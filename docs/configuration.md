@@ -390,6 +390,7 @@ Project names (the file name without `.yaml`) must start with a letter or digit 
 |----------|---------|-------------|
 | `LAIR_HOST` | server | Bind address (default `127.0.0.1`). The host is also added to the allowed browser `Origin`s and `Host` headers (ports 4777 and 5173). A wildcard (`0.0.0.0`, `::`) listens on every interface and **turns the `Host` check off**. Lair has no authentication, so don't use anything but loopback on an untrusted network |
 | `LAIR_NODE_TOKEN` | server, lair-node | Shared secret for remote lair-node daemons. The server accepts `/ws/node` connections from its own machine (loopback) without it; any other peer is refused unless `LAIR_NODE_TOKEN` is set on the server and the node presents the same value as `Authorization: Bearer <token>` or `?token=<token>`. lair-node sends it automatically when `LAIR_NODE_TOKEN` is set in its environment |
+| `LAIR_PROJECT` | server | The default project: the one the dashboard opens first, the one API requests without `?project=` use, and the one whose `processes:` the process manager runs. It must name a project in `projects/` or `projects/local/` (for example `LAIR_PROJECT=myproject`); an invalid or unknown name logs a warning at startup and is ignored. Without it the default is `example` if it exists, else the first project found |
 | `LAIR_CLIENT_DIR` | server | Directory of the built web UI to serve (default `dist/client`) |
 | `LAIR_AGENT_ID` | lair-bus | The calling agent's ID (required) |
 

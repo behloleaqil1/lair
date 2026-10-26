@@ -136,21 +136,40 @@ export function listProjects(projectsDir: string = PROJECTS_DIR): string[] {
   return [...new Set(names)];
 }
 
+/** LAIR_PROJECT values already warned about, so a bad value is logged once, not per request. */
+const warnedDefaultProjects = new Set<string>();
+
 /**
- * Get the default project (first one, or 'example' if it exists)
+ * Get the default project: LAIR_PROJECT when it names a listed project,
+ * else 'example' if it exists, else the first project found.
+ * An invalid or unknown LAIR_PROJECT logs a warning and is ignored.
+ * `env` and `projects` are for tests.
  */
-export function getDefaultProject(): string {
-  const projects = listProjects();
-
-  if (projects.includes("example")) {
-    return "example";
+export function getDefaultProject(
+  env: NodeJS.ProcessEnv = process.env,
+  projects: string[] = listProjects(),
+): string {
+  const requested = env.LAIR_PROJECT?.trim();
+  const safe = requested !== undefined && SAFE_PROJECT_NAME.test(requested);
+  if (requested && safe && projects.includes(requested)) {
+    return requested;
   }
 
-  if (projects.length > 0) {
-    return projects[0];
+  if (projects.length === 0) {
+    throw new Error("No project configurations found in projects/");
   }
+  const fallback = projects.includes("example") ? "example" : projects[0];
 
-  throw new Error("No project configurations found in projects/");
+  if (requested && !warnedDefaultProjects.has(requested)) {
+    warnedDefaultProjects.add(requested);
+    const reason = safe
+      ? "no such project in projects/ or projects/local/"
+      : "not a valid project name";
+    console.warn(
+      `LAIR_PROJECT=${JSON.stringify(requested)} ignored (${reason}); using "${fallback}"`,
+    );
+  }
+  return fallback;
 }
 
 /**

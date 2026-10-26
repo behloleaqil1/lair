@@ -65,7 +65,7 @@ machines:
     runners: [heavy, light]
 ```
 
-Only `.yaml` files are loaded. Restart the server after adding a project. See [Getting Started](docs/getting-started.md) for a walkthrough and [Configuration](docs/configuration.md) for every option (machines over SSH, controls, merge bar, dragons, process manager).
+Only `.yaml` files are loaded. Restart the server after adding a project. To open it by default instead of `example`, start the server with `LAIR_PROJECT=myproject` (an unknown name logs a warning and is ignored). See [Getting Started](docs/getting-started.md) for a walkthrough and [Configuration](docs/configuration.md) for every option (machines over SSH, controls, merge bar, dragons, process manager).
 
 ## Connect an agent
 

@@ -1,11 +1,11 @@
 /**
  * Project discovery (src/server/config.ts).
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi, type MockInstance } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { listProjects } from "./config.js";
+import { getDefaultProject, listProjects } from "./config.js";
 
 describe("listProjects", () => {
   let dir: string;
@@ -53,5 +53,71 @@ describe("listProjects", () => {
 
   it("returns [] when the directory does not exist", () => {
     expect(listProjects(join(dir, "missing"))).toEqual([]);
+  });
+});
+
+describe("getDefaultProject", () => {
+  let warn: MockInstance;
+
+  beforeEach(() => {
+    warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    warn.mockRestore();
+  });
+
+  it("prefers example, then the first project, without LAIR_PROJECT", () => {
+    expect(getDefaultProject({}, ["alpha", "example"])).toBe("example");
+    expect(getDefaultProject({}, ["beta", "alpha"])).toBe("beta");
+    expect(getDefaultProject({ LAIR_PROJECT: "" }, ["beta", "example"])).toBe("example");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("uses LAIR_PROJECT when it names a listed project", () => {
+    expect(getDefaultProject({ LAIR_PROJECT: "alpha" }, ["alpha", "example"])).toBe("alpha");
+    expect(getDefaultProject({ LAIR_PROJECT: "  alpha\n" }, ["example", "alpha"])).toBe("alpha");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("warns and falls back when LAIR_PROJECT is not a listed project", () => {
+    expect(getDefaultProject({ LAIR_PROJECT: "gone" }, ["alpha", "example"])).toBe("example");
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('LAIR_PROJECT="gone" ignored (no such project');
+    expect(warn.mock.calls[0][0]).toContain('using "example"');
+  });
+
+  it.each(["../example", "/etc/passwd", ".hidden", "a b", "-x"])(
+    "warns and falls back when LAIR_PROJECT is the unsafe name %j",
+    (name) => {
+      // Even if a list somehow contained the name, it must not be used
+      expect(getDefaultProject({ LAIR_PROJECT: name }, [name, "beta"])).toBe("beta");
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toContain("not a valid project name");
+    },
+  );
+
+  it("warns only once for the same bad value", () => {
+    getDefaultProject({ LAIR_PROJECT: "repeat-me" }, ["example"]);
+    getDefaultProject({ LAIR_PROJECT: "repeat-me" }, ["example"]);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws when there are no projects", () => {
+    expect(() => getDefaultProject({}, [])).toThrow("No project configurations found");
+    expect(() => getDefaultProject({ LAIR_PROJECT: "x" }, [])).toThrow(
+      "No project configurations found",
+    );
+  });
+
+  it("reads LAIR_PROJECT from process.env by default", () => {
+    const saved = process.env.LAIR_PROJECT;
+    process.env.LAIR_PROJECT = "beta";
+    try {
+      expect(getDefaultProject(undefined, ["example", "beta"])).toBe("beta");
+    } finally {
+      if (saved === undefined) delete process.env.LAIR_PROJECT;
+      else process.env.LAIR_PROJECT = saved;
+    }
   });
 });

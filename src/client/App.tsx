@@ -13,6 +13,7 @@ import { Inbox } from "./components/Inbox";
 import { Processes } from "./components/Processes";
 import { Nodes } from "./components/Nodes";
 import { CommandBar } from "./components/CommandBar";
+import { pickInitialProject } from "./initial-project";
 import type { CommandMode, ControlsStatus } from "../shared/types";
 import { LAIR_VERSION } from "../shared/version";
 import "./App.css";
@@ -54,17 +55,20 @@ export function App() {
     tickRunning: false,
   });
 
-  // Load projects on mount
+  // Load projects on mount, and open the server's default project (LAIR_PROJECT)
   useEffect(() => {
+    const defaultProject = fetch("/api/projects/default")
+      .then((res) => res.json())
+      .then((data) => (data.success ? data.data : undefined))
+      .catch(() => undefined);
     fetch("/api/projects")
       .then((res) => res.json())
-      .then((data) => {
+      .then(async (data) => {
         if (data.success && data.data) {
           setProjects(data.data);
-          if (data.data.length > 0) {
-            setCurrentProject(
-              data.data.includes("example") ? "example" : data.data[0],
-            );
+          const initial = pickInitialProject(data.data, await defaultProject);
+          if (initial) {
+            setCurrentProject(initial);
           }
         }
       })

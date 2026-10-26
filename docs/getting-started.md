@@ -71,7 +71,7 @@ See [Configuration](configuration.md) for all available options.
 ## Verifying the setup
 
 1. Open `http://localhost:4777` (or `http://localhost:5173` in dev mode)
-2. If you have more than one project, pick it from the project selector in the header (the `example` project is selected by default when it exists)
+2. If you have more than one project, pick it from the project selector in the header. The dashboard opens the project named in `LAIR_PROJECT` (for example `LAIR_PROJECT=myproject npm start`), else `example` when it exists, else the first project
 3. Check the Overview page for any detected problems
 4. Verify that your repository status is showing correctly
 
