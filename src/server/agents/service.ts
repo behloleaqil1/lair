@@ -911,20 +911,20 @@ export class AgentsService {
       const why = claim
         ? `task ${run.task} is now claimed by run ${short(claim.runId)} (agent ${claim.agent})`
         : `its claim on task ${run.task} was released`;
-      return this.stop(run, "lost_claim", why, [why], t);
+      return this.stopRun(run, "lost_claim", why, [why], t);
     }
 
     // A rate limit or provider error at the end of a silent log
     const failover = this.failoverWhileAlive(run, t.now);
     if (failover) {
       run.failover = failover;
-      return this.stop(run, "failover", `${failoverLabel(failover.kind)}: ${failover.line}`, [`log line: ${failover.line}`], t);
+      return this.stopRun(run, "failover", `${failoverLabel(failover.kind)}: ${failover.line}`, [`log line: ${failover.line}`], t);
     }
 
     // Hung: the watchdog's rule (never for an agent WAITING on a gate)
     const proc = t.snap.get(run.pid);
     const hung = proc ? hungFinding(this.view(t), run.agent, proc, this.watchdogSettings.hungMinutes) : null;
-    if (hung) return this.stop(run, "hung", hung.summary, hung.evidence, t);
+    if (hung) return this.stopRun(run, "hung", hung.summary, hung.evidence, t);
 
     const detail = `working (pid ${run.pid})`;
     if (run.detail !== detail) {
@@ -945,7 +945,7 @@ export class AgentsService {
     return matchFailover(lastLines(readTail(run.logPath, 8192), 1), this.settings);
   }
 
-  private async stop(run: AgentRun, reason: StopReason, detail: string, evidence: string[], t: Tick): Promise<void> {
+  private async stopRun(run: AgentRun, reason: StopReason, detail: string, evidence: string[], t: Tick): Promise<void> {
     run.state = "stopping";
     run.stopReason = reason;
     run.stopDetail = detail;
@@ -1625,7 +1625,7 @@ export class AgentsService {
       const now = this.probes.clock.now();
       const t = await this.newTick(now);
       if (run.state === "running") {
-        await this.stop(run, "fresh_session", "a fresh session was requested", ["requested through the API (Agents view)"], t);
+        await this.stopRun(run, "fresh_session", "a fresh session was requested", ["requested through the API (Agents view)"], t);
         return runView(run);
       }
       if (run.state === "stopping") throw new AgentsError(409, `Run ${short(run.id)} is already stopping`);
