@@ -16,6 +16,7 @@ Lair is **agent-agnostic**: agents are started by commands you configure, so any
 - **Machines**: machine health, runners and SSH connectivity
 - **Activity and Inbox**: live fleet bus feed, audit log, and messages to and from the orchestrator
 - **Processes and Nodes**: services Lair supervises, and connected lair-node daemons (experimental)
+- **Health**: the progress watchdog. It is off by default, and observe-only until you opt in. It detects hung or duplicate agents, stale locks and claims, orphaned gates, broken lanes, idle capacity, stalls and crash loops, and recovers through your own commands ([configuration](docs/configuration.md#watchdog))
 
 ## Requirements
 

@@ -169,6 +169,7 @@ Each view is a standalone component:
 - **`Nodes.tsx`**: connected lair-node instances
 - **`Processes.tsx`**: managed processes and their logs
 - **`Activity.tsx`**, **`LiveFeed.tsx`**: fleet bus activity feed
+- **`Health.tsx`**: watchdog SLO status, open breaches and playbook runs (read-only)
 - **`Inbox.tsx`**: owner inbox and orchestrator replies
 - **`CommandBar.tsx`**: ask / instruct / task command bar
 - **`Settings.tsx`**: project configuration UI
