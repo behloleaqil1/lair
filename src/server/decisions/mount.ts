@@ -1,7 +1,8 @@
 /**
  * Mount the Decision Inbox on a Fastify server: the store, the inbox, its
- * routes, the sweep timer, and the producers that raise decisions (today the
- * watchdog's escalations). Answers need an owner session from the shared
+ * routes, the sweep timer, and the producers that raise decisions (the
+ * watchdog's escalations, and `decision.needed` events: gate pipelines).
+ * Answers need an owner session from the shared
  * human credential (src/server/human-auth/), which the server creates and
  * passes in. src/server/index.ts calls this, and the wiring test calls the
  * same function, so what the test drives is what runs.
@@ -10,6 +11,7 @@ import type { FastifyInstance } from "fastify";
 import type { EventBus } from "../core/event-bus.js";
 import type { HumanAuth } from "../human-auth/index.js";
 import { registerDecisionRoutes } from "./routes.js";
+import { listenForDecisionRequests } from "./request-bridge.js";
 import { MemorySecretStore, type SecretStore } from "./secrets.js";
 import { DEFAULT_MAX_OPEN_HTTP_PER_PROJECT, DEFAULT_MAX_OPEN_PER_SOURCE, DecisionInbox } from "./service.js";
 import { DecisionStore } from "./store.js";
@@ -76,10 +78,13 @@ export async function mountDecisions(
     maxOpenHttpPerProject: options.maxOpenHttpPerProject ?? maxOpenHttpFromEnv(env),
   });
   await registerDecisionRoutes(fastify, inbox, options.defaultProject, options.humanAuth);
+  // Modules that ask through "decision.needed" events (gate pipelines) raise here, in the server
+  const stopListening = options.events ? listenForDecisionRequests(options.events, inbox) : undefined;
   for (const producer of options.producers ?? []) producer.useDecisions(inbox);
   inbox.start();
   // fastify.close() (the server's shutdown) stops the sweeps and closes the store
   fastify.addHook("onClose", async () => {
+    stopListening?.();
     await inbox.stop();
     store.close();
   });

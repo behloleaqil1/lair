@@ -154,6 +154,27 @@ describe("parseRaiseInput", () => {
       "http://[fe80::1]/",
       "http://[::ffff:127.0.0.1]/",
       "http://[::ffff:10.0.0.1]/",
+      // Other ways to write 127.0.0.1: decimal, hex, octal, short form, userinfo, trailing dot, expanded IPv6
+      "http://2130706433/",
+      "http://0x7f000001/",
+      "http://0177.0.0.1/",
+      "http://127.1/",
+      "http://user:pass@127.0.0.1/",
+      "http://example.com@127.0.0.1/answer",
+      "http://127.0.0.1./",
+      "http://[0:0:0:0:0:ffff:7f00:1]/",
+      "http://[0000:0000:0000:0000:0000:ffff:127.0.0.1]/",
+      // Names that only resolve locally, and wildcard DNS that answers with a local address
+      "http://db.internal/",
+      "http://router.home.arpa/",
+      "http://nas.lan/",
+      "http://1.0.0.127.in-addr.arpa/",
+      "http://localtest.me/",
+      "http://app.localtest.me:3000/",
+      "http://anything.lvh.me/",
+      "http://127.0.0.1.nip.io/",
+      "http://10-0-0-1.sslip.io/",
+      "http://127.0.0.1.xip.io/",
     ];
     for (const url of refused) {
       expect([url, errorsOf(input({ links: [{ label: "x", url }] }))[0]]).toEqual([
@@ -167,6 +188,11 @@ describe("parseRaiseInput", () => {
       "http://172.32.0.1/",
       "http://[2001:db8::1]/",
       "https://docs.example.org:8443/a?b#c",
+      // A private name inside a public one is still public
+      "https://planet.lan.example.org/",
+      "https://nip.io.example.com/",
+      "https://notlocal.example.com/",
+      "http://localhost@example.com/",
     ]) {
       expect([url, errorsOf(input({ links: [{ label: "x", url }] }))]).toEqual([url, []]);
     }
@@ -178,6 +204,10 @@ describe("parseRaiseInput", () => {
     expect(isPrivateHost("[::ffff:7f00:1]")).toBe(true);
     expect(isPrivateHost("example.com")).toBe(false);
     expect(isPrivateHost("203.0.113.9")).toBe(false);
+    expect(isPrivateHost("NIP.IO")).toBe(true);
+    expect(isPrivateHost("printer.local.")).toBe(true);
+    expect(isPrivateHost("home.arpa")).toBe(true);
+    expect(isPrivateHost("lanparty.example.com")).toBe(false);
   });
 
   it("ties secrets to credentials decisions", () => {

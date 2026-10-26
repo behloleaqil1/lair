@@ -1,8 +1,16 @@
 /**
  * This browser's owner session (src/server/human-auth/): signed in once
- * with the owner token, kept in this origin's localStorage (scheme, host
- * and port, so no other local server can read it), and sent in the
- * X-Lair-Owner-Session header on owner-only requests. Never a cookie.
+ * with the owner token and sent in the X-Lair-Owner-Session header on
+ * owner-only requests. Never a cookie.
+ *
+ * Where it is kept depends on how the dashboard is served (keeperFor):
+ * - the built dashboard (`npm start`, port 4777): this origin's
+ *   localStorage, so it survives reloads. The origin is scheme, host and
+ *   port, so no other local server can read it.
+ * - the Vite dev server (`npm run dev`, port 5173): this page's memory
+ *   only. Vite serves every file of the checkout from that origin, so an
+ *   HTML file an agent commits would be same-origin and could read
+ *   localStorage. Sign in again after a reload.
  */
 export const OWNER_SESSION_HEADER = "X-Lair-Owner-Session";
 const STORAGE_KEY = "lair.ownerSession";
@@ -16,32 +24,74 @@ export interface OwnerSessionInfo {
   current?: boolean;
 }
 
-function storage(): Storage | null {
-  try {
-    return typeof localStorage === "undefined" ? null : localStorage;
-  } catch {
-    return null;
-  }
+/** Where this page keeps its session value. */
+export interface SessionKeeper {
+  read(): string | null;
+  write(value: string | null): void;
+  /** True when a reload keeps the session */
+  persistent: boolean;
 }
+
+/** This origin's localStorage. Blocked storage (private mode, policy) just means not signed in. */
+export function localStorageKeeper(): SessionKeeper {
+  const storage = (): Storage | null => {
+    try {
+      return typeof localStorage === "undefined" ? null : localStorage;
+    } catch {
+      return null;
+    }
+  };
+  return {
+    persistent: true,
+    read() {
+      try {
+        return storage()?.getItem(STORAGE_KEY) ?? null;
+      } catch {
+        return null;
+      }
+    },
+    write(value) {
+      try {
+        const s = storage();
+        if (!s) return;
+        if (value) s.setItem(STORAGE_KEY, value);
+        else s.removeItem(STORAGE_KEY);
+      } catch {
+        // Storage blocked: this browser just can't stay signed in
+      }
+    },
+  };
+}
+
+/** This page's memory: nothing another page of the origin can read, gone on reload. */
+export function memoryKeeper(): SessionKeeper {
+  let value: string | null = null;
+  return {
+    persistent: false,
+    read: () => value,
+    write: (next) => {
+      value = next;
+    },
+  };
+}
+
+/** The keeper for a dashboard served by the Vite dev server (`dev`), or built. */
+export function keeperFor(dev: boolean): SessionKeeper {
+  return dev ? memoryKeeper() : localStorageKeeper();
+}
+
+const keeper = keeperFor(import.meta.env.DEV === true);
+
+/** False under `npm run dev`: a reload signs this browser out. */
+export const sessionSurvivesReload = keeper.persistent;
 
 /** The session value this browser holds, or null. */
 export function storedSession(): string | null {
-  try {
-    return storage()?.getItem(STORAGE_KEY) ?? null;
-  } catch {
-    return null;
-  }
+  return keeper.read();
 }
 
 function keepSession(value: string | null): void {
-  try {
-    const s = storage();
-    if (!s) return;
-    if (value) s.setItem(STORAGE_KEY, value);
-    else s.removeItem(STORAGE_KEY);
-  } catch {
-    // Storage blocked (private mode, policy): this browser just can't stay signed in
-  }
+  keeper.write(value);
 }
 
 /** The header that makes a request the owner's, when this browser is signed in. */

@@ -96,15 +96,36 @@ function privateIpv4([a, b]: number[]): boolean {
 }
 
 /**
- * True for hosts on this machine or a private network: localhost and
- * *.localhost, *.local, single-label names, loopback, private, link-local
- * and unique-local addresses (also IPv4-mapped IPv6). A link to one of them
+ * Names that only resolve on this machine or a local network (special-use
+ * and common home-network domains), and public wildcard-DNS services that
+ * answer with whatever address is in the name or with 127.0.0.1.
+ */
+const PRIVATE_NAMES = [
+  "localhost",
+  "local",
+  "internal",
+  "home.arpa",
+  "lan",
+  "arpa",
+  "localtest.me",
+  "lvh.me",
+  "nip.io",
+  "sslip.io",
+  "xip.io",
+];
+
+/**
+ * True for hosts on this machine or a private network: localhost, the names
+ * in PRIVATE_NAMES and anything under them, single-label names, loopback,
+ * private, link-local and unique-local addresses (also IPv4-mapped IPv6).
+ * Pass a URL's `hostname` (the URL parser has already turned 2130706433,
+ * 0x7f000001, 0177.0.0.1 and 127.1 into 127.0.0.1). A link to one of them
  * could lead the owner's browser to a local listener an agent runs.
  */
 export function isPrivateHost(hostname: string): boolean {
   let host = hostname.toLowerCase().replace(/\.+$/, "");
   if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
-  if (host === "" || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return true;
+  if (host === "" || PRIVATE_NAMES.some((name) => host === name || host.endsWith(`.${name}`))) return true;
   const v4 = ipv4(host);
   if (v4) return privateIpv4(v4);
   if (host.includes(":")) {
@@ -151,7 +172,7 @@ const LinkSchema = z
         } catch {
           return true; // reported above
         }
-      }, "must not point at this machine or a private network (localhost, 127.0.0.0/8, ::1, 10/8, 172.16/12, 192.168/16, 169.254/16, *.local, *.localhost)"),
+      }, "must not point at this machine or a private network (localhost, *.local, *.internal, *.lan, *.arpa, wildcard DNS such as nip.io, names without a dot, 127.0.0.0/8, ::1, 10/8, 172.16/12, 192.168/16, 169.254/16)"),
   })
   .strict();
 

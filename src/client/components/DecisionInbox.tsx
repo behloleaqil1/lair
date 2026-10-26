@@ -25,7 +25,7 @@ import {
   postAnswer,
   type DecisionSummary,
 } from "../decisions-api";
-import { ownerStatus, signIn, tokenFromHash } from "../owner-session";
+import { ownerStatus, sessionSurvivesReload, signIn, tokenFromHash } from "../owner-session";
 import { OwnerSessions } from "./OwnerSessions";
 
 interface Props {
@@ -397,6 +397,13 @@ export function UnlockAnswering({ onUnlock }: { onUnlock: (token: string) => Pro
         Only you answer decisions, so this browser has to sign in as the owner, once, with the owner token Lair keeps
         in <code>data/owner.token</code>. Open the setup link the server printed when it first started, or paste the
         token here.
+        {!sessionSurvivesReload && (
+          <>
+            {" "}
+            Under <code>npm run dev</code> the session stays in this page only (the dev server also serves the
+            repository's files), so sign in again after a reload.
+          </>
+        )}
       </p>
       <input
         type="password"
