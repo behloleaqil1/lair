@@ -13,16 +13,13 @@ import type { SLODefinition, PlaybookDefinition } from "./types.js";
 // Mock store with required methods
 function createMockStore() {
   return {
-    getTasksByStatus: vi.fn().mockReturnValue([]),
-    getRecentJobs: vi.fn().mockReturnValue([]),
-    getAgentRunsByStatus: vi.fn().mockReturnValue([]),
-    getAllNodes: vi.fn().mockReturnValue([]),
-    getJobsByStatus: vi.fn().mockReturnValue([]),
+    listTasks: vi.fn().mockReturnValue([]),
+    listJobs: vi.fn().mockReturnValue([]),
+    listNodes: vi.fn().mockReturnValue([]),
     getAgentRun: vi.fn(),
     getNode: vi.fn(),
-    getJobsByLane: vi.fn().mockReturnValue([]),
     updateJobStatus: vi.fn(),
-  } as any;
+  };
 }
 
 describe("WatchdogStore", () => {
@@ -377,7 +374,7 @@ describe("Detectors", () => {
     };
 
     it("returns healthy when no ready tasks", async () => {
-      mockStore.getTasksByStatus.mockReturnValue([]);
+      mockStore.listTasks.mockReturnValue([]);
 
       const result = await runDetector(slo, ctx);
 
@@ -386,7 +383,7 @@ describe("Detectors", () => {
     });
 
     it("returns breached when no recent merges", async () => {
-      mockStore.getTasksByStatus.mockReturnValue([{ id: "task-1" }]);
+      mockStore.listTasks.mockReturnValue([{ id: "task-1" }]);
       // No merge events
 
       const result = await runDetector(slo, ctx);
@@ -408,8 +405,7 @@ describe("Detectors", () => {
     };
 
     it("returns healthy when no running agents", async () => {
-      mockStore.getAgentRunsByStatus.mockReturnValue([]);
-
+      // No task.started events means no running agents
       const result = await runDetector(slo, ctx);
 
       expect(result.status).toBe("healthy");
@@ -417,15 +413,17 @@ describe("Detectors", () => {
     });
 
     it("returns breached when agent is stuck", async () => {
+      // Emit a task.started event from a long time ago
       const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-      mockStore.getAgentRunsByStatus.mockReturnValue([
-        {
-          agentId: "agent-1",
-          status: "running",
-          startedAt: oneHourAgo,
-          lastActivityAt: oneHourAgo,
-        },
-      ]);
+      await eventBus.emit("task.started", {
+        taskId: "task-1",
+        agentId: "agent-1",
+      });
+      // Manually backdate the event timestamp
+      const events = eventBus.getRecentEvents("task.started", 1);
+      if (events.length > 0) {
+        (events[0] as { timestamp: string }).timestamp = oneHourAgo;
+      }
 
       const result = await runDetector(slo, ctx);
 
