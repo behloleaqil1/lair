@@ -6,20 +6,14 @@
  * 2. The playbook fixing it
  * 3. Zero human steps required
  */
-import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import Database from "better-sqlite3";
 import { WatchdogStore } from "./store.js";
 import { PlaybookEngine, registerStepExecutor, clearStepExecutors } from "./playbook-engine.js";
-import { runDetector, type DetectorContext, detectorRegistry } from "./detectors.js";
-import { builtInPlaybooks } from "./playbooks.js";
-import { WatchdogService } from "./service.js";
 import { EventBus } from "../core/event-bus.js";
 import type {
-  SLODefinition,
-  SLOBreach,
   PlaybookDefinition,
   PlaybookStep,
-  PlaybookStepResult,
 } from "./types.js";
 
 // ============================================================================
@@ -59,24 +53,14 @@ interface MockNode {
   registeredAt: string;
 }
 
-interface MockLock {
-  id: string;
-  holderId: string;
-  holderPid: number | null;
-  acquiredAt: string;
-  leaseSeconds: number;
-}
-
 function createMockStore(overrides: Partial<{
   agents: MockAgent[];
   jobs: MockJob[];
   nodes: MockNode[];
-  locks: MockLock[];
 }> = {}) {
   const agents = overrides.agents ?? [];
   const jobs = overrides.jobs ?? [];
   const nodes = overrides.nodes ?? [];
-  const locks = overrides.locks ?? [];
 
   return {
     // Job methods
@@ -340,7 +324,7 @@ describe("Acceptance: HUNG vs WAITING", () => {
     engine = new PlaybookEngine(eventBus, mockStore, watchdogStore);
 
     let hungRestarted = false;
-    let waitingLeftAlone = true;
+    const waitingLeftAlone = true;
 
     registerStepExecutor("diagnose", async (step) => {
       if (step.params.action === "classify-agents") {
@@ -419,7 +403,7 @@ describe("Acceptance: Claims protection", () => {
     mockStore = createMockStore({});
     engine = new PlaybookEngine(eventBus, mockStore, watchdogStore);
 
-    let claimedAgentProtected = true;
+    const claimedAgentProtected = true;
     let unclaimedAgentRestarted = false;
 
     registerStepExecutor("diagnose", async (step) => {

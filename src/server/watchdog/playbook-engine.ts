@@ -165,7 +165,7 @@ export class PlaybookEngine {
     const now = new Date().toISOString();
 
     // Create the run
-    let run = this.watchdogStore.createPlaybookRun({
+    const run = this.watchdogStore.createPlaybookRun({
       id: runId,
       playbookId: playbook.id,
       breachId: breach.id,
@@ -539,7 +539,7 @@ registerStepExecutor("verify", async (step, ctx) => {
 /**
  * Wait step - wait for a condition
  */
-registerStepExecutor("wait", async (step, ctx) => {
+registerStepExecutor("wait", async (step, _ctx) => {
   const seconds = (step.params.seconds as number) ?? 5;
   await new Promise(resolve => setTimeout(resolve, seconds * 1000));
   return { success: true, output: `Waited ${seconds}s` };

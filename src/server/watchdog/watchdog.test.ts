@@ -4,11 +4,11 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import Database from "better-sqlite3";
 import { WatchdogStore } from "./store.js";
-import { PlaybookEngine, registerStepExecutor } from "./playbook-engine.js";
-import { runDetector, type DetectorContext, detectorRegistry } from "./detectors.js";
+import { PlaybookEngine } from "./playbook-engine.js";
+import { runDetector, type DetectorContext } from "./detectors.js";
 import { builtInPlaybooks } from "./playbooks.js";
 import { EventBus } from "../core/event-bus.js";
-import type { SLODefinition, SLOBreach, PlaybookDefinition } from "./types.js";
+import type { SLODefinition, PlaybookDefinition } from "./types.js";
 
 // Mock store with required methods
 function createMockStore() {
