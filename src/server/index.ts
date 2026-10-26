@@ -40,6 +40,7 @@ import { WatchdogManager, registerWatchdogRoutes } from "./watchdog/index.js";
 import { DeliveryManager, registerDeliveryRoutes } from "./delivery/index.js";
 import { PipelineManager, registerPipelineRoutes } from "./gates/index.js";
 import { getBudgetManager } from "./fleet/budget.js";
+import { ReviewManager, registerReviewRoutes } from "./review/index.js";
 import { join } from "path";
 import type { ApiResponse } from "../shared/types.js";
 
@@ -390,6 +391,14 @@ await mountDecisions(fastify, {
   producers: [watchdogs],
 });
 
+// Reviews and policy merge: one per project with `review.enabled: true`
+const reviews = new ReviewManager({
+  dbPath: join(process.cwd(), "data", "review.db"),
+  events: getEventBus(),
+});
+reviews.load(projectEntries);
+await registerReviewRoutes(fastify, reviews, () => getDefaultProject());
+
 // Serve the built web UI (dist/client) with an SPA fallback, when it exists.
 // In development the UI comes from the Vite dev server on port 5173 instead.
 const clientDir = resolveClientDir();
@@ -423,6 +432,9 @@ const shutdown = async (signal: string) => {
 
   // Stop pipeline jobs: in-flight attempts stay recorded and resume on restart
   await pipelines.stop();
+
+  // Close the review store
+  reviews.close();
 
   // Stop healer
   stopHealer();
@@ -512,6 +524,12 @@ const start = async () => {
       watched.length > 0
         ? `[watchdog] Watching: ${watched.join(", ")}`
         : "[watchdog] Off (no project sets watchdog.enabled)",
+    );
+    const reviewed = reviews.enabled();
+    console.log(
+      reviewed.length > 0
+        ? `[review] Reviews and policy merge for: ${reviewed.join(", ")}`
+        : "[review] Off (no project sets review.enabled)",
     );
 
     // Start delivery

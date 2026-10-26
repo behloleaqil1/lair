@@ -16,8 +16,35 @@ export {
 export {
   evaluatePolicy,
   canMerge,
+  verifyGateResults,
   type EvaluatePolicyOptions,
 } from "./policy-evaluator.js";
+
+export {
+  assessRisk,
+  matchPath,
+  fileKindsOf,
+  higherTier,
+  DEFAULT_FILE_KINDS,
+  DEFAULT_RISK_RULES,
+  type RiskRule,
+  type ChangedFile,
+  type ChangeFacts,
+} from "./risk-rules.js";
+
+export {
+  matchSlots,
+  slotMismatch,
+  slotLabel,
+  optionLabel,
+  type SlotCandidate,
+} from "./reviewer-slots.js";
+
+export {
+  evaluateMergePolicy,
+  type MergePolicyInput,
+  type MergePolicyResult,
+} from "./merge-policy.js";
 
 export {
   attemptMerge,

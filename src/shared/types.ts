@@ -62,6 +62,11 @@ export interface ProjectConfig {
    */
   pipelines?: Record<string, unknown>;
   executors?: Record<string, unknown>;
+  /**
+   * Reviews and policy merge (src/server/review/). Validated by
+   * parseReviewConfig; see docs/configuration.md#reviews-and-policy-merge
+   */
+  review?: Record<string, unknown>;
 }
 
 // Process configuration as it appears in YAML (before defaults applied)

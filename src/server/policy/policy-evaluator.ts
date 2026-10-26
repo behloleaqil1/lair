@@ -265,7 +265,7 @@ function checkGateResult(
  * result (bad signature, other project, old pipeline version, tampered) is
  * ignored. If no candidate can be trusted, every rejection is reported.
  */
-function verifyGateResults(
+export function verifyGateResults(
   pr: PullRequest,
   policy: PolicyConfig,
   nodePublicKeys: Map<string, string>,

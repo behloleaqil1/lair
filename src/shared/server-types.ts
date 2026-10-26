@@ -227,7 +227,14 @@ export type EventType =
   | "pipeline.job.fallback"
   | "pipeline.run.completed"
   // A module needs a human decision (the Decision Inbox listens)
-  | "decision.needed";
+  | "decision.needed"
+  // Reviews and policy merge (src/server/review/)
+  | "review.submitted"
+  | "review.invalidated"
+  | "review.assignment_requested"
+  | "review.decision_requested"
+  | "review.merged"
+  | "review.merge_refused";
 
 /** Event stored in the database */
 export interface Event {
