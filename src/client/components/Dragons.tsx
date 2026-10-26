@@ -7,6 +7,7 @@ import { useApi } from "../hooks/useApi";
 import { useDragonsWebSocket } from "../hooks/useWebSocket";
 import { DragonStartDialog } from "./DragonStartDialog";
 import { DragonStopDialog } from "./DragonStopDialog";
+import { canStartDragon, hasStartableDragons } from "../dragon-start";
 import type {
   Dragon,
   QueueLine,
@@ -111,10 +112,11 @@ export function Dragons({ project, refreshKey }: Props) {
     }
   };
 
-  // Get configured dragons (merge with runtime dragon data)
+  // Dragons the server accepts for start/stop: the YAML dragons: map plus
+  // dragons.txt (dragons.txt-only ones have no model or machine)
   const configuredDragons = dragonConfig?.dragons || {};
   const availableModels = dragonConfig?.available_models || [];
-  const hasConfiguredDragons = Object.keys(configuredDragons).length > 0;
+  const hasConfiguredDragons = hasStartableDragons(configuredDragons);
 
   return (
     <div>
@@ -265,7 +267,7 @@ export function Dragons({ project, refreshKey }: Props) {
                         Stop
                       </button>
                     ) : (
-                      hasConfiguredDragons && (
+                      canStartDragon(dragon.id, configuredDragons) && (
                         <button
                           onClick={() => handleStartClick(dragon.id)}
                           style={{

@@ -7,6 +7,7 @@ import type {
   AvailableModel,
   DragonStartRequest,
 } from "../../shared/types";
+import { dragonSummary } from "../dragon-start";
 
 interface Props {
   dragons: Record<string, DragonConfig>;
@@ -147,8 +148,7 @@ export function DragonStartDialog({
                   marginTop: "0.25rem",
                 }}
               >
-                Machine: {selectedDragon.machine} | Model:{" "}
-                {selectedDragon.model}
+                {dragonSummary(selectedDragon)}
               </p>
             )}
           </div>
