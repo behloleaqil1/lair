@@ -22,7 +22,19 @@ import type {
   RequestedBy,
 } from "./types.js";
 
-const SCHEMA_VERSION = 1;
+/**
+ * 1: holds, crash loops, samples, operations, refs.
+ * 2: operations.recovered_by, delivery_service_shas, delivery_containers.
+ */
+export const SCHEMA_VERSION = 2;
+
+/**
+ * Changes to tables that already exist, by the version they upgrade from.
+ * New tables need no entry: SCHEMA creates whatever is missing.
+ */
+const MIGRATIONS: Record<number, string[]> = {
+  1: [`ALTER TABLE delivery_operations ADD COLUMN recovered_by TEXT`],
+};
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS delivery_holds (
@@ -160,8 +172,15 @@ export class DeliveryStore {
     }
     const version = this.db.pragma("user_version", { simple: true }) as number;
     if (version < SCHEMA_VERSION) {
-      this.db.exec(SCHEMA);
-      this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+      this.db.transaction(() => {
+        // Creates what is missing: every table on a new database, the tables added since on an old one
+        this.db.exec(SCHEMA);
+        // A new database (version 0) already has the current tables
+        for (let from = version; version > 0 && from < SCHEMA_VERSION; from++) {
+          for (const statement of MIGRATIONS[from] ?? []) this.db.exec(statement);
+        }
+        this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+      })();
     }
   }
 
