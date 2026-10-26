@@ -159,7 +159,7 @@ export function generateWorkflow(options: WorkflowOptions): string {
 
 // ============ LOGS ============
 
-const TIMESTAMP = /^﻿?\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z ?/;
+const TIMESTAMP = /^\uFEFF?\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z ?/;
 
 /** Drop the timestamp GitHub puts in front of every log line */
 export function stripTimestamps(log: string): string[] {

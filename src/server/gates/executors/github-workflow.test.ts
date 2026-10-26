@@ -122,7 +122,7 @@ describe("parseStepLogs", () => {
   it("reads each step's exit code and output from its markers, ignoring the echoed script", () => {
     const ts = "2026-03-02T12:00:00.1234567Z";
     const log = [
-      `﻿${ts} ##[group]Run echo "lair-step-start lint"`,
+      `\uFEFF${ts} ##[group]Run echo "lair-step-start lint"`,
       `${ts} echo "lair-step-start lint"`,
       `${ts} echo "lair-step-exit lint $rc"`,
       `${ts} ##[endgroup]`,
