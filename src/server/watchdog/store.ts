@@ -72,7 +72,8 @@ const SCHEMA = `
     breach_id TEXT NOT NULL UNIQUE REFERENCES watchdog_breaches(id),
     created_at TEXT NOT NULL,
     file TEXT,
-    text TEXT NOT NULL
+    text TEXT NOT NULL,
+    suppressed INTEGER NOT NULL DEFAULT 0
   );
 
   CREATE TABLE IF NOT EXISTS watchdog_container_samples (
@@ -139,6 +140,7 @@ interface EscalationRow {
   created_at: string;
   file: string | null;
   text: string;
+  suppressed: number;
 }
 
 interface SloRow {
@@ -341,8 +343,8 @@ export class WatchdogStore {
   recordEscalation(escalation: Omit<Escalation, "id">): boolean {
     const result = this.db
       .prepare(
-        `INSERT OR IGNORE INTO watchdog_escalations (id, project, breach_id, created_at, file, text)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT OR IGNORE INTO watchdog_escalations (id, project, breach_id, created_at, file, text, suppressed)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         randomUUID(),
@@ -351,6 +353,7 @@ export class WatchdogStore {
         escalation.createdAt,
         escalation.file ?? null,
         escalation.text,
+        escalation.suppressed ? 1 : 0,
       );
     return result.changes > 0;
   }
@@ -360,6 +363,19 @@ export class WatchdogStore {
       this.db.prepare(`SELECT 1 FROM watchdog_escalations WHERE breach_id = ?`).get(breachId) !==
       undefined
     );
+  }
+
+  /** When a breach with this key was last escalated (not suppressed), or null. */
+  lastEscalationForKey(project: string, key: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT e.created_at FROM watchdog_escalations e
+         JOIN watchdog_breaches b ON b.id = e.breach_id
+         WHERE e.project = ? AND b.key = ? AND e.suppressed = 0
+         ORDER BY e.created_at DESC, e.rowid DESC LIMIT 1`,
+      )
+      .get(project, key) as { created_at: string } | undefined;
+    return row?.created_at ?? null;
   }
 
   listEscalations(project: string, options: { limit?: number } = {}): Escalation[] {
@@ -375,6 +391,7 @@ export class WatchdogStore {
       createdAt: row.created_at,
       file: row.file ?? undefined,
       text: row.text,
+      suppressed: row.suppressed === 1,
     }));
   }
 

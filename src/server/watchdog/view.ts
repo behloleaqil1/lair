@@ -28,6 +28,8 @@ export interface WatchdogContext {
   settings: WatchdogSettings;
   probes: Probes;
   store: WatchdogStore;
+  /** Aborted by Watchdog.stop(): waits end early and no further action starts */
+  signal?: AbortSignal;
 }
 
 export interface AgentLog {
@@ -71,27 +73,6 @@ export function parsePid(text: string | null): number | null {
   if (!match) return null;
   const pid = Number(match[1]);
   return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
-}
-
-/** A queue line's time: full ISO, or HH:MMZ read as its latest occurrence at or before `now`. */
-export function queueLineTime(timestamp: string | undefined, now: number): number | null {
-  if (!timestamp) return null;
-  if (timestamp.includes("T")) {
-    const ms = Date.parse(timestamp);
-    return Number.isNaN(ms) ? null : ms;
-  }
-  const match = timestamp.match(/^(\d{2}):(\d{2})Z$/);
-  if (!match) return null;
-  const day = new Date(now);
-  let ms = Date.UTC(
-    day.getUTCFullYear(),
-    day.getUTCMonth(),
-    day.getUTCDate(),
-    Number(match[1]),
-    Number(match[2]),
-  );
-  if (ms > now) ms -= 24 * 3600 * 1000;
-  return ms;
 }
 
 export function isSafeLane(lane: unknown): lane is string {
@@ -167,9 +148,36 @@ export class ProjectView {
   }
 
   /**
-   * The processes attributed to an agent through watchdog.agent_command,
-   * oldest first. A match whose ancestor is also a match for the same agent
-   * (a wrapper and its child) counts once, as the ancestor.
+   * The machine an agent runs on, and whether that is this machine (the only
+   * one whose processes `ps` shows). The machine is the agent's
+   * `dragons.<id>.machine`; unset means "local". It is local when
+   * `machines.<id>.type` is "local", or when it is "local" and not listed in
+   * machines:. Any other machine (ssh, or unknown) is remote: its agents'
+   * processes are unknown here, never "dead".
+   */
+  agentMachine(agentId: string): { machine: string; local: boolean } {
+    const raw = this.config.dragons?.[agentId]?.machine;
+    const machine = typeof raw === "string" && raw.trim() !== "" ? raw.trim() : "local";
+    const configured = this.config.machines?.[machine];
+    if (configured) return { machine, local: configured.type === "local" };
+    return { machine, local: machine === "local" };
+  }
+
+  isLocalAgent(agentId: string): boolean {
+    return this.agentMachine(agentId).local;
+  }
+
+  /** Known agents that run on this machine. */
+  localAgentIds(): string[] {
+    return this.agentIds().filter((id) => this.isLocalAgent(id));
+  }
+
+  /**
+   * The local processes attributed to an agent through
+   * watchdog.agent_command, oldest first. A match whose ancestor is also a
+   * match for the same agent (a wrapper and its child) counts once, as the
+   * ancestor. Only meaningful for local agents (isLocalAgent): callers must
+   * not read "no process" as "dead" for a remote one.
    */
   async agentProcesses(agentId: string): Promise<ProcessInfo[]> {
     const pattern = this.settings.agentCommand;
@@ -192,14 +200,23 @@ export class ProjectView {
     });
   }
 
-  /** Agents (known ids or claim holders) with at least one live process. */
-  async liveAgents(): Promise<string[]> {
-    const ids = new Set([...this.agentIds(), ...this.claims().map((c) => c.agent)]);
-    const live: string[] = [];
+  /**
+   * Agents counted as running: a local agent (known id or claim holder) with
+   * a live process, or a remote agent with a claim (its process can't be
+   * seen from here, so its claim is the signal).
+   */
+  async runningAgents(): Promise<string[]> {
+    const claimed = new Set(this.claims().map((c) => c.agent));
+    const ids = new Set([...this.agentIds(), ...claimed]);
+    const running: string[] = [];
     for (const id of ids) {
-      if ((await this.agentProcesses(id)).length > 0) live.push(id);
+      if (this.isLocalAgent(id)) {
+        if ((await this.agentProcesses(id)).length > 0) running.push(id);
+      } else if (claimed.has(id)) {
+        running.push(id);
+      }
     }
-    return live.sort();
+    return running.sort();
   }
 
   /** The newest <id>.log / <id>-<UTC>.log in agents_dir, by mtime. */

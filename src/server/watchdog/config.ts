@@ -79,6 +79,8 @@ const WatchdogSchema = z
     merged_cmd: argv.optional(),
     docker_cmd: argv.default(["docker"]),
     escalation_file: z.string().min(1).optional(),
+    /** A breach key escalated less than this long ago is not escalated again (0: always) */
+    reescalate_minutes: z.number().min(0).default(60),
     disabled_detectors: z.array(z.enum(DETECTOR_IDS)).default([]),
     locks: z.array(LockSchema).default([]),
     containers: z.array(ContainerSchema).default([]),
@@ -121,6 +123,7 @@ export interface WatchdogSettings {
   mergedCmd?: string[];
   dockerCmd: string[];
   escalationFile?: string;
+  reescalateMinutes: number;
   disabledDetectors: DetectorId[];
   locks: LockSettings[];
   containers: ContainerSettings[];
@@ -248,6 +251,7 @@ export function parseWatchdogConfig(raw: unknown): ParseResult {
       mergedCmd: value.merged_cmd,
       dockerCmd: value.docker_cmd,
       escalationFile: value.escalation_file,
+      reescalateMinutes: value.reescalate_minutes,
       disabledDetectors: value.disabled_detectors,
       locks: value.locks.map((lock) => ({
         name: lock.name,

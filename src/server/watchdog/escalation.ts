@@ -66,14 +66,29 @@ export class Escalator {
 
   /**
    * Escalate a breach unless it already was. Returns true when this call
-   * wrote the escalation.
+   * wrote the escalation. A breach whose key was escalated less than
+   * watchdog.reescalate_minutes ago (it cleared and came back) is recorded as
+   * suppressed instead, so a flapping condition doesn't flood the inbox.
    */
   async escalate(breach: Breach, reason: string, run?: PlaybookRun): Promise<boolean> {
-    const { store, project, probes } = this.ctx;
+    const { store, project, probes, settings } = this.ctx;
     if (store.hasEscalation(breach.id)) return false;
 
-    const at = new Date(probes.clock.now()).toISOString();
+    const now = probes.clock.now();
+    const at = new Date(now).toISOString();
     const text = formatEscalation(project, breach, reason, at, run);
+    const previous = settings.reescalateMinutes > 0 ? store.lastEscalationForKey(project, breach.key) : null;
+    if (previous && now - Date.parse(previous) < settings.reescalateMinutes * 60000) {
+      store.recordEscalation({
+        project,
+        breachId: breach.id,
+        createdAt: at,
+        text: `${text}  - suppressed: ${breach.key} was escalated at ${previous} (watchdog.reescalate_minutes: ${settings.reescalateMinutes})\n`,
+        suppressed: true,
+      });
+      store.markEscalated(breach.id, at);
+      return false;
+    }
     const file = this.target;
     let writeError: string | undefined;
     if (file) {

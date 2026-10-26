@@ -175,6 +175,11 @@ export interface Escalation {
   /** The inbox file written, or undefined when none is configured */
   file?: string;
   text: string;
+  /**
+   * Not written: the same breach key was escalated less than
+   * watchdog.reescalate_minutes ago (a flapping breach)
+   */
+  suppressed?: boolean;
 }
 
 export type SloState = "ok" | "breached" | "inactive" | "error";

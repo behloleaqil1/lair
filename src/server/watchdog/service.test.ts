@@ -89,4 +89,14 @@ describe("Watchdog lifecycle", () => {
     await expect(tick).resolves.toMatchObject({ findings: 0 });
     expect(store!.sloStatus("demo")).toHaveLength(9);
   });
+
+  it("is running only between start() and stop()", async () => {
+    const { wd, release } = blockedWatchdog();
+    release();
+    expect(wd.running).toBe(false);
+    wd.start();
+    expect(wd.running).toBe(true);
+    await wd.stop();
+    expect(wd.running).toBe(false);
+  });
 });

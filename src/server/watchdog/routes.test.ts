@@ -90,7 +90,8 @@ describe("watchdog routes", () => {
     expect(escalations.data).toHaveLength(1);
 
     const status = (await app.inject({ url: "/api/watchdog/status" })).json();
-    expect(status.data).toMatchObject({ project: "watched", enabled: true, mode: "observe" });
+    // ticked by hand here, never start()ed
+    expect(status.data).toMatchObject({ project: "watched", enabled: true, running: false, mode: "observe" });
     expect(status.data.actBlocked).toBe("watchdog.mode is observe");
     expect(status.data.slos).toHaveLength(9);
     expect(status.data.slos.find((s: { detector: string }) => s.detector === "orphan_claim")).toMatchObject({

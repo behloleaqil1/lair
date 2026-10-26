@@ -48,6 +48,7 @@ export class Watchdog {
   private timer: NodeJS.Timeout | null = null;
   private ticking: Promise<TickSummary> | null = null;
   private stopped = true;
+  private abort = new AbortController();
   lastTick?: TickSummary;
   lastError?: string;
 
@@ -60,6 +61,7 @@ export class Watchdog {
       settings: options.settings,
       probes: options.probes,
       store: options.store,
+      signal: this.abort.signal,
     };
     this.engine = new PlaybookEngine(this.ctx, options.events);
     this.escalator = new Escalator(this.ctx, options.events);
@@ -72,6 +74,11 @@ export class Watchdog {
   /** Why act mode is off for this project, or null when it is on. */
   get actBlocked(): string | null {
     return actBlockedReason(this.ctx.config, this.ctx.settings);
+  }
+
+  /** True between start() and stop(). */
+  get running(): boolean {
+    return !this.stopped;
   }
 
   private iso(ms = this.ctx.probes.clock.now()): string {
@@ -98,6 +105,7 @@ export class Watchdog {
     const statuses: SloStatus[] = [];
     const findings = new Map<string, Finding>();
     const evaluated = new Set<DetectorId>();
+    const errored = new Set<DetectorId>();
     for (const detector of DETECTORS) {
       const inactive = settings.disabledDetectors.includes(detector.id)
         ? "disabled in watchdog.disabled_detectors"
@@ -120,6 +128,7 @@ export class Watchdog {
           checkedAt: at,
         });
       } catch (e) {
+        errored.add(detector.id);
         statuses.push({
           detector: detector.id,
           state: "error",
@@ -165,8 +174,12 @@ export class Watchdog {
       }
     }
 
-    // 3. Handle open breaches
+    // 3. Handle open breaches. Skip those whose detector failed this tick (a
+    // probe error): no playbook on stale data, no attempt used up, no
+    // escalation. Stop handling once the watchdog is stopping.
     for (const breach of store.openBreaches(project)) {
+      if (this.ctx.signal?.aborted) break;
+      if (errored.has(breach.detector)) continue;
       const handled = await this.handle(breach);
       summary.runs += handled.runs;
       summary.escalations += handled.escalations;
@@ -193,7 +206,7 @@ export class Watchdog {
     let escalations = 0;
 
     const escalate = async (reason: string, run?: PlaybookRun) => {
-      if (breach.escalatedAt) return;
+      if (breach.escalatedAt || this.ctx.signal?.aborted) return;
       if (await this.escalator.escalate(breach, reason, run)) escalations++;
     };
 
@@ -209,9 +222,14 @@ export class Watchdog {
       return { runs: 0, escalations };
     }
 
-    // Act: the first opted-in playbook with attempts left, after its cooldown
+    // Act: the first opted-in playbook with attempts left, after its cooldown.
+    // An attempt is a run that reached its act step; a run that stopped at
+    // diagnose (a probe error) or before acting (a stop) doesn't use one up.
     const now = probes.clock.now();
-    const actRuns = () => store.runsForBreach(breach.id).filter((r) => r.mode === "act");
+    const actRuns = () =>
+      store
+        .runsForBreach(breach.id)
+        .filter((r) => r.mode === "act" && r.steps.some((s) => s.type === "act" && s.status !== "skipped"));
     const runs = actRuns();
     for (const playbook of optedIn) {
       const playbookSettings = settings.playbooks[playbook.id];
@@ -245,7 +263,7 @@ export class Watchdog {
     if (last) {
       const cooldown = settings.playbooks[last.playbookId].cooldownMinutes * 60000;
       if (last.status === "failed" || now - Date.parse(last.startedAt) >= cooldown) {
-        await escalate(`Still detected after ${runs.length} playbook run(s).`, last);
+        await escalate(`Still detected after ${runs.length} playbook attempt(s).`, last);
       }
     }
     return { runs: 0, escalations };
@@ -262,6 +280,10 @@ export class Watchdog {
   start(): void {
     if (!this.stopped) return;
     this.stopped = false;
+    if (this.abort.signal.aborted) {
+      this.abort = new AbortController();
+      this.ctx.signal = this.abort.signal;
+    }
     const loop = async () => {
       if (this.stopped) return;
       try {
@@ -278,9 +300,13 @@ export class Watchdog {
     this.timer.unref();
   }
 
-  /** Stop ticking; resolves once a tick in progress has finished. */
+  /**
+   * Stop ticking. A tick in progress ends early: a verify delay is cut short
+   * and no further action starts. Resolves once that tick has finished.
+   */
   async stop(): Promise<void> {
     this.stopped = true;
+    this.abort.abort();
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
@@ -400,7 +426,7 @@ export class WatchdogManager {
     return {
       project,
       enabled: watchdog !== undefined,
-      running: watchdog !== undefined && this.store !== null,
+      running: watchdog?.running ?? false,
       mode: settings?.mode ?? null,
       actBlocked: watchdog ? watchdog.actBlocked : null,
       errors: this.problems.get(project) ?? [],

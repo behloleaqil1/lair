@@ -42,11 +42,22 @@ const MIN = 60_000;
 
 class FakeClock implements Clock {
   t = NOW;
+  sleeps = 0;
+  /** Make sleep() a long real wait that only an abort ends */
+  blockSleeps = false;
   now(): number {
     return this.t;
   }
-  async sleep(ms: number): Promise<void> {
-    this.t += ms;
+  async sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    this.sleeps++;
+    if (!this.blockSleeps) {
+      this.t += ms;
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      if (signal?.aborted) resolve();
+      signal?.addEventListener("abort", () => resolve(), { once: true });
+    });
   }
   advance(ms: number): void {
     this.t += ms;
@@ -55,6 +66,11 @@ class FakeClock implements Clock {
 
 class FakeProcessTable implements ProcessTable {
   procs: ProcessInfo[] = [];
+  listCalls = 0;
+  /** `ps` is broken: list() fails */
+  failing = false;
+  /** Runs inside list() call n, before it answers (to change state mid-tick) */
+  onList?: (call: number) => void;
   add(pid: number, command: string, options: { ppid?: number; upMinutes?: number } = {}): void {
     this.procs.push({
       pid,
@@ -68,8 +84,19 @@ class FakeProcessTable implements ProcessTable {
     this.procs = this.procs.filter((p) => p.pid !== pid);
   }
   async list(): Promise<ProcessInfo[]> {
+    this.listCalls++;
+    if (this.failing) throw new Error("ps failed (1): ps: cannot read process table");
+    this.onList?.(this.listCalls);
     return this.procs.map((p) => ({ ...p, argv: [...p.argv] }));
   }
+}
+
+/** Let pending promises run until `condition` holds. */
+async function until(condition: () => boolean): Promise<void> {
+  for (let i = 0; i < 200 && !condition(); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  expect(condition()).toBe(true);
 }
 
 interface Handler {
@@ -162,7 +189,7 @@ function makePaths(): Paths {
 
 function setup(
   watchdog: (p: Paths) => Record<string, unknown>,
-  options: { readOnly?: boolean; paths?: Paths; store?: WatchdogStore } = {},
+  options: { readOnly?: boolean; paths?: Paths; store?: WatchdogStore; remote?: boolean } = {},
 ): Harness {
   const paths = options.paths ?? makePaths();
   const config: ProjectConfig = {
@@ -172,12 +199,30 @@ function setup(
     queue_file: paths.queueFile,
     agents_dir: paths.agentsDir,
     gates_dir: paths.gatesDir,
-    machines: {},
+    // remote: worker-r runs on an ssh machine, worker-u on a machine not listed here
+    machines: options.remote
+      ? {
+          "build-server": {
+            name: "Build Server",
+            type: "ssh",
+            host: "198.51.100.10",
+            user: "deploy",
+            key: "~/.ssh/example_key",
+            runners: [],
+          },
+        }
+      : {},
     read_only: options.readOnly ?? false,
     inbox_file: paths.inboxFile,
     dragons: {
       "worker-a": { name: "A", model: "test-model", machine: "local", instructions: "" },
       "worker-b": { name: "B", model: "test-model", machine: "local", instructions: "" },
+      ...(options.remote
+        ? {
+            "worker-r": { name: "R", model: "test-model", machine: "build-server", instructions: "" },
+            "worker-u": { name: "U", model: "test-model", machine: "gpu-box", instructions: "" },
+          }
+        : {}),
     },
     watchdog: { enabled: true, agent_command: AGENT_COMMAND, ...watchdog(paths) },
   };
@@ -369,6 +414,23 @@ describe("1. lock whose holder is dead, while agents wait", () => {
     expect(existsSync(h.lockDir)).toBe(true);
   });
 
+  it("the act guard re-checks: a holder that comes back after diagnose is not broken", async () => {
+    const h = setup(withLock(act("stale_lock")));
+    staleLock(h);
+    // ps call 1: the tick's detection, 2: the diagnose re-check, 3: the act guard
+    h.procs.onList = (call) => {
+      if (call === 3) h.procs.add(4001, "gate-runner --lane heavy");
+    };
+
+    await h.wd.tick();
+
+    expect(h.runner.calls).toEqual([]);
+    const [run] = runs(h);
+    expect(steps(run)).toEqual(["diagnose:succeeded", "act:failed", "verify:skipped"]);
+    expect(run.steps[1].error).toBe("refused: holder pid 4001 is running");
+    expect(existsSync(h.lockDir)).toBe(true);
+  });
+
   it("a lock with no pid is stale only past its lease", async () => {
     const young = setup(withLock(act("stale_lock")));
     staleLock(young, { pid: false, ageMinutes: 10 });
@@ -533,6 +595,89 @@ describe("3. hung agent: alive, log silent, not WAITING on a gate", () => {
     expect(readFileSync(h.inboxFile, "utf-8")).toContain("session busy");
     expect(breaches(h)[0]).toMatchObject({ status: "open" });
   });
+
+  it("the act guard re-checks: an agent that goes WAITING after diagnose is not restarted", async () => {
+    const h = setup(act("agent_stuck"));
+    hung(h);
+    restarts(h);
+    // ps call 1: the tick's detection, 2: the diagnose re-check, 3: the act guard
+    h.procs.onList = (call) => {
+      if (call === 3) queueLine(h, `- WAITING login-fix ${GATE_A} by worker-a 11:59Z: gate queued on heavy`);
+    };
+
+    await h.wd.tick();
+
+    expect(h.runner.calls).toEqual([]);
+    const [run] = runs(h);
+    expect(steps(run)).toEqual(["diagnose:succeeded", "act:failed", "verify:skipped"]);
+    expect(run.steps[1].error).toBe(`refused: agent worker-a is WAITING on gate ${GATE_A}`);
+  });
+
+  it("a ps failure skips the breach that tick: no playbook, no attempt used up", async () => {
+    const h = setup(act("agent_stuck"));
+    hung(h);
+    h.runner.when((a) => a[0] === "./bin/restart-agent", {
+      reply: () => ({ code: 3, stdout: "", stderr: "session busy" }),
+    });
+    const argv = ["./bin/restart-agent", "worker-a", "3001"];
+
+    await h.wd.tick(); // attempt 1 fails
+    h.clock.advance(11 * MIN);
+    h.procs.failing = true;
+    await h.wd.tick(); // ps fails: the open breach is left alone
+    expect(h.runner.calls).toEqual([argv]);
+    expect(runs(h)).toHaveLength(1);
+    expect(sloState(h, "agent_hung")).toBe("error");
+    expect(breaches(h)[0].status).toBe("open");
+    expect(inboxEntries(h)).toEqual([]);
+
+    h.procs.failing = false;
+    await h.wd.tick(); // attempt 2 of 2, then the one escalation
+    expect(h.runner.calls).toEqual([argv, argv]);
+    expect(runs(h).map((r) => r.attempt)).toEqual([2, 1]);
+    expect(inboxEntries(h)).toHaveLength(1);
+  });
+
+  it("a ps failure during diagnose ends the run before acting, without using up an attempt", async () => {
+    const h = setup(act("agent_stuck"));
+    hung(h);
+    restarts(h);
+    h.procs.onList = (call) => {
+      if (call === 2) throw new Error("ps failed (1): interrupted");
+    };
+
+    await h.wd.tick(); // diagnose fails: nothing runs
+    expect(h.runner.calls).toEqual([]);
+    await h.wd.tick(); // no cooldown or attempt was used: attempt 1 runs
+    expect(h.runner.calls).toEqual([["./bin/restart-agent", "worker-a", "3001"]]);
+    expect(runs(h).map((r) => [r.attempt, r.outcome, steps(r)])).toEqual([
+      [1, "recovered", ["diagnose:succeeded", "act:succeeded", "verify:succeeded"]],
+      [1, "failed", ["diagnose:failed", "act:skipped", "verify:skipped"]],
+    ]);
+    expect(inboxEntries(h)).toEqual([]);
+  });
+
+  it("stop() during the verify delay returns promptly; the action stands, verify is left to later ticks", async () => {
+    const h = setup(act("agent_stuck"));
+    hung(h);
+    restarts(h);
+    h.clock.blockSleeps = true;
+
+    const tick = h.wd.tick();
+    await until(() => h.clock.sleeps === 1); // restarted, now waiting 30 s to verify
+    const started = Date.now();
+    await h.wd.stop();
+    expect(Date.now() - started).toBeLessThan(1000);
+    await tick;
+
+    expect(h.runner.calls).toEqual([["./bin/restart-agent", "worker-a", "3001"]]);
+    const [run] = runs(h);
+    expect(run).toMatchObject({ status: "succeeded", outcome: "acted" });
+    expect(steps(run)).toEqual(["diagnose:succeeded", "act:succeeded", "verify:skipped"]);
+    expect(run.steps[2].output).toBe("watchdog stopping: left to later ticks");
+    expect(breaches(h)[0].status).toBe("open");
+    expect(inboxEntries(h)).toEqual([]);
+  });
 });
 
 // ============ 4. ORPHAN CLAIMS ============
@@ -639,6 +784,24 @@ describe("5. the same failure in gates of different tracks on one lane", () => {
       detector: "infra_signature",
       plannedArgv: ["./bin/lane-broken", "heavy"],
     });
+  });
+
+  it("a failure text starting with dashes never reaches the command as an option", async () => {
+    const h = setup(
+      act("lane_broken", {
+        actions: { ...ACTIONS, mark_lane_broken: ["./bin/lane-broken", "{lane}", "{signature}"] },
+      }),
+    );
+    const flagLike = "--- error: --force-reset lane storage unavailable";
+    failedGate(h, "20260302T111000Z-login-fix-abc1234-501", 10, flagLike);
+    failedGate(h, "20260302T112000Z-search-panel-def5678-502", 20, flagLike);
+    failedGate(h, "20260302T113000Z-billing-page-0a1b2c3-503", 30, flagLike);
+
+    await h.wd.tick();
+
+    expect(h.runner.calls).toEqual([
+      ["./bin/lane-broken", "heavy", "error: --force-reset lane storage unavailable"],
+    ]);
   });
 
   it("two identical failures (not three) don't mark the lane", async () => {
@@ -803,6 +966,34 @@ describe("8. no merge for 4 h while work is queued (read from the queue file)", 
     aged(join(h.agentsDir, "worker-a.log"), 1, "working\n");
   }
 
+  it("an undated (HH:MMZ) MERGED line can't pass for a recent merge: merged_cmd decides", async () => {
+    // "11:30Z" may be from any day; read as today it would look 30 min old
+    const h = setup(act("no_merges", { merged_cmd: ["./bin/last-merge"] }));
+    stalled(h, "11:30Z");
+    h.runner.when((a) => a[0] === "./bin/last-merge", {
+      reply: () => ({ code: 0, stdout: "2026-03-02T05:30:00Z\n", stderr: "" }),
+    });
+
+    await h.wd.tick();
+
+    // the tick's detection, the diagnose re-check, then the action
+    expect(h.runner.calls).toEqual([["./bin/last-merge"], ["./bin/last-merge"], ["./bin/triage", "6.5"]]);
+  });
+
+  it("without merged_cmd, an undated latest MERGED line means the last merge is unknown", async () => {
+    const h = setup(act("no_merges"));
+    queueLine(h, "- MERGED #39 docs-fix by worker-a 2026-03-01T20:00:00Z: merged"); // 16 h ago
+    stalled(h, "11:30Z"); // later in the file, but undated
+
+    await h.wd.tick();
+
+    expect(h.runner.calls).toEqual([]);
+    expect(breaches(h)).toEqual([]);
+    const slo = h.store.sloStatus("demo").find((s) => s.detector === "progress_stall");
+    expect(slo).toMatchObject({ state: "ok" });
+    expect(slo?.detail).toContain("the latest MERGED line has no date");
+  });
+
   it("act: runs the triage command", async () => {
     const h = setup(act("no_merges"));
     stalled(h, "2026-03-02T06:30:00Z");
@@ -964,17 +1155,26 @@ describe("modes: act needs mode act, read_only false and the playbook's opt-in",
     expect(h.store.listEscalations("demo")[0].file).toBe(join(h.dir, "decisions.md"));
   });
 
-  it("a breach that clears is resolved, and a new one is escalated again", async () => {
+  it("a cleared breach that comes back is escalated again only after reescalate_minutes", async () => {
     const h = setup(observe());
     const claim = orphan(h);
-    await h.wd.tick();
+    await h.wd.tick(); // escalated
     rmSync(claim, { recursive: true });
     await h.wd.tick();
     expect(breaches(h)[0]).toMatchObject({ status: "resolved", resolution: "cleared" });
 
     aged(claim, 30, null);
+    h.clock.advance(10 * MIN);
+    await h.wd.tick(); // back within 60 min: recorded, not written
+    expect(inboxEntries(h)).toHaveLength(1);
+    expect(h.store.listEscalations("demo").map((e) => e.suppressed)).toEqual([true, false]);
+
+    rmSync(claim, { recursive: true });
     await h.wd.tick();
-    expect(breaches(h).map((b) => b.status)).toEqual(["open", "resolved"]);
+    aged(claim, 30, null);
+    h.clock.advance(61 * MIN);
+    await h.wd.tick(); // back after more than 60 min: escalated
+    expect(breaches(h).map((b) => b.status)).toEqual(["open", "resolved", "resolved"]);
     expect(inboxEntries(h)).toHaveLength(2);
   });
 
@@ -986,5 +1186,53 @@ describe("modes: act needs mode act, read_only false and the playbook's opt-in",
     expect(sloState(h, "orphan_claim")).toBe("inactive");
     expect(sloState(h, "agent_hung")).toBe("inactive");
     expect(sloState(h, "duplicate_agent")).toBe("inactive");
+  });
+});
+
+// ============ REMOTE AGENTS ============
+
+describe("remote agents: the local process table says nothing about them", () => {
+  it("never releases a remote agent's claim, even in act mode", async () => {
+    const h = setup(act("orphan_claim"), { remote: true });
+    const onSsh = aged(join(h.agentsDir, "worker-r.running"), 120, null);
+    const onUnlisted = aged(join(h.agentsDir, "worker-u.running"), 120, null);
+    h.runner.when((a) => a[0] === "./bin/release-claim", {
+      effect: (a) => rmSync(a[2], { recursive: true, force: true }),
+    });
+
+    await h.wd.tick();
+
+    expect(h.runner.calls).toEqual([]);
+    expect(breaches(h)).toEqual([]);
+    expect(existsSync(onSsh)).toBe(true);
+    expect(existsSync(onUnlisted)).toBe(true);
+    const slo = h.store.sloStatus("demo").find((s) => s.detector === "orphan_claim");
+    expect(slo?.detail).toBe("not checked (remote agents): worker-r (build-server), worker-u (gpu-box)");
+  });
+
+  it("counts a remote agent with a claim as running for idle capacity", async () => {
+    const h = setup(act("idle_capacity", { max_agents: 1 }), { remote: true });
+    aged(join(h.agentsDir, "worker-r.running"), 120, null);
+    aged(join(h.queueDir, "light.2.20260302T113000Z-docs-fix-abc1234-301.req"), 15);
+
+    await h.wd.tick();
+
+    expect(h.runner.calls).toEqual([]);
+    expect(breaches(h)).toEqual([]);
+    const slo = h.store.sloStatus("demo").find((s) => s.detector === "idle_capacity");
+    expect(slo?.detail).toContain("1 agent(s) running of max 1");
+  });
+
+  it("ignores local processes that match a remote agent (an ssh wrapper is not the agent)", async () => {
+    const h = setup(act("duplicate_agent", { playbooks: { duplicate_agent: { act: true }, agent_stuck: { act: true } } }), {
+      remote: true,
+    });
+    h.procs.add(9001, `ssh build-server ${agentCmd("worker-r")}`, { upMinutes: 300 });
+    h.procs.add(9002, `ssh build-server ${agentCmd("worker-r")}`, { upMinutes: 200 });
+
+    await h.wd.tick();
+
+    expect(h.runner.calls).toEqual([]);
+    expect(breaches(h)).toEqual([]);
   });
 });

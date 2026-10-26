@@ -22,6 +22,7 @@ describe("parseWatchdogConfig", () => {
       idleMinutes: 10,
       stallHours: 4,
       infraMinTracks: 3,
+      reescalateMinutes: 60,
       dockerCmd: ["docker"],
       locks: [],
       containers: [],
@@ -149,6 +150,19 @@ describe("argv templates", () => {
       error: "watchdog.actions.restart_agent: placeholder {gate} is not allowed",
     });
   });
+
+  it("refuses a value that would turn an argument into an option", () => {
+    expect(buildArgv("mark_lane_broken", ["./mark", "{lane}", "{signature}"], { lane: "heavy", signature: "-rf /" })).toEqual({
+      error: 'watchdog.actions.mark_lane_broken: the value of {signature} starts with "-" and would be read as an option',
+    });
+    expect(buildArgv("restart_agent", ["./restart", "{log}"], { log: "--help" })).toMatchObject({
+      error: expect.stringContaining("{log}"),
+    });
+    // A value inside an argument, or after the template's own dash, is data
+    expect(
+      buildArgv("mark_lane_broken", ["./mark", "--signature={signature}", "x{signature}"], { signature: "-rf" }),
+    ).toEqual({ argv: ["./mark", "--signature=-rf", "x-rf"] });
+  });
 });
 
 describe("failure signatures", () => {
@@ -170,6 +184,11 @@ describe("failure signatures", () => {
       "error: later line",
     ].join("\n");
     expect(failureSignature(log)).toBe("fatal: unable to access remote: could not resolve host");
+  });
+
+  it("drops leading dashes, so the text never reads as an option", () => {
+    expect(normaliseFailure("--- FAIL: error in TestLogin")).toBe("fail: error in testlogin");
+    expect(failureSignature("-- error: --force-reset storage\n")).toBe("error: --force-reset storage");
   });
 
   it("prefers the result JSON's error, and returns null without an error line", () => {

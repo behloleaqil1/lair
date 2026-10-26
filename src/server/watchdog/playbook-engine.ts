@@ -65,13 +65,33 @@ export class PlaybookEngine {
     let outcome: RunOutcome | undefined;
     let error: string | undefined;
 
+    const signal = this.ctx.signal;
     for (const step of playbook.steps) {
       if (stopped) {
         steps.push({ stepId: step.id, type: step.type, status: "skipped" });
         continue;
       }
+      // The watchdog is stopping: start no action, and don't wait to verify one
+      if (step.type === "act" && signal?.aborted) {
+        steps.push({ stepId: step.id, type: step.type, status: "skipped", output: "watchdog stopping: not acting" });
+        failed = true;
+        stopped = true;
+        error = "stopped before acting";
+        continue;
+      }
       if (step.type === "verify" && step.check !== "deferred" && settings.verifyDelaySeconds > 0) {
-        await probes.clock.sleep(settings.verifyDelaySeconds * 1000);
+        await probes.clock.sleep(settings.verifyDelaySeconds * 1000, signal);
+      }
+      if (step.type === "verify" && signal?.aborted) {
+        steps.push({
+          stepId: step.id,
+          type: step.type,
+          status: "skipped",
+          output: "watchdog stopping: left to later ticks",
+        });
+        outcome = "acted";
+        stopped = true;
+        continue;
       }
       const startedAt = this.iso();
       let result: StepOutcome;

@@ -6,7 +6,7 @@
 import { createHash } from "crypto";
 import { basename, join } from "path";
 import type { DetectorId, Finding } from "./types.js";
-import { isSafeLane, parsePid, queueLineTime, type ProjectView, type WatchdogContext } from "./view.js";
+import { isSafeLane, parsePid, type ProjectView, type WatchdogContext } from "./view.js";
 
 export interface DetectorResult {
   findings: Finding[];
@@ -84,7 +84,7 @@ const duplicateAgent: Detector = {
   inactiveReason: (ctx) => (ctx.settings.agentCommand ? null : NO_AGENT_PATTERN),
   async detect(view) {
     const findings: Finding[] = [];
-    for (const agent of view.agentIds()) {
+    for (const agent of view.localAgentIds()) {
       const procs = await view.agentProcesses(agent);
       if (procs.length < 2) continue;
       const [keep, ...extra] = procs;
@@ -113,7 +113,7 @@ const agentHung: Detector = {
   async detect(view) {
     const findings: Finding[] = [];
     const limit = view.settings.hungMinutes;
-    for (const agent of view.agentIds()) {
+    for (const agent of view.localAgentIds()) {
       const procs = await view.agentProcesses(agent);
       if (procs.length === 0) continue;
       const gate = view.waitingOn(agent);
@@ -153,7 +153,13 @@ const orphanClaim: Detector = {
   inactiveReason: (ctx) => (ctx.settings.agentCommand ? null : NO_AGENT_PATTERN),
   async detect(view) {
     const findings: Finding[] = [];
+    const remote: string[] = [];
     for (const claim of view.claims()) {
+      // A remote agent's process is not in the local process table: unknown, never "dead"
+      if (!view.isLocalAgent(claim.agent)) {
+        remote.push(`${claim.agent} (${view.agentMachine(claim.agent).machine})`);
+        continue;
+      }
       if ((await view.agentProcesses(claim.agent)).length > 0) continue; // live agent: never touched
       const age = view.minutesSince(claim.mtimeMs);
       if (age < view.settings.claimGraceMinutes) continue;
@@ -168,7 +174,13 @@ const orphanClaim: Detector = {
         vars: { agent: claim.agent, claim: claim.path },
       });
     }
-    return { findings };
+    return {
+      findings,
+      detail:
+        remote.length > 0
+          ? `not checked (remote agents): ${remote.join(", ")}`
+          : undefined,
+    };
   },
 };
 
@@ -188,7 +200,11 @@ const ERROR_TEXT =
   /\b(error|fatal|failed|failure|cannot|can't|unable|refused|timed? ?out|no space|out of memory|oom|killed|denied|unreachable|panic|exception)\b/i;
 const GATE_ID = /^(\d{8}T\d{6}Z)-([a-zA-Z0-9-]+)-([a-f0-9]+)-(\d+)$/;
 
-/** Normalise failure text so the same failure on different gates compares equal. */
+/**
+ * Normalise failure text so the same failure on different gates compares
+ * equal. Leading dashes are dropped ("--- FAIL: x" -> "fail: x"), so the
+ * text never reads as an option when passed to a command as {signature}.
+ */
 export function normaliseFailure(text: string, tokens: string[] = []): string {
   let s = text;
   for (const token of [...tokens].filter((t) => t.length >= 3).sort((a, b) => b.length - a.length)) {
@@ -200,6 +216,7 @@ export function normaliseFailure(text: string, tokens: string[] = []): string {
     .replace(/\b(?=[0-9a-f]*\d)[0-9a-f]{7,}\b/gi, "<hex>")
     .replace(/\d+/g, "<n>")
     .replace(/\s+/g, " ")
+    .replace(/^[\s-]+/, "")
     .trim()
     .toLowerCase()
     .slice(0, 300);
@@ -338,8 +355,9 @@ const idleCapacity: Detector = {
     const ready = await view.readyTasks();
     const work = queued.length + ready.length;
     const claims = view.claims();
+    // Local agents count by their live process, remote ones by their claim
     const running = view.hasAgentPattern()
-      ? (await view.liveAgents()).length
+      ? (await view.runningAgents()).length
       : new Set(claims.map((c) => c.agent)).size;
     const free = s.maxAgents !== undefined ? running < s.maxAgents : running === 0;
     const holds = work > 0 && free;
@@ -351,7 +369,7 @@ const idleCapacity: Detector = {
       ...claims.map((c) => c.mtimeMs),
       ...requests.filter((r) => r.gate.status === "running").map((r) => r.mtimeMs),
     ];
-    for (const agent of view.agentIds()) {
+    for (const agent of view.localAgentIds()) {
       for (const proc of await view.agentProcesses(agent)) {
         starts.push(view.now - proc.elapsedSeconds * 1000);
       }
@@ -392,6 +410,8 @@ const idleCapacity: Detector = {
 // ============ 8. PROGRESS STALL ============
 
 const ISO_TIME = /\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})\b/g;
+/** One ISO time (with a zone), for a single queue line */
+const ISO_TIME_ONE = new RegExp(ISO_TIME.source);
 
 const progressStall: Detector = {
   id: "progress_stall",
@@ -400,10 +420,24 @@ const progressStall: Detector = {
   async detect(view) {
     const s = view.settings;
     const merges: number[] = [];
+    // The queue file's last merge is its LAST "- MERGED" line (the file is
+    // appended in time order), and it counts only with a full ISO time: an
+    // HH:MMZ time has no date, so an old line could pass for today's.
+    let lastMerged: { message: string } | undefined;
     for (const line of view.queueLines()) {
-      if (!/^MERGED\b/i.test(line.message)) continue;
-      const at = queueLineTime(line.timestamp, view.now);
-      if (at !== null) merges.push(at);
+      if (/^MERGED\b/i.test(line.message)) lastMerged = line;
+    }
+    let undated: string | null = null;
+    if (lastMerged) {
+      const at = Date.parse(lastMerged.message.match(ISO_TIME_ONE)?.[0] ?? "");
+      if (Number.isNaN(at)) undated = lastMerged.message.slice(0, 80);
+      else merges.push(at);
+    }
+    if (undated !== null && !s.mergedCmd) {
+      return {
+        findings: [],
+        detail: `the latest MERGED line has no date ("${undated}"): write ISO times or set merged_cmd`,
+      };
     }
     if (s.mergedCmd) {
       const out = await view.ctx.probes.runner.run(s.mergedCmd, {

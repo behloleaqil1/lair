@@ -40,7 +40,9 @@ function tail(text: string): string {
 
 /**
  * Fill an argv template. Every placeholder must be one the action allows and
- * that this breach provides.
+ * that this breach provides. Values come from files (log text, file names),
+ * so one that would turn an argument into an option (a leading "-" where the
+ * template has none) is refused rather than passed on.
  */
 export function buildArgv(
   action: ActionId,
@@ -56,9 +58,18 @@ export function buildArgv(
       return { error: `watchdog.actions.${action}: no value for {${name}}` };
     }
   }
-  return {
-    argv: template.map((arg) => arg.replace(/\{([A-Za-z_]+)\}/g, (_, name: string) => vars[name] ?? "")),
-  };
+  const argv: string[] = [];
+  for (const arg of template) {
+    const filled = arg.replace(/\{([A-Za-z_]+)\}/g, (_, name: string) => vars[name] ?? "");
+    if (filled.startsWith("-") && !arg.startsWith("-")) {
+      const name = arg.match(/^\{([A-Za-z_]+)\}/)?.[1] ?? "?";
+      return {
+        error: `watchdog.actions.${action}: the value of {${name}} starts with "-" and would be read as an option`,
+      };
+    }
+    argv.push(filled);
+  }
+  return { argv };
 }
 
 export class StepExecutors {
@@ -147,6 +158,9 @@ export class StepExecutors {
         if (!agent || !view.agentIds().includes(agent)) {
           return `${agent ?? "(none)"} is not a configured agent`;
         }
+        if (!view.isLocalAgent(agent)) {
+          return `agent ${agent} runs on ${view.agentMachine(agent).machine}, whose processes are not visible here`;
+        }
         const procs = await view.agentProcesses(agent);
         if (pid === null || !procs.some((p) => p.pid === pid)) {
           return `pid ${vars.pid ?? "(none)"} is not a live process of agent ${agent}`;
@@ -161,6 +175,9 @@ export class StepExecutors {
       }
       case "release_claim": {
         if (!view.hasAgentPattern()) return "watchdog.agent_command is not set";
+        if (!view.isLocalAgent(vars.agent ?? "")) {
+          return `agent ${vars.agent} runs on ${view.agentMachine(vars.agent ?? "").machine}, so its liveness is unknown here`;
+        }
         const live = await view.agentProcesses(vars.agent ?? "");
         return live.length > 0 ? `agent ${vars.agent} has a live process (pid ${live[0].pid})` : null;
       }

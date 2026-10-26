@@ -67,7 +67,8 @@ export interface CommandRunner {
 export interface Clock {
   /** Milliseconds since the epoch */
   now(): number;
-  sleep(ms: number): Promise<void>;
+  /** Wait `ms`, or less: resolves as soon as `signal` aborts */
+  sleep(ms: number, signal?: AbortSignal): Promise<void>;
 }
 
 export interface Probes {
@@ -212,7 +213,20 @@ export class NodeFileSystem implements FileSystem {
 
 export const systemClock: Clock = {
   now: () => Date.now(),
-  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  sleep: (ms, signal) =>
+    new Promise<void>((resolve) => {
+      if (signal?.aborted) {
+        resolve();
+        return;
+      }
+      const done = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", done);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      signal?.addEventListener("abort", done, { once: true });
+    }),
 };
 
 /** The real probes. */
