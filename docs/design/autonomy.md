@@ -5,8 +5,10 @@ Goal: Lair manages the whole fleet on its own, and any input a human must give g
 file wins for the behaviour it describes. Status: planned, not built, except §2's detectors and playbook engine
 (`src/server/watchdog/`, see [configuration](../configuration.md#watchdog)) and §7's `local` environment as a docker
 compose project (`src/server/delivery/`, see [configuration](../configuration.md#delivery)); the watchdog's escalations
-go to the project's inbox file until the Decision Inbox (§1) exists. Keep everything generic (see
-[CONTRIBUTING.md](../../CONTRIBUTING.md)).
+go to the project's inbox file until the Decision Inbox (§1) exists. §5's risk tiers, reviews, test integrity check
+and policy merge are built (`src/server/review/`, see [configuration](../configuration.md#reviews-and-policy-merge));
+its reviewer requests go out as events until the agents (§6) and Decision Inbox (§1) modules take them, and its weekly
+audit is not built yet. Keep everything generic (see [CONTRIBUTING.md](../../CONTRIBUTING.md)).
 
 ## 0. Principles
 1. **Deterministic core, AI at the edges.** Detection, routing, scheduling, merging and rollback are rules and code.

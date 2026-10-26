@@ -157,6 +157,20 @@ Environments as docker compose projects ([configuration](configuration.md#delive
 - **`store.ts`**: holds, crash loops, restart samples, operations, the last commit seen, the commit each service was deployed at, and the last container names read, in SQLite (`data/delivery.db`)
 - **`service.ts`**, **`routes.ts`**: the per-project tick loop started and stopped by `index.ts`, the `ContainerServices` view the watchdog reads (crash loops and holds), and the `/api/delivery/*` routes
 
+#### Reviews and policy merge (`review/`)
+
+Risk tiers, reviews bound to the head sha, the test integrity check and policy merge ([configuration](configuration.md#reviews-and-policy-merge)). Off unless a project sets `review.enabled`.
+
+- **`config.ts`**: the `review:` block (tier rules, reviewers per tier, integrity options, merge settings)
+- **`host.ts`**, **`github.ts`**: the git host interface and its GitHub REST provider (PRs, files, commits, checks, contents, compare, the host's merge)
+- **`diff.ts`**, **`integrity.ts`**: unified diff hunks, and the test integrity heuristics (self-asserting tests, skips, weakened assertions, removed tests, loosened suites, swallowed errors)
+- **`gate-source.ts`**: the required gate at the exact head, from host checks or from signed gate results (verified by `policy/policy-evaluator.ts`)
+- **`git.ts`**, **`executor.ts`**: git through execFile, the merge method choice, the host merge, the local fast-forward or squash in a fresh clone, and the email allow-list check on every commit to be published
+- **`ports.ts`**: the interfaces other modules implement (Decision Inbox, reviewer assignment), with event-bus defaults
+- **`store.ts`**: reviews, findings, authors, holds, merges and reviewer requests in SQLite (`data/review.db`)
+- **`service.ts`**, **`routes.ts`**: per-project evaluation, reviews, holds and merges, started by `index.ts`, and the `/api/review/*` routes
+- **`testing/`**: stand-ins for the git host API and git used by the tests (not built)
+
 #### Store (`store/`)
 
 - **`store.ts`**: SQLite store (better-sqlite3) for nodes, tasks, jobs, events and agent runs, at `data/lair.db`
@@ -187,6 +201,7 @@ Library modules with tests, not exposed through the API yet:
 - **`gates/pipeline-config.ts`**, **`gates/gate-executor.ts`**: gate pipeline configuration and step execution (also used by every pipeline executor, so results have one shape)
 - **`gates/signature.ts`**: signing and verification of gate results (not end-to-end yet; see [Status and limitations](../README.md#status-and-limitations))
 - **`policy/policy-config.ts`**, **`policy/policy-evaluator.ts`**, **`policy/merge-controller.ts`**: merge policy configuration, evaluation and a control-plane merge controller
+- **`policy/risk-rules.ts`**, **`policy/reviewer-slots.ts`**, **`policy/merge-policy.ts`**: risk tiers from rules over paths, file kinds, size and labels; required reviewers per tier; and the merge conditions the review module enforces
 
 ### Client (`src/client/`)
 
@@ -213,6 +228,7 @@ Each view is a standalone component:
 - **`Activity.tsx`**, **`LiveFeed.tsx`**: fleet bus activity feed
 - **`Health.tsx`**: watchdog SLO status, open breaches and playbook runs (read-only)
 - **`Delivery.tsx`**: environments and services (state, health, restarts, holds, crash loops, error lines) with Up, Down, Restart, Deploy and Release, and the operations log. Its requests are built in `delivery-api.ts`
+- **`Reviews.tsx`**: per PR, the risk tier, required and present reviews, findings, the gate at the head and the merge button with its reasons (view logic in `review-view.ts`)
 - **`Inbox.tsx`**: owner inbox and orchestrator replies
 - **`CommandBar.tsx`**: ask / instruct / task command bar
 - **`Settings.tsx`**: project configuration UI
@@ -234,6 +250,7 @@ Types shared between server, client, bus and node:
 - **`node-types.ts`**: lair-node local configuration and capacity types
 - **`fleet-types.ts`**: machines, healing, budgets
 - **`policy-types.ts`**: gates, policies, verification
+- **`review-types.ts`**: reviews, findings, risk tiers and merge conditions as the review API returns them
 - **`process-types.ts`**: process manager
 - **`version.ts`**: the Lair version string
 
