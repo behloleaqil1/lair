@@ -6,6 +6,7 @@
 import { createHash } from "crypto";
 import { basename, join } from "path";
 import type { DetectorId, Finding } from "./types.js";
+import type { ProcessInfo } from "./probes.js";
 import { isSafeLane, parsePid, type ProjectView, type WatchdogContext } from "./view.js";
 
 export interface DetectorResult {
@@ -106,40 +107,54 @@ const duplicateAgent: Detector = {
 
 // ============ 3. HUNG AGENT ============
 
+/**
+ * The hung rule for one agent process: it is alive, the agent is not WAITING
+ * on a gate that has no result yet (such an agent is never hung), and
+ * neither its newest log nor the process itself has changed for `limit`
+ * minutes. Null when it isn't hung. The agents module
+ * (src/server/agents/) applies the same rule to the runs it starts.
+ */
+export function hungFinding(
+  view: ProjectView,
+  agent: string,
+  proc: ProcessInfo,
+  limit: number = view.settings.hungMinutes,
+): Finding | null {
+  if (view.waitingOn(agent)) return null; // WAITING on a gate with no result yet: never hung
+  const startedAt = view.now - proc.elapsedSeconds * 1000;
+  const log = view.newestLog(agent);
+  const lastActivity = Math.max(startedAt, log?.mtimeMs ?? startedAt);
+  const silent = view.minutesSince(lastActivity);
+  if (silent < limit) return null;
+  const latest = view.latestLineFor(agent);
+  return {
+    detector: "agent_hung",
+    key: `agent_hung:${agent}`,
+    summary: `Agent ${agent} (pid ${proc.pid}) shows no progress for ${minutes(silent)} (limit ${limit} min)`,
+    evidence: [
+      log
+        ? `newest log ${log.name} last changed ${iso(log.mtimeMs)}`
+        : `no log for ${agent} in agents_dir since the process started ${iso(startedAt)}`,
+      `pid ${proc.pid} alive: ${proc.command.slice(0, 200)}`,
+      latest
+        ? `latest queue line (${latest.type}, not WAITING on an unfinished gate): ${latest.message.slice(0, 200)}`
+        : "no queue line for this agent",
+    ],
+    vars: { agent, pid: String(proc.pid), log: log?.path ?? "" },
+  };
+}
+
 const agentHung: Detector = {
   id: "agent_hung",
   title: "Running agents show progress",
   inactiveReason: (ctx) => (ctx.settings.agentCommand ? null : NO_AGENT_PATTERN),
   async detect(view) {
     const findings: Finding[] = [];
-    const limit = view.settings.hungMinutes;
     for (const agent of view.localAgentIds()) {
       const procs = await view.agentProcesses(agent);
       if (procs.length === 0) continue;
-      const gate = view.waitingOn(agent);
-      if (gate) continue; // WAITING on a gate with no result yet: never hung
-      const proc = procs[0];
-      const startedAt = view.now - proc.elapsedSeconds * 1000;
-      const log = view.newestLog(agent);
-      const lastActivity = Math.max(startedAt, log?.mtimeMs ?? startedAt);
-      const silent = view.minutesSince(lastActivity);
-      if (silent < limit) continue;
-      const latest = view.latestLineFor(agent);
-      findings.push({
-        detector: "agent_hung",
-        key: `agent_hung:${agent}`,
-        summary: `Agent ${agent} (pid ${proc.pid}) shows no progress for ${minutes(silent)} (limit ${limit} min)`,
-        evidence: [
-          log
-            ? `newest log ${log.name} last changed ${iso(log.mtimeMs)}`
-            : `no log for ${agent} in agents_dir since the process started ${iso(startedAt)}`,
-          `pid ${proc.pid} alive: ${proc.command.slice(0, 200)}`,
-          latest
-            ? `latest queue line (${latest.type}, not WAITING on an unfinished gate): ${latest.message.slice(0, 200)}`
-            : "no queue line for this agent",
-        ],
-        vars: { agent, pid: String(proc.pid), log: log?.path ?? "" },
-      });
+      const finding = hungFinding(view, agent, procs[0]);
+      if (finding) findings.push(finding);
     }
     return { findings };
   },
