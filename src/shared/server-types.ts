@@ -209,7 +209,14 @@ export type EventType =
   | "playbook.started"
   | "playbook.succeeded"
   | "playbook.failed"
-  | "escalation.created";
+  | "escalation.created"
+  // Delivery (src/server/delivery/)
+  | "delivery.started"
+  | "delivery.finished"
+  | "delivery.held"
+  | "delivery.released"
+  | "delivery.crash_loop"
+  | "delivery.crash_loop_cleared";
 
 /** Event stored in the database */
 export interface Event {

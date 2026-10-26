@@ -16,5 +16,11 @@
     "src/cli/**/*",
     "src/node/**/*"
   ],
-  "exclude": ["node_modules", "dist", "src/**/*.test.ts", "src/**/*.test.tsx"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/**/*.test.ts",
+    "src/**/*.test.tsx",
+    "src/server/delivery/fake-docker.ts"
+  ]
 }

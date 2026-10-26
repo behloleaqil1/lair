@@ -51,6 +51,11 @@ export interface ProjectConfig {
    * parseWatchdogConfig; see docs/configuration.md#watchdog
    */
   watchdog?: Record<string, unknown>;
+  /**
+   * Delivery environments (src/server/delivery/). Validated by
+   * parseDeliveryConfig; see docs/configuration.md#delivery
+   */
+  delivery?: Record<string, unknown>;
 }
 
 // Process configuration as it appears in YAML (before defaults applied)
