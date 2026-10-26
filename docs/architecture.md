@@ -103,7 +103,7 @@ Pure functions that parse project files into typed structures:
 
 #### Machines (`machines/`)
 
-- **`ssh.ts`**: SSH command builder (argument arrays only)
+- **`ssh.ts`**: SSH command builder. The local `ssh` call is an argument array; the remote command is one string for the remote shell, with every value single-quoted and gate env var names validated
 - **`health.ts`**: machine reachability checks
 - **`mapper.ts`**: lane-to-machine mapping (round-robin)
 
@@ -186,6 +186,7 @@ Types shared between server, client, bus and node:
 MCP server (stdio) for direct agent-to-Lair communication. Run it with `npm run bus -- --project <name>`.
 
 - **`cli.ts`**: CLI entry point (`lair-bus`)
+- **`project-config.ts`**: finds and reads `projects/[local/]<name>.yaml` or `.yml` (same lookup order as the server)
 - **`server.ts`**: MCP server and its tools (whoami, claim, release, report, inbox, ack, send, board)
 - **`storage.ts`**: SQLite storage via sql.js (`data/<project>.db`)
 - **`mirror.ts`**: mirrors reports and messages into the project's text files
@@ -246,11 +247,11 @@ UI ← Result
 
 1. **Localhost only**: the server binds to `127.0.0.1:4777` by default
 2. **No authentication**: anyone who can reach the port can use the API, so never bind it to a network or wildcard address on an untrusted network
-3. **Browser checks**: cross-site requests (foreign `Origin`) and foreign `Host` headers get HTTP 403, on HTTP routes and WebSocket handshakes (`origin.ts`); `LAIR_HOST` extends the allowed names, and a wildcard bind turns the `Host` check off
-4. **Input validation**: invalid or unknown `?project=` names and unsafe gate or dragon IDs get HTTP 400
+3. **Browser checks**: cross-site requests (foreign `Origin`) and foreign `Host` headers get HTTP 403, on HTTP routes and WebSocket handshakes (`origin.ts`); `LAIR_HOST` extends the allowed names, and a wildcard bind turns the `Host` check off but adds no allowed origin (remote browsers get read-only GETs; their POSTs and WebSockets are refused)
+4. **Input validation**: invalid or unknown `?project=` names, unsafe gate or dragon IDs, and dragon start/stop requests for a dragon that is neither in the YAML `dragons:` map nor in `dragons.txt` get HTTP 400
 5. **Node peers**: `/ws/node` accepts loopback peers, and remote ones only with `LAIR_NODE_TOKEN`
 6. **Read-only default**: controls are disabled until `read_only: false`
-7. **No shell execution**: commands run as argument arrays, preventing injection
+7. **Argument arrays, not a shell**: controls, dragon start/stop, the process manager and local gate scripts run as argument arrays, preventing injection. Two exceptions, both for commands from your own config: the legacy `ssh_cmd` machine setting runs through the local shell (`services/data.ts`), and commands sent over SSH, such as remote gates, are one string for the remote shell with every value single-quoted (`machines/ssh.ts` `buildGateCommand`)
 8. **No credential storage**: SSH keys are paths, never contents
 9. **Audit logging**: control actions are logged to `data/audit.log`
 

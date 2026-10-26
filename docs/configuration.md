@@ -375,21 +375,20 @@ dragon_stop_cmd: ["./work/bin/dragon-stop.sh", "{dragon}"]
 
 Lair looks for project configurations in this order:
 
-1. `projects/local/<name>.yaml` — Private configs (gitignored)
-2. `projects/<name>.yaml` — Public configs
+1. `projects/local/<name>.yaml`, then `projects/local/<name>.yml` — Private configs (gitignored)
+2. `projects/<name>.yaml`, then `projects/<name>.yml` — Public configs
 
-The first matching file is used.
+The first matching file is used. The server and the fleet bus (`npm run bus`) both load files ending in `.yaml` or `.yml`. Start Lair from the repository root: `projects/` and `data/` are found from the current directory, and the relative paths in `projects/example.yaml` (such as `./fixtures/queue.md`) assume it.
 
-Only files ending in `.yaml` are loaded. Start Lair from the repository root: `projects/` and `data/` are found from the current directory, and the relative paths in `projects/example.yaml` (such as `./fixtures/queue.md`) assume it.
-
-Project names (the file name without `.yaml`) must start with a letter or digit and contain only letters, digits, `.`, `_` and `-`. API requests with an invalid or unknown `?project=` are refused with HTTP 400.
+Project names (the file name without `.yaml` or `.yml`) must start with a letter or digit and contain only letters, digits, `.`, `_` and `-`; files with other names are not listed. API requests with an invalid or unknown `?project=` are refused with HTTP 400.
 
 ## Environment variables
 
 | Variable | Used by | Description |
 |----------|---------|-------------|
-| `LAIR_HOST` | server | Bind address (default `127.0.0.1`). The host is also added to the allowed browser `Origin`s and `Host` headers (ports 4777 and 5173). A wildcard (`0.0.0.0`, `::`) listens on every interface and **turns the `Host` check off**. Lair has no authentication, so don't use anything but loopback on an untrusted network |
+| `LAIR_HOST` | server | Bind address (default `127.0.0.1`). The host is also added to the allowed browser `Origin`s and `Host` headers (ports 4777 and 5173), so a browser that opens `http://<LAIR_HOST>:4777` gets the full dashboard. A wildcard (`0.0.0.0`, `::`) listens on every interface and **turns the `Host` check off**, but adds no allowed `Origin`: a browser on another machine gets only the read-only GET requests, while its POSTs (every control) get HTTP 403 and its WebSocket is refused. To use the dashboard from another machine, set the address that machine's browser opens instead of a wildcard. Lair has no authentication, so don't use anything but loopback on an untrusted network |
 | `LAIR_NODE_TOKEN` | server, lair-node | Shared secret for remote lair-node daemons. The server accepts `/ws/node` connections from its own machine (loopback) without it; any other peer is refused unless `LAIR_NODE_TOKEN` is set on the server and the node presents the same value as `Authorization: Bearer <token>` or `?token=<token>`. lair-node sends it automatically when `LAIR_NODE_TOKEN` is set in its environment |
+| `LAIR_PROJECT` | server | The default project: the one the dashboard opens first, the one API requests without `?project=` use, and the one whose `processes:` the process manager runs. It must name a project in `projects/` or `projects/local/` (for example `LAIR_PROJECT=myproject`); an invalid or unknown name logs a warning at startup and is ignored. Without it the default is `example` if it exists, else the first project found |
 | `LAIR_CLIENT_DIR` | server | Directory of the built web UI to serve (default `dist/client`) |
 | `LAIR_AGENT_ID` | lair-bus | The calling agent's ID (required) |
 

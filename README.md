@@ -65,7 +65,7 @@ machines:
     runners: [heavy, light]
 ```
 
-Only `.yaml` files are loaded. Restart the server after adding a project. See [Getting Started](docs/getting-started.md) for a walkthrough and [Configuration](docs/configuration.md) for every option (machines over SSH, controls, merge bar, dragons, process manager).
+Project files end in `.yaml` or `.yml` (both the server and the bus load either; `.yaml` wins if both exist). Restart the server after adding a project. To open your project by default instead of `example`, start the server with `LAIR_PROJECT=myproject` (an unknown name logs a warning and is ignored). See [Getting Started](docs/getting-started.md) for a walkthrough and [Configuration](docs/configuration.md) for every option (machines over SSH, controls, merge bar, dragons, process manager).
 
 ## Connect an agent
 
@@ -109,9 +109,9 @@ Lair is early software (0.x). The dashboard, the controls listed above and the f
 - The server binds to `127.0.0.1:4777` by default.
 - **There is no authentication.** Anyone who can reach the port can read your project data and, with controls enabled, run the configured commands.
 - The server refuses (HTTP 403) cross-site browser requests, that is any `Origin` other than its own loopback origins on ports 4777 and 5173, and requests whose `Host` header names another host, which blocks DNS rebinding. WebSocket handshakes get the same `Origin` check. Clients without an `Origin` header (`curl`, lair-node) are allowed.
-- `LAIR_HOST` changes the bind address and adds that host to the allowed origins and `Host` headers. A wildcard such as `LAIR_HOST=0.0.0.0` listens on every interface and switches the `Host` check off. **This is unsafe on an untrusted network: never set `LAIR_HOST` to a network or wildcard address there.**
+- `LAIR_HOST` changes the bind address and adds that host to the allowed origins and `Host` headers, so a browser that opens `http://<LAIR_HOST>:4777` gets the full dashboard. A wildcard (`LAIR_HOST=0.0.0.0` or `::`) listens on every interface and switches the `Host` check off, but a wildcard is not an origin, so it adds none: a browser on another machine gets only the read-only GET requests, while its POSTs (every control) get HTTP 403 and its WebSocket is refused (no live updates). To use the dashboard from another machine, set `LAIR_HOST` to the address that machine's browser opens. **Either way this is unsafe on an untrusted network: never set `LAIR_HOST` to a network or wildcard address there.**
 - lair-node connections from other machines are refused unless the server has `LAIR_NODE_TOKEN` set and the node sends the same token. The connection is still unencrypted.
-- Controls are off by default (`read_only: true`) and run only commands from your config, as argument arrays.
+- Controls are off by default (`read_only: true`) and run only commands from your config, as argument arrays. The legacy `ssh_cmd` machine setting and remote gate commands over SSH do go through a shell; see [SECURITY.md](SECURITY.md#command-execution-safety).
 - Lair never reads `.env` or credential files. SSH keys are paths in the config; Lair never stores key contents.
 
 See [SECURITY.md](SECURITY.md) for details and how to report a vulnerability privately.

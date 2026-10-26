@@ -64,14 +64,14 @@ agents_dir: /path/to/agents
 gates_dir: /path/to/gates
 ```
 
-The file name (without `.yaml`) is the project name. A file in `projects/local/` takes precedence over one with the same name in `projects/`. Restart the server after adding a project.
+The file name (without `.yaml` or `.yml`) is the project name. A file in `projects/local/` takes precedence over one with the same name in `projects/`, and `.yaml` over `.yml` in the same directory. Restart the server after adding a project.
 
 See [Configuration](configuration.md) for all available options.
 
 ## Verifying the setup
 
 1. Open `http://localhost:4777` (or `http://localhost:5173` in dev mode)
-2. If you have more than one project, pick it from the project selector in the header (the `example` project is selected by default when it exists)
+2. If you have more than one project, pick it from the project selector in the header. The dashboard opens the project named in `LAIR_PROJECT` (for example `LAIR_PROJECT=myproject npm start`), else `example` when it exists, else the first project
 3. Check the Overview page for any detected problems
 4. Verify that your repository status is showing correctly
 
@@ -93,7 +93,8 @@ See [Configuration](configuration.md) for all available options.
 ### Project not showing
 
 - Ensure the YAML file is in `projects/` or `projects/local/`
-- Check that the file name ends in `.yaml` (`.yml` is not loaded)
+- Check that the file name ends in `.yaml` or `.yml`
+- Check the project name (the file name without the extension): it must start with a letter or digit and contain only letters, digits, `.`, `_` and `-`. Other files are not listed
 - Verify the YAML syntax is valid
 - Restart the server after adding the file
 
@@ -102,5 +103,6 @@ See [Configuration](configuration.md) for all available options.
 - The server binds to `127.0.0.1` only by default (localhost)
 - After `npm start`, if the server logs "No built web UI found", run `npm run build` first
 - In development mode, the UI runs on port 5173, not 4777
+- If `npm run dev` stops with "Port 5173 is already in use", another process (often an earlier `npm run dev`) holds the port: find it with `lsof -i :5173` and stop it. Vite is set to `strictPort`, so it fails instead of moving to 5174, because the server only accepts the dashboard from ports 5173 and 4777 and would refuse a page on 5174 with HTTP 403
 - Check browser console for WebSocket connection errors
 - An HTTP 403 ("Cross-origin request refused" or "Unexpected Host header") means the page was opened under a host name the server does not know: use `http://localhost:4777` or `http://127.0.0.1:4777` (or the address in `LAIR_HOST`)

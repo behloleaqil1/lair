@@ -8,53 +8,18 @@
  *
  * The agent's identity comes from the LAIR_AGENT_ID environment variable.
  */
-import { existsSync, readFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
-import { parse as parseYaml } from "yaml";
 import { runServer } from "./server.js";
-import type { BusProjectConfig } from "./types.js";
+import { loadBusProjectConfig } from "./project-config.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-interface ProjectYaml {
-  name: string;
-  queue_file: string;
-  inbox_file?: string;
-  mail_dir?: string;
-  wake_file?: string;
-}
-
-function loadProjectConfig(projectName: string): BusProjectConfig {
-  // Look for config in projects/ relative to the current directory, then
-  // relative to the package root. As in the server, a private config in
-  // projects/local/ wins over a public one of the same name.
-  const searchPaths = [
-    join(process.cwd(), "projects", "local", `${projectName}.yaml`),
-    join(process.cwd(), "projects", `${projectName}.yaml`),
-    join(__dirname, "..", "..", "projects", "local", `${projectName}.yaml`),
-    join(__dirname, "..", "..", "projects", `${projectName}.yaml`),
-  ];
-
-  for (const configPath of searchPaths) {
-    if (existsSync(configPath)) {
-      const content = readFileSync(configPath, "utf-8");
-      const yaml = parseYaml(content) as ProjectYaml;
-
-      return {
-        name: yaml.name,
-        queue_file: yaml.queue_file,
-        inbox_file: yaml.inbox_file,
-        mail_dir: yaml.mail_dir,
-        wake_file: yaml.wake_file,
-      };
-    }
-  }
-
-  throw new Error(
-    `Project config not found: ${projectName}\nSearched: ${searchPaths.join(", ")}`,
-  );
-}
+/**
+ * Look for the config in projects/ under the current directory, then under
+ * the package root (two levels up from src/bus/ or dist/bus/).
+ */
+const CONFIG_ROOTS = [process.cwd(), join(__dirname, "..", "..")];
 
 function parseArgs(args: string[]): { project: string } {
   let project: string | undefined;
@@ -84,7 +49,7 @@ async function main(): Promise<void> {
       );
     }
 
-    const config = loadProjectConfig(args.project);
+    const config = loadBusProjectConfig(args.project, CONFIG_ROOTS);
 
     // Data directory is relative to CWD
     const dataDir = join(process.cwd(), "data");

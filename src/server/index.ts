@@ -100,6 +100,15 @@ fastify.get("/api/projects", async () => {
   return respond(listProjects());
 });
 
+// The default project (LAIR_PROJECT, else "example", else the first one)
+fastify.get("/api/projects/default", async () => {
+  try {
+    return respond(getDefaultProject());
+  } catch (e) {
+    return respondError(e instanceof Error ? e.message : "Unknown error");
+  }
+});
+
 // Overview
 fastify.get<{ Querystring: { project?: string } }>(
   "/api/overview",

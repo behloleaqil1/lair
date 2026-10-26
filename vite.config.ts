@@ -15,6 +15,9 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    // The server accepts the dashboard only from port 5173 (or 4777); if 5173 is
+    // busy, fail instead of moving to 5174, whose Origin would get HTTP 403
+    strictPort: true,
     proxy: {
       '/api': 'http://127.0.0.1:4777',
     },

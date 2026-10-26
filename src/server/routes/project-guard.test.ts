@@ -51,6 +51,8 @@ beforeAll(() => {
     createdLocalDir = true;
   }
   writeFileSync(OUTSIDE_FILE, OUTSIDE_YAML);
+  // A dragon that exists only in <agents_dir>/dragons.txt, not in the YAML map
+  writeFileSync(join(TMP, "dragons.txt"), "bravo\tBravo\tunassigned\n");
   writeFileSync(
     PROJECT_FILE,
     [
@@ -213,6 +215,50 @@ describe("dragon start/stop validation", () => {
     // The project is read-only, so the start command itself is refused
     expect(res.statusCode).toBe(200);
     expect(readFileSync(join(TMP, "prompts", "my-task-alpha.txt"), "utf-8")).toBe("do it");
+  });
+
+  it("accepts a dragon listed only in dragons.txt on stop", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/controls/dragon/stop",
+      query: { project: PROJECT },
+      payload: { dragonId: "bravo" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().success).toBe(true);
+  });
+
+  it("accepts a dragon listed only in dragons.txt on start", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/controls/dragon/start",
+      query: { project: PROJECT },
+      payload: { dragonId: "bravo", task: "txt task", prompt: "go" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(readFileSync(join(TMP, "prompts", "txt-task-bravo.txt"), "utf-8")).toBe("go");
+  });
+
+  it("refuses a digit-first dragonId that the registry would never list", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/controls/dragon/stop",
+      query: { project: PROJECT },
+      payload: { dragonId: "1-agent" },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("Invalid dragonId");
+  });
+
+  it("names an unknown dragon in the error", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/controls/dragon/start",
+      query: { project: PROJECT },
+      payload: { dragonId: "charlie", task: "t", prompt: "p" },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("Unknown dragon: charlie");
   });
 
   it("defaults prompts_dir to data/prompts, not a repo-specific layout", () => {

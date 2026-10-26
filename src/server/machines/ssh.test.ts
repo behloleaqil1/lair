@@ -410,6 +410,19 @@ describe("gate env var validation", () => {
     "DYLD_INSERT_LIBRARIES",
     "BASH_ENV",
     "NODE_OPTIONS",
+    "NODE_PATH",
+    "PYTHONPATH",
+    "CDPATH",
+    "ZDOTDIR",
+    "GIT_SSH_COMMAND",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_KEY_0",
+    "GIT_CONFIG_VALUE_0",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "git_config_count",
+    "node_path",
   ])("rejects env var name %j", (key) => {
     expect(isValidEnvKey(key)).toBe(false);
     expect(() =>
@@ -421,6 +434,13 @@ describe("gate env var validation", () => {
     expect(isValidEnvKey("BACKEND_TESTS")).toBe(true);
     expect(isValidEnvKey("_private1")).toBe(true);
     expect(validateEnvVars({ A: "1", B_2: "x" })).toEqual([]);
+  });
+
+  it("accepts names that only resemble reserved ones", () => {
+    expect(isValidEnvKey("GIT_AUTHOR_NAME")).toBe(true);
+    expect(isValidEnvKey("MY_GIT_CONFIG_DIR")).toBe(true);
+    expect(isValidEnvKey("NODE_ENV")).toBe(true);
+    expect(isValidEnvKey("PYTHONPATH_EXTRA")).toBe(true);
   });
 
   it("rejects non-string values and non-object envVars", () => {
