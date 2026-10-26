@@ -56,6 +56,12 @@ export interface ProjectConfig {
    * parseDeliveryConfig; see docs/configuration.md#delivery
    */
   delivery?: Record<string, unknown>;
+  /**
+   * Gate pipelines and where they run (src/server/gates/). Validated by
+   * parsePipelineConfig; see docs/configuration.md#gate-pipelines
+   */
+  pipelines?: Record<string, unknown>;
+  executors?: Record<string, unknown>;
 }
 
 // Process configuration as it appears in YAML (before defaults applied)

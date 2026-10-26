@@ -30,6 +30,8 @@ import { registerClientStatic, resolveClientDir } from "./static.js";
 import { getEventBus } from "./core/event-bus.js";
 import { WatchdogManager, registerWatchdogRoutes } from "./watchdog/index.js";
 import { DeliveryManager, registerDeliveryRoutes } from "./delivery/index.js";
+import { PipelineManager, registerPipelineRoutes } from "./gates/index.js";
+import { getBudgetManager } from "./fleet/budget.js";
 import { join } from "path";
 import type { ApiResponse } from "../shared/types.js";
 
@@ -346,6 +348,16 @@ const watchdogs = new WatchdogManager({
 watchdogs.load(projectEntries);
 await registerWatchdogRoutes(fastify, watchdogs, () => getDefaultProject());
 
+// Gate pipelines (`pipelines:` in a project config): each job runs on the
+// repository's CI runners first and on this machine last (docs/design/runners.md)
+const pipelines = new PipelineManager({
+  dbPath: join(process.cwd(), "data", "pipelines.db"),
+  events: getEventBus(),
+  budget: getBudgetManager(),
+});
+pipelines.load(projectEntries);
+await registerPipelineRoutes(fastify, pipelines, () => getDefaultProject());
+
 // Serve the built web UI (dist/client) with an SPA fallback, when it exists.
 // In development the UI comes from the Vite dev server on port 5173 instead.
 const clientDir = resolveClientDir();
@@ -376,6 +388,9 @@ const shutdown = async (signal: string) => {
   // Stop delivery (after the watchdogs, which read it): a wait in progress
   // ends early and no further command starts; then close its store
   await delivery.stop();
+
+  // Stop pipeline jobs: in-flight attempts stay recorded and resume on restart
+  await pipelines.stop();
 
   // Stop healer
   stopHealer();
@@ -474,6 +489,10 @@ const start = async () => {
         ? `[delivery] Environments of: ${delivering.join(", ")}`
         : "[delivery] Off (no project sets delivery.enabled)",
     );
+
+    // Resume pipeline jobs that were in flight when the server stopped
+    const piped = pipelines.start();
+    if (piped.length > 0) console.log(`[pipelines] Pipelines for: ${piped.join(", ")}`);
 
     // Start file watchers for all projects
     const projects = listProjects();

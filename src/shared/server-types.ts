@@ -216,7 +216,13 @@ export type EventType =
   | "delivery.held"
   | "delivery.released"
   | "delivery.crash_loop"
-  | "delivery.crash_loop_cleared";
+  | "delivery.crash_loop_cleared"
+  // Gate pipelines and their executors (src/server/gates/)
+  | "pipeline.run.started"
+  | "pipeline.job.fallback"
+  | "pipeline.run.completed"
+  // A module needs a human decision (the Decision Inbox listens)
+  | "decision.needed";
 
 /** Event stored in the database */
 export interface Event {

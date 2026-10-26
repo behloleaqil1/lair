@@ -21,6 +21,7 @@
     "dist",
     "src/**/*.test.ts",
     "src/**/*.test.tsx",
-    "src/server/delivery/fake-docker.ts"
+    "src/server/delivery/fake-docker.ts",
+    "src/**/testing/**"
   ]
 }
