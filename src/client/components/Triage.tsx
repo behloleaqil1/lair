@@ -3,9 +3,14 @@
  * verdict of each cause with its evidence, the actions taken and the retry
  * count; the default branch's incident with its bisect status. Configured in
  * the project YAML (triage:, see docs/configuration.md#triage).
+ *
+ * Revert and protect are the owner's: they send this browser's owner session
+ * (sign in from the Decisions view) and ask for confirmation first; an
+ * unproven suspect asks a second time.
  */
 import { Fragment, useState } from "react";
 import { useApi } from "../hooks/useApi";
+import { ownerHeaders } from "../owner-session";
 import type {
   Incident,
   Recheck,
@@ -56,11 +61,12 @@ function short(sha: string | undefined): string {
   return sha ? sha.slice(0, 8) : "—";
 }
 
+/** An owner-only request: the owner session goes in its header, never a cookie. */
 async function post(path: string, project: string, body: unknown): Promise<string | null> {
   try {
     const res = await fetch(`/api${path}?project=${encodeURIComponent(project)}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...ownerHeaders() },
       body: JSON.stringify(body),
     });
     const data = (await res.json()) as { success: boolean; error?: string };
@@ -84,6 +90,7 @@ function Actions({ actions }: { actions: TriageAction[] }) {
             </td>
             <td>
               {a.detail}
+              {a.actor && <div style={muted}>by {a.actor}</div>}
               {a.argv && <div style={muted}><code>{a.argv.join(" ")}</code></div>}
             </td>
           </tr>
@@ -153,6 +160,21 @@ function IncidentCard({ incident, project, onChange }: { incident: Incident; pro
     setError(await post(path, project, body));
     onChange();
   };
+  const revert = (sha: string) => {
+    const proven = b.proven && sha === culprit;
+    if (!window.confirm(`Open a revert of ${short(sha)} on ${incident.branch}? It goes through the gate and the merge policy.`)) return;
+    if (
+      !proven &&
+      !window.confirm(`${short(sha)} is NOT proven to have broken ${incident.branch}. Revert it anyway, as your own decision?`)
+    ) {
+      return;
+    }
+    void act(`/triage/owner/incidents/${incident.id}/revert`, { sha, ...(proven ? {} : { acknowledgeUnproven: true }) });
+  };
+  const protect = (sha: string) => {
+    if (!window.confirm(`Protect ${short(sha)}? Lair will never revert it automatically.`)) return;
+    void act("/triage/owner/protected", { sha, note: "protected from the Triage view" });
+  };
   return (
     <div className="card">
       <div style={{ display: "flex", gap: "0.75rem", alignItems: "center", flexWrap: "wrap" }}>
@@ -173,6 +195,7 @@ function IncidentCard({ incident, project, onChange }: { incident: Incident; pro
           <strong>{incident.revert.status}</strong>
           {incident.revert.detail ? ` · ${incident.revert.detail}` : ""}
           {incident.revert.ref ? ` · ${incident.revert.ref}` : ""}
+          {incident.revert.by ? ` · asked by ${incident.revert.by}` : ""}
         </p>
       )}
       {b.suspects && b.suspects.length > 1 && <p style={muted}>Suspects: {b.suspects.map(short).join(", ")}</p>}
@@ -203,16 +226,14 @@ function IncidentCard({ incident, project, onChange }: { incident: Incident; pro
       )}
       {incident.status === "open" && culprit && (
         <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
-          {incident.revert.status !== "opened" && (
-            <button style={button} onClick={() => act(`/triage/incidents/${incident.id}/revert`, { sha: culprit })}>
+          {incident.revert.status !== "opened" && incident.revert.status !== "opening" && (
+            <button style={button} onClick={() => revert(culprit)}>
               Open revert of {short(culprit)}
+              {b.proven ? "" : " (not proven)"}
             </button>
           )}
           {!incident.revert.protected && (
-            <button
-              style={button}
-              onClick={() => act("/triage/protected", { sha: culprit, note: "protected from the Triage view" })}
-            >
+            <button style={button} onClick={() => protect(culprit)}>
               Protect {short(culprit)}
             </button>
           )}
@@ -243,9 +264,9 @@ export function Triage({ project, refreshKey }: Props) {
         <h2 style={{ marginBottom: "1.5rem" }}>Triage</h2>
         <div className="card">
           <p>
-            Triage is off for this project. Set <code>triage.enabled: true</code> in its YAML and post gate results to{" "}
-            <code>POST /api/triage/results</code>. It starts in observe mode: it classifies and records, and runs none of
-            your commands.
+            Triage is off for this project. Set <code>triage.enabled: true</code> in its YAML. It reads the results of
+            your gate pipelines, and signed results from the nodes in <code>triage.trusted_nodes</code>. It starts in
+            observe mode: it classifies and records, and runs none of your commands.
           </p>
           {s.errors.map((e) => (
             <p key={e} className="error" style={{ marginTop: "1rem" }}>
