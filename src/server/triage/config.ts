@@ -97,6 +97,9 @@ const argv = z.array(z.string().min(1)).min(1);
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 export const SHA_PATTERN = /^[0-9a-f]{7,64}$/i;
+/** A full commit sha (SHA-1 or SHA-256 object format); results, answers and protection need one */
+export const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+const NODE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 const PatternSchema = z
   .object({
@@ -125,6 +128,20 @@ const TriageSchema = z
     default_context_patterns: z.boolean().default(true),
     /** A timeout while the machine's load per core was at least this is infra (load) */
     overload_per_core: z.number().positive().default(2),
+    /** A base commit's result older than this is not used to call a failure pre-existing */
+    base_max_age_hours: z.number().positive().default(72),
+    /** Nodes whose signed results POST /api/triage/results accepts */
+    trusted_nodes: z
+      .array(
+        z
+          .object({
+            id: z.string().regex(NODE_ID, "node ids use letters, digits, '.', '_', ':' and '-'"),
+            /** The node's Ed25519 public key (PEM) */
+            public_key_file: z.string().min(1),
+          })
+          .strict(),
+      )
+      .default([]),
     actions: z
       .object({
         infra: z.enum(["recheck", "route", "none"]).default("recheck"),
@@ -138,6 +155,8 @@ const TriageSchema = z
         max_retries: z.number().int().min(0).max(5).default(1),
         max_concurrent: z.number().int().min(1).max(20).default(1),
         timeout_minutes: z.number().positive().default(120),
+        /** recheck must start the run and return; it is stopped after this */
+        request_timeout_seconds: z.number().int().min(1).max(300).default(30),
         max_load_per_core: z.number().positive().optional(),
         min_free_memory_mb: z.number().min(0).optional(),
         /** Exits 0 when there is capacity for a re-check */
@@ -153,6 +172,8 @@ const TriageSchema = z
         ticket_deadline_days: z.number().int().min(1).max(90).default(7),
         quarantine: z.boolean().default(true),
         quarantine_cap: z.number().int().min(0).default(10),
+        /** A quarantined test that passes this many times in a row is released */
+        release_after_passes: z.number().int().min(1).max(100).default(5),
       })
       .strict()
       .default({}),
@@ -163,8 +184,11 @@ const TriageSchema = z
         revert: z.enum(["auto", "propose", "off"]).default("propose"),
         max_candidates: z.number().int().min(1).max(1000).default(64),
         /** Merges a human marked protected: never reverted automatically */
-        protected_merges: z.array(z.string().regex(SHA_PATTERN, "not a commit sha")).default([]),
-        /** A merge whose message has `<trailer>: yes` is protected too */
+        protected_merges: z.array(z.string().regex(FULL_SHA, "not a full commit sha")).default([]),
+        /**
+         * A merge whose message has `<trailer>: yes` is proposed for revert,
+         * never reverted automatically. A hint only: whoever merged it wrote it
+         */
         protected_trailer: z.string().regex(/^[A-Za-z][A-Za-z0-9-]{0,63}$/).default("Lair-Protected"),
       })
       .strict()
@@ -191,11 +215,14 @@ export interface TriageSettings {
   infraPatterns: CompiledPattern[];
   contextPatterns: RegExp[];
   overloadPerCore: number;
+  baseMaxAgeHours: number;
+  trustedNodes: { id: string; publicKeyFile: string }[];
   actions: { infra: "recheck" | "route" | "none"; preExisting: "fix_task" | "none"; code: "route" | "none" };
   recheck: {
     maxRetries: number;
     maxConcurrent: number;
     timeoutMinutes: number;
+    requestTimeoutSeconds: number;
     maxLoadPerCore?: number;
     minFreeMemoryMb?: number;
     capacityCmd?: string[];
@@ -206,6 +233,7 @@ export interface TriageSettings {
     ticketDeadlineDays: number;
     quarantine: boolean;
     quarantineCap: number;
+    releaseAfterPasses: number;
   };
   bisect: {
     enabled: boolean;
@@ -293,6 +321,12 @@ export function parseTriageConfig(raw: unknown): TriageParseResult {
     }
   }
 
+  const nodeIds = new Set<string>();
+  for (const node of value.trusted_nodes) {
+    if (nodeIds.has(node.id)) errors.push(`triage.trusted_nodes: duplicate node id ${node.id}`);
+    nodeIds.add(node.id);
+  }
+
   if (errors.length > 0) return { ok: false, errors };
 
   return {
@@ -306,6 +340,8 @@ export function parseTriageConfig(raw: unknown): TriageParseResult {
       infraPatterns,
       contextPatterns,
       overloadPerCore: value.overload_per_core,
+      baseMaxAgeHours: value.base_max_age_hours,
+      trustedNodes: value.trusted_nodes.map((n) => ({ id: n.id, publicKeyFile: n.public_key_file })),
       actions: {
         infra: value.actions.infra,
         preExisting: value.actions.pre_existing,
@@ -315,6 +351,7 @@ export function parseTriageConfig(raw: unknown): TriageParseResult {
         maxRetries: value.recheck.max_retries,
         maxConcurrent: value.recheck.max_concurrent,
         timeoutMinutes: value.recheck.timeout_minutes,
+        requestTimeoutSeconds: value.recheck.request_timeout_seconds,
         maxLoadPerCore: value.recheck.max_load_per_core,
         minFreeMemoryMb: value.recheck.min_free_memory_mb,
         capacityCmd: value.recheck.capacity_cmd,
@@ -325,6 +362,7 @@ export function parseTriageConfig(raw: unknown): TriageParseResult {
         ticketDeadlineDays: value.flaky.ticket_deadline_days,
         quarantine: value.flaky.quarantine,
         quarantineCap: value.flaky.quarantine_cap,
+        releaseAfterPasses: value.flaky.release_after_passes,
       },
       bisect: {
         enabled: value.bisect.enabled,

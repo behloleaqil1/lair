@@ -84,15 +84,24 @@ export interface ClassifiedCause {
 /** gate: a normal gate run; recheck: an infra re-check; bisect: a bisect probe. */
 export type ResultPurpose = "gate" | "recheck" | "bisect";
 
+/**
+ * trusted: from a server module in-process (the gate.completed event);
+ * signed: a SignedGateResult over HTTP, verified against a trusted node key.
+ */
+export type ResultTrust = "trusted" | "signed";
+
 /** One ingested gate result and its triage. */
 export interface TriageRecord {
   id: string;
   project: string;
   gateId: string;
+  /** The pipeline the result ran (GateResult.pipelineId): incidents and passes are per pipeline */
+  pipelineId: string;
+  trust: ResultTrust;
   sha: string;
   branch: string;
   baseSha?: string;
-  /** The agent that authored the change (from the result's context) */
+  /** The agent that authored the change (only from a trusted result) */
   agent?: string;
   pr?: number;
   purpose: ResultPurpose;
@@ -148,23 +157,29 @@ export interface TriageAction {
   /** The command that ran, or would run in observe mode */
   argv?: string[];
   output?: string;
+  /** Who acted, for a human's action (an owner session id) */
+  actor?: string;
   at: string;
 }
 
 export type RecheckPurpose = "infra" | "bisect";
 
 /**
- * waiting_capacity: queued until there is capacity; requested: the executor
- * accepted it; planned: observe mode; unavailable: no executor, or it refused;
- * passed / failed: answered; expired: no answer in time; cancelled.
+ * waiting_capacity: queued until there is capacity; dispatching: the
+ * executor is being asked; requested: it accepted; planned: observe mode;
+ * unavailable: no executor, or it refused; passed / failed: answered;
+ * unproven: answered "passed" without showing the requested tests (or steps)
+ * passing; expired: no answer in time; cancelled.
  */
 export type RecheckStatus =
   | "waiting_capacity"
+  | "dispatching"
   | "requested"
   | "planned"
   | "unavailable"
   | "passed"
   | "failed"
+  | "unproven"
   | "expired"
   | "cancelled";
 
@@ -193,6 +208,8 @@ export interface Recheck {
   completedAt?: string;
   /** The result that answered it */
   answerId?: string;
+  /** The run id the executor returned; an answer carries it (or this re-check's id) as its result id */
+  runId?: string;
 }
 
 export interface TriageTask {
@@ -215,6 +232,10 @@ export interface FlakyTest {
   occurrences: number;
   lastAt: string;
   quarantinedAt?: string;
+  /** The quarantine ends then (the reliability task's deadline) */
+  quarantineUntil?: string;
+  /** Passes in a row since the last failure (the quarantine ends after flaky.release_after_passes) */
+  passes: number;
   ticketId?: string;
 }
 
@@ -249,7 +270,7 @@ export interface BisectState {
   detail: string;
 }
 
-export type RevertStatus = "none" | "opened" | "proposed" | "protected" | "failed" | "off";
+export type RevertStatus = "none" | "opening" | "opened" | "proposed" | "protected" | "failed" | "off";
 
 export interface IncidentTarget {
   /** The narrowest failing set: test ids, classes and steps to run at each probe */
@@ -260,11 +281,13 @@ export interface IncidentTarget {
   signatures: string[];
 }
 
-/** The default branch is red. */
+/** The default branch is red, for one pipeline. */
 export interface Incident {
   id: string;
   project: string;
   branch: string;
+  /** The pipeline that went red; only its own green result resolves the incident */
+  pipelineId: string;
   status: "open" | "resolved";
   openedAt: string;
   resolvedAt?: string;
@@ -281,6 +304,8 @@ export interface Incident {
     detail?: string;
     /** Whether the culprit is a merge a human marked protected */
     protected?: boolean;
+    /** Who asked for the revert, when a human did */
+    by?: string;
   };
   decisionRef?: string;
 }
@@ -288,6 +313,8 @@ export interface Incident {
 export interface ProtectedMerge {
   sha: string;
   note: string;
+  /** Who protected it (an owner session id) */
+  by?: string;
   createdAt: string;
 }
 
@@ -308,8 +335,11 @@ export interface TriageProjectStatus {
   openTasks: number;
   quarantined: number;
   quarantineCap: number | null;
-  /** The open incident on the default branch, else the latest one */
+  /** The newest open incident on the default branch, else the latest one */
   incident: Incident | null;
+  openIncidents: number;
   /** Which commands are configured (triage.commands.<id>) */
   commands: Record<string, boolean>;
+  /** Node ids whose signed results are accepted over HTTP */
+  trustedNodes: string[];
 }

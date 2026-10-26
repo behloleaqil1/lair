@@ -20,10 +20,22 @@ export interface GitProbe {
   commit(sha: string): Promise<CommitInfo>;
   /** Files changed on `head` since it left `base` (base...head) */
   changedFiles(base: string, head: string): Promise<string[]>;
+  /** Where `sha` left `branch` (git merge-base), or null when they share no history */
+  mergeBase(sha: string, branch: string): Promise<string | null>;
+  /** Whether `ancestor` is in `descendant`'s history (git merge-base --is-ancestor) */
+  isAncestor(ancestor: string, descendant: string): Promise<boolean>;
 }
+
+const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 
 function assertSha(sha: string): void {
   if (!SHA_PATTERN.test(sha)) throw new Error(`not a commit sha: ${JSON.stringify(sha).slice(0, 80)}`);
+}
+
+function assertBranch(branch: string): void {
+  if (!BRANCH.test(branch) || branch.includes("..")) {
+    throw new Error(`not a branch name: ${JSON.stringify(branch).slice(0, 80)}`);
+  }
 }
 
 export class GitCli implements GitProbe {
@@ -71,5 +83,26 @@ export class GitCli implements GitProbe {
       .split("\n")
       .map((l) => l.trim())
       .filter(Boolean);
+  }
+
+  async mergeBase(sha: string, branch: string): Promise<string | null> {
+    assertSha(sha);
+    assertBranch(branch);
+    const out = await this.runner.run(["git", "-C", this.repo, "merge-base", sha, branch], { timeoutMs: this.timeoutMs });
+    if (out.code === 1 && out.stdout.trim() === "") return null;
+    if (out.code !== 0) throw new Error(`git merge-base failed (${out.code}): ${out.stderr.trim().slice(0, 300)}`);
+    const base = out.stdout.trim();
+    return SHA_PATTERN.test(base) ? base.toLowerCase() : null;
+  }
+
+  async isAncestor(ancestor: string, descendant: string): Promise<boolean> {
+    assertSha(ancestor);
+    assertSha(descendant);
+    const out = await this.runner.run(["git", "-C", this.repo, "merge-base", "--is-ancestor", ancestor, descendant], {
+      timeoutMs: this.timeoutMs,
+    });
+    if (out.code === 0) return true;
+    if (out.code === 1) return false;
+    throw new Error(`git merge-base --is-ancestor failed (${out.code}): ${out.stderr.trim().slice(0, 300)}`);
   }
 }

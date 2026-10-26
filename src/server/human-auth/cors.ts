@@ -24,6 +24,7 @@ export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/decisions",
   "/api/review",
   "/api/agents",
+  "/api/triage/owner",
   // Modules whose writes need the owner (requireOwnerForChanges); their reads stay open but get no CORS either
   "/api/delivery",
   "/api/controls",

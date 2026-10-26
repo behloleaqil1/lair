@@ -7,10 +7,11 @@
  * | RecheckExecutor  | triage.commands.recheck                   | runners (POST /api/pipelines/runs)       |
  * | AgentRouter      | triage.commands.notify_agent              | agents (the PR agent's mailbox)          |
  * | TaskSink         | triage.commands.create_task               | planner / intake                         |
- * | DecisionRaiser   | triage.commands.raise_decision, else an   | decisions (POST /api/decisions)          |
- * |                  | OWNER? line in the decision or inbox file |                                          |
+ * | DecisionRaiser   | the Decision Inbox (InboxDecisions), else | decisions (connected by the server)      |
+ * |                  | raise_decision, else an OWNER? line       |                                          |
  * | RevertOpener     | triage.commands.open_revert               | review / policy (revert PR through gate) |
  * | CapacityProbe    | load and memory limits, capacity_cmd      | runners / scheduler (measured capacity)  |
+ * | OwnerGuard       | the owner credential (human-auth)         | (built)                                  |
  *
  * Without a command, a route or a task is still recorded in the store and
  * emitted on the event bus (triage.routed, triage.task_created), so a module
@@ -18,9 +19,39 @@
  * of these for a project.
  */
 import { cpus, freemem, loadavg } from "os";
+import type { FastifyReply, FastifyRequest } from "fastify";
 import type { Recheck, TriageTask } from "../../shared/triage-types.js";
+import type { DecisionProducer } from "../decisions/types.js";
 import type { Clock, CommandRunner } from "../watchdog/probes.js";
 import { COMMAND_PLACEHOLDERS, LIST_PLACEHOLDERS, type CommandId, type TriageSettings } from "./config.js";
+
+/** The module name triage raises Decision Inbox decisions as */
+export const DECISION_MODULE = "triage";
+
+/**
+ * Who may use the human-only routes (protect, unprotect, revert, release a
+ * quarantine). The server passes the shared owner credential
+ * (src/server/human-auth/ HumanAuth), which has this shape.
+ */
+export interface OwnerGuard {
+  /** A route onRequest hook: 403 unless the request carries the owner's session */
+  requireOwner(refusal?: string): (request: FastifyRequest, reply: FastifyReply) => Promise<unknown>;
+  /** The session requireOwner() verified, to record who acted */
+  sessionOf(request: FastifyRequest): { id: string } | undefined;
+}
+
+/** Without the owner credential, no request is the owner's. */
+export const NO_OWNER: OwnerGuard = {
+  requireOwner(refusal = "Only the owner can do this") {
+    return async (_request: FastifyRequest, reply: FastifyReply) =>
+      reply.code(403).send({
+        success: false,
+        error: `${refusal}: the owner credential is not set up on this server`,
+        timestamp: new Date().toISOString(),
+      });
+  },
+  sessionOf: () => undefined,
+};
 
 export interface AdapterResult {
   ok: boolean;
@@ -33,7 +64,12 @@ export interface AdapterResult {
 }
 
 export interface RecheckExecutor {
-  /** Start a re-check; its result comes back as a gate result with context.recheck_id */
+  /**
+   * Start a re-check and return at once (within recheck.request_timeout_seconds),
+   * with the run's id as `ref`. The run's result comes back later as a gate
+   * result whose id is that run id (or the re-check's id), with
+   * context.recheckId set: in-process, or signed over HTTP.
+   */
   request(recheck: Recheck): Promise<AdapterResult>;
 }
 
@@ -56,24 +92,49 @@ export interface TaskSink {
   create(task: TriageTask): Promise<AdapterResult>;
 }
 
-/** The Decision Inbox request shape (docs/design/autonomy.md §1). */
+export interface DecisionChoice {
+  /** Lowercase letters, digits, '_' and '-' (the Decision Inbox's option ids) */
+  id: string;
+  label: string;
+  consequences: string;
+}
+
+/** What triage asks the human (the Decision Inbox's shape, docs/design/autonomy.md §1). */
 export interface DecisionRequest {
   project: string;
-  /** Stable id of what it is about, for dedupe (an incident id, a failure id) */
+  /** Stable id of what it is about, for dedupe: "revert:<incident>", "infra:<failure>" */
   subject: string;
   kind: "escalation" | "other";
   question: string;
   context: string[];
-  options: string[];
+  options: DecisionChoice[];
+  /** One of the options' ids */
   recommended: string;
   why: string;
-  reversible: boolean;
-  onTimeout: "wait";
-  requestedBy: "triage";
 }
 
 export interface DecisionRaiser {
   raise(request: DecisionRequest): Promise<AdapterResult>;
+}
+
+/** Raises triage's decisions in the Decision Inbox (src/server/decisions/). */
+export class InboxDecisions implements DecisionRaiser {
+  constructor(private inbox: DecisionProducer) {}
+
+  async raise(request: DecisionRequest): Promise<AdapterResult> {
+    const result = await this.inbox.raise({
+      project: request.project,
+      kind: request.kind,
+      title: oneLine(request.question, 190),
+      context: request.context.join("\n\n").slice(0, 19_000),
+      options: request.options.map((o) => ({ id: o.id, label: oneLine(o.label, 90), consequences: oneLine(o.consequences, 400) })),
+      recommended: { optionId: request.recommended, reasoning: oneLine(request.why, 1900) },
+      source: { module: DECISION_MODULE, ref: request.subject },
+      key: request.subject,
+    });
+    const id = result.decision.id;
+    return { ok: true, detail: result.created ? `decision ${id} raised` : `decision ${id} is already open`, ref: id };
+  }
 }
 
 export interface RevertRequest {
@@ -218,7 +279,7 @@ export function decisionVars(request: DecisionRequest): Vars {
     question: request.question,
     context: request.context.join("\n"),
     recommended: request.recommended,
-    options: request.options,
+    options: request.options.map((o) => o.id),
   };
 }
 
@@ -240,8 +301,10 @@ export function commandAdapters(settings: TriageSettings, runner: CommandRunner)
   const adapters: TriageAdapters = {};
   if (c.recheck) {
     const template = c.recheck;
+    // It only starts the run, so it gets the short request timeout
+    const requestMs = settings.recheck.requestTimeoutSeconds * 1000;
     adapters.recheck = {
-      request: (recheck) => runCommand(runner, "recheck", template, recheckVars(recheck.project, recheck), timeoutMs),
+      request: (recheck) => runCommand(runner, "recheck", template, recheckVars(recheck.project, recheck), requestMs),
     };
   }
   if (c.notify_agent) {
@@ -275,8 +338,9 @@ function oneLine(text: string, max = 500): string {
 /** The `OWNER?` entry the Decision Inbox importers read (same convention as the watchdog's escalations). */
 export function formatDecision(request: DecisionRequest, at: string): string {
   const tag = request.subject.replace(/([0-9a-f]{8})-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, "$1");
+  const recommended = request.options.find((o) => o.id === request.recommended)?.label ?? request.recommended;
   const lines = [
-    `- OWNER? ${at} [triage:${tag}] ${request.project}: ${oneLine(request.question)} Options: ${request.options.join(" | ")} (recommended: ${request.recommended}). ${oneLine(request.why)}`,
+    `- OWNER? ${at} [triage:${tag}] ${request.project}: ${oneLine(request.question)} Options: ${request.options.map((o) => o.label).join(" | ")} (recommended: ${recommended}). ${oneLine(request.why)}`,
     ...request.context.map((c) => `  - ${oneLine(c)}`),
   ];
   return `${lines.join("\n")}\n`;

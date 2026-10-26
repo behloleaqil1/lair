@@ -1,11 +1,12 @@
 /**
  * Triage store (SQLite, data/triage.db): every ingested result with its
- * causes and verdicts, per-test observations (pass or fail at a commit),
- * actions, re-checks, tasks, flaky tests, incidents with their bisect state,
- * protected merges and raised decisions.
+ * causes and verdicts, per-test observations (pass or fail at a commit, in a
+ * step), actions, re-checks, tasks, flaky tests, incidents with their bisect
+ * state, protected merges and raised decisions.
  *
  * Times come from the triage Clock, never SQLite's datetime(), so tests with
- * a fake clock get exact values.
+ * a fake clock get exact values. Lists bound into SQL are chunked below
+ * SQLite's variable limit.
  */
 import Database from "better-sqlite3";
 import { existsSync, mkdirSync } from "fs";
@@ -25,6 +26,7 @@ import type {
   RecheckPurpose,
   RecheckStatus,
   ResultPurpose,
+  ResultTrust,
   TriageAction,
   TriageClass,
   TriageRecord,
@@ -34,12 +36,16 @@ import type {
 import { TRIAGE_CLASSES } from "../../shared/triage-types.js";
 
 const SCHEMA_VERSION = 1;
+/** Rows of an IN (...) list per statement, well below SQLite's variable limit */
+const CHUNK = 500;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS triage_records (
     id TEXT PRIMARY KEY,
     project TEXT NOT NULL,
     gate_id TEXT NOT NULL,
+    pipeline_id TEXT NOT NULL,
+    trust TEXT NOT NULL,
     sha TEXT NOT NULL,
     branch TEXT NOT NULL,
     base_sha TEXT,
@@ -54,13 +60,15 @@ const SCHEMA = `
     blocking INTEGER NOT NULL DEFAULT 0,
     resolution TEXT,
     failed_steps TEXT NOT NULL,
+    passed_steps TEXT NOT NULL,
     changed_files TEXT NOT NULL,
     received_at TEXT NOT NULL,
     received_ms INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_tr_records_project ON triage_records(project, received_ms);
   CREATE INDEX IF NOT EXISTS idx_tr_records_sha ON triage_records(project, sha);
-  CREATE INDEX IF NOT EXISTS idx_tr_records_branch ON triage_records(project, branch, received_ms);
+  CREATE INDEX IF NOT EXISTS idx_tr_records_branch ON triage_records(project, branch, pipeline_id, received_ms);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_tr_records_gate ON triage_records(project, gate_id);
 
   CREATE TABLE IF NOT EXISTS triage_causes (
     id TEXT PRIMARY KEY,
@@ -80,6 +88,7 @@ const SCHEMA = `
     record_id TEXT NOT NULL,
     outcome TEXT NOT NULL,
     class TEXT,
+    step TEXT,
     at_ms INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_tr_tests_sha ON triage_tests(project, sha, test_key);
@@ -95,6 +104,7 @@ const SCHEMA = `
     detail TEXT NOT NULL,
     argv TEXT,
     output TEXT,
+    actor TEXT,
     at TEXT NOT NULL,
     at_ms INTEGER NOT NULL
   );
@@ -117,6 +127,7 @@ const SCHEMA = `
     attempt INTEGER NOT NULL,
     status TEXT NOT NULL,
     reason TEXT,
+    run_id TEXT,
     created_at TEXT NOT NULL,
     created_ms INTEGER NOT NULL,
     requested_at TEXT,
@@ -148,6 +159,8 @@ const SCHEMA = `
     occurrences INTEGER NOT NULL,
     last_at TEXT NOT NULL,
     quarantined_at TEXT,
+    quarantine_until TEXT,
+    passes INTEGER NOT NULL DEFAULT 0,
     ticket_id TEXT,
     PRIMARY KEY (project, test_key)
   );
@@ -156,6 +169,7 @@ const SCHEMA = `
     id TEXT PRIMARY KEY,
     project TEXT NOT NULL,
     branch TEXT NOT NULL,
+    pipeline_id TEXT NOT NULL,
     status TEXT NOT NULL,
     opened_at TEXT NOT NULL,
     resolved_at TEXT,
@@ -168,12 +182,14 @@ const SCHEMA = `
     revert TEXT NOT NULL,
     decision_ref TEXT
   );
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_tr_incidents_open ON triage_incidents(project, branch) WHERE status = 'open';
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_tr_incidents_open
+    ON triage_incidents(project, branch, pipeline_id) WHERE status = 'open';
 
   CREATE TABLE IF NOT EXISTS triage_protected (
     project TEXT NOT NULL,
     sha TEXT NOT NULL,
     note TEXT NOT NULL,
+    by_who TEXT,
     created_at TEXT NOT NULL,
     PRIMARY KEY (project, sha)
   );
@@ -191,6 +207,8 @@ interface RecordRow {
   id: string;
   project: string;
   gate_id: string;
+  pipeline_id: string;
+  trust: string;
   sha: string;
   branch: string;
   base_sha: string | null;
@@ -205,6 +223,7 @@ interface RecordRow {
   blocking: number;
   resolution: string | null;
   failed_steps: string;
+  passed_steps: string;
   changed_files: string;
   received_at: string;
   received_ms: number;
@@ -230,6 +249,7 @@ interface ActionRow {
   detail: string;
   argv: string | null;
   output: string | null;
+  actor: string | null;
   at: string;
 }
 
@@ -248,6 +268,7 @@ interface RecheckRow {
   attempt: number;
   status: string;
   reason: string | null;
+  run_id: string | null;
   created_at: string;
   requested_at: string | null;
   completed_at: string | null;
@@ -273,6 +294,8 @@ interface FlakyRow {
   occurrences: number;
   last_at: string;
   quarantined_at: string | null;
+  quarantine_until: string | null;
+  passes: number;
   ticket_id: string | null;
 }
 
@@ -280,6 +303,7 @@ interface IncidentRow {
   id: string;
   project: string;
   branch: string;
+  pipeline_id: string;
   status: string;
   opened_at: string;
   resolved_at: string | null;
@@ -296,6 +320,8 @@ interface IncidentRow {
 export interface NewRecord {
   project: string;
   gateId: string;
+  pipelineId: string;
+  trust: ResultTrust;
   sha: string;
   branch: string;
   baseSha?: string;
@@ -307,6 +333,7 @@ export interface NewRecord {
   status: TriageRecord["status"];
   defaultBranch: boolean;
   failedSteps: string[];
+  passedSteps: string[];
   changedFiles: string[];
   receivedAt: string;
   receivedMs: number;
@@ -316,10 +343,17 @@ export interface TestRow {
   key: string;
   outcome: "pass" | "fail";
   cls?: TriageClass;
+  step?: string;
 }
 
 function placeholders(n: number): string {
   return new Array(n).fill("?").join(", ");
+}
+
+function chunks<T>(items: T[], size = CHUNK): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
 }
 
 export class TriageStore {
@@ -344,7 +378,7 @@ export class TriageStore {
     this.db.close();
   }
 
-  /** Run `fn` in one transaction. */
+  /** Run `fn` in one transaction (nested calls join the outer one). */
   transaction<T>(fn: () => T): T {
     return this.db.transaction(fn)();
   }
@@ -356,14 +390,16 @@ export class TriageStore {
     this.db
       .prepare(
         `INSERT INTO triage_records
-           (id, project, gate_id, sha, branch, base_sha, agent, pr, purpose, recheck_id, origin_id, status,
-            default_branch, failed_steps, changed_files, received_at, received_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (id, project, gate_id, pipeline_id, trust, sha, branch, base_sha, agent, pr, purpose, recheck_id, origin_id,
+            status, default_branch, failed_steps, passed_steps, changed_files, received_at, received_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
         record.project,
         record.gateId,
+        record.pipelineId,
+        record.trust,
         record.sha,
         record.branch,
         record.baseSha ?? null,
@@ -375,11 +411,19 @@ export class TriageStore {
         record.status,
         record.defaultBranch ? 1 : 0,
         JSON.stringify(record.failedSteps),
+        JSON.stringify(record.passedSteps),
         JSON.stringify(record.changedFiles),
         record.receivedAt,
         record.receivedMs,
       );
     return id;
+  }
+
+  /** True when a result with this gate id was already ingested. */
+  hasGateResult(project: string, gateId: string): boolean {
+    return (
+      this.db.prepare(`SELECT 1 FROM triage_records WHERE project = ? AND gate_id = ?`).get(project, gateId) !== undefined
+    );
   }
 
   updateRecord(
@@ -439,6 +483,8 @@ export class TriageStore {
       id: row.id,
       project: row.project,
       gateId: row.gate_id,
+      pipelineId: row.pipeline_id,
+      trust: row.trust as ResultTrust,
       sha: row.sha,
       branch: row.branch,
       baseSha: row.base_sha ?? undefined,
@@ -490,7 +536,7 @@ export class TriageStore {
     }
     if (options.sha) {
       where.push("sha = ?");
-      args.push(options.sha);
+      args.push(options.sha.toLowerCase());
     }
     args.push(options.limit ?? 100);
     const rows = this.db
@@ -499,39 +545,58 @@ export class TriageStore {
     return rows.map((row) => this.toRecord(row));
   }
 
-  /** The newest result at a commit, of the given purposes. */
-  latestAt(project: string, sha: string, purposes: ResultPurpose[]): TriageRecord | null {
+  /** The newest gate run (not a re-check or probe) of a pipeline at exactly this commit, received since `sinceMs`. */
+  baseResult(project: string, sha: string, pipelineId: string, sinceMs: number, excludeId: string): TriageRecord | null {
     const row = this.db
       .prepare(
-        `SELECT * FROM triage_records WHERE project = ? AND sha = ? AND purpose IN (${placeholders(purposes.length)})
+        `SELECT * FROM triage_records WHERE project = ? AND sha = ? AND pipeline_id = ? AND purpose = 'gate'
+           AND received_ms >= ? AND id != ?
          ORDER BY received_ms DESC, rowid DESC LIMIT 1`,
       )
-      .get(project, sha, ...purposes) as RecordRow | undefined;
+      .get(project, sha.toLowerCase(), pipelineId, sinceMs, excludeId) as RecordRow | undefined;
     return row ? this.toRecord(row) : null;
   }
 
-  /** The newest gate result on a branch, optionally only passed ones. */
-  latestOnBranch(project: string, branch: string, options: { passed?: boolean; beforeMs?: number } = {}): TriageRecord | null {
-    const row = this.db
+  /**
+   * The newest passed gate run of a pipeline on a branch, received at or
+   * before `beforeMs`, that ran (and passed) every one of `steps`.
+   */
+  lastGreen(project: string, branch: string, pipelineId: string, steps: string[], beforeMs: number): TriageRecord | null {
+    const rows = this.db
       .prepare(
-        `SELECT * FROM triage_records WHERE project = ? AND branch = ? AND purpose = 'gate'
-           ${options.passed ? "AND status = 'passed'" : ""} AND received_ms <= ?
-         ORDER BY received_ms DESC, rowid DESC LIMIT 1`,
+        `SELECT * FROM triage_records WHERE project = ? AND branch = ? AND pipeline_id = ? AND purpose = 'gate'
+           AND status = 'passed' AND received_ms <= ?
+         ORDER BY received_ms DESC, rowid DESC LIMIT 200`,
       )
-      .get(project, branch, options.beforeMs ?? Number.MAX_SAFE_INTEGER) as RecordRow | undefined;
+      .all(project, branch, pipelineId, beforeMs) as RecordRow[];
+    const row = rows.find((r) => {
+      const passed = new Set(JSON.parse(r.passed_steps) as string[]);
+      return steps.every((s) => passed.has(s));
+    });
     return row ? this.toRecord(row) : null;
+  }
+
+  /** The steps a record ran and passed. */
+  passedSteps(id: string): string[] {
+    const row = this.db.prepare(`SELECT passed_steps FROM triage_records WHERE id = ?`).get(id) as
+      | { passed_steps: string }
+      | undefined;
+    return row ? (JSON.parse(row.passed_steps) as string[]) : [];
   }
 
   /** Gate results at any of these commits, newest first. */
   recordsAt(project: string, shas: string[]): TriageRecord[] {
-    if (shas.length === 0) return [];
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM triage_records WHERE project = ? AND sha IN (${placeholders(shas.length)}) AND purpose = 'gate'
-         ORDER BY received_ms DESC, rowid DESC`,
-      )
-      .all(project, ...shas) as RecordRow[];
-    return rows.map((row) => this.toRecord(row));
+    const out: TriageRecord[] = [];
+    for (const part of chunks(shas.map((s) => s.toLowerCase()))) {
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM triage_records WHERE project = ? AND sha IN (${placeholders(part.length)}) AND purpose = 'gate'
+           ORDER BY received_ms DESC, rowid DESC`,
+        )
+        .all(project, ...part) as RecordRow[];
+      out.push(...rows.map((row) => this.toRecord(row)));
+    }
+    return out;
   }
 
   counts(project: string): { failures: number; blocking: number; byClass: Record<TriageClass, number> } {
@@ -556,10 +621,12 @@ export class TriageStore {
 
   addTests(project: string, sha: string, recordId: string, rows: TestRow[], atMs: number): void {
     const insert = this.db.prepare(
-      `INSERT INTO triage_tests (project, sha, test_key, record_id, outcome, class, at_ms) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO triage_tests (project, sha, test_key, record_id, outcome, class, step, at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     this.transaction(() => {
-      for (const row of rows) insert.run(project, sha, row.key, recordId, row.outcome, row.cls ?? null, atMs);
+      for (const row of rows) {
+        insert.run(project, sha, row.key, recordId, row.outcome, row.cls ?? null, row.step ?? null, atMs);
+      }
     });
   }
 
@@ -570,7 +637,7 @@ export class TriageStore {
     keys: string[],
     sinceMs: number,
     untilMs: number,
-    excludeRecord?: string,
+    excludeRecord: string,
   ): Map<string, { recordId: string; at: string }> {
     const found = new Map<string, { recordId: string; at: string }>();
     if (keys.length === 0) return found;
@@ -580,7 +647,7 @@ export class TriageStore {
        ORDER BY at_ms DESC LIMIT 1`,
     );
     for (const key of new Set(keys)) {
-      const row = select.get(project, sha, key, sinceMs, untilMs, excludeRecord ?? "") as
+      const row = select.get(project, sha, key, sinceMs, untilMs, excludeRecord) as
         | { test_key: string; record_id: string; at_ms: number }
         | undefined;
       if (row) found.set(key, { recordId: row.record_id, at: new Date(row.at_ms).toISOString() });
@@ -589,24 +656,40 @@ export class TriageStore {
   }
 
   /** Failures of these tests at a commit since `sinceMs`, from other results. */
-  failsAt(project: string, sha: string, keys: string[], sinceMs: number, excludeRecord: string): { recordId: string; key: string; cls: TriageClass | null }[] {
-    if (keys.length === 0) return [];
-    const rows = this.db
-      .prepare(
-        `SELECT record_id, test_key, class FROM triage_tests
-         WHERE project = ? AND sha = ? AND outcome = 'fail' AND at_ms >= ? AND record_id != ?
-           AND test_key IN (${placeholders(keys.length)})`,
-      )
-      .all(project, sha, sinceMs, excludeRecord, ...keys) as { record_id: string; test_key: string; class: string | null }[];
-    return rows.map((r) => ({ recordId: r.record_id, key: r.test_key, cls: (r.class as TriageClass | null) ?? null }));
+  failsAt(
+    project: string,
+    sha: string,
+    keys: string[],
+    sinceMs: number,
+    excludeRecord: string,
+  ): { recordId: string; key: string; cls: TriageClass | null }[] {
+    const out: { recordId: string; key: string; cls: TriageClass | null }[] = [];
+    for (const part of chunks([...new Set(keys)])) {
+      const rows = this.db
+        .prepare(
+          `SELECT record_id, test_key, class FROM triage_tests
+           WHERE project = ? AND sha = ? AND outcome = 'fail' AND at_ms >= ? AND record_id != ?
+             AND test_key IN (${placeholders(part.length)})`,
+        )
+        .all(project, sha, sinceMs, excludeRecord, ...part) as { record_id: string; test_key: string; class: string | null }[];
+      out.push(...rows.map((r) => ({ recordId: r.record_id, key: r.test_key, cls: (r.class as TriageClass | null) ?? null })));
+    }
+    return out;
   }
 
-  /** Every test that failed at a commit since `sinceMs`. */
-  failedKeysAt(project: string, sha: string, sinceMs: number): string[] {
-    const rows = this.db
-      .prepare(`SELECT DISTINCT test_key FROM triage_tests WHERE project = ? AND sha = ? AND outcome = 'fail' AND at_ms >= ?`)
-      .all(project, sha, sinceMs) as { test_key: string }[];
-    return rows.map((r) => r.test_key);
+  /** Tests that failed at a commit, in one of these steps, since `sinceMs`. */
+  failedKeysInSteps(project: string, sha: string, steps: string[], sinceMs: number): string[] {
+    const keys = new Set<string>();
+    for (const part of chunks([...new Set(steps)])) {
+      const rows = this.db
+        .prepare(
+          `SELECT DISTINCT test_key FROM triage_tests
+           WHERE project = ? AND sha = ? AND outcome = 'fail' AND at_ms >= ? AND step IN (${placeholders(part.length)})`,
+        )
+        .all(project, sha, sinceMs, ...part) as { test_key: string }[];
+      for (const r of rows) keys.add(r.test_key);
+    }
+    return [...keys];
   }
 
   setTestClass(recordId: string, keys: string[], cls: TriageClass): void {
@@ -633,8 +716,8 @@ export class TriageStore {
     const id = randomUUID();
     this.db
       .prepare(
-        `INSERT INTO triage_actions (id, project, record_id, incident_id, kind, status, detail, argv, output, at, at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO triage_actions (id, project, record_id, incident_id, kind, status, detail, argv, output, actor, at, at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -646,6 +729,7 @@ export class TriageStore {
         action.detail,
         action.argv ? JSON.stringify(action.argv) : null,
         action.output ?? null,
+        action.actor ?? null,
         action.at,
         atMs,
       );
@@ -702,7 +786,15 @@ export class TriageStore {
 
   updateRecheck(
     id: string,
-    patch: { status?: RecheckStatus; reason?: string; requestedAt?: string; requestedMs?: number; completedAt?: string; answerId?: string },
+    patch: {
+      status?: RecheckStatus;
+      reason?: string;
+      runId?: string;
+      requestedAt?: string;
+      requestedMs?: number;
+      completedAt?: string;
+      answerId?: string;
+    },
   ): void {
     const sets: string[] = [];
     const args: unknown[] = [];
@@ -712,6 +804,7 @@ export class TriageStore {
     };
     if (patch.status !== undefined) add("status", patch.status);
     if (patch.reason !== undefined) add("reason", patch.reason);
+    if (patch.runId !== undefined) add("run_id", patch.runId);
     if (patch.requestedAt !== undefined) add("requested_at", patch.requestedAt);
     if (patch.requestedMs !== undefined) add("requested_ms", patch.requestedMs);
     if (patch.completedAt !== undefined) add("completed_at", patch.completedAt);
@@ -796,11 +889,12 @@ export class TriageStore {
 
   // ============ FLAKY TESTS ============
 
+  /** A flaky occurrence: counted, and a quarantined test's run of passes starts over. */
   bumpFlaky(project: string, key: string, at: string): FlakyTest {
     this.db
       .prepare(
         `INSERT INTO triage_flaky (project, test_key, occurrences, last_at) VALUES (?, ?, 1, ?)
-         ON CONFLICT(project, test_key) DO UPDATE SET occurrences = occurrences + 1, last_at = excluded.last_at`,
+         ON CONFLICT(project, test_key) DO UPDATE SET occurrences = occurrences + 1, last_at = excluded.last_at, passes = 0`,
       )
       .run(project, key, at);
     return this.getFlaky(project, key)!;
@@ -813,15 +907,58 @@ export class TriageStore {
     return row ? toFlaky(row) : null;
   }
 
-  markFlaky(project: string, key: string, patch: { quarantinedAt?: string; ticketId?: string }): void {
-    if (patch.quarantinedAt !== undefined) {
+  setTicket(project: string, key: string, ticketId: string): void {
+    this.db.prepare(`UPDATE triage_flaky SET ticket_id = ? WHERE project = ? AND test_key = ?`).run(ticketId, project, key);
+  }
+
+  quarantine(project: string, key: string, at: string, until: string): void {
+    this.db
+      .prepare(
+        `UPDATE triage_flaky SET quarantined_at = ?, quarantine_until = ?, passes = 0
+         WHERE project = ? AND test_key = ? AND quarantined_at IS NULL`,
+      )
+      .run(at, until, project, key);
+  }
+
+  /** End a quarantine; false when the test was not quarantined. */
+  liftQuarantine(project: string, key: string): boolean {
+    return (
       this.db
-        .prepare(`UPDATE triage_flaky SET quarantined_at = COALESCE(quarantined_at, ?) WHERE project = ? AND test_key = ?`)
-        .run(patch.quarantinedAt, project, key);
-    }
-    if (patch.ticketId !== undefined) {
-      this.db.prepare(`UPDATE triage_flaky SET ticket_id = ? WHERE project = ? AND test_key = ?`).run(patch.ticketId, project, key);
-    }
+        .prepare(
+          `UPDATE triage_flaky SET quarantined_at = NULL, quarantine_until = NULL, passes = 0
+           WHERE project = ? AND test_key = ? AND quarantined_at IS NOT NULL`,
+        )
+        .run(project, key).changes > 0
+    );
+  }
+
+  /** A quarantined test passed: its run of passes, or null when it is not quarantined. */
+  quarantinedPass(project: string, key: string): number | null {
+    const result = this.db
+      .prepare(
+        `UPDATE triage_flaky SET passes = passes + 1 WHERE project = ? AND test_key = ? AND quarantined_at IS NOT NULL`,
+      )
+      .run(project, key);
+    if (result.changes === 0) return null;
+    return this.getFlaky(project, key)?.passes ?? null;
+  }
+
+  /** A quarantined test failed: its run of passes starts over. */
+  quarantinedFail(project: string, key: string): void {
+    this.db
+      .prepare(`UPDATE triage_flaky SET passes = 0 WHERE project = ? AND test_key = ? AND quarantined_at IS NOT NULL`)
+      .run(project, key);
+  }
+
+  /** Quarantined tests whose quarantine ended before `at`. */
+  expiredQuarantines(project: string, at: string): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT test_key FROM triage_flaky WHERE project = ? AND quarantined_at IS NOT NULL
+           AND quarantine_until IS NOT NULL AND quarantine_until <= ?`,
+      )
+      .all(project, at) as { test_key: string }[];
+    return rows.map((r) => r.test_key);
   }
 
   listFlaky(project: string): FlakyTest[] {
@@ -845,13 +982,14 @@ export class TriageStore {
     this.db
       .prepare(
         `INSERT INTO triage_incidents
-           (id, project, branch, status, opened_at, red_sha, last_green_sha, record_id, target, bisect, revert)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (id, project, branch, pipeline_id, status, opened_at, red_sha, last_green_sha, record_id, target, bisect, revert)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
         incident.project,
         incident.branch,
+        incident.pipelineId,
         incident.status,
         incident.openedAt,
         incident.redSha,
@@ -893,11 +1031,20 @@ export class TriageStore {
     return row ? toIncident(row) : null;
   }
 
-  openIncident(project: string, branch: string): Incident | null {
+  /** The open incident of a pipeline on a branch. */
+  openIncident(project: string, branch: string, pipelineId: string): Incident | null {
     const row = this.db
-      .prepare(`SELECT * FROM triage_incidents WHERE project = ? AND branch = ? AND status = 'open'`)
-      .get(project, branch) as IncidentRow | undefined;
+      .prepare(`SELECT * FROM triage_incidents WHERE project = ? AND branch = ? AND pipeline_id = ? AND status = 'open'`)
+      .get(project, branch, pipelineId) as IncidentRow | undefined;
     return row ? toIncident(row) : null;
+  }
+
+  /** Every open incident of a project, newest first. */
+  openIncidents(project: string): Incident[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM triage_incidents WHERE project = ? AND status = 'open' ORDER BY opened_at DESC, rowid DESC`)
+      .all(project) as IncidentRow[];
+    return rows.map(toIncident);
   }
 
   listIncidents(project: string, options: { status?: "open" | "resolved"; limit?: number } = {}): Incident[] {
@@ -915,13 +1062,13 @@ export class TriageStore {
 
   // ============ PROTECTED MERGES ============
 
-  protect(project: string, sha: string, note: string, at: string): void {
+  protect(project: string, sha: string, note: string, by: string | undefined, at: string): void {
     this.db
       .prepare(
-        `INSERT INTO triage_protected (project, sha, note, created_at) VALUES (?, ?, ?, ?)
-         ON CONFLICT(project, sha) DO UPDATE SET note = excluded.note`,
+        `INSERT INTO triage_protected (project, sha, note, by_who, created_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(project, sha) DO UPDATE SET note = excluded.note, by_who = excluded.by_who`,
       )
-      .run(project, sha.toLowerCase(), note, at);
+      .run(project, sha.toLowerCase(), note, by ?? null, at);
   }
 
   unprotect(project: string, sha: string): boolean {
@@ -930,9 +1077,9 @@ export class TriageStore {
 
   listProtected(project: string): ProtectedMerge[] {
     const rows = this.db
-      .prepare(`SELECT sha, note, created_at FROM triage_protected WHERE project = ? ORDER BY created_at DESC, rowid DESC`)
-      .all(project) as { sha: string; note: string; created_at: string }[];
-    return rows.map((r) => ({ sha: r.sha, note: r.note, createdAt: r.created_at }));
+      .prepare(`SELECT sha, note, by_who, created_at FROM triage_protected WHERE project = ? ORDER BY created_at DESC, rowid DESC`)
+      .all(project) as { sha: string; note: string; by_who: string | null; created_at: string }[];
+    return rows.map((r) => ({ sha: r.sha, note: r.note, by: r.by_who ?? undefined, createdAt: r.created_at }));
   }
 
   // ============ DECISIONS ============
@@ -944,6 +1091,11 @@ export class TriageStore {
         .prepare(`INSERT OR IGNORE INTO triage_decisions (project, subject, created_at) VALUES (?, ?, ?)`)
         .run(project, subject, at).changes > 0
     );
+  }
+
+  /** An answered subject may be asked about again. */
+  releaseDecision(project: string, subject: string): void {
+    this.db.prepare(`DELETE FROM triage_decisions WHERE project = ? AND subject = ?`).run(project, subject);
   }
 
   setDecisionRef(project: string, subject: string, ref: string): void {
@@ -962,6 +1114,7 @@ function toAction(row: ActionRow): TriageAction {
     detail: row.detail,
     argv: row.argv ? (JSON.parse(row.argv) as string[]) : undefined,
     output: row.output ?? undefined,
+    actor: row.actor ?? undefined,
     at: row.at,
   };
 }
@@ -982,6 +1135,7 @@ function toRecheck(row: RecheckRow): Recheck {
     attempt: row.attempt,
     status: row.status as RecheckStatus,
     reason: row.reason ?? undefined,
+    runId: row.run_id ?? undefined,
     createdAt: row.created_at,
     requestedAt: row.requested_at ?? undefined,
     completedAt: row.completed_at ?? undefined,
@@ -1010,6 +1164,8 @@ function toFlaky(row: FlakyRow): FlakyTest {
     occurrences: row.occurrences,
     lastAt: row.last_at,
     quarantinedAt: row.quarantined_at ?? undefined,
+    quarantineUntil: row.quarantine_until ?? undefined,
+    passes: row.passes,
     ticketId: row.ticket_id ?? undefined,
   };
 }
@@ -1019,6 +1175,7 @@ function toIncident(row: IncidentRow): Incident {
     id: row.id,
     project: row.project,
     branch: row.branch,
+    pipelineId: row.pipeline_id,
     status: row.status as Incident["status"],
     openedAt: row.opened_at,
     resolvedAt: row.resolved_at ?? undefined,

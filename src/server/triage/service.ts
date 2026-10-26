@@ -1,9 +1,14 @@
 /**
  * The triage service: one TriageService per project with `triage.enabled`.
  *
- * ingest(result) for every gate result (a POST, or a `gate.completed` event):
+ * ingest(result) for every gate result: in-process from the gates module
+ * (trusted: the gate.completed event), or a SignedGateResult over HTTP
+ * (signed: verified against a trusted node key; only its re-check id is read
+ * from its context, and the base comes from git):
  * 1. parse its reports and failed steps into causes;
- * 2. record which tests failed and passed at that commit;
+ * 2. record which tests failed and passed at that commit. A test passed
+ *    only when a report lists it as passed, or the run ran and passed the
+ *    step it failed in;
  * 3. classify each cause (infra, flaky, pre-existing, code) with evidence;
  * 4. earlier failures at the same commit whose tests now passed become flaky;
  * 5. act per class: infra -> one re-check of only the failed tests at the
@@ -11,11 +16,14 @@
  *    not blocking, one fix task on the default branch; flaky -> recorded,
  *    a reliability task after `ticket_after` in a row; code -> back to the
  *    author agent with the tests and a log excerpt;
- * 6. on the default branch: red opens an incident and bisects the merges
- *    since the last green commit; green resolves it.
+ * 6. on the default branch: red opens an incident (per pipeline) and
+ *    bisects the merges since its last green run; a green run of the same
+ *    pipeline that ran the failing steps resolves it.
  *
- * Calls for one project run one at a time, so the bisect state and the
- * re-check queue never race.
+ * Decisions run one at a time per project (the serial queue), each in one
+ * store transaction that never waits on anything slow. Commands, decisions
+ * and events go to an outbox drained outside the queue, so a re-check
+ * command that posts its answer straight back never waits on itself.
  */
 import { randomUUID } from "crypto";
 import type { EventBus } from "../core/event-bus.js";
@@ -32,19 +40,24 @@ import type {
   Recheck,
   RecheckStatus,
   ResultPurpose,
+  ResultTrust,
   TestRef,
   TriageAction,
   TriageRecord,
   TriageTask,
   Verdict,
 } from "../../shared/triage-types.js";
-import { actBlockedReason, type TriageSettings } from "./config.js";
-import { parseGateEvidence, type EvidenceParser, type ReportInput } from "./parsers/index.js";
+import type { DecisionProducer, DecisionResolution } from "../decisions/types.js";
+import { verifySignedGateResult } from "../gates/signature.js";
+import { FULL_SHA, actBlockedReason, type TriageSettings } from "./config.js";
+import { parseGateEvidence, type EvidenceParser, type GateEvidence, type ReportInput } from "./parsers/index.js";
 import { classifyCause, overallClass, type BaseFacts, type ClassifyContext } from "./classifier.js";
-import type { NewRecord, TestRow, TriageStore } from "./store.js";
+import type { TestRow, TriageStore } from "./store.js";
 import type { CommitInfo, GitProbe } from "./git.js";
 import {
+  DECISION_MODULE,
   InboxDecisionRaiser,
+  InboxDecisions,
   LimitsCapacity,
   decisionVars,
   messageVars,
@@ -57,6 +70,7 @@ import {
   type CapacityProbe,
   type DecisionRaiser,
   type DecisionRequest,
+  type RevertRequest,
   type TriageAdapters,
 } from "./adapters.js";
 import { applyProbe, nextStep, retryProbe, startBisect, type ProbeOutcome } from "./bisect.js";
@@ -65,11 +79,11 @@ import type { Clock, CommandRunner } from "../watchdog/probes.js";
 
 // ============ INPUT AND ERRORS ============
 
-/** What the gate runner knows besides the result. */
+/** What the gate runner knows besides the result. Only a trusted result's context is read whole. */
 export interface IngestContext {
-  /** The commit the change is based on (a PR's base) */
+  /** The commit the change is based on (a PR's base); from git when missing */
   baseSha?: string;
-  /** Files the change touched; computed with git from baseSha when missing */
+  /** Files the change touched; from git (base...head) when missing */
   changedFiles?: string[];
   /** The agent that authored the change */
   agent?: string;
@@ -84,6 +98,7 @@ export interface IngestInput {
   result: GateResult;
   reports?: ReportInput[];
   context?: IngestContext;
+  trust: ResultTrust;
 }
 
 export interface IngestOutcome {
@@ -95,6 +110,8 @@ export interface IngestOutcome {
 
 /** Bad input: HTTP 400. */
 export class TriageInputError extends Error {}
+/** Not from a trusted source: HTTP 403. */
+export class TriageForbiddenError extends Error {}
 /** Unknown id: HTTP 404. */
 export class TriageNotFoundError extends Error {}
 /** Not possible in the current state (triage off, already answered, commands blocked): HTTP 409. */
@@ -118,13 +135,40 @@ export interface TriageServiceOptions {
   adapters: TriageAdapters;
   /** True when adapters.decisions is the raise_decision command (it doesn't run in observe mode) */
   decisionsViaCommand?: boolean;
+  /** Trusted nodes' public keys (PEM), by node id */
+  nodeKeys: Map<string, string>;
   parsers: EvidenceParser[];
   events?: EventBus;
 }
 
-type Target = { recordId?: string; incidentId?: string };
+/** A signed result as POSTed: the result object exactly as signed. */
+export interface SignedInput {
+  result: Record<string, unknown>;
+  signature: string;
+  nodePublicKey: string;
+}
 
-const OPEN_RECHECK: RecheckStatus[] = ["waiting_capacity", "requested", "planned", "unavailable"];
+type Target = { recordId?: string; incidentId?: string };
+type Job = () => Promise<void>;
+
+/** What one decision section leaves to do once its transaction commits. */
+interface Section {
+  jobs: Job[];
+  events: { type: EventType; data: Record<string, unknown> }[];
+  dispatch: boolean;
+}
+
+interface IncidentPlan {
+  target: IncidentTarget;
+  lastGreenSha?: string;
+  bisect: BisectState;
+}
+
+/** A re-check that an answer may still come back for. */
+const ANSWERABLE: RecheckStatus[] = ["dispatching", "requested"];
+const OPEN_RECHECK: RecheckStatus[] = ["waiting_capacity", "dispatching", "requested", "planned", "unavailable"];
+/** A re-check left "dispatching" this long (the server stopped mid-request) is given up */
+const DISPATCH_STALE_MS = 10 * 60_000;
 
 function short(sha: string): string {
   return sha.slice(0, 8);
@@ -149,12 +193,6 @@ function unique(items: string[]): string[] {
   return [...new Set(items)];
 }
 
-function sameSha(a: string, b: string): boolean {
-  const x = a.toLowerCase();
-  const y = b.toLowerCase();
-  return x.startsWith(y) || y.startsWith(x);
-}
-
 function selection(recheck: Pick<Recheck, "tests" | "classes" | "steps">): string {
   if (recheck.tests.length > 0) {
     return `${recheck.tests.length} test(s) in ${recheck.classes.slice(0, 5).join(", ")}${recheck.classes.length > 5 ? ", ..." : ""}`;
@@ -168,13 +206,40 @@ function describe(cause: ClassifiedCause): string {
   return `${tests}: ${clip(c.type ? `${c.type}: ${c.message}` : c.message, 160)}`;
 }
 
+async function settle(run: () => Promise<AdapterResult>): Promise<AdapterResult> {
+  try {
+    return await run();
+  } catch (e) {
+    return { ok: false, detail: message(e) };
+  }
+}
+
+/** `promise`, or a failed result after `ms`. */
+function withTimeout(promise: Promise<AdapterResult>, ms: number): Promise<AdapterResult> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<AdapterResult>((resolve) => {
+    timer = setTimeout(() => resolve({ ok: false, detail: `no answer within ${Math.round(ms / 1000)} s` }), ms);
+    timer.unref();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function stopped(status: BisectState["status"], detail: string): BisectState {
+  return { status, candidates: [], good: -1, bad: -1, skipped: [], probes: [], proven: false, detail };
+}
+
 export class TriageService {
   readonly project: string;
   readonly settings: TriageSettings;
   private queue: Promise<unknown> = Promise.resolve();
+  private outbox: Job[] = [];
+  private draining: Promise<void> | null = null;
+  private dispatchQueued = false;
   private git: GitProbe;
   private capacity: CapacityProbe;
   private decisions?: DecisionRaiser;
+  private decisionsViaCommand: boolean;
+  private unsubscribe?: () => void;
 
   constructor(private o: TriageServiceOptions) {
     this.project = o.project;
@@ -183,6 +248,20 @@ export class TriageService {
     this.capacity = o.adapters.capacity ?? new LimitsCapacity(o.settings.recheck, o.probes.runner);
     const file = o.settings.decisionFile ?? o.config.inbox_file;
     this.decisions = o.adapters.decisions ?? (file ? new InboxDecisionRaiser(file, o.probes.fs, o.probes.clock) : undefined);
+    this.decisionsViaCommand = o.decisionsViaCommand === true;
+  }
+
+  /** Raise decisions in the Decision Inbox, and follow their answers. */
+  useDecisions(inbox: DecisionProducer): void {
+    this.decisions = new InboxDecisions(inbox);
+    this.decisionsViaCommand = false;
+    this.unsubscribe?.();
+    this.unsubscribe = inbox.onResolved(DECISION_MODULE, (r) => this.followDecision(r), { project: this.project });
+  }
+
+  close(): void {
+    this.unsubscribe?.();
+    this.unsubscribe = undefined;
   }
 
   /** Why commands don't run (observe mode, read_only), or null. */
@@ -202,6 +281,10 @@ export class TriageService {
     };
   }
 
+  get trustedNodes(): string[] {
+    return [...this.o.nodeKeys.keys()];
+  }
+
   private now(): number {
     return this.o.probes.clock.now();
   }
@@ -210,16 +293,69 @@ export class TriageService {
     return new Date(ms).toISOString();
   }
 
-  /** Run calls for this project one at a time. */
+  // ============ QUEUE AND OUTBOX ============
+
+  /** Run decisions for this project one at a time. */
   private serial<T>(fn: () => Promise<T>): Promise<T> {
     const run = this.queue.then(fn, fn);
     this.queue = run.catch(() => undefined);
     return run;
   }
 
-  /** Resolves when the calls queued so far have finished. */
-  idle(): Promise<void> {
-    return this.queue.then(() => undefined);
+  /** One decision section: its writes in one transaction; its jobs and events queued after it commits. */
+  private commit<T>(fn: (s: Section) => T): T {
+    const s: Section = { jobs: [], events: [], dispatch: false };
+    const value = this.o.store.transaction(() => fn(s));
+    for (const event of s.events) this.outbox.push(() => this.emit(event.type, event.data));
+    this.outbox.push(...s.jobs);
+    if (s.dispatch && !this.dispatchQueued) {
+      this.dispatchQueued = true;
+      this.outbox.push(() => this.dispatch());
+    }
+    return value;
+  }
+
+  /**
+   * Run the outbox outside the serial queue. Returns at once when a drain is
+   * already running (it takes the new jobs too): a job's command may call
+   * back into ingest(), which must not wait for that very job.
+   */
+  private drain(): Promise<void> {
+    if (this.draining) return Promise.resolve();
+    if (this.outbox.length === 0) return Promise.resolve();
+    const run = async () => {
+      await Promise.resolve();
+      try {
+        while (this.outbox.length > 0) {
+          const job = this.outbox.shift()!;
+          try {
+            await job();
+          } catch (e) {
+            console.warn(`[triage] ${this.project}: ${message(e)}`);
+          }
+        }
+      } finally {
+        this.draining = null;
+      }
+    };
+    this.draining = run();
+    return this.draining;
+  }
+
+  /** Resolves when no decision is queued and the outbox is empty. */
+  async idle(): Promise<void> {
+    for (let i = 0; i < 10_000; i++) {
+      await this.queue;
+      if (this.draining) {
+        await this.draining;
+        continue;
+      }
+      if (this.outbox.length > 0) {
+        await this.drain();
+        continue;
+      }
+      return;
+    }
   }
 
   private async emit(type: EventType, data: Record<string, unknown>): Promise<void> {
@@ -233,6 +369,7 @@ export class TriageService {
     detail: string,
     argv?: string[],
     output?: string,
+    actor?: string,
   ): TriageAction {
     return this.o.store.addAction(
       {
@@ -244,6 +381,7 @@ export class TriageService {
         detail,
         argv,
         output,
+        actor,
         at: this.iso(),
       },
       this.now(),
@@ -251,258 +389,394 @@ export class TriageService {
   }
 
   /**
-   * Run an adapter, or record why it didn't run: observe mode or read_only
-   * (planned, with the argv it would run), no adapter (recorded), or the
-   * adapter's result (done or failed).
+   * Queue an adapter call, or record why it doesn't run: observe mode or
+   * read_only (planned, with the argv it would run), or no adapter
+   * (recorded). The call runs from the outbox; its result is recorded in a
+   * decision section of its own, where `after` may act on it.
    */
-  private async perform(
+  private perform(
+    s: Section,
     target: Target,
     kind: ActionKind,
     what: string,
     run: (() => Promise<AdapterResult>) | undefined,
     planned: string[] | null,
-  ): Promise<AdapterResult | null> {
+    after?: (result: AdapterResult, s: Section) => void,
+    actor?: string,
+  ): void {
     const blocked = this.actBlocked;
     if (blocked) {
-      this.action(target, kind, "planned", `${what} (not run: ${blocked})`, planned ?? undefined);
-      return null;
+      this.action(target, kind, "planned", `${what} (not run: ${blocked})`, planned ?? undefined, undefined, actor);
+      return;
     }
     if (!run) {
-      this.action(target, kind, "recorded", `${what} (recorded and emitted; no command or module set)`);
-      return null;
+      this.action(target, kind, "recorded", `${what} (recorded and emitted; no command or module set)`, undefined, undefined, actor);
+      return;
     }
-    let result: AdapterResult;
-    try {
-      result = await run();
-    } catch (e) {
-      result = { ok: false, detail: message(e) };
+    s.jobs.push(async () => {
+      const result = await settle(run);
+      await this.serial(async () =>
+        this.commit((s2) => {
+          this.action(target, kind, result.ok ? "done" : "failed", `${what}: ${result.detail}`, result.argv, result.output, actor);
+          after?.(result, s2);
+        }),
+      );
+    });
+  }
+
+  // ============ TRUST ============
+
+  /** Throws unless a trusted node signed this result (its key from triage.trusted_nodes). */
+  verifySigned(signed: SignedInput): void {
+    const nodeId = typeof signed.result.nodeId === "string" ? signed.result.nodeId : "";
+    const key = this.o.nodeKeys.get(nodeId);
+    if (!key) {
+      throw new TriageForbiddenError(
+        nodeId ? `Node ${clip(nodeId, 80)} is not trusted (triage.trusted_nodes)` : "The result names no node (nodeId)",
+      );
     }
-    this.action(target, kind, result.ok ? "done" : "failed", `${what}: ${result.detail}`, result.argv, result.output);
-    return result;
+    const check = verifySignedGateResult(
+      { result: signed.result as unknown as GateResult, signature: signed.signature, nodePublicKey: key },
+      key,
+    );
+    if (!check.valid) throw new TriageForbiddenError(`The signature does not verify: ${check.errors.join("; ")}`);
   }
 
   // ============ INGEST ============
 
-  ingest(input: IngestInput): Promise<IngestOutcome> {
-    return this.serial(() => this.doIngest(input));
+  async ingest(input: IngestInput): Promise<IngestOutcome> {
+    const recordId = await this.serial(() => this.decideIngest(input));
+    await this.drain();
+    return this.serial(async () => this.outcome(recordId));
   }
 
-  /** Expire, advance and request re-checks and bisect probes. */
-  tick(): Promise<void> {
-    return this.serial(() => this.pump());
+  /** Expire, advance and request re-checks and bisect probes; release ended quarantines. */
+  async tick(): Promise<void> {
+    await this.serial(async () => this.commit((s) => this.pumpSync(s)));
+    await this.drain();
   }
 
-  private async doIngest(input: IngestInput): Promise<IngestOutcome> {
+  private outcome(recordId: string): IngestOutcome {
+    const { store, settings, project } = this.o;
+    const record = store.getRecord(recordId)!;
+    return {
+      record,
+      actions: store.actionsFor({ recordId }),
+      rechecks: store.rechecksFor({ recordId: record.originId ?? recordId }),
+      incident: store.openIncident(project, settings.defaultBranch, record.pipelineId),
+    };
+  }
+
+  private async decideIngest(input: IngestInput): Promise<string> {
     const { store, settings, project } = this.o;
     const result = input.result;
-    const context = input.context ?? {};
+    // A signed result over HTTP: its context is not signed, so only its re-check id is read
+    const context: IngestContext =
+      input.trust === "trusted" ? (input.context ?? {}) : { recheckId: input.context?.recheckId };
+    const sha = result.commitSha.toLowerCase();
+    if (!FULL_SHA.test(sha)) throw new TriageInputError("commitSha must be a full commit sha (40 or 64 hex characters)");
+    if (store.hasGateResult(project, result.id)) {
+      throw new TriageConflictError(`A result with id ${clip(result.id, 80)} was already received`);
+    }
     const nowMs = this.now();
-    const at = this.iso(nowMs);
-    const sha = result.commitSha;
 
     let recheck: Recheck | null = null;
     if (context.recheckId) {
       recheck = store.getRecheck(context.recheckId);
       if (!recheck || recheck.project !== project) throw new TriageNotFoundError(`No re-check ${context.recheckId}`);
-      if (!sameSha(recheck.sha, sha)) {
+      if (recheck.sha.toLowerCase() !== sha) {
         throw new TriageInputError(`Re-check ${short(recheck.id)} is for ${recheck.sha}, not ${sha}`);
       }
-      if (recheck.status === "passed" || recheck.status === "failed" || recheck.status === "cancelled") {
-        throw new TriageConflictError(`Re-check ${short(recheck.id)} is already ${recheck.status}`);
+      if (recheck.branch !== result.branch) {
+        throw new TriageInputError(`Re-check ${short(recheck.id)} is for branch ${recheck.branch}, not ${result.branch}`);
+      }
+      if (!ANSWERABLE.includes(recheck.status)) {
+        throw new TriageConflictError(`Re-check ${short(recheck.id)} is ${recheck.status}: it was not requested, or it was already answered`);
+      }
+      if (result.id !== recheck.id && result.id !== recheck.runId) {
+        throw new TriageConflictError(
+          `An answer to re-check ${short(recheck.id)} must have its id (${recheck.id})${recheck.runId ? ` or its run id (${recheck.runId})` : ""} as the result id`,
+        );
       }
     }
     const origin = recheck?.recordId ? store.getRecord(recheck.recordId) : null;
     const purpose: ResultPurpose = recheck ? (recheck.purpose === "bisect" ? "bisect" : "recheck") : "gate";
     const isDefault = result.branch === settings.defaultBranch;
-    const baseSha = context.baseSha ?? origin?.baseSha;
     const failed = result.status !== "passed";
+    const pipelineId = result.pipelineId;
+    const passedSteps = result.steps.filter((st) => st.status === "passed").map((st) => st.name);
+    const failedSteps = result.steps.filter((st) => st.status === "failed" || st.status === "timed_out").map((st) => st.name);
 
-    // 1. Causes
     const evidence = parseGateEvidence(result, input.reports ?? [], {
       contextPatterns: settings.contextPatterns,
       parsers: this.o.parsers,
     });
 
-    // 2. Changed files
-    let changedFiles = context.changedFiles ?? origin?.changedFiles ?? [];
-    let changedNote: string | undefined;
-    if (!context.changedFiles && !origin && baseSha && !isDefault && failed) {
-      try {
-        changedFiles = await this.git.changedFiles(baseSha, sha);
-      } catch (e) {
-        changedNote = `the changed files are unknown (${clip(message(e), 160)})`;
+    // The base and the changed files: a trusted result's context, else git
+    let baseSha = context.baseSha?.toLowerCase() ?? origin?.baseSha;
+    let changedFiles = context.changedFiles ?? origin?.changedFiles;
+    const notes: string[] = [];
+    if (!isDefault && !origin) {
+      if (!baseSha) {
+        try {
+          baseSha = (await this.git.mergeBase(sha, settings.defaultBranch)) ?? undefined;
+          if (!baseSha) notes.push(`${short(sha)} shares no history with ${settings.defaultBranch}`);
+        } catch (e) {
+          notes.push(`the base commit is unknown (${clip(message(e), 160)})`);
+        }
+      }
+      if (!changedFiles && baseSha && failed) {
+        try {
+          changedFiles = await this.git.changedFiles(baseSha, sha);
+        } catch (e) {
+          notes.push(`the changed files are unknown (${clip(message(e), 160)})`);
+        }
       }
     }
 
-    const record: NewRecord = {
-      project,
-      gateId: result.id,
-      sha,
-      branch: result.branch,
-      baseSha,
-      agent: context.agent ?? origin?.agent,
-      pr: context.pr ?? origin?.pr,
-      purpose,
-      recheckId: recheck?.id,
-      originId: origin?.id,
-      status: result.status,
-      defaultBranch: isDefault,
-      failedSteps: result.steps.filter((s) => s.status === "failed" || s.status === "timed_out").map((s) => s.name),
-      changedFiles,
-      receivedAt: at,
-      receivedMs: nowMs,
-    };
-    const recordId = store.insertRecord(record);
-
-    // 3. Which tests passed at this commit
-    const windowMs = settings.flaky.windowMinutes * 60000;
-    const passedKeys = new Set(evidence.passed.map((t) => t.key));
-    const requested = this.requestedKeys(recheck, origin);
-    if (!failed) {
-      if (purpose === "gate") for (const key of store.failedKeysAt(project, sha, nowMs - windowMs)) passedKeys.add(key);
-      for (const key of requested) passedKeys.add(key);
-    } else if (requested.length > 0 && evidence.causes.some((c) => c.tests.length > 0)) {
-      const failing = new Set(evidence.causes.flatMap((c) => c.tests.map((t) => t.key)));
-      for (const key of requested) if (!failing.has(key)) passedKeys.add(key);
+    // The default branch's open incident counts for a change only when its base includes the red commit
+    let incident = store.openIncident(project, settings.defaultBranch, pipelineId);
+    if (incident && !isDefault) {
+      let applies = false;
+      if (baseSha) {
+        try {
+          applies = baseSha === incident.redSha.toLowerCase() || (await this.git.isAncestor(incident.redSha, baseSha));
+        } catch {
+          applies = false;
+        }
+      }
+      if (!applies) incident = null;
     }
 
-    // 4. Classify
-    let classified: ClassifiedCause[] = [];
-    if (failed) {
-      const ctx = this.classifyContext({
+    const classified = failed
+      ? this.classify(evidence, {
+          sha,
+          isDefault,
+          baseSha,
+          pipelineId,
+          changedFiles: changedFiles ?? [],
+          notes,
+          nowMs,
+          loadPerCore: context.loadPerCore,
+          incident,
+        })
+      : [];
+
+    // A red default branch: what the incident's bisect needs from git, read before the transaction
+    const regressions = isDefault && purpose !== "bisect" && failed ? classified.filter((c) => c.verdict.class === "code") : [];
+    const plan =
+      regressions.length > 0 && !store.openIncident(project, result.branch, pipelineId)
+        ? await this.planIncident(result.branch, pipelineId, sha, regressions, failedSteps, nowMs)
+        : null;
+
+    return this.commit((s) => {
+      const windowMs = settings.flaky.windowMinutes * 60000;
+      const id = store.insertRecord({
+        project,
+        gateId: result.id,
+        pipelineId,
+        trust: input.trust,
         sha,
-        isDefault,
+        branch: result.branch,
         baseSha,
-        changedFiles,
-        changedNote,
-        recordId,
-        nowMs,
-        loadPerCore: context.loadPerCore,
-        keys: evidence.causes.flatMap((c) => c.tests.map((t) => t.key)),
+        agent: context.agent ?? origin?.agent,
+        pr: context.pr ?? origin?.pr,
+        purpose,
+        recheckId: recheck?.id,
+        originId: origin?.id,
+        status: result.status,
+        defaultBranch: isDefault,
+        failedSteps,
+        passedSteps,
+        changedFiles: changedFiles ?? [],
+        receivedAt: this.iso(nowMs),
+        receivedMs: nowMs,
       });
-      classified = evidence.causes.map((cause) => ({ id: randomUUID(), cause, verdict: classifyCause(cause, ctx, settings) }));
-      store.insertCauses(recordId, classified);
-    }
-    const rows: TestRow[] = [];
-    const failingKeys = new Set<string>();
-    for (const c of classified) {
-      for (const t of c.cause.tests) {
-        failingKeys.add(t.key);
-        rows.push({ key: t.key, outcome: "fail", cls: c.verdict.class });
+      if (classified.length > 0) store.insertCauses(id, classified);
+
+      // Which tests passed: listed as passed by a report, or (a gate run) failed
+      // at this commit in a step this run ran and passed
+      const passedKeys = new Set(evidence.passed.map((t) => t.key));
+      if (purpose === "gate" && passedSteps.length > 0) {
+        for (const key of store.failedKeysInSteps(project, sha, passedSteps, nowMs - windowMs)) passedKeys.add(key);
       }
-    }
-    for (const key of passedKeys) if (!failingKeys.has(key)) rows.push({ key, outcome: "pass" });
-    for (const t of uniqueTests(evidence.flaky)) {
-      rows.push({ key: t.key, outcome: "fail", cls: "flaky" }, { key: t.key, outcome: "pass" });
-    }
-    store.addTests(project, sha, recordId, rows, nowMs);
+      const rows: TestRow[] = [];
+      const failing = new Set<string>();
+      for (const c of classified) {
+        for (const t of c.cause.tests) {
+          failing.add(t.key);
+          rows.push({ key: t.key, outcome: "fail", cls: c.verdict.class, step: c.cause.step });
+        }
+      }
+      for (const key of passedKeys) if (!failing.has(key)) rows.push({ key, outcome: "pass" });
+      for (const t of uniqueTests(evidence.flaky)) {
+        rows.push({ key: t.key, outcome: "fail", cls: "flaky" }, { key: t.key, outcome: "pass" });
+      }
+      store.addTests(project, sha, id, rows, nowMs);
+      for (const key of failing) passedKeys.delete(key);
+      this.quarantineObservations([...passedKeys], [...failing]);
 
-    // 5. Earlier failures at this commit whose tests passed now
-    await this.reclassifyFlaky(sha, passedKeys, recordId, nowMs);
+      this.reclassifyFlaky(sha, passedKeys, id, nowMs, s);
+      if (recheck) this.answerRecheck(recheck, id, result, evidence, classified, origin, s);
 
-    // 6. The re-check this result answers
-    if (recheck) await this.answerRecheck(recheck, recordId, result.status, origin, classified);
+      const record = store.getRecord(id)!;
+      if (failed && purpose !== "bisect") {
+        this.act(record, classified, origin, s);
+      } else if (failed) {
+        store.updateRecord(id, { verdict: overallClass(classified) ?? null, blocking: false, resolution: "bisect probe" });
+      }
+      for (const t of uniqueTests(evidence.flaky)) {
+        this.flakyOccurrence(t.key, record, "failed, then passed on a rerun in the same run", s);
+      }
+      if (isDefault && purpose !== "bisect") {
+        this.defaultBranchResult(store.getRecord(id)!, classified, passedSteps, plan, s);
+      }
+      this.pumpSync(s);
 
-    // 7. Act per class
-    const stored = store.getRecord(recordId)!;
-    if (failed && purpose !== "bisect") {
-      await this.act(stored, classified, origin);
-    } else if (failed) {
-      store.updateRecord(recordId, { verdict: overallClass(classified) ?? null, blocking: false, resolution: "bisect probe" });
-    } else if (purpose === "recheck") {
-      store.updateRecord(recordId, { blocking: false, resolution: "re-check passed" });
-    }
-    for (const t of uniqueTests(evidence.flaky)) {
-      await this.flakyOccurrence(t.key, stored, "failed, then passed on a rerun in the same run");
-    }
-
-    // 8. The default branch (a bisect probe runs old commits, so it never counts)
-    if (isDefault && purpose !== "bisect") await this.defaultBranchResult(store.getRecord(recordId)!, classified);
-
-    // 9. Re-checks and probes waiting for capacity
-    await this.pump();
-
-    const final = store.getRecord(recordId)!;
-    await this.emit("triage.classified", {
-      recordId,
-      gateId: final.gateId,
-      sha,
-      branch: final.branch,
-      status: final.status,
-      verdict: final.verdict ?? null,
-      blocking: final.blocking,
-      causes: final.causes.map((c) => ({ signature: c.cause.signature, class: c.verdict.class, rule: c.verdict.rule })),
+      const final = store.getRecord(id)!;
+      s.events.push({
+        type: "triage.classified",
+        data: {
+          recordId: id,
+          gateId: final.gateId,
+          pipelineId,
+          trust: input.trust,
+          sha,
+          branch: final.branch,
+          status: final.status,
+          verdict: final.verdict ?? null,
+          blocking: final.blocking,
+          causes: final.causes.map((c) => ({ signature: c.cause.signature, class: c.verdict.class, rule: c.verdict.rule })),
+        },
+      });
+      return id;
     });
-    return {
-      record: final,
-      actions: store.actionsFor({ recordId }),
-      rechecks: store.rechecksFor({ recordId: final.originId ?? recordId }),
-      incident: store.openIncident(project, settings.defaultBranch),
-    };
   }
 
   /** The tests a re-check was asked to run, by key. */
-  private requestedKeys(recheck: Recheck | null, origin: TriageRecord | null): string[] {
-    if (!recheck) return [];
+  private requestedKeys(recheck: Recheck, origin: TriageRecord | null): string[] {
     if (recheck.incidentId) return this.o.store.getIncident(recheck.incidentId)?.target.keys ?? [];
     if (!origin) return [];
     const ids = new Set(recheck.tests);
     return unique(origin.causes.flatMap((c) => c.cause.tests.filter((t) => ids.has(t.id)).map((t) => t.key)));
   }
 
-  private classifyContext(input: {
-    sha: string;
-    isDefault: boolean;
-    baseSha?: string;
-    changedFiles: string[];
-    changedNote?: string;
-    recordId: string;
-    nowMs: number;
-    loadPerCore?: number;
-    keys: string[];
-  }): ClassifyContext {
+  private classify(
+    evidence: GateEvidence,
+    input: {
+      sha: string;
+      isDefault: boolean;
+      baseSha?: string;
+      pipelineId: string;
+      changedFiles: string[];
+      notes: string[];
+      nowMs: number;
+      loadPerCore?: number;
+      incident: Incident | null;
+    },
+  ): ClassifiedCause[] {
     const { store, project, settings } = this.o;
     let base: BaseFacts | undefined;
+    let baseNote: string | undefined;
     if (!input.isDefault) {
-      const atBase = input.baseSha ? store.latestAt(project, input.baseSha, ["gate", "recheck"]) : null;
-      const latest = atBase ?? store.latestOnBranch(project, settings.defaultBranch);
-      if (latest && latest.id !== input.recordId) {
-        base = {
-          recordId: latest.id,
-          sha: latest.sha,
-          source: atBase ? "base" : "default-branch",
-          status: latest.status,
-          at: latest.receivedAt,
-          failedKeys: new Set(latest.causes.flatMap((c) => c.cause.tests.map((t) => t.key))),
-          signatures: new Set(latest.causes.map((c) => c.cause.signature)),
-        };
+      if (input.baseSha) {
+        const since = input.nowMs - settings.baseMaxAgeHours * 3_600_000;
+        const latest = store.baseResult(project, input.baseSha, input.pipelineId, since, "");
+        if (latest) {
+          base = {
+            recordId: latest.id,
+            sha: latest.sha,
+            status: latest.status,
+            at: latest.receivedAt,
+            failedKeys: new Set(latest.causes.flatMap((c) => c.cause.tests.map((t) => t.key))),
+            signatures: new Set(latest.causes.map((c) => c.cause.signature)),
+          };
+        } else {
+          baseNote = `no gate run of ${input.pipelineId || "this pipeline"} at the base commit ${short(input.baseSha)} in the last ${settings.baseMaxAgeHours} h`;
+        }
+      } else {
+        baseNote = input.notes[0] ?? "the base commit is unknown";
       }
     }
-    const incident = store.openIncident(project, settings.defaultBranch);
+    const keys = evidence.causes.flatMap((c) => c.tests.map((t) => t.key));
     const windowMs = settings.flaky.windowMinutes * 60000;
-    return {
+    const ctx: ClassifyContext = {
       sha: input.sha,
       defaultBranch: input.isDefault,
       changedFiles: input.changedFiles,
-      changedNote: input.changedNote,
+      changedNote: input.changedFiles.length === 0 && input.notes.length > 0 ? input.notes.join("; ") : undefined,
       base,
-      incident: incident
+      baseNote,
+      incident: input.incident
         ? {
-            id: incident.id,
-            redSha: incident.redSha,
-            keys: new Set(incident.target.keys),
-            signatures: new Set(incident.target.signatures),
+            id: input.incident.id,
+            redSha: input.incident.redSha,
+            keys: new Set(input.incident.target.keys),
+            signatures: new Set(input.incident.target.signatures),
           }
         : undefined,
-      passedAtSha: store.passesAt(project, input.sha, input.keys, input.nowMs - windowMs, input.nowMs + windowMs, input.recordId),
+      passedAtSha: store.passesAt(project, input.sha, keys, input.nowMs - windowMs, input.nowMs + windowMs, ""),
       quarantined: store.quarantinedKeys(project),
       loadPerCore: input.loadPerCore,
     };
+    return evidence.causes.map((cause) => ({ id: randomUUID(), cause, verdict: classifyCause(cause, ctx, settings) }));
+  }
+
+  private targetOf(regressions: ClassifiedCause[], failedSteps: string[]): IncidentTarget {
+    const tests = uniqueTests(regressions.flatMap((c) => c.cause.tests));
+    const steps = unique(regressions.flatMap((c) => (c.cause.step ? [c.cause.step] : [])));
+    return {
+      tests: tests.map((t) => t.id),
+      keys: tests.map((t) => t.key),
+      classes: unique(tests.map(testClass)),
+      steps: steps.length > 0 ? steps : failedSteps,
+      signatures: regressions.map((c) => c.cause.signature),
+    };
+  }
+
+  private async planIncident(
+    branch: string,
+    pipelineId: string,
+    sha: string,
+    regressions: ClassifiedCause[],
+    failedSteps: string[],
+    nowMs: number,
+  ): Promise<IncidentPlan> {
+    const { store, settings, project } = this.o;
+    const target = this.targetOf(regressions, failedSteps);
+    if (!settings.bisect.enabled) return { target, bisect: stopped("off", "triage.bisect.enabled is false") };
+    const lastGreen = store.lastGreen(project, branch, pipelineId, target.steps, nowMs);
+    if (!lastGreen) {
+      return {
+        target,
+        bisect: stopped(
+          "no_baseline",
+          `no green run of ${pipelineId || "this pipeline"} on ${branch} that ran ${target.steps.join(", ") || "its steps"} yet, so there is nothing to bisect from`,
+        ),
+      };
+    }
+    try {
+      const candidates = await this.git.firstParentRange(lastGreen.sha, sha);
+      if (candidates.length > settings.bisect.maxCandidates) {
+        return {
+          target,
+          lastGreenSha: lastGreen.sha,
+          bisect: stopped(
+            "inconclusive",
+            `${candidates.length} commits since the last green one is more than bisect.max_candidates (${settings.bisect.maxCandidates})`,
+          ),
+        };
+      }
+      const red = candidates.find((c) => c.toLowerCase() === sha) ?? sha;
+      return { target, lastGreenSha: lastGreen.sha, bisect: startBisect(candidates, red) };
+    } catch (e) {
+      return { target, lastGreenSha: lastGreen.sha, bisect: stopped("inconclusive", `git: ${clip(message(e), 200)}`) };
+    }
   }
 
   // ============ ACTIONS PER CLASS ============
 
-  private async act(record: TriageRecord, classified: ClassifiedCause[], origin: TriageRecord | null): Promise<void> {
+  private act(record: TriageRecord, classified: ClassifiedCause[], origin: TriageRecord | null, s: Section): void {
     const { store, settings } = this.o;
     const of = (cls: Verdict["class"]) => classified.filter((c) => c.verdict.class === cls);
     const infra = of("infra");
@@ -513,9 +787,9 @@ export class TriageService {
     if (infra.length > 0) {
       blocking = true;
       if (settings.actions.infra === "recheck") {
-        pending.push(await this.recheckInfra(record, infra, origin));
+        pending.push(this.recheckInfra(record, infra, origin, s));
       } else if (settings.actions.infra === "route") {
-        await this.routeToAuthor(record, infra, "infrastructure failures are routed to the author (triage.actions.infra: route)");
+        this.routeToAuthor(record, infra, s, "infrastructure failures are routed to the author (triage.actions.infra: route)");
         pending.push("infra: routed to the author");
       } else {
         this.action({ recordId: record.id }, "note", "skipped", "infra: no action (triage.actions.infra: none)");
@@ -528,15 +802,15 @@ export class TriageService {
         // Nobody authored the default branch's head: the incident's bisect finds the culprit and its author
         pending.push("code: the default branch is red");
       } else if (settings.actions.code === "route") {
-        await this.routeToAuthor(record, code);
+        this.routeToAuthor(record, code, s);
         pending.push("code: back to the author");
       } else {
         this.action({ recordId: record.id }, "note", "skipped", "code: no action (triage.actions.code: none)");
       }
     }
-    for (const c of of("pre-existing")) await this.preExisting(record, c);
+    for (const c of of("pre-existing")) this.preExisting(record, c, s);
     for (const c of of("flaky")) {
-      for (const t of c.cause.tests) await this.flakyOccurrence(t.key, record, c.verdict.evidence[0] ?? c.verdict.rule);
+      for (const t of c.cause.tests) this.flakyOccurrence(t.key, record, c.verdict.evidence[0] ?? c.verdict.rule, s);
     }
 
     const notBlocking = [
@@ -551,19 +825,19 @@ export class TriageService {
   }
 
   /** One re-check of only the failed tests (else only the failed steps) at the same commit. */
-  private async recheckInfra(record: TriageRecord, infra: ClassifiedCause[], origin: TriageRecord | null): Promise<string> {
+  private recheckInfra(record: TriageRecord, infra: ClassifiedCause[], origin: TriageRecord | null, s: Section): string {
     const { store, settings, project } = this.o;
     const chainId = origin?.id ?? record.id;
     const done = store.rechecksFor({ recordId: chainId, purpose: "infra" });
     const max = settings.recheck.maxRetries;
-    if (done.length >= max) return this.infraExhausted(record, infra, done.length, origin);
+    if (done.length >= max) return this.infraExhausted(record, infra, done.length, origin, s);
 
     const tests = uniqueTests(infra.flatMap((c) => c.cause.tests));
     let steps = unique(infra.flatMap((c) => (c.cause.step ? [c.cause.step] : [])));
     if (tests.length === 0 && steps.length === 0) steps = record.failedSteps;
     if (tests.length === 0 && steps.length === 0) {
       this.action({ recordId: chainId }, "recheck", "skipped", "no failed test or step to re-check, and a full re-run is never requested");
-      return this.infraExhausted(record, infra, done.length, origin);
+      return this.infraExhausted(record, infra, done.length, origin, s);
     }
     const recheck = store.createRecheck(
       {
@@ -592,39 +866,42 @@ export class TriageService {
     return `infra: re-check ${recheck.attempt}/${max} queued`;
   }
 
-  /** No re-checks left: route to the author when the base passes, else ask the human. */
-  private async infraExhausted(
+  /** No re-checks left: route to the author when the base's own run passes, else ask the human. */
+  private infraExhausted(
     record: TriageRecord,
     infra: ClassifiedCause[],
     attempts: number,
     origin: TriageRecord | null,
-  ): Promise<string> {
+    s: Section,
+  ): string {
     const { store, settings, project } = this.o;
     const chainId = origin?.id ?? record.id;
-    const base = record.defaultBranch
-      ? null
-      : (record.baseSha ? store.latestAt(project, record.baseSha, ["gate", "recheck"]) : null) ??
-        store.latestOnBranch(project, settings.defaultBranch);
-    if (base && base.status === "passed" && base.id !== record.id) {
-      await this.routeToAuthor(
+    const since = this.now() - settings.baseMaxAgeHours * 3_600_000;
+    const base =
+      !record.defaultBranch && record.baseSha ? store.baseResult(project, record.baseSha, record.pipelineId, since, record.id) : null;
+    if (base && base.status === "passed") {
+      this.routeToAuthor(
         record,
         infra,
+        s,
         `still failing after ${attempts} re-check(s) at the same commit while ${short(base.sha)} passes`,
       );
       return `infra: still failing after ${attempts} re-check(s); routed to the author`;
     }
-    await this.raiseDecision({ recordId: chainId }, {
+    const first = origin ?? record;
+    this.raiseDecision({ recordId: chainId }, s, {
       project,
       subject: `infra:${chainId}`,
       kind: "escalation",
-      question: `Gate ${record.gateId} at ${short(record.sha)} on ${record.branch} still fails with an infrastructure error after ${attempts} re-check(s).`,
+      question: `Gate ${first.gateId} at ${short(first.sha)} on ${first.branch} still fails with an infrastructure error after ${attempts} re-check(s).`,
       context: infra.flatMap((c) => [describe(c), ...c.verdict.evidence.slice(0, 2)]).slice(0, 8),
-      options: ["fix the environment, then re-run", "re-run now", "ignore"],
-      recommended: "fix the environment, then re-run",
+      options: [
+        { id: "fix-environment", label: "Fix the environment", consequences: "Nothing runs; re-run the gate once it is fixed" },
+        { id: "rerun", label: "Re-check now", consequences: "One more re-check of the same tests at the same commit" },
+        { id: "ignore", label: "Ignore", consequences: "The failure stays blocking" },
+      ],
+      recommended: "fix-environment",
       why: "Lair re-checks an infrastructure failure only up to triage.recheck.max_retries.",
-      reversible: true,
-      onTimeout: "wait",
-      requestedBy: "triage",
     });
     return `infra: still failing after ${attempts} re-check(s); asked the human`;
   }
@@ -655,12 +932,17 @@ export class TriageService {
     return lines.join("\n");
   }
 
-  private async routeToAuthor(record: TriageRecord, causes: ClassifiedCause[], why?: string): Promise<void> {
+  private routeToAuthor(record: TriageRecord, causes: ClassifiedCause[], s: Section, why?: string): void {
     const text = this.agentText(record, causes, why);
     const agent = record.agent;
-    await this.emit("triage.routed", { recordId: record.id, agent: agent ?? null, sha: record.sha, text });
+    s.events.push({ type: "triage.routed", data: { recordId: record.id, agent: agent ?? null, sha: record.sha, text } });
     if (!agent) {
-      this.action({ recordId: record.id }, "route", "skipped", "no author agent in the result (send context.agent with it)");
+      this.action(
+        { recordId: record.id },
+        "route",
+        "skipped",
+        "no author agent: only a trusted result (the gates module's gate.completed event) names one",
+      );
       return;
     }
     const msg: AgentMessage = {
@@ -674,7 +956,8 @@ export class TriageService {
       text,
     };
     const router = this.o.adapters.router;
-    await this.perform(
+    this.perform(
+      s,
       { recordId: record.id },
       "route",
       `${causes.length} cause(s) sent to ${agent}`,
@@ -683,9 +966,9 @@ export class TriageService {
     );
   }
 
-  private async preExisting(record: TriageRecord, c: ClassifiedCause): Promise<void> {
+  private preExisting(record: TriageRecord, c: ClassifiedCause, s: Section): void {
     const { store, settings, project } = this.o;
-    const incident = c.verdict.rule === "open-incident" ? store.openIncident(project, settings.defaultBranch) : null;
+    const incident = c.verdict.rule === "open-incident" ? store.openIncident(project, settings.defaultBranch, record.pipelineId) : null;
     if (incident) {
       this.action(
         { recordId: record.id },
@@ -694,6 +977,8 @@ export class TriageService {
         `${describe(c)}: part of the default branch's open incident ${short(incident.id)}, not this change`,
       );
     }
+    // The default branch's own failure is its incident's to fix
+    if (record.defaultBranch) return;
     if (settings.actions.preExisting !== "fix_task") {
       this.action({ recordId: record.id }, "fix_task", "skipped", `${describe(c)}: no fix task (triage.actions.pre_existing: none)`);
       return;
@@ -719,24 +1004,27 @@ export class TriageService {
       this.action({ recordId: record.id }, "fix_task", "skipped", `fix task ${short(task.id)} is already open for ${describe(c)}`);
       return;
     }
-    await this.createTask(record, task, "fix_task");
+    this.createTask(record, task, "fix_task", s);
   }
 
-  private async createTask(record: TriageRecord, task: TriageTask, kind: ActionKind): Promise<void> {
-    await this.emit("triage.task_created", { recordId: record.id, task });
+  private createTask(record: TriageRecord, task: TriageTask, kind: ActionKind, s: Section): void {
+    s.events.push({ type: "triage.task_created", data: { recordId: record.id, task } });
     const sink = this.o.adapters.tasks;
-    const result = await this.perform(
+    this.perform(
+      s,
       { recordId: record.id },
       kind,
       `task ${short(task.id)} "${clip(task.title, 120)}"`,
       sink ? () => sink.create(task) : undefined,
       plannedArgv(this.settings, "create_task", taskVars(task)),
+      (result) => {
+        if (result.ok && result.ref) this.o.store.setTaskRef(task.id, result.ref);
+      },
     );
-    if (result?.ok && result.ref) this.o.store.setTaskRef(task.id, result.ref);
   }
 
   /** Record a flaky occurrence; flaky `ticket_after` times in a row opens a reliability task and quarantines the test. */
-  private async flakyOccurrence(key: string, record: TriageRecord, why: string): Promise<void> {
+  private flakyOccurrence(key: string, record: TriageRecord, why: string, s: Section): void {
     const { store, settings, project } = this.o;
     const flaky = store.bumpFlaky(project, key, this.iso());
     this.action({ recordId: record.id }, "flaky", "recorded", `${key} is flaky (${flaky.occurrences} time(s)): ${clip(why, 200)}`);
@@ -753,7 +1041,9 @@ export class TriageService {
       body: [
         `${key} was flaky ${n} time(s) in a row (${flaky.occurrences} in all): it failed and then passed at the same commit.`,
         `Make it reliable by ${deadline}.`,
-        settings.flaky.quarantine ? "It is quarantined until then: it still runs, but it no longer blocks." : "",
+        settings.flaky.quarantine
+          ? `It is quarantined until then, or until it passes ${settings.flaky.releaseAfterPasses} times in a row: it still runs, it no longer blocks a change (it still counts on the default branch).`
+          : "",
         `Latest: ${why}`,
       ]
         .filter(Boolean)
@@ -761,11 +1051,10 @@ export class TriageService {
       createdAt: this.iso(),
     });
     if (!created) return;
-    store.markFlaky(project, key, { ticketId: task.id });
-    await this.createTask(record, task, "ticket");
+    store.setTicket(project, key, task.id);
+    this.createTask(record, task, "ticket", s);
     if (!settings.flaky.quarantine) return;
-    const quarantined = store.quarantinedKeys(project);
-    if (quarantined.size >= settings.flaky.quarantineCap) {
+    if (store.quarantinedKeys(project).size >= settings.flaky.quarantineCap) {
       this.action(
         { recordId: record.id },
         "quarantine",
@@ -774,12 +1063,32 @@ export class TriageService {
       );
       return;
     }
-    store.markFlaky(project, key, { quarantinedAt: this.iso() });
-    this.action({ recordId: record.id }, "quarantine", "done", `${key} quarantined: it runs, but its failures no longer block`);
+    store.quarantine(project, key, this.iso(), deadline);
+    this.action(
+      { recordId: record.id },
+      "quarantine",
+      "done",
+      `${key} quarantined until ${deadline} (or ${settings.flaky.releaseAfterPasses} passes in a row): it runs, but its failures no longer block a change`,
+    );
+  }
+
+  /** A quarantined test that passed enough times in a row is released; a failure starts its count over. */
+  private quarantineObservations(passed: string[], failing: string[]): void {
+    const { store, settings, project } = this.o;
+    const quarantined = store.quarantinedKeys(project);
+    if (quarantined.size === 0) return;
+    for (const key of passed) {
+      if (!quarantined.has(key)) continue;
+      const passes = store.quarantinedPass(project, key);
+      if (passes !== null && passes >= settings.flaky.releaseAfterPasses && store.liftQuarantine(project, key)) {
+        this.action({}, "quarantine", "done", `${key} released: it passed ${passes} times in a row`);
+      }
+    }
+    for (const key of failing) if (quarantined.has(key)) store.quarantinedFail(project, key);
   }
 
   /** Earlier failures at this commit whose tests have all passed now are flaky, not code. */
-  private async reclassifyFlaky(sha: string, passedKeys: Set<string>, recordId: string, nowMs: number): Promise<void> {
+  private reclassifyFlaky(sha: string, passedKeys: Set<string>, recordId: string, nowMs: number, s: Section): void {
     const { store, settings, project } = this.o;
     if (passedKeys.size === 0) return;
     const earlier = store
@@ -804,7 +1113,7 @@ export class TriageService {
         store.updateCauseVerdict(c.id, verdict);
         store.setTestClass(rid, c.cause.tests.map((t) => t.key), "flaky");
         changed = true;
-        for (const t of c.cause.tests) await this.flakyOccurrence(t.key, rec, verdict.evidence[0]);
+        for (const t of c.cause.tests) this.flakyOccurrence(t.key, rec, verdict.evidence[0], s);
       }
       if (!changed) continue;
       const updated = store.getRecord(rid)!;
@@ -824,19 +1133,40 @@ export class TriageService {
 
   // ============ RE-CHECKS ============
 
-  private async answerRecheck(
+  /**
+   * A result for a re-check. It counts as passed only when it shows the
+   * requested tests passing (a report lists every one of them as passed), or,
+   * for a re-check of steps, every requested step passed. A "passed" without
+   * that is unproven and unblocks nothing.
+   */
+  private answerRecheck(
     recheck: Recheck,
     recordId: string,
-    status: TriageRecord["status"],
-    origin: TriageRecord | null,
+    result: GateResult,
+    evidence: GateEvidence,
     classified: ClassifiedCause[],
-  ): Promise<void> {
+    origin: TriageRecord | null,
+    s: Section,
+  ): void {
     const { store } = this.o;
-    store.updateRecheck(recheck.id, {
-      status: status === "passed" ? "passed" : "failed",
-      completedAt: this.iso(),
-      answerId: recordId,
-    });
+    const requested = this.requestedKeys(recheck, origin);
+    const listed = new Set(evidence.passed.map((t) => t.key));
+    const stepsPassed = new Set(result.steps.filter((st) => st.status === "passed").map((st) => st.name));
+    const shown =
+      requested.length > 0
+        ? requested.every((k) => listed.has(k))
+        : recheck.steps.length > 0 && recheck.steps.every((st) => stepsPassed.has(st));
+    const status: RecheckStatus = result.status !== "passed" ? "failed" : shown ? "passed" : "unproven";
+    const missing = requested.filter((k) => !listed.has(k));
+    const why =
+      requested.length > 0
+        ? `${missing.length} of the ${requested.length} requested test(s) are not listed as passed (send the test report with the result)`
+        : `the requested step(s) ${recheck.steps.join(", ")} did not all pass`;
+    store.updateRecheck(recheck.id, { status, completedAt: this.iso(), answerId: recordId });
+    if (result.status === "passed") {
+      store.updateRecord(recordId, { blocking: false, resolution: shown ? "re-check passed" : `re-check unproven: ${why}` });
+    }
+
     if (recheck.purpose === "infra" && origin) {
       if (status === "passed") {
         const stillBlocking = origin.causes.some((c) => c.verdict.class === "code");
@@ -852,108 +1182,157 @@ export class TriageService {
           "done",
           `re-check ${recheck.attempt} of ${selection(recheck)} passed at ${short(recheck.sha)} (result ${short(recordId)})`,
         );
-      } else {
+      } else if (status === "unproven") {
         this.action(
           { recordId: origin.id },
-          "note",
-          "recorded",
-          `re-check ${recheck.attempt} failed again (result ${short(recordId)})`,
+          "recheck",
+          "failed",
+          `re-check ${recheck.attempt} answered "passed" but ${why}: not unblocked`,
         );
+        const infra = origin.causes.filter((c) => c.verdict.class === "infra");
+        store.updateRecord(origin.id, { resolution: this.recheckInfra(origin, infra, null, s) });
+      } else {
+        this.action({ recordId: origin.id }, "note", "recorded", `re-check ${recheck.attempt} failed again (result ${short(recordId)})`);
       }
       return;
     }
-    if (recheck.purpose === "bisect" && recheck.incidentId) {
-      await this.bisectAnswer(recheck, recordId, status, classified);
-    }
+    if (recheck.purpose === "bisect") this.bisectAnswer(recheck, recordId, status, classified, why);
   }
 
-  /** Expire stale re-checks, advance the bisect, then request what capacity allows. */
-  private async pump(): Promise<void> {
+  /** Expire stale re-checks, release ended quarantines, advance bisects, and ask for a dispatch. */
+  private pumpSync(s: Section): void {
     const { store, settings, project } = this.o;
     const nowMs = this.now();
     const timeoutMs = settings.recheck.timeoutMinutes * 60000;
-    for (const r of store.rechecksWithStatus(project, ["requested", "unavailable"])) {
+    for (const r of store.rechecksWithStatus(project, ["dispatching", "requested", "unavailable"])) {
       const since = store.requestedMs(r.id);
-      if (since === null || nowMs - since < timeoutMs) continue;
-      const reason = `no result within ${settings.recheck.timeoutMinutes} min`;
+      const limit = r.status === "dispatching" ? DISPATCH_STALE_MS : timeoutMs;
+      if (since === null || nowMs - since < limit) continue;
+      const reason =
+        r.status === "dispatching" ? "its request never finished" : `no result within ${settings.recheck.timeoutMinutes} min`;
       store.updateRecheck(r.id, { status: "expired", reason, completedAt: this.iso(nowMs) });
-      await this.recheckLost(r, reason);
+      this.recheckLost(r, reason, s);
     }
 
-    await this.advanceBisect();
+    for (const key of store.expiredQuarantines(project, this.iso(nowMs))) {
+      if (store.liftQuarantine(project, key)) {
+        this.action({}, "quarantine", "done", `${key} released: its reliability task's deadline passed`);
+      }
+    }
 
-    for (const r of store.rechecksWithStatus(project, ["waiting_capacity"])) {
-      const target: Target = r.recordId ? { recordId: r.recordId } : { incidentId: r.incidentId };
-      const blocked = this.actBlocked;
-      if (blocked) {
-        store.updateRecheck(r.id, { status: "planned", reason: `not run: ${blocked}` });
-        this.action(
-          target,
-          "recheck",
-          "planned",
-          `re-check of ${selection(r)} at ${short(r.sha)} (not run: ${blocked})`,
-          plannedArgv(settings, "recheck", recheckVars(project, r)) ?? undefined,
-        );
-        continue;
-      }
-      const inFlight = store.rechecksWithStatus(project, ["requested"]).length;
-      if (inFlight >= settings.recheck.maxConcurrent) {
-        store.updateRecheck(r.id, { reason: `waiting: ${inFlight} re-check(s) running (max_concurrent ${settings.recheck.maxConcurrent})` });
-        break;
-      }
-      let capacity: { ok: boolean; reason: string };
-      try {
-        capacity = await this.capacity.check();
-      } catch (e) {
-        capacity = { ok: false, reason: `capacity check failed: ${message(e)}` };
-      }
-      if (!capacity.ok) {
-        store.updateRecheck(r.id, { reason: `waiting for capacity: ${capacity.reason}` });
-        break;
-      }
-      await this.requestRecheck(r, target, capacity.reason);
+    for (const incident of store.openIncidents(project)) {
+      if (incident.branch === settings.defaultBranch) this.advanceBisect(incident, s);
+    }
+
+    const waiting = store.rechecksWithStatus(project, ["waiting_capacity"]);
+    if (waiting.length === 0) return;
+    const blocked = this.actBlocked;
+    if (!blocked) {
+      s.dispatch = true;
+      return;
+    }
+    for (const r of waiting) {
+      store.updateRecheck(r.id, { status: "planned", reason: `not run: ${blocked}` });
+      this.action(
+        r.recordId ? { recordId: r.recordId } : { incidentId: r.incidentId },
+        "recheck",
+        "planned",
+        `re-check of ${selection(r)} at ${short(r.sha)} (not run: ${blocked})`,
+        plannedArgv(settings, "recheck", recheckVars(project, r)) ?? undefined,
+      );
     }
   }
 
-  private async requestRecheck(r: Recheck, target: Target, capacityReason: string): Promise<void> {
-    const { store } = this.o;
-    const nowMs = this.now();
-    await this.emit("triage.recheck_requested", { recheck: r });
+  /**
+   * Ask the executor for the oldest waiting re-check, when there is room and
+   * capacity. Runs from the outbox: the capacity check and the request are
+   * outside the serial queue, so the run's answer can come straight back.
+   */
+  private async dispatch(): Promise<void> {
+    this.dispatchQueued = false;
+    const { store, settings, project } = this.o;
+    const inFlight = () => store.rechecksWithStatus(project, ["dispatching", "requested"]).length;
+    const pick = await this.serial(async () => {
+      const [next] = store.rechecksWithStatus(project, ["waiting_capacity"]);
+      if (!next) return null;
+      const running = inFlight();
+      if (running >= settings.recheck.maxConcurrent) {
+        store.updateRecheck(next.id, {
+          reason: `waiting: ${running} re-check(s) running (max_concurrent ${settings.recheck.maxConcurrent})`,
+        });
+        return null;
+      }
+      return next;
+    });
+    if (!pick) return;
+
+    let capacity: { ok: boolean; reason: string };
+    try {
+      capacity = await this.capacity.check();
+    } catch (e) {
+      capacity = { ok: false, reason: `capacity check failed: ${message(e)}` };
+    }
+    const go = await this.serial(async () =>
+      this.commit((s) => {
+        const r = store.getRecheck(pick.id);
+        if (!r || r.status !== "waiting_capacity" || this.actBlocked) return null;
+        if (!capacity.ok) {
+          store.updateRecheck(r.id, { reason: `waiting for capacity: ${capacity.reason}` });
+          return null;
+        }
+        if (inFlight() >= settings.recheck.maxConcurrent) return null;
+        const at = this.now();
+        store.updateRecheck(r.id, { status: "dispatching", reason: capacity.reason, requestedAt: this.iso(at), requestedMs: at });
+        const dispatching = store.getRecheck(r.id)!;
+        s.events.push({ type: "triage.recheck_requested", data: { recheck: dispatching } });
+        return dispatching;
+      }),
+    );
+    if (!go) return;
+
     const executor = this.o.adapters.recheck;
-    if (!executor) {
-      store.updateRecheck(r.id, {
-        status: "unavailable",
-        reason: "no re-check executor (triage.commands.recheck); answer with context.recheckId",
-        requestedAt: this.iso(nowMs),
-        requestedMs: nowMs,
-      });
+    const result = executor
+      ? await withTimeout(settle(() => executor.request(go)), settings.recheck.requestTimeoutSeconds * 1000 + 1000)
+      : null;
+    await this.serial(async () =>
+      this.commit((s) => {
+        this.dispatched(go, result);
+        this.pumpSync(s);
+      }),
+    );
+  }
+
+  /** Record what the executor said. The answer may already have arrived while it ran. */
+  private dispatched(r: Recheck, result: AdapterResult | null): void {
+    const { store } = this.o;
+    const current = store.getRecheck(r.id);
+    if (!current) return;
+    const target: Target = r.recordId ? { recordId: r.recordId } : { incidentId: r.incidentId };
+    const stillAsking = current.status === "dispatching";
+    if (!result) {
+      if (stillAsking) {
+        store.updateRecheck(r.id, { status: "unavailable", reason: "no re-check executor (triage.commands.recheck)" });
+      }
       this.action(target, "recheck", "recorded", `re-check ${short(r.id)} of ${selection(r)} at ${short(r.sha)}: no executor is set`);
       return;
     }
-    let result: AdapterResult;
-    try {
-      result = await executor.request(r);
-    } catch (e) {
-      result = { ok: false, detail: message(e) };
+    if (result.ok) {
+      store.updateRecheck(r.id, { ...(stillAsking ? { status: "requested" as const } : {}), ...(result.ref ? { runId: result.ref } : {}) });
+    } else if (stillAsking) {
+      store.updateRecheck(r.id, { status: "unavailable", reason: result.detail });
     }
-    store.updateRecheck(r.id, {
-      status: result.ok ? "requested" : "unavailable",
-      reason: result.ok ? capacityReason : result.detail,
-      requestedAt: this.iso(nowMs),
-      requestedMs: nowMs,
-    });
     this.action(
       target,
       "recheck",
       result.ok ? "done" : "failed",
-      `re-check ${r.attempt} (${short(r.id)}) of ${selection(r)} at ${short(r.sha)}: ${result.detail}`,
+      `re-check ${r.attempt} (${short(r.id)}) of ${selection(r)} at ${short(r.sha)}: ${result.detail}${result.ref ? ` (run ${clip(result.ref, 80)})` : ""}`,
       result.argv,
       result.output,
     );
   }
 
   /** A re-check that never answered. */
-  private async recheckLost(r: Recheck, reason: string): Promise<void> {
+  private recheckLost(r: Recheck, reason: string, s: Section): void {
     const { store } = this.o;
     if (r.purpose === "bisect" && r.incidentId) {
       const incident = store.getIncident(r.incidentId);
@@ -968,18 +1347,33 @@ export class TriageService {
     if (!origin) return;
     this.action({ recordId: origin.id }, "recheck", "failed", `re-check ${r.attempt} (${short(r.id)}): ${reason}`);
     const infra = origin.causes.filter((c) => c.verdict.class === "infra");
-    const note = await this.recheckInfra(origin, infra, null);
-    store.updateRecord(origin.id, { resolution: note });
+    store.updateRecord(origin.id, { resolution: this.recheckInfra(origin, infra, null, s) });
   }
 
   // ============ DEFAULT BRANCH: INCIDENT AND BISECT ============
 
-  private async defaultBranchResult(record: TriageRecord, classified: ClassifiedCause[]): Promise<void> {
+  private defaultBranchResult(
+    record: TriageRecord,
+    classified: ClassifiedCause[],
+    passedSteps: string[],
+    plan: IncidentPlan | null,
+    s: Section,
+  ): void {
     const { store, project } = this.o;
-    const open = store.openIncident(project, record.branch);
+    const open = store.openIncident(project, record.branch, record.pipelineId);
     if (record.status === "passed") {
-      // Only a full gate run proves the branch green; a re-check runs a few tests
+      // Only a full gate run of the same pipeline that ran the failing steps proves the branch green
       if (!open || record.purpose !== "gate") return;
+      const missing = open.target.steps.filter((st) => !passedSteps.includes(st));
+      if (missing.length > 0) {
+        this.action(
+          { incidentId: open.id },
+          "note",
+          "recorded",
+          `a green run at ${short(record.sha)} did not run ${missing.join(", ")}: the incident stays open`,
+        );
+        return;
+      }
       for (const r of store.rechecksFor({ incidentId: open.id })) {
         if (OPEN_RECHECK.includes(r.status)) store.updateRecheck(r.id, { status: "cancelled", reason: "the branch is green again" });
       }
@@ -991,7 +1385,7 @@ export class TriageService {
         bisect,
       });
       this.action({ incidentId: open.id }, "incident", "done", `resolved: ${record.branch} is green at ${short(record.sha)}`);
-      await this.emit("triage.incident_resolved", { incidentId: open.id, sha: record.sha });
+      s.events.push({ type: "triage.incident_resolved", data: { incidentId: open.id, sha: record.sha } });
       return;
     }
     const regressions = classified.filter((c) => c.verdict.class === "code");
@@ -1005,84 +1399,46 @@ export class TriageService {
       );
       return;
     }
-    await this.openIncident(record, regressions);
+    if (plan) this.openIncident(record, regressions, plan, s);
   }
 
-  private async openIncident(record: TriageRecord, regressions: ClassifiedCause[]): Promise<void> {
-    const { store, settings, project } = this.o;
-    const tests = uniqueTests(regressions.flatMap((c) => c.cause.tests));
-    const steps = unique(regressions.flatMap((c) => (c.cause.step ? [c.cause.step] : [])));
-    const target: IncidentTarget = {
-      tests: tests.map((t) => t.id),
-      keys: tests.map((t) => t.key),
-      classes: unique(tests.map(testClass)),
-      steps: steps.length > 0 ? steps : record.failedSteps,
-      signatures: regressions.map((c) => c.cause.signature),
-    };
-    const receivedMs = store.receivedMs(record.id) ?? this.now();
-    const lastGreen = store.latestOnBranch(project, record.branch, { passed: true, beforeMs: receivedMs });
-    const stopped = (status: BisectState["status"], detail: string): BisectState => ({
-      status,
-      candidates: [],
-      good: -1,
-      bad: -1,
-      skipped: [],
-      probes: [],
-      proven: false,
-      detail,
-    });
-    let bisect: BisectState;
-    if (!settings.bisect.enabled) {
-      bisect = stopped("off", "triage.bisect.enabled is false");
-    } else if (!lastGreen) {
-      bisect = stopped("no_baseline", `no green result on ${record.branch} yet, so there is nothing to bisect from`);
-    } else {
-      try {
-        const candidates = await this.git.firstParentRange(lastGreen.sha, record.sha);
-        if (candidates.length > settings.bisect.maxCandidates) {
-          bisect = stopped(
-            "inconclusive",
-            `${candidates.length} commits since the last green one is more than bisect.max_candidates (${settings.bisect.maxCandidates})`,
-          );
-        } else {
-          const red = candidates.find((c) => sameSha(c, record.sha)) ?? record.sha;
-          bisect = startBisect(candidates, red);
-        }
-      } catch (e) {
-        bisect = stopped("inconclusive", `git: ${clip(message(e), 200)}`);
-      }
-    }
+  private openIncident(record: TriageRecord, regressions: ClassifiedCause[], plan: IncidentPlan, s: Section): void {
+    const { store, project } = this.o;
     const incident = store.createIncident({
       project,
       branch: record.branch,
+      pipelineId: record.pipelineId,
       status: "open",
       openedAt: this.iso(),
       redSha: record.sha,
-      lastGreenSha: lastGreen?.sha,
+      lastGreenSha: plan.lastGreenSha,
       recordId: record.id,
-      target,
-      bisect,
+      target: plan.target,
+      bisect: plan.bisect,
       revert: { status: "none" },
     });
     this.action(
       { incidentId: incident.id },
       "incident",
       "done",
-      `${record.branch} is red at ${short(record.sha)}: ${regressions.map(describe).slice(0, 3).join("; ")}. ${bisect.detail}`,
+      `${record.branch} is red at ${short(record.sha)}: ${regressions.map(describe).slice(0, 3).join("; ")}. ${plan.bisect.detail}`,
     );
-    this.action({ recordId: record.id }, "incident", "done", `opened incident ${short(incident.id)} (${bisect.status})`);
-    await this.emit("triage.incident_opened", {
-      incidentId: incident.id,
-      sha: record.sha,
-      lastGreenSha: lastGreen?.sha ?? null,
-      candidates: bisect.candidates.length,
+    this.action({ recordId: record.id }, "incident", "done", `opened incident ${short(incident.id)} (${plan.bisect.status})`);
+    s.events.push({
+      type: "triage.incident_opened",
+      data: {
+        incidentId: incident.id,
+        sha: record.sha,
+        pipelineId: record.pipelineId,
+        lastGreenSha: plan.lastGreenSha ?? null,
+        candidates: plan.bisect.candidates.length,
+      },
     });
   }
 
-  private async advanceBisect(): Promise<void> {
-    const { store, settings, project } = this.o;
-    const incident = store.openIncident(project, settings.defaultBranch);
-    if (!incident || incident.bisect.status !== "running") return;
+  private advanceBisect(incident: Incident, s: Section): void {
+    const { store, project } = this.o;
+    if (incident.bisect.status !== "running") return;
     if (incident.bisect.probes.some((p) => p.outcome === "pending")) return;
     const step = nextStep(incident.bisect);
     if (step.type === "probe") {
@@ -1123,7 +1479,17 @@ export class TriageService {
       const bisect: BisectState = { ...incident.bisect, status: "found", culprit: step.culprit, proven: true, detail: step.detail };
       store.updateIncident(incident.id, { bisect });
       this.action({ incidentId: incident.id }, "bisect", "done", `culprit ${short(step.culprit)}: ${step.detail}`);
-      await this.onCulprit(store.getIncident(incident.id)!);
+      const culprit = step.culprit;
+      // The culprit's commit (parents, message) is read outside the queue, then decided on
+      s.jobs.push(async () => {
+        let info: CommitInfo | null = null;
+        try {
+          info = await this.git.commit(culprit);
+        } catch {
+          info = null;
+        }
+        await this.serial(async () => this.commit((s2) => this.decideCulprit(incident.id, info, s2)));
+      });
       return;
     }
     const bisect: BisectState = {
@@ -1141,10 +1507,10 @@ export class TriageService {
       "done",
       `not proven: ${step.detail}; suspects ${step.suspects.map(short).join(", ") || "none"}`,
     );
-    await this.onSuspects(store.getIncident(incident.id)!);
+    this.onSuspects(store.getIncident(incident.id)!, s);
   }
 
-  private async bisectAnswer(recheck: Recheck, recordId: string, status: TriageRecord["status"], classified: ClassifiedCause[]): Promise<void> {
+  private bisectAnswer(recheck: Recheck, recordId: string, status: RecheckStatus, classified: ClassifiedCause[], why: string): void {
     const { store, settings } = this.o;
     const incident = recheck.incidentId ? store.getIncident(recheck.incidentId) : null;
     if (!incident || incident.status !== "open") return;
@@ -1153,9 +1519,20 @@ export class TriageService {
     const target = incident.target;
     let outcome: ProbeOutcome;
     let detail: string;
+    const retried = incident.bisect.probes.filter((p) => p.sha === probe.sha && p.retried).length;
+    const retry = (reason: string): boolean => {
+      if (retried >= settings.recheck.maxRetries) return false;
+      store.updateIncident(incident.id, { bisect: retryProbe(incident.bisect, probe, `${reason}; probing again`) });
+      this.action({ incidentId: incident.id }, "bisect", "recorded", `probe ${short(probe.sha)}: ${reason}, probing again`);
+      return true;
+    };
     if (status === "passed") {
       outcome = "pass";
       detail = `passed (result ${short(recordId)})`;
+    } else if (status === "unproven") {
+      if (retry(`answered "passed" but ${why}`)) return;
+      outcome = "skip";
+      detail = `unproven: ${why}`;
     } else {
       const hit = classified.find(
         (c) =>
@@ -1166,13 +1543,7 @@ export class TriageService {
         outcome = "fail";
         detail = `the same cause: ${clip(hit.cause.rootCause, 140)} (result ${short(recordId)})`;
       } else if (classified.length > 0 && classified.every((c) => c.verdict.class === "infra")) {
-        const retried = incident.bisect.probes.filter((p) => p.sha === probe.sha && p.retried).length;
-        if (retried < settings.recheck.maxRetries) {
-          const bisect = retryProbe(incident.bisect, probe, `infrastructure (${classified[0].verdict.rule}); probing again`);
-          store.updateIncident(incident.id, { bisect });
-          this.action({ incidentId: incident.id }, "bisect", "recorded", `probe ${short(probe.sha)}: infrastructure, probing again`);
-          return;
-        }
+        if (retry(`infrastructure (${classified[0].verdict.rule})`)) return;
         outcome = "skip";
         detail = `infrastructure after ${retried + 1} attempt(s)`;
       } else {
@@ -1189,18 +1560,32 @@ export class TriageService {
     );
   }
 
-  private protectedReason(sha: string, info: CommitInfo | null): string | null {
+  /**
+   * What protects a merge from an automatic revert. A human's mark (in Lair)
+   * and the project's config protect it; the message trailer is only a hint
+   * (whoever merged it wrote it), which turns an automatic revert into a
+   * proposal.
+   */
+  private protection(sha: string, info: CommitInfo | null): { kind: "human" | "config" | "hint"; text: string } | null {
     const { store, settings, project } = this.o;
-    const shas = [sha, ...(info?.parents.slice(1) ?? [])].map((s) => s.toLowerCase());
-    const matches = (list: string[]) => list.some((p) => shas.some((s) => sameSha(s, p)));
-    if (matches(store.listProtected(project).map((p) => p.sha))) return "a human marked it protected in Lair";
-    if (matches(settings.bisect.protectedMerges)) return "it is listed in triage.bisect.protected_merges";
+    const shas = new Set([sha, ...(info?.parents.slice(1) ?? [])].map((x) => x.toLowerCase()));
+    if (store.listProtected(project).some((p) => shas.has(p.sha))) {
+      return { kind: "human", text: "a human marked it protected in Lair" };
+    }
+    if (settings.bisect.protectedMerges.some((p) => shas.has(p))) {
+      return { kind: "config", text: "it is listed in triage.bisect.protected_merges" };
+    }
     const trailer = new RegExp(`^${settings.bisect.protectedTrailer}:\\s*(yes|true|1)\\s*$`, "im");
-    if (info && trailer.test(info.body)) return `its message has "${settings.bisect.protectedTrailer}: yes"`;
+    if (info && trailer.test(info.body.slice(0, 20_000))) {
+      return {
+        kind: "hint",
+        text: `its merge message carries "${settings.bisect.protectedTrailer}: yes" (written by whoever merged it, not a human's mark)`,
+      };
+    }
     return null;
   }
 
-  /** The gate result (with its agent and PR) of the change a merge brought in. */
+  /** The gate result (with its agent and PR) of the change a merge brought in; only trusted results name one. */
   private authorOf(sha: string, info: CommitInfo | null): TriageRecord | null {
     const { store, project } = this.o;
     const shas = [sha, ...(info?.parents.slice(1) ?? [])];
@@ -1211,77 +1596,90 @@ export class TriageService {
     return store.listRecords(project, { limit: 500 }).find((r) => r.pr === pr && r.agent) ?? null;
   }
 
-  private async onCulprit(incident: Incident): Promise<void> {
+  private decideCulprit(incidentId: string, info: CommitInfo | null, s: Section): void {
     const { store, settings } = this.o;
-    const culprit = incident.bisect.culprit!;
-    let info: CommitInfo | null = null;
-    try {
-      info = await this.git.commit(culprit);
-    } catch {
-      info = null;
-    }
-    const protectedBy = this.protectedReason(culprit, info);
+    const incident = store.getIncident(incidentId);
+    if (!incident || incident.status !== "open" || !incident.bisect.culprit) return;
+    const culprit = incident.bisect.culprit;
+    const protection = this.protection(culprit, info);
     const author = this.authorOf(culprit, info);
     const red = store.getRecord(incident.recordId);
     const causes = red?.causes.filter((c) => incident.target.signatures.includes(c.cause.signature)) ?? [];
     const reason = `${incident.branch} is red since ${short(culprit)}${info?.subject ? ` (${clip(info.subject, 100)})` : ""}: ${
       causes.map(describe).slice(0, 2).join("; ") || "see the incident"
     }. Green before, red after, the same cause twice.`;
-    await this.emit("triage.culprit_found", { incidentId: incident.id, sha: culprit, proven: true, protected: protectedBy !== null });
+    s.events.push({
+      type: "triage.culprit_found",
+      data: { incidentId, sha: culprit, proven: true, protected: protection?.kind ?? null },
+    });
 
     if (author?.agent && red) {
-      await this.routeToAuthor(
-        { ...red, agent: author.agent, pr: author.pr },
-        causes,
-        `your change ${short(culprit)} broke ${incident.branch}`,
-      );
+      this.routeToAuthor({ ...red, agent: author.agent, pr: author.pr }, causes, s, `your change ${short(culprit)} broke ${incident.branch}`);
     }
 
-    const revert: Incident["revert"] = { ...incident.revert, protected: protectedBy !== null };
+    const humanProtected = protection !== null && protection.kind !== "hint";
+    const revert: Incident["revert"] = { ...incident.revert, protected: humanProtected };
     const policy = settings.bisect.revert;
     if (policy === "off") {
-      store.updateIncident(incident.id, { revert: { ...revert, status: "off", detail: "triage.bisect.revert is off" } });
+      store.updateIncident(incidentId, { revert: { ...revert, status: "off", detail: "triage.bisect.revert is off" } });
       return;
     }
-    if (policy === "auto" && !protectedBy) {
-      const opened = await this.openRevert(incident, culprit, reason, author?.pr);
-      if (opened?.ok) {
-        store.updateIncident(incident.id, { revert: { ...revert, status: "opened", ref: opened.ref, detail: opened.detail } });
-        return;
-      }
-      revert.detail = opened ? `the revert could not be opened: ${opened.detail}` : "the revert was not opened";
+    if (policy === "auto" && !protection) {
+      store.updateIncident(incidentId, { revert });
+      if (this.openRevert(store.getIncident(incidentId)!, culprit, reason, author?.pr, undefined, s)) return;
+      revert.detail = this.actBlocked ? `not opened: ${this.actBlocked}` : "triage.commands.open_revert is not set";
     }
-    const status = protectedBy ? "protected" : "proposed";
-    store.updateIncident(incident.id, {
+    store.updateIncident(incidentId, {
       revert: {
         ...revert,
-        status,
-        detail: protectedBy ? `never reverted automatically: ${protectedBy}` : revert.detail ?? "a decision proposes the revert",
+        status: humanProtected ? "protected" : "proposed",
+        detail: protection
+          ? `never reverted automatically: ${protection.text}`
+          : (revert.detail ?? "a decision proposes the revert"),
       },
     });
-    await this.raiseDecision({ incidentId: incident.id }, {
+    this.proposeRevert(
+      store.getIncident(incidentId)!,
+      culprit,
+      reason,
+      protection ? { text: protection.text, keep: humanProtected } : undefined,
+      s,
+    );
+  }
+
+  private proposeRevert(
+    incident: Incident,
+    culprit: string,
+    reason: string,
+    protection: { text: string; keep: boolean } | undefined,
+    s: Section,
+  ): void {
+    const protectedBy = protection?.text;
+    this.raiseDecision({ incidentId: incident.id }, s, {
       project: this.project,
       subject: `revert:${incident.id}`,
       kind: "other",
       question: `Revert ${short(culprit)} to make ${incident.branch} green again?`,
       context: [
         reason,
-        ...(protectedBy ? [`It is protected: ${protectedBy}.`] : []),
+        ...(protectedBy ? [`Not reverted automatically: ${protectedBy}.`] : []),
         `Incident ${incident.id}; last green ${incident.lastGreenSha ? short(incident.lastGreenSha) : "unknown"}.`,
         ...incident.bisect.probes.filter((p) => p.recheckId).map((p) => `probe ${short(p.sha)}: ${p.outcome}${p.detail ? ` (${p.detail})` : ""}`),
       ],
-      options: ["revert", "keep and fix forward"],
-      recommended: protectedBy ? "keep and fix forward" : "revert",
-      why: protectedBy
+      options: [
+        { id: "revert", label: `Revert ${short(culprit)}`, consequences: "Lair opens a revert, which goes through the gate and the merge policy" },
+        { id: "keep", label: "Keep it and fix forward", consequences: "Nothing is reverted; the branch stays red until a fix merges" },
+      ],
+      recommended: protection?.keep ? "keep" : "revert",
+      why: protection?.keep
         ? "A merge a human protected is never reverted automatically."
-        : "Bisect proved this merge broke the branch; triage.bisect.revert is propose.",
-      reversible: true,
-      onTimeout: "wait",
-      requestedBy: "triage",
+        : protectedBy
+          ? "Bisect proved this merge broke the branch; its message asks not to revert it automatically."
+          : "Bisect proved this merge broke the branch; triage.bisect.revert is propose.",
     });
   }
 
-  private async onSuspects(incident: Incident): Promise<void> {
+  private onSuspects(incident: Incident, s: Section): void {
     const { store, settings } = this.o;
     const suspects = incident.bisect.suspects ?? [];
     if (settings.bisect.revert === "off") {
@@ -1289,9 +1687,13 @@ export class TriageService {
       return;
     }
     store.updateIncident(incident.id, {
-      revert: { ...incident.revert, status: suspects.length > 0 ? "proposed" : "none", detail: "not proven: never reverted automatically" },
+      revert: {
+        ...incident.revert,
+        status: suspects.length > 0 ? "proposed" : "none",
+        detail: "not proven: reverted only on a human's explicit decision",
+      },
     });
-    await this.raiseDecision({ incidentId: incident.id }, {
+    this.raiseDecision({ incidentId: incident.id }, s, {
       project: this.project,
       subject: `revert:${incident.id}`,
       kind: "escalation",
@@ -1301,99 +1703,217 @@ export class TriageService {
         `Suspects: ${suspects.map(short).join(", ") || "none"}.`,
         ...incident.bisect.probes.filter((p) => p.recheckId).map((p) => `probe ${short(p.sha)}: ${p.outcome}${p.detail ? ` (${p.detail})` : ""}`),
       ],
-      options: [...suspects.slice(0, 5).map((s) => `revert ${short(s)}`), "investigate"],
+      options: [
+        ...suspects.slice(0, 5).map((sha, i) => ({
+          id: `revert-${i + 1}`,
+          label: `Revert ${short(sha)} (not proven)`,
+          consequences: `Lair opens a revert of ${short(sha)} although bisect did not prove it broke the branch`,
+        })),
+        { id: "investigate", label: "Investigate", consequences: "Nothing is reverted" },
+      ],
       recommended: "investigate",
-      why: "Only a merge proven to break the branch is reverted; this one is not proven.",
-      reversible: true,
-      onTimeout: "wait",
-      requestedBy: "triage",
+      why: "Only a merge proven to break the branch is reverted without a human; this one is not proven.",
     });
   }
 
-  private async openRevert(incident: Incident, sha: string, reason: string, pr?: number): Promise<AdapterResult | null> {
+  /** Queue the revert; false when it can't run (observe mode, read_only, no command). */
+  private openRevert(incident: Incident, sha: string, reason: string, pr: number | undefined, actor: string | undefined, s: Section): boolean {
     const opener = this.o.adapters.revert;
-    const request = { project: this.project, incidentId: incident.id, sha, branch: incident.branch, reason, pr };
-    await this.emit("triage.revert_requested", { incidentId: incident.id, sha });
-    return this.perform(
+    if (this.actBlocked || !opener) return false;
+    const request: RevertRequest = { project: this.project, incidentId: incident.id, sha, branch: incident.branch, reason, pr };
+    this.o.store.updateIncident(incident.id, {
+      revert: { ...incident.revert, status: "opening", detail: `opening the revert of ${short(sha)}`, by: actor },
+    });
+    s.events.push({ type: "triage.revert_requested", data: { incidentId: incident.id, sha, by: actor ?? null } });
+    this.perform(
+      s,
       { incidentId: incident.id },
       "revert",
-      `revert ${short(sha)} on ${incident.branch}`,
-      opener ? () => opener.open(request) : undefined,
+      `revert ${short(sha)} on ${incident.branch}${actor ? ` (asked by ${actor})` : ""}`,
+      () => opener.open(request),
       plannedArgv(this.settings, "open_revert", revertVars(request)),
+      (result, s2) => this.revertDone(incident.id, sha, result, reason, actor, s2),
+      actor,
     );
+    return true;
   }
 
-  private async raiseDecision(target: Target, request: DecisionRequest): Promise<void> {
+  private revertDone(incidentId: string, sha: string, result: AdapterResult, reason: string, actor: string | undefined, s: Section): void {
+    const { store } = this.o;
+    const incident = store.getIncident(incidentId);
+    if (!incident) return;
+    store.updateIncident(incidentId, {
+      revert: { ...incident.revert, status: result.ok ? "opened" : "failed", ref: result.ref, detail: result.detail, by: actor },
+    });
+    // An automatic revert that could not be opened becomes a proposal
+    if (!result.ok && !actor) this.proposeRevert(store.getIncident(incidentId)!, sha, reason, undefined, s);
+  }
+
+  private raiseDecision(target: Target, s: Section, request: DecisionRequest): void {
     const { store } = this.o;
     if (!store.claimDecision(this.project, request.subject, this.iso())) {
       this.action(target, "decision", "skipped", `already asked: ${clip(request.question, 160)}`);
       return;
     }
-    await this.emit("triage.decision_requested", { decision: request });
+    s.events.push({ type: "triage.decision_requested", data: { decision: request } });
     const raiser = this.decisions;
-    const viaCommand = this.o.decisionsViaCommand === true;
-    let result: AdapterResult | null;
-    if (viaCommand) {
-      result = await this.perform(
+    const raised = (result: AdapterResult) => {
+      if (!result.ok || !result.ref) return;
+      store.setDecisionRef(this.project, request.subject, result.ref);
+      if (target.incidentId) store.updateIncident(target.incidentId, { decisionRef: result.ref });
+    };
+    if (this.decisionsViaCommand) {
+      this.perform(
+        s,
         target,
         "decision",
         clip(request.question, 200),
         raiser ? () => raiser.raise(request) : undefined,
         plannedArgv(this.settings, "raise_decision", decisionVars(request)),
+        raised,
       );
-    } else if (raiser) {
-      // Asking the human is safe in observe mode too, as the watchdog's escalations are
-      try {
-        result = await raiser.raise(request);
-      } catch (e) {
-        result = { ok: false, detail: message(e) };
-      }
-      this.action(target, "decision", result.ok ? "done" : "failed", `${clip(request.question, 200)}: ${result.detail}`);
-    } else {
-      result = null;
-      this.action(target, "decision", "recorded", `${clip(request.question, 200)} (no decision_file, inbox_file or decisions module)`);
+      return;
     }
-    if (result?.ok && result.ref) store.setDecisionRef(this.project, request.subject, result.ref);
-    if (target.incidentId && result?.ok) store.updateIncident(target.incidentId, { decisionRef: result.ref ?? request.subject });
-  }
-
-  // ============ HUMAN ACTIONS ============
-
-  /** A human asked for the revert (from the UI, or answering the decision). */
-  requestRevert(incidentId: string, sha?: string): Promise<Incident> {
-    return this.serial(async () => {
-      const { store } = this.o;
-      const incident = store.getIncident(incidentId);
-      if (!incident || incident.project !== this.project) throw new TriageNotFoundError(`No incident ${incidentId}`);
-      const candidates = [incident.bisect.culprit, ...(incident.bisect.suspects ?? [])].filter((s): s is string => !!s);
-      const target = sha ? candidates.find((c) => sameSha(c, sha)) : incident.bisect.culprit;
-      if (!target) {
-        throw new TriageConflictError(
-          sha ? `${sha} is not this incident's culprit or a suspect` : "The bisect has not found a culprit (yet)",
-        );
-      }
-      if (incident.revert.status === "opened") throw new TriageConflictError("A revert is already open");
-      const blocked = this.actBlocked;
-      if (blocked) throw new TriageConflictError(`Commands don't run: ${blocked}`);
-      if (!this.o.adapters.revert) throw new TriageConflictError("triage.commands.open_revert is not set");
-      const opened = await this.openRevert(incident, target, `requested by a human for incident ${short(incident.id)}`);
-      store.updateIncident(incident.id, {
-        revert: {
-          ...incident.revert,
-          status: opened?.ok ? "opened" : "failed",
-          ref: opened?.ref,
-          detail: opened?.detail ?? "not opened",
-        },
-      });
-      return store.getIncident(incident.id)!;
+    if (!raiser) {
+      this.action(target, "decision", "recorded", `${clip(request.question, 200)} (no Decision Inbox, decision_file or inbox_file)`);
+      return;
+    }
+    // Asking the human is safe in observe mode too, as the watchdog's escalations are
+    s.jobs.push(async () => {
+      const result = await settle(() => raiser.raise(request));
+      await this.serial(async () =>
+        this.commit(() => {
+          this.action(target, "decision", result.ok ? "done" : "failed", `${clip(request.question, 200)}: ${result.detail}`);
+          raised(result);
+        }),
+      );
     });
   }
 
-  protect(sha: string, note: string): void {
-    this.o.store.protect(this.project, sha, note, this.iso());
+  /** An answer from the Decision Inbox: revert (the culprit or a chosen suspect), or one more re-check. */
+  async followDecision(resolution: DecisionResolution): Promise<void> {
+    const subject = resolution.decision.source.ref;
+    const by = resolution.by;
+    await this.serial(async () =>
+      this.commit((s) => {
+        const { store } = this.o;
+        store.releaseDecision(this.project, subject);
+        if (subject.startsWith("revert:")) {
+          const incident = store.getIncident(subject.slice("revert:".length));
+          if (!incident || incident.status !== "open") return;
+          const suspect = resolution.optionId.match(/^revert-(\d)$/);
+          const sha =
+            resolution.optionId === "revert"
+              ? incident.bisect.culprit
+              : suspect
+                ? incident.bisect.suspects?.[Number(suspect[1]) - 1]
+                : undefined;
+          if (!sha) {
+            this.action({ incidentId: incident.id }, "decision", "done", `answered "${resolution.optionId}": nothing is reverted`, undefined, undefined, by);
+            return;
+          }
+          const reason = `the owner chose to revert it (decision ${resolution.decision.id})`;
+          if (!this.openRevert(incident, sha, reason, undefined, by, s)) {
+            this.action(
+              { incidentId: incident.id },
+              "revert",
+              "failed",
+              `the owner chose to revert ${short(sha)}, but ${this.actBlocked ?? "triage.commands.open_revert is not set"}`,
+              undefined,
+              undefined,
+              by,
+            );
+          }
+          return;
+        }
+        if (subject.startsWith("infra:")) {
+          const origin = store.getRecord(subject.slice("infra:".length));
+          if (!origin) return;
+          const last = store.rechecksFor({ recordId: origin.id, purpose: "infra" }).pop();
+          if (resolution.optionId !== "rerun" || !last) {
+            this.action({ recordId: origin.id }, "decision", "done", `answered "${resolution.optionId}"`, undefined, undefined, by);
+            return;
+          }
+          store.createRecheck(
+            { ...last, attempt: last.attempt + 1, status: "waiting_capacity", reason: "asked by the owner", createdAt: this.iso() },
+            this.now(),
+          );
+          this.action({ recordId: origin.id }, "recheck", "waiting", `one more re-check, asked by the owner`, undefined, undefined, by);
+          this.pumpSync(s);
+        }
+      }),
+    );
+    await this.drain();
   }
 
-  unprotect(sha: string): boolean {
-    return this.o.store.unprotect(this.project, sha);
+  // ============ HUMAN ACTIONS (the owner's credential is checked by the routes) ============
+
+  /**
+   * The owner asked for a revert. A culprit bisect did not prove needs
+   * `acknowledgeUnproven`: an explicit decision to revert a suspect.
+   */
+  async requestRevert(
+    incidentId: string,
+    options: { sha?: string; acknowledgeUnproven?: boolean; actor?: string } = {},
+  ): Promise<Incident> {
+    const id = await this.serial(async () =>
+      this.commit((s) => {
+        const { store } = this.o;
+        const incident = store.getIncident(incidentId);
+        if (!incident || incident.project !== this.project) throw new TriageNotFoundError(`No incident ${incidentId}`);
+        if (incident.status !== "open") throw new TriageConflictError("The incident is resolved");
+        const candidates = [incident.bisect.culprit, ...(incident.bisect.suspects ?? [])].filter((x): x is string => !!x);
+        const wanted = options.sha?.toLowerCase();
+        const target = wanted ? candidates.find((c) => c.toLowerCase() === wanted) : incident.bisect.culprit;
+        if (!target) {
+          throw new TriageConflictError(
+            wanted ? `${wanted} is not this incident's culprit or a suspect` : "The bisect has not found a culprit (yet)",
+          );
+        }
+        const proven = incident.bisect.proven && incident.bisect.culprit === target;
+        if (!proven && options.acknowledgeUnproven !== true) {
+          throw new TriageConflictError(
+            `${short(target)} is not proven to have broken ${incident.branch}: revert it only as an explicit decision ("acknowledgeUnproven": true)`,
+          );
+        }
+        if (incident.revert.status === "opened" || incident.revert.status === "opening") {
+          throw new TriageConflictError("A revert is already open");
+        }
+        const blocked = this.actBlocked;
+        if (blocked) throw new TriageConflictError(`Commands don't run: ${blocked}`);
+        if (!this.o.adapters.revert) throw new TriageConflictError("triage.commands.open_revert is not set");
+        const reason = `requested by the owner for incident ${short(incident.id)}${proven ? "" : " (not proven; acknowledged)"}`;
+        this.openRevert(incident, target, reason, undefined, options.actor, s);
+        return incident.id;
+      }),
+    );
+    await this.drain();
+    return this.o.store.getIncident(id)!;
+  }
+
+  protect(sha: string, note: string, actor?: string): void {
+    const value = sha.toLowerCase();
+    if (!FULL_SHA.test(value)) throw new TriageInputError("Protect a merge by its full commit sha");
+    this.o.store.transaction(() => {
+      this.o.store.protect(this.project, value, note, actor, this.iso());
+      this.action({}, "note", "done", `protected ${short(value)} from automatic reverts${note ? `: ${clip(note, 200)}` : ""}`, undefined, undefined, actor);
+    });
+  }
+
+  unprotect(sha: string, actor?: string): boolean {
+    const value = sha.toLowerCase();
+    return this.o.store.transaction(() => {
+      const removed = this.o.store.unprotect(this.project, value);
+      if (removed) this.action({}, "note", "done", `no longer protected: ${short(value)}`, undefined, undefined, actor);
+      return removed;
+    });
+  }
+
+  liftQuarantine(key: string, actor?: string): boolean {
+    return this.o.store.transaction(() => {
+      const lifted = this.o.store.liftQuarantine(this.project, key);
+      if (lifted) this.action({}, "quarantine", "done", `${key} released by the owner`, undefined, undefined, actor);
+      return lifted;
+    });
   }
 }

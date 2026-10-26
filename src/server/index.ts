@@ -403,7 +403,7 @@ await registerPipelineRoutes(fastify, pipelines, () => getDefaultProject(), huma
 // watchdog's and the agents module's escalations (and the agents' spend decisions) become
 // decisions, and their answers resume them.
 // Closed by fastify.close() in shutdown().
-await mountDecisions(fastify, {
+const decisionInbox = await mountDecisions(fastify, {
   dbPath: join(process.cwd(), "data", "decisions.db"),
   humanAuth,
   defaultProject: () => getDefaultProject(),
@@ -425,14 +425,18 @@ await registerReviewRoutes(fastify, reviews, () => getDefaultProject(), humanAut
 await registerAgentsRoutes(fastify, agents, () => getDefaultProject(), humanAuth);
 
 // Failure triage, bisect and revert: one per project with `triage.enabled:
-// true` (off by default). Gate results arrive by POST /api/triage/results or
-// as gate.completed events.
+// true` (off by default). Results come in-process from the pipelines
+// (gate.completed) or as signed results from trusted nodes; protect, revert
+// and releasing a quarantine need the owner's session. Its revert and
+// re-check questions go to the Decision Inbox, whose answers resume it.
 const triage = await mountTriage(fastify, {
   dbPath: join(process.cwd(), "data", "triage.db"),
   events: getEventBus(),
   projects: projectEntries,
   defaultProject: () => getDefaultProject(),
+  owner: humanAuth,
 });
+triage.useDecisions(decisionInbox);
 
 // Serve the built web UI (dist/client) with an SPA fallback, when it exists.
 // In development the UI comes from the Vite dev server on port 5173 instead.

@@ -7,22 +7,26 @@
  *    chain; a step killed (exit 137/143) or timed out with nothing more
  *    specific; or a timeout while the machine was overloaded.
  * 2. flaky: every failing test of the cause passed at the same commit within
- *    the flaky window, or is quarantined.
- * 3. pre-existing: the default branch has an open incident with this cause,
- *    or the same tests (or the same cause) failed in the base commit's latest
- *    result (the default branch's latest result when the base has none).
- * 4. code: everything else, with which changed files it is near.
+ *    the flaky window, or (off the default branch) is quarantined.
+ * 3. pre-existing: the default branch has an open incident with this cause
+ *    and the base commit includes its red commit, or the same tests (or the
+ *    same cause) failed in the base commit's own recent gate run. Never
+ *    without a base result.
+ * 4. code: everything else, with which changed files it is near; low
+ *    confidence when there is no base result to compare with.
  */
 import type { ClassifiedCause, FailureCause, TriageClass, Verdict } from "../../shared/triage-types.js";
 import type { CompiledPattern, TriageSettings } from "./config.js";
 import { basename, clip, dirname, stem } from "./text.js";
 
-/** What the base commit's latest result showed. */
+/**
+ * What the base commit's own gate run showed: the newest gate run of the same
+ * pipeline at exactly the base commit, no older than triage.base_max_age_hours.
+ * Without one there are no base facts, and nothing is called pre-existing.
+ */
 export interface BaseFacts {
   recordId: string;
   sha: string;
-  /** base: the PR's base commit; default-branch: the default branch's latest result */
-  source: "base" | "default-branch";
   status: "passed" | "failed" | "error";
   at: string;
   failedKeys: Set<string>;
@@ -43,6 +47,9 @@ export interface ClassifyContext {
   /** Why changed files are unknown, when they are */
   changedNote?: string;
   base?: BaseFacts;
+  /** Why there are no base facts, when there are none */
+  baseNote?: string;
+  /** The default branch's open incident, when the base commit includes its red commit */
   incident?: IncidentFacts;
   /** Tests (by key) that passed at this commit within the flaky window */
   passedAtSha: Map<string, { recordId: string; at: string }>;
@@ -146,7 +153,8 @@ function matchExit(cause: FailureCause, ctx: ClassifyContext, settings: TriageSe
 
 function matchFlaky(cause: FailureCause, ctx: ClassifyContext): Verdict | null {
   if (cause.tests.length === 0) return null;
-  if (cause.tests.every((t) => ctx.quarantined.has(t.key))) {
+  // On the default branch a quarantined test that fails is a failure until it passes at the same commit
+  if (!ctx.defaultBranch && cause.tests.every((t) => ctx.quarantined.has(t.key))) {
     return {
       class: "flaky",
       rule: "quarantined",
@@ -189,7 +197,7 @@ function matchPreExisting(cause: FailureCause, ctx: ClassifyContext): Verdict | 
   const sameSignature = base.signatures.has(cause.signature);
   const sameTests = cause.tests.length > 0 && cause.tests.every((t) => base.failedKeys.has(t.key));
   if (!sameSignature && !sameTests) return null;
-  const where = base.source === "base" ? `the base commit ${short(base.sha)}` : `the default branch (latest result, at ${short(base.sha)})`;
+  const where = `the base commit ${short(base.sha)}`;
   const evidence = sameTests
     ? cause.tests.slice(0, 5).map((t) => `${t.key} also failed on ${where}, result ${short(base.recordId)} (${base.at})`)
     : [`the same cause (${clip(cause.rootCause, 160)}) failed on ${where}, result ${short(base.recordId)} (${base.at})`];
@@ -238,17 +246,18 @@ function codeVerdict(cause: FailureCause, ctx: ClassifyContext): Verdict {
   } else if (ctx.base) {
     evidence.push(
       ctx.base.status === "passed"
-        ? `the ${ctx.base.source === "base" ? "base commit" : "default branch"} passed at ${short(ctx.base.sha)} (result ${short(ctx.base.recordId)})`
-        : `it did not fail on ${ctx.base.source === "base" ? "the base commit" : "the default branch"} ${short(ctx.base.sha)}`,
+        ? `the base commit passed at ${short(ctx.base.sha)} (result ${short(ctx.base.recordId)})`
+        : `it did not fail on the base commit ${short(ctx.base.sha)}`,
     );
   } else {
-    evidence.push("no result for the base commit or the default branch to compare with");
+    evidence.push(ctx.baseNote ?? "no recent gate run of the base commit to compare with");
   }
   evidence.push(clip(cause.type ? `${cause.type}: ${cause.message}` : cause.message, 200));
   return {
     class: "code",
     rule: near.length > 0 ? "near-change" : "new-failure",
-    confidence: near.length > 0 || ctx.base !== undefined || ctx.defaultBranch ? "high" : "low",
+    // Without the base's own run there is nothing to compare with: low, never pre-existing
+    confidence: ctx.base !== undefined || ctx.defaultBranch ? "high" : "low",
     evidence,
   };
 }

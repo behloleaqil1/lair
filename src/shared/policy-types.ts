@@ -112,6 +112,20 @@ export interface GateResult {
   completedAt: string;
   /** Pipeline version hash (for reproducibility) */
   pipelineVersion: string;
+  /**
+   * Machine-readable reports the gate wrote (JUnit XML and the like), by
+   * digest, so the result's signature covers them (triage reads them)
+   */
+  reports?: GateReportDigest[];
+}
+
+/** A report a gate wrote, identified by the SHA-256 of its content */
+export interface GateReportDigest {
+  name: string;
+  /** The step that wrote it */
+  step?: string;
+  /** Hex SHA-256 of the report's content */
+  sha256: string;
 }
 
 /** Signed gate result from a node */

@@ -2,10 +2,11 @@
  * Classification and the action for each class, through the production
  * path: TriageManager -> TriageService.ingest -> parsers -> classifier ->
  * real SQLite store -> command adapters. Only the command runner (which
- * records argv), the clock and git are fake.
+ * records argv), the clock and git are fake. Results here are in-process
+ * (trusted), as the gates module hands them over.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { actingTriage, fixture, gate, harness, MIN, sha, step, type Harness } from "./test-harness.js";
+import { actingTriage, fixture, gate, harness, junitPassing, MIN, sha, step, type Harness } from "./testing/harness.js";
 import type { IngestContext } from "./service.js";
 
 let h: Harness | null = null;
@@ -17,6 +18,13 @@ afterEach(async () => {
 
 const OrderApiIT = "com.example.shop.api.OrderApiIT";
 const PaymentApiIT = "com.example.shop.api.PaymentApiIT";
+/** The four tests the context failure fixture fails */
+const CONTEXT_TESTS = [
+  { suite: OrderApiIT, name: "createsOrder()" },
+  { suite: OrderApiIT, name: "listsOrders()" },
+  { suite: OrderApiIT, name: "cancelsOrder()" },
+  { suite: PaymentApiIT, name: "refundsPayment()" },
+];
 
 /** A one-test JUnit report: `test` in `suite` failed with `message`. */
 function junitOne(suite: string, test: string, message: string): string {
@@ -28,10 +36,25 @@ function junitOne(suite: string, test: string, message: string): string {
 }
 
 function contextFailure(t: Harness, commit: string, context: IngestContext = {}) {
-  return t.service.ingest({
+  return t.ingest({
     result: gate({ sha: commit, branch: "feat/orders", steps: [step("lint", "passed"), step("test", "failed")] }),
     reports: [{ step: "test", content: fixture("junit-context-failure.xml") }],
     context: { agent: "worker-a", ...context },
+  });
+}
+
+/** The re-check's answer, as the runner sends it: the re-check's id as the result id. */
+function answer(t: Harness, recheckId: string, commit: string, options: { passed: boolean; report?: string }) {
+  return t.ingest({
+    result: gate({
+      id: recheckId,
+      sha: commit,
+      branch: "feat/orders",
+      status: options.passed ? "passed" : "failed",
+      steps: [step("test", options.passed ? "passed" : "failed")],
+    }),
+    reports: options.report ? [{ step: "test", content: options.report }] : [],
+    context: { recheckId },
   });
 }
 
@@ -46,10 +69,9 @@ describe("classifier", () => {
     expect(c.verdict.evidence[0]).toBe(
       "Caused by: java.net.SocketTimeoutException: connect timed out (matches infra pattern connection-timeout)",
     );
-    expect(c.verdict.evidence).toContain(
-      "one context failure for 4 test(s): the tests never ran, so this is not the change",
-    );
-    expect(out.record).toMatchObject({ verdict: "infra", blocking: true });
+    expect(c.verdict.evidence).toContain("one context failure for 4 test(s): the tests never ran, so this is not the change");
+    expect(out.record).toMatchObject({ verdict: "infra", blocking: true, trust: "trusted" });
+    await h.manager.idle();
     expect(h.events.getRecentEvents("triage.classified")).toHaveLength(1);
   });
 
@@ -60,7 +82,7 @@ describe("classifier", () => {
         default_infra_patterns: false,
       }),
     );
-    const own = await h.service.ingest({
+    const own = await h.ingest({
       result: gate({ sha: sha("p1"), branch: "feat/a", steps: [step("build", "failed", "error: license server lic.example unreachable\n", 2)] }),
     });
     expect(own.record.causes[0].verdict).toMatchObject({ class: "infra", rule: "infra-pattern:license-server" });
@@ -69,22 +91,63 @@ describe("classifier", () => {
     expect(builtin.record.causes[0].verdict.class).toBe("code");
   });
 
-  it("pre-existing: the same test failed in the base commit's latest result", async () => {
+  it("pre-existing: the same test failed in the base commit's own gate run", async () => {
     h = harness(actingTriage());
     const base = sha("b0");
-    await h.service.ingest({
+    await h.ingest({
       result: gate({ sha: base, branch: "feat/base" }),
       reports: [{ content: junitOne("com.example.shop.CartTest", "addsItem()", "expected 2 items") }],
     });
-    const out = await h.service.ingest({
+    const out = await h.ingest({
       result: gate({ sha: sha("p1"), branch: "feat/stacked" }),
       reports: [{ content: junitOne("com.example.shop.CartTest", "addsItem()", "expected 2 items") }],
       context: { baseSha: base, agent: "worker-a", changedFiles: ["src/main/java/com/example/shop/Cart.java"] },
     });
     const [c] = out.record.causes;
     expect(c.verdict).toMatchObject({ class: "pre-existing", rule: "failed-on-base" });
-    expect(c.verdict.evidence[0]).toMatch(/^CartTest#addsItem\(\) also failed on the base commit 6230/);
+    expect(c.verdict.evidence[0]).toMatch(/^CartTest#addsItem\(\) also failed on the base commit 62300000/);
     expect(out.record).toMatchObject({ verdict: "pre-existing", blocking: false });
+  });
+
+  it("pre-existing needs the base commit's own recent run: no fallback to the default branch, nothing stale", async () => {
+    h = harness(actingTriage({ base_max_age_hours: 24 }));
+    const report = junitOne("com.example.shop.CartTest", "addsItem()", "expected 2 items");
+    // The default branch fails the same test at another commit: not this change's base
+    await h.ingest({ result: gate({ sha: sha("m9"), branch: "main" }), reports: [{ content: report }] });
+    const unrelated = await h.ingest({
+      result: gate({ sha: sha("p1"), branch: "feat/a" }),
+      reports: [{ content: report }],
+      context: { baseSha: sha("m1"), agent: "worker-a" },
+    });
+    expect(unrelated.record.causes[0].verdict).toMatchObject({ class: "code", confidence: "low" });
+    expect(unrelated.record.causes[0].verdict.evidence).toContain(
+      `no gate run of example at the base commit ${sha("m1").slice(0, 8)} in the last 24 h`,
+    );
+
+    // A base result older than base_max_age_hours does not count either
+    const base = sha("b0");
+    await h.ingest({ result: gate({ sha: base, branch: "feat/base" }), reports: [{ content: report }] });
+    h.clock.advance(25 * 60 * MIN);
+    const stale = await h.ingest({
+      result: gate({ sha: sha("p2"), branch: "feat/b" }),
+      reports: [{ content: report }],
+      context: { baseSha: base },
+    });
+    expect(stale.record.causes[0].verdict).toMatchObject({ class: "code", confidence: "low" });
+    expect(stale.record.blocking).toBe(true);
+  });
+
+  it("the base commit of a result whose context names none comes from git (merge-base)", async () => {
+    h = harness(actingTriage());
+    const base = sha("b0");
+    const head = sha("p1");
+    h.git.bases.set(head, base);
+    const report = junitOne("com.example.shop.CartTest", "addsItem()", "expected 2 items");
+    await h.ingest({ result: gate({ sha: base, branch: "feat/base" }), reports: [{ content: report }] });
+    const out = await h.ingest({ result: gate({ sha: head, branch: "feat/x" }), reports: [{ content: report }] });
+    expect(h.git.calls).toContain(`merge-base ${head} main`);
+    expect(out.record.baseSha).toBe(base);
+    expect(out.record.causes[0].verdict.rule).toBe("failed-on-base");
   });
 
   it("flaky: the test passed at the same commit within the window; outside the window it is not", async () => {
@@ -92,25 +155,41 @@ describe("classifier", () => {
     const at = sha("s1");
     const report = junitOne("com.example.shop.CartTest", "addsItem()", "expected 2 items");
     // An earlier run at the same commit failed for another reason, but its report shows the test passing
-    await h.service.ingest({
+    await h.ingest({
       result: gate({ sha: at, branch: "feat/cart", steps: [step("lint", "failed", "", 1), step("test", "passed")] }),
-      reports: [{ content: `<testsuite name="com.example.shop.CartTest"><testcase classname="com.example.shop.CartTest" name="addsItem()"/></testsuite>` }],
+      reports: [{ content: junitPassing([{ suite: "com.example.shop.CartTest", name: "addsItem()" }]) }],
     });
     h.clock.advance(10 * MIN);
-    const flaky = await h.service.ingest({ result: gate({ sha: at, branch: "feat/cart" }), reports: [{ content: report }] });
+    const flaky = await h.ingest({ result: gate({ sha: at, branch: "feat/cart" }), reports: [{ content: report }] });
     expect(flaky.record.causes[0].verdict).toMatchObject({ class: "flaky", rule: "passed-at-same-sha" });
     expect(flaky.record.blocking).toBe(false);
 
     h.clock.advance(120 * MIN);
-    const late = await h.service.ingest({ result: gate({ sha: at, branch: "feat/cart" }), reports: [{ content: report }] });
+    const late = await h.ingest({ result: gate({ sha: at, branch: "feat/cart" }), reports: [{ content: report }] });
     expect(late.record.causes[0].verdict.class).toBe("code");
+  });
+
+  it("a pass counts only for tests the passing run ran: a lint-only run does not make a test failure flaky", async () => {
+    h = harness(actingTriage());
+    const at = sha("s1");
+    const failed = await h.ingest({
+      result: gate({ sha: at, branch: "feat/cart" }),
+      reports: [{ content: junitOne("com.example.shop.CartTest", "addsItem()", "expected 2 items") }],
+    });
+    expect(failed.record.verdict).toBe("code");
+    await h.ingest({ result: gate({ sha: at, branch: "feat/cart", status: "passed", steps: [step("lint", "passed")] }) });
+    expect(h.manager.getStore()!.getRecord(failed.record.id)).toMatchObject({ verdict: "code", blocking: true });
+
+    // A run that ran (and passed) the step the test failed in does
+    await h.ingest({ result: gate({ sha: at, branch: "feat/cart", status: "passed", steps: [step("test", "passed")] }) });
+    expect(h.manager.getStore()!.getRecord(failed.record.id)).toMatchObject({ verdict: "flaky", blocking: false });
   });
 
   it("code: near the changed files, with the files and the base comparison as evidence", async () => {
     h = harness(actingTriage());
     const base = sha("m0");
-    await h.service.ingest({ result: gate({ sha: base, branch: "main", status: "passed" }) });
-    const out = await h.service.ingest({
+    await h.ingest({ result: gate({ sha: base, branch: "main", status: "passed" }) });
+    const out = await h.ingest({
       result: gate({ sha: sha("p1"), branch: "feat/tax" }),
       reports: [{ content: fixture("junit-assertion.xml") }],
       context: { baseSha: base, agent: "worker-a", changedFiles: ["app/src/main/java/com/example/shop/orders/OrderService.java"] },
@@ -129,7 +208,7 @@ describe("classifier", () => {
     const base = sha("m0");
     const head = sha("p1");
     h.git.changed.set(`${base}...${head}`, ["app/src/main/java/com/example/shop/orders/OrderService.java"]);
-    const out = await h.service.ingest({
+    const out = await h.ingest({
       result: gate({ sha: head, branch: "feat/tax" }),
       reports: [{ content: fixture("junit-assertion.xml") }],
       context: { baseSha: base },
@@ -149,17 +228,26 @@ describe("classifier", () => {
 
   it("a timeout while the machine was overloaded is infra (load)", async () => {
     h = harness(actingTriage({ overload_per_core: 1.5 }));
-    const out = await h.service.ingest({
+    const out = await h.ingest({
       result: gate({ sha: sha("p1"), branch: "feat/a" }),
       reports: [{ content: junitOne("com.example.shop.SearchIT", "findsItems()", "Timed out after 30 seconds waiting for the index") }],
       context: { loadPerCore: 3.2 },
     });
     expect(out.record.causes[0].verdict).toMatchObject({ class: "infra", rule: "timeout-under-load", infraKind: "load" });
   });
+
+  it("refuses a short sha and a result id it has already seen", async () => {
+    h = harness(actingTriage());
+    await expect(h.ingest({ result: gate({ sha: "abc1234", branch: "feat/a" }) })).rejects.toThrow("full commit sha");
+    await h.ingest({ result: gate({ id: "run-1", sha: sha("p1"), branch: "feat/a" }) });
+    await expect(h.ingest({ result: gate({ id: "run-1", sha: sha("p1"), branch: "feat/a" }) })).rejects.toThrow(
+      "already received",
+    );
+  });
 });
 
 describe("actions: infra", () => {
-  it("re-checks ONLY the failed classes at the same commit, once, and unblocks when it passes", async () => {
+  it("re-checks ONLY the failed classes at the same commit, once, and unblocks when the answer shows them passing", async () => {
     h = harness(actingTriage());
     const p1 = sha("p1");
     const out = await contextFailure(h, p1);
@@ -167,28 +255,55 @@ describe("actions: infra", () => {
     const [recheck] = out.rechecks;
     expect(recheck).toMatchObject({ purpose: "infra", status: "requested", attempt: 1, sha: p1, steps: ["test"] });
     expect(recheck.classes).toEqual([OrderApiIT, PaymentApiIT]);
-    expect(recheck.tests).toEqual([
-      `${OrderApiIT}#createsOrder()`,
-      `${OrderApiIT}#listsOrders()`,
-      `${OrderApiIT}#cancelsOrder()`,
-      `${PaymentApiIT}#refundsPayment()`,
-    ]);
+    expect(recheck.tests).toEqual(CONTEXT_TESTS.map((t) => `${t.suite}#${t.name}`));
     // Never the passing MoneyTest, never the whole suite
     expect(h.runner.callsTo("./bin/recheck")).toEqual([
       ["./bin/recheck", `--sha=${p1}`, `--request=${recheck.id}`, "--steps=test", OrderApiIT, PaymentApiIT],
     ]);
     expect(out.record).toMatchObject({ blocking: true, retries: 1 });
 
-    const answer = await h.service.ingest({
-      result: gate({ id: "recheck-1", sha: p1, branch: "feat/orders", status: "passed", steps: [step("test", "passed")] }),
-      context: { recheckId: recheck.id },
-    });
-    expect(answer.record).toMatchObject({ purpose: "recheck", status: "passed", blocking: false, originId: out.record.id });
+    const back = await answer(h, recheck.id, p1, { passed: true, report: junitPassing(CONTEXT_TESTS) });
+    expect(back.record).toMatchObject({ purpose: "recheck", status: "passed", blocking: false, originId: out.record.id });
     const origin = h.manager.getStore()!.getRecord(out.record.id)!;
     expect(origin.blocking).toBe(false);
     expect(origin.resolution).toBe("re-check 1 passed at the same commit: it was infrastructure");
     expect(h.manager.getStore()!.getRecheck(recheck.id)!.status).toBe("passed");
     expect(h.runner.callsTo("./bin/recheck")).toHaveLength(1);
+  });
+
+  it("an answer that says passed without listing the requested tests is unproven and unblocks nothing", async () => {
+    h = harness(actingTriage());
+    const p1 = sha("p1");
+    const out = await contextFailure(h, p1);
+    // Only one of the four requested tests is shown passing
+    const back = await answer(h, out.rechecks[0].id, p1, { passed: true, report: junitPassing(CONTEXT_TESTS.slice(0, 1)) });
+    expect(back.record.resolution).toContain("re-check unproven: 3 of the 4 requested test(s) are not listed as passed");
+    expect(h.manager.getStore()!.getRecheck(out.rechecks[0].id)!.status).toBe("unproven");
+    const origin = h.manager.getStore()!.getRecord(out.record.id)!;
+    expect(origin.blocking).toBe(true);
+    // Its one re-check is used up: the human is asked
+    expect(origin.resolution).toBe("infra: still failing after 1 re-check(s); asked the human");
+  });
+
+  it("an answer must carry the re-check's id (or the run id its executor returned) as its result id", async () => {
+    h = harness(actingTriage());
+    h.runner.when((argv) => argv[0] === "./bin/recheck", () => ({ code: 0, stdout: "run-77\n", stderr: "" }));
+    const p1 = sha("p1");
+    const out = await contextFailure(h, p1);
+    expect(out.rechecks[0].runId).toBe("run-77");
+    const forged = h.ingest({
+      result: gate({ id: "some-other-run", sha: p1, branch: "feat/orders", status: "passed", steps: [step("test", "passed")] }),
+      reports: [{ content: junitPassing(CONTEXT_TESTS) }],
+      context: { recheckId: out.rechecks[0].id },
+    });
+    await expect(forged).rejects.toThrow(`must have its id (${out.rechecks[0].id}) or its run id (run-77) as the result id`);
+    const byRunId = await h.ingest({
+      result: gate({ id: "run-77", sha: p1, branch: "feat/orders", status: "passed", steps: [step("test", "passed")] }),
+      reports: [{ content: junitPassing(CONTEXT_TESTS) }],
+      context: { recheckId: out.rechecks[0].id },
+    });
+    expect(byRunId.record.status).toBe("passed");
+    expect(h.manager.getStore()!.getRecord(out.record.id)!.blocking).toBe(false);
   });
 
   it("waits for capacity, then re-checks", async () => {
@@ -219,10 +334,7 @@ describe("actions: infra", () => {
     const second = await contextFailure(h, sha("p2"));
     expect(second.rechecks[0]).toMatchObject({ status: "waiting_capacity" });
     expect(second.rechecks[0].reason).toContain("1 re-check(s) running (max_concurrent 1)");
-    await h.service.ingest({
-      result: gate({ sha: sha("p1"), branch: "feat/orders", status: "passed", steps: [step("test", "passed")] }),
-      context: { recheckId: first.rechecks[0].id },
-    });
+    await answer(h, first.rechecks[0].id, sha("p1"), { passed: true, report: junitPassing(CONTEXT_TESTS) });
     expect(h.runner.callsTo("./bin/recheck").map((c) => c[1])).toEqual([`--sha=${sha("p1")}`, `--sha=${sha("p2")}`]);
   });
 
@@ -230,8 +342,8 @@ describe("actions: infra", () => {
     h = harness(actingTriage());
     const p1 = sha("p1");
     const out = await contextFailure(h, p1);
-    const again = await h.service.ingest({
-      result: gate({ sha: p1, branch: "feat/orders", steps: [step("test", "failed")] }),
+    const again = await h.ingest({
+      result: gate({ id: out.rechecks[0].id, sha: p1, branch: "feat/orders", steps: [step("test", "failed")] }),
       reports: [{ step: "test", content: fixture("junit-context-failure.xml") }],
       context: { recheckId: out.rechecks[0].id },
     });
@@ -240,21 +352,23 @@ describe("actions: infra", () => {
     expect(h.manager.getStore()!.getRecord(out.record.id)!.retries).toBe(1);
     expect(again.record.resolution).toBe("infra: still failing after 1 re-check(s); asked the human");
     expect(h.inbox()).toMatch(
-      /^- OWNER\? 2026-03-02T12:00:00\.000Z \[triage:infra:[0-9a-f]{8}\] demo: Gate gate-703100 at 70310000 on feat\/orders still fails with an infrastructure error after 1 re-check\(s\)\./,
+      new RegExp(
+        `^- OWNER\\? 2026-03-02T12:00:00\\.000Z \\[triage:infra:[0-9a-f]{8}\\] demo: Gate ${out.record.gateId} at 70310000 on feat/orders still fails with an infrastructure error after 1 re-check\\(s\\)\\.`,
+      ),
     );
     // Asked once per failure
     await h.service.tick();
     expect(h.inbox().match(/OWNER\?/g)).toHaveLength(1);
   });
 
-  it("after max_retries, routes to the author when the base passes", async () => {
+  it("after max_retries, routes to the author when the base's own run passes", async () => {
     h = harness(actingTriage());
     const base = sha("m0");
-    await h.service.ingest({ result: gate({ sha: base, branch: "main", status: "passed" }) });
+    await h.ingest({ result: gate({ sha: base, branch: "main", status: "passed" }) });
     const p1 = sha("p1");
     const out = await contextFailure(h, p1, { baseSha: base, changedFiles: ["src/main/resources/application.yml"] });
-    await h.service.ingest({
-      result: gate({ sha: p1, branch: "feat/orders", steps: [step("test", "failed")] }),
+    await h.ingest({
+      result: gate({ id: out.rechecks[0].id, sha: p1, branch: "feat/orders", steps: [step("test", "failed")] }),
       reports: [{ step: "test", content: fixture("junit-context-failure.xml") }],
       context: { recheckId: out.rechecks[0].id },
     });
@@ -268,7 +382,7 @@ describe("actions: infra", () => {
   it("re-checks only the failed step when the failure has no tests (never a full re-run)", async () => {
     h = harness(actingTriage());
     const p2 = sha("p2");
-    const out = await h.service.ingest({
+    const out = await h.ingest({
       result: gate({
         sha: p2,
         branch: "feat/infra",
@@ -301,16 +415,16 @@ describe("actions: pre-existing, flaky, code", () => {
     h = harness(actingTriage());
     const m1 = sha("m1");
     const report = junitOne("com.example.shop.CartTest", "addsItem()", "expected 2 items");
-    const main = await h.service.ingest({ result: gate({ sha: m1, branch: "main" }), reports: [{ content: report }] });
+    const main = await h.ingest({ result: gate({ sha: m1, branch: "main" }), reports: [{ content: report }] });
     expect(main.record).toMatchObject({ verdict: "code", blocking: true });
     expect(main.incident?.status).toBe("open");
 
-    const pr1 = await h.service.ingest({
+    const pr1 = await h.ingest({
       result: gate({ sha: sha("p1"), branch: "feat/one" }),
       reports: [{ content: report }],
       context: { baseSha: m1, agent: "worker-a" },
     });
-    const pr2 = await h.service.ingest({
+    const pr2 = await h.ingest({
       result: gate({ sha: sha("p2"), branch: "feat/two" }),
       reports: [{ content: report }],
       context: { baseSha: m1, agent: "worker-b" },
@@ -334,9 +448,9 @@ describe("actions: pre-existing, flaky, code", () => {
 
     const failThenPass = async (label: string) => {
       const at = sha(label);
-      const failed = await h!.service.ingest({ result: gate({ sha: at, branch: `feat/${label}` }), reports: [{ content: report }], context: { agent: "worker-a" } });
+      const failed = await h!.ingest({ result: gate({ sha: at, branch: `feat/${label}` }), reports: [{ content: report }], context: { agent: "worker-a" } });
       expect(failed.record.verdict).toBe("code");
-      await h!.service.ingest({ result: gate({ sha: at, branch: `feat/${label}`, status: "passed" }) });
+      await h!.ingest({ result: gate({ sha: at, branch: `feat/${label}`, status: "passed" }) });
       return store().getRecord(failed.record.id)!;
     };
 
@@ -350,29 +464,80 @@ describe("actions: pre-existing, flaky, code", () => {
     expect(h.runner.callsTo("./bin/task")).toEqual([["./bin/task", "reliability", "Flaky test: CartTest#addsItem()"]]);
     const flaky = store().getFlaky("demo", "CartTest#addsItem()")!;
     expect(flaky.occurrences).toBe(2);
-    expect(flaky.quarantinedAt).toBeDefined();
+    expect(flaky).toMatchObject({ quarantinedAt: expect.any(String), quarantineUntil: "2026-03-09T12:00:00.000Z" });
     expect(store().listTasks("demo", "open")[0].body).toContain("Make it reliable by 2026-03-09T12:00:00.000Z");
 
-    // Quarantined: it still runs, it no longer blocks, and no second task is opened
-    const third = await h.service.ingest({ result: gate({ sha: sha("s3"), branch: "feat/s3" }), reports: [{ content: report }] });
+    // Quarantined: it still runs, it no longer blocks a change, and no second task is opened
+    const third = await h.ingest({ result: gate({ sha: sha("s3"), branch: "feat/s3" }), reports: [{ content: report }] });
     expect(third.record.causes[0].verdict).toMatchObject({ class: "flaky", rule: "quarantined" });
     expect(third.record.blocking).toBe(false);
     expect(h.runner.callsTo("./bin/task")).toHaveLength(1);
     expect(store().getFlaky("demo", "CartTest#addsItem()")?.occurrences).toBe(3);
   });
 
+  it("a quarantine ends at the task's deadline, or after release_after_passes passes in a row", async () => {
+    h = harness(actingTriage({ flaky: { release_after_passes: 2 } }));
+    const store = () => h!.manager.getStore()!;
+    const quarantine = (key: string) => {
+      store().bumpFlaky("demo", key, new Date(h!.clock.now()).toISOString());
+      store().quarantine("demo", key, new Date(h!.clock.now()).toISOString(), new Date(h!.clock.now() + 7 * 24 * 60 * MIN).toISOString());
+    };
+    quarantine("CartTest#addsItem()");
+    quarantine("CartTest#removesItem()");
+    const passing = junitPassing([{ suite: "com.example.shop.CartTest", name: "addsItem()" }]);
+    for (const label of ["q1", "q2"]) {
+      await h.ingest({ result: gate({ sha: sha(label), branch: "feat/q", status: "passed" }), reports: [{ content: passing }] });
+    }
+    expect(store().getFlaky("demo", "CartTest#addsItem()")?.quarantinedAt).toBeUndefined();
+    expect(store().getFlaky("demo", "CartTest#removesItem()")?.quarantinedAt).toBeDefined();
+
+    h.clock.advance(7 * 24 * 60 * MIN + MIN);
+    await h.service.tick();
+    expect(store().quarantinedKeys("demo").size).toBe(0);
+    expect(store().listActions("demo").map((a) => a.detail)).toContain(
+      "CartTest#removesItem() released: its reliability task's deadline passed",
+    );
+  });
+
+  it("on the default branch a quarantined test that fails is a failure and opens an incident", async () => {
+    h = harness(actingTriage());
+    const store = h.manager.getStore()!;
+    store.bumpFlaky("demo", "CartTest#addsItem()", new Date(h.clock.now()).toISOString());
+    store.quarantine("demo", "CartTest#addsItem()", new Date(h.clock.now()).toISOString(), "2026-04-01T00:00:00.000Z");
+    const red = await h.ingest({
+      result: gate({ sha: sha("m1"), branch: "main" }),
+      reports: [{ content: junitOne("com.example.shop.CartTest", "addsItem()", "expected 2 items") }],
+    });
+    expect(red.record.causes[0].verdict.class).toBe("code");
+    expect(red.incident).toMatchObject({ status: "open", redSha: sha("m1") });
+  });
+
   it("a test that failed and passed on a rerun inside one run is recorded as flaky", async () => {
     h = harness(actingTriage());
-    await h.service.ingest({
+    await h.ingest({
       result: gate({ sha: sha("p1"), branch: "feat/a", status: "passed", steps: [step("test", "passed")] }),
       reports: [{ content: fixture("junit-assertion.xml") }],
     });
     expect(h.manager.getStore()!.getFlaky("demo", "OrderServiceTest#appliesDiscount()")?.occurrences).toBe(1);
   });
 
+  it("a report with tens of thousands of passing tests reclassifies the earlier failure among them", async () => {
+    h = harness(actingTriage());
+    const at = sha("s1");
+    const failed = await h.ingest({
+      result: gate({ sha: at, branch: "feat/big" }),
+      reports: [{ content: junitOne("com.example.shop.CartTest", "addsItem()", "expected 2 items") }],
+    });
+    // More tests than SQLite's variable limit (32766): the lookups are chunked
+    const many = Array.from({ length: 33_000 }, (_, i) => ({ suite: "com.example.shop.BulkTest", name: `case${i}()` }));
+    many.push({ suite: "com.example.shop.CartTest", name: "addsItem()" });
+    await h.ingest({ result: gate({ sha: at, branch: "feat/big", status: "passed" }), reports: [{ content: junitPassing(many) }] });
+    expect(h.manager.getStore()!.getRecord(failed.record.id)).toMatchObject({ verdict: "flaky", blocking: false });
+  });
+
   it("code goes back to the author agent with the failing tests and a log excerpt", async () => {
     h = harness(actingTriage());
-    const out = await h.service.ingest({
+    const out = await h.ingest({
       result: gate({ id: "gate-tax-1", sha: sha("p5"), branch: "feat/tax" }),
       reports: [{ content: fixture("junit-assertion.xml") }],
       context: { agent: "worker-a", pr: 42, changedFiles: ["app/src/main/java/com/example/shop/orders/OrderService.java"] },
@@ -393,12 +558,13 @@ describe("actions: pre-existing, flaky, code", () => {
 
   it("with no notify command, the route is still recorded and emitted for the agents module", async () => {
     h = harness({ enabled: true, mode: "act" });
-    const out = await h.service.ingest({
+    const out = await h.ingest({
       result: gate({ sha: sha("p5"), branch: "feat/tax" }),
       reports: [{ content: fixture("junit-assertion.xml") }],
       context: { agent: "worker-a" },
     });
     expect(out.actions.find((a) => a.kind === "route")).toMatchObject({ status: "recorded" });
+    await h.manager.idle();
     const [event] = h.events.getRecentEvents("triage.routed");
     expect(event.data).toMatchObject({ project: "demo", agent: "worker-a", recordId: out.record.id });
     expect(String(event.data.text)).toContain("OrderServiceTest#totalIncludesTax()");

@@ -78,5 +78,15 @@ describe("GitCli", () => {
     const cli = new GitCli(dir, new ExecFileRunner());
     await expect(cli.firstParentRange("--all", shas.m2)).rejects.toThrow("not a commit sha");
     await expect(cli.commit("0123456789abcdef0123456789abcdef01234567")).rejects.toThrow(/^git show failed/);
+    await expect(cli.mergeBase(shas.f2, "--output=x")).rejects.toThrow("not a branch name");
+  });
+
+  it("finds where a change left the default branch, and whether a commit is in another's history", async () => {
+    const cli = new GitCli(dir, new ExecFileRunner());
+    // feat-two was branched from main after the first merge
+    expect(await cli.mergeBase(shas.f2, "main")).toBe(shas.m1);
+    expect(await cli.isAncestor(shas.m1, shas.m2)).toBe(true);
+    expect(await cli.isAncestor(shas.m2, shas.m1)).toBe(false);
+    expect(await cli.isAncestor(shas.c0, shas.f2)).toBe(true);
   });
 });

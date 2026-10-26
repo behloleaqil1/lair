@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 import { actBlockedReason, DEFAULT_CONTEXT_PATTERNS, DEFAULT_INFRA_PATTERNS, parseTriageConfig } from "./config.js";
 import { fillArgv, formatDecision } from "./adapters.js";
-import { projectConfig } from "./test-harness.js";
+import { projectConfig } from "./testing/harness.js";
 
 describe("parseTriageConfig", () => {
   it("is off and in observe mode by default, with the built-in patterns", () => {
@@ -16,9 +16,11 @@ describe("parseTriageConfig", () => {
       mode: "observe",
       defaultBranch: "main",
       actions: { infra: "recheck", preExisting: "fix_task", code: "route" },
-      recheck: { maxRetries: 1, maxConcurrent: 1 },
-      flaky: { ticketAfter: 2, quarantine: true },
+      recheck: { maxRetries: 1, maxConcurrent: 1, requestTimeoutSeconds: 30 },
+      flaky: { ticketAfter: 2, quarantine: true, releaseAfterPasses: 5 },
       bisect: { enabled: true, revert: "propose" },
+      baseMaxAgeHours: 72,
+      trustedNodes: [],
       commands: {},
     });
     expect(parsed.settings.infraPatterns.map((p) => p.id)).toEqual(DEFAULT_INFRA_PATTERNS.map((p) => p.id));
@@ -56,6 +58,17 @@ describe("parseTriageConfig", () => {
     if (!unknown.ok) expect(unknown.errors[0]).toContain("Unrecognized key(s) in object: 'retry'");
     const kind = parseTriageConfig({ infra_patterns: [{ id: "x", kind: "weather", pattern: "rain" }] });
     expect(kind.ok).toBe(false);
+    // A protected merge is named by its full sha, not a prefix that could match another commit
+    const prefix = parseTriageConfig({ bisect: { protected_merges: ["abc1234"] } });
+    expect(prefix.ok).toBe(false);
+    if (!prefix.ok) expect(prefix.errors[0]).toBe("triage.bisect.protected_merges.0: not a full commit sha");
+    const twice = parseTriageConfig({
+      trusted_nodes: [
+        { id: "ci-1", public_key_file: "keys/a.pem" },
+        { id: "ci-1", public_key_file: "keys/b.pem" },
+      ],
+    });
+    expect(twice.ok).toBe(false);
   });
 
   it("act mode is blocked by observe mode and by read_only", () => {
@@ -94,17 +107,17 @@ describe("command argv", () => {
         kind: "other",
         question: "Revert 6d330000 to make main green again?",
         context: ["main is red since 6d330000"],
-        options: ["revert", "keep and fix forward"],
+        options: [
+          { id: "revert", label: "Revert 6d330000", consequences: "a revert is opened" },
+          { id: "keep", label: "Keep it and fix forward", consequences: "nothing is reverted" },
+        ],
         recommended: "revert",
         why: "Bisect proved it.",
-        reversible: true,
-        onTimeout: "wait",
-        requestedBy: "triage",
       },
       "2026-01-01T12:00:00.000Z",
     );
     expect(text).toBe(
-      "- OWNER? 2026-01-01T12:00:00.000Z [triage:revert:0123abcd] demo: Revert 6d330000 to make main green again? Options: revert | keep and fix forward (recommended: revert). Bisect proved it.\n  - main is red since 6d330000\n",
+      "- OWNER? 2026-01-01T12:00:00.000Z [triage:revert:0123abcd] demo: Revert 6d330000 to make main green again? Options: Revert 6d330000 | Keep it and fix forward (recommended: Revert 6d330000). Bisect proved it.\n  - main is red since 6d330000\n",
     );
   });
 });

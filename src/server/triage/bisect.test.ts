@@ -8,8 +8,9 @@
  * it answers each probe the fake command runner received.
  */
 import { afterEach, describe, expect, it } from "vitest";
+import { DecisionInbox, DecisionStore, MemorySecretStore } from "../decisions/index.js";
 import { applyProbe, maxProbes, nextStep, startBisect } from "./bisect.js";
-import { actingTriage, fixture, gate, harness, sha, step, type Harness } from "./test-harness.js";
+import { actingTriage, fixture, gate, harness, junitPassing, sha, step, type Harness } from "./testing/harness.js";
 
 describe("bisect state machine", () => {
   const [a, b, c, d] = ["a", "b", "c", "d"].map((x) => sha(x));
@@ -87,14 +88,14 @@ function history(t: Harness, options: { body?: (i: number) => string } = {}): vo
 
 /** The project's history: c0 green, four merges, the PRs' own gates, and main red at the last merge. */
 async function redMain(t: Harness): Promise<string> {
-  await t.service.ingest({ result: gate({ sha: c0, branch: "main", status: "passed" }) });
+  await t.ingest({ result: gate({ sha: c0, branch: "main", status: "passed" }) });
   for (let i = 0; i < 4; i++) {
-    await t.service.ingest({
+    await t.ingest({
       result: gate({ sha: heads[i], branch: `feat/${i + 1}`, status: "passed" }),
       context: { agent: `worker-${"abcd"[i]}`, pr: 11 + i },
     });
   }
-  const red = await t.service.ingest({ result: gate({ id: "main-red", sha: merges[3], branch: "main" }), reports: [{ content: report }] });
+  const red = await t.ingest({ result: gate({ id: "main-red", sha: merges[3], branch: "main" }), reports: [{ content: report }] });
   expect(red.incident).not.toBeNull();
   return red.incident!.id;
 }
@@ -118,20 +119,25 @@ async function playRunner(t: Harness, firstBad: string, answer?: (sha: string, n
     const recheck = t.manager.getStore()!.getRecheck(id)!;
     const outcome =
       answer?.(recheck.sha, n) ?? (order.indexOf(recheck.sha) >= order.indexOf(firstBad) ? "fail" : "pass");
-    await t.service.ingest({
+    // The runner's answer: the re-check's id as the result id, and the report showing the target test
+    await t.ingest({
       result: gate({
-        id: `probe-${n}`,
+        id,
         sha: recheck.sha,
         branch: "main",
         status: outcome === "pass" ? "passed" : "failed",
         steps: [step("test", outcome === "pass" ? "passed" : "failed")],
       }),
-      reports:
-        outcome === "fail"
-          ? [{ content: report }]
-          : outcome === "infra"
-            ? [{ content: fixture("junit-context-failure.xml") }]
-            : [],
+      reports: [
+        {
+          content:
+            outcome === "fail"
+              ? report
+              : outcome === "infra"
+                ? fixture("junit-context-failure.xml")
+                : junitPassing([{ suite: "com.example.shop.CartTest", name: "addsItem()" }]),
+        },
+      ],
       context: { recheckId: id },
     });
   }
@@ -185,17 +191,21 @@ describe("a red default branch", () => {
     expect(incident.revert.detail).toBe("never reverted automatically: a human marked it protected in Lair");
     const inbox = h.inbox();
     expect(inbox).toContain(`Revert ${merges[2].slice(0, 8)} to make main green again?`);
-    expect(inbox).toContain("(recommended: keep and fix forward)");
-    expect(inbox).toContain("It is protected: a human marked it protected in Lair.");
+    expect(inbox).toContain("(recommended: Keep it and fix forward)");
+    expect(inbox).toContain("Not reverted automatically: a human marked it protected in Lair.");
   });
 
-  it("a protected trailer in the merge message protects it too", async () => {
+  it("a protection trailer in the merge message is only a hint: the revert is proposed, never automatic", async () => {
     h = harness(actingTriage({ bisect: { revert: "auto" } }));
     history(h, { body: (i) => (i === 2 ? "Lair-Protected: yes" : "") });
     const incidentId = await redMain(h);
     await playRunner(h, merges[2]);
     expect(h.runner.callsTo("./bin/revert")).toEqual([]);
-    expect(h.manager.getStore()!.getIncident(incidentId)!.revert.status).toBe("protected");
+    const revert = h.manager.getStore()!.getIncident(incidentId)!.revert;
+    // Not "protected": whoever merged it wrote the trailer, no human marked it
+    expect(revert).toMatchObject({ status: "proposed", protected: false });
+    expect(revert.detail).toContain("written by whoever merged it, not a human's mark");
+    expect(h.inbox()).toContain("(recommended: Revert");
   });
 
   it("propose (the default): asks through a decision, and a human's answer opens the revert", async () => {
@@ -205,11 +215,40 @@ describe("a red default branch", () => {
     await playRunner(h, merges[2]);
     expect(h.runner.callsTo("./bin/revert")).toEqual([]);
     expect(h.manager.getStore()!.getIncident(incidentId)!.revert.status).toBe("proposed");
-    expect(h.inbox()).toContain("(recommended: revert)");
+    expect(h.inbox()).toContain(`(recommended: Revert ${merges[2].slice(0, 8)})`);
 
-    const after = await h.service.requestRevert(incidentId);
+    const after = await h.service.requestRevert(incidentId, { actor: "owner session s1" });
     expect(h.runner.callsTo("./bin/revert")).toEqual([["./bin/revert", merges[2], `--incident=${incidentId}`]]);
-    expect(after.revert.status).toBe("opened");
+    expect(after.revert).toMatchObject({ status: "opened", by: "owner session s1" });
+    const revert = h.manager.getStore()!.actionsFor({ incidentId }).find((a) => a.kind === "revert");
+    expect(revert).toMatchObject({ status: "done", actor: "owner session s1" });
+    expect(revert?.detail).toContain("asked by owner session s1");
+  });
+
+  it("through the Decision Inbox: the revert question is a decision, and the owner's answer opens the revert", async () => {
+    h = harness(actingTriage());
+    const inbox = new DecisionInbox({ store: new DecisionStore(":memory:"), secrets: new MemorySecretStore() });
+    h.manager.useDecisions(inbox);
+    history(h);
+    const incidentId = await redMain(h);
+    await playRunner(h, merges[2]);
+    await h.manager.idle();
+    const [decision] = inbox.list().filter((d) => d.source.module === "triage");
+    expect(decision).toMatchObject({
+      project: "demo",
+      kind: "other",
+      title: `Revert ${merges[2].slice(0, 8)} to make main green again?`,
+      source: { module: "triage", ref: `revert:${incidentId}` },
+    });
+    expect(decision.options.map((o) => o.id)).toEqual(["revert", "keep"]);
+    expect(h.inbox()).toBe("");
+    expect(h.manager.getStore()!.getIncident(incidentId)!.decisionRef).toBe(decision.id);
+
+    await inbox.answer(decision.id, { optionId: "revert" });
+    await h.manager.idle();
+    expect(h.runner.callsTo("./bin/revert")).toEqual([["./bin/revert", merges[2], `--incident=${incidentId}`]]);
+    expect(h.manager.getStore()!.getIncident(incidentId)!.revert.status).toBe("opened");
+    await inbox.stop();
   });
 
   it("a culprit that passes on confirmation is not proven, and is never reverted", async () => {
@@ -227,7 +266,14 @@ describe("a red default branch", () => {
     expect(incident.bisect.detail).toContain("not reproducible");
     expect(h.runner.callsTo("./bin/revert")).toEqual([]);
     expect(incident.revert.status).toBe("proposed");
-    expect(h.inbox()).toContain("(recommended: investigate)");
+    expect(h.inbox()).toContain("(recommended: Investigate)");
+
+    // An unproven suspect is reverted only on an explicit decision
+    await expect(h.service.requestRevert(incidentId)).rejects.toThrow("is not proven to have broken main");
+    expect(h.runner.callsTo("./bin/revert")).toEqual([]);
+    const after = await h.service.requestRevert(incidentId, { acknowledgeUnproven: true, actor: "owner session s1" });
+    expect(after.revert.status).toBe("opened");
+    expect(h.runner.callsTo("./bin/revert")).toEqual([["./bin/revert", merges[2], `--incident=${incidentId}`]]);
   });
 
   it("probes a commit again when infrastructure failed the probe", async () => {
@@ -258,7 +304,7 @@ describe("a red default branch", () => {
     const pending = h.manager.getStore()!.rechecksFor({ incidentId });
     expect(pending.map((r) => r.status)).toEqual(["requested"]);
 
-    await h.service.ingest({ result: gate({ sha: merges[4], branch: "main", status: "passed" }) });
+    await h.ingest({ result: gate({ sha: merges[4], branch: "main", status: "passed" }) });
     const incident = h.manager.getStore()!.getIncident(incidentId)!;
     expect(incident).toMatchObject({ status: "resolved" });
     expect(incident.bisect.status).toBe("cancelled");
@@ -268,7 +314,7 @@ describe("a red default branch", () => {
   it("without a green result there is nothing to bisect from", async () => {
     h = harness(actingTriage());
     history(h);
-    const red = await h.service.ingest({ result: gate({ sha: merges[3], branch: "main" }), reports: [{ content: report }] });
+    const red = await h.ingest({ result: gate({ sha: merges[3], branch: "main" }), reports: [{ content: report }] });
     expect(red.incident?.bisect.status).toBe("no_baseline");
     expect(h.runner.callsTo("./bin/recheck")).toEqual([]);
   });
