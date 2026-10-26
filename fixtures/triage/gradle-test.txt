@@ -1,0 +1,40 @@
+> Task :app:compileJava UP-TO-DATE
+> Task :app:compileTestJava UP-TO-DATE
+> Task :app:test
+
+com.example.shop.orders.OrderServiceTest > totalIncludesTax() FAILED
+    org.opentest4j.AssertionFailedError: expected: <108> but was: <100>
+        at app//org.junit.jupiter.api.AssertionUtils.fail(AssertionUtils.java:55)
+        at app//com.example.shop.orders.OrderService.total(OrderService.java:88)
+        at app//com.example.shop.orders.OrderServiceTest.totalIncludesTax(OrderServiceTest.java:42)
+
+com.example.shop.api.OrderApiIT > createsOrder() FAILED
+    java.lang.IllegalStateException: Failed to load ApplicationContext for [WebMergedContextConfiguration@1a2b3c4d testClass = com.example.shop.api.OrderApiIT]
+        at app//org.springframework.test.context.cache.DefaultCacheAwareContextLoaderDelegate.loadContext(DefaultCacheAwareContextLoaderDelegate.java:180)
+
+        Caused by:
+        org.testcontainers.containers.ContainerLaunchException: Container startup failed for image postgres:16
+            at app//org.testcontainers.containers.GenericContainer.doStart(GenericContainer.java:362)
+
+            Caused by:
+            java.net.SocketTimeoutException: connect timed out
+                at java.base/sun.nio.ch.NioSocketImpl.timedFinishConnect(NioSocketImpl.java:546)
+
+com.example.shop.api.OrderApiIT > listsOrders() FAILED
+    java.lang.IllegalStateException: ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [WebMergedContextConfiguration@1a2b3c4d testClass = com.example.shop.api.OrderApiIT]
+        at app//org.springframework.test.context.cache.DefaultCacheAwareContextLoaderDelegate.loadContext(DefaultCacheAwareContextLoaderDelegate.java:145)
+
+12 tests completed, 3 failed, 1 skipped
+
+> Task :app:test FAILED
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':app:test'.
+> There were failing tests. See the report at: file:///home/user/project/app/build/reports/tests/test/index.html
+
+* Try:
+> Run with --scan to get full insights.
+
+BUILD FAILED in 41s

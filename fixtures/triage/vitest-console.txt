@@ -1,0 +1,40 @@
+
+ RUN  v1.6.0 /home/user/project
+
+ ❯ src/orders/total.test.ts  (3 tests | 1 failed) 12ms
+   ❯ src/orders/total.test.ts > total > includes tax
+     → expected 100 to be 108 // Object.is equality
+ ✓ src/orders/list.test.ts  (4 tests) 8ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Suites 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/db/orders-repo.test.ts [ src/db/orders-repo.test.ts ]
+Error: connect ECONNREFUSED 127.0.0.1:5432
+ ❯ src/db/orders-repo.test.ts:6:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/orders/total.test.ts > total > includes tax
+AssertionError: expected 100 to be 108 // Object.is equality
+
+- Expected
++ Received
+
+- 108
++ 100
+
+ ❯ src/orders/total.test.ts:14:25
+     12|   it("includes tax", () => {
+     13|     const order = makeOrder();
+     14|     expect(total(order)).toBe(108);
+       |                         ^
+     15|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+ Test Files  2 failed | 1 passed (3)
+      Tests  1 failed | 6 passed (7)
+   Start at  12:00:00
+   Duration  1.20s

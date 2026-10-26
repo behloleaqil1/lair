@@ -1,0 +1,18 @@
+> Task :app:compileJava FAILED
+/home/user/project/app/src/main/java/com/example/shop/orders/OrderService.java:88: error: cannot find symbol
+        return subtotal.add(taxFor(region));
+                            ^
+  symbol:   method taxFor(Region)
+  location: class OrderService
+1 error
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':app:compileJava'.
+> Compilation failed; see the compiler error output for details.
+
+* Try:
+> Run with --stacktrace option to get the stack trace.
+
+BUILD FAILED in 6s

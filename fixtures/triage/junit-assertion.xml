@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Invented: unit tests with a real assertion failure, a validation error, a test that passed on a rerun, and a skipped test -->
+<testsuite name="com.example.shop.orders.OrderServiceTest" tests="4" failures="1" errors="1" skipped="1" time="0.412">
+  <testcase name="totalIncludesTax()" classname="com.example.shop.orders.OrderServiceTest" time="0.021">
+    <failure message="expected: &lt;108&gt; but was: &lt;100&gt;" type="org.opentest4j.AssertionFailedError">org.opentest4j.AssertionFailedError: expected: &lt;108&gt; but was: &lt;100&gt;
+	at org.junit.jupiter.api.AssertionUtils.fail(AssertionUtils.java:55)
+	at com.example.shop.orders.OrderService.total(OrderService.java:88)
+	at com.example.shop.orders.OrderServiceTest.totalIncludesTax(OrderServiceTest.java:42)
+</failure>
+  </testcase>
+  <testcase name="rejectsEmptyOrder()" classname="com.example.shop.orders.OrderServiceTest" time="0.013">
+    <error message="Validation failed for argument [0]" type="org.springframework.web.bind.MethodArgumentNotValidException">org.springframework.web.bind.MethodArgumentNotValidException: Validation failed for argument [0]: [Field error in object 'orderRequest' on field 'quantity': rejected value [0]; default message [must be greater than or equal to 1]]
+	at com.example.shop.orders.OrderController.create(OrderController.java:31)
+</error>
+  </testcase>
+  <testcase name="appliesDiscount()" classname="com.example.shop.orders.OrderServiceTest" time="0.015">
+    <flakyFailure message="timed out after 100 ms" type="java.util.concurrent.TimeoutException">java.util.concurrent.TimeoutException: timed out after 100 ms
+	at com.example.shop.orders.DiscountClient.fetch(DiscountClient.java:19)
+</flakyFailure>
+  </testcase>
+  <testcase name="exportsCsv()" classname="com.example.shop.orders.OrderServiceTest" time="0">
+    <skipped message="not supported yet"/>
+  </testcase>
+</testsuite>

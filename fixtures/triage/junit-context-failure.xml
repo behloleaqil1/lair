@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Invented: an integration suite whose application context cannot start because its database container timed out -->
+<testsuites name="example-shop" tests="5" failures="0" errors="4">
+  <testsuite name="com.example.shop.api.OrderApiIT" tests="3" failures="0" errors="3" skipped="0" time="31.204" timestamp="2026-01-01T12:00:00">
+    <testcase name="createsOrder()" classname="com.example.shop.api.OrderApiIT" time="30.112">
+      <error message="Failed to load ApplicationContext for [WebMergedContextConfiguration@1a2b3c4d testClass = com.example.shop.api.OrderApiIT]" type="java.lang.IllegalStateException"><![CDATA[java.lang.IllegalStateException: Failed to load ApplicationContext for [WebMergedContextConfiguration@1a2b3c4d testClass = com.example.shop.api.OrderApiIT]
+	at org.springframework.test.context.cache.DefaultCacheAwareContextLoaderDelegate.loadContext(DefaultCacheAwareContextLoaderDelegate.java:180)
+	at org.springframework.test.context.support.DefaultTestContext.getApplicationContext(DefaultTestContext.java:130)
+	at com.example.shop.support.DatabaseExtension.beforeAll(DatabaseExtension.java:27)
+Caused by: org.springframework.beans.factory.BeanCreationException: Error creating bean with name 'dataSource': Failed to initialize the pool
+	at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.initializeBean(AbstractAutowireCapableBeanFactory.java:1786)
+	... 42 more
+Caused by: org.testcontainers.containers.ContainerLaunchException: Container startup failed for image postgres:16
+	at org.testcontainers.containers.GenericContainer.doStart(GenericContainer.java:362)
+	... 58 more
+Caused by: java.net.SocketTimeoutException: connect timed out
+	at java.base/sun.nio.ch.NioSocketImpl.timedFinishConnect(NioSocketImpl.java:546)
+	... 61 more
+]]></error>
+    </testcase>
+    <testcase name="listsOrders()" classname="com.example.shop.api.OrderApiIT" time="0.002">
+      <error message="ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [WebMergedContextConfiguration@1a2b3c4d testClass = com.example.shop.api.OrderApiIT]" type="java.lang.IllegalStateException">java.lang.IllegalStateException: ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [WebMergedContextConfiguration@1a2b3c4d testClass = com.example.shop.api.OrderApiIT]
+	at org.springframework.test.context.cache.DefaultCacheAwareContextLoaderDelegate.loadContext(DefaultCacheAwareContextLoaderDelegate.java:145)
+</error>
+    </testcase>
+    <testcase name="cancelsOrder()" classname="com.example.shop.api.OrderApiIT" time="0.001">
+      <error message="ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [WebMergedContextConfiguration@1a2b3c4d testClass = com.example.shop.api.OrderApiIT]" type="java.lang.IllegalStateException">java.lang.IllegalStateException: ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [WebMergedContextConfiguration@1a2b3c4d testClass = com.example.shop.api.OrderApiIT]
+	at org.springframework.test.context.cache.DefaultCacheAwareContextLoaderDelegate.loadContext(DefaultCacheAwareContextLoaderDelegate.java:145)
+</error>
+    </testcase>
+  </testsuite>
+  <testsuite name="com.example.shop.api.PaymentApiIT" tests="1" failures="0" errors="1" skipped="0" time="0.004">
+    <testcase name="refundsPayment()" classname="com.example.shop.api.PaymentApiIT" time="0.001">
+      <error message="ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [WebMergedContextConfiguration@5e6f7a8b testClass = com.example.shop.api.PaymentApiIT]" type="java.lang.IllegalStateException">java.lang.IllegalStateException: ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [WebMergedContextConfiguration@5e6f7a8b testClass = com.example.shop.api.PaymentApiIT]
+</error>
+    </testcase>
+  </testsuite>
+  <testsuite name="com.example.shop.MoneyTest" tests="1" failures="0" errors="0" skipped="0" time="0.010">
+    <testcase name="addsAmounts()" classname="com.example.shop.MoneyTest" time="0.010"/>
+  </testsuite>
+</testsuites>

@@ -1,0 +1,45 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.0, pytest-8.0.0, pluggy-1.4.0
+rootdir: /home/user/project
+collected 14 items
+
+tests/test_orders.py F.....                                              [ 42%]
+tests/test_refunds.py .E.E                                               [ 71%]
+tests/test_reports.py ....                                               [100%]
+
+==================================== ERRORS ====================================
+________________ ERROR at setup of TestRefunds.test_full_refund ________________
+
+    @pytest.fixture
+    def db():
+>       return connect(DATABASE_URL)
+
+tests/conftest.py:12:
+E   sqlalchemy.exc.OperationalError: (psycopg.OperationalError) connection failed: Connection refused
+
+tests/conftest.py:12: OperationalError
+_______________ ERROR at setup of TestRefunds.test_partial_refund ______________
+
+    @pytest.fixture
+    def db():
+>       return connect(DATABASE_URL)
+
+tests/conftest.py:12:
+E   sqlalchemy.exc.OperationalError: (psycopg.OperationalError) connection failed: Connection refused
+
+tests/conftest.py:12: OperationalError
+=================================== FAILURES ===================================
+_____________________________ test_total_with_tax ______________________________
+
+    def test_total_with_tax():
+        order = make_order()
+>       assert total(order) == 108
+E       assert 100 == 108
+E        +  where 100 = total(<Order id=1>)
+
+tests/test_orders.py:9: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_orders.py::test_total_with_tax - assert 100 == 108
+ERROR tests/test_refunds.py::TestRefunds::test_full_refund - sqlalchemy.exc.OperationalError: (psycopg.OperationalError) connection failed: Connection refused
+ERROR tests/test_refunds.py::TestRefunds::test_partial_refund - sqlalchemy.exc.OperationalError: (psycopg.OperationalError) connection failed: Connection refused
+==================== 1 failed, 11 passed, 2 errors in 2.31s ====================

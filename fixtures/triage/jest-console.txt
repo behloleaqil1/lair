@@ -1,0 +1,33 @@
+FAIL src/orders/total.test.js
+  total
+    ✕ includes tax (4 ms)
+    ✓ rounds to cents (1 ms)
+
+  ● total › includes tax
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 108
+    Received: 100
+
+      12 |   it("includes tax", () => {
+      13 |     const order = makeOrder();
+    > 14 |     expect(total(order)).toBe(108);
+         |                          ^
+      15 |   });
+
+      at Object.toBe (src/orders/total.test.js:14:26)
+
+FAIL src/db/orders-repo.test.js
+  ● Test suite failed to run
+
+    Cannot find module '../config/database' from 'src/db/orders-repo.test.js'
+
+      at Resolver._throwModNotFoundError (node_modules/jest-resolve/build/resolver.js:427:11)
+
+PASS src/orders/list.test.js
+
+Test Suites: 2 failed, 1 passed, 3 total
+Tests:       1 failed, 5 passed, 6 total
+Snapshots:   0 total
+Time:        1.234 s
