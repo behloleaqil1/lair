@@ -173,7 +173,9 @@ gate configs.
   laptop, 20 queued tasks run with agents scaled automatically to the measured capacity, with no manual step; an agent
   cannot read the git token or write outside its worktree (tested).
 - **M2 Verification and policy:** gate pipelines as config, dev-checks, signed results, policy engine, control-plane
-  merge, automatic revert. Acceptance: a fake or partial gate log can never lead to a merge (tested).
+  merge, automatic revert. Gates and other heavy jobs run on the repository's CI runners first (GitHub Actions
+  first), then the project's Lair machines, and on the developer's machine last ([runners.md](runners.md)).
+  Acceptance: a fake or partial gate log can never lead to a merge (tested).
 - **M3 Fleet:** add machines over SSH from the UI, auto-install of lair-node, scheduling across nodes, self-healing
   playbooks, budgets. Acceptance: unplugging a node mid-run reschedules its work with no human action.
 - **M4 Delivery:** environments, deploy targets, strategies, rollback.

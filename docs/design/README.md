@@ -10,6 +10,7 @@
 |----------|-------------|--------|
 | [platform.md](platform.md) | Platform direction: architecture, nodes, scheduler, sandboxes, workflow, verification, policy engine | Planned; parts exist (scheduler, store, policy, gate signing, TypeScript node daemon), all experimental |
 | [autonomy.md](autonomy.md) | Autonomous operation: decision inbox, watchdog, playbooks, triage, planner, lifecycle | Planned, not built |
+| [runners.md](runners.md) | Where gates run: CI runners (GitHub Actions) first, Lair machines next, the local machine last; minutes budget and fallback | Partly built: pipeline config, GitHub Actions and local executors, the selector, the minutes budget, API and UI; lair-node executors are not built |
 | [node.md](node.md) | The lair-node daemon: compiled Go binary, protocol, job execution | Planned; only the experimental TypeScript daemon in `src/node/` exists |
 | [quality.md](quality.md) | Quality control: test integrity, contracts, migrations, security, performance | Planned, not built |
 | [launch-kit.md](launch-kit.md) | Launch readiness: billing, analytics, compliance, legal, experiments | Planned, not built |
@@ -33,5 +34,5 @@
 1. Start with `platform.md` for the overall direction
 2. Read `phase1-dashboard.md` through `phase5-deploy.md` for the implementation phases
 3. Read `autonomy.md` for the autonomous operation model
-4. Read `node.md` for the compiled daemon design
+4. Read `node.md` for the compiled daemon design, and `runners.md` for where gates run
 5. Read `quality.md` and `launch-kit.md` for quality and launch criteria
