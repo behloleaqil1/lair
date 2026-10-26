@@ -46,6 +46,11 @@ export interface ProjectConfig {
    * resolve against the Lair working directory. Default: data/prompts
    */
   prompts_dir?: string;
+  /**
+   * Progress watchdog (src/server/watchdog/). Validated by
+   * parseWatchdogConfig; see docs/configuration.md#watchdog
+   */
+  watchdog?: Record<string, unknown>;
 }
 
 // Process configuration as it appears in YAML (before defaults applied)

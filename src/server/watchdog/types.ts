@@ -1,205 +1,189 @@
 /**
- * Watchdog module types (SPEC-autonomy §2)
+ * Watchdog types (docs/design/autonomy.md §2).
+ *
+ * A detector reads probe data and reports findings. A finding with a new key
+ * opens a breach; the breach stays open while the detector keeps reporting
+ * that key. Playbooks (diagnose, act, verify) run against open breaches in
+ * act mode; otherwise, or when every playbook is used up, the breach is
+ * escalated once to the project's inbox.
  */
+
+export const DETECTOR_IDS = [
+  "lock_holder_dead",
+  "duplicate_agent",
+  "agent_hung",
+  "orphan_claim",
+  "infra_signature",
+  "gate_owner_gone",
+  "idle_capacity",
+  "progress_stall",
+  "crash_loop",
+] as const;
+export type DetectorId = (typeof DETECTOR_IDS)[number];
 
 /**
- * An SLO definition - what to measure and thresholds
+ * Project-configured commands (watchdog.actions.<id>), and the placeholders
+ * each one may use. {project} is available to all of them.
  */
-export interface SLODefinition {
-  /** Unique SLO ID */
-  id: string;
-  /** Human-readable name */
-  name: string;
-  /** Description of what this SLO measures */
-  description: string;
-  /** Project ID this SLO belongs to (null = global) */
-  projectId: string | null;
-  /** Whether this SLO is enabled */
-  enabled: boolean;
-  /** Threshold value (meaning depends on SLO type) */
-  threshold: number;
-  /** Unit for the threshold (hours, minutes, percentage, etc.) */
-  unit: "hours" | "minutes" | "seconds" | "percentage" | "count";
-  /** SLO type determines the detector logic */
-  type: SLOType;
-  /** When this condition must be met (for conditional SLOs) */
-  condition?: string;
-}
+export const ACTION_PLACEHOLDERS = {
+  break_lock: ["lock", "lock_name", "pid"],
+  stop_duplicate: ["agent", "pid", "keep_pid"],
+  restart_agent: ["agent", "pid", "log"],
+  release_claim: ["agent", "claim"],
+  mark_lane_broken: ["lane", "signature", "gates"],
+  requeue_gate: ["gate", "lane", "file", "pid"],
+  fill_capacity: ["free", "ready", "queued", "running"],
+  triage_stall: ["hours", "last_merge"],
+  stop_container_restarts: ["container", "restarts"],
+} as const satisfies Record<string, readonly string[]>;
+export type ActionId = keyof typeof ACTION_PLACEHOLDERS;
+export const ACTION_IDS = Object.keys(ACTION_PLACEHOLDERS) as ActionId[];
 
-export type SLOType =
-  | "merge-frequency"      // merge every N hours while tasks ready
-  | "gate-frequency"       // passing gate every N hours while gates run
-  | "agent-progress"       // agent shows progress every N minutes
-  | "lane-busy"            // lane not busy > N× median
-  | "idle-capacity"        // idle capacity used within N minutes
-  | "branch-green";        // default branch is green
+export const PLAYBOOK_IDS = [
+  "stale_lock",
+  "duplicate_agent",
+  "agent_stuck",
+  "orphan_claim",
+  "lane_broken",
+  "gate_owner_gone",
+  "idle_capacity",
+  "no_merges",
+  "crash_loop",
+] as const;
+export type PlaybookId = (typeof PLAYBOOK_IDS)[number];
 
-/**
- * Current state of an SLO
- */
-export interface SLOState {
-  /** SLO definition ID */
-  sloId: string;
-  /** Current status */
-  status: "healthy" | "warning" | "breached";
-  /** Current value being measured */
-  currentValue: number;
-  /** Threshold from definition */
-  threshold: number;
-  /** When the current state started */
-  stateChangedAt: string;
-  /** Evidence for current state */
+/** What a detector reports for one subject (an agent, a lock, a gate, ...). */
+export interface Finding {
+  detector: DetectorId;
+  /** Stable identity, e.g. "agent_hung:worker-a"; one open breach per key */
+  key: string;
+  summary: string;
   evidence: string[];
-  /** Last check timestamp */
-  lastCheckedAt: string;
+  /** Placeholder values for the playbook's command */
+  vars: Record<string, string>;
 }
 
-/**
- * An SLO breach event
- */
-export interface SLOBreach {
-  /** Unique breach ID */
+export type BreachStatus = "open" | "resolved";
+/** cleared: the detector stopped reporting it; recovered: a playbook fixed it */
+export type BreachResolution = "cleared" | "recovered";
+
+export interface Breach {
   id: string;
-  /** SLO that was breached */
-  sloId: string;
-  /** When the breach was detected */
+  project: string;
+  detector: DetectorId;
+  key: string;
+  summary: string;
+  evidence: string[];
+  vars: Record<string, string>;
+  status: BreachStatus;
   detectedAt: string;
-  /** Evidence at time of breach */
-  evidence: string[];
-  /** Current value when breached */
-  value: number;
-  /** Threshold that was exceeded */
-  threshold: number;
-  /** Playbook runs triggered by this breach */
-  playbookRuns: string[];
-  /** Whether this breach is resolved */
-  resolved: boolean;
-  /** When resolved */
+  lastSeenAt: string;
   resolvedAt?: string;
+  resolution?: BreachResolution;
+  escalatedAt?: string;
 }
 
-/**
- * A playbook definition - how to respond to a breach
- */
-export interface PlaybookDefinition {
-  /** Unique playbook ID */
-  id: string;
-  /** Human-readable name */
-  name: string;
-  /** Description of what this playbook does */
-  description: string;
-  /** SLO types this playbook handles */
-  forSLOTypes: SLOType[];
-  /** Pattern to match against breach evidence (optional) */
-  forPattern?: string;
-  /** Whether owner approval is required */
-  requiresApproval: boolean;
-  /** Priority (lower = run first) */
-  priority: number;
-  /** Maximum attempts before escalating */
-  maxAttempts: number;
-  /** Cooldown between attempts in seconds */
-  cooldownSeconds: number;
-  /** Steps in this playbook */
-  steps: PlaybookStep[];
-}
+export type StepType = "diagnose" | "act" | "verify";
 
 /**
- * A single step in a playbook
+ * How a verify step checks the result:
+ * - recheck: run the detector again; passes when the breach key is gone
+ * - agent_restarted: the breached pid is gone and the agent has a live process
+ * - deferred: nothing to check right away; the breach closes when the
+ *   detector stops reporting it, or is escalated after the last attempt
  */
+export type VerifyCheck = "recheck" | "agent_restarted" | "deferred";
+
 export interface PlaybookStep {
-  /** Step ID (unique within playbook) */
   id: string;
-  /** Step name */
+  type: StepType;
+  /** act steps: the watchdog.actions.<id> command to run */
+  action?: ActionId;
+  /** verify steps */
+  check?: VerifyCheck;
+}
+
+export interface PlaybookSettings {
+  /** Per-playbook opt-in: act mode runs only playbooks with act: true */
+  act: boolean;
+  maxAttempts: number;
+  cooldownMinutes: number;
+  /** Wait before the verify step (agents take a moment to come back) */
+  verifyDelaySeconds: number;
+}
+
+export interface PlaybookDefinition {
+  id: PlaybookId;
   name: string;
-  /** What this step does */
   description: string;
-  /** Step type */
-  type: PlaybookStepType;
-  /** Step-specific parameters */
-  params: Record<string, unknown>;
-  /** Whether to continue on failure */
-  continueOnFailure?: boolean;
-  /** Timeout in seconds */
-  timeoutSeconds?: number;
+  detector: DetectorId;
+  /** Lower runs first when several playbooks handle one detector */
+  priority: number;
+  steps: PlaybookStep[];
+  defaults: PlaybookSettings;
 }
 
-export type PlaybookStepType =
-  | "diagnose"     // gather information
-  | "act"          // take action
-  | "verify"       // check if action worked
-  | "escalate"     // raise to decision inbox
-  | "wait"         // wait for a condition
-  | "notify";      // send a notification
-
-/**
- * A running or completed playbook execution
- */
-export interface PlaybookRun {
-  /** Unique run ID */
-  id: string;
-  /** Playbook being run */
-  playbookId: string;
-  /** Breach that triggered this run */
-  breachId: string;
-  /** Current status */
-  status: PlaybookRunStatus;
-  /** Attempt number (1-based) */
-  attempt: number;
-  /** When the run started */
-  startedAt: string;
-  /** When the run completed */
-  completedAt?: string;
-  /** Steps that have been executed */
-  stepResults: PlaybookStepResult[];
-  /** Diagnosis gathered during the run */
-  diagnosis?: Record<string, unknown>;
-  /** Error if failed */
-  error?: string;
+export interface CommandRecord {
+  argv: string[];
+  code: number;
+  stdout: string;
+  stderr: string;
 }
 
-export type PlaybookRunStatus =
-  | "pending"        // waiting to start
-  | "running"        // currently executing
-  | "succeeded"      // completed successfully
-  | "failed"         // failed, may retry
-  | "escalated"      // escalated to decision inbox
-  | "cancelled";     // cancelled by user
-
-/**
- * Result of a playbook step execution
- */
-export interface PlaybookStepResult {
-  /** Step ID */
+export interface StepResult {
   stepId: string;
-  /** Status */
-  status: "pending" | "running" | "succeeded" | "failed" | "skipped";
-  /** When the step started */
+  type: StepType;
+  status: "succeeded" | "failed" | "skipped" | "planned";
   startedAt?: string;
-  /** When the step completed */
   completedAt?: string;
-  /** Output from the step */
   output?: string;
-  /** Error if failed */
+  error?: string;
+  /** act steps: the command that ran */
+  command?: CommandRecord;
+  /** observe mode: the command the act step would run */
+  plannedArgv?: string[];
+}
+
+export type RunMode = "act" | "observe";
+export type RunStatus = "running" | "succeeded" | "failed" | "observed";
+/**
+ * recovered: verify passed; acted: the command ran, verify is deferred;
+ * cleared: diagnose found the breach already gone; failed; observed
+ */
+export type RunOutcome = "recovered" | "acted" | "cleared" | "failed" | "observed";
+
+export interface PlaybookRun {
+  id: string;
+  project: string;
+  breachId: string;
+  playbookId: PlaybookId;
+  mode: RunMode;
+  status: RunStatus;
+  outcome?: RunOutcome;
+  attempt: number;
+  startedAt: string;
+  completedAt?: string;
+  steps: StepResult[];
   error?: string;
 }
 
-/**
- * Health summary for the UI
- */
-export interface HealthSummary {
-  /** Overall health status */
-  overall: "healthy" | "warning" | "critical";
-  /** SLO states by status */
-  slosByStatus: {
-    healthy: number;
-    warning: number;
-    breached: number;
-  };
-  /** Active breaches */
-  activeBreaches: SLOBreach[];
-  /** Recent playbook runs */
-  recentPlaybookRuns: PlaybookRun[];
-  /** Timestamp of this summary */
-  generatedAt: string;
+export interface Escalation {
+  id: string;
+  project: string;
+  breachId: string;
+  createdAt: string;
+  /** The inbox file written, or undefined when none is configured */
+  file?: string;
+  text: string;
+}
+
+export type SloState = "ok" | "breached" | "inactive" | "error";
+
+/** One detector's state after the latest tick. */
+export interface SloStatus {
+  detector: DetectorId;
+  state: SloState;
+  openBreaches: number;
+  detail: string;
+  checkedAt: string;
 }
