@@ -67,6 +67,12 @@ export interface ProjectConfig {
    * parseReviewConfig; see docs/configuration.md#reviews-and-policy-merge
    */
   review?: Record<string, unknown>;
+  /**
+   * Agent runs: claims, locks, recovery, failover and budgets
+   * (src/server/agents/). Validated by parseAgentsConfig; see
+   * docs/configuration.md#agents
+   */
+  agents?: Record<string, unknown>;
 }
 
 // Process configuration as it appears in YAML (before defaults applied)

@@ -234,7 +234,17 @@ export type EventType =
   | "review.assignment_requested"
   | "review.decision_requested"
   | "review.merged"
-  | "review.merge_refused";
+  | "review.merge_refused"
+  // Agents (src/server/agents/)
+  | "agent.run.requested"
+  | "agent.run.started"
+  | "agent.run.ended"
+  | "agent.claim.released"
+  | "agent.lock.broken"
+  | "agent.recovery"
+  | "agent.failover"
+  | "agent.budget.warning"
+  | "agent.budget.exceeded";
 
 /** Event stored in the database */
 export interface Event {
