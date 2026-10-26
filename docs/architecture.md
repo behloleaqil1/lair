@@ -183,6 +183,20 @@ Risk tiers, reviews bound to the head sha, the test integrity check and policy m
 - **`service.ts`**, **`routes.ts`**: per-project evaluation, reviews, holds and merges, started by `index.ts`, and the `/api/review/*` routes
 - **`testing/`**: stand-ins for the git host API and git used by the tests (not built)
 
+#### Triage (`triage/`)
+
+Failure triage, bisect and revert ([configuration](configuration.md#triage)). It is off unless a project sets `triage.enabled`, and runs no command unless it sets `mode: act`. `index.ts` calls `mountTriage()`.
+
+- **`parsers/`**: evidence parsers. `junit.ts` (JUnit XML, with a small XML reader in `xml.ts`), `gradle.ts`, `js.ts` (vitest and jest), `pytest.ts`; `index.ts` turns a gate result and its reports into causes
+- **`text.ts`**: signatures, test keys, `Caused by` chains, stack frames, and grouping a context failure into one cause
+- **`classifier.ts`**: the rules (infra, flaky, pre-existing, code), each verdict with its evidence
+- **`bisect.ts`**: the bisect state machine over the merges since the last green commit
+- **`adapters.ts`**: the interfaces triage needs from other modules (re-check executor, agent router, task sink, decision raiser, revert opener, capacity) and the built-in command, inbox-file and capacity adapters
+- **`git.ts`**: read-only git (first-parent merges, a commit's parents and message, changed files)
+- **`store.ts`**: results, causes, test observations, actions, re-checks, tasks, flaky tests, incidents and protected merges in SQLite (`data/triage.db`)
+- **`service.ts`**, **`manager.ts`**, **`routes.ts`**, **`index.ts`**: per-project ingest and actions, the manager's lifecycle, and the `/api/triage/*` routes
+- **`test-harness.ts`**: the fakes the tests use (command runner, clock, git) and result builders
+
 #### Store (`store/`)
 
 - **`store.ts`**: SQLite store (better-sqlite3) for nodes, tasks, jobs, events and agent runs, at `data/lair.db`
@@ -243,6 +257,7 @@ Each view is a standalone component:
 - **`SignInHint.tsx`**: the "sign in from Decisions" notice the views with owner-only actions show while this browser isn't signed in as the owner. Those views send their writes through `owner-actions.ts` (and `delivery-api.ts`), which add the owner session
 - **`Reviews.tsx`**: per PR, the risk tier, required and present reviews, findings, the gate at the head, holds and the merge button with its reasons (view logic in `review-view.ts`, requests in `review-api.ts`, owner-only ones with the owner session)
 - **`Agents.tsx`**: per agent its state, run, claims, budget and recoveries; locks and their holders. Release a claim or start a fresh session, after a confirmation (`agents-actions.ts`)
+- **`Triage.tsx`**: gate failures with each cause's verdict, evidence, actions and retry count; the default branch's incident and bisect, with revert and protect buttons
 - **`Inbox.tsx`**: owner inbox and orchestrator replies
 - **`CommandBar.tsx`**: ask / instruct / task command bar
 - **`Settings.tsx`**: project configuration UI

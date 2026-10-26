@@ -1040,6 +1040,136 @@ Unknown keys, invalid regular expressions, a usage pattern without a named group
 
 Every POST here is the owner's (starting a run, releasing a claim, a fresh session, an early check): they need a browser signed in as the owner (see "Only you answer" in [Decision Inbox](#decision-inbox)), from the dashboard. Any other caller, an agent included, gets HTTP 403, so no process on this machine can put a prompt into a task or stop another agent's run. `/api/agents` gets no CORS. Modules that start runs (the scheduler, the planner) do it in-process through `AgentsManager.requestRun`, not over HTTP. The two actions that stop work also need `confirm: true` (HTTP 400 without); the Agents view asks before sending them.
 
+## Triage
+
+> Off by default. With `enabled: true` and the default `mode: observe`, triage parses, classifies and records every gate result you send it, and runs none of your commands.
+
+Triage ([design](design/autonomy.md#3-failure-triage-bisect-and-revert-module-triage)) answers "why did this gate fail, and what now?". Send it each gate result, with the test reports the gate wrote, as `POST /api/triage/results` (or as a `gate.completed` event on the server's event bus). It stores everything in `data/triage.db`.
+
+1. **Causes.** JUnit XML reports (JUnit, Surefire, Gradle, pytest `--junitxml`, the vitest and jest JUnit reporters) and the console output of every failed step (Gradle, vitest, jest, pytest) are parsed into causes: the error, its `Caused by` chain, field errors, the failing tests and the project's source locations. A context or bootstrap failure (an application context that can't start, a setup error, a test file that can't load) is **one** cause, however many tests it failed: later tests that only say "failure threshold exceeded" join the first failure's cause. A failed step that no parser reads becomes one cause with its exit code and the error lines of its output.
+2. **Classes**, decided per cause, in this order, each with the lines and facts that decided it:
+
+| Class | When | Action (`actions.*`) | Blocks a merge |
+|-------|------|----------------------|----------------|
+| `infra` | An infrastructure pattern (below) matches the error, its `Caused by` chain or its log lines; a step was killed (exit 137 or 143) or timed out with nothing more specific; or a timeout while the machine's load per core was at least `overload_per_core` | `recheck`: ONE re-check of only the failed test classes (or, without tests, only the failed steps) at the same commit, when there is capacity, up to `recheck.max_retries`. Never a full re-run. A pass unblocks the failure. After the last re-check: back to the author when the base passes, otherwise a decision for the human | Until a re-check passes |
+| `flaky` | Every failing test of the cause passed at the same commit within `flaky.window_minutes` (before or after), or is quarantined | Recorded. Flaky `flaky.ticket_after` times in a row (default 2): one reliability task with a deadline, and the test is quarantined (it runs, it no longer blocks), up to `flaky.quarantine_cap` | No |
+| `pre-existing` | The default branch has an open incident with the same tests or cause, or the same tests (or the same cause) failed in the base commit's latest result (the default branch's latest result when the base has none) | `fix_task`: one fix task on the default branch per cause, however many changes hit it | No |
+| `code` | Anything else, with the changed files it is near (the same file, a test of a changed file, or the same directory) | `route`: back to the author agent with the failing tests, the error, its root cause, source locations and the log lines | Yes |
+
+3. **The default branch.** A red gate result on `default_branch` with `code` causes opens an incident. Triage takes the last green gate result on the branch, lists the first-parent commits since then (`git rev-list --first-parent`), and bisects them, running only the failing tests at each probe (as re-checks, so capacity and `max_concurrent` apply). A probe that fails on infrastructure is run again; one that can't decide is skipped. The culprit is **proven** when it is the only commit left, the one before it passed, and it failed with the same cause twice (a confirmation run). Then, per `bisect.revert`: `auto` opens a revert with `commands.open_revert`, `propose` (the default) asks through a decision, `off` records it. The culprit's author agent gets the cause either way. **A merge that is not proven is never reverted automatically**, and neither is a protected one: a merge marked protected in the Triage view (or with `POST /api/triage/protected`), listed in `bisect.protected_merges`, or whose message has a `Lair-Protected: yes` line. Those get a decision instead. A green gate result on the branch resolves the incident and cancels its probes.
+
+Decisions go to the Decision Inbox's importers as `- OWNER? ...` lines in `decision_file` (default: `inbox_file`), once per subject, or to `commands.raise_decision` when set. Asking the human is allowed in observe mode, as the watchdog's escalations are.
+
+```yaml
+triage:
+  enabled: true
+  mode: act                    # observe (default) | act
+  default_branch: main
+  infra_patterns:              # yours first; one with a built-in id replaces it
+    - id: license-server
+      kind: network            # network | container | oom | runner | disk | load
+      pattern: "license server .* unreachable"
+  recheck:
+    max_retries: 1
+    max_load_per_core: 1.5     # wait for capacity above this
+    min_free_memory_mb: 2048
+  bisect:
+    revert: propose            # auto | propose | off
+  commands:
+    recheck: ["./work/bin/gate-recheck.sh", "--sha={sha}", "--request={request}", "--steps={steps}", "{classes}"]
+    notify_agent: ["./work/bin/agent-mail.sh", "{agent}", "{message}"]
+    create_task: ["./work/bin/task-add.sh", "{kind}", "{title}", "{body}"]
+    open_revert: ["./work/bin/revert-pr.sh", "{sha}", "{incident}"]
+```
+
+The built-in infrastructure patterns (case-insensitive regular expressions, `default_infra_patterns: false` drops them): `connection-timeout` (connect timed out, `SocketTimeoutException`, `ETIMEDOUT`), `connection-refused` (`ECONNREFUSED`, `java.net.ConnectException`), `connection-reset`, `dns` (`EAI_AGAIN`, `ENOTFOUND`, could not resolve host), `download` (dependency downloads failing with 5xx or a read timeout), `container-start` (container startup failed, cannot connect to the Docker daemon), `out-of-memory` (`OutOfMemoryError`, heap out of memory, `ENOMEM`, `OOMKilled`), `runner-died` (runner lost, forked VM or test worker died, a shutdown signal) and `disk-full` (`ENOSPC`). Context patterns (`context_patterns`, `default_context_patterns`) decide what counts as a context failure.
+
+### Triage options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Triage this project's gate results |
+| `mode` | `observe` \| `act` | `observe` | `observe` runs no command: every action is recorded as `planned`, with the argv it would run. `act` runs them, unless the project is `read_only: true` |
+| `default_branch` | string | `main` | The branch whose red results open incidents |
+| `interval_seconds` | number | `60` | How often waiting re-checks and bisect probes are retried |
+| `command_timeout_seconds` | number | `120` | Timeout for each command |
+| `infra_patterns` | array | `[]` | `{id, kind, pattern}` |
+| `default_infra_patterns` | boolean | `true` | Use the built-in infrastructure patterns too |
+| `context_patterns` | array | `[]` | Regular expressions for context and bootstrap failures |
+| `default_context_patterns` | boolean | `true` | Use the built-in context patterns too |
+| `overload_per_core` | number | `2` | A timeout while `context.loadPerCore` was at least this is `infra` (`load`) |
+| `actions.infra` | `recheck` \| `route` \| `none` | `recheck` | |
+| `actions.pre_existing` | `fix_task` \| `none` | `fix_task` | |
+| `actions.code` | `route` \| `none` | `route` | |
+| `recheck.max_retries` | number | `1` | Re-checks per failure |
+| `recheck.max_concurrent` | number | `1` | Re-checks and probes running at once |
+| `recheck.timeout_minutes` | number | `120` | A requested re-check with no answer by then expires (and counts as a failed attempt) |
+| `recheck.max_load_per_core`, `recheck.min_free_memory_mb` | number | — | Wait while this machine's load per core is above, or its free memory below, these |
+| `recheck.capacity_cmd` | array | — | Exits 0 when there is capacity (for example, a check of your CI runners) |
+| `flaky.window_minutes` | number | `1440` | A pass at the same commit within this window makes a failure flaky |
+| `flaky.ticket_after` | number | `2` | Flaky this many times in a row opens a reliability task |
+| `flaky.ticket_deadline_days` | number | `7` | The task's deadline |
+| `flaky.quarantine` | boolean | `true` | Quarantine a test when its task opens |
+| `flaky.quarantine_cap` | number | `10` | No more quarantined tests than this |
+| `bisect.enabled` | boolean | `true` | Bisect a red default branch |
+| `bisect.revert` | `auto` \| `propose` \| `off` | `propose` | What to do with a proven culprit |
+| `bisect.max_candidates` | number | `64` | Don't bisect more commits than this |
+| `bisect.protected_merges` | array | `[]` | Commit shas never reverted automatically |
+| `bisect.protected_trailer` | string | `Lair-Protected` | A merge whose message has `<trailer>: yes` is protected |
+| `commands` | map | `{}` | See below |
+| `decision_file` | string | `inbox_file` | Where decisions are appended |
+
+Unknown keys, an invalid regular expression or an unknown placeholder are config errors; a project with an invalid `triage:` block is not triaged, and `GET /api/triage/status` shows why.
+
+### Triage commands
+
+Each command is an argv array (no shell). Every command also gets `{project}`. A list placeholder (`{steps}`, `{tests}`, `{classes}`, `{options}`) that is a whole argument becomes one argument per item; inside a longer argument it is joined with `,`. A value that would start an argument with `-` is refused. Without a command, a route or a task is still recorded in the store and emitted on the event bus (`triage.routed`, `triage.task_created`), for a module that takes them.
+
+| Command | Placeholders | Runs when |
+|---------|--------------|-----------|
+| `recheck` | `{request}` (the re-check id), `{purpose}` (`infra` or `bisect`), `{sha}`, `{branch}`, `{gate}`, `{steps}`, `{tests}` (pytest node ids, else `<class>#<test>`), `{classes}` (test classes, files or modules), `{attempt}` | A re-check or bisect probe has capacity. Run the tests, then `POST /api/triage/results` with `context.recheckId` set to `{request}` |
+| `notify_agent` | `{agent}`, `{gate}`, `{sha}`, `{branch}`, `{pr}`, `{record}`, `{message}` | A failure goes back to its author |
+| `create_task` | `{kind}` (`fix` or `reliability`), `{key}`, `{title}`, `{body}` | A fix or reliability task opens (once per key while open) |
+| `raise_decision` | `{kind}`, `{subject}`, `{question}`, `{context}`, `{recommended}`, `{options}` | A decision is needed (instead of the inbox file) |
+| `open_revert` | `{sha}`, `{branch}`, `{incident}`, `{reason}`, `{pr}` | A proven culprit is reverted (`bisect.revert: auto`), or a human asks for it. Print the revert PR's URL; it is shown on the incident |
+
+### Sending results
+
+The body is a gate result (`src/shared/policy-types.ts`; only `id`, `commitSha`, `branch` and `status` are required), the reports, and what the runner knows about the change:
+
+```bash
+curl -s -X POST "http://localhost:4777/api/triage/results?project=myproject" \
+  -H 'Content-Type: application/json' \
+  --data @- <<'EOF'
+{
+  "result": {
+    "id": "20260101T000000Z-example-abcdef12-1",
+    "commitSha": "abcdef1234567890abcdef1234567890abcdef12",
+    "branch": "feat/example",
+    "status": "failed",
+    "steps": [{ "name": "test", "status": "failed", "exitCode": 1, "output": "..." }]
+  },
+  "reports": [{ "name": "TEST-OrderServiceTest.xml", "step": "test", "content": "<testsuite ...>" }],
+  "context": { "baseSha": "1234567890abcdef1234567890abcdef12345678", "agent": "worker-a", "pr": 42 }
+}
+EOF
+```
+
+`context` fields: `baseSha` (the changed files are computed with `git diff base...head` in the project's `repo` when `changedFiles` is missing), `changedFiles`, `agent`, `pr`, `recheckId` (this result answers that re-check or probe) and `loadPerCore`. The answer is the triage record, its actions, its re-checks and the default branch's open incident.
+
+### Triage API
+
+`?project=` defaults to the default project:
+
+- `POST /api/triage/results`: a gate result, as above (up to 32 MB)
+- `GET /api/triage/status`: mode, why commands don't run, config errors, counts per class, pending re-checks, open tasks, quarantined tests, the default branch's incident and which commands are set
+- `GET /api/triage/failures?verdict=&blocking=true|false&sha=&limit=100`, `GET /api/triage/failures/<id>`: each cause's verdict and evidence, the actions taken (with their argv) and the re-checks
+- `GET /api/triage/rechecks?limit=100`
+- `GET /api/triage/incidents?status=open|resolved|all&limit=50`, `GET /api/triage/incidents/<id>`: the bisect's candidates, probes, culprit and revert status
+- `POST /api/triage/incidents/<id>/revert` with `{"sha": "..."}` (optional): a human opens the revert of the culprit or a suspect
+- `GET /api/triage/tasks?status=open|resolved|all`, `GET /api/triage/flaky`
+- `GET /api/triage/protected`, `POST /api/triage/protected` with `{"sha": "...", "note": "..."}`, `DELETE /api/triage/protected/<sha>`
+
 ## Example complete configuration
 
 ```yaml

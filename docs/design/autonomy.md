@@ -3,8 +3,9 @@
 Goal: Lair manages the whole fleet on its own, and any input a human must give goes through Lair's UI. This builds on
 [platform.md](platform.md) (architecture, milestones) and [node.md](node.md) (the host daemon). Where they differ, this
 file wins for the behaviour it describes. Status: planned, not built, except §2's detectors and playbook engine
-(`src/server/watchdog/`, see [configuration](../configuration.md#watchdog)), §6's agent runs with claims, locks,
-session recovery, failover and budgets (`src/server/agents/`, see [configuration](../configuration.md#agents)), and §7's
+(`src/server/watchdog/`, see [configuration](../configuration.md#watchdog)), §3's triage, bisect and revert
+(`src/server/triage/`, see [configuration](../configuration.md#triage)), §6's agent runs with claims, locks, session
+recovery, failover and budgets (`src/server/agents/`, see [configuration](../configuration.md#agents)), and §7's
 `local` environment as a docker compose project (`src/server/delivery/`, see
 [configuration](../configuration.md#delivery)); the watchdog's escalations go to the project's inbox file until the
 Decision Inbox (§1) exists. §5's risk tiers, reviews, test integrity check and policy merge are built
@@ -105,6 +106,12 @@ everything generic (see [CONTRIBUTING.md](../../CONTRIBUTING.md)).
   outcome.
 
 ## 3. Failure triage, bisect and revert (module `triage`)
+Built: parsers for JUnit XML, Gradle, vitest, jest and pytest; the rules below as four classes, `code` (`own`),
+`pre-existing` (`base-red`), `flaky` (`flake`) and `infra` (`infra` and `load`); one re-check of only the failed tests at
+the same commit (on spare capacity, where this file says "on a different node"); the two-in-a-row flaky rule of
+[quality.md](quality.md) §15; and the bisect with revert by policy. The re-check executor, the agent mailbox, the task
+sink, the Decision Inbox and the revert PR are interfaces (`src/server/triage/adapters.ts`) with command adapters until
+their modules exist. Not built: TAP and SARIF parsers, the agent for leftover causes, and the nightly run.
 - **Structured causes:** every check result carries `causes[]`, parsed from machine-readable output (JUnit XML
   `Caused by` and field errors, pytest, TAP, SARIF, exit codes) by pluggable parsers. It's never only a log tail. A
   context or bootstrap failure is identified as ONE cause, even when it fails hundreds of tests.
