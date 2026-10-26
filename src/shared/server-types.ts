@@ -193,16 +193,35 @@ export type EventType =
   | "node.heartbeat"
   | "node.offline"
   | "node.online"
+  | "node.gc.requested"
+  | "node.runtime.restart.requested"
   | "task.created"
   | "task.assigned"
   | "task.started"
   | "task.completed"
   | "task.failed"
+  | "task.start.requested"
   | "job.created"
   | "job.started"
   | "job.completed"
   | "job.failed"
-  | "scheduler.tick";
+  | "job.requeue.requested"
+  | "job.move.requested"
+  | "scheduler.tick"
+  // Watchdog/playbook events
+  | "slo.breached"
+  | "slo.recovered"
+  | "slo.warning"
+  | "playbook.started"
+  | "playbook.succeeded"
+  | "playbook.failed"
+  | "playbook.step.completed"
+  | "escalation.created"
+  | "decision.requested"
+  | "notification.sent"
+  | "agent.restart.requested"
+  | "branch.status"
+  | "container.crashed";
 
 /** Event stored in the database */
 export interface Event {

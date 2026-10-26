@@ -373,29 +373,32 @@ registerStepExecutor("diagnose", async (step, ctx) => {
   const action = step.params.action as string;
 
   switch (action) {
-    case "get-agent-state":
+    case "get-agent-state": {
       const agentId = step.params.agentId as string;
-      const run = ctx.store.getAgentRun?.(agentId);
+      const run = ctx.store.getAgentRun(agentId);
       if (run) {
         ctx.diagnosis.agentState = run;
         return { success: true, output: `Agent ${agentId}: ${run.status}` };
       }
       return { success: false, error: `Agent ${agentId} not found` };
+    }
 
-    case "get-lane-jobs":
+    case "get-lane-jobs": {
       const lane = step.params.lane as string;
-      const jobs = ctx.store.getJobsByLane?.(lane) ?? [];
+      const jobs = ctx.store.listJobs({ nodeId: lane });
       ctx.diagnosis.laneJobs = jobs;
       return { success: true, output: `Found ${jobs.length} jobs in lane ${lane}` };
+    }
 
-    case "get-node-capacity":
+    case "get-node-capacity": {
       const nodeId = step.params.nodeId as string;
-      const node = ctx.store.getNode?.(nodeId);
+      const node = ctx.store.getNode(nodeId);
       if (node) {
         ctx.diagnosis.nodeCapacity = node;
         return { success: true, output: `Node ${nodeId}: ${node.capacity.cores} cores` };
       }
       return { success: false, error: `Node ${nodeId} not found` };
+    }
 
     default:
       return { success: false, error: `Unknown diagnose action: ${action}` };
@@ -409,8 +412,8 @@ registerStepExecutor("act", async (step, ctx) => {
   const action = step.params.action as string;
 
   switch (action) {
-    case "restart-agent":
-      const agentId = step.params.agentId as string ?? ctx.diagnosis.agentState?.agentId;
+    case "restart-agent": {
+      const agentId = step.params.agentId as string ?? (ctx.diagnosis.agentState as { id?: string })?.id;
       if (!agentId) {
         return { success: false, error: "No agent ID specified" };
       }
@@ -421,17 +424,19 @@ registerStepExecutor("act", async (step, ctx) => {
         breachId: ctx.breach.id,
       });
       return { success: true, output: `Requested restart of agent ${agentId}` };
+    }
 
-    case "mark-job-stuck":
+    case "mark-job-stuck": {
       const jobId = step.params.jobId as string;
       if (!jobId) {
         return { success: false, error: "No job ID specified" };
       }
-      // Mark job stuck in store
-      ctx.store.updateJobStatus?.(jobId, "stuck");
+      // Mark job failed in store (stuck is not a valid JobStatus, use failed)
+      ctx.store.updateJobStatus(jobId, "failed", { error: "Marked as stuck by playbook" });
       return { success: true, output: `Marked job ${jobId} as stuck` };
+    }
 
-    case "requeue-job":
+    case "requeue-job": {
       const requeueJobId = step.params.jobId as string;
       const targetNode = step.params.targetNode as string;
       await ctx.eventBus.emit("job.requeue.requested", {
@@ -440,8 +445,9 @@ registerStepExecutor("act", async (step, ctx) => {
         reason: "Playbook: lane jammed",
       });
       return { success: true, output: `Requeued job ${requeueJobId}` };
+    }
 
-    case "move-job-to-node":
+    case "move-job-to-node": {
       const moveJobId = step.params.jobId as string;
       const toNode = step.params.nodeId as string;
       await ctx.eventBus.emit("job.move.requested", {
@@ -450,16 +456,18 @@ registerStepExecutor("act", async (step, ctx) => {
         reason: "Playbook: idle capacity",
       });
       return { success: true, output: `Moving job ${moveJobId} to node ${toNode}` };
+    }
 
-    case "start-agent":
+    case "start-agent": {
       const taskId = step.params.taskId as string;
       await ctx.eventBus.emit("task.start.requested", {
         taskId,
         reason: "Playbook: ready but idle",
       });
       return { success: true, output: `Requested start for task ${taskId}` };
+    }
 
-    case "gc-worktrees":
+    case "gc-worktrees": {
       const nodeIdGc = step.params.nodeId as string;
       await ctx.eventBus.emit("node.gc.requested", {
         nodeId: nodeIdGc,
@@ -467,8 +475,9 @@ registerStepExecutor("act", async (step, ctx) => {
         reason: "Playbook: disk low",
       });
       return { success: true, output: `Requested worktree GC on node ${nodeIdGc}` };
+    }
 
-    case "restart-runtime":
+    case "restart-runtime": {
       const nodeIdRestart = step.params.nodeId as string;
       const runtime = step.params.runtime as string;
       await ctx.eventBus.emit("node.runtime.restart.requested", {
@@ -477,6 +486,7 @@ registerStepExecutor("act", async (step, ctx) => {
         reason: "Playbook: runtime down",
       });
       return { success: true, output: `Requested ${runtime} restart on node ${nodeIdRestart}` };
+    }
 
     default:
       return { success: false, error: `Unknown action: ${action}` };
@@ -490,30 +500,36 @@ registerStepExecutor("verify", async (step, ctx) => {
   const check = step.params.check as string;
 
   switch (check) {
-    case "agent-running":
-      const agentId = step.params.agentId as string ?? ctx.diagnosis.agentState?.agentId;
-      const run = ctx.store.getAgentRun?.(agentId);
+    case "agent-running": {
+      const agentId = step.params.agentId as string ?? (ctx.diagnosis.agentState as { id?: string })?.id;
+      if (!agentId) {
+        return { success: false, error: "No agent ID to verify" };
+      }
+      const run = ctx.store.getAgentRun(agentId);
       if (run?.status === "running") {
         return { success: true, output: `Agent ${agentId} is running` };
       }
       return { success: false, error: `Agent ${agentId} not running: ${run?.status}` };
+    }
 
-    case "lane-flowing":
+    case "lane-flowing": {
       const lane = step.params.lane as string;
-      const jobs = ctx.store.getJobsByLane?.(lane) ?? [];
-      const stuck = jobs.filter(j => j.status === "stuck");
+      const jobs = ctx.store.listJobs({ nodeId: lane });
+      const stuck = jobs.filter(j => j.status === "failed" && j.error?.includes("stuck"));
       if (stuck.length === 0) {
         return { success: true, output: `Lane ${lane} is flowing` };
       }
       return { success: false, error: `Lane ${lane} still has ${stuck.length} stuck jobs` };
+    }
 
-    case "node-healthy":
+    case "node-healthy": {
       const nodeId = step.params.nodeId as string;
-      const node = ctx.store.getNode?.(nodeId);
+      const node = ctx.store.getNode(nodeId);
       if (node?.status === "online") {
         return { success: true, output: `Node ${nodeId} is healthy` };
       }
       return { success: false, error: `Node ${nodeId} not healthy: ${node?.status}` };
+    }
 
     default:
       return { success: false, error: `Unknown verify check: ${check}` };

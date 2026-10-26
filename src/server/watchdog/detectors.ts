@@ -4,7 +4,8 @@
 import type { EventBus } from "../core/event-bus.js";
 import type { Store } from "../store/store.js";
 import type { WatchdogStore } from "./store.js";
-import type { SLODefinition, SLOState, SLOType } from "./types.js";
+import type { SLODefinition, SLOType } from "./types.js";
+import type { Job, Node } from "../../shared/server-types.js";
 
 /**
  * Context passed to detectors
@@ -46,7 +47,6 @@ export const mergeFrequencyDetector: SLODetector = {
       .filter(e => e.data.result === "merged");
 
     const now = Date.now();
-    const thresholdMs = slo.threshold * 60 * 60 * 1000; // hours to ms
 
     // Find the most recent merge
     let lastMergeTime = 0;
@@ -58,7 +58,7 @@ export const mergeFrequencyDetector: SLODetector = {
     }
 
     // Check if there are ready tasks (condition for this SLO)
-    const tasks = ctx.store.getTasksByStatus("ready");
+    const tasks = ctx.store.listTasks({ status: "queued" });
     if (tasks.length === 0) {
       return {
         status: "healthy",
@@ -106,14 +106,16 @@ export const gateFrequencyDetector: SLODetector = {
 
   async check(slo: SLODefinition, ctx: DetectorContext): Promise<DetectorResult> {
     // Get recent job completions
-    const jobs = ctx.store.getRecentJobs?.(100) ?? [];
-    const gateJobs = jobs.filter(j => j.type === "gate" && j.status === "completed");
+    const jobs = ctx.store.listJobs({ limit: 100 });
+    const completedJobs = jobs.filter((j): j is Job & { completedAt: string } =>
+      j.status === "completed" && j.completedAt !== undefined
+    );
 
     const now = Date.now();
 
-    // Check if there are running gates (condition for this SLO)
-    const runningGates = jobs.filter(j => j.type === "gate" && j.status === "running");
-    if (runningGates.length === 0 && gateJobs.length === 0) {
+    // Check if there are running jobs (condition for this SLO)
+    const runningJobs = jobs.filter(j => j.status === "running");
+    if (runningJobs.length === 0 && completedJobs.length === 0) {
       return {
         status: "healthy",
         currentValue: 0,
@@ -123,9 +125,9 @@ export const gateFrequencyDetector: SLODetector = {
 
     // Find the most recent passing gate
     let lastPassingGateTime = 0;
-    for (const job of gateJobs) {
-      if (job.result?.exitCode === 0) {
-        const jobTime = new Date(job.completedAt!).getTime();
+    for (const job of completedJobs) {
+      if (job.exitCode === 0) {
+        const jobTime = new Date(job.completedAt).getTime();
         if (jobTime > lastPassingGateTime) {
           lastPassingGateTime = jobTime;
         }
@@ -164,15 +166,23 @@ export const gateFrequencyDetector: SLODetector = {
 
 /**
  * Agent progress detector - checks for stuck agents
+ *
+ * Note: This detector requires agent run data that may not be available in all setups.
+ * It checks for agents that have been idle for longer than the threshold without making progress.
  */
 export const agentProgressDetector: SLODetector = {
   type: "agent-progress",
 
   async check(slo: SLODefinition, ctx: DetectorContext): Promise<DetectorResult> {
-    // Get running agent runs
-    const runs = ctx.store.getAgentRunsByStatus?.("running") ?? [];
+    // Use events to detect stuck agents - look for agents that haven't emitted activity
+    const agentEvents = ctx.eventBus.getRecentEvents("task.started", 100);
+    const completedEvents = ctx.eventBus.getRecentEvents("task.completed", 100);
 
-    if (runs.length === 0) {
+    // Find tasks that started but haven't completed
+    const completedTaskIds = new Set(completedEvents.map(e => e.data.taskId as string));
+    const runningTasks = agentEvents.filter(e => !completedTaskIds.has(e.data.taskId as string));
+
+    if (runningTasks.length === 0) {
       return {
         status: "healthy",
         currentValue: 0,
@@ -184,21 +194,12 @@ export const agentProgressDetector: SLODetector = {
     const thresholdMs = slo.threshold * 60 * 1000; // minutes to ms
     const stuckAgents: string[] = [];
 
-    for (const run of runs) {
-      // Check last activity (heartbeat, commit, etc.)
-      const lastActivity = run.lastActivityAt
-        ? new Date(run.lastActivityAt).getTime()
-        : new Date(run.startedAt).getTime();
-
-      const idleMs = now - lastActivity;
-
-      // Skip if agent is explicitly WAITING
-      if (run.status === "waiting") {
-        continue;
-      }
+    for (const event of runningTasks) {
+      const startTime = new Date(event.timestamp).getTime();
+      const idleMs = now - startTime;
 
       if (idleMs > thresholdMs) {
-        stuckAgents.push(`${run.agentId}: ${(idleMs / 60000).toFixed(0)}min idle`);
+        stuckAgents.push(`task ${event.data.taskId}: ${(idleMs / 60000).toFixed(0)}min since start`);
       }
     }
 
@@ -207,7 +208,7 @@ export const agentProgressDetector: SLODetector = {
         status: "breached",
         currentValue: stuckAgents.length,
         evidence: [
-          `${stuckAgents.length} agent(s) stuck (no progress > ${slo.threshold}min)`,
+          `${stuckAgents.length} agent(s) potentially stuck (no progress > ${slo.threshold}min)`,
           ...stuckAgents,
         ],
       };
@@ -216,7 +217,7 @@ export const agentProgressDetector: SLODetector = {
     return {
       status: "healthy",
       currentValue: 0,
-      evidence: [`${runs.length} agents running, all showing progress`],
+      evidence: [`${runningTasks.length} agents running, all showing progress`],
     };
   },
 };
@@ -228,19 +229,21 @@ export const laneBusyDetector: SLODetector = {
   type: "lane-busy",
 
   async check(slo: SLODefinition, ctx: DetectorContext): Promise<DetectorResult> {
-    // Get jobs grouped by lane
-    const jobs = ctx.store.getRecentJobs?.(500) ?? [];
-    const lanes = new Map<string, { running: typeof jobs; completed: typeof jobs }>();
+    // Get jobs grouped by lane using available method
+    const jobs = ctx.store.listJobs({ limit: 500 });
+    type JobWithTimes = Job & { startedAt: string; completedAt?: string };
+    const lanes = new Map<string, { running: JobWithTimes[]; completed: JobWithTimes[] }>();
 
     for (const job of jobs) {
-      const lane = (job.metadata?.lane as string) ?? "default";
+      // Jobs don't have metadata.lane in the current schema, use nodeId as proxy for lane
+      const lane = job.nodeId ?? "default";
       if (!lanes.has(lane)) {
         lanes.set(lane, { running: [], completed: [] });
       }
-      if (job.status === "running") {
-        lanes.get(lane)!.running.push(job);
-      } else if (job.status === "completed") {
-        lanes.get(lane)!.completed.push(job);
+      if (job.status === "running" && job.startedAt) {
+        lanes.get(lane)!.running.push(job as JobWithTimes);
+      } else if (job.status === "completed" && job.startedAt && job.completedAt) {
+        lanes.get(lane)!.completed.push(job as JobWithTimes);
       }
     }
 
@@ -252,7 +255,6 @@ export const laneBusyDetector: SLODetector = {
 
       // Calculate median job time for this lane
       const durations = completed
-        .filter(j => j.completedAt && j.startedAt)
         .map(j => new Date(j.completedAt!).getTime() - new Date(j.startedAt).getTime());
 
       if (durations.length === 0) continue;
@@ -283,7 +285,7 @@ export const laneBusyDetector: SLODetector = {
     return {
       status: "healthy",
       currentValue: 0,
-      evidence: [`All lanes flowing normally`],
+      evidence: ["All lanes flowing normally"],
     };
   },
 };
@@ -296,8 +298,8 @@ export const idleCapacityDetector: SLODetector = {
 
   async check(slo: SLODefinition, ctx: DetectorContext): Promise<DetectorResult> {
     // Check if there's queued work
-    const queuedJobs = ctx.store.getJobsByStatus?.("pending") ?? [];
-    if (queuedJobs.length === 0) {
+    const pendingJobs = ctx.store.listJobs({ status: "pending" });
+    if (pendingJobs.length === 0) {
       return {
         status: "healthy",
         currentValue: 0,
@@ -306,23 +308,23 @@ export const idleCapacityDetector: SLODetector = {
     }
 
     // Get nodes with free capacity
-    const nodes = ctx.store.getAllNodes?.() ?? [];
+    const nodes = ctx.store.listNodes();
     const idleNodes: string[] = [];
     const now = Date.now();
 
     for (const node of nodes) {
       if (node.status !== "online") continue;
 
-      const usedCores = node.usedCores ?? 0;
+      const usedCores = node.usedCapacity.cores;
       const totalCores = node.capacity.cores;
       const freeCapacity = totalCores - usedCores;
 
       if (freeCapacity >= 1) {
-        // Check how long this capacity has been idle
-        const lastJobAssigned = node.lastJobAssignedAt
-          ? new Date(node.lastJobAssignedAt).getTime()
+        // Check how long this capacity has been idle based on last heartbeat
+        const lastActivity = node.lastHeartbeat
+          ? new Date(node.lastHeartbeat).getTime()
           : 0;
-        const idleMinutes = (now - lastJobAssigned) / 60000;
+        const idleMinutes = (now - lastActivity) / 60000;
 
         if (idleMinutes > slo.threshold) {
           idleNodes.push(`${node.name}: ${freeCapacity} cores free for ${idleMinutes.toFixed(0)}min`);
@@ -335,7 +337,7 @@ export const idleCapacityDetector: SLODetector = {
         status: "breached",
         currentValue: idleNodes.length,
         evidence: [
-          `${idleNodes.length} node(s) with idle capacity while ${queuedJobs.length} jobs queued`,
+          `${idleNodes.length} node(s) with idle capacity while ${pendingJobs.length} jobs queued`,
           ...idleNodes,
         ],
       };
@@ -344,7 +346,7 @@ export const idleCapacityDetector: SLODetector = {
     return {
       status: "healthy",
       currentValue: 0,
-      evidence: [`Capacity being utilized, ${queuedJobs.length} jobs queued`],
+      evidence: [`Capacity being utilized, ${pendingJobs.length} jobs queued`],
     };
   },
 };
@@ -356,9 +358,9 @@ export const branchGreenDetector: SLODetector = {
   type: "branch-green",
 
   async check(slo: SLODefinition, ctx: DetectorContext): Promise<DetectorResult> {
-    // Look for branch status events
+    // Look for branch status and job completion events
     const events = ctx.eventBus.getRecentEvents(undefined, 500);
-    const branchStatusEvents = events.filter(
+    const relevantEvents = events.filter(
       e => e.type === "branch.status" || e.type === "job.completed"
     );
 
@@ -366,7 +368,7 @@ export const branchGreenDetector: SLODetector = {
     let branchGreen = true;
     let evidence: string[] = [];
 
-    for (const event of branchStatusEvents.reverse()) {
+    for (const event of relevantEvents.reverse()) {
       if (event.data.branch === "main" || event.data.branch === "master") {
         if (event.type === "job.completed" && event.data.type === "nightly") {
           branchGreen = event.data.exitCode === 0;
