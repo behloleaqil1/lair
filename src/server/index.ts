@@ -357,8 +357,8 @@ const initSupervisor = async () => {
 const shutdown = async (signal: string) => {
   console.log(`Received ${signal}, shutting down gracefully...`);
 
-  // Stop watchdogs (and close their store)
-  watchdogs.stop();
+  // Stop watchdogs: wait for a tick in progress, then close their store
+  await watchdogs.stop();
 
   // Stop healer
   stopHealer();

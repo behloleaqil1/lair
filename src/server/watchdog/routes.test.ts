@@ -20,7 +20,7 @@ let dir: string | null = null;
 
 afterEach(async () => {
   await app?.close();
-  manager?.stop();
+  await manager?.stop();
   if (dir) rmSync(dir, { recursive: true, force: true });
   app = null;
   manager = null;

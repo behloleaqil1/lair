@@ -278,12 +278,14 @@ export class Watchdog {
     this.timer.unref();
   }
 
-  stop(): void {
+  /** Stop ticking; resolves once a tick in progress has finished. */
+  async stop(): Promise<void> {
     this.stopped = true;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    await this.ticking?.catch(() => undefined);
   }
 }
 
@@ -376,8 +378,9 @@ export class WatchdogManager {
     return [...this.watchdogs.keys()];
   }
 
-  stop(): void {
-    for (const watchdog of this.watchdogs.values()) watchdog.stop();
+  /** Stop every watchdog, wait for ticks in progress, then close the store. */
+  async stop(): Promise<void> {
+    await Promise.all([...this.watchdogs.values()].map((watchdog) => watchdog.stop()));
     this.store?.close();
     this.store = null;
     this.watchdogs.clear();
