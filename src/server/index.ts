@@ -39,6 +39,8 @@ import { getEventBus } from "./core/event-bus.js";
 import { WatchdogManager, registerWatchdogRoutes } from "./watchdog/index.js";
 import { DeliveryManager, registerDeliveryRoutes } from "./delivery/index.js";
 import { PipelineManager, registerPipelineRoutes } from "./gates/index.js";
+
+import { AgentsManager, registerAgentsRoutes } from "./agents/index.js";
 import { getBudgetManager } from "./fleet/budget.js";
 import { ReviewManager, registerReviewRoutes } from "./review/index.js";
 import { join } from "path";
@@ -400,6 +402,17 @@ reviews.load(projectEntries);
 // Merges, human reviews, finding resolutions and hold releases need the owner's session
 await registerReviewRoutes(fastify, reviews, () => getDefaultProject(), humanAuth);
 
+// Agent runs (claims, locks, recovery, failover, budgets): one service per
+// project with `agents.enabled: true` (off by default). Costs reach its
+// per-agent and per-project budgets through the fleet budget.
+const agents = new AgentsManager({
+  dbPath: join(process.cwd(), "data", "agents.db"),
+  events: getEventBus(),
+  budget: getBudgetManager(),
+});
+agents.load(projectEntries);
+await registerAgentsRoutes(fastify, agents, () => getDefaultProject());
+
 // Serve the built web UI (dist/client) with an SPA fallback, when it exists.
 // In development the UI comes from the Vite dev server on port 5173 instead.
 const clientDir = resolveClientDir();
@@ -436,6 +449,9 @@ const shutdown = async (signal: string) => {
 
   // Close the review store
   reviews.close();
+
+  // Stop agent supervision (the agents themselves keep running)
+  await agents.stop();
 
   // Stop healer
   stopHealer();
@@ -544,6 +560,14 @@ const start = async () => {
     // Resume pipeline jobs that were in flight when the server stopped
     const piped = await pipelines.start();
     if (piped.length > 0) console.log(`[pipelines] Pipelines for: ${piped.join(", ")}`);
+
+    // Start agent supervision
+    const supervised = agents.start();
+    console.log(
+      supervised.length > 0
+        ? `[agents] Supervising: ${supervised.join(", ")}`
+        : "[agents] Off (no project sets agents.enabled)",
+    );
 
     // Start file watchers for all projects
     const projects = listProjects();
