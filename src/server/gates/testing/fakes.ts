@@ -42,6 +42,33 @@ export class FakeClock implements Clock {
   }
 }
 
+/**
+ * Real time, but every sleep is cut to at most `capMs`: for tests where real
+ * processes run alongside polling loops, so time-based state (unavailable
+ * executors) keeps its real meaning.
+ */
+export class ShortSleepClock implements Clock {
+  constructor(private capMs = 20) {}
+  now(): number {
+    return Date.now();
+  }
+  sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    return new Promise<void>((resolve) => {
+      if (signal?.aborted) {
+        resolve();
+        return;
+      }
+      const done = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", done);
+        resolve();
+      };
+      const timer = setTimeout(done, Math.min(ms, this.capMs));
+      signal?.addEventListener("abort", done, { once: true });
+    });
+  }
+}
+
 // ============ CAPACITY ============
 
 export const AMPLE: CapacitySample = {

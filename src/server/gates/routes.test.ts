@@ -17,7 +17,7 @@ import { registerRootGuards } from "../root-guards.js";
 import type { PipelineRun, PipelinesStatus } from "../../shared/pipeline-types.js";
 import { PipelineManager } from "./pipeline-service.js";
 import { registerPipelineRoutes } from "./routes.js";
-import { AMPLE, FakeCapacity, FakeClock, FakeGitHub, TOKEN } from "./testing/fakes.js";
+import { AMPLE, FakeCapacity, FakeGitHub, ShortSleepClock, TOKEN } from "./testing/fakes.js";
 
 const LOCAL_DIR = join(process.cwd(), "projects", "local");
 const PROJECT = "lair-pipelines-http-test";
@@ -94,7 +94,8 @@ beforeAll(async () => {
   writeFileSync(join(LOCAL_DIR, `${PROJECT}.yaml`), yamlFor(PROJECT, false));
   writeFileSync(join(LOCAL_DIR, `${READ_ONLY}.yaml`), yamlFor(READ_ONLY, true));
 
-  const clock = new FakeClock();
+  // Real time with short sleeps: unavailable executors stay unavailable while real processes run
+  const clock = new ShortSleepClock();
   github = new FakeGitHub(clock);
   github.repo = { private: true, visibility: "private", default_branch: "main" };
   github.defaultScript = { refuse: SPENDING };
