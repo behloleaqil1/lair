@@ -130,16 +130,8 @@ describe("Acceptance: Dead lock holder", () => {
   });
 
   it("breaks stale lock, stops waiters doing no work, starts ONE copy", async () => {
-    // Setup: A lock whose holder pid is dead
-    const staleLock: MockLock = {
-      id: "agent-lock-1",
-      holderId: "agent-1",
-      holderPid: 99999,
-      acquiredAt: new Date(Date.now() - 3600000).toISOString(),
-      leaseSeconds: 300,
-    };
-
-    mockStore = createMockStore({ locks: [staleLock] });
+    // Setup: Mock store (lock state is simulated via step executors)
+    mockStore = createMockStore({});
     engine = new PlaybookEngine(eventBus, mockStore, watchdogStore);
 
     // Track actions

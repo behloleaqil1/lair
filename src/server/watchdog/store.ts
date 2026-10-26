@@ -204,8 +204,8 @@ export class WatchdogStore {
       projectId: row.project_id,
       enabled: row.enabled === 1,
       threshold: row.threshold,
-      unit: row.unit,
-      type: row.type,
+      unit: row.unit as SLODefinition["unit"],
+      type: row.type as SLODefinition["type"],
       condition: row.condition ?? undefined,
     };
   }
@@ -258,7 +258,7 @@ export class WatchdogStore {
   private rowToSLOState(row: SLOStateRow): SLOState {
     return {
       sloId: row.slo_id,
-      status: row.status,
+      status: row.status as SLOState["status"],
       currentValue: row.current_value,
       threshold: row.threshold,
       stateChangedAt: row.state_changed_at,

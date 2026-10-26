@@ -140,7 +140,7 @@ const watchdogModule: ModuleRegistration = {
  */
 export function initializeWatchdogService(
   app: FastifyInstance,
-  _eventBus: EventBus,
+  eventBus: EventBus,
   store: Store,
   db: import("better-sqlite3").Database
 ): WatchdogService {
