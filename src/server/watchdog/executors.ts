@@ -6,8 +6,9 @@
  * Act steps are guarded twice: the detector only reports what it can
  * attribute, and the guard here re-checks on a fresh view right before the
  * command runs (a WAITING agent is never restarted, a live agent's claim is
- * never released, a live holder's lock is never broken, and no pid that
- * isn't a configured agent's process is ever passed to a command).
+ * never released, a live holder's lock is never broken, no pid that isn't a
+ * configured agent's process is ever passed to a command, and no command runs
+ * on a container whose delivery service a human holds).
  */
 import { ACTION_PLACEHOLDERS, type ActionId, type Breach, type CommandRecord, type PlaybookStep } from "./types.js";
 import { placeholdersIn } from "./config.js";
@@ -149,6 +150,11 @@ export class StepExecutors {
 
   /** Why an action must not run on the current state, or null. */
   private async guard(action: ActionId, vars: Record<string, string>): Promise<string | null> {
+    // A container whose delivery service a human holds gets no command at all
+    if (vars.container) {
+      const held = this.ctx.services?.heldReason(this.ctx.project, vars.container);
+      if (held) return held;
+    }
     const view = this.freshView();
     const pid = vars.pid ? Number(vars.pid) : null;
     switch (action) {

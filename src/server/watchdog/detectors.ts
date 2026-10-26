@@ -485,15 +485,44 @@ const progressStall: Detector = {
 
 // ============ 9. CRASH LOOP ============
 
+/**
+ * Restarts between restart-count samples (oldest first). A count that drops
+ * (the container was recreated) counts again from the new value.
+ */
+export function countRestarts(samples: { restartCount: number }[]): number {
+  let restarts = 0;
+  for (let i = 1; i < samples.length; i++) {
+    restarts += Math.max(0, samples[i].restartCount - samples[i - 1].restartCount);
+  }
+  return restarts;
+}
+
+const CONTAINER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+
+/**
+ * Two sources: the containers in watchdog.containers (sampled here), and the
+ * crash loops delivery marked on its environments' services (it samples
+ * them). A container whose delivery service a human holds is skipped.
+ */
 const crashLoop: Detector = {
   id: "crash_loop",
   title: "Containers are not crash-looping",
-  inactiveReason: (ctx) => (ctx.settings.containers.length === 0 ? "no watchdog.containers configured" : null),
+  inactiveReason: (ctx) =>
+    ctx.settings.containers.length === 0 && !ctx.services?.covers(ctx.project)
+      ? "no watchdog.containers configured"
+      : null,
   async detect(view) {
     const s = view.settings;
+    const project = view.ctx.project;
+    const services = view.ctx.services;
     const findings: Finding[] = [];
     const errors: string[] = [];
+    const held: string[] = [];
     for (const container of s.containers) {
+      if (services?.heldReason(project, container.name)) {
+        held.push(container.name);
+        continue;
+      }
       const out = await view.ctx.probes.runner.run(
         [...s.dockerCmd, "inspect", "--format", "{{.RestartCount}}", container.name],
         { timeoutMs: s.commandTimeoutSeconds * 1000 },
@@ -510,10 +539,7 @@ const crashLoop: Detector = {
         container.name,
         view.now - container.windowMinutes * 60000,
       );
-      let restarts = 0;
-      for (let i = 1; i < samples.length; i++) {
-        restarts += Math.max(0, samples[i].restartCount - samples[i - 1].restartCount);
-      }
+      const restarts = countRestarts(samples);
       if (restarts < container.maxRestarts) continue;
       findings.push({
         detector: "crash_loop",
@@ -523,7 +549,23 @@ const crashLoop: Detector = {
         vars: { container: container.name, restarts: String(restarts) },
       });
     }
-    return { findings, detail: errors.length > 0 ? errors.join("; ") : undefined };
+    for (const loop of services?.crashLoops(project) ?? []) {
+      const key = `crash_loop:${loop.container}`;
+      if (!CONTAINER_NAME.test(loop.container) || findings.some((f) => f.key === key)) continue;
+      if (services?.heldReason(project, loop.container)) {
+        held.push(loop.container);
+        continue;
+      }
+      findings.push({
+        detector: "crash_loop",
+        key,
+        summary: `Service ${loop.service} (delivery environment ${loop.environment}): container ${loop.container} restarted ${loop.restarts} times in ${loop.windowMinutes} min (limit ${loop.maxRestarts}); Lair stopped restarting it`,
+        evidence: loop.evidence,
+        vars: { container: loop.container, restarts: String(loop.restarts) },
+      });
+    }
+    const details = [...errors, ...(held.length > 0 ? [`held, left alone: ${held.join(", ")}`] : [])];
+    return { findings, detail: details.length > 0 ? details.join("; ") : undefined };
   },
 };
 

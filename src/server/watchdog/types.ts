@@ -182,6 +182,32 @@ export interface Escalation {
   suppressed?: boolean;
 }
 
+/** A crash loop delivery marked on one of its services' containers. */
+export interface ContainerCrashLoop {
+  container: string;
+  service: string;
+  environment: string;
+  restarts: number;
+  maxRestarts: number;
+  windowMinutes: number;
+  /** Restart samples and the container's last error lines */
+  evidence: string[];
+}
+
+/**
+ * Containers another module runs: delivery environments
+ * (src/server/delivery/). The watchdog only reads them. Their crash loops
+ * become crash_loop findings, and a container whose service a human holds is
+ * left alone: no finding, and no command runs on it.
+ */
+export interface ContainerServices {
+  /** True when the project has such containers (the crash_loop detector is active) */
+  covers(project: string): boolean;
+  crashLoops(project: string): ContainerCrashLoop[];
+  /** Why the container must be left alone (its service is held), or null */
+  heldReason(project: string, container: string): string | null;
+}
+
 export type SloState = "ok" | "breached" | "inactive" | "error";
 
 /** One detector's state after the latest tick. */
