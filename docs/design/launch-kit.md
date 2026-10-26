@@ -8,7 +8,7 @@ from the template, the planner turns it into cards, and the checks verify it wit
 ## 0. Launch readiness
 - One checklist per product (lifecycle stage 9), generated from the kits the app pack enables. Each item needs
   evidence (a passing check, a link, a document version), not a tick.
-- The Launch view shows a readiness score per kit and the blocking items. "Go/no-go" is a `release` decision, the
+- The Launch view shows a readiness score per kit and the blocking items. "Go/no-go" is a `go_no_go` decision, the
   last one.
 
 ## 1. Billing and money
@@ -58,7 +58,7 @@ from the template, the planner turns it into cards, and the checks verify it wit
 ## 7. Market, positioning and pricing
 - A research agent produces a competitor scan, positioning, an ideal-customer profile and pricing options with
   reasoning, with sources cited.
-- Pricing is a `product` decision with a recommended answer, never automatic.
+- Pricing is a `pricing` decision with a recommended answer, never automatic.
 
 ## 8. Experiments
 - Feature flags with kill switches, A/B tests with a pre-registered metric and sample size, automatic analysis, and a

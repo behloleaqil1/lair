@@ -448,9 +448,77 @@ processes:
 | `action` | `restart` \| `alert` \| `none` | `none` | Action on failure |
 | `retries` | number | `1` | Retries before action |
 
+## Decision Inbox
+
+> Always on, nothing to configure. It is the one place Lair asks you something: pricing, legal, spend, accounts, credentials, go/no-go, and problems its own playbooks couldn't fix.
+
+The Decision Inbox ([design](design/autonomy.md#1-decision-inbox-the-only-place-a-human-is-needed-module-decisions)) is the **Decisions** view. The number next to it in the nav is how many decisions wait for you, in red while one of them is overdue. It shows every project's decisions, open ones first: the soonest to expire, then the oldest. Decisions are kept in `data/decisions.db`, so they survive a restart.
+
+Each decision shows:
+
+- its **kind**, its title, and its **context**: what is blocked and why;
+- the **options**, each with its consequences, and the **recommended** one with the reasoning;
+- who raised it (a module, such as `watchdog`, and its own reference), and the work it blocks;
+- when it expires, if it does, and what happens then;
+- under **History**, its audit trail: raised, answered, overdue, expired, withdrawn and delivered, each with its time and who did it.
+
+You answer by choosing an option, with an optional note. Answers to `spend` and `go_no_go` decisions ask you to confirm first.
+
+| Kind | For | Can it have a default? |
+|------|-----|------------------------|
+| `pricing` | prices and plans | no |
+| `legal` | terms, privacy policy, licences | no |
+| `spend` | money: budgets, paid plans | no (and answers need confirming) |
+| `account` | creating accounts with outside services | no |
+| `credentials` | a token or password Lair needs | no |
+| `go_no_go` | launching or releasing | no (and answers need confirming) |
+| `security` | security trade-offs | no |
+| `escalation` | a problem Lair's playbooks couldn't fix (the watchdog raises these) | yes |
+| `other` | anything else | yes |
+
+**Waiting and resuming.** The module that raised a decision parks the work it blocks until you answer, then resumes with your answer. A module asks the same question (the same project, module and key) only once while it is open. If the module isn't listening when you answer (for example, Lair is restarting), the answer is kept and delivered when it is back.
+
+**Expiry and defaults.** A decision may expire. A decision with a **default** gets that option as its answer when it expires unanswered, and its history says so. Kinds marked "no" above can't have a default: Lair never decides those for you. A decision without a default keeps waiting after it expires, and is marked overdue.
+
+**Credentials.** A `credentials` decision has a password field. The value goes to Lair's secret store and nowhere else: not to `data/decisions.db`, the history, a log line or any API response. The decision records only that you supplied it. Lair's built-in secret store keeps values in the server's memory only, never on disk, so after a restart the module that needs the value asks again. A persistent store (an OS keychain, a vault) can replace it through the `SecretStore` interface in `src/server/decisions/secrets.ts`.
+
+**From your own tools.** Any module, script or agent can ask through the API below. Answering doesn't run anything by itself, so it also works on a `read_only` project: the module that asked decides what the answer allows. Server modules use the `DecisionProducer` interface (`raise`, `blockedOn`, `onResolved`, `withdraw`) from `src/server/decisions/`.
+
+### Decision Inbox API
+
+`?project=` is validated as on every route. Bodies are JSON.
+
+- `GET /api/decisions?project=&status=open|answered|expired|withdrawn|closed|all&limit=100`: open first, by urgency. Without `?project=`, every project's decisions
+- `GET /api/decisions/summary?project=`: `{open, overdue, secretStore}`
+- `GET /api/decisions/:id`: one decision with its audit trail
+- `POST /api/decisions?project=`: raise a decision (201, or 200 with the open one when the same key is already open). The project comes from `?project=`, else the default project:
+
+  ```json
+  {
+    "kind": "spend",
+    "title": "Raise the monthly hosting budget",
+    "context": "The staging deploy needs a larger database plan.",
+    "options": [
+      { "id": "approve", "label": "Approve the larger plan", "consequences": "Costs more each month; the deploy goes ahead." },
+      { "id": "decline", "label": "Keep the current plan", "consequences": "The deploy stays blocked." }
+    ],
+    "recommended": { "optionId": "approve", "reasoning": "Staging can't start on the current plan." },
+    "source": { "module": "deploy-script", "ref": "staging" },
+    "key": "budget:staging",
+    "blocks": ["deploy:staging"],
+    "expiresAt": "2026-01-02T12:00:00Z"
+  }
+  ```
+
+  `blocks`, `links` (`[{label, url}]`, http or https only), `expiresAt` and `defaultOptionId` are optional. A default needs `expiresAt`, and is refused for the kinds above that can't have one. A `credentials` decision also needs `secretName` and an option with `"suppliesSecret": true`.
+- `POST /api/decisions/:id/answer`: `{optionId, note?, confirm?, secret?}`. `confirm: true` is required for `spend` and `go_no_go`, and `secret` goes only with an option that supplies it
+- `POST /api/decisions/:id/withdraw`: `{module, reason}`, only by the module that raised it
+
+Errors: 400 for invalid input, 403 for a cross-site request or another module's withdrawal, 404 for an unknown decision, 409 when it is no longer open, 503 when the secret store can't take a value.
+
 ## Watchdog
 
-> Off by default. With `enabled: true` and the default `mode: observe`, the watchdog detects, records and escalates, and never runs any of your commands.
+> Off by default. With `enabled: true` and the default `mode: observe`, the watchdog detects, records and escalates, and runs none of your commands unless you approve one in the [Decision Inbox](#decision-inbox).
 
 The watchdog ([design](design/autonomy.md#2-progress-watchdog-and-playbook-engine-module-watchdog)) checks each project every `interval_seconds` for the failures in the table below. It reads the project's files (`queue_file`, `agents_dir`, `gates_dir`), the process table (`ps`), and the read-only commands you configure (`ready_tasks_cmd`, `merged_cmd`, `docker inspect`). Each failure it finds is a **breach**, stored in `data/watchdog.db`. A breach stays open while it is still detected and is resolved once it is not.
 
@@ -458,7 +526,7 @@ What happens to an open breach:
 
 - **Act**: when `mode: act` is set, the project is not `read_only`, and the breach's playbook has `act: true`, the playbook runs. It **diagnoses** (re-checks the breach on fresh data), **acts** (runs your `watchdog.actions.<action>` command) and **verifies**. A breach that is still open is retried after `cooldown_minutes`, up to `max_attempts` times, and then escalated. An attempt is a run that reached its act step: a run that stopped at diagnose (for example because `ps` failed) does not use one up.
 - **Observe**: in every other case the playbook is recorded as `observed`, together with the command it would have run, and the breach is escalated.
-- **Escalation**: happens once per breach. Lair appends an `- OWNER? ...` entry with the evidence (and the command output, if a command ran) to `escalation_file`, or to `inbox_file` when `escalation_file` is not set. With neither set, the escalation is kept in the store only. A breach that clears and comes back within `reescalate_minutes` of the last escalation for the same subject is recorded as suppressed and not written again.
+- **Escalation**: happens once per breach, as an `escalation` decision in the [Decision Inbox](#decision-inbox), with the evidence (and the command output, if a command ran). Until you answer, the breach is parked: no playbook runs and nothing is escalated again. **Run once** (offered when the playbook's command is configured and the project isn't `read_only`) runs the breach's playbook one more time, also in observe mode; if that run fails, Lair asks again. **Leave it to me** stops all action on the breach. A breach that clears on its own withdraws its open decision. When `escalation_file` is set, Lair also appends an `- OWNER? ...` entry there. If the decision can't be raised, the entry goes to `escalation_file`, or to `inbox_file` when that isn't set, and is otherwise kept in the store only. A breach that clears and comes back within `reescalate_minutes` of the last escalation for the same subject is recorded as suppressed and not escalated again.
 - **A failed probe**: when a detector fails during a tick (`ps` fails, `merged_cmd` exits non-zero, ...), its open breaches are left alone for that tick. Nothing is resolved, run or escalated on data that could not be read.
 
 Lair decides what to do and calls your commands; it never stops, kills or restarts anything itself. Any process id it passes to a command (`{pid}`) belongs to a process that `agent_command` matched to a configured agent. Right before each command runs, Lair checks again on fresh data. It refuses to restart a WAITING agent, to release a live agent's claim, to break a lock whose holder is alive, or to run any command on a container whose [delivery](#delivery) service is held. When the server stops, a verify delay in progress is cut short and no further command starts.
@@ -524,7 +592,7 @@ A detector without the config it needs is inactive: the three process-based dete
 | `ready_tasks_cmd` | array | — | Prints ready task ids, one per line (or a JSON array) |
 | `merged_cmd` | array | — | Prints merge times as ISO-8601 timestamps, e.g. `["gh", "pr", "list", "-R", "org/repo", "--state", "merged", "--json", "mergedAt", "-L", "1"]` |
 | `docker_cmd` | array | `["docker"]` | The container CLI used for `inspect` |
-| `escalation_file` | string | `inbox_file` | Where escalations are appended |
+| `escalation_file` | string | — | A file that also gets each escalation as an `- OWNER? ...` entry. Escalations are decisions in the [Decision Inbox](#decision-inbox); when one can't be raised, the entry goes here, or to `inbox_file` |
 | `reescalate_minutes` | number | `60` | A breach whose subject (the same lock, agent, claim, ...) was escalated less than this long ago is not written again. `0` writes every one |
 | `disabled_detectors` | array | `[]` | Detector ids to skip |
 | `locks` | array | `[]` | `{name, path, pid_file: "pid", lease_minutes: 30}`. `path` is a lock directory (its holder's pid is in `<path>/<pid_file>`) or a lock file (holding the pid). A pid is written as `1234` or `pid=1234` |
@@ -568,7 +636,7 @@ Read-only routes. `?project=` defaults to the default project:
 - `GET /api/watchdog/status`: mode, why act mode is off, config errors, the last tick, SLO status per detector (`ok`, `breached`, `inactive`, `error`) and the playbook settings
 - `GET /api/watchdog/breaches?status=open|resolved|all&limit=100`
 - `GET /api/watchdog/runs?limit=100`: playbook runs with each step's output and the argv that ran (or, when observed, would have run)
-- `GET /api/watchdog/escalations?limit=100`
+- `GET /api/watchdog/escalations?limit=100`: each with the `decisionId` it raised in the Decision Inbox
 
 ## Delivery
 

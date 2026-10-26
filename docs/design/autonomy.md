@@ -25,19 +25,32 @@ go to the project's inbox file until the Decision Inbox (§1) exists. Keep every
    `src/shared/server-types.ts`).
 
 ## 1. Decision Inbox: the only place a human is needed (module `decisions`)
-- **Any module or agent can raise a decision:** API `POST /api/decisions`, and the MCP fleet tool `decision.request`.
-  A decision carries:
-  - `{question, context (markdown + links to PRs/gates/logs), options[], recommended, why, kind, reversible, deadline,
-    on_timeout, requested_by}`;
-  - `kind` is one of: `product`, `spend`, `legal`, `security`, `credential`, `release`, `escalation`, `other`.
-- **UI:** an always-visible "Needs you (n)" badge, and an Inbox view sorted by deadline. Each decision shows its
-  context and gets one-click options, a free-text answer, or a secure field. A `credential` decision, e.g. "connect
-  GitHub", writes the value to the secrets broker and never to the store or a log. Answers become events
-  (`decision.answered`), and the requester resumes.
-- **Timeouts (policy, per kind):** `on_timeout: wait | recommended | cancel`.
-  - Defaults: `recommended` only for reversible kinds `other`/`escalation`, and only when the owner turned that on in
-    Settings. Everything else waits.
-  - `spend`, `legal`, `security`, `credential` and `release` ALWAYS wait.
+- **Status:** built in `src/server/decisions/` (see [configuration](../configuration.md#decision-inbox)): the store,
+  the API and the `DecisionProducer` interface, blocking and resume, expiry with defaults, credentials through a
+  `SecretStore`, and the Decisions view with its badge. The watchdog's escalations (§2) are decisions now. Not built
+  yet: the MCP tool, notifications, importers and the weekly digest.
+- **Any module or agent can raise a decision:** API `POST /api/decisions`, the `DecisionProducer` interface inside the
+  server, and (planned) the MCP fleet tool `decision.request`. A decision carries:
+  - `{kind, title, context (markdown: what is blocked and why), options[] (each with its consequences), recommended
+    {optionId, reasoning}, source {module, ref}, key, blocks[], links[], expiresAt, defaultOptionId}`, plus
+    `secretName` for credentials;
+  - `kind` is one of: `pricing`, `legal`, `spend`, `account`, `credentials`, `go_no_go`, `security`, `escalation`,
+    `other`.
+- **Blocking and resume:** one open decision per project, module and `key`. The producer parks the work listed in
+  `blocks` (`blockedOn(ref)`) and resumes when the answer is delivered to its `onResolved` handler. An answer it
+  couldn't take is delivered again on the next sweep, and after a restart. A producer withdraws a decision that became
+  moot (the watchdog does when its breach clears).
+- **UI:** an always-visible count badge on the Decisions view, which lists open decisions by expiry, then age. Each
+  decision shows its context and gets one-click options, an optional note, or a secure field. `spend` and `go_no_go`
+  answers are confirmed first. A `credentials` decision, e.g. "connect the git host", writes the value to the secret
+  store and never to the store, the audit trail, a log or a response. Answers become events (`decision.answered`),
+  and the requester resumes.
+- **Timeouts (per kind):** a decision may carry `expiresAt` and a `defaultOptionId`. At expiry the default is applied
+  (status `expired`, in the audit trail); without one, the decision keeps waiting and is marked overdue.
+  - Only `escalation` and `other` may carry a default, set by the module that raises it. A Settings switch for
+    defaults is not built.
+  - `pricing`, `legal`, `spend`, `account`, `credentials`, `go_no_go` and `security` refuse a default: they ALWAYS
+    wait.
 - **Notifications:** browser push, plus optional plugins (email, Slack, Telegram, webhooks). They fire only for a new
   decision, a deadline within 2 h, and a failed last playbook. Quiet hours are a setting.
 - **Importers:** an app adapter can turn its existing human channels into decisions. Examples: lines tagged
@@ -210,7 +223,7 @@ planner (§4) turns documents into work; this module WRITES and maintains those 
   failure, so nobody has to update the local stack by hand after a merge.
 - **staging/production:** promote on green with a strategy (all at once, canary, blue-green) and roll back
   automatically on a failed health check. The first production deploy and any credential needed are Decision Inbox
-  items (`release`, `credential`).
+  items (`go_no_go`, `credentials`).
 
 ## 8. Knowledge and learning loop (module `knowledge`)
 - **Every incident** (a playbook escalation, a base-red, a revert, a fake or partial gate) gets an auto-written
@@ -227,7 +240,7 @@ planner (§4) turns documents into work; this module WRITES and maintains those 
 - A scrubber fails the build on any private data: paths, hostnames, emails other than noreply, project names from
   `projects/local/`, and secrets (a pattern scan and an entropy check).
 - The `public` branch is built from `main` by the pipeline: scrub, tests, license headers, SBOM, reproducible
-  lair-node binaries, signed checksums. Publishing is a `release` decision; the human clicks Publish in the UI.
+  lair-node binaries, signed checksums. Publishing is a `go_no_go` decision; the human clicks Publish in the UI.
 
 ## 10. Migration of an existing project (module `importer`)
 - Read an existing setup and run it under Lair with no downtime: its agent registry, task list, queue/inbox files,
@@ -245,7 +258,7 @@ planner (§4) turns documents into work; this module WRITES and maintains those 
   - a hung agent, a jammed lane, an idle node, a red default branch caused by a merge, a flaky test, a provider rate
     limit, a disk filling up, and a broken session.
   - Every fault is fixed by a playbook with zero human actions, and the only Decision Inbox items are the two the
-    script raises on purpose (`spend`, `release`).
+    script raises on purpose (`spend`, `go_no_go`).
 - A bootstrap failure appears as one cause, not hundreds of test failures.
 - A merge proven to break the default branch is reverted automatically, and a merge not proven to break it is not.
 - A fake gate (a command that isn't the declared check, missing steps, an unsigned result) never merges.

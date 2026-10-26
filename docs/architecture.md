@@ -114,6 +114,17 @@ Pure functions that parse project files into typed structures:
 - **`healer.ts`**: self-healing (failure detection, job rescheduling)
 - **`budget.ts`**: provider cost tracking, rate limits and pausing
 
+#### Decisions (`decisions/`)
+
+The Decision Inbox ([configuration](configuration.md#decision-inbox)): the one place Lair asks the human. Always mounted.
+
+- **`types.ts`**: the `DecisionProducer` interface other modules use: `raise` (deduplicated per project, module and key), `blockedOn` (is this work parked?), `onResolved` (resume with the answer, delivered again after a restart until the handler takes it) and `withdraw`
+- **`validate.ts`**: input validation for decisions, answers and withdrawals; the kinds that can't have a default
+- **`service.ts`**: `DecisionInbox`: answers (confirmation for spend and go/no-go), expiry with defaults or overdue marks, delivery to producers, the sweep timer
+- **`secrets.ts`**: the `SecretStore` interface credentials answers go to, and the in-memory stub
+- **`store.ts`**: decisions, the work they block and their audit trail in SQLite (`data/decisions.db`)
+- **`routes.ts`**, **`mount.ts`**: the `/api/decisions` routes, and `mountDecisions()`, which `index.ts` calls to wire the store, routes, sweeps and producers (the watchdog)
+
 #### Watchdog (`watchdog/`)
 
 The progress watchdog ([configuration](configuration.md#watchdog)). It is off unless a project sets `watchdog.enabled`, and in observe mode unless it sets `mode: act`.
@@ -122,7 +133,7 @@ The progress watchdog ([configuration](configuration.md#watchdog)). It is off un
 - **`view.ts`**: one snapshot of a project's queue file, agents dir, gates dir and processes, with memoized reads
 - **`detectors.ts`**: the nine detectors (stale locks, duplicate agents, hung agents, orphaned claims, infrastructure failure signatures, orphaned gates, idle capacity, progress stalls, crash loops)
 - **`playbooks.ts`**, **`playbook-engine.ts`**, **`executors.ts`**: built-in playbooks (diagnose, act, verify), the engine that runs their steps, and the executors that re-check the breach on fresh data and run the project's configured commands
-- **`escalation.ts`**: once-per-breach `OWNER?` entries in the project's inbox file
+- **`escalation.ts`**: once-per-breach escalations as Decision Inbox items (run the playbook once more, or leave it to the human), with an `OWNER?` entry in the inbox file when no decision can be raised
 - **`store.ts`**: breaches, runs, escalations, SLO status and samples in SQLite (`data/watchdog.db`)
 - **`service.ts`**, **`routes.ts`**: the per-project tick loop started and stopped by `index.ts`, and read-only `GET /api/watchdog/*` routes
 
@@ -182,6 +193,7 @@ React-based frontend built with Vite.
 Each view is a standalone component:
 
 - **`Overview.tsx`**: repo status, problems, counts
+- **`DecisionInbox.tsx`**: the Decision Inbox (open decisions with their context, options and recommendation, a confirmation step for spend and go/no-go, a password field for credentials, history) and the nav badge with the open count. Its requests and answer rules are in `decisions-api.ts`
 - **`Dragons.tsx`**, **`DragonStartDialog.tsx`**, **`DragonStopDialog.tsx`**: agent list, start and stop dialogs
 - **`Gates.tsx`**, **`PipelineRuns.tsx`**: gate queue by lane, recent results; pipeline runs with where each step ran, fallback reasons, CI minutes, executor availability and the workflow file
 - **`PRs.tsx`**: pull requests with gate status and merge readiness
@@ -207,6 +219,7 @@ Each view is a standalone component:
 Types shared between server, client, bus and node:
 
 - **`types.ts`**: project config and view types
+- **`decision-types.ts`**: Decision Inbox decisions, kinds (and which can't default or need confirming), answers and audit entries
 - **`bus-types.ts`**: fleet bus events
 - **`server-types.ts`**: nodes, jobs, tasks, scheduler, events, and the node wire protocol
 - **`node-types.ts`**: lair-node local configuration and capacity types

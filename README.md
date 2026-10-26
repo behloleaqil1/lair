@@ -9,6 +9,7 @@ Lair is **agent-agnostic**: agents are started by commands you configure, so any
 ## What it shows
 
 - **Overview**: repository status, recent merges and detected problems
+- **Decisions**: the Decision Inbox, the one place Lair asks you something (pricing, legal, spend, accounts, credentials, go/no-go, and problems its playbooks couldn't fix). Each decision shows what it blocks, its options with their consequences and a recommendation; the nav shows how many wait for you ([details](docs/configuration.md#decision-inbox))
 - **Dragons**: agent status, current tasks, logs and stats
 - **Gates**: gate queue by lane, running jobs and recent results
 - **PRs**: open pull requests with gate status and merge readiness
