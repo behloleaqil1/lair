@@ -633,7 +633,7 @@ describe("Acceptance: Node unreachable mid-job", () => {
       projectId: null,
       enabled: true,
       threshold: 3,
-      unit: "multiplier",
+      unit: "count",
       type: "lane-busy",
     });
 
@@ -710,7 +710,7 @@ describe("Acceptance: Job ownership with heartbeats", () => {
       projectId: null,
       enabled: true,
       threshold: 3,
-      unit: "multiplier",
+      unit: "count",
       type: "lane-busy",
     });
 
