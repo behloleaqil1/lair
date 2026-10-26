@@ -46,6 +46,13 @@ export function registerStepExecutor(type: string, executor: StepExecutor): void
 }
 
 /**
+ * Clear all step executors (for testing)
+ */
+export function clearStepExecutors(): void {
+  stepExecutors.clear();
+}
+
+/**
  * Playbook Engine
  */
 export class PlaybookEngine {
