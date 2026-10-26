@@ -338,6 +338,124 @@ processes:
 | `action` | `restart` \| `alert` \| `none` | `none` | Action on failure |
 | `retries` | number | `1` | Retries before action |
 
+## Watchdog
+
+> Off by default. With `enabled: true` and the default `mode: observe`, the watchdog detects, records and escalates, and never runs any of your commands.
+
+The watchdog ([design](design/autonomy.md#2-progress-watchdog-and-playbook-engine-module-watchdog)) checks each project every `interval_seconds` for the failures in the table below. It reads the project's files (`queue_file`, `agents_dir`, `gates_dir`), the process table (`ps`), and the read-only commands you configure (`ready_tasks_cmd`, `merged_cmd`, `docker inspect`). Each failure it finds is a **breach**, stored in `data/watchdog.db`. A breach stays open while it is still detected and is resolved once it is not.
+
+What happens to an open breach:
+
+- **Act**: when `mode: act` is set, the project is not `read_only`, and the breach's playbook has `act: true`, the playbook runs. It **diagnoses** (re-checks the breach on fresh data), **acts** (runs your `watchdog.actions.<action>` command) and **verifies**. A breach that is still open is retried after `cooldown_minutes`, up to `max_attempts` times, and then escalated.
+- **Observe**: in every other case the playbook is recorded as `observed`, together with the command it would have run, and the breach is escalated.
+- **Escalation**: happens once per breach. Lair appends an `- OWNER? ...` entry with the evidence (and the command output, if a command ran) to `escalation_file`, or to `inbox_file` when `escalation_file` is not set. With neither set, the escalation is kept in the store only.
+
+Lair decides what to do and calls your commands; it never stops, kills or restarts anything itself. Any process id it passes to a command (`{pid}`) belongs to a process that `agent_command` matched to a configured agent. Right before each command runs, Lair checks again on fresh data. It refuses to restart a WAITING agent, to release a live agent's claim, or to break a lock whose holder is alive.
+
+```yaml
+watchdog:
+  enabled: true
+  mode: act                  # observe (default) | act
+  agent_command: "agent-cli chat .*--agent {agent}"
+  max_agents: 4
+  locks:
+    - name: gate-lock
+      path: /home/user/my-project/work/gates/lock   # a directory with a pid file, or a file
+  containers:
+    - name: backend
+  actions:
+    restart_agent: ["./work/bin/agent-restart.sh", "{agent}", "{pid}"]
+    release_claim: ["./work/bin/agent-release.sh", "{agent}"]
+    break_lock: ["./work/bin/lock-break.sh", "{lock}"]
+    requeue_gate: ["./work/bin/gate-requeue.sh", "{gate}"]
+  playbooks:
+    agent_stuck: { act: true }
+    orphan_claim: { act: true }
+    stale_lock: { act: true, max_attempts: 1 }
+    gate_owner_gone: { act: true }
+```
+
+### Detectors and playbooks
+
+| Detector | Breach when | Playbook | Action | Verify |
+|----------|-------------|----------|--------|--------|
+| `lock_holder_dead` | A configured lock's recorded holder pid is not running, or the lock has no pid and is older than `lease_minutes`, while an agent is WAITING or a gate request is queued | `stale_lock` | `break_lock` | the lock is gone or held by a live process |
+| `duplicate_agent` | More than one process matches `agent_command` for one agent id (a wrapper and its child count once). One breach for each process except the oldest | `duplicate_agent` | `stop_duplicate` | one process left |
+| `agent_hung` | The agent's process is alive, but neither its newest log nor the process itself has changed for `hung_minutes`, **and** the agent is not WAITING. WAITING means its latest queue line is a `WAITING` line naming a gate id that has no `<gate-id>.rc` result yet; such an agent is never hung | `agent_stuck` | `restart_agent` | the old pid is gone and the agent has a live process |
+| `orphan_claim` | A claim `agents_dir/<id>.running` older than `claim_grace_minutes` whose agent has no live process. A live agent's claim is never touched | `orphan_claim` | `release_claim` | the claim is gone |
+| `infra_signature` | The same normalised failure text (timestamps, hashes, numbers and the gate's own ids removed) in at least `infra_min_tracks` finished, failed gates of different tracks on one lane within `infra_window_minutes` | `lane_broken` | `mark_lane_broken` | later ticks |
+| `gate_owner_gone` | A running gate request (`.req.run`) whose runner pid (in the `.req.run` file, else `gates_dir/runner-<lane>.pid`) is not running, or that has no runner pid at all, and whose log has been silent for `gate_lease_minutes` | `gate_owner_gone` | `requeue_gate` | the request is no longer running |
+| `idle_capacity` | Ready work (queued gate requests plus `ready_tasks_cmd` tasks) and free capacity (no agent running, or fewer than `max_agents`), with nothing started (no claim, running gate or agent process) for `idle_minutes` | `idle_capacity` | `fill_capacity` | later ticks |
+| `progress_stall` | No merge for `stall_hours` while work is pending (gate requests, ready tasks or claims). A merge is a `- MERGED ...` line in the queue file, or a time printed by `merged_cmd`. With no merge on record it reports nothing | `no_merges` | `triage_stall` | later ticks |
+| `crash_loop` | A configured container's `RestartCount` (from `docker inspect`) rose by `max_restarts` or more within `window_minutes` | `crash_loop` | `stop_container_restarts` | later ticks |
+
+A detector without the config it needs is inactive: the three process-based detectors need `agent_command`, `lock_holder_dead` needs `locks`, and `crash_loop` needs `containers`. A "later ticks" verify means the breach is resolved when it is no longer detected, or escalated once its attempts are used up.
+
+### Watchdog options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Run the watchdog for this project |
+| `mode` | `observe` \| `act` | `observe` | `observe` never runs an action. `act` runs the playbooks that have `act: true`, unless the project is `read_only: true` |
+| `interval_seconds` | number | `60` | Seconds between checks |
+| `command_timeout_seconds` | number | `120` | Timeout for each command Lair runs |
+| `agent_command` | string | — | Regular expression matched against each process's command line, where `{agent}` stands for the agent id (matched as a whole word). Agent ids come from `dragons:` and `agents_dir/dragons.txt` |
+| `hung_minutes` | number | `45` | `agent_hung`: silence limit |
+| `claim_grace_minutes` | number | `5` | `orphan_claim`: minimum claim age, so a starting agent isn't flagged |
+| `max_agents` | number | — | `idle_capacity`: capacity is free below this. When unset, capacity is free only when no agent runs |
+| `idle_minutes` | number | `10` | `idle_capacity`: how long nothing may start |
+| `stall_hours` | number | `4` | `progress_stall`: hours without a merge |
+| `gate_lease_minutes` | number | `30` | `gate_owner_gone`: how long the log may be silent |
+| `infra_window_minutes` | number | `60` | `infra_signature`: window for finished gates |
+| `infra_min_tracks` | number | `3` | `infra_signature`: different tracks with the same failure |
+| `ready_tasks_cmd` | array | — | Prints ready task ids, one per line (or a JSON array) |
+| `merged_cmd` | array | — | Prints merge times as ISO-8601 timestamps, e.g. `["gh", "pr", "list", "-R", "org/repo", "--state", "merged", "--json", "mergedAt", "-L", "1"]` |
+| `docker_cmd` | array | `["docker"]` | The container CLI used for `inspect` |
+| `escalation_file` | string | `inbox_file` | Where escalations are appended |
+| `disabled_detectors` | array | `[]` | Detector ids to skip |
+| `locks` | array | `[]` | `{name, path, pid_file: "pid", lease_minutes: 30}`. `path` is a lock directory (its holder's pid is in `<path>/<pid_file>`) or a lock file (holding the pid). A pid is written as `1234` or `pid=1234` |
+| `containers` | array | `[]` | `{name, max_restarts: 3, window_minutes: 10}` |
+| `actions` | map | `{}` | The commands, as argv arrays (no shell). See below |
+| `playbooks` | map | `{}` | Per-playbook settings. See below |
+
+Unknown keys, an unknown placeholder in an action, or `act: true` for a playbook whose action is not set are config errors. A project with an invalid `watchdog:` block is not watched, and `GET /api/watchdog/status` shows the errors. Lair reads the watchdog config at startup.
+
+### Actions
+
+Each action is an argv array, and `{placeholder}`s are replaced inside each argument. Every action also gets `{project}`.
+
+| Action | Placeholders |
+|--------|--------------|
+| `break_lock` | `{lock}` (path), `{lock_name}`, `{pid}` (empty when the lock has none) |
+| `stop_duplicate` | `{agent}`, `{pid}` (the duplicate), `{keep_pid}` (the oldest, kept) |
+| `restart_agent` | `{agent}`, `{pid}`, `{log}` (newest log path, or empty). It must stop the hung session and start a fresh one |
+| `release_claim` | `{agent}`, `{claim}` (path) |
+| `mark_lane_broken` | `{lane}`, `{signature}`, `{gates}` (comma-separated gate ids) |
+| `requeue_gate` | `{gate}`, `{lane}`, `{file}` (the `.req.run` path), `{pid}` |
+| `fill_capacity` | `{free}`, `{ready}` (ready tasks), `{queued}` (queued gate requests), `{running}` |
+| `triage_stall` | `{hours}` (since the last merge), `{last_merge}` |
+| `stop_container_restarts` | `{container}`, `{restarts}` |
+
+### Playbook settings
+
+`watchdog.playbooks.<id>` for `stale_lock`, `duplicate_agent`, `agent_stuck`, `orphan_claim`, `lane_broken`, `gate_owner_gone`, `idle_capacity`, `no_merges`, `crash_loop`:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `act` | boolean | `false` | Opt this playbook in to act mode |
+| `max_attempts` | number | `2` (`1` for `lane_broken`, `no_merges`, `crash_loop`) | Runs per breach before escalating |
+| `cooldown_minutes` | number | `10` (`60` for `lane_broken` and `no_merges`, `30` for `crash_loop`) | Minutes between attempts |
+| `verify_delay_seconds` | number | `0` (`30` for `agent_stuck`, `5` for `duplicate_agent`) | Wait before verifying |
+
+### Watchdog API
+
+Read-only routes. `?project=` defaults to the default project:
+
+- `GET /api/watchdog/status`: mode, why act mode is off, config errors, the last tick, SLO status per detector (`ok`, `breached`, `inactive`, `error`) and the playbook settings
+- `GET /api/watchdog/breaches?status=open|resolved|all&limit=100`
+- `GET /api/watchdog/runs?limit=100`: playbook runs with each step's output and the argv that ran (or, when observed, would have run)
+- `GET /api/watchdog/escalations?limit=100`
+
 ## Example complete configuration
 
 ```yaml

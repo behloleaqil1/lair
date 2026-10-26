@@ -114,6 +114,18 @@ Pure functions that parse project files into typed structures:
 - **`healer.ts`**: self-healing (failure detection, job rescheduling)
 - **`budget.ts`**: provider cost tracking, rate limits and pausing
 
+#### Watchdog (`watchdog/`)
+
+The progress watchdog ([configuration](configuration.md#watchdog)). It is off unless a project sets `watchdog.enabled`, and in observe mode unless it sets `mode: act`.
+
+- **`probes.ts`**: the only system boundary: `ProcessTable` (`ps` via execFile), `FileSystem`, `CommandRunner` (execFile, never a shell) and `Clock`
+- **`view.ts`**: one snapshot of a project's queue file, agents dir, gates dir and processes, with memoized reads
+- **`detectors.ts`**: the nine detectors (stale locks, duplicate agents, hung agents, orphaned claims, infrastructure failure signatures, orphaned gates, idle capacity, progress stalls, crash loops)
+- **`playbooks.ts`**, **`playbook-engine.ts`**, **`executors.ts`**: built-in playbooks (diagnose, act, verify), the engine that runs their steps, and the executors that re-check the breach on fresh data and run the project's configured commands
+- **`escalation.ts`**: once-per-breach `OWNER?` entries in the project's inbox file
+- **`store.ts`**: breaches, runs, escalations, SLO status and samples in SQLite (`data/watchdog.db`)
+- **`service.ts`**, **`routes.ts`**: the per-project tick loop started and stopped by `index.ts`, and read-only `GET /api/watchdog/*` routes
+
 #### Store (`store/`)
 
 - **`store.ts`**: SQLite store (better-sqlite3) for nodes, tasks, jobs, events and agent runs, at `data/lair.db`
