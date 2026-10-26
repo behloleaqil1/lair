@@ -1,7 +1,10 @@
 /**
  * SSH command builder for remote machine operations
  *
- * Security: All commands are built as arrays for spawn(), never shell-interpolated.
+ * Security: the local `ssh` call is an argument array for spawn(), never run
+ * through a local shell. The remote command is ONE string that the remote
+ * user's shell parses, so every value in it is single-quoted (shellQuote) and
+ * env var names are validated (isValidEnvKey).
  * BatchMode=yes prevents password prompts (would hang).
  * IdentitiesOnly=yes prevents agent key confusion.
  */
