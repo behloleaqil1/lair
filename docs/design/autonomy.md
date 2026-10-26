@@ -242,8 +242,11 @@ planner (§4) turns documents into work; this module WRITES and maintains those 
   always names the lock's holder, and a run with no live process in N minutes is never-started and retried with
   backoff. Hung agents (the watchdog's rule) and dead-on-start or crashed ones restart with the same session K times,
   then in a fresh one (the old session moved aside), then escalate. Rate limits and provider errors fail over to the
-  agent's next profile; budgets are per agent and per project, per day and month, fed by the fleet budget. Usage is
-  read from run logs by pattern until adapters report it.
+  agent's next profile, a bounded number of times per task; budgets are per agent and per project, per day and month,
+  fed by the fleet budget. Agents get a built environment (never the server's secrets).
+- **Budgets are advisory until adapters report usage:** today usage is read from run logs by pattern, text the agent
+  itself writes, so it can under-report. Budgets become enforcement once providers or adapters report usage to the
+  fleet budget directly; until then keep a spending limit at the provider too.
 
 ## 7. Delivery (module `delivery`, [platform.md](platform.md) milestone M4 brought forward for environment 1)
 - **Environments per app pack:** `local` (the developer's own running stack), `staging`, `production`. Each has a
