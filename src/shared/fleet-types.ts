@@ -109,6 +109,12 @@ export interface ProviderBudget {
   rateLimit?: number; // max requests per minute
   currentRate?: number; // current requests this minute
   paused: boolean; // budget exceeded
+  /**
+   * Unit of maxCostPerPeriod and currentCost (default "usd"). "minutes"
+   * budgets (CI runner minutes, e.g. provider "github-actions:<project>") are
+   * kept out of the cost totals and the global cost limits.
+   */
+  unit?: "usd" | "minutes";
 }
 
 /** Global budget config */

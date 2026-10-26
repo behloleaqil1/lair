@@ -177,4 +177,43 @@ describe("BudgetManager", () => {
       expect(manager.isProviderAvailable("unknown-provider")).toBe(true);
     });
   });
+
+  describe("minutes budgets", () => {
+    it("keep CI minutes out of the cost totals and the global pause", () => {
+      manager.updateConfig({ maxDailyCost: 1 });
+      const periodStart = new Date().toISOString();
+      manager.setProviderBudget({
+        provider: "model-provider",
+        maxCostPerPeriod: 50,
+        period: "monthly",
+        currentCost: 0,
+        paused: false,
+        periodStart,
+      });
+      manager.setProviderBudget({
+        provider: "github-actions:demo",
+        maxCostPerPeriod: 100,
+        period: "monthly",
+        currentCost: 0,
+        paused: false,
+        periodStart,
+        unit: "minutes",
+      });
+
+      manager.recordCost("github-actions:demo", 40, "pipeline job");
+      expect(manager.getStatus().totalCostToday).toBe(0);
+      expect(manager.getProviderStatus("model-provider")?.paused).toBe(false);
+      expect(manager.getProviderStatus("github-actions:demo")).toMatchObject({ currentCost: 40, paused: false });
+
+      // Going over the daily cost pauses the cost providers, not the minutes budget
+      manager.recordCost("model-provider", 2);
+      expect(manager.getProviderStatus("model-provider")?.paused).toBe(true);
+      expect(manager.getProviderStatus("github-actions:demo")?.paused).toBe(false);
+
+      // A minutes budget pauses itself when it is used up, with minutes in the alert
+      manager.recordCost("github-actions:demo", 60);
+      expect(manager.getProviderStatus("github-actions:demo")?.paused).toBe(true);
+      expect(manager.getStatus().alerts.join("\n")).toContain("100 min / 100 min");
+    });
+  });
 });

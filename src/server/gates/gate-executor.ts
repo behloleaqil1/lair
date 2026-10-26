@@ -29,6 +29,8 @@ export interface RunGateOptions {
   workDir: string;
   /** Execute command function (injected for testing) */
   executeCommand: (command: string, options: ExecuteOptions) => Promise<ExecuteResult>;
+  /** Stops the run: steps not started yet are skipped and the result is "error" */
+  signal?: AbortSignal;
 }
 
 /** Options for command execution */
@@ -36,6 +38,12 @@ export interface ExecuteOptions {
   cwd: string;
   timeoutMs: number;
   env?: Record<string, string>;
+  /** The step's argv (no shell), when the step has one */
+  argv?: string[];
+  /** The step's name */
+  step?: string;
+  /** Aborted when the run is cancelled */
+  signal?: AbortSignal;
 }
 
 /** Result of command execution */
@@ -60,6 +68,7 @@ export async function runGate(options: RunGateOptions): Promise<GateResult> {
     changedFiles,
     workDir,
     executeCommand,
+    signal,
   } = options;
 
   const gateId = `gate-${randomUUID().slice(0, 8)}`;
@@ -75,6 +84,7 @@ export async function runGate(options: RunGateOptions): Promise<GateResult> {
   const stepResults: GateStepResult[] = [];
   let overallStatus: "passed" | "failed" | "error" = "passed";
   let aborted = false;
+  let cancelled = false;
 
   // Check overall timeout
   const overallTimeoutMs = pipeline.timeoutSeconds * 1000;
@@ -94,11 +104,17 @@ export async function runGate(options: RunGateOptions): Promise<GateResult> {
       break;
     }
 
+    if (!aborted && signal?.aborted) {
+      cancelled = true;
+      aborted = true;
+      overallStatus = "error";
+    }
+
     if (aborted) {
       stepResults.push({
         name: step.name,
         status: "skipped",
-        error: "Previous step failed",
+        error: cancelled ? "Pipeline cancelled" : "Previous step failed",
       });
       continue;
     }
@@ -107,6 +123,7 @@ export async function runGate(options: RunGateOptions): Promise<GateResult> {
       workDir,
       executeCommand,
       remainingTimeMs: Math.max(0, overallDeadline - Date.now()),
+      signal,
     });
 
     stepResults.push(stepResult);
@@ -160,9 +177,10 @@ async function runStep(
     workDir: string;
     executeCommand: (command: string, options: ExecuteOptions) => Promise<ExecuteResult>;
     remainingTimeMs: number;
+    signal?: AbortSignal;
   }
 ): Promise<GateStepResult> {
-  const { workDir, executeCommand, remainingTimeMs } = options;
+  const { workDir, executeCommand, remainingTimeMs, signal } = options;
 
   const stepStartedAt = new Date().toISOString();
   const timeoutMs = Math.min(step.timeoutSeconds * 1000, remainingTimeMs);
@@ -172,6 +190,9 @@ async function runStep(
       cwd: workDir,
       timeoutMs,
       env: step.env,
+      argv: step.argv,
+      step: step.name,
+      signal,
     });
 
     const stepCompletedAt = new Date().toISOString();

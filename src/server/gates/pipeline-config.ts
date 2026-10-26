@@ -10,6 +10,7 @@ import type { GatePipeline, GateStep, ProjectGateConfig } from "../../shared/pol
 const GateStepSchema = z.object({
   name: z.string().min(1),
   command: z.string().min(1),
+  argv: z.array(z.string()).min(1).optional(),
   timeoutSeconds: z.number().int().positive().default(300),
   requires: z.array(z.string()).optional(),
   continueOnFailure: z.boolean().optional(),
@@ -161,8 +162,11 @@ export function computePipelineVersion(pipeline: GatePipeline): string {
     steps: pipeline.steps.map(s => ({
       name: s.name,
       command: s.command,
+      argv: s.argv,
       timeoutSeconds: s.timeoutSeconds,
       requires: s.requires,
+      continueOnFailure: s.continueOnFailure,
+      env: s.env,
     })),
     scope: pipeline.scope,
     defaultSteps: pipeline.defaultSteps,

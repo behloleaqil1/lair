@@ -24,6 +24,8 @@ interface CostRecord {
   provider: string;
   cost: number;
   reason?: string;
+  /** "minutes" records (CI runner minutes) are not money: they stay out of the cost totals */
+  unit?: "usd" | "minutes";
 }
 
 /**
@@ -63,6 +65,8 @@ export class BudgetManager {
    */
   recordCost(provider: string, cost: number, reason?: string): void {
     const now = new Date().toISOString();
+    const budget = this.config.providers.find((p) => p.provider === provider);
+    const unit = budget?.unit ?? "usd";
 
     // Add to history
     this.costHistory.push({
@@ -70,6 +74,7 @@ export class BudgetManager {
       provider,
       cost,
       reason,
+      unit,
     });
 
     // Keep only last 1000 records
@@ -78,7 +83,6 @@ export class BudgetManager {
     }
 
     // Update provider budget
-    const budget = this.config.providers.find((p) => p.provider === provider);
     if (budget) {
       // Check if we need to reset the period
       this.maybeResetPeriod(budget);
@@ -88,9 +92,15 @@ export class BudgetManager {
       // Check if budget exceeded
       if (budget.currentCost >= budget.maxCostPerPeriod) {
         budget.paused = true;
-        this.addAlert(`Budget exceeded for ${provider}: $${budget.currentCost.toFixed(2)} / $${budget.maxCostPerPeriod.toFixed(2)}`);
+        const amount = (value: number) => (unit === "minutes" ? `${value} min` : `$${value.toFixed(2)}`);
+        this.addAlert(`Budget exceeded for ${provider}: ${amount(budget.currentCost)} / ${amount(budget.maxCostPerPeriod)}`);
         console.log(`[BudgetManager] Provider ${provider} paused: budget exceeded`);
       }
+    }
+
+    // Minutes are not money: they never count toward the global cost limits
+    if (unit === "minutes") {
+      return;
     }
 
     // Check global budgets
@@ -273,7 +283,7 @@ export class BudgetManager {
   private calculateCostSince(since: Date): number {
     const sinceTime = since.getTime();
     return this.costHistory
-      .filter((r) => new Date(r.timestamp).getTime() >= sinceTime)
+      .filter((r) => r.unit !== "minutes" && new Date(r.timestamp).getTime() >= sinceTime)
       .reduce((sum, r) => sum + r.cost, 0);
   }
 
@@ -338,9 +348,9 @@ export class BudgetManager {
 
     if (status.totalCostToday >= this.config.maxDailyCost) {
       this.addAlert(`Daily budget exceeded: $${status.totalCostToday.toFixed(2)} / $${this.config.maxDailyCost.toFixed(2)}`);
-      // Pause all providers
+      // Pause all cost providers (a minutes budget has its own limit)
       for (const provider of this.config.providers) {
-        provider.paused = true;
+        if (provider.unit !== "minutes") provider.paused = true;
       }
     }
 

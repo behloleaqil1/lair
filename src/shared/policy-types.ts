@@ -11,6 +11,11 @@ export interface GateStep {
   name: string;
   /** Command to execute (runs in a sandbox) */
   command: string;
+  /**
+   * The command as an argv array (no shell). When set, executors run this and
+   * `command` is only its display form.
+   */
+  argv?: string[];
   /** Timeout in seconds */
   timeoutSeconds: number;
   /** Required node capabilities (e.g., "docker", "gpu") */
