@@ -118,8 +118,9 @@ export function buildGateCommand(
 const ENV_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /**
- * Variables that change how the dynamic loader, shells or runtimes start.
- * A gate request (written by an agent) must not be able to set them.
+ * Variables that change how the dynamic loader, shells, git or runtimes
+ * start, or where they load code from. A gate request (written by an agent)
+ * must not be able to set them.
  */
 const RESERVED_ENV_KEYS = new Set([
   "PATH",
@@ -128,14 +129,23 @@ const RESERVED_ENV_KEYS = new Set([
   "IFS",
   "ENV",
   "BASH_ENV",
+  "CDPATH",
+  "ZDOTDIR",
   "PS4",
   "PROMPT_COMMAND",
+  "GIT_SSH_COMMAND",
+  "GIT_CONFIG",
   "NODE_OPTIONS",
+  "NODE_PATH",
   "PYTHONSTARTUP",
+  "PYTHONPATH",
   "PERL5OPT",
   "RUBYOPT",
 ]);
-const RESERVED_ENV_PREFIXES = ["LD_", "DYLD_", "BASH_FUNC_"];
+// GIT_CONFIG_ covers GIT_CONFIG_COUNT, GIT_CONFIG_KEY_<n>, GIT_CONFIG_VALUE_<n>,
+// GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM (any of them can set core.sshCommand
+// or other config that runs commands)
+const RESERVED_ENV_PREFIXES = ["LD_", "DYLD_", "BASH_FUNC_", "GIT_CONFIG_"];
 
 /** True if `key` is a plain, non-reserved environment variable name. */
 export function isValidEnvKey(key: string): boolean {
