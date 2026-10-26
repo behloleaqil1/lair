@@ -49,14 +49,28 @@ const REPO_TTL_MS = 10 * 60_000;
 const RUNNERS_TTL_MS = 60_000;
 /** How long to look for the run a dispatch created */
 export const FIND_WINDOW_MS = 2 * 60_000;
+/**
+ * After a restart, how long to look for the run of a dispatch that was sent:
+ * longer, since dispatching again could run the job twice
+ */
+export const RESUME_FIND_WINDOW_MS = 10 * 60_000;
 const FIND_POLL_MS = 5_000;
 /** After a cancel, how long before a force-cancel */
 const CANCEL_GRACE_MS = 2 * 60_000;
 const LOG_TAIL_CHARS = 64 * 1024;
 
-/** What GitHub says when it refuses a job for money reasons */
+/**
+ * GitHub's own explanation for a job it did not start for money reasons
+ * ("The job was not started because ... spending limit ..."). Matched only
+ * against GitHub's own annotations, never those a project's tools write.
+ */
 export const BILLING_PATTERN =
-  /billing|spending limit|payments? (?:have|has) failed|account is locked|minutes? (?:quota|limit)/i;
+  /^The job was not started because\b.*(?:billing|spending limit|payments? (?:have|has) failed|account is locked)/i;
+
+/** An annotation GitHub wrote itself: no file path, or ".github" */
+export function isGitHubAnnotation(annotation: { path: string }): boolean {
+  return annotation.path === "" || annotation.path === ".github";
+}
 
 export interface GitHubPlan {
   /** Executors that can take the job, best first */
@@ -125,9 +139,10 @@ export class GitHubProvider {
     return null;
   }
 
-  async repoInfo(): Promise<RepoInfo> {
+  /** The repository (cached for 10 minutes; `fresh` reads it again) */
+  async repoInfo(fresh = false): Promise<RepoInfo> {
     const now = this.options.clock.now();
-    if (this.repoCache && now - this.repoCache.at < REPO_TTL_MS) return this.repoCache.info;
+    if (!fresh && this.repoCache && now - this.repoCache.at < REPO_TTL_MS) return this.repoCache.info;
     if (!this.api) throw new Error(this.configProblem() ?? "GitHub is not configured");
     const info = await this.api.getRepo();
     this.repoCache = { at: now, info };
@@ -311,6 +326,7 @@ export class GitHubProvider {
     dispatchId: string,
     dispatchedAt: number,
     signal: AbortSignal,
+    windowMs = FIND_WINDOW_MS,
   ): Promise<WorkflowRunInfo | undefined> {
     const { clock } = this.options;
     const title = `lair ${dispatchId}`;
@@ -324,18 +340,15 @@ export class GitHubProvider {
       } catch {
         // transient: try again
       }
-      if (signal.aborted || clock.now() - start >= FIND_WINDOW_MS) return undefined;
+      if (signal.aborted || clock.now() - start >= windowMs) return undefined;
       await clock.sleep(FIND_POLL_MS, signal);
     }
   }
 
   /** A dispatch GitHub refused: nothing was created, so falling back is safe */
-  private refused(e: unknown, executor: GitHubExecutorId, branch: string): AttemptOutcome {
+  private refused(e: unknown, branch: string): AttemptOutcome {
     const status = e instanceof GitHubApiError ? e.status : 0;
     const message = reasonOf(e);
-    if (BILLING_PATTERN.test(message)) {
-      return { kind: "fallback", reason: message, markUnavailable: [executor] };
-    }
     if (status === 401 || status === 403 || status === 429 || status === 0 || status >= 500) {
       return { kind: "fallback", reason: message, markUnavailable: [...GITHUB_EXECUTORS] };
     }
@@ -371,7 +384,8 @@ export class GitHubProvider {
     let dispatchedAt = resume ? Date.parse(resume.startedAt) : clock.now();
 
     if (runId === undefined && resume?.dispatchId) {
-      const found = await this.findRun(api, resume.dispatchId, dispatchedAt, control.signal);
+      // The dispatch was sent before the restart: look longer before sending it again
+      const found = await this.findRun(api, resume.dispatchId, dispatchedAt, control.signal, RESUME_FIND_WINDOW_MS);
       if (found) {
         runId = found.id;
         runUrl = found.htmlUrl || runUrl;
@@ -384,12 +398,16 @@ export class GitHubProvider {
     if (runId === undefined) {
       const dispatchId = resume?.dispatchId ? `${resume.dispatchId}-2` : `${job.jobId}-${job.attemptNo}`;
       const inputs: Record<string, string> = { lair_run: dispatchId, sha: job.commitSha, job: key };
-      if (this.allowSelfHosted(info)) {
+      // Right before a job goes to a self-hosted runner, read the visibility
+      // again rather than trust the cache: a repository made public since
+      // must never get one
+      const current = executor === "github-self-hosted" ? await this.repoInfo(true) : info;
+      if (this.allowSelfHosted(current)) {
         inputs.runner = executor === "github-self-hosted" ? "self-hosted" : "hosted";
       } else if (executor === "github-self-hosted") {
         return {
           kind: "fallback",
-          reason: `the repository is ${info.visibility}: Lair never sends jobs to its self-hosted runners`,
+          reason: `the repository is ${current.visibility}: Lair never sends jobs to its self-hosted runners`,
         };
       }
       if (!RUN_ID_PATTERN.test(dispatchId) || !SHA_PATTERN.test(job.commitSha) || !/^[A-Za-z0-9._-]+$/.test(key)) {
@@ -401,7 +419,7 @@ export class GitHubProvider {
       try {
         dispatched = await api.dispatch(github.workflow, info.defaultBranch, inputs);
       } catch (e) {
-        return this.refused(e, executor, info.defaultBranch);
+        return this.refused(e, info.defaultBranch);
       }
       runId = dispatched.runId;
       runUrl = dispatched.runUrl;
@@ -506,12 +524,29 @@ export class GitHubProvider {
         ...usage,
       };
     }
+    const cancelled = ours.conclusion === "cancelled" || run?.conclusion === "cancelled";
+    if (cancelReason && cancelled) {
+      // Lair cancelled it (no runner in time). A runner that took the job in
+      // the last poll gap was stopped by that cancel: the commit is untested,
+      // so this is a fallback, not a failed gate
+      return {
+        kind: "fallback",
+        reason: anyRan
+          ? `${cancelReason}; a runner took the job just as Lair cancelled it, so it stopped unfinished: running it on the next executor`
+          : `${cancelReason}; the CI run was cancelled`,
+        markUnavailable: [executor],
+        ...usage,
+      };
+    }
+    // Only what GitHub itself wrote, never annotations from the project's tools
+    const githubNotes = async () =>
+      (await api.annotations(ours.id))
+        .filter(isGitHubAnnotation)
+        .map((a) => a.message)
+        .join(" ");
     if (!anyRan) {
-      if (cancelReason) {
-        return { kind: "fallback", reason: `${cancelReason}; the CI run was cancelled`, markUnavailable: [executor], ...usage };
-      }
       if (!ours.runnerId) {
-        const notes = (await api.annotations(ours.id)).join(" ");
+        const notes = await githubNotes();
         if (BILLING_PATTERN.test(notes)) {
           return { kind: "fallback", reason: `GitHub refused the job: ${notes}`, markUnavailable: [executor], ...usage };
         }
@@ -539,6 +574,25 @@ export class GitHubProvider {
         reason: `the workflow on ${info.defaultBranch} is out of date: it ran "${ours.name}", expected "${expectedName}"`,
         ...usage,
       };
+    }
+
+    // A runner lost mid-run (the job ended cancelled or timed out with no
+    // failed step, or GitHub says it lost the runner) gets one retry; a time
+    // limit the job reached is a real failure
+    let note: string | undefined;
+    const failedStep = ours.steps.some((s) => s.conclusion === "failure");
+    const endedEarly = (cancelled || ours.conclusion === "timed_out") && !failedStep;
+    if (endedEarly || ours.conclusion === "failure") {
+      const notes = await githubNotes();
+      const timeLimit = /exceeded the maximum execution time|has timed out/i.test(notes);
+      const lostByGitHub = /lost communication with the server|received a shutdown signal/i.test(notes);
+      if (!timeLimit && (endedEarly || lostByGitHub)) {
+        const why = `runner lost: the job ended ${ours.conclusion ?? "unfinished"}${failedStep ? "" : " with no failed step"}${notes ? ` (${notes})` : ""}`;
+        if (!job.runnerLostBefore) {
+          return { kind: "retry", reason: `${why}; trying once more`, ...usage };
+        }
+        note = `${why}, for the second time, so the result stands`;
+      }
     }
 
     // Replay the CI steps through the gate executor: same result shape as local
@@ -576,6 +630,7 @@ export class GitHubProvider {
       billedMinutes,
       ciRunId: runId,
       ciRunUrl: runUrl,
+      note,
     };
   }
 }

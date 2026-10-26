@@ -25,6 +25,8 @@ export interface JobSpec {
   settings: ProjectPipelineSettings;
   /** 1-based number of this attempt within the job */
   attemptNo: number;
+  /** An earlier attempt of this job lost its runner (it gets one retry) */
+  runnerLostBefore?: boolean;
 }
 
 /** How an attempt ended */
@@ -39,9 +41,23 @@ export type AttemptOutcome =
       billedMinutes: number;
       ciRunId?: number;
       ciRunUrl?: string;
+      /** Shown as the attempt's reason, e.g. a runner lost a second time */
+      note?: string;
     }
   | {
-      /** Proven not to have run a step: try the next executor */
+      /** The runner was lost mid-run: run the job again (once), from the start */
+      kind: "retry";
+      reason: string;
+      minutes?: number;
+      billedMinutes?: number;
+      ciRunId?: number;
+      ciRunUrl?: string;
+    }
+  | {
+      /**
+       * Try the next executor: proven not to have run a step, or stopped
+       * unfinished by Lair's own cancel (no result for the commit)
+       */
       kind: "fallback";
       reason: string;
       /** Executors to mark unavailable for `unavailable_minutes` */

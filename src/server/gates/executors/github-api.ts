@@ -293,13 +293,19 @@ export class GitHubApi {
     return text;
   }
 
-  /** Annotations of a job (its check run): where GitHub explains a job it did not start */
-  async annotations(jobId: number): Promise<string[]> {
+  /**
+   * Annotations of a job (its check run): where GitHub explains a job it did
+   * not start. `path` tells GitHub's own annotations (".github" or none) from
+   * those a project's tools write (a file path).
+   */
+  async annotations(jobId: number): Promise<{ message: string; path: string }[]> {
     const { status, text } = await this.request("GET", this.repoPath(`/check-runs/${jobId}/annotations`));
     if (status < 200 || status >= 300) return [];
     try {
       const raw = JSON.parse(text) as unknown;
-      return Array.isArray(raw) ? (raw as Json[]).map((a) => str(a.message)).filter(Boolean) : [];
+      return Array.isArray(raw)
+        ? (raw as Json[]).map((a) => ({ message: str(a.message), path: str(a.path) })).filter((a) => a.message)
+        : [];
     } catch {
       return [];
     }

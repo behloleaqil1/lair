@@ -325,7 +325,7 @@ executors:
 
 **Never self-hosted for a public repository.** Fork pull requests can run code on a public repository's self-hosted runners, so Lair never sends a job there, the workflow it generates for a public repository has no self-hosted option, and the status shows a warning when such runners are registered.
 
-**Fallback.** A job GitHub refuses (billing, spending limit, Actions disabled, a workflow that fails to start), or that no runner picks up within `pickup_timeout_minutes`, is cancelled and goes to the next executor once GitHub reports that none of its steps started. The refused executor is unavailable for `unavailable_minutes` (shown, with the reason, in the Gates view). A job is never run twice: when a runner takes the job while it is being cancelled, Lair keeps that run's result. In-flight jobs resume after a server restart.
+**Fallback.** A job GitHub refuses (billing, spending limit, Actions disabled, a workflow that fails to start), or that no runner picks up within `pickup_timeout_minutes`, is cancelled and goes to the next executor once GitHub reports that none of its steps started. If a runner took the job in the moment Lair cancelled it, the job stopped unfinished and also goes to the next executor: Lair's own cancel never makes a gate fail. The refused executor is unavailable for `unavailable_minutes` (shown, with the reason, in the Gates view). A job is never run twice: when the cancel came too late and the run finished, Lair keeps that run's result. A runner lost mid-run (the job ended cancelled or timed out with no failed step) gets one retry; the second time the result stands. In-flight jobs resume after a server restart, and leftover job worktrees are removed then.
 
 **Minutes budget.** Before sending a private repository's job to a GitHub-hosted runner, Lair adds the lane's expected minutes (the most of its last five hosted runs, at least 1) to the minutes billed this calendar month (UTC). When that would go over `monthly_minutes`, it sends nothing there, raises a `spend` decision once per month (event `decision.needed`), and uses the next executor. Billed minutes also go into the fleet budget as provider `github-actions:<project>`, in minutes.
 
@@ -379,7 +379,7 @@ Each step:
 | `local.workdir` | `worktree` \| `repo` | `worktree` | `worktree`: a clean `git worktree` at the commit, removed afterwards. `repo`: the repository itself, which must be at the commit |
 | `local.worktree_dir` | string | `data/pipelines/worktrees` | Where worktrees go |
 
-Memory pressure is read from `/proc/pressure/memory` on Linux (`some avg10` of 20% or more) and `kern.memorystatus_vm_pressure_level` on macOS. Local steps get Lair's environment without `LAIR_NODE_TOKEN`, `LAIR_GITHUB_TOKEN` (or your `token_env`), `GITHUB_TOKEN` and `GH_TOKEN`.
+Memory pressure is read from `/proc/pressure/memory` on Linux (`some avg10` of 20% or more) and `kern.memorystatus_vm_pressure_level` on macOS. Local steps get Lair's environment without `LAIR_NODE_TOKEN`, `LAIR_GITHUB_TOKEN` (or your `token_env`), `GITHUB_TOKEN` and `GH_TOKEN`. Each local step runs in its own process group: cancelling a run or reaching a timeout stops every process the step started, and anything a step leaves running when it ends is killed (on Windows, through `taskkill /T`). So, unlike on GitHub Actions, a background process does not survive into the next step.
 
 Unknown keys and invalid values are config errors; a project with an invalid block has no pipelines, and `GET /api/pipelines/status` shows the errors. Lair reads these blocks at startup.
 

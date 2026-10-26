@@ -6,11 +6,10 @@
  * result through the existing gate executor (runGate).
  */
 import { spawn } from "child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "fs";
 import { cpus, freemem, loadavg, platform, totalmem } from "os";
 import { join } from "path";
 import { runGate, type ExecuteResult } from "../gate-executor.js";
-import { terminateWithEscalation } from "../../services/remote-gate.js";
 import { ExecFileRunner, type Clock, type CommandRunner } from "../../watchdog/probes.js";
 import type {
   AttemptOutcome,
@@ -35,7 +34,62 @@ function keepTail(text: string, max = MAX_OUTPUT_CHARS): string {
   return text.length > max ? text.slice(-max) : text;
 }
 
-/** child_process.spawn with an argv array, shell: false, a timeout and abort. */
+const IS_WINDOWS = process.platform === "win32";
+/** After the step's own process exits, how long to wait for its output to close */
+const CLOSE_GRACE_MS = 2000;
+
+/**
+ * Signal a step's whole process tree. On POSIX a step is spawned detached,
+ * so it leads its own process group and the signal goes to the group (its
+ * children and their children too). On Windows: `taskkill /T /F`. Returns
+ * false when nothing was left to signal.
+ */
+export function signalTree(pid: number, signal: NodeJS.Signals): boolean {
+  if (IS_WINDOWS) {
+    try {
+      spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).on(
+        "error",
+        () => undefined,
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  try {
+    process.kill(-pid, signal);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether any process of the step's group is left (POSIX) */
+function treeAlive(pid: number): boolean {
+  if (IS_WINDOWS) return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** SIGTERM to the whole tree, then SIGKILL to what is left after `graceMs` */
+export function terminateTree(pid: number, graceMs: number): void {
+  if (!signalTree(pid, "SIGTERM")) return;
+  const timer = setTimeout(() => {
+    if (treeAlive(pid)) signalTree(pid, "SIGKILL");
+  }, graceMs);
+  timer.unref();
+}
+
+/**
+ * child_process.spawn with an argv array, shell: false, a timeout and abort.
+ * Each step runs in its own process group: a cancel or timeout stops every
+ * process it started, and whatever it leaves running is killed when it ends,
+ * so nothing outlives the step (and its slot and worktree).
+ */
 export class ProcessSpawner implements Spawner {
   constructor(private killGraceMs = 5000) {}
 
@@ -54,12 +108,15 @@ export class ProcessSpawner implements Spawner {
       let stdout = "";
       let stderr = "";
       let timedOut = false;
-      const finish = (exitCode: number) => {
+      let exitCode: number | null = null;
+      let closeTimer: NodeJS.Timeout | undefined;
+      const finish = (code: number) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (closeTimer) clearTimeout(closeTimer);
         options.signal?.removeEventListener("abort", onAbort);
-        resolve({ exitCode, stdout, stderr, timedOut, durationMs: Date.now() - started });
+        resolve({ exitCode: code, stdout, stderr, timedOut, durationMs: Date.now() - started });
       };
       let child: ReturnType<typeof spawn>;
       try {
@@ -68,17 +125,32 @@ export class ProcessSpawner implements Spawner {
           env: options.env,
           shell: false,
           stdio: ["ignore", "pipe", "pipe"],
+          // Its own process group (POSIX), so the whole tree can be signalled
+          detached: !IS_WINDOWS,
+          windowsHide: true,
         });
       } catch (e) {
         stderr = e instanceof Error ? e.message : String(e);
         resolve({ exitCode: -1, stdout, stderr, timedOut: false, durationMs: Date.now() - started });
         return;
       }
-      const onAbort = () => terminateWithEscalation(child, this.killGraceMs);
+      const pid = child.pid;
+      const terminate = () => {
+        if (pid !== undefined) terminateTree(pid, this.killGraceMs);
+      };
+      const onAbort = () => terminate();
       const timer = setTimeout(() => {
         timedOut = true;
-        terminateWithEscalation(child, this.killGraceMs);
+        terminate();
       }, Math.max(0, options.timeoutMs));
+      child.on("exit", (code) => {
+        exitCode = code ?? -1;
+        // The step is over: nothing it started may keep running
+        if (pid !== undefined) signalTree(pid, "SIGKILL");
+        // A process that left the group but holds the output can't keep the step open
+        closeTimer = setTimeout(() => finish(exitCode ?? -1), CLOSE_GRACE_MS);
+        closeTimer.unref();
+      });
       if (options.signal?.aborted) onAbort();
       else options.signal?.addEventListener("abort", onAbort, { once: true });
       child.stdout?.on("data", (chunk: Buffer) => {
@@ -92,7 +164,7 @@ export class ProcessSpawner implements Spawner {
         // A spawn failure (e.g. ENOENT) may not be followed by "close"
         if (child.pid === undefined) finish(-1);
       });
-      child.on("close", (code) => finish(code ?? -1));
+      child.on("close", (code) => finish(code ?? exitCode ?? -1));
     });
   }
 }
@@ -205,6 +277,8 @@ export function capacityProblem(sample: CapacitySample, settings: LocalSettings)
 
 /** Environment variables never passed to local steps */
 const ALWAYS_STRIPPED = ["LAIR_NODE_TOKEN", "LAIR_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"];
+/** A job worktree directory (job ids are `job-` and 12 hex characters) */
+const JOB_DIR = /^job-[0-9a-f]{12}$/;
 
 export interface LocalExecutorOptions {
   spawner: Spawner;
@@ -228,13 +302,17 @@ export class LocalExecutor implements Executor {
     return this.running.get(project) ?? 0;
   }
 
-  private stepEnv(job: JobSpec, extra?: Record<string, string>): Record<string, string> {
-    const strip = new Set([...ALWAYS_STRIPPED, job.settings.executors.github.tokenEnv]);
+  private env(tokenEnv?: string, extra?: Record<string, string>): Record<string, string> {
+    const strip = new Set([...ALWAYS_STRIPPED, ...(tokenEnv ? [tokenEnv] : [])]);
     const env: Record<string, string> = {};
     for (const [key, value] of Object.entries(this.options.env)) {
       if (value !== undefined && !strip.has(key)) env[key] = value;
     }
     return { ...env, ...(extra ?? {}) };
+  }
+
+  private stepEnv(job: JobSpec, extra?: Record<string, string>): Record<string, string> {
+    return this.env(job.settings.executors.github.tokenEnv, extra);
   }
 
   private git(job: JobSpec, args: string[], timeoutMs = 120_000): Promise<ExecuteResult> {
@@ -243,6 +321,40 @@ export class LocalExecutor implements Executor {
       env: this.stepEnv(job),
       timeoutMs,
     });
+  }
+
+  private worktreeBase(settings: LocalSettings): string {
+    return settings.worktreeDir ?? join(this.options.lairDir, "data", "pipelines", "worktrees");
+  }
+
+  /**
+   * Remove the job worktrees a crash left behind, then `git worktree prune`.
+   * Call it before any local job runs (at startup): every job directory found
+   * then is an orphan. Only `job-<id>` directories are touched. Returns the
+   * removed paths.
+   */
+  async cleanupWorktrees(repoDir: string, settings: LocalSettings): Promise<string[]> {
+    if (settings.workdir !== "worktree") return [];
+    const base = this.worktreeBase(settings);
+    let names: string[] = [];
+    try {
+      names = readdirSync(base);
+    } catch {
+      names = [];
+    }
+    const removed: string[] = [];
+    for (const name of names) {
+      if (!JOB_DIR.test(name)) continue;
+      const path = join(base, name);
+      rmSync(path, { recursive: true, force: true });
+      removed.push(path);
+    }
+    await this.options.spawner.run(["git", "-C", repoDir, "worktree", "prune"], {
+      cwd: repoDir,
+      env: this.env(),
+      timeoutMs: 60_000,
+    });
+    return removed;
   }
 
   async run(job: JobSpec, reporter: AttemptReporter, control: JobControl): Promise<AttemptOutcome> {
@@ -278,7 +390,7 @@ export class LocalExecutor implements Executor {
     try {
       let workDir = job.repoDir;
       if (settings.workdir === "worktree") {
-        const base = settings.worktreeDir ?? join(this.options.lairDir, "data", "pipelines", "worktrees");
+        const base = this.worktreeBase(settings);
         mkdirSync(base, { recursive: true });
         worktree = join(base, job.jobId);
         if (existsSync(worktree)) {

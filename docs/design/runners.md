@@ -62,17 +62,24 @@ example, a quick lint lane that always runs locally).
 - **Hosted runners:** allowed by config (`executors.github.hosted`), and for private repositories by the budget.
 - **Before dispatch** Lair checks that the token is set, the repository is reachable, the commit is on GitHub, and
   the workflow file on the dispatch branch is the one Lair generates for the current pipelines (a version marker in
-  the file). Any of these failing skips GitHub for that job, with the reason.
+  the file). Any of these failing skips GitHub for that job, with the reason. Right before a job goes to a
+  self-hosted runner, the repository's visibility is read again, not taken from the cache.
 - **Refusals and timeouts:** a job that GitHub refuses (billing, spending limit, a locked account, Actions disabled,
   a workflow that fails to start), or that no runner picks up within `pickup_timeout_minutes`, is cancelled and
-  confirmed cancelled, and then falls back to the next executor. The refused executor (hosted, self-hosted, or all of
-  GitHub for account-wide problems) is marked unavailable for `unavailable_minutes`, and the UI shows why and until
-  when.
+  confirmed cancelled, and then falls back to the next executor. Billing is read only from GitHub's own annotations,
+  never from those a project's tools write. The refused executor (hosted, self-hosted, or all of GitHub for
+  account-wide problems) is marked unavailable for `unavailable_minutes`, and the UI shows why and until when.
 - **Never lost, never twice:** Lair records each attempt (with its dispatch id) before dispatching. A fallback
-  happens only after GitHub reports the run finished with none of the pipeline's steps started. If a cancel races
-  with a runner that already started the job, Lair keeps that run's result and does not fall back. After a restart,
-  Lair finds an in-flight run by its dispatch id and goes on polling it; a local job that the restart interrupted
-  never finished, so it is started again.
+  happens only after GitHub reports the run finished, either with none of the pipeline's steps started or
+  stopped unfinished by Lair's own pickup cancel (a runner took the job in the moment Lair cancelled it: the commit
+  is untested, so that is a fallback, never a failed gate). If the cancel came too late and the run finished, Lair
+  keeps that run's result and does not fall back. After a restart, Lair looks for an in-flight run by its dispatch
+  id for up to 10 minutes before dispatching again, then goes on polling it; a local job that the restart
+  interrupted never finished, so it is started again, after the worktrees a crash left behind are removed.
+- **A lost runner** (the job ended cancelled or timed out with no failed step, or GitHub reports it lost the
+  runner) is retried once, and the attempt says so; the second time, the result stands.
+- **Local steps** run in their own process group: a cancel or timeout stops every process a step started, and
+  what a finished step leaves running is killed, so nothing outlives its slot or its worktree.
 - When every executor is unavailable, the job waits and is retried; it is never dropped.
 
 ## 5. Results

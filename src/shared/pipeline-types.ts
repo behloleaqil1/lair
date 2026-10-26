@@ -44,6 +44,8 @@ export interface PipelineAttempt {
   where?: string;
   minutes?: number;
   billedMinutes?: number;
+  /** The runner was lost mid-run; the job gets one more try */
+  runnerLost?: boolean;
 }
 
 export type PipelineJobStatus =

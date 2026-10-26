@@ -160,6 +160,12 @@ export interface RunScript {
   labels?: string[];
   /** A cancel arrives after a runner took the job: 409, and the run completes normally */
   cancelTooLate?: boolean;
+  /** A runner takes the job just as Lair cancels it: the cancel stops it in its first step */
+  pickupOnCancel?: boolean;
+  /** The runner is lost mid-run: the job ends cancelled in its first step, nobody cancelled it */
+  lostRunner?: boolean;
+  /** Annotations of the job (default: `refuse` as GitHub's own annotation) */
+  annotations?: { path: string; message: string }[];
 }
 
 interface WorkflowJob {
@@ -210,6 +216,8 @@ export class FakeGitHub {
   dispatchError?: { status: number; message: string };
   /** 200 with the run id (newer API) or 204 (older) */
   returnRunDetails = true;
+  /** Runs don't show in the workflow's run list before this time (clock ms) */
+  listHiddenUntil = 0;
   /** The script for the next dispatched runs (shifted), then `defaultScript` */
   scripts: RunScript[] = [];
   defaultScript: RunScript = {};
@@ -280,10 +288,8 @@ export class FakeGitHub {
         : response(204);
     }
     if (init.method === "GET" && m(/^\/actions\/workflows\/[^/]+\/runs$/)) {
-      return response(200, {
-        total_count: this.runs.size,
-        workflow_runs: [...this.runs.values()].map((r) => this.runJson(r)),
-      });
+      const listed = this.clock.now() < this.listHiddenUntil ? [] : [...this.runs.values()];
+      return response(200, { total_count: listed.length, workflow_runs: listed.map((r) => this.runJson(r)) });
     }
     if (init.method === "GET" && (match = m(/^\/actions\/runs\/(\d+)$/))) {
       const run = this.runs.get(Number(match[1]));
@@ -302,7 +308,9 @@ export class FakeGitHub {
     }
     if (init.method === "GET" && (match = m(/^\/check-runs\/(\d+)\/annotations$/))) {
       const run = this.runs.get(Number(match[1]) - 1);
-      return response(200, run?.script.refuse ? [{ message: run.script.refuse, annotation_level: "failure" }] : []);
+      const notes =
+        run?.script.annotations ?? (run?.script.refuse ? [{ path: ".github", message: run.script.refuse }] : []);
+      return response(200, notes.map((a) => ({ ...a, annotation_level: "failure" })));
     }
     if (init.method === "GET" && (match = m(/^\/actions\/runs\/(\d+)\/artifacts$/))) {
       return response(200, { total_count: 1, artifacts: [{ name: "reports", size_in_bytes: 2048, expired: false }] });
@@ -319,6 +327,11 @@ export class FakeGitHub {
       }
       if (run.state === "completed") {
         return response(409, { message: "Cannot cancel a workflow run that is completed." });
+      }
+      if (run.state === "queued" && run.script.pickupOnCancel) {
+        // A runner took the job in the same moment: the cancel stops it mid-step
+        run.state = "in_progress";
+        run.startedAt = this.clock.now();
       }
       run.cancelRequested = true;
       return response(202, {});
@@ -409,9 +422,17 @@ export class FakeGitHub {
     const lines: string[] = [];
     const ts = iso(started);
     let failed = false;
+    // Cancelled while running, or the runner was lost: it stops in its first step
+    const interrupted = (run.cancelRequested && !script.cancelTooLate) || script.lostRunner === true;
+    let cut = false;
     pipelineSteps.forEach((name, i) => {
       const scripted = script.steps?.find((s) => s.name === name);
-      const conclusion = scripted?.conclusion ?? (failed ? "skipped" : "success");
+      const conclusion = interrupted
+        ? cut
+          ? "skipped"
+          : "cancelled"
+        : (scripted?.conclusion ?? (failed ? "skipped" : "success"));
+      if (conclusion === "cancelled") cut = true;
       const from = 0.05 + (0.9 * i) / pipelineSteps.length;
       const to = 0.05 + (0.9 * (i + 1)) / pipelineSteps.length;
       if (!script.omitSteps?.includes(name)) {
@@ -444,8 +465,8 @@ export class FakeGitHub {
     steps.push({ name: "Complete job", status: "completed", conclusion: "success", number: steps.length + 1, started_at: at(1), completed_at: at(1) });
     run.steps = steps;
     run.log = lines.join("\n") + "\n";
-    const cancelled = run.cancelRequested && !script.cancelTooLate;
-    this.complete(run, cancelled ? "cancelled" : failed ? "failure" : "success", cancelled ? "cancelled" : failed ? "failure" : "success");
+    const outcome = interrupted ? "cancelled" : failed ? "failure" : "success";
+    this.complete(run, outcome, outcome);
   }
 
   private runJson(run: FakeRun) {

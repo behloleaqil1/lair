@@ -207,9 +207,23 @@ export class PipelineManager {
     }
   }
 
-  /** Resume the jobs that were in flight when the server stopped */
-  start(): string[] {
+  /**
+   * Remove what a crash left behind (job worktrees, then `git worktree
+   * prune`), then resume the jobs that were in flight when the server stopped.
+   * Nothing runs yet, so every job worktree found here is an orphan.
+   */
+  async start(): Promise<string[]> {
     if (this.projects.size === 0) return [];
+    for (const p of this.projects.values()) {
+      try {
+        const removed = await this.local.cleanupWorktrees(p.config.repo, p.settings.executors.local);
+        if (removed.length > 0) {
+          console.log(`[pipelines] ${p.name}: removed ${removed.length} leftover worktree(s)`);
+        }
+      } catch (e) {
+        console.warn(`[pipelines] ${p.name}: worktree cleanup failed: ${message(e)}`);
+      }
+    }
     for (const job of this.store.activeJobs()) {
       if (this.projects.has(job.project) && !this.active.has(job.id)) this.launch(job.project, job.id);
     }
@@ -419,6 +433,7 @@ export class PipelineManager {
       }
       const index = attempts.length - 1;
       spec.attemptNo = attempts.filter((a) => a.status !== "skipped").length;
+      spec.runnerLostBefore = attempts.some((a) => a.runnerLost === true);
       const reporter: AttemptReporter = {
         update: (patch) => {
           attempts[index] = { ...attempts[index], ...patch };
@@ -459,7 +474,7 @@ export class PipelineManager {
           attempts[index] = {
             ...attempt,
             status: "completed",
-            reason: undefined,
+            reason: outcome.note,
             completedAt: now,
             where: outcome.where,
             minutes: outcome.minutes,
@@ -482,6 +497,28 @@ export class PipelineManager {
             billedMinutes: sum(attempts, "billedMinutes"),
           });
           return;
+        }
+        case "retry": {
+          // The runner was lost: this attempt never finished. Run the job again
+          // (once); the same executor may take it, since it did not fall back
+          attempts[index] = {
+            ...attempt,
+            status: "interrupted",
+            reason: outcome.reason,
+            runnerLost: true,
+            completedAt: now,
+            minutes: outcome.minutes ?? attempt.minutes,
+            billedMinutes: outcome.billedMinutes ?? attempt.billedMinutes,
+            ciRunId: outcome.ciRunId ?? attempt.ciRunId,
+            ciRunUrl: outcome.ciRunUrl ?? attempt.ciRunUrl,
+          };
+          store.updateJob(job.id, {
+            attempts,
+            minutes: sum(attempts, "minutes"),
+            billedMinutes: sum(attempts, "billedMinutes"),
+          });
+          this.account(p, outcome.billedMinutes ?? 0, job.id);
+          continue;
         }
         case "fallback": {
           attempts[index] = {

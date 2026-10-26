@@ -6,7 +6,7 @@
  * capacity probe and the clock.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { EventBus } from "../core/event-bus.js";
@@ -607,7 +607,7 @@ describe("restarts and capacity", () => {
     const restarted = new PipelineManager(h.options);
     cleanups.push(() => restarted.stop());
     restarted.load([{ name: "demo", config: h.config }]);
-    expect(restarted.start()).toEqual(["demo"]);
+    expect(await restarted.start()).toEqual(["demo"]);
     await restarted.idle();
 
     const run = restarted.getRun("demo", started.id);
@@ -665,5 +665,141 @@ describe("restarts and capacity", () => {
     expect(cancelled.status).toBe("cancelled");
     expect(cancelled.jobs[0].status).toBe("cancelled");
     expect(h.spawner.stepCalls()).toEqual([]);
+  });
+});
+
+describe("cancels, lost runners and visibility", () => {
+  it("falls back, and does not fail the gate, when Lair's own pickup cancel stops a job a runner had just taken", async () => {
+    const h = await harness({
+      visibility: "private",
+      runners: [{ name: "runner-1" }],
+      executors: { github: { pickup_timeout_minutes: 2 } },
+      scripts: [{ pickupAfterPolls: Infinity, pickupOnCancel: true }],
+    });
+    const run = await h.run();
+
+    expect(h.github.cancels).toHaveLength(1);
+    expect([...h.github.runs.values()][0].conclusion).toBe("cancelled");
+    expect(run.status).toBe("passed");
+    expect(run.jobs[0].executor).toBe("local");
+    expect(run.jobs[0].attempts[0]).toMatchObject({
+      executor: "github-self-hosted",
+      status: "fell_back",
+      reason:
+        "no runner picked the job up within 2 min; a runner took the job just as Lair cancelled it, so it stopped unfinished: running it on the next executor",
+    });
+    expect(h.spawner.stepCalls()).toHaveLength(2);
+  });
+
+  it("retries once when the runner is lost mid-run", async () => {
+    const h = await harness({ visibility: "public", scripts: [{ lostRunner: true }, {}] });
+    const run = await h.run();
+
+    expect(run.status).toBe("passed");
+    expect(h.github.dispatches).toHaveLength(2);
+    const hosted = run.jobs[0].attempts.filter((a) => a.executor === "github-hosted");
+    expect(hosted.map((a) => a.status)).toEqual(["interrupted", "completed"]);
+    expect(hosted[0]).toMatchObject({
+      runnerLost: true,
+      reason: "runner lost: the job ended cancelled with no failed step; trying once more",
+    });
+    expect(h.spawner.stepCalls()).toEqual([]);
+  });
+
+  it("fails, and says the runner was lost again, the second time", async () => {
+    const h = await harness({ visibility: "public", scripts: [{ lostRunner: true }, { lostRunner: true }] });
+    const run = await h.run();
+
+    expect(run.status).toBe("failed");
+    expect(h.github.dispatches).toHaveLength(2);
+    expect(run.jobs[0].attempts.at(-1)).toMatchObject({
+      executor: "github-hosted",
+      status: "completed",
+      reason: "runner lost: the job ended cancelled with no failed step, for the second time, so the result stands",
+    });
+  });
+
+  it("reads the visibility again right before a self-hosted dispatch, not from the cache", async () => {
+    const h = await harness({ visibility: "private", runners: [{ name: "runner-1" }] });
+    // Made public after Lair cached it as private
+    h.github.repo = { private: false, visibility: "public", default_branch: "main" };
+    const run = await h.run();
+
+    expect(h.github.dispatches).toEqual([]);
+    expect(run.jobs[0].attempts[0]).toMatchObject({
+      executor: "github-self-hosted",
+      status: "fell_back",
+      reason: "the repository is public: Lair never sends jobs to its self-hosted runners",
+    });
+    expect(run.jobs[0].executor).toBe("local");
+  });
+
+  it("treats only GitHub's own annotations as a billing refusal", async () => {
+    const h = await harness({
+      visibility: "private",
+      executors: { github: { monthly_minutes: 100 } },
+      scripts: [
+        {
+          refuse: "unused",
+          annotations: [
+            { path: ".github", message: "The job was not started because no runner matches its labels." },
+            { path: "src/billing.test.ts", message: "The job was not started because the spending limit fixture says so" },
+          ],
+        },
+      ],
+    });
+    const run = await h.run();
+
+    const hosted = run.jobs[0].attempts.find((a) => a.executor === "github-hosted")!;
+    expect(hosted).toMatchObject({
+      status: "fell_back",
+      reason: "the job never started on a runner: The job was not started because no runner matches its labels.",
+    });
+    expect(hosted.reason).not.toContain("spending limit");
+  });
+});
+
+describe("restarts", () => {
+  it("after a restart, waits up to 10 minutes for the run of a dispatch it had sent, instead of dispatching again", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lair-runners-db-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const dbPath = join(dir, "pipelines.db");
+    const h = await harness({ visibility: "public", dbPath });
+    h.github.returnRunDetails = false;
+    h.github.listHiddenUntil = Number.MAX_SAFE_INTEGER;
+    const started = await h.manager.startRun("demo", { pipeline: "gate", sha: SHA });
+    await until(() => h.github.dispatches.length === 1 && h.github.requests.some((r) => r.path.endsWith("/runs")));
+    await h.manager.stop();
+
+    const store = new PipelineStore(dbPath);
+    const attempt = store.getRun("demo", started.id)!.jobs[0].attempts.at(-1);
+    store.close();
+    expect(attempt).toMatchObject({ executor: "github-hosted", status: "dispatching" });
+
+    // The run shows up 5 minutes after the restart: longer than a fresh dispatch waits
+    h.github.listHiddenUntil = h.clock.now() + 5 * MIN;
+    const restarted = new PipelineManager(h.options);
+    cleanups.push(() => restarted.stop());
+    restarted.load([{ name: "demo", config: h.config }]);
+    await restarted.start();
+    await restarted.idle();
+
+    const run = restarted.getRun("demo", started.id);
+    expect(run.status).toBe("passed");
+    expect(h.github.dispatches).toHaveLength(1);
+    expect(run.jobs[0].executor).toBe("github-hosted");
+  });
+
+  it("removes the worktrees a crash left behind when it starts", async () => {
+    const h = await harness({ token: false });
+    const base = join(h.options.lairDir!, "data", "pipelines", "worktrees");
+    mkdirSync(join(base, "job-0123456789ab"), { recursive: true });
+    writeFileSync(join(base, "job-0123456789ab", "file.txt"), "left over");
+    mkdirSync(join(base, "keep-me"), { recursive: true });
+
+    expect(await h.manager.start()).toEqual(["demo"]);
+    expect(existsSync(join(base, "job-0123456789ab"))).toBe(false);
+    expect(existsSync(join(base, "keep-me"))).toBe(true);
+    expect(h.spawner.calls.map((c) => c.argv)).toContainEqual(["git", "-C", REPO_DIR, "worktree", "prune"]);
   });
 });

@@ -491,7 +491,7 @@ const start = async () => {
     );
 
     // Resume pipeline jobs that were in flight when the server stopped
-    const piped = pipelines.start();
+    const piped = await pipelines.start();
     if (piped.length > 0) console.log(`[pipelines] Pipelines for: ${piped.join(", ")}`);
 
     // Start file watchers for all projects

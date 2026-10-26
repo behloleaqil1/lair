@@ -2,7 +2,10 @@
  * The local executor's real system boundary: the process spawner (argv, no
  * shell, timeout, abort) and the capacity readings it waits on.
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
   ProcessSpawner,
   SystemCapacityProbe,
@@ -16,6 +19,96 @@ import type { LocalSettings } from "../project-pipelines.js";
 
 const NODE = process.execPath;
 const env = { PATH: process.env.PATH ?? "" };
+
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function waitFor(condition: () => boolean, ms = 10_000): Promise<boolean> {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (condition()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return condition();
+}
+
+/** A step that starts a child (not holding its output) and writes the child's pid */
+function parentOf(pidFile: string, parentStays: boolean): string[] {
+  const script = [
+    "const { spawn } = require('child_process');",
+    "const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });",
+    `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+    parentStays ? "setTimeout(() => {}, 60000);" : "process.exit(0);",
+  ].join(" ");
+  return [NODE, "-e", script];
+}
+
+const leftovers: number[] = [];
+const dirs: string[] = [];
+afterEach(() => {
+  for (const pid of leftovers.splice(0)) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // already gone
+    }
+  }
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+describe.skipIf(process.platform === "win32")("ProcessSpawner process tree", () => {
+  const spawner = new ProcessSpawner(500);
+
+  it("kills the children of a cancelled step, not only the step", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lair-tree-"));
+    dirs.push(dir);
+    const pidFile = join(dir, "child.pid");
+    const controller = new AbortController();
+    const running = spawner.run(parentOf(pidFile, true), {
+      cwd: dir,
+      env,
+      timeoutMs: 60_000,
+      signal: controller.signal,
+    });
+    expect(await waitFor(() => existsSync(pidFile) && readFileSync(pidFile, "utf-8").length > 0)).toBe(true);
+    const child = Number(readFileSync(pidFile, "utf-8"));
+    leftovers.push(child);
+    expect(alive(child)).toBe(true);
+
+    controller.abort();
+    const result = await running;
+    expect(result.exitCode).not.toBe(0);
+    expect(await waitFor(() => !alive(child), 5000)).toBe(true);
+  });
+
+  it("kills what a finished step left running", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lair-tree-"));
+    dirs.push(dir);
+    const pidFile = join(dir, "child.pid");
+    const result = await spawner.run(parentOf(pidFile, false), { cwd: dir, env, timeoutMs: 60_000 });
+    expect(result.exitCode).toBe(0);
+    const child = Number(readFileSync(pidFile, "utf-8"));
+    leftovers.push(child);
+    expect(await waitFor(() => !alive(child), 5000)).toBe(true);
+  });
+
+  it("kills the children of a step that timed out", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lair-tree-"));
+    dirs.push(dir);
+    const pidFile = join(dir, "child.pid");
+    const result = await spawner.run(parentOf(pidFile, true), { cwd: dir, env, timeoutMs: 3000 });
+    expect(result.timedOut).toBe(true);
+    const child = Number(readFileSync(pidFile, "utf-8"));
+    leftovers.push(child);
+    expect(await waitFor(() => !alive(child), 5000)).toBe(true);
+  });
+});
 
 describe("ProcessSpawner", () => {
   const spawner = new ProcessSpawner(200);
