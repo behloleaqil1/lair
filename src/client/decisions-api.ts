@@ -10,6 +10,7 @@ import {
   type DecisionKind,
   type DecisionOption,
 } from "../shared/decision-types";
+import { fetchApi, ownerHeaders } from "./owner-session";
 
 export const KIND_LABELS: Record<DecisionKind, string> = {
   pricing: "Pricing",
@@ -95,55 +96,24 @@ export function expiryText(decision: Decision, now: number): string | null {
     : `Expires in ${span(at - now)}; it keeps waiting after that`;
 }
 
-async function fetchData<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init);
-  const body = (await res.json()) as { success: boolean; data?: T; error?: string };
-  if (!body.success || body.data === undefined) {
-    throw new Error(body.error ?? `HTTP ${res.status}`);
-  }
-  return body.data;
-}
-
 /** Every project's decisions: open first by urgency, then the rest. */
 export function listDecisions(): Promise<Decision[]> {
-  return fetchData<Decision[]>("/api/decisions?limit=200");
+  return fetchApi<Decision[]>("/api/decisions?limit=200");
 }
 
 export function decisionSummary(): Promise<DecisionSummary> {
-  return fetchData<DecisionSummary>("/api/decisions/summary");
+  return fetchApi<DecisionSummary>("/api/decisions/summary");
 }
 
 export function getDecision(id: string): Promise<Decision> {
-  return fetchData<Decision>(`/api/decisions/${encodeURIComponent(id)}`);
+  return fetchApi<Decision>(`/api/decisions/${encodeURIComponent(id)}`);
 }
 
-/** Send an answer. The browser adds the answer session cookie (httpOnly) and its Origin. */
+/** Send an answer, as the owner: this browser's owner session goes in its header (owner-session.ts). */
 export function postAnswer(id: string, body: Record<string, unknown>): Promise<Decision> {
-  return fetchData<Decision>(`/api/decisions/${encodeURIComponent(id)}/answer`, {
+  return fetchApi<Decision>(`/api/decisions/${encodeURIComponent(id)}/answer`, {
     method: "POST",
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...ownerHeaders() },
     body: JSON.stringify(body),
   });
-}
-
-/** Is answering unlocked in this browser? */
-export function answerSession(): Promise<{ answering: boolean }> {
-  return fetchData<{ answering: boolean }>("/api/decisions/session", { credentials: "same-origin" });
-}
-
-/** Unlock answering in this browser with the token from data/decisions.answer-token. */
-export function startAnswerSession(token: string): Promise<{ answering: boolean }> {
-  return fetchData<{ answering: boolean }>("/api/decisions/session", {
-    method: "POST",
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ token: token.trim() }),
-  });
-}
-
-/** The token in a setup link's fragment (`#answer-token=...`), or null. */
-export function tokenFromHash(hash: string): string | null {
-  const match = /^#answer-token=([A-Za-z0-9_-]{32,200})$/.exec(hash);
-  return match ? match[1] : null;
 }

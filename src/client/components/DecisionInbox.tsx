@@ -7,15 +7,14 @@
  * Spend and go/no-go answers go through a confirmation step. A credentials
  * decision has a password field and no note: the value goes to the server's
  * secret store with the answer and is never shown again (the API has none to
- * give). Answering works only once this browser holds the answer session
- * (UnlockAnswering, or the setup link the nav badge picks up).
+ * give). Answering works only once this browser is signed in as the owner
+ * (UnlockAnswering, or the setup link the nav badge picks up; owner-session.ts).
  */
 import { useEffect, useRef, useState } from "react";
 import type { Decision, DecisionAuditEntry, DecisionCounts, DecisionOption } from "../../shared/decision-types";
 import {
   KIND_LABELS,
   answerBody,
-  answerSession,
   confirmationText,
   decisionSummary,
   expiryText,
@@ -24,10 +23,10 @@ import {
   needsConfirmation,
   outcomeText,
   postAnswer,
-  startAnswerSession,
-  tokenFromHash,
   type DecisionSummary,
 } from "../decisions-api";
+import { ownerStatus, signIn, tokenFromHash } from "../owner-session";
+import { OwnerSessions } from "./OwnerSessions";
 
 interface Props {
   project: string;
@@ -117,19 +116,29 @@ export function DecisionCardView(p: DecisionCardViewProps) {
       <div style={muted}>
         {decision.project} · raised by <code>{decision.source.module}</code> ({decision.source.ref}) ·{" "}
         {time(decision.createdAt)}
+        {decision.raisedVia === "http" && (
+          <span data-raised-via="http"> · over HTTP, so that module name is only what the caller said</span>
+        )}
       </div>
       {expiry && (
         <div style={{ ...muted, color: decision.overdue ? "var(--error)" : "var(--warning)" }}>{expiry}</div>
       )}
 
       <p style={{ whiteSpace: "pre-wrap", margin: "0.75rem 0" }}>{decision.context}</p>
+      {/* Links are text to copy, never clickable: a decision's links come from whoever raised it */}
       {decision.links.length > 0 && (
-        <ul style={{ ...muted, margin: "0 0 0.75rem 1rem" }}>
+        <ul style={{ ...muted, margin: "0 0 0.75rem 1rem" }} data-links="text">
           {decision.links.map((link) => (
             <li key={link.url}>
-              <a href={link.url} target="_blank" rel="noopener noreferrer">
-                {link.label}
-              </a>
+              {link.label}: <code>{link.url}</code>{" "}
+              <button
+                type="button"
+                onClick={() => void navigator.clipboard?.writeText(link.url)}
+                style={{ ...secondaryButton, padding: "0.1rem 0.4rem", fontSize: "0.75rem" }}
+                title="Copy the address, then check it before you open it"
+              >
+                Copy
+              </button>
             </li>
           ))}
         </ul>
@@ -361,9 +370,9 @@ export function AuditList({ entries }: { entries: DecisionAuditEntry[] }) {
 }
 
 /**
- * Shown until answering is unlocked in this browser: the token from
- * data/decisions.answer-token (or the setup link the server printed at its
- * first start) turns on the answer session cookie.
+ * Shown until this browser is signed in as the owner: the token from
+ * data/owner.token (or the setup link the server printed at its first
+ * start) gets an owner session, kept in this origin's localStorage.
  */
 export function UnlockAnswering({ onUnlock }: { onUnlock: (token: string) => Promise<void> }) {
   const token = useRef("");
@@ -385,15 +394,15 @@ export function UnlockAnswering({ onUnlock }: { onUnlock: (token: string) => Pro
     <div className="card" data-unlock="answering" style={{ borderColor: "var(--warning)" }}>
       <h3>Unlock answering</h3>
       <p style={muted}>
-        Only you answer decisions, so answering needs the token Lair keeps in{" "}
-        <code>data/decisions.answer-token</code>. Open the setup link the server printed when it first started, or
-        paste the token here once; this browser then remembers it.
+        Only you answer decisions, so this browser has to sign in as the owner, once, with the owner token Lair keeps
+        in <code>data/owner.token</code>. Open the setup link the server printed when it first started, or paste the
+        token here.
       </p>
       <input
         type="password"
         autoComplete="off"
-        name="answer-token"
-        placeholder="Answer token"
+        name="owner-token"
+        placeholder="Owner token"
         onChange={(e) => {
           token.current = e.target.value;
         }}
@@ -418,14 +427,17 @@ export function DecisionInboxView({
   now,
   answering,
   onUnlock,
+  onSignedOut = () => undefined,
   onAnswered,
 }: {
   decisions: Decision[];
   secretStore: string;
   now: number;
-  /** Answering is unlocked in this browser */
+  /** This browser is signed in as the owner */
   answering: boolean;
   onUnlock: (token: string) => Promise<void>;
+  /** This browser signed itself out (in the signed-in browsers list) */
+  onSignedOut?: () => void;
   onAnswered: () => void;
 }) {
   const open = decisions.filter((d) => d.status === "open");
@@ -440,7 +452,7 @@ export function DecisionInboxView({
         </span>
       </div>
 
-      {!answering && <UnlockAnswering onUnlock={onUnlock} />}
+      {answering ? <OwnerSessions onSignedOut={onSignedOut} /> : <UnlockAnswering onUnlock={onUnlock} />}
 
       {open.length === 0 ? (
         <div className="card">
@@ -506,12 +518,12 @@ export function DecisionInbox({ refreshKey }: Props) {
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([listDecisions(), decisionSummary(), answerSession()])
+    Promise.all([listDecisions(), decisionSummary(), ownerStatus()])
       .then(([list, counts, session]) => {
         if (cancelled) return;
         setDecisions(list);
         setSummary(counts);
-        setAnswering(session.answering);
+        setAnswering(session.signedIn);
         setError(null);
       })
       .catch((e: unknown) => {
@@ -533,9 +545,10 @@ export function DecisionInbox({ refreshKey }: Props) {
         now={Date.now()}
         answering={answering}
         onUnlock={async (token) => {
-          await startAnswerSession(token);
+          await signIn(token);
           setReload((n) => n + 1);
         }}
+        onSignedOut={() => setReload((n) => n + 1)}
         onAnswered={() => setReload((n) => n + 1)}
       />
     </>
@@ -558,7 +571,7 @@ export function DecisionCountBadge({ open, overdue }: DecisionCounts) {
 
 /**
  * The nav badge. It is on every page, so it also takes the setup link's
- * token (`#answer-token=...`): it unlocks answering and removes the token
+ * token (`#owner-token=...`): it signs this browser in and removes the token
  * from the address bar and the history.
  */
 export function DecisionsBadge({ refreshKey }: { refreshKey: number }) {
@@ -568,7 +581,7 @@ export function DecisionsBadge({ refreshKey }: { refreshKey: number }) {
     const token = tokenFromHash(window.location.hash);
     if (!token) return;
     window.history.replaceState(null, "", window.location.pathname + window.location.search);
-    startAnswerSession(token).catch((e: unknown) => console.warn("Could not unlock answering:", e));
+    signIn(token).catch((e: unknown) => console.warn("Could not sign this browser in:", e));
   }, []);
 
   useEffect(() => {

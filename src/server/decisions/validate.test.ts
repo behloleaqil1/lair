@@ -3,6 +3,7 @@ import { NEVER_DEFAULT_KINDS } from "../../shared/decision-types.js";
 import {
   hasControlCharacters,
   isDecisionId,
+  isPrivateHost,
   parseAnswerInput,
   parseRaiseInput,
   parseWithdrawInput,
@@ -124,9 +125,59 @@ describe("parseRaiseInput", () => {
   });
 
   it("only allows http(s) links", () => {
-    expect(errorsOf(input({ links: [{ label: "x", url: "javascript:alert(1)" }] }))[0]).toBe(
+    expect(errorsOf(input({ links: [{ label: "x", url: "javascript:alert(1)" }] }))).toEqual([
       "links.0.url: must be an http or https URL",
-    );
+    ]);
+  });
+
+  it("refuses links to this machine or a private network, however the address is written", () => {
+    const refused = [
+      "http://localhost:9999/answer",
+      "http://LOCALHOST./x",
+      "http://agent.localhost/",
+      "http://printer.local/",
+      "http://intranet/",
+      "http://127.0.0.1:3000/",
+      "http://127.1.2.3/",
+      "http://0x7f.1/",
+      "http://2130706433/",
+      "http://0.0.0.0/",
+      "http://10.1.2.3/",
+      "http://172.16.0.1/",
+      "http://172.31.255.255/",
+      "http://192.168.1.10/",
+      "http://169.254.169.254/latest",
+      "http://100.64.0.1/",
+      "http://[::1]:4777/",
+      "http://[::]/",
+      "http://[fd12:3456::1]/",
+      "http://[fe80::1]/",
+      "http://[::ffff:127.0.0.1]/",
+      "http://[::ffff:10.0.0.1]/",
+    ];
+    for (const url of refused) {
+      expect([url, errorsOf(input({ links: [{ label: "x", url }] }))[0]]).toEqual([
+        url,
+        expect.stringContaining("links.0.url: must not point at this machine or a private network"),
+      ]);
+    }
+    for (const url of [
+      "https://example.com/plan",
+      "http://198.51.100.7/",
+      "http://172.32.0.1/",
+      "http://[2001:db8::1]/",
+      "https://docs.example.org:8443/a?b#c",
+    ]) {
+      expect([url, errorsOf(input({ links: [{ label: "x", url }] }))]).toEqual([url, []]);
+    }
+  });
+
+  it("recognises private hosts", () => {
+    expect(isPrivateHost("localhost")).toBe(true);
+    expect(isPrivateHost("[::1]")).toBe(true);
+    expect(isPrivateHost("[::ffff:7f00:1]")).toBe(true);
+    expect(isPrivateHost("example.com")).toBe(false);
+    expect(isPrivateHost("203.0.113.9")).toBe(false);
   });
 
   it("ties secrets to credentials decisions", () => {

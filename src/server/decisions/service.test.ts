@@ -652,4 +652,64 @@ describe("limits and origins", () => {
       detail: "chose large (100 rows); note: ok; from ::1 (Example Browser)",
     });
   });
+
+  it("caps HTTP-raised decisions per project whatever module they name; producers in the server have their own cap", async () => {
+    const store = new DecisionStore(":memory:");
+    stores.push(store);
+    const inbox = new DecisionInbox({
+      store,
+      secrets: new MemorySecretStore(),
+      clock: new FakeClock(),
+      maxOpenHttpPerProject: 2,
+    });
+    const from = (module: string, key: string) => other({ key, source: { module, ref: "r" } });
+    await inbox.raiseFromHttp(from("alpha", "a"));
+    await inbox.raiseFromHttp(from("beta", "b"));
+    const capped = await rejection(inbox.raiseFromHttp(from("gamma", "c")));
+    expect(capped).toMatchObject({ statusCode: 429 });
+    expect(capped.message).toContain("HTTP callers already have 2 open decisions in demo (the limit is 2)");
+    // Another project has its own count; producers inside the server aren't counted or capped by it
+    expect(
+      await inbox.raiseFromHttp(other({ project: "shop", key: "c", source: { module: "gamma", ref: "r" } })),
+    ).toMatchObject({ created: true });
+    expect(await inbox.raise(from("watchdog", "w1"))).toMatchObject({ created: true });
+    expect(await inbox.raise(from("watchdog", "w2"))).toMatchObject({ created: true });
+    expect(inbox.list({ project: "demo", status: "open" }).map((d) => d.raisedVia).sort()).toEqual([
+      "http",
+      "http",
+      "server",
+      "server",
+    ]);
+  });
+});
+
+describe("delivering credentials answers", () => {
+  it("reopens an answer whose secret is gone by the time it is delivered (a restart), instead of resuming the producer", async () => {
+    const dbPath = join(tempDir(), "decisions.db");
+    const first = setup({ dbPath });
+    const { decision } = await first.inbox.raise(credentials());
+    const answered = await first.inbox.answer(decision.id, { optionId: "supply", secret: SECRET });
+    expect(answered).toMatchObject({ status: "answered", deliveredAt: undefined });
+    first.store.close();
+
+    // A restart: the in-memory secret store is empty again
+    const second = setup({ dbPath, secrets: new MemorySecretStore() });
+    const resumed: DecisionResolution[] = [];
+    second.inbox.onResolved("delivery", (r) => {
+      resumed.push(r);
+    });
+    await second.inbox.deliverPending();
+    expect(resumed).toEqual([]);
+    const reopened = second.inbox.get(decision.id)!;
+    expect(reopened).toMatchObject({ status: "open" });
+    expect(reopened.answer).toBeUndefined();
+    expect(reopened.audit?.map((a) => a.action)).toEqual(["raised", "answered", "reopened"]);
+    expect(reopened.audit?.[2].detail).toBe(
+      "the secret store has no GIT_HOST_TOKEN any more, so the answer can't be used: answer again",
+    );
+
+    // Answered again, with the secret there, it is delivered
+    await second.inbox.answer(decision.id, { optionId: "supply", secret: SECRET });
+    expect(resumed.map((r) => r.optionId)).toEqual(["supply"]);
+  });
 });

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Decision } from "../shared/decision-types";
-import { answerBody, confirmationText, expiryText, needsConfirmation, outcomeText, tokenFromHash } from "./decisions-api";
+import { answerBody, confirmationText, expiryText, needsConfirmation, outcomeText } from "./decisions-api";
+import { tokenFromHash } from "./owner-session";
 
 const NOW = Date.parse("2026-03-02T12:00:00.000Z");
 const MIN = 60_000;
@@ -24,6 +25,7 @@ function decision(overrides: Partial<Decision> = {}): Decision {
     createdAt: "2026-03-02T11:00:00.000Z",
     overdue: false,
     status: "open",
+    raisedVia: "server",
     ...overrides,
   };
 }
@@ -67,10 +69,10 @@ describe("answer rules", () => {
 
   it("takes the answer token only from a setup link's fragment", () => {
     const token = "Abc_def-0123456789Abc_def-0123456789Abc_def";
-    expect(tokenFromHash(`#answer-token=${token}`)).toBe(token);
+    expect(tokenFromHash(`#owner-token=${token}`)).toBe(token);
     expect(tokenFromHash("")).toBeNull();
-    expect(tokenFromHash("#answer-token=short")).toBeNull();
-    expect(tokenFromHash(`#answer-token=${token}&next=/x`)).toBeNull();
+    expect(tokenFromHash("#owner-token=short")).toBeNull();
+    expect(tokenFromHash(`#owner-token=${token}&next=/x`)).toBeNull();
     expect(tokenFromHash(`#other=${token}`)).toBeNull();
   });
 

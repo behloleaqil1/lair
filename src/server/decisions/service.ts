@@ -21,7 +21,7 @@ import {
   type DecisionAnswer,
   type DecisionCounts,
 } from "../../shared/decision-types.js";
-import type { DecisionStore, ListOptions } from "./store.js";
+import type { DecisionStore, ListOptions, RaisedVia } from "./store.js";
 import { SecretStoreUnavailableError, type SecretStore } from "./secrets.js";
 import { DecisionError, parseAnswerInput, parseRaiseInput, parseWithdrawInput } from "./validate.js";
 import type {
@@ -47,14 +47,21 @@ export interface DecisionInboxOptions {
    * refused with 429 (default DEFAULT_MAX_OPEN_PER_SOURCE)
    */
   maxOpenPerSource?: number;
+  /**
+   * Open decisions raised over HTTP per project, whatever module they name
+   * (the name is the caller's word); more get 429 (default
+   * DEFAULT_MAX_OPEN_HTTP_PER_PROJECT)
+   */
+  maxOpenHttpPerProject?: number;
 }
 
 /** The actor for what the inbox does itself (defaults, overdue marks, deliveries). */
 const LAIR = "lair";
-/** The only one who answers: the human with the answer session (see answer-auth.ts). */
+/** The only one who answers: the human with an owner session (src/server/human-auth/). */
 const OWNER = "owner";
 const DEFAULT_SWEEP_SECONDS = 30;
 export const DEFAULT_MAX_OPEN_PER_SOURCE = 50;
+export const DEFAULT_MAX_OPEN_HTTP_PER_PROJECT = 20;
 const MAX_USER_AGENT = 200;
 
 function message(e: unknown): string {
@@ -85,6 +92,7 @@ export class DecisionInbox implements DecisionProducer {
   private sweeping: Promise<void> | null = null;
   private timer: NodeJS.Timeout | null = null;
   private maxOpenPerSource: number;
+  private maxOpenHttpPerProject: number;
   /** Answers whose secret is being stored: not deliverable until that succeeds */
   private settling = new Set<string>();
 
@@ -95,6 +103,7 @@ export class DecisionInbox implements DecisionProducer {
     this.clock = options.clock ?? { now: () => Date.now() };
     this.sweepSeconds = options.sweepSeconds ?? DEFAULT_SWEEP_SECONDS;
     this.maxOpenPerSource = options.maxOpenPerSource ?? DEFAULT_MAX_OPEN_PER_SOURCE;
+    this.maxOpenHttpPerProject = options.maxOpenHttpPerProject ?? DEFAULT_MAX_OPEN_HTTP_PER_PROJECT;
   }
 
   private iso(): string {
@@ -108,18 +117,36 @@ export class DecisionInbox implements DecisionProducer {
 
   // ============ PRODUCER INTERFACE ============
 
-  async raise(input: RaiseDecisionInput): Promise<RaiseResult> {
+  /** A module inside the server asks. */
+  raise(input: RaiseDecisionInput): Promise<RaiseResult> {
+    return this.raiseVia(input, "server");
+  }
+
+  /**
+   * POST /api/decisions asks: the caller is unknown, so besides the
+   * per-module cap, every HTTP caller shares one cap per project.
+   */
+  raiseFromHttp(input: RaiseDecisionInput): Promise<RaiseResult> {
+    return this.raiseVia(input, "http");
+  }
+
+  private async raiseVia(input: RaiseDecisionInput, via: RaisedVia): Promise<RaiseResult> {
     const parsed = parseRaiseInput(input, this.clock.now());
     if (!parsed.ok) {
       throw new DecisionError(400, `Invalid decision: ${parsed.errors.join("; ")}`);
     }
     const at = this.iso();
-    const outcome = this.store.raise(parsed.value, at, this.maxOpenPerSource);
+    const outcome = this.store.raise(parsed.value, at, {
+      via,
+      maxOpenPerSource: this.maxOpenPerSource,
+      maxOpenHttpPerProject: this.maxOpenHttpPerProject,
+    });
     if (outcome.kind === "capped") {
+      const who = outcome.by === "http" ? "HTTP callers already have" : `${parsed.value.source.module} already has`;
       throw new DecisionError(
         429,
-        `${parsed.value.source.module} already has ${outcome.open} open decisions in ${parsed.value.project} ` +
-          `(the limit is ${this.maxOpenPerSource}): wait for answers or withdraw some first`,
+        `${who} ${outcome.open} open decisions in ${parsed.value.project} ` +
+          `(the limit is ${outcome.limit}): wait for answers or withdraw some first`,
       );
     }
     const { decision, addedBlocks } = outcome;
@@ -378,6 +405,19 @@ export class DecisionInbox implements DecisionProducer {
     const module = decision.source.module;
     const handler = this.handlerFor(module, decision.project);
     if (!handler) return false;
+    // A supplied secret must still be there (the server can restart between the answer and storing it,
+    // and the in-memory store forgets on restart): if not, the human has to supply it again
+    if (answer.secretSupplied && decision.secretName && !(await this.secrets.has(decision.secretName))) {
+      if (decision.answeredAt && this.store.reopenDecision(id, decision.answeredAt)) {
+        this.store.addAudit(id, {
+          at: this.iso(),
+          action: "reopened",
+          actor: LAIR,
+          detail: `the secret store has no ${decision.secretName} any more, so the answer can't be used: answer again`,
+        });
+      }
+      return false;
+    }
     try {
       await handler({
         decision,

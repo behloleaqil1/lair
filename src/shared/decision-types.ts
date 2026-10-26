@@ -84,7 +84,8 @@ export type DecisionAuditAction =
   | "expired"
   | "withdrawn"
   | "delivered"
-  | "delivery_failed";
+  | "delivery_failed"
+  | "reopened";
 
 export interface DecisionAuditEntry {
   at: string;
@@ -127,6 +128,8 @@ export interface Decision {
   closedAt?: string;
   /** When the producer received the answer */
   deliveredAt?: string;
+  /** "http": raised over the API, so `source.module` is only what the caller said; "server": by a module inside Lair */
+  raisedVia: "server" | "http";
   /** Only in GET /api/decisions/:id */
   audit?: DecisionAuditEntry[];
 }

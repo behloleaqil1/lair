@@ -74,6 +74,61 @@ const OptionSchema = z
   })
   .strict();
 
+/** An IPv4 address as four numbers, or null. */
+function ipv4(host: string): number[] | null {
+  const parts = host.split(".");
+  if (parts.length !== 4 || !parts.every((p) => /^\d{1,3}$/.test(p))) return null;
+  const nums = parts.map(Number);
+  return nums.every((n) => n <= 255) ? nums : null;
+}
+
+function privateIpv4([a, b]: number[]): boolean {
+  return (
+    a === 0 || // "this network"
+    a === 10 ||
+    a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) || // carrier-grade NAT
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    a >= 224 // multicast and reserved
+  );
+}
+
+/**
+ * True for hosts on this machine or a private network: localhost and
+ * *.localhost, *.local, single-label names, loopback, private, link-local
+ * and unique-local addresses (also IPv4-mapped IPv6). A link to one of them
+ * could lead the owner's browser to a local listener an agent runs.
+ */
+export function isPrivateHost(hostname: string): boolean {
+  let host = hostname.toLowerCase().replace(/\.+$/, "");
+  if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
+  if (host === "" || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return true;
+  const v4 = ipv4(host);
+  if (v4) return privateIpv4(v4);
+  if (host.includes(":")) {
+    // IPv6: loopback, unspecified, unique local (fc00::/7), link local (fe80::/10), IPv4-mapped
+    if (host === "::1" || host === "::") return true;
+    if (/^f[cd][0-9a-f]{0,2}:/.test(host) || /^fe[89ab][0-9a-f]?:/.test(host)) return true;
+    if (host.startsWith("::ffff:")) {
+      const mapped = host.slice("::ffff:".length);
+      const dotted = ipv4(mapped);
+      if (dotted) return privateIpv4(dotted);
+      const words = mapped.split(":");
+      if (words.length === 2) {
+        const hi = parseInt(words[0], 16);
+        const lo = parseInt(words[1], 16);
+        return privateIpv4([hi >> 8, hi & 0xff, lo >> 8, lo & 0xff]);
+      }
+      return true;
+    }
+    return false;
+  }
+  // A name without a dot resolves on the local network, if at all
+  return !host.includes(".");
+}
+
 const LinkSchema = z
   .object({
     label: oneLine(120),
@@ -87,7 +142,16 @@ const LinkSchema = z
         } catch {
           return false;
         }
-      }, "must be an http or https URL"),
+      }, "must be an http or https URL")
+      .refine((u) => {
+        try {
+          const url = new URL(u);
+          if (url.protocol !== "http:" && url.protocol !== "https:") return true; // reported above
+          return !isPrivateHost(url.hostname);
+        } catch {
+          return true; // reported above
+        }
+      }, "must not point at this machine or a private network (localhost, 127.0.0.0/8, ::1, 10/8, 172.16/12, 192.168/16, 169.254/16, *.local, *.localhost)"),
   })
   .strict();
 

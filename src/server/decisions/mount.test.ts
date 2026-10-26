@@ -1,26 +1,28 @@
 /**
  * The Decision Inbox wired the way src/server/index.ts wires it: the root
- * guards, mountDecisions() with a real WatchdogManager as producer, a real
- * port, and plain HTTP requests. Only the watchdog's system boundary (the
- * process table and the command runner) is fake, and, for the client helper
- * test, the browser: a fetch that adds what a browser adds (Origin,
- * Sec-Fetch-Site, its cookies).
+ * guards, the owner credential and its routes, mountDecisions() with a real
+ * WatchdogManager as producer, a real port, and plain HTTP requests. Only the
+ * watchdog's system boundary (the process table and the command runner) is
+ * fake, and, for the client helper test, the browser: a fetch that adds what
+ * a browser adds (Origin, Sec-Fetch-Site) and a localStorage of its origin.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
 import { request as httpRequest, type IncomingHttpHeaders } from "http";
 import type { AddressInfo } from "net";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { fileURLToPath } from "url";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { Decision } from "../../shared/decision-types.js";
 import { registerRootGuards } from "../root-guards.js";
+import { HumanAuth, OWNER_SESSION_HEADER, registerOwnerRoutes } from "../human-auth/index.js";
 import { WatchdogManager } from "../watchdog/service.js";
 import { NodeFileSystem, type CommandOutput } from "../watchdog/probes.js";
-import { answerBody, answerSession, listDecisions, postAnswer, startAnswerSession } from "../../client/decisions-api";
-import { dashboardUrlFor, maxOpenFromEnv, mountDecisions } from "./mount.js";
+import { answerBody, listDecisions, postAnswer } from "../../client/decisions-api";
+import { listOwnerSessions, ownerStatus, revokeOwnerSession, signIn, storedSession } from "../../client/owner-session";
+import { maxOpenFromEnv, maxOpenHttpFromEnv, mountDecisions } from "./mount.js";
 import type { DecisionResolution } from "./types.js";
 
 const NOW = Date.parse("2026-03-02T12:00:00.000Z");
@@ -87,40 +89,47 @@ function call(
 }
 
 /**
- * A browser on the dashboard (origin http://127.0.0.1:4777), as a fetch to the test server on `port`: it
- * resolves relative URLs, adds Origin to non-GET requests and
- * Sec-Fetch-Site: same-origin to all, and keeps the cookies it is sent.
+ * A browser on the dashboard (origin http://127.0.0.1:4777), as a fetch to
+ * the test server on `port`: it resolves relative URLs, adds Origin to
+ * non-GET requests and Sec-Fetch-Site: same-origin to all. It sends no
+ * cookies (the server sets none; the test checks that).
  */
-function browserFetch(port: number) {
+function browserFetch(port: number, seen: Reply[]) {
   const origin = "http://127.0.0.1:4777";
-  const jar = new Map<string, string>();
   return async (input: string | URL | Request, init: RequestInit = {}): Promise<Response> => {
     const url = new URL(String(input), origin);
     const method = init.method ?? "GET";
     const headers: Record<string, string> = { ...((init.headers as Record<string, string> | undefined) ?? {}) };
     headers["sec-fetch-site"] = "same-origin";
     if (method !== "GET" && method !== "HEAD") headers.origin = origin;
-    if (jar.size > 0 && init.credentials !== "omit") {
-      headers.cookie = [...jar].map(([name, value]) => `${name}=${value}`).join("; ");
-    }
     const reply = await call(port, method, url.pathname + url.search, init.body as string | undefined, headers);
-    const setCookie = reply.headers["set-cookie"] ?? [];
-    for (const cookie of setCookie) {
-      const [pair] = cookie.split(";");
-      const eq = pair.indexOf("=");
-      jar.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
-    }
+    seen.push(reply);
     return new Response(reply.text, { status: reply.status, headers: { "content-type": "application/json" } });
   };
 }
 
+/** localStorage for one origin. */
+function memoryStorage(): Storage {
+  const values = new Map<string, string>();
+  return {
+    get length() {
+      return values.size;
+    },
+    clear: () => values.clear(),
+    getItem: (key: string) => values.get(key) ?? null,
+    key: (index: number) => [...values.keys()][index] ?? null,
+    removeItem: (key: string) => void values.delete(key),
+    setItem: (key: string, value: string) => void values.set(key, String(value)),
+  };
+}
+
 /** One project, watchdog in observe mode, with an orphaned claim and its release command configured. */
-async function boot(options: { log?: string[] } = {}) {
-  dir ??= mkdtempSync(join(tmpdir(), "lair-decisions-mount-"));
+async function boot() {
+  dir = mkdtempSync(join(tmpdir(), "lair-decisions-mount-"));
   const root = join(dir, "demo");
   mkdirSync(join(root, "agents"), { recursive: true });
   const claim = join(root, "agents", "worker-b.running");
-  if (!existsSync(claim)) mkdirSync(claim);
+  mkdirSync(claim);
   utimesSync(claim, new Date(NOW - 30 * 60000), new Date(NOW - 30 * 60000));
   const config: ProjectConfig = {
     name: "Demo",
@@ -156,37 +165,44 @@ async function boot(options: { log?: string[] } = {}) {
   });
   manager.load([{ name: "demo", config }]);
 
+  // As src/server/index.ts does it
   app = Fastify();
   registerRootGuards(app);
-  const tokenPath = join(dir, "data", "decisions.answer-token");
+  const tokenPath = join(dir, "data", "owner.token");
+  const humanAuth = HumanAuth.open({ tokenPath, dbPath: join(dir, "data", "owner-sessions.db") });
+  await registerOwnerRoutes(app, humanAuth);
   const inbox = await mountDecisions(app, {
     dbPath: join(dir, "data", "decisions.db"),
-    answerTokenPath: tokenPath,
-    dashboardUrl: "http://127.0.0.1:4777",
+    humanAuth,
     defaultProject: () => "example",
     producers: [manager],
     sweepSeconds: 3600,
-    log: (line) => options.log?.push(line),
+    env: {},
   });
   await app.listen({ port: 0, host: "127.0.0.1" });
   const port = (app.server.address() as AddressInfo).port;
-  const answerToken = readFileSync(tokenPath, "utf-8").trim();
-  return { inbox, manager, port, calls, claim, tokenPath, answerToken, inboxFile: config.inbox_file! };
+  const ownerToken = readFileSync(tokenPath, "utf-8").trim();
+  return { inbox, manager, port, calls, claim, ownerToken, inboxFile: config.inbox_file! };
 }
 
 describe("mountDecisions (the server's wiring)", () => {
-  it("is what src/server/index.ts mounts, with the answer token and the watchdog as a producer", () => {
+  it("is what src/server/index.ts mounts: the owner credential, its routes, CORS kept off them, the watchdog as producer", () => {
     const index = readFileSync(fileURLToPath(new URL("../index.ts", import.meta.url)), "utf-8");
-    expect(index).toContain('import { dashboardUrlFor, mountDecisions } from "./decisions/index.js";');
+    expect(index).toMatch(/import \{ mountDecisions \} from "\.\/decisions\/index\.js";/);
     expect(index).toMatch(
-      /await mountDecisions\(fastify, \{\s*dbPath: join\(process\.cwd\(\), "data", "decisions\.db"\),\s*answerTokenPath: join\(process\.cwd\(\), "data", "decisions\.answer-token"\),[\s\S]*?producers: \[watchdogs\],\s*\}\);/,
+      /const humanAuth = HumanAuth\.open\(\{\s*tokenPath: join\(process\.cwd\(\), "data", "owner\.token"\),\s*dbPath: join\(process\.cwd\(\), "data", "owner-sessions\.db"\),\s*\}\);/,
     );
+    expect(index).toContain("await registerOwnerRoutes(fastify, humanAuth);");
+    expect(index).toMatch(
+      /await mountDecisions\(fastify, \{\s*dbPath: join\(process\.cwd\(\), "data", "decisions\.db"\),\s*humanAuth,[\s\S]*?producers: \[watchdogs\],\s*\}\);/,
+    );
+    expect(index).toMatch(/await fastify\.register\(\s*cors,\s*corsOptionsWithout\(\[[^\]]*\], OWNER_ONLY_PREFIXES\),\s*\);/);
     // Mounted before the server starts the watchdogs, so no escalation goes elsewhere
     expect(index.indexOf("await mountDecisions(")).toBeLessThan(index.indexOf("watchdogs.start()"));
   });
 
   it("drives raise -> list -> answer -> producer resumed over HTTP", async () => {
-    const { inbox, manager, port, calls, claim, answerToken, inboxFile } = await boot();
+    const { inbox, manager, port, calls, claim, ownerToken, inboxFile } = await boot();
     const watchdog = manager.get("demo")!;
 
     // 1. Raise: the watchdog's escalation is a decision, not an inbox line
@@ -200,6 +216,7 @@ describe("mountDecisions (the server's wiring)", () => {
       kind: "escalation",
       status: "open",
       source: { module: "watchdog" },
+      raisedVia: "server",
       recommended: { optionId: "run_playbook" },
       blocks: ["watchdog:demo:orphan_claim:worker-b.running"],
     });
@@ -212,26 +229,35 @@ describe("mountDecisions (the server's wiring)", () => {
     expect(calls).toEqual([]);
     expect(inbox.blockedOn("watchdog:demo:orphan_claim:worker-b.running")?.id).toBe(decision.id);
 
-    // 3. A local process can't answer: no Origin and no session (403, still open, nothing runs)
+    // 3. The owner signs a browser in; the session comes back in the body, never as a cookie
+    const dashboard = { origin: "http://localhost:4777", "sec-fetch-site": "same-origin" };
+    const signedIn = await call(port, "POST", "/api/owner/sessions", { token: ownerToken }, dashboard);
+    expect(signedIn.status).toBe(201);
+    expect(signedIn.headers["set-cookie"]).toBeUndefined();
+    const session = signedIn.body.data.session as string;
+
+    // 4. Nobody else can answer: no Origin, a cookie, another local origin, forged headers (403, nothing runs)
     const answerPath = `/api/decisions/${decision.id}/answer`;
-    const agent = await call(port, "POST", answerPath, { optionId: "run_playbook" });
-    expect(agent.status).toBe(403);
-    const forged = await call(port, "POST", answerPath, { optionId: "run_playbook" }, {
-      origin: "http://localhost:4777",
-      "sec-fetch-site": "same-origin",
-    });
-    expect(forged.status).toBe(403);
+    for (const headers of [
+      {},
+      { [OWNER_SESSION_HEADER]: session },
+      { ...dashboard, cookie: `session=${session}` },
+      { ...dashboard, origin: "http://localhost:3000", [OWNER_SESSION_HEADER]: session },
+      dashboard,
+    ]) {
+      expect((await call(port, "POST", answerPath, { optionId: "run_playbook" }, headers)).status).toBe(403);
+    }
     await watchdog.tick();
     expect(calls).toEqual([]);
     expect(inbox.get(decision.id)?.status).toBe("open");
 
-    // 4. The owner unlocks answering in the browser and answers over HTTP; the watchdog gets it right away
-    const dashboard = { origin: "http://localhost:4777", "sec-fetch-site": "same-origin" };
-    const session = await call(port, "POST", "/api/decisions/session", { token: answerToken }, dashboard);
-    expect(session.status).toBe(200);
-    const cookie = String(session.headers["set-cookie"]).split(";")[0];
-    const answered = await call(port, "POST", answerPath, { optionId: "run_playbook" }, { ...dashboard, cookie });
+    // 5. The owner answers over HTTP; the watchdog gets it right away
+    const answered = await call(port, "POST", answerPath, { optionId: "run_playbook" }, {
+      ...dashboard,
+      [OWNER_SESSION_HEADER]: session,
+    });
     expect(answered.status).toBe(200);
+    expect(answered.headers["set-cookie"]).toBeUndefined();
     expect(answered.body.data).toMatchObject({ status: "answered", answer: { optionId: "run_playbook" } });
     expect(answered.body.data.deliveredAt).toBeDefined();
     expect(answered.body.data.audit.map((a: { action: string }) => a.action)).toEqual([
@@ -241,7 +267,7 @@ describe("mountDecisions (the server's wiring)", () => {
     ]);
     expect(answered.body.data.audit[1].detail).toContain("from 127.0.0.1");
 
-    // 5. Resumed: the next tick runs the playbook once, and the breach recovers
+    // 6. Resumed: the next tick runs the playbook once, and the breach recovers
     await watchdog.tick();
     expect(calls).toEqual([["./bin/release-claim", "worker-b", claim]]);
     expect(existsSync(claim)).toBe(false);
@@ -250,16 +276,18 @@ describe("mountDecisions (the server's wiring)", () => {
     expect(calls).toHaveLength(1);
   });
 
-  it("answers through the real client helpers, as the Decisions view does", async () => {
-    const { inbox, port, answerToken } = await boot();
-    vi.stubGlobal("fetch", browserFetch(port));
+  it("answers through the real client helpers, as the Decisions view does, and signs out", async () => {
+    const { inbox, port, ownerToken } = await boot();
+    const seen: Reply[] = [];
+    vi.stubGlobal("fetch", browserFetch(port, seen));
+    vi.stubGlobal("localStorage", memoryStorage());
 
     // Any producer: raise over HTTP, resume through onResolved
     const resumed: DecisionResolution[] = [];
     inbox.onResolved("intake", (r) => {
       resumed.push(r);
     });
-    const raised = await call(port, "POST", "/api/decisions?project=example", {
+    const spend = {
       kind: "spend",
       title: "Pay for the starter plan of the error tracker",
       context: "Error reports from staging are blocked until the plan is paid.",
@@ -271,45 +299,40 @@ describe("mountDecisions (the server's wiring)", () => {
       source: { module: "intake", ref: "request-7" },
       key: "error-tracker-plan",
       blocks: ["card:error-reports"],
-    });
+    };
+    const raised = await call(port, "POST", "/api/decisions?project=example", spend);
     expect(raised.status).toBe(201);
     const id = raised.body.data.decision.id as string;
-    expect(inbox.blockedOn("card:error-reports")?.id).toBe(id);
+    expect(raised.body.data.decision.raisedVia).toBe("http");
 
     const decision = (await listDecisions()).find((d: Decision) => d.id === id)!;
     const body = answerBody(decision, { optionId: "pay", note: "Within budget." });
     expect(body).toEqual({ optionId: "pay", note: "Within budget.", confirm: true });
 
-    // Locked: the browser has no session yet
-    expect(await answerSession()).toEqual({ answering: false });
-    await expect(postAnswer(id, body)).rejects.toThrow("answering is not unlocked in this browser");
-    await expect(startAnswerSession("not-the-token-at-all-not-the-token-at-all")).rejects.toThrow(
-      "That is not the answer token",
-    );
+    // Not signed in yet
+    expect(await ownerStatus()).toEqual({ signedIn: false, session: null });
+    await expect(postAnswer(id, body)).rejects.toThrow("this browser is not signed in as the owner");
+    await expect(signIn("not-the-token-at-all-not-the-token-at-all")).rejects.toThrow("That is not the owner token");
+    expect(storedSession()).toBeNull();
 
-    // Unlocked with the token: the answer goes through and the producer resumes
-    expect(await startAnswerSession(answerToken)).toEqual({ answering: true });
-    expect(await answerSession()).toEqual({ answering: true });
+    // Signed in: the session sits in this origin's localStorage and goes in a header
+    await signIn(ownerToken);
+    expect(storedSession()).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(await ownerStatus()).toMatchObject({ signedIn: true });
     const answered = await postAnswer(id, body);
     expect(answered).toMatchObject({ status: "answered", answeredBy: "owner", answer: { optionId: "pay" } });
     expect(resumed.map((r) => [r.decision.id, r.optionId, r.note])).toEqual([[id, "pay", "Within budget."]]);
     expect(inbox.blockedOn("card:error-reports")).toBeNull();
-  });
+    expect(seen.every((r) => r.headers["set-cookie"] === undefined)).toBe(true);
 
-  it("creates the answer token once (mode 0600) and prints the setup link only then", async () => {
-    const firstLog: string[] = [];
-    const { tokenPath, answerToken } = await boot({ log: firstLog });
-    expect(statSync(tokenPath).mode & 0o777).toBe(0o600);
-    expect(answerToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
-    expect(firstLog.join("\n")).toContain(`http://127.0.0.1:4777/#answer-token=${answerToken}`);
-
-    await manager!.stop();
-    await app!.close();
-    const secondLog: string[] = [];
-    const again = await boot({ log: secondLog });
-    expect(again.answerToken).toBe(answerToken);
-    expect(secondLog.join("\n")).not.toContain(answerToken);
-    expect(secondLog.join("\n")).toContain(tokenPath);
+    // Signed-in browsers, and signing this one out
+    const sessions = await listOwnerSessions();
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]).toMatchObject({ current: true });
+    await revokeOwnerSession(sessions[0].id);
+    expect(storedSession()).toBeNull();
+    const again = await call(port, "POST", "/api/decisions?project=example", { ...spend, key: "again" });
+    await expect(postAnswer(again.body.data.decision.id, body)).rejects.toThrow("not signed in as the owner");
   });
 
   it("refuses cross-site browser requests on the mounted routes", async () => {
@@ -326,18 +349,13 @@ describe("mountDecisions (the server's wiring)", () => {
   });
 });
 
-describe("mount helpers", () => {
-  it("builds the dashboard URL for a bind address", () => {
-    expect(dashboardUrlFor("127.0.0.1", 4777)).toBe("http://127.0.0.1:4777");
-    expect(dashboardUrlFor("0.0.0.0", 4777)).toBe("http://localhost:4777");
-    expect(dashboardUrlFor("::", 4777)).toBe("http://localhost:4777");
-    expect(dashboardUrlFor("::1", 4777)).toBe("http://[::1]:4777");
-  });
-
-  it("reads LAIR_DECISIONS_MAX_OPEN as a positive whole number", () => {
+describe("mount settings", () => {
+  it("reads the open-decision caps from the environment as positive whole numbers", () => {
     expect(maxOpenFromEnv({})).toBeUndefined();
     expect(maxOpenFromEnv({ LAIR_DECISIONS_MAX_OPEN: "20" })).toBe(20);
     expect(maxOpenFromEnv({ LAIR_DECISIONS_MAX_OPEN: "0" })).toBeUndefined();
     expect(maxOpenFromEnv({ LAIR_DECISIONS_MAX_OPEN: "lots" })).toBeUndefined();
+    expect(maxOpenHttpFromEnv({ LAIR_DECISIONS_MAX_OPEN_HTTP: "5" })).toBe(5);
+    expect(maxOpenHttpFromEnv({ LAIR_DECISIONS_MAX_OPEN_HTTP: "-1" })).toBeUndefined();
   });
 });

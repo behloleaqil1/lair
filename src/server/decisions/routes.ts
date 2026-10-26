@@ -4,30 +4,32 @@
  *   GET  /api/decisions?project=&status=open|answered|expired|withdrawn|closed|all&limit=
  *        open first by urgency; without ?project=, every project's decisions
  *   GET  /api/decisions/summary?project=      {open, overdue, secretStore}, for the nav badge
- *   GET  /api/decisions/session               {answering}: is answering unlocked in this browser?
- *   POST /api/decisions/session               {token}: unlock answering (sets the session cookie)
  *   GET  /api/decisions/:id                    one decision with its audit trail
  *   POST /api/decisions?project=               raise (the body is a RaiseDecisionInput without project;
  *                                              the project is ?project=, else the default project)
- *   POST /api/decisions/:id/answer             {optionId, note?, confirm?, secret?}
+ *   POST /api/decisions/:id/answer             {optionId, note?, confirm?, secret?}, owner only
  *
- * Answering is for the human in the Decisions view only: POST
- * /api/decisions/session and /answer need a same-origin browser request
- * from the dashboard, and /answer also the answer session cookie (see
- * answer-auth.ts). Anything else gets 403 and the decision stays open.
+ * Answering is for the owner in the Decisions view only: the request must
+ * carry a live owner session in X-Lair-Owner-Session, from the dashboard's
+ * origin, as a same-origin browser request (src/server/human-auth/). The
+ * check is a route onRequest hook, so anything else gets 403 before its body
+ * is read, and the decision stays open. Signing in, listing and signing out
+ * browsers are /api/owner/* (human-auth/routes.ts).
+ *
  * There is no HTTP withdraw: HTTP callers have no identity yet, so only
- * producers inside the server withdraw (DecisionProducer.withdraw).
+ * producers inside the server withdraw (DecisionProducer.withdraw). HTTP
+ * raises share one cap per project (raiseFromHttp).
  *
  * Every route also passes the cross-site guard; `?project=` is validated by
  * the root guards (src/server/root-guards.ts), and `:id` must be a decision
  * id (400). Expiry belongs to the inbox's sweep, not to reads. No response or
- * error carries a secret value.
+ * error carries a secret value, and no CORS is granted (human-auth/cors.ts).
  */
-import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
+import type { HumanAuth } from "../human-auth/index.js";
 import { rejectCrossSiteRequests } from "../origin.js";
 import { requireValidIdParam } from "../root-guards.js";
-import { dashboardRequestProblem, type AnswerCredential } from "./answer-auth.js";
 import type { DecisionInbox } from "./service.js";
 import type { AnswerInput, RaiseDecisionInput } from "./types.js";
 import { DecisionError, isDecisionId } from "./validate.js";
@@ -51,32 +53,24 @@ const ListQuery = z.object({
   limit: z.coerce.number().int().min(1).max(500).default(100),
 });
 const ProjectQuery = z.object({ project: z.string().optional() });
-const SessionBody = z.object({ token: z.string().min(1).max(200) }).strict();
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-const NOT_UNLOCKED =
-  "Answering is only possible from the Decisions view with answering unlocked " +
-  "(the token in data/decisions.answer-token)";
-
 export async function registerDecisionRoutes(
   fastify: FastifyInstance,
   inbox: DecisionInbox,
   defaultProject: () => string,
-  credential: AnswerCredential,
+  auth: HumanAuth,
 ): Promise<void> {
   // Encapsulated so the cross-site guard applies to these routes too
   await fastify.register(async (app) => {
     app.addHook("onRequest", rejectCrossSiteRequests);
     const idGuard = requireValidIdParam(isDecisionId, "decision");
-
-    /** Only the dashboard, in a browser, with the answer session. */
-    const answerGuard = async (request: FastifyRequest, reply: FastifyReply) => {
-      const problem = credential.answerProblem(request.headers);
-      if (problem) return fail(reply, 403, `${NOT_UNLOCKED}: ${problem}`);
-    };
+    const ownerOnly = auth.requireOwner(
+      "Only you answer decisions, from the Decisions view in a browser signed in as the owner",
+    );
 
     app.get("/api/decisions", async (request, reply) => {
       const query = ListQuery.safeParse(request.query ?? {});
@@ -98,22 +92,6 @@ export async function registerDecisionRoutes(
       }
     });
 
-    app.get("/api/decisions/session", async (request) => {
-      const cookie = typeof request.headers.cookie === "string" ? request.headers.cookie : undefined;
-      return respond({ answering: credential.hasSession(cookie) });
-    });
-
-    app.post("/api/decisions/session", async (request, reply) => {
-      const problem = dashboardRequestProblem(request.headers);
-      if (problem) return fail(reply, 403, `Answering can only be unlocked from the Decisions view: ${problem}`);
-      const body = SessionBody.safeParse(request.body ?? {});
-      if (!body.success || !credential.matchesToken(body.data.token)) {
-        return fail(reply, 403, "That is not the answer token in data/decisions.answer-token");
-      }
-      reply.header("set-cookie", credential.sessionCookie());
-      return respond({ answering: true });
-    });
-
     app.get<{ Params: { id: string } }>("/api/decisions/:id", { preHandler: idGuard }, async (request, reply) => {
       try {
         const decision = inbox.get(request.params.id);
@@ -133,7 +111,7 @@ export async function registerDecisionRoutes(
       }
       try {
         const project = query.data.project ?? defaultProject();
-        const result = await inbox.raise({ ...body, project } as unknown as RaiseDecisionInput);
+        const result = await inbox.raiseFromHttp({ ...body, project } as unknown as RaiseDecisionInput);
         return reply.code(result.created ? 201 : 200).send(respond(result));
       } catch (e) {
         return failWith(reply, e);
@@ -142,7 +120,7 @@ export async function registerDecisionRoutes(
 
     app.post<{ Params: { id: string } }>(
       "/api/decisions/:id/answer",
-      { preHandler: [answerGuard, idGuard] },
+      { onRequest: ownerOnly, preHandler: idGuard },
       async (request, reply) => {
         try {
           const userAgent = request.headers["user-agent"];

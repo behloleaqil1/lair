@@ -24,7 +24,8 @@ import type {
 } from "../../shared/decision-types.js";
 import type { ValidRaise } from "./validate.js";
 
-const SCHEMA_VERSION = 1;
+// 2: decisions.raised_via (server | http), for the per-project cap on HTTP callers
+const SCHEMA_VERSION = 2;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS decisions (
@@ -54,7 +55,8 @@ const SCHEMA = `
     withdrawn_reason TEXT,
     closed_at TEXT,
     delivered_at TEXT,
-    delivery_error TEXT
+    delivery_error TEXT,
+    raised_via TEXT NOT NULL DEFAULT 'server'
   );
   CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_open_key
     ON decisions(project, source_module, dedupe_key) WHERE status = 'open';
@@ -106,6 +108,7 @@ interface DecisionRow {
   closed_at: string | null;
   delivered_at: string | null;
   delivery_error: string | null;
+  raised_via: string;
 }
 
 /** Open first, by urgency (soonest expiry, then oldest); then the rest, newest first. */
@@ -125,8 +128,22 @@ export interface ListOptions {
 
 export type RaiseOutcome =
   | { kind: "created" | "existing"; decision: Decision; addedBlocks: string[] }
-  /** The module already has the maximum number of open decisions in the project */
-  | { kind: "capped"; open: number };
+  /**
+   * module: the module already has the maximum open in the project; http:
+   * HTTP callers together already have the maximum open in the project
+   */
+  | { kind: "capped"; by: "module" | "http"; open: number; limit: number };
+
+/** Where a decision was raised: by a module inside the server, or over HTTP (any caller). */
+export type RaisedVia = "server" | "http";
+
+export interface RaiseLimits {
+  via: RaisedVia;
+  /** Open decisions per project and module */
+  maxOpenPerSource?: number;
+  /** Open decisions raised over HTTP per project, whatever module they name */
+  maxOpenHttpPerProject?: number;
+}
 
 export interface Closing {
   status: Exclude<DecisionStatus, "open">;
@@ -155,8 +172,12 @@ export class DecisionStore {
     }
     const version = this.db.pragma("user_version", { simple: true }) as number;
     if (version < SCHEMA_VERSION) {
-      this.db.exec(SCHEMA);
-      this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+      this.db.transaction(() => {
+        // Version 1 files lack raised_via; their decisions were raised in the server or over HTTP alike
+        if (version === 1) this.db.exec(`ALTER TABLE decisions ADD COLUMN raised_via TEXT NOT NULL DEFAULT 'server'`);
+        this.db.exec(SCHEMA);
+        this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+      })();
     }
   }
 
@@ -167,10 +188,13 @@ export class DecisionStore {
   /**
    * Insert a decision, or return the open one with the same project, module
    * and key (merging in any new blocked refs). A new one is refused
-   * ("capped") while the module already has `maxOpen` open decisions in the
-   * project. Atomic.
+   * ("capped") while the module already has maxOpenPerSource open in the
+   * project, or, raised over HTTP, while HTTP callers already have
+   * maxOpenHttpPerProject open there (the module name is the caller's word,
+   * so it can't be what bounds them). Atomic.
    */
-  raise(input: ValidRaise, at: string, maxOpen = Number.POSITIVE_INFINITY): RaiseOutcome {
+  raise(input: ValidRaise, at: string, limits: RaiseLimits = { via: "server" }): RaiseOutcome {
+    const maxOpen = limits.maxOpenPerSource ?? Number.POSITIVE_INFINITY;
     return this.db.transaction((): RaiseOutcome => {
       const existing = this.db
         .prepare(
@@ -186,15 +210,23 @@ export class DecisionStore {
       const { open } = this.db
         .prepare(`SELECT COUNT(*) AS open FROM decisions WHERE project = ? AND source_module = ? AND status = 'open'`)
         .get(input.project, input.source.module) as { open: number };
-      if (open >= maxOpen) return { kind: "capped", open };
+      if (open >= maxOpen) return { kind: "capped", by: "module", open, limit: maxOpen };
+      if (limits.via === "http" && limits.maxOpenHttpPerProject !== undefined) {
+        const { open: viaHttp } = this.db
+          .prepare(`SELECT COUNT(*) AS open FROM decisions WHERE project = ? AND raised_via = 'http' AND status = 'open'`)
+          .get(input.project) as { open: number };
+        if (viaHttp >= limits.maxOpenHttpPerProject) {
+          return { kind: "capped", by: "http", open: viaHttp, limit: limits.maxOpenHttpPerProject };
+        }
+      }
       const id = randomUUID();
       this.db
         .prepare(
           `INSERT INTO decisions
              (id, project, kind, title, context, options, recommended_option, recommended_reasoning,
               source_module, source_ref, dedupe_key, links, secret_name, default_option,
-              created_at, expires_at, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')`,
+              created_at, expires_at, status, raised_via)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)`,
         )
         .run(
           id,
@@ -213,6 +245,7 @@ export class DecisionStore {
           input.defaultOptionId ?? null,
           at,
           input.expiresAt ?? null,
+          limits.via,
         );
       this.addBlocks(id, input.blocks);
       return { kind: "created", decision: this.get(id)!, addedBlocks: input.blocks };
@@ -427,6 +460,7 @@ export class DecisionStore {
       withdrawnReason: row.withdrawn_reason ?? undefined,
       closedAt: row.closed_at ?? undefined,
       deliveredAt: row.delivered_at ?? undefined,
+      raisedVia: row.raised_via === "http" ? "http" : "server",
     };
   }
 }

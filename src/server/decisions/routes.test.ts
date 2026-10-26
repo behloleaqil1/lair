@@ -1,8 +1,8 @@
 /**
  * The Decision Inbox routes behind the root guards, as in src/server/index.ts:
- * answering only from the dashboard with the answer session, validated ids
- * and queries, origin checks, confirmation for spend, the open-decision cap,
- * and no secret in any response.
+ * answering only with an owner session in its header, from the dashboard
+ * (never a cookie); validated ids and queries, origin checks, confirmation
+ * for spend, the open-decision caps, and no secret in any response.
  */
 import { afterEach, describe, expect, it } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
@@ -10,7 +10,7 @@ import { mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { registerRootGuards } from "../root-guards.js";
-import { AnswerCredential } from "./answer-auth.js";
+import { HumanAuth, OWNER_SESSION_HEADER, registerOwnerRoutes } from "../human-auth/index.js";
 import { registerDecisionRoutes } from "./routes.js";
 import { DecisionInbox } from "./service.js";
 import { DecisionStore } from "./store.js";
@@ -36,29 +36,29 @@ afterEach(async () => {
   dir = null;
 });
 
-async function build(options: { maxOpenPerSource?: number } = {}) {
+async function build(options: { maxOpenPerSource?: number; maxOpenHttpPerProject?: number } = {}) {
   dir = mkdtempSync(join(tmpdir(), "lair-decision-routes-"));
-  const tokenPath = join(dir, "decisions.answer-token");
-  const credential = AnswerCredential.loadOrCreate(tokenPath);
+  const tokenPath = join(dir, "owner.token");
+  const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
   store = new DecisionStore(":memory:");
   const clock = { t: NOW, now: (): number => clock.t };
   const secrets = new MemorySecretStore();
-  const inbox = new DecisionInbox({ store, secrets, clock, maxOpenPerSource: options.maxOpenPerSource });
+  const inbox = new DecisionInbox({ store, secrets, clock, ...options });
   app = Fastify();
   registerRootGuards(app);
-  await registerDecisionRoutes(app, inbox, () => "example", credential);
+  await registerOwnerRoutes(app, auth);
+  await registerDecisionRoutes(app, inbox, () => "example", auth);
   await app.ready();
   const answerToken = readFileSync(tokenPath, "utf-8").trim();
-  return { app, inbox, clock, secrets, answerToken };
+  return { app, inbox, clock, secrets, auth, answerToken };
 }
 
-/** Unlock answering the way the Decisions view does; returns the browser's headers with the session cookie. */
+/** Sign in the way the Decisions view does; returns the browser's headers with its owner session. */
 async function unlock(a: FastifyInstance, answerToken: string): Promise<Record<string, string>> {
-  const res = await a.inject({ method: "POST", url: "/api/decisions/session", payload: { token: answerToken }, headers: DASHBOARD });
-  expect(res.statusCode).toBe(200);
-  const setCookie = res.headers["set-cookie"];
-  const cookie = String(Array.isArray(setCookie) ? setCookie[0] : setCookie).split(";")[0];
-  return { ...DASHBOARD, cookie };
+  const res = await a.inject({ method: "POST", url: "/api/owner/sessions", payload: { token: answerToken }, headers: DASHBOARD });
+  expect(res.statusCode).toBe(201);
+  expect(res.headers["set-cookie"]).toBeUndefined();
+  return { ...DASHBOARD, [OWNER_SESSION_HEADER]: res.json().data.session as string };
 }
 
 const budget = {
@@ -94,59 +94,66 @@ function post(a: FastifyInstance, url: string, payload: unknown, headers: Record
 }
 
 describe("answering is for the owner in the Decisions view only", () => {
-  it("refuses an answer without the session cookie, without an Origin, or with a forged Sec-Fetch-Site (403, still open)", async () => {
+  it("refuses an answer that is cookie-only, from another origin, without an Origin, or with a forged Sec-Fetch-Site (403, still open)", async () => {
     const { app, inbox, answerToken } = await build();
     const id = (await post(app, "/api/decisions", { ...budget, kind: "other" })).json().data.decision.id;
     const browser = await unlock(app, answerToken);
+    const session = browser[OWNER_SESSION_HEADER];
     const answer = { optionId: "approve" };
-
-    // A local process: no Origin, no cookie (curl, a script, an agent)
-    const bare = await post(app, `/api/decisions/${id}/answer`, answer);
-    expect(bare.statusCode).toBe(403);
-    expect(bare.json().error).toContain("no Origin header");
-    // The dashboard's headers, forged, but no session cookie
-    const forged = await post(app, `/api/decisions/${id}/answer`, answer, DASHBOARD);
-    expect(forged.statusCode).toBe(403);
-    expect(forged.json().error).toContain("answering is not unlocked in this browser");
-    // The cookie without a browser Origin
-    const noOrigin = await post(app, `/api/decisions/${id}/answer`, answer, { cookie: browser.cookie });
-    expect(noOrigin.statusCode).toBe(403);
-    // The cookie and Origin, but not a same-origin fetch
-    const crossSite = await post(app, `/api/decisions/${id}/answer`, answer, { ...browser, "sec-fetch-site": "none" });
-    expect(crossSite.statusCode).toBe(403);
-    // A wrong cookie
-    const wrong = await post(app, `/api/decisions/${id}/answer`, answer, { ...DASHBOARD, cookie: "lair_decisions=guess" });
-    expect(wrong.statusCode).toBe(403);
-
+    const tries = {
+      // A local process: no Origin, no session (curl, a script, an agent)
+      bare: {},
+      // The session as a cookie (what another local listener could get from a port-blind cookie)
+      cookieOnly: { ...DASHBOARD, cookie: `lair_owner_session=${session}; ${OWNER_SESSION_HEADER}=${session}` },
+      // The dashboard's headers, forged, without a session
+      forged: DASHBOARD,
+      // The session from another local origin (the app under test, a dev server)
+      otherOrigin: { ...browser, origin: "http://localhost:3000" },
+      otherPort: { ...browser, origin: "http://localhost:9999" },
+      // The session without a browser Origin
+      noOrigin: { [OWNER_SESSION_HEADER]: session },
+      // A cross-site browser request
+      crossSite: { ...browser, "sec-fetch-site": "cross-site" },
+      // A guessed session
+      guessed: { ...DASHBOARD, [OWNER_SESSION_HEADER]: "g".repeat(43) },
+    };
+    for (const [name, headers] of Object.entries(tries)) {
+      const res = await post(app, `/api/decisions/${id}/answer`, answer, headers as Record<string, string>);
+      expect([name, res.statusCode]).toEqual([name, 403]);
+      expect(res.headers["set-cookie"]).toBeUndefined();
+    }
     expect(inbox.get(id)).toMatchObject({ status: "open" });
     expect(inbox.get(id)?.audit?.map((a) => a.action)).toEqual(["raised"]);
 
     const ok = await post(app, `/api/decisions/${id}/answer`, answer, { ...browser, "user-agent": "ExampleBrowser/1.0" });
     expect(ok.statusCode).toBe(200);
+    expect(ok.headers["set-cookie"]).toBeUndefined();
     expect(ok.json().data).toMatchObject({ status: "answered", answeredBy: "owner" });
     expect(ok.json().data.audit[1].detail).toBe("chose approve (Approve); from 127.0.0.1 (ExampleBrowser/1.0)");
   });
 
-  it("unlocks only with the token, from the dashboard, with an httpOnly SameSite=Strict cookie", async () => {
-    const { app, answerToken } = await build();
-    expect((await app.inject({ url: "/api/decisions/session" })).json().data).toEqual({ answering: false });
+  it("refuses a revoked session", async () => {
+    const { app, inbox, auth, answerToken } = await build();
+    const id = (await post(app, "/api/decisions", { ...budget, kind: "other" })).json().data.decision.id;
+    const browser = await unlock(app, answerToken);
+    const [session] = auth.listSessions();
+    const signOut = await post(app, `/api/owner/sessions/${session.id}/revoke`, undefined, browser);
+    expect(signOut.statusCode).toBe(200);
+    const res = await post(app, `/api/decisions/${id}/answer`, { optionId: "approve" }, browser);
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error).toContain("not valid");
+    expect(inbox.get(id)?.status).toBe("open");
+  });
 
-    const noBrowser = await post(app, "/api/decisions/session", { token: answerToken });
-    expect(noBrowser.statusCode).toBe(403);
-    expect(noBrowser.headers["set-cookie"]).toBeUndefined();
-    const wrongToken = await post(app, "/api/decisions/session", { token: "x".repeat(43) }, DASHBOARD);
-    expect(wrongToken.statusCode).toBe(403);
-    expect(wrongToken.headers["set-cookie"]).toBeUndefined();
-
-    const res = await post(app, "/api/decisions/session", { token: answerToken }, DASHBOARD);
-    expect(res.statusCode).toBe(200);
-    const setCookie = String(res.headers["set-cookie"]);
-    expect(setCookie).toMatch(/^lair_decisions=[A-Za-z0-9_-]+; HttpOnly; SameSite=Strict; Path=\/api\/decisions; Max-Age=\d+$/);
-    expect(setCookie).not.toContain(answerToken);
-    const cookie = setCookie.split(";")[0];
-    expect((await app.inject({ url: "/api/decisions/session", headers: { cookie } })).json().data).toEqual({
-      answering: true,
+  it("refuses an answer before reading its body", async () => {
+    const { app } = await build();
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/decisions/${UNKNOWN_ID}/answer`,
+      payload: "{not json",
+      headers: { ...DASHBOARD, "content-type": "application/json" },
     });
+    expect(res.statusCode).toBe(403);
   });
 
   it("takes no answerer from the request, and has no HTTP withdraw", async () => {
@@ -161,6 +168,37 @@ describe("answering is for the owner in the Decisions view only", () => {
     expect(inbox.get(id)?.status).toBe("open");
   });
 });
+
+describe("raising over HTTP", () => {
+  it("caps open HTTP-raised decisions per project, whatever module they name (429)", async () => {
+    const { app, inbox } = await build({ maxOpenHttpPerProject: 2 });
+    const as = (module: string, key: string) => ({ ...budget, key, source: { module, ref: "r" } });
+    expect((await post(app, "/api/decisions", as("one", "a"))).statusCode).toBe(201);
+    expect((await post(app, "/api/decisions", as("two", "b"))).statusCode).toBe(201);
+    const capped = await post(app, "/api/decisions", as("three", "c"));
+    expect(capped.statusCode).toBe(429);
+    expect(capped.json().error).toBe(
+      "HTTP callers already have 2 open decisions in example (the limit is 2): wait for answers or withdraw some first",
+    );
+    // An open key is still answered with its decision; producers inside the server don't count
+    expect((await post(app, "/api/decisions", as("one", "a"))).statusCode).toBe(200);
+    expect((await inbox.raise({ ...as("watchdog", "inside"), project: "example" } as never)).created).toBe(true);
+    expect(inbox.list({ status: "open" }).map((d) => d.raisedVia).sort()).toEqual(["http", "http", "server"]);
+  });
+
+  it("refuses links to this machine or a private network", async () => {
+    const { app } = await build();
+    const res = await post(app, "/api/decisions", {
+      ...budget,
+      links: [{ label: "Plan", url: "http://localhost:9999/plan" }],
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toContain("links.0.url: must not point at this machine or a private network");
+    const ok = await post(app, "/api/decisions", { ...budget, links: [{ label: "Plan", url: "https://example.com/plan" }] });
+    expect(ok.statusCode).toBe(201);
+  });
+});
+
 
 describe("decision routes", () => {
   it("raise, list open first, detail with audit, answer; the producer resumes", async () => {

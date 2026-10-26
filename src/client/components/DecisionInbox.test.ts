@@ -32,6 +32,7 @@ function decision(overrides: Partial<Decision> = {}): Decision {
     expiresAt: "2026-03-02T11:30:00.000Z",
     overdue: true,
     status: "open",
+    raisedVia: "server",
     ...overrides,
   };
 }
@@ -68,9 +69,14 @@ describe("DecisionCardView", () => {
     expect(html).toContain("Approve the larger plan (recommended)");
     expect(html).toContain("Staging needs it to start.");
     expect(html).toContain("Overdue by 30 min");
-    expect(html).toContain('href="https://example.com/plans"');
-    expect(html).toContain('rel="noopener noreferrer"');
+    // Links are text to copy, never anchors (whoever raised the decision chose them)
+    expect(html).toContain("Plans: <code>https://example.com/plans</code>");
+    expect(html).toContain('data-links="text"');
+    expect(html).not.toContain("<a ");
+    expect(html).toContain(">Copy</button>");
     expect(html).not.toContain('type="password"');
+    expect(html).not.toContain('data-raised-via="http"');
+    expect(card({ decision: decision({ raisedVia: "http" }) })).toContain('data-raised-via="http"');
   });
 
   it("asks for confirmation before sending a spend answer", () => {
@@ -131,8 +137,8 @@ describe("DecisionInboxView", () => {
       );
     const locked = view(false);
     expect(locked).toContain('data-unlock="answering"');
-    expect(locked).toContain("data/decisions.answer-token");
-    expect(locked).toContain('name="answer-token"');
+    expect(locked).toContain("data/owner.token");
+    expect(locked).toContain('name="owner-token"');
     expect(locked).toContain("Unlock answering first");
     const unlocked = view(true);
     expect(unlocked).not.toContain('data-unlock="answering"');

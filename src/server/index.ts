@@ -12,7 +12,14 @@ import {
 import { DataService, isSafeGateId } from "./services/data.js";
 import { isValidDragonId } from "./parsers/dragon-config.js";
 import { registerRootGuards, requireValidIdParam } from "./root-guards.js";
-import { dashboardUrlFor, mountDecisions } from "./decisions/index.js";
+import { mountDecisions } from "./decisions/index.js";
+import {
+  HumanAuth,
+  OWNER_ONLY_PREFIXES,
+  corsOptionsWithout,
+  dashboardUrlFor,
+  registerOwnerRoutes,
+} from "./human-auth/index.js";
 import { registerControlRoutes } from "./routes/controls.js";
 import { registerBusRoutes } from "./routes/bus.js";
 import { registerProcessRoutes } from "./routes/processes.js";
@@ -43,10 +50,12 @@ const fastify = Fastify({
   logger: true,
 });
 
-// Enable CORS for the client
-await fastify.register(cors, {
-  origin: [`http://${HOST}:5173`, `http://localhost:5173`], // Vite dev server
-});
+// Enable CORS for the client (the Vite dev server), but never for the
+// owner-only routes (src/server/human-auth/cors.ts)
+await fastify.register(
+  cors,
+  corsOptionsWithout([`http://${HOST}:5173`, `http://localhost:5173`], OWNER_ONLY_PREFIXES),
+);
 
 // Refuse cross-site browser requests and foreign Host headers (403) on every
 // route, and unsafe or unknown ?project= names on API routes (400)
@@ -359,14 +368,23 @@ const pipelines = new PipelineManager({
 pipelines.load(projectEntries);
 await registerPipelineRoutes(fastify, pipelines, () => getDefaultProject());
 
+// The owner's credential (src/server/human-auth/): the token in
+// data/owner.token and the browser sessions signed in with it. Routes only
+// the human may use (answering decisions) need one of those sessions. The
+// setup link is printed to this process's stdout at first start.
+const humanAuth = HumanAuth.open({
+  tokenPath: join(process.cwd(), "data", "owner.token"),
+  dbPath: join(process.cwd(), "data", "owner-sessions.db"),
+});
+humanAuth.announce(dashboardUrlFor(HOST, PORT));
+await registerOwnerRoutes(fastify, humanAuth);
+
 // Decision Inbox: the one place Lair asks the human (data/decisions.db). The
 // watchdog's escalations become decisions, and their answers resume it.
-// Answering needs the token in data/decisions.answer-token (a setup link is
-// printed at first start). Closed by fastify.close() in shutdown().
+// Closed by fastify.close() in shutdown().
 await mountDecisions(fastify, {
   dbPath: join(process.cwd(), "data", "decisions.db"),
-  answerTokenPath: join(process.cwd(), "data", "decisions.answer-token"),
-  dashboardUrl: dashboardUrlFor(HOST, PORT),
+  humanAuth,
   defaultProject: () => getDefaultProject(),
   events: getEventBus(),
   producers: [watchdogs],
