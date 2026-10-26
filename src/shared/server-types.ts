@@ -218,6 +218,7 @@ export type EventType =
   | "playbook.step.completed"
   | "escalation.created"
   | "decision.requested"
+  | "decision.answered"
   | "notification.sent"
   | "agent.restart.requested"
   | "branch.status"
