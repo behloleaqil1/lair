@@ -29,6 +29,7 @@ import { stopMachineManager } from "./fleet/machine-manager.js";
 import { registerClientStatic, resolveClientDir } from "./static.js";
 import { getEventBus } from "./core/event-bus.js";
 import { WatchdogManager, registerWatchdogRoutes } from "./watchdog/index.js";
+import { DeliveryManager, registerDeliveryRoutes } from "./delivery/index.js";
 import { join } from "path";
 import type { ApiResponse } from "../shared/types.js";
 
@@ -316,21 +317,33 @@ await registerSchedulerRoutes(fastify);
 // Register M3 fleet management routes
 await registerFleetRoutes(fastify);
 
+const projectEntries = listProjects().map((name) => {
+  try {
+    return { name, config: loadProjectConfig(name) };
+  } catch (e) {
+    return { name, error: e instanceof Error ? e.message : String(e) };
+  }
+});
+
+// Delivery: one per project with `delivery.enabled: true` (off by default).
+// Its environments are docker compose projects that the routes bring up and
+// down, and that it deploys to after a merge when `deploy.auto` is set.
+const delivery = new DeliveryManager({
+  dbPath: join(process.cwd(), "data", "delivery.db"),
+  events: getEventBus(),
+});
+delivery.load(projectEntries);
+await registerDeliveryRoutes(fastify, delivery, () => getDefaultProject());
+
 // Progress watchdog: one per project with `watchdog.enabled: true` (off by
-// default). Its routes are read-only and answer for every project.
+// default). Its routes are read-only and answer for every project. It reads
+// delivery's crash loops and holds (the crash_loop detector and act guard).
 const watchdogs = new WatchdogManager({
   dbPath: join(process.cwd(), "data", "watchdog.db"),
   events: getEventBus(),
+  services: delivery,
 });
-watchdogs.load(
-  listProjects().map((name) => {
-    try {
-      return { name, config: loadProjectConfig(name) };
-    } catch (e) {
-      return { name, error: e instanceof Error ? e.message : String(e) };
-    }
-  }),
-);
+watchdogs.load(projectEntries);
 await registerWatchdogRoutes(fastify, watchdogs, () => getDefaultProject());
 
 // Serve the built web UI (dist/client) with an SPA fallback, when it exists.
@@ -359,6 +372,10 @@ const shutdown = async (signal: string) => {
 
   // Stop watchdogs: wait for a tick in progress, then close their store
   await watchdogs.stop();
+
+  // Stop delivery (after the watchdogs, which read it): a wait in progress
+  // ends early and no further command starts; then close its store
+  await delivery.stop();
 
   // Stop healer
   stopHealer();
@@ -448,6 +465,14 @@ const start = async () => {
       watched.length > 0
         ? `[watchdog] Watching: ${watched.join(", ")}`
         : "[watchdog] Off (no project sets watchdog.enabled)",
+    );
+
+    // Start delivery
+    const delivering = delivery.start();
+    console.log(
+      delivering.length > 0
+        ? `[delivery] Environments of: ${delivering.join(", ")}`
+        : "[delivery] Off (no project sets delivery.enabled)",
     );
 
     // Start file watchers for all projects
