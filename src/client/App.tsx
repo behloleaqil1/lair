@@ -13,6 +13,7 @@ import { Inbox } from "./components/Inbox";
 import { Processes } from "./components/Processes";
 import { Nodes } from "./components/Nodes";
 import { Health } from "./components/Health";
+import { Delivery } from "./components/Delivery";
 import { CommandBar } from "./components/CommandBar";
 import { pickInitialProject } from "./initial-project";
 import type { CommandMode, ControlsStatus } from "../shared/types";
@@ -30,6 +31,7 @@ type View =
   | "processes"
   | "activity"
   | "health"
+  | "delivery"
   | "inbox";
 
 const VIEWS: { id: View; label: string }[] = [
@@ -43,6 +45,7 @@ const VIEWS: { id: View; label: string }[] = [
   { id: "processes", label: "Processes" },
   { id: "activity", label: "Activity" },
   { id: "health", label: "Health" },
+  { id: "delivery", label: "Delivery" },
   { id: "inbox", label: "Inbox" },
 ];
 
@@ -126,6 +129,8 @@ export function App() {
         return <Activity {...props} />;
       case "health":
         return <Health {...props} />;
+      case "delivery":
+        return <Delivery {...props} />;
       case "inbox":
         return <Inbox {...props} />;
     }
