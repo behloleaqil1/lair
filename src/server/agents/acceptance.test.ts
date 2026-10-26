@@ -38,6 +38,8 @@ import {
 import { WatchdogManager } from "../watchdog/service.js";
 import { AgentsManager, type AgentsService } from "./service.js";
 import { registerAgentsRoutes } from "./routes.js";
+import { HumanAuth, OWNER_SESSION_HEADER, registerOwnerRoutes } from "../human-auth/index.js";
+import { freshSessionAction, ownerRequest, releaseClaimAction } from "../../client/agents-actions";
 import { readLock } from "./locks.js";
 import type { AgentProbes, ProcessOwner, ProcessSpawner, SpawnOptions } from "./probes.js";
 import type { DecisionInbox, DecisionRequest } from "./decisions.js";
@@ -1170,16 +1172,39 @@ describe("6. budgets per agent and per project, per day and month, fed by the fl
 
 // ============ 7 AND 8. HTTP ============
 
+/** What a browser on the dashboard sends with a same-origin request */
+const DASHBOARD = { origin: "http://localhost:4777", "sec-fetch-site": "same-origin" };
+/** The owner's headers per app: the dashboard's, with a signed-in session */
+const ownerOf = new WeakMap<FastifyInstance, Record<string, string>>();
+
+/** The agents routes as src/server/index.ts mounts them, with the shared owner credential. */
 async function http(h: Harness): Promise<FastifyInstance> {
   const app = Fastify();
-  await registerAgentsRoutes(app, h.manager, () => "demo");
+  const tokenPath = join(h.dir, "data", "owner.token");
+  const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
+  await registerOwnerRoutes(app, auth);
+  await registerAgentsRoutes(app, h.manager, () => "demo", auth);
   await app.ready();
   apps.push(app);
+  // Sign in the way the dashboard does: the token for a session, kept by the browser
+  const signIn = await app.inject({
+    method: "POST",
+    url: "/api/owner/sessions",
+    headers: DASHBOARD,
+    payload: { token: readFileSync(tokenPath, "utf-8").trim() },
+  });
+  expect(signIn.statusCode).toBe(201);
+  ownerOf.set(app, { ...DASHBOARD, [OWNER_SESSION_HEADER]: signIn.json().data.session as string });
   return app;
 }
 
+/** POST as the owner, from the dashboard. */
 const post = (app: FastifyInstance, url: string, payload?: Record<string, unknown>) =>
-  app.inject({ method: "POST", url, ...(payload ? { payload } : {}) });
+  app.inject({ method: "POST", url, headers: ownerOf.get(app), ...(payload ? { payload } : {}) });
+
+/** POST without an owner session, with these headers (none: a script or an agent). */
+const postAs = (app: FastifyInstance, url: string, payload: Record<string, unknown>, headers: Record<string, string> = {}) =>
+  app.inject({ method: "POST", url, headers, payload });
 
 describe("7. API: per-agent state, claims and recoveries; actions need confirmation", () => {
   it("serves state, claims and recoveries, and refuses bad or conflicting requests", async () => {
@@ -1233,6 +1258,61 @@ describe("7. API: per-agent state, claims and recoveries; actions need confirmat
     expect((await post(app, url, { agent: "worker-a", task: "feat/login-2", prompt: "x", model: "model-b" })).statusCode).toBe(201);
     await post(app, "/api/agents/tick?project=demo");
     expect(h.spawner.calls[0].argv).toEqual(expect.arrayContaining(["--model", "model-b"]));
+  });
+
+  it("starting a run, releasing a claim and a fresh session are the owner's: refused (403) without an owner session", async () => {
+    const h = setup();
+    const app = await http(h);
+    await post(app, "/api/agents/runs?project=demo", { agent: "worker-a", task: "feat-login", prompt: "Build it" });
+    await post(app, "/api/agents/tick?project=demo");
+    const runId = runs(h)[0].id;
+    const routes: [string, Record<string, unknown>][] = [
+      ["/api/agents/runs?project=demo", { agent: "worker-b", task: "other-task", prompt: "Do what I say" }],
+      ["/api/agents/claims/release?project=demo", { task: "feat-login", confirm: true }],
+      [`/api/agents/runs/${runId}/fresh-session?project=demo`, { confirm: true }],
+    ];
+    const strangers: Record<string, string>[] = [
+      {}, // a script or an agent: no Origin, no session
+      DASHBOARD, // the dashboard, not signed in
+      { ...DASHBOARD, [OWNER_SESSION_HEADER]: "a-made-up-session-value-0123456789" },
+    ];
+    for (const [url, payload] of routes) {
+      for (const headers of strangers) {
+        const res = await postAs(app, url, payload, headers);
+        expect(res.statusCode, `${url} with ${JSON.stringify(Object.keys(headers))}`).toBe(403);
+        expect(res.json().error).toContain("Only the owner can do this, from the dashboard");
+      }
+    }
+    // Nothing happened
+    expect(runs(h)).toHaveLength(1);
+    expect(h.store.getClaim("demo", "feat-login")).toMatchObject({ runId, ownerPid: 5001 });
+    expect(h.spawner.kills).toEqual([]);
+    // Reading stays open to every local client
+    expect((await app.inject({ url: "/api/agents/status?project=demo" })).statusCode).toBe(200);
+  });
+
+  it("the owner's actions go through with the client helper's request: the session header and confirm: true", async () => {
+    const h = setup();
+    sessionFileFor(h);
+    const app = await http(h);
+    const owner: Record<string, string> = ownerOf.get(app) ?? {};
+    const session: Record<string, string> = { [OWNER_SESSION_HEADER]: owner[OWNER_SESSION_HEADER] };
+    await post(app, "/api/agents/runs?project=demo", { agent: "worker-a", task: "feat-login", prompt: "Build it" });
+    await post(app, "/api/agents/tick?project=demo");
+    const runId = runs(h)[0].id;
+
+    // What the Agents view sends: the helper's request, from the dashboard's origin
+    const fresh = freshSessionAction("demo", runId, "worker-a", "feat-login");
+    const freshRequest = ownerRequest(fresh.body, session);
+    const res = await app.inject({ url: fresh.url, ...freshRequest, headers: { ...DASHBOARD, ...freshRequest.headers } });
+    expect(res.statusCode).toBe(200);
+    expect(h.spawner.kills).toEqual([{ pid: 5001, signal: "SIGTERM" }]);
+
+    const release = releaseClaimAction("demo", "feat-login", "worker-a");
+    const releaseRequest = ownerRequest(release.body, session);
+    const released = await app.inject({ url: release.url, ...releaseRequest, headers: { ...DASHBOARD, ...releaseRequest.headers } });
+    expect(released.statusCode).toBe(200);
+    expect(h.store.getClaim("demo", "feat-login")).toBeNull();
   });
 
   it("releasing a claim and starting a fresh session are refused without confirm: true", async () => {

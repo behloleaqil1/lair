@@ -139,6 +139,12 @@ export function Agents({ project, refreshKey }: Props) {
         {s.readOnly && <span className="badge badge-neutral">read_only: nothing is started or stopped</span>}
         <span style={muted}>Last check: {time(s.lastTick?.at)}</span>
       </div>
+      {!s.readOnly && (
+        <p style={{ ...muted, marginBottom: "1rem" }}>
+          Releasing a claim and starting a fresh session are the owner&apos;s: this browser must be signed in as the
+          owner (from the Decisions view).
+        </p>
+      )}
 
       {s.lastError && <div className="error">Last check failed: {s.lastError}</div>}
       {s.errors.map((e) => (

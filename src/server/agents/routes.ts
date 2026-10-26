@@ -9,13 +9,20 @@
  *   POST /api/agents/runs/:id/fresh-session?project=  {confirm: true}
  *   POST /api/agents/tick?project=               check now
  *
- * The two actions that stop work need `confirm: true` (the Agents view asks
- * first). `?project=` is validated by the root guards
- * (src/server/root-guards.ts); without it the default project is used.
+ * Starting a run, releasing a claim and starting a fresh session are the
+ * owner's: they need an owner session (src/server/human-auth/, the
+ * X-Lair-Owner-Session header from the dashboard), so an agent, or any other
+ * local process, can't put a prompt into a task or stop a peer's run.
+ * /api/agents is in OWNER_ONLY_PREFIXES (no CORS). Modules that start runs do
+ * it in-process (AgentsManager.requestRun), not over HTTP. The two actions
+ * that stop work also need `confirm: true` (the Agents view asks first).
+ * `?project=` is validated by the root guards (src/server/root-guards.ts);
+ * without it the default project is used.
  */
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
 import { rejectCrossSiteRequests } from "../origin.js";
+import type { HumanAuth } from "../human-auth/index.js";
 import { AgentsError, isValidTaskId, type AgentsManager, type AgentsService } from "./service.js";
 
 function respond<T>(data: T) {
@@ -51,10 +58,13 @@ export async function registerAgentsRoutes(
   fastify: FastifyInstance,
   manager: AgentsManager,
   defaultProject: () => string,
+  auth: HumanAuth,
 ): Promise<void> {
   // Encapsulated so the cross-site guard applies to these routes too
   await fastify.register(async (app) => {
     app.addHook("onRequest", rejectCrossSiteRequests);
+    // Before the body is read: a refused request is never parsed
+    const ownerOnly = { onRequest: auth.requireOwner("Only the owner can do this, from the dashboard") };
 
     const projectOf = (query: { project?: string }) => query.project ?? defaultProject();
 
@@ -112,7 +122,7 @@ export async function registerAgentsRoutes(
       }
     });
 
-    app.post("/api/agents/runs", async (request, reply) => {
+    app.post("/api/agents/runs", ownerOnly, async (request, reply) => {
       const query = ProjectQuery.safeParse(request.query ?? {});
       if (!query.success) return fail(reply, 400, `Invalid query: ${query.error.issues[0].path.join(".")}`);
       const body = RunBody.safeParse(request.body ?? {});
@@ -131,7 +141,7 @@ export async function registerAgentsRoutes(
       }
     });
 
-    app.post("/api/agents/claims/release", async (request, reply) => {
+    app.post("/api/agents/claims/release", ownerOnly, async (request, reply) => {
       const query = ProjectQuery.safeParse(request.query ?? {});
       if (!query.success) return fail(reply, 400, `Invalid query: ${query.error.issues[0].path.join(".")}`);
       const body = ReleaseBody.safeParse(request.body ?? {});
@@ -146,7 +156,7 @@ export async function registerAgentsRoutes(
       }
     });
 
-    app.post<{ Params: { id: string } }>("/api/agents/runs/:id/fresh-session", async (request, reply) => {
+    app.post<{ Params: { id: string } }>("/api/agents/runs/:id/fresh-session", ownerOnly, async (request, reply) => {
       const query = ProjectQuery.safeParse(request.query ?? {});
       if (!query.success) return fail(reply, 400, `Invalid query: ${query.error.issues[0].path.join(".")}`);
       if (!RUN_ID.test(request.params.id)) return fail(reply, 400, "Invalid run id");

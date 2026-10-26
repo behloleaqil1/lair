@@ -3,7 +3,8 @@
  * once confirmed.
  */
 import { describe, expect, it } from "vitest";
-import { freshSessionAction, releaseClaimAction, runConfirmed } from "./agents-actions";
+import { freshSessionAction, ownerRequest, releaseClaimAction, runConfirmed } from "./agents-actions";
+import { OWNER_SESSION_HEADER } from "./owner-session";
 
 function recorder(response: { success: boolean; error?: string } = { success: true }) {
   const posts: { url: string; body: Record<string, unknown> }[] = [];
@@ -52,5 +53,15 @@ describe("agents view actions", () => {
         body: { confirm: true },
       },
     ]);
+  });
+
+  it("send the owner session header with the JSON body; without a signed-in browser there is none", () => {
+    expect(ownerRequest({ confirm: true }, { [OWNER_SESSION_HEADER]: "a-session-value" })).toEqual({
+      method: "POST",
+      headers: { "Content-Type": "application/json", [OWNER_SESSION_HEADER]: "a-session-value" },
+      body: '{"confirm":true}',
+    });
+    // No localStorage here: not signed in, so the server will answer 403
+    expect(ownerRequest({ confirm: true }).headers).toEqual({ "Content-Type": "application/json" });
   });
 });

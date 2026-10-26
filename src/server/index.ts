@@ -39,7 +39,6 @@ import { getEventBus } from "./core/event-bus.js";
 import { WatchdogManager, registerWatchdogRoutes } from "./watchdog/index.js";
 import { DeliveryManager, registerDeliveryRoutes } from "./delivery/index.js";
 import { PipelineManager, registerPipelineRoutes } from "./gates/index.js";
-
 import { AgentsManager, registerAgentsRoutes } from "./agents/index.js";
 import { getBudgetManager } from "./fleet/budget.js";
 import { ReviewManager, registerReviewRoutes } from "./review/index.js";
@@ -415,8 +414,9 @@ reviews.load(projectEntries);
 // Merges, human reviews, finding resolutions and hold releases need the owner's session
 await registerReviewRoutes(fastify, reviews, () => getDefaultProject(), humanAuth);
 
-// The agents routes
-await registerAgentsRoutes(fastify, agents, () => getDefaultProject());
+// The agents routes: starting a run, releasing a claim and a fresh session
+// need an owner session; modules start runs in-process (agents.requestRun)
+await registerAgentsRoutes(fastify, agents, () => getDefaultProject(), humanAuth);
 
 // Serve the built web UI (dist/client) with an SPA fallback, when it exists.
 // In development the UI comes from the Vite dev server on port 5173 instead.

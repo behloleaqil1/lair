@@ -19,7 +19,7 @@ import type { FastifyCorsOptions } from "@fastify/cors";
  * to add one. Prefer a module's whole prefix (e.g. /api/review) over single
  * routes, so a new owner-only route under it can't be forgotten here.
  */
-export const OWNER_ONLY_PREFIXES: readonly string[] = ["/api/owner", "/api/decisions", "/api/review"];
+export const OWNER_ONLY_PREFIXES: readonly string[] = ["/api/owner", "/api/decisions", "/api/review", "/api/agents"];
 
 export function isUnder(url: string, prefixes: readonly string[]): boolean {
   const path = url.split("?")[0];

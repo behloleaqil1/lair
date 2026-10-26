@@ -1,8 +1,10 @@
 /**
  * Agents view actions that stop work (release a claim, start a fresh
  * session). Each asks for confirmation first, and only a confirmed action is
- * sent, with `confirm: true` (the server refuses it without).
+ * sent, with `confirm: true` (the server refuses it without) and this
+ * browser's owner session (only the owner may take them).
  */
+import { ownerHeaders } from "./owner-session";
 
 export interface ConfirmableAction {
   /** The question the confirmation dialog asks */
@@ -52,12 +54,23 @@ export async function runConfirmed(
   }
 }
 
-/** POST JSON with fetch, returning the API envelope. */
+export interface ActionRequest {
+  method: "POST";
+  headers: Record<string, string>;
+  body: string;
+}
+
+/**
+ * The request for an owner-only agents route: JSON, with this browser's owner
+ * session (`ownerHeaders()`, src/client/owner-session.ts). Without one the
+ * server answers 403: sign in from the Decisions view first.
+ */
+export function ownerRequest(body: Record<string, unknown>, headers: Record<string, string> = ownerHeaders()): ActionRequest {
+  return { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) };
+}
+
+/** POST an owner-only request with fetch, returning the API envelope. */
 export async function postJson(url: string, body: Record<string, unknown>): Promise<{ success: boolean; error?: string }> {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const res = await fetch(url, ownerRequest(body));
   return (await res.json()) as { success: boolean; error?: string };
 }

@@ -2005,7 +2005,12 @@ export interface AgentsManagerOptions {
  * All projects' agents services. The store (data/agents.db) is opened only
  * when at least one project enables the module.
  */
-export class AgentsManager implements SupervisedAgents {
+/** How other modules start agent runs, in-process (AgentsManager has it). */
+export interface AgentRuns {
+  requestRun(project: string, input: RunRequest): Promise<AgentRunView>;
+}
+
+export class AgentsManager implements SupervisedAgents, AgentRuns {
   private services = new Map<string, AgentsService>();
   private problems = new Map<string, string[]>();
   private configs = new Map<string, ProjectConfig>();
@@ -2082,6 +2087,16 @@ export class AgentsManager implements SupervisedAgents {
 
   get(project: string): AgentsService | undefined {
     return this.services.get(project);
+  }
+
+  /**
+   * Start a run from another module (the scheduler, the planner): the
+   * in-process way, AgentRuns. Over HTTP only the owner may start runs.
+   */
+  requestRun(project: string, input: RunRequest): Promise<AgentRunView> {
+    const service = this.services.get(project);
+    if (!service) return Promise.reject(new AgentsError(404, `The agents module is off for ${project}`));
+    return service.requestRun(input);
   }
 
   getStore(): AgentsStore | null {
