@@ -1,437 +1,492 @@
 /**
- * Watchdog store - persistence for SLOs, breaches, and playbook runs
+ * Watchdog store: breaches, playbook runs, escalations, SLO status and the
+ * few samples detectors need across ticks (container restart counts, how long
+ * a condition has held). SQLite, so all of it survives a restart.
+ *
+ * Times are written from the watchdog's Clock, never SQLite's datetime(), so
+ * tests with a fake clock get exact values.
  */
-import type Database from "better-sqlite3";
+import Database from "better-sqlite3";
+import { existsSync, mkdirSync } from "fs";
+import { dirname } from "path";
+import { randomUUID } from "crypto";
 import type {
-  SLODefinition,
-  SLOState,
-  SLOBreach,
+  Breach,
+  BreachResolution,
+  BreachStatus,
+  DetectorId,
+  Escalation,
+  Finding,
+  PlaybookId,
   PlaybookRun,
-  PlaybookRunStatus,
+  RunMode,
+  RunOutcome,
+  RunStatus,
+  SloState,
+  SloStatus,
+  StepResult,
 } from "./types.js";
 
-/** Database row type for SLO definitions */
-interface SLODefinitionRow {
-  id: string;
-  name: string;
-  description: string;
-  project_id: string | null;
-  enabled: number;
-  threshold: number;
-  unit: string;
-  type: string;
-  condition: string | null;
-  created_at: string;
-  updated_at: string;
-}
+const SCHEMA_VERSION = 1;
 
-/** Database row type for SLO states */
-interface SLOStateRow {
-  slo_id: string;
-  status: string;
-  current_value: number;
-  threshold: number;
-  state_changed_at: string;
+const SCHEMA = `
+  CREATE TABLE IF NOT EXISTS watchdog_breaches (
+    id TEXT PRIMARY KEY,
+    project TEXT NOT NULL,
+    detector TEXT NOT NULL,
+    key TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    vars TEXT NOT NULL,
+    status TEXT NOT NULL,
+    detected_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolution TEXT,
+    escalated_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_wd_breaches_project ON watchdog_breaches(project, status);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_wd_breaches_open_key
+    ON watchdog_breaches(project, key) WHERE status = 'open';
+
+  CREATE TABLE IF NOT EXISTS watchdog_runs (
+    id TEXT PRIMARY KEY,
+    project TEXT NOT NULL,
+    breach_id TEXT NOT NULL REFERENCES watchdog_breaches(id),
+    playbook_id TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    status TEXT NOT NULL,
+    outcome TEXT,
+    attempt INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    steps TEXT NOT NULL,
+    error TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_wd_runs_breach ON watchdog_runs(breach_id);
+  CREATE INDEX IF NOT EXISTS idx_wd_runs_project ON watchdog_runs(project, started_at);
+
+  CREATE TABLE IF NOT EXISTS watchdog_escalations (
+    id TEXT PRIMARY KEY,
+    project TEXT NOT NULL,
+    breach_id TEXT NOT NULL UNIQUE REFERENCES watchdog_breaches(id),
+    created_at TEXT NOT NULL,
+    file TEXT,
+    text TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS watchdog_container_samples (
+    project TEXT NOT NULL,
+    container TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    restart_count INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_wd_samples ON watchdog_container_samples(project, container, at);
+
+  CREATE TABLE IF NOT EXISTS watchdog_conditions (
+    project TEXT NOT NULL,
+    key TEXT NOT NULL,
+    since INTEGER NOT NULL,
+    PRIMARY KEY (project, key)
+  );
+
+  CREATE TABLE IF NOT EXISTS watchdog_slo_status (
+    project TEXT NOT NULL,
+    detector TEXT NOT NULL,
+    state TEXT NOT NULL,
+    open_breaches INTEGER NOT NULL,
+    detail TEXT NOT NULL,
+    checked_at TEXT NOT NULL,
+    PRIMARY KEY (project, detector)
+  );
+`;
+
+interface BreachRow {
+  id: string;
+  project: string;
+  detector: string;
+  key: string;
+  summary: string;
   evidence: string;
-  last_checked_at: string;
-}
-
-/** Database row type for breaches */
-interface SLOBreachRow {
-  id: string;
-  slo_id: string;
+  vars: string;
+  status: string;
   detected_at: string;
-  evidence: string;
-  value: number;
-  threshold: number;
-  playbook_runs: string;
-  resolved: number;
+  last_seen_at: string;
   resolved_at: string | null;
+  resolution: string | null;
+  escalated_at: string | null;
 }
 
-/** Database row type for playbook runs */
-interface PlaybookRunRow {
+interface RunRow {
   id: string;
-  playbook_id: string;
+  project: string;
   breach_id: string;
+  playbook_id: string;
+  mode: string;
   status: string;
+  outcome: string | null;
   attempt: number;
   started_at: string;
   completed_at: string | null;
-  step_results: string;
-  diagnosis: string | null;
+  steps: string;
   error: string | null;
 }
 
-/**
- * SQL for creating watchdog tables
- */
-export const WATCHDOG_SCHEMA = `
-  -- SLO definitions
-  CREATE TABLE IF NOT EXISTS slo_definitions (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    description TEXT NOT NULL,
-    project_id TEXT,
-    enabled INTEGER NOT NULL DEFAULT 1,
-    threshold REAL NOT NULL,
-    unit TEXT NOT NULL,
-    type TEXT NOT NULL,
-    condition TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-  );
+interface EscalationRow {
+  id: string;
+  project: string;
+  breach_id: string;
+  created_at: string;
+  file: string | null;
+  text: string;
+}
 
-  -- SLO current state
-  CREATE TABLE IF NOT EXISTS slo_states (
-    slo_id TEXT PRIMARY KEY REFERENCES slo_definitions(id),
-    status TEXT NOT NULL DEFAULT 'healthy',
-    current_value REAL NOT NULL DEFAULT 0,
-    threshold REAL NOT NULL,
-    state_changed_at TEXT NOT NULL DEFAULT (datetime('now')),
-    evidence TEXT NOT NULL DEFAULT '[]',
-    last_checked_at TEXT NOT NULL DEFAULT (datetime('now'))
-  );
+interface SloRow {
+  project: string;
+  detector: string;
+  state: string;
+  open_breaches: number;
+  detail: string;
+  checked_at: string;
+}
 
-  -- SLO breaches
-  CREATE TABLE IF NOT EXISTS slo_breaches (
-    id TEXT PRIMARY KEY,
-    slo_id TEXT NOT NULL REFERENCES slo_definitions(id),
-    detected_at TEXT NOT NULL DEFAULT (datetime('now')),
-    evidence TEXT NOT NULL DEFAULT '[]',
-    value REAL NOT NULL,
-    threshold REAL NOT NULL,
-    playbook_runs TEXT NOT NULL DEFAULT '[]',
-    resolved INTEGER NOT NULL DEFAULT 0,
-    resolved_at TEXT
-  );
-  CREATE INDEX IF NOT EXISTS idx_breaches_slo ON slo_breaches(slo_id);
-  CREATE INDEX IF NOT EXISTS idx_breaches_resolved ON slo_breaches(resolved);
-
-  -- Playbook runs
-  CREATE TABLE IF NOT EXISTS playbook_runs (
-    id TEXT PRIMARY KEY,
-    playbook_id TEXT NOT NULL,
-    breach_id TEXT NOT NULL REFERENCES slo_breaches(id),
-    status TEXT NOT NULL DEFAULT 'pending',
-    attempt INTEGER NOT NULL DEFAULT 1,
-    started_at TEXT NOT NULL DEFAULT (datetime('now')),
-    completed_at TEXT,
-    step_results TEXT NOT NULL DEFAULT '[]',
-    diagnosis TEXT,
-    error TEXT
-  );
-  CREATE INDEX IF NOT EXISTS idx_runs_breach ON playbook_runs(breach_id);
-  CREATE INDEX IF NOT EXISTS idx_runs_status ON playbook_runs(status);
-`;
-
-/**
- * Watchdog store operations
- */
 export class WatchdogStore {
-  constructor(private db: Database.Database) {}
+  private db: Database.Database;
 
-  /**
-   * Initialize schema
-   */
-  initialize(): void {
-    this.db.exec(WATCHDOG_SCHEMA);
+  /** `dbPath` may be ":memory:" */
+  constructor(dbPath: string) {
+    if (dbPath !== ":memory:") {
+      const dir = dirname(dbPath);
+      if (!existsSync(dir)) {
+        mkdirSync(dir, { recursive: true });
+      }
+    }
+    this.db = new Database(dbPath);
+    if (dbPath !== ":memory:") {
+      this.db.pragma("journal_mode = WAL");
+    }
+    const version = this.db.pragma("user_version", { simple: true }) as number;
+    if (version < SCHEMA_VERSION) {
+      this.db.exec(SCHEMA);
+      this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+    }
   }
 
-  // ============ SLO Definitions ============
-
-  /**
-   * Create or update an SLO definition
-   */
-  upsertSLODefinition(slo: SLODefinition): void {
-    const stmt = this.db.prepare(`
-      INSERT INTO slo_definitions (id, name, description, project_id, enabled, threshold, unit, type, condition, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-      ON CONFLICT(id) DO UPDATE SET
-        name = excluded.name,
-        description = excluded.description,
-        project_id = excluded.project_id,
-        enabled = excluded.enabled,
-        threshold = excluded.threshold,
-        unit = excluded.unit,
-        type = excluded.type,
-        condition = excluded.condition,
-        updated_at = datetime('now')
-    `);
-    stmt.run(
-      slo.id,
-      slo.name,
-      slo.description,
-      slo.projectId,
-      slo.enabled ? 1 : 0,
-      slo.threshold,
-      slo.unit,
-      slo.type,
-      slo.condition ?? null
-    );
+  close(): void {
+    this.db.close();
   }
 
-  /**
-   * Get an SLO definition by ID
-   */
-  getSLODefinition(id: string): SLODefinition | null {
-    const row = this.db.prepare(`SELECT * FROM slo_definitions WHERE id = ?`).get(id) as SLODefinitionRow | undefined;
-    if (!row) return null;
-    return this.rowToSLODefinition(row);
+  // ============ BREACHES ============
+
+  createBreach(project: string, finding: Finding, at: string): Breach {
+    const id = randomUUID();
+    this.db
+      .prepare(
+        `INSERT INTO watchdog_breaches
+           (id, project, detector, key, summary, evidence, vars, status, detected_at, last_seen_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`,
+      )
+      .run(
+        id,
+        project,
+        finding.detector,
+        finding.key,
+        finding.summary,
+        JSON.stringify(finding.evidence),
+        JSON.stringify(finding.vars),
+        at,
+        at,
+      );
+    return this.getBreach(id)!;
   }
 
-  /**
-   * Get all SLO definitions
-   */
-  getAllSLODefinitions(): SLODefinition[] {
-    const rows = this.db.prepare(`SELECT * FROM slo_definitions ORDER BY type, name`).all() as SLODefinitionRow[];
-    return rows.map(this.rowToSLODefinition);
+  /** Refresh an open breach with the latest evidence. */
+  touchBreach(id: string, finding: Finding, at: string): void {
+    this.db
+      .prepare(
+        `UPDATE watchdog_breaches SET summary = ?, evidence = ?, vars = ?, last_seen_at = ? WHERE id = ?`,
+      )
+      .run(finding.summary, JSON.stringify(finding.evidence), JSON.stringify(finding.vars), at, id);
   }
 
-  /**
-   * Get enabled SLO definitions
-   */
-  getEnabledSLODefinitions(): SLODefinition[] {
-    const rows = this.db.prepare(`SELECT * FROM slo_definitions WHERE enabled = 1 ORDER BY type, name`).all() as SLODefinitionRow[];
-    return rows.map(this.rowToSLODefinition);
+  resolveBreach(id: string, resolution: BreachResolution, at: string): void {
+    this.db
+      .prepare(
+        `UPDATE watchdog_breaches SET status = 'resolved', resolution = ?, resolved_at = ?
+         WHERE id = ? AND status = 'open'`,
+      )
+      .run(resolution, at, id);
   }
 
-  private rowToSLODefinition(row: SLODefinitionRow): SLODefinition {
-    return {
-      id: row.id,
-      name: row.name,
-      description: row.description,
-      projectId: row.project_id,
-      enabled: row.enabled === 1,
-      threshold: row.threshold,
-      unit: row.unit as SLODefinition["unit"],
-      type: row.type as SLODefinition["type"],
-      condition: row.condition ?? undefined,
-    };
+  markEscalated(id: string, at: string): void {
+    this.db
+      .prepare(`UPDATE watchdog_breaches SET escalated_at = ? WHERE id = ? AND escalated_at IS NULL`)
+      .run(at, id);
   }
 
-  // ============ SLO States ============
-
-  /**
-   * Update SLO state
-   */
-  updateSLOState(state: SLOState): void {
-    const stmt = this.db.prepare(`
-      INSERT INTO slo_states (slo_id, status, current_value, threshold, state_changed_at, evidence, last_checked_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(slo_id) DO UPDATE SET
-        status = excluded.status,
-        current_value = excluded.current_value,
-        threshold = excluded.threshold,
-        state_changed_at = CASE WHEN slo_states.status != excluded.status THEN excluded.state_changed_at ELSE slo_states.state_changed_at END,
-        evidence = excluded.evidence,
-        last_checked_at = excluded.last_checked_at
-    `);
-    stmt.run(
-      state.sloId,
-      state.status,
-      state.currentValue,
-      state.threshold,
-      state.stateChangedAt,
-      JSON.stringify(state.evidence),
-      state.lastCheckedAt
-    );
+  getBreach(id: string): Breach | null {
+    const row = this.db.prepare(`SELECT * FROM watchdog_breaches WHERE id = ?`).get(id) as
+      | BreachRow
+      | undefined;
+    return row ? toBreach(row) : null;
   }
 
-  /**
-   * Get SLO state by ID
-   */
-  getSLOState(sloId: string): SLOState | null {
-    const row = this.db.prepare(`SELECT * FROM slo_states WHERE slo_id = ?`).get(sloId) as SLOStateRow | undefined;
-    if (!row) return null;
-    return this.rowToSLOState(row);
+  openBreaches(project: string): Breach[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM watchdog_breaches WHERE project = ? AND status = 'open' ORDER BY detected_at, rowid`,
+      )
+      .all(project) as BreachRow[];
+    return rows.map(toBreach);
   }
 
-  /**
-   * Get all SLO states
-   */
-  getAllSLOStates(): SLOState[] {
-    const rows = this.db.prepare(`SELECT * FROM slo_states`).all() as SLOStateRow[];
-    return rows.map(this.rowToSLOState);
+  listBreaches(
+    project: string,
+    options: { status?: BreachStatus | "all"; limit?: number } = {},
+  ): Breach[] {
+    const status = options.status ?? "all";
+    const limit = options.limit ?? 100;
+    const rows = (
+      status === "all"
+        ? this.db
+            .prepare(
+              `SELECT * FROM watchdog_breaches WHERE project = ? ORDER BY detected_at DESC, rowid DESC LIMIT ?`,
+            )
+            .all(project, limit)
+        : this.db
+            .prepare(
+              `SELECT * FROM watchdog_breaches WHERE project = ? AND status = ? ORDER BY detected_at DESC, rowid DESC LIMIT ?`,
+            )
+            .all(project, status, limit)
+    ) as BreachRow[];
+    return rows.map(toBreach);
   }
 
-  private rowToSLOState(row: SLOStateRow): SLOState {
-    return {
-      sloId: row.slo_id,
-      status: row.status as SLOState["status"],
-      currentValue: row.current_value,
-      threshold: row.threshold,
-      stateChangedAt: row.state_changed_at,
-      evidence: JSON.parse(row.evidence),
-      lastCheckedAt: row.last_checked_at,
-    };
+  // ============ PLAYBOOK RUNS ============
+
+  createRun(run: Omit<PlaybookRun, "id">): PlaybookRun {
+    const id = randomUUID();
+    this.db
+      .prepare(
+        `INSERT INTO watchdog_runs
+           (id, project, breach_id, playbook_id, mode, status, outcome, attempt, started_at, completed_at, steps, error)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        run.project,
+        run.breachId,
+        run.playbookId,
+        run.mode,
+        run.status,
+        run.outcome ?? null,
+        run.attempt,
+        run.startedAt,
+        run.completedAt ?? null,
+        JSON.stringify(run.steps),
+        run.error ?? null,
+      );
+    return this.getRun(id)!;
   }
 
-  // ============ Breaches ============
-
-  /**
-   * Create a new breach
-   */
-  createBreach(breach: Omit<SLOBreach, "playbookRuns" | "resolved" | "resolvedAt">): SLOBreach {
-    const stmt = this.db.prepare(`
-      INSERT INTO slo_breaches (id, slo_id, detected_at, evidence, value, threshold)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
-    stmt.run(
-      breach.id,
-      breach.sloId,
-      breach.detectedAt,
-      JSON.stringify(breach.evidence),
-      breach.value,
-      breach.threshold
-    );
-    return this.getBreach(breach.id)!;
-  }
-
-  /**
-   * Get a breach by ID
-   */
-  getBreach(id: string): SLOBreach | null {
-    const row = this.db.prepare(`SELECT * FROM slo_breaches WHERE id = ?`).get(id) as SLOBreachRow | undefined;
-    if (!row) return null;
-    return this.rowToBreach(row);
-  }
-
-  /**
-   * Get active (unresolved) breaches
-   */
-  getActiveBreaches(): SLOBreach[] {
-    const rows = this.db.prepare(`SELECT * FROM slo_breaches WHERE resolved = 0 ORDER BY detected_at DESC`).all() as SLOBreachRow[];
-    return rows.map(this.rowToBreach);
-  }
-
-  /**
-   * Get breaches for an SLO
-   */
-  getBreachesForSLO(sloId: string, limit = 10): SLOBreach[] {
-    const rows = this.db.prepare(`SELECT * FROM slo_breaches WHERE slo_id = ? ORDER BY detected_at DESC LIMIT ?`).all(sloId, limit) as SLOBreachRow[];
-    return rows.map(this.rowToBreach);
-  }
-
-  /**
-   * Add a playbook run to a breach
-   */
-  addPlaybookRunToBreach(breachId: string, runId: string): void {
-    const breach = this.getBreach(breachId);
-    if (!breach) return;
-    const runs = [...breach.playbookRuns, runId];
-    this.db.prepare(`UPDATE slo_breaches SET playbook_runs = ? WHERE id = ?`).run(JSON.stringify(runs), breachId);
-  }
-
-  /**
-   * Resolve a breach
-   */
-  resolveBreach(id: string): void {
-    this.db.prepare(`UPDATE slo_breaches SET resolved = 1, resolved_at = datetime('now') WHERE id = ?`).run(id);
-  }
-
-  private rowToBreach(row: SLOBreachRow): SLOBreach {
-    return {
-      id: row.id,
-      sloId: row.slo_id,
-      detectedAt: row.detected_at,
-      evidence: JSON.parse(row.evidence),
-      value: row.value,
-      threshold: row.threshold,
-      playbookRuns: JSON.parse(row.playbook_runs),
-      resolved: row.resolved === 1,
-      resolvedAt: row.resolved_at ?? undefined,
-    };
-  }
-
-  // ============ Playbook Runs ============
-
-  /**
-   * Create a playbook run
-   */
-  createPlaybookRun(run: Omit<PlaybookRun, "stepResults" | "completedAt" | "diagnosis" | "error">): PlaybookRun {
-    const stmt = this.db.prepare(`
-      INSERT INTO playbook_runs (id, playbook_id, breach_id, status, attempt, started_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
-    stmt.run(run.id, run.playbookId, run.breachId, run.status, run.attempt, run.startedAt);
-    return this.getPlaybookRun(run.id)!;
-  }
-
-  /**
-   * Get a playbook run by ID
-   */
-  getPlaybookRun(id: string): PlaybookRun | null {
-    const row = this.db.prepare(`SELECT * FROM playbook_runs WHERE id = ?`).get(id) as PlaybookRunRow | undefined;
-    if (!row) return null;
-    return this.rowToPlaybookRun(row);
-  }
-
-  /**
-   * Update a playbook run
-   */
-  updatePlaybookRun(
+  updateRun(
     id: string,
-    updates: Partial<Pick<PlaybookRun, "status" | "completedAt" | "stepResults" | "diagnosis" | "error">>
+    patch: Partial<Pick<PlaybookRun, "status" | "outcome" | "completedAt" | "steps" | "error">>,
   ): void {
-    const run = this.getPlaybookRun(id);
+    const run = this.getRun(id);
     if (!run) return;
+    const next = { ...run, ...patch };
+    this.db
+      .prepare(
+        `UPDATE watchdog_runs SET status = ?, outcome = ?, completed_at = ?, steps = ?, error = ? WHERE id = ?`,
+      )
+      .run(
+        next.status,
+        next.outcome ?? null,
+        next.completedAt ?? null,
+        JSON.stringify(next.steps),
+        next.error ?? null,
+        id,
+      );
+  }
 
-    const newRun = { ...run, ...updates };
-    this.db.prepare(`
-      UPDATE playbook_runs SET
-        status = ?,
-        completed_at = ?,
-        step_results = ?,
-        diagnosis = ?,
-        error = ?
-      WHERE id = ?
-    `).run(
-      newRun.status,
-      newRun.completedAt ?? null,
-      JSON.stringify(newRun.stepResults),
-      newRun.diagnosis ? JSON.stringify(newRun.diagnosis) : null,
-      newRun.error ?? null,
-      id
+  getRun(id: string): PlaybookRun | null {
+    const row = this.db.prepare(`SELECT * FROM watchdog_runs WHERE id = ?`).get(id) as
+      | RunRow
+      | undefined;
+    return row ? toRun(row) : null;
+  }
+
+  /** A breach's runs, newest first. */
+  runsForBreach(breachId: string): PlaybookRun[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM watchdog_runs WHERE breach_id = ? ORDER BY started_at DESC, rowid DESC`)
+      .all(breachId) as RunRow[];
+    return rows.map(toRun);
+  }
+
+  /** A project's runs, newest first. */
+  listRuns(project: string, options: { limit?: number } = {}): PlaybookRun[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM watchdog_runs WHERE project = ? ORDER BY started_at DESC, rowid DESC LIMIT ?`,
+      )
+      .all(project, options.limit ?? 100) as RunRow[];
+    return rows.map(toRun);
+  }
+
+  // ============ ESCALATIONS ============
+
+  /** Record an escalation; false when the breach already has one. */
+  recordEscalation(escalation: Omit<Escalation, "id">): boolean {
+    const result = this.db
+      .prepare(
+        `INSERT OR IGNORE INTO watchdog_escalations (id, project, breach_id, created_at, file, text)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        randomUUID(),
+        escalation.project,
+        escalation.breachId,
+        escalation.createdAt,
+        escalation.file ?? null,
+        escalation.text,
+      );
+    return result.changes > 0;
+  }
+
+  hasEscalation(breachId: string): boolean {
+    return (
+      this.db.prepare(`SELECT 1 FROM watchdog_escalations WHERE breach_id = ?`).get(breachId) !==
+      undefined
     );
   }
 
-  /**
-   * Get runs for a breach
-   */
-  getRunsForBreach(breachId: string): PlaybookRun[] {
-    const rows = this.db.prepare(`SELECT * FROM playbook_runs WHERE breach_id = ? ORDER BY started_at DESC`).all(breachId) as PlaybookRunRow[];
-    return rows.map(this.rowToPlaybookRun);
-  }
-
-  /**
-   * Get recent playbook runs
-   */
-  getRecentRuns(limit = 20): PlaybookRun[] {
-    const rows = this.db.prepare(`SELECT * FROM playbook_runs ORDER BY started_at DESC LIMIT ?`).all(limit) as PlaybookRunRow[];
-    return rows.map(this.rowToPlaybookRun);
-  }
-
-  /**
-   * Get running playbook runs
-   */
-  getRunningRuns(): PlaybookRun[] {
-    const rows = this.db.prepare(`SELECT * FROM playbook_runs WHERE status IN ('pending', 'running') ORDER BY started_at`).all() as PlaybookRunRow[];
-    return rows.map(this.rowToPlaybookRun);
-  }
-
-  private rowToPlaybookRun(row: PlaybookRunRow): PlaybookRun {
-    return {
+  listEscalations(project: string, options: { limit?: number } = {}): Escalation[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM watchdog_escalations WHERE project = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`,
+      )
+      .all(project, options.limit ?? 100) as EscalationRow[];
+    return rows.map((row) => ({
       id: row.id,
-      playbookId: row.playbook_id,
+      project: row.project,
       breachId: row.breach_id,
-      status: row.status as PlaybookRunStatus,
-      attempt: row.attempt,
-      startedAt: row.started_at,
-      completedAt: row.completed_at ?? undefined,
-      stepResults: JSON.parse(row.step_results),
-      diagnosis: row.diagnosis ? JSON.parse(row.diagnosis) : undefined,
-      error: row.error ?? undefined,
-    };
+      createdAt: row.created_at,
+      file: row.file ?? undefined,
+      text: row.text,
+    }));
   }
+
+  // ============ SAMPLES AND CONDITIONS ============
+
+  addContainerSample(project: string, container: string, at: number, restartCount: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO watchdog_container_samples (project, container, at, restart_count) VALUES (?, ?, ?, ?)`,
+      )
+      .run(project, container, at, restartCount);
+  }
+
+  /** Samples taken at or after `sinceMs`, oldest first; older ones are deleted. */
+  containerSamples(
+    project: string,
+    container: string,
+    sinceMs: number,
+  ): { at: number; restartCount: number }[] {
+    this.db
+      .prepare(`DELETE FROM watchdog_container_samples WHERE project = ? AND container = ? AND at < ?`)
+      .run(project, container, sinceMs);
+    const rows = this.db
+      .prepare(
+        `SELECT at, restart_count FROM watchdog_container_samples
+         WHERE project = ? AND container = ? ORDER BY at, rowid`,
+      )
+      .all(project, container) as { at: number; restart_count: number }[];
+    return rows.map((r) => ({ at: r.at, restartCount: r.restart_count }));
+  }
+
+  /**
+   * Track how long a condition has held: returns when it first became true
+   * (kept across restarts), or null after clearing it when it is false.
+   */
+  conditionSince(project: string, key: string, holds: boolean, now: number): number | null {
+    if (!holds) {
+      this.db.prepare(`DELETE FROM watchdog_conditions WHERE project = ? AND key = ?`).run(project, key);
+      return null;
+    }
+    this.db
+      .prepare(`INSERT OR IGNORE INTO watchdog_conditions (project, key, since) VALUES (?, ?, ?)`)
+      .run(project, key, now);
+    const row = this.db
+      .prepare(`SELECT since FROM watchdog_conditions WHERE project = ? AND key = ?`)
+      .get(project, key) as { since: number };
+    return row.since;
+  }
+
+  // ============ SLO STATUS ============
+
+  setSloStatus(project: string, statuses: SloStatus[]): void {
+    const upsert = this.db.prepare(
+      `INSERT INTO watchdog_slo_status (project, detector, state, open_breaches, detail, checked_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(project, detector) DO UPDATE SET
+         state = excluded.state, open_breaches = excluded.open_breaches,
+         detail = excluded.detail, checked_at = excluded.checked_at`,
+    );
+    const write = this.db.transaction((rows: SloStatus[]) => {
+      for (const s of rows) {
+        upsert.run(project, s.detector, s.state, s.openBreaches, s.detail, s.checkedAt);
+      }
+    });
+    write(statuses);
+  }
+
+  sloStatus(project: string): SloStatus[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM watchdog_slo_status WHERE project = ? ORDER BY rowid`)
+      .all(project) as SloRow[];
+    return rows.map((row) => ({
+      detector: row.detector as DetectorId,
+      state: row.state as SloState,
+      openBreaches: row.open_breaches,
+      detail: row.detail,
+      checkedAt: row.checked_at,
+    }));
+  }
+}
+
+function toBreach(row: BreachRow): Breach {
+  return {
+    id: row.id,
+    project: row.project,
+    detector: row.detector as DetectorId,
+    key: row.key,
+    summary: row.summary,
+    evidence: JSON.parse(row.evidence) as string[],
+    vars: JSON.parse(row.vars) as Record<string, string>,
+    status: row.status as BreachStatus,
+    detectedAt: row.detected_at,
+    lastSeenAt: row.last_seen_at,
+    resolvedAt: row.resolved_at ?? undefined,
+    resolution: (row.resolution as BreachResolution | null) ?? undefined,
+    escalatedAt: row.escalated_at ?? undefined,
+  };
+}
+
+function toRun(row: RunRow): PlaybookRun {
+  return {
+    id: row.id,
+    project: row.project,
+    breachId: row.breach_id,
+    playbookId: row.playbook_id as PlaybookId,
+    mode: row.mode as RunMode,
+    status: row.status as RunStatus,
+    outcome: (row.outcome as RunOutcome | null) ?? undefined,
+    attempt: row.attempt,
+    startedAt: row.started_at,
+    completedAt: row.completed_at ?? undefined,
+    steps: JSON.parse(row.steps) as StepResult[],
+    error: row.error ?? undefined,
+  };
 }
