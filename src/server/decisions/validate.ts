@@ -1,0 +1,254 @@
+/**
+ * Input validation for the Decision Inbox, like watchdog/config.ts: zod for
+ * shapes, then the rules that span fields (the recommended option exists, a
+ * default is allowed for this kind, ...). Every error names its field.
+ *
+ * Error messages never repeat a value from the input, so a secret sent in
+ * the wrong field can't come back in a response or a log line.
+ */
+import { z } from "zod";
+import {
+  DECISION_KINDS,
+  NEVER_DEFAULT_KINDS,
+  type DecisionKind,
+  type DecisionLink,
+  type DecisionOption,
+} from "../../shared/decision-types.js";
+import type { AnswerInput, WithdrawInput } from "./types.js";
+
+/** An error with the HTTP status the routes answer with. */
+export class DecisionError extends Error {
+  constructor(
+    readonly statusCode: 400 | 403 | 404 | 409 | 503,
+    message: string,
+  ) {
+    super(message);
+    this.name = "DecisionError";
+  }
+}
+
+const PROJECT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
+const OPTION_ID = /^[a-z][a-z0-9_-]{0,39}$/;
+const MODULE = /^[a-z][a-z0-9_-]{0,39}$/;
+const SECRET_NAME = /^[A-Za-z_][A-Za-z0-9_.-]{0,99}$/;
+const DECISION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** True for the ids decisions get (lowercase UUIDs). */
+export function isDecisionId(id: unknown): id is string {
+  return typeof id === "string" && DECISION_ID.test(id);
+}
+
+/** Control characters other than tab and newlines (when allowed). */
+export function hasControlCharacters(text: string, allowNewlines: boolean): boolean {
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code === 0x7f) return true;
+    if (code < 0x20) {
+      if (allowNewlines && (code === 0x09 || code === 0x0a || code === 0x0d)) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
+const oneLine = (max: number) =>
+  z
+    .string()
+    .min(1)
+    .max(max)
+    .refine((s) => !hasControlCharacters(s, false), "must be one line without control characters");
+
+const text = (max: number) =>
+  z
+    .string()
+    .min(1)
+    .max(max)
+    .refine((s) => !hasControlCharacters(s, true), "must not contain control characters");
+
+const OptionSchema = z
+  .object({
+    id: z.string().regex(OPTION_ID, "use lowercase letters, digits, '_' and '-', starting with a letter (at most 40)"),
+    label: oneLine(120),
+    consequences: text(1000),
+    suppliesSecret: z.boolean().optional(),
+  })
+  .strict();
+
+const LinkSchema = z
+  .object({
+    label: oneLine(120),
+    url: z
+      .string()
+      .max(2000)
+      .refine((u) => {
+        try {
+          const protocol = new URL(u).protocol;
+          return protocol === "http:" || protocol === "https:";
+        } catch {
+          return false;
+        }
+      }, "must be an http or https URL"),
+  })
+  .strict();
+
+const RaiseSchema = z
+  .object({
+    project: z.string().regex(PROJECT, "must be a project name (letters, digits, '.', '_' and '-')"),
+    kind: z.enum(DECISION_KINDS),
+    title: oneLine(200),
+    context: text(20000),
+    options: z.array(OptionSchema).min(1).max(10),
+    recommended: z
+      .object({
+        optionId: z.string().min(1).max(40),
+        reasoning: text(2000),
+      })
+      .strict(),
+    source: z
+      .object({
+        module: z.string().regex(MODULE, "use lowercase letters, digits, '_' and '-', starting with a letter"),
+        ref: oneLine(200),
+      })
+      .strict(),
+    key: oneLine(200),
+    blocks: z.array(oneLine(200)).max(50).default([]),
+    links: z.array(LinkSchema).max(20).default([]),
+    secretName: z.string().regex(SECRET_NAME, "use letters, digits, '_', '.' and '-'").optional(),
+    expiresAt: z.string().datetime({ offset: true }).optional(),
+    defaultOptionId: z.string().min(1).max(40).optional(),
+  })
+  .strict();
+
+/** A raise() input after validation, with defaults applied and times normalised. */
+export interface ValidRaise {
+  project: string;
+  kind: DecisionKind;
+  title: string;
+  context: string;
+  options: DecisionOption[];
+  recommended: { optionId: string; reasoning: string };
+  source: { module: string; ref: string };
+  key: string;
+  blocks: string[];
+  links: DecisionLink[];
+  secretName?: string;
+  expiresAt?: string;
+  defaultOptionId?: string;
+}
+
+export type Parsed<T> = { ok: true; value: T } | { ok: false; errors: string[] };
+
+function zodErrors(error: z.ZodError, prefix = ""): string[] {
+  return error.issues.map((issue) => {
+    const path = issue.path.join(".");
+    return `${prefix}${path || "(body)"}: ${issue.message}`;
+  });
+}
+
+/** Validate what a producer passes to raise(). `now` decides whether expiresAt is in the future. */
+export function parseRaiseInput(raw: unknown, now: number): Parsed<ValidRaise> {
+  const parsed = RaiseSchema.safeParse(raw ?? {});
+  if (!parsed.success) return { ok: false, errors: zodErrors(parsed.error) };
+  const value = parsed.data;
+  const errors: string[] = [];
+
+  const ids = value.options.map((o) => o.id);
+  const duplicate = ids.find((id, i) => ids.indexOf(id) !== i);
+  if (duplicate) errors.push(`options: duplicate option id ${duplicate}`);
+  if (!ids.includes(value.recommended.optionId)) {
+    errors.push("recommended.optionId: must be one of the options");
+  }
+
+  const supplying = value.options.filter((o) => o.suppliesSecret === true);
+  if (value.kind === "credentials") {
+    if (!value.secretName) errors.push("secretName: a credentials decision needs the name its secret is stored under");
+    if (supplying.length === 0) {
+      errors.push("options: a credentials decision needs an option with suppliesSecret: true");
+    }
+  } else {
+    if (value.secretName !== undefined) errors.push("secretName: only credentials decisions take a secret");
+    if (supplying.length > 0) errors.push("options: only credentials decisions have options that supply a secret");
+  }
+
+  let expiresAt: string | undefined;
+  if (value.expiresAt !== undefined) {
+    const at = Date.parse(value.expiresAt);
+    if (!Number.isFinite(at)) {
+      errors.push("expiresAt: not a valid time");
+    } else if (at <= now) {
+      errors.push("expiresAt: must be in the future");
+    } else {
+      expiresAt = new Date(at).toISOString();
+    }
+  }
+
+  if (value.defaultOptionId !== undefined) {
+    if (NEVER_DEFAULT_KINDS.includes(value.kind)) {
+      errors.push(`defaultOptionId: ${value.kind} decisions can't have a default: they always wait for a human`);
+    } else if (!ids.includes(value.defaultOptionId)) {
+      errors.push("defaultOptionId: must be one of the options");
+    } else if (value.expiresAt === undefined) {
+      errors.push("defaultOptionId: a default applies at expiry, so it needs expiresAt");
+    }
+  }
+
+  if (errors.length > 0) return { ok: false, errors };
+  return {
+    ok: true,
+    value: {
+      project: value.project,
+      kind: value.kind,
+      title: value.title,
+      context: value.context,
+      options: value.options.map((o) => ({
+        id: o.id,
+        label: o.label,
+        consequences: o.consequences,
+        ...(o.suppliesSecret ? { suppliesSecret: true } : {}),
+      })),
+      recommended: value.recommended,
+      source: value.source,
+      key: value.key,
+      blocks: [...new Set(value.blocks)],
+      links: value.links,
+      secretName: value.secretName,
+      expiresAt,
+      defaultOptionId: value.defaultOptionId,
+    },
+  };
+}
+
+const AnswerSchema = z
+  .object({
+    optionId: z.string().min(1).max(40),
+    note: z
+      .string()
+      .max(2000)
+      .refine((s) => !hasControlCharacters(s, true), "must not contain control characters")
+      .optional(),
+    confirm: z.boolean().optional(),
+    secret: z.string().min(1).max(10000).optional(),
+    by: oneLine(100).optional(),
+  })
+  .strict();
+
+/** Validate an answer. The shape only; the decision's own rules are checked by the inbox. */
+export function parseAnswerInput(raw: unknown): Parsed<AnswerInput> {
+  const parsed = AnswerSchema.safeParse(raw ?? {});
+  if (!parsed.success) return { ok: false, errors: zodErrors(parsed.error) };
+  const { note, ...rest } = parsed.data;
+  return { ok: true, value: { ...rest, ...(note && note.trim() ? { note } : {}) } };
+}
+
+const WithdrawSchema = z
+  .object({
+    module: z.string().regex(MODULE, "use lowercase letters, digits, '_' and '-', starting with a letter"),
+    reason: text(1000),
+  })
+  .strict();
+
+export function parseWithdrawInput(raw: unknown): Parsed<WithdrawInput> {
+  const parsed = WithdrawSchema.safeParse(raw ?? {});
+  if (!parsed.success) return { ok: false, errors: zodErrors(parsed.error) };
+  return { ok: true, value: parsed.data };
+}

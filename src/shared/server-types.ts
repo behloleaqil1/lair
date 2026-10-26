@@ -203,6 +203,11 @@ export type EventType =
   | "job.completed"
   | "job.failed"
   | "scheduler.tick"
+  // Decision Inbox (src/server/decisions/)
+  | "decision.raised"
+  | "decision.answered"
+  | "decision.expired"
+  | "decision.withdrawn"
   // Watchdog (src/server/watchdog/)
   | "slo.breached"
   | "slo.recovered"
