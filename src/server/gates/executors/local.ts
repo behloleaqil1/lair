@@ -259,14 +259,19 @@ export class LocalExecutor implements Executor {
         busy >= settings.maxParallel
           ? `${busy} local job(s) running (executors.local.max_parallel is ${settings.maxParallel})`
           : null;
-      if (!problem) problem = capacityProblem(await capacity.sample(), settings);
-      if (!problem) break;
+      if (!problem) {
+        // Hold the slot while measuring, so two jobs can't both take the last one
+        this.running.set(job.project, busy + 1);
+        problem = capacityProblem(await capacity.sample(), settings);
+        if (!problem) break;
+        this.running.set(job.project, Math.max(0, this.runningJobs(job.project) - 1));
+      }
       reporter.wait(`waiting for local capacity: ${problem}`);
       reporter.update({ status: "queued", reason: `waiting for local capacity: ${problem}` });
       await clock.sleep(settings.capacityRetrySeconds * 1000, control.signal);
     }
+    // The slot taken above is released in the finally below
     reporter.wait(undefined);
-    this.running.set(job.project, this.runningJobs(job.project) + 1);
     reporter.update({ status: "running", reason: undefined, where: "local machine" });
 
     let worktree: string | null = null;

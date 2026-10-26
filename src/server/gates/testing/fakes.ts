@@ -104,6 +104,10 @@ export class FakeSpawner implements Spawner {
   results = new Map<string, Partial<ExecuteResult>>();
   /** What `git rev-parse HEAD` prints */
   head = SHA;
+  /** Steps take this many event-loop turns, so concurrent steps overlap */
+  stepTicks = 0;
+  running = 0;
+  maxRunning = 0;
 
   async run(argv: string[], options: { cwd: string; env: Record<string, string> }): Promise<ExecuteResult> {
     this.calls.push({ argv: [...argv], cwd: options.cwd, env: options.env });
@@ -111,6 +115,10 @@ export class FakeSpawner implements Spawner {
       const out = argv.includes("rev-parse") ? `${this.head}\n` : "";
       return { exitCode: 0, stdout: out, stderr: "", timedOut: false, durationMs: 1 };
     }
+    this.running++;
+    this.maxRunning = Math.max(this.maxRunning, this.running);
+    for (let i = 0; i < this.stepTicks; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+    this.running--;
     const r = this.results.get(argv.join(" ")) ?? {};
     return {
       exitCode: r.exitCode ?? 0,

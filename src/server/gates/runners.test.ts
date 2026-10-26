@@ -635,6 +635,27 @@ describe("restarts and capacity", () => {
     expect(h.spawner.stepCalls()).toHaveLength(2);
   });
 
+  it("runs at most max_parallel local jobs at once, even when they ask together", async () => {
+    const h = await harness({
+      token: false,
+      pipelines: {
+        gate: {
+          steps: [
+            { name: "lint", run: ["npm", "run", "lint"], lane: "a" },
+            { name: "test", run: ["npm", "test"], lane: "b" },
+            { name: "build", run: ["npm", "run", "build"], lane: "c" },
+          ],
+        },
+      },
+    });
+    h.spawner.stepTicks = 20;
+    const run = await h.run();
+
+    expect(run.status).toBe("passed");
+    expect(h.spawner.stepCalls()).toHaveLength(3);
+    expect(h.spawner.maxRunning).toBe(1);
+  });
+
   it("cancels a waiting run", async () => {
     const h = await harness({ token: false });
     h.capacity.value = { ...AMPLE, memoryPressure: "critical" };

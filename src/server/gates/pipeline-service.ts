@@ -401,7 +401,13 @@ export class PipelineManager {
       }
 
       if (!executor) {
-        const choice = await this.select(p, spec, attempts);
+        let choice: { executor: Executor } | { wait: string };
+        try {
+          choice = await this.select(p, spec, attempts);
+        } catch (e) {
+          // Never drop the job: wait and select again
+          choice = { wait: `choosing an executor failed: ${message(e)}` };
+        }
         if ("wait" in choice) {
           store.updateJob(job.id, { status: "waiting", waitReason: choice.wait, attempts });
           await this.clock.sleep(retryMs, control.signal);
