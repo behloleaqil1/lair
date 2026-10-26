@@ -14,6 +14,7 @@ import { Processes } from "./components/Processes";
 import { Nodes } from "./components/Nodes";
 import { Health } from "./components/Health";
 import { Delivery } from "./components/Delivery";
+import { Reviews } from "./components/Reviews";
 import { CommandBar } from "./components/CommandBar";
 import { pickInitialProject } from "./initial-project";
 import type { CommandMode, ControlsStatus } from "../shared/types";
@@ -34,6 +35,7 @@ type View =
   | "activity"
   | "health"
   | "delivery"
+  | "reviews"
   | "inbox";
 
 const VIEWS: { id: View; label: string }[] = [
@@ -44,6 +46,7 @@ const VIEWS: { id: View; label: string }[] = [
   { id: "nodes", label: "Nodes" },
   { id: "gates", label: "Gates" },
   { id: "prs", label: "PRs" },
+  { id: "reviews", label: "Reviews" },
   { id: "orchestrator", label: "Orchestrator" },
   { id: "machines", label: "Machines" },
   { id: "processes", label: "Processes" },
@@ -137,6 +140,8 @@ export function App() {
         return <Health {...props} />;
       case "delivery":
         return <Delivery {...props} />;
+      case "reviews":
+        return <Reviews {...props} />;
       case "inbox":
         return <Inbox {...props} />;
     }
