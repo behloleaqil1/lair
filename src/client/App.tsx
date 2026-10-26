@@ -18,9 +18,11 @@ import { CommandBar } from "./components/CommandBar";
 import { pickInitialProject } from "./initial-project";
 import type { CommandMode, ControlsStatus } from "../shared/types";
 import { LAIR_VERSION } from "../shared/version";
+import { DecisionInbox, DecisionsBadge } from "./components/DecisionInbox";
 import "./App.css";
 
 type View =
+  | "decisions"
   | "overview"
   | "dragons"
   | "gates"
@@ -36,6 +38,8 @@ type View =
 
 const VIEWS: { id: View; label: string }[] = [
   { id: "overview", label: "Overview" },
+  // The Decision Inbox: the one place Lair asks you; its badge counts open decisions
+  { id: "decisions", label: "Decisions" },
   { id: "dragons", label: "Dragons" },
   { id: "nodes", label: "Nodes" },
   { id: "gates", label: "Gates" },
@@ -111,6 +115,8 @@ export function App() {
     switch (currentView) {
       case "overview":
         return <Overview {...props} />;
+      case "decisions":
+        return <DecisionInbox {...props} />;
       case "dragons":
         return <Dragons {...props} />;
       case "gates":
@@ -177,6 +183,7 @@ export function App() {
             onClick={() => setCurrentView(view.id)}
           >
             {view.label}
+            {view.id === "decisions" && <DecisionsBadge refreshKey={lastRefresh.getTime()} />}
           </button>
         ))}
       </nav>
