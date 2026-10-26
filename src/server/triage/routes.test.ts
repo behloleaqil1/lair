@@ -159,7 +159,7 @@ describe("triage over HTTP", () => {
     git.commitOnMain(c0);
     git.commitOnMain(m1);
     git.commitOnMain(m2);
-    const post = (payload: unknown) => app.inject({ method: "POST", url: "/api/triage/results", payload });
+    const post = (payload: Record<string, unknown>) => app.inject({ method: "POST", url: "/api/triage/results", payload });
     expect((await post({ result: { id: "main-0", commitSha: c0, branch: "main", status: "passed" } })).statusCode).toBe(200);
     const red = await post({
       result: { id: "main-2", commitSha: m2, branch: "main", status: "failed", steps: [{ name: "test", status: "failed", exitCode: 1 }] },
