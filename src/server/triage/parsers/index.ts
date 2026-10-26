@@ -12,7 +12,7 @@
  */
 import type { GateResult, GateStepResult } from "../../../shared/policy-types.js";
 import type { FailureCause, TestRef } from "../../../shared/triage-types.js";
-import { cleanLog, clip, groupFailures, mergeCauses } from "../text.js";
+import { boundedLines, clip, groupFailures, mergeCauses } from "../text.js";
 import { gradleParser } from "./gradle.js";
 import { jestParser, vitestParser } from "./js.js";
 import { junitParser } from "./junit.js";
@@ -56,9 +56,7 @@ function failedSteps(result: GateResult): GateStepResult[] {
 
 /** A failed step that no parser explains: its exit code and the error lines of its output. */
 function stepCause(step: GateStepResult): FailureCause {
-  const output = cleanLog(step.output ?? "");
-  const lines = output
-    .split("\n")
+  const lines = boundedLines(step.output ?? "")
     .map((l) => l.trim())
     .filter((l) => l.length > 0 && !/^\.\.\. \(\d+ lines truncated\)$/.test(l));
   const errorLines = lines.filter((l) => ERRORISH.test(l));
@@ -119,19 +117,25 @@ export function parseGateEvidence(
   const notes: string[] = [];
 
   for (const report of reports) {
-    const parser = report.format
-      ? parsers.find((p) => p.id === report.format)
-      : parsers.find((p) => p.source === "report" && p.detect(report.content)) ??
-        parsers.find((p) => p.detect(report.content));
-    if (!parser) {
-      notes.push(`report ${report.name ?? "(unnamed)"}: no parser recognises it`);
-      continue;
+    const name = report.name ?? "(unnamed)";
+    try {
+      const lines = boundedLines(report.content);
+      const parser = report.format
+        ? parsers.find((p) => p.id === report.format)
+        : (parsers.find((p) => p.source === "report" && p.detect(report.content, lines)) ??
+          parsers.find((p) => p.detect(report.content, lines)));
+      if (!parser) {
+        notes.push(`report ${name}: no parser recognises it`);
+        continue;
+      }
+      const out = parser.parse(report.content, { step: report.step ?? onlyStep, contextPatterns: options.contextPatterns });
+      used.add(parser.id);
+      reportCauses.push(...out.causes);
+      passed.push(...out.passed);
+      flaky.push(...out.flaky);
+    } catch (e) {
+      notes.push(`report ${name}: could not be read (${clip(e instanceof Error ? e.message : String(e), 200)})`);
     }
-    const out = parser.parse(report.content, { step: report.step ?? onlyStep, contextPatterns: options.contextPatterns });
-    used.add(parser.id);
-    reportCauses.push(...out.causes);
-    passed.push(...out.passed);
-    flaky.push(...out.flaky);
   }
 
   const covered = new Set(reportCauses.flatMap((c) => c.tests.map((t) => t.key)));
@@ -140,10 +144,17 @@ export function parseGateEvidence(
   for (const step of failed) {
     const output = step.output ?? "";
     if (!output.trim()) continue;
-    const parser = consoleParsers.find((p) => p.detect(output));
-    if (!parser) continue;
-    const out = parser.parse(output, { step: step.name, contextPatterns: options.contextPatterns });
-    used.add(parser.id);
+    let out: ReturnType<EvidenceParser["parse"]>;
+    try {
+      const lines = boundedLines(output);
+      const parser = consoleParsers.find((p) => p.detect(output, lines));
+      if (!parser) continue;
+      out = parser.parse(output, { step: step.name, contextPatterns: options.contextPatterns });
+      used.add(parser.id);
+    } catch (e) {
+      notes.push(`step ${step.name}: its output could not be read (${clip(e instanceof Error ? e.message : String(e), 200)})`);
+      continue;
+    }
     for (const cause of out.causes) {
       if (cause.tests.length > 0 && cause.tests.every((t) => covered.has(t.key))) continue;
       if (cause.kind === "build" && reportCauses.some((c) => c.step === step.name)) continue;

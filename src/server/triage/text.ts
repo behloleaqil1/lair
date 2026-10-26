@@ -9,12 +9,35 @@ export const MAX_LINE = 300;
 export const MAX_EVIDENCE = 12;
 export const MAX_TESTS = 500;
 const MAX_LOCATIONS = 8;
+/** Every line a parser reads is cut to this many characters before any regular expression sees it */
+export const MAX_LINE_LENGTH = 2000;
+/** A parser reads at most this many lines of a log (the last ones: failures and summaries come last) */
+export const MAX_LOG_LINES = 20_000;
+/** Stack frames are short; longer lines are not read as frames */
+const MAX_FRAME_LENGTH = 400;
 
 const ANSI = new RegExp(`${String.fromCharCode(27)}\\[[0-9;?]*[A-Za-z]`, "g");
 
 /** Remove terminal colour codes and carriage returns. */
 export function cleanLog(text: string): string {
   return text.replace(ANSI, "").replace(/\r\n?/g, "\n");
+}
+
+/**
+ * A log as lines a regular expression can read in linear time: colour codes
+ * removed, at most MAX_LOG_LINES lines (the last ones), each cut to
+ * MAX_LINE_LENGTH characters. Test output is written by the code under test,
+ * so a parser never runs a pattern over an unbounded line.
+ */
+export function boundedLines(text: string): string[] {
+  const lines = cleanLog(text).split("\n");
+  const kept = lines.length > MAX_LOG_LINES ? lines.slice(-MAX_LOG_LINES) : lines;
+  return kept.map((l) => (l.length > MAX_LINE_LENGTH ? l.slice(0, MAX_LINE_LENGTH) : l));
+}
+
+/** Cut a string to MAX_LINE_LENGTH characters. */
+export function cut(text: string, max = MAX_LINE_LENGTH): string {
+  return text.length > max ? text.slice(0, max) : text;
 }
 
 export function clip(line: string, max = MAX_LINE): string {
@@ -89,19 +112,25 @@ export function testClass(test: TestRef): string {
 // ============ THROWABLES AND CHAINS ============
 
 const THROWABLE = /^((?:[A-Za-z_$][\w$]*\.)+[A-Za-z_$][\w$]*|[A-Z][\w$]*(?:Error|Exception|Failure|Fault|Throwable)|Error)(?::\s*(.*))?$/;
-const GRADLE_AT = /\s+at\s+\S+\.\w+:\d+\)?$/;
+const AT_LOCATION = /^\S+\.\w+:\d+\)?$/;
+
+/** Remove Gradle's short-format suffix " at File.java:42" (one scan for the last " at "). */
+function stripAtLocation(text: string): string {
+  const at = text.lastIndexOf(" at ");
+  if (at < 0) return text;
+  const rest = text.slice(at + 4).trim();
+  return AT_LOCATION.test(rest) ? text.slice(0, at).trimEnd() : text;
+}
 
 /** "java.lang.IllegalStateException: boom" -> type and message; anything else -> message only. */
 export function parseThrowable(line: string): { type?: string; message: string } {
-  const text = line.trim().replace(GRADLE_AT, "");
+  const text = stripAtLocation(cut(line).trim());
   const match = text.match(THROWABLE);
   if (match && (match[2] !== undefined || /[A-Z]/.test(match[1]))) {
     return { type: match[1], message: (match[2] ?? "").trim() };
   }
   return { message: text };
 }
-
-const CAUSED_BY = /^\s*Caused by:\s*(.*?)\s*$/;
 
 /**
  * The "Caused by" chain in a stack trace, outermost first. The cause is on
@@ -111,10 +140,14 @@ const CAUSED_BY = /^\s*Caused by:\s*(.*?)\s*$/;
 export function causedByChain(lines: string[]): string[] {
   const chain: string[] = [];
   for (let i = 0; i < lines.length; i++) {
-    const match = lines[i].match(CAUSED_BY);
-    if (!match) continue;
-    const text = match[1] || (lines.slice(i + 1).find((l) => l.trim().length > 0) ?? "").trim();
-    if (text) chain.push(clip(text.replace(GRADLE_AT, "")));
+    const line = lines[i];
+    const at = line.indexOf("Caused by:");
+    if (at < 0 || line.slice(0, at).trim() !== "") continue;
+    let text = line.slice(at + "Caused by:".length).trim();
+    if (!text) {
+      for (let j = i + 1; j < lines.length && !text; j++) text = lines[j].trim();
+    }
+    if (text) chain.push(clip(stripAtLocation(cut(text))));
   }
   return chain;
 }
@@ -125,7 +158,9 @@ const FIELD_ERROR = /Field error in object '[^']+' on field '[^']+'[^\n]*/;
 export function fieldErrors(lines: string[]): string[] {
   const found: string[] = [];
   for (const line of lines) {
-    const match = line.match(FIELD_ERROR);
+    if (found.length >= 4) break;
+    if (!line.includes("Field error in object")) continue;
+    const match = cut(line).match(FIELD_ERROR);
     if (match) found.push(clip(match[0]));
   }
   return found;
@@ -176,8 +211,10 @@ export function sourceLocations(lines: string[]): SourceLocation[] {
     seen.add(key);
     out.push({ file, line });
   };
-  for (const raw of lines) {
+  for (let i = 0; i < lines.length && i < MAX_LOG_LINES; i++) {
     if (out.length >= MAX_LOCATIONS) break;
+    const raw = lines[i];
+    if (raw.length > MAX_FRAME_LENGTH) continue;
     const jvm = raw.match(JVM_FRAME);
     if (jvm) {
       const cls = jvm[1];
@@ -263,7 +300,7 @@ function toCause(raw: RawFailure, kind: CauseKind): FailureCause {
     kind,
     step: raw.step,
     parser: raw.parser,
-    type: raw.type,
+    type: raw.type ? clip(raw.type, 200) : undefined,
     message: clip(raw.message),
     causedBy,
     rootCause,
@@ -274,9 +311,17 @@ function toCause(raw: RawFailure, kind: CauseKind): FailureCause {
   };
 }
 
+const seenKeys = new WeakMap<FailureCause, Set<string>>();
+
 function addTests(cause: FailureCause, tests: TestRef[]): void {
+  let seen = seenKeys.get(cause);
+  if (!seen) {
+    seen = new Set(cause.tests.map((t) => t.key));
+    seenKeys.set(cause, seen);
+  }
   for (const test of tests) {
-    if (cause.tests.some((t) => t.key === test.key)) continue;
+    if (seen.has(test.key)) continue;
+    seen.add(test.key);
     cause.testCount++;
     if (cause.tests.length < MAX_TESTS) cause.tests.push(test);
   }
@@ -295,7 +340,12 @@ export function groupFailures(raws: RawFailure[], contextPatterns: RegExp[]): Fa
   const contexts = new Map<string, RawFailure[]>();
 
   for (const raw of raws) {
-    const text = [raw.test?.name ?? "", raw.contextText ?? "", raw.type ?? "", raw.message, ...causedByChain(raw.lines)].join("\n");
+    const text = cut(
+      [raw.test?.name ?? "", raw.contextText ?? "", raw.type ?? "", raw.message, ...causedByChain(raw.lines)]
+        .map((t) => cut(t, 500))
+        .join("\n"),
+      4000,
+    );
     const kind = raw.kind ?? (contextPatterns.some((p) => p.test(text)) ? "context" : raw.test ? "test" : "build");
     if (kind === "context") {
       const scope = `${raw.parser}|${raw.step ?? ""}`;
@@ -358,7 +408,7 @@ export function groupFailures(raws: RawFailure[], contextPatterns: RegExp[]): Fa
 const FOLLOWER = /failure threshold \(\d+\) exceeded|skipping repeated attempt|context (has )?already failed|previous (attempt|failure) to (load|start)/i;
 
 function isFollower(raw: RawFailure): boolean {
-  return FOLLOWER.test(`${raw.type ?? ""}: ${raw.message}`) && causedByChain(raw.lines).length === 0;
+  return FOLLOWER.test(cut(`${raw.type ?? ""}: ${raw.message}`)) && causedByChain(raw.lines).length === 0;
 }
 
 function deepestOf(raws: RawFailure[]): RawFailure {

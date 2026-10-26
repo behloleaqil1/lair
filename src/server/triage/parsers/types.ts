@@ -26,7 +26,12 @@ export interface EvidenceParser {
   id: string;
   /** Machine-readable reports first; console parsers are tried on step output */
   source: "report" | "console";
-  /** True when the text looks like this parser's format */
-  detect(text: string): boolean;
+  /**
+   * True when the text looks like this parser's format. `lines` is the text
+   * as bounded lines (boundedLines()): console parsers read only those, so a
+   * huge line never meets a regular expression.
+   */
+  detect(text: string, lines: string[]): boolean;
+  /** Reads bounded input only (boundedLines(), or the XML reader's caps) */
   parse(text: string, options: ParseOptions): ParseOutput;
 }

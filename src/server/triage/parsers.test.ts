@@ -6,7 +6,7 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_CONTEXT_PATTERNS } from "./config.js";
 import { parseGateEvidence, parseGradle, parseJUnit, parseJest, parsePytest, parseVitest, parseXml } from "./parsers/index.js";
-import { fixture, gate, sha, step } from "./test-harness.js";
+import { fixture, gate, sha, step } from "./testing/harness.js";
 
 const options = { contextPatterns: DEFAULT_CONTEXT_PATTERNS.map((p) => new RegExp(p, "i")) };
 
@@ -203,4 +203,41 @@ describe("parseGateEvidence", () => {
     const [cause] = parseGateEvidence(result, [], { contextPatterns }).causes;
     expect(cause).toMatchObject({ kind: "step", parser: "runner", type: "error" });
   });
+});
+
+describe("output written by the code under test", () => {
+  it("multi-megabyte lines and a deeply nested report finish fast and don't throw", () => {
+    const started = Date.now();
+    // Lines shaped to make backtracking patterns explode: test headers, banners,
+    // separators, Caused by, a FAIL header and an E line, each megabytes long
+    const output = [
+      "a > ".repeat(1_000_000) + "b",
+      "x".repeat(3_000_000) + " > y FAILED",
+      "=".repeat(2_000_000) + " short test summary info",
+      "_".repeat(2_000_000) + " t " + "_".repeat(10),
+      "⎯".repeat(1_000_000) + " Failed Tests",
+      " FAIL  " + "a".repeat(2_000_000) + " > x",
+      "Caused by:" + " ".repeat(2_000_000) + "x",
+      "    at " + "a.".repeat(500_000) + "b(Foo.java:1)",
+      "E   " + "a".repeat(1_000_000),
+      "12 tests completed, 1 failed",
+    ].join("\n");
+    const result = gate({ sha: sha("p1"), branch: "feat/x", steps: [step("test", "failed", output, 1)] });
+    const nested =
+      "<testsuites>" +
+      '<testsuite name="s">'.repeat(100_000) +
+      `<testcase name="t" classname="${"c".repeat(1_000_000)}"><failure message="m">${"x\n".repeat(500_000)}</failure></testcase>` +
+      "</testsuite>".repeat(100_000) +
+      "</testsuites>";
+    const attributes = `<testsuite><testcase name="a" ${"x=".repeat(500_000)}/></testsuite>`;
+    const unclosed = "<a>".repeat(200_000) + "</b>".repeat(200_000);
+
+    const evidence = parseGateEvidence(result, [{ content: nested }, { content: attributes }, { content: unclosed, format: "junit" }], options);
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(evidence.causes.length).toBeGreaterThan(0);
+    // The nested report still yields its failing testcase, cut to a bounded size
+    const junit = evidence.causes.find((c) => c.parser === "junit");
+    expect(junit?.tests[0].suite.length).toBeLessThanOrEqual(500);
+    expect(junit?.message).toBe("m");
+  }, 30_000);
 });

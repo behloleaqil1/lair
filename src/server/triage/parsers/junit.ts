@@ -5,14 +5,14 @@
  * failure is one cause however many testcases it failed.
  */
 import type { TestRef } from "../../../shared/triage-types.js";
-import { groupFailures, makeTest, parseThrowable, pytestTest, type RawFailure } from "../text.js";
+import { cut, groupFailures, makeTest, parseThrowable, pytestTest, type RawFailure } from "../text.js";
 import { parseXml, type XmlElement } from "./xml.js";
 import type { EvidenceParser, ParseOptions, ParseOutput } from "./types.js";
 
 function testOf(testcase: XmlElement, suite: string): TestRef {
-  const classname = testcase.attrs.classname || suite;
-  const name = testcase.attrs.name || "(unnamed)";
-  const file = testcase.attrs.file || undefined;
+  const classname = cut(testcase.attrs.classname || suite, 500);
+  const name = cut(testcase.attrs.name || "(unnamed)", 500);
+  const file = testcase.attrs.file ? cut(testcase.attrs.file, 500) : undefined;
   if (file && file.endsWith(".py")) {
     // pytest: rebuild the node id from the file and the class part of the classname
     const module = file.replace(/\.py$/, "").split("/").filter(Boolean).join(".");
@@ -22,8 +22,17 @@ function testOf(testcase: XmlElement, suite: string): TestRef {
   return makeTest(classname || file || "(unknown)", name, { file });
 }
 
+/** A report's failure body as bounded lines (the first ones: the error and its chain come first). */
+function bodyLines(text: string): string[] {
+  const lines = text.split("\n");
+  return (lines.length > MAX_BODY_LINES ? lines.slice(0, MAX_BODY_LINES) : lines).map((l) => cut(l));
+}
+
+const MAX_BODY_LINES = 2000;
+
 function firstLine(text: string): string {
-  return text.split("\n").find((l) => l.trim().length > 0)?.trim() ?? "";
+  const lines = bodyLines(text);
+  return lines.find((l) => l.trim().length > 0)?.trim() ?? "";
 }
 
 export function parseJUnit(xml: string, options: ParseOptions): ParseOutput {
@@ -43,7 +52,7 @@ export function parseJUnit(xml: string, options: ParseOptions): ParseOutput {
       return;
     }
     const failure = failures[0];
-    const lines = failure.text.split("\n");
+    const lines = bodyLines(failure.text);
     const head = parseThrowable(firstLine(failure.text));
     // Some reporters leave out `type` and write "AssertionError: ..." as the message
     const attrMessage = firstLine(failure.attrs.message ?? "");
@@ -59,14 +68,23 @@ export function parseJUnit(xml: string, options: ParseOptions): ParseOutput {
     });
   };
 
-  const walk = (element: XmlElement, suite: string) => {
-    for (const child of element.children) {
-      if (child.name === "testsuite") walk(child, child.attrs.name || suite);
-      else if (child.name === "testcase") visit(child, suite);
-      else walk(child, suite);
+  // Depth-first, in document order, without recursion
+  const stack: { element: XmlElement; suite: string; testcase: boolean }[] = [
+    { element: root, suite: "", testcase: false },
+  ];
+  while (stack.length > 0) {
+    const frame = stack.pop()!;
+    if (frame.testcase) {
+      visit(frame.element, frame.suite);
+      continue;
     }
-  };
-  walk(root, "");
+    const children = frame.element.children;
+    for (let k = children.length - 1; k >= 0; k--) {
+      const child = children[k];
+      const suite = child.name === "testsuite" ? child.attrs.name || frame.suite : frame.suite;
+      stack.push({ element: child, suite, testcase: child.name === "testcase" });
+    }
+  }
 
   return {
     causes: groupFailures(raws, options.contextPatterns),
@@ -79,6 +97,6 @@ export function parseJUnit(xml: string, options: ParseOptions): ParseOutput {
 export const junitParser: EvidenceParser = {
   id: "junit",
   source: "report",
-  detect: (text) => /<testsuites?[\s>]/.test(text),
+  detect: (text) => /<testsuites?[\s>]/.test(text.slice(0, 64 * 1024)),
   parse: parseJUnit,
 };
