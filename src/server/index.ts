@@ -397,7 +397,8 @@ const reviews = new ReviewManager({
   events: getEventBus(),
 });
 reviews.load(projectEntries);
-await registerReviewRoutes(fastify, reviews, () => getDefaultProject());
+// Merges, human reviews, finding resolutions and hold releases need the owner's session
+await registerReviewRoutes(fastify, reviews, () => getDefaultProject(), humanAuth);
 
 // Serve the built web UI (dist/client) with an SPA fallback, when it exists.
 // In development the UI comes from the Vite dev server on port 5173 instead.

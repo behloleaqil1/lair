@@ -5,19 +5,25 @@
  *   GET  /api/review/status                     enabled, config errors, repo, read-only
  *   GET  /api/review/prs                        open PRs with their last verdict
  *   GET  /api/review/prs/:number                tier, required vs present reviews, findings, gate, conditions, plan
- *   POST /api/review/prs/:number/reviews        {reviewer, head_sha, verdict, summary, findings[]}
+ *   POST /api/review/prs/:number/reviews        an agent's review {reviewer, head_sha, verdict, summary, findings[], assignment_token}
+ *   POST /api/review/prs/:number/owner-review   owner: a human review {reviewer, head_sha, verdict, summary, findings[]}
  *   POST /api/review/prs/:number/request-reviews
- *   POST /api/review/prs/:number/merge          {confirm: true, head_sha, by?}
- *   POST /api/review/findings/:id/resolve       {by: {id, kind}, status?, note}
+ *   POST /api/review/prs/:number/merge          owner: {confirm: true, head_sha, by?}
+ *   POST /api/review/findings/:id/resolve       owner: {by, status?, note}
  *   GET  /api/review/holds
- *   POST /api/review/holds                      {reason, pr?, by}
- *   POST /api/review/holds/:id/release          {by}
+ *   POST /api/review/holds                      {reason, pr?, by} (anyone may hold)
+ *   POST /api/review/holds/:id/release          owner: {by}
  *   POST /api/review/gate-results               a signed gate result
  *   GET  /api/review/merges
+ *
+ * "owner" routes need the owner's browser session (src/server/human-auth/),
+ * checked before the body is read; /api/review is in OWNER_ONLY_PREFIXES, so
+ * no CORS is granted for it. Agents can review only under an assignment.
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { rejectCrossSiteRequests } from "../origin.js";
+import type { HumanAuth } from "../human-auth/index.js";
 import { HostError } from "./host.js";
 import { ReviewError, type ReviewManager, type ReviewService } from "./service.js";
 import type { SignedGateResult } from "../../shared/policy-types.js";
@@ -78,9 +84,20 @@ const MergeBody = z
   })
   .strict();
 
+const OwnerReviewBody = z
+  .object({
+    /** The name to record the review under */
+    reviewer: ActorId,
+    head_sha: FullSha,
+    verdict: z.enum(["approve", "request_changes"]),
+    summary: z.string().max(10_000).default(""),
+    findings: z.array(Finding).max(200).default([]),
+  })
+  .strict();
+
 const ResolveBody = z
   .object({
-    by: Reviewer,
+    by: ActorId,
     status: z.enum(["resolved", "dismissed"]).default("resolved"),
     note: z.string().min(1).max(4000),
   })
@@ -134,9 +151,15 @@ const SignedGateBody = z
   .strict();
 
 /** Where a request came from, recorded with what it did. */
-function clientOf(request: FastifyRequest): ClientInfo {
+function clientOf(request: FastifyRequest, auth?: HumanAuth): ClientInfo {
   const agent = request.headers["user-agent"];
-  return { address: request.ip ?? null, userAgent: typeof agent === "string" ? agent.slice(0, 300) : null };
+  const client: ClientInfo = {
+    address: request.ip ?? null,
+    userAgent: typeof agent === "string" ? agent.slice(0, 300) : null,
+  };
+  const session = auth?.sessionOf(request);
+  if (session) client.ownerSession = session.id;
+  return client;
 }
 
 function firstIssue(error: z.ZodError): string {
@@ -148,9 +171,12 @@ export async function registerReviewRoutes(
   fastify: FastifyInstance,
   manager: ReviewManager,
   defaultProject: () => string,
+  /** The owner's credential: merges, human reviews, resolutions and hold releases need its session */
+  auth: HumanAuth,
 ): Promise<void> {
   await fastify.register(async (app) => {
     app.addHook("onRequest", rejectCrossSiteRequests);
+    const owner = { onRequest: auth.requireOwner("Only the owner can do this, from the dashboard signed in as the owner") };
 
     const projectOf = (query: unknown): string | null => {
       const parsed = ProjectQuery.safeParse(query ?? {});
@@ -214,6 +240,9 @@ export async function registerReviewRoutes(
       if (n === null) return fail(reply, 400, "Invalid PR number");
       const body = ReviewBody.safeParse(request.body);
       if (!body.success) return fail(reply, 400, `Invalid review: ${firstIssue(body.error)}`);
+      if (body.data.reviewer.kind === "human") {
+        return fail(reply, 403, "A human reviews from the dashboard, signed in as the owner (POST ./owner-review)");
+      }
       return withService(request.query, reply, (service) =>
         service.submitReview(
           n,
@@ -229,13 +258,33 @@ export async function registerReviewRoutes(
       );
     });
 
+    app.post("/api/review/prs/:number/owner-review", owner, async (request, reply) => {
+      const n = prNumber(request.params);
+      if (n === null) return fail(reply, 400, "Invalid PR number");
+      const body = OwnerReviewBody.safeParse(request.body);
+      if (!body.success) return fail(reply, 400, `Invalid review: ${firstIssue(body.error)}`);
+      return withService(request.query, reply, (service) =>
+        service.submitReview(
+          n,
+          {
+            reviewer: { id: body.data.reviewer, kind: "human" },
+            headSha: body.data.head_sha.toLowerCase(),
+            verdict: body.data.verdict,
+            summary: body.data.summary,
+            findings: body.data.findings,
+          },
+          { assignmentToken: null, client: clientOf(request, auth), owner: true },
+        ),
+      );
+    });
+
     app.post("/api/review/prs/:number/request-reviews", async (request, reply) => {
       const n = prNumber(request.params);
       if (n === null) return fail(reply, 400, "Invalid PR number");
       return withService(request.query, reply, (service) => service.requestReviews(n));
     });
 
-    app.post("/api/review/prs/:number/merge", async (request, reply) => {
+    app.post("/api/review/prs/:number/merge", owner, async (request, reply) => {
       const n = prNumber(request.params);
       if (n === null) return fail(reply, 400, "Invalid PR number");
       const body = MergeBody.safeParse(request.body ?? {});
@@ -245,7 +294,7 @@ export async function registerReviewRoutes(
           confirm: body.data.confirm,
           headSha: body.data.head_sha.toLowerCase(),
           by: body.data.by,
-          client: clientOf(request),
+          client: clientOf(request, auth),
         });
         if (!result.merged) {
           return fail(reply, 409, `Merge refused: ${result.reasons.join(" | ")}`, result);
@@ -254,13 +303,19 @@ export async function registerReviewRoutes(
       });
     });
 
-    app.post("/api/review/findings/:id/resolve", async (request, reply) => {
+    app.post("/api/review/findings/:id/resolve", owner, async (request, reply) => {
       const params = IdParams.safeParse(request.params);
       if (!params.success) return fail(reply, 400, "Invalid finding id");
       const body = ResolveBody.safeParse(request.body);
       if (!body.success) return fail(reply, 400, `Invalid resolution: ${firstIssue(body.error)}`);
       return withService(request.query, reply, (service) =>
-        service.resolveFinding(params.data.id, body.data.by, body.data.status, body.data.note, clientOf(request)),
+        service.resolveFinding(
+          params.data.id,
+          { id: body.data.by, kind: "human" },
+          body.data.status,
+          body.data.note,
+          clientOf(request, auth),
+        ),
       );
     });
 
@@ -276,7 +331,7 @@ export async function registerReviewRoutes(
       );
     });
 
-    app.post("/api/review/holds/:id/release", async (request, reply) => {
+    app.post("/api/review/holds/:id/release", owner, async (request, reply) => {
       const params = IdParams.safeParse(request.params);
       if (!params.success) return fail(reply, 400, "Invalid hold id");
       const body = ReleaseBody.safeParse(request.body);

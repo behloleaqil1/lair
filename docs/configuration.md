@@ -824,11 +824,16 @@ Globs use `**` (any directories), `*`, `?` and `{a,b}`; a glob without `/` match
 
 Defaults: `red: [human]`, `amber: [peer]`, `green: [self]`. Only an `approve` given at the PR's current head sha counts; a push makes every older review stale, and a reviewer's later review replaces its earlier one. The author is the agent Lair's own modules registered for the PR (the agent assigner or intake; never settable over HTTP), else the agent id that `authors.branch_pattern` finds in the PR's branch; its model comes from `dragons:` or `authors.models`. `branch_pattern` is a template, not a regular expression: `{agent}` (exactly once) is an agent id, `*` matches within one path segment and `**` (at most once) across segments, and everything else is literal, so `agent/{agent}/**` reads `worker-a` from `agent/worker-a/fix-login`. Branch names longer than 255 characters never match. With no author, `peer`, `self` and `different_model` can't be satisfied, and the status says so.
 
-A review has a fixed schema: `reviewer {id, kind: human|agent, model?}`, the full `head_sha`, `verdict` (`approve` or `request_changes`) and `findings[]` of `{severity, file, line, text, blocking}`. An agent's review also needs `assignment_token`: the token of an assignment Lair issued for that PR, head and agent (see below); without one, or with another agent's, another PR's or another head's, it is refused with 403. Every review, resolution and merge records the request's remote address and user agent. An approval can't carry blocking findings. An open blocking finding blocks the merge, even after a push, until its reviewer reviews again or it is resolved by its reviewer, a human, or an agent named in the red tier's reviewers (never the PR's author).
+A review has a fixed schema: a reviewer, the full `head_sha`, `verdict` (`approve` or `request_changes`) and `findings[]` of `{severity, file, line, text, blocking}`. Who may review:
+
+- **An agent** posts `{reviewer: {id, kind: agent, model?}, ..., assignment_token}`: the token of an assignment Lair issued for that PR, head and agent (see below). Without one, or with another agent's, another PR's or another head's, it is refused with 403.
+- **A human** reviews only as the owner: from the dashboard, in a browser signed in with the owner token (the same owner session as the Decision Inbox, `src/server/human-auth/`). A `kind: human` review on the agents' route is refused; the owner's route refuses any request without that session.
+
+An approval can't carry blocking findings. An open blocking finding blocks the merge, even after a push, until its reviewer reviews again or the owner resolves it (never in the PR's author's name). Resolving findings, releasing holds and merging are the owner's too; adding a hold is open to anyone, since it only stops merges. Every review, resolution and merge records the request's remote address and user agent, and the owner session for the owner's actions.
 
 ### Test integrity check
 
-Lair checks every PR, in every tier, at each new head, and records the result as a review by `lair:test-integrity`. Its checks are heuristics, so only its `high` and `critical` findings block, and only in `integrity.blocking_tiers` (default `[red]`); the rest are advisory. Only a human or a red-tier reviewer agent can dismiss one. It flags, with file and line (severity in brackets):
+Lair checks every PR, in every tier, at each new head, and records the result as a review by `lair:test-integrity`. Its checks are heuristics, so only its `high` and `critical` findings block, and only in `integrity.blocking_tiers` (default `[red]`); the rest are advisory. Only the owner can dismiss one. It flags, with file and line (severity in brackets):
 
 - `self-asserting-test` [high]: a test whose assertions can only check values it built itself or fakes' recorded calls, because it imports no production module that it actually uses (its imports are test libraries, fakes, type-only, mocked with `vi.mock`/`jest.mock`, or never referenced). Checked for JavaScript/TypeScript and Python, where a test must import what it tests. Relative imports count as production code, and so do other packages unless they are known test libraries; add your own package prefixes (such as `@/`) to `integrity.production_imports`;
 - `skipped-test` [high], `focused-test` [medium]: an added skip, disable or `.only` (Jest, Vitest, Mocha, pytest, unittest, JUnit, Go, Rust, .NET);
@@ -903,15 +908,16 @@ Other keys: `provider` (`github`), `api_url` (default `https://api.github.com`),
 
 ### Review API
 
-`?project=` defaults to the default project:
+`?project=` defaults to the default project. Routes marked (owner) need the owner's session (`X-Lair-Owner-Session`, from the dashboard), and `/api/review` is in `OWNER_ONLY_PREFIXES`, so no CORS is granted for it:
 
 - `GET /api/review/status`: on or off, config errors, repository, read-only
 - `GET /api/review/prs`: open PRs with the tier and verdict of their last evaluation at the current head
 - `GET /api/review/prs/:number`: the evaluation: tier and matched rules, required and present reviews, reviews, findings, the gate at the head, holds, every condition, and the merge plan
-- `POST /api/review/prs/:number/reviews` with `{reviewer, head_sha, verdict, summary, findings, assignment_token}` (the token for agents), `POST /api/review/prs/:number/request-reviews`
-- `POST /api/review/prs/:number/merge` with `{confirm: true, head_sha, by}`: 200 when merged, 409 with the reasons when refused, 403 for a read-only project
-- `POST /api/review/findings/:id/resolve` with `{by: {id, kind}, status: resolved|dismissed, note}`
-- `GET /api/review/holds`, `POST /api/review/holds` with `{reason, pr?, by}`, `POST /api/review/holds/:id/release` with `{by}`
+- `POST /api/review/prs/:number/reviews` (agents) with `{reviewer, head_sha, verdict, summary, findings, assignment_token}`, and `POST /api/review/prs/:number/request-reviews`
+- `POST /api/review/prs/:number/owner-review` (owner) with `{reviewer: name, head_sha, verdict, summary, findings}`
+- `POST /api/review/prs/:number/merge` (owner) with `{confirm: true, head_sha, by}`: 200 when merged, 409 with the reasons when refused, 403 without the owner's session or for a read-only project
+- `POST /api/review/findings/:id/resolve` (owner) with `{by: name, status: resolved|dismissed, note}`
+- `GET /api/review/holds`, `POST /api/review/holds` with `{reason, pr?, by}`, `POST /api/review/holds/:id/release` (owner) with `{by}`
 - `POST /api/review/gate-results` (a signed gate result), `GET /api/review/merges`
 
 ## Example complete configuration

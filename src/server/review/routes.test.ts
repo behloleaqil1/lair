@@ -5,9 +5,9 @@
  * the assertions are on what changed: the branch on the "host", the PR's
  * state, the stored merge record and the events published.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
-import { mkdtempSync, rmSync } from "fs";
+import { mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { EventBus } from "../core/event-bus.js";
@@ -15,6 +15,9 @@ import type { Event } from "../../shared/server-types.js";
 import type { ProjectConfig } from "../../shared/types.js";
 import { ReviewManager } from "./service.js";
 import { registerReviewRoutes } from "./routes.js";
+import { HumanAuth, OWNER_SESSION_HEADER, registerOwnerRoutes } from "../human-auth/index.js";
+import { signIn } from "../../client/owner-session";
+import { mergePr, releaseHold, resolveFinding, submitOwnerReview } from "../../client/review-api";
 import { FakeClock, FakeGit, FakeRemote, fakeGitHubApi, type FakeFile, type Person } from "./testing/fakes.js";
 
 const NOW = Date.parse("2026-03-02T12:00:00.000Z");
@@ -55,6 +58,7 @@ let manager: ReviewManager | null = null;
 let dir: string | null = null;
 
 afterEach(async () => {
+  vi.unstubAllGlobals();
   await app?.close();
   manager?.close();
   if (dir) rmSync(dir, { recursive: true, force: true });
@@ -129,8 +133,19 @@ async function boot() {
   ]);
   const server = Fastify();
   app = server;
-  await registerReviewRoutes(server, manager, () => "demo");
+  // The owner's credential, as src/server/index.ts wires it; fastify.close() closes it
+  const tokenPath = join(dir, "owner.token");
+  const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
+  await registerOwnerRoutes(server, auth);
+  await registerReviewRoutes(server, manager, () => "demo", auth);
   await server.ready();
+  const ownerToken = readFileSync(tokenPath, "utf-8").trim();
+  /** A browser on the dashboard signed in as the owner */
+  const owner = {
+    origin: "http://localhost:4777",
+    "sec-fetch-site": "same-origin",
+    [OWNER_SESSION_HEADER]: auth.createSession(ownerToken)!.session,
+  };
   /** Ask for the missing reviews; returns the token the assigner would hand to the reviewer agent. */
   const assign = async (pr: number, project = "demo"): Promise<string> => {
     const before = seen.length;
@@ -140,7 +155,7 @@ async function boot() {
     if (!event) throw new Error(`no agent assignment for PR ${pr}: ${res.body}`);
     return String(event.data.token);
   };
-  return { app: server, remote, base, head, seen, assign };
+  return { app: server, remote, base, head, seen, assign, owner, ownerToken };
 }
 
 async function review(
@@ -174,7 +189,7 @@ async function status(server: FastifyInstance, pr: number, project = "demo") {
 
 describe("review routes: review, policy, merge", () => {
   it("drives a review to a satisfied policy and merges locally (ff-only) over HTTP", async () => {
-    const { app, remote, base, head, seen, assign } = await boot();
+    const { app, remote, base, head, seen, assign, owner } = await boot();
 
     const list = (await app.inject({ url: "/api/review/prs" })).json();
     expect(list.data).toEqual([expect.objectContaining({ number: 7, headSha: head, tier: null, canMerge: null })]);
@@ -233,10 +248,21 @@ describe("review routes: review, policy, merge", () => {
     expect(ready.data.slots[0].satisfiedBy.reviewer.id).toBe("worker-b");
     expect(ready.data.conditions.every((c: { ok: boolean }) => c.ok)).toBe(true);
 
+    // Only the owner merges: an agent (no session) is refused, and nothing is pushed
+    const byAgent = await app.inject({
+      method: "POST",
+      url: "/api/review/prs/7/merge",
+      payload: { confirm: true, head_sha: head },
+    });
+    expect(byAgent.statusCode).toBe(403);
+    expect(byAgent.json().error).toContain("Only the owner");
+    expect(remote.branches.get("main")).toBe(base);
+
     // Without confirmation nothing happens
     const unconfirmed = await app.inject({
       method: "POST",
       url: "/api/review/prs/7/merge",
+      headers: owner,
       payload: { head_sha: head },
     });
     expect(unconfirmed.statusCode).toBe(400);
@@ -246,6 +272,7 @@ describe("review routes: review, policy, merge", () => {
     const merged = await app.inject({
       method: "POST",
       url: "/api/review/prs/7/merge",
+      headers: owner,
       payload: { confirm: true, head_sha: head, by: "owner" },
     });
     expect(merged.statusCode).toBe(200);
@@ -277,7 +304,7 @@ describe("review routes: review, policy, merge", () => {
   });
 
   it("refuses a merge whose commits carry an email outside the allow-list, before pushing", async () => {
-    const { app, remote, base, seen, assign } = await boot();
+    const { app, remote, base, seen, assign, owner } = await boot();
     const leaked = remote.commit([base], PRIVATE, "fix: tidy up");
     remote.openPull({ number: 8, title: "Tidy up", headRef: "agent/worker-a/tidy", headSha: leaked, files: [FEATURE] });
     remote.setChecks(leaked, [["build", "success"]]);
@@ -288,6 +315,7 @@ describe("review routes: review, policy, merge", () => {
     const res = await app.inject({
       method: "POST",
       url: "/api/review/prs/8/merge",
+      headers: owner,
       payload: { confirm: true, head_sha: leaked },
     });
     expect(res.statusCode).toBe(409);
@@ -314,7 +342,7 @@ describe("review routes: review, policy, merge", () => {
   });
 
   it("binds approvals to the head: a new push makes them stale, and a merge confirmed at the old head is refused", async () => {
-    const { app, remote, head, seen, assign } = await boot();
+    const { app, remote, head, seen, assign, owner } = await boot();
     const first = await assign(7);
     await review(app, 7, { id: "worker-b", kind: "agent" }, head, "approve", [], "demo", first);
     expect((await status(app, 7)).data.canMerge).toBe(true);
@@ -349,6 +377,7 @@ describe("review routes: review, policy, merge", () => {
     const old = await app.inject({
       method: "POST",
       url: "/api/review/prs/7/merge",
+      headers: owner,
       payload: { confirm: true, head_sha: head },
     });
     expect(old.statusCode).toBe(409);
@@ -358,8 +387,8 @@ describe("review routes: review, policy, merge", () => {
     expect((await status(app, 7)).data.canMerge).toBe(true);
   });
 
-  it("blocks on open blocking findings until the reviewer resolves them; the author can't", async () => {
-    const { app, head, assign } = await boot();
+  it("blocks on open blocking findings until the owner resolves them; an agent or the author can't", async () => {
+    const { app, head, assign, owner } = await boot();
     const token = await assign(7);
     const contradictory = await review(
       app,
@@ -394,20 +423,36 @@ describe("review routes: review, policy, merge", () => {
     expect(blocked.data.conditions.find((c: { id: string }) => c.id === "changes_requested")).toMatchObject({ ok: false });
     const finding = blocked.data.findings.find((f: { blocking: boolean }) => f.blocking);
 
-    const byAuthor = await app.inject({
+    // Without the owner's session (an agent, a script) it is refused before the body is read
+    const byAgent = await app.inject({
       method: "POST",
       url: `/api/review/findings/${finding.id}/resolve`,
-      payload: { by: { id: "worker-a", kind: "agent" }, note: "fixed it" },
+      payload: { by: "worker-b", note: "fixed it" },
     });
-    expect(byAuthor.statusCode).toBe(403);
+    expect(byAgent.statusCode).toBe(403);
+    // The owner can't resolve it in the author's name either
+    const asAuthor = await app.inject({
+      method: "POST",
+      url: `/api/review/findings/${finding.id}/resolve`,
+      headers: owner,
+      payload: { by: "worker-a", note: "fixed it" },
+    });
+    expect(asAuthor.statusCode).toBe(403);
 
-    const byReviewer = await app.inject({
+    const byOwner = await app.inject({
       method: "POST",
       url: `/api/review/findings/${finding.id}/resolve`,
-      payload: { by: { id: "worker-b", kind: "agent" }, note: "Bounded in the caller" },
+      headers: owner,
+      payload: { by: "owner", note: "Bounded in the caller" },
     });
-    expect(byReviewer.statusCode).toBe(200);
-    expect(byReviewer.json().data).toMatchObject({ status: "resolved", resolvedBy: "worker-b", resolution: "Bounded in the caller" });
+    expect(byOwner.statusCode).toBe(200);
+    expect(byOwner.json().data).toMatchObject({
+      status: "resolved",
+      resolvedBy: "owner",
+      resolution: "Bounded in the caller",
+      resolvedClient: { address: "127.0.0.1" },
+    });
+    expect(byOwner.json().data.resolvedClient.ownerSession).toEqual(expect.any(String));
 
     const stillObjecting = await status(app, 7);
     expect(stillObjecting.data.conditions.find((c: { id: string }) => c.id === "findings")).toMatchObject({ ok: true });
@@ -418,7 +463,7 @@ describe("review routes: review, policy, merge", () => {
   });
 
   it("holds stop a merge until released", async () => {
-    const { app, head, assign } = await boot();
+    const { app, head, assign, owner } = await boot();
     await review(app, 7, { id: "worker-b", kind: "agent" }, head, "approve", [], "demo", await assign(7));
     const hold = await app.inject({
       method: "POST",
@@ -432,6 +477,7 @@ describe("review routes: review, policy, merge", () => {
     const refused = await app.inject({
       method: "POST",
       url: "/api/review/prs/7/merge",
+      headers: owner,
       payload: { confirm: true, head_sha: head },
     });
     expect(refused.statusCode).toBe(409);
@@ -440,6 +486,7 @@ describe("review routes: review, policy, merge", () => {
     const released = await app.inject({
       method: "POST",
       url: `/api/review/holds/${hold.json().data.id}/release`,
+      headers: owner,
       payload: { by: "owner" },
     });
     expect(released.statusCode).toBe(200);
@@ -447,7 +494,7 @@ describe("review routes: review, policy, merge", () => {
   });
 
   it("validates input and reports projects without reviews", async () => {
-    const { app, head, assign } = await boot();
+    const { app, head, assign, owner } = await boot();
     expect((await app.inject({ url: "/api/review/prs/0" })).statusCode).toBe(400);
     expect((await app.inject({ url: "/api/review/prs/abc" })).statusCode).toBe(400);
     // An approval must name the full head sha
@@ -478,8 +525,136 @@ describe("review routes: review, policy, merge", () => {
     const merge = await app.inject({
       method: "POST",
       url: "/api/review/prs/7/merge?project=frozen",
+      headers: owner,
       payload: { confirm: true, head_sha: head },
     });
     expect(merge.statusCode).toBe(403);
   });
+
+  it("refuses human reviews, resolutions, hold releases and merges without the owner's session", async () => {
+    const { app, remote, base, head, assign, owner } = await boot();
+    const humanReview = { reviewer: "owner", head_sha: head, verdict: "approve" };
+    const dashboardOnly = { origin: owner.origin, "sec-fetch-site": owner["sec-fetch-site"] };
+
+    // A human-kind review through the agents' route is refused: humans review as the owner
+    const viaAgentRoute = await review(app, 7, { id: "owner", kind: "human" }, head);
+    expect(viaAgentRoute.statusCode).toBe(403);
+    expect(viaAgentRoute.json().error).toContain("owner-review");
+    // ...and the owner route needs the session, from the dashboard
+    for (const headers of [{}, dashboardOnly, { [OWNER_SESSION_HEADER]: owner[OWNER_SESSION_HEADER] }]) {
+      const res = await app.inject({ method: "POST", url: "/api/review/prs/7/owner-review", headers, payload: humanReview });
+      expect(res.statusCode).toBe(403);
+    }
+
+    const token = await assign(7);
+    await review(app, 7, { id: "worker-b", kind: "agent" }, head, "request_changes", [
+      { severity: "high", file: "src/feature.ts", line: 2, text: "Overflows", blocking: true },
+    ], "demo", token);
+    const finding = (await status(app, 7)).data.findings.find((f: { blocking: boolean }) => f.blocking);
+    const resolve = await app.inject({
+      method: "POST",
+      url: `/api/review/findings/${finding.id}/resolve`,
+      headers: dashboardOnly,
+      payload: { by: "owner", note: "fine" },
+    });
+    expect(resolve.statusCode).toBe(403);
+
+    // Anyone may add a hold; only the owner releases one
+    const hold = await app.inject({ method: "POST", url: "/api/review/holds", payload: { reason: "Freeze", by: "worker-b" } });
+    expect(hold.statusCode).toBe(200);
+    const release = await app.inject({
+      method: "POST",
+      url: `/api/review/holds/${hold.json().data.id}/release`,
+      payload: { by: "worker-b" },
+    });
+    expect(release.statusCode).toBe(403);
+
+    const merge = await app.inject({
+      method: "POST",
+      url: "/api/review/prs/7/merge",
+      headers: dashboardOnly,
+      payload: { confirm: true, head_sha: head },
+    });
+    expect(merge.statusCode).toBe(403);
+
+    const after = await status(app, 7);
+    expect(after.data.reviews.map((r: { reviewer: { id: string } }) => r.reviewer.id)).toEqual(["lair:test-integrity", "worker-b"]);
+    expect(after.data.findings.find((f: { id: string }) => f.id === finding.id).status).toBe("open");
+    expect(after.data.holds).toHaveLength(1);
+    expect(remote.branches.get("main")).toBe(base);
+  });
+
+  it("lets the owner review, resolve, release and merge through the dashboard's client helpers", async () => {
+    const { app, remote, head, ownerToken } = await boot();
+    vi.stubGlobal("localStorage", memoryStorage());
+    vi.stubGlobal("fetch", browserFetch(app));
+
+    // Not signed in yet: the helpers send no session and the server refuses
+    await expect(mergePr("demo", 7, head, "owner")).rejects.toThrow("not signed in as the owner");
+
+    await signIn(ownerToken);
+    const draft = { reviewer: "owner", headSha: head, summary: "" };
+    const objection = await submitOwnerReview("demo", 7, {
+      ...draft,
+      verdict: "request_changes",
+      findings: [{ severity: "high", file: "src/feature.ts", line: 2, text: "Check overflow", blocking: true }],
+    });
+    expect(objection.review).toMatchObject({ reviewer: { id: "owner", kind: "human" }, verdict: "request_changes" });
+    expect(objection.review.client?.ownerSession).toEqual(expect.any(String));
+    const resolved = await resolveFinding("demo", objection.review.findings[0].id, { by: "owner", note: "Checked" });
+    expect(resolved).toMatchObject({ status: "resolved", resolvedBy: "owner" });
+    await submitOwnerReview("demo", 7, { ...draft, verdict: "approve", findings: [] });
+
+    const hold = await app.inject({ method: "POST", url: "/api/review/holds", payload: { reason: "Freeze", by: "owner" } });
+    expect((await status(app, 7)).data.canMerge).toBe(false);
+    expect(await releaseHold("demo", hold.json().data.id, "owner")).toMatchObject({ releasedBy: "owner" });
+
+    // The owner fills the amber tier's peer slot, so it can merge
+    const ready = await status(app, 7);
+    expect(ready.data.slots[0].satisfiedBy.reviewer).toEqual({ id: "owner", kind: "human" });
+    const merged = await mergePr("demo", 7, head, "owner");
+    expect(merged).toMatchObject({ merged: true, record: { pr: 7, resultSha: head, initiatedBy: "owner" } });
+    expect(merged.record?.client?.ownerSession).toEqual(objection.review.client?.ownerSession);
+    expect(remote.branches.get("main")).toBe(head);
+  });
 });
+
+/** localStorage for one origin. */
+function memoryStorage(): Storage {
+  const values = new Map<string, string>();
+  return {
+    get length() {
+      return values.size;
+    },
+    clear: () => values.clear(),
+    getItem: (key: string) => values.get(key) ?? null,
+    key: (index: number) => [...values.keys()][index] ?? null,
+    removeItem: (key: string) => void values.delete(key),
+    setItem: (key: string, value: string) => void values.set(key, String(value)),
+  };
+}
+
+/**
+ * A browser on the dashboard (origin http://127.0.0.1:4777) as the client
+ * helpers' fetch: it resolves relative URLs, adds Origin to non-GET requests
+ * and Sec-Fetch-Site: same-origin to all, and goes to the test server.
+ */
+function browserFetch(server: FastifyInstance) {
+  const origin = "http://127.0.0.1:4777";
+  return async (input: string | URL | Request, init: RequestInit = {}): Promise<Response> => {
+    const url = new URL(String(input), origin);
+    const method = (init.method ?? "GET").toUpperCase() as "GET" | "POST";
+    const headers: Record<string, string> = {
+      ...((init.headers as Record<string, string> | undefined) ?? {}),
+      "sec-fetch-site": "same-origin",
+    };
+    if (method !== "GET") headers.origin = origin;
+    const res = await server.inject({
+      method,
+      url: url.pathname + url.search,
+      headers,
+      payload: typeof init.body === "string" ? init.body : undefined,
+    });
+    return new Response(res.body, { status: res.statusCode, headers: { "content-type": "application/json" } });
+  };
+}

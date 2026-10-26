@@ -9,8 +9,17 @@
 import type { FastifyRequest } from "fastify";
 import type { FastifyCorsOptions } from "@fastify/cors";
 
-/** Paths that take the owner session (src/server/index.ts passes these to corsOptionsWithout). */
-export const OWNER_ONLY_PREFIXES: readonly string[] = ["/api/owner", "/api/decisions"];
+/**
+ * Paths that take the owner session: no CORS is ever granted under them.
+ *
+ * A module that registers a route with `requireOwner()` adds its prefix
+ * here, in this list, at build time. src/server/index.ts passes the list to
+ * corsOptionsWithout() once, when it registers @fastify/cors, so a prefix
+ * added at runtime would not take effect; there is deliberately no helper
+ * to add one. Prefer a module's whole prefix (e.g. /api/review) over single
+ * routes, so a new owner-only route under it can't be forgotten here.
+ */
+export const OWNER_ONLY_PREFIXES: readonly string[] = ["/api/owner", "/api/decisions", "/api/review"];
 
 export function isUnder(url: string, prefixes: readonly string[]): boolean {
   const path = url.split("?")[0];

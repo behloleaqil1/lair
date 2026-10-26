@@ -137,7 +137,8 @@ function setup(review: Record<string, unknown>, files: FakeFile[], labels: strin
 }
 
 let current: Setup | null = null;
-const NO_CONTEXT = { assignmentToken: null, client: null };
+/** A human review comes from the owner (the routes check the owner's session) */
+const OWNER_CONTEXT = { assignmentToken: null, client: null, owner: true };
 
 /**
  * Submit a review. A human reviews directly; an agent first needs an
@@ -152,7 +153,7 @@ async function reviewAs(
 ) {
   const s = current!;
   const input = { reviewer, headSha, verdict, summary: "", findings: [] };
-  if (reviewer.kind !== "agent") return s.service.submitReview(n, input, NO_CONTEXT);
+  if (reviewer.kind !== "agent") return s.service.submitReview(n, input, OWNER_CONTEXT);
   await s.service.requestReviews(n);
   const assignment = [...s.assignments]
     .reverse()
@@ -259,7 +260,7 @@ describe("test integrity check in the policy", () => {
       "author",
     );
     await expect(service.resolveFinding(finding.id, { id: "worker-b", kind: "agent" }, "dismissed", "fine")).rejects.toThrow(
-      "Only a human",
+      "Only the owner",
     );
     const dismissed = await service.resolveFinding(finding.id, { id: "owner", kind: "human" }, "dismissed", "Smoke test");
     expect(dismissed).toMatchObject({ status: "dismissed", resolvedBy: "owner" });

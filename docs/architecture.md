@@ -127,7 +127,7 @@ The Decision Inbox ([configuration](configuration.md#decision-inbox)): the one p
 
 #### Owner credential (`human-auth/`)
 
-Who may use the routes only the human may use: answering decisions today, shared with other owner-only routes ([configuration](configuration.md#decision-inbox)).
+Who may use the routes only the human may use: answering decisions, and in reviews merging, human reviews, resolving findings and releasing holds ([configuration](configuration.md#decision-inbox)).
 
 - **`human-auth.ts`**: `HumanAuth`: the owner token (`data/owner.token`, mode 0600) and its one-time setup link, browser sessions stored only as HMACs (`data/owner-sessions.db`), `verifyRequest()` (the `X-Lair-Owner-Session` header, the dashboard `Origin`, `Sec-Fetch-Site: same-origin`), and the `requireOwner()` / `requireDashboard()` route hooks
 - **`routes.ts`**: `/api/owner/*`: sign a browser in, check, list and sign out browsers
@@ -228,7 +228,7 @@ Each view is a standalone component:
 - **`Activity.tsx`**, **`LiveFeed.tsx`**: fleet bus activity feed
 - **`Health.tsx`**: watchdog SLO status, open breaches and playbook runs (read-only)
 - **`Delivery.tsx`**: environments and services (state, health, restarts, holds, crash loops, error lines) with Up, Down, Restart, Deploy and Release, and the operations log. Its requests are built in `delivery-api.ts`
-- **`Reviews.tsx`**: per PR, the risk tier, required and present reviews, findings, the gate at the head and the merge button with its reasons (view logic in `review-view.ts`)
+- **`Reviews.tsx`**: per PR, the risk tier, required and present reviews, findings, the gate at the head, holds and the merge button with its reasons (view logic in `review-view.ts`, requests in `review-api.ts`, owner-only ones with the owner session)
 - **`Inbox.tsx`**: owner inbox and orchestrator replies
 - **`CommandBar.tsx`**: ask / instruct / task command bar
 - **`Settings.tsx`**: project configuration UI

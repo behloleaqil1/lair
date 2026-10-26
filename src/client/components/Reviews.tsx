@@ -11,12 +11,13 @@
 import { useEffect, useState } from "react";
 import { useApi } from "../hooks/useApi";
 import type {
-  MergeResponse,
+  MergeHold,
   PrReviewStatus,
   PrSummary,
   ReviewFinding,
   ReviewProjectInfo,
 } from "../../shared/review-types";
+import { mergePr, prStatus, releaseHold, requestReviews, resolveFinding, submitOwnerReview } from "../review-api";
 import {
   GATE_BADGE,
   TIER_BADGE,
@@ -31,12 +32,6 @@ interface Props {
   refreshKey: number;
 }
 
-interface ApiResult<T> {
-  success: boolean;
-  data?: T;
-  error?: string;
-}
-
 const muted = { color: "var(--text-secondary)", fontSize: "0.85rem" };
 
 function buttonStyle(kind: "primary" | "danger" | "plain", disabled = false) {
@@ -49,15 +44,6 @@ function buttonStyle(kind: "primary" | "danger" | "plain", disabled = false) {
     cursor: disabled ? "not-allowed" : "pointer",
     opacity: disabled ? 0.5 : 1,
   };
-}
-
-async function post<T>(url: string, body: unknown): Promise<ApiResult<T>> {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body ?? {}),
-  });
-  return (await res.json()) as ApiResult<T>;
 }
 
 function Flag({ ok }: { ok: boolean }) {
@@ -82,8 +68,6 @@ export function Reviews({ project, refreshKey }: Props) {
   const [summary, setSummary] = useState("");
   const [findingText, setFindingText] = useState("");
 
-  const query = `?project=${encodeURIComponent(project)}`;
-
   useEffect(() => {
     setSelected(null);
     setStatus(null);
@@ -94,32 +78,26 @@ export function Reviews({ project, refreshKey }: Props) {
     let cancelled = false;
     setLoading(true);
     setStatusError(null);
-    fetch(`/api/review/prs/${selected}${query}`)
-      .then((res) => res.json())
-      .then((result: ApiResult<PrReviewStatus>) => {
-        if (cancelled) return;
-        if (result.success && result.data) setStatus(result.data);
-        else setStatusError(result.error ?? "Unknown error");
+    prStatus(project, selected)
+      .then((data) => {
+        if (!cancelled) setStatus(data);
       })
       .catch((e) => !cancelled && setStatusError(e instanceof Error ? e.message : "Network error"))
       .finally(() => !cancelled && setLoading(false));
     return () => {
       cancelled = true;
     };
-  }, [selected, query, localKey]);
+  }, [selected, project, localKey]);
 
   const refresh = () => setLocalKey((k) => k + 1);
 
-  const act = async <T,>(label: string, url: string, body: unknown, done?: (data: T | undefined) => string) => {
+  /** Run an action; owner-only ones fail with the server's 403 when this browser isn't signed in as the owner. */
+  const act = async <T,>(label: string, run: () => Promise<T>, done?: (data: T) => string) => {
     setBusy(true);
     setMessage(null);
     try {
-      const result = await post<T>(url, body);
-      setMessage(
-        result.success
-          ? { ok: true, text: done ? done(result.data) : `${label}: done` }
-          : { ok: false, text: `${label}: ${result.error ?? "failed"}` },
-      );
+      const data = await run();
+      setMessage({ ok: true, text: done ? done(data) : `${label}: done` });
     } catch (e) {
       setMessage({ ok: false, text: `${label}: ${e instanceof Error ? e.message : "network error"}` });
     } finally {
@@ -131,24 +109,19 @@ export function Reviews({ project, refreshKey }: Props) {
   const merge = async () => {
     if (!status) return;
     setConfirming(false);
-    await act<MergeResponse>(
+    await act(
       "Merge",
-      `/api/review/prs/${status.number}/merge${query}`,
-      { confirm: true, head_sha: status.headSha, by: reviewer || "dashboard" },
-      (data) => `Merged #${status.number} as ${data?.record?.resultSha ? shortSha(data.record.resultSha) : "?"}`,
+      () => mergePr(project, status.number, status.headSha, reviewer || "owner"),
+      (data) => `Merged #${status.number} as ${data.record?.resultSha ? shortSha(data.record.resultSha) : "?"}`,
     );
   };
 
   const submitReview = async () => {
     if (!status) return;
     const findings = parseFindingLines(findingText, verdict === "request_changes");
-    await act("Review", `/api/review/prs/${status.number}/reviews${query}`, {
-      reviewer: { id: reviewer, kind: "human" },
-      head_sha: status.headSha,
-      verdict,
-      summary,
-      findings,
-    });
+    await act("Review", () =>
+      submitOwnerReview(project, status.number, { reviewer, headSha: status.headSha, verdict, summary, findings }),
+    );
     setSummary("");
     setFindingText("");
   };
@@ -156,11 +129,11 @@ export function Reviews({ project, refreshKey }: Props) {
   const resolve = async (finding: ReviewFinding) => {
     const note = window.prompt(`Why is this finding resolved?\n\n${finding.text}`);
     if (!note) return;
-    await act("Resolve", `/api/review/findings/${finding.id}/resolve${query}`, {
-      by: { id: reviewer, kind: "human" },
-      status: "resolved",
-      note,
-    });
+    await act("Resolve", () => resolveFinding(project, finding.id, { by: reviewer, note }));
+  };
+
+  const release = async (hold: MergeHold) => {
+    await act("Release", () => releaseHold(project, hold.id, reviewer || "owner"));
   };
 
   if (info.loading && !info.data) return <div className="loading">Loading reviews...</div>;
@@ -324,7 +297,7 @@ export function Reviews({ project, refreshKey }: Props) {
                 type="button"
                 style={buttonStyle("plain", busy)}
                 disabled={busy || status.slots.every((s) => s.satisfiedBy !== null)}
-                onClick={() => act("Request reviews", `/api/review/prs/${status.number}/request-reviews${query}`, {})}
+                onClick={() => act("Request reviews", () => requestReviews(project, status.number))}
               >
                 Request missing reviews
               </button>
@@ -469,6 +442,31 @@ export function Reviews({ project, refreshKey }: Props) {
             </table>
           </div>
 
+          {status.holds.length > 0 && (
+            <div className="card">
+              <h3>Holds</h3>
+              <table className="table">
+                <tbody>
+                  {status.holds.map((h) => (
+                    <tr key={h.id}>
+                      <td style={{ fontSize: "0.85rem" }}>
+                        {h.reason}
+                        <div style={muted}>
+                          {h.pr === null ? "every PR" : `PR #${h.pr}`} · by {h.createdBy}
+                        </div>
+                      </td>
+                      <td>
+                        <button type="button" style={buttonStyle("plain", busy)} disabled={busy} onClick={() => release(h)}>
+                          Release
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
           <div className="card">
             <h3>Merge</h3>
             <table className="table">
@@ -504,6 +502,10 @@ export function Reviews({ project, refreshKey }: Props) {
             >
               {button.label}
             </button>
+            <p style={{ ...muted, marginTop: "0.5rem" }}>
+              Merging, reviewing, resolving and releasing a hold need this browser signed in as the owner (see
+              Decisions).
+            </p>
             {button.reasons.length > 0 && (
               <ul style={{ ...muted, marginTop: "0.5rem" }}>
                 {button.reasons.map((r) => (

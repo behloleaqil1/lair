@@ -474,10 +474,14 @@ export class ReviewService {
   async submitReview(
     n: number,
     input: ReviewInput,
-    context: { assignmentToken: string | null; client: ClientInfo | null },
+    /** `owner`: the request carried the owner's session (required for a human review) */
+    context: { assignmentToken: string | null; client: ClientInfo | null; owner?: boolean },
   ): Promise<{ review: ReviewRecord; stale: boolean }> {
     if (input.reviewer.kind === "check") {
       throw new ReviewError("reviewer.kind check is reserved for Lair's own checks", 400);
+    }
+    if (input.reviewer.kind === "human" && context.owner !== true) {
+      throw new ReviewError("A human review needs the owner's session (the dashboard, signed in as the owner)", 403);
     }
     if (input.verdict === "approve" && input.findings.some((f) => f.blocking)) {
       throw new ReviewError("An approval can't carry blocking findings: use request_changes", 400);
@@ -552,9 +556,9 @@ export class ReviewService {
   }
 
   /**
-   * Resolve or dismiss a finding. Allowed for the reviewer who raised it, a
-   * human, or an agent named in the red tier's reviewers; never the author.
-   * Check findings (the integrity check) only by a human or such an agent.
+   * Resolve or dismiss a finding: only the owner (the routes check its
+   * session), never the PR's author. A reviewer agent withdraws its own
+   * finding by reviewing again, which replaces its earlier review.
    */
   async resolveFinding(
     id: string,
@@ -575,18 +579,8 @@ export class ReviewService {
     if (author && by.id === author.id) {
       throw new ReviewError("The PR's author can't resolve findings on their own PR", 403);
     }
-    const strongAgents = this.settings.reviewers.red
-      .flatMap((slot) => slot.anyOf)
-      .flatMap((o) => (o.kind === "agent" ? [o.agent] : []));
-    const isStrong = by.kind === "human" || (by.kind === "agent" && strongAgents.includes(by.id));
-    const isOwn = finding.reviewer.kind !== "check" && by.id === finding.reviewer.id;
-    if (!isStrong && !isOwn) {
-      throw new ReviewError(
-        finding.reviewer.kind === "check"
-          ? "Only a human or a red-tier reviewer agent can resolve a check's finding"
-          : `Only ${finding.reviewer.id}, a human or a red-tier reviewer agent can resolve this finding`,
-        403,
-      );
+    if (by.kind !== "human") {
+      throw new ReviewError("Only the owner resolves findings; a reviewer withdraws its own by reviewing again", 403);
     }
     this.o.store.resolveFinding(this.project, id, { status, by: by.id, note, at: this.now(), client });
     return this.annotate(this.o.store.listReviews(this.project, prNumber), pr.headSha)

@@ -21,6 +21,8 @@ export interface ReviewerRef {
 export interface ClientInfo {
   address: string | null;
   userAgent: string | null;
+  /** The owner session (its public id) that made the request, for owner-only actions */
+  ownerSession?: string;
 }
 
 export type Verdict = "approve" | "request_changes";
