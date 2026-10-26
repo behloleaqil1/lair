@@ -464,15 +464,21 @@ Each decision shows:
 
 You answer by choosing an option, with an optional note. Answers to `spend` and `go_no_go` decisions ask you to confirm first.
 
-**Only you answer.** The first time the server starts, it writes a random **answer token** to `data/decisions.answer-token` (readable only by your OS user) and prints a setup link once:
+**Only you answer.** The first time the server starts, it writes a random **owner token** to `data/owner.token` (readable only by your OS user) and prints a setup link, once, to its standard output (the terminal you ran `npm start` in, or your service manager's log):
 
 ```
-[decisions] Answering decisions is locked to your browser. Open this link once to unlock it: http://127.0.0.1:4777/#answer-token=...
+[owner] Only you answer decisions. Open this link once in your browser to sign it in: http://127.0.0.1:4777/#owner-token=...
 ```
 
-Open that link, or paste the token in the Decisions view, and answering is unlocked in that browser: it gets a session cookie that page scripts can't read (`HttpOnly`) and other sites can't make it send (`SameSite=Strict`). An answer is accepted only with that cookie, from the dashboard's own origin, in a same-origin browser request. Anything else, such as `curl`, a script or an agent, gets HTTP 403 and the decision stays open, so the work it gates can't approve itself. The audit trail records each answer as the owner's, with the address and browser it came from. Delete the token file and restart to issue a new token, which signs out every browser.
+Open that link, or paste the token in the Decisions view, and that browser is **signed in as the owner**. It gets a random session that it keeps in the dashboard's own `localStorage`, which belongs to the dashboard's exact origin (scheme, host and port), so no other local server can read it. The server stores only a keyed hash of the session. No cookie is used: browsers send cookies for `localhost` to every port, so any other local server the browser visits would get one.
 
-This keeps out other programs on your machine **unless they run as your OS user and read `data/`**: such a program can read the token. Running your agents as a separate OS user, without access to Lair's `data/` directory, closes that gap.
+An answer is accepted only with that session in the `X-Lair-Owner-Session` header, from the dashboard's own origin, in a same-origin browser request (`Origin` and `Sec-Fetch-Site: same-origin`). No CORS is granted for these routes, so a page on another origin can't send that header. Anything else gets HTTP 403 before its body is read, and the decision stays open: `curl`, a script, an agent, another local app, or a request with a forged `Origin` but no session. The work a decision gates can't approve itself. The audit trail records each answer as the owner's, with the address and browser it came from.
+
+- **Signed-in browsers.** The Decisions view lists the browsers signed in as the owner, with when each signed in, when it was last used, and its user agent. You can sign any of them out there, including the one you're using. Signing out needs a signed-in browser. At most 20 sessions are kept; the least recently used one goes first.
+- **Signing every browser out.** Delete `data/owner.token` and restart the server. The new token makes every old session invalid, and the server prints a new setup link.
+- **Keep the setup link and the token from your agents.** Don't run the server where its output goes somewhere your agents can read, such as a shared terminal, a log file in the project, or an agent's own session. Run your agents as a separate OS user, without access to Lair's `data/` directory or the server's log. A program running as your OS user can read both, and with them sign itself in.
+- **Browsers.** Answering needs a browser that sends `Sec-Fetch-Site`: current Chrome, Edge, Firefox and Safari do. Safari before 16.4 doesn't, so its answers are refused.
+- **Links in a decision** are shown as text with a Copy button, never as links you click: whoever raised the decision chose them. Links to this machine or a private network (`localhost`, `*.localhost`, `*.local`, names without a dot, `127.0.0.0/8`, `::1`, `10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `fc00::/7`, `fe80::/10`) are refused when the decision is raised. A public name can still resolve to a local address, so check an address before you open it.
 
 | Kind | For | Can it have a default? |
 |------|-----|------------------------|
@@ -490,9 +496,9 @@ This keeps out other programs on your machine **unless they run as your OS user 
 
 **Expiry and defaults.** A decision may expire. A decision with a **default** gets that option as its answer when it expires unanswered, and its history says so. Kinds marked "no" above can't have a default: Lair never decides those for you. A decision without a default keeps waiting after it expires, and is marked overdue.
 
-**Credentials.** A `credentials` decision has a password field and no note field (a note could end up holding the secret). The value goes to Lair's secret store and nowhere else: not to `data/decisions.db`, the history, a log line or any API response. The decision records only that you supplied it. It is handed to the secret store only once your answer has closed the decision, so a second, losing answer never stores anything; if the secret store fails, the decision is open again. Lair's built-in secret store keeps values in the server's memory only, never on disk, so after a restart the module that needs the value asks again. A persistent store (an OS keychain, a vault) can replace it through the `SecretStore` interface in `src/server/decisions/secrets.ts`.
+**Credentials.** A `credentials` decision has a password field and no note field (a note could end up holding the secret). The value goes to Lair's secret store and nowhere else: not to `data/decisions.db`, the history, a log line or any API response. The decision records only that you supplied it. It is handed to the secret store only once your answer has closed the decision, so a second, losing answer never stores anything; if the secret store fails, the decision is open again. If the server restarts before the module that asked has the answer, and the secret store forgot the value meanwhile (the built-in one does), the decision opens again too, so you supply it once more. Lair's built-in secret store keeps values in the server's memory only, never on disk, so after a restart the module that needs the value asks again. A persistent store (an OS keychain, a vault) can replace it through the `SecretStore` interface in `src/server/decisions/secrets.ts`.
 
-**From your own tools.** Any module, script or agent can ask through the API below; only you answer. One module may have at most 50 open decisions per project (`LAIR_DECISIONS_MAX_OPEN` changes that); more are refused with HTTP 429 until some are answered. Answering doesn't run anything by itself, so it also works on a `read_only` project: the module that asked decides what the answer allows. Server modules use the `DecisionProducer` interface (`raise`, `blockedOn`, `onResolved`, `withdraw`) from `src/server/decisions/`. Only they can withdraw a decision: HTTP callers have no identity yet, so there is no withdraw route.
+**From your own tools.** Any module, script or agent can ask through the API below; only you answer. Two limits keep a flood of questions out: one module may have at most 50 open decisions per project (`LAIR_DECISIONS_MAX_OPEN`), and decisions raised over HTTP may have at most 20 open per project together, whatever module they name, since over HTTP the module name is only what the caller says (`LAIR_DECISIONS_MAX_OPEN_HTTP`). More are refused with HTTP 429 until some are answered. Modules inside the server count only against their own limit. A decision raised over HTTP shows that, so you know its module name is unchecked. Answering doesn't run anything by itself, so it also works on a `read_only` project: the module that asked decides what the answer allows. Server modules use the `DecisionProducer` interface (`raise`, `blockedOn`, `onResolved`, `withdraw`) from `src/server/decisions/`. Only they can withdraw a decision: HTTP callers have no identity yet, so there is no withdraw route.
 
 ### Decision Inbox API
 
@@ -500,8 +506,8 @@ This keeps out other programs on your machine **unless they run as your OS user 
 
 - `GET /api/decisions?project=&status=open|answered|expired|withdrawn|closed|all&limit=100`: open first, by urgency. Without `?project=`, every project's decisions
 - `GET /api/decisions/summary?project=`: `{open, overdue, secretStore}`
-- `GET /api/decisions/session`: `{answering}`, whether answering is unlocked in this browser
-- `POST /api/decisions/session`: `{token}`, from the dashboard only: sets the answer session cookie
+- `GET /api/owner/session`: `{signedIn, session}` for the `X-Lair-Owner-Session` header sent
+- `POST /api/owner/sessions`: `{token}`, from the dashboard only: signs this browser in and returns `{session, info}`, the session value only this once. `GET /api/owner/sessions` lists the signed-in browsers and `POST /api/owner/sessions/:id/revoke` signs one out; both need a signed-in browser
 - `GET /api/decisions/:id`: one decision with its audit trail
 - `POST /api/decisions?project=`: raise a decision (201, or 200 with the open one when the same key is already open). The project comes from `?project=`, else the default project:
 
@@ -522,10 +528,10 @@ This keeps out other programs on your machine **unless they run as your OS user 
   }
   ```
 
-  `blocks`, `links` (`[{label, url}]`, http or https only), `expiresAt` and `defaultOptionId` are optional. A default needs `expiresAt`, and is refused for the kinds above that can't have one. A `credentials` decision also needs `secretName` and an option with `"suppliesSecret": true`.
-- `POST /api/decisions/:id/answer`: `{optionId, note?, confirm?, secret?}`, from the Decisions view only (see "Only you answer"). `confirm: true` is required for `spend` and `go_no_go`; `secret` goes only with an option that supplies it, and `credentials` decisions take no `note`
+  `blocks`, `links` (`[{label, url}]`, http or https, not to this machine or a private network), `expiresAt` and `defaultOptionId` are optional. A default needs `expiresAt`, and is refused for the kinds above that can't have one. A `credentials` decision also needs `secretName` and an option with `"suppliesSecret": true`.
+- `POST /api/decisions/:id/answer`: `{optionId, note?, confirm?, secret?}`, with an owner session (see "Only you answer"). `confirm: true` is required for `spend` and `go_no_go`; `secret` goes only with an option that supplies it, and `credentials` decisions take no `note`
 
-Errors: 400 for invalid input, 403 for a cross-site request or an answer from outside the Decisions view, 404 for an unknown decision, 409 when it is no longer open, 429 when a module has too many open decisions, 503 when the secret store can't take a value.
+Errors: 400 for invalid input, 403 for a cross-site request or an answer without an owner session, 404 for an unknown decision, 409 when it is no longer open, 429 when a module, or HTTP callers together, have too many open decisions, 503 when the secret store can't take a value.
 
 ## Watchdog
 
@@ -818,6 +824,7 @@ Project names (the file name without `.yaml` or `.yml`) must start with a letter
 | `LAIR_PROJECT` | server | The default project: the one the dashboard opens first, the one API requests without `?project=` use, and the one whose `processes:` the process manager runs. It must name a project in `projects/` or `projects/local/` (for example `LAIR_PROJECT=myproject`); an invalid or unknown name logs a warning at startup and is ignored. Without it the default is `example` if it exists, else the first project found |
 | `LAIR_CLIENT_DIR` | server | Directory of the built web UI to serve (default `dist/client`) |
 | `LAIR_DECISIONS_MAX_OPEN` | server | How many open decisions one module may have per project in the [Decision Inbox](#decision-inbox) (default `50`). More are refused with HTTP 429 |
+| `LAIR_DECISIONS_MAX_OPEN_HTTP` | server | How many open decisions raised over HTTP one project may have, whatever module they name (default `20`). More are refused with HTTP 429 |
 | `LAIR_AGENT_ID` | lair-bus | The calling agent's ID (required) |
 | `LAIR_GITHUB_TOKEN` | server | A fine-grained GitHub token for running gate pipelines on GitHub Actions (see [Gate pipelines](#gate-pipelines)). A project can name another variable with `executors.github.token_env`. Never passed to local steps |
 

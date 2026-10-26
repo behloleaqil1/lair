@@ -120,11 +120,18 @@ The Decision Inbox ([configuration](configuration.md#decision-inbox)): the one p
 
 - **`types.ts`**: the `DecisionProducer` interface other modules use: `raise` (deduplicated per project, module and key), `blockedOn` (is this work parked?), `onResolved` (resume with the answer, delivered again after a restart until the handler takes it) and `withdraw`
 - **`validate.ts`**: input validation for decisions, answers and withdrawals; the kinds that can't have a default
-- **`service.ts`**: `DecisionInbox`: answers (confirmation for spend and go/no-go; a credentials secret is stored only once the answer has won), expiry with defaults or overdue marks, the open-decision cap, delivery to producers, the sweep timer
+- **`service.ts`**: `DecisionInbox`: answers (confirmation for spend and go/no-go; a credentials secret is stored only once the answer has won), expiry with defaults or overdue marks, the open-decision caps (per module, and per project for HTTP raises), delivery to producers (reopening a credentials answer whose secret is gone), the sweep timer
 - **`secrets.ts`**: the `SecretStore` interface credentials answers go to, and the in-memory stub
-- **`answer-auth.ts`**: who may answer: the answer token (`data/decisions.answer-token`, mode 0600), the session cookie the Decisions view gets with it, and the same-origin dashboard check on every answer
-- **`store.ts`**: decisions, the work they block and their audit trail in SQLite (`data/decisions.db`)
-- **`routes.ts`**, **`mount.ts`**: the `/api/decisions` routes (answering only with the answer session; no HTTP withdraw), and `mountDecisions()`, which `index.ts` calls to wire the store, the answer token, routes, sweeps and producers (the watchdog)
+- **`store.ts`**: decisions (and whether each was raised over HTTP), the work they block and their audit trail in SQLite (`data/decisions.db`)
+- **`routes.ts`**, **`mount.ts`**: the `/api/decisions` routes (answering only with an owner session; no HTTP withdraw), and `mountDecisions()`, which `index.ts` calls to wire the store, routes, sweeps and producers (the watchdog)
+
+#### Owner credential (`human-auth/`)
+
+Who may use the routes only the human may use: answering decisions today, shared with other owner-only routes ([configuration](configuration.md#decision-inbox)).
+
+- **`human-auth.ts`**: `HumanAuth`: the owner token (`data/owner.token`, mode 0600) and its one-time setup link, browser sessions stored only as HMACs (`data/owner-sessions.db`), `verifyRequest()` (the `X-Lair-Owner-Session` header, the dashboard `Origin`, `Sec-Fetch-Site: same-origin`), and the `requireOwner()` / `requireDashboard()` route hooks
+- **`routes.ts`**: `/api/owner/*`: sign a browser in, check, list and sign out browsers
+- **`cors.ts`**: the CORS options `index.ts` uses: the dev server's origins, but none for owner-only paths
 
 #### Watchdog (`watchdog/`)
 
@@ -194,7 +201,8 @@ React-based frontend built with Vite.
 Each view is a standalone component:
 
 - **`Overview.tsx`**: repo status, problems, counts
-- **`DecisionInbox.tsx`**: the Decision Inbox (open decisions with their context, options and recommendation, a confirmation step for spend and go/no-go, a password field for credentials, history) and the nav badge with the open count. Its requests and answer rules are in `decisions-api.ts`
+- **`DecisionInbox.tsx`**: the Decision Inbox (open decisions with their context, links as text to copy, options and recommendation, a confirmation step for spend and go/no-go, a password field for credentials, history, signing in as the owner) and the nav badge with the open count. Its requests and answer rules are in `decisions-api.ts`; the owner session (kept in this origin's `localStorage`, sent as a header) is in `owner-session.ts`
+- **`OwnerSessions.tsx`**: the signed-in browsers, each with Sign out
 - **`Dragons.tsx`**, **`DragonStartDialog.tsx`**, **`DragonStopDialog.tsx`**: agent list, start and stop dialogs
 - **`Gates.tsx`**, **`PipelineRuns.tsx`**: gate queue by lane, recent results; pipeline runs with where each step ran, fallback reasons, CI minutes, executor availability and the workflow file
 - **`PRs.tsx`**: pull requests with gate status and merge readiness
