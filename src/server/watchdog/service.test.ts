@@ -32,6 +32,8 @@ function blockedWatchdog() {
     agents_dir: join(dir, "agents"),
     gates_dir: join(dir, "gates"),
     machines: {},
+    // An agent, so the process-based detectors read the (blocking) process table
+    dragons: { "worker-a": { name: "A", model: "m", machine: "local", instructions: "" } },
     watchdog: { enabled: true, agent_command: "agent-cli --agent {agent}" },
   };
   let release: () => void = () => {};
