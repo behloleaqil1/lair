@@ -216,4 +216,37 @@ describe("BudgetManager", () => {
       expect(manager.getStatus().alerts.join("\n")).toContain("100 min / 100 min");
     });
   });
+
+  describe("cost listeners", () => {
+    it("get every recorded cost with its attribution, until unsubscribed", () => {
+      const seen: unknown[] = [];
+      const unsubscribe = manager.onCost((event) => {
+        seen.push(event);
+      });
+
+      manager.recordCost("provider-a", 1.5, "usage", { project: "demo", agent: "worker-a", tokens: 300 });
+      manager.recordCost("provider-b", 2);
+      unsubscribe();
+      manager.recordCost("provider-a", 4);
+
+      expect(seen).toEqual([
+        expect.objectContaining({
+          provider: "provider-a",
+          cost: 1.5,
+          reason: "usage",
+          attribution: { project: "demo", agent: "worker-a", tokens: 300 },
+        }),
+        expect.objectContaining({ provider: "provider-b", cost: 2, attribution: undefined }),
+      ]);
+      expect(manager.getStatus().totalCostToday).toBe(7.5);
+    });
+
+    it("a failing listener doesn't stop the cost from being recorded", () => {
+      manager.onCost(() => {
+        throw new Error("listener failed");
+      });
+      manager.recordCost("provider-a", 3);
+      expect(manager.getStatus().totalCostToday).toBe(3);
+    });
+  });
 });

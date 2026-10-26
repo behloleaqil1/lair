@@ -6,3 +6,4 @@
 export { MachineManager, getMachineManager, stopMachineManager } from "./machine-manager.js";
 export { Healer, getHealer, stopHealer } from "./healer.js";
 export { BudgetManager, getBudgetManager, resetBudgetManager } from "./budget.js";
+export type { CostAttribution, CostEvent } from "./budget.js";

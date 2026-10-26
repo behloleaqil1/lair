@@ -18,6 +18,17 @@ const DEFAULT_CONFIG: BudgetConfig = {
   providers: [],
 };
 
+/**
+ * Who a cost belongs to, when the caller knows. The agents module
+ * (src/server/agents/) keeps its per-agent and per-project budgets from it.
+ */
+export interface CostAttribution {
+  project?: string;
+  agent?: string;
+  runId?: string;
+  tokens?: number;
+}
+
 /** Cost record for tracking */
 interface CostRecord {
   timestamp: string;
@@ -28,6 +39,11 @@ interface CostRecord {
   unit?: "usd" | "minutes";
 }
 
+/** A recorded cost, as cost listeners (onCost) receive it. */
+export interface CostEvent extends CostRecord {
+  attribution?: CostAttribution;
+}
+
 /**
  * Budget manager.
  */
@@ -36,6 +52,7 @@ export class BudgetManager {
   private costHistory: CostRecord[] = [];
   private rateLimitWindows = new Map<string, number[]>(); // provider -> timestamps of recent requests
   private alerts: string[] = [];
+  private costListeners = new Set<(event: CostEvent) => void>();
 
   constructor(config?: Partial<BudgetConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -61,9 +78,20 @@ export class BudgetManager {
   }
 
   /**
-   * Record a cost event.
+   * Call `listener` after every recorded cost. Returns the unsubscribe function.
    */
-  recordCost(provider: string, cost: number, reason?: string): void {
+  onCost(listener: (event: CostEvent) => void): () => void {
+    this.costListeners.add(listener);
+    return () => {
+      this.costListeners.delete(listener);
+    };
+  }
+
+  /**
+   * Record a cost event. `attribution` names the project and agent (and the
+   * tokens) when the caller knows them; listeners get it with the cost.
+   */
+  recordCost(provider: string, cost: number, reason?: string, attribution?: CostAttribution): void {
     const now = new Date().toISOString();
     const budget = this.config.providers.find((p) => p.provider === provider);
     const unit = budget?.unit ?? "usd";
@@ -105,6 +133,15 @@ export class BudgetManager {
 
     // Check global budgets
     this.checkGlobalBudgets();
+
+    const event: CostEvent = { timestamp: now, provider, cost, reason, attribution };
+    for (const listener of this.costListeners) {
+      try {
+        listener(event);
+      } catch (error) {
+        console.error("[BudgetManager] Cost listener failed:", error);
+      }
+    }
   }
 
   /**
