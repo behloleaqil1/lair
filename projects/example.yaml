@@ -1,0 +1,77 @@
+# Example project configuration with stub commands
+# Use this as a template for your own projects
+
+name: Example
+repo: /tmp/example-repo
+github: example/example-repo
+queue_file: ./fixtures/queue.md
+agents_dir: ./fixtures
+gates_dir: ./fixtures
+
+# Phase 2: Control commands using stubs
+read_only: true
+allow_direct_assign: false
+inbox_file: ./fixtures/inbox.md
+outbox_file: ./fixtures/outbox.md
+backlog_file: ./fixtures/backlog.md
+
+# Phase 3: Fleet bus
+mail_dir: ./fixtures/mail
+wake_file: ./fixtures/wake
+
+# Commands (using stubs for testing)
+ask_cmd: ["./fixtures/stubs/ask.sh", "{text}"]
+tick_now_cmd: ["./fixtures/stubs/tick.sh"]
+pause_cmd: ["./fixtures/stubs/pause.sh"]
+resume_cmd: ["./fixtures/stubs/resume.sh"]
+agent_run_cmd: ["./fixtures/stubs/agent-run.sh", "{task}"]
+agent_stop_cmd: ["./fixtures/stubs/agent-stop.sh", "{agent}"]
+gate_submit_cmd: ["./fixtures/stubs/gate-submit.sh", "{track}", "{lane}", "{priority}"]
+merge_cmd: ["./fixtures/stubs/merge.sh", "{number}", "{sha}"]
+
+# Merge bar configuration
+merge_bar:
+  required_steps:
+    - commitlint
+    - gitleaks
+    - semgrep
+    - verify-backend
+  require_review: true
+
+machines:
+  local:
+    name: Local
+    type: local
+
+orchestrator:
+  launchd_label: com.example.orchestrator
+
+# Phase 4: Dragon management
+dragons:
+  kiro-A:
+    name: Smaug
+    model: claude-opus-4.5
+    machine: local
+    instructions: Focus on backend work.
+  kiro-B:
+    name: Saphira
+    model: claude-sonnet-4
+    machine: local
+    instructions: ""
+
+available_models:
+  - id: claude-opus-4.5
+    name: Claude Opus 4.5
+    description: Most capable, higher cost
+  - id: claude-sonnet-4
+    name: Claude Sonnet 4
+    description: Fast and capable, lower cost
+  - id: claude-haiku
+    name: Claude Haiku
+    description: Fastest, lowest cost
+
+default_instructions: |
+  Follow the dragon rules. Always run quick-check before committing.
+
+dragon_start_cmd: ["./fixtures/stubs/dragon-start.sh", "{dragon}", "{task}", "{prompt_file}"]
+dragon_stop_cmd: ["./fixtures/stubs/dragon-stop.sh", "{dragon}"]

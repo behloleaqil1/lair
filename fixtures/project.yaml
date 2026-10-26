@@ -1,0 +1,30 @@
+# Test project configuration
+name: TestProject
+repo: /tmp/test-repo
+github: testuser/test-repo
+queue_file: /tmp/test-project/queue.md
+agents_dir: /tmp/test-project/agents
+gates_dir: /tmp/test-project/gates
+status_cmd: /tmp/test-project/status.sh
+
+machines:
+  local:
+    name: Local Workstation
+    type: local
+    runners:
+      - heavy
+      - light
+  remote:
+    name: Build Server
+    type: ssh
+    host: 198.51.100.10
+    user: deploy
+    key: ~/.ssh/example_key
+    connect_timeout: 4
+    runners:
+      - remote
+    # Legacy field kept for compatibility testing
+    ssh_cmd: ssh -o BatchMode=yes deploy@198.51.100.10 "echo up"
+
+orchestrator:
+  launchd_label: com.test.orchestrator

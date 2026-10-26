@@ -1,0 +1,9 @@
+# Test Dragons File
+kiro-A	Smaug	fix-login PR, then db-migration
+kiro-B	Saphira	search-panel UI (kiro/search-panel)
+kiro-C	Drogon	build-config setup
+kiro-D	Glaurung	refactoring phase 1
+kiro-E	Toothless	api-tests coverage
+kiro-F	Falkor	pricing-page implementation
+kiro-G	Balerion	remote-sync infrastructure
+kiro-H	Viserion	ui-fixes accessibility

@@ -1,0 +1,52 @@
+# Test fixture: multiple machines per lane for load distribution
+name: MultiMachineProject
+repo: /home/user/my-project
+github: example-org/my-project
+queue_file: work/gates/queue
+agents_dir: work/agents
+gates_dir: work/gates
+
+machines:
+  primary:
+    name: Primary Workstation
+    type: local
+    runners:
+      - heavy
+      - light
+  secondary:
+    name: Secondary Workstation
+    type: local
+    runners:
+      - light
+  build-server:
+    name: Build Server
+    type: ssh
+    host: 198.51.100.10
+    user: deploy
+    key: ~/.ssh/example_key
+    connect_timeout: 4
+    runners:
+      - remote
+      - heavy
+    work_dir: /home/deploy/my-project
+    gate_script: work/bin/gate.sh
+  ci-server:
+    name: CI Server
+    type: ssh
+    host: 198.51.100.20
+    user: ci
+    key: ~/.ssh/example_key
+    connect_timeout: 10
+    runners:
+      - heavy
+      - remote
+    work_dir: /opt/builds/my-project
+    sync: rsync
+
+# Gate runner config (optional, enables Lair gate distribution)
+gate_runner:
+  enabled: true
+  poll_interval: 5
+  strategy: round-robin
+  gate_script: work/bin/gate.sh
+  config_path: config.yaml

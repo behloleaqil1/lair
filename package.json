@@ -1,0 +1,79 @@
+{
+  "name": "lair-agents",
+  "version": "0.2.0",
+  "description": "Dashboard and controls for AI coding agent fleets",
+  "private": true,
+  "license": "MIT",
+  "author": "M Behlole Aqil <295972724+behloleaqil1@users.noreply.github.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/behloleaqil1/lair.git"
+  },
+  "homepage": "https://github.com/behloleaqil1/lair",
+  "bugs": {
+    "url": "https://github.com/behloleaqil1/lair/issues"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "coding-assistant",
+    "dashboard",
+    "fleet-management",
+    "devtools",
+    "automation",
+    "ci-cd"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "lair-bus": "./dist/bus/cli.js",
+    "lair-node": "./dist/cli/node.js"
+  },
+  "scripts": {
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
+    "dev:server": "tsx watch src/server/index.ts",
+    "dev:client": "vite",
+    "build": "npm run build:client && npm run build:server",
+    "build:client": "vite build",
+    "build:server": "tsc -p tsconfig.server.json",
+    "start": "node dist/server/index.js",
+    "bus": "tsx src/bus/cli.ts",
+    "node": "tsx src/cli/node.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src --ext .ts,.tsx",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@fastify/cors": "^9.0.1",
+    "@fastify/static": "^7.0.4",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "better-sqlite3": "^12.11.1",
+    "chokidar": "^4.0.1",
+    "fastify": "^4.28.1",
+    "sql.js": "^1.15.1",
+    "ws": "^8.18.0",
+    "yaml": "^2.4.5",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^20.14.10",
+    "@types/ws": "^8.5.12",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@typescript-eslint/eslint-plugin": "^7.16.0",
+    "@typescript-eslint/parser": "^7.16.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "concurrently": "^8.2.2",
+    "eslint": "^8.57.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tsx": "^4.16.2",
+    "typescript": "^5.5.3",
+    "vite": "^5.3.3",
+    "vitest": "^1.6.0"
+  }
+}

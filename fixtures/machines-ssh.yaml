@@ -1,0 +1,38 @@
+# Test fixture: mixed local and SSH machine configuration
+name: MixedMachinesProject
+repo: /home/user/my-project
+github: example-org/my-project
+queue_file: work/agents/queue.md
+agents_dir: work/agents
+gates_dir: work/gates
+
+machines:
+  local:
+    name: Local Workstation
+    type: local
+    runners:
+      - heavy
+      - light
+  build-server:
+    name: Build Server
+    type: ssh
+    host: 198.51.100.10
+    user: deploy
+    key: ~/.ssh/example_key
+    connect_timeout: 4
+    runners:
+      - remote
+    work_dir: /home/deploy/my-project
+    gate_script: work/bin/gate.sh
+  ci-server:
+    name: CI Server
+    type: ssh
+    host: 198.51.100.20
+    user: ci
+    key: ~/.ssh/example_key
+    connect_timeout: 10
+    runners:
+      - heavy
+      - remote
+    work_dir: /opt/builds/my-project
+    sync: rsync

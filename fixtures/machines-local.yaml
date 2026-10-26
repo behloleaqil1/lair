@@ -1,0 +1,20 @@
+# Test fixture: local-only machine configuration
+name: LocalOnlyProject
+repo: /tmp/test-repo
+github: testuser/test-repo
+queue_file: /tmp/test-project/queue.md
+agents_dir: /tmp/test-project/agents
+gates_dir: /tmp/test-project/gates
+
+machines:
+  primary:
+    name: Primary Workstation
+    type: local
+    runners:
+      - heavy
+      - light
+  secondary:
+    name: Secondary Workstation
+    type: local
+    runners:
+      - light

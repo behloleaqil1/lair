@@ -1,0 +1,39 @@
+# Test fixture: invalid SSH machine configuration (for error testing)
+name: InvalidMachinesProject
+repo: /tmp/test-repo
+github: testuser/test-repo
+queue_file: /tmp/test-project/queue.md
+agents_dir: /tmp/test-project/agents
+gates_dir: /tmp/test-project/gates
+
+machines:
+  mac:
+    name: Local Workstation
+    type: local
+    runners:
+      - heavy
+  # Missing required SSH fields
+  bad-ssh:
+    name: Bad SSH Machine
+    type: ssh
+    runners:
+      - remote
+    # Missing: host, user, key
+  # Partial SSH config
+  partial-ssh:
+    name: Partial SSH Machine
+    type: ssh
+    host: 198.51.100.10
+    # Missing: user, key
+    runners:
+      - remote
+  # Invalid timeout
+  bad-timeout:
+    name: Bad Timeout Machine
+    type: ssh
+    host: 198.51.100.11
+    user: deploy
+    key: ~/.ssh/example_key
+    connect_timeout: 0
+    runners:
+      - remote

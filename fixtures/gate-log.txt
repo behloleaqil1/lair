@@ -1,0 +1,14 @@
+[gate-run] preflight, in the gate's heavy slot: /path/to/quick-check.sh --static /path/to/worktree
+quick-check (static): /path/to/worktree at abc1234d, base def5678e, apps: backend
+PASS security-guard (24s)
+PASS pre-commit (120s)
+PASS commitlint (4s)
+PASS backend-lint (9s)
+PASS backend-typecheck (45s)
+QUICK-CHECK PASS (120s)
+== gate backend at abc1234d 2026-10-24T14:35:00Z; base def5678e
+== incremental keys: commitlint=bd14aa4f pre-commit=35292619 preflight=72637b8f
+STEP commitlint: PASS (2s)
+STEP gitleaks: PASS (15s)
+STEP semgrep: PASS (90s)
+STEP verify-backend: running

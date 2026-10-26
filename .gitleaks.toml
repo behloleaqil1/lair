@@ -1,0 +1,15 @@
+# Gitleaks configuration for Lair
+# https://github.com/gitleaks/gitleaks
+
+title = "Lair gitleaks config"
+
+[allowlist]
+description = "Allowlist for known false positives"
+
+# The stub key generator in src/node/registration.ts creates obviously-fake
+# "M1-STUB-PRIVATE" keys that are template placeholders, not real secrets.
+# Pattern: -----BEGIN LAIR PRIVATE KEY-----\nM1-STUB-PRIVATE-{nodeId}-{timestamp}
+paths = [
+  '''src/node/registration\.ts''',
+  '''local/.*'''
+]

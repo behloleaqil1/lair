@@ -1,0 +1,94 @@
+# Test fixture: full dragon configuration
+name: DragonFleetProject
+repo: /home/user/my-project
+github: example-org/my-project
+queue_file: work/agents/queue.md
+agents_dir: work/agents
+gates_dir: work/gates
+
+machines:
+  local:
+    name: Local Workstation
+    type: local
+    runners:
+      - heavy
+      - light
+  build-server:
+    name: Build Server
+    type: ssh
+    host: 198.51.100.10
+    user: deploy
+    key: ~/.ssh/example_key
+    connect_timeout: 4
+    runners:
+      - remote
+    work_dir: /home/deploy/my-project
+    kiro_cli: /home/deploy/.local/bin/kiro-cli
+
+available_models:
+  - id: claude-opus-4.5
+    name: Claude Opus 4.5
+    description: Most capable, higher cost
+  - id: claude-sonnet-4-20250514
+    name: Claude Sonnet 4
+    description: Fast and capable, lower cost
+  - id: claude-haiku
+    name: Claude Haiku
+    description: Fastest, lowest cost
+
+default_instructions: |
+  You are a builder agent.
+  Always run quick-check before committing.
+  Follow the rules in your project's rules file.
+
+dragons:
+  kiro-A:
+    name: Smaug
+    model: claude-opus-4.5
+    machine: local
+    instructions: |
+      Focus on backend work.
+      Handle database migrations carefully.
+  kiro-B:
+    name: Saphira
+    model: claude-sonnet-4-20250514
+    machine: local
+    instructions: ""
+  kiro-C:
+    name: Drogon
+    model: claude-opus-4.5
+    machine: build-server
+    instructions: |
+      You handle frontend and UI work.
+      Use Tailwind for styling.
+  kiro-D:
+    name: Falkor
+    model: claude-haiku
+    machine: local
+    instructions: |
+      Fast, simple tasks only.
+      Documentation and minor fixes.
+
+dragon_start_cmd:
+  - work/bin/dragon-start.sh
+  - "{dragon}"
+  - "{task}"
+  - "{prompt_file}"
+
+dragon_stop_cmd:
+  - work/bin/dragon-stop.sh
+  - "{dragon}"
+
+dragon_release_cmd:
+  - work/bin/kiro-release.sh
+  - "{task}"
+
+gate_runner:
+  enabled: true
+  poll_interval: 5
+  sync_method: rsync
+  rsync_exclude:
+    - node_modules/
+    - .gradle/
+    - target/
+    - dist/

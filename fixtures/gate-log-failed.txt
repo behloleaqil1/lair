@@ -1,0 +1,7 @@
+[gate-run] heavy lane, track: api-tests
+== gate backend at fgh9101a 2026-10-24T17:00:00Z; base abc1234d
+STEP commitlint: PASS (2s)
+STEP gitleaks: PASS (12s)
+STEP semgrep: PASS (85s)
+STEP verify-backend: FAIL (240s)
+== FAILED STEPS: verify-backend(rc=1)

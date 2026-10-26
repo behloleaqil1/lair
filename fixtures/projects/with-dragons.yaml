@@ -1,0 +1,91 @@
+# Test fixture: project with dragon configurations
+name: DragonFleetProject
+repo: /tmp/test-repo
+github: testuser/test-repo
+queue_file: /tmp/test-project/queue.md
+agents_dir: /tmp/test-project/agents
+gates_dir: /tmp/test-project/gates
+
+machines:
+  local:
+    name: Local Workstation
+    type: local
+    runners:
+      - heavy
+      - light
+  build-server:
+    name: Build Server
+    type: ssh
+    host: 198.51.100.10
+    user: deploy
+    key: ~/.ssh/example_key
+    connect_timeout: 4
+    runners:
+      - remote
+
+# Default instructions for all dragons in this project
+default_instructions: |
+  Always run quick-check before committing.
+  Follow the dragon rules file.
+
+# Available AI models for this project
+available_models:
+  - id: claude-opus-4.5
+    name: Claude Opus 4.5
+    description: Most capable, higher cost
+  - id: claude-sonnet-4
+    name: Claude Sonnet 4
+    description: Fast and capable, lower cost
+  - id: claude-haiku
+    name: Claude Haiku
+    description: Fastest, lowest cost
+
+# Dragon registry
+dragons:
+  kiro-A:
+    name: Smaug
+    model: claude-opus-4.5
+    machine: local
+    instructions: |
+      Focus on backend work.
+      Prefer database migrations over schema changes.
+  kiro-B:
+    name: Saphira
+    model: claude-sonnet-4
+    machine: local
+    instructions: |
+      Handle frontend and UI work.
+      Ensure accessibility compliance.
+  kiro-C:
+    name: Drogon
+    model: claude-opus-4.5
+    machine: build-server
+    instructions: ""
+  kiro-D:
+    name: Glaurung
+    model: claude-haiku
+    machine: local
+    instructions: Quick fixes and documentation.
+  kiro-E:
+    name: Toothless
+    model: claude-sonnet-4
+    machine: local
+    instructions: ""
+
+# Dragon management commands
+dragon_start_cmd:
+  - /tmp/test-project/bin/dragon-start.sh
+dragon_stop_cmd:
+  - /tmp/test-project/bin/dragon-stop.sh
+dragon_release_cmd:
+  - /tmp/test-project/bin/dragon-release.sh
+
+# Gate runner config (optional, for Lair-managed distribution)
+gate_runner:
+  enabled: false
+  poll_interval: 5
+  sync_method: rsync
+  rsync_exclude:
+    - node_modules/
+    - .gradle/
+    - target/
