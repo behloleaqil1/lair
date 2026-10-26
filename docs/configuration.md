@@ -351,7 +351,7 @@ What happens to an open breach:
 - **Escalation**: happens once per breach. Lair appends an `- OWNER? ...` entry with the evidence (and the command output, if a command ran) to `escalation_file`, or to `inbox_file` when `escalation_file` is not set. With neither set, the escalation is kept in the store only. A breach that clears and comes back within `reescalate_minutes` of the last escalation for the same subject is recorded as suppressed and not written again.
 - **A failed probe**: when a detector fails during a tick (`ps` fails, `merged_cmd` exits non-zero, ...), its open breaches are left alone for that tick. Nothing is resolved, run or escalated on data that could not be read.
 
-Lair decides what to do and calls your commands; it never stops, kills or restarts anything itself. Any process id it passes to a command (`{pid}`) belongs to a process that `agent_command` matched to a configured agent. Right before each command runs, Lair checks again on fresh data. It refuses to restart a WAITING agent, to release a live agent's claim, or to break a lock whose holder is alive. When the server stops, a verify delay in progress is cut short and no further command starts.
+Lair decides what to do and calls your commands; it never stops, kills or restarts anything itself. Any process id it passes to a command (`{pid}`) belongs to a process that `agent_command` matched to a configured agent. Right before each command runs, Lair checks again on fresh data. It refuses to restart a WAITING agent, to release a live agent's claim, to break a lock whose holder is alive, or to run any command on a container whose [delivery](#delivery) service is held. When the server stops, a verify delay in progress is cut short and no further command starts.
 
 **Local agents only.** The process-based checks (`duplicate_agent`, `agent_hung`, `orphan_claim`, and the agents counted by `idle_capacity`) read this machine's `ps`. They only judge agents that run here: an agent whose `dragons.<id>.machine` is unset, or names a `machines:` entry of `type: local` (`local` also counts when it isn't listed). An agent on an `ssh` machine, or on a machine that isn't listed, is unknown here and never treated as dead. Its claim is never released, `idle_capacity` counts it as running while it has a claim, and local processes that match its id (an `ssh` wrapper, say) are ignored.
 
@@ -390,9 +390,9 @@ watchdog:
 | `gate_owner_gone` | A running gate request (`.req.run`) whose runner pid (in the `.req.run` file, else `gates_dir/runner-<lane>.pid`) is not running, or that has no runner pid at all, and whose log has been silent for `gate_lease_minutes` | `gate_owner_gone` | `requeue_gate` | the request is no longer running |
 | `idle_capacity` | Ready work (queued gate requests plus `ready_tasks_cmd` tasks) and free capacity (no agent running, or fewer than `max_agents`), with nothing started (no claim, running gate or agent process) for `idle_minutes` | `idle_capacity` | `fill_capacity` | later ticks |
 | `progress_stall` | No merge for `stall_hours` while work is pending (gate requests, ready tasks or claims). The queue file's last merge is its last `- MERGED ...` line, and only a full ISO time on it counts (`2026-01-01T12:00:00Z`): an `HH:MMZ` time has no date, so when the last MERGED line has none, the queue's last merge is unknown. A time printed by `merged_cmd` also counts. With no known merge it reports nothing | `no_merges` | `triage_stall` | later ticks |
-| `crash_loop` | A configured container's `RestartCount` (from `docker inspect`) rose by `max_restarts` or more within `window_minutes` | `crash_loop` | `stop_container_restarts` | later ticks |
+| `crash_loop` | A configured container's `RestartCount` (from `docker inspect`) rose by `max_restarts` or more within `window_minutes`, or [delivery](#delivery) marked one of its services crash-looping. A held delivery service's container is left alone | `crash_loop` | `stop_container_restarts` | later ticks |
 
-A detector without the config it needs is inactive: the three process-based detectors need `agent_command`, `lock_holder_dead` needs `locks`, and `crash_loop` needs `containers`. A "later ticks" verify means the breach is resolved when it is no longer detected, or escalated once its attempts are used up.
+A detector without the config it needs is inactive: the three process-based detectors need `agent_command`, `lock_holder_dead` needs `locks`, and `crash_loop` needs `containers` or an enabled [delivery](#delivery) block. A "later ticks" verify means the breach is resolved when it is no longer detected, or escalated once its attempts are used up.
 
 ### Watchdog options
 
@@ -459,6 +459,106 @@ Read-only routes. `?project=` defaults to the default project:
 - `GET /api/watchdog/breaches?status=open|resolved|all&limit=100`
 - `GET /api/watchdog/runs?limit=100`: playbook runs with each step's output and the argv that ran (or, when observed, would have run)
 - `GET /api/watchdog/escalations?limit=100`
+
+## Delivery
+
+> Off by default. With `enabled: true` Lair reads your environments' status, and runs Up, Down, Restart and Deploy when you ask from the Delivery view. It deploys on its own only with `deploy.auto: true`.
+
+Delivery ([design](design/autonomy.md#7-delivery-module-delivery-platformmd-milestone-m4-brought-forward-for-environment-1)) manages a project's **environments**. An environment is a docker compose project, such as the developer's own running stack. Every `interval_seconds` Lair reads each service's containers (`docker compose ps`, `docker inspect`) and its health check, and shows them in the Delivery view: state (`running`, `stopped`, `unhealthy` or `restarting`), health, restart count and the last error lines of its log. From the view you can bring the whole environment, or one service, up, down or restart it. Down, Restart and Deploy ask for confirmation first, and Down asks for a reason.
+
+What Lair does, and what it never does on its own:
+
+- **Up** starts the services in `start_order`, one at a time, and waits for each one to be healthy before the next (`start_timeout_seconds`). If a service doesn't become healthy, the services after it are not started. Every start uses `--no-deps`, so Compose never starts a service as another one's dependency.
+- **Held services.** A service you take **Down** is *held*, with your reason. Lair never starts a held service: an environment Up skips it, a deploy skips it, and the watchdog leaves its container alone. It stays held, across restarts of Lair (the hold is stored in `data/delivery.db`), until you **Release** it. An environment Down (`docker compose down`) holds every service, and the next environment Up releases those holds again. A service you took down on its own stays held.
+- **Crash loops.** A service whose restart count (Docker's restart policy restarting it) rises by `crash_loop.max_restarts` or more within `crash_loop.window_minutes` is marked *crash-looping*, with its last error lines. Lair then stops restarting it: an environment Up or Restart and an automatic deploy skip it. When you Up, Restart or Deploy that service on its own, the mark is cleared. The mark also clears itself after a whole window with no restarts, while the service runs healthy. The watchdog's `crash_loop` detector reports these marks as breaches, so its `crash_loop` playbook stops Docker's own restarts (`watchdog.actions.stop_container_restarts`) or escalates them to your inbox, with the error lines as evidence (see [Watchdog](#watchdog)).
+- **Deploy after a merge** (`deploy.auto: true`). When `deploy.ref` points at a new commit, Lair diffs the commit against the previous one (`git diff --name-only`) and deploys every service with `build: true` whose `paths` the diff changed. The first commit Lair sees is taken as what already runs. Each commit is tried once. For each service, in start order, Lair:
+  1. tags the image the service runs now as `<image>:lair-previous`;
+  2. rebuilds the image (`docker compose build <service>`);
+  3. rolls the service (`docker compose up -d --no-deps --no-build <service>`);
+  4. waits up to `deploy.health_timeout_minutes` for it to be healthy;
+  5. if it isn't healthy in time, points the image back at `lair-previous` and recreates the container (`--force-recreate`), which is a **rollback**. The services after it are not deployed.
+
+  A failed build changes nothing that runs. An automatic deploy never starts a service that isn't running, and skips held and crash-looping services. The Deploy button on a service runs the same steps by hand. On a `read_only: true` project there are no actions at all, by hand or automatic.
+
+Every command is an argv array (no shell), built from this config only. The environment and service names in a request must be configured ones: a request only picks one of them.
+
+```yaml
+delivery:
+  enabled: true
+  environments:
+    local:
+      compose_files: ["/home/user/shop/compose.yaml"]
+      project_name: shop-local
+      start_order: [db, api, web]
+      services:
+        db:
+          health: { type: container }        # the image's Docker HEALTHCHECK
+        api:
+          health: { type: http, url: "http://localhost:8080/health" }
+          build: true
+          paths: ["api/", "shared/"]
+        web:
+          health: { type: http, url: "http://localhost:3000/", expect_status: 200 }
+          build: true
+          paths: ["web/"]
+      crash_loop: { max_restarts: 3, window_minutes: 10 }
+      deploy:
+        auto: true
+        ref: main
+        prepare_cmd: ["git", "-C", "/home/user/shop", "merge", "--ff-only", "{sha}"]
+        health_timeout_minutes: 5
+```
+
+### Delivery options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Manage this project's environments |
+| `interval_seconds` | number | `30` | Seconds between reads (and restart-count samples) |
+| `docker_cmd` | array | `["docker"]` | The container CLI. Lair runs `<docker_cmd> compose ...`, `<docker_cmd> inspect` and `<docker_cmd> tag` |
+| `command_timeout_seconds` | number | `300` | Timeout for each command except builds |
+| `build_timeout_seconds` | number | `1800` | Timeout for `docker compose build` and `prepare_cmd` |
+| `environments` | map | `{}` | Environment name (letters, digits, `_` and `-`, starting with a letter) to its settings, below |
+
+### Environment options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `compose_files` | array | required | Compose files, passed as `-f <file>` each. Relative paths resolve against Lair's working directory |
+| `project_name` | string | required | The compose project name (`-p`): lowercase letters, digits, `-` and `_`. Containers are found by it, so use the name the stack already runs under |
+| `project_directory` | string | — | Passed as `--project-directory` |
+| `services` | map | required | Service name to its settings, below. Only these services are shown and managed |
+| `start_order` | array | the order of `services` | Services Up and Restart start first, in this order. Services not listed follow, in the order of `services` |
+| `start_timeout_seconds` | number | `120` | How long Up, Restart and a rollback wait for each service to be healthy |
+| `crash_loop.max_restarts` | number | `3` | Restarts within the window that mark a crash loop |
+| `crash_loop.window_minutes` | number | `10` | The window |
+| `deploy.auto` | boolean | `false` | Deploy changed services when `ref` moves |
+| `deploy.repo` | string | the project's `repo` | The repository to watch |
+| `deploy.ref` | string | `main` | The branch or ref to watch |
+| `deploy.prepare_cmd` | array | — | Runs before an automatic deploy builds anything, for example to update the working tree the images are built from. Placeholders: `{sha}` (the new commit), `{ref}`, `{environment}`, `{project}` |
+| `deploy.health_timeout_minutes` | number | `5` | Roll back a deployed service that isn't healthy within this many minutes |
+
+### Service options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `health` | map | `{type: container}` | `{type: container}`: the image's Docker `HEALTHCHECK` (a container without one counts as healthy while it runs). `{type: http, url, expect_status, timeout_seconds: 5}`: a GET to `url` (not following redirects). Without `expect_status`, any `2xx` or `3xx` answer is healthy |
+| `build` | boolean | `false` | The image is built by Compose (the service has a `build:`), so a deploy can rebuild it |
+| `paths` | array | `[]` | Repository paths (directories or files, relative to the repository root) whose changes deploy this service after a merge. Only for `build: true` |
+
+Unknown keys, unsafe names, a value that starts with `-`, a `start_order` entry that isn't a service, or `deploy.auto` with no service that has `build: true` and `paths` are config errors. A project with an invalid `delivery:` block is not managed, and `GET /api/delivery/status` shows the errors. Lair reads the delivery config at startup.
+
+### Delivery API
+
+`?project=` defaults to the default project. Actions answer `202` with the operation, which runs in the background, one at a time per environment (a second one gets `409`). A `read_only` project answers `403`.
+
+- `GET /api/delivery/status`: each environment's services (state, health, restart count, containers, hold, crash loop, last error lines), the operation in progress and the automatic deploy state
+- `GET /api/delivery/operations?environment=&limit=50`: operations with every command they ran, its exit code and output
+- `GET /api/delivery/operations/:id`
+- `POST /api/delivery/environments/:environment/up|down|restart|deploy`
+- `POST /api/delivery/environments/:environment/services/:service/up|down|restart|deploy|release`
+
+POST bodies are JSON. `down`, `restart` and `deploy` need `"confirm": true`. `down` needs a `"reason"`. An environment `deploy` takes `"services": [...]` (default: every service with `build: true`). Up, Restart and Deploy of a held service, by name, answer `409` until it is released.
 
 ## Example complete configuration
 

@@ -3,8 +3,10 @@
 Goal: Lair manages the whole fleet on its own, and any input a human must give goes through Lair's UI. This builds on
 [platform.md](platform.md) (architecture, milestones) and [node.md](node.md) (the host daemon). Where they differ, this
 file wins for the behaviour it describes. Status: planned, not built, except §2's detectors and playbook engine
-(`src/server/watchdog/`, see [configuration](../configuration.md#watchdog)); its escalations go to the project's inbox
-file until the Decision Inbox (§1) exists. Keep everything generic (see [CONTRIBUTING.md](../../CONTRIBUTING.md)).
+(`src/server/watchdog/`, see [configuration](../configuration.md#watchdog)) and §7's `local` environment as a docker
+compose project (`src/server/delivery/`, see [configuration](../configuration.md#delivery)); the watchdog's escalations
+go to the project's inbox file until the Decision Inbox (§1) exists. Keep everything generic (see
+[CONTRIBUTING.md](../../CONTRIBUTING.md)).
 
 ## 0. Principles
 1. **Deterministic core, AI at the edges.** Detection, routing, scheduling, merging and rollback are rules and code.

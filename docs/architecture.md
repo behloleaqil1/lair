@@ -126,6 +126,17 @@ The progress watchdog ([configuration](configuration.md#watchdog)). It is off un
 - **`store.ts`**: breaches, runs, escalations, SLO status and samples in SQLite (`data/watchdog.db`)
 - **`service.ts`**, **`routes.ts`**: the per-project tick loop started and stopped by `index.ts`, and read-only `GET /api/watchdog/*` routes
 
+#### Delivery (`delivery/`)
+
+Environments as docker compose projects ([configuration](configuration.md#delivery)). Off unless a project sets `delivery.enabled`.
+
+- **`config.ts`**: the validated `delivery:` block (environments, services, health checks, start order, crash-loop window, deploy settings)
+- **`compose.ts`**: argv builders and the parsers for `docker compose ps --format json` and `docker inspect`
+- **`probes.ts`**: the system boundary: the watchdog's `CommandRunner` and `Clock`, and `HttpProbe` for HTTP health checks
+- **`environment.ts`**: one environment: status reads, restart-count sampling and crash-loop marks, Up / Down / Restart / Deploy / Release as recorded operations, rollback, and the deploy after a merge
+- **`store.ts`**: holds, crash loops, restart samples, operations and the last commit seen in SQLite (`data/delivery.db`)
+- **`service.ts`**, **`routes.ts`**: the per-project tick loop started and stopped by `index.ts`, the `ContainerServices` view the watchdog reads (crash loops and holds), and the `/api/delivery/*` routes
+
 #### Store (`store/`)
 
 - **`store.ts`**: SQLite store (better-sqlite3) for nodes, tasks, jobs, events and agent runs, at `data/lair.db`
@@ -170,6 +181,7 @@ Each view is a standalone component:
 - **`Processes.tsx`**: managed processes and their logs
 - **`Activity.tsx`**, **`LiveFeed.tsx`**: fleet bus activity feed
 - **`Health.tsx`**: watchdog SLO status, open breaches and playbook runs (read-only)
+- **`Delivery.tsx`**: environments and services (state, health, restarts, holds, crash loops, error lines) with Up, Down, Restart, Deploy and Release, and the operations log. Its requests are built in `delivery-api.ts`
 - **`Inbox.tsx`**: owner inbox and orchestrator replies
 - **`CommandBar.tsx`**: ask / instruct / task command bar
 - **`Settings.tsx`**: project configuration UI
