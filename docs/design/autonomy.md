@@ -3,12 +3,14 @@
 Goal: Lair manages the whole fleet on its own, and any input a human must give goes through Lair's UI. This builds on
 [platform.md](platform.md) (architecture, milestones) and [node.md](node.md) (the host daemon). Where they differ, this
 file wins for the behaviour it describes. Status: planned, not built, except §2's detectors and playbook engine
-(`src/server/watchdog/`, see [configuration](../configuration.md#watchdog)) and §7's `local` environment as a docker
-compose project (`src/server/delivery/`, see [configuration](../configuration.md#delivery)); the watchdog's escalations
-go to the project's inbox file until the Decision Inbox (§1) exists. §5's risk tiers, reviews, test integrity check
-and policy merge are built (`src/server/review/`, see [configuration](../configuration.md#reviews-and-policy-merge));
-its reviewer requests go out as events until the agents (§6) and Decision Inbox (§1) modules take them, and its weekly
-audit is not built yet. Keep everything generic (see [CONTRIBUTING.md](../../CONTRIBUTING.md)).
+(`src/server/watchdog/`, see [configuration](../configuration.md#watchdog)), §6's agent runs with claims, locks,
+session recovery, failover and budgets (`src/server/agents/`, see [configuration](../configuration.md#agents)), and §7's
+`local` environment as a docker compose project (`src/server/delivery/`, see
+[configuration](../configuration.md#delivery)); the watchdog's escalations go to the project's inbox file until the
+Decision Inbox (§1) exists. §5's risk tiers, reviews, test integrity check and policy merge are built
+(`src/server/review/`, see [configuration](../configuration.md#reviews-and-policy-merge)); its reviewer requests go out
+as events until the agents (§6) and Decision Inbox (§1) modules take them, and its weekly audit is not built yet. Keep
+everything generic (see [CONTRIBUTING.md](../../CONTRIBUTING.md)).
 
 ## 0. Principles
 1. **Deterministic core, AI at the edges.** Detection, routing, scheduling, merging and rollback are rules and code.
@@ -235,6 +237,13 @@ planner (§4) turns documents into work; this module WRITES and maintains those 
 - **Agents run as a separate OS user** from the Lair server, without access to Lair's `data/` or the server's output.
   Otherwise an agent can read the owner token (`data/owner.token`, §1) or the setup link, sign itself in, and answer
   the decisions that gate its own work.
+- **Built so far** (`src/server/agents/`): Lair starts the runs itself. A task's claim is owned by a pid plus that
+  process's start time, and every lock the launch takes is pid-owned; dead owners are released and broken, a waiter
+  always names the lock's holder, and a run with no live process in N minutes is never-started and retried with
+  backoff. Hung agents (the watchdog's rule) and dead-on-start or crashed ones restart with the same session K times,
+  then in a fresh one (the old session moved aside), then escalate. Rate limits and provider errors fail over to the
+  agent's next profile; budgets are per agent and per project, per day and month, fed by the fleet budget. Usage is
+  read from run logs by pattern until adapters report it.
 
 ## 7. Delivery (module `delivery`, [platform.md](platform.md) milestone M4 brought forward for environment 1)
 - **Environments per app pack:** `local` (the developer's own running stack), `staging`, `production`. Each has a

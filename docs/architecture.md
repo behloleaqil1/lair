@@ -112,7 +112,18 @@ Pure functions that parse project files into typed structures:
 
 - **`machine-manager.ts`**: adding, removing and monitoring machines
 - **`healer.ts`**: self-healing (failure detection, job rescheduling)
-- **`budget.ts`**: provider cost tracking, rate limits and pausing
+- **`budget.ts`**: provider cost tracking, rate limits and pausing; cost listeners get each cost with its project and agent
+
+#### Agents (`agents/`)
+
+Agent runs with claims, locks, session recovery, failover and budgets ([configuration](configuration.md#agents)). Off unless a project sets `agents.enabled`.
+
+- **`probes.ts`**: the watchdog's probes plus a `ProcessSpawner` (child_process.spawn, detached, no shell) and `ProcessSnapshot`, which judges an owner by pid and start time
+- **`locks.ts`**: pid-owned lock files (exclusive create, hand-over, race-safe removal) and legacy pid-only or pid-less locks
+- **`store.ts`**: runs, claims (one per task, claimed in an immediate transaction), events and the usage ledger in SQLite (`data/agents.db`)
+- **`failover.ts`**, **`budgets.ts`**, **`sessions.ts`**: profiles and failover patterns; per-agent and per-project budgets per UTC day and month; session directories moved aside and resume summaries
+- **`decisions.ts`**: the Decision Inbox interface the agents module raises `spend` and `escalation` decisions through, with an inbox-file fallback
+- **`service.ts`**, **`routes.ts`**: the per-project tick (launch, supervise, recover, reap) started and stopped by `index.ts`, and `/api/agents/*`
 
 #### Decisions (`decisions/`)
 
@@ -230,6 +241,7 @@ Each view is a standalone component:
 - **`Health.tsx`**: watchdog SLO status, open breaches and playbook runs (read-only)
 - **`Delivery.tsx`**: environments and services (state, health, restarts, holds, crash loops, error lines) with Up, Down, Restart, Deploy and Release, and the operations log. Its requests are built in `delivery-api.ts`
 - **`Reviews.tsx`**: per PR, the risk tier, required and present reviews, findings, the gate at the head, holds and the merge button with its reasons (view logic in `review-view.ts`, requests in `review-api.ts`, owner-only ones with the owner session)
+- **`Agents.tsx`**: per agent its state, run, claims, budget and recoveries; locks and their holders. Release a claim or start a fresh session, after a confirmation (`agents-actions.ts`)
 - **`Inbox.tsx`**: owner inbox and orchestrator replies
 - **`CommandBar.tsx`**: ask / instruct / task command bar
 - **`Settings.tsx`**: project configuration UI

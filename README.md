@@ -19,6 +19,7 @@ Lair is **agent-agnostic**: agents are started by commands you configure, so any
 - **Processes and Nodes**: services Lair supervises, and connected lair-node daemons (experimental)
 - **Health**: the progress watchdog. It is off by default, and observe-only until you opt in. It detects hung or duplicate agents, stale locks and claims, orphaned gates, broken lanes, idle capacity, stalls and crash loops, and recovers through your own commands ([configuration](docs/configuration.md#watchdog))
 - **Delivery**: your application's environments (docker compose projects). Bring them, or one service, up and down; Lair deploys changed services after a merge and rolls them back when they aren't healthy in time, never starts a service you stopped until you release it, and stops restarting a crash-looping one ([configuration](docs/configuration.md#delivery))
+- **Agents**: agent runs Lair starts and supervises, off by default. One claim per task and pid-owned locks (a dead holder's lock is broken and logged), never-started runs retried, hung or dead-on-start agents restarted in the same session and then a fresh one, failover to another agent CLI or provider on rate limits, and per-agent and per-project token and cost budgets ([configuration](docs/configuration.md#agents))
 
 ## Requirements
 

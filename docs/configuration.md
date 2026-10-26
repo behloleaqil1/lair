@@ -922,6 +922,94 @@ Other keys: `provider` (`github`), `api_url` (default `https://api.github.com`),
 - `GET /api/review/holds`, `POST /api/review/holds` with `{reason, pr?, by}`, `POST /api/review/holds/:id/release` (owner) with `{by}`
 - `POST /api/review/gate-results` (a signed gate result), `GET /api/review/merges`
 
+## Agents
+
+> Off by default. With `enabled: true`, Lair starts the agent runs you request itself (one process per run, no shell) and supervises them: claims, locks, session recovery, failover and budgets ([design](design/autonomy.md#6-agents-budgets-failover-and-session-recovery-module-agents)). A `read_only: true` project is shown but never started, stopped, released or broken.
+
+A run is requested for an agent (a `dragons:` entry or a `dragons.txt` line) and a task, with a prompt: from the Agents view or `POST /api/agents/runs`. Lair starts it with the agent's adapter (`start_cmd`, see [Agents](agents.md#agent-adapters)), its model, and the prompt file (`prompts_dir`). The process's output goes to `agents_dir/<agent>-<UTC>.log`, the log the dashboard and the watchdog read. The command must run the agent in the foreground: Lair supervises the process it started, so a launcher that starts the agent in the background and exits looks like an agent that died on start. The process gets `LAIR_RUN_ID`, `LAIR_TASK`, `LAIR_AGENT`, `LAIR_SESSION_ID`, `LAIR_SESSION_MODE` (`new`, `resume`, `fresh`), `TASK`, `MODEL`, and the adapter's `session_id_env` set to the session id.
+
+- **Claims.** A task is claimed by exactly one run. The claim is owned by a process: the Lair server while the run starts, then the agent's process. An owner is a pid **and** that process's start time, so a pid the system gave to another process is not the owner. A second request for a claimed task is refused (HTTP 409) while the owner lives; a claim whose owner is dead is released and logged. A run that loses its claim (released from the Agents view, say) stops itself. One agent runs one task at a time.
+- **Locks.** `agents.locks` are lock files every run takes before it starts (`hold: launch`, released once the agent runs) or for as long as the agent runs (`hold: run`, owned by the agent's process). Lair writes `pid=<pid>`, `started=<ISO time>` and `owner=<who>` and creates the file exclusively. Each check breaks a lock whose holder is dead (not running, or its pid now belongs to a process that started later), whether or not a run waits on it: the lock and its holder are logged as a `lock_broken` event and counted. Legacy locks are read too: a file holding only a pid, or a directory with a `<pid_file>` (as the watchdog's locks), is broken when that pid is dead; one with no pid at all is broken once it is `stale_minutes` old. A run that waits on a lock shows the lock, its holder pid and whether it is alive, and, for a lock with no pid, when it will be broken.
+- **Never started.** A run with no live agent process `start_timeout_minutes` after Lair began starting it (time over budget or with no usable profile doesn't count) is `never_started`, with the reason: the lock it waited on and its holder, or the spawn error. It is retried after `retries.backoff_seconds`, doubling up to `retries.max_backoff_seconds`, `retries.max_retries` times; then the task is escalated.
+- **Hung, dead on start, crashed.** A running agent is hung by the watchdog's rule (`agent_hung`: its newest log and its process silent for `hung_minutes`), and an agent WAITING on a gate that has no result yet is never hung. A hung agent gets SIGTERM, then SIGKILL after `stop_grace_seconds`. A process that ends with exit code 0, or whose latest queue line is `DONE <task>`, completed. One that ends within `dead_on_start_seconds`, or with an empty log, died on start; any other end is a crash. Every failure restarts the task: with the same session (the adapter's `resume_flag`) up to `recovery.same_session_restarts` times, then in a fresh session up to `recovery.fresh_sessions` times, then it is escalated. A fresh session moves the agent's `session_dir` aside to `<dir>.aside-<UTC>` (it is never deleted) and starts from a resume summary written into the prompt: the task card, the previous attempts, the branch state (`branch_state_cmd`), the agent's latest queue lines and its last gate's log, and the previous session's last output. Restarts wait `recovery.backoff_seconds`, doubling up to `recovery.max_backoff_seconds`.
+- **Failover.** An agent's profiles are its own adapter and model, then `agents.fallbacks.<agent>` in order. A run whose log's last lines match a rate limit or provider error (`failover.*_patterns`) when it exits, or whose log has been silent for `failover.silence_seconds` on such a last line, is stopped and the task moves to the next profile, with a resume summary, as a `failover` event (from, to, the line). The provider that failed is skipped for `failover.cooldown_minutes`, and so is a provider the fleet budget has paused or rate limited. Only when every profile is unusable is the owner asked (once), and the task waits for the first cooldown to end.
+- **Budgets.** Token and cost limits per UTC day and month, for the project (`budgets.project`) and for each agent (`budgets.agent`, overridden per metric by `budgets.per_agent.<id>`). Usage comes from the fleet budget: every cost recorded there with a project (and agent) is counted, including the usage Lair reads from run logs with `usage_patterns` (named groups `tokens` and `cost`, each match adds), which it records through the fleet budget. A soft limit is a `budget_warning`, once per period. A hard limit stops new runs and restarts for that scope (running agents continue) and raises a `spend` decision, once per period.
+- **Decisions.** Escalations (`escalation`) and hard limits (`spend`) go to the Decision Inbox. Until a decisions module is registered they are written to `inbox_file` as `- OWNER? ...` entries with the evidence.
+
+```yaml
+agents:
+  enabled: true
+  session_dir: "{agents_dir}/sessions/{agent}"
+  branch_state_cmd: ["git", "-C", "{repo}", "status", "--short", "--branch"]
+  locks:
+    - name: session-store
+      path: /home/user/my-project/work/session.lock
+      hold: launch
+  fallbacks:
+    worker-a:
+      - { adapter: other-cli, model: example-model-b, provider: provider-b }
+  providers:
+    my-agent: provider-a          # adapter id -> provider (default: the adapter id)
+  usage_patterns:
+    - "tokens used: (?<tokens>[0-9,]+)"
+    - "cost: \\$(?<cost>[0-9.]+)"
+  budgets:
+    project: { monthly_cost: { soft: 400, hard: 500 } }
+    agent: { daily_cost: { soft: 15, hard: 20 } }
+    per_agent:
+      worker-a: { daily_tokens: { hard: 2000000 } }
+```
+
+### Agents options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Run the agents module for this project |
+| `interval_seconds` | number | `15` | Seconds between checks |
+| `start_timeout_minutes` | number | `10` | A run with no live agent process this long after starting began is never-started |
+| `dead_on_start_seconds` | number | `60` | A process that ends this soon after it started died on start |
+| `hung_minutes` | number | `watchdog.hung_minutes` (`45`) | Silence limit for a running agent |
+| `stop_grace_seconds` | number | `30` | SIGTERM, then SIGKILL after this long |
+| `pid_start_tolerance_seconds` | number | `5` | How far a process's start time may be from its owner's recorded one |
+| `session_dir` | string | — | The agent's session directory, moved aside for a fresh session. `{agents_dir}`, `{agent}` and `{repo}` are replaced; relative to `repo` |
+| `branch_state_cmd` | array | — | Prints the branch state for a resume summary. `{task}`, `{agent}`, `{repo}` |
+| `command_timeout_seconds` | number | `30` | Timeout for `branch_state_cmd` |
+| `recovery.same_session_restarts` | number | `2` | Restarts with the same session after a failure |
+| `recovery.fresh_sessions` | number | `1` | Then restarts in a fresh session, then escalate |
+| `recovery.backoff_seconds` | number | `30` | First restart delay, doubling |
+| `recovery.max_backoff_seconds` | number | `1800` | Longest restart delay |
+| `retries.max_retries` | number | `3` | Never-started retries, then escalate |
+| `retries.backoff_seconds` | number | `60` | First retry delay, doubling |
+| `retries.max_backoff_seconds` | number | `3600` | Longest retry delay |
+| `locks` | array | `[]` | `{name, path, pid_file: "pid", hold: launch \| run, stale_minutes: 30}` |
+| `failover.rate_limit_patterns` | array | see below | Regular expressions (case-insensitive) for a rate limit |
+| `failover.provider_error_patterns` | array | see below | Regular expressions (case-insensitive) for a provider error |
+| `failover.silence_seconds` | number | `120` | A live run fails over only when its log's last line matches and the log was silent this long |
+| `failover.cooldown_minutes` | number | `30` | A provider that failed is skipped this long |
+| `fallbacks` | map | `{}` | Agent id -> profiles `{adapter, model, provider}` to fail over to, in order |
+| `providers` | map | `{}` | Adapter id -> provider name, for cooldowns and the fleet budget |
+| `usage_patterns` | array | `[]` | Regular expressions with `(?<tokens>...)` and/or `(?<cost>...)`, read from run logs |
+| `budgets.project`, `budgets.agent`, `budgets.per_agent.<id>` | map | — | `daily_tokens`, `daily_cost`, `monthly_tokens`, `monthly_cost`, each `{soft, hard}` |
+
+The default patterns look for an error, not the words alone, so an agent writing about rate limiting in its own work doesn't trigger a failover: a rate limit is `rate limit ... exceeded|reached|error|retry`, `exceeded|reached|hit ... rate limit`, `error|status|http 429`, `429 too many requests`, `quota exceeded|exhausted` or `usage limit reached|exceeded`; a provider error is `overloaded_error`, `model is overloaded|unavailable`, `api error ... 5xx` or `status|http 500|502|503|504|529`. Tune them to your adapters' output.
+
+Unknown keys, invalid regular expressions, a usage pattern without a named group, a fallback naming an unknown adapter, or a soft limit above its hard limit are config errors: the project's agents module doesn't start, and `GET /api/agents/status` shows the errors. Lair reads the config at startup.
+
+For agents this module runs, leave the watchdog's `agent_stuck` and `orphan_claim` playbooks in observe mode (or without `act: true`), so one failure isn't handled twice.
+
+### Agents API
+
+`?project=` defaults to the default project.
+
+- `GET /api/agents/status`: per agent its state (`idle`, `starting`, `working`, `waiting_on_lock`, `hung`, `stopping`, `never_started`, `failed_over`, `over_budget`, `failed`) with the detail (for a lock wait: the lock, its holder pid and whether it is alive), its current or latest run, its profiles, claims, budget and recent recoveries; the project's claims, locks (holder, how often broken) and budget
+- `GET /api/agents/runs?limit=100`, `GET /api/agents/recoveries?limit=100`: runs, and the recovery events (claim releases, lock breaks, never-started, hung, dead on start, crashes, restarts, fresh sessions, failovers, budget alerts, escalations, decisions) with their evidence
+- `POST /api/agents/runs` `{agent, task, prompt, model?}`: claim the task and start it on the next check. 409 when the task is claimed or the agent is busy, 403 when over budget or `read_only`
+- `POST /api/agents/claims/release` `{task, confirm: true}`: the run holding it stops itself
+- `POST /api/agents/runs/<id>/fresh-session` `{confirm: true}`: stop the run and start the task again in a fresh session (also for a run that ended, when it is the task's latest)
+- `POST /api/agents/tick`: check now
+
+The two actions that stop work are refused (HTTP 400) without `confirm: true`; the Agents view asks before sending them. Task ids are 1 to 128 letters, digits, `.`, `_`, `-`, `/`, `:` or `#`, starting with a letter or digit.
+
 ## Example complete configuration
 
 ```yaml
