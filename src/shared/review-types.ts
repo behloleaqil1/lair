@@ -17,6 +17,12 @@ export interface ReviewerRef {
   model?: string;
 }
 
+/** Where a request came from, recorded with every review, resolution and merge. */
+export interface ClientInfo {
+  address: string | null;
+  userAgent: string | null;
+}
+
 export type Verdict = "approve" | "request_changes";
 export type FindingSeverity = "critical" | "high" | "medium" | "low" | "info";
 export type FindingStatus = "open" | "resolved" | "dismissed";
@@ -39,6 +45,7 @@ export interface ReviewFinding {
   resolvedBy: string | null;
   resolvedAt: string | null;
   resolution: string | null;
+  resolvedClient: ClientInfo | null;
   /** A later review by the same reviewer replaced this review's findings */
   superseded: boolean;
 }
@@ -52,6 +59,7 @@ export interface ReviewRecord {
   verdict: Verdict;
   summary: string;
   createdAt: string;
+  client: ClientInfo | null;
   findings: ReviewFinding[];
   /** Given at an older head: it no longer counts toward the required reviews */
   stale: boolean;
@@ -226,6 +234,7 @@ export interface ReviewMergeRecord {
   mergedAt: string;
   /** Commits whose author/committer emails were checked before publishing */
   commitsChecked: number;
+  client: ClientInfo | null;
 }
 
 export interface MergeResponse {

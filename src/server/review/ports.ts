@@ -53,9 +53,17 @@ export interface ReviewAssignment {
   /** The reviewer must run on a model other than this one */
   differentModelFrom: string | null;
   reason: string;
+  /**
+   * The assignment token: give it only to the agent that does the review,
+   * which sends it as `assignment_token`. Lair accepts an agent's review only
+   * with the token of an assignment for that PR, head and agent; one without
+   * a named reviewer binds to the first agent (not in `exclude`) that uses it.
+   */
+  token: string;
 }
 
 export interface ReviewAssigner {
+  /** `agent`: the agent it was given to, when the assigner knows (it then binds the token) */
   assign(assignment: ReviewAssignment): Promise<{ assigned: boolean; agent: string | null; detail: string }>;
 }
 

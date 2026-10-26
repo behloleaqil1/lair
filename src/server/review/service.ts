@@ -6,9 +6,11 @@
  *
  * ReviewManager holds one ReviewService per project with `review.enabled`.
  */
+import { createHash, randomBytes } from "crypto";
 import { resolve } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
 import type {
+  ClientInfo,
   FindingSeverity,
   MergeResponse,
   PrReviewStatus,
@@ -32,7 +34,7 @@ import { GitHubHost, tokenFrom, type FetchLike, type TokenSource } from "./githu
 import type { GitHost, HostFile, HostPullRequest, HostRepo } from "./host.js";
 import { systemGit, type GitRunner } from "./git.js";
 import { LocalMerger, mergeOnHost, planMerge, type MergeExecution } from "./executor.js";
-import { ReviewStore, type StoredReview } from "./store.js";
+import { ReviewStore, type AssignmentRecord, type StoredReview } from "./store.js";
 import { hostChecksGate, signedGate, type GateSource } from "./gate-source.js";
 import {
   eventBusAssigner,
@@ -101,6 +103,11 @@ export interface ReviewServiceOptions {
 
 function short(sha: string): string {
   return sha.slice(0, 7);
+}
+
+/** Assignment tokens are stored only as hashes. */
+function hashToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
 }
 
 export class ReviewService {
@@ -194,6 +201,7 @@ export class ReviewService {
         resolvedBy: f.resolvedBy,
         resolvedAt: f.resolvedAt,
         resolution: f.resolution,
+        resolvedClient: f.resolvedClient,
         superseded,
       }));
       return {
@@ -205,6 +213,7 @@ export class ReviewService {
         verdict: r.verdict,
         summary: r.summary,
         createdAt: r.createdAt,
+        client: r.client,
         findings,
         stale: r.headSha !== headSha,
         superseded,
@@ -268,6 +277,7 @@ export class ReviewService {
           blocking: blocks(f.severity),
           rule: f.rule,
         })),
+        client: null,
         at: this.now(),
       });
     })();
@@ -461,17 +471,24 @@ export class ReviewService {
   }
 
   /** Record a review. It counts only while `headSha` is the PR's head. */
-  async submitReview(n: number, input: ReviewInput): Promise<{ review: ReviewRecord; stale: boolean }> {
+  async submitReview(
+    n: number,
+    input: ReviewInput,
+    context: { assignmentToken: string | null; client: ClientInfo | null },
+  ): Promise<{ review: ReviewRecord; stale: boolean }> {
     if (input.reviewer.kind === "check") {
       throw new ReviewError("reviewer.kind check is reserved for Lair's own checks", 400);
     }
     if (input.verdict === "approve" && input.findings.some((f) => f.blocking)) {
       throw new ReviewError("An approval can't carry blocking findings: use request_changes", 400);
     }
+    const assignment =
+      input.reviewer.kind === "agent" ? this.assignmentFor(n, input.reviewer.id, input.headSha, context.assignmentToken) : null;
     const pr = await this.o.host.getPullRequest(n);
     this.noteHead(pr);
     if (pr.state !== "open") throw new ReviewError(`PR #${n} is ${pr.state}`, 409);
     const reviewer = this.withModel(input.reviewer);
+    if (assignment) this.o.store.markAssignmentUsed(this.project, n, assignment.headSha, assignment.slot, reviewer.id);
     const stored = this.o.store.addReview({
       project: this.project,
       pr: n,
@@ -481,6 +498,7 @@ export class ReviewService {
       summary: input.summary,
       context: {},
       findings: input.findings.map((f) => ({ ...f, rule: null })),
+      client: context.client,
       at: this.now(),
     });
     const review = this.annotate(this.o.store.listReviews(this.project, n), pr.headSha).find(
@@ -495,6 +513,35 @@ export class ReviewService {
       stale: review.stale,
     });
     return { review, stale: review.stale };
+  }
+
+  /**
+   * The assignment an agent's review is made under. An agent may review
+   * only with the token Lair issued (through the assigner) for this PR and
+   * head, and for this agent, or for any agent but the excluded ones.
+   */
+  private assignmentFor(n: number, reviewer: string, headSha: string, token: string | null): AssignmentRecord {
+    if (!token) {
+      throw new ReviewError(
+        "An agent's review needs the assignment_token Lair issued when it asked for the review (POST ./request-reviews)",
+        403,
+      );
+    }
+    const assignment = this.o.store.findAssignment(this.project, n, hashToken(token));
+    if (!assignment) throw new ReviewError(`No review of PR #${n} was assigned with this token`, 403);
+    if (assignment.headSha !== headSha) {
+      throw new ReviewError(`This assignment is for head ${short(assignment.headSha)}, not ${short(headSha)}`, 403);
+    }
+    const allowed = assignment.reviewer ? assignment.reviewer === reviewer : !assignment.exclude.includes(reviewer);
+    if (!allowed) {
+      throw new ReviewError(
+        assignment.reviewer
+          ? `This assignment is for ${assignment.reviewer}, not ${reviewer}`
+          : `${reviewer} may not take this assignment (the PR's author)`,
+        403,
+      );
+    }
+    return assignment;
   }
 
   /** Register the agent (or person) that wrote the PR. */
@@ -514,6 +561,7 @@ export class ReviewService {
     by: ReviewerRef,
     status: "resolved" | "dismissed",
     note: string,
+    client: ClientInfo | null = null,
   ): Promise<ReviewFinding> {
     const prNumber = this.o.store.findingPr(this.project, id);
     if (prNumber === null) throw new ReviewError(`No finding ${id} in ${this.project}`, 404);
@@ -540,7 +588,7 @@ export class ReviewService {
         403,
       );
     }
-    this.o.store.resolveFinding(this.project, id, { status, by: by.id, note, at: this.now() });
+    this.o.store.resolveFinding(this.project, id, { status, by: by.id, note, at: this.now(), client });
     return this.annotate(this.o.store.listReviews(this.project, prNumber), pr.headSha)
       .flatMap((r) => r.findings)
       .find((f) => f.id === id)!;
@@ -583,7 +631,9 @@ export class ReviewService {
     const outcomes: RequestOutcome[] = [];
     for (const [index, slot] of status.slots.entries()) {
       if (slot.satisfiedBy) continue;
-      if (this.o.store.wasRequested(this.project, n, status.headSha, index)) {
+      // Once per head; again only when the assignee reviewed without filling the slot
+      const previous = this.o.store.getRequest(this.project, n, status.headSha, index);
+      if (previous && !previous.usedBy) {
         outcomes.push({ slot: slot.label, channel: "already requested", detail: `at ${short(status.headSha)}` });
         continue;
       }
@@ -593,6 +643,7 @@ export class ReviewService {
       const self = options.some((o) => o.kind === "self");
       let channel: string;
       let detail: string;
+      let assignment: { reviewer: string | null; exclude: string[]; tokenHash: string } | null = null;
       if (named || peer || self) {
         const role = named || peer ? "review" : "self-check";
         const reviewer = named && named.kind === "agent" ? named.agent : role === "self-check" ? (status.author?.id ?? null) : null;
@@ -600,17 +651,23 @@ export class ReviewService {
           outcomes.push({ slot: slot.label, channel: "none", detail: "the PR's author is unknown" });
           continue;
         }
+        const exclude = role === "review" && status.author ? [status.author.id] : [];
+        const token = randomBytes(24).toString("base64url");
         const result = await this.o.assigner.assign({
           project: this.project,
           pr: n,
           headSha: status.headSha,
           tier: status.risk.tier,
           reviewer,
-          exclude: role === "review" && status.author ? [status.author.id] : [],
+          exclude,
           role,
           differentModelFrom: slot.slot.differentModel ? (status.author?.model ?? null) : null,
           reason: `The ${status.risk.tier} tier needs ${slot.label}`,
+          token,
         });
+        // The assigner may name the agent it picked; an excluded pick binds nobody
+        const picked = reviewer ?? (result.agent && !exclude.includes(result.agent) ? result.agent : null);
+        assignment = { reviewer: picked, exclude, tokenHash: hashToken(token) };
         channel = "assigner";
         detail = result.agent ? `${result.agent}: ${result.detail}` : result.detail;
       } else {
@@ -634,8 +691,7 @@ export class ReviewService {
         channel = "decision";
         detail = result.channel;
       }
-      this.o.store.recordRequest(this.project, n, status.headSha, index, channel, detail, this.now());
-      this.emit("review.assignment_requested", { pr: n, headSha: status.headSha, slot: slot.label, channel });
+      this.o.store.recordRequest(this.project, n, status.headSha, index, channel, detail, this.now(), assignment);
       outcomes.push({ slot: slot.label, channel, detail });
     }
     return outcomes;
@@ -650,7 +706,10 @@ export class ReviewService {
    * Merge, if the policy allows it at the head the caller confirmed. Every
    * refusal lists the conditions that failed.
    */
-  async merge(n: number, request: { confirm: boolean; headSha: string; by: string }): Promise<MergeResponse> {
+  async merge(
+    n: number,
+    request: { confirm: boolean; headSha: string; by: string; client?: ClientInfo | null },
+  ): Promise<MergeResponse> {
     if (this.readOnly) throw new ReviewError("The project is read-only (read_only: true): Lair does not merge", 403);
     if (request.confirm !== true) throw new ReviewError("Confirm the merge: send confirm: true", 400);
     if (this.merging) throw new ReviewError("Another merge is running for this project", 409);
@@ -753,6 +812,7 @@ export class ReviewService {
         at: this.now(),
         commitsChecked: execution.commitsChecked,
         conditions: status.conditions,
+        client: request.client ?? null,
       });
       this.emit("review.merged", {
         pr: n,

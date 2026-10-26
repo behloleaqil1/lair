@@ -9,6 +9,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { GateResult } from "../../shared/policy-types.js";
+import type { ReviewerRef } from "../../shared/review-types.js";
 import { generateNodeKeyPair, signGateResult } from "../gates/signature.js";
 import { ReviewManager, type ReviewService } from "./service.js";
 import type { DecisionRequest, ReviewAssignment } from "./ports.js";
@@ -116,7 +117,7 @@ function setup(review: Record<string, unknown>, files: FakeFile[], labels: strin
     assigner: {
       async assign(assignment) {
         assignments.push(assignment);
-        return { assigned: true, agent: assignment.reviewer ?? "worker-c", detail: "queued" };
+        return { assigned: true, agent: assignment.reviewer, detail: "queued" };
       },
     },
   });
@@ -131,7 +132,37 @@ function setup(review: Record<string, unknown>, files: FakeFile[], labels: strin
       }),
     },
   ]);
-  return { service: manager.get("demo")!, remote, base, head, decisions, assignments };
+  current = { service: manager.get("demo")!, remote, base, head, decisions, assignments };
+  return current;
+}
+
+let current: Setup | null = null;
+const NO_CONTEXT = { assignmentToken: null, client: null };
+
+/**
+ * Submit a review. A human reviews directly; an agent first needs an
+ * assignment, so Lair is asked for the missing reviews and the agent uses
+ * the token of the newest assignment it may take (none: no token).
+ */
+async function reviewAs(
+  reviewer: ReviewerRef,
+  headSha: string,
+  verdict: "approve" | "request_changes" = "approve",
+  n = 3,
+) {
+  const s = current!;
+  const input = { reviewer, headSha, verdict, summary: "", findings: [] };
+  if (reviewer.kind !== "agent") return s.service.submitReview(n, input, NO_CONTEXT);
+  await s.service.requestReviews(n);
+  const assignment = [...s.assignments]
+    .reverse()
+    .find(
+      (a) =>
+        a.pr === n &&
+        a.headSha === headSha &&
+        (a.reviewer === reviewer.id || (a.reviewer === null && !a.exclude.includes(reviewer.id))),
+    );
+  return s.service.submitReview(n, input, { assignmentToken: assignment?.token ?? null, client: null });
 }
 
 function condition(status: { conditions: { id: string; ok: boolean; detail: string }[] }, id: string) {
@@ -151,24 +182,11 @@ describe("required reviewers per tier", () => {
     ]);
     expect(before.slots.map((s) => s.label)).toEqual(["a human or agent lead-reviewer"]);
 
-    await service.submitReview(3, {
-      reviewer: { id: "worker-b", kind: "agent" },
-      headSha: head,
-      verdict: "approve",
-      summary: "",
-      findings: [],
-    });
-    const peerOnly = await service.status(3);
-    expect(peerOnly.canMerge).toBe(false);
-    expect(peerOnly.slots[0].detail).toContain("worker-b: not a human");
+    // Lair assigns the review to lead-reviewer: another agent has no assignment to review under
+    await expect(reviewAs({ id: "worker-b", kind: "agent" }, head)).rejects.toThrow("assignment_token");
+    expect((await service.status(3)).canMerge).toBe(false);
 
-    await service.submitReview(3, {
-      reviewer: { id: "lead-reviewer", kind: "agent" },
-      headSha: head,
-      verdict: "approve",
-      summary: "",
-      findings: [],
-    });
+    await reviewAs({ id: "lead-reviewer", kind: "agent" }, head);
     const ready = await service.status(3);
     expect(ready.slots[0].satisfiedBy?.reviewer.id).toBe("lead-reviewer");
     expect(ready.canMerge).toBe(true);
@@ -180,13 +198,7 @@ describe("required reviewers per tier", () => {
       [MIGRATION],
     );
     const approve = (id: string, kind: "human" | "agent", model?: string) =>
-      service.submitReview(3, {
-        reviewer: model ? { id, kind, model } : { id, kind },
-        headSha: head,
-        verdict: "approve",
-        summary: "",
-        findings: [],
-      });
+      reviewAs(model ? { id, kind, model } : { id, kind }, head);
     await approve("owner", "human");
     const onlyHuman = await service.status(3);
     // The human fills the human slot; it can't also be the peer
@@ -208,13 +220,7 @@ describe("required reviewers per tier", () => {
     const status = await service.status(3);
     expect(status.risk.tier).toBe("green");
     expect(status.slots[0].label).toBe("the author's self-check");
-    await service.submitReview(3, {
-      reviewer: { id: "worker-a", kind: "agent" },
-      headSha: head,
-      verdict: "approve",
-      summary: "self-check",
-      findings: [],
-    });
+    await reviewAs({ id: "worker-a", kind: "agent" }, head);
     expect((await service.status(3)).canMerge).toBe(true);
 
     // A PR whose branch names no agent: self and peer can't be judged
@@ -232,13 +238,7 @@ describe("required reviewers per tier", () => {
 describe("test integrity check in the policy", () => {
   it("blocks a red-tier PR whose test asserts only on its own fakes, with file:line", async () => {
     const { service, head } = setup({}, [MIGRATION, SELF_ASSERTING]);
-    await service.submitReview(3, {
-      reviewer: { id: "owner", kind: "human" },
-      headSha: head,
-      verdict: "approve",
-      summary: "",
-      findings: [],
-    });
+    await reviewAs({ id: "owner", kind: "human" }, head);
     const status = await service.status(3);
     expect(status.risk.tier).toBe("red");
     const finding = status.findings.find((f) => f.rule === "self-asserting-test")!;
@@ -268,13 +268,7 @@ describe("test integrity check in the policy", () => {
 
   it("records the same finding as advisory in the green tier", async () => {
     const { service, head } = setup({}, [SELF_ASSERTING]);
-    await service.submitReview(3, {
-      reviewer: { id: "worker-a", kind: "agent" },
-      headSha: head,
-      verdict: "approve",
-      summary: "",
-      findings: [],
-    });
+    await reviewAs({ id: "worker-a", kind: "agent" }, head);
     const status = await service.status(3);
     expect(status.risk.tier).toBe("green");
     expect(status.findings).toEqual([expect.objectContaining({ rule: "self-asserting-test", blocking: false })]);
@@ -301,13 +295,7 @@ describe("test integrity check in the policy", () => {
       content: source.join("\n"),
     };
     const { service, head } = setup({}, [MIGRATION, loadTest]);
-    await service.submitReview(3, {
-      reviewer: { id: "owner", kind: "human" },
-      headSha: head,
-      verdict: "approve",
-      summary: "",
-      findings: [],
-    });
+    await reviewAs({ id: "owner", kind: "human" }, head);
     const status = await service.status(3);
     expect(status.risk.tier).toBe("red");
     expect(status.findings).toEqual([
@@ -320,13 +308,7 @@ describe("test integrity check in the policy", () => {
 describe("merge conditions", () => {
   it("refuses with the failed gate, conflicts and a branch behind its base, naming each", async () => {
     const { service, remote, base, head } = setup({}, [README]);
-    await service.submitReview(3, {
-      reviewer: { id: "worker-a", kind: "agent" },
-      headSha: head,
-      verdict: "approve",
-      summary: "",
-      findings: [],
-    });
+    await reviewAs({ id: "worker-a", kind: "agent" }, head);
     remote.setChecks(head, [["build", "failure"]]);
     remote.pulls.get(3)!.mergeable = false;
     const moved = remote.commit([base], AGENT, "someone else's merge");
@@ -349,13 +331,7 @@ describe("merge conditions", () => {
 
   it("holds every merge while the default branch is red, and no label exempts a PR by default", async () => {
     const { service, remote, base, head } = setup({}, [README], ["revert"]);
-    await service.submitReview(3, {
-      reviewer: { id: "worker-a", kind: "agent" },
-      headSha: head,
-      verdict: "approve",
-      summary: "",
-      findings: [],
-    });
+    await reviewAs({ id: "worker-a", kind: "agent" }, head);
     remote.setChecks(base, [["build", "failure"]]);
     const red = await service.status(3);
     expect(condition(red, "holds").detail).toBe(
@@ -383,13 +359,7 @@ describe("merge conditions", () => {
     const revert = remote.commit([base], AGENT, `Revert "Add orders"\n\nThis reverts commit ${"a".repeat(40)}.`);
     remote.pushToPull(3, revert);
     remote.setChecks(revert, [["build", "success"]]);
-    await service.submitReview(3, {
-      reviewer: { id: "worker-a", kind: "agent" },
-      headSha: revert,
-      verdict: "approve",
-      summary: "",
-      findings: [],
-    });
+    await reviewAs({ id: "worker-a", kind: "agent" }, revert);
     const proven = await service.status(3);
     expect(condition(proven, "holds").ok).toBe(true);
     expect(proven.canMerge).toBe(true);
@@ -397,13 +367,7 @@ describe("merge conditions", () => {
 
   it("counts only check runs from the allow-listed app, not a same-named run or status from anyone else", async () => {
     const { service, remote, head } = setup({}, [README]);
-    await service.submitReview(3, {
-      reviewer: { id: "worker-a", kind: "agent" },
-      headSha: head,
-      verdict: "approve",
-      summary: "",
-      findings: [],
-    });
+    await reviewAs({ id: "worker-a", kind: "agent" }, head);
     remote.setChecks(head, [["build", "success"]], { id: 999, slug: "someone-elses-app" });
     remote.statuses.set(head, [{ context: "build", state: "success", creator: "untrusted-account" }]);
     const forged = await service.status(3);
@@ -441,13 +405,7 @@ describe("merge conditions", () => {
       },
       [README],
     );
-    await service.submitReview(3, {
-      reviewer: { id: "worker-a", kind: "agent" },
-      headSha: head,
-      verdict: "approve",
-      summary: "",
-      findings: [],
-    });
+    await reviewAs({ id: "worker-a", kind: "agent" }, head);
     expect((await service.status(3)).gate).toEqual([expect.objectContaining({ name: "backend", status: "missing" })]);
 
     const result: GateResult = {
@@ -503,8 +461,24 @@ describe("asking for missing reviewers", () => {
       expect.objectContaining({ reviewer: null, exclude: ["worker-a"], differentModelFrom: "model-one" }),
     ]);
 
+    // Each assignment carries its own token, which only that assignment accepts
+    const [lead, peer] = assignments;
+    expect(lead.token).toMatch(/^[A-Za-z0-9_-]{32,}$/);
+    expect(peer.token).not.toBe(lead.token);
+    const approve = (id: string, token: string) =>
+      service.submitReview(
+        3,
+        { reviewer: { id, kind: "agent" }, headSha: head, verdict: "approve", summary: "", findings: [] },
+        { assignmentToken: token, client: { address: "127.0.0.1", userAgent: "reviewer-agent" } },
+      );
+    await expect(approve("worker-b", lead.token)).rejects.toThrow("for lead-reviewer, not worker-b");
+    await expect(approve("worker-a", peer.token)).rejects.toThrow("the PR's author");
+    const { review } = await approve("lead-reviewer", lead.token);
+    expect(review.client).toEqual({ address: "127.0.0.1", userAgent: "reviewer-agent" });
+
     const again = await service.requestReviews(3);
-    expect(again.map((o) => o.channel)).toEqual(["already requested", "already requested", "already requested"]);
+    // lead-reviewer's slot is filled; the others were asked at this head already
+    expect(again.map((o) => o.channel)).toEqual(["already requested", "already requested"]);
     expect(decisions).toHaveLength(1);
     expect(assignments).toHaveLength(2);
   });

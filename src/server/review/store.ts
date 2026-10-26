@@ -9,6 +9,7 @@ import { existsSync, mkdirSync } from "fs";
 import { dirname } from "path";
 import { randomUUID } from "crypto";
 import type {
+  ClientInfo,
   FindingSeverity,
   FindingStatus,
   MergeHold,
@@ -36,6 +37,7 @@ const SCHEMA = `
     verdict TEXT NOT NULL,
     summary TEXT NOT NULL,
     context TEXT NOT NULL,
+    client TEXT,
     created_at TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_review_reviews_pr ON review_reviews(project, pr);
@@ -54,7 +56,8 @@ const SCHEMA = `
     status TEXT NOT NULL,
     resolved_by TEXT,
     resolved_at TEXT,
-    resolution TEXT
+    resolution TEXT,
+    resolved_client TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_review_findings_review ON review_findings(review_id);
 
@@ -93,7 +96,8 @@ const SCHEMA = `
     initiated_by TEXT NOT NULL,
     merged_at TEXT NOT NULL,
     commits_checked INTEGER NOT NULL,
-    conditions TEXT NOT NULL
+    conditions TEXT NOT NULL,
+    client TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_review_merges_project ON review_merges(project, merged_at);
 
@@ -105,8 +109,13 @@ const SCHEMA = `
     channel TEXT NOT NULL,
     detail TEXT NOT NULL,
     requested_at TEXT NOT NULL,
+    reviewer TEXT,
+    exclude TEXT NOT NULL DEFAULT '[]',
+    token_hash TEXT,
+    used_by TEXT,
     PRIMARY KEY (project, pr, head_sha, slot)
   );
+  CREATE INDEX IF NOT EXISTS idx_review_requests_token ON review_requests(project, pr, token_hash);
 
   CREATE TABLE IF NOT EXISTS review_gate_results (
     project TEXT NOT NULL,
@@ -139,6 +148,8 @@ export interface NewReview {
   /** Extra facts, e.g. the tier a check ran for */
   context: Record<string, unknown>;
   findings: NewFinding[];
+  /** Where the request came from (null for Lair's own checks) */
+  client: ClientInfo | null;
   at: string;
 }
 
@@ -153,6 +164,7 @@ export interface StoredFinding extends NewFinding {
   resolvedBy: string | null;
   resolvedAt: string | null;
   resolution: string | null;
+  resolvedClient: ClientInfo | null;
 }
 
 export interface StoredReview {
@@ -165,6 +177,7 @@ export interface StoredReview {
   summary: string;
   context: Record<string, unknown>;
   createdAt: string;
+  client: ClientInfo | null;
   /** Insertion order */
   seq: number;
   findings: StoredFinding[];
@@ -190,6 +203,7 @@ interface ReviewRow {
   verdict: string;
   summary: string;
   context: string;
+  client: string | null;
   created_at: string;
 }
 
@@ -208,6 +222,7 @@ interface FindingRow {
   resolved_by: string | null;
   resolved_at: string | null;
   resolution: string | null;
+  resolved_client: string | null;
 }
 
 interface HoldRow {
@@ -232,6 +247,43 @@ interface MergeRow {
   initiated_by: string;
   merged_at: string;
   commits_checked: number;
+  client: string | null;
+}
+
+/** One reviewer request, with its assignment token's hash (agents only). */
+export interface AssignmentRecord {
+  pr: number;
+  headSha: string;
+  slot: number;
+  /** The assigned agent, or null until the first review with the token binds it */
+  reviewer: string | null;
+  exclude: string[];
+  usedBy: string | null;
+}
+
+interface RequestRow {
+  pr: number;
+  head_sha: string;
+  slot: number;
+  reviewer: string | null;
+  exclude: string;
+  token_hash: string | null;
+  used_by: string | null;
+}
+
+function clientOf(json: string | null): ClientInfo | null {
+  return json ? (JSON.parse(json) as ClientInfo) : null;
+}
+
+function assignmentOf(row: RequestRow): AssignmentRecord {
+  return {
+    pr: row.pr,
+    headSha: row.head_sha,
+    slot: row.slot,
+    reviewer: row.reviewer,
+    exclude: JSON.parse(row.exclude) as string[],
+    usedBy: row.used_by,
+  };
 }
 
 function reviewerOf(row: { reviewer_id: string; reviewer_kind: string; reviewer_model: string | null }): ReviewerRef {
@@ -287,8 +339,8 @@ export class ReviewStore {
       this.db
         .prepare(
           `INSERT INTO review_reviews
-             (id, project, pr, head_sha, reviewer_id, reviewer_kind, reviewer_model, verdict, summary, context, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             (id, project, pr, head_sha, reviewer_id, reviewer_kind, reviewer_model, verdict, summary, context, client, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -301,6 +353,7 @@ export class ReviewStore {
           input.verdict,
           input.summary,
           JSON.stringify(input.context),
+          input.client ? JSON.stringify(input.client) : null,
           input.at,
         );
       const findingStmt = this.db.prepare(
@@ -347,6 +400,7 @@ export class ReviewStore {
         summary: row.summary,
         context: JSON.parse(row.context) as Record<string, unknown>,
         createdAt: row.created_at,
+        client: clientOf(row.client),
         seq: row.seq,
         findings: findings
           .filter((f) => f.review_id === row.id)
@@ -367,6 +421,7 @@ export class ReviewStore {
             resolvedBy: f.resolved_by,
             resolvedAt: f.resolved_at,
             resolution: f.resolution,
+            resolvedClient: clientOf(f.resolved_client),
           })),
       };
     });
@@ -383,14 +438,22 @@ export class ReviewStore {
   resolveFinding(
     project: string,
     id: string,
-    resolution: { status: "resolved" | "dismissed"; by: string; note: string; at: string },
+    resolution: { status: "resolved" | "dismissed"; by: string; note: string; at: string; client: ClientInfo | null },
   ): boolean {
     const result = this.db
       .prepare(
-        `UPDATE review_findings SET status = ?, resolved_by = ?, resolution = ?, resolved_at = ?
+        `UPDATE review_findings SET status = ?, resolved_by = ?, resolution = ?, resolved_at = ?, resolved_client = ?
          WHERE project = ? AND id = ? AND status = 'open'`,
       )
-      .run(resolution.status, resolution.by, resolution.note, resolution.at, project, id);
+      .run(
+        resolution.status,
+        resolution.by,
+        resolution.note,
+        resolution.at,
+        resolution.client ? JSON.stringify(resolution.client) : null,
+        project,
+        id,
+      );
     return result.changes > 0;
   }
 
@@ -503,13 +566,14 @@ export class ReviewStore {
     at: string;
     commitsChecked: number;
     conditions: unknown;
+    client: ClientInfo | null;
   }): ReviewMergeRecord {
     const id = shortId("merge");
     this.db
       .prepare(
         `INSERT INTO review_merges
-           (id, project, pr, head_sha, method, strategy, result_sha, initiated_by, merged_at, commits_checked, conditions)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (id, project, pr, head_sha, method, strategy, result_sha, initiated_by, merged_at, commits_checked, conditions, client)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -523,6 +587,7 @@ export class ReviewStore {
         input.at,
         input.commitsChecked,
         JSON.stringify(input.conditions),
+        input.client ? JSON.stringify(input.client) : null,
       );
     return this.listMerges(input.project).find((m) => m.id === id)!;
   }
@@ -542,26 +607,67 @@ export class ReviewStore {
       initiatedBy: r.initiated_by,
       mergedAt: r.merged_at,
       commitsChecked: r.commits_checked,
+      client: clientOf(r.client),
     }));
   }
 
   // ============ REVIEWER REQUESTS ============
 
-  wasRequested(project: string, pr: number, headSha: string, slot: number): boolean {
-    return (
-      this.db
-        .prepare(`SELECT 1 FROM review_requests WHERE project = ? AND pr = ? AND head_sha = ? AND slot = ?`)
-        .get(project, pr, headSha, slot) !== undefined
-    );
+  /** The request for one slot at one head, or null if none was made. */
+  getRequest(project: string, pr: number, headSha: string, slot: number): AssignmentRecord | null {
+    const row = this.db
+      .prepare(`SELECT * FROM review_requests WHERE project = ? AND pr = ? AND head_sha = ? AND slot = ?`)
+      .get(project, pr, headSha, slot) as RequestRow | undefined;
+    return row ? assignmentOf(row) : null;
   }
 
-  recordRequest(project: string, pr: number, headSha: string, slot: number, channel: string, detail: string, at: string): void {
+  /** Record a request; an agent assignment also stores its token's hash, never the token. */
+  recordRequest(
+    project: string,
+    pr: number,
+    headSha: string,
+    slot: number,
+    channel: string,
+    detail: string,
+    at: string,
+    assignment: { reviewer: string | null; exclude: string[]; tokenHash: string } | null = null,
+  ): void {
     this.db
       .prepare(
-        `INSERT OR REPLACE INTO review_requests (project, pr, head_sha, slot, channel, detail, requested_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT OR REPLACE INTO review_requests
+           (project, pr, head_sha, slot, channel, detail, requested_at, reviewer, exclude, token_hash, used_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
       )
-      .run(project, pr, headSha, slot, channel, detail, at);
+      .run(
+        project,
+        pr,
+        headSha,
+        slot,
+        channel,
+        detail,
+        at,
+        assignment?.reviewer ?? null,
+        JSON.stringify(assignment?.exclude ?? []),
+        assignment?.tokenHash ?? null,
+      );
+  }
+
+  /** The assignment a token (by its hash) was issued for, or null. */
+  findAssignment(project: string, pr: number, tokenHash: string): AssignmentRecord | null {
+    const row = this.db
+      .prepare(`SELECT * FROM review_requests WHERE project = ? AND pr = ? AND token_hash = ?`)
+      .get(project, pr, tokenHash) as RequestRow | undefined;
+    return row ? assignmentOf(row) : null;
+  }
+
+  /** Bind an assignment to the reviewer who used it (the first use binds an unnamed one). */
+  markAssignmentUsed(project: string, pr: number, headSha: string, slot: number, reviewer: string): void {
+    this.db
+      .prepare(
+        `UPDATE review_requests SET reviewer = COALESCE(reviewer, ?), used_by = ?
+         WHERE project = ? AND pr = ? AND head_sha = ? AND slot = ?`,
+      )
+      .run(reviewer, reviewer, project, pr, headSha, slot);
   }
 
   // ============ SIGNED GATE RESULTS ============

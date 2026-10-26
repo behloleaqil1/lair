@@ -6,7 +6,6 @@
  *   GET  /api/review/prs                        open PRs with their last verdict
  *   GET  /api/review/prs/:number                tier, required vs present reviews, findings, gate, conditions, plan
  *   POST /api/review/prs/:number/reviews        {reviewer, head_sha, verdict, summary, findings[]}
- *   POST /api/review/prs/:number/author         {id, kind, model?}
  *   POST /api/review/prs/:number/request-reviews
  *   POST /api/review/prs/:number/merge          {confirm: true, head_sha, by?}
  *   POST /api/review/findings/:id/resolve       {by: {id, kind}, status?, note}
@@ -16,12 +15,13 @@
  *   POST /api/review/gate-results               a signed gate result
  *   GET  /api/review/merges
  */
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { rejectCrossSiteRequests } from "../origin.js";
 import { HostError } from "./host.js";
 import { ReviewError, type ReviewManager, type ReviewService } from "./service.js";
 import type { SignedGateResult } from "../../shared/policy-types.js";
+import type { ClientInfo } from "../../shared/review-types.js";
 
 function respond<T>(data: T) {
   return { success: true, data, timestamp: new Date().toISOString() };
@@ -65,6 +65,8 @@ const ReviewBody = z
     verdict: z.enum(["approve", "request_changes"]),
     summary: z.string().max(10_000).default(""),
     findings: z.array(Finding).max(200).default([]),
+    /** For an agent's review: the token of its assignment (from request-reviews, via the assigner) */
+    assignment_token: z.string().min(16).max(200).optional(),
   })
   .strict();
 
@@ -130,6 +132,12 @@ const SignedGateBody = z
     nodePublicKey: z.string().min(1),
   })
   .strict();
+
+/** Where a request came from, recorded with what it did. */
+function clientOf(request: FastifyRequest): ClientInfo {
+  const agent = request.headers["user-agent"];
+  return { address: request.ip ?? null, userAgent: typeof agent === "string" ? agent.slice(0, 300) : null };
+}
 
 function firstIssue(error: z.ZodError): string {
   const issue = error.issues[0];
@@ -207,22 +215,18 @@ export async function registerReviewRoutes(
       const body = ReviewBody.safeParse(request.body);
       if (!body.success) return fail(reply, 400, `Invalid review: ${firstIssue(body.error)}`);
       return withService(request.query, reply, (service) =>
-        service.submitReview(n, {
-          reviewer: body.data.reviewer,
-          headSha: body.data.head_sha.toLowerCase(),
-          verdict: body.data.verdict,
-          summary: body.data.summary,
-          findings: body.data.findings,
-        }),
+        service.submitReview(
+          n,
+          {
+            reviewer: body.data.reviewer,
+            headSha: body.data.head_sha.toLowerCase(),
+            verdict: body.data.verdict,
+            summary: body.data.summary,
+            findings: body.data.findings,
+          },
+          { assignmentToken: body.data.assignment_token ?? null, client: clientOf(request) },
+        ),
       );
-    });
-
-    app.post("/api/review/prs/:number/author", async (request, reply) => {
-      const n = prNumber(request.params);
-      if (n === null) return fail(reply, 400, "Invalid PR number");
-      const body = Reviewer.safeParse(request.body);
-      if (!body.success) return fail(reply, 400, `Invalid author: ${firstIssue(body.error)}`);
-      return withService(request.query, reply, async (service) => service.setAuthor(n, body.data));
     });
 
     app.post("/api/review/prs/:number/request-reviews", async (request, reply) => {
@@ -241,6 +245,7 @@ export async function registerReviewRoutes(
           confirm: body.data.confirm,
           headSha: body.data.head_sha.toLowerCase(),
           by: body.data.by,
+          client: clientOf(request),
         });
         if (!result.merged) {
           return fail(reply, 409, `Merge refused: ${result.reasons.join(" | ")}`, result);
@@ -255,7 +260,7 @@ export async function registerReviewRoutes(
       const body = ResolveBody.safeParse(request.body);
       if (!body.success) return fail(reply, 400, `Invalid resolution: ${firstIssue(body.error)}`);
       return withService(request.query, reply, (service) =>
-        service.resolveFinding(params.data.id, body.data.by, body.data.status, body.data.note),
+        service.resolveFinding(params.data.id, body.data.by, body.data.status, body.data.note, clientOf(request)),
       );
     });
 
