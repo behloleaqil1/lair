@@ -90,8 +90,8 @@ describe("getDefaultProject", () => {
   it.each(["../example", "/etc/passwd", ".hidden", "a b", "-x"])(
     "warns and falls back when LAIR_PROJECT is the unsafe name %j",
     (name) => {
-      // Even if a list somehow contained the name, it must not be used
-      expect(getDefaultProject({ LAIR_PROJECT: name }, [name, "beta"])).toBe("beta");
+      // Even if the list somehow contained the name, LAIR_PROJECT must not select it
+      expect(getDefaultProject({ LAIR_PROJECT: name }, ["beta", name])).toBe("beta");
       expect(warn).toHaveBeenCalledTimes(1);
       expect(warn.mock.calls[0][0]).toContain("not a valid project name");
     },
