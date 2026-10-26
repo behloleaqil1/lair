@@ -27,6 +27,9 @@ import { registerFleetRoutes } from "./routes/fleet.js";
 import { getHealer, stopHealer } from "./fleet/healer.js";
 import { stopMachineManager } from "./fleet/machine-manager.js";
 import { registerClientStatic, resolveClientDir } from "./static.js";
+import { getEventBus } from "./core/event-bus.js";
+import { WatchdogManager, registerWatchdogRoutes } from "./watchdog/index.js";
+import { join } from "path";
 import type { ApiResponse } from "../shared/types.js";
 
 const PORT = 4777;
@@ -313,6 +316,23 @@ await registerSchedulerRoutes(fastify);
 // Register M3 fleet management routes
 await registerFleetRoutes(fastify);
 
+// Progress watchdog: one per project with `watchdog.enabled: true` (off by
+// default). Its routes are read-only and answer for every project.
+const watchdogs = new WatchdogManager({
+  dbPath: join(process.cwd(), "data", "watchdog.db"),
+  events: getEventBus(),
+});
+watchdogs.load(
+  listProjects().map((name) => {
+    try {
+      return { name, config: loadProjectConfig(name) };
+    } catch (e) {
+      return { name, error: e instanceof Error ? e.message : String(e) };
+    }
+  }),
+);
+await registerWatchdogRoutes(fastify, watchdogs, () => getDefaultProject());
+
 // Serve the built web UI (dist/client) with an SPA fallback, when it exists.
 // In development the UI comes from the Vite dev server on port 5173 instead.
 const clientDir = resolveClientDir();
@@ -336,6 +356,9 @@ const initSupervisor = async () => {
 // Graceful shutdown handler
 const shutdown = async (signal: string) => {
   console.log(`Received ${signal}, shutting down gracefully...`);
+
+  // Stop watchdogs (and close their store)
+  watchdogs.stop();
 
   // Stop healer
   stopHealer();
@@ -418,6 +441,14 @@ const start = async () => {
     const healer = getHealer();
     healer.start();
     console.log("[M3] Self-healing healer started");
+
+    // Start watchdogs
+    const watched = watchdogs.start();
+    console.log(
+      watched.length > 0
+        ? `[watchdog] Watching: ${watched.join(", ")}`
+        : "[watchdog] Off (no project sets watchdog.enabled)",
+    );
 
     // Start file watchers for all projects
     const projects = listProjects();
