@@ -5,7 +5,7 @@ import type { EventBus } from "../core/event-bus.js";
 import type { Store } from "../store/store.js";
 import type { WatchdogStore } from "./store.js";
 import type { SLODefinition, SLOType } from "./types.js";
-import type { Job, Node } from "../../shared/server-types.js";
+import type { Job } from "../../shared/server-types.js";
 
 /**
  * Context passed to detectors

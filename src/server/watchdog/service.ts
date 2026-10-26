@@ -11,7 +11,6 @@ import type {
   SLODefinition,
   SLOState,
   SLOBreach,
-  SLOType,
   HealthSummary,
 } from "./types.js";
 
@@ -96,7 +95,7 @@ export class WatchdogService {
   constructor(
     private eventBus: EventBus,
     private store: Store,
-    private db: any // Database instance
+    private db: import("better-sqlite3").Database // Database instance
   ) {
     this.watchdogStore = new WatchdogStore(db);
     this.playbookEngine = new PlaybookEngine(eventBus, store, this.watchdogStore);

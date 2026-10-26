@@ -8,8 +8,60 @@ import type {
   SLOBreach,
   PlaybookRun,
   PlaybookRunStatus,
-  PlaybookStepResult,
 } from "./types.js";
+
+/** Database row type for SLO definitions */
+interface SLODefinitionRow {
+  id: string;
+  name: string;
+  description: string;
+  project_id: string | null;
+  enabled: number;
+  threshold: number;
+  unit: string;
+  type: string;
+  condition: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Database row type for SLO states */
+interface SLOStateRow {
+  slo_id: string;
+  status: string;
+  current_value: number;
+  threshold: number;
+  state_changed_at: string;
+  evidence: string;
+  last_checked_at: string;
+}
+
+/** Database row type for breaches */
+interface SLOBreachRow {
+  id: string;
+  slo_id: string;
+  detected_at: string;
+  evidence: string;
+  value: number;
+  threshold: number;
+  playbook_runs: string;
+  resolved: number;
+  resolved_at: string | null;
+}
+
+/** Database row type for playbook runs */
+interface PlaybookRunRow {
+  id: string;
+  playbook_id: string;
+  breach_id: string;
+  status: string;
+  attempt: number;
+  started_at: string;
+  completed_at: string | null;
+  step_results: string;
+  diagnosis: string | null;
+  error: string | null;
+}
 
 /**
  * SQL for creating watchdog tables
@@ -123,7 +175,7 @@ export class WatchdogStore {
    * Get an SLO definition by ID
    */
   getSLODefinition(id: string): SLODefinition | null {
-    const row = this.db.prepare(`SELECT * FROM slo_definitions WHERE id = ?`).get(id) as any;
+    const row = this.db.prepare(`SELECT * FROM slo_definitions WHERE id = ?`).get(id) as SLODefinitionRow | undefined;
     if (!row) return null;
     return this.rowToSLODefinition(row);
   }
@@ -132,7 +184,7 @@ export class WatchdogStore {
    * Get all SLO definitions
    */
   getAllSLODefinitions(): SLODefinition[] {
-    const rows = this.db.prepare(`SELECT * FROM slo_definitions ORDER BY type, name`).all() as any[];
+    const rows = this.db.prepare(`SELECT * FROM slo_definitions ORDER BY type, name`).all() as SLODefinitionRow[];
     return rows.map(this.rowToSLODefinition);
   }
 
@@ -140,11 +192,11 @@ export class WatchdogStore {
    * Get enabled SLO definitions
    */
   getEnabledSLODefinitions(): SLODefinition[] {
-    const rows = this.db.prepare(`SELECT * FROM slo_definitions WHERE enabled = 1 ORDER BY type, name`).all() as any[];
+    const rows = this.db.prepare(`SELECT * FROM slo_definitions WHERE enabled = 1 ORDER BY type, name`).all() as SLODefinitionRow[];
     return rows.map(this.rowToSLODefinition);
   }
 
-  private rowToSLODefinition(row: any): SLODefinition {
+  private rowToSLODefinition(row: SLODefinitionRow): SLODefinition {
     return {
       id: row.id,
       name: row.name,
@@ -190,7 +242,7 @@ export class WatchdogStore {
    * Get SLO state by ID
    */
   getSLOState(sloId: string): SLOState | null {
-    const row = this.db.prepare(`SELECT * FROM slo_states WHERE slo_id = ?`).get(sloId) as any;
+    const row = this.db.prepare(`SELECT * FROM slo_states WHERE slo_id = ?`).get(sloId) as SLOStateRow | undefined;
     if (!row) return null;
     return this.rowToSLOState(row);
   }
@@ -199,11 +251,11 @@ export class WatchdogStore {
    * Get all SLO states
    */
   getAllSLOStates(): SLOState[] {
-    const rows = this.db.prepare(`SELECT * FROM slo_states`).all() as any[];
+    const rows = this.db.prepare(`SELECT * FROM slo_states`).all() as SLOStateRow[];
     return rows.map(this.rowToSLOState);
   }
 
-  private rowToSLOState(row: any): SLOState {
+  private rowToSLOState(row: SLOStateRow): SLOState {
     return {
       sloId: row.slo_id,
       status: row.status,
@@ -240,7 +292,7 @@ export class WatchdogStore {
    * Get a breach by ID
    */
   getBreach(id: string): SLOBreach | null {
-    const row = this.db.prepare(`SELECT * FROM slo_breaches WHERE id = ?`).get(id) as any;
+    const row = this.db.prepare(`SELECT * FROM slo_breaches WHERE id = ?`).get(id) as SLOBreachRow | undefined;
     if (!row) return null;
     return this.rowToBreach(row);
   }
@@ -249,7 +301,7 @@ export class WatchdogStore {
    * Get active (unresolved) breaches
    */
   getActiveBreaches(): SLOBreach[] {
-    const rows = this.db.prepare(`SELECT * FROM slo_breaches WHERE resolved = 0 ORDER BY detected_at DESC`).all() as any[];
+    const rows = this.db.prepare(`SELECT * FROM slo_breaches WHERE resolved = 0 ORDER BY detected_at DESC`).all() as SLOBreachRow[];
     return rows.map(this.rowToBreach);
   }
 
@@ -257,7 +309,7 @@ export class WatchdogStore {
    * Get breaches for an SLO
    */
   getBreachesForSLO(sloId: string, limit = 10): SLOBreach[] {
-    const rows = this.db.prepare(`SELECT * FROM slo_breaches WHERE slo_id = ? ORDER BY detected_at DESC LIMIT ?`).all(sloId, limit) as any[];
+    const rows = this.db.prepare(`SELECT * FROM slo_breaches WHERE slo_id = ? ORDER BY detected_at DESC LIMIT ?`).all(sloId, limit) as SLOBreachRow[];
     return rows.map(this.rowToBreach);
   }
 
@@ -278,7 +330,7 @@ export class WatchdogStore {
     this.db.prepare(`UPDATE slo_breaches SET resolved = 1, resolved_at = datetime('now') WHERE id = ?`).run(id);
   }
 
-  private rowToBreach(row: any): SLOBreach {
+  private rowToBreach(row: SLOBreachRow): SLOBreach {
     return {
       id: row.id,
       sloId: row.slo_id,
@@ -310,7 +362,7 @@ export class WatchdogStore {
    * Get a playbook run by ID
    */
   getPlaybookRun(id: string): PlaybookRun | null {
-    const row = this.db.prepare(`SELECT * FROM playbook_runs WHERE id = ?`).get(id) as any;
+    const row = this.db.prepare(`SELECT * FROM playbook_runs WHERE id = ?`).get(id) as PlaybookRunRow | undefined;
     if (!row) return null;
     return this.rowToPlaybookRun(row);
   }
@@ -348,7 +400,7 @@ export class WatchdogStore {
    * Get runs for a breach
    */
   getRunsForBreach(breachId: string): PlaybookRun[] {
-    const rows = this.db.prepare(`SELECT * FROM playbook_runs WHERE breach_id = ? ORDER BY started_at DESC`).all(breachId) as any[];
+    const rows = this.db.prepare(`SELECT * FROM playbook_runs WHERE breach_id = ? ORDER BY started_at DESC`).all(breachId) as PlaybookRunRow[];
     return rows.map(this.rowToPlaybookRun);
   }
 
@@ -356,7 +408,7 @@ export class WatchdogStore {
    * Get recent playbook runs
    */
   getRecentRuns(limit = 20): PlaybookRun[] {
-    const rows = this.db.prepare(`SELECT * FROM playbook_runs ORDER BY started_at DESC LIMIT ?`).all(limit) as any[];
+    const rows = this.db.prepare(`SELECT * FROM playbook_runs ORDER BY started_at DESC LIMIT ?`).all(limit) as PlaybookRunRow[];
     return rows.map(this.rowToPlaybookRun);
   }
 
@@ -364,11 +416,11 @@ export class WatchdogStore {
    * Get running playbook runs
    */
   getRunningRuns(): PlaybookRun[] {
-    const rows = this.db.prepare(`SELECT * FROM playbook_runs WHERE status IN ('pending', 'running') ORDER BY started_at`).all() as any[];
+    const rows = this.db.prepare(`SELECT * FROM playbook_runs WHERE status IN ('pending', 'running') ORDER BY started_at`).all() as PlaybookRunRow[];
     return rows.map(this.rowToPlaybookRun);
   }
 
-  private rowToPlaybookRun(row: any): PlaybookRun {
+  private rowToPlaybookRun(row: PlaybookRunRow): PlaybookRun {
     return {
       id: row.id,
       playbookId: row.playbook_id,

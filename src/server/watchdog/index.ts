@@ -3,7 +3,7 @@
  */
 import type { FastifyInstance } from "fastify";
 import type { EventBus } from "../core/event-bus.js";
-import { registerModule, type ModuleRegistration, type Detector, type Playbook, type ViewRegistration } from "../modules.js";
+import { registerModule, type ModuleRegistration, type Detector, type Playbook } from "../modules.js";
 import { WatchdogService } from "./service.js";
 import { registerWatchdogRoutes } from "./routes.js";
 import { builtInPlaybooks } from "./playbooks.js";
@@ -37,7 +37,7 @@ function createDetectors(): Detector[] {
       name: "SLO Monitor",
       description: "Monitors all configured SLOs and triggers playbooks on breaches",
       enabledByDefault: true,
-      start: (eventBus: EventBus) => {
+      start: (_eventBus: EventBus) => {
         // The actual monitoring is done by the WatchdogService
         // This detector just ensures the service is started
         if (watchdogService) {
@@ -114,12 +114,12 @@ const watchdogModule: ModuleRegistration = {
     },
   ],
 
-  registerRoutes: async (app: FastifyInstance) => {
+  registerRoutes: async (_app: FastifyInstance) => {
     // Routes are registered when the service is initialized
     // This is called before initialize()
   },
 
-  initialize: async (eventBus: EventBus) => {
+  initialize: async (_eventBus: EventBus) => {
     // The service needs the Store and DB, which we'll get from context
     // For now, we'll create a placeholder and initialize it properly
     // when the server passes us the actual dependencies
@@ -140,9 +140,9 @@ const watchdogModule: ModuleRegistration = {
  */
 export function initializeWatchdogService(
   app: FastifyInstance,
-  eventBus: EventBus,
+  _eventBus: EventBus,
   store: Store,
-  db: any
+  db: import("better-sqlite3").Database
 ): WatchdogService {
   watchdogService = new WatchdogService(eventBus, store, db);
   watchdogService.initialize();
