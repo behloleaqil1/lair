@@ -238,13 +238,14 @@ describe("mountDecisions (the server's wiring)", () => {
 
     // 4. Nobody else can answer: no Origin, a cookie, another local origin, forged headers (403, nothing runs)
     const answerPath = `/api/decisions/${decision.id}/answer`;
-    for (const headers of [
+    const refused: Record<string, string>[] = [
       {},
       { [OWNER_SESSION_HEADER]: session },
       { ...dashboard, cookie: `session=${session}` },
       { ...dashboard, origin: "http://localhost:3000", [OWNER_SESSION_HEADER]: session },
       dashboard,
-    ]) {
+    ];
+    for (const headers of refused) {
       expect((await call(port, "POST", answerPath, { optionId: "run_playbook" }, headers)).status).toBe(403);
     }
     await watchdog.tick();
