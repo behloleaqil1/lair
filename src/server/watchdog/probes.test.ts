@@ -100,6 +100,18 @@ describe("ExecFileRunner", () => {
     const out = await new ExecFileRunner(5000).run([process.execPath, "-e", "process.exit(3)"]);
     expect(out.code).toBe(3);
   });
+
+  it("kills the command when the signal aborts, long before its timeout", async () => {
+    const abort = new AbortController();
+    const started = Date.now();
+    const running = new ExecFileRunner(60_000).run([process.execPath, "-e", "setTimeout(() => {}, 60000)"], {
+      signal: abort.signal,
+    });
+    setTimeout(() => abort.abort(), 50);
+    const out = await running;
+    expect(out.code).toBe(-1);
+    expect(Date.now() - started).toBeLessThan(10_000);
+  });
 });
 
 describe("NodeFileSystem", () => {

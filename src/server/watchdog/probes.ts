@@ -59,9 +59,15 @@ export interface CommandOutput {
   stderr: string;
 }
 
+export interface RunOptions {
+  timeoutMs?: number;
+  /** Kills the command when it aborts (it then answers with code -1) */
+  signal?: AbortSignal;
+}
+
 /** Runs a command from an argv array. Never through a shell. */
 export interface CommandRunner {
-  run(argv: string[], options?: { timeoutMs?: number }): Promise<CommandOutput>;
+  run(argv: string[], options?: RunOptions): Promise<CommandOutput>;
 }
 
 export interface Clock {
@@ -86,7 +92,7 @@ const MAX_OUTPUT_BYTES = 1024 * 1024;
 export class ExecFileRunner implements CommandRunner {
   constructor(private defaultTimeoutMs = 120_000) {}
 
-  run(argv: string[], options: { timeoutMs?: number } = {}): Promise<CommandOutput> {
+  run(argv: string[], options: RunOptions = {}): Promise<CommandOutput> {
     const [file, ...args] = argv;
     if (!file) {
       return Promise.resolve({ code: -1, stdout: "", stderr: "empty command" });
@@ -100,6 +106,7 @@ export class ExecFileRunner implements CommandRunner {
           maxBuffer: MAX_OUTPUT_BYTES,
           encoding: "utf-8",
           shell: false,
+          signal: options.signal,
         },
         (error, stdout, stderr) => {
           if (!error) {
