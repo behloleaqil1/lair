@@ -16,6 +16,7 @@ import { Health } from "./components/Health";
 import { Delivery } from "./components/Delivery";
 import { Reviews } from "./components/Reviews";
 import { Agents } from "./components/Agents";
+import { Triage } from "./components/Triage";
 import { CommandBar } from "./components/CommandBar";
 import { pickInitialProject } from "./initial-project";
 import type { CommandMode, ControlsStatus } from "../shared/types";
@@ -38,6 +39,7 @@ type View =
   | "delivery"
   | "reviews"
   | "agents"
+  | "triage"
   | "inbox";
 
 const VIEWS: { id: View; label: string }[] = [
@@ -56,6 +58,7 @@ const VIEWS: { id: View; label: string }[] = [
   { id: "health", label: "Health" },
   { id: "delivery", label: "Delivery" },
   { id: "agents", label: "Agents" },
+  { id: "triage", label: "Triage" },
   { id: "inbox", label: "Inbox" },
 ];
 
@@ -147,6 +150,8 @@ export function App() {
         return <Reviews {...props} />;
       case "agents":
         return <Agents {...props} />;
+      case "triage":
+        return <Triage {...props} />;
       case "inbox":
         return <Inbox {...props} />;
     }
