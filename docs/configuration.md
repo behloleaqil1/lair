@@ -346,11 +346,14 @@ The watchdog ([design](design/autonomy.md#2-progress-watchdog-and-playbook-engin
 
 What happens to an open breach:
 
-- **Act**: when `mode: act` is set, the project is not `read_only`, and the breach's playbook has `act: true`, the playbook runs. It **diagnoses** (re-checks the breach on fresh data), **acts** (runs your `watchdog.actions.<action>` command) and **verifies**. A breach that is still open is retried after `cooldown_minutes`, up to `max_attempts` times, and then escalated.
+- **Act**: when `mode: act` is set, the project is not `read_only`, and the breach's playbook has `act: true`, the playbook runs. It **diagnoses** (re-checks the breach on fresh data), **acts** (runs your `watchdog.actions.<action>` command) and **verifies**. A breach that is still open is retried after `cooldown_minutes`, up to `max_attempts` times, and then escalated. An attempt is a run that reached its act step: a run that stopped at diagnose (for example because `ps` failed) does not use one up.
 - **Observe**: in every other case the playbook is recorded as `observed`, together with the command it would have run, and the breach is escalated.
-- **Escalation**: happens once per breach. Lair appends an `- OWNER? ...` entry with the evidence (and the command output, if a command ran) to `escalation_file`, or to `inbox_file` when `escalation_file` is not set. With neither set, the escalation is kept in the store only.
+- **Escalation**: happens once per breach. Lair appends an `- OWNER? ...` entry with the evidence (and the command output, if a command ran) to `escalation_file`, or to `inbox_file` when `escalation_file` is not set. With neither set, the escalation is kept in the store only. A breach that clears and comes back within `reescalate_minutes` of the last escalation for the same subject is recorded as suppressed and not written again.
+- **A failed probe**: when a detector fails during a tick (`ps` fails, `merged_cmd` exits non-zero, ...), its open breaches are left alone for that tick. Nothing is resolved, run or escalated on data that could not be read.
 
-Lair decides what to do and calls your commands; it never stops, kills or restarts anything itself. Any process id it passes to a command (`{pid}`) belongs to a process that `agent_command` matched to a configured agent. Right before each command runs, Lair checks again on fresh data. It refuses to restart a WAITING agent, to release a live agent's claim, or to break a lock whose holder is alive.
+Lair decides what to do and calls your commands; it never stops, kills or restarts anything itself. Any process id it passes to a command (`{pid}`) belongs to a process that `agent_command` matched to a configured agent. Right before each command runs, Lair checks again on fresh data. It refuses to restart a WAITING agent, to release a live agent's claim, or to break a lock whose holder is alive. When the server stops, a verify delay in progress is cut short and no further command starts.
+
+**Local agents only.** The process-based checks (`duplicate_agent`, `agent_hung`, `orphan_claim`, and the agents counted by `idle_capacity`) read this machine's `ps`. They only judge agents that run here: an agent whose `dragons.<id>.machine` is unset, or names a `machines:` entry of `type: local` (`local` also counts when it isn't listed). An agent on an `ssh` machine, or on a machine that isn't listed, is unknown here and never treated as dead. Its claim is never released, `idle_capacity` counts it as running while it has a claim, and local processes that match its id (an `ssh` wrapper, say) are ignored.
 
 ```yaml
 watchdog:
@@ -386,7 +389,7 @@ watchdog:
 | `infra_signature` | The same normalised failure text (timestamps, hashes, numbers and the gate's own ids removed) in at least `infra_min_tracks` finished, failed gates of different tracks on one lane within `infra_window_minutes` | `lane_broken` | `mark_lane_broken` | later ticks |
 | `gate_owner_gone` | A running gate request (`.req.run`) whose runner pid (in the `.req.run` file, else `gates_dir/runner-<lane>.pid`) is not running, or that has no runner pid at all, and whose log has been silent for `gate_lease_minutes` | `gate_owner_gone` | `requeue_gate` | the request is no longer running |
 | `idle_capacity` | Ready work (queued gate requests plus `ready_tasks_cmd` tasks) and free capacity (no agent running, or fewer than `max_agents`), with nothing started (no claim, running gate or agent process) for `idle_minutes` | `idle_capacity` | `fill_capacity` | later ticks |
-| `progress_stall` | No merge for `stall_hours` while work is pending (gate requests, ready tasks or claims). A merge is a `- MERGED ...` line in the queue file, or a time printed by `merged_cmd`. With no merge on record it reports nothing | `no_merges` | `triage_stall` | later ticks |
+| `progress_stall` | No merge for `stall_hours` while work is pending (gate requests, ready tasks or claims). The queue file's last merge is its last `- MERGED ...` line, and only a full ISO time on it counts (`2026-01-01T12:00:00Z`): an `HH:MMZ` time has no date, so when the last MERGED line has none, the queue's last merge is unknown. A time printed by `merged_cmd` also counts. With no known merge it reports nothing | `no_merges` | `triage_stall` | later ticks |
 | `crash_loop` | A configured container's `RestartCount` (from `docker inspect`) rose by `max_restarts` or more within `window_minutes` | `crash_loop` | `stop_container_restarts` | later ticks |
 
 A detector without the config it needs is inactive: the three process-based detectors need `agent_command`, `lock_holder_dead` needs `locks`, and `crash_loop` needs `containers`. A "later ticks" verify means the breach is resolved when it is no longer detected, or escalated once its attempts are used up.
@@ -412,6 +415,7 @@ A detector without the config it needs is inactive: the three process-based dete
 | `merged_cmd` | array | — | Prints merge times as ISO-8601 timestamps, e.g. `["gh", "pr", "list", "-R", "org/repo", "--state", "merged", "--json", "mergedAt", "-L", "1"]` |
 | `docker_cmd` | array | `["docker"]` | The container CLI used for `inspect` |
 | `escalation_file` | string | `inbox_file` | Where escalations are appended |
+| `reescalate_minutes` | number | `60` | A breach whose subject (the same lock, agent, claim, ...) was escalated less than this long ago is not written again. `0` writes every one |
 | `disabled_detectors` | array | `[]` | Detector ids to skip |
 | `locks` | array | `[]` | `{name, path, pid_file: "pid", lease_minutes: 30}`. `path` is a lock directory (its holder's pid is in `<path>/<pid_file>`) or a lock file (holding the pid). A pid is written as `1234` or `pid=1234` |
 | `containers` | array | `[]` | `{name, max_restarts: 3, window_minutes: 10}` |
@@ -422,7 +426,7 @@ Unknown keys, an unknown placeholder in an action, or `act: true` for a playbook
 
 ### Actions
 
-Each action is an argv array, and `{placeholder}`s are replaced inside each argument. Every action also gets `{project}`.
+Each action is an argv array, and `{placeholder}`s are replaced inside each argument. Every action also gets `{project}`. Values come from your files (log text, file names), so a value that would start an argument with `-` (and so read as an option) is refused: the step fails instead of running. Inside an argument, as in `--signature={signature}`, such a value is passed as data. The `{signature}` text never starts with a dash.
 
 | Action | Placeholders |
 |--------|--------------|
