@@ -103,5 +103,6 @@ See [Configuration](configuration.md) for all available options.
 - The server binds to `127.0.0.1` only by default (localhost)
 - After `npm start`, if the server logs "No built web UI found", run `npm run build` first
 - In development mode, the UI runs on port 5173, not 4777
+- If `npm run dev` stops with "Port 5173 is already in use", another process (often an earlier `npm run dev`) holds the port: find it with `lsof -i :5173` and stop it. Vite is set to `strictPort`, so it fails instead of moving to 5174, because the server only accepts the dashboard from ports 5173 and 4777 and would refuse a page on 5174 with HTTP 403
 - Check browser console for WebSocket connection errors
 - An HTTP 403 ("Cross-origin request refused" or "Unexpected Host header") means the page was opened under a host name the server does not know: use `http://localhost:4777` or `http://127.0.0.1:4777` (or the address in `LAIR_HOST`)
