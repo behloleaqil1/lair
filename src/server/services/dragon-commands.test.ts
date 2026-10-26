@@ -5,6 +5,9 @@
  * (actual execution is mocked)
  */
 import { describe, it, expect } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { buildCommand, CommandService } from "./command.js";
 import type { ProjectConfig } from "../../shared/types.js";
 
@@ -133,12 +136,44 @@ describe("CommandService dragon methods", () => {
     });
 
     it("returns undefined when dragons not configured", () => {
-      const config = createMockConfig();
-      const service = new CommandService(config);
-      const mgmtConfig = service.getDragonManagementConfig();
+      const agentsDir = mkdtempSync(join(tmpdir(), "lair-mgmt-"));
+      try {
+        const config = createMockConfig({ agents_dir: agentsDir });
+        const service = new CommandService(config);
+        const mgmtConfig = service.getDragonManagementConfig();
 
-      expect(mgmtConfig.dragons).toBeUndefined();
-      expect(mgmtConfig.available_models).toBeUndefined();
+        expect(mgmtConfig.dragons).toEqual({});
+        expect(mgmtConfig.available_models).toBeUndefined();
+      } finally {
+        rmSync(agentsDir, { recursive: true, force: true });
+      }
+    });
+
+    it("includes dragons listed only in dragons.txt, next to the YAML ones", () => {
+      const agentsDir = mkdtempSync(join(tmpdir(), "lair-mgmt-"));
+      try {
+        writeFileSync(join(agentsDir, "dragons.txt"), "kiro-B\tFafnir\tfix-auth\n1-bad\tBad\tt\n");
+        const config = createMockConfig({
+          agents_dir: agentsDir,
+          dragons: {
+            "kiro-A": { name: "Smaug", model: "claude-opus-4.5", machine: "mac", instructions: "" },
+          },
+        });
+        const service = new CommandService(config);
+        const { dragons } = service.getDragonManagementConfig();
+
+        expect(Object.keys(dragons!).sort()).toEqual(["kiro-A", "kiro-B"]);
+        expect(dragons!["kiro-A"]).toMatchObject({ name: "Smaug", model: "claude-opus-4.5", machine: "mac" });
+        expect(dragons!["kiro-B"]).toEqual({
+          id: "kiro-B",
+          name: "Fafnir",
+          model: "",
+          machine: "",
+          instructions: "",
+        });
+      } finally {
+        rmSync(agentsDir, { recursive: true, force: true });
+      }
     });
   });
 

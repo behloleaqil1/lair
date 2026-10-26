@@ -11,8 +11,8 @@ import {
 } from "fs";
 import { join, resolve } from "path";
 import { loadProjectConfig } from "../config.js";
-import { isValidDragonId, parseDragonRegistry } from "../parsers/dragon-config.js";
-import { parseDragonsFile } from "../parsers/dragons.js";
+import { isValidDragonId } from "../parsers/dragon-config.js";
+import { knownDragonIds } from "../services/dragon-registry.js";
 import { projectQueryGuard, type ProjectRouteConfig } from "./project-guard.js";
 import { rejectCrossSiteRequests } from "../origin.js";
 import { CommandService, getAuditLog } from "../services/command.js";
@@ -110,30 +110,13 @@ export function getPromptsDir(config: ProjectConfig): string {
   return resolve(config.prompts_dir || DEFAULT_PROMPTS_DIR);
 }
 
-/**
- * IDs of the dragons a project has, from the same two sources the dashboard
- * lists: the YAML `dragons:` map and `<agents_dir>/dragons.txt`. Only IDs
- * that pass isValidDragonId are included.
- */
-export function knownDragonIds(config: ProjectConfig): Set<string> {
-  const ids = new Set(parseDragonRegistry(config).keys());
-  let content = "";
-  try {
-    content = readFileSync(join(config.agents_dir, "dragons.txt"), "utf-8");
-  } catch {
-    // No dragons.txt: the YAML map is the whole registry
-  }
-  for (const dragon of parseDragonsFile(content)) {
-    if (isValidDragonId(dragon.id)) {
-      ids.add(dragon.id);
-    }
-  }
-  return ids;
-}
+// The registry lives in services/dragon-registry.ts; re-exported for callers of this module
+export { knownDragonIds };
 
 /**
- * Check a dragon id from a request against the project's dragons (see
- * knownDragonIds). Returns an error message, or null if the id is known.
+ * Check a dragon id from a request against the project's dragons (the YAML
+ * `dragons:` map plus dragons.txt, see services/dragon-registry.ts).
+ * Returns an error message, or null if the id is known.
  */
 export function dragonIdError(config: ProjectConfig, dragonId: unknown): string | null {
   if (typeof dragonId !== "string" || dragonId.length === 0) {

@@ -92,6 +92,7 @@ Pure functions that parse project files into typed structures:
 
 - **`data.ts`**: main data service, aggregates parsers for each view (read-only)
 - **`command.ts`**: runs configured commands as argument arrays (no shell) and appends each action to `data/audit.log`
+- **`dragon-registry.ts`**: the dragons a project has (YAML `dragons:` plus `dragons.txt`); start/stop requests are checked against it and the start dialog lists it
 - **`adapters.ts`**: built-in agent adapter definitions and command builders (adapters are listed in the UI; dragons are started with `dragon_start_cmd`)
 - **`supervisor.ts`**, **`managed-process.ts`**, **`ring-buffer.ts`**: process manager for long-running services and their logs
 - **`file-watcher.ts`**: watches project files and broadcasts changes over the WebSocket

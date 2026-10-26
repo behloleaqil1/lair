@@ -18,6 +18,7 @@ import type {
   DragonManagementConfig,
 } from "../../shared/types.js";
 import { listAdapters } from "./adapters.js";
+import { loadKnownDragons } from "./dragon-registry.js";
 
 const DATA_DIR = join(process.cwd(), "data");
 const AUDIT_LOG = join(DATA_DIR, "audit.log");
@@ -374,12 +375,14 @@ export class CommandService {
   // ============ DRAGON MANAGEMENT (Phase 4) ============
 
   /**
-   * Get dragon management config (dragons, models, adapters, commands)
+   * Get dragon management config (dragons, models, adapters, commands).
+   * `dragons` is every dragon start/stop accepts: the YAML map plus
+   * dragons.txt, read now (see services/dragon-registry.ts).
    */
   getDragonManagementConfig(): DragonManagementConfig {
     const cfg = this.config as ProjectConfig & DragonManagementConfig;
     return {
-      dragons: cfg.dragons,
+      dragons: Object.fromEntries(loadKnownDragons(this.config)),
       available_models: cfg.available_models,
       available_adapters: listAdapters(this.config),
       default_instructions: cfg.default_instructions,

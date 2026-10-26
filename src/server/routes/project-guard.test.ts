@@ -261,6 +261,20 @@ describe("dragon start/stop validation", () => {
     expect(res.json().error).toBe("Unknown dragon: charlie");
   });
 
+  it("lists the YAML and the dragons.txt dragons in dragon/config", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/controls/dragon/config",
+      query: { project: PROJECT },
+    });
+    expect(res.statusCode).toBe(200);
+    const { dragons } = res.json().data;
+    // Exactly the ids start/stop accept
+    expect(Object.keys(dragons).sort()).toEqual(["alpha", "bravo"]);
+    expect(dragons.alpha.name).toBe("Alpha");
+    expect(dragons.bravo).toMatchObject({ id: "bravo", name: "Bravo", model: "", machine: "" });
+  });
+
   it("defaults prompts_dir to data/prompts, not a repo-specific layout", () => {
     const config = { repo: "/some/repo" } as ProjectConfig;
     expect(getPromptsDir(config)).toBe(resolve("data", "prompts"));
