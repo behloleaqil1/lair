@@ -1,10 +1,12 @@
 /**
- * Gates view - queue and results
+ * Gates view - queue and results, and the pipelines section (runs and where
+ * they ran).
  * Uses WebSocket for real-time updates with REST polling as fallback.
  */
 import { useState } from "react";
 import { useApi } from "../hooks/useApi";
 import { useGatesWebSocket } from "../hooks/useWebSocket";
+import { PipelineRuns } from "./PipelineRuns";
 import type { Gate, GateResult } from "../../shared/types";
 
 interface GatesData {
@@ -225,6 +227,9 @@ export function Gates({ project, refreshKey }: Props) {
           </table>
         )}
       </div>
+
+      {/* Pipelines from the project config: runs, executors, fallbacks, minutes */}
+      <PipelineRuns project={project} refreshKey={refreshKey} />
 
       {/* Gate log panel */}
       {selectedGate && (
