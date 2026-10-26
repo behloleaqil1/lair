@@ -34,6 +34,9 @@ import {
   type ProcessTable,
 } from "./probes.js";
 import type { Breach, PlaybookRun } from "./types.js";
+import { DecisionInbox } from "../decisions/service.js";
+import { DecisionStore } from "../decisions/store.js";
+import { MemorySecretStore } from "../decisions/secrets.js";
 
 // ============ BOUNDARY FAKES ============
 
@@ -1234,5 +1237,265 @@ describe("remote agents: the local process table says nothing about them", () =>
 
     expect(h.runner.calls).toEqual([]);
     expect(breaches(h)).toEqual([]);
+  });
+});
+
+// ============ DECISION INBOX ============
+
+describe("Decision Inbox: an escalation is a decision, and its answer drives the watchdog", () => {
+  const decisionStores: DecisionStore[] = [];
+  afterEach(() => {
+    for (const store of decisionStores.splice(0)) {
+      try {
+        store.close();
+      } catch {}
+    }
+  });
+
+  /** The real Decision Inbox, on the harness clock, connected as the server connects it. */
+  function connect(h: Harness, dbPath = ":memory:") {
+    const store = new DecisionStore(dbPath);
+    decisionStores.push(store);
+    const inbox = new DecisionInbox({ store, secrets: new MemorySecretStore(), clock: h.clock });
+    h.wd.useDecisions(inbox);
+    return { inbox, store };
+  }
+
+  const BLOCK = "watchdog:demo:orphan_claim:worker-b.running";
+  const orphan = (h: Paths) => aged(join(h.agentsDir, "worker-b.running"), 20, null);
+  const releases = (h: Harness) =>
+    h.runner.when((a) => a[0] === "./bin/release-claim", {
+      effect: (a) => rmSync(a[2], { recursive: true, force: true }),
+    });
+
+  it("observe: raises one decision with the evidence instead of an inbox line, and parks the breach", async () => {
+    const h = setup(observe());
+    const claim = orphan(h);
+    const { inbox } = connect(h);
+
+    await h.wd.tick();
+    h.clock.advance(30 * MIN);
+    await h.wd.tick();
+
+    expect(h.runner.calls).toEqual([]);
+    expect(inboxEntries(h)).toEqual([]);
+    const [breach, ...others] = breaches(h);
+    expect(others).toEqual([]);
+    const [decision, ...more] = inbox.list();
+    expect(more).toEqual([]);
+    expect(decision).toMatchObject({
+      project: "demo",
+      kind: "escalation",
+      status: "open",
+      title: "Claim worker-b.running has no live agent process",
+      source: { module: "watchdog", ref: breach.id },
+      key: `breach:${breach.id}`,
+      blocks: [BLOCK],
+      recommended: { optionId: "run_playbook" },
+    });
+    expect(decision.options.map((o) => o.id)).toEqual(["run_playbook", "stand_down"]);
+    expect(decision.context).toContain("Not acting: watchdog.mode is observe.");
+    expect(decision.context).toContain(`- claim ${claim} is 20 min old`);
+    expect(decision.context).toContain(`- would run: ./bin/release-claim worker-b ${claim}`);
+    expect(inbox.blockedOn(BLOCK)?.id).toBe(decision.id);
+    expect(h.store.listEscalations("demo")).toMatchObject([{ breachId: breach.id, decisionId: decision.id }]);
+    expect(h.store.listEscalations("demo")[0].file).toBeUndefined();
+    expect(h.store.breachDecision(breach.id)).toMatchObject({ decisionId: decision.id, state: "open" });
+    expect(breach.escalatedAt).toBeDefined();
+  });
+
+  it("run_playbook: the next tick runs the playbook once, also in observe mode, and the breach recovers", async () => {
+    const h = setup(observe());
+    const claim = orphan(h);
+    releases(h);
+    const { inbox } = connect(h);
+    await h.wd.tick();
+    const [decision] = inbox.list();
+
+    const answered = await inbox.answer(decision.id, { optionId: "run_playbook" });
+    expect(answered.deliveredAt).toBeDefined();
+    expect(h.store.breachDecision(breaches(h)[0].id)).toMatchObject({ decisionId: decision.id, state: "run" });
+    expect(h.runner.calls).toEqual([]);
+
+    await h.wd.tick();
+    expect(h.runner.calls).toEqual([["./bin/release-claim", "worker-b", claim]]);
+    expect(runs(h).find((r) => r.mode === "act")).toMatchObject({
+      playbookId: "orphan_claim",
+      status: "succeeded",
+      outcome: "recovered",
+      attempt: 1,
+    });
+    expect(breaches(h)[0]).toMatchObject({ status: "resolved", resolution: "recovered" });
+    expect(h.store.breachDecision(breaches(h)[0].id)?.state).toBe("done");
+
+    h.clock.advance(30 * MIN);
+    await h.wd.tick();
+    expect(h.runner.calls).toHaveLength(1);
+    expect(inbox.list()).toHaveLength(1);
+  });
+
+  it("stand_down: nothing more runs or asks for the breach, which closes once it clears", async () => {
+    const h = setup(observe());
+    const claim = orphan(h);
+    releases(h);
+    const { inbox } = connect(h);
+    await h.wd.tick();
+    const [decision] = inbox.list();
+    await inbox.answer(decision.id, { optionId: "stand_down", note: "Looking at it myself." });
+
+    for (let i = 0; i < 3; i++) {
+      h.clock.advance(30 * MIN);
+      await h.wd.tick();
+    }
+    expect(h.runner.calls).toEqual([]);
+    expect(inbox.list().map((d) => d.status)).toEqual(["answered"]);
+    expect(breaches(h)[0]).toMatchObject({ status: "open" });
+    expect(h.store.breachDecision(breaches(h)[0].id)?.state).toBe("stand_down");
+
+    rmSync(claim, { recursive: true });
+    await h.wd.tick();
+    expect(breaches(h)[0]).toMatchObject({ status: "resolved", resolution: "cleared" });
+    expect(inbox.get(decision.id)?.status).toBe("answered");
+  });
+
+  it("withdraws the open decision of a breach that clears on its own", async () => {
+    const h = setup(observe());
+    const claim = orphan(h);
+    const { inbox } = connect(h);
+    await h.wd.tick();
+    const [decision] = inbox.list();
+
+    rmSync(claim, { recursive: true });
+    await h.wd.tick();
+
+    expect(breaches(h)[0]).toMatchObject({ status: "resolved", resolution: "cleared" });
+    expect(inbox.get(decision.id)).toMatchObject({
+      status: "withdrawn",
+      withdrawnReason: "The breach cleared: orphan_claim no longer reports it.",
+    });
+    expect(inbox.blockedOn(BLOCK)).toBeNull();
+    expect(h.store.breachDecision(breaches(h)[0].id)?.state).toBe("closed");
+  });
+
+  it("act mode, playbooks used up: recommends standing down, and an approved run that fails asks again", async () => {
+    const h = setup(act("orphan_claim"));
+    const claim = orphan(h);
+    h.runner.when((a) => a[0] === "./bin/release-claim", {
+      reply: () => ({ code: 1, stdout: "", stderr: "claim is locked" }),
+    });
+    const { inbox } = connect(h);
+
+    await h.wd.tick(); // attempt 1 fails
+    h.clock.advance(11 * MIN);
+    await h.wd.tick(); // attempt 2 of 2 fails: escalate
+    const [first, ...none] = inbox.list();
+    expect(none).toEqual([]);
+    expect(first).toMatchObject({ status: "open", recommended: { optionId: "stand_down" } });
+    expect(first.recommended.reasoning).toContain("already ran (attempt 2)");
+    expect(first.context).toContain("Playbook orphan_claim failed on its last attempt (2/2).");
+    expect(first.context).toContain("claim is locked");
+
+    h.clock.advance(11 * MIN);
+    await h.wd.tick(); // parked: no third attempt, no second escalation
+    expect(h.runner.calls).toHaveLength(2);
+
+    await inbox.answer(first.id, { optionId: "run_playbook" });
+    await h.wd.tick(); // the approved attempt 3 fails: ask again
+    const argv = ["./bin/release-claim", "worker-b", claim];
+    expect(h.runner.calls).toEqual([argv, argv, argv]);
+    expect(runs(h)[0]).toMatchObject({ playbookId: "orphan_claim", attempt: 3, status: "failed" });
+
+    const decisions = inbox.list();
+    expect(decisions.map((d) => d.status)).toEqual(["open", "answered"]);
+    expect(decisions[0].key).toBe(first.key);
+    expect(decisions[0].context).toContain("The approved run of playbook orphan_claim failed (attempt 3).");
+    expect(h.store.listEscalations("demo")).toMatchObject([{ decisionId: decisions[0].id }]);
+
+    h.clock.advance(60 * MIN);
+    await h.wd.tick(); // parked again
+    expect(h.runner.calls).toHaveLength(3);
+  });
+
+  it("read_only: offers no run, so the only answer is to leave it to you", async () => {
+    const h = setup(act("orphan_claim"), { readOnly: true });
+    orphan(h);
+    const { inbox } = connect(h);
+    await h.wd.tick();
+    const [decision] = inbox.list();
+    expect(decision.options.map((o) => o.id)).toEqual(["stand_down"]);
+    expect(decision.recommended).toEqual({
+      optionId: "stand_down",
+      reasoning: "The project is read_only, so Lair runs no command for it: only you can fix this.",
+    });
+    expect(decision.context).toContain("Not acting: the project is read_only.");
+    expect(h.runner.calls).toEqual([]);
+  });
+
+  it("offers no run when the playbook's command is not configured", async () => {
+    const h = setup(() => ({ actions: {} }));
+    orphan(h);
+    const { inbox } = connect(h);
+    await h.wd.tick();
+    const [decision] = inbox.list();
+    expect(decision.options.map((o) => o.id)).toEqual(["stand_down"]);
+    expect(decision.recommended.reasoning).toBe(
+      "No playbook for orphan_claim has its watchdog.actions command configured, so only you can fix this.",
+    );
+  });
+
+  it("escalation_file still gets a copy of the entry", async () => {
+    const h = setup((p) => ({ ...observe()(), escalation_file: join(p.dir, "decisions.md") }));
+    orphan(h);
+    const { inbox } = connect(h);
+    await h.wd.tick();
+    const [decision, ...more] = inbox.list();
+    expect(more).toEqual([]);
+    expect(inboxEntries(h)).toEqual([]);
+    const copy = readFileSync(join(h.dir, "decisions.md"), "utf-8");
+    expect(copy.split("\n").filter((l) => l.startsWith("- OWNER? "))).toHaveLength(1);
+    expect(h.store.listEscalations("demo")[0]).toMatchObject({
+      file: join(h.dir, "decisions.md"),
+      decisionId: decision.id,
+    });
+  });
+
+  it("writes the inbox file as before when the decision can't be raised", async () => {
+    const h = setup(observe());
+    orphan(h);
+    const { store } = connect(h);
+    store.close();
+    await h.wd.tick();
+    const entries = inboxEntries(h);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toContain("Not acting: watchdog.mode is observe.");
+    expect(h.store.listEscalations("demo")[0].text).toContain("  - could not raise a decision: ");
+    expect(h.store.breachDecision(breaches(h)[0].id)).toBeNull();
+  });
+
+  it("follows an answer given while it was stopped once it listens again (a restart)", async () => {
+    const paths = makePaths();
+    const watchdogDb = join(paths.dir, "watchdog.db");
+    const decisionsDb = join(paths.dir, "decisions.db");
+    const before = setup(observe(), { paths, store: new WatchdogStore(watchdogDb) });
+    const claim = orphan(before);
+    const first = connect(before, decisionsDb);
+    await before.wd.tick();
+    const [decision] = first.inbox.list();
+    await before.wd.stop();
+    const answered = await first.inbox.answer(decision.id, { optionId: "run_playbook" });
+    expect(answered.deliveredAt).toBeUndefined();
+    before.store.close();
+    first.store.close();
+
+    const after = setup(observe(), { paths, store: new WatchdogStore(watchdogDb) });
+    stores.push(after.store);
+    releases(after);
+    const second = connect(after, decisionsDb);
+    await second.inbox.deliverPending();
+    expect(second.inbox.get(decision.id)?.deliveredAt).toBeDefined();
+
+    await after.wd.tick();
+    expect(after.runner.calls).toEqual([["./bin/release-claim", "worker-b", claim]]);
+    expect(breaches(after)[0]).toMatchObject({ status: "resolved", resolution: "recovered" });
   });
 });

@@ -167,6 +167,28 @@ export interface PlaybookRun {
   error?: string;
 }
 
+/**
+ * A breach escalated to the Decision Inbox:
+ * - open: parked until the human answers (no playbook runs, no escalation);
+ * - run: the human approved one more run of its playbook (taken by the next tick);
+ * - stand_down: the human handles it: Lair does nothing more for this breach;
+ * - done: the approved run was taken;
+ * - closed: the decision was withdrawn (the breach cleared)
+ */
+export type BreachDecisionState = "open" | "run" | "stand_down" | "done" | "closed";
+
+export interface BreachDecision {
+  breachId: string;
+  project: string;
+  decisionId: string;
+  state: BreachDecisionState;
+  updatedAt: string;
+}
+
+/** The options of a watchdog decision (see escalation.ts). */
+export const DECISION_RUN = "run_playbook";
+export const DECISION_STAND_DOWN = "stand_down";
+
 export interface Escalation {
   id: string;
   project: string;
@@ -175,6 +197,8 @@ export interface Escalation {
   /** The inbox file written, or undefined when none is configured */
   file?: string;
   text: string;
+  /** The Decision Inbox item it raised (the latest one for its breach) */
+  decisionId?: string;
   /**
    * Not written: the same breach key was escalated less than
    * watchdog.reescalate_minutes ago (a flapping breach)

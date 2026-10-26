@@ -12,6 +12,8 @@ import { dirname } from "path";
 import { randomUUID } from "crypto";
 import type {
   Breach,
+  BreachDecision,
+  BreachDecisionState,
   BreachResolution,
   BreachStatus,
   DetectorId,
@@ -27,7 +29,9 @@ import type {
   StepResult,
 } from "./types.js";
 
-const SCHEMA_VERSION = 1;
+// 2: watchdog_breach_decisions (every statement is IF NOT EXISTS, so a
+// version 1 file gets the new table and keeps its data)
+const SCHEMA_VERSION = 2;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS watchdog_breaches (
@@ -99,6 +103,14 @@ const SCHEMA = `
     detail TEXT NOT NULL,
     checked_at TEXT NOT NULL,
     PRIMARY KEY (project, detector)
+  );
+
+  CREATE TABLE IF NOT EXISTS watchdog_breach_decisions (
+    breach_id TEXT PRIMARY KEY REFERENCES watchdog_breaches(id),
+    project TEXT NOT NULL,
+    decision_id TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL,
+    updated_at TEXT NOT NULL
   );
 `;
 
@@ -381,9 +393,11 @@ export class WatchdogStore {
   listEscalations(project: string, options: { limit?: number } = {}): Escalation[] {
     const rows = this.db
       .prepare(
-        `SELECT * FROM watchdog_escalations WHERE project = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`,
+        `SELECT e.*, d.decision_id FROM watchdog_escalations e
+         LEFT JOIN watchdog_breach_decisions d ON d.breach_id = e.breach_id
+         WHERE e.project = ? ORDER BY e.created_at DESC, e.rowid DESC LIMIT ?`,
       )
-      .all(project, options.limit ?? 100) as EscalationRow[];
+      .all(project, options.limit ?? 100) as (EscalationRow & { decision_id: string | null })[];
     return rows.map((row) => ({
       id: row.id,
       project: row.project,
@@ -391,8 +405,66 @@ export class WatchdogStore {
       createdAt: row.created_at,
       file: row.file ?? undefined,
       text: row.text,
+      ...(row.decision_id ? { decisionId: row.decision_id } : {}),
       suppressed: row.suppressed === 1,
     }));
+  }
+
+  // ============ DECISION INBOX ============
+
+  /** Link a breach to the decision raised for it (replacing an earlier one), state open. */
+  linkDecision(breachId: string, project: string, decisionId: string, at: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO watchdog_breach_decisions (breach_id, project, decision_id, state, updated_at)
+         VALUES (?, ?, ?, 'open', ?)
+         ON CONFLICT(breach_id) DO UPDATE SET
+           decision_id = excluded.decision_id, state = 'open', updated_at = excluded.updated_at`,
+      )
+      .run(breachId, project, decisionId, at);
+  }
+
+  breachDecision(breachId: string): BreachDecision | null {
+    const row = this.db
+      .prepare(`SELECT * FROM watchdog_breach_decisions WHERE breach_id = ?`)
+      .get(breachId) as
+      | { breach_id: string; project: string; decision_id: string; state: string; updated_at: string }
+      | undefined;
+    return row
+      ? {
+          breachId: row.breach_id,
+          project: row.project,
+          decisionId: row.decision_id,
+          state: row.state as BreachDecisionState,
+          updatedAt: row.updated_at,
+        }
+      : null;
+  }
+
+  /**
+   * Record the answer to a breach's open decision. Only an open link to this
+   * decision changes, so a repeated delivery or an answer to a replaced
+   * decision does nothing. True when it changed.
+   */
+  answerDecision(decisionId: string, state: BreachDecisionState, at: string): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE watchdog_breach_decisions SET state = ?, updated_at = ? WHERE decision_id = ? AND state = 'open'`,
+        )
+        .run(state, at, decisionId).changes > 0
+    );
+  }
+
+  /** Move a breach's decision link from one state to another; true when it was in `from`. */
+  moveDecision(breachId: string, from: BreachDecisionState, to: BreachDecisionState, at: string): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE watchdog_breach_decisions SET state = ?, updated_at = ? WHERE breach_id = ? AND state = ?`,
+        )
+        .run(to, at, breachId, from).changes > 0
+    );
   }
 
   // ============ SAMPLES AND CONDITIONS ============

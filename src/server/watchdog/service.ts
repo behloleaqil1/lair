@@ -7,19 +7,23 @@
  *    breaches no longer reported are resolved as "cleared";
  * 3. each open breach is handled: in act mode, with its playbook opted in,
  *    the playbook runs (respecting max attempts and cooldown); otherwise, or
- *    once the playbooks are used up, it is escalated once to the inbox.
+ *    once the playbooks are used up, it is escalated once: to the Decision
+ *    Inbox when it is connected (useDecisions()), else to the inbox file. A
+ *    breach whose decision is open is parked until it is answered.
  */
 import type { EventBus } from "../core/event-bus.js";
 import type { ProjectConfig } from "../../shared/types.js";
+import type { DecisionProducer, DecisionResolution } from "../decisions/types.js";
 import { actBlockedReason, parseWatchdogConfig, type WatchdogSettings } from "./config.js";
 import { DETECTORS } from "./detectors.js";
-import { Escalator } from "./escalation.js";
+import { DECISION_MODULE, Escalator, runnablePlaybook } from "./escalation.js";
 import { PlaybookEngine } from "./playbook-engine.js";
 import { BUILTIN_PLAYBOOKS, playbooksFor } from "./playbooks.js";
 import { systemProbes, type Probes } from "./probes.js";
 import { WatchdogStore } from "./store.js";
 import type { Breach, ContainerServices, DetectorId, Finding, PlaybookRun, SloStatus } from "./types.js";
 import { ProjectView, type WatchdogContext } from "./view.js";
+import { DECISION_RUN, DECISION_STAND_DOWN, type BreachDecisionState } from "./types.js";
 
 export interface WatchdogOptions {
   project: string;
@@ -53,6 +57,8 @@ export class Watchdog {
   private abort = new AbortController();
   lastTick?: TickSummary;
   lastError?: string;
+  private decisions?: DecisionProducer;
+  private unsubscribe?: () => void;
 
   constructor(options: WatchdogOptions) {
     this.project = options.project;
@@ -86,6 +92,126 @@ export class Watchdog {
 
   private iso(ms = this.ctx.probes.clock.now()): string {
     return new Date(ms).toISOString();
+  }
+
+  /**
+   * Escalate through the Decision Inbox and follow the answers: from now on
+   * an escalation is a decision (escalation.ts), its breach is parked until
+   * it is answered, and the answer is delivered to followAnswer(). Answers
+   * given while the watchdog was stopped are delivered when it listens again.
+   */
+  useDecisions(decisions: DecisionProducer): void {
+    this.decisions = decisions;
+    this.escalator.decisions = decisions;
+    this.listen();
+  }
+
+  private listen(): void {
+    this.unsubscribe?.();
+    this.unsubscribe = this.decisions?.onResolved(DECISION_MODULE, (r) => this.followAnswer(r), {
+      project: this.project,
+    });
+  }
+
+  /**
+   * An answer to one of this watchdog's decisions: "run_playbook" approves
+   * one more run of the breach's playbook (the next tick takes it, and a
+   * running watchdog ticks right away), "stand_down" leaves the breach to
+   * the human. An answer to a decision that was replaced since does nothing.
+   */
+  async followAnswer(resolution: DecisionResolution): Promise<void> {
+    const { store } = this.ctx;
+    const breachId = resolution.decision.source.ref;
+    const link = store.breachDecision(breachId);
+    if (!link) {
+      // Answered while raise() was still linking it: fail, so it is delivered again
+      if (store.getBreach(breachId)?.status === "open") {
+        throw new Error(`breach ${breachId} is not linked to its decision yet`);
+      }
+      return;
+    }
+    if (link.decisionId !== resolution.decision.id) return;
+    const state: BreachDecisionState =
+      resolution.optionId === DECISION_RUN
+        ? "run"
+        : resolution.optionId === DECISION_STAND_DOWN
+          ? "stand_down"
+          : "closed";
+    if (store.answerDecision(resolution.decision.id, state, this.iso()) && state === "run" && this.running) {
+      this.tick().catch((e) => console.error(`[watchdog] ${this.project}: tick failed:`, e));
+    }
+  }
+
+  /**
+   * A breach with a decision: parked while it is open or after "stand_down";
+   * after "run_playbook", its playbook runs once more (also in observe mode,
+   * never on a read_only project), and a failed run asks again. Null when no
+   * decision holds the breach, so it is handled as usual.
+   */
+  private async followDecision(breach: Breach): Promise<{ runs: number; escalations: number } | null> {
+    const { store, settings, config, project } = this.ctx;
+    const link = store.breachDecision(breach.id);
+    if (!link || link.state === "done" || link.state === "closed") return null;
+    if (link.state !== "run") return { runs: 0, escalations: 0 };
+    // Take the approval before running, so it runs once even if the run throws
+    if (!store.moveDecision(breach.id, "run", "done", this.iso())) return { runs: 0, escalations: 0 };
+    const playbook = runnablePlaybook(this.ctx, breach);
+    if (config.read_only === true || !playbook) {
+      console.warn(
+        `[watchdog] ${project}: not running the approved playbook for ${breach.key}: ${playbook ? "the project is read_only" : "no playbook command is configured"}`,
+      );
+      return { runs: 0, escalations: 0 };
+    }
+    const attempts = store
+      .runsForBreach(breach.id)
+      .filter(
+        (r) =>
+          r.mode === "act" &&
+          r.playbookId === playbook.id &&
+          r.steps.some((s) => s.type === "act" && s.status !== "skipped"),
+      ).length;
+    const run = await this.engine.run(playbook, breach, attempts + 1, settings.playbooks[playbook.id]);
+    let escalations = 0;
+    if (run.outcome === "recovered" || run.outcome === "cleared") {
+      await this.recovered(breach, run);
+    } else if (run.status === "failed") {
+      const reason = `The approved run of playbook ${playbook.id} failed (attempt ${run.attempt}).`;
+      if (await this.escalator.askAgain(breach, reason, run)) escalations++;
+    }
+    return { runs: 1, escalations };
+  }
+
+  /** A playbook run fixed the breach (or found it gone): resolve it. */
+  private async recovered(breach: Breach, run: PlaybookRun): Promise<void> {
+    this.ctx.store.resolveBreach(breach.id, run.outcome === "recovered" ? "recovered" : "cleared", this.iso());
+    await this.events?.emit("slo.recovered", {
+      project: this.ctx.project,
+      breachId: breach.id,
+      key: breach.key,
+      resolution: run.outcome,
+      runId: run.id,
+    });
+  }
+
+  /** A breach that cleared on its own needs no answer: withdraw its open decision. */
+  private async withdrawDecision(breach: Breach): Promise<void> {
+    const { store } = this.ctx;
+    const link = store.breachDecision(breach.id);
+    if (!link || link.state !== "open") return;
+    if (this.decisions) {
+      try {
+        await this.decisions.withdraw(link.decisionId, {
+          module: DECISION_MODULE,
+          reason: `The breach cleared: ${breach.detector} no longer reports it.`,
+        });
+      } catch (e) {
+        // Answered meanwhile, or the inbox is gone: the question is moot either way
+        console.warn(
+          `[watchdog] ${this.project}: could not withdraw the decision for ${breach.key}: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    }
+    store.moveDecision(breach.id, "open", "closed", this.iso());
   }
 
   /** Run one tick. Concurrent calls share the tick in progress. */
@@ -174,6 +300,7 @@ export class Watchdog {
           key: breach.key,
           resolution: "cleared",
         });
+        await this.withdrawDecision(breach);
       }
     }
 
@@ -202,7 +329,10 @@ export class Watchdog {
   }
 
   private async handle(breach: Breach): Promise<{ runs: number; escalations: number }> {
-    const { store, settings, probes, project } = this.ctx;
+    const decided = await this.followDecision(breach);
+    if (decided) return decided;
+
+    const { store, settings, probes } = this.ctx;
     const playbooks = playbooksFor(breach.detector);
     const blocked = this.actBlocked;
     const optedIn = playbooks.filter((p) => settings.playbooks[p.id].act);
@@ -244,14 +374,7 @@ export class Watchdog {
       }
       const run = await this.engine.run(playbook, breach, previous.length + 1, playbookSettings);
       if (run.outcome === "recovered" || run.outcome === "cleared") {
-        store.resolveBreach(breach.id, run.outcome === "recovered" ? "recovered" : "cleared", this.iso());
-        await this.events?.emit("slo.recovered", {
-          project,
-          breachId: breach.id,
-          key: breach.key,
-          resolution: run.outcome,
-          runId: run.id,
-        });
+        await this.recovered(breach, run);
       } else if (run.status === "failed" && this.usedUp(optedIn, actRuns())) {
         await escalate(
           `Playbook ${playbook.id} failed on its last attempt (${run.attempt}/${playbookSettings.maxAttempts}).`,
@@ -283,6 +406,7 @@ export class Watchdog {
   start(): void {
     if (!this.stopped) return;
     this.stopped = false;
+    if (this.decisions && !this.unsubscribe) this.listen();
     if (this.abort.signal.aborted) {
       this.abort = new AbortController();
       this.ctx.signal = this.abort.signal;
@@ -310,6 +434,9 @@ export class Watchdog {
   async stop(): Promise<void> {
     this.stopped = true;
     this.abort.abort();
+    // Answers given from now on wait in the Decision Inbox until it listens again
+    this.unsubscribe?.();
+    this.unsubscribe = undefined;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
@@ -424,6 +551,14 @@ export class WatchdogManager {
 
   getStore(): WatchdogStore | null {
     return this.store;
+  }
+
+  /**
+   * Connect the Decision Inbox (call after load()): every watchdog escalates
+   * through it and follows the answers. src/server/decisions/mount.ts does it.
+   */
+  useDecisions(decisions: DecisionProducer): void {
+    for (const watchdog of this.watchdogs.values()) watchdog.useDecisions(decisions);
   }
 
   status(project: string): WatchdogProjectStatus {

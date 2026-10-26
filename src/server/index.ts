@@ -12,6 +12,7 @@ import {
 import { DataService, isSafeGateId } from "./services/data.js";
 import { isValidDragonId } from "./parsers/dragon-config.js";
 import { registerRootGuards, requireValidIdParam } from "./root-guards.js";
+import { mountDecisions } from "./decisions/index.js";
 import { registerControlRoutes } from "./routes/controls.js";
 import { registerBusRoutes } from "./routes/bus.js";
 import { registerProcessRoutes } from "./routes/processes.js";
@@ -357,6 +358,16 @@ const pipelines = new PipelineManager({
 });
 pipelines.load(projectEntries);
 await registerPipelineRoutes(fastify, pipelines, () => getDefaultProject());
+
+// Decision Inbox: the one place Lair asks the human (data/decisions.db). The
+// watchdog's escalations become decisions, and their answers resume it.
+// Closed by fastify.close() in shutdown().
+await mountDecisions(fastify, {
+  dbPath: join(process.cwd(), "data", "decisions.db"),
+  defaultProject: () => getDefaultProject(),
+  events: getEventBus(),
+  producers: [watchdogs],
+});
 
 // Serve the built web UI (dist/client) with an SPA fallback, when it exists.
 // In development the UI comes from the Vite dev server on port 5173 instead.
