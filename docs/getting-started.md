@@ -64,7 +64,7 @@ agents_dir: /path/to/agents
 gates_dir: /path/to/gates
 ```
 
-The file name (without `.yaml`) is the project name. A file in `projects/local/` takes precedence over one with the same name in `projects/`. Restart the server after adding a project.
+The file name (without `.yaml` or `.yml`) is the project name. A file in `projects/local/` takes precedence over one with the same name in `projects/`, and `.yaml` over `.yml` in the same directory. Restart the server after adding a project.
 
 See [Configuration](configuration.md) for all available options.
 
@@ -93,7 +93,7 @@ See [Configuration](configuration.md) for all available options.
 ### Project not showing
 
 - Ensure the YAML file is in `projects/` or `projects/local/`
-- Check that the file name ends in `.yaml` (`.yml` is not loaded)
+- Check that the file name ends in `.yaml` or `.yml`
 - Check the project name (the file name without the extension): it must start with a letter or digit and contain only letters, digits, `.`, `_` and `-`. Other files are not listed
 - Verify the YAML syntax is valid
 - Restart the server after adding the file

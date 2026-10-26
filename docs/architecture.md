@@ -186,6 +186,7 @@ Types shared between server, client, bus and node:
 MCP server (stdio) for direct agent-to-Lair communication. Run it with `npm run bus -- --project <name>`.
 
 - **`cli.ts`**: CLI entry point (`lair-bus`)
+- **`project-config.ts`**: finds and reads `projects/[local/]<name>.yaml` or `.yml` (same lookup order as the server)
 - **`server.ts`**: MCP server and its tools (whoami, claim, release, report, inbox, ack, send, board)
 - **`storage.ts`**: SQLite storage via sql.js (`data/<project>.db`)
 - **`mirror.ts`**: mirrors reports and messages into the project's text files

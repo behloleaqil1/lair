@@ -375,14 +375,12 @@ dragon_stop_cmd: ["./work/bin/dragon-stop.sh", "{dragon}"]
 
 Lair looks for project configurations in this order:
 
-1. `projects/local/<name>.yaml` — Private configs (gitignored)
-2. `projects/<name>.yaml` — Public configs
+1. `projects/local/<name>.yaml`, then `projects/local/<name>.yml` — Private configs (gitignored)
+2. `projects/<name>.yaml`, then `projects/<name>.yml` — Public configs
 
-The first matching file is used.
+The first matching file is used. The server and the fleet bus (`npm run bus`) both load files ending in `.yaml` or `.yml`. Start Lair from the repository root: `projects/` and `data/` are found from the current directory, and the relative paths in `projects/example.yaml` (such as `./fixtures/queue.md`) assume it.
 
-Only files ending in `.yaml` are loaded. Start Lair from the repository root: `projects/` and `data/` are found from the current directory, and the relative paths in `projects/example.yaml` (such as `./fixtures/queue.md`) assume it.
-
-Project names (the file name without `.yaml`) must start with a letter or digit and contain only letters, digits, `.`, `_` and `-`. API requests with an invalid or unknown `?project=` are refused with HTTP 400.
+Project names (the file name without `.yaml` or `.yml`) must start with a letter or digit and contain only letters, digits, `.`, `_` and `-`; files with other names are not listed. API requests with an invalid or unknown `?project=` are refused with HTTP 400.
 
 ## Environment variables
 
