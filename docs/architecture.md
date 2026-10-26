@@ -120,10 +120,11 @@ The Decision Inbox ([configuration](configuration.md#decision-inbox)): the one p
 
 - **`types.ts`**: the `DecisionProducer` interface other modules use: `raise` (deduplicated per project, module and key), `blockedOn` (is this work parked?), `onResolved` (resume with the answer, delivered again after a restart until the handler takes it) and `withdraw`
 - **`validate.ts`**: input validation for decisions, answers and withdrawals; the kinds that can't have a default
-- **`service.ts`**: `DecisionInbox`: answers (confirmation for spend and go/no-go), expiry with defaults or overdue marks, delivery to producers, the sweep timer
+- **`service.ts`**: `DecisionInbox`: answers (confirmation for spend and go/no-go; a credentials secret is stored only once the answer has won), expiry with defaults or overdue marks, the open-decision cap, delivery to producers, the sweep timer
 - **`secrets.ts`**: the `SecretStore` interface credentials answers go to, and the in-memory stub
+- **`answer-auth.ts`**: who may answer: the answer token (`data/decisions.answer-token`, mode 0600), the session cookie the Decisions view gets with it, and the same-origin dashboard check on every answer
 - **`store.ts`**: decisions, the work they block and their audit trail in SQLite (`data/decisions.db`)
-- **`routes.ts`**, **`mount.ts`**: the `/api/decisions` routes, and `mountDecisions()`, which `index.ts` calls to wire the store, routes, sweeps and producers (the watchdog)
+- **`routes.ts`**, **`mount.ts`**: the `/api/decisions` routes (answering only with the answer session; no HTTP withdraw), and `mountDecisions()`, which `index.ts` calls to wire the store, the answer token, routes, sweeps and producers (the watchdog)
 
 #### Watchdog (`watchdog/`)
 

@@ -464,6 +464,16 @@ Each decision shows:
 
 You answer by choosing an option, with an optional note. Answers to `spend` and `go_no_go` decisions ask you to confirm first.
 
+**Only you answer.** The first time the server starts, it writes a random **answer token** to `data/decisions.answer-token` (readable only by your OS user) and prints a setup link once:
+
+```
+[decisions] Answering decisions is locked to your browser. Open this link once to unlock it: http://127.0.0.1:4777/#answer-token=...
+```
+
+Open that link, or paste the token in the Decisions view, and answering is unlocked in that browser: it gets a session cookie that page scripts can't read (`HttpOnly`) and other sites can't make it send (`SameSite=Strict`). An answer is accepted only with that cookie, from the dashboard's own origin, in a same-origin browser request. Anything else, such as `curl`, a script or an agent, gets HTTP 403 and the decision stays open, so the work it gates can't approve itself. The audit trail records each answer as the owner's, with the address and browser it came from. Delete the token file and restart to issue a new token, which signs out every browser.
+
+This keeps out other programs on your machine **unless they run as your OS user and read `data/`**: such a program can read the token. Running your agents as a separate OS user, without access to Lair's `data/` directory, closes that gap.
+
 | Kind | For | Can it have a default? |
 |------|-----|------------------------|
 | `pricing` | prices and plans | no |
@@ -480,9 +490,9 @@ You answer by choosing an option, with an optional note. Answers to `spend` and 
 
 **Expiry and defaults.** A decision may expire. A decision with a **default** gets that option as its answer when it expires unanswered, and its history says so. Kinds marked "no" above can't have a default: Lair never decides those for you. A decision without a default keeps waiting after it expires, and is marked overdue.
 
-**Credentials.** A `credentials` decision has a password field. The value goes to Lair's secret store and nowhere else: not to `data/decisions.db`, the history, a log line or any API response. The decision records only that you supplied it. Lair's built-in secret store keeps values in the server's memory only, never on disk, so after a restart the module that needs the value asks again. A persistent store (an OS keychain, a vault) can replace it through the `SecretStore` interface in `src/server/decisions/secrets.ts`.
+**Credentials.** A `credentials` decision has a password field and no note field (a note could end up holding the secret). The value goes to Lair's secret store and nowhere else: not to `data/decisions.db`, the history, a log line or any API response. The decision records only that you supplied it. It is handed to the secret store only once your answer has closed the decision, so a second, losing answer never stores anything; if the secret store fails, the decision is open again. Lair's built-in secret store keeps values in the server's memory only, never on disk, so after a restart the module that needs the value asks again. A persistent store (an OS keychain, a vault) can replace it through the `SecretStore` interface in `src/server/decisions/secrets.ts`.
 
-**From your own tools.** Any module, script or agent can ask through the API below. Answering doesn't run anything by itself, so it also works on a `read_only` project: the module that asked decides what the answer allows. Server modules use the `DecisionProducer` interface (`raise`, `blockedOn`, `onResolved`, `withdraw`) from `src/server/decisions/`.
+**From your own tools.** Any module, script or agent can ask through the API below; only you answer. One module may have at most 50 open decisions per project (`LAIR_DECISIONS_MAX_OPEN` changes that); more are refused with HTTP 429 until some are answered. Answering doesn't run anything by itself, so it also works on a `read_only` project: the module that asked decides what the answer allows. Server modules use the `DecisionProducer` interface (`raise`, `blockedOn`, `onResolved`, `withdraw`) from `src/server/decisions/`. Only they can withdraw a decision: HTTP callers have no identity yet, so there is no withdraw route.
 
 ### Decision Inbox API
 
@@ -490,6 +500,8 @@ You answer by choosing an option, with an optional note. Answers to `spend` and 
 
 - `GET /api/decisions?project=&status=open|answered|expired|withdrawn|closed|all&limit=100`: open first, by urgency. Without `?project=`, every project's decisions
 - `GET /api/decisions/summary?project=`: `{open, overdue, secretStore}`
+- `GET /api/decisions/session`: `{answering}`, whether answering is unlocked in this browser
+- `POST /api/decisions/session`: `{token}`, from the dashboard only: sets the answer session cookie
 - `GET /api/decisions/:id`: one decision with its audit trail
 - `POST /api/decisions?project=`: raise a decision (201, or 200 with the open one when the same key is already open). The project comes from `?project=`, else the default project:
 
@@ -511,10 +523,9 @@ You answer by choosing an option, with an optional note. Answers to `spend` and 
   ```
 
   `blocks`, `links` (`[{label, url}]`, http or https only), `expiresAt` and `defaultOptionId` are optional. A default needs `expiresAt`, and is refused for the kinds above that can't have one. A `credentials` decision also needs `secretName` and an option with `"suppliesSecret": true`.
-- `POST /api/decisions/:id/answer`: `{optionId, note?, confirm?, secret?}`. `confirm: true` is required for `spend` and `go_no_go`, and `secret` goes only with an option that supplies it
-- `POST /api/decisions/:id/withdraw`: `{module, reason}`, only by the module that raised it
+- `POST /api/decisions/:id/answer`: `{optionId, note?, confirm?, secret?}`, from the Decisions view only (see "Only you answer"). `confirm: true` is required for `spend` and `go_no_go`; `secret` goes only with an option that supplies it, and `credentials` decisions take no `note`
 
-Errors: 400 for invalid input, 403 for a cross-site request or another module's withdrawal, 404 for an unknown decision, 409 when it is no longer open, 503 when the secret store can't take a value.
+Errors: 400 for invalid input, 403 for a cross-site request or an answer from outside the Decisions view, 404 for an unknown decision, 409 when it is no longer open, 429 when a module has too many open decisions, 503 when the secret store can't take a value.
 
 ## Watchdog
 
@@ -806,6 +817,7 @@ Project names (the file name without `.yaml` or `.yml`) must start with a letter
 | `LAIR_NODE_TOKEN` | server, lair-node | Shared secret for remote lair-node daemons. The server accepts `/ws/node` connections from its own machine (loopback) without it; any other peer is refused unless `LAIR_NODE_TOKEN` is set on the server and the node presents the same value as `Authorization: Bearer <token>` or `?token=<token>`. lair-node sends it automatically when `LAIR_NODE_TOKEN` is set in its environment |
 | `LAIR_PROJECT` | server | The default project: the one the dashboard opens first, the one API requests without `?project=` use, and the one whose `processes:` the process manager runs. It must name a project in `projects/` or `projects/local/` (for example `LAIR_PROJECT=myproject`); an invalid or unknown name logs a warning at startup and is ignored. Without it the default is `example` if it exists, else the first project found |
 | `LAIR_CLIENT_DIR` | server | Directory of the built web UI to serve (default `dist/client`) |
+| `LAIR_DECISIONS_MAX_OPEN` | server | How many open decisions one module may have per project in the [Decision Inbox](#decision-inbox) (default `50`). More are refused with HTTP 429 |
 | `LAIR_AGENT_ID` | lair-bus | The calling agent's ID (required) |
 | `LAIR_GITHUB_TOKEN` | server | A fine-grained GitHub token for running gate pipelines on GitHub Actions (see [Gate pipelines](#gate-pipelines)). A project can name another variable with `executors.github.token_env`. Never passed to local steps |
 

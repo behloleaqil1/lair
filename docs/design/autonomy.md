@@ -41,8 +41,8 @@ go to the project's inbox file until the Decision Inbox (§1) exists. Keep every
   couldn't take is delivered again on the next sweep, and after a restart. A producer withdraws a decision that became
   moot (the watchdog does when its breach clears).
 - **UI:** an always-visible count badge on the Decisions view, which lists open decisions by expiry, then age. Each
-  decision shows its context and gets one-click options, an optional note, or a secure field. `spend` and `go_no_go`
-  answers are confirmed first. A `credentials` decision, e.g. "connect the git host", writes the value to the secret
+  decision shows its context and gets one-click options, an optional note (none for `credentials`), or a secure
+  field. `spend` and `go_no_go` answers are confirmed first. A `credentials` decision, e.g. "connect the git host", writes the value to the secret
   store and never to the store, the audit trail, a log or a response. Answers become events (`decision.answered`),
   and the requester resumes.
 - **Timeouts (per kind):** a decision may carry `expiresAt` and a `defaultOptionId`. At expiry the default is applied
@@ -51,6 +51,15 @@ go to the project's inbox file until the Decision Inbox (§1) exists. Keep every
     defaults is not built.
   - `pricing`, `legal`, `spend`, `account`, `credentials`, `go_no_go` and `security` refuse a default: they ALWAYS
     wait.
+- **Who answers (built):** only the human. Answers need the answer session: a cookie (`HttpOnly`, `SameSite=Strict`)
+  the Decisions view gets once with the token in `data/decisions.answer-token` (mode 0600, setup link printed at first
+  start), plus a dashboard `Origin` and `Sec-Fetch-Site: same-origin`. Other local processes, including the agents a
+  decision gates, get 403. The answerer is always recorded as the owner, with the request's address and user agent.
+  A process running as the same OS user can still read the token; running agents as a separate OS user (§6) closes
+  that. HTTP callers have no identity yet, so only producers inside the server withdraw.
+- **Follow-up: human presence.** Answers to `spend`, `credentials`, `legal`, `go_no_go` and `security` decisions also
+  need a WebAuthn assertion (a platform authenticator such as Touch ID, or a security key; WebAuthn works on
+  `localhost`), registered once in Settings. Then even a process that holds the token can't answer those kinds.
 - **Notifications:** browser push, plus optional plugins (email, Slack, Telegram, webhooks). They fire only for a new
   decision, a deadline within 2 h, and a failed last playbook. Quiet hours are a setting.
 - **Importers:** an app adapter can turn its existing human channels into decisions. Examples: lines tagged
@@ -215,6 +224,9 @@ planner (§4) turns documents into work; this module WRITES and maintains those 
   its last messages. Broken sessions are never resumed in a loop: at most 2 attempts, then a fresh one.
 - **Agents report through fleet tools** (`task.status`, `task.waiting`, `task.done`, `task.blocked`), not by
   appending to files. An app adapter mirrors them into the app's legacy files during migration.
+- **Agents run as a separate OS user** from the Lair server, without access to Lair's `data/`. Otherwise an agent can
+  read the Decision Inbox answer token (`data/decisions.answer-token`, §1) and answer the decisions that gate its own
+  work.
 
 ## 7. Delivery (module `delivery`, [platform.md](platform.md) milestone M4 brought forward for environment 1)
 - **Environments per app pack:** `local` (the developer's own running stack), `staging`, `production`. Each has a
