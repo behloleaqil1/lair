@@ -43,7 +43,8 @@ example, a quick lint lane that always runs locally).
 - **Budget:** before dispatching to a hosted runner of a private repository, Lair adds the expected minutes (the
   largest of the last five hosted runs of that lane, at least 1) to the minutes used this calendar month (UTC). When
   that would exceed the budget, it does not dispatch, raises a `spend` Decision Inbox item (once per month), and
-  goes on to the next executor. `spend` decisions never resolve on a timeout.
+  goes on to the next executor. `spend` decisions never resolve on a timeout. The pipelines module does not act on
+  the answer yet: the budget changes only when `monthly_minutes` does.
 - **Never self-hosted for a public repository.** Fork pull requests can change workflows, so a self-hosted runner
   registered to a public repository can run a stranger's code on the developer's machine. Lair never dispatches there
   for a public (or internal) repository: the workflow it generates for such a repository has no self-hosted option at

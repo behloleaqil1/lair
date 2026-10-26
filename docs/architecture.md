@@ -122,6 +122,7 @@ The Decision Inbox ([configuration](configuration.md#decision-inbox)): the one p
 - **`validate.ts`**: input validation for decisions, answers and withdrawals; the kinds that can't have a default
 - **`service.ts`**: `DecisionInbox`: answers (confirmation for spend and go/no-go; a credentials secret is stored only once the answer has won), expiry with defaults or overdue marks, the open-decision caps (per module, and per project for HTTP raises), delivery to producers (reopening a credentials answer whose secret is gone), the sweep timer
 - **`secrets.ts`**: the `SecretStore` interface credentials answers go to, and the in-memory stub
+- **`request-bridge.ts`**: decision requests in the design note's shape (`DecisionRequest`, string options, the old kind names) as inbox decisions: `InboxDecisionHook`, and the `decision.needed` listener `mountDecisions()` wires, through which gate pipelines raise their minutes-budget decision
 - **`store.ts`**: decisions (and whether each was raised over HTTP), the work they block and their audit trail in SQLite (`data/decisions.db`)
 - **`routes.ts`**, **`mount.ts`**: the `/api/decisions` routes (answering only with an owner session; no HTTP withdraw), and `mountDecisions()`, which `index.ts` calls to wire the store, routes, sweeps and producers (the watchdog)
 
@@ -216,7 +217,7 @@ React-based frontend built with Vite.
 Each view is a standalone component:
 
 - **`Overview.tsx`**: repo status, problems, counts
-- **`DecisionInbox.tsx`**: the Decision Inbox (open decisions with their context, links as text to copy, options and recommendation, a confirmation step for spend and go/no-go, a password field for credentials, history, signing in as the owner) and the nav badge with the open count. Its requests and answer rules are in `decisions-api.ts`; the owner session (kept in this origin's `localStorage`, sent as a header) is in `owner-session.ts`
+- **`DecisionInbox.tsx`**: the Decision Inbox (open decisions with their context, links as text to copy, options and recommendation, a confirmation step for spend and go/no-go, a password field for credentials, history, signing in as the owner) and the nav badge with the open count. Its requests and answer rules are in `decisions-api.ts`; the owner session (sent as a header; kept in this origin's `localStorage`, or only in the page's memory under the Vite dev server) is in `owner-session.ts`
 - **`OwnerSessions.tsx`**: the signed-in browsers, each with Sign out
 - **`Dragons.tsx`**, **`DragonStartDialog.tsx`**, **`DragonStopDialog.tsx`**: agent list, start and stop dialogs
 - **`Gates.tsx`**, **`PipelineRuns.tsx`**: gate queue by lane, recent results; pipeline runs with where each step ran, fallback reasons, CI minutes, executor availability and the workflow file
