@@ -47,6 +47,7 @@ import { hungFinding } from "../watchdog/detectors.js";
 import { WatchdogStore } from "../watchdog/store.js";
 import { ProjectView } from "../watchdog/view.js";
 import type { ProjectEntry } from "../watchdog/service.js";
+import type { SupervisedAgents } from "../watchdog/types.js";
 import { backoffMs, MODEL_ID, parseAgentsConfig, type AgentLockSettings, type AgentsSettings } from "./config.js";
 import {
   agentLimits,
@@ -66,10 +67,17 @@ import {
   transferLock,
   type LockFile,
   type LockOwnerLabel,
+  type LockVerdict,
 } from "./locks.js";
-import { ProcessSnapshot, systemAgentProbes, type AgentProbes, type ProcessOwner } from "./probes.js";
+import {
+  agentEnvironment,
+  ProcessSnapshot,
+  systemAgentProbes,
+  type AgentProbes,
+  type ProcessOwner,
+} from "./probes.js";
 import { lastLines, moveSessionAside, readTail, resumeSummary, sessionDirFor, utcStamp } from "./sessions.js";
-import { AgentsStore } from "./store.js";
+import { AgentsStore, type ClaimResult } from "./store.js";
 import {
   claimView,
   eventView,
@@ -94,6 +102,16 @@ export class AgentsError extends Error {
 
 /** Task ids: they reach argv placeholders and file names, so no shell characters and no leading dash. */
 export const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._/#:-]{0,127}$/;
+
+/** A task id: TASK_ID, no leading "/", and no "." or ".." path segment. */
+export function isValidTaskId(task: unknown): task is string {
+  return (
+    typeof task === "string" &&
+    TASK_ID.test(task) &&
+    !task.startsWith("/") &&
+    !task.split("/").some((segment) => segment === ".." || segment === ".")
+  );
+}
 const MAX_PROMPT_CHARS = 200_000;
 
 /** The events shown as an agent's recoveries. */
@@ -251,6 +269,8 @@ export class AgentsService {
   private timer: NodeJS.Timeout | null = null;
   private stopped = true;
   private snapshot: ProcessSnapshot | null = null;
+  /** Locks no run waits on that the last reaper check judged stale (name -> what was read) */
+  private staleSeen = new Map<string, string>();
   lastTick?: AgentsTickSummary;
   lastError?: string;
 
@@ -274,8 +294,9 @@ export class AgentsService {
           agent: who.agent,
           provider: event.provider,
           runId: who.runId,
-          tokens: who.tokens ?? 0,
-          cost: event.cost,
+          // Never negative: usage can't buy budget back
+          tokens: Math.max(0, who.tokens ?? 0),
+          cost: Math.max(0, event.cost),
           at: this.probes.clock.now(),
           reason: event.reason,
         });
@@ -312,6 +333,37 @@ export class AgentsService {
       touchedTasks: new Set(),
       touchedLocks: new Set(),
     };
+  }
+
+  /**
+   * Read the process table again. A holder (of a lock or a claim) is only
+   * judged dead on a reading taken AFTER its lock or claim was read: a
+   * process that took it after the tick's first reading isn't in that one.
+   * Callers read the lock or claim first, then call this. The processes this
+   * tick started stay alive in the new reading.
+   */
+  private async relist(t: Tick): Promise<ProcessSnapshot> {
+    const list = await this.probes.processes.list();
+    const fresh = new ProcessSnapshot(list, this.probes.clock.now(), this.probes.self, this.settings.pidStartToleranceSeconds);
+    for (const owner of t.snap.spawnedOwners()) fresh.addSpawned(owner);
+    t.snap = fresh;
+    this.snapshot = fresh;
+    return fresh;
+  }
+
+  /**
+   * Claim a task for a run. An existing claim is replaced only when its owner
+   * is dead on a reading taken after the claim was read.
+   */
+  private async claimFor(t: Tick, task: string, runId: string, agent: string): Promise<ClaimResult> {
+    const existing = this.store.getClaim(this.project, task);
+    let snap = t.snap;
+    if (existing && !snap.isAlive(existing.ownerPid, existing.ownerStartedAt)) snap = await this.relist(t);
+    return this.store.claim(this.project, task, runId, agent, this.probes.self, t.now, (pid, started) => {
+      if (snap.isAlive(pid, started)) return true;
+      // Only the owner that was read before the reading may be judged dead by it
+      return !(existing && existing.ownerPid === pid && existing.ownerStartedAt === started);
+    });
   }
 
   private view(t: Tick): ProjectView {
@@ -457,24 +509,28 @@ export class AgentsService {
     return profilesFor(this.config, this.settings, agent, model);
   }
 
-  /** When a provider that rate-limited or failed may be used again, or null. */
-  private coolingUntil(provider: string, now: number): number | null {
+  /**
+   * When a provider that rate-limited or failed may be used again by `agent`,
+   * or null. A provider cools down for the agent whose run hit it; for every
+   * agent only once runs of two or more agents hit it within the cooldown,
+   * so one agent's output can't take a provider away from the others.
+   */
+  private coolingUntil(provider: string, agent: string, now: number): number | null {
     const cooldown = this.settings.failover.cooldownMinutes * 60000;
     if (cooldown <= 0) return null;
-    const recent = this.store.listEvents(this.project, {
-      kinds: ["failover"],
-      subject: provider,
-      since: now - cooldown,
-      limit: 20,
-    });
-    const failure = recent.find((e) => e.data.kind === "rate_limit" || e.data.kind === "provider_error");
-    return failure && failure.at + cooldown > now ? failure.at + cooldown : null;
+    const failures = this.store
+      .listEvents(this.project, { kinds: ["failover"], subject: provider, since: now - cooldown, limit: 100 })
+      .filter((e) => e.data.kind === "rate_limit" || e.data.kind === "provider_error");
+    const own = failures.find((e) => e.agent === agent);
+    const agents = new Set(failures.map((e) => e.agent ?? ""));
+    const until = Math.max(own ? own.at + cooldown : 0, agents.size >= 2 ? failures[0].at + cooldown : 0);
+    return until > now ? until : null;
   }
 
-  /** Why a profile can't be used now, or null. */
-  private unusable(profile: AgentProfile, now: number): string | null {
+  /** Why a profile can't be used now by `agent`, or null. */
+  private unusable(profile: AgentProfile, agent: string, now: number): string | null {
     if (!getAdapter(profile.adapter, this.config)) return `adapter ${profile.adapter} is not defined`;
-    const until = this.coolingUntil(profile.provider, now);
+    const until = this.coolingUntil(profile.provider, agent, now);
     if (until !== null) return `provider ${profile.provider} is cooling down until ${iso(until)}`;
     if (this.budget && !this.budget.isProviderAvailable(profile.provider)) {
       return `the fleet budget has provider ${profile.provider} paused or rate limited`;
@@ -521,11 +577,11 @@ export class AgentsService {
       return;
     }
     const { chosen, skipped } = chooseProfile(profiles, Math.min(run.profileIndex, profiles.length - 1), true, (p) =>
-      this.unusable(p, t.now),
+      this.unusable(p, run.agent, t.now),
     );
     if (!chosen) {
       const ends = profiles
-        .map((p) => this.coolingUntil(p.provider, t.now))
+        .map((p) => this.coolingUntil(p.provider, run.agent, t.now))
         .filter((at): at is number => at !== null);
       run.state = "queued";
       run.launchingSince = undefined;
@@ -561,9 +617,7 @@ export class AgentsService {
     run.launchingSince ??= t.now;
 
     // The task's claim: the server holds it until the agent process runs
-    const claimed = this.store.claim(this.project, run.task, run.id, run.agent, this.probes.self, t.now, (pid, started) =>
-      t.snap.isAlive(pid, started),
-    );
+    const claimed = await this.claimFor(t, run.task, run.id, run.agent);
     if (!claimed.ok) {
       const holder = claimed.holder;
       return this.endRun(
@@ -671,8 +725,13 @@ export class AgentsService {
     return built.command;
   }
 
+  /**
+   * The agent's whole environment: PATH, HOME and the like, agents.env_passthrough,
+   * and the run's variables. Never the rest of this server's environment
+   * (LAIR_NODE_TOKEN, say), and no LAIR_* but the run's own.
+   */
   private env(run: AgentRun): Record<string, string> {
-    const env: Record<string, string> = {
+    const own: Record<string, string> = {
       LAIR_RUN_ID: run.id,
       LAIR_TASK: run.task,
       LAIR_AGENT: run.agent,
@@ -680,10 +739,12 @@ export class AgentsService {
       LAIR_SESSION_MODE: run.sessionMode,
       TASK: run.task,
     };
-    if (run.profile.model) env.MODEL = run.profile.model;
+    if (run.profile.model) own.MODEL = run.profile.model;
     const adapter = getAdapter(run.profile.adapter, this.config);
-    if (adapter?.session_id_env) env[adapter.session_id_env] = run.sessionId;
-    return env;
+    if (adapter?.session_id_env && !adapter.session_id_env.startsWith("LAIR_")) {
+      own[adapter.session_id_env] = run.sessionId;
+    }
+    return agentEnvironment(process.env, this.settings.envPassthrough, own);
   }
 
   // ============ LOCKS ============
@@ -701,8 +762,7 @@ export class AgentsService {
       }
       // Held by a live process (or by no pid, and not old enough to break): wait
       this.releaseHeld(held);
-      const info = readLock(lock.path, lock.pidFile);
-      const verdict = judgeLock(info, t.snap, lock.staleMinutes);
+      const { info, verdict } = await this.judgeFresh(lock, t);
       const since = run.waitingLock?.lock === lock.name ? run.waitingLock.since : t.now;
       const why =
         verdict.state === "held" || verdict.state === "young"
@@ -727,15 +787,45 @@ export class AgentsService {
   }
 
   /**
+   * Read a lock, then judge it. A holder that looks dead is judged again on a
+   * process reading taken after the lock was read (see relist).
+   */
+  private async judgeFresh(lock: AgentLockSettings, t: Tick): Promise<{ info: LockFile | null; verdict: LockVerdict }> {
+    const info = readLock(lock.path, lock.pidFile);
+    let verdict = judgeLock(info, t.snap, lock.staleMinutes);
+    if (verdict.state === "stale" && verdict.lock.pid !== null) {
+      verdict = judgeLock(info, await this.relist(t), lock.staleMinutes);
+    }
+    return { info, verdict };
+  }
+
+  /**
    * Break a lock whose holder is dead (or a pid-less one past stale_minutes,
    * or one this server left behind: launch locks never outlive a launch).
+   * With a run waiting on it (`run`) that happens at once. A lock nobody
+   * waits on is broken only when two checks in a row found it stale, and a
+   * pid-less one only with break_without_waiter.
    */
   private async breakIfStale(lock: AgentLockSettings, t: Tick, run?: AgentRun): Promise<void> {
-    const info = readLock(lock.path, lock.pidFile);
-    const verdict = judgeLock(info, t.snap, lock.staleMinutes);
+    const { verdict } = await this.judgeFresh(lock, t);
     if (verdict.state === "stale") {
+      if (!run) {
+        if (verdict.lock.pid === null && !lock.breakWithoutWaiter) {
+          this.staleSeen.delete(lock.name);
+          return;
+        }
+        const seen = `${verdict.lock.mtimeMs}\u0000${verdict.lock.content}`;
+        if (this.staleSeen.get(lock.name) !== seen) {
+          this.staleSeen.set(lock.name, seen);
+          return;
+        }
+      }
+      this.staleSeen.delete(lock.name);
       await this.breakLock(lock, verdict.lock, verdict.reason, t, run);
-    } else if (
+      return;
+    }
+    this.staleSeen.delete(lock.name);
+    if (
       verdict.state === "held" &&
       verdict.lock.pid === this.probes.self.pid &&
       verdict.lock.startedAt !== null &&
@@ -890,6 +980,7 @@ export class AgentsService {
       freshSessions: prev.freshSessions,
       startRetries: prev.startRetries,
       launchFailures: 0,
+      failovers: prev.failovers ?? 0,
       // A summary that never reached a running agent is still owed
       resumeSummary: prev.spawnedAt === undefined ? prev.resumeSummary : undefined,
       state: "queued",
@@ -1014,6 +1105,9 @@ export class AgentsService {
 
   /** The process is gone and nobody stopped it. */
   private async onExit(run: AgentRun, t: Tick): Promise<void> {
+    if (run.pid !== undefined && this.probes.spawner.exitCode(run.pid) === undefined && this.probes.spawner.knows(run.pid)) {
+      return; // this server started it and its exit status is on its way: the next check has it
+    }
     const code = this.collectExit(run);
     const claim = this.store.getClaim(this.project, run.task);
     if (!claim || claim.runId !== run.id) {
@@ -1024,10 +1118,23 @@ export class AgentsService {
       return this.endRun(run, "completed", code === 0 ? "exited 0" : "the agent reported the task DONE", t, true);
     }
     const tail = run.logPath ? readTail(run.logPath, 64 * 1024) : "";
+    if (code === undefined) {
+      // It ended while this server wasn't supervising it (it was started before
+      // a restart): the exit status is lost. It may have finished, so it is
+      // never restarted: the owner is asked.
+      run.state = "failed";
+      run.endedAt = t.now;
+      run.detail = "ended while Lair wasn't supervising it (started before a restart): outcome unknown";
+      this.releaseRunLocks(run);
+      this.store.saveRun(run);
+      t.summary.ended++;
+      await this.escalate(run, "it ended while Lair was restarting, and its outcome is unknown", t);
+      return;
+    }
     const failover = matchFailover(lastLines(tail, 20), this.settings);
     if (failover) return this.failover(run, failover, t);
 
-    const exit = code === undefined ? "exit status unknown" : code === null ? "ended by a signal" : `exit code ${code}`;
+    const exit = code === null ? "ended by a signal" : `exit code ${code}`;
     const lived = t.now - (run.spawnedAt ?? t.now);
     const empty = run.logPath ? fileSize(run.logPath) === 0 : true;
     const evidence = [`pid ${run.pid} ${exit}`, ...lastLines(tail, 10).map((line) => `log: ${oneLine(line)}`)];
@@ -1238,7 +1345,12 @@ export class AgentsService {
 
   // ============ FAILOVER ============
 
-  /** A rate limit or provider error: the next profile carries the task on, with a resume summary. */
+  /**
+   * A rate limit or provider error: the next profile carries the task on,
+   * with a resume summary. The agent's output decides this, so a chain gets
+   * at most failover.max_failovers of them (then it is escalated), and the
+   * recovery counters carry over: failing over never buys more restarts.
+   */
   private async failover(run: AgentRun, info: FailoverInfo, t: Tick): Promise<void> {
     run.state = "failed";
     run.endedAt = t.now;
@@ -1249,27 +1361,34 @@ export class AgentsService {
     t.summary.ended++;
 
     const cooldown = this.settings.failover.cooldownMinutes * 60000;
+    const done = run.failovers ?? 0;
+    const capped = done >= this.settings.failover.maxFailovers;
     const profiles = this.profiles(run.agent, run.requestModel);
-    const { chosen, skipped } = chooseProfile(profiles, run.profileIndex + 1, true, (p) =>
-      p.provider === run.profile.provider ? `provider ${p.provider} just failed` : this.unusable(p, t.now),
-    );
-    const next = this.followUp(run, t.now, t.now);
-    next.sessionMode = "new";
-    next.sessionId = randomUUID();
-    next.sameSessionRestarts = 0;
-    next.freshSessions = 0;
-    next.startRetries = 0;
-    next.resumeSummary = await this.summary(run, t, `${failoverLabel(info.kind)}: ${info.line}`);
-    if (chosen) {
-      next.profileIndex = chosen.index;
-      next.profile = chosen.profile;
-      next.detail = `failing over to ${profileLabel(chosen.profile)}`;
-    } else {
-      const ends = [t.now + cooldown, ...profiles.map((p) => this.coolingUntil(p.provider, t.now) ?? t.now)];
-      next.profileIndex = 0;
-      next.profile = profiles[0] ?? run.profile;
-      next.notBefore = cooldown > 0 ? Math.min(...ends.filter((at) => at > t.now), t.now + cooldown) : t.now;
-      next.detail = `every profile failed or is cooling down; trying again at ${iso(next.notBefore)}`;
+    const { chosen, skipped } = capped
+      ? { chosen: null, skipped: [`failover.max_failovers (${this.settings.failover.maxFailovers}) reached`] }
+      : chooseProfile(profiles, run.profileIndex + 1, true, (p) =>
+          p.provider === run.profile.provider ? `provider ${p.provider} just failed` : this.unusable(p, run.agent, t.now),
+        );
+    const next = capped ? null : this.followUp(run, t.now, t.now);
+    if (next) {
+      next.sessionMode = "new";
+      next.sessionId = randomUUID();
+      next.failovers = done + 1;
+      next.resumeSummary = await this.summary(run, t, `${failoverLabel(info.kind)}: ${info.line}`);
+      if (chosen) {
+        next.profileIndex = chosen.index;
+        next.profile = chosen.profile;
+        next.detail = `failing over to ${profileLabel(chosen.profile)}`;
+      } else {
+        const ends = [
+          t.now + cooldown,
+          ...profiles.map((p) => this.coolingUntil(p.provider, run.agent, t.now) ?? t.now),
+        ];
+        next.profileIndex = 0;
+        next.profile = profiles[0] ?? run.profile;
+        next.notBefore = cooldown > 0 ? Math.min(...ends.filter((at) => at > t.now), t.now + cooldown) : t.now;
+        next.detail = `every profile failed or is cooling down; trying again at ${iso(next.notBefore)}`;
+      }
     }
     await this.record(
       "failover",
@@ -1278,9 +1397,11 @@ export class AgentsService {
         task: run.task,
         runId: run.id,
         subject: run.profile.provider,
-        summary: chosen
-          ? `${run.agent} on ${run.task}: ${failoverLabel(info.kind)} on ${profileLabel(run.profile)}; switched to ${profileLabel(chosen.profile)}`
-          : `${run.agent} on ${run.task}: ${failoverLabel(info.kind)} on ${profileLabel(run.profile)}; no fallback left`,
+        summary: capped
+          ? `${run.agent} on ${run.task}: ${failoverLabel(info.kind)} on ${profileLabel(run.profile)}; ${done} failovers already: escalating`
+          : chosen
+            ? `${run.agent} on ${run.task}: ${failoverLabel(info.kind)} on ${profileLabel(run.profile)}; switched to ${profileLabel(chosen.profile)}`
+            : `${run.agent} on ${run.task}: ${failoverLabel(info.kind)} on ${profileLabel(run.profile)}; no fallback left`,
         evidence: [`log line: ${oneLine(info.line)}`, ...skipped],
         data: {
           kind: info.kind,
@@ -1289,7 +1410,9 @@ export class AgentsService {
           to: chosen?.profile ?? null,
           fromIndex: run.profileIndex,
           toIndex: chosen?.index ?? null,
-          nextRunId: next.id,
+          nextRunId: next?.id ?? null,
+          failovers: done + 1,
+          capped,
           coolingUntil: cooldown > 0 ? iso(t.now + cooldown) : null,
         },
       },
@@ -1297,6 +1420,10 @@ export class AgentsService {
     );
     t.summary.failovers++;
     this.store.saveRun(run);
+    if (!next) {
+      await this.escalate(run, `${done + 1} provider errors or rate limits in a row (failover.max_failovers is ${this.settings.failover.maxFailovers}): ${oneLine(info.line, 200)}`, t);
+      return;
+    }
     this.store.insertRun(next);
     this.store.transferClaim(this.project, run.task, run.id, next.id, this.probes.self);
     if (!chosen) await this.raiseExhausted(next, skipped, t);
@@ -1340,12 +1467,13 @@ export class AgentsService {
         const groups: Record<string, string | undefined> = match.groups ?? {};
         const tk = groups.tokens ? Number(groups.tokens.replace(/[,_]/g, "")) : Number.NaN;
         const cs = groups.cost ? Number(groups.cost.replace(/[,_]/g, "")) : Number.NaN;
+        // The agent writes this text: a negative amount would buy budget back
         if (Number.isFinite(tk)) {
-          tokens += tk;
+          tokens += Math.max(0, tk);
           found = true;
         }
         if (Number.isFinite(cs)) {
-          cost += cs;
+          cost += Math.max(0, cs);
           found = true;
         }
       }
@@ -1467,18 +1595,20 @@ export class AgentsService {
     );
   }
 
-  /** Claims whose owner is dead, or whose run has ended, and that no active run handled this tick. */
+  /**
+   * Claims no active run handled this tick: released when their owner is
+   * dead, or when their run has ended. Owners are judged on a process reading
+   * taken after the claims were read. A live owner's claim whose run isn't in
+   * the store (yet) is left alone.
+   */
   private async reapClaims(t: Tick): Promise<void> {
-    for (const claim of this.store.listClaims(this.project)) {
-      if (t.touchedTasks.has(claim.task)) continue;
+    const claims = this.store.listClaims(this.project).filter((claim) => !t.touchedTasks.has(claim.task));
+    const snap = claims.some((c) => !t.snap.isAlive(c.ownerPid, c.ownerStartedAt)) ? await this.relist(t) : t.snap;
+    for (const claim of claims) {
       const run = this.store.getRun(claim.runId);
-      const alive = t.snap.isAlive(claim.ownerPid, claim.ownerStartedAt);
-      if (alive && run && isActive(run.state)) continue;
-      const why = !alive
-        ? "no live process owns it"
-        : !run
-          ? `its run ${short(claim.runId)} does not exist`
-          : `its run ${short(run.id)} has ended (${run.state})`;
+      const alive = snap.isAlive(claim.ownerPid, claim.ownerStartedAt);
+      if (alive && (!run || isActive(run.state))) continue;
+      const why = !alive ? "no live process owns it" : `its run ${short(claim.runId)} has ended (${run?.state})`;
       if (this.store.releaseClaim(this.project, claim.task, claim.runId)) await this.claimReleased(claim, t, why);
     }
   }
@@ -1501,10 +1631,10 @@ export class AgentsService {
       if (typeof agent !== "string" || !isValidDragonId(agent) || !knownDragonIds(this.config).has(agent)) {
         throw new AgentsError(400, `Unknown agent: ${String(agent)}`);
       }
-      if (typeof task !== "string" || !TASK_ID.test(task)) {
+      if (!isValidTaskId(task)) {
         throw new AgentsError(
           400,
-          "Invalid task: 1-128 characters (letters, digits, '.', '_', '-', '/', ':', '#'), starting with a letter or digit",
+          "Invalid task: 1-128 characters (letters, digits, '.', '_', '-', '/', ':', '#'), starting with a letter or digit, with no '.' or '..' segment",
         );
       }
       if (typeof prompt !== "string" || prompt.trim().length === 0 || prompt.length > MAX_PROMPT_CHARS) {
@@ -1512,6 +1642,16 @@ export class AgentsService {
       }
       if (model !== undefined && (typeof model !== "string" || !MODEL_ID.test(model))) {
         throw new AgentsError(400, "Invalid model id");
+      }
+      if (model !== undefined) {
+        // Only a model the project configured for this agent (its own, or a fallback's)
+        const allowed = [...new Set(this.profiles(agent).map((p) => p.model).filter((m): m is string => !!m))];
+        if (!allowed.includes(model)) {
+          throw new AgentsError(
+            400,
+            `Model ${model} is not one of agent ${agent}'s models (${allowed.join(", ") || "none configured"})`,
+          );
+        }
       }
       const busy = this.store.activeRunForAgent(this.project, agent);
       if (busy) {
@@ -1548,9 +1688,7 @@ export class AgentsService {
         notBefore: now,
         logOffset: 0,
       };
-      const claimed = this.store.claim(this.project, task, id, agent, this.probes.self, now, (pid, started) =>
-        t.snap.isAlive(pid, started),
-      );
+      const claimed = await this.claimFor(t, task, id, agent);
       if (!claimed.ok) {
         const holder = claimed.holder;
         throw new AgentsError(
@@ -1646,9 +1784,7 @@ export class AgentsService {
       if (blocked) throw new AgentsError(403, `Over budget: ${blocked}`);
       const next = this.followUp(run, now, now);
       next.startRetries = 0;
-      const claimed = this.store.claim(this.project, run.task, next.id, run.agent, this.probes.self, now, (pid, started) =>
-        t.snap.isAlive(pid, started),
-      );
+      const claimed = await this.claimFor(t, run.task, next.id, run.agent);
       if (!claimed.ok) throw new AgentsError(409, `Task ${run.task} is claimed by run ${short(claimed.holder.runId)}`);
       await this.switchToFresh(next, run, t, "a fresh session was requested");
       this.store.insertRun(next);
@@ -1869,7 +2005,7 @@ export interface AgentsManagerOptions {
  * All projects' agents services. The store (data/agents.db) is opened only
  * when at least one project enables the module.
  */
-export class AgentsManager {
+export class AgentsManager implements SupervisedAgents {
   private services = new Map<string, AgentsService>();
   private problems = new Map<string, string[]>();
   private configs = new Map<string, ProjectConfig>();
@@ -1950,6 +2086,17 @@ export class AgentsManager {
 
   getStore(): AgentsStore | null {
     return this.store;
+  }
+
+  /**
+   * For the watchdog (SupervisedAgents): an agent with an active run here is
+   * this module's to recover, so the watchdog's agent_hung and orphan_claim
+   * leave it alone.
+   */
+  supervisedReason(project: string, agent: string): string | null {
+    if (!this.services.has(project) || !this.store) return null;
+    const run = this.store.activeRunForAgent(project, agent);
+    return run ? `run ${run.id.slice(0, 8)} on ${run.task} is ${run.state}` : null;
   }
 
   status(project: string): AgentsStatusView {

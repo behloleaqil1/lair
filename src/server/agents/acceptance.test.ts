@@ -35,6 +35,7 @@ import {
   type ProcessInfo,
   type ProcessTable,
 } from "../watchdog/probes.js";
+import { WatchdogManager } from "../watchdog/service.js";
 import { AgentsManager, type AgentsService } from "./service.js";
 import { registerAgentsRoutes } from "./routes.js";
 import { readLock } from "./locks.js";
@@ -78,15 +79,21 @@ class FakeProcessTable implements ProcessTable {
   has(pid: number): boolean {
     return this.procs.has(pid);
   }
+  listCalls = 0;
+  /** Runs right after reading n is taken: what happens on the machine between two readings */
+  afterList?: (call: number) => void;
   async list(): Promise<ProcessInfo[]> {
     if (this.failing) throw new Error("ps failed (1): cannot read the process table");
-    return [...this.procs.entries()].map(([pid, p]) => ({
+    this.listCalls++;
+    const reading = [...this.procs.entries()].map(([pid, p]) => ({
       pid,
       ppid: 1,
       elapsedSeconds: Math.max(0, Math.floor((this.clock.now() - p.startedAt) / 1000)),
       argv: p.command.split(" "),
       command: p.command,
     }));
+    this.afterList?.(this.listCalls);
+    return reading;
   }
 }
 
@@ -126,13 +133,20 @@ class FakeSpawner implements ProcessSpawner {
     if (this.failAll) throw new Error(this.failAll);
     writeLog(this.clock, options.logPath, "");
     const pid = this.nextPid++;
+    this.started.add(pid);
     this.procs.add(pid, argv.join(" "), this.clock.now());
     this.behaviour?.(pid, options.logPath, this.calls.length);
     return { pid, startedAt: this.clock.now() };
   }
 
+  private started = new Set<number>();
+
   exitCode(pid: number): number | null | undefined {
     return this.exits.has(pid) ? this.exits.get(pid) : undefined;
+  }
+
+  knows(pid: number): boolean {
+    return this.started.has(pid);
   }
 
   kill(pid: number, signal: "SIGTERM" | "SIGKILL"): boolean {
@@ -143,6 +157,7 @@ class FakeSpawner implements ProcessSpawner {
 
   forget(pid: number): void {
     this.exits.delete(pid);
+    this.started.delete(pid);
   }
 
   /** The process ends with this exit code */
@@ -566,17 +581,83 @@ describe("2. locks are pid-owned; a dead holder's lock is broken, logged and cou
     expect(h.spawner.calls).toHaveLength(1);
   });
 
-  it("a lock nobody in Lair waits on is broken too once its holder is dead (an external launcher's)", async () => {
+  it("a lock nobody in Lair waits on is broken too once two checks in a row found its holder dead", async () => {
     const h = setup(sessionLock);
     writeFileSync(lockPath(h), lockText(4242, NOW - 60 * MIN));
 
-    expect(await h.service.tick()).toMatchObject({ locksBroken: 1 });
+    expect(await h.service.tick()).toMatchObject({ locksBroken: 0 }); // the first dead reading
+    expect(existsSync(lockPath(h))).toBe(true);
+    expect(await h.service.tick()).toMatchObject({ locksBroken: 1 }); // the second
     expect(eventsOf(h, "lock_broken")[0].evidence).toContain("found by the lock check");
     expect(existsSync(lockPath(h))).toBe(false);
     // Counted per lock
     writeFileSync(lockPath(h), lockText(4243, NOW - 60 * MIN));
     await h.service.tick();
+    await h.service.tick();
     expect(h.service.status().locks[0].breaks).toBe(2);
+  });
+
+  it("a holder that comes back between two checks resets the count: its lock is not broken", async () => {
+    const h = setup(sessionLock);
+    writeFileSync(lockPath(h), lockText(4242, NOW - 60 * MIN));
+    await h.service.tick(); // dead once
+    h.procs.add(4242, "another-launcher", NOW - 60 * MIN);
+    await h.service.tick(); // alive: the count starts over
+    h.procs.remove(4242);
+    await h.service.tick(); // dead once again
+    expect(eventsOf(h, "lock_broken")).toEqual([]);
+    expect(existsSync(lockPath(h))).toBe(true);
+  });
+
+  it("a pid-less legacy lock nobody waits on is left alone, unless break_without_waiter is set", async () => {
+    const h = setup(sessionLock);
+    mkdirSync(lockPath(h));
+    aged(lockPath(h), 60);
+    for (let i = 0; i < 3; i++) await h.service.tick();
+    expect(existsSync(lockPath(h))).toBe(true);
+
+    const opted = setup((p) => sessionLock(p, { break_without_waiter: true }));
+    mkdirSync(lockPath(opted));
+    aged(lockPath(opted), 60);
+    await opted.service.tick();
+    await opted.service.tick();
+    expect(existsSync(lockPath(opted))).toBe(false);
+    expect(eventsOf(opted, "lock_broken")[0].summary).toContain("no holder pid");
+  });
+
+  it("a lock taken after the process reading is judged on a newer one: the waiter waits on its live holder", async () => {
+    const h = setup(sessionLock);
+    await request(h);
+    // Another launcher starts and takes the lock right after this tick read the process table
+    h.procs.afterList = (call) => {
+      if (call !== 2) return;
+      h.procs.add(4242, "another-launcher --task other", h.clock.now());
+      writeFileSync(lockPath(h), lockText(4242, h.clock.now(), "another launcher"));
+    };
+
+    expect(await h.service.tick()).toMatchObject({ locksBroken: 0, started: 0 });
+
+    expect(readFileSync(lockPath(h), "utf-8")).toContain("pid=4242");
+    expect(runs(h)[0]).toMatchObject({
+      state: "waiting_lock",
+      waitingLock: { lock: "session-store", holderPid: 4242, holderAlive: true },
+    });
+    expect(h.procs.listCalls).toBe(3); // the request's reading, the tick's, and one after the lock was read
+  });
+
+  it("a claim made after the process reading is judged on a newer one: its live owner keeps it", async () => {
+    const h = setup();
+    h.procs.afterList = (call) => {
+      if (call !== 1) return;
+      h.procs.add(7001, "agent-cli run --agent worker-b", h.clock.now());
+      h.store.claim("demo", "peer-task", "a-run-not-stored-yet", "worker-b", { pid: 7001, startedAt: h.clock.now() }, h.clock.now(), () => false);
+    };
+
+    expect(await h.service.tick()).toMatchObject({ claimsReleased: 0 });
+    expect(h.store.getClaim("demo", "peer-task")).toMatchObject({ ownerPid: 7001 });
+
+    h.procs.remove(7001); // its owner dies: now it goes
+    expect(await h.service.tick()).toMatchObject({ claimsReleased: 1 });
   });
 
   it("a `hold: run` lock is owned by the agent's pid while it runs; the next run waits on it, then takes it", async () => {
@@ -796,6 +877,29 @@ describe("4. hung and dead-on-start: same session K times, then a fresh one, the
     expect(crash.evidence).toContain("log: step 1 of 9");
     expect(runs(h)[1]).toMatchObject({ state: "queued", sessionMode: "resume", notBefore: NOW + 5 * MIN + 10 * SEC });
   });
+
+  it("after a restart, a run that ended unseen is never restarted: DONE completes it, anything else asks the owner", async () => {
+    const h1 = setup();
+    await request(h1, "worker-a", "task-1");
+    await request(h1, "worker-b", "task-2");
+    await h1.service.tick(); // both run (pids 5001 and 5002)
+    // Lair restarts; meanwhile both agents end, and worker-b reports its task DONE
+    appendFileSync(h1.queueFile, "- DONE task-2 by worker-b 12:05Z: finished\n");
+    const h2 = setup(() => ({}), { paths: h1, self: { pid: 200, startedAt: NOW } });
+
+    await h2.service.tick(); // the new server never saw them exit: their exit status is unknown
+    await h2.service.tick();
+
+    expect(h2.spawner.calls).toEqual([]);
+    const byAgent = Object.fromEntries(runs(h2).map((r) => [r.agent, r]));
+    expect(byAgent["worker-b"].state).toBe("completed");
+    expect(byAgent["worker-a"]).toMatchObject({ state: "failed" });
+    expect(byAgent["worker-a"].detail).toContain("outcome unknown");
+    const entries = inboxEntries(h2);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toContain("Agent worker-a could not finish task task-1 after 1 attempt(s): it ended while Lair was restarting, and its outcome is unknown");
+    expect(h2.store.listClaims("demo")).toEqual([]);
+  });
 });
 
 // ============ 5. FAILOVER ============
@@ -874,7 +978,7 @@ describe("5. provider errors and rate limits fail over to the next configured pr
     expect(switched.evidence[0]).toContain("the fleet budget has provider provider-a paused or rate limited");
   });
 
-  it("when every profile is failing the owner hears once, and the task waits for the cooldown", async () => {
+  it("when every profile is failing the owner hears once, the task waits for the cooldown, and the failover cap ends it", async () => {
     const h = setup(() => FALLBACK);
     h.spawner.behaviour = (pid, log) => {
       writeLog(h.clock, log, "Error: 429 Too Many Requests\n");
@@ -886,15 +990,51 @@ describe("5. provider errors and rate limits fail over to the next configured pr
     expect(h.spawner.calls.map((c) => c.argv[0])).toEqual(["agent-cli", "other-cli"]);
     expect(eventsOf(h, "failover").map((e) => e.data.to === null)).toEqual([false, true]);
     const waiting = runs(h)[2];
-    expect(waiting).toMatchObject({ state: "queued", profileIndex: 0, notBefore: NOW + 30 * MIN });
+    expect(waiting).toMatchObject({ state: "queued", profileIndex: 0, notBefore: NOW + 30 * MIN, failovers: 2 });
     const entries = inboxEntries(h);
     expect(entries).toHaveLength(1);
     expect(entries[0]).toContain("Every configured agent profile for worker-a is failing or rate limited");
 
     await at(h, 30 * MIN); // provider-a's cooldown is over
     expect(h.spawner.calls.map((c) => c.argv[0])).toEqual(["agent-cli", "other-cli", "agent-cli"]);
-    for (let i = 0; i < 4; i++) await at(h, 30 * MIN);
-    expect(inboxEntries(h)).toHaveLength(1);
+    for (let i = 0; i < 6; i++) await at(h, 30 * MIN);
+    // A third failover, then failover.max_failovers (3) is reached: escalated, not looped
+    expect(h.spawner.calls).toHaveLength(4);
+    const after = inboxEntries(h);
+    expect(after).toHaveLength(2);
+    expect(after[1]).toContain("Agent worker-a could not finish task feat-login after 4 attempt(s): 4 provider errors or rate limits in a row");
+    expect(eventsOf(h, "failover").at(-1)?.data).toMatchObject({ capped: true, failovers: 4 });
+    expect(h.store.getClaim("demo", "feat-login")).toBeNull();
+  });
+
+  it("failing over keeps the recovery counters, is capped per task, and cools a provider only for the agent that hit it", async () => {
+    const h = setup(() => ({ ...FALLBACK, failover: { max_failovers: 1 } }));
+    h.spawner.behaviour = (pid, log, call) => {
+      if (call === 1) h.spawner.exit(pid, 1); // dies on start: a same-session restart
+      if (call === 2 || call === 3) {
+        writeLog(h.clock, log, "Error: 429 Too Many Requests\n");
+        h.spawner.exit(pid, 1);
+      }
+    };
+    await request(h);
+    await at(h, 0);
+    await at(h, 0); // dead on start: restart in 10 s
+    await at(h, 10 * SEC);
+    await at(h, 10 * SEC); // a rate limit: fail over
+
+    expect(runs(h)[2]).toMatchObject({ profileIndex: 1, sessionMode: "new", sameSessionRestarts: 1, failovers: 1 });
+    await at(h, 10 * SEC);
+    await at(h, 10 * SEC); // a rate limit again: the cap (1) is reached
+    expect(h.spawner.calls.map((c) => c.argv[0])).toEqual(["agent-cli", "agent-cli", "other-cli"]);
+    expect(eventsOf(h, "escalated")).toHaveLength(1);
+    expect(inboxEntries(h)[0]).toContain("2 provider errors or rate limits in a row (failover.max_failovers is 1)");
+
+    // provider-a cools down for worker-a only: worker-b still starts on it
+    await request(h, "worker-b", "task-b");
+    await at(h, 10 * SEC);
+    expect(h.spawner.calls).toHaveLength(4);
+    expect(h.spawner.calls[3]).toMatchObject({ argv: expect.arrayContaining(["agent-cli"]), env: expect.objectContaining({ LAIR_AGENT: "worker-b" }) });
+    expect(eventsOf(h, "failover").filter((e) => e.agent === "worker-b")).toEqual([]);
   });
 });
 
@@ -1011,6 +1151,21 @@ describe("6. budgets per agent and per project, per day and month, fed by the fl
     expect(h.store.usageSince("demo", null, 0)).toEqual({ tokens: 1500, cost: 0.5 });
     expect(agentView(h.service.status(), "worker-a").budget?.lines[0]).toMatchObject({ metric: "daily_cost", used: 0.5 });
   });
+
+  it("usage is never negative, from a run's log or from the fleet budget: it can't buy budget back", async () => {
+    const h = setup(() => ({ usage_patterns: ["tokens used: (?<tokens>-?[\\d,]+)", "cost: \\$(?<cost>-?[\\d.]+)"] }));
+    h.spawner.behaviour = (_pid, log) =>
+      writeLog(h.clock, log, "tokens used: -50000 cost: $-9.5\ntokens used: 100 cost: $0.25\n");
+    await request(h);
+    await h.service.tick();
+    await h.service.tick();
+    expect(h.store.usageSince("demo", "worker-a", 0)).toEqual({ tokens: 100, cost: 0.25 });
+
+    const budget = new BudgetManager({ enabled: true, maxDailyCost: 1000, providers: [] });
+    const fed = setup(() => ({}), { budget });
+    budget.recordCost("provider-a", -5, "a refund", { project: "demo", agent: "worker-a", tokens: -1000 });
+    expect(fed.store.usageSince("demo", "worker-a", 0)).toEqual({ tokens: 0, cost: 0 });
+  });
 });
 
 // ============ 7 AND 8. HTTP ============
@@ -1058,6 +1213,26 @@ describe("7. API: per-agent state, claims and recoveries; actions need confirmat
     const listed = (await app.inject({ url: "/api/agents/runs?project=demo&limit=5" })).json();
     expect(listed.data).toHaveLength(1);
     expect((await app.inject({ url: "/api/agents/runs?project=demo&limit=0" })).statusCode).toBe(400);
+  });
+
+  it("a run's model must be one configured for the agent, and a task id can't climb out of a directory", async () => {
+    const h = setup(() => FALLBACK);
+    const app = await http(h);
+    const url = "/api/agents/runs?project=demo";
+
+    const model = await post(app, url, { agent: "worker-a", task: "t-1", prompt: "x", model: "model-z" });
+    expect(model.statusCode).toBe(400);
+    expect(model.json().error).toBe("Model model-z is not one of agent worker-a's models (model-a, model-b)");
+    for (const task of ["a/../b", "..", "a/./b", "/etc/x"]) {
+      expect((await post(app, url, { agent: "worker-a", task, prompt: "x" })).statusCode).toBe(400);
+    }
+    expect((await post(app, "/api/agents/claims/release?project=demo", { task: "a/../b", confirm: true })).statusCode).toBe(400);
+    expect(h.store.listClaims("demo")).toEqual([]);
+
+    // A fallback's model is one of the agent's
+    expect((await post(app, url, { agent: "worker-a", task: "feat/login-2", prompt: "x", model: "model-b" })).statusCode).toBe(201);
+    await post(app, "/api/agents/tick?project=demo");
+    expect(h.spawner.calls[0].argv).toEqual(expect.arrayContaining(["--model", "model-b"]));
   });
 
   it("releasing a claim and starting a fresh session are refused without confirm: true", async () => {
@@ -1181,5 +1356,31 @@ describe("8. wiring: the router and the service's own tick", () => {
     expect(tick.statusCode).toBe(500);
     expect(existsSync(join(h.locksDir, "session.lock"))).toBe(true);
     expect(h.spawner.calls).toEqual([]);
+  });
+
+  it("the watchdog leaves an agent with an active run to this module: no agent_hung breach for it", async () => {
+    const h = setup();
+    await request(h);
+    await at(h, 0); // worker-a runs here as pid 5001
+    h.procs.add(6001, "agent-cli run --agent worker-b --model model-a", NOW); // worker-b runs outside this module
+    const watchdogs = new WatchdogManager({
+      dbPath: ":memory:",
+      probes: { processes: h.procs, fs: new NodeFileSystem(), runner: h.runner, clock: h.clock },
+      agents: h.manager,
+    });
+    watchdogs.load([
+      { name: "demo", config: { ...h.config, watchdog: { enabled: true, agent_command: "agent-cli run --agent {agent}" } } },
+    ]);
+    try {
+      h.clock.t = NOW + 46 * MIN; // both silent past hung_minutes
+      await watchdogs.get("demo")?.tick();
+      const store = watchdogs.getStore();
+      expect(store?.listBreaches("demo").map((b) => b.key)).toEqual(["agent_hung:worker-b"]);
+      expect(store?.sloStatus("demo").find((s) => s.detector === "agent_hung")?.detail).toContain(
+        "left to the agents module: worker-a (run",
+      );
+    } finally {
+      await watchdogs.stop();
+    }
   });
 });

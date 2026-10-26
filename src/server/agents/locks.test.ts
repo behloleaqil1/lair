@@ -90,6 +90,25 @@ describe("lock files", () => {
     expect(existsSync(path)).toBe(false);
   });
 
+  it("removes a lock directory only when it holds nothing but its pid file, and never recursively", () => {
+    const dir = tempDir();
+    const busy = join(dir, "busy.lock");
+    mkdirSync(busy);
+    writeFileSync(join(busy, "pid"), "pid=4242\n");
+    writeFileSync(join(busy, "notes.txt"), "someone keeps work here\n");
+    const result = removeLock(readLock(busy)!);
+    expect(result.removed).toBe(false);
+    expect(result.detail).toContain("the lock directory holds other files (notes.txt)");
+    expect(readFileSync(join(busy, "notes.txt"), "utf-8")).toBe("someone keeps work here\n");
+    expect(readFileSync(join(busy, "pid"), "utf-8")).toBe("pid=4242\n");
+
+    const plain = join(dir, "plain.lock");
+    mkdirSync(plain);
+    writeFileSync(join(plain, "pid"), "pid=4242\n");
+    expect(removeLock(readLock(plain)!)).toMatchObject({ removed: true });
+    expect(existsSync(plain)).toBe(false);
+  });
+
   it("judges holders by pid and start time; legacy locks by pid, or by age", () => {
     const dir = tempDir();
     const lair = join(dir, "lair.lock");

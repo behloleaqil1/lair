@@ -3,10 +3,12 @@
  * script), and the pid-plus-start-time liveness rule.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, readFileSync, rmSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { ChildProcessSpawner, ProcessSnapshot } from "./probes.js";
+import type { ProjectConfig } from "../../shared/types.js";
+import { agentEnvironment, ChildProcessSpawner, ProcessSnapshot } from "./probes.js";
+import { AgentsManager } from "./service.js";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -42,8 +44,10 @@ describe("ChildProcessSpawner", () => {
     await until(() => readFileSync(log, "utf-8").includes("literal"));
     expect(readFileSync(log, "utf-8")).toContain("hello feat-login\n");
     expect(readFileSync(log, "utf-8")).toContain("$HOME stays literal\n");
+    expect(spawner.knows(owner.pid)).toBe(true);
     spawner.forget(owner.pid);
     expect(spawner.exitCode(owner.pid)).toBeUndefined();
+    expect(spawner.knows(owner.pid)).toBe(false);
   });
 
   it("rejects a command that can't start", async () => {
@@ -82,5 +86,86 @@ describe("ProcessSnapshot", () => {
     expect(snap.isAlive(self.pid, self.startedAt)).toBe(true); // this server, also when ps doesn't list it
     snap.addSpawned({ pid: 5001, startedAt: now });
     expect(snap.isAlive(5001, now)).toBe(true);
+  });
+});
+
+describe("an agent's environment", () => {
+  it("copies only the base names and env_passthrough from the server's, never a LAIR_* one", () => {
+    const env = agentEnvironment(
+      { PATH: "/usr/bin", HOME: "/home/user", LAIR_NODE_TOKEN: "t", LAIR_PROJECT: "p", SECRET: "s", KEY: "k" },
+      ["KEY", "LAIR_PROJECT"],
+      { LAIR_RUN_ID: "r" },
+    );
+    expect(env).toEqual({ PATH: "/usr/bin", HOME: "/home/user", KEY: "k", LAIR_RUN_ID: "r" });
+  });
+
+  it("is built, not inherited: a real agent never sees the server's secrets", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lair-env-"));
+    dirs.push(dir);
+    const planted: Record<string, string> = {
+      LAIR_NODE_TOKEN: "node-token-planted-for-this-test",
+      EXAMPLE_SERVER_SECRET: "server-secret-planted-for-this-test",
+      EXAMPLE_PROVIDER_KEY: "provider-key-planted-for-this-test",
+    };
+    const saved = Object.fromEntries(Object.keys(planted).map((name) => [name, process.env[name]]));
+    Object.assign(process.env, planted);
+    const agentsDir = join(dir, "agents");
+    mkdirSync(agentsDir, { recursive: true });
+    writeFileSync(join(dir, "queue.md"), "# Queue\n");
+    const config = {
+      name: "Demo",
+      repo: dir,
+      github: "example/demo",
+      queue_file: join(dir, "queue.md"),
+      agents_dir: agentsDir,
+      gates_dir: join(dir, "gates"),
+      machines: {},
+      prompts_dir: join(dir, "prompts"),
+      dragons: { "worker-a": { name: "A", model: "model-a", machine: "local", instructions: "", adapter: "env-cli" } },
+      agent_adapters: {
+        "env-cli": {
+          id: "env-cli",
+          name: "Env CLI",
+          // The agent prints the names of its environment variables
+          start_cmd: `"${process.execPath}" -e "console.log(JSON.stringify(Object.keys(process.env).sort()))"`,
+          stop_cmd: "kill -TERM {pid}",
+          status_method: "file",
+          log_dir: "logs",
+          session_id_env: "ENV_CLI_SESSION",
+        },
+      },
+      agents: { enabled: true, env_passthrough: ["EXAMPLE_PROVIDER_KEY"] },
+    } as ProjectConfig;
+    // The real probes: ps, the real spawner, the system clock
+    const manager = new AgentsManager({ dbPath: join(dir, "agents.db") });
+    try {
+      manager.load([{ name: "demo", config }]);
+      const service = manager.get("demo");
+      if (!service) throw new Error(manager.status("demo").errors.join("; "));
+      await service.requestRun({ agent: "worker-a", task: "env-check", prompt: "print the environment" });
+      await service.tick();
+      const log = service.runs()[0].logPath ?? "";
+      await until(() => existsSync(log) && readFileSync(log, "utf-8").includes("]"));
+
+      const keys = JSON.parse(readFileSync(log, "utf-8").trim().split("\n").pop() ?? "[]") as string[];
+      expect(keys).not.toContain("LAIR_NODE_TOKEN");
+      expect(keys).not.toContain("EXAMPLE_SERVER_SECRET");
+      expect(keys).toContain("EXAMPLE_PROVIDER_KEY");
+      expect(keys).toContain("PATH");
+      expect(keys).toContain("ENV_CLI_SESSION");
+      expect(keys.filter((name) => name.startsWith("LAIR_"))).toEqual([
+        "LAIR_AGENT",
+        "LAIR_RUN_ID",
+        "LAIR_SESSION_ID",
+        "LAIR_SESSION_MODE",
+        "LAIR_TASK",
+      ]);
+    } finally {
+      await manager.stop();
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
   });
 });

@@ -24,14 +24,15 @@ import {
   mkdirSync,
   openSync,
   readSync,
+  readdirSync,
   renameSync,
-  rmSync,
+  rmdirSync,
   unlinkSync,
   writeFileSync,
   type Stats,
 } from "fs";
 import { randomUUID } from "crypto";
-import { dirname, join } from "path";
+import { basename, dirname, join } from "path";
 import { parsePid } from "../watchdog/view.js";
 import type { ProcessOwner, ProcessSnapshot } from "./probes.js";
 
@@ -151,10 +152,28 @@ export function releaseLock(path: string, owner: ProcessOwner, toleranceMs = 100
   return removeLock(lock).removed;
 }
 
+/** Put a moved-aside lock back, unless its path was taken again meanwhile. */
+function restore(lock: LockFile, aside: string): boolean {
+  try {
+    if (lock.isDirectory) {
+      if (existsSync(lock.path)) return false;
+      renameSync(aside, lock.path);
+      return true;
+    }
+    linkSync(aside, lock.path); // fails if the path exists: never replaces a newer lock
+    unlinkSync(aside);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Remove a lock, safely against a race: move it aside, check that what moved
  * is the lock that was read (nobody re-took it in between), then delete it.
- * A lock that changed in between is put back.
+ * A lock directory is removed only when it holds nothing but its pid file;
+ * nothing is ever deleted recursively. A lock that changed in between, or a
+ * directory with other files, is put back.
  */
 export function removeLock(lock: LockFile): { removed: boolean; detail: string } {
   const aside = `${lock.path}.broken-${randomUUID().slice(0, 8)}`;
@@ -164,23 +183,25 @@ export function removeLock(lock: LockFile): { removed: boolean; detail: string }
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return { removed: true, detail: "already gone" };
     throw e;
   }
-  const moved = readSmall(lock.isDirectory ? join(aside, lock.holderFile.slice(lock.path.length + 1)) : aside) ?? "";
-  if (moved !== lock.content) {
-    // Someone took the lock after it was read: put theirs back
-    try {
-      if (lock.isDirectory) {
-        if (!existsSync(lock.path)) renameSync(aside, lock.path);
-      } else {
-        linkSync(aside, lock.path);
-        unlinkSync(aside);
-      }
-    } catch {
-      // the path was taken again meanwhile: the newest holder keeps it
-    }
-    if (existsSync(aside)) rmSync(aside, { recursive: true, force: true });
-    return { removed: false, detail: "the lock changed while it was being removed; left to its new holder" };
+  const holderName = basename(lock.holderFile);
+  const moved = readSmall(lock.isDirectory ? join(aside, holderName) : aside) ?? "";
+  const others = lock.isDirectory ? readdirSync(aside).filter((entry) => entry !== holderName) : [];
+  if (moved !== lock.content || others.length > 0) {
+    const why =
+      moved !== lock.content
+        ? "the lock changed while it was being removed; left to its new holder"
+        : `the lock directory holds other files (${others.slice(0, 5).join(", ")}); left in place`;
+    return {
+      removed: false,
+      detail: restore(lock, aside) ? why : `${why}; it could not be put back and stays at ${aside}`,
+    };
   }
-  rmSync(aside, { recursive: true, force: true });
+  if (lock.isDirectory) {
+    if (existsSync(join(aside, holderName))) unlinkSync(join(aside, holderName));
+    rmdirSync(aside);
+  } else {
+    unlinkSync(aside);
+  }
   return { removed: true, detail: "removed" };
 }
 

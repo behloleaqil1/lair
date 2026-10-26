@@ -56,6 +56,8 @@ export interface AgentRun {
   freshSessions: number;
   startRetries: number;
   launchFailures: number;
+  /** Failovers so far in this chain (capped by failover.max_failovers) */
+  failovers?: number;
   /** Written into the prompt file of a fresh session or a fallback run */
   resumeSummary?: string;
   state: AgentRunState;

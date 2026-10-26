@@ -350,13 +350,26 @@ const delivery = new DeliveryManager({
 delivery.load(projectEntries);
 await registerDeliveryRoutes(fastify, delivery, () => getDefaultProject());
 
+// Agent runs (claims, locks, recovery, failover, budgets): one service per
+// project with `agents.enabled: true` (off by default). Costs reach its
+// per-agent and per-project budgets through the fleet budget. Its routes are
+// registered below, once the owner's credential exists.
+const agents = new AgentsManager({
+  dbPath: join(process.cwd(), "data", "agents.db"),
+  events: getEventBus(),
+  budget: getBudgetManager(),
+});
+agents.load(projectEntries);
+
 // Progress watchdog: one per project with `watchdog.enabled: true` (off by
 // default). Its routes are read-only and answer for every project. It reads
-// delivery's crash loops and holds (the crash_loop detector and act guard).
+// delivery's crash loops and holds (the crash_loop detector and act guard),
+// and leaves the agents the agents module supervises to it.
 const watchdogs = new WatchdogManager({
   dbPath: join(process.cwd(), "data", "watchdog.db"),
   events: getEventBus(),
   services: delivery,
+  agents,
 });
 watchdogs.load(projectEntries);
 await registerWatchdogRoutes(fastify, watchdogs, () => getDefaultProject());
@@ -402,15 +415,7 @@ reviews.load(projectEntries);
 // Merges, human reviews, finding resolutions and hold releases need the owner's session
 await registerReviewRoutes(fastify, reviews, () => getDefaultProject(), humanAuth);
 
-// Agent runs (claims, locks, recovery, failover, budgets): one service per
-// project with `agents.enabled: true` (off by default). Costs reach its
-// per-agent and per-project budgets through the fleet budget.
-const agents = new AgentsManager({
-  dbPath: join(process.cwd(), "data", "agents.db"),
-  events: getEventBus(),
-  budget: getBudgetManager(),
-});
-agents.load(projectEntries);
+// The agents routes
 await registerAgentsRoutes(fastify, agents, () => getDefaultProject());
 
 // Serve the built web UI (dist/client) with an SPA fallback, when it exists.

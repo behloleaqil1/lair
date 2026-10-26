@@ -61,10 +61,15 @@ const LockSchema = z
     pid_file: z.string().regex(SAFE_NAME).default("pid"),
     /** launch: held while a run starts; run: held by the agent process until it ends */
     hold: z.enum(["launch", "run"]).default("launch"),
-    /** A lock with no holder pid (a legacy lock) is broken once it is this old */
+    /** A lock with no holder pid (a legacy lock) is broken once it is this old, when a run waits on it */
     stale_minutes: z.number().positive().default(30),
+    /** Also break such a pid-less lock when no run waits on it */
+    break_without_waiter: z.boolean().default(false),
   })
   .strict();
+
+/** An environment variable name */
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 
 const ProfileSchema = z
   .object({
@@ -93,6 +98,8 @@ const AgentsSchema = z
     /** Prints the branch state for a resume summary; {task}, {agent} and {repo} are replaced */
     branch_state_cmd: argv.optional(),
     command_timeout_seconds: z.number().int().min(1).max(600).default(30),
+    /** Variables of this server's environment an agent also gets (beyond PATH, HOME, ...), e.g. a provider API key */
+    env_passthrough: z.array(z.string().regex(ENV_NAME, "environment variable names only")).default([]),
     recovery: z
       .object({
         same_session_restarts: z.number().int().min(0).max(10).default(2),
@@ -120,6 +127,8 @@ const AgentsSchema = z
         silence_seconds: z.number().min(0).default(120),
         /** A provider that rate-limited or failed is skipped this long */
         cooldown_minutes: z.number().min(0).default(30),
+        /** Failovers per task (chain of runs); one more is escalated instead */
+        max_failovers: z.number().int().min(0).max(20).default(3),
       })
       .strict()
       .default({}),
@@ -156,6 +165,7 @@ export interface AgentLockSettings {
   pidFile: string;
   hold: "launch" | "run";
   staleMinutes: number;
+  breakWithoutWaiter: boolean;
 }
 
 export interface ProfileSettings {
@@ -176,6 +186,8 @@ export interface AgentsSettings {
   sessionDir?: string;
   branchStateCmd?: string[];
   commandTimeoutSeconds: number;
+  /** Extra variables an agent gets from this server's environment (never LAIR_*) */
+  envPassthrough: string[];
   recovery: {
     sameSessionRestarts: number;
     freshSessions: number;
@@ -189,6 +201,7 @@ export interface AgentsSettings {
     providerError: RegExp[];
     silenceSeconds: number;
     cooldownMinutes: number;
+    maxFailovers: number;
   };
   /** Usage patterns, compiled case-insensitive and global */
   usagePatterns: RegExp[];
@@ -272,6 +285,12 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
     checkPlaceholders(arg, ["task", "agent", "repo"], `agents.branch_state_cmd[${i}]`, errors),
   );
 
+  for (const name of value.env_passthrough) {
+    if (name.startsWith("LAIR_")) {
+      errors.push(`agents.env_passthrough: ${name}: LAIR_* variables are never passed to agents`);
+    }
+  }
+
   const lockNames = new Set<string>();
   const lockPaths = new Set<string>();
   for (const lock of value.locks) {
@@ -318,6 +337,7 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
       sessionDir: value.session_dir,
       branchStateCmd: value.branch_state_cmd,
       commandTimeoutSeconds: value.command_timeout_seconds,
+      envPassthrough: value.env_passthrough,
       recovery: {
         sameSessionRestarts: value.recovery.same_session_restarts,
         freshSessions: value.recovery.fresh_sessions,
@@ -335,12 +355,14 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         pidFile: lock.pid_file,
         hold: lock.hold,
         staleMinutes: lock.stale_minutes,
+        breakWithoutWaiter: lock.break_without_waiter,
       })),
       failover: {
         rateLimit,
         providerError,
         silenceSeconds: value.failover.silence_seconds,
         cooldownMinutes: value.failover.cooldown_minutes,
+        maxFailovers: value.failover.max_failovers,
       },
       usagePatterns,
       providers: value.providers,

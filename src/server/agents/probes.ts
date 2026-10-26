@@ -17,9 +17,33 @@ export interface ProcessOwner {
 
 export interface SpawnOptions {
   cwd?: string;
+  /** The process's whole environment: nothing is inherited from this server (see agentEnvironment) */
   env: Record<string, string>;
   /** stdout and stderr are appended here */
   logPath: string;
+}
+
+/** Variables every agent gets from this server's environment, when they are set. */
+export const BASE_ENV: readonly string[] = ["PATH", "HOME", "USER", "LANG", "TMPDIR", "TERM", "SHELL"];
+
+/**
+ * An agent's whole environment: BASE_ENV and the `passthrough` names
+ * (agents.env_passthrough, e.g. a provider API key the CLI needs) copied from
+ * `source`, then the run's own variables. Nothing else of this server's
+ * environment reaches an agent, and no LAIR_* variable but the run's own.
+ */
+export function agentEnvironment(
+  source: NodeJS.ProcessEnv,
+  passthrough: readonly string[],
+  run: Record<string, string>,
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const name of [...BASE_ENV, ...passthrough]) {
+    if (name.startsWith("LAIR_")) continue;
+    const value = source[name];
+    if (value !== undefined) env[name] = value;
+  }
+  return { ...env, ...run };
 }
 
 export interface ProcessSpawner {
@@ -34,6 +58,8 @@ export interface ProcessSpawner {
    * running, or started before this server did).
    */
   exitCode(pid: number): number | null | undefined;
+  /** True when this spawner started the process (in this server's lifetime) and hasn't forgotten it */
+  knows(pid: number): boolean;
   /** Signal the process and its process group. False when it can't be signalled. */
   kill(pid: number, signal: "SIGTERM" | "SIGKILL"): boolean;
   /** Drop what is kept about an ended process */
@@ -77,6 +103,11 @@ export class ProcessSnapshot {
     this.spawned.set(owner.pid, owner.startedAt);
   }
 
+  /** The processes added with addSpawned */
+  spawnedOwners(): ProcessOwner[] {
+    return [...this.spawned.entries()].map(([pid, startedAt]) => ({ pid, startedAt }));
+  }
+
   /** When the process with this pid started, or null when none runs. */
   startedAt(pid: number): number | null {
     const spawned = this.spawned.get(pid);
@@ -109,6 +140,7 @@ export class ProcessSnapshot {
 /** The real spawner: child_process.spawn, detached, output appended to the run's log. */
 export class ChildProcessSpawner implements ProcessSpawner {
   private exits = new Map<number, number | null>();
+  private started = new Set<number>();
 
   spawn(argv: string[], options: SpawnOptions): Promise<ProcessOwner> {
     const [file, ...args] = argv;
@@ -133,7 +165,8 @@ export class ChildProcessSpawner implements ProcessSpawner {
       try {
         const child = spawn(file, args, {
           cwd: options.cwd,
-          env: { ...process.env, ...options.env },
+          // Exactly the environment given: never this server's own
+          env: options.env,
           // Its own process group, so a stop reaches the agent's children too,
           // and the agent keeps running if this server restarts
           detached: true,
@@ -148,6 +181,7 @@ export class ChildProcessSpawner implements ProcessSpawner {
             return;
           }
           child.unref();
+          this.started.add(pid);
           resolve({ pid, startedAt: Date.now() });
         });
         child.once("error", (error) => {
@@ -168,6 +202,10 @@ export class ChildProcessSpawner implements ProcessSpawner {
     return this.exits.has(pid) ? this.exits.get(pid) : undefined;
   }
 
+  knows(pid: number): boolean {
+    return this.started.has(pid);
+  }
+
   kill(pid: number, signal: "SIGTERM" | "SIGKILL"): boolean {
     try {
       process.kill(-pid, signal);
@@ -184,6 +222,7 @@ export class ChildProcessSpawner implements ProcessSpawner {
 
   forget(pid: number): void {
     this.exits.delete(pid);
+    this.started.delete(pid);
   }
 }
 

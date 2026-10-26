@@ -16,7 +16,7 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
 import { rejectCrossSiteRequests } from "../origin.js";
-import { AgentsError, TASK_ID, type AgentsManager, type AgentsService } from "./service.js";
+import { AgentsError, isValidTaskId, type AgentsManager, type AgentsService } from "./service.js";
 
 function respond<T>(data: T) {
   return { success: true, data, timestamp: new Date().toISOString() };
@@ -135,7 +135,7 @@ export async function registerAgentsRoutes(
       const query = ProjectQuery.safeParse(request.query ?? {});
       if (!query.success) return fail(reply, 400, `Invalid query: ${query.error.issues[0].path.join(".")}`);
       const body = ReleaseBody.safeParse(request.body ?? {});
-      if (!body.success || !TASK_ID.test(body.data.task)) return fail(reply, 400, "Invalid body: {task, confirm: true}");
+      if (!body.success || !isValidTaskId(body.data.task)) return fail(reply, 400, "Invalid body: {task, confirm: true}");
       if (body.data.confirm !== true) return fail(reply, 400, CONFIRM_RELEASE);
       const service = serviceOf(reply, projectOf(query.data));
       if (!service) return reply;

@@ -43,7 +43,8 @@ describe("agents config", () => {
       stopGraceSeconds: 30,
       recovery: { sameSessionRestarts: 2, freshSessions: 1, backoffSeconds: 30, maxBackoffSeconds: 1800 },
       retries: { maxRetries: 3, backoffSeconds: 60, maxBackoffSeconds: 3600 },
-      failover: { silenceSeconds: 120, cooldownMinutes: 30 },
+      failover: { silenceSeconds: 120, cooldownMinutes: 30, maxFailovers: 3 },
+      envPassthrough: [],
       locks: [],
       fallbacks: {},
       budgets: { perAgent: {} },
@@ -57,6 +58,7 @@ describe("agents config", () => {
       {
         enabled: true,
         locks: [{ name: "session-store", path: "/home/user/project/work/session.lock", hold: "run" }],
+        env_passthrough: ["EXAMPLE_PROVIDER_KEY"],
         providers: { "other-cli": "provider-a" },
         fallbacks: { "worker-a": [{ adapter: "other-cli", model: "vendor/model-b", provider: "provider-b" }] },
         budgets: { agent: { daily_cost: { soft: 5, hard: 8 } }, per_agent: { "worker-a": { monthly_tokens: { hard: 1000000 } } } },
@@ -67,8 +69,16 @@ describe("agents config", () => {
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
     expect(parsed.settings.locks).toEqual([
-      { name: "session-store", path: "/home/user/project/work/session.lock", pidFile: "pid", hold: "run", staleMinutes: 30 },
+      {
+        name: "session-store",
+        path: "/home/user/project/work/session.lock",
+        pidFile: "pid",
+        hold: "run",
+        staleMinutes: 30,
+        breakWithoutWaiter: false,
+      },
     ]);
+    expect(parsed.settings.envPassthrough).toEqual(["EXAMPLE_PROVIDER_KEY"]);
     expect(parsed.settings.fallbacks["worker-a"]).toEqual([
       { adapter: "other-cli", model: "vendor/model-b", provider: "provider-b" },
     ]);
@@ -97,6 +107,10 @@ describe("agents config", () => {
     expect(errorsOf({ fallbacks: { "worker-a": [{ adapter: "other-cli", model: "-rf" }] } })[0]).toContain(
       "agents.fallbacks.worker-a.0.model",
     );
+    expect(errorsOf({ env_passthrough: ["LAIR_NODE_TOKEN"] })).toEqual([
+      "agents.env_passthrough: LAIR_NODE_TOKEN: LAIR_* variables are never passed to agents",
+    ]);
+    expect(errorsOf({ env_passthrough: ["NOT A NAME"] })[0]).toContain("agents.env_passthrough.0");
   });
 
   it("backs off exponentially, capped", () => {
