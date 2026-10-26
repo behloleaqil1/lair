@@ -779,7 +779,7 @@ review:
   repo: example-org/example-repo     # default: github
   token_env: GITHUB_TOKEN            # or token_cmd: ["gh", "auth", "token"]
   authors:
-    branch_pattern: "^agent/(?<agent>[A-Za-z0-9_-]+)/"
+    branch_pattern: "agent/{agent}/**"
   tiers:
     default: amber
     rules:
@@ -793,7 +793,11 @@ review:
     amber: [peer]
     green: [self]
   merge:
-    gate: { source: checks, required: ["build (22)", "build (24)"] }
+    gate:
+      source: checks
+      required:                      # check runs by name, from GitHub Actions unless app says otherwise
+        - "build (22)"
+        - { name: "build (24)", app: github-actions }
     method: auto                     # auto | host | local
     local_strategy: ff-only          # ff-only | squash
     identity: { name: Release Bot, email: 12345+release@users.noreply.github.com }
@@ -818,20 +822,26 @@ Globs use `**` (any directories), `*`, `?` and `{a,b}`; a glob without `/` match
 | `self` | The author's own review (its self-check) |
 | `{any_of: [...], different_model: true}` | Any of the listed ones; with `different_model`, an agent on a model other than the author's (a human always qualifies) |
 
-Defaults: `red: [human]`, `amber: [peer]`, `green: [self]`. Only an `approve` given at the PR's current head sha counts; a push makes every older review stale, and a reviewer's later review replaces its earlier one. The author is the agent registered with `POST /api/review/prs/:number/author`, else the `agent` group of `authors.branch_pattern` matched against the PR's branch; its model comes from `dragons:` or `authors.models`. With no author, `peer`, `self` and `different_model` can't be satisfied, and the status says so.
+Defaults: `red: [human]`, `amber: [peer]`, `green: [self]`. Only an `approve` given at the PR's current head sha counts; a push makes every older review stale, and a reviewer's later review replaces its earlier one. The author is the agent registered with `POST /api/review/prs/:number/author`, else the agent id that `authors.branch_pattern` finds in the PR's branch; its model comes from `dragons:` or `authors.models`. `branch_pattern` is a template, not a regular expression: `{agent}` (exactly once) is an agent id, `*` matches within one path segment and `**` (at most once) across segments, and everything else is literal, so `agent/{agent}/**` reads `worker-a` from `agent/worker-a/fix-login`. Branch names longer than 255 characters never match. With no author, `peer`, `self` and `different_model` can't be satisfied, and the status says so.
 
 A review has a fixed schema: `reviewer {id, kind: human|agent, model?}`, the full `head_sha`, `verdict` (`approve` or `request_changes`) and `findings[]` of `{severity, file, line, text, blocking}`. An approval can't carry blocking findings. An open blocking finding blocks the merge, even after a push, until its reviewer reviews again or it is resolved by its reviewer, a human, or an agent named in the red tier's reviewers (never the PR's author).
 
 ### Test integrity check
 
-Lair checks every PR, in every tier, at each new head, and records the result as a review by `lair:test-integrity`. Its findings block in `integrity.blocking_tiers` (default `[red]`) and are advisory elsewhere; only a human or a red-tier reviewer agent can dismiss one. It flags, with file and line:
+Lair checks every PR, in every tier, at each new head, and records the result as a review by `lair:test-integrity`. Its checks are heuristics, so only its `high` and `critical` findings block, and only in `integrity.blocking_tiers` (default `[red]`); the rest are advisory. Only a human or a red-tier reviewer agent can dismiss one. It flags, with file and line (severity in brackets):
 
-- `self-asserting-test`: a test whose assertions can only check values it built itself or fakes' recorded calls, because it imports no production module that it actually uses (its imports are test libraries, fakes, type-only, mocked with `vi.mock`/`jest.mock`, or never referenced). Checked for JavaScript/TypeScript and Python, where a test must import what it tests. Relative imports count as production code, and so do other packages unless they are known test libraries; add your own package prefixes (such as `@/`) to `integrity.production_imports`;
-- `skipped-test`, `focused-test`: an added skip, disable or `.only` (Jest, Vitest, Mocha, pytest, unittest, JUnit, Go, Rust, .NET);
-- `assertion-weakened`, `tolerance-widened`, `assertion-removed`: an exact check replaced by a weaker one (`toBe(42)` becoming `toBeDefined()`, `toHaveBeenCalledWith(...)` becoming `toHaveBeenCalled()`, `assertEqual` becoming `assertTrue`), a wider tolerance, or fewer assertions than before;
-- `test-removed`: a deleted test file, or fewer test cases than before;
-- `suite-loosened`: exclusions added to a test runner config, or a coverage threshold lowered;
-- `error-swallowed`: an empty `catch` or `except: pass` added in test code.
+- `self-asserting-test` [high]: a test whose assertions can only check values it built itself or fakes' recorded calls, because it imports no production module that it actually uses (its imports are test libraries, fakes, type-only, mocked with `vi.mock`/`jest.mock`, or never referenced). Checked for JavaScript/TypeScript and Python, where a test must import what it tests. Relative imports count as production code, and so do other packages unless they are known test libraries; add your own package prefixes (such as `@/`) to `integrity.production_imports`;
+- `skipped-test` [high], `focused-test` [medium]: an added skip, disable or `.only` (Jest, Vitest, Mocha, pytest, unittest, JUnit, Go, Rust, .NET);
+- `assertion-weakened` [high], `tolerance-widened` [medium], `assertion-removed` [medium]: an exact check replaced by a weaker one (`toBe(42)` becoming `toBeDefined()`, `toHaveBeenCalledWith(...)` becoming `toHaveBeenCalled()`, `assertEqual` becoming `assertTrue`), a wider tolerance, or fewer assertions than before;
+- `test-removed` [high]: fewer test cases than before, or a deleted test file. A deleted file whose test cases all appear in a test file the same PR adds (a move the host didn't detect as a rename) is reported as [low] instead;
+- `suite-loosened` [high]: exclusions added to a test runner config, or a coverage threshold lowered;
+- `error-swallowed` [medium]: an empty `catch` or `except: pass` added in test code.
+
+What it can't see (a review still has to):
+
+- it reads imports, not behaviour: a production import that the test uses only through `vi.spyOn`, or partly mocks, counts as exercised, and so does a test of fakes that also calls one real helper;
+- a file that imports a browser or HTTP driver (`@playwright/test`, `playwright`, `cypress`, `puppeteer`, `selenium-webdriver`, `webdriverio`, `supertest`) is taken to drive a running app and skips `self-asserting-test`;
+- other languages get every check except `self-asserting-test`, and it pairs a removed assertion with the added one in the same place, so a reordered test can show a false `assertion-weakened`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -849,34 +859,41 @@ A merge happens only when all of these hold, and a refusal lists each one that d
 - every gate in `merge.gate.required` passed at exactly the head sha (a pending, skipped or older result doesn't count);
 - the tier's required reviews are present at the head, nobody's latest review at the head requests changes, and no blocking finding is open;
 - the host reports the branch mergeable and, with `require_up_to_date`, it contains the target branch's tip;
-- no hold applies: a hold added through the API, or, with `hold_when_default_red`, a failed required gate on the default branch's tip (a PR labelled as in `hold_exempt_labels` may still merge).
+- no hold applies: a hold added through the API, or, with `hold_when_default_red`, a failed required gate on the default branch's tip. While it is red nothing merges, unless `hold_exempt_labels` is set (it is empty by default) and the PR carries one of those labels **and** is a plain revert: its title starts with `Revert "` and every commit says `This reverts commit <sha>`. A label alone is easy to add, so it is never enough.
 
 The merge request must confirm (`confirm: true`) and name the head sha it was shown; if the head moved since, it is refused.
 
-`merge.gate.source: checks` reads the host's check runs and commit statuses by name. `merge.gate.source: signed` reads gate results that a Lair node signed and posted to `POST /api/review/gate-results`, verified with `node_keys` (node id to public key) and `pipeline_versions` (pipeline id to version); a result's `projectId` must be the Lair project name.
+`merge.gate.source: checks` reads the host's check runs at the head. Each `required` entry is `{name, app}` (or just the name, meaning `app: github-actions`), and only a check run by that name **created by that app** (its slug or numeric id) counts. Commit statuses count only when posted by an account in `status_creators` (empty by default). This matters because anyone whose token can write statuses, or who can install an app, can post a "success" under any name; results from other apps and accounts are ignored, and the status says how many were. The red default branch hold reads the same source.
+
+`merge.gate.source: signed` reads gate results that a Lair node signed and posted to `POST /api/review/gate-results`, verified with `node_keys` (node id to public key) and `pipeline_versions` (pipeline id to version); a result's `projectId` must be the Lair project name. A result can't be forged without a node's key, so prefer `signed` for projects with red-tier code (money, auth, migrations), where a forged check is most costly.
 
 ### Merge method
 
-- `host`: the host's own merge (`host_method`: `squash`, `merge` or `rebase`) at the exact head sha. The host writes that commit with its account's identity, which Lair cannot check before it is published.
 - `local`: a fresh clone of the target branch, `local_strategy` `ff-only` (the target must not have moved) or `squash` (one commit by `identity`, which a squash requires), then a push. Squash commits are not signed. Over https the host token is passed to git in the environment, never in a URL or argv.
-- `auto` (the default): `host` for a private repository or when `host_email_private: true` says the account's email is private; otherwise, including when the visibility is unknown, `local`.
+- `host`: the host's own merge (`host_method`: `squash`, `merge` or `rebase`) at the exact head sha. It is refused unless `host_email_private: true` says the host account's commit email is private, because the host writes the new commits with identities Lair can't fully check. On GitHub:
+  - `squash`: one commit **authored** as the account that opened the PR, **committed** by GitHub (`noreply@github.com`);
+  - `merge`: the PR's commits, plus a merge commit authored as the account that owns the token and committed by GitHub;
+  - `rebase`: the PR's commits with their authors kept, re-committed by GitHub.
+
+  Lair checks the PR's commits as below and, for `squash` and `merge`, the authoring account's *public* email (refused if it shows one outside `allowed_emails`). An account with no public email may still commit with a private one, which only `host_email_private` can vouch for.
+- `auto` (the default): `host` when `host_email_private: true`, otherwise `local`. A private repository is no exception: a repository made public later publishes its whole history.
 
 Before anything is published, Lair checks every commit that would land on the target branch: its author and committer emails, and any address in its message (such as `Co-authored-by:` trailers), must match `allowed_emails` (globs, case-insensitive). The default is `identity.email` plus `*@users.noreply.github.com`. A commit that doesn't match stops the merge before the push, the refusal names the commit and a masked address, and Lair raises a `security` decision.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `merge.gate` | object | required | `{source: checks, required: [names]}` or `{source: signed, required: [pipeline ids], node_keys, pipeline_versions}` |
+| `merge.gate` | object | required | `{source: checks, required: [{name, app}], status_creators}` or `{source: signed, required: [pipeline ids], node_keys, pipeline_versions}` |
 | `merge.require_up_to_date` | boolean | `true` | The PR must contain the target branch's tip |
 | `merge.method` | `auto` \| `host` \| `local` | `auto` | See above |
 | `merge.host_method` | `squash` \| `merge` \| `rebase` | `squash` | The host merge's method |
 | `merge.local_strategy` | `ff-only` \| `squash` | `ff-only` | The local merge's strategy |
-| `merge.host_email_private` | boolean | unknown | Whether the host account's email is private |
+| `merge.host_email_private` | boolean | unknown | Set `true` only when the host account's commit email is private; required for host merges |
 | `merge.identity` | `{name, email}` | — | Who a local squash commit is by |
 | `merge.allowed_emails` | array | identity + noreply | Addresses allowed in published commits |
 | `merge.clone_url` | string | from `repo` | What the local merge clones and pushes to |
 | `merge.work_dir` | string | `data/review` | Where temporary clones go |
 | `merge.hold_when_default_red` | boolean | `true` | Hold merges while the default branch's gate is red |
-| `merge.hold_exempt_labels` | array | `[revert]` | Labels that may merge while it is red |
+| `merge.hold_exempt_labels` | array | `[]` | Labels that let a proven revert merge while it is red |
 
 Other keys: `provider` (`github`), `api_url` (default `https://api.github.com`), `token_env` (default `GITHUB_TOKEN`), `token_cmd` (an argv printing the token, used when `token_env` is unset), `default_branch`, `authors.models` (agent id to model). Unknown keys are config errors; a project with an invalid `review:` block has reviews off, and `GET /api/review/status` shows the errors.
 
