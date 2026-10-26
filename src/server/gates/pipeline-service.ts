@@ -496,6 +496,7 @@ export class PipelineManager {
             minutes: sum(attempts, "minutes"),
             billedMinutes: sum(attempts, "billedMinutes"),
           });
+          await this.options.events?.emit("gate.completed", { project: p.name, result: outcome.result });
           return;
         }
         case "retry": {
