@@ -67,6 +67,8 @@ const DeploySchema = z
     /** The repository to watch; default: the project's `repo` */
     repo: pathArg.optional(),
     ref: z.string().regex(GIT_REF, "must be a branch or ref name").default("main"),
+    /** Runs on every tick before `ref` is read: Lair itself never fetches, so this is what moves a remote-tracking ref */
+    fetch_cmd: argv.optional(),
     /** Runs before an automatic deploy builds anything, e.g. to update the working tree */
     prepare_cmd: argv.optional(),
     /** Roll back a deployed service that isn't healthy within this many minutes */
@@ -129,6 +131,7 @@ export interface EnvironmentSettings {
     auto: boolean;
     repo?: string;
     ref: string;
+    fetchCmd?: string[];
     prepareCmd?: string[];
     healthTimeoutMinutes: number;
   };
@@ -262,6 +265,7 @@ export function parseDeliveryConfig(raw: unknown): ParseResult {
             auto: env.deploy.auto,
             repo: env.deploy.repo,
             ref: env.deploy.ref,
+            fetchCmd: env.deploy.fetch_cmd,
             prepareCmd: env.deploy.prepare_cmd,
             healthTimeoutMinutes: env.deploy.health_timeout_minutes,
           },

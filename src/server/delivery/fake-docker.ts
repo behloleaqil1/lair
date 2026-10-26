@@ -8,7 +8,7 @@
  * commands left behind.
  */
 import { createHash } from "crypto";
-import type { Clock, CommandOutput, CommandRunner } from "../watchdog/probes.js";
+import type { Clock, CommandOutput, CommandRunner, RunOptions } from "../watchdog/probes.js";
 import type { HttpProbe } from "./probes.js";
 
 export const NOW = Date.parse("2026-03-02T12:00:00.000Z");
@@ -34,6 +34,8 @@ export interface FakeService {
   healthcheck?: boolean;
   /** An HTTP health URL that answers 200 while a working image runs */
   url?: string;
+  /** A compose container_name instead of <project>-<service>-1 */
+  containerName?: string;
 }
 
 export interface FakeContainer {
@@ -77,7 +79,14 @@ export class FakeDocker implements CommandRunner {
   /** Runs before each command answers (to change things mid-operation) */
   onRun?: (argv: string[]) => void;
   private counter = 0;
-  readonly services: Record<string, Required<Omit<FakeService, "url">> & { url?: string }>;
+  readonly services: Record<string, { imageRef: string; healthcheck: boolean; url?: string; containerName?: string }>;
+  /** Every docker command fails as when the CLI is missing or the daemon is down (e.g. "spawn docker ENOENT") */
+  broken: string | null = null;
+  /** `compose build` runs until the command is killed (its signal aborts) */
+  hangBuilds = false;
+  /** The options each command was run with */
+  options: (RunOptions | undefined)[] = [];
+  private delays: { match: (argv: string[]) => boolean; gate: Promise<void> }[] = [];
 
   constructor(
     readonly project: string,
@@ -89,6 +98,7 @@ export class FakeDocker implements CommandRunner {
         imageRef: s.imageRef ?? `${project}-${name}`,
         healthcheck: s.healthcheck ?? false,
         url: s.url,
+        containerName: s.containerName,
       };
       this.tags.set(normalise(this.services[name].imageRef), this.newImage(false));
     }
@@ -152,11 +162,46 @@ export class FakeDocker implements CommandRunner {
     return ["-p", "-f", "--project-directory"].includes(argv[i - 1]);
   }
 
-  async run(argv: string[]): Promise<CommandOutput> {
+  /**
+   * The next command `match` accepts answers only after the returned release
+   * is called. Its answer is worked out when it is called, as a real command
+   * would have read the state then.
+   */
+  delay(match: (argv: string[]) => boolean): () => void {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.delays.push({ match, gate });
+    return release;
+  }
+
+  async run(argv: string[], options?: RunOptions): Promise<CommandOutput> {
     this.calls.push([...argv]);
+    this.options.push(options);
     this.onRun?.(argv);
+    const answer = this.answer(argv, options);
+    const delayed = this.delays.findIndex((d) => d.match(argv));
+    if (delayed >= 0) {
+      const [{ gate }] = this.delays.splice(delayed, 1);
+      const result = await answer;
+      await gate;
+      return result;
+    }
+    return answer;
+  }
+
+  private answer(argv: string[], options?: RunOptions): CommandOutput | Promise<CommandOutput> {
     if (argv[0] === "git") return this.gitCommand(argv);
-    if (argv[0] !== "docker") return ok(); // a project script (prepare_cmd)
+    if (argv[0] !== "docker") return ok(); // a project script (prepare_cmd, fetch_cmd)
+    if (this.broken !== null) return { code: -1, stdout: "", stderr: this.broken };
+    if (this.hangBuilds && argv[1] === "compose" && argv.includes("build")) {
+      return new Promise((resolve) => {
+        const killed = () => resolve({ code: -1, stdout: "", stderr: "The operation was aborted" });
+        if (options?.signal?.aborted) killed();
+        options?.signal?.addEventListener("abort", killed, { once: true });
+      });
+    }
     switch (argv[1]) {
       case "compose":
         return this.compose(argv.slice(2));
@@ -262,7 +307,7 @@ export class FakeDocker implements CommandRunner {
     if (!c) {
       c = {
         id: hex(`container-${this.counter++}`),
-        name: `${this.project}-${name}-1`,
+        name: service.containerName ?? `${this.project}-${name}-1`,
         service: name,
         state: "created",
         exitCode: 0,

@@ -14,7 +14,7 @@ import { join } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { Event } from "../../shared/server-types.js";
 import { EventBus } from "../core/event-bus.js";
-import { FakeClock, FakeDocker, MIN } from "./fake-docker.js";
+import { FakeClock, FakeDocker, MIN, type FakeService } from "./fake-docker.js";
 import { createDelivery, type Delivery } from "./service.js";
 import { DeliveryStore } from "./store.js";
 import type { EnvironmentController, RequestResult } from "./environment.js";
@@ -58,13 +58,12 @@ afterEach(() => {
 
 function setup(
   overrides: Record<string, unknown> = {},
-  options: { readOnly?: boolean; store?: DeliveryStore } = {},
+  options: { readOnly?: boolean; store?: DeliveryStore; docker?: FakeDocker; fake?: Record<string, FakeService> } = {},
 ): Harness {
-  const docker = new FakeDocker("shop-local", {
-    db: { healthcheck: true },
-    api: { url: "http://localhost:8080/health" },
-    web: {},
-  });
+  // options.docker: the same containers and images across a restart of Lair
+  const docker =
+    options.docker ??
+    new FakeDocker("shop-local", options.fake ?? { db: { healthcheck: true }, api: { url: "http://localhost:8080/health" }, web: {} });
   const clock = new FakeClock();
   const store = options.store ?? new DeliveryStore(":memory:");
   if (!options.store) stores.push(store);
@@ -163,17 +162,25 @@ describe("Up and Down", () => {
     const h = setup();
     h.docker.arrayFormat = true;
     h.docker.running("db", "api", "web");
+    await h.env.read();
     expect((await h.env.status()).services.map((s) => s.state)).toEqual(["running", "running", "running"]);
   });
 
-  it("an environment Down runs docker compose down and holds every service", async () => {
-    const h = setup();
-    h.docker.running("db", "api", "web");
+  it("an environment Down stops the configured services (never compose down), leaves the rest, and holds them", async () => {
+    // cache is in the compose project but not in the delivery config
+    const h = setup({}, { fake: { db: { healthcheck: true }, api: { url: "http://localhost:8080/health" }, web: {}, cache: {} } });
+    h.docker.running("db", "api", "web", "cache");
     const op = await run(h, { kind: "down", by: "human", reason: "end of day" });
 
-    expect(h.docker.mutations()).toEqual([C("down")]);
+    expect(h.docker.mutations()).toEqual([C("stop", "web", "api", "db")]);
     expect(op.status).toBe("succeeded");
-    expect(h.docker.containers).toEqual([]);
+    expect(h.docker.container("cache")!.state).toBe("running");
+    expect(h.docker.containers.map((c) => [c.service, c.state])).toEqual([
+      ["db", "exited"],
+      ["api", "exited"],
+      ["web", "exited"],
+      ["cache", "running"],
+    ]);
     const status = await h.env.status();
     expect(status.services.map((s) => [s.name, s.state, s.held?.source, s.held?.reason])).toEqual([
       ["db", "stopped", "environment", "end of day"],
@@ -236,7 +243,6 @@ describe("held: a service a human stopped is never started by Lair until release
         error: "service api is held (profiling): release it first",
       });
     }
-    expect(h.env.request({ kind: "deploy", services: ["api", "web"], by: "human" })).toMatchObject({ ok: false, code: 409 });
     expect(h.docker.mutations()).toEqual([]);
 
     const release = await run(h, { kind: "release", service: "api", by: "human" });
@@ -285,7 +291,7 @@ describe("held: a service a human stopped is never started by Lair until release
     expect(skipped(up)).toEqual([{ service: "db", detail: "held: disk check" }]);
   });
 
-  it("an operation cut off by a stop is marked failed when Lair starts again", async () => {
+  it("an operation cut off by a stop is marked interrupted when Lair starts again", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lair-delivery-"));
     dirs.push(dir);
     const path = join(dir, "delivery.db");
@@ -304,7 +310,7 @@ describe("held: a service a human stopped is never started by Lair until release
     const reopened = new DeliveryStore(path);
     stores.push(reopened);
     setup({}, { store: reopened });
-    expect(reopened.getOperation(op.id)).toMatchObject({ status: "failed", error: expect.stringContaining("interrupted") });
+    expect(reopened.getOperation(op.id)).toMatchObject({ status: "interrupted", error: expect.stringContaining("interrupted") });
   });
 });
 
@@ -357,8 +363,9 @@ describe("crash loop: a restart count rising within the window", () => {
     h.docker.calls = [];
     const own = await run(h, { kind: "restart", service: "api", by: "human" });
     expect(own.status).toBe("succeeded");
-    expect(own.steps.map((s) => s.action)).toEqual(["clear-crash-loop", "restart", "wait"]);
-    expect(h.docker.mutations()).toEqual([C("restart", "api")]);
+    // recreated, so the container gets the compose file's settings back (a playbook may have set restart=no)
+    expect(own.steps.map((s) => s.action)).toEqual(["clear-crash-loop", "up", "wait"]);
+    expect(h.docker.mutations()).toEqual([C("up", "-d", "--no-deps", "--force-recreate", "api")]);
     expect(h.store.getCrashLoop("shop", "local", "api")).toBeNull();
   });
 
@@ -579,5 +586,364 @@ describe("deploy after a merge", () => {
       C("up", "-d", "--no-deps", "--no-build", "web"),
     ]);
     expect(h.env.request({ kind: "deploy", service: "db", by: "human" })).toMatchObject({ ok: false, code: 400 });
+  });
+});
+
+// ============ REVIEW FIXES ============
+
+/** Let pending promises run until `condition` holds. */
+async function until(condition: () => boolean): Promise<void> {
+  for (let i = 0; i < 500 && !condition(); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  expect(condition()).toBe(true);
+}
+
+/** Running stack, first commit seen, then a merge to SHA2 that changed `files`. */
+async function mergedTo(h: Harness, files: string[]): Promise<void> {
+  h.docker.running("db", "api", "web");
+  await h.delivery.tick();
+  h.docker.git.head = SHA2;
+  h.docker.git.diffs.set(`${SHA1}..${SHA2}`, files);
+  h.docker.calls = [];
+}
+
+describe("an environment that can't be read (docker missing, the daemon down)", () => {
+  const ENOENT = "spawn docker ENOENT";
+
+  it("before any good read: every service is unknown, and Up, Restart and Deploy wait (Down still holds)", async () => {
+    const h = setup({ deploy: { auto: false } });
+    h.docker.broken = ENOENT;
+    await h.delivery.tick();
+
+    const status = await h.env.status();
+    expect(status.error).toContain(ENOENT);
+    expect(status.services.map((s) => [s.name, s.state, s.health])).toEqual([
+      ["db", "unknown", "unknown"],
+      ["api", "unknown", "unknown"],
+      ["web", "unknown", "unknown"],
+    ]);
+    expect(status.services[0].healthDetail).toBe(`can't read the environment: docker compose ps exited -1: ${ENOENT}`);
+    for (const kind of ["up", "restart", "deploy"] as const) {
+      expect(h.env.request({ kind, by: "human" })).toMatchObject({ ok: false, code: 409 });
+    }
+    expect(h.env.request({ kind: "down", service: "api", by: "human", reason: "safe side" }).ok).toBe(true);
+    await h.env.idle();
+    expect(h.store.getHold("shop", "local", "api")).not.toBeNull();
+  });
+
+  it("after a good read: the last known 'running' is never shown beside the error", async () => {
+    const h = setup({ deploy: { auto: false } });
+    h.docker.running("db", "api", "web");
+    await h.delivery.tick();
+    expect((await h.env.status()).services.map((s) => s.state)).toEqual(["running", "running", "running"]);
+
+    h.docker.broken = ENOENT;
+    await h.delivery.tick();
+    const broken = await h.env.status();
+    expect(broken.error).toContain(ENOENT);
+    expect(broken.services.map((s) => s.state)).toEqual(["unknown", "unknown", "unknown"]);
+    expect(broken.services.every((s) => s.containers.length === 0)).toBe(true);
+    expect(broken.checkedAt).toBe("2026-03-02T12:00:00.000Z"); // the last good read
+
+    h.docker.broken = null;
+    await h.delivery.tick();
+    const back = await h.env.status();
+    expect(back.error).toBeNull();
+    expect(back.services.map((s) => s.state)).toEqual(["running", "running", "running"]);
+  });
+
+  it("GET status never runs docker: before the first tick every service is 'not read yet'", async () => {
+    const h = setup();
+    const status = await h.env.status();
+    expect(h.docker.calls).toEqual([]);
+    expect(status.checkedAt).toBeNull();
+    expect(status.services.map((s) => [s.state, s.healthDetail])).toEqual([
+      ["unknown", "not read yet"],
+      ["unknown", "not read yet"],
+      ["unknown", "not read yet"],
+    ]);
+  });
+
+  it("an older read that finishes last doesn't overwrite a newer one", async () => {
+    const h = setup({ deploy: { auto: false } });
+    h.docker.running("db", "api", "web");
+    const release = h.docker.delay((argv) => argv.includes("ps"));
+    const older = h.env.read(); // its answer (web running) arrives late
+    h.docker.container("web")!.state = "exited";
+    await h.env.read();
+    release();
+    await older;
+    expect((await service(h, "web")).state).toBe("stopped");
+  });
+});
+
+describe("merges are never lost, and a service left behind comes again", () => {
+  it("a human operation started while git diff runs leaves the merge for the next tick", async () => {
+    const h = setup();
+    await mergedTo(h, ["api/src/orders.ts"]);
+    h.docker.onRun = (argv) => {
+      if (argv[0] === "git" && argv[3] === "diff") {
+        h.docker.onRun = undefined;
+        started(h.env.request({ kind: "restart", service: "web", by: "human" }));
+      }
+    };
+    await h.delivery.tick();
+    await h.delivery.idle();
+    expect(h.store.listOperations("shop").map((o) => o.kind)).toEqual(["restart"]);
+    expect(h.store.seenSha("shop", "local")).toBe(SHA1);
+
+    await h.delivery.tick();
+    await h.delivery.idle();
+    expect(h.store.listOperations("shop")[0]).toMatchObject({ kind: "deploy", sha: SHA2, services: ["api"], status: "succeeded" });
+    expect(h.docker.mutations()).toContainEqual(C("build", "api"));
+    expect(h.store.seenSha("shop", "local")).toBe(SHA2);
+  });
+
+  it("a failed git diff leaves the merge for the next tick", async () => {
+    const h = setup();
+    await mergedTo(h, ["api/src/orders.ts"]);
+    const files = h.docker.git.diffs.get(`${SHA1}..${SHA2}`)!;
+    h.docker.git.diffs.delete(`${SHA1}..${SHA2}`);
+    await h.delivery.tick();
+    expect(h.delivery.lastError).toContain("git diff");
+    expect(h.store.seenSha("shop", "local")).toBe(SHA1);
+
+    h.docker.git.diffs.set(`${SHA1}..${SHA2}`, files);
+    await h.delivery.tick();
+    await h.delivery.idle();
+    expect(h.store.listOperations("shop")[0]).toMatchObject({ kind: "deploy", sha: SHA2, status: "succeeded" });
+  });
+
+  it("a rolled-back service shows as behind, and the next merge deploys it even if it didn't touch it", async () => {
+    const h = setup({ deploy: { auto: true, ref: "main", health_timeout_minutes: 1 } });
+    await mergedTo(h, ["api/src/orders.ts"]);
+    h.docker.nextBuild.api = "broken";
+    await h.delivery.tick();
+    await h.delivery.idle();
+    expect(h.store.listOperations("shop")[0].status).toBe("rolled_back");
+    expect(await service(h, "api")).toMatchObject({ deployedSha: SHA1, behind: true });
+    expect(await service(h, "web")).toMatchObject({ deployedSha: SHA1, behind: false });
+
+    // SHA2..SHA3 changes only web, but api is still at SHA1, so it comes along
+    const SHA3 = "3".repeat(40);
+    h.docker.git.head = SHA3;
+    h.docker.git.diffs.set(`${SHA1}..${SHA3}`, ["api/src/orders.ts", "web/src/cart.tsx"]);
+    h.docker.calls = [];
+    await h.delivery.tick();
+    await h.delivery.idle();
+    expect(h.store.listOperations("shop")[0]).toMatchObject({
+      kind: "deploy",
+      sha: SHA3,
+      services: ["api", "web"],
+      status: "succeeded",
+    });
+    expect(h.docker.mutations()).toContainEqual(C("build", "api"));
+    expect(h.docker.mutations()).toContainEqual(C("build", "web"));
+    expect(await service(h, "api")).toMatchObject({ deployedSha: SHA3, behind: false });
+  });
+
+  it("runs fetch_cmd before reading deploy.ref (Lair itself never fetches)", async () => {
+    const FETCH = ["git", "-C", "/home/user/shop", "fetch", "--quiet", "origin", "main"];
+    const h = setup({ deploy: { auto: true, ref: "origin/main", fetch_cmd: FETCH } });
+    h.docker.running("db", "api", "web");
+    await h.delivery.tick();
+    expect(h.docker.calls.filter((a) => a[0] === "git")).toEqual([
+      FETCH,
+      ["git", "-C", "/home/user/shop", "rev-parse", "--verify", "--quiet", "origin/main^{commit}"],
+    ]);
+  });
+});
+
+describe("stops, interrupted deploys and a human taking over", () => {
+  it("a deploy interrupted by a stop is rolled back, as a recover operation, when Lair starts again", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lair-delivery-"));
+    dirs.push(dir);
+    const path = join(dir, "delivery.db");
+    const first = setup({}, { store: new DeliveryStore(path) });
+    await mergedTo(first, ["api/src/orders.ts"]);
+    const before = first.docker.container("api")!.imageId;
+    first.docker.nextBuild.api = "broken";
+    // stop Lair while the deploy waits for the new container to be healthy
+    let rolled = false;
+    let stopping: Promise<void> | undefined;
+    first.docker.onRun = (argv) => {
+      if (argv.includes("--no-build")) rolled = true;
+      else if (rolled && !stopping && argv.includes("ps")) stopping = first.delivery.stop();
+    };
+    await first.delivery.tick();
+    await until(() => stopping !== undefined);
+    await stopping;
+    const [interrupted] = first.store.listOperations("shop");
+    expect(interrupted).toMatchObject({ kind: "deploy", status: "interrupted" });
+    // left on the image nobody saw healthy
+    expect(first.docker.container("api")!.imageId).not.toBe(before);
+    first.store.close();
+
+    const store = new DeliveryStore(path);
+    stores.push(store);
+    const second = setup({}, { store, docker: first.docker });
+    second.docker.onRun = undefined;
+    second.docker.calls = [];
+    await second.delivery.tick();
+    await second.delivery.idle();
+
+    const [recovery] = second.store.listOperations("shop");
+    expect(recovery).toMatchObject({ kind: "recover", requestedBy: "auto", services: ["api"], status: "rolled_back" });
+    expect(second.docker.mutations()).toEqual([
+      ["docker", "tag", "shop-local-api:lair-previous", "shop-local-api"],
+      C("up", "-d", "--no-deps", "--no-build", "--force-recreate", "api"),
+    ]);
+    expect(second.docker.container("api")!.imageId).toBe(before);
+    expect(second.docker.healthy("api")).toBe(true);
+    expect(second.store.getOperation(interrupted.id)!.recoveredBy).toBe(recovery.id);
+    expect(await service(second, "api")).toMatchObject({ behind: true });
+
+    // checked once
+    second.docker.calls = [];
+    await second.delivery.tick();
+    await second.delivery.idle();
+    expect(second.docker.mutations()).toEqual([]);
+  });
+
+  it("a stop kills a build in progress instead of waiting for it", async () => {
+    const h = setup({ deploy: { auto: false } });
+    h.docker.running("db", "api", "web");
+    h.docker.hangBuilds = true;
+    const op = started(h.env.request({ kind: "deploy", service: "api", by: "human" }));
+    await until(() => h.docker.calls.some((a) => a.includes("build")));
+
+    await h.delivery.stop(); // returns only because the build is killed
+
+    const build = h.docker.calls.findIndex((a) => a.includes("build"));
+    expect(h.docker.options[build]?.signal?.aborted).toBe(true);
+    expect(h.store.getOperation(op.id)).toMatchObject({ status: "interrupted" });
+    expect(h.docker.mutations().some((a) => a.includes("--no-build"))).toBe(false);
+  });
+
+  it("a Down during a deploy holds and stops the service at once, and the rollback doesn't start it again", async () => {
+    const h = setup();
+    await mergedTo(h, ["api/src/orders.ts"]);
+    const before = h.docker.container("api")!.imageId;
+    h.docker.nextBuild.api = "broken";
+    let rolled = false;
+    let down: RequestResult | undefined;
+    h.docker.onRun = (argv) => {
+      if (argv.includes("--no-build")) rolled = true;
+      else if (rolled && !down && argv.includes("ps")) {
+        down = h.env.request({ kind: "down", service: "api", by: "human", reason: "stop it now" });
+      }
+    };
+    await h.delivery.tick();
+    await until(() => down !== undefined);
+    await h.delivery.idle();
+
+    expect(down).toMatchObject({ ok: true });
+    const mutations = h.docker.mutations();
+    expect(mutations).toContainEqual(C("stop", "api"));
+    expect(mutations).toContainEqual(["docker", "tag", "shop-local-api:lair-previous", "shop-local-api"]);
+    expect(mutations).not.toContainEqual(C("up", "-d", "--no-deps", "--no-build", "--force-recreate", "api"));
+    expect(h.docker.container("api")!.state).toBe("exited");
+    // a later Up starts the image that ran before the deploy
+    expect(h.docker.imageOf("api")).toBe(before);
+    const deploy = h.store.listOperations("shop").find((o) => o.kind === "deploy")!;
+    expect(deploy.status).toBe("rolled_back");
+    expect(deploy.error).toContain("not started (held)");
+  });
+
+  it("a human Up of a crash-looping service recreates it, undoing a playbook's restart=no", async () => {
+    const h = setup({ deploy: { auto: false } });
+    h.docker.running("db", "api", "web");
+    await h.delivery.tick();
+    for (let i = 0; i < 2; i++) {
+      h.docker.crash("api", 2);
+      h.clock.advance(2 * MIN);
+      await h.delivery.tick();
+    }
+    // what the watchdog's crash_loop playbook runs
+    await h.docker.run(["docker", "update", "--restart=no", "shop-local-api-1"]);
+    expect(h.docker.container("api")).toMatchObject({ restartPolicy: "no", state: "exited" });
+    h.docker.calls = [];
+
+    const op = await run(h, { kind: "up", service: "api", by: "human" });
+
+    expect(op.status).toBe("succeeded");
+    expect(h.docker.mutations()).toEqual([C("up", "-d", "--no-deps", "--force-recreate", "api")]);
+    expect(h.docker.container("api")).toMatchObject({ restartPolicy: "unless-stopped", state: "running", restartCount: 0 });
+  });
+});
+
+describe("deploy edge cases", () => {
+  it("a human environment Deploy skips held services instead of refusing", async () => {
+    const h = setup({ deploy: { auto: false } });
+    h.docker.running("db", "api", "web");
+    await run(h, { kind: "down", service: "api", by: "human", reason: "profiling" });
+    const webImage = h.docker.container("web")!.imageId;
+    h.docker.calls = [];
+
+    const op = await run(h, { kind: "deploy", by: "human" });
+
+    expect(op.status).toBe("succeeded");
+    expect(skipped(op)).toEqual([{ service: "api", detail: "held: profiling" }]);
+    expect(h.docker.mutations()).toEqual([
+      ["docker", "tag", webImage, "shop-local-web:lair-previous"],
+      C("build", "web"),
+      C("up", "-d", "--no-deps", "--no-build", "web"),
+    ]);
+  });
+
+  it("refuses to deploy a service that shares its image with another one", async () => {
+    const h = setup(
+      { deploy: { auto: false }, services: { api: { build: true }, worker: { build: true } }, start_order: ["api", "worker"] },
+      { fake: { api: { imageRef: "example/app" }, worker: { imageRef: "example/app" } } },
+    );
+    h.docker.running("api", "worker");
+    const op = await run(h, { kind: "deploy", service: "api", by: "human" });
+    expect(op.status).toBe("failed");
+    expect(op.error).toBe(
+      "services api and worker share the image example/app: a rollback of one would move the other's image too, so Lair doesn't deploy it",
+    );
+    expect(h.docker.mutations()).toEqual([]);
+  });
+
+  it("redacts credentials in stored commands and in the log lines it shows", async () => {
+    const secret = ["s3cr3t", "value"].join("-");
+    const remote = `https://deploy:${secret}@git.example.com/shop.git`;
+    const h = setup({ deploy: { auto: true, prepare_cmd: ["git", "-C", "/home/user/shop", "pull", remote, "{sha}"] } });
+    await mergedTo(h, ["api/src/orders.ts"]);
+    h.docker.crash("db", 1, `FATAL: cannot connect to postgres://shop:${secret}@db:5432/shop`);
+    h.docker.crash("db", 1, `DB_PASSWORD=${secret} denied`);
+
+    await h.delivery.tick();
+    await h.delivery.idle();
+
+    const stored = JSON.stringify(h.store.listOperations("shop"));
+    expect(stored).not.toContain(secret);
+    expect(stored).toContain("https://***:***@git.example.com/shop.git");
+    const db = await service(h, "db");
+    expect(JSON.stringify(db)).not.toContain(secret);
+    expect(db.lastErrorLines).toContain("FATAL: cannot connect to postgres://***:***@db:5432/shop");
+    expect(db.lastErrorLines).toContain("DB_PASSWORD=*** denied");
+  });
+
+  it("matches a held service's container by the names last read: after a restart, with a custom container_name", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lair-delivery-"));
+    dirs.push(dir);
+    const path = join(dir, "delivery.db");
+    const fake = { db: { healthcheck: true }, api: { url: "http://localhost:8080/health", containerName: "orders-api" }, web: {} };
+    const first = setup({ deploy: { auto: false } }, { store: new DeliveryStore(path), fake });
+    first.docker.running("db", "api", "web");
+    await first.delivery.tick();
+    await run(first, { kind: "down", service: "api", by: "human", reason: "debugging" });
+    await first.delivery.stop();
+    first.store.close();
+
+    const store = new DeliveryStore(path);
+    stores.push(store);
+    const second = setup({ deploy: { auto: false } }, { store, docker: first.docker });
+    expect(second.delivery.heldReason("orders-api")).toBe(
+      "container orders-api is service api of delivery environment local, held by a human: debugging",
+    );
+    expect(second.delivery.heldReason("shop-local-db-1")).toBeNull();
   });
 });

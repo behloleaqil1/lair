@@ -6,18 +6,26 @@
  *   isn't running healthy. On ticks it also samples restart counts: a count
  *   that rises by crash_loop.max_restarts within crash_loop.window_minutes
  *   marks the service crash-looping (the watchdog's crash_loop detector reads
- *   the mark).
+ *   the mark). When the environment can't be read, every service is
+ *   `unknown`, and Up, Restart and Deploy wait until it can be.
  * - request(): Up, Down, Restart, Deploy and Release, run one at a time in
- *   the background as recorded operations (every argv, exit code and output).
- * - checkMerge(): with deploy.auto, deploys the services a new commit on
- *   deploy.ref changed.
+ *   the background as recorded operations (every argv, exit code and output,
+ *   redacted). A Down may also run while another operation is in progress:
+ *   that operation re-checks holds before each command, so it never starts
+ *   or recreates what the human just stopped.
+ * - checkMerge(): with deploy.auto, deploys the services whose paths changed
+ *   since the commit each one was last deployed at, so a service a rollback
+ *   left behind comes again with the next merge.
+ * - recoverInterrupted(): after a restart, rolls back what a deploy cut off
+ *   by the stop had built or rolled but never seen healthy.
  *
  * What Lair never does on its own: start a held service (Up skips it, a
  * deploy skips it, the watchdog leaves its container alone), restart a
  * crash-looping one (only a per-service action by a human does, and that
  * clears the mark), or start a stopped one in an automatic deploy. Every
- * compose call starts services with --no-deps, so a held dependency is never
- * started as a side effect.
+ * compose call names the configured services and starts them with
+ * --no-deps, so neither a held dependency nor a service Lair doesn't manage
+ * is started or removed as a side effect.
  */
 import type { EventBus } from "../core/event-bus.js";
 import type { ProjectConfig } from "../../shared/types.js";
@@ -40,11 +48,13 @@ import {
 } from "./compose.js";
 import { pathMatches, type DeliverySettings, type EnvironmentSettings, type ServiceSettings } from "./config.js";
 import type { DeliveryProbes } from "./probes.js";
+import { redact } from "./redact.js";
 import type { DeliveryStore } from "./store.js";
 import type {
   ContainerInfo,
   CrashLoop,
   EnvironmentStatus,
+  Hold,
   Operation,
   OperationKind,
   OperationStatus,
@@ -61,7 +71,7 @@ export interface DeliveryContext {
   store: DeliveryStore;
   probes: DeliveryProbes;
   events?: EventBus;
-  /** Aborted by Delivery.stop(): waits end early and no further command starts */
+  /** Aborted by Delivery.stop(): running commands are killed, waits end, no further command starts */
   signal: AbortSignal;
 }
 
@@ -81,6 +91,9 @@ export type RequestResult =
   | { ok: false; code: 400 | 403 | 404 | 409; error: string };
 
 type Outcome = { status: OperationStatus; error?: string };
+type Started = { ok: true } | { ok: false; held: boolean; error: string };
+type Waited = { ok: boolean; held?: boolean; detail: string };
+type Previous = { ref: string; tag: string };
 
 /** How often Up, Restart and Deploy re-read a service while waiting for it to be healthy */
 const POLL_MS = 5000;
@@ -91,7 +104,7 @@ const COMMIT = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 
 class Stopping extends Error {
   constructor() {
-    super("stopped: Lair is shutting down");
+    super("interrupted: Lair is shutting down");
   }
 }
 
@@ -120,20 +133,20 @@ function toContainer(ps: PsEntry, inspect: InspectEntry | undefined): ContainerI
     imageId: inspect?.imageId || undefined,
     imageRef: inspect?.imageRef || ps.image || undefined,
     health: inspect?.health?.status ?? ps.health,
-    error: errors.length > 0 ? errors.join("; ") : undefined,
+    error: errors.length > 0 ? redact(errors.join("; ")) : undefined,
   };
 }
 
-/** Fill prepare_cmd's placeholders; a value that would read as an option is refused. */
-function fillPrepare(template: string[], vars: Record<string, string>): { argv: string[] } | { error: string } {
+/** Fill a command's {placeholders}; a value that would read as an option is refused. */
+function fill(key: string, template: string[], vars: Record<string, string>): { argv: string[] } | { error: string } {
   for (const name of placeholdersIn(template)) {
-    if (vars[name] === undefined) return { error: `deploy.prepare_cmd: no value for {${name}}` };
+    if (vars[name] === undefined) return { error: `${key}: no value for {${name}}` };
   }
   const argv: string[] = [];
   for (const arg of template) {
     const filled = arg.replace(/\{([A-Za-z_]+)\}/g, (_, name: string) => vars[name] ?? "");
     if (filled.startsWith("-") && !arg.startsWith("-")) {
-      return { error: `deploy.prepare_cmd: ${arg} would start with "-" and read as an option` };
+      return { error: `${key}: ${arg} would start with "-" and read as an option` };
     }
     argv.push(filled);
   }
@@ -143,7 +156,12 @@ function fillPrepare(template: string[], vars: Record<string, string>): { argv: 
 export class EnvironmentController {
   private snapshot: { at: number; services: ServiceStatus[] } | null = null;
   private readError: string | null = null;
+  /** Reads are numbered; an older read never overwrites a newer one's result */
+  private readSeq = 0;
+  private appliedSeq = 0;
   private current: { operation: Operation; done: Promise<void> } | null = null;
+  /** Downs that run while another operation is in progress */
+  private sides = new Set<Promise<void>>();
   /** Why deploy.auto is not acting (read_only), or null */
   autoDeployBlocked: string | null = null;
 
@@ -172,12 +190,17 @@ export class EnvironmentController {
     return [...this.ctx.settings.dockerCmd, ...args];
   }
 
+  /** Every command gets the stop signal: a stop kills it instead of waiting out a build. */
   private run(argv: string[], timeoutSeconds = this.ctx.settings.commandTimeoutSeconds): Promise<CommandOutput> {
-    return this.ctx.probes.runner.run(argv, { timeoutMs: timeoutSeconds * 1000 });
+    return this.ctx.probes.runner.run(argv, { timeoutMs: timeoutSeconds * 1000, signal: this.ctx.signal });
   }
 
   service(name: string): ServiceSettings | undefined {
     return this.env.services.find((s) => s.name === name);
+  }
+
+  private holdOf(name: string): Hold | null {
+    return this.ctx.store.getHold(this.ctx.project, this.env.name, name);
   }
 
   // ============ READING ============
@@ -188,11 +211,12 @@ export class EnvironmentController {
    * that aren't running healthy.
    */
   async read(options: { sample?: boolean; logs?: boolean } = {}): Promise<ServiceStatus[]> {
+    const seq = ++this.readSeq;
     const now = this.ctx.probes.clock.now();
     try {
       const ps = await this.run(this.compose("ps", "--all", "--format", "json"));
       if (ps.code !== 0) {
-        throw new Error(`docker compose ps exited ${ps.code}: ${ps.stderr.trim().slice(0, 300)}`);
+        throw new Error(`docker compose ps exited ${ps.code}: ${redact(ps.stderr.trim().slice(0, 300))}`);
       }
       const known = new Set(this.env.services.map((s) => s.name));
       const entries = parseComposePs(ps.stdout).filter((e) => known.has(e.service));
@@ -218,13 +242,29 @@ export class EnvironmentController {
         }
         services.push(status);
       }
-      this.snapshot = { at: now, services };
-      this.readError = null;
+      if (seq > this.appliedSeq) {
+        this.appliedSeq = seq;
+        this.snapshot = { at: now, services };
+        this.readError = null;
+        for (const s of services) {
+          if (s.containers.length > 0) {
+            this.ctx.store.setContainerNames(this.ctx.project, this.env.name, s.name, s.containers.map((c) => c.name));
+          }
+        }
+      }
       return services;
     } catch (e) {
-      this.readError = e instanceof Error ? e.message : String(e);
+      if (seq > this.appliedSeq) {
+        this.appliedSeq = seq;
+        this.readError = redact(e instanceof Error ? e.message : String(e));
+      }
       throw e;
     }
+  }
+
+  private shaFields(name: string): { deployedSha: string | null; behind: boolean } {
+    const { deployedSha, targetSha } = this.ctx.store.serviceShas(this.ctx.project, this.env.name, name);
+    return { deployedSha, behind: targetSha !== null && targetSha !== deployedSha };
   }
 
   private async serviceStatus(service: ServiceSettings, containers: ContainerInfo[]): Promise<ServiceStatus> {
@@ -237,6 +277,7 @@ export class EnvironmentController {
       crashLoop: store.getCrashLoop(project, this.env.name, service.name),
       lastErrorLines: [] as string[],
       buildable: service.build,
+      ...this.shaFields(service.name),
     };
     const restarting = containers.find((c) => c.state === "restarting");
     if (restarting) {
@@ -256,7 +297,12 @@ export class EnvironmentController {
     if (check.type === "http") {
       const answer = await this.ctx.probes.http.get(check.url, check.timeoutSeconds * 1000);
       if ("error" in answer) {
-        return { ...base, state: "unhealthy", health: "unhealthy", healthDetail: `GET ${check.url}: ${answer.error}` };
+        return {
+          ...base,
+          state: "unhealthy",
+          health: "unhealthy",
+          healthDetail: redact(`GET ${check.url}: ${answer.error}`),
+        };
       }
       const ok =
         check.expectStatus !== undefined
@@ -266,7 +312,7 @@ export class EnvironmentController {
         ...base,
         state: ok ? "running" : "unhealthy",
         health: ok ? "healthy" : "unhealthy",
-        healthDetail: `GET ${check.url}: ${answer.status}`,
+        healthDetail: redact(`GET ${check.url}: ${answer.status}`),
       };
     }
     const unhealthy = running.find((c) => c.health === "unhealthy");
@@ -297,7 +343,7 @@ export class EnvironmentController {
     const docker = status.containers.map((c) => c.error).filter((e): e is string => !!e);
     const out = await this.run(this.compose("logs", "--no-color", "--no-log-prefix", "--tail", "200", status.name));
     const logged = out.code === 0 ? errorLines(out.stdout, MAX_ERROR_LINES) : [];
-    return [...docker, ...logged].slice(-MAX_ERROR_LINES);
+    return [...docker, ...logged].slice(-MAX_ERROR_LINES).map(redact);
   }
 
   /** Record a restart-count sample, and mark or clear a crash loop. */
@@ -356,24 +402,22 @@ export class EnvironmentController {
     }
   }
 
-  /** Status for the API: the latest read (made now if there is none), with fresh holds and crash loops. */
+  /**
+   * Status for the API. It never runs a command (the tick reads every
+   * interval_seconds), so a request never waits on docker. When the last
+   * read failed, or there was none yet, every service is `unknown`: a stale
+   * "running" or a guessed "stopped" would both mislead.
+   */
   async status(): Promise<EnvironmentStatus> {
     const { store, project } = this.ctx;
-    if (!this.snapshot) {
-      try {
-        await this.read({ logs: true });
-      } catch {
-        // shown as `error`
-      }
-    }
-    const services = this.env.services.map((service) => {
-      const read = this.snapshot?.services.find((s) => s.name === service.name);
+    const services = this.env.services.map((service): ServiceStatus => {
+      const read = this.readError === null ? this.snapshot?.services.find((s) => s.name === service.name) : undefined;
       return {
         ...(read ?? {
           name: service.name,
-          state: "stopped" as const,
+          state: "unknown" as const,
           health: "unknown" as const,
-          healthDetail: "not read yet",
+          healthDetail: this.readError !== null ? `can't read the environment: ${this.readError}` : "not read yet",
           restartCount: 0,
           containers: [],
           lastErrorLines: [],
@@ -381,6 +425,7 @@ export class EnvironmentController {
         }),
         held: store.getHold(project, this.env.name, service.name),
         crashLoop: store.getCrashLoop(project, this.env.name, service.name),
+        ...this.shaFields(service.name),
       };
     });
     const running = this.current ? store.getOperation(this.current.operation.id) : null;
@@ -427,30 +472,40 @@ export class EnvironmentController {
     return null;
   }
 
+  /**
+   * Whether a container is one of a service's: from the latest read, else
+   * the names last read (kept in the store, so this holds right after a
+   * restart and for a custom container_name), else Compose's default name
+   * <project>-<service>-<n> for a service never read.
+   */
   private belongsTo(container: string, service: string): boolean {
     const read = this.snapshot?.services.find((s) => s.name === service);
     if (read?.containers.some((c) => c.name === container)) return true;
-    // Not read yet, or removed by a Down: Compose names containers <project>-<service>-<n>
+    const known = this.ctx.store.containerNames(this.ctx.project, this.env.name, service);
+    if (known.includes(container)) return true;
     const prefix = `${this.env.projectName}-${service}-`;
     return container.startsWith(prefix) && /^\d+$/.test(container.slice(prefix.length));
   }
 
   // ============ OPERATIONS ============
 
-  /** The operation in progress, if any. */
+  /** The operation in progress, if any (a Down running beside it is not counted). */
   get busy(): Operation | null {
     return this.current?.operation ?? null;
   }
 
   /** Resolves once no operation is running. */
   async idle(): Promise<void> {
-    while (this.current) await this.current.done;
+    while (this.current || this.sides.size > 0) {
+      await Promise.all([this.current?.done, ...this.sides]);
+    }
   }
 
   /**
    * Start an operation. Checks run now (the answer is immediate); the
    * commands run in the background. A Down holds right away, so nothing can
-   * start the service while it is being stopped.
+   * start the service while it is being stopped, and it runs even while
+   * another operation is in progress.
    */
   request(req: OperationRequest): RequestResult {
     const { store, project } = this.ctx;
@@ -480,13 +535,22 @@ export class EnvironmentController {
           status: "succeeded",
           startedAt: at,
           completedAt: at,
-          steps: [{ at, service: target, action: "release", status: "succeeded", detail: `released (held: ${hold.reason})` }],
+          steps: [{ at, service: target, action: "release", status: "succeeded", detail: redact(`released (held: ${hold.reason})`) }],
         }),
       };
     }
+    if (req.kind === "recover") return { ok: false, code: 400, error: "recover runs on its own after a restart" };
 
-    if (this.current) {
+    const beside = req.kind === "down" && this.current !== null;
+    if (this.current && !beside) {
       return { ok: false, code: 409, error: `environment ${env} is busy: ${this.current.operation.kind} started ${this.current.operation.startedAt}` };
+    }
+    if (this.readError !== null && (req.kind === "up" || req.kind === "restart" || req.kind === "deploy")) {
+      return {
+        ok: false,
+        code: 409,
+        error: `environment ${env} can't be read (${this.readError}): Up, Restart and Deploy wait until it can`,
+      };
     }
 
     let services = target !== undefined ? [target] : [];
@@ -499,13 +563,11 @@ export class EnvironmentController {
         if (!service.build) return { ok: false, code: 400, error: `service ${name} has no build: true, so it can't be deployed` };
       }
     }
-    if (req.by === "human" && req.kind !== "down") {
-      // An environment Up or Restart skips held services; asking for one by name is refused
-      const named = req.kind === "deploy" || target !== undefined ? services : [];
-      for (const name of named) {
-        const hold = store.getHold(project, env, name);
-        if (hold) return { ok: false, code: 409, error: `service ${name} is held (${hold.reason}): release it first` };
-      }
+    // A service asked for by name must not be held; an environment-wide Up,
+    // Restart or Deploy skips held services instead
+    if (req.by === "human" && req.kind !== "down" && target !== undefined) {
+      const hold = store.getHold(project, env, target);
+      if (hold) return { ok: false, code: 409, error: redact(`service ${target} is held (${hold.reason}): release it first`) };
     }
     const reason = req.reason?.trim();
     if (req.kind === "down" && !reason) return { ok: false, code: 400, error: "a reason is required to take services down" };
@@ -517,7 +579,7 @@ export class EnvironmentController {
       kind: req.kind,
       services,
       requestedBy: req.by,
-      reason: reason || undefined,
+      reason: reason ? redact(reason) : undefined,
       sha: req.sha,
       status: "running",
       startedAt: at,
@@ -531,23 +593,35 @@ export class EnvironmentController {
         if (target === undefined && existing) continue;
         const source = target !== undefined ? "service" : "environment";
         store.setHold({ project, environment: env, service: name, reason, source, heldAt: at });
-        steps.push({ at, service: name, action: "hold", status: "succeeded", detail: `held (${source}): ${reason}` });
+        this.record(operation, steps, { action: "hold", service: name, status: "succeeded", detail: `held (${source}): ${reason}` });
         void this.ctx.events?.emit("delivery.held", { project, environment: env, service: name, reason, source });
       }
-      store.updateOperation(operation.id, { steps });
     }
-    // Start on the next microtask, after `current` is set; never reject (nobody may be waiting)
-    const done = Promise.resolve()
-      .then(() => this.execute(operation, steps))
-      .catch((e) => {
-        console.error(`[delivery] ${project}/${env}: ${req.kind} failed to finish:`, e);
-        if (this.current?.operation.id === operation.id) this.current = null;
-      });
-    this.current = { operation, done };
-    return { ok: true, operation: store.getOperation(operation.id)! };
+    return this.launch(operation, steps, { beside });
   }
 
-  private async execute(op: Operation, steps: OperationStep[]): Promise<void> {
+  /** Run an operation in the background; it never rejects (nobody may be waiting). */
+  private launch(
+    operation: Operation,
+    steps: OperationStep[],
+    options: { beside?: boolean; perform?: () => Promise<Outcome> } = {},
+  ): RequestResult {
+    const { project } = this.ctx;
+    const done: Promise<void> = Promise.resolve()
+      .then(() => this.execute(operation, steps, options.perform))
+      .catch((e) => {
+        console.error(`[delivery] ${project}/${this.env.name}: ${operation.kind} failed to finish:`, e);
+        if (this.current?.operation.id === operation.id) this.current = null;
+      })
+      .finally(() => {
+        this.sides.delete(done);
+      });
+    if (options.beside) this.sides.add(done);
+    else this.current = { operation, done };
+    return { ok: true, operation: this.ctx.store.getOperation(operation.id)! };
+  }
+
+  private async execute(op: Operation, steps: OperationStep[], perform?: () => Promise<Outcome>): Promise<void> {
     const { store, project, events } = this.ctx;
     await events?.emit("delivery.started", {
       project,
@@ -559,9 +633,16 @@ export class EnvironmentController {
     });
     let outcome: Outcome;
     try {
-      outcome = await this.perform(op, steps);
+      outcome = await (perform ? perform() : this.perform(op, steps));
     } catch (e) {
-      outcome = { status: "failed", error: e instanceof Error ? e.message : String(e) };
+      outcome =
+        e instanceof Stopping
+          ? { status: "interrupted", error: e.message }
+          : { status: "failed", error: e instanceof Error ? e.message : String(e) };
+    }
+    // Cut short by a stop: interrupted, so a deploy is recovered on the next start
+    if (this.ctx.signal.aborted && outcome.status !== "succeeded") {
+      outcome = { status: "interrupted", error: outcome.error ?? "interrupted: Lair is shutting down" };
     }
     // Read before reporting the end, so a finished operation never comes with a stale status
     if (!this.ctx.signal.aborted) {
@@ -571,7 +652,8 @@ export class EnvironmentController {
         // shown as the environment's read error
       }
     }
-    store.updateOperation(op.id, { status: outcome.status, error: outcome.error, completedAt: this.iso(), steps });
+    const error = outcome.error === undefined ? undefined : redact(outcome.error);
+    store.updateOperation(op.id, { status: outcome.status, error, completedAt: this.iso(), steps });
     if (this.current?.operation.id === op.id) this.current = null;
     await events?.emit("delivery.finished", {
       project,
@@ -579,12 +661,19 @@ export class EnvironmentController {
       operationId: op.id,
       kind: op.kind,
       status: outcome.status,
-      error: outcome.error ?? null,
+      error: error ?? null,
     });
   }
 
+  /** Append a step (redacted) and save the operation's steps. */
   private record(op: Operation, steps: OperationStep[], step: Omit<OperationStep, "at">): void {
-    steps.push({ at: this.iso(), ...step });
+    steps.push({
+      at: this.iso(),
+      ...step,
+      argv: step.argv?.map(redact),
+      output: step.output === undefined ? undefined : redact(step.output),
+      detail: step.detail === undefined ? undefined : redact(step.detail),
+    });
     this.ctx.store.updateOperation(op.id, { steps });
   }
 
@@ -595,14 +684,18 @@ export class EnvironmentController {
     action: string,
     service: string | undefined,
     argv: string[],
-    timeoutSeconds?: number,
+    options: { timeoutSeconds?: number; ref?: string } = {},
   ): Promise<boolean> {
     if (this.ctx.signal.aborted) {
       this.record(op, steps, { action, service, status: "skipped", argv, detail: "Lair is stopping" });
       throw new Stopping();
     }
-    const out = await this.run(argv, timeoutSeconds);
+    const out = await this.run(argv, options.timeoutSeconds);
     const output = tail([out.stdout.trim(), out.stderr.trim()].filter((s) => s !== "").join("\n"));
+    if (this.ctx.signal.aborted) {
+      this.record(op, steps, { action, service, status: "failed", argv, code: out.code, output: output || undefined, detail: "killed: Lair is stopping", ref: options.ref });
+      throw new Stopping();
+    }
     this.record(op, steps, {
       action,
       service,
@@ -610,6 +703,7 @@ export class EnvironmentController {
       argv,
       code: out.code,
       output: output || undefined,
+      ref: options.ref,
     });
     return out.code === 0;
   }
@@ -634,13 +728,13 @@ export class EnvironmentController {
     return null;
   }
 
-  /** A human acting on a crash-looping service by name clears the mark. */
-  private clearCrashLoop(op: Operation, steps: OperationStep[], name: string): void {
+  /** A human acting on a crash-looping service by name clears the mark; true when there was one. */
+  private clearCrashLoop(op: Operation, steps: OperationStep[], name: string): boolean {
     const { store, project } = this.ctx;
-    if (store.clearCrashLoop(project, this.env.name, name)) {
-      this.record(op, steps, { action: "clear-crash-loop", service: name, status: "succeeded", detail: `asked for by ${op.requestedBy}` });
-      void this.ctx.events?.emit("delivery.crash_loop_cleared", { project, environment: this.env.name, service: name });
-    }
+    if (!store.clearCrashLoop(project, this.env.name, name)) return false;
+    this.record(op, steps, { action: "clear-crash-loop", service: name, status: "succeeded", detail: `asked for by ${op.requestedBy}` });
+    void this.ctx.events?.emit("delivery.crash_loop_cleared", { project, environment: this.env.name, service: name });
+    return true;
   }
 
   private async perform(op: Operation, steps: OperationStep[]): Promise<Outcome> {
@@ -649,30 +743,44 @@ export class EnvironmentController {
       case "up":
         return one !== undefined ? this.upService(op, steps, one) : this.upAll(op, steps);
       case "down":
-        return one !== undefined ? this.downService(op, steps, one) : this.downAll(op, steps);
+        return this.down(op, steps, one);
       case "restart":
         return one !== undefined ? this.restartService(op, steps, one) : this.restartAll(op, steps);
       case "deploy":
         return this.deploy(op, steps);
       case "release":
+      case "recover":
         return { status: "succeeded" };
     }
   }
 
-  /** `up -d --no-deps` or `restart` one service, then wait for it to be healthy. */
-  private async start(
-    op: Operation,
-    steps: OperationStep[],
-    name: string,
-    how: "up" | "restart",
-  ): Promise<{ ok: true } | { ok: false; error: string }> {
-    const argv = how === "up" ? this.compose("up", "-d", "--no-deps", name) : this.compose("restart", name);
-    if (!(await this.command(op, steps, how, name, argv))) {
-      return { ok: false, error: `${how} ${name} failed` };
+  /**
+   * Start one service and wait for it to be healthy. "recreate" is an Up
+   * with --force-recreate: the container comes back with the compose file's
+   * settings (a crash-loop playbook may have set its restart policy to no).
+   * A service held meanwhile is not started.
+   */
+  private async start(op: Operation, steps: OperationStep[], name: string, how: "up" | "restart" | "recreate"): Promise<Started> {
+    const hold = this.holdOf(name);
+    if (hold) {
+      this.skip(op, steps, name, `held: ${hold.reason}`);
+      return { ok: false, held: true, error: `service ${name} is held (${hold.reason})` };
+    }
+    const argv =
+      how === "restart"
+        ? this.compose("restart", name)
+        : this.compose("up", "-d", "--no-deps", ...(how === "recreate" ? ["--force-recreate"] : []), name);
+    if (!(await this.command(op, steps, how === "restart" ? "restart" : "up", name, argv))) {
+      return { ok: false, held: false, error: `${how} ${name} failed` };
     }
     const wait = await this.waitHealthy(name, this.env.startTimeoutSeconds * 1000);
-    this.record(op, steps, { action: "wait", service: name, status: wait.ok ? "succeeded" : "failed", detail: wait.detail });
-    return wait.ok ? { ok: true } : { ok: false, error: `${name}: ${wait.detail}` };
+    this.record(op, steps, {
+      action: "wait",
+      service: name,
+      status: wait.ok ? "succeeded" : wait.held ? "skipped" : "failed",
+      detail: wait.detail,
+    });
+    return wait.ok ? { ok: true } : { ok: false, held: wait.held === true, error: `${name}: ${wait.detail}` };
   }
 
   /** Start every service in start order, each healthy before the next; held and crash-looping ones are skipped. */
@@ -698,7 +806,7 @@ export class EnvironmentController {
         continue;
       }
       const started = await this.start(op, steps, name, "up");
-      if (!started.ok) {
+      if (!started.ok && !started.held) {
         this.skipRest(op, steps, services.slice(i + 1), `not started: ${name} did not become healthy`);
         return { status: "failed", error: started.error };
       }
@@ -707,24 +815,20 @@ export class EnvironmentController {
   }
 
   private async upService(op: Operation, steps: OperationStep[], name: string): Promise<Outcome> {
-    const hold = this.ctx.store.getHold(this.ctx.project, this.env.name, name);
-    if (hold) {
-      this.skip(op, steps, name, `held: ${hold.reason}`);
-      return { status: "failed", error: `service ${name} is held (${hold.reason})` };
-    }
-    this.clearCrashLoop(op, steps, name);
-    const started = await this.start(op, steps, name, "up");
+    const cleared = this.clearCrashLoop(op, steps, name);
+    const started = await this.start(op, steps, name, cleared ? "recreate" : "up");
     return started.ok ? { status: "succeeded" } : { status: "failed", error: started.error };
   }
 
-  private async downAll(op: Operation, steps: OperationStep[]): Promise<Outcome> {
-    const ok = await this.command(op, steps, "down", undefined, this.compose("down"));
-    return ok ? { status: "succeeded" } : { status: "failed", error: "docker compose down failed" };
-  }
-
-  private async downService(op: Operation, steps: OperationStep[], name: string): Promise<Outcome> {
-    const ok = await this.command(op, steps, "stop", name, this.compose("stop", name));
-    return ok ? { status: "succeeded" } : { status: "failed", error: `stop ${name} failed (it stays held)` };
+  /**
+   * Stop the configured services (one, or all of them in reverse start
+   * order). Never `docker compose down`: that would remove services of the
+   * compose project Lair doesn't manage, which no Up brings back.
+   */
+  private async down(op: Operation, steps: OperationStep[], one: string | undefined): Promise<Outcome> {
+    const names = one !== undefined ? [one] : [...this.env.services].reverse().map((s) => s.name);
+    const ok = await this.command(op, steps, "stop", one, this.compose("stop", ...names));
+    return ok ? { status: "succeeded" } : { status: "failed", error: `stop ${names.join(", ")} failed (held anyway)` };
   }
 
   /** Restart every service that has a container, in start order; held and crash-looping ones are skipped. */
@@ -743,7 +847,7 @@ export class EnvironmentController {
         continue;
       }
       const restarted = await this.start(op, steps, name, "restart");
-      if (!restarted.ok) {
+      if (!restarted.ok && !restarted.held) {
         this.skipRest(op, steps, services.slice(i + 1), `not restarted: ${name} did not become healthy`);
         return { status: "failed", error: restarted.error };
       }
@@ -752,27 +856,28 @@ export class EnvironmentController {
   }
 
   private async restartService(op: Operation, steps: OperationStep[], name: string): Promise<Outcome> {
-    const hold = this.ctx.store.getHold(this.ctx.project, this.env.name, name);
-    if (hold) {
-      this.skip(op, steps, name, `held: ${hold.reason}`);
-      return { status: "failed", error: `service ${name} is held (${hold.reason})` };
-    }
     const current = (await this.read()).find((s) => s.name === name);
     if (!current || current.containers.length === 0) {
       this.skip(op, steps, name, "no container: nothing to restart (use Up)");
       return { status: "failed", error: `service ${name} has no container to restart` };
     }
-    this.clearCrashLoop(op, steps, name);
-    const restarted = await this.start(op, steps, name, "restart");
+    const cleared = this.clearCrashLoop(op, steps, name);
+    const restarted = await this.start(op, steps, name, cleared ? "recreate" : "restart");
     return restarted.ok ? { status: "succeeded" } : { status: "failed", error: restarted.error };
   }
 
-  /** Re-read the environment until the service is healthy, or `timeoutMs` has passed. */
-  private async waitHealthy(name: string, timeoutMs: number): Promise<{ ok: boolean; detail: string }> {
+  /**
+   * Re-read the environment until the service is healthy, or `timeoutMs` has
+   * passed. Ends early when the service gets held (a human stopped it) or
+   * Lair is stopping.
+   */
+  private async waitHealthy(name: string, timeoutMs: number): Promise<Waited> {
     const clock = this.ctx.probes.clock;
     const start = clock.now();
     const deadline = start + timeoutMs;
     for (;;) {
+      const hold = this.holdOf(name);
+      if (hold) return { ok: false, held: true, detail: `held by a human while waiting (${hold.reason})` };
       let detail: string;
       try {
         const status = (await this.read()).find((s) => s.name === name);
@@ -796,14 +901,14 @@ export class EnvironmentController {
    * Deploy services in start order: tag the image each one runs, build, roll
    * it, wait for it to be healthy, and roll back to the tagged image when it
    * isn't within deploy.health_timeout_minutes. A service that isn't deployed
-   * stops the deploy (the later ones may need it).
+   * stops the deploy (the later ones may need it). Held services are skipped.
    */
   private async deploy(op: Operation, steps: OperationStep[]): Promise<Outcome> {
-    const { store, project } = this.ctx;
+    const { project } = this.ctx;
     const auto = op.requestedBy === "auto";
     const prepare = this.env.deploy.prepareCmd;
     if (auto && prepare) {
-      const built = fillPrepare(prepare, {
+      const built = fill("deploy.prepare_cmd", prepare, {
         sha: op.sha ?? "",
         ref: this.env.deploy.ref,
         environment: this.env.name,
@@ -813,7 +918,7 @@ export class EnvironmentController {
         this.record(op, steps, { action: "prepare", status: "failed", detail: built.error });
         return { status: "failed", error: built.error };
       }
-      if (!(await this.command(op, steps, "prepare", undefined, built.argv, this.ctx.settings.buildTimeoutSeconds))) {
+      if (!(await this.command(op, steps, "prepare", undefined, built.argv, { timeoutSeconds: this.ctx.settings.buildTimeoutSeconds }))) {
         return { status: "failed", error: "deploy.prepare_cmd failed" };
       }
     }
@@ -822,7 +927,7 @@ export class EnvironmentController {
     for (let i = 0; i < targets.length; i++) {
       const name = targets[i].name;
       const status = current.find((s) => s.name === name);
-      const hold = store.getHold(project, this.env.name, name);
+      const hold = this.holdOf(name);
       if (hold) {
         this.skip(op, steps, name, `held: ${hold.reason}`);
         continue;
@@ -840,7 +945,7 @@ export class EnvironmentController {
       } else {
         this.clearCrashLoop(op, steps, name);
       }
-      const result = await this.deployService(op, steps, name, status);
+      const result = await this.deployService(op, steps, name, status, current);
       if (result.status !== "succeeded") {
         this.skipRest(op, steps, targets.slice(i + 1), `not deployed: ${name} was not`);
         return result;
@@ -854,9 +959,10 @@ export class EnvironmentController {
     steps: OperationStep[],
     name: string,
     status: ServiceStatus | undefined,
+    current: ServiceStatus[],
   ): Promise<Outcome> {
     const primary = status?.containers[0];
-    let previous: { ref: string; tag: string } | null = null;
+    let previous: Previous | null = null;
     if (primary) {
       const ref = primary.imageRef ?? "";
       const id = primary.imageId ?? "";
@@ -866,8 +972,18 @@ export class EnvironmentController {
         this.record(op, steps, { action: "tag", service: name, status: "failed", detail });
         return { status: "failed", error: detail };
       }
+      // A rollback re-tags the image reference: with two services on one
+      // image it would move the other service's image too
+      const sharing = current
+        .filter((s) => s.name !== name)
+        .find((s) => s.containers.some((c) => c.imageRef !== undefined && imageRepository(c.imageRef) === repository));
+      if (sharing) {
+        const detail = `services ${name} and ${sharing.name} share the image ${repository}: a rollback of one would move the other's image too, so Lair doesn't deploy it`;
+        this.record(op, steps, { action: "tag", service: name, status: "failed", detail });
+        return { status: "failed", error: detail };
+      }
       const tag = `${repository}:${PREVIOUS_TAG}`;
-      if (!(await this.command(op, steps, "tag", name, this.docker("tag", id, tag)))) {
+      if (!(await this.command(op, steps, "tag", name, this.docker("tag", id, tag), { ref }))) {
         return { status: "failed", error: `could not tag the previous image of ${name}` };
       }
       previous = { ref, tag };
@@ -880,16 +996,34 @@ export class EnvironmentController {
       });
     }
 
-    if (!(await this.command(op, steps, "build", name, this.compose("build", name), this.ctx.settings.buildTimeoutSeconds))) {
+    if (
+      !(await this.command(op, steps, "build", name, this.compose("build", name), {
+        timeoutSeconds: this.ctx.settings.buildTimeoutSeconds,
+      }))
+    ) {
       return { status: "failed", error: `build of ${name} failed; the running container was not touched` };
+    }
+    // Held during the build: don't start it; point its image back so a later Up starts the known one
+    const heldNow = this.holdOf(name);
+    if (heldNow) {
+      return previous
+        ? this.rollback(op, steps, name, previous, `held by a human during the deploy (${heldNow.reason})`)
+        : { status: "failed", error: `${name} was held during the deploy and has no previous image to point back at` };
     }
     const rolled = await this.command(op, steps, "roll", name, this.compose("up", "-d", "--no-deps", "--no-build", name));
     let why: string;
     if (rolled) {
-      const timeout = this.env.deploy.healthTimeoutMinutes * 60000;
-      const wait = await this.waitHealthy(name, timeout);
-      this.record(op, steps, { action: "wait", service: name, status: wait.ok ? "succeeded" : "failed", detail: wait.detail });
-      if (wait.ok) return { status: "succeeded" };
+      const wait = await this.waitHealthy(name, this.env.deploy.healthTimeoutMinutes * 60000);
+      this.record(op, steps, {
+        action: "wait",
+        service: name,
+        status: wait.ok ? "succeeded" : wait.held ? "skipped" : "failed",
+        detail: wait.detail,
+      });
+      if (wait.ok) {
+        if (op.sha) this.ctx.store.setDeployedSha(this.ctx.project, this.env.name, name, op.sha);
+        return { status: "succeeded" };
+      }
       why = wait.detail;
     } else {
       why = "the new container did not start";
@@ -900,16 +1034,19 @@ export class EnvironmentController {
     return this.rollback(op, steps, name, previous, why);
   }
 
-  /** Point the image reference back at the tagged previous image and recreate the container. */
-  private async rollback(
-    op: Operation,
-    steps: OperationStep[],
-    name: string,
-    previous: { ref: string; tag: string },
-    why: string,
-  ): Promise<Outcome> {
-    if (!(await this.command(op, steps, "rollback", name, this.docker("tag", previous.tag, previous.ref)))) {
+  /**
+   * Point the image reference back at the tagged previous image and recreate
+   * the container. A held service is only re-tagged, never started: it gets
+   * the previous image when the human starts it again.
+   */
+  private async rollback(op: Operation, steps: OperationStep[], name: string, previous: Previous, why: string): Promise<Outcome> {
+    if (!(await this.command(op, steps, "rollback", name, this.docker("tag", previous.tag, previous.ref), { ref: previous.ref }))) {
       return { status: "failed", error: `${name}: ${why}; rollback failed: could not re-tag ${previous.tag}` };
+    }
+    const hold = this.holdOf(name);
+    if (hold) {
+      this.skip(op, steps, name, `held (${hold.reason}): not recreated; it starts on ${previous.tag}'s image when it is started again`);
+      return { status: "rolled_back", error: `${name}: ${why}; its image points back at ${previous.tag}, not started (held)` };
     }
     if (
       !(await this.command(
@@ -923,19 +1060,101 @@ export class EnvironmentController {
       return { status: "failed", error: `${name}: ${why}; rollback failed: the previous image did not start` };
     }
     const wait = await this.waitHealthy(name, this.env.startTimeoutSeconds * 1000);
-    this.record(op, steps, { action: "wait", service: name, status: wait.ok ? "succeeded" : "failed", detail: wait.detail });
-    return wait.ok
+    this.record(op, steps, {
+      action: "wait",
+      service: name,
+      status: wait.ok ? "succeeded" : wait.held ? "skipped" : "failed",
+      detail: wait.detail,
+    });
+    return wait.ok || wait.held
       ? { status: "rolled_back", error: `${name}: ${why}; rolled back to ${previous.tag}` }
       : { status: "failed", error: `${name}: ${why}; rolled back, but the previous image is not healthy either (${wait.detail})` };
+  }
+
+  // ============ AFTER A RESTART ============
+
+  /**
+   * A deploy cut off by a stop may have left a service built (its image
+   * reference moved) or rolled, but never seen healthy. On the next start,
+   * each such service is rolled back to the image tagged before the build,
+   * as a recorded `recover` operation; the next merge deploys it again (it
+   * is behind). One interrupted deploy per tick.
+   */
+  async recoverInterrupted(): Promise<void> {
+    if (this.readOnly || this.current) return;
+    const { store, project } = this.ctx;
+    for (const op of store.interruptedDeploys(project, this.env.name)) {
+      const unverified = this.unverified(op);
+      if (unverified.length === 0) {
+        store.markRecovered(op.id, "nothing to recover");
+        continue;
+      }
+      const steps: OperationStep[] = [];
+      const recovery = store.createOperation({
+        project,
+        environment: this.env.name,
+        kind: "recover",
+        services: unverified.map((u) => u.service),
+        requestedBy: "auto",
+        reason: `deploy ${op.id} was interrupted`,
+        sha: op.sha,
+        status: "running",
+        startedAt: this.iso(),
+        steps,
+      });
+      this.launch(recovery, steps, {
+        perform: async () => {
+          const outcome = await this.recover(recovery, steps, unverified);
+          store.markRecovered(op.id, recovery.id);
+          return outcome;
+        },
+      });
+      return;
+    }
+  }
+
+  /** The services an interrupted deploy built or rolled without a healthy wait after. */
+  private unverified(op: Operation): { service: string; previous: Previous | null }[] {
+    const out: { service: string; previous: Previous | null }[] = [];
+    for (const service of this.env.services) {
+      const mine = op.steps.filter((s) => s.service === service.name);
+      const built = mine.some((s) => (s.action === "build" || s.action === "roll") && s.status !== "skipped");
+      const last = mine[mine.length - 1];
+      if (!built || (last?.action === "wait" && last.status === "succeeded")) continue;
+      const tag = mine.find((s) => s.action === "tag" && s.status === "succeeded" && s.argv && s.ref);
+      out.push({
+        service: service.name,
+        previous: tag?.argv && tag.ref ? { ref: tag.ref, tag: tag.argv[tag.argv.length - 1] } : null,
+      });
+    }
+    return out;
+  }
+
+  private async recover(op: Operation, steps: OperationStep[], services: { service: string; previous: Previous | null }[]): Promise<Outcome> {
+    let rolledBack = false;
+    for (const { service, previous } of services) {
+      if (!previous) {
+        this.skip(op, steps, service, "the interrupted deploy tagged no previous image: nothing to roll back to");
+        continue;
+      }
+      const result = await this.rollback(op, steps, service, previous, "the deploy was interrupted before it was verified");
+      if (result.status === "failed") return result;
+      rolledBack = true;
+    }
+    return rolledBack
+      ? { status: "rolled_back", error: `rolled back what the interrupted deploy left unverified: ${services.map((s) => s.service).join(", ")}` }
+      : { status: "succeeded" };
   }
 
   // ============ AFTER A MERGE ============
 
   /**
-   * With deploy.auto: when deploy.ref points at a new commit, deploy the
-   * services whose paths it changed. The first commit seen is taken as what
-   * runs now. Each commit is tried once; a deploy that rolls back waits for
-   * the next merge.
+   * With deploy.auto: when deploy.ref points at a new commit, deploy every
+   * service with paths that changed since the commit it was last deployed
+   * at (a service a rollback left behind comes again). The first commit seen
+   * is taken as what runs now. The commit is marked seen only once its
+   * deploy has started, or nothing needed deploying: a failed git diff, or a
+   * human operation in the way, leaves it for the next tick.
    */
   async checkMerge(): Promise<void> {
     const deploy = this.env.deploy;
@@ -950,35 +1169,64 @@ export class EnvironmentController {
     this.autoDeployBlocked = null;
     if (this.current) return; // the next tick looks again
     const { store, project } = this.ctx;
+    const env = this.env.name;
+    if (deploy.fetchCmd) {
+      const fetched = await this.run(deploy.fetchCmd, this.ctx.settings.buildTimeoutSeconds);
+      if (fetched.code !== 0) {
+        throw new Error(`deploy.fetch_cmd exited ${fetched.code}: ${redact(fetched.stderr.trim().slice(0, 200))}`);
+      }
+    }
     const repo = deploy.repo ?? this.ctx.config.repo;
     const rev = await this.run(["git", "-C", repo, "rev-parse", "--verify", "--quiet", `${deploy.ref}^{commit}`]);
     const sha = rev.stdout.trim();
     if (rev.code !== 0 || !COMMIT.test(sha)) {
-      throw new Error(`git rev-parse ${deploy.ref} exited ${rev.code}: ${rev.stderr.trim().slice(0, 200)}`);
+      throw new Error(`git rev-parse ${deploy.ref} exited ${rev.code}: ${redact(rev.stderr.trim().slice(0, 200))}`);
     }
-    const seen = store.seenSha(project, this.env.name);
+    const deployable = this.env.services.filter((s) => s.build && s.paths.length > 0);
+    const seen = store.seenSha(project, env);
+    if (seen === null) {
+      store.setSeenSha(project, env, sha, this.iso());
+      for (const s of deployable) {
+        if (store.serviceShas(project, env, s.name).deployedSha === null) store.setDeployedSha(project, env, s.name, sha);
+      }
+      return;
+    }
     if (seen === sha) return;
-    store.setSeenSha(project, this.env.name, sha, this.iso());
-    if (seen === null) return;
-    const diff = await this.run(["git", "-C", repo, "diff", "--name-only", seen, sha]);
-    if (diff.code !== 0) {
-      throw new Error(`git diff ${seen.slice(0, 12)} ${sha.slice(0, 12)} exited ${diff.code}: ${diff.stderr.trim().slice(0, 200)}`);
+    const baseOf = (s: ServiceSettings) => store.serviceShas(project, env, s.name).deployedSha ?? seen;
+    const filesSince = new Map<string, string[]>();
+    for (const s of deployable) {
+      const base = baseOf(s);
+      if (filesSince.has(base) || !COMMIT.test(base)) continue;
+      const diff = await this.run(["git", "-C", repo, "diff", "--name-only", base, sha]);
+      if (diff.code !== 0) {
+        throw new Error(`git diff ${base.slice(0, 12)} ${sha.slice(0, 12)} exited ${diff.code}: ${redact(diff.stderr.trim().slice(0, 200))}`);
+      }
+      filesSince.set(
+        base,
+        diff.stdout
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((line) => line !== ""),
+      );
     }
-    const files = diff.stdout
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line !== "");
-    const changed = this.env.services.filter(
-      (s) => s.build && s.paths.some((path) => files.some((file) => pathMatches(path, file))),
+    const changed = deployable.filter((s) =>
+      s.paths.some((path) => (filesSince.get(baseOf(s)) ?? []).some((file) => pathMatches(path, file))),
     );
-    if (changed.length === 0) return;
+    if (changed.length === 0) {
+      store.setSeenSha(project, env, sha, this.iso());
+      return;
+    }
+    if (this.current) return; // a human operation started while git ran: the next tick tries again
     const result = this.request({ kind: "deploy", services: changed.map((s) => s.name), by: "auto", sha });
-    if (!result.ok) throw new Error(`deploy of ${sha.slice(0, 12)} not started: ${result.error}`);
+    if (!result.ok) throw new Error(`deploy of ${sha.slice(0, 12)} not started (tried again next tick): ${result.error}`);
+    store.setSeenSha(project, env, sha, this.iso());
+    for (const s of changed) store.setTargetSha(project, env, s.name, sha);
   }
 
-  /** One tick: read (sampling restart counts), then look for a merge. */
+  /** One tick: read (sampling restart counts), recover an interrupted deploy, then look for a merge. */
   async tick(): Promise<void> {
     await this.read({ sample: true, logs: true });
+    await this.recoverInterrupted();
     await this.checkMerge();
   }
 }

@@ -11,8 +11,12 @@
  * crash_loop playbook picks it up.
  */
 
-/** What the status shows for a service. */
-export const SERVICE_STATES = ["running", "stopped", "unhealthy", "restarting"] as const;
+/**
+ * What the status shows for a service. unknown: the environment could not be
+ * read (docker missing, the daemon down, ...) or has not been read yet; Up,
+ * Restart and Deploy wait until it can be read.
+ */
+export const SERVICE_STATES = ["running", "stopped", "unhealthy", "restarting", "unknown"] as const;
 export type ServiceState = (typeof SERVICE_STATES)[number];
 
 /**
@@ -86,10 +90,20 @@ export interface ServiceStatus {
   lastErrorLines: string[];
   /** Has build: true, so a deploy can rebuild it */
   buildable: boolean;
+  /** The commit an automatic deploy last deployed this service at, or null */
+  deployedSha: string | null;
+  /**
+   * A merge changed this service, and it is not deployed at that merge yet
+   * (it was rolled back, skipped or not reached): the next automatic deploy
+   * includes it
+   */
+  behind: boolean;
 }
 
-export type OperationKind = "up" | "down" | "restart" | "deploy" | "release";
-export type OperationStatus = "running" | "succeeded" | "failed" | "rolled_back";
+/** recover: after a restart, rolls back what an interrupted deploy left unverified */
+export type OperationKind = "up" | "down" | "restart" | "deploy" | "release" | "recover";
+/** interrupted: cut off by a stop of Lair (a deploy is then recovered on the next start) */
+export type OperationStatus = "running" | "succeeded" | "failed" | "rolled_back" | "interrupted";
 export type RequestedBy = "human" | "auto";
 
 export interface OperationStep {
@@ -102,6 +116,8 @@ export interface OperationStep {
   code?: number;
   output?: string;
   detail?: string;
+  /** tag steps of a deploy: the image reference the service runs, which a rollback points back */
+  ref?: string;
 }
 
 /** One Up, Down, Restart, Deploy or Release, with every command it ran. */
@@ -121,6 +137,8 @@ export interface Operation {
   completedAt?: string;
   steps: OperationStep[];
   error?: string;
+  /** An interrupted deploy: the recover operation that checked it (or "nothing to recover") */
+  recoveredBy?: string;
 }
 
 export interface EnvironmentStatus {

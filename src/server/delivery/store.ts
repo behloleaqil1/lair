@@ -1,7 +1,8 @@
 /**
- * Delivery store: holds, crash loops, restart samples, operations and the
- * last commit seen per environment. SQLite (data/delivery.db), so a hold, a
- * crash loop and the operation history survive a restart.
+ * Delivery store: holds, crash loops, restart samples, operations, the last
+ * commit seen per environment, the commit each service was deployed at, and
+ * the last container names read for each service. SQLite (data/delivery.db),
+ * so a hold, a crash loop and the operation history survive a restart.
  *
  * Times are written from the delivery Clock, never SQLite's datetime(), so
  * tests with a fake clock get exact values.
@@ -71,7 +72,8 @@ const SCHEMA = `
     started_at TEXT NOT NULL,
     completed_at TEXT,
     steps TEXT NOT NULL,
-    error TEXT
+    error TEXT,
+    recovered_by TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_delivery_operations
     ON delivery_operations(project, environment, started_at);
@@ -82,6 +84,23 @@ const SCHEMA = `
     sha TEXT NOT NULL,
     seen_at TEXT NOT NULL,
     PRIMARY KEY (project, environment)
+  );
+
+  CREATE TABLE IF NOT EXISTS delivery_service_shas (
+    project TEXT NOT NULL,
+    environment TEXT NOT NULL,
+    service TEXT NOT NULL,
+    deployed_sha TEXT,
+    target_sha TEXT,
+    PRIMARY KEY (project, environment, service)
+  );
+
+  CREATE TABLE IF NOT EXISTS delivery_containers (
+    project TEXT NOT NULL,
+    environment TEXT NOT NULL,
+    service TEXT NOT NULL,
+    names TEXT NOT NULL,
+    PRIMARY KEY (project, environment, service)
   );
 `;
 
@@ -121,6 +140,7 @@ interface OperationRow {
   completed_at: string | null;
   steps: string;
   error: string | null;
+  recovered_by: string | null;
 }
 
 export class DeliveryStore {
@@ -346,16 +366,81 @@ export class DeliveryStore {
 
   /**
    * Operations still marked running when the server starts were cut off by a
-   * stop or a crash: mark them failed.
+   * stop or a crash: mark them interrupted (a deploy is then recovered).
    */
   failInterrupted(project: string, at: string): number {
     return this.db
       .prepare(
-        `UPDATE delivery_operations SET status = 'failed', completed_at = ?,
+        `UPDATE delivery_operations SET status = 'interrupted', completed_at = ?,
            error = 'interrupted: the server stopped before it finished'
          WHERE project = ? AND status = 'running'`,
       )
       .run(at, project).changes;
+  }
+
+  /** Interrupted deploys of an environment that no recover operation has checked yet, oldest first. */
+  interruptedDeploys(project: string, environment: string): Operation[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM delivery_operations
+         WHERE project = ? AND environment = ? AND kind = 'deploy' AND status = 'interrupted' AND recovered_by IS NULL
+         ORDER BY started_at, rowid`,
+      )
+      .all(project, environment) as OperationRow[];
+    return rows.map(toOperation);
+  }
+
+  markRecovered(id: string, by: string): void {
+    this.db.prepare(`UPDATE delivery_operations SET recovered_by = ? WHERE id = ?`).run(by, id);
+  }
+
+  // ============ COMMITS PER SERVICE ============
+
+  /** The commit a service was last deployed at, and the last merge that changed it. */
+  serviceShas(project: string, environment: string, service: string): { deployedSha: string | null; targetSha: string | null } {
+    const row = this.db
+      .prepare(
+        `SELECT deployed_sha, target_sha FROM delivery_service_shas WHERE project = ? AND environment = ? AND service = ?`,
+      )
+      .get(project, environment, service) as { deployed_sha: string | null; target_sha: string | null } | undefined;
+    return { deployedSha: row?.deployed_sha ?? null, targetSha: row?.target_sha ?? null };
+  }
+
+  setDeployedSha(project: string, environment: string, service: string, sha: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO delivery_service_shas (project, environment, service, deployed_sha) VALUES (?, ?, ?, ?)
+         ON CONFLICT(project, environment, service) DO UPDATE SET deployed_sha = excluded.deployed_sha`,
+      )
+      .run(project, environment, service, sha);
+  }
+
+  setTargetSha(project: string, environment: string, service: string, sha: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO delivery_service_shas (project, environment, service, target_sha) VALUES (?, ?, ?, ?)
+         ON CONFLICT(project, environment, service) DO UPDATE SET target_sha = excluded.target_sha`,
+      )
+      .run(project, environment, service, sha);
+  }
+
+  // ============ CONTAINER NAMES ============
+
+  /** The container names last read for a service, so a hold is matched to them after a restart. */
+  setContainerNames(project: string, environment: string, service: string, names: string[]): void {
+    this.db
+      .prepare(
+        `INSERT INTO delivery_containers (project, environment, service, names) VALUES (?, ?, ?, ?)
+         ON CONFLICT(project, environment, service) DO UPDATE SET names = excluded.names`,
+      )
+      .run(project, environment, service, JSON.stringify(names));
+  }
+
+  containerNames(project: string, environment: string, service: string): string[] {
+    const row = this.db
+      .prepare(`SELECT names FROM delivery_containers WHERE project = ? AND environment = ? AND service = ?`)
+      .get(project, environment, service) as { names: string } | undefined;
+    return row ? (JSON.parse(row.names) as string[]) : [];
   }
 
   // ============ REFS ============
@@ -419,5 +504,6 @@ function toOperation(row: OperationRow): Operation {
     completedAt: row.completed_at ?? undefined,
     steps: JSON.parse(row.steps) as OperationStep[],
     error: row.error ?? undefined,
+    recoveredBy: row.recovered_by ?? undefined,
   };
 }

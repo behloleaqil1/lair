@@ -112,8 +112,17 @@ describe("delivery over HTTP: Up -> status -> Down", () => {
   it("brings the environment up and down through the routes", async () => {
     const { app, docker } = await build();
 
+    // GET status never runs docker: before the first tick nothing is known
+    const unread = await status(app);
+    expect(unread).toMatchObject({ project: PROJECT, enabled: true, readOnly: false });
+    expect(unread.environments[0].services.map((s) => [s.name, s.state, s.healthDetail])).toEqual([
+      ["db", "unknown", "not read yet"],
+      ["api", "unknown", "not read yet"],
+    ]);
+    expect(docker.calls).toEqual([]);
+
+    await manager!.get(PROJECT)!.tick();
     const before = await status(app);
-    expect(before).toMatchObject({ project: PROJECT, enabled: true, readOnly: false });
     expect(before.environments[0].services.map((s) => [s.name, s.state, s.healthDetail])).toEqual([
       ["db", "stopped", "no container"],
       ["api", "stopped", "no container"],
@@ -143,7 +152,7 @@ describe("delivery over HTTP: Up -> status -> Down", () => {
     const down = await post(app, "down", { confirmed: true, reason: "end of day" });
     expect(down.statusCode).toBe(202);
     expect((await finished(app, down.json().data.id)).status).toBe("succeeded");
-    expect(docker.mutations().slice(2)).toEqual([C("down")]);
+    expect(docker.mutations().slice(2)).toEqual([C("stop", "api", "db")]);
 
     const after = await status(app);
     expect(after.environments[0].services.map((s) => [s.name, s.state, s.held?.source, s.held?.reason])).toEqual([
