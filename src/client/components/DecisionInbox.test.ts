@@ -96,7 +96,8 @@ describe("DecisionCardView", () => {
     });
     const empty = card({ decision: credentials });
     expect(empty).toContain('type="password"');
-    expect(empty).toContain('autocomplete="new-password"');
+    // HTML attribute names are case-insensitive; React 18 renders this one as autoComplete
+    expect(empty).toMatch(/autocomplete="new-password"/i);
     expect(empty).not.toMatch(/type="password"[^>]*value=/);
     expect(empty).toContain("GIT_HOST_TOKEN");
     expect(empty).toContain('title="Enter the secret first"');
