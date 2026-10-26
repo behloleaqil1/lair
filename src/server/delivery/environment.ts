@@ -157,6 +157,8 @@ export class EnvironmentController {
   private snapshot: { at: number; services: ServiceStatus[] } | null = null;
   private readError: string | null = null;
   /** Reads are numbered; an older read never overwrites a newer one's result */
+  /** A commit to try once more although it was seen: its deploy was interrupted and recovered */
+  private retrySha: string | null = null;
   private readSeq = 0;
   private appliedSeq = 0;
   private current: { operation: Operation; done: Promise<void> } | null = null;
@@ -780,7 +782,17 @@ export class EnvironmentController {
       status: wait.ok ? "succeeded" : wait.held ? "skipped" : "failed",
       detail: wait.detail,
     });
+    if (wait.held) await this.stopHeld(op, steps, name);
     return wait.ok ? { ok: true } : { ok: false, held: wait.held === true, error: `${name}: ${wait.detail}` };
+  }
+
+  /**
+   * A Down that lands while Lair is starting the service races that start:
+   * its stop can run before the container is up. So when a wait ends because
+   * the service got held, stop it again: a held service never stays running.
+   */
+  private async stopHeld(op: Operation, steps: OperationStep[], name: string): Promise<void> {
+    await this.command(op, steps, "stop", name, this.compose("stop", name));
   }
 
   /** Start every service in start order, each healthy before the next; held and crash-looping ones are skipped. */
@@ -1021,9 +1033,13 @@ export class EnvironmentController {
         detail: wait.detail,
       });
       if (wait.ok) {
-        if (op.sha) this.ctx.store.setDeployedSha(this.ctx.project, this.env.name, name, op.sha);
+        // A deploy by hand counts as deployed at the latest commit Lair has seen
+        const { store, project } = this.ctx;
+        const sha = op.sha ?? store.seenSha(project, this.env.name);
+        if (sha) store.setDeployedSha(project, this.env.name, name, sha);
         return { status: "succeeded" };
       }
+      if (wait.held) await this.stopHeld(op, steps, name);
       why = wait.detail;
     } else {
       why = "the new container did not start";
@@ -1066,6 +1082,7 @@ export class EnvironmentController {
       status: wait.ok ? "succeeded" : wait.held ? "skipped" : "failed",
       detail: wait.detail,
     });
+    if (wait.held) await this.stopHeld(op, steps, name);
     return wait.ok || wait.held
       ? { status: "rolled_back", error: `${name}: ${why}; rolled back to ${previous.tag}` }
       : { status: "failed", error: `${name}: ${why}; rolled back, but the previous image is not healthy either (${wait.detail})` };
@@ -1077,8 +1094,9 @@ export class EnvironmentController {
    * A deploy cut off by a stop may have left a service built (its image
    * reference moved) or rolled, but never seen healthy. On the next start,
    * each such service is rolled back to the image tagged before the build,
-   * as a recorded `recover` operation; the next merge deploys it again (it
-   * is behind). One interrupted deploy per tick.
+   * as a recorded `recover` operation. The commit is then tried once more on
+   * the next tick (the rolled-back services are behind); after that, the next
+   * merge brings them. One interrupted deploy per tick.
    */
   async recoverInterrupted(): Promise<void> {
     if (this.readOnly || this.current) return;
@@ -1106,6 +1124,7 @@ export class EnvironmentController {
         perform: async () => {
           const outcome = await this.recover(recovery, steps, unverified);
           store.markRecovered(op.id, recovery.id);
+          if (op.sha) this.retrySha = op.sha;
           return outcome;
         },
       });
@@ -1113,14 +1132,20 @@ export class EnvironmentController {
     }
   }
 
-  /** The services an interrupted deploy built or rolled without a healthy wait after. */
+  /**
+   * The services an interrupted deploy left unverified: their build finished
+   * (the image reference moved) or their roll started, and no healthy wait
+   * followed. A build that was killed or failed, with no roll, left the
+   * service on its old image: nothing to recover.
+   */
   private unverified(op: Operation): { service: string; previous: Previous | null }[] {
     const out: { service: string; previous: Previous | null }[] = [];
     for (const service of this.env.services) {
       const mine = op.steps.filter((s) => s.service === service.name);
-      const built = mine.some((s) => (s.action === "build" || s.action === "roll") && s.status !== "skipped");
-      const last = mine[mine.length - 1];
-      if (!built || (last?.action === "wait" && last.status === "succeeded")) continue;
+      const built = mine.some((s) => s.action === "build" && s.status === "succeeded");
+      const rolled = mine.some((s) => s.action === "roll" && s.status !== "skipped");
+      const verified = mine.some((s, i) => s.action === "wait" && s.status === "succeeded" && i === mine.length - 1);
+      if ((!built && !rolled) || verified) continue;
       const tag = mine.find((s) => s.action === "tag" && s.status === "succeeded" && s.argv && s.ref);
       out.push({
         service: service.name,
@@ -1154,7 +1179,8 @@ export class EnvironmentController {
    * at (a service a rollback left behind comes again). The first commit seen
    * is taken as what runs now. The commit is marked seen only once its
    * deploy has started, or nothing needed deploying: a failed git diff, or a
-   * human operation in the way, leaves it for the next tick.
+   * human operation in the way, leaves it for the next tick. A commit whose
+   * deploy was interrupted and recovered is tried once more.
    */
   async checkMerge(): Promise<void> {
     const deploy = this.env.deploy;
@@ -1171,7 +1197,8 @@ export class EnvironmentController {
     const { store, project } = this.ctx;
     const env = this.env.name;
     if (deploy.fetchCmd) {
-      const fetched = await this.run(deploy.fetchCmd, this.ctx.settings.buildTimeoutSeconds);
+      // command_timeout_seconds: ticks are serial, so a hung fetch must not hold up every environment for long
+      const fetched = await this.run(deploy.fetchCmd);
       if (fetched.code !== 0) {
         throw new Error(`deploy.fetch_cmd exited ${fetched.code}: ${redact(fetched.stderr.trim().slice(0, 200))}`);
       }
@@ -1191,7 +1218,7 @@ export class EnvironmentController {
       }
       return;
     }
-    if (seen === sha) return;
+    if (seen === sha && this.retrySha !== sha) return;
     const baseOf = (s: ServiceSettings) => store.serviceShas(project, env, s.name).deployedSha ?? seen;
     const filesSince = new Map<string, string[]>();
     for (const s of deployable) {
@@ -1213,12 +1240,14 @@ export class EnvironmentController {
       s.paths.some((path) => (filesSince.get(baseOf(s)) ?? []).some((file) => pathMatches(path, file))),
     );
     if (changed.length === 0) {
+      this.retrySha = null;
       store.setSeenSha(project, env, sha, this.iso());
       return;
     }
     if (this.current) return; // a human operation started while git ran: the next tick tries again
     const result = this.request({ kind: "deploy", services: changed.map((s) => s.name), by: "auto", sha });
     if (!result.ok) throw new Error(`deploy of ${sha.slice(0, 12)} not started (tried again next tick): ${result.error}`);
+    this.retrySha = null;
     store.setSeenSha(project, env, sha, this.iso());
     for (const s of changed) store.setTargetSha(project, env, s.name, sha);
   }

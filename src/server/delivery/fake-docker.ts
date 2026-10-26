@@ -86,7 +86,7 @@ export class FakeDocker implements CommandRunner {
   hangBuilds = false;
   /** The options each command was run with */
   options: (RunOptions | undefined)[] = [];
-  private delays: { match: (argv: string[]) => boolean; gate: Promise<void> }[] = [];
+  private delays: { match: (argv: string[]) => boolean; gate: Promise<void>; onRelease: boolean }[] = [];
 
   constructor(
     readonly project: string,
@@ -164,15 +164,17 @@ export class FakeDocker implements CommandRunner {
 
   /**
    * The next command `match` accepts answers only after the returned release
-   * is called. Its answer is worked out when it is called, as a real command
-   * would have read the state then.
+   * is called. By default its answer is worked out when it is called, as a
+   * read would have seen the state then. With `effect: "on release"` the
+   * command does what it does (start a container, ...) only at release, like
+   * a slow `docker compose up` that finishes after another command ran.
    */
-  delay(match: (argv: string[]) => boolean): () => void {
+  delay(match: (argv: string[]) => boolean, options: { effect?: "on call" | "on release" } = {}): () => void {
     let release: () => void = () => undefined;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    this.delays.push({ match, gate });
+    this.delays.push({ match, gate, onRelease: options.effect === "on release" });
     return release;
   }
 
@@ -180,15 +182,18 @@ export class FakeDocker implements CommandRunner {
     this.calls.push([...argv]);
     this.options.push(options);
     this.onRun?.(argv);
-    const answer = this.answer(argv, options);
     const delayed = this.delays.findIndex((d) => d.match(argv));
     if (delayed >= 0) {
-      const [{ gate }] = this.delays.splice(delayed, 1);
-      const result = await answer;
+      const [{ gate, onRelease }] = this.delays.splice(delayed, 1);
+      if (onRelease) {
+        await gate;
+        return this.answer(argv, options);
+      }
+      const result = await this.answer(argv, options);
       await gate;
       return result;
     }
-    return answer;
+    return this.answer(argv, options);
   }
 
   private answer(argv: string[], options?: RunOptions): CommandOutput | Promise<CommandOutput> {

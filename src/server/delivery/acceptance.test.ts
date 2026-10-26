@@ -752,6 +752,9 @@ describe("merges are never lost, and a service left behind comes again", () => {
       FETCH,
       ["git", "-C", "/home/user/shop", "rev-parse", "--verify", "--quiet", "origin/main^{commit}"],
     ]);
+    // command_timeout_seconds (300), not build_timeout_seconds: ticks are serial
+    const fetch = h.docker.calls.findIndex((a) => a[3] === "fetch");
+    expect(h.docker.options[fetch]?.timeoutMs).toBe(300_000);
   });
 });
 
@@ -799,7 +802,15 @@ describe("stops, interrupted deploys and a human taking over", () => {
     expect(second.store.getOperation(interrupted.id)!.recoveredBy).toBe(recovery.id);
     expect(await service(second, "api")).toMatchObject({ behind: true });
 
-    // checked once
+    // the commit is tried once more on the next tick (the build works this time)
+    second.docker.calls = [];
+    await second.delivery.tick();
+    await second.delivery.idle();
+    expect(second.store.listOperations("shop")[0]).toMatchObject({ kind: "deploy", sha: SHA2, services: ["api"], status: "succeeded" });
+    expect(second.docker.mutations()).toContainEqual(C("build", "api"));
+    expect(await service(second, "api")).toMatchObject({ deployedSha: SHA2, behind: false });
+
+    // and only once: recovery and retry are done
     second.docker.calls = [];
     await second.delivery.tick();
     await second.delivery.idle();
@@ -819,6 +830,15 @@ describe("stops, interrupted deploys and a human taking over", () => {
     expect(h.docker.options[build]?.signal?.aborted).toBe(true);
     expect(h.store.getOperation(op.id)).toMatchObject({ status: "interrupted" });
     expect(h.docker.mutations().some((a) => a.includes("--no-build"))).toBe(false);
+
+    // the killed build left api on its old image: nothing to recover after a restart
+    const again = setup({ deploy: { auto: false } }, { store: h.store, docker: h.docker });
+    h.docker.calls = [];
+    await again.delivery.tick();
+    await again.delivery.idle();
+    expect(h.docker.mutations()).toEqual([]);
+    expect(h.store.getOperation(op.id)!.recoveredBy).toBe("nothing to recover");
+    expect(h.store.listOperations("shop").map((o) => o.kind)).toEqual(["deploy"]);
   });
 
   it("a Down during a deploy holds and stops the service at once, and the rollback doesn't start it again", async () => {
@@ -945,5 +965,60 @@ describe("deploy edge cases", () => {
       "container orders-api is service api of delivery environment local, held by a human: debugging",
     );
     expect(second.delivery.heldReason("shop-local-db-1")).toBeNull();
+  });
+});
+
+describe("a Down racing a start never leaves the held service running", () => {
+  const same = (a: string[], b: string[]) => a.join(" ") === b.join(" ");
+
+  it("a Down that lands while the deploy's roll is starting the service stops it again", async () => {
+    const h = setup();
+    await mergedTo(h, ["api/src/orders.ts"]);
+    const ROLL = C("up", "-d", "--no-deps", "--no-build", "api");
+    // the roll's `up` starts the container only when released: after the Down's stop
+    const release = h.docker.delay((a) => same(a, ROLL), { effect: "on release" });
+    await h.delivery.tick();
+    await until(() => h.docker.calls.some((a) => same(a, ROLL)));
+
+    expect(h.env.request({ kind: "down", service: "api", by: "human", reason: "now" }).ok).toBe(true);
+    await until(() => h.docker.calls.some((a) => same(a, C("stop", "api"))));
+    expect(h.docker.container("api")!.state).toBe("exited");
+    release();
+    await h.delivery.idle();
+
+    expect(h.docker.container("api")!.state).toBe("exited");
+    const deploy = h.store.listOperations("shop").find((o) => o.kind === "deploy")!;
+    expect(deploy.steps.filter((s) => s.action === "stop").map((s) => s.argv)).toEqual([C("stop", "api")]);
+  });
+
+  it("a Down that lands while an Up is starting the service stops it again, and the Up goes on", async () => {
+    const h = setup({ deploy: { auto: false } });
+    const release = h.docker.delay((a) => same(a, UP("api")), { effect: "on release" });
+    started(h.env.request({ kind: "up", by: "human" }));
+    await until(() => h.docker.calls.some((a) => same(a, UP("api"))));
+
+    expect(h.env.request({ kind: "down", service: "api", by: "human", reason: "now" }).ok).toBe(true);
+    await until(() => h.docker.calls.some((a) => same(a, C("stop", "api"))));
+    release();
+    await h.env.idle();
+
+    expect(h.docker.container("api")!.state).toBe("exited");
+    expect(h.docker.container("web")!.state).toBe("running");
+  });
+});
+
+describe("a deploy by hand", () => {
+  it("counts as deployed at the latest commit seen, so a service it fixed is no longer behind", async () => {
+    const h = setup({ deploy: { auto: true, ref: "main", health_timeout_minutes: 1 } });
+    await mergedTo(h, ["api/src/orders.ts"]);
+    h.docker.nextBuild.api = "broken";
+    await h.delivery.tick();
+    await h.delivery.idle();
+    expect(await service(h, "api")).toMatchObject({ deployedSha: SHA1, behind: true });
+
+    const op = await run(h, { kind: "deploy", service: "api", by: "human" });
+
+    expect(op.status).toBe("succeeded");
+    expect(await service(h, "api")).toMatchObject({ deployedSha: SHA2, behind: false });
   });
 });
