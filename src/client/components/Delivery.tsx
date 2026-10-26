@@ -35,6 +35,7 @@ const STATE_BADGE: Record<ServiceState, string> = {
   stopped: "badge-neutral",
   unhealthy: "badge-error",
   restarting: "badge-warning",
+  unknown: "badge-neutral",
 };
 
 const OPERATION_BADGE: Record<OperationStatus, string> = {
@@ -42,6 +43,7 @@ const OPERATION_BADGE: Record<OperationStatus, string> = {
   succeeded: "badge-success",
   failed: "badge-error",
   rolled_back: "badge-warning",
+  interrupted: "badge-warning",
 };
 
 const ACTION_LABEL: Record<DeliveryAction, string> = {
@@ -75,7 +77,7 @@ function warning(p: Pending): string {
     case "down":
       return p.service
         ? `Stops ${p.service} and holds it: Lair won't start it (not on Up, not on a deploy, not from the watchdog) until you release it.`
-        : `Takes every service of ${p.environment} down (docker compose down) and holds them until the next environment Up.`;
+        : `Stops every configured service of ${p.environment} and holds them until the next environment Up. Services of the compose project that Lair doesn't manage are left alone.`;
     case "restart":
       return p.service
         ? `Restarts ${p.service} and waits for it to be healthy. A crash loop mark on it is cleared.`
@@ -187,16 +189,19 @@ function ConfirmDialog({
 function ServiceRow({
   service,
   busy,
+  unreadable,
   readOnly,
   onAction,
 }: {
   service: ServiceStatus;
   busy: boolean;
+  /** The environment can't be read, or wasn't yet: Up, Restart and Deploy wait */
+  unreadable: boolean;
   readOnly: boolean;
   onAction: (action: DeliveryAction) => void;
 }) {
   const held = service.held !== null;
-  const locked = busy || readOnly;
+  const locked = busy || readOnly || unreadable;
   return (
     <tr>
       <td>
@@ -214,6 +219,11 @@ function ServiceRow({
             crash loop
           </span>
         )}
+        {service.behind && (
+          <span className="badge badge-warning" style={{ marginLeft: "0.25rem" }}>
+            behind
+          </span>
+        )}
       </td>
       <td style={muted}>
         {service.healthDetail}
@@ -226,6 +236,13 @@ function ServiceRow({
           <div>
             {service.crashLoop.restarts} restarts in {service.crashLoop.windowMinutes} min since{" "}
             {time(service.crashLoop.since)}: Lair stopped restarting it
+          </div>
+        )}
+        {service.behind && (
+          <div>
+            Not deployed at the latest merge
+            {service.deployedSha ? ` (runs ${service.deployedSha.slice(0, 12)})` : ""}: the next automatic deploy
+            includes it
           </div>
         )}
         {service.lastErrorLines.length > 0 && (
@@ -247,7 +264,8 @@ function ServiceRow({
             disabled={locked || held || service.containers.length === 0}
             onClick={() => onAction("restart")}
           />
-          <ActionButton action="down" disabled={locked} onClick={() => onAction("down")} />
+          {/* Down works during another operation and without a read: it holds, then stops what it can */}
+          <ActionButton action="down" disabled={readOnly} onClick={() => onAction("down")} />
           {service.buildable && (
             <ActionButton action="deploy" disabled={locked || held} onClick={() => onAction("deploy")} />
           )}
@@ -267,7 +285,8 @@ function EnvironmentCard({
   onAction: (p: Pending) => void;
 }) {
   const busy = env.operation !== null;
-  const locked = busy || readOnly;
+  const unreadable = env.error !== null || env.checkedAt === null;
+  const locked = busy || readOnly || unreadable;
   return (
     <div className="card">
       <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" }}>
@@ -279,7 +298,7 @@ function EnvironmentCard({
             <ActionButton
               key={action}
               action={action}
-              disabled={locked}
+              disabled={action === "down" ? readOnly : locked}
               onClick={() => onAction({ environment: env.environment, action })}
             />
           ))}
@@ -287,8 +306,11 @@ function EnvironmentCard({
       </div>
       {env.error && (
         <div className="error" style={{ marginTop: "0.75rem" }}>
-          {env.error}
+          Can't read the environment, so its state is unknown and Up, Restart and Deploy wait: {env.error}
         </div>
+      )}
+      {!env.error && env.checkedAt === null && (
+        <p style={{ ...muted, marginTop: "0.75rem" }}>Not read yet: Lair reads it every interval_seconds.</p>
       )}
       {env.operation && (
         <p style={{ ...muted, marginTop: "0.75rem" }}>
@@ -320,6 +342,7 @@ function EnvironmentCard({
               key={service.name}
               service={service}
               busy={busy}
+              unreadable={unreadable}
               readOnly={readOnly}
               onAction={(action) => onAction({ environment: env.environment, service: service.name, action })}
             />

@@ -464,23 +464,33 @@ Read-only routes. `?project=` defaults to the default project:
 
 > Off by default. With `enabled: true` Lair reads your environments' status, and runs Up, Down, Restart and Deploy when you ask from the Delivery view. It deploys on its own only with `deploy.auto: true`.
 
-Delivery ([design](design/autonomy.md#7-delivery-module-delivery-platformmd-milestone-m4-brought-forward-for-environment-1)) manages a project's **environments**. An environment is a docker compose project, such as the developer's own running stack. Every `interval_seconds` Lair reads each service's containers (`docker compose ps`, `docker inspect`) and its health check, and shows them in the Delivery view: state (`running`, `stopped`, `unhealthy` or `restarting`), health, restart count and the last error lines of its log. From the view you can bring the whole environment, or one service, up, down or restart it. Down, Restart and Deploy ask for confirmation first, and Down asks for a reason.
+Delivery ([design](design/autonomy.md#7-delivery-module-delivery-platformmd-milestone-m4-brought-forward-for-environment-1)) manages a project's **environments**. An environment is a docker compose project, such as the developer's own running stack. Every `interval_seconds` Lair reads each configured service's containers (`docker compose ps`, `docker inspect`) and its health check, and shows them in the Delivery view: state (`running`, `stopped`, `unhealthy`, `restarting` or `unknown`), health, restart count and the last error lines of its log. From the view you can bring the whole environment, or one service, up, down or restart it. Down, Restart and Deploy ask for confirmation first, and Down asks for a reason.
+
+Lair shows and acts on the services you list under `services` only. Other services of the same compose project are left alone: no command names them, an environment Down doesn't stop them, and an Up doesn't start them (every start uses `--no-deps`).
 
 What Lair does, and what it never does on its own:
 
-- **Up** starts the services in `start_order`, one at a time, and waits for each one to be healthy before the next (`start_timeout_seconds`). If a service doesn't become healthy, the services after it are not started. Every start uses `--no-deps`, so Compose never starts a service as another one's dependency.
-- **Held services.** A service you take **Down** is *held*, with your reason. Lair never starts a held service: an environment Up skips it, a deploy skips it, and the watchdog leaves its container alone. It stays held, across restarts of Lair (the hold is stored in `data/delivery.db`), until you **Release** it. An environment Down (`docker compose down`) holds every service, and the next environment Up releases those holds again. A service you took down on its own stays held.
-- **Crash loops.** A service whose restart count (Docker's restart policy restarting it) rises by `crash_loop.max_restarts` or more within `crash_loop.window_minutes` is marked *crash-looping*, with its last error lines. Lair then stops restarting it: an environment Up or Restart and an automatic deploy skip it. When you Up, Restart or Deploy that service on its own, the mark is cleared. The mark also clears itself after a whole window with no restarts, while the service runs healthy. The watchdog's `crash_loop` detector reports these marks as breaches, so its `crash_loop` playbook stops Docker's own restarts (`watchdog.actions.stop_container_restarts`) or escalates them to your inbox, with the error lines as evidence (see [Watchdog](#watchdog)).
-- **Deploy after a merge** (`deploy.auto: true`). When `deploy.ref` points at a new commit, Lair diffs the commit against the previous one (`git diff --name-only`) and deploys every service with `build: true` whose `paths` the diff changed. The first commit Lair sees is taken as what already runs. Each commit is tried once. For each service, in start order, Lair:
+- **Unknown state.** When the environment can't be read (the docker CLI is missing, the daemon is down, `docker compose ps` fails), every service shows as `unknown` with the error, never a guessed `stopped` or the last `running`. Up, Restart and Deploy then answer `409` until a read succeeds; Down still works, because holding is always safe. The status route never runs docker itself: it shows the latest read, and `not read yet` before the first one.
+- **Up** starts the services in `start_order`, one at a time, and waits for each one to be healthy before the next (`start_timeout_seconds`). If a service doesn't become healthy, the services after it are not started.
+- **Held services.** A service you take **Down** is *held*, with your reason. Lair never starts a held service: an environment Up skips it, a deploy skips it, and the watchdog leaves its container alone. It stays held, across restarts of Lair (the hold is stored in `data/delivery.db`), until you **Release** it. An environment Down stops every configured service (`docker compose stop`, never `docker compose down`, so containers and unmanaged services stay) and holds them; the next environment Up releases those holds again. A service you took down on its own stays held. Down works even while another operation runs (a build, a health wait): the service is held at once and stopped, and that operation re-checks holds before each command, so it never starts or recreates the service again.
+- **Crash loops.** A service whose restart count (Docker's restart policy restarting it) rises by `crash_loop.max_restarts` or more within `crash_loop.window_minutes` is marked *crash-looping*, with its last error lines. Lair then stops restarting it: an environment Up or Restart and an automatic deploy skip it. When you Up, Restart or Deploy that service on its own, the mark is cleared, and Up and Restart recreate the container (`--force-recreate`), so it gets the compose file's settings back, including a restart policy the watchdog's playbook set to `no`. The mark also clears itself after a whole window with no restarts, while the service runs healthy. The watchdog's `crash_loop` detector reports these marks as breaches, so its `crash_loop` playbook stops Docker's own restarts (`watchdog.actions.stop_container_restarts`) or escalates them to your inbox, with the error lines as evidence (see [Watchdog](#watchdog)).
+- **Deploy after a merge** (`deploy.auto: true`). Lair never fetches on its own: `deploy.ref` moves when something updates it. To follow a remote branch, set `ref: origin/main` and a `fetch_cmd` that fetches it; Lair runs `fetch_cmd` on every tick, then reads `ref`. When `ref` points at a new commit, Lair diffs it (`git diff --name-only`) against the commit each service was last deployed at, and deploys every service with `build: true` whose `paths` changed. The first commit Lair sees is taken as what already runs. A commit is marked seen only once its deploy has started, or when no service needs it; a failed `git diff`, or an operation of yours in the way, leaves it for the next tick. For each service, in start order, Lair:
   1. tags the image the service runs now as `<image>:lair-previous`;
   2. rebuilds the image (`docker compose build <service>`);
   3. rolls the service (`docker compose up -d --no-deps --no-build <service>`);
   4. waits up to `deploy.health_timeout_minutes` for it to be healthy;
-  5. if it isn't healthy in time, points the image back at `lair-previous` and recreates the container (`--force-recreate`), which is a **rollback**. The services after it are not deployed.
+  5. if it isn't healthy in time, points the image back at `lair-previous` and recreates the container (`--force-recreate`), which is a **rollback**. The services after it are not deployed. A service held meanwhile is only re-tagged, not started.
 
-  A failed build changes nothing that runs. An automatic deploy never starts a service that isn't running, and skips held and crash-looping services. The Deploy button on a service runs the same steps by hand. On a `read_only: true` project there are no actions at all, by hand or automatic.
+  A failed build changes nothing that runs. An automatic deploy never starts a service that isn't running, and skips held and crash-looping services. A service that was rolled back, skipped or not reached shows as **behind**, and the next automatic deploy includes it again, even when the next merge doesn't touch it. The Deploy button on a service, or on the environment (which skips held services), runs the same steps by hand. On a `read_only: true` project there are no actions at all, by hand or automatic.
+- **A stop of Lair** kills the commands in progress (a build included) instead of waiting for them, and marks the operation `interrupted`. When Lair starts again, a deploy that was interrupted after it built or rolled a service, but before it saw the service healthy, is rolled back to `lair-previous` in a recorded `recover` operation; the service is then behind and comes again with the next merge.
 
-Every command is an argv array (no shell), built from this config only. The environment and service names in a request must be configured ones: a request only picks one of them.
+Every command is an argv array (no shell), built from this config only. The environment and service names in a request must be configured ones: a request only picks one of them. Before anything is stored or shown, credentials are redacted from commands, their output and log lines: `scheme://user:password@` URLs, common token shapes (GitHub, GitLab, Slack, Stripe, AWS, `Bearer ...`) and `password=`, `token: ...`-style values.
+
+Known limits:
+
+- A deploy assumes each service has an image of its own. A service whose image repository another configured service also runs is refused (a rollback re-tags the repository, which would move the other service's image too).
+- Each deployed image repository keeps one extra tag, `<image>:lair-previous`, overwritten by the next deploy. Lair doesn't prune images.
+- A hold is matched to a container by the names Lair last read for the service (kept in the store), so a custom `container_name` works after a restart too. A service never read is matched by Compose's default name, `<project>-<service>-<n>`.
 
 ```yaml
 delivery:
@@ -504,7 +514,10 @@ delivery:
       crash_loop: { max_restarts: 3, window_minutes: 10 }
       deploy:
         auto: true
-        ref: main
+        # Lair never fetches: fetch_cmd moves origin/main, then Lair reads it
+        ref: origin/main
+        fetch_cmd: ["git", "-C", "/home/user/shop", "fetch", "--quiet", "origin", "main"]
+        # Bring the working tree the images are built from to the new commit
         prepare_cmd: ["git", "-C", "/home/user/shop", "merge", "--ff-only", "{sha}"]
         health_timeout_minutes: 5
 ```
@@ -517,7 +530,7 @@ delivery:
 | `interval_seconds` | number | `30` | Seconds between reads (and restart-count samples) |
 | `docker_cmd` | array | `["docker"]` | The container CLI. Lair runs `<docker_cmd> compose ...`, `<docker_cmd> inspect` and `<docker_cmd> tag` |
 | `command_timeout_seconds` | number | `300` | Timeout for each command except builds |
-| `build_timeout_seconds` | number | `1800` | Timeout for `docker compose build` and `prepare_cmd` |
+| `build_timeout_seconds` | number | `1800` | Timeout for `docker compose build`, `fetch_cmd` and `prepare_cmd` |
 | `environments` | map | `{}` | Environment name (letters, digits, `_` and `-`, starting with a letter) to its settings, below |
 
 ### Environment options
@@ -527,14 +540,15 @@ delivery:
 | `compose_files` | array | required | Compose files, passed as `-f <file>` each. Relative paths resolve against Lair's working directory |
 | `project_name` | string | required | The compose project name (`-p`): lowercase letters, digits, `-` and `_`. Containers are found by it, so use the name the stack already runs under |
 | `project_directory` | string | — | Passed as `--project-directory` |
-| `services` | map | required | Service name to its settings, below. Only these services are shown and managed |
-| `start_order` | array | the order of `services` | Services Up and Restart start first, in this order. Services not listed follow, in the order of `services` |
+| `services` | map | required | Service name to its settings, below. Lair shows and acts on these services only; other services of the compose project are left alone |
+| `start_order` | array | the order of `services` | Services Up and Restart start first, in this order. Services not listed follow, in the order of `services`. An environment Down stops them in reverse |
 | `start_timeout_seconds` | number | `120` | How long Up, Restart and a rollback wait for each service to be healthy |
 | `crash_loop.max_restarts` | number | `3` | Restarts within the window that mark a crash loop |
 | `crash_loop.window_minutes` | number | `10` | The window |
 | `deploy.auto` | boolean | `false` | Deploy changed services when `ref` moves |
 | `deploy.repo` | string | the project's `repo` | The repository to watch |
-| `deploy.ref` | string | `main` | The branch or ref to watch |
+| `deploy.ref` | string | `main` | The branch or ref to watch, e.g. `origin/main` with a `fetch_cmd` |
+| `deploy.fetch_cmd` | array | — | Runs on every tick before `ref` is read. Lair itself never fetches |
 | `deploy.prepare_cmd` | array | — | Runs before an automatic deploy builds anything, for example to update the working tree the images are built from. Placeholders: `{sha}` (the new commit), `{ref}`, `{environment}`, `{project}` |
 | `deploy.health_timeout_minutes` | number | `5` | Roll back a deployed service that isn't healthy within this many minutes |
 
@@ -550,15 +564,15 @@ Unknown keys, unsafe names, a value that starts with `-`, a `start_order` entry 
 
 ### Delivery API
 
-`?project=` defaults to the default project. Actions answer `202` with the operation, which runs in the background, one at a time per environment (a second one gets `409`). A `read_only` project answers `403`.
+`?project=` defaults to the default project. Actions answer `202` with the operation, which runs in the background, one at a time per environment (a second one gets `409`, except a Down, which runs beside it). A `read_only` project answers `403`.
 
-- `GET /api/delivery/status`: each environment's services (state, health, restart count, containers, hold, crash loop, last error lines), the operation in progress and the automatic deploy state
-- `GET /api/delivery/operations?environment=&limit=50`: operations with every command they ran, its exit code and output
+- `GET /api/delivery/status`: each environment's services (state, health, restart count, containers, hold, crash loop, last error lines, the commit it was deployed at and whether it is behind), the read error if any, the operation in progress and the automatic deploy state. It never runs docker
+- `GET /api/delivery/operations?environment=&limit=50`: operations with every command they ran, its exit code and output (redacted)
 - `GET /api/delivery/operations/:id`
 - `POST /api/delivery/environments/:environment/up|down|restart|deploy`
 - `POST /api/delivery/environments/:environment/services/:service/up|down|restart|deploy|release`
 
-POST bodies are JSON. `down`, `restart` and `deploy` need `"confirm": true`. `down` needs a `"reason"`. An environment `deploy` takes `"services": [...]` (default: every service with `build: true`). Up, Restart and Deploy of a held service, by name, answer `409` until it is released.
+POST bodies are JSON. `down`, `restart` and `deploy` need `"confirm": true`. `down` needs a `"reason"`. An environment `deploy` takes `"services": [...]` (default: every service with `build: true`) and skips held ones. Up, Restart and Deploy of a held service, by name, answer `409` until it is released, and so does any Up, Restart or Deploy while the environment can't be read.
 
 ## Example complete configuration
 

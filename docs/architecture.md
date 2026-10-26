@@ -133,8 +133,9 @@ Environments as docker compose projects ([configuration](configuration.md#delive
 - **`config.ts`**: the validated `delivery:` block (environments, services, health checks, start order, crash-loop window, deploy settings)
 - **`compose.ts`**: argv builders and the parsers for `docker compose ps --format json` and `docker inspect`
 - **`probes.ts`**: the system boundary: the watchdog's `CommandRunner` and `Clock`, and `HttpProbe` for HTTP health checks
-- **`environment.ts`**: one environment: status reads, restart-count sampling and crash-loop marks, Up / Down / Restart / Deploy / Release as recorded operations, rollback, and the deploy after a merge
-- **`store.ts`**: holds, crash loops, restart samples, operations and the last commit seen in SQLite (`data/delivery.db`)
+- **`environment.ts`**: one environment: status reads (`unknown` when docker can't be read), restart-count sampling and crash-loop marks, Up / Down / Restart / Deploy / Release as recorded operations (a Down may run beside another one), rollback, the deploy after a merge, and the recovery of a deploy interrupted by a stop
+- **`redact.ts`**: removes credentials from commands, output and log lines before they are stored or shown
+- **`store.ts`**: holds, crash loops, restart samples, operations, the last commit seen, the commit each service was deployed at, and the last container names read, in SQLite (`data/delivery.db`)
 - **`service.ts`**, **`routes.ts`**: the per-project tick loop started and stopped by `index.ts`, the `ContainerServices` view the watchdog reads (crash loops and holds), and the `/api/delivery/*` routes
 
 #### Store (`store/`)
