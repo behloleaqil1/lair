@@ -19,7 +19,7 @@ import type { AnswerInput, WithdrawInput } from "./types.js";
 /** An error with the HTTP status the routes answer with. */
 export class DecisionError extends Error {
   constructor(
-    readonly statusCode: 400 | 403 | 404 | 409 | 503,
+    readonly statusCode: 400 | 403 | 404 | 409 | 429 | 503,
     message: string,
   ) {
     super(message);
@@ -228,7 +228,6 @@ const AnswerSchema = z
       .optional(),
     confirm: z.boolean().optional(),
     secret: z.string().min(1).max(10000).optional(),
-    by: oneLine(100).optional(),
   })
   .strict();
 

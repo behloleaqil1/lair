@@ -123,6 +123,11 @@ export interface ListOptions {
   limit?: number;
 }
 
+export type RaiseOutcome =
+  | { kind: "created" | "existing"; decision: Decision; addedBlocks: string[] }
+  /** The module already has the maximum number of open decisions in the project */
+  | { kind: "capped"; open: number };
+
 export interface Closing {
   status: Exclude<DecisionStatus, "open">;
   at: string;
@@ -161,10 +166,12 @@ export class DecisionStore {
 
   /**
    * Insert a decision, or return the open one with the same project, module
-   * and key (merging in any new blocked refs). Atomic.
+   * and key (merging in any new blocked refs). A new one is refused
+   * ("capped") while the module already has `maxOpen` open decisions in the
+   * project. Atomic.
    */
-  raise(input: ValidRaise, at: string): { decision: Decision; created: boolean; addedBlocks: string[] } {
-    return this.db.transaction(() => {
+  raise(input: ValidRaise, at: string, maxOpen = Number.POSITIVE_INFINITY): RaiseOutcome {
+    return this.db.transaction((): RaiseOutcome => {
       const existing = this.db
         .prepare(
           `SELECT id FROM decisions WHERE project = ? AND source_module = ? AND dedupe_key = ? AND status = 'open'`,
@@ -174,8 +181,12 @@ export class DecisionStore {
         const known = new Set(this.blocksOf(existing.id));
         const added = input.blocks.filter((ref) => !known.has(ref));
         this.addBlocks(existing.id, added);
-        return { decision: this.get(existing.id)!, created: false, addedBlocks: added };
+        return { kind: "existing", decision: this.get(existing.id)!, addedBlocks: added };
       }
+      const { open } = this.db
+        .prepare(`SELECT COUNT(*) AS open FROM decisions WHERE project = ? AND source_module = ? AND status = 'open'`)
+        .get(input.project, input.source.module) as { open: number };
+      if (open >= maxOpen) return { kind: "capped", open };
       const id = randomUUID();
       this.db
         .prepare(
@@ -204,7 +215,7 @@ export class DecisionStore {
           input.expiresAt ?? null,
         );
       this.addBlocks(id, input.blocks);
-      return { decision: this.get(id)!, created: true, addedBlocks: input.blocks };
+      return { kind: "created", decision: this.get(id)!, addedBlocks: input.blocks };
     })();
   }
 
@@ -311,6 +322,22 @@ export class DecisionStore {
         id,
       );
     return result.changes > 0;
+  }
+
+  /**
+   * Undo an answer that could not be completed (its secret store failed):
+   * open again, only if it is still that answer and not yet delivered.
+   */
+  reopenDecision(id: string, answeredAt: string): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE decisions SET status = 'open', closed_at = NULL, answer_option = NULL, answer_note = NULL,
+             answer_secret_supplied = 0, answered_by = NULL, answered_at = NULL
+           WHERE id = ? AND status = 'answered' AND answered_at = ? AND delivered_at IS NULL`,
+        )
+        .run(id, answeredAt).changes > 0
+    );
   }
 
   /** Answered or expired decisions not yet delivered to their producer. */

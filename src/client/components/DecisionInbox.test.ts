@@ -44,6 +44,7 @@ function card(overrides: Partial<DecisionCardViewProps> = {}): string {
       secretStore: "server memory only",
       stage: "choose",
       hasSecret: false,
+      canAnswer: true,
       submitting: false,
       error: null,
       onChoose: noop,
@@ -102,10 +103,42 @@ describe("DecisionCardView", () => {
     expect(empty).toContain("GIT_HOST_TOKEN");
     expect(empty).toContain('title="Enter the secret first"');
     expect(card({ decision: credentials, hasSecret: true })).not.toContain('title="Enter the secret first"');
+    // No note field: a secret could end up in it
+    expect(empty).not.toContain("<textarea");
+    expect(card()).toContain("<textarea");
+  });
+
+  it("disables every option until answering is unlocked in this browser", () => {
+    const locked = card({ canAnswer: false });
+    expect(locked.match(/title="Unlock answering first"/g)).toHaveLength(2);
+    expect(locked.match(/<button type="button" disabled=""/g)).toHaveLength(2);
+    expect(card()).not.toContain("Unlock answering first");
   });
 });
 
 describe("DecisionInboxView", () => {
+  it("asks for the answer token while answering is locked", () => {
+    const view = (answering: boolean) =>
+      renderToStaticMarkup(
+        createElement(DecisionInboxView, {
+          decisions: [decision()],
+          secretStore: "x",
+          now: NOW,
+          answering,
+          onUnlock: async () => undefined,
+          onAnswered: noop,
+        }),
+      );
+    const locked = view(false);
+    expect(locked).toContain('data-unlock="answering"');
+    expect(locked).toContain("data/decisions.answer-token");
+    expect(locked).toContain('name="answer-token"');
+    expect(locked).toContain("Unlock answering first");
+    const unlocked = view(true);
+    expect(unlocked).not.toContain('data-unlock="answering"');
+    expect(unlocked).not.toContain("Unlock answering first");
+  });
+
   it("lists open decisions as cards and closed ones with their outcome, never a secret", () => {
     const html = renderToStaticMarkup(
       createElement(DecisionInboxView, {
@@ -127,6 +160,8 @@ describe("DecisionInboxView", () => {
         ],
         secretStore: "server memory only",
         now: NOW,
+        answering: true,
+        onUnlock: async () => undefined,
         onAnswered: noop,
       }),
     );
@@ -138,7 +173,14 @@ describe("DecisionInboxView", () => {
 
   it("says so when nothing needs you", () => {
     const html = renderToStaticMarkup(
-      createElement(DecisionInboxView, { decisions: [], secretStore: "x", now: NOW, onAnswered: noop }),
+      createElement(DecisionInboxView, {
+        decisions: [],
+        secretStore: "x",
+        now: NOW,
+        answering: true,
+        onUnlock: async () => undefined,
+        onAnswered: noop,
+      }),
     );
     expect(html).toContain("Nothing needs you right now.");
   });

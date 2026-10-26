@@ -12,7 +12,7 @@ import {
 import { DataService, isSafeGateId } from "./services/data.js";
 import { isValidDragonId } from "./parsers/dragon-config.js";
 import { registerRootGuards, requireValidIdParam } from "./root-guards.js";
-import { mountDecisions } from "./decisions/index.js";
+import { dashboardUrlFor, mountDecisions } from "./decisions/index.js";
 import { registerControlRoutes } from "./routes/controls.js";
 import { registerBusRoutes } from "./routes/bus.js";
 import { registerProcessRoutes } from "./routes/processes.js";
@@ -361,9 +361,12 @@ await registerPipelineRoutes(fastify, pipelines, () => getDefaultProject());
 
 // Decision Inbox: the one place Lair asks the human (data/decisions.db). The
 // watchdog's escalations become decisions, and their answers resume it.
-// Closed by fastify.close() in shutdown().
+// Answering needs the token in data/decisions.answer-token (a setup link is
+// printed at first start). Closed by fastify.close() in shutdown().
 await mountDecisions(fastify, {
   dbPath: join(process.cwd(), "data", "decisions.db"),
+  answerTokenPath: join(process.cwd(), "data", "decisions.answer-token"),
+  dashboardUrl: dashboardUrlFor(HOST, PORT),
   defaultProject: () => getDefaultProject(),
   events: getEventBus(),
   producers: [watchdogs],

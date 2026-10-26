@@ -5,14 +5,17 @@
  * options with their consequences, and the recommended one.
  *
  * Spend and go/no-go answers go through a confirmation step. A credentials
- * decision has a password field: the value goes to the server's secret
- * store with the answer and is never shown again (the API has none to give).
+ * decision has a password field and no note: the value goes to the server's
+ * secret store with the answer and is never shown again (the API has none to
+ * give). Answering works only once this browser holds the answer session
+ * (UnlockAnswering, or the setup link the nav badge picks up).
  */
 import { useEffect, useRef, useState } from "react";
 import type { Decision, DecisionAuditEntry, DecisionCounts, DecisionOption } from "../../shared/decision-types";
 import {
   KIND_LABELS,
   answerBody,
+  answerSession,
   confirmationText,
   decisionSummary,
   expiryText,
@@ -21,6 +24,8 @@ import {
   needsConfirmation,
   outcomeText,
   postAnswer,
+  startAnswerSession,
+  tokenFromHash,
   type DecisionSummary,
 } from "../decisions-api";
 
@@ -87,6 +92,8 @@ export interface DecisionCardViewProps {
   pending?: DecisionOption;
   /** A secret has been typed (enables the option that supplies it) */
   hasSecret: boolean;
+  /** Answering is unlocked in this browser */
+  canAnswer: boolean;
   submitting: boolean;
   error: string | null;
   onChoose: (option: DecisionOption) => void;
@@ -158,13 +165,16 @@ export function DecisionCardView(p: DecisionCardViewProps) {
           />
         </label>
       )}
-      <textarea
-        placeholder="Note (optional)"
-        rows={2}
-        onChange={(e) => p.onNote(e.target.value)}
-        disabled={p.submitting}
-        style={field}
-      />
+      {/* No note on credentials decisions: a secret could end up in it */}
+      {decision.kind !== "credentials" && (
+        <textarea
+          placeholder="Note (optional)"
+          rows={2}
+          onChange={(e) => p.onNote(e.target.value)}
+          disabled={p.submitting}
+          style={field}
+        />
+      )}
 
       {p.stage === "confirm" && p.pending ? (
         <div
@@ -188,13 +198,18 @@ export function DecisionCardView(p: DecisionCardViewProps) {
           {decision.options.map((option) => {
             const isRecommended = option.id === decision.recommended.optionId;
             const needsSecret = option.suppliesSecret === true && !p.hasSecret;
+            const blockedBy = !p.canAnswer
+              ? "Unlock answering first"
+              : needsSecret
+                ? "Enter the secret first"
+                : undefined;
             return (
               <div key={option.id} style={{ display: "flex", gap: "0.75rem", alignItems: "flex-start" }}>
                 <button
                   type="button"
                   onClick={() => p.onChoose(option)}
-                  disabled={p.submitting || needsSecret}
-                  title={needsSecret ? "Enter the secret first" : undefined}
+                  disabled={p.submitting || blockedBy !== undefined}
+                  title={blockedBy}
                   style={isRecommended ? primaryButton : secondaryButton}
                 >
                   {option.label}
@@ -224,11 +239,13 @@ export function DecisionCard({
   decision,
   now,
   secretStore,
+  canAnswer,
   onAnswered,
 }: {
   decision: Decision;
   now: number;
   secretStore: string;
+  canAnswer: boolean;
   onAnswered: () => void;
 }) {
   const [stage, setStage] = useState<CardStage>("choose");
@@ -266,6 +283,7 @@ export function DecisionCard({
       stage={stage}
       pending={pending}
       hasSecret={hasSecret}
+      canAnswer={canAnswer}
       submitting={submitting}
       error={error}
       onChoose={(option) => {
@@ -342,15 +360,72 @@ export function AuditList({ entries }: { entries: DecisionAuditEntry[] }) {
   );
 }
 
+/**
+ * Shown until answering is unlocked in this browser: the token from
+ * data/decisions.answer-token (or the setup link the server printed at its
+ * first start) turns on the answer session cookie.
+ */
+export function UnlockAnswering({ onUnlock }: { onUnlock: (token: string) => Promise<void> }) {
+  const token = useRef("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const unlock = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await onUnlock(token.current);
+      token.current = "";
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not unlock answering");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="card" data-unlock="answering" style={{ borderColor: "var(--warning)" }}>
+      <h3>Unlock answering</h3>
+      <p style={muted}>
+        Only you answer decisions, so answering needs the token Lair keeps in{" "}
+        <code>data/decisions.answer-token</code>. Open the setup link the server printed when it first started, or
+        paste the token here once; this browser then remembers it.
+      </p>
+      <input
+        type="password"
+        autoComplete="off"
+        name="answer-token"
+        placeholder="Answer token"
+        onChange={(e) => {
+          token.current = e.target.value;
+        }}
+        disabled={busy}
+        style={field}
+      />
+      <button type="button" onClick={() => void unlock()} disabled={busy} style={{ ...primaryButton, marginTop: "0.5rem" }}>
+        {busy ? "Unlocking..." : "Unlock answering"}
+      </button>
+      {error && (
+        <div className="error" style={{ marginTop: "0.5rem" }}>
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function DecisionInboxView({
   decisions,
   secretStore,
   now,
+  answering,
+  onUnlock,
   onAnswered,
 }: {
   decisions: Decision[];
   secretStore: string;
   now: number;
+  /** Answering is unlocked in this browser */
+  answering: boolean;
+  onUnlock: (token: string) => Promise<void>;
   onAnswered: () => void;
 }) {
   const open = decisions.filter((d) => d.status === "open");
@@ -365,6 +440,8 @@ export function DecisionInboxView({
         </span>
       </div>
 
+      {!answering && <UnlockAnswering onUnlock={onUnlock} />}
+
       {open.length === 0 ? (
         <div className="card">
           <p style={muted}>Nothing needs you right now.</p>
@@ -376,6 +453,7 @@ export function DecisionInboxView({
             decision={decision}
             now={now}
             secretStore={secretStore}
+            canAnswer={answering}
             onAnswered={onAnswered}
           />
         ))
@@ -422,16 +500,18 @@ export function DecisionInboxView({
 export function DecisionInbox({ refreshKey }: Props) {
   const [decisions, setDecisions] = useState<Decision[] | null>(null);
   const [summary, setSummary] = useState<DecisionSummary | null>(null);
+  const [answering, setAnswering] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([listDecisions(), decisionSummary()])
-      .then(([list, counts]) => {
+    Promise.all([listDecisions(), decisionSummary(), answerSession()])
+      .then(([list, counts, session]) => {
         if (cancelled) return;
         setDecisions(list);
         setSummary(counts);
+        setAnswering(session.answering);
         setError(null);
       })
       .catch((e: unknown) => {
@@ -451,6 +531,11 @@ export function DecisionInbox({ refreshKey }: Props) {
         decisions={decisions}
         secretStore={summary?.secretStore ?? "the server's secret store"}
         now={Date.now()}
+        answering={answering}
+        onUnlock={async (token) => {
+          await startAnswerSession(token);
+          setReload((n) => n + 1);
+        }}
         onAnswered={() => setReload((n) => n + 1)}
       />
     </>
@@ -471,8 +556,21 @@ export function DecisionCountBadge({ open, overdue }: DecisionCounts) {
   );
 }
 
+/**
+ * The nav badge. It is on every page, so it also takes the setup link's
+ * token (`#answer-token=...`): it unlocks answering and removes the token
+ * from the address bar and the history.
+ */
 export function DecisionsBadge({ refreshKey }: { refreshKey: number }) {
   const [counts, setCounts] = useState<DecisionCounts | null>(null);
+
+  useEffect(() => {
+    const token = tokenFromHash(window.location.hash);
+    if (!token) return;
+    window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    startAnswerSession(token).catch((e: unknown) => console.warn("Could not unlock answering:", e));
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     decisionSummary()

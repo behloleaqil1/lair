@@ -45,7 +45,8 @@ export function answerBody(decision: Decision, draft: AnswerDraft): Record<strin
   const option = decision.options.find((o) => o.id === draft.optionId);
   const body: Record<string, unknown> = { optionId: draft.optionId };
   const note = draft.note.trim();
-  if (note) body.note = note;
+  // Credentials decisions take no note: a secret could end up in it
+  if (note && decision.kind !== "credentials") body.note = note;
   if (needsConfirmation(decision.kind)) body.confirm = true;
   if (option?.suppliesSecret && draft.secret) body.secret = draft.secret;
   return body;
@@ -116,10 +117,33 @@ export function getDecision(id: string): Promise<Decision> {
   return fetchData<Decision>(`/api/decisions/${encodeURIComponent(id)}`);
 }
 
+/** Send an answer. The browser adds the answer session cookie (httpOnly) and its Origin. */
 export function postAnswer(id: string, body: Record<string, unknown>): Promise<Decision> {
   return fetchData<Decision>(`/api/decisions/${encodeURIComponent(id)}/answer`, {
     method: "POST",
+    credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+/** Is answering unlocked in this browser? */
+export function answerSession(): Promise<{ answering: boolean }> {
+  return fetchData<{ answering: boolean }>("/api/decisions/session", { credentials: "same-origin" });
+}
+
+/** Unlock answering in this browser with the token from data/decisions.answer-token. */
+export function startAnswerSession(token: string): Promise<{ answering: boolean }> {
+  return fetchData<{ answering: boolean }>("/api/decisions/session", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token: token.trim() }),
+  });
+}
+
+/** The token in a setup link's fragment (`#answer-token=...`), or null. */
+export function tokenFromHash(hash: string): string | null {
+  const match = /^#answer-token=([A-Za-z0-9_-]{32,200})$/.exec(hash);
+  return match ? match[1] : null;
 }

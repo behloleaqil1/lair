@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Decision } from "../shared/decision-types";
-import { answerBody, confirmationText, expiryText, needsConfirmation, outcomeText } from "./decisions-api";
+import { answerBody, confirmationText, expiryText, needsConfirmation, outcomeText, tokenFromHash } from "./decisions-api";
 
 const NOW = Date.parse("2026-03-02T12:00:00.000Z");
 const MIN = 60_000;
@@ -61,6 +61,17 @@ describe("answer rules", () => {
     expect(answerBody(credentials, { optionId: "later", note: "", secret: "typed-value" })).toEqual({
       optionId: "later",
     });
+    // Credentials decisions take no note
+    expect(answerBody(credentials, { optionId: "later", note: "the token is abc" })).toEqual({ optionId: "later" });
+  });
+
+  it("takes the answer token only from a setup link's fragment", () => {
+    const token = "Abc_def-0123456789Abc_def-0123456789Abc_def";
+    expect(tokenFromHash(`#answer-token=${token}`)).toBe(token);
+    expect(tokenFromHash("")).toBeNull();
+    expect(tokenFromHash("#answer-token=short")).toBeNull();
+    expect(tokenFromHash(`#answer-token=${token}&next=/x`)).toBeNull();
+    expect(tokenFromHash(`#other=${token}`)).toBeNull();
   });
 
   it("says what is being confirmed, with the consequences", () => {

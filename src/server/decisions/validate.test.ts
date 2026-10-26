@@ -147,10 +147,12 @@ describe("parseRaiseInput", () => {
 describe("parseAnswerInput and parseWithdrawInput", () => {
   it("accepts an answer and drops an empty note", () => {
     expect(parseAnswerInput({ optionId: "small", note: "  " })).toEqual({ ok: true, value: { optionId: "small" } });
-    expect(parseAnswerInput({ optionId: "small", note: "ok", confirm: true, by: "owner" })).toEqual({
+    expect(parseAnswerInput({ optionId: "small", note: "ok", confirm: true })).toEqual({
       ok: true,
-      value: { optionId: "small", note: "ok", confirm: true, by: "owner" },
+      value: { optionId: "small", note: "ok", confirm: true },
     });
+    // Who answered is decided by the server, never the request
+    expect(parseAnswerInput({ optionId: "small", by: "someone-else" }).ok).toBe(false);
   });
 
   it("rejects unknown keys without repeating their values", () => {

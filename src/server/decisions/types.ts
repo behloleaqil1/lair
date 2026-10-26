@@ -45,6 +45,7 @@ export interface RaiseResult {
 
 export interface AnswerInput {
   optionId: string;
+  /** Not for credentials decisions (a secret could end up in it) */
   note?: string;
   /** Required for the CONFIRM_KINDS (spend, go_no_go) */
   confirm?: boolean;
@@ -53,8 +54,15 @@ export interface AnswerInput {
    * value, handed to the secret store and never kept anywhere else
    */
   secret?: string;
-  /** Who answered (default "owner") */
-  by?: string;
+}
+
+/**
+ * Where an answer came from, for its audit entry. The answerer is always
+ * the owner: the server decides that, never the request.
+ */
+export interface AnswerContext {
+  remoteAddress?: string;
+  userAgent?: string;
 }
 
 export interface WithdrawInput {

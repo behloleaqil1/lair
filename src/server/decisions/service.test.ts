@@ -473,17 +473,25 @@ describe("credentials", () => {
     });
     const { decision } = await inbox.raise(credentials());
 
-    const answered = await inbox.answer(decision.id, { optionId: "supply", secret: SECRET, note: "Read-only scope." });
+    const answered = await inbox.answer(
+      decision.id,
+      { optionId: "supply", secret: SECRET },
+      { remoteAddress: "127.0.0.1", userAgent: "ExampleBrowser/1.0" },
+    );
     expect(await secrets.get("GIT_HOST_TOKEN")).toBe(SECRET);
     expect(answered).toMatchObject({
       status: "answered",
       secretName: "GIT_HOST_TOKEN",
-      answer: { optionId: "supply", secretSupplied: true, note: "Read-only scope." },
+      answer: { optionId: "supply", secretSupplied: true },
+      answeredBy: "owner",
     });
-    expect(answered.audit?.[1].detail).toBe(
-      "chose supply (Enter the token); the secret went to the secret store as GIT_HOST_TOKEN; note: Read-only scope.",
-    );
-    expect(resumed).toMatchObject([{ optionId: "supply", secretSupplied: true }]);
+    expect(answered.audit?.[1]).toMatchObject({
+      action: "answered",
+      actor: "owner",
+      detail:
+        "chose supply (Enter the token); the secret went to the secret store as GIT_HOST_TOKEN; from 127.0.0.1 (ExampleBrowser/1.0)",
+    });
+    expect(resumed).toMatchObject([{ optionId: "supply", secretSupplied: true, by: "owner" }]);
 
     expect(JSON.stringify(answered)).not.toContain(SECRET);
     expect(JSON.stringify(inbox.list())).not.toContain(SECRET);
@@ -495,7 +503,7 @@ describe("credentials", () => {
     }
   });
 
-  it("takes a secret only with an option that supplies it, needs one there, and never in the note", async () => {
+  it("takes a secret only with an option that supplies it, needs one there, and takes no note at all", async () => {
     const secrets = new MemorySecretStore();
     const { inbox } = setup({ secrets });
     const { decision } = await inbox.raise(credentials());
@@ -505,9 +513,11 @@ describe("credentials", () => {
     const extra = await rejection(inbox.answer(decision.id, { optionId: "later", secret: SECRET }));
     expect(extra.message).toBe("secret: only an option that supplies the secret takes a value");
     const inNote = await rejection(
-      inbox.answer(decision.id, { optionId: "supply", secret: SECRET, note: `token is ${SECRET}` }),
+      inbox.answer(decision.id, { optionId: "supply", secret: SECRET, note: `token is ${SECRET.slice(0, 10)} ...` }),
     );
-    expect(inNote.message).toBe("note: must not contain the secret");
+    expect(inNote.message).toBe("note: credentials decisions take no note (a secret could end up in it)");
+    const anyNote = await rejection(inbox.answer(decision.id, { optionId: "later", note: "maybe next week" }));
+    expect(anyNote.statusCode).toBe(400);
     for (const error of [missing, extra, inNote]) expect(error.message).not.toContain(SECRET);
     expect(await secrets.has("GIT_HOST_TOKEN")).toBe(false);
     expect(inbox.get(decision.id)?.status).toBe("open");
@@ -522,7 +532,7 @@ describe("credentials", () => {
     expect(await secrets.has("GIT_HOST_TOKEN")).toBe(false);
   });
 
-  it("leaves the decision open (503) when the secret store can't take the value", async () => {
+  it("reopens the decision (503) when the secret store can't take the value, and delivers nothing", async () => {
     const unavailable: SecretStore = {
       description: "a broker that is down",
       put: async () => {
@@ -531,14 +541,115 @@ describe("credentials", () => {
       has: async () => false,
       get: async () => undefined,
     };
-    const { inbox } = setup({ secrets: unavailable });
+    const { inbox, events } = setup({ secrets: unavailable });
+    const resumed: DecisionResolution[] = [];
+    inbox.onResolved("delivery", (r) => {
+      resumed.push(r);
+    });
     const { decision } = await inbox.raise(credentials());
     const error = await rejection(inbox.answer(decision.id, { optionId: "supply", secret: SECRET }));
     expect(error).toMatchObject({
       statusCode: 503,
       message: "The secret store could not take the secret: the broker is not reachable",
     });
-    expect(inbox.get(decision.id)).toMatchObject({ status: "open" });
-    expect(inbox.get(decision.id)?.audit?.map((a) => a.action)).toEqual(["raised"]);
+    const reopened = inbox.get(decision.id)!;
+    expect(reopened).toMatchObject({ status: "open" });
+    expect(reopened.answer).toBeUndefined();
+    expect(reopened.answeredAt).toBeUndefined();
+    expect(reopened.audit?.map((a) => a.action)).toEqual(["raised"]);
+    await inbox.deliverPending();
+    expect(resumed).toEqual([]);
+    expect(events.map((e) => e.type)).toEqual(["decision.raised"]);
+
+    // Still answerable another way
+    expect((await inbox.answer(decision.id, { optionId: "later" })).status).toBe("answered");
+    expect(resumed.map((r) => r.optionId)).toEqual(["later"]);
+  });
+
+  it("closes the decision before storing the secret: a second answer or a withdrawal loses, and its secret is never stored", async () => {
+    const stored = new Map<string, string>();
+    const puts: string[] = [];
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const gated: SecretStore = {
+      description: "a slow broker",
+      put: async (name, value) => {
+        puts.push(value);
+        await gate;
+        stored.set(name, value);
+      },
+      has: async (name) => stored.has(name),
+      get: async (name) => stored.get(name),
+    };
+    const { inbox } = setup({ secrets: gated });
+    const resumed: DecisionResolution[] = [];
+    inbox.onResolved("delivery", (r) => {
+      resumed.push(r);
+    });
+    const { decision } = await inbox.raise(credentials());
+
+    // The first answer closes the decision and waits on the secret store
+    const first = inbox.answer(decision.id, { optionId: "supply", secret: "first-secret-value-1a2b" });
+    expect(puts).toEqual(["first-secret-value-1a2b"]);
+
+    const second = await rejection(inbox.answer(decision.id, { optionId: "supply", secret: "second-secret-value-3c4d" }));
+    expect(second.statusCode).toBe(409);
+    const withdrawal = await rejection(inbox.withdraw(decision.id, { module: "delivery", reason: "not needed" }));
+    expect(withdrawal.statusCode).toBe(409);
+    // While the secret is being stored, the answer is not delivered
+    await inbox.deliverPending();
+    expect(resumed).toEqual([]);
+
+    release();
+    expect((await first).status).toBe("answered");
+    expect(puts).toEqual(["first-secret-value-1a2b"]);
+    expect(stored.get("GIT_HOST_TOKEN")).toBe("first-secret-value-1a2b");
+    expect(resumed.map((r) => r.optionId)).toEqual(["supply"]);
+  });
+});
+
+describe("limits and origins", () => {
+  it("refuses a new decision with 429 once a module has the maximum open in a project", async () => {
+    const store = new DecisionStore(":memory:");
+    stores.push(store);
+    const inbox = new DecisionInbox({
+      store,
+      secrets: new MemorySecretStore(),
+      clock: new FakeClock(),
+      maxOpenPerSource: 2,
+    });
+    await inbox.raise(other({ key: "a" }));
+    const b = await inbox.raise(other({ key: "b" }));
+    const capped = await rejection(inbox.raise(other({ key: "c" })));
+    expect(capped.statusCode).toBe(429);
+    expect(capped.message).toBe(
+      "planner already has 2 open decisions in demo (the limit is 2): wait for answers or withdraw some first",
+    );
+    // The same key is still the open decision, another project or module has its own count
+    expect(await inbox.raise(other({ key: "a" }))).toMatchObject({ created: false });
+    expect(await inbox.raise(other({ key: "c", project: "shop" }))).toMatchObject({ created: true });
+    expect(await inbox.raise(other({ key: "c", source: { module: "intake", ref: "r" } }))).toMatchObject({
+      created: true,
+    });
+    // An answer frees a place
+    await inbox.answer(b.decision.id, { optionId: "small" });
+    expect(await inbox.raise(other({ key: "c" }))).toMatchObject({ created: true });
+  });
+
+  it("records where an answer came from, and always the owner as who answered", async () => {
+    const { inbox } = setup();
+    const { decision } = await inbox.raise(other());
+    const answered = await inbox.answer(
+      decision.id,
+      { optionId: "large", note: "ok" },
+      { remoteAddress: "::1", userAgent: "Example\u0007Browser" },
+    );
+    expect(answered.answeredBy).toBe("owner");
+    expect(answered.audit?.[1]).toMatchObject({
+      actor: "owner",
+      detail: "chose large (100 rows); note: ok; from ::1 (Example Browser)",
+    });
   });
 });

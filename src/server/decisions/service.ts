@@ -25,6 +25,7 @@ import type { DecisionStore, ListOptions } from "./store.js";
 import { SecretStoreUnavailableError, type SecretStore } from "./secrets.js";
 import { DecisionError, parseAnswerInput, parseRaiseInput, parseWithdrawInput } from "./validate.js";
 import type {
+  AnswerContext,
   AnswerInput,
   Clock,
   DecisionProducer,
@@ -41,14 +42,32 @@ export interface DecisionInboxOptions {
   clock?: Clock;
   /** Seconds between expiry and delivery sweeps once start()ed (default 30) */
   sweepSeconds?: number;
+  /**
+   * Open decisions one module may have in one project; raising more is
+   * refused with 429 (default DEFAULT_MAX_OPEN_PER_SOURCE)
+   */
+  maxOpenPerSource?: number;
 }
 
 /** The actor for what the inbox does itself (defaults, overdue marks, deliveries). */
 const LAIR = "lair";
+/** The only one who answers: the human with the answer session (see answer-auth.ts). */
+const OWNER = "owner";
 const DEFAULT_SWEEP_SECONDS = 30;
+export const DEFAULT_MAX_OPEN_PER_SOURCE = 50;
+const MAX_USER_AGENT = 200;
 
 function message(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/** "from 127.0.0.1 (user agent)" for the audit trail, printable and bounded; "" without either. */
+function describeOrigin(context: AnswerContext): string {
+  const printable = (text: string) => [...text].map((ch) => (ch < " " || ch === "\u007f" ? " " : ch)).join("");
+  const address = context.remoteAddress ? printable(context.remoteAddress).slice(0, 64) : "";
+  const agent = context.userAgent ? printable(context.userAgent).slice(0, MAX_USER_AGENT) : "";
+  if (!address && !agent) return "";
+  return `from ${address || "an unknown address"}${agent ? ` (${agent})` : ""}`;
 }
 
 function handlerKey(module: string, project: string | undefined): string {
@@ -65,6 +84,9 @@ export class DecisionInbox implements DecisionProducer {
   private inflight = new Map<string, Promise<boolean>>();
   private sweeping: Promise<void> | null = null;
   private timer: NodeJS.Timeout | null = null;
+  private maxOpenPerSource: number;
+  /** Answers whose secret is being stored: not deliverable until that succeeds */
+  private settling = new Set<string>();
 
   constructor(options: DecisionInboxOptions) {
     this.store = options.store;
@@ -72,6 +94,7 @@ export class DecisionInbox implements DecisionProducer {
     this.events = options.events;
     this.clock = options.clock ?? { now: () => Date.now() };
     this.sweepSeconds = options.sweepSeconds ?? DEFAULT_SWEEP_SECONDS;
+    this.maxOpenPerSource = options.maxOpenPerSource ?? DEFAULT_MAX_OPEN_PER_SOURCE;
   }
 
   private iso(): string {
@@ -91,7 +114,16 @@ export class DecisionInbox implements DecisionProducer {
       throw new DecisionError(400, `Invalid decision: ${parsed.errors.join("; ")}`);
     }
     const at = this.iso();
-    const { decision, created, addedBlocks } = this.store.raise(parsed.value, at);
+    const outcome = this.store.raise(parsed.value, at, this.maxOpenPerSource);
+    if (outcome.kind === "capped") {
+      throw new DecisionError(
+        429,
+        `${parsed.value.source.module} already has ${outcome.open} open decisions in ${parsed.value.project} ` +
+          `(the limit is ${this.maxOpenPerSource}): wait for answers or withdraw some first`,
+      );
+    }
+    const { decision, addedBlocks } = outcome;
+    const created = outcome.kind === "created";
     const { module, ref } = decision.source;
     if (created) {
       const expiry = decision.expiresAt
@@ -186,8 +218,14 @@ export class DecisionInbox implements DecisionProducer {
 
   // ============ ANSWERS ============
 
-  /** A human's answer. Validates it against the decision, stores it, then resumes the producer. */
-  async answer(id: string, raw: AnswerInput): Promise<Decision> {
+  /**
+   * The owner's answer. Validates it against the decision and closes it
+   * (the first answer wins), then hands a credentials answer's secret to the
+   * secret store, and only then records it and resumes the producer. When
+   * the secret store fails, the decision is open again (503). `context`
+   * (where the request came from) goes into the audit entry.
+   */
+  async answer(id: string, raw: AnswerInput, context: AnswerContext = {}): Promise<Decision> {
     const parsed = parseAnswerInput(raw);
     if (!parsed.ok) throw new DecisionError(400, `Invalid answer: ${parsed.errors.join("; ")}`);
     const input = parsed.value;
@@ -206,6 +244,9 @@ export class DecisionInbox implements DecisionProducer {
       throw new DecisionError(400, `confirm: answering a ${decision.kind} decision needs confirm: true`);
     }
 
+    if (decision.kind === "credentials" && input.note !== undefined) {
+      throw new DecisionError(400, "note: credentials decisions take no note (a secret could end up in it)");
+    }
     const suppliesSecret = option.suppliesSecret === true;
     if (input.secret !== undefined && !suppliesSecret) {
       throw new DecisionError(
@@ -215,44 +256,48 @@ export class DecisionInbox implements DecisionProducer {
           : "secret: only credentials decisions take a secret",
       );
     }
-    if (suppliesSecret) {
-      const secret = input.secret;
-      if (secret === undefined || secret.trim() === "") {
-        throw new DecisionError(400, "secret: this option supplies the secret, so it needs the value");
-      }
-      if (input.note?.includes(secret)) {
-        throw new DecisionError(400, "note: must not contain the secret");
-      }
-      try {
-        await this.secrets.put(decision.secretName!, secret);
-      } catch (e) {
-        // Only our own error type is known to carry no value; say nothing else about others
-        const why = e instanceof SecretStoreUnavailableError ? e.message : "it failed";
-        throw new DecisionError(503, `The secret store could not take the secret: ${why}`);
-      }
+    const secret = input.secret;
+    if (suppliesSecret && (secret === undefined || secret.trim() === "")) {
+      throw new DecisionError(400, "secret: this option supplies the secret, so it needs the value");
     }
 
-    const by = input.by ?? "owner";
     const at = this.iso();
     const answer: DecisionAnswer = {
       optionId: option.id,
       ...(input.note ? { note: input.note } : {}),
       ...(suppliesSecret ? { secretSupplied: true } : {}),
     };
-    if (!this.store.closeDecision(id, { status: "answered", at, answer, answeredBy: by })) {
+    // Close first: only the answer that wins hands its secret on
+    if (!this.store.closeDecision(id, { status: "answered", at, answer, answeredBy: OWNER })) {
       throw new DecisionError(409, `Decision is ${this.store.get(id)?.status ?? "closed"}, not open`);
     }
+    if (suppliesSecret && secret !== undefined) {
+      this.settling.add(id);
+      try {
+        await this.secrets.put(decision.secretName!, secret);
+      } catch (e) {
+        this.store.reopenDecision(id, at);
+        // Only our own error type is known to carry no value; say nothing else about others
+        const why = e instanceof SecretStoreUnavailableError ? e.message : "it failed";
+        throw new DecisionError(503, `The secret store could not take the secret: ${why}`);
+      } finally {
+        this.settling.delete(id);
+      }
+    }
+
     const parts = [`chose ${option.id} (${option.label})`];
     if (suppliesSecret) parts.push(`the secret went to the secret store as ${decision.secretName}`);
     if (input.note) parts.push(`note: ${input.note}`);
-    this.store.addAudit(id, { at, action: "answered", actor: by, detail: parts.join("; ") });
+    const from = describeOrigin(context);
+    if (from) parts.push(from);
+    this.store.addAudit(id, { at, action: "answered", actor: OWNER, detail: parts.join("; ") });
     await this.events?.emit("decision.answered", {
       decisionId: id,
       project: decision.project,
       kind: decision.kind,
       module: decision.source.module,
       optionId: option.id,
-      by,
+      by: OWNER,
       secretSupplied: suppliesSecret,
     });
     await this.deliver(id);
@@ -327,7 +372,7 @@ export class DecisionInbox implements DecisionProducer {
   private async deliverNow(id: string): Promise<boolean> {
     const decision = this.store.get(id, this.iso());
     const answer = decision?.answer;
-    if (!decision || decision.deliveredAt || !answer) return false;
+    if (!decision || decision.deliveredAt || !answer || this.settling.has(id)) return false;
     if (decision.status !== "answered" && decision.status !== "expired") return false;
     const outcome = decision.status === "expired" ? "expired" : "answered";
     const module = decision.source.module;

@@ -8,12 +8,14 @@ export { DecisionInbox } from "./service.js";
 export type { DecisionInboxOptions } from "./service.js";
 export { DecisionStore } from "./store.js";
 export { registerDecisionRoutes } from "./routes.js";
-export { mountDecisions } from "./mount.js";
+export { dashboardUrlFor, maxOpenFromEnv, mountDecisions } from "./mount.js";
 export type { MountDecisionsOptions, DecisionConsumer } from "./mount.js";
 export { MemorySecretStore, SecretStoreUnavailableError } from "./secrets.js";
 export type { SecretStore } from "./secrets.js";
 export { DecisionError, isDecisionId, parseRaiseInput, parseAnswerInput } from "./validate.js";
+export { AnswerCredential } from "./answer-auth.js";
 export type {
+  AnswerContext,
   AnswerInput,
   Clock,
   DecisionProducer,
