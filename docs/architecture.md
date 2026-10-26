@@ -154,9 +154,18 @@ Environments as docker compose projects ([configuration](configuration.md#delive
 
 #### Gates and policy (`gates/`, `policy/`)
 
+Gate pipelines from the project config and their executors ([configuration](configuration.md#gate-pipelines), [design](design/runners.md)), started and stopped by `index.ts`:
+
+- **`gates/project-pipelines.ts`**: the `pipelines:` and `executors:` blocks, validated; each lane becomes a gate pipeline
+- **`gates/pipeline-service.ts`**: runs, one job per lane; the selector (executor order, availability, the minutes budget, the `spend` decision); attempts, fallback, and resuming in-flight jobs after a restart
+- **`gates/executors/`**: `github.ts` and `github-api.ts` (GitHub Actions over the REST API: dispatch, find, poll, cancel, logs, artifacts, minutes), `github-workflow.ts` (the workflow file Lair generates and its log markers), `local.ts` (argv spawner, capacity probe, worktrees), `types.ts` (the Executor interface and the boundaries tests fake)
+- **`gates/run-store.ts`**: runs, jobs, attempts, unavailable executors and raised decisions in SQLite (`data/pipelines.db`)
+- **`gates/decision-hook.ts`**: the interface the Decision Inbox implements; the default emits `decision.needed`
+- **`gates/routes.ts`**: `/api/pipelines/*`
+
 Library modules with tests, not exposed through the API yet:
 
-- **`gates/pipeline-config.ts`**, **`gates/gate-executor.ts`**: gate pipeline configuration and step execution
+- **`gates/pipeline-config.ts`**, **`gates/gate-executor.ts`**: gate pipeline configuration and step execution (also used by every pipeline executor, so results have one shape)
 - **`gates/signature.ts`**: signing and verification of gate results (not end-to-end yet; see [Status and limitations](../README.md#status-and-limitations))
 - **`policy/policy-config.ts`**, **`policy/policy-evaluator.ts`**, **`policy/merge-controller.ts`**: merge policy configuration, evaluation and a control-plane merge controller
 
@@ -174,7 +183,7 @@ Each view is a standalone component:
 
 - **`Overview.tsx`**: repo status, problems, counts
 - **`Dragons.tsx`**, **`DragonStartDialog.tsx`**, **`DragonStopDialog.tsx`**: agent list, start and stop dialogs
-- **`Gates.tsx`**: gate queue by lane, recent results
+- **`Gates.tsx`**, **`PipelineRuns.tsx`**: gate queue by lane, recent results; pipeline runs with where each step ran, fallback reasons, CI minutes, executor availability and the workflow file
 - **`PRs.tsx`**: pull requests with gate status and merge readiness
 - **`Orchestrator.tsx`**: orchestrator ticks, STOP file, service status
 - **`Machines.tsx`**: machine health, runner status

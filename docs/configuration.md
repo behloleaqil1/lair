@@ -283,6 +283,116 @@ gate_runner:
 | `sync_method` | `rsync` \| `git` \| `none` | `none` | Method for syncing to remote machines |
 | `rsync_exclude` | array | `[]` | Patterns to exclude from rsync |
 
+## Gate pipelines
+
+A pipeline is a list of steps, each an argv command (no shell). Lair runs each **lane** of a pipeline as one job, and sends every job to the first executor in this order that can take it ([design](design/runners.md)):
+
+1. **GitHub Actions** runners of the project's repository: an idle self-hosted runner (private repositories only), then GitHub-hosted runners (free for public repositories; for private ones only within `monthly_minutes`), then a busy self-hosted runner.
+2. **lair-node machines**: not built yet, so this step is always skipped.
+3. **The local machine**, once it has capacity (no memory pressure, enough free RAM, load per core below the limit). Until then the job waits.
+
+With only a `pipelines:` block, jobs run on the local machine. Runs are started from the Gates view or with `POST /api/pipelines/runs`.
+
+```yaml
+pipelines:
+  gate:
+    steps:
+      - name: install
+        run: [npm, ci]
+      - name: test
+        run: [npm, test]
+        timeout_minutes: 20
+      - name: lint
+        run: [npm, run, lint]
+        lane: quick          # a separate job
+    lanes:
+      quick:
+        executors: [local]   # this lane always runs here
+
+executors:
+  order: [github, nodes, local]
+  github:
+    monthly_minutes: 500     # GitHub-hosted minutes a private repository may use per month
+  local:
+    min_free_ram_mb: 2048
+```
+
+**Using GitHub Actions:**
+
+1. Create a fine-grained token for the repository with **Actions: read and write**, **Contents: read** and **Metadata: read** (add **Administration: read** to use self-hosted runners) and start Lair with it in `LAIR_GITHUB_TOKEN`. The token never goes in the YAML, and local steps never see it.
+2. Open the Gates view, click **Workflow file**, and commit that file to the default branch as `.github/workflows/lair-gates.yml`. It declares `permissions: contents: read`, validates its inputs, and checks out the exact commit. Copy it again after changing a pipeline: Lair skips GitHub while the committed file is missing or out of date, and says so.
+3. Private repository: to run without billed minutes, register a self-hosted runner to the repository (Settings, Actions, Runners, New self-hosted runner) on a spare machine, and start it with GitHub's `./config.sh` and `./run.sh` commands. To use GitHub-hosted runners too, set `monthly_minutes`.
+
+**Never self-hosted for a public repository.** Fork pull requests can run code on a public repository's self-hosted runners, so Lair never sends a job there, the workflow it generates for a public repository has no self-hosted option, and the status shows a warning when such runners are registered.
+
+**Fallback.** A job GitHub refuses (billing, spending limit, Actions disabled, a workflow that fails to start), or that no runner picks up within `pickup_timeout_minutes`, is cancelled and goes to the next executor once GitHub reports that none of its steps started. The refused executor is unavailable for `unavailable_minutes` (shown, with the reason, in the Gates view). A job is never run twice: when a runner takes the job while it is being cancelled, Lair keeps that run's result. In-flight jobs resume after a server restart.
+
+**Minutes budget.** Before sending a private repository's job to a GitHub-hosted runner, Lair adds the lane's expected minutes (the most of its last five hosted runs, at least 1) to the minutes billed this calendar month (UTC). When that would go over `monthly_minutes`, it sends nothing there, raises a `spend` decision once per month (event `decision.needed`), and uses the next executor. Billed minutes also go into the fleet budget as provider `github-actions:<project>`, in minutes.
+
+**Results** are the same gate result whichever executor ran the job: each step's status, exit code, duration and output tail, plus where it ran, the attempts with their fallback reasons, the redacted log, CI artifacts and the minutes used. A CI run that is missing a step fails.
+
+### Pipeline options
+
+`pipelines.<name>` (names: letters, digits, `_`, `-`, at most 40):
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `steps` | array | required | The steps, in order |
+| `timeout_minutes` | number | `120` | Time limit for each lane |
+| `lanes` | map | `{}` | `<lane>: { executors: [...] }`: an executor order for that lane. Every lane named here must be used by a step |
+
+Each step:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `name` | string | required | Letters, digits, `.`, `_`, `-`. Names starting with `lair-` are reserved |
+| `run` | array | required | The argv. Arguments may not contain `${{`, newlines or control characters |
+| `lane` | string | `default` | Steps of one lane run in order on one executor |
+| `timeout_minutes` | number | `30` | Time limit for the step |
+| `continue_on_failure` | boolean | `false` | Run the next steps even when this one fails (the job still fails) |
+| `env` | map | — | Extra environment variables. Names starting with `GITHUB_`, `RUNNER_` or `LAIR_` are reserved |
+
+### Executor options
+
+`executors`:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `order` | array | `[github, nodes, local]` | Executor kinds in order; leave one out to never use it |
+| `retry_seconds` | number | `60` | While no executor can take a job, how often to try again |
+| `github.repo` | string | the project's `github` | `owner/name` |
+| `github.token_env` | string | `LAIR_GITHUB_TOKEN` | The environment variable that holds the token |
+| `github.workflow` | string | `lair-gates.yml` | The workflow file name under `.github/workflows/` |
+| `github.hosted` | boolean | `true` | Use GitHub-hosted runners |
+| `github.hosted_runs_on` | string | `ubuntu-latest` | Their label |
+| `github.self_hosted` | boolean | `true` | Use self-hosted runners (private repositories only) |
+| `github.self_hosted_labels` | array | `[self-hosted]` | Labels a self-hosted runner must have, e.g. `[self-hosted, lair]` to keep Lair's jobs on dedicated runners |
+| `github.monthly_minutes` | number | `0` | GitHub-hosted minutes a private repository may use per calendar month (0: none) |
+| `github.pickup_timeout_minutes` | number | `10` | Cancel and fall back when no runner picks a job up in this time |
+| `github.unavailable_minutes` | number | `30` | How long a refused executor is skipped |
+| `github.poll_seconds` | number | `15` | Seconds between polls of a CI run |
+| `github.checkout_action` | string | `actions/checkout@v4` | The checkout action, e.g. pinned to a commit |
+| `local.max_parallel` | number | `1` | Local jobs at a time for this project |
+| `local.min_free_ram_mb` | number | `1024` | Wait while free RAM is below this |
+| `local.max_load_per_core` | number | `1.5` | Wait while the 1-minute load per core is above this |
+| `local.capacity_retry_seconds` | number | `30` | Seconds between capacity checks while waiting |
+| `local.workdir` | `worktree` \| `repo` | `worktree` | `worktree`: a clean `git worktree` at the commit, removed afterwards. `repo`: the repository itself, which must be at the commit |
+| `local.worktree_dir` | string | `data/pipelines/worktrees` | Where worktrees go |
+
+Memory pressure is read from `/proc/pressure/memory` on Linux (`some avg10` of 20% or more) and `kern.memorystatus_vm_pressure_level` on macOS. Local steps get Lair's environment without `LAIR_NODE_TOKEN`, `LAIR_GITHUB_TOKEN` (or your `token_env`), `GITHUB_TOKEN` and `GH_TOKEN`.
+
+Unknown keys and invalid values are config errors; a project with an invalid block has no pipelines, and `GET /api/pipelines/status` shows the errors. Lair reads these blocks at startup.
+
+### Pipeline API
+
+`?project=` defaults to the default project. Starting and cancelling runs are refused (HTTP 403) for a `read_only: true` project.
+
+- `GET /api/pipelines/status`: executor order and availability (with the reason and the time an executor is unavailable until), the repository's visibility and runners, warnings, minutes used this month and the budget, and decisions raised
+- `GET /api/pipelines/workflow`: the workflow file to commit, with setup steps
+- `GET /api/pipelines/runs?limit=50`, `GET /api/pipelines/runs/<id>`: runs with their steps (and where each ran), jobs, attempts, logs and minutes
+- `POST /api/pipelines/runs` with `{"pipeline": "gate", "sha": "<40 hex>"}` or `{"pipeline": "gate", "branch": "main"}` (default: the repository's `HEAD`): starts a run, HTTP 202
+- `POST /api/pipelines/runs/<id>/cancel`: cancels a run; CI runs in flight are asked to cancel
+
 ## Process manager
 
 Define processes for Lair to manage:
@@ -629,5 +739,6 @@ Project names (the file name without `.yaml` or `.yml`) must start with a letter
 | `LAIR_PROJECT` | server | The default project: the one the dashboard opens first, the one API requests without `?project=` use, and the one whose `processes:` the process manager runs. It must name a project in `projects/` or `projects/local/` (for example `LAIR_PROJECT=myproject`); an invalid or unknown name logs a warning at startup and is ignored. Without it the default is `example` if it exists, else the first project found |
 | `LAIR_CLIENT_DIR` | server | Directory of the built web UI to serve (default `dist/client`) |
 | `LAIR_AGENT_ID` | lair-bus | The calling agent's ID (required) |
+| `LAIR_GITHUB_TOKEN` | server | A fine-grained GitHub token for running gate pipelines on GitHub Actions (see [Gate pipelines](#gate-pipelines)). A project can name another variable with `executors.github.token_env`. Never passed to local steps |
 
 The server refuses, with HTTP 403, browser requests whose `Origin` is not one of its own (`http://localhost`, `http://127.0.0.1` or `http://[::1]` on port 4777 or 5173, plus `LAIR_HOST`) and requests whose `Host` header names another host (DNS rebinding). Requests without an `Origin` header, such as `curl` or lair-node, are allowed. WebSocket handshakes get the same `Origin` check.
