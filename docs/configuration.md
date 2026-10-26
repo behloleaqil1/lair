@@ -1042,29 +1042,43 @@ Every POST here is the owner's (starting a run, releasing a claim, a fresh sessi
 
 ## Triage
 
-> Off by default. With `enabled: true` and the default `mode: observe`, triage parses, classifies and records every gate result you send it, and runs none of your commands.
+> Off by default. With `enabled: true` and the default `mode: observe`, triage parses, classifies and records the gate results it gets, and runs none of your commands.
 
-Triage ([design](design/autonomy.md#3-failure-triage-bisect-and-revert-module-triage)) answers "why did this gate fail, and what now?". Send it each gate result, with the test reports the gate wrote, as `POST /api/triage/results` (or as a `gate.completed` event on the server's event bus). It stores everything in `data/triage.db`.
+Triage ([design](design/autonomy.md#3-failure-triage-bisect-and-revert-module-triage)) answers "why did this gate fail, and what now?". It stores everything in `data/triage.db`.
 
-1. **Causes.** JUnit XML reports (JUnit, Surefire, Gradle, pytest `--junitxml`, the vitest and jest JUnit reporters) and the console output of every failed step (Gradle, vitest, jest, pytest) are parsed into causes: the error, its `Caused by` chain, field errors, the failing tests and the project's source locations. A context or bootstrap failure (an application context that can't start, a setup error, a test file that can't load) is **one** cause, however many tests it failed: later tests that only say "failure threshold exceeded" join the first failure's cause. A failed step that no parser reads becomes one cause with its exit code and the error lines of its output.
-2. **Classes**, decided per cause, in this order, each with the lines and facts that decided it:
+**Where results come from.** Every local process can reach the server, including the agents whose work triage judges, so triage only believes results from a trusted source:
 
-| Class | When | Action (`actions.*`) | Blocks a merge |
-|-------|------|----------------------|----------------|
-| `infra` | An infrastructure pattern (below) matches the error, its `Caused by` chain or its log lines; a step was killed (exit 137 or 143) or timed out with nothing more specific; or a timeout while the machine's load per core was at least `overload_per_core` | `recheck`: ONE re-check of only the failed test classes (or, without tests, only the failed steps) at the same commit, when there is capacity, up to `recheck.max_retries`. Never a full re-run. A pass unblocks the failure. After the last re-check: back to the author when the base passes, otherwise a decision for the human | Until a re-check passes |
-| `flaky` | Every failing test of the cause passed at the same commit within `flaky.window_minutes` (before or after), or is quarantined | Recorded. Flaky `flaky.ticket_after` times in a row (default 2): one reliability task with a deadline, and the test is quarantined (it runs, it no longer blocks), up to `flaky.quarantine_cap` | No |
-| `pre-existing` | The default branch has an open incident with the same tests or cause, or the same tests (or the same cause) failed in the base commit's latest result (the default branch's latest result when the base has none) | `fix_task`: one fix task on the default branch per cause, however many changes hit it | No |
-| `code` | Anything else, with the changed files it is near (the same file, a test of a changed file, or the same directory) | `route`: back to the author agent with the failing tests, the error, its root cause, source locations and the log lines | Yes |
+- **In-process (trusted):** the gate pipelines (`pipelines:`, [Gate pipelines](#gate-pipelines)) hand over each finished job's result as a `gate.completed` event. Only these may name the author agent, the PR and the base commit.
+- **Signed (over HTTP):** `POST /api/triage/results` takes only a `SignedGateResult` from a node listed in `trusted_nodes` (its Ed25519 public key file), verified with the gates module's signature check. Test reports must be covered by the signature: the signed result lists each report's SHA-256 in `result.reports`. Only `recheckId` is read from the rest of the body: the base commit comes from `git merge-base`, the changed files from `git diff`, and no agent is routed to.
+- An unsigned result, a tampered one, one from an untrusted node, or one signed for another project gets HTTP 403.
 
-3. **The default branch.** A red gate result on `default_branch` with `code` causes opens an incident. Triage takes the last green gate result on the branch, lists the first-parent commits since then (`git rev-list --first-parent`), and bisects them, running only the failing tests at each probe (as re-checks, so capacity and `max_concurrent` apply). A probe that fails on infrastructure is run again; one that can't decide is skipped. The culprit is **proven** when it is the only commit left, the one before it passed, and it failed with the same cause twice (a confirmation run). Then, per `bisect.revert`: `auto` opens a revert with `commands.open_revert`, `propose` (the default) asks through a decision, `off` records it. The culprit's author agent gets the cause either way. **A merge that is not proven is never reverted automatically**, and neither is a protected one: a merge marked protected in the Triage view (or with `POST /api/triage/protected`), listed in `bisect.protected_merges`, or whose message has a `Lair-Protected: yes` line. Those get a decision instead. A green gate result on the branch resolves the incident and cancels its probes.
+**Status: informational.** Nothing reads a failure's `blocking` yet: the merge policy will once it consumes triage (docs/design/autonomy.md §5). Until then triage records verdicts, asks for re-checks, opens tasks and decisions, and reverts per `bisect.revert`.
 
-Decisions go to the Decision Inbox's importers as `- OWNER? ...` lines in `decision_file` (default: `inbox_file`), once per subject, or to `commands.raise_decision` when set. Asking the human is allowed in observe mode, as the watchdog's escalations are.
+1. **Causes.** JUnit XML reports (JUnit, Surefire, Gradle, pytest `--junitxml`, the vitest and jest JUnit reporters) and the console output of every failed step (Gradle, vitest, jest, pytest) are parsed into causes: the error, its `Caused by` chain, field errors, the failing tests and the project's source locations. A context or bootstrap failure (an application context that can't start, a setup error, a test file that can't load) is **one** cause, however many tests it failed: later tests that only say "failure threshold exceeded" join the first failure's cause. A failed step that no parser reads becomes one cause with its exit code and the error lines of its output. Output is written by the code under test, so the parsers read at most the last 20,000 lines of a log, each cut to 2,000 characters, with patterns that run in linear time, and the XML reader flattens nesting deeper than 64 elements.
+2. **Passes.** A test passed at a commit only when a report lists it as passed, or a gate run ran (and passed) the step it failed in. A lint-only run proves nothing about a unit test.
+3. **Classes**, decided per cause, in this order, each with the lines and facts that decided it:
+
+| Class | When | Action (`actions.*`) | Blocks a change |
+|-------|------|----------------------|-----------------|
+| `infra` | An infrastructure pattern (below) matches the error, its `Caused by` chain or its log lines; a step was killed (exit 137 or 143) or timed out with nothing more specific; or a timeout while the machine's load per core was at least `overload_per_core` | `recheck`: ONE re-check of only the failed test classes (or, without tests, only the failed steps) at the same commit, when there is capacity, up to `recheck.max_retries`. Never a full re-run. It unblocks the failure only when its answer lists every requested test as passed (or, for steps, every requested step passed); an answer that only says "passed" is `unproven`. After the last re-check: back to the author when the base commit's own run passes, otherwise a decision for the human | Until a re-check passes |
+| `flaky` | Every failing test of the cause passed at the same commit within `flaky.window_minutes` (before or after), or, off the default branch, is quarantined | Recorded. Flaky `flaky.ticket_after` times in a row (default 2): one reliability task with a deadline (`ticket_deadline_days`, default 7), and the test is quarantined (it runs, it no longer blocks a change), up to `flaky.quarantine_cap`. The quarantine ends at that deadline, after `release_after_passes` passes in a row (default 5), or when the owner releases it. On the default branch a quarantined test that fails still counts, and opens an incident | No |
+| `pre-existing` | The same tests (or the same cause) failed in the base commit's own gate run of the same pipeline, no older than `base_max_age_hours`; or the default branch has an open incident with them and the base commit includes its red commit. Without a base result, nothing is pre-existing | `fix_task`: one fix task on the default branch per cause, however many changes hit it | No |
+| `code` | Anything else, with the changed files it is near (the same file, a test of a changed file, or the same directory). Low confidence when there is no base result to compare with | `route`: back to the author agent (from a trusted result) with the failing tests, the error, its root cause, source locations and the log lines | Yes |
+
+4. **The default branch.** A red gate result on `default_branch` with `code` causes opens an incident for its pipeline (`pipelineId`). Triage takes that pipeline's last green run on the branch that ran the failing steps, lists the first-parent commits since then (`git rev-list --first-parent`), and bisects them, running only the failing tests at each probe (as re-checks, so capacity and `max_concurrent` apply, and an answer must show the target tests passing to count as a pass). A probe that fails on infrastructure is run again; one that can't decide is skipped. The culprit is **proven** when it is the only commit left, the one before it passed, and it failed with the same cause twice (a confirmation run). Then, per `bisect.revert`: `auto` opens a revert with `commands.open_revert`, `propose` (the default) asks through a decision, `off` records it. The culprit's author agent gets the cause either way. **A merge that is not proven is never reverted without the owner's explicit decision**, and a merge the owner protected (in the Triage view) or listed in `bisect.protected_merges` is never reverted automatically. A `Lair-Protected: yes` line in the merge message is only a hint (whoever merged it wrote it): it turns an automatic revert into a proposal. Only a green run of the same pipeline that ran the failing steps resolves the incident and cancels its probes.
+
+Decisions go to the [Decision Inbox](#decision-inbox) (the owner answers `revert`, `keep`, `revert-<n>` for a suspect, or `rerun` for an infrastructure failure, and triage acts on the answer), or to `commands.raise_decision` when set, or, without either, as `- OWNER? ...` lines to `decision_file` (default: `inbox_file`). Asking the human is allowed in observe mode, as the watchdog's escalations are.
+
+**Commands never run inside triage's own queue.** Its decisions are short store transactions; commands, decisions and events run afterwards. The `recheck` command must **start** the run and return at once (print the run's id); it is stopped after `recheck.request_timeout_seconds` (default 30). The run's answer is a gate result whose id is `{request}` (or the run id it printed), with `recheckId` set to `{request}`: in-process, or signed. It may arrive while the command is still running.
 
 ```yaml
 triage:
   enabled: true
   mode: act                    # observe (default) | act
   default_branch: main
+  trusted_nodes:               # who may POST signed results
+    - id: ci-runner-1
+      public_key_file: ./projects/local/keys/ci-runner-1.pub.pem
   infra_patterns:              # yours first; one with a built-in id replaces it
     - id: license-server
       kind: network            # network | container | oom | runner | disk | load
@@ -1091,33 +1105,37 @@ The built-in infrastructure patterns (case-insensitive regular expressions, `def
 | `enabled` | boolean | `false` | Triage this project's gate results |
 | `mode` | `observe` \| `act` | `observe` | `observe` runs no command: every action is recorded as `planned`, with the argv it would run. `act` runs them, unless the project is `read_only: true` |
 | `default_branch` | string | `main` | The branch whose red results open incidents |
-| `interval_seconds` | number | `60` | How often waiting re-checks and bisect probes are retried |
-| `command_timeout_seconds` | number | `120` | Timeout for each command |
+| `trusted_nodes` | array | `[]` | `{id, public_key_file}`: the nodes whose signed results `POST /api/triage/results` accepts (the PEM public key; relative paths resolve against the Lair working directory). An unreadable key file stops triage for the project |
+| `interval_seconds` | number | `60` | How often waiting re-checks and bisect probes are retried and ended quarantines released |
+| `command_timeout_seconds` | number | `120` | Timeout for each command but `recheck` |
 | `infra_patterns` | array | `[]` | `{id, kind, pattern}` |
 | `default_infra_patterns` | boolean | `true` | Use the built-in infrastructure patterns too |
 | `context_patterns` | array | `[]` | Regular expressions for context and bootstrap failures |
 | `default_context_patterns` | boolean | `true` | Use the built-in context patterns too |
-| `overload_per_core` | number | `2` | A timeout while `context.loadPerCore` was at least this is `infra` (`load`) |
+| `overload_per_core` | number | `2` | A timeout while a trusted result's `context.loadPerCore` was at least this is `infra` (`load`) |
+| `base_max_age_hours` | number | `72` | A base commit's gate run older than this is not used to call a failure pre-existing |
 | `actions.infra` | `recheck` \| `route` \| `none` | `recheck` | |
 | `actions.pre_existing` | `fix_task` \| `none` | `fix_task` | |
 | `actions.code` | `route` \| `none` | `route` | |
 | `recheck.max_retries` | number | `1` | Re-checks per failure |
 | `recheck.max_concurrent` | number | `1` | Re-checks and probes running at once |
 | `recheck.timeout_minutes` | number | `120` | A requested re-check with no answer by then expires (and counts as a failed attempt) |
+| `recheck.request_timeout_seconds` | number | `30` | The `recheck` command only starts the run; it is stopped after this |
 | `recheck.max_load_per_core`, `recheck.min_free_memory_mb` | number | — | Wait while this machine's load per core is above, or its free memory below, these |
 | `recheck.capacity_cmd` | array | — | Exits 0 when there is capacity (for example, a check of your CI runners) |
 | `flaky.window_minutes` | number | `1440` | A pass at the same commit within this window makes a failure flaky |
 | `flaky.ticket_after` | number | `2` | Flaky this many times in a row opens a reliability task |
-| `flaky.ticket_deadline_days` | number | `7` | The task's deadline |
+| `flaky.ticket_deadline_days` | number | `7` | The task's deadline, which also ends the quarantine |
 | `flaky.quarantine` | boolean | `true` | Quarantine a test when its task opens |
 | `flaky.quarantine_cap` | number | `10` | No more quarantined tests than this |
+| `flaky.release_after_passes` | number | `5` | A quarantined test that passes this many times in a row is released |
 | `bisect.enabled` | boolean | `true` | Bisect a red default branch |
 | `bisect.revert` | `auto` \| `propose` \| `off` | `propose` | What to do with a proven culprit |
 | `bisect.max_candidates` | number | `64` | Don't bisect more commits than this |
-| `bisect.protected_merges` | array | `[]` | Commit shas never reverted automatically |
-| `bisect.protected_trailer` | string | `Lair-Protected` | A merge whose message has `<trailer>: yes` is protected |
+| `bisect.protected_merges` | array | `[]` | Full commit shas never reverted automatically |
+| `bisect.protected_trailer` | string | `Lair-Protected` | A merge whose message has `<trailer>: yes` is proposed for revert, never reverted automatically |
 | `commands` | map | `{}` | See below |
-| `decision_file` | string | `inbox_file` | Where decisions are appended |
+| `decision_file` | string | `inbox_file` | Where decisions are appended when there is no Decision Inbox or `raise_decision` |
 
 Unknown keys, an invalid regular expression or an unknown placeholder are config errors; a project with an invalid `triage:` block is not triaged, and `GET /api/triage/status` shows why.
 
@@ -1125,50 +1143,46 @@ Unknown keys, an invalid regular expression or an unknown placeholder are config
 
 Each command is an argv array (no shell). Every command also gets `{project}`. A list placeholder (`{steps}`, `{tests}`, `{classes}`, `{options}`) that is a whole argument becomes one argument per item; inside a longer argument it is joined with `,`. A value that would start an argument with `-` is refused. Without a command, a route or a task is still recorded in the store and emitted on the event bus (`triage.routed`, `triage.task_created`), for a module that takes them.
 
+> **Careful with a list after a single-value flag.** `["run", "--tests", "{tests}"]` becomes `run --tests a b c`: most tools bind only `a` to `--tests` and read `b` and `c` as something else. Join the list into the flag's value (`"--tests={tests}"` gives `--tests=a,b,c`), or give the list its own position.
+
 | Command | Placeholders | Runs when |
 |---------|--------------|-----------|
-| `recheck` | `{request}` (the re-check id), `{purpose}` (`infra` or `bisect`), `{sha}`, `{branch}`, `{gate}`, `{steps}`, `{tests}` (pytest node ids, else `<class>#<test>`), `{classes}` (test classes, files or modules), `{attempt}` | A re-check or bisect probe has capacity. Run the tests, then `POST /api/triage/results` with `context.recheckId` set to `{request}` |
+| `recheck` | `{request}` (the re-check id), `{purpose}` (`infra` or `bisect`), `{sha}`, `{branch}`, `{gate}`, `{steps}`, `{tests}` (pytest node ids, else `<class>#<test>`), `{classes}` (test classes, files or modules), `{attempt}` | A re-check or bisect probe has capacity. Start the run and return at once, printing its id; the run's result comes back with `{request}` as its id and as `recheckId` |
 | `notify_agent` | `{agent}`, `{gate}`, `{sha}`, `{branch}`, `{pr}`, `{record}`, `{message}` | A failure goes back to its author |
 | `create_task` | `{kind}` (`fix` or `reliability`), `{key}`, `{title}`, `{body}` | A fix or reliability task opens (once per key while open) |
-| `raise_decision` | `{kind}`, `{subject}`, `{question}`, `{context}`, `{recommended}`, `{options}` | A decision is needed (instead of the inbox file) |
-| `open_revert` | `{sha}`, `{branch}`, `{incident}`, `{reason}`, `{pr}` | A proven culprit is reverted (`bisect.revert: auto`), or a human asks for it. Print the revert PR's URL; it is shown on the incident |
+| `raise_decision` | `{kind}`, `{subject}`, `{question}`, `{context}`, `{recommended}`, `{options}` | A decision is needed and there is no Decision Inbox |
+| `open_revert` | `{sha}`, `{branch}`, `{incident}`, `{reason}`, `{pr}` | A proven culprit is reverted (`bisect.revert: auto`), or the owner asks for it. Print the revert PR's URL; it is shown on the incident |
 
-### Sending results
+### Sending signed results
 
-The body is a gate result (`src/shared/policy-types.ts`; only `id`, `commitSha`, `branch` and `status` are required), the reports, and what the runner knows about the change:
+A node signs the whole gate result (`src/shared/policy-types.ts` `GateResult`, with `reports` listing each report's name, step and SHA-256) with its Ed25519 key, as `signGateResult()` in `src/server/gates/signature.ts` does, and sends:
 
-```bash
-curl -s -X POST "http://localhost:4777/api/triage/results?project=myproject" \
-  -H 'Content-Type: application/json' \
-  --data @- <<'EOF'
+```json
 {
-  "result": {
-    "id": "20260101T000000Z-example-abcdef12-1",
-    "commitSha": "abcdef1234567890abcdef1234567890abcdef12",
-    "branch": "feat/example",
-    "status": "failed",
-    "steps": [{ "name": "test", "status": "failed", "exitCode": 1, "output": "..." }]
-  },
-  "reports": [{ "name": "TEST-OrderServiceTest.xml", "step": "test", "content": "<testsuite ...>" }],
-  "context": { "baseSha": "1234567890abcdef1234567890abcdef12345678", "agent": "worker-a", "pr": 42 }
+  "signed": { "result": { "id": "...", "commitSha": "<full sha>", "nodeId": "ci-runner-1", "reports": [{ "name": "TEST-OrderServiceTest.xml", "step": "test", "sha256": "..." }], "...": "..." }, "signature": "<base64>", "nodePublicKey": "<PEM>" },
+  "reports": [{ "name": "TEST-OrderServiceTest.xml", "content": "<testsuite ...>" }],
+  "recheckId": "<only when answering a re-check>"
 }
-EOF
 ```
 
-`context` fields: `baseSha` (the changed files are computed with `git diff base...head` in the project's `repo` when `changedFiles` is missing), `changedFiles`, `agent`, `pr`, `recheckId` (this result answers that re-check or probe) and `loadPerCore`. The answer is the triage record, its actions, its re-checks and the default branch's open incident.
+Commit shas are full (40 or 64 hex characters), and a result id is accepted once. The answer is the triage record, its actions, its re-checks and the pipeline's open incident on the default branch.
 
 ### Triage API
 
 `?project=` defaults to the default project:
 
-- `POST /api/triage/results`: a gate result, as above (up to 32 MB)
-- `GET /api/triage/status`: mode, why commands don't run, config errors, counts per class, pending re-checks, open tasks, quarantined tests, the default branch's incident and which commands are set
-- `GET /api/triage/failures?verdict=&blocking=true|false&sha=&limit=100`, `GET /api/triage/failures/<id>`: each cause's verdict and evidence, the actions taken (with their argv) and the re-checks
+- `POST /api/triage/results`: a signed gate result, as above (up to 32 MB)
+- `GET /api/triage/status`: mode, why commands don't run, config errors, counts per class, pending re-checks, open tasks, quarantined tests, the newest open incident and how many are open, which commands are set, and the trusted nodes
+- `GET /api/triage/failures?verdict=&blocking=true|false&sha=&limit=100`, `GET /api/triage/failures/<id>`: each cause's verdict and evidence, the actions taken (with their argv and who acted) and the re-checks
 - `GET /api/triage/rechecks?limit=100`
 - `GET /api/triage/incidents?status=open|resolved|all&limit=50`, `GET /api/triage/incidents/<id>`: the bisect's candidates, probes, culprit and revert status
-- `POST /api/triage/incidents/<id>/revert` with `{"sha": "..."}` (optional): a human opens the revert of the culprit or a suspect
-- `GET /api/triage/tasks?status=open|resolved|all`, `GET /api/triage/flaky`
-- `GET /api/triage/protected`, `POST /api/triage/protected` with `{"sha": "...", "note": "..."}`, `DELETE /api/triage/protected/<sha>`
+- `GET /api/triage/tasks?status=open|resolved|all`, `GET /api/triage/flaky`, `GET /api/triage/protected`
+
+The owner only (the owner's session from [the owner credential](#decision-inbox), from the dashboard; no CORS; HTTP 403 otherwise; each records who acted):
+
+- `POST /api/triage/owner/incidents/<id>/revert` with `{"sha": "...", "acknowledgeUnproven": true}` (both optional): open the revert of the culprit, or of a suspect, which needs `acknowledgeUnproven`
+- `POST /api/triage/owner/protected` with `{"sha": "<full sha>", "note": "..."}`, `DELETE /api/triage/owner/protected/<sha>`
+- `DELETE /api/triage/owner/flaky/<test key>`: release a quarantined test
 
 ## Example complete configuration
 

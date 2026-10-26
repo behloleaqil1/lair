@@ -185,17 +185,18 @@ Risk tiers, reviews bound to the head sha, the test integrity check and policy m
 
 #### Triage (`triage/`)
 
-Failure triage, bisect and revert ([configuration](configuration.md#triage)). It is off unless a project sets `triage.enabled`, and runs no command unless it sets `mode: act`. `index.ts` calls `mountTriage()`.
+Failure triage, bisect and revert ([configuration](configuration.md#triage)). It is off unless a project sets `triage.enabled`, and runs no command unless it sets `mode: act`. `index.ts` calls `mountTriage()` with the owner credential and connects the Decision Inbox; the gate pipelines hand it each job's result (`gate.completed`).
 
-- **`parsers/`**: evidence parsers. `junit.ts` (JUnit XML, with a small XML reader in `xml.ts`), `gradle.ts`, `js.ts` (vitest and jest), `pytest.ts`; `index.ts` turns a gate result and its reports into causes
-- **`text.ts`**: signatures, test keys, `Caused by` chains, stack frames, and grouping a context failure into one cause
+- **`parsers/`**: evidence parsers over bounded input. `junit.ts` (JUnit XML, with a small linear XML reader in `xml.ts`), `gradle.ts`, `js.ts` (vitest and jest), `pytest.ts`; `index.ts` turns a gate result and its reports into causes
+- **`text.ts`**: bounded lines, signatures, test keys, `Caused by` chains, stack frames, and grouping a context failure into one cause
 - **`classifier.ts`**: the rules (infra, flaky, pre-existing, code), each verdict with its evidence
 - **`bisect.ts`**: the bisect state machine over the merges since the last green commit
-- **`adapters.ts`**: the interfaces triage needs from other modules (re-check executor, agent router, task sink, decision raiser, revert opener, capacity) and the built-in command, inbox-file and capacity adapters
-- **`git.ts`**: read-only git (first-parent merges, a commit's parents and message, changed files)
+- **`adapters.ts`**: the interfaces triage needs from other modules (re-check executor, agent router, task sink, decision raiser, revert opener, capacity, the owner guard), the Decision Inbox adapter, and the built-in command, inbox-file and capacity adapters
+- **`git.ts`**: read-only git (first-parent merges, a commit's parents and message, changed files, merge base, ancestry)
 - **`store.ts`**: results, causes, test observations, actions, re-checks, tasks, flaky tests, incidents and protected merges in SQLite (`data/triage.db`)
-- **`service.ts`**, **`manager.ts`**, **`routes.ts`**, **`index.ts`**: per-project ingest and actions, the manager's lifecycle, and the `/api/triage/*` routes
-- **`test-harness.ts`**: the fakes the tests use (command runner, clock, git) and result builders
+- **`service.ts`**: per-project ingest, trust and decisions, each in one store transaction; commands, decisions and events run from an outbox outside the project's queue
+- **`manager.ts`**, **`routes.ts`**, **`index.ts`**: the projects' lifecycle and trusted node keys, the `/api/triage/*` routes (signed results; `/api/triage/owner/*` for the owner), and `mountTriage()`
+- **`testing/harness.ts`**: the fakes the tests use (command runner, clock, git), a signing node, and result builders
 
 #### Store (`store/`)
 

@@ -106,12 +106,31 @@ everything generic (see [CONTRIBUTING.md](../../CONTRIBUTING.md)).
   outcome.
 
 ## 3. Failure triage, bisect and revert (module `triage`)
-Built: parsers for JUnit XML, Gradle, vitest, jest and pytest; the rules below as four classes, `code` (`own`),
-`pre-existing` (`base-red`), `flaky` (`flake`) and `infra` (`infra` and `load`); one re-check of only the failed tests at
-the same commit (on spare capacity, where this file says "on a different node"); the two-in-a-row flaky rule of
-[quality.md](quality.md) §15; and the bisect with revert by policy. The re-check executor, the agent mailbox, the task
-sink, the Decision Inbox and the revert PR are interfaces (`src/server/triage/adapters.ts`) with command adapters until
-their modules exist. Not built: TAP and SARIF parsers, the agent for leftover causes, and the nightly run.
+Built ([configuration](../configuration.md#triage)):
+- parsers for JUnit XML, Gradle, vitest, jest and pytest, which read only bounded input;
+- the rules below as four classes: `code` (`own`), `pre-existing` (`base-red`), `flaky` (`flake`) and `infra` (`infra`
+  and `load`);
+- one re-check of only the failed tests at the same commit, on spare capacity (where this file says "on a different
+  node"). It counts as passed only when its answer lists the requested tests as passed;
+- the flaky rule of [quality.md](quality.md) §15 with these defaults: flaky 2 times in a row (`ticket_after: 2`) opens a
+  reliability task due in 7 days and quarantines the test. Quarantined, it still runs but no longer blocks a change, and
+  it still counts on the default branch. The quarantine ends at the deadline, after 5 passes in a row, or when the owner
+  releases it;
+- the bisect per pipeline, with revert by policy. A suspect that is not proven is reverted only on the owner's explicit
+  decision.
+
+Trust:
+- results come in-process from the gate pipelines (`gate.completed`), or signed by a node in `triage.trusted_nodes`;
+- the base commit is the result's own (in-process) or `git merge-base`;
+- protect, revert and quarantine releases need the owner's session (`src/server/human-auth/`);
+- triage's questions go to the Decision Inbox, whose answers it follows.
+
+The re-check executor, the agent mailbox, the task sink and the revert PR are interfaces (`src/server/triage/adapters.ts`)
+with command adapters until their modules exist.
+
+Informational until the policy consumes it: nothing reads a failure's `blocking` yet. §5's merge policy will.
+
+Not built: TAP and SARIF parsers, the agent for leftover causes, and the nightly run.
 - **Structured causes:** every check result carries `causes[]`, parsed from machine-readable output (JUnit XML
   `Caused by` and field errors, pytest, TAP, SARIF, exit codes) by pluggable parsers. It's never only a log tail. A
   context or bootstrap failure is identified as ONE cause, even when it fails hundreds of tests.
