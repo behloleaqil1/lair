@@ -113,22 +113,26 @@ export function validateDragonsConfig(config: ProjectConfig): string[] {
 }
 
 /**
- * List all available project configs
+ * List all available project configs: the `.yaml` and `.yml` files in
+ * projects/ and projects/local/. Only names that pass SAFE_PROJECT_NAME are
+ * returned, so the UI never offers a project that the API then refuses.
+ * `projectsDir` is for tests.
  */
-export function listProjects(): string[] {
-  if (!existsSync(PROJECTS_DIR)) {
+export function listProjects(projectsDir: string = PROJECTS_DIR): string[] {
+  if (!existsSync(projectsDir)) {
     return [];
   }
 
-  const localDir = join(PROJECTS_DIR, "local");
+  const localDir = join(projectsDir, "local");
   const files = [
-    ...readdirSync(PROJECTS_DIR),
+    ...readdirSync(projectsDir),
     ...(existsSync(localDir) ? readdirSync(localDir) : []),
   ];
 
   const names = files
     .filter((f: string) => f.endsWith(".yaml") || f.endsWith(".yml"))
-    .map((f: string) => f.replace(/\.ya?ml$/, ""));
+    .map((f: string) => f.replace(/\.ya?ml$/, ""))
+    .filter((name: string) => SAFE_PROJECT_NAME.test(name));
   return [...new Set(names)];
 }
 

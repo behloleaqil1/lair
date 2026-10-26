@@ -94,6 +94,7 @@ See [Configuration](configuration.md) for all available options.
 
 - Ensure the YAML file is in `projects/` or `projects/local/`
 - Check that the file name ends in `.yaml` (`.yml` is not loaded)
+- Check the project name (the file name without the extension): it must start with a letter or digit and contain only letters, digits, `.`, `_` and `-`. Other files are not listed
 - Verify the YAML syntax is valid
 - Restart the server after adding the file
 
