@@ -735,11 +735,73 @@ function suiteFindings(file: IntegrityFile, hunks: DiffHunk[]): IntegrityFinding
   return findings;
 }
 
+const TEST_NAMES = [
+  /^\s*(?:it|test|specify)\s*(?:\.\s*\w+\s*)?\(\s*(["'`])(.+?)\1/,
+  /^\s*(?:async\s+)?def\s+(test\w*)\s*\(/,
+  /^\s*func\s+(Test\w+)\s*\(/,
+];
+
+/** The names of the test cases on these lines. */
+function testNames(lines: string[]): string[] {
+  const names: string[] = [];
+  for (const line of lines) {
+    for (const re of TEST_NAMES) {
+      const m = re.exec(line);
+      if (m) {
+        names.push(m[m.length - 1]);
+        break;
+      }
+    }
+  }
+  return names;
+}
+
+/**
+ * A deleted test file blocks unless a test file this PR adds has all of its
+ * test cases (a move or a rename the host didn't detect).
+ */
+function removedTestFinding(
+  file: IntegrityFile,
+  hunks: DiffHunk[],
+  addedTests: { path: string; text: string }[],
+): IntegrityFinding {
+  const names = testNames(removedLines(hunks).map((l) => l.text));
+  const home =
+    names.length > 0 ? addedTests.find((t) => names.every((name) => t.text.includes(name))) : undefined;
+  if (home) {
+    return {
+      rule: "test-removed",
+      severity: "low",
+      file: file.path,
+      line: null,
+      text: `Deletes a test file whose ${names.length} test case(s) all appear in ${home.path} (moved).`,
+    };
+  }
+  return {
+    rule: "test-removed",
+    severity: "high",
+    file: file.path,
+    line: null,
+    text:
+      names.length > 0
+        ? `Deletes a test file with ${names.length} test case(s) (first: ${names[0]}) that no added test file has.`
+        : "Deletes a test file.",
+  };
+}
+
 /**
  * Run every integrity check over a PR's changed files.
  */
 export function checkTestIntegrity(files: IntegrityFile[], options: IntegrityOptions): IntegrityFinding[] {
   const findings: IntegrityFinding[] = [];
+  // Test files this PR adds, for telling a moved test file from a deleted one
+  const addedTests = files
+    .filter((f) => f.status === "added" && isTestFile(f.path, options))
+    .map((f) => ({
+      path: f.path,
+      text: f.content ?? addedLines(f.patch ? parsePatch(f.patch) : []).map((l) => l.text).join("\n"),
+    }));
+
   for (const file of files) {
     if (options.ignore.some((g) => matchPath(g, file.path))) continue;
     const hunks = file.patch ? parsePatch(file.patch) : [];
@@ -751,13 +813,7 @@ export function checkTestIntegrity(files: IntegrityFile[], options: IntegrityOpt
       isTestFile(file.path, options) || (file.previousPath !== null && isTestFile(file.previousPath, options));
     if (isTest) {
       if (file.status === "removed") {
-        perFile.push({
-          rule: "test-removed",
-          severity: "high",
-          file: file.path,
-          line: null,
-          text: "Deletes a test file.",
-        });
+        perFile.push(removedTestFinding(file, hunks, addedTests));
       } else {
         perFile.push(...diffFindings(file, hunks));
         const source =

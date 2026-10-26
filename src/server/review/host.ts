@@ -46,6 +46,12 @@ export interface HostCommit {
 
 export interface HostCheck {
   name: string;
+  /** A check run (made by an app) or a commit status (posted by an account) */
+  kind: "check_run" | "status";
+  /** For a check run: the app that created it */
+  app: { id: number; slug: string } | null;
+  /** For a commit status: the account that posted it */
+  creator: string | null;
   state: "pending" | "success" | "failure" | "skipped";
   detail: string;
   url: string | null;
@@ -89,6 +95,10 @@ export interface GitHost {
   ): Promise<HostMergeResult>;
   /** Close a PR that was merged outside the host (a local squash), with a comment */
   closePullRequest(n: number, comment: string): Promise<void>;
+  /** An account's public email, or null when it shows none */
+  publicEmail(login: string): Promise<string | null>;
+  /** The account the token belongs to (who the host's merge commit is authored by) */
+  viewer(): Promise<{ login: string; email: string | null }>;
 }
 
 export class HostError extends Error {

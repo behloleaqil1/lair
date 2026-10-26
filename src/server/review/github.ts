@@ -95,6 +95,7 @@ interface GhCheckRun {
   html_url?: string | null;
   started_at?: string | null;
   completed_at?: string | null;
+  app?: { id?: number; slug?: string } | null;
 }
 
 interface GhStatus {
@@ -103,7 +104,10 @@ interface GhStatus {
   description?: string | null;
   target_url?: string | null;
   updated_at?: string | null;
+  creator?: { login?: string } | null;
 }
+
+const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?$/;
 
 const SHA = /^[0-9a-f]{7,64}$/i;
 
@@ -278,9 +282,13 @@ export class GitHubHost implements GitHost {
       "GET",
       this.repoPath(`/commits/${sha}/check-runs?per_page=100`),
     );
-    const statuses = await this.json<{ statuses?: GhStatus[] }>("GET", this.repoPath(`/commits/${sha}/status`));
+    // The statuses list (not the combined status) says who posted each one
+    const statuses = await this.json<GhStatus[]>("GET", this.repoPath(`/commits/${sha}/statuses?per_page=100`));
     const checks: HostCheck[] = (runs.check_runs ?? []).map((r): HostCheck => ({
       name: r.name,
+      kind: "check_run",
+      app: r.app && typeof r.app.id === "number" && typeof r.app.slug === "string" ? { id: r.app.id, slug: r.app.slug } : null,
+      creator: null,
       state:
         r.status !== "completed"
           ? "pending"
@@ -293,9 +301,12 @@ export class GitHubHost implements GitHost {
       url: r.html_url ?? null,
       at: r.completed_at ?? r.started_at ?? null,
     }));
-    for (const s of statuses.statuses ?? []) {
+    for (const s of statuses) {
       checks.push({
         name: s.context,
+        kind: "status",
+        app: null,
+        creator: s.creator?.login ?? null,
         state: s.state === "success" ? "success" : s.state === "pending" ? "pending" : "failure",
         detail: s.description ?? s.state,
         url: s.target_url ?? null,
@@ -337,5 +348,16 @@ export class GitHubHost implements GitHost {
   async closePullRequest(n: number, comment: string): Promise<void> {
     await this.json("POST", this.repoPath(`/issues/${n}/comments`), { body: comment });
     await this.json("PATCH", this.repoPath(`/pulls/${n}`), { state: "closed" });
+  }
+
+  async publicEmail(login: string): Promise<string | null> {
+    if (!LOGIN.test(login)) throw new HostError(`Not an account name: ${login.slice(0, 80)}`, 400);
+    const user = await this.json<{ email?: string | null }>("GET", `/users/${encodeURIComponent(login)}`);
+    return user.email ?? null;
+  }
+
+  async viewer(): Promise<{ login: string; email: string | null }> {
+    const user = await this.json<{ login?: string; email?: string | null }>("GET", "/user");
+    return { login: user.login ?? "", email: user.email ?? null };
   }
 }

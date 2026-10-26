@@ -277,6 +277,42 @@ describe("removed tests, loosened suites and swallowed errors", () => {
     ]);
   });
 
+  it("does not block a test file that moved: every test case it had is in a test file the PR adds", () => {
+    const removed: IntegrityFile = {
+      path: "src/old/orders.test.ts",
+      previousPath: null,
+      status: "removed",
+      patch: [
+        "@@ -1,4 +0,0 @@",
+        '-it("totals orders", () => {',
+        "-  expect(total([1])).toBe(1);",
+        "-});",
+        '-test("refunds", () => {});',
+      ].join("\n"),
+      content: null,
+    };
+    const moved = added("src/orders/orders.test.ts", [
+      'import { expect, it, test } from "vitest";',
+      'import { total } from "./orders";',
+      'it("totals orders", () => {',
+      "  expect(total([1])).toBe(1);",
+      "});",
+      'test("refunds", () => expect(total([])).toBe(0));',
+    ]);
+    expect(checkTestIntegrity([removed, moved], OPTIONS)).toEqual([
+      expect.objectContaining({ rule: "test-removed", severity: "low", file: "src/old/orders.test.ts" }),
+    ]);
+
+    const partial = added("src/orders/orders.test.ts", [
+      'import { expect, it } from "vitest";',
+      'import { total } from "./orders";',
+      'it("totals orders", () => expect(total([1])).toBe(1));',
+    ]);
+    const lost = checkTestIntegrity([removed, partial], OPTIONS);
+    expect(lost).toEqual([expect.objectContaining({ rule: "test-removed", severity: "high" })]);
+    expect(lost[0].text).toContain("2 test case(s) (first: totals orders)");
+  });
+
   it("flags exclusions added to a test config and a lowered coverage threshold", () => {
     const config = [
       "@@ -3,6 +3,7 @@ export default defineConfig({",

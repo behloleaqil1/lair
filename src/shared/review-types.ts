@@ -159,6 +159,8 @@ export type MergeStrategy = "squash" | "merge" | "rebase" | "ff-only";
 export interface MergePlan {
   method: MergeMethod;
   strategy: MergeStrategy;
+  /** Why this method may not merge at all (e.g. a host merge without host_email_private), or null */
+  refusal: string | null;
   reason: string;
   warnings: string[];
 }
@@ -179,6 +181,8 @@ export interface PrReviewStatus {
   author: ReviewerRef | null;
   /** Where the author came from: registered with Lair, or parsed from the branch name */
   authorSource: "lair" | "branch" | null;
+  /** The host account that opened the PR (agents often share one) */
+  hostUser: string | null;
   labels: string[];
   risk: RiskAssessment;
   slots: SlotStatus[];

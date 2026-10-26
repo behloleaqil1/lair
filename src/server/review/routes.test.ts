@@ -74,8 +74,8 @@ function projectConfig(name: string, review: Record<string, unknown> | undefined
     machines: {},
     read_only: readOnly,
     dragons: {
-      "kiro-a": { name: "A", model: "model-one", machine: "local", instructions: "" },
-      "kiro-b": { name: "B", model: "model-two", machine: "local", instructions: "" },
+      "worker-a": { name: "A", model: "model-one", machine: "local", instructions: "" },
+      "worker-b": { name: "B", model: "model-two", machine: "local", instructions: "" },
     },
     review,
   };
@@ -91,7 +91,7 @@ async function boot() {
   remote.openPull({
     number: 7,
     title: "Double numbers",
-    headRef: "agent/kiro-a/double",
+    headRef: "agent/worker-a/double",
     headSha: head,
     files: [FEATURE, FEATURE_TEST],
   });
@@ -104,7 +104,7 @@ async function boot() {
   });
   const review = {
     enabled: true,
-    authors: { branch_pattern: "^agent/(?<agent>[A-Za-z0-9_-]+)/" },
+    authors: { branch_pattern: "agent/{agent}/**" },
     merge: {
       gate: { source: "checks", required: ["build"] },
       allowed_emails: ["*@users.noreply.github.com", "owner@example.com"],
@@ -164,11 +164,11 @@ describe("review routes: review, policy, merge", () => {
     const before = await status(app, 7);
     expect(before.success).toBe(true);
     expect(before.data.risk.tier).toBe("amber");
-    expect(before.data.author).toEqual({ id: "kiro-a", kind: "agent", model: "model-one" });
+    expect(before.data.author).toEqual({ id: "worker-a", kind: "agent", model: "model-one" });
     expect(before.data.authorSource).toBe("branch");
     expect(before.data.gate).toEqual([expect.objectContaining({ name: "build", status: "passed", sha: head })]);
     expect(before.data.plan).toMatchObject({ method: "local", strategy: "ff-only" });
-    expect(before.data.plan.reason).toContain("public repository");
+    expect(before.data.plan.reason).toContain("host_email_private");
     // The test integrity check ran at the head: a real test of real code, no findings
     expect(before.data.reviews).toEqual([
       expect.objectContaining({ reviewer: { id: "lair:test-integrity", kind: "check" }, headSha: head, verdict: "approve" }),
@@ -178,19 +178,19 @@ describe("review routes: review, policy, merge", () => {
     expect(before.data.reasons.join("\n")).toContain("Required reviews: 0/1");
 
     // The author's own approval doesn't fill the peer slot
-    expect((await review(app, 7, { id: "kiro-a", kind: "agent" }, head)).statusCode).toBe(200);
+    expect((await review(app, 7, { id: "worker-a", kind: "agent" }, head)).statusCode).toBe(200);
     const selfOnly = await status(app, 7);
     expect(selfOnly.data.canMerge).toBe(false);
-    expect(selfOnly.data.slots[0].detail).toContain("kiro-a: is the author");
+    expect(selfOnly.data.slots[0].detail).toContain("worker-a: is the author");
 
     // A peer's approval at the head does
-    const peer = await review(app, 7, { id: "kiro-b", kind: "agent" }, head);
+    const peer = await review(app, 7, { id: "worker-b", kind: "agent" }, head);
     expect(peer.statusCode).toBe(200);
-    expect(peer.json().data).toMatchObject({ stale: false, review: { reviewer: { id: "kiro-b", model: "model-two" } } });
+    expect(peer.json().data).toMatchObject({ stale: false, review: { reviewer: { id: "worker-b", model: "model-two" } } });
     const ready = await status(app, 7);
     expect(ready.data.canMerge).toBe(true);
     expect(ready.data.reasons).toEqual([]);
-    expect(ready.data.slots[0].satisfiedBy.reviewer.id).toBe("kiro-b");
+    expect(ready.data.slots[0].satisfiedBy.reviewer.id).toBe("worker-b");
     expect(ready.data.conditions.every((c: { ok: boolean }) => c.ok)).toBe(true);
 
     // Without confirmation nothing happens
@@ -230,10 +230,10 @@ describe("review routes: review, policy, merge", () => {
   it("refuses a merge whose commits carry an email outside the allow-list, before pushing", async () => {
     const { app, remote, base, seen } = await boot();
     const leaked = remote.commit([base], PRIVATE, "fix: tidy up");
-    remote.openPull({ number: 8, title: "Tidy up", headRef: "agent/kiro-a/tidy", headSha: leaked, files: [FEATURE] });
+    remote.openPull({ number: 8, title: "Tidy up", headRef: "agent/worker-a/tidy", headSha: leaked, files: [FEATURE] });
     remote.setChecks(leaked, [["build", "success"]]);
 
-    await review(app, 8, { id: "kiro-b", kind: "agent" }, leaked);
+    await review(app, 8, { id: "worker-b", kind: "agent" }, leaked);
     expect((await status(app, 8)).data.canMerge).toBe(true);
 
     const res = await app.inject({
@@ -266,7 +266,7 @@ describe("review routes: review, policy, merge", () => {
 
   it("binds approvals to the head: a new push makes them stale, and a merge confirmed at the old head is refused", async () => {
     const { app, remote, head, seen } = await boot();
-    await review(app, 7, { id: "kiro-b", kind: "agent" }, head);
+    await review(app, 7, { id: "worker-b", kind: "agent" }, head);
     expect((await status(app, 7)).data.canMerge).toBe(true);
 
     const pushed = remote.commit([head], AGENT, "feat: handle negatives");
@@ -275,7 +275,7 @@ describe("review routes: review, policy, merge", () => {
     const after = await status(app, 7);
     expect(after.data.headSha).toBe(pushed);
     expect(after.data.canMerge).toBe(false);
-    expect(after.data.reviews.find((r: { reviewer: { id: string } }) => r.reviewer.id === "kiro-b")).toMatchObject({
+    expect(after.data.reviews.find((r: { reviewer: { id: string } }) => r.reviewer.id === "worker-b")).toMatchObject({
       headSha: head,
       stale: true,
     });
@@ -291,7 +291,7 @@ describe("review routes: review, policy, merge", () => {
 
     remote.setChecks(pushed, [["build", "success"]]);
     // A merge confirmed at the old head is refused even though the new head would pass
-    await review(app, 7, { id: "kiro-b", kind: "agent" }, pushed);
+    await review(app, 7, { id: "worker-b", kind: "agent" }, pushed);
     const old = await app.inject({
       method: "POST",
       url: "/api/review/prs/7/merge",
@@ -306,12 +306,12 @@ describe("review routes: review, policy, merge", () => {
 
   it("blocks on open blocking findings until the reviewer resolves them; the author can't", async () => {
     const { app, head } = await boot();
-    const contradictory = await review(app, 7, { id: "kiro-b", kind: "agent" }, head, "approve", [
+    const contradictory = await review(app, 7, { id: "worker-b", kind: "agent" }, head, "approve", [
       { severity: "high", file: "src/feature.ts", line: 2, text: "Overflows", blocking: true },
     ]);
     expect(contradictory.statusCode).toBe(400);
 
-    await review(app, 7, { id: "kiro-b", kind: "agent" }, head, "request_changes", [
+    await review(app, 7, { id: "worker-b", kind: "agent" }, head, "request_changes", [
       { severity: "high", file: "src/feature.ts", line: 2, text: "Overflows for large inputs", blocking: true },
       { severity: "low", file: null, line: null, text: "Consider a doc comment", blocking: false },
     ]);
@@ -319,36 +319,36 @@ describe("review routes: review, policy, merge", () => {
     expect(blocked.data.canMerge).toBe(false);
     const findings = blocked.data.conditions.find((c: { id: string }) => c.id === "findings");
     expect(findings).toMatchObject({ ok: false });
-    expect(findings.detail).toContain("src/feature.ts:2 Overflows for large inputs (kiro-b)");
+    expect(findings.detail).toContain("src/feature.ts:2 Overflows for large inputs (worker-b)");
     expect(blocked.data.conditions.find((c: { id: string }) => c.id === "changes_requested")).toMatchObject({ ok: false });
     const finding = blocked.data.findings.find((f: { blocking: boolean }) => f.blocking);
 
     const byAuthor = await app.inject({
       method: "POST",
       url: `/api/review/findings/${finding.id}/resolve`,
-      payload: { by: { id: "kiro-a", kind: "agent" }, note: "fixed it" },
+      payload: { by: { id: "worker-a", kind: "agent" }, note: "fixed it" },
     });
     expect(byAuthor.statusCode).toBe(403);
 
     const byReviewer = await app.inject({
       method: "POST",
       url: `/api/review/findings/${finding.id}/resolve`,
-      payload: { by: { id: "kiro-b", kind: "agent" }, note: "Bounded in the caller" },
+      payload: { by: { id: "worker-b", kind: "agent" }, note: "Bounded in the caller" },
     });
     expect(byReviewer.statusCode).toBe(200);
-    expect(byReviewer.json().data).toMatchObject({ status: "resolved", resolvedBy: "kiro-b", resolution: "Bounded in the caller" });
+    expect(byReviewer.json().data).toMatchObject({ status: "resolved", resolvedBy: "worker-b", resolution: "Bounded in the caller" });
 
     const stillObjecting = await status(app, 7);
     expect(stillObjecting.data.conditions.find((c: { id: string }) => c.id === "findings")).toMatchObject({ ok: true });
     expect(stillObjecting.data.canMerge).toBe(false);
 
-    await review(app, 7, { id: "kiro-b", kind: "agent" }, head);
+    await review(app, 7, { id: "worker-b", kind: "agent" }, head);
     expect((await status(app, 7)).data.canMerge).toBe(true);
   });
 
   it("holds stop a merge until released", async () => {
     const { app, head } = await boot();
-    await review(app, 7, { id: "kiro-b", kind: "agent" }, head);
+    await review(app, 7, { id: "worker-b", kind: "agent" }, head);
     const hold = await app.inject({
       method: "POST",
       url: "/api/review/holds",
@@ -380,7 +380,7 @@ describe("review routes: review, policy, merge", () => {
     expect((await app.inject({ url: "/api/review/prs/0" })).statusCode).toBe(400);
     expect((await app.inject({ url: "/api/review/prs/abc" })).statusCode).toBe(400);
     // An approval must name the full head sha
-    expect((await review(app, 7, { id: "kiro-b", kind: "agent" }, head.slice(0, 7))).statusCode).toBe(400);
+    expect((await review(app, 7, { id: "worker-b", kind: "agent" }, head.slice(0, 7))).statusCode).toBe(400);
     const asCheck = await app.inject({
       method: "POST",
       url: "/api/review/prs/7/reviews",
@@ -400,7 +400,7 @@ describe("review routes: review, policy, merge", () => {
     expect(broken.errors[0]).toContain("review.merge.gate");
 
     // A read-only project shows why it can't merge, and refuses to
-    await review(app, 7, { id: "kiro-b", kind: "agent" }, head, "approve", [], "frozen");
+    await review(app, 7, { id: "worker-b", kind: "agent" }, head, "approve", [], "frozen");
     const frozen = await status(app, 7, "frozen");
     expect(frozen.data.canMerge).toBe(false);
     expect(frozen.data.reasons).toEqual([expect.stringContaining("Read-only")]);

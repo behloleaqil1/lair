@@ -26,7 +26,7 @@ import type { EventBus } from "../core/event-bus.js";
 import { assessRisk } from "../policy/risk-rules.js";
 import { matchSlots } from "../policy/reviewer-slots.js";
 import { evaluateMergePolicy } from "../policy/merge-policy.js";
-import { parseReviewConfig, type ReviewSettings } from "./config.js";
+import { agentFromBranch, parseReviewConfig, type ReviewSettings } from "./config.js";
 import { checkTestIntegrity, isTestFile, type IntegrityFile } from "./integrity.js";
 import { GitHubHost, tokenFrom, type FetchLike, type TokenSource } from "./github.js";
 import type { GitHost, HostFile, HostPullRequest, HostRepo } from "./host.js";
@@ -116,7 +116,9 @@ export class ReviewService {
     this.settings = o.settings;
     const gate = o.settings.merge.gate;
     this.gateSource =
-      gate.source === "checks" ? hostChecksGate(o.host, gate.required) : signedGate(o.store, o.project, gate);
+      gate.source === "checks"
+        ? hostChecksGate(o.host, gate.required, gate.statusCreators)
+        : signedGate(o.store, o.project, gate);
   }
 
   get readOnly(): boolean {
@@ -154,7 +156,7 @@ export class ReviewService {
   private authorOf(pr: HostPullRequest): { author: ReviewerRef | null; source: "lair" | "branch" | null } {
     const stored = this.o.store.getAuthor(this.project, pr.number);
     if (stored) return { author: this.withModel(stored), source: "lair" };
-    const agent = this.settings.authors.branchPattern?.exec(pr.headRef)?.groups?.agent;
+    const agent = agentFromBranch(this.settings.authors.branchPattern, pr.headRef);
     if (agent) return { author: this.withModel({ id: agent, kind: "agent" }), source: "branch" };
     return { author: null, source: null };
   }
@@ -243,24 +245,27 @@ export class ReviewService {
         inputs.push({ path: f.path, previousPath: f.previousPath, status: f.status, patch: f.patch, content });
       }
       const findings = checkTestIntegrity(inputs, options);
-      const blocking = settings.blockingTiers.includes(tier);
+      // Heuristics: only high and critical findings block, and only in the blocking tiers
+      const blockingTier = settings.blockingTiers.includes(tier);
+      const blocks = (severity: string) => blockingTier && (severity === "high" || severity === "critical");
+      const blockingCount = findings.filter((f) => blocks(f.severity)).length;
       this.o.store.addReview({
         project: this.project,
         pr: pr.number,
         headSha: pr.headSha,
         reviewer: INTEGRITY_REVIEWER,
-        verdict: findings.length > 0 && blocking ? "request_changes" : "approve",
+        verdict: blockingCount > 0 ? "request_changes" : "approve",
         summary:
           findings.length === 0
             ? `No test integrity findings in ${files.length} changed file(s)`
-            : `${findings.length} test integrity finding(s), ${blocking ? `blocking in the ${tier} tier` : `advisory in the ${tier} tier`}`,
+            : `${findings.length} test integrity finding(s), ${blockingCount} blocking in the ${tier} tier`,
         context: { tier, files: files.length },
         findings: findings.map((f) => ({
           severity: f.severity,
           file: f.file,
           line: f.line,
           text: f.text,
-          blocking,
+          blocking: blocks(f.severity),
           rule: f.rule,
         })),
         at: this.now(),
@@ -281,8 +286,6 @@ export class ReviewService {
   ): Promise<string | null> {
     const merge = this.settings.merge;
     if (!merge.holdWhenDefaultRed || !defaultBranch) return null;
-    const exempt = merge.holdExemptLabels.map((l) => l.toLowerCase());
-    if (pr.labels.some((l) => exempt.includes(l.toLowerCase()))) return null;
     let tip = pr.baseRef === defaultBranch ? baseTip : null;
     if (!tip) {
       try {
@@ -293,9 +296,27 @@ export class ReviewService {
     }
     const failed = (await this.gateSource.checksAt(tip)).filter((c) => c.status === "failed");
     if (failed.length === 0) return null;
-    return `the default branch ${defaultBranch} is red at ${short(tip)} (${failed
-      .map((c) => c.name)
-      .join(", ")} failed): only a fix or a PR labelled ${merge.holdExemptLabels.join(" or ")} may merge`;
+    const red = `the default branch ${defaultBranch} is red at ${short(tip)} (${failed.map((c) => c.name).join(", ")} failed)`;
+
+    const exempt = merge.holdExemptLabels.map((l) => l.toLowerCase());
+    const label = pr.labels.find((l) => exempt.includes(l.toLowerCase()));
+    if (exempt.length === 0) return `${red}: nothing merges until it is green`;
+    if (!label) return `${red}: only a revert labelled ${merge.holdExemptLabels.join(" or ")} may merge`;
+    // A label is easy to add: the PR must also be a revert
+    const notRevert = await this.notARevert(pr);
+    return notRevert ? `${red}: the ${label} label doesn't apply, ${notRevert}` : null;
+  }
+
+  /**
+   * Why the PR is not a plain revert, or null when it is: its title starts
+   * with `Revert "` and every commit says `This reverts commit <sha>`.
+   */
+  private async notARevert(pr: HostPullRequest): Promise<string | null> {
+    if (!/^Revert "/.test(pr.title)) return 'its title does not start with Revert "';
+    const commits = await this.o.host.listCommits(pr.number);
+    if (commits.length === 0) return "it has no commits";
+    const plain = commits.find((c) => !/This reverts commit [0-9a-f]{40}/.test(c.message));
+    return plain ? `commit ${short(plain.sha)} does not say which commit it reverts` : null;
   }
 
   /** Evaluate a PR: everything the merge policy looks at, and its verdict. */
@@ -374,7 +395,9 @@ export class ReviewService {
       defaultBranchRed: red,
     });
 
+    const plan = planMerge(this.settings.merge);
     const reasons = [...policy.reasons];
+    if (plan.refusal) reasons.push(`Merge method: ${plan.refusal}`);
     if (this.readOnly) reasons.push("Read-only: the project sets read_only: true, so Lair does not merge");
     const status: PrReviewStatus = {
       project: this.project,
@@ -397,9 +420,10 @@ export class ReviewService {
       gate,
       holds,
       conditions: policy.conditions,
-      canMerge: policy.allowed && !this.readOnly,
+      hostUser: pr.user,
+      canMerge: policy.allowed && !plan.refusal && !this.readOnly,
       reasons,
-      plan: planMerge(this.settings.merge, repo),
+      plan,
       readOnly: this.readOnly,
       evaluatedAt: this.now(),
     };
@@ -661,6 +685,7 @@ export class ReviewService {
           title,
           body,
           allowedEmails: merge.allowedEmails,
+          prUser: status.hostUser,
         });
       } else {
         const strategy = plan.strategy;

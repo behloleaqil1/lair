@@ -5,8 +5,15 @@
 export { ReviewManager, ReviewService, ReviewError, INTEGRITY_REVIEWER, systemClock } from "./service.js";
 export type { Clock, ReviewInput, RequestOutcome, ProjectEntry, ReviewManagerOptions } from "./service.js";
 export { registerReviewRoutes } from "./routes.js";
-export { parseReviewConfig, DEFAULT_REVIEWERS, NOREPLY_EMAILS } from "./config.js";
-export type { ReviewSettings, MergeSettings, GateSettings, IntegritySettings } from "./config.js";
+export {
+  parseReviewConfig,
+  compileBranchTemplate,
+  agentFromBranch,
+  DEFAULT_REVIEWERS,
+  DEFAULT_CHECK_APP,
+  NOREPLY_EMAILS,
+} from "./config.js";
+export type { ReviewSettings, MergeSettings, GateSettings, IntegritySettings, RequiredCheck } from "./config.js";
 export { ReviewStore } from "./store.js";
 export { checkTestIntegrity, classifyAssertion, isTestFile } from "./integrity.js";
 export type { IntegrityFile, IntegrityFinding, IntegrityOptions, IntegrityRule } from "./integrity.js";
@@ -25,7 +32,7 @@ export {
   maskEmail,
 } from "./executor.js";
 export type { MergeExecution, PublishedCommit, EmailViolation } from "./executor.js";
-export { hostChecksGate, signedGate, checkVerdict } from "./gate-source.js";
+export { hostChecksGate, signedGate, checkVerdict, trustedCheck } from "./gate-source.js";
 export type { GateSource } from "./gate-source.js";
 export {
   eventBusDecisionSink,

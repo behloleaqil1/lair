@@ -54,7 +54,17 @@ export interface FakeCheckRun {
   status: "completed" | "in_progress" | "queued";
   conclusion: string | null;
   completed_at: string | null;
+  app: { id: number; slug: string };
 }
+
+export interface FakeStatus {
+  context: string;
+  state: "success" | "failure" | "error" | "pending";
+  creator: string;
+}
+
+/** GitHub Actions, the app whose check runs count by default. */
+export const ACTIONS_APP = { id: 15368, slug: "github-actions" };
 
 /** The identity the host writes its own merges with. */
 export const HOST_ACCOUNT: Person = { name: "Host Account", email: "account-owner@example.com" };
@@ -78,6 +88,11 @@ export class FakeRemote {
   readonly branches = new Map<string, string>();
   readonly pulls = new Map<number, FakePull>();
   readonly checks = new Map<string, FakeCheckRun[]>();
+  readonly statuses = new Map<string, FakeStatus[]>();
+  /** Accounts' public emails (an account missing here shows none) */
+  readonly publicEmails = new Map<string, string>();
+  /** The account the token belongs to */
+  viewer = "example-bot";
   readonly contents = new Map<string, string>();
   /** Every API request, so a test can show what was never called */
   readonly requests: { method: string; path: string; body: unknown }[] = [];
@@ -160,8 +175,8 @@ export class FakeRemote {
     }
   }
 
-  /** Completed check runs at `sha`: [name, conclusion]. */
-  setChecks(sha: string, runs: [string, string][]): void {
+  /** Completed check runs at `sha`: [name, conclusion], made by `app` (GitHub Actions by default). */
+  setChecks(sha: string, runs: [string, string][], app = ACTIONS_APP): void {
     this.checks.set(
       sha,
       runs.map(([name, conclusion], i) => ({
@@ -169,6 +184,7 @@ export class FakeRemote {
         status: "completed",
         conclusion,
         completed_at: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(),
+        app,
       })),
     );
   }
@@ -220,11 +236,18 @@ export function fakeGitHubApi(remote: FakeRemote): FetchLike {
     });
     const notFound = () => reply(404, { message: "Not Found" });
 
+    let m: RegExpExecArray | null;
+    if (method === "GET" && (m = /^\/users\/([^/]+)$/.exec(path))) {
+      return reply(200, { login: m[1], email: remote.publicEmails.get(m[1]) ?? null });
+    }
+    if (method === "GET" && path === "/user") {
+      return reply(200, { login: remote.viewer, email: remote.publicEmails.get(remote.viewer) ?? null });
+    }
+
     const prefix = `/repos/${remote.repo}`;
     if (!path.startsWith(prefix)) return notFound();
     const rest = path.slice(prefix.length);
     const page = Number(u.searchParams.get("page") ?? "1");
-    let m: RegExpExecArray | null;
 
     if (method === "GET" && rest === "") {
       return reply(200, { private: remote.isPrivate, default_branch: remote.defaultBranch });
@@ -307,8 +330,18 @@ export function fakeGitHubApi(remote: FakeRemote): FetchLike {
         check_runs: runs.map((r) => ({ ...r, html_url: null, started_at: r.completed_at })),
       });
     }
-    if (method === "GET" && /^\/commits\/[0-9a-f]+\/status$/.test(rest)) {
-      return reply(200, { state: "pending", statuses: [] });
+    if (method === "GET" && (m = /^\/commits\/([0-9a-f]+)\/statuses$/.exec(rest))) {
+      return reply(
+        200,
+        (remote.statuses.get(m[1]) ?? []).map((s) => ({
+          context: s.context,
+          state: s.state,
+          description: s.state,
+          target_url: null,
+          updated_at: "2026-01-01T00:30:00Z",
+          creator: { login: s.creator },
+        })),
+      );
     }
     if (method === "POST" && /^\/issues\/\d+\/comments$/.test(rest)) {
       return reply(201, { id: 1 });

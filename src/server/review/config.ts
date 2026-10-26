@@ -47,12 +47,34 @@ const SlotSchema = z.union(
   },
 );
 
+/** GitHub Actions' app slug: check runs from any other app don't count unless configured. */
+export const DEFAULT_CHECK_APP = "github-actions";
+
+const RequiredCheckSchema = z.union([
+  z
+    .string()
+    .min(1)
+    .transform((name) => ({ name, app: DEFAULT_CHECK_APP })),
+  z
+    .object({
+      name: z.string().min(1),
+      /** The app that must have created the check run: its slug or numeric id */
+      app: z
+        .union([z.string().min(1), z.number().int().positive()])
+        .transform((app) => String(app))
+        .default(DEFAULT_CHECK_APP),
+    })
+    .strict(),
+]);
+
 const GateSchema = z.discriminatedUnion("source", [
   z
     .object({
       source: z.literal("checks"),
-      /** Check-run names or commit-status contexts on the git host */
-      required: z.array(z.string().min(1)).min(1),
+      /** Check runs by name, each from an allow-listed app (default GitHub Actions) */
+      required: z.array(RequiredCheckSchema).min(1),
+      /** Accounts whose commit statuses count; statuses from anyone else are ignored */
+      status_creators: z.array(z.string().min(1)).default([]),
     })
     .strict(),
   z
@@ -87,7 +109,8 @@ const MergeSchema = z
     clone_url: z.string().min(1).optional(),
     work_dir: z.string().min(1).optional(),
     hold_when_default_red: z.boolean().default(true),
-    hold_exempt_labels: z.array(z.string().min(1)).default(["revert"]),
+    /** Labels that let a proven revert merge while the default branch is red (none by default) */
+    hold_exempt_labels: z.array(z.string().min(1)).default([]),
   })
   .strict();
 
@@ -102,8 +125,8 @@ const ReviewSchema = z
     default_branch: z.string().min(1).optional(),
     authors: z
       .object({
-        /** A regular expression with a named group `agent`, matched against the PR's branch */
-        branch_pattern: z.string().min(1).optional(),
+        /** A branch template such as agent/{agent}/** (not a regular expression) */
+        branch_pattern: z.string().min(1).max(200).optional(),
         /** Agent id -> model, for agents not listed under `dragons:` */
         models: z.record(z.string().min(1)).default({}),
       })
@@ -140,8 +163,14 @@ const ReviewSchema = z
   })
   .strict();
 
+/** A required check run: its name, and the app (slug or numeric id) that must have created it. */
+export interface RequiredCheck {
+  name: string;
+  app: string;
+}
+
 export type GateSettings =
-  | { source: "checks"; required: string[] }
+  | { source: "checks"; required: RequiredCheck[]; statusCreators: string[] }
   | {
       source: "signed";
       required: string[];
@@ -220,6 +249,48 @@ function parseSlot(value: z.infer<typeof SlotSchema>): ReviewSlot {
   return { anyOf: value.any_of.map(parseOption), differentModel: value.different_model };
 }
 
+/** Branch names longer than this never match `authors.branch_pattern`. */
+export const MAX_BRANCH_LENGTH = 255;
+
+const TEMPLATE_CHARS = /^[A-Za-z0-9._/{}*-]+$/;
+
+/**
+ * Compile a branch template such as `agent/{agent}/**` into an anchored
+ * regular expression. `{agent}` (exactly once) captures an agent id, `*`
+ * matches within one path segment and `**` (at most once) across segments.
+ * Everything else is literal, so a template can't be a catastrophic pattern.
+ */
+export function compileBranchTemplate(template: string): RegExp | string {
+  if (!TEMPLATE_CHARS.test(template)) {
+    return "use letters, digits, '.', '_', '-', '/', the wildcards * and **, and {agent}";
+  }
+  if (template.split("{agent}").length !== 2) return "needs {agent} exactly once";
+  if (template.split("**").length > 2) return "** may appear at most once";
+  let source = "";
+  for (let i = 0; i < template.length; i++) {
+    if (template.startsWith("{agent}", i)) {
+      source += "(?<agent>[A-Za-z0-9][A-Za-z0-9._-]{0,63})";
+      i += "{agent}".length - 1;
+    } else if (template.startsWith("**", i)) {
+      source += ".*";
+      i += 1;
+    } else if (template[i] === "*") {
+      source += "[^/]*";
+    } else if (template[i] === "{" || template[i] === "}") {
+      return "braces are only for {agent}";
+    } else {
+      source += template[i] === "." ? "\\." : template[i];
+    }
+  }
+  return new RegExp(`^${source}$`);
+}
+
+/** The agent id a branch name carries, per the compiled template; null when it doesn't match or is too long. */
+export function agentFromBranch(pattern: RegExp | null, branch: string): string | null {
+  if (!pattern || branch.length > MAX_BRANCH_LENGTH) return null;
+  return pattern.exec(branch)?.groups?.agent ?? null;
+}
+
 function cloneUrlFor(apiUrl: string, repo: string): string {
   const api = new URL(apiUrl);
   const web = api.hostname === "api.github.com" ? "https://github.com" : api.origin;
@@ -247,15 +318,11 @@ export function parseReviewConfig(raw: unknown, project: Pick<ProjectConfig, "gi
 
   let branchPattern: RegExp | null = null;
   if (value.authors.branch_pattern) {
-    try {
-      branchPattern = new RegExp(value.authors.branch_pattern);
-      if (!value.authors.branch_pattern.includes("(?<agent>")) {
-        errors.push("review.authors.branch_pattern: needs a named group (?<agent>...)");
-      }
-    } catch (e) {
-      errors.push(
-        `review.authors.branch_pattern: not a valid regular expression (${e instanceof Error ? e.message : String(e)})`,
-      );
+    const compiled = compileBranchTemplate(value.authors.branch_pattern);
+    if (typeof compiled === "string") {
+      errors.push(`review.authors.branch_pattern: ${compiled} (e.g. agent/{agent}/**)`);
+    } else {
+      branchPattern = compiled;
     }
   }
 
@@ -311,12 +378,12 @@ export function parseReviewConfig(raw: unknown, project: Pick<ProjectConfig, "gi
   if (errors.length > 0) return { ok: false, errors };
 
   const identity = merge?.identity ?? null;
-  let gate: GateSettings = { source: "checks", required: [] };
+  let gate: GateSettings = { source: "checks", required: [], statusCreators: [] };
   if (merge) {
     const g = merge.gate;
     gate =
       g.source === "checks"
-        ? { source: "checks", required: g.required }
+        ? { source: "checks", required: g.required, statusCreators: g.status_creators }
         : {
             source: "signed",
             required: g.required,
@@ -358,7 +425,7 @@ export function parseReviewConfig(raw: unknown, project: Pick<ProjectConfig, "gi
         cloneUrl: merge?.clone_url ?? (repo ? cloneUrlFor(value.api_url, repo) : ""),
         workDir: merge?.work_dir ?? "data/review",
         holdWhenDefaultRed: merge?.hold_when_default_red ?? true,
-        holdExemptLabels: merge?.hold_exempt_labels ?? ["revert"],
+        holdExemptLabels: merge?.hold_exempt_labels ?? [],
       },
     },
   };

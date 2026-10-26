@@ -1,8 +1,9 @@
 /**
  * Where "the required gate passed at the exact head" comes from:
  *
- * - checks: the git host's check runs and commit statuses for that commit
- *   (e.g. CI jobs), by name;
+ * - checks: the git host's check runs for that commit, by name, made by an
+ *   allow-listed app (GitHub Actions by default), plus commit statuses only
+ *   from allow-listed accounts;
  * - signed: gate results signed by a Lair node and posted to Lair, verified
  *   with the node keys and pipeline versions in the config (the policy
  *   engine's own verification, src/server/policy/policy-evaluator.ts).
@@ -10,7 +11,7 @@
 import type { GateCheck } from "../../shared/review-types.js";
 import type { PolicyConfig, PullRequest } from "../../shared/policy-types.js";
 import { verifyGateResults } from "../policy/policy-evaluator.js";
-import type { GateSettings } from "./config.js";
+import type { GateSettings, RequiredCheck } from "./config.js";
 import type { GitHost, HostCheck } from "./host.js";
 import type { ReviewStore } from "./store.js";
 
@@ -42,17 +43,34 @@ export function checkVerdict(name: string, sha: string, runs: HostCheck[]): Gate
   }
 }
 
-export function hostChecksGate(host: GitHost, required: string[]): GateSource {
+/**
+ * True if `check` comes from a source the config trusts: a check run made by
+ * the required app (slug or numeric id), or a commit status posted by an
+ * allow-listed account. Anyone who can write statuses (or install an app)
+ * can post a "success" under any name, so the name alone proves nothing.
+ */
+export function trustedCheck(check: HostCheck, required: RequiredCheck, statusCreators: string[]): boolean {
+  if (check.kind === "check_run") {
+    return check.app !== null && (check.app.slug === required.app || String(check.app.id) === required.app);
+  }
+  return check.creator !== null && statusCreators.includes(check.creator);
+}
+
+export function hostChecksGate(host: GitHost, required: RequiredCheck[], statusCreators: string[]): GateSource {
   return {
     async checksAt(sha) {
       const checks = await host.listChecks(sha);
-      return required.map((name) =>
-        checkVerdict(
-          name,
-          sha,
-          checks.filter((c) => c.name === name),
-        ),
-      );
+      return required.map((req) => {
+        const named = checks.filter((c) => c.name === req.name);
+        const trusted = named.filter((c) => trustedCheck(c, req, statusCreators));
+        const verdict = checkVerdict(req.name, sha, trusted);
+        const ignored = named.length - trusted.length;
+        if (ignored > 0 && verdict.status !== "passed") {
+          const from = [`app ${req.app}`, ...statusCreators.map((c) => `statuses by ${c}`)].join(" or ");
+          verdict.detail = `${verdict.detail}; ignored ${ignored} result(s) not from ${from}`;
+        }
+        return verdict;
+      });
     },
   };
 }

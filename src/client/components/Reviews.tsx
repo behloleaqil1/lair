@@ -487,6 +487,9 @@ export function Reviews({ project, refreshKey }: Props) {
             <p style={{ ...muted, marginTop: "0.75rem" }}>
               Method: {status.plan.method} ({status.plan.strategy}): {status.plan.reason}
             </p>
+            {status.plan.refusal && (
+              <p style={{ color: "var(--error)", fontSize: "0.85rem" }}>{status.plan.refusal}</p>
+            )}
             {status.plan.warnings.map((w) => (
               <p key={w} style={{ color: "var(--warning)", fontSize: "0.85rem" }}>
                 {w}

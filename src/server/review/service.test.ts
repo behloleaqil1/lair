@@ -96,7 +96,7 @@ function setup(review: Record<string, unknown>, files: FakeFile[], labels: strin
   remote.branches.set("main", base);
   remote.setChecks(base, [["build", "success"]]);
   const head = remote.commit([base], AGENT, "change");
-  remote.openPull({ number: 3, title: "A change", headRef: "agent/kiro-a/change", headSha: head, files, labels });
+  remote.openPull({ number: 3, title: "A change", headRef: "agent/worker-a/change", headSha: head, files, labels });
   remote.setChecks(head, [["build", "success"]]);
   const decisions: DecisionRequest[] = [];
   const assignments: ReviewAssignment[] = [];
@@ -116,7 +116,7 @@ function setup(review: Record<string, unknown>, files: FakeFile[], labels: strin
     assigner: {
       async assign(assignment) {
         assignments.push(assignment);
-        return { assigned: true, agent: assignment.reviewer ?? "kiro-c", detail: "queued" };
+        return { assigned: true, agent: assignment.reviewer ?? "worker-c", detail: "queued" };
       },
     },
   });
@@ -125,7 +125,7 @@ function setup(review: Record<string, unknown>, files: FakeFile[], labels: strin
       name: "demo",
       config: config({
         enabled: true,
-        authors: { branch_pattern: "^agent/(?<agent>[A-Za-z0-9_-]+)/", models: { "kiro-a": "model-one" } },
+        authors: { branch_pattern: "agent/{agent}/**", models: { "worker-a": "model-one" } },
         merge: { gate: { source: "checks", required: ["build"] }, work_dir: join(dir, "work") },
         ...review,
       }),
@@ -152,7 +152,7 @@ describe("required reviewers per tier", () => {
     expect(before.slots.map((s) => s.label)).toEqual(["a human or agent lead-reviewer"]);
 
     await service.submitReview(3, {
-      reviewer: { id: "kiro-b", kind: "agent" },
+      reviewer: { id: "worker-b", kind: "agent" },
       headSha: head,
       verdict: "approve",
       summary: "",
@@ -160,7 +160,7 @@ describe("required reviewers per tier", () => {
     });
     const peerOnly = await service.status(3);
     expect(peerOnly.canMerge).toBe(false);
-    expect(peerOnly.slots[0].detail).toContain("kiro-b: not a human");
+    expect(peerOnly.slots[0].detail).toContain("worker-b: not a human");
 
     await service.submitReview(3, {
       reviewer: { id: "lead-reviewer", kind: "agent" },
@@ -192,14 +192,14 @@ describe("required reviewers per tier", () => {
     // The human fills the human slot; it can't also be the peer
     expect(onlyHuman.slots.map((s) => s.satisfiedBy?.reviewer.id ?? null)).toEqual(["owner", null]);
 
-    await approve("kiro-b", "agent", "model-one");
+    await approve("worker-b", "agent", "model-one");
     const sameModel = await service.status(3);
     expect(sameModel.slots[1].satisfiedBy).toBeNull();
     expect(sameModel.slots[1].detail).toContain("uses the author's model model-one");
 
-    await approve("kiro-c", "agent", "model-two");
+    await approve("worker-c", "agent", "model-two");
     const done = await service.status(3);
-    expect(done.slots.map((s) => s.satisfiedBy?.reviewer.id)).toEqual(["owner", "kiro-c"]);
+    expect(done.slots.map((s) => s.satisfiedBy?.reviewer.id)).toEqual(["owner", "worker-c"]);
     expect(done.canMerge).toBe(true);
   });
 
@@ -209,7 +209,7 @@ describe("required reviewers per tier", () => {
     expect(status.risk.tier).toBe("green");
     expect(status.slots[0].label).toBe("the author's self-check");
     await service.submitReview(3, {
-      reviewer: { id: "kiro-a", kind: "agent" },
+      reviewer: { id: "worker-a", kind: "agent" },
       headSha: head,
       verdict: "approve",
       summary: "self-check",
@@ -224,8 +224,8 @@ describe("required reviewers per tier", () => {
     const unknown = await service.status(4);
     expect(unknown.author).toBeNull();
     expect(unknown.slots[0].detail).toContain("the PR's author is unknown");
-    service.setAuthor(4, { id: "kiro-d", kind: "agent" });
-    expect((await service.status(4)).author).toEqual({ id: "kiro-d", kind: "agent" });
+    service.setAuthor(4, { id: "worker-d", kind: "agent" });
+    expect((await service.status(4)).author).toEqual({ id: "worker-d", kind: "agent" });
   });
 });
 
@@ -255,10 +255,10 @@ describe("test integrity check in the policy", () => {
     expect(condition(status, "findings").detail).toContain("src/orders/orders.test.ts:8");
 
     // The author can't wave it through; a human can, with a reason
-    await expect(service.resolveFinding(finding.id, { id: "kiro-a", kind: "agent" }, "dismissed", "fine")).rejects.toThrow(
+    await expect(service.resolveFinding(finding.id, { id: "worker-a", kind: "agent" }, "dismissed", "fine")).rejects.toThrow(
       "author",
     );
-    await expect(service.resolveFinding(finding.id, { id: "kiro-b", kind: "agent" }, "dismissed", "fine")).rejects.toThrow(
+    await expect(service.resolveFinding(finding.id, { id: "worker-b", kind: "agent" }, "dismissed", "fine")).rejects.toThrow(
       "Only a human",
     );
     const dismissed = await service.resolveFinding(finding.id, { id: "owner", kind: "human" }, "dismissed", "Smoke test");
@@ -269,7 +269,7 @@ describe("test integrity check in the policy", () => {
   it("records the same finding as advisory in the green tier", async () => {
     const { service, head } = setup({}, [SELF_ASSERTING]);
     await service.submitReview(3, {
-      reviewer: { id: "kiro-a", kind: "agent" },
+      reviewer: { id: "worker-a", kind: "agent" },
       headSha: head,
       verdict: "approve",
       summary: "",
@@ -280,13 +280,48 @@ describe("test integrity check in the policy", () => {
     expect(status.findings).toEqual([expect.objectContaining({ rule: "self-asserting-test", blocking: false })]);
     expect(status.canMerge).toBe(true);
   });
+
+  it("blocks only high and critical findings in a red PR: a swallowed error is advisory", async () => {
+    const source = [
+      'import { expect, it } from "vitest";',
+      'import { load } from "./load";',
+      'it("loads", async () => {',
+      "  try {",
+      "    await load();",
+      "  } catch {}",
+      "  expect(await load()).toBe(1);",
+      "});",
+    ];
+    const loadTest: FakeFile = {
+      filename: "src/load.test.ts",
+      status: "added",
+      additions: source.length,
+      deletions: 0,
+      patch: `@@ -0,0 +1,${source.length} @@\n${source.map((l) => `+${l}`).join("\n")}`,
+      content: source.join("\n"),
+    };
+    const { service, head } = setup({}, [MIGRATION, loadTest]);
+    await service.submitReview(3, {
+      reviewer: { id: "owner", kind: "human" },
+      headSha: head,
+      verdict: "approve",
+      summary: "",
+      findings: [],
+    });
+    const status = await service.status(3);
+    expect(status.risk.tier).toBe("red");
+    expect(status.findings).toEqual([
+      expect.objectContaining({ rule: "error-swallowed", severity: "medium", blocking: false, line: 6 }),
+    ]);
+    expect(status.canMerge).toBe(true);
+  });
 });
 
 describe("merge conditions", () => {
   it("refuses with the failed gate, conflicts and a branch behind its base, naming each", async () => {
     const { service, remote, base, head } = setup({}, [README]);
     await service.submitReview(3, {
-      reviewer: { id: "kiro-a", kind: "agent" },
+      reviewer: { id: "worker-a", kind: "agent" },
       headSha: head,
       verdict: "approve",
       summary: "",
@@ -312,10 +347,10 @@ describe("merge conditions", () => {
     expect(remote.branches.get("main")).toBe(moved);
   });
 
-  it("holds every merge while the default branch is red, except a PR labelled revert", async () => {
-    const { service, remote, base, head } = setup({}, [README]);
+  it("holds every merge while the default branch is red, and no label exempts a PR by default", async () => {
+    const { service, remote, base, head } = setup({}, [README], ["revert"]);
     await service.submitReview(3, {
-      reviewer: { id: "kiro-a", kind: "agent" },
+      reviewer: { id: "worker-a", kind: "agent" },
       headSha: head,
       verdict: "approve",
       summary: "",
@@ -323,11 +358,71 @@ describe("merge conditions", () => {
     });
     remote.setChecks(base, [["build", "failure"]]);
     const red = await service.status(3);
-    expect(condition(red, "holds").detail).toContain(`the default branch main is red at ${base.slice(0, 7)}`);
+    expect(condition(red, "holds").detail).toBe(
+      `the default branch main is red at ${base.slice(0, 7)} (build failed): nothing merges until it is green`,
+    );
     expect(red.canMerge).toBe(false);
+  });
 
-    remote.pulls.get(3)!.labels = ["revert"];
-    expect(condition(await service.status(3), "holds").ok).toBe(true);
+  it("lets an exempt label through only on a proven revert: the title and every commit say so", async () => {
+    const { service, remote, base, head } = setup(
+      { merge: { gate: { source: "checks", required: ["build"] }, hold_exempt_labels: ["revert"] } },
+      [README],
+      ["revert"],
+    );
+    remote.setChecks(base, [["build", "failure"]]);
+    const labelOnly = await service.status(3);
+    expect(condition(labelOnly, "holds").detail).toContain(
+      'the revert label doesn\'t apply, its title does not start with Revert "',
+    );
+    remote.pulls.get(3)!.title = 'Revert "Add orders"';
+    expect(condition(await service.status(3), "holds").detail).toContain(
+      `commit ${head.slice(0, 7)} does not say which commit it reverts`,
+    );
+
+    const revert = remote.commit([base], AGENT, `Revert "Add orders"\n\nThis reverts commit ${"a".repeat(40)}.`);
+    remote.pushToPull(3, revert);
+    remote.setChecks(revert, [["build", "success"]]);
+    await service.submitReview(3, {
+      reviewer: { id: "worker-a", kind: "agent" },
+      headSha: revert,
+      verdict: "approve",
+      summary: "",
+      findings: [],
+    });
+    const proven = await service.status(3);
+    expect(condition(proven, "holds").ok).toBe(true);
+    expect(proven.canMerge).toBe(true);
+  });
+
+  it("counts only check runs from the allow-listed app, not a same-named run or status from anyone else", async () => {
+    const { service, remote, head } = setup({}, [README]);
+    await service.submitReview(3, {
+      reviewer: { id: "worker-a", kind: "agent" },
+      headSha: head,
+      verdict: "approve",
+      summary: "",
+      findings: [],
+    });
+    remote.setChecks(head, [["build", "success"]], { id: 999, slug: "someone-elses-app" });
+    remote.statuses.set(head, [{ context: "build", state: "success", creator: "untrusted-account" }]);
+    const forged = await service.status(3);
+    expect(forged.gate).toEqual([expect.objectContaining({ name: "build", status: "missing", sha: head })]);
+    expect(forged.gate[0].detail).toContain("ignored 2 result(s) not from app github-actions");
+    expect(forged.canMerge).toBe(false);
+
+    remote.setChecks(head, [["build", "success"]]);
+    expect((await service.status(3)).gate[0].status).toBe("passed");
+  });
+
+  it("counts a commit status only from an allow-listed account", async () => {
+    const { service, remote, head } = setup(
+      { merge: { gate: { source: "checks", required: ["build"], status_creators: ["release-bot"] } } },
+      [README],
+    );
+    remote.checks.delete(head);
+    remote.statuses.set(head, [{ context: "build", state: "success", creator: "release-bot" }]);
+    expect((await service.status(3)).gate[0]).toMatchObject({ name: "build", status: "passed" });
   });
 
   it("accepts a signed gate result at the head and rejects one with a bad signature", async () => {
@@ -347,7 +442,7 @@ describe("merge conditions", () => {
       [README],
     );
     await service.submitReview(3, {
-      reviewer: { id: "kiro-a", kind: "agent" },
+      reviewer: { id: "worker-a", kind: "agent" },
       headSha: head,
       verdict: "approve",
       summary: "",
@@ -359,7 +454,7 @@ describe("merge conditions", () => {
       id: "20260101T000000Z-example-abcdef12-1",
       pipelineId: "backend",
       commitSha: head,
-      branch: "agent/kiro-a/change",
+      branch: "agent/worker-a/change",
       projectId: "demo",
       nodeId: "node-1",
       status: "passed",
@@ -405,7 +500,7 @@ describe("asking for missing reviewers", () => {
     ]);
     expect(assignments).toEqual([
       expect.objectContaining({ reviewer: "lead-reviewer", role: "review", headSha: head, tier: "red" }),
-      expect.objectContaining({ reviewer: null, exclude: ["kiro-a"], differentModelFrom: "model-one" }),
+      expect.objectContaining({ reviewer: null, exclude: ["worker-a"], differentModelFrom: "model-one" }),
     ]);
 
     const again = await service.requestReviews(3);

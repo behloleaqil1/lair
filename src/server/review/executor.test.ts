@@ -176,23 +176,18 @@ describe("choosing the method", () => {
     return parsed.settings.merge;
   };
 
-  it("merges locally when the repository is public and the host email's privacy is unknown", () => {
-    expect(planMerge(settings({}), { private: false, defaultBranch: "main" })).toMatchObject({
-      method: "local",
-      strategy: "ff-only",
-    });
-    expect(planMerge(settings({}), null).method).toBe("local");
-    expect(planMerge(settings({}), { private: true, defaultBranch: "main" })).toMatchObject({
+  it("merges locally unless the host account's email is declared private, whatever the repository's visibility", () => {
+    expect(planMerge(settings({}))).toMatchObject({ method: "local", strategy: "ff-only", refusal: null });
+    expect(planMerge(settings({ host_email_private: true }))).toMatchObject({
       method: "host",
       strategy: "squash",
+      refusal: null,
     });
-    expect(planMerge(settings({ host_email_private: true }), { private: false, defaultBranch: "main" })).toMatchObject({
-      method: "host",
-      warnings: [],
-    });
-    expect(planMerge(settings({ method: "host" }), { private: false, defaultBranch: "main" }).warnings[0]).toContain(
-      "Lair cannot check that email",
-    );
+    // Asking for host merges without declaring the email private is refused, not silently allowed
+    const host = planMerge(settings({ method: "host" }));
+    expect(host.method).toBe("host");
+    expect(host.refusal).toContain("host_email_private: true");
+    expect(planMerge(settings({ method: "local", host_email_private: true })).method).toBe("local");
   });
 
   it("needs an identity for a local squash, and defaults the allow-list to it plus noreply addresses", () => {
@@ -231,6 +226,7 @@ describe("host merge through the GitHub provider", () => {
       title: "x",
       body: "",
       allowedEmails: ALLOWED,
+      prUser: "example-bot",
     });
     expect(result.merged).toBe(false);
     expect(result.reasons).toHaveLength(2);
@@ -247,6 +243,7 @@ describe("host merge through the GitHub provider", () => {
       title: "x",
       body: `Reviewed by ${PRIVATE.email}`,
       allowedEmails: ALLOWED,
+      prUser: "example-bot",
     });
     expect(leaky.merged).toBe(false);
     expect(leaky.emailViolations).toEqual([expect.objectContaining({ role: "message" })]);
@@ -258,11 +255,20 @@ describe("host merge through the GitHub provider", () => {
       title: "x",
       body: "",
       allowedEmails: ALLOWED,
+      prUser: "example-bot",
     });
     expect(stale.merged).toBe(false);
     expect(stale.reasons[0]).toContain("409");
 
-    const merged = await mergeOnHost(host, { pr: 5, headSha: head, strategy: "squash", title: "x", body: "", allowedEmails: ALLOWED });
+    const merged = await mergeOnHost(host, {
+      pr: 5,
+      headSha: head,
+      strategy: "squash",
+      title: "x",
+      body: "",
+      allowedEmails: ALLOWED,
+      prUser: "example-bot",
+    });
     expect(merged.merged).toBe(true);
     const tip = remote.branches.get("main")!;
     expect(merged.resultSha).toBe(tip);
@@ -272,5 +278,51 @@ describe("host merge through the GitHub provider", () => {
       expect.objectContaining({ sha: base }),
       expect.objectContaining({ sha: head, merge_method: "squash" }),
     ]);
+  });
+
+  it("refuses a host squash or merge commit authored as an account whose public email isn't allowed", async () => {
+    const { remote, base, head, host } = hostRepo(AGENT);
+    remote.publicEmails.set("example-bot", PRIVATE.email);
+    const squash = await mergeOnHost(host, {
+      pr: 5,
+      headSha: head,
+      strategy: "squash",
+      title: "x",
+      body: "",
+      allowedEmails: ALLOWED,
+      prUser: "example-bot",
+    });
+    expect(squash.merged).toBe(false);
+    expect(squash.reasons).toEqual([
+      "the host would author the squash commit as example-bot, whose public email s***@private.example is not in review.merge.allowed_emails",
+    ]);
+
+    // A merge commit is authored as the token's account
+    remote.publicEmails.delete("example-bot");
+    remote.viewer = "merge-account";
+    remote.publicEmails.set("merge-account", PRIVATE.email);
+    const merge = await mergeOnHost(host, {
+      pr: 5,
+      headSha: head,
+      strategy: "merge",
+      title: "x",
+      body: "",
+      allowedEmails: ALLOWED,
+      prUser: "example-bot",
+    });
+    expect(merge.reasons[0]).toContain("merge commit as merge-account");
+
+    const unknown = await mergeOnHost(host, {
+      pr: 5,
+      headSha: head,
+      strategy: "squash",
+      title: "x",
+      body: "",
+      allowedEmails: ALLOWED,
+      prUser: null,
+    });
+    expect(unknown.reasons[0]).toContain("host account is unknown");
+    expect(remote.requests.some((r) => r.method === "PUT")).toBe(false);
+    expect(remote.branches.get("main")).toBe(base);
   });
 });

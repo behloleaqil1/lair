@@ -15,7 +15,7 @@ import { join, resolve } from "path";
 import type { MergePlan } from "../../shared/review-types.js";
 import type { MergeSettings } from "./config.js";
 import type { GitRunner } from "./git.js";
-import type { GitHost, HostRepo, PersonIdentity } from "./host.js";
+import type { GitHost, PersonIdentity } from "./host.js";
 
 export interface PublishedCommit {
   sha: string;
@@ -113,34 +113,41 @@ export function describeViolations(violations: EmailViolation[]): string[] {
 // ============ PLAN ============
 
 /**
- * Pick the method. `auto` merges on the host only when that can't publish a
- * private email: a private repository, or a host account whose email is known
- * to be private. Otherwise it merges locally with the configured identity.
+ * Pick the method. A host merge publishes an identity Lair can't fully check
+ * (the host authors the commit as an account and commits it as itself), so
+ * it happens only when `host_email_private: true` says the account's commit
+ * email is private. That holds for private repositories too: a repository
+ * made public later publishes its whole history. Otherwise Lair merges
+ * locally with the configured identity.
  */
-export function planMerge(settings: MergeSettings, repo: HostRepo | null): MergePlan {
-  const host = (reason: string): MergePlan => ({
+export function planMerge(settings: MergeSettings): MergePlan {
+  const emailPrivate = settings.hostEmailPrivate === true;
+  if (settings.method === "local" || (settings.method === "auto" && !emailPrivate)) {
+    return {
+      method: "local",
+      strategy: settings.localStrategy,
+      reason:
+        settings.method === "local"
+          ? "review.merge.method is local"
+          : "Lair merges locally with the configured identity unless review.merge.host_email_private is true",
+      warnings: [],
+      refusal: null,
+    };
+  }
+  return {
     method: "host",
     strategy: settings.hostMethod,
-    reason,
-    warnings:
-      settings.hostEmailPrivate === true
-        ? []
-        : ["The host writes the merge with its account's identity; Lair cannot check that email before it is published."],
-  });
-  const local = (reason: string): MergePlan => ({
-    method: "local",
-    strategy: settings.localStrategy,
-    reason,
-    warnings: [],
-  });
-  if (settings.method === "host") return host("review.merge.method is host");
-  if (settings.method === "local") return local("review.merge.method is local");
-  if (repo === null) return local("the repository's visibility is unknown, so Lair merges locally with the configured identity");
-  if (repo.private) return host("private repository");
-  if (settings.hostEmailPrivate === true) {
-    return host("public repository whose host account keeps its email private (review.merge.host_email_private)");
-  }
-  return local("public repository, and the host account's email privacy is not known to be private");
+    reason:
+      settings.method === "host"
+        ? "review.merge.method is host"
+        : "the host account's commit email is private (review.merge.host_email_private)",
+    warnings: emailPrivate
+      ? ["The host authors the merge as an account and commits it as itself; Lair checks the account's public email only."]
+      : [],
+    refusal: emailPrivate
+      ? null
+      : "A host merge publishes the host account's identity: set review.merge.host_email_private: true once its commit email is private, or merge locally",
+  };
 }
 
 // ============ HOST MERGE ============
@@ -152,12 +159,22 @@ export interface HostMergeInput {
   title: string;
   body: string;
   allowedEmails: string[];
+  /** The host account that opened the PR: a squash commit is authored as it */
+  prUser: string | null;
 }
 
 /**
- * Merge through the host's API, after checking the commits it would publish:
- * every PR commit for merge, their authors and messages for rebase (the host
- * rewrites the committer), and Lair's own message for squash.
+ * Merge through the host's API, after checking what it would publish.
+ *
+ * - squash: one new commit, authored as the PR's account and committed by
+ *   the host; Lair's own message, and the account's public email, are checked;
+ * - merge: the PR's commits plus a merge commit authored as the token's
+ *   account; every PR commit and that account's public email are checked;
+ * - rebase: the PR's commits, re-committed by the host; their authors and
+ *   messages are checked.
+ *
+ * An account that shows no public email may still commit with a private one,
+ * which is why planMerge requires `host_email_private: true` first.
  */
 export async function mergeOnHost(host: GitHost, input: HostMergeInput): Promise<MergeExecution> {
   let checked: PublishedCommit[];
@@ -171,14 +188,31 @@ export async function mergeOnHost(host: GitHost, input: HostMergeInput): Promise
     roles = input.strategy === "merge" ? ["author", "committer", "message"] : ["author", "message"];
   }
   const violations = checkCommitEmails(checked, input.allowedEmails, roles);
-  if (violations.length > 0) {
-    return {
-      merged: false,
-      resultSha: null,
-      commitsChecked: checked.length,
-      reasons: describeViolations(violations),
-      emailViolations: violations,
-    };
+  const refuse = (reasons: string[]): MergeExecution => ({
+    merged: false,
+    resultSha: null,
+    commitsChecked: checked.length,
+    reasons,
+    emailViolations: violations,
+  });
+  if (violations.length > 0) return refuse(describeViolations(violations));
+
+  if (input.strategy !== "rebase") {
+    let account: { login: string; email: string | null };
+    if (input.strategy === "squash") {
+      if (!input.prUser) return refuse(["the PR's host account is unknown, so the squash commit's author can't be checked"]);
+      account = { login: input.prUser, email: await host.publicEmail(input.prUser) };
+    } else {
+      account = await host.viewer();
+    }
+    if (account.email && !emailAllowed(account.email, input.allowedEmails)) {
+      violations.push({ sha: input.headSha, role: "author", email: account.email });
+      return refuse([
+        `the host would author the ${input.strategy} commit as ${account.login}, whose public email ${maskEmail(
+          account.email,
+        )} is not in review.merge.allowed_emails`,
+      ]);
+    }
   }
   const result = await host.merge(input.pr, {
     method: input.strategy,
