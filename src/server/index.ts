@@ -42,6 +42,7 @@ import { PipelineManager, registerPipelineRoutes } from "./gates/index.js";
 import { AgentsManager, registerAgentsRoutes } from "./agents/index.js";
 import { getBudgetManager } from "./fleet/budget.js";
 import { ReviewManager, registerReviewRoutes } from "./review/index.js";
+import { mountTriage } from "./triage/index.js";
 import { join } from "path";
 import type { ApiResponse } from "../shared/types.js";
 
@@ -423,6 +424,16 @@ await registerReviewRoutes(fastify, reviews, () => getDefaultProject(), humanAut
 // need an owner session; modules start runs in-process (agents.requestRun)
 await registerAgentsRoutes(fastify, agents, () => getDefaultProject(), humanAuth);
 
+// Failure triage, bisect and revert: one per project with `triage.enabled:
+// true` (off by default). Gate results arrive by POST /api/triage/results or
+// as gate.completed events.
+const triage = await mountTriage(fastify, {
+  dbPath: join(process.cwd(), "data", "triage.db"),
+  events: getEventBus(),
+  projects: projectEntries,
+  defaultProject: () => getDefaultProject(),
+});
+
 // Serve the built web UI (dist/client) with an SPA fallback, when it exists.
 // In development the UI comes from the Vite dev server on port 5173 instead.
 const clientDir = resolveClientDir();
@@ -462,6 +473,8 @@ const shutdown = async (signal: string) => {
 
   // Stop agent supervision (the agents themselves keep running)
   await agents.stop();
+  // Stop triage: wait for calls in progress, then close its store
+  await triage.stop();
 
   // Stop healer
   stopHealer();
@@ -577,6 +590,14 @@ const start = async () => {
       supervised.length > 0
         ? `[agents] Supervising: ${supervised.join(", ")}`
         : "[agents] Off (no project sets agents.enabled)",
+    );
+
+    // Start triage (re-checks waiting for capacity, bisect probes)
+    const triaged = triage.start();
+    console.log(
+      triaged.length > 0
+        ? `[triage] Triaging: ${triaged.join(", ")}`
+        : "[triage] Off (no project sets triage.enabled)",
     );
 
     // Start file watchers for all projects

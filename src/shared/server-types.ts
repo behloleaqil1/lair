@@ -244,7 +244,19 @@ export type EventType =
   | "agent.recovery"
   | "agent.failover"
   | "agent.budget.warning"
-  | "agent.budget.exceeded";
+  | "agent.budget.exceeded"
+  // Gate results, for triage: {project, result: GateResult, reports?, context?}
+  | "gate.completed"
+  // Triage (src/server/triage/)
+  | "triage.classified"
+  | "triage.recheck_requested"
+  | "triage.routed"
+  | "triage.task_created"
+  | "triage.decision_requested"
+  | "triage.incident_opened"
+  | "triage.incident_resolved"
+  | "triage.culprit_found"
+  | "triage.revert_requested";
 
 /** Event stored in the database */
 export interface Event {

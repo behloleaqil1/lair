@@ -73,6 +73,11 @@ export interface ProjectConfig {
    * docs/configuration.md#agents
    */
   agents?: Record<string, unknown>;
+  /**
+   * Failure triage, bisect and revert (src/server/triage/). Validated by
+   * parseTriageConfig; see docs/configuration.md#triage
+   */
+  triage?: Record<string, unknown>;
 }
 
 // Process configuration as it appears in YAML (before defaults applied)
