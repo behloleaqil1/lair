@@ -11,6 +11,8 @@ import {
 } from "fs";
 import { join, resolve } from "path";
 import { loadProjectConfig } from "../config.js";
+import { isValidDragonId, parseDragonRegistry } from "../parsers/dragon-config.js";
+import { parseDragonsFile } from "../parsers/dragons.js";
 import { projectQueryGuard, type ProjectRouteConfig } from "./project-guard.js";
 import { rejectCrossSiteRequests } from "../origin.js";
 import { CommandService, getAuditLog } from "../services/command.js";
@@ -109,18 +111,38 @@ export function getPromptsDir(config: ProjectConfig): string {
 }
 
 /**
- * Check a dragon id from a request against the dragons in the project config.
- * Returns an error message, or null if the id is a configured dragon.
+ * IDs of the dragons a project has, from the same two sources the dashboard
+ * lists: the YAML `dragons:` map and `<agents_dir>/dragons.txt`. Only IDs
+ * that pass isValidDragonId are included.
+ */
+export function knownDragonIds(config: ProjectConfig): Set<string> {
+  const ids = new Set(parseDragonRegistry(config).keys());
+  let content = "";
+  try {
+    content = readFileSync(join(config.agents_dir, "dragons.txt"), "utf-8");
+  } catch {
+    // No dragons.txt: the YAML map is the whole registry
+  }
+  for (const dragon of parseDragonsFile(content)) {
+    if (isValidDragonId(dragon.id)) {
+      ids.add(dragon.id);
+    }
+  }
+  return ids;
+}
+
+/**
+ * Check a dragon id from a request against the project's dragons (see
+ * knownDragonIds). Returns an error message, or null if the id is known.
  */
 export function dragonIdError(config: ProjectConfig, dragonId: unknown): string | null {
   if (typeof dragonId !== "string" || dragonId.length === 0) {
     return "Missing dragonId";
   }
-  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(dragonId)) {
+  if (!isValidDragonId(dragonId)) {
     return "Invalid dragonId";
   }
-  const dragons = config.dragons ?? {};
-  if (!Object.prototype.hasOwnProperty.call(dragons, dragonId)) {
+  if (!knownDragonIds(config).has(dragonId)) {
     return `Unknown dragon: ${dragonId}`;
   }
   return null;
