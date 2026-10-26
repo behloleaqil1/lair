@@ -20,7 +20,7 @@ import { isSafeGateId } from "../services/data.js";
 import { agentMatcher, type WatchdogSettings } from "./config.js";
 import type { ProcessInfo, Probes } from "./probes.js";
 import type { WatchdogStore } from "./store.js";
-import type { ContainerServices } from "./types.js";
+import type { ContainerServices, SupervisedAgents } from "./types.js";
 
 /** Everything a detector or executor needs for one project. */
 export interface WatchdogContext {
@@ -31,6 +31,8 @@ export interface WatchdogContext {
   store: WatchdogStore;
   /** Delivery's containers: their crash loops, and which ones are held */
   services?: ContainerServices;
+  /** The agents module's supervised agents: agent_hung and orphan_claim leave them alone */
+  agents?: SupervisedAgents;
   /** Aborted by Watchdog.stop(): waits end early and no further action starts */
   signal?: AbortSignal;
 }

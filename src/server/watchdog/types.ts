@@ -232,6 +232,17 @@ export interface ContainerServices {
   heldReason(project: string, container: string): string | null;
 }
 
+/**
+ * Agents another module supervises: the agents module
+ * (src/server/agents/), which recovers hung agents and releases claims
+ * itself. The agent_hung and orphan_claim detectors leave such an agent alone,
+ * so one failure isn't handled twice.
+ */
+export interface SupervisedAgents {
+  /** Why the watchdog leaves this agent alone (a run supervises it), or null */
+  supervisedReason(project: string, agent: string): string | null;
+}
+
 export type SloState = "ok" | "breached" | "inactive" | "error";
 
 /** One detector's state after the latest tick. */

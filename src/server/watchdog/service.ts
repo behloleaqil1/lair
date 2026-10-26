@@ -21,7 +21,15 @@ import { PlaybookEngine } from "./playbook-engine.js";
 import { BUILTIN_PLAYBOOKS, playbooksFor } from "./playbooks.js";
 import { systemProbes, type Probes } from "./probes.js";
 import { WatchdogStore } from "./store.js";
-import type { Breach, ContainerServices, DetectorId, Finding, PlaybookRun, SloStatus } from "./types.js";
+import type {
+  Breach,
+  ContainerServices,
+  DetectorId,
+  Finding,
+  PlaybookRun,
+  SloStatus,
+  SupervisedAgents,
+} from "./types.js";
 import { ProjectView, type WatchdogContext } from "./view.js";
 import { DECISION_RUN, DECISION_STAND_DOWN, type BreachDecisionState } from "./types.js";
 
@@ -34,6 +42,8 @@ export interface WatchdogOptions {
   events?: EventBus;
   /** Delivery's containers (crash loops, holds); see ContainerServices */
   services?: ContainerServices;
+  /** Agents the agents module supervises; see SupervisedAgents */
+  agents?: SupervisedAgents;
 }
 
 export interface TickSummary {
@@ -70,6 +80,7 @@ export class Watchdog {
       probes: options.probes,
       store: options.store,
       services: options.services,
+      agents: options.agents,
       signal: this.abort.signal,
     };
     this.engine = new PlaybookEngine(this.ctx, options.events);
@@ -500,6 +511,8 @@ export class WatchdogManager {
       events?: EventBus;
       /** Delivery's containers, read by the crash_loop detector and the act guard */
       services?: ContainerServices;
+      /** The agents module's supervised agents, left alone by agent_hung and orphan_claim */
+      agents?: SupervisedAgents;
     },
   ) {}
 
@@ -527,6 +540,7 @@ export class WatchdogManager {
           probes: this.options.probes ?? systemProbes(parsed.settings.commandTimeoutSeconds * 1000),
           events: this.options.events,
           services: this.options.services,
+          agents: this.options.agents,
         }),
       );
     }

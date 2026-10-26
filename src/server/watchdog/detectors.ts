@@ -150,15 +150,26 @@ const agentHung: Detector = {
   inactiveReason: (ctx) => (ctx.settings.agentCommand ? null : NO_AGENT_PATTERN),
   async detect(view) {
     const findings: Finding[] = [];
+    const supervised: string[] = [];
     for (const agent of view.localAgentIds()) {
+      // The agents module recovers the agents it runs; one failure is handled once
+      const reason = view.ctx.agents?.supervisedReason(view.ctx.project, agent);
+      if (reason) {
+        supervised.push(`${agent} (${reason})`);
+        continue;
+      }
       const procs = await view.agentProcesses(agent);
       if (procs.length === 0) continue;
       const finding = hungFinding(view, agent, procs[0]);
       if (finding) findings.push(finding);
     }
-    return { findings };
+    return { findings, detail: supervisedDetail(supervised) };
   },
 };
+
+function supervisedDetail(supervised: string[]): string | undefined {
+  return supervised.length > 0 ? `left to the agents module: ${supervised.join(", ")}` : undefined;
+}
 
 // ============ 4. ORPHAN CLAIM ============
 
@@ -169,10 +180,16 @@ const orphanClaim: Detector = {
   async detect(view) {
     const findings: Finding[] = [];
     const remote: string[] = [];
+    const supervised: string[] = [];
     for (const claim of view.claims()) {
       // A remote agent's process is not in the local process table: unknown, never "dead"
       if (!view.isLocalAgent(claim.agent)) {
         remote.push(`${claim.agent} (${view.agentMachine(claim.agent).machine})`);
+        continue;
+      }
+      const reason = view.ctx.agents?.supervisedReason(view.ctx.project, claim.agent);
+      if (reason) {
+        supervised.push(`${claim.agent} (${reason})`);
         continue;
       }
       if ((await view.agentProcesses(claim.agent)).length > 0) continue; // live agent: never touched
@@ -189,13 +206,11 @@ const orphanClaim: Detector = {
         vars: { agent: claim.agent, claim: claim.path },
       });
     }
-    return {
-      findings,
-      detail:
-        remote.length > 0
-          ? `not checked (remote agents): ${remote.join(", ")}`
-          : undefined,
-    };
+    const details = [
+      ...(remote.length > 0 ? [`not checked (remote agents): ${remote.join(", ")}`] : []),
+      ...(supervised.length > 0 ? [supervisedDetail(supervised) ?? ""] : []),
+    ];
+    return { findings, detail: details.length > 0 ? details.join("; ") : undefined };
   },
 };
 
