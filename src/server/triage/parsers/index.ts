@@ -4,15 +4,19 @@
  * Machine-readable reports (JUnit XML) are parsed first; then the output of
  * every failed step is read by the first console parser that recognises it
  * (Gradle, vitest, jest, pytest). A console cause whose tests a report
- * already explains is dropped (the report is richer). A failed step that
- * nothing explains becomes one "step" cause with its exit code and the
- * error lines of its output, so a failure is never just a log tail.
+ * already explains is dropped (the report is richer), but its "Caused by"
+ * chain is kept for a report trace that has none (a cut JUnit XML trace); a
+ * context failure without any gets the chain of its step's output. Follower
+ * context failures in other reports join the first context failure (their
+ * cause). A failed step that nothing explains becomes one "step" cause with
+ * its exit code and the error lines of its output, so a failure is never just
+ * a log tail.
  *
  * Parsers are pluggable: pass your own list (TriageManager's `parsers`).
  */
 import type { GateResult, GateStepResult } from "../../../shared/policy-types.js";
 import type { FailureCause, TestRef } from "../../../shared/triage-types.js";
-import { boundedLines, clip, groupFailures, mergeCauses } from "../text.js";
+import { MAX_EVIDENCE, absorbFollowers, boundedLines, causedByChain, clip, groupFailures, mergeCauses } from "../text.js";
 import { gradleParser } from "./gradle.js";
 import { jestParser, vitestParser } from "./js.js";
 import { junitParser } from "./junit.js";
@@ -101,6 +105,50 @@ function runnerCause(result: GateResult): FailureCause {
   return cause;
 }
 
+/** At most this many "Caused by" lines are taken from a console for one cause */
+const MAX_CHAIN = 20;
+
+/**
+ * A test or context failure whose trace has no "Caused by" chain gets the one
+ * the console shows for its tests; a context failure without that gets the
+ * chain in its step's output (or, naming no step, the first failed step's
+ * that has one). The root cause is then the chain's last link, which is what
+ * the classifier reads. Its signature stays the report's.
+ */
+function withChains(causes: FailureCause[], byTest: Map<string, string[]>, failed: GateStepResult[]): FailureCause[] {
+  const stepChains = new Map<string, string[]>();
+  const chainOf = (step: GateStepResult): string[] => {
+    let chain = stepChains.get(step.name);
+    if (!chain) {
+      chain = causedByChain(boundedLines(step.output ?? "")).slice(0, MAX_CHAIN);
+      stepChains.set(step.name, chain);
+    }
+    return chain;
+  };
+  for (const cause of causes) {
+    if (cause.causedBy.length > 0 || (cause.kind !== "test" && cause.kind !== "context")) continue;
+    let chain = cause.tests.map((t) => byTest.get(t.key)).find((c): c is string[] => c !== undefined && c.length > 0);
+    if (!chain && cause.kind === "context") {
+      for (const step of failed) {
+        if (cause.step !== undefined && step.name !== cause.step) continue;
+        const found = chainOf(step);
+        if (found.length > 0) {
+          chain = found;
+          break;
+        }
+      }
+    }
+    if (!chain) continue;
+    cause.causedBy = chain.slice(0, MAX_CHAIN);
+    cause.rootCause = cause.causedBy[cause.causedBy.length - 1];
+    cause.evidence = [
+      ...cause.evidence,
+      ...cause.causedBy.slice(-2).map((c) => `Caused by (from the console output): ${c}`),
+    ].slice(0, MAX_EVIDENCE);
+  }
+  return causes;
+}
+
 /** Turn a gate result and its reports into causes (empty for a passed result). */
 export function parseGateEvidence(
   result: GateResult,
@@ -139,6 +187,8 @@ export function parseGateEvidence(
   }
 
   const covered = new Set(reportCauses.flatMap((c) => c.tests.map((t) => t.key)));
+  /** The "Caused by" chain the console shows for a test a report explains */
+  const consoleChains = new Map<string, string[]>();
   const consoleCauses: FailureCause[] = [];
   const consoleParsers = parsers.filter((p) => p.source === "console");
   for (const step of failed) {
@@ -156,7 +206,11 @@ export function parseGateEvidence(
       continue;
     }
     for (const cause of out.causes) {
-      if (cause.tests.length > 0 && cause.tests.every((t) => covered.has(t.key))) continue;
+      if (cause.tests.length > 0 && cause.tests.every((t) => covered.has(t.key))) {
+        // A report explains these tests, but its trace may lack the "Caused by" chain the console shows
+        if (cause.causedBy.length > 0) for (const t of cause.tests) if (!consoleChains.has(t.key)) consoleChains.set(t.key, cause.causedBy);
+        continue;
+      }
       if (cause.kind === "build" && reportCauses.some((c) => c.step === step.name)) continue;
       consoleCauses.push(cause);
     }
@@ -168,7 +222,7 @@ export function parseGateEvidence(
     return { causes: [], passed, flaky, parsers: [...used], notes };
   }
 
-  const causes = mergeCauses([...reportCauses, ...consoleCauses]);
+  const causes = withChains(absorbFollowers(mergeCauses([...reportCauses, ...consoleCauses])), consoleChains, failed);
   // A report that names no step explains the failure on its own
   const unattributed = causes.some((c) => c.step === undefined);
   for (const step of failed) {

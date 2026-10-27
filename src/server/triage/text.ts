@@ -424,6 +424,40 @@ function deepestOf(raws: RawFailure[]): RawFailure {
   return best;
 }
 
+/** A context failure that only says the context failed before (Spring's "failure threshold (1) exceeded"). */
+export function isFollowerCause(cause: FailureCause): boolean {
+  return cause.kind === "context" && cause.causedBy.length === 0 && FOLLOWER.test(cut(`${cause.type ?? ""}: ${cause.message}`));
+}
+
+/**
+ * A follower cause from another report (Gradle writes one report per test
+ * class, and later classes only say the cached context failed before) is the
+ * first context failure's consequence, not a failure of its own: its tests
+ * join that failure (of the same step when there is one), and so does its
+ * class. Without a real context failure in the result, followers stay.
+ */
+export function absorbFollowers(causes: FailureCause[]): FailureCause[] {
+  const leaders = causes.filter((c) => c.kind === "context" && !isFollowerCause(c));
+  if (leaders.length === 0) return causes;
+  const out: FailureCause[] = [];
+  for (const cause of causes) {
+    if (!isFollowerCause(cause)) {
+      out.push(cause);
+      continue;
+    }
+    const leader = leaders.find((l) => l.step === cause.step) ?? leaders[0];
+    const before = leader.testCount;
+    addTests(leader, cause.tests);
+    if (leader.testCount > before) {
+      leader.evidence = [
+        ...leader.evidence,
+        `+${leader.testCount - before} test(s) that only report this context failing before (${clip(cause.message, 120)})`,
+      ].slice(0, MAX_EVIDENCE);
+    }
+  }
+  return out;
+}
+
 /** Merge causes with the same signature (from different reports or parsers). */
 export function mergeCauses(causes: FailureCause[]): FailureCause[] {
   const out: FailureCause[] = [];

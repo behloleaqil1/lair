@@ -4,8 +4,11 @@
  *
  * 1. infra: an infrastructure pattern (connection timeout, container start,
  *    OOM, runner died, network, disk) in the cause's text or "Caused by"
- *    chain; a step killed (exit 137/143) or timed out with nothing more
- *    specific; or a timeout while the machine was overloaded.
+ *    chain; a root-cause signature there (signatures.ts: the root cause, not
+ *    the top exception; a timeout signature is a timeout under load); a step
+ *    killed (exit 137/143) or timed out with nothing more specific; or a
+ *    timeout while the machine was overloaded. An assertion's failure is never
+ *    infra by its text.
  * 2. flaky: every failing test of the cause passed at the same commit within
  *    the flaky window, or (off the default branch) is quarantined.
  * 3. pre-existing: the default branch has an open incident with this cause
@@ -17,6 +20,7 @@
  */
 import type { ClassifiedCause, FailureCause, TriageClass, Verdict } from "../../shared/triage-types.js";
 import type { CompiledPattern, TriageSettings } from "./config.js";
+import { findSignature, isAssertion } from "./signatures.js";
 import { basename, clip, dirname, stem } from "./text.js";
 
 /**
@@ -83,6 +87,8 @@ function causeLines(cause: FailureCause): { where: string; text: string }[] {
 }
 
 function matchInfra(cause: FailureCause, patterns: CompiledPattern[]): Verdict | null {
+  // An assertion is the test's own verdict, whatever its message quotes
+  if (isAssertion(cause)) return null;
   const lines = causeLines(cause);
   for (const pattern of patterns) {
     const hits = lines.filter((l) => pattern.regex.test(l.text));
@@ -102,6 +108,25 @@ function matchInfra(cause: FailureCause, patterns: CompiledPattern[]): Verdict |
     };
   }
   return null;
+}
+
+/** The root cause, not the top exception: a signature in the message, the "Caused by" chain or the log lines. */
+function matchSignature(cause: FailureCause, settings: TriageSettings): Verdict | null {
+  const found = findSignature(cause, settings.infraSignatures, settings.timeoutSignatures);
+  if (!found) return null;
+  const what = found.timeout ? "timeout" : "infra";
+  const evidence = [`${found.where}: ${clip(found.text, 200)} (matches ${what} signature ${found.signature.id})`];
+  if (cause.kind === "context") {
+    evidence.push(`one context failure for ${cause.testCount} test(s): the tests never ran, so this is not the change`);
+  }
+  if (found.timeout) evidence.push("a timeout of the environment, not an assertion: a timeout under load until a quiet re-check says otherwise");
+  return {
+    class: "infra",
+    rule: `${what}-signature:${found.signature.id}`,
+    confidence: found.timeout ? "low" : "high",
+    evidence,
+    infraKind: found.timeout ? "load" : found.signature.kind,
+  };
 }
 
 function matchExit(cause: FailureCause, ctx: ClassifyContext, settings: TriageSettings): Verdict | null {
@@ -265,6 +290,7 @@ function codeVerdict(cause: FailureCause, ctx: ClassifyContext): Verdict {
 export function classifyCause(cause: FailureCause, ctx: ClassifyContext, settings: TriageSettings): Verdict {
   return (
     matchInfra(cause, settings.infraPatterns) ??
+    matchSignature(cause, settings) ??
     matchExit(cause, ctx, settings) ??
     matchFlaky(cause, ctx) ??
     matchPreExisting(cause, ctx) ??

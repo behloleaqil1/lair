@@ -123,9 +123,14 @@ export function isTestTimeout(cause: FailureCause): boolean {
   return [head, cause.rootCause, ...cause.causedBy.slice(0, 5)].some((line) => TEST_TIMEOUT.test(clip(line, 500)));
 }
 
+/** A timeout of the environment by the classifier's own rules (under load, or a timeout signature). */
+function infraTimeout(verdict: Verdict): boolean {
+  return verdict.class === "infra" && (verdict.rule === "timeout-under-load" || verdict.rule.startsWith("timeout-signature:"));
+}
+
 /** The re-check kind of a classified cause. */
 export function causeKindOf(c: ClassifiedCause): CauseKind {
-  if (c.verdict.class === "infra") return c.verdict.rule === "timeout-under-load" ? "timeout" : "infra";
+  if (c.verdict.class === "infra") return infraTimeout(c.verdict) ? "timeout" : "infra";
   if (c.verdict.class === "flaky") return "flaky";
   if (c.verdict.class === "pre-existing") return "ignore";
   return isTestTimeout(c.cause) ? "timeout" : "real";
@@ -340,21 +345,35 @@ export class GateRechecks {
     }
     if (this.sameWay(r, classified)) {
       this.rows.update(r.id, { status: "failed_again", answerId, completedAt: this.iso(), detail: `${r.detail}; failed the same way (${answerGate})` });
+      // A timeout that comes back on a quiet machine is not load: real (infra stays infra: the environment)
+      let real = 0;
       for (const c of origin.causes) {
-        if (!r.signatures.includes(c.cause.signature) || c.verdict.class !== "code") continue;
+        if (!r.signatures.includes(c.cause.signature) || causeKindOf(c) !== "timeout") continue;
         store.updateCauseVerdict(c.id, {
-          ...c.verdict,
+          class: "code",
           rule: "failed-on-recheck",
           confidence: "high",
           evidence: [
             `failed again the same way on triage's re-check at the same commit (result ${answerGate}): a real failure`,
-            ...c.verdict.evidence.slice(0, 3),
+            ...c.verdict.evidence.slice(0, 3).map((e) => `was ${c.verdict.class}: ${e}`),
           ],
         });
+        store.setTestClass(origin.id, c.cause.tests.map((t) => t.key), "code");
+        real++;
       }
-      store.updateRecord(origin.id, { resolution: `re-check ${answerGate} failed the same way: escalated` });
+      const updated = store.getRecord(origin.id)!;
+      store.updateRecord(origin.id, {
+        verdict: overallClass(updated.causes) ?? null,
+        blocking: true,
+        resolution: `re-check ${answerGate} failed the same way: escalated${real > 0 ? " as a real failure" : ""}`,
+      });
       host.action(target, "recheck", "failed", `re-check ${r.attempt} (${r.kind}) failed the same way (result ${answerGate}): escalated`);
       this.escalate(r.rootId, origin, `failed the same way on triage's re-check (result ${answerGate})`, s);
+      // Its code causes go back to the author now (the re-check's own result is not routed again)
+      const code = updated.causes.filter((c) => c.verdict.class === "code");
+      if (code.length > 0 && host.settings.actions.code === "route") {
+        host.routeToAuthor(updated, code, s, `it failed the same way on triage's re-check (result ${answerGate})`);
+      }
       s.events.push({ type: "triage.recheck_escalated", data: { recheck: this.rows.get(r.id), answerId } });
       return;
     }
@@ -409,7 +428,8 @@ export class GateRechecks {
         flaky.push(...keys);
         continue;
       }
-      if (c.verdict.class !== "code") continue;
+      // Infra stays infra (the environment); a code failure or a timeout of the environment that passes quietly is flaky
+      if (c.verdict.class !== "code" && !infraTimeout(c.verdict)) continue;
       const verdict: Verdict = {
         class: "flaky",
         rule: "passed-on-recheck",
@@ -454,6 +474,12 @@ export class GateRechecks {
     if (cfg.mode === "off" || !cfg.command) return null;
     const { host } = this;
     const target = { recordId: record.id };
+    const rootId = link?.recheck.rootId ?? record.id;
+    const chain = this.rows.forRoot(rootId);
+    // Escalated: the failure it re-checked went back to its author, so this result is not routed again
+    if (link && chain.some((r) => r.status === "failed_again")) {
+      return { text: "it failed the same way on a re-check: escalated", holdRoute: true };
+    }
     const kinds = classified.map((c) => ({ c, kind: causeKindOf(c) }));
     const eligible = kinds.filter(
       (x): x is { c: ClassifiedCause; kind: GateRecheckCause } => x.kind === "infra" || x.kind === "timeout" || x.kind === "flaky",
@@ -464,9 +490,6 @@ export class GateRechecks {
       host.action(target, "recheck", "skipped", `not re-checked: it has a real failure (${describe(real.c)})`);
       return { text: "not re-checked: it has a real failure", holdRoute: false };
     }
-    const rootId = link?.recheck.rootId ?? record.id;
-    const chain = this.rows.forRoot(rootId);
-    if (chain.some((r) => r.status === "failed_again")) return { text: "it failed the same way on a re-check: escalated", holdRoute: false };
     const used = eligible.filter((x) => cfg.kinds[x.kind] !== "none");
     if (used.length === 0) {
       const names = unique(eligible.map((x) => x.kind)).join(", ");

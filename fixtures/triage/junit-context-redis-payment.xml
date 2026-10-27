@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Invented: the next test class of the same run, whose tests only say the cached context failed before -->
+<testsuite name="com.example.shop.api.PaymentApiIT" tests="2" skipped="0" failures="0" errors="2" timestamp="2026-03-02T11:58:09" hostname="runner" time="0.004">
+  <properties/>
+  <testcase name="refundsPayment()" classname="com.example.shop.api.PaymentApiIT" time="0.001">
+    <error message="ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [WebMergedContextConfiguration@5c2a7f31 testClass = com.example.shop.api.PaymentApiIT, locations = [], classes = [com.example.shop.ShopApplication], contextInitializerClasses = [], activeProfiles = []]" type="java.lang.IllegalStateException">java.lang.IllegalStateException: ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [WebMergedContextConfiguration@5c2a7f31 testClass = com.example.shop.api.PaymentApiIT, locations = [], classes = [com.example.shop.ShopApplication], contextInitializerClasses = [], activeProfiles = []]
+	at org.springframework.test.context.cache.DefaultCacheAwareContextLoaderDelegate.loadContext(DefaultCacheAwareContextLoaderDelegate.java:145)
+	at org.springframework.test.context.support.DefaultTestContext.getApplicationContext(DefaultTestContext.java:130)
+</error>
+  </testcase>
+  <testcase name="capturesPayment()" classname="com.example.shop.api.PaymentApiIT" time="0.001">
+    <error message="ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [WebMergedContextConfiguration@5c2a7f31 testClass = com.example.shop.api.PaymentApiIT, locations = [], classes = [com.example.shop.ShopApplication], contextInitializerClasses = [], activeProfiles = []]" type="java.lang.IllegalStateException">java.lang.IllegalStateException: ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [WebMergedContextConfiguration@5c2a7f31 testClass = com.example.shop.api.PaymentApiIT, locations = [], classes = [com.example.shop.ShopApplication], contextInitializerClasses = [], activeProfiles = []]
+	at org.springframework.test.context.cache.DefaultCacheAwareContextLoaderDelegate.loadContext(DefaultCacheAwareContextLoaderDelegate.java:145)
+	at org.springframework.test.context.support.DefaultTestContext.getApplicationContext(DefaultTestContext.java:130)
+</error>
+  </testcase>
+</testsuite>

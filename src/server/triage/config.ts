@@ -5,6 +5,7 @@
 import { z } from "zod";
 import type { ProjectConfig } from "../../shared/types.js";
 import { GATE_RECHECK_KEYS, parseGateRecheck, type GateRecheckSettings } from "./gate-recheck-config.js";
+import { DEFAULT_INFRA_SIGNATURES, DEFAULT_TIMEOUT_SIGNATURES, type CompiledSignature, type SignatureDef } from "./signatures.js";
 
 export const INFRA_KINDS = ["network", "container", "oom", "runner", "disk", "load"] as const;
 export type InfraKind = (typeof INFRA_KINDS)[number];
@@ -123,8 +124,11 @@ export const TriageSchema = z
     interval_seconds: z.number().int().min(5).max(3600).default(60),
     command_timeout_seconds: z.number().int().min(1).max(3600).default(120),
     infra_patterns: z.array(PatternSchema).default([]),
-    /** false: only the project's infra_patterns apply */
+    /** false: only the project's infra_patterns and signatures apply */
     default_infra_patterns: z.boolean().default(true),
+    /** Root-cause signatures (signatures.ts): regular expressions, added to the built-in ones */
+    infra_signatures: z.array(z.string().min(1).max(500)).max(100).default([]),
+    timeout_signatures: z.array(z.string().min(1).max(500)).max(100).default([]),
     context_patterns: z.array(z.string().min(1)).default([]),
     default_context_patterns: z.boolean().default(true),
     /** A timeout while the machine's load per core was at least this is infra (load) */
@@ -216,6 +220,9 @@ export interface TriageSettings {
   intervalSeconds: number;
   commandTimeoutSeconds: number;
   infraPatterns: CompiledPattern[];
+  /** Root-cause signatures (signatures.ts): the project's first, then the built-in ones */
+  infraSignatures: CompiledSignature[];
+  timeoutSignatures: CompiledSignature[];
   contextPatterns: RegExp[];
   overloadPerCore: number;
   baseMaxAgeHours: number;
@@ -303,6 +310,22 @@ export function parseTriageConfig(raw: unknown): TriageParseResult {
     if (regex) infraPatterns.push({ id: p.id, kind: p.kind, regex });
   }
 
+  // Root-cause signatures: the project's first, then (unless default_infra_patterns: false) the built-in ones
+  const signatures = (key: "infra_signatures" | "timeout_signatures", defaults: SignatureDef[]): CompiledSignature[] => {
+    const out: CompiledSignature[] = [];
+    const sources: (SignatureDef & { where: string })[] = [
+      ...value[key].map((pattern, i) => ({ id: `${key}.${i}`, pattern, where: `triage.${key}.${i}` })),
+      ...(value.default_infra_patterns ? defaults.map((d) => ({ ...d, where: `default signature ${d.id}` })) : []),
+    ];
+    for (const s of sources) {
+      const regex = compile(s.pattern, s.where, errors);
+      if (regex) out.push({ id: s.id, kind: s.kind, regex });
+    }
+    return out;
+  };
+  const infraSignatures = signatures("infra_signatures", DEFAULT_INFRA_SIGNATURES);
+  const timeoutSignatures = signatures("timeout_signatures", DEFAULT_TIMEOUT_SIGNATURES);
+
   const contextPatterns: RegExp[] = [];
   const contextSources = [
     ...value.context_patterns.map((p, i) => ({ p, where: `triage.context_patterns.${i}` })),
@@ -345,6 +368,8 @@ export function parseTriageConfig(raw: unknown): TriageParseResult {
       intervalSeconds: value.interval_seconds,
       commandTimeoutSeconds: value.command_timeout_seconds,
       infraPatterns,
+      infraSignatures,
+      timeoutSignatures,
       contextPatterns,
       overloadPerCore: value.overload_per_core,
       baseMaxAgeHours: value.base_max_age_hours,

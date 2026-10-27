@@ -1,0 +1,51 @@
+> Task :app:compileJava UP-TO-DATE
+> Task :app:compileTestJava UP-TO-DATE
+> Task :app:test
+
+com.example.shop.api.OrderApiIT > createsOrder() FAILED
+    java.lang.IllegalStateException: Failed to load ApplicationContext for [WebMergedContextConfiguration@5c2a7f31 testClass = com.example.shop.api.OrderApiIT, locations = [], classes = [com.example.shop.ShopApplication], contextInitializerClasses = [], activeProfiles = []]
+        at app//org.springframework.test.context.cache.DefaultCacheAwareContextLoaderDelegate.loadContext(DefaultCacheAwareContextLoaderDelegate.java:180)
+
+        Caused by:
+        org.springframework.beans.factory.BeanCreationException: Error creating bean with name 'sessionRepository': Invocation of init method failed
+            at app//org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.initializeBean(AbstractAutowireCapableBeanFactory.java:1786)
+
+            Caused by:
+            org.springframework.data.redis.RedisConnectionFailureException: Unable to connect to Redis
+                at app//org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory.getConnection(LettuceConnectionFactory.java:1602)
+
+                Caused by:
+                io.lettuce.core.RedisConnectionException: Unable to connect to 127.0.0.1/<unresolved>:64225
+                    at app//io.lettuce.core.RedisConnectionException.create(RedisConnectionException.java:78)
+
+                    Caused by:
+                    io.lettuce.core.RedisCommandTimeoutException: Connection initialization timed out after 2 second(s)
+                        at app//io.lettuce.core.internal.ExceptionFactory.createTimeoutException(ExceptionFactory.java:59)
+
+com.example.shop.api.OrderApiIT > listsOrders() FAILED
+    java.lang.IllegalStateException: ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [WebMergedContextConfiguration@5c2a7f31 testClass = com.example.shop.api.OrderApiIT, locations = [], classes = [com.example.shop.ShopApplication], contextInitializerClasses = [], activeProfiles = []]
+        at app//org.springframework.test.context.cache.DefaultCacheAwareContextLoaderDelegate.loadContext(DefaultCacheAwareContextLoaderDelegate.java:145)
+
+com.example.shop.api.OrderApiIT > cancelsOrder() FAILED
+    java.lang.IllegalStateException: ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [WebMergedContextConfiguration@5c2a7f31 testClass = com.example.shop.api.OrderApiIT, locations = [], classes = [com.example.shop.ShopApplication], contextInitializerClasses = [], activeProfiles = []]
+        at app//org.springframework.test.context.cache.DefaultCacheAwareContextLoaderDelegate.loadContext(DefaultCacheAwareContextLoaderDelegate.java:145)
+
+com.example.shop.api.PaymentApiIT > refundsPayment() FAILED
+    java.lang.IllegalStateException: ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [WebMergedContextConfiguration@5c2a7f31 testClass = com.example.shop.api.PaymentApiIT, locations = [], classes = [com.example.shop.ShopApplication], contextInitializerClasses = [], activeProfiles = []]
+        at app//org.springframework.test.context.cache.DefaultCacheAwareContextLoaderDelegate.loadContext(DefaultCacheAwareContextLoaderDelegate.java:145)
+
+com.example.shop.api.PaymentApiIT > capturesPayment() FAILED
+    java.lang.IllegalStateException: ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [WebMergedContextConfiguration@5c2a7f31 testClass = com.example.shop.api.PaymentApiIT, locations = [], classes = [com.example.shop.ShopApplication], contextInitializerClasses = [], activeProfiles = []]
+        at app//org.springframework.test.context.cache.DefaultCacheAwareContextLoaderDelegate.loadContext(DefaultCacheAwareContextLoaderDelegate.java:145)
+
+5 tests completed, 5 failed
+
+> Task :app:test FAILED
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':app:test'.
+> There were failing tests. See the report at: file:///home/user/project/app/build/reports/tests/test/index.html
+
+BUILD FAILED in 38s

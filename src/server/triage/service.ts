@@ -979,8 +979,9 @@ export class TriageService {
         // Nobody authored the default branch's head: the incident's bisect finds the culprit and its author
         pending.push("code: the default branch is red");
       } else if (gate?.holdRoute) {
-        // Test timeouts: re-checked quietly first; they go to the author if the re-check fails the same way
-        pending.push(`code: a test timeout, ${gate.text ?? "re-checked first"}`);
+        // Test timeouts are re-checked quietly first, and go to the author if the re-check fails the same way
+        // (or escalated: the failure it re-checked went to the author)
+        pending.push(`code: ${gate.text ?? "re-checked first"}`);
       } else if (settings.actions.code === "route") {
         this.routeToAuthor(record, code, s);
         pending.push("code: back to the author");

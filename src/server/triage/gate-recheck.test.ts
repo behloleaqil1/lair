@@ -167,6 +167,17 @@ function timeoutReport(names: string[], suite = ORDER): Report {
   return { name: `TEST-${simple}.xml`, step: "test", content: `<testsuite name="${suite}">${cases.join("")}</testsuite>` };
 }
 
+/** JUnit 4 timeouts (TestTimedOutException): no timeout signature, so classified code; triage's timeout signal re-checks them */
+function junit4TimeoutReport(names: string[], suite = ORDER): Report {
+  const simple = suite.split(".").pop();
+  const cases = names.map(
+    (n) => `<testcase name="${n}" classname="${suite}" time="10.0"><error message="test timed out after 10000 milliseconds" type="org.junit.runners.model.TestTimedOutException">org.junit.runners.model.TestTimedOutException: test timed out after 10000 milliseconds
+	at ${suite}.${n.replace(/\(.*$/, "")}(${simple}.java:42)
+</error></testcase>`,
+  );
+  return { name: `TEST-${simple}-junit4.xml`, step: "test", content: `<testsuite name="${suite}">${cases.join("")}</testsuite>` };
+}
+
 function assertionReport(suite: string, test: string, message: string): Report {
   const simple = suite.split(".").pop();
   return {
@@ -218,37 +229,54 @@ describe("which re-check, by the classification", () => {
     await b.events.emit("gate.completed", {
       project: "demo",
       result: result("gate-load", S4, failedTest),
-      reports: [timeoutReport(["listsOrders()"])],
+      reports: [junit4TimeoutReport(["listsOrders()"])],
       context: { loadPerCore: 3.5 },
     });
     await b.manager.idle();
+    // A JUnit 4 timeout, no load reading: classified code, re-checked by the timeout signal
+    await post(b, result("gate-junit4", sha("j1"), failedTest), [junit4TimeoutReport(["cancelsOrder()"])]);
 
     expect(b.runner.callsTo(PROGRAM)).toEqual([
       [PROGRAM, S1, "backend", "same", "gate-infra", "infra:infra-pattern:container-start"],
-      [PROGRAM, S2, "backend", "failed_tests", "gate-timeout", "timeout:test-timeout", `${ORDER}#createsOrder`, `${ORDER}#listsOrders`],
+      [
+        PROGRAM,
+        S2,
+        "backend",
+        "failed_tests",
+        "gate-timeout",
+        "timeout:timeout-signature:timeout-exception",
+        `${ORDER}#createsOrder`,
+        `${ORDER}#listsOrders`,
+      ],
       [PROGRAM, S3, "backend", "failed_tests", "gate-flaky", "flaky:passed-at-same-sha", `${CART}#addsItem`],
       [PROGRAM, S4, "backend", "failed_tests", "gate-load", "timeout:timeout-under-load", `${ORDER}#listsOrders`],
+      [PROGRAM, sha("j1"), "backend", "failed_tests", "gate-junit4", "timeout:test-timeout", `${ORDER}#cancelsOrder`],
     ]);
     const list = await rechecks(b);
     expect(list.map((r) => [r.gateId, r.kind, r.causes, r.status, r.runId])).toEqual([
+      ["gate-junit4", "failed_tests", ["timeout"], "queued", "run-5"],
       ["gate-load", "failed_tests", ["timeout"], "queued", "run-4"],
       ["gate-flaky", "failed_tests", ["flaky"], "queued", "run-3"],
       ["gate-timeout", "failed_tests", ["timeout"], "queued", "run-2"],
       ["gate-infra", "same", ["infra"], "queued", "run-1"],
     ]);
     // The load hint only where the result carried it
-    expect(list[0].detail).toContain("load per core 3.50");
-    expect(list[2].detail).not.toContain("load per core");
-    expect(eventsOf(b, "triage.recheck_queued")).toHaveLength(4);
+    expect(list[1].detail).toContain("load per core 3.50");
+    expect(list[3].detail).not.toContain("load per core");
+    expect(eventsOf(b, "triage.recheck_queued")).toHaveLength(5);
 
-    // The failure waits for its re-check, and says so
+    // The failure waits for its re-check, and says so: a JUnit 5 timeout is infra (its timeout signature) ...
     const timeout = await failure(b, "gate-timeout");
-    expect(timeout.record).toMatchObject({ verdict: "code", blocking: true });
-    expect(timeout.record.resolution).toContain("code: a test timeout, re-check 1/2 (failed_tests) in the gate system");
+    expect(timeout.record).toMatchObject({ verdict: "infra", blocking: true, resolution: "infra: re-check 1/2 (failed_tests) in the gate system" });
+    expect(timeout.record.causes[0].verdict).toMatchObject({ rule: "timeout-signature:timeout-exception", infraKind: "load" });
     expect(timeout.gateRechecks.map((r) => r.status)).toEqual(["queued"]);
+    // ... a JUnit 4 one stays code, and is not sent to its author while its re-check runs
+    const junit4 = await failure(b, "gate-junit4");
+    expect(junit4.record).toMatchObject({ verdict: "code", blocking: true, resolution: "code: re-check 1/2 (failed_tests) in the gate system" });
+    expect(junit4.gateRechecks[0].holdRoute).toBe(true);
 
     const status = (await b.app.inject({ url: "/api/triage/status" })).json().data;
-    expect(status.gateRecheck).toEqual({ mode: "act", blocked: null, pending: 4 });
+    expect(status.gateRecheck).toEqual({ mode: "act", blocked: null, pending: 5 });
   });
 
   it("a real failure is never re-checked, and neither is a result that has one", async () => {
@@ -271,7 +299,7 @@ describe("which re-check, by the classification", () => {
     const real = await failure(b, "gate-real");
     expect(real.record).toMatchObject({ verdict: "code", blocking: true });
     const mixed = await failure(b, "gate-mixed");
-    expect(mixed.record.resolution).not.toContain("re-check");
+    expect(mixed.record).toMatchObject({ verdict: "code", resolution: "infra: not re-checked: it has a real failure; code: back to the author" });
     const infraReal = await failure(b, "gate-infra-real");
     expect(infraReal.record.verdict).toBe("code");
     expect(infraReal.record.resolution).toContain("infra: not re-checked: it has a real failure");
@@ -284,7 +312,7 @@ describe("which re-check, by the classification", () => {
     enqueues(b);
     const S = sha("o1");
     await post(b, result("gate-infra", S, dockerDown()));
-    await post(b, result("gate-timeout", sha("o2"), failedTest), [timeoutReport(["createsOrder()"])]);
+    await post(b, result("gate-timeout", sha("o2"), failedTest), [junit4TimeoutReport(["createsOrder()"])]);
     b.clock.advance(10 * HOUR);
     await b.tick();
 
@@ -523,15 +551,19 @@ describe("the re-check's result", () => {
     expect(b.runner.callsTo(PROGRAM)).toHaveLength(1);
     const { record, gateRechecks } = await failure(b, "gate-t");
     expect(gateRechecks.map((r) => r.status)).toEqual(["failed_again"]);
-    expect(record).toMatchObject({ verdict: "code", blocking: true, resolution: "re-check run-1 failed the same way: escalated" });
-    expect(record.causes[0].verdict.rule).toBe("failed-on-recheck");
+    // A timeout that comes back on a quiet machine is not load: the failure is real now (it was infra by its signature)
+    expect(record).toMatchObject({ verdict: "code", blocking: true, resolution: "re-check run-1 failed the same way: escalated as a real failure" });
+    expect(record.causes[0].verdict).toMatchObject({ class: "code", rule: "failed-on-recheck" });
     expect(record.causes[0].verdict.evidence[0]).toBe(
       "failed again the same way on triage's re-check at the same commit (result run-1): a real failure",
     );
-    // The re-check's own result is not re-checked: it goes back to its author as any real failure
+    const routed = (await b.app.inject({ url: `/api/triage/failures/${record.id}` })).json().data.actions as { kind: string; status: string }[];
+    // Back to its author (a signed result names none here, so the route is recorded as skipped)
+    expect(routed.filter((a) => a.kind === "route").map((a) => a.status)).toEqual(["skipped"]);
+    // The re-check's own result is not re-checked, nor routed a second time
     const answer = await failure(b, "run-1");
     expect(answer.gateRechecks.map((r) => r.status)).toEqual(["failed_again"]);
-    expect(answer.record.resolution).toContain("code: back to the author");
+    expect(answer.record.resolution).toBe("infra: it failed the same way on a re-check: escalated");
     const decisions = b.decisions();
     expect(decisions).toHaveLength(1);
     expect(decisions[0]).toContain(
@@ -543,6 +575,146 @@ describe("the re-check's result", () => {
     const late = await post(b, result("run-1b", S, failedTest, "kiro-backend-targeted"), [timeoutReport(["createsOrder()"])], "gate-t");
     expect(late.statusCode).toBe(409);
     expect(b.decisions()).toHaveLength(1);
+  });
+});
+
+describe("classified by the root cause, not the top exception", () => {
+  const targeted = (id: string, commit: string, output: string) =>
+    result(id, commit, [step("backend-tests", "passed"), step("backend-targeted", "failed", output, 1)], "kiro-backend-targeted");
+  const redisReports = (): Report[] => [
+    { name: "TEST-com.example.shop.api.OrderApiIT.xml", step: "backend-targeted", content: fixture("junit-context-redis-order.xml") },
+    { name: "TEST-com.example.shop.api.PaymentApiIT.xml", step: "backend-targeted", content: fixture("junit-context-redis-payment.xml") },
+  ];
+
+  it("five context-load failures whose console chain ends in a Redis that did not answer: ONE infra cause, re-checked as the same pipeline", async () => {
+    const b = await boot({ mode: "observe" });
+    const S = sha("rd");
+    const res = await post(b, targeted("gate-redis", S, fixture("gradle-context-redis.txt")), redisReports());
+    expect(res.statusCode).toBe(200);
+    const { record, gateRechecks } = await failure(b, "gate-redis");
+    // The other test classes only say the cached context failed before: consequences, joined to the first failure
+    expect(record.causes).toHaveLength(1);
+    const [c] = record.causes;
+    expect(c.cause.kind).toBe("context");
+    expect(c.cause.testCount).toBe(5);
+    expect(c.cause.tests.map((t) => t.key)).toEqual([
+      "OrderApiIT#createsOrder()",
+      "OrderApiIT#listsOrders()",
+      "OrderApiIT#cancelsOrder()",
+      "PaymentApiIT#refundsPayment()",
+      "PaymentApiIT#capturesPayment()",
+    ]);
+    // The report's trace has no "Caused by"; the console's chain for the same tests is the root cause
+    expect(c.cause.causedBy).toEqual([
+      "org.springframework.beans.factory.BeanCreationException: Error creating bean with name 'sessionRepository': Invocation of init method failed",
+      "org.springframework.data.redis.RedisConnectionFailureException: Unable to connect to Redis",
+      "io.lettuce.core.RedisConnectionException: Unable to connect to 127.0.0.1/<unresolved>:64225",
+      "io.lettuce.core.RedisCommandTimeoutException: Connection initialization timed out after 2 second(s)",
+    ]);
+    expect(c.cause.rootCause).toBe("io.lettuce.core.RedisCommandTimeoutException: Connection initialization timed out after 2 second(s)");
+    expect(c.verdict).toMatchObject({ class: "infra", rule: "infra-signature:unable-to-connect", infraKind: "network", confidence: "high" });
+    expect(c.verdict.evidence).toEqual([
+      "Caused by: org.springframework.data.redis.RedisConnectionFailureException: Unable to connect to Redis (matches infra signature unable-to-connect)",
+      "one context failure for 5 test(s): the tests never ran, so this is not the change",
+    ]);
+    expect(record).toMatchObject({ verdict: "infra", blocking: true });
+    expect(gateRechecks).toMatchObject([{ status: "would", kind: "same", causes: ["infra"] }]);
+    expect(gateRechecks[0].argv).toEqual([PROGRAM, S, "kiro-backend-targeted", "same", "gate-redis", "infra:infra-signature:unable-to-connect"]);
+  });
+
+  it("the same, with the chain in the report itself and no console output; a timeout signature alone is a timeout", async () => {
+    const b = await boot({ mode: "observe" });
+    const chain = (lines: string[]) => lines.map((l) => `Caused by: ${l}\n\tat io.lettuce.core.Example.run(Example.java:1)\n`).join("");
+    const leader = (extra: string) =>
+      fixture("junit-context-redis-order.xml").replace("\t... 85 more\n", `${extra}\t... 85 more\n`);
+    await post(b, targeted("gate-in-report", sha("rr"), ""), [
+      {
+        name: "TEST-OrderApiIT.xml",
+        step: "backend-targeted",
+        content: leader(chain(["io.lettuce.core.RedisConnectionException: Unable to connect to 127.0.0.1/&lt;unresolved&gt;:64225"])),
+      },
+    ]);
+    await post(b, targeted("gate-init-timeout", sha("rt"), ""), [
+      {
+        name: "TEST-OrderApiIT.xml",
+        step: "backend-targeted",
+        content: leader(chain(["io.lettuce.core.RedisCommandTimeoutException: Connection initialization timed out after 2 second(s)"])),
+      },
+    ]);
+    const inReport = (await failure(b, "gate-in-report")).record.causes[0].verdict;
+    expect(inReport).toMatchObject({ class: "infra", rule: "infra-signature:unable-to-connect" });
+    const initTimeout = await failure(b, "gate-init-timeout");
+    expect(initTimeout.record.causes[0].verdict).toMatchObject({
+      class: "infra",
+      rule: "timeout-signature:connection-init-timeout",
+      infraKind: "load",
+      confidence: "low",
+    });
+    // A timeout of the environment: only the failed tests, quietly
+    expect(initTimeout.gateRechecks[0]).toMatchObject({ kind: "failed_tests", causes: ["timeout"] });
+  });
+
+  it("follower failures in other reports follow the first failure's class: a real context failure keeps them code", async () => {
+    const b = await boot();
+    enqueues(b);
+    const realLeader = fixture("junit-context-redis-order.xml").replace(
+      "\t... 85 more\n",
+      "Caused by: org.springframework.beans.factory.NoSuchBeanDefinitionException: No qualifying bean of type 'com.example.shop.payments.PaymentGateway' available\n\t... 85 more\n",
+    );
+    await post(b, targeted("gate-bean", sha("bn"), ""), [
+      { name: "TEST-OrderApiIT.xml", step: "backend-targeted", content: realLeader },
+      { name: "TEST-PaymentApiIT.xml", step: "backend-targeted", content: fixture("junit-context-redis-payment.xml") },
+    ]);
+    const { record } = await failure(b, "gate-bean");
+    expect(record.causes).toHaveLength(1);
+    expect(record.causes[0]).toMatchObject({ cause: { kind: "context", testCount: 5 }, verdict: { class: "code" } });
+    expect(b.runner.callsTo(PROGRAM)).toEqual([]);
+  });
+
+  it("real failures stay code: an assertion that quotes an infra message, and a compile error", async () => {
+    const b = await boot();
+    enqueues(b);
+    await post(b, result("gate-assert", sha("as"), failedTest), [
+      {
+        name: "TEST-OrderClientTest.xml",
+        step: "test",
+        content: `<testsuite name="com.example.shop.OrderClientTest"><testcase classname="com.example.shop.OrderClientTest" name="reportsDownstreamErrors()"><failure message="expected: &lt;OK&gt; but was: &lt;Connection refused&gt;" type="org.opentest4j.AssertionFailedError">org.opentest4j.AssertionFailedError: expected: &lt;OK&gt; but was: &lt;Connection refused&gt;
+	at com.example.shop.OrderClientTest.reportsDownstreamErrors(OrderClientTest.java:31)
+</failure></testcase></testsuite>`,
+      },
+    ]);
+    await post(b, result("gate-compile", sha("cp"), [step("build", "failed", fixture("gradle-compile.txt"), 1)]));
+    expect((await failure(b, "gate-assert")).record.causes[0].verdict.class).toBe("code");
+    const compile = (await failure(b, "gate-compile")).record.causes[0];
+    expect(compile).toMatchObject({ cause: { kind: "build" }, verdict: { class: "code" } });
+    expect(b.runner.callsTo(PROGRAM)).toEqual([]);
+  });
+
+  it("the signatures are configurable; default_infra_patterns: false drops the built-in ones", () => {
+    const parsed = parseTriageConfig({
+      enabled: true,
+      infra_signatures: ["license server .* unreachable"],
+      timeout_signatures: ["index refresh took too long"],
+    });
+    if (!parsed.ok) throw new Error(parsed.errors.join("; "));
+    expect(parsed.settings.infraSignatures.map((s) => s.id)).toEqual([
+      "infra_signatures.0",
+      "connection-refused",
+      "connection-reset",
+      "unable-to-connect",
+      "redis-connection",
+      "jdbc-connection",
+      "docker-environment",
+      "disk-full",
+      "out-of-memory",
+    ]);
+    expect(parsed.settings.timeoutSignatures.map((s) => s.id)).toEqual(["timeout_signatures.0", "connection-init-timeout", "timeout-exception"]);
+    const own = parseTriageConfig({ enabled: true, default_infra_patterns: false, infra_signatures: ["license server"] });
+    if (!own.ok) throw new Error(own.errors.join("; "));
+    expect(own.settings.infraSignatures.map((s) => s.id)).toEqual(["infra_signatures.0"]);
+    expect(own.settings.timeoutSignatures).toEqual([]);
+    const bad = parseTriageConfig({ enabled: true, timeout_signatures: ["("] });
+    expect(bad.ok ? [] : bad.errors[0]).toContain("triage.timeout_signatures.0: not a valid regular expression");
   });
 });
 
@@ -671,7 +843,7 @@ describe("placeholders and the command", () => {
     await b.events.emit("gate.completed", {
       project: "demo",
       result: result("gate-t", sha("n1"), failedTest),
-      reports: [timeoutReport(["createsOrder()"])],
+      reports: [junit4TimeoutReport(["createsOrder()"])],
       context: { agent: "worker-a" },
     });
     await b.manager.idle();

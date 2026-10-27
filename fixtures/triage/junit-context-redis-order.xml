@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Invented, shaped like a real targeted Spring Boot gate on a loaded machine: the test Redis did not answer in time, so the
+     application context failed to load. Gradle writes one report per test class; this trace stops before its "Caused by"
+     chain (the console output has it), and the later tests only say the context failed before -->
+<testsuite name="com.example.shop.api.OrderApiIT" tests="3" skipped="0" failures="0" errors="3" timestamp="2026-03-02T11:58:04" hostname="runner" time="4.812">
+  <properties/>
+  <testcase name="createsOrder()" classname="com.example.shop.api.OrderApiIT" time="4.802">
+    <error message="Failed to load ApplicationContext for [WebMergedContextConfiguration@5c2a7f31 testClass = com.example.shop.api.OrderApiIT, locations = [], classes = [com.example.shop.ShopApplication], contextInitializerClasses = [], activeProfiles = []]" type="java.lang.IllegalStateException">java.lang.IllegalStateException: Failed to load ApplicationContext for [WebMergedContextConfiguration@5c2a7f31 testClass = com.example.shop.api.OrderApiIT, locations = [], classes = [com.example.shop.ShopApplication], contextInitializerClasses = [], activeProfiles = []]
+	at org.springframework.test.context.cache.DefaultCacheAwareContextLoaderDelegate.loadContext(DefaultCacheAwareContextLoaderDelegate.java:180)
+	at org.springframework.test.context.support.DefaultTestContext.getApplicationContext(DefaultTestContext.java:130)
+	at org.springframework.test.context.junit.jupiter.SpringExtension.postProcessTestInstance(SpringExtension.java:163)
+	... 85 more
+</error>
+  </testcase>
+  <testcase name="listsOrders()" classname="com.example.shop.api.OrderApiIT" time="0.001">
+    <error message="ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [WebMergedContextConfiguration@5c2a7f31 testClass = com.example.shop.api.OrderApiIT, locations = [], classes = [com.example.shop.ShopApplication], contextInitializerClasses = [], activeProfiles = []]" type="java.lang.IllegalStateException">java.lang.IllegalStateException: ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [WebMergedContextConfiguration@5c2a7f31 testClass = com.example.shop.api.OrderApiIT, locations = [], classes = [com.example.shop.ShopApplication], contextInitializerClasses = [], activeProfiles = []]
+	at org.springframework.test.context.cache.DefaultCacheAwareContextLoaderDelegate.loadContext(DefaultCacheAwareContextLoaderDelegate.java:145)
+	at org.springframework.test.context.support.DefaultTestContext.getApplicationContext(DefaultTestContext.java:130)
+</error>
+  </testcase>
+  <testcase name="cancelsOrder()" classname="com.example.shop.api.OrderApiIT" time="0.001">
+    <error message="ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [WebMergedContextConfiguration@5c2a7f31 testClass = com.example.shop.api.OrderApiIT, locations = [], classes = [com.example.shop.ShopApplication], contextInitializerClasses = [], activeProfiles = []]" type="java.lang.IllegalStateException">java.lang.IllegalStateException: ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [WebMergedContextConfiguration@5c2a7f31 testClass = com.example.shop.api.OrderApiIT, locations = [], classes = [com.example.shop.ShopApplication], contextInitializerClasses = [], activeProfiles = []]
+	at org.springframework.test.context.cache.DefaultCacheAwareContextLoaderDelegate.loadContext(DefaultCacheAwareContextLoaderDelegate.java:145)
+	at org.springframework.test.context.support.DefaultTestContext.getApplicationContext(DefaultTestContext.java:130)
+</error>
+  </testcase>
+</testsuite>
