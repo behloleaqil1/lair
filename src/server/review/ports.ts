@@ -46,6 +46,8 @@ export interface DecisionRequest {
 
 export interface DecisionSink {
   raise(request: DecisionRequest): Promise<{ id: string | null; channel: string }>;
+  /** Withdraw the open decision raised with `key`, when it no longer applies; true when one was withdrawn */
+  withdraw?(project: string, key: string, reason: string): Promise<boolean>;
 }
 
 export interface ReviewAssignment {
@@ -126,8 +128,15 @@ export interface ReviewerRuns {
  * `review`. A request without a key gets one from its project and question,
  * so the same question is not asked twice while it is open.
  */
-export function inboxDecisionSink(inbox: Pick<DecisionProducer, "raise">): DecisionSink {
+export function inboxDecisionSink(inbox: Pick<DecisionProducer, "raise" | "blockedOn" | "withdraw">): DecisionSink {
   return {
+    async withdraw(project, key, reason) {
+      // A decision raised here blocks on its key (toDecisionInput)
+      const open = inbox.blockedOn(key);
+      if (!open || open.project !== project || open.source.module !== "review" || open.status !== "open") return false;
+      await inbox.withdraw(open.id, { module: "review", reason: reason.slice(0, 500) });
+      return true;
+    },
     async raise(request) {
       const key =
         request.key ?? `review:${createHash("sha256").update(`${request.project}\n${request.question}`).digest("hex").slice(0, 24)}`;

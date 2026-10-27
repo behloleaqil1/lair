@@ -39,6 +39,7 @@
  *   using up an attempt.
  * Everything is in the review store, so a restart carries on where it stopped.
  */
+import { createHash } from "crypto";
 import type { ProjectConfig } from "../../shared/types.js";
 import { backoffMs } from "../agents/config.js";
 import { isActive } from "../agents/types.js";
@@ -251,7 +252,10 @@ export class AgentReviewAssigner implements ReviewAssigner {
     if (!project?.settings.agentReviews.promptFile) return fail("reviews by agents are off for the project");
     const settings = project.settings.agentReviews;
     const pick = this.candidates(record);
-    if ("blocked" in pick) return fail(pick.blocked);
+    if ("blocked" in pick) {
+      if (pick.config) await this.raiseConfig(record, pick.blocked);
+      return fail(pick.blocked);
+    }
     const spec = record.spec;
     const prompt = buildReviewPrompt(getPromptsDir(project.config), settings.promptFile!, {
       pr: record.pr,
@@ -261,7 +265,10 @@ export class AgentReviewAssigner implements ReviewAssigner {
       base: spec.base,
       url: spec.url,
     });
-    if (!prompt.ok) return fail(prompt.reason);
+    if (!prompt.ok) {
+      if (prompt.cause === "template") await this.raiseConfig(record, prompt.reason);
+      return fail(prompt.reason);
+    }
 
     const refused = [...pick.waiting];
     for (const candidate of pick.free) {
@@ -313,18 +320,22 @@ export class AgentReviewAssigner implements ReviewAssigner {
 
   /**
    * The agents that may take the slot now (`free`, not-yet-tried ones first),
-   * and why the others don't; `blocked` when none ever can as configured.
+   * and why the others don't; `blocked` when none ever can, with `config`
+   * when the configuration is why (any PR needing such a slot would fail).
    */
-  private candidates(record: AgentAssignmentRecord): { free: Candidate[]; waiting: string[] } | { blocked: string } {
+  private candidates(
+    record: AgentAssignmentRecord,
+  ): { free: Candidate[]; waiting: string[] } | { blocked: string; config: boolean } {
     const spec = record.spec;
     const status = this.o.agents.status(record.project);
-    if (!status.enabled) return { blocked: `the agents module is off for ${record.project} (agents.enabled)` };
+    if (!status.enabled) return { blocked: `the agents module is off for ${record.project} (agents.enabled)`, config: true };
     // Any agent, the named one included, may be an unknown author
     if (!spec.author) {
       return {
         blocked:
           "the PR's author is unknown, so no agent can be told apart from it: map its branch (review.authors.branches " +
           "or review.authors.branch_pattern)",
+        config: false,
       };
     }
     const views = new Map(status.agents.map((view) => [view.id, view]));
@@ -335,15 +346,22 @@ export class AgentReviewAssigner implements ReviewAssigner {
       if (spec.authorModel) authorModels.add(spec.authorModel);
       const authorView = views.get(spec.author);
       for (const profile of authorView?.profiles ?? []) {
-        if (!profile.model) return { blocked: `the slot needs another model than the author's, and one of ${spec.author}'s profiles names none` };
+        if (!profile.model) {
+          return {
+            blocked: `the slot needs another model than the author's, and one of ${spec.author}'s profiles names none`,
+            config: true,
+          };
+        }
         authorModels.add(profile.model);
       }
       if (authorModels.size === 0) {
-        return { blocked: "the slot needs a model other than the author's, and the author's model is unknown" };
+        return { blocked: "the slot needs a model other than the author's, and the author's model is unknown", config: true };
       }
     }
     const pool = spec.reviewer ? [spec.reviewer] : (spec.pool ?? []);
-    if (pool.length === 0) return { blocked: `no reviewer pool: set review.reviewers_pool.${spec.tier} or the slot's pool` };
+    if (pool.length === 0) {
+      return { blocked: `no reviewer pool: set review.reviewers_pool.${spec.tier} or the slot's pool`, config: true };
+    }
 
     const busy = this.o.agents.managedRuns(record.project);
     const reviewing = new Set(this.o.store.agentsReviewing(record.project, record.pr));
@@ -356,25 +374,30 @@ export class AgentReviewAssigner implements ReviewAssigner {
     const free: Candidate[] = [];
     const waiting: string[] = [];
     const never: string[] = [];
+    /** How many of `never` are the configuration's doing (not this PR's author or reviews) */
+    let configured = 0;
     for (const id of pool) {
       const view = views.get(id);
       if (id === spec.author || spec.exclude.includes(id)) {
-        never.push(`${id}: the PR's author`);
+        never.push(id === spec.author ? `${id}: the PR's author` : `${id}: may be the PR's author`);
         continue;
       }
       if (!view) {
         never.push(`${id}: not an agent of this project`);
+        configured++;
         continue;
       }
       const models = view.profiles.map((p) => p.model ?? null);
       if (spec.differentModel) {
         if (models.length === 0 || models.includes(null)) {
           never.push(`${id}: the model of one of its profiles is unknown`);
+          configured++;
           continue;
         }
         const shared = models.find((m) => m !== null && authorModels.has(m));
         if (shared) {
           never.push(`${id}: it and the author can both run on ${shared}`);
+          configured++;
           continue;
         }
       }
@@ -396,7 +419,9 @@ export class AgentReviewAssigner implements ReviewAssigner {
       }
       free.push({ id, model: models[0] ?? null });
     }
-    if (free.length === 0 && waiting.length === 0) return { blocked: `no agent can review it: ${never.join("; ")}` };
+    if (free.length === 0 && waiting.length === 0) {
+      return { blocked: `no agent can review it: ${never.join("; ")}`, config: configured === never.length };
+    }
     // Stable: pool order, with the agents whose runs already ended without a review last
     free.sort((a, b) => Number(spec.tried.includes(a.id)) - Number(spec.tried.includes(b.id)));
     return { free, waiting: [...waiting, ...never] };
@@ -494,6 +519,40 @@ export class AgentReviewAssigner implements ReviewAssigner {
     // The new token's hash and its agent are on the request round before the run starts (reissueRequest)
     await this.startRun(record, newAssignmentToken(), true);
     this.save(record);
+  }
+
+  /**
+   * The configuration can't satisfy a slot (no pool, every reviewer sharing
+   * the author's model, a refused template, the agents module off): tell the
+   * owner once per project and reason. The key dedupes it while it is open,
+   * however many PRs hit the same reason.
+   */
+  private async raiseConfig(record: AgentAssignmentRecord, reason: string): Promise<void> {
+    const key = `review:config:${createHash("sha256").update(reason).digest("hex").slice(0, 24)}`;
+    try {
+      await this.o.decisions.raise({
+        project: record.project,
+        question: `Reviews by agents can't be done as configured: ${oneLine(reason, 150)}`,
+        context: [
+          `${reason}.`,
+          "",
+          `PR #${record.pr} at ${record.headSha.slice(0, 7)} hit it first (${record.spec.label}). Until the configuration ` +
+            "is fixed, no agent takes such a slot, and the PRs that need one wait for another reviewer.",
+          "",
+          "Once it is fixed, request the missing reviews in Lair's Reviews view: a failed slot is not asked for again on its own.",
+        ].join("\n"),
+        options: ["Fix the configuration", "Review these PRs yourself"],
+        recommended: "Fix the configuration",
+        why: "The configuration can't satisfy the slot, so every PR that needs it waits.",
+        kind: "other",
+        reversible: true,
+        requestedBy: "review",
+        links: record.spec.url ? [{ label: `PR #${record.pr}`, url: record.spec.url }] : [],
+        key,
+      });
+    } catch (e) {
+      this.lastError = `${record.project}: the configuration problem could not be raised: ${message(e)}`;
+    }
   }
 
   /** The last attempt ended without a review: the slot fails and the owner is asked. */

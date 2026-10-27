@@ -48,6 +48,7 @@ import {
   unwiredDecisionSink,
   type DecisionSink,
   type ReviewAssigner,
+  type ReviewAssignment,
   type ReviewerRuns,
 } from "./ports.js";
 import type { SignedGateResult } from "../../shared/policy-types.js";
@@ -119,8 +120,24 @@ export type RequestOrigin = "owner" | "auto";
 /** An automatic round for a PR starts at most this often (a new head waits until then). */
 export const AUTO_REQUEST_MIN_INTERVAL_MS = 5 * 60_000;
 
+/** A request round's channel from its token's hash being written until the assigner answers */
+const REQUESTING = "requesting";
+/** The channel of a round whose assigner threw */
+const REQUEST_ERROR = "error";
+/**
+ * A round still `requesting` after this long was interrupted (Lair stopped
+ * between writing its token's hash and the assigner's answer): the slot may
+ * be asked for again. An assigner answers in seconds.
+ */
+export const REQUESTING_EXPIRY_MS = 10 * 60_000;
+
 function short(sha: string): string {
   return sha.slice(0, 7);
+}
+
+/** The Decision Inbox key of a human review asked for one slot at one head. */
+export function humanReviewKey(pr: number, headSha: string, slot: number): string {
+  return `review:human:${pr}:${headSha}:${slot}`;
 }
 
 export class ReviewService {
@@ -187,21 +204,28 @@ export class ReviewService {
     author: ReviewerRef | null;
     source: PrReviewStatus["authorSource"];
     note: string | null;
+    /** Agents that may be the author too (the tasks file chose the author among them): none of them reviews */
+    others: string[];
   } {
     const stored = this.o.store.getAuthor(this.project, pr.number);
-    if (stored) return { author: this.withModel(stored), source: "lair", note: null };
+    if (stored) return { author: this.withModel(stored), source: "lair", note: null, others: [] };
     const mapped = mapAuthor(this.settings.authors, pr.headRef, this.o.config);
     if (mapped.agent) {
-      return { author: this.withModel({ id: mapped.agent, kind: "agent" }), source: mapped.source, note: mapped.note };
+      return {
+        author: this.withModel({ id: mapped.agent, kind: "agent" }),
+        source: mapped.source,
+        note: mapped.note,
+        others: mapped.others,
+      };
     }
-    return { author: null, source: null, note: mapped.note };
+    return { author: null, source: null, note: mapped.note, others: [] };
   }
 
   /** The PR's state and head now, from the git host (recorded as the head seen), or null when it can't say. */
   async currentPullRequest(n: number): Promise<{ state: string; headSha: string } | null> {
     try {
       const pr = await this.o.host.getPullRequest(n);
-      this.noteHead(pr);
+      await this.noteHead(pr);
       return { state: pr.state, headSha: pr.headSha };
     } catch {
       return null;
@@ -247,14 +271,30 @@ export class ReviewService {
     return views;
   }
 
-  /** Record the head; a new one makes every review at an older head stale. */
-  private noteHead(pr: HostPullRequest): void {
+  /**
+   * Record the head; a new one makes every review at an older head stale,
+   * and withdraws the human reviews asked for at the old head from the
+   * Decision Inbox (a review there would bind to a head that is gone).
+   */
+  private async noteHead(pr: HostPullRequest): Promise<void> {
     const previous = this.o.store.observeHead(this.project, pr.number, pr.headSha, this.now());
-    if (previous) {
-      const stale = this.o.store
-        .listReviews(this.project, pr.number)
-        .filter((r) => r.headSha !== pr.headSha && r.reviewer.kind !== "check").length;
-      this.emit("review.invalidated", { pr: pr.number, previousHead: previous, headSha: pr.headSha, staleReviews: stale });
+    if (!previous) return;
+    const stale = this.o.store
+      .listReviews(this.project, pr.number)
+      .filter((r) => r.headSha !== pr.headSha && r.reviewer.kind !== "check").length;
+    this.emit("review.invalidated", { pr: pr.number, previousHead: previous, headSha: pr.headSha, staleReviews: stale });
+    for (const slot of this.o.store.decisionSlots(this.project, pr.number, previous)) {
+      try {
+        await this.o.decisions.withdraw?.(
+          this.project,
+          humanReviewKey(pr.number, previous, slot),
+          `PR #${pr.number} moved from ${short(previous)} to ${short(pr.headSha)}: a review must bind to the new head`,
+        );
+      } catch (e) {
+        console.warn(
+          `[review] ${this.project} #${pr.number}: withdrawing the old head's review request failed: ${e instanceof Error ? e.message : e}`,
+        );
+      }
     }
   }
 
@@ -412,7 +452,7 @@ export class ReviewService {
   async status(n: number): Promise<PrReviewStatus> {
     const host = this.o.host;
     const pr = await host.getPullRequest(n);
-    this.noteHead(pr);
+    await this.noteHead(pr);
     const repo = await this.repo();
     const defaultBranch = this.settings.defaultBranch ?? repo?.defaultBranch ?? null;
 
@@ -433,7 +473,7 @@ export class ReviewService {
     );
     if (pr.state === "open") await this.ensureIntegrity(pr, files, risk.tier);
 
-    const { author, source, note } = this.authorOf(pr);
+    const { author, source, note, others } = this.authorOf(pr);
     const reviews = this.annotate(this.o.store.listReviews(this.project, n), pr.headSha);
     const findings = reviews.flatMap((r) => r.findings);
     const openBlocking = findings.filter((f) => f.status === "open" && f.blocking && !f.superseded);
@@ -451,6 +491,7 @@ export class ReviewService {
         })),
       author,
       pr.headSha,
+      others,
     );
 
     const gate = await this.gateSource.checksAt(pr.headSha);
@@ -502,6 +543,7 @@ export class ReviewService {
       author,
       authorSource: source,
       authorNote: note,
+      authorExcluded: others,
       labels: pr.labels,
       risk,
       slots,
@@ -570,7 +612,7 @@ export class ReviewService {
     const assignment =
       input.reviewer.kind === "agent" ? this.assignmentFor(n, input.reviewer.id, input.headSha, context.assignmentToken) : null;
     const pr = await this.o.host.getPullRequest(n);
-    this.noteHead(pr);
+    await this.noteHead(pr);
     if (pr.state !== "open") throw new ReviewError(`PR #${n} is ${pr.state}`, 409);
     let reviewer = this.withModel(input.reviewer);
     if (assignment) {
@@ -759,7 +801,7 @@ export class ReviewService {
     if (this.closing) return [];
     const asked: number[] = [];
     for (const pr of await this.o.host.listOpenPullRequests()) {
-      this.noteHead(pr);
+      await this.noteHead(pr);
       if (pr.draft) continue;
       const now = this.o.clock.now();
       const last = this.autoRequested.get(pr.number);
@@ -784,7 +826,15 @@ export class ReviewService {
       const previous = this.o.store.getRequest(this.project, n, status.headSha, index);
       const agents = this.o.store.getAgentAssignment(this.project, n, status.headSha, index);
       const failedRound = previous && !previous.usedBy && agents?.round === previous.round && agents.state === "failed";
-      if (previous && !previous.usedBy && !(failedRound && origin === "owner")) {
+      // A round whose hand-over never finished (a crash after its token's hash was written, or an assigner error) doesn't count
+      const handedOn = agents?.round === previous?.round && (agents?.state === "requested" || agents?.state === "assigned");
+      const interrupted =
+        previous &&
+        !previous.usedBy &&
+        !handedOn &&
+        (previous.channel === REQUEST_ERROR ||
+          (previous.channel === REQUESTING && this.o.clock.now() - Date.parse(previous.requestedAt) >= REQUESTING_EXPIRY_MS));
+      if (previous && !previous.usedBy && !interrupted && !(failedRound && origin === "owner")) {
         outcomes.push({
           slot: slot.label,
           channel: "already requested",
@@ -810,15 +860,24 @@ export class ReviewService {
           continue;
         }
         const reviewer = named && named.kind === "agent" ? named.agent : role === "self-check" ? status.author.id : null;
-        const exclude = role === "review" ? [status.author.id] : [];
+        // The author, and the agents the branch mappings also matched when the tasks file chose between them
+        const exclude = role === "review" ? [status.author.id, ...(status.authorExcluded ?? [])] : [];
+        if (reviewer && role === "review" && exclude.includes(reviewer)) {
+          outcomes.push({
+            slot: slot.label,
+            channel: "none",
+            detail: `${reviewer} may be the PR's author (${status.authorNote ?? "the branch mappings matched it"}): it reviews nothing here`,
+          });
+          continue;
+        }
         const token = newAssignmentToken();
         // The token's hash is recorded first, so no token is ever handed out that Lair doesn't know
-        const round = this.o.store.recordRequest(this.project, n, status.headSha, index, "requesting", "requesting", this.now(), {
+        const round = this.o.store.recordRequest(this.project, n, status.headSha, index, REQUESTING, REQUESTING, this.now(), {
           reviewer,
           exclude,
           tokenHash: hashToken(token),
         });
-        const result = await this.o.assigner.assign({
+        const assignment = {
           project: this.project,
           pr: n,
           headSha: status.headSha,
@@ -837,7 +896,22 @@ export class ReviewService {
           url: status.url,
           reason: `The ${status.risk.tier} tier needs ${slot.label}`,
           token,
-        });
+        } satisfies ReviewAssignment;
+        let result: Awaited<ReturnType<ReviewAssigner["assign"]>>;
+        try {
+          result = await this.o.assigner.assign(assignment);
+        } catch (e) {
+          // Recorded as an error, so the slot can be asked for again
+          const why = `the assigner failed: ${e instanceof Error ? e.message : String(e)}`.slice(0, 500);
+          this.o.store.completeRequest(this.project, n, status.headSha, index, round, {
+            channel: REQUEST_ERROR,
+            detail: why,
+            reviewer: null,
+            model: null,
+          });
+          outcomes.push({ slot: slot.label, channel: REQUEST_ERROR, detail: why });
+          continue;
+        }
         // The assigner may name the agent it picked; an excluded pick binds nobody
         const picked = reviewer ?? (result.agent && !exclude.includes(result.agent) ? result.agent : null);
         channel = result.channel ?? "assigner";
@@ -867,7 +941,7 @@ export class ReviewService {
           reversible: true,
           requestedBy: "review",
           links: status.url ? [{ label: `PR #${n}`, url: status.url }] : [],
-          key: `review:human:${n}:${status.headSha}:${index}`,
+          key: humanReviewKey(n, status.headSha, index),
         });
         channel = "decision";
         detail = result.channel;

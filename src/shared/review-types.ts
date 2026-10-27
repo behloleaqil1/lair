@@ -221,6 +221,8 @@ export interface PrReviewStatus {
   authorSource: "lair" | "branch" | "tasks_file" | null;
   /** Why the author is unknown when a mapping didn't settle it (e.g. two agents match the branch) */
   authorNote?: string | null;
+  /** Agents the branch mappings matched besides the author, when the tasks file chose between them: none of them may review */
+  authorExcluded?: string[];
   /** The host account that opened the PR (agents often share one) */
   hostUser: string | null;
   labels: string[];

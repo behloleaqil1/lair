@@ -76,17 +76,17 @@ export function buildReviewPrompt(
   promptsDir: string,
   file: string,
   values: PromptValues,
-): { ok: true; prompt: string } | { ok: false; reason: string } {
+): { ok: true; prompt: string } | { ok: false; reason: string; cause: "value" | "template" } {
   const invalid = invalidValue(values);
-  if (invalid) return { ok: false, reason: `refused: ${invalid}` };
+  if (invalid) return { ok: false, reason: `refused: ${invalid}`, cause: "value" };
   let template: string;
   try {
     template = readPromptFile(promptsDir, file).text;
   } catch (e) {
     const why = e instanceof PromptFileError ? e.message : e instanceof Error ? e.message : String(e);
-    return { ok: false, reason: `review.prompt_file ${file}: ${why}` };
+    return { ok: false, reason: `review.prompt_file ${file}: ${why}`, cause: "template" };
   }
   const prompt = fillTemplate(template, values);
-  if (prompt.trim().length === 0) return { ok: false, reason: `review.prompt_file ${file} is empty` };
+  if (prompt.trim().length === 0) return { ok: false, reason: `review.prompt_file ${file} is empty`, cause: "template" };
   return { ok: true, prompt };
 }

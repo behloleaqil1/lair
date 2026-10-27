@@ -315,8 +315,8 @@ const check = (h: Harness) => h.reviews.agentReviews!.check();
 const reviewDb = (h: Harness) => join(h.dir, "data", "review.db");
 
 /** The owner asks for the missing reviews (the dashboard's "Request missing reviews"). */
-async function requestReviews(h: Harness): Promise<{ slot: string; channel: string; detail: string }[]> {
-  const res = await h.app.inject({ method: "POST", url: "/api/review/prs/7/request-reviews?project=demo", headers: h.owner });
+async function requestReviews(h: Harness, pr = 7): Promise<{ slot: string; channel: string; detail: string }[]> {
+  const res = await h.app.inject({ method: "POST", url: `/api/review/prs/${pr}/request-reviews?project=demo`, headers: h.owner });
   expect(res.statusCode).toBe(200);
   return res.json().data;
 }
@@ -956,10 +956,16 @@ describe("the prompt template", () => {
     writeFileSync(outside, "SECRET-OUTSIDE-PROMPTS");
     symlinkSync(outside, join(h.promptsDir, "review-prompt.md"));
     const outcomes = await requestReviews(h);
-    expect(outcomes[0].detail).toBe("review.prompt_file review-prompt.md: review-prompt.md links to a file outside prompts_dir: refused");
+    const why = "review.prompt_file review-prompt.md: review-prompt.md links to a file outside prompts_dir: refused";
+    expect(outcomes[0].detail).toBe(why);
     await tick(h);
     expect(h.spawner.calls).toHaveLength(0);
     expect((await statusOf(h)).assignments![0].state).toBe("failed");
+    // The owner learns the configuration can't do it, once
+    await requestReviews(h);
+    expect(h.inbox.list({ project: "demo" }).map((d) => d.title)).toEqual([
+      `Reviews by agents can't be done as configured: ${why}`,
+    ]);
   });
 
   it("refuses a placeholder value that isn't its plain shape (a base branch carrying text)", async () => {
@@ -998,5 +1004,130 @@ describe("the prompt template", () => {
     ]);
     expect(() => parseFindings("a/b.ts:3: urgent: x", false)).toThrow("findings line 1");
     expect(() => parseFindings("a/b.ts:0: low: x", false)).toThrow("findings line 1");
+  });
+});
+
+// ============ 8. WHAT THE INBOX AND THE STORE KEEP ============
+
+describe("human reviews asked for at a head that is gone", () => {
+  it("are withdrawn from the Decision Inbox when the PR moves on: only the current head's stays open", async () => {
+    const h = await boot({ review: { reviewers: { amber: ["human", "peer"] } } });
+    const asked = () => h.inbox.list({ project: "demo", status: "all" }).filter((d) => d.title.startsWith("Review PR #7"));
+    await h.reviews.requestOpenPullRequests();
+    expect(asked().map((d) => [d.title, d.status])).toEqual([[`Review PR #7 (amber tier) at ${h.head.slice(0, 7)}`, "open"]]);
+
+    // Three pushes, each seen by the automatic path
+    const heads = [h.head];
+    for (let i = 1; i <= 3; i++) {
+      h.clock.t = NOW + i * 6 * MIN;
+      heads.push(push(h));
+      await h.reviews.requestOpenPullRequests();
+    }
+    const items = asked();
+    expect(items.filter((d) => d.status === "open").map((d) => d.title)).toEqual([
+      `Review PR #7 (amber tier) at ${heads[3].slice(0, 7)}`,
+    ]);
+    expect(
+      items
+        .filter((d) => d.status === "withdrawn")
+        .map((d) => d.title)
+        .sort(),
+    ).toEqual(heads.slice(0, 3).map((head) => `Review PR #7 (amber tier) at ${head.slice(0, 7)}`).sort());
+  });
+});
+
+describe("a tasks file that chose between two matched agents", () => {
+  it("keeps every other matched agent from reviewing", async () => {
+    const h = await boot({
+      headRef: "team/login",
+      review: {
+        authors: { from_tasks_file: true, branches: { "team/**": "worker-a", "team/l*": "rev-c" } },
+        reviewers_pool: { amber: ["rev-c", "rev-b"] },
+        reviewers: { amber: ["peer", "agent:rev-c"] },
+      },
+      agents: { fill: { tasks_file: "tasks.txt" } },
+    });
+    writeFileSync(join(h.dir, "tasks.txt"), "worker-a|A|feat-login|Build the login form (branch: team/login)\n");
+    const status = await statusOf(h);
+    expect(status.author).toMatchObject({ id: "worker-a" });
+    expect(status.authorSource).toBe("tasks_file");
+    expect(status.authorExcluded).toEqual(["rev-c"]);
+    expect(status.authorNote).toBe(
+      'branch team/login matches worker-a (review.authors.branches "team/**"), rev-c (review.authors.branches "team/l*"); ' +
+        "the tasks file names worker-a, so rev-c may not review it either",
+    );
+
+    const outcomes = await requestReviews(h);
+    expect(outcomes[0]).toMatchObject({ channel: "agents", detail: expect.stringContaining("rev-b: run ") });
+    expect(outcomes[1]).toEqual({
+      slot: "agent rev-c",
+      channel: "none",
+      detail: `rev-c may be the PR's author (${status.authorNote}): it reviews nothing here`,
+    });
+    await tick(h);
+    expect(h.spawner.calls.map((c) => c.env.LAIR_AGENT)).toEqual(["rev-b"]);
+
+    // Nor would the policy count a review by rev-c, in any agent slot
+    const approval = { id: "rv-x", reviewer: { id: "rev-c", kind: "agent" as const }, verdict: "approve" as const, headSha: h.head, superseded: false };
+    const author = { id: "worker-a", kind: "agent" as const };
+    for (const option of [{ kind: "peer" as const }, { kind: "agent" as const, agent: "rev-c" }]) {
+      expect(slotMismatch({ anyOf: [option], differentModel: false }, approval, author, h.head, ["rev-c"])).toBe(
+        "may be the author (the branch mappings matched it too)",
+      );
+    }
+  });
+});
+
+describe("a slot the configuration can't satisfy", () => {
+  it("is raised once in the Decision Inbox for the project and reason, however many PRs hit it", async () => {
+    const h = await boot({ review: { reviewers_pool: {} } });
+    const other = h.remote.commit([h.head], AGENT, "feat: other");
+    h.remote.openPull({ number: 8, title: "Other", headRef: "agent/worker-a/other", headSha: other, files: [FEATURE] });
+    h.remote.setChecks(other, [["build", "success"]]);
+    const why = "no reviewer pool: set review.reviewers_pool.amber or the slot's pool";
+    expect((await requestReviews(h, 7))[0].detail).toBe(why);
+    expect((await requestReviews(h, 8))[0].detail).toBe(why);
+    await requestReviews(h, 7); // the owner asks again: still one
+    const items = h.inbox.list({ project: "demo" });
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      kind: "other",
+      status: "open",
+      title: `Reviews by agents can't be done as configured: ${why}`,
+      source: { module: "review" },
+    });
+    expect(items[0].context).toContain(`PR #7 at ${h.head.slice(0, 7)} hit it first`);
+    await tick(h);
+    expect(h.spawner.calls).toHaveLength(0);
+  });
+});
+
+describe("a request round interrupted before its hand-over", () => {
+  it("blocks asking again at that head for 10 minutes, then no longer", async () => {
+    const h = await boot();
+    await statusOf(h);
+    // Lair stopped right after writing the round's token hash, before the assigner answered
+    const db = new Database(reviewDb(h));
+    db.prepare(
+      `INSERT INTO review_requests (project, pr, head_sha, slot, round, channel, detail, requested_at, reviewer, exclude, token_hash, used_by, model)
+       VALUES ('demo', 7, ?, 0, 1, 'requesting', 'requesting', ?, NULL, '["worker-a"]', ?, NULL, NULL)`,
+    ).run(h.head, new Date(NOW - MIN).toISOString(), sha256("an interrupted round's token"));
+    db.close();
+
+    expect((await requestReviews(h))[0]).toMatchObject({ channel: "already requested" });
+    await h.reviews.requestOpenPullRequests();
+    await tick(h);
+    expect(h.spawner.calls).toHaveLength(0);
+
+    h.clock.t = NOW + 10 * MIN;
+    const again = await requestReviews(h);
+    expect(again[0]).toMatchObject({ channel: "agents", detail: expect.stringContaining("rev-b: run ") });
+    expect(query(reviewDb(h), `SELECT round, channel FROM review_requests WHERE pr = 7 ORDER BY round`)).toEqual([
+      { round: 1, channel: "requesting" },
+      { round: 2, channel: "agents" },
+    ]);
+    await tick(h);
+    expect(h.spawner.calls).toHaveLength(1);
+    expect((await submit(h, h.spawner.calls[0].env)).code).toBe(EXIT_OK);
   });
 });

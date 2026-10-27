@@ -44,13 +44,19 @@ function isAuthor(reviewer: ReviewerRef, author: ReviewerRef | null): boolean {
   return author !== null && reviewer.id === author.id;
 }
 
-/** Why `candidate` can't fill `option`, or null if it can. */
+/**
+ * Why `candidate` can't fill `option`, or null if it can. `excluded`: agents
+ * that may be the author too (the agent-writable tasks file chose the author
+ * among them): their reviews count for no agent slot.
+ */
 function optionMismatch(
   option: ReviewerOption,
   candidate: SlotCandidate,
   author: ReviewerRef | null,
+  excluded: readonly string[],
 ): string | null {
   const r = candidate.reviewer;
+  const mayBeAuthor = r.kind === "agent" && excluded.includes(r.id);
   switch (option.kind) {
     case "human":
       if (r.kind !== "human") return "not a human";
@@ -59,10 +65,12 @@ function optionMismatch(
       if (r.kind !== "agent" || r.id !== option.agent) return `not agent ${option.agent}`;
       // An unknown author may be this very agent: its review can't count
       if (author === null) return "the PR's author is unknown";
+      if (mayBeAuthor) return "may be the author (the branch mappings matched it too)";
       return isAuthor(r, author) ? "is the author" : null;
     case "peer":
       if (r.kind === "check") return "a check, not a reviewer";
       if (author === null) return "the PR's author is unknown";
+      if (mayBeAuthor) return "may be the author (the branch mappings matched it too)";
       return isAuthor(r, author) ? "is the author" : null;
     case "self":
       if (author === null) return "the PR's author is unknown";
@@ -84,11 +92,12 @@ export function slotMismatch(
   candidate: SlotCandidate,
   author: ReviewerRef | null,
   headSha: string,
+  excluded: readonly string[] = [],
 ): string | null {
   if (candidate.headSha !== headSha) return `reviewed ${candidate.headSha.slice(0, 7)}, not the head`;
   if (candidate.superseded) return "replaced by a later review";
   if (candidate.verdict !== "approve") return "requested changes";
-  const mismatches = slot.anyOf.map((o) => optionMismatch(o, candidate, author));
+  const mismatches = slot.anyOf.map((o) => optionMismatch(o, candidate, author, excluded));
   if (mismatches.every((m) => m !== null)) return mismatches[0];
   if (slot.differentModel) return modelMismatch(candidate, author);
   return null;
@@ -103,10 +112,12 @@ export function matchSlots(
   candidates: SlotCandidate[],
   author: ReviewerRef | null,
   headSha: string,
+  /** Agents that may be the author too: their reviews fill no agent slot */
+  excluded: readonly string[] = [],
 ): SlotStatus[] {
   const eligible = slots.map((slot) =>
     candidates
-      .map((c, index) => (slotMismatch(slot, c, author, headSha) === null ? index : -1))
+      .map((c, index) => (slotMismatch(slot, c, author, headSha, excluded) === null ? index : -1))
       .filter((index) => index >= 0),
   );
 
@@ -152,7 +163,7 @@ export function matchSlots(
     const why = candidates
       .map((c, i) => ({ c, i }))
       .filter(({ c, i }) => c.headSha === headSha && !c.superseded && !eligible[index].includes(i))
-      .map(({ c }) => `${c.reviewer.id}: ${slotMismatch(slot, c, author, headSha)}`)
+      .map(({ c }) => `${c.reviewer.id}: ${slotMismatch(slot, c, author, headSha, excluded)}`)
       .slice(0, 3);
     if (why.length > 0) parts.push(`not counted: ${why.join("; ")}`);
     return { slot, label, satisfiedBy: null, detail: parts.join(". ") };

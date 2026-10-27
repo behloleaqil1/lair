@@ -179,13 +179,20 @@ export interface MappedAuthor {
   source: "branch" | "tasks_file" | null;
   /** Why the author is unknown (nothing matched, ambiguous, the tasks file alone), or a tasks file problem */
   note: string | null;
+  /**
+   * When the tasks file narrowed several matches to one: the other agents
+   * the mappings matched. The tasks file is agent-writable, so any of them
+   * may be the real author, and none of them may review.
+   */
+  others: string[];
 }
 
 /**
  * The agent a branch belongs to. branch_pattern and branches decide it; the
  * tasks file, which agents can write, only confirms them: it may narrow
- * several matches down to one, never name an author on its own, and a line
- * naming another agent than the one they matched leaves the author unknown.
+ * several matches down to one (and then every other match is kept from
+ * reviewing), never name an author on its own, and a line naming another
+ * agent than the ones they matched leaves the author unknown.
  */
 export function mapAuthor(
   mapping: AuthorMapping,
@@ -193,7 +200,7 @@ export function mapAuthor(
   config: Pick<ProjectConfig, "agents" | "repo">,
 ): MappedAuthor {
   if (branch.length > MAX_BRANCH_CHARS) {
-    return { agent: null, source: null, note: `the branch name is longer than ${MAX_BRANCH_CHARS} characters` };
+    return { agent: null, source: null, note: `the branch name is longer than ${MAX_BRANCH_CHARS} characters`, others: [] };
   }
   const found: { agent: string; why: string }[] = [];
   const fromPattern = mapping.branchPattern?.exec(branch)?.groups?.agent;
@@ -221,6 +228,7 @@ export function mapAuthor(
     agent: null,
     source: null,
     note: tasksProblem ? `${note}; ${tasksProblem}` : note,
+    others: [],
   });
   const describe = (items: { agent: string; why: string }[]) => items.map((f) => `${f.agent} (${f.why})`).join(", ");
 
@@ -238,10 +246,18 @@ export function mapAuthor(
   const ambiguous = () =>
     unknown(`ambiguous: branch ${branch} matches ${describe([...found, ...listed])}, so the author stays unknown`);
   if (named.length === 0) {
-    return matched.length === 1 ? { agent: matched[0], source: "branch", note: tasksProblem } : ambiguous();
+    return matched.length === 1 ? { agent: matched[0], source: "branch", note: tasksProblem, others: [] } : ambiguous();
   }
   // The tasks file narrows: it must name only agents the mappings matched, and leave exactly one
   if (named.some((agent) => !matched.includes(agent))) return ambiguous();
   if (named.length !== 1) return ambiguous();
-  return { agent: named[0], source: matched.length === 1 ? "branch" : "tasks_file", note: null };
+  if (matched.length === 1) return { agent: named[0], source: "branch", note: null, others: [] };
+  // It chose between several: the agent-writable file may be wrong, so none of the others reviews either
+  const others = matched.filter((agent) => agent !== named[0]);
+  return {
+    agent: named[0],
+    source: "tasks_file",
+    note: `branch ${branch} matches ${describe(found)}; the tasks file names ${named[0]}, so ${others.join(", ")} may not review it either`,
+    others,
+  };
 }

@@ -77,7 +77,8 @@ const SCHEMA_2 = `
   CREATE INDEX IF NOT EXISTS idx_review_agent_assignments_state ON review_agent_assignments(state);
 `;
 
-const SCHEMA = `
+/** Schema version 1, as it shipped (the migration test builds a v1 file with it). */
+export const SCHEMA_1 = `
   CREATE TABLE IF NOT EXISTS review_reviews (
     id TEXT PRIMARY KEY,
     project TEXT NOT NULL,
@@ -471,7 +472,7 @@ export class ReviewStore {
     const version = this.db.pragma("user_version", { simple: true }) as number;
     if (version < SCHEMA_VERSION) {
       this.db.transaction(() => {
-        this.db.exec(SCHEMA);
+        this.db.exec(SCHEMA_1);
         // 1 -> 2: review_requests is rebuilt with `round` in its key (its rows become round 1)
         if (version < 2) this.db.exec(SCHEMA_2);
         this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
@@ -774,6 +775,17 @@ export class ReviewStore {
       )
       .get(project, pr, headSha, slot) as RequestRow | undefined;
     return row ? assignmentOf(row) : null;
+  }
+
+  /** The slots whose human review was asked for at one head (through the Decision Inbox). */
+  decisionSlots(project: string, pr: number, headSha: string): number[] {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT slot FROM review_requests WHERE project = ? AND pr = ? AND head_sha = ? AND channel = 'decision'
+         ORDER BY slot`,
+      )
+      .all(project, pr, headSha) as { slot: number }[];
+    return rows.map((r) => r.slot);
   }
 
   /** Every round of a slot's request at one head, first first. */
