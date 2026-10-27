@@ -22,45 +22,8 @@ import { pickInitialProject } from "./initial-project";
 import type { CommandMode, ControlsStatus } from "../shared/types";
 import { LAIR_VERSION } from "../shared/version";
 import { DecisionInbox, DecisionsBadge } from "./components/DecisionInbox";
+import { VIEWS, type View } from "./nav";
 import "./App.css";
-
-type View =
-  | "decisions"
-  | "overview"
-  | "dragons"
-  | "gates"
-  | "prs"
-  | "orchestrator"
-  | "machines"
-  | "nodes"
-  | "processes"
-  | "activity"
-  | "health"
-  | "delivery"
-  | "reviews"
-  | "agents"
-  | "triage"
-  | "inbox";
-
-const VIEWS: { id: View; label: string }[] = [
-  { id: "overview", label: "Overview" },
-  // The Decision Inbox: the one place Lair asks you; its badge counts open decisions
-  { id: "decisions", label: "Decisions" },
-  { id: "dragons", label: "Dragons" },
-  { id: "nodes", label: "Nodes" },
-  { id: "gates", label: "Gates" },
-  { id: "prs", label: "PRs" },
-  { id: "reviews", label: "Reviews" },
-  { id: "orchestrator", label: "Orchestrator" },
-  { id: "machines", label: "Machines" },
-  { id: "processes", label: "Processes" },
-  { id: "activity", label: "Activity" },
-  { id: "health", label: "Health" },
-  { id: "delivery", label: "Delivery" },
-  { id: "agents", label: "Agents" },
-  { id: "triage", label: "Triage" },
-  { id: "inbox", label: "Inbox" },
-];
 
 export function App() {
   const [currentView, setCurrentView] = useState<View>("overview");

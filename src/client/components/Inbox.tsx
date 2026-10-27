@@ -1,7 +1,10 @@
 /**
- * Inbox view - Owner instructions and replies
+ * Owner messages view (view id "inbox") - the owner's message file
+ * (inbox_file): instructions to the orchestrator and its replies. Not the
+ * decisions Lair asks the owner for: those are in Decisions.
  */
 import { useApi } from "../hooks/useApi";
+import { OWNER_MESSAGES_LABEL, OWNER_MESSAGES_SUBTITLE } from "../nav";
 import type { InboxItem } from "../../shared/types";
 
 interface Props {
@@ -16,7 +19,7 @@ export function Inbox({ project, refreshKey }: Props) {
     error,
   } = useApi<InboxItem[]>("/controls/inbox", project, refreshKey);
 
-  if (loading) return <div className="loading">Loading inbox...</div>;
+  if (loading) return <div className="loading">Loading owner messages...</div>;
   if (error) return <div className="error">Error: {error}</div>;
   if (!items) return null;
 
@@ -30,10 +33,12 @@ export function Inbox({ project, refreshKey }: Props) {
           display: "flex",
           alignItems: "center",
           gap: "1rem",
-          marginBottom: "1.5rem",
+          marginBottom: "0.5rem",
         }}
       >
-        <h2>Inbox ({pending.length} pending)</h2>
+        <h2>
+          {OWNER_MESSAGES_LABEL} ({pending.length} pending)
+        </h2>
         <span
           className="badge badge-neutral"
           style={{ fontSize: "0.7rem" }}
@@ -42,6 +47,9 @@ export function Inbox({ project, refreshKey }: Props) {
           📡 Polling
         </span>
       </div>
+      <p style={{ color: "var(--text-secondary)", fontSize: "0.85rem", marginBottom: "1.5rem" }}>
+        {OWNER_MESSAGES_SUBTITLE}
+      </p>
 
       {/* Pending items */}
       <div className="card">
