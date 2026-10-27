@@ -50,6 +50,7 @@ import {
   startRunAction,
 } from "../../client/agents-actions";
 import { readLock } from "./locks.js";
+import { DataService } from "../services/data.js";
 import { listPromptFiles, MAX_PROMPT_FILE_BYTES, PromptFileError, readPromptFile } from "./prompts.js";
 import type { AgentProbes, ProcessOwner, ProcessSpawner, SpawnOptions } from "./probes.js";
 import type { DecisionInbox, DecisionRequest } from "./decisions.js";
@@ -1823,5 +1824,39 @@ describe("9. prompt files and the start-run form", () => {
     expect(spawnOf("worker-a").argv).toEqual(expect.arrayContaining(["--agent", "worker-a", "--model", "model-b"]));
     expect(promptOf(spawnOf("worker-a"))).toContain("Build the login form");
     expect(spawnOf("worker-b").argv).toEqual(expect.arrayContaining(["--agent", "worker-b", "--model", "model-a"]));
+  });
+});
+
+// ============ 10. THE DRAGONS VIEW ============
+
+describe("10. the Dragons view: a dragon this module runs is running, managed by Lair", () => {
+  it("shows the run and the agent's state from the request to the end of the run", async () => {
+    const h = setup();
+    // As src/server/index.ts gives the data service the agents module's runs
+    const data = new DataService(h.config, { managedRuns: () => h.manager.managedRuns("demo") });
+    writeFileSync(join(h.agentsDir, "dragons.txt"), "worker-b\tB\tunassigned\n");
+    const dragon = (id: string) => data.getDragons().find((d) => d.id === id);
+
+    expect(dragon("worker-a")).toBeUndefined(); // in dragons: only, and not running: not listed
+    const run = await request(h);
+    // Requested: shown (though dragons.txt doesn't list it), running, starting
+    expect(dragon("worker-a")).toMatchObject({
+      running: true,
+      managedRun: { runId: run.id, task: "feat-login", state: "starting" },
+    });
+
+    await h.service.tick();
+    expect(h.store.getRun(run.id)).toMatchObject({ state: "running", pid: 5001 });
+    expect(dragon("worker-a")).toMatchObject({ running: true, managedRun: { runId: run.id, state: "working" } });
+    expect(dragon("worker-b")).toMatchObject({ running: false });
+    expect(dragon("worker-b")?.managedRun).toBeUndefined();
+
+    h.spawner.exit(5001, 0);
+    await h.service.tick();
+    expect(h.store.getRun(run.id)?.state).toBe("completed");
+    expect(h.manager.managedRuns("demo").size).toBe(0);
+    expect(dragon("worker-a")).toBeUndefined();
+    // A project without the module has no managed runs
+    expect(h.manager.managedRuns("off").size).toBe(0);
   });
 });
