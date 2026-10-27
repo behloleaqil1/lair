@@ -48,6 +48,7 @@ import type {
   RunOrigin,
   StopReason,
 } from "../../shared/agents-types.js";
+import type { Decision } from "../../shared/decision-types.js";
 import type { DecisionProducer, DecisionResolution } from "../decisions/types.js";
 import { buildStartCommand, getAdapter } from "../services/adapters.js";
 import { knownDragonIds, loadKnownDragons } from "../services/dragon-registry.js";
@@ -71,12 +72,14 @@ import {
   DECISION_MODULE,
   InboxFileDecisions,
   ProducerDecisions,
+  escalationDecisionKey,
   type DecisionInbox,
   type DecisionRequest,
 } from "./decisions.js";
 import { chooseProfile, matchFailover, profileLabel, profilesFor } from "./failover.js";
 import {
   AgentsFill,
+  DECISION_FILL_KEEP,
   DECISION_FILL_START,
   OWNER_HOLDS,
   QueueLines,
@@ -382,7 +385,13 @@ export class AgentsService {
         // The in-process path every module uses: claims, locks, retries and budgets apply
         requestRun: (input) => this.requestRun(input, { origin: "fill" }),
         record: (kind, input, at) => this.record(kind, input, at),
-        raise: (request, run) => this.raiseAt(request, this.probes.clock.now(), run),
+        raise: (request, run) => this.raiseAt(request, this.probes.clock.now(), run ?? undefined),
+        openDecisions: () => this.decisions().open?.(this.project) ?? [],
+        findDecision: (key) => {
+          const inbox = this.decisions();
+          return inbox.find ? inbox.find(this.project, key) : undefined;
+        },
+        withdraw: (decision, reason) => this.withdrawDecision(decision, reason, this.probes.clock.now()),
       });
     }
   }
@@ -515,13 +524,21 @@ export class AgentsService {
     return raised;
   }
 
-  /** Raise a decision once per key (fill raises outside a tick). True when this call raised it. */
+  /**
+   * Raise a decision once per key (fill raises outside a tick): not again
+   * while it is open or once it was answered. One the module withdrew (its
+   * condition lifted) is raised again if the condition comes back, once per
+   * withdrawn decision, so a refused inbox can't make it write the inbox
+   * file on every check. True when this call raised it.
+   */
   private async raiseAt(
     request: Omit<DecisionRequest, "project" | "requestedBy">,
     now: number,
     run?: AgentRun,
   ): Promise<boolean> {
-    const dedupeKey = `decision:${request.key}`;
+    const known = this.decisions().find?.(this.project, request.key) ?? null;
+    if (known && known.status !== "withdrawn") return false;
+    const dedupeKey = known ? `decision:${request.key}:after:${known.id}` : `decision:${request.key}`;
     if (this.store.hasEvent(this.project, dedupeKey)) return false;
     const full: DecisionRequest = { ...request, project: this.project, requestedBy: "agents" };
     let outcome: { id: string; via: string };
@@ -555,16 +572,90 @@ export class AgentsService {
   }
 
   /**
+   * Withdraw one of this module's open decisions whose condition is gone (a
+   * hold that lifted another way, a chain that moved on), and record it.
+   * Never throws: an answer that won the race, or a missing inbox, makes it
+   * moot either way.
+   */
+  private async withdrawDecision(decision: Decision, reason: string, now: number): Promise<void> {
+    const inbox = this.decisions();
+    if (!inbox.withdraw) return;
+    try {
+      await inbox.withdraw(decision.id, reason);
+    } catch (e) {
+      console.warn(`[agents] ${this.project}: could not withdraw decision ${decision.id}: ${message(e)}`);
+      return;
+    }
+    await this.record(
+      "decision",
+      {
+        subject: decision.kind,
+        summary: `withdrawn: ${decision.title}; ${reason}`,
+        data: { decisionId: decision.id, key: decision.key, withdrawn: true, reason },
+        dedupeKey: `decision_withdrawn:${decision.id}`,
+      },
+      now,
+    );
+  }
+
+  /**
+   * Withdraw the escalations and "every profile is failing" decisions whose
+   * run chain moved on: started again some other way (the owner's run or a
+   * fresh session from Work, fill after the owner released its hold), or no
+   * longer waiting for a provider.
+   */
+  private async withdrawMoot(t: Tick): Promise<void> {
+    for (const decision of this.decisions().open?.(this.project) ?? []) {
+      if (!decision.source.ref.startsWith("chain:")) continue;
+      const chainId = decision.source.ref.slice("chain:".length);
+      const chain = this.store.chainRuns(chainId);
+      const last = chain[chain.length - 1];
+      let why: string | null = null;
+      if (!last) {
+        why = "its runs are gone";
+      } else if (decision.key.startsWith("escalation:")) {
+        const attempts = Number(decision.key.slice(decision.key.lastIndexOf(":") + 1));
+        const latest = this.store.latestRunForTask(this.project, last.task);
+        if (chain.length > attempts || isActive(last.state)) why = `${last.task} started again (run ${short(last.id)})`;
+        else if (latest && latest.chainId !== chainId) why = `${last.task} started again as run ${short(latest.id)}`;
+      } else if (decision.key.startsWith("exhausted:")) {
+        if (!chain.some((r) => r.state === "queued" || r.state === "waiting_lock")) {
+          why = `nothing of ${last.task} waits for a provider any more (run ${short(last.id)} is ${last.state})`;
+        }
+      }
+      if (why) await this.withdrawDecision(decision, `It moved on: ${why}.`, t.now);
+    }
+  }
+
+  /** The owner's pause of `task` (fill's `paused` hold): fill starts it again once they release it. */
+  private async recordFillPause(task: string, latest: AgentRun | null, why: string, now: number): Promise<void> {
+    await this.record(
+      "fill_paused",
+      {
+        agent: latest?.agent,
+        task,
+        runId: latest?.id,
+        summary: `the owner paused ${task} (${why}): fill starts it again once it is released`,
+        data: { runId: latest?.id ?? null, why },
+      },
+      now,
+    );
+  }
+
+  /**
    * An answer from the Decision Inbox to one of this module's decisions
    * (AgentsManager.useDecisions delivers them):
    * - an escalated task: "fresh_session" starts it again in a fresh session
-   *   (if that fails too, Lair asks again), "release" leaves it unclaimed;
+   *   (if that fails too, Lair asks again), "release" leaves it unclaimed (a
+   *   task fill runs is then the owner's pause, so its hold no longer waits
+   *   for them);
    * - every profile failing: "wait" keeps the run waiting for the cooldown,
    *   "stop" ends it and frees the task;
    * - a hard budget limit: "allow" lets runs start past it until the period
    *   ends, "wait" keeps them waiting;
    * - a task fill holds for the owner: "start_again" releases the hold (if
-   *   the run it was about is still the task's latest), "keep_held" keeps it.
+   *   the run it was about is still the task's latest), "keep_held" makes it
+   *   the owner's pause (`paused`).
    * A resume that can't happen (the task was claimed meanwhile, say) is
    * recorded, not retried, so the answer still counts as delivered.
    */
@@ -608,11 +699,18 @@ export class AgentsService {
       return `runs may start past ${budgetKey} until the period ends`;
     }
     if (key.startsWith("fill:") && ref.startsWith("fill:")) {
-      if (optionId !== DECISION_FILL_START) return "fill keeps the task held";
+      // The hold's run is the key's last part ("none": a task with no run yet)
       const task = ref.slice("fill:".length);
-      const runId = key.slice(key.lastIndexOf(":") + 1);
+      const runPart = key.slice(key.lastIndexOf(":") + 1);
+      const runId = runPart === "none" ? null : runPart;
       const latest = this.store.latestRunForTask(this.project, task);
-      if (!latest || latest.id !== runId) return "the task has moved on since: nothing to release";
+      if ((latest?.id ?? null) !== runId) return "the task has moved on since: nothing to change";
+      if (optionId === DECISION_FILL_KEEP) {
+        await this.recordFillPause(task, latest, 'you chose "Keep it paused"', t.now);
+        return "fill keeps the task paused until you release it";
+      }
+      if (optionId !== DECISION_FILL_START) return "nothing to do";
+      if (this.readOnly) return "the project is read_only: Lair starts no agents";
       await this.recordFillRelease(task, latest, "decision", t.now);
       return "fill starts the task again on its next check";
     }
@@ -620,7 +718,14 @@ export class AgentsService {
     const latest = chain[chain.length - 1];
     if (!latest) return "its task is gone";
     if (key.startsWith("escalation:")) {
-      if (optionId !== DECISION_FRESH) return "the task stays unclaimed";
+      if (optionId !== DECISION_FRESH) {
+        // Fill leaves the task too: the owner's pause, not a hold that still waits for them
+        if (this.fill?.lineFor(latest.task) && this.store.latestRunForTask(this.project, latest.task)?.id === latest.id) {
+          await this.recordFillPause(latest.task, latest, 'you chose "Leave the task unclaimed"', t.now);
+          return "the task stays unclaimed, and fill leaves it paused until you release it";
+        }
+        return "the task stays unclaimed";
+      }
       const next = await this.restartFresh(latest, t, "the owner chose a fresh session");
       return `started again as run ${short(next.id)} in a fresh session`;
     }
@@ -676,6 +781,8 @@ export class AgentsService {
       const activeChains = new Set(this.store.activeRuns(this.project).map((run) => run.chainId));
       for (const chain of this.moduleVars.keys()) if (!activeChains.has(chain)) this.moduleVars.delete(chain);
     }
+    // A question whose chain moved on is moot: withdrawn, so nothing is left waiting for the owner by mistake
+    await this.withdrawMoot(t);
     this.lastTick = t.summary;
     this.lastError = undefined;
     return t.summary;
@@ -1561,11 +1668,14 @@ export class AgentsService {
       {
         kind: "escalation",
         // Per chain and escalation: a chain the owner resumed can ask again when it fails again
-        key: `escalation:${run.chainId}:${chain.length}`,
+        key: escalationDecisionKey(run.chainId, chain.length),
         ref: `chain:${run.chainId}`,
         blocks: [`agents:${this.project}:task:${run.task}`],
-        question: `Agent ${run.agent} could not finish task ${run.task} after ${chain.length} attempt(s): ${oneLine(why, 200)}`,
+        // A plain sentence; what failed (it can quote the agent's output) stays in the context
+        question: `${run.agent} is paused on ${run.task}: it failed ${chain.length} time(s), and Lair's automatic restarts are used up`,
         context: [
+          `Why it stopped: ${oneLine(why, 300)}`,
+          "",
           "Attempts:",
           ...attempts.map((a) => `- ${a}`),
           ...(output.length > 0 ? ["", "Last output:", ...output.map((line) => `- ${oneLine(line)}`)] : []),
@@ -1573,13 +1683,13 @@ export class AgentsService {
         options: [
           {
             id: DECISION_FRESH,
-            label: "Start it again in a fresh session",
+            label: "Start it again",
             consequences: `Lair starts ${run.task} again for ${run.agent} in a fresh session (the old one moved aside), with a resume summary. If that fails too, Lair asks again.`,
           },
           {
             id: DECISION_RELEASE,
             label: "Leave the task unclaimed",
-            consequences: `Lair starts nothing more for ${run.task}; the task is free for another run.`,
+            consequences: `Lair starts nothing more for ${run.task}; the task is free for another run. A task fill runs stays paused until you release it in Work.`,
           },
         ],
         recommended: DECISION_RELEASE,

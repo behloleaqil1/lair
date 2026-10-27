@@ -380,6 +380,15 @@ function inboxEntries(h: Paths): string[] {
     .filter((line) => line.startsWith("- OWNER? "));
 }
 
+/** The inbox file's whole text: the entries with their detail lines. */
+function inboxText(h: Paths): string {
+  return existsSync(h.inboxFile) ? readFileSync(h.inboxFile, "utf-8") : "";
+}
+
+/** The escalation's plain title for worker-a on feat-login after `n` attempts. */
+const escalated = (n: number) =>
+  `worker-a is paused on feat-login: it failed ${n} time(s), and Lair's automatic restarts are used up`;
+
 function agentView(status: AgentsStatusView, id: string): AgentView {
   const agent = status.agents.find((a) => a.id === id);
   if (!agent) throw new Error(`no agent ${id}`);
@@ -757,7 +766,8 @@ describe("3. a requested run with no live agent process within N minutes is neve
     expect(eventsOf(h, "escalated")).toHaveLength(1);
     const entries = inboxEntries(h);
     expect(entries).toHaveLength(1);
-    expect(entries[0]).toContain("Agent worker-a could not finish task feat-login after 3 attempt(s): never started");
+    expect(entries[0]).toContain(escalated(3));
+    expect(inboxText(h)).toContain("Why it stopped: never started");
     expect(entries[0]).toContain("(escalation)");
     expect(h.store.getClaim("demo", "feat-login")).toBeNull();
   });
@@ -827,7 +837,8 @@ describe("4. hung and dead-on-start: same session K times, then a fresh one, the
     expect(h.spawner.kills.map((k) => k.signal)).toEqual(["SIGTERM", "SIGTERM", "SIGTERM", "SIGTERM"]);
     const entries = inboxEntries(h);
     expect(entries).toHaveLength(1);
-    expect(entries[0]).toContain("Agent worker-a could not finish task feat-login after 4 attempt(s): hung");
+    expect(entries[0]).toContain(escalated(4));
+    expect(inboxText(h)).toContain("Why it stopped: hung");
     expect(h.store.getClaim("demo", "feat-login")).toBeNull();
     expect(agentView(h.service.status(), "worker-a").state).toBe("failed");
   });
@@ -1093,7 +1104,10 @@ describe("5. provider errors and rate limits fail over to the next configured pr
     expect(h.spawner.calls).toHaveLength(4);
     const after = inboxEntries(h);
     expect(after).toHaveLength(2);
-    expect(after[1]).toContain("Agent worker-a could not finish task feat-login after 4 attempt(s): 4 provider errors or rate limits in a row");
+    expect(after[1]).toContain(escalated(4));
+    // What the agent printed stays in the context, never in the title (which notifications show)
+    expect(after[1]).not.toContain("rate limit");
+    expect(inboxText(h)).toContain("Why it stopped: 4 provider errors or rate limits in a row");
     expect(eventsOf(h, "failover").at(-1)?.data).toMatchObject({ capped: true, failovers: 4 });
     expect(h.store.getClaim("demo", "feat-login")).toBeNull();
   });
@@ -1558,7 +1572,7 @@ describe("8. wiring: the router and the service's own tick", () => {
 // ============ 9. THE DECISION INBOX ============
 
 /** The agents routes and the real Decision Inbox, mounted as src/server/index.ts does. */
-async function withInbox(h: Harness, options: { maxOpenPerSource?: number } = {}) {
+async function withInbox(h: Harness, options: { maxOpenPerSource?: number; dbPath?: string } = {}) {
   const app = Fastify();
   const tokenPath = join(h.dir, "data", "owner.token");
   const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
@@ -1606,8 +1620,13 @@ describe("9. the Decision Inbox: decisions are raised there, and the owner's ans
       blocks: ["agents:demo:task:feat-login"],
       recommended: { optionId: "release" },
     });
-    expect(asked.options.map((o) => o.id)).toEqual(["fresh_session", "release"]);
-    expect(asked.title).toContain("Agent worker-a could not finish task feat-login after 4 attempt(s)");
+    expect(asked.options.map((o) => [o.id, o.label])).toEqual([
+      ["fresh_session", "Start it again"],
+      ["release", "Leave the task unclaimed"],
+    ]);
+    expect(asked.title).toBe(escalated(4));
+    expect(asked.attention).toBe("action");
+    expect(asked.context).toContain("Why it stopped: dead on start");
     expect(inboxEntries(h)).toEqual([]); // the inbox file is only the fallback
     expect(h.spawner.calls).toHaveLength(4);
 
@@ -2299,7 +2318,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     // The chain's own escalation is the owner's decision: fill doesn't raise a second one for it
     const entries = inboxEntries(h);
     expect(entries).toHaveLength(1);
-    expect(entries[0]).toContain("Agent worker-a could not finish task feat-login");
+    expect(entries[0]).toContain("worker-a is paused on feat-login: it failed");
   });
 
   it("the fill loop runs on its own and stops with the module, killing a capacity_cmd in progress", async () => {
@@ -2381,9 +2400,13 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
       source: { module: "agents", ref: "fill:feat-login" },
       recommended: { optionId: "keep_held" },
     });
-    expect(asked.options.map((o) => o.id)).toEqual(["start_again", "keep_held"]);
-    expect(asked.title).toBe("Fill holds task feat-login: worker-a's last 3 run(s) exited 0 without reporting it done");
+    expect(asked.options.map((o) => [o.id, o.label])).toEqual([
+      ["start_again", "Start it again"],
+      ["keep_held", "Keep it paused"],
+    ]);
+    expect(asked.title).toBe("worker-a is paused on feat-login: its last 3 run(s) ended without reporting it done");
     expect(asked.context).toContain("usage limit reached for today");
+    expect(line.decisionId).toBe(asked.id);
     // Held: no more runs and no second decision, however long it waits
     for (const minute of [10, 60, 600]) {
       h.clock.t = NOW + minute * MIN;
@@ -2447,7 +2470,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(lineOf(status, "feat-b")).toMatchObject({ state: "started" });
   });
 
-  it("an owner hold is shown and is the owner's to lift: a claim lost to another holder asks once; the owner releases it over HTTP", async () => {
+  it("an owner hold is shown and is the owner's to lift: each asks once; released over HTTP, its decision is withdrawn", async () => {
     const h = setup(fill());
     const { inbox, app, owner } = await withInbox(h);
     prompts(h);
@@ -2469,11 +2492,15 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(lineOf(status, "feat-login")).toMatchObject({ state: "held", hold: "owner", releasable: true, runId: login.id });
     expect(lineOf(status, "feat-search")).toMatchObject({ state: "held", hold: "owner", releasable: true, runId: search.id });
     expect(lineOf(status, "feat-search").detail).toContain("lost its claim");
-    // Only the claim the owner didn't release asks: once
+    // Each owner hold asks once (the claim the owner released too: only they lift the hold)
     await check(h);
     const open = inbox.list({ project: "demo", status: "open" });
-    expect(open.map((d) => d.key)).toEqual([`fill:feat-search:${search.id}`]);
-    expect(open[0].title).toBe(`Fill holds task feat-search: run ${search.id.slice(0, 8)} of worker-b lost its claim, and you did not release it`);
+    expect(open.map((d) => d.key).sort()).toEqual([`fill:feat-login:${login.id}`, `fill:feat-search:${search.id}`].sort());
+    const loginAsked = open.find((d) => d.key === `fill:feat-login:${login.id}`)!;
+    const searchAsked = open.find((d) => d.key === `fill:feat-search:${search.id}`)!;
+    expect(searchAsked.title).toBe("worker-b is paused on feat-search: its run lost its claim to the task, and you did not release it");
+    expect(loginAsked.title).toBe("worker-a is paused on feat-login: you released its claim on the task");
+    expect(lineOf(h.service.status().fill, "feat-login").decisionId).toBe(loginAsked.id);
 
     // Releasing a hold is the owner's, and confirmed
     const release = releaseFillHoldAction("demo", "feat-login", "worker-a");
@@ -2485,8 +2512,11 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(released.json().data).toEqual({ task: "feat-login", runId: login.id });
 
     const after = await check(h);
-    expect(lineOf(after, "feat-login")).toMatchObject({ state: "started" });
-    expect(lineOf(after, "feat-search")).toMatchObject({ state: "held", hold: "owner" });
+    expect(lineOf(after, "feat-login")).toMatchObject({ state: "started", decisionId: null });
+    expect(lineOf(after, "feat-search")).toMatchObject({ state: "held", hold: "owner", decisionId: searchAsked.id });
+    // Released in Work, the hold's decision is withdrawn; the other stays
+    expect(inbox.get(loginAsked.id)).toMatchObject({ status: "withdrawn", withdrawnReason: "The hold lifted: feat-login started again." });
+    expect(inbox.list({ project: "demo", status: "open" }).map((d) => d.id)).toEqual([searchAsked.id]);
     // A task that isn't held for the owner has nothing to release
     const again = await app.inject({ url: release.url, ...sent, headers: { ...DASHBOARD, ...sent.headers } });
     expect(again.statusCode).toBe(409);
@@ -2700,7 +2730,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(runs(h)).toHaveLength(3);
     const entries = inboxEntries(h);
     expect(entries).toHaveLength(1);
-    expect(entries[0]).toContain("Fill holds task feat-login: worker-a's last 3 run(s) exited 0 without reporting it done");
+    expect(entries[0]).toContain("worker-a is paused on feat-login: its last 3 run(s) ended without reporting it done");
   });
 
   it("a stale wake (its result is older than the run) is counted and backed off, then held; rewriting the result later doesn't lift the hold", async () => {
@@ -2833,8 +2863,8 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     const [asked, ...more] = inbox.list({ project: "demo", status: "open" });
     expect(more).toEqual([]);
     expect(asked).toMatchObject({ key: `fill:feat-login:waiting:${runs(h)[1].id}`, source: { ref: "fill:feat-login" } });
-    expect(asked.title).toBe(`Fill: worker-a is waiting too long on ${gate2} (task feat-login, since 2026-03-02T12:01:00.000Z)`);
-    expect(asked.options.map((o) => o.label)).toEqual(["Start it again now", "Keep it held"]);
+    expect(asked.title).toBe(`worker-a is paused on feat-login: it has waited on ${gate2} since 2026-03-02T12:01:00.000Z`);
+    expect(asked.options.map((o) => o.label)).toEqual(["Start it again now", "Keep it paused"]);
     expect(asked.context).toContain(`- WAITING feat-login ${gate2} by worker-a: gate queued`);
 
     expect((await answer(asked.id, { optionId: "start_again" })).statusCode).toBe(200);
@@ -2852,7 +2882,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     h.clock.t = NOW + 11 * MIN;
     expect(lineOf(await check(h), "feat-login").hold).toBe("waited_too_long");
     const [asked] = inbox.list({ project: "demo", status: "open" });
-    expect(asked.title).toBe("Fill: worker-a is waiting too long on its WAITING line (task feat-login, since 2026-03-02T12:01:00.000Z)");
+    expect(asked.title).toBe("worker-a is paused on feat-login: it has waited on its WAITING line since 2026-03-02T12:01:00.000Z");
     expect(asked.title).not.toContain("owner.token");
   });
 
@@ -2944,7 +2974,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     const [asked, ...more] = inbox.list({ project: "demo", status: "open" });
     expect(more).toEqual([]);
     expect(asked).toMatchObject({ key: `fill:feat-login:blocked:${run.id}`, recommended: { optionId: "keep_held" } });
-    expect(asked.title).toBe("Fill holds task feat-login: worker-a reported it blocked");
+    expect(asked.title).toBe("worker-a is paused on feat-login: it reported the task blocked");
     // In a code block, its backticks neutralised: shown as data
     expect(asked.context).toContain("```text\n- BLOCKED feat-login by worker-a: needs the payment API key 'rm -rf /' from the owner\n```");
     expect(eventsOf(h, "fill_held").map((e) => e.data.hold)).toEqual(["blocked"]);
@@ -3358,7 +3388,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(eventsOf(h, "decision").map((e) => e.data.key)).toEqual([`fill:feat-login:blocked:${run.id}`]);
     const entries = inboxEntries(h);
     expect(entries).toHaveLength(1);
-    expect(entries[0]).toContain("Fill holds task feat-login: worker-a reported it blocked");
+    expect(entries[0]).toContain("worker-a is paused on feat-login: it reported the task blocked");
     expect(eventsOf(h, "fill_held").map((e) => e.data.hold)).toEqual(["blocked"]);
   });
 
@@ -3421,7 +3451,8 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(eventsOf(h, "escalated")).toHaveLength(1);
     const entries = inboxEntries(h);
     expect(entries).toHaveLength(1);
-    expect(entries[0]).toContain(`Agent worker-a could not finish task feat-login after 2 attempt(s): ${NO_LINE}`);
+    expect(entries[0]).toContain(escalated(2));
+    expect(inboxText(h)).toContain(`Why it stopped: ${NO_LINE}`);
     expect(h.store.getClaim("demo", "feat-login")).toBeNull();
     // Fill leaves the escalated task to the owner, with no decision of its own
     expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "held", hold: "owner" });
@@ -3458,5 +3489,208 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     } finally {
       reopened.close();
     }
+  });
+
+  // ============ ONE DECISION PER OWNER HOLD ============
+
+  /** Every attempt dies on start until recovery escalates the chain; then the owner hold stands on its escalation. */
+  async function escalatedFillTask(h: Harness) {
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    h.spawner.behaviour = (pid) => h.spawner.exit(pid, 1);
+    await check(h);
+    for (const ms of [0, 0, 10 * SEC, 10 * SEC, 30 * SEC, 30 * SEC, 70 * SEC, 70 * SEC]) await at(h, ms);
+    expect(eventsOf(h, "escalated")).toHaveLength(1);
+    return lineOf(await check(h), "feat-login");
+  }
+
+  it("a hold's decision is raised once: no second one across checks, a restart of Lair, or the inbox opened again", async () => {
+    const paths = makePaths();
+    const decisionsDb = join(paths.dir, "data", "decisions.db");
+    const h = setup(fill({ agents: ["worker-a"] }), { paths });
+    const first = await withInbox(h, { dbPath: decisionsDb });
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    const run = await runEndingWith(h, "- BLOCKED feat-login by worker-a: needs the API key");
+    for (let i = 0; i < 3; i++) await check(h);
+    const [asked, ...more] = first.inbox.list({ project: "demo", status: "open" });
+    expect(more).toEqual([]);
+    expect(asked).toMatchObject({ key: `fill:feat-login:blocked:${run.id}`, attention: "action" });
+
+    // Lair restarts: a new agents module on the same store, the inbox on the same file
+    await h.manager.stop();
+    await first.app.close();
+    apps.splice(apps.indexOf(first.app), 1);
+    const again = setup(fill({ agents: ["worker-a"] }), { paths });
+    const second = await withInbox(again, { dbPath: decisionsDb });
+    for (let i = 0; i < 3; i++) await check(again);
+    expect(second.inbox.list({ project: "demo", status: "open" }).map((d) => d.id)).toEqual([asked.id]);
+    expect(lineOf(again.service.status().fill, "feat-login")).toMatchObject({ hold: "blocked", decisionId: asked.id });
+  });
+
+  it("a refused run asks once per refusal: 'Start it again' refused again asks again; once fixed, it is withdrawn", async () => {
+    const h = setup(fill({ agents: ["worker-a"] }));
+    const { inbox, answer } = await withInbox(h);
+    // Prompt files with nothing in them: the run request is refused (an empty prompt)
+    mkdirSync(h.promptsDir, { recursive: true });
+    writeFileSync(join(h.promptsDir, "restart-addendum.txt"), "");
+    writeFileSync(join(h.promptsDir, "worker-a.txt"), "");
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "held", hold: "refused", releasable: false });
+    await check(h);
+    const [asked, ...more] = inbox.list({ project: "demo", status: "open" });
+    expect(more).toEqual([]);
+    expect(asked).toMatchObject({ key: "fill:feat-login:refused:0:none", source: { ref: "fill:feat-login" } });
+    expect(asked.title).toContain("worker-a can't start feat-login: Invalid prompt");
+    expect(lineOf(h.service.status().fill, "feat-login").decisionId).toBe(asked.id);
+
+    // "Start it again", and it is refused the same way: asked again (the first one was answered)
+    expect((await answer(asked.id, { optionId: "start_again" })).statusCode).toBe(200);
+    await check(h);
+    await check(h);
+    const again = inbox.list({ project: "demo", status: "open" });
+    expect(again).toHaveLength(1);
+    expect(again[0].id).not.toBe(asked.id);
+    expect(again[0].key).toMatch(/^fill:feat-login:refused:[0-9a-f-]{36}:none$/);
+
+    // Fixed: fill starts it, and the refusal's decision is withdrawn
+    writeFileSync(join(h.promptsDir, "worker-a.txt"), "Build what the task says.\n");
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "started", decisionId: null });
+    expect(inbox.get(again[0].id)).toMatchObject({ status: "withdrawn", withdrawnReason: "The hold lifted: feat-login started again." });
+    expect(inbox.list({ project: "demo", status: "open" })).toEqual([]);
+  });
+
+  it("'Keep it paused' makes the hold the owner's pause: nothing more is asked; only the owner's Release starts it again", async () => {
+    const h = setup(fill({ agents: ["worker-a"] }));
+    const { inbox, answer } = await withInbox(h);
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    await runEndingWith(h, "- BLOCKED feat-login by worker-a: needs the API key");
+    await check(h);
+    const [asked] = inbox.list({ project: "demo", status: "open" });
+
+    expect((await answer(asked.id, { optionId: "keep_held" })).statusCode).toBe(200);
+    const line = lineOf(await check(h), "feat-login");
+    expect(line).toMatchObject({ state: "held", hold: "paused", releasable: true, decisionId: null });
+    expect(line.detail).toContain('paused by you (you chose "Keep it paused"');
+    for (const minute of [10, 60, 600]) {
+      h.clock.t = NOW + minute * MIN;
+      await check(h);
+      await h.service.tick();
+    }
+    expect(inbox.list({ project: "demo", status: "open" })).toEqual([]);
+    expect(h.spawner.calls).toHaveLength(1);
+    // The planner may not lift the owner's own pause; the owner's Release does
+    await expect(h.service.releaseFillHold("feat-login", "planner")).rejects.toMatchObject({ statusCode: 409 });
+    await h.service.releaseFillHold("feat-login");
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "started" });
+  });
+
+  it("a hold that lifts another way withdraws its decision: the task reported done", async () => {
+    const h = setup(fill({ agents: ["worker-a"] }));
+    const { inbox } = await withInbox(h);
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    await runEndingWith(h, "- BLOCKED feat-login by worker-a: needs the API key");
+    await check(h);
+    const [blocked] = inbox.list({ project: "demo", status: "open" });
+
+    // Someone else unblocked and finished it: the agent's DONE line, later than its BLOCKED one
+    appendFileSync(h.queueFile, "- DONE feat-login by worker-a 12:30Z: merged\n");
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "done", decisionId: null });
+    expect(inbox.get(blocked.id)).toMatchObject({ status: "withdrawn", withdrawnReason: "The hold lifted: feat-login is done." });
+    expect(eventsOf(h, "decision").at(-1)).toMatchObject({ data: { decisionId: blocked.id, withdrawn: true } });
+  });
+
+  it("a hold that lifts another way withdraws its decision: its line taken out of the tasks file", async () => {
+    const h = setup(fill({ agents: ["worker-a"] }));
+    const { inbox } = await withInbox(h);
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    await runEndingWith(h, "- BLOCKED feat-login by worker-a: needs the API key");
+    await check(h);
+    const [blocked] = inbox.list({ project: "demo", status: "open" });
+
+    tasks(h, "# feat-login is no longer planned");
+    await check(h);
+    expect(inbox.get(blocked.id)).toMatchObject({
+      status: "withdrawn",
+      withdrawnReason: "The hold lifted: feat-login is no longer in the tasks file.",
+    });
+    // Put back as it was, the same hold asks again (its earlier decision was withdrawn, not answered)
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    await check(h);
+    await check(h);
+    const open = inbox.list({ project: "demo", status: "open" });
+    expect(open).toHaveLength(1);
+    expect(open[0]).toMatchObject({ key: blocked.key });
+    expect(open[0].id).not.toBe(blocked.id);
+  });
+
+  it("an escalation is the owner hold's one decision; 'Leave the task unclaimed' pauses the task, with no hold left waiting", async () => {
+    const h = setup(fill({ agents: ["worker-a"] }));
+    const { inbox, answer } = await withInbox(h);
+    const line = await escalatedFillTask(h);
+
+    const [asked, ...more] = inbox.list({ project: "demo", status: "open" });
+    expect(more).toEqual([]); // fill raises no second decision for the escalated run
+    expect(asked.key).toMatch(/^escalation:/);
+    expect(line).toMatchObject({ state: "held", hold: "owner", decisionId: asked.id });
+
+    expect((await answer(asked.id, { optionId: "release" })).statusCode).toBe(200);
+    const after = lineOf(await check(h), "feat-login");
+    expect(after).toMatchObject({ state: "held", hold: "paused", releasable: true, decisionId: null });
+    expect(after.detail).toContain('paused by you (you chose "Leave the task unclaimed"');
+    expect(eventsOf(h, "decision").at(-1)?.summary).toContain("fill leaves it paused until you release it");
+    for (const ms of [10 * MIN, 30 * MIN]) {
+      await at(h, ms);
+      await check(h);
+    }
+    expect(inbox.list({ project: "demo", status: "open" })).toEqual([]);
+    expect(h.spawner.calls).toHaveLength(4);
+
+    // Released in Work: fill starts it again
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
+    await h.service.releaseFillHold("feat-login");
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "started" });
+  });
+
+  it("an escalation answered without moving the task on leaves fill to ask: the hold gets its own decision", async () => {
+    const h = setup(fill({ agents: ["worker-a"] }));
+    const { inbox, answer } = await withInbox(h);
+    await escalatedFillTask(h);
+    const [escalation] = inbox.list({ project: "demo", status: "open" });
+    // "Start it again" can't happen while worker-a is busy on another task: the task stays where it was
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
+    await request(h, "worker-a", "feat-other", "Something else");
+    await at(h, 2 * MIN);
+    expect((await answer(escalation.id, { optionId: "fresh_session" })).statusCode).toBe(200);
+    expect(eventsOf(h, "decision").at(-1)?.summary).toContain("could not act on it");
+
+    const line = lineOf(await check(h), "feat-login");
+    const open = inbox.list({ project: "demo", status: "open" });
+    expect(open).toHaveLength(1);
+    expect(open[0]).toMatchObject({ key: `fill:feat-login:${line.runId}`, source: { ref: "fill:feat-login" } });
+    expect(open[0].title).toContain("worker-a is paused on feat-login: its last run");
+    expect(line).toMatchObject({ hold: "owner", decisionId: open[0].id });
+    await check(h);
+    expect(inbox.list({ project: "demo", status: "open" })).toHaveLength(1);
+  });
+
+  it("an escalation whose task started again another way is withdrawn: the owner released fill's hold in Work", async () => {
+    const h = setup(fill({ agents: ["worker-a"] }));
+    const { inbox } = await withInbox(h);
+    await escalatedFillTask(h);
+    const [escalation] = inbox.list({ project: "demo", status: "open" });
+
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
+    await h.service.releaseFillHold("feat-login");
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "started" });
+    await at(h, 2 * MIN);
+    const withdrawn = inbox.get(escalation.id);
+    expect(withdrawn?.status).toBe("withdrawn");
+    expect(withdrawn?.withdrawnReason).toContain("It moved on: feat-login started again as run");
+    expect(inbox.list({ project: "demo", status: "open" })).toEqual([]);
   });
 });

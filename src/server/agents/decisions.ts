@@ -7,12 +7,15 @@
  * file, the convention the Decision Inbox importers read.
  */
 import { randomUUID } from "crypto";
-import type { DecisionKind as InboxKind } from "../../shared/decision-types.js";
+import type { Decision, DecisionKind as InboxKind } from "../../shared/decision-types.js";
 import type { DecisionProducer, RaiseDecisionInput } from "../decisions/types.js";
 import type { Clock, FileSystem } from "../watchdog/probes.js";
 
 /** The module name the agents module raises decisions as. */
 export const DECISION_MODULE = "agents";
+
+/** The key of a run chain's escalation, per escalation (`attempts`: the chain's runs when it was escalated). */
+export const escalationDecisionKey = (chainId: string, attempts: number) => `escalation:${chainId}:${attempts}`;
 
 export type DecisionKind =
   | "product"
@@ -59,6 +62,15 @@ export interface DecisionRequest {
 export interface DecisionInbox {
   /** Raise a decision. Resolves with its id and where it went. */
   request(decision: DecisionRequest): Promise<{ id: string; via: string }>;
+  /**
+   * The Decision Inbox's latest decision of this module with this key (null
+   * when there is none). Absent: this inbox can't tell (the inbox file).
+   */
+  find?(project: string, key: string): Decision | null;
+  /** This module's open decisions in the project. Absent: this inbox can't tell. */
+  open?(project: string): Decision[];
+  /** Withdraw an open decision whose condition is gone. Absent: this inbox can't. */
+  withdraw?(id: string, reason: string): Promise<void>;
 }
 
 function oneLine(text: string, max = 500): string {
@@ -136,6 +148,18 @@ export class ProducerDecisions implements DecisionInbox {
     private producer: DecisionProducer,
     private fallback: DecisionInbox,
   ) {}
+
+  find(project: string, key: string): Decision | null {
+    return this.producer.find(project, DECISION_MODULE, key);
+  }
+
+  open(project: string): Decision[] {
+    return this.producer.openOf(project, DECISION_MODULE);
+  }
+
+  async withdraw(id: string, reason: string): Promise<void> {
+    await this.producer.withdraw(id, { module: DECISION_MODULE, reason: clip(printable(reason, false), 1000) });
+  }
 
   async request(decision: DecisionRequest): Promise<{ id: string; via: string }> {
     try {

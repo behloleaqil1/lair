@@ -58,6 +58,7 @@ import { createHash } from "crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync } from "fs";
 import { isAbsolute, relative, resolve, sep } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
+import type { Decision } from "../../shared/decision-types.js";
 import type {
   AgentEventKind,
   AgentRunView,
@@ -79,7 +80,7 @@ import {
   type FillPattern,
   type FillSettings,
 } from "./config.js";
-import type { DecisionRequest } from "./decisions.js";
+import { escalationDecisionKey, type DecisionRequest } from "./decisions.js";
 import type { AgentProbes } from "./probes.js";
 import { MAX_PROMPT_FILE_BYTES } from "./prompts.js";
 import { lastLines, readTail } from "./sessions.js";
@@ -93,11 +94,15 @@ const QUEUE_MAX_BYTES = 4 * 1024 * 1024;
 const QUEUE_LINE_CHARS = 1000;
 const MARK_TAIL_BYTES = 256;
 
-/** The decision options fill offers for a task it holds for the owner */
+/**
+ * The decision options fill offers for a task it holds for the owner:
+ * "Start it again" releases the hold, "Keep it paused" turns it into the
+ * owner's own pause (a `paused` hold, which waits for nobody).
+ */
 export const DECISION_FILL_START = "start_again";
 export const DECISION_FILL_KEEP = "keep_held";
 /** Holds the owner lifts (POST /api/agents/fill/release, or the decision); a waiting one also ends by itself */
-export const OWNER_HOLDS: readonly FillHold[] = ["owner", "no_done", "blocked", "waiting", "waited_too_long"];
+export const OWNER_HOLDS: readonly FillHold[] = ["owner", "no_done", "blocked", "waiting", "waited_too_long", "paused"];
 
 const short = (id: string) => id.slice(0, 8);
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -114,6 +119,28 @@ const iso = (ms: number) => new Date(ms).toISOString();
  */
 export const fillDecisionKey = (task: string, runId: string, kind?: "blocked" | "waiting") =>
   `fill:${task}:${kind ? `${kind}:` : ""}${runId}`;
+
+/**
+ * The key of the decision about a refused task: per release (`since`, the
+ * owner's last release of the task, or "0"), so a refusal that comes back
+ * after "Start it again" asks again; the latest run (or "none") is last.
+ */
+export const fillRefusedKey = (task: string, since: string, runId: string | null) =>
+  `fill:${task}:refused:${since}:${runId ?? "none"}`;
+
+/** How a run that ended other than completed ended, in plain words (never its log). */
+function howItEnded(run: AgentRun): string {
+  const detail = run.detail.toLowerCase();
+  if (detail.startsWith("exit unknown")) return "its last run failed while Lair was restarting";
+  if (detail.startsWith("stopped by the owner") || detail.includes("stopped by you")) return "you stopped its last run";
+  if (detail.startsWith("crashed")) return "its last run crashed";
+  if (detail.startsWith("dead on start")) return "its last run died as it started";
+  if (detail.startsWith("hung")) return "its last run hung and was stopped";
+  if (run.state === "never_started" || detail.startsWith("never started")) return "its last run never started";
+  if (run.failover) return "its last run hit provider errors or rate limits";
+  if (run.state === "lost_claim") return "you released its claim on the task";
+  return `its last run ended ${run.state.replace(/_/g, " ")}`;
+}
 
 /** Agent-written text for a decision's context: one line, bounded, in a code block (data, never markdown). */
 function asData(text: string, max = 300): string[] {
@@ -606,6 +633,17 @@ export interface FillEventInput {
 
 export type FillDecision = Omit<DecisionRequest, "project" | "requestedBy">;
 
+/** What a hold's decision says: a plain sentence, the evidence, and the options' wording when it differs. */
+interface HoldQuestion {
+  question: string;
+  context: string[];
+  startLabel?: string;
+  startConsequences?: string;
+  keepConsequences?: string;
+  why?: string;
+  withOutput?: boolean;
+}
+
 export interface AgentsFillOptions {
   project: string;
   config: ProjectConfig;
@@ -619,8 +657,14 @@ export interface AgentsFillOptions {
   requestRun: (input: { agent: string; task: string; prompt: string }) => Promise<AgentRunView>;
   /** Record an event in the store, and on the bus */
   record: (kind: AgentEventKind, input: FillEventInput, at: number) => Promise<boolean>;
-  /** Raise a decision in the Decision Inbox, once per key (AgentsService's) */
-  raise: (request: FillDecision, run: AgentRun) => Promise<boolean>;
+  /** Raise a decision in the Decision Inbox, once per key while it is open or answered (AgentsService's) */
+  raise: (request: FillDecision, run: AgentRun | null) => Promise<boolean>;
+  /** The agents module's open Decision Inbox items in the project ([] without the inbox) */
+  openDecisions: () => Decision[];
+  /** The latest decision raised with this key; null when there is none, undefined without a Decision Inbox to ask */
+  findDecision: (key: string) => Decision | null | undefined;
+  /** Withdraw a decision whose hold lifted (never throws) */
+  withdraw: (decision: Decision, reason: string) => Promise<void>;
 }
 
 function firstLine(text: string): string | null {
@@ -812,6 +856,8 @@ export class AgentsFill {
     this.waitingSeen.clear();
     const views: FillLineView[] = [];
     const seen = new Set<string>();
+    /** The keys of the decisions that the holds of this check stand on (fill's own, or a run's escalation) */
+    const wanted = new Set<string>();
 
     for (const entry of entries) {
       if (signal.aborted) break;
@@ -828,6 +874,7 @@ export class AgentsFill {
           releasable: false,
           waiting: null,
           runId: null,
+          decisionId: null,
         });
         continue;
       }
@@ -854,6 +901,7 @@ export class AgentsFill {
           releasable: hold !== null && OWNER_HOLDS.includes(hold),
           waiting,
           runId,
+          decisionId: null,
         });
       };
       const hold = async (kind: FillHold, reason: string, runId: string | null = null, waiting: FillWaitingView | null = null) => {
@@ -865,6 +913,18 @@ export class AgentsFill {
           { agent, task, summary: `fill holds ${agent} on ${task}: ${reason}`, evidence: [reason], data: { line, hold: kind, reason } },
           probes.clock.now(),
         );
+      };
+      // This line's hold stands on the decision with this key: keep it, and show it on the line
+      const standOn = (decisionKey: string) => {
+        wanted.add(decisionKey);
+        const decision = this.options.findDecision(decisionKey);
+        const view = views[views.length - 1];
+        if (view && view.task === task) view.decisionId = decision?.status === "open" ? decision.id : null;
+      };
+      // One decision per hold that needs the owner: raised once, kept while the hold lasts
+      const ask = async (run: AgentRun | null, decisionKey: string, question: HoldQuestion) => {
+        await this.raiseHold(run, agent, task, decisionKey, question);
+        standOn(decisionKey);
       };
 
       if (!allowed.has(agent)) {
@@ -889,12 +949,37 @@ export class AgentsFill {
       // Lines that name only the agent end where its next run on another task began (an owner's run, say)
       const until = queueWindowEnd(store, project, settings, entry, latest);
 
+      // The owner's last release of the task, and their pause (the owner's own hold) when it is newer
+      const release = store.listEvents(project, { kinds: ["fill_released"], task, limit: 1 })[0];
+      const paused = this.pausedBy(task, latest);
+      // A refusal needs the owner: one decision per refusal and release ("Start it again" that is refused again asks again)
+      const refused = async (reason: string, question: string, context: string[]) => {
+        if (paused) {
+          await hold("paused", paused, latest?.id ?? null);
+          return;
+        }
+        await hold("refused", reason);
+        await ask(latest, fillRefusedKey(task, release?.id ?? "0", latest?.id ?? null), {
+          question,
+          context,
+          startLabel: "Start it again",
+          startConsequences: `Fill tries to start ${task} for ${agent} again on its next check: choose this once you fixed what refused it.`,
+          keepConsequences: `Fill stops trying ${task} until you release it in Work.`,
+          why: "Fill tries again on every check, and it is refused the same way until the cause is fixed.",
+          withOutput: false,
+        });
+      };
+
       // Done: kept once seen (for this latest run and this line as written), else from the queue file
       let check: DoneCheck;
       try {
         check = checkDone(store, project, queue, settings, entry, latest, until);
       } catch (e) {
-        await hold("refused", `done_pattern: ${message(e)}`);
+        await refused(
+          `done_pattern: ${message(e)}`,
+          `${agent} can't start ${task}: fill can't tell whether the task is done`,
+          ["Fill checks agents.fill.done_pattern against the queue file before it starts a task, and that check failed:", "", ...asData(message(e))],
+        );
         continue;
       }
       if (check?.kind === "kept") {
@@ -920,27 +1005,52 @@ export class AgentsFill {
         continue;
       }
 
+      // The owner chose to leave it: nothing waits for them, and nothing starts until they release it
+      if (paused) {
+        await hold("paused", paused, latest?.id ?? null);
+        continue;
+      }
+
       // The owner's: a run that ended other than completed, or completions without done
-      const release = store.listEvents(project, { kinds: ["fill_released"], task, limit: 1 })[0];
       const releasedRun = typeof release?.data.runId === "string" ? release.data.runId : null;
       const releasedChain = typeof release?.data.chainId === "string" ? release.data.chainId : null;
       // A superseded run never ran (another live claim held the task when it tried to start): it starts with no
       // backoff once that claim is gone, as a first start does; the claimed check above holds it until then
       if (latest && latest.state !== "completed" && latest.state !== "superseded" && latest.id !== releasedRun) {
+        const runs = ["Runs:", `- Run ${short(latest.id)}: ${latest.state}: ${oneLine(latest.detail)}`];
         if (latest.state === "lost_claim" && !this.claimReleasedByOwner(latest)) {
           const reason = `its run ${short(latest.id)} lost its claim (${oneLine(latest.detail)}), not released by you: fill leaves the task to you`;
           await hold("owner", reason, latest.id);
-          await this.raiseHold(latest, agent, task, {
-            question: `Fill holds task ${task}: run ${short(latest.id)} of ${agent} lost its claim, and you did not release it`,
-            context: ["Runs:", `- Run ${short(latest.id)}: ${latest.state}: ${oneLine(latest.detail)}`],
+          await ask(latest, fillDecisionKey(task, latest.id), {
+            question: `${agent} is paused on ${task}: its run lost its claim to the task, and you did not release it`,
+            context: runs,
           });
-        } else {
-          await hold(
-            "owner",
-            `its last run ${short(latest.id)} ended ${latest.state} (${oneLine(latest.detail)}): fill leaves the task to you (answer its decision, start a run, or release the hold)`,
-            latest.id,
-          );
+          continue;
         }
+        await hold(
+          "owner",
+          `its last run ${short(latest.id)} ended ${latest.state} (${oneLine(latest.detail)}): fill leaves the task to you (answer its decision, start a run, or release the hold)`,
+          latest.id,
+        );
+        // An escalated run's own decision is this hold's while it is open; without it, fill asks
+        const escalated = store.listEvents(project, { kinds: ["escalated"], runId: latest.id, limit: 1 }).length > 0;
+        const escalationKey = escalationDecisionKey(latest.chainId, store.chainRuns(latest.chainId).length);
+        const escalation = escalated ? this.options.findDecision(escalationKey) : null;
+        if (escalated && escalation === undefined) continue; // no Decision Inbox: the escalation went to the inbox file
+        if (escalation?.status === "open") {
+          standOn(escalationKey);
+          continue;
+        }
+        await ask(latest, fillDecisionKey(task, latest.id), {
+          question: `${agent} is paused on ${task}: ${howItEnded(latest)}`,
+          context: [
+            ...runs,
+            "",
+            escalated
+              ? "Its escalation was answered, and the task is still held: start it again, or keep it paused."
+              : "Fill doesn't start a task again after a run that ended this way: that is your call.",
+          ],
+        });
         continue;
       }
       // A run that ended on a WAITING or BLOCKED line (the latest such line wins; a done line won above)
@@ -949,11 +1059,9 @@ export class AgentsFill {
       if (latest && status?.kind === "blocked") {
         const reason = `blocked: ${oneLine(status.line)}: fill leaves the task to you (release the hold once it is unblocked)`;
         await hold("blocked", reason, latest.id);
-        await this.raiseHold(latest, agent, task, {
-          kind: "blocked",
-          question: `Fill holds task ${task}: ${agent} reported it blocked`,
+        await ask(latest, fillDecisionKey(task, latest.id, "blocked"), {
+          question: `${agent} is paused on ${task}: it reported the task blocked`,
           context: [`Run ${short(latest.id)} ended ${iso(latest.endedAt ?? latest.requestedAt)} on this line:`, "", ...asData(status.line)],
-          startLabel: "Start it again",
           startConsequences: `Fill starts ${task} for ${agent} again on its next check: choose this once what blocked it is cleared.`,
           why: "A blocked task needs someone else first; starting it again before that only repeats the run.",
         });
@@ -967,8 +1075,8 @@ export class AgentsFill {
           `its last ${count} run(s) exited 0 without progress (no done line, or waiting on nothing that came; agents.fill.max_completions_without_done is ${settings.maxCompletionsWithoutDone}): fill leaves the task to you`,
           run.id,
         );
-        await this.raiseHold(run, agent, task, {
-          question: `Fill holds task ${task}: ${agent}'s last ${count} run(s) exited 0 without reporting it done`,
+        await ask(run, fillDecisionKey(task, run.id), {
+          question: `${agent} is paused on ${task}: its last ${count} run(s) ended without reporting it done`,
           context: [
             "Runs:",
             ...completions.map(
@@ -998,9 +1106,8 @@ export class AgentsFill {
             latest.id,
             view,
           );
-          await this.raiseHold(latest, agent, task, {
-            kind: "waiting",
-            question: `Fill: ${agent} is waiting too long on ${on} (task ${task}, since ${iso(streakStart)})`,
+          await ask(latest, fillDecisionKey(task, latest.id, "waiting"), {
+            question: `${agent} is paused on ${task}: it has waited on ${on} since ${iso(streakStart)}`,
             context: [
               `Run ${short(latest.id)} ended ${iso(since)} on this line:`,
               "",
@@ -1103,7 +1210,17 @@ export class AgentsFill {
       try {
         run = await this.options.requestRun({ agent, task, prompt: prompt.text });
       } catch (e) {
-        await hold("refused", `the run request was refused: ${message(e)}`);
+        const why = message(e);
+        if (why.startsWith("Over budget")) {
+          // The hard limit's own spend decision asks the owner, and the refusal ends with the budget period
+          await hold("refused", `the run request was refused: ${why}`);
+          continue;
+        }
+        await refused(`the run request was refused: ${why}`, `${agent} can't start ${task}: ${oneLine(why, 120)}`, [
+          "Fill asked Lair to start the run, and it was refused:",
+          "",
+          ...asData(why),
+        ]);
         continue;
       }
       active++;
@@ -1127,35 +1244,74 @@ export class AgentsFill {
     for (const key of [...this.polled.keys()]) {
       if (!this.waitingSeen.has(key)) this.polled.delete(key);
     }
+    // A check cut short saw only some lines: what it didn't see may still be held
+    if (!signal.aborted) await this.withdrawLifted(views, wanted);
     return views;
   }
 
   /**
+   * The owner's pause of `task` (the reason shown), or null: their latest
+   * pause or release of the task is a pause ("Keep it paused", or "Leave the
+   * task unclaimed" on its run's escalation), about the task's latest run.
+   */
+  private pausedBy(task: string, latest: AgentRun | null): string | null {
+    const { store, project } = this.options;
+    const last = store.listEvents(project, { kinds: ["fill_paused", "fill_released"], task, limit: 1 })[0];
+    if (!last || last.kind !== "fill_paused") return null;
+    if ((typeof last.data.runId === "string" ? last.data.runId : null) !== (latest?.id ?? null)) return null;
+    const why = typeof last.data.why === "string" ? last.data.why : "you paused it";
+    return `paused by you (${why}, ${iso(last.at)}): fill starts it again once you release it`;
+  }
+
+  /**
+   * Withdraw the open decisions whose hold lifted: fill's own that no line
+   * of this check stands on (released in Work, the task done, started or
+   * claimed, its line removed), and a run's escalation once its task is done.
+   * An escalation whose chain moved on is the tick's to withdraw.
+   */
+  private async withdrawLifted(views: FillLineView[], wanted: Set<string>): Promise<void> {
+    const prefix = `agents:${this.options.project}:task:`;
+    const lines = new Map(views.filter((v) => v.task !== null).map((v) => [v.task as string, v]));
+    for (const decision of this.options.openDecisions()) {
+      if (wanted.has(decision.key)) continue;
+      const own = decision.key.startsWith("fill:") && decision.source.ref.startsWith("fill:");
+      const task = own
+        ? decision.source.ref.slice("fill:".length)
+        : decision.key.startsWith("escalation:")
+          ? (decision.blocks.find((ref) => ref.startsWith(prefix))?.slice(prefix.length) ?? null)
+          : null;
+      if (task === null) continue;
+      const line = lines.get(task);
+      if (!own && line?.state !== "done") continue;
+      let reason: string;
+      if (!line) reason = `${task} is no longer in the tasks file`;
+      else if (line.state === "done") reason = `${task} is done`;
+      else if (line.state === "held" && line.hold === "paused") reason = `you paused ${task}`;
+      else if (line.state === "held") reason = `${task} is held for another reason now (${line.hold})`;
+      else if (line.state === "started") reason = `${task} started again`;
+      else reason = `${task} is ${line.state.replace(/_/g, " ")} now`;
+      await this.options.withdraw(decision, `The hold lifted: ${reason}.`);
+    }
+  }
+
+  /**
    * One decision per hold (per task, latest run and kind of hold): start it
-   * again (the release), or keep it held. The last run's output is added
-   * unless `withOutput` is false; agent-written text goes in as data.
+   * again (the release), or keep it paused (the owner's pause). The last
+   * run's output is added unless `withOutput` is false; agent-written text
+   * goes in as data.
    */
   private async raiseHold(
-    latest: AgentRun,
+    latest: AgentRun | null,
     agent: string,
     task: string,
-    ask: {
-      kind?: "blocked" | "waiting";
-      question: string;
-      context: string[];
-      startLabel?: string;
-      startConsequences?: string;
-      keepLabel?: string;
-      keepConsequences?: string;
-      why?: string;
-      withOutput?: boolean;
-    },
+    key: string,
+    ask: HoldQuestion,
   ): Promise<void> {
-    const output = ask.withOutput === false ? [] : lastOutput(latest);
+    const output = ask.withOutput === false || !latest ? [] : lastOutput(latest);
     await this.options.raise(
       {
         kind: "escalation",
-        key: fillDecisionKey(task, latest.id, ask.kind),
+        key,
         ref: `fill:${task}`,
         blocks: [`agents:${this.options.project}:task:${task}`],
         question: ask.question,
@@ -1163,14 +1319,15 @@ export class AgentsFill {
         options: [
           {
             id: DECISION_FILL_START,
-            label: ask.startLabel ?? "Let fill start it again",
+            label: ask.startLabel ?? "Start it again",
             consequences: ask.startConsequences ?? `Fill starts ${task} for ${agent} again on its next check, counting from zero.`,
           },
           {
             id: DECISION_FILL_KEEP,
-            label: ask.keepLabel ?? "Keep it held",
+            label: "Keep it paused",
             consequences:
-              ask.keepConsequences ?? `Fill leaves ${task} alone until you start a run of it, or release the hold in the Agents view.`,
+              ask.keepConsequences ??
+              `Fill leaves ${task} paused until you start a run of it, or release it in Work. Nothing more is asked about it.`,
           },
         ],
         recommended: DECISION_FILL_KEEP,

@@ -139,6 +139,7 @@ export type AgentEventKind =
   | "fill_held"
   | "fill_done"
   | "fill_released"
+  | "fill_paused"
   | "fill_waiting"
   | "fill_blocked"
   | "fill_woken"
@@ -260,11 +261,17 @@ export type FillLineState = "started" | "done" | "held" | "claimed" | "not_allow
  *   the run ended) it counts as a run without progress and starts again after the fallback and backoff
  * - waited_too_long: its runs have been waiting longer than fill.wake.max_wait_minutes in a row
  * - blocked: its last run ended on a BLOCKED line: it needs someone else first
- * - busy, read_only, max_active, capacity, prompt (a refused prompt file), refused (the run request)
- * owner, no_done, blocked, waiting and waited_too_long are the owner's to release (POST
+ * - busy, read_only, max_active, capacity, prompt (a refused prompt file), refused (the run request,
+ *   or done_pattern)
+ * - paused: you chose to leave it ("Keep it paused" on its decision, or "Leave the task unclaimed" on
+ *   its run's escalation): nothing waits for you, and fill starts it again once you release it
+ * owner, no_done, blocked, waiting, waited_too_long and paused are the owner's to release (POST
  * /api/agents/fill/release, or the decision); a waiting one also ends by itself.
+ * owner, no_done, blocked, waited_too_long and refused need the owner (FILL_OWNER_HOLDS): each has
+ * exactly one open Decision Inbox item while it lasts (`decisionId`).
  */
 export type FillHold =
+  | "paused"
   | "owner"
   | "no_done"
   | "backoff"
@@ -289,12 +296,17 @@ export interface FillLineView {
   detail: string;
   /** Why it is held (state "held"), else null */
   hold: FillHold | null;
-  /** The owner can release this hold (owner, no_done, blocked and waiting holds) */
+  /** The owner can release this hold (owner, no_done, blocked, waiting, waited_too_long and paused holds) */
   releasable: boolean;
   /** A waiting line: what it waits on (null without one) and since when its run ended */
   waiting: FillWaitingView | null;
   runId: string | null;
+  /** The open Decision Inbox item of a hold that needs the owner (FILL_OWNER_HOLDS), when it has one */
+  decisionId: string | null;
 }
+
+/** The holds that need the owner: each has exactly one open decision while it lasts. */
+export const FILL_OWNER_HOLDS: readonly FillHold[] = ["owner", "no_done", "blocked", "waited_too_long", "refused"];
 
 export interface FillWaitingView {
   /** What the WAITING line named (a gate id, say), when the pattern captures it */
