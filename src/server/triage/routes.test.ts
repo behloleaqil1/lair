@@ -250,9 +250,14 @@ describe("triage over HTTP", () => {
       ["DELETE", `/api/triage/owner/flaky/${encodeURIComponent("CartTest#addsItem()")}`, undefined],
       ["POST", "/api/triage/owner/incidents/00000000-0000-4000-8000-000000000000/revert", {}],
     ];
+    // No session, an agent with the session but no browser origin, and a cross-site page
+    const refused: Record<string, string>[] = [
+      {},
+      { [OWNER_SESSION_HEADER]: owner[OWNER_SESSION_HEADER] },
+      { ...owner, "sec-fetch-site": "cross-site" },
+    ];
     for (const [method, url, payload] of routes) {
-      // No session, an agent with the session but no browser origin, and a cross-site page
-      for (const headers of [{}, { [OWNER_SESSION_HEADER]: owner[OWNER_SESSION_HEADER] }, { ...owner, "sec-fetch-site": "cross-site" }]) {
+      for (const headers of refused) {
         const res = await call(method, url, headers, payload);
         expect(res.statusCode).toBe(403);
       }
