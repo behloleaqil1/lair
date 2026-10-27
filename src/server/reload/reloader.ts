@@ -19,13 +19,13 @@
  * after it. A module that fails to start with the new config is started
  * again with the previous one, so none is left half-started.
  */
-import { watch, type FSWatcher } from "chokidar";
 import { existsSync } from "fs";
-import { relative, sep } from "path";
+import { join, relative, sep } from "path";
 import type { EventBus } from "../core/event-bus.js";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { ConfigProblem, ConfigReload, ConfigStatusView } from "../../shared/lifecycle-types.js";
 import { PROJECTS_DIR, getConfigPath, isSafeProjectName, listProjects, loadProjectConfig } from "../config.js";
+import { DirWatch, type WatchFn } from "../services/dir-watch.js";
 import { fingerprint, type ProjectEntry, type ReloadableModule } from "./modules.js";
 
 export interface ConfigReloaderOptions {
@@ -42,7 +42,11 @@ export interface ConfigReloaderOptions {
   /** File names are shown relative to this (default: the working directory) */
   cwd?: string;
   log?: Pick<Console, "log" | "warn">;
+  /** fs.watch (tests count the watches) */
+  watch?: WatchFn;
 }
+
+const isYaml = (name: string) => /\.ya?ml$/.test(name);
 
 const MAX_RECENT = 50;
 const MAX_ERROR = 2000;
@@ -71,7 +75,8 @@ export class ConfigReloader {
   private readonly debounceMs: number;
   private readonly log: Pick<Console, "log" | "warn">;
   private readonly owned: Set<string>;
-  private watcher: FSWatcher | null = null;
+  /** projects/ and projects/local/: one watch per folder, none per file */
+  private watchers: DirWatch[] = [];
   private readyPromise: Promise<void> = Promise.resolve();
   private stopped = false;
   private timers = new Map<string, NodeJS.Timeout>();
@@ -121,22 +126,30 @@ export class ConfigReloader {
     }
   }
 
-  /** Watch the project files. */
+  /**
+   * Watch the project files: the folders projects/ and projects/local/ (one
+   * watch each, the .yaml and .yml names only), never each file in them.
+   */
   start(): void {
-    if (this.watcher || this.stopped) return;
-    const watcher = watch(this.dir, { ignoreInitial: true, depth: 1, persistent: true });
+    if (this.watchers.length > 0 || this.stopped) return;
     const onFile = (path: string) => {
       const project = this.projectOf(path);
       if (project) this.schedule(project);
     };
-    watcher.on("add", onFile);
-    watcher.on("change", onFile);
-    watcher.on("unlink", onFile);
-    watcher.on("error", (error: unknown) => {
-      this.log.warn(`[config] watching ${this.display(this.dir)} failed: ${message(error)}`);
-    });
+    this.watchers = [this.dir, join(this.dir, "local")].map(
+      (dir) =>
+        new DirWatch(dir, {
+          accept: isYaml,
+          onEvent: (_event, path) => onFile(path),
+          watch: this.options.watch,
+          onError: (text) => this.log.warn(`[config] ${text}`),
+        }),
+    );
+    for (const watcher of this.watchers) watcher.start();
     this.readyPromise = new Promise<void>((resolve) => {
-      watcher.once("ready", () => {
+      // The folders are watched from here on
+      setImmediate(() => {
+        if (this.stopped) return resolve();
         // A file changed between the startup load and now is seen here
         try {
           for (const project of listProjects(this.dir)) this.apply(project, { quiet: true });
@@ -146,10 +159,9 @@ export class ConfigReloader {
         resolve();
       });
     });
-    this.watcher = watcher;
   }
 
-  /** Resolves once the watcher has scanned the directory (changes made after it are seen). */
+  /** Resolves once the folders are watched (changes made after it are seen). */
   ready(): Promise<void> {
     return this.readyPromise;
   }
@@ -163,9 +175,8 @@ export class ConfigReloader {
     this.stopped = true;
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
-    const watcher = this.watcher;
-    this.watcher = null;
-    await watcher?.close();
+    for (const watcher of this.watchers) watcher.stop();
+    this.watchers = [];
   }
 
   /** Resolves when no change is waiting and no reload runs (for tests). */
@@ -183,7 +194,7 @@ export class ConfigReloader {
 
   status(): ConfigStatusView {
     return {
-      watching: this.watcher !== null,
+      watching: this.watchers.length > 0,
       problems: [...this.problems.values()].sort((a, b) => a.project.localeCompare(b.project)),
       recent: [...this.recent],
     };

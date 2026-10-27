@@ -9,12 +9,14 @@ import {
   readlinkSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { DragonUpdateData, GateUpdateData, LairWebSocketServer } from "../websocket.js";
+import { defaultWatch, type WatchFn } from "./dir-watch.js";
 import { FileWatcherService, dragonIdFromLogFile } from "./file-watcher.js";
 
 describe("dragonIdFromLogFile", () => {
@@ -169,11 +171,12 @@ describe("FileWatcherService on large folders", () => {
     // Time for a watcher that sets up asynchronously to finish
     await sleep(1500);
 
-    // A watch or a descriptor per file would be thousands here
+    // A watch or a descriptor per file would be thousands here (the margin is
+    // for the other test files running in this process meanwhile)
     const watches = inotifyWatches();
     if (watches !== null && watchesBefore !== null) expect(watches - watchesBefore).toBeLessThan(100);
     const descriptors = descriptorCount();
-    if (descriptors !== null && descriptorsBefore !== null) expect(descriptors - descriptorsBefore).toBeLessThan(100);
+    if (descriptors !== null && descriptorsBefore !== null) expect(descriptors - descriptorsBefore).toBeLessThan(250);
     expect(descriptorsUnder(root)).toEqual([]);
 
     // New and changed files of the watched folders are still reported
@@ -197,7 +200,32 @@ describe("FileWatcherService on large folders", () => {
 
     expect(descriptorsUnder(root)).toEqual([]);
     const after = descriptorCount();
-    if (after !== null && descriptorsBefore !== null) expect(after - descriptorsBefore).toBeLessThan(100);
+    if (after !== null && descriptorsBefore !== null) expect(after - descriptorsBefore).toBeLessThan(250);
+  }, 60_000);
+
+  it("watches each of its folders once, and never a file", async () => {
+    const { root, config } = bigProject();
+    const watched: string[] = [];
+    const watch: WatchFn = (dir, listener) => {
+      watched.push(dir);
+      return defaultWatch(dir, listener);
+    };
+    const watcher = new FileWatcherService(fakeWs().server, config, { watch });
+    cleanup = async () => {
+      await watcher.stop();
+      rmSync(root, { recursive: true, force: true });
+    };
+    watcher.start();
+    // agents_dir, the gate queue and results, and the queue file's folder
+    const folders = [config.agents_dir, join(config.gates_dir, "queue"), join(config.gates_dir, "results"), root];
+    expect([...watched].sort()).toEqual([...folders].sort());
+    for (const dir of watched) expect(statSync(dir).isDirectory()).toBe(true);
+    expect(watcher.watched().map((w) => w.state)).toEqual(["watching", "watching", "watching", "watching"]);
+
+    // New files don't add watches
+    for (let i = 0; i < 100; i++) writeFileSync(join(config.agents_dir, `late${i}.log`), "x\n");
+    await sleep(500);
+    expect(watched).toHaveLength(4);
   }, 60_000);
 
   it("reports a burst of writes to one log once (debounced)", async () => {

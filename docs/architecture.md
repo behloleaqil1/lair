@@ -96,7 +96,8 @@ Pure functions that parse project files into typed structures:
 - **`dragon-registry.ts`**: the dragons a project has (YAML `dragons:` plus `dragons.txt`); start/stop requests are checked against it and the start dialog lists it
 - **`adapters.ts`**: built-in agent adapter definitions and command builders (adapters are listed in the UI; dragons are started with `dragon_start_cmd`)
 - **`supervisor.ts`**, **`managed-process.ts`**, **`ring-buffer.ts`**: process manager for long-running services and their logs
-- **`file-watcher.ts`**: watches project files and broadcasts changes over the WebSocket
+- **`file-watcher.ts`**: watches a project's folders (agents_dir, the gate queue and results, the queue file's folder) and broadcasts changes over the WebSocket
+- **`dir-watch.ts`**: one folder's watch (fs.watch on the folder, never on its files), with polling where the folder can't be watched; the file watcher and the config reloader use it
 - **`gate-runner.ts`**, **`gate-distribution.ts`**, **`remote-gate.ts`**: optional gate runner, lane-to-machine distribution and remote gate execution over SSH (library code with tests; not started by the server yet)
 
 #### Core (`core/`)
@@ -378,6 +379,8 @@ UI receives update
 ```
 
 The UI subscribes to channels (`dragons`, `gates`, `machines`, `orchestrator`, `logs:dragon-id`) and receives instant updates.
+
+Lair watches folders, not files: each watched folder (agents_dir, the gate queue and results folders, the queue file's folder, `projects/` and `projects/local/`) gets one `fs.watch` of the folder itself (inotify on Linux, FSEvents on macOS, so no descriptor per file), and only the names the dashboard uses among the folder's direct entries are looked at, with one `lstat` each, after a 100 ms debounce. Subfolders (archives, prompts, older logs) are not watched, and no file is opened to be watched, so the cost stays one watch per folder however many files the folders hold. A folder that is missing or can't be watched is polled every 5 s instead (one listing, and an `lstat` of the new names and of the 200 most recently changed files) until it can be watched.
 
 ### Command execution
 
