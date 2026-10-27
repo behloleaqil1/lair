@@ -6,10 +6,15 @@ import { z } from "zod";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { ReviewerOption, ReviewSlot, Tier } from "../../shared/review-types.js";
 import { DEFAULT_FILE_KINDS, DEFAULT_RISK_RULES, type RiskRule } from "../policy/risk-rules.js";
+import { isValidPromptName, PROMPT_NAME_RULE } from "../agents/prompts.js";
+import { compileBranchGlob, type BranchGlob } from "./authors.js";
 
 const TierSchema = z.enum(["red", "amber", "green"]);
 const RULE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const AGENT_ID = "[A-Za-z0-9][A-Za-z0-9._-]{0,63}";
+const AgentId = z.string().regex(new RegExp(`^${AGENT_ID}$`), "agent ids use letters, digits, '.', '_' and '-'");
+/** Reviewer agents the agent assigner may pick from */
+const Pool = z.array(AgentId).min(1).max(50);
 const globs = z.array(z.string().min(1));
 
 const RuleSchema = z
@@ -36,13 +41,15 @@ const SlotSchema = z.union(
       .object({
         any_of: z.array(OptionString).min(1),
         different_model: z.boolean().default(false),
+        /** Reviewer agents for this slot (reviews by agents), instead of reviewers_pool.<tier> */
+        pool: Pool.optional(),
       })
       .strict(),
   ],
   {
     errorMap: (issue, ctx) =>
       issue.code === "invalid_union"
-        ? { message: "use human, peer, self or agent:<id>, or {any_of: [...], different_model: true}" }
+        ? { message: "use human, peer, self or agent:<id>, or {any_of: [...], different_model: true, pool?: [...]}" }
         : { message: ctx.defaultError },
   },
 );
@@ -129,6 +136,26 @@ const ReviewSchema = z
         branch_pattern: z.string().min(1).max(200).optional(),
         /** Agent id -> model, for agents not listed under `dragons:` */
         models: z.record(z.string().min(1)).default({}),
+        /** Branch glob -> agent id, for branches that don't carry the agent id (team/topic) */
+        branches: z.record(z.string().min(1).max(200), AgentId).default({}),
+        /** Also take a branch's agent from the agents fill tasks file: "(branch: <name>)" or "(<prefix>/<topic>)" */
+        from_tasks_file: z.boolean().default(false),
+      })
+      .strict()
+      .default({}),
+    /** Reviews by agents: the template (a file name in prompts_dir) of a reviewer agent's prompt */
+    prompt_file: z.string().min(1).optional(),
+    /** Reviewer agents per tier the agent assigner picks a peer from */
+    reviewers_pool: z
+      .object({ red: Pool.optional(), amber: Pool.optional(), green: Pool.optional() })
+      .strict()
+      .default({}),
+    /** A reviewer run that ends without a review is retried, with backoff, then the owner is asked */
+    retries: z
+      .object({
+        max_attempts: z.number().int().min(1).max(10).default(3),
+        backoff_seconds: z.number().int().min(1).max(86_400).default(120),
+        max_backoff_seconds: z.number().int().min(1).max(86_400).default(3600),
       })
       .strict()
       .default({}),
@@ -213,9 +240,23 @@ export interface ReviewSettings {
   tokenEnv: string;
   tokenCmd: string[] | null;
   defaultBranch: string | null;
-  authors: { branchPattern: RegExp | null; models: Record<string, string> };
+  authors: {
+    branchPattern: RegExp | null;
+    models: Record<string, string>;
+    /** review.authors.branches, in config order */
+    branches: BranchGlob[];
+    fromTasksFile: boolean;
+  };
   tiers: { default: Tier; rules: RiskRule[]; fileKinds: Record<string, string[]> };
   reviewers: Record<Tier, ReviewSlot[]>;
+  /** Reviews by agents: on when promptFile is set (and the agents module runs the project) */
+  agentReviews: {
+    promptFile: string | null;
+    pools: Partial<Record<Tier, string[]>>;
+    maxAttempts: number;
+    backoffSeconds: number;
+    maxBackoffSeconds: number;
+  };
   integrity: IntegritySettings;
   merge: MergeSettings;
 }
@@ -246,7 +287,9 @@ function parseOption(value: string): ReviewerOption {
 
 function parseSlot(value: z.infer<typeof SlotSchema>): ReviewSlot {
   if (typeof value === "string") return { anyOf: [parseOption(value)], differentModel: false };
-  return { anyOf: value.any_of.map(parseOption), differentModel: value.different_model };
+  const slot: ReviewSlot = { anyOf: value.any_of.map(parseOption), differentModel: value.different_model };
+  if (value.pool) slot.pool = value.pool;
+  return slot;
 }
 
 /** Branch names longer than this never match `authors.branch_pattern`. */
@@ -298,7 +341,10 @@ function cloneUrlFor(apiUrl: string, repo: string): string {
 }
 
 /** Validate a project's `review:` block (undefined means disabled). */
-export function parseReviewConfig(raw: unknown, project: Pick<ProjectConfig, "github">): ParseResult {
+export function parseReviewConfig(
+  raw: unknown,
+  project: Pick<ProjectConfig, "github"> & Partial<Pick<ProjectConfig, "agents">>,
+): ParseResult {
   const parsed = ReviewSchema.safeParse(raw ?? {});
   if (!parsed.success) {
     return {
@@ -324,6 +370,27 @@ export function parseReviewConfig(raw: unknown, project: Pick<ProjectConfig, "gi
     } else {
       branchPattern = compiled;
     }
+  }
+  const branches: BranchGlob[] = [];
+  const branchEntries = Object.entries(value.authors.branches);
+  if (branchEntries.length > 100) errors.push("review.authors.branches: at most 100 entries");
+  for (const [glob, agent] of branchEntries.slice(0, 100)) {
+    const compiled = compileBranchGlob(glob, agent);
+    if (typeof compiled === "string") errors.push(`review.authors.branches."${glob}": ${compiled}`);
+    else branches.push(compiled);
+  }
+
+  if (value.prompt_file !== undefined) {
+    if (!isValidPromptName(value.prompt_file)) {
+      errors.push(`review.prompt_file: ${PROMPT_NAME_RULE} (a file directly in prompts_dir)`);
+    }
+    if (value.enabled && project.agents?.enabled !== true) {
+      errors.push("review.prompt_file: reviews by agents need the agents module (agents.enabled: true)");
+    }
+  }
+  const retries = value.retries;
+  if (retries.backoff_seconds > retries.max_backoff_seconds) {
+    errors.push("review.retries.backoff_seconds: more than max_backoff_seconds");
   }
 
   const fileKinds = { ...DEFAULT_FILE_KINDS, ...value.tiers.file_kinds };
@@ -402,9 +469,21 @@ export function parseReviewConfig(raw: unknown, project: Pick<ProjectConfig, "gi
       tokenEnv: value.token_env,
       tokenCmd: value.token_cmd ?? null,
       defaultBranch: value.default_branch ?? null,
-      authors: { branchPattern, models: value.authors.models },
+      authors: {
+        branchPattern,
+        models: value.authors.models,
+        branches,
+        fromTasksFile: value.authors.from_tasks_file,
+      },
       tiers: { default: value.tiers.default, rules, fileKinds },
       reviewers,
+      agentReviews: {
+        promptFile: value.prompt_file ?? null,
+        pools: value.reviewers_pool,
+        maxAttempts: retries.max_attempts,
+        backoffSeconds: retries.backoff_seconds,
+        maxBackoffSeconds: retries.max_backoff_seconds,
+      },
       integrity: {
         enabled: value.integrity.enabled,
         blockingTiers: value.integrity.blocking_tiers,

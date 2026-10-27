@@ -1,6 +1,39 @@
 import { describe, expect, it } from "vitest";
-import type { PrReviewStatus } from "../shared/review-types";
-import { findingLocation, mergeButtonState, parseFindingLines } from "./review-view";
+import type { PrReviewStatus, SlotAssignmentView } from "../shared/review-types";
+import { assignmentLabel, findingLocation, mergeButtonState, parseFindingLines } from "./review-view";
+
+describe("assignmentLabel", () => {
+  const base: SlotAssignmentView = {
+    slot: 0,
+    state: "requested",
+    channel: "agents",
+    agent: null,
+    runId: null,
+    attempts: 0,
+    maxAttempts: 3,
+    detail: "waiting for a free reviewer (rev-b: busy)",
+    notBefore: "2026-03-02T12:05:00.000Z",
+    updatedAt: "2026-03-02T12:00:00.000Z",
+  };
+
+  it("names each step: requested, assigned to the agent, reviewed, failed", () => {
+    expect(assignmentLabel(undefined)).toBeNull();
+    expect(assignmentLabel(base)).toEqual({ badge: "badge-neutral", text: "requested", detail: base.detail });
+    expect(assignmentLabel({ ...base, attempts: 1, detail: "retry" })?.text).toBe("requested: retry at 12:05 UTC");
+    expect(
+      assignmentLabel({ ...base, state: "assigned", agent: "rev-b", runId: "0123456789abcdef", attempts: 2 }),
+    ).toMatchObject({ badge: "badge-warning", text: "assigned to rev-b (run 01234567, attempt 2 of 3)" });
+    expect(assignmentLabel({ ...base, state: "reviewed", agent: "rev-b" })).toMatchObject({
+      badge: "badge-success",
+      text: "reviewed by rev-b",
+    });
+    expect(assignmentLabel({ ...base, state: "failed", detail: "no review after 3 run(s)" })).toEqual({
+      badge: "badge-error",
+      text: "failed",
+      detail: "no review after 3 run(s)",
+    });
+  });
+});
 
 function status(overrides: Partial<PrReviewStatus>): PrReviewStatus {
   return {

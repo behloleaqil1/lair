@@ -6,7 +6,6 @@
  *
  * ReviewManager holds one ReviewService per project with `review.enabled`.
  */
-import { createHash, randomBytes } from "crypto";
 import { resolve } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
 import type {
@@ -21,6 +20,8 @@ import type {
   ReviewProjectInfo,
   ReviewRecord,
   MergeHold,
+  SlotAssignmentView,
+  SlotStatus,
   Tier,
   Verdict,
 } from "../../shared/review-types.js";
@@ -28,7 +29,10 @@ import type { EventBus } from "../core/event-bus.js";
 import { assessRisk } from "../policy/risk-rules.js";
 import { matchSlots } from "../policy/reviewer-slots.js";
 import { evaluateMergePolicy } from "../policy/merge-policy.js";
-import { agentFromBranch, parseReviewConfig, type ReviewSettings } from "./config.js";
+import { parseReviewConfig, type ReviewSettings } from "./config.js";
+import { mapAuthor } from "./authors.js";
+import { AGENTS_CHANNEL, AgentReviewAssigner, CHECK_INTERVAL_MS } from "./agent-assigner.js";
+import { hashToken, newAssignmentToken } from "./tokens.js";
 import { checkTestIntegrity, isTestFile, type IntegrityFile } from "./integrity.js";
 import { GitHubHost, tokenFrom, type FetchLike, type TokenSource } from "./github.js";
 import type { GitHost, HostFile, HostPullRequest, HostRepo } from "./host.js";
@@ -43,6 +47,7 @@ import {
   unwiredDecisionSink,
   type DecisionSink,
   type ReviewAssigner,
+  type ReviewerRuns,
 } from "./ports.js";
 import type { SignedGateResult } from "../../shared/policy-types.js";
 
@@ -105,17 +110,14 @@ function short(sha: string): string {
   return sha.slice(0, 7);
 }
 
-/** Assignment tokens are stored only as hashes. */
-function hashToken(token: string): string {
-  return createHash("sha256").update(token).digest("hex");
-}
-
 export class ReviewService {
   readonly project: string;
   readonly settings: ReviewSettings;
   private readonly gateSource: GateSource;
   private repoInfo: { at: number; repo: HostRepo | null } | null = null;
   private integrityRuns = new Map<string, Promise<void>>();
+  /** requestReviews in progress per PR: a second call shares it, so a slot is never asked for twice at once */
+  private requesting = new Map<number, Promise<RequestOutcome[]>>();
   private merging = false;
   /** Set by drain() (a config reload): no merge starts here any more */
   private closing = false;
@@ -164,12 +166,72 @@ export class ReviewService {
     return model ? { ...ref, model } : ref;
   }
 
-  private authorOf(pr: HostPullRequest): { author: ReviewerRef | null; source: "lair" | "branch" | null } {
+  /**
+   * The PR's author: the one Lair's modules registered, else what the branch
+   * mappings agree on (authors.ts; agents that disagree leave it unknown).
+   */
+  private authorOf(pr: HostPullRequest): {
+    author: ReviewerRef | null;
+    source: PrReviewStatus["authorSource"];
+    note: string | null;
+  } {
     const stored = this.o.store.getAuthor(this.project, pr.number);
-    if (stored) return { author: this.withModel(stored), source: "lair" };
-    const agent = agentFromBranch(this.settings.authors.branchPattern, pr.headRef);
-    if (agent) return { author: this.withModel({ id: agent, kind: "agent" }), source: "branch" };
-    return { author: null, source: null };
+    if (stored) return { author: this.withModel(stored), source: "lair", note: null };
+    const mapped = mapAuthor(this.settings.authors, pr.headRef, this.o.config);
+    if (mapped.agent) {
+      return { author: this.withModel({ id: mapped.agent, kind: "agent" }), source: mapped.source, note: mapped.note };
+    }
+    return { author: null, source: null, note: mapped.note };
+  }
+
+  /** The PR's state and head now, from the git host (recorded as the head seen), or null when it can't say. */
+  async currentPullRequest(n: number): Promise<{ state: string; headSha: string } | null> {
+    try {
+      const pr = await this.o.host.getPullRequest(n);
+      this.noteHead(pr);
+      return { state: pr.state, headSha: pr.headSha };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Where each slot's request stands at `headSha`: reviews by agents, else the request record. */
+  private assignmentViews(n: number, headSha: string, slots: SlotStatus[]): SlotAssignmentView[] {
+    const rows = new Map(this.o.store.agentAssignments(this.project, n, headSha).map((r) => [r.slot, r]));
+    const views: SlotAssignmentView[] = [];
+    slots.forEach((_slot, index) => {
+      const row = rows.get(index);
+      if (row) {
+        views.push({
+          slot: index,
+          state: row.state,
+          channel: AGENTS_CHANNEL,
+          agent: row.agent,
+          runId: row.runId,
+          attempts: row.attempts,
+          maxAttempts: this.settings.agentReviews.maxAttempts,
+          detail: row.detail,
+          notBefore: row.state === "requested" ? new Date(row.notBefore).toISOString() : null,
+          updatedAt: row.updatedAt,
+        });
+        return;
+      }
+      const request = this.o.store.getRequest(this.project, n, headSha, index);
+      if (!request) return;
+      views.push({
+        slot: index,
+        state: request.usedBy ? "reviewed" : "requested",
+        channel: request.channel,
+        agent: request.usedBy ?? request.reviewer,
+        runId: null,
+        attempts: 0,
+        maxAttempts: null,
+        detail: request.detail,
+        notBefore: null,
+        updatedAt: request.requestedAt,
+      });
+    });
+    return views;
   }
 
   /** Record the head; a new one makes every review at an older head stale. */
@@ -358,7 +420,7 @@ export class ReviewService {
     );
     if (pr.state === "open") await this.ensureIntegrity(pr, files, risk.tier);
 
-    const { author, source } = this.authorOf(pr);
+    const { author, source, note } = this.authorOf(pr);
     const reviews = this.annotate(this.o.store.listReviews(this.project, n), pr.headSha);
     const findings = reviews.flatMap((r) => r.findings);
     const openBlocking = findings.filter((f) => f.status === "open" && f.blocking && !f.superseded);
@@ -426,9 +488,11 @@ export class ReviewService {
       defaultBranch,
       author,
       authorSource: source,
+      authorNote: note,
       labels: pr.labels,
       risk,
       slots,
+      assignments: this.assignmentViews(n, pr.headSha, slots),
       reviews,
       findings,
       gate,
@@ -495,7 +559,8 @@ export class ReviewService {
     const pr = await this.o.host.getPullRequest(n);
     this.noteHead(pr);
     if (pr.state !== "open") throw new ReviewError(`PR #${n} is ${pr.state}`, 409);
-    const reviewer = this.withModel(input.reviewer);
+    // The model Lair started the assigned agent on is what counts, not the one the review claims
+    const reviewer = this.withModel(assignment?.model ? { ...input.reviewer, model: assignment.model } : input.reviewer);
     if (assignment) this.o.store.markAssignmentUsed(this.project, n, assignment.headSha, assignment.slot, reviewer.id);
     const stored = this.o.store.addReview({
       project: this.project,
@@ -624,14 +689,23 @@ export class ReviewService {
    * agent through the assigner, the author's self-check through the
    * assigner, and a human through the Decision Inbox.
    */
-  async requestReviews(n: number): Promise<RequestOutcome[]> {
+  requestReviews(n: number): Promise<RequestOutcome[]> {
+    const running = this.requesting.get(n);
+    if (running) return running;
+    const request = this.requestNow(n).finally(() => this.requesting.delete(n));
+    this.requesting.set(n, request);
+    return request;
+  }
+
+  private async requestNow(n: number): Promise<RequestOutcome[]> {
     const status = await this.status(n);
     const outcomes: RequestOutcome[] = [];
     for (const [index, slot] of status.slots.entries()) {
       if (slot.satisfiedBy) continue;
-      // Once per head; again only when the assignee reviewed without filling the slot
+      // Once per head; again only when the assignee reviewed without filling the slot, or reviews by agents failed
       const previous = this.o.store.getRequest(this.project, n, status.headSha, index);
-      if (previous && !previous.usedBy) {
+      const agents = this.o.store.getAgentAssignment(this.project, n, status.headSha, index);
+      if (previous && !previous.usedBy && agents?.state !== "failed") {
         outcomes.push({ slot: slot.label, channel: "already requested", detail: `at ${short(status.headSha)}` });
         continue;
       }
@@ -641,7 +715,8 @@ export class ReviewService {
       const self = options.some((o) => o.kind === "self");
       let channel: string;
       let detail: string;
-      let assignment: { reviewer: string | null; exclude: string[]; tokenHash: string } | null = null;
+      let assignment: { reviewer: string | null; exclude: string[]; tokenHash: string; model: string | null } | null =
+        null;
       if (named || peer || self) {
         const role = named || peer ? "review" : "self-check";
         const reviewer = named && named.kind === "agent" ? named.agent : role === "self-check" ? (status.author?.id ?? null) : null;
@@ -650,7 +725,7 @@ export class ReviewService {
           continue;
         }
         const exclude = role === "review" && status.author ? [status.author.id] : [];
-        const token = randomBytes(24).toString("base64url");
+        const token = newAssignmentToken();
         const result = await this.o.assigner.assign({
           project: this.project,
           pr: n,
@@ -660,13 +735,25 @@ export class ReviewService {
           exclude,
           role,
           differentModelFrom: slot.slot.differentModel ? (status.author?.model ?? null) : null,
+          differentModel: slot.slot.differentModel,
+          slot: index,
+          author: status.author?.id ?? null,
+          pool: slot.slot.pool ?? this.settings.agentReviews.pools[status.risk.tier] ?? null,
+          repo: this.settings.repo,
+          base: status.baseRef,
+          url: status.url,
           reason: `The ${status.risk.tier} tier needs ${slot.label}`,
           token,
         });
         // The assigner may name the agent it picked; an excluded pick binds nobody
         const picked = reviewer ?? (result.agent && !exclude.includes(result.agent) ? result.agent : null);
-        assignment = { reviewer: picked, exclude, tokenHash: hashToken(token) };
-        channel = "assigner";
+        assignment = {
+          reviewer: picked,
+          exclude,
+          tokenHash: hashToken(token),
+          model: picked && picked === result.agent ? (result.model ?? null) : null,
+        };
+        channel = result.channel ?? "assigner";
         detail = result.agent ? `${result.agent}: ${result.detail}` : result.detail;
       } else {
         const result = await this.o.decisions.raise({
@@ -868,6 +955,16 @@ export interface ReviewManagerOptions {
   hostFactory?: (settings: ReviewSettings, token: TokenSource) => GitHost;
   decisions?: DecisionSink;
   assigner?: ReviewAssigner;
+  /**
+   * The agents module (AgentsManager), for reviews by agents: a project that
+   * sets review.prompt_file has its agent reviews done by agents it starts
+   * (agent-assigner.ts). Without it, requests go to `assigner`.
+   */
+  agents?: ReviewerRuns;
+  /** This server's URL, given to reviewer runs as LAIR_URL */
+  serverUrl?: string;
+  /** How often reviews by agents are followed, in ms (0: only through agentReviews.check()). Default 15 s */
+  agentCheckMs?: number;
 }
 
 export class ReviewManager {
@@ -876,8 +973,14 @@ export class ReviewManager {
   private configs = new Map<string, ProjectConfig>();
   private store: ReviewStore | null = null;
   private closed = false;
+  private agentAssigner: AgentReviewAssigner | null = null;
 
   constructor(private readonly options: ReviewManagerOptions) {}
+
+  /** The agent assigner, when a project has reviews by agents on. */
+  get agentReviews(): AgentReviewAssigner | null {
+    return this.agentAssigner;
+  }
 
   /**
    * Apply a project's new config (src/server/reload/): a merge in progress
@@ -915,6 +1018,22 @@ export class ReviewManager {
         ? this.options.hostFactory(settings, token)
         : new GitHubHost({ repo: settings.repo, apiUrl: settings.apiUrl, token, fetch: this.options.fetch });
       const events = this.options.events;
+      const clock = this.options.clock ?? systemClock;
+      const decisions = this.options.decisions ?? (events ? eventBusDecisionSink(events) : unwiredDecisionSink);
+      let assigner = this.options.assigner ?? (events ? eventBusAssigner(events) : unwiredAssigner);
+      if (this.options.agents && settings.agentReviews.promptFile) {
+        this.agentAssigner ??= new AgentReviewAssigner({
+          agents: this.options.agents,
+          store: this.store,
+          clock,
+          decisions,
+          fallback: assigner,
+          serverUrl: this.options.serverUrl,
+          pullRequest: (project, n) => this.services.get(project)?.currentPullRequest(n) ?? Promise.resolve(null),
+        });
+        this.agentAssigner.addProject(entry.name, { config: entry.config, settings });
+        assigner = this.agentAssigner;
+      }
       this.services.set(
         entry.name,
         new ReviewService({
@@ -924,10 +1043,10 @@ export class ReviewManager {
           store: this.store,
           host,
           git: this.options.git ?? systemGit(),
-          clock: this.options.clock ?? systemClock,
+          clock,
           events,
-          decisions: this.options.decisions ?? (events ? eventBusDecisionSink(events) : unwiredDecisionSink),
-          assigner: this.options.assigner ?? (events ? eventBusAssigner(events) : unwiredAssigner),
+          decisions,
+          assigner,
           authHeader: async () => {
             const t = await token();
             return t ? `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${t}`).toString("base64")}` : null;
@@ -936,6 +1055,8 @@ export class ReviewManager {
         }),
       );
     }
+    const every = this.options.agentCheckMs ?? CHECK_INTERVAL_MS;
+    if (this.agentAssigner && every > 0) this.agentAssigner.start(every);
   }
 
   get(project: string): ReviewService | undefined {
@@ -975,6 +1096,8 @@ export class ReviewManager {
 
   close(): void {
     this.closed = true;
+    this.agentAssigner?.stop();
+    this.agentAssigner = null;
     this.store?.close();
     this.store = null;
     this.services.clear();

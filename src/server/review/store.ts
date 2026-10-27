@@ -23,7 +23,32 @@ import type {
 } from "../../shared/review-types.js";
 import type { SignedGateResult } from "../../shared/policy-types.js";
 
-const SCHEMA_VERSION = 1;
+/**
+ * 1: reviews, findings, PRs, holds, merges, requests, gate results.
+ * 2: review_requests.model (the model the assigned agent runs on), and
+ *    review_agent_assignments (reviews by agents: each slot's run, attempts and state).
+ */
+export const SCHEMA_VERSION = 2;
+
+const SCHEMA_2 = `
+  CREATE TABLE IF NOT EXISTS review_agent_assignments (
+    project TEXT NOT NULL,
+    pr INTEGER NOT NULL,
+    head_sha TEXT NOT NULL,
+    slot INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    agent TEXT,
+    run_id TEXT,
+    chain_id TEXT,
+    attempts INTEGER NOT NULL,
+    not_before INTEGER NOT NULL,
+    detail TEXT NOT NULL,
+    spec TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (project, pr, head_sha, slot)
+  );
+  CREATE INDEX IF NOT EXISTS idx_review_agent_assignments_state ON review_agent_assignments(state);
+`;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS review_reviews (
@@ -259,17 +284,100 @@ export interface AssignmentRecord {
   reviewer: string | null;
   exclude: string[];
   usedBy: string | null;
+  /** The model the assigned agent runs on, when Lair started its run (recorded with its review) */
+  model: string | null;
+  channel: string;
+  detail: string;
+  requestedAt: string;
 }
 
 interface RequestRow {
   pr: number;
   head_sha: string;
   slot: number;
+  channel: string;
+  detail: string;
+  requested_at: string;
   reviewer: string | null;
   exclude: string;
   token_hash: string | null;
   used_by: string | null;
+  model: string | null;
 }
+
+export type AgentAssignmentState = "requested" | "assigned" | "reviewed" | "failed" | "stale";
+
+/** What an agent assignment was asked for (never the token). */
+export interface AgentAssignmentSpec {
+  tier: Tier;
+  /** A named reviewer agent, or null for a peer */
+  reviewer: string | null;
+  exclude: string[];
+  author: string | null;
+  pool: string[] | null;
+  differentModel: boolean;
+  authorModel: string | null;
+  repo: string;
+  base: string;
+  url: string | null;
+  label: string;
+  /** Agents whose runs ended without a review, in order */
+  tried: string[];
+}
+
+/** One slot's reviews by agents at one head: the current run, attempts and state. */
+export interface AgentAssignmentRecord {
+  project: string;
+  pr: number;
+  headSha: string;
+  slot: number;
+  state: AgentAssignmentState;
+  agent: string | null;
+  runId: string | null;
+  chainId: string | null;
+  attempts: number;
+  /** ms: a requested slot starts no run before this */
+  notBefore: number;
+  detail: string;
+  spec: AgentAssignmentSpec;
+  updatedAt: string;
+}
+
+interface AgentAssignmentRow {
+  project: string;
+  pr: number;
+  head_sha: string;
+  slot: number;
+  state: string;
+  agent: string | null;
+  run_id: string | null;
+  chain_id: string | null;
+  attempts: number;
+  not_before: number;
+  detail: string;
+  spec: string;
+  updated_at: string;
+}
+
+function agentAssignmentOf(row: AgentAssignmentRow): AgentAssignmentRecord {
+  return {
+    project: row.project,
+    pr: row.pr,
+    headSha: row.head_sha,
+    slot: row.slot,
+    state: row.state as AgentAssignmentState,
+    agent: row.agent,
+    runId: row.run_id,
+    chainId: row.chain_id,
+    attempts: row.attempts,
+    notBefore: row.not_before,
+    detail: row.detail,
+    spec: JSON.parse(row.spec) as AgentAssignmentSpec,
+    updatedAt: row.updated_at,
+  };
+}
+
+export const OPEN_AGENT_STATES: readonly AgentAssignmentState[] = ["requested", "assigned"];
 
 function clientOf(json: string | null): ClientInfo | null {
   return json ? (JSON.parse(json) as ClientInfo) : null;
@@ -283,6 +391,10 @@ function assignmentOf(row: RequestRow): AssignmentRecord {
     reviewer: row.reviewer,
     exclude: JSON.parse(row.exclude) as string[],
     usedBy: row.used_by,
+    model: row.model ?? null,
+    channel: row.channel,
+    detail: row.detail,
+    requestedAt: row.requested_at,
   };
 }
 
@@ -322,8 +434,15 @@ export class ReviewStore {
     if (dbPath !== ":memory:") this.db.pragma("journal_mode = WAL");
     const version = this.db.pragma("user_version", { simple: true }) as number;
     if (version < SCHEMA_VERSION) {
-      this.db.exec(SCHEMA);
-      this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+      this.db.transaction(() => {
+        this.db.exec(SCHEMA);
+        if (version < 2) {
+          const columns = this.db.prepare(`PRAGMA table_info(review_requests)`).all() as { name: string }[];
+          if (!columns.some((c) => c.name === "model")) this.db.exec(`ALTER TABLE review_requests ADD COLUMN model TEXT`);
+          this.db.exec(SCHEMA_2);
+        }
+        this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+      })();
     }
   }
 
@@ -630,13 +749,13 @@ export class ReviewStore {
     channel: string,
     detail: string,
     at: string,
-    assignment: { reviewer: string | null; exclude: string[]; tokenHash: string } | null = null,
+    assignment: { reviewer: string | null; exclude: string[]; tokenHash: string; model?: string | null } | null = null,
   ): void {
     this.db
       .prepare(
         `INSERT OR REPLACE INTO review_requests
-           (project, pr, head_sha, slot, channel, detail, requested_at, reviewer, exclude, token_hash, used_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+           (project, pr, head_sha, slot, channel, detail, requested_at, reviewer, exclude, token_hash, used_by, model)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
       )
       .run(
         project,
@@ -649,7 +768,99 @@ export class ReviewStore {
         assignment?.reviewer ?? null,
         JSON.stringify(assignment?.exclude ?? []),
         assignment?.tokenHash ?? null,
+        assignment?.model ?? null,
       );
+  }
+
+  /**
+   * A new token (by its hash) for an unused agent request, bound to the agent
+   * now given the review: the previous token stops working. False when the
+   * request was used or doesn't exist.
+   */
+  reissueRequest(
+    project: string,
+    pr: number,
+    headSha: string,
+    slot: number,
+    issue: { reviewer: string; tokenHash: string; model: string | null; detail: string },
+  ): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE review_requests SET reviewer = ?, token_hash = ?, model = ?, detail = ?
+         WHERE project = ? AND pr = ? AND head_sha = ? AND slot = ? AND used_by IS NULL AND token_hash IS NOT NULL`,
+      )
+      .run(issue.reviewer, issue.tokenHash, issue.model, issue.detail, project, pr, headSha, slot);
+    return result.changes > 0;
+  }
+
+  /** The head Lair last saw for a PR, or null. */
+  currentHead(project: string, pr: number): string | null {
+    const row = this.db.prepare(`SELECT head_sha FROM review_prs WHERE project = ? AND pr = ?`).get(project, pr) as
+      | { head_sha: string | null }
+      | undefined;
+    return row?.head_sha ?? null;
+  }
+
+  // ============ REVIEWS BY AGENTS ============
+
+  saveAgentAssignment(record: AgentAssignmentRecord): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO review_agent_assignments
+           (project, pr, head_sha, slot, state, agent, run_id, chain_id, attempts, not_before, detail, spec, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        record.project,
+        record.pr,
+        record.headSha,
+        record.slot,
+        record.state,
+        record.agent,
+        record.runId,
+        record.chainId,
+        record.attempts,
+        record.notBefore,
+        record.detail,
+        JSON.stringify(record.spec),
+        record.updatedAt,
+      );
+  }
+
+  getAgentAssignment(project: string, pr: number, headSha: string, slot: number): AgentAssignmentRecord | null {
+    const row = this.db
+      .prepare(`SELECT * FROM review_agent_assignments WHERE project = ? AND pr = ? AND head_sha = ? AND slot = ?`)
+      .get(project, pr, headSha, slot) as AgentAssignmentRow | undefined;
+    return row ? agentAssignmentOf(row) : null;
+  }
+
+  /** A PR's agent assignments at one head, by slot. */
+  agentAssignments(project: string, pr: number, headSha: string): AgentAssignmentRecord[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM review_agent_assignments WHERE project = ? AND pr = ? AND head_sha = ? ORDER BY slot`)
+      .all(project, pr, headSha) as AgentAssignmentRow[];
+    return rows.map(agentAssignmentOf);
+  }
+
+  /** Assignments still waiting for a run or a review (every project), oldest first; at most `limit`. */
+  openAgentAssignments(limit = 500): AgentAssignmentRecord[] {
+    const states = OPEN_AGENT_STATES.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(`SELECT * FROM review_agent_assignments WHERE state IN (${states}) ORDER BY rowid LIMIT ?`)
+      .all(...OPEN_AGENT_STATES, limit) as AgentAssignmentRow[];
+    return rows.map(agentAssignmentOf);
+  }
+
+  /** The agents with an open assignment on a PR (at any head). */
+  agentsReviewing(project: string, pr: number): string[] {
+    const states = OPEN_AGENT_STATES.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT agent FROM review_agent_assignments
+         WHERE project = ? AND pr = ? AND agent IS NOT NULL AND state IN (${states})`,
+      )
+      .all(project, pr, ...OPEN_AGENT_STATES) as { agent: string }[];
+    return rows.map((r) => r.agent);
   }
 
   /** The assignment a token (by its hash) was issued for, or null. */

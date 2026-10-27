@@ -444,10 +444,13 @@ const decisionInbox = await mountDecisions(fastify, {
   producers: [watchdogs, agents],
 });
 
-// Reviews and policy merge: one per project with `review.enabled: true`
+// Reviews and policy merge: one per project with `review.enabled: true`;
+// with review.prompt_file, reviews by agents the agents module starts
 const reviews = new ReviewManager({
   dbPath: join(process.cwd(), "data", "review.db"),
   events: getEventBus(),
+  agents,
+  serverUrl: dashboardUrlFor(HOST, PORT),
 });
 reviews.load(projectEntries);
 // Merges, human reviews, finding resolutions and hold releases need the owner's session

@@ -110,6 +110,8 @@ export interface ReviewSlot {
   anyOf: ReviewerOption[];
   /** The reviewer must run on a different model from the author */
   differentModel: boolean;
+  /** Reviewer agents the agent assigner picks from for this slot (else review.reviewers_pool.<tier>) */
+  pool?: string[];
 }
 
 export interface SlotStatus {
@@ -117,6 +119,32 @@ export interface SlotStatus {
   label: string;
   satisfiedBy: { reviewId: string; reviewer: ReviewerRef } | null;
   detail: string;
+}
+
+/**
+ * Where a slot's request stands at the head:
+ * - requested: asked for (an agent run not started yet: no free reviewer, or a retry waiting for `notBefore`);
+ * - assigned: an agent's run is reviewing it;
+ * - reviewed: the assignee reviewed (whether or not that filled the slot);
+ * - failed: no review came (runs ended without one, or no agent can take it), `detail` says why;
+ * - stale: the PR moved on (a new head, or closed) before a review came.
+ */
+export type SlotAssignmentState = "requested" | "assigned" | "reviewed" | "failed" | "stale";
+
+export interface SlotAssignmentView {
+  /** Index into PrReviewStatus.slots */
+  slot: number;
+  state: SlotAssignmentState;
+  /** How it was asked for: "agents" (reviews by agents), "assigner" (the event bus), "decision" (a human) */
+  channel: string;
+  agent: string | null;
+  runId: string | null;
+  /** Agent runs started for it */
+  attempts: number;
+  maxAttempts: number | null;
+  detail: string;
+  notBefore: string | null;
+  updatedAt: string;
 }
 
 // ============ GATE, HOLDS, CONDITIONS ============
@@ -189,13 +217,17 @@ export interface PrReviewStatus {
   baseRef: string;
   defaultBranch: string | null;
   author: ReviewerRef | null;
-  /** Where the author came from: registered with Lair, or parsed from the branch name */
-  authorSource: "lair" | "branch" | null;
+  /** Where the author came from: registered with Lair, the branch name (pattern or map), or the agents fill tasks file */
+  authorSource: "lair" | "branch" | "tasks_file" | null;
+  /** Why the author is unknown when a mapping didn't settle it (e.g. two agents match the branch) */
+  authorNote?: string | null;
   /** The host account that opened the PR (agents often share one) */
   hostUser: string | null;
   labels: string[];
   risk: RiskAssessment;
   slots: SlotStatus[];
+  /** The requests at the head, per slot that was asked for (read-only) */
+  assignments?: SlotAssignmentView[];
   reviews: ReviewRecord[];
   findings: ReviewFinding[];
   gate: GateCheck[];

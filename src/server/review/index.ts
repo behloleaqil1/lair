@@ -40,4 +40,14 @@ export {
   unwiredDecisionSink,
   unwiredAssigner,
 } from "./ports.js";
-export type { DecisionSink, DecisionRequest, DecisionKind, ReviewAssigner, ReviewAssignment } from "./ports.js";
+export type {
+  DecisionSink,
+  DecisionRequest,
+  DecisionKind,
+  ReviewAssigner,
+  ReviewAssignment,
+  ReviewerRuns,
+} from "./ports.js";
+export { AgentReviewAssigner, reviewTaskId, AGENTS_CHANNEL } from "./agent-assigner.js";
+export { buildReviewPrompt, fillTemplate, FINDINGS_FORMAT } from "./prompt.js";
+export { mapAuthor, compileBranchGlob, globMatches, branchesFromTasks } from "./authors.js";

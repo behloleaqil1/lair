@@ -21,6 +21,7 @@ import { mergePr, prStatus, releaseHold, requestReviews, resolveFinding, submitO
 import {
   GATE_BADGE,
   TIER_BADGE,
+  assignmentLabel,
   findingLocation,
   mergeButtonState,
   parseFindingLines,
@@ -247,8 +248,9 @@ export function Reviews({ project, refreshKey }: Props) {
             <p style={muted}>
               Author:{" "}
               {status.author
-                ? `${status.author.id} (${status.author.kind}${status.author.model ? `, ${status.author.model}` : ""}; ${status.authorSource === "lair" ? "registered" : "from the branch name"})`
+                ? `${status.author.id} (${status.author.kind}${status.author.model ? `, ${status.author.model}` : ""}; ${status.authorSource === "lair" ? "registered" : status.authorSource === "tasks_file" ? "from the tasks file" : "from the branch name"})`
                 : "unknown"}
+              {status.authorNote && ` (${status.authorNote})`}
               {status.labels.length > 0 && ` · Labels: ${status.labels.join(", ")}`}
             </p>
           </div>
@@ -310,17 +312,31 @@ export function Reviews({ project, refreshKey }: Props) {
                   <tr>
                     <th>Required</th>
                     <th>Present at head</th>
+                    <th>Request</th>
                     <th>Detail</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {status.slots.map((s, index) => (
-                    <tr key={index}>
-                      <td>{s.label}</td>
-                      <td>{s.satisfiedBy ? <Flag ok={true} /> : <Flag ok={false} />}</td>
-                      <td style={{ fontSize: "0.85rem" }}>{s.detail}</td>
-                    </tr>
-                  ))}
+                  {status.slots.map((s, index) => {
+                    const request = assignmentLabel(status.assignments?.find((a) => a.slot === index));
+                    return (
+                      <tr key={index}>
+                        <td>{s.label}</td>
+                        <td>{s.satisfiedBy ? <Flag ok={true} /> : <Flag ok={false} />}</td>
+                        <td style={{ fontSize: "0.85rem" }}>
+                          {request ? (
+                            <>
+                              <span className={`badge ${request.badge}`}>{request.text}</span>
+                              <div style={muted}>{request.detail}</div>
+                            </>
+                          ) : (
+                            <span style={muted}>not requested</span>
+                          )}
+                        </td>
+                        <td style={{ fontSize: "0.85rem" }}>{s.detail}</td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             )}

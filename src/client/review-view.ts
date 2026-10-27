@@ -7,8 +7,44 @@ import type {
   GateStatus,
   PrReviewStatus,
   ReviewFinding,
+  SlotAssignmentState,
+  SlotAssignmentView,
   Tier,
 } from "../shared/review-types";
+
+export const ASSIGNMENT_BADGE: Record<SlotAssignmentState, string> = {
+  requested: "badge-neutral",
+  assigned: "badge-warning",
+  reviewed: "badge-success",
+  failed: "badge-error",
+  stale: "badge-neutral",
+};
+
+/**
+ * A slot's request at the head, in a few words: "requested", "assigned to
+ * <agent>", "reviewed by <agent>", "failed" or "stale", with the attempt and
+ * the run when an agent's run took it; null when it wasn't asked for.
+ */
+export function assignmentLabel(a: SlotAssignmentView | undefined): { badge: string; text: string; detail: string } | null {
+  if (!a) return null;
+  const attempt = a.maxAttempts && a.attempts > 0 ? `, attempt ${a.attempts} of ${a.maxAttempts}` : "";
+  const run = a.runId ? `run ${a.runId.slice(0, 8)}` : "";
+  let text: string;
+  switch (a.state) {
+    case "assigned":
+      text = `assigned to ${a.agent ?? "an agent"}${run ? ` (${run}${attempt})` : attempt ? ` (${attempt.slice(2)})` : ""}`;
+      break;
+    case "reviewed":
+      text = a.agent ? `reviewed by ${a.agent}` : "reviewed";
+      break;
+    case "requested":
+      text = a.notBefore && a.attempts > 0 ? `requested: retry at ${a.notBefore.slice(11, 16)} UTC` : "requested";
+      break;
+    default:
+      text = a.state;
+  }
+  return { badge: ASSIGNMENT_BADGE[a.state], text, detail: a.detail };
+}
 
 export interface MergeButtonState {
   enabled: boolean;

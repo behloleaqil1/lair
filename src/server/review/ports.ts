@@ -3,7 +3,8 @@
  *
  * - DecisionSink: raise an item in the Decision Inbox (docs/design/autonomy.md §1),
  *   e.g. "review this red-tier PR" or "a merge was refused over a private email";
- * - ReviewAssigner: hand a review (or the author's self-check) to an agent.
+ * - ReviewAssigner: hand a review (or the author's self-check) to an agent;
+ * - ReviewerRuns: the agents module, for reviews by agents (agent-assigner.ts).
  *
  * The defaults publish events on the bus, so a module that implements the
  * real thing can subscribe without touching this one; it can also be passed
@@ -11,6 +12,7 @@
  */
 import type { EventBus } from "../core/event-bus.js";
 import type { Tier } from "../../shared/review-types.js";
+import type { AgentRunState, AgentRunView, AgentsStatusView } from "../../shared/agents-types.js";
 
 export type DecisionKind =
   | "product"
@@ -52,6 +54,17 @@ export interface ReviewAssignment {
   role: "review" | "self-check";
   /** The reviewer must run on a model other than this one */
   differentModelFrom: string | null;
+  /** The slot needs a model other than the author's (`differentModelFrom` is null when that model is unknown) */
+  differentModel: boolean;
+  /** The slot's index in the tier's reviewers */
+  slot: number;
+  /** The PR's author, when known */
+  author: string | null;
+  /** Reviewer agents to pick a peer from: the slot's pool, else review.reviewers_pool.<tier> */
+  pool: string[] | null;
+  repo: string;
+  base: string;
+  url: string | null;
   reason: string;
   /**
    * The assignment token: give it only to the agent that does the review,
@@ -63,8 +76,30 @@ export interface ReviewAssignment {
 }
 
 export interface ReviewAssigner {
-  /** `agent`: the agent it was given to, when the assigner knows (it then binds the token) */
-  assign(assignment: ReviewAssignment): Promise<{ assigned: boolean; agent: string | null; detail: string }>;
+  /**
+   * `agent`: the agent it was given to, when the assigner knows (it then binds
+   * the token); `model`: the model that agent runs on, when the assigner
+   * started its run (recorded with its review instead of the model the review
+   * claims); `channel`: how it was handed on, for the request record.
+   */
+  assign(
+    assignment: ReviewAssignment,
+  ): Promise<{ assigned: boolean; agent: string | null; detail: string; model?: string | null; channel?: string }>;
+}
+
+/**
+ * What reviews by agents need from the agents module (AgentsManager has it):
+ * the in-process run request, the agents' states and profiles, and a chain's
+ * runs, to see a review run end.
+ */
+export interface ReviewerRuns {
+  requestRun(
+    project: string,
+    input: { agent: string; task: string; prompt: string; variables: Record<string, string> },
+  ): Promise<AgentRunView>;
+  status(project: string): AgentsStatusView;
+  managedRuns(project: string): ReadonlyMap<string, unknown>;
+  getStore(): { chainRuns(chainId: string): { id: string; state: AgentRunState; detail: string }[] } | null;
 }
 
 /** For a server without an event bus: nothing receives the request, and the result says so. */
