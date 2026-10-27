@@ -246,6 +246,11 @@ export class DeliveryManager implements ContainerServices {
     return [...this.deliveries.keys()];
   }
 
+  /** A method, so a check after an await reads the phase again (stop() may have run meanwhile). */
+  private inPhase(phase: "loaded" | "started" | "stopped"): boolean {
+    return this.phase === phase;
+  }
+
   /**
    * Apply a project's new config (src/server/reload/): its delivery drains
    * (the operation in progress finishes, new ones get 409), then the new one
@@ -254,16 +259,16 @@ export class DeliveryManager implements ContainerServices {
    * delivery is either running or off. A shutdown during the drain wins.
    */
   async reloadProject(entry: ProjectEntry): Promise<void> {
-    if (this.phase === "stopped") return;
+    if (this.inPhase("stopped")) return;
     const old = this.deliveries.get(entry.name);
     if (old) await old.drain();
-    if (this.phase === "stopped") return;
+    if (this.inPhase("stopped")) return;
     this.deliveries.delete(entry.name);
     this.problems.delete(entry.name);
     this.readOnly.delete(entry.name);
     this.load([entry]);
     const next = this.deliveries.get(entry.name);
-    if (!next || this.phase !== "started") return;
+    if (!next || !this.inPhase("started")) return;
     try {
       next.start();
     } catch (e) {

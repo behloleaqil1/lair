@@ -555,6 +555,11 @@ export class WatchdogManager {
     return [...this.watchdogs.keys()];
   }
 
+  /** A method, so a check after an await reads the phase again (stop() may have run meanwhile). */
+  private inPhase(phase: "loaded" | "started" | "stopped"): boolean {
+    return this.phase === phase;
+  }
+
   /**
    * Apply a project's new config (src/server/reload/): its watchdog stops as
    * on shutdown (a tick in progress ends early and no further action
@@ -563,10 +568,10 @@ export class WatchdogManager {
    * thrown, so the project's watchdog is either running or off.
    */
   async reloadProject(entry: ProjectEntry): Promise<void> {
-    if (this.phase === "stopped") return;
+    if (this.inPhase("stopped")) return;
     const old = this.watchdogs.get(entry.name);
     if (old) await old.stop();
-    if (this.phase === "stopped") return;
+    if (this.inPhase("stopped")) return;
     this.watchdogs.delete(entry.name);
     this.problems.delete(entry.name);
     this.load([entry]);
@@ -574,7 +579,7 @@ export class WatchdogManager {
     if (!next) return;
     try {
       if (this.decisions) next.useDecisions(this.decisions);
-      if (this.phase === "started") next.start();
+      if (this.inPhase("started")) next.start();
     } catch (e) {
       await next.stop();
       this.watchdogs.delete(entry.name);

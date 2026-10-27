@@ -2388,6 +2388,11 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
     return [...this.services.keys()];
   }
 
+  /** A method, so a check after an await reads the phase again (stop() may have run meanwhile). */
+  private inPhase(phase: "loaded" | "started" | "stopped"): boolean {
+    return this.phase === phase;
+  }
+
   /**
    * Apply a project's new config (src/server/reload/): its service stops as
    * on shutdown (the tick or action in progress finishes; the agents keep
@@ -2396,7 +2401,7 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
    * that fails to start is stopped and removed before the error is thrown.
    */
   async reloadProject(entry: ProjectEntry): Promise<void> {
-    if (this.phase === "stopped") return;
+    if (this.inPhase("stopped")) return;
     this.stopFollowing.get(entry.name)?.();
     this.stopFollowing.delete(entry.name);
     const old = this.services.get(entry.name);
@@ -2404,7 +2409,7 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
       await old.stop();
       old.dispose();
     }
-    if (this.phase === "stopped") return;
+    if (this.inPhase("stopped")) return;
     this.services.delete(entry.name);
     this.problems.delete(entry.name);
     this.configs.delete(entry.name);
@@ -2413,7 +2418,7 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
     if (!next) return;
     try {
       this.follow(entry.name, next);
-      if (this.phase === "started") next.start();
+      if (this.inPhase("started")) next.start();
     } catch (e) {
       this.stopFollowing.get(entry.name)?.();
       this.stopFollowing.delete(entry.name);
