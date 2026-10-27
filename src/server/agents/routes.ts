@@ -7,12 +7,13 @@
  *   POST /api/agents/runs?project=               {agent, task, prompt, model?}: claim the task, start on the next tick
  *   POST /api/agents/claims/release?project=     {task, confirm: true}: the run holding it stops itself
  *   POST /api/agents/runs/:id/fresh-session?project=  {confirm: true}
- *   POST /api/agents/tick?project=               check now
+ *   POST /api/agents/tick?project=               check now (and a fill check, when agents.fill is on)
+ *   POST /api/agents/fill/release?project=       {task, confirm: true}: fill starts a task it holds for the owner again
  *   GET  /api/agents/prompts?project=            owner: the files in prompts_dir (basenames, sizes, times)
  *   GET  /api/agents/prompts/file?name=&project= owner: one of them, by basename: {name, size, text}
  *
  * Every POST is the owner's (starting a run, releasing a claim, a fresh
- * session, an early check): it needs an owner session (src/server/human-auth/,
+ * session, an early check, releasing a fill hold): it needs an owner session (src/server/human-auth/,
  * the X-Lair-Owner-Session header from the dashboard), so an agent, or any
  * other local process, can't put a prompt into a task or stop a peer's run.
  * So are the two prompt reads, which read files from disk (prompts.ts: a
@@ -20,7 +21,8 @@
  * a run's prompt). The service's own timer ticks in-process.
  * /api/agents is in OWNER_ONLY_PREFIXES (no CORS). Modules that start runs do
  * it in-process (AgentsManager.requestRun), not over HTTP. The two actions
- * that stop work also need `confirm: true` (the Agents view asks first).
+ * that stop work, and releasing a fill hold (it starts work), also need
+ * `confirm: true` (the Agents view asks first).
  * `?project=` is validated by the root guards (src/server/root-guards.ts);
  * without it the default project is used.
  */
@@ -60,6 +62,8 @@ const CONFIRM_RELEASE =
   "Releasing a claim stops the run that holds it: send confirm: true to release it";
 const CONFIRM_FRESH =
   "A fresh session stops the run and moves its session aside: send confirm: true to start one";
+const CONFIRM_FILL_RELEASE =
+  "Releasing a fill hold lets fill start the task again: send confirm: true to release it";
 
 export async function registerAgentsRoutes(
   fastify: FastifyInstance,
@@ -213,7 +217,22 @@ export async function registerAgentsRoutes(
       const service = serviceOf(reply, projectOf(query.data));
       if (!service) return reply;
       try {
-        return respond(await service.tick());
+        return respond(await service.checkNow());
+      } catch (e) {
+        return handleError(reply, e);
+      }
+    });
+
+    app.post("/api/agents/fill/release", ownerOnly, async (request, reply) => {
+      const query = ProjectQuery.safeParse(request.query ?? {});
+      if (!query.success) return fail(reply, 400, `Invalid query: ${query.error.issues[0].path.join(".")}`);
+      const body = ReleaseBody.safeParse(request.body ?? {});
+      if (!body.success || !isValidTaskId(body.data.task)) return fail(reply, 400, "Invalid body: {task, confirm: true}");
+      if (body.data.confirm !== true) return fail(reply, 400, CONFIRM_FILL_RELEASE);
+      const service = serviceOf(reply, projectOf(query.data));
+      if (!service) return reply;
+      try {
+        return respond(await service.releaseFillHold(body.data.task));
       } catch (e) {
         return handleError(reply, e);
       }

@@ -50,6 +50,7 @@ import {
   promptFileUrl,
   promptsUrl,
   releaseClaimAction,
+  releaseFillHoldAction,
   startRunAction,
 } from "../../client/agents-actions";
 import { readLock } from "./locks.js";
@@ -1488,36 +1489,36 @@ describe("8. wiring: the router and the service's own tick", () => {
 
 // ============ 9. THE DECISION INBOX ============
 
-describe("9. the Decision Inbox: decisions are raised there, and the owner's answers resume or stand down the work", () => {
-  /** The agents routes and the real Decision Inbox, mounted as src/server/index.ts does. */
-  async function withInbox(h: Harness, options: { maxOpenPerSource?: number } = {}) {
-    const app = Fastify();
-    const tokenPath = join(h.dir, "data", "owner.token");
-    const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
-    await registerOwnerRoutes(app, auth);
-    const inbox = await mountDecisions(app, {
-      dbPath: ":memory:",
-      humanAuth: auth,
-      defaultProject: () => "demo",
-      clock: h.clock,
-      producers: [h.manager],
-      ...options,
-    });
-    await registerAgentsRoutes(app, h.manager, () => "demo", auth);
-    await app.ready();
-    apps.push(app);
-    const signIn = await app.inject({
-      method: "POST",
-      url: "/api/owner/sessions",
-      headers: DASHBOARD,
-      payload: { token: readFileSync(tokenPath, "utf-8").trim() },
-    });
-    const owner: Record<string, string> = { ...DASHBOARD, [OWNER_SESSION_HEADER]: signIn.json().data.session as string };
-    const answer = (id: string, payload: Record<string, unknown>) =>
-      app.inject({ method: "POST", url: `/api/decisions/${id}/answer`, headers: owner, payload });
-    return { app, inbox, answer };
-  }
+/** The agents routes and the real Decision Inbox, mounted as src/server/index.ts does. */
+async function withInbox(h: Harness, options: { maxOpenPerSource?: number } = {}) {
+  const app = Fastify();
+  const tokenPath = join(h.dir, "data", "owner.token");
+  const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
+  await registerOwnerRoutes(app, auth);
+  const inbox = await mountDecisions(app, {
+    dbPath: ":memory:",
+    humanAuth: auth,
+    defaultProject: () => "demo",
+    clock: h.clock,
+    producers: [h.manager],
+    ...options,
+  });
+  await registerAgentsRoutes(app, h.manager, () => "demo", auth);
+  await app.ready();
+  apps.push(app);
+  const signIn = await app.inject({
+    method: "POST",
+    url: "/api/owner/sessions",
+    headers: DASHBOARD,
+    payload: { token: readFileSync(tokenPath, "utf-8").trim() },
+  });
+  const owner: Record<string, string> = { ...DASHBOARD, [OWNER_SESSION_HEADER]: signIn.json().data.session as string };
+  const answer = (id: string, payload: Record<string, unknown>) =>
+    app.inject({ method: "POST", url: `/api/decisions/${id}/answer`, headers: owner, payload });
+  return { app, inbox, answer, owner };
+}
 
+describe("9. the Decision Inbox: decisions are raised there, and the owner's answers resume or stand down the work", () => {
   it("an escalated task is a decision; 'fresh_session' starts it again, and when that fails too it asks again", async () => {
     const h = setup();
     const { inbox, answer } = await withInbox(h);
@@ -1993,11 +1994,14 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(h.spawner.calls).toHaveLength(1);
 
     // The owner reopens feat-old: its DONE line is older than this start, so once the
-    // run ends (exit 0) without a new one, fill starts the task again
+    // run ends (exit 0) without a new one, fill starts the task again, after the backoff
     await request(h, "worker-b", "feat-old", "Redo the old work");
     await at(h, 7 * MIN); // pid 5002
     h.spawner.exit(5002, 0);
     await at(h, 8 * MIN);
+    await check(h);
+    expect(lineOf(h.service.status().fill, "feat-old")).toMatchObject({ state: "held", hold: "backoff" });
+    h.clock.t = NOW + 9 * MIN;
     await check(h);
     expect(lineOf(h.service.status().fill, "feat-old")).toMatchObject({ state: "started" });
     expect(runs(h)[runs(h).length - 1]).toMatchObject({ agent: "worker-b", task: "feat-old", origin: "fill", state: "queued" });
@@ -2220,10 +2224,14 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(h.spawner.calls.map((c) => c.env.LAIR_SESSION_MODE)).toEqual(["new", "resume", "resume", "fresh"]);
     expect(eventsOf(h, "fill_started")).toHaveLength(1);
     const line = lineOf(h.service.status().fill, "feat-login");
-    expect(line.state).toBe("held");
-    expect(line.detail).toContain("fill leaves the task to the owner");
+    expect(line).toMatchObject({ state: "held", hold: "owner", releasable: true });
+    expect(line.detail).toContain("fill leaves the task to you");
     expect(h.store.getClaim("demo", "feat-login")).toBeNull();
     expect(eventsOf(h, "fill_held").map((e) => e.data.hold)).toEqual(["owner"]);
+    // The chain's own escalation is the owner's decision: fill doesn't raise a second one for it
+    const entries = inboxEntries(h);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toContain("Agent worker-a could not finish task feat-login");
   });
 
   it("the fill loop runs on its own and stops with the module, killing a capacity_cmd in progress", async () => {
@@ -2248,7 +2256,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     };
 
     expect(h.manager.start()).toEqual(["demo"]);
-    expect(h.service.fillRunning).toBe(true);
+    expect(h.service.status().fill?.running).toBe(true);
     for (let i = 0; i < 300 && h.runner.calls.length < 2; i++) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
@@ -2257,11 +2265,183 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
 
     await h.manager.stop();
     expect(killed).toBe(true);
-    expect(h.service.fillRunning).toBe(false);
-    // No check runs after the stop
+    // The module is off for the project now, and no check runs after the stop
+    expect(h.manager.status("demo")).toMatchObject({ enabled: false, running: false });
     await new Promise((resolve) => setTimeout(resolve, 1500));
     expect(h.runner.calls).toHaveLength(2);
   }, 10_000);
+
+  it("a run that exits 0 without the done line starts again after a backoff, then is held with one decision and its last output", async () => {
+    const h = setup(fill({ agents: ["worker-a"], max_completions_without_done: 3, backoff_seconds: 60, max_backoff_seconds: 600 }));
+    const { inbox, answer } = await withInbox(h);
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    // An adapter that stops on a usage limit with exit 0, and never writes the done line
+    h.spawner.behaviour = (pid, log) => {
+      writeLog(h.clock, log, "working on it\nusage limit reached for today\n");
+      h.spawner.exit(pid, 0);
+    };
+    const startAndEnd = async (ms: number) => {
+      h.clock.t = NOW + ms;
+      await check(h); // requested
+      await at(h, ms); // spawned; it exits at once
+      await at(h, ms + MIN); // the tick sees it: completed
+    };
+
+    await startAndEnd(0);
+    let line = lineOf(await check(h), "feat-login");
+    expect(line).toMatchObject({ state: "held", hold: "backoff", releasable: false });
+    expect(line.detail).toContain("(1 of 3): starting it again at 2026-03-02T12:02:00.000Z");
+    h.clock.t = NOW + 90 * SEC;
+    expect(lineOf(await check(h), "feat-login").hold).toBe("backoff");
+    expect(runs(h)).toHaveLength(1);
+
+    await startAndEnd(2 * MIN); // ends at +3 min; the backoff doubles
+    expect(lineOf(await check(h), "feat-login").detail).toContain("(2 of 3): starting it again at 2026-03-02T12:05:00.000Z");
+    await startAndEnd(5 * MIN); // the third in a row
+    line = lineOf(await check(h), "feat-login");
+    expect(line).toMatchObject({ state: "held", hold: "no_done", releasable: true });
+    expect(line.detail).toContain("its last 3 run(s) exited 0 without reporting it done");
+    expect(runs(h).map((r) => r.state)).toEqual(["completed", "completed", "completed"]);
+
+    // One decision, with the runs and their last output
+    const [asked, ...more] = inbox.list({ project: "demo", status: "open" });
+    expect(more).toEqual([]);
+    expect(asked).toMatchObject({
+      kind: "escalation",
+      key: `fill:feat-login:${runs(h)[2].id}`,
+      source: { module: "agents", ref: "fill:feat-login" },
+      recommended: { optionId: "keep_held" },
+    });
+    expect(asked.options.map((o) => o.id)).toEqual(["start_again", "keep_held"]);
+    expect(asked.title).toBe("Fill holds task feat-login: worker-a's last 3 run(s) exited 0 without reporting it done");
+    expect(asked.context).toContain("usage limit reached for today");
+    // Held: no more runs and no second decision, however long it waits
+    for (const minute of [10, 60, 600]) {
+      h.clock.t = NOW + minute * MIN;
+      await check(h);
+      await h.service.tick();
+    }
+    expect(h.spawner.calls).toHaveLength(3);
+    expect(inbox.list({ project: "demo", status: "open" })).toHaveLength(1);
+
+    // The owner lets fill start it again: it counts from zero
+    expect((await answer(asked.id, { optionId: "start_again" })).statusCode).toBe(200);
+    expect(eventsOf(h, "fill_released").map((e) => e.data.by)).toEqual(["decision"]);
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "started" });
+    expect(runs(h)).toHaveLength(4);
+  });
+
+  it("done is kept once seen: a rotated or truncated queue file doesn't restart the task; an edited line clears it", async () => {
+    const h = setup(fill({ agents: ["worker-a"] }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    await check(h);
+    await at(h, 0); // pid 5001
+    appendFileSync(h.queueFile, "- DONE feat-login by worker-a 12:05Z: merged\n");
+    h.spawner.exit(5001, 0);
+    await at(h, MIN);
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "done" });
+    expect(eventsOf(h, "fill_done")).toHaveLength(1);
+
+    // Rotated, then truncated: still done
+    writeFileSync(h.queueFile, "# Queue (rotated)\n- PROGRESS other-task by worker-b\n");
+    let line = lineOf(await check(h), "feat-login");
+    expect(line.state).toBe("done");
+    expect(line.detail).toBe("done: - DONE feat-login by worker-a 12:05Z: merged (seen 2026-03-02T12:01:00.000Z)");
+    writeFileSync(h.queueFile, "");
+    for (let i = 0; i < 3; i++) await check(h);
+    expect(lineOf(h.service.status().fill, "feat-login").state).toBe("done");
+    expect(eventsOf(h, "fill_done")).toHaveLength(1);
+    expect(runs(h)).toHaveLength(1);
+
+    // An edited line is a new task card: what was done for the old one no longer counts
+    tasks(h, "worker-a|Alice|feat-login|Login form, now with a remember-me box");
+    h.clock.t = NOW + 3 * MIN; // past the backoff after a run that ended without a done line
+    line = lineOf(await check(h), "feat-login");
+    expect(line.state).toBe("started");
+    expect(runs(h)).toHaveLength(2);
+  });
+
+  it("the done check reads queue lines as the module does: trimmed, DONE in any case, the task id exact", async () => {
+    const h = setup(fill());
+    prompts(h);
+    appendFileSync(
+      h.queueFile,
+      "   -  done feat-a by worker-a 11:00Z: merged   \n- DONE FEAT-B by worker-b 11:05Z: merged\n- DONE feat-b-2 by worker-b\n",
+    );
+    tasks(h, "worker-a|Alice|feat-a|", "worker-b|Bob|feat-b|");
+
+    const status = await check(h);
+
+    expect(lineOf(status, "feat-a")).toMatchObject({ state: "done", detail: "done: - done feat-a by worker-a 11:00Z: merged" });
+    // FEAT-B and feat-b-2 are other tasks
+    expect(lineOf(status, "feat-b")).toMatchObject({ state: "started" });
+  });
+
+  it("an owner hold is shown and is the owner's to lift: a claim lost to another holder asks once; the owner releases it over HTTP", async () => {
+    const h = setup(fill());
+    const { inbox, app, owner } = await withInbox(h);
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form", "worker-b|Bob|feat-search|Search page");
+    await check(h);
+    await at(h, 0); // both run: 5001 and 5002
+    const [login, search] = runs(h);
+
+    // The owner releases feat-login's claim; another process takes feat-search's, then lets it go
+    await h.service.releaseClaim("feat-login");
+    h.procs.add(4242, "another-launcher", NOW);
+    h.store.claim("demo", "feat-search", "other-run", "worker-b", { pid: 4242, startedAt: NOW }, NOW, () => false);
+    await at(h, 10 * SEC); // both stop themselves
+    await at(h, 20 * SEC); // and end
+    expect(runs(h).map((r) => r.state)).toEqual(["lost_claim", "lost_claim"]);
+    h.store.releaseClaim("demo", "feat-search", "other-run");
+
+    const status = await check(h);
+    expect(lineOf(status, "feat-login")).toMatchObject({ state: "held", hold: "owner", releasable: true, runId: login.id });
+    expect(lineOf(status, "feat-search")).toMatchObject({ state: "held", hold: "owner", releasable: true, runId: search.id });
+    expect(lineOf(status, "feat-search").detail).toContain("lost its claim");
+    // Only the claim the owner didn't release asks: once
+    await check(h);
+    const open = inbox.list({ project: "demo", status: "open" });
+    expect(open.map((d) => d.key)).toEqual([`fill:feat-search:${search.id}`]);
+    expect(open[0].title).toBe(`Fill holds task feat-search: run ${search.id.slice(0, 8)} of worker-b lost its claim, and you did not release it`);
+
+    // Releasing a hold is the owner's, and confirmed
+    const release = releaseFillHoldAction("demo", "feat-login", "worker-a");
+    expect((await postAs(app, release.url, release.body, DASHBOARD)).statusCode).toBe(403);
+    expect((await app.inject({ method: "POST", url: release.url, headers: owner, payload: { task: "feat-login" } })).statusCode).toBe(400);
+    const sent = ownerRequest(release.body, { [OWNER_SESSION_HEADER]: owner[OWNER_SESSION_HEADER] });
+    const released = await app.inject({ url: release.url, ...sent, headers: { ...DASHBOARD, ...sent.headers } });
+    expect(released.statusCode).toBe(200);
+    expect(released.json().data).toEqual({ task: "feat-login", runId: login.id });
+
+    const after = await check(h);
+    expect(lineOf(after, "feat-login")).toMatchObject({ state: "started" });
+    expect(lineOf(after, "feat-search")).toMatchObject({ state: "held", hold: "owner" });
+    // A task that isn't held for the owner has nothing to release
+    const again = await app.inject({ url: release.url, ...sent, headers: { ...DASHBOARD, ...sent.headers } });
+    expect(again.statusCode).toBe(409);
+    const served = (await app.inject({ url: "/api/agents/status?project=demo" })).json().data as AgentsStatusView;
+    expect(served.fill?.lines.map((l) => [l.task, l.state, l.hold, l.releasable])).toEqual([
+      ["feat-login", "started", null, false],
+      ["feat-search", "held", "owner", true],
+    ]);
+  });
+
+  it("the owner's check now (POST /api/agents/tick) runs a fill check too", async () => {
+    const h = setup(fill({ agents: ["worker-a"] }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    const app = await http(h);
+    expect(h.service.status().fill?.lastCheck).toBeNull();
+
+    const tick = await post(app, "/api/agents/tick?project=demo");
+
+    expect(tick.statusCode).toBe(200);
+    expect(h.service.status().fill?.lastCheck).toBe(new Date(NOW).toISOString());
+    expect(runs(h)).toMatchObject([{ task: "feat-login", origin: "fill", state: "queued" }]);
+  });
 
   it("a store from before fill (schema version 1) gains the task index; its runs are found by task", () => {
     const paths = makePaths();

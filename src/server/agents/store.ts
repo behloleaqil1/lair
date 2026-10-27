@@ -16,9 +16,10 @@ import { ACTIVE_STATES, type AgentEvent, type AgentRun, type Claim, type UsageRe
 import type { ProcessOwner } from "./probes.js";
 
 /**
- * 1: runs, claims, events, usage. 2: idx_agents_runs_task (fill looks up a
- * task's latest run). Every statement is IF NOT EXISTS, so running SCHEMA
- * migrates any older version.
+ * 1: runs, claims, events, usage. 2: idx_agents_runs_task,
+ * idx_agents_events_task and idx_agents_events_run (fill looks up a task's
+ * runs, releases and claim releases on every check). Every statement is IF
+ * NOT EXISTS, so running SCHEMA migrates any older version.
  */
 export const SCHEMA_VERSION = 2;
 
@@ -64,6 +65,8 @@ const SCHEMA = `
     at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_agents_events_project ON agents_events(project, at);
+  CREATE INDEX IF NOT EXISTS idx_agents_events_task ON agents_events(project, task, kind, at);
+  CREATE INDEX IF NOT EXISTS idx_agents_events_run ON agents_events(project, run_id);
   CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_events_dedupe
     ON agents_events(project, dedupe_key) WHERE dedupe_key IS NOT NULL;
 
@@ -237,6 +240,17 @@ export class AgentsStore {
     );
   }
 
+  /** The first runs of a task's newest chains (a chain's id is its first run's), newest first. */
+  chainHeadsForTask(project: string, task: string, limit: number): AgentRun[] {
+    return this.runs(
+      `SELECT data FROM agents_runs WHERE project = ? AND task = ? AND id = chain_id
+       ORDER BY requested_at DESC, rowid DESC LIMIT ?`,
+      project,
+      task,
+      limit,
+    );
+  }
+
   /** A chain's runs, first attempt first. */
   chainRuns(chainId: string): AgentRun[] {
     return this.runs(`SELECT data FROM agents_runs WHERE chain_id = ? ORDER BY requested_at, rowid`, chainId);
@@ -387,10 +401,26 @@ export class AgentsStore {
     );
   }
 
+  /** The event recorded with this dedupe key, or null. */
+  getEventByKey(project: string, dedupeKey: string): AgentEvent | null {
+    const row = this.db
+      .prepare(`SELECT * FROM agents_events WHERE project = ? AND dedupe_key = ?`)
+      .get(project, dedupeKey) as EventRow | undefined;
+    return row ? toEvent(row) : null;
+  }
+
   /** A project's events, newest first. */
   listEvents(
     project: string,
-    options: { kinds?: readonly AgentEventKind[]; agent?: string; subject?: string; since?: number; limit?: number } = {},
+    options: {
+      kinds?: readonly AgentEventKind[];
+      agent?: string;
+      task?: string;
+      runId?: string;
+      subject?: string;
+      since?: number;
+      limit?: number;
+    } = {},
   ): AgentEvent[] {
     const where = ["project = ?"];
     const params: (string | number)[] = [project];
@@ -401,6 +431,14 @@ export class AgentsStore {
     if (options.agent !== undefined) {
       where.push("agent = ?");
       params.push(options.agent);
+    }
+    if (options.task !== undefined) {
+      where.push("task = ?");
+      params.push(options.task);
+    }
+    if (options.runId !== undefined) {
+      where.push("run_id = ?");
+      params.push(options.runId);
     }
     if (options.subject !== undefined) {
       where.push("subject = ?");

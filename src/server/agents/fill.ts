@@ -9,21 +9,32 @@
  * - started when a run of its agent on its task is active;
  * - claimed when another agent's run, or any other claim, holds the task;
  * - done when done_pattern matches a queue line written since the task's
- *   last chain was requested (the whole file for a task with no run);
- * - held, with the reason, when its task's last run ended other than
- *   completed (escalated, stopped by the owner, its claim released: the
- *   owner's to resume, so fill never loops on it), its agent is busy, the
- *   project is read_only, max_active runs fill started are active,
- *   capacity_cmd says no, a prompt file is refused, or the request is;
+ *   last chain was requested (the whole file for a task with no run). Once
+ *   seen, done is kept in the store (a fill_done event for the task's latest
+ *   run and the line as written), so a rotated or truncated queue file never
+ *   restarts a finished task; a new run of the task, or an edited line,
+ *   clears it;
+ * - held, with the reason, when:
+ *   - owner: its last run ended other than completed (escalated, stopped by
+ *     the owner, its claim lost). The owner's to resume; a claim lost without
+ *     the owner releasing it raises a decision (an escalated chain already
+ *     raised its own);
+ *   - no_done / backoff: its runs exited 0 without reporting it done. It is
+ *     started again after a backoff (fill.backoff_seconds, doubling), and
+ *     after fill.max_completions_without_done of them in a row it is held and
+ *     one decision is raised, with the last output;
+ *   - busy, read_only, max_active, capacity (capacity_cmd), prompt (a
+ *     refused prompt file) or refused (the run request);
+ *   the owner releases an owner or no_done hold from the Agents view, or by
+ *   answering the decision;
  * - otherwise started: the prompt is built from prompt_files and the run is
  *   requested through AgentsService.requestRun, the module's in-process path,
  *   so claims, locks, never-started retries, recovery, failover and budgets
- *   apply to it as to any run. A task whose run completed (exit 0) without
- *   reporting done is started again on the next check.
+ *   apply to it as to any run.
  * Input is bounded: the tasks file (256 KB, 200 tasks, 2000 characters a
  * line), each prompt file (200 KB, a regular file inside prompts_dir with no
  * symlink out of it) and the queue file (its last 4 MB, lines cut at 1000
- * characters before done_pattern sees them).
+ * characters and trimmed before done_pattern sees them).
  */
 import { createHash } from "crypto";
 import { closeSync, constants, fstatSync, openSync, readSync, realpathSync } from "fs";
@@ -32,24 +43,33 @@ import type { ProjectConfig } from "../../shared/types.js";
 import type {
   AgentEventKind,
   AgentRunView,
+  FillHold,
   FillLineState,
   FillLineView,
   FillStatusView,
 } from "../../shared/agents-types.js";
 import { isValidDragonId } from "../parsers/dragon-config.js";
 import { getPromptsDir } from "../routes/controls.js";
-import { donePatternFor, type FillSettings } from "./config.js";
+import { backoffMs, doneLineMatches, donePatternFor, type FillSettings } from "./config.js";
+import type { DecisionRequest } from "./decisions.js";
 import type { AgentProbes } from "./probes.js";
+import { MAX_PROMPT_FILE_BYTES } from "./prompts.js";
+import { lastLines, readTail } from "./sessions.js";
 import type { AgentsStore } from "./store.js";
-import { isActive, isValidTaskId, type QueueMark } from "./types.js";
+import { isActive, isValidTaskId, type AgentRun, type QueueMark } from "./types.js";
 
 export const MAX_TASKS_FILE_BYTES = 256 * 1024;
 export const MAX_TASK_LINES = 200;
 export const MAX_TASK_LINE_CHARS = 2000;
-export const MAX_PROMPT_FILE_BYTES = 200_000;
 const QUEUE_MAX_BYTES = 4 * 1024 * 1024;
 const QUEUE_LINE_CHARS = 1000;
 const MARK_TAIL_BYTES = 256;
+
+/** The decision options fill offers for a task it holds for the owner */
+export const DECISION_FILL_START = "start_again";
+export const DECISION_FILL_KEEP = "keep_held";
+/** Holds only the owner lifts (POST /api/agents/fill/release, or the decision) */
+export const OWNER_HOLDS: readonly FillHold[] = ["owner", "no_done"];
 
 const short = (id: string) => id.slice(0, 8);
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -58,6 +78,10 @@ const oneLine = (text: string, max = 200) => {
   return flat.length > max ? `${flat.slice(0, max)}...` : flat;
 };
 const sha256 = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+const iso = (ms: number) => new Date(ms).toISOString();
+
+/** The key of a fill decision about `task` while `runId` is its latest run (the task id may hold ':'; a run id doesn't). */
+export const fillDecisionKey = (task: string, runId: string) => `fill:${task}:${runId}`;
 
 // ============ FILES ============
 
@@ -135,7 +159,7 @@ export function queueMark(path: string): QueueMark {
   }
 }
 
-/** The queue file's lines at one check (its last 4 MB), each with the offset it starts at. */
+/** The queue file's lines at one check (its last 4 MB), trimmed, each with the offset it starts at. */
 class QueueLines {
   private lines: { start: number; text: string }[] = [];
   private size = 0;
@@ -157,8 +181,8 @@ class QueueLines {
           const text = bytes
             .subarray(pos, Math.min(end, pos + QUEUE_LINE_CHARS * 4))
             .toString("utf-8")
-            .replace(/\r$/, "")
-            .slice(0, QUEUE_LINE_CHARS);
+            .slice(0, QUEUE_LINE_CHARS)
+            .trim();
           this.lines.push({ start: begin + pos, text });
         }
         pos = end + 1;
@@ -172,13 +196,13 @@ class QueueLines {
 
   /**
    * The first line written after `mark` (the whole window without a usable
-   * mark) that contains the task id and that `pattern` matches.
+   * mark) that reports the task done (doneLineMatches).
    */
   find(pattern: RegExp, task: string, mark: QueueMark | undefined): string | null {
     const from = mark && this.usable(mark) ? mark.offset : 0;
     for (const line of this.lines) {
       if (line.start < from || !line.text.includes(task)) continue;
-      if (pattern.test(line.text)) return line.text;
+      if (doneLineMatches(pattern, task, line.text)) return line.text;
     }
     return null;
   }
@@ -262,6 +286,11 @@ export function parseTasksFile(content: string): TasksFileEntry[] {
   return entries;
 }
 
+/** A tasks_file line as written (its fields trimmed): a done task stays done while it is unchanged. */
+function lineHash(entry: { agent: string; name: string; task: string; description: string }): string {
+  return sha256(Buffer.from([entry.agent, entry.name, entry.task, entry.description].join("\u0000"), "utf-8")).slice(0, 16);
+}
+
 // ============ PROMPTS ============
 
 export type PromptResult = { ok: true; text: string; files: string[] } | { ok: false; reason: string };
@@ -322,7 +351,10 @@ export interface FillEventInput {
   summary: string;
   evidence?: string[];
   data?: Record<string, unknown>;
+  dedupeKey?: string;
 }
+
+export type FillDecision = Omit<DecisionRequest, "project" | "requestedBy">;
 
 export interface AgentsFillOptions {
   project: string;
@@ -337,9 +369,9 @@ export interface AgentsFillOptions {
   requestRun: (input: { agent: string; task: string; prompt: string }) => Promise<AgentRunView>;
   /** Record an event in the store, and on the bus */
   record: (kind: AgentEventKind, input: FillEventInput, at: number) => Promise<boolean>;
+  /** Raise a decision in the Decision Inbox, once per key (AgentsService's) */
+  raise: (request: FillDecision, run: AgentRun) => Promise<boolean>;
 }
-
-type Hold = "owner" | "busy" | "read_only" | "max_active" | "capacity" | "prompt" | "refused";
 
 function firstLine(text: string): string | null {
   const line = text
@@ -348,6 +380,11 @@ function firstLine(text: string): string | null {
     .map((l) => l.trim())
     .find((l) => l.length > 0);
   return line ? oneLine(line) : null;
+}
+
+/** The last lines of a run's log, for a decision's context (text the agent wrote: cut, one line each). */
+function lastOutput(run: AgentRun): string[] {
+  return run.logPath ? lastLines(readTail(run.logPath, 8192), 10).map((line) => oneLine(line)) : [];
 }
 
 export class AgentsFill {
@@ -359,7 +396,7 @@ export class AgentsFill {
   private lastCheck: number | null = null;
   private lastError: string | null = null;
   /** The hold each held line is in (agent|task -> hold): fill_held is recorded when it changes */
-  private holds = new Map<string, Hold>();
+  private holds = new Map<string, FillHold>();
 
   constructor(private options: AgentsFillOptions) {}
 
@@ -383,10 +420,15 @@ export class AgentsFill {
       maxActive: settings.maxActive,
       active: this.activeCount(),
       intervalSeconds: settings.intervalSeconds,
-      lastCheck: this.lastCheck === null ? null : new Date(this.lastCheck).toISOString(),
+      lastCheck: this.lastCheck === null ? null : iso(this.lastCheck),
       lastError: this.lastError,
       lines: this.lines,
     };
+  }
+
+  /** The task's line at the last check, if there is one. */
+  lineFor(task: string): FillLineView | null {
+    return this.lines.find((line) => line.task === task) ?? null;
   }
 
   /** Active runs (any attempt) of the chains fill started. */
@@ -436,7 +478,7 @@ export class AgentsFill {
     this.abort = abort;
     const now = this.options.probes.clock.now();
     try {
-      this.lines = await this.evaluate(abort.signal);
+      this.lines = await this.evaluate(abort.signal, now);
       this.lastError = abort.signal.aborted ? "the check was interrupted: the module stopped" : null;
     } catch (e) {
       const error = message(e);
@@ -449,7 +491,32 @@ export class AgentsFill {
     }
   }
 
-  private async evaluate(signal: AbortSignal): Promise<FillLineView[]> {
+  /** Whether the owner released the claim of this run (POST /api/agents/claims/release). */
+  private claimReleasedByOwner(run: AgentRun): boolean {
+    return this.options.store
+      .listEvents(this.options.project, { kinds: ["claim_released"], runId: run.id, limit: 20 })
+      .some((event) => event.data.by === "request");
+  }
+
+  /**
+   * The task's chains in a row, newest first, whose last run completed (exit
+   * 0) without reporting it done: since the owner last released it, and up
+   * to and including a chain the owner started (a new start counts afresh).
+   */
+  private completionsWithoutDone(task: string, releasedChain: string | null): AgentRun[] {
+    const { store, project, settings } = this.options;
+    const counted: AgentRun[] = [];
+    for (const head of store.chainHeadsForTask(project, task, settings.maxCompletionsWithoutDone + 1)) {
+      if (head.chainId === releasedChain) break;
+      const last = store.chainRuns(head.chainId).at(-1);
+      if (!last || last.state !== "completed") break;
+      counted.push(last);
+      if (head.origin !== "fill") break;
+    }
+    return counted;
+  }
+
+  private async evaluate(signal: AbortSignal, now: number): Promise<FillLineView[]> {
     const { project, settings, store, config, probes } = this.options;
     const path = this.tasksPath;
     if (!path) throw new Error("agents.fill.tasks_file is not set");
@@ -475,6 +542,8 @@ export class AgentsFill {
           description: null,
           state: "malformed",
           detail: `${entry.reason}: ${entry.text}`,
+          hold: null,
+          releasable: false,
           runId: null,
         });
         continue;
@@ -482,12 +551,23 @@ export class AgentsFill {
       const { line, agent, name, task, description } = entry;
       const key = `${agent}|${task}`;
       seen.add(key);
-      const show = (state: FillLineState, detail: string, runId: string | null = null) => {
+      const show = (state: FillLineState, detail: string, runId: string | null = null, hold: FillHold | null = null) => {
         if (state !== "held") this.holds.delete(key);
-        views.push({ line, agent, name, task, description, state, detail, runId });
+        views.push({
+          line,
+          agent,
+          name,
+          task,
+          description,
+          state,
+          detail,
+          hold,
+          releasable: hold !== null && OWNER_HOLDS.includes(hold),
+          runId,
+        });
       };
-      const hold = async (kind: Hold, reason: string) => {
-        show("held", reason);
+      const hold = async (kind: FillHold, reason: string, runId: string | null = null) => {
+        show("held", reason, runId, kind);
         if (this.holds.get(key) === kind) return;
         this.holds.set(key, kind);
         await this.options.record(
@@ -515,6 +595,14 @@ export class AgentsFill {
         show("claimed", `claimed by run ${short(claim.runId)} (agent ${claim.agent})`, claim.runId);
         continue;
       }
+
+      // Done: kept once seen (for this latest run and this line as written), else from the queue file
+      const doneKey = `fill_done:${task}:${latest?.id ?? "none"}:${lineHash(entry)}`;
+      const kept = store.getEventByKey(project, doneKey);
+      if (kept) {
+        show("done", `done: ${oneLine(String(kept.data.line ?? ""))} (seen ${iso(kept.at)})`, latest?.id ?? null);
+        continue;
+      }
       let done: string | null;
       try {
         done = queue.find(donePatternFor(settings.donePattern, task, agent), task, latest?.queueMark);
@@ -523,16 +611,71 @@ export class AgentsFill {
         continue;
       }
       if (done !== null) {
+        await this.options.record(
+          "fill_done",
+          {
+            agent,
+            task,
+            runId: latest?.id,
+            summary: `fill: ${task} is done: ${oneLine(done)}`,
+            evidence: [done],
+            data: { line: done, runId: latest?.id ?? null, lineHash: lineHash(entry) },
+            dedupeKey: doneKey,
+          },
+          probes.clock.now(),
+        );
         show("done", `done: ${oneLine(done)}`, latest?.id ?? null);
         continue;
       }
-      if (latest && latest.state !== "completed" && latest.state !== "superseded") {
-        await hold(
-          "owner",
-          `its last run ${short(latest.id)} ended ${latest.state} (${oneLine(latest.detail)}): fill leaves the task to the owner (the decision, or a run requested from the Agents view)`,
-        );
+
+      // The owner's: a run that ended other than completed, or completions without done
+      const release = store.listEvents(project, { kinds: ["fill_released"], task, limit: 1 })[0];
+      const releasedRun = typeof release?.data.runId === "string" ? release.data.runId : null;
+      const releasedChain = typeof release?.data.chainId === "string" ? release.data.chainId : null;
+      if (latest && latest.state !== "completed" && latest.state !== "superseded" && latest.id !== releasedRun) {
+        if (latest.state === "lost_claim" && !this.claimReleasedByOwner(latest)) {
+          const reason = `its run ${short(latest.id)} lost its claim (${oneLine(latest.detail)}), not released by you: fill leaves the task to you`;
+          await hold("owner", reason, latest.id);
+          await this.raiseHold(latest, agent, task, `Fill holds task ${task}: run ${short(latest.id)} of ${agent} lost its claim, and you did not release it`, [
+            `Run ${short(latest.id)}: ${latest.state}: ${oneLine(latest.detail)}`,
+          ]);
+        } else {
+          await hold(
+            "owner",
+            `its last run ${short(latest.id)} ended ${latest.state} (${oneLine(latest.detail)}): fill leaves the task to you (answer its decision, start a run, or release the hold)`,
+            latest.id,
+          );
+        }
         continue;
       }
+      if (latest && latest.state === "completed") {
+        const completions = this.completionsWithoutDone(task, releasedChain);
+        const count = completions.length;
+        if (count >= settings.maxCompletionsWithoutDone) {
+          const reason = `its last ${count} run(s) exited 0 without reporting it done (agents.fill.max_completions_without_done is ${settings.maxCompletionsWithoutDone}): fill leaves the task to you`;
+          await hold("no_done", reason, latest.id);
+          await this.raiseHold(
+            latest,
+            agent,
+            task,
+            `Fill holds task ${task}: ${agent}'s last ${count} run(s) exited 0 without reporting it done`,
+            completions.map((run) => `Run ${short(run.id)} (${run.origin === "fill" ? "fill" : "requested"}): ended ${iso(run.endedAt ?? run.requestedAt)}: ${oneLine(run.detail)}`),
+          );
+          continue;
+        }
+        if (count >= 1) {
+          const at = (latest.endedAt ?? latest.requestedAt) + backoffMs(count, settings.backoffSeconds, settings.maxBackoffSeconds);
+          if (now < at) {
+            await hold(
+              "backoff",
+              `its last run ${short(latest.id)} exited 0 without reporting it done (${count} of ${settings.maxCompletionsWithoutDone}): starting it again at ${iso(at)}`,
+              latest.id,
+            );
+            continue;
+          }
+        }
+      }
+
       const busy = store.activeRunForAgent(project, agent);
       if (busy) {
         await hold("busy", `${agent} is busy: run ${short(busy.id)} on ${busy.task} is ${busy.state}`);
@@ -591,6 +734,41 @@ export class AgentsFill {
       if (!seen.has(key)) this.holds.delete(key);
     }
     return views;
+  }
+
+  /** One decision per hold (per task and latest run): start it again, or keep it held. */
+  private async raiseHold(latest: AgentRun, agent: string, task: string, question: string, runs: string[]): Promise<void> {
+    const output = lastOutput(latest);
+    await this.options.raise(
+      {
+        kind: "escalation",
+        key: fillDecisionKey(task, latest.id),
+        ref: `fill:${task}`,
+        blocks: [`agents:${this.options.project}:task:${task}`],
+        question,
+        context: [
+          "Runs:",
+          ...runs.map((r) => `- ${r}`),
+          ...(output.length > 0 ? ["", "Last output:", ...output.map((l) => `- ${l}`)] : []),
+        ].join("\n"),
+        options: [
+          {
+            id: DECISION_FILL_START,
+            label: "Let fill start it again",
+            consequences: `Fill starts ${task} for ${agent} again on its next check, counting from zero.`,
+          },
+          {
+            id: DECISION_FILL_KEEP,
+            label: "Keep it held",
+            consequences: `Fill leaves ${task} alone until you start a run of it, or release the hold in the Agents view.`,
+          },
+        ],
+        recommended: DECISION_FILL_KEEP,
+        why: "A run that stops the same way again and again usually needs a change a restart won't make (a usage limit, a missing done line, a prompt).",
+        reversible: true,
+      },
+      latest,
+    );
   }
 
   /** null when capacity_cmd exits 0; otherwise why fill holds (a timeout holds too). */

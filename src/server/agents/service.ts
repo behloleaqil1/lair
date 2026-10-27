@@ -71,7 +71,7 @@ import {
   type DecisionRequest,
 } from "./decisions.js";
 import { chooseProfile, matchFailover, profileLabel, profilesFor } from "./failover.js";
-import { AgentsFill, queueMark } from "./fill.js";
+import { AgentsFill, DECISION_FILL_START, OWNER_HOLDS, queueMark } from "./fill.js";
 import {
   createLock,
   judgeLock,
@@ -330,6 +330,7 @@ export class AgentsService {
         // The in-process path every module uses: claims, locks, retries and budgets apply
         requestRun: (input) => this.requestRun(input, { origin: "fill" }),
         record: (kind, input, at) => this.record(kind, input, at),
+        raise: (request, run) => this.raiseAt(request, this.probes.clock.now(), run),
       });
     }
   }
@@ -451,10 +452,21 @@ export class AgentsService {
     return true;
   }
 
-  /** Raise a decision once per key. True when this call raised it. */
+  /** Raise a decision once per key, counted in the tick. True when this call raised it. */
   private async raise(
     request: Omit<DecisionRequest, "project" | "requestedBy">,
     t: Tick,
+    run?: AgentRun,
+  ): Promise<boolean> {
+    const raised = await this.raiseAt(request, t.now, run);
+    if (raised) t.summary.escalations++;
+    return raised;
+  }
+
+  /** Raise a decision once per key (fill raises outside a tick). True when this call raised it. */
+  private async raiseAt(
+    request: Omit<DecisionRequest, "project" | "requestedBy">,
+    now: number,
     run?: AgentRun,
   ): Promise<boolean> {
     const dedupeKey = `decision:${request.key}`;
@@ -485,9 +497,8 @@ export class AgentsService {
         },
         dedupeKey,
       },
-      t.now,
+      now,
     );
-    if (recorded) t.summary.escalations++;
     return recorded;
   }
 
@@ -499,7 +510,9 @@ export class AgentsService {
    * - every profile failing: "wait" keeps the run waiting for the cooldown,
    *   "stop" ends it and frees the task;
    * - a hard budget limit: "allow" lets runs start past it until the period
-   *   ends, "wait" keeps them waiting.
+   *   ends, "wait" keeps them waiting;
+   * - a task fill holds for the owner: "start_again" releases the hold (if
+   *   the run it was about is still the task's latest), "keep_held" keeps it.
    * A resume that can't happen (the task was claimed meanwhile, say) is
    * recorded, not retried, so the answer still counts as delivered.
    */
@@ -541,6 +554,15 @@ export class AgentsService {
         t.now,
       );
       return `runs may start past ${budgetKey} until the period ends`;
+    }
+    if (key.startsWith("fill:") && ref.startsWith("fill:")) {
+      if (optionId !== DECISION_FILL_START) return "fill keeps the task held";
+      const task = ref.slice("fill:".length);
+      const runId = key.slice(key.lastIndexOf(":") + 1);
+      const latest = this.store.latestRunForTask(this.project, task);
+      if (!latest || latest.id !== runId) return "the task has moved on since: nothing to release";
+      await this.recordFillRelease(task, latest, "decision", t.now);
+      return "fill starts the task again on its next check";
     }
     const chain = ref.startsWith("chain:") ? this.store.chainRuns(ref.slice("chain:".length)) : [];
     const latest = chain[chain.length - 1];
@@ -2058,15 +2080,55 @@ export class AgentsService {
     };
   }
 
-  /** Run one fill check now (the fill loop runs them every fill.interval_seconds). */
+  /** Run one fill check now (the fill loop runs them every fill.interval_seconds; checkNow runs one too). */
   async checkFill(): Promise<FillStatusView> {
     if (!this.fill) throw new AgentsError(404, `agents.fill is off for ${this.project}`);
     await this.fill.check();
     return this.fill.view();
   }
 
-  get fillRunning(): boolean {
-    return this.fill?.running ?? false;
+  /** The owner's "check now" (POST /api/agents/tick): a tick, then a fill check when fill is on. */
+  async checkNow(): Promise<AgentsTickSummary> {
+    const summary = await this.tick();
+    if (this.fill) await this.checkFill();
+    return summary;
+  }
+
+  /**
+   * The owner releases a task fill holds for them (an owner or no_done hold,
+   * at fill's last check): fill starts it again on its next check, and counts
+   * its completions without done from zero.
+   */
+  releaseFillHold(task: string): Promise<{ task: string; runId: string | null }> {
+    return this.exclusive(async () => {
+      if (!this.fill) throw new AgentsError(404, `agents.fill is off for ${this.project}`);
+      if (this.readOnly) throw new AgentsError(403, "The project is read_only");
+      const line = this.fill.lineFor(task);
+      if (!line || line.state !== "held" || line.hold === null || !OWNER_HOLDS.includes(line.hold)) {
+        throw new AgentsError(
+          409,
+          `Task ${task} is not held for the owner at fill's last check${line ? ` (it is ${line.state}${line.hold ? `: ${line.hold}` : ""})` : ""}`,
+        );
+      }
+      const latest = this.store.latestRunForTask(this.project, task);
+      await this.recordFillRelease(task, latest, "owner", this.probes.clock.now());
+      return { task, runId: latest?.id ?? null };
+    });
+  }
+
+  /** Lift fill's owner hold on `task` for its latest run and chain (see fill.ts). */
+  private async recordFillRelease(task: string, latest: AgentRun | null, by: "owner" | "decision", now: number): Promise<void> {
+    await this.record(
+      "fill_released",
+      {
+        agent: latest?.agent,
+        task,
+        runId: latest?.id,
+        summary: `the owner released fill's hold on ${task}${by === "decision" ? " (a decision)" : ""}: fill starts it again`,
+        data: { by, runId: latest?.id ?? null, chainId: latest?.chainId ?? null },
+      },
+      now,
+    );
   }
 
   private agentView(

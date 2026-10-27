@@ -132,7 +132,9 @@ export type AgentEventKind =
   | "budget_override"
   | "decision"
   | "fill_started"
-  | "fill_held";
+  | "fill_held"
+  | "fill_done"
+  | "fill_released";
 
 /** Recovery and audit record: what happened, why, and the evidence. */
 export interface AgentEventView {
@@ -238,6 +240,25 @@ export interface AgentsStatusView {
  */
 export type FillLineState = "started" | "done" | "held" | "claimed" | "not_allowlisted" | "malformed";
 
+/**
+ * Why a line is held:
+ * - owner: the task's last run ended other than completed (escalated, stopped, its claim lost)
+ * - no_done: its runs exited 0 without reporting it done fill.max_completions_without_done times in a row
+ * - backoff: its last run exited 0 without reporting it done; it starts again after a backoff
+ * - busy, read_only, max_active, capacity, prompt (a refused prompt file), refused (the run request)
+ * owner and no_done are the owner's to release (POST /api/agents/fill/release, or the decision).
+ */
+export type FillHold =
+  | "owner"
+  | "no_done"
+  | "backoff"
+  | "busy"
+  | "read_only"
+  | "max_active"
+  | "capacity"
+  | "prompt"
+  | "refused";
+
 export interface FillLineView {
   /** 1-based line number in tasks_file */
   line: number;
@@ -247,6 +268,10 @@ export interface FillLineView {
   description: string | null;
   state: FillLineState;
   detail: string;
+  /** Why it is held (state "held"), else null */
+  hold: FillHold | null;
+  /** The owner can release this hold (owner and no_done holds) */
+  releasable: boolean;
   runId: string | null;
 }
 

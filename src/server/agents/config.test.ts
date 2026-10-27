@@ -1,9 +1,11 @@
 /**
  * The `agents:` config block: defaults, validation, and the backoff rule.
  */
+import { readFileSync } from "fs";
 import { describe, expect, it } from "vitest";
+import { parse as parseYaml } from "yaml";
 import type { ProjectConfig } from "../../shared/types.js";
-import { backoffMs, DEFAULT_DONE_PATTERN, donePatternFor, parseAgentsConfig } from "./config.js";
+import { backoffMs, DEFAULT_DONE_PATTERN, doneLineMatches, donePatternFor, parseAgentsConfig } from "./config.js";
 
 const project = {
   name: "Demo",
@@ -128,6 +130,9 @@ describe("agents config", () => {
       donePattern: DEFAULT_DONE_PATTERN,
       capacityCmd: undefined,
       intervalSeconds: 60,
+      maxCompletionsWithoutDone: 3,
+      backoffSeconds: 60,
+      maxBackoffSeconds: 1800,
     });
     expect(errorsOf({ fill: { enabled: true } })).toEqual([
       "agents.fill.enabled: fill needs agents.enabled: true",
@@ -159,19 +164,43 @@ describe("agents config", () => {
       "agents.fill.done_pattern: not a valid regular expression",
     );
     expect(errorsOf(withFill({ max_active: 0 }))[0]).toContain("agents.fill.max_active");
+    expect(errorsOf(withFill({ max_completions_without_done: 0 }))[0]).toContain("agents.fill.max_completions_without_done");
     expect(errorsOf(withFill({ capacity_cmd: [] }))[0]).toContain("agents.fill.capacity_cmd");
     expect(errorsOf(withFill({ launch_forever: true }))[0]).toContain("agents.fill");
   });
 
-  it("the default done_pattern matches a DONE line for the task, not for a longer task id", () => {
-    const pattern = donePatternFor(DEFAULT_DONE_PATTERN, "feat-login", "worker-a");
-    expect(pattern.test("- DONE feat-login by worker-a 12:05Z: merged")).toBe(true);
-    expect(pattern.test("- DONE feat-login: merged")).toBe(true);
-    expect(pattern.test("- DONE feat-login")).toBe(true);
-    expect(pattern.test("- DONE feat-login-2 by worker-a 12:05Z: merged")).toBe(false);
-    expect(pattern.test("- WAITING feat-login 20260101T000000Z-x-abcdef12-1 by worker-a")).toBe(false);
+  it("the default done_pattern: a DONE line for the task, in any case and spacing, never a longer task id", () => {
+    const done = (line: string, task = "feat-login") =>
+      doneLineMatches(donePatternFor(DEFAULT_DONE_PATTERN, task, "worker-a"), task, line);
+    expect(done("- DONE feat-login by worker-a 12:05Z: merged")).toBe(true);
+    expect(done("- DONE feat-login")).toBe(true);
+    // Trimmed, and DONE in any case, as the module's own DONE check reads queue lines
+    expect(done("   -  done feat-login by worker-a   ")).toBe(true);
+    // The task id is exact: another case, or a longer id, is another task
+    expect(done("- DONE FEAT-LOGIN by worker-a")).toBe(false);
+    expect(done("- DONE feat-login-2 by worker-a 12:05Z: merged")).toBe(false);
+    expect(done("- WAITING feat-login 20260101T000000Z-x-abcdef12-1 by worker-a")).toBe(false);
+    // ':' and '-' can be inside a task id, so neither ends one: "feat" isn't done by feat:login or feat-login
+    expect(done("- DONE feat:login by worker-a", "feat")).toBe(false);
+    expect(done("- DONE feat-login by worker-a", "feat")).toBe(false);
+    expect(done("- DONE feat by worker-a", "feat")).toBe(true);
     // Task ids are literal text in the pattern
-    expect(donePatternFor(DEFAULT_DONE_PATTERN, "fix.1", "worker-a").test("- DONE fix21 by worker-a")).toBe(false);
+    expect(done("- DONE fix21 by worker-a", "fix.1")).toBe(false);
+  });
+
+  it("the documented fill example parses, and its done_pattern refuses a longer task id", () => {
+    const doc = readFileSync(new URL("../../../docs/configuration.md", import.meta.url), "utf-8");
+    const section = doc.slice(doc.indexOf("### Fill"));
+    const start = section.indexOf("```yaml") + "```yaml".length;
+    const example = parseYaml(section.slice(start, section.indexOf("```", start))) as { agents: unknown };
+    const parsed = parseAgentsConfig(example.agents, project);
+    expect(parsed.ok ? [] : parsed.errors).toEqual([]);
+    if (!parsed.ok) return;
+    const done = (line: string, task: string) =>
+      doneLineMatches(donePatternFor(parsed.settings.fill.donePattern, task, "worker-a"), task, line);
+    expect(done("- DONE feat-login by worker-a 12:05Z: merged", "feat-login")).toBe(true);
+    expect(done("- DONE feat-login-2 by worker-a", "feat-login")).toBe(false);
+    expect(done("- DONE feat:login by worker-a", "feat")).toBe(false);
   });
 
   it("backs off exponentially, capped", () => {

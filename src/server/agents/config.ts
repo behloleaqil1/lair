@@ -71,8 +71,12 @@ const LockSchema = z
 /** An environment variable name */
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 
-/** A queue line that reports a task done: "- DONE <task> by <agent> ..." */
-export const DEFAULT_DONE_PATTERN = "^- DONE {task}(?=[\\s:]|$)";
+/**
+ * A queue line that reports a task done: "- DONE <task> by <agent> ...". The
+ * task id ends at whitespace or the end of the line, never at ':' or '-' (task
+ * ids may contain both, so "feat" isn't done by "- DONE feat:login").
+ */
+export const DEFAULT_DONE_PATTERN = "^-\\s+DONE\\s+{task}(?=\\s|$)";
 
 const FillSchema = z
   .object({
@@ -85,11 +89,20 @@ const FillSchema = z
     prompt_files: z.array(z.string().min(1)).default([]),
     /** Runs fill started that may be active at once */
     max_active: z.number().int().min(1).max(100).default(1),
-    /** Matched against the queue lines written since the task's last start; {task} and {agent} are replaced */
+    /**
+     * Matched case-insensitively against each trimmed queue line written since
+     * the task's last start; {task} and {agent} are replaced (the task id must
+     * be in the matched text exactly as written)
+     */
     done_pattern: z.string().min(1).max(500).default(DEFAULT_DONE_PATTERN),
     /** Exit 0: capacity available; anything else (a timeout too) holds, its first output line the reason */
     capacity_cmd: argv.optional(),
     interval_seconds: z.number().int().min(1).max(3600).default(60),
+    /** Runs in a row that exit 0 without reporting the task done; then fill holds it and asks the owner */
+    max_completions_without_done: z.number().int().min(1).max(100).default(3),
+    /** After such a run, fill waits this long before starting the task again, doubling up to max_backoff_seconds */
+    backoff_seconds: z.number().min(0).default(60),
+    max_backoff_seconds: z.number().min(0).default(1800),
   })
   .strict();
 
@@ -185,15 +198,33 @@ export interface FillSettings {
   donePattern: string;
   capacityCmd?: string[];
   intervalSeconds: number;
+  maxCompletionsWithoutDone: number;
+  backoffSeconds: number;
+  maxBackoffSeconds: number;
 }
 
 const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-/** done_pattern for one task: {task} and {agent} replaced by the ids, as literal text. */
+/**
+ * done_pattern for one task: {task} and {agent} replaced by the ids, as
+ * literal text, and case-insensitive, like the module's own DONE check
+ * (parseQueueLine). doneLineMatches keeps the task id itself exact.
+ */
 export function donePatternFor(template: string, task: string, agent: string): RegExp {
   return new RegExp(
     template.replace(/\{(task|agent)\}/g, (_match, name: string) => escapeRegExp(name === "task" ? task : agent)),
+    "i",
   );
+}
+
+/**
+ * A queue line reports the task done: the trimmed line matches the pattern,
+ * and the matched text holds the task id exactly as written (task ids are
+ * case-sensitive; the DONE keyword is not).
+ */
+export function doneLineMatches(pattern: RegExp, task: string, line: string): boolean {
+  const match = pattern.exec(line.trim());
+  return match !== null && match[0].includes(task);
 }
 
 export interface BudgetLimit {
@@ -427,6 +458,9 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         donePattern: value.fill.done_pattern,
         capacityCmd: value.fill.capacity_cmd,
         intervalSeconds: value.fill.interval_seconds,
+        maxCompletionsWithoutDone: value.fill.max_completions_without_done,
+        backoffSeconds: value.fill.backoff_seconds,
+        maxBackoffSeconds: value.fill.max_backoff_seconds,
       },
     },
   };
