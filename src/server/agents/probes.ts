@@ -39,7 +39,7 @@ export function agentEnvironment(
 ): Record<string, string> {
   const env: Record<string, string> = {};
   for (const name of [...BASE_ENV, ...passthrough]) {
-    if (name.startsWith("LAIR_")) continue;
+    if (name.toUpperCase().startsWith("LAIR_")) continue; // any case: some environments ignore it
     const value = source[name];
     if (value !== undefined) env[name] = value;
   }

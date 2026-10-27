@@ -111,6 +111,10 @@ describe("agents config", () => {
       "agents.env_passthrough: LAIR_NODE_TOKEN: LAIR_* variables are never passed to agents",
     ]);
     expect(errorsOf({ env_passthrough: ["NOT A NAME"] })[0]).toContain("agents.env_passthrough.0");
+    // In any case: some environments treat variable names case-insensitively
+    expect(errorsOf({ env_passthrough: ["lair_node_token"] })).toEqual([
+      "agents.env_passthrough: lair_node_token: LAIR_* variables are never passed to agents",
+    ]);
   });
 
   it("backs off exponentially, capped", () => {

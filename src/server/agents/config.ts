@@ -286,7 +286,7 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
   );
 
   for (const name of value.env_passthrough) {
-    if (name.startsWith("LAIR_")) {
+    if (name.toUpperCase().startsWith("LAIR_")) {
       errors.push(`agents.env_passthrough: ${name}: LAIR_* variables are never passed to agents`);
     }
   }

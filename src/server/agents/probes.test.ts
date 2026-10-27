@@ -92,8 +92,8 @@ describe("ProcessSnapshot", () => {
 describe("an agent's environment", () => {
   it("copies only the base names and env_passthrough from the server's, never a LAIR_* one", () => {
     const env = agentEnvironment(
-      { PATH: "/usr/bin", HOME: "/home/user", LAIR_NODE_TOKEN: "t", LAIR_PROJECT: "p", SECRET: "s", KEY: "k" },
-      ["KEY", "LAIR_PROJECT"],
+      { PATH: "/usr/bin", HOME: "/home/user", LAIR_NODE_TOKEN: "t", LAIR_PROJECT: "p", lair_node_token: "t", SECRET: "s", KEY: "k" },
+      ["KEY", "LAIR_PROJECT", "lair_node_token", "Lair_Node_Token"],
       { LAIR_RUN_ID: "r" },
     );
     expect(env).toEqual({ PATH: "/usr/bin", HOME: "/home/user", KEY: "k", LAIR_RUN_ID: "r" });

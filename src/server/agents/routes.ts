@@ -9,10 +9,11 @@
  *   POST /api/agents/runs/:id/fresh-session?project=  {confirm: true}
  *   POST /api/agents/tick?project=               check now
  *
- * Starting a run, releasing a claim and starting a fresh session are the
- * owner's: they need an owner session (src/server/human-auth/, the
- * X-Lair-Owner-Session header from the dashboard), so an agent, or any other
- * local process, can't put a prompt into a task or stop a peer's run.
+ * Every POST is the owner's (starting a run, releasing a claim, a fresh
+ * session, an early check): it needs an owner session (src/server/human-auth/,
+ * the X-Lair-Owner-Session header from the dashboard), so an agent, or any
+ * other local process, can't put a prompt into a task or stop a peer's run.
+ * The service's own timer ticks in-process.
  * /api/agents is in OWNER_ONLY_PREFIXES (no CORS). Modules that start runs do
  * it in-process (AgentsManager.requestRun), not over HTTP. The two actions
  * that stop work also need `confirm: true` (the Agents view asks first).
@@ -172,7 +173,7 @@ export async function registerAgentsRoutes(
       }
     });
 
-    app.post("/api/agents/tick", async (request, reply) => {
+    app.post("/api/agents/tick", ownerOnly, async (request, reply) => {
       const query = ProjectQuery.safeParse(request.query ?? {});
       if (!query.success) return fail(reply, 400, `Invalid query: ${query.error.issues[0].path.join(".")}`);
       const service = serviceOf(reply, projectOf(query.data));
