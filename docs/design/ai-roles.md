@@ -49,10 +49,18 @@ A dragon can still name its own profile (a specialist), and a role can be left u
 - **ACP** (Agent Client Protocol), as the long-term path: several agent tools speak it (the Kiro CLI already does).
   An ACP adapter gives Lair structured progress, tool calls and usage instead of log scraping, and one adapter covers
   every ACP tool.
-- **Model discovery:**
-  - an optional `models_cmd` per tool (for Kiro, `kiro-cli chat --list-models`) fills the model picker, with each
-    tool's own notes (cost multipliers, context size);
-  - a model can always be typed in, since tools change their lists faster than Lair releases.
+- **Models: a dropdown of what the chosen tool offers.** Every place that takes a model is a dropdown filled from that
+  tool's own list: a dragon, a profile, and each role and fallback. It is refilled when the tool changes.
+  - **Where the list comes from:**
+    - each preset has a `models_cmd` and a parser (for Kiro, `kiro-cli chat --list-models`). Lair runs it on each
+      machine the tool is used on, with a timeout, and caches the result (1 h, plus a Refresh button);
+    - the dropdown shows each model with the tool's own notes (default marked, cost multiplier, context size);
+    - a tool with no list command ships a known list in its preset.
+  - **Typing still works.** An "Other…" entry accepts any model name, since tools add models faster than Lair
+    releases. A name the tool doesn't list is saved with a warning, never refused.
+  - **Checks:**
+    - a model that disappears from a tool's list shows as "not offered any more" on every dragon and role using it;
+    - a model missing on one machine is flagged per machine.
 
 ## Authentication: Lair never logs in for you
 
@@ -102,6 +110,8 @@ Lair through the ops API (MCP), which any MCP-capable tool can use.
 ## Acceptance
 
 - One project runs builders on tool A and reviewers on tool B, and both appear in Work with their tool and model.
+- On a dragon, choosing tool A then tool B refills the model dropdown with B's own models, read from B's list command
+  (a fake tool in tests). "Other…" saves a typed model with a warning.
 - Changing `review.amber` in Settings makes the next AMBER review start on the new profile. A failing first profile
   falls back to the second.
 - On a machine where the tool is signed out, Settings → AI shows "Not signed in" with the exact command. No start is
