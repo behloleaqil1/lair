@@ -283,6 +283,20 @@ export class HumanAuth {
     };
   }
 
+  /**
+   * A module-wide `onRequest` hook: every request that can change something
+   * (any method but GET, HEAD and OPTIONS) needs the owner, as requireOwner();
+   * reads stay open. For route modules whose writes are all the human's, so a
+   * write route added later can't be left open by mistake.
+   */
+  requireOwnerForChanges(refusal = "Only the owner can do this, from the dashboard signed in as the owner") {
+    const owner = this.requireOwner(refusal);
+    return async (request: FastifyRequest, reply: FastifyReply) => {
+      if (request.method === "GET" || request.method === "HEAD" || request.method === "OPTIONS") return;
+      return owner(request, reply);
+    };
+  }
+
   /** A route `onRequest` hook: only a same-origin browser request from the dashboard (403 otherwise). */
   requireDashboard(refusal = "Only the dashboard can do this") {
     return async (request: FastifyRequest, reply: FastifyReply) => {

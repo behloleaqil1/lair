@@ -2,7 +2,11 @@
  * Bus routes - Phase 3 fleet bus API
  *
  * Exposes the bus storage via HTTP for the Lair dashboard.
- * The actual MCP bus runs as a separate stdio process per agent.
+ * The actual MCP bus runs as a separate stdio process per agent, on the bus
+ * database directly, never through these routes.
+ *
+ * POST /api/bus/send writes a message from "owner", so it needs the owner's
+ * session (src/server/human-auth/). The board and the event stream stay open.
  */
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { join } from "path";
@@ -11,6 +15,7 @@ import { loadProjectConfig } from "../config.js";
 import { BusStorage } from "../../bus/storage.js";
 import { projectQueryGuard } from "./project-guard.js";
 import { rejectCrossSiteRequests } from "../origin.js";
+import type { HumanAuth } from "../human-auth/index.js";
 import type { ApiResponse, BoardOutput, TaskStatus } from "../../shared/types.js";
 
 function respond<T>(data: T): ApiResponse<T> {
@@ -47,16 +52,19 @@ const sseConnections = new Map<string, Set<FastifyReply>>();
 
 export async function registerBusRoutes(
   fastify: FastifyInstance,
+  /** Messages sent as the owner need the owner's session */
+  auth: HumanAuth,
 ): Promise<void> {
   // Encapsulated so the project guard applies only to these routes
-  await fastify.register(busRoutes);
+  await fastify.register((app) => busRoutes(app, auth));
 }
 
-async function busRoutes(fastify: FastifyInstance): Promise<void> {
+async function busRoutes(fastify: FastifyInstance, auth: HumanAuth): Promise<void> {
   // The project name becomes data/<project>.db, so validate it first
   // Refuse cross-site browser requests (CSRF, DNS rebinding) before anything else
   fastify.addHook("onRequest", rejectCrossSiteRequests);
   fastify.addHook("onRequest", projectQueryGuard());
+  fastify.addHook("onRequest", auth.requireOwnerForChanges());
 
   // ============ BOARD ============
 

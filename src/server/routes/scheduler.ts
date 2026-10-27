@@ -1,5 +1,10 @@
 /**
  * Scheduler and node API routes for M1 Core.
+ *
+ * Starting, stopping and ticking the scheduler, and creating, cancelling and
+ * retrying tasks need the owner's session (src/server/human-auth/); the GETs
+ * stay open. Code inside the server creates tasks through the JobManager
+ * (getJobManager().createTask), not over HTTP.
  */
 import type { FastifyInstance } from "fastify";
 import { getStore } from "../store/store.js";
@@ -7,6 +12,7 @@ import { getScheduler } from "../scheduler/scheduler.js";
 import { getJobManager } from "../jobs/job-manager.js";
 import { getNodeManager } from "../nodes/node-manager.js";
 import { rejectCrossSiteRequests } from "../origin.js";
+import type { HumanAuth } from "../human-auth/index.js";
 import type {
   CreateTaskRequest,
   TaskStatus,
@@ -42,14 +48,19 @@ function respondError(error: string): ApiResponse<never> {
 /**
  * Register scheduler and node routes.
  */
-export async function registerSchedulerRoutes(fastify: FastifyInstance): Promise<void> {
+export async function registerSchedulerRoutes(
+  fastify: FastifyInstance,
+  /** Scheduler controls and task changes need the owner's session */
+  auth: HumanAuth,
+): Promise<void> {
   // Encapsulated so the cross-site guard applies to these routes
-  await fastify.register(schedulerRoutes);
+  await fastify.register((app) => schedulerRoutes(app, auth));
 }
 
-async function schedulerRoutes(fastify: FastifyInstance): Promise<void> {
+async function schedulerRoutes(fastify: FastifyInstance, auth: HumanAuth): Promise<void> {
   // Refuse cross-site browser requests (CSRF, DNS rebinding)
   fastify.addHook("onRequest", rejectCrossSiteRequests);
+  fastify.addHook("onRequest", auth.requireOwnerForChanges());
 
   // ============ NODES ============
 

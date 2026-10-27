@@ -1,9 +1,11 @@
 /**
  * Requests the Delivery view sends: the routes in src/server/delivery/routes.ts.
  * Kept apart from the component so tests can send the same requests to the
- * real router.
+ * real router. Every action carries this browser's owner session
+ * (owner-session.ts); without one the server answers 403.
  */
 import type { Operation } from "../shared/delivery-types";
+import { ownerHeaders } from "./owner-session";
 
 export type EnvironmentAction = "up" | "down" | "restart" | "deploy";
 export type ServiceAction = "up" | "down" | "restart" | "deploy" | "release";
@@ -53,7 +55,7 @@ export async function runDeliveryAction(
 ): Promise<Operation> {
   const res = await fetch(deliveryActionUrl(target, action), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...ownerHeaders() },
     body: JSON.stringify(deliveryActionBody(action, options)),
   });
   const json = (await res.json()) as { success: boolean; data?: Operation; error?: string };

@@ -3,16 +3,22 @@
  * guards, then registerDeliveryRoutes with a DeliveryManager whose only fake
  * is docker (and the clock). Requests are built by the Delivery view's own
  * helpers (src/client/delivery-api.ts), and the view's runDeliveryAction is
- * sent through the router too.
+ * sent through the router too. Every action needs the owner's session
+ * (src/server/human-auth/), registered here as index.ts registers it.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
+import { mkdtempSync, readFileSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { DeliveryProjectStatus, Operation } from "../../shared/delivery-types.js";
 import { registerRootGuards } from "../root-guards.js";
 import { FakeClock, FakeDocker } from "./fake-docker.js";
 import { DeliveryManager } from "./service.js";
 import { registerDeliveryRoutes } from "./routes.js";
+import { HumanAuth, OWNER_SESSION_HEADER, registerOwnerRoutes } from "../human-auth/index.js";
+import { signIn } from "../../client/owner-session";
 import {
   deliveryActionBody,
   deliveryActionUrl,
@@ -23,11 +29,14 @@ import {
 
 // "example" is the project shipped in projects/, so the root ?project= guard knows it
 const PROJECT = "example";
-const BROWSER = { host: "127.0.0.1:4777", origin: "http://localhost:5173" };
+const BROWSER = { host: "127.0.0.1:4777", origin: "http://localhost:5173", "sec-fetch-site": "same-origin" };
 const C = (...args: string[]) => ["docker", "compose", "-p", "shop-local", "-f", "./deploy/compose.yaml", ...args];
 
 let app: FastifyInstance | null = null;
 let manager: DeliveryManager | null = null;
+const dirs: string[] = [];
+/** This browser's owner session (the dashboard signed in as the owner) */
+let session = "";
 
 afterEach(async () => {
   vi.unstubAllGlobals();
@@ -35,6 +44,7 @@ afterEach(async () => {
   await manager?.stop();
   app = null;
   manager = null;
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 function config(extra: Partial<ProjectConfig> = {}): ProjectConfig {
@@ -72,20 +82,40 @@ async function build(project: ProjectConfig = config()) {
   manager.load([{ name: PROJECT, config: project }]);
   app = Fastify();
   registerRootGuards(app);
-  await registerDeliveryRoutes(app, manager, () => PROJECT);
+  // The owner's credential, as src/server/index.ts wires it; app.close() closes it
+  const dir = mkdtempSync(join(tmpdir(), "lair-delivery-owner-"));
+  dirs.push(dir);
+  const tokenPath = join(dir, "owner.token");
+  const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
+  await registerOwnerRoutes(app, auth);
+  await registerDeliveryRoutes(app, manager, () => PROJECT, auth);
   await app.ready();
-  return { app, docker };
+  const ownerToken = readFileSync(tokenPath, "utf-8").trim();
+  session = auth.createSession(ownerToken)!.session;
+  return { app, docker, ownerToken };
 }
 
 async function post(
   server: FastifyInstance,
   action: DeliveryAction,
-  options: { service?: string; confirmed?: boolean; reason?: string; headers?: Record<string, string> } = {},
+  options: {
+    service?: string;
+    confirmed?: boolean;
+    reason?: string;
+    headers?: Record<string, string>;
+    /** Send this browser's owner session (default: yes) */
+    owner?: boolean;
+  } = {},
 ) {
   return server.inject({
     method: "POST",
     url: deliveryActionUrl({ project: PROJECT, environment: "local", service: options.service }, action),
-    headers: { ...BROWSER, "content-type": "application/json", ...options.headers },
+    headers: {
+      ...BROWSER,
+      "content-type": "application/json",
+      ...(options.owner === false ? {} : { [OWNER_SESSION_HEADER]: session }),
+      ...options.headers,
+    },
     payload: deliveryActionBody(action, { confirmed: options.confirmed, reason: options.reason }),
   });
 }
@@ -186,14 +216,27 @@ describe("delivery over HTTP: Up -> status -> Down", () => {
     expect((await status(app)).environments[0].services[0].held).toBeNull();
   });
 
-  it("the Delivery view's runDeliveryAction calls the real routes", async () => {
-    const { app, docker } = await build();
+  it("the Delivery view's runDeliveryAction calls the real routes, as the owner once signed in", async () => {
+    const { app, docker, ownerToken } = await build();
     const server = app;
-    vi.stubGlobal("fetch", async (url: string, init: { method: string; headers: Record<string, string>; body: string }) => {
-      const res = await server.inject({ method: "POST", url, headers: { ...BROWSER, ...init.headers }, payload: init.body });
+    vi.stubGlobal("localStorage", memoryStorage());
+    vi.stubGlobal("fetch", async (url: string, init: { method?: string; headers?: Record<string, string>; body?: string } = {}) => {
+      const res = await server.inject({
+        method: (init.method ?? "GET") as "GET" | "POST",
+        url,
+        headers: { ...BROWSER, ...init.headers },
+        payload: init.body,
+      });
       return { status: res.statusCode, json: async () => res.json() };
     });
 
+    // Not signed in: the helper sends no session, and nothing runs
+    await expect(runDeliveryAction({ project: PROJECT, environment: "local" }, "up")).rejects.toThrow(
+      "not signed in as the owner",
+    );
+    expect(docker.calls).toEqual([]);
+
+    await signIn(ownerToken);
     const up = await runDeliveryAction({ project: PROJECT, environment: "local" }, "up");
     await finished(app, up.id);
     expect(docker.mutations()).toEqual([C("up", "-d", "--no-deps", "db"), C("up", "-d", "--no-deps", "api")]);
@@ -211,6 +254,28 @@ describe("delivery over HTTP: Up -> status -> Down", () => {
 });
 
 describe("delivery routes: guards and validation", () => {
+  it("refuses every action without the owner's session, before anything runs or is held", async () => {
+    const { app, docker } = await build();
+    for (const action of ["up", "down", "restart", "deploy"] as const) {
+      const environment = await post(app, action, { confirmed: true, reason: "x", owner: false });
+      expect(environment.statusCode).toBe(403);
+      expect(environment.json().error).toContain("not signed in as the owner");
+      const one = await post(app, action, { service: "api", confirmed: true, reason: "x", owner: false });
+      expect(one.statusCode).toBe(403);
+    }
+    // A made-up session value is no better
+    const forged = await post(app, "up", { owner: false, headers: { [OWNER_SESSION_HEADER]: "z".repeat(43) } });
+    expect(forged.statusCode).toBe(403);
+    expect((await post(app, "release", { service: "db", owner: false })).statusCode).toBe(403);
+
+    expect(docker.calls).toEqual([]);
+    expect(manager!.getStore()!.listOperations(PROJECT)).toEqual([]);
+    expect(manager!.getStore()!.holds(PROJECT)).toEqual([]);
+    // Reads stay open, to any local client
+    const read = await app.inject({ url: `/api/delivery/status?project=${PROJECT}`, headers: { host: "127.0.0.1:4777" } });
+    expect(read.statusCode).toBe(200);
+  });
+
   it("refuses cross-site requests and foreign Host headers before running anything", async () => {
     const { app, docker } = await build();
     const crossSite = await post(app, "up", { headers: { origin: "http://attacker.example" } });
@@ -222,8 +287,14 @@ describe("delivery routes: guards and validation", () => {
 
   it("refuses unknown projects, environments, services and actions, and unexpected body keys", async () => {
     const { app, docker } = await build();
+    // As the owner, so validation (not the session check) answers
     const send = (url: string, payload: Record<string, unknown> = {}) =>
-      app.inject({ method: "POST", url, headers: { ...BROWSER, "content-type": "application/json" }, payload });
+      app.inject({
+        method: "POST",
+        url,
+        headers: { ...BROWSER, "content-type": "application/json", [OWNER_SESSION_HEADER]: session },
+        payload,
+      });
 
     expect((await send("/api/delivery/environments/local/up?project=nope")).statusCode).toBe(400);
     expect((await send("/api/delivery/environments/local/up?project=..%2Fx")).statusCode).toBe(400);
@@ -274,3 +345,18 @@ describe("delivery routes: guards and validation", () => {
     expect(get.statusCode).toBe(404);
   });
 });
+
+/** localStorage for one origin (where the dashboard keeps its owner session). */
+function memoryStorage(): Storage {
+  const values = new Map<string, string>();
+  return {
+    get length() {
+      return values.size;
+    },
+    clear: () => values.clear(),
+    getItem: (key: string) => values.get(key) ?? null,
+    key: (index: number) => [...values.keys()][index] ?? null,
+    removeItem: (key: string) => void values.delete(key),
+    setItem: (key: string, value: string) => void values.set(key, String(value)),
+  };
+}

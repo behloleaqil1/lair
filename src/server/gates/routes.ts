@@ -8,13 +8,16 @@
  *   POST /api/pipelines/runs?project=            { pipeline, sha?, branch? }: start a run (202)
  *   POST /api/pipelines/runs/:id/cancel?project=
  *
- * Starting and cancelling runs are controls: refused for a read_only
- * project. `?project=` is validated by the root guards; without it the
- * default project is used.
+ * Starting and cancelling runs are controls: they need the owner's session
+ * (src/server/human-auth/), and are refused for a read_only project. Code
+ * inside the server starts runs with PipelineManager.startRun, not over
+ * HTTP. `?project=` is validated by the root guards; without it the default
+ * project is used.
  */
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
 import { rejectCrossSiteRequests } from "../origin.js";
+import type { HumanAuth } from "../human-auth/index.js";
 import { requireValidIdParam } from "../root-guards.js";
 import { PIPELINE_NAME } from "./project-pipelines.js";
 import { SHA_PATTERN } from "./executors/github-workflow.js";
@@ -53,10 +56,13 @@ export async function registerPipelineRoutes(
   fastify: FastifyInstance,
   manager: PipelineManager,
   defaultProject: () => string,
+  /** Starting and cancelling runs need the owner's session */
+  auth: HumanAuth,
 ): Promise<void> {
   // Encapsulated so the cross-site guard applies to these routes too
   await fastify.register(async (app) => {
     app.addHook("onRequest", rejectCrossSiteRequests);
+    app.addHook("onRequest", auth.requireOwnerForChanges());
 
     const projectOf = (query: { project?: string }) => query.project ?? defaultProject();
     const badQuery = (reply: FastifyReply, error: z.ZodError) =>

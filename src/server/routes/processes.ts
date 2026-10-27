@@ -8,10 +8,13 @@
  * - POST /api/processes/:id/stop    - stop a process
  * - POST /api/processes/:id/restart - restart a process
  * - GET  /api/processes/:id/logs    - get recent logs
+ *
+ * Start, stop and restart need the owner's session (src/server/human-auth/).
  */
 import type { FastifyInstance } from "fastify";
 import { getSupervisor } from "../services/supervisor.js";
 import { rejectCrossSiteRequests } from "../origin.js";
+import type { HumanAuth } from "../human-auth/index.js";
 import type { ApiResponse } from "../../shared/types.js";
 import type {
   ProcessState,
@@ -37,16 +40,20 @@ function respondError(error: string): ApiResponse<never> {
 
 export async function registerProcessRoutes(
   fastify: FastifyInstance,
+  /** Start, stop and restart need the owner's session */
+  auth: HumanAuth,
 ): Promise<void> {
   // Encapsulated so the cross-site guard applies to these routes
-  await fastify.register(processRoutes);
+  await fastify.register((app) => processRoutes(app, auth));
 }
 
 async function processRoutes(
   fastify: FastifyInstance,
+  auth: HumanAuth,
 ): Promise<void> {
   // Refuse cross-site browser requests (CSRF, DNS rebinding)
   fastify.addHook("onRequest", rejectCrossSiteRequests);
+  fastify.addHook("onRequest", auth.requireOwnerForChanges());
 
   const supervisor = getSupervisor();
 

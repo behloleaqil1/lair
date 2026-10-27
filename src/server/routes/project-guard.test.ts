@@ -1,6 +1,6 @@
 /**
- * Security tests: `?project=` path traversal, dragonId validation,
- * the SSE CORS header and the removed budget-cost route.
+ * Security tests: `?project=` path traversal, dragonId validation (behind
+ * the owner's session), the SSE CORS header and the removed budget-cost route.
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
@@ -20,6 +20,7 @@ import { registerControlRoutes, getPromptsDir } from "./controls.js";
 import { registerFleetRoutes } from "./fleet.js";
 import { registerProcessRoutes } from "./processes.js";
 import { registerSchedulerRoutes } from "./scheduler.js";
+import { HumanAuth, OWNER_SESSION_HEADER } from "../human-auth/index.js";
 import type { ProjectConfig } from "../../shared/types.js";
 
 const TMP = join(process.cwd(), "data", "test-project-guard");
@@ -43,9 +44,19 @@ const OUTSIDE_YAML = [
 const TRAVERSAL = "../../data/test-project-guard/outside";
 
 let createdLocalDir = false;
+// The owner's credential, as src/server/index.ts gives it to every route module
+let auth: HumanAuth;
+let ownerSession = "";
+
+/** A browser on the dashboard signed in as the owner: the control POSTs need it */
+function owner(): Record<string, string> {
+  return { origin: "http://localhost:4777", "sec-fetch-site": "same-origin", [OWNER_SESSION_HEADER]: ownerSession };
+}
 
 beforeAll(() => {
   mkdirSync(TMP, { recursive: true });
+  auth = HumanAuth.open({ tokenPath: join(TMP, "owner.token"), dbPath: ":memory:" });
+  ownerSession = auth.createSession(readFileSync(join(TMP, "owner.token"), "utf-8").trim())!.session;
   if (!existsSync(LOCAL_DIR)) {
     mkdirSync(LOCAL_DIR, { recursive: true });
     createdLocalDir = true;
@@ -76,6 +87,7 @@ beforeAll(() => {
 });
 
 afterAll(() => {
+  auth.close();
   rmSync(PROJECT_FILE, { force: true });
   rmSync(TMP, { recursive: true, force: true });
   rmSync(join(process.cwd(), "data", `${PROJECT}.db`), { force: true });
@@ -86,10 +98,10 @@ afterAll(() => {
 
 async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({ logger: false });
-  await registerControlRoutes(app);
-  await registerBusRoutes(app);
-  await registerSettingsRoutes(app);
-  await registerFleetRoutes(app);
+  await registerControlRoutes(app, auth);
+  await registerBusRoutes(app, auth);
+  await registerSettingsRoutes(app, auth);
+  await registerFleetRoutes(app, auth);
   await app.ready();
   return app;
 }
@@ -182,9 +194,25 @@ describe("dragon start/stop validation", () => {
     await app.close();
   });
 
+  it("refuses a start or stop without the owner's session, before writing any prompt file", async () => {
+    for (const action of ["start", "stop"]) {
+      const res = await app.inject({
+        method: "POST",
+        url: `/api/controls/dragon/${action}`,
+        query: { project: PROJECT },
+        headers: { origin: "http://localhost:4777", "sec-fetch-site": "same-origin" },
+        payload: { dragonId: "alpha", task: "no owner", prompt: "p" },
+      });
+      expect(res.statusCode).toBe(403);
+      expect(res.json().error).toContain("not signed in as the owner");
+    }
+    expect(existsSync(join(TMP, "prompts", "no-owner-alpha.txt"))).toBe(false);
+  });
+
   it("rejects an unknown dragonId before writing any prompt file", async () => {
     const res = await app.inject({
       method: "POST",
+      headers: owner(),
       url: "/api/controls/dragon/start",
       query: { project: PROJECT },
       // Without validation this wrote <repo>/work/escape.txt
@@ -198,6 +226,7 @@ describe("dragon start/stop validation", () => {
   it("rejects an unknown dragonId on stop", async () => {
     const res = await app.inject({
       method: "POST",
+      headers: owner(),
       url: "/api/controls/dragon/stop",
       query: { project: PROJECT },
       payload: { dragonId: "not-configured" },
@@ -208,6 +237,7 @@ describe("dragon start/stop validation", () => {
   it("writes the prompt for a configured dragon into prompts_dir", async () => {
     const res = await app.inject({
       method: "POST",
+      headers: owner(),
       url: "/api/controls/dragon/start",
       query: { project: PROJECT },
       payload: { dragonId: "alpha", task: "my task", prompt: "do it" },
@@ -220,6 +250,7 @@ describe("dragon start/stop validation", () => {
   it("accepts a dragon listed only in dragons.txt on stop", async () => {
     const res = await app.inject({
       method: "POST",
+      headers: owner(),
       url: "/api/controls/dragon/stop",
       query: { project: PROJECT },
       payload: { dragonId: "bravo" },
@@ -231,6 +262,7 @@ describe("dragon start/stop validation", () => {
   it("accepts a dragon listed only in dragons.txt on start", async () => {
     const res = await app.inject({
       method: "POST",
+      headers: owner(),
       url: "/api/controls/dragon/start",
       query: { project: PROJECT },
       payload: { dragonId: "bravo", task: "txt task", prompt: "go" },
@@ -242,6 +274,7 @@ describe("dragon start/stop validation", () => {
   it("refuses a digit-first dragonId that the registry would never list", async () => {
     const res = await app.inject({
       method: "POST",
+      headers: owner(),
       url: "/api/controls/dragon/stop",
       query: { project: PROJECT },
       payload: { dragonId: "1-agent" },
@@ -253,6 +286,7 @@ describe("dragon start/stop validation", () => {
   it("names an unknown dragon in the error", async () => {
     const res = await app.inject({
       method: "POST",
+      headers: owner(),
       url: "/api/controls/dragon/start",
       query: { project: PROJECT },
       payload: { dragonId: "charlie", task: "t", prompt: "p" },
@@ -304,7 +338,7 @@ describe("bus SSE CORS", () => {
   beforeAll(async () => {
     app = Fastify({ logger: false, forceCloseConnections: true });
     await app.register(cors, { origin: ["http://localhost:5173"] });
-    await registerBusRoutes(app);
+    await registerBusRoutes(app, auth);
     await app.listen({ port: 0, host: "127.0.0.1" });
     port = (app.server.address() as AddressInfo).port;
   });
@@ -358,11 +392,11 @@ describe("cross-site browser requests", () => {
 
   beforeAll(async () => {
     app = Fastify({ logger: false });
-    await registerControlRoutes(app);
-    await registerSettingsRoutes(app);
-    await registerProcessRoutes(app);
-    await registerSchedulerRoutes(app);
-    await registerFleetRoutes(app);
+    await registerControlRoutes(app, auth);
+    await registerSettingsRoutes(app, auth);
+    await registerProcessRoutes(app, auth);
+    await registerSchedulerRoutes(app, auth);
+    await registerFleetRoutes(app, auth);
     await app.ready();
   });
 

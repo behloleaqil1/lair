@@ -13,6 +13,11 @@
  * answer 202 with the operation, which runs in the background: poll
  * GET /api/delivery/operations/:id. A read_only project answers 403.
  *
+ * Every POST needs the owner's session (src/server/human-auth/): without it
+ * the answer is 403, before the body is read. The GETs stay open. Delivery's
+ * own automatic deploys and recoveries run inside the server
+ * (EnvironmentController), never through these routes.
+ *
  * Every route passes the cross-site guard and the ?project= guard (without
  * it the default project is used). Environment and service names in the
  * path must be configured ones: a request only selects a configured value,
@@ -21,6 +26,7 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
 import { rejectCrossSiteRequests } from "../origin.js";
+import type { HumanAuth } from "../human-auth/index.js";
 import { projectQueryGuard } from "../routes/project-guard.js";
 import { ENVIRONMENT_NAME, SERVICE_NAME } from "./config.js";
 import type { OperationRequest } from "./environment.js";
@@ -67,11 +73,14 @@ export async function registerDeliveryRoutes(
   fastify: FastifyInstance,
   manager: DeliveryManager,
   defaultProject: () => string,
+  /** Up, Down, Restart, Deploy and Release need the owner's session */
+  auth: HumanAuth,
 ): Promise<void> {
   // Encapsulated so the guards apply to these routes
   await fastify.register(async (app) => {
     app.addHook("onRequest", rejectCrossSiteRequests);
     app.addHook("onRequest", projectQueryGuard({ optional: true }));
+    app.addHook("onRequest", auth.requireOwnerForChanges());
 
     const projectOf = (query: { project?: string }) => query.project ?? defaultProject();
 

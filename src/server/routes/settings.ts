@@ -1,5 +1,8 @@
 /**
  * Settings routes - manage project configuration from UI
+ *
+ * Saving the config and testing a machine need the owner's session
+ * (src/server/human-auth/); reading the settings stays open.
  */
 import type { FastifyInstance } from "fastify";
 import { existsSync, readFileSync, writeFileSync, copyFileSync } from "fs";
@@ -7,6 +10,7 @@ import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { loadProjectConfig, getConfigPath } from "../config.js";
 import { projectQueryGuard } from "./project-guard.js";
 import { rejectCrossSiteRequests } from "../origin.js";
+import type { HumanAuth } from "../human-auth/index.js";
 import { getBuiltInAdapters } from "../services/adapters.js";
 import type {
   ApiResponse,
@@ -47,17 +51,20 @@ interface SettingsUpdate {
 }
 
 export async function registerSettingsRoutes(
-  fastify: FastifyInstance
+  fastify: FastifyInstance,
+  /** Saving the config and testing a machine need the owner's session */
+  auth: HumanAuth,
 ): Promise<void> {
   // Encapsulated so the project guard applies only to these routes
-  await fastify.register(settingsRoutes);
+  await fastify.register((app) => settingsRoutes(app, auth));
 }
 
-async function settingsRoutes(fastify: FastifyInstance): Promise<void> {
+async function settingsRoutes(fastify: FastifyInstance, auth: HumanAuth): Promise<void> {
   // Every settings route reads (or rewrites) projects/<project>.yaml
   // Refuse cross-site browser requests (CSRF, DNS rebinding) before anything else
   fastify.addHook("onRequest", rejectCrossSiteRequests);
   fastify.addHook("onRequest", projectQueryGuard());
+  fastify.addHook("onRequest", auth.requireOwnerForChanges());
 
   // GET /api/settings - Get current settings
   fastify.get<{ Querystring: { project: string } }>(

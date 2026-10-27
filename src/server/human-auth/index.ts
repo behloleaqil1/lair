@@ -1,11 +1,14 @@
 /**
  * The owner's credential, shared by every route only the human may use
  * (Decision Inbox answers; review merges, human reviews, finding resolutions
- * and hold releases). See human-auth.ts for the model:
+ * and hold releases; and every write of controls, bus messages, processes,
+ * settings, scheduler, tasks, fleet, delivery and pipelines). See
+ * human-auth.ts for the model:
  *
  *   const auth = HumanAuth.open({ tokenPath, dbPath });
  *   await registerOwnerRoutes(fastify, auth);           // sign in, list, revoke
  *   app.post("/api/...", { onRequest: auth.requireOwner() }, handler);
+ *   app.addHook("onRequest", auth.requireOwnerForChanges()); // a module whose writes are all the owner's
  *
  * and add the route's prefix to OWNER_ONLY_PREFIXES so no CORS is granted.
  *

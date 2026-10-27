@@ -1,5 +1,9 @@
 /**
  * Control routes - Phase 2 command bar and buttons
+ *
+ * Every POST (ask, instruct, tick, pause, resume, agent run/stop/release,
+ * gate submit/stuck, merge, dragon start/stop) needs the owner's session
+ * (src/server/human-auth/); the GETs stay open.
  */
 import type { FastifyInstance } from "fastify";
 import {
@@ -15,6 +19,7 @@ import { isValidDragonId } from "../parsers/dragon-config.js";
 import { knownDragonIds } from "../services/dragon-registry.js";
 import { projectQueryGuard, type ProjectRouteConfig } from "./project-guard.js";
 import { rejectCrossSiteRequests } from "../origin.js";
+import type { HumanAuth } from "../human-auth/index.js";
 import { CommandService, getAuditLog } from "../services/command.js";
 import { parseInboxFile, formatInboxEntry } from "../parsers/inbox.js";
 import type {
@@ -133,16 +138,20 @@ export function dragonIdError(config: ProjectConfig, dragonId: unknown): string 
 
 export async function registerControlRoutes(
   fastify: FastifyInstance,
+  /** Every POST here (commands, dragon start and stop) needs the owner's session */
+  auth: HumanAuth,
 ): Promise<void> {
   // Encapsulated so the project guard applies only to these routes
-  await fastify.register(controlRoutes);
+  await fastify.register((app) => controlRoutes(app, auth));
 }
 
-async function controlRoutes(fastify: FastifyInstance): Promise<void> {
+async function controlRoutes(fastify: FastifyInstance, auth: HumanAuth): Promise<void> {
   // Every control route loads projects/<project>.yaml; validate the name first
   // Refuse cross-site browser requests (CSRF, DNS rebinding) before anything else
   fastify.addHook("onRequest", rejectCrossSiteRequests);
   fastify.addHook("onRequest", projectQueryGuard());
+  // Commands run the project's scripts and start or stop agents: the owner only, before the body is read
+  fastify.addHook("onRequest", auth.requireOwnerForChanges());
 
   // ============ CONTROLS STATUS ============
 

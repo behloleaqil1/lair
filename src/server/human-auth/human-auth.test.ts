@@ -12,7 +12,7 @@ import { join } from "path";
 import { registerRootGuards } from "../root-guards.js";
 import { HumanAuth, OWNER_SESSION_HEADER, dashboardRequestProblem, dashboardUrlFor } from "./human-auth.js";
 import { registerOwnerRoutes } from "./routes.js";
-import { corsOptionsWithout, isUnder } from "./cors.js";
+import { OWNER_ONLY_PREFIXES, corsOptionsWithout, isUnder } from "./cors.js";
 
 const NOW = Date.parse("2026-03-02T12:00:00.000Z");
 const DASHBOARD = { origin: "http://localhost:4777", "sec-fetch-site": "same-origin" };
@@ -297,5 +297,60 @@ describe("CORS", () => {
     expect(isUnder("/api/decisions/x/answer?y=1", ["/api/decisions"])).toBe(true);
     expect(isUnder("/api/decisionsx", ["/api/decisions"])).toBe(false);
     expect(isUnder("/api/other", ["/api/decisions"])).toBe(false);
+  });
+});
+
+describe("requireOwnerForChanges", () => {
+  it("lets every read through and holds every write to the owner's session, before the handler runs", async () => {
+    const { auth, token } = open();
+    const { session } = auth.createSession(token)!;
+    const ran: string[] = [];
+    app = Fastify();
+    await app.register(async (routes) => {
+      routes.addHook("onRequest", auth.requireOwnerForChanges());
+      routes.get("/api/module/state", async () => ({ ok: true }));
+      for (const method of ["POST", "PUT", "PATCH", "DELETE"] as const) {
+        routes.route({
+          method,
+          url: "/api/module/state",
+          handler: async () => {
+            ran.push(method);
+            return { ok: true };
+          },
+        });
+      }
+    });
+    await app.ready();
+
+    expect((await app.inject({ url: "/api/module/state" })).statusCode).toBe(200);
+    for (const method of ["POST", "PUT", "PATCH", "DELETE"] as const) {
+      const refused = await app.inject({ method, url: "/api/module/state", headers: DASHBOARD });
+      expect(refused.statusCode).toBe(403);
+      expect(refused.json().error).toContain("this browser is not signed in as the owner");
+    }
+    expect(ran).toEqual([]);
+    for (const method of ["POST", "PUT", "PATCH", "DELETE"] as const) {
+      const owner = await app.inject({ method, url: "/api/module/state", headers: { ...DASHBOARD, [OWNER_SESSION_HEADER]: session } });
+      expect(owner.statusCode).toBe(200);
+    }
+    expect(ran).toEqual(["POST", "PUT", "PATCH", "DELETE"]);
+  });
+
+  it("keeps CORS off every prefix whose writes are the owner's, and on the bus's reads", () => {
+    for (const path of [
+      "/api/delivery/environments/local/up",
+      "/api/controls/dragon/start",
+      "/api/processes/api/start",
+      "/api/settings",
+      "/api/scheduler/start",
+      "/api/tasks",
+      "/api/fleet/machines",
+      "/api/pipelines/runs",
+      "/api/bus/send",
+    ]) {
+      expect(isUnder(path, OWNER_ONLY_PREFIXES)).toBe(true);
+    }
+    expect(isUnder("/api/bus/events", OWNER_ONLY_PREFIXES)).toBe(false);
+    expect(isUnder("/api/watchdog/status", OWNER_ONLY_PREFIXES)).toBe(false);
   });
 });

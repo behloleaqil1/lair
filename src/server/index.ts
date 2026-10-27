@@ -313,23 +313,36 @@ fastify.get<{ Querystring: { project?: string } }>(
   },
 );
 
-// Register Phase 2 control routes
-await registerControlRoutes(fastify);
+// The owner's credential (src/server/human-auth/): the token in
+// data/owner.token and the browser sessions signed in with it. Every route
+// that changes something only the human may change needs one of those
+// sessions: decisions, reviews, and the writes of controls, bus messages,
+// processes, settings, scheduler, tasks, fleet, delivery and pipelines. The
+// setup link is printed to this process's stdout at first start.
+const humanAuth = HumanAuth.open({
+  tokenPath: join(process.cwd(), "data", "owner.token"),
+  dbPath: join(process.cwd(), "data", "owner-sessions.db"),
+});
+humanAuth.announce(dashboardUrlFor(HOST, PORT));
+await registerOwnerRoutes(fastify, humanAuth);
 
-// Register Phase 3 bus routes
-await registerBusRoutes(fastify);
+// Register Phase 2 control routes (commands and dragon start/stop: owner only)
+await registerControlRoutes(fastify, humanAuth);
 
-// Register process manager routes
-await registerProcessRoutes(fastify);
+// Register Phase 3 bus routes (messages sent as the owner: owner only)
+await registerBusRoutes(fastify, humanAuth);
 
-// Register settings routes
-await registerSettingsRoutes(fastify);
+// Register process manager routes (start/stop/restart: owner only)
+await registerProcessRoutes(fastify, humanAuth);
 
-// Register M1 scheduler and node routes
-await registerSchedulerRoutes(fastify);
+// Register settings routes (saving, machine tests: owner only)
+await registerSettingsRoutes(fastify, humanAuth);
 
-// Register M3 fleet management routes
-await registerFleetRoutes(fastify);
+// Register M1 scheduler and node routes (scheduler controls, task changes: owner only)
+await registerSchedulerRoutes(fastify, humanAuth);
+
+// Register M3 fleet management routes (every change: owner only)
+await registerFleetRoutes(fastify, humanAuth);
 
 const projectEntries = listProjects().map((name) => {
   try {
@@ -347,7 +360,8 @@ const delivery = new DeliveryManager({
   events: getEventBus(),
 });
 delivery.load(projectEntries);
-await registerDeliveryRoutes(fastify, delivery, () => getDefaultProject());
+// Up, Down, Restart, Deploy and Release need the owner's session
+await registerDeliveryRoutes(fastify, delivery, () => getDefaultProject(), humanAuth);
 
 // Agent runs (claims, locks, recovery, failover, budgets): one service per
 // project with `agents.enabled: true` (off by default). Costs reach its
@@ -381,18 +395,8 @@ const pipelines = new PipelineManager({
   budget: getBudgetManager(),
 });
 pipelines.load(projectEntries);
-await registerPipelineRoutes(fastify, pipelines, () => getDefaultProject());
-
-// The owner's credential (src/server/human-auth/): the token in
-// data/owner.token and the browser sessions signed in with it. Routes only
-// the human may use (answering decisions) need one of those sessions. The
-// setup link is printed to this process's stdout at first start.
-const humanAuth = HumanAuth.open({
-  tokenPath: join(process.cwd(), "data", "owner.token"),
-  dbPath: join(process.cwd(), "data", "owner-sessions.db"),
-});
-humanAuth.announce(dashboardUrlFor(HOST, PORT));
-await registerOwnerRoutes(fastify, humanAuth);
+// Starting and cancelling runs need the owner's session
+await registerPipelineRoutes(fastify, pipelines, () => getDefaultProject(), humanAuth);
 
 // Decision Inbox: the one place Lair asks the human (data/decisions.db). The
 // watchdog's and the agents module's escalations (and the agents' spend decisions) become

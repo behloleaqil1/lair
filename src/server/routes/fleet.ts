@@ -1,6 +1,11 @@
 /**
  * Fleet management API routes for M3.
  * Add machines, manage self-healing, control budgets.
+ *
+ * Every change (machines added, removed, tested or installed; healing and
+ * budget settings; provider budgets and unpausing) needs the owner's session
+ * (src/server/human-auth/); the GETs stay open. The healer and the scheduler
+ * use the managers inside the server, not these routes.
  */
 import type { FastifyInstance } from "fastify";
 import { getMachineManager } from "../fleet/machine-manager.js";
@@ -8,6 +13,7 @@ import { getHealer } from "../fleet/healer.js";
 import { getBudgetManager } from "../fleet/budget.js";
 import { getScheduler } from "../scheduler/scheduler.js";
 import { rejectCrossSiteRequests } from "../origin.js";
+import type { HumanAuth } from "../human-auth/index.js";
 import type {
   AddMachineRequest,
   ProviderBudget,
@@ -42,14 +48,19 @@ function respondError(error: string): ApiResponse<never> {
 /**
  * Register fleet management routes.
  */
-export async function registerFleetRoutes(fastify: FastifyInstance): Promise<void> {
+export async function registerFleetRoutes(
+  fastify: FastifyInstance,
+  /** Every fleet change needs the owner's session */
+  auth: HumanAuth,
+): Promise<void> {
   // Encapsulated so the cross-site guard applies to these routes
-  await fastify.register(fleetRoutes);
+  await fastify.register((app) => fleetRoutes(app, auth));
 }
 
-async function fleetRoutes(fastify: FastifyInstance): Promise<void> {
+async function fleetRoutes(fastify: FastifyInstance, auth: HumanAuth): Promise<void> {
   // Refuse cross-site browser requests (CSRF, DNS rebinding)
   fastify.addHook("onRequest", rejectCrossSiteRequests);
+  fastify.addHook("onRequest", auth.requireOwnerForChanges());
 
   // ============ OVERVIEW ============
 

@@ -3,12 +3,13 @@
  * guards and pipeline routes as src/server/index.ts, listening on a port,
  * with a project config loaded from projects/local/ by the real loader.
  * Steps run as real processes (the real spawner) in a real git worktree.
- * Only the GitHub REST API is fake.
+ * Only the GitHub REST API is fake. Starting and cancelling runs need the
+ * owner's session (src/server/human-auth/), registered as index.ts does.
  */
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
 import { execFileSync } from "child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import type { AddressInfo } from "net";
@@ -18,6 +19,9 @@ import type { PipelineRun, PipelinesStatus } from "../../shared/pipeline-types.j
 import { PipelineManager } from "./pipeline-service.js";
 import { registerPipelineRoutes } from "./routes.js";
 import { AMPLE, FakeCapacity, FakeGitHub, ShortSleepClock, TOKEN } from "./testing/fakes.js";
+import { HumanAuth, OWNER_SESSION_HEADER, registerOwnerRoutes } from "../human-auth/index.js";
+import { signIn } from "../../client/owner-session";
+import { startPipelineRun } from "../../client/owner-actions";
 
 const LOCAL_DIR = join(process.cwd(), "projects", "local");
 const PROJECT = "lair-pipelines-http-test";
@@ -33,6 +37,10 @@ let app: FastifyInstance | null = null;
 let manager: PipelineManager | null = null;
 let github: FakeGitHub;
 let capacity: FakeCapacity;
+/** The owner token, and a browser session signed in with it (starting and cancelling runs need one) */
+let ownerToken = "";
+let ownerSession = "";
+const DASHBOARD = "http://localhost:4777";
 
 function yamlFor(name: string, readOnly: boolean): string {
   const q = JSON.stringify;
@@ -117,7 +125,12 @@ beforeAll(async () => {
 
   app = Fastify({ logger: false });
   registerRootGuards(app);
-  await registerPipelineRoutes(app, manager, () => PROJECT);
+  // The owner's credential, as src/server/index.ts wires it; app.close() closes it
+  const auth = HumanAuth.open({ tokenPath: join(tmp, "owner.token"), dbPath: ":memory:" });
+  await registerOwnerRoutes(app, auth);
+  await registerPipelineRoutes(app, manager, () => PROJECT, auth);
+  ownerToken = readFileSync(join(tmp, "owner.token"), "utf-8").trim();
+  ownerSession = auth.createSession(ownerToken)!.session;
   await app.listen({ port: 0, host: "127.0.0.1" });
   base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
 });
@@ -135,10 +148,16 @@ afterAll(async () => {
 
 async function api<T>(
   path: string,
-  init: { method?: string; body?: unknown; origin?: string } = {},
+  init: { method?: string; body?: unknown; origin?: string; owner?: boolean } = {},
 ): Promise<{ status: number; body: { success: boolean; data?: T; error?: string } }> {
   const headers: Record<string, string> = {};
   if (init.body !== undefined) headers["content-type"] = "application/json";
+  // Writes go out as the dashboard signed in as the owner, unless a test says otherwise
+  if ((init.method ?? "GET") !== "GET" && init.owner !== false) {
+    headers.origin = DASHBOARD;
+    headers["sec-fetch-site"] = "same-origin";
+    headers[OWNER_SESSION_HEADER] = ownerSession;
+  }
   if (init.origin) headers.origin = init.origin;
   const res = await fetch(`${base}${path}`, {
     method: init.method ?? "GET",
@@ -260,3 +279,64 @@ describe("pipeline API over HTTP", () => {
     expect(github.dispatches).toHaveLength(1);
   });
 });
+
+describe("pipeline runs need the owner's session", () => {
+  it("refuses to start or cancel a run without it, before anything runs", async () => {
+    const dispatches = github.dispatches.length;
+    const runs = (await api<PipelineRun[]>(`/api/pipelines/runs?project=${PROJECT}&limit=500`)).body.data!.length;
+
+    const start = await api(`/api/pipelines/runs?project=${PROJECT}`, {
+      method: "POST",
+      body: { pipeline: "gate", sha },
+      owner: false,
+    });
+    expect(start.status).toBe(403);
+    expect(start.body.error).toContain("no Origin header");
+    const cancel = await api(`/api/pipelines/runs/run-000000000000/cancel?project=${PROJECT}`, { method: "POST", owner: false });
+    expect(cancel.status).toBe(403);
+
+    expect(github.dispatches).toHaveLength(dispatches);
+    expect((await api<PipelineRun[]>(`/api/pipelines/runs?project=${PROJECT}&limit=500`)).body.data).toHaveLength(runs);
+  });
+
+  it("starts a run through the Gates view's helper once this browser is signed in as the owner", async () => {
+    const realFetch = globalThis.fetch;
+    // The dashboard's browser: relative URLs on this server, with the headers a same-origin page sends
+    vi.stubGlobal("localStorage", memoryStorage());
+    vi.stubGlobal("fetch", (input: string, init: RequestInit = {}) =>
+      realFetch(`${base}${input}`, {
+        ...init,
+        headers: { ...(init.headers as Record<string, string>), origin: DASHBOARD, "sec-fetch-site": "same-origin" },
+      }),
+    );
+    try {
+      const refused = await startPipelineRun<PipelineRun>(PROJECT, { pipeline: "gate", sha });
+      expect(refused.success).toBe(false);
+      expect(refused.error).toContain("not signed in as the owner");
+
+      await signIn(ownerToken);
+      const started = await startPipelineRun<PipelineRun>(PROJECT, { pipeline: "gate", sha });
+      expect(started.success).toBe(true);
+      vi.unstubAllGlobals();
+      const run = await waitForRun(started.data!.id);
+      expect(run).toMatchObject({ pipeline: "gate", commitSha: sha });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+/** localStorage for one origin (where the dashboard keeps its owner session). */
+function memoryStorage(): Storage {
+  const values = new Map<string, string>();
+  return {
+    get length() {
+      return values.size;
+    },
+    clear: () => values.clear(),
+    getItem: (key: string) => values.get(key) ?? null,
+    key: (index: number) => [...values.keys()][index] ?? null,
+    removeItem: (key: string) => void values.delete(key),
+    setItem: (key: string, value: string) => void values.set(key, String(value)),
+  };
+}
