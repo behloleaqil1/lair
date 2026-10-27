@@ -1151,7 +1151,7 @@ Unknown keys, invalid regular expressions, a usage pattern without a named group
 
 - An agent that isn't in `fill.agents` is never started (`not allowlisted`). The allowlist is required, so you can move agents over one at a time while another launcher still runs the rest.
 - A task with an active run of the line's agent is `started`; one with another agent's run or another claim on it is `claimed`. Neither is started again.
-- A task that is `done` is not started again: `done_pattern` matches a queue line (`queue_file`) written since the task was last started (the whole file for a task Lair never ran). Lines are matched as the module's own DONE check reads them: trimmed, and case-insensitively, but the task id must be in the matched text exactly as written (task ids are case-sensitive). Once fill has seen a task done it keeps that in the store, so rotating or truncating the queue file, or a done line falling out of the 4 MB fill reads, never restarts a finished task. Editing the task's line in `tasks_file` drops what was kept, but the next check finds the done line again while it is still in the queue file. Agents write the queue file, so a done line only keeps fill from starting a task again; it proves nothing else. To overrule a done line you don't trust, request a run of the task yourself (Agents view): that is a new start, so only lines written after it count, and fill carries the task on from there.
+- A task that is `done` is not started again: `done_pattern` matches a queue line (`queue_file`) written since the task was last started (the whole file for a task Lair never ran). Lines are matched as the module's own DONE check reads them: trimmed, and case-insensitively, but the task id must be in the matched text exactly as written (task ids are case-sensitive). A pattern may match by agent instead (see [Matching by agent](#matching-by-agent)). Once fill has seen a task done it keeps that in the store, so rotating or truncating the queue file, or a done line falling out of the 4 MB fill reads, never restarts a finished task. Editing the task's line in `tasks_file` drops what was kept, but the next check finds the done line again while it is still in the queue file. Agents write the queue file, so a done line only keeps fill from starting a task again; it proves nothing else. To overrule a done line you don't trust, request a run of the task yourself (Agents view): that is a new start, so only lines written after it count, and fill carries the task on from there.
 - A run that exits 0 on a WAITING or BLOCKED line for its task waits, or is held: see [Waiting and blocked runs](#waiting-and-blocked-runs) below.
 - A run that exits 0 without writing the done line, or a WAITING or BLOCKED one (an adapter that stops on a usage limit with exit code 0, say), is started again with fill's prompt (built from `prompt_files` again, not the prompt of a run you requested), after `backoff_seconds`, doubling up to `max_backoff_seconds` (`held: backoff`, with the time). After `max_completions_without_done` such runs in a row, fill holds the task (`held: no_done`) and raises one decision in the [Decision Inbox](#decision-inbox) with those runs and the last run's last output lines: "Let fill start it again" (it counts from zero) or "Keep it held" (recommended).
 - A task whose last run ended in any other way than completing is `held: owner`: it is yours to resume, and fill never restarts it by itself. A run that was escalated has its own decision already (`escalation`, see Decisions above), and one you stopped or whose claim you released is your own doing; a run whose claim was lost to another holder, without you releasing it, gets one decision from fill. A run that dies is restarted by the module's recovery, not by fill, so there is never a second run of one task.
@@ -1198,7 +1198,7 @@ worker-b|Bob|feat-search|Search page
 | `fill.agents` | array | `[]` | Required when enabled. The agent ids fill may start |
 | `fill.prompt_files` | array | `[]` | Required when enabled. Files whose contents, in order, make the prompt. `{prompts_dir}`, `{agent}`, `{task}` |
 | `fill.max_active` | number | `1` | Runs fill started that may be active at once (restarts and retries count) |
-| `fill.done_pattern` | string | `^-\s+DONE\s+{task}(?=\s\|$)` | Regular expression for a queue line that reports the task done, matched case-insensitively against each trimmed line; the task id must be in the matched text exactly. Must contain `{task}`; `{agent}` too, if you like. Both are inserted as literal text. End the task id at whitespace, not `\b`, `:` or `-`: task ids can contain `-` and `:` |
+| `fill.done_pattern` | string | `^-\s+DONE\s+{task}(?=\s\|$)` | Regular expression for a queue line that reports the task done, matched case-insensitively against each trimmed line; the task id must be in the matched text exactly. Must contain `{task}`, `{agent}` or both ([Matching by agent](#matching-by-agent)), inserted as literal text. End the task id at whitespace, not `\b`, `:` or `-`: task ids can contain `-` and `:` |
 | `fill.capacity_cmd` | array | — | Exit 0: capacity available; anything else holds, with its first output line as the reason |
 | `fill.interval_seconds` | number | `60` | Seconds between fill checks |
 | `fill.max_completions_without_done` | number | `3` | Runs in a row that exit 0 without the done line; then fill holds the task and asks you |
@@ -1212,7 +1212,7 @@ worker-b|Bob|feat-search|Search page
 | `fill.wake.max_wait_minutes` | number | `240` | Waiting this long raises one decision |
 | `fill.wake.fallback_seconds` | number | `900` | With nothing to wait on (no capture, no `wake.file`, or a refused capture), the task starts again after this long |
 
-A fill block that is enabled without `agents.enabled`, `tasks_file`, `agents` or `prompt_files`, an invalid agent id in `agents`, a `prompt_files` entry with a `..` segment or an unknown placeholder, a `done_pattern`, `waiting_pattern` or `blocked_pattern` without `{task}` or that isn't a regular expression, or a `wake.file` without `{wake}` (or a `wake.file` or `wake.root` with a `..` segment or an unknown placeholder) is a config error.
+A fill block that is enabled without `agents.enabled`, `tasks_file`, `agents` or `prompt_files`, an invalid agent id in `agents`, a `prompt_files` entry with a `..` segment or an unknown placeholder, a `done_pattern`, `waiting_pattern` or `blocked_pattern` with neither `{task}` nor `{agent}`, or that isn't a regular expression, or a `wake.file` without `{wake}` (or a `wake.file` or `wake.root` with a `..` segment or an unknown placeholder) is a config error.
 
 #### Waiting and blocked runs
 
@@ -1233,6 +1233,26 @@ agents:
       poll_seconds: 60
       max_wait_minutes: 240
       fallback_seconds: 900
+```
+
+#### Matching by agent
+
+`done_pattern`, `waiting_pattern` and `blocked_pattern` contain `{task}`, `{agent}` or both; at least one is required, and both are inserted as literal text. Use `{agent}` when your agents' queue lines don't carry the `tasks_file` id. A line for `kiro/currency-enforcement` may say `- WAITING currency-enforcement <gate-id> by kiro-H (Viserion) 06:25Z: ...`, and one for `kiro/sf-storage` `- WAITING #183 sf-storage gate <gate-id> by kiro-D (Glaurung) ...`. What every line has is `by <agent>`.
+
+Matching by agent is safe because fill only looks at the lines written since the task's run was requested, and one agent runs one task at a time: after its start, a line by that agent is about its current task. So a pattern without `{task}` counts no line from before a start. A task Lair never ran isn't done by such a pattern, and neither is one whose queue file was rewritten (what fill had already seen is kept).
+
+With `{agent}` the line must be that agent's own, as the module reads queue lines: the agent is the first `by <id>` followed by `(`, a time, `:` or the end of the line. A line by another agent that names this one in its message (`... by kiro-H (Viserion) 07:10Z: reviewed by kiro-C`) is kiro-H's, so it never counts for kiro-C. A longer id is another agent: end `{agent}` with `(?=[\s(]|$)`, as below, so `kiro-A` doesn't match `kiro-AB`. One limit remains: a line whose text puts `by <other-agent> (` before its real author's attribution is read as that other agent's.
+
+```yaml
+agents:
+  fill:
+    # A fleet whose queue lines name the agent, not always the task id
+    done_pattern: '^-\s+DONE\s+.*\bby\s+{agent}(?=[\s(]|$)'
+    # The gate id is optional: a WAITING line without one still waits (and falls back)
+    waiting_pattern: '^-\s+WAITING\s+(?:(?:.*?\s)?(?<wake>\d{8}T\d{6}Z-[A-Za-z0-9._-]+)\b)?.*\bby\s+{agent}(?=[\s(]|$)'
+    blocked_pattern: '^-\s+BLOCKED\s+.*\bby\s+{agent}(?=[\s(]|$)'
+    wake:
+      file: "{gates_dir}/results/{wake}.rc"
 ```
 
 ### Agents API

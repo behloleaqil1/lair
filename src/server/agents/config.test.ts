@@ -11,7 +11,7 @@ import {
   DEFAULT_DONE_PATTERN,
   DEFAULT_WAITING_PATTERN,
   doneLineMatches,
-  donePatternFor,
+  fillPatternFor,
   parseAgentsConfig,
   taskLineMatch,
 } from "./config.js";
@@ -167,8 +167,10 @@ describe("agents config", () => {
     expect(errorsOf(withFill({}))).toEqual([]);
     for (const key of ["waiting_pattern", "blocked_pattern"]) {
       expect(errorsOf(withFill({ [key]: "^- WAITING " }))).toEqual([
-        `agents.fill.${key}: needs {task} (without it one ${key === "waiting_pattern" ? "waiting" : "blocked"} line would match every task)`,
+        `agents.fill.${key}: needs {task} or {agent} (without either one ${key === "waiting_pattern" ? "waiting" : "blocked"} line would match every task)`,
       ]);
+      // {agent} alone is enough
+      expect(errorsOf(withFill({ [key]: "^- WAITING .*\\bby\\s+{agent}(?=[\\s(]|$)" }))).toEqual([]);
       expect(errorsOf(withFill({ [key]: "^- BLOCKED ({task}" }))[0]).toContain(`agents.fill.${key}: not a valid regular expression`);
       expect(errorsOf(withFill({ [key]: "^- BLOCKED {task} {gate}" }))[0]).toContain(`agents.fill.${key}: unknown placeholder {gate}`);
     }
@@ -186,7 +188,7 @@ describe("agents config", () => {
 
   it("the default waiting and blocked patterns: the task's own line, the task id exact", () => {
     const matches = (template: string, line: string, task = "feat-login") =>
-      taskLineMatch(donePatternFor(template, task, "worker-a"), task, line) !== null;
+      taskLineMatch(fillPatternFor(template, task, "worker-a"), line) !== null;
     expect(matches(DEFAULT_WAITING_PATTERN, "- WAITING feat-login 20260101T000000Z-x-abcdef12-1 by worker-a: gate queued")).toBe(true);
     expect(matches(DEFAULT_WAITING_PATTERN, "  -  waiting feat-login")).toBe(true);
     expect(matches(DEFAULT_WAITING_PATTERN, "- WAITING feat-login-2 by worker-a")).toBe(false);
@@ -195,11 +197,47 @@ describe("agents config", () => {
     expect(matches(DEFAULT_BLOCKED_PATTERN, "- BLOCKED FEAT-LOGIN by worker-a")).toBe(false);
     expect(matches(DEFAULT_BLOCKED_PATTERN, "- DONE feat-login by worker-a")).toBe(false);
     // A capture names what the run waits on
-    const gate = donePatternFor("^-\\s+WAITING\\s+{task}(?:\\s+(?<wake>\\d{8}T\\d{6}Z-\\S+))?(?=\\s|$)", "feat-login", "worker-a");
-    expect(taskLineMatch(gate, "feat-login", "- WAITING feat-login 20260101T000000Z-x-abcdef12-1 by worker-a")?.groups?.wake).toBe(
+    const gate = fillPatternFor("^-\\s+WAITING\\s+{task}(?:\\s+(?<wake>\\d{8}T\\d{6}Z-\\S+))?(?=\\s|$)", "feat-login", "worker-a");
+    expect(taskLineMatch(gate, "- WAITING feat-login 20260101T000000Z-x-abcdef12-1 by worker-a")?.groups?.wake).toBe(
       "20260101T000000Z-x-abcdef12-1",
     );
-    expect(taskLineMatch(gate, "feat-login", "- WAITING feat-login by worker-a")?.groups?.wake).toBeUndefined();
+    expect(taskLineMatch(gate, "- WAITING feat-login by worker-a")?.groups?.wake).toBeUndefined();
+  });
+
+  it("patterns that match by agent: the fleet's real line shapes, the agent's own lines only, never a longer id", () => {
+    const doc = readFileSync(new URL("../../../docs/configuration.md", import.meta.url), "utf-8");
+    const section = doc.slice(doc.indexOf("#### Matching by agent"));
+    const start = section.indexOf("```yaml") + "```yaml".length;
+    const example = parseYaml(section.slice(start, section.indexOf("```", start))) as { agents: unknown };
+    const parsed = parseAgentsConfig(example.agents, project);
+    expect(parsed.ok ? [] : parsed.errors).toEqual([]);
+    if (!parsed.ok) return;
+    const { donePattern, waitingPattern, blockedPattern } = parsed.settings.fill;
+    // The tasks file's ids (kiro/currency-enforcement, ...) are not in the lines: these patterns don't use {task}
+    const match = (template: string, agent: string, line: string) =>
+      taskLineMatch(fillPatternFor(template, "kiro/currency-enforcement", agent), line);
+
+    const waitingH =
+      "- WAITING currency-enforcement 20261027T041146Z-currency-enforcement-r9-64bebb9d-77679 by kiro-H (Viserion) 06:25Z: gate queued";
+    expect(match(waitingPattern, "kiro-H", waitingH)?.groups?.wake).toBe("20261027T041146Z-currency-enforcement-r9-64bebb9d-77679");
+    const waitingD = "- WAITING #183 sf-storage gate 20261027T064438Z-sf-storage-ab12cd34-5150 by kiro-D (Glaurung) 06:45Z: gate queued";
+    expect(match(waitingPattern, "kiro-D", waitingD)?.groups?.wake).toBe("20261027T064438Z-sf-storage-ab12cd34-5150");
+    // A WAITING line without a gate id still waits (it falls back)
+    const waitingB = "- WAITING trial-allowance-3 by kiro-B (Drogon) 06:30Z: waiting on a review";
+    expect(match(waitingPattern, "kiro-B", waitingB)).not.toBeNull();
+    expect(match(waitingPattern, "kiro-B", waitingB)?.groups?.wake).toBeUndefined();
+    expect(match(donePattern, "kiro-H", "- DONE currency-enforcement by kiro-H (Viserion) 07:10Z: merged")).not.toBeNull();
+    expect(match(blockedPattern, "kiro-D", "- BLOCKED #183 sf-storage by kiro-D (Glaurung) 06:50Z: needs the bucket key")).not.toBeNull();
+
+    // Only the agent's own lines: kiro-H's line naming kiro-C in its message isn't kiro-C's
+    expect(match(donePattern, "kiro-C", "- DONE currency-enforcement by kiro-H (Viserion) 07:10Z: reviewed by kiro-C")).toBeNull();
+    expect(match(waitingPattern, "kiro-C", `${waitingH}, review by kiro-C`)).toBeNull();
+    // A longer id that starts with the agent's is another agent
+    expect(match(donePattern, "kiro-A", "- DONE sf-storage by kiro-AB (Rhaegal) 07:00Z: merged")).toBeNull();
+    expect(match(blockedPattern, "kiro-A", "- BLOCKED sf-storage by kiro-AB: needs a key")).toBeNull();
+    // Another kind of line, and another agent, never count
+    expect(match(donePattern, "kiro-H", waitingH)).toBeNull();
+    expect(match(waitingPattern, "kiro-D", waitingH)).toBeNull();
   });
 
   it("fill: prompt paths can't climb out, placeholders are checked, done_pattern needs {task}", () => {
@@ -219,7 +257,10 @@ describe("agents config", () => {
       "agents.fill.prompt_files[0]: unknown placeholder {repo}",
     );
     expect(errorsOf(withFill({ agents: ["not an id"] }))).toEqual(["agents.fill.agents[0]: not an id is not a valid agent id"]);
-    expect(errorsOf(withFill({ done_pattern: "^- DONE " }))[0]).toContain("agents.fill.done_pattern: needs {task}");
+    expect(errorsOf(withFill({ done_pattern: "^- DONE " }))).toEqual([
+      "agents.fill.done_pattern: needs {task} or {agent} (without either one done line would match every task)",
+    ]);
+    expect(errorsOf(withFill({ done_pattern: "^- DONE .*\\bby\\s+{agent}(?=[\\s(]|$)" }))).toEqual([]);
     expect(errorsOf(withFill({ done_pattern: "^- DONE ({task}" }))[0]).toContain(
       "agents.fill.done_pattern: not a valid regular expression",
     );
@@ -230,8 +271,7 @@ describe("agents config", () => {
   });
 
   it("the default done_pattern: a DONE line for the task, in any case and spacing, never a longer task id", () => {
-    const done = (line: string, task = "feat-login") =>
-      doneLineMatches(donePatternFor(DEFAULT_DONE_PATTERN, task, "worker-a"), task, line);
+    const done = (line: string, task = "feat-login") => doneLineMatches(fillPatternFor(DEFAULT_DONE_PATTERN, task, "worker-a"), line);
     expect(done("- DONE feat-login by worker-a 12:05Z: merged")).toBe(true);
     expect(done("- DONE feat-login")).toBe(true);
     // Trimmed, and DONE in any case, as the module's own DONE check reads queue lines
@@ -257,7 +297,7 @@ describe("agents config", () => {
     expect(parsed.ok ? [] : parsed.errors).toEqual([]);
     if (!parsed.ok) return;
     const done = (line: string, task: string) =>
-      doneLineMatches(donePatternFor(parsed.settings.fill.donePattern, task, "worker-a"), task, line);
+      doneLineMatches(fillPatternFor(parsed.settings.fill.donePattern, task, "worker-a"), line);
     expect(done("- DONE feat-login by worker-a 12:05Z: merged", "feat-login")).toBe(true);
     expect(done("- DONE feat-login-2 by worker-a", "feat-login")).toBe(false);
     expect(done("- DONE feat:login by worker-a", "feat")).toBe(false);

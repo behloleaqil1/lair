@@ -6,6 +6,7 @@ import { z } from "zod";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { BudgetMetric } from "../../shared/agents-types.js";
 import { isValidDragonId } from "../parsers/dragon-config.js";
+import { parseQueueLine } from "../parsers/queue.js";
 import { getAdapter } from "../services/adapters.js";
 import { placeholdersIn } from "../watchdog/config.js";
 
@@ -250,19 +251,48 @@ export function donePatternFor(template: string, task: string, agent: string): R
   );
 }
 
-/**
- * A queue line reports the task done: the trimmed line matches the pattern,
- * and the matched text holds the task id exactly as written (task ids are
- * case-sensitive; the DONE keyword is not).
- */
-export function doneLineMatches(pattern: RegExp, task: string, line: string): boolean {
-  return taskLineMatch(pattern, task, line) !== null;
+/** A fill pattern (done, waiting, blocked) for one task and agent, with what it names. */
+export interface FillPattern {
+  regex: RegExp;
+  /** The task id, when the template has {task}: the matched text must hold it exactly */
+  task: string | null;
+  /** The agent id, when the template has {agent}: the line must be that agent's */
+  agent: string | null;
 }
 
-/** The match of a fill pattern (done, waiting, blocked) on a queue line, by doneLineMatches' rules, or null. */
-export function taskLineMatch(pattern: RegExp, task: string, line: string): RegExpExecArray | null {
-  const match = pattern.exec(line.trim());
-  return match !== null && match[0].includes(task) ? match : null;
+/** A fill pattern for one task: the template has {task}, {agent} or both (config.ts checks it). */
+export function fillPatternFor(template: string, task: string, agent: string): FillPattern {
+  return {
+    regex: donePatternFor(template, task, agent),
+    task: template.includes("{task}") ? task : null,
+    agent: template.includes("{agent}") ? agent : null,
+  };
+}
+
+/** A queue line reports what the pattern looks for (see taskLineMatch). */
+export function doneLineMatches(pattern: FillPattern, line: string): boolean {
+  return taskLineMatch(pattern, line) !== null;
+}
+
+/**
+ * The match of a fill pattern on a queue line, or null. The trimmed line
+ * must match, case-insensitively. With {task}, the matched text must hold
+ * the task id exactly as written (task ids are case-sensitive; the DONE
+ * keyword is not). With {agent}, the line must be that agent's, by the
+ * module's own reading of a queue line (parseQueueLine: the first
+ * "by <agent>" followed by "(", a time, ":" or the end): a line by another
+ * agent that names this one in its message, or a longer id that starts with
+ * this one, doesn't count.
+ */
+export function taskLineMatch(pattern: FillPattern, line: string): RegExpExecArray | null {
+  const text = line.trim();
+  if (pattern.task !== null && !text.includes(pattern.task)) return null;
+  if (pattern.agent !== null && !text.toLowerCase().includes(pattern.agent.toLowerCase())) return null;
+  const match = pattern.regex.exec(text);
+  if (match === null) return null;
+  if (pattern.task !== null && !match[0].includes(pattern.task)) return null;
+  if (pattern.agent !== null && parseQueueLine(text)?.agent?.toLowerCase() !== pattern.agent.toLowerCase()) return null;
+  return match;
 }
 
 /** What a waiting line may name to wait on: one plain name (a gate id, say), never a path or an option */
@@ -551,11 +581,11 @@ function checkFill(value: RawSettings, errors: string[]): void {
   if (wake.root.split(/[\\/]/).includes("..")) errors.push('agents.fill.wake.root: a ".." segment is refused');
 }
 
-/** A fill pattern: {task} and {agent} only, {task} required, and it compiles. */
+/** A fill pattern: {task} and {agent} only, at least one of them, and it compiles. */
 function checkTaskPattern(pattern: string, key: string, what: string, errors: string[]): void {
   checkPlaceholders(pattern, ["task", "agent"], `agents.fill.${key}`, errors);
-  if (!pattern.includes("{task}")) {
-    errors.push(`agents.fill.${key}: needs {task} (without it one ${what} line would match every task)`);
+  if (!pattern.includes("{task}") && !pattern.includes("{agent}")) {
+    errors.push(`agents.fill.${key}: needs {task} or {agent} (without either one ${what} line would match every task)`);
     return;
   }
   try {

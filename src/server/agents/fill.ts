@@ -9,7 +9,9 @@
  * - started when a run of its agent on its task is active;
  * - claimed when another agent's run, or any other claim, holds the task;
  * - done when done_pattern matches a queue line written since the task's
- *   last chain was requested (the whole file for a task with no run). Once
+ *   last chain was requested (the whole file for a task with no run, when
+ *   the pattern names the task; one that names only the agent counts only
+ *   that agent's own lines, and only since a start). Once
  *   seen, done is kept in the store (a fill_done event for the task's latest
  *   run and the line as written), so a rotated or truncated queue file never
  *   restarts a finished task. An edited line drops that record, but the queue
@@ -61,7 +63,15 @@ import type {
 } from "../../shared/agents-types.js";
 import { isValidDragonId } from "../parsers/dragon-config.js";
 import { getPromptsDir } from "../routes/controls.js";
-import { backoffMs, doneLineMatches, donePatternFor, taskLineMatch, WAKE_VALUE, type FillSettings } from "./config.js";
+import {
+  backoffMs,
+  doneLineMatches,
+  fillPatternFor,
+  taskLineMatch,
+  WAKE_VALUE,
+  type FillPattern,
+  type FillSettings,
+} from "./config.js";
 import type { DecisionRequest } from "./decisions.js";
 import type { AgentProbes } from "./probes.js";
 import { MAX_PROMPT_FILE_BYTES } from "./prompts.js";
@@ -224,32 +234,41 @@ class QueueLines {
   }
 
   /**
-   * The first line written after `mark` (the whole window without a usable
-   * mark) that reports the task done (doneLineMatches).
+   * Where the lines a pattern may look at start: after `mark`. Without a
+   * usable mark (no run of the task yet, or a rewritten file) a pattern that
+   * names the task looks at the whole window; one that names only the agent
+   * looks at nothing, since a line by the agent from before the task's start
+   * can be about anything it did before.
    */
-  find(pattern: RegExp, task: string, mark: QueueMark | undefined): string | null {
-    const from = mark && this.usable(mark) ? mark.offset : 0;
+  private from(pattern: FillPattern, mark: QueueMark | undefined): number | null {
+    if (mark && this.usable(mark)) return mark.offset;
+    return pattern.task !== null ? 0 : null;
+  }
+
+  /** The first line written after `mark` that reports what the pattern looks for (taskLineMatch). */
+  find(pattern: FillPattern, mark: QueueMark | undefined): string | null {
+    const from = this.from(pattern, mark);
+    if (from === null) return null;
     for (const line of this.lines) {
-      if (line.start < from || !line.text.includes(task)) continue;
-      if (doneLineMatches(pattern, task, line.text)) return line.text;
+      if (line.start >= from && doneLineMatches(pattern, line.text)) return line.text;
     }
     return null;
   }
 
   /**
-   * The last line written after `mark` (the whole window without a usable
-   * mark) that reports the task waiting or blocked, by doneLineMatches' rules:
-   * the latest such line wins. A waiting line's (?<wake>...) is what it waits on.
+   * The last line written after `mark` that reports the task waiting or
+   * blocked (taskLineMatch): the latest such line wins. A waiting line's
+   * (?<wake>...) is what it waits on.
    */
-  lastStatus(waiting: RegExp, blocked: RegExp, task: string, mark: QueueMark | undefined): RunStatus | null {
-    const from = mark && this.usable(mark) ? mark.offset : 0;
+  lastStatus(waiting: FillPattern, blocked: FillPattern, mark: QueueMark | undefined): RunStatus | null {
+    const fromWaiting = this.from(waiting, mark);
+    const fromBlocked = this.from(blocked, mark);
     let last: RunStatus | null = null;
     for (const line of this.lines) {
-      if (line.start < from || !line.text.includes(task)) continue;
-      const wait = taskLineMatch(waiting, task, line.text);
+      const wait = fromWaiting !== null && line.start >= fromWaiting ? taskLineMatch(waiting, line.text) : null;
       if (wait) {
         last = { kind: "waiting", line: line.text, wake: wait.groups?.wake?.trim() || null };
-      } else if (taskLineMatch(blocked, task, line.text)) {
+      } else if (fromBlocked !== null && line.start >= fromBlocked && taskLineMatch(blocked, line.text)) {
         last = { kind: "blocked", line: line.text, wake: null };
       }
     }
@@ -670,7 +689,7 @@ export class AgentsFill {
       }
       let done: string | null;
       try {
-        done = queue.find(donePatternFor(settings.donePattern, task, agent), task, latest?.queueMark);
+        done = queue.find(fillPatternFor(settings.donePattern, task, agent), latest?.queueMark);
       } catch (e) {
         await hold("refused", `done_pattern: ${message(e)}`);
         continue;
@@ -916,9 +935,8 @@ export class AgentsFill {
   private async runStatus(latest: AgentRun, agent: string, task: string, queue: QueueLines): Promise<RunStatus | null> {
     const { settings, store, project, probes } = this.options;
     const seen = queue.lastStatus(
-      donePatternFor(settings.waitingPattern, task, agent),
-      donePatternFor(settings.blockedPattern, task, agent),
-      task,
+      fillPatternFor(settings.waitingPattern, task, agent),
+      fillPatternFor(settings.blockedPattern, task, agent),
       latest.queueMark,
     );
     if (seen) {

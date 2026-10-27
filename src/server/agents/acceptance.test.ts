@@ -2747,6 +2747,75 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(promptOf(h.spawner.calls[1])).toBe(FILL_PROMPT);
   });
 
+  /** Patterns that match by agent: a fleet's queue lines name the agent ("by <agent> (<Name>)"), not always the task id */
+  const BY_AGENT = {
+    done_pattern: "^-\\s+DONE\\s+.*\\bby\\s+{agent}(?=[\\s(]|$)",
+    waiting_pattern: "^-\\s+WAITING\\s+(?:(?:.*?\\s)?(?<wake>\\d{8}T\\d{6}Z-[A-Za-z0-9._-]+)\\b)?.*\\bby\\s+{agent}(?=[\\s(]|$)",
+    blocked_pattern: "^-\\s+BLOCKED\\s+.*\\bby\\s+{agent}(?=[\\s(]|$)",
+  };
+
+  it("patterns by agent: tasks whose lines don't carry their id wait, are blocked and are done by their agent's own lines since the start", async () => {
+    const h = setup(fill({ ...BY_AGENT, wake: { file: "{gates_dir}/results/{wake}.rc" } }));
+    prompts(h);
+    // Before Lair ran these tasks, worker-a reported other work done: an agent's lines from before a start count for nothing
+    appendFileSync(h.queueFile, "- DONE onboarding by worker-a (Viserion) 05:00Z: merged\n");
+    tasks(h, "worker-a|Viserion|kiro/currency-enforcement|Enforce currencies", "worker-b|Glaurung|kiro/sf-storage|Storage");
+    let status = await check(h);
+    expect(status.lines.map((l) => [l.task, l.state])).toEqual([
+      ["kiro/currency-enforcement", "started"],
+      ["kiro/sf-storage", "started"],
+    ]);
+    await at(h, 0); // 5001, 5002
+    const gate = "20261027T041146Z-currency-enforcement-r9-64bebb9d-77679";
+    appendFileSync(
+      h.queueFile,
+      `- WAITING currency-enforcement ${gate} by worker-a (Viserion) 06:25Z: gate queued\n` +
+        "- BLOCKED #183 sf-storage by worker-b (Glaurung) 06:26Z: needs the bucket credentials\n",
+    );
+    h.spawner.exit(5001, 0);
+    h.spawner.exit(5002, 0);
+    await at(h, MIN);
+
+    status = await check(h);
+    expect(lineOf(status, "kiro/currency-enforcement")).toMatchObject({ state: "held", hold: "waiting", waiting: { wake: gate } });
+    expect(lineOf(status, "kiro/sf-storage")).toMatchObject({ state: "held", hold: "blocked" });
+
+    // The gate's result arrives: it starts again, and then its agent reports it done
+    writeFileSync(join(h.gatesDir, "results", `${gate}.rc`), "0\n");
+    h.clock.t = NOW + 2 * MIN;
+    expect(lineOf(await check(h), "kiro/currency-enforcement").state).toBe("started");
+    await at(h, 2 * MIN); // 5003
+    appendFileSync(h.queueFile, "- DONE currency-enforcement by worker-a (Viserion) 07:10Z: merged\n");
+    h.spawner.exit(5003, 0);
+    await at(h, 3 * MIN);
+    expect(lineOf(await check(h), "kiro/currency-enforcement")).toMatchObject({
+      state: "done",
+      detail: "done: - DONE currency-enforcement by worker-a (Viserion) 07:10Z: merged",
+    });
+  });
+
+  it("patterns by agent count only the agent's own lines: not another agent's that names it, not a longer id; no gate id still waits", async () => {
+    const h = setup(fill({ ...BY_AGENT, agents: ["worker-a"], wake: { file: "{gates_dir}/results/{wake}.rc", fallback_seconds: 900 } }));
+    prompts(h);
+    tasks(h, "worker-a|Viserion|kiro/trial-allowance|Trial allowance");
+    await check(h);
+    await at(h, 0); // 5001
+    appendFileSync(
+      h.queueFile,
+      "- DONE trial-allowance-3 by worker-b (Drogon) 06:20Z: reviewed by worker-a\n" +
+        "- DONE trial-allowance-3 by worker-ab (Rhaegal) 06:21Z: merged\n" +
+        "- WAITING trial-allowance-3 by worker-a (Viserion) 06:30Z: waiting on a review\n",
+    );
+    h.spawner.exit(5001, 0);
+    await at(h, MIN);
+
+    const line = lineOf(await check(h), "kiro/trial-allowance");
+    expect(line).toMatchObject({ state: "held", hold: "waiting", waiting: { wake: null, fallbackAt: "2026-03-02T12:16:00.000Z" } });
+    expect(eventsOf(h, "fill_done")).toEqual([]);
+    h.clock.t = NOW + 16 * MIN;
+    expect(lineOf(await check(h), "kiro/trial-allowance").state).toBe("started");
+  });
+
   it("a store from before fill (schema version 1) gains the task index; its runs are found by task", () => {
     const paths = makePaths();
     mkdirSync(dirname(paths.dbPath), { recursive: true });
