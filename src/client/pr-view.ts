@@ -33,6 +33,11 @@ function oneLine(text: string): string {
  */
 export function summaryReadiness(pr: PrSummary, check?: ReadinessCheck): Readiness {
   const checkedAt = pr.evaluatedAt ? Date.parse(pr.evaluatedAt) : null;
+  const asPr = { number: pr.number, headRefOid: pr.headSha } as PullRequest;
+  // This page's own evaluation at this head, newer than the list's (after "Re-check all"), wins
+  if (check && check.headSha === pr.headSha && (check.status || check.error) && (checkedAt === null || check.checkedAt > checkedAt)) {
+    return readinessOf(asPr, true, check);
+  }
   if (pr.canMerge === true) return { group: "ready", label: "Merge ready", tier: pr.tier, checkedAt };
   if (pr.canMerge === false) {
     return {
@@ -42,7 +47,6 @@ export function summaryReadiness(pr: PrSummary, check?: ReadinessCheck): Readine
       checkedAt,
     };
   }
-  const asPr = { number: pr.number, headRefOid: pr.headSha } as PullRequest;
   return readinessOf(asPr, true, check);
 }
 
@@ -80,6 +84,19 @@ export function hostRows(prs: readonly PullRequest[]): PrRow[] {
 /** The PRs of the review list that need an evaluation from this page: not evaluated at their head yet. */
 export function unevaluated(prs: readonly PrSummary[]): { number: number; headRefOid: string }[] {
   return prs.filter((pr) => pr.canMerge === null).map((pr) => ({ number: pr.number, headRefOid: pr.headSha }));
+}
+
+/**
+ * The PRs to evaluate in one pass: with "Re-check all" (`force`), every open
+ * one; otherwise those not evaluated at their head yet.
+ */
+export function prsToEvaluate(prs: readonly PrSummary[], force: boolean): { number: number; headRefOid: string }[] {
+  return force ? prs.map((pr) => ({ number: pr.number, headRefOid: pr.headSha })) : unevaluated(prs);
+}
+
+/** What "Re-check all" asks before it evaluates every open PR again (each evaluation asks the git host several times). */
+export function recheckAllQuestion(count: number): string {
+  return `Evaluate all ${count} open pull request${count === 1 ? "" : "s"} again? Each evaluation asks the git host several times; the list shows the new readiness as each one answers.`;
 }
 
 export interface SlotView {

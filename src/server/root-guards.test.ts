@@ -25,8 +25,9 @@ describe("root guards with the static UI", () => {
     app = Fastify();
     registerRootGuards(app);
     app.get("/api/overview", async () => ({ success: true }));
+    // A gate id in the path, checked as the dashboard's gate detail checks it (src/server/dashboard/)
     app.get(
-      "/api/gates/:id/log",
+      "/api/dashboard/gates/:id",
       { preHandler: requireValidIdParam(isSafeGateId, "gate") },
       async () => ({ success: true }),
     );
@@ -100,14 +101,14 @@ describe("root guards with the static UI", () => {
   it("refuses unsafe gate and dragon ids with 400", async () => {
     const goodGate = await app.inject({
       method: "GET",
-      url: "/api/gates/20260101T000000Z-example-abcdef12-1/log",
+      url: "/api/dashboard/gates/20260101T000000Z-example-abcdef12-1",
       headers: LOCAL,
     });
     expect(goodGate.statusCode).toBe(200);
 
     const badGate = await app.inject({
       method: "GET",
-      url: "/api/gates/..%2F..%2Fsecret/log",
+      url: "/api/dashboard/gates/..%2F..%2Fsecret",
       headers: LOCAL,
     });
     expect(badGate.statusCode).toBe(400);

@@ -14,10 +14,13 @@ import { join } from "path";
 import { HumanAuth, OWNER_SESSION_HEADER } from "../human-auth/index.js";
 import { DataService } from "../services/data.js";
 import { MAX_TAIL_LINES, MAX_TAIL_LINE_LENGTH } from "../services/log-tail.js";
-import { registerDashboardRoutes } from "./routes.js";
+import { CONFIG_UNREADABLE, isReadOnly, registerDashboardRoutes } from "./routes.js";
 import { MAX_FAILING_TESTS } from "./gate-detail.js";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { AgentDetailView } from "../../client/components/AgentDetail";
 import type { ProjectConfig } from "../../shared/types.js";
-import type { AgentRunView } from "../../shared/agents-types.js";
+import type { AgentRunView, AgentsStatusView } from "../../shared/agents-types.js";
 import type { PipelineRun } from "../../shared/pipeline-types.js";
 import type { PlacementStatus } from "../../shared/placement-types.js";
 import type { TriageRecord } from "../../shared/triage-types.js";
@@ -223,7 +226,8 @@ beforeAll(async () => {
     {
       defaultProject: () => PROJECT,
       config: (project) => {
-        if (project !== PROJECT) throw new Error(`No project ${project}`);
+        // As the config loader fails: its message names the file's path on this machine
+        if (project !== PROJECT) throw new Error(`${tmp}/projects/${project}.yaml: ENOENT: no such file or directory`);
         return config;
       },
       data: () => data,
@@ -270,11 +274,84 @@ describe("GET /api/dashboard/modules", () => {
     });
   });
 
-  it("turns every module off for a project whose config can't be read, and says why", async () => {
-    const { body } = await get<DashboardModules>("/api/dashboard/modules?project=gone");
-    expect(body.data!.error).toBe("No project gone");
+  it("turns every module off for a project whose config can't be read, without the error's text (it names paths)", async () => {
+    const { body, raw } = await get<DashboardModules>("/api/dashboard/modules?project=gone");
+    expect(body.data!.error).toBe(CONFIG_UNREADABLE);
+    expect(raw).not.toContain(tmp);
+    expect(raw).not.toContain("ENOENT");
     expect(body.data!.readOnly).toBe(true);
     expect(Object.entries(body.data!.modules).filter(([, on]) => on)).toEqual([["nodes", true]]);
+  });
+
+  it("has controls on unless read_only: true, as every module reads it, and then the owner sees the actions", async () => {
+    const plain = { ...config } as ProjectConfig;
+    delete plain.read_only;
+    const configs: Record<string, ProjectConfig> = { plain, locked: { ...config, read_only: true }, open: { ...config, read_only: false } };
+    const other = Fastify({ logger: false });
+    await registerDashboardRoutes(
+      other,
+      {
+        defaultProject: () => "plain",
+        config: (project) => configs[project],
+        data: (project) => new DataService(configs[project]),
+      },
+      auth,
+    );
+    const readOnly = async (project: string) => {
+      const res = await other.inject({ method: "GET", url: `/api/dashboard/modules?project=${project}` });
+      return (res.json() as { data: DashboardModules }).data.readOnly;
+    };
+    const plainReadOnly = await readOnly("plain");
+    expect(plainReadOnly).toBe(false);
+    expect(await readOnly("open")).toBe(false);
+    const lockedReadOnly = await readOnly("locked");
+    expect(lockedReadOnly).toBe(true);
+    expect(isReadOnly({})).toBe(false);
+    await other.close();
+
+    // The Work section gives an agent's detail that value: a signed-in owner gets the buttons, a read_only project none
+    const detail = (ro: boolean) =>
+      renderToStaticMarkup(
+        createElement(AgentDetailView, {
+          id: "alpha",
+          project: "plain",
+          refreshKey: 0,
+          dragons: [{ id: "alpha", name: "Alpha", task: "feat-x", running: true }],
+          status: {
+            project: "plain",
+            enabled: true,
+            readOnly: ro,
+            agents: [
+              {
+                id: "alpha",
+                state: "working",
+                detail: "",
+                run: { id: "r1", agent: "alpha", task: "feat-x", state: "running", profile: { adapter: "a", provider: "p" }, sessionId: "s", sessionMode: "new", sameSessionRestarts: 0, freshSessions: 0, startRetries: 0, attempt: 1, detail: "", requestedAt: "2026-10-27T11:00:00Z", notBefore: "2026-10-27T11:00:00Z" },
+                profiles: [],
+                claims: [{ task: "feat-x", runId: "r1", agent: "alpha", ownerPid: 1, ownerStartedAt: "x", ownerAlive: true, claimedAt: "2026-10-27T11:00:00Z" }],
+                recoveries: [],
+                budget: null,
+              },
+            ],
+          } as unknown as AgentsStatusView,
+          readOnly: ro,
+          dragonConfig: null,
+          onChanged: () => undefined,
+          onClose: () => undefined,
+          data: {
+            signedIn: true,
+            runs: { data: [], loading: false, error: null },
+            queue: { data: [], loading: false, error: null },
+            log: { data: null, loading: false, error: null },
+          },
+        }),
+      );
+    const open = detail(plainReadOnly);
+    expect(open).toContain(">Release<");
+    expect(open).toContain(">Fresh session<");
+    const locked = detail(lockedReadOnly);
+    expect(locked).not.toContain(">Release<");
+    expect(locked).not.toContain(">Fresh session<");
   });
 });
 

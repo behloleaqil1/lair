@@ -74,6 +74,23 @@ function fail(reply: FastifyReply, code: number, error: string) {
   return reply.code(code).send({ success: false, error, timestamp: new Date().toISOString() });
 }
 
+/**
+ * What a caller is told when a read fails unexpectedly, or a project's
+ * config can't be read: never the error's own text, which can name paths on
+ * this machine. The error goes to the server log.
+ */
+export const READ_FAILED = "Lair could not read this: the server log says why";
+export const CONFIG_UNREADABLE = "The project's config could not be read: the server log says why";
+
+/**
+ * Whether a project's controls are off. Like every module (services/command.ts
+ * isReadOnly, the agents, review, pipelines, delivery ...), only `read_only: true`
+ * turns them off: a config without the key has them on.
+ */
+export function isReadOnly(config: Pick<ProjectConfig, "read_only">): boolean {
+  return config.read_only === true;
+}
+
 const ProjectQuery = z.object({ project: z.string().optional() });
 const LinesQuery = ProjectQuery.extend({ lines: z.string().max(10).optional() });
 
@@ -147,9 +164,10 @@ export async function registerDashboardRoutes(
       let view: DashboardModules;
       try {
         const config = sources.config(project);
-        view = { project, readOnly: config.read_only !== false, error: null, modules: moduleFlags(config, nodes) };
+        view = { project, readOnly: isReadOnly(config), error: null, modules: moduleFlags(config, nodes) };
       } catch (e) {
-        view = { project, readOnly: true, error: e instanceof Error ? e.message : String(e), modules: { ...NO_MODULES, nodes: nodes > 0 } };
+        request.log.warn({ err: e, project }, "dashboard: the project's config could not be read");
+        view = { project, readOnly: true, error: CONFIG_UNREADABLE, modules: { ...NO_MODULES, nodes: nodes > 0 } };
       }
       return respond(view);
     });
@@ -163,7 +181,8 @@ export async function registerDashboardRoutes(
         if (!found) return fail(reply, 404, `No gate ${request.params.id} in ${project}: not in the queue, the results, the pipeline runs or triage`);
         return respond<GateDetailView>(found.detail);
       } catch (e) {
-        return fail(reply, 500, e instanceof Error ? e.message : "Unknown error");
+        request.log.error({ err: e }, "dashboard: a gate's detail could not be read");
+        return fail(reply, 500, READ_FAILED);
       }
     });
 
@@ -190,7 +209,8 @@ export async function registerDashboardRoutes(
           });
           return respond(output);
         } catch (e) {
-          return fail(reply, 500, e instanceof Error ? e.message : "Unknown error");
+          request.log.error({ err: e }, "dashboard: an owner read failed");
+          return fail(reply, 500, READ_FAILED);
         }
       },
     );
@@ -220,7 +240,8 @@ export async function registerDashboardRoutes(
           }
           return respond(view);
         } catch (e) {
-          return fail(reply, 500, e instanceof Error ? e.message : "Unknown error");
+          request.log.error({ err: e }, "dashboard: an owner read failed");
+          return fail(reply, 500, READ_FAILED);
         }
       },
     );

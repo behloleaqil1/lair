@@ -77,7 +77,7 @@ machines:
 
 ## Control commands
 
-By default, Lair runs in read-only mode. Enable controls by setting `read_only: false` and defining command templates. Running them from the dashboard (the command bar, the Work section) also needs the browser to be signed in as the owner (see [Owner-only routes](#owner-only-routes)):
+Controls are on unless a project sets `read_only: true`; each one also needs its command template below (a project without any can run nothing). Set `read_only: true` to keep a project look-only. Running them from the dashboard (the command bar, the Work section) also needs the browser to be signed in as the owner (see [Owner-only routes](#owner-only-routes)):
 
 ```yaml
 read_only: false
@@ -113,7 +113,7 @@ merge_cmd: ["/path/to/merge.sh", "{number}", "{sha}"]
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `read_only` | boolean | `true` | Disable all write operations when true |
+| `read_only` | boolean | `false` | `true` turns off every write: commands, starting and stopping, merges, deploys, acting modes. Without the key the controls are on (each still needs its command or module configured, and the owner's session); a project the Settings view creates starts with `read_only: true` |
 | `allow_direct_assign` | boolean | `false` | Allow assigning tasks directly to agents |
 | `inbox_file` | string | — | Path to inbox markdown file for instructions |
 | `outbox_file` | string | — | Path to outbox markdown file for replies |

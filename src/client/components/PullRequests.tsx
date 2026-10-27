@@ -11,21 +11,25 @@ import { useEffect, useRef, useState } from "react";
 import { useApi } from "../hooks/useApi";
 import { prStatus } from "../review-api";
 import { prsToCheck, type ReadinessCheck } from "../pr-readiness";
-import { hostRows, reviewRows, unevaluated, type PrRow } from "../pr-view";
+import { hostRows, prsToEvaluate, recheckAllQuestion, reviewRows, type PrRow } from "../pr-view";
 import { TIER_BADGE, shortSha } from "../review-view";
 import type { PullRequest } from "../../shared/types";
 import type { PrSummary, ReviewProjectInfo } from "../../shared/review-types";
 import { DataTable, type Column } from "./DataTable";
 import { SectionHeader, type SectionProps } from "./Section";
 import { PrDetail } from "./PrDetail";
-import { EmptyState, ErrorState, Loading, Time, muted } from "./ui";
+import { EmptyState, ErrorState, Loading, Time, muted, useOwnerSignedIn } from "./ui";
 
-/** Evaluate, one at a time, the PRs of the review list not evaluated at their head. */
-function useReadinessChecks(project: string, prs: PrSummary[] | null): Record<number, ReadinessCheck> {
+/**
+ * Evaluate, one at a time, the PRs of the review list not evaluated at their
+ * head; and, each time `recheck` goes up ("Re-check all"), every open PR.
+ */
+function useReadinessChecks(project: string, prs: PrSummary[] | null, recheck: number): Record<number, ReadinessCheck> {
   const [checks, setChecks] = useState<Record<number, ReadinessCheck>>({});
   const checksRef = useRef<Record<number, ReadinessCheck>>({});
   const inFlight = useRef(new Set<number>());
   const projectRef = useRef(project);
+  const forced = useRef(0);
 
   useEffect(() => {
     projectRef.current = project;
@@ -36,7 +40,9 @@ function useReadinessChecks(project: string, prs: PrSummary[] | null): Record<nu
 
   useEffect(() => {
     if (!prs) return;
-    const due = prsToCheck(unevaluated(prs), checksRef.current, Date.now(), { inFlight: inFlight.current });
+    const force = recheck > forced.current;
+    forced.current = recheck;
+    const due = prsToCheck(prsToEvaluate(prs, force), checksRef.current, Date.now(), { force, inFlight: inFlight.current });
     if (due.length === 0) return;
     const asked = project;
     const pending = inFlight.current;
@@ -63,7 +69,7 @@ function useReadinessChecks(project: string, prs: PrSummary[] | null): Record<nu
         setChecks(checksRef.current);
       }
     })();
-  }, [prs, project]);
+  }, [prs, project, recheck]);
 
   return checks;
 }
@@ -73,7 +79,9 @@ export function PullRequests({ project, refreshKey, route, modules, readOnly, op
   const info = useApi<ReviewProjectInfo>("/review/status", project, refreshKey, { skip: !reviewOn });
   const summaries = useApi<PrSummary[]>("/review/prs", project, refreshKey, { skip: !reviewOn });
   const hostPrs = useApi<PullRequest[]>("/prs", project, refreshKey, { skip: reviewOn || modules === null });
-  const checks = useReadinessChecks(project, reviewOn ? summaries.data : null);
+  const signedIn = useOwnerSignedIn(refreshKey);
+  const [recheck, setRecheck] = useState(0);
+  const checks = useReadinessChecks(project, reviewOn ? summaries.data : null, recheck);
 
   const list = reviewOn ? summaries : hostPrs;
   const rows: PrRow[] = reviewOn ? reviewRows(summaries.data ?? [], checks) : hostRows(hostPrs.data ?? []);
@@ -152,6 +160,14 @@ export function PullRequests({ project, refreshKey, route, modules, readOnly, op
           {info.data?.repo ? ` · ${info.data.repo}` : ""}
         </span>
         {info.data?.readOnly && <span className="badge badge-neutral">read-only: no merges</span>}
+        {reviewOn && (
+          <RecheckAllButton
+            count={rows.length}
+            signedIn={signedIn}
+            onConfirmed={() => setRecheck((n) => n + 1)}
+            confirm={(question) => window.confirm(question)}
+          />
+        )}
       </SectionHeader>
       {info.data?.errors.map((e) => (
         <div key={e} className="error">
@@ -172,5 +188,38 @@ export function PullRequests({ project, refreshKey, route, modules, readOnly, op
         />
       )}
     </div>
+  );
+}
+
+/**
+ * "Re-check all": evaluate every open PR again at its head, after a
+ * confirmation. The owner's (each evaluation asks the git host several
+ * times): disabled until this browser is signed in as the owner.
+ */
+export function RecheckAllButton({
+  count,
+  signedIn,
+  onConfirmed,
+  confirm,
+}: {
+  count: number;
+  signedIn: boolean | null;
+  onConfirmed: () => void;
+  confirm: (question: string) => boolean;
+}) {
+  const owner = signedIn === true;
+  return (
+    <button
+      type="button"
+      className="small-button"
+      data-action="recheck-all"
+      disabled={!owner || count === 0}
+      title={owner ? "Evaluate every open PR again" : "Sign this browser in as the owner from Decisions first"}
+      onClick={() => {
+        if (owner && confirm(recheckAllQuestion(count))) onConfirmed();
+      }}
+    >
+      Re-check all
+    </button>
   );
 }

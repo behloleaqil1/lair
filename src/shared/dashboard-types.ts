@@ -40,7 +40,7 @@ export interface ModuleFlags {
 export interface DashboardModules {
   project: string;
   readOnly: boolean;
-  /** Why the project's config could not be read (every module is then off) */
+  /** Set when the project's config could not be read (every module is then off): a fixed text, the server log has the error */
   error: string | null;
   modules: ModuleFlags;
 }
