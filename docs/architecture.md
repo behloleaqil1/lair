@@ -267,8 +267,9 @@ Each view is a standalone component:
 #### Hooks (`hooks/`)
 
 - **`useApi.ts`**: data fetching with polling and error handling
-- **`useWebSocket.ts`**: WebSocket subscription management
+- **`useWebSocket.ts`**: WebSocket subscription management. The connection is a `LiveSocket` (`live-socket.ts`): when the server goes away (a restart) it reconnects with backoff (`reconnect.ts`: 1 s, doubling, at most 30 s), subscribes again once open, and reports `reconnecting` meanwhile; unmounting closes it for good
 - **`useBusEvents.ts`**: SSE subscription to fleet bus events
+- **`event-stream.ts`**: the live feed's SSE connection (`LiveFeed.tsx`). Any connection error closes the browser's `EventSource`, whose own retry stops for good after an HTTP error during a restart, and opens a new one with the same backoff; the feed says "Reconnecting…" meanwhile
 
 ### Shared (`src/shared/`)
 

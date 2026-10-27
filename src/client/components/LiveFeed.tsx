@@ -1,8 +1,14 @@
 /**
  * LiveFeed - Real-time activity feed using SSE from the fleet bus
+ *
+ * The stream (hooks/event-stream.ts) reconnects with backoff when the server
+ * goes away and comes back (a restart), and the header says "Reconnecting…"
+ * meanwhile.
  */
 import { useState, useEffect, useRef } from "react";
 import type { BoardOutput, ReportKind } from "../../shared/types";
+import { EventStream } from "../hooks/event-stream";
+import { connectionLabel, type ConnectionStatus } from "../hooks/reconnect";
 
 interface LiveFeedProps {
   project: string;
@@ -40,28 +46,22 @@ const KIND_ICONS: Record<ReportKind, string> = {
 export function LiveFeed({ project }: LiveFeedProps) {
   const [board, setBoard] = useState<BoardOutput | null>(null);
   const [events, setEvents] = useState<FeedEvent[]>([]);
-  const [connected, setConnected] = useState(false);
+  const [status, setStatus] = useState<ConnectionStatus>("connecting");
+  const [retryInMs, setRetryInMs] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const previousBoardRef = useRef<BoardOutput | null>(null);
 
   useEffect(() => {
     if (!project) return;
+    let active = true;
+    // Another project's board is no baseline for this one's changes
+    previousBoardRef.current = null;
+    setBoard(null);
+    setEvents([]);
 
-    const eventSource = new EventSource(`/api/bus/events?project=${project}`);
-
-    eventSource.onopen = () => {
-      setConnected(true);
-      setError(null);
-    };
-
-    eventSource.onerror = () => {
-      setConnected(false);
-      setError("Connection lost. Reconnecting...");
-    };
-
-    eventSource.addEventListener("board", (e) => {
+    const onBoard = (data: string) => {
       try {
-        const newBoard = JSON.parse(e.data) as BoardOutput;
+        const newBoard = JSON.parse(data) as BoardOutput;
         setBoard(newBoard);
 
         // Generate events from board changes
@@ -95,20 +95,38 @@ export function LiveFeed({ project }: LiveFeedProps) {
       } catch (err) {
         console.error("Failed to parse board event:", err);
       }
-    });
+    };
 
-    eventSource.addEventListener("error", (e) => {
+    // The server's own "error" event: it could not read the board
+    const onServerError = (data: string) => {
       try {
-        const data = JSON.parse((e as MessageEvent).data);
-        setError(data.error);
+        const parsed = JSON.parse(data) as { error?: unknown };
+        if (typeof parsed.error === "string") setError(parsed.error);
       } catch {
         // Ignore parse errors
       }
+    };
+
+    const stream = new EventStream({
+      url: `/api/bus/events?project=${encodeURIComponent(project)}`,
+      events: ["board", "error"],
+      onEvent: (name, data) => {
+        if (!active) return;
+        if (name === "board") onBoard(data);
+        else if (name === "error") onServerError(data);
+      },
+      onState: (s) => {
+        if (!active) return;
+        setStatus(s.status);
+        setRetryInMs(s.retryInMs);
+        if (s.status === "connected") setError(null);
+      },
     });
+    stream.start();
 
     return () => {
-      eventSource.close();
-      setConnected(false);
+      active = false;
+      stream.stop();
     };
   }, [project]);
 
@@ -166,8 +184,11 @@ export function LiveFeed({ project }: LiveFeedProps) {
       <div className="live-feed-header">
         <h3>
           🔴 Live Feed
-          <span className={`connection-status ${connected ? "connected" : "disconnected"}`}>
-            {connected ? "Connected" : "Disconnected"}
+          <span
+            className={`connection-status ${status === "connected" ? "connected" : status === "closed" ? "disconnected" : "reconnecting"}`}
+            title={retryInMs !== null ? `Next try in ${Math.ceil(retryInMs / 1000)} s` : undefined}
+          >
+            {connectionLabel(status)}
           </span>
         </h3>
       </div>
@@ -270,6 +291,11 @@ export function LiveFeed({ project }: LiveFeedProps) {
 
         .connection-status.disconnected {
           background: #f44336;
+          color: white;
+        }
+
+        .connection-status.reconnecting {
+          background: #ff9800;
           color: white;
         }
 

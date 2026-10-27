@@ -3,9 +3,17 @@
  *
  * Provides real-time updates for dragons, gates, machines, and orchestrator,
  * replacing REST polling with push-based updates.
+ *
+ * The connection itself is a LiveSocket (live-socket.ts): when the server
+ * goes away (a restart) it reconnects with backoff (1 s, doubling, at most
+ * 30 s) and subscribes again, and `status` / `connectionState` say
+ * "reconnecting" meanwhile. Unmounting, or a new project or channel list,
+ * closes it on purpose: no reconnect follows.
  */
 import { useState, useEffect, useCallback, useRef } from "react";
 import type { Dragon, Gate } from "../../shared/types";
+import { LiveSocket } from "./live-socket";
+import { RECONNECT_INITIAL_MS, type ConnectionStatus } from "./reconnect";
 
 // WebSocket message types (mirrors server types)
 interface WSServerMessage {
@@ -17,11 +25,6 @@ interface WSServerMessage {
   data?: unknown;
   error?: string;
   timestamp: string;
-}
-
-interface WSClientMessage {
-  type: "subscribe" | "unsubscribe" | "ping";
-  channels?: string[];
 }
 
 // Dragon update data from WebSocket
@@ -64,6 +67,12 @@ export type WSChannel =
 
 export interface UseWebSocketState {
   connected: boolean;
+  /** connecting (first try), connected, reconnecting (lost: retrying with backoff), closed */
+  status: ConnectionStatus;
+  /** True while the connection is lost and a retry is scheduled or under way */
+  reconnecting: boolean;
+  /** The wait before the scheduled retry, while reconnecting */
+  retryInMs: number | null;
   sessionId: string | null;
   subscribedChannels: Set<string>;
   error: string | null;
@@ -88,7 +97,7 @@ export interface UseWebSocketOptions {
   onConnectionChange?: (connected: boolean) => void;
   /** Auto-reconnect on disconnect (default: true) */
   autoReconnect?: boolean;
-  /** Reconnect delay in ms (default: 3000) */
+  /** The first reconnect's delay in ms (default: 1000); it doubles per failed try, up to 30 s */
   reconnectDelay?: number;
 }
 
@@ -98,8 +107,27 @@ export interface UseWebSocketLegacyOptions {
   onConnectionChange?: (connected: boolean) => void;
 }
 
-const DEFAULT_RECONNECT_DELAY = 3000;
-const PING_INTERVAL = 25000; // Send ping every 25 seconds
+const DEFAULT_RECONNECT_DELAY = RECONNECT_INITIAL_MS;
+
+/** The hook's connectionState for a connection status. */
+export function toConnectionState(
+  status: ConnectionStatus,
+): "connecting" | "connected" | "reconnecting" | "disconnected" {
+  return status === "closed" ? "disconnected" : status;
+}
+
+function isServerMessage(value: unknown): value is WSServerMessage {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { type?: unknown }).type === "string"
+  );
+}
+
+/** The WebSocket URL of the Lair server for a project. */
+export function socketUrl(hostname: string, project: string): string {
+  return `ws://${hostname}:4777/ws?project=${encodeURIComponent(project)}`;
+}
 
 /**
  * Hook for WebSocket connection to Lair server.
@@ -124,251 +152,127 @@ export function useWebSocket(
   const {
     project,
     channels = [],
-    onDragonUpdate,
-    onGateUpdate,
-    onMachineUpdate,
-    onOrchestratorUpdate,
-    onLogLine,
-    onConnectionChange,
     autoReconnect = true,
     reconnectDelay = DEFAULT_RECONNECT_DELAY,
   } = options;
+  // Callers pass a new array each render: key the connection on its content
+  const channelsKey = channels.join("\n");
 
   const [state, setState] = useState<UseWebSocketState>({
     connected: false,
+    status: "connecting",
+    reconnecting: false,
+    retryInMs: null,
     sessionId: null,
     subscribedChannels: new Set(),
     error: null,
   });
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
-    null,
-  );
-  const pingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const mountedRef = useRef(true);
+  // The latest callbacks: a new function each render must not reopen the socket
+  const handlersRef = useRef(options);
+  handlersRef.current = options;
+  const socketRef = useRef<LiveSocket | null>(null);
 
-  // Cleanup function
-  const cleanup = useCallback(() => {
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = null;
-    }
-    if (pingIntervalRef.current) {
-      clearInterval(pingIntervalRef.current);
-      pingIntervalRef.current = null;
-    }
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
-  }, []);
-
-  // Send message to WebSocket
-  const sendMessage = useCallback((message: WSClientMessage) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(message));
-    }
-  }, []);
-
-  // Subscribe to channels
-  const subscribe = useCallback(
-    (channelsToSubscribe: WSChannel[]) => {
-      sendMessage({ type: "subscribe", channels: channelsToSubscribe });
-    },
-    [sendMessage],
-  );
-
-  // Unsubscribe from channels
-  const unsubscribe = useCallback(
-    (channelsToUnsubscribe: WSChannel[]) => {
-      sendMessage({ type: "unsubscribe", channels: channelsToUnsubscribe });
-    },
-    [sendMessage],
-  );
-
-  // Connect to WebSocket
-  const connect = useCallback(() => {
-    if (!mountedRef.current) return;
-
-    cleanup();
-
-    const wsUrl = `ws://${window.location.hostname}:4777/ws?project=${encodeURIComponent(project)}`;
-
-    try {
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        if (!mountedRef.current) return;
-
-        console.log("[useWebSocket] Connected");
-        setState((prev) => ({
-          ...prev,
-          connected: true,
-          error: null,
-        }));
-        onConnectionChange?.(true);
-
-        // Subscribe to initial channels
-        if (channels.length > 0) {
-          sendMessage({ type: "subscribe", channels });
-        }
-
-        // Start ping interval
-        pingIntervalRef.current = setInterval(() => {
-          sendMessage({ type: "ping" });
-        }, PING_INTERVAL);
-      };
-
-      ws.onmessage = (event) => {
-        if (!mountedRef.current) return;
-
-        try {
-          const message = JSON.parse(event.data) as WSServerMessage;
-
-          switch (message.type) {
-            case "connected":
-              setState((prev) => ({
-                ...prev,
-                sessionId: message.sessionId || null,
-              }));
-              break;
-
-            case "subscribed":
-              setState((prev) => {
-                const newChannels = new Set(prev.subscribedChannels);
-                for (const ch of message.channels || []) {
-                  newChannels.add(ch);
-                }
-                return { ...prev, subscribedChannels: newChannels };
-              });
-              break;
-
-            case "unsubscribed":
-              setState((prev) => {
-                const newChannels = new Set(prev.subscribedChannels);
-                for (const ch of message.channels || []) {
-                  newChannels.delete(ch);
-                }
-                return { ...prev, subscribedChannels: newChannels };
-              });
-              break;
-
-            case "update":
-              handleUpdate(message.channel || "", message.data);
-              break;
-
-            case "error":
-              console.error("[useWebSocket] Server error:", message.error);
-              setState((prev) => ({ ...prev, error: message.error || null }));
-              break;
-
-            case "pong":
-              // Pong received, connection is alive
-              break;
-          }
-        } catch (err) {
-          console.error("[useWebSocket] Failed to parse message:", err);
-        }
-      };
-
-      ws.onerror = (error) => {
-        console.error("[useWebSocket] WebSocket error:", error);
-        setState((prev) => ({
-          ...prev,
-          error: "WebSocket connection error",
-        }));
-      };
-
-      ws.onclose = (event) => {
-        console.log("[useWebSocket] Disconnected:", event.code, event.reason);
-
-        setState((prev) => ({
-          ...prev,
-          connected: false,
-          sessionId: null,
-          subscribedChannels: new Set(),
-        }));
-        onConnectionChange?.(false);
-
-        // Clear ping interval
-        if (pingIntervalRef.current) {
-          clearInterval(pingIntervalRef.current);
-          pingIntervalRef.current = null;
-        }
-
-        // Auto-reconnect if enabled and component is still mounted
-        if (autoReconnect && mountedRef.current && event.code !== 1000) {
-          console.log(`[useWebSocket] Reconnecting in ${reconnectDelay}ms...`);
-          reconnectTimeoutRef.current = setTimeout(() => {
-            if (mountedRef.current) {
-              connect();
-            }
-          }, reconnectDelay);
-        }
-      };
-    } catch (err) {
-      console.error("[useWebSocket] Failed to connect:", err);
-      setState((prev) => ({
-        ...prev,
-        error: "Failed to connect to WebSocket",
-      }));
-    }
-  }, [project, channels, autoReconnect, reconnectDelay, cleanup, sendMessage]);
-
-  // Handle update messages
-  const handleUpdate = useCallback(
-    (channel: string, data: unknown) => {
-      if (channel === "dragons" && onDragonUpdate) {
-        onDragonUpdate(data as DragonUpdateData);
-      } else if (channel === "gates" && onGateUpdate) {
-        onGateUpdate(data as GateUpdateData);
-      } else if (channel === "machines" && onMachineUpdate) {
-        onMachineUpdate(data as MachineUpdateData);
-      } else if (channel === "orchestrator" && onOrchestratorUpdate) {
-        onOrchestratorUpdate(data);
-      } else if (channel.startsWith("logs:") && onLogLine) {
-        onLogLine(data as LogLineData);
-      }
-    },
-    [
-      onDragonUpdate,
-      onGateUpdate,
-      onMachineUpdate,
-      onOrchestratorUpdate,
-      onLogLine,
-    ],
-  );
-
-  // Effect to manage connection lifecycle
   useEffect(() => {
-    mountedRef.current = true;
-    connect();
+    let active = true;
+    let connected = false;
+
+    const handleMessage = (message: unknown) => {
+      if (!active || !isServerMessage(message)) return;
+      const handlers = handlersRef.current;
+      switch (message.type) {
+        case "connected":
+          setState((prev) => ({ ...prev, sessionId: message.sessionId || null }));
+          break;
+        case "subscribed":
+          setState((prev) => {
+            const next = new Set(prev.subscribedChannels);
+            for (const ch of message.channels || []) next.add(ch);
+            return { ...prev, subscribedChannels: next };
+          });
+          break;
+        case "unsubscribed":
+          setState((prev) => {
+            const next = new Set(prev.subscribedChannels);
+            for (const ch of message.channels || []) next.delete(ch);
+            return { ...prev, subscribedChannels: next };
+          });
+          break;
+        case "update": {
+          const channel = message.channel || "";
+          if (channel === "dragons") handlers.onDragonUpdate?.(message.data as DragonUpdateData);
+          else if (channel === "gates") handlers.onGateUpdate?.(message.data as GateUpdateData);
+          else if (channel === "machines") handlers.onMachineUpdate?.(message.data as MachineUpdateData);
+          else if (channel === "orchestrator") handlers.onOrchestratorUpdate?.(message.data);
+          else if (channel.startsWith("logs:")) handlers.onLogLine?.(message.data as LogLineData);
+          break;
+        }
+        case "error":
+          console.error("[useWebSocket] Server error:", message.error);
+          setState((prev) => ({ ...prev, error: message.error || null }));
+          break;
+        case "pong":
+          break;
+      }
+    };
+
+    const socket = new LiveSocket({
+      url: socketUrl(window.location.hostname, project),
+      channels: channelsKey ? channelsKey.split("\n") : [],
+      autoReconnect,
+      initialDelayMs: reconnectDelay,
+      onMessage: handleMessage,
+      onState: (s) => {
+        if (!active) return;
+        const isConnected = s.status === "connected";
+        setState((prev) => ({
+          ...prev,
+          connected: isConnected,
+          status: s.status,
+          reconnecting: s.status === "reconnecting",
+          retryInMs: s.retryInMs,
+          error: s.error,
+          // A new connection (to a restarted server) has a new session and no subscriptions yet
+          ...(isConnected ? {} : { sessionId: null, subscribedChannels: new Set<string>() }),
+        }));
+        if (isConnected !== connected) {
+          connected = isConnected;
+          handlersRef.current.onConnectionChange?.(isConnected);
+        }
+      },
+    });
+    socketRef.current = socket;
+    socket.start();
 
     return () => {
-      mountedRef.current = false;
-      cleanup();
+      active = false;
+      socket.stop();
+      if (socketRef.current === socket) socketRef.current = null;
+      if (connected) handlersRef.current.onConnectionChange?.(false);
     };
-  }, [connect, cleanup]);
+  }, [project, channelsKey, autoReconnect, reconnectDelay]);
 
-  // Reconnect when project changes
-  useEffect(() => {
-    if (state.connected) {
-      cleanup();
-      connect();
-    }
-    // Only reconnect when project changes, not on connect/cleanup updates
-  }, [project]);
+  // Subscribe to channels (kept across reconnects)
+  const subscribe = useCallback((channelsToSubscribe: WSChannel[]) => {
+    socketRef.current?.subscribe(channelsToSubscribe);
+  }, []);
+
+  // Unsubscribe from channels
+  const unsubscribe = useCallback((channelsToUnsubscribe: WSChannel[]) => {
+    socketRef.current?.unsubscribe(channelsToUnsubscribe);
+  }, []);
+
+  // Try now instead of waiting for the scheduled retry
+  const reconnect = useCallback(() => {
+    socketRef.current?.reconnectNow();
+  }, []);
 
   return {
     ...state,
-    connectionState: state.connected
-      ? ("connected" as const)
-      : ("disconnected" as const),
+    connectionState: toConnectionState(state.status),
     subscribe,
     unsubscribe,
-    reconnect: connect,
+    reconnect,
   };
 }
 
