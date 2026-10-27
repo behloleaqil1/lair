@@ -178,9 +178,8 @@ async function setup(options: { extra?: string } = {}) {
   return { root, projects, data, file, original, app, auth, service, reloader, deliveries, watchdogs, owner, versions, historyDir };
 }
 
-type Harness = Awaited<ReturnType<typeof setup>>;
 
-async function hashOf(h: Harness): Promise<string> {
+async function hashOf(): Promise<string> {
   const view = await loadProjectSettings("shop");
   expect(view.success).toBe(true);
   return view.data!.hash;
@@ -234,7 +233,7 @@ describe("saving", () => {
     await h.owner();
     const before = h.watchdogs.get("shop");
     const reply = await saveProjectSettings("shop", {
-      baseHash: await hashOf(h),
+      baseHash: await hashOf(),
       changes: [{ path: ["watchdog", "interval_seconds"], value: 1 }],
     });
     expect(reply.status).toBe(422);
@@ -249,10 +248,10 @@ describe("saving", () => {
     expect(h.watchdogs.get("shop")).toBe(before);
 
     // A missing required field and a YAML error, from the YAML tab
-    const missing = await saveProjectSettings("shop", { baseHash: await hashOf(h), yaml: h.original.replace("name: Shop\n", "") });
+    const missing = await saveProjectSettings("shop", { baseHash: await hashOf(), yaml: h.original.replace("name: Shop\n", "") });
     expect(missing.status).toBe(422);
     expect(missing.check?.errors).toContainEqual({ path: "name", message: "required" });
-    const broken = await saveProjectSettings("shop", { baseHash: await hashOf(h), yaml: "name: [unclosed\n" });
+    const broken = await saveProjectSettings("shop", { baseHash: await hashOf(), yaml: "name: [unclosed\n" });
     expect(broken.status).toBe(422);
     expect(broken.check?.errors[0]).toMatchObject({ path: "", message: expect.stringContaining("YAML") });
     expect(readFileSync(h.file, "utf-8")).toBe(h.original);
@@ -291,7 +290,7 @@ describe("saving", () => {
   it("refuses a save based on a version the file no longer is (a hand edit) and shows the change re-applied", async () => {
     const h = await setup();
     await h.owner();
-    const hash = await hashOf(h);
+    const hash = await hashOf();
     const handEdited = h.original.replace("  interval_seconds: 30\n", "  interval_seconds: 45\n");
     writeFileSync(h.file, handEdited);
 
@@ -348,7 +347,7 @@ describe("saving", () => {
     await h.owner();
     const argv = ["./bin/restart-agent", "{agent}", "{pid}"];
     const changes = [{ path: ["watchdog", "actions"], value: { restart_agent: argv } }];
-    const unconfirmed = await saveProjectSettings("shop", { baseHash: await hashOf(h), changes });
+    const unconfirmed = await saveProjectSettings("shop", { baseHash: await hashOf(), changes });
     expect(unconfirmed.status).toBe(428);
     expect(unconfirmed.code).toBe("confirm_commands");
     expect(unconfirmed.check!.commands).toEqual([{ path: "watchdog.actions.restart_agent", before: null, after: argv }]);
@@ -357,11 +356,11 @@ describe("saving", () => {
     expect(readFileSync(h.file, "utf-8")).toBe(h.original);
 
     // A confirmation of other commands is not this one
-    const wrong = await saveProjectSettings("shop", { baseHash: await hashOf(h), changes, confirmCommands: "0".repeat(64) });
+    const wrong = await saveProjectSettings("shop", { baseHash: await hashOf(), changes, confirmCommands: "0".repeat(64) });
     expect(wrong.status).toBe(428);
     expect(readFileSync(h.file, "utf-8")).toBe(h.original);
 
-    const confirmed = await saveProjectSettings("shop", { baseHash: await hashOf(h), changes, confirmCommands: digest });
+    const confirmed = await saveProjectSettings("shop", { baseHash: await hashOf(), changes, confirmCommands: digest });
     expect(confirmed.status).toBe(200);
     expect((parseYaml(readFileSync(h.file, "utf-8")) as { watchdog: { actions: unknown } }).watchdog.actions).toEqual({
       restart_agent: argv,
@@ -369,7 +368,7 @@ describe("saving", () => {
 
     // Changing it again needs a new confirmation; removing it doesn't
     const changed = await saveProjectSettings("shop", {
-      baseHash: await hashOf(h),
+      baseHash: await hashOf(),
       changes: [{ path: ["watchdog", "actions", "restart_agent"], value: ["./bin/other", "{agent}"] }],
     });
     expect(changed.status).toBe(428);
@@ -377,7 +376,7 @@ describe("saving", () => {
       { path: "watchdog.actions.restart_agent", before: argv, after: ["./bin/other", "{agent}"] },
     ]);
     const removed = await saveProjectSettings("shop", {
-      baseHash: await hashOf(h),
+      baseHash: await hashOf(),
       changes: [{ path: ["watchdog", "actions"], remove: true }],
     });
     expect(removed.status).toBe(200);
@@ -393,14 +392,14 @@ describe("saving", () => {
     const url = ["https://deploy:", password, "@example.com/shop.git"].join("");
 
     const byKey = await saveProjectSettings("shop", {
-      baseHash: await hashOf(h),
+      baseHash: await hashOf(),
       changes: [{ path: ["api_token"], value: "plain-looking-value" }],
     });
     expect(byKey.status).toBe(422);
     expect(byKey.check!.errors).toContainEqual({ path: "api_token", message: expect.stringContaining("data/") });
 
     const byShape = await saveProjectSettings("shop", {
-      baseHash: await hashOf(h),
+      baseHash: await hashOf(),
       changes: [
         { path: ["delivery", "environments", "local", "deploy"], value: { fetch_cmd: ["git", "fetch", url] } },
         { path: ["notes"], value: `ci uses ${token}` },
@@ -417,7 +416,7 @@ describe("saving", () => {
 
     const pem = ["-----BEGIN ", "PRIVATE KEY-----\nAAAA\n-----END ", "PRIVATE KEY-----"].join("");
     const inYaml = await saveProjectSettings("shop", {
-      baseHash: await hashOf(h),
+      baseHash: await hashOf(),
       yaml: `${h.original}signing_key: ${JSON.stringify(pem)}\n`,
     });
     expect(inYaml.status).toBe(422);
@@ -455,7 +454,7 @@ describe("saving", () => {
     const h = await setup();
     await h.owner();
     const big = `${h.original}# ${"a".repeat(MAX_CONFIG_BYTES)}\n`;
-    const tooBig = await saveProjectSettings("shop", { baseHash: await hashOf(h), yaml: big });
+    const tooBig = await saveProjectSettings("shop", { baseHash: await hashOf(), yaml: big });
     expect(tooBig.status).toBe(413);
     expect(tooBig.code).toBe("too_large");
 
@@ -476,12 +475,12 @@ describe("history", () => {
     const h = await setup();
     await h.owner();
     const first = await saveProjectSettings("shop", {
-      baseHash: await hashOf(h),
+      baseHash: await hashOf(),
       changes: [{ path: ["watchdog", "interval_seconds"], value: 90 }],
     });
     expect(first.status).toBe(200);
     const second = await saveProjectSettings("shop", {
-      baseHash: await hashOf(h),
+      baseHash: await hashOf(),
       changes: [{ path: ["watchdog", "interval_seconds"], value: 120 }],
     });
     expect(second.status).toBe(200);
@@ -508,7 +507,7 @@ describe("history", () => {
     const original = versions[2].version;
     const restoreView = (await loadVersion("shop", original)).data!;
     expect(restoreView.yaml).toBe(h.original);
-    const restored = await restoreVersion("shop", original, { baseHash: await hashOf(h) });
+    const restored = await restoreVersion("shop", original, { baseHash: await hashOf() });
     expect(restored.status).toBe(200);
     expect(readFileSync(h.file, "utf-8")).toBe(h.original);
     const after = (await loadHistory("shop")).data!.versions;
@@ -576,7 +575,7 @@ describe("creating a project", () => {
 });
 
 describe("forms", () => {
-  const KINDS = new Set(["text", "textarea", "number", "toggle", "select", "argv", "list", "globs", "path", "yaml", "object", "record", "objects"]);
+  const KINDS = ["text", "textarea", "number", "toggle", "select", "argv", "list", "globs", "path", "yaml", "object", "record", "objects"];
 
   function allFields(fields: FieldModel[], ctx: Parameters<typeof fieldsOf>[4], depth = 0): FieldModel[] {
     const out: FieldModel[] = [];
@@ -603,7 +602,7 @@ describe("forms", () => {
       agents: {} as AgentsManager,
       triage: {} as TriageManager,
     });
-    const blocks = new Set(sections.flatMap((s) => s.blocks));
+    const blocks = sections.flatMap((s) => s.blocks);
     for (const module of all) for (const block of module.blocks) expect(blocks, block).toContain(block);
     expect(sections.filter((s) => s.toggle).map((s) => s.key)).toEqual(
       expect.arrayContaining(["watchdog", "delivery", "review", "agents", "triage"]),
