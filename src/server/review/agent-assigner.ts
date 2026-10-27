@@ -199,7 +199,7 @@ export class AgentReviewAssigner implements ReviewAssigner {
       updatedAt: iso(now),
     };
     // The service records this token's hash with the agent picked here
-    const outcome = await this.start(record, a.token, false);
+    const outcome = await this.startRun(record, a.token, false);
     this.save(record);
     return outcome;
   }
@@ -217,7 +217,7 @@ export class AgentReviewAssigner implements ReviewAssigner {
    * record gets this token's hash and the agent (a retry, or a run started
    * after none was free); otherwise the caller records them.
    */
-  private async start(record: AgentAssignmentRecord, token: string, reissue: boolean): Promise<AssignResult> {
+  private async startRun(record: AgentAssignmentRecord, token: string, reissue: boolean): Promise<AssignResult> {
     const fail = (detail: string): AssignResult => {
       record.state = "failed";
       record.agent = null;
@@ -427,7 +427,7 @@ export class AgentReviewAssigner implements ReviewAssigner {
     }
     if (pr.state !== "open") return this.stale(record, `the PR is ${pr.state}`);
     if (pr.headSha !== record.headSha) return this.stale(record, `the PR moved to ${pr.headSha.slice(0, 7)}`);
-    await this.start(record, newAssignmentToken(), true);
+    await this.startRun(record, newAssignmentToken(), true);
     this.save(record);
   }
 
