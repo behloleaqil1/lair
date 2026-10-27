@@ -77,7 +77,7 @@ export function readQueue(files: QueueFiles, gatesDir: string, settings: Placeme
       id: gate.id,
       lane: gate.lane,
       priority: gate.priority,
-      status: gate.status,
+      status: gate.status === "running" ? "running" : "queued",
       name,
       path,
       command,
