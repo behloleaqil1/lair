@@ -209,7 +209,8 @@ function replan(
  *   apply). Without such a machine it is placed by time as below, but only
  *   on machines no busier than its own;
  * - a job its own lane can never run (a class limit of 0 there) goes to the
- *   lane that can run it soonest, before any move by time;
+ *   lane that can run it soonest, before any move by time, a quiet re-check
+ *   too (whatever the loads: anywhere it can run beats where it can't);
  * - any other queued job goes where it is expected to finish at least
  *   `minGainSeconds` sooner, when the move also saves that much in all
  *   (what it costs the jobs of the same or a more urgent priority on both
@@ -274,7 +275,8 @@ export function decide(options: DecideOptions): Decision {
       };
 
       const fromUtil = options.utilization(from.machine);
-      if (job.quiet && fromUtil !== null) {
+      // A job its lane never runs goes wherever it can run, quiet re-check or not
+      if (job.quiet && fromUtil !== null && !stuck) {
         // Quiet re-check: the least-loaded eligible machine, by load per cpu
         let quietest: { lane: ModelLane; util: number } | null = null;
         for (const lane of targets) {

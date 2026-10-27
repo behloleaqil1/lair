@@ -12,7 +12,8 @@ import { randomUUID } from "crypto";
 import type { PlacementMove, PlacementMoveStatus } from "../../shared/placement-types.js";
 
 // 2: placement_samples.rc (the run's exit code; NULL for a sample learned by version 1)
-const SCHEMA_VERSION = 2;
+// 3: placement_holds (jobs the per-job cap holds, already reported; created by SCHEMA's IF NOT EXISTS)
+const SCHEMA_VERSION = 3;
 
 /** Version 1 to 2, on a file made by version 1 */
 const MIGRATE_1_TO_2 = `ALTER TABLE placement_samples ADD COLUMN rc INTEGER;`;
@@ -65,6 +66,13 @@ const SCHEMA = `
     PRIMARY KEY (project, gate_id)
   );
   CREATE INDEX IF NOT EXISTS idx_pl_samples ON placement_samples(project, finished_at);
+
+  CREATE TABLE IF NOT EXISTS placement_holds (
+    project TEXT NOT NULL,
+    gate_id TEXT NOT NULL,
+    held_at INTEGER NOT NULL,
+    PRIMARY KEY (project, gate_id)
+  );
 `;
 
 /** Rows kept: moves for 30 days, samples for 90 */
@@ -272,6 +280,30 @@ export class PlacementStore {
       out.set(row.gate_id, list);
     }
     return out;
+  }
+
+  // ============ HOLDS ============
+
+  /**
+   * Record that a job's hold (the per-job move cap) was reported. True the
+   * first time for a hold, false while the same hold is in place (also after
+   * a restart).
+   */
+  markHeld(project: string, gateId: string, at: number): boolean {
+    return (
+      this.db
+        .prepare(`INSERT OR IGNORE INTO placement_holds (project, gate_id, held_at) VALUES (?, ?, ?)`)
+        .run(project, gateId, at).changes > 0
+    );
+  }
+
+  /** Forget the holds of jobs no longer held (moved on, finished, or past the 24 hours). */
+  releaseHolds(project: string, stillHeld: ReadonlySet<string>): void {
+    const rows = this.db.prepare(`SELECT gate_id FROM placement_holds WHERE project = ?`).all(project) as {
+      gate_id: string;
+    }[];
+    const drop = this.db.prepare(`DELETE FROM placement_holds WHERE project = ? AND gate_id = ?`);
+    for (const row of rows) if (!stillHeld.has(row.gate_id)) drop.run(project, row.gate_id);
   }
 
   // ============ RUNS ============

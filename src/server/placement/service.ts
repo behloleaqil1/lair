@@ -143,8 +143,6 @@ export class Placement {
   private lastTickAt: number | null = null;
   private historyChecked = new Set<string>();
   private historyMark: string | null = null;
-  /** Jobs the per-job cap holds, already reported (placement.job_held) */
-  private heldReported = new Set<string>();
   private recovered = false;
   private snapshot: Snapshot | null = null;
   private timer: NodeJS.Timeout | null = null;
@@ -516,7 +514,11 @@ export class Placement {
     return this.store.attemptsSince(this.project, now - window);
   }
 
-  /** Report each job the per-job cap holds, once while it is held. */
+  /**
+   * Report each job the per-job cap holds, once per hold: the store keeps
+   * which holds were reported, so a restart doesn't report one again while
+   * it is still in place. A job that is no longer held is forgotten.
+   */
   private async reportHeld(jobs: ModelJob[], attempts: Map<string, StoredMove[]>, now: number): Promise<void> {
     const held = new Set<string>();
     for (const job of jobs) {
@@ -524,8 +526,7 @@ export class Placement {
       const recent = (attempts.get(job.id) ?? []).filter((m) => m.createdAt >= now - DAY_MS).length;
       if (recent < this.settings.maxMovesPerJob) continue;
       held.add(job.id);
-      if (this.heldReported.has(job.id)) continue;
-      this.heldReported.add(job.id);
+      if (!this.store.markHeld(this.project, job.id, now)) continue;
       await this.events?.emit("placement.job_held", {
         project: this.project,
         gateId: job.id,
@@ -534,7 +535,7 @@ export class Placement {
         reason: `moved or tried ${recent} times in 24 h (max_moves_per_job is ${this.settings.maxMovesPerJob}): placement leaves it where it is`,
       });
     }
-    for (const id of [...this.heldReported]) if (!held.has(id)) this.heldReported.delete(id);
+    this.store.releaseHolds(this.project, held);
   }
 
   private explain(c: Candidate, verb: string, now: number): string {

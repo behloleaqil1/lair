@@ -906,8 +906,10 @@ describe("placement: learning keeps the full runs, not the fragments", () => {
     expect(store.addSample("demo", { ...sample, seconds: 200, rc: 1 })).toBe(false);
     expect(store.addSample("demo", { ...sample, seconds: 2900, rc: 0 })).toBe(true);
     expect(store.recentSamples("demo")).toMatchObject([{ gateId: "old", seconds: 2900, rc: 0 }]);
+    // Migrated all the way: the holds table of version 3 is there too
+    expect(store.markHeld("demo", "old", NOW)).toBe(true);
     const check = new Database(dbPath, { readonly: true });
-    expect(check.pragma("user_version", { simple: true })).toBe(2);
+    expect(check.pragma("user_version", { simple: true })).toBe(3);
     check.close();
   });
 });
@@ -1055,5 +1057,59 @@ describe("placement: a job its lane never runs", () => {
     h.request("heavy", 5, "q1", "run suite");
     await h.tick();
     expect(h.job("q1")).toMatchObject({ expectedStart: null, advice: { to: "remote", gainSeconds: 0, stuck: true } });
+  });
+});
+
+describe("placement: follow-ups", () => {
+  it("moves a quiet re-check its lane never runs, even to a busier machine", async () => {
+    const h = new Harness(
+      placementConfig({
+        prefer_quiet: ["*QUIET=1*"],
+        lanes: {
+          heavy: { machine: "workstation", slots: 1, limits: { big: 0 } },
+          remote: { machine: "laptop", slots: 2, limits: { big: 1 } },
+        },
+      }),
+    );
+    // The laptop is busier (0.9/cpu vs 0.3/cpu), but it is the only lane that runs the job at all
+    h.world.loads = { workstation: "{ 3.00 3.00 3.00 }\n10\n", laptop: "7.20 7.00 7.00 1/200 999\n8\n" };
+    h.request("heavy", 5, "q1", "QUIET=1 run suite");
+    await h.tick();
+    expect(h.moved()).toEqual([["mover", "q1", "heavy", "remote"]]);
+    expect(h.eventsOf("placement.moved")[0].data.explanation).toBe(
+      "moved q1 heavy→remote: est. never → 60 min; heavy never runs big, remote idle",
+    );
+  });
+
+  it("reports a hold once, also across a restart, and again for a new hold", async () => {
+    const dbPath = storeFile();
+    const h = new Harness(placementConfig({ max_moves_per_job: 1 }), { dbPath });
+    h.request("heavy", 5, "r1", "run suite", ".run");
+    h.request("heavy", 5, "q1", "run suite");
+    await h.tick();
+    expect(h.moved()).toHaveLength(1);
+    h.rename("remote.5.q1.req", "heavy.5.q1.req");
+    h.clock.advance(MIN);
+    await h.tick();
+    const held = () => h.eventsOf("placement.job_held");
+    expect(held()).toHaveLength(1);
+
+    // A restart: the hold is still in place, so it is not reported again
+    await h.manager.stop();
+    h.open();
+    h.clock.advance(MIN);
+    await h.tick();
+    expect(held()).toHaveLength(1);
+    expect(h.job("q1")?.held).toBe("moved or tried 1 times in 24 h: held (max_moves_per_job is 1)");
+    expect(h.moved()).toHaveLength(1);
+
+    // It leaves the queue, then comes back still capped: a new hold, reported again
+    unlinkSync(join(h.queue, "heavy.5.q1.req"));
+    h.clock.advance(MIN);
+    await h.tick();
+    h.request("heavy", 5, "q1", "run suite");
+    h.clock.advance(MIN);
+    await h.tick();
+    expect(held()).toHaveLength(2);
   });
 });
