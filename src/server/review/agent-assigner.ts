@@ -187,10 +187,24 @@ export class AgentReviewAssigner implements ReviewAssigner {
   }
 
   private async assignNow(a: ReviewAssignment): Promise<AssignResult> {
+    // A round a later request replaced (a slow call that outlived a reload, say) starts nothing
+    const latest = this.o.store.getRequest(a.project, a.pr, a.headSha, a.slot);
+    if (latest && latest.round !== a.round) {
+      return {
+        assigned: false,
+        agent: null,
+        detail: `round ${a.round} was replaced by round ${latest.round}: nothing started for it`,
+        channel: AGENTS_CHANNEL,
+      };
+    }
     const existing = this.o.store.getAgentAssignment(a.project, a.pr, a.headSha, a.slot);
     if (existing && (existing.state === "requested" || existing.state === "assigned")) {
-      // One run per slot: this one is being taken care of
-      return { assigned: false, agent: null, detail: `already ${existing.state}: ${existing.detail}`, channel: AGENTS_CHANNEL };
+      if (existing.round === a.round) {
+        // One run per slot: this one is being taken care of
+        return { assigned: false, agent: null, detail: `already ${existing.state}: ${existing.detail}`, channel: AGENTS_CHANNEL };
+      }
+      // An earlier round not followed up yet (its reviewer reviewed without filling the slot, or it was interrupted)
+      await this.retire(existing, a.round);
     }
     const now = this.now();
     const record: AgentAssignmentRecord = {
@@ -374,35 +388,43 @@ export class AgentReviewAssigner implements ReviewAssigner {
     const free: Candidate[] = [];
     const waiting: string[] = [];
     const never: string[] = [];
-    /** How many of `never` are the configuration's doing (not this PR's author or reviews) */
-    let configured = 0;
+    /**
+     * How many of `never` are this PR's doing rather than the configuration's:
+     * an agent the tasks file left as a possible author, or one that already
+     * reviewed this head. The author itself in the pool is the pool's doing
+     * (a pool that leaves no one else can't review that author's PRs).
+     */
+    let thisPr = 0;
     for (const id of pool) {
       const view = views.get(id);
-      if (id === spec.author || spec.exclude.includes(id)) {
-        never.push(id === spec.author ? `${id}: the PR's author` : `${id}: may be the PR's author`);
+      if (id === spec.author) {
+        never.push(`${id}: the PR's author`);
+        continue;
+      }
+      if (spec.exclude.includes(id)) {
+        never.push(`${id}: may be the PR's author`);
+        thisPr++;
         continue;
       }
       if (!view) {
         never.push(`${id}: not an agent of this project`);
-        configured++;
         continue;
       }
       const models = view.profiles.map((p) => p.model ?? null);
       if (spec.differentModel) {
         if (models.length === 0 || models.includes(null)) {
           never.push(`${id}: the model of one of its profiles is unknown`);
-          configured++;
           continue;
         }
         const shared = models.find((m) => m !== null && authorModels.has(m));
         if (shared) {
           never.push(`${id}: it and the author can both run on ${shared}`);
-          configured++;
           continue;
         }
       }
       if (reviewedHere.has(id)) {
         never.push(`${id}: already reviewed this head`);
+        thisPr++;
         continue;
       }
       if (reviewing.has(id)) {
@@ -420,7 +442,7 @@ export class AgentReviewAssigner implements ReviewAssigner {
       free.push({ id, model: models[0] ?? null });
     }
     if (free.length === 0 && waiting.length === 0) {
-      return { blocked: `no agent can review it: ${never.join("; ")}`, config: configured === never.length };
+      return { blocked: `no agent can review it: ${never.join("; ")}`, config: thisPr === 0 };
     }
     // Stable: pool order, with the agents whose runs already ended without a review last
     free.sort((a, b) => Number(spec.tried.includes(a.id)) - Number(spec.tried.includes(b.id)));
@@ -435,6 +457,21 @@ export class AgentReviewAssigner implements ReviewAssigner {
         this.lastError = `${record.project} #${record.pr}: ${message(e)}`;
       }
     }
+  }
+
+  /** Close an earlier round's open record now that `round` replaces it: reviewed if its token was used, else stale. */
+  private async retire(record: AgentAssignmentRecord, round: number): Promise<void> {
+    const request = this.o.store
+      .requestRounds(record.project, record.pr, record.headSha, record.slot)
+      .find((r) => r.round === record.round);
+    if (request?.usedBy) {
+      record.state = "reviewed";
+      record.agent = request.usedBy;
+      record.detail = `reviewed by ${request.usedBy}`;
+      this.hostChecked.delete(recordKey(record));
+      return this.save(record);
+    }
+    return this.stale(record, `round ${record.round} was replaced by round ${round}`);
   }
 
   /** The PR moved on: no more runs for this head, and a review run still going is stopped. */
@@ -476,6 +513,10 @@ export class AgentReviewAssigner implements ReviewAssigner {
       record.state = "failed";
       record.detail = "its review request is gone";
       return this.save(record);
+    }
+    const latest = this.o.store.getRequest(record.project, record.pr, record.headSha, record.slot);
+    if (latest && latest.round !== record.round) {
+      return this.stale(record, `round ${record.round} was replaced by round ${latest.round}`);
     }
     const seen = this.o.store.currentHead(record.project, record.pr);
     if (seen && seen !== record.headSha) return this.stale(record, `the PR moved to ${seen.slice(0, 7)}`);

@@ -777,6 +777,19 @@ export class ReviewStore {
     return row ? assignmentOf(row) : null;
   }
 
+  /**
+   * A human review round whose inbox item was withdrawn (the PR left the
+   * head): channel `withdrawn`, so it no longer counts as asked for.
+   */
+  markRequestWithdrawn(project: string, pr: number, headSha: string, slot: number, detail: string): void {
+    this.db
+      .prepare(
+        `UPDATE review_requests SET channel = 'withdrawn', detail = ?
+         WHERE project = ? AND pr = ? AND head_sha = ? AND slot = ? AND channel = 'decision' AND used_by IS NULL`,
+      )
+      .run(detail.slice(0, 500), project, pr, headSha, slot);
+  }
+
   /** The slots whose human review was asked for at one head (through the Decision Inbox). */
   decisionSlots(project: string, pr: number, headSha: string): number[] {
     const rows = this.db

@@ -124,6 +124,8 @@ export const AUTO_REQUEST_MIN_INTERVAL_MS = 5 * 60_000;
 const REQUESTING = "requesting";
 /** The channel of a round whose assigner threw */
 const REQUEST_ERROR = "error";
+/** The channel of a human review round whose inbox item was withdrawn when the PR moved off its head */
+const REQUEST_WITHDRAWN = "withdrawn";
 /**
  * A round still `requesting` after this long was interrupted (Lair stopped
  * between writing its token's hash and the assigner's answer): the slot may
@@ -283,18 +285,17 @@ export class ReviewService {
       .listReviews(this.project, pr.number)
       .filter((r) => r.headSha !== pr.headSha && r.reviewer.kind !== "check").length;
     this.emit("review.invalidated", { pr: pr.number, previousHead: previous, headSha: pr.headSha, staleReviews: stale });
+    const why = `PR #${pr.number} moved from ${short(previous)} to ${short(pr.headSha)}: a review must bind to the new head`;
     for (const slot of this.o.store.decisionSlots(this.project, pr.number, previous)) {
       try {
-        await this.o.decisions.withdraw?.(
-          this.project,
-          humanReviewKey(pr.number, previous, slot),
-          `PR #${pr.number} moved from ${short(previous)} to ${short(pr.headSha)}: a review must bind to the new head`,
-        );
+        await this.o.decisions.withdraw?.(this.project, humanReviewKey(pr.number, previous, slot), why);
       } catch (e) {
         console.warn(
           `[review] ${this.project} #${pr.number}: withdrawing the old head's review request failed: ${e instanceof Error ? e.message : e}`,
         );
       }
+      // The round no longer counts: if the head comes back, the human review is asked for again
+      this.o.store.markRequestWithdrawn(this.project, pr.number, previous, slot, why);
     }
   }
 
@@ -826,13 +827,15 @@ export class ReviewService {
       const previous = this.o.store.getRequest(this.project, n, status.headSha, index);
       const agents = this.o.store.getAgentAssignment(this.project, n, status.headSha, index);
       const failedRound = previous && !previous.usedBy && agents?.round === previous.round && agents.state === "failed";
-      // A round whose hand-over never finished (a crash after its token's hash was written, or an assigner error) doesn't count
+      // A round whose hand-over never finished (a crash after its token's hash was written, or an assigner error),
+      // or whose inbox item was withdrawn when the PR left this head, doesn't count
       const handedOn = agents?.round === previous?.round && (agents?.state === "requested" || agents?.state === "assigned");
       const interrupted =
         previous &&
         !previous.usedBy &&
         !handedOn &&
         (previous.channel === REQUEST_ERROR ||
+          previous.channel === REQUEST_WITHDRAWN ||
           (previous.channel === REQUESTING && this.o.clock.now() - Date.parse(previous.requestedAt) >= REQUESTING_EXPIRY_MS));
       if (previous && !previous.usedBy && !interrupted && !(failedRound && origin === "owner")) {
         outcomes.push({

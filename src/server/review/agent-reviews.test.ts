@@ -1034,6 +1034,98 @@ describe("human reviews asked for at a head that is gone", () => {
         .sort(),
     ).toEqual(heads.slice(0, 3).map((head) => `Review PR #7 (amber tier) at ${head.slice(0, 7)}`).sort());
   });
+
+  it("are asked for again when the head comes back to one the PR left (A, then B, then A)", async () => {
+    const h = await boot({ review: { reviewers: { amber: ["human", "peer"] } } });
+    const asked = () => h.inbox.list({ project: "demo", status: "all" }).filter((d) => d.title.startsWith("Review PR #7"));
+    const title = (head: string) => `Review PR #7 (amber tier) at ${head.slice(0, 7)}`;
+    const a = h.head;
+    await h.reviews.requestOpenPullRequests();
+    h.clock.t = NOW + 6 * MIN;
+    const b = push(h);
+    await h.reviews.requestOpenPullRequests();
+    // A throwaway commit, then a force-push back to A
+    h.clock.t = NOW + 12 * MIN;
+    h.remote.pushToPull(7, a);
+    await h.reviews.requestOpenPullRequests();
+
+    expect(asked().filter((d) => d.status === "open").map((d) => d.title)).toEqual([title(a)]);
+    expect(
+      asked()
+        .filter((d) => d.status === "withdrawn")
+        .map((d) => d.title)
+        .sort(),
+    ).toEqual([title(a), title(b)].sort());
+    // A's first round no longer counts; the second is the open one
+    expect(
+      query(reviewDb(h), `SELECT round, channel FROM review_requests WHERE pr = 7 AND head_sha = ? AND slot = 0 ORDER BY round`, a),
+    ).toEqual([
+      { round: 1, channel: "withdrawn" },
+      { round: 2, channel: "decision" },
+    ]);
+    expect((await statusOf(h)).assignments![0]).toMatchObject({ slot: 0, state: "requested", channel: "decision" });
+  });
+});
+
+describe("a request round replaced by a later one", () => {
+  it("starts nothing when its assignment reaches the assigner late", async () => {
+    const h = await boot();
+    await statusOf(h);
+    // Round 1 was left interrupted; the owner's round 2 goes to rev-b
+    const db = new Database(reviewDb(h));
+    db.prepare(
+      `INSERT INTO review_requests (project, pr, head_sha, slot, round, channel, detail, requested_at, reviewer, exclude, token_hash, used_by, model)
+       VALUES ('demo', 7, ?, 0, 1, 'requesting', 'requesting', ?, NULL, '["worker-a"]', ?, NULL, NULL)`,
+    ).run(h.head, new Date(NOW - 11 * MIN).toISOString(), sha256("round one's token"));
+    db.close();
+    expect((await requestReviews(h))[0].detail).toContain("rev-b: run ");
+
+    // Round 1's assignment arriving only now (a slow call that outlived a reload)
+    const late = await h.reviews.agentReviews!.assign({
+      project: "demo",
+      pr: 7,
+      headSha: h.head,
+      tier: "amber",
+      reviewer: null,
+      exclude: ["worker-a"],
+      role: "review",
+      differentModelFrom: null,
+      differentModel: false,
+      slot: 0,
+      round: 1,
+      author: "worker-a",
+      pool: ["rev-b", "rev-c"],
+      repo: "example-org/demo",
+      base: "main",
+      url: null,
+      reason: "The amber tier needs a peer other than the author",
+      token: "t".repeat(32),
+    });
+    expect(late).toEqual({
+      assigned: false,
+      agent: null,
+      detail: "round 1 was replaced by round 2: nothing started for it",
+      channel: "agents",
+    });
+    await tick(h);
+    expect(h.spawner.calls.map((c) => c.env.LAIR_AGENT)).toEqual(["rev-b"]);
+    expect(h.agents.getStore()!.listRuns("demo")).toHaveLength(1);
+  });
+
+  it("is closed when the owner asks again before the check saw its review", async () => {
+    // The reviewer requests changes; the owner asks again at once, before the next check
+    const h = await boot({ review: { reviewers_pool: { amber: ["rev-b", "rev-c"] } } });
+    const call = await assignedRun(h);
+    expect((await submit(h, call.env, { verdict: "request_changes", findings: "src/feature.ts:2: high: overflows\n" })).code).toBe(EXIT_OK);
+    const again = await requestReviews(h);
+    expect(again[0]).toMatchObject({ channel: "agents", detail: expect.stringContaining("rev-c: run ") });
+    expect(
+      query(reviewDb(h), `SELECT round, state, agent FROM review_agent_assignments WHERE pr = 7 ORDER BY round`),
+    ).toEqual([
+      { round: 1, state: "reviewed", agent: "rev-b" },
+      { round: 2, state: "assigned", agent: "rev-c" },
+    ]);
+  });
 });
 
 describe("a tasks file that chose between two matched agents", () => {
@@ -1099,6 +1191,24 @@ describe("a slot the configuration can't satisfy", () => {
     expect(items[0].context).toContain(`PR #7 at ${h.head.slice(0, 7)} hit it first`);
     await tick(h);
     expect(h.spawner.calls).toHaveLength(0);
+  });
+
+  it("is raised when the pool leaves no one but the author and agents on its model", async () => {
+    const h = await boot({
+      review: { reviewers: { amber: [{ any_of: ["peer"], different_model: true, pool: ["worker-a", "rev-c"] }] } },
+    });
+    const why = "no agent can review it: worker-a: the PR's author; rev-c: it and the author can both run on model-a";
+    expect((await requestReviews(h))[0].detail).toBe(why);
+    expect(h.inbox.list({ project: "demo" }).map((d) => d.title)).toEqual([`Reviews by agents can't be done as configured: ${why}`]);
+  });
+
+  it("is not raised when this PR is why (its only reviewer already reviewed this head)", async () => {
+    const h = await boot({ review: { reviewers_pool: { amber: ["rev-b"] } } });
+    const call = await assignedRun(h);
+    expect((await submit(h, call.env, { verdict: "request_changes", findings: "src/feature.ts:2: high: overflows\n" })).code).toBe(EXIT_OK);
+    const again = await requestReviews(h);
+    expect(again[0].detail).toBe("no agent can review it: rev-b: already reviewed this head");
+    expect(h.inbox.list({ project: "demo" })).toEqual([]);
   });
 });
 
