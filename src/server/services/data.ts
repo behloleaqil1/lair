@@ -270,7 +270,7 @@ export class DataService {
       return {
         ...d,
         running: run !== undefined || isDragonRunning(runningDirs, d.id),
-        lastLogTime: newest ? new Date(newest.mtimeMs).toISOString() : undefined,
+        lastLogTime: newest ? newest.mtime.toISOString() : undefined,
         lastLogLine: parsed?.line,
         stats,
         model,
@@ -297,14 +297,14 @@ export class DataService {
    * looked at (their names carry a UTC stamp), so a directory of old logs
    * costs no more than a handful of stats.
    */
-  private newestLog(files: string[]): { path: string; mtimeMs: number } | null {
-    let newest: { path: string; mtimeMs: number } | null = null;
+  private newestLog(files: string[]): { path: string; mtimeMs: number; mtime: Date } | null {
+    let newest: { path: string; mtimeMs: number; mtime: Date } | null = null;
     for (const file of [...files].sort().reverse().slice(0, LOG_CANDIDATES)) {
       const path = join(this.config.agents_dir, file);
       try {
         const stat = statSync(path);
         if (stat.isFile() && (newest === null || stat.mtimeMs > newest.mtimeMs)) {
-          newest = { path, mtimeMs: stat.mtimeMs };
+          newest = { path, mtimeMs: stat.mtimeMs, mtime: stat.mtime };
         }
       } catch {
         // Gone since the listing
@@ -404,7 +404,7 @@ export class DataService {
     const cutoff = now - span * 60 * 60 * 1000;
     const latest = now + CLOCK_SKEW_MS;
 
-    const recent: { id: string; rcPath: string; mtimeMs: number }[] = [];
+    const recent: { id: string; rcPath: string; mtimeMs: number; mtime: Date }[] = [];
     for (const file of safeListDir(resultsDir)) {
       if (!file.endsWith(".rc")) continue;
       const id = file.slice(0, -".rc".length);
@@ -413,7 +413,7 @@ export class DataService {
       try {
         const stat = statSync(rcPath);
         if (!stat.isFile() || stat.mtimeMs < cutoff || stat.mtimeMs > latest) continue;
-        recent.push({ id, rcPath, mtimeMs: stat.mtimeMs });
+        recent.push({ id, rcPath, mtimeMs: stat.mtimeMs, mtime: stat.mtime });
       } catch {
         continue;
       }
@@ -424,7 +424,7 @@ export class DataService {
     );
 
     const results: GateResult[] = [];
-    for (const { id, rcPath, mtimeMs } of recent) {
+    for (const { id, rcPath, mtime } of recent) {
       if (results.length >= limit) break;
       const rc = parseGateRc(readTail(rcPath, 1024) ?? "");
       if (rc === null) continue;
@@ -437,7 +437,7 @@ export class DataService {
       results.push({
         id,
         rc,
-        finishedAt: new Date(mtimeMs).toISOString(),
+        finishedAt: mtime.toISOString(),
         failedSteps: failedSteps.length > 0 ? failedSteps : undefined,
       });
     }
