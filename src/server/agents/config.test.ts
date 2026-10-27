@@ -3,7 +3,7 @@
  */
 import { describe, expect, it } from "vitest";
 import type { ProjectConfig } from "../../shared/types.js";
-import { backoffMs, parseAgentsConfig } from "./config.js";
+import { backoffMs, DEFAULT_DONE_PATTERN, donePatternFor, parseAgentsConfig } from "./config.js";
 
 const project = {
   name: "Demo",
@@ -115,6 +115,63 @@ describe("agents config", () => {
     expect(errorsOf({ env_passthrough: ["lair_node_token"] })).toEqual([
       "agents.env_passthrough: lair_node_token: LAIR_* variables are never passed to agents",
     ]);
+  });
+
+  it("fill is off by default; enabled, it needs agents.enabled, tasks_file, an allowlist and prompt files", () => {
+    const parsed = parseAgentsConfig(undefined, project);
+    expect(parsed.ok && parsed.settings.fill).toEqual({
+      enabled: false,
+      tasksFile: undefined,
+      agents: [],
+      promptFiles: [],
+      maxActive: 1,
+      donePattern: DEFAULT_DONE_PATTERN,
+      capacityCmd: undefined,
+      intervalSeconds: 60,
+    });
+    expect(errorsOf({ fill: { enabled: true } })).toEqual([
+      "agents.fill.enabled: fill needs agents.enabled: true",
+      "agents.fill.tasks_file: required when fill is enabled",
+      "agents.fill.agents: list the agents fill may start (required when fill is enabled)",
+      "agents.fill.prompt_files: at least one prompt file is required when fill is enabled",
+    ]);
+  });
+
+  it("fill: prompt paths can't climb out, placeholders are checked, done_pattern needs {task}", () => {
+    const fill = {
+      enabled: true,
+      tasks_file: "work/tasks.txt",
+      agents: ["worker-a"],
+      prompt_files: ["{prompts_dir}/restart-addendum.txt", "{prompts_dir}/{agent}.txt"],
+      capacity_cmd: ["capacity-check"],
+    };
+    const withFill = (extra: Record<string, unknown>) => ({ enabled: true, fill: { ...fill, ...extra } });
+    expect(errorsOf(withFill({}))).toEqual([]);
+    expect(errorsOf(withFill({ prompt_files: ["{prompts_dir}/../secrets.txt"] }))).toEqual([
+      'agents.fill.prompt_files[0]: a ".." segment is refused (prompt files stay inside prompts_dir)',
+    ]);
+    expect(errorsOf(withFill({ prompt_files: ["{prompts_dir}/{repo}.txt"] }))[0]).toContain(
+      "agents.fill.prompt_files[0]: unknown placeholder {repo}",
+    );
+    expect(errorsOf(withFill({ agents: ["not an id"] }))).toEqual(["agents.fill.agents[0]: not an id is not a valid agent id"]);
+    expect(errorsOf(withFill({ done_pattern: "^- DONE " }))[0]).toContain("agents.fill.done_pattern: needs {task}");
+    expect(errorsOf(withFill({ done_pattern: "^- DONE ({task}" }))[0]).toContain(
+      "agents.fill.done_pattern: not a valid regular expression",
+    );
+    expect(errorsOf(withFill({ max_active: 0 }))[0]).toContain("agents.fill.max_active");
+    expect(errorsOf(withFill({ capacity_cmd: [] }))[0]).toContain("agents.fill.capacity_cmd");
+    expect(errorsOf(withFill({ launch_forever: true }))[0]).toContain("agents.fill");
+  });
+
+  it("the default done_pattern matches a DONE line for the task, not for a longer task id", () => {
+    const pattern = donePatternFor(DEFAULT_DONE_PATTERN, "feat-login", "worker-a");
+    expect(pattern.test("- DONE feat-login by worker-a 12:05Z: merged")).toBe(true);
+    expect(pattern.test("- DONE feat-login: merged")).toBe(true);
+    expect(pattern.test("- DONE feat-login")).toBe(true);
+    expect(pattern.test("- DONE feat-login-2 by worker-a 12:05Z: merged")).toBe(false);
+    expect(pattern.test("- WAITING feat-login 20260101T000000Z-x-abcdef12-1 by worker-a")).toBe(false);
+    // Task ids are literal text in the pattern
+    expect(donePatternFor(DEFAULT_DONE_PATTERN, "fix.1", "worker-a").test("- DONE fix21 by worker-a")).toBe(false);
   });
 
   it("backs off exponentially, capped", () => {

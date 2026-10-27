@@ -15,7 +15,12 @@ import type { AgentEventKind, AgentRunState } from "../../shared/agents-types.js
 import { ACTIVE_STATES, type AgentEvent, type AgentRun, type Claim, type UsageRecord } from "./types.js";
 import type { ProcessOwner } from "./probes.js";
 
-const SCHEMA_VERSION = 1;
+/**
+ * 1: runs, claims, events, usage. 2: idx_agents_runs_task (fill looks up a
+ * task's latest run). Every statement is IF NOT EXISTS, so running SCHEMA
+ * migrates any older version.
+ */
+export const SCHEMA_VERSION = 2;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS agents_runs (
@@ -31,6 +36,7 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_agents_runs_state ON agents_runs(project, state);
   CREATE INDEX IF NOT EXISTS idx_agents_runs_agent ON agents_runs(project, agent, requested_at);
   CREATE INDEX IF NOT EXISTS idx_agents_runs_chain ON agents_runs(chain_id);
+  CREATE INDEX IF NOT EXISTS idx_agents_runs_task ON agents_runs(project, task, requested_at);
 
   CREATE TABLE IF NOT EXISTS agents_claims (
     project TEXT NOT NULL,
@@ -216,6 +222,17 @@ export class AgentsStore {
         `SELECT data FROM agents_runs WHERE project = ? AND agent = ? ORDER BY requested_at DESC, rowid DESC LIMIT 1`,
         project,
         agent,
+      )[0] ?? null
+    );
+  }
+
+  /** A task's newest run (of any agent). */
+  latestRunForTask(project: string, task: string): AgentRun | null {
+    return (
+      this.runs(
+        `SELECT data FROM agents_runs WHERE project = ? AND task = ? ORDER BY requested_at DESC, rowid DESC LIMIT 1`,
+        project,
+        task,
       )[0] ?? null
     );
   }

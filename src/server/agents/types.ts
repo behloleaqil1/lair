@@ -10,9 +10,34 @@ import type {
   AgentRunState,
   AgentRunView,
   ClaimView,
+  RunOrigin,
   SessionMode,
   StopReason,
 } from "../../shared/agents-types.js";
+
+/** Task ids: they reach argv placeholders and file names, so no shell characters and no leading dash. */
+export const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._/#:-]{0,127}$/;
+
+/** A task id: TASK_ID, no leading "/", and no "." or ".." path segment. */
+export function isValidTaskId(task: unknown): task is string {
+  return (
+    typeof task === "string" &&
+    TASK_ID.test(task) &&
+    !task.startsWith("/") &&
+    !task.split("/").some((segment) => segment === ".." || segment === ".")
+  );
+}
+
+/**
+ * Where the queue file stood when a task's chain was requested: its size,
+ * and a hash of the bytes just before that point (so a rewritten file is
+ * noticed). Fill matches done_pattern against the lines written after it.
+ */
+export interface QueueMark {
+  offset: number;
+  /** sha256 (hex) of the up to 256 bytes before `offset` */
+  tail: string;
+}
 
 export const ACTIVE_STATES: readonly AgentRunState[] = ["queued", "waiting_lock", "running", "stopping"];
 
@@ -83,6 +108,10 @@ export interface AgentRun {
   logOffset: number;
   promptFile?: string;
   lastError?: string;
+  /** What started the chain, when it was agents.fill (kept by every attempt) */
+  origin?: RunOrigin;
+  /** The queue file when the chain was requested (kept by every attempt) */
+  queueMark?: QueueMark;
 }
 
 export interface Claim {
@@ -164,6 +193,7 @@ export function runView(run: AgentRun): AgentRunView {
     exitCode: run.exitCode,
     logPath: run.logPath,
     lastError: run.lastError,
+    origin: run.origin,
   };
 }
 

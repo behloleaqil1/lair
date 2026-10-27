@@ -17,15 +17,17 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   utimesSync,
   writeFileSync,
 } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
+import { dirname, join } from "path";
+import Database from "better-sqlite3";
 import type { AgentAdapter, ProjectConfig } from "../../shared/types.js";
-import type { AgentEventKind, AgentsStatusView, AgentView, PromptFileView } from "../../shared/agents-types.js";
+import type { AgentEventKind, AgentsStatusView, AgentView, FillStatusView, PromptFileView } from "../../shared/agents-types.js";
 import { EventBus } from "../core/event-bus.js";
 import { BudgetManager } from "../fleet/budget.js";
 import {
@@ -35,6 +37,7 @@ import {
   type CommandRunner,
   type ProcessInfo,
   type ProcessTable,
+  type RunOptions,
 } from "../watchdog/probes.js";
 import { WatchdogManager } from "../watchdog/service.js";
 import { AgentsManager, type AgentsService } from "./service.js";
@@ -54,7 +57,7 @@ import { DataService } from "../services/data.js";
 import { listPromptFiles, MAX_PROMPT_FILE_BYTES, PromptFileError, readPromptFile } from "./prompts.js";
 import type { AgentProbes, ProcessOwner, ProcessSpawner, SpawnOptions } from "./probes.js";
 import type { DecisionInbox, DecisionRequest } from "./decisions.js";
-import type { AgentsStore } from "./store.js";
+import { AgentsStore, SCHEMA_VERSION } from "./store.js";
 import type { AgentEvent, AgentRun } from "./types.js";
 
 // ============ BOUNDARY FAKES ============
@@ -182,9 +185,15 @@ class FakeSpawner implements ProcessSpawner {
 
 class FakeCommandRunner implements CommandRunner {
   calls: string[][] = [];
+  options: RunOptions[] = [];
   stdout = "";
-  async run(argv: string[]): Promise<CommandOutput> {
+  /** Answers a command itself (the capacity command, say); undefined falls through */
+  answer?: (argv: string[], options: RunOptions) => Promise<CommandOutput | undefined> | CommandOutput | undefined;
+  async run(argv: string[], options: RunOptions = {}): Promise<CommandOutput> {
     this.calls.push([...argv]);
+    this.options.push(options);
+    const answered = await this.answer?.(argv, options);
+    if (answered) return answered;
     return { code: 0, stdout: this.stdout, stderr: "" };
   }
 }
@@ -1858,5 +1867,430 @@ describe("10. the Dragons view: a dragon this module runs is running, managed by
     expect(dragon("worker-a")).toBeUndefined();
     // A project without the module has no managed runs
     expect(h.manager.managedRuns("off").size).toBe(0);
+  });
+});
+
+// ============ 11. FILL ============
+
+describe("11. fill: Lair starts runs itself from a task list", () => {
+  const ADDENDUM = "If this is a restart, read your notes and the branch state first.";
+  const tasksPath = (p: Paths) => join(p.dir, "tasks.txt");
+  const fill =
+    (extra: Record<string, unknown> | ((p: Paths) => Record<string, unknown>) = {}) =>
+    (p: Paths) => ({
+      fill: {
+        enabled: true,
+        tasks_file: tasksPath(p),
+        agents: ["worker-a", "worker-b"],
+        prompt_files: ["{prompts_dir}/restart-addendum.txt", "{prompts_dir}/{agent}.txt"],
+        max_active: 2,
+        interval_seconds: 1,
+        ...(typeof extra === "function" ? extra(p) : extra),
+      },
+    });
+
+  /** The prompt files, in prompts_dir */
+  function prompts(p: Paths): void {
+    mkdirSync(p.promptsDir, { recursive: true });
+    writeFileSync(join(p.promptsDir, "restart-addendum.txt"), `${ADDENDUM}\n`);
+    writeFileSync(join(p.promptsDir, "worker-a.txt"), "You are worker A: build what the task says.\n");
+    writeFileSync(join(p.promptsDir, "worker-b.txt"), "You are worker B.\n");
+  }
+
+  const tasks = (p: Paths, ...lines: string[]) => writeFileSync(tasksPath(p), `${lines.join("\n")}\n`);
+
+  function lineOf(status: FillStatusView | undefined, task: string) {
+    const line = status?.lines.find((l) => l.task === task);
+    if (!line) throw new Error(`no fill line for ${task}`);
+    return line;
+  }
+
+  const check = (h: Harness) => h.service.checkFill();
+
+  it("starts an idle allowlisted task: its prompt is the prompt files in order, and it is requested in-process", async () => {
+    const h = setup(fill());
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+
+    const status = await check(h);
+
+    const line = lineOf(status, "feat-login");
+    expect(line).toMatchObject({ line: 1, agent: "worker-a", name: "Alice", description: "Build the login form", state: "started" });
+    const [run] = runs(h);
+    expect(run).toMatchObject({ agent: "worker-a", task: "feat-login", state: "queued", origin: "fill" });
+    expect(line.runId).toBe(run.id);
+    // What requestRun does for any caller: the claim and the requested event
+    expect(h.store.getClaim("demo", "feat-login")).toMatchObject({ runId: run.id, ownerPid: SELF.pid });
+    expect(eventsOf(h, "requested")[0].summary).toContain("by fill");
+    const [started] = eventsOf(h, "fill_started");
+    expect(started).toMatchObject({ agent: "worker-a", task: "feat-login", runId: run.id });
+    expect(started.data.promptFiles).toEqual([join(h.promptsDir, "restart-addendum.txt"), join(h.promptsDir, "worker-a.txt")]);
+    expect(h.bus).toContain("agents.fill_started");
+    expect(status.active).toBe(1);
+
+    await h.service.tick();
+    expect(h.spawner.calls).toHaveLength(1);
+    expect(promptOf(h.spawner.calls[0])).toBe(`${ADDENDUM}\n\nYou are worker A: build what the task says.\n`);
+    expect(h.spawner.calls[0].env).toMatchObject({ LAIR_TASK: "feat-login", LAIR_AGENT: "worker-a" });
+
+    // While it runs, later checks leave it alone
+    await check(h);
+    await check(h);
+    expect(runs(h)).toHaveLength(1);
+    expect(lineOf(h.service.status().fill, "feat-login")).toMatchObject({ state: "started", runId: run.id });
+    expect(lineOf(h.service.status().fill, "feat-login").detail).toContain("is running");
+
+    // The status API serves it
+    const app = await http(h);
+    const served = (await app.inject({ url: "/api/agents/status?project=demo" })).json().data as AgentsStatusView;
+    expect(served.fill).toMatchObject({ enabled: true, active: 1, maxActive: 2, tasksFile: tasksPath(h), lastError: null });
+    expect(served.fill?.lastCheck).toBe(new Date(NOW).toISOString());
+    expect(served.fill?.lines.map((l) => [l.task, l.state])).toEqual([["feat-login", "started"]]);
+  });
+
+  it("never starts an agent that is not allowlisted (another launcher may still run it)", async () => {
+    const h = setup(fill({ agents: ["worker-a"] }));
+    prompts(h);
+    tasks(h, "worker-b|Bob|feat-search|Search page", "worker-a|Alice|feat-login|Login form");
+
+    for (let i = 0; i < 3; i++) {
+      await check(h);
+      await at(h, i * MIN);
+    }
+
+    expect(runs(h).map((r) => r.agent)).toEqual(["worker-a"]);
+    expect(h.spawner.calls.map((c) => c.env.LAIR_AGENT)).toEqual(["worker-a"]);
+    expect(lineOf(h.service.status().fill, "feat-search")).toMatchObject({ state: "not_allowlisted", agent: "worker-b", runId: null });
+    expect(h.store.getClaim("demo", "feat-search")).toBeNull();
+    expect(eventsOf(h, "fill_started").map((e) => e.agent)).toEqual(["worker-a"]);
+    expect(eventsOf(h, "fill_held")).toEqual([]);
+  });
+
+  it("a task done since its last start is not started again; one done before it (the owner reopened it) is", async () => {
+    const h = setup(fill());
+    prompts(h);
+    // Done before Lair ever ran it (by another launcher, say): never started
+    appendFileSync(h.queueFile, "- DONE feat-old by worker-b 11:00Z: merged\n");
+    tasks(h, "worker-b|Bob|feat-old|Old work", "worker-a|Alice|feat-login|Login form");
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
+
+    await check(h);
+    expect(lineOf(h.service.status().fill, "feat-old")).toMatchObject({
+      state: "done",
+      detail: "done: - DONE feat-old by worker-b 11:00Z: merged",
+    });
+    await at(h, 0); // feat-login runs as pid 5001
+    // The agent reports it done, then exits 0
+    appendFileSync(h.queueFile, "- DONE feat-login by worker-a 12:05Z: merged\n");
+    h.spawner.exit(5001, 0);
+    await at(h, 5 * MIN);
+    expect(runs(h)[0].state).toBe("completed");
+
+    await check(h);
+    await at(h, 6 * MIN);
+    expect(lineOf(h.service.status().fill, "feat-login")).toMatchObject({ state: "done" });
+    expect(runs(h)).toHaveLength(1);
+    expect(h.spawner.calls).toHaveLength(1);
+
+    // The owner reopens feat-old: its DONE line is older than this start, so once the
+    // run ends (exit 0) without a new one, fill starts the task again
+    await request(h, "worker-b", "feat-old", "Redo the old work");
+    await at(h, 7 * MIN); // pid 5002
+    h.spawner.exit(5002, 0);
+    await at(h, 8 * MIN);
+    await check(h);
+    expect(lineOf(h.service.status().fill, "feat-old")).toMatchObject({ state: "started" });
+    expect(runs(h)[runs(h).length - 1]).toMatchObject({ agent: "worker-b", task: "feat-old", origin: "fill", state: "queued" });
+    expect(lineOf(h.service.status().fill, "feat-login")).toMatchObject({ state: "done" });
+  });
+
+  it("starts at most max_active runs, and holds while capacity_cmd says no or times out, with the reason", async () => {
+    const h = setup(fill({ max_active: 1, capacity_cmd: ["capacity-check", "--for", "agents"] }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form", "worker-b|Bob|feat-search|Search page");
+    let capacity: CommandOutput | "slow" = { code: 1, stdout: "load 41 is above 40\nsecond line\n", stderr: "" };
+    h.runner.answer = (argv, options) => {
+      if (argv[0] !== "capacity-check") return undefined;
+      if (capacity !== "slow") return capacity;
+      // A command that takes a minute: the runner's timeout ends it first (code -1, as ExecFileRunner answers)
+      return (options.timeoutMs ?? Infinity) < 60_000 ? { code: -1, stdout: "", stderr: "" } : { code: 0, stdout: "", stderr: "" };
+    };
+    const capacityCalls = () => h.runner.calls.filter((c) => c[0] === "capacity-check");
+
+    // No capacity: both lines are held with the command's first line, and nothing is requested
+    let status = await check(h);
+    expect(status.lines.map((l) => [l.task, l.state])).toEqual([
+      ["feat-login", "held"],
+      ["feat-search", "held"],
+    ]);
+    expect(lineOf(status, "feat-login").detail).toBe("no capacity (capacity_cmd exited 1): load 41 is above 40");
+    expect(lineOf(status, "feat-search").detail).toBe("no capacity (capacity_cmd exited 1): load 41 is above 40");
+    expect(capacityCalls()).toEqual([["capacity-check", "--for", "agents"]]); // asked once: it said no
+    expect(runs(h)).toEqual([]);
+    const held = eventsOf(h, "fill_held");
+    expect(held.map((e) => [e.task, e.data.hold])).toEqual([
+      ["feat-login", "capacity"],
+      ["feat-search", "capacity"],
+    ]);
+    expect(held[0].summary).toBe("fill holds worker-a on feat-login: no capacity (capacity_cmd exited 1): load 41 is above 40");
+    expect(h.bus).toContain("agents.fill_held");
+    // The same hold again is not recorded again
+    await check(h);
+    expect(eventsOf(h, "fill_held")).toHaveLength(2);
+
+    // A timeout holds too
+    capacity = "slow";
+    status = await check(h);
+    expect(lineOf(status, "feat-login")).toMatchObject({ state: "held" });
+    expect(lineOf(status, "feat-login").detail).toContain("capacity_cmd did not finish within 30 s");
+    expect(h.runner.options[h.runner.options.length - 1].timeoutMs).toBe(30_000);
+    expect(runs(h)).toEqual([]);
+
+    // Capacity: one run starts, and max_active holds the other
+    capacity = { code: 0, stdout: "ok\n", stderr: "" };
+    status = await check(h);
+    expect(lineOf(status, "feat-login")).toMatchObject({ state: "started" });
+    expect(lineOf(status, "feat-search")).toMatchObject({
+      state: "held",
+      detail: "max_active: 1 run(s) fill started are active (max_active 1)",
+    });
+    expect(runs(h).map((r) => r.task)).toEqual(["feat-login"]);
+    expect(status.active).toBe(1);
+
+    // Once that one is done, the next starts
+    await h.service.tick(); // pid 5001
+    appendFileSync(h.queueFile, "- DONE feat-login by worker-a 12:10Z: merged\n");
+    h.spawner.exit(5001, 0);
+    await at(h, 10 * MIN);
+    status = await check(h);
+    expect(lineOf(status, "feat-login")).toMatchObject({ state: "done" });
+    expect(lineOf(status, "feat-search")).toMatchObject({ state: "started" });
+    expect(runs(h).map((r) => r.task)).toEqual(["feat-login", "feat-search"]);
+  });
+
+  it("refuses prompt files outside prompts_dir: '..' in a task, a symlink out, a directory, an oversized file, a path outside", async () => {
+    const h = setup(fill({ agents: ["worker-a"], prompt_files: ["{prompts_dir}/{task}.txt"] }));
+    mkdirSync(join(h.promptsDir, "shared"), { recursive: true });
+    const secret = join(h.dir, "secret.txt");
+    writeFileSync(secret, "the owner's private notes\n");
+    symlinkSync(secret, join(h.promptsDir, "t-link.txt"));
+    mkdirSync(join(h.promptsDir, "t-dir.txt"));
+    writeFileSync(join(h.promptsDir, "t-big.txt"), "x".repeat(200_001));
+    writeFileSync(join(h.promptsDir, "shared", "real.txt"), "Build the thing.\n");
+    // A symlink that stays inside prompts_dir is fine
+    symlinkSync(join(h.promptsDir, "shared", "real.txt"), join(h.promptsDir, "t-ok.txt"));
+    tasks(h, "worker-a|A|../secret|", "worker-a|A|t-link|", "worker-a|A|t-dir|", "worker-a|A|t-big|", "worker-a|A|t-ok|");
+
+    const status = await check(h);
+
+    expect(status.lines.map((l) => [l.task, l.state])).toEqual([
+      [null, "malformed"],
+      ["t-link", "held"],
+      ["t-dir", "held"],
+      ["t-big", "held"],
+      ["t-ok", "started"],
+    ]);
+    expect(status.lines[0].detail).toContain("../secret is not a valid task id");
+    expect(lineOf(status, "t-link").detail).toBe(
+      `prompt file ${join(h.promptsDir, "t-link.txt")} refused: a symlink out of prompts_dir (to ${realpathSync(secret)})`,
+    );
+    expect(lineOf(status, "t-dir").detail).toBe(`prompt file ${join(h.promptsDir, "t-dir.txt")} refused: it is not a regular file`);
+    expect(lineOf(status, "t-big").detail).toBe(
+      `prompt file ${join(h.promptsDir, "t-big.txt")} refused: it is larger than 200000 bytes (200001)`,
+    );
+    expect(runs(h).map((r) => [r.task, r.prompt])).toEqual([["t-ok", "Build the thing."]]);
+    expect(eventsOf(h, "fill_held").map((e) => e.data.hold)).toEqual(["prompt", "prompt", "prompt"]);
+
+    // An absolute path outside prompts_dir, even without "..", is refused once resolved
+    const outside = setup(fill((p) => ({ agents: ["worker-a"], prompt_files: [join(p.dir, "notes.txt")] })));
+    mkdirSync(outside.promptsDir, { recursive: true });
+    writeFileSync(join(outside.dir, "notes.txt"), "private\n");
+    tasks(outside, "worker-a|A|feat-login|");
+    const refused = await check(outside);
+    expect(lineOf(refused, "feat-login")).toMatchObject({
+      state: "held",
+      detail: `prompt file ${join(outside.dir, "notes.txt")} refused: it is outside prompts_dir (${outside.promptsDir})`,
+    });
+    expect(runs(outside)).toEqual([]);
+  });
+
+  it("reports malformed lines and still fills the others", async () => {
+    const h = setup(fill());
+    prompts(h);
+    tasks(
+      h,
+      "# agent|name|task|description",
+      "",
+      "worker-a|Alice|feat-login|Login form",
+      "just some words",
+      "worker-b|Bob|-rf|a task id that would be an option",
+      "bad agent!|X|feat-x|",
+      "worker-b|Bob|feat-search|Search page | with a pipe",
+      "worker-a|Alice|feat-login|the same task again",
+    );
+
+    const status = await check(h);
+
+    expect(status.lines.map((l) => [l.line, l.state, l.task])).toEqual([
+      [3, "started", "feat-login"],
+      [4, "malformed", null],
+      [5, "malformed", null],
+      [6, "malformed", null],
+      [7, "started", "feat-search"],
+      [8, "malformed", null],
+    ]);
+    const detail = (n: number) => status.lines.find((l) => l.line === n)?.detail;
+    expect(detail(4)).toBe("expected <agent>|<name>|<task>|<description>: just some words");
+    expect(detail(5)).toContain("-rf is not a valid task id");
+    expect(detail(6)).toContain("bad agent! is not a valid agent id");
+    expect(detail(8)).toContain("task feat-login is already on line 3");
+    expect(lineOf(status, "feat-search").description).toBe("Search page | with a pipe");
+    expect(runs(h).map((r) => [r.agent, r.task])).toEqual([
+      ["worker-a", "feat-login"],
+      ["worker-b", "feat-search"],
+    ]);
+    expect(status.lastError).toBeNull();
+
+    // A tasks_file that can't be read is the check's error, not a crash
+    rmSync(tasksPath(h));
+    const missing = await check(h);
+    expect(missing.lines).toEqual([]);
+    expect(missing.lastError).toBe(`tasks_file ${tasksPath(h)} does not exist`);
+  });
+
+  it("leaves a claimed task alone: no second run, whoever holds the claim", async () => {
+    const h = setup(fill());
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form", "worker-b|Bob|feat-search|Search page");
+    // The owner started feat-login with worker-b; a live process outside this module holds feat-search
+    const owners = await request(h, "worker-b", "feat-login", "Build it, B");
+    h.procs.add(4242, "another-launcher", NOW - 5 * MIN);
+    h.store.claim("demo", "feat-search", "external-run", "worker-b", { pid: 4242, startedAt: NOW - 5 * MIN }, NOW - 5 * MIN, () => false);
+
+    for (const ms of [0, 0, MIN]) {
+      await check(h);
+      await at(h, ms);
+    }
+
+    const status = h.service.status().fill;
+    expect(lineOf(status, "feat-login")).toMatchObject({ state: "claimed", runId: owners.id });
+    expect(lineOf(status, "feat-login").detail).toContain("of agent worker-b");
+    expect(lineOf(status, "feat-search")).toMatchObject({
+      state: "claimed",
+      runId: "external-run",
+      detail: "claimed by run external (agent worker-b)",
+    });
+    expect(runs(h).map((r) => [r.agent, r.task])).toEqual([["worker-b", "feat-login"]]);
+    expect(h.spawner.calls).toHaveLength(1);
+    expect(eventsOf(h, "fill_started")).toEqual([]);
+  });
+
+  it("a run that dies takes the recovery path, never a second fill start; an escalated task is left to the owner", async () => {
+    const h = setup(fill({ agents: ["worker-a"] }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "step 1 of 9\n");
+
+    await check(h);
+    await at(h, 0); // pid 5001
+    h.spawner.exit(5001, 2); // it crashes; no tick has seen it yet
+    await check(h);
+    expect(runs(h)).toHaveLength(1);
+    await at(h, 5 * MIN); // the tick sees the crash: a same-session restart after the backoff
+    await check(h);
+    const [first, restart] = runs(h);
+    expect(first.state).toBe("failed");
+    expect(restart).toMatchObject({ state: "queued", sessionMode: "resume", chainId: first.chainId, origin: "fill" });
+    expect(lineOf(h.service.status().fill, "feat-login")).toMatchObject({ state: "started", runId: restart.id });
+    await at(h, 5 * MIN + 10 * SEC); // the restart starts (pid 5002)
+    expect(h.spawner.calls.map((c) => c.env.LAIR_SESSION_MODE)).toEqual(["new", "resume"]);
+
+    // Every attempt from now on dies at once, until recovery escalates
+    h.spawner.behaviour = (pid) => h.spawner.exit(pid, 1);
+    h.spawner.exit(5002, 1);
+    for (let minute = 6; minute <= 20; minute += 2) {
+      await check(h);
+      await at(h, minute * MIN);
+    }
+    await check(h);
+    await check(h);
+
+    expect(eventsOf(h, "escalated")).toHaveLength(1);
+    expect(new Set(runs(h).map((r) => r.chainId)).size).toBe(1);
+    expect(h.spawner.calls.map((c) => c.env.LAIR_SESSION_MODE)).toEqual(["new", "resume", "resume", "fresh"]);
+    expect(eventsOf(h, "fill_started")).toHaveLength(1);
+    const line = lineOf(h.service.status().fill, "feat-login");
+    expect(line.state).toBe("held");
+    expect(line.detail).toContain("fill leaves the task to the owner");
+    expect(h.store.getClaim("demo", "feat-login")).toBeNull();
+    expect(eventsOf(h, "fill_held").map((e) => e.data.hold)).toEqual(["owner"]);
+  });
+
+  it("the fill loop runs on its own and stops with the module, killing a capacity_cmd in progress", async () => {
+    const h = setup(fill({ capacity_cmd: ["capacity-check"] }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form", "worker-b|Bob|feat-search|Search page");
+    let killed = false;
+    h.runner.answer = (argv, options) => {
+      if (argv[0] !== "capacity-check") return undefined;
+      if (h.runner.calls.length === 1) return { code: 0, stdout: "", stderr: "" };
+      // The next one hangs until it is killed, as a real command would
+      return new Promise<CommandOutput>((resolve) => {
+        options.signal?.addEventListener(
+          "abort",
+          () => {
+            killed = true;
+            resolve({ code: -1, stdout: "", stderr: "killed" });
+          },
+          { once: true },
+        );
+      });
+    };
+
+    expect(h.manager.start()).toEqual(["demo"]);
+    expect(h.service.fillRunning).toBe(true);
+    for (let i = 0; i < 300 && h.runner.calls.length < 2; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(h.runner.calls).toHaveLength(2);
+    expect(runs(h).map((r) => [r.task, r.origin])).toEqual([["feat-login", "fill"]]);
+
+    await h.manager.stop();
+    expect(killed).toBe(true);
+    expect(h.service.fillRunning).toBe(false);
+    // No check runs after the stop
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(h.runner.calls).toHaveLength(2);
+  }, 10_000);
+
+  it("a store from before fill (schema version 1) gains the task index; its runs are found by task", () => {
+    const paths = makePaths();
+    mkdirSync(dirname(paths.dbPath), { recursive: true });
+    const old = new Database(paths.dbPath);
+    old.exec(`CREATE TABLE agents_runs (
+      id TEXT PRIMARY KEY, project TEXT NOT NULL, task TEXT NOT NULL, agent TEXT NOT NULL,
+      chain_id TEXT NOT NULL, state TEXT NOT NULL, requested_at INTEGER NOT NULL, data TEXT NOT NULL)`);
+    const legacy = { id: "run-1", project: "demo", task: "feat-login", agent: "worker-a", chainId: "run-1", state: "completed" };
+    old.prepare("INSERT INTO agents_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run("run-1", "demo", "feat-login", "worker-a", "run-1", "completed", NOW, JSON.stringify(legacy));
+    old.pragma("user_version = 1");
+    old.close();
+
+    const store = new AgentsStore(paths.dbPath);
+    try {
+      expect(store.latestRunForTask("demo", "feat-login")).toMatchObject({ id: "run-1", state: "completed" });
+      expect(store.latestRunForTask("demo", "other")).toBeNull();
+    } finally {
+      store.close();
+    }
+    const reopened = new Database(paths.dbPath);
+    try {
+      expect(reopened.pragma("user_version", { simple: true })).toBe(SCHEMA_VERSION);
+      expect(SCHEMA_VERSION).toBe(2);
+      expect(reopened.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_agents_runs_task'").get()).toEqual({
+        name: "idx_agents_runs_task",
+      });
+    } finally {
+      reopened.close();
+    }
   });
 });

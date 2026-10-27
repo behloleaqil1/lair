@@ -46,6 +46,9 @@ export type SessionMode = "new" | "resume" | "fresh";
 
 export type StopReason = "hung" | "failover" | "lost_claim" | "fresh_session";
 
+/** What started a run's chain, when not the owner or another module: "fill" (agents.fill) */
+export type RunOrigin = "fill";
+
 /** One way to run an agent: an adapter (CLI), a model, and the provider it bills. */
 export interface AgentProfile {
   adapter: string;
@@ -93,6 +96,8 @@ export interface AgentRunView {
   exitCode?: number | null;
   logPath?: string;
   lastError?: string;
+  /** Set when agents.fill started the run's chain */
+  origin?: RunOrigin;
 }
 
 /** A task's claim: exactly one run owns it, through a pid and that process's start time. */
@@ -125,7 +130,9 @@ export type AgentEventKind =
   | "budget_warning"
   | "budget_exceeded"
   | "budget_override"
-  | "decision";
+  | "decision"
+  | "fill_started"
+  | "fill_held";
 
 /** Recovery and audit record: what happened, why, and the evidence. */
 export interface AgentEventView {
@@ -216,6 +223,46 @@ export interface AgentsStatusView {
   claims: ClaimView[];
   locks: LockView[];
   projectBudget: BudgetScopeView | null;
+  /** agents.fill, whenever the module runs for the project */
+  fill?: FillStatusView;
+}
+
+/**
+ * A tasks_file line at fill's last check:
+ * - started: a run of the line's agent on its task is active (fill started it, now or before)
+ * - done: done_pattern matched a queue line written since the task's last start
+ * - held: it would start but doesn't, for the reason in `detail`
+ * - claimed: another agent's run, or another claim, holds the task
+ * - not_allowlisted: its agent is not in agents.fill.agents, so fill never starts it
+ * - malformed: the line doesn't parse; `detail` says why
+ */
+export type FillLineState = "started" | "done" | "held" | "claimed" | "not_allowlisted" | "malformed";
+
+export interface FillLineView {
+  /** 1-based line number in tasks_file */
+  line: number;
+  agent: string | null;
+  name: string | null;
+  task: string | null;
+  description: string | null;
+  state: FillLineState;
+  detail: string;
+  runId: string | null;
+}
+
+export interface FillStatusView {
+  enabled: boolean;
+  /** The fill loop is running */
+  running: boolean;
+  tasksFile: string | null;
+  agents: string[];
+  maxActive: number;
+  /** Active runs whose chain fill started */
+  active: number;
+  intervalSeconds: number;
+  lastCheck: string | null;
+  lastError: string | null;
+  lines: FillLineView[];
 }
 
 /**

@@ -71,6 +71,28 @@ const LockSchema = z
 /** An environment variable name */
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 
+/** A queue line that reports a task done: "- DONE <task> by <agent> ..." */
+export const DEFAULT_DONE_PATTERN = "^- DONE {task}(?=[\\s:]|$)";
+
+const FillSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    /** Lines <agent>|<name>|<task>|<description>; relative to repo */
+    tasks_file: z.string().min(1).optional(),
+    /** The agents fill may start; required when enabled */
+    agents: z.array(z.string()).default([]),
+    /** Files whose contents, in order, make a run's prompt; {prompts_dir}, {agent} and {task} are replaced */
+    prompt_files: z.array(z.string().min(1)).default([]),
+    /** Runs fill started that may be active at once */
+    max_active: z.number().int().min(1).max(100).default(1),
+    /** Matched against the queue lines written since the task's last start; {task} and {agent} are replaced */
+    done_pattern: z.string().min(1).max(500).default(DEFAULT_DONE_PATTERN),
+    /** Exit 0: capacity available; anything else (a timeout too) holds, its first output line the reason */
+    capacity_cmd: argv.optional(),
+    interval_seconds: z.number().int().min(1).max(3600).default(60),
+  })
+  .strict();
+
 const ProfileSchema = z
   .object({
     adapter: z.string().regex(SAFE_NAME, "adapter ids use letters, digits, '.', '_' and '-'"),
@@ -147,10 +169,32 @@ const AgentsSchema = z
       })
       .strict()
       .default({}),
+    fill: FillSchema.default({}),
   })
   .strict();
 
 type RawSettings = z.infer<typeof AgentsSchema>;
+
+/** The parsed `agents.fill:` block. */
+export interface FillSettings {
+  enabled: boolean;
+  tasksFile?: string;
+  agents: string[];
+  promptFiles: string[];
+  maxActive: number;
+  donePattern: string;
+  capacityCmd?: string[];
+  intervalSeconds: number;
+}
+
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** done_pattern for one task: {task} and {agent} replaced by the ids, as literal text. */
+export function donePatternFor(template: string, task: string, agent: string): RegExp {
+  return new RegExp(
+    template.replace(/\{(task|agent)\}/g, (_match, name: string) => escapeRegExp(name === "task" ? task : agent)),
+  );
+}
 
 export interface BudgetLimit {
   soft?: number;
@@ -212,6 +256,7 @@ export interface AgentsSettings {
     agent?: BudgetLimits;
     perAgent: Record<string, BudgetLimits>;
   };
+  fill: FillSettings;
 }
 
 export type AgentsParseResult =
@@ -319,6 +364,7 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
   for (const [agent, limits] of Object.entries(value.budgets.per_agent)) {
     checkLimits(limits, `agents.budgets.per_agent.${agent}`, errors);
   }
+  checkFill(value, errors);
 
   if (errors.length > 0) {
     return { ok: false, errors };
@@ -372,8 +418,51 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         agent: value.budgets.agent,
         perAgent: value.budgets.per_agent,
       },
+      fill: {
+        enabled: value.fill.enabled,
+        tasksFile: value.fill.tasks_file,
+        agents: value.fill.agents,
+        promptFiles: value.fill.prompt_files,
+        maxActive: value.fill.max_active,
+        donePattern: value.fill.done_pattern,
+        capacityCmd: value.fill.capacity_cmd,
+        intervalSeconds: value.fill.interval_seconds,
+      },
     },
   };
+}
+
+function checkFill(value: RawSettings, errors: string[]): void {
+  const fill = value.fill;
+  if (fill.enabled) {
+    if (!value.enabled) errors.push("agents.fill.enabled: fill needs agents.enabled: true");
+    if (!fill.tasks_file) errors.push("agents.fill.tasks_file: required when fill is enabled");
+    if (fill.agents.length === 0) {
+      errors.push("agents.fill.agents: list the agents fill may start (required when fill is enabled)");
+    }
+    if (fill.prompt_files.length === 0) {
+      errors.push("agents.fill.prompt_files: at least one prompt file is required when fill is enabled");
+    }
+  }
+  fill.agents.forEach((agent, i) => {
+    if (!isValidDragonId(agent)) errors.push(`agents.fill.agents[${i}]: ${agent} is not a valid agent id`);
+  });
+  fill.prompt_files.forEach((template, i) => {
+    checkPlaceholders(template, ["prompts_dir", "agent", "task"], `agents.fill.prompt_files[${i}]`, errors);
+    if (template.split(/[\\/]/).includes("..")) {
+      errors.push(`agents.fill.prompt_files[${i}]: a ".." segment is refused (prompt files stay inside prompts_dir)`);
+    }
+  });
+  checkPlaceholders(fill.done_pattern, ["task", "agent"], "agents.fill.done_pattern", errors);
+  if (!fill.done_pattern.includes("{task}")) {
+    errors.push("agents.fill.done_pattern: needs {task} (without it one done line would match every task)");
+  } else {
+    try {
+      donePatternFor(fill.done_pattern, "example-task", "example-agent");
+    } catch (e) {
+      errors.push(`agents.fill.done_pattern: not a valid regular expression (${e instanceof Error ? e.message : String(e)})`);
+    }
+  }
 }
 
 /** Backoff for attempt n (1-based): base * 2^(n-1), capped. In milliseconds. */

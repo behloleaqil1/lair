@@ -18,6 +18,9 @@
  * times, then in a fresh session (the old one moved aside) with a resume
  * summary, then escalate to the Decision Inbox. Finally claims and locks whose
  * owner is dead are released and broken. Every step is recorded as an event.
+ *
+ * With agents.fill on, a second loop (fill.ts) requests runs itself from a
+ * task list, through requestRun like any other in-process caller.
  */
 import { randomUUID } from "crypto";
 import { closeSync, fstatSync, mkdirSync, openSync, readSync, statSync, writeFileSync } from "fs";
@@ -36,7 +39,9 @@ import type {
   AgentView,
   BudgetLine,
   BudgetScopeView,
+  FillStatusView,
   LockView,
+  RunOrigin,
   StopReason,
 } from "../../shared/agents-types.js";
 import type { DecisionProducer, DecisionResolution } from "../decisions/types.js";
@@ -66,6 +71,7 @@ import {
   type DecisionRequest,
 } from "./decisions.js";
 import { chooseProfile, matchFailover, profileLabel, profilesFor } from "./failover.js";
+import { AgentsFill, queueMark } from "./fill.js";
 import {
   createLock,
   judgeLock,
@@ -90,12 +96,15 @@ import {
   claimView,
   eventView,
   isActive,
+  isValidTaskId,
   runView,
   type AgentRun,
   type Claim,
   type FailoverInfo,
   type StoredLockWait,
 } from "./types.js";
+
+export { TASK_ID, isValidTaskId } from "./types.js";
 
 /** An error with the HTTP status the routes answer with. */
 export class AgentsError extends Error {
@@ -108,18 +117,6 @@ export class AgentsError extends Error {
   }
 }
 
-/** Task ids: they reach argv placeholders and file names, so no shell characters and no leading dash. */
-export const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._/#:-]{0,127}$/;
-
-/** A task id: TASK_ID, no leading "/", and no "." or ".." path segment. */
-export function isValidTaskId(task: unknown): task is string {
-  return (
-    typeof task === "string" &&
-    TASK_ID.test(task) &&
-    !task.startsWith("/") &&
-    !task.split("/").some((segment) => segment === ".." || segment === ".")
-  );
-}
 const MAX_PROMPT_CHARS = 200_000;
 
 /** The options of this module's decisions (see followAnswer) */
@@ -165,6 +162,8 @@ const BUS_EVENTS: Partial<Record<AgentEventKind, EventType>> = {
   failover: "agent.failover",
   budget_warning: "agent.budget.warning",
   budget_exceeded: "agent.budget.exceeded",
+  fill_started: "agents.fill_started",
+  fill_held: "agents.fill_held",
 };
 
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -287,6 +286,8 @@ export class AgentsService {
   private snapshot: ProcessSnapshot | null = null;
   /** Locks no run waits on that the last reaper check judged stale (name -> what was read) */
   private staleSeen = new Map<string, string>();
+  /** agents.fill: starts runs from tasks_file through requestRun (null when off) */
+  private fill: AgentsFill | null = null;
   lastTick?: AgentsTickSummary;
   lastError?: string;
 
@@ -317,6 +318,20 @@ export class AgentsService {
           reason: event.reason,
         });
       }) ?? null;
+    if (options.settings.fill.enabled) {
+      this.fill = new AgentsFill({
+        project: this.project,
+        config: this.config,
+        settings: options.settings.fill,
+        commandTimeoutSeconds: options.settings.commandTimeoutSeconds,
+        store: this.store,
+        probes: this.probes,
+        readOnly: () => this.readOnly,
+        // The in-process path every module uses: claims, locks, retries and budgets apply
+        requestRun: (input) => this.requestRun(input, { origin: "fill" }),
+        record: (kind, input, at) => this.record(kind, input, at),
+      });
+    }
   }
 
   get readOnly(): boolean {
@@ -1084,6 +1099,8 @@ export class AgentsService {
       startRetries: prev.startRetries,
       launchFailures: 0,
       failovers: prev.failovers ?? 0,
+      origin: prev.origin,
+      queueMark: prev.queueMark,
       // A summary that never reached a running agent is still owed
       resumeSummary: prev.spawnedAt === undefined ? prev.resumeSummary : undefined,
       state: "queued",
@@ -1757,8 +1774,11 @@ export class AgentsService {
 
   // ============ ACTIONS ============
 
-  /** Request a run: the task is claimed now, and the run starts on the next tick. */
-  requestRun(input: RunRequest): Promise<AgentRunView> {
+  /**
+   * Request a run: the task is claimed now, and the run starts on the next
+   * tick. `origin` marks a chain agents.fill started (for its max_active).
+   */
+  requestRun(input: RunRequest, options: { origin?: RunOrigin } = {}): Promise<AgentRunView> {
     return this.exclusive(async () => {
       if (this.readOnly) throw new AgentsError(403, "The project is read_only: Lair starts no agents");
       const { agent, task, prompt, model } = input;
@@ -1821,6 +1841,9 @@ export class AgentsService {
         requestedAt: now,
         notBefore: now,
         logOffset: 0,
+        origin: options.origin,
+        // Fill's done_pattern looks at the queue lines written after this
+        queueMark: queueMark(this.config.queue_file),
       };
       const claimed = await this.claimFor(t, task, id, agent);
       if (!claimed.ok) {
@@ -1838,8 +1861,8 @@ export class AgentsService {
           agent,
           task,
           runId: id,
-          summary: `requested ${agent} on ${task} (${profileLabel(profiles[0])})`,
-          data: { profile: profiles[0] },
+          summary: `requested ${agent} on ${task} (${profileLabel(profiles[0])})${options.origin ? ` by ${options.origin}` : ""}`,
+          data: { profile: profiles[0], origin: options.origin ?? null },
         },
         now,
       );
@@ -1996,6 +2019,7 @@ export class AgentsService {
       claims: claims.map((c) => claimView(c, alive(c.ownerPid, c.ownerStartedAt))),
       locks: this.lockViews(snap),
       projectBudget,
+      fill: this.fillStatus(),
     };
   }
 
@@ -2014,6 +2038,35 @@ export class AgentsService {
       runs.set(run.agent, { runId: run.id, task: run.task, state, detail });
     }
     return runs;
+  }
+
+  /** agents.fill: enabled, the last check, and each tasks_file line's state then. */
+  fillStatus(): FillStatusView {
+    if (this.fill) return this.fill.view();
+    const fill = this.settings.fill;
+    return {
+      enabled: false,
+      running: false,
+      tasksFile: fill.tasksFile ?? null,
+      agents: fill.agents,
+      maxActive: fill.maxActive,
+      active: 0,
+      intervalSeconds: fill.intervalSeconds,
+      lastCheck: null,
+      lastError: null,
+      lines: [],
+    };
+  }
+
+  /** Run one fill check now (the fill loop runs them every fill.interval_seconds). */
+  async checkFill(): Promise<FillStatusView> {
+    if (!this.fill) throw new AgentsError(404, `agents.fill is off for ${this.project}`);
+    await this.fill.check();
+    return this.fill.view();
+  }
+
+  get fillRunning(): boolean {
+    return this.fill?.running ?? false;
   }
 
   private agentView(
@@ -2071,10 +2124,11 @@ export class AgentsService {
 
   // ============ LIFECYCLE ============
 
-  /** Tick soon, then every interval_seconds, until stop(). */
+  /** Tick soon, then every interval_seconds, until stop(); and the fill loop, when it is on. */
   start(): void {
     if (!this.stopped) return;
     this.stopped = false;
+    this.fill?.start();
     const loop = async () => {
       if (this.stopped) return;
       try {
@@ -2091,9 +2145,13 @@ export class AgentsService {
     this.timer.unref();
   }
 
-  /** Stop ticking; resolves once the tick or action in progress has finished. */
+  /**
+   * Stop ticking and filling; resolves once the fill check, tick or action in
+   * progress has finished (fill first, so it requests nothing more).
+   */
   async stop(): Promise<void> {
     this.stopped = true;
+    await this.fill?.stop();
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
