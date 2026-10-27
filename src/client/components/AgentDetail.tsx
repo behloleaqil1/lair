@@ -250,6 +250,7 @@ export function AgentDetailView({
               <li key={hold.line}>
                 <span className={`badge ${hold.badge}`}>{hold.state}</span> <code>{hold.task ?? `line ${hold.line}`}</code>{" "}
                 <span style={muted}>{hold.detail}</span>{" "}
+                {hold.waiting && <span className="waiting">{hold.waiting} </span>}
                 {hold.releasable && owner && (
                   <button type="button" className="small-button" onClick={() => releaseHold(hold)}>
                     Release
@@ -275,6 +276,7 @@ export function AgentDetailView({
                   <td>
                     <span className={`badge ${item.badge}`}>{item.state}</span>
                     <div style={muted}>{item.detail}</div>
+                    {item.waiting && <div className="waiting">{item.waiting}</div>}
                   </td>
                 </tr>
               ))}

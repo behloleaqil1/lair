@@ -59,7 +59,7 @@ export const LEGACY_VIEWS: Readonly<Record<string, { section: SectionId; tab: st
   overview: { section: "home", tab: null },
   health: { section: "home", tab: "health" },
   activity: { section: "home", tab: "activity" },
-  // The external orchestration loop's view is retired: its tick lines are in the activity feed
+  // The external orchestration loop's view is retired (GET /api/orchestrator stays): its old link opens the activity
   orchestrator: { section: "home", tab: "activity" },
   dragons: { section: "work", tab: null },
   agents: { section: "work", tab: null },

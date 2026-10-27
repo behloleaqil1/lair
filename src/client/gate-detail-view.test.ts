@@ -77,7 +77,7 @@ describe("gate detail", () => {
           expectedStart: "2026-10-24T17:15:00.000Z",
           expectedFinish: "2026-10-24T17:45:00.000Z",
           held: null,
-          advice: { to: "remote", gainSeconds: 1200, explanation: "faster", quiet: false },
+          advice: { to: "remote", gainSeconds: 1200, explanation: "faster", quiet: false, stuck: false },
         },
       },
     });

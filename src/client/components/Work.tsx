@@ -9,7 +9,7 @@
 import { useMemo, useState } from "react";
 import { useApi } from "../hooks/useApi";
 import { useDragonsWebSocket } from "../hooks/useWebSocket";
-import { workRows, type WorkRow } from "../work-view";
+import { fillWaitingText, workRows, type WorkRow } from "../work-view";
 import { hasStartableDragons } from "../dragon-start";
 import { startDragon } from "../owner-actions";
 import { failureMessage, postJson, releaseFillHoldAction, runConfirmed } from "../agents-actions";
@@ -255,10 +255,13 @@ function FillTab({
       label: "State",
       sort: (l) => l.state,
       render: (l) => (
-        <span className={`badge ${FILL_BADGE[l.state] ?? "badge-neutral"}`}>
-          {l.state.replace(/_/g, " ")}
-          {l.hold ? `: ${l.hold.replace(/_/g, " ")}` : ""}
-        </span>
+        <>
+          <span className={`badge ${FILL_BADGE[l.state] ?? "badge-neutral"}`}>
+            {l.state.replace(/_/g, " ")}
+            {l.hold ? `: ${l.hold.replace(/_/g, " ")}` : ""}
+          </span>
+          {l.waiting && <div className="waiting">{fillWaitingText(l.waiting)}</div>}
+        </>
       ),
     },
     {

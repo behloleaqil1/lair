@@ -114,7 +114,7 @@ const placement: PlacementStatus = {
       expectedStart: "2026-10-24T17:10:00.000Z",
       expectedFinish: "2026-10-24T17:40:00.000Z",
       held: null,
-      advice: { to: "remote", gainSeconds: 1200, explanation: "would move to remote: 20 min sooner", quiet: false },
+      advice: { to: "remote", gainSeconds: 1200, explanation: "would move to remote: 20 min sooner", quiet: false, stuck: false },
     },
   ],
   moves: [],

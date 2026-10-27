@@ -14,6 +14,7 @@ import type {
   BudgetScopeView,
   ClaimView,
   FillLineView,
+  FillWaitingView,
 } from "../shared/agents-types";
 import { modelLabel, runningLabel } from "./dragon-view";
 import { relativeTime } from "./time";
@@ -140,6 +141,18 @@ export interface FillItem {
   /** Held for the owner: the owner can release it */
   releasable: boolean;
   hold: string | null;
+  /** What its last run waits on, and since when ("Waiting on gate-123 since 5 min ago"), else null */
+  waiting: string | null;
+}
+
+/** A WAITING line's wait in one line: what it names, since when, and when fill starts it again without it. */
+export function fillWaitingText(waiting: FillWaitingView | null, now: number = Date.now()): string | null {
+  if (!waiting) return null;
+  const on = waiting.wake ? `Waiting on ${waiting.wake}` : "Waiting on nothing it named";
+  const parts = [`${on} since ${relativeTime(waiting.since, now)}`];
+  if (waiting.refused) parts.push(`not used: ${waiting.refused}`);
+  if (waiting.fallbackAt) parts.push(`fill starts it again ${relativeTime(waiting.fallbackAt, now)} without it`);
+  return parts.join("; ");
 }
 
 const FILL_BADGE: Record<string, string> = {
@@ -151,7 +164,7 @@ const FILL_BADGE: Record<string, string> = {
   malformed: "badge-error",
 };
 
-export function fillItem(line: FillLineView): FillItem {
+export function fillItem(line: FillLineView, now: number = Date.now()): FillItem {
   return {
     line: line.line,
     task: line.task,
@@ -161,6 +174,7 @@ export function fillItem(line: FillLineView): FillItem {
     detail: line.detail,
     releasable: line.releasable,
     hold: line.hold,
+    waiting: fillWaitingText(line.waiting ?? null, now),
   };
 }
 
@@ -276,9 +290,10 @@ export function agentDetail(
   const agent: AgentView | null = status?.enabled ? (status.agents.find((a) => a.id === id) ?? null) : null;
   if (!dragon && !agent) return null;
   const row = workRows(dragon ? [dragon] : [], agent && status ? { ...status, agents: [agent] } : null)[0];
-  const fill = fillLinesOf(status, id).map(fillItem);
+  const fill = fillLinesOf(status, id).map((line) => fillItem(line, now));
   const task = row.task;
-  const description = fill.find((f) => f.task !== null && f.task === task)?.description ?? null;
+  const current = fill.find((f) => f.task !== null && f.task === task) ?? null;
+  const description = current?.description ?? null;
   const profiles = agent?.profiles.map((p) => `${p.adapter}${p.model ? `/${p.model}` : ""}`).join(" → ") || null;
   return {
     id,
@@ -295,7 +310,8 @@ export function agentDetail(
     machine: row.machine,
     profiles,
     run: agent?.run ? runSummary(agent.run) : null,
-    waiting: waitingText(agent?.run, now),
+    // The run's own wait (a lock, a start time), else what fill says its task waits on
+    waiting: waitingText(agent?.run, now) ?? current?.waiting ?? fill.find((f) => f.waiting !== null)?.waiting ?? null,
     claims: agent?.claims ?? [],
     holds: fill.filter((f) => f.hold !== null),
     fill,

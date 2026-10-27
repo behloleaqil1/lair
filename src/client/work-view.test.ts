@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 import type { Dragon } from "../shared/types";
 import type { AgentRunView, AgentsStatusView, AgentView, FillLineView } from "../shared/agents-types";
-import { agentDetail, waitingText, workCounts, workRows } from "./work-view";
+import { agentDetail, fillWaitingText, waitingText, workCounts, workRows } from "./work-view";
 
 const NOW = Date.parse("2026-10-27T12:00:00.000Z");
 
@@ -65,6 +65,7 @@ const line = (over: Partial<FillLineView>): FillLineView => ({
   detail: "run active",
   hold: null,
   releasable: false,
+  waiting: null,
   runId: null,
   ...over,
 });
@@ -183,6 +184,29 @@ describe("agent detail", () => {
     );
     expect(waitingText(run(), NOW)).toBeNull();
     expect(waitingText(undefined, NOW)).toBeNull();
+  });
+
+  it("says what fill's task waits on (a WAITING line's wake), since when, and when fill tries again", () => {
+    expect(
+      fillWaitingText({ wake: "gate-123", since: "2026-10-27T11:55:00.000Z", fallbackAt: null, refused: null }, NOW),
+    ).toBe("Waiting on gate-123 since 5 min ago");
+    expect(
+      fillWaitingText(
+        { wake: "../x", since: "2026-10-27T11:00:00.000Z", fallbackAt: "2026-10-27T12:30:00.000Z", refused: "not a safe file name" },
+        NOW,
+      ),
+    ).toBe("Waiting on ../x since 1 h ago; not used: not a safe file name; fill starts it again in 30 min without it");
+    // An agent with no run of its own waits on what fill says
+    const waitingLine = line({
+      state: "held",
+      hold: "waiting",
+      releasable: true,
+      detail: "its run ended on WAITING",
+      waiting: { wake: "gate-9", since: "2026-10-27T11:50:00.000Z", fallbackAt: null, refused: null },
+    });
+    const detail = agentDetail("kiro-A", [dragon()], status([agent({ run: undefined, claims: [] })], [waitingLine]), [], [], NOW)!;
+    expect(detail.waiting).toBe("Waiting on gate-9 since 10 min ago");
+    expect(detail.holds[0]).toMatchObject({ state: "held: waiting", releasable: true, waiting: "Waiting on gate-9 since 10 min ago" });
   });
 
   it("is null for an agent nobody knows", () => {
