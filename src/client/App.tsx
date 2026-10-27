@@ -17,6 +17,7 @@ import { Delivery } from "./components/Delivery";
 import { Reviews } from "./components/Reviews";
 import { Agents } from "./components/Agents";
 import { Triage } from "./components/Triage";
+import { Settings } from "./components/Settings";
 import { CommandBar } from "./components/CommandBar";
 import { pickInitialProject } from "./initial-project";
 import type { CommandMode, ControlsStatus } from "../shared/types";
@@ -119,6 +120,8 @@ export function App() {
         return <Triage {...props} />;
       case "inbox":
         return <Inbox {...props} />;
+      case "settings":
+        return <Settings key={currentProject} {...props} />;
     }
   };
 

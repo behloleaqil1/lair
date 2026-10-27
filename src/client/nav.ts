@@ -17,7 +17,8 @@ export type View =
   | "reviews"
   | "agents"
   | "triage"
-  | "inbox";
+  | "inbox"
+  | "settings";
 
 /**
  * The owner's message file (inbox_file: instructions to the orchestrator and
@@ -48,4 +49,6 @@ export const VIEWS: { id: View; label: string }[] = [
   { id: "agents", label: "Agents" },
   { id: "triage", label: "Triage" },
   { id: "inbox", label: OWNER_MESSAGES_LABEL },
+  // Every project setting (the owner only); writes the project YAML
+  { id: "settings", label: "Settings" },
 ];

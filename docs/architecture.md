@@ -70,7 +70,7 @@ The Fastify-based backend that serves the API and manages state.
 - **`controls.ts`**: command bar and control buttons (ask, instruct, tick, pause/resume, agent run/stop/release, gate submit and mark stuck, merge, dragon start/stop, audit log)
 - **`bus.ts`**: HTTP view of the fleet bus storage and an SSE event stream (`/api/bus/*`)
 - **`processes.ts`**: process manager endpoints
-- **`settings.ts`**: project settings endpoints
+- **`settings.ts`**: the machine test of the settings (owner only); the Settings API is `settings/`
 - **`scheduler.ts`**: scheduler, task and node endpoints
 - **`fleet.ts`**: fleet management (machines, self-healing, budgets)
 - **`project-guard.ts`**: shared `?project=` validation hook (HTTP 400 for an invalid or unknown project)
@@ -210,6 +210,17 @@ Which machine runs each queued job of a project's own gate queue ([configuration
 - **`store.ts`**: moves, the runs Lair saw start, and learned durations in SQLite (`data/placement.db`)
 - **`service.ts`**, **`routes.ts`**: the per-project tick (probes, learning, estimates, act or observe, recovery of a move cut short) started and stopped by `index.ts`, and the read-only `GET /api/placement/status`
 
+#### Settings (`settings/`)
+
+Every project setting from the dashboard, written to the project's YAML ([design](design/settings-ui.md)):
+
+- **`registry.ts`**: one entry per module (its block and the zod schema its parser uses) and the core settings' sections (`core-schemas.ts`, descriptive schemas for the keys no module parses); `json-schema.ts` converts them to JSON Schema for the forms
+- **`service.ts`**: read, check (`parseProjectConfig` and the modules' parsers through `ConfigReloader.validate`, secrets, commands to confirm), save with the hash check, history, restore, create and the repository check (`git` as argv)
+- **`yaml-doc.ts`**: form changes applied with the yaml Document API, so comments, key order and unknown keys stay
+- **`files.ts`**, **`history.ts`**: no symlinks, atomic writes, `data/config-history/<project>/`
+- **`checks.ts`**: parser messages as errors per field, the command changes and their digest; the rules for commands and secrets are in `src/shared/settings-rules.ts`
+- **`routes.ts`**: `/api/settings/*`, all behind `requireOwner()`
+
 #### Store (`store/`)
 
 - **`store.ts`**: SQLite store (better-sqlite3) for nodes, tasks, jobs, events and agent runs, at `data/lair.db`
@@ -274,7 +285,7 @@ Each view is a standalone component:
 - **`Triage.tsx`**: gate failures with each cause's verdict, evidence, actions and retry count; the default branch's incident and bisect, with revert and protect buttons
 - **`Inbox.tsx`**: the "Owner messages" view (`inbox_file`: the owner's instructions and the orchestrator's replies; decisions are in Decisions). The nav labels are in `nav.ts`
 - **`CommandBar.tsx`**: ask / instruct / task command bar
-- **`Settings.tsx`**: project configuration UI
+- **`Settings.tsx`**: the Settings view (owner only): a project's Form, YAML and History tabs and New project. `SettingsForm.tsx` draws each section from its JSON Schema (fields and widgets from `settings-form.ts`), `SettingsReview.tsx` shows a save's diff, errors and commands to confirm, `SettingsHistory.tsx` the versions and Restore, `ProjectWizard.tsx` the new project; requests in `settings-api.ts`
 
 #### Hooks (`hooks/`)
 

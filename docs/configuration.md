@@ -2,6 +2,8 @@
 
 Lair uses YAML files in the `projects/` directory to configure each monitored project. Private configurations can be placed in `projects/local/` (gitignored).
 
+Everything here can be set from **Settings** in the dashboard; the YAML is what Settings writes. See [Settings](#settings) for how it checks, confirms and records a change.
+
 ## Required fields
 
 Every project must define these core settings:
@@ -561,7 +563,7 @@ Errors: 400 for invalid input, 403 for a cross-site request or an answer without
 
 ## Owner-only routes
 
-Every route that changes something only you should change needs the owner's session, the same one the Decision Inbox uses (see "Only you answer"): the `X-Lair-Owner-Session` header, from the dashboard's own origin, in a same-origin browser request. Without it the answer is HTTP 403, before the request's body is read, and nothing changes. `curl`, scripts, agents and other local programs can still read: every `GET` stays open, except the two that read prompt files from disk (`/api/agents/prompts`). No CORS is granted under these prefixes (`OWNER_ONLY_PREFIXES` in `src/server/human-auth/cors.ts`). The dashboard's views send the session once this browser is signed in, and show "sign in from Decisions" until it is.
+Every route that changes something only you should change needs the owner's session, the same one the Decision Inbox uses (see "Only you answer"): the `X-Lair-Owner-Session` header, from the dashboard's own origin, in a same-origin browser request. Without it the answer is HTTP 403, before the request's body is read, and nothing changes. `curl`, scripts, agents and other local programs can still read: every `GET` stays open, except the two that read prompt files from disk (`/api/agents/prompts`) and the Settings API (`/api/settings`), whose reads reveal paths and commands. No CORS is granted under these prefixes (`OWNER_ONLY_PREFIXES` in `src/server/human-auth/cors.ts`). The dashboard's views send the session once this browser is signed in, and show "sign in from Decisions" until it is.
 
 | Prefix | Owner only | Open |
 |--------|------------|------|
@@ -572,7 +574,7 @@ Every route that changes something only you should change needs the owner's sess
 | `/api/controls` | every `POST`: ask, instruct, tick, pause, resume, agent run/stop/release, gate submit/stuck, merge, dragon start/stop | status, inbox, audit, dragon config |
 | `/api/bus/send` | sending a message (it is sent as `owner`) | the board and the event stream (`/api/bus/board`, `/api/bus/events`) |
 | `/api/processes` | start, stop, restart | the list, a process, its logs |
-| `/api/settings` | saving the config, testing a machine | reading the settings |
+| `/api/settings` | everything: reading, checking and saving project settings, their history and restore, creating a project, the repository check, testing a machine | nothing |
 | `/api/scheduler`, `/api/tasks` | scheduler start, stop and tick; creating, cancelling and retrying tasks | status, tasks, jobs, nodes |
 | `/api/fleet` | adding, removing, testing and installing machines; healing and budget settings; provider budgets and unpausing | the overview, machines, healing events, budgets |
 | `/api/delivery` | Up, Down, Restart, Deploy, Release | status and operations |
@@ -1568,6 +1570,30 @@ dragons:
 dragon_start_cmd: ["./work/bin/dragon-start.sh", "{dragon}", "{task}"]
 dragon_stop_cmd: ["./work/bin/dragon-stop.sh", "{dragon}"]
 ```
+
+## Settings
+
+The **Settings** view edits every key on this page, for the owner only (reads included: a config reveals paths and commands). It writes the project's YAML file itself, so a hand edit and a Settings edit are the same thing to Lair. Design: [docs/design/settings-ui.md](design/settings-ui.md).
+
+- **Forms** are drawn from each module's own schema: a section per module with its `enabled` switch, defaults shown as placeholders (clear a field to go back to its default), advanced fields folded, and errors under the field they belong to. Keys no section knows are kept as they are and shown read-only. The **YAML** tab edits the whole file with the same checks.
+- **Nothing invalid is written.** A change is checked first by the same parsers startup and [live reload](#live-config-reload) use; a refused change leaves the file untouched. A saved change is applied by live reload at once.
+- **Comments and key order stay.** A form save changes only the fields you changed, in place.
+- **No silent overwrite.** A save names the version of the file it started from. If the file changed since (a hand edit, another browser), it is refused (HTTP 409) with what saving would now change, and the form offers to make your changes again on top of the current file.
+- **Commands are confirmed.** A change that adds or changes something Lair runs (any `*_cmd` key, adapters' `start_cmd` and `stop_cmd`, watchdog `actions`, triage `commands`, a step's `run`, a process's `command`, `gate_script`...) shows the exact argv lists and needs your confirmation; the server refuses it without (HTTP 428).
+- **No secrets.** A value whose key names a secret (`token`, `password`, `api_key`, `private_key`...) or that looks like one (a private key, a known token format, a URL with a password) is refused. Keep secrets in a file under `data/` (mode 0600) or an environment variable and name it in the config (`token_env`, `*_file`); the view shows whether the ones Lair knows are set, never their values.
+- **History.** Every accepted version is kept in `data/config-history/<project>/` (the newest 50) with when and which owner session (its public id) made it; a version Settings finds on disk that it didn't write, such as a hand edit, is kept too before it is replaced. Each shows its diff, and **Restore** saves it again through the same checks.
+- **Files.** Writes are atomic (a temporary file, `fsync`, `rename`). A project file that is a symlink, a `projects/local/` that is one, or anything but a regular file is refused. A save is at most 1 MiB, like the file.
+- **New project** asks for an id, a name and a repository (a git work tree; its GitHub `owner/name` is read from `git remote -v`), proposes `<repo>/work/queue.md`, `<repo>/work/agents` and `<repo>/work/gates`, and switches on the modules you pick with their defaults. It writes `projects/local/<id>.yaml`.
+
+| Route (owner only) | What |
+|---|---|
+| `GET /api/settings/modules` | the sections: their JSON Schema and hints |
+| `GET /api/settings/projects`, `GET /api/settings/projects/:id` | the projects; one project's text, hash, values, problems, unknown keys and secret status |
+| `PUT /api/settings/projects/:id` | save `{baseHash, changes \| yaml, confirmCommands?}`: 200, or 409, 413, 422, 428 with the check |
+| `POST /api/settings/validate` | the same checks as a dry run (`{project, ...}`, `{project, restore, baseHash}` or `{create: {...}}`) |
+| `POST /api/settings/projects` | create a project |
+| `POST /api/settings/repo` | check a repository path |
+| `GET /api/settings/projects/:id/history`, `.../history/:version`, `POST .../history/:version/restore` | the versions, one with its diffs, restoring one |
 
 ## Configuration lookup
 

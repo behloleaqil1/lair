@@ -72,12 +72,6 @@ export function processAction(
   return ownerPost(`/api/processes/${encodeURIComponent(processId)}/${action}${query(project)}`);
 }
 
-// ============ SETTINGS ============
-
-export function saveSettings(project: string, updates: Record<string, unknown>): Promise<ApiEnvelope> {
-  return ownerPost(`/api/settings${query(project)}`, updates);
-}
-
 // ============ PIPELINES ============
 
 export function startPipelineRun<T>(project: string, body: { pipeline: string; sha?: string; branch?: string }): Promise<ApiEnvelope<T>> {

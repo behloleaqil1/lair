@@ -22,6 +22,7 @@ Lair is **agent-agnostic**: agents are started by commands you configure, so any
 - **Agents**: agent runs Lair starts and supervises, off by default. One claim per task and pid-owned locks (a dead holder's lock is broken and logged), never-started runs retried, hung or dead-on-start agents restarted in the same session and then a fresh one, failover to another agent CLI or provider on rate limits, and per-agent and per-project token and cost budgets ([configuration](docs/configuration.md#agents))
 - **Triage**: why a gate failed. Each failure is parsed from test reports and logs into causes and classified as infrastructure, pre-existing, flaky or a real failure of the change, with its evidence. Infrastructure gets one re-check of only the failed tests, a red default branch is bisected to the merge that broke it, and a proven culprit is reverted or proposed for revert. Off by default ([configuration](docs/configuration.md#triage))
 - **Placement** (in Gates and Machines): for a project with its own gate queue and runners on several machines, which machine runs each queued job. Lair probes the machines (a machine counts as up only after a few minutes of passing probes), learns how long each kind of job takes on each machine, estimates every job's start and finish, and moves a job to another machine's lane through your own mover when it would finish sooner there. Observe-only until you opt in ([configuration](docs/configuration.md#placement))
+- **Settings**: every project setting from the dashboard, for the owner only: forms drawn from each module's schema and a YAML tab, each change checked by the same parsers as the server before it is written, commands it adds confirmed, secrets refused, a hand edit never overwritten, every version kept with Restore, and **New project** ([configuration](docs/configuration.md#settings))
 
 ## Requirements
 
@@ -48,7 +49,7 @@ For development with hot reload, run `npm run dev` and open `http://localhost:51
 
 ## Configure your project
 
-Each monitored project is a YAML file. Put your own in `projects/local/` (gitignored), starting from the example:
+Each monitored project is a YAML file. The quickest way is **Settings** in the dashboard (signed in as the owner): **New project** checks the repository, reads its GitHub repo from the remote and writes `projects/local/<id>.yaml`, and the forms change every setting after that, with each change checked, its commands confirmed and every version kept ([Settings](docs/configuration.md#settings)). By hand, put your own in `projects/local/` (gitignored), starting from the example:
 
 ```bash
 mkdir -p projects/local

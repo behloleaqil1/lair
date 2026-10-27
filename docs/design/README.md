@@ -12,6 +12,7 @@
 | [platform.md](platform.md) | Platform direction: architecture, nodes, scheduler, sandboxes, workflow, verification, policy engine | Planned; parts exist (scheduler, store, policy, gate signing, TypeScript node daemon), all experimental |
 | [autonomy.md](autonomy.md) | Autonomous operation: decision inbox, watchdog, playbooks, triage, planner, lifecycle | Partly built: the Decision Inbox (§1, `src/server/decisions/`) and the watchdog's detectors and playbooks (§2, `src/server/watchdog/`); the rest is planned |
 | [runners.md](runners.md) | Where gates run: CI runners (GitHub Actions) first, Lair machines next, the local machine last; minutes budget and fallback | Partly built: pipeline config, GitHub Actions and local executors, the selector, the minutes budget, API and UI; lair-node executors are not built |
+| [settings-ui.md](settings-ui.md) | Settings: every project setting from the dashboard, written to the YAML; guided setup actions; auto-detection | Partly built: phase 1 (forms for every module, YAML tab, checks, command confirmation, history and restore, New project); phases 2 and 3 are planned |
 | [node.md](node.md) | The lair-node daemon: compiled Go binary, protocol, job execution | Planned; only the experimental TypeScript daemon in `src/node/` exists |
 | [quality.md](quality.md) | Quality control: test integrity, contracts, migrations, security, performance | Planned, not built |
 | [launch-kit.md](launch-kit.md) | Launch readiness: billing, analytics, compliance, legal, experiments | Planned, not built |
