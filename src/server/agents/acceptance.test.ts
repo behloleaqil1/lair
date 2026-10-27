@@ -3082,6 +3082,104 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(eventsOf(h, "fill_done")).toEqual([]);
   });
 
+  it("patterns by agent: when the queue file was rewritten after the agent's next run began, none of that run's lines count for the earlier task", async () => {
+    const h = setup(fill({ ...BY_AGENT, agents: ["worker-a"], wake: { file: "{gates_dir}/results/{wake}.rc" } }));
+    prompts(h);
+    tasks(h, "worker-a|Viserion|kiro/T1|First");
+    await check(h);
+    await at(h, 0); // 5001
+    const gate = "20261027T070000Z-T1-ab12cd34-1";
+    appendFileSync(h.queueFile, `- WAITING T1 ${gate} by worker-a (Viserion) 06:25Z: gate queued\n`);
+    h.spawner.exit(5001, 0);
+    await at(h, MIN);
+    expect(lineOf(await check(h), "kiro/T1").hold).toBe("waiting");
+    const t1Start = runs(h)[0].queueMark?.offset ?? 0;
+
+    // T1's line taken out, worker-a runs something else and reports it done
+    tasks(h, "# kiro/T1 paused");
+    await check(h);
+    await request(h, "worker-a", "kiro/other", "Something else");
+    await at(h, 2 * MIN); // 5002
+    appendFileSync(h.queueFile, "- DONE other by worker-a (Viserion) 06:40Z: merged\n");
+    h.spawner.exit(5002, 0);
+    await at(h, 3 * MIN);
+    // The queue file is rewritten: what came before T1's start is kept, the other run's DONE line comes right after it
+    const kept = readFileSync(h.queueFile).subarray(0, t1Start);
+    writeFileSync(h.queueFile, Buffer.concat([kept, Buffer.from("- DONE other by worker-a (Viserion) 06:40Z: merged (rewritten)\n")]));
+
+    // Where the other run's lines begin is unknown now: none of them count for T1, which keeps what fill saw
+    tasks(h, "worker-a|Viserion|kiro/T1|First");
+    expect(lineOf(await check(h), "kiro/T1")).toMatchObject({ state: "held", hold: "waiting", waiting: { wake: gate } });
+    expect(eventsOf(h, "fill_done")).toEqual([]);
+  });
+
+  it("patterns by agent: a fresh session of the agent on another task is refused while its fill task is open, over HTTP and as an escalation's answer", async () => {
+    const h = setup(fill({ ...BY_AGENT, agents: ["worker-a"], wake: { file: "{gates_dir}/results/{wake}.rc" } }));
+    const { inbox, answer, app, owner } = await withInbox(h);
+    prompts(h);
+    const gate = "20261027T070000Z-T1-ab12cd34-1";
+    // The owner's run of worker-a on another task dies on start until it is escalated; then T1's run waits on a gate
+    h.spawner.behaviour = (pid, _log, call) => {
+      if (call === 5) appendFileSync(h.queueFile, `- WAITING T1 ${gate} by worker-a (Viserion) 06:25Z: gate queued\n`);
+      h.spawner.exit(pid, call === 5 ? 0 : 1);
+    };
+    tasks(h, "# no fill task for worker-a yet");
+    await check(h);
+    const other = await request(h, "worker-a", "kiro/other", "Something else");
+    for (const ms of [0, 0, 10 * SEC, 10 * SEC, 30 * SEC, 30 * SEC, 70 * SEC, 70 * SEC]) await at(h, ms);
+    const [escalation] = inbox.list({ project: "demo", status: "open" });
+    expect(escalation.key).toBe(`escalation:${other.chainId}:4`);
+
+    tasks(h, "worker-a|Viserion|kiro/T1|First");
+    h.clock.t = NOW + 2 * MIN;
+    expect(lineOf(await check(h), "kiro/T1").state).toBe("started");
+    await at(h, 2 * MIN); // T1's run (call 5) waits on its gate
+    await at(h, 3 * MIN);
+    expect(lineOf(await check(h), "kiro/T1").hold).toBe("waiting");
+
+    // A fresh session of the other task, from the Agents view: refused
+    const last = runs(h).filter((r) => r.task === "kiro/other").at(-1);
+    expect(last?.state).toBe("failed");
+    const fresh = freshSessionAction("demo", last?.id ?? "", "worker-a", "kiro/other");
+    const sent = ownerRequest(fresh.body, { [OWNER_SESSION_HEADER]: owner[OWNER_SESSION_HEADER] });
+    const refused = await app.inject({ url: fresh.url, ...sent, headers: { ...DASHBOARD, ...sent.headers } });
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json().error).toContain("Agent worker-a has an open fill task, kiro/T1 (held: waiting)");
+    // The escalation answered "fresh_session": refused the same way, and the reason is recorded with the answer
+    expect((await answer(escalation.id, { optionId: "fresh_session" })).statusCode).toBe(200);
+    expect(eventsOf(h, "decision").at(-1)?.summary).toContain("could not act on it: Agent worker-a has an open fill task, kiro/T1");
+    expect(runs(h).filter((r) => r.task === "kiro/other")).toHaveLength(4);
+    expect(h.spawner.calls).toHaveLength(5);
+  });
+
+  it("a result newer than the chain's first start is a real wake, even when the attempt that waits on it started later", async () => {
+    const h = setup(gateFill());
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    // Attempt 1 works a while and crashes; attempt 2 (the same chain) ends at once on a WAITING line
+    h.spawner.behaviour = (pid, log, call) => {
+      if (call === 1) writeLog(h.clock, log, "working on it\n");
+      if (call === 2) {
+        appendFileSync(h.queueFile, `- WAITING feat-login ${GATE} by worker-a: gate queued\n`);
+        h.spawner.exit(pid, 0);
+      }
+    };
+    await check(h);
+    await at(h, 0); // attempt 1: 5001
+    h.spawner.exit(5001, 2);
+    await at(h, 5 * MIN); // crashed: a same-session restart at +5:10
+    await at(h, 5 * MIN + 10 * SEC); // attempt 2: 5002
+    await at(h, 6 * MIN);
+    const [first, second] = runs(h);
+    expect(second).toMatchObject({ chainId: first.chainId, state: "completed" });
+
+    // The gate's result is from +3 min: after the chain began, before attempt 2 did. Fill first finds it there
+    resultAt(h, GATE, 3 * MIN);
+    expect(lineOf(await check(h), "feat-login").state).toBe("started");
+    expect(eventsOf(h, "fill_woken")).toHaveLength(1);
+    expect(eventsOf(h, "fill_weak")).toEqual([]);
+  });
+
   it("a store from before fill (schema version 1) gains the task index; its runs are found by task", () => {
     const paths = makePaths();
     mkdirSync(dirname(paths.dbPath), { recursive: true });

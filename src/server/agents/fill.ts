@@ -265,12 +265,15 @@ class QueueLines {
    * The lines a pattern looks at: [from, to). A pattern that names only the
    * agent also stops where the agent's next run on another task began
    * (`until`, that run's mark): its lines after that are about that task.
+   * When that mark no longer describes the file (it was rewritten since),
+   * where that run's lines begin is unknown, so such a pattern reads
+   * nothing: what fill saw before is kept in the store.
    */
   private window(pattern: FillPattern, mark: QueueMark | undefined, until: QueueMark | undefined): { from: number; to: number } | null {
     const from = this.from(pattern, mark);
     if (from === null) return null;
-    const to = pattern.task === null && until && this.usable(until) ? until.offset : Number.POSITIVE_INFINITY;
-    return { from, to };
+    if (pattern.task !== null || !until) return { from, to: Number.POSITIVE_INFINITY };
+    return this.usable(until) ? { from, to: until.offset } : null;
   }
 
   /** The first line in the pattern's window that reports what it looks for (taskLineMatch). */
@@ -1192,11 +1195,12 @@ export class AgentsFill {
       if (found.state !== "present") {
         return { kind: "pending", named, view: view(null), detail: `waiting: ${shown} since ${iso(since)}; starts again once ${file} exists` };
       }
-      // It came: fill saw it absent before (whatever its mtime says: a copy may keep an old one), or it is newer than the run
-      if (seen.has("fill_wake_absent") || found.mtimeMs > (latest.spawnedAt ?? latest.requestedAt)) {
+      // It came: fill saw it absent before (whatever its mtime says: a copy may keep an old one), or it is newer than
+      // the chain's first start (an earlier attempt of the same chain may have queued the gate the last one waits on)
+      if (seen.has("fill_wake_absent") || found.mtimeMs > this.chainStart(latest)) {
         return { kind: "woken", file, named };
       }
-      await note("fill_weak", `fill: ${file} was there before run ${short(latest.id)} started: waiting on it was no wait`);
+      await note("fill_weak", `fill: ${file} was there before run ${short(latest.id)}'s chain started: waiting on it was no wait`);
       return stale;
     }
     const fallbackAt = since + settings.wake.fallbackSeconds * 1000;
@@ -1244,6 +1248,15 @@ export class AgentsFill {
     const path = absolute(fill(settings.wake.file ?? ""));
     if (!within(root, path)) return { ok: false, reason: `${path} is outside wake.root (${root})` };
     return { ok: true, path };
+  }
+
+  /** When the run's chain first started a process (its first attempt's spawn), or was requested if none did. */
+  private chainStart(run: AgentRun): number {
+    const spawned = this.options.store
+      .chainRuns(run.chainId)
+      .map((r) => r.spawnedAt)
+      .filter((at): at is number => at !== undefined);
+    return spawned.length > 0 ? Math.min(...spawned) : (run.spawnedAt ?? run.requestedAt);
   }
 
   /** The wake file, looked for at most every wake.poll_seconds per waiting run ("unchecked" in between). */

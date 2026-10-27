@@ -39,6 +39,7 @@ import type {
   AgentView,
   BudgetLine,
   BudgetScopeView,
+  FillLineView,
   FillStatusView,
   LockView,
   RunOrigin,
@@ -175,6 +176,10 @@ const oneLine = (text: string, max = 300) => {
   return flat.length > max ? `${flat.slice(0, max)}...` : flat;
 };
 const failoverLabel = (kind: FailoverInfo["kind"]) => (kind === "rate_limit" ? "rate limit" : "provider error");
+
+/** Why a run of `agent` on another task is refused while its fill task is open (fill matching by agent). */
+const openTaskRefusal = (agent: string, open: FillLineView) =>
+  `Agent ${agent} has an open fill task, ${open.task} (${open.state}${open.hold ? `: ${open.hold}` : ""}): with fill's patterns matching by agent, its lines on another task would count for that one. Let ${open.task} finish, or take its line out of tasks_file first`;
 
 function fileSize(path: string): number {
   try {
@@ -1880,12 +1885,7 @@ export class AgentsService {
       }
       // Fill matching by agent: the agent's lines about another task would read as its open fill task's
       const open = options.origin === "fill" ? null : this.fill?.openTaskFor(agent, task);
-      if (open) {
-        throw new AgentsError(
-          409,
-          `Agent ${agent} has an open fill task, ${open.task} (${open.state}${open.hold ? `: ${open.hold}` : ""}): with fill's patterns matching by agent, its lines on another task would count for that one. Let ${open.task} finish, or take its line out of tasks_file first`,
-        );
-      }
+      if (open) throw new AgentsError(409, openTaskRefusal(agent, open));
       const now = this.probes.clock.now();
       const blocked = this.budgetBlock(agent, now);
       if (blocked) throw new AgentsError(403, `Over budget: ${blocked}`);
@@ -2027,6 +2027,9 @@ export class AgentsService {
     if (run.state === "completed") throw new AgentsError(409, `Run ${short(run.id)} completed its task`);
     const busy = this.store.activeRunForAgent(this.project, run.agent);
     if (busy) throw new AgentsError(409, `Agent ${run.agent} is busy with task ${busy.task}`);
+    // As for a new run (requestRun): with fill matching by agent, not while the agent's fill task on another task is open
+    const open = this.fill?.openTaskFor(run.agent, run.task);
+    if (open) throw new AgentsError(409, openTaskRefusal(run.agent, open));
     const blocked = this.budgetBlock(run.agent, t.now);
     if (blocked) throw new AgentsError(403, `Over budget: ${blocked}`);
     const next = this.followUp(run, t.now, t.now);

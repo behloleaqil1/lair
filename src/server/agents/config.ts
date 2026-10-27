@@ -593,9 +593,11 @@ function checkFill(value: RawSettings, errors: string[]): void {
 /**
  * What must come right before {agent} in a pattern: a word "by", then
  * `\s+`, as in "... \bby\s+{agent}" (the line's author: "... by <agent>
- * (Name)"). "by" starts the pattern or follows `\b`, `\s`, a space or "(".
+ * (Name)"). "by" (in any case: patterns match case-insensitively) starts
+ * the pattern or follows `\b`, `\s`, a space or "(". The escapes are matched
+ * as written: `\S+` or `\B` is not `\s+` or `\b`.
  */
-const BY_BEFORE_AGENT = /(?:^|\\b|\\s| |\()by\\s\+$/i;
+const BY_BEFORE_AGENT = /(?:^|\\b|\\s| |\()[bB][yY]\\s\+$/;
 
 /**
  * A fill pattern: {task} and {agent} only, at least one of them, every

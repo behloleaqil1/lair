@@ -172,6 +172,8 @@ describe("agents config", () => {
       // {agent} alone is enough, right after "by\s+" (the line's author)
       expect(errorsOf(withFill({ [key]: "^- WAITING .*\\bby\\s+{agent}(?=[\\s(]|$)" }))).toEqual([]);
       expect(errorsOf(withFill({ [key]: "^- WAITING .* by\\s+{agent}(?=[\\s(]|$)" }))).toEqual([]);
+      // "by" in any case (patterns match case-insensitively), but the escapes as written
+      expect(errorsOf(withFill({ [key]: "^- WAITING .*\\bBY\\s+{agent}(?=[\\s(]|$)" }))).toEqual([]);
       // Anywhere else it could match a line that only names the agent ("merged kiro-A's PR"), or another agent
       for (const pattern of [
         "^- DONE merged {agent}'s PR",
@@ -180,6 +182,9 @@ describe("agents config", () => {
         "^- DONE .*\\bby\\s*{agent}",
         "^- DONE .* by {agent}",
         "^- DONE .*-by\\s+{agent}",
+        // \S+ is not \s+, and \B is not \b
+        "^- DONE .*\\bby\\S+{agent}",
+        "^- DONE .*\\Bby\\s+{agent}",
       ]) {
         expect(errorsOf(withFill({ [key]: pattern }))).toEqual([
           `agents.fill.${key}: {agent} must come right after "\\bby\\s+" (the line's author: "... by {agent}")`,
