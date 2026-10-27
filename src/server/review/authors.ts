@@ -13,19 +13,18 @@
  * one lets the author review its own work.
  *
  * Globs are matched without regular expressions (a table over the glob and
- * the name, so no pattern can backtrack), and the tasks file is read bounded:
- * a regular file of at most 256 KB, 200 tasks and 2000 characters a line.
+ * the name, so no pattern can backtrack), and the tasks file is read bounded
+ * and parsed as agents fill parses it (agents/fill.ts: at most 256 KB, 200
+ * tasks and 2000 characters a line).
  */
 import { closeSync, constants, fstatSync, openSync, readSync } from "fs";
 import { isAbsolute, resolve } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
 import { isValidDragonId } from "../parsers/dragon-config.js";
+import { MAX_TASKS_FILE_BYTES, parseTasksFile } from "../agents/fill.js";
 
 /** Branch names longer than this match nothing. */
 export const MAX_BRANCH_CHARS = 255;
-export const MAX_TASKS_FILE_BYTES = 256 * 1024;
-export const MAX_TASK_LINES = 200;
-export const MAX_TASK_LINE_CHARS = 2000;
 
 const GLOB_CHARS = /^[A-Za-z0-9._/*?-]+$/;
 const BRANCH_NAME = /^[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}$/;
@@ -109,30 +108,21 @@ const BRANCH_TAG = /\(branch:\s*([^\s()]{1,255})\s*\)/g;
 const PREFIX_TOPIC = /\(([A-Za-z0-9._-]{1,100}(?:\/[A-Za-z0-9._-]{1,100}){1,8})\)/g;
 
 /**
- * The branches a tasks file names, per line: `(branch: <name>)` or a
- * `(<prefix>/<topic>)` token in the description. Comments, blank lines and
- * lines that don't parse are skipped; at most MAX_TASK_LINES tasks are read.
+ * The branches a tasks file names, per task line (as fill parses them; a
+ * malformed line names none): `(branch: <name>)` or a `(<prefix>/<topic>)`
+ * token in the description.
  */
 export function branchesFromTasks(content: string): TaskBranch[] {
   const out: TaskBranch[] = [];
-  const lines = content.split("\n");
-  let tasks = 0;
-  for (let i = 0; i < lines.length && tasks < MAX_TASK_LINES; i++) {
-    const text = lines[i].replace(/\r$/, "").trim();
-    if (text.length === 0 || text.startsWith("#") || text.length > MAX_TASK_LINE_CHARS) continue;
-    const fields = text.split("|");
-    if (fields.length < 4) continue;
-    const agent = fields[0].trim();
-    if (!isValidDragonId(agent)) continue;
-    tasks++;
-    const description = fields.slice(3).join("|");
+  for (const entry of parseTasksFile(content)) {
+    if (entry.kind !== "task") continue;
     const named = new Set<string>();
     for (const pattern of [BRANCH_TAG, PREFIX_TOPIC]) {
-      for (const match of description.matchAll(pattern)) {
+      for (const match of entry.description.matchAll(pattern)) {
         if (isSafeBranchName(match[1])) named.add(match[1]);
       }
     }
-    for (const branch of named) out.push({ line: i + 1, agent, branch });
+    for (const branch of named) out.push({ line: entry.line, agent: entry.agent, branch });
   }
   return out;
 }

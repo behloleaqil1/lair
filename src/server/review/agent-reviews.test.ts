@@ -644,11 +644,10 @@ describe("author mapping", () => {
   ].join("\n");
 
   async function authorFor(headRef: string, authors: Record<string, unknown>) {
-    const h = await boot({ headRef, review: { authors } });
+    // agents.fill.tasks_file is relative to the repo (fill itself stays off)
+    const h = await boot({ headRef, review: { authors }, agents: { fill: { tasks_file: "tasks.txt" } } });
+    expect(h.agents.status("demo").errors).toEqual([]);
     writeFileSync(join(h.dir, "tasks.txt"), tasks);
-    // agents.fill.tasks_file, relative to the repo. Added once the agents module has loaded the config: this
-    // branch's agents schema doesn't know the fill block yet, and the review module reads it when it evaluates
-    (h.config.agents as Record<string, unknown>).fill = { tasks_file: "tasks.txt" };
     const status = await statusOf(h);
     return { h, status };
   }
