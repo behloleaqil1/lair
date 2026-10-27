@@ -57,6 +57,8 @@ function optionMismatch(
       return isAuthor(r, author) ? "is the author" : null;
     case "agent":
       if (r.kind !== "agent" || r.id !== option.agent) return `not agent ${option.agent}`;
+      // An unknown author may be this very agent: its review can't count
+      if (author === null) return "the PR's author is unknown";
       return isAuthor(r, author) ? "is the author" : null;
     case "peer":
       if (r.kind === "check") return "a check, not a reviewer";
@@ -143,9 +145,10 @@ export function matchSlots(
       const names = eligible[index].map((c) => candidates[c].reviewer.id);
       parts.push(`${names.join(", ")} already fill${names.length === 1 ? "s" : ""} another slot`);
     }
-    const needsAuthor =
-      author === null && (slot.differentModel || slot.anyOf.some((o) => o.kind === "peer" || o.kind === "self"));
-    if (needsAuthor) parts.push("the PR's author is unknown: register it or set review.authors.branch_pattern");
+    const needsAuthor = author === null && (slot.differentModel || slot.anyOf.some((o) => o.kind !== "human"));
+    if (needsAuthor) {
+      parts.push("the PR's author is unknown: register it, or map its branch (review.authors.branch_pattern or branches)");
+    }
     const why = candidates
       .map((c, i) => ({ c, i }))
       .filter(({ c, i }) => c.headSha === headSha && !c.superseded && !eligible[index].includes(i))

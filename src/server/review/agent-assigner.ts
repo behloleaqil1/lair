@@ -6,10 +6,13 @@
  * projects without it, go to the default assigner.
  *
  * For a requested slot of kind `agent:<id>` (that agent) or `peer` (any agent
- * but the author) it picks a reviewer that is:
+ * but the author) of a PR whose author is known (an unknown author could be
+ * any agent, so no agent reviews it), it picks a reviewer that is:
  * - in the slot's `pool`, else review.reviewers_pool.<tier> (a named slot: that agent), and not the author;
- * - with `different_model`, on a model other than the author's in every
- *   profile it can run with, fallbacks included, so a failover can't land on it;
+ * - with `different_model`, on no model the author can run on: none of the
+ *   reviewer's profiles (fallbacks included) may share a model with the
+ *   author's model or any of the author's profiles, so neither side's
+ *   failover can land on a shared model;
  * - free in the agents module (no active run, not over budget), not reviewing
  *   this PR already, and not one that already reviewed this head.
  * It starts the run in-process (AgentRuns.requestRun) with task id
@@ -18,17 +21,20 @@
  * assignment token goes to the run's environment only, as LAIR_REVIEW_TOKEN:
  * a module run variable the agents module keeps in memory, never in the
  * prompt, the store or a log. The reviewer posts its review with
- * `lair review submit` (src/cli/review-submit.ts).
+ * `lair review submit` (src/cli/review-submit.ts); the review service takes
+ * it once, only while that run is active.
  *
- * One record per slot and head (review_agent_assignments), and at most one
- * run per slot at a time. check() follows them, every 15 s:
+ * One record per slot, head and request round (review_agent_assignments),
+ * and at most one run per slot at a time. check() follows them, every 15 s:
  * - the request's token was used: reviewed;
- * - the PR moved to another head, or closed: stale, nothing more is started;
+ * - the PR moved to another head, or closed: stale; nothing more is started,
+ *   and a review run still going is stopped (its claim released);
  * - the run's chain ended without a review (it exited without submitting, was
  *   escalated, or its variables were lost in a restart): retried with a new
  *   token (the old one stops working) after retries.backoff_seconds, doubling,
  *   by an agent not tried yet when there is one; after retries.max_attempts
- *   runs the owner is asked in the Decision Inbox and the slot is failed;
+ *   runs the owner is asked in the Decision Inbox and the slot is failed (only
+ *   the owner starts another round);
  * - requested and no reviewer free: tried again on the next check, without
  *   using up an attempt.
  * Everything is in the review store, so a restart carries on where it stopped.
@@ -46,6 +52,8 @@ import type { AgentAssignmentRecord, ReviewStore } from "./store.js";
 
 /** How often check() runs, by default */
 export const CHECK_INTERVAL_MS = 15_000;
+/** An assigned review whose head nobody looked at for this long is checked on the git host */
+export const HOST_CHECK_MS = 60_000;
 /** The request channel of reviews by agents */
 export const AGENTS_CHANNEL = "agents";
 
@@ -71,13 +79,13 @@ export interface AgentReviewAssignerOptions {
   agents: ReviewerRuns;
   store: ReviewStore;
   clock: Clock;
-  /** Where a slot no agent could review goes */
+  /** Where a slot no agent could review goes (the server: the Decision Inbox) */
   decisions: DecisionSink;
   /** For what this assigner doesn't take: self-checks, and projects without review.prompt_file */
   fallback: ReviewAssigner;
   /** The server's URL, given to reviewer runs as LAIR_URL (where `lair review submit` posts) */
   serverUrl?: string;
-  /** The PR's state and head now, from the git host (before a retry starts a run); null when it can't say */
+  /** The PR's state and head now, from the git host; null when it can't say */
   pullRequest: (project: string, pr: number) => Promise<{ state: string; headSha: string } | null>;
 }
 
@@ -88,18 +96,27 @@ interface Candidate {
   model: string | null;
 }
 
+const recordKey = (r: AgentAssignmentRecord) => `${r.project}\n${r.pr}\n${r.headSha}\n${r.slot}\n${r.round}`;
+
 export class AgentReviewAssigner implements ReviewAssigner {
   private projects = new Map<string, AgentReviewProject>();
   private queue: Promise<unknown> = Promise.resolve();
   private checking: Promise<void> | null = null;
   private timer: NodeJS.Timeout | null = null;
   private stopped = true;
+  /** When each assigned record's PR was last looked at on the git host (in memory: a restart checks again) */
+  private hostChecked = new Map<string, number>();
   lastError: string | null = null;
 
   constructor(private readonly o: AgentReviewAssignerOptions) {}
 
   addProject(name: string, project: AgentReviewProject): void {
     this.projects.set(name, project);
+  }
+
+  /** For a config reload: the project's next settings come with addProject (if it still has reviews by agents). */
+  removeProject(name: string): void {
+    this.projects.delete(name);
   }
 
   /** Reviews by agents are on for the project (review.prompt_file). */
@@ -112,6 +129,11 @@ export class AgentReviewAssigner implements ReviewAssigner {
     const result = this.queue.then(fn);
     this.queue = result.catch(() => undefined);
     return result;
+  }
+
+  /** Resolves once the assignment or check in progress (and any queued) has finished. */
+  async idle(): Promise<void> {
+    await this.queue;
   }
 
   assign(a: ReviewAssignment): Promise<AssignResult> {
@@ -158,9 +180,9 @@ export class AgentReviewAssigner implements ReviewAssigner {
     return this.o.clock.now();
   }
 
-  private save(record: AgentAssignmentRecord): void {
+  private save(record: AgentAssignmentRecord, bind?: { reviewer: string; model: string | null }): void {
     record.updatedAt = iso(this.now());
-    this.o.store.saveAgentAssignment(record);
+    this.o.store.saveAgentAssignment(record, bind);
   }
 
   private async assignNow(a: ReviewAssignment): Promise<AssignResult> {
@@ -175,6 +197,7 @@ export class AgentReviewAssigner implements ReviewAssigner {
       pr: a.pr,
       headSha: a.headSha,
       slot: a.slot,
+      round: a.round,
       state: "requested",
       agent: null,
       runId: null,
@@ -198,9 +221,9 @@ export class AgentReviewAssigner implements ReviewAssigner {
       },
       updatedAt: iso(now),
     };
-    // The service records this token's hash with the agent picked here
+    // The service wrote the round's request with this token's hash first; the agent is bound with this record
     const outcome = await this.startRun(record, a.token, false);
-    this.save(record);
+    this.save(record, outcome.assigned && outcome.agent ? { reviewer: outcome.agent, model: outcome.model ?? null } : undefined);
     return outcome;
   }
 
@@ -214,8 +237,8 @@ export class AgentReviewAssigner implements ReviewAssigner {
 
   /**
    * Pick a reviewer and start its run with `token`. `reissue`: the request
-   * record gets this token's hash and the agent (a retry, or a run started
-   * after none was free); otherwise the caller records them.
+   * round gets this token's hash and the agent first (a retry, or a run
+   * started after none was free); otherwise the service wrote the hash.
    */
   private async startRun(record: AgentAssignmentRecord, token: string, reissue: boolean): Promise<AssignResult> {
     const fail = (detail: string): AssignResult => {
@@ -243,14 +266,15 @@ export class AgentReviewAssigner implements ReviewAssigner {
     const refused = [...pick.waiting];
     for (const candidate of pick.free) {
       if (reissue) {
-        const bound = this.o.store.reissueRequest(record.project, record.pr, record.headSha, record.slot, {
+        const bound = this.o.store.reissueRequest(record.project, record.pr, record.headSha, record.slot, record.round, {
           reviewer: candidate.id,
           tokenHash: hashToken(token),
           model: candidate.model,
           detail: `${candidate.id}: reviews by agents`,
         });
         if (!bound) {
-          const request = this.o.store.getRequest(record.project, record.pr, record.headSha, record.slot);
+          const request = this.o.store.requestRounds(record.project, record.pr, record.headSha, record.slot)
+            .find((r) => r.round === record.round);
           if (request?.usedBy) {
             record.state = "reviewed";
             record.detail = `reviewed by ${request.usedBy}`;
@@ -272,6 +296,7 @@ export class AgentReviewAssigner implements ReviewAssigner {
         record.chainId = run.chainId;
         record.attempts++;
         record.detail = `run ${short(run.id)} (attempt ${record.attempts} of ${settings.maxAttempts})`;
+        this.hostChecked.set(recordKey(record), this.now());
         return { assigned: true, agent: candidate.id, detail: record.detail, model: candidate.model, channel: AGENTS_CHANNEL };
       } catch (e) {
         refused.push(`${candidate.id}: ${oneLine(message(e))}`);
@@ -294,20 +319,32 @@ export class AgentReviewAssigner implements ReviewAssigner {
     const spec = record.spec;
     const status = this.o.agents.status(record.project);
     if (!status.enabled) return { blocked: `the agents module is off for ${record.project} (agents.enabled)` };
-    if (!spec.reviewer && !spec.author) {
+    // Any agent, the named one included, may be an unknown author
+    if (!spec.author) {
       return {
         blocked:
-          "the PR's author is unknown, so no agent can be told apart from it: map it (review.authors.branches, " +
-          "review.authors.from_tasks_file or review.authors.branch_pattern)",
+          "the PR's author is unknown, so no agent can be told apart from it: map its branch (review.authors.branches " +
+          "or review.authors.branch_pattern)",
       };
     }
-    if (spec.differentModel && !spec.authorModel) {
-      return { blocked: "the slot needs a model other than the author's, and the author's model is unknown" };
+    const views = new Map(status.agents.map((view) => [view.id, view]));
+
+    // Every model the author can run on: its model, and each of its profiles in the agents module
+    const authorModels = new Set<string>();
+    if (spec.differentModel) {
+      if (spec.authorModel) authorModels.add(spec.authorModel);
+      const authorView = views.get(spec.author);
+      for (const profile of authorView?.profiles ?? []) {
+        if (!profile.model) return { blocked: `the slot needs another model than the author's, and one of ${spec.author}'s profiles names none` };
+        authorModels.add(profile.model);
+      }
+      if (authorModels.size === 0) {
+        return { blocked: "the slot needs a model other than the author's, and the author's model is unknown" };
+      }
     }
     const pool = spec.reviewer ? [spec.reviewer] : (spec.pool ?? []);
     if (pool.length === 0) return { blocked: `no reviewer pool: set review.reviewers_pool.${spec.tier} or the slot's pool` };
 
-    const views = new Map(status.agents.map((view) => [view.id, view]));
     const busy = this.o.agents.managedRuns(record.project);
     const reviewing = new Set(this.o.store.agentsReviewing(record.project, record.pr));
     const reviewedHere = new Set(
@@ -335,8 +372,9 @@ export class AgentReviewAssigner implements ReviewAssigner {
           never.push(`${id}: the model of one of its profiles is unknown`);
           continue;
         }
-        if (models.includes(spec.authorModel)) {
-          never.push(`${id}: can run on the author's model ${spec.authorModel}`);
+        const shared = models.find((m) => m !== null && authorModels.has(m));
+        if (shared) {
+          never.push(`${id}: it and the author can both run on ${shared}`);
           continue;
         }
       }
@@ -374,9 +412,22 @@ export class AgentReviewAssigner implements ReviewAssigner {
     }
   }
 
-  private stale(record: AgentAssignmentRecord, why: string): void {
+  /** The PR moved on: no more runs for this head, and a review run still going is stopped. */
+  private async stale(record: AgentAssignmentRecord, why: string): Promise<void> {
+    let stopped = "";
+    const chain = record.chainId ? (this.o.agents.getStore()?.chainRuns(record.chainId) ?? []) : [];
+    const active = chain.find((run) => isActive(run.state));
+    if (active) {
+      try {
+        await this.o.agents.get(record.project)?.releaseClaim(active.task, `the review module: ${why}`);
+        stopped = `; its run ${short(active.id)} was stopped (claim released)`;
+      } catch (e) {
+        stopped = `; its run ${short(active.id)} could not be stopped (${oneLine(message(e))})`;
+      }
+    }
     record.state = "stale";
-    record.detail = `${why}: nothing more is started for ${record.headSha.slice(0, 7)}`;
+    record.detail = `${why}: nothing more is started for ${record.headSha.slice(0, 7)}${stopped}`;
+    this.hostChecked.delete(recordKey(record));
     this.save(record);
   }
 
@@ -386,11 +437,14 @@ export class AgentReviewAssigner implements ReviewAssigner {
     const settings = project.settings.agentReviews;
     const now = this.now();
 
-    const request = this.o.store.getRequest(record.project, record.pr, record.headSha, record.slot);
+    const request = this.o.store
+      .requestRounds(record.project, record.pr, record.headSha, record.slot)
+      .find((r) => r.round === record.round);
     if (request?.usedBy) {
       record.state = "reviewed";
       record.agent = request.usedBy;
       record.detail = `reviewed by ${request.usedBy}`;
+      this.hostChecked.delete(recordKey(record));
       return this.save(record);
     }
     if (!request) {
@@ -403,7 +457,17 @@ export class AgentReviewAssigner implements ReviewAssigner {
 
     if (record.state === "assigned") {
       const chain = record.chainId ? (this.o.agents.getStore()?.chainRuns(record.chainId) ?? []) : [];
-      if (chain.some((run) => isActive(run.state))) return; // still reviewing
+      if (chain.some((run) => isActive(run.state))) {
+        // Still reviewing: look at the PR on the host now and then, so a push or a close stops the run
+        const key = recordKey(record);
+        if (now - (this.hostChecked.get(key) ?? 0) < HOST_CHECK_MS) return;
+        this.hostChecked.set(key, now);
+        const pr = await this.o.pullRequest(record.project, record.pr);
+        if (pr && pr.state !== "open") return this.stale(record, `the PR is ${pr.state}`);
+        if (pr && pr.headSha !== record.headSha) return this.stale(record, `the PR moved to ${pr.headSha.slice(0, 7)}`);
+        return;
+      }
+      this.hostChecked.delete(recordKey(record));
       const last = chain[chain.length - 1];
       const ended = last ? `run ${short(last.id)} ended ${last.state} (${oneLine(last.detail)})` : "run is gone";
       const agent = record.agent ?? "the reviewer";
@@ -427,6 +491,7 @@ export class AgentReviewAssigner implements ReviewAssigner {
     }
     if (pr.state !== "open") return this.stale(record, `the PR is ${pr.state}`);
     if (pr.headSha !== record.headSha) return this.stale(record, `the PR moved to ${pr.headSha.slice(0, 7)}`);
+    // The new token's hash and its agent are on the request round before the run starts (reissueRequest)
     await this.startRun(record, newAssignmentToken(), true);
     this.save(record);
   }
@@ -458,6 +523,7 @@ export class AgentReviewAssigner implements ReviewAssigner {
         reversible: true,
         requestedBy: "review",
         links: spec.url ? [{ label: `PR #${record.pr}`, url: spec.url }] : [],
+        key: `review:agents:${record.pr}:${record.headSha}:${record.slot}:${record.round}`,
       });
       record.detail = `${record.detail}; the owner was asked (${raised.channel})`;
     } catch (e) {

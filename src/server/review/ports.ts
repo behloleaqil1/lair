@@ -6,13 +6,17 @@
  * - ReviewAssigner: hand a review (or the author's self-check) to an agent;
  * - ReviewerRuns: the agents module, for reviews by agents (agent-assigner.ts).
  *
- * The defaults publish events on the bus, so a module that implements the
- * real thing can subscribe without touching this one; it can also be passed
- * to ReviewManager directly.
+ * The server raises decisions in the Decision Inbox (inboxDecisionSink). The
+ * event-bus defaults are for a server without one: a module that implements
+ * the real thing can subscribe without touching this one, or be passed to
+ * ReviewManager directly.
  */
+import { createHash } from "crypto";
 import type { EventBus } from "../core/event-bus.js";
 import type { Tier } from "../../shared/review-types.js";
 import type { AgentRunState, AgentRunView, AgentsStatusView } from "../../shared/agents-types.js";
+import type { DecisionProducer } from "../decisions/types.js";
+import { toDecisionInput } from "../decisions/request-bridge.js";
 
 export type DecisionKind =
   | "product"
@@ -36,6 +40,8 @@ export interface DecisionRequest {
   reversible: boolean;
   requestedBy: string;
   links: { label: string; url: string }[];
+  /** Stable key: while a decision with it is open, the same request is not raised again */
+  key?: string;
 }
 
 export interface DecisionSink {
@@ -58,6 +64,8 @@ export interface ReviewAssignment {
   differentModel: boolean;
   /** The slot's index in the tier's reviewers */
   slot: number;
+  /** The request's round for this slot and head (its record, with the token's hash, is written before assign) */
+  round: number;
   /** The PR's author, when known */
   author: string | null;
   /** Reviewer agents to pick a peer from: the slot's pool, else review.reviewers_pool.<tier> */
@@ -89,8 +97,9 @@ export interface ReviewAssigner {
 
 /**
  * What reviews by agents need from the agents module (AgentsManager has it):
- * the in-process run request, the agents' states and profiles, and a chain's
- * runs, to see a review run end.
+ * the in-process run request, the agents' states and profiles, a chain's
+ * runs (to see a review run end, and which profile it runs on), and a
+ * project's service, to stop a review run that is no longer needed.
  */
 export interface ReviewerRuns {
   requestRun(
@@ -99,7 +108,46 @@ export interface ReviewerRuns {
   ): Promise<AgentRunView>;
   status(project: string): AgentsStatusView;
   managedRuns(project: string): ReadonlyMap<string, unknown>;
-  getStore(): { chainRuns(chainId: string): { id: string; state: AgentRunState; detail: string }[] } | null;
+  getStore(): {
+    chainRuns(chainId: string): {
+      id: string;
+      agent: string;
+      task: string;
+      state: AgentRunState;
+      detail: string;
+      profile: { model?: string };
+    }[];
+  } | null;
+  get(project: string): { releaseClaim(task: string, why?: string): Promise<unknown> } | undefined;
+}
+
+/**
+ * Raise decisions in the Decision Inbox (src/server/decisions/), as module
+ * `review`. A request without a key gets one from its project and question,
+ * so the same question is not asked twice while it is open.
+ */
+export function inboxDecisionSink(inbox: Pick<DecisionProducer, "raise">): DecisionSink {
+  return {
+    async raise(request) {
+      const key =
+        request.key ?? `review:${createHash("sha256").update(`${request.project}\n${request.question}`).digest("hex").slice(0, 24)}`;
+      const input = toDecisionInput({
+        key,
+        project: request.project,
+        kind: request.kind,
+        question: request.question,
+        context: request.context.trim() || request.question,
+        options: request.options,
+        recommended: request.recommended ?? request.options[0] ?? "",
+        why: request.why,
+        reversible: request.reversible,
+        onTimeout: "wait",
+        requestedBy: request.requestedBy,
+      });
+      const { decision } = await inbox.raise({ ...input, links: request.links.slice(0, 20) });
+      return { id: decision.id, channel: `decision inbox (${decision.id})` };
+    },
+  };
 }
 
 /** For a server without an event bus: nothing receives the request, and the result says so. */

@@ -248,7 +248,7 @@ export function Reviews({ project, refreshKey }: Props) {
             <p style={muted}>
               Author:{" "}
               {status.author
-                ? `${status.author.id} (${status.author.kind}${status.author.model ? `, ${status.author.model}` : ""}; ${status.authorSource === "lair" ? "registered" : status.authorSource === "tasks_file" ? "from the tasks file" : "from the branch name"})`
+                ? `${status.author.id} (${status.author.kind}${status.author.model ? `, ${status.author.model}` : ""}; ${status.authorSource === "lair" ? "registered" : status.authorSource === "tasks_file" ? "from the branch name, narrowed by the tasks file" : "from the branch name"})`
                 : "unknown"}
               {status.authorNote && ` (${status.authorNote})`}
               {status.labels.length > 0 && ` · Labels: ${status.labels.join(", ")}`}

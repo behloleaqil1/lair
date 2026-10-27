@@ -80,7 +80,11 @@ export class FakeSpawner implements ProcessSpawner {
     return this.started.has(pid);
   }
 
-  kill(pid: number): boolean {
+  /** Signals sent, in order; a signalled process ends at once */
+  kills: { pid: number; signal: string }[] = [];
+
+  kill(pid: number, signal: "SIGTERM" | "SIGKILL"): boolean {
+    this.kills.push({ pid, signal });
     this.exit(pid, null);
     return true;
   }

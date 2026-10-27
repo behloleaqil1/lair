@@ -147,10 +147,14 @@ async function boot() {
     "sec-fetch-site": "same-origin",
     [OWNER_SESSION_HEADER]: auth.createSession(ownerToken)!.session,
   };
-  /** Ask for the missing reviews; returns the token the assigner would hand to the reviewer agent. */
+  /** The owner asks for the missing reviews; returns the token the assigner would hand to the reviewer agent. */
   const assign = async (pr: number, project = "demo"): Promise<string> => {
     const before = seen.length;
-    const res = await server.inject({ method: "POST", url: `/api/review/prs/${pr}/request-reviews?project=${project}` });
+    const res = await server.inject({
+      method: "POST",
+      url: `/api/review/prs/${pr}/request-reviews?project=${project}`,
+      headers: owner,
+    });
     if (res.statusCode !== 200) throw new Error(res.body);
     const event = seen.slice(before).find((e) => e.type === "review.assignment_requested");
     if (!event) throw new Error(`no agent assignment for PR ${pr}: ${res.body}`);
@@ -239,10 +243,16 @@ describe("review routes: review, policy, merge", () => {
       stale: false,
       review: { reviewer: { id: "worker-b", model: "model-two" }, client: { address: "127.0.0.1" } },
     });
-    // The first use bound the assignment to worker-b
+    // The first use bound the assignment to worker-b, and used it up
     const reused = await review(app, 7, { id: "worker-c", kind: "agent" }, head, "approve", [], "demo", token);
     expect(reused.statusCode).toBe(403);
     expect(reused.json().error).toContain("for worker-b");
+    const again = await review(app, 7, { id: "worker-b", kind: "agent" }, head, "request_changes", [], "demo", token);
+    expect(again.statusCode).toBe(403);
+    expect(again.json().error).toContain("already used (by worker-b)");
+    // Asking for reviews is the owner's: without its session the request is refused
+    const anonymous = await app.inject({ method: "POST", url: "/api/review/prs/7/request-reviews?project=demo" });
+    expect(anonymous.statusCode).toBe(403);
     const ready = await status(app, 7);
     expect(ready.data.canMerge).toBe(true);
     expect(ready.data.reasons).toEqual([]);
@@ -459,7 +469,10 @@ describe("review routes: review, policy, merge", () => {
     expect(stillObjecting.data.conditions.find((c: { id: string }) => c.id === "findings")).toMatchObject({ ok: true });
     expect(stillObjecting.data.canMerge).toBe(false);
 
-    await review(app, 7, { id: "worker-b", kind: "agent" }, head, "approve", [], "demo", token);
+    // The used token doesn't count again: the reviewer approves under a new assignment
+    const reused = await review(app, 7, { id: "worker-b", kind: "agent" }, head, "approve", [], "demo", token);
+    expect(reused.statusCode).toBe(403);
+    await review(app, 7, { id: "worker-b", kind: "agent" }, head, "approve", [], "demo", await assign(7));
     expect((await status(app, 7)).data.canMerge).toBe(true);
   });
 
@@ -666,7 +679,7 @@ describe("review routes: review, policy, merge", () => {
       payload: { by: "owner", note: "Bounded in the caller" },
     });
     expect(resolved.statusCode).toBe(200);
-    await review(app, 7, { id: "worker-b", kind: "agent" }, head, "approve", [], "demo", token);
+    await review(app, 7, { id: "worker-b", kind: "agent" }, head, "approve", [], "demo", await assign(7));
     const allowed = await prStatus("demo", 7);
     expect(allowed.canMerge).toBe(true);
     expect(readinessOf(listed, true, { headSha: head, checkedAt: NOW, status: allowed, error: null })).toEqual({

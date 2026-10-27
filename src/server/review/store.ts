@@ -25,17 +25,44 @@ import type { SignedGateResult } from "../../shared/policy-types.js";
 
 /**
  * 1: reviews, findings, PRs, holds, merges, requests, gate results.
- * 2: review_requests.model (the model the assigned agent runs on), and
- *    review_agent_assignments (reviews by agents: each slot's run, attempts and state).
+ * 2: review_requests gets `round` (a slot asked for again at the same head is
+ *    a new round, and the earlier rounds' records stay) and `model` (the
+ *    model the assigned agent runs on); review_agent_assignments (reviews by
+ *    agents: each round's run, attempts and state).
  */
 export const SCHEMA_VERSION = 2;
 
 const SCHEMA_2 = `
+  CREATE TABLE review_requests_2 (
+    project TEXT NOT NULL,
+    pr INTEGER NOT NULL,
+    head_sha TEXT NOT NULL,
+    slot INTEGER NOT NULL,
+    round INTEGER NOT NULL,
+    channel TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    reviewer TEXT,
+    exclude TEXT NOT NULL DEFAULT '[]',
+    token_hash TEXT,
+    used_by TEXT,
+    model TEXT,
+    PRIMARY KEY (project, pr, head_sha, slot, round)
+  );
+  INSERT INTO review_requests_2
+    (project, pr, head_sha, slot, round, channel, detail, requested_at, reviewer, exclude, token_hash, used_by)
+    SELECT project, pr, head_sha, slot, 1, channel, detail, requested_at, reviewer, exclude, token_hash, used_by
+    FROM review_requests;
+  DROP TABLE review_requests;
+  ALTER TABLE review_requests_2 RENAME TO review_requests;
+  CREATE INDEX IF NOT EXISTS idx_review_requests_token ON review_requests(project, pr, token_hash);
+
   CREATE TABLE IF NOT EXISTS review_agent_assignments (
     project TEXT NOT NULL,
     pr INTEGER NOT NULL,
     head_sha TEXT NOT NULL,
     slot INTEGER NOT NULL,
+    round INTEGER NOT NULL,
     state TEXT NOT NULL,
     agent TEXT,
     run_id TEXT,
@@ -45,7 +72,7 @@ const SCHEMA_2 = `
     detail TEXT NOT NULL,
     spec TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    PRIMARY KEY (project, pr, head_sha, slot)
+    PRIMARY KEY (project, pr, head_sha, slot, round)
   );
   CREATE INDEX IF NOT EXISTS idx_review_agent_assignments_state ON review_agent_assignments(state);
 `;
@@ -280,6 +307,8 @@ export interface AssignmentRecord {
   pr: number;
   headSha: string;
   slot: number;
+  /** 1, then one more each time the slot is asked for again at this head */
+  round: number;
   /** The assigned agent, or null until the first review with the token binds it */
   reviewer: string | null;
   exclude: string[];
@@ -295,6 +324,7 @@ interface RequestRow {
   pr: number;
   head_sha: string;
   slot: number;
+  round: number;
   channel: string;
   detail: string;
   requested_at: string;
@@ -316,6 +346,7 @@ export interface AgentAssignmentSpec {
   author: string | null;
   pool: string[] | null;
   differentModel: boolean;
+  /** The author's model as the review module knows it (dragons:, authors.models); its profiles come from the agents module */
   authorModel: string | null;
   repo: string;
   base: string;
@@ -325,12 +356,14 @@ export interface AgentAssignmentSpec {
   tried: string[];
 }
 
-/** One slot's reviews by agents at one head: the current run, attempts and state. */
+/** One round of a slot's reviews by agents at one head: the current run, attempts and state. */
 export interface AgentAssignmentRecord {
   project: string;
   pr: number;
   headSha: string;
   slot: number;
+  /** The review request's round this is for */
+  round: number;
   state: AgentAssignmentState;
   agent: string | null;
   runId: string | null;
@@ -348,6 +381,7 @@ interface AgentAssignmentRow {
   pr: number;
   head_sha: string;
   slot: number;
+  round: number;
   state: string;
   agent: string | null;
   run_id: string | null;
@@ -365,6 +399,7 @@ function agentAssignmentOf(row: AgentAssignmentRow): AgentAssignmentRecord {
     pr: row.pr,
     headSha: row.head_sha,
     slot: row.slot,
+    round: row.round,
     state: row.state as AgentAssignmentState,
     agent: row.agent,
     runId: row.run_id,
@@ -388,6 +423,7 @@ function assignmentOf(row: RequestRow): AssignmentRecord {
     pr: row.pr,
     headSha: row.head_sha,
     slot: row.slot,
+    round: row.round,
     reviewer: row.reviewer,
     exclude: JSON.parse(row.exclude) as string[],
     usedBy: row.used_by,
@@ -436,11 +472,8 @@ export class ReviewStore {
     if (version < SCHEMA_VERSION) {
       this.db.transaction(() => {
         this.db.exec(SCHEMA);
-        if (version < 2) {
-          const columns = this.db.prepare(`PRAGMA table_info(review_requests)`).all() as { name: string }[];
-          if (!columns.some((c) => c.name === "model")) this.db.exec(`ALTER TABLE review_requests ADD COLUMN model TEXT`);
-          this.db.exec(SCHEMA_2);
-        }
+        // 1 -> 2: review_requests is rebuilt with `round` in its key (its rows become round 1)
+        if (version < 2) this.db.exec(SCHEMA_2);
         this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
       })();
     }
@@ -732,15 +765,30 @@ export class ReviewStore {
 
   // ============ REVIEWER REQUESTS ============
 
-  /** The request for one slot at one head, or null if none was made. */
+  /** The latest round of the request for one slot at one head, or null if none was made. */
   getRequest(project: string, pr: number, headSha: string, slot: number): AssignmentRecord | null {
     const row = this.db
-      .prepare(`SELECT * FROM review_requests WHERE project = ? AND pr = ? AND head_sha = ? AND slot = ?`)
+      .prepare(
+        `SELECT * FROM review_requests WHERE project = ? AND pr = ? AND head_sha = ? AND slot = ?
+         ORDER BY round DESC LIMIT 1`,
+      )
       .get(project, pr, headSha, slot) as RequestRow | undefined;
     return row ? assignmentOf(row) : null;
   }
 
-  /** Record a request; an agent assignment also stores its token's hash, never the token. */
+  /** Every round of a slot's request at one head, first first. */
+  requestRounds(project: string, pr: number, headSha: string, slot: number): AssignmentRecord[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM review_requests WHERE project = ? AND pr = ? AND head_sha = ? AND slot = ? ORDER BY round`)
+      .all(project, pr, headSha, slot) as RequestRow[];
+    return rows.map(assignmentOf);
+  }
+
+  /**
+   * Record a request as the slot's next round at this head (earlier rounds
+   * stay); an agent assignment also stores its token's hash, never the
+   * token. Returns the round.
+   */
   recordRequest(
     project: string,
     pr: number,
@@ -750,46 +798,72 @@ export class ReviewStore {
     detail: string,
     at: string,
     assignment: { reviewer: string | null; exclude: string[]; tokenHash: string; model?: string | null } | null = null,
+  ): number {
+    return this.db.transaction(() => {
+      const last = this.db
+        .prepare(`SELECT MAX(round) AS round FROM review_requests WHERE project = ? AND pr = ? AND head_sha = ? AND slot = ?`)
+        .get(project, pr, headSha, slot) as { round: number | null };
+      const round = (last.round ?? 0) + 1;
+      this.db
+        .prepare(
+          `INSERT INTO review_requests
+             (project, pr, head_sha, slot, round, channel, detail, requested_at, reviewer, exclude, token_hash, used_by, model)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+        )
+        .run(
+          project,
+          pr,
+          headSha,
+          slot,
+          round,
+          channel,
+          detail,
+          at,
+          assignment?.reviewer ?? null,
+          JSON.stringify(assignment?.exclude ?? []),
+          assignment?.tokenHash ?? null,
+          assignment?.model ?? null,
+        );
+      return round;
+    })();
+  }
+
+  /** The request's outcome once it was handed on: how, and to whom (a reviewer is bound only once). */
+  completeRequest(
+    project: string,
+    pr: number,
+    headSha: string,
+    slot: number,
+    round: number,
+    outcome: { channel: string; detail: string; reviewer: string | null; model: string | null },
   ): void {
     this.db
       .prepare(
-        `INSERT OR REPLACE INTO review_requests
-           (project, pr, head_sha, slot, channel, detail, requested_at, reviewer, exclude, token_hash, used_by, model)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+        `UPDATE review_requests SET channel = ?, detail = ?, reviewer = COALESCE(reviewer, ?), model = COALESCE(model, ?)
+         WHERE project = ? AND pr = ? AND head_sha = ? AND slot = ? AND round = ?`,
       )
-      .run(
-        project,
-        pr,
-        headSha,
-        slot,
-        channel,
-        detail,
-        at,
-        assignment?.reviewer ?? null,
-        JSON.stringify(assignment?.exclude ?? []),
-        assignment?.tokenHash ?? null,
-        assignment?.model ?? null,
-      );
+      .run(outcome.channel, outcome.detail, outcome.reviewer, outcome.model, project, pr, headSha, slot, round);
   }
 
   /**
    * A new token (by its hash) for an unused agent request, bound to the agent
    * now given the review: the previous token stops working. False when the
-   * request was used or doesn't exist.
+   * round was used or doesn't exist.
    */
   reissueRequest(
     project: string,
     pr: number,
     headSha: string,
     slot: number,
+    round: number,
     issue: { reviewer: string; tokenHash: string; model: string | null; detail: string },
   ): boolean {
     const result = this.db
       .prepare(
         `UPDATE review_requests SET reviewer = ?, token_hash = ?, model = ?, detail = ?
-         WHERE project = ? AND pr = ? AND head_sha = ? AND slot = ? AND used_by IS NULL AND token_hash IS NOT NULL`,
+         WHERE project = ? AND pr = ? AND head_sha = ? AND slot = ? AND round = ? AND used_by IS NULL AND token_hash IS NOT NULL`,
       )
-      .run(issue.reviewer, issue.tokenHash, issue.model, issue.detail, project, pr, headSha, slot);
+      .run(issue.reviewer, issue.tokenHash, issue.model, issue.detail, project, pr, headSha, slot, round);
     return result.changes > 0;
   }
 
@@ -803,41 +877,76 @@ export class ReviewStore {
 
   // ============ REVIEWS BY AGENTS ============
 
-  saveAgentAssignment(record: AgentAssignmentRecord): void {
-    this.db
-      .prepare(
-        `INSERT OR REPLACE INTO review_agent_assignments
-           (project, pr, head_sha, slot, state, agent, run_id, chain_id, attempts, not_before, detail, spec, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        record.project,
-        record.pr,
-        record.headSha,
-        record.slot,
-        record.state,
-        record.agent,
-        record.runId,
-        record.chainId,
-        record.attempts,
-        record.notBefore,
-        record.detail,
-        JSON.stringify(record.spec),
-        record.updatedAt,
-      );
+  /**
+   * Save one round's agent assignment. `bind`: in the same transaction, the
+   * request of that round is bound to the agent whose run was started (and
+   * the model it runs on), so the two never disagree.
+   */
+  saveAgentAssignment(record: AgentAssignmentRecord, bind?: { reviewer: string; model: string | null }): void {
+    this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT OR REPLACE INTO review_agent_assignments
+             (project, pr, head_sha, slot, round, state, agent, run_id, chain_id, attempts, not_before, detail, spec, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          record.project,
+          record.pr,
+          record.headSha,
+          record.slot,
+          record.round,
+          record.state,
+          record.agent,
+          record.runId,
+          record.chainId,
+          record.attempts,
+          record.notBefore,
+          record.detail,
+          JSON.stringify(record.spec),
+          record.updatedAt,
+        );
+      if (bind) {
+        this.db
+          .prepare(
+            `UPDATE review_requests SET reviewer = COALESCE(reviewer, ?), model = ?
+             WHERE project = ? AND pr = ? AND head_sha = ? AND slot = ? AND round = ? AND used_by IS NULL`,
+          )
+          .run(bind.reviewer, bind.model, record.project, record.pr, record.headSha, record.slot, record.round);
+      }
+    })();
   }
 
+  /** The latest round's agent assignment for one slot at one head. */
   getAgentAssignment(project: string, pr: number, headSha: string, slot: number): AgentAssignmentRecord | null {
     const row = this.db
-      .prepare(`SELECT * FROM review_agent_assignments WHERE project = ? AND pr = ? AND head_sha = ? AND slot = ?`)
+      .prepare(
+        `SELECT * FROM review_agent_assignments WHERE project = ? AND pr = ? AND head_sha = ? AND slot = ?
+         ORDER BY round DESC LIMIT 1`,
+      )
       .get(project, pr, headSha, slot) as AgentAssignmentRow | undefined;
     return row ? agentAssignmentOf(row) : null;
   }
 
-  /** A PR's agent assignments at one head, by slot. */
+  /** One round's agent assignment, or null. */
+  agentAssignmentOfRound(project: string, pr: number, headSha: string, slot: number, round: number): AgentAssignmentRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM review_agent_assignments WHERE project = ? AND pr = ? AND head_sha = ? AND slot = ? AND round = ?`,
+      )
+      .get(project, pr, headSha, slot, round) as AgentAssignmentRow | undefined;
+    return row ? agentAssignmentOf(row) : null;
+  }
+
+  /** A PR's agent assignments at one head: each slot's latest round, by slot. */
   agentAssignments(project: string, pr: number, headSha: string): AgentAssignmentRecord[] {
     const rows = this.db
-      .prepare(`SELECT * FROM review_agent_assignments WHERE project = ? AND pr = ? AND head_sha = ? ORDER BY slot`)
+      .prepare(
+        `SELECT * FROM review_agent_assignments a WHERE project = ? AND pr = ? AND head_sha = ?
+           AND round = (SELECT MAX(round) FROM review_agent_assignments b
+                        WHERE b.project = a.project AND b.pr = a.pr AND b.head_sha = a.head_sha AND b.slot = a.slot)
+         ORDER BY slot`,
+      )
       .all(project, pr, headSha) as AgentAssignmentRow[];
     return rows.map(agentAssignmentOf);
   }
@@ -871,14 +980,19 @@ export class ReviewStore {
     return row ? assignmentOf(row) : null;
   }
 
-  /** Bind an assignment to the reviewer who used it (the first use binds an unnamed one). */
-  markAssignmentUsed(project: string, pr: number, headSha: string, slot: number, reviewer: string): void {
-    this.db
+  /**
+   * Use an assignment, once: bind it to the reviewer (the first use binds an
+   * unnamed one) and mark it used. False when it was used already, so a token
+   * never counts twice, even for two requests at once.
+   */
+  markAssignmentUsed(project: string, pr: number, headSha: string, slot: number, round: number, reviewer: string): boolean {
+    const result = this.db
       .prepare(
         `UPDATE review_requests SET reviewer = COALESCE(reviewer, ?), used_by = ?
-         WHERE project = ? AND pr = ? AND head_sha = ? AND slot = ?`,
+         WHERE project = ? AND pr = ? AND head_sha = ? AND slot = ? AND round = ? AND used_by IS NULL`,
       )
-      .run(reviewer, reviewer, project, pr, headSha, slot);
+      .run(reviewer, reviewer, project, pr, headSha, slot, round);
+    return result.changes > 0;
   }
 
   // ============ SIGNED GATE RESULTS ============

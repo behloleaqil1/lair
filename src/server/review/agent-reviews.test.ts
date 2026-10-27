@@ -1,18 +1,19 @@
 /**
  * Reviews by agents, end to end: the real ReviewManager (routes, service,
  * store, policy, the agent assigner) on top of the real AgentsManager
- * (service, store, claims, run environment), and the reviewer's
- * `lair review submit` (src/cli/review-submit.ts) posting over HTTP to a
- * listening Fastify server. Only the boundaries are stand-ins: the process
- * spawner and table and the clock (testing/agent-fakes.ts), and the git
- * host's API (testing/fakes.ts). Assertions are on what was spawned (argv,
- * environment, prompt file), what the stores hold, and what the API reports.
+ * (service, store, claims, run environment, failover), the real Decision
+ * Inbox, and the reviewer's `lair review submit` (src/cli/review-submit.ts)
+ * posting over HTTP to a listening Fastify server. Only the boundaries are
+ * stand-ins: the process spawner and table and the clock
+ * (testing/agent-fakes.ts), and the git host's API (testing/fakes.ts).
+ * Assertions are on what was spawned (argv, environment, prompt file, the
+ * signals sent), what the stores hold, and what the APIs report.
  */
 import { afterEach, describe, expect, it } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
 import Database from "better-sqlite3";
 import { createHash } from "crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "fs";
 import { createServer } from "net";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -22,18 +23,22 @@ import type { AgentAdapter, ProjectConfig } from "../../shared/types.js";
 import type { PrReviewStatus } from "../../shared/review-types.js";
 import { AgentsManager } from "../agents/service.js";
 import { NodeFileSystem } from "../watchdog/probes.js";
-import { HumanAuth, registerOwnerRoutes } from "../human-auth/index.js";
+import { HumanAuth, OWNER_SESSION_HEADER, registerOwnerRoutes } from "../human-auth/index.js";
+import { mountDecisions, type DecisionInbox } from "../decisions/index.js";
+import { slotMismatch } from "../policy/reviewer-slots.js";
 import { EXIT_OK, EXIT_REFUSED, EXIT_USAGE, parseFindings, reviewSubmit } from "../../cli/review-submit.js";
 import { ReviewManager } from "./service.js";
 import { registerReviewRoutes } from "./routes.js";
 import { parseReviewConfig } from "./config.js";
 import { reviewTaskId } from "./agent-assigner.js";
+import { inboxDecisionSink, type ReviewerRuns } from "./ports.js";
 import { FINDINGS_FORMAT, fillTemplate, invalidValue } from "./prompt.js";
 import { FakeRemote, fakeGitHubApi, type FakeFile, type Person } from "./testing/fakes.js";
 import { FakeProcessTable, FakeSpawner, NoCommands, SharedClock, type SpawnCall } from "./testing/agent-fakes.js";
 
 const NOW = Date.parse("2026-03-02T12:00:00.000Z");
 const SEC = 1000;
+const MIN = 60 * SEC;
 const SELF = { pid: 100, startedAt: NOW - 3_600_000 };
 const OWNER: Person = { name: "Example Owner", email: "owner@example.com" };
 const AGENT: Person = { name: "Fleet Agent", email: "12345+fleet@users.noreply.github.com" };
@@ -74,9 +79,11 @@ const ADAPTER: AgentAdapter = {
   stop_cmd: "kill -TERM {pid}",
   status_method: "file",
   log_dir: "logs",
-} as AgentAdapter;
+};
 
 const dragon = (model: string) => ({ name: model, model, machine: "local", instructions: "", adapter: "test-cli" });
+/** A profile on another provider, for agents.fallbacks */
+const fallback = (model: string) => [{ adapter: "test-cli", model, provider: "provider-b" }];
 
 interface BootOptions {
   review?: Record<string, unknown>;
@@ -90,7 +97,10 @@ interface Stack {
   app: FastifyInstance;
   agents: AgentsManager;
   reviews: ReviewManager;
+  inbox: DecisionInbox;
   url: string;
+  /** A browser on the dashboard signed in as the owner */
+  owner: Record<string, string>;
 }
 
 interface Harness extends Stack {
@@ -102,6 +112,8 @@ interface Harness extends Stack {
   spawner: FakeSpawner;
   seen: Event[];
   config: ProjectConfig;
+  /** For each run the assigner started: was its token's hash in review.db already */
+  hashKnownAtStart: boolean[];
   restart(): Promise<void>;
 }
 
@@ -123,6 +135,24 @@ async function freePort(): Promise<number> {
   });
 }
 
+/** Rows of a query on a store file, read as another process could. */
+function query<T>(path: string, sql: string, ...params: unknown[]): T[] {
+  const db = new Database(path);
+  try {
+    return db.prepare(sql).all(...params) as T[];
+  } finally {
+    db.close();
+  }
+}
+
+/** Every row of every table, as text: what a process that can read the file could find in it. */
+function dbText(path: string): string {
+  const tables = query<{ name: string }>(path, `SELECT name FROM sqlite_master WHERE type = 'table'`);
+  return tables.map((t) => `${t.name}: ${JSON.stringify(query(path, `SELECT * FROM "${t.name}"`))}`).join("\n");
+}
+
+const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+
 async function boot(options: BootOptions = {}): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), "lair-agent-reviews-"));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
@@ -133,6 +163,7 @@ async function boot(options: BootOptions = {}): Promise<Harness> {
   mkdirSync(promptsDir, { recursive: true });
   writeFileSync(join(dir, "queue.md"), "# Queue\n");
   if (options.template !== null) writeFileSync(join(promptsDir, "review-prompt.md"), options.template ?? TEMPLATE);
+  const reviewDb = join(dir, "data", "review.db");
 
   const remote = new FakeRemote("example-org/demo");
   const base = remote.commit([], OWNER, "initial");
@@ -164,6 +195,7 @@ async function boot(options: BootOptions = {}): Promise<Harness> {
       "rev-b": dragon("model-b"),
       "rev-c": dragon("model-a"),
       "rev-d": dragon("model-b"),
+      "rev-e": dragon("model-c"),
     },
     agent_adapters: { "test-cli": ADAPTER },
     agents: {
@@ -196,41 +228,63 @@ async function boot(options: BootOptions = {}): Promise<Harness> {
   events.on("*", (event) => {
     seen.push(event);
   });
+  const hashKnownAtStart: boolean[] = [];
 
-  /** The server as src/server/index.ts wires it: agents, then reviews with the agents module, then the routes */
+  /** The server as src/server/index.ts wires it: agents, the Decision Inbox, reviews with both, the routes */
   const start = async (): Promise<Stack> => {
     const port = await freePort();
     const url = `http://127.0.0.1:${port}`;
+    const app = Fastify();
+    const tokenPath = join(dir, "owner.token");
+    const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
+    await registerOwnerRoutes(app, auth);
     const agents = new AgentsManager({
       dbPath: join(dir, "data", "agents.db"),
       probes: { processes: procs, fs: new NodeFileSystem(), runner: new NoCommands(), clock, spawner, self: SELF },
       events,
     });
     agents.load([{ name: "demo", config }]);
+    const inbox = await mountDecisions(app, { dbPath: ":memory:", humanAuth: auth, defaultProject: () => "demo", events, clock });
+    // The real agents module, with a look at review.db as each run is requested (the token's hash must be there first)
+    const port_: ReviewerRuns = {
+      requestRun: async (project, input) => {
+        const hash = sha256(input.variables.LAIR_REVIEW_TOKEN ?? "");
+        hashKnownAtStart.push(query(reviewDb, `SELECT 1 FROM review_requests WHERE token_hash = ?`, hash).length === 1);
+        return agents.requestRun(project, input);
+      },
+      status: (project) => agents.status(project),
+      managedRuns: (project) => agents.managedRuns(project),
+      getStore: () => agents.getStore(),
+      get: (project) => agents.get(project),
+    };
     const reviews = new ReviewManager({
-      dbPath: join(dir, "data", "review.db"),
+      dbPath: reviewDb,
       events,
       clock,
       fetch: fakeGitHubApi(remote),
       env: {},
       cwd: dir,
-      agents,
+      agents: port_,
       serverUrl: url,
+      decisions: inboxDecisionSink(inbox),
       agentCheckMs: 0,
+      autoRequestMs: 0,
     });
     reviews.load([{ name: "demo", config }]);
-    const app = Fastify();
-    const auth = HumanAuth.open({ tokenPath: join(dir, "owner.token"), dbPath: ":memory:" });
-    await registerOwnerRoutes(app, auth);
     await registerReviewRoutes(app, reviews, () => "demo", auth);
     await app.listen({ port, host: "127.0.0.1" });
-    return { app, agents, reviews, url };
+    const owner = {
+      origin: "http://localhost:4777",
+      "sec-fetch-site": "same-origin",
+      [OWNER_SESSION_HEADER]: auth.createSession(readFileSync(tokenPath, "utf-8").trim())!.session,
+    };
+    return { app, agents, reviews, inbox, url, owner };
   };
 
   let stack = await start();
   const stopStack = async (s: Stack) => {
+    await s.reviews.stop();
     await s.app.close();
-    s.reviews.close();
     await s.agents.stop();
   };
   const h: Harness = {
@@ -243,6 +297,7 @@ async function boot(options: BootOptions = {}): Promise<Harness> {
     spawner,
     seen,
     config,
+    hashKnownAtStart,
     restart: async () => {
       await stopStack(stack);
       stack = await start();
@@ -257,9 +312,11 @@ async function boot(options: BootOptions = {}): Promise<Harness> {
 
 const tick = (h: Harness) => h.agents.get("demo")!.tick();
 const check = (h: Harness) => h.reviews.agentReviews!.check();
+const reviewDb = (h: Harness) => join(h.dir, "data", "review.db");
 
+/** The owner asks for the missing reviews (the dashboard's "Request missing reviews"). */
 async function requestReviews(h: Harness): Promise<{ slot: string; channel: string; detail: string }[]> {
-  const res = await h.app.inject({ method: "POST", url: "/api/review/prs/7/request-reviews?project=demo" });
+  const res = await h.app.inject({ method: "POST", url: "/api/review/prs/7/request-reviews?project=demo", headers: h.owner });
   expect(res.statusCode).toBe(200);
   return res.json().data;
 }
@@ -274,18 +331,13 @@ function promptOf(call: SpawnCall): string {
   return readFileSync(call.argv[call.argv.indexOf("--prompt") + 1], "utf-8");
 }
 
-/** Every row of every table, as text: what a process that can read the file could find in it. */
-function dbText(path: string): string {
-  const db = new Database(path);
-  try {
-    const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as { name: string }[];
-    return tables.map((t) => `${t.name}: ${JSON.stringify(db.prepare(`SELECT * FROM "${t.name}"`).all())}`).join("\n");
-  } finally {
-    db.close();
-  }
+/** A push to the PR: a new head, with a passing gate. */
+function push(h: Harness): string {
+  const pushed = h.remote.commit([h.head], AGENT, "feat: handle negatives");
+  h.remote.pushToPull(7, pushed);
+  h.remote.setChecks(pushed, [["build", "success"]]);
+  return pushed;
 }
-
-const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 
 interface Submitted {
   code: number;
@@ -318,7 +370,7 @@ async function submit(
   return { code, out, err };
 }
 
-/** Request, then the agents module's next check starts the run: the spawn it made. */
+/** The owner requests, then the agents module's next check starts the run: the spawn it made. */
 async function assignedRun(h: Harness): Promise<SpawnCall> {
   await requestReviews(h);
   const before = h.spawner.calls.length;
@@ -329,7 +381,7 @@ async function assignedRun(h: Harness): Promise<SpawnCall> {
 
 // ============ 1. ASSIGNMENT ============
 
-describe("reviews by agents: a peer slot goes to an agent Lair starts", () => {
+describe("reviews by agents: a slot goes to an agent Lair starts", () => {
   it("assigns the peer slot to a reviewer other than the author; the token is only in the run's environment", async () => {
     const h = await boot();
     const outcomes = await requestReviews(h);
@@ -353,6 +405,8 @@ describe("reviews by agents: a peer slot goes to an agent Lair starts", () => {
     expect(call.env.LAIR_URL).toBe(h.url);
     const token = call.env.LAIR_REVIEW_TOKEN;
     expect(token).toMatch(/^[A-Za-z0-9_-]{32}$/);
+    // The token's hash was in review.db before the run was requested
+    expect(h.hashKnownAtStart).toEqual([true]);
 
     // The prompt: the template verbatim except its placeholders, and no token
     const prompt = promptOf(call);
@@ -367,10 +421,10 @@ describe("reviews by agents: a peer slot goes to an agent Lair starts", () => {
     expect(call.argv.join(" ")).not.toContain(token);
     // Not in either store, nor on the event bus: the review store has its hash only
     const agentsDb = dbText(join(h.dir, "data", "agents.db"));
-    const reviewDb = dbText(join(h.dir, "data", "review.db"));
+    const reviews = dbText(reviewDb(h));
     expect(agentsDb).not.toContain(token);
-    expect(reviewDb).not.toContain(token);
-    expect(reviewDb).toContain(sha256(token));
+    expect(reviews).not.toContain(token);
+    expect(reviews).toContain(sha256(token));
     expect(h.agents.getStore()!.listRuns("demo")[0].variableNames).toEqual([
       "LAIR_REVIEW_TOKEN",
       "LAIR_REVIEW_PROJECT",
@@ -380,20 +434,19 @@ describe("reviews by agents: a peer slot goes to an agent Lair starts", () => {
     expect(h.seen.some((e) => e.type === "review.assignment_requested")).toBe(false);
   });
 
-  it("enforces different_model: never the author's model, in any profile the reviewer can fail over to", async () => {
+  it("enforces different_model both ways: no shared model in any profile of the reviewer or the author", async () => {
     const h = await boot({
       review: {
-        reviewers: { amber: [{ any_of: ["peer"], different_model: true, pool: ["rev-c", "rev-d", "rev-b"] }] },
+        reviewers: { amber: [{ any_of: ["peer"], different_model: true, pool: ["rev-c", "rev-d", "rev-e", "rev-b"] }] },
       },
-      // rev-d runs on model-b but fails over to the author's model-a
-      agents: { fallbacks: { "rev-d": [{ adapter: "test-cli", model: "model-a", provider: "provider-b" }] } },
+      // rev-d fails over to the author's model-a; the author fails over to rev-e's model-c
+      agents: { fallbacks: { "rev-d": fallback("model-a"), "worker-a": fallback("model-c") } },
     });
     const call = await assignedRun(h);
     expect(call.env.LAIR_AGENT).toBe("rev-b");
-    const assigned = (await statusOf(h)).assignments![0];
-    expect(assigned).toMatchObject({ state: "assigned", agent: "rev-b" });
+    expect((await statusOf(h)).assignments![0]).toMatchObject({ state: "assigned", agent: "rev-b" });
 
-    // The model recorded is the one Lair started rev-b on, whatever the review claims
+    // The model recorded is the one rev-b's run runs on, whatever the review claims
     const res = await h.app.inject({
       method: "POST",
       url: "/api/review/prs/7/reviews?project=demo",
@@ -411,25 +464,55 @@ describe("reviews by agents: a peer slot goes to an agent Lair starts", () => {
     expect(after.slots[0].satisfiedBy).toMatchObject({ reviewer: { id: "rev-b", model: "model-b" } });
   });
 
-  it("assigns nobody when every pooled reviewer can run on the author's model", async () => {
+  it("assigns nobody when every pooled reviewer shares a model with the author", async () => {
     const h = await boot({
-      review: { reviewers: { amber: [{ any_of: ["peer"], different_model: true, pool: ["rev-c", "rev-d"] }] } },
-      agents: { fallbacks: { "rev-d": [{ adapter: "test-cli", model: "model-a", provider: "provider-b" }] } },
+      review: { reviewers: { amber: [{ any_of: ["peer"], different_model: true, pool: ["rev-c", "rev-d", "rev-e"] }] } },
+      agents: { fallbacks: { "rev-d": fallback("model-a"), "worker-a": fallback("model-c") } },
     });
     const outcomes = await requestReviews(h);
-    expect(outcomes[0].detail).toContain("no agent can review it");
-    expect(outcomes[0].detail).toContain("rev-c: can run on the author's model model-a");
-    expect(outcomes[0].detail).toContain("rev-d: can run on the author's model model-a");
+    expect(outcomes[0].detail).toBe(
+      "no agent can review it: rev-c: it and the author can both run on model-a; " +
+        "rev-d: it and the author can both run on model-a; rev-e: it and the author can both run on model-c",
+    );
     await tick(h);
     expect(h.spawner.calls).toHaveLength(0);
     expect((await statusOf(h)).assignments).toEqual([expect.objectContaining({ state: "failed", agent: null })]);
   });
 });
 
+describe("an unknown author", () => {
+  it("blocks every agent slot, a named one too: the named agent may be the author", async () => {
+    // rev-b pushes a branch no mapping knows, and the tier names agent:rev-b
+    const h = await boot({ headRef: "rev-b/topic", review: { reviewers: { amber: ["agent:rev-b", "peer"] } } });
+    const outcomes = await requestReviews(h);
+    const why = "the PR's author is unknown (branch rev-b/topic matches no review.authors mapping (branch_pattern or branches)): no agent reviews it";
+    expect(outcomes).toEqual([
+      { slot: "agent rev-b", channel: "none", detail: why },
+      { slot: "a peer other than the author", channel: "none", detail: why },
+    ]);
+    await tick(h);
+    expect(h.spawner.calls).toHaveLength(0);
+    const status = await statusOf(h);
+    expect(status.author).toBeNull();
+    expect(status.authorNote).toBe("branch rev-b/topic matches no review.authors mapping (branch_pattern or branches)");
+    expect(status.slots[0].detail).toContain("the PR's author is unknown");
+    expect(status.assignments).toEqual([]);
+
+    // And the policy never counts such a review, however it came in
+    const approval = { id: "rv-x", reviewer: { id: "rev-b", kind: "agent" as const }, verdict: "approve" as const, headSha: h.head, superseded: false };
+    expect(slotMismatch({ anyOf: [{ kind: "agent", agent: "rev-b" }], differentModel: false }, approval, null, h.head)).toBe(
+      "the PR's author is unknown",
+    );
+    expect(
+      slotMismatch({ anyOf: [{ kind: "agent", agent: "rev-b" }], differentModel: false }, approval, { id: "worker-a", kind: "agent" }, h.head),
+    ).toBeNull();
+  });
+});
+
 // ============ 2. THE REVIEWER'S SUBMIT ============
 
 describe("lair review submit: the reviewer's review fills the slot", () => {
-  it("posts with the run's environment; the slot is filled, the assignment reviewed, and the token never printed", async () => {
+  it("posts with the run's environment; the slot is filled once, and the token never printed", async () => {
     const h = await boot();
     const call = await assignedRun(h);
     const token = call.env.LAIR_REVIEW_TOKEN;
@@ -447,6 +530,14 @@ describe("lair review submit: the reviewer's review fills the slot", () => {
     ]);
     expect(status.reasons.join("\n")).not.toContain("Required reviews");
 
+    // The token counts once: a second review with it (a stolen copy, say) is refused
+    const again = await submit(h, call.env, { verdict: "request_changes" });
+    expect(again.code).toBe(EXIT_REFUSED);
+    expect(again.err[0]).toBe(
+      "lair review submit: refused (HTTP 403): This assignment was already used (by rev-b): a token counts for one review",
+    );
+    expect((await statusOf(h)).reviews.filter((r) => r.reviewer.id === "rev-b")).toHaveLength(1);
+
     // The run ends; the assignment is reviewed and the agent free again
     h.spawner.exit(call.pid, 0);
     await tick(h);
@@ -455,6 +546,20 @@ describe("lair review submit: the reviewer's review fills the slot", () => {
       expect.objectContaining({ state: "reviewed", agent: "rev-b", detail: "reviewed by rev-b" }),
     ]);
     expect(h.agents.managedRuns("demo").has("rev-b")).toBe(false);
+  });
+
+  it("takes a review only while the run it was given to is running", async () => {
+    const h = await boot();
+    const call = await assignedRun(h);
+    // The run ends before anyone used its token (a copy of the token outlives it)
+    h.spawner.exit(call.pid, 0);
+    await tick(h);
+    const late = await submit(h, call.env);
+    expect(late.code).toBe(EXIT_REFUSED);
+    expect(late.err[0]).toBe(
+      "lair review submit: refused (HTTP 403): The review run this assignment was given to is not running: its token no longer counts",
+    );
+    expect((await statusOf(h)).slots[0].satisfiedBy).toBeNull();
   });
 
   it("request_changes: every finding blocks; a malformed findings file sends nothing", async () => {
@@ -479,7 +584,7 @@ describe("lair review submit: the reviewer's review fills the slot", () => {
     expect(status.canMerge).toBe(false);
   });
 
-  it("refuses a wrong token, another agent's token and the author's use of it", async () => {
+  it("refuses a wrong token, a reviewer id other than the assignment's, and the author's use of it", async () => {
     const h = await boot();
     const call = await assignedRun(h);
     const forged = "f".repeat(32);
@@ -498,13 +603,37 @@ describe("lair review submit: the reviewer's review fills the slot", () => {
     const status = await statusOf(h);
     expect(status.slots[0].satisfiedBy).toBeNull();
     expect(status.reviews.filter((r) => r.reviewer.kind === "agent")).toEqual([]);
+    // None of them used the token up: the reviewer still can
+    expect((await submit(h, call.env)).code).toBe(EXIT_OK);
+  });
+
+  it("records the model of the profile that actually ran, after a failover", async () => {
+    // rev-d runs on model-b and fails over to model-a
+    const h = await boot({ review: { reviewers_pool: { amber: ["rev-d"] } }, agents: { fallbacks: { "rev-d": fallback("model-a") } } });
+    const first = await assignedRun(h);
+    expect(first.argv).toContain("model-b");
+    appendFileSync(first.logPath, "API error: rate limit exceeded, retry later\n");
+    utimesSync(first.logPath, new Date(NOW), new Date(NOW));
+    h.clock.t = NOW + 121 * SEC;
+    await tick(h); // the log ends on a rate limit: stop it and fail over
+    await tick(h); // the next profile's run is queued
+    await tick(h); // and starts
+    expect(h.spawner.calls).toHaveLength(2);
+    const second = h.spawner.calls[1];
+    expect(second.argv).toContain("model-a");
+    // The same chain, so the same run variables
+    expect(second.env.LAIR_REVIEW_TOKEN).toBe(first.env.LAIR_REVIEW_TOKEN);
+    const result = await submit(h, second.env);
+    expect(result.code).toBe(EXIT_OK);
+    const review = (await statusOf(h)).reviews.find((r) => r.reviewer.id === "rev-d")!;
+    expect(review.reviewer).toEqual({ id: "rev-d", kind: "agent", model: "model-a" });
   });
 });
 
 // ============ 3. RETRY, THEN A DECISION ============
 
 describe("a reviewer run that ends without a review", () => {
-  it("is retried with backoff and a new token by another agent, then the owner is asked", async () => {
+  it("is retried with backoff and a new token by another agent, then the owner is asked in the Decision Inbox", async () => {
     const h = await boot();
     const first = await assignedRun(h);
     expect(first.env.LAIR_AGENT).toBe("rev-b");
@@ -527,6 +656,7 @@ describe("a reviewer run that ends without a review", () => {
     const second = h.spawner.calls[1];
     expect(second.env.LAIR_AGENT).toBe("rev-c");
     expect(second.env.LAIR_REVIEW_TOKEN).not.toBe(first.env.LAIR_REVIEW_TOKEN);
+    expect(h.hashKnownAtStart).toEqual([true, true]);
     // The first token stopped working
     const late = await submit(h, first.env);
     expect(late.code).toBe(EXIT_REFUSED);
@@ -538,23 +668,45 @@ describe("a reviewer run that ends without a review", () => {
     const failed = (await statusOf(h)).assignments![0];
     expect(failed.state).toBe("failed");
     expect(failed.detail).toContain("no review after 2 run(s)");
-    expect(failed.detail).toContain("the owner was asked (event:review.decision_requested)");
-    const decisions = h.seen.filter((e) => e.type === "review.decision_requested");
+    expect(failed.detail).toContain("the owner was asked (decision inbox (");
+    // One item in the Decision Inbox, from the review module
+    const decisions = h.inbox.list({ project: "demo" });
     expect(decisions).toHaveLength(1);
-    expect(decisions[0].data).toMatchObject({
-      project: "demo",
-      question: `No agent reviewed PR #7 at ${h.head.slice(0, 7)} after 2 run(s)`,
+    expect(decisions[0]).toMatchObject({
       kind: "escalation",
-      requestedBy: "review",
+      status: "open",
+      title: `No agent reviewed PR #7 at ${h.head.slice(0, 7)} after 2 run(s)`,
+      source: { module: "review" },
       links: [{ label: "PR #7", url: "https://github.com/example-org/demo/pull/7" }],
     });
-    expect(String(decisions[0].data.context)).toContain("Reviewers tried: rev-b, rev-c.");
-    // Nothing more starts on its own; asking again (the owner) starts a new round
+    expect(decisions[0].context).toContain("Reviewers tried: rev-b, rev-c.");
+    expect(decisions[0].options.map((o) => o.label)).toEqual(["Review it yourself", "Request agent reviews again"]);
+    await check(h); // raised once
+    expect(h.inbox.list({ project: "demo" })).toHaveLength(1);
+
+    // Nothing more starts on its own: the automatic scan doesn't start a new round, the owner does
+    await h.reviews.requestOpenPullRequests();
     await check(h);
     await tick(h);
     expect(h.spawner.calls).toHaveLength(2);
     const again = await requestReviews(h);
     expect(again[0]).toMatchObject({ channel: "agents", detail: expect.stringContaining("rev-b: run ") });
+    // Round 1 is kept next to round 2
+    expect(
+      query<{ round: number; reviewer: string; used_by: string | null }>(
+        reviewDb(h),
+        `SELECT round, reviewer, used_by FROM review_requests WHERE pr = 7 ORDER BY round`,
+      ),
+    ).toEqual([
+      { round: 1, reviewer: "rev-c", used_by: null },
+      { round: 2, reviewer: "rev-b", used_by: null },
+    ]);
+    expect(
+      query<{ round: number; state: string }>(reviewDb(h), `SELECT round, state FROM review_agent_assignments WHERE pr = 7 ORDER BY round`),
+    ).toEqual([
+      { round: 1, state: "failed" },
+      { round: 2, state: "assigned" },
+    ]);
   });
 
   it("after a restart: a run that hadn't started ends (its token was only in memory) and is assigned again", async () => {
@@ -581,6 +733,22 @@ describe("a reviewer run that ends without a review", () => {
     const result = await submit(h, call.env);
     expect(result.code).toBe(EXIT_OK);
     expect((await statusOf(h)).slots[0].satisfiedBy).not.toBeNull();
+  });
+
+  it("a config reload of both modules keeps a queued review run and its token", async () => {
+    const h = await boot();
+    await requestReviews(h);
+    await h.agents.reloadProject({ name: "demo", config: h.config });
+    await h.reviews.reloadProject({ name: "demo", config: h.config });
+    await tick(h);
+    expect(h.spawner.calls).toHaveLength(1);
+    const call = h.spawner.calls[0];
+    expect(call.env.LAIR_REVIEW_TOKEN).toMatch(/^[A-Za-z0-9_-]{32}$/);
+    await check(h);
+    expect((await statusOf(h)).assignments![0]).toMatchObject({ state: "assigned", agent: "rev-b" });
+    expect((await submit(h, call.env)).code).toBe(EXIT_OK);
+    await check(h);
+    expect((await statusOf(h)).assignments![0]).toMatchObject({ state: "reviewed", agent: "rev-b" });
   });
 });
 
@@ -632,7 +800,70 @@ describe("no double assignment", () => {
   });
 });
 
-// ============ 5. AUTHORS ============
+// ============ 5. WHO ASKS, AND THE PR MOVING ON ============
+
+describe("asking for reviews", () => {
+  it("is the owner's over HTTP", async () => {
+    const h = await boot();
+    for (const headers of [{}, { origin: "http://localhost:4777", "sec-fetch-site": "same-origin" }]) {
+      const res = await h.app.inject({ method: "POST", url: "/api/review/prs/7/request-reviews?project=demo", headers });
+      expect(res.statusCode).toBe(403);
+    }
+    await tick(h);
+    expect(h.spawner.calls).toHaveLength(0);
+    expect((await statusOf(h)).assignments).toEqual([]);
+  });
+
+  it("happens on its own for a new PR or head, at most once per PR in 5 minutes", async () => {
+    const h = await boot();
+    await h.reviews.requestOpenPullRequests();
+    await tick(h);
+    expect(h.spawner.calls.map((c) => c.env.LAIR_TASK)).toEqual([`review-7-${h.head.slice(0, 8)}`]);
+    await h.reviews.requestOpenPullRequests(); // the same head: nothing new
+    await tick(h);
+    expect(h.spawner.calls).toHaveLength(1);
+
+    // A push a minute later: the old head's review stops; the new head waits for the rate limit
+    h.clock.t = NOW + MIN;
+    const pushed = push(h);
+    await h.reviews.requestOpenPullRequests();
+    await check(h);
+    await tick(h);
+    expect(h.spawner.calls).toHaveLength(1);
+    expect(h.spawner.kills).toEqual([{ pid: h.spawner.calls[0].pid, signal: "SIGTERM" }]);
+
+    h.clock.t = NOW + 6 * MIN;
+    await h.reviews.requestOpenPullRequests();
+    await tick(h);
+    expect(h.spawner.calls.map((c) => c.env.LAIR_TASK)).toEqual([
+      `review-7-${h.head.slice(0, 8)}`,
+      `review-7-${pushed.slice(0, 8)}`,
+    ]);
+  });
+});
+
+describe("the PR moving on", () => {
+  it("makes the assignment stale and stops its running review", async () => {
+    const h = await boot();
+    const call = await assignedRun(h);
+    push(h);
+    await statusOf(h); // Lair sees the new head
+    await check(h);
+    const [row] = query<{ state: string; detail: string }>(
+      reviewDb(h),
+      `SELECT state, detail FROM review_agent_assignments WHERE pr = 7 AND head_sha = ?`,
+      h.head,
+    );
+    expect(row.state).toBe("stale");
+    expect(row.detail).toMatch(/^the PR moved to \w{7}: nothing more is started for \w{7}; its run \w{8} was stopped \(claim released\)$/);
+    await tick(h);
+    expect(h.spawner.kills).toEqual([{ pid: call.pid, signal: "SIGTERM" }]);
+    // Its token no longer counts either
+    expect((await submit(h, call.env)).code).toBe(EXIT_REFUSED);
+  });
+});
+
+// ============ 6. AUTHORS ============
 
 describe("author mapping", () => {
   const tasks = [
@@ -658,23 +889,41 @@ describe("author mapping", () => {
     expect(status.authorSource).toBe("branch");
   });
 
-  it("maps a branch through the agents fill tasks file", async () => {
-    const login = await authorFor("team/login", { from_tasks_file: true });
-    expect(login.status.author).toMatchObject({ id: "worker-a" });
-    expect(login.status.authorSource).toBe("tasks_file");
-    const cache = await authorFor("fix/cache-ttl", { from_tasks_file: true });
-    expect(cache.status.author).toMatchObject({ id: "rev-b" });
+  it("lets the tasks file narrow two branch matches to one, and confirm a single one", async () => {
+    const narrowed = await authorFor("team/login", {
+      from_tasks_file: true,
+      branches: { "team/**": "worker-a", "team/l*": "rev-c" },
+    });
+    expect(narrowed.status.author).toMatchObject({ id: "worker-a" });
+    expect(narrowed.status.authorSource).toBe("tasks_file");
+    const confirmed = await authorFor("fix/cache-ttl", { from_tasks_file: true, branches: { "fix/**": "rev-b" } });
+    expect(confirmed.status.author).toMatchObject({ id: "rev-b" });
+    expect(confirmed.status.authorSource).toBe("branch");
   });
 
-  it("refuses ambiguous matches: the author stays unknown, and no peer review starts", async () => {
-    const twoLines = await authorFor("team/shared", { from_tasks_file: true });
+  it("never takes the author from the tasks file alone (agents can write it)", async () => {
+    const { h, status } = await authorFor("fix/cache-ttl", { from_tasks_file: true });
+    expect(status.author).toBeNull();
+    expect(status.authorNote).toBe(
+      "branch fix/cache-ttl matches no review.authors mapping; the tasks file names rev-b (tasks file line 3), " +
+        "but it only confirms a mapping (agents can write it), so the author stays unknown",
+    );
+    const outcomes = await requestReviews(h);
+    expect(outcomes[0]).toMatchObject({ channel: "none" });
+    await tick(h);
+    expect(h.spawner.calls).toHaveLength(0);
+  });
+
+  it("refuses ambiguous and contradicting matches: the author stays unknown, and no review starts", async () => {
+    const twoLines = await authorFor("team/shared", { from_tasks_file: true, branches: { "team/**": "worker-a" } });
     expect(twoLines.status.author).toBeNull();
     expect(twoLines.status.authorNote).toBe(
-      "ambiguous: branch team/shared matches worker-a (tasks file line 4), rev-c (tasks file line 5), so the author stays unknown",
+      'ambiguous: branch team/shared matches worker-a (review.authors.branches "team/**"), worker-a (tasks file line 4), ' +
+        "rev-c (tasks file line 5), so the author stays unknown",
     );
-    const sources = await authorFor("fix/cache-ttl", { from_tasks_file: true, branches: { "fix/**": "worker-a" } });
-    expect(sources.status.author).toBeNull();
-    expect(sources.status.authorNote).toContain('worker-a (review.authors.branches "fix/**"), rev-b (tasks file line 3)');
+    const contradicting = await authorFor("fix/cache-ttl", { from_tasks_file: true, branches: { "fix/**": "worker-a" } });
+    expect(contradicting.status.author).toBeNull();
+    expect(contradicting.status.authorNote).toContain('worker-a (review.authors.branches "fix/**"), rev-b (tasks file line 3)');
     const globs = await authorFor("team/login", { branches: { "team/**": "worker-a", "team/log?n": "rev-b" } });
     expect(globs.status.author).toBeNull();
 
@@ -685,7 +934,7 @@ describe("author mapping", () => {
   });
 });
 
-// ============ 6. THE PROMPT TEMPLATE ============
+// ============ 7. THE PROMPT TEMPLATE ============
 
 describe("the prompt template", () => {
   it("is a file name in prompts_dir: a path is a config error", () => {

@@ -41,7 +41,7 @@ import { DeliveryManager, registerDeliveryRoutes } from "./delivery/index.js";
 import { PipelineManager, registerPipelineRoutes } from "./gates/index.js";
 import { AgentsManager, registerAgentsRoutes } from "./agents/index.js";
 import { getBudgetManager } from "./fleet/budget.js";
-import { ReviewManager, registerReviewRoutes } from "./review/index.js";
+import { ReviewManager, inboxDecisionSink, registerReviewRoutes } from "./review/index.js";
 import { mountTriage } from "./triage/index.js";
 import { PlacementManager, registerPlacementRoutes } from "./placement/index.js";
 import { ConfigReloader, registerReloadRoutes, serverModules } from "./reload/index.js";
@@ -445,12 +445,14 @@ const decisionInbox = await mountDecisions(fastify, {
 });
 
 // Reviews and policy merge: one per project with `review.enabled: true`;
-// with review.prompt_file, reviews by agents the agents module starts
+// with review.prompt_file, reviews by agents the agents module starts.
+// Its decisions (a human review, a refused merge, no agent review) go to the Decision Inbox
 const reviews = new ReviewManager({
   dbPath: join(process.cwd(), "data", "review.db"),
   events: getEventBus(),
   agents,
   serverUrl: dashboardUrlFor(HOST, PORT),
+  decisions: inboxDecisionSink(decisionInbox),
 });
 reviews.load(projectEntries);
 // Merges, human reviews, finding resolutions and hold releases need the owner's session

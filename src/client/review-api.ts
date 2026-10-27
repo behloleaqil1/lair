@@ -78,7 +78,7 @@ export function mergePr(project: string, pr: number, headSha: string, by: string
   return fetchApi<MergeResponse>(`/api/review/prs/${pr}/merge${query(project)}`, post({ confirm: true, head_sha: headSha, by }, true));
 }
 
-/** Ask the assigner and the Decision Inbox for the missing reviews (no owner session needed). */
+/** Ask the assigner and the Decision Inbox for the missing reviews (owner only: it can start reviewer runs). */
 export function requestReviews(project: string, pr: number): Promise<{ slot: string; channel: string; detail: string }[]> {
-  return fetchApi<{ slot: string; channel: string; detail: string }[]>(`/api/review/prs/${pr}/request-reviews${query(project)}`, post({}, false));
+  return fetchApi<{ slot: string; channel: string; detail: string }[]>(`/api/review/prs/${pr}/request-reviews${query(project)}`, post({}, true));
 }

@@ -7,7 +7,7 @@
  *   GET  /api/review/prs/:number                tier, required vs present reviews, findings, gate, conditions, plan
  *   POST /api/review/prs/:number/reviews        an agent's review {reviewer, head_sha, verdict, summary, findings[], assignment_token}
  *   POST /api/review/prs/:number/owner-review   owner: a human review {reviewer, head_sha, verdict, summary, findings[]}
- *   POST /api/review/prs/:number/request-reviews
+ *   POST /api/review/prs/:number/request-reviews owner: ask for the missing reviews at the head
  *   POST /api/review/prs/:number/merge          owner: {confirm: true, head_sha, by?}
  *   POST /api/review/findings/:id/resolve       owner: {by, status?, note}
  *   GET  /api/review/holds
@@ -278,10 +278,11 @@ export async function registerReviewRoutes(
       );
     });
 
-    app.post("/api/review/prs/:number/request-reviews", async (request, reply) => {
+    // Asking can start reviewer runs (spend): the owner's only; reviews by agents also ask in-process
+    app.post("/api/review/prs/:number/request-reviews", owner, async (request, reply) => {
       const n = prNumber(request.params);
       if (n === null) return fail(reply, 400, "Invalid PR number");
-      return withService(request.query, reply, (service) => service.requestReviews(n));
+      return withService(request.query, reply, (service) => service.requestReviews(n, "owner"));
     });
 
     app.post("/api/review/prs/:number/merge", owner, async (request, reply) => {

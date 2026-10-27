@@ -217,7 +217,7 @@ export interface PrReviewStatus {
   baseRef: string;
   defaultBranch: string | null;
   author: ReviewerRef | null;
-  /** Where the author came from: registered with Lair, the branch name (pattern or map), or the agents fill tasks file */
+  /** Where the author came from: registered with Lair, the branch name (pattern or map), or those narrowed by the tasks file */
   authorSource: "lair" | "branch" | "tasks_file" | null;
   /** Why the author is unknown when a mapping didn't settle it (e.g. two agents match the branch) */
   authorNote?: string | null;

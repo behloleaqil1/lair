@@ -1939,11 +1939,18 @@ export class AgentsService {
     });
   }
 
+  /** A config reload: take over the run variables of the service this one replaces (same project, same store). */
+  adoptModuleVariables(previous: AgentsService): void {
+    for (const [chain, vars] of previous.moduleVars) this.moduleVars.set(chain, vars);
+    previous.moduleVars.clear();
+  }
+
   /**
    * Release a task's claim. A running run notices on the next tick and stops
-   * itself; a run that hasn't started yet ends now.
+   * itself; a run that hasn't started yet ends now. `why`: who asked, when
+   * not the owner through the API (an in-process module).
    */
-  releaseClaim(task: string): Promise<{ task: string; runId: string; runState: string | null }> {
+  releaseClaim(task: string, why?: string): Promise<{ task: string; runId: string; runState: string | null }> {
     return this.exclusive(async () => {
       if (this.readOnly) throw new AgentsError(403, "The project is read_only");
       const claim = this.store.getClaim(this.project, task);
@@ -1958,8 +1965,8 @@ export class AgentsService {
           runId: claim.runId,
           subject: task,
           summary: `released the claim on ${task} (run ${short(claim.runId)}) on request`,
-          evidence: ["released through the API (Agents view)"],
-          data: { by: "request", ownerPid: claim.ownerPid },
+          evidence: [why ? `released by ${oneLine(why, 200)}` : "released through the API (Agents view)"],
+          data: { by: why ? "module" : "request", ownerPid: claim.ownerPid },
         },
         now,
       );
@@ -2463,6 +2470,8 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
     this.load([entry]);
     const next = this.services.get(entry.name);
     if (!next) return;
+    // The runs go on in the same store: their in-memory run variables go on with them
+    if (old) next.adoptModuleVariables(old);
     try {
       this.follow(entry.name, next);
       if (this.inPhase("started")) next.start();

@@ -7,10 +7,12 @@
  * - review.authors.from_tasks_file: the agents fill tasks file
  *   (`<agent>|<name>|<task>|<description>` lines), whose description names the
  *   line's branch as `(branch: <name>)` or as a `(<prefix>/<topic>)` token.
+ *   Agents can write that file, so it only confirms the other two: it may
+ *   narrow their matches, never decide the author alone.
  *
- * Every source that matches is asked, and when they name different agents
- * the author stays unknown: an unknown author only holds the PR back, a wrong
- * one lets the author review its own work.
+ * When they name different agents the author stays unknown: an unknown
+ * author only holds the PR back, a wrong one lets the author review its own
+ * work.
  *
  * Globs are matched without regular expressions (a table over the glob and
  * the name, so no pattern can backtrack), and the tasks file is read bounded
@@ -173,54 +175,73 @@ export interface AuthorMapping {
 
 export interface MappedAuthor {
   agent: string | null;
+  /** branch: branch_pattern or branches decided it; tasks_file: the tasks file narrowed what they matched */
   source: "branch" | "tasks_file" | null;
-  /** Why it is unknown when a source matched or failed (ambiguous, the tasks file unreadable) */
+  /** Why the author is unknown (nothing matched, ambiguous, the tasks file alone), or a tasks file problem */
   note: string | null;
 }
 
 /**
- * The agent a branch belongs to, by every configured mapping. Two sources (or
- * two entries of one) naming different agents leave it unknown, with a note.
+ * The agent a branch belongs to. branch_pattern and branches decide it; the
+ * tasks file, which agents can write, only confirms them: it may narrow
+ * several matches down to one, never name an author on its own, and a line
+ * naming another agent than the one they matched leaves the author unknown.
  */
 export function mapAuthor(
   mapping: AuthorMapping,
   branch: string,
   config: Pick<ProjectConfig, "agents" | "repo">,
 ): MappedAuthor {
-  if (branch.length > MAX_BRANCH_CHARS) return { agent: null, source: null, note: null };
-  const found: { agent: string; source: "branch" | "tasks_file"; why: string }[] = [];
-  const notes: string[] = [];
-  const fromPattern = mapping.branchPattern?.exec(branch)?.groups?.agent;
-  if (fromPattern) found.push({ agent: fromPattern, source: "branch", why: "review.authors.branch_pattern" });
-  for (const entry of mapping.branches) {
-    if (globMatches(entry, branch)) {
-      found.push({ agent: entry.agent, source: "branch", why: `review.authors.branches "${entry.glob}"` });
-    }
+  if (branch.length > MAX_BRANCH_CHARS) {
+    return { agent: null, source: null, note: `the branch name is longer than ${MAX_BRANCH_CHARS} characters` };
   }
+  const found: { agent: string; why: string }[] = [];
+  const fromPattern = mapping.branchPattern?.exec(branch)?.groups?.agent;
+  if (fromPattern) found.push({ agent: fromPattern, why: "review.authors.branch_pattern" });
+  for (const entry of mapping.branches) {
+    if (globMatches(entry, branch)) found.push({ agent: entry.agent, why: `review.authors.branches "${entry.glob}"` });
+  }
+  const listed: { agent: string; why: string }[] = [];
+  let tasksProblem: string | null = null;
   if (mapping.fromTasksFile) {
     const path = tasksFilePath(config);
     if (!path) {
-      notes.push("review.authors.from_tasks_file: no agents.fill.tasks_file is configured");
+      tasksProblem = "review.authors.from_tasks_file: no agents.fill.tasks_file is configured";
     } else {
       const read = readTasksFile(path);
-      if (!read.ok) notes.push(`the tasks file ${read.reason}`);
+      if (!read.ok) tasksProblem = `the tasks file ${read.reason}`;
       else {
         for (const entry of branchesFromTasks(read.text)) {
-          if (entry.branch === branch) {
-            found.push({ agent: entry.agent, source: "tasks_file", why: `tasks file line ${entry.line}` });
-          }
+          if (entry.branch === branch) listed.push({ agent: entry.agent, why: `tasks file line ${entry.line}` });
         }
       }
     }
   }
-  const agents = [...new Set(found.map((f) => f.agent))];
-  if (agents.length === 1) {
-    const source = found.some((f) => f.source === "branch") ? "branch" : "tasks_file";
-    return { agent: agents[0], source, note: notes.length > 0 ? notes.join("; ") : null };
+  const unknown = (note: string): MappedAuthor => ({
+    agent: null,
+    source: null,
+    note: tasksProblem ? `${note}; ${tasksProblem}` : note,
+  });
+  const describe = (items: { agent: string; why: string }[]) => items.map((f) => `${f.agent} (${f.why})`).join(", ");
+
+  const matched = [...new Set(found.map((f) => f.agent))];
+  const named = [...new Set(listed.map((f) => f.agent))];
+  if (matched.length === 0) {
+    if (named.length > 0) {
+      return unknown(
+        `branch ${branch} matches no review.authors mapping; the tasks file names ${describe(listed)}, but it only ` +
+          "confirms a mapping (agents can write it), so the author stays unknown",
+      );
+    }
+    return unknown(`branch ${branch} matches no review.authors mapping (branch_pattern or branches)`);
   }
-  if (agents.length > 1) {
-    const which = found.map((f) => `${f.agent} (${f.why})`).join(", ");
-    return { agent: null, source: null, note: `ambiguous: branch ${branch} matches ${which}, so the author stays unknown` };
+  const ambiguous = () =>
+    unknown(`ambiguous: branch ${branch} matches ${describe([...found, ...listed])}, so the author stays unknown`);
+  if (named.length === 0) {
+    return matched.length === 1 ? { agent: matched[0], source: "branch", note: tasksProblem } : ambiguous();
   }
-  return { agent: null, source: null, note: notes.length > 0 ? notes.join("; ") : null };
+  // The tasks file narrows: it must name only agents the mappings matched, and leave exactly one
+  if (named.some((agent) => !matched.includes(agent))) return ambiguous();
+  if (named.length !== 1) return ambiguous();
+  return { agent: named[0], source: matched.length === 1 ? "branch" : "tasks_file", note: null };
 }

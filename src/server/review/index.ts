@@ -37,6 +37,7 @@ export type { GateSource } from "./gate-source.js";
 export {
   eventBusDecisionSink,
   eventBusAssigner,
+  inboxDecisionSink,
   unwiredDecisionSink,
   unwiredAssigner,
 } from "./ports.js";
