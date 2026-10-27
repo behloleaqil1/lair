@@ -209,7 +209,8 @@ function eventsOf(b: Boot, type: "triage.recheck_would" | "triage.recheck_queued
 
 describe("which re-check, by the classification", () => {
   it("each kind maps to its argv: infra -> same, a test timeout -> failed_tests, flaky -> failed_tests, a timeout under load -> failed_tests", async () => {
-    const b = await boot();
+    // Five at once: above the default max_pending (3)
+    const b = await boot({ max_pending: 10 });
     enqueues(b);
     const S1 = sha("i1");
     const S2 = sha("t1");
