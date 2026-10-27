@@ -433,11 +433,11 @@ describe("merge conditions", () => {
       completedAt: "2026-01-01T00:00:05.000Z",
       pipelineVersion: "v1",
     };
+    // Signed with another key while naming node-1's: refused when it is posted, and nothing is stored
     const forged = signGateResult({ ...result, id: "forged" }, generateNodeKeyPair("node-1").privateKey, node.publicKey);
-    service.addGateResult(forged);
+    expect(() => service.addGateResult(forged)).toThrow("The signature does not verify with node_keys.node-1");
     const rejected = await service.status(3);
-    expect(rejected.gate[0]).toMatchObject({ status: "failed" });
-    expect(rejected.gate[0].detail).toContain("Invalid signature");
+    expect(rejected.gate[0]).toMatchObject({ status: "missing" });
 
     service.addGateResult(signGateResult(result, node.privateKey, node.publicKey));
     const passed = await service.status(3);

@@ -13,7 +13,7 @@
  *   GET  /api/review/holds
  *   POST /api/review/holds                      {reason, pr?, by} (anyone may hold)
  *   POST /api/review/holds/:id/release          owner: {by}
- *   POST /api/review/gate-results               a signed gate result
+ *   POST /api/review/gate-results               a signed gate result: refused (403) unless node_keys verify it; the first per id stays
  *   GET  /api/review/merges
  *
  * "owner" routes need the owner's browser session (src/server/human-auth/),
@@ -44,7 +44,15 @@ const PrParams = z.object({ number: z.string().regex(/^[1-9]\d{0,9}$/) });
 const IdParams = z.object({ id: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/) });
 /** The full commit sha: an approval binds to exactly one commit */
 const FullSha = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i, "the full head commit sha");
-const ActorId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/, "letters, digits, '.', '_', ':' and '-'");
+/**
+ * Who a request names (a reviewer, a merger, a holder). Names starting with
+ * `lair:` are Lair's own (lair:test-integrity, lair:policy for automatic
+ * merges): no caller may record anything under one.
+ */
+const ActorId = z
+  .string()
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/, "letters, digits, '.', '_', ':' and '-'")
+  .refine((name) => !name.toLowerCase().startsWith("lair:"), "names starting with lair: are Lair's own");
 
 const Reviewer = z
   .object({
@@ -80,10 +88,8 @@ const MergeBody = z
   .object({
     confirm: z.literal(true, { errorMap: () => ({ message: "send confirm: true to merge" }) }),
     head_sha: FullSha,
-    // lair:policy and the like are Lair's own merges (review.merge.auto): the record must not be mistaken for one
-    by: ActorId.refine((by) => !by.toLowerCase().startsWith("lair:"), "names starting with lair: are Lair's own").default(
-      "dashboard",
-    ),
+    // Never lair:policy (an automatic merge, review.merge.auto): ActorId refuses Lair's own names
+    by: ActorId.default("dashboard"),
   })
   .strict();
 
@@ -348,9 +354,11 @@ export async function registerReviewRoutes(
     app.post("/api/review/gate-results", async (request, reply) => {
       const body = SignedGateBody.safeParse(request.body);
       if (!body.success) return fail(reply, 400, `Invalid gate result: ${firstIssue(body.error)}`);
+      // Any local process can post here: the service refuses (403) a result its node_keys don't verify
       return withService(request.query, reply, async (service) => {
-        service.addGateResult(body.data as SignedGateResult);
-        return { stored: body.data.result.id };
+        const stored = service.addGateResult(body.data as SignedGateResult);
+        // stored: false when a result with this id was already kept (the first one stays)
+        return { id: body.data.result.id, stored };
       });
     });
 

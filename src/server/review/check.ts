@@ -12,6 +12,9 @@
  * - Its environment is Lair's minimal one (BASE_ENV: PATH, HOME, USER, LANG,
  *   TMPDIR, TERM, SHELL), never the server's tokens or other variables.
  * - A timeout, and bounded output.
+ * - It runs in its own process group, so a timeout kills what it started
+ *   too. If Lair itself is killed (SIGKILL, a crash) while a check runs,
+ *   nothing stops the check: it runs on, orphaned, until it ends.
  */
 import { spawn, type ChildProcess } from "child_process";
 import { agentEnvironment } from "../agents/probes.js";
@@ -75,23 +78,65 @@ export function checkEnvironment(source: NodeJS.ProcessEnv): Record<string, stri
   return agentEnvironment(source, [], {});
 }
 
+/** ESC then one of these opens a string (OSC, DCS, SOS, PM, APC) that runs to BEL or ST (ESC \). */
+const STRING_INTRODUCERS = new Set(["]", "P", "X", "^", "_"]);
+
 /**
- * Text someone else wrote, as one plain line: ANSI escapes dropped, other
- * control characters made spaces.
+ * Where the escape sequence that starts with the ESC at `at` ends (the
+ * index of its last character): CSI (ESC [ parameters, intermediates, a
+ * final byte), the strings above, and every other ESC sequence (ESC,
+ * intermediate bytes 0x20-0x2f, one final byte). An unterminated one runs
+ * to the end of the text.
+ */
+function escapeEnd(text: string, at: number): number {
+  const last = text.length - 1;
+  const next = text[at + 1];
+  if (next === undefined) return at;
+  if (next === "[") {
+    let i = at + 2;
+    while (i <= last && !(text.charCodeAt(i) >= 0x40 && text.charCodeAt(i) <= 0x7e)) i++;
+    return Math.min(i, last);
+  }
+  if (STRING_INTRODUCERS.has(next)) {
+    for (let i = at + 2; i <= last; i++) {
+      if (text.charCodeAt(i) === 0x07) return i;
+      if (text.charCodeAt(i) === 0x1b && text[i + 1] === "\\") return i + 1;
+    }
+    return last;
+  }
+  let i = at + 1;
+  while (i <= last && text.charCodeAt(i) >= 0x20 && text.charCodeAt(i) <= 0x2f) i++;
+  return Math.min(i, last);
+}
+
+/** Characters that change how a terminal or a page shows the text around them: C1 controls, bidi overrides, line separators. */
+function invisible(code: number): boolean {
+  return (
+    code < 0x20 ||
+    (code >= 0x7f && code <= 0x9f) ||
+    (code >= 0x202a && code <= 0x202e) ||
+    (code >= 0x2066 && code <= 0x2069) ||
+    code === 0x2028 ||
+    code === 0x2029 ||
+    code === 0x200e ||
+    code === 0x200f
+  );
+}
+
+/**
+ * Text someone else wrote, as one plain line: every escape sequence dropped
+ * (colours, cursor moves, window titles, hyperlinks), other control and
+ * direction characters made spaces.
  */
 export function plainLine(text: string): string {
   let out = "";
   for (let i = 0; i < text.length; i++) {
     const code = text.charCodeAt(i);
     if (code === 0x1b) {
-      // ESC [ parameters final-byte: skip the whole sequence
-      if (text[i + 1] === "[") {
-        i += 2;
-        while (i < text.length && !(text.charCodeAt(i) >= 0x40 && text.charCodeAt(i) <= 0x7e)) i++;
-      }
+      i = escapeEnd(text, i);
       continue;
     }
-    out += code < 0x20 || code === 0x7f ? " " : text[i];
+    out += invisible(code) ? " " : text[i];
   }
   return out;
 }

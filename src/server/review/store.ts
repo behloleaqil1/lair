@@ -1060,18 +1060,17 @@ export class ReviewStore {
   // ============ SIGNED GATE RESULTS ============
 
   /**
-   * Store a signed result under its id. The same result again changes
-   * nothing (a repeated delivery is a no-op); a different one with that id
-   * replaces it. True when the row was written.
+   * Store a signed result under its id. The first result kept under an id
+   * stays: a later one with the same id, identical or not, changes nothing
+   * (as triage takes an id once). Replacing a newer failure with anything
+   * would let an older pass decide the gate. True when the row was written.
    */
   addGateResult(project: string, signed: SignedGateResult, at: string): boolean {
     const result = this.db
       .prepare(
         `INSERT INTO review_gate_results (project, id, sha, pipeline_id, payload, received_at)
          VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(project, id) DO UPDATE SET
-           sha = excluded.sha, pipeline_id = excluded.pipeline_id, payload = excluded.payload, received_at = excluded.received_at
-         WHERE review_gate_results.payload <> excluded.payload`,
+         ON CONFLICT(project, id) DO NOTHING`,
       )
       .run(project, signed.result.id, signed.result.commitSha, signed.result.pipelineId, JSON.stringify(signed), at);
     return result.changes > 0;
@@ -1113,6 +1112,21 @@ export class ReviewStore {
       .run(state, JSON.stringify(reasons.slice(0, 20)), at, project, pr, headSha);
   }
 
+  /**
+   * Mark an automatic merge that is still `started` as interrupted (a
+   * restart stopped it). True only for the call that changed it, so it is
+   * reported once however many callers find it.
+   */
+  interruptAutoMerge(project: string, pr: number, headSha: string, reasons: string[], at: number): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE review_auto_merges SET state = 'interrupted', reasons = ?, finished_at = ?
+         WHERE project = ? AND pr = ? AND head_sha = ? AND state = 'started'`,
+      )
+      .run(JSON.stringify(reasons.slice(0, 20)), at, project, pr, headSha);
+    return result.changes > 0;
+  }
+
   getAutoMerge(project: string, pr: number, headSha: string): AutoMergeRecord | null {
     const row = this.db
       .prepare(`SELECT * FROM review_auto_merges WHERE project = ? AND pr = ? AND head_sha = ?`)
@@ -1127,13 +1141,24 @@ export class ReviewStore {
     return rows.map(autoMergeOf);
   }
 
-  /** When the project's latest automatic merge started (ms), or null. */
+  /**
+   * When the project's latest real automatic merge attempt started (ms), or
+   * null. A skipped one (the head moved, the policy changed, another merge
+   * ran) ran nothing, so it doesn't count.
+   */
   lastAutoMergeStart(project: string): number | null {
     const row = this.db
-      .prepare(`SELECT MAX(started_at) AS at FROM review_auto_merges WHERE project = ?`)
+      .prepare(`SELECT MAX(started_at) AS at FROM review_auto_merges WHERE project = ? AND state <> 'skipped'`)
       .get(project) as { at: number | null };
     return row.at;
   }
+
+  /**
+   * Automatic merges this process is running, by "<project>:<pr>:<head>".
+   * In memory only: after a restart none runs. It lives with the store,
+   * which a config reload's new service shares with the old one.
+   */
+  readonly runningAutoMerges = new Set<string>();
 }
 
 /**

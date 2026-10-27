@@ -294,6 +294,25 @@ describe("review routes: review, policy, merge", () => {
     expect(posing.json().error).toContain("names starting with lair: are Lair's own");
     expect(remote.branches.get("main")).toBe(base);
 
+    // Nor anything else under Lair's names: a review, a hold, a release or a resolution
+    const posingAsLair: [string, Record<string, unknown>, Record<string, string>][] = [
+      ["/api/review/prs/7/owner-review", { reviewer: "lair:test-integrity", head_sha: head, verdict: "approve" }, owner],
+      [
+        "/api/review/prs/7/reviews",
+        { reviewer: { id: "LAIR:policy", kind: "agent" }, head_sha: head, verdict: "approve", assignment_token: "t".repeat(32) },
+        {},
+      ],
+      ["/api/review/holds", { reason: "freeze", by: "lair:policy" }, {}],
+      ["/api/review/holds/hold-1/release", { by: "lair:policy" }, owner],
+      ["/api/review/findings/f-1/resolve", { by: "lair:policy", note: "fixed" }, owner],
+    ];
+    for (const [url, payload, headers] of posingAsLair) {
+      const res = await app.inject({ method: "POST", url, headers, payload });
+      expect(res.statusCode, url).toBe(400);
+      expect(res.json().error, url).toContain("names starting with lair: are Lair's own");
+    }
+    expect((await app.inject({ url: "/api/review/holds" })).json().data).toEqual([]);
+
     const merged = await app.inject({
       method: "POST",
       url: "/api/review/prs/7/merge",

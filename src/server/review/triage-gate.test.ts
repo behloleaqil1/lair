@@ -3,7 +3,9 @@
  * triage (review.merge.gate.from_triage): mountTriage() and the review
  * routes on one Fastify instance, with the triage manager handed the
  * ReviewManager as src/server/index.ts wires them. A signed result is
- * POSTed to triage only; the PR's "Gate at head" is read from review. Only
+ * POSTed to triage only; the PR's "Gate at head" is read from review. The
+ * review route's own signed results are verified when they are written,
+ * and the first result per id stays. Only
  * the git host's API, git, the clock and triage's command runner are
  * stand-ins; the signatures are real Ed25519 ones.
  */
@@ -225,5 +227,44 @@ describe("signed results through triage reach the merge gate (review.merge.gate.
     const { app, node, head } = await boot({ fromTriage: false });
     expect((await postToTriage(app, submission(node, passedAt(head, "run-9")))).statusCode).toBe(200);
     expect((await gateAtHead(app)).gate).toMatchObject({ status: "missing" });
+  });
+});
+
+describe("POST /api/review/gate-results: verified when it is written, and the first result per id stays", () => {
+  async function postToReview(server: FastifyInstance, payload: unknown) {
+    return server.inject({ method: "POST", url: "/api/review/gate-results", payload: payload as Record<string, unknown> });
+  }
+
+  it("a forged body under a newer failure's id can't replace it to let an older pass decide", async () => {
+    const { app, node, other, stranger, head } = await boot();
+    // At the head: a pass, then a newer failure of the same pipeline (both really signed)
+    const pass = node.sign({ ...passedAt(head, "r1"), nodeId: node.id });
+    const failed = gate({ id: "r2", sha: head, branch: "agent/worker-a/change", status: "failed", steps: [step("test", "failed")], pipelineId: "backend" });
+    const later = new Date(Date.parse(failed.completedAt) + 10 * 60_000).toISOString();
+    const fail = node.sign({ ...failed, nodeId: node.id, startedAt: later, completedAt: later });
+    expect((await postToReview(app, pass)).json().data).toEqual({ id: "r1", stored: true });
+    expect((await postToReview(app, fail)).json().data).toEqual({ id: "r2", stored: true });
+    const before = await gateAtHead(app);
+    expect(before.gate).toMatchObject({ status: "failed", detail: "Gate r2 failed with status: failed" });
+
+    // Any local process can post: a body with the failure's id, made a pass, keeping its signature
+    const asPass = { ...fail.result, status: "passed" as const, steps: [step("test", "passed")] };
+    const forged = await postToReview(app, { result: asPass, signature: fail.signature, nodePublicKey: fail.nodePublicKey });
+    expect(forged.statusCode).toBe(403);
+    expect(forged.json().error).toContain("The signature does not verify with node_keys.gates-1");
+    // ...signed with a key of its own, naming the trusted node
+    expect((await postToReview(app, stranger.sign({ ...asPass, nodeId: node.id }))).statusCode).toBe(403);
+    // ...or from a node review doesn't list
+    const unlisted = await postToReview(app, other.sign({ ...asPass, nodeId: other.id }));
+    expect(unlisted.statusCode).toBe(403);
+    expect(unlisted.json().error).toContain("Node gates-2 is not in review.merge.gate.node_keys");
+
+    // Even a validly signed result can't take the id over: the first one stays, here and through triage
+    expect((await postToReview(app, node.sign(asPass))).json().data).toEqual({ id: "r2", stored: false });
+    expect((await postToTriage(app, submission(node, asPass))).statusCode).toBe(200);
+
+    const after = await gateAtHead(app);
+    expect(after.gate).toMatchObject({ status: "failed", detail: "Gate r2 failed with status: failed" });
+    expect(after.status.canMerge).toBe(false);
   });
 });

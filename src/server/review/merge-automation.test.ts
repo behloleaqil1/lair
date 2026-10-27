@@ -12,11 +12,12 @@ import { join } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { GateResult, SignedGateResult } from "../../shared/policy-types.js";
 import { generateNodeKeyPair, signGateResult } from "../gates/signature.js";
-import { ReviewManager, autoMergeDecisionKey, type ReviewService } from "./service.js";
+import { MAX_AUTO_GATE_READS, ReviewManager, autoMergeDecisionKey, type ReviewService } from "./service.js";
 import { parseReviewConfig } from "./config.js";
 import {
   CHECK_OUTPUT_BYTES,
   expandCheckCommand,
+  plainLine,
   systemCheckRunner,
   type CheckOutput,
   type CheckRunOptions,
@@ -249,8 +250,10 @@ describe("gate requirements: any of", () => {
     expect(status.gate[0]).toMatchObject({ status: "failed" });
     expect(status.canMerge).toBe(false);
 
-    // A pass signed with a key review doesn't trust is no pass either
-    service.addGateResult(signed(head, "backend", "passed", { key: generateNodeKeyPair("gates-1") }));
+    // A pass signed with a key review doesn't trust is refused, and is no pass either
+    expect(() => service.addGateResult(signed(head, "backend", "passed", { key: generateNodeKeyPair("gates-1") }))).toThrow(
+      "does not verify",
+    );
     expect((await service.status(3)).gate[0]).toMatchObject({ status: "failed" });
   });
 
@@ -420,6 +423,21 @@ describe("merge.check_cmd", () => {
     expect(missing.code).toBeNull();
     expect(missing.error).toBeTruthy();
   });
+
+  it("makes its output plain: every escape sequence dropped, control and text-direction characters made spaces", () => {
+    const esc = String.fromCharCode(27);
+    const bel = String.fromCharCode(7);
+    // A hyperlink (OSC 8, ended by ST), a window title (OSC 0, ended by BEL), DCS, charset and cursor saves, CSI colours
+    expect(plainLine(`${esc}]8;;https://example.invalid/x${esc}\\click${esc}]8;;${esc}\\ here`)).toBe("click here");
+    expect(plainLine(`${esc}]0;a window title${bel}done`)).toBe("done");
+    expect(plainLine(`${esc}Pq#0;2;0;0;0${esc}\\after`)).toBe("after");
+    expect(plainLine(`${esc}(Bplain${esc}7 saved${esc}8`)).toBe("plain saved");
+    expect(plainLine(`${esc}[1;31mred${esc}[0m`)).toBe("red");
+    // C1 controls, a right-to-left override, a tab
+    expect(plainLine(`a${String.fromCharCode(0x9b)}b${String.fromCharCode(0x202e)}c\td`)).toBe("a b c d");
+    // An unterminated string swallows the rest of the line, never shows it
+    expect(plainLine(`kept ${esc}]0;title`)).toBe("kept ");
+  });
 });
 
 // ============ M6: automatic merge ============
@@ -550,9 +568,40 @@ describe("merge.auto", () => {
     expect(decisions).toEqual([]);
 
     // The new head has no gate result: it waits for one
-    clock.advance(10 * MINUTE);
+    clock.advance(MINUTE);
     await scan();
     expect(remote.branches.get("main")).toBe(base);
+
+    // The skipped attempt ran nothing, so auto_min_interval_seconds doesn't hold the new head back
+    const newHead = remote.pulls.get(3)!.headSha;
+    service.addGateResult(signed(newHead));
+    await scan();
+    expect(remote.branches.get("main")).toBe(newHead);
+    expect(service.listMerges()).toEqual([expect.objectContaining({ headSha: newHead, initiatedBy: "lair:policy" })]);
+  });
+
+  it("with source: checks, reads at most MAX_AUTO_GATE_READS gates from the host per scan, and the next scan goes on from there", async () => {
+    const at = repo();
+    let ready = "";
+    for (let i = 0; i < 25; i++) {
+      const sha = at.remote.commit([at.base], AGENT, `change ${i}`);
+      at.remote.openPull({ number: 10 + i, headRef: `agent/worker-a/change-${i}`, headSha: sha, files: [README] });
+      if (i === 24) ready = sha;
+    }
+    // Only the last of 26 open PRs has its check run
+    at.remote.setChecks(ready, [["build", "success"]]);
+    const { remote, base, scan } = boot(at, { auto: true, gate: { source: "checks", required: ["build"] } });
+    const checkReads = () => remote.requests.filter((r) => r.path.includes("/check-runs")).length;
+
+    await scan();
+    expect(checkReads()).toBe(MAX_AUTO_GATE_READS);
+    expect(remote.branches.get("main")).toBe(base);
+
+    // The next scan starts after the last PR the first one read, and reaches the ready one
+    await scan();
+    expect(remote.branches.get("main")).toBe(ready);
+    expect(remote.pulls.get(34)).toMatchObject({ state: "closed", merged: true });
+    expect(checkReads()).toBeLessThanOrEqual(2 * MAX_AUTO_GATE_READS + 2);
   });
 
   it("with hold_when_default_red, a revert the red default branch lets through still needs the red tier's reviews", async () => {
@@ -586,19 +635,24 @@ describe("merge.auto", () => {
     expect(service.listMerges()).toEqual([expect.objectContaining({ pr: 3, initiatedBy: "lair:policy" })]);
   });
 
-  it("never runs an automatic merge a restart interrupted again blindly: it is reported once", async () => {
-    const at = repo();
-    const dbPath = join(dir!, "review.db");
-    const check = { auto: true, check_cmd: ["/opt/checks/migration-order", "--pr", "{pr}"] };
+  const CHECKED_AUTO = { auto: true, check_cmd: ["/opt/checks/migration-order", "--pr", "{pr}"] };
 
-    // The first server starts the merge and dies while its check runs
-    const first = boot(at, check, { dbPath });
+  /** A server that starts an automatic merge of PR #3 and is killed while its check runs. */
+  async function crashMidMerge(at: Repo, dbPath: string): Promise<void> {
+    const first = boot(at, CHECKED_AUTO, { dbPath });
     first.service.addGateResult(signed(at.head));
     first.spawner.reply = () => new Promise<CheckOutput>(() => {});
     void first.scan();
     for (let i = 0; i < 200 && first.spawner.calls.length === 0; i++) await new Promise((r) => setTimeout(r, 5));
     expect(first.spawner.calls).toHaveLength(1);
     first.manager.close();
+  }
+
+  it("never runs an automatic merge a restart interrupted again blindly: it is reported once", async () => {
+    const at = repo();
+    const dbPath = join(dir!, "review.db");
+    const check = CHECKED_AUTO;
+    await crashMidMerge(at, dbPath);
 
     // The restarted server finds the attempt: it asks the owner once and doesn't merge at that head
     const second = boot(at, check, { dbPath });
@@ -619,5 +673,24 @@ describe("merge.auto", () => {
     await second.scan();
     expect(at.remote.branches.get("main")).toBe(next);
     expect(second.spawner.calls).toHaveLength(1);
+  });
+
+  it("reports an interrupted automatic merge when the project loads, even with merge.auto turned off since", async () => {
+    const at = repo();
+    const dbPath = join(dir!, "review.db");
+    await crashMidMerge(at, dbPath);
+
+    // The owner turned automatic merges off before restarting: the decision is raised all the same, once
+    const second = boot(at, { check_cmd: CHECKED_AUTO.check_cmd }, { dbPath });
+    const interrupted = expect.objectContaining({
+      key: autoMergeDecisionKey(3, at.head),
+      question: `Automatic merge of PR #3 at ${at.head.slice(0, 7)} was interrupted`,
+    });
+    expect(second.decisions).toEqual([interrupted]);
+    await second.scan();
+    second.clock.advance(10 * MINUTE);
+    await second.scan();
+    expect(second.decisions).toEqual([interrupted]);
+    expect(at.remote.branches.get("main")).toBe(at.base);
   });
 });
