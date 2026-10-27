@@ -77,6 +77,25 @@ const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
  * ids may contain both, so "feat" isn't done by "- DONE feat:login").
  */
 export const DEFAULT_DONE_PATTERN = "^-\\s+DONE\\s+{task}(?=\\s|$)";
+/** A run that waits ("come back when my gate finishes"); add (?<wake>...) to capture what it waits on */
+export const DEFAULT_WAITING_PATTERN = "^-\\s+WAITING\\s+{task}(?=\\s|$)";
+/** A run that needs someone else first */
+export const DEFAULT_BLOCKED_PATTERN = "^-\\s+BLOCKED\\s+{task}(?=\\s|$)";
+
+const WakeSchema = z
+  .object({
+    /** The file whose existence wakes a waiting task (a gate's result); {wake}, {gates_dir}, {agents_dir}, {repo} */
+    file: z.string().min(1).optional(),
+    /** The directory that file must stay inside; {gates_dir}, {agents_dir}, {repo} */
+    root: z.string().min(1).default("{gates_dir}"),
+    /** How often fill looks for the file, per task */
+    poll_seconds: z.number().int().min(1).max(3600).default(60),
+    /** Waiting this long raises one decision */
+    max_wait_minutes: z.number().positive().default(240),
+    /** With nothing to wait on (no capture, or no wake.file), the task starts again after this long */
+    fallback_seconds: z.number().min(0).default(900),
+  })
+  .strict();
 
 const FillSchema = z
   .object({
@@ -103,6 +122,11 @@ const FillSchema = z
     /** After such a run, fill waits this long before starting the task again, doubling up to max_backoff_seconds */
     backoff_seconds: z.number().min(0).default(60),
     max_backoff_seconds: z.number().min(0).default(1800),
+    /** A run that ended on such a line waits (see wake); same rules as done_pattern; (?<wake>...) optional */
+    waiting_pattern: z.string().min(1).max(500).default(DEFAULT_WAITING_PATTERN),
+    /** A run that ended on such a line is held for the owner at once */
+    blocked_pattern: z.string().min(1).max(500).default(DEFAULT_BLOCKED_PATTERN),
+    wake: WakeSchema.default({}),
   })
   .strict();
 
@@ -201,6 +225,15 @@ export interface FillSettings {
   maxCompletionsWithoutDone: number;
   backoffSeconds: number;
   maxBackoffSeconds: number;
+  waitingPattern: string;
+  blockedPattern: string;
+  wake: {
+    file?: string;
+    root: string;
+    pollSeconds: number;
+    maxWaitMinutes: number;
+    fallbackSeconds: number;
+  };
 }
 
 const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -223,9 +256,17 @@ export function donePatternFor(template: string, task: string, agent: string): R
  * case-sensitive; the DONE keyword is not).
  */
 export function doneLineMatches(pattern: RegExp, task: string, line: string): boolean {
-  const match = pattern.exec(line.trim());
-  return match !== null && match[0].includes(task);
+  return taskLineMatch(pattern, task, line) !== null;
 }
+
+/** The match of a fill pattern (done, waiting, blocked) on a queue line, by doneLineMatches' rules, or null. */
+export function taskLineMatch(pattern: RegExp, task: string, line: string): RegExpExecArray | null {
+  const match = pattern.exec(line.trim());
+  return match !== null && match[0].includes(task) ? match : null;
+}
+
+/** What a waiting line may name to wait on: one plain name (a gate id, say), never a path or an option */
+export const WAKE_VALUE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 
 export interface BudgetLimit {
   soft?: number;
@@ -461,6 +502,15 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         maxCompletionsWithoutDone: value.fill.max_completions_without_done,
         backoffSeconds: value.fill.backoff_seconds,
         maxBackoffSeconds: value.fill.max_backoff_seconds,
+        waitingPattern: value.fill.waiting_pattern,
+        blockedPattern: value.fill.blocked_pattern,
+        wake: {
+          file: value.fill.wake.file,
+          root: value.fill.wake.root,
+          pollSeconds: value.fill.wake.poll_seconds,
+          maxWaitMinutes: value.fill.wake.max_wait_minutes,
+          fallbackSeconds: value.fill.wake.fallback_seconds,
+        },
       },
     },
   };
@@ -487,15 +537,31 @@ function checkFill(value: RawSettings, errors: string[]): void {
       errors.push(`agents.fill.prompt_files[${i}]: a ".." segment is refused (prompt files stay inside prompts_dir)`);
     }
   });
-  checkPlaceholders(fill.done_pattern, ["task", "agent"], "agents.fill.done_pattern", errors);
-  if (!fill.done_pattern.includes("{task}")) {
-    errors.push("agents.fill.done_pattern: needs {task} (without it one done line would match every task)");
-  } else {
-    try {
-      donePatternFor(fill.done_pattern, "example-task", "example-agent");
-    } catch (e) {
-      errors.push(`agents.fill.done_pattern: not a valid regular expression (${e instanceof Error ? e.message : String(e)})`);
-    }
+  checkTaskPattern(fill.done_pattern, "done_pattern", "done", errors);
+  checkTaskPattern(fill.waiting_pattern, "waiting_pattern", "waiting", errors);
+  checkTaskPattern(fill.blocked_pattern, "blocked_pattern", "blocked", errors);
+
+  const wake = fill.wake;
+  if (wake.file !== undefined) {
+    checkPlaceholders(wake.file, ["wake", "gates_dir", "agents_dir", "repo"], "agents.fill.wake.file", errors);
+    if (!wake.file.includes("{wake}")) errors.push("agents.fill.wake.file: needs {wake} (what the waiting line names)");
+    if (wake.file.split(/[\\/]/).includes("..")) errors.push('agents.fill.wake.file: a ".." segment is refused');
+  }
+  checkPlaceholders(wake.root, ["gates_dir", "agents_dir", "repo"], "agents.fill.wake.root", errors);
+  if (wake.root.split(/[\\/]/).includes("..")) errors.push('agents.fill.wake.root: a ".." segment is refused');
+}
+
+/** A fill pattern: {task} and {agent} only, {task} required, and it compiles. */
+function checkTaskPattern(pattern: string, key: string, what: string, errors: string[]): void {
+  checkPlaceholders(pattern, ["task", "agent"], `agents.fill.${key}`, errors);
+  if (!pattern.includes("{task}")) {
+    errors.push(`agents.fill.${key}: needs {task} (without it one ${what} line would match every task)`);
+    return;
+  }
+  try {
+    donePatternFor(pattern, "example-task", "example-agent");
+  } catch (e) {
+    errors.push(`agents.fill.${key}: not a valid regular expression (${e instanceof Error ? e.message : String(e)})`);
   }
 }
 

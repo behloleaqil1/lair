@@ -488,6 +488,11 @@ export function Agents({ project, refreshKey }: Props) {
                       {label(line.state)}
                       {line.hold ? `: ${label(line.hold)}` : ""}
                     </span>
+                    {line.waiting && (
+                      <div style={muted}>
+                        waiting: {line.waiting.wake ?? "nothing named"} since {time(line.waiting.since)}
+                      </div>
+                    )}
                   </td>
                   <td style={muted}>
                     {line.detail}{" "}

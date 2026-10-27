@@ -21,14 +21,22 @@
  *     the owner, its claim lost). The owner's to resume; a claim lost without
  *     the owner releasing it raises a decision (an escalated chain already
  *     raised its own);
+ *   - blocked: its last run exited 0 on a BLOCKED line for the task (the
+ *     latest of its WAITING and BLOCKED lines): held at once, with one
+ *     decision carrying the line (as data, never in a prompt);
+ *   - waiting: its last run exited 0 on a WAITING line. With a (?<wake>...)
+ *     capture and fill.wake.file it starts again once that file exists (a
+ *     gate's result, say: a plain name, inside wake.root); otherwise after
+ *     wake.fallback_seconds. No backoff, and it isn't counted as a run
+ *     without progress. Waiting past wake.max_wait_minutes raises one decision;
  *   - no_done / backoff: its runs exited 0 without reporting it done. It is
  *     started again after a backoff (fill.backoff_seconds, doubling), and
  *     after fill.max_completions_without_done of them in a row it is held and
  *     one decision is raised, with the last output;
  *   - busy, read_only, max_active, capacity (capacity_cmd), prompt (a
  *     refused prompt file) or refused (the run request);
- *   the owner releases an owner or no_done hold from the Agents view, or by
- *   answering the decision;
+ *   the owner releases an owner, no_done, blocked or waiting hold from the
+ *   Agents view, or by answering the decision;
  * - otherwise started: the prompt is built from prompt_files and the run is
  *   requested through AgentsService.requestRun, the module's in-process path,
  *   so claims, locks, never-started retries, recovery, failover and budgets
@@ -39,7 +47,7 @@
  * characters and trimmed before done_pattern sees them).
  */
 import { createHash } from "crypto";
-import { closeSync, constants, fstatSync, openSync, readSync, realpathSync } from "fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync } from "fs";
 import { isAbsolute, relative, resolve, sep } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
 import type {
@@ -49,10 +57,11 @@ import type {
   FillLineState,
   FillLineView,
   FillStatusView,
+  FillWaitingView,
 } from "../../shared/agents-types.js";
 import { isValidDragonId } from "../parsers/dragon-config.js";
 import { getPromptsDir } from "../routes/controls.js";
-import { backoffMs, doneLineMatches, donePatternFor, type FillSettings } from "./config.js";
+import { backoffMs, doneLineMatches, donePatternFor, taskLineMatch, WAKE_VALUE, type FillSettings } from "./config.js";
 import type { DecisionRequest } from "./decisions.js";
 import type { AgentProbes } from "./probes.js";
 import { MAX_PROMPT_FILE_BYTES } from "./prompts.js";
@@ -70,8 +79,8 @@ const MARK_TAIL_BYTES = 256;
 /** The decision options fill offers for a task it holds for the owner */
 export const DECISION_FILL_START = "start_again";
 export const DECISION_FILL_KEEP = "keep_held";
-/** Holds only the owner lifts (POST /api/agents/fill/release, or the decision) */
-export const OWNER_HOLDS: readonly FillHold[] = ["owner", "no_done"];
+/** Holds the owner lifts (POST /api/agents/fill/release, or the decision); a waiting one also ends by itself */
+export const OWNER_HOLDS: readonly FillHold[] = ["owner", "no_done", "blocked", "waiting"];
 
 const short = (id: string) => id.slice(0, 8);
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -82,8 +91,17 @@ const oneLine = (text: string, max = 200) => {
 const sha256 = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
 const iso = (ms: number) => new Date(ms).toISOString();
 
-/** The key of a fill decision about `task` while `runId` is its latest run (the task id may hold ':'; a run id doesn't). */
-export const fillDecisionKey = (task: string, runId: string) => `fill:${task}:${runId}`;
+/**
+ * The key of a fill decision about `task` while `runId` is its latest run,
+ * per kind of hold (the task id may hold ':'; a run id doesn't, so it is last).
+ */
+export const fillDecisionKey = (task: string, runId: string, kind?: "blocked" | "waiting") =>
+  `fill:${task}:${kind ? `${kind}:` : ""}${runId}`;
+
+/** Agent-written text for a decision's context: one line, bounded, in a code block (data, never markdown). */
+function asData(text: string, max = 300): string[] {
+  return ["```text", oneLine(text, max).replace(/`/g, "'"), "```"];
+}
 
 // ============ FILES ============
 
@@ -161,6 +179,15 @@ export function queueMark(path: string): QueueMark {
   }
 }
 
+/** How a run that exited 0 without the done line ended: on a WAITING or a BLOCKED line for its task. */
+interface RunStatus {
+  kind: "waiting" | "blocked";
+  /** The line as the agent wrote it (cut at 1000 characters): data, never a prompt */
+  line: string;
+  /** What a waiting line names to wait on ((?<wake>...)), not yet checked */
+  wake: string | null;
+}
+
 /** The queue file's lines at one check (its last 4 MB), trimmed, each with the offset it starts at. */
 class QueueLines {
   private lines: { start: number; text: string }[] = [];
@@ -207,6 +234,26 @@ class QueueLines {
       if (doneLineMatches(pattern, task, line.text)) return line.text;
     }
     return null;
+  }
+
+  /**
+   * The last line written after `mark` (the whole window without a usable
+   * mark) that reports the task waiting or blocked, by doneLineMatches' rules:
+   * the latest such line wins. A waiting line's (?<wake>...) is what it waits on.
+   */
+  lastStatus(waiting: RegExp, blocked: RegExp, task: string, mark: QueueMark | undefined): RunStatus | null {
+    const from = mark && this.usable(mark) ? mark.offset : 0;
+    let last: RunStatus | null = null;
+    for (const line of this.lines) {
+      if (line.start < from || !line.text.includes(task)) continue;
+      const wait = taskLineMatch(waiting, task, line.text);
+      if (wait) {
+        last = { kind: "waiting", line: line.text, wake: wait.groups?.wake?.trim() || null };
+      } else if (taskLineMatch(blocked, task, line.text)) {
+        last = { kind: "blocked", line: line.text, wake: null };
+      }
+    }
+    return last;
   }
 
   /** A mark still describes this file: it isn't past its end and the bytes before it are unchanged. */
@@ -399,6 +446,10 @@ export class AgentsFill {
   private lastError: string | null = null;
   /** The hold each held line is in (agent|task -> hold): fill_held is recorded when it changes */
   private holds = new Map<string, FillHold>();
+  /** When fill last looked for a waiting run's wake file and didn't find it (task|run -> time) */
+  private polled = new Map<string, number>();
+  /** The waiting runs seen in the check in progress (to forget the others' polls) */
+  private waitingSeen = new Set<string>();
 
   constructor(private options: AgentsFillOptions) {}
 
@@ -502,8 +553,10 @@ export class AgentsFill {
 
   /**
    * The task's chains in a row, newest first, whose last run completed (exit
-   * 0) without reporting it done: since the owner last released it, and up
-   * to and including a chain the owner started (a new start counts afresh).
+   * 0) without reporting it done: since the owner last released it, since a
+   * run that ended waiting or blocked (that one made progress: it isn't
+   * counted), and up to and including a chain the owner started (a new start
+   * counts afresh).
    */
   private completionsWithoutDone(task: string, releasedChain: string | null): AgentRun[] {
     const { store, project, settings } = this.options;
@@ -512,6 +565,7 @@ export class AgentsFill {
       if (head.chainId === releasedChain) break;
       const last = store.chainRuns(head.chainId).at(-1);
       if (!last || last.state !== "completed") break;
+      if (store.listEvents(project, { kinds: ["fill_waiting", "fill_blocked"], task, runId: last.id, limit: 1 }).length > 0) break;
       counted.push(last);
       if (head.origin !== "fill") break;
     }
@@ -530,6 +584,7 @@ export class AgentsFill {
     const promptsDir = getPromptsDir(config);
     let active = this.activeCount();
     let noCapacity: string | null = null;
+    this.waitingSeen.clear();
     const views: FillLineView[] = [];
     const seen = new Set<string>();
 
@@ -546,6 +601,7 @@ export class AgentsFill {
           detail: `${entry.reason}: ${entry.text}`,
           hold: null,
           releasable: false,
+          waiting: null,
           runId: null,
         });
         continue;
@@ -553,7 +609,13 @@ export class AgentsFill {
       const { line, agent, name, task, description } = entry;
       const key = `${agent}|${task}`;
       seen.add(key);
-      const show = (state: FillLineState, detail: string, runId: string | null = null, hold: FillHold | null = null) => {
+      const show = (
+        state: FillLineState,
+        detail: string,
+        runId: string | null = null,
+        hold: FillHold | null = null,
+        waiting: FillWaitingView | null = null,
+      ) => {
         if (state !== "held") this.holds.delete(key);
         views.push({
           line,
@@ -565,11 +627,12 @@ export class AgentsFill {
           detail,
           hold,
           releasable: hold !== null && OWNER_HOLDS.includes(hold),
+          waiting,
           runId,
         });
       };
-      const hold = async (kind: FillHold, reason: string, runId: string | null = null) => {
-        show("held", reason, runId, kind);
+      const hold = async (kind: FillHold, reason: string, runId: string | null = null, waiting: FillWaitingView | null = null) => {
+        show("held", reason, runId, kind, waiting);
         if (this.holds.get(key) === kind) return;
         this.holds.set(key, kind);
         await this.options.record(
@@ -640,9 +703,10 @@ export class AgentsFill {
         if (latest.state === "lost_claim" && !this.claimReleasedByOwner(latest)) {
           const reason = `its run ${short(latest.id)} lost its claim (${oneLine(latest.detail)}), not released by you: fill leaves the task to you`;
           await hold("owner", reason, latest.id);
-          await this.raiseHold(latest, agent, task, `Fill holds task ${task}: run ${short(latest.id)} of ${agent} lost its claim, and you did not release it`, [
-            `Run ${short(latest.id)}: ${latest.state}: ${oneLine(latest.detail)}`,
-          ]);
+          await this.raiseHold(latest, agent, task, {
+            question: `Fill holds task ${task}: run ${short(latest.id)} of ${agent} lost its claim, and you did not release it`,
+            context: ["Runs:", `- Run ${short(latest.id)}: ${latest.state}: ${oneLine(latest.detail)}`],
+          });
         } else {
           await hold(
             "owner",
@@ -652,19 +716,66 @@ export class AgentsFill {
         }
         continue;
       }
-      if (latest && latest.state === "completed") {
+      // A run that ended on a WAITING or BLOCKED line (the latest such line wins; a done line won above)
+      const status = latest && latest.state === "completed" && latest.id !== releasedRun ? await this.runStatus(latest, agent, task, queue) : null;
+      if (latest && status?.kind === "blocked") {
+        const reason = `blocked: ${oneLine(status.line)}: fill leaves the task to you (release the hold once it is unblocked)`;
+        await hold("blocked", reason, latest.id);
+        await this.raiseHold(latest, agent, task, {
+          kind: "blocked",
+          question: `Fill holds task ${task}: ${agent} reported it blocked`,
+          context: [`Run ${short(latest.id)} ended ${iso(latest.endedAt ?? latest.requestedAt)} on this line:`, "", ...asData(status.line)],
+          startLabel: "Start it again",
+          startConsequences: `Fill starts ${task} for ${agent} again on its next check: choose this once what blocked it is cleared.`,
+          why: "A blocked task needs someone else first; starting it again before that only repeats the run.",
+        });
+        continue;
+      }
+      if (latest && status?.kind === "waiting") {
+        const waiting = this.waitFor(latest, task, status, now);
+        if (waiting) {
+          let detail = waiting.detail;
+          const waitedMs = now - (latest.endedAt ?? latest.requestedAt);
+          if (waitedMs >= settings.wake.maxWaitMinutes * 60000) {
+            detail = `${detail}; waiting over ${settings.wake.maxWaitMinutes} min: asked you`;
+            const on = waiting.view.wake ?? "its WAITING line";
+            await this.raiseHold(latest, agent, task, {
+              kind: "waiting",
+              question: `Fill: ${agent} is waiting too long on ${oneLine(on, 100)} (task ${task}, since ${waiting.view.since})`,
+              context: [
+                `Run ${short(latest.id)} ended ${waiting.view.since} on this line:`,
+                "",
+                ...asData(status.line),
+                "",
+                waiting.file ? `Fill starts it again once ${waiting.file} exists.` : `Fill starts it again at ${waiting.view.fallbackAt}.`,
+              ],
+              startLabel: "Start it again now",
+              startConsequences: `Fill starts ${task} for ${agent} again on its next check, without waiting any longer.`,
+              keepLabel: "Keep waiting",
+              keepConsequences: `Fill keeps waiting, and starts ${task} once what it waits on is there.`,
+              why: "A gate or a review usually finishes on its own; a wait this long may mean it never will.",
+              withOutput: false,
+            });
+          }
+          await hold("waiting", detail, latest.id, waiting.view);
+          continue;
+        }
+        // What it waited on is there (or the fallback is up): it starts again now, without a backoff
+      } else if (latest && latest.state === "completed") {
         const completions = this.completionsWithoutDone(task, releasedChain);
         const count = completions.length;
         if (count >= settings.maxCompletionsWithoutDone) {
           const reason = `its last ${count} run(s) exited 0 without reporting it done (agents.fill.max_completions_without_done is ${settings.maxCompletionsWithoutDone}): fill leaves the task to you`;
           await hold("no_done", reason, latest.id);
-          await this.raiseHold(
-            latest,
-            agent,
-            task,
-            `Fill holds task ${task}: ${agent}'s last ${count} run(s) exited 0 without reporting it done`,
-            completions.map((run) => `Run ${short(run.id)} (${run.origin === "fill" ? "fill" : "requested"}): ended ${iso(run.endedAt ?? run.requestedAt)}: ${oneLine(run.detail)}`),
-          );
+          await this.raiseHold(latest, agent, task, {
+            question: `Fill holds task ${task}: ${agent}'s last ${count} run(s) exited 0 without reporting it done`,
+            context: [
+              "Runs:",
+              ...completions.map(
+                (run) => `- Run ${short(run.id)} (${run.origin === "fill" ? "fill" : "requested"}): ended ${iso(run.endedAt ?? run.requestedAt)}: ${oneLine(run.detail)}`,
+              ),
+            ],
+          });
           continue;
         }
         if (count >= 1) {
@@ -737,42 +848,174 @@ export class AgentsFill {
     for (const key of [...this.holds.keys()]) {
       if (!seen.has(key)) this.holds.delete(key);
     }
+    for (const key of [...this.polled.keys()]) {
+      if (!this.waitingSeen.has(key)) this.polled.delete(key);
+    }
     return views;
   }
 
-  /** One decision per hold (per task and latest run): start it again, or keep it held. */
-  private async raiseHold(latest: AgentRun, agent: string, task: string, question: string, runs: string[]): Promise<void> {
-    const output = lastOutput(latest);
+  /**
+   * One decision per hold (per task, latest run and kind of hold): start it
+   * again (the release), or keep it held. The last run's output is added
+   * unless `withOutput` is false; agent-written text goes in as data.
+   */
+  private async raiseHold(
+    latest: AgentRun,
+    agent: string,
+    task: string,
+    ask: {
+      kind?: "blocked" | "waiting";
+      question: string;
+      context: string[];
+      startLabel?: string;
+      startConsequences?: string;
+      keepLabel?: string;
+      keepConsequences?: string;
+      why?: string;
+      withOutput?: boolean;
+    },
+  ): Promise<void> {
+    const output = ask.withOutput === false ? [] : lastOutput(latest);
     await this.options.raise(
       {
         kind: "escalation",
-        key: fillDecisionKey(task, latest.id),
+        key: fillDecisionKey(task, latest.id, ask.kind),
         ref: `fill:${task}`,
         blocks: [`agents:${this.options.project}:task:${task}`],
-        question,
-        context: [
-          "Runs:",
-          ...runs.map((r) => `- ${r}`),
-          ...(output.length > 0 ? ["", "Last output:", ...output.map((l) => `- ${l}`)] : []),
-        ].join("\n"),
+        question: ask.question,
+        context: [...ask.context, ...(output.length > 0 ? ["", "Last output:", ...output.map((l) => `- ${l}`)] : [])].join("\n"),
         options: [
           {
             id: DECISION_FILL_START,
-            label: "Let fill start it again",
-            consequences: `Fill starts ${task} for ${agent} again on its next check, counting from zero.`,
+            label: ask.startLabel ?? "Let fill start it again",
+            consequences: ask.startConsequences ?? `Fill starts ${task} for ${agent} again on its next check, counting from zero.`,
           },
           {
             id: DECISION_FILL_KEEP,
-            label: "Keep it held",
-            consequences: `Fill leaves ${task} alone until you start a run of it, or release the hold in the Agents view.`,
+            label: ask.keepLabel ?? "Keep it held",
+            consequences:
+              ask.keepConsequences ?? `Fill leaves ${task} alone until you start a run of it, or release the hold in the Agents view.`,
           },
         ],
         recommended: DECISION_FILL_KEEP,
-        why: "A run that stops the same way again and again usually needs a change a restart won't make (a usage limit, a missing done line, a prompt).",
+        why:
+          ask.why ??
+          "A run that stops the same way again and again usually needs a change a restart won't make (a usage limit, a missing done line, a prompt).",
         reversible: true,
       },
       latest,
     );
+  }
+
+  /**
+   * How the run ended, beyond exit 0: the latest WAITING or BLOCKED line for
+   * the task written since its chain was requested. Once seen it is kept in
+   * the store (fill_waiting / fill_blocked for this run), so a rotated queue
+   * file doesn't turn a waiting or blocked run into one without progress.
+   */
+  private async runStatus(latest: AgentRun, agent: string, task: string, queue: QueueLines): Promise<RunStatus | null> {
+    const { settings, store, project, probes } = this.options;
+    const seen = queue.lastStatus(
+      donePatternFor(settings.waitingPattern, task, agent),
+      donePatternFor(settings.blockedPattern, task, agent),
+      task,
+      latest.queueMark,
+    );
+    if (seen) {
+      await this.options.record(
+        seen.kind === "waiting" ? "fill_waiting" : "fill_blocked",
+        {
+          agent,
+          task,
+          runId: latest.id,
+          summary: `fill: run ${short(latest.id)} of ${agent} on ${task} ended ${seen.kind}: ${oneLine(seen.line)}`,
+          evidence: [seen.line],
+          data: { line: seen.line, wake: seen.wake },
+          dedupeKey: `fill_status:${task}:${latest.id}:${seen.kind}:${sha256(Buffer.from(seen.line, "utf-8")).slice(0, 16)}`,
+        },
+        probes.clock.now(),
+      );
+      return seen;
+    }
+    const kept = store.listEvents(project, { kinds: ["fill_waiting", "fill_blocked"], task, runId: latest.id, limit: 1 })[0];
+    if (!kept) return null;
+    return {
+      kind: kept.kind === "fill_waiting" ? "waiting" : "blocked",
+      line: String(kept.data.line ?? ""),
+      wake: typeof kept.data.wake === "string" ? kept.data.wake : null,
+    };
+  }
+
+  /**
+   * A waiting run: null when it may start again (the wake file exists, or the
+   * fallback is up), else what it waits for. A wake that isn't a plain name,
+   * or whose file would be outside wake.root, is refused (and shown): the run
+   * waits fallback_seconds instead.
+   */
+  private waitFor(
+    latest: AgentRun,
+    task: string,
+    status: RunStatus,
+    now: number,
+  ): { detail: string; view: FillWaitingView; file: string | null } | null {
+    const wake = this.options.settings.wake;
+    const since = latest.endedAt ?? latest.requestedAt;
+    let file: string | null = null;
+    let refused: string | null = null;
+    if (status.wake !== null && wake.file) {
+      const resolved = this.wakePath(status.wake);
+      if (resolved.ok) file = resolved.path;
+      else refused = resolved.reason;
+    }
+    const pollKey = `${task}|${latest.id}`;
+    this.waitingSeen.add(pollKey);
+    if (file !== null && this.wakeExists(pollKey, file, now)) return null;
+    const fallbackAt = file === null ? since + wake.fallbackSeconds * 1000 : null;
+    if (fallbackAt !== null && now >= fallbackAt) return null;
+    const shown = status.wake === null ? null : oneLine(status.wake, 100);
+    const view: FillWaitingView = {
+      wake: shown,
+      since: iso(since),
+      fallbackAt: fallbackAt === null ? null : iso(fallbackAt),
+      refused,
+    };
+    const detail = [
+      `waiting: ${shown ?? "(nothing named)"} since ${view.since}`,
+      file !== null ? `starts again once ${file} exists` : `starting it again at ${view.fallbackAt}`,
+      ...(refused !== null ? [`wake "${shown}" refused: ${refused}`] : []),
+    ].join("; ");
+    return { detail, view, file };
+  }
+
+  /** The wake file for a waiting line's capture: a plain name, inside wake.root. */
+  private wakePath(value: string): { ok: true; path: string } | { ok: false; reason: string } {
+    if (!WAKE_VALUE.test(value) || value.includes("..")) {
+      return { ok: false, reason: "not a plain name (letters, digits, '.', '_' and '-', no '..', '/' or leading '-')" };
+    }
+    const { config, settings } = this.options;
+    const vars: Record<string, string> = { wake: value, gates_dir: config.gates_dir, agents_dir: config.agents_dir, repo: config.repo };
+    const fill = (template: string) => template.replace(/\{(wake|gates_dir|agents_dir|repo)\}/g, (match, name: string) => vars[name] ?? match);
+    const absolute = (path: string) => (isAbsolute(path) ? resolve(path) : resolve(config.repo, path));
+    const root = absolute(fill(settings.wake.root));
+    const path = absolute(fill(settings.wake.file ?? ""));
+    if (!within(root, path)) return { ok: false, reason: `${path} is outside wake.root (${root})` };
+    return { ok: true, path };
+  }
+
+  /** The wake file exists; looked for at most every wake.poll_seconds per waiting run. */
+  private wakeExists(key: string, path: string, now: number): boolean {
+    const last = this.polled.get(key);
+    if (last !== undefined && now - last < this.options.settings.wake.pollSeconds * 1000) return false;
+    let exists = false;
+    try {
+      lstatSync(path);
+      exists = true;
+    } catch {
+      exists = false;
+    }
+    if (exists) this.polled.delete(key);
+    else this.polled.set(key, now);
+    return exists;
   }
 
   /** null when capacity_cmd exits 0; otherwise why fill holds (a timeout holds too). */

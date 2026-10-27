@@ -134,7 +134,9 @@ export type AgentEventKind =
   | "fill_started"
   | "fill_held"
   | "fill_done"
-  | "fill_released";
+  | "fill_released"
+  | "fill_waiting"
+  | "fill_blocked";
 
 /** Recovery and audit record: what happened, why, and the evidence. */
 export interface AgentEventView {
@@ -245,13 +247,19 @@ export type FillLineState = "started" | "done" | "held" | "claimed" | "not_allow
  * - owner: the task's last run ended other than completed (escalated, stopped, its claim lost)
  * - no_done: its runs exited 0 without reporting it done fill.max_completions_without_done times in a row
  * - backoff: its last run exited 0 without reporting it done; it starts again after a backoff
+ * - waiting: its last run ended on a WAITING line; it starts again once what it waits on is there
+ *   (fill.wake.file), or after fill.wake.fallback_seconds
+ * - blocked: its last run ended on a BLOCKED line: it needs someone else first
  * - busy, read_only, max_active, capacity, prompt (a refused prompt file), refused (the run request)
- * owner and no_done are the owner's to release (POST /api/agents/fill/release, or the decision).
+ * owner, no_done, blocked and waiting are the owner's to release (POST /api/agents/fill/release, or
+ * the decision); a waiting one also ends by itself.
  */
 export type FillHold =
   | "owner"
   | "no_done"
   | "backoff"
+  | "waiting"
+  | "blocked"
   | "busy"
   | "read_only"
   | "max_active"
@@ -270,9 +278,21 @@ export interface FillLineView {
   detail: string;
   /** Why it is held (state "held"), else null */
   hold: FillHold | null;
-  /** The owner can release this hold (owner and no_done holds) */
+  /** The owner can release this hold (owner, no_done, blocked and waiting holds) */
   releasable: boolean;
+  /** A waiting line: what it waits on (null without one) and since when its run ended */
+  waiting: FillWaitingView | null;
   runId: string | null;
+}
+
+export interface FillWaitingView {
+  /** What the WAITING line named (a gate id, say), when the pattern captures it */
+  wake: string | null;
+  since: string;
+  /** When fill starts it again without the wake (no wake, or one refused), else null */
+  fallbackAt: string | null;
+  /** Why the captured wake isn't used, if it isn't */
+  refused: string | null;
 }
 
 export interface FillStatusView {

@@ -5,7 +5,16 @@ import { readFileSync } from "fs";
 import { describe, expect, it } from "vitest";
 import { parse as parseYaml } from "yaml";
 import type { ProjectConfig } from "../../shared/types.js";
-import { backoffMs, DEFAULT_DONE_PATTERN, doneLineMatches, donePatternFor, parseAgentsConfig } from "./config.js";
+import {
+  backoffMs,
+  DEFAULT_BLOCKED_PATTERN,
+  DEFAULT_DONE_PATTERN,
+  DEFAULT_WAITING_PATTERN,
+  doneLineMatches,
+  donePatternFor,
+  parseAgentsConfig,
+  taskLineMatch,
+} from "./config.js";
 
 const project = {
   name: "Demo",
@@ -133,6 +142,9 @@ describe("agents config", () => {
       maxCompletionsWithoutDone: 3,
       backoffSeconds: 60,
       maxBackoffSeconds: 1800,
+      waitingPattern: DEFAULT_WAITING_PATTERN,
+      blockedPattern: DEFAULT_BLOCKED_PATTERN,
+      wake: { file: undefined, root: "{gates_dir}", pollSeconds: 60, maxWaitMinutes: 240, fallbackSeconds: 900 },
     });
     expect(errorsOf({ fill: { enabled: true } })).toEqual([
       "agents.fill.enabled: fill needs agents.enabled: true",
@@ -140,6 +152,54 @@ describe("agents config", () => {
       "agents.fill.agents: list the agents fill may start (required when fill is enabled)",
       "agents.fill.prompt_files: at least one prompt file is required when fill is enabled",
     ]);
+  });
+
+  it("fill: waiting_pattern and blocked_pattern need {task} and must compile; wake.file needs {wake} and stays put", () => {
+    const fill = {
+      enabled: true,
+      tasks_file: "work/tasks.txt",
+      agents: ["worker-a"],
+      prompt_files: ["{prompts_dir}/{agent}.txt"],
+      waiting_pattern: "^-\\s+WAITING\\s+{task}(?:\\s+(?<wake>\\d{8}T\\d{6}Z-\\S+))?(?=\\s|$)",
+      wake: { file: "{gates_dir}/results/{wake}.rc", root: "{gates_dir}/results" },
+    };
+    const withFill = (extra: Record<string, unknown>) => ({ enabled: true, fill: { ...fill, ...extra } });
+    expect(errorsOf(withFill({}))).toEqual([]);
+    for (const key of ["waiting_pattern", "blocked_pattern"]) {
+      expect(errorsOf(withFill({ [key]: "^- WAITING " }))).toEqual([
+        `agents.fill.${key}: needs {task} (without it one ${key === "waiting_pattern" ? "waiting" : "blocked"} line would match every task)`,
+      ]);
+      expect(errorsOf(withFill({ [key]: "^- BLOCKED ({task}" }))[0]).toContain(`agents.fill.${key}: not a valid regular expression`);
+      expect(errorsOf(withFill({ [key]: "^- BLOCKED {task} {gate}" }))[0]).toContain(`agents.fill.${key}: unknown placeholder {gate}`);
+    }
+    const wake = (extra: Record<string, unknown>) => withFill({ wake: { ...fill.wake, ...extra } });
+    expect(errorsOf(wake({ file: "{gates_dir}/results/latest.rc" }))).toEqual([
+      "agents.fill.wake.file: needs {wake} (what the waiting line names)",
+    ]);
+    expect(errorsOf(wake({ file: "{gates_dir}/../{wake}.rc" }))).toEqual(['agents.fill.wake.file: a ".." segment is refused']);
+    expect(errorsOf(wake({ file: "{home}/{wake}.rc" }))[0]).toContain("agents.fill.wake.file: unknown placeholder {home}");
+    expect(errorsOf(wake({ root: "{gates_dir}/.." }))).toEqual(['agents.fill.wake.root: a ".." segment is refused']);
+    expect(errorsOf(wake({ root: "{wake}" }))[0]).toContain("agents.fill.wake.root: unknown placeholder {wake}");
+    expect(errorsOf(wake({ poll_seconds: 0 }))[0]).toContain("agents.fill.wake.poll_seconds");
+    expect(errorsOf(wake({ every: 1 }))[0]).toContain("agents.fill.wake");
+  });
+
+  it("the default waiting and blocked patterns: the task's own line, the task id exact", () => {
+    const matches = (template: string, line: string, task = "feat-login") =>
+      taskLineMatch(donePatternFor(template, task, "worker-a"), task, line) !== null;
+    expect(matches(DEFAULT_WAITING_PATTERN, "- WAITING feat-login 20260101T000000Z-x-abcdef12-1 by worker-a: gate queued")).toBe(true);
+    expect(matches(DEFAULT_WAITING_PATTERN, "  -  waiting feat-login")).toBe(true);
+    expect(matches(DEFAULT_WAITING_PATTERN, "- WAITING feat-login-2 by worker-a")).toBe(false);
+    expect(matches(DEFAULT_WAITING_PATTERN, "- WAITING feat:login by worker-a", "feat")).toBe(false);
+    expect(matches(DEFAULT_BLOCKED_PATTERN, "- BLOCKED feat-login by worker-a: needs a key")).toBe(true);
+    expect(matches(DEFAULT_BLOCKED_PATTERN, "- BLOCKED FEAT-LOGIN by worker-a")).toBe(false);
+    expect(matches(DEFAULT_BLOCKED_PATTERN, "- DONE feat-login by worker-a")).toBe(false);
+    // A capture names what the run waits on
+    const gate = donePatternFor("^-\\s+WAITING\\s+{task}(?:\\s+(?<wake>\\d{8}T\\d{6}Z-\\S+))?(?=\\s|$)", "feat-login", "worker-a");
+    expect(taskLineMatch(gate, "feat-login", "- WAITING feat-login 20260101T000000Z-x-abcdef12-1 by worker-a")?.groups?.wake).toBe(
+      "20260101T000000Z-x-abcdef12-1",
+    );
+    expect(taskLineMatch(gate, "feat-login", "- WAITING feat-login by worker-a")?.groups?.wake).toBeUndefined();
   });
 
   it("fill: prompt paths can't climb out, placeholders are checked, done_pattern needs {task}", () => {
