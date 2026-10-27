@@ -544,6 +544,7 @@ Every route that changes something only you should change needs the owner's sess
 | `/api/decisions` | answering a decision | listing, the summary, raising |
 | `/api/owner` | listing and signing out browsers | the session check, signing in with the token |
 | `/api/review` | the owner's review, resolving findings, releasing holds, merging | reading, agent reviews, adding holds, gate results |
+| `/api/agents` | starting a run, releasing a claim, a fresh session, an early check | status, runs, recoveries |
 | `/api/controls` | every `POST`: ask, instruct, tick, pause, resume, agent run/stop/release, gate submit/stuck, merge, dragon start/stop | status, inbox, audit, dragon config |
 | `/api/bus/send` | sending a message (it is sent as `owner`) | the board and the event stream (`/api/bus/board`, `/api/bus/events`) |
 | `/api/processes` | start, stop, restart | the list, a process, its logs |
