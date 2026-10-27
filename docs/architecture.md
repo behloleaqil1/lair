@@ -58,7 +58,7 @@ In production (`npm run build && npm start`) the server also serves the built UI
 The Fastify-based backend that serves the API and manages state.
 
 - **`index.ts`**: server entry point, route registration, lifecycle and graceful shutdown
-- **`static.ts`**: serves the built UI (`dist/client`) with an SPA fallback, only when the build exists
+- **`static.ts`**: serves the built UI (`dist/client`) with an SPA fallback, only when the build exists; a served file is closed when its response closes, also when the client left before the reply
 - **`root-guards.ts`**: root request hooks (cross-site and `Host` checks on every route, `?project=` validation on API routes) and the `:id` path-parameter check
 - **`origin.ts`**: allowed browser origins and `Host` names, the cross-site request hook, and the lair-node peer check (`LAIR_NODE_TOKEN`)
 - **`config.ts`**: project YAML loader and project-name validation (`projects/<name>.yaml`; a file of the same name in `projects/local/` takes precedence)

@@ -10,6 +10,7 @@ import type { FastifyInstance } from "fastify";
 import fastifyStatic from "@fastify/static";
 import { existsSync } from "fs";
 import { dirname, join, resolve } from "path";
+import type { Readable } from "stream";
 import { fileURLToPath } from "url";
 
 /**
@@ -36,6 +37,31 @@ export function isBackendPath(url: string): boolean {
 }
 
 /**
+ * Close a served file when its response stream closes.
+ *
+ * @fastify/static 7 pipes the file (an fs read stream from @fastify/send 2)
+ * into a stream of its own, `res` here, and @fastify/send closes the file
+ * only when that stream *finishes*. When the client goes away first (a
+ * reload, a closed tab, a request that waited behind a busy server), Fastify
+ * destroys that stream instead: the file stayed open for good, one
+ * descriptor per such request. `res` emits "pipe" with the file stream when
+ * the file is piped into it; destroying the file when `res` closes releases
+ * it either way (after a complete send it is closed already).
+ */
+export function closeFileWithResponse(res: unknown): void {
+  const candidate = res as { once?: unknown } | null | undefined;
+  if (!candidate || typeof candidate.once !== "function") return;
+  const out = res as NodeJS.EventEmitter & { destroyed?: boolean };
+  out.once("pipe", (file: Readable) => {
+    if (out.destroyed) {
+      file.destroy();
+      return;
+    }
+    out.once("close", () => file.destroy());
+  });
+}
+
+/**
  * Register static serving of the built client with an SPA fallback:
  * any GET/HEAD request that is not an API or WebSocket path and does not
  * match a file gets index.html, so client-side routes survive a reload.
@@ -53,6 +79,9 @@ export async function registerClientStatic(
   await fastify.register(fastifyStatic, {
     root: clientDir,
     prefix: "/",
+    // Called with the response stream before the file is opened (for
+    // reply.sendFile too, so the SPA fallback's index.html is covered)
+    setHeaders: (res) => closeFileWithResponse(res),
   });
 
   fastify.setNotFoundHandler((request, reply) => {
