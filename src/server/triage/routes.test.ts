@@ -9,7 +9,7 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
-import { mkdtempSync, readFileSync, rmSync } from "fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import type { GateResult } from "../../shared/policy-types.js";
@@ -65,6 +65,9 @@ async function boot() {
   const runner = new FakeRunner();
   const git = new FakeGit();
   const events = new EventBus();
+  // The node keys live outside the project repository (an agent could replace a key inside it)
+  const repo = join(dir, "repo");
+  mkdirSync(repo);
   const node = trustedNode(dir, "ci-1");
   const tokenPath = join(dir, "owner.token");
   auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
@@ -76,9 +79,9 @@ async function boot() {
     probes: { runner, clock: new FakeClock(), fs: new NodeFileSystem(), git: () => git },
     events,
     projects: [
-      { name: "demo", config: projectConfig(dir, actingTriage({ trusted_nodes: [{ id: node.id, public_key_file: node.publicKeyFile }] })) },
-      { name: "off", config: projectConfig(dir, {}) },
-      { name: "broken", config: projectConfig(dir, { enabled: true, mode: "sometimes" }) },
+      { name: "demo", config: projectConfig(repo, actingTriage({ trusted_nodes: [{ id: node.id, public_key_file: node.publicKeyFile }] })) },
+      { name: "off", config: projectConfig(repo, {}) },
+      { name: "broken", config: projectConfig(repo, { enabled: true, mode: "sometimes" }) },
       { name: "unreadable", error: "Project config not found" },
     ],
     defaultProject: () => "demo",
@@ -115,7 +118,7 @@ function requestOf(argv: string[]): string {
 
 describe("triage over HTTP", () => {
   it("a signed failed result is classified and re-checked; the re-check command posts its signed answer straight back", async () => {
-    const { app, runner, node } = await boot();
+    const { app, runner, node, manager } = await boot();
     const answers: number[] = [];
     // The project's re-check command: it runs the tests and posts the signed answer before it returns
     runner.when(
@@ -143,9 +146,12 @@ describe("triage over HTTP", () => {
       payload: signedBody(node, failedContextResult(), contextReport()),
     });
     expect(res.statusCode).toBe(200);
-    const { record, rechecks } = res.json().data;
-    expect(record).toMatchObject({ gateId: "gate-1", sha: P1, trust: "signed", verdict: "infra", retries: 1 });
-    expect(record.causes[0].verdict.rule).toBe("infra-pattern:connection-timeout");
+    // The record comes back at once; its re-check runs in the background
+    const received = res.json().data.record;
+    expect(received).toMatchObject({ gateId: "gate-1", sha: P1, trust: "signed", verdict: "infra", retries: 1 });
+    expect(received.causes[0].verdict.rule).toBe("infra-pattern:connection-timeout");
+    await manager.idle();
+    const { record, rechecks } = (await app.inject({ url: `/api/triage/failures/${received.id}` })).json().data;
     // Only the failed classes, at the same commit
     expect(runner.callsTo("./bin/recheck")).toEqual([
       ["./bin/recheck", `--sha=${P1}`, `--request=${rechecks[0].id}`, "--steps=test", OrderApiIT, PaymentApiIT],
@@ -181,7 +187,7 @@ describe("triage over HTTP", () => {
   });
 
   it("refuses unsigned, tampered and untrusted results, and forged re-check answers", async () => {
-    const { app, node } = await boot();
+    const { app, node, manager } = await boot();
     const post = (payload: Record<string, unknown>) => app.inject({ method: "POST", url: "/api/triage/results", payload });
 
     // Unsigned: anyone on this machine could send it
@@ -213,7 +219,8 @@ describe("triage over HTTP", () => {
 
     // A real failure whose re-check is pending
     const failed = await post(signedBody(node, failedContextResult(), contextReport()));
-    const { record, rechecks } = failed.json().data;
+    await manager.idle();
+    const { record, rechecks } = (await app.inject({ url: `/api/triage/failures/${failed.json().data.record.id}` })).json().data;
     expect(rechecks[0].status).toBe("requested");
     // A validly signed pass that isn't the asked-for run: refused, the failure stays blocking
     const forged = await post(
@@ -336,6 +343,22 @@ describe("triage over HTTP", () => {
     const early = await app.inject({ method: "POST", url: `/api/triage/owner/incidents/${incident.id}/revert`, headers: owner, payload: {} });
     expect(early.statusCode).toBe(409);
     expect(runner.callsTo("./bin/revert")).toEqual([]);
+  });
+
+  it("refuses a trusted node's key kept inside the project's repository, where an agent could replace it", async () => {
+    dir = mkdtempSync(join(tmpdir(), "lair-triage-routes-"));
+    const inside = trustedNode(dir, "ci-1");
+    app = Fastify();
+    manager = await mountTriage(app, {
+      dbPath: ":memory:",
+      probes: { runner: new FakeRunner(), clock: new FakeClock(), fs: new NodeFileSystem(), git: () => new FakeGit() },
+      projects: [
+        { name: "demo", config: projectConfig(dir, actingTriage({ trusted_nodes: [{ id: inside.id, public_key_file: inside.publicKeyFile }] })) },
+      ],
+      defaultProject: () => "demo",
+    });
+    expect(manager.get("demo")).toBeUndefined();
+    expect(manager.status("demo").errors.join("; ")).toContain("inside the project's repository");
   });
 
   it("validates input, ids and origins", async () => {

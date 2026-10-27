@@ -108,6 +108,12 @@ export class FakeGit implements GitProbe {
     const at = this.main.indexOf(descendant);
     return at >= 0 && this.main.indexOf(ancestor) >= 0 && this.main.indexOf(ancestor) <= at;
   }
+
+  async branchTips(branch: string): Promise<string[]> {
+    this.calls.push(`tips ${branch}`);
+    const tip = this.main[this.main.length - 1];
+    return tip ? [tip] : [];
+  }
 }
 
 /** A 40-character sha made from a short label, e.g. sha("a1") */
@@ -221,15 +227,17 @@ export function projectConfig(dir: string, triage: Record<string, unknown>, extr
 export function harness(
   triage: Record<string, unknown> | ((dir: string) => Record<string, unknown>),
   extra: Partial<ProjectConfig> = {},
+  /** A restart: the same project directory and store file as an earlier harness */
+  restart?: { dir: string; dbPath: string },
 ): Harness {
-  const dir = mkdtempSync(join(tmpdir(), "lair-triage-"));
+  const dir = restart?.dir ?? mkdtempSync(join(tmpdir(), "lair-triage-"));
   const runner = new FakeRunner();
   const clock = new FakeClock();
   const git = new FakeGit();
   const events = new EventBus();
   const config = projectConfig(dir, typeof triage === "function" ? triage(dir) : triage, extra);
   const manager = new TriageManager({
-    dbPath: ":memory:",
+    dbPath: restart?.dbPath ?? ":memory:",
     probes: { runner, clock, fs: new NodeFileSystem(), git: () => git },
     events,
   });

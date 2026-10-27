@@ -152,6 +152,7 @@ const TrustedBody = z.object({
       agent: z.string().regex(AGENT, "not an agent id").optional(),
       pr: z.number().int().positive().optional(),
       recheckId: z.string().regex(UUID, "not a re-check id").optional(),
+      runId: z.string().min(1).max(300).optional(),
       loadPerCore: z.number().min(0).optional(),
     })
     .default({}),
@@ -259,12 +260,12 @@ export async function registerTriageRoutes(
           reports.push({ name: entry.name, step: entry.step, format: report.format, content: report.content });
         }
         return respond(
-          await manager.ingest(project, {
-            result: result.data,
-            reports,
-            context: { recheckId: body.data.recheckId },
-            trust: "signed",
-          }),
+          // The record at once: its re-checks, messages and tasks run in the background
+          await manager.ingest(
+            project,
+            { result: result.data, reports, context: { recheckId: body.data.recheckId }, trust: "signed" },
+            { background: true },
+          ),
         );
       } catch (e) {
         return failWith(reply, e);

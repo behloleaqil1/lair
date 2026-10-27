@@ -94,4 +94,14 @@ describe("GitCli", () => {
     expect(await cli.isAncestor(shas.m2, shas.m1)).toBe(false);
     expect(await cli.isAncestor(shas.c0, shas.f2)).toBe(true);
   });
+
+  it("reads a branch's tips: the local branch and each remote's branch of exactly that name", async () => {
+    const cli = new GitCli(dir, new ExecFileRunner());
+    git("update-ref", "refs/remotes/origin/main", shas.m1);
+    // Branches that only end in the name are not it
+    git("update-ref", "refs/remotes/origin/feature/main", shas.f1);
+    git("update-ref", "refs/heads/old/main", shas.c0);
+    expect((await cli.branchTips("main")).sort()).toEqual([git("rev-parse", "refs/heads/main"), shas.m1].sort());
+    await expect(cli.branchTips("--all")).rejects.toThrow("not a branch name");
+  });
 });

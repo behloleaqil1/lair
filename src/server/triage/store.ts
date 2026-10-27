@@ -201,6 +201,19 @@ const SCHEMA = `
     created_at TEXT NOT NULL,
     PRIMARY KEY (project, subject)
   );
+
+  -- Calls a decision queued (agent messages, tasks, reverts, decisions, a
+  -- culprit's commit), written in the decision's transaction and removed in
+  -- the transaction that records the call's result, so a restart runs what a
+  -- killed process left
+  CREATE TABLE IF NOT EXISTS triage_outbox (
+    id TEXT PRIMARY KEY,
+    project TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_ms INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_tr_outbox ON triage_outbox(project, created_ms);
 `;
 
 interface RecordRow {
@@ -564,7 +577,7 @@ export class TriageStore {
   lastGreen(project: string, branch: string, pipelineId: string, steps: string[], beforeMs: number): TriageRecord | null {
     const rows = this.db
       .prepare(
-        `SELECT * FROM triage_records WHERE project = ? AND branch = ? AND pipeline_id = ? AND purpose = 'gate'
+        `SELECT * FROM triage_records WHERE project = ? AND branch = ? AND default_branch = 1 AND pipeline_id = ? AND purpose = 'gate'
            AND status = 'passed' AND received_ms <= ?
          ORDER BY received_ms DESC, rowid DESC LIMIT 200`,
       )
@@ -815,6 +828,20 @@ export class TriageStore {
 
   getRecheck(id: string): Recheck | null {
     const row = this.db.prepare(`SELECT * FROM triage_rechecks WHERE id = ?`).get(id) as RecheckRow | undefined;
+    return row ? toRecheck(row) : null;
+  }
+
+  /** The re-check still waiting for an answer whose id or run id is one of `ids`, at this commit and branch. */
+  answerableRecheck(project: string, ids: string[], sha: string, branch: string, statuses: readonly string[]): Recheck | null {
+    if (ids.length === 0 || statuses.length === 0) return null;
+    const idMarks = ids.map(() => "?").join(", ");
+    const statusMarks = statuses.map(() => "?").join(", ");
+    const row = this.db
+      .prepare(
+        `SELECT * FROM triage_rechecks WHERE project = ? AND lower(sha) = ? AND branch = ? AND status IN (${statusMarks})
+           AND (id IN (${idMarks}) OR run_id IN (${idMarks})) ORDER BY created_ms DESC LIMIT 1`,
+      )
+      .get(project, sha.toLowerCase(), branch, ...statuses, ...ids, ...ids) as RecheckRow | undefined;
     return row ? toRecheck(row) : null;
   }
 
@@ -1100,6 +1127,27 @@ export class TriageStore {
 
   setDecisionRef(project: string, subject: string, ref: string): void {
     this.db.prepare(`UPDATE triage_decisions SET ref = ? WHERE project = ? AND subject = ?`).run(ref, project, subject);
+  }
+
+  addOutbox(project: string, kind: string, payload: unknown, createdMs: number): string {
+    const id = randomUUID();
+    this.db
+      .prepare(`INSERT INTO triage_outbox (id, project, kind, payload, created_ms) VALUES (?, ?, ?, ?, ?)`)
+      .run(id, project, kind, JSON.stringify(payload), createdMs);
+    return id;
+  }
+
+  /** The calls still to run, oldest first. */
+  outbox(project: string): { id: string; kind: string; payload: unknown }[] {
+    const rows = this.db
+      .prepare(`SELECT id, kind, payload FROM triage_outbox WHERE project = ? ORDER BY created_ms, rowid`)
+      .all(project) as { id: string; kind: string; payload: string }[];
+    return rows.map((r) => ({ id: r.id, kind: r.kind, payload: JSON.parse(r.payload) as unknown }));
+  }
+
+  /** Remove a call that ran; false when it was already removed. */
+  removeOutbox(id: string): boolean {
+    return this.db.prepare(`DELETE FROM triage_outbox WHERE id = ?`).run(id).changes > 0;
   }
 }
 

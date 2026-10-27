@@ -24,6 +24,8 @@ export interface GitProbe {
   mergeBase(sha: string, branch: string): Promise<string | null>;
   /** Whether `ancestor` is in `descendant`'s history (git merge-base --is-ancestor) */
   isAncestor(ancestor: string, descendant: string): Promise<boolean>;
+  /** The commits `branch` points at: the local branch and each remote's branch of that exact name */
+  branchTips(branch: string): Promise<string[]>;
 }
 
 const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
@@ -104,5 +106,20 @@ export class GitCli implements GitProbe {
     if (out.code === 0) return true;
     if (out.code === 1) return false;
     throw new Error(`git merge-base --is-ancestor failed (${out.code}): ${out.stderr.trim().slice(0, 300)}`);
+  }
+
+  async branchTips(branch: string): Promise<string[]> {
+    assertBranch(branch);
+    const out = await this.git(["for-each-ref", "--format=%(objectname) %(refname)", `refs/heads/${branch}`, "refs/remotes/"]);
+    const tips = new Set<string>();
+    for (const line of out.split("\n")) {
+      const [sha, ref] = line.trim().split(" ");
+      if (!sha || !ref || !SHA_PATTERN.test(sha)) continue;
+      // Exactly refs/heads/<branch> or refs/remotes/<remote>/<branch>: never a branch that only ends in its name
+      const remote = ref.startsWith("refs/remotes/") ? ref.slice("refs/remotes/".length) : null;
+      const slash = remote ? remote.indexOf("/") : -1;
+      if (ref === `refs/heads/${branch}` || (remote && slash > 0 && remote.slice(slash + 1) === branch)) tips.add(sha.toLowerCase());
+    }
+    return [...tips];
   }
 }

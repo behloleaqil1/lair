@@ -6,6 +6,9 @@
  * (trusted), as the gates module hands them over.
  */
 import { afterEach, describe, expect, it } from "vitest";
+import { mkdtempSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { actingTriage, fixture, gate, harness, junitPassing, MIN, sha, step, type Harness } from "./testing/harness.js";
 import type { IngestContext } from "./service.js";
 
@@ -113,6 +116,7 @@ describe("classifier", () => {
     h = harness(actingTriage({ base_max_age_hours: 24 }));
     const report = junitOne("com.example.shop.CartTest", "addsItem()", "expected 2 items");
     // The default branch fails the same test at another commit: not this change's base
+    h.git.commitOnMain(sha("m9"));
     await h.ingest({ result: gate({ sha: sha("m9"), branch: "main" }), reports: [{ content: report }] });
     const unrelated = await h.ingest({
       result: gate({ sha: sha("p1"), branch: "feat/a" }),
@@ -188,6 +192,7 @@ describe("classifier", () => {
   it("code: near the changed files, with the files and the base comparison as evidence", async () => {
     h = harness(actingTriage());
     const base = sha("m0");
+    h.git.commitOnMain(base);
     await h.ingest({ result: gate({ sha: base, branch: "main", status: "passed" }) });
     const out = await h.ingest({
       result: gate({ sha: sha("p1"), branch: "feat/tax" }),
@@ -306,6 +311,36 @@ describe("actions: infra", () => {
     expect(h.manager.getStore()!.getRecord(out.record.id)!.blocking).toBe(false);
   });
 
+  it("an answer that arrives after the request timed out still counts, until the re-check times out", async () => {
+    h = harness(actingTriage());
+    // The command started the run but did not return in time (the runner's timeout code)
+    h.runner.when((argv) => argv[0] === "./bin/recheck", () => ({ code: -1, stdout: "", stderr: "timed out" }));
+    const p1 = sha("p1");
+    const out = await contextFailure(h, p1);
+    const recheck = h.manager.getStore()!.getRecheck(out.rechecks[0].id)!;
+    expect(recheck.status).toBe("unavailable");
+
+    const late = await answer(h, recheck.id, p1, { passed: true, report: junitPassing(CONTEXT_TESTS) });
+    expect(late.record).toMatchObject({ purpose: "recheck", status: "passed" });
+    expect(h.manager.getStore()!.getRecheck(recheck.id)!.status).toBe("passed");
+    expect(h.manager.getStore()!.getRecord(out.record.id)!.blocking).toBe(false);
+  });
+
+  it("an in-process result answers the re-check whose run it is, without a re-check id", async () => {
+    h = harness(actingTriage());
+    h.runner.when((argv) => argv[0] === "./bin/recheck", () => ({ code: 0, stdout: "run-88\n", stderr: "" }));
+    const p1 = sha("p1");
+    const out = await contextFailure(h, p1);
+    // As the pipelines module sends it: its own result id, and the run id in the context
+    const back = await h.ingest({
+      result: gate({ id: "gate-5e1f2a3b", sha: p1, branch: "feat/orders", status: "passed", steps: [step("test", "passed")] }),
+      reports: [{ step: "test", content: junitPassing(CONTEXT_TESTS) }],
+      context: { runId: "run-88" },
+    });
+    expect(back.record).toMatchObject({ purpose: "recheck", recheckId: out.rechecks[0].id, originId: out.record.id });
+    expect(h.manager.getStore()!.getRecord(out.record.id)!.blocking).toBe(false);
+  });
+
   it("waits for capacity, then re-checks", async () => {
     h = harness(actingTriage({ recheck: { capacity_cmd: ["./bin/capacity"] } }));
     let busy = true;
@@ -364,6 +399,7 @@ describe("actions: infra", () => {
   it("after max_retries, routes to the author when the base's own run passes", async () => {
     h = harness(actingTriage());
     const base = sha("m0");
+    h.git.commitOnMain(base);
     await h.ingest({ result: gate({ sha: base, branch: "main", status: "passed" }) });
     const p1 = sha("p1");
     const out = await contextFailure(h, p1, { baseSha: base, changedFiles: ["src/main/resources/application.yml"] });
@@ -415,6 +451,7 @@ describe("actions: pre-existing, flaky, code", () => {
     h = harness(actingTriage());
     const m1 = sha("m1");
     const report = junitOne("com.example.shop.CartTest", "addsItem()", "expected 2 items");
+    h.git.commitOnMain(m1);
     const main = await h.ingest({ result: gate({ sha: m1, branch: "main" }), reports: [{ content: report }] });
     expect(main.record).toMatchObject({ verdict: "code", blocking: true });
     expect(main.incident?.status).toBe("open");
@@ -504,6 +541,7 @@ describe("actions: pre-existing, flaky, code", () => {
     const store = h.manager.getStore()!;
     store.bumpFlaky("demo", "CartTest#addsItem()", new Date(h.clock.now()).toISOString());
     store.quarantine("demo", "CartTest#addsItem()", new Date(h.clock.now()).toISOString(), "2026-04-01T00:00:00.000Z");
+    h.git.commitOnMain(sha("m1"));
     const red = await h.ingest({
       result: gate({ sha: sha("m1"), branch: "main" }),
       reports: [{ content: junitOne("com.example.shop.CartTest", "addsItem()", "expected 2 items") }],
@@ -554,6 +592,36 @@ describe("actions: pre-existing, flaky, code", () => {
     expect(text).toContain("Field error in object 'orderRequest' on field 'quantity'");
     expect(text).toContain("why: near the change: app/src/main/java/com/example/shop/orders/OrderService.java");
     expect(out.actions.find((a) => a.kind === "route")).toMatchObject({ status: "done", argv: notes[0] });
+  });
+
+  it("a message whose process was killed before it went out is sent once after the restart", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lair-triage-restart-"));
+    const dbPath = join(dir, "triage.db");
+    const failure = {
+      result: gate({ id: "gate-tax-2", sha: sha("p6"), branch: "feat/tax" }),
+      reports: [{ content: fixture("junit-assertion.xml") }],
+      context: { agent: "worker-a", pr: 43 },
+    };
+    // The first process decides, then dies while its message is on the way (the command never finishes)
+    const killed = harness(actingTriage(), {}, { dir, dbPath });
+    killed.runner.when((argv) => argv[0] === "./bin/notify", () => new Promise<never>(() => {}));
+    const decided = await killed.service.ingest({ ...failure, trust: "trusted" }, { background: true });
+    for (let i = 0; i < 1000 && killed.runner.callsTo("./bin/notify").length === 0; i++) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    expect(killed.runner.callsTo("./bin/notify")).toHaveLength(1);
+    expect(decided.actions.filter((a) => a.kind === "route")).toEqual([]);
+
+    // The restarted process finds the message in the store's outbox and sends it, once
+    h = harness(actingTriage(), {}, { dir, dbPath });
+    await h.service.tick();
+    await h.manager.idle();
+    await h.service.tick();
+    await h.manager.idle();
+    expect(h.runner.callsTo("./bin/notify")).toHaveLength(1);
+    expect(h.runner.callsTo("./bin/notify")[0][1]).toBe("worker-a");
+    const routes = h.manager.getStore()!.actionsFor({ recordId: decided.record.id }).filter((a) => a.kind === "route");
+    expect(routes).toMatchObject([{ status: "done" }]);
   });
 
   it("with no notify command, the route is still recorded and emitted for the agents module", async () => {

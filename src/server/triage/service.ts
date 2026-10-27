@@ -16,14 +16,17 @@
  *    not blocking, one fix task on the default branch; flaky -> recorded,
  *    a reliability task after `ticket_after` in a row; code -> back to the
  *    author agent with the tests and a log excerpt;
- * 6. on the default branch: red opens an incident (per pipeline) and
- *    bisects the merges since its last green run; a green run of the same
- *    pipeline that ran the failing steps resolves it.
+ * 6. on the default branch (a commit in its history, whatever the label):
+ *    red opens an incident (per pipeline) and bisects the merges since its
+ *    last green run; a green run of the same pipeline that ran the failing
+ *    steps, at a commit containing the red one, resolves it.
  *
  * Decisions run one at a time per project (the serial queue), each in one
  * store transaction that never waits on anything slow. Commands, decisions
- * and events go to an outbox drained outside the queue, so a re-check
- * command that posts its answer straight back never waits on itself.
+ * and events go to an outbox drained outside the queue (the calls are also
+ * written to the store, so a restart makes the ones a killed process left),
+ * so a re-check command that posts its answer straight back never waits on
+ * itself.
  */
 import { randomUUID } from "crypto";
 import type { EventBus } from "../core/event-bus.js";
@@ -90,6 +93,8 @@ export interface IngestContext {
   pr?: number;
   /** This result answers the re-check (or bisect probe) with this id */
   recheckId?: string;
+  /** The run that produced it (in-process only): answers the re-check whose executor returned this run id */
+  runId?: string;
   /** The machine's load per core while the gate ran */
   loadPerCore?: number;
 }
@@ -151,6 +156,20 @@ export interface SignedInput {
 type Target = { recordId?: string; incidentId?: string };
 type Job = () => Promise<void>;
 
+/**
+ * A call a decision queued. It is written to the store's outbox in the
+ * decision's transaction and removed in the one that records its result, so
+ * a call a killed process never ran runs after the restart (one that was
+ * running when the process died may run again: at least once).
+ */
+type AdapterCall =
+  | { kind: "route"; target: Target; what: string; message: AgentMessage }
+  | { kind: "task"; target: Target; what: string; action: ActionKind; task: TriageTask }
+  | { kind: "revert"; target: Target; what: string; request: RevertRequest; reason: string; actor?: string }
+  | { kind: "decision"; target: Target; what: string; request: DecisionRequest };
+/** Reading a culprit's commit, then deciding on it */
+type Call = AdapterCall | { kind: "culprit"; incidentId: string; sha: string };
+
 /** What one decision section leaves to do once its transaction commits. */
 interface Section {
   jobs: Job[];
@@ -165,7 +184,8 @@ interface IncidentPlan {
 }
 
 /** A re-check that an answer may still come back for. */
-const ANSWERABLE: RecheckStatus[] = ["dispatching", "requested"];
+// "unavailable": the request failed or timed out, but the run may have started; its answer still counts until the re-check times out
+const ANSWERABLE: RecheckStatus[] = ["dispatching", "requested", "unavailable"];
 const OPEN_RECHECK: RecheckStatus[] = ["waiting_capacity", "dispatching", "requested", "planned", "unavailable"];
 /** A re-check left "dispatching" this long (the server stopped mid-request) is given up */
 const DISPATCH_STALE_MS = 10 * 60_000;
@@ -206,6 +226,10 @@ function describe(cause: ClassifiedCause): string {
   return `${tests}: ${clip(c.type ? `${c.type}: ${c.message}` : c.message, 160)}`;
 }
 
+function actionKindOf(call: AdapterCall): ActionKind {
+  return call.kind === "task" ? call.action : call.kind;
+}
+
 async function settle(run: () => Promise<AdapterResult>): Promise<AdapterResult> {
   try {
     return await run();
@@ -233,6 +257,8 @@ export class TriageService {
   readonly settings: TriageSettings;
   private queue: Promise<unknown> = Promise.resolve();
   private outbox: Job[] = [];
+  /** Outbox rows this process has queued (the others are a previous process's) */
+  private queued = new Set<string>();
   private draining: Promise<void> | null = null;
   private dispatchQueued = false;
   private git: GitProbe;
@@ -391,37 +417,104 @@ export class TriageService {
   /**
    * Queue an adapter call, or record why it doesn't run: observe mode or
    * read_only (planned, with the argv it would run), or no adapter
-   * (recorded). The call runs from the outbox; its result is recorded in a
-   * decision section of its own, where `after` may act on it.
+   * (recorded). The call goes through the outbox; its result is recorded in
+   * a decision section of its own (afterCall).
    */
-  private perform(
-    s: Section,
-    target: Target,
-    kind: ActionKind,
-    what: string,
-    run: (() => Promise<AdapterResult>) | undefined,
-    planned: string[] | null,
-    after?: (result: AdapterResult, s: Section) => void,
-    actor?: string,
-  ): void {
+  private perform(s: Section, call: AdapterCall, planned: string[] | null): void {
+    const kind = actionKindOf(call);
+    const actor = call.kind === "revert" ? call.actor : undefined;
     const blocked = this.actBlocked;
     if (blocked) {
-      this.action(target, kind, "planned", `${what} (not run: ${blocked})`, planned ?? undefined, undefined, actor);
+      this.action(call.target, kind, "planned", `${call.what} (not run: ${blocked})`, planned ?? undefined, undefined, actor);
       return;
     }
-    if (!run) {
-      this.action(target, kind, "recorded", `${what} (recorded and emitted; no command or module set)`, undefined, undefined, actor);
+    if (!this.hasAdapter(call)) {
+      this.action(call.target, kind, "recorded", `${call.what} (recorded and emitted; no command or module set)`, undefined, undefined, actor);
       return;
     }
-    s.jobs.push(async () => {
-      const result = await settle(run);
+    this.enqueue(s, call);
+  }
+
+  private hasAdapter(call: AdapterCall): boolean {
+    const a = this.o.adapters;
+    if (call.kind === "route") return a.router !== undefined;
+    if (call.kind === "task") return a.tasks !== undefined;
+    if (call.kind === "revert") return a.revert !== undefined;
+    return this.decisions !== undefined;
+  }
+
+  /** Write the call to the store's outbox (in this section's transaction) and run it once the section commits. */
+  private enqueue(s: Section, call: Call): void {
+    const id = this.o.store.addOutbox(this.project, call.kind, call, this.now());
+    this.queued.add(id);
+    s.jobs.push(() => this.runCall(id, call));
+  }
+
+  /** Queue the calls a previous process wrote to the outbox and never finished. */
+  private requeue(): void {
+    for (const row of this.o.store.outbox(this.project)) {
+      if (this.queued.has(row.id)) continue;
+      this.queued.add(row.id);
+      const call = row.payload as Call;
+      this.outbox.push(() => this.runCall(row.id, call));
+    }
+  }
+
+  /** Run one outbox call outside the queue, then record its result and remove it, in one transaction. */
+  private async runCall(id: string, call: Call): Promise<void> {
+    const { store } = this.o;
+    try {
+      if (call.kind === "culprit") {
+        let info: CommitInfo | null = null;
+        try {
+          info = await this.git.commit(call.sha);
+        } catch {
+          info = null;
+        }
+        await this.serial(async () =>
+          this.commit((s) => {
+            if (store.removeOutbox(id)) this.decideCulprit(call.incidentId, info, s);
+          }),
+        );
+        return;
+      }
+      const kind = actionKindOf(call);
+      const actor = call.kind === "revert" ? call.actor : undefined;
+      // A previous process's call, after the project switched to observe mode or read_only
+      const blocked = call.kind === "decision" ? null : this.actBlocked;
+      const result: AdapterResult = blocked ? { ok: false, detail: `not run: ${blocked}` } : await settle(() => this.callAdapter(call));
       await this.serial(async () =>
-        this.commit((s2) => {
-          this.action(target, kind, result.ok ? "done" : "failed", `${what}: ${result.detail}`, result.argv, result.output, actor);
-          after?.(result, s2);
+        this.commit((s) => {
+          if (!store.removeOutbox(id)) return;
+          this.action(call.target, kind, blocked ? "planned" : result.ok ? "done" : "failed", `${call.what}: ${result.detail}`, result.argv, result.output, actor);
+          if (!blocked) this.afterCall(call, result, s);
         }),
       );
-    });
+    } finally {
+      this.queued.delete(id);
+    }
+  }
+
+  private callAdapter(call: AdapterCall): Promise<AdapterResult> {
+    const a = this.o.adapters;
+    const none = (what: string): Promise<AdapterResult> => Promise.resolve({ ok: false, detail: `${what} is no longer set` });
+    if (call.kind === "route") return a.router ? a.router.route(call.message) : none("notify_agent");
+    if (call.kind === "task") return a.tasks ? a.tasks.create(call.task) : none("create_task");
+    if (call.kind === "revert") return a.revert ? a.revert.open(call.request) : none("open_revert");
+    return this.decisions ? this.decisions.raise(call.request) : none("the Decision Inbox");
+  }
+
+  /** What a call's result changes besides its action record. */
+  private afterCall(call: AdapterCall, result: AdapterResult, s: Section): void {
+    const { store } = this.o;
+    if (call.kind === "task") {
+      if (result.ok && result.ref) store.setTaskRef(call.task.id, result.ref);
+    } else if (call.kind === "revert") {
+      this.revertDone(call.request.incidentId, call.request.sha, result, call.reason, call.actor, s);
+    } else if (call.kind === "decision" && result.ok && result.ref) {
+      store.setDecisionRef(this.project, call.request.subject, result.ref);
+      if (call.target.incidentId) store.updateIncident(call.target.incidentId, { decisionRef: result.ref });
+    }
   }
 
   // ============ TRUST ============
@@ -444,15 +537,22 @@ export class TriageService {
 
   // ============ INGEST ============
 
-  async ingest(input: IngestInput): Promise<IngestOutcome> {
+  /**
+   * Decide on a result. By default this also waits for what the decision
+   * queued (agent messages, tasks, re-check requests); with `background` (an
+   * HTTP caller) it returns the record at once and that runs on its own.
+   */
+  async ingest(input: IngestInput, options: { background?: boolean } = {}): Promise<IngestOutcome> {
     const recordId = await this.serial(() => this.decideIngest(input));
-    await this.drain();
+    if (options.background) void this.drain();
+    else await this.drain();
     return this.serial(async () => this.outcome(recordId));
   }
 
   /** Expire, advance and request re-checks and bisect probes; release ended quarantines. */
   async tick(): Promise<void> {
     await this.serial(async () => this.commit((s) => this.pumpSync(s)));
+    this.requeue();
     await this.drain();
   }
 
@@ -465,6 +565,28 @@ export class TriageService {
       rechecks: store.rechecksFor({ recordId: record.originId ?? recordId }),
       incident: store.openIncident(project, settings.defaultBranch, record.pipelineId),
     };
+  }
+
+  /** Whether `sha` is in the default branch's history (its local or a remote's tip); false when git can't tell. */
+  private async inDefaultBranch(sha: string): Promise<boolean> {
+    try {
+      for (const tip of await this.git.branchTips(this.o.settings.defaultBranch)) {
+        if (await this.contains(tip, sha)) return true;
+      }
+    } catch {
+      // Unknown history: not trusted as the default branch
+    }
+    return false;
+  }
+
+  /** Whether `descendant` is `ancestor` or has it in its history; false when git can't tell. */
+  private async contains(descendant: string, ancestor: string): Promise<boolean> {
+    if (descendant.toLowerCase() === ancestor.toLowerCase()) return true;
+    try {
+      return await this.git.isAncestor(ancestor, descendant);
+    } catch {
+      return false;
+    }
   }
 
   private async decideIngest(input: IngestInput): Promise<string> {
@@ -480,10 +602,15 @@ export class TriageService {
     }
     const nowMs = this.now();
 
+    // A run the pipelines module names in-process; an HTTP caller's context is not signed
+    const runId = input.trust === "trusted" ? context.runId : undefined;
     let recheck: Recheck | null = null;
-    if (context.recheckId) {
-      recheck = store.getRecheck(context.recheckId);
-      if (!recheck || recheck.project !== project) throw new TriageNotFoundError(`No re-check ${context.recheckId}`);
+    // Without a re-check id, a result still answers the waiting re-check whose id or run id it carries
+    const recheckId =
+      context.recheckId ?? store.answerableRecheck(project, [result.id, ...(runId ? [runId] : [])], sha, result.branch, ANSWERABLE)?.id;
+    if (recheckId) {
+      recheck = store.getRecheck(recheckId);
+      if (!recheck || recheck.project !== project) throw new TriageNotFoundError(`No re-check ${recheckId}`);
       if (recheck.sha.toLowerCase() !== sha) {
         throw new TriageInputError(`Re-check ${short(recheck.id)} is for ${recheck.sha}, not ${sha}`);
       }
@@ -493,7 +620,7 @@ export class TriageService {
       if (!ANSWERABLE.includes(recheck.status)) {
         throw new TriageConflictError(`Re-check ${short(recheck.id)} is ${recheck.status}: it was not requested, or it was already answered`);
       }
-      if (result.id !== recheck.id && result.id !== recheck.runId) {
+      if (result.id !== recheck.id && result.id !== recheck.runId && !(runId && runId === recheck.runId)) {
         throw new TriageConflictError(
           `An answer to re-check ${short(recheck.id)} must have its id (${recheck.id})${recheck.runId ? ` or its run id (${recheck.runId})` : ""} as the result id`,
         );
@@ -501,11 +628,25 @@ export class TriageService {
     }
     const origin = recheck?.recordId ? store.getRecord(recheck.recordId) : null;
     const purpose: ResultPurpose = recheck ? (recheck.purpose === "bisect" ? "bisect" : "recheck") : "gate";
-    const isDefault = result.branch === settings.defaultBranch;
     const failed = result.status !== "passed";
     const pipelineId = result.pipelineId;
     const passedSteps = result.steps.filter((st) => st.status === "passed").map((st) => st.name);
     const failedSteps = result.steps.filter((st) => st.status === "failed" || st.status === "timed_out").map((st) => st.name);
+    const notes: string[] = [];
+    // A result's branch is only a label: it is the default branch's run only
+    // when the commit is in that branch's history
+    let branchNote: string | undefined;
+    let isDefault = false;
+    if (result.branch === settings.defaultBranch) {
+      isDefault = await this.inDefaultBranch(sha);
+      if (!isDefault) {
+        branchNote = `labelled ${settings.defaultBranch}, but ${short(sha)} is not in ${settings.defaultBranch}'s history: triaged as a change`;
+      }
+    }
+    // A green default branch ends an incident only at a commit that contains the red one
+    let greenAfterRed = false;
+    const openOnDefault = isDefault && !failed && purpose === "gate" ? store.openIncident(project, settings.defaultBranch, pipelineId) : null;
+    if (openOnDefault) greenAfterRed = await this.contains(sha, openOnDefault.redSha);
 
     const evidence = parseGateEvidence(result, input.reports ?? [], {
       contextPatterns: settings.contextPatterns,
@@ -515,7 +656,6 @@ export class TriageService {
     // The base and the changed files: a trusted result's context, else git
     let baseSha = context.baseSha?.toLowerCase() ?? origin?.baseSha;
     let changedFiles = context.changedFiles ?? origin?.changedFiles;
-    const notes: string[] = [];
     if (!isDefault && !origin) {
       if (!baseSha) {
         try {
@@ -593,6 +733,7 @@ export class TriageService {
         receivedMs: nowMs,
       });
       if (classified.length > 0) store.insertCauses(id, classified);
+      if (branchNote) this.action({ recordId: id }, "note", "recorded", branchNote);
 
       // Which tests passed: listed as passed by a report, or (a gate run) failed
       // at this commit in a step this run ran and passed
@@ -629,7 +770,7 @@ export class TriageService {
         this.flakyOccurrence(t.key, record, "failed, then passed on a rerun in the same run", s);
       }
       if (isDefault && purpose !== "bisect") {
-        this.defaultBranchResult(store.getRecord(id)!, classified, passedSteps, plan, s);
+        this.defaultBranchResult(store.getRecord(id)!, classified, passedSteps, plan, greenAfterRed, s);
       }
       this.pumpSync(s);
 
@@ -955,13 +1096,9 @@ export class TriageService {
       pr: record.pr,
       text,
     };
-    const router = this.o.adapters.router;
     this.perform(
       s,
-      { recordId: record.id },
-      "route",
-      `${causes.length} cause(s) sent to ${agent}`,
-      router ? () => router.route(msg) : undefined,
+      { kind: "route", target: { recordId: record.id }, what: `${causes.length} cause(s) sent to ${agent}`, message: msg },
       plannedArgv(this.settings, "notify_agent", messageVars(msg)),
     );
   }
@@ -1009,17 +1146,10 @@ export class TriageService {
 
   private createTask(record: TriageRecord, task: TriageTask, kind: ActionKind, s: Section): void {
     s.events.push({ type: "triage.task_created", data: { recordId: record.id, task } });
-    const sink = this.o.adapters.tasks;
     this.perform(
       s,
-      { recordId: record.id },
-      kind,
-      `task ${short(task.id)} "${clip(task.title, 120)}"`,
-      sink ? () => sink.create(task) : undefined,
+      { kind: "task", target: { recordId: record.id }, what: `task ${short(task.id)} "${clip(task.title, 120)}"`, action: kind, task },
       plannedArgv(this.settings, "create_task", taskVars(task)),
-      (result) => {
-        if (result.ok && result.ref) this.o.store.setTaskRef(task.id, result.ref);
-      },
     );
   }
 
@@ -1357,13 +1487,24 @@ export class TriageService {
     classified: ClassifiedCause[],
     passedSteps: string[],
     plan: IncidentPlan | null,
+    greenAfterRed: boolean,
     s: Section,
   ): void {
     const { store, project } = this.o;
     const open = store.openIncident(project, record.branch, record.pipelineId);
     if (record.status === "passed") {
-      // Only a full gate run of the same pipeline that ran the failing steps proves the branch green
+      // Only a full gate run of the same pipeline that ran the failing steps,
+      // at a commit that contains the red one, proves the branch green
       if (!open || record.purpose !== "gate") return;
+      if (!greenAfterRed) {
+        this.action(
+          { incidentId: open.id },
+          "note",
+          "recorded",
+          `a green run at ${short(record.sha)} does not contain the red commit ${short(open.redSha)}: the incident stays open`,
+        );
+        return;
+      }
       const missing = open.target.steps.filter((st) => !passedSteps.includes(st));
       if (missing.length > 0) {
         this.action(
@@ -1481,15 +1622,7 @@ export class TriageService {
       this.action({ incidentId: incident.id }, "bisect", "done", `culprit ${short(step.culprit)}: ${step.detail}`);
       const culprit = step.culprit;
       // The culprit's commit (parents, message) is read outside the queue, then decided on
-      s.jobs.push(async () => {
-        let info: CommitInfo | null = null;
-        try {
-          info = await this.git.commit(culprit);
-        } catch {
-          info = null;
-        }
-        await this.serial(async () => this.commit((s2) => this.decideCulprit(incident.id, info, s2)));
-      });
+      this.enqueue(s, { kind: "culprit", incidentId: incident.id, sha: culprit });
       return;
     }
     const bisect: BisectState = {
@@ -1727,13 +1860,15 @@ export class TriageService {
     s.events.push({ type: "triage.revert_requested", data: { incidentId: incident.id, sha, by: actor ?? null } });
     this.perform(
       s,
-      { incidentId: incident.id },
-      "revert",
-      `revert ${short(sha)} on ${incident.branch}${actor ? ` (asked by ${actor})` : ""}`,
-      () => opener.open(request),
+      {
+        kind: "revert",
+        target: { incidentId: incident.id },
+        what: `revert ${short(sha)} on ${incident.branch}${actor ? ` (asked by ${actor})` : ""}`,
+        request,
+        reason,
+        actor,
+      },
       plannedArgv(this.settings, "open_revert", revertVars(request)),
-      (result, s2) => this.revertDone(incident.id, sha, result, reason, actor, s2),
-      actor,
     );
     return true;
   }
@@ -1756,38 +1891,17 @@ export class TriageService {
       return;
     }
     s.events.push({ type: "triage.decision_requested", data: { decision: request } });
-    const raiser = this.decisions;
-    const raised = (result: AdapterResult) => {
-      if (!result.ok || !result.ref) return;
-      store.setDecisionRef(this.project, request.subject, result.ref);
-      if (target.incidentId) store.updateIncident(target.incidentId, { decisionRef: result.ref });
-    };
+    const call: AdapterCall = { kind: "decision", target, what: clip(request.question, 200), request };
     if (this.decisionsViaCommand) {
-      this.perform(
-        s,
-        target,
-        "decision",
-        clip(request.question, 200),
-        raiser ? () => raiser.raise(request) : undefined,
-        plannedArgv(this.settings, "raise_decision", decisionVars(request)),
-        raised,
-      );
+      this.perform(s, call, plannedArgv(this.settings, "raise_decision", decisionVars(request)));
       return;
     }
-    if (!raiser) {
+    if (!this.decisions) {
       this.action(target, "decision", "recorded", `${clip(request.question, 200)} (no Decision Inbox, decision_file or inbox_file)`);
       return;
     }
     // Asking the human is safe in observe mode too, as the watchdog's escalations are
-    s.jobs.push(async () => {
-      const result = await settle(() => raiser.raise(request));
-      await this.serial(async () =>
-        this.commit(() => {
-          this.action(target, "decision", result.ok ? "done" : "failed", `${clip(request.question, 200)}: ${result.detail}`);
-          raised(result);
-        }),
-      );
-    });
+    this.enqueue(s, call);
   }
 
   /** An answer from the Decision Inbox: revert (the culprit or a chosen suspect), or one more re-check. */

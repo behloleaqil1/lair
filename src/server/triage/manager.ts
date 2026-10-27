@@ -2,8 +2,8 @@
  * All projects' triage services. The store (data/triage.db) is opened only
  * when at least one project enables triage.
  */
-import { readFileSync } from "fs";
-import { resolve } from "path";
+import { readFileSync, realpathSync } from "fs";
+import { isAbsolute, relative, resolve, sep } from "path";
 import type { EventBus } from "../core/event-bus.js";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { TriageClass, TriageProjectStatus } from "../../shared/triage-types.js";
@@ -42,6 +42,18 @@ export interface TriageManagerOptions {
   parsers?: EvidenceParser[];
 }
 
+/** Whether `file` (a real path) is inside `dir`, symlinks resolved. */
+function isInside(file: string, dir: string): boolean {
+  let root: string;
+  try {
+    root = realpathSync(resolve(dir));
+  } catch {
+    root = resolve(dir);
+  }
+  const rel = relative(root, file);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
 export class TriageManager {
   private services = new Map<string, TriageService>();
   private problems = new Map<string, string[]>();
@@ -53,13 +65,21 @@ export class TriageManager {
 
   constructor(private options: TriageManagerOptions) {}
 
-  /** The trusted nodes' keys, or the errors reading them. */
-  private nodeKeys(nodes: { id: string; publicKeyFile: string }[]): { keys: Map<string, string>; errors: string[] } {
+  /**
+   * The trusted nodes' keys, or the errors reading them. A relative path is
+   * read from Lair's working directory. A key inside the project's
+   * repository is refused: an agent working there could replace it.
+   */
+  private nodeKeys(nodes: { id: string; publicKeyFile: string }[], repo: string): { keys: Map<string, string>; errors: string[] } {
     const keys = new Map<string, string>();
     const errors: string[] = [];
     for (const node of nodes) {
       try {
-        const pem = readFileSync(resolve(node.publicKeyFile), "utf-8");
+        const file = realpathSync(resolve(node.publicKeyFile));
+        if (isInside(file, repo)) {
+          throw new Error("it is inside the project's repository, where an agent could replace it: keep it under Lair's data/");
+        }
+        const pem = readFileSync(file, "utf-8");
         if (!pem.includes("PUBLIC KEY")) throw new Error("not a PEM public key");
         keys.set(node.id, pem);
       } catch (e) {
@@ -83,7 +103,7 @@ export class TriageManager {
       }
       if (!parsed.settings.enabled) continue;
       const settings = parsed.settings;
-      const nodes = this.nodeKeys(settings.trustedNodes);
+      const nodes = this.nodeKeys(settings.trustedNodes, entry.config.repo);
       if (nodes.errors.length > 0) {
         this.problems.set(entry.name, nodes.errors);
         console.warn(`[triage] ${entry.name}: not started: ${nodes.errors.join("; ")}`);
@@ -194,8 +214,8 @@ export class TriageManager {
     );
   }
 
-  ingest(project: string, input: IngestInput): Promise<IngestOutcome> {
-    return this.require(project).ingest(input);
+  ingest(project: string, input: IngestInput, options: { background?: boolean } = {}): Promise<IngestOutcome> {
+    return this.require(project).ingest(input, options);
   }
 
   status(project: string): TriageProjectStatus {

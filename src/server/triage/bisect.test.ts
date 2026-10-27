@@ -311,6 +311,36 @@ describe("a red default branch", () => {
     expect(h.manager.getStore()!.getRecheck(pending[0].id)!.status).toBe("cancelled");
   });
 
+  it("an older green main commit labelled main does not resolve the incident: it lacks the red commit", async () => {
+    h = harness(actingTriage());
+    history(h);
+    const incidentId = await redMain(h);
+    const store = h.manager.getStore()!;
+
+    // A truthful result, re-sent or re-run at a commit from before the break
+    const old = await h.ingest({ result: gate({ sha: merges[1], branch: "main", status: "passed" }) });
+    expect(old.record.defaultBranch).toBe(true);
+    expect(store.getIncident(incidentId)).toMatchObject({ status: "open" });
+    expect(store.actionsFor({ incidentId }).map((a) => a.detail)).toContain(
+      `a green run at ${merges[1].slice(0, 8)} does not contain the red commit ${merges[3].slice(0, 8)}: the incident stays open`,
+    );
+  });
+
+  it("a change's commit labelled main is triaged as a change: it opens no incident", async () => {
+    h = harness(actingTriage());
+    history(h);
+    await h.ingest({ result: gate({ sha: c0, branch: "main", status: "passed" }) });
+    // heads[0] is a PR's head, not in main's history (only its merge is)
+    const forged = await h.ingest({ result: gate({ sha: heads[0], branch: "main" }), reports: [{ content: report }] });
+
+    expect(forged.record).toMatchObject({ branch: "main", defaultBranch: false });
+    expect(forged.incident).toBeNull();
+    expect(h.manager.getStore()!.openIncidents("demo")).toEqual([]);
+    expect(forged.actions.map((a) => a.detail)).toContain(
+      `labelled main, but ${heads[0].slice(0, 8)} is not in main's history: triaged as a change`,
+    );
+  });
+
   it("without a green result there is nothing to bisect from", async () => {
     h = harness(actingTriage());
     history(h);
