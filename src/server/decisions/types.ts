@@ -4,6 +4,7 @@
  */
 import type {
   Decision,
+  DecisionAttention,
   DecisionKind,
   DecisionLink,
   DecisionOption,
@@ -14,7 +15,13 @@ import type {
 export interface RaiseDecisionInput {
   project: string;
   kind: DecisionKind;
-  /** One line, at most 200 characters */
+  /**
+   * action (the default): it needs the owner's answer; notice: for their
+   * information only, nothing to choose. Notices are listed apart, never
+   * counted in the badge and never notified.
+   */
+  attention?: DecisionAttention;
+  /** One line, at most 200 characters: a plain sentence saying what waits and why */
   title: string;
   /** What is blocked and why (markdown) */
   context: string;
@@ -94,12 +101,20 @@ export type ResolutionHandler = (resolution: DecisionResolution) => void | Promi
  *   module wasn't listening, e.g. before a restart: a resolution counts as
  *   delivered only once a handler returns without throwing.
  * - withdraw(): the question is moot (the producer fixed it some other way).
+ * - find(): the latest decision the module raised with this key (an open one
+ *   first), whatever its status, or null: a producer that keeps one
+ *   decision per condition reads it to tell "asked and answered" from
+ *   "never asked" or "withdrawn", across restarts.
+ * - openOf(): the module's open decisions in a project, to withdraw those
+ *   whose condition is gone.
  */
 export interface DecisionProducer {
   raise(input: RaiseDecisionInput): Promise<RaiseResult>;
   withdraw(id: string, input: WithdrawInput): Promise<Decision>;
   blockedOn(ref: string): Decision | null;
   onResolved(module: string, handler: ResolutionHandler, options?: { project?: string }): () => void;
+  find(project: string, module: string, key: string): Decision | null;
+  openOf(project: string, module: string): Decision[];
 }
 
 export interface Clock {

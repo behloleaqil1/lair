@@ -11,6 +11,7 @@ function decision(overrides: Partial<Decision> = {}): Decision {
     id: "0b5c2c3e-7a43-4f7e-9d2a-0d4b1f2e3a4b",
     project: "demo",
     kind: "other",
+    attention: "action",
     title: "Pick the default page size",
     context: "The list view needs a page size.",
     options: [

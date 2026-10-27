@@ -123,8 +123,8 @@ function memoryStorage(): Storage {
   };
 }
 
-/** One project, watchdog in observe mode, with an orphaned claim and its release command configured. */
-async function boot() {
+/** One project, watchdog in observe mode, with an orphaned claim and (unless `actions` is false) its release command configured. */
+async function boot(options: { actions?: boolean } = {}) {
   dir = mkdtempSync(join(tmpdir(), "lair-decisions-mount-"));
   const root = join(dir, "demo");
   mkdirSync(join(root, "agents"), { recursive: true });
@@ -144,7 +144,7 @@ async function boot() {
     watchdog: {
       enabled: true,
       agent_command: "agent-cli --agent {agent}",
-      actions: { release_claim: ["./bin/release-claim", "{agent}", "{claim}"] },
+      ...(options.actions === false ? {} : { actions: { release_claim: ["./bin/release-claim", "{agent}", "{claim}"] } }),
     },
   };
   const calls: string[][] = [];
@@ -277,6 +277,30 @@ describe("mountDecisions (the server's wiring)", () => {
     expect(manager.getStore()!.listBreaches("demo")[0]).toMatchObject({ status: "resolved", resolution: "recovered" });
     await watchdog.tick();
     expect(calls).toHaveLength(1);
+  });
+
+  it("an escalation with nothing to run ('Leave it to me' only) is a notice: never counted, withdrawn when the breach clears", async () => {
+    const { inbox, manager, port, claim } = await boot({ actions: false });
+    const watchdog = manager.get("demo")!;
+    await watchdog.tick();
+    const [notice, ...more] = inbox.list({ status: "open" });
+    expect(more).toEqual([]);
+    expect(notice).toMatchObject({ attention: "notice", source: { module: "watchdog" } });
+    expect(notice.options.map((o) => o.id)).toEqual(["stand_down"]);
+    expect((await call(port, "GET", "/api/decisions/summary")).body.data).toMatchObject({ open: 1, action: 0, notices: 1 });
+
+    // The breach clears on its own: the notice goes with it
+    rmSync(claim, { recursive: true, force: true });
+    await watchdog.tick();
+    expect(inbox.get(notice.id)).toMatchObject({ status: "withdrawn" });
+    expect((await call(port, "GET", "/api/decisions/summary")).body.data).toMatchObject({ open: 0, action: 0, notices: 0 });
+  });
+
+  it("an escalation with a playbook to run needs an answer: it is an action", async () => {
+    const { inbox, manager } = await boot();
+    await manager.get("demo")!.tick();
+    expect(inbox.list({ status: "open" }).map((d) => d.attention)).toEqual(["action"]);
+    expect(inbox.counts()).toMatchObject({ action: 1, notices: 0 });
   });
 
   it("answers through the real client helpers, as the Decisions view does, and signs out", async () => {

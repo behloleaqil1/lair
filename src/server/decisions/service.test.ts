@@ -432,7 +432,7 @@ describe("expiry and defaults", () => {
     expect(waiting.audit?.[1].detail).toBe(
       "past its expiry (2026-03-02T13:00:00.000Z) and still waiting for an answer: spend decisions never default",
     );
-    expect(inbox.counts()).toEqual({ open: 1, overdue: 1 });
+    expect(inbox.counts()).toEqual({ open: 1, overdue: 1, action: 1, notices: 0 });
     expect(inbox.blockedOn("deploy:staging")?.id).toBe(decision.id);
     expect(resumed).toEqual([]);
   });

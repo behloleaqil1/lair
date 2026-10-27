@@ -8,8 +8,10 @@
  */
 import { z } from "zod";
 import {
+  DECISION_ATTENTIONS,
   DECISION_KINDS,
   NEVER_DEFAULT_KINDS,
+  type DecisionAttention,
   type DecisionKind,
   type DecisionLink,
   type DecisionOption,
@@ -180,6 +182,7 @@ const RaiseSchema = z
   .object({
     project: z.string().regex(PROJECT, "must be a project name (letters, digits, '.', '_' and '-')"),
     kind: z.enum(DECISION_KINDS),
+    attention: z.enum(DECISION_ATTENTIONS).default("action"),
     title: oneLine(200),
     context: text(20000),
     options: z.array(OptionSchema).min(1).max(10),
@@ -208,6 +211,7 @@ const RaiseSchema = z
 export interface ValidRaise {
   project: string;
   kind: DecisionKind;
+  attention: DecisionAttention;
   title: string;
   context: string;
   options: DecisionOption[];
@@ -267,6 +271,14 @@ export function parseRaiseInput(raw: unknown, now: number): Parsed<ValidRaise> {
     }
   }
 
+  // A notice asks nothing: it can't stand for a question that always waits for a human, or apply a default
+  if (value.attention === "notice") {
+    if (NEVER_DEFAULT_KINDS.includes(value.kind)) {
+      errors.push(`attention: a ${value.kind} decision always needs an answer, so it can't be a notice`);
+    }
+    if (value.defaultOptionId !== undefined) errors.push("attention: a notice has no default (nothing is decided for you)");
+  }
+
   if (value.defaultOptionId !== undefined) {
     if (NEVER_DEFAULT_KINDS.includes(value.kind)) {
       errors.push(`defaultOptionId: ${value.kind} decisions can't have a default: they always wait for a human`);
@@ -283,6 +295,7 @@ export function parseRaiseInput(raw: unknown, now: number): Parsed<ValidRaise> {
     value: {
       project: value.project,
       kind: value.kind,
+      attention: value.attention,
       title: value.title,
       context: value.context,
       options: value.options.map((o) => ({

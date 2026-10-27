@@ -1,9 +1,10 @@
 /**
  * Decision Inbox routes.
  *
- *   GET  /api/decisions?project=&status=open|answered|expired|withdrawn|closed|all&limit=
+ *   GET  /api/decisions?project=&status=open|answered|expired|withdrawn|closed|all&attention=action|notice&limit=
  *        open first by urgency; without ?project=, every project's decisions
- *   GET  /api/decisions/summary?project=      {open, overdue, secretStore}, for the nav badge
+ *   GET  /api/decisions/summary?project=      {open, overdue, action, notices, secretStore}; the nav
+ *                                              badge counts `action` (notices are never counted)
  *   GET  /api/decisions/:id                    one decision with its audit trail
  *   POST /api/decisions?project=               raise (the body is a RaiseDecisionInput without project;
  *                                              the project is ?project=, else the default project)
@@ -27,6 +28,7 @@
  */
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
+import { DECISION_ATTENTIONS } from "../../shared/decision-types.js";
 import type { HumanAuth } from "../human-auth/index.js";
 import { rejectCrossSiteRequests } from "../origin.js";
 import { requireValidIdParam } from "../root-guards.js";
@@ -50,6 +52,7 @@ function failWith(reply: FastifyReply, e: unknown) {
 const ListQuery = z.object({
   project: z.string().optional(),
   status: z.enum(["open", "answered", "expired", "withdrawn", "closed", "all"]).default("all"),
+  attention: z.enum(DECISION_ATTENTIONS).optional(),
   limit: z.coerce.number().int().min(1).max(500).default(100),
 });
 const ProjectQuery = z.object({ project: z.string().optional() });

@@ -37,6 +37,16 @@ export const NEVER_DEFAULT_KINDS: readonly DecisionKind[] = [
 /** Kinds whose answer must be confirmed (the API requires `confirm: true`). */
 export const CONFIRM_KINDS: readonly DecisionKind[] = ["spend", "go_no_go"];
 
+/**
+ * What a decision asks of the owner: an `action` needs their answer (it
+ * counts toward the nav badge and Home's "Needs you", and it may notify
+ * them); a `notice` is for their information only (nothing to choose, e.g.
+ * a watchdog breach with no playbook to run): listed apart, never counted,
+ * never notified.
+ */
+export const DECISION_ATTENTIONS = ["action", "notice"] as const;
+export type DecisionAttention = (typeof DECISION_ATTENTIONS)[number];
+
 export const DECISION_STATUSES = ["open", "answered", "expired", "withdrawn"] as const;
 /**
  * open: waiting for an answer (also past its expiry when it has no default);
@@ -99,6 +109,9 @@ export interface Decision {
   id: string;
   project: string;
   kind: DecisionKind;
+  /** action: needs the owner's answer; notice: for their information only (DECISION_ATTENTIONS) */
+  attention: DecisionAttention;
+  /** One plain sentence: what waits and why */
   title: string;
   /** What is blocked and why (markdown) */
   context: string;
@@ -135,6 +148,12 @@ export interface Decision {
 }
 
 export interface DecisionCounts {
+  /** Every open decision, notices included */
   open: number;
+  /** Open action decisions past their expiry */
   overdue: number;
+  /** Open decisions that need the owner's answer: what the nav badge and "Needs you" count */
+  action: number;
+  /** Open notices (for information only) */
+  notices: number;
 }

@@ -109,6 +109,9 @@ export function runnablePlaybook(ctx: WatchdogContext, breach: Breach): Playbook
  * The Decision Inbox item for an escalated breach. "Run once" is offered
  * only when a playbook command is configured and the project isn't
  * read_only. It is recommended unless the playbooks already failed.
+ * Without it the only option is "Leave it to me": nothing to choose, so the
+ * item is a notice (never counted in the badge, never notified), withdrawn
+ * like any escalation once the breach clears.
  */
 export function decisionFor(
   ctx: WatchdogContext,
@@ -164,6 +167,8 @@ export function decisionFor(
   return {
     project,
     kind: "escalation",
+    // With nothing to run, "Leave it to me" is no choice: the breach is for the owner's information
+    attention: options.some((o) => o.id === DECISION_RUN) ? "action" : "notice",
     title: clip(printable(oneLine(breach.summary)) || breach.detector, MAX_TITLE),
     context: clip(context, MAX_CONTEXT),
     options,

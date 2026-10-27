@@ -14,6 +14,7 @@ import { randomUUID } from "crypto";
 import type {
   Decision,
   DecisionAnswer,
+  DecisionAttention,
   DecisionAuditAction,
   DecisionAuditEntry,
   DecisionCounts,
@@ -25,7 +26,8 @@ import type {
 import type { ValidRaise } from "./validate.js";
 
 // 2: decisions.raised_via (server | http), for the per-project cap on HTTP callers
-const SCHEMA_VERSION = 2;
+// 3: decisions.attention (action | notice): what needs the owner's answer, and what is for their information
+export const SCHEMA_VERSION = 3;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS decisions (
@@ -56,7 +58,8 @@ const SCHEMA = `
     closed_at TEXT,
     delivered_at TEXT,
     delivery_error TEXT,
-    raised_via TEXT NOT NULL DEFAULT 'server'
+    raised_via TEXT NOT NULL DEFAULT 'server',
+    attention TEXT NOT NULL DEFAULT 'action'
   );
   CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_open_key
     ON decisions(project, source_module, dedupe_key) WHERE status = 'open';
@@ -109,6 +112,7 @@ interface DecisionRow {
   delivered_at: string | null;
   delivery_error: string | null;
   raised_via: string;
+  attention: string;
 }
 
 /** Open first, by urgency (soonest expiry, then oldest); then the rest, newest first. */
@@ -123,6 +127,8 @@ const URGENCY_ORDER = `
 export interface ListOptions {
   project?: string;
   status?: DecisionStatus | "closed" | "all";
+  /** Only action decisions, or only notices */
+  attention?: DecisionAttention;
   limit?: number;
 }
 
@@ -175,6 +181,10 @@ export class DecisionStore {
       this.db.transaction(() => {
         // Version 1 files lack raised_via; their decisions were raised in the server or over HTTP alike
         if (version === 1) this.db.exec(`ALTER TABLE decisions ADD COLUMN raised_via TEXT NOT NULL DEFAULT 'server'`);
+        // Versions 1 and 2 lack attention: every decision then asked for an answer
+        if (version >= 1 && version <= 2) {
+          this.db.exec(`ALTER TABLE decisions ADD COLUMN attention TEXT NOT NULL DEFAULT 'action'`);
+        }
         this.db.exec(SCHEMA);
         this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
       })();
@@ -225,8 +235,8 @@ export class DecisionStore {
           `INSERT INTO decisions
              (id, project, kind, title, context, options, recommended_option, recommended_reasoning,
               source_module, source_ref, dedupe_key, links, secret_name, default_option,
-              created_at, expires_at, status, raised_via)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)`,
+              created_at, expires_at, status, raised_via, attention)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`,
         )
         .run(
           id,
@@ -246,6 +256,7 @@ export class DecisionStore {
           at,
           input.expiresAt ?? null,
           limits.via,
+          input.attention,
         );
       this.addBlocks(id, input.blocks);
       return { kind: "created", decision: this.get(id)!, addedBlocks: input.blocks };
@@ -283,6 +294,10 @@ export class DecisionStore {
       where.push("d.status = ?");
       params.push(status);
     }
+    if (options.attention) {
+      where.push("d.attention = ?");
+      params.push(options.attention);
+    }
     params.push(options.limit ?? 100);
     const rows = this.db
       .prepare(
@@ -296,11 +311,34 @@ export class DecisionStore {
     const row = this.db
       .prepare(
         `SELECT COUNT(*) AS open,
-                COALESCE(SUM(CASE WHEN expires_at IS NOT NULL AND expires_at <= ? THEN 1 ELSE 0 END), 0) AS overdue
+                COALESCE(SUM(CASE WHEN attention = 'action' AND expires_at IS NOT NULL AND expires_at <= ? THEN 1 ELSE 0 END), 0)
+                  AS overdue,
+                COALESCE(SUM(CASE WHEN attention = 'action' THEN 1 ELSE 0 END), 0) AS action
          FROM decisions WHERE status = 'open' ${project ? "AND project = ?" : ""}`,
       )
-      .get(...(project ? [now, project] : [now])) as { open: number; overdue: number };
-    return { open: row.open, overdue: row.overdue };
+      .get(...(project ? [now, project] : [now])) as { open: number; overdue: number; action: number };
+    return { open: row.open, overdue: row.overdue, action: row.action, notices: row.open - row.action };
+  }
+
+  /** The latest decision of this module with this key in the project (an open one first), or null. */
+  find(project: string, module: string, key: string, now?: string): Decision | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM decisions d WHERE d.project = ? AND d.source_module = ? AND d.dedupe_key = ?
+         ORDER BY (d.status = 'open') DESC, d.rowid DESC LIMIT 1`,
+      )
+      .get(project, module, key) as DecisionRow | undefined;
+    return row ? this.toDecision(row, now) : null;
+  }
+
+  /** The module's open decisions in the project, oldest first. */
+  openOf(project: string, module: string, now?: string): Decision[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM decisions d WHERE d.project = ? AND d.source_module = ? AND d.status = 'open' ORDER BY d.rowid`,
+      )
+      .all(project, module) as DecisionRow[];
+    return rows.map((row) => this.toDecision(row, now));
   }
 
   /** Open decisions that block this ref, most urgent first. */
@@ -440,6 +478,7 @@ export class DecisionStore {
       id: row.id,
       project: row.project,
       kind: row.kind as DecisionKind,
+      attention: row.attention === "notice" ? "notice" : "action",
       title: row.title,
       context: row.context,
       options: JSON.parse(row.options) as DecisionOption[],

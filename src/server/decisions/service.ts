@@ -160,12 +160,13 @@ export class DecisionInbox implements DecisionProducer {
         at,
         action: "raised",
         actor: module,
-        detail: `${decision.kind} decision raised by ${module} (${ref}), recommending ${decision.recommended.optionId}${expiry}`,
+        detail: `${decision.attention === "notice" ? "notice" : `${decision.kind} decision`} raised by ${module} (${ref}), recommending ${decision.recommended.optionId}${expiry}`,
       });
       await this.events?.emit("decision.raised", {
         decisionId: decision.id,
         project: decision.project,
         kind: decision.kind,
+        attention: decision.attention,
         title: decision.title,
         module,
         ref,
@@ -214,6 +215,16 @@ export class DecisionInbox implements DecisionProducer {
   /** The most urgent open decision that blocks `ref`, or null when the work may go on. */
   blockedOn(ref: string): Decision | null {
     return this.store.blocking(ref, this.iso())[0] ?? null;
+  }
+
+  /** The latest decision `module` raised with `key` in `project` (an open one first), or null. */
+  find(project: string, module: string, key: string): Decision | null {
+    return this.store.find(project, module, key, this.iso());
+  }
+
+  /** The open decisions `module` raised in `project`, oldest first. */
+  openOf(project: string, module: string): Decision[] {
+    return this.store.openOf(project, module, this.iso());
   }
 
   onResolved(module: string, handler: ResolutionHandler, options: { project?: string } = {}): () => void {

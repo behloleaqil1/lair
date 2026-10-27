@@ -17,6 +17,7 @@ function decision(overrides: Partial<Decision> = {}): Decision {
     id: "0b5c2c3e-7a43-4f7e-9d2a-0d4b1f2e3a4b",
     project: "demo",
     kind: "spend",
+    attention: "action",
     title: "Raise the monthly hosting budget",
     context: "The staging deploy needs a larger database plan.",
     options: [
