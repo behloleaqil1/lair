@@ -19,7 +19,8 @@ accounts, credentials, go/no-go) in the Decision Inbox.
 
 In review (open pull requests): **agents** (claims, pid-owned locks, session recovery, failover, budgets;
 [autonomy.md §6](autonomy.md)) and **triage** (failure classes, narrow re-checks, bisect and revert;
-[autonomy.md §3](autonomy.md)).
+[autonomy.md §3](autonomy.md)). The planner's first step, Lair keeping fill's tasks file with a supervised planner
+agent ([planner.md](planner.md), `src/server/planner/`), is in review too; step 1 below builds on it.
 
 ## Next, in order
 

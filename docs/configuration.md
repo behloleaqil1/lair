@@ -1664,6 +1664,113 @@ Unknown keys, a lane on an unknown machine, an unknown class in `limits` or `eli
 
 Events on the bus: `placement.moved`, `placement.would_move`, `placement.move_failed`, `placement.machine_up`, `placement.machine_down`, `placement.job_held`.
 
+## Planner
+
+> Off by default. With `enabled: true`, Lair keeps [fill](#fill)'s tasks file itself: it marks tasks done, drops the ones the plan marks done, and runs a supervised planner agent when something happens, whose proposals it checks before anything changes ([design](design/planner.md)). A project then needs no free-running orchestrator agent that edits the tasks file.
+
+The planner reads its **sources**, all bounded and path-checked:
+
+- `markdown_plan`: markdown files with checkbox tasks, `- [ ] <id>: text` and `- [x] <id>: text` (`*` and `+` bullets too). The id comes from `id_pattern` (a named group `id`, or the first group); a line without one is an open task in the planner agent's context but is never matched against the tasks file. Headings give each task its section, a heading matching `phase_pattern` its phase, a line that is only bold text a subsection; lines indented under a task are its details; `depends_pattern` (`depends on A-1, A-2 and B-3` by default) lists what it waits on, and a task is ready when every one of those is done. Fenced code blocks are skipped. A repeated id counts once (the first); the rest are reported.
+- `backlog_file`: one task per line, as a `checklist` (the same parser, the default), as `list` items (`- text`, `1. text`), or as `table` rows (every row after a header; the id from `id_column`). List items and rows are done when `done_pattern` matches.
+- `owner_messages`: the owner's message file (default: `inbox_file`, the `- OWNER <time> [<id>]: <text>` lines the Owner messages view writes), without the ones answered in `replies_path` (default: `outbox_file`). A new one is a trigger. The planner writes no replies.
+- `queue_events`: the queue file (default: `queue_file`): the lines written since the last check (`DONE`, `BLOCKED`, `WAITING` and the rest). The first check only notes where the file ends, so old lines are never taken for new ones; neither are those of a file that was rewritten.
+
+Plan and backlog files are read whole up to `max_bytes` (a larger one is refused, not cut) and `max_lines`; message and queue files from their end. Every line is cut at 2,000 characters before a pattern sees it. A path is relative to `repo` and must be inside `repo`, `agents_dir` or one of `roots`, also once symlinks are resolved, so a symlink can't lead out; the files the project config names itself (`queue_file`, `inbox_file`, `outbox_file`) are checked against their own directory. The file must be a regular file (a FIFO or a directory is refused, and its last component is never followed if it is a symlink).
+
+**The rules** run every `interval_seconds`, with no agent:
+
+- **done**: a line whose task the queue reports done, by fill's own done check (`done_pattern`, the lines written since the task's latest run started, the whole file for a task Lair never ran), becomes `<done_marker><line>` (`#done worker-a|...`), which fill reads as a comment. `mark_done: lair_runs` limits this to tasks the agents module ran, for a project where another launcher still runs some tasks and reuses task ids for a whole workstream; `off` turns it off.
+- **plan done**: a line whose task id is a plan or backlog task marked done is removed (`drop_plan_done`).
+- Every edit is checked with fill's parser: one that would add a malformed line, a duplicate task, a task past fill's 200 or a file over 256 KB is refused. Lines Lair writes name only agents in `agents.fill.agents`.
+- In `act` mode the tasks file is written atomically (a new file in its directory, then a rename) and only if it still has the content the change was made from; a tasks file that is a symlink is never written. In `observe` mode nothing is written: each change is recorded once as `planned`.
+- Every change is recorded with its reason and diff (`GET /api/planner/history`, and the Planner view). An edit someone else makes is accepted and recorded as `external`.
+
+**The planner agent** (`agent:`, optional: without it only the rules run) is an agent of the project that fill never starts (it must not be in `agents.fill.agents`), run through the agents module like any run (claims, locks, recovery, failover and budgets apply). A run starts on a **trigger**: an allowlisted agent reports `DONE` and has no open line left; an agent reports `BLOCKED` for a task problem (below); allowlisted agents are idle with no line (once per idle set and tasks file); a new owner message; a plan or backlog file changed. Triggers wait until the newest is `debounce_seconds` old, and a run starts at least `min_interval_seconds` after the previous one; there is one at a time. Its prompt is `prompt_file` (inside `prompts_dir`, read as fill reads prompt files), then what Lair adds: the path of its proposal file, the rules, and the context as JSON data (the triggers, the allowlist and idle agents, the tasks file, open plan and backlog tasks, recent queue events, unanswered owner messages and blocked tasks; every string cleaned and cut, the whole cut to `context_max_bytes`).
+
+Its **only output** is the proposal file, `<work_dir>/<run id>/proposals.json`:
+
+```json
+{"proposals": [{"op": "add", "task": "feat-search", "agent": "worker-b", "text": "Search page", "reason": "ready in the plan; worker-b is idle"}]}
+```
+
+- `op`: `add` (a new task id, an allowlisted `agent`, and `text`, the line's description), `finish` (mark it done), `reassign` (another allowlisted `agent`), `reword` (new `text`), `drop` (remove the line), `unblock` (release fill's `no_done` hold on it, never an `owner` hold, and clear the planner's blocked record); `reason` always.
+- Each proposal is checked in order: the schema (unknown keys are refused), fill's task-id rules and `task_id_pattern`, the allowlist (never the planner agent), the tasks file as the proposals before it leave it (`add` needs a new id, not a done one; the others an open line; `reassign` and `drop` wait while the task has an active run), one proposal per task, `text` one line of at most 500 characters, and `max_proposals` (the rest are refused). A refused proposal is kept with its reason. A run whose agent didn't complete, wrote no file, a file over 256 KB, a symlink or not `{"proposals": [...]}` fails; its triggers wait for the next run, and after `max_failed_runs` failures in a row planner runs pause and you are asked once.
+- In `act` mode accepted proposals are applied at once, except ops with `approval: always` (default: `drop` and `reassign`); in `observe` mode all of them wait. Waiting proposals are listed in the Planner view, where you approve or reject each one or a whole run, and each run with waiting proposals raises one [Decision Inbox](#decision-inbox) decision ("Apply them all" or "Reject them all"). An approval is checked again against the tasks file as it is then. **Approving writes the tasks file, in observe mode too.**
+- **The planner agent can't edit the tasks file.** In `act` mode a change to it while a planner run is active is put back, that run's proposals are refused, and you get a decision with the diff (go on, or pause planner runs). In `observe` mode, where another tool may still write the file, the change is recorded and kept. Running agents as a separate OS user is what makes the file unwritable for them. Its `text` only becomes a description, which fill shows and never puts into a prompt.
+
+**BLOCKED lines.** A new `BLOCKED` queue line is matched to a task (an id it names, else the reporting agent's only open line), and its reason (the text after the first `: `) is classified by `blocked.owner_patterns`, then `blocked.environment_patterns` (case-insensitive; the defaults cover approvals, decisions, credentials, accounts and money, then permissions, disk, memory, containers, network, timeouts, load, locks and stuck runners):
+
+- needs you, or the environment: one decision per task and class ("It's sorted: let the task go on", which unblocks it, or "Leave it blocked"), and a `planner.blocked` event;
+- anything else is a task problem: a planner run (it may `reword` or `unblock`), at most `attempts_per_task` of them per task; then one decision ("Let the planner try again" or "Leave it to me"). A task you leave blocked is left alone until its line changes.
+
+```yaml
+agents:
+  enabled: true
+  fill:
+    enabled: true
+    tasks_file: /home/user/lair-work/my-project-tasks.txt   # the planner keeps this file
+    agents: [worker-a, worker-b]
+    prompt_files: ["{prompts_dir}/{agent}.txt"]
+planner:
+  enabled: true
+  mode: observe                      # act: Lair writes the tasks file itself
+  roots: [/home/user/lair-work]
+  sources:
+    - kind: markdown_plan
+      paths: [docs/plan.md]          # "- [ ] feat-search: Search page"
+    - kind: backlog_file
+      paths: [docs/backlog.md]
+      format: table
+      id_pattern: "^(?<id>B\\d+)\\b"
+      done_pattern: "\\bdone\\b"
+    - kind: owner_messages
+    - kind: queue_events
+  agent:
+    id: planner-agent                 # a dragons entry, not in agents.fill.agents
+    prompt_file: planner.md           # in prompts_dir
+    min_interval_seconds: 600
+    max_proposals: 10
+  approval: { drop: always, reassign: always }
+  attempts_per_task: 2
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Run the planner for this project (needs `agents.enabled` and `agents.fill.tasks_file`) |
+| `mode` | `observe` \| `act` | `observe` | `act`: Lair writes the tasks file; `observe`: it records what it would write, and every proposal waits for you |
+| `interval_seconds` | number | `60` | Seconds between checks |
+| `tasks_file` | string | `agents.fill.tasks_file` | Must be fill's tasks file |
+| `done_marker` | string | `"#done "` | What a done line starts with (a `#`, so fill skips it) |
+| `mark_done` | `all` \| `lair_runs` \| `off` | `all` | Which lines the queue's done lines mark done |
+| `drop_plan_done` | boolean | `true` | Remove lines whose task the plan marks done |
+| `work_dir` | string | `{agents_dir}/lair-planner` | Where each planner run's directory (`context.json`, `proposals.json`) is made. `{agents_dir}`, `{repo}` |
+| `roots` | array | `[]` | Directories sources may be read from, besides `repo` and `agents_dir` |
+| `sources` | array | `[]` | `{kind, name?, ...}`: see above. `markdown_plan`: `paths`, `id_pattern`, `phase_pattern`, `depends_pattern`, `max_bytes` (1 MB, at most 4 MB), `max_lines` (20,000). `backlog_file`: the same, plus `format`, `done_pattern`, `id_column`. `owner_messages`: `path`, `replies_path`, `max_messages` (20), `max_bytes` (256 KB). `queue_events`: `path`, `max_events` (200). At most one of each of the last two |
+| `agent.id` | string | — | The planner agent |
+| `agent.prompt_file` | string | — | Its prompt template, in `prompts_dir`. `{prompts_dir}`, `{agent}`, `{task}` |
+| `agent.min_interval_seconds` | number | `600` | Least time between two planner runs' starts |
+| `agent.debounce_seconds` | number | `60` | A run starts once the newest trigger is this old |
+| `agent.max_proposals` | number | `10` | Proposals a run may make (at most 50) |
+| `approval.<op>` | `never` \| `always` | `drop`, `reassign`: `always`; the rest `never` | Ops that wait for you in `act` mode |
+| `attempts_per_task` | number | `2` | Planner runs per blocked task; then you decide |
+| `max_failed_runs` | number | `3` | Failed planner runs in a row before runs pause |
+| `blocked.owner_patterns`, `blocked.environment_patterns` | array | see above | Regular expressions for a BLOCKED reason |
+| `context_max_bytes` | number | `64000` | The context bundle's size |
+| `task_id_pattern` | string | — | A regular expression the task ids of proposals must match too |
+
+Config errors (an unknown key, an invalid pattern or one without its group, a `tasks_file` other than fill's, a planner agent that is unknown or in `agents.fill.agents`, a `..` in `prompt_file`, a repeated source name, two `owner_messages` or `queue_events` sources) turn the planner off for that project; `GET /api/planner/status` shows them. A tasks file, `prompts_dir` or `work_dir` inside `repo` is a warning: whoever writes the tasks file or the planner's prompt chooses what the agents work on.
+
+### Planner API
+
+`?project=` defaults to the default project. `GET /api/planner/status` is open: enabled, mode, whether runs are paused, the last check and error, config errors and warnings, and counts (sources, open and ready tasks, waiting proposals, runs); it holds no plan or task text. Everything else needs the owner's session, from the dashboard (HTTP 403 otherwise; `/api/planner` gets no CORS), because it shows plan text or changes something:
+
+- `GET /api/planner/overview`: the sources and their parse status, the tasks file's lines and done tasks, open plan and backlog tasks (ready or what they wait on), pending triggers, blocked tasks and how each was routed, idle agents, the planner agent and when its next run can start
+- `GET /api/planner/proposals?status=pending|applied|rejected|declined&limit=100`, `GET /api/planner/runs?limit=100`, `GET /api/planner/history?limit=100`
+- `POST /api/planner/check`: check now
+- `POST /api/planner/proposals/<id>/approve`, `.../reject`, `POST /api/planner/runs/<id>/approve`, `.../reject`, `POST /api/planner/resume`: each with `{"confirm": true}` (HTTP 400 without; 409 when nothing waits)
+
+Events: `planner.changed`, `planner.run_started`, `planner.run_finished`, `planner.proposals_pending`, `planner.blocked`, `planner.tasks_file_restored`. Decisions are raised as module `planner`. Everything is kept in `data/planner.db`: a restart keeps the pending triggers, the planner run in progress, waiting proposals and the history.
+
 ## Example complete configuration
 
 ```yaml
@@ -1738,7 +1845,7 @@ Project names (the file name without `.yaml` or `.yml`) must start with a letter
 
 The server watches `projects/` and `projects/local/`. When a project file changes (or a new one appears), it waits until the file has been quiet for a second, then reads it and checks it with every module's own parser, the same checks as at startup:
 
-- **Valid:** only the modules whose part of the file changed are reloaded, each for that project only. A module's part is its own block (`watchdog:`, `delivery:`, `pipelines:` and `executors:`, `review:`, `agents:`, `triage:`, `placement:`), the blocks it also reads (the agents module reads `watchdog:`), and every other top-level key a module may read (`repo`, `read_only`, `dragons`, `machines`, `agents_dir`...), so a change to one of those reloads every module of the project. Keys no module reads reload nothing: the dashboard's commands (`*_cmd`, `allow_direct_assign`, `outbox_file`, `backlog_file`), `merge_bar`, `processes`, `orchestrator`, `available_models` and `gate_runner`. Editing only a comment reloads nothing. The dashboard's reads use the new file from the next request.
+- **Valid:** only the modules whose part of the file changed are reloaded, each for that project only. A module's part is its own block (`watchdog:`, `delivery:`, `pipelines:` and `executors:`, `review:`, `agents:`, `triage:`, `placement:`, `planner:`), the blocks it also reads (the agents module reads `watchdog:`, the planner `agents:`), and every other top-level key a module may read (`repo`, `read_only`, `dragons`, `machines`, `agents_dir`, `outbox_file`...), so a change to one of those reloads every module of the project. Keys no module reads reload nothing: the dashboard's commands (`*_cmd`, `allow_direct_assign`, `backlog_file`), `merge_bar`, `processes`, `orchestrator`, `available_models` and `gate_runner`. Editing only a comment reloads nothing. The dashboard's reads use the new file from the next request.
 - **Invalid** (YAML errors, missing required fields, any module's parser refusing its block, a file that is not a regular file or is over 1 MiB): nothing changes, and the modules keep running the previous config. The error is logged, emitted as a `config.invalid` event, and shown in a banner on the dashboard: "projects/x.yaml has an error; the previous config is still running: ..." until the file is fixed.
 - **Another file:** the modules keep running the file they started with. When it is deleted (deleting `projects/local/x.yaml` would otherwise fall back to the public `projects/x.yaml`), or a new file takes its place (a new `projects/local/x.yaml`), nothing changes and the banner says so; restart Lair to switch files. Deleting a project's only file also keeps its previous config running until a restart.
 

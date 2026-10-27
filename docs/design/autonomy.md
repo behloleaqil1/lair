@@ -154,6 +154,10 @@ Not built: TAP and SARIF parsers, the agent for leftover causes, and the nightly
 - **Nightly:** a full suite runs on the default branch every night, and a red nightly opens the same incident.
 
 ## 4. Planner: work comes from documents, not prompts (module `planner`)
+- **Status:** the first step is built in `src/server/planner/` ([planner.md](planner.md), see
+  [configuration](../configuration.md#planner)): Lair keeps fill's tasks file from plans, backlogs, owner messages and
+  queue lines; rules mark tasks done, and a planner agent, started on triggers through the agents module, proposes
+  changes that code checks before they apply or go to the owner. Task cards, the graph and docs PRs are not built.
 - **Inputs (per app pack):** the project plan, design docs with PR plans, specs, issues, and Decision Inbox
   answers. An agent extracts **task cards**; code validates them against the card schema and the dependency graph.
 - **A task card holds** `{id, title, source (doc + section), acceptance criteria (tests first), size budget (lines,
