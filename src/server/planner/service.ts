@@ -177,6 +177,8 @@ export class PlannerService {
   private stopped = true;
   private lastCycle: number | null = null;
   private lastError: string | null = null;
+  /** A problem this cycle got past (a write that failed), shown as its error */
+  private cycleError: string | null = null;
   private sourceViews: SourceStatusView[] = [];
   private planTasks: PlanTaskView[] = [];
   private doc: TasksDoc | null = null;
@@ -236,9 +238,10 @@ export class PlannerService {
 
   private async runCycle(): Promise<void> {
     const now = this.clock.now();
+    this.cycleError = null;
     try {
       await this.cycleAt(now);
-      this.lastError = null;
+      this.lastError = this.cycleError;
     } catch (e) {
       const error = message(e);
       if (error !== this.lastError) console.warn(`[planner] ${this.project}: cycle failed: ${error}`);
@@ -525,8 +528,15 @@ export class PlannerService {
       }
       return { doc, settled };
     }
-    const result = await this.commit(doc, changes, now);
-    return { doc: result.doc, settled };
+    try {
+      const result = await this.commit(doc, changes, now);
+      return { doc: result.doc, settled };
+    } catch (e) {
+      // Not written (the file changed meanwhile, say): the next cycle tries again. The rest of this cycle goes on,
+      // so the queue lines read this cycle (a BLOCKED line, say) are still handled.
+      this.cycleError = message(e);
+      return { doc, settled: new Set() };
+    }
   }
 
   // ============ EVENTS AND TRIGGERS ============

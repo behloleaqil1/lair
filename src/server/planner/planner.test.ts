@@ -6,7 +6,7 @@
  * raised and the routes' answers.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { appendFileSync, existsSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "fs";
+import { appendFileSync, chmodSync, existsSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 import { parseTasksFile } from "../agents/fill.js";
 import type { ChangeView, PlannerOverviewView, PlannerRunView, ProposalView } from "../../shared/planner-types.js";
@@ -76,6 +76,29 @@ describe("the deterministic part", () => {
     // Done stays done: nothing more on later cycles
     await h.service.cycle();
     expect(history(h)).toHaveLength(1);
+  });
+
+  it("a write that fails is reported, and the rest of the cycle still runs: its BLOCKED line is routed", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form", "worker-b|Bob|feat-search|Search page");
+    const h = await setup(p, plannerBlock(p, { agent: undefined }));
+    await h.service.cycle();
+    queue(p, "- DONE feat-login by worker-a 12:05Z: merged", "- BLOCKED feat-search by worker-b 12:06Z: docker daemon is down");
+    // No new file can be made next to the tasks file, so the atomic write can't happen
+    chmodSync(p.work, 0o555);
+    try {
+      await h.service.cycle();
+    } finally {
+      chmodSync(p.work, 0o755);
+    }
+    expect(h.service.status().lastError).toContain("could not be written");
+    expect(taskIds(h)).toEqual(["feat-login", "feat-search"]);
+    expect(history(h)).toEqual([]);
+    expect(h.service.overview().blocked.map((b) => [b.task, b.class])).toEqual([["feat-search", "environment"]]);
+    // Once it can be written again, the next cycle marks the task done
+    await h.service.cycle();
+    expect(taskIds(h)).toEqual(["feat-search"]);
+    expect(h.service.status().lastError).toBeNull();
   });
 
   it("observe mode writes nothing: the change is recorded as planned, once", async () => {
