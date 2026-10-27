@@ -248,7 +248,7 @@ Each view is a standalone component:
 - **`OwnerSessions.tsx`**: the signed-in browsers, each with Sign out
 - **`Dragons.tsx`**, **`DragonStartDialog.tsx`**, **`DragonStopDialog.tsx`**: agent list (running also for a run of the agents module, "managed by Lair"; the effective model, "(default)" when from `dragon_defaults`; the newest log's time), start and stop dialogs (view logic in `dragon-view.ts`)
 - **`Gates.tsx`**, **`PipelineRuns.tsx`**: gate queue by lane (every lane the request files name), results of the last 24 hours newest first (view logic in `gates-view.ts`); pipeline runs with where each step ran, fallback reasons, CI minutes, executor availability and the workflow file
-- **`PRs.tsx`**: pull requests with gate status and merge readiness
+- **`PRs.tsx`**: pull requests with gate status and merge readiness. With the review module on, readiness is that module's evaluation of each PR at its head (`GET /api/review/prs/:number`: "Merge ready" only when `canMerge`, else `Waiting: <first reason>`), asked again when the head changes, after 5 minutes or on Re-check readiness; without it the first group is "Gate passed". The rules are in `pr-readiness.ts`
 - **`Orchestrator.tsx`**: orchestrator ticks, STOP file, service status
 - **`Machines.tsx`**: machine health, runner status
 - **`Nodes.tsx`**: connected lair-node instances

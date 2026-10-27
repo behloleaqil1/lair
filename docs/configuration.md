@@ -818,7 +818,7 @@ POST bodies are JSON. `down`, `restart` and `deploy` need `"confirm": true`. `do
 
 ## Reviews and policy merge
 
-The `review:` block turns on risk tiers, recorded reviews, the test integrity check and policy merge for a project ([design](design/autonomy.md#5-reviews-and-policy-merge-module-review-extends-policy)). It is off unless `enabled: true`, and it never merges a project with `read_only: true`. The Reviews view shows each open PR's tier, required and present reviews, findings, the gate at the head, and the merge button with the reasons it is disabled.
+The `review:` block turns on risk tiers, recorded reviews, the test integrity check and policy merge for a project ([design](design/autonomy.md#5-reviews-and-policy-merge-module-review-extends-policy)). It is off unless `enabled: true`, and it never merges a project with `read_only: true`. The Reviews view shows each open PR's tier, required and present reviews, findings, the gate at the head, and the merge button with the reasons it is disabled. The PRs view takes its readiness from the same evaluation: a PR is "Merge ready" only when the review module allows the merge at its head, and otherwise shows "Waiting:" with the first reason. Without `review.enabled` that view's first group is "Gate passed": it means only that a gate passed at the head.
 
 ```yaml
 review:

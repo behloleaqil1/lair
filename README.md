@@ -12,7 +12,7 @@ Lair is **agent-agnostic**: agents are started by commands you configure, so any
 - **Decisions**: the Decision Inbox, the one place Lair asks you something (pricing, legal, spend, accounts, credentials, go/no-go, and problems its playbooks couldn't fix). Each decision shows what it blocks, its options with their consequences and a recommendation; the nav shows how many wait for you ([details](docs/configuration.md#decision-inbox))
 - **Dragons**: agent status, current tasks, logs and stats
 - **Gates**: gate queue by lane, running jobs and recent results
-- **PRs**: open pull requests with gate status and merge readiness
+- **PRs**: open pull requests and their merge readiness. With reviews on (`review.enabled`), a PR is "Merge ready" only when the review module allows its merge at the head, and otherwise waits with the first reason; without reviews the group is "Gate passed", since nothing checked reviews
 - **Orchestrator**: heartbeat ticks, STOP file and service status
 - **Machines**: machine health, runners and SSH connectivity
 - **Activity and Owner messages**: live fleet bus feed, audit log, and your messages to and from the orchestrator (decisions Lair needs from you are in Decisions)

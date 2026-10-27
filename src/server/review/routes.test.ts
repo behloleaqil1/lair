@@ -12,12 +12,13 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { EventBus } from "../core/event-bus.js";
 import type { Event } from "../../shared/server-types.js";
-import type { ProjectConfig } from "../../shared/types.js";
+import type { ProjectConfig, PullRequest } from "../../shared/types.js";
 import { ReviewManager } from "./service.js";
 import { registerReviewRoutes } from "./routes.js";
 import { HumanAuth, OWNER_SESSION_HEADER, registerOwnerRoutes } from "../human-auth/index.js";
 import { signIn } from "../../client/owner-session";
-import { mergePr, releaseHold, resolveFinding, submitOwnerReview } from "../../client/review-api";
+import { mergePr, prStatus, releaseHold, resolveFinding, submitOwnerReview } from "../../client/review-api";
+import { readinessOf } from "../../client/pr-readiness";
 import { FakeClock, FakeGit, FakeRemote, fakeGitHubApi, type FakeFile, type Person } from "./testing/fakes.js";
 
 const NOW = Date.parse("2026-03-02T12:00:00.000Z");
@@ -616,6 +617,64 @@ describe("review routes: review, policy, merge", () => {
     expect(merged).toMatchObject({ merged: true, record: { pr: 7, resultSha: head, initiatedBy: "owner" } });
     expect(merged.record?.client?.ownerSession).toEqual(objection.review.client?.ownerSession);
     expect(remote.branches.get("main")).toBe(head);
+  });
+
+  it("gives the PRs view its readiness: a passed gate with changes requested waits, and is merge ready once the policy allows it", async () => {
+    const { app, head, assign, owner } = await boot();
+    vi.stubGlobal("fetch", browserFetch(app));
+    // The PR as /api/prs lists it: a gate passed at the head (all the view used to look at)
+    const listed: PullRequest = {
+      number: 7,
+      title: "Double numbers",
+      headRefName: "agent/worker-a/double",
+      headRefOid: head,
+      mergeable: "MERGEABLE",
+      updatedAt: new Date(NOW).toISOString(),
+      mergeReady: true,
+    };
+    const token = await assign(7);
+    await review(
+      app,
+      7,
+      { id: "worker-b", kind: "agent" },
+      head,
+      "request_changes",
+      [{ severity: "high", file: "src/feature.ts", line: 2, text: "Overflows for large inputs", blocking: true }],
+      "demo",
+      token,
+    );
+
+    // What the PRs view asks for, with the dashboard's helper: the review module's own status for the PR
+    const rejected = await prStatus("demo", 7);
+    expect(rejected.canMerge).toBe(false);
+    expect(rejected.reasons.length).toBeGreaterThan(0);
+    expect(readinessOf(listed, true, { headSha: head, checkedAt: NOW, status: rejected, error: null })).toEqual({
+      group: "waiting",
+      label: `Waiting: ${rejected.reasons[0]}`,
+      tier: rejected.risk.tier,
+      checkedAt: NOW,
+    });
+    // Without the review module the same PR only counts as a passed gate
+    expect(readinessOf(listed, false)).toMatchObject({ group: "ready", label: "Gate passed" });
+
+    // The owner resolves the blocking finding and the reviewer approves at the head
+    const finding = rejected.findings.find((f) => f.blocking);
+    const resolved = await app.inject({
+      method: "POST",
+      url: `/api/review/findings/${finding?.id}/resolve`,
+      headers: owner,
+      payload: { by: "owner", note: "Bounded in the caller" },
+    });
+    expect(resolved.statusCode).toBe(200);
+    await review(app, 7, { id: "worker-b", kind: "agent" }, head, "approve", [], "demo", token);
+    const allowed = await prStatus("demo", 7);
+    expect(allowed.canMerge).toBe(true);
+    expect(readinessOf(listed, true, { headSha: head, checkedAt: NOW, status: allowed, error: null })).toEqual({
+      group: "ready",
+      label: "Merge ready",
+      tier: allowed.risk.tier,
+      checkedAt: NOW,
+    });
   });
 });
 
