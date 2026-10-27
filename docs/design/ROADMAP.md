@@ -66,3 +66,19 @@ review:
    Operations interrupted by a restart are resumed or rolled back, never left half done.
 7. **No private details and no AI attribution** in code, tests, docs or commits ([CONTRIBUTING.md](../../CONTRIBUTING.md)).
 8. **CI is the test runner.** Typecheck, lint, tests and build on Node 22 and 24 must be green before review.
+
+## UI consolidation (when a project's agents move to Lair)
+
+Some views exist twice because Lair grew next to the tools it replaces: the old view shows the state the previous
+launcher keeps, and the new one shows Lair's. They stay apart while both run, so the owner can see each, and they merge
+once a project's agents run under Lair.
+
+| Today | After the move |
+|---|---|
+| **Dragons** (the roster; Start and Stop through the project's own start command) and **Agents** (runs Lair supervises) | One **Dragons** view with Lair's state per agent: claim, recoveries, budget; Start and Stop through Lair |
+| **PRs** (mergeable and gate) and **Reviews** (tier, reviewers, findings, merge policy) | One **Pull requests** view; "merge ready" comes from the review policy |
+| **Inbox** (the owner's message file) and **Decisions** | **Decisions** only; owner messages go through the command bar |
+| **Orchestrator** (an external orchestration loop) | Removed once that loop's duties (reviews, merges, triage) run in Lair |
+| **Machines** (SSH machines) and **Nodes** (lair-node) | One **Machines** view once lair-node runs jobs |
+| **Processes** (the previous launcher's helper loops) | Only the processes Lair supervises; retired loops disappear |
+| **Gates** (an external gate queue) and **Pipelines** | One **Gates** view once the project's gates run as Lair pipelines |
