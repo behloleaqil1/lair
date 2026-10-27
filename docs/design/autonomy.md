@@ -269,7 +269,10 @@ planner (§4) turns documents into work; this module WRITES and maintains those 
   backoff. Hung agents (the watchdog's rule) and dead-on-start or crashed ones restart with the same session K times,
   then in a fresh one (the old session moved aside), then escalate. Rate limits and provider errors fail over to the
   agent's next profile, a bounded number of times per task; budgets are per agent and per project, per day and month,
-  fed by the fleet budget. Agents get a built environment (never the server's secrets).
+  fed by the fleet budget. Agents get a built environment (never the server's secrets). Fill (`agents.fill`) starts
+  runs from a task list for an allowlist of agents, within `max_active` and a capacity command, through the same
+  in-process request, so a project needs no launcher loop; a task done since its last start or left to the owner is
+  never started again.
 - **Budgets are advisory until adapters report usage:** today usage is read from run logs by pattern, text the agent
   itself writes, so it can under-report. Budgets become enforcement once providers or adapters report usage to the
   fleet budget directly; until then keep a spending limit at the provider too.

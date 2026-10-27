@@ -1046,16 +1046,71 @@ agents:
 | `providers` | map | `{}` | Adapter id -> provider name, for cooldowns and the fleet budget |
 | `usage_patterns` | array | `[]` | Regular expressions with `(?<tokens>...)` and/or `(?<cost>...)`, read from run logs |
 | `budgets.project`, `budgets.agent`, `budgets.per_agent.<id>` | map | — | `daily_tokens`, `daily_cost`, `monthly_tokens`, `monthly_cost`, each `{soft, hard}` |
+| `fill` | map | off | Start runs from a task list: see [Fill](#fill) |
 
 The default patterns look for an error, not the words alone, so an agent writing about rate limiting in its own work doesn't trigger a failover: a rate limit is `rate limit ... exceeded|reached|error|retry`, `exceeded|reached|hit ... rate limit`, `error|status|http 429`, `429 too many requests`, `quota exceeded|exhausted` or `usage limit reached|exceeded`; a provider error is `overloaded_error`, `model is overloaded|unavailable`, `api error ... 5xx` or `status|http 500|502|503|504|529`. Tune them to your adapters' output.
 
-Unknown keys, invalid regular expressions, a usage pattern without a named group, a fallback naming an unknown adapter, a `LAIR_*` name in `env_passthrough`, or a soft limit above its hard limit are config errors: the project's agents module doesn't start, and `GET /api/agents/status` shows the errors. Lair reads the config at startup.
+Unknown keys, invalid regular expressions, a usage pattern without a named group, a fallback naming an unknown adapter, a `LAIR_*` name in `env_passthrough`, a soft limit above its hard limit, or a `fill` block that is enabled but incomplete (see below) are config errors: the project's agents module doesn't start, and `GET /api/agents/status` shows the errors. Lair reads the config at startup.
+
+### Fill
+
+> Off by default. With `fill.enabled: true`, Lair starts agent runs itself from a task list, so the project needs no launcher loop of its own. Fill only asks for runs: they are started and supervised like any other run (claims, locks, never-started retries, recovery, failover, budgets and escalation all apply unchanged).
+
+`tasks_file` holds one task per line, `<agent>|<name>|<task>|<description>`: the agent id, a display name, the task id and a description (it may be empty and may contain `|`). Blank lines and lines starting with `#` are skipped. Every `interval_seconds` fill reads the file and looks at each line in order:
+
+- An agent that isn't in `fill.agents` is never started (`not allowlisted`). The allowlist is required, so you can move agents over one at a time while another launcher still runs the rest.
+- A task with an active run of the line's agent is `started`; one with another agent's run or another claim on it is `claimed`. Neither is started again.
+- A task that is `done` is not started again: `done_pattern` matches a queue line (`queue_file`) written since the task was last started (the whole file for a task Lair never ran). A run that exits 0 without writing that line is started again on the next check, with the same prompt. Agents write the queue file, so a done line only keeps fill from starting a task again; it proves nothing else.
+- A task whose last run ended in any other way than completing (escalated to the Decision Inbox, stopped by your answer, its claim released) is `held`: it is yours to resume, from the decision or by requesting a run in the Agents view, and fill never restarts it by itself. A run that dies is restarted by the module's recovery, not by fill, so there is never a second run of one task.
+- Otherwise the task is started when its agent has no active run, fewer than `max_active` runs fill started are active, and `capacity_cmd` (when set) exits 0. Its prompt is the contents of `prompt_files`, in order, separated by a blank line (`default_instructions` and the agent's `instructions` come first, as for every run). It is requested through the module's in-process request, never over HTTP. A line that waits for any of these is `held`, with the reason: the agent is busy, `max_active` is reached, the capacity command's first output line, a refused prompt file, or the refused request (over budget, say).
+- A line that doesn't parse, names an invalid agent or task id, or repeats a task is `malformed`: it is reported, and the other lines are still filled.
+
+**Prompt files stay inside `prompts_dir`.** In each path `{prompts_dir}`, `{agent}` and `{task}` are replaced, and a relative path is relative to `prompts_dir`. A path with a `..` segment is a config error; at run time a path outside `prompts_dir`, a symlink that leads out of it (one that stays inside is fine), anything but a regular file, or a file over 200 KB is refused and the line is held with the reason. Their text is used as it is: placeholders are not replaced inside it (the agent gets `LAIR_TASK` and `LAIR_AGENT` in its environment), and a line's description is shown in the status, never put into a prompt. Keep `tasks_file` and `prompts_dir` where the agents can't write (not in the repository they work in): whoever edits them chooses what the allowlisted agents work on.
+
+**The capacity command** is an argv, run without a shell before each start, with `command_timeout_seconds` as its timeout. Exit 0 means there is capacity; any other exit code, or a timeout, holds every line that would start in that check, with its first output line as the reason.
+
+`agents.fill_started` and `agents.fill_held` events go on the event bus (and into the agents store): one when fill starts a task, and one when a line becomes held or is held for another kind of reason (busy, `max_active`, capacity, a prompt file, the owner's, a refused request), not on every check. Bounds: the tasks file is read up to 256 KB, 200 tasks and 2,000 characters a line; the queue file's last 4 MB are searched, each line cut at 1,000 characters, and a done line must contain the task id. A queue file that was rewritten (not appended to) since a task's start is searched whole. Task ids are not reused: a task that is done stays done.
+
+```yaml
+agents:
+  enabled: true
+  fill:
+    enabled: true
+    tasks_file: /home/user/lair-work/my-project-tasks.txt   # outside the repo the agents work in
+    agents: [worker-a, worker-b]             # the only agents fill starts
+    prompt_files:
+      - "{prompts_dir}/restart-addendum.txt"
+      - "{prompts_dir}/{agent}.txt"
+    max_active: 2
+    done_pattern: "^- DONE {task}\\b"
+    capacity_cmd: ["/home/user/my-project/scripts/has-capacity"]
+    interval_seconds: 60
+```
+
+```text
+# agent|name|task|description
+worker-a|Alice|feat-login|Build the login form
+worker-b|Bob|feat-search|Search page
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `fill.enabled` | boolean | `false` | Start runs from `tasks_file` (needs `agents.enabled: true`) |
+| `fill.tasks_file` | string | — | Required when enabled. Lines `<agent>\|<name>\|<task>\|<description>`; relative to `repo` |
+| `fill.agents` | array | `[]` | Required when enabled. The agent ids fill may start |
+| `fill.prompt_files` | array | `[]` | Required when enabled. Files whose contents, in order, make the prompt. `{prompts_dir}`, `{agent}`, `{task}` |
+| `fill.max_active` | number | `1` | Runs fill started that may be active at once (restarts and retries count) |
+| `fill.done_pattern` | string | `^- DONE {task}(?=[\s:]\|$)` | Regular expression (case-sensitive) for a queue line that reports the task done. Must contain `{task}`; `{agent}` too, if you like. Both are inserted as literal text |
+| `fill.capacity_cmd` | array | — | Exit 0: capacity available; anything else holds, with its first output line as the reason |
+| `fill.interval_seconds` | number | `60` | Seconds between fill checks |
+
+A fill block that is enabled without `agents.enabled`, `tasks_file`, `agents` or `prompt_files`, an invalid agent id in `agents`, a `prompt_files` entry with a `..` segment or an unknown placeholder, or a `done_pattern` without `{task}` or that isn't a regular expression is a config error.
 
 ### Agents API
 
 `?project=` defaults to the default project.
 
-- `GET /api/agents/status`: per agent its state (`idle`, `starting`, `working`, `waiting_on_lock`, `hung`, `stopping`, `never_started`, `failed_over`, `over_budget`, `failed`) with the detail (for a lock wait: the lock, its holder pid and whether it is alive), its current or latest run, its profiles, claims, budget and recent recoveries; the project's claims, locks (holder, how often broken) and budget
+- `GET /api/agents/status`: per agent its state (`idle`, `starting`, `working`, `waiting_on_lock`, `hung`, `stopping`, `never_started`, `failed_over`, `over_budget`, `failed`) with the detail (for a lock wait: the lock, its holder pid and whether it is alive), its current or latest run, its profiles, claims, budget and recent recoveries; the project's claims, locks (holder, how often broken) and budget; and `fill`: whether it is enabled and running, its last check (and error), how many of its runs are active, and each `tasks_file` line's state at that check (`started`, `done`, `held`, `claimed`, `not_allowlisted` or `malformed`, with the detail: the reason a line is held, say)
 - `GET /api/agents/runs?limit=100`, `GET /api/agents/recoveries?limit=100`: runs, and the recovery events (claim releases, lock breaks, never-started, hung, dead on start, crashes, restarts, fresh sessions, failovers, budget alerts, escalations, decisions) with their evidence
 - `POST /api/agents/runs` `{agent, task, prompt, model?}`, with an owner session: claim the task and start it on the next check. 400 for a model the agent doesn't have, 409 when the task is claimed or the agent is busy, 403 without an owner session, over budget or `read_only`
 - `POST /api/agents/claims/release` `{task, confirm: true}`, with an owner session: the run holding it stops itself
