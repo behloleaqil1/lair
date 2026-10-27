@@ -4,7 +4,9 @@
  * budget and recent recoveries; the launch locks and their holders. The
  * owner starts a run from the "Start a run" form (agent, task, model, prompt,
  * optionally loaded from a file in prompts_dir). Starting a run, releasing a
- * claim and starting a fresh session ask for confirmation first.
+ * claim and starting a fresh session ask for confirmation first. With
+ * agents.fill on, the Fill card shows each tasks_file line's state and why it
+ * is held; the owner can release a task fill holds for them.
  */
 import { useEffect, useState } from "react";
 import { useApi } from "../hooks/useApi";
@@ -16,6 +18,7 @@ import {
   modelsOf,
   postJson,
   releaseClaimAction,
+  releaseFillHoldAction,
   runConfirmed,
   startRunAction,
   type ConfirmableAction,
@@ -28,8 +31,18 @@ import type {
   AgentView,
   BudgetScopeView,
   ClaimView,
+  FillLineState,
   PromptFileView,
 } from "../../shared/agents-types";
+
+const FILL_BADGE: Record<FillLineState, string> = {
+  started: "badge-success",
+  done: "badge-neutral",
+  held: "badge-warning",
+  claimed: "badge-neutral",
+  not_allowlisted: "badge-neutral",
+  malformed: "badge-error",
+};
 
 interface Props {
   project: string;
@@ -441,6 +454,65 @@ export function Agents({ project, refreshKey }: Props) {
           </tbody>
         </table>
       </div>
+
+      {s.fill?.enabled && (
+        <div className="card" data-card="fill">
+          <h3>Fill</h3>
+          <p style={muted}>
+            {s.fill.tasksFile ?? "no tasks_file"}: last check {time(s.fill.lastCheck)}, {s.fill.active} of{" "}
+            {s.fill.maxActive} run(s) active, agents {s.fill.agents.join(", ")}
+            {s.fill.running ? "" : " (not running)"}
+          </p>
+          {s.fill.lastError && <div className="error">Fill check failed: {s.fill.lastError}</div>}
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Line</th>
+                <th>Agent</th>
+                <th>Task</th>
+                <th>State</th>
+                <th>Detail</th>
+              </tr>
+            </thead>
+            <tbody>
+              {s.fill.lines.map((line) => (
+                <tr key={line.line}>
+                  <td>{line.line}</td>
+                  <td>{line.agent ? <code>{line.agent}</code> : "—"}</td>
+                  <td>
+                    {line.task ? <code>{line.task}</code> : "—"}
+                    {line.description && <div style={muted}>{line.description}</div>}
+                  </td>
+                  <td>
+                    <span className={`badge ${FILL_BADGE[line.state] ?? "badge-neutral"}`}>
+                      {label(line.state)}
+                      {line.hold ? `: ${label(line.hold)}` : ""}
+                    </span>
+                  </td>
+                  <td style={muted}>
+                    {line.detail}{" "}
+                    {line.releasable && line.task && line.agent && !s.readOnly && (
+                      <button
+                        style={actionButton}
+                        onClick={() => line.task && line.agent && act(releaseFillHoldAction(project, line.task, line.agent))}
+                      >
+                        Release hold
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+              {s.fill.lines.length === 0 && (
+                <tr>
+                  <td colSpan={5} style={muted}>
+                    No lines at the last check
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
 
       <div className="card">
         <h3>Locks</h3>

@@ -1,6 +1,7 @@
 /**
- * Agents view actions: starting a run, and the two that stop work (release a
- * claim, start a fresh session). Each asks for confirmation first, and only a
+ * Agents view actions: starting a run, the two that stop work (release a
+ * claim, start a fresh session), and releasing a task fill holds for the
+ * owner. Each asks for confirmation first, and only a
  * confirmed action is sent, with this browser's owner session (only the owner
  * may take them); the stopping ones also send `confirm: true` (the server
  * refuses them without). The start-run form's "Load a prompt" select reads
@@ -48,6 +49,15 @@ export function freshSessionAction(project: string, runId: string, agent: string
     question: `Start ${task} again in a fresh session? A running ${agent} is stopped first, and its session is moved aside (not deleted).`,
     url: withProject(`/api/agents/runs/${encodeURIComponent(runId)}/fresh-session`, project),
     body: { confirm: true },
+  };
+}
+
+/** Release a task fill holds for the owner (POST /api/agents/fill/release): fill starts it again. */
+export function releaseFillHoldAction(project: string, task: string, agent: string): ConfirmableAction {
+  return {
+    question: `Let fill start ${task} again? Fill starts ${agent} on it on its next check, and counts its runs without a done line from zero.`,
+    url: withProject("/api/agents/fill/release", project),
+    body: { task, confirm: true },
   };
 }
 

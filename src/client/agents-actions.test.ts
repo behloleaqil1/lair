@@ -12,6 +12,7 @@ import {
   promptFileUrl,
   promptsUrl,
   releaseClaimAction,
+  releaseFillHoldAction,
   runConfirmed,
   startRunAction,
 } from "./agents-actions";
@@ -54,6 +55,18 @@ describe("agents view actions", () => {
     expect(result).toEqual({ sent: true, ok: true });
     expect(posts).toEqual([
       { url: "/api/agents/claims/release?project=my%20project", body: { task: "feat-login", confirm: true } },
+    ]);
+  });
+
+  it("release a fill hold with confirm: true only once confirmed", async () => {
+    const action = releaseFillHoldAction("my project", "feat-login", "worker-a");
+    expect(action.question).toContain("Let fill start feat-login again?");
+    const { posts, post } = recorder();
+    expect(await runConfirmed(action, () => false, post)).toEqual({ sent: false, ok: false });
+    expect(posts).toEqual([]);
+    expect(await runConfirmed(action, () => true, post)).toEqual({ sent: true, ok: true });
+    expect(posts).toEqual([
+      { url: "/api/agents/fill/release?project=my%20project", body: { task: "feat-login", confirm: true } },
     ]);
   });
 
