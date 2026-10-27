@@ -1048,13 +1048,14 @@ Triage ([design](design/autonomy.md#3-failure-triage-bisect-and-revert-module-tr
 
 **Where results come from.** Every local process can reach the server, including the agents whose work triage judges, so triage only believes results from a trusted source:
 
-- **In-process (trusted):** the gate pipelines (`pipelines:`, [Gate pipelines](#gate-pipelines)) hand over each finished job's result as a `gate.completed` event. Only these may name the author agent, the PR and the base commit.
+- **In-process (trusted):** the gate pipelines (`pipelines:`, [Gate pipelines](#gate-pipelines)) hand over each finished job's result as a `gate.completed` event, with its run id (which answers a re-check that started that run). Only in-process results may name the author agent, the PR and the base commit. The pipelines send neither the test reports nor the agent yet: their failures are read from the steps' console output and are not routed to an agent.
 - **Signed (over HTTP):** `POST /api/triage/results` takes only a `SignedGateResult` from a node listed in `trusted_nodes` (its Ed25519 public key file), verified with the gates module's signature check. Test reports must be covered by the signature: the signed result lists each report's SHA-256 in `result.reports`. Only `recheckId` is read from the rest of the body: the base commit comes from `git merge-base`, the changed files from `git diff`, and no agent is routed to.
 - An unsigned result, a tampered one, one from an untrusted node, or one signed for another project gets HTTP 403.
+- **The branch is a label.** A result for `default_branch` counts as that branch's run only when its commit is in the branch's history (the local branch, or a remote's branch of exactly that name). Otherwise it is triaged as a change, with a note. A green run ends an incident only at a commit that contains the red one.
 
 **Status: informational.** Nothing reads a failure's `blocking` yet: the merge policy will once it consumes triage (docs/design/autonomy.md §5). Until then triage records verdicts, asks for re-checks, opens tasks and decisions, and reverts per `bisect.revert`.
 
-1. **Causes.** JUnit XML reports (JUnit, Surefire, Gradle, pytest `--junitxml`, the vitest and jest JUnit reporters) and the console output of every failed step (Gradle, vitest, jest, pytest) are parsed into causes: the error, its `Caused by` chain, field errors, the failing tests and the project's source locations. A context or bootstrap failure (an application context that can't start, a setup error, a test file that can't load) is **one** cause, however many tests it failed: later tests that only say "failure threshold exceeded" join the first failure's cause. A failed step that no parser reads becomes one cause with its exit code and the error lines of its output. Output is written by the code under test, so the parsers read at most the last 20,000 lines of a log, each cut to 2,000 characters, with patterns that run in linear time, and the XML reader flattens nesting deeper than 64 elements.
+1. **Causes.** JUnit XML reports (JUnit, Surefire, Gradle, pytest `--junitxml`, the vitest and jest JUnit reporters) and the console output of every failed step (Gradle, vitest, jest, pytest) are parsed into causes: the error, its `Caused by` chain, field errors, the failing tests and the project's source locations. A context or bootstrap failure (an application context that can't start, a setup error, a test file that can't load) is **one** cause, however many tests it failed: later tests that only say "failure threshold exceeded" join the first failure's cause. A failed step that no parser reads becomes one cause with its exit code and the error lines of its output. Output is written by the code under test, so the parsers read at most the last 20,000 lines of a log, each cut to 2,000 characters, with patterns that run in linear time, and the XML reader matches a closing tag against at most the 64 innermost open elements.
 2. **Passes.** A test passed at a commit only when a report lists it as passed, or a gate run ran (and passed) the step it failed in. A lint-only run proves nothing about a unit test.
 3. **Classes**, decided per cause, in this order, each with the lines and facts that decided it:
 
@@ -1069,7 +1070,9 @@ Triage ([design](design/autonomy.md#3-failure-triage-bisect-and-revert-module-tr
 
 Decisions go to the [Decision Inbox](#decision-inbox) (the owner answers `revert`, `keep`, `revert-<n>` for a suspect, or `rerun` for an infrastructure failure, and triage acts on the answer), or to `commands.raise_decision` when set, or, without either, as `- OWNER? ...` lines to `decision_file` (default: `inbox_file`). Asking the human is allowed in observe mode, as the watchdog's escalations are.
 
-**Commands never run inside triage's own queue.** Its decisions are short store transactions; commands, decisions and events run afterwards. The `recheck` command must **start** the run and return at once (print the run's id); it is stopped after `recheck.request_timeout_seconds` (default 30). The run's answer is a gate result whose id is `{request}` (or the run id it printed), with `recheckId` set to `{request}`: in-process, or signed. It may arrive while the command is still running.
+**Commands never run inside triage's own queue.** Its decisions are short store transactions; commands, decisions and events run afterwards. The `recheck` command must **start** the run and return at once (print the run's id); it is stopped after `recheck.request_timeout_seconds` (default 30). The run's answer is a gate result whose id is `{request}` (or the run id it printed), with `recheckId` set to `{request}`: in-process, or signed. It may arrive while the command is still running, and it still counts when it comes after the command timed out, until `recheck.timeout_minutes`. A result without `recheckId` answers the waiting re-check whose id, or run id, it carries.
+
+**Calls survive a restart.** Agent messages, tasks, reverts and decisions are written to an outbox table in the transaction of the decision that makes them, and removed in the one that records their result. A call a killed process never made is made on the restarted server's first tick; one that was running when the process died may be made again. `POST /api/triage/results` returns the record at once, and its re-checks and messages run in the background.
 
 ```yaml
 triage:
@@ -1078,7 +1081,7 @@ triage:
   default_branch: main
   trusted_nodes:               # who may POST signed results
     - id: ci-runner-1
-      public_key_file: ./projects/local/keys/ci-runner-1.pub.pem
+      public_key_file: ./data/keys/ci-runner-1.pub.pem   # not in the project's repository
   infra_patterns:              # yours first; one with a built-in id replaces it
     - id: license-server
       kind: network            # network | container | oom | runner | disk | load
@@ -1105,7 +1108,7 @@ The built-in infrastructure patterns (case-insensitive regular expressions, `def
 | `enabled` | boolean | `false` | Triage this project's gate results |
 | `mode` | `observe` \| `act` | `observe` | `observe` runs no command: every action is recorded as `planned`, with the argv it would run. `act` runs them, unless the project is `read_only: true` |
 | `default_branch` | string | `main` | The branch whose red results open incidents |
-| `trusted_nodes` | array | `[]` | `{id, public_key_file}`: the nodes whose signed results `POST /api/triage/results` accepts (the PEM public key; relative paths resolve against the Lair working directory). An unreadable key file stops triage for the project |
+| `trusted_nodes` | array | `[]` | `{id, public_key_file}`: the nodes whose signed results `POST /api/triage/results` accepts (the PEM public key; relative paths resolve against the Lair working directory). Keep the keys under Lair's `data/` or another place agents can't write: a key inside the project's repository is refused. A refused or unreadable key stops triage for the project |
 | `interval_seconds` | number | `60` | How often waiting re-checks and bisect probes are retried and ended quarantines released |
 | `command_timeout_seconds` | number | `120` | Timeout for each command but `recheck` |
 | `infra_patterns` | array | `[]` | `{id, kind, pattern}` |

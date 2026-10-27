@@ -194,7 +194,7 @@ Failure triage, bisect and revert ([configuration](configuration.md#triage)). It
 - **`adapters.ts`**: the interfaces triage needs from other modules (re-check executor, agent router, task sink, decision raiser, revert opener, capacity, the owner guard), the Decision Inbox adapter, and the built-in command, inbox-file and capacity adapters
 - **`git.ts`**: read-only git (first-parent merges, a commit's parents and message, changed files, merge base, ancestry)
 - **`store.ts`**: results, causes, test observations, actions, re-checks, tasks, flaky tests, incidents and protected merges in SQLite (`data/triage.db`)
-- **`service.ts`**: per-project ingest, trust and decisions, each in one store transaction; commands, decisions and events run from an outbox outside the project's queue
+- **`service.ts`**: per-project ingest, trust and decisions, each in one store transaction; commands and decisions run from an outbox kept in the store (so they survive a restart), outside the project's queue
 - **`manager.ts`**, **`routes.ts`**, **`index.ts`**: the projects' lifecycle and trusted node keys, the `/api/triage/*` routes (signed results; `/api/triage/owner/*` for the owner), and `mountTriage()`
 - **`testing/harness.ts`**: the fakes the tests use (command runner, clock, git), a signing node, and result builders
 
