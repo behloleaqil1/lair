@@ -13,6 +13,8 @@ import { parseReviewConfig } from "../review/config.js";
 import type { ReviewManager } from "../review/service.js";
 import type { TriageManager } from "../triage/manager.js";
 import type { PlacementManager } from "../placement/service.js";
+import { parsePlannerConfig } from "../planner/config.js";
+import type { PlannerManager } from "../planner/manager.js";
 import { parseWatchdogConfig } from "../watchdog/config.js";
 import type { WatchdogManager } from "../watchdog/service.js";
 
@@ -48,6 +50,7 @@ export interface ServerModules {
   agents?: AgentsManager;
   triage?: TriageManager;
   placements?: PlacementManager;
+  planner?: PlannerManager;
 }
 
 function errorsOf(result: { ok: true } | { ok: false; errors: string[] }): string[] {
@@ -57,7 +60,7 @@ function errorsOf(result: { ok: true } | { ok: false; errors: string[] }): strin
 /** The server's modules, as src/server/index.ts wires them. */
 export function serverModules(m: ServerModules): ReloadableModule[] {
   const modules: ReloadableModule[] = [];
-  const { delivery, watchdogs, pipelines, reviews, agents, triage, placements } = m;
+  const { delivery, watchdogs, pipelines, reviews, agents, triage, placements, planner } = m;
   if (delivery) {
     modules.push({
       name: "delivery",
@@ -119,6 +122,16 @@ export function serverModules(m: ServerModules): ReloadableModule[] {
       reload: (entry) => placements.reloadProject(entry),
     });
   }
+  if (planner) {
+    modules.push({
+      name: "planner",
+      blocks: ["planner"],
+      // Its tasks file, allowlist and done pattern are agents.fill's
+      reads: ["agents"],
+      validate: (config) => errorsOf(parsePlannerConfig(config.planner, config)),
+      reload: (entry) => planner.reloadProject(entry),
+    });
+  }
   return modules;
 }
 
@@ -155,7 +168,6 @@ export const UNREAD_KEYS: ReadonlySet<string> = new Set([
   "status_cmd",
   "orchestrator",
   "allow_direct_assign",
-  "outbox_file",
   "backlog_file",
   "ask_cmd",
   "tick_now_cmd",

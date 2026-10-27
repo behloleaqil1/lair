@@ -90,6 +90,11 @@ export interface ProjectConfig {
    * docs/configuration.md#placement
    */
   placement?: Record<string, unknown>;
+  /**
+   * The planner: Lair keeps agents.fill's tasks file (src/server/planner/).
+   * Validated by parsePlannerConfig; see docs/configuration.md#planner
+   */
+  planner?: Record<string, unknown>;
 }
 
 // Process configuration as it appears in YAML (before defaults applied)

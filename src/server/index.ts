@@ -53,6 +53,7 @@ import {
   withDeadline,
 } from "./restart/index.js";
 import { SettingsService, registerSettingsUiRoutes } from "./settings/index.js";
+import { mountPlanner, plannerAgentsFrom } from "./planner/index.js";
 import { join } from "path";
 import type { ApiResponse, ProjectConfig } from "../shared/types.js";
 
@@ -477,6 +478,19 @@ const triage = await mountTriage(fastify, {
 });
 triage.useDecisions(decisionInbox);
 
+// The planner: Lair keeps agents.fill's tasks file itself (docs/design/planner.md). One per project with
+// `planner.enabled: true` (off by default). Its planner agent runs through the agents module, in-process; every
+// route but its text-free status needs the owner's session; approvals and blocked tasks go to the Decision Inbox.
+const planner = await mountPlanner(fastify, {
+  dbPath: join(process.cwd(), "data", "planner.db"),
+  agents: plannerAgentsFrom(agents),
+  events: getEventBus(),
+  projects: projectEntries,
+  defaultProject: () => getDefaultProject(),
+  humanAuth,
+});
+planner.useDecisions(decisionInbox);
+
 // Placement: one per project with `placement.enabled: true` (off by
 // default). It probes the project's machines, estimates when each queued
 // job of the project's own gate queue finishes on each lane, and moves jobs
@@ -493,7 +507,7 @@ await registerPlacementRoutes(fastify, placements, () => getDefaultProject());
 // the modules whose part of it changed, without a restart; an invalid one
 // keeps the previous config running and shows in the dashboard's banner
 const reloader = new ConfigReloader({
-  modules: serverModules({ delivery, watchdogs, pipelines, reviews, agents, triage, placements }),
+  modules: serverModules({ delivery, watchdogs, pipelines, reviews, agents, triage, placements, planner }),
   initial: projectEntries,
   events: getEventBus(),
   onAccepted: (project, config) => {
@@ -581,6 +595,9 @@ const stopServer = async (reason: string) => {
 
   // Let a merge in progress finish and record itself, then close the review store
   await reviews.stop();
+
+  // Stop the planner first: it requests runs from the agents module
+  await planner.stop();
 
   // Stop agent supervision (the agents themselves keep running)
   await agents.stop();
@@ -713,6 +730,14 @@ const start = async () => {
       supervised.length > 0
         ? `[agents] Supervising: ${supervised.join(", ")}`
         : "[agents] Off (no project sets agents.enabled)",
+    );
+
+    // Start the planner (after agent supervision: its planner agent is an agents run)
+    const planning = planner.start();
+    console.log(
+      planning.length > 0
+        ? `[planner] Planning for: ${planning.join(", ")}`
+        : "[planner] Off (no project sets planner.enabled)",
     );
 
     // Start triage (re-checks waiting for capacity, bisect probes)

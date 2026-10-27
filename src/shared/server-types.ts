@@ -276,7 +276,14 @@ export type EventType =
   | "placement.move_failed"
   | "placement.machine_up"
   | "placement.machine_down"
-  | "placement.job_held";
+  | "placement.job_held"
+  // Planner (src/server/planner/)
+  | "planner.changed"
+  | "planner.run_started"
+  | "planner.run_finished"
+  | "planner.proposals_pending"
+  | "planner.blocked"
+  | "planner.tasks_file_restored";
 
 /** Event stored in the database */
 export interface Event {
