@@ -42,7 +42,7 @@ import type {
   TriggerView,
 } from "../../shared/planner-types.js";
 import type { DecisionProducer, DecisionResolution, RaiseDecisionInput } from "../decisions/types.js";
-import { buildPrompt, checkDone, MAX_TASKS_FILE_BYTES, QueueLines, type DoneCheck } from "../agents/fill.js";
+import { buildPrompt, checkDone, MAX_TASKS_FILE_BYTES, QueueLines, queueWindowEnd, type DoneCheck } from "../agents/fill.js";
 import { utcStamp } from "../agents/sessions.js";
 import { isActive, type QueueMark } from "../agents/types.js";
 import { getPromptsDir } from "../routes/controls.js";
@@ -266,7 +266,7 @@ export class PlannerService {
     this.sourceViews = [...plan.views, ...(owner ? [owner.view] : []), ...(queue ? [queue.view] : [])];
     this.messages = owner?.messages ?? [];
 
-    let doc = parseTasksDoc(read.text, this.settings.doneMarker);
+    let doc = parseTasksDoc(read.text, this.settings.doneMarker, this.settings.onePerAgent);
     doc = await this.watchTasksFile(doc, this.store.activeRun(this.project), now);
     const { doc: afterRules, settled } = await this.deterministic(doc, plan.tasks, now);
     doc = afterRules;
@@ -443,7 +443,7 @@ export class PlannerService {
         ],
         recommended: { optionId: "pause", reasoning: "A change during a planner run may be the planner agent's: pause until you know who made it." },
       });
-      return restored.ok ? parseTasksDoc(known.text, this.settings.doneMarker) : doc;
+      return restored.ok ? parseTasksDoc(known.text, this.settings.doneMarker, this.settings.onePerAgent) : doc;
     }
     this.store.addChange({
       project: this.project,
@@ -479,7 +479,9 @@ export class PlannerService {
         if (latest && isActive(latest.state)) continue;
         let check: DoneCheck;
         try {
-          check = checkDone(agentsStore, this.project, queue, this.settings.donePattern, line, latest);
+          const patterns = this.settings.fillPatterns;
+          const until = queueWindowEnd(agentsStore, this.project, patterns, line, latest);
+          check = checkDone(agentsStore, this.project, queue, patterns, line, latest, until);
         } catch {
           continue;
         }
@@ -606,7 +608,12 @@ export class PlannerService {
     }
     record.kept = undefined;
     await this.emit("planner.blocked", { task, agent: event.agent, class: c.class, rule: c.rule });
-    if (c.class === "owner" || c.class === "environment") {
+    const lineAgent = findTask(doc, task)?.agent ?? null;
+    const fillRunsIt = this.settings.fillEnabled && lineAgent !== null && this.settings.allowlist.includes(lineAgent);
+    if ((c.class === "owner" || c.class === "environment") && fillRunsIt) {
+      // Fill holds a run that ended on a BLOCKED line and asks the owner itself: one decision for one line
+      record.route = `${c.class === "owner" ? "needs you" : "its environment"}: fill holds the task and asks you (its decision, in the Agents view)`;
+    } else if (c.class === "owner" || c.class === "environment") {
       const id = await this.raise({
         kind: "escalation",
         key: `blocked:${task}:${c.class}`,
@@ -1038,7 +1045,7 @@ export class PlannerService {
   private async apply(proposals: StoredProposal[], by: string, now: number): Promise<void> {
     const read = readTasksFile(this.settings.tasksFile, MAX_TASKS_FILE_BYTES);
     if (!read.ok) throw new PlannerError(409, `the tasks file: ${read.reason}`);
-    let doc = parseTasksDoc(read.text, this.settings.doneMarker);
+    let doc = parseTasksDoc(read.text, this.settings.doneMarker, this.settings.onePerAgent);
     doc = await this.watchTasksFile(doc, by === "planner" ? null : this.store.activeRun(this.project), now);
     const items = proposals.map((p) => ({
       op: p.op,
@@ -1071,7 +1078,8 @@ export class PlannerService {
   }
 
   /**
-   * Unblock: release fill's no_done hold (never an owner hold) and clear the
+   * Unblock: release fill's blocked or no_done hold (a run that stopped
+   * without done and said so; never an owner or a waiting hold) and clear the
    * planner's record. One the planner proposed spends an attempt on the task,
    * so a task that keeps getting blocked reaches the owner's decision instead
    * of a loop of runs (fill's release counts its runs without done from zero).
@@ -1080,10 +1088,10 @@ export class PlannerService {
     if (ref.proposalId) this.store.addAttempt(this.project, task, now);
     const line = this.agents.fillLines(this.project).find((l) => l.task === task);
     let outcome: string;
-    if (line && line.state === "held" && line.hold === "no_done") {
+    if (line && line.state === "held" && (line.hold === "no_done" || line.hold === "blocked")) {
       try {
         await this.agents.releaseFillHold(this.project, task);
-        outcome = "released fill's no_done hold: fill starts it again";
+        outcome = `released fill's ${line.hold} hold: fill starts it again`;
       } catch (e) {
         outcome = `fill's hold was not released (${message(e)})`;
       }

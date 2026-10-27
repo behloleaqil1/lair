@@ -7,7 +7,13 @@ import { basename, dirname, isAbsolute, relative, resolve, sep } from "path";
 import { z } from "zod";
 import type { ProjectConfig } from "../../shared/types.js";
 import { PLANNER_OPS, type PlannerMode, type PlannerOp } from "../../shared/planner-types.js";
-import { parseAgentsConfig } from "../agents/config.js";
+import {
+  DEFAULT_BLOCKED_PATTERN,
+  DEFAULT_DONE_PATTERN,
+  DEFAULT_WAITING_PATTERN,
+  matchesByAgent,
+  parseAgentsConfig,
+} from "../agents/config.js";
 import { isValidDragonId } from "../parsers/dragon-config.js";
 import { getPromptsDir } from "../routes/controls.js";
 import { knownDragonIds } from "../services/dragon-registry.js";
@@ -254,8 +260,12 @@ export interface PlannerSettings {
   taskIdPattern: RegExp | null;
   /** agents.fill.agents: the agents proposals may name */
   allowlist: string[];
-  /** agents.fill.done_pattern */
-  donePattern: string;
+  /** agents.fill's done, waiting and blocked patterns (fill's done check reads them) */
+  fillPatterns: { donePattern: string; waitingPattern: string; blockedPattern: string };
+  /** Fill's patterns match by agent: one open line per agent, as fill parses the file */
+  onePerAgent: boolean;
+  /** agents.fill.enabled: fill runs the allowlisted agents' lines (and holds their BLOCKED runs for the owner) */
+  fillEnabled: boolean;
   /** Not errors: the planner runs, but the owner should know */
   warnings: string[];
 }
@@ -338,6 +348,11 @@ export function parsePlannerConfig(raw: unknown, project: ProjectConfig): Planne
   }
 
   const allowlist = fill?.agents ?? [];
+  const fillPatterns = {
+    donePattern: fill?.donePattern ?? DEFAULT_DONE_PATTERN,
+    waitingPattern: fill?.waitingPattern ?? DEFAULT_WAITING_PATTERN,
+    blockedPattern: fill?.blockedPattern ?? DEFAULT_BLOCKED_PATTERN,
+  };
   const known = knownDragonIds(project);
   let agent: PlannerAgentSettings | null = null;
   if (value.agent) {
@@ -516,7 +531,9 @@ export function parsePlannerConfig(raw: unknown, project: ProjectConfig): Planne
       contextMaxBytes: value.context_max_bytes,
       taskIdPattern,
       allowlist,
-      donePattern: fill?.donePattern ?? "",
+      fillPatterns,
+      onePerAgent: matchesByAgent(fillPatterns),
+      fillEnabled: fill?.enabled === true,
       warnings,
     },
   };

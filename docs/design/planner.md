@@ -143,8 +143,8 @@ made moot in the view is withdrawn.
 
 Op effects: `add` appends `<agent>|<name>|<task>|<text>`, with the agent's name from the project's agent registry;
 `finish` marks the line done; `reassign` changes the agent and name; `reword` changes the description; `drop` removes
-the line; `unblock` releases fill's `no_done` hold on the task (fill's `owner` holds stay the owner's) and clears the
-planner's blocked record.
+the line; `unblock` releases fill's `blocked` or `no_done` hold on the task (a run that stopped without done and said
+so; fill's `owner`, `waiting` and `waited_too_long` holds stay the owner's) and clears the planner's blocked record.
 
 ### What the agent can't do
 
@@ -175,6 +175,10 @@ checked in this order:
    check can take up;
 3. anything else is a **task** problem (wording, scope, a dependency): a planner run that may propose `reword` or
    `unblock`.
+
+Fill holds a run of its own that ended on a BLOCKED line for its task (its `blocked` hold) and raises its decision.
+For a task fill runs, the planner raises no owner or environment decision of its own for that line, so one line asks
+the owner once; it records the route and still handles task problems.
 
 Never a loop: each task has `attempts_per_task` attempts. A planner run for it spends one, and so does an applied
 `unblock`, so fill's own cycle (runs without a done line, a `no_done` hold, an unblock that releases it, runs again)

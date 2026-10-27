@@ -51,7 +51,12 @@ describe("planner config", () => {
     expect(s.mode).toBe("observe");
     expect(s.tasksFile).toBe((config.agents as { fill: { tasks_file: string } }).fill.tasks_file);
     expect(s.allowlist).toEqual(["worker-a"]);
-    expect(s.donePattern).toBe("^-\\s+DONE\\s+{task}(?=\\s|$)");
+    expect(s.fillPatterns).toEqual({
+      donePattern: "^-\\s+DONE\\s+{task}(?=\\s|$)",
+      waitingPattern: "^-\\s+WAITING\\s+{task}(?=\\s|$)",
+      blockedPattern: "^-\\s+BLOCKED\\s+{task}(?=\\s|$)",
+    });
+    expect(s).toMatchObject({ onePerAgent: false, fillEnabled: false });
     expect(s.approval).toEqual({ add: "never", finish: "always", reassign: "always", reword: "never", drop: "always", unblock: "always" });
     expect(s.agent).toMatchObject({ maxRunsPerDay: 24, minIntervalSeconds: 600 });
     expect(s.workDir).toBe(join(config.agents_dir, "lair-planner"));

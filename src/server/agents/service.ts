@@ -2167,7 +2167,8 @@ export class AgentsService {
    * (the owner answered its escalation with a fresh session, say) would lift
    * a hold the owner never saw, so it is refused, as the decision's answer is.
    * The planner (src/server/planner/, in-process: an unblock it applies) may
-   * release only a no_done hold: an owner hold stays the owner's.
+   * release only a blocked or no_done hold (a run that stopped without done
+   * and said so): an owner, waiting or waited_too_long hold stays the owner's.
    */
   releaseFillHold(task: string, by: "owner" | "planner" = "owner"): Promise<{ task: string; runId: string | null }> {
     return this.exclusive(async () => {
@@ -2180,7 +2181,7 @@ export class AgentsService {
           `Task ${task} is not held for the owner at fill's last check${line ? ` (it is ${line.state}${line.hold ? `: ${line.hold}` : ""})` : ""}`,
         );
       }
-      if (by === "planner" && line.hold !== "no_done") {
+      if (by === "planner" && line.hold !== "no_done" && line.hold !== "blocked") {
         throw new AgentsError(409, `Task ${task} is held for the owner (${line.hold}): only the owner releases that hold`);
       }
       const latest = this.store.latestRunForTask(this.project, task);

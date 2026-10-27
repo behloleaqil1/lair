@@ -716,13 +716,15 @@ async function workerRun(h: Harness, line: string): Promise<void> {
 }
 
 describe("blocked tasks, fill's holds, recovery and cost", () => {
-  it("an unblock waits for the owner and spends an attempt: fill's no_done holds end at one owner decision, not a loop of runs", async () => {
+  it("an unblock waits for the owner and spends an attempt: fill's holds end at one owner decision, not a loop of runs", async () => {
     const p = makePaths();
     tasks(p, "worker-a|Alice|feat-cart|Cart");
     const h = await setup(p, plannerBlock(p), { extra: fillOn(p) });
     await h.service.cycle();
     await h.agentsService.checkFill(); // fill starts worker-a on feat-cart
-    await workerRun(h, "- BLOCKED feat-cart by worker-a 12:01Z: the scope is unclear");
+    // A BLOCKED line that doesn't name the task: fill's blocked_pattern misses it, so the run counts as one without
+    // progress (a no_done hold, max_completions_without_done 1); the planner maps it by the agent's only open line
+    await workerRun(h, "- BLOCKED cart work by worker-a 12:01Z: the scope is unclear");
     expect((await h.agentsService.checkFill()).lines[0]).toMatchObject({ task: "feat-cart", state: "held", hold: "no_done" });
 
     await h.service.cycle(); // the BLOCKED line: a task problem, so a planner run (attempt 1 of 2)
@@ -743,10 +745,10 @@ describe("blocked tasks, fill's holds, recovery and cost", () => {
     expect(history(h)[0]).toMatchObject({ op: "unblock", task: "feat-cart" });
     expect(history(h)[0].reason).toContain("released fill's no_done hold");
 
-    // Fill starts it again; it reports BLOCKED again and is held again
+    // Fill starts it again; it reports BLOCKED again, naming the task this time, and fill holds it as blocked
     expect((await h.agentsService.checkFill()).lines[0]).toMatchObject({ task: "feat-cart", state: "started" });
     await workerRun(h, "- BLOCKED feat-cart by worker-a 12:20Z: still unclear");
-    await h.agentsService.checkFill();
+    expect((await h.agentsService.checkFill()).lines[0]).toMatchObject({ task: "feat-cart", state: "held", hold: "blocked" });
     at(h, 30 * MIN);
     await h.service.cycle();
     // The attempts are spent: one owner decision, and no more planner runs for it however long it waits
@@ -760,10 +762,11 @@ describe("blocked tasks, fill's holds, recovery and cost", () => {
     expect(runsOf(h)).toHaveLength(1);
   });
 
-  it("the planner may release fill's no_done hold, never an owner hold", async () => {
+  it("the planner may release fill's blocked or no_done hold, never an owner hold; a run fill holds as blocked asks the owner once", async () => {
     const p = makePaths();
     tasks(p, "worker-a|Alice|feat-login|Login form");
     const h = await setup(p, plannerBlock(p, { agent: undefined }), { extra: fillOn(p) });
+    await h.service.cycle();
     await h.agentsService.checkFill();
     await h.agentsService.tick(); // worker-a runs
     // The owner releases its claim: the run stops itself, and fill leaves the task to the owner
@@ -782,6 +785,23 @@ describe("blocked tasks, fill's holds, recovery and cost", () => {
     // The owner's own release goes through
     await expect(h.agentsService.releaseFillHold("feat-login")).resolves.toMatchObject({ task: "feat-login" });
     expect(h.agentsStore.listEvents("demo", { kinds: ["fill_released"] }).map((e) => e.data.by)).toEqual(["owner"]);
+
+    // Fill starts it again; it ends on a BLOCKED line for its environment: fill holds it as blocked and asks the
+    // owner itself, so the planner raises no second decision for the same line
+    expect((await h.agentsService.checkFill()).lines[0]).toMatchObject({ state: "started" });
+    await workerRun(h, "- BLOCKED feat-login by worker-a 12:30Z: docker daemon is down");
+    expect((await h.agentsService.checkFill()).lines[0]).toMatchObject({ state: "held", hold: "blocked" });
+    await h.service.cycle();
+    expect(open(h)).toEqual([]);
+    expect(h.inbox.list({ project: "demo", status: "open" }).filter((d) => d.source.module === "agents")).toHaveLength(1);
+    expect(h.service.overview().blocked[0]).toMatchObject({
+      task: "feat-login",
+      class: "environment",
+      route: "its environment: fill holds the task and asks you (its decision, in the Agents view)",
+    });
+    // A blocked hold is one the planner may release (an unblock it applies)
+    await expect(h.agentsService.releaseFillHold("feat-login", "planner")).resolves.toMatchObject({ task: "feat-login" });
+    expect(h.agentsStore.listEvents("demo", { kinds: ["fill_released"], limit: 5 }).map((e) => e.data.by)).toEqual(["planner", "owner"]);
   });
 
   it("a write a restart interrupted is finished when its rename happened, and dropped when it didn't", async () => {

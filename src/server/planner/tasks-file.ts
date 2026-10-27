@@ -30,6 +30,8 @@ export interface TasksDoc {
   /** Done tasks: lines marked with done_marker (task -> line) */
   done: Map<string, number>;
   malformed: { line: number; reason: string; text: string }[];
+  /** Parsed as fill parses it when its patterns match by agent: a second line for an agent is malformed */
+  onePerAgent: boolean;
 }
 
 export type TaskEdit =
@@ -43,11 +45,11 @@ export type EditResult =
   | { ok: true; doc: TasksDoc; line: number; before: string | null; after: string | null }
   | { ok: false; reason: string };
 
-export function parseTasksDoc(text: string, doneMarker: string): TasksDoc {
+export function parseTasksDoc(text: string, doneMarker: string, onePerAgent = false): TasksDoc {
   const rows = text.split("\n");
   const tasks: TaskLine[] = [];
   const malformed: TasksDoc["malformed"] = [];
-  for (const entry of parseTasksFile(text)) {
+  for (const entry of parseTasksFile(text, onePerAgent)) {
     if (entry.kind === "task") {
       tasks.push({ line: entry.line, agent: entry.agent, name: entry.name, task: entry.task, description: entry.description });
     } else {
@@ -65,7 +67,7 @@ export function parseTasksDoc(text: string, doneMarker: string): TasksDoc {
     const [entry] = parseTasksFile(rest.trim());
     if (entry && entry.kind === "task" && !done.has(entry.task)) done.set(entry.task, i + 1);
   });
-  return { text, hash: sha256(text), rows, tasks, done, malformed };
+  return { text, hash: sha256(text), rows, tasks, done, malformed, onePerAgent };
 }
 
 /** A line's fields as fill reads them: no "|" in the first three, the description one line. */
@@ -78,8 +80,8 @@ export function findTask(doc: TasksDoc, task: string): TaskLine | null {
   return doc.tasks.find((t) => t.task === task) ?? null;
 }
 
-function withRows(rows: string[], doneMarker: string): TasksDoc {
-  return parseTasksDoc(rows.join("\n"), doneMarker);
+function withRows(rows: string[], doneMarker: string, onePerAgent: boolean): TasksDoc {
+  return parseTasksDoc(rows.join("\n"), doneMarker, onePerAgent);
 }
 
 /** Apply one edit; the result must be a valid tasks file with no new malformed line. */
@@ -128,7 +130,7 @@ export function applyEdit(doc: TasksDoc, edit: TaskEdit, doneMarker: string): Ed
   if (after !== null && after.length > MAX_TASK_LINE_CHARS) {
     return { ok: false, reason: `the line would be longer than ${MAX_TASK_LINE_CHARS} characters` };
   }
-  const next = withRows(rows, doneMarker);
+  const next = withRows(rows, doneMarker, doc.onePerAgent);
   if (Buffer.byteLength(next.text, "utf-8") > MAX_TASKS_FILE_BYTES) {
     return { ok: false, reason: `the tasks file would be larger than ${MAX_TASKS_FILE_BYTES} bytes` };
   }
