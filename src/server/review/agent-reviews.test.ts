@@ -1118,10 +1118,21 @@ describe("a request round replaced by a later one", () => {
     const call = await assignedRun(h);
     expect((await submit(h, call.env, { verdict: "request_changes", findings: "src/feature.ts:2: high: overflows\n" })).code).toBe(EXIT_OK);
     const again = await requestReviews(h);
-    expect(again[0]).toMatchObject({ channel: "agents", detail: expect.stringContaining("rev-c: run ") });
-    expect(
-      query(reviewDb(h), `SELECT round, state, agent FROM review_agent_assignments WHERE pr = 7 ORDER BY round`),
-    ).toEqual([
+    // Round 1 is closed as reviewed; round 2 waits for the slot's task, which rev-b's run still holds
+    expect(again[0].detail).toMatch(/^waiting for a free reviewer \(rev-b: already reviewed this head; rev-c: Task review-7-\w{8} is already claimed by run /);
+    const rounds = () => query(reviewDb(h), `SELECT round, state, agent FROM review_agent_assignments WHERE pr = 7 ORDER BY round`);
+    expect(rounds()).toEqual([
+      { round: 1, state: "reviewed", agent: "rev-b" },
+      { round: 2, state: "requested", agent: null },
+    ]);
+
+    // rev-b's run ends: round 2 goes to rev-c on the next check
+    h.spawner.exit(call.pid, 0);
+    await tick(h);
+    await check(h);
+    await tick(h);
+    expect(h.spawner.calls.map((c) => c.env.LAIR_AGENT)).toEqual(["rev-b", "rev-c"]);
+    expect(rounds()).toEqual([
       { round: 1, state: "reviewed", agent: "rev-b" },
       { round: 2, state: "assigned", agent: "rev-c" },
     ]);
