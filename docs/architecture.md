@@ -141,7 +141,7 @@ The Decision Inbox ([configuration](configuration.md#decision-inbox)): the one p
 
 Who may use the routes only the human may use: answering decisions, and in reviews merging, human reviews, resolving findings and releasing holds ([configuration](configuration.md#decision-inbox)).
 
-- **`human-auth.ts`**: `HumanAuth`: the owner token (`data/owner.token`, mode 0600) and its one-time setup link, browser sessions stored only as HMACs (`data/owner-sessions.db`), `verifyRequest()` (the `X-Lair-Owner-Session` header, the dashboard `Origin`, `Sec-Fetch-Site: same-origin`), and the `requireOwner()` / `requireDashboard()` route hooks
+- **`human-auth.ts`**: `HumanAuth`: the owner token (`data/owner.token`, mode 0600) and its one-time setup link, browser sessions stored only as HMACs (`data/owner-sessions.db`), `verifyRequest()` (the `X-Lair-Owner-Session` header, the dashboard `Origin`, `Sec-Fetch-Site: same-origin`), and the `requireOwner()` / `requireDashboard()` route hooks, and `requireOwnerForChanges()`, the module-wide hook that makes every write of a route module (controls, bus messages, processes, settings, scheduler, fleet, delivery, pipelines) owner-only and leaves its reads open
 - **`routes.ts`**: `/api/owner/*`: sign a browser in, check, list and sign out browsers
 - **`cors.ts`**: the CORS options `index.ts` uses: the dev server's origins, but none for owner-only paths
 
@@ -240,6 +240,7 @@ Each view is a standalone component:
 - **`Activity.tsx`**, **`LiveFeed.tsx`**: fleet bus activity feed
 - **`Health.tsx`**: watchdog SLO status, open breaches and playbook runs (read-only)
 - **`Delivery.tsx`**: environments and services (state, health, restarts, holds, crash loops, error lines) with Up, Down, Restart, Deploy and Release, and the operations log. Its requests are built in `delivery-api.ts`
+- **`SignInHint.tsx`**: the "sign in from Decisions" notice the views with owner-only actions show while this browser isn't signed in as the owner. Those views send their writes through `owner-actions.ts` (and `delivery-api.ts`), which add the owner session
 - **`Reviews.tsx`**: per PR, the risk tier, required and present reviews, findings, the gate at the head, holds and the merge button with its reasons (view logic in `review-view.ts`, requests in `review-api.ts`, owner-only ones with the owner session)
 - **`Agents.tsx`**: per agent its state, run, claims, budget and recoveries; locks and their holders. Release a claim or start a fresh session, after a confirmation (`agents-actions.ts`)
 - **`Inbox.tsx`**: owner inbox and orchestrator replies

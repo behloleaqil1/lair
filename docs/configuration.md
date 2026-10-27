@@ -70,7 +70,7 @@ machines:
 
 ## Control commands
 
-By default, Lair runs in read-only mode. Enable controls by setting `read_only: false` and defining command templates:
+By default, Lair runs in read-only mode. Enable controls by setting `read_only: false` and defining command templates. Running them from the dashboard (the command bar, the Dragons view) also needs the browser to be signed in as the owner (see [Owner-only routes](#owner-only-routes)):
 
 ```yaml
 read_only: false
@@ -385,7 +385,7 @@ Unknown keys and invalid values are config errors; a project with an invalid blo
 
 ### Pipeline API
 
-`?project=` defaults to the default project. Starting and cancelling runs are refused (HTTP 403) for a `read_only: true` project.
+`?project=` defaults to the default project. Starting and cancelling runs need the owner's session (see [Owner-only routes](#owner-only-routes)), and are refused (HTTP 403) for a `read_only: true` project. Code inside the server starts runs with `PipelineManager.startRun`.
 
 - `GET /api/pipelines/status`: executor order and availability (with the reason and the time an executor is unavailable until), the repository's visibility and runners, warnings, minutes used this month and the budget, and decisions raised
 - `GET /api/pipelines/workflow`: the workflow file to commit, with setup steps
@@ -395,7 +395,7 @@ Unknown keys and invalid values are config errors; a project with an invalid blo
 
 ## Process manager
 
-Define processes for Lair to manage:
+Define processes for Lair to manage (starting, stopping and restarting them from the dashboard needs the owner's session, see [Owner-only routes](#owner-only-routes)):
 
 ```yaml
 processes:
@@ -534,6 +534,26 @@ An answer is accepted only with that session in the `X-Lair-Owner-Session` heade
 - `POST /api/decisions/:id/answer`: `{optionId, note?, confirm?, secret?}`, with an owner session (see "Only you answer"). `confirm: true` is required for `spend` and `go_no_go`; `secret` goes only with an option that supplies it, and `credentials` decisions take no `note`
 
 Errors: 400 for invalid input, 403 for a cross-site request or an answer without an owner session, 404 for an unknown decision, 409 when it is no longer open, 429 when a module, or HTTP callers together, have too many open decisions, 503 when the secret store can't take a value.
+
+## Owner-only routes
+
+Every route that changes something only you should change needs the owner's session, the same one the Decision Inbox uses (see "Only you answer"): the `X-Lair-Owner-Session` header, from the dashboard's own origin, in a same-origin browser request. Without it the answer is HTTP 403, before the request's body is read, and nothing changes. `curl`, scripts, agents and other local programs can still read: every `GET` stays open. No CORS is granted under these prefixes (`OWNER_ONLY_PREFIXES` in `src/server/human-auth/cors.ts`). The dashboard's views send the session once this browser is signed in, and show "sign in from Decisions" until it is.
+
+| Prefix | Owner only | Open |
+|--------|------------|------|
+| `/api/decisions` | answering a decision | listing, the summary, raising |
+| `/api/owner` | listing and signing out browsers | the session check, signing in with the token |
+| `/api/review` | the owner's review, resolving findings, releasing holds, merging | reading, agent reviews, adding holds, gate results |
+| `/api/controls` | every `POST`: ask, instruct, tick, pause, resume, agent run/stop/release, gate submit/stuck, merge, dragon start/stop | status, inbox, audit, dragon config |
+| `/api/bus/send` | sending a message (it is sent as `owner`) | the board and the event stream (`/api/bus/board`, `/api/bus/events`) |
+| `/api/processes` | start, stop, restart | the list, a process, its logs |
+| `/api/settings` | saving the config, testing a machine | reading the settings |
+| `/api/scheduler`, `/api/tasks` | scheduler start, stop and tick; creating, cancelling and retrying tasks | status, tasks, jobs, nodes |
+| `/api/fleet` | adding, removing, testing and installing machines; healing and budget settings; provider budgets and unpausing | the overview, machines, healing events, budgets |
+| `/api/delivery` | Up, Down, Restart, Deploy, Release | status and operations |
+| `/api/pipelines` | starting and cancelling runs | status, the workflow file, runs |
+
+The watchdog's routes are all reads; it acts only inside the server. Lair's own work doesn't go through these routes either: delivery's automatic deploys, the scheduler, the healer and the watchdog's playbooks run inside the server, server code starts pipeline runs with `PipelineManager.startRun` and creates tasks with the job manager, and agents use the fleet bus (`npm run bus`), which works on the bus database directly. The `lair-node` daemon connects over `/ws/node`, not these routes.
 
 ## Watchdog
 
@@ -761,7 +781,7 @@ Unknown keys, unsafe names, a value that starts with `-`, a `start_order` entry 
 
 ### Delivery API
 
-`?project=` defaults to the default project. Actions answer `202` with the operation, which runs in the background, one at a time per environment (a second one gets `409`, except a Down, which runs beside it). A `read_only` project answers `403`.
+`?project=` defaults to the default project. Actions answer `202` with the operation, which runs in the background, one at a time per environment (a second one gets `409`, except a Down, which runs beside it). A `read_only` project answers `403`. Every action needs the owner's session (see [Owner-only routes](#owner-only-routes)); without it the answer is `403` and nothing runs or is held.
 
 - `GET /api/delivery/status`: each environment's services (state, health, restart count, containers, hold, crash loop, last error lines, the commit it was deployed at and whether it is behind), the read error if any, the operation in progress and the automatic deploy state. It never runs docker
 - `GET /api/delivery/operations?environment=&limit=50`: operations with every command they ran, its exit code and output (redacted)
