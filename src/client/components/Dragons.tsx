@@ -8,7 +8,7 @@ import { useDragonsWebSocket } from "../hooks/useWebSocket";
 import { DragonStartDialog } from "./DragonStartDialog";
 import { DragonStopDialog } from "./DragonStopDialog";
 import { canStartDragon, hasStartableDragons } from "../dragon-start";
-import { startDragon, stopDragon } from "../owner-actions";
+import { startDragon, stopDragon as requestDragonStop } from "../owner-actions";
 import { SignInHint } from "./SignInHint";
 import type {
   Dragon,
@@ -89,7 +89,7 @@ export function Dragons({ project, refreshKey }: Props) {
   };
 
   const handleStopDragon = async (request: DragonStopRequest) => {
-    const data = await stopDragon(project, request);
+    const data = await requestDragonStop(project, request);
     if (!data.success) {
       throw new Error(data.error || "Failed to stop dragon");
     }
