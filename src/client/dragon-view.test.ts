@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 import type { Dragon } from "../shared/types";
-import { logTimeLabel, modelLabel, runningLabel } from "./dragon-view";
+import { modelLabel, runningLabel } from "./dragon-view";
 
 const dragon = (overrides: Partial<Dragon> = {}): Dragon => ({
   id: "kiro-A",
@@ -35,10 +35,4 @@ describe("dragons view", () => {
     expect(modelLabel(dragon())).toBe("-");
   });
 
-  it("says when the log time is unknown instead of showing nothing", () => {
-    expect(logTimeLabel(dragon())).toBe("log time unknown");
-    expect(logTimeLabel(dragon({ lastLogTime: "not a time" }))).toBe("log time unknown");
-    const iso = "2026-10-27T04:10:41.000Z";
-    expect(logTimeLabel(dragon({ lastLogTime: iso }))).toBe(new Date(iso).toLocaleString());
-  });
 });

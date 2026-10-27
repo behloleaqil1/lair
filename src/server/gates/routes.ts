@@ -8,13 +8,18 @@
  *   POST /api/pipelines/runs?project=            { pipeline, sha?, branch? }: start a run (202)
  *   POST /api/pipelines/runs/:id/cancel?project=
  *
+ * A job's log tail and its steps' output can hold anything a step printed,
+ * so only the owner's session gets them; other callers get the runs
+ * without them.
+ *
  * Starting and cancelling runs are controls: they need the owner's session
  * (src/server/human-auth/), and are refused for a read_only project. Code
  * inside the server starts runs with PipelineManager.startRun, not over
  * HTTP. `?project=` is validated by the root guards; without it the default
  * project is used.
  */
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type { PipelineRun } from "../../shared/pipeline-types.js";
 import { z } from "zod";
 import { rejectCrossSiteRequests } from "../origin.js";
 import type { HumanAuth } from "../human-auth/index.js";
@@ -52,6 +57,18 @@ const StartBody = z
 
 const runIdGuard = requireValidIdParam((id) => RUN_ID.test(id), "run");
 
+/** A run as callers other than the owner see it: without its jobs' log tails and step output. */
+function withoutLogs(run: PipelineRun): PipelineRun {
+  return {
+    ...run,
+    jobs: run.jobs.map((job) => ({
+      ...job,
+      log: undefined,
+      result: job.result ? { ...job.result, steps: job.result.steps.map((step) => ({ ...step, output: undefined })) } : job.result,
+    })),
+  };
+}
+
 export async function registerPipelineRoutes(
   fastify: FastifyInstance,
   manager: PipelineManager,
@@ -65,6 +82,8 @@ export async function registerPipelineRoutes(
     app.addHook("onRequest", auth.requireOwnerForChanges());
 
     const projectOf = (query: { project?: string }) => query.project ?? defaultProject();
+    // A job's log tail can hold anything a step printed: the owner's only
+    const isOwner = (request: FastifyRequest) => auth.verifyRequest(request.headers, { method: request.method }).ok;
     const badQuery = (reply: FastifyReply, error: z.ZodError) =>
       fail(reply, 400, `Invalid query: ${error.issues[0].path.join(".")}`);
 
@@ -92,7 +111,8 @@ export async function registerPipelineRoutes(
       const query = ListQuery.safeParse(request.query ?? {});
       if (!query.success) return badQuery(reply, query.error);
       try {
-        return respond(manager.listRuns(projectOf(query.data), query.data.limit));
+        const runs = manager.listRuns(projectOf(query.data), query.data.limit);
+        return respond(isOwner(request) ? runs : runs.map(withoutLogs));
       } catch (e) {
         return failWith(reply, e);
       }
@@ -105,7 +125,8 @@ export async function registerPipelineRoutes(
         const query = ProjectQuery.safeParse(request.query ?? {});
         if (!query.success) return badQuery(reply, query.error);
         try {
-          return respond(manager.getRun(projectOf(query.data), request.params.id));
+          const run = manager.getRun(projectOf(query.data), request.params.id);
+          return respond(isOwner(request) ? run : withoutLogs(run));
         } catch (e) {
           return failWith(reply, e);
         }

@@ -3,7 +3,7 @@
  * never reach a shell or escape gates_dir.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdirSync, rmSync, statSync, utimesSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "fs";
 import { join } from "path";
 import { DataService, isSafeGateId, parsePidFile } from "./data.js";
 import { groupByLane } from "../parsers/gates.js";
@@ -63,15 +63,46 @@ describe("gate log ids", () => {
   it("refuses ids that would leave gates_dir", () => {
     writeFileSync(join(TMP, "secret.log"), "secret");
     const service = new DataService(makeConfig());
-    expect(() => service.getGateLog("../../secret")).toThrow("Invalid gate id");
-    expect(() => service.getGateLog("../secret")).toThrow("Invalid gate id");
-    expect(() => service.getGateLog("/etc/passwd")).toThrow("Invalid gate id");
+    expect(() => service.getGateLogTail("../../secret")).toThrow("Invalid gate id");
+    expect(() => service.getGateLogTail("../secret")).toThrow("Invalid gate id");
+    expect(() => service.getGateRecord("/etc/passwd")).toThrow("Invalid gate id");
   });
 
-  it("still reads a normal gate log", () => {
-    writeFileSync(join(GATES, "results", "bt-20261024-001.log"), "ok");
+  it("still reads a normal gate log, bounded to its tail", () => {
+    writeFileSync(join(GATES, "results", "bt-20261024-001.log"), "ok\n");
     const service = new DataService(makeConfig());
-    expect(service.getGateLog("bt-20261024-001")).toBe("ok");
+    expect(service.getGateLogTail("bt-20261024-001")?.lines).toEqual(["ok"]);
+    const many = Array.from({ length: 5000 }, (_, i) => `line ${i}`).join("\n");
+    writeFileSync(join(GATES, "results", "bt-20261024-002.log"), many);
+    const tail = service.getGateLogTail("bt-20261024-002", 50);
+    expect(tail?.lines).toHaveLength(50);
+    expect(tail?.lines[49]).toBe("line 4999");
+    expect(tail?.truncated).toBe(true);
+  });
+
+  it("finds a running gate's log in the queue, and its result once written", () => {
+    const id = "20261024T170000Z-api-abcdef12-1";
+    writeFileSync(join(GATES, "queue", `heavy.2.${id}.req.run`), "");
+    writeFileSync(join(GATES, "queue", `heavy.2.${id}.log`), "STEP lint: PASS (2s)\n");
+    const service = new DataService(makeConfig());
+    const running = service.getGateRecord(id);
+    expect(running.gate).toMatchObject({ id, lane: "heavy", priority: 2, status: "running", track: "api" });
+    expect(running.result).toBeNull();
+    expect(running.logPath).toBe(join(GATES, "queue", `heavy.2.${id}.log`));
+
+    writeFileSync(join(GATES, "results", `${id}.rc`), "1\n");
+    writeFileSync(join(GATES, "results", `${id}.log`), "STEP lint: FAIL (2s)\n");
+    const done = service.getGateRecord(id);
+    expect(done.result?.rc).toBe(1);
+    expect(done.logPath).toBe(join(GATES, "results", `${id}.log`));
+  });
+
+  it("does not follow a symlink planted as a gate log", () => {
+    writeFileSync(join(TMP, "secret.txt"), "secret");
+    symlinkSync(join(TMP, "secret.txt"), join(GATES, "results", "bt-link.log"));
+    const service = new DataService(makeConfig());
+    expect(service.getGateRecord("bt-link").logPath).toBeNull();
+    expect(service.getGateLogTail("bt-link")).toBeNull();
   });
 
   it("isSafeGateId", () => {

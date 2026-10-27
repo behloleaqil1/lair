@@ -44,13 +44,3 @@ export function recentResults(
   return timed.map(({ result }) => result);
 }
 
-/** "5 min ago", "3 h ago" for a finish time. */
-export function ago(iso: string | undefined, now: number = Date.now()): string {
-  if (!iso) return "-";
-  const at = Date.parse(iso);
-  if (!Number.isFinite(at)) return "-";
-  const minutes = Math.max(0, Math.round((now - at) / 60000));
-  if (minutes < 1) return "just now";
-  if (minutes < 60) return `${minutes} min ago`;
-  return `${Math.floor(minutes / 60)} h ${minutes % 60} min ago`;
-}

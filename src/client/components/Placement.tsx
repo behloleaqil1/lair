@@ -1,36 +1,53 @@
 /**
- * Placement in the Gates and Machines views (/api/placement/status, read
- * only): the latest moves and the mode in Gates, and each machine's probe
- * state, load and lanes in Machines. See docs/configuration.md#placement.
+ * Placement (/api/placement/status, read only) in the Gates section's
+ * Placement tab: the mode, config errors and the latest moves (or, in
+ * observe mode, advice); a move opens its gate's detail. The probes of each
+ * machine are in the Machines section. See docs/configuration.md#placement.
  */
 import { useApi } from "../hooks/useApi";
-import {
-  laneSlots,
-  latestMoves,
-  machineBadge,
-  machineLoad,
-  machineState,
-  modeText,
-  moveBadge,
-} from "../placement-view";
-import type { PlacementStatus } from "../../shared/placement-types";
+import { latestMoves, modeText, moveBadge } from "../placement-view";
+import type { PlacementMove, PlacementStatus } from "../../shared/placement-types";
+import { DataTable, type Column } from "./DataTable";
+import { Time, muted } from "./ui";
 
-const muted = { color: "var(--text-secondary)", fontSize: "0.85rem" };
-
-export function usePlacement(project: string, refreshKey: number) {
-  return useApi<PlacementStatus>("/placement/status", project, refreshKey);
+export function usePlacement(project: string, refreshKey: number, skip = false) {
+  return useApi<PlacementStatus>("/placement/status", project, refreshKey, { skip });
 }
 
-/** Gates view: the mode, config errors and the latest moves (or, in observe mode, advice). */
-export function PlacementMoves({ status }: { status: PlacementStatus | null }) {
-  if (!status || (!status.enabled && status.errors.length === 0)) return null;
-  const moves = latestMoves(status);
+const MOVE_COLUMNS: Column<PlacementMove>[] = [
+  { key: "at", label: "When", sort: (m) => m.at, render: (m) => <Time iso={m.at} /> },
+  {
+    key: "status",
+    label: "Status",
+    sort: (m) => m.status,
+    render: (m) => <span className={`badge ${moveBadge(m)}`}>{m.status.replace("_", " ")}</span>,
+  },
+  { key: "gate", label: "Gate", sort: (m) => m.gateId, render: (m) => <code>{m.gateId}</code> },
+  {
+    key: "decision",
+    label: "Decision",
+    render: (m) => (
+      <span style={{ fontSize: "0.85rem" }}>
+        {m.explanation}
+        {m.error && <span style={{ display: "block", color: "var(--error)" }}>{m.error}</span>}
+      </span>
+    ),
+  },
+];
+
+/** The mode, config errors and the latest moves (or advice). */
+export function PlacementMoves({ status, openGate }: { status: PlacementStatus | null; openGate: (id: string) => void }) {
+  if (!status) return null;
   return (
     <div className="card">
-      <h3>Placement</h3>
       <p style={muted}>
         Mode: {modeText(status)}
-        {status.lastTick ? ` · last check ${new Date(status.lastTick.at).toLocaleTimeString()}` : ""}
+        {status.lastTick && (
+          <>
+            {" "}
+            · last check <Time iso={status.lastTick.at} />
+          </>
+        )}
       </p>
       {status.errors.length > 0 && (
         <ul style={{ color: "var(--error)", fontSize: "0.85rem" }}>
@@ -40,78 +57,14 @@ export function PlacementMoves({ status }: { status: PlacementStatus | null }) {
         </ul>
       )}
       {status.lastError && <p style={{ color: "var(--error)", fontSize: "0.85rem" }}>{status.lastError}</p>}
-      {moves.length === 0 ? (
-        <p style={muted}>No moves yet</p>
-      ) : (
-        <table className="table">
-          <thead>
-            <tr>
-              <th>When</th>
-              <th>Status</th>
-              <th>Decision</th>
-            </tr>
-          </thead>
-          <tbody>
-            {moves.map((move) => (
-              <tr key={move.id}>
-                <td style={muted}>{new Date(move.at).toLocaleTimeString()}</td>
-                <td>
-                  <span className={`badge ${moveBadge(move)}`}>{move.status.replace("_", " ")}</span>
-                </td>
-                <td style={{ fontSize: "0.85rem" }}>
-                  {move.explanation}
-                  {move.error && <div style={{ color: "var(--error)" }}>{move.error}</div>}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-    </div>
-  );
-}
-
-/** Machines view: placement's probe state, load and lanes per machine. */
-export function PlacementMachines({ project, refreshKey }: { project: string; refreshKey: number }) {
-  const { data: status } = usePlacement(project, refreshKey);
-  if (!status || !status.enabled) return null;
-  return (
-    <div className="card">
-      <h3>Placement</h3>
-      <p style={muted}>Mode: {modeText(status)}</p>
-      <table className="table">
-        <thead>
-          <tr>
-            <th>Machine</th>
-            <th>Probe</th>
-            <th>Load</th>
-            <th>Lanes</th>
-          </tr>
-        </thead>
-        <tbody>
-          {status.machines.map((m) => (
-            <tr key={m.id}>
-              <td>{m.id}</td>
-              <td>
-                <span className={`badge ${machineBadge(m)}`}>{m.state}</span>{" "}
-                <span style={muted}>{machineState(m)}</span>
-                {m.lastError && <div style={{ color: "var(--error)", fontSize: "0.85rem" }}>{m.lastError}</div>}
-              </td>
-              <td style={muted}>{machineLoad(m)}</td>
-              <td style={{ fontSize: "0.85rem" }}>
-                {status.lanes
-                  .filter((lane) => lane.machine === m.id)
-                  .map((lane) => (
-                    <div key={lane.name}>
-                      <strong>{lane.name}</strong>
-                      {lane.serves.length > 0 ? ` (takes from ${lane.serves.join(", ")})` : ""}: {laneSlots(lane)}
-                    </div>
-                  ))}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      <DataTable
+        label="Placement moves"
+        columns={MOVE_COLUMNS}
+        rows={latestMoves(status, 50)}
+        rowKey={(m) => m.id}
+        onOpen={(m) => openGate(m.gateId)}
+        empty={<p style={muted}>No moves yet: placement moves (or, in observe mode, advises) a queued job when another lane would finish it sooner.</p>}
+      />
     </div>
   );
 }

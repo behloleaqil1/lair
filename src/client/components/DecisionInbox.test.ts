@@ -123,7 +123,7 @@ describe("DecisionCardView", () => {
 });
 
 describe("DecisionInboxView", () => {
-  it("asks for the answer token while answering is locked", () => {
+  it("asks for the answer token while answering is locked, and the open decision's detail says so", () => {
     const view = (answering: boolean) =>
       renderToStaticMarkup(
         createElement(DecisionInboxView, {
@@ -133,6 +133,7 @@ describe("DecisionInboxView", () => {
           answering,
           onUnlock: async () => undefined,
           onAnswered: noop,
+          selected: decision().id,
         }),
       );
     const locked = view(false);
@@ -145,7 +146,7 @@ describe("DecisionInboxView", () => {
     expect(unlocked).not.toContain("Unlock answering first");
   });
 
-  it("lists open decisions as cards and closed ones with their outcome, never a secret", () => {
+  it("lists open decisions and closed ones with their outcome in one table, never a secret", () => {
     const html = renderToStaticMarkup(
       createElement(DecisionInboxView, {
         decisions: [

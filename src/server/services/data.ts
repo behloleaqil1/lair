@@ -7,6 +7,7 @@ import {
   existsSync,
   readdirSync,
   statSync,
+  lstatSync,
   openSync,
   fstatSync,
   readSync,
@@ -42,7 +43,6 @@ import {
   parseDragonsFile,
   isDragonRunning,
   matchLogsToDragons,
-  getMostRecentLog,
   parseLogLastLine,
   calculateDragonStats,
   isLogSilent,
@@ -57,6 +57,8 @@ import {
 } from "../parsers/gates.js";
 import { hasOwnModel } from "../parsers/dragon-config.js";
 import { mergeDragonRegistry } from "./dragon-registry.js";
+import { DEFAULT_TAIL_LINES, readLogTail } from "./log-tail.js";
+import type { LogTailView } from "../../shared/dashboard-types.js";
 
 /**
  * Safe file read - returns null if file doesn't exist
@@ -174,6 +176,22 @@ function readTail(path: string, maxBytes: number): string | null {
   } finally {
     if (fd !== null) closeSync(fd);
   }
+}
+
+/** True for a regular file at `path` itself (a symlink is not one). */
+function isRegularFile(path: string): boolean {
+  try {
+    return lstatSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** A dragon's log: `<id>.log`, or `<id>-<UTC stamp>...log` (as the agents module and launchers name them). */
+function isLogOf(file: string, id: string): boolean {
+  if (!file.endsWith(".log")) return false;
+  if (file === `${id}.log`) return true;
+  return file.startsWith(`${id}-`) && /^\d{8}T\d{6}Z/.test(file.slice(id.length + 1));
 }
 
 export interface DataServiceOptions {
@@ -318,20 +336,19 @@ export class DataService {
     return dragons.find((d) => d.id === id) || null;
   }
 
-  getDragonLogTail(id: string, lines = 50): string | null {
-    const logFiles = safeListDir(this.config.agents_dir).filter(
-      (f) => f.startsWith(id) && f.endsWith(".log"),
-    );
+  /**
+   * The path of a dragon's newest log by mtime (`<id>.log` or
+   * `<id>-<UTC>.log` in agents_dir), or null without one.
+   */
+  getDragonLogPath(id: string): string | null {
+    const logs = safeListDir(this.config.agents_dir).filter((f) => isLogOf(f, id));
+    return this.newestLog(logs)?.path ?? null;
+  }
 
-    const recentLog = getMostRecentLog(logFiles);
-    if (!recentLog) return null;
-
-    const logPath = join(this.config.agents_dir, recentLog);
-    const content = safeReadFile(logPath);
-    if (!content) return null;
-
-    const allLines = content.split("\n");
-    return allLines.slice(-lines).join("\n");
+  /** The bounded tail of a dragon's newest log (services/log-tail.ts), or null without one. */
+  getDragonLogTail(id: string, lines = DEFAULT_TAIL_LINES): LogTailView | null {
+    const path = this.getDragonLogPath(id);
+    return path ? readLogTail(path, lines) : null;
   }
 
   // ============ GATES ============
@@ -445,28 +462,50 @@ export class DataService {
     return results;
   }
 
-  getGateLog(id: string): string | null {
-    // The id comes from the URL (Fastify decodes %2F), so it must not be
-    // able to name a path outside gates_dir
+  /**
+   * One gate of the queue or the results, by id: its request (null once it
+   * left the queue), its result (rc and when it was written; null before),
+   * and the path of its log (the result's log, else the request's; null
+   * without one). The id comes from a URL (Fastify decodes %2F), so it must
+   * be a safe file-name stem that can't name a path outside gates_dir.
+   */
+  getGateRecord(id: string): {
+    gate: Gate | null;
+    result: { rc: number; finishedAt: string } | null;
+    logPath: string | null;
+  } {
     if (!isSafeGateId(id)) {
       throw new Error("Invalid gate id");
     }
-
-    // Try results first
-    const resultsLog = join(this.config.gates_dir, "results", `${id}.log`);
-    const content = safeReadFile(resultsLog);
-    if (content) return content;
-
-    // Try finding in queue logs
-    const queueDir = join(this.config.gates_dir, "queue");
-    const files = safeListDir(queueDir).filter(
-      (f) => f.includes(id) && f.endsWith(".log"),
-    );
-    if (files.length > 0) {
-      return safeReadFile(join(queueDir, files[0]));
+    const gate = this.getGateQueue().find((g) => g.id === id) ?? null;
+    const resultsDir = join(this.config.gates_dir, "results");
+    let result: { rc: number; finishedAt: string } | null = null;
+    const rcPath = join(resultsDir, `${id}.rc`);
+    if (isRegularFile(rcPath)) {
+      const rc = parseGateRc(readTail(rcPath, 1024) ?? "");
+      if (rc !== null) result = { rc, finishedAt: statSync(rcPath).mtime.toISOString() };
     }
 
-    return null;
+    const queueDir = join(this.config.gates_dir, "queue");
+    const candidates = [join(resultsDir, `${id}.log`)];
+    if (gate) candidates.push(join(queueDir, `${gate.lane}.${gate.priority}.${id}.log`));
+    for (const file of safeListDir(queueDir)) {
+      if (file.endsWith(`.${id}.log`)) candidates.push(join(queueDir, file));
+    }
+    const logPath = candidates.find((path) => isRegularFile(path)) ?? null;
+    return { gate, result, logPath };
+  }
+
+  /** The bounded tail of a gate's log (services/log-tail.ts), or null without one. */
+  getGateLogTail(id: string, lines = DEFAULT_TAIL_LINES): LogTailView | null {
+    const { logPath } = this.getGateRecord(id);
+    return logPath ? readLogTail(logPath, lines) : null;
+  }
+
+  /** The end of a gate's log as text (at most RESULT_LOG_TAIL_BYTES), to read its steps; null without one. */
+  getGateLogText(id: string): string | null {
+    const { logPath } = this.getGateRecord(id);
+    return logPath ? readTail(logPath, RESULT_LOG_TAIL_BYTES) : null;
   }
 
   // ============ PRs ============

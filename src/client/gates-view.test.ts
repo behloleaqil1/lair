@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 import { parseGateFiles } from "../server/parsers/gates";
 import type { GateResult } from "../shared/types";
-import { ago, laneGates, queueLanes, recentResults, statusBadge } from "./gates-view";
+import { laneGates, queueLanes, recentResults, statusBadge } from "./gates-view";
 
 const QUEUE = parseGateFiles([
   "heavy.1.20261027T090000Z-api-tests-abcd1234-101.req.run",
@@ -53,9 +53,4 @@ describe("gates view: recent results", () => {
     expect(recentResults(results, NOW).map((r) => r.id)).toEqual(["e-latest", "c-morning", "b-yesterday"]);
   });
 
-  it("says how long ago a result finished", () => {
-    expect(ago(at(0.5), NOW)).toBe("30 min ago");
-    expect(ago(at(3.25), NOW)).toBe("3 h 15 min ago");
-    expect(ago(undefined, NOW)).toBe("-");
-  });
 });

@@ -1,8 +1,9 @@
 /**
- * What the Dragons view shows for a dragon, apart from the component so
- * tests check the same rules: its running state (a run of Lair's agents
- * module counts, "managed by Lair"), its effective model ("(default)" when it
- * came from dragon_defaults or the built-in default), and its last log time.
+ * What the Work section shows for an agent the project's own launcher runs
+ * (work-view.ts), apart from the component so tests check the same rules:
+ * its running state (a run of Lair's agents module counts, "managed by
+ * Lair") and its effective model ("(default)" when it came from
+ * dragon_defaults or the built-in default).
  */
 import type { Dragon } from "../shared/types";
 
@@ -41,9 +42,3 @@ export function modelLabel(dragon: Dragon): string {
   return dragon.modelFromDefault ? `${dragon.model} (default)` : dragon.model;
 }
 
-/** When the dragon's newest log was written, in local time; "log time unknown" without a log. */
-export function logTimeLabel(dragon: Dragon): string {
-  if (!dragon.lastLogTime) return "log time unknown";
-  const at = new Date(dragon.lastLogTime);
-  return Number.isNaN(at.getTime()) ? "log time unknown" : at.toLocaleString();
-}

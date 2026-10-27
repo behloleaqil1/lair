@@ -1,36 +1,56 @@
 /**
- * Lair - Main App Component
+ * Lair - the dashboard: a header with the project, the command bar, the nav
+ * of sections (nav.ts: only those whose module the project turns on), and
+ * the section the URL names (router.ts: #/<section>[/<detail>][?tab=]).
+ * Old view ids in the URL redirect to the section that replaced them.
  */
-import { useState, useEffect } from "react";
-import { Overview } from "./components/Overview";
-import { Dragons } from "./components/Dragons";
-import { Gates } from "./components/Gates";
-import { PRs } from "./components/PRs";
-import { Orchestrator } from "./components/Orchestrator";
-import { Machines } from "./components/Machines";
-import { Activity } from "./components/Activity";
-import { Inbox } from "./components/Inbox";
-import { Processes } from "./components/Processes";
-import { Nodes } from "./components/Nodes";
-import { Health } from "./components/Health";
+import { useCallback, useEffect, useState } from "react";
+import { Home } from "./components/Home";
+import { Work } from "./components/Work";
+import { GatesSection } from "./components/GatesSection";
+import { PullRequests } from "./components/PullRequests";
+import { MachinesSection } from "./components/MachinesSection";
+import { DecisionsSection } from "./components/DecisionsSection";
 import { Delivery } from "./components/Delivery";
-import { Reviews } from "./components/Reviews";
-import { Agents } from "./components/Agents";
-import { Triage } from "./components/Triage";
+import { Processes } from "./components/Processes";
 import { Settings } from "./components/Settings";
-import { Planner } from "./components/Planner";
 import { CommandBar } from "./components/CommandBar";
 import { pickInitialProject } from "./initial-project";
 import type { CommandMode, ControlsStatus } from "../shared/types";
+import type { DashboardModules } from "../shared/dashboard-types";
 import { LAIR_VERSION } from "../shared/version";
-import { DecisionInbox, DecisionsBadge } from "./components/DecisionInbox";
-import { VIEWS, type View } from "./nav";
+import { DecisionsBadge } from "./components/DecisionInbox";
+import { sectionAvailable, sectionDef, visibleSections } from "./nav";
+import { linkTo, parseRoute, redirectFor, routeHash, type Route } from "./router";
+import { useApi } from "./hooks/useApi";
 import { ConfigBanner } from "./components/ConfigBanner";
 import { ServerControls } from "./components/ServerControls";
+import { ModuleOff } from "./components/ui";
+import type { SectionProps } from "./components/Section";
 import "./App.css";
 
+/** Follow the location hash: canonical routes only (old view ids are replaced in place). */
+function useRoute(): [Route, (next: Route) => void] {
+  const [route, setRoute] = useState<Route>(() => parseRoute(window.location.hash));
+  useEffect(() => {
+    const sync = () => {
+      const redirect = redirectFor(window.location.hash);
+      if (redirect) window.history.replaceState(null, "", redirect);
+      setRoute(parseRoute(window.location.hash));
+    };
+    sync();
+    window.addEventListener("hashchange", sync);
+    return () => window.removeEventListener("hashchange", sync);
+  }, []);
+  const go = useCallback((next: Route) => {
+    const hash = routeHash(next);
+    if (hash !== window.location.hash) window.location.hash = hash;
+  }, []);
+  return [route, go];
+}
+
 export function App() {
-  const [currentView, setCurrentView] = useState<View>("overview");
+  const [route, go] = useRoute();
   const [projects, setProjects] = useState<string[]>([]);
   const [currentProject, setCurrentProject] = useState<string>("");
   const [lastRefresh, setLastRefresh] = useState<Date>(new Date());
@@ -40,8 +60,9 @@ export function App() {
     orchestratorPaused: false,
     tickRunning: false,
   });
+  const refreshKey = lastRefresh.getTime();
 
-  // Load projects on mount, and open the server's default project (LAIR_PROJECT)
+  // Load projects on mount: the one the URL names, else the server's default (LAIR_PROJECT)
   useEffect(() => {
     const defaultProject = fetch("/api/projects/default")
       .then((res) => res.json())
@@ -52,19 +73,28 @@ export function App() {
       .then(async (data) => {
         if (data.success && data.data) {
           setProjects(data.data);
-          const initial = pickInitialProject(data.data, await defaultProject);
-          if (initial) {
-            setCurrentProject(initial);
-          }
+          const named = parseRoute(window.location.hash).project;
+          const initial = named && data.data.includes(named) ? named : pickInitialProject(data.data, await defaultProject);
+          if (initial) setCurrentProject(initial);
         }
       })
       .catch(console.error);
   }, []);
 
+  // A URL that names another known project switches to it; with several projects, the URL always names one
+  useEffect(() => {
+    if (!currentProject || projects.length < 2) return;
+    if (route.project && route.project !== currentProject && projects.includes(route.project)) {
+      setCurrentProject(route.project);
+    } else if (route.project !== currentProject) {
+      window.history.replaceState(null, "", routeHash({ ...route, project: currentProject }));
+    }
+  }, [route, currentProject, projects]);
+
   // Fetch controls status when project changes
   useEffect(() => {
     if (!currentProject) return;
-    fetch(`/api/controls/status?project=${currentProject}`)
+    fetch(`/api/controls/status?project=${encodeURIComponent(currentProject)}`)
       .then((res) => res.json())
       .then((data) => {
         if (data.success && data.data) {
@@ -82,62 +112,67 @@ export function App() {
     return () => clearInterval(interval);
   }, []);
 
-  const renderView = () => {
-    const props = {
-      project: currentProject,
-      refreshKey: lastRefresh.getTime(),
-    };
+  const modulesApi = useApi<DashboardModules>("/dashboard/modules", currentProject, refreshKey, { skip: !currentProject });
+  const modules = modulesApi.data?.modules ?? null;
+  const readOnly = modulesApi.data?.readOnly ?? controlsStatus.readOnly;
 
-    switch (currentView) {
-      case "overview":
-        return <Overview {...props} />;
-      case "decisions":
-        return <DecisionInbox {...props} />;
-      case "dragons":
-        return <Dragons {...props} />;
+  const switchProject = (project: string) => {
+    setCurrentProject(project);
+    go({ section: route.section, tab: route.tab, detail: null, project: projects.length > 1 ? project : null });
+  };
+
+  const renderSection = () => {
+    if (!currentProject) return null;
+    const def = sectionDef(route.section);
+    if (modules && !sectionAvailable(route.section, modules)) {
+      return <ModuleOff what={def.label} enable={def.enable} />;
+    }
+    const props: SectionProps = {
+      project: currentProject,
+      refreshKey,
+      route,
+      modules,
+      readOnly,
+      open: (detail) => go({ ...route, detail }),
+    };
+    switch (route.section) {
+      case "home":
+        return <Home {...props} />;
+      case "work":
+        return <Work {...props} />;
       case "gates":
-        return <Gates {...props} />;
+        return <GatesSection {...props} />;
       case "prs":
-        return <PRs {...props} />;
-      case "orchestrator":
-        return <Orchestrator {...props} />;
+        return <PullRequests {...props} />;
       case "machines":
-        return <Machines {...props} />;
-      case "nodes":
-        return <Nodes {...props} />;
-      case "processes":
-        return <Processes {...props} />;
-      case "activity":
-        return <Activity {...props} />;
-      case "health":
-        return <Health {...props} />;
+        return <MachinesSection {...props} />;
+      case "decisions":
+        return <DecisionsSection {...props} />;
       case "delivery":
-        return <Delivery {...props} />;
-      case "reviews":
-        return <Reviews {...props} />;
-      case "agents":
-        return <Agents {...props} />;
-      case "triage":
-        return <Triage {...props} />;
-      case "planner":
-        return <Planner {...props} />;
-      case "inbox":
-        return <Inbox {...props} />;
+        return <Delivery project={currentProject} refreshKey={refreshKey} />;
+      case "processes":
+        return <Processes project={currentProject} refreshKey={refreshKey} />;
       case "settings":
-        return <Settings key={currentProject} {...props} />;
+        // Settings (src/client/components/Settings.tsx) is keyed by project: a switch starts it afresh
+        return <Settings key={currentProject} project={currentProject} refreshKey={refreshKey} />;
     }
   };
 
   return (
     <div className="app">
       <header className="header">
-        <h1>🐉 Lair</h1>
+        <h1>
+          <a href={linkTo("home")} className="brand">
+            🐉 Lair
+          </a>
+        </h1>
         <div className="header-controls">
           {projects.length > 1 && (
             <select
               value={currentProject}
-              onChange={(e) => setCurrentProject(e.target.value)}
+              onChange={(e) => switchProject(e.target.value)}
               className="project-select"
+              aria-label="Project"
             >
               {projects.map((p) => (
                 <option key={p} value={p}>
@@ -146,8 +181,8 @@ export function App() {
               ))}
             </select>
           )}
-          <span className="last-refresh">
-            Last refresh: {lastRefresh.toLocaleTimeString()}
+          <span className="last-refresh" title={lastRefresh.toLocaleString()}>
+            Updated {lastRefresh.toLocaleTimeString()}
           </span>
         </div>
       </header>
@@ -161,34 +196,43 @@ export function App() {
         />
       )}
 
-      <nav className="nav">
-        {VIEWS.map((view) => (
-          <button
-            key={view.id}
-            className={`nav-button ${currentView === view.id ? "active" : ""}`}
-            onClick={() => setCurrentView(view.id)}
+      <nav className="nav" aria-label="Sections">
+        {visibleSections(modules).map((section) => (
+          <a
+            key={section.id}
+            href={linkTo(section.id)}
+            className={`nav-button ${route.section === section.id ? "active" : ""}`}
+            aria-current={route.section === section.id ? "page" : undefined}
           >
-            {view.label}
-            {view.id === "decisions" && <DecisionsBadge refreshKey={lastRefresh.getTime()} />}
-          </button>
+            {section.label}
+            {section.id === "decisions" && <DecisionsBadge refreshKey={refreshKey} />}
+          </a>
         ))}
       </nav>
 
-      <ConfigBanner refreshKey={lastRefresh.getTime()} />
+      <ConfigBanner refreshKey={refreshKey} />
 
-      <main className="main">{renderView()}</main>
+      <main className="main">
+        {modulesApi.error && !modulesApi.data && (
+          <div className="error" role="alert">
+            Could not read which modules {currentProject} turns on ({modulesApi.error}): only the sections every project
+            has are shown.
+          </div>
+        )}
+        {renderSection()}
+      </main>
 
       <footer className="footer">
         <span>Lair v{LAIR_VERSION}</span>
         <span>•</span>
-        <span>{controlsStatus.readOnly ? "🔒 Read-only" : "🔓 Control"}</span>
+        <span>{readOnly ? "🔒 Read-only" : "🔓 Control"}</span>
         {controlsStatus.orchestratorPaused && (
           <>
             <span>•</span>
             <span>⏸ Paused</span>
           </>
         )}
-        <ServerControls refreshKey={lastRefresh.getTime()} />
+        <ServerControls refreshKey={refreshKey} />
       </footer>
     </div>
   );

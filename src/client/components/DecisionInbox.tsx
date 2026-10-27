@@ -1,8 +1,10 @@
 /**
- * Decision Inbox view: the questions only a human can answer (pricing,
- * legal, spend, accounts, credentials, go/no-go, escalations), from every
- * project, open first by urgency. Each one shows what it blocks and why, its
- * options with their consequences, and the recommended one.
+ * The Decision Inbox (the Decisions section's first tab): the questions only
+ * a human can answer (pricing, legal, spend, accounts, credentials,
+ * go/no-go, escalations), from every project, open first by urgency, in one
+ * table; a row opens the decision (#/decisions/<id>): what it blocks and
+ * why, its options with their consequences, the recommended one, then the
+ * answer form (or, once closed, how it ended and its history).
  *
  * Spend and go/no-go answers go through a confirmation step. A credentials
  * decision has a password field and no note: the value goes to the server's
@@ -19,19 +21,15 @@ import {
   decisionSummary,
   expiryText,
   getDecision,
-  listDecisions,
   needsConfirmation,
   outcomeText,
   postAnswer,
-  type DecisionSummary,
 } from "../decisions-api";
-import { ownerStatus, sessionSurvivesReload, signIn, tokenFromHash } from "../owner-session";
+import { sessionSurvivesReload, signIn, tokenFromHash } from "../owner-session";
 import { OwnerSessions } from "./OwnerSessions";
-
-interface Props {
-  project: string;
-  refreshKey: number;
-}
+import { DataTable, type Column } from "./DataTable";
+import { DetailPanel } from "./DetailPanel";
+import { Time } from "./ui";
 
 const muted = { color: "var(--text-secondary)", fontSize: "0.85rem" };
 
@@ -428,6 +426,101 @@ export function UnlockAnswering({ onUnlock }: { onUnlock: (token: string) => Pro
   );
 }
 
+const DECISION_COLUMNS: Column<Decision>[] = [
+  {
+    key: "kind",
+    label: "Kind",
+    sort: (d) => KIND_LABELS[d.kind],
+    render: (d) => <span className={`badge ${KIND_BADGE[d.kind] ?? "badge-neutral"}`}>{KIND_LABELS[d.kind]}</span>,
+  },
+  {
+    key: "title",
+    label: "Decision",
+    sort: (d) => d.title,
+    render: (d) => (
+      <>
+        {d.title}
+        <div style={muted}>
+          {d.project} · {d.source.module}
+        </div>
+      </>
+    ),
+  },
+  { key: "raised", label: "Raised", sort: (d) => d.createdAt, render: (d) => <Time iso={d.createdAt} /> },
+  {
+    key: "status",
+    label: "Status",
+    sort: (d) => (d.status === "open" ? (d.overdue ? 0 : 1) : 2),
+    render: (d) =>
+      d.status === "open" ? (
+        <span className={`badge ${d.overdue ? "badge-error" : "badge-warning"}`}>{d.overdue ? "overdue" : "open"}</span>
+      ) : (
+        <span style={muted}>{outcomeText(d)}</span>
+      ),
+  },
+];
+
+/** A decision's detail: its full context and options, then the answer form (open) or how it ended (closed). */
+export function DecisionDetail({
+  decision,
+  now,
+  secretStore,
+  answering,
+  onAnswered,
+  onClose,
+}: {
+  decision: Decision;
+  now: number;
+  secretStore: string;
+  answering: boolean;
+  onAnswered: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <DetailPanel
+      title={decision.title}
+      subtitle={
+        <>
+          <span className={`badge ${KIND_BADGE[decision.kind] ?? "badge-neutral"}`}>{KIND_LABELS[decision.kind]}</span>{" "}
+          <span style={muted}>
+            {decision.status === "open" ? "open" : decision.status} · raised <Time iso={decision.createdAt} now={now} />
+          </span>
+        </>
+      }
+      onClose={onClose}
+    >
+      {decision.status === "open" ? (
+        <DecisionCard decision={decision} now={now} secretStore={secretStore} canAnswer={answering} onAnswered={onAnswered} />
+      ) : (
+        <div className="card" data-decision={decision.id}>
+          <div style={muted}>
+            {decision.project} · raised by <code>{decision.source.module}</code> ({decision.source.ref})
+          </div>
+          <p style={{ whiteSpace: "pre-wrap", margin: "0.75rem 0" }}>{decision.context}</p>
+          <ul style={{ ...muted, margin: "0 0 0.75rem 1rem" }}>
+            {decision.options.map((o) => (
+              <li key={o.id}>
+                <strong>{o.label}</strong>: {o.consequences}
+              </li>
+            ))}
+          </ul>
+          <p>
+            <strong>Outcome:</strong> {outcomeText(decision)}
+            {decision.closedAt && (
+              <span style={muted}>
+                {" "}
+                (<Time iso={decision.closedAt} now={now} />)
+              </span>
+            )}
+          </p>
+          {decision.answer?.note && <p style={muted}>Note: {decision.answer.note}</p>}
+          <AuditToggle id={decision.id} />
+        </div>
+      )}
+    </DetailPanel>
+  );
+}
+
 export function DecisionInboxView({
   decisions,
   secretStore,
@@ -436,6 +529,8 @@ export function DecisionInboxView({
   onUnlock,
   onSignedOut = () => undefined,
   onAnswered,
+  selected = null,
+  onOpen = () => undefined,
 }: {
   decisions: Decision[];
   secretStore: string;
@@ -446,119 +541,60 @@ export function DecisionInboxView({
   /** This browser signed itself out (in the signed-in browsers list) */
   onSignedOut?: () => void;
   onAnswered: () => void;
+  /** The decision whose detail is open */
+  selected?: string | null;
+  /** Open a decision's detail (null closes it) */
+  onOpen?: (id: string | null) => void;
 }) {
   const open = decisions.filter((d) => d.status === "open");
-  const closed = decisions.filter((d) => d.status !== "open").slice(0, 25);
+  const closed = decisions.filter((d) => d.status !== "open").slice(0, 50);
+  const shown = [...open, ...closed];
+  const current = selected ? (decisions.find((d) => d.id === selected) ?? null) : null;
   return (
     <div>
-      <div style={{ display: "flex", alignItems: "baseline", gap: "1rem", marginBottom: "1.5rem", flexWrap: "wrap" }}>
-        <h2>Decisions ({open.length} open)</h2>
-        <span style={muted}>
-          Only what Lair can't decide for you: pricing, legal, spend, accounts, credentials, go/no-go, and problems its
-          playbooks couldn't fix.
-        </span>
-      </div>
+      <p style={{ ...muted, marginBottom: "1rem" }}>
+        Decisions ({open.length} open): only what Lair can&apos;t decide for you: pricing, legal, spend, accounts, credentials,
+        go/no-go, and problems its playbooks couldn&apos;t fix. Every project&apos;s are here.
+      </p>
 
       {answering ? <OwnerSessions onSignedOut={onSignedOut} /> : <UnlockAnswering onUnlock={onUnlock} />}
 
-      {open.length === 0 ? (
+      {open.length === 0 && (
         <div className="card">
           <p style={muted}>Nothing needs you right now.</p>
         </div>
-      ) : (
-        open.map((decision) => (
-          <DecisionCard
-            key={decision.id}
-            decision={decision}
-            now={now}
-            secretStore={secretStore}
-            canAnswer={answering}
-            onAnswered={onAnswered}
-          />
-        ))
       )}
 
       <div className="card">
-        <h3>Decided</h3>
-        {closed.length === 0 ? (
-          <p style={muted}>None yet</p>
-        ) : (
-          <table className="table">
-            <thead>
-              <tr>
-                <th>Closed</th>
-                <th>Project</th>
-                <th>Kind</th>
-                <th>Decision</th>
-                <th>Outcome</th>
-              </tr>
-            </thead>
-            <tbody>
-              {closed.map((d) => (
-                <tr key={d.id}>
-                  <td style={muted}>{time(d.closedAt)}</td>
-                  <td>{d.project}</td>
-                  <td>
-                    <span className={`badge ${KIND_BADGE[d.kind] ?? "badge-neutral"}`}>{KIND_LABELS[d.kind]}</span>
-                  </td>
-                  <td>
-                    {d.title}
-                    {d.answer?.note && <div style={muted}>Note: {d.answer.note}</div>}
-                  </td>
-                  <td>{outcomeText(d)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
+        <DataTable
+          label="Decisions"
+          columns={DECISION_COLUMNS}
+          rows={shown}
+          rowKey={(d) => d.id}
+          onOpen={(d) => onOpen(d.id)}
+          selected={selected}
+          empty={<p style={muted}>No decisions yet: modules raise them here when they need you.</p>}
+        />
       </div>
+
+      {selected && current && (
+        <DecisionDetail
+          decision={current}
+          now={now}
+          secretStore={secretStore}
+          answering={answering}
+          onAnswered={onAnswered}
+          onClose={() => onOpen(null)}
+        />
+      )}
+      {selected && !current && (
+        <DetailPanel title="Decision" onClose={() => onOpen(null)}>
+          <p style={muted}>
+            No decision <code>{selected}</code> in the latest {decisions.length}: it may be older, or the link may be wrong.
+          </p>
+        </DetailPanel>
+      )}
     </div>
-  );
-}
-
-export function DecisionInbox({ refreshKey }: Props) {
-  const [decisions, setDecisions] = useState<Decision[] | null>(null);
-  const [summary, setSummary] = useState<DecisionSummary | null>(null);
-  const [answering, setAnswering] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [reload, setReload] = useState(0);
-
-  useEffect(() => {
-    let cancelled = false;
-    Promise.all([listDecisions(), decisionSummary(), ownerStatus()])
-      .then(([list, counts, session]) => {
-        if (cancelled) return;
-        setDecisions(list);
-        setSummary(counts);
-        setAnswering(session.signedIn);
-        setError(null);
-      })
-      .catch((e: unknown) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : "Network error");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [refreshKey, reload]);
-
-  if (!decisions && error) return <div className="error">Error: {error}</div>;
-  if (!decisions) return <div className="loading">Loading decisions...</div>;
-  return (
-    <>
-      {error && <div className="error">Refresh failed: {error}</div>}
-      <DecisionInboxView
-        decisions={decisions}
-        secretStore={summary?.secretStore ?? "the server's secret store"}
-        now={Date.now()}
-        answering={answering}
-        onUnlock={async (token) => {
-          await signIn(token);
-          setReload((n) => n + 1);
-        }}
-        onSignedOut={() => setReload((n) => n + 1)}
-        onAnswered={() => setReload((n) => n + 1)}
-      />
-    </>
   );
 }
 

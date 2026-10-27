@@ -226,3 +226,157 @@ export function isStaleRun(gate: Gate, maxAgeSeconds: number = 7200): boolean {
   const age = calculateGateAge(gate.startTime);
   return age > maxAgeSeconds;
 }
+
+// ============ STEPS, FOR THE GATE DETAIL ============
+
+/** A step's result as a gate log states it */
+export type GateLogStepState = "passed" | "failed" | "skipped" | "running" | "timed_out";
+
+export interface GateLogStep {
+  name: string;
+  state: GateLogStepState;
+  /** null when the log gives no duration */
+  durationSeconds: number | null;
+  /** From "== FAILED STEPS: name(rc=N)" */
+  exitCode?: number;
+}
+
+/** What a gate log says about its run: its steps and the commit it tested. */
+export interface GateLogSummary {
+  steps: GateLogStep[];
+  /** The step still running (its "STEP name: running" line has no result after it) */
+  currentStep: string | null;
+  failedSteps: string[];
+  sha: string | null;
+  base: string | null;
+  startedAt: string | null;
+  lane: string | null;
+  track: string | null;
+  branch: string | null;
+}
+
+/** Lines are cut to this many characters before any regular expression sees them */
+const MAX_STEP_LINE = 500;
+/** At most this many lines of a log are read (the last ones) */
+const MAX_STEP_LINES = 20_000;
+/** At most this many steps are listed */
+const MAX_STEPS = 200;
+
+const STEP_NAME = "([A-Za-z0-9][\\w.-]{0,99})";
+const RESULT = "(PASS(?:ED)?|FAIL(?:ED)?|SKIP(?:PED)?|TIMEOUT|TIMED[ _]OUT|running)";
+const DURATION = "(\\d{1,9}(?:\\.\\d{1,3})?)\\s?(ms|s|sec|m|min)";
+/** "STEP commitlint: PASS (2s)", "STEP verify-backend: running" */
+const STEP_LINE = new RegExp(`^\\s*STEP\\s+${STEP_NAME}\\s*:\\s*${RESULT}\\b(?:\\s*\\(${DURATION}\\))?`, "i");
+/** "PASS security-guard (24s)" */
+const RESULT_FIRST = new RegExp(`^\\s*${RESULT}\\s+${STEP_NAME}(?:\\s*\\(${DURATION}\\))?\\s*$`, "i");
+/** "  commitlint      0s  PASS" */
+const TABLE_ROW = new RegExp(`^\\s*${STEP_NAME}\\s{2,}${DURATION}\\s+${RESULT}\\s*$`, "i");
+/** "== gate backend at abc1234d 2026-10-24T14:35:00Z; base def5678e" */
+const GATE_HEADER =
+  /^==\s*gate\s+\S+\s+at\s+([0-9a-f]{7,64})(?:\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z))?(?:;\s*base\s+([0-9a-f]{7,64}))?/i;
+/** "[gate-run] heavy lane, track: api-tests" */
+const RUN_HEADER = /^\[gate-run\]\s*(?:([A-Za-z][\w-]{0,31})\s+lane)?(?:,?\s*track:\s*([A-Za-z0-9][\w.-]{0,99}))?/;
+const BRANCH = /^(?:==|\[gate-run\]).*?\bbranch[:=]?\s+([A-Za-z0-9][A-Za-z0-9._/-]{0,199})/i;
+const FAILED_LIST = /^==\s*FAILED STEPS:\s*(.+)$/;
+const FAILED_ENTRY = /([A-Za-z0-9][\w.-]{0,99})\(rc=(\d{1,5})\)/g;
+
+function stepState(word: string): GateLogStepState {
+  const w = word.toUpperCase();
+  if (w.startsWith("PASS")) return "passed";
+  if (w.startsWith("FAIL")) return "failed";
+  if (w.startsWith("SKIP")) return "skipped";
+  if (w === "RUNNING") return "running";
+  return "timed_out";
+}
+
+function seconds(value: string | undefined, unit: string | undefined): number | null {
+  if (value === undefined || unit === undefined) return null;
+  const n = Number.parseFloat(value);
+  if (!Number.isFinite(n)) return null;
+  const u = unit.toLowerCase();
+  if (u === "ms") return n / 1000;
+  if (u === "m" || u === "min") return n * 60;
+  return n;
+}
+
+/**
+ * Read a gate log's steps with their results and durations, and the commit,
+ * lane and track its header lines name. Bounded: the last MAX_STEP_LINES
+ * lines, each cut to MAX_STEP_LINE characters, at most MAX_STEPS steps. A
+ * step named twice (a preflight and the gate run) keeps its place and takes
+ * the later result.
+ */
+export function parseGateSteps(content: string): GateLogSummary {
+  const summary: GateLogSummary = {
+    steps: [],
+    currentStep: null,
+    failedSteps: [],
+    sha: null,
+    base: null,
+    startedAt: null,
+    lane: null,
+    track: null,
+    branch: null,
+  };
+  const byName = new Map<string, GateLogStep>();
+  const record = (name: string, state: GateLogStepState, duration: number | null) => {
+    const known = byName.get(name);
+    if (known) {
+      known.state = state;
+      if (duration !== null || state !== "running") known.durationSeconds = duration;
+      return;
+    }
+    if (byName.size >= MAX_STEPS) return;
+    const step: GateLogStep = { name, state, durationSeconds: duration };
+    byName.set(name, step);
+    summary.steps.push(step);
+  };
+
+  const all = content.split("\n");
+  const lines = all.length > MAX_STEP_LINES ? all.slice(-MAX_STEP_LINES) : all;
+  for (const raw of lines) {
+    const line = raw.length > MAX_STEP_LINE ? raw.slice(0, MAX_STEP_LINE) : raw.replace(/\r$/, "");
+    let m = STEP_LINE.exec(line);
+    if (m) {
+      record(m[1], stepState(m[2]), seconds(m[3], m[4]));
+      continue;
+    }
+    m = RESULT_FIRST.exec(line);
+    if (m) {
+      record(m[2], stepState(m[1]), seconds(m[3], m[4]));
+      continue;
+    }
+    m = TABLE_ROW.exec(line);
+    if (m) {
+      record(m[1], stepState(m[4]), seconds(m[2], m[3]));
+      continue;
+    }
+    m = FAILED_LIST.exec(line);
+    if (m) {
+      for (const entry of m[1].matchAll(FAILED_ENTRY)) {
+        record(entry[1], "failed", byName.get(entry[1])?.durationSeconds ?? null);
+        const step = byName.get(entry[1]);
+        if (step) step.exitCode = Number(entry[2]);
+      }
+      continue;
+    }
+    m = GATE_HEADER.exec(line);
+    if (m) {
+      summary.sha = m[1].toLowerCase();
+      summary.startedAt = m[2] ?? summary.startedAt;
+      summary.base = m[3] ? m[3].toLowerCase() : summary.base;
+    }
+    m = RUN_HEADER.exec(line);
+    if (m) {
+      summary.lane = m[1] ?? summary.lane;
+      summary.track = m[2] ?? summary.track;
+    }
+    m = BRANCH.exec(line);
+    if (m) summary.branch = m[1];
+  }
+
+  summary.failedSteps = summary.steps.filter((s) => s.state === "failed" || s.state === "timed_out").map((s) => s.name);
+  const running = summary.steps.filter((s) => s.state === "running");
+  summary.currentStep = running.length > 0 ? running[running.length - 1].name : null;
+  return summary;
+}

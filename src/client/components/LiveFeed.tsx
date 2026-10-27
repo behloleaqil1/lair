@@ -1,5 +1,7 @@
 /**
- * LiveFeed - Real-time activity feed using SSE from the fleet bus
+ * LiveFeed - Home's recent activity: the agents' reports and claims, live
+ * from the fleet bus (SSE). The agent, gate and PR of an event link to their
+ * detail.
  *
  * The stream (hooks/event-stream.ts) reconnects with backoff when the server
  * goes away and comes back (a restart), and the header says "Reconnecting…"
@@ -9,9 +11,13 @@ import { useState, useEffect, useRef } from "react";
 import type { BoardOutput, ReportKind } from "../../shared/types";
 import { EventStream } from "../hooks/event-stream";
 import { connectionLabel, type ConnectionStatus } from "../hooks/reconnect";
+import { linkTo } from "../router";
+import { Time } from "./ui";
 
 interface LiveFeedProps {
   project: string;
+  /** At most this many events are shown */
+  limit?: number;
 }
 
 interface FeedEvent {
@@ -43,8 +49,7 @@ const KIND_ICONS: Record<ReportKind, string> = {
   TICK: "⏱️",
 };
 
-export function LiveFeed({ project }: LiveFeedProps) {
-  const [board, setBoard] = useState<BoardOutput | null>(null);
+export function LiveFeed({ project, limit = 20 }: LiveFeedProps) {
   const [events, setEvents] = useState<FeedEvent[]>([]);
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [retryInMs, setRetryInMs] = useState<number | null>(null);
@@ -56,13 +61,11 @@ export function LiveFeed({ project }: LiveFeedProps) {
     let active = true;
     // Another project's board is no baseline for this one's changes
     previousBoardRef.current = null;
-    setBoard(null);
     setEvents([]);
 
     const onBoard = (data: string) => {
       try {
         const newBoard = JSON.parse(data) as BoardOutput;
-        setBoard(newBoard);
 
         // Generate events from board changes
         if (previousBoardRef.current) {
@@ -174,16 +177,11 @@ export function LiveFeed({ project }: LiveFeedProps) {
     return events;
   }
 
-  function formatTime(iso: string): string {
-    const d = new Date(iso);
-    return d.toLocaleTimeString();
-  }
-
   return (
     <div className="live-feed">
       <div className="live-feed-header">
         <h3>
-          🔴 Live Feed
+          Recent activity
           <span
             className={`connection-status ${status === "connected" ? "connected" : status === "closed" ? "disconnected" : "reconnecting"}`}
             title={retryInMs !== null ? `Next try in ${Math.ceil(retryInMs / 1000)} s` : undefined}
@@ -195,23 +193,17 @@ export function LiveFeed({ project }: LiveFeedProps) {
 
       {error && <div className="live-feed-error">{error}</div>}
 
-      {board && (
-        <div className="live-feed-summary">
-          <span>{board.tasks.length} tasks</span>
-          <span>{board.agents.length} agents</span>
-          <span>
-            {board.tasks.filter((t) => t.owner).length} active
-          </span>
-        </div>
-      )}
-
       <div className="live-feed-events">
         {events.length === 0 ? (
-          <div className="live-feed-empty">No recent activity</div>
+          <div className="live-feed-empty">
+            No recent activity: agents&apos; reports (WAITING, DONE, BLOCKED) show here as they write them.
+          </div>
         ) : (
-          events.map((event) => (
+          events.slice(0, limit).map((event) => (
             <div key={event.id} className={`feed-event feed-event-${event.type}`}>
-              <span className="feed-time">{formatTime(event.time)}</span>
+              <span className="feed-time">
+                <Time iso={event.time} />
+              </span>
 
               {event.type === "report" && event.kind && (
                 <span
@@ -229,7 +221,9 @@ export function LiveFeed({ project }: LiveFeedProps) {
               <span className="feed-task">{event.task}</span>
 
               {event.agent && (
-                <span className="feed-agent">by {event.agent}</span>
+                <span className="feed-agent">
+                  by <a href={linkTo("work", event.agent)}>{event.agent}</a>
+                </span>
               )}
 
               {event.summary && (
@@ -237,13 +231,15 @@ export function LiveFeed({ project }: LiveFeedProps) {
               )}
 
               {event.gate_id && (
-                <span className="feed-gate" title={event.gate_id}>
+                <a className="feed-gate" href={linkTo("gates", event.gate_id)} title={event.gate_id}>
                   🚦 Gate
-                </span>
+                </a>
               )}
 
               {event.pr && (
-                <span className="feed-pr">PR #{event.pr}</span>
+                <a className="feed-pr" href={linkTo("prs", String(event.pr))}>
+                  PR #{event.pr}
+                </a>
               )}
 
               {event.sha && (

@@ -9,7 +9,7 @@ import {
   getDefaultProject,
   listProjects,
 } from "./config.js";
-import { DataService, isSafeGateId } from "./services/data.js";
+import { DataService } from "./services/data.js";
 import { isValidDragonId } from "./parsers/dragon-config.js";
 import { registerRootGuards, requireValidIdParam } from "./root-guards.js";
 import { mountDecisions } from "./decisions/index.js";
@@ -44,6 +44,7 @@ import { getBudgetManager } from "./fleet/budget.js";
 import { ReviewManager, inboxDecisionSink, registerReviewRoutes } from "./review/index.js";
 import { mountTriage } from "./triage/index.js";
 import { PlacementManager, registerPlacementRoutes } from "./placement/index.js";
+import { registerDashboardRoutes } from "./dashboard/index.js";
 import { ConfigReloader, registerReloadRoutes, serverModules } from "./reload/index.js";
 import {
   RestartController,
@@ -77,7 +78,6 @@ registerRootGuards(fastify);
 
 // Path ids are matched against files on disk: refuse unsafe ones with 400
 const dragonIdGuard = requireValidIdParam(isValidDragonId, "dragon");
-const gateIdGuard = requireValidIdParam(isSafeGateId, "gate");
 
 // Wrap response in standard format
 function respond<T>(data: T): ApiResponse<T> {
@@ -205,19 +205,7 @@ fastify.get<{ Params: { id: string }; Querystring: { project?: string } }>(
   },
 );
 
-fastify.get<{
-  Params: { id: string };
-  Querystring: { project?: string; lines?: string };
-}>("/api/dragons/:id/log", { preHandler: dragonIdGuard }, async (request) => {
-  try {
-    const service = getDataService(request.query.project);
-    const lines = request.query.lines ? parseInt(request.query.lines, 10) : 50;
-    const log = service.getDragonLogTail(request.params.id, lines);
-    return respond({ id: request.params.id, log });
-  } catch (e) {
-    return respondError(e instanceof Error ? e.message : "Unknown error");
-  }
-});
+// A dragon's log tail is the owner's: GET /api/dashboard/agents/:id/log (src/server/dashboard/)
 
 fastify.get<{ Params: { id: string }; Querystring: { project?: string } }>(
   "/api/dragons/:id/queue",
@@ -278,19 +266,8 @@ fastify.get<{ Querystring: { project?: string; hours?: string } }>(
   },
 );
 
-fastify.get<{ Params: { id: string }; Querystring: { project?: string } }>(
-  "/api/gates/:id/log",
-  { preHandler: gateIdGuard },
-  async (request) => {
-    try {
-      const service = getDataService(request.query.project);
-      const log = service.getGateLog(request.params.id);
-      return respond({ id: request.params.id, log });
-    } catch (e) {
-      return respondError(e instanceof Error ? e.message : "Unknown error");
-    }
-  },
-);
+// A gate's detail is GET /api/dashboard/gates/:id, its log tail and failing
+// tests the owner's GET /api/dashboard/gates/:id/output (src/server/dashboard/)
 
 // Queue
 fastify.get<{ Querystring: { project?: string; types?: string } }>(
@@ -502,6 +479,24 @@ const placements = new PlacementManager({
 });
 placements.load(projectEntries);
 await registerPlacementRoutes(fastify, placements, () => getDefaultProject());
+
+// The dashboard's own reads (src/server/dashboard/): the nav's module flags,
+// a gate's detail from the queue, the pipelines, triage and placement, and
+// the owner-only log tails and failing tests
+await registerDashboardRoutes(
+  fastify,
+  {
+    defaultProject: () => getDefaultProject(),
+    config: (project) => loadProjectConfig(project),
+    data: (project) => getDataService(project),
+    agentRuns: (project, limit) => agents.get(project)?.runs(limit) ?? [],
+    pipelineRuns: (project, limit) => pipelines.listRuns(project, limit),
+    triageRecords: (project, limit) => triage.getStore()?.listRecords(project, { limit }) ?? [],
+    placement: (project) => placements.status(project),
+    nodeCount: () => getStore().listNodes().length,
+  },
+  humanAuth,
+);
 
 // Live config reload (src/server/reload/): a changed project file reaches
 // the modules whose part of it changed, without a restart; an invalid one

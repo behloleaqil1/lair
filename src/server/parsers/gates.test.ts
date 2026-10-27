@@ -11,7 +11,10 @@ import {
   groupByLane,
   findDuplicates,
   isStaleRun,
+  parseGateSteps,
 } from "./gates.js";
+import { readFileSync } from "fs";
+import { join } from "path";
 
 describe("parseGateTimestamp", () => {
   it("converts gate timestamp to ISO format", () => {
@@ -309,5 +312,54 @@ describe("isStaleRun", () => {
     expect(
       isStaleRun({ status: "running", startTime: oldTime } as any, 1700),
     ).toBe(true); // 1700s threshold, 30 min > that
+  });
+});
+
+describe("parseGateSteps", () => {
+  const fixture = (name: string) => readFileSync(join(process.cwd(), "fixtures", name), "utf-8");
+
+  it("reads each step's result and duration, the running step, and the commit the gate tested", () => {
+    const log = parseGateSteps(fixture("gate-log.txt"));
+    expect(log.steps.map((s) => [s.name, s.state, s.durationSeconds])).toEqual([
+      ["security-guard", "passed", 24],
+      ["pre-commit", "passed", 120],
+      ["commitlint", "passed", 2],
+      ["backend-lint", "passed", 9],
+      ["backend-typecheck", "passed", 45],
+      ["gitleaks", "passed", 15],
+      ["semgrep", "passed", 90],
+      ["verify-backend", "running", null],
+    ]);
+    expect(log.currentStep).toBe("verify-backend");
+    expect(log.failedSteps).toEqual([]);
+    expect(log).toMatchObject({ sha: "abc1234d", base: "def5678e", startedAt: "2026-10-24T14:35:00Z" });
+  });
+
+  it("marks failed steps with their exit code, and reads the lane and track", () => {
+    const log = parseGateSteps(fixture("gate-log-failed.txt"));
+    expect(log.failedSteps).toEqual(["verify-backend"]);
+    expect(log.steps.find((s) => s.name === "verify-backend")).toEqual({
+      name: "verify-backend",
+      state: "failed",
+      durationSeconds: 240,
+      exitCode: 1,
+    });
+    // The fixture's commit is not hexadecimal, so it is not taken for a sha
+    expect(log).toMatchObject({ lane: "heavy", track: "api-tests", sha: null });
+    expect(log.currentStep).toBeNull();
+  });
+
+  it("reads table rows and other units, and stays bounded on hostile input", () => {
+    const log = parseGateSteps(["  unit-tests      90ms  PASS", "  e2e   2min  FAIL", "STEP slow: TIMED OUT (5m)"].join("\n"));
+    expect(log.steps).toEqual([
+      { name: "unit-tests", state: "passed", durationSeconds: 0.09 },
+      { name: "e2e", state: "failed", durationSeconds: 120 },
+      { name: "slow", state: "timed_out", durationSeconds: 300 },
+    ]);
+    const hostile = parseGateSteps(
+      [`STEP ${"a".repeat(5000)}: PASS (1s)`, ...Array.from({ length: 500 }, (_, i) => `STEP s${i}: PASS (1s)`)].join("\n"),
+    );
+    expect(hostile.steps.length).toBe(200);
+    expect(hostile.steps.every((s) => s.name.length <= 100)).toBe(true);
   });
 });

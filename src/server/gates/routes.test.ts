@@ -152,8 +152,8 @@ async function api<T>(
 ): Promise<{ status: number; body: { success: boolean; data?: T; error?: string } }> {
   const headers: Record<string, string> = {};
   if (init.body !== undefined) headers["content-type"] = "application/json";
-  // Writes go out as the dashboard signed in as the owner, unless a test says otherwise
-  if ((init.method ?? "GET") !== "GET" && init.owner !== false) {
+  // Writes go out as the dashboard signed in as the owner, unless a test says otherwise; reads only when it says so
+  if (init.owner ?? (init.method ?? "GET") !== "GET") {
     headers.origin = DASHBOARD;
     headers["sec-fetch-site"] = "same-origin";
     headers[OWNER_SESSION_HEADER] = ownerSession;
@@ -169,7 +169,7 @@ async function api<T>(
 
 async function waitForRun(id: string, project = PROJECT): Promise<PipelineRun> {
   for (let i = 0; i < 400; i++) {
-    const { body } = await api<PipelineRun>(`/api/pipelines/runs/${id}?project=${project}`);
+    const { body } = await api<PipelineRun>(`/api/pipelines/runs/${id}?project=${project}`, { owner: true });
     if (body.data?.completedAt) return body.data;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
@@ -195,6 +195,15 @@ describe("pipeline API over HTTP", () => {
     // The step ran in a worktree of the commit, as a real process
     const checks = run.jobs.find((j) => j.lane === "default")!;
     expect(checks.result!.steps[0].output).toBe("file:hello");
+    // Its log tail and step output are the owner's: anyone else gets the run without them
+    for (const path of [`/api/pipelines/runs/${run.id}?project=${PROJECT}`, `/api/pipelines/runs?project=${PROJECT}&limit=5`]) {
+      const anyone = await api<PipelineRun | PipelineRun[]>(path);
+      const seen = ([] as PipelineRun[]).concat(anyone.body.data!).find((r) => r.id === run.id)!;
+      const job = seen.jobs.find((j) => j.lane === "default")!;
+      expect(job.log).toBeUndefined();
+      expect(job.result!.steps[0].output).toBeUndefined();
+      expect(job.result!.steps[0].status).toBe("passed");
+    }
     expect(checks.attempts.map((a) => [a.executor, a.status])).toEqual([
       ["github-self-hosted", "skipped"],
       ["github-hosted", "fell_back"],

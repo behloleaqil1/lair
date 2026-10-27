@@ -1,14 +1,16 @@
 /**
- * Pipelines section of the Gates view: where jobs can run (executor
- * availability, CI minutes, warnings), pipeline runs with the executor and
- * the fallback reasons of every step, and the workflow file a project
- * commits to use GitHub Actions. Calls /api/pipelines/* (see
- * docs/configuration.md#gate-pipelines).
+ * The Pipelines tab of Gates: where jobs can run (executor availability, CI
+ * minutes, warnings), the pipeline runs (a row opens the run's gate detail,
+ * #/gates/<run id>?tab=pipelines, with its steps and PipelineJobs), and the
+ * workflow file a project commits to use GitHub Actions. Calls
+ * /api/pipelines/* (see docs/configuration.md#gate-pipelines).
  */
 import { useState } from "react";
 import { useApi } from "../hooks/useApi";
 import { cancelPipelineRun, startPipelineRun, type ApiEnvelope } from "../owner-actions";
 import { SignInHint } from "./SignInHint";
+import { DataTable, type Column } from "./DataTable";
+import { Time } from "./ui";
 import type {
   PipelineAttempt,
   PipelineRun,
@@ -75,12 +77,11 @@ function whereOf(run: PipelineRun): string {
   return places.length > 0 ? places.join(", ") : "—";
 }
 
-export function PipelineRuns({ project, refreshKey }: Props) {
+export function PipelineRuns({ project, refreshKey, openRun }: Props & { openRun: (id: string) => void }) {
   const [tick, setTick] = useState(0);
   const key = refreshKey + tick;
   const status = useApi<PipelinesStatus>("/pipelines/status", project, key);
   const runs = useApi<PipelineRun[]>("/pipelines/runs", project, key);
-  const [selected, setSelected] = useState<string | null>(null);
   const [showWorkflow, setShowWorkflow] = useState(false);
   const [pipeline, setPipeline] = useState("");
   const [branch, setBranch] = useState("");
@@ -121,8 +122,8 @@ export function PipelineRuns({ project, refreshKey }: Props) {
         }),
       );
       setMessage(`Started ${run.id} at ${run.commitSha.slice(0, 10)}`);
-      setSelected(run.id);
       setTick((t) => t + 1);
+      openRun(run.id);
     } catch (e) {
       setMessage(e instanceof Error ? e.message : String(e));
     } finally {
@@ -222,54 +223,16 @@ export function PipelineRuns({ project, refreshKey }: Props) {
 
       <div className="card">
         <h3>Pipeline runs</h3>
-        {(runs.data ?? []).length === 0 ? (
-          <p style={muted}>No runs yet</p>
-        ) : (
-          <table className="table">
-            <thead>
-              <tr>
-                <th>Started</th>
-                <th>Pipeline</th>
-                <th>Commit</th>
-                <th>Status</th>
-                <th>Where</th>
-                <th>Minutes</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(runs.data ?? []).slice(0, 20).map((run) => (
-                <tr key={run.id} className="clickable" onClick={() => setSelected(run.id)}>
-                  <td style={muted}>{time(run.createdAt)}</td>
-                  <td>{run.pipeline}</td>
-                  <td>
-                    <code>{run.commitSha.slice(0, 10)}</code>
-                  </td>
-                  <td>{badge(run.status)}</td>
-                  <td style={muted}>{whereOf(run)}</td>
-                  <td>
-                    {run.minutes}
-                    {run.billedMinutes > 0 ? ` (${run.billedMinutes} billed)` : ""}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
+        <DataTable
+          label="Pipeline runs"
+          columns={RUN_COLUMNS}
+          rows={(runs.data ?? []).slice(0, 50)}
+          rowKey={(run) => run.id}
+          onOpen={(run) => openRun(run.id)}
+          empty={<p style={muted}>No runs yet: start one above, or let a module start them.</p>}
+        />
       </div>
 
-      {selected && (
-        <>
-          <div className="overlay" onClick={() => setSelected(null)} />
-          <RunPanel
-            id={selected}
-            project={project}
-            refreshKey={key}
-            readOnly={s.readOnly}
-            onChanged={() => setTick((t) => t + 1)}
-            onClose={() => setSelected(null)}
-          />
-        </>
-      )}
       {showWorkflow && (
         <>
           <div className="overlay" onClick={() => setShowWorkflow(false)} />
@@ -279,6 +242,21 @@ export function PipelineRuns({ project, refreshKey }: Props) {
     </div>
   );
 }
+
+const RUN_COLUMNS: Column<PipelineRun>[] = [
+  { key: "started", label: "Started", sort: (run) => run.createdAt, render: (run) => <Time iso={run.createdAt} /> },
+  { key: "pipeline", label: "Pipeline", sort: (run) => run.pipeline, render: (run) => run.pipeline },
+  { key: "commit", label: "Commit", render: (run) => <code>{run.commitSha.slice(0, 10)}</code> },
+  { key: "status", label: "Status", sort: (run) => run.status, render: (run) => badge(run.status) },
+  { key: "where", label: "Where", render: (run) => <span style={muted}>{whereOf(run)}</span> },
+  {
+    key: "minutes",
+    label: "Minutes",
+    align: "right",
+    sort: (run) => run.minutes,
+    render: (run) => `${run.minutes}${run.billedMinutes > 0 ? ` (${run.billedMinutes} billed)` : ""}`,
+  },
+];
 
 function AttemptRow({ attempt }: { attempt: PipelineAttempt }) {
   return (
@@ -303,118 +281,80 @@ function AttemptRow({ attempt }: { attempt: PipelineAttempt }) {
   );
 }
 
-function RunPanel({
+/**
+ * A pipeline run's jobs in the gate detail: where each lane's job went and
+ * why (every executor tried, its fallback reason), its artifacts and
+ * minutes, and Cancel while it runs (the owner's). Its steps are in the
+ * gate detail; its log tail is the owner's (GET /api/dashboard/gates/:id/output).
+ */
+export function PipelineJobs({
   id,
   project,
   refreshKey,
   readOnly,
-  onChanged,
-  onClose,
 }: {
   id: string;
   project: string;
   refreshKey: number;
   readOnly: boolean;
-  onChanged: () => void;
-  onClose: () => void;
 }) {
-  const { data: run, error } = useApi<PipelineRun>(`/pipelines/runs/${id}`, project, refreshKey);
+  const [tick, setTick] = useState(0);
+  const { data: run, error } = useApi<PipelineRun>(`/pipelines/runs/${encodeURIComponent(id)}`, project, refreshKey + tick);
   const [cancelError, setCancelError] = useState<string | null>(null);
 
   const cancel = async () => {
+    if (!window.confirm(`Cancel run ${id}? Jobs still running are stopped.`)) return;
     setCancelError(null);
     try {
       await unwrap(cancelPipelineRun<PipelineRun>(project, id));
-      onChanged();
+      setTick((t) => t + 1);
     } catch (e) {
       setCancelError(e instanceof Error ? e.message : String(e));
     }
   };
 
+  if (error) return <div className="error">Could not load run {id}: {error}</div>;
+  if (!run) return <p style={muted}>Loading the run's jobs…</p>;
   return (
-    <div className="detail-panel">
-      <div className="detail-panel-header">
-        <h2>Pipeline run</h2>
-        <button className="detail-panel-close" onClick={onClose}>
-          ×
+    <>
+      <p style={muted}>
+        {run.minutes} CI minute(s){run.billedMinutes > 0 ? `, ${run.billedMinutes} billed` : ""}
+      </p>
+      {run.error && <p className="error">{run.error}</p>}
+      {!run.completedAt && !readOnly && (
+        <button type="button" className="small-button danger" onClick={() => void cancel()}>
+          Cancel run
         </button>
-      </div>
-      {error && <div className="error">{error}</div>}
-      {run && (
-        <>
-          <p style={muted}>
-            {run.pipeline} at <code>{run.commitSha}</code>
-            {run.branch ? ` (${run.branch})` : ""} · {badge(run.status)} · {run.minutes} CI minute(s)
-            {run.billedMinutes > 0 ? `, ${run.billedMinutes} billed` : ""}
-          </p>
-          {run.error && <p className="error">{run.error}</p>}
-          {!run.completedAt && !readOnly && (
-            <button className="nav-button" onClick={cancel} style={{ marginBottom: "0.5rem" }}>
-              Cancel run
-            </button>
-          )}
-          {cancelError && <p className="error">{cancelError}</p>}
-
-          <h3>Steps</h3>
+      )}
+      {cancelError && <p className="error">{cancelError}</p>}
+      {run.jobs.map((job) => (
+        <div key={job.id} style={{ marginTop: "1rem" }}>
+          <h4>
+            Lane {job.lane} {badge(job.status)} <span style={muted}>{duration(job.minutes * 60_000)}</span>
+          </h4>
+          {job.waitReason && <p style={muted}>{job.waitReason}</p>}
+          {job.error && <p className="error">{job.error}</p>}
           <table className="table">
             <thead>
               <tr>
-                <th>Step</th>
-                <th>Lane</th>
-                <th>Status</th>
-                <th>Exit</th>
-                <th>Time</th>
-                <th>Where it ran</th>
+                <th>Executor</th>
+                <th>Attempt</th>
+                <th>Why / where</th>
+                <th>Minutes</th>
               </tr>
             </thead>
             <tbody>
-              {run.steps.map((step) => (
-                <tr key={`${step.lane}/${step.name}`}>
-                  <td>{step.name}</td>
-                  <td style={muted}>{step.lane}</td>
-                  <td>
-                    {badge(step.status)}
-                    {step.error && <div style={muted}>{step.error}</div>}
-                  </td>
-                  <td>{step.exitCode ?? "—"}</td>
-                  <td>{duration(step.durationMs)}</td>
-                  <td style={muted}>{step.where ?? "—"}</td>
-                </tr>
+              {job.attempts.map((attempt, i) => (
+                <AttemptRow key={i} attempt={attempt} />
               ))}
             </tbody>
           </table>
-
-          {run.jobs.map((job) => (
-            <div key={job.id} style={{ marginTop: "1rem" }}>
-              <h3>
-                Lane {job.lane} {badge(job.status)}
-              </h3>
-              {job.waitReason && <p style={muted}>{job.waitReason}</p>}
-              {job.error && <p className="error">{job.error}</p>}
-              <table className="table">
-                <thead>
-                  <tr>
-                    <th>Executor</th>
-                    <th>Attempt</th>
-                    <th>Why / where</th>
-                    <th>Minutes</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {job.attempts.map((attempt, i) => (
-                    <AttemptRow key={i} attempt={attempt} />
-                  ))}
-                </tbody>
-              </table>
-              {job.artifacts.length > 0 && (
-                <p style={muted}>Artifacts: {job.artifacts.map((a) => `${a.name} (${a.sizeBytes} bytes)`).join(", ")}</p>
-              )}
-              {job.log && <div className="code">{job.log}</div>}
-            </div>
-          ))}
-        </>
-      )}
-    </div>
+          {job.artifacts.length > 0 && (
+            <p style={muted}>Artifacts: {job.artifacts.map((a) => `${a.name} (${a.sizeBytes} bytes)`).join(", ")}</p>
+          )}
+        </div>
+      ))}
+    </>
   );
 }
 
