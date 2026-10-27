@@ -24,21 +24,32 @@ any machines.
 | Live reload, Restart and Update | configuration.md "Live config reload" | `src/server/reload/`, `src/server/restart/` | Config changes apply without a restart; the owner restarts or updates Lair from the dashboard |
 | Settings | [settings-ui.md](settings-ui.md) | `src/server/settings/` | Every project setting from the dashboard: validated, history and restore, command and sensitive fields confirmed |
 | Dashboard | [architecture.md](../architecture.md) | `src/client/`, `src/server/dashboard/` | Eight sections, a detail view with a URL for every row, owner-only logs |
+| Needs you and notifications | configuration.md "Needs you", "Notifications" | `src/server/notifications/`, `src/server/decisions/` | One decision per owner hold; action items vs notices; Home "Needs you"; desktop and phone notifications |
+| No false holds | configuration.md "Fill", "Agents" | `src/server/agents/` | A wait on a gate still queued is not "too long"; transient provider errors are waited out, with a retry cap and failover first |
 
 ## Next, in order
 
-The order follows what lets a project run unattended soonest, and then what lets other developers adopt Lair. Each
-step lists what must exist first. One module per pull request, each with its own acceptance tests.
+Lair now runs its first project's development day to day, so Lair itself is the focus. The goal of version 1: **an
+engineer of any level describes an application (or points Lair at a repository), picks the AI tools and models they
+have, and Lair takes it from nothing to a running app**, with a dashboard that is clear to use. The order:
+
+1. **A: unattended operation and the experience of using Lair**: the supervisor, AI roles, the new look and Settings.
+2. **C1-C4: from an idea to a running app**: documents become work, documents first, a new project from scratch.
+3. **B: what other engineers need to adopt it**: install, onboarding, adapters, security, docs, releases.
+4. **The rest of C**: importer, nodes, deploy targets, learning loop, quality, launch kit, teams.
+
+Each step lists what must exist first. One module per pull request, each with its own acceptance tests.
 
 ### A. Unattended operation (now)
 
 | # | Step | Spec | Needs first | Acceptance (summary) |
 |---|---|---|---|---|
-| A1 | **Needs you and notifications**: one decision per owner hold; action items vs notices; a desktop and phone push (ntfy) | configuration.md (in review) | Decision Inbox | Every hold the owner must lift has exactly one decision, and answering it lifts the hold; a new action item notifies within a minute, batched |
-| A2 | **Reliability**: dashboard probes off the request path (async, cached); transient provider errors waited out instead of escalated; retention for results and logs in watched folders | [#38](https://github.com/behloleaqil1/lair/issues/38) | — | No synchronous command on a request; a 30-minute provider outage escalates nothing; a watched folder past its retention limit is archived |
-| A3 | **Supervisor S1–S2**: self-checks, the ops API, answers, the daily digest, proposals as decisions | [supervisor.md](supervisor.md) | A1, A2 | See supervisor.md |
+| A2 | **Reliability**: dashboard probes off the request path (async, cached); retention for results and logs in watched folders | [#38](https://github.com/behloleaqil1/lair/issues/38) | — | No synchronous command on a request; a 30-minute provider outage escalates nothing; a watched folder past its retention limit is archived |
+| A3 | **Supervisor S1–S2**: self-checks, the ops API, answers, the daily digest, proposals as decisions | [supervisor.md](supervisor.md) | A2 | See supervisor.md |
+| A6 | **AI roles**: any tool, any model, per role (build, review per tier, plan, supervise); sign-in status per machine; a write-only key store for API-key tools; reviewer calibration | [ai-roles.md](ai-roles.md) | — | See ai-roles.md |
+| A7 | **Look and feel, then Settings v2**: design tokens, light/dark, a component kit for every view (T1); Settings by task, with plain language, levels, search, templates and test buttons (S2-1 to S2-3) | [settings-v2.md](settings-v2.md) | T1 first; S2-1 needs A6 | See settings-v2.md |
 | A4 | **Supervisor S3**: an allowlist of acting fixes | [supervisor.md](supervisor.md) | A3 | See supervisor.md |
-| A5 | **Hands-off day** (end-to-end acceptance) | [autonomy.md §11](autonomy.md) | A1–A4 | A project runs a full day with no human input except Decision Inbox answers |
+| A5 | **Hands-off day** (end-to-end acceptance) | [autonomy.md §11](autonomy.md) | A2–A4 | A project runs a full day with no human input except Decision Inbox answers |
 
 ### B. A proper open-source project
 

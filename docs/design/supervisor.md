@@ -1,6 +1,6 @@
 # Supervisor: Lair's operator
 
-> Status: design. Phases S1–S4 below; nothing is built yet. Roadmap: [ROADMAP.md](ROADMAP.md).
+> Status: design. Phases S1–S4 below; nothing is built yet. Roadmap: [ROADMAP.md](ROADMAP.md). The supervisor runs on whatever AI tool and model `ai.roles.supervise` names ([ai-roles.md](ai-roles.md)).
 
 A developer running Lair should not need someone at a terminal to answer "why is this agent paused?", to notice that
 the server is slow or leaking file handles, or to work around an outage at night. Today the owner, or a coding

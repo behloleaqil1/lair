@@ -39,3 +39,5 @@
 4. Read `node.md` for the compiled daemon design, and `runners.md` for where gates run
 5. Read `quality.md` and `launch-kit.md` for quality and launch criteria
 - [supervisor.md](supervisor.md): the supervisor, Lair's operator: self-checks, answers, diagnoses and fixes within the autonomy the owner gives it
+- [ai-roles.md](ai-roles.md): any AI tool and model, per role; how Lair checks sign-in and keeps API keys
+- [settings-v2.md](settings-v2.md): Settings organised by task, and the look and feel of the whole dashboard
