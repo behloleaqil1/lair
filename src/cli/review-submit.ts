@@ -223,7 +223,8 @@ export async function reviewSubmit(args: string[], deps: SubmitDeps): Promise<nu
     body = {};
   }
   if (status >= 200 && status < 300 && body.success === true) {
-    const id = typeof body.data?.review?.id === "string" ? body.data.review.id : "?";
+    const review = body.data?.review;
+    const id = review && typeof review.id === "string" ? review.id : "?";
     const stale = body.data?.stale === true ? " (stale: the PR's head has moved since)" : "";
     say(deps.out, `Review ${id} recorded for PR #${request.pr} at ${request.head.slice(0, 7)}: ${request.verdict}${stale}`);
     return EXIT_OK;
