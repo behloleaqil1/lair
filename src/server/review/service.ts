@@ -11,6 +11,7 @@ import type { ProjectConfig } from "../../shared/types.js";
 import type {
   ClientInfo,
   FindingSeverity,
+  MergeRefusal,
   MergeResponse,
   PrReviewStatus,
   PrSummary,
@@ -39,7 +40,8 @@ import { GitHubHost, tokenFrom, type FetchLike, type TokenSource } from "./githu
 import type { GitHost, HostFile, HostPullRequest, HostRepo } from "./host.js";
 import { systemGit, type GitRunner } from "./git.js";
 import { LocalMerger, mergeOnHost, planMerge, type MergeExecution } from "./executor.js";
-import { ReviewStore, type AssignmentRecord, type StoredReview } from "./store.js";
+import { ReviewStore, type AssignmentRecord, type AutoMergeState, type StoredReview } from "./store.js";
+import { checkEnvironment, runPreMergeCheck, systemCheckRunner, type CheckRunner } from "./check.js";
 import { hostChecksGate, signedGate, type GateSource } from "./gate-source.js";
 import {
   eventBusAssigner,
@@ -122,8 +124,36 @@ export interface ReviewServiceOptions {
   reviewRun?: (chainId: string) => { active: boolean; agent: string; model: string | null } | null;
   /** `Authorization` header for https clones (local merges) */
   authHeader: () => Promise<string | null>;
-  /** Relative work dirs resolve against this */
+  /** Relative work dirs resolve against this; the pre-merge check runs here */
   cwd: string;
+  /** Runs merge.check_cmd (no shell) */
+  checks: CheckRunner;
+  /** merge.check_cmd's whole environment: Lair's minimal one, never the server's tokens */
+  checkEnv: Record<string, string>;
+}
+
+/** What an automatic merge (review.merge.auto) is recorded as initiated by. */
+export const AUTO_MERGE_ACTOR = "lair:policy";
+/** The automatic path evaluates at most this many PRs in full per scan (each costs several host API calls). */
+export const MAX_AUTO_EVALUATIONS = 10;
+/**
+ * A signed result triage hands over is kept only up to this size: its
+ * signature covers every byte, so it can't be cut (POST
+ * /api/review/gate-results takes bodies up to 1 MiB).
+ */
+export const MAX_TRIAGE_RESULT_BYTES = 8 * 1024 * 1024;
+
+/** The Decision Inbox key of an automatic merge's failure (or interruption) at one head: one per PR and head. */
+export function autoMergeDecisionKey(pr: number, headSha: string): string {
+  return `review:auto-merge:${pr}:${headSha}`;
+}
+
+/** What one automatic merge attempt did. */
+export interface AutoMergeOutcome {
+  pr: number;
+  headSha: string;
+  state: Exclude<AutoMergeState, "started" | "interrupted">;
+  reasons: string[];
 }
 
 /** Who asked for the missing reviews: the owner (the route), or the review module's own scan of open PRs. */
@@ -425,32 +455,38 @@ export class ReviewService {
     }
   }
 
+  /**
+   * With hold_when_default_red: whether the default branch's gate is red,
+   * and the hold that puts on this PR (null for a proven revert with an
+   * exempt label).
+   */
   private async defaultBranchRed(
     pr: HostPullRequest,
     defaultBranch: string | null,
     baseTip: string | null,
-  ): Promise<string | null> {
+  ): Promise<{ red: boolean; hold: string | null }> {
     const merge = this.settings.merge;
-    if (!merge.holdWhenDefaultRed || !defaultBranch) return null;
+    const green = { red: false, hold: null };
+    if (!merge.holdWhenDefaultRed || !defaultBranch) return green;
     let tip = pr.baseRef === defaultBranch ? baseTip : null;
     if (!tip) {
       try {
         tip = await this.o.host.branchHead(defaultBranch);
       } catch {
-        return null;
+        return green;
       }
     }
     const failed = (await this.gateSource.checksAt(tip)).filter((c) => c.status === "failed");
-    if (failed.length === 0) return null;
+    if (failed.length === 0) return green;
     const red = `the default branch ${defaultBranch} is red at ${short(tip)} (${failed.map((c) => c.name).join(", ")} failed)`;
 
     const exempt = merge.holdExemptLabels.map((l) => l.toLowerCase());
     const label = pr.labels.find((l) => exempt.includes(l.toLowerCase()));
-    if (exempt.length === 0) return `${red}: nothing merges until it is green`;
-    if (!label) return `${red}: only a revert labelled ${merge.holdExemptLabels.join(" or ")} may merge`;
+    if (exempt.length === 0) return { red: true, hold: `${red}: nothing merges until it is green` };
+    if (!label) return { red: true, hold: `${red}: only a revert labelled ${merge.holdExemptLabels.join(" or ")} may merge` };
     // A label is easy to add: the PR must also be a revert
     const notRevert = await this.notARevert(pr);
-    return notRevert ? `${red}: the ${label} label doesn't apply, ${notRevert}` : null;
+    return { red: true, hold: notRevert ? `${red}: the ${label} label doesn't apply, ${notRevert}` : null };
   }
 
   /**
@@ -467,6 +503,15 @@ export class ReviewService {
 
   /** Evaluate a PR: everything the merge policy looks at, and its verdict. */
   async status(n: number): Promise<PrReviewStatus> {
+    return (await this.evaluate(n)).status;
+  }
+
+  /**
+   * status(), plus what only the automatic path reads: whether the default
+   * branch is red (also when a proven revert is exempt from its hold), and
+   * the red tier's slots as the reviews at the head fill them.
+   */
+  private async evaluate(n: number): Promise<{ status: PrReviewStatus; defaultBranchRed: boolean; redSlots: SlotStatus[] }> {
     const host = this.o.host;
     const pr = await host.getPullRequest(n);
     await this.noteHead(pr);
@@ -495,21 +540,18 @@ export class ReviewService {
     const findings = reviews.flatMap((r) => r.findings);
     const openBlocking = findings.filter((f) => f.status === "open" && f.blocking && !f.superseded);
     const current = reviews.filter((r) => !r.stale && !r.superseded && r.reviewer.kind !== "check");
-    const slots = matchSlots(
-      this.settings.reviewers[risk.tier],
-      reviews
-        .filter((r) => r.reviewer.kind !== "check")
-        .map((r) => ({
-          id: r.id,
-          reviewer: r.reviewer,
-          verdict: r.verdict,
-          headSha: r.headSha,
-          superseded: r.superseded,
-        })),
-      author,
-      pr.headSha,
-      others,
-    );
+    const candidates = reviews
+      .filter((r) => r.reviewer.kind !== "check")
+      .map((r) => ({
+        id: r.id,
+        reviewer: r.reviewer,
+        verdict: r.verdict,
+        headSha: r.headSha,
+        superseded: r.superseded,
+      }));
+    const slots = matchSlots(this.settings.reviewers[risk.tier], candidates, author, pr.headSha, others);
+    const redSlots =
+      risk.tier === "red" ? slots : matchSlots(this.settings.reviewers.red, candidates, author, pr.headSha, others);
 
     const gate = await this.gateSource.checksAt(pr.headSha);
     let baseTip: string | null = null;
@@ -539,7 +581,7 @@ export class ReviewService {
       verdictsAtHead: current.map((r) => ({ reviewer: r.reviewer, verdict: r.verdict })),
       openBlocking,
       holds,
-      defaultBranchRed: red,
+      defaultBranchRed: red.hold,
     });
 
     const plan = planMerge(this.settings.merge);
@@ -584,7 +626,7 @@ export class ReviewService {
       reasons,
       evaluatedAt: status.evaluatedAt,
     });
-    return status;
+    return { status, defaultBranchRed: red.red, redSlots };
   }
 
   /** Open PRs, with the verdict of their last evaluation at the current head. */
@@ -863,11 +905,37 @@ export class ReviewService {
     return this.o.store.listMerges(this.project);
   }
 
-  addGateResult(signed: SignedGateResult): void {
+  /**
+   * Store a signed gate result (POST /api/review/gate-results). Nothing is
+   * trusted here: the gate verifies every stored result each time it is
+   * read (its node's key in node_keys, the signature, this project, the
+   * pipeline version, the commit). True when it was new or changed.
+   */
+  addGateResult(signed: SignedGateResult): boolean {
     if (this.settings.merge.gate.source !== "signed") {
       throw new ReviewError("This project's gate is read from the git host's checks (review.merge.gate.source)", 409);
     }
-    this.o.store.addGateResult(this.project, signed, this.now());
+    return this.o.store.addGateResult(this.project, signed, this.now());
+  }
+
+  /**
+   * A signed result triage accepted for this project, handed over in-process
+   * (review.merge.gate.from_triage). Stored as addGateResult() stores one,
+   * so the gate checks it exactly as it checks one posted to review: triage
+   * having trusted its node proves nothing to the review side. The same
+   * result again is a no-op.
+   */
+  acceptTriageResult(signed: SignedGateResult): { stored: boolean; detail: string } {
+    const gate = this.settings.merge.gate;
+    if (gate.source !== "signed" || !gate.fromTriage) {
+      return { stored: false, detail: "review.merge.gate.from_triage is off" };
+    }
+    const bytes = Buffer.byteLength(JSON.stringify(signed));
+    if (bytes > MAX_TRIAGE_RESULT_BYTES) {
+      return { stored: false, detail: `the result is ${bytes} bytes, more than review keeps (${MAX_TRIAGE_RESULT_BYTES})` };
+    }
+    const stored = this.o.store.addGateResult(this.project, signed, this.now());
+    return { stored, detail: stored ? "stored" : "already stored" };
   }
 
   /**
@@ -913,6 +981,164 @@ export class ReviewService {
       }
     }
     return asked;
+  }
+
+  /** "<pr>:<head>" of the automatic merge running in this process, if one is */
+  private autoMergeInFlight: string | null = null;
+
+  /**
+   * The automatic path (review.merge.auto), from the periodic scan of open
+   * PRs: merge at most one PR whose status allows it at its current head,
+   * through merge() exactly as the owner's route does (that head bound,
+   * check_cmd included), recorded as AUTO_MERGE_ACTOR. Nothing starts within
+   * auto_min_interval_seconds of the project's last automatic merge.
+   *
+   * Each attempt is written to the store before it starts. One still there
+   * from before a restart is reported once and never run again blindly; a
+   * failed one raises one decision and is not tried again at that head
+   * (merge it from its page, or push a new head). With hold_when_default_red,
+   * a red-tier PR, or any PR while the default branch is red, merges
+   * automatically only with every red-tier slot filled at the head.
+   */
+  async autoMerge(): Promise<AutoMergeOutcome | null> {
+    const merge = this.settings.merge;
+    if (!merge.auto || this.readOnly || this.closing || this.merging || this.autoMergeInFlight) return null;
+    await this.reportInterruptedAutoMerges();
+    const last = this.o.store.lastAutoMergeStart(this.project);
+    if (last !== null && this.o.clock.now() - last < merge.autoMinIntervalSeconds * 1000) return null;
+
+    const pulls = (await this.o.host.listOpenPullRequests()).filter((p) => !p.draft).sort((a, b) => a.number - b.number);
+    let evaluated = 0;
+    for (const pr of pulls) {
+      if (this.closing || this.merging) return null;
+      const tried = this.o.store.getAutoMerge(this.project, pr.number, pr.headSha);
+      if (tried && tried.state !== "skipped") continue;
+      // The gate first: signed results come from the store, so a PR waiting for its gate costs no host calls
+      const gate = await this.gateSource.checksAt(pr.headSha);
+      if (gate.length === 0 || gate.some((g) => g.status !== "passed")) continue;
+      if (evaluated >= MAX_AUTO_EVALUATIONS) break;
+      evaluated++;
+      const { status, defaultBranchRed, redSlots } = await this.evaluate(pr.number);
+      if (!status.canMerge || status.headSha !== pr.headSha) continue;
+      const held = this.autoMergeHeld(status, defaultBranchRed, redSlots);
+      if (held) continue;
+      // At most one per scan
+      return this.attemptAutoMerge(status);
+    }
+    return null;
+  }
+
+  /**
+   * Why the automatic path leaves a PR the policy allows to the owner, or
+   * null. With hold_when_default_red, a red-tier PR, or any PR while the
+   * default branch is red (a proven revert the hold exempts), needs every
+   * slot of the red tier filled at the head.
+   */
+  private autoMergeHeld(status: PrReviewStatus, defaultBranchRed: boolean, redSlots: SlotStatus[]): string | null {
+    if (!this.settings.merge.holdWhenDefaultRed) return null;
+    if (status.risk.tier !== "red" && !defaultBranchRed) return null;
+    const missing = redSlots.filter((s) => s.satisfiedBy === null);
+    if (missing.length === 0) return null;
+    return `${status.risk.tier === "red" ? "a red-tier PR" : "the default branch is red"}: the red tier's reviews are missing (${missing
+      .map((s) => s.label)
+      .join("; ")})`;
+  }
+
+  private async attemptAutoMerge(status: PrReviewStatus): Promise<AutoMergeOutcome> {
+    const n = status.number;
+    const head = status.headSha;
+    const outcome = (state: AutoMergeOutcome["state"], reasons: string[]): AutoMergeOutcome => {
+      this.o.store.finishAutoMerge(this.project, n, head, state, reasons, this.o.clock.now());
+      return { pr: n, headSha: head, state, reasons };
+    };
+    this.autoMergeInFlight = `${n}:${head}`;
+    try {
+      // Written before anything runs, so a restart finds it
+      if (!this.o.store.startAutoMerge(this.project, n, head, this.o.clock.now())) {
+        return { pr: n, headSha: head, state: "skipped", reasons: ["an automatic merge at this head already ran"] };
+      }
+      let result: MergeResponse;
+      try {
+        result = await this.merge(n, { confirm: true, headSha: head, by: AUTO_MERGE_ACTOR, client: null });
+      } catch (e) {
+        const reason = e instanceof Error ? e.message : String(e);
+        // Another merge running, or a config reload: nothing was tried
+        if (e instanceof ReviewError && (e.statusCode === 409 || e.statusCode === 503)) return outcome("skipped", [reason]);
+        await this.raiseAutoMergeFailure(status, [reason]);
+        return outcome("failed", [reason]);
+      }
+      if (result.merged) return outcome("merged", []);
+      // The head moved, or the policy changed, since the evaluation: the next scan looks again
+      if (result.refusedBy === "head" || result.refusedBy === "policy") return outcome("skipped", result.reasons);
+      // An email refusal raised its own security decision in merge()
+      if (result.refusedBy !== "emails") await this.raiseAutoMergeFailure(status, result.reasons);
+      return outcome("failed", result.reasons);
+    } finally {
+      this.autoMergeInFlight = null;
+    }
+  }
+
+  /** Automatic merges still `started` while none runs here: a restart interrupted them. Each is reported once. */
+  private async reportInterruptedAutoMerges(): Promise<void> {
+    for (const attempt of this.o.store.autoMergesInState(this.project, "started")) {
+      if (this.autoMergeInFlight === `${attempt.pr}:${attempt.headSha}`) continue;
+      const why = "Lair stopped while it ran (a restart or a crash): it is not tried again at this head";
+      this.o.store.finishAutoMerge(this.project, attempt.pr, attempt.headSha, "interrupted", [why], this.o.clock.now());
+      try {
+        await this.o.decisions.raise({
+          project: this.project,
+          question: `Automatic merge of PR #${attempt.pr} at ${short(attempt.headSha)} was interrupted`,
+          context: [
+            `An automatic merge (review.merge.auto) of PR #${attempt.pr} at ${attempt.headSha} started, and Lair stopped before it ended.`,
+            "",
+            "It may or may not have landed. Lair does not run it again at this head: check the target branch's history,",
+            "and merge the PR from its page in PRs if it is still open.",
+          ].join("\n"),
+          options: ["Check the target branch", "Leave it"],
+          recommended: "Check the target branch",
+          why: "A merge that a restart cut short is never repeated blindly.",
+          kind: "other",
+          reversible: true,
+          requestedBy: "review",
+          links: [],
+          key: autoMergeDecisionKey(attempt.pr, attempt.headSha),
+        });
+      } catch (e) {
+        console.warn(`[review] ${this.project} #${attempt.pr}: could not report an interrupted automatic merge: ${e instanceof Error ? e.message : e}`);
+      }
+    }
+  }
+
+  /** One decision per PR and head for an automatic merge that was refused or failed. */
+  private async raiseAutoMergeFailure(status: PrReviewStatus, reasons: string[]): Promise<void> {
+    const n = status.number;
+    try {
+      await this.o.decisions.raise({
+        project: this.project,
+        question: `Automatic merge of PR #${n} failed at ${short(status.headSha)}`,
+        context: [
+          `**${asContextText(status.title, 200)}**`,
+          "",
+          `The policy allowed PR #${n} at ${status.headSha}, and the automatic merge (review.merge.auto) was refused:`,
+          "",
+          "```text",
+          asContextText(reasons.join("\n"), 2000),
+          "```",
+          "",
+          "Lair does not try again at this head. Merge it from its page in PRs once the cause is fixed, or push a new head.",
+        ].join("\n"),
+        options: ["Merge it from the PR's page", "Leave it unmerged"],
+        recommended: "Merge it from the PR's page",
+        why: "An automatic merge that failed is not retried at the same head.",
+        kind: "other",
+        reversible: true,
+        requestedBy: "review",
+        links: status.url ? [{ label: `PR #${n}`, url: status.url }] : [],
+        key: autoMergeDecisionKey(n, status.headSha),
+      });
+    } catch (e) {
+      console.warn(`[review] ${this.project} #${n}: could not raise the automatic merge's failure: ${e instanceof Error ? e.message : e}`);
+    }
   }
 
   private async requestNow(n: number, origin: RequestOrigin): Promise<RequestOutcome[]> {
@@ -1052,14 +1278,16 @@ export class ReviewService {
     return outcomes;
   }
 
-  private refuse(n: number, headSha: string, reasons: string[]): MergeResponse {
-    this.emit("review.merge_refused", { pr: n, headSha, reasons });
-    return { merged: false, record: null, reasons };
+  private refuse(n: number, headSha: string, reasons: string[], refusedBy: MergeRefusal, by: string): MergeResponse {
+    this.emit("review.merge_refused", { pr: n, headSha, reasons, refusedBy, by });
+    return { merged: false, record: null, reasons, refusedBy };
   }
 
   /**
-   * Merge, if the policy allows it at the head the caller confirmed. Every
-   * refusal lists the conditions that failed.
+   * Merge, if the policy allows it at the head the caller confirmed, and
+   * merge.check_cmd (when set) passes at that head. Every refusal lists the
+   * conditions that failed. The owner's route and the automatic path
+   * (autoMerge) both merge only through here.
    */
   async merge(
     n: number,
@@ -1073,13 +1301,31 @@ export class ReviewService {
     try {
       const status = await this.status(n);
       if (status.headSha !== request.headSha) {
-        return this.refuse(n, status.headSha, [
-          `The head is now ${short(status.headSha)}, not ${short(request.headSha)} as confirmed: check the new head first`,
-        ]);
+        return this.refuse(
+          n,
+          status.headSha,
+          [`The head is now ${short(status.headSha)}, not ${short(request.headSha)} as confirmed: check the new head first`],
+          "head",
+          request.by,
+        );
       }
-      if (!status.canMerge) return this.refuse(n, status.headSha, status.reasons);
+      if (!status.canMerge) return this.refuse(n, status.headSha, status.reasons, "policy", request.by);
 
       const merge = this.settings.merge;
+      if (merge.checkCmd) {
+        // The project's own check, at the head the policy allowed; the executor still binds that head
+        const refusal = await runPreMergeCheck(
+          {
+            runner: this.o.checks,
+            template: merge.checkCmd,
+            cwd: this.o.cwd,
+            env: this.o.checkEnv,
+            timeoutSeconds: merge.checkTimeoutSeconds,
+          },
+          { pr: n, head: status.headSha, base: status.baseRef, repo: this.settings.repo },
+        );
+        if (refusal) return this.refuse(n, status.headSha, [refusal], "check", request.by);
+      }
       const plan = status.plan;
       const approvers = status.slots.flatMap((s) => (s.satisfiedBy ? [s.satisfiedBy.reviewer.id] : []));
       const title = `${status.title} (#${n})`;
@@ -1155,7 +1401,13 @@ export class ReviewService {
             // The refusal stands whether or not the inbox took it
           }
         }
-        return this.refuse(n, status.headSha, execution.reasons);
+        return this.refuse(
+          n,
+          status.headSha,
+          execution.reasons,
+          execution.emailViolations.length > 0 ? "emails" : "executor",
+          request.by,
+        );
       }
 
       const record = this.o.store.recordMerge({
@@ -1178,6 +1430,7 @@ export class ReviewService {
         method: plan.method,
         strategy: plan.strategy,
         tier: status.risk.tier,
+        by: request.by,
       });
       return { merged: true, record, reasons: [] };
     } finally {
@@ -1236,11 +1489,17 @@ export interface ReviewManagerOptions {
   serverUrl?: string;
   /** How often reviews by agents are followed, in ms (0: only through agentReviews.check()). Default 15 s */
   agentCheckMs?: number;
-  /** How often open PRs are scanned for missing reviews by agents, in ms (0: only through requestOpenPullRequests()). Default 60 s */
+  /**
+   * How often open PRs are scanned for missing reviews by agents and for
+   * automatic merges (review.merge.auto), in ms (0: only through
+   * requestOpenPullRequests()). Default 60 s
+   */
   autoRequestMs?: number;
+  /** Runs review.merge.check_cmd (default: spawn, no shell); tests pass a fake spawner */
+  checks?: CheckRunner;
 }
 
-/** How often open PRs are scanned for missing reviews by agents, by default */
+/** How often open PRs are scanned for missing reviews by agents and automatic merges, by default */
 export const AUTO_REQUEST_INTERVAL_MS = 60_000;
 
 export class ReviewManager {
@@ -1304,23 +1563,49 @@ export class ReviewManager {
 
   /**
    * The automatic path: every project with reviews by agents requests the
-   * missing reviews of its open PRs (ReviewService.requestOpenPullRequests).
-   * Concurrent calls share the scan in progress; it never rejects.
+   * missing reviews of its open PRs (ReviewService.requestOpenPullRequests),
+   * and every project with review.merge.auto merges at most one PR its
+   * policy allows (ReviewService.autoMerge). Concurrent calls share the scan
+   * in progress; it never rejects.
    */
   requestOpenPullRequests(): Promise<void> {
     this.scanning ??= (async () => {
       for (const [project, service] of [...this.services.entries()]) {
-        if (!this.agentAssigner?.handles(project)) continue;
-        try {
-          await service.requestOpenPullRequests();
-        } catch (e) {
-          console.warn(`[review] ${project}: scanning open PRs failed: ${e instanceof Error ? e.message : e}`);
+        if (this.agentAssigner?.handles(project)) {
+          try {
+            await service.requestOpenPullRequests();
+          } catch (e) {
+            console.warn(`[review] ${project}: scanning open PRs failed: ${e instanceof Error ? e.message : e}`);
+          }
+        }
+        if (service.settings.merge.auto) {
+          try {
+            await service.autoMerge();
+          } catch (e) {
+            console.warn(`[review] ${project}: the automatic merge scan failed: ${e instanceof Error ? e.message : e}`);
+          }
         }
       }
     })().finally(() => {
       this.scanning = null;
     });
     return this.scanning;
+  }
+
+  /**
+   * A signed result triage accepted for `project` (src/server/triage/, its
+   * `review` option): kept for the project's gate when
+   * review.merge.gate.from_triage is on, and verified there as any signed
+   * result is. In-process only; never throws.
+   */
+  acceptSignedResult(project: string, signed: SignedGateResult): { stored: boolean; detail: string } {
+    const service = this.services.get(project);
+    if (!service) return { stored: false, detail: `reviews are off for ${project}` };
+    try {
+      return service.acceptTriageResult(signed);
+    } catch (e) {
+      return { stored: false, detail: e instanceof Error ? e.message : String(e) };
+    }
   }
 
   private startScanning(): void {
@@ -1402,6 +1687,9 @@ export class ReviewManager {
             return t ? `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${t}`).toString("base64")}` : null;
           },
           cwd: this.options.cwd ?? process.cwd(),
+          checks: this.options.checks ?? systemCheckRunner(),
+          // Never the server's environment: the token above stays out of the check's reach
+          checkEnv: checkEnvironment(this.options.env ?? process.env),
         }),
       );
       // A project loaded after the inbox was connected (a reload) follows its holds' decisions too
@@ -1410,7 +1698,7 @@ export class ReviewManager {
     }
     const every = this.options.agentCheckMs ?? CHECK_INTERVAL_MS;
     if (this.agentAssigner && every > 0) this.agentAssigner.start(every);
-    if (this.agentAssigner) this.startScanning();
+    if (this.agentAssigner || [...this.services.values()].some((s) => s.settings.merge.auto)) this.startScanning();
   }
 
   get(project: string): ReviewService | undefined {

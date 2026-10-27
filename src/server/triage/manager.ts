@@ -6,6 +6,7 @@ import { readFileSync, realpathSync } from "fs";
 import { isAbsolute, relative, resolve, sep } from "path";
 import type { EventBus } from "../core/event-bus.js";
 import type { ProjectConfig } from "../../shared/types.js";
+import type { GateResult, SignedGateResult } from "../../shared/policy-types.js";
 import type { TriageClass, TriageProjectStatus } from "../../shared/triage-types.js";
 import { TRIAGE_CLASSES } from "../../shared/triage-types.js";
 import type { DecisionProducer } from "../decisions/types.js";
@@ -40,6 +41,18 @@ export interface TriageManagerOptions {
   adapters?: (project: string) => Partial<TriageAdapters>;
   /** Evidence parsers (default: the built-in ones) */
   parsers?: EvidenceParser[];
+  /**
+   * The review module (ReviewManager), in-process: every signed result
+   * triage accepts is handed to it, which keeps it for the project's merge
+   * gate when review.merge.gate.from_triage is on (and verifies it again
+   * there). A result triage refuses never reaches it.
+   */
+  review?: SignedResultSink;
+}
+
+/** Takes the signed results triage accepted (src/server/review/ ReviewManager.acceptSignedResult). */
+export interface SignedResultSink {
+  acceptSignedResult(project: string, signed: SignedGateResult): { stored: boolean; detail: string };
 }
 
 /** Whether `file` (a real path) is inside `dir`, symlinks resolved. */
@@ -242,9 +255,30 @@ export class TriageManager {
     for (const service of this.services.values()) service.useDecisions(inbox);
   }
 
-  /** Throws (403) unless a node the project trusts signed this result. */
-  verify(project: string, signed: SignedInput): void {
-    this.require(project).verifySigned(signed);
+  /** Throws (403) unless a node the project trusts signed this result; returns that node's key. */
+  verify(project: string, signed: SignedInput): string {
+    return this.require(project).verifySigned(signed);
+  }
+
+  /**
+   * Hand a signed result triage verified (with `trustedKey`, the key that
+   * verified it) and accepted to the review module, if one is wired. The
+   * result goes exactly as it was signed. Never throws: a review that can't
+   * take it doesn't change triage's answer.
+   */
+  forwardSigned(project: string, signed: SignedInput, trustedKey: string): void {
+    const review = this.options.review;
+    if (!review) return;
+    const result: SignedGateResult = {
+      result: signed.result as unknown as GateResult,
+      signature: signed.signature,
+      nodePublicKey: trustedKey,
+    };
+    try {
+      review.acceptSignedResult(project, result);
+    } catch (e) {
+      console.warn(`[triage] ${project}: could not hand a signed result to review: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   get(project: string): TriageService | undefined {

@@ -4,14 +4,16 @@
  * - checks: the git host's check runs for that commit, by name, made by an
  *   allow-listed app (GitHub Actions by default), plus commit statuses only
  *   from allow-listed accounts;
- * - signed: gate results signed by a Lair node and posted to Lair, verified
- *   with the node keys and pipeline versions in the config (the policy
- *   engine's own verification, src/server/policy/policy-evaluator.ts).
+ * - signed: gate results signed by a Lair node and posted to Lair (or
+ *   handed over by triage, with from_triage), verified with the node keys
+ *   and pipeline versions in the config (the policy engine's own
+ *   verification, src/server/policy/policy-evaluator.ts). A required entry
+ *   is a pipeline, or a group {anyOf} that any one of its pipelines fills.
  */
 import type { GateCheck } from "../../shared/review-types.js";
 import type { PolicyConfig, PullRequest } from "../../shared/policy-types.js";
 import { verifyGateResults } from "../policy/policy-evaluator.js";
-import type { GateSettings, RequiredCheck } from "./config.js";
+import { requirementName, type GateSettings, type RequiredCheck } from "./config.js";
 import type { GitHost, HostCheck } from "./host.js";
 import type { ReviewStore } from "./store.js";
 
@@ -75,6 +77,25 @@ export function hostChecksGate(host: GitHost, required: RequiredCheck[], statusC
   };
 }
 
+/**
+ * A group's result from its pipelines' results: passed when any one passed
+ * (its newest trustworthy result at the head is a pass), else failed when one
+ * failed or can't be trusted, else missing. The detail names every pipeline.
+ */
+export function groupVerdict(name: string, sha: string, members: GateCheck[]): GateCheck {
+  const passed = members.find((m) => m.status === "passed");
+  if (passed) return { name, status: "passed", sha, detail: `${passed.name}: ${passed.detail}`, url: passed.url };
+  const failed = members.some((m) => m.status === "failed");
+  const status: GateCheck["status"] = failed ? "failed" : members.some((m) => m.status === "pending") ? "pending" : "missing";
+  const detail =
+    status === "missing"
+      ? "no signed result at this commit for any of them"
+      : `none passed: ${members
+          .map((m) => `${m.name} ${m.status}${m.status === "failed" && m.detail ? ` (${m.detail.slice(0, 300)})` : ""}`)
+          .join("; ")}`;
+  return { name, status, sha, detail, url: null };
+}
+
 export function signedGate(
   store: ReviewStore,
   project: string,
@@ -85,7 +106,7 @@ export function signedGate(
   return {
     async checksAt(sha) {
       const results = store.gateResults(project, sha);
-      return settings.required.map((gate): GateCheck => {
+      const verdict = (gate: string): GateCheck => {
         const pr: PullRequest = {
           id: `${project}@${sha}`,
           number: 0,
@@ -116,7 +137,12 @@ export function signedGate(
           return { name: gate, status: "missing", sha, detail: "no signed result at this commit", url: null };
         }
         return { name: gate, status: "failed", sha, detail: violations.map((v) => v.message).join("; "), url: null };
-      });
+      };
+      return settings.required.map((requirement) =>
+        typeof requirement === "string"
+          ? verdict(requirement)
+          : groupVerdict(requirementName(requirement), sha, requirement.anyOf.map(verdict)),
+      );
     },
   };
 }

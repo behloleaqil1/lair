@@ -946,11 +946,14 @@ A merge happens only when all of these hold, and a refusal lists each one that d
 - the host reports the branch mergeable and, with `require_up_to_date`, it contains the target branch's tip;
 - no hold applies: a hold added through the API, or, with `hold_when_default_red`, a failed required gate on the default branch's tip. While it is red nothing merges, unless `hold_exempt_labels` is set (it is empty by default) and the PR carries one of those labels **and** is a plain revert: its title starts with `Revert "` and every commit says `This reverts commit <sha>`. A label alone is easy to add, so it is never enough.
 
-The merge request must confirm (`confirm: true`) and name the head sha it was shown; if the head moved since, it is refused.
+The merge request must confirm (`confirm: true`) and name the head sha it was shown; if the head moved since, it is refused. When all of the above hold, `merge.check_cmd` runs (if set, [below](#pre-merge-check)), and only then the merge method. A refusal says what refused it (`refusedBy`: `head`, `policy`, `check`, `emails` or `executor`).
 
 `merge.gate.source: checks` reads the host's check runs at the head. Each `required` entry is `{name, app}` (or just the name, meaning `app: github-actions`), and only a check run by that name **created by that app** (its slug or numeric id) counts. Commit statuses count only when posted by an account in `status_creators` (empty by default). This matters because anyone whose token can write statuses, or who can install an app, can post a "success" under any name; results from other apps and accounts are ignored, and the status says how many were. The red default branch hold reads the same source.
 
-`merge.gate.source: signed` reads gate results that a Lair node signed and posted to `POST /api/review/gate-results`, verified with `node_keys` (node id to public key) and `pipeline_versions` (pipeline id to version); a result's `projectId` must be the Lair project name. A result can't be forged without a node's key, so prefer `signed` for projects with red-tier code (money, auth, migrations), where a forged check is most costly.
+`merge.gate.source: signed` reads gate results that a Lair node signed and posted to `POST /api/review/gate-results`, verified with `node_keys` (node id to public key) and `pipeline_versions` (pipeline id to version); a result's `projectId` must be the Lair project name. A result can't be forged without a node's key, so prefer `signed` for projects with red-tier code (money, auth, migrations), where a forged check is most costly. Every stored result is verified each time the gate is read: its node is in `node_keys` and its `nodePublicKey` is that key, the signature, the project, the pipeline version, a real run, and its commit is the PR's head. For each pipeline the newest result that passes those checks decides, so an older pass can't hide a newer failure. The same result delivered again changes nothing.
+
+- **All of, or any of.** Each plain entry of `required` must pass. An entry `{any_of: [pipeline ids]}` is a group, which passes when any one of its pipelines passes at the head. The status and the refusal name the group, as `any of (backend, docs)`, and say what each of its pipelines showed. Use a group when one gate queue runs one of several tracks per change (a backend track or a docs-only track) and any one of them is enough. A group is for `source: signed` only.
+- **From triage.** With `from_triage: true`, the signed results that [triage](#triage) accepts for the project (`POST /api/triage/results`, as `lair-node gate-result submit` sends them) are handed to the merge gate in-process, as if they had been posted here. A result triage refuses (a bad signature, a node not in `triage.trusted_nodes`, another project) never reaches it, and triage's trust proves nothing here: the gate checks the result with its own `node_keys` and `pipeline_versions`, as above. So a node needs to be in both: its public key file in `triage.trusted_nodes`, and the same PEM text in `node_keys` (a YAML block scalar, `|`, keeps its line breaks). Results larger than 8 MiB are not kept for the gate. It is off by default.
 
 ### Merge method
 
@@ -967,7 +970,8 @@ Before anything is published, Lair checks every commit that would land on the ta
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `merge.gate` | object | required | `{source: checks, required: [{name, app}], status_creators}` or `{source: signed, required: [pipeline ids], node_keys, pipeline_versions}` |
+| `merge.gate` | object | required | `{source: checks, required: [{name, app}], status_creators}` or `{source: signed, required: [pipeline ids or {any_of: [pipeline ids]}], node_keys, pipeline_versions, from_triage}` |
+| `merge.gate.from_triage` | boolean | `false` | `source: signed` only: also take the signed results triage accepted for the project |
 | `merge.require_up_to_date` | boolean | `true` | The PR must contain the target branch's tip |
 | `merge.method` | `auto` \| `host` \| `local` | `auto` | See above |
 | `merge.host_method` | `squash` \| `merge` \| `rebase` | `squash` | The host merge's method |
@@ -979,8 +983,72 @@ Before anything is published, Lair checks every commit that would land on the ta
 | `merge.work_dir` | string | `data/review` | Where temporary clones go |
 | `merge.hold_when_default_red` | boolean | `true` | Hold merges while the default branch's gate is red |
 | `merge.hold_exempt_labels` | array | `[]` | Labels that let a proven revert merge while it is red |
+| `merge.check_cmd` | array | — | An argv run before each merge is executed, with `{pr}`, `{head}`, `{base}` and `{repo}` ([below](#pre-merge-check)); non-zero refuses the merge |
+| `merge.check_timeout_seconds` | number | `300` | `check_cmd` is stopped after this, and the merge refused (1 to 3600) |
+| `merge.auto` | boolean | `false` | Merge every PR the policy allows, from the periodic scan of open PRs ([below](#automatic-merge)) |
+| `merge.auto_min_interval_seconds` | number | `120` | The least time between two automatic merges of the project (0 to 86400) |
 
 Other keys: `provider` (`github`), `api_url` (default `https://api.github.com`), `token_env` (default `GITHUB_TOKEN`), `token_cmd` (an argv printing the token, used when `token_env` is unset), `default_branch`, `authors.models` (agent id to model). Unknown keys are config errors; a project with an invalid `review:` block has reviews off, and `GET /api/review/status` shows the errors.
+
+### Pre-merge check
+
+`merge.check_cmd` is your own check of a merge that only your project knows how to make: for example, that the PR's database migrations still come after the ones the target branch got since. It runs for every merge, the owner's and the automatic ones, after every policy condition holds and before the merge method publishes anything.
+
+```yaml
+merge:
+  check_cmd: ["/opt/checks/migration-order", "--pr", "{pr}", "--head={head}", "--base={base}"]
+  check_timeout_seconds: 300
+```
+
+- **Placeholders.** `{pr}` is the PR number, `{head}` the full head sha the policy allowed, `{base}` the target branch, `{repo}` the `owner/name` it merges into. Each value is checked for its shape (a number, a full sha, a branch name, `owner/name`) and none may start with `-`, so no value becomes an option; one that fails refuses the merge without running anything. Any other `{name}` is a config error, and so is a placeholder as the program (`check_cmd[0]`).
+- **How it runs.** An argv, never through a shell, from Lair's working directory, with only `PATH`, `HOME`, `USER`, `LANG`, `TMPDIR`, `TERM` and `SHELL` from Lair's environment: never the host token or any other variable. Keep the program where agents can't write (not in a repository they work in).
+- **Its answer.** Exit 0 lets the merge go on. Anything else refuses it, and so does a timeout (the command and what it started are killed): the reason is `Pre-merge check: check_cmd exited <code>` with its first five output lines, stdout first, each made plain (no control characters) and cut to 200 characters. At most 64 KiB of each stream is read.
+- The merge method still binds the head: if the PR moves while the check runs, the merge is refused.
+
+### Automatic merge
+
+With `merge.auto: true`, the review module's periodic scan of open PRs (every 60 seconds) merges a PR the policy allows. It merges through the same path as the owner's Merge button, at the head it evaluated: the head bound, every policy condition and `check_cmd` again. The merge is recorded as initiated by `lair:policy`, a name the owner's route refuses.
+
+- **One at a time.** At most one automatic merge per project per scan, oldest PR first, and none within `auto_min_interval_seconds` (default 120) of the project's last one, so a gate re-run or a reviewer has time to see the new target branch. The scan reads a PR's gate before anything else, and evaluates at most 10 PRs in full per scan.
+- **Red.** With `hold_when_default_red` (the default), a red-tier PR, or any PR while the default branch is red (a proven revert with an exempt label), merges automatically only when every slot of the **red** tier (`reviewers.red`) is filled at its head. The owner can still merge it from its page.
+- **A failure.** A refused or failed automatic merge (the check, the email allow-list, the clone or the push) is recorded and raises **one** decision per PR and head (an email refusal's own `security` decision stands for it), and is not tried again at that head: fix the cause and merge from the PR's page, or push a new head. A head that moved, or a policy that changed, between the evaluation and the merge is no failure: the next scan looks again.
+- **Restarts.** Each automatic merge is written to the store before it starts. One still there after a restart (Lair stopped while it ran) is never run again: it raises one decision to check the target branch, and only a new head of that PR merges automatically. A restart from the dashboard waits for a merge in progress.
+- **Read-only.** A project with `read_only: true` never merges, automatically or not.
+
+Start with `auto: false`, and compare the PRs shown as "Merge ready" with what you would merge, before you turn it on.
+
+### Gates from an external queue through triage
+
+A project whose gates run in its own queue (not Lair pipelines) sends each finished gate to triage with `lair-node gate-result submit` ([Results from an existing gate system](#results-from-an-existing-gate-system)). To let those results also decide merges, trust the node in both places, turn on `from_triage`, give each pipeline its version, and require what a change needs:
+
+```yaml
+triage:
+  enabled: true
+  trusted_nodes:
+    - id: ci-gates
+      public_key_file: ./data/keys/ci-gates.pub        # not in the project's repository
+review:
+  enabled: true
+  merge:
+    gate:
+      source: signed
+      from_triage: true
+      # backend changes run the backend track, docs-only changes the docs track: either is enough
+      required: [{ any_of: [backend, docs] }]
+      node_keys:
+        ci-gates: |                                     # the same PEM as ./data/keys/ci-gates.pub
+          -----BEGIN PUBLIC KEY-----
+          ...
+          -----END PUBLIC KEY-----
+      pipeline_versions: { backend: "1", docs: "1" }    # what the runner sends as --pipeline-version
+    method: local
+    local_strategy: ff-only
+    require_up_to_date: true
+    check_cmd: ["/opt/checks/migration-order", "--pr", "{pr}", "--head={head}"]
+    auto: false                                         # true once its "Merge ready" verdicts match yours
+```
+
+The runner sends `--pipeline <id>` and `--pipeline-version <version>` with each result. A result whose pipeline version isn't in `pipeline_versions`, or that a node outside `node_keys` signed, is stored but never passes; the PR's gate says why.
 
 ### Reviewers and the Decision Inbox
 
@@ -1083,10 +1151,10 @@ The tasks file is on the agents' side of the trust boundary: agents can write it
 - `POST /api/review/prs/:number/reviews` (agents) with `{reviewer, head_sha, verdict, summary, findings, assignment_token}`
 - `POST /api/review/prs/:number/request-reviews` (owner): ask for the missing reviews at the head
 - `POST /api/review/prs/:number/owner-review` (owner) with `{reviewer: name, head_sha, verdict, summary, findings}`
-- `POST /api/review/prs/:number/merge` (owner) with `{confirm: true, head_sha, by}`: 200 when merged, 409 with the reasons when refused, 403 without the owner's session or for a read-only project
+- `POST /api/review/prs/:number/merge` (owner) with `{confirm: true, head_sha, by}`: 200 when merged, 409 with the reasons (and `refusedBy`) when refused, 403 without the owner's session or for a read-only project. A `by` starting with `lair:` is refused (400): it is Lair's own, as `lair:policy` for automatic merges
 - `POST /api/review/findings/:id/resolve` (owner) with `{by: name, status: resolved|dismissed, note}`
 - `GET /api/review/holds`, `POST /api/review/holds` with `{reason, pr?, by}`, `POST /api/review/holds/:id/release` (owner) with `{by}`. Each unreleased hold has [one decision](#one-decision-per-hold) (module `review-holds`): "Release the hold" releases it as you; releasing it here withdraws the decision
-- `POST /api/review/gate-results` (a signed gate result), `GET /api/review/merges`
+- `POST /api/review/gate-results` (a signed gate result; with `merge.gate.from_triage`, triage's accepted results arrive in-process too), `GET /api/review/merges`
 
 ## Agents
 
@@ -1357,7 +1425,7 @@ Triage ([design](design/autonomy.md#3-failure-triage-bisect-and-revert-module-tr
 - An unsigned result, a tampered one, one from an untrusted node, or one signed for another project gets HTTP 403.
 - **The branch is a label.** A result for `default_branch` counts as that branch's run only when its commit is in the branch's history (the local branch, or a remote's branch of exactly that name). Otherwise it is triaged as a change, with a note. A green run ends an incident only at a commit that contains the red one.
 
-**Status: informational.** Nothing reads a failure's `blocking` yet: the merge policy will once it consumes triage (docs/design/autonomy.md §5). Until then triage records verdicts, asks for re-checks, opens tasks and decisions, and reverts per `bisect.revert`.
+**Status: informational.** Nothing reads a failure's `blocking` yet: the merge policy will once it consumes triage (docs/design/autonomy.md §5). Until then triage records verdicts, asks for re-checks, opens tasks and decisions, and reverts per `bisect.revert`. What the merge gate can take from triage is the signed results themselves: with `review.merge.gate.from_triage: true`, every signed result triage accepts is handed to the project's review module, which verifies it again ([Merge policy](#merge-policy)).
 
 1. **Causes.** JUnit XML reports (JUnit, Surefire, Gradle, pytest `--junitxml`, the vitest and jest JUnit reporters) and the console output of every failed step (Gradle, vitest, jest, pytest) are parsed into causes: the error, its `Caused by` chain, field errors, the failing tests and the project's source locations. A context or bootstrap failure (an application context that can't start, a setup error, a test file that can't load) is **one** cause, however many tests it failed: later tests that only say "failure threshold exceeded" join the first failure's cause, also from the reports of other test classes (Gradle writes one per class), so they take its class. A report's trace without a `Caused by` chain gets the one the step's console output shows for the same tests (or, for a context failure, the chain in its step's output). A failed step that no parser reads becomes one cause with its exit code and the error lines of its output. Output is written by the code under test, so the parsers read at most the last 20,000 lines of a log, each cut to 2,000 characters, with patterns that run in linear time, and the XML reader matches a closing tag against at most the 64 innermost open elements.
 2. **Passes.** A test passed at a commit only when a report lists it as passed, or a gate run ran (and passed) the step it failed in. A lint-only run proves nothing about a unit test.
@@ -1528,7 +1596,7 @@ A project whose gates run in its own queue and runner scripts (not Lair pipeline
 - **Reports.** `--report <file>` and `--report-dir <dir>` (every `*.xml` under it; symlinks are not followed) take JUnit XML. Each report's SHA-256 goes into the signed `result.reports`, so the signature covers it. Reports with failures are sent first, up to 20 MiB in all, and a file over 8 MiB is left out with a warning. More files than a result takes (50; Gradle writes one per test class) are bundled per step into `<testsuites>` documents of at most 6 MiB each: the bundles are what is signed and sent.
 - **Exit codes:** `0` accepted (it prints the triage record), `1` refused (it prints the server's reason: an untrusted node or key, a repeated result id, triage off for the project), `2` usage (a missing or bad flag, an unreadable file or key), `3` the server is unreachable (`--timeout`, default 30 seconds). A runner should **fail open**: log a refusal or an unreachable server and go on, never change the gate's own result because of it.
 
-`review.merge.gate.source: signed` verifies the same kind of signed result, posted to `POST /api/review/gate-results` (this command sends to triage only). It also checks the `pipelineVersion` against `merge.gate.pipeline_versions` (`--pipeline-version`), and it does not take a passed result with a skipped step or a passed step that took under 10 ms.
+`review.merge.gate.source: signed` verifies the same kind of signed result. This command sends to triage only, and with `review.merge.gate.from_triage: true` the results triage accepts reach the merge gate too ([Gates from an external queue through triage](#gates-from-an-external-queue-through-triage)); without it, the gate takes only results posted to `POST /api/review/gate-results`. The gate also checks the `pipelineVersion` against `merge.gate.pipeline_versions` (`--pipeline-version`), and it does not take a passed result with a skipped step or a passed step that took under 10 ms.
 
 ### Re-checks for an existing gate system
 

@@ -74,6 +74,19 @@ const RequiredCheckSchema = z.union([
     .strict(),
 ]);
 
+const PipelineId = z.string().min(1).max(200);
+
+/** A signed gate requirement: a pipeline id, or a group of which any one pipeline passing is enough. */
+const GateRequirementSchema = z.union(
+  [PipelineId, z.object({ any_of: z.array(PipelineId).min(1).max(50) }).strict()],
+  {
+    errorMap: (issue, ctx) =>
+      issue.code === "invalid_union"
+        ? { message: "use a pipeline id or {any_of: [pipeline ids]}" }
+        : { message: ctx.defaultError },
+  },
+);
+
 const GateSchema = z.discriminatedUnion("source", [
   z
     .object({
@@ -87,10 +100,15 @@ const GateSchema = z.discriminatedUnion("source", [
   z
     .object({
       source: z.literal("signed"),
-      /** Gate pipeline ids whose signed results Lair receives (POST /api/review/gate-results) */
-      required: z.array(z.string().min(1)).min(1),
+      /**
+       * Gate pipeline ids whose signed results Lair receives (POST /api/review/gate-results, or from
+       * triage with from_triage): each id must pass; a group {any_of: [ids]} needs one of its ids to pass
+       */
+      required: z.array(GateRequirementSchema).min(1).max(50),
       node_keys: z.record(z.string().min(1)),
       pipeline_versions: z.record(z.string().min(1)),
+      /** Also take the signed results triage accepted for this project (POST /api/triage/results) */
+      from_triage: z.boolean().default(false),
     })
     .strict(),
 ]);
@@ -118,6 +136,13 @@ const MergeSchema = z
     hold_when_default_red: z.boolean().default(true),
     /** Labels that let a proven revert merge while the default branch is red (none by default) */
     hold_exempt_labels: z.array(z.string().min(1)).default([]),
+    /** An argv run after the policy allows a merge and before it is executed: non-zero refuses the merge */
+    check_cmd: z.array(z.string().min(1).max(1000)).min(1).max(50).optional(),
+    check_timeout_seconds: z.number().int().min(1).max(3600).default(300),
+    /** Merge every PR the policy allows, from the periodic scan of open PRs */
+    auto: z.boolean().default(false),
+    /** The least time between two automatic merges of the project */
+    auto_min_interval_seconds: z.number().int().min(0).max(86_400).default(120),
   })
   .strict();
 
@@ -196,13 +221,23 @@ export interface RequiredCheck {
   app: string;
 }
 
+/** A signed gate requirement: one pipeline that must pass, or a group of which any one passing is enough. */
+export type GateRequirement = string | { anyOf: string[] };
+
+/** How a requirement is named in the gate's results and in a refusal's reasons. */
+export function requirementName(requirement: GateRequirement): string {
+  return typeof requirement === "string" ? requirement : `any of (${requirement.anyOf.join(", ")})`;
+}
+
 export type GateSettings =
   | { source: "checks"; required: RequiredCheck[]; statusCreators: string[] }
   | {
       source: "signed";
-      required: string[];
+      required: GateRequirement[];
       nodeKeys: Record<string, string>;
       pipelineVersions: Record<string, string>;
+      /** Take the signed results triage accepted for the project too */
+      fromTriage: boolean;
     };
 
 export interface MergeSettings {
@@ -221,6 +256,12 @@ export interface MergeSettings {
   workDir: string;
   holdWhenDefaultRed: boolean;
   holdExemptLabels: string[];
+  /** Run before a merge is executed: an argv with {pr}, {head}, {base} and {repo}; null: none */
+  checkCmd: string[] | null;
+  checkTimeoutSeconds: number;
+  /** Merge the PRs the policy allows from the periodic scan of open PRs */
+  auto: boolean;
+  autoMinIntervalSeconds: number;
 }
 
 export interface IntegritySettings {
@@ -334,6 +375,27 @@ export function agentFromBranch(pattern: RegExp | null, branch: string): string 
   return pattern.exec(branch)?.groups?.agent ?? null;
 }
 
+/** The placeholders merge.check_cmd may use. */
+export const CHECK_PLACEHOLDERS = ["pr", "head", "base", "repo"] as const;
+
+/** What is wrong with a check_cmd: an unknown placeholder, or one in the program's place. */
+function checkCommandErrors(argv: string[]): string[] {
+  const errors: string[] = [];
+  const known: readonly string[] = CHECK_PLACEHOLDERS;
+  argv.forEach((arg, index) => {
+    for (const match of arg.matchAll(/\{([^{}]*)\}/g)) {
+      if (!known.includes(match[1])) {
+        errors.push(
+          `review.merge.check_cmd.${index}: unknown placeholder {${match[1]}} (use ${known.map((p) => `{${p}}`).join(", ")})`,
+        );
+      } else if (index === 0) {
+        errors.push("review.merge.check_cmd.0: the program is fixed: a placeholder can't be it");
+      }
+    }
+  });
+  return errors;
+}
+
 function cloneUrlFor(apiUrl: string, repo: string): string {
   const api = new URL(apiUrl);
   const web = api.hostname === "api.github.com" ? "https://github.com" : api.origin;
@@ -441,6 +503,7 @@ export function parseReviewConfig(
   if (merge && merge.local_strategy === "squash" && merge.method !== "host" && !merge.identity) {
     errors.push("review.merge.identity: required for a local squash merge (the squash commit's author)");
   }
+  if (merge?.check_cmd) errors.push(...checkCommandErrors(merge.check_cmd));
 
   if (errors.length > 0) return { ok: false, errors };
 
@@ -453,9 +516,10 @@ export function parseReviewConfig(
         ? { source: "checks", required: g.required, statusCreators: g.status_creators }
         : {
             source: "signed",
-            required: g.required,
+            required: g.required.map((r) => (typeof r === "string" ? r : { anyOf: r.any_of })),
             nodeKeys: g.node_keys,
             pipelineVersions: g.pipeline_versions,
+            fromTriage: g.from_triage,
           };
   }
 
@@ -505,6 +569,10 @@ export function parseReviewConfig(
         workDir: merge?.work_dir ?? "data/review",
         holdWhenDefaultRed: merge?.hold_when_default_red ?? true,
         holdExemptLabels: merge?.hold_exempt_labels ?? [],
+        checkCmd: merge?.check_cmd ?? null,
+        checkTimeoutSeconds: merge?.check_timeout_seconds ?? 300,
+        auto: merge?.auto ?? false,
+        autoMinIntervalSeconds: merge?.auto_min_interval_seconds ?? 120,
       },
     },
   };

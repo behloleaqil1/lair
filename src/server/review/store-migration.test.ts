@@ -55,7 +55,7 @@ describe("review.db: schema 1 to 2", () => {
       const version = reader.pragma("user_version", { simple: true });
       reader.close();
       expect(version).toBe(SCHEMA_VERSION);
-      expect(SCHEMA_VERSION).toBe(3);
+      expect(SCHEMA_VERSION).toBe(4);
 
       const used = store.getRequest("demo", 7, HEAD, 0)!;
       expect(used).toMatchObject({
@@ -127,6 +127,12 @@ describe("review.db: schema 1 to 2", () => {
       );
       expect(store.getRequest("demo", 7, HEAD, 0)).toMatchObject({ round: 2, reviewer: "rev-b", model: "model-b" });
       expect(store.getAgentAssignment("demo", 7, HEAD, 0)).toMatchObject({ round: 2, state: "assigned", agent: "rev-b" });
+
+      // 3 -> 4: automatic merges start empty, and a head is started only once
+      expect(store.lastAutoMergeStart("demo")).toBeNull();
+      expect(store.startAutoMerge("demo", 7, HEAD, 1000)).toBe(true);
+      expect(store.startAutoMerge("demo", 7, HEAD, 2000)).toBe(false);
+      expect(store.autoMergesInState("demo", "started")).toEqual([expect.objectContaining({ pr: 7, headSha: HEAD, startedAt: 1000 })]);
     } finally {
       store.close();
     }
@@ -136,6 +142,8 @@ describe("review.db: schema 1 to 2", () => {
     try {
       expect(again.requestRounds("demo", 7, HEAD, 0).map((r) => r.round)).toEqual([1, 2]);
       expect(again.listReviews("demo", 7)).toHaveLength(1);
+      // The attempt written before a restart is still there for the restarted server to find
+      expect(again.getAutoMerge("demo", 7, HEAD)).toMatchObject({ state: "started", startedAt: 1000 });
     } finally {
       again.close();
     }

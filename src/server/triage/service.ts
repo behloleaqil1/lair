@@ -543,8 +543,12 @@ export class TriageService {
 
   // ============ TRUST ============
 
-  /** Throws unless a trusted node signed this result (its key from triage.trusted_nodes). */
-  verifySigned(signed: SignedInput): void {
+  /**
+   * Throws unless a trusted node signed this result (its key from
+   * triage.trusted_nodes); returns that key (PEM), whatever the caller sent
+   * as `nodePublicKey`.
+   */
+  verifySigned(signed: SignedInput): string {
     const nodeId = typeof signed.result.nodeId === "string" ? signed.result.nodeId : "";
     const key = this.o.nodeKeys.get(nodeId);
     if (!key) {
@@ -557,6 +561,7 @@ export class TriageService {
       key,
     );
     if (!check.valid) throw new TriageForbiddenError(`The signature does not verify: ${check.errors.join("; ")}`);
+    return key;
   }
 
   // ============ INGEST ============

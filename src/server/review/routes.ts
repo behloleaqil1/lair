@@ -80,7 +80,10 @@ const MergeBody = z
   .object({
     confirm: z.literal(true, { errorMap: () => ({ message: "send confirm: true to merge" }) }),
     head_sha: FullSha,
-    by: ActorId.default("dashboard"),
+    // lair:policy and the like are Lair's own merges (review.merge.auto): the record must not be mistaken for one
+    by: ActorId.refine((by) => !by.toLowerCase().startsWith("lair:"), "names starting with lair: are Lair's own").default(
+      "dashboard",
+    ),
   })
   .strict();
 

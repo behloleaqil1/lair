@@ -9,7 +9,8 @@
  * the owner's credential (src/server/human-auth/).
  *
  *   POST   /api/triage/results                 {signed, reports?, recheckId?}: a signed gate result -> its triage
- *                                              (recheckId: a Lair re-check's id, or the id of the result a gate system re-checks)
+ *                                              (recheckId: a Lair re-check's id, or the id of the result a gate system re-checks);
+ *                                              once accepted, also handed to review (review.merge.gate.from_triage)
  *   GET    /api/triage/status                  mode, counts, the incident, commands, trusted nodes
  *   GET    /api/triage/failures?verdict=&blocking=&sha=&limit=
  *   GET    /api/triage/failures/:id            causes, verdicts, evidence, actions, re-checks
@@ -246,7 +247,7 @@ export async function registerTriageRoutes(
       if (!body.success) return fail(reply, 400, invalid(body.error));
       try {
         // Verify the result exactly as it was signed, before anything reads it
-        manager.verify(project, body.data.signed);
+        const trustedKey = manager.verify(project, body.data.signed);
         const result = SignedResultSchema.safeParse(body.data.signed.result);
         if (!result.success) return fail(reply, 400, invalid(result.error));
         if (result.data.projectId !== project) {
@@ -263,14 +264,15 @@ export async function registerTriageRoutes(
           }
           reports.push({ name: entry.name, step: entry.step, format: report.format, content: report.content });
         }
-        return respond(
-          // The record at once: its re-checks, messages and tasks run in the background
-          await manager.ingest(
-            project,
-            { result: result.data, reports, context: { recheckId: body.data.recheckId }, trust: "signed" },
-            { background: true },
-          ),
+        // The record at once: its re-checks, messages and tasks run in the background
+        const outcome = await manager.ingest(
+          project,
+          { result: result.data, reports, context: { recheckId: body.data.recheckId }, trust: "signed" },
+          { background: true },
         );
+        // Accepted: the merge gate may take it too (review.merge.gate.from_triage), which verifies it again
+        manager.forwardSigned(project, body.data.signed, trustedKey);
+        return respond(outcome);
       } catch (e) {
         return failWith(reply, e);
       }

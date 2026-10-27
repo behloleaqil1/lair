@@ -283,6 +283,17 @@ describe("review routes: review, policy, merge", () => {
     expect(unconfirmed.json().error).toContain("confirm");
     expect(remote.branches.get("main")).toBe(base);
 
+    // lair:policy is what an automatic merge is recorded as: the owner's route can't record one under it
+    const posing = await app.inject({
+      method: "POST",
+      url: "/api/review/prs/7/merge",
+      headers: owner,
+      payload: { confirm: true, head_sha: head, by: "lair:policy" },
+    });
+    expect(posing.statusCode).toBe(400);
+    expect(posing.json().error).toContain("names starting with lair: are Lair's own");
+    expect(remote.branches.get("main")).toBe(base);
+
     const merged = await app.inject({
       method: "POST",
       url: "/api/review/prs/7/merge",

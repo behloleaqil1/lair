@@ -160,6 +160,9 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       reviewers: { help: "Per tier: human, peer, self or agent:<id>, or {any_of: [...], different_model: true}" },
       api_url: { advanced: true, sensitive: true, help: "Where the GitHub token is sent" },
       "merge.clone_url": { sensitive: true, help: "Where a local merge pushes" },
+      "merge.check_cmd": { help: "Runs before each merge; non-zero refuses it. Placeholders: {pr}, {head}, {base}, {repo}" },
+      "merge.auto": { sensitive: true, help: "Merge every PR the policy allows, one per scan, as lair:policy" },
+      "merge.gate.from_triage": { help: "Also take the signed results triage accepted (verified again here)" },
     },
   },
   {

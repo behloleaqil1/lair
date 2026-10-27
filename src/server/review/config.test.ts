@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "fs";
+import { parse as parseYaml } from "yaml";
 import { DEFAULT_REVIEWERS, agentFromBranch, compileBranchTemplate, parseReviewConfig } from "./config.js";
+import { parseTriageConfig } from "../triage/config.js";
 
 const project = { github: "example-org/demo" };
 const gate = { gate: { source: "checks", required: ["build"] } };
@@ -78,11 +81,40 @@ describe("parseReviewConfig", () => {
       required: ["backend"],
       nodeKeys: { "node-1": "PUBLIC KEY" },
       pipelineVersions: { backend: "v1" },
+      fromTriage: false,
     });
     expect(parsed.settings.merge.allowedEmails).toEqual([
       "12345+release@users.noreply.github.com",
       "*@users.noreply.github.com",
     ]);
+    // No pre-merge check and no automatic merge unless asked for
+    expect(parsed.settings.merge).toMatchObject({ checkCmd: null, checkTimeoutSeconds: 300, auto: false, autoMinIntervalSeconds: 120 });
+  });
+
+  it("parses the documented gates-from-an-external-queue example: from triage, any of, check_cmd, auto off", () => {
+    const doc = readFileSync(new URL("../../../docs/configuration.md", import.meta.url), "utf-8");
+    const section = doc.slice(doc.indexOf("### Gates from an external queue through triage"));
+    const start = section.indexOf("```yaml") + "```yaml".length;
+    const example = parseYaml(section.slice(start, section.indexOf("```", start))) as { review: unknown; triage: unknown };
+    const parsed = parseReviewConfig(example.review, project);
+    expect(parsed.ok ? [] : parsed.errors).toEqual([]);
+    if (!parsed.ok) return;
+    expect(parsed.settings.merge).toMatchObject({
+      gate: {
+        source: "signed",
+        fromTriage: true,
+        required: [{ anyOf: ["backend", "docs"] }],
+        pipelineVersions: { backend: "1", docs: "1" },
+      },
+      method: "local",
+      localStrategy: "ff-only",
+      checkCmd: ["/opt/checks/migration-order", "--pr", "{pr}", "--head={head}"],
+      checkTimeoutSeconds: 300,
+      auto: false,
+    });
+    const gate = parsed.settings.merge.gate;
+    expect(gate.source === "signed" && gate.nodeKeys["ci-gates"]).toContain("-----BEGIN PUBLIC KEY-----\n");
+    expect(parseTriageConfig(example.triage).ok).toBe(true);
   });
 });
 

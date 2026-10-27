@@ -15,7 +15,7 @@ import { TriageManager, type ProjectEntry, type TriageManagerOptions } from "./m
 import { parseIngestBody, registerTriageRoutes } from "./routes.js";
 
 export { TriageManager } from "./manager.js";
-export type { ProjectEntry, TriageManagerOptions } from "./manager.js";
+export type { ProjectEntry, TriageManagerOptions, SignedResultSink } from "./manager.js";
 export {
   TriageService,
   TriageConflictError,

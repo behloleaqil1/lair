@@ -275,11 +275,20 @@ export interface ReviewMergeRecord {
   client: ClientInfo | null;
 }
 
+/**
+ * What refused a merge: the head moved since it was confirmed, the policy,
+ * the pre-merge check (merge.check_cmd), the email allow-list, or the
+ * executor (the clone, the fast-forward, the push, the host).
+ */
+export type MergeRefusal = "head" | "policy" | "check" | "emails" | "executor";
+
 export interface MergeResponse {
   merged: boolean;
   record: ReviewMergeRecord | null;
   /** Why the merge was refused (empty when merged) */
   reasons: string[];
+  /** What refused it (absent when merged) */
+  refusedBy?: MergeRefusal;
 }
 
 export interface ReviewProjectInfo {

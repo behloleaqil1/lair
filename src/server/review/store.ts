@@ -31,8 +31,24 @@ import type { SignedGateResult } from "../../shared/policy-types.js";
  *    agents: each round's run, attempts and state).
  * 3: review_holds.by_owner: the hold was added from a browser signed in as
  *    the owner (its decision needs an answer; anyone else's is a notice).
+ * 4: review_auto_merges: each automatic merge (review.merge.auto) per PR and
+ *    head, written before it starts, so one a restart interrupted is known.
  */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
+
+const SCHEMA_4 = `
+  CREATE TABLE IF NOT EXISTS review_auto_merges (
+    project TEXT NOT NULL,
+    pr INTEGER NOT NULL,
+    head_sha TEXT NOT NULL,
+    state TEXT NOT NULL,
+    reasons TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    PRIMARY KEY (project, pr, head_sha)
+  );
+  CREATE INDEX IF NOT EXISTS idx_review_auto_merges_state ON review_auto_merges(project, state);
+`;
 
 const SCHEMA_3 = `ALTER TABLE review_holds ADD COLUMN by_owner INTEGER NOT NULL DEFAULT 0;`;
 
@@ -483,6 +499,8 @@ export class ReviewStore {
         if (version < 2) this.db.exec(SCHEMA_2);
         // 2 -> 3: holds added before it are counted as not the owner's (their decisions are notices)
         if (version < 3) this.db.exec(SCHEMA_3);
+        // 3 -> 4: automatic merges are new (no rows to carry over)
+        if (version < 4) this.db.exec(SCHEMA_4);
         this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
       })();
     }
@@ -1041,13 +1059,22 @@ export class ReviewStore {
 
   // ============ SIGNED GATE RESULTS ============
 
-  addGateResult(project: string, signed: SignedGateResult, at: string): void {
-    this.db
+  /**
+   * Store a signed result under its id. The same result again changes
+   * nothing (a repeated delivery is a no-op); a different one with that id
+   * replaces it. True when the row was written.
+   */
+  addGateResult(project: string, signed: SignedGateResult, at: string): boolean {
+    const result = this.db
       .prepare(
-        `INSERT OR REPLACE INTO review_gate_results (project, id, sha, pipeline_id, payload, received_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO review_gate_results (project, id, sha, pipeline_id, payload, received_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(project, id) DO UPDATE SET
+           sha = excluded.sha, pipeline_id = excluded.pipeline_id, payload = excluded.payload, received_at = excluded.received_at
+         WHERE review_gate_results.payload <> excluded.payload`,
       )
       .run(project, signed.result.id, signed.result.commitSha, signed.result.pipelineId, JSON.stringify(signed), at);
+    return result.changes > 0;
   }
 
   gateResults(project: string, sha: string): SignedGateResult[] {
@@ -1056,4 +1083,96 @@ export class ReviewStore {
       .all(project, sha) as { payload: string }[];
     return rows.map((r) => JSON.parse(r.payload) as SignedGateResult);
   }
+
+  // ============ AUTOMATIC MERGES ============
+
+  /**
+   * Record that an automatic merge of `pr` at `headSha` starts, before it
+   * does. False when one at this head already started or ended (only a
+   * skipped one may start again), so a head is never merged automatically twice.
+   */
+  startAutoMerge(project: string, pr: number, headSha: string, at: number): boolean {
+    const result = this.db
+      .prepare(
+        `INSERT INTO review_auto_merges (project, pr, head_sha, state, reasons, started_at, finished_at)
+         VALUES (?, ?, ?, 'started', '[]', ?, NULL)
+         ON CONFLICT(project, pr, head_sha) DO UPDATE SET
+           state = 'started', reasons = '[]', started_at = excluded.started_at, finished_at = NULL
+         WHERE review_auto_merges.state = 'skipped'`,
+      )
+      .run(project, pr, headSha, at);
+    return result.changes > 0;
+  }
+
+  /** How the automatic merge at this head ended. */
+  finishAutoMerge(project: string, pr: number, headSha: string, state: Exclude<AutoMergeState, "started">, reasons: string[], at: number): void {
+    this.db
+      .prepare(
+        `UPDATE review_auto_merges SET state = ?, reasons = ?, finished_at = ? WHERE project = ? AND pr = ? AND head_sha = ?`,
+      )
+      .run(state, JSON.stringify(reasons.slice(0, 20)), at, project, pr, headSha);
+  }
+
+  getAutoMerge(project: string, pr: number, headSha: string): AutoMergeRecord | null {
+    const row = this.db
+      .prepare(`SELECT * FROM review_auto_merges WHERE project = ? AND pr = ? AND head_sha = ?`)
+      .get(project, pr, headSha) as AutoMergeRow | undefined;
+    return row ? autoMergeOf(row) : null;
+  }
+
+  autoMergesInState(project: string, state: AutoMergeState): AutoMergeRecord[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM review_auto_merges WHERE project = ? AND state = ? ORDER BY started_at`)
+      .all(project, state) as AutoMergeRow[];
+    return rows.map(autoMergeOf);
+  }
+
+  /** When the project's latest automatic merge started (ms), or null. */
+  lastAutoMergeStart(project: string): number | null {
+    const row = this.db
+      .prepare(`SELECT MAX(started_at) AS at FROM review_auto_merges WHERE project = ?`)
+      .get(project) as { at: number | null };
+    return row.at;
+  }
+}
+
+/**
+ * An automatic merge at one head: `started` (written before it runs; still
+ * there after a restart means it was interrupted), `merged`, `failed` (not
+ * tried again at this head), `skipped` (the head moved or the policy changed
+ * as it started: it may be tried again), `interrupted` (a restart stopped it).
+ */
+export type AutoMergeState = "started" | "merged" | "failed" | "skipped" | "interrupted";
+
+export interface AutoMergeRecord {
+  project: string;
+  pr: number;
+  headSha: string;
+  state: AutoMergeState;
+  reasons: string[];
+  /** ms */
+  startedAt: number;
+  finishedAt: number | null;
+}
+
+interface AutoMergeRow {
+  project: string;
+  pr: number;
+  head_sha: string;
+  state: string;
+  reasons: string;
+  started_at: number;
+  finished_at: number | null;
+}
+
+function autoMergeOf(row: AutoMergeRow): AutoMergeRecord {
+  return {
+    project: row.project,
+    pr: row.pr,
+    headSha: row.head_sha,
+    state: row.state as AutoMergeState,
+    reasons: JSON.parse(row.reasons) as string[],
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+  };
 }

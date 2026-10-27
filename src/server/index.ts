@@ -463,12 +463,15 @@ await registerAgentsRoutes(fastify, agents, () => getDefaultProject(), humanAuth
 // (gate.completed) or as signed results from trusted nodes; protect, revert
 // and releasing a quarantine need the owner's session. Its revert and
 // re-check questions go to the Decision Inbox, whose answers resume it.
+// Each signed result it accepts is handed to reviews in-process, which keeps
+// it for the merge gate when review.merge.gate.from_triage is on
 const triage = await mountTriage(fastify, {
   dbPath: join(process.cwd(), "data", "triage.db"),
   events: getEventBus(),
   projects: projectEntries,
   defaultProject: () => getDefaultProject(),
   owner: humanAuth,
+  review: reviews,
 });
 triage.useDecisions(decisionInbox);
 
