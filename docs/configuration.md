@@ -864,12 +864,12 @@ Globs use `**` (any directories), `*`, `?` and `{a,b}`; a glob without `/` match
 | Entry | Filled by |
 |-------|-----------|
 | `human` | A review with `kind: human` from someone other than the author |
-| `agent:<id>` | That reviewer agent (never the author) |
+| `agent:<id>` | That reviewer agent, never the author; the author must be known (an unknown author may be that very agent) |
 | `peer` | Any reviewer, agent or human, other than the author |
 | `self` | The author's own review (its self-check) |
 | `{any_of: [...], different_model: true}` | Any of the listed ones; with `different_model`, an agent on a model other than the author's (a human always qualifies). `pool: [ids]` names the reviewer agents for this slot ([Reviews by agents](#reviews-by-agents)) |
 
-Defaults: `red: [human]`, `amber: [peer]`, `green: [self]`. Only an `approve` given at the PR's current head sha counts; a push makes every older review stale, and a reviewer's later review replaces its earlier one. The author is the agent Lair's own modules registered for the PR (the agent assigner or intake; never settable over HTTP), else the agent the branch mappings name (`authors.branch_pattern`, `authors.branches` and `authors.from_tasks_file`, see [Reviews by agents](#reviews-by-agents)); its model comes from `dragons:` or `authors.models`. `branch_pattern` is a template, not a regular expression: `{agent}` (exactly once) is an agent id, `*` matches within one path segment and `**` (at most once) across segments, and everything else is literal, so `agent/{agent}/**` reads `worker-a` from `agent/worker-a/fix-login`. Branch names longer than 255 characters never match. With no author, `peer`, `self` and `different_model` can't be satisfied, and the status says so.
+Defaults: `red: [human]`, `amber: [peer]`, `green: [self]`. Only an `approve` given at the PR's current head sha counts; a push makes every older review stale, and a reviewer's later review replaces its earlier one. The author is the agent Lair's own modules registered for the PR (the agent assigner or intake; never settable over HTTP), else the agent the branch mappings name (`authors.branch_pattern`, `authors.branches` and `authors.from_tasks_file`, see [Reviews by agents](#reviews-by-agents)); its model comes from `dragons:` or `authors.models`. `branch_pattern` is a template, not a regular expression: `{agent}` (exactly once) is an agent id, `*` matches within one path segment and `**` (at most once) across segments, and everything else is literal, so `agent/{agent}/**` reads `worker-a` from `agent/worker-a/fix-login`. Branch names longer than 255 characters never match. With no author, no agent slot (`agent:<id>`, `peer`, `self`) and no `different_model` can be satisfied, no agent is asked to review, and the status says why (`authorNote`).
 
 A review has a fixed schema: a reviewer, the full `head_sha`, `verdict` (`approve` or `request_changes`) and `findings[]` of `{severity, file, line, text, blocking}`. Who may review:
 
@@ -951,7 +951,11 @@ Other keys: `provider` (`github`), `api_url` (default `https://api.github.com`),
 
 ### Reviewers and the Decision Inbox
 
-`POST /api/review/prs/:number/request-reviews` asks for every missing review at the head, once per head: a named or peer reviewer agent, or the author's self-check, through the agent assigner, and a human through the Decision Inbox. Each agent assignment carries a random token, which the assigner must hand only to the agent doing the review; Lair stores only its hash. An assignment for a named agent (or the author's self-check) is that agent's; one for any peer binds to the first agent, other than the author, that reviews with it. A slot is asked for again at the same head only after its assignee reviewed without filling it (for example on the author's model when `different_model` is set). A project with [reviews by agents](#reviews-by-agents) has its named and peer reviews done by agents Lair starts; otherwise, and for self-checks, agent requests are published on the event bus as `review.assignment_requested`. Decisions are published as `review.decision_requested` until the Decision Inbox is wired in. The assignment event carries the token, and the event bus is internal to the server: it is not served over HTTP. Other events: `review.submitted`, `review.invalidated` (a push made reviews stale), `review.merged`, `review.merge_refused`.
+`POST /api/review/prs/:number/request-reviews` (owner only: asking can start reviewer runs) asks for every missing review at the head, once per head: a named or peer reviewer agent, or the author's self-check, through the agent assigner, and a human through the Decision Inbox. A slot is asked for again at the same head only after its assignee reviewed without filling it (for example on the author's model when `different_model` is set), as a new round: the earlier rounds' records stay.
+
+Each agent assignment carries a random token, which the assigner must hand only to the agent doing the review; Lair stores only its hash, recorded before the assigner is called. A token counts for **one** review: a second review with it is refused (403), and so is a review under an assignment that a later request replaced. An assignment for a named agent (or the author's self-check) is that agent's, and a review under it must name that agent; one for any peer binds to the first agent, other than the author, that reviews with it.
+
+A project with [reviews by agents](#reviews-by-agents) has its named and peer reviews done by agents Lair starts; otherwise, and for self-checks, agent requests are published on the event bus as `review.assignment_requested`. The assignment event carries the token, and the event bus is internal to the server: it is not served over HTTP. The review module's decisions (a human review, a refused merge, no agent review) are raised in the [Decision Inbox](#decision-inbox) as module `review`. Other events: `review.submitted`, `review.invalidated` (a push made reviews stale), `review.merged`, `review.merge_refused`.
 
 ### Reviews by agents
 
@@ -972,13 +976,15 @@ review:
     from_tasks_file: true
 ```
 
-**Who reviews.** For each missing slot at the head (`POST .../request-reviews`, or "Request missing reviews" in the Reviews view), Lair takes, in pool order, the first agent that:
+**When it asks.** Lair scans the open PRs every minute and asks for the missing reviews of a non-draft PR when it first sees it or its head changed, at most once per PR in 5 minutes. The owner asks too, with "Request missing reviews" in the Reviews view (`POST .../request-reviews`, owner only). A round that failed (below) starts again only when the owner asks.
 
-- is in the slot's `pool`, else in `reviewers_pool.<tier>` (for an `agent:<id>` slot: that agent), and is not the PR's author. A `peer` slot needs a known author;
-- with `different_model`, runs on a model other than the author's in every profile it has, its `agents.fallbacks` included, so a failover can't land on the author's model;
+**Who reviews.** Nobody, while the PR's author is unknown: any agent, a named one too, could be the author. Otherwise, for each missing slot at the head, Lair takes, in pool order, the first agent that:
+
+- is in the slot's `pool`, else in `reviewers_pool.<tier>` (for an `agent:<id>` slot: that agent), and is not the PR's author;
+- with `different_model`, shares no model with the author: none of its profiles (its `agents.fallbacks` included) runs on the author's model or on a model of any of the author's profiles, so neither side's failover can land on a shared model;
 - is free in the agents module (no active run, not over budget), is not reviewing this PR already, and hasn't reviewed this head.
 
-An agent whose run on the slot already ended without a review comes last. With no agent free, the slot stays `requested` and is tried again on the next check (every 15 seconds), which doesn't use up an attempt. When no agent can ever take it (the author unknown, every pooled agent able to run on the author's model, no pool), the slot fails with the reason. The route is not owner-only: any local process can ask. Each slot is asked for once per head, and runs are bounded by the pool, the agents module's budgets and `retries.max_attempts`.
+An agent whose run on the slot already ended without a review comes last. With no agent free, the slot stays `requested` and is tried again on the next check (every 15 seconds), which doesn't use up an attempt. When no agent can ever take it (every pooled agent sharing a model with the author, no pool), the slot fails with the reason. Runs are bounded by the pool, the agents module's budgets and `retries.max_attempts`.
 
 **The run.** Lair requests the run in-process, for task `review-<pr>-<head8>` (with `-2`, `-3`, ... for a tier's further slots), so claims, locks, budgets, recovery and failover apply as to any run. Its prompt is `prompt_file`: one file name directly in `prompts_dir` (no path, and a symlink only to a file in the same directory), a regular file of at most 200 KB. The file is used verbatim except for these placeholders, each replaced in one pass:
 
@@ -994,7 +1000,9 @@ An agent whose run on the slot already ended without a review comes last. With n
 
 Each value is checked against its shape first (a number, a full sha, `owner/name`, a plain branch name, an http(s) URL). When a PR's values don't fit, the request is refused with the reason and no run starts. Lair writes run prompts to `prompts_dir`, and agents that run as your OS user can write there too: run them as a separate user ([design](design/autonomy.md#6-agents-budgets-failover-and-session-recovery-module-agents)) so they can't rewrite the reviewers' instructions.
 
-**The token.** The assignment token reaches the run's environment only, as `LAIR_REVIEW_TOKEN`, with `LAIR_REVIEW_PROJECT` (the project) and `LAIR_URL` (this server). These are run variables that the agents module keeps in memory: they are never written to its store, the prompt file or a log, and Lair's review store keeps only the token's hash. If Lair restarts before the run starts, those variables are gone, so the run ends (`failed`: "its run variables ... were lost in a restart") and the slot is assigned again with a new token.
+**The token.** The assignment token reaches the run's environment only, as `LAIR_REVIEW_TOKEN`, with `LAIR_REVIEW_PROJECT` (the project) and `LAIR_URL` (this server). These are run variables that the agents module keeps in memory: they are never written to its store, the prompt file or a log, and Lair's review store keeps only the token's hash. A config reload of the agents module keeps them; if Lair restarts before the run starts, they are gone, so the run ends (`failed`: "its run variables ... were lost in a restart") and the slot is assigned again with a new token.
+
+A review is taken under the token only once, only while the run Lair started for it is running, and only as that run's agent; the reviewer id is the assignment's. An environment is not a secret from the same OS user, though: other processes of that user can read it (`/proc/<pid>/environ` on Linux, `ps eww` on macOS), and so can the reviewer's own subprocesses. While the reviewer's run lasts, an author agent running as the same user could take its token and review first. Run each agent as its own OS user, apart from the Lair server ([design](design/autonomy.md#6-agents-budgets-failover-and-session-recovery-module-agents)).
 
 **Submitting.** The reviewer runs:
 
@@ -1005,13 +1013,13 @@ lair review submit --pr <n> --head <sha> --verdict approve|request_changes --sum
 It is `node <lair>/dist/cli/lair.js review submit ...` after `npm run build`, or `npm run --silent lair -- review submit ...` from the Lair repository. It reads `LAIR_REVIEW_TOKEN`, `LAIR_AGENT`, `LAIR_REVIEW_PROJECT` and `LAIR_URL` (default `http://127.0.0.1:4777`) from its environment and posts to `POST /api/review/prs/<n>/reviews`. The findings file has one finding per line, `path:line: severity: text` (severity `critical`, `high`, `medium`, `low` or `info`). With `request_changes` every finding blocks; with `approve` none does. The summary holds at most 10000 characters, and a review at most 200 findings. The token is never printed. Exit codes:
 
 - `0`: the review was recorded;
-- `1`: Lair refused it (a wrong or another agent's token, a closed PR, an invalid review);
+- `1`: Lair refused it (a wrong, used or another agent's token, a run that ended, a closed PR, an invalid review);
 - `2`: a usage or input error, and nothing was sent;
 - `3`: Lair could not be reached, or answered with a server error.
 
-The model recorded with the review is the one Lair started the agent on, not one the review claims.
+The model recorded with the review is the one of the profile the run actually runs on (after a failover, the fallback's), not one the review claims.
 
-**Retries and decisions.** A run can end without a review: it exited without submitting, crashed past the agents module's own recovery, or was escalated. Then the slot is retried with a new token (the old one stops working) after `retries.backoff_seconds`, doubling up to `retries.max_backoff_seconds`, by an agent that hasn't tried yet when there is one. After `retries.max_attempts` runs the slot fails and Lair raises an `escalation` decision ("No agent reviewed PR #n at <sha>"); requesting the missing reviews again starts a new round. A push or a closed PR makes the open assignments `stale`, and nothing more starts for that head. The state is in `data/review.db` (schema version 2), so a restart carries on where it stopped.
+**Retries and decisions.** A run can end without a review: it exited without submitting, crashed past the agents module's own recovery, or was escalated. Then the slot is retried with a new token (the old one stops working) after `retries.backoff_seconds`, doubling up to `retries.max_backoff_seconds`, by an agent that hasn't tried yet when there is one. After `retries.max_attempts` runs the slot fails and Lair raises an `escalation` decision in the Decision Inbox ("No agent reviewed PR #n at <sha>"); only the owner's "Request missing reviews" starts a new round. A push or a closed PR makes the open assignments `stale`: nothing more starts for that head, and a review run still going is stopped (its claim is released, and the agents module stops it on its next check). The state is in `data/review.db` (schema version 2), so a restart carries on where it stopped.
 
 **Status.** The Reviews view's "Required reviews" table shows each slot's request, read-only: `requested` (with the retry time), `assigned to <agent>` (the run and the attempt), `reviewed by <agent>`, `failed` or `stale`, with the detail. `GET /api/review/prs/:number` returns the same as `assignments`.
 
@@ -1020,7 +1028,7 @@ The model recorded with the review is the one Lair started the agent on, not one
 - `authors.branches` maps branch globs to agent ids, for branches such as `team/topic`: `*` matches within one path segment, `**` across segments and `?` one character (at most 100 entries);
 - `authors.from_tasks_file: true` reads the agents fill tasks file (`agents.fill.tasks_file`, relative to `repo`: `<agent>|<name>|<task>|<description>` lines, at most 256 KB and 200 tasks). A line's branch comes from its description: `(branch: <name>)`, or a `(<prefix>/<topic>)` token in parentheses.
 
-Every mapping is asked. When they (or two entries of one) name different agents, the author stays unknown and the status says why (`authorNote`): an unknown author holds a PR back, a wrong one would let it review its own work.
+The tasks file is on the agents' side of the trust boundary: agents can write it, so it never decides an author on its own. It only confirms `branch_pattern` and `branches`: when those match several agents it may narrow them to one it names, and a line naming an agent they didn't match leaves the author unknown. When the mappings (or two entries of one) name different agents, the author stays unknown and the status says why (`authorNote`): an unknown author holds a PR back, a wrong one would let it review its own work.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -1030,7 +1038,7 @@ Every mapping is asked. When they (or two entries of one) name different agents,
 | `retries.backoff_seconds` | number | `120` | First retry delay, doubling |
 | `retries.max_backoff_seconds` | number | `3600` | Longest retry delay |
 | `authors.branches` | map | `{}` | Branch glob to agent id |
-| `authors.from_tasks_file` | boolean | `false` | Also map the branches the agents fill tasks file names |
+| `authors.from_tasks_file` | boolean | `false` | Let the agents fill tasks file confirm or narrow the branch mappings (never decide alone) |
 
 ### Review API
 
@@ -1039,7 +1047,8 @@ Every mapping is asked. When they (or two entries of one) name different agents,
 - `GET /api/review/status`: on or off, config errors, repository, read-only
 - `GET /api/review/prs`: open PRs with the tier and verdict of their last evaluation at the current head
 - `GET /api/review/prs/:number`: the evaluation: tier and matched rules, required and present reviews, reviews, findings, the gate at the head, holds, every condition, and the merge plan
-- `POST /api/review/prs/:number/reviews` (agents) with `{reviewer, head_sha, verdict, summary, findings, assignment_token}`, and `POST /api/review/prs/:number/request-reviews`
+- `POST /api/review/prs/:number/reviews` (agents) with `{reviewer, head_sha, verdict, summary, findings, assignment_token}`
+- `POST /api/review/prs/:number/request-reviews` (owner): ask for the missing reviews at the head
 - `POST /api/review/prs/:number/owner-review` (owner) with `{reviewer: name, head_sha, verdict, summary, findings}`
 - `POST /api/review/prs/:number/merge` (owner) with `{confirm: true, head_sha, by}`: 200 when merged, 409 with the reasons when refused, 403 without the owner's session or for a read-only project
 - `POST /api/review/findings/:id/resolve` (owner) with `{by: name, status: resolved|dismissed, note}`
