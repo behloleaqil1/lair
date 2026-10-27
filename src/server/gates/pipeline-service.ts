@@ -496,7 +496,8 @@ export class PipelineManager {
             minutes: sum(attempts, "minutes"),
             billedMinutes: sum(attempts, "billedMinutes"),
           });
-          await this.options.events?.emit("gate.completed", { project: p.name, result: outcome.result });
+          // For triage: the run id links the result to a re-check that started this run
+          await this.options.events?.emit("gate.completed", { project: p.name, result: outcome.result, context: { runId: run.id } });
           return;
         }
         case "retry": {

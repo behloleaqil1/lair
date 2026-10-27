@@ -579,8 +579,8 @@ describe("results", () => {
     const run = await h.run();
 
     expect(completed).toHaveLength(1);
-    const data = completed[0].data as { project: string; result: GateResult };
-    expect(data).toEqual({ project: "demo", result: run.jobs[0].result });
+    const data = completed[0].data as { project: string; result: GateResult; context: { runId: string } };
+    expect(data).toEqual({ project: "demo", result: run.jobs[0].result, context: { runId: run.id } });
     expect(data.result).toMatchObject({ commitSha: SHA, status: "failed" });
   });
 
