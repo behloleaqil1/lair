@@ -2097,7 +2097,10 @@ export class AgentsService {
   /**
    * The owner releases a task fill holds for them (an owner or no_done hold,
    * at fill's last check): fill starts it again on its next check, and counts
-   * its completions without done from zero.
+   * its completions without done from zero. Only while the run that hold was
+   * about is still the task's latest: a release seen after the task moved on
+   * (the owner answered its escalation with a fresh session, say) would lift
+   * a hold the owner never saw, so it is refused, as the decision's answer is.
    */
   releaseFillHold(task: string): Promise<{ task: string; runId: string | null }> {
     return this.exclusive(async () => {
@@ -2111,6 +2114,12 @@ export class AgentsService {
         );
       }
       const latest = this.store.latestRunForTask(this.project, task);
+      if (line.runId !== (latest?.id ?? null)) {
+        throw new AgentsError(
+          409,
+          `Task ${task} has moved on since fill's last check: its latest run is ${latest ? `${short(latest.id)} (${latest.state})` : "gone"}, not ${line.runId ? short(line.runId) : "none"}; nothing to release`,
+        );
+      }
       await this.recordFillRelease(task, latest, "owner", this.probes.clock.now());
       return { task, runId: latest?.id ?? null };
     });

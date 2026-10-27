@@ -2443,6 +2443,66 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(runs(h)).toMatchObject([{ task: "feat-login", origin: "fill", state: "queued" }]);
   });
 
+  it("a release seen after the task moved on is refused: the owner's fresh session, then a stale Release hold", async () => {
+    const h = setup(fill({ agents: ["worker-a"] }));
+    const { inbox, answer, app, owner } = await withInbox(h);
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    h.spawner.behaviour = (pid) => h.spawner.exit(pid, 1); // every attempt dies on start
+    await check(h);
+    for (const ms of [0, 0, 10 * SEC, 10 * SEC, 30 * SEC, 30 * SEC, 70 * SEC, 70 * SEC]) await at(h, ms);
+    const escalated = runs(h).at(-1);
+    expect(escalated?.state).toBe("failed");
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "held", hold: "owner", runId: escalated?.id });
+
+    // The owner answers the chain's escalation: a fresh session, queued in the same chain
+    const [asked] = inbox.list({ project: "demo", status: "open" });
+    expect(asked.key).toBe(`escalation:${escalated?.chainId}:4`);
+    expect((await answer(asked.id, { optionId: "fresh_session" })).statusCode).toBe(200);
+    const fresh = runs(h).at(-1);
+    expect(fresh).toMatchObject({ state: "queued", chainId: escalated?.chainId, sessionMode: "fresh" });
+
+    // Then a Release hold from the page as it was at fill's last check: refused, nothing recorded
+    const release = releaseFillHoldAction("demo", "feat-login", "worker-a");
+    const sent = ownerRequest(release.body, { [OWNER_SESSION_HEADER]: owner[OWNER_SESSION_HEADER] });
+    const refused = await app.inject({ url: release.url, ...sent, headers: { ...DASHBOARD, ...sent.headers } });
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json().error).toContain("has moved on since fill's last check");
+    expect(eventsOf(h, "fill_released")).toEqual([]);
+    // The next check shows where the task is now: its fresh session
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "started", runId: fresh?.id });
+  });
+
+  it("an edited line keeps a task done while its DONE line is in the queue; a run the owner requests is the way past it", async () => {
+    const h = setup(fill({ agents: ["worker-a"] }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    await check(h);
+    await at(h, 0); // pid 5001
+    appendFileSync(h.queueFile, "- DONE feat-login by worker-a 12:05Z: merged\n");
+    h.spawner.exit(5001, 0);
+    await at(h, MIN);
+    expect(lineOf(await check(h), "feat-login").state).toBe("done");
+
+    // Editing the line drops the kept record, but the DONE line is still in the queue file: done again
+    tasks(h, "worker-a|Alice|feat-login|Login form, reopened");
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "done", detail: "done: - DONE feat-login by worker-a 12:05Z: merged" });
+    expect(eventsOf(h, "fill_done")).toHaveLength(2);
+    expect(runs(h)).toHaveLength(1);
+
+    // The owner requests a run: a new start, so the older DONE line no longer counts
+    await request(h, "worker-a", "feat-login", "Check the login form again");
+    await at(h, 2 * MIN); // pid 5002
+    h.spawner.exit(5002, 0);
+    await at(h, 3 * MIN); // it ends without a new DONE line
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "held", hold: "backoff" });
+    h.clock.t = NOW + 4 * MIN;
+    expect(lineOf(await check(h), "feat-login").state).toBe("started");
+    // Fill carries it on with its own prompt (prompt_files), not the prompt of the run the owner requested
+    await h.service.tick();
+    expect(promptOf(h.spawner.calls[2])).toBe(`${ADDENDUM}\n\nYou are worker A: build what the task says.\n`);
+  });
+
   it("a store from before fill (schema version 1) gains the task index; its runs are found by task", () => {
     const paths = makePaths();
     mkdirSync(dirname(paths.dbPath), { recursive: true });

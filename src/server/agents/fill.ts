@@ -12,8 +12,10 @@
  *   last chain was requested (the whole file for a task with no run). Once
  *   seen, done is kept in the store (a fill_done event for the task's latest
  *   run and the line as written), so a rotated or truncated queue file never
- *   restarts a finished task; a new run of the task, or an edited line,
- *   clears it;
+ *   restarts a finished task. An edited line drops that record, but the queue
+ *   scan finds the DONE line again while it is in the window; only a new run
+ *   of the task (the owner requests one: a new run id and queue mark) makes
+ *   the lines written before it not count;
  * - held, with the reason, when:
  *   - owner: its last run ended other than completed (escalated, stopped by
  *     the owner, its claim lost). The owner's to resume; a claim lost without
@@ -632,6 +634,8 @@ export class AgentsFill {
       const release = store.listEvents(project, { kinds: ["fill_released"], task, limit: 1 })[0];
       const releasedRun = typeof release?.data.runId === "string" ? release.data.runId : null;
       const releasedChain = typeof release?.data.chainId === "string" ? release.data.chainId : null;
+      // A superseded run never ran (another live claim held the task when it tried to start): it starts with no
+      // backoff once that claim is gone, as a first start does; the claimed check above holds it until then
       if (latest && latest.state !== "completed" && latest.state !== "superseded" && latest.id !== releasedRun) {
         if (latest.state === "lost_claim" && !this.claimReleasedByOwner(latest)) {
           const reason = `its run ${short(latest.id)} lost its claim (${oneLine(latest.detail)}), not released by you: fill leaves the task to you`;
