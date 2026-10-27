@@ -77,6 +77,7 @@ import {
   type TriageAdapters,
 } from "./adapters.js";
 import { applyProbe, nextStep, retryProbe, startBisect, type ProbeOutcome } from "./bisect.js";
+import { GateRechecks, type GatePlan } from "./gate-recheck.js";
 import { clip, testClass } from "./text.js";
 import type { Clock, CommandRunner } from "../watchdog/probes.js";
 
@@ -171,7 +172,7 @@ type AdapterCall =
 type Call = AdapterCall | { kind: "culprit"; incidentId: string; sha: string };
 
 /** What one decision section leaves to do once its transaction commits. */
-interface Section {
+export interface Section {
   jobs: Job[];
   events: { type: EventType; data: Record<string, unknown> }[];
   dispatch: boolean;
@@ -266,6 +267,8 @@ export class TriageService {
   private decisions?: DecisionRaiser;
   private decisionsViaCommand: boolean;
   private unsubscribe?: () => void;
+  /** Re-checks in the project's own gate system (triage.recheck.mode) */
+  private gateRechecks: GateRechecks;
 
   constructor(private o: TriageServiceOptions) {
     this.project = o.project;
@@ -275,6 +278,27 @@ export class TriageService {
     const file = o.settings.decisionFile ?? o.config.inbox_file;
     this.decisions = o.adapters.decisions ?? (file ? new InboxDecisionRaiser(file, o.probes.fs, o.probes.clock) : undefined);
     this.decisionsViaCommand = o.decisionsViaCommand === true;
+    this.gateRechecks = new GateRechecks({
+      project: o.project,
+      config: o.config,
+      settings: o.settings,
+      store: o.store,
+      runner: o.probes.runner,
+      now: () => this.now(),
+      serial: <T>(fn: () => Promise<T>) => this.serial(fn),
+      commit: <T>(fn: (s: Section) => T) => this.commit(fn),
+      action: (target, kind, status, detail, argv, output, actor) => {
+        this.action(target, kind, status, detail, argv, output, actor);
+      },
+      raiseDecision: (target, s, request) => this.raiseDecision(target, s, request),
+      routeToAuthor: (record, causes, s, why) => this.routeToAuthor(record, causes, s, why),
+      flakyOccurrence: (key, record, why, s) => this.flakyOccurrence(key, record, why, s),
+    });
+  }
+
+  /** Re-checks in the project's own gate system: mode, why they don't run, how many are pending. */
+  get gateRecheckStatus(): { mode: "off" | "observe" | "act"; blocked: string | null; pending: number } {
+    return this.gateRechecks.status();
   }
 
   /** Raise decisions in the Decision Inbox, and follow their answers. */
@@ -605,9 +629,16 @@ export class TriageService {
     // A run the pipelines module names in-process; an HTTP caller's context is not signed
     const runId = input.trust === "trusted" ? context.runId : undefined;
     let recheck: Recheck | null = null;
+    // A re-check in the project's own gate system names the result it re-checks (gate-recheck.ts)
+    const gateLink = this.gateRechecks.link(context.recheckId, result.id, sha);
+    if (gateLink && !gateLink.ok) {
+      throw gateLink.status === 400 ? new TriageInputError(gateLink.error) : new TriageConflictError(gateLink.error);
+    }
+    const linked = gateLink?.ok ? gateLink.link : null;
     // Without a re-check id, a result still answers the waiting re-check whose id or run id it carries
-    const recheckId =
-      context.recheckId ?? store.answerableRecheck(project, [result.id, ...(runId ? [runId] : [])], sha, result.branch, ANSWERABLE)?.id;
+    const recheckId = linked
+      ? undefined
+      : (context.recheckId ?? store.answerableRecheck(project, [result.id, ...(runId ? [runId] : [])], sha, result.branch, ANSWERABLE)?.id);
     if (recheckId) {
       recheck = store.getRecheck(recheckId);
       if (!recheck || recheck.project !== project) throw new TriageNotFoundError(`No re-check ${recheckId}`);
@@ -626,8 +657,8 @@ export class TriageService {
         );
       }
     }
-    const origin = recheck?.recordId ? store.getRecord(recheck.recordId) : null;
-    const purpose: ResultPurpose = recheck ? (recheck.purpose === "bisect" ? "bisect" : "recheck") : "gate";
+    const origin = linked?.origin ?? (recheck?.recordId ? store.getRecord(recheck.recordId) : null);
+    const purpose: ResultPurpose = recheck ? (recheck.purpose === "bisect" ? "bisect" : "recheck") : linked ? "recheck" : "gate";
     const failed = result.status !== "passed";
     const pipelineId = result.pipelineId;
     const passedSteps = result.steps.filter((st) => st.status === "passed").map((st) => st.name);
@@ -722,7 +753,7 @@ export class TriageService {
         agent: context.agent ?? origin?.agent,
         pr: context.pr ?? origin?.pr,
         purpose,
-        recheckId: recheck?.id,
+        recheckId: recheck?.id ?? linked?.recheck.id,
         originId: origin?.id,
         status: result.status,
         defaultBranch: isDefault,
@@ -759,10 +790,11 @@ export class TriageService {
 
       this.reclassifyFlaky(sha, passedKeys, id, nowMs, s);
       if (recheck) this.answerRecheck(recheck, id, result, evidence, classified, origin, s);
+      if (linked) this.gateRechecks.answer(linked, id, result, evidence, classified, s);
 
       const record = store.getRecord(id)!;
       if (failed && purpose !== "bisect") {
-        this.act(record, classified, origin, s);
+        this.act(record, classified, origin, this.gateRechecks.plan(record, classified, linked, context.loadPerCore, s), s);
       } else if (failed) {
         store.updateRecord(id, { verdict: overallClass(classified) ?? null, blocking: false, resolution: "bisect probe" });
       }
@@ -917,7 +949,8 @@ export class TriageService {
 
   // ============ ACTIONS PER CLASS ============
 
-  private act(record: TriageRecord, classified: ClassifiedCause[], origin: TriageRecord | null, s: Section): void {
+  /** `gate`: the gate system's re-check (gate-recheck.ts), null when triage.recheck.mode is off */
+  private act(record: TriageRecord, classified: ClassifiedCause[], origin: TriageRecord | null, gate: GatePlan | null, s: Section): void {
     const { store, settings } = this.o;
     const of = (cls: Verdict["class"]) => classified.filter((c) => c.verdict.class === cls);
     const infra = of("infra");
@@ -927,7 +960,10 @@ export class TriageService {
 
     if (infra.length > 0) {
       blocking = true;
-      if (settings.actions.infra === "recheck") {
+      if (gate) {
+        // The project's gate system re-checks it, in place of a re-check Lair runs
+        if (gate.text) pending.push(`infra: ${gate.text}`);
+      } else if (settings.actions.infra === "recheck") {
         pending.push(this.recheckInfra(record, infra, origin, s));
       } else if (settings.actions.infra === "route") {
         this.routeToAuthor(record, infra, s, "infrastructure failures are routed to the author (triage.actions.infra: route)");
@@ -942,6 +978,9 @@ export class TriageService {
       if (record.defaultBranch) {
         // Nobody authored the default branch's head: the incident's bisect finds the culprit and its author
         pending.push("code: the default branch is red");
+      } else if (gate?.holdRoute) {
+        // Test timeouts: re-checked quietly first; they go to the author if the re-check fails the same way
+        pending.push(`code: a test timeout, ${gate.text ?? "re-checked first"}`);
       } else if (settings.actions.code === "route") {
         this.routeToAuthor(record, code, s);
         pending.push("code: back to the author");
@@ -1353,6 +1392,9 @@ export class TriageService {
     for (const incident of store.openIncidents(project)) {
       if (incident.branch === settings.defaultBranch) this.advanceBisect(incident, s);
     }
+
+    // The gate system's re-checks: interrupted commands, expiry, the ones whose cool-down is over
+    this.gateRechecks.pump(s);
 
     const waiting = store.rechecksWithStatus(project, ["waiting_capacity"]);
     if (waiting.length === 0) return;
@@ -1955,6 +1997,8 @@ export class TriageService {
           this.action({ recordId: origin.id }, "recheck", "waiting", `one more re-check, asked by the owner`, undefined, undefined, by);
           this.pumpSync(s);
         }
+        // An escalated re-check in the gate system (gate-recheck.ts)
+        if (subject.startsWith("recheck:")) this.gateRechecks.followDecision(subject.slice("recheck:".length), resolution.optionId, by, s);
       }),
     );
     await this.drain();

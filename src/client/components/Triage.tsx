@@ -7,11 +7,17 @@
  * Revert and protect are the owner's: they send this browser's owner session
  * (sign in from the Decisions view) and ask for confirmation first; an
  * unproven suspect asks a second time.
+ *
+ * With triage.recheck.mode on, each failure also shows its re-check in the
+ * project's gate system (would re-check, queued, passed, failed again,
+ * expired, ...), and the flaky-test list is always shown.
  */
 import { Fragment, useState } from "react";
 import { useApi } from "../hooks/useApi";
 import { ownerHeaders } from "../owner-session";
 import type {
+  GateRecheck,
+  GateRecheckStatus,
   Incident,
   Recheck,
   TriageAction,
@@ -21,6 +27,73 @@ import type {
   TriageTask,
   FlakyTest,
 } from "../../shared/triage-types";
+
+/** A gate system re-check's state, as the view names it */
+const GATE_RECHECK_LABEL: Record<GateRecheckStatus, string> = {
+  would: "would re-check",
+  waiting: "waiting (cool-down)",
+  running: "queuing",
+  queued: "queued",
+  not_queued: "not queued",
+  refused: "not re-checked",
+  passed: "passed",
+  unproven: "unproven",
+  failed_again: "failed again",
+  failed_differently: "failed differently",
+  expired: "expired",
+};
+
+const GATE_RECHECK_BADGE: Record<GateRecheckStatus, string> = {
+  would: "badge-neutral",
+  waiting: "badge-warning",
+  running: "badge-warning",
+  queued: "badge-warning",
+  not_queued: "badge-error",
+  refused: "badge-neutral",
+  passed: "badge-success",
+  unproven: "badge-error",
+  failed_again: "badge-error",
+  failed_differently: "badge-neutral",
+  expired: "badge-error",
+};
+
+function GateRecheckBadge({ recheck }: { recheck: GateRecheck }) {
+  return (
+    <span className={`badge ${GATE_RECHECK_BADGE[recheck.status]}`} title={recheck.detail}>
+      {GATE_RECHECK_LABEL[recheck.status]}
+    </span>
+  );
+}
+
+function GateRechecks({ rechecks }: { rechecks: GateRecheck[] }) {
+  return (
+    <table className="table">
+      <tbody>
+        {rechecks.map((r) => (
+          <tr key={r.id}>
+            <td style={{ whiteSpace: "nowrap" }}>{time(r.createdAt)}</td>
+            <td>
+              {r.gateId} <span style={muted}>#{r.attempt} {r.kind}</span>
+            </td>
+            <td>
+              <GateRecheckBadge recheck={r} />
+            </td>
+            <td>
+              {r.detail}
+              {r.runId && <div style={muted}>its result: {r.runId}</div>}
+              {r.passedTests.length > 0 && <div style={muted}>passed: {r.passedTests.join(", ")}</div>}
+              {r.argv && (
+                <div style={muted}>
+                  <code>{r.argv.join(" ")}</code>
+                </div>
+              )}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
 
 interface Props {
   project: string;
@@ -101,13 +174,14 @@ function Actions({ actions }: { actions: TriageAction[] }) {
 }
 
 function FailureDetail({ id, project, refreshKey }: { id: string; project: string; refreshKey: number }) {
-  const detail = useApi<{ record: TriageRecord; actions: TriageAction[]; rechecks: Recheck[] }>(
+  const detail = useApi<{ record: TriageRecord; actions: TriageAction[]; rechecks: Recheck[]; gateRechecks?: GateRecheck[] }>(
     `/triage/failures/${id}`,
     project,
     refreshKey,
   );
   if (!detail.data) return <p style={muted}>{detail.error ?? "Loading..."}</p>;
   const { record, actions, rechecks } = detail.data;
+  const gateRechecks = detail.data.gateRechecks ?? [];
   return (
     <div style={{ padding: "0.5rem 0" }}>
       {record.resolution && <p style={muted}>{record.resolution}</p>}
@@ -146,6 +220,12 @@ function FailureDetail({ id, project, refreshKey }: { id: string; project: strin
           Re-checks:{" "}
           {rechecks.map((r) => `#${r.attempt} ${r.status}${r.reason ? ` (${r.reason})` : ""}`).join("; ")}
         </p>
+      )}
+      {gateRechecks.length > 0 && (
+        <>
+          <p style={muted}>Re-checks in the gate system:</p>
+          <GateRechecks rechecks={gateRechecks} />
+        </>
       )}
       <Actions actions={actions} />
     </div>
@@ -252,6 +332,7 @@ export function Triage({ project, refreshKey }: Props) {
   const failures = useApi<TriageRecord[]>("/triage/failures", project, key);
   const tasks = useApi<TriageTask[]>("/triage/tasks", project, key);
   const flaky = useApi<FlakyTest[]>("/triage/flaky", project, key);
+  const gateRechecks = useApi<GateRecheck[]>("/triage/gate-rechecks", project, key);
 
   if (status.loading && !status.data) return <div className="loading">Loading triage...</div>;
   if (status.error && !status.data) return <div className="error">Error: {status.error}</div>;
@@ -279,6 +360,10 @@ export function Triage({ project, refreshKey }: Props) {
   }
 
   const acting = s.mode === "act" && !s.actBlocked;
+  const gate = s.gateRecheck && s.gateRecheck.mode !== "off" ? s.gateRecheck : null;
+  // The newest gate system re-check of each failure (the list is newest first)
+  const latestRecheck = new Map<string, GateRecheck>();
+  for (const r of gateRechecks.data ?? []) if (!latestRecheck.has(r.recordId)) latestRecheck.set(r.recordId, r);
   return (
     <div>
       <div style={{ display: "flex", alignItems: "center", gap: "1rem", marginBottom: "1.5rem", flexWrap: "wrap" }}>
@@ -307,6 +392,7 @@ export function Triage({ project, refreshKey }: Props) {
                 <th>Verdict</th>
                 <th>Blocking</th>
                 <th>Retries</th>
+                {gate && <th>Re-check</th>}
                 <th>Status</th>
               </tr>
             </thead>
@@ -325,11 +411,12 @@ export function Triage({ project, refreshKey }: Props) {
                     <td>{r.verdict ? <span className={`badge ${CLASS_BADGE[r.verdict]}`}>{r.verdict}</span> : "—"}</td>
                     <td>{r.blocking ? "yes" : "no"}</td>
                     <td>{r.retries}</td>
+                    {gate && <td>{latestRecheck.has(r.id) ? <GateRecheckBadge recheck={latestRecheck.get(r.id)!} /> : "—"}</td>}
                     <td style={muted}>{r.resolution ?? ""}</td>
                   </tr>
                   {open === r.id && (
                     <tr>
-                      <td colSpan={7}>
+                      <td colSpan={gate ? 8 : 7}>
                         <FailureDetail id={r.id} project={project} refreshKey={key} />
                       </td>
                     </tr>
@@ -356,6 +443,30 @@ export function Triage({ project, refreshKey }: Props) {
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {gate && (
+        <div className="card">
+          <div style={{ display: "flex", alignItems: "center", gap: "1rem", flexWrap: "wrap" }}>
+            <h3 style={{ margin: 0 }}>Re-checks in the gate system</h3>
+            <span className={`badge ${gate.blocked ? "badge-neutral" : "badge-warning"}`}>{gate.blocked ? "Observe" : "Act"}</span>
+            <span style={muted}>
+              {gate.pending} pending{gate.blocked ? ` · not run: ${gate.blocked}` : ""}
+            </span>
+          </div>
+          {(gateRechecks.data ?? []).length === 0 ? (
+            <p style={muted}>No re-checks yet: infra, timeout and flaky failures are re-checked; real failures never are.</p>
+          ) : (
+            <GateRechecks rechecks={gateRechecks.data ?? []} />
+          )}
+        </div>
+      )}
+
+      {gate && (flaky.data ?? []).length === 0 && (
+        <div className="card">
+          <h3>Flaky tests</h3>
+          <p style={muted}>None yet. A test that timed out and passed on a quiet re-check is listed here.</p>
         </div>
       )}
 

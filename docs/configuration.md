@@ -1370,6 +1370,14 @@ The built-in infrastructure patterns (case-insensitive regular expressions, `def
 | `recheck.request_timeout_seconds` | number | `30` | The `recheck` command only starts the run; it is stopped after this |
 | `recheck.max_load_per_core`, `recheck.min_free_memory_mb` | number | — | Wait while this machine's load per core is above, or its free memory below, these |
 | `recheck.capacity_cmd` | array | — | Exits 0 when there is capacity (for example, a check of your CI runners) |
+| `recheck.mode` | `off` \| `observe` \| `act` | `off` | Re-checks in your own gate system ([below](#re-checks-for-an-existing-gate-system)): `observe` records each one it would ask for, with its argv; `act` runs `recheck.command`. It decides for that command alone, whatever `mode` says; a `read_only` project never runs it |
+| `recheck.command` | array | — | Enqueues a re-check in your gate system and returns. Required when `recheck.mode` is not `off` |
+| `recheck.max_per_result` | number | `2` | Re-checks per original result, re-checks of its re-checks included |
+| `recheck.cooldown_seconds` | number | `120` | No re-check sooner than this after the failure arrived |
+| `recheck.timeout_seconds` | number | `60` | `recheck.command` is stopped after this |
+| `recheck.expire_hours` | number | `3` | A queued re-check with no result by then expires: reported, not retried |
+| `recheck.kinds.infra`, `.timeout`, `.flaky` | `same` \| `failed_tests` \| `none` | `same`, `failed_tests`, `failed_tests` | Which re-check each kind of failure gets |
+| `recheck.max_tests` | number | `8` | `failed_tests` names at most this many tests |
 | `flaky.window_minutes` | number | `1440` | A pass at the same commit within this window makes a failure flaky |
 | `flaky.ticket_after` | number | `2` | Flaky this many times in a row opens a reliability task |
 | `flaky.ticket_deadline_days` | number | `7` | The task's deadline, which also ends the quarantine |
@@ -1408,7 +1416,7 @@ A node signs the whole gate result (`src/shared/policy-types.ts` `GateResult`, w
 {
   "signed": { "result": { "id": "...", "commitSha": "<full sha>", "nodeId": "ci-runner-1", "reports": [{ "name": "TEST-OrderServiceTest.xml", "step": "test", "sha256": "..." }], "...": "..." }, "signature": "<base64>", "nodePublicKey": "<PEM>" },
   "reports": [{ "name": "TEST-OrderServiceTest.xml", "content": "<testsuite ...>" }],
-  "recheckId": "<only when answering a re-check>"
+  "recheckId": "<only when answering a re-check: its id, or, for a re-check in your gate system, the failed result's id>"
 }
 ```
 
@@ -1456,6 +1464,55 @@ A project whose gates run in its own queue and runner scripts (not Lair pipeline
 
 `review.merge.gate.source: signed` verifies the same kind of signed result, posted to `POST /api/review/gate-results` (this command sends to triage only). It also checks the `pipelineVersion` against `merge.gate.pipeline_versions` (`--pipeline-version`), and it does not take a passed result with a skipped step or a passed step that took under 10 ms.
 
+### Re-checks for an existing gate system
+
+> Off by default (`recheck.mode: off`). Start with `observe`: triage records each re-check it would ask for, with the exact argv, and runs nothing.
+
+When your gates run in your own system, a gate that failed because of the environment (the container runtime was down, the run was killed, a remote machine dropped) or because the machine was overloaded (tests that time out under load) usually goes back to whoever submitted it, who then submits the whole gate again. With `recheck.mode: act`, triage asks your gate system to re-check it instead, through `recheck.command`, and links the re-check's result back to the failure.
+
+**Which re-check.** Triage decides from the classification it already makes, per cause:
+
+| Kind | When | `recheck.kinds` default |
+|------|------|-------------------------|
+| `infra` | The cause is `infra` (an infrastructure pattern, a killed step, a step timeout) | `same`: the same pipeline again, at the same commit |
+| `timeout` | A test failed with a timeout (`TimeoutException ... timed out after`, `TestTimedOutException`, `ConditionTimeoutException`, "test timed out", "Exceeded timeout of"), or the `timeout-under-load` rule matched because the result carried the machine's load (only an in-process result does). A signed result carries no load, so a test timeout in it is still classified `code`, and this is how it is re-checked first | `failed_tests`: only the failed tests, on a quiet machine |
+| `flaky` | The cause is `flaky` | `failed_tests` |
+
+Any other `code` cause is a **real failure: never re-checked**, and neither is a result that has one beside its other causes. `pre-existing` causes are left out. A kind set to `none` is not re-checked. `{tests}` lists the failed tests' ids from the JUnit reports (pytest node ids, else `<class>#<test>`, without a JUnit method's trailing `()`), only when each one uses safe characters (letters, digits and `. _ $ # : / -`) and there are at most `max_tests`; otherwise an `infra` failure falls back to `same`, and anything else is not re-checked. With `recheck.mode` on, an `infra` failure gets this re-check in place of the one Lair runs itself (`actions.infra`, `commands.recheck`); bisect probes still use `commands.recheck`.
+
+**The command** is an argv (no shell) that only enqueues the re-check and returns: it is stopped after `timeout_seconds`. Its placeholders: `{sha}` (full), `{pipeline}` (the result's `pipelineId`), `{branch}`, `{result_id}` (the failed result's id), `{reason}` (`<kind>:<rule>` items, comma-separated, such as `timeout:test-timeout`), `{kind}` (`same` or `failed_tests`), `{tests}` (a list: as a whole argument, one argument per test; inside a longer one, joined with `,`) and `{project}`. Every value is checked before the command runs (a full sha, a branch name, an id or a pipeline of letters, digits and `. _ : / -`, nothing that starts with `-`); a value that fails the check refuses that re-check, and the Triage view says which placeholder. Print the re-check's own result id on the first line of stdout: then only a result with that id answers it. Exit 0 means queued; any other exit, or a timeout, is reported and **never retried**.
+
+**The re-check's result** comes back as any result does (`lair-node gate-result submit`), with `--recheck <the failed result's id>` (`recheckId` in the body):
+
+- **It passes:** the failure is resolved, as infrastructure, or as flaky for a test that timed out (or was flaky) and passed. Those tests join the flaky-test list (`GET /api/triage/flaky`, the Triage view), with its reliability tasks and quarantine. A `failed_tests` re-check counts as passed only when its JUnit reports list every re-checked test as passed, and a `same` one when none of the failed steps failed or was skipped again; a bare "passed" is `unproven` and resolves nothing.
+- **It fails the same way** (the same cause, or one of a timeout's tests failing again but not on infrastructure): the failure is escalated as real, once, through one decision (the Decision Inbox, else `commands.raise_decision` or `decision_file`): fix the environment or treat it as real, re-check once more (while `max_per_result` allows), or ignore. Its code causes go back to the author.
+- **It fails differently:** it is a new failure, triaged on its own; it can be re-checked too, from the same `max_per_result` budget.
+
+**Budget and safety.** At most `max_per_result` re-checks for one original result (re-checks of its re-checks count). None sooner than `cooldown_seconds` after the failure arrived, and none while another for the same commit and pipeline is pending. A queued re-check with no result after `expire_hours` expires: it is reported on the failure, never retried. In act mode, a test timeout goes back to its author (`actions.code: route`) only when its re-check fails the same way, is unproven, expires or can't be queued. Re-checks are stored rows: after a restart, a waiting one runs when its cool-down ends, and one whose command was running when the server stopped is kept as queued (the command may have queued it) until its result or its expiry, and is never run again. Events: `triage.recheck_would`, `triage.recheck_queued`, `triage.recheck_resolved` (with `outcome`: `passed`, `unproven`, `failed_differently`, `expired` or `not_queued`) and `triage.recheck_escalated`.
+
+```yaml
+triage:
+  enabled: true
+  mode: observe                # triage itself still only observes
+  trusted_nodes:
+    - id: ci-gates
+      public_key_file: ./data/keys/ci-gates.pub
+  recheck:
+    mode: observe              # off | observe | act
+    command: ["./ci/bin/enqueue-recheck", "{sha}", "{pipeline}", "{kind}", "{result_id}", "{reason}", "{tests}"]
+    max_per_result: 2
+    cooldown_seconds: 120
+    timeout_seconds: 60
+    expire_hours: 3
+    kinds:
+      infra: same              # the same pipeline at the same commit
+      timeout: failed_tests    # only the failed tests, on a quiet machine
+      flaky: failed_tests
+    max_tests: 8
+```
+
+The script re-validates what it gets (it is your gate system's front door), enqueues the run, prints its result id and exits 0. For example: for `same`, the failed gate's own command again; for `failed_tests`, the test runner with only those tests, on the least loaded machine. It should make the new run's command differ from the failed one if your queue shares identical runs' results, and keep the original submitter from submitting the whole gate again while the re-check is pending. Its runner then submits the result with `--recheck <result_id>`.
+
 ### Triage API
 
 `?project=` defaults to the default project:
@@ -1464,6 +1521,7 @@ A project whose gates run in its own queue and runner scripts (not Lair pipeline
 - `GET /api/triage/status`: mode, why commands don't run, config errors, counts per class, pending re-checks, open tasks, quarantined tests, the newest open incident and how many are open, which commands are set, and the trusted nodes
 - `GET /api/triage/failures?verdict=&blocking=true|false&sha=&limit=100`, `GET /api/triage/failures/<id>`: each cause's verdict and evidence, the actions taken (with their argv and who acted) and the re-checks
 - `GET /api/triage/rechecks?limit=100`
+- `GET /api/triage/gate-rechecks?limit=100`: the re-checks in your gate system, newest first, with their state (`would`, `waiting`, `running`, `queued`, `not_queued`, `refused`, `passed`, `unproven`, `failed_again`, `failed_differently`, `expired`), argv, the result id the command printed and the tests that passed; `GET /api/triage/failures/<id>` lists a failure's as `gateRechecks`
 - `GET /api/triage/incidents?status=open|resolved|all&limit=50`, `GET /api/triage/incidents/<id>`: the bisect's candidates, probes, culprit and revert status
 - `GET /api/triage/tasks?status=open|resolved|all`, `GET /api/triage/flaky`, `GET /api/triage/protected`
 

@@ -4,6 +4,7 @@
  */
 import { z } from "zod";
 import type { ProjectConfig } from "../../shared/types.js";
+import { GATE_RECHECK_KEYS, parseGateRecheck, type GateRecheckSettings } from "./gate-recheck-config.js";
 
 export const INFRA_KINDS = ["network", "container", "oom", "runner", "disk", "load"] as const;
 export type InfraKind = (typeof INFRA_KINDS)[number];
@@ -161,6 +162,8 @@ export const TriageSchema = z
         min_free_memory_mb: z.number().min(0).optional(),
         /** Exits 0 when there is capacity for a re-check */
         capacity_cmd: argv.optional(),
+        // Re-checks in the project's own gate system (gate-recheck-config.ts)
+        ...GATE_RECHECK_KEYS,
       })
       .strict()
       .default({}),
@@ -227,6 +230,8 @@ export interface TriageSettings {
     minFreeMemoryMb?: number;
     capacityCmd?: string[];
   };
+  /** Re-checks in the project's own gate system (triage.recheck.mode, command, ...) */
+  gateRecheck: GateRecheckSettings;
   flaky: {
     windowMinutes: number;
     ticketAfter: number;
@@ -321,6 +326,8 @@ export function parseTriageConfig(raw: unknown): TriageParseResult {
     }
   }
 
+  const gateRecheck = parseGateRecheck(value.recheck, errors);
+
   const nodeIds = new Set<string>();
   for (const node of value.trusted_nodes) {
     if (nodeIds.has(node.id)) errors.push(`triage.trusted_nodes: duplicate node id ${node.id}`);
@@ -356,6 +363,7 @@ export function parseTriageConfig(raw: unknown): TriageParseResult {
         minFreeMemoryMb: value.recheck.min_free_memory_mb,
         capacityCmd: value.recheck.capacity_cmd,
       },
+      gateRecheck,
       flaky: {
         windowMinutes: value.flaky.window_minutes,
         ticketAfter: value.flaky.ticket_after,

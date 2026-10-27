@@ -252,6 +252,11 @@ export type EventType =
   // Triage (src/server/triage/)
   | "triage.classified"
   | "triage.recheck_requested"
+  // Re-checks for an existing gate system: {project, recheck, ...}
+  | "triage.recheck_would"
+  | "triage.recheck_queued"
+  | "triage.recheck_resolved"
+  | "triage.recheck_escalated"
   | "triage.routed"
   | "triage.task_created"
   | "triage.decision_requested"

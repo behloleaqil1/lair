@@ -9,10 +9,12 @@
  * the owner's credential (src/server/human-auth/).
  *
  *   POST   /api/triage/results                 {signed, reports?, recheckId?}: a signed gate result -> its triage
+ *                                              (recheckId: a Lair re-check's id, or the id of the result a gate system re-checks)
  *   GET    /api/triage/status                  mode, counts, the incident, commands, trusted nodes
  *   GET    /api/triage/failures?verdict=&blocking=&sha=&limit=
  *   GET    /api/triage/failures/:id            causes, verdicts, evidence, actions, re-checks
  *   GET    /api/triage/rechecks?limit=
+ *   GET    /api/triage/gate-rechecks?limit=    re-checks in the project's own gate system (triage.recheck.mode)
  *   GET    /api/triage/incidents?status=&limit=
  *   GET    /api/triage/incidents/:id           bisect state, actions and probes
  *   GET    /api/triage/tasks?status=
@@ -165,7 +167,8 @@ const SignedBody = z.object({
     nodePublicKey: z.string().max(10_000).default(""),
   }),
   reports: ReportsSchema,
-  recheckId: z.string().regex(UUID, "not a re-check id").optional(),
+  // A Lair re-check's id (a UUID), or the id of the result a gate system re-checks (gate-recheck.ts)
+  recheckId: z.string().regex(GATE_ID, "not a re-check id or a gate result id").optional(),
 });
 
 /** Validate a trusted, in-process result (the gate.completed event's payload). */
@@ -312,6 +315,7 @@ export async function registerTriageRoutes(
         record,
         actions: store.actionsFor({ recordId: record.id }),
         rechecks: store.rechecksFor({ recordId: record.originId ?? record.id }),
+        gateRechecks: store.gateRechecks.related(record.id),
       });
     });
 
@@ -320,6 +324,13 @@ export async function registerTriageRoutes(
       if (!query.success) return fail(reply, 400, invalid(query.error));
       const store = manager.getStore();
       return respond(store ? store.listRechecks(projectOf(query.data), query.data.limit) : []);
+    });
+
+    app.get("/api/triage/gate-rechecks", async (request, reply) => {
+      const query = ListQuery.safeParse(request.query ?? {});
+      if (!query.success) return fail(reply, 400, invalid(query.error));
+      const store = manager.getStore();
+      return respond(store ? store.gateRechecks.list(projectOf(query.data), query.data.limit) : []);
     });
 
     app.get("/api/triage/incidents", async (request, reply) => {

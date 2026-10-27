@@ -292,6 +292,7 @@ export class TriageManager {
         openIncidents: 0,
         commands: {},
         trustedNodes: [],
+        gateRecheck: null,
       };
     }
     const settings = service.settings;
@@ -312,6 +313,7 @@ export class TriageManager {
       openIncidents: open.length,
       commands: service.commands,
       trustedNodes: service.trustedNodes,
+      gateRecheck: service.gateRecheckStatus,
     };
   }
 }

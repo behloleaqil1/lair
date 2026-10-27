@@ -34,8 +34,10 @@ import type {
   Verdict,
 } from "../../shared/triage-types.js";
 import { TRIAGE_CLASSES } from "../../shared/triage-types.js";
+import { GATE_RECHECK_SCHEMA, GateRecheckStore } from "./gate-recheck-store.js";
 
-const SCHEMA_VERSION = 1;
+/** 2: triage_gate_rechecks (gate-recheck-store.ts) */
+const SCHEMA_VERSION = 2;
 /** Rows of an IN (...) list per statement, well below SQLite's variable limit */
 const CHUNK = 500;
 
@@ -371,6 +373,8 @@ function chunks<T>(items: T[], size = CHUNK): T[][] {
 
 export class TriageStore {
   private db: Database.Database;
+  /** Re-checks in a project's own gate system (gate-recheck.ts) */
+  readonly gateRechecks: GateRecheckStore;
 
   /** `dbPath` may be ":memory:" */
   constructor(dbPath: string) {
@@ -382,9 +386,12 @@ export class TriageStore {
     if (dbPath !== ":memory:") this.db.pragma("journal_mode = WAL");
     const version = this.db.pragma("user_version", { simple: true }) as number;
     if (version < SCHEMA_VERSION) {
+      // Every statement is CREATE ... IF NOT EXISTS: a version 1 store gets the tables version 2 added
       this.db.exec(SCHEMA);
+      this.db.exec(GATE_RECHECK_SCHEMA);
       this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
     }
+    this.gateRechecks = new GateRecheckStore(this.db);
   }
 
   close(): void {

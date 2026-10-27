@@ -291,7 +291,8 @@ names; flags override its fields):
   --started <time>         ISO 8601 or Unix seconds (default: --finished minus the steps' durations)
   --finished <time>        (default: now)
   --pipeline-version <v>   what review's gate.source: signed compares with review.merge.gate.pipeline_versions
-  --recheck <id>           this result answers the triage re-check with this id
+  --recheck <id>           this result answers the triage re-check with this id, or, for a
+                           re-check triage asked your gate system for, the failed result's id
 
   --timeout <seconds>      for the request (default 30)
   --dry-run                print the signed request instead of sending it

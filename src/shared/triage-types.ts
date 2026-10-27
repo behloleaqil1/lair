@@ -318,6 +318,85 @@ export interface ProtectedMerge {
   createdAt: string;
 }
 
+// ============ RE-CHECKS FOR AN EXISTING GATE SYSTEM (src/server/triage/gate-recheck.ts) ============
+
+/**
+ * What made a failure worth re-checking: infra (the classifier's infra
+ * class), timeout (a test that failed with a timeout, or a timeout under
+ * load) or flaky (the flaky class). A real failure is never re-checked.
+ */
+export type GateRecheckCause = "infra" | "timeout" | "flaky";
+
+/** same: the same pipeline at the same commit; failed_tests: only the failed tests, on a quiet machine */
+export type GateRecheckKind = "same" | "failed_tests";
+
+/**
+ * would: observe mode (or read_only), recorded with the argv it would run;
+ * waiting: for its cool-down; running: the command is enqueuing it; queued:
+ * the command enqueued it, waiting for its result; not_queued: the command
+ * failed or timed out; refused: not re-checked (a placeholder value that is
+ * not valid, one pending for the same commit and pipeline); passed;
+ * unproven: "passed" without showing the re-checked tests passing;
+ * failed_again: failed the same way, escalated; failed_differently: a new
+ * failure; expired: no result in time.
+ */
+export type GateRecheckStatus =
+  | "would"
+  | "waiting"
+  | "running"
+  | "queued"
+  | "not_queued"
+  | "refused"
+  | "passed"
+  | "unproven"
+  | "failed_again"
+  | "failed_differently"
+  | "expired";
+
+/** A re-check that the project's gate system runs (triage.recheck.command enqueues it). */
+export interface GateRecheck {
+  id: string;
+  project: string;
+  /** The failure re-checked (a triage record) */
+  recordId: string;
+  /** The first failure of the chain: re-checks of re-checks share its max_per_result */
+  rootId: string;
+  /** The failure's result id: {result_id}, and what the re-check's result names as recheckId */
+  gateId: string;
+  sha: string;
+  pipelineId: string;
+  branch: string;
+  causes: GateRecheckCause[];
+  kind: GateRecheckKind;
+  /** {reason}: "<cause>:<rule>" items, comma-separated */
+  reason: string;
+  /** {tests}: the failed tests' ids (failed_tests only) */
+  tests: string[];
+  /** The re-checked tests' keys (TestRef.key) */
+  keys: string[];
+  /** The re-checked causes' signatures */
+  signatures: string[];
+  attempt: number;
+  status: GateRecheckStatus;
+  detail: string;
+  /** The command it runs, or would run */
+  argv?: string[];
+  output?: string;
+  /** The result id the command printed: only that result answers it */
+  runId?: string;
+  /** The triage record of the result that answered it */
+  answerId?: string;
+  /** The re-checked tests that passed */
+  passedTests: string[];
+  /** The failure's code causes (test timeouts) are not routed to the author until it is answered */
+  holdRoute: boolean;
+  /** It runs no sooner than this (cooldown_seconds) */
+  notBefore: string;
+  createdAt: string;
+  queuedAt?: string;
+  completedAt?: string;
+}
+
 export interface TriageProjectStatus {
   project: string;
   enabled: boolean;
@@ -342,4 +421,6 @@ export interface TriageProjectStatus {
   commands: Record<string, boolean>;
   /** Node ids whose signed results are accepted over HTTP */
   trustedNodes: string[];
+  /** Re-checks for an existing gate system (triage.recheck.mode), when triage runs */
+  gateRecheck: { mode: "off" | "observe" | "act"; blocked: string | null; pending: number } | null;
 }

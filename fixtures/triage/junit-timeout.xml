@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Invented: two JUnit 5 @Timeout failures on a loaded machine (the tests pass when they run alone) -->
+<testsuite name="com.example.shop.orders.OrderServiceTest" tests="3" failures="0" errors="2" skipped="0" time="21.304">
+  <testcase name="createsOrder()" classname="com.example.shop.orders.OrderServiceTest" time="10.012">
+    <error message="createsOrder() timed out after 10 seconds" type="java.util.concurrent.TimeoutException">java.util.concurrent.TimeoutException: createsOrder() timed out after 10 seconds
+	at org.junit.jupiter.engine.extension.TimeoutExceptionFactory.create(TimeoutExceptionFactory.java:29)
+	at org.junit.jupiter.engine.extension.SameThreadTimeoutInvocation.proceed(SameThreadTimeoutInvocation.java:58)
+	at com.example.shop.orders.OrderServiceTest.createsOrder(OrderServiceTest.java:42)
+</error>
+  </testcase>
+  <testcase name="listsOrders()" classname="com.example.shop.orders.OrderServiceTest" time="10.008">
+    <error message="listsOrders() timed out after 10 seconds" type="java.util.concurrent.TimeoutException">java.util.concurrent.TimeoutException: listsOrders() timed out after 10 seconds
+	at org.junit.jupiter.engine.extension.TimeoutExceptionFactory.create(TimeoutExceptionFactory.java:29)
+	at com.example.shop.orders.OrderServiceTest.listsOrders(OrderServiceTest.java:57)
+</error>
+  </testcase>
+  <testcase name="cancelsOrder()" classname="com.example.shop.orders.OrderServiceTest" time="1.284"/>
+</testsuite>
