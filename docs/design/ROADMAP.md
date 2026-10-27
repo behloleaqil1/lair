@@ -29,9 +29,18 @@ any machines.
 
 ## Next, in order
 
-Lair now runs its first project's development day to day, so Lair itself is the focus. The goal of version 1: **an
-engineer of any level describes an application (or points Lair at a repository), picks the AI tools and models they
-have, and Lair takes it from nothing to a running app**, with a dashboard that is clear to use. The order:
+Lair now runs its first project's development day to day, so Lair itself is the focus.
+
+**What Lair is for:** Lair builds **enterprise-grade applications from ground zero**:
+- **at scale and in the shortest time**, with many agents working in parallel;
+- **to a high standard of quality**, with very few bugs: gates, reviews by risk tier, triage and a quality pipeline
+  on every change;
+- **highly configurable**, with any AI tool and model and every policy a setting;
+- **automating the whole of development organically**, from version control, planning and code through tests,
+  reviews and merges to deployments and product analytics.
+
+The engineer, of any level, describes the application (or points Lair at a repository), picks the AI tools and models
+they have, and answers only the decisions that are theirs. Every step below is judged against that. The order:
 
 1. **A: unattended operation and the experience of using Lair**: the supervisor, AI roles, the new look and Settings.
 2. **C1-C4: from an idea to a running app**: documents become work, documents first, a new project from scratch.
