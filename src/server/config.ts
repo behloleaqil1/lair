@@ -9,6 +9,7 @@ import {
   parseDragonRegistry,
   parseAvailableModels,
   validateAllDragons,
+  validateDragonDefaults,
 } from "./parsers/dragon-config.js";
 
 const PROJECTS_DIR = join(process.cwd(), "projects");
@@ -85,6 +86,12 @@ export function loadProjectConfig(name: string): ProjectConfig {
     throw new Error(
       `Invalid project config: missing required fields in ${configPath}`,
     );
+  }
+
+  // Optional keys that apply to every dragon: a mistake there fails loudly
+  const problems = validateDragonDefaults(config);
+  if (problems.length > 0) {
+    throw new Error(`Invalid project config ${name}: ${problems.join("; ")}`);
   }
 
   return config;

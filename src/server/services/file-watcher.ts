@@ -6,6 +6,7 @@ import { watch, FSWatcher } from "chokidar";
 import { readFileSync, existsSync, statSync } from "fs";
 import { join, basename } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
+import { parseGateFilename } from "../parsers/gates.js";
 import type {
   LairWebSocketServer,
   DragonUpdateData,
@@ -274,7 +275,8 @@ export class FileWatcherService {
           id: dragonId,
           event: "log_line",
           lastLogLine: lastLine.slice(0, 200), // Truncate for the summary
-          lastLogTime: new Date().toISOString(),
+          // The log's mtime, as GET /api/dragons reports it
+          lastLogTime: stats.mtime.toISOString(),
         };
         this.wsServer.broadcastDragonUpdate(update, this.config.name);
 
@@ -296,30 +298,18 @@ export class FileWatcherService {
     filename: string,
     event: "add" | "change" | "unlink",
   ): void {
-    // Gate queue files: *.req, *.req.running, etc.
-    if (path.includes("/queue/")) {
-      if (filename.endsWith(".req") && event === "add") {
-        // New gate queued
-        const gateId = this.parseGateId(filename);
-        if (gateId) {
-          console.log(`[FileWatcher] Gate queued: ${gateId}`);
-          const update: GateUpdateData = {
-            id: gateId,
-            event: "queued",
-          };
-          this.wsServer.broadcastGateUpdate(update, this.config.name);
-        }
-      } else if (filename.includes(".req.running") && event === "add") {
-        // Gate started running
-        const gateId = this.parseGateId(filename);
-        if (gateId) {
-          console.log(`[FileWatcher] Gate started: ${gateId}`);
-          const update: GateUpdateData = {
-            id: gateId,
-            event: "started",
-          };
-          this.wsServer.broadcastGateUpdate(update, this.config.name);
-        }
+    // Gate queue files: <lane>.<priority>.<gate-id>.req (queued), .req.run (running), ...
+    if (path.includes("/queue/") && event === "add") {
+      const gate = parseGateFilename(filename);
+      if (gate && (gate.status === "queued" || gate.status === "running")) {
+        const queued = gate.status === "queued";
+        console.log(`[FileWatcher] Gate ${queued ? "queued" : "started"}: ${gate.id} (${gate.lane})`);
+        const update: GateUpdateData = {
+          id: gate.id,
+          event: queued ? "queued" : "started",
+          lane: gate.lane,
+        };
+        this.wsServer.broadcastGateUpdate(update, this.config.name);
       }
     }
 
@@ -353,21 +343,6 @@ export class FileWatcherService {
         this.config.name,
       );
     }
-  }
-
-  /**
-   * Parse gate ID from filename.
-   * Format: heavy.0.20260101T000000Z-example-track.req
-   */
-  private parseGateId(filename: string): string | null {
-    // Remove extensions
-    const base = filename.replace(/\.(req|running|log|rc).*$/, "");
-    // Extract the timestamp-based ID part
-    const parts = base.split(".");
-    if (parts.length >= 3) {
-      return parts.slice(2).join(".");
-    }
-    return base;
   }
 
   /**

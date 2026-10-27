@@ -88,12 +88,21 @@ function respondError(error: string): ApiResponse<never> {
 // Get data service for project (cached per request cycle)
 const dataServices = new Map<string, DataService>();
 
+// The agents module's runs, for the Dragons view: a dragon it runs is
+// running, "managed by Lair". Set once the module is loaded, below.
+let managedRuns: Pick<AgentsManager, "managedRuns"> | null = null;
+
 function getDataService(project?: string): DataService {
   const projectName = project || getDefaultProject();
 
   if (!dataServices.has(projectName)) {
     const config = loadProjectConfig(projectName);
-    dataServices.set(projectName, new DataService(config));
+    dataServices.set(
+      projectName,
+      new DataService(config, {
+        managedRuns: () => managedRuns?.managedRuns(projectName) ?? new Map(),
+      }),
+    );
   }
 
   return dataServices.get(projectName)!;
@@ -374,6 +383,7 @@ const agents = new AgentsManager({
   budget: getBudgetManager(),
 });
 agents.load(projectEntries);
+managedRuns = agents;
 
 // Progress watchdog: one per project with `watchdog.enabled: true` (off by
 // default). Its routes are read-only and answer for every project. It reads

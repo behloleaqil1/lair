@@ -2,7 +2,17 @@
  * Data service - reads files from the configured project paths
  * All operations are READ-ONLY
  */
-import { readFileSync, existsSync, readdirSync, statSync } from "fs";
+import {
+  readFileSync,
+  existsSync,
+  readdirSync,
+  statSync,
+  openSync,
+  fstatSync,
+  readSync,
+  closeSync,
+  constants,
+} from "fs";
 import { join } from "path";
 import { execSync, execFileSync } from "child_process";
 import type {
@@ -19,6 +29,7 @@ import type {
   GateResult,
   RunnerStatus,
   MergedPR,
+  ManagedRunInfo,
 } from "../../shared/types.js";
 import {
   parseQueueFile,
@@ -44,7 +55,8 @@ import {
   findDuplicates,
   isStaleRun,
 } from "../parsers/gates.js";
-import { parseDragonRegistry } from "../parsers/dragon-config.js";
+import { hasOwnModel } from "../parsers/dragon-config.js";
+import { mergeDragonRegistry } from "./dragon-registry.js";
 
 /**
  * Safe file read - returns null if file doesn't exist
@@ -130,8 +142,53 @@ function isPidRunning(pid: string): boolean {
   return safeExecFile("ps", ["-p", pid, "-o", "pid="]) !== null;
 }
 
+/** How many of a dragon's newest logs (by name) are checked for the newest by mtime */
+const LOG_CANDIDATES = 20;
+/** The end of a dragon's log that its last line is read from */
+const DRAGON_LOG_TAIL_BYTES = 64 * 1024;
+/** The end of a gate result's log that failed steps are read from */
+const RESULT_LOG_TAIL_BYTES = 1024 * 1024;
+/** At most this many recent gate results (newest first) */
+const RECENT_RESULTS_LIMIT = 100;
+/** The longest window /api/gates/results looks back */
+const MAX_RESULT_HOURS = 24 * 30;
+/** A result written a little "in the future" (another machine's clock) still counts */
+const CLOCK_SKEW_MS = 5 * 60 * 1000;
+
+/**
+ * The last `maxBytes` of a regular file as UTF-8, or null. Opened without
+ * blocking, so a FIFO planted where a log should be can't hang the server.
+ */
+function readTail(path: string, maxBytes: number): string | null {
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return null;
+    const length = Math.min(stat.size, maxBytes);
+    const buffer = Buffer.alloc(length);
+    const read = readSync(fd, buffer, 0, length, stat.size - length);
+    return buffer.subarray(0, read).toString("utf-8");
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+export interface DataServiceOptions {
+  /**
+   * The agents module's active runs per dragon id (AgentsManager.managedRuns
+   * for this project): such a dragon is running, "managed by Lair"
+   */
+  managedRuns?: () => Map<string, ManagedRunInfo>;
+}
+
 export class DataService {
-  constructor(private config: ProjectConfig) {}
+  constructor(
+    private config: ProjectConfig,
+    private options: DataServiceOptions = {},
+  ) {}
 
   // ============ QUEUE ============
 
@@ -153,48 +210,51 @@ export class DataService {
 
   // ============ DRAGONS ============
 
+  /**
+   * The dragons of dragons.txt (and any dragon the agents module has a run
+   * for), with:
+   * - running: a `<id>.running` directory, or an active run in the agents
+   *   module (managedRun: its state, e.g. working or hung);
+   * - lastLogTime: when its newest log (`<id>-<UTC>.log` or `<id>.log`) was
+   *   last written, that file's mtime; lastLogLine: that file's last line;
+   * - model and adapter: its own (YAML dragons:), else dragon_defaults';
+   *   modelFromDefault says which.
+   */
   getDragons(): Dragon[] {
-    const dragonsPath = join(this.config.agents_dir, "dragons.txt");
-    const content = safeReadFile(dragonsPath);
-    if (!content) return [];
+    const content = safeReadFile(join(this.config.agents_dir, "dragons.txt")) ?? "";
+    const listed = parseDragonsFile(content);
+    // The YAML dragons: with dragons.txt, dragon_defaults applied (as start/stop and the agents module see them)
+    const registry = mergeDragonRegistry(this.config, content);
+    const managed = this.managedRuns();
 
-    const baseDragons = parseDragonsFile(content);
-    const runningDirs = safeListDir(this.config.agents_dir).filter((d) =>
-      d.endsWith(".running"),
+    // A dragon the agents module runs is shown even when dragons.txt doesn't list it
+    const listedIds = new Set(listed.map((d) => d.id));
+    for (const [id, run] of managed) {
+      const known = registry.get(id);
+      if (known && !listedIds.has(id)) {
+        listed.push({ id, name: known.name, task: run.task });
+        listedIds.add(id);
+      }
+    }
+    if (listed.length === 0) return [];
+
+    const entries = safeListDir(this.config.agents_dir);
+    const runningDirs = entries.filter((d) => d.endsWith(".running"));
+    const logFiles = entries.filter((f) => f.endsWith(".log"));
+    const logsByDragon = matchLogsToDragons(
+      logFiles,
+      listed.map((d) => d.id),
     );
-
-    const logFiles = safeListDir(this.config.agents_dir).filter((f) =>
-      f.endsWith(".log"),
-    );
-
-    const dragonIds = baseDragons.map((d) => d.id);
-    const logsByDragon = matchLogsToDragons(logFiles, dragonIds);
 
     const queueLines = this.getQueueLines();
     const gateResults = this.getGateResultsMap();
 
-    // Get dragon registry from config (phase 4)
-    const dragonRegistry = parseDragonRegistry(this.config);
-
-    return baseDragons.map((d) => {
-      const running = isDragonRunning(runningDirs, d.id);
-      const logs = logsByDragon.get(d.id) || [];
-      const recentLog = getMostRecentLog(logs);
-
-      let lastLogTime: string | undefined;
-      let lastLogLine: string | undefined;
-
-      if (recentLog) {
-        const logPath = join(this.config.agents_dir, recentLog);
-        const logContent = safeReadFile(logPath);
-        if (logContent) {
-          const parsed = parseLogLastLine(logContent);
-          if (parsed) {
-            lastLogTime = parsed.time;
-            lastLogLine = parsed.line;
-          }
-        }
-      }
+    return listed.map((d) => {
+      const run = managed.get(d.id);
+      const newest = this.newestLog(logsByDragon.get(d.id) || []);
+      const parsed = newest
+        ? parseLogLastLine(readTail(newest.path, DRAGON_LOG_TAIL_BYTES) ?? "")
+        : null;
 
       const queueStats = calculateAgentStats(queueLines, d.id);
       const stats = calculateDragonStats(
@@ -203,22 +263,54 @@ export class DataService {
         queueStats,
       );
 
-      // Get config-derived fields (phase 4)
-      const dragonConfig = dragonRegistry.get(d.id);
+      // Config-derived fields (phase 4)
+      const dragonConfig = registry.get(d.id);
+      const model = dragonConfig?.model || undefined;
 
       return {
         ...d,
-        running,
-        lastLogTime,
-        lastLogLine,
+        running: run !== undefined || isDragonRunning(runningDirs, d.id),
+        lastLogTime: newest ? new Date(newest.mtimeMs).toISOString() : undefined,
+        lastLogLine: parsed?.line,
         stats,
-        // Add config-derived fields
-        model: dragonConfig?.model,
-        machine: dragonConfig?.machine,
-        instructions: dragonConfig?.instructions,
+        model,
+        modelFromDefault: model !== undefined && !hasOwnModel(this.config, d.id),
+        machine: dragonConfig?.machine || undefined,
+        instructions: dragonConfig?.instructions || undefined,
         adapter: dragonConfig?.adapter,
+        ...(run ? { managedRun: run } : {}),
       };
     });
+  }
+
+  /** The agents module's active runs per dragon (none without the module). */
+  private managedRuns(): Map<string, ManagedRunInfo> {
+    try {
+      return this.options.managedRuns?.() ?? new Map();
+    } catch {
+      return new Map();
+    }
+  }
+
+  /**
+   * The newest of a dragon's logs by mtime. Only the newest few by name are
+   * looked at (their names carry a UTC stamp), so a directory of old logs
+   * costs no more than a handful of stats.
+   */
+  private newestLog(files: string[]): { path: string; mtimeMs: number } | null {
+    let newest: { path: string; mtimeMs: number } | null = null;
+    for (const file of [...files].sort().reverse().slice(0, LOG_CANDIDATES)) {
+      const path = join(this.config.agents_dir, file);
+      try {
+        const stat = statSync(path);
+        if (stat.isFile() && (newest === null || stat.mtimeMs > newest.mtimeMs)) {
+          newest = { path, mtimeMs: stat.mtimeMs };
+        }
+      } catch {
+        // Gone since the listing
+      }
+    }
+    return newest;
   }
 
   getDragonById(id: string): Dragon | null {
@@ -262,13 +354,13 @@ export class DataService {
     return gates
       .filter((g) => g.status === "running")
       .map((gate) => {
-        // Try to read current step from log
+        // Try to read current step from log: <lane>.<priority>.<gate-id>.log
         const logPath = join(
           this.config.gates_dir,
           "queue",
-          `${gate.lane}.${gate.priority}.${gate.id.split("-")[0]}-${gate.track}-${gate.headSha}-${gate.id.split("-").pop()}.log`,
+          `${gate.lane}.${gate.priority}.${gate.id}.log`,
         );
-        const content = safeReadFile(logPath);
+        const content = readTail(logPath, RESULT_LOG_TAIL_BYTES);
         if (content) {
           const { currentStep } = parseGateLog(content);
           return { ...gate, currentStep };
@@ -295,36 +387,49 @@ export class DataService {
     return results;
   }
 
-  getRecentGateResults(hours = 24): GateResult[] {
+  /**
+   * The results written in the last `hours` hours, newest first, at most
+   * `limit`. A result's time is when it was written (its .rc file's mtime),
+   * returned as finishedAt; one more than a few minutes in the future (a
+   * clock ahead, a copied file) is not counted as recent.
+   */
+  getRecentGateResults(
+    hours = 24,
+    limit = RECENT_RESULTS_LIMIT,
+    now = Date.now(),
+  ): GateResult[] {
     const resultsDir = join(this.config.gates_dir, "results");
-    const files = safeListDir(resultsDir);
+    const span =
+      Number.isFinite(hours) && hours > 0 ? Math.min(hours, MAX_RESULT_HOURS) : 24;
+    const cutoff = now - span * 60 * 60 * 1000;
+    const latest = now + CLOCK_SKEW_MS;
 
-    const cutoff = Date.now() - hours * 60 * 60 * 1000;
-    const results: GateResult[] = [];
-
-    for (const file of files) {
+    const recent: { id: string; rcPath: string; mtimeMs: number }[] = [];
+    for (const file of safeListDir(resultsDir)) {
       if (!file.endsWith(".rc")) continue;
-
-      const id = file.replace(".rc", "");
+      const id = file.slice(0, -".rc".length);
+      if (!isSafeGateId(id)) continue;
       const rcPath = join(resultsDir, file);
-      const logPath = join(resultsDir, `${id}.log`);
-
-      // Check file modification time
       try {
         const stat = statSync(rcPath);
-        if (stat.mtimeMs < cutoff) continue;
+        if (!stat.isFile() || stat.mtimeMs < cutoff || stat.mtimeMs > latest) continue;
+        recent.push({ id, rcPath, mtimeMs: stat.mtimeMs });
       } catch {
         continue;
       }
+    }
+    // Newest first; for the same time, the later id first
+    recent.sort(
+      (a, b) => b.mtimeMs - a.mtimeMs || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0),
+    );
 
-      const rcContent = safeReadFile(rcPath);
-      const logContent = safeReadFile(logPath);
-
-      if (!rcContent) continue;
-
-      const rc = parseGateRc(rcContent);
+    const results: GateResult[] = [];
+    for (const { id, rcPath, mtimeMs } of recent) {
+      if (results.length >= limit) break;
+      const rc = parseGateRc(readTail(rcPath, 1024) ?? "");
       if (rc === null) continue;
 
+      const logContent = readTail(join(resultsDir, `${id}.log`), RESULT_LOG_TAIL_BYTES);
       const { failedSteps } = logContent
         ? parseGateLog(logContent)
         : { failedSteps: [] };
@@ -332,6 +437,7 @@ export class DataService {
       results.push({
         id,
         rc,
+        finishedAt: new Date(mtimeMs).toISOString(),
         failedSteps: failedSteps.length > 0 ? failedSteps : undefined,
       });
     }
@@ -592,25 +698,33 @@ export class DataService {
       });
     }
 
-    // Silent agents
+    // Silent agents: only a known log time can be silent; an unknown one is said so
     for (const dragon of dragons) {
-      if (dragon.running && isLogSilent(dragon.lastLogTime, 45)) {
+      if (!dragon.running) continue;
+      if (!dragon.lastLogTime) {
+        problems.push({
+          type: "log_time_unknown",
+          severity: "warning",
+          message: `${dragon.name} (${dragon.id}): log time unknown`,
+          details: `No log of it (${dragon.id}-<UTC>.log or ${dragon.id}.log) in agents_dir`,
+        });
+      } else if (isLogSilent(dragon.lastLogTime, 45)) {
         problems.push({
           type: "silent_agent",
           severity: "warning",
           message: `${dragon.name} (${dragon.id}) silent > 45 min`,
-          details: `Last log: ${dragon.lastLogTime || "unknown"}`,
+          details: `Last log: ${dragon.lastLogTime}`,
         });
       }
     }
 
-    // No runner for lane with queued gates
+    // No runner for lane with queued gates: the lanes a machine's runners can serve
     const byLane = groupByLane(gates);
     const machines = this.getMachineStatuses();
     const localMachine = machines.find((m) => m.type === "local");
 
     for (const lane of ["heavy", "light", "remote"] as const) {
-      const queued = byLane[lane].filter((g) => g.status === "queued");
+      const queued = (byLane[lane] ?? []).filter((g) => g.status === "queued");
       if (queued.length > 0) {
         const runner = localMachine?.runners?.find((r) => r.lane === lane);
         if (!runner || !runner.running) {

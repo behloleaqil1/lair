@@ -24,7 +24,7 @@ import { closeSync, fstatSync, mkdirSync, openSync, readSync, statSync, writeFil
 import { basename, join } from "path";
 import type { EventBus } from "../core/event-bus.js";
 import type { EventType } from "../../shared/server-types.js";
-import type { ProjectConfig } from "../../shared/types.js";
+import type { ManagedRunInfo, ProjectConfig } from "../../shared/types.js";
 import type {
   AgentEventKind,
   AgentEventView,
@@ -1994,6 +1994,23 @@ export class AgentsService {
     };
   }
 
+  /**
+   * The agents this module has an active run for (queued, waiting on a lock,
+   * running or stopping), with the run and the agent's state as the Agents
+   * view derives it: what the Dragons view shows as "managed by Lair".
+   */
+  managedRuns(): Map<string, ManagedRunInfo> {
+    const now = this.probes.clock.now();
+    const runs = new Map<string, ManagedRunInfo>();
+    for (const run of this.store.activeRuns(this.project)) {
+      // activeRuns is oldest first: an agent's newest active run wins
+      const previous = run.previousRunId ? this.store.getRun(run.previousRunId) : null;
+      const { state, detail } = deriveState(run, run, previous, this.budgetBlock(run.agent, now));
+      runs.set(run.agent, { runId: run.id, task: run.task, state, detail });
+    }
+    return runs;
+  }
+
   private agentView(
     id: string,
     claims: Claim[],
@@ -2264,6 +2281,11 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
     if (!this.services.has(project) || !this.store) return null;
     const run = this.store.activeRunForAgent(project, agent);
     return run ? `run ${run.id.slice(0, 8)} on ${run.task} is ${run.state}` : null;
+  }
+
+  /** For the Dragons view: the agents with an active run in `project` (none when the module is off for it). */
+  managedRuns(project: string): Map<string, ManagedRunInfo> {
+    return this.services.get(project)?.managedRuns() ?? new Map();
   }
 
   status(project: string): AgentsStatusView {

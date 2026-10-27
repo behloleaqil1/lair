@@ -33,6 +33,12 @@ export interface ProjectConfig {
   processes?: Record<string, ProcessConfigYaml>;
   // Phase 4: Dragon management
   dragons?: Record<string, Omit<DragonConfig, "id">>;
+  /**
+   * The model and adapter of a dragon that names none: every dragons.txt
+   * dragon, and a dragons: entry without the key (its own value wins).
+   * Validated by validateDragonDefaults; see docs/configuration.md
+   */
+  dragon_defaults?: { model?: string; adapter?: string };
   available_models?: AIModel[];
   default_instructions?: string;
   gate_runner?: GateRunnerConfig;
@@ -202,14 +208,28 @@ export interface Dragon {
   name: string;
   task: string;
   running: boolean;
+  /** When its newest log was last written (that file's mtime, ISO); unknown without a log */
   lastLogTime?: string;
   lastLogLine?: string;
   stats?: DragonStats;
   // Config-derived fields (phase 4)
-  model?: string; // AI model ID from dragon config
+  model?: string; // AI model ID: its own (YAML dragons:), else dragon_defaults.model
+  /** True when `model` came from a default (dragon_defaults.model, or the built-in one), not the dragon's own entry */
+  modelFromDefault?: boolean;
   machine?: string; // Machine ID from dragon config
   instructions?: string; // Standing instructions from dragon config
-  adapter?: string; // Agent adapter ID (e.g., 'kiro', 'aider')
+  adapter?: string; // Agent adapter ID (e.g., 'kiro', 'aider'): its own, else dragon_defaults.adapter
+  /** The run Lair's agents module supervises for this dragon, while it has one (it is then running) */
+  managedRun?: ManagedRunInfo;
+}
+
+/** A dragon's active run in the agents module (src/server/agents/), as the Dragons view shows it */
+export interface ManagedRunInfo {
+  runId: string;
+  task: string;
+  /** The agent's state: starting, working, waiting_on_lock, hung, stopping, ... */
+  state: string;
+  detail: string;
 }
 
 export interface DragonStats {
@@ -224,12 +244,18 @@ export interface DragonStats {
 }
 
 // Gate types
+/** The lanes a machine's gate runners can be configured for (machines.<id>.runners) */
 export type GateLane = "heavy" | "light" | "remote";
-export type GateStatus = "queued" | "running" | "completed" | "superseded";
+/**
+ * queued (.req), running (.req.run), completed, or the status another suffix
+ * of the request file names (.req.superseded, .req.stuck, .req.deferred-stacked)
+ */
+export type GateStatus = "queued" | "running" | "completed" | "superseded" | (string & Record<never, never>);
 
 export interface Gate {
   id: string;
-  lane: GateLane;
+  /** From the request file name: heavy, light, remote or any other lane (quick, actions, ...) */
+  lane: string;
   priority: number;
   status: GateStatus;
   branch?: string;
@@ -245,6 +271,8 @@ export interface Gate {
 export interface GateResult {
   id: string;
   rc: number;
+  /** When the result was written (its .rc file's mtime, ISO) */
+  finishedAt?: string;
   log?: string;
   failedSteps?: string[];
   duration?: number;
@@ -285,6 +313,7 @@ export interface Problem {
     | "no_runner"
     | "duplicate_gate"
     | "silent_agent"
+    | "log_time_unknown"
     | "status_cmd";
   severity: "warning" | "error";
   message: string;

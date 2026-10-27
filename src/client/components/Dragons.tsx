@@ -10,6 +10,7 @@ import { DragonStopDialog } from "./DragonStopDialog";
 import { canStartDragon, hasStartableDragons } from "../dragon-start";
 import { startDragon, stopDragon as requestDragonStop } from "../owner-actions";
 import { SignInHint } from "./SignInHint";
+import { logTimeLabel, modelLabel, runningLabel } from "../dragon-view";
 import type {
   Dragon,
   QueueLine,
@@ -179,11 +180,17 @@ export function Dragons({ project, refreshKey }: Props) {
                 }
               >
                 <td>
-                  <span
-                    className={`badge ${dragon.running ? "badge-success" : "badge-neutral"}`}
-                  >
-                    {dragon.running ? "Running" : "Idle"}
+                  <span className={`badge ${runningLabel(dragon).badge}`}>
+                    {runningLabel(dragon).text}
                   </span>
+                  {runningLabel(dragon).detail && (
+                    <div
+                      style={{ color: "var(--text-secondary)", fontSize: "0.75rem" }}
+                      title={dragon.managedRun?.detail}
+                    >
+                      {runningLabel(dragon).detail}
+                    </div>
+                  )}
                 </td>
                 <td>
                   <code>{dragon.id}</code>
@@ -203,7 +210,7 @@ export function Dragons({ project, refreshKey }: Props) {
                     fontSize: "0.85rem",
                   }}
                 >
-                  {dragon.model || "-"}
+                  {modelLabel(dragon)}
                 </td>
                 <td
                   style={{
@@ -229,7 +236,7 @@ export function Dragons({ project, refreshKey }: Props) {
                     fontSize: "0.85rem",
                   }}
                 >
-                  {dragon.lastLogTime || "-"}
+                  {logTimeLabel(dragon)}
                 </td>
                 <td>{dragon.stats?.doneCount || 0}</td>
                 <td>
@@ -239,7 +246,12 @@ export function Dragons({ project, refreshKey }: Props) {
                 </td>
                 {!controlsReadOnly && (
                   <td onClick={(e) => e.stopPropagation()}>
-                    {dragon.running ? (
+                    {dragon.managedRun ? (
+                      // The agents module supervises it: a stop command would look like a crash it recovers from
+                      <span style={{ color: "var(--text-secondary)", fontSize: "0.8rem" }}>
+                        in Agents
+                      </span>
+                    ) : dragon.running ? (
                       <button
                         onClick={() => handleStopClick(dragon)}
                         style={{
@@ -360,10 +372,8 @@ function DragonDetail({
       </div>
 
       <div style={{ marginBottom: "1.5rem" }}>
-        <span
-          className={`badge ${dragon.running ? "badge-success" : "badge-neutral"}`}
-        >
-          {dragon.running ? "Running" : "Idle"}
+        <span className={`badge ${runningLabel(dragon).badge}`}>
+          {runningLabel(dragon).text}
         </span>
         <span
           className="badge badge-neutral"
@@ -376,7 +386,7 @@ function DragonDetail({
             className="badge badge-neutral"
             style={{ marginLeft: "0.5rem" }}
           >
-            {dragon.model}
+            {modelLabel(dragon)}
           </span>
         )}
         {dragon.machine && (
@@ -389,6 +399,15 @@ function DragonDetail({
         )}
         <p style={{ marginTop: "0.5rem", color: "var(--text-secondary)" }}>
           {dragon.task}
+        </p>
+        {dragon.managedRun && (
+          <p style={{ marginTop: "0.5rem", color: "var(--text-secondary)", fontSize: "0.85rem" }}>
+            {runningLabel(dragon).detail}: run {dragon.managedRun.runId.slice(0, 8)} on{" "}
+            <code>{dragon.managedRun.task}</code>. {dragon.managedRun.detail}
+          </p>
+        )}
+        <p style={{ marginTop: "0.5rem", color: "var(--text-secondary)", fontSize: "0.85rem" }}>
+          Last log: {logTimeLabel(dragon)}
         </p>
         {dragon.instructions && (
           <p

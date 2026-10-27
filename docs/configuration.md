@@ -26,6 +26,11 @@ agents_dir: /home/user/my-project/work/agents
 gates_dir: /home/user/my-project/work/gates
 ```
 
+The Gates view reads `gates_dir/queue/` and `gates_dir/results/`:
+
+- A gate request is `<lane>.<priority>.<gate-id>.req` (queued), `.req.run` (running), or `.req.<status>` for any other state the runners use (`.req.superseded`, `.req.stuck`, `.req.deferred-stacked`, ...: shown as that status). The lanes are whatever the file names say (`heavy`, `light`, `remote`, `quick`, `actions`, ...): a letter, then letters, digits, `_` or `-`, at most 32 characters. Every lane shows under Running, Queued and By Lane.
+- A result is `results/<gate-id>.rc` (the exit code) with its `<gate-id>.log`. Recent Results lists the results written in the last 24 hours (by the `.rc` file's modification time), newest first.
+
 ## Machines
 
 Define machines that can run agents and gates:
@@ -194,18 +199,37 @@ default_instructions: |
   Follow the dragon rules. Always run quick-check before committing.
 ```
 
-Each key under `dragons` is the dragon's ID. IDs start with a letter, contain only letters, digits, `_` and `-`, end with a letter or digit, and are at most 64 characters: `kiro-A`, `aider-1` and `worker_b` all work. Entries with other IDs are skipped. Log files are matched to dragons by name: `<id>.log` or `<id>-<YYYYMMDDTHHMMSSZ>.log` in `agents_dir`.
+Each key under `dragons` is the dragon's ID. IDs start with a letter, contain only letters, digits, `_` and `-`, end with a letter or digit, and are at most 64 characters: `kiro-A`, `aider-1` and `worker_b` all work. Entries with other IDs are skipped. Log files are matched to dragons by name: `<id>.log` or `<id>-<YYYYMMDDTHHMMSSZ>.log` in `agents_dir`. A dragon's last log time (the Dragons view, the Overview's "silent" check) is when its newest log file was last written (the file's modification time); a running dragon with no log is reported as "log time unknown", never as silent.
 
-Dragons listed in `<agents_dir>/dragons.txt` (one per line: id, name, task) can be started and stopped from the dashboard too, without a `dragons:` entry. Such a dragon uses its name from `dragons.txt` and the default adapter, and has no model, machine or instructions; add a `dragons:` entry to set them. When a dragon is in both, the `dragons:` entry is used. The same ID rules apply, and `dragons.txt` is re-read on every request, so new lines need no restart.
+Dragons listed in `<agents_dir>/dragons.txt` (one per line: id, name, task) can be started and stopped from the dashboard too, without a `dragons:` entry. Such a dragon uses its name from `dragons.txt`, the model and adapter of `dragon_defaults` (below; without it, no model and the default adapter), and has no machine or instructions; add a `dragons:` entry to set them. When a dragon is in both, the `dragons:` entry is used. The same ID rules apply, and `dragons.txt` is re-read on every request, so new lines need no restart.
+
+A dragon that Lair's [agents module](#agents) has an active run for shows as running in the Dragons view, with the run's state (starting, working, waiting on lock, hung, ...) and "managed by Lair"; stop it from the Agents view.
+
+### Dragon defaults
+
+```yaml
+dragon_defaults:
+  model: model-id
+  adapter: claude-code
+```
+
+`dragon_defaults` gives a model and an adapter to every dragon that names none: each `dragons.txt` dragon, and a `dragons:` entry that leaves `model` or `adapter` out. A dragon's own value always wins. The Dragons view shows the effective model, with "(default)" when it came from a default. The agents module, the start dialog and start/stop requests use the same values. Both keys are optional:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `model` | string | — | A model id: letters, digits, `.`, `_`, `:`, `/`, `@` and `-`, not starting with `-`, at most 100 characters |
+| `adapter` | string | — | A built-in adapter (`kiro`, `aider`, `claude-code`, `cursor-agent`) or one of the project's `agent_adapters` |
+
+Any other key, or a value that doesn't fit, stops the project from loading, with an error that names the key.
 
 ### Dragon options
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `name` | string | (agent id) | Display name for the agent |
-| `model` | string | `claude-sonnet-4` | AI model ID to use |
+| `model` | string | `dragon_defaults.model`, else `claude-sonnet-4` | AI model ID to use |
 | `machine` | string | `local` | Machine ID where this agent runs |
-| `adapter` | string | `kiro` | Agent adapter ID (see [Agents](agents.md)) |
+| `adapter` | string | `dragon_defaults.adapter`, else `kiro` | Agent adapter ID (see [Agents](agents.md)) |
 | `instructions` | string | `""` | Standing instructions for this agent |
 
 ### Dragon commands

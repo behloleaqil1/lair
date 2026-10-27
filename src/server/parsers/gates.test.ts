@@ -71,6 +71,63 @@ describe("parseGateFilename", () => {
     expect(parseGateFilename("random.log")).toBeNull();
   });
 
+  it("takes the lane from the file name: quick and actions lanes too, not a fixed list", () => {
+    expect(parseGateFilename("quick.1.20261027T100000Z-lint-fix-beef0001-201.req.run")).toMatchObject({
+      lane: "quick",
+      priority: 1,
+      status: "running",
+      track: "lint-fix",
+      headSha: "beef0001",
+      id: "20261027T100000Z-lint-fix-beef0001-201",
+    });
+    expect(parseGateFilename("actions.2.20261027T101000Z-e2e-cafe0001-301.req")).toMatchObject({
+      lane: "actions",
+      status: "queued",
+      track: "e2e",
+    });
+    expect(parseGateFilename("nightly_2.0.20261027T101000Z-e2e-cafe0001-301.req")?.lane).toBe("nightly_2");
+  });
+
+  it("shows another suffix as the status it names, and skips files that are not requests", () => {
+    const status = (name: string) => parseGateFilename(name)?.status;
+    expect(status("actions.2.20261027T101100Z-e2e-cafe0002-302.req.stuck")).toBe("stuck");
+    expect(status("light.4.20261027T081000Z-stacked-dead0002-402.req.deferred-stacked")).toBe("deferred-stacked");
+    expect(status("light.5.20261027T080000Z-old-work-dead0001-401.req.superseded")).toBe("superseded");
+    for (const name of [
+      "quick.1.20261027T100000Z-lint-fix-beef0001-201.req.log",
+      "quick.1.20261027T100000Z-lint-fix-beef0001-201.req.lock",
+      "quick.1.20261027T100000Z-lint-fix-beef0001-201.log",
+      "quick.1.20261027T100000Z-lint-fix-beef0001-201.req.Run",
+      "quick.1.20261027T100000Z-lint-fix-beef0001-201.req.run.log",
+    ]) {
+      expect(parseGateFilename(name), name).toBeNull();
+    }
+  });
+
+  it("refuses unsafe lane names and ids, and over-long names", () => {
+    for (const name of [
+      "9lane.1.20261027T100000Z-t-abcd0001-1.req",
+      "-x.1.20261027T100000Z-t-abcd0001-1.req",
+      "a b.1.20261027T100000Z-t-abcd0001-1.req",
+      `${"l".repeat(33)}.1.20261027T100000Z-t-abcd0001-1.req`,
+      "quick.x.20261027T100000Z-t-abcd0001-1.req",
+      "quick.1..hidden.req",
+      "quick.1.-rf.req",
+      `quick.1.${"a".repeat(300)}.req`,
+    ]) {
+      expect(parseGateFilename(name), name).toBeNull();
+    }
+  });
+
+  it("keeps a request whose id has another form, without track or sha", () => {
+    expect(parseGateFilename("quick.3.manual-check-7.req")).toEqual({
+      id: "manual-check-7",
+      lane: "quick",
+      priority: 3,
+      status: "queued",
+    });
+  });
+
   it("handles full path", () => {
     const filename =
       "/path/to/queue/heavy.1.20261024T143500Z-fix-login-abc1234d-12345.req";
@@ -181,6 +238,21 @@ describe("groupByLane", () => {
     expect(grouped.heavy).toHaveLength(2);
     expect(grouped.light).toHaveLength(1);
     expect(grouped.remote).toHaveLength(1);
+  });
+
+  it("has one group per lane the gates name: heavy, light, remote first, then the others by name", () => {
+    const gates = [
+      { lane: "quick", id: "1" },
+      { lane: "heavy", id: "2" },
+      { lane: "actions", id: "3" },
+      { lane: "quick", id: "4" },
+    ] as any;
+
+    const grouped = groupByLane(gates);
+
+    expect(Object.keys(grouped)).toEqual(["heavy", "actions", "quick"]);
+    expect(grouped.quick.map((g) => g.id)).toEqual(["1", "4"]);
+    expect(grouped.light).toBeUndefined();
   });
 });
 

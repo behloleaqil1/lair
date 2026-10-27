@@ -1,46 +1,72 @@
 /**
  * Gate file parser - pure functions for parsing gate queue and results
  */
-import type { Gate, GateLane, GateStatus } from "../../shared/types.js";
+import type { Gate, GateStatus } from "../../shared/types.js";
+import { laneNames } from "../../shared/gate-lanes.js";
+
+/**
+ * A request file: <lane>.<priority>.<gate-id>.req, then an optional status
+ * suffix (.req.run, .req.superseded, .req.stuck, .req.deferred-stacked, ...).
+ * The lane comes from the file name, so every lane a runner uses shows
+ * (heavy, light, remote, quick, actions, ...): a letter, then letters,
+ * digits, "_" or "-", at most 32 characters (as the watchdog's isSafeLane).
+ * The gate id is a safe file-name stem (as isSafeGateId in services/data.ts).
+ */
+const REQUEST_FILE =
+  /^([A-Za-z][A-Za-z0-9_-]{0,31})\.(\d{1,9})\.([A-Za-z0-9][A-Za-z0-9._-]{0,199}?)\.req(?:\.([a-z][a-z0-9-]{0,31}))?$/;
+
+/** The usual gate id: <UTC stamp>-<track>-<sha>-<random> */
+const STRUCTURED_ID = /^(\d{8}T\d{6}Z)-([a-zA-Z0-9-]+)-([a-f0-9]+)-(\d+)$/;
+
+/** Suffixes of files kept next to the requests that are not a request status */
+const NOT_A_STATUS = new Set(["log", "lock", "pid", "tmp", "json", "rc", "txt", "out", "err"]);
+
+/** Longest file name looked at (the parts' limits add up to less) */
+const MAX_NAME_LENGTH = 300;
 
 /**
  * Parse a gate request filename into structured data
- * Format: <lane>.<priority>.<timestamp>-<track>-<sha>-<random>.req[.run|.superseded]
+ * Format: <lane>.<priority>.<gate-id>.req[.<status>]
  * Example: heavy.1.20260101T000000Z-example-track-abcdef12-12345.req
+ *
+ * The lane is any safe lane name (REQUEST_FILE), not a fixed list. The status is
+ * queued for .req and running for .req.run; any other suffix is the status
+ * it names (.req.superseded: superseded, .req.stuck: stuck). Track, sha and
+ * start time are filled in when the id has the usual form (STRUCTURED_ID).
  */
 export function parseGateFilename(filename: string): Gate | null {
   // Remove directory path if present
   const basename = filename.split("/").pop() || filename;
+  if (basename.length > MAX_NAME_LENGTH) {
+    return null;
+  }
 
-  // Match the pattern
-  const match = basename.match(
-    /^(heavy|light|remote)\.(\d+)\.(\d{8}T\d{6}Z)-([a-zA-Z0-9-]+)-([a-f0-9]+)-(\d+)\.req(\.run|\.superseded)?$/,
-  );
-
+  const match = REQUEST_FILE.exec(basename);
   if (!match) {
     return null;
   }
 
-  const [, lane, priority, timestamp, track, sha, random, suffix] = match;
-
-  let status: GateStatus = "queued";
-  if (suffix === ".run") {
-    status = "running";
-  } else if (suffix === ".superseded") {
-    status = "superseded";
+  const [, lane, priority, id, suffix] = match;
+  if (suffix !== undefined && NOT_A_STATUS.has(suffix)) {
+    return null;
   }
+  const status: GateStatus =
+    suffix === undefined ? "queued" : suffix === "run" ? "running" : suffix;
 
-  const id = `${timestamp}-${track}-${sha}-${random}`;
-
-  return {
+  const gate: Gate = {
     id,
-    lane: lane as GateLane,
+    lane,
     priority: parseInt(priority, 10),
     status,
-    track,
-    headSha: sha,
-    startTime: parseGateTimestamp(timestamp),
   };
+  const structured = STRUCTURED_ID.exec(id);
+  if (structured) {
+    const [, timestamp, track, sha] = structured;
+    gate.track = track;
+    gate.headSha = sha;
+    gate.startTime = parseGateTimestamp(timestamp);
+  }
+  return gate;
 }
 
 /**
@@ -156,14 +182,14 @@ export function parseGateFiles(filenames: string[]): Gate[] {
 }
 
 /**
- * Group gates by lane
+ * Group gates by lane: one entry per lane the gates name (laneNames order),
+ * not a fixed list.
  */
-export function groupByLane(gates: Gate[]): Record<GateLane, Gate[]> {
-  const result: Record<GateLane, Gate[]> = {
-    heavy: [],
-    light: [],
-    remote: [],
-  };
+export function groupByLane(gates: Gate[]): Record<string, Gate[]> {
+  const result: Record<string, Gate[]> = {};
+  for (const lane of laneNames(gates)) {
+    result[lane] = [];
+  }
 
   for (const gate of gates) {
     result[gate.lane].push(gate);

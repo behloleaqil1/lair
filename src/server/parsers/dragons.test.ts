@@ -176,8 +176,11 @@ describe("getMostRecentLog", () => {
 });
 
 describe("isLogSilent", () => {
-  it("returns true for undefined time", () => {
-    expect(isLogSilent(undefined)).toBe(true);
+  it("never calls an unknown or unreadable time silent", () => {
+    expect(isLogSilent(undefined)).toBe(false);
+    expect(isLogSilent("")).toBe(false);
+    expect(isLogSilent("not a time")).toBe(false);
+    expect(isLogSilent("2026-13-45TXX")).toBe(false);
   });
 
   it("returns true for old ISO timestamp", () => {

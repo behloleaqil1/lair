@@ -1,12 +1,15 @@
 /**
  * Gates view - queue and results, and the pipelines section (runs and where
- * they ran).
+ * they ran). The lanes are those the queue's request files name (any lane,
+ * not a fixed list), and the recent results those of the last 24 hours,
+ * newest first (gates-view.ts).
  * Uses WebSocket for real-time updates with REST polling as fallback.
  */
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useApi } from "../hooks/useApi";
 import { useGatesWebSocket } from "../hooks/useWebSocket";
 import { PipelineRuns } from "./PipelineRuns";
+import { ago, laneGates, queueLanes, recentResults, statusBadge } from "../gates-view";
 import type { Gate, GateResult } from "../../shared/types";
 
 interface GatesData {
@@ -27,11 +30,13 @@ export function Gates({ project, refreshKey }: Props) {
     error,
   } = useApi<GatesData>("/gates", project, refreshKey);
   const [selectedGate, setSelectedGate] = useState<string | null>(null);
+  // One array per REST answer, so the WebSocket hook isn't reset on every render
+  const restQueue = useMemo(() => restData?.queue ?? [], [restData]);
 
   // Use WebSocket for real-time gate queue updates
   const { gates: wsGates, connected: wsConnected } = useGatesWebSocket(
     project,
-    restData?.queue || [],
+    restQueue,
   );
 
   if (loading && wsGates.length === 0)
@@ -40,15 +45,12 @@ export function Gates({ project, refreshKey }: Props) {
     return <div className="error">Error: {error}</div>;
 
   // Use WebSocket gates if connected, otherwise fall back to REST data
-  const queue = wsConnected ? wsGates : restData?.queue || [];
-  const results = restData?.results || [];
+  const queue = wsConnected ? wsGates : restQueue;
+  // The last 24 hours only, newest first (the server sends them so; checked again here)
+  const results = recentResults(restData?.results || []);
 
-  // Group queue by lane
-  const byLane = {
-    heavy: queue.filter((g) => g.lane === "heavy"),
-    light: queue.filter((g) => g.lane === "light"),
-    remote: queue.filter((g) => g.lane === "remote"),
-  };
+  // Every lane the queue's request files name (heavy, light, remote, quick, actions, ...)
+  const lanes = queueLanes(queue);
 
   const running = queue.filter((g) => g.status === "running");
   const queued = queue.filter((g) => g.status === "queued");
@@ -104,7 +106,7 @@ export function Gates({ project, refreshKey }: Props) {
                     <td>
                       <span className="badge badge-success">{gate.lane}</span>
                     </td>
-                    <td>{gate.track}</td>
+                    <td>{gate.track ?? gate.id}</td>
                     <td style={{ color: "var(--text-secondary)" }}>
                       {gate.currentStep || "-"}
                     </td>
@@ -140,7 +142,7 @@ export function Gates({ project, refreshKey }: Props) {
                     <td>
                       <span className="badge badge-neutral">{gate.lane}</span>
                     </td>
-                    <td>{gate.track}</td>
+                    <td>{gate.track ?? gate.id}</td>
                   </tr>
                 ))}
               </tbody>
@@ -152,53 +154,55 @@ export function Gates({ project, refreshKey }: Props) {
       {/* By lane */}
       <div className="card">
         <h3>By Lane</h3>
-        <div className="grid grid-3">
-          {(["heavy", "light", "remote"] as const).map((lane) => (
-            <div key={lane} className="lane-group">
-              <div className="lane-title">
-                <span className="lane-name">{lane}</span>
-                <span className="lane-count">{byLane[lane].length}</span>
-              </div>
-              <ul style={{ listStyle: "none", padding: 0 }}>
-                {byLane[lane].slice(0, 5).map((gate) => (
-                  <li
-                    key={gate.id}
-                    style={{
-                      padding: "0.5rem",
-                      marginBottom: "0.25rem",
-                      background: "var(--bg-secondary)",
-                      borderRadius: "4px",
-                      fontSize: "0.85rem",
-                    }}
-                  >
-                    <span
-                      className={`badge ${
-                        gate.status === "running"
-                          ? "badge-success"
-                          : "badge-neutral"
-                      }`}
-                    >
-                      {gate.status}
-                    </span>{" "}
-                    {gate.track}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ))}
-        </div>
+        {lanes.length === 0 ? (
+          <p style={{ color: "var(--text-secondary)" }}>No gate requests in the queue</p>
+        ) : (
+          <div className="grid grid-3">
+            {lanes.map((lane) => {
+              const gates = laneGates(queue, lane);
+              return (
+                <div key={lane} className="lane-group">
+                  <div className="lane-title">
+                    <span className="lane-name">{lane}</span>
+                    <span className="lane-count">{gates.length}</span>
+                  </div>
+                  <ul style={{ listStyle: "none", padding: 0 }}>
+                    {gates.slice(0, 5).map((gate) => (
+                      <li
+                        key={`${gate.id}-${gate.status}`}
+                        style={{
+                          padding: "0.5rem",
+                          marginBottom: "0.25rem",
+                          background: "var(--bg-secondary)",
+                          borderRadius: "4px",
+                          fontSize: "0.85rem",
+                        }}
+                      >
+                        <span className={`badge ${statusBadge(gate.status)}`}>
+                          {gate.status}
+                        </span>{" "}
+                        {gate.track ?? gate.id}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* Recent results */}
       <div className="card">
-        <h3>Recent Results (24h)</h3>
+        <h3>Recent Results (24h, newest first)</h3>
         {results.length === 0 ? (
-          <p style={{ color: "var(--text-secondary)" }}>No recent results</p>
+          <p style={{ color: "var(--text-secondary)" }}>No results in the last 24 hours</p>
         ) : (
           <table className="table">
             <thead>
               <tr>
                 <th>RC</th>
+                <th>Finished</th>
                 <th>Gate ID</th>
                 <th>Failed Steps</th>
               </tr>
@@ -216,6 +220,12 @@ export function Gates({ project, refreshKey }: Props) {
                     >
                       {result.rc}
                     </span>
+                  </td>
+                  <td
+                    style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}
+                    title={result.finishedAt ? new Date(result.finishedAt).toLocaleString() : undefined}
+                  >
+                    {ago(result.finishedAt)}
                   </td>
                   <td style={{ fontSize: "0.85rem" }}>{result.id}</td>
                   <td style={{ color: "var(--error)", fontSize: "0.85rem" }}>

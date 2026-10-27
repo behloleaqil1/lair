@@ -2,10 +2,10 @@
  * Project discovery (src/server/config.ts).
  */
 import { describe, it, expect, beforeEach, afterEach, vi, type MockInstance } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { getDefaultProject, listProjects } from "./config.js";
+import { getDefaultProject, listProjects, loadProjectConfig } from "./config.js";
 
 describe("listProjects", () => {
   let dir: string;
@@ -119,5 +119,57 @@ describe("getDefaultProject", () => {
       if (saved === undefined) delete process.env.LAIR_PROJECT;
       else process.env.LAIR_PROJECT = saved;
     }
+  });
+});
+
+describe("loadProjectConfig validates dragon_defaults", () => {
+  const LOCAL_DIR = join(process.cwd(), "projects", "local");
+  const NAME = "lair-dragon-defaults-test";
+  const FILE = join(LOCAL_DIR, `${NAME}.yaml`);
+  let createdLocalDir = false;
+
+  beforeEach(() => {
+    if (!existsSync(LOCAL_DIR)) {
+      mkdirSync(LOCAL_DIR, { recursive: true });
+      createdLocalDir = true;
+    }
+  });
+
+  afterEach(() => {
+    rmSync(FILE, { force: true });
+    if (createdLocalDir && existsSync(LOCAL_DIR) && readdirSync(LOCAL_DIR).length === 0) {
+      rmSync(LOCAL_DIR, { recursive: true, force: true });
+    }
+  });
+
+  function write(...extra: string[]): void {
+    writeFileSync(
+      FILE,
+      [
+        `name: ${NAME}`,
+        "repo: /nonexistent",
+        "github: example/defaults-test",
+        "queue_file: /nonexistent/queue.md",
+        "agents_dir: /nonexistent/agents",
+        "gates_dir: /nonexistent/gates",
+        "machines: {}",
+        ...extra,
+        "",
+      ].join("\n"),
+    );
+  }
+
+  it("loads a project whose dragon_defaults name a model id and a known adapter", () => {
+    write("dragon_defaults:", "  model: model-default", "  adapter: aider");
+    expect(loadProjectConfig(NAME).dragon_defaults).toEqual({ model: "model-default", adapter: "aider" });
+  });
+
+  it("refuses to load one with a bad value or an unknown key, and says which", () => {
+    write("dragon_defaults:", "  model: --model=x", "  adapter: no-such-cli");
+    expect(() => loadProjectConfig(NAME)).toThrow(/dragon_defaults\.model: must be a model id.*dragon_defaults\.adapter: unknown adapter no-such-cli/);
+    write("dragon_defaults:", "  machine: local");
+    expect(() => loadProjectConfig(NAME)).toThrow("dragon_defaults.machine: unknown key");
+    write("dragon_defaults: model-a");
+    expect(() => loadProjectConfig(NAME)).toThrow("dragon_defaults: must be a mapping");
   });
 });

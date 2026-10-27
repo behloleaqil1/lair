@@ -205,14 +205,17 @@ export function getMostRecentLog(logFiles: string[]): string | null {
 }
 
 /**
- * Check if a log is silent (no updates in given minutes)
+ * Check if a log is silent (no updates in given minutes). Only a known time
+ * can be silent: an unknown or unreadable one is not (the overview says "log
+ * time unknown" for it instead of raising a false "silent" alarm).
  */
 export function isLogSilent(
   lastLogTime: string | undefined,
   silentMinutes: number = 45,
+  now: number = Date.now(),
 ): boolean {
   if (!lastLogTime) {
-    return true;
+    return false;
   }
 
   // Parse the time - could be HH:MM:SS or full ISO
@@ -232,11 +235,13 @@ export function isLogSilent(
       s,
     );
   } else {
-    return true; // Can't parse
+    return false; // Can't parse: unknown, not silent
+  }
+  if (Number.isNaN(logDate.getTime())) {
+    return false;
   }
 
-  const now = new Date();
-  const diffMinutes = (now.getTime() - logDate.getTime()) / (1000 * 60);
+  const diffMinutes = (now - logDate.getTime()) / (1000 * 60);
 
   return diffMinutes > silentMinutes;
 }

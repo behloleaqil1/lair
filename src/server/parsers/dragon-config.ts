@@ -9,6 +9,7 @@ import type {
   DragonConfig,
   AIModel,
 } from "../../shared/types.js";
+import { getAdapter } from "../services/adapters.js";
 
 // Default models if none configured
 const DEFAULT_MODELS: AIModel[] = [
@@ -35,15 +36,85 @@ const DEFAULT_MODEL_ID = "claude-sonnet-4";
 // Default machine when not specified
 const DEFAULT_MACHINE = "local";
 
+/** Model ids such as "vendor/model-1.5:latest"; never starting with "-" (as the agents module's MODEL_ID) */
+const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,99}$/;
+
+/** Adapter ids such as "kiro", "claude-code", or one of the project's agent_adapters */
+const ADAPTER_ID = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+
+/** `dragon_defaults:` in the project YAML, for dragons that don't name their own */
+export interface DragonDefaults {
+  model?: string;
+  adapter?: string;
+}
+
+/**
+ * The project's `dragon_defaults`, for a dragon with no model or adapter of
+ * its own: a dragons.txt dragon (it never has one), or a YAML `dragons:`
+ * entry that leaves the key out. A dragon's own value always wins. Only
+ * well-formed values are returned (validateDragonDefaults reports the
+ * others), so a config that was never validated can't pass a bad one on.
+ */
+export function dragonDefaults(config: ProjectConfig): DragonDefaults {
+  const raw: unknown = config.dragon_defaults;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const { model, adapter } = raw as Record<string, unknown>;
+  const defaults: DragonDefaults = {};
+  if (typeof model === "string" && MODEL_ID.test(model)) defaults.model = model;
+  if (typeof adapter === "string" && ADAPTER_ID.test(adapter)) defaults.adapter = adapter;
+  return defaults;
+}
+
+/**
+ * What is wrong with `dragon_defaults` (nothing when it is absent): it must
+ * be a mapping with only `model` (a model id) and `adapter` (a built-in
+ * adapter or one of agent_adapters).
+ */
+export function validateDragonDefaults(config: ProjectConfig): string[] {
+  const raw: unknown = config.dragon_defaults;
+  if (raw === undefined || raw === null) return [];
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    return ["dragon_defaults: must be a mapping, e.g. { model: <model id>, adapter: <adapter id> }"];
+  }
+  const errors: string[] = [];
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (key === "model") {
+      if (typeof value !== "string" || !MODEL_ID.test(value)) {
+        errors.push(
+          "dragon_defaults.model: must be a model id (letters, digits, '.', '_', ':', '/', '@' or '-', not starting with '-')",
+        );
+      }
+    } else if (key === "adapter") {
+      if (typeof value !== "string" || !ADAPTER_ID.test(value)) {
+        errors.push("dragon_defaults.adapter: must be an adapter id (a letter, then letters, digits, '_' or '-')");
+      } else if (!getAdapter(value, config)) {
+        errors.push(`dragon_defaults.adapter: unknown adapter ${value} (neither built in nor in agent_adapters)`);
+      }
+    } else {
+      errors.push(`dragon_defaults.${key.slice(0, 40)}: unknown key (only model and adapter)`);
+    }
+  }
+  return errors;
+}
+
+/** True when the YAML `dragons:` entry for `id` names its own model. */
+export function hasOwnModel(config: ProjectConfig, id: string): boolean {
+  const own: unknown = config.dragons?.[id]?.model;
+  return typeof own === "string" && own.length > 0;
+}
+
 /**
  * Parse dragon registry from project config.
- * Returns full DragonConfig objects with all fields populated.
+ * Returns full DragonConfig objects with all fields populated: an entry's
+ * own model and adapter, else dragon_defaults', else the built-in default
+ * model (and no adapter: 'kiro' at runtime).
  */
 export function parseDragonRegistry(
   config: ProjectConfig,
 ): Map<string, DragonConfig> {
   const dragons = new Map<string, DragonConfig>();
   const rawDragons = config.dragons || {};
+  const defaults = dragonDefaults(config);
 
   for (const [id, rawConfig] of Object.entries(rawDragons)) {
     if (!isValidDragonId(id)) {
@@ -53,10 +124,10 @@ export function parseDragonRegistry(
     const dragon: DragonConfig = {
       id,
       name: rawConfig.name || id,
-      model: rawConfig.model || DEFAULT_MODEL_ID,
+      model: rawConfig.model || defaults.model || DEFAULT_MODEL_ID,
       machine: rawConfig.machine || DEFAULT_MACHINE,
       instructions: rawConfig.instructions || "",
-      adapter: rawConfig.adapter, // optional, defaults to 'kiro' at runtime
+      adapter: rawConfig.adapter || defaults.adapter, // optional, defaults to 'kiro' at runtime
     };
 
     dragons.set(id, dragon);

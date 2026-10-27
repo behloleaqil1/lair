@@ -245,8 +245,8 @@ Each view is a standalone component:
 - **`Overview.tsx`**: repo status, problems, counts
 - **`DecisionInbox.tsx`**: the Decision Inbox (open decisions with their context, links as text to copy, options and recommendation, a confirmation step for spend and go/no-go, a password field for credentials, history, signing in as the owner) and the nav badge with the open count. Its requests and answer rules are in `decisions-api.ts`; the owner session (sent as a header; kept in this origin's `localStorage`, or only in the page's memory under the Vite dev server) is in `owner-session.ts`
 - **`OwnerSessions.tsx`**: the signed-in browsers, each with Sign out
-- **`Dragons.tsx`**, **`DragonStartDialog.tsx`**, **`DragonStopDialog.tsx`**: agent list, start and stop dialogs
-- **`Gates.tsx`**, **`PipelineRuns.tsx`**: gate queue by lane, recent results; pipeline runs with where each step ran, fallback reasons, CI minutes, executor availability and the workflow file
+- **`Dragons.tsx`**, **`DragonStartDialog.tsx`**, **`DragonStopDialog.tsx`**: agent list (running also for a run of the agents module, "managed by Lair"; the effective model, "(default)" when from `dragon_defaults`; the newest log's time), start and stop dialogs (view logic in `dragon-view.ts`)
+- **`Gates.tsx`**, **`PipelineRuns.tsx`**: gate queue by lane (every lane the request files name), results of the last 24 hours newest first (view logic in `gates-view.ts`); pipeline runs with where each step ran, fallback reasons, CI minutes, executor availability and the workflow file
 - **`PRs.tsx`**: pull requests with gate status and merge readiness
 - **`Orchestrator.tsx`**: orchestrator ticks, STOP file, service status
 - **`Machines.tsx`**: machine health, runner status
@@ -259,7 +259,7 @@ Each view is a standalone component:
 - **`Reviews.tsx`**: per PR, the risk tier, required and present reviews, findings, the gate at the head, holds and the merge button with its reasons (view logic in `review-view.ts`, requests in `review-api.ts`, owner-only ones with the owner session)
 - **`Agents.tsx`**: per agent its state, run, claims, budget and recoveries; locks and their holders. Release a claim or start a fresh session, after a confirmation (`agents-actions.ts`)
 - **`Triage.tsx`**: gate failures with each cause's verdict, evidence, actions and retry count; the default branch's incident and bisect, with revert and protect buttons
-- **`Inbox.tsx`**: owner inbox and orchestrator replies
+- **`Inbox.tsx`**: the "Owner messages" view (`inbox_file`: the owner's instructions and the orchestrator's replies; decisions are in Decisions). The nav labels are in `nav.ts`
 - **`CommandBar.tsx`**: ask / instruct / task command bar
 - **`Settings.tsx`**: project configuration UI
 

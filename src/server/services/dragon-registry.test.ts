@@ -11,6 +11,7 @@ import {
   mergeDragonRegistry,
   readDragonsFile,
 } from "./dragon-registry.js";
+import { dragonDefaults, hasOwnModel, validateDragonDefaults } from "../parsers/dragon-config.js";
 import type { ProjectConfig } from "../../shared/types.js";
 
 let agentsDir: string;
@@ -96,6 +97,70 @@ describe("mergeDragonRegistry", () => {
     expect([...mergeDragonRegistry(config(undefined), "kiro-A\tSmaug\tt\n").keys()]).toEqual([
       "kiro-A",
     ]);
+  });
+});
+
+describe("dragon_defaults", () => {
+  const withDefaults = (defaults: unknown, dragons?: Record<string, Record<string, string>>) =>
+    ({ ...config(dragons), dragon_defaults: defaults }) as unknown as ProjectConfig;
+
+  it("gives dragons.txt dragons the default model and adapter", () => {
+    const dragons = mergeDragonRegistry(
+      withDefaults({ model: "model-default", adapter: "aider" }),
+      "kiro-C\tFafnir\tfix-auth\n",
+    );
+    expect(dragons.get("kiro-C")).toEqual({
+      id: "kiro-C",
+      name: "Fafnir",
+      model: "model-default",
+      machine: "",
+      instructions: "",
+      adapter: "aider",
+    });
+  });
+
+  it("lets a YAML entry's own model and adapter win, and fills in only what it leaves out", () => {
+    const dragons = mergeDragonRegistry(
+      withDefaults(
+        { model: "model-default", adapter: "aider" },
+        {
+          "kiro-A": { name: "Smaug", model: "model-own", adapter: "kiro" },
+          "kiro-B": { name: "Saphira" },
+        },
+      ),
+      "kiro-A\tSmaug\tt\n",
+    );
+    expect(dragons.get("kiro-A")).toMatchObject({ model: "model-own", adapter: "kiro" });
+    expect(dragons.get("kiro-B")).toMatchObject({ model: "model-default", adapter: "aider" });
+    expect(hasOwnModel(withDefaults({}, { "kiro-A": { name: "Smaug", model: "model-own" } }), "kiro-A")).toBe(true);
+    expect(hasOwnModel(withDefaults({}, { "kiro-B": { name: "Saphira" } }), "kiro-B")).toBe(false);
+  });
+
+  it("uses only well-formed values, also when the config was never validated", () => {
+    expect(dragonDefaults(withDefaults({ model: "-rf", adapter: "../x" }))).toEqual({});
+    expect(dragonDefaults(withDefaults("model-a"))).toEqual({});
+    expect(dragonDefaults(withDefaults(["model-a"]))).toEqual({});
+    expect(dragonDefaults(withDefaults({ model: "vendor/model-1.5:latest" }))).toEqual({
+      model: "vendor/model-1.5:latest",
+    });
+    const dragons = mergeDragonRegistry(withDefaults({ model: "--model=x" }), "kiro-C\tFafnir\tt\n");
+    expect(dragons.get("kiro-C")?.model).toBe("");
+  });
+
+  it("is validated: a mapping of a model id and a known adapter only", () => {
+    expect(validateDragonDefaults(config({}))).toEqual([]);
+    expect(validateDragonDefaults(withDefaults({ model: "model-a", adapter: "claude-code" }))).toEqual([]);
+    expect(validateDragonDefaults(withDefaults("model-a"))).toEqual([
+      expect.stringContaining("dragon_defaults: must be a mapping"),
+    ]);
+    expect(validateDragonDefaults(withDefaults({ model: "-rf", adapter: "no-such-cli", machine: "x" }))).toEqual([
+      expect.stringContaining("dragon_defaults.model: must be a model id"),
+      expect.stringContaining("dragon_defaults.adapter: unknown adapter no-such-cli"),
+      expect.stringContaining("dragon_defaults.machine: unknown key"),
+    ]);
+    // A project's own adapter counts
+    const own = { ...withDefaults({ adapter: "my-cli" }), agent_adapters: { "my-cli": { id: "my-cli" } } };
+    expect(validateDragonDefaults(own as unknown as ProjectConfig)).toEqual([]);
   });
 });
 
