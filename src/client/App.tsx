@@ -18,6 +18,7 @@ import { Reviews } from "./components/Reviews";
 import { Agents } from "./components/Agents";
 import { Triage } from "./components/Triage";
 import { Settings } from "./components/Settings";
+import { Planner } from "./components/Planner";
 import { CommandBar } from "./components/CommandBar";
 import { pickInitialProject } from "./initial-project";
 import type { CommandMode, ControlsStatus } from "../shared/types";
@@ -118,6 +119,8 @@ export function App() {
         return <Agents {...props} />;
       case "triage":
         return <Triage {...props} />;
+      case "planner":
+        return <Planner {...props} />;
       case "inbox":
         return <Inbox {...props} />;
       case "settings":

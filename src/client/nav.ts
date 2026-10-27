@@ -17,6 +17,7 @@ export type View =
   | "reviews"
   | "agents"
   | "triage"
+  | "planner"
   | "inbox"
   | "settings";
 
@@ -47,6 +48,8 @@ export const VIEWS: { id: View; label: string }[] = [
   { id: "health", label: "Health" },
   { id: "delivery", label: "Delivery" },
   { id: "agents", label: "Agents" },
+  // How Lair keeps the tasks file the agents work from (owner only: it shows plan text)
+  { id: "planner", label: "Planner" },
   { id: "triage", label: "Triage" },
   { id: "inbox", label: OWNER_MESSAGES_LABEL },
   // Every project setting (the owner only); writes the project YAML
