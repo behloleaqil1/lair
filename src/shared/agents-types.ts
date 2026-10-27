@@ -10,9 +10,12 @@
  * - waiting_lock: a launch lock is held by a live process
  * - running: the agent process is alive
  * - stopping: Lair asked the process to stop (hung, failover, lost claim, fresh session)
- * - completed: the process exited 0, or the agent reported the task DONE
- * - failed: the attempt failed (crashed, dead on start, hung, provider error); a
- *   follow-up run carries the task on unless the chain was escalated
+ * - completed: the process exited 0, or, when its exit status was lost (it
+ *   ended while Lair was restarting), the agent's own queue line for the task
+ *   reported it DONE, WAITING or BLOCKED (the run's detail says which)
+ * - failed: the attempt failed (crashed, dead on start, hung, provider error, an
+ *   exit status lost with no such line); a follow-up run carries the task on
+ *   unless the chain was escalated
  * - never_started: no live agent process within agents.start_timeout_minutes
  * - lost_claim: the run lost its claim on the task and stopped
  * - superseded: another live run had claimed the task when this one tried to start
@@ -121,6 +124,7 @@ export type AgentEventKind =
   | "never_started"
   | "dead_on_start"
   | "crashed"
+  | "exit_unknown"
   | "hung"
   | "lost_claim"
   | "restart_same_session"

@@ -496,6 +496,51 @@ export function checkDone(
   return line === null ? null : { kind: "queue", line };
 }
 
+/** How a run ended by its own queue line: DONE, WAITING or BLOCKED, and the line as written (data, never a prompt). */
+export interface ReportedOutcome {
+  kind: "done" | "waiting" | "blocked";
+  line: string;
+}
+
+/**
+ * How a run ended, by its agent's own queue lines for its task written since
+ * its chain was requested (its queue mark): read with fill's patterns as
+ * checkDone and runStatus read them (a done line that names the task wins,
+ * else the latest WAITING or BLOCKED line; with a done_pattern that names
+ * only the agent, its last DONE, WAITING or BLOCKED line decides), and only
+ * lines the agent wrote by their attribution ("by <agent>", attributedAgent)
+ * count, whatever the patterns name. For a run whose exit status is lost
+ * (it ended while Lair was restarting). null: it wrote no such line.
+ */
+export function reportedOutcome(
+  queue: QueueLines,
+  settings: Pick<FillSettings, "donePattern" | "waitingPattern" | "blockedPattern">,
+  run: Pick<AgentRun, "agent" | "task" | "queueMark">,
+  until: QueueMark | undefined,
+): ReportedOutcome | null {
+  // Its agent's lines only: a pattern that names the task alone would count another agent's line about it
+  const own = (template: string): FillPattern => ({ ...fillPatternFor(template, run.task, run.agent), agent: run.agent });
+  const done = own(settings.donePattern);
+  const waiting = own(settings.waitingPattern);
+  const blocked = own(settings.blockedPattern);
+  if (done.task !== null) {
+    const line = queue.find(done, run.queueMark, until);
+    if (line !== null) return { kind: "done", line };
+    const status = queue.lastStatus(waiting, blocked, run.queueMark, until);
+    return status ? { kind: status.kind, line: status.line } : null;
+  }
+  const last = queue.lastOf<ReportedOutcome["kind"]>(
+    [
+      { kind: "done", pattern: done },
+      { kind: "waiting", pattern: waiting },
+      { kind: "blocked", pattern: blocked },
+    ],
+    run.queueMark,
+    until,
+  );
+  return last ? { kind: last.kind, line: last.line } : null;
+}
+
 // ============ PROMPTS ============
 
 export type PromptResult = { ok: true; text: string; files: string[] } | { ok: false; reason: string };

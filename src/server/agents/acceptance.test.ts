@@ -901,7 +901,7 @@ describe("4. hung and dead-on-start: same session K times, then a fresh one, the
     expect(runs(h)[1]).toMatchObject({ state: "queued", sessionMode: "resume", notBefore: NOW + 5 * MIN + 10 * SEC });
   });
 
-  it("after a restart, a run that ended unseen is never restarted: DONE completes it, anything else asks the owner", async () => {
+  it("after a restart, a run that ended unseen completes on its DONE line; with no line it is one failed attempt, restarted in its session, never escalated", async () => {
     const h1 = setup();
     await request(h1, "worker-a", "task-1");
     await request(h1, "worker-b", "task-2");
@@ -914,14 +914,82 @@ describe("4. hung and dead-on-start: same session K times, then a fresh one, the
     await h2.service.tick();
 
     expect(h2.spawner.calls).toEqual([]);
-    const byAgent = Object.fromEntries(runs(h2).map((r) => [r.agent, r]));
-    expect(byAgent["worker-b"].state).toBe("completed");
-    expect(byAgent["worker-a"]).toMatchObject({ state: "failed" });
-    expect(byAgent["worker-a"].detail).toContain("outcome unknown");
-    const entries = inboxEntries(h2);
-    expect(entries).toHaveLength(1);
-    expect(entries[0]).toContain("Agent worker-a could not finish task task-1 after 1 attempt(s): it ended while Lair was restarting, and its outcome is unknown");
-    expect(h2.store.listClaims("demo")).toEqual([]);
+    const [b] = runs(h2).filter((r) => r.agent === "worker-b");
+    expect(b).toMatchObject({
+      state: "completed",
+      detail: "exit unknown (it ended while Lair was restarting); classified from its queue line: DONE",
+    });
+    expect(eventsOf(h2, "completed").map((e) => e.evidence)).toEqual([["queue line: - DONE task-2 by worker-b 12:05Z: finished"]]);
+    const [first, restart, ...more] = runs(h2).filter((r) => r.agent === "worker-a");
+    expect(more).toEqual([]);
+    expect(first).toMatchObject({
+      state: "failed",
+      detail: "exit unknown: ended while Lair wasn't supervising it (started before a restart), with no queue line for the task",
+    });
+    expect(restart).toMatchObject({
+      state: "queued",
+      chainId: first.chainId,
+      sessionMode: "resume",
+      sessionId: first.sessionId,
+      sameSessionRestarts: 1,
+      notBefore: NOW + 10 * SEC,
+    });
+    const [unknown] = eventsOf(h2, "exit_unknown");
+    expect(unknown.summary).toBe(
+      "worker-a on task-1 ended while Lair wasn't supervising it (started before a restart), with no queue line for the task",
+    );
+    expect(unknown.evidence[0]).toBe("pid 5001: its exit status is unknown (it ended while Lair wasn't supervising it)");
+    expect(eventsOf(h2, "restart_same_session")).toHaveLength(1);
+    expect(eventsOf(h2, "escalated")).toEqual([]);
+    expect(inboxEntries(h2)).toEqual([]);
+    expect(h2.store.listClaims("demo")).toMatchObject([{ task: "task-1", runId: restart.id, ownerPid: 200 }]);
+
+    // The restart resumes the same session after the backoff
+    await at(h2, 10 * SEC);
+    expect(h2.spawner.calls).toHaveLength(1);
+    expect(h2.spawner.calls[0].argv.slice(-2)).toEqual(["--resume", first.sessionId]);
+    expect(h2.spawner.calls[0].env.LAIR_SESSION_MODE).toBe("resume");
+  });
+
+  it("after a restart, a re-adopted run is supervised to its end; an unknown exit counts only its own agent's line for its own task", async () => {
+    const h1 = setup();
+    await request(h1, "worker-a", "feat-login");
+    await request(h1, "worker-b", "feat-search");
+    await h1.service.tick(); // both run (pids 5001 and 5002)
+    // Lair restarts while both agents work: the new server finds them by pid and start time
+    const h2 = setup(() => ({}), { paths: h1, self: { pid: 200, startedAt: NOW + 5 * MIN } });
+    h2.procs.add(5001, h1.spawner.calls[0].argv.join(" "), NOW);
+    h2.procs.add(5002, h1.spawner.calls[1].argv.join(" "), NOW);
+    await at(h2, 5 * MIN);
+    await at(h2, 6 * MIN);
+    expect(runs(h2).map((r) => [r.agent, r.state, r.detail])).toEqual([
+      ["worker-a", "running", "working (pid 5001)"],
+      ["worker-b", "running", "working (pid 5002)"],
+    ]);
+    expect(h2.store.listClaims("demo").map((c) => [c.task, c.ownerPid])).toEqual([
+      ["feat-login", 5001],
+      ["feat-search", 5002],
+    ]);
+
+    // worker-b reports its own task DONE, and writes a DONE line about worker-a's task; both exit
+    appendFileSync(h1.queueFile, "- DONE feat-login by worker-b 12:06Z: reviewed it\n- DONE feat-search by worker-b 12:07Z: merged\n");
+    h2.procs.remove(5001);
+    h2.procs.remove(5002);
+    await at(h2, 7 * MIN);
+
+    const [a, b, aRestart] = runs(h2);
+    expect(b).toMatchObject({
+      agent: "worker-b",
+      state: "completed",
+      detail: "exit unknown (it ended while Lair was restarting); classified from its queue line: DONE",
+    });
+    // worker-b's line about feat-login isn't worker-a's: worker-a's run is one failed attempt, restarted
+    expect(a).toMatchObject({ agent: "worker-a", state: "failed" });
+    expect(a.detail).toContain("with no queue line for the task");
+    expect(aRestart).toMatchObject({ agent: "worker-a", state: "queued", chainId: a.chainId, sessionMode: "resume" });
+    expect(eventsOf(h2, "escalated")).toEqual([]);
+    expect(inboxEntries(h2)).toEqual([]);
+    expect(h2.spawner.calls).toEqual([]);
   });
 });
 
@@ -3178,6 +3246,187 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(lineOf(await check(h), "feat-login").state).toBe("started");
     expect(eventsOf(h, "fill_woken")).toHaveLength(1);
     expect(eventsOf(h, "fill_weak")).toEqual([]);
+  });
+
+  // ---- Runs whose exit status a restart lost ----
+
+  const UNSEEN = "exit unknown (it ended while Lair was restarting); classified from its queue line";
+  const NO_LINE = "exit unknown: ended while Lair wasn't supervising it (started before a restart), with no queue line for the task";
+
+  /**
+   * Fill starts feat-login at NOW on server 1 (pid 5001). Lair restarts at +5 min (server 2, on the same data)
+   * while the agent works, and re-adopts it by pid. At +6 min the agent writes `queueLine` (when given) and exits:
+   * server 2 never started it, so the exit status never reaches it.
+   */
+  async function exitUnseen(make: (p: Paths) => Record<string, unknown>, queueLine: string | null): Promise<Harness> {
+    const h1 = setup(make);
+    prompts(h1);
+    tasks(h1, "worker-a|Alice|feat-login|Login form");
+    await check(h1);
+    await at(h1, 0); // pid 5001
+    const h = setup(make, { paths: h1, self: { pid: 200, startedAt: NOW + 5 * MIN } });
+    h.procs.add(5001, h1.spawner.calls[0].argv.join(" "), NOW);
+    await at(h, 5 * MIN);
+    // Re-adopted: supervised as before the restart
+    expect(runs(h)).toMatchObject([{ state: "running", pid: 5001, detail: "working (pid 5001)", origin: "fill" }]);
+    expect(h.store.getClaim("demo", "feat-login")).toMatchObject({ ownerPid: 5001 });
+    expect(lineOf(await check(h), "feat-login").state).toBe("started");
+    if (queueLine !== null) appendFileSync(h.queueFile, `${queueLine}\n`);
+    h.procs.remove(5001);
+    await at(h, 6 * MIN);
+    return h;
+  }
+
+  /** Nothing went to the owner: no escalation, and no decision from the module or from fill */
+  function nothingAsked(h: Harness): void {
+    expect(eventsOf(h, "escalated")).toEqual([]);
+    expect(eventsOf(h, "decision")).toEqual([]);
+    expect(inboxEntries(h)).toEqual([]);
+  }
+
+  it("after a restart, a re-adopted run whose exit is lost and that ended on its WAITING line waits on its gate (no owner hold, no decision), then wakes", async () => {
+    // A fleet's line, by agent: "- WAITING <task> <gate id> by <agent> (<Name>) ..."
+    const line = `- WAITING feat-login ${GATE} by worker-a (Alice) 12:05Z: gate queued`;
+    const h = await exitUnseen(fill({ ...BY_AGENT, agents: ["worker-a"], wake: { file: "{gates_dir}/results/{wake}.rc" } }), line);
+    const [run] = runs(h);
+    expect(run).toMatchObject({ state: "completed", detail: `${UNSEEN}: WAITING` });
+    expect(eventsOf(h, "completed")).toMatchObject([
+      { runId: run.id, evidence: [`queue line: ${line}`], data: { exit: "unknown", classifiedAs: "waiting", line } },
+    ]);
+    expect(eventsOf(h, "exit_unknown")).toEqual([]);
+    expect(h.store.listClaims("demo")).toEqual([]);
+
+    const resultFile = join(h.gatesDir, "results", `${GATE}.rc`);
+    const waiting = lineOf(await check(h), "feat-login");
+    expect(waiting).toMatchObject({
+      state: "held",
+      hold: "waiting",
+      runId: run.id,
+      waiting: { wake: GATE, since: "2026-03-02T12:06:00.000Z", fallbackAt: null, refused: null },
+    });
+    expect(waiting.detail).toBe(`waiting: ${GATE} since 2026-03-02T12:06:00.000Z; starts again once ${resultFile} exists`);
+    h.clock.t = NOW + 30 * MIN;
+    expect(lineOf(await check(h), "feat-login").hold).toBe("waiting");
+    expect(runs(h)).toHaveLength(1);
+    nothingAsked(h);
+
+    // The gate's result arrives: fill starts the task again, once, with its own prompt
+    resultAt(h, GATE, 40 * MIN);
+    h.clock.t = NOW + 41 * MIN;
+    expect(lineOf(await check(h), "feat-login").state).toBe("started");
+    expect(lineOf(await check(h), "feat-login").state).toBe("started");
+    expect(eventsOf(h, "fill_woken")).toHaveLength(1);
+    await at(h, 41 * MIN);
+    expect(h.spawner.calls).toHaveLength(1);
+    expect(promptOf(h.spawner.calls[0])).toBe(FILL_PROMPT);
+    expect(runs(h).map((r) => r.state)).toEqual(["completed", "running"]);
+    expect(eventsOf(h, "fill_held").map((e) => e.data.hold)).toEqual(["waiting"]);
+    nothingAsked(h);
+  });
+
+  it("after a restart, a re-adopted run whose exit is lost and that ended on its DONE line is done", async () => {
+    const h = await exitUnseen(fill({ agents: ["worker-a"] }), "- DONE feat-login by worker-a (Alice) 12:05Z: merged");
+    const [run] = runs(h);
+    expect(run).toMatchObject({ state: "completed", detail: `${UNSEEN}: DONE` });
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({
+      state: "done",
+      runId: run.id,
+      detail: "done: - DONE feat-login by worker-a (Alice) 12:05Z: merged",
+    });
+    for (const minute of [30, 120]) {
+      await at(h, minute * MIN);
+      expect(lineOf(await check(h), "feat-login").state).toBe("done");
+    }
+    expect(runs(h)).toHaveLength(1);
+    expect(h.spawner.calls).toEqual([]);
+    expect(eventsOf(h, "fill_held")).toEqual([]);
+    nothingAsked(h);
+  });
+
+  it("after a restart, a re-adopted run whose exit is lost and that ended on its BLOCKED line is held blocked, with fill's one decision", async () => {
+    const h = await exitUnseen(fill({ agents: ["worker-a"] }), "- BLOCKED feat-login by worker-a (Alice) 12:05Z: needs the payment API key");
+    const [run] = runs(h);
+    expect(run).toMatchObject({ state: "completed", detail: `${UNSEEN}: BLOCKED` });
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "held", hold: "blocked", releasable: true, runId: run.id });
+    for (const minute of [10, 60, 600]) {
+      await at(h, minute * MIN);
+      expect(lineOf(await check(h), "feat-login").hold).toBe("blocked");
+    }
+    expect(runs(h)).toHaveLength(1);
+    expect(h.spawner.calls).toEqual([]);
+    expect(eventsOf(h, "escalated")).toEqual([]);
+    expect(eventsOf(h, "decision").map((e) => e.data.key)).toEqual([`fill:feat-login:blocked:${run.id}`]);
+    const entries = inboxEntries(h);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toContain("Fill holds task feat-login: worker-a reported it blocked");
+    expect(eventsOf(h, "fill_held").map((e) => e.data.hold)).toEqual(["blocked"]);
+  });
+
+  it("after a restart, a re-adopted run whose exit is lost with no queue line is one recovery: the same session again, no escalation, no second fill start", async () => {
+    const h = await exitUnseen(fill({ agents: ["worker-a"] }), null);
+    const [first, restart, ...more] = runs(h);
+    expect(more).toEqual([]);
+    expect(first).toMatchObject({ state: "failed", detail: NO_LINE });
+    expect(restart).toMatchObject({
+      state: "queued",
+      chainId: first.chainId,
+      origin: "fill",
+      sessionMode: "resume",
+      sessionId: first.sessionId,
+      sameSessionRestarts: 1,
+      notBefore: NOW + 6 * MIN + 10 * SEC,
+    });
+    expect(eventsOf(h, "exit_unknown")).toHaveLength(1);
+    expect(eventsOf(h, "restart_same_session")).toHaveLength(1);
+    nothingAsked(h);
+
+    // The restart is the task's run: fill neither holds nor starts it again
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "started", runId: restart.id });
+    await at(h, 6 * MIN + 10 * SEC);
+    expect(h.spawner.calls).toHaveLength(1);
+    expect(h.spawner.calls[0].argv.slice(-2)).toEqual(["--resume", first.sessionId]);
+    expect(eventsOf(h, "fill_started")).toHaveLength(1);
+    expect(eventsOf(h, "fill_held")).toEqual([]);
+    nothingAsked(h);
+  });
+
+  it("after a restart, a re-adopted run whose exit is lost with no queue line is escalated as before once its chain's recovery budget is spent", async () => {
+    const make = (p: Paths) => ({
+      ...fill({ agents: ["worker-a"] })(p),
+      recovery: { same_session_restarts: 1, fresh_sessions: 0, backoff_seconds: 10, max_backoff_seconds: 600 },
+    });
+    const h1 = setup(make);
+    prompts(h1);
+    tasks(h1, "worker-a|Alice|feat-login|Login form");
+    h1.spawner.behaviour = (_pid, log) => writeLog(h1.clock, log, "step 1 of 9\n");
+    await check(h1);
+    await at(h1, 0); // pid 5001
+    h1.spawner.exit(5001, 2); // a crash Lair sees: the chain's one same-session restart
+    await at(h1, 5 * MIN);
+    await at(h1, 5 * MIN + 10 * SEC); // the restart: pid 5002
+    expect(runs(h1).map((r) => r.state)).toEqual(["failed", "running"]);
+
+    // Lair restarts while the restart works; it then ends unseen, with no line
+    const h = setup(make, { paths: h1, self: { pid: 200, startedAt: NOW + 10 * MIN } });
+    h.procs.add(5002, h1.spawner.calls[1].argv.join(" "), NOW + 5 * MIN + 10 * SEC);
+    await at(h, 10 * MIN);
+    expect(runs(h)[1]).toMatchObject({ state: "running", pid: 5002 });
+    h.procs.remove(5002);
+    await at(h, 11 * MIN);
+
+    const [, second, ...more] = runs(h);
+    expect(more).toEqual([]);
+    expect(second).toMatchObject({ state: "failed", detail: NO_LINE });
+    expect(eventsOf(h, "exit_unknown")).toHaveLength(1);
+    expect(eventsOf(h, "escalated")).toHaveLength(1);
+    const entries = inboxEntries(h);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toContain(`Agent worker-a could not finish task feat-login after 2 attempt(s): ${NO_LINE}`);
+    expect(h.store.getClaim("demo", "feat-login")).toBeNull();
+    // Fill leaves the escalated task to the owner, with no decision of its own
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "held", hold: "owner" });
+    expect(eventsOf(h, "decision")).toHaveLength(1);
+    expect(h.spawner.calls).toEqual([]);
   });
 
   it("a store from before fill (schema version 1) gains the task index; its runs are found by task", () => {

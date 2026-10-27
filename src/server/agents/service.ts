@@ -12,7 +12,10 @@
  * - running: a run that lost its claim stops itself; a provider error or
  *   rate limit fails over to the next profile; a hung agent (the watchdog's
  *   rule, so a WAITING agent never is) is stopped; a dead process completed
- *   (exit 0), died on start, or crashed.
+ *   (exit 0), died on start, or crashed. One whose exit status was lost (it
+ *   ended while Lair was restarting) completed when its agent's queue line
+ *   for the task says DONE, WAITING or BLOCKED, and is a failed attempt
+ *   otherwise.
  * - stopping: SIGTERM, then SIGKILL after stop_grace_seconds.
  * Failures restart with the same session up to recovery.same_session_restarts
  * times, then in a fresh session (the old one moved aside) with a resume
@@ -72,7 +75,16 @@ import {
   type DecisionRequest,
 } from "./decisions.js";
 import { chooseProfile, matchFailover, profileLabel, profilesFor } from "./failover.js";
-import { AgentsFill, DECISION_FILL_START, OWNER_HOLDS, queueMark } from "./fill.js";
+import {
+  AgentsFill,
+  DECISION_FILL_START,
+  OWNER_HOLDS,
+  QueueLines,
+  queueMark,
+  queueWindowEnd,
+  reportedOutcome,
+  type ReportedOutcome,
+} from "./fill.js";
 import {
   createLock,
   judgeLock,
@@ -134,6 +146,7 @@ export const RECOVERY_KINDS: readonly AgentEventKind[] = [
   "never_started",
   "dead_on_start",
   "crashed",
+  "exit_unknown",
   "hung",
   "lost_claim",
   "restart_same_session",
@@ -155,6 +168,7 @@ const BUS_EVENTS: Partial<Record<AgentEventKind, EventType>> = {
   never_started: "agent.recovery",
   dead_on_start: "agent.recovery",
   crashed: "agent.recovery",
+  exit_unknown: "agent.recovery",
   hung: "agent.recovery",
   lost_claim: "agent.recovery",
   restart_same_session: "agent.recovery",
@@ -1287,10 +1301,19 @@ export class AgentsService {
     return code;
   }
 
-  /** The agent reported the task DONE in the queue file. */
-  private reportedDone(run: AgentRun, t: Tick): boolean {
-    const line = this.view(t).latestLineFor(run.agent);
-    return line?.type === "DONE" && line.message.match(/^DONE\s+(\S+)/i)?.[1] === run.task;
+  /**
+   * How the run ended by its agent's own queue line for its task since the
+   * run's queue mark (DONE, WAITING or BLOCKED), read with fill's patterns
+   * as fill reads them, so fill classifies the completed run the same way.
+   */
+  private reportedOutcome(run: AgentRun): ReportedOutcome | null {
+    const patterns = this.settings.fill;
+    try {
+      const until = queueWindowEnd(this.store, this.project, patterns, run, run);
+      return reportedOutcome(new QueueLines(this.config.queue_file), patterns, run, until);
+    } catch {
+      return null; // a pattern that doesn't compile for this task: no line found
+    }
   }
 
   /** The process is gone and nobody stopped it. */
@@ -1304,23 +1327,9 @@ export class AgentsService {
       // Its claim went first: the task isn't this run's to restart
       return this.endRun(run, "lost_claim", "the process ended after its claim was released", t, false);
     }
-    if (code === 0 || (code === undefined && this.reportedDone(run, t))) {
-      return this.endRun(run, "completed", code === 0 ? "exited 0" : "the agent reported the task DONE", t, true);
-    }
+    if (code === 0) return this.endRun(run, "completed", "exited 0", t, true);
+    if (code === undefined) return this.unsupervisedExit(run, t);
     const tail = run.logPath ? readTail(run.logPath, 64 * 1024) : "";
-    if (code === undefined) {
-      // It ended while this server wasn't supervising it (it was started before
-      // a restart): the exit status is lost. It may have finished, so it is
-      // never restarted: the owner is asked.
-      run.state = "failed";
-      run.endedAt = t.now;
-      run.detail = "ended while Lair wasn't supervising it (started before a restart): outcome unknown";
-      this.releaseRunLocks(run);
-      this.store.saveRun(run);
-      t.summary.ended++;
-      await this.escalate(run, "it ended while Lair was restarting, and its outcome is unknown", t);
-      return;
-    }
     const failover = matchFailover(lastLines(tail, 20), this.settings);
     if (failover) return this.failover(run, failover, t);
 
@@ -1337,12 +1346,50 @@ export class AgentsService {
     return this.recover(run, "crashed", `the process ended after ${seconds(lived)} (${exit})`, evidence, t);
   }
 
+  /**
+   * A process that ended while this server wasn't supervising it: it was
+   * started before a restart and re-adopted by pid, so no exit status
+   * reached this server (a config reload keeps the spawner, and with it the
+   * exit codes). An agent that wrote its queue line
+   * for the task since the run's queue mark ended normally: DONE, WAITING or
+   * BLOCKED completes the run, and fill (for its runs) carries the task on
+   * from that line, as after exit 0: done, waiting on its wake, or held
+   * blocked with fill's one decision. With no such line it is one failed
+   * attempt: recovery restarts it (the same session first, per
+   * agents.recovery), and escalates only once that budget is spent.
+   */
+  private async unsupervisedExit(run: AgentRun, t: Tick): Promise<void> {
+    const outcome = this.reportedOutcome(run);
+    if (outcome) {
+      // The line is the agent's text: kept as evidence, never in the run's detail (resume summaries carry details)
+      const detail = `exit unknown (it ended while Lair was restarting); classified from its queue line: ${outcome.kind.toUpperCase()}`;
+      return this.endRun(run, "completed", detail, t, true, {
+        evidence: [`queue line: ${oneLine(outcome.line)}`],
+        data: { exit: "unknown", classifiedAs: outcome.kind, line: outcome.line },
+      });
+    }
+    const tail = run.logPath ? readTail(run.logPath, 64 * 1024) : "";
+    const evidence = [
+      `pid ${run.pid}: its exit status is unknown (it ended while Lair wasn't supervising it)`,
+      "no DONE, WAITING or BLOCKED line of its own for the task since its chain was requested",
+      ...lastLines(tail, 10).map((line) => `log: ${oneLine(line)}`),
+    ];
+    return this.recover(
+      run,
+      "exit_unknown",
+      "ended while Lair wasn't supervising it (started before a restart), with no queue line for the task",
+      evidence,
+      t,
+    );
+  }
+
   private async endRun(
     run: AgentRun,
     state: "completed" | "lost_claim" | "superseded" | "failed",
     detail: string,
     t: Tick,
     releaseClaim: boolean,
+    event: { evidence?: string[]; data?: Record<string, unknown> } = {},
   ): Promise<void> {
     run.state = state;
     run.detail = detail;
@@ -1355,7 +1402,7 @@ export class AgentsService {
     if (state === "completed") {
       await this.record(
         "completed",
-        { agent: run.agent, task: run.task, runId: run.id, summary: `${run.agent} finished ${run.task}: ${detail}` },
+        { agent: run.agent, task: run.task, runId: run.id, summary: `${run.agent} finished ${run.task}: ${detail}`, ...event },
         t.now,
       );
     }
@@ -1371,7 +1418,7 @@ export class AgentsService {
    */
   private async recover(
     run: AgentRun,
-    kind: "hung" | "crashed" | "dead_on_start" | "fresh_session",
+    kind: "hung" | "crashed" | "dead_on_start" | "exit_unknown" | "fresh_session",
     detail: string,
     evidence: string[],
     t: Tick,
@@ -1383,7 +1430,7 @@ export class AgentsService {
     // The server keeps the task between attempts
     this.store.transferClaim(this.project, run.task, run.id, run.id, this.probes.self);
     t.summary.ended++;
-    if (kind === "crashed" || kind === "dead_on_start") {
+    if (kind === "crashed" || kind === "dead_on_start" || kind === "exit_unknown") {
       await this.record(
         kind,
         {
