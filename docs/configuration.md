@@ -561,14 +561,14 @@ Errors: 400 for invalid input, 403 for a cross-site request or an answer without
 
 ## Owner-only routes
 
-Every route that changes something only you should change needs the owner's session, the same one the Decision Inbox uses (see "Only you answer"): the `X-Lair-Owner-Session` header, from the dashboard's own origin, in a same-origin browser request. Without it the answer is HTTP 403, before the request's body is read, and nothing changes. `curl`, scripts, agents and other local programs can still read: every `GET` stays open. No CORS is granted under these prefixes (`OWNER_ONLY_PREFIXES` in `src/server/human-auth/cors.ts`). The dashboard's views send the session once this browser is signed in, and show "sign in from Decisions" until it is.
+Every route that changes something only you should change needs the owner's session, the same one the Decision Inbox uses (see "Only you answer"): the `X-Lair-Owner-Session` header, from the dashboard's own origin, in a same-origin browser request. Without it the answer is HTTP 403, before the request's body is read, and nothing changes. `curl`, scripts, agents and other local programs can still read: every `GET` stays open, except the two that read prompt files from disk (`/api/agents/prompts`). No CORS is granted under these prefixes (`OWNER_ONLY_PREFIXES` in `src/server/human-auth/cors.ts`). The dashboard's views send the session once this browser is signed in, and show "sign in from Decisions" until it is.
 
 | Prefix | Owner only | Open |
 |--------|------------|------|
 | `/api/decisions` | answering a decision | listing, the summary, raising |
 | `/api/owner` | listing and signing out browsers | the session check, signing in with the token |
 | `/api/review` | the owner's review, resolving findings, releasing holds, merging | reading, agent reviews, adding holds, gate results |
-| `/api/agents` | starting a run, releasing a claim, a fresh session, an early check | status, runs, recoveries |
+| `/api/agents` | starting a run, releasing a claim, a fresh session, an early check, listing and reading prompt files | status, runs, recoveries |
 | `/api/controls` | every `POST`: ask, instruct, tick, pause, resume, agent run/stop/release, gate submit/stuck, merge, dragon start/stop | status, inbox, audit, dragon config |
 | `/api/bus/send` | sending a message (it is sent as `owner`) | the board and the event stream (`/api/bus/board`, `/api/bus/events`) |
 | `/api/processes` | start, stop, restart | the list, a process, its logs |
@@ -1061,8 +1061,12 @@ Unknown keys, invalid regular expressions, a usage pattern without a named group
 - `POST /api/agents/claims/release` `{task, confirm: true}`, with an owner session: the run holding it stops itself
 - `POST /api/agents/runs/<id>/fresh-session` `{confirm: true}`, with an owner session: stop the run and start the task again in a fresh session (also for a run that ended, when it is the task's latest)
 - `POST /api/agents/tick`, with an owner session: check now (the service checks on its own every `interval_seconds`)
+- `GET /api/agents/prompts`, with an owner session: the files in the project's `prompts_dir`, newest first (at most 200), each as `{name, size, modifiedAt, tooLarge}`. Names only, never paths
+- `GET /api/agents/prompts/file?name=<file name>`, with an owner session: one of them, `{name, size, text}`. The name is one file name (letters, digits, `.`, `_` and `-`, starting with a letter or digit, no `..`; HTTP 400 otherwise). Only a regular file directly in `prompts_dir`, or a symlink to one there, is read: a symlink to anything outside it, a directory or any other kind of file is refused (HTTP 403), and a file over 200000 bytes, the most a run's prompt may hold, is refused (HTTP 413)
 
-Every POST here is the owner's (starting a run, releasing a claim, a fresh session, an early check): they need a browser signed in as the owner (see "Only you answer" in [Decision Inbox](#decision-inbox)), from the dashboard. Any other caller, an agent included, gets HTTP 403, so no process on this machine can put a prompt into a task or stop another agent's run. `/api/agents` gets no CORS. Modules that start runs (the scheduler, the planner) do it in-process through `AgentsManager.requestRun`, not over HTTP. The two actions that stop work also need `confirm: true` (HTTP 400 without); the Agents view asks before sending them.
+Every POST here is the owner's (starting a run, releasing a claim, a fresh session, an early check), and so are the two prompt-file reads, which read files from disk: they need a browser signed in as the owner (see "Only you answer" in [Decision Inbox](#decision-inbox)), from the dashboard. Any other caller, an agent included, gets HTTP 403, so no process on this machine can put a prompt into a task, stop another agent's run, or read a file through Lair. `/api/agents` gets no CORS. Modules that start runs (the scheduler, the planner) do it in-process through `AgentsManager.requestRun`, not over HTTP. The two actions that stop work also need `confirm: true` (HTTP 400 without); the Agents view asks before sending them.
+
+**Starting a run from the Agents view.** The "Start a run" form (shown unless the project is `read_only`) takes the agent, the task id, the model (the agent's own and its fallbacks' models; empty for its default) and the prompt, which you can type or load from a file in `prompts_dir` ("Load a prompt" lists the files there, including the prompts Lair wrote for earlier runs). Start asks for confirmation, then sends `POST /api/agents/runs`; a refusal shows the server's reason with its status: 400 for an invalid task, prompt or model, 403 when this browser is not signed in as the owner, the project is `read_only` or the budget is spent, 409 when the task is claimed or the agent is busy. Until this browser is signed in as the owner (from Decisions), the form is disabled and says so.
 
 ## Triage
 

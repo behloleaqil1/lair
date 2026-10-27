@@ -124,6 +124,7 @@ Agent runs with claims, locks, session recovery, failover and budgets ([configur
 - **`failover.ts`**, **`budgets.ts`**, **`sessions.ts`**: profiles and failover patterns; per-agent and per-project budgets per UTC day and month; session directories moved aside and resume summaries
 - **`decisions.ts`**: the Decision Inbox interface the agents module raises `spend` and `escalation` decisions through, with an inbox-file fallback
 - **`service.ts`**, **`routes.ts`**: the per-project tick (launch, supervise, recover, reap) started and stopped by `index.ts`, and `/api/agents/*`
+- **`prompts.ts`**: the prompt files in `prompts_dir` for the Agents view's start-run form (owner only): basenames, regular files directly in the directory, capped at a run's prompt size
 
 #### Decisions (`decisions/`)
 

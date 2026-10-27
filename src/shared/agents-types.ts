@@ -217,3 +217,24 @@ export interface AgentsStatusView {
   locks: LockView[];
   projectBudget: BudgetScopeView | null;
 }
+
+/**
+ * A file in the project's prompts_dir, offered by the Agents view's "Load a
+ * prompt" select (GET /api/agents/prompts, owner only). Its name only, never
+ * a path.
+ */
+export interface PromptFileView {
+  /** The file's basename in prompts_dir */
+  name: string;
+  size: number;
+  modifiedAt: string;
+  /** Larger than a run's prompt may be: listed, but it can't be loaded */
+  tooLarge: boolean;
+}
+
+/** One prompt file's text (GET /api/agents/prompts/:name, owner only). */
+export interface PromptFileText {
+  name: string;
+  size: number;
+  text: string;
+}

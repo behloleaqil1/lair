@@ -8,12 +8,16 @@
  *   POST /api/agents/claims/release?project=     {task, confirm: true}: the run holding it stops itself
  *   POST /api/agents/runs/:id/fresh-session?project=  {confirm: true}
  *   POST /api/agents/tick?project=               check now
+ *   GET  /api/agents/prompts?project=            owner: the files in prompts_dir (basenames, sizes, times)
+ *   GET  /api/agents/prompts/file?name=&project= owner: one of them, by basename: {name, size, text}
  *
  * Every POST is the owner's (starting a run, releasing a claim, a fresh
  * session, an early check): it needs an owner session (src/server/human-auth/,
  * the X-Lair-Owner-Session header from the dashboard), so an agent, or any
  * other local process, can't put a prompt into a task or stop a peer's run.
- * The service's own timer ticks in-process.
+ * So are the two prompt reads, which read files from disk (prompts.ts: a
+ * basename only, a regular file directly in prompts_dir, at most the size of
+ * a run's prompt). The service's own timer ticks in-process.
  * /api/agents is in OWNER_ONLY_PREFIXES (no CORS). Modules that start runs do
  * it in-process (AgentsManager.requestRun), not over HTTP. The two actions
  * that stop work also need `confirm: true` (the Agents view asks first).
@@ -25,6 +29,7 @@ import { z } from "zod";
 import { rejectCrossSiteRequests } from "../origin.js";
 import type { HumanAuth } from "../human-auth/index.js";
 import { AgentsError, isValidTaskId, type AgentsManager, type AgentsService } from "./service.js";
+import { isValidPromptName, listPromptFiles, PROMPT_NAME_RULE, PromptFileError, readPromptFile } from "./prompts.js";
 
 function respond<T>(data: T) {
   return { success: true, data, timestamp: new Date().toISOString() };
@@ -37,6 +42,7 @@ function fail(reply: FastifyReply, code: number, error: string) {
 const limit = z.coerce.number().int().min(1).max(500).default(100);
 const ProjectQuery = z.object({ project: z.string().optional() });
 const ListQuery = ProjectQuery.extend({ limit });
+const PromptQuery = ProjectQuery.extend({ name: z.string().max(255) });
 const RUN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 const RunBody = z
@@ -70,7 +76,7 @@ export async function registerAgentsRoutes(
     const projectOf = (query: { project?: string }) => query.project ?? defaultProject();
 
     const handleError = (reply: FastifyReply, e: unknown) =>
-      e instanceof AgentsError
+      e instanceof AgentsError || e instanceof PromptFileError
         ? fail(reply, e.statusCode, e.message)
         : fail(reply, 500, e instanceof Error ? e.message : "Unknown error");
 
@@ -168,6 +174,34 @@ export async function registerAgentsRoutes(
       if (!service) return reply;
       try {
         return respond(await service.freshSession(request.params.id));
+      } catch (e) {
+        return handleError(reply, e);
+      }
+    });
+
+    // The prompt files the Agents view's start-run form can load: owner only, they are files read from disk
+    app.get("/api/agents/prompts", ownerOnly, async (request, reply) => {
+      const query = ProjectQuery.safeParse(request.query ?? {});
+      if (!query.success) return fail(reply, 400, `Invalid query: ${query.error.issues[0].path.join(".")}`);
+      const service = serviceOf(reply, projectOf(query.data));
+      if (!service) return reply;
+      try {
+        return respond(listPromptFiles(service.promptsDir()));
+      } catch (e) {
+        return handleError(reply, e);
+      }
+    });
+
+    // The name is a query value, not a path segment: no URL normalisation or parameter length limit applies to it
+    app.get("/api/agents/prompts/file", ownerOnly, async (request, reply) => {
+      const query = PromptQuery.safeParse(request.query ?? {});
+      if (!query.success || !isValidPromptName(query.data.name)) {
+        return fail(reply, 400, `Invalid prompt file name: ${PROMPT_NAME_RULE}`);
+      }
+      const service = serviceOf(reply, projectOf(query.data));
+      if (!service) return reply;
+      try {
+        return respond(readPromptFile(service.promptsDir(), query.data.name));
       } catch (e) {
         return handleError(reply, e);
       }

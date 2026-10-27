@@ -18,13 +18,14 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import type { AgentAdapter, ProjectConfig } from "../../shared/types.js";
-import type { AgentEventKind, AgentsStatusView, AgentView } from "../../shared/agents-types.js";
+import type { AgentEventKind, AgentsStatusView, AgentView, PromptFileView } from "../../shared/agents-types.js";
 import { EventBus } from "../core/event-bus.js";
 import { BudgetManager } from "../fleet/budget.js";
 import {
@@ -40,8 +41,16 @@ import { AgentsManager, type AgentsService } from "./service.js";
 import { registerAgentsRoutes } from "./routes.js";
 import { HumanAuth, OWNER_SESSION_HEADER, registerOwnerRoutes } from "../human-auth/index.js";
 import { mountDecisions } from "../decisions/index.js";
-import { freshSessionAction, ownerRequest, releaseClaimAction } from "../../client/agents-actions";
+import {
+  freshSessionAction,
+  ownerRequest,
+  promptFileUrl,
+  promptsUrl,
+  releaseClaimAction,
+  startRunAction,
+} from "../../client/agents-actions";
 import { readLock } from "./locks.js";
+import { listPromptFiles, MAX_PROMPT_FILE_BYTES, PromptFileError, readPromptFile } from "./prompts.js";
 import type { AgentProbes, ProcessOwner, ProcessSpawner, SpawnOptions } from "./probes.js";
 import type { DecisionInbox, DecisionRequest } from "./decisions.js";
 import type { AgentsStore } from "./store.js";
@@ -1599,5 +1608,220 @@ describe("9. the Decision Inbox: decisions are raised there, and the owner's ans
       "Decision Inbox",
       expect.stringContaining("the Decision Inbox refused it"),
     ]);
+  });
+});
+
+// ============ 9. PROMPT FILES AND THE START-RUN FORM ============
+
+/** GET as the owner from the dashboard, or with these headers. */
+const get = (app: FastifyInstance, url: string, headers: Record<string, string> | undefined = ownerOf.get(app)) =>
+  app.inject({ method: "GET", url, headers });
+
+const OUTSIDE_TEXT = "text-of-a-file-outside-prompts-dir";
+
+/** A prompts_dir with one prompt, and a file outside it that must never be read. */
+function promptsFixture(h: Paths): { outside: string } {
+  mkdirSync(h.promptsDir, { recursive: true });
+  writeFileSync(join(h.promptsDir, "feat-login.txt"), "Build the login form\n");
+  const outside = join(h.dir, "outside.txt");
+  writeFileSync(outside, `${OUTSIDE_TEXT}\n`);
+  return { outside };
+}
+
+/** The error `run` throws (it must throw). */
+function refusal(run: () => unknown): unknown {
+  try {
+    run();
+  } catch (e) {
+    return e;
+  }
+  throw new Error("expected a refusal");
+}
+
+describe("9. prompt files and the start-run form", () => {
+  it("listing and reading prompt files are the owner's: refused (403) without an owner session", async () => {
+    const h = setup();
+    promptsFixture(h);
+    const app = await http(h);
+    const strangers: Record<string, string>[] = [
+      {}, // a script or an agent: no Origin, no session
+      DASHBOARD, // the dashboard, not signed in
+      { ...DASHBOARD, [OWNER_SESSION_HEADER]: "a-made-up-session-value-0123456789" },
+    ];
+    for (const url of [promptsUrl("demo"), promptFileUrl("demo", "feat-login.txt")]) {
+      for (const headers of strangers) {
+        const res = await get(app, url, headers);
+        expect(res.statusCode, `${url} with ${JSON.stringify(Object.keys(headers))}`).toBe(403);
+        expect(res.json().error).toContain("Only the owner can do this, from the dashboard");
+        expect(res.body).not.toContain("feat-login.txt");
+        expect(res.body).not.toContain("Build the login form");
+      }
+    }
+    // The owner gets them
+    expect((await get(app, promptsUrl("demo"))).statusCode).toBe(200);
+    expect((await get(app, promptFileUrl("demo", "feat-login.txt"))).statusCode).toBe(200);
+  });
+
+  it("lists basenames only, newest first, and loads one file's text by its basename", async () => {
+    const h = setup();
+    promptsFixture(h);
+    writeFileSync(join(h.promptsDir, "older.md"), "An older prompt\n");
+    aged(join(h.promptsDir, "older.md"), 60);
+    // Not names a request could ask for: not offered either
+    writeFileSync(join(h.promptsDir, ".hidden.txt"), "hidden\n");
+    writeFileSync(join(h.promptsDir, "with space.txt"), "spaced\n");
+    const app = await http(h);
+
+    const listed = await get(app, promptsUrl("demo"));
+    expect(listed.statusCode).toBe(200);
+    const files = listed.json().data as PromptFileView[];
+    expect(files.map((f) => f.name)).toEqual(["feat-login.txt", "older.md"]);
+    expect(files[0]).toMatchObject({ name: "feat-login.txt", size: 21, tooLarge: false });
+    expect(Object.keys(files[0]).sort()).toEqual(["modifiedAt", "name", "size", "tooLarge"]);
+    expect(listed.body).not.toContain(h.dir);
+
+    const read = await get(app, promptFileUrl("demo", "feat-login.txt"));
+    expect(read.statusCode).toBe(200);
+    expect(read.json().data).toEqual({ name: "feat-login.txt", size: 21, text: "Build the login form\n" });
+    expect(read.body).not.toContain(h.dir);
+
+    expect((await get(app, promptFileUrl("demo", "missing.txt"))).statusCode).toBe(404);
+    // No prompts_dir yet: nothing to list
+    rmSync(h.promptsDir, { recursive: true, force: true });
+    expect((await get(app, promptsUrl("demo"))).json().data).toEqual([]);
+    expect(listPromptFiles(h.promptsDir)).toEqual([]);
+  });
+
+  it("refuses a name that could leave prompts_dir (400) and reads nothing", async () => {
+    const h = setup();
+    const { outside } = promptsFixture(h);
+    const app = await http(h);
+    for (const name of [
+      "..",
+      "../outside.txt",
+      "a/b",
+      "/etc/passwd",
+      "a\\b",
+      ".hidden",
+      "-x",
+      "x..y",
+      "",
+      "%2e%2e",
+      "a".repeat(256),
+    ]) {
+      const res = await get(app, promptFileUrl("demo", name));
+      expect(res.statusCode, JSON.stringify(name)).toBe(400);
+      expect(res.json().error).toContain("Invalid prompt file name");
+      expect(res.body).not.toContain(OUTSIDE_TEXT);
+    }
+    // The name as a raw query value, missing, or given twice
+    for (const url of [
+      "/api/agents/prompts/file?project=demo&name=..%2Foutside.txt",
+      "/api/agents/prompts/file?project=demo",
+      "/api/agents/prompts/file?project=demo&name=feat-login.txt&name=other.txt",
+    ]) {
+      const res = await get(app, url);
+      expect(res.statusCode, url).toBe(400);
+      expect(res.body).not.toContain(OUTSIDE_TEXT);
+    }
+    // The module itself refuses them too, whatever calls it
+    expect(refusal(() => readPromptFile(h.promptsDir, ".."))).toMatchObject({ statusCode: 400 });
+    expect(refusal(() => readPromptFile(h.promptsDir, "../outside.txt"))).toBeInstanceOf(PromptFileError);
+    expect(readFileSync(outside, "utf-8")).toBe(`${OUTSIDE_TEXT}\n`);
+  });
+
+  it("a symlink out of prompts_dir is refused (403) and not listed; one to a file in it is allowed; a directory is refused", async () => {
+    const h = setup();
+    const { outside } = promptsFixture(h);
+    // An agent plants links: to a file outside, to the directory above, and to a prompt of the directory
+    symlinkSync(outside, join(h.promptsDir, "planted.txt"));
+    symlinkSync(h.dir, join(h.promptsDir, "parent"));
+    symlinkSync(join(h.promptsDir, "feat-login.txt"), join(h.promptsDir, "alias.txt"));
+    mkdirSync(join(h.promptsDir, "folder.txt"));
+    const app = await http(h);
+
+    const files = (await get(app, promptsUrl("demo"))).json().data as PromptFileView[];
+    expect(files.map((f) => f.name).sort()).toEqual(["alias.txt", "feat-login.txt"]);
+
+    for (const name of ["planted.txt", "parent"]) {
+      const res = await get(app, promptFileUrl("demo", name));
+      expect(res.statusCode, name).toBe(403);
+      expect(res.json().error).toContain("outside prompts_dir");
+      expect(res.body).not.toContain(OUTSIDE_TEXT);
+      expect(res.body).not.toContain(h.dir);
+    }
+    const folder = await get(app, promptFileUrl("demo", "folder.txt"));
+    expect(folder.statusCode).toBe(403);
+    expect(folder.json().error).toContain("not a regular file");
+
+    const alias = await get(app, promptFileUrl("demo", "alias.txt"));
+    expect(alias.statusCode).toBe(200);
+    expect(alias.json().data).toEqual({ name: "alias.txt", size: 21, text: "Build the login form\n" });
+  });
+
+  it("caps a prompt file at the size of a run's prompt: 200000 bytes load (and start a run), one more is refused (413)", async () => {
+    const h = setup();
+    promptsFixture(h);
+    expect(MAX_PROMPT_FILE_BYTES).toBe(200_000);
+    writeFileSync(join(h.promptsDir, "largest.txt"), "a".repeat(MAX_PROMPT_FILE_BYTES));
+    writeFileSync(join(h.promptsDir, "too-large.txt"), "a".repeat(MAX_PROMPT_FILE_BYTES + 1));
+    const app = await http(h);
+
+    const files = (await get(app, promptsUrl("demo"))).json().data as PromptFileView[];
+    expect(files.find((f) => f.name === "largest.txt")).toMatchObject({ size: 200_000, tooLarge: false });
+    expect(files.find((f) => f.name === "too-large.txt")).toMatchObject({ size: 200_001, tooLarge: true });
+
+    const largest = await get(app, promptFileUrl("demo", "largest.txt"));
+    expect(largest.statusCode).toBe(200);
+    const text = largest.json().data.text as string;
+    expect(text).toHaveLength(200_000);
+    const tooLarge = await get(app, promptFileUrl("demo", "too-large.txt"));
+    expect(tooLarge.statusCode).toBe(413);
+    expect(tooLarge.json().error).toContain("larger than 200000 bytes");
+    expect(tooLarge.body).not.toContain("a".repeat(1000));
+
+    // What loads is a prompt a run accepts
+    const run = await post(app, "/api/agents/runs?project=demo", { agent: "worker-a", task: "big-task", prompt: text });
+    expect(run.statusCode).toBe(201);
+  });
+
+  it("the form's request starts the run: the client helper's body with the owner session, the chosen model on the next check", async () => {
+    const h = setup(() => FALLBACK);
+    promptsFixture(h);
+    const app = await http(h);
+    const owner: Record<string, string> = ownerOf.get(app) ?? {};
+    const session: Record<string, string> = { [OWNER_SESSION_HEADER]: owner[OWNER_SESSION_HEADER] };
+
+    // What the Agents view does: load a prompt file, then send startRunAction with this browser's owner session
+    const loaded = await app.inject({ method: "GET", url: promptFileUrl("demo", "feat-login.txt"), headers: { ...DASHBOARD, ...session } });
+    const prompt = loaded.json().data.text as string;
+    const chosen = startRunAction("demo", { agent: "worker-a", task: "feat-login", prompt, model: "model-b" });
+    const chosenRequest = ownerRequest(chosen.body, session);
+    const res = await app.inject({ url: chosen.url, ...chosenRequest, headers: { ...DASHBOARD, ...chosenRequest.headers } });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().data).toMatchObject({ agent: "worker-a", task: "feat-login", state: "queued" });
+
+    // The default model: the form sends no model
+    const byDefault = startRunAction("demo", { agent: "worker-b", task: "feat-signup", prompt: "Build the signup form", model: "" });
+    expect(byDefault.body).not.toHaveProperty("model");
+    const defaultRequest = ownerRequest(byDefault.body, session);
+    const second = await app.inject({ url: byDefault.url, ...defaultRequest, headers: { ...DASHBOARD, ...defaultRequest.headers } });
+    expect(second.statusCode).toBe(201);
+
+    // Without the owner session the same request is refused, and nothing more is claimed
+    const stranger = ownerRequest(startRunAction("demo", { agent: "worker-a", task: "other", prompt: "x" }).body, {});
+    expect((await app.inject({ url: chosen.url, ...stranger, headers: { ...DASHBOARD, ...stranger.headers } })).statusCode).toBe(403);
+    expect(h.store.listClaims("demo").map((c) => c.task).sort()).toEqual(["feat-login", "feat-signup"]);
+
+    await post(app, "/api/agents/tick?project=demo");
+    expect(h.spawner.calls).toHaveLength(2);
+    const spawnOf = (agent: string) => {
+      const call = h.spawner.calls.find((c) => c.env.LAIR_AGENT === agent);
+      if (!call) throw new Error(`no spawn for ${agent}`);
+      return call;
+    };
+    expect(spawnOf("worker-a").argv).toEqual(expect.arrayContaining(["--agent", "worker-a", "--model", "model-b"]));
+    expect(promptOf(spawnOf("worker-a"))).toContain("Build the login form");
+    expect(spawnOf("worker-b").argv).toEqual(expect.arrayContaining(["--agent", "worker-b", "--model", "model-a"]));
   });
 });

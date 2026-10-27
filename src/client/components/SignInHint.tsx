@@ -2,8 +2,10 @@
  * Shown above actions that need the owner's session (owner-actions.ts),
  * while this browser is not signed in as the owner: the server refuses them
  * with 403 until it is. Signing in happens once, in the Decisions view.
+ * `onStatus` hands each check's answer to the view, so it can disable a form
+ * while the browser is signed out.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ownerStatus } from "../owner-session";
 
 interface Props {
@@ -11,20 +13,25 @@ interface Props {
   what: string;
   /** Re-checks when it changes (the views' refresh key) */
   refreshKey?: number;
+  /** Called after every check: true when this browser is signed in as the owner */
+  onStatus?: (signedIn: boolean) => void;
 }
 
-export function SignInHint({ what, refreshKey }: Props) {
+export function SignInHint({ what, refreshKey, onStatus }: Props) {
   const [signedIn, setSignedIn] = useState<boolean | null>(null);
+  const report = useRef(onStatus);
+  report.current = onStatus;
 
   useEffect(() => {
     let cancelled = false;
+    const settle = (value: boolean) => {
+      if (cancelled) return;
+      setSignedIn(value);
+      report.current?.(value);
+    };
     ownerStatus()
-      .then((status) => {
-        if (!cancelled) setSignedIn(status.signedIn);
-      })
-      .catch(() => {
-        if (!cancelled) setSignedIn(false);
-      });
+      .then((status) => settle(status.signedIn))
+      .catch(() => settle(false));
     return () => {
       cancelled = true;
     };

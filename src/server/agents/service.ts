@@ -323,6 +323,11 @@ export class AgentsService {
     return this.config.read_only === true;
   }
 
+  /** The project's prompts_dir: where run prompts are written, and where the Agents view loads prompts from */
+  promptsDir(): string {
+    return getPromptsDir(this.config);
+  }
+
   get running(): boolean {
     return !this.stopped;
   }
