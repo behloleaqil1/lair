@@ -228,6 +228,22 @@ describe("Settings is the owner's only, reads included", () => {
   });
 });
 
+describe("project names", () => {
+  it("refuses a name that is not a project's: 400 for an unsafe one, 404 for an unknown one", async () => {
+    const h = await setup();
+    await h.owner();
+    writeFileSync(join(h.root, "escape.yaml"), h.original);
+    const traversal = await loadProjectSettings("../escape");
+    expect(traversal).toMatchObject({ status: 400, code: "invalid_project" });
+    const save = await saveProjectSettings("../escape", { baseHash: "0".repeat(64), yaml: "name: x\n" });
+    expect(save.status).toBe(400);
+    expect(readFileSync(join(h.root, "escape.yaml"), "utf-8")).toBe(h.original);
+    expect((await loadProjectSettings("nope")).status).toBe(404);
+    expect((await loadHistory("../escape")).status).toBe(400);
+    expect((await loadVersion("shop", "../../owner")).status).toBe(400);
+  });
+});
+
 describe("saving", () => {
   it("refuses an invalid change with errors per field and writes nothing", async () => {
     const h = await setup();

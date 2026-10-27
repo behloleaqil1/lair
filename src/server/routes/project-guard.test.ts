@@ -132,7 +132,7 @@ describe("project name validation (routes)", () => {
   });
 
   it.each([
-    ["GET", "/api/settings"],
+    ["POST", "/api/settings/test-machine"],
     ["GET", "/api/controls/status"],
     ["GET", "/api/controls/inbox"],
     ["GET", "/api/controls/dragon/config"],
@@ -150,14 +150,15 @@ describe("project name validation (routes)", () => {
     expect(res.json().success).toBe(false);
   });
 
-  it("POST /api/settings cannot overwrite or back up a YAML outside projects/", async () => {
+  it("has no unvalidated rewrite left that could overwrite or back up a YAML outside projects/", async () => {
+    // POST /api/settings is gone; saving goes through src/server/settings/ (owner only, validated)
     const res = await app.inject({
       method: "POST",
       url: "/api/settings",
       query: { project: TRAVERSAL },
       payload: { read_only: false },
     });
-    expect(res.statusCode).toBe(400);
+    expect(res.statusCode).toBe(404);
     expect(readFileSync(OUTSIDE_FILE, "utf-8")).toBe(OUTSIDE_YAML);
     expect(readdirSync(TMP).filter((f) => f.includes(".backup-"))).toEqual([]);
   });
@@ -175,11 +176,11 @@ describe("project name validation (routes)", () => {
   it("accepts a known project", async () => {
     const res = await app.inject({
       method: "GET",
-      url: "/api/settings",
+      url: "/api/controls/dragon/config",
       query: { project: PROJECT },
     });
     expect(res.statusCode).toBe(200);
-    expect(res.json().data.config.name).toBe(PROJECT);
+    expect(res.json().success).toBe(true);
   });
 });
 
@@ -426,7 +427,7 @@ describe("cross-site browser requests", () => {
   it("refuses a DNS-rebinding Host header", async () => {
     const res = await app.inject({
       method: "GET",
-      url: "/api/settings",
+      url: "/api/controls/status",
       query: { project: PROJECT },
       headers: { host: "attacker.example:4777" },
     });
@@ -436,7 +437,7 @@ describe("cross-site browser requests", () => {
   it("allows the dashboard origin and loopback hosts", async () => {
     const res = await app.inject({
       method: "GET",
-      url: "/api/settings",
+      url: "/api/controls/status",
       query: { project: PROJECT },
       headers: { origin: "http://localhost:5173", host: "localhost:5173" },
     });
