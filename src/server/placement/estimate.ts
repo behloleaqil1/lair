@@ -7,8 +7,9 @@
  * runners, at most `limits.<class>` of a class at a time, and a job never
  * starts before the one ahead of it (a runner takes the head of its queue,
  * as the usual runners do). A running job ends after its expected duration,
- * counted from when it started; one past it is expected to need a tenth of
- * it more. A pseudo-lane (`serves`) runs the jobs it takes from the lanes it
+ * counted from when it started, but always has at least a tenth of it left
+ * (so one past its duration is expected to need a tenth of it more). A
+ * pseudo-lane (`serves`) runs the jobs it takes from the lanes it
  * serves, beside their own runners.
  */
 import { laneOrder } from "./queue.js";

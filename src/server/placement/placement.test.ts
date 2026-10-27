@@ -352,11 +352,11 @@ describe("placement: where a job goes", () => {
 
     await h.tick();
 
-    // r1 has 5 min left: q1 finishes in 65 min on heavy, in 60 on the laptop: 5 min < 10
+    // r1 has at least a tenth of its hour left (6 min): q1 finishes in 66 min on heavy, in 60 on the laptop: 6 < 10
     expect(h.moved()).toEqual([]);
     expect(h.job("q1")).toMatchObject({
-      expectedStart: at(NOW + 60 * MIN),
-      expectedFinish: at(NOW + 120 * MIN),
+      expectedStart: at(NOW + 61 * MIN),
+      expectedFinish: at(NOW + 121 * MIN),
       advice: null,
     });
 
