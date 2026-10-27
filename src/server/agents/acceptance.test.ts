@@ -2301,7 +2301,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     await startAndEnd(5 * MIN); // the third in a row
     line = lineOf(await check(h), "feat-login");
     expect(line).toMatchObject({ state: "held", hold: "no_done", releasable: true });
-    expect(line.detail).toContain("its last 3 run(s) exited 0 without reporting it done");
+    expect(line.detail).toContain("its last 3 run(s) exited 0 without progress (no done line, or waiting on nothing that came");
     expect(runs(h).map((r) => r.state)).toEqual(["completed", "completed", "completed"]);
 
     // One decision, with the runs and their last output
