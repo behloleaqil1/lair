@@ -223,15 +223,6 @@ export function systemCheckRunner(): CheckRunner {
         }
         const stdout = new Capture(options.maxOutputBytes);
         const stderr = new Capture(options.maxOutputBytes);
-        let timer: NodeJS.Timeout | undefined;
-        let settled = false;
-        let timedOut = false;
-        const done = (code: number | null, error?: string) => {
-          if (settled) return;
-          settled = true;
-          if (timer) clearTimeout(timer);
-          resolve({ code, stdout: stdout.text(), stderr: stderr.text(), timedOut, ...(error ? { error } : {}) });
-        };
         let child: ChildProcess;
         try {
           child = spawn(file, args, {
@@ -244,10 +235,19 @@ export function systemCheckRunner(): CheckRunner {
             windowsHide: true,
           });
         } catch (e) {
-          done(null, e instanceof Error ? e.message : String(e));
+          resolve({ code: null, stdout: "", stderr: "", timedOut: false, error: e instanceof Error ? e.message : String(e) });
           return;
         }
-        timer = setTimeout(() => {
+        let settled = false;
+        let timedOut = false;
+        const done = (code: number | null, error?: string) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve({ code, stdout: stdout.text(), stderr: stderr.text(), timedOut, ...(error ? { error } : {}) });
+        };
+        // done() runs only from the timer and the child's events, all after this line
+        const timer = setTimeout(() => {
           timedOut = true;
           killTree(child);
           child.stdout?.destroy();
