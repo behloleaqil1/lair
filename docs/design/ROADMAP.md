@@ -79,7 +79,7 @@ Each step lists what must exist first. One module per pull request, each with it
 |---|---|---|---|---|
 | C1 | **Planner: documents become work** | [autonomy.md §4](autonomy.md) | planner (built) | Cards extracted from a versioned document, each tracing to its section; dependencies and merge order |
 | C2 | **Intake**: feature requests and bug reports | [autonomy.md §4a](autonomy.md) | C1 | Requests from the UI, an in-app widget and importers become triaged cards or decisions; duplicates merged |
-| C3 | **Lifecycle**: documents first | [autonomy.md §4b](autonomy.md) | C1, reviews | Audit, plan, architecture and designs written by an author agent and critiqued by two reviewer agents |
+| C3 | **Lifecycle**: documents first | [autonomy.md §4b](autonomy.md), [app-architecture.md](app-architecture.md) | C1, reviews | Audit, plan and designs written by an author agent and critiqued by two reviewer agents; the **architecture stage**: quality attributes, options and trade-offs, ADRs, the stack, a reference architecture and fitness functions, for any style (modular monolith, microservices on Kubernetes, event-driven, serverless, AI-native) |
 | C4 | **Kickstart and projects** | [phase5-deploy.md §3](phase5-deploy.md), [platform.md §10](platform.md) | C3, B2 | "New project": create or connect a repository, choose or detect the stack, first plan |
 | C5 | **Importer**: take over an existing project | [autonomy.md §10](autonomy.md) | C3 | An existing repository and its scripts adopted with no downtime: audit, shadow mode, then cutover |
 | C6 | **lair-node**: run work on other machines | [node.md](node.md) | runners | Capacity reporting and remote runs without SSH scripts; unplugging a node loses nothing |
