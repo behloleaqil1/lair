@@ -90,7 +90,8 @@ Pure functions that parse project files into typed structures:
 
 #### Services (`services/`)
 
-- **`data.ts`**: main data service, aggregates parsers for each view (read-only)
+- **`data.ts`**: main data service, aggregates parsers for each view (read-only); a gate's record and log path, and a dragon's newest log, for the dashboard's details
+- **`log-tail.ts`**: the bounded tail of a log the owner reads (lines, bytes, line length, no symlinks, credentials masked)
 - **`command.ts`**: runs configured commands as argument arrays (no shell) and appends each action to `data/audit.log`
 - **`dragon-registry.ts`**: the dragons a project has (YAML `dragons:` plus `dragons.txt`); start/stop requests are checked against it and the start dialog lists it
 - **`adapters.ts`**: built-in agent adapter definitions and command builders (adapters are listed in the UI; dragons are started with `dragon_start_cmd`)
@@ -124,7 +125,7 @@ Agent runs with claims, locks, session recovery, failover and budgets ([configur
 - **`failover.ts`**, **`budgets.ts`**, **`sessions.ts`**: profiles and failover patterns; per-agent and per-project budgets per UTC day and month; session directories moved aside and resume summaries
 - **`decisions.ts`**: the Decision Inbox interface the agents module raises `spend` and `escalation` decisions through, with an inbox-file fallback
 - **`service.ts`**, **`routes.ts`**: the per-project tick (launch, supervise, recover, reap) started and stopped by `index.ts`, and `/api/agents/*`
-- **`prompts.ts`**: the prompt files in `prompts_dir` for the Agents view's start-run form (owner only): basenames, regular files directly in the directory, capped at a run's prompt size
+- **`prompts.ts`**: the prompt files in `prompts_dir` for the Work section's start-run form (owner only): basenames, regular files directly in the directory, capped at a run's prompt size
 
 #### Decisions (`decisions/`)
 
@@ -221,6 +222,14 @@ Every project setting from the dashboard, written to the project's YAML ([design
 - **`checks.ts`**: parser messages as errors per field, the command changes and their digest; the rules for commands and secrets are in `src/shared/settings-rules.ts`
 - **`routes.ts`**: `/api/settings/*`, all behind `requireOwner()`
 
+#### Dashboard reads (`dashboard/`)
+
+What the dashboard's sections need that the modules' own routes don't expose. Every route only reads; `/api/dashboard` is in `OWNER_ONLY_PREFIXES`.
+
+- **`modules.ts`**: `GET /api/dashboard/modules`: which modules a project's YAML turns on, for the nav
+- **`gate-detail.ts`**: a gate's detail from the project's gate queue (the request, its result, the steps and durations its log names: `parsers/gates.ts` `parseGateSteps`), a Lair pipeline run, triage's record and placement's job (`GET /api/dashboard/gates/:id`, open, no log line or test output); and its output: the failing tests with their messages (triage's, else read from the log's console output with triage's parsers) and the log tail
+- **`routes.ts`**: the routes. The log and test output (`GET /api/dashboard/gates/:id/output`, `GET /api/dashboard/agents/:id/log`) are the owner's (`requireOwner()`, before anything is read) and bounded (`services/log-tail.ts`: at most 1,000 lines of the last 128 KB, each cut to 2,000 characters, credentials masked, no symlink followed); an agent's log is its latest run's (only inside `agents_dir`) or its newest log there
+
 #### Store (`store/`)
 
 - **`store.ts`**: SQLite store (better-sqlite3) for nodes, tasks, jobs, events and agent runs, at `data/lair.db`
@@ -244,7 +253,7 @@ Gate pipelines from the project config and their executors ([configuration](conf
 - **`gates/executors/`**: `github.ts` and `github-api.ts` (GitHub Actions over the REST API: dispatch, find, poll, cancel, logs, artifacts, minutes), `github-workflow.ts` (the workflow file Lair generates and its log markers), `local.ts` (argv spawner, capacity probe, worktrees), `types.ts` (the Executor interface and the boundaries tests fake)
 - **`gates/run-store.ts`**: runs, jobs, attempts, unavailable executors and raised decisions in SQLite (`data/pipelines.db`)
 - **`gates/decision-hook.ts`**: the interface the Decision Inbox implements; the default emits `decision.needed`
-- **`gates/routes.ts`**: `/api/pipelines/*`
+- **`gates/routes.ts`**: `/api/pipelines/*`; a job's log tail and its steps' output only for the owner's session, other callers get the runs without them
 
 Library modules with tests, not exposed through the API yet:
 
@@ -255,41 +264,49 @@ Library modules with tests, not exposed through the API yet:
 
 ### Client (`src/client/`)
 
-React-based frontend built with Vite.
+React-based frontend built with Vite. No UI framework: CSS variables in `App.css` (a dark scheme, and a light one when the system asks for it), one table component and one detail panel.
 
 - **`main.tsx`**: entry point
-- **`App.tsx`**: main app with navigation, view routing and the command bar
+- **`App.tsx`**: the header (project), the command bar, the nav of sections and the section the URL names; old view ids in the URL are replaced by their section (`router.ts`)
+- **`router.ts`**: hash routes, one per section with an optional tab and open detail: `#/work/<agent>`, `#/gates/<id>?tab=triage`, `#/prs/<n>`, `#/decisions/<id>`, `#/machines/<name>`; `&project=<name>` when the server has several projects. `LEGACY_VIEWS` maps the old views (Dragons, Agents, Reviews, Nodes, Health, Activity, Triage, Owner messages, Orchestrator) to where each went; `#owner-token=` (the setup link) is not a route and is left alone
+- **`nav.ts`**: the sections and their tabs, and which the nav shows: a section or tab whose module is off for the project (`GET /api/dashboard/modules`) is hidden, and opened by its URL it says what to set to turn it on
+- **`time.ts`**: "5 min ago", with the absolute time on hover (`<Time>`); durations
+- **`table.ts`**: the sort and keyboard rules of `DataTable`
 - **`App.css`**: styles
+
+| Section | What it shows | Detail (a row's click, Enter or Space) |
+|---|---|---|
+| Home | Needs you (open decisions, holds, failed gates, PRs ready to merge, config problems, agents in trouble: `home-view.ts`), one tile per section, problems, merges, recent activity; tabs Activity and Health (watchdog) | each item links to its row's detail |
+| Work | every agent once (the project's dragons and the agents module's agents merged: `work-view.ts`); tabs Tasks (fill's tasks file) and Locks and budget | `#/work/<agent>`: task and description, current run (state, model, started, recoveries, claims), what it waits on and since when, holds with Release, its tasks file lines, budget, recent runs, recoveries, reports, the log tail |
+| Gates | the gate queue (any lane), results of 24 hours; tabs Pipelines, Triage, Placement | `#/gates/<id>`: track, sha, branch, lane, machine, each step's result and duration, triage's verdict per cause and actions, placement's advice, a pipeline run's jobs and where they ran; the failing tests and the log tail (`gate-detail-view.ts`) |
+| PRs | open pull requests with their readiness (the review module's evaluation at the head, or only the gate without it: `pr-view.ts`, `pr-readiness.ts`) | `#/prs/<n>`: tier and the rules that set it, required reviews and who holds each slot, reviews, findings, the gate at the head, holds, merge conditions and Merge, the owner's review |
+| Machines | the project's machines with their runners and placement's probes (`machines-view.ts`); tab Nodes | `#/machines/<name>`: probe, lanes, the jobs on them; a node's capacity |
+| Decisions | the Decision Inbox; tab Owner messages | `#/decisions/<id>`: the full context, then the answer (or the outcome and history) |
+| Delivery, Processes, Settings | as before; Processes only when the project defines processes | |
+
+Logs and test output are the owner's: a detail asks for them only once this browser is signed in as the owner (`useOwnerSignedIn`), with the owner session in the header, and until then says where to sign in (`OwnerOnlyNotice`). Owner-only actions are disabled the same way, and the server refuses them anyway.
 
 #### Components (`components/`)
 
-Each view is a standalone component:
-
-- **`Overview.tsx`**: repo status, problems, counts
-- **`DecisionInbox.tsx`**: the Decision Inbox (open decisions with their context, links as text to copy, options and recommendation, a confirmation step for spend and go/no-go, a password field for credentials, history, signing in as the owner) and the nav badge with the open count. Its requests and answer rules are in `decisions-api.ts`; the owner session (sent as a header; kept in this origin's `localStorage`, or only in the page's memory under the Vite dev server) is in `owner-session.ts`
-- **`OwnerSessions.tsx`**: the signed-in browsers, each with Sign out
-- **`Dragons.tsx`**, **`DragonStartDialog.tsx`**, **`DragonStopDialog.tsx`**: agent list (running also for a run of the agents module, "managed by Lair"; the effective model, "(default)" when from `dragon_defaults`; the newest log's time), start and stop dialogs (view logic in `dragon-view.ts`)
-- **`Gates.tsx`**, **`PipelineRuns.tsx`**: gate queue by lane (every lane the request files name), results of the last 24 hours newest first (view logic in `gates-view.ts`); pipeline runs with where each step ran, fallback reasons, CI minutes, executor availability and the workflow file
-- **`Placement.tsx`**: placement in the Gates view (each queued job's expected start, finish and advice; the mode and latest moves) and the Machines view (probe state, load, slots in use per lane); view logic in `placement-view.ts`
-- **`PRs.tsx`**: pull requests with gate status and merge readiness. With the review module on, readiness is that module's evaluation of each PR at its head (`GET /api/review/prs/:number`: "Merge ready" only when `canMerge`, else `Waiting: <first reason>`), asked again when the head changes, after 5 minutes or on Re-check readiness; without it the first group is "Gate passed". The rules are in `pr-readiness.ts`
-- **`Orchestrator.tsx`**: orchestrator ticks, STOP file, service status
-- **`Machines.tsx`**: machine health, runner status
-- **`Nodes.tsx`**: connected lair-node instances
-- **`Processes.tsx`**: managed processes and their logs
-- **`Activity.tsx`**, **`LiveFeed.tsx`**: fleet bus activity feed
-- **`Health.tsx`**: watchdog SLO status, open breaches and playbook runs (read-only)
+- **`Section.tsx`**: the props every section gets, and its header (title and tab links)
+- **`DataTable.tsx`**: the one table: sortable headers, rows that open their detail, arrow keys between rows
+- **`DetailPanel.tsx`**: the side panel a detail opens in: it takes the focus and gives it back, Esc closes it, Tab stays inside
+- **`ui.tsx`**: `Time`, the loading, error and empty states (each says what to do), `ModuleOff`, `KeyValues`, `Tabs`, `OwnerOnlyNotice`, `useOwnerSignedIn`
+- **`Home.tsx`**, **`LiveFeed.tsx`**, **`Activity.tsx`**, **`Health.tsx`**: Home, its recent activity (the bus's reports, linked to their agent, gate and PR), the Activity tab (bus reports and the control audit log) and the Health tab (watchdog SLOs, breaches, playbook runs)
+- **`Work.tsx`**, **`AgentDetail.tsx`**, **`StartRunForm.tsx`**, **`Budget.tsx`**, **`DragonStartDialog.tsx`**, **`DragonStopDialog.tsx`**: Work, an agent's detail (`AgentDetailView` renders what `AgentDetail` reads), the owner's "Start a run" (`agents-actions.ts`), budget lines, and the start and stop commands of a project's own launcher (`dragon-view.ts`, `dragon-start.ts`)
+- **`GatesSection.tsx`**, **`GateDetail.tsx`**, **`PipelineRuns.tsx`**, **`Triage.tsx`**, **`Placement.tsx`**: Gates, a gate's detail, the Pipelines tab (executors, minutes, runs, the workflow file; a run's jobs in `PipelineJobs`), the Triage tab (incident, bisect, revert and protect, failures, tasks, flaky tests; what triage did about one failure in `TriageRecordDetail`) and the Placement tab (mode and moves); view logic in `gates-view.ts` and `placement-view.ts`
+- **`PullRequests.tsx`**, **`PrDetail.tsx`**: PRs and a PR's detail (requests in `review-api.ts`, view logic in `review-view.ts`)
+- **`MachinesSection.tsx`**: Machines and Nodes with their details
+- **`DecisionsSection.tsx`**, **`DecisionInbox.tsx`**, **`OwnerSessions.tsx`**, **`Inbox.tsx`**: Decisions (the inbox as a table, a decision's detail with the confirmation step for spend and go/no-go and the password field for credentials, signing in as the owner, the signed-in browsers) and the Owner messages tab (`inbox_file`). Requests and answer rules in `decisions-api.ts`; the owner session (sent as a header; kept in this origin's `localStorage`, or only in the page's memory under the Vite dev server) in `owner-session.ts`
 - **`Delivery.tsx`**: environments and services (state, health, restarts, holds, crash loops, error lines) with Up, Down, Restart, Deploy and Release, and the operations log. Its requests are built in `delivery-api.ts`
-- **`SignInHint.tsx`**: the "sign in from Decisions" notice the views with owner-only actions show while this browser isn't signed in as the owner. Those views send their writes through `owner-actions.ts` (and `delivery-api.ts`), which add the owner session
-- **`Reviews.tsx`**: per PR, the risk tier, required and present reviews, findings, the gate at the head, holds and the merge button with its reasons (view logic in `review-view.ts`, requests in `review-api.ts`, owner-only ones with the owner session)
-- **`Agents.tsx`**: per agent its state, run, claims, budget and recoveries; locks and their holders. Release a claim or start a fresh session, after a confirmation (`agents-actions.ts`)
-- **`Triage.tsx`**: gate failures with each cause's verdict, evidence, actions and retry count; the default branch's incident and bisect, with revert and protect buttons
-- **`Inbox.tsx`**: the "Owner messages" view (`inbox_file`: the owner's instructions and the orchestrator's replies; decisions are in Decisions). The nav labels are in `nav.ts`
+- **`Processes.tsx`**: managed processes and their logs
+- **`SignInHint.tsx`**: the "sign in from Decisions" notice above forms with owner-only actions. Writes go through `owner-actions.ts` (and `delivery-api.ts`), which add the owner session
 - **`CommandBar.tsx`**: ask / instruct / task command bar
 - **`Settings.tsx`**: the Settings view (owner only): a project's Form, YAML and History tabs and New project. `SettingsForm.tsx` draws each section from its JSON Schema (fields and widgets from `settings-form.ts`), `SettingsReview.tsx` shows a save's diff, errors and commands to confirm, `SettingsHistory.tsx` the versions and Restore, `ProjectWizard.tsx` the new project; requests in `settings-api.ts`
 
 #### Hooks (`hooks/`)
 
-- **`useApi.ts`**: data fetching with polling and error handling
+- **`useApi.ts`**: data fetching on the 10-second refresh; keeps its data across refreshes, starts empty for another endpoint or project, sends the owner session for owner-only reads (`owner`), and fetches nothing when told to (`skip`: a module that is off, a reader not signed in)
 - **`useWebSocket.ts`**: WebSocket subscription management. The connection is a `LiveSocket` (`live-socket.ts`): when the server goes away (a restart) it reconnects with backoff (`reconnect.ts`: 1 s, doubling, at most 30 s), subscribes again once open, and reports `reconnecting` meanwhile; unmounting closes it for good
 - **`useBusEvents.ts`**: SSE subscription to fleet bus events
 - **`event-stream.ts`**: the live feed's SSE connection (`LiveFeed.tsx`). Any connection error closes the browser's `EventSource`, whose own retry stops for good after an HTTP error during a restart, and opens a new one with the same backoff; the feed says "Reconnecting…" meanwhile

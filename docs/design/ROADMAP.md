@@ -68,18 +68,24 @@ review:
 7. **No private details and no AI attribution** in code, tests, docs or commits ([CONTRIBUTING.md](../../CONTRIBUTING.md)).
 8. **CI is the test runner.** Typecheck, lint, tests and build on Node 22 and 24 must be green before review.
 
-## UI consolidation (when a project's agents move to Lair)
+## UI consolidation (built)
 
-Some views exist twice because Lair grew next to the tools it replaces: the old view shows the state the previous
-launcher keeps, and the new one shows Lair's. They stay apart while both run, so the owner can see each, and they merge
-once a project's agents run under Lair.
+The dashboard had grown one view per module (16 nav items, several of them twice: the state a previous launcher keeps
+next to Lair's). It now has a section per job the owner does, each shown only when its module is on for the project, and
+every list row opens a detail view with a URL (`src/client/router.ts`, [architecture](../architecture.md#client-srcclient)).
+Logs and test output are the owner's (`/api/dashboard/*`, `src/server/dashboard/`).
 
-| Today | After the move |
+| Before | Now |
 |---|---|
-| **Dragons** (the roster; Start and Stop through the project's own start command) and **Agents** (runs Lair supervises) | One **Dragons** view with Lair's state per agent: claim, recoveries, budget; Start and Stop through Lair |
-| **PRs** (mergeable and gate) and **Reviews** (tier, reviewers, findings, merge policy) | One **Pull requests** view; "merge ready" comes from the review policy |
-| **Inbox** (the owner's message file) and **Decisions** | **Decisions** only; owner messages go through the command bar |
-| **Orchestrator** (an external orchestration loop) | Removed once that loop's duties (reviews, merges, triage) run in Lair |
-| **Machines** (SSH machines) and **Nodes** (lair-node) | One **Machines** view once lair-node runs jobs |
-| **Processes** (the previous launcher's helper loops) | Only the processes Lair supervises; retired loops disappear |
-| **Gates** (an external gate queue) and **Pipelines** | One **Gates** view once the project's gates run as Lair pipelines |
+| **Overview**, **Health**, **Activity** | **Home**: what needs you, the fleet at a glance, problems, recent activity; Activity and Health (watchdog) are its tabs |
+| **Dragons** (the roster; Start and Stop through the project's own start command) and **Agents** (runs Lair supervises) | **Work**: one row per agent, Lair's state when it supervises the agent, else the launcher's; the agent's detail has its task, run, claims, holds, fill's wait, recent runs and the log; the launcher's Start and Stop stay for agents Lair doesn't run |
+| **Gates** (an external gate queue), **Pipelines**, **Triage**, **Placement** | **Gates**: the queue and results, with Pipelines, Triage and Placement as tabs; one gate detail for a queue gate and a pipeline run |
+| **PRs** (mergeable and gate) and **Reviews** (tier, reviewers, findings, merge policy) | **PRs**: one list, "merge ready" from the review policy when it is on; a PR's detail has the tier, slots, findings, gate and merge |
+| **Machines** (SSH machines) and **Nodes** (lair-node) | **Machines**, with Nodes as a tab |
+| **Inbox** (the owner's message file) and **Decisions** | **Decisions**, with Owner messages as a tab |
+| **Orchestrator** (an external orchestration loop) | Removed from the dashboard (`#/orchestrator` opens Home's activity; a pause still shows in the footer); `GET /api/orchestrator` keeps its tick lines, STOP file and launchd state for scripts |
+| **Processes** | **Processes**, only when the project defines processes |
+| — | **Settings** ([#36](settings-ui.md)) |
+
+The old view ids redirect to their section (`#/dragons` → `#/work`, `#/reviews/42` → `#/prs/42`, ...). Still apart while a
+project's gates run outside Lair: the gate queue and Lair's pipelines (two sources in one Gates section).
