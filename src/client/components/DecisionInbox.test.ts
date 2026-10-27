@@ -173,7 +173,7 @@ describe("DecisionInboxView", () => {
         onAnswered: noop,
       }),
     );
-    expect(html).toContain("Decisions (1 open)");
+    expect(html).toContain("Decisions (1 needs you)");
     expect(html).toContain("Raise the monthly hosting budget");
     expect(html).toContain("Connect the git host");
     expect(html).toContain("Enter the token (by owner); secret supplied");
@@ -190,7 +190,51 @@ describe("DecisionInboxView", () => {
         onAnswered: noop,
       }),
     );
-    expect(html).toContain("Nothing needs you right now.");
+    expect(html).toContain("Nothing needs you.");
+  });
+
+  it("lists notices as FYI after the action items, and counts only the action items", () => {
+    const notice = decision({
+      id: "2b5c2c3e-7a43-4f7e-9d2a-0d4b1f2e3a4b",
+      kind: "escalation",
+      attention: "notice",
+      title: "No merge for 4.2 h",
+      options: [{ id: "stand_down", label: "Leave it to me", consequences: "Lair runs nothing more." }],
+      recommended: { optionId: "stand_down", reasoning: "Only you can fix it." },
+      expiresAt: undefined,
+      overdue: false,
+    });
+    const view = (decisions: Decision[]) =>
+      renderToStaticMarkup(
+        createElement(DecisionInboxView, {
+          decisions,
+          secretStore: "x",
+          now: NOW,
+          answering: true,
+          onUnlock: async () => undefined,
+          onAnswered: noop,
+        }),
+      );
+    // The server lists open decisions by urgency, so a notice may come first: the view puts it after
+    const html = view([notice, decision()]);
+    expect(html).toContain("Decisions (1 needs you, 1 FYI)");
+    expect(html.indexOf("Raise the monthly hosting budget")).toBeLessThan(html.indexOf("No merge for 4.2 h"));
+    expect(html).toContain('data-attention="notice"');
+    expect(html).not.toContain('data-empty="needs-you"');
+    // Only notices open: nothing needs you
+    const fyiOnly = view([notice]);
+    expect(fyiOnly).toContain("Decisions (0 need you, 1 FYI)");
+    expect(fyiOnly).toContain('data-empty="needs-you"');
+    expect(fyiOnly).toContain("Nothing needs you.");
+  });
+});
+
+describe("DecisionCardView of a notice", () => {
+  it("is labelled FYI and says nothing waits on an answer", () => {
+    const html = card({ decision: decision({ attention: "notice", kind: "escalation" }) });
+    expect(html).toContain(">FYI<");
+    expect(html).toContain("nothing waits on your answer");
+    expect(card()).not.toContain(">FYI<");
   });
 });
 
@@ -201,5 +245,15 @@ describe("DecisionCountBadge", () => {
     expect(waiting).toContain(">3<");
     expect(waiting).toContain("badge-warning");
     expect(renderToStaticMarkup(createElement(DecisionCountBadge, { open: 3, overdue: 1 }))).toContain("badge-error");
+  });
+
+  it("counts action items only: notices never show in the badge", () => {
+    const counted = renderToStaticMarkup(createElement(DecisionCountBadge, { open: 5, overdue: 0, action: 2, notices: 3 }));
+    expect(counted).toContain(">2<");
+    expect(counted).toContain("2 things need you");
+    expect(renderToStaticMarkup(createElement(DecisionCountBadge, { open: 3, overdue: 0, action: 0, notices: 3 }))).toBe("");
+    expect(
+      renderToStaticMarkup(createElement(DecisionCountBadge, { open: 4, overdue: 1, action: 1, notices: 3 })),
+    ).toContain("badge-error");
   });
 });

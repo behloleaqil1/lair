@@ -5,7 +5,16 @@
 import { describe, expect, it } from "vitest";
 import type { Dragon } from "../shared/types";
 import type { AgentRunView, AgentsStatusView, AgentView, FillLineView } from "../shared/agents-types";
-import { agentDetail, fillWaitingText, waitingText, workCounts, workRows } from "./work-view";
+import {
+  agentDetail,
+  fillDecisionHref,
+  fillItem,
+  fillStateText,
+  fillWaitingText,
+  waitingText,
+  workCounts,
+  workRows,
+} from "./work-view";
 
 const NOW = Date.parse("2026-10-27T12:00:00.000Z");
 
@@ -67,6 +76,7 @@ const line = (over: Partial<FillLineView>): FillLineView => ({
   releasable: false,
   waiting: null,
   runId: null,
+  decisionId: null,
   ...over,
 });
 
@@ -211,5 +221,16 @@ describe("agent detail", () => {
 
   it("is null for an agent nobody knows", () => {
     expect(agentDetail("ghost", [dragon()], status([agent()]), [])).toBeNull();
+  });
+
+  it("a hold that needs you links to its decision; a task you paused says so and is still yours to release", () => {
+    const id = "0b5c2c3e-7a43-4f7e-9d2a-0d4b1f2e3a4b";
+    const asked = fillItem(line({ state: "held", hold: "no_done", releasable: true, decisionId: id }), NOW);
+    expect(asked).toMatchObject({ state: "held: no done", decisionHref: `#/decisions/${id}`, releasable: true });
+    const paused = fillItem(line({ state: "held", hold: "paused", releasable: true, detail: "you chose to keep it paused" }), NOW);
+    expect(paused).toMatchObject({ state: "Paused by you", decisionHref: null, releasable: true, badge: "badge-neutral" });
+    expect(fillStateText("started", null)).toBe("started");
+    expect(fillStateText("held", "waited_too_long")).toBe("held: waited too long");
+    expect(fillDecisionHref({ decisionId: null })).toBeNull();
   });
 });

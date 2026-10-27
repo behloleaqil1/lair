@@ -17,6 +17,7 @@ import type {
   FillWaitingView,
 } from "../shared/agents-types";
 import { modelLabel, runningLabel } from "./dragon-view";
+import { linkTo } from "./router";
 import { relativeTime } from "./time";
 
 export const AGENT_STATE_BADGE: Record<AgentState, string> = {
@@ -143,6 +144,22 @@ export interface FillItem {
   hold: string | null;
   /** What its last run waits on, and since when ("Waiting on gate-123 since 5 min ago"), else null */
   waiting: string | null;
+  /** The hold's open decision (#/decisions/<id>), when it needs the owner's answer, else null */
+  decisionHref: string | null;
+}
+
+/** A paused line is the owner's own choice: it reads so, and Release starts it again. */
+export const PAUSED_BY_YOU = "Paused by you";
+
+/** A fill line's state in words: "held: no done", "started", or "Paused by you". */
+export function fillStateText(state: string, hold: string | null): string {
+  if (hold === "paused") return PAUSED_BY_YOU;
+  return hold ? `${label(state)}: ${label(hold)}` : label(state);
+}
+
+/** The link to the open decision of a line's hold, or null. */
+export function fillDecisionHref(line: Pick<FillLineView, "decisionId">): string | null {
+  return line.decisionId ? linkTo("decisions", line.decisionId) : null;
 }
 
 /** A WAITING line's wait in one line: what it names, since when, and when fill starts it again without it. */
@@ -169,12 +186,13 @@ export function fillItem(line: FillLineView, now: number = Date.now()): FillItem
     line: line.line,
     task: line.task,
     description: line.description,
-    state: line.hold ? `${label(line.state)}: ${label(line.hold)}` : label(line.state),
-    badge: FILL_BADGE[line.state] ?? "badge-neutral",
+    state: fillStateText(line.state, line.hold),
+    badge: line.hold === "paused" ? "badge-neutral" : (FILL_BADGE[line.state] ?? "badge-neutral"),
     detail: line.detail,
     releasable: line.releasable,
     hold: line.hold,
     waiting: fillWaitingText(line.waiting ?? null, now),
+    decisionHref: fillDecisionHref(line),
   };
 }
 

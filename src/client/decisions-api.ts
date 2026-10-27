@@ -29,6 +29,37 @@ export interface DecisionSummary extends DecisionCounts {
   secretStore: string;
 }
 
+/**
+ * What the nav badge shows: the open action items (notices never count),
+ * red while any of them is overdue. A server from before attention sends no
+ * `action`: every open decision then needed an answer.
+ */
+export function badgeCount(counts: Pick<DecisionCounts, "open" | "overdue"> & Partial<DecisionCounts>): {
+  count: number;
+  overdue: boolean;
+} {
+  const count = counts.action ?? counts.open;
+  return { count, overdue: count > 0 && counts.overdue > 0 };
+}
+
+/** A notice: for the owner's information, nothing to choose (an older server's decisions have no attention). */
+export function isNoticeDecision(decision: Decision): boolean {
+  return decision.attention === "notice";
+}
+
+/**
+ * The Decisions view's order: open action items (by the server's urgency),
+ * then open notices (FYI), then the closed ones.
+ */
+export function inboxOrder(decisions: readonly Decision[]): { action: Decision[]; notices: Decision[]; closed: Decision[] } {
+  const open = decisions.filter((d) => d.status === "open");
+  return {
+    action: open.filter((d) => !isNoticeDecision(d)),
+    notices: open.filter(isNoticeDecision),
+    closed: decisions.filter((d) => d.status !== "open"),
+  };
+}
+
 /** Answers to these kinds go through a confirmation step (and carry confirm: true). */
 export function needsConfirmation(kind: DecisionKind): boolean {
   return CONFIRM_KINDS.includes(kind);

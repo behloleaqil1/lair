@@ -71,14 +71,24 @@ const status = {
 
 const dragons: Dragon[] = [{ id: "kiro-A", name: "Smaug", task: "feat-login", running: true }];
 
-function render(signedIn: boolean | null, log: AgentDetailData["log"] = { data: null, loading: false, error: null }): string {
+/** The status with these fill lines (of kiro-A) in place of the fixture's. */
+function withLines(lines: Record<string, unknown>[]): AgentsStatusView {
+  const base = status as unknown as { fill: Record<string, unknown> };
+  return { ...status, fill: { ...base.fill, lines } } as unknown as AgentsStatusView;
+}
+
+function render(
+  signedIn: boolean | null,
+  log: AgentDetailData["log"] = { data: null, loading: false, error: null },
+  shown: AgentsStatusView = status,
+): string {
   return renderToStaticMarkup(
     createElement(AgentDetailView, {
       id: "kiro-A",
       project: "demo",
       refreshKey: 0,
       dragons,
-      status,
+      status: shown,
       readOnly: false,
       dragonConfig: null,
       onChanged: noop,
@@ -132,5 +142,37 @@ describe("agent detail", () => {
     expect(html).toContain("the last 2 lines");
     expect(html).toContain(">Release<");
     expect(html).toContain(">Fresh session<");
+  });
+
+  it("a hold that needs you links to its decision; a task you paused reads so, and Release starts it again", () => {
+    const line = (over: Record<string, unknown>) => ({
+      line: 3,
+      agent: "kiro-A",
+      name: null,
+      task: "feat-logout",
+      description: null,
+      state: "held",
+      detail: "its last 3 runs ended without reporting it done",
+      hold: "no_done",
+      releasable: true,
+      waiting: null,
+      runId: null,
+      decisionId: null,
+      ...over,
+    });
+    const asked = render(true, undefined, withLines([line({ decisionId: "0b5c2c3e-7a43-4f7e-9d2a-0d4b1f2e3a4b" })]));
+    expect(asked).toContain('href="#/decisions/0b5c2c3e-7a43-4f7e-9d2a-0d4b1f2e3a4b"');
+    expect(asked).toContain(">Answer it<");
+    expect(asked).toContain("held: no done");
+    // The link is there signed out too: answering asks to sign in on the decision itself
+    expect(render(false, undefined, withLines([line({ decisionId: "0b5c2c3e-7a43-4f7e-9d2a-0d4b1f2e3a4b" })]))).toContain(
+      ">Answer it<",
+    );
+
+    const paused = render(true, undefined, withLines([line({ hold: "paused", detail: "you chose to keep it paused" })]));
+    expect(paused).toContain("Paused by you");
+    expect(paused).not.toContain("held: paused");
+    expect(paused).not.toContain(">Answer it<");
+    expect(paused).toContain(">Release (start it again)<");
   });
 });

@@ -1,163 +1,208 @@
 /**
- * Home's "Needs you" list and its fleet tiles: everything waiting on the
- * owner in one place, each item linking to the row that explains it. Kept
- * apart from the component so tests check the same rules.
+ * Home's "Needs you" list and its FYI list, kept apart from the component
+ * so tests check the same rules.
+ *
+ * - Needs you: what only the owner can settle, newest first. Every open
+ *   `action` decision of this project (each hold the owner must lift has
+ *   one, so holds are not listed apart), the project's config errors, and
+ *   one row for the action items of other projects. A decision row is its
+ *   plain sentence (the decision's title), its answer buttons inline (the
+ *   same rules as the Decisions view: inlineAnswer) and a link to its full
+ *   context.
+ * - FYI (collapsed): what is worth knowing but asks nothing: notices, agents
+ *   whose state needs a look, failed gates and PRs ready to merge.
  */
-import type { Decision } from "../shared/decision-types";
-import type { MergeHold } from "../shared/review-types";
-import type { AgentsStatusView } from "../shared/agents-types";
-import type { DeliveryProjectStatus } from "../shared/delivery-types";
+import { CONFIRM_KINDS, type Decision, type DecisionOption } from "../shared/decision-types";
 import type { ConfigProblem } from "../shared/lifecycle-types";
 import type { FailedGate } from "./gate-detail-view";
 import type { PrRow } from "./pr-view";
 import type { WorkRow } from "./work-view";
 import { linkTo } from "./router";
 
-export type NeedKind = "decision" | "config" | "agent" | "hold" | "gate" | "pr";
+export type NeedKind = "decision" | "config" | "elsewhere" | "notice" | "agent" | "gate" | "pr";
 export type NeedTone = "error" | "warning" | "neutral";
+
+/** What Home shows when nothing waits on the owner. */
+export const NOTHING_NEEDS_YOU = "Nothing needs you.";
+
+export const SIGN_IN_TO_ANSWER = "Sign in as the owner from Decisions to answer here";
+
+export interface InlineOption {
+  option: DecisionOption;
+  recommended: boolean;
+  /** The answer goes through a confirmation step first (the CONFIRM_KINDS) */
+  confirm: boolean;
+}
+
+/**
+ * How a decision is answered from Home:
+ * - buttons: one per option; disabled (with the reason) until this browser is signed in as the owner;
+ * - link: only from the Decisions view (a credentials decision needs its secret typed there).
+ */
+export type InlineAnswer =
+  | { mode: "buttons"; options: InlineOption[]; disabledReason: string | null }
+  | { mode: "link"; label: string; reason: string };
 
 export interface NeedItem {
   kind: NeedKind;
-  /** Unique within the list */
+  /** Unique within its list */
   key: string;
+  /** The plain sentence: what waits and why */
   title: string;
   detail: string;
+  /** The full context */
   href: string;
+  linkLabel: string;
   tone: NeedTone;
   at: string | null;
+  /** A decision row: the decision, and (action items) how Home answers it */
+  decision?: Decision;
+  answer?: InlineAnswer;
 }
 
 export interface NeedsInput {
   project: string;
   /** Every project's decisions (the Decision Inbox is shared) */
   decisions: readonly Decision[];
-  reviewHolds: readonly MergeHold[];
-  agents: AgentsStatusView | null;
-  delivery: DeliveryProjectStatus | null;
   failures: readonly FailedGate[];
   prs: readonly PrRow[];
   configProblems: readonly ConfigProblem[];
   work: readonly WorkRow[];
+  /** This browser is signed in as the owner (null: not known yet) */
+  signedIn: boolean | null;
 }
 
-const KIND_ORDER: NeedKind[] = ["decision", "config", "agent", "hold", "gate", "pr"];
-const TONE_ORDER: NeedTone[] = ["error", "warning", "neutral"];
+export interface NeedsView {
+  /** What needs the owner, newest first (the other projects' row last) */
+  items: NeedItem[];
+  /** For their information; shown collapsed */
+  fyi: NeedItem[];
+}
 
-export function needsYou(input: NeedsInput): NeedItem[] {
+/** How Home answers a decision: the Decisions view's rules (confirmation first; a secret only there). */
+export function inlineAnswer(decision: Decision, signedIn: boolean | null): InlineAnswer {
+  if (decision.kind === "credentials") {
+    return { mode: "link", label: "Answer in Decisions", reason: "It needs the secret, typed in the Decisions view" };
+  }
+  const confirm = CONFIRM_KINDS.includes(decision.kind);
+  return {
+    mode: "buttons",
+    options: decision.options.map((option) => ({
+      option,
+      recommended: option.id === decision.recommended.optionId,
+      confirm,
+    })),
+    disabledReason: signedIn === true ? null : SIGN_IN_TO_ANSWER,
+  };
+}
+
+/** Newest first; rows without a time last, in the order they came. */
+function newestFirst(a: NeedItem, b: NeedItem): number {
+  if (a.at === b.at) return 0;
+  if (a.at === null) return 1;
+  if (b.at === null) return -1;
+  return Date.parse(b.at) - Date.parse(a.at);
+}
+
+/** An open decision that needs the owner's answer (a decision without attention, from an older server, does). */
+export const isActionItem = (d: Decision) => d.status === "open" && d.attention !== "notice";
+export const isNotice = (d: Decision) => d.status === "open" && d.attention === "notice";
+
+export function needsYou(input: NeedsInput): NeedsView {
+  const mine = (d: Decision) => d.project === input.project;
   const items: NeedItem[] = [];
 
-  const open = input.decisions.filter((d) => d.status === "open");
-  for (const d of open.filter((d) => d.project === input.project)) {
+  for (const d of input.decisions.filter((d) => isActionItem(d) && mine(d))) {
     items.push({
       kind: "decision",
       key: `decision:${d.id}`,
       title: d.title,
-      detail: `${d.overdue ? "Overdue · " : ""}raised by ${d.source.module}`,
+      detail: `${d.overdue ? "Overdue · " : ""}from ${d.source.module}`,
       href: linkTo("decisions", d.id),
+      linkLabel: "Details",
       tone: d.overdue ? "error" : "warning",
       at: d.createdAt,
+      decision: d,
+      answer: inlineAnswer(d, input.signedIn),
     });
   }
-  const elsewhere = open.filter((d) => d.project !== input.project).length;
+  for (const p of input.configProblems.filter((p) => p.project === input.project)) {
+    items.push({
+      kind: "config",
+      key: `config:${p.file}`,
+      title: `${p.file} has an error: Lair can't use it until you fix it`,
+      detail: p.previousRunning ? `The previous config is still running: ${p.error}` : p.error,
+      href: linkTo("settings"),
+      linkLabel: "Open Settings",
+      tone: "error",
+      at: p.at,
+    });
+  }
+  items.sort(newestFirst);
+
+  const elsewhere = input.decisions.filter((d) => isActionItem(d) && !mine(d)).length;
   if (elsewhere > 0) {
     items.push({
-      kind: "decision",
+      kind: "elsewhere",
       key: "decision:elsewhere",
-      title: `${elsewhere} open decision${elsewhere === 1 ? "" : "s"} in other projects`,
-      detail: "The Decision Inbox lists every project's",
+      title: `${elsewhere} ${elsewhere === 1 ? "thing needs" : "things need"} you in other projects`,
+      detail: "The Decisions view lists every project's",
       href: linkTo("decisions"),
+      linkLabel: "Open Decisions",
       tone: "neutral",
       at: null,
     });
   }
 
-  for (const p of input.configProblems.filter((p) => p.project === input.project)) {
-    items.push({
-      kind: "config",
-      key: `config:${p.file}`,
-      title: `${p.file} has an error`,
-      detail: p.previousRunning ? `The previous config is still running: ${p.error}` : p.error,
-      href: linkTo("settings"),
-      tone: "error",
-      at: p.at,
+  const fyi: NeedItem[] = [];
+  for (const d of input.decisions.filter((d) => isNotice(d) && mine(d))) {
+    fyi.push({
+      kind: "notice",
+      key: `notice:${d.id}`,
+      title: d.title,
+      detail: `from ${d.source.module}`,
+      href: linkTo("decisions", d.id),
+      linkLabel: "Details",
+      tone: "neutral",
+      at: d.createdAt,
+      decision: d,
     });
   }
-
   for (const row of input.work.filter((r) => r.attention)) {
-    items.push({
+    fyi.push({
       kind: "agent",
       key: `agent:${row.id}`,
       title: `${row.id} is ${row.state}`,
       detail: row.detail ?? "",
       href: linkTo("work", row.id),
+      linkLabel: "Open",
       tone: "error",
       at: null,
     });
   }
-
-  for (const h of input.reviewHolds.filter((h) => h.releasedAt === null)) {
-    items.push({
-      kind: "hold",
-      key: `hold:review:${h.id}`,
-      title: h.pr === null ? "Every merge is held" : `Merge of #${h.pr} is held`,
-      detail: `${h.reason} (by ${h.createdBy})`,
-      href: h.pr === null ? linkTo("prs") : linkTo("prs", String(h.pr)),
-      tone: "warning",
-      at: h.createdAt,
-    });
-  }
-  for (const line of input.agents?.fill?.enabled ? input.agents.fill.lines : []) {
-    if (!line.releasable || !line.agent) continue;
-    items.push({
-      kind: "hold",
-      key: `hold:fill:${line.line}`,
-      title: `${line.task ?? `Line ${line.line}`} is held for you`,
-      detail: line.detail,
-      href: linkTo("work", line.agent),
-      tone: "warning",
-      at: null,
-    });
-  }
-  for (const env of input.delivery?.enabled ? input.delivery.environments : []) {
-    for (const service of env.services) {
-      if (!service.held) continue;
-      items.push({
-        kind: "hold",
-        key: `hold:delivery:${env.environment}:${service.name}`,
-        title: `${env.environment}/${service.name} is held`,
-        detail: service.held.reason,
-        href: linkTo("delivery"),
-        tone: "neutral",
-        at: service.held.heldAt,
-      });
-    }
-  }
-
   for (const f of input.failures) {
-    items.push({
+    fyi.push({
       kind: "gate",
       key: `gate:${f.id}`,
       title: `Gate failed: ${f.track}`,
       detail: f.failedSteps.length > 0 ? `Failed: ${f.failedSteps.join(", ")}` : "See its steps",
       href: linkTo("gates", f.id, "results"),
+      linkLabel: "Open",
       tone: "error",
       at: f.finishedAt ?? null,
     });
   }
-
   for (const pr of input.prs.filter((p) => p.readiness.group === "ready")) {
-    items.push({
+    fyi.push({
       kind: "pr",
       key: `pr:${pr.number}`,
       title: `#${pr.number} ${pr.readiness.label === "Merge ready" ? "is ready to merge" : "passed its gate"}`,
       detail: pr.title,
       href: linkTo("prs", String(pr.number)),
+      linkLabel: "Open",
       tone: "neutral",
       at: pr.updatedAt,
     });
   }
-
-  return items.sort(
-    (a, b) => TONE_ORDER.indexOf(a.tone) - TONE_ORDER.indexOf(b.tone) || KIND_ORDER.indexOf(a.kind) - KIND_ORDER.indexOf(b.kind),
-  );
+  return { items, fyi: fyi.sort(newestFirst) };
 }

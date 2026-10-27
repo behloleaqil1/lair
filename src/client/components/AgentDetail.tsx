@@ -251,9 +251,21 @@ export function AgentDetailView({
                 <span className={`badge ${hold.badge}`}>{hold.state}</span> <code>{hold.task ?? `line ${hold.line}`}</code>{" "}
                 <span style={muted}>{hold.detail}</span>{" "}
                 {hold.waiting && <span className="waiting">{hold.waiting} </span>}
+                {hold.decisionHref && (
+                  <>
+                    <a href={hold.decisionHref} className="small-button" data-hold-decision="answer">
+                      Answer it
+                    </a>{" "}
+                  </>
+                )}
                 {hold.releasable && owner && (
-                  <button type="button" className="small-button" onClick={() => releaseHold(hold)}>
-                    Release
+                  <button
+                    type="button"
+                    className="small-button"
+                    onClick={() => releaseHold(hold)}
+                    title={hold.hold === "paused" ? "Fill starts it again on its next check" : undefined}
+                  >
+                    {hold.hold === "paused" ? "Release (start it again)" : "Release"}
                   </button>
                 )}
               </li>

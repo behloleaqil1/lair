@@ -10,7 +10,7 @@
 import { useMemo, useState } from "react";
 import { useApi } from "../hooks/useApi";
 import { useDragonsWebSocket } from "../hooks/useWebSocket";
-import { fillWaitingText, workRows, type WorkRow } from "../work-view";
+import { fillDecisionHref, fillStateText, fillWaitingText, workRows, type WorkRow } from "../work-view";
 import { hasStartableDragons } from "../dragon-start";
 import { startDragon } from "../owner-actions";
 import { failureMessage, postJson, releaseFillHoldAction, runConfirmed } from "../agents-actions";
@@ -260,9 +260,8 @@ function FillTab({
       sort: (l) => l.state,
       render: (l) => (
         <>
-          <span className={`badge ${FILL_BADGE[l.state] ?? "badge-neutral"}`}>
-            {l.state.replace(/_/g, " ")}
-            {l.hold ? `: ${l.hold.replace(/_/g, " ")}` : ""}
+          <span className={`badge ${l.hold === "paused" ? "badge-neutral" : (FILL_BADGE[l.state] ?? "badge-neutral")}`}>
+            {fillStateText(l.state, l.hold)}
           </span>
           {l.waiting && <div className="waiting">{fillWaitingText(l.waiting)}</div>}
         </>
@@ -274,6 +273,13 @@ function FillTab({
       render: (l) => (
         <span style={muted}>
           {l.detail}{" "}
+          {fillDecisionHref(l) && (
+            <>
+              <a href={fillDecisionHref(l) ?? undefined} className="small-button" onClick={(e) => e.stopPropagation()}>
+                Answer it
+              </a>{" "}
+            </>
+          )}
           {l.releasable && !readOnly && (
             <button
               type="button"
@@ -285,7 +291,7 @@ function FillTab({
                 onRelease(l);
               }}
             >
-              Release hold
+              {l.hold === "paused" ? "Release (start it again)" : "Release hold"}
             </button>
           )}
         </span>

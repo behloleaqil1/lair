@@ -1,8 +1,10 @@
 /**
  * The Decision Inbox (the Decisions section's first tab): the questions only
  * a human can answer (pricing, legal, spend, accounts, credentials,
- * go/no-go, escalations), from every project, open first by urgency, in one
- * table; a row opens the decision (#/decisions/<id>): what it blocks and
+ * go/no-go, escalations, holds only the owner lifts), from every project, in
+ * one table: the open action items first by urgency, then the open notices
+ * (labelled FYI: for information, nothing to choose, never counted in the
+ * badge), then the closed ones; a row opens the decision (#/decisions/<id>): what it blocks and
  * why, its options with their consequences, the recommended one, then the
  * answer form (or, once closed, how it ended and its history).
  *
@@ -17,10 +19,13 @@ import type { Decision, DecisionAuditEntry, DecisionCounts, DecisionOption } fro
 import {
   KIND_LABELS,
   answerBody,
+  badgeCount,
   confirmationText,
   decisionSummary,
   expiryText,
   getDecision,
+  inboxOrder,
+  isNoticeDecision,
   needsConfirmation,
   outcomeText,
   postAnswer,
@@ -109,8 +114,14 @@ export function DecisionCardView(p: DecisionCardViewProps) {
     <div className="card" data-decision={decision.id}>
       <div style={{ display: "flex", gap: "0.75rem", alignItems: "center", flexWrap: "wrap", marginBottom: "0.25rem" }}>
         <span className={`badge ${KIND_BADGE[decision.kind] ?? "badge-neutral"}`}>{KIND_LABELS[decision.kind]}</span>
+        {isNoticeDecision(decision) && <span className="badge badge-neutral">FYI</span>}
         <h3 style={{ margin: 0 }}>{decision.title}</h3>
       </div>
+      {isNoticeDecision(decision) && (
+        <div style={muted} data-attention="notice">
+          For your information: nothing waits on your answer. It goes away by itself once it no longer applies.
+        </div>
+      )}
       <div style={muted}>
         {decision.project} · raised by <code>{decision.source.module}</code> ({decision.source.ref}) ·{" "}
         {time(decision.createdAt)}
@@ -450,10 +461,16 @@ const DECISION_COLUMNS: Column<Decision>[] = [
   {
     key: "status",
     label: "Status",
-    sort: (d) => (d.status === "open" ? (d.overdue ? 0 : 1) : 2),
+    sort: (d) => (d.status === "open" ? (isNoticeDecision(d) ? 2 : d.overdue ? 0 : 1) : 3),
     render: (d) =>
       d.status === "open" ? (
-        <span className={`badge ${d.overdue ? "badge-error" : "badge-warning"}`}>{d.overdue ? "overdue" : "open"}</span>
+        isNoticeDecision(d) ? (
+          <span className="badge badge-neutral" data-attention="notice">
+            FYI
+          </span>
+        ) : (
+          <span className={`badge ${d.overdue ? "badge-error" : "badge-warning"}`}>{d.overdue ? "overdue" : "needs you"}</span>
+        )
       ) : (
         <span style={muted}>{outcomeText(d)}</span>
       ),
@@ -546,22 +563,24 @@ export function DecisionInboxView({
   /** Open a decision's detail (null closes it) */
   onOpen?: (id: string | null) => void;
 }) {
-  const open = decisions.filter((d) => d.status === "open");
-  const closed = decisions.filter((d) => d.status !== "open").slice(0, 50);
-  const shown = [...open, ...closed];
+  // Action items first, then the notices (FYI), then the closed ones
+  const { action, notices, closed } = inboxOrder(decisions);
+  const shown = [...action, ...notices, ...closed.slice(0, 50)];
   const current = selected ? (decisions.find((d) => d.id === selected) ?? null) : null;
   return (
     <div>
       <p style={{ ...muted, marginBottom: "1rem" }}>
-        Decisions ({open.length} open): only what Lair can&apos;t decide for you: pricing, legal, spend, accounts, credentials,
-        go/no-go, and problems its playbooks couldn&apos;t fix. Every project&apos;s are here.
+        {`Decisions (${action.length} ${action.length === 1 ? "needs" : "need"} you${notices.length > 0 ? `, ${notices.length} FYI` : ""})`}
+        : only what Lair can&apos;t decide for you: pricing, legal,
+        spend, accounts, credentials, go/no-go, holds only you can lift, and problems its playbooks couldn&apos;t fix. FYI
+        items ask nothing and go away by themselves. Every project&apos;s are here.
       </p>
 
       {answering ? <OwnerSessions onSignedOut={onSignedOut} /> : <UnlockAnswering onUnlock={onUnlock} />}
 
-      {open.length === 0 && (
-        <div className="card">
-          <p style={muted}>Nothing needs you right now.</p>
+      {action.length === 0 && (
+        <div className="card" data-empty="needs-you">
+          <p style={muted}>Nothing needs you.</p>
         </div>
       )}
 
@@ -598,16 +617,17 @@ export function DecisionInboxView({
   );
 }
 
-/** The open count in the nav ("needs you"); red while any decision is overdue. */
-export function DecisionCountBadge({ open, overdue }: DecisionCounts) {
-  if (open <= 0) return null;
+/** The nav's "needs you" count: open action items only (notices never count); red while any is overdue. */
+export function DecisionCountBadge(counts: Pick<DecisionCounts, "open" | "overdue"> & Partial<DecisionCounts>) {
+  const { count, overdue } = badgeCount(counts);
+  if (count <= 0) return null;
   return (
     <span
-      className={`badge ${overdue > 0 ? "badge-error" : "badge-warning"}`}
+      className={`badge ${overdue ? "badge-error" : "badge-warning"}`}
       style={{ marginLeft: "0.4rem" }}
-      title={`${open} decision(s) need you${overdue > 0 ? `, ${overdue} overdue` : ""}`}
+      title={`${count} ${count === 1 ? "thing needs" : "things need"} you${overdue ? `, ${counts.overdue} overdue` : ""}`}
     >
-      {open}
+      {count}
     </span>
   );
 }
@@ -631,12 +651,12 @@ export function DecisionsBadge({ refreshKey }: { refreshKey: number }) {
     let cancelled = false;
     decisionSummary()
       .then((s) => {
-        if (!cancelled) setCounts({ open: s.open, overdue: s.overdue });
+        if (!cancelled) setCounts({ open: s.open, overdue: s.overdue, action: s.action, notices: s.notices });
       })
       .catch(() => undefined);
     return () => {
       cancelled = true;
     };
   }, [refreshKey]);
-  return counts ? <DecisionCountBadge open={counts.open} overdue={counts.overdue} /> : null;
+  return counts ? <DecisionCountBadge {...counts} /> : null;
 }

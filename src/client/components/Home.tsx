@@ -1,14 +1,22 @@
 /**
- * Home: what needs the owner (open decisions, holds, failed gates, PRs ready
- * to merge, config problems, agents in trouble), the fleet at a glance (one
- * tile per section, each a link), the problems Lair sees, and the recent
- * activity. Its Activity tab is the bus's reports and the control audit log;
- * its Health tab (with the watchdog on) the SLOs, breaches and playbook runs.
+ * Home: what needs the owner ("Needs you": the open action items of the
+ * Decision Inbox, newest first, each a plain sentence with its answer
+ * buttons inline and a link to its full context, and config errors; below
+ * it a collapsed FYI list of notices, agents in trouble, failed gates and
+ * PRs ready to merge), the fleet at a glance (one tile per section, each a
+ * link), the problems Lair sees, and the recent activity. Its Activity tab
+ * is the bus's reports and the control audit log; its Health tab (with the
+ * watchdog on) the SLOs, breaches and playbook runs.
+ *
+ * Answers from Home follow the Decisions view's rules: a spend or go/no-go
+ * answer is confirmed first, a credentials decision is answered only there
+ * (its secret is typed in that view), and nothing is answered until this
+ * browser is signed in as the owner.
  */
-import { useMemo, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { useApi } from "../hooks/useApi";
 import { gitDateToIso } from "../time";
-import { needsYou, type NeedItem } from "../home-view";
+import { NOTHING_NEEDS_YOU, needsYou, type InlineAnswer, type NeedItem } from "../home-view";
 import { workCounts, workRows } from "../work-view";
 import { latestFailures } from "../gate-detail-view";
 import { hostRows, reviewRows } from "../pr-view";
@@ -16,17 +24,17 @@ import { machineCounts, machineRows } from "../machines-view";
 import { recentResults } from "../gates-view";
 import { linkTo } from "../router";
 import { tabAvailable, tabDef } from "../nav";
+import { answerBody, confirmationText, postAnswer } from "../decisions-api";
 import type { Dragon, Gate, GateResult, MachineStatus, OverviewData, PullRequest } from "../../shared/types";
 import type { AgentsStatusView } from "../../shared/agents-types";
-import type { Decision } from "../../shared/decision-types";
-import type { DeliveryProjectStatus } from "../../shared/delivery-types";
+import type { Decision, DecisionOption } from "../../shared/decision-types";
 import type { ConfigStatusView } from "../../shared/lifecycle-types";
-import type { MergeHold, PrSummary } from "../../shared/review-types";
+import type { PrSummary } from "../../shared/review-types";
 import { SectionHeader, type SectionProps } from "./Section";
 import { LiveFeed } from "./LiveFeed";
 import { Activity } from "./Activity";
 import { Health } from "./Health";
-import { ErrorState, Loading, ModuleOff, Time, muted } from "./ui";
+import { ErrorState, Loading, ModuleOff, Time, muted, useOwnerSignedIn } from "./ui";
 
 interface WatchdogSummary {
   enabled: boolean;
@@ -34,6 +42,166 @@ interface WatchdogSummary {
 }
 
 const TONE_ICON: Record<NeedItem["tone"], string> = { error: "🔴", warning: "🟡", neutral: "⚪" };
+
+export interface NeedAnswerViewProps {
+  decision: Decision;
+  answer: InlineAnswer;
+  /** The option waiting for its confirmation (a CONFIRM_KINDS answer) */
+  pending: DecisionOption | null;
+  submitting: boolean;
+  error: string | null;
+  onChoose: (option: DecisionOption, confirm: boolean) => void;
+  onConfirm: () => void;
+  onCancel: () => void;
+}
+
+/** A decision's answer buttons on Home. Stateless: NeedAnswer holds the state. */
+export function NeedAnswerView(p: NeedAnswerViewProps) {
+  const { answer } = p;
+  if (answer.mode === "link") {
+    return (
+      <a href={linkTo("decisions", p.decision.id)} className="small-button" title={answer.reason} data-answer="link">
+        {answer.label}
+      </a>
+    );
+  }
+  if (p.pending) {
+    return (
+      <span role="alertdialog" className="need-confirm" data-answer="confirm">
+        <span>{confirmationText(p.decision, p.pending)}</span>{" "}
+        <button type="button" className="small-button" onClick={p.onCancel} disabled={p.submitting}>
+          Cancel
+        </button>{" "}
+        <button type="button" className="small-button primary" onClick={p.onConfirm} disabled={p.submitting}>
+          {p.submitting ? "Sending..." : `Confirm: ${p.pending.label}`}
+        </button>
+      </span>
+    );
+  }
+  return (
+    <span className="need-answers" data-answer="buttons">
+      {answer.options.map(({ option, recommended, confirm }) => (
+        <button
+          key={option.id}
+          type="button"
+          className={`small-button${recommended ? " primary" : ""}`}
+          disabled={p.submitting || answer.disabledReason !== null}
+          title={answer.disabledReason ?? option.consequences}
+          onClick={() => p.onChoose(option, confirm)}
+        >
+          {option.label}
+          {recommended ? " (recommended)" : ""}
+        </button>
+      ))}
+      {answer.disabledReason !== null && (
+        <span style={muted}>
+          {" "}
+          <a href={linkTo("decisions")}>Sign in</a> to answer here.
+        </span>
+      )}
+      {p.error && <span className="error"> {p.error}</span>}
+    </span>
+  );
+}
+
+/** A decision's answer buttons on Home, with the confirmation step and the answer sent as the owner. */
+function NeedAnswer({ decision, answer, onAnswered }: { decision: Decision; answer: InlineAnswer; onAnswered: () => void }) {
+  const [pending, setPending] = useState<DecisionOption | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const send = async (option: DecisionOption) => {
+    setSubmitting(true);
+    setError(null);
+    try {
+      await postAnswer(decision.id, answerBody(decision, { optionId: option.id, note: "" }));
+      setPending(null);
+      onAnswered();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not send the answer");
+      setPending(null);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+  return (
+    <NeedAnswerView
+      decision={decision}
+      answer={answer}
+      pending={pending}
+      submitting={submitting}
+      error={error}
+      onChoose={(option, confirm) => {
+        if (confirm) setPending(option);
+        else void send(option);
+      }}
+      onConfirm={() => {
+        if (pending) void send(pending);
+      }}
+      onCancel={() => setPending(null)}
+    />
+  );
+}
+
+/** One row: the plain sentence, its answer (decisions), a short detail and the link to its full context. */
+export function NeedRow({ item, onAnswered }: { item: NeedItem; onAnswered: () => void }) {
+  return (
+    <li className={`need need-${item.tone}`} data-need={item.kind}>
+      <span aria-hidden="true">{TONE_ICON[item.tone]}</span>
+      <span className="need-title">{item.title}</span>
+      {item.decision && item.answer && (
+        <NeedAnswer decision={item.decision} answer={item.answer} onAnswered={onAnswered} />
+      )}
+      {item.detail && <span style={muted}>{item.detail}</span>}
+      {item.at && (
+        <span style={muted}>
+          <Time iso={item.at} />
+        </span>
+      )}
+      <a href={item.href}>{item.linkLabel}</a>
+    </li>
+  );
+}
+
+/** "Needs you" and, collapsed below it, "FYI". */
+export function NeedsYouCard({
+  items,
+  fyi,
+  error,
+  onAnswered,
+}: {
+  items: NeedItem[];
+  fyi: NeedItem[];
+  error?: ReactNode;
+  onAnswered: () => void;
+}) {
+  return (
+    <div className="card" data-card="needs-you">
+      <h3>Needs you</h3>
+      {error}
+      {items.length === 0 ? (
+        <p style={{ color: "var(--success)" }} data-empty="needs-you">
+          ✓ {NOTHING_NEEDS_YOU}
+        </p>
+      ) : (
+        <ul className="needs-list">
+          {items.map((item) => (
+            <NeedRow key={item.key} item={item} onAnswered={onAnswered} />
+          ))}
+        </ul>
+      )}
+      {fyi.length > 0 && (
+        <details className="needs-fyi" data-card="fyi">
+          <summary>FYI ({fyi.length})</summary>
+          <ul className="needs-list">
+            {fyi.map((item) => (
+              <NeedRow key={item.key} item={item} onAnswered={onAnswered} />
+            ))}
+          </ul>
+        </details>
+      )}
+    </div>
+  );
+}
 
 function Tile({ href, value, label, detail, tone }: { href: string; value: string; label: string; detail?: string; tone?: string }) {
   return (
@@ -72,11 +240,12 @@ function HomeOverview({ project, refreshKey, modules }: SectionProps) {
   const agents = useApi<AgentsStatusView>("/agents/status", project, refreshKey, { skip: modules?.agents !== true });
   const gates = useApi<{ queue: Gate[]; results: GateResult[] }>("/gates", project, refreshKey);
   const machines = useApi<MachineStatus[]>("/machines", project, refreshKey);
-  const decisions = useApi<Decision[]>("/decisions?limit=200", "", refreshKey);
-  const holds = useApi<MergeHold[]>("/review/holds", project, refreshKey, { skip: !reviewOn });
+  // An answer given here refreshes the list at once
+  const [answered, setAnswered] = useState(0);
+  const decisions = useApi<Decision[]>("/decisions?status=open&limit=500", "", refreshKey + answered);
+  const signedIn = useOwnerSignedIn(refreshKey);
   const reviewPrs = useApi<PrSummary[]>("/review/prs", project, slowKey, { skip: !reviewOn });
   const hostPrs = useApi<PullRequest[]>("/prs", project, slowKey, { skip: reviewOn || modules?.github !== true });
-  const delivery = useApi<DeliveryProjectStatus>("/delivery/status", project, refreshKey, { skip: modules?.delivery !== true });
   const config = useApi<ConfigStatusView>("/config/status", "", refreshKey);
   const watchdog = useApi<WatchdogSummary>("/watchdog/status", project, refreshKey, { skip: modules?.watchdog !== true });
 
@@ -85,16 +254,14 @@ function HomeOverview({ project, refreshKey, modules }: SectionProps) {
   const queue = gates.data?.queue ?? [];
   const failures = latestFailures(recentResults(gates.data?.results ?? []), queue);
   const prs = reviewOn ? reviewRows(reviewPrs.data ?? [], {}) : hostRows(hostPrs.data ?? []);
-  const items = needsYou({
+  const { items, fyi } = needsYou({
     project,
     decisions: decisions.data ?? [],
-    reviewHolds: holds.data ?? [],
-    agents: agentsView,
-    delivery: delivery.data ?? null,
     failures,
     prs,
     configProblems: config.data?.problems ?? [],
     work,
+    signedIn,
   });
 
   const counts = workCounts(work);
@@ -105,28 +272,12 @@ function HomeOverview({ project, refreshKey, modules }: SectionProps) {
 
   return (
     <>
-      <div className="card" data-card="needs-you">
-        <h3>Needs you</h3>
-        {decisions.error && !decisions.data && <ErrorState what="the decisions" error={decisions.error} />}
-        {items.length === 0 ? (
-          <p style={{ color: "var(--success)" }}>✓ Nothing needs you right now.</p>
-        ) : (
-          <ul className="needs-list">
-            {items.map((item) => (
-              <li key={item.key} className={`need need-${item.tone}`}>
-                <span aria-hidden="true">{TONE_ICON[item.tone]}</span>
-                <a href={item.href}>{item.title}</a>
-                {item.detail && <span style={muted}>{item.detail}</span>}
-                {item.at && (
-                  <span style={muted}>
-                    <Time iso={item.at} />
-                  </span>
-                )}
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
+      <NeedsYouCard
+        items={items}
+        fyi={fyi}
+        error={decisions.error && !decisions.data ? <ErrorState what="the decisions" error={decisions.error} /> : undefined}
+        onAnswered={() => setAnswered((n) => n + 1)}
+      />
 
       <div className="grid grid-4 tiles">
         <Tile

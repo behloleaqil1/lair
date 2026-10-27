@@ -1146,6 +1146,27 @@ a.nav-button {
   border-bottom: none;
 }
 
+.need-title {
+  font-weight: 500;
+}
+
+.need-answers,
+.need-confirm {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35rem;
+}
+
+.needs-fyi {
+  margin-top: 0.75rem;
+}
+
+.needs-fyi > summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+
 .tiles {
   margin-bottom: 1.5rem;
 }

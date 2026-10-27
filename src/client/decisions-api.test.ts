@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { Decision } from "../shared/decision-types";
-import { answerBody, confirmationText, expiryText, needsConfirmation, outcomeText } from "./decisions-api";
+import {
+  answerBody,
+  badgeCount,
+  confirmationText,
+  expiryText,
+  inboxOrder,
+  needsConfirmation,
+  outcomeText,
+} from "./decisions-api";
 import { tokenFromHash } from "./owner-session";
 
 const NOW = Date.parse("2026-03-02T12:00:00.000Z");
@@ -116,5 +124,26 @@ describe("display text", () => {
     expect(outcomeText(decision({ status: "withdrawn", withdrawnReason: "Done another way." }))).toBe(
       "Withdrawn by planner: Done another way.",
     );
+  });
+});
+
+describe("action items and notices", () => {
+  it("the badge counts open action items only, red only while one is overdue", () => {
+    expect(badgeCount({ open: 5, overdue: 0, action: 2, notices: 3 })).toEqual({ count: 2, overdue: false });
+    expect(badgeCount({ open: 3, overdue: 0, action: 0, notices: 3 })).toEqual({ count: 0, overdue: false });
+    expect(badgeCount({ open: 2, overdue: 1, action: 1, notices: 1 })).toEqual({ count: 1, overdue: true });
+    // A server from before attention: every open decision needed an answer
+    expect(badgeCount({ open: 2, overdue: 0 })).toEqual({ count: 2, overdue: false });
+  });
+
+  it("orders the inbox: action items, then notices (FYI), then the closed ones", () => {
+    const notice = decision({ id: "n", attention: "notice" });
+    const action = decision({ id: "a" });
+    const older = decision({ id: "old", attention: undefined });
+    const closed = decision({ id: "c", status: "answered" });
+    const order = inboxOrder([notice, closed, action, older]);
+    expect(order.action.map((d) => d.id)).toEqual(["a", "old"]);
+    expect(order.notices.map((d) => d.id)).toEqual(["n"]);
+    expect(order.closed.map((d) => d.id)).toEqual(["c"]);
   });
 });
