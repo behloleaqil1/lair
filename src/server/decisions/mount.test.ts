@@ -382,12 +382,12 @@ describe("mountDecisions (the server's wiring)", () => {
       defaultOptionId: "run_playbook",
     };
     // The watchdog follows its answers: an HTTP caller can't raise in its name
-    const refused = await call(port, "POST", "/api/decisions?project=demo", breachDecision);
+    const refused = await call(port, "POST", "/api/decisions?project=example", breachDecision);
     expect(refused.status).toBe(403);
     expect(refused.body.error).toContain("watchdog is a module inside Lair");
 
     // A module that starts listening after an HTTP caller used its name never gets that answer
-    const raised = await call(port, "POST", "/api/decisions?project=demo", {
+    const raised = await call(port, "POST", "/api/decisions?project=example", {
       ...breachDecision,
       source: { module: "intake", ref: "r" },
       key: "intake:1",
