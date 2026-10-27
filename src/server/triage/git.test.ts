@@ -83,8 +83,13 @@ describe("GitCli", () => {
 
   it("finds where a change left the default branch, and whether a commit is in another's history", async () => {
     const cli = new GitCli(dir, new ExecFileRunner());
-    // feat-two was branched from main after the first merge
-    expect(await cli.mergeBase(shas.f2, "main")).toBe(shas.m1);
+    // feat-three leaves main at the second merge and is not merged yet
+    git("checkout", "-q", "-b", "feat-three", shas.m2);
+    const f3 = commit("d.txt", "feature three");
+    git("checkout", "-q", "main");
+    expect(await cli.mergeBase(f3, "main")).toBe(shas.m2);
+    // feat-two is merged: main already has it, so it is its own base
+    expect(await cli.mergeBase(shas.f2, "main")).toBe(shas.f2);
     expect(await cli.isAncestor(shas.m1, shas.m2)).toBe(true);
     expect(await cli.isAncestor(shas.m2, shas.m1)).toBe(false);
     expect(await cli.isAncestor(shas.c0, shas.f2)).toBe(true);

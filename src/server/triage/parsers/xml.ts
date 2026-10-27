@@ -6,9 +6,10 @@
  * would, by closing back to the matching open element.
  *
  * Reports are written by the code under test, so every scan is linear: no
- * regular expression runs over attribute text, nesting deeper than MAX_DEPTH
- * is flattened, and at most MAX_ELEMENTS elements and MAX_TEXT characters of
- * text per element are kept.
+ * regular expression runs over attribute text, a closing tag is matched
+ * against at most the MAX_DEPTH innermost open elements, and at most
+ * MAX_ELEMENTS elements and MAX_TEXT characters of text per element are
+ * kept. Whatever reads the tree walks it without recursion.
  */
 
 export interface XmlElement {
@@ -124,7 +125,7 @@ export function parseXml(xml: string): XmlElement {
     if (xml.startsWith("</", lt)) {
       const end = xml.indexOf(">", lt + 2);
       const name = xml.slice(lt + 2, end < 0 ? length : end).trim();
-      // The stack is at most MAX_DEPTH deep, so this search is bounded
+      // The stack holds at most MAX_DEPTH open elements, so this search is bounded
       for (let k = stack.length - 1; k > 0; k--) {
         if (stack[k].name === name) {
           stack.length = k;
@@ -159,8 +160,13 @@ export function parseXml(xml: string): XmlElement {
     elements++;
     const element: XmlElement = { name, attrs: parseAttrs(content.slice(nameEnd)), children: [], text: "" };
     top().children.push(element);
-    // Deeper nesting is flattened into the deepest kept element
-    if (!selfClosing && stack.length < MAX_DEPTH) stack.push(element);
+    if (!selfClosing) {
+      // Deeper than MAX_DEPTH, the outermost open element (below the root) is
+      // forgotten: the tree keeps its shape, and a closing tag that only it
+      // would match is ignored
+      if (stack.length >= MAX_DEPTH) stack.splice(1, 1);
+      stack.push(element);
+    }
   }
   return root;
 }
