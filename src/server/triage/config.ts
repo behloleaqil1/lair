@@ -114,7 +114,7 @@ const commandsShape = Object.fromEntries(COMMAND_IDS.map((id) => [id, argv.optio
   z.ZodOptional<typeof argv>
 >;
 
-const TriageSchema = z
+export const TriageSchema = z
   .object({
     enabled: z.boolean().default(false),
     mode: z.enum(["observe", "act"]).default("observe"),

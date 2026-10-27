@@ -79,7 +79,7 @@ const PipelineSchema = z
   })
   .strict();
 
-const PipelinesSchema = z.record(PipelineSchema);
+export const PipelinesSchema = z.record(PipelineSchema);
 
 const GithubSchema = z
   .object({
@@ -115,7 +115,7 @@ const LocalSchema = z
   })
   .strict();
 
-const ExecutorsSchema = z
+export const ExecutorsSchema = z
   .object({
     order: Order.default([...EXECUTOR_KINDS]),
     /** Seconds between tries while no executor can take a job */

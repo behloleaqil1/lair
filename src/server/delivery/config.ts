@@ -94,7 +94,7 @@ const EnvironmentSchema = z
   })
   .strict();
 
-const DeliverySchema = z
+export const DeliverySchema = z
   .object({
     enabled: z.boolean().default(false),
     interval_seconds: z.number().int().min(5).max(3600).default(30),

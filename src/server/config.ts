@@ -88,6 +88,18 @@ export function loadProjectConfig(name: string, projectsDir: string = PROJECTS_D
   } catch (e) {
     throw new Error(`Invalid project config: ${e instanceof Error ? e.message : String(e)}`);
   }
+  return parseProjectConfig(content, name, configPath);
+}
+
+/**
+ * A project config's text, checked as loadProjectConfig checks the file:
+ * Settings checks a change with it before anything is written. `configPath`
+ * is where the text is (or will be), for messages.
+ */
+export function parseProjectConfig(content: string, name: string, configPath: string): ProjectConfig {
+  if (Buffer.byteLength(content, "utf-8") > MAX_CONFIG_BYTES) {
+    throw new Error(`Invalid project config: ${configPath} is larger than ${MAX_CONFIG_BYTES / 1024} KiB`);
+  }
   const config = parseYaml(content) as ProjectConfig | null;
 
   // Validate required fields

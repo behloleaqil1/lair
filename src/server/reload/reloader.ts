@@ -227,6 +227,30 @@ export class ConfigReloader {
   }
 
   /**
+   * What keeps `config` from being taken ([] when nothing does): every
+   * module's own parser, and that its part of the config can be compared.
+   * apply() checks a changed file with it, and Settings checks a change
+   * before writing it.
+   */
+  validate(config: ProjectConfig): string[] {
+    const errors: string[] = [];
+    for (const module of this.options.modules) {
+      try {
+        errors.push(...module.validate(config));
+      } catch (e) {
+        errors.push(`${module.name}: ${message(e)}`);
+      }
+      if (this.fingerprintOf(module, config) === null) errors.push(`${module.name}: the config can't be compared`);
+    }
+    return [...new Set(errors)];
+  }
+
+  /** The problem the dashboard's banner shows for `project`, or null. */
+  problemOf(project: string): string | null {
+    return this.problems.get(project)?.error ?? null;
+  }
+
+  /**
    * Read and check the project's file; when it is valid, reload the modules
    * whose part changed. The modules keep running the file they run now:
    * when that file is gone, or another one takes its place (deleting
@@ -269,17 +293,9 @@ export class ConfigReloader {
       this.problem(project, file, message(e), previousRunning);
       return;
     }
-    const errors: string[] = [];
-    for (const module of this.options.modules) {
-      try {
-        errors.push(...module.validate(config));
-      } catch (e) {
-        errors.push(`${module.name}: ${message(e)}`);
-      }
-      if (this.fingerprintOf(module, config) === null) errors.push(`${module.name}: the config can't be compared`);
-    }
+    const errors = this.validate(config);
     if (errors.length > 0) {
-      this.problem(project, file, [...new Set(errors)].join("; "), previousRunning);
+      this.problem(project, file, errors.join("; "), previousRunning);
       return;
     }
     this.problems.delete(project);

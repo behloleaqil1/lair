@@ -55,7 +55,7 @@ const playbooksShape = Object.fromEntries(
   PLAYBOOK_IDS.map((id) => [id, PlaybookSettingsSchema.optional()]),
 ) as Record<PlaybookId, z.ZodOptional<typeof PlaybookSettingsSchema>>;
 
-const WatchdogSchema = z
+export const WatchdogSchema = z
   .object({
     enabled: z.boolean().default(false),
     mode: z.enum(["observe", "act"]).default("observe"),

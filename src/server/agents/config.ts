@@ -114,7 +114,7 @@ const ProfileSchema = z
   })
   .strict();
 
-const AgentsSchema = z
+export const AgentsSchema = z
   .object({
     enabled: z.boolean().default(false),
     interval_seconds: z.number().int().min(1).max(3600).default(15),

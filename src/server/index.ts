@@ -52,6 +52,7 @@ import {
   registerRestartRoutes,
   withDeadline,
 } from "./restart/index.js";
+import { SettingsService, registerSettingsUiRoutes } from "./settings/index.js";
 import { join } from "path";
 import type { ApiResponse, ProjectConfig } from "../shared/types.js";
 
@@ -368,7 +369,7 @@ await registerBusRoutes(fastify, humanAuth);
 // Register process manager routes (start/stop/restart: owner only)
 await registerProcessRoutes(fastify, humanAuth);
 
-// Register settings routes (saving, machine tests: owner only)
+// Register the machine test of the settings (owner only); the Settings API is below
 await registerSettingsRoutes(fastify, humanAuth);
 
 // Register M1 scheduler and node routes (scheduler controls, task changes: owner only)
@@ -501,6 +502,18 @@ const reloader = new ConfigReloader({
   },
 });
 await registerReloadRoutes(fastify, reloader);
+
+// Settings (src/server/settings/): the owner reads and changes every project
+// setting from the dashboard. A save is checked by the same parsers as the
+// live reload, written atomically to the project file (with a history in
+// data/config-history/), and applied by the reloader at once
+const settings = new SettingsService({
+  dataDir: join(process.cwd(), "data"),
+  validate: (config) => reloader.validate(config),
+  reload: (project) => reloader.apply(project),
+  reloadProblem: (project) => reloader.problemOf(project),
+});
+await registerSettingsUiRoutes(fastify, { service: settings, auth: humanAuth });
 
 // The owner's Restart and "Update and restart" (src/server/restart/): the
 // graceful shutdown below, then exit code 0 for the service manager

@@ -1,24 +1,15 @@
 /**
- * Settings routes - manage project configuration from UI
- *
- * Saving the config and testing a machine need the owner's session
- * (src/server/human-auth/); reading the settings stays open.
+ * The machine test of the Settings view (owner only). Reading and saving a
+ * project's settings moved to src/server/settings/ (the Settings API, every
+ * route the owner's, reads included); the old open GET /api/settings and its
+ * unvalidated POST rewrite are gone.
  */
 import type { FastifyInstance } from "fastify";
-import { existsSync, readFileSync, writeFileSync, copyFileSync } from "fs";
-import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import { loadProjectConfig, getConfigPath } from "../config.js";
+import { loadProjectConfig } from "../config.js";
 import { projectQueryGuard } from "./project-guard.js";
 import { rejectCrossSiteRequests } from "../origin.js";
 import type { HumanAuth } from "../human-auth/index.js";
-import { getBuiltInAdapters } from "../services/adapters.js";
-import type {
-  ApiResponse,
-  ProjectConfig,
-  DragonConfig,
-  AIModel,
-  MachineConfig,
-} from "../../shared/types.js";
+import type { ApiResponse } from "../../shared/types.js";
 
 function respond<T>(data: T): ApiResponse<T> {
   return {
@@ -36,23 +27,9 @@ function respondError(error: string): ApiResponse<never> {
   };
 }
 
-interface SettingsData {
-  config: ProjectConfig;
-  configPath: string;
-  availableAdapters: ReturnType<typeof getBuiltInAdapters>;
-}
-
-interface SettingsUpdate {
-  read_only?: boolean;
-  dragons?: Record<string, Omit<DragonConfig, "id">>;
-  available_models?: AIModel[];
-  machines?: Record<string, MachineConfig>;
-  default_instructions?: string;
-}
-
 export async function registerSettingsRoutes(
   fastify: FastifyInstance,
-  /** Saving the config and testing a machine need the owner's session */
+  /** Testing a machine needs the owner's session */
   auth: HumanAuth,
 ): Promise<void> {
   // Encapsulated so the project guard applies only to these routes
@@ -60,105 +37,10 @@ export async function registerSettingsRoutes(
 }
 
 async function settingsRoutes(fastify: FastifyInstance, auth: HumanAuth): Promise<void> {
-  // Every settings route reads (or rewrites) projects/<project>.yaml
   // Refuse cross-site browser requests (CSRF, DNS rebinding) before anything else
   fastify.addHook("onRequest", rejectCrossSiteRequests);
   fastify.addHook("onRequest", projectQueryGuard());
   fastify.addHook("onRequest", auth.requireOwnerForChanges());
-
-  // GET /api/settings - Get current settings
-  fastify.get<{ Querystring: { project: string } }>(
-    "/api/settings",
-    async (request) => {
-      try {
-        const projectName = request.query.project;
-        const config = loadProjectConfig(projectName);
-        const configPath = getConfigPath(projectName);
-        const availableAdapters = getBuiltInAdapters();
-
-        const data: SettingsData = {
-          config,
-          configPath,
-          availableAdapters,
-        };
-
-        return respond(data);
-      } catch (e) {
-        return respondError(e instanceof Error ? e.message : "Unknown error");
-      }
-    }
-  );
-
-  // POST /api/settings - Update settings
-  fastify.post<{ Body: SettingsUpdate; Querystring: { project: string } }>(
-    "/api/settings",
-    async (request) => {
-      try {
-        const projectName = request.query.project;
-        const configPath = getConfigPath(projectName);
-        const updates = request.body;
-
-        if (!existsSync(configPath)) {
-          return respondError(`Config file not found: ${configPath}`);
-        }
-
-        // Read current YAML
-        const currentYaml = readFileSync(configPath, "utf-8");
-        const currentConfig = parseYaml(currentYaml) as Record<string, unknown>;
-
-        // Create backup
-        const backupPath = `${configPath}.backup-${Date.now()}`;
-        copyFileSync(configPath, backupPath);
-
-        // Apply updates
-        if (updates.read_only !== undefined) {
-          currentConfig.read_only = updates.read_only;
-        }
-
-        if (updates.dragons !== undefined) {
-          currentConfig.dragons = updates.dragons;
-        }
-
-        if (updates.available_models !== undefined) {
-          currentConfig.available_models = updates.available_models;
-        }
-
-        if (updates.machines !== undefined) {
-          // Merge machine updates (preserve fields not in the update)
-          const existingMachines = (currentConfig.machines as Record<string, MachineConfig>) || {};
-          for (const [id, update] of Object.entries(updates.machines)) {
-            existingMachines[id] = {
-              ...existingMachines[id],
-              ...update,
-            };
-          }
-          currentConfig.machines = existingMachines;
-        }
-
-        if (updates.default_instructions !== undefined) {
-          currentConfig.default_instructions = updates.default_instructions;
-        }
-
-        // Write back
-        const newYaml = stringifyYaml(currentConfig, {
-          lineWidth: 120,
-          singleQuote: true,
-        });
-        writeFileSync(configPath, newYaml, "utf-8");
-
-        // Reload config to verify
-        const newConfig = loadProjectConfig(projectName);
-
-        return respond({
-          success: true,
-          config: newConfig,
-          backupPath,
-        });
-      } catch (e) {
-        return respondError(e instanceof Error ? e.message : "Unknown error");
-      }
-    }
-  );
 
   // POST /api/settings/test-machine - Test machine connection
   fastify.post<{

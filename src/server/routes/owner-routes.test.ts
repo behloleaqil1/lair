@@ -24,7 +24,7 @@ import { registerSettingsRoutes } from "./settings.js";
 import { registerSchedulerRoutes } from "./scheduler.js";
 import { registerFleetRoutes } from "./fleet.js";
 import { signIn } from "../../client/owner-session";
-import { processAction, runCommand, saveSettings, sendBusMessage, startDragon } from "../../client/owner-actions";
+import { processAction, runCommand, sendBusMessage, startDragon } from "../../client/owner-actions";
 
 const DATA = join(process.cwd(), "data");
 const TMP = join(DATA, "test-owner-routes");
@@ -249,22 +249,25 @@ describe("processes: start, stop and restart", () => {
   });
 });
 
-describe("settings: saving and machine tests", () => {
-  it("refuses a save or a machine test without the owner's session, and leaves the YAML alone", async () => {
-    const yaml = readFileSync(PROJECT_FILE, "utf-8");
-    expectRefused(await post(`/api/settings${p}`, { read_only: true }));
+describe("settings: machine tests", () => {
+  it("refuses a machine test without the owner's session", async () => {
     expectRefused(await post(`/api/settings/test-machine${p}`, { machineId: "local" }));
-    expect(readFileSync(PROJECT_FILE, "utf-8")).toBe(yaml);
-    expect(readdirSync(LOCAL_DIR).filter((f) => f.startsWith(`${PROJECT}.yaml.backup-`))).toEqual([]);
-    expect((await app.inject({ url: `/api/settings${p}` })).statusCode).toBe(200);
   });
 
-  it("saves the owner's changes through the Settings view's helper", async () => {
-    browser();
-    await signIn(ownerToken);
-    const saved = await saveSettings(PROJECT, { default_instructions: "Run the gate before every push." });
-    expect(saved.success).toBe(true);
-    expect(readFileSync(PROJECT_FILE, "utf-8")).toContain("Run the gate before every push.");
+  it("tests a machine for the owner", async () => {
+    const res = await post(`/api/settings/test-machine${p}`, { machineId: "local" }, owner());
+    expect(res.statusCode).toBe(200);
+    // This project has no machines
+    expect(res.json()).toMatchObject({ success: false, error: "Machine not found: local" });
+  });
+
+  it("no longer serves the open read or the unvalidated rewrite of the old Settings view", async () => {
+    // Reading and saving moved to src/server/settings/ (owner only, validated: settings.test.ts)
+    const yaml = readFileSync(PROJECT_FILE, "utf-8");
+    expect((await app.inject({ url: `/api/settings${p}` })).statusCode).toBe(404);
+    expect((await post(`/api/settings${p}`, { read_only: true }, owner())).statusCode).toBe(404);
+    expect(readFileSync(PROJECT_FILE, "utf-8")).toBe(yaml);
+    expect(readdirSync(LOCAL_DIR).filter((f) => f.startsWith(`${PROJECT}.yaml.backup-`))).toEqual([]);
   });
 });
 

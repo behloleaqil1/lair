@@ -121,7 +121,7 @@ const MergeSchema = z
   })
   .strict();
 
-const ReviewSchema = z
+export const ReviewSchema = z
   .object({
     enabled: z.boolean().default(false),
     provider: z.literal("github").default("github"),
