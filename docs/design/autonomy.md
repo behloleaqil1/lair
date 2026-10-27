@@ -248,6 +248,10 @@ planner (§4) turns documents into work; this module WRITES and maintains those 
   automatic revert through §3.
 - **Weekly audit:** a reviewer agent re-reads every red-tier merge of the week and files findings as tasks. A
   disagreement between reviewers becomes a Decision Inbox item only when policy says the human must decide.
+- **Built:** reviews by agents (`review.prompt_file`): named and peer slots go to free reviewer agents from a pool
+  (never the author; with `different_model`, never the author's model in any profile), started through the agents
+  module with the assignment token only in the run's environment; runs that end without a review are retried with
+  backoff, then the owner is asked; reviewers post with `lair review submit`.
 
 ## 6. Agents: budgets, failover and session recovery (module `agents`)
 - **Adapters** (Kiro, Claude Code, Aider, Codex and others, as plugins) report usage: tokens, credits, requests and
