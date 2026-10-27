@@ -43,9 +43,10 @@ The engineer, of any level, describes the application (or points Lair at a repos
 they have, and answers only the decisions that are theirs. Every step below is judged against that. The order:
 
 1. **A: unattended operation and the experience of using Lair**: the supervisor, AI roles, the new look and Settings.
-2. **C1-C4: from an idea to a running app**: documents become work, documents first, a new project from scratch.
+2. **C1-C5: from an idea, or an existing repository, to a running app**: documents become work, documents first, a new
+   project from scratch, and taking over an existing project.
 3. **B: what other engineers need to adopt it**: install, onboarding, adapters, security, docs, releases.
-4. **The rest of C**: importer, nodes, deploy targets, learning loop, quality, launch kit, teams.
+4. **The rest of C**: nodes, deploy targets, learning loop, quality, launch kit, teams.
 
 Each step lists what must exist first. One module per pull request, each with its own acceptance tests.
 
@@ -81,7 +82,7 @@ Each step lists what must exist first. One module per pull request, each with it
 | C2 | **Intake**: feature requests and bug reports | [autonomy.md §4a](autonomy.md) | C1 | Requests from the UI, an in-app widget and importers become triaged cards or decisions; duplicates merged |
 | C3 | **Lifecycle**: documents first | [autonomy.md §4b](autonomy.md), [app-architecture.md](app-architecture.md) | C1, reviews | Audit, plan and designs written by an author agent and critiqued by two reviewer agents; the **architecture stage**: quality attributes, options and trade-offs, ADRs, the stack, a reference architecture and fitness functions, for any style (modular monolith, microservices on Kubernetes, event-driven, serverless, AI-native) |
 | C4 | **Kickstart and projects** | [phase5-deploy.md §3](phase5-deploy.md), [platform.md §10](platform.md) | C3, B2 | "New project": create or connect a repository, choose or detect the stack, first plan |
-| C5 | **Importer**: take over an existing project | [autonomy.md §10](autonomy.md) | C3 | An existing repository and its scripts adopted with no downtime: audit, shadow mode, then cutover |
+| C5 | **Importer**: take over an existing project | [importer.md](importer.md), [autonomy.md §10](autonomy.md) | C3 (architecture recovery uses the architecture stage) | An existing repository adopted with no downtime: connect read-only, discover and audit (stack, build and test commands, CI, deploys, team rules, health, recovered architecture, risk map), a proposed setup, shadow mode beside the existing CI, then a staged, reversible cutover |
 | C6 | **lair-node**: run work on other machines | [node.md](node.md) | runners | Capacity reporting and remote runs without SSH scripts; unplugging a node loses nothing |
 | C7 | **Kubernetes and PaaS deploy targets** | [platform.md §10](platform.md) | delivery | Rollouts with checks and rollback; strategies; promotion behind policy |
 | C8 | **Knowledge and learning loop** | [autonomy.md §8](autonomy.md) | triage, reviews, A3 | Lessons from incidents and reviews turned into checks, playbooks and brief rules |
