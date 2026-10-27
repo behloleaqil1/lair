@@ -3,44 +3,71 @@
 > What is built, what is next, and in which order. The design notes in this folder say *how* each part works; this
 > file says *when* and *what must be true first*. Where this file and the code disagree, the code is right.
 
-Lair's goal: a developer describes an application, or points Lair at a repository, and Lair runs the whole development
-lifecycle with coding agents. The developer answers only the questions that are theirs (pricing, legal, spend,
-accounts, credentials, go/no-go) in the Decision Inbox.
+Lair's goal is to run the whole development lifecycle with coding agents. A developer describes an application, or
+points Lair at a repository, and answers only the questions that are theirs (pricing, legal, spend, accounts,
+credentials, go/no-go) in the Decision Inbox. Lair is open source and works with any agent CLI, any gate system and
+any machines.
 
 ## Built
 
 | Module | Spec | Code | What it does |
 |---|---|---|---|
-| Watchdog and playbooks | [autonomy.md §2](autonomy.md) | `src/server/watchdog/` | Detects stalls and known failure classes and runs playbooks (observe or act); escalations become decisions |
+| Watchdog and playbooks | [autonomy.md §2](autonomy.md) | `src/server/watchdog/` | Detects stalls and known failure classes, and runs playbooks (observe or act); escalations become decisions |
+| Agents and fill | [autonomy.md §6](autonomy.md) | `src/server/agents/` | Supervised agent runs: claims, locks, recovery, failover, budgets. Fill starts runs from a tasks file: waits on a gate's result, holds blocked work, bounds runs without progress, matches queue lines by agent, judges a run whose exit a restart lost by its queue line |
+| Planner | [planner.md](planner.md) | `src/server/planner/` | Keeps fill's tasks file: deterministic done-marking, plus a supervised planner agent whose only output is a validated proposal file (observe or act) |
+| Triage and re-checks | [autonomy.md §3](autonomy.md) | `src/server/triage/` | Signed gate results (from Lair's pipelines or a project's own gate system) are classified by root cause; infrastructure and timeout failures are re-checked in the project's gate system |
+| Placement | configuration.md "Placement" | `src/server/placement/` | Decides which machine runs each queued job of an external gate queue, from learned durations, load and slots, and moves jobs when that finishes them sooner |
+| Reviews by agents and policy merge | [autonomy.md §5](autonomy.md) | `src/server/review/` | Risk tiers, reviewer slots filled by agents with single-use tokens, approvals bound to the head, test integrity check, merge executor |
 | Delivery | [autonomy.md §7](autonomy.md), [platform.md §10](platform.md) | `src/server/delivery/` | Docker Compose environments: status, Up/Down/Restart, holds, crash loops, deploy after a merge with rollback |
-| Gate pipelines and runners | [runners.md](runners.md) | `src/server/gates/` | Pipelines as config; GitHub Actions first (self-hosted only for private repositories), the local machine last; minutes budget |
-| Decision Inbox and owner credential | [autonomy.md §1](autonomy.md) | `src/server/decisions/`, `src/server/human-auth/` | The one place a human decides; owner-only actions need a signed-in browser session (header, not cookie) |
-| Reviews and policy merge | [autonomy.md §5](autonomy.md) | `src/server/review/` | Risk tiers, reviewers per tier, approvals bound to the head commit, test integrity check, merge executor with an email allow-list |
-
-In review (open pull requests): **agents** (claims, pid-owned locks, session recovery, failover, budgets;
-[autonomy.md §6](autonomy.md)) and **triage** (failure classes, narrow re-checks, bisect and revert;
-[autonomy.md §3](autonomy.md)). The planner's first step, Lair keeping fill's tasks file with a supervised planner
-agent ([planner.md](planner.md), `src/server/planner/`), is in review too; step 1 below builds on it.
+| Gate pipelines and runners | [runners.md](runners.md) | `src/server/gates/` | Pipelines as config: GitHub Actions first, the local machine last; a minutes budget |
+| Decision Inbox and owner credential | [autonomy.md §1](autonomy.md) | `src/server/decisions/`, `src/server/human-auth/` | The one place a human decides; owner-only actions need a signed-in browser session |
+| Live reload, Restart and Update | configuration.md "Live config reload" | `src/server/reload/`, `src/server/restart/` | Config changes apply without a restart; the owner restarts or updates Lair from the dashboard |
+| Settings | [settings-ui.md](settings-ui.md) | `src/server/settings/` | Every project setting from the dashboard: validated, history and restore, command and sensitive fields confirmed |
+| Dashboard | [architecture.md](../architecture.md) | `src/client/`, `src/server/dashboard/` | Eight sections, a detail view with a URL for every row, owner-only logs |
 
 ## Next, in order
 
-Each step lists what must exist first. One module per pull request, each with its own acceptance tests.
+The order follows what lets a project run unattended soonest, and then what lets other developers adopt Lair. Each
+step lists what must exist first. One module per pull request, each with its own acceptance tests.
+
+### A. Unattended operation (now)
+
+| # | Step | Spec | Needs first | Acceptance (summary) |
+|---|---|---|---|---|
+| A1 | **Needs you and notifications**: one decision per owner hold; action items vs notices; a desktop and phone push (ntfy) | configuration.md (in review) | Decision Inbox | Every hold the owner must lift has exactly one decision, and answering it lifts the hold; a new action item notifies within a minute, batched |
+| A2 | **Reliability**: dashboard probes off the request path (async, cached); transient provider errors waited out instead of escalated; retention for results and logs in watched folders | [#38](https://github.com/behloleaqil1/lair/issues/38) | — | No synchronous command on a request; a 30-minute provider outage escalates nothing; a watched folder past its retention limit is archived |
+| A3 | **Supervisor S1–S2**: self-checks, the ops API, answers, the daily digest, proposals as decisions | [supervisor.md](supervisor.md) | A1, A2 | See supervisor.md |
+| A4 | **Supervisor S3**: an allowlist of acting fixes | [supervisor.md](supervisor.md) | A3 | See supervisor.md |
+| A5 | **Hands-off day** (end-to-end acceptance) | [autonomy.md §11](autonomy.md) | A1–A4 | A project runs a full day with no human input except Decision Inbox answers |
+
+### B. A proper open-source project
+
+| # | Step | Needs first | Acceptance (summary) |
+|---|---|---|---|
+| B1 | **Install and upgrade**: `npx lair init`, a container image, `lair service install` (launchd/systemd), upgrade from the dashboard for git and package installs, store backups and restore | — | A clean macOS or Linux machine runs Lair as a service in under ten minutes; an upgrade keeps every store |
+| B2 | **Onboarding**: Settings phase 2 (guided setup: node keys, machine and adapter tests, review-tier preview) and phase 3 (detect the repository, CI and gate system, and propose settings); a demo project and tutorial | B1 | A first project with one agent and one gate runs end to end from the wizard alone |
+| B3 | **Adapters and gate systems**: an adapter SDK with conformance tests (Kiro, Claude Code, Aider, Cursor, Codex-style CLIs); documented external gate integration | — | A new adapter passes the conformance suite without core changes |
+| B4 | **Security hardening**: agents as a separate OS user (sandbox profiles); secrets never on paths agents can read; owner-token rotation; an exported audit log; a threat-model document | — | An agent cannot read the owner token, Lair's data or another agent's run environment |
+| B5 | **Docs site**: concepts, quickstart, a guide per module, a config reference generated from the schemas, an API reference, troubleshooting | B1 | Every config key and route is documented from code |
+| B6 | **Quality of Lair itself**: CI on macOS and Linux; end-to-end tests (Lair with fake agents and a fake gate system for a full cycle); scale tests (5,000-file folders, 50 agents); parser fuzzing | — | The end-to-end suite runs on every PR |
+| B7 | **Release** (for Lair itself): semver, a changelog, signed releases, an SBOM, release notes, a deprecation policy | B1, B6 | A tagged release builds, signs and publishes by itself |
+| B8 | **Supervisor S4**: repair of Lair's own defects through reviews by agents | A4, B6 | See supervisor.md |
+
+### C. The whole lifecycle
 
 | # | Module | Spec | Needs first | Acceptance (summary) |
 |---|---|---|---|---|
-| 1 | **Planner**: documents become work | [autonomy.md §4](autonomy.md) | agents, review | Cards extracted from a versioned document, each tracing to its section; dependencies and merge order; cards assigned to agents through the agents module |
-| 2 | **Intake**: feature requests and bug reports | [autonomy.md §4a](autonomy.md) | planner, Decision Inbox | Requests from the UI, an in-app widget and importers become triaged cards or decisions; duplicates merged |
-| 3 | **Lifecycle**: documents first | [autonomy.md §4b](autonomy.md) | planner, review | Audit, project plan, architecture and feature designs written by an author agent, critiqued by two reviewer agents (one a different model), open questions as decisions with recommended answers; docs PRs when a merge changes a boundary; a drift check |
-| 4 | **Kickstart and projects** | [phase5-deploy.md §3](phase5-deploy.md), [platform.md §10, M5](platform.md) | lifecycle, planner, git-host integration | "New project": create or connect a repository, choose or detect a template, describe the product; Lair drafts the spec and plan for approval, then runs the build |
-| 5 | **Importer**: take over an existing project | [autonomy.md §10](autonomy.md) | lifecycle (audit stage) | An existing repository and its scripts adopted with no downtime: audit first, then plan; shadow mode, then cutover with rollback |
-| 6 | **lair-node**: run work on other machines | [node.md](node.md), [platform.md M1/M3](platform.md) | runners | A standard-library Go binary; the runners module's Lair-machines step; capacity reporting; unplugging a node reschedules its work |
-| 7 | **Kubernetes and PaaS deploy targets** | [platform.md §10, M4](platform.md) | delivery | `helm upgrade` per role, rollout checks, `helm rollback`; strategies (rolling, blue-green, canary); promotion as a policy-gated step |
-| 8 | **Knowledge and learning loop** | [autonomy.md §8](autonomy.md) | triage, review | Lessons from incidents and reviews turned into checks, playbooks and brief rules; a weekly digest |
-| 9 | **Quality** | [quality.md](quality.md) | review, triage | Contracts, migration safety, honest health, spec conformance, exploratory and UX testing, performance and cost budgets, AI evaluations, a security pipeline, a quality scorecard |
-| 10 | **Release** (for Lair itself) | [autonomy.md §9](autonomy.md), [platform.md M7](platform.md) | review | Packaging, signed releases, an SBOM, release notes, docs and examples |
-| 11 | **Launch kit** (for the apps Lair builds) | [launch-kit.md](launch-kit.md) | quality, delivery | Billing and money, product analytics, the customer-facing surface, a feedback loop, launch readiness |
-| 12 | **Teams and scale** | [platform.md M6](platform.md) | the rest | Postgres, roles and permissions, SSO, high availability, quotas |
-| — | **Hands-off day** (end-to-end acceptance) | [autonomy.md §11](autonomy.md) | 1–5 at least | A project runs a full day with no human input except Decision Inbox answers |
+| C1 | **Planner: documents become work** | [autonomy.md §4](autonomy.md) | planner (built) | Cards extracted from a versioned document, each tracing to its section; dependencies and merge order |
+| C2 | **Intake**: feature requests and bug reports | [autonomy.md §4a](autonomy.md) | C1 | Requests from the UI, an in-app widget and importers become triaged cards or decisions; duplicates merged |
+| C3 | **Lifecycle**: documents first | [autonomy.md §4b](autonomy.md) | C1, reviews | Audit, plan, architecture and designs written by an author agent and critiqued by two reviewer agents |
+| C4 | **Kickstart and projects** | [phase5-deploy.md §3](phase5-deploy.md), [platform.md §10](platform.md) | C3, B2 | "New project": create or connect a repository, choose or detect the stack, first plan |
+| C5 | **Importer**: take over an existing project | [autonomy.md §10](autonomy.md) | C3 | An existing repository and its scripts adopted with no downtime: audit, shadow mode, then cutover |
+| C6 | **lair-node**: run work on other machines | [node.md](node.md) | runners | Capacity reporting and remote runs without SSH scripts; unplugging a node loses nothing |
+| C7 | **Kubernetes and PaaS deploy targets** | [platform.md §10](platform.md) | delivery | Rollouts with checks and rollback; strategies; promotion behind policy |
+| C8 | **Knowledge and learning loop** | [autonomy.md §8](autonomy.md) | triage, reviews, A3 | Lessons from incidents and reviews turned into checks, playbooks and brief rules |
+| C9 | **Quality** | [quality.md](quality.md) | reviews, triage | Contracts, migration safety, spec conformance, exploratory and UX testing, performance and cost budgets, AI evaluations, a security pipeline |
+| C10 | **Launch kit** (for the apps Lair builds) | [launch-kit.md](launch-kit.md) | C9, delivery | Billing, analytics, the customer-facing surface, a feedback loop, launch readiness |
+| C11 | **Teams and scale** | [platform.md M6](platform.md) | the rest | Postgres, roles and permissions, SSO, high availability, quotas |
 
 ## Rules every new module follows
 

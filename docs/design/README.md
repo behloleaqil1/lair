@@ -38,3 +38,4 @@
 3. Read `autonomy.md` for the autonomous operation model
 4. Read `node.md` for the compiled daemon design, and `runners.md` for where gates run
 5. Read `quality.md` and `launch-kit.md` for quality and launch criteria
+- [supervisor.md](supervisor.md): the supervisor, Lair's operator: self-checks, answers, diagnoses and fixes within the autonomy the owner gives it
