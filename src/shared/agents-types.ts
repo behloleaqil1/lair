@@ -137,7 +137,9 @@ export type AgentEventKind =
   | "fill_released"
   | "fill_waiting"
   | "fill_blocked"
-  | "fill_woken";
+  | "fill_woken"
+  | "fill_weak"
+  | "fill_wake_absent";
 
 /** Recovery and audit record: what happened, why, and the evidence. */
 export interface AgentEventView {

@@ -2635,7 +2635,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(entries[0]).toContain("Fill holds task feat-login: worker-a's last 3 run(s) exited 0 without reporting it done");
   });
 
-  it("a stale wake (its result was there before the run ended) is counted and backed off, then held", async () => {
+  it("a stale wake (its result is older than the run) is counted and backed off, then held; rewriting the result later doesn't lift the hold", async () => {
     const h = setup(gateFill({ max_wait_minutes: 600 }));
     prompts(h);
     tasks(h, "worker-a|Alice|feat-login|Login form");
@@ -2647,7 +2647,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     await runAt(h, 0);
     let line = lineOf(await check(h), "feat-login");
     expect(line).toMatchObject({ state: "held", hold: "waiting" });
-    expect(line.detail).toContain(`its result ${join(h.gatesDir, "results", `${GATE}.rc`)} was there before the run ended`);
+    expect(line.detail).toContain(`its result ${join(h.gatesDir, "results", `${GATE}.rc`)} was there before the run started`);
     expect(line.detail).toContain("(1 of 3): starting it again at 2026-03-02T12:02:00.000Z");
     await runAt(h, 2);
     expect(lineOf(await check(h), "feat-login").detail).toContain("(2 of 3): starting it again at 2026-03-02T12:05:00.000Z");
@@ -2656,6 +2656,46 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(line).toMatchObject({ state: "held", hold: "no_done" });
     expect(runs(h)).toHaveLength(3);
     expect(eventsOf(h, "fill_woken")).toEqual([]);
+    expect(eventsOf(h, "fill_weak")).toHaveLength(3);
+
+    // The result file is rewritten later (a newer mtime): the runs stay what they were, and the hold stays the owner's
+    resultAt(h, GATE, 30 * MIN);
+    for (const minute of [31, 60, 120]) {
+      h.clock.t = NOW + minute * MIN;
+      expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "held", hold: "no_done" });
+      await h.service.tick();
+    }
+    expect(runs(h)).toHaveLength(3);
+    expect(eventsOf(h, "fill_woken")).toEqual([]);
+    expect(inboxEntries(h)).toHaveLength(1);
+  });
+
+  it("a gate that finishes before Lair sees the run end is a real wake, and so is a result fill saw absent that appears with an old mtime", async () => {
+    // The gate the run queued finishes at +30 s; Lair sees the run end at its next check, +1 min
+    const fast = setup(gateFill());
+    prompts(fast);
+    tasks(fast, "worker-a|Alice|feat-login|Login form");
+    await check(fast);
+    await at(fast, 0); // spawned at NOW
+    appendFileSync(fast.queueFile, `- WAITING feat-login ${GATE} by worker-a: gate queued\n`);
+    resultAt(fast, GATE, 30 * SEC);
+    fast.spawner.exit(5001, 0);
+    await at(fast, MIN);
+    expect(lineOf(await check(fast), "feat-login").state).toBe("started");
+    expect(eventsOf(fast, "fill_woken")).toHaveLength(1);
+    expect(eventsOf(fast, "fill_weak")).toEqual([]);
+
+    // Fill saw the result absent; it then appears with an mtime from long before (copied with its times kept)
+    const copied = setup(gateFill());
+    prompts(copied);
+    tasks(copied, "worker-a|Alice|feat-login|Login form");
+    await runEndingWith(copied, `- WAITING feat-login ${GATE} by worker-a: gate queued`);
+    expect(lineOf(await check(copied), "feat-login").hold).toBe("waiting");
+    expect(eventsOf(copied, "fill_wake_absent")).toHaveLength(1);
+    resultAt(copied, GATE, -60 * MIN);
+    copied.clock.t = NOW + 2 * MIN;
+    expect(lineOf(await check(copied), "feat-login").state).toBe("started");
+    expect(eventsOf(copied, "fill_woken")).toHaveLength(1);
   });
 
   it("alternating runs without a line and WAITING runs on nothing are all counted: held after N", async () => {
@@ -2973,6 +3013,73 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     resultAt(h, gate, 30 * MIN);
     h.clock.t = NOW + 31 * MIN;
     expect(lineOf(await check(h), "kiro/L-08").state).toBe("started");
+  });
+
+  it("patterns by agent: one open task per agent. A second line for it is malformed, a run on another task is refused while its task waits, and the task's later DONE is its own", async () => {
+    const h = setup(fill({ ...BY_AGENT, wake: { file: "{gates_dir}/results/{wake}.rc" } }));
+    const app = await http(h);
+    prompts(h);
+    tasks(h, "worker-a|Viserion|kiro/T1|First", "worker-a|Viserion|kiro/T2|Second");
+
+    let status = await check(h);
+    expect(status.lines.map((l) => [l.line, l.state, l.task])).toEqual([
+      [1, "started", "kiro/T1"],
+      [2, "malformed", null],
+    ]);
+    expect(status.lines[1].detail).toContain("worker-a already has a task on line 1: with patterns that match by agent, one line per agent");
+    await at(h, 0); // 5001
+    const gate = "20261027T070000Z-T1-ab12cd34-1";
+    appendFileSync(h.queueFile, `- WAITING T1 ${gate} by worker-a (Viserion) 06:25Z: gate queued\n`);
+    h.spawner.exit(5001, 0);
+    await at(h, MIN);
+    status = await check(h);
+    expect(lineOf(status, "kiro/T1")).toMatchObject({ state: "held", hold: "waiting" });
+
+    // While T1 waits, a run of worker-a on another task is refused: its lines would count for T1
+    const refused = await post(app, "/api/agents/runs?project=demo", { agent: "worker-a", task: "kiro/T2", prompt: "Do T2" });
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json().error).toContain("Agent worker-a has an open fill task, kiro/T1 (held: waiting)");
+    expect(runs(h).map((r) => r.task)).toEqual(["kiro/T1"]);
+
+    // T1's gate comes, and its next run reports it done: that DONE is T1's
+    resultAt(h, gate, 90 * SEC);
+    h.clock.t = NOW + 2 * MIN;
+    expect(lineOf(await check(h), "kiro/T1").state).toBe("started");
+    await at(h, 2 * MIN); // 5002
+    appendFileSync(h.queueFile, "- DONE T1 by worker-a (Viserion) 07:00Z: merged\n");
+    h.spawner.exit(5002, 0);
+    await at(h, 3 * MIN);
+    expect(lineOf(await check(h), "kiro/T1")).toMatchObject({ state: "done", detail: "done: - DONE T1 by worker-a (Viserion) 07:00Z: merged" });
+    // T1 is done: worker-a is free for another task
+    expect((await post(app, "/api/agents/runs?project=demo", { agent: "worker-a", task: "kiro/T2", prompt: "Do T2" })).statusCode).toBe(201);
+  });
+
+  it("patterns by agent: a task's lines end where its agent's next run on another task began", async () => {
+    const h = setup(fill({ ...BY_AGENT, agents: ["worker-a"], wake: { file: "{gates_dir}/results/{wake}.rc" } }));
+    prompts(h);
+    tasks(h, "worker-a|Viserion|kiro/T1|First");
+    await check(h);
+    await at(h, 0); // 5001
+    const gate = "20261027T070000Z-T1-ab12cd34-1";
+    appendFileSync(h.queueFile, `- WAITING T1 ${gate} by worker-a (Viserion) 06:25Z: gate queued\n`);
+    h.spawner.exit(5001, 0);
+    await at(h, MIN);
+    expect(lineOf(await check(h), "kiro/T1").hold).toBe("waiting");
+
+    // The owner takes T1's line out, and runs worker-a on something else, which it reports done
+    tasks(h, "# kiro/T1 paused");
+    await check(h);
+    await request(h, "worker-a", "kiro/other", "Something else");
+    await at(h, 2 * MIN); // 5002
+    appendFileSync(h.queueFile, "- DONE other by worker-a (Viserion) 06:40Z: merged\n");
+    h.spawner.exit(5002, 0);
+    await at(h, 3 * MIN);
+
+    // T1's line comes back: worker-a's DONE was the other task's, written after that run began
+    tasks(h, "worker-a|Viserion|kiro/T1|First");
+    const line = lineOf(await check(h), "kiro/T1");
+    expect(line).toMatchObject({ state: "held", hold: "waiting", waiting: { wake: gate } });
+    expect(eventsOf(h, "fill_done")).toEqual([]);
   });
 
   it("a store from before fill (schema version 1) gains the task index; its runs are found by task", () => {

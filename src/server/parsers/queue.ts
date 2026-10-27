@@ -58,6 +58,16 @@ const BY_AGENT = new RegExp(
   `\\bby\\s+(${AGENT_ID})(?=\\s*(?:\\(|\\d{1,2}:\\d{2}Z|:|$))`,
 );
 
+/**
+ * A line's author by its attribution only: the first "by <agent>" followed by
+ * "(", a time, ":" or the end, never extractAgent's fallbacks (a "(agent, ..."
+ * prefix, or a kiro-style id anywhere). For callers that must not credit an
+ * agent with a line that only names it (agents fill).
+ */
+export function attributedAgent(line: string): string | undefined {
+  return line.match(BY_AGENT)?.[1];
+}
+
 /** "(<agent>, ...)" prefix of an orchestrator-style line; the agent ID contains a "-". */
 const PAREN_AGENT = /^\(([A-Za-z][A-Za-z0-9_]*-[A-Za-z0-9_-]+),/;
 

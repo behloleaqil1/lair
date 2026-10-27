@@ -240,6 +240,23 @@ export class AgentsStore {
     );
   }
 
+  /** The first run of `agent` on another task than `task` requested after the run `after`, or null. */
+  firstRunForAgentAfter(project: string, agent: string, task: string, after: AgentRun): AgentRun | null {
+    return (
+      this.runs(
+        `SELECT data FROM agents_runs WHERE project = ? AND agent = ? AND task != ?
+           AND (requested_at > ? OR (requested_at = ? AND rowid > (SELECT rowid FROM agents_runs WHERE id = ?)))
+         ORDER BY requested_at, rowid LIMIT 1`,
+        project,
+        agent,
+        task,
+        after.requestedAt,
+        after.requestedAt,
+        after.id,
+      )[0] ?? null
+    );
+  }
+
   /** The first runs of a task's newest chains (a chain's id is its first run's), newest first. */
   chainHeadsForTask(project: string, task: string, limit: number): AgentRun[] {
     return this.runs(

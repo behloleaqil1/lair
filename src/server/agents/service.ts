@@ -1878,6 +1878,14 @@ export class AgentsService {
       if (busy) {
         throw new AgentsError(409, `Agent ${agent} is busy: run ${short(busy.id)} on task ${busy.task} is ${busy.state}`);
       }
+      // Fill matching by agent: the agent's lines about another task would read as its open fill task's
+      const open = options.origin === "fill" ? null : this.fill?.openTaskFor(agent, task);
+      if (open) {
+        throw new AgentsError(
+          409,
+          `Agent ${agent} has an open fill task, ${open.task} (${open.state}${open.hold ? `: ${open.hold}` : ""}): with fill's patterns matching by agent, its lines on another task would count for that one. Let ${open.task} finish, or take its line out of tasks_file first`,
+        );
+      }
       const now = this.probes.clock.now();
       const blocked = this.budgetBlock(agent, now);
       if (blocked) throw new AgentsError(403, `Over budget: ${blocked}`);

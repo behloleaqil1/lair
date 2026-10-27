@@ -6,7 +6,7 @@ import { z } from "zod";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { BudgetMetric } from "../../shared/agents-types.js";
 import { isValidDragonId } from "../parsers/dragon-config.js";
-import { parseQueueLine } from "../parsers/queue.js";
+import { attributedAgent } from "../parsers/queue.js";
 import { getAdapter } from "../services/adapters.js";
 import { placeholdersIn } from "../watchdog/config.js";
 
@@ -278,11 +278,11 @@ export function doneLineMatches(pattern: FillPattern, line: string): boolean {
  * The match of a fill pattern on a queue line, or null. The trimmed line
  * must match, case-insensitively. With {task}, the matched text must hold
  * the task id exactly as written (task ids are case-sensitive; the DONE
- * keyword is not). With {agent}, the line must be that agent's, by the
- * module's own reading of a queue line (parseQueueLine: the first
- * "by <agent>" followed by "(", a time, ":" or the end): a line by another
- * agent that names this one in its message, or a longer id that starts with
- * this one, doesn't count.
+ * keyword is not). With {agent}, the line must be that agent's by its
+ * attribution only (attributedAgent: the first "by <agent>" followed by
+ * "(", a time, ":" or the end; never a kiro-style id found elsewhere in the
+ * line): a line by another agent that names this one in its message, or a
+ * longer id that starts with this one, doesn't count.
  */
 export function taskLineMatch(pattern: FillPattern, line: string): RegExpExecArray | null {
   const text = line.trim();
@@ -291,8 +291,17 @@ export function taskLineMatch(pattern: FillPattern, line: string): RegExpExecArr
   const match = pattern.regex.exec(text);
   if (match === null) return null;
   if (pattern.task !== null && !match[0].includes(pattern.task)) return null;
-  if (pattern.agent !== null && parseQueueLine(text)?.agent?.toLowerCase() !== pattern.agent.toLowerCase()) return null;
+  if (pattern.agent !== null && attributedAgent(text)?.toLowerCase() !== pattern.agent.toLowerCase()) return null;
   return match;
+}
+
+/**
+ * Fill matches by agent when any of its patterns names only the agent: then
+ * an agent's lines can't say which task they are about, so it has one open
+ * task at a time (see fill.ts).
+ */
+export function matchesByAgent(fill: Pick<FillSettings, "donePattern" | "waitingPattern" | "blockedPattern">): boolean {
+  return [fill.donePattern, fill.waitingPattern, fill.blockedPattern].some((pattern) => !pattern.includes("{task}"));
 }
 
 /** What a waiting line may name to wait on: one plain name (a gate id, say), never a path or an option */
@@ -581,8 +590,12 @@ function checkFill(value: RawSettings, errors: string[]): void {
   if (wake.root.split(/[\\/]/).includes("..")) errors.push('agents.fill.wake.root: a ".." segment is refused');
 }
 
-/** What must come right before {agent} in a pattern: "by" and whitespace, the line's author (as "... by <agent> (Name)") */
-const BY_BEFORE_AGENT = /(?:^|[^a-z]|\\b)by(?:\\s[+*]?|\s+)$/i;
+/**
+ * What must come right before {agent} in a pattern: a word "by", then
+ * `\s+`, as in "... \bby\s+{agent}" (the line's author: "... by <agent>
+ * (Name)"). "by" starts the pattern or follows `\b`, `\s`, a space or "(".
+ */
+const BY_BEFORE_AGENT = /(?:^|\\b|\\s| |\()by\\s\+$/i;
 
 /**
  * A fill pattern: {task} and {agent} only, at least one of them, every
@@ -597,7 +610,7 @@ function checkTaskPattern(pattern: string, key: string, what: string, errors: st
   }
   const parts = pattern.split("{agent}");
   if (parts.slice(0, -1).some((before) => !BY_BEFORE_AGENT.test(before))) {
-    errors.push(`agents.fill.${key}: {agent} must come right after "by\\s+" (the line's author: "... by {agent}")`);
+    errors.push(`agents.fill.${key}: {agent} must come right after "\\bby\\s+" (the line's author: "... by {agent}")`);
     return;
   }
   try {

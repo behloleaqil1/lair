@@ -171,11 +171,18 @@ describe("agents config", () => {
       ]);
       // {agent} alone is enough, right after "by\s+" (the line's author)
       expect(errorsOf(withFill({ [key]: "^- WAITING .*\\bby\\s+{agent}(?=[\\s(]|$)" }))).toEqual([]);
-      expect(errorsOf(withFill({ [key]: "^- WAITING .* by {agent}(?=[\\s(]|$)" }))).toEqual([]);
-      // Anywhere else it could match a line that only names the agent ("merged kiro-A's PR")
-      for (const pattern of ["^- DONE merged {agent}'s PR", "^- DONE .*{agent}", "^- DONE .*\\bbaby\\s+{agent}"]) {
+      expect(errorsOf(withFill({ [key]: "^- WAITING .* by\\s+{agent}(?=[\\s(]|$)" }))).toEqual([]);
+      // Anywhere else it could match a line that only names the agent ("merged kiro-A's PR"), or another agent
+      for (const pattern of [
+        "^- DONE merged {agent}'s PR",
+        "^- DONE .*{agent}",
+        "^- DONE .*\\bbaby\\s+{agent}",
+        "^- DONE .*\\bby\\s*{agent}",
+        "^- DONE .* by {agent}",
+        "^- DONE .*-by\\s+{agent}",
+      ]) {
         expect(errorsOf(withFill({ [key]: pattern }))).toEqual([
-          `agents.fill.${key}: {agent} must come right after "by\\s+" (the line's author: "... by {agent}")`,
+          `agents.fill.${key}: {agent} must come right after "\\bby\\s+" (the line's author: "... by {agent}")`,
         ]);
       }
       expect(errorsOf(withFill({ [key]: "^- BLOCKED ({task}" }))[0]).toContain(`agents.fill.${key}: not a valid regular expression`);
@@ -239,6 +246,9 @@ describe("agents config", () => {
     // Only the agent's own lines: kiro-H's line naming kiro-C in its message isn't kiro-C's
     expect(match(donePattern, "kiro-C", "- DONE currency-enforcement by kiro-H (Viserion) 07:10Z: reviewed by kiro-C")).toBeNull();
     expect(match(waitingPattern, "kiro-C", `${waitingH}, review by kiro-C`)).toBeNull();
+    // Only the attribution form counts ("by <id>" then "(", a time, ":" or the end), not a kiro-style id elsewhere
+    expect(match(donePattern, "kiro-A", "- DONE reviewed by kiro-A and merged")).toBeNull();
+    expect(match(donePattern, "kiro-A", "- DONE reviewed by kiro-A")).not.toBeNull();
     // A longer id that starts with the agent's is another agent
     expect(match(donePattern, "kiro-A", "- DONE sf-storage by kiro-AB (Rhaegal) 07:00Z: merged")).toBeNull();
     expect(match(blockedPattern, "kiro-A", "- BLOCKED sf-storage by kiro-AB: needs a key")).toBeNull();
