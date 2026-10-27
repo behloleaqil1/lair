@@ -6,6 +6,8 @@
 import { useState, useCallback } from "react";
 import type { CommandMode, CommandResult } from "../../shared/types";
 import type { MessageDeliveryState } from "../../shared/bus-types";
+import { runCommand, sendBusMessage } from "../owner-actions";
+import { SignInHint } from "./SignInHint";
 
 interface Props {
   project: string;
@@ -63,16 +65,7 @@ export function CommandBar({
         // Handle different modes
         if (mode === "instruct") {
           // Send through bus to orchestrator
-          const res = await fetch(`/api/bus/send?project=${project}`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              to: "orchestrator",
-              text: text.trim(),
-            }),
-          });
-
-          const data = await res.json();
+          const data = await sendBusMessage(project, "orchestrator", text.trim());
           if (data.success && data.data) {
             setResult({ type: "bus", data: data.data });
             setShowResult(true);
@@ -98,17 +91,8 @@ export function CommandBar({
         if (match && !readOnly) {
           const dragonId = match[1] ?? match[2];
           const message = match[3];
-          const res = await fetch(`/api/bus/send?project=${project}`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              // Bus inboxes match the agent ID exactly, so send it as typed
-              to: dragonId,
-              text: message.trim(),
-            }),
-          });
-
-          const data = await res.json();
+          // Bus inboxes match the agent ID exactly, so send it as typed
+          const data = await sendBusMessage(project, dragonId, message.trim());
           if (data.success && data.data) {
             setResult({ type: "bus", data: data.data });
             setShowResult(true);
@@ -123,27 +107,11 @@ export function CommandBar({
           return;
         }
 
-        // Legacy command handling
-        let endpoint = "";
-        let body: Record<string, unknown> = { text: text.trim() };
-
-        switch (mode) {
-          case "ask":
-            endpoint = "/api/controls/ask";
-            break;
-          case "task":
-            endpoint = "/api/controls/agent/run";
-            body = { task: text.trim() };
-            break;
-        }
-
-        const res = await fetch(`${endpoint}?project=${project}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-
-        const data = await res.json();
+        // Legacy command handling: ask the orchestrator, or run a task
+        const data =
+          mode === "task"
+            ? await runCommand(project, "agent/run", { task: text.trim() })
+            : await runCommand(project, "ask", { text: text.trim() });
         if (data.success && data.data) {
           setResult({ type: "command", data: data.data });
           setShowResult(true);
@@ -229,6 +197,9 @@ export function CommandBar({
           {loading ? "..." : "Send"}
         </button>
       </form>
+
+      {/* Questions, instructions, messages and tasks all go out as the owner's */}
+      <SignInHint what="Sending commands and messages" refreshKey={showResult ? 1 : 0} />
 
       {/* Result panel */}
       {showResult && result && (

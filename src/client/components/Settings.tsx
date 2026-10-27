@@ -2,6 +2,8 @@
  * Settings view - configure project, toggle controls, manage dragons/models/machines
  */
 import { useState, useEffect } from "react";
+import { saveSettings } from "../owner-actions";
+import { SignInHint } from "./SignInHint";
 import type {
   ProjectConfig,
   DragonConfig,
@@ -69,22 +71,13 @@ export function Settings({ project, refreshKey, onConfigChange }: Props) {
     setSaveMessage(null);
 
     try {
-      const response = await fetch(
-        `/api/settings?project=${encodeURIComponent(project)}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            read_only: readOnly,
-            dragons,
-            available_models: models,
-            machines,
-            default_instructions: defaultInstructions,
-          }),
-        }
-      );
-
-      const result = await response.json();
+      const result = await saveSettings(project, {
+        read_only: readOnly,
+        dragons,
+        available_models: models,
+        machines,
+        default_instructions: defaultInstructions,
+      });
       if (result.success) {
         setSaveMessage("Settings saved successfully!");
         onConfigChange?.();
@@ -184,6 +177,8 @@ export function Settings({ project, refreshKey, onConfigChange }: Props) {
           </button>
         </div>
       </div>
+
+      <SignInHint what="Saving settings" refreshKey={refreshKey} />
 
       {/* Controls Section */}
       <div className="card" style={{ marginBottom: "1.5rem" }}>

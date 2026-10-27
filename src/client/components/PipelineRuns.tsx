@@ -7,6 +7,8 @@
  */
 import { useState } from "react";
 import { useApi } from "../hooks/useApi";
+import { cancelPipelineRun, startPipelineRun, type ApiEnvelope } from "../owner-actions";
+import { SignInHint } from "./SignInHint";
 import type {
   PipelineAttempt,
   PipelineRun,
@@ -60,18 +62,10 @@ function duration(ms: number | undefined): string {
   return ms < 60_000 ? `${(ms / 1000).toFixed(1)} s` : `${(ms / 60_000).toFixed(1)} min`;
 }
 
-function query(project: string): string {
-  return project ? `?project=${encodeURIComponent(project)}` : "";
-}
-
-async function post<T>(url: string, body?: unknown): Promise<T> {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  const json = (await res.json()) as { success: boolean; data?: T; error?: string };
-  if (!json.success || json.data === undefined) throw new Error(json.error ?? `HTTP ${res.status}`);
+/** The data of an owner request (owner-actions.ts), or its error thrown. */
+async function unwrap<T>(request: Promise<ApiEnvelope<T>>): Promise<T> {
+  const json = await request;
+  if (!json.success || json.data === undefined) throw new Error(json.error ?? "Request failed");
   return json.data;
 }
 
@@ -120,10 +114,12 @@ export function PipelineRuns({ project, refreshKey }: Props) {
     setBusy(true);
     setMessage(null);
     try {
-      const run = await post<PipelineRun>(`/api/pipelines/runs${query(project)}`, {
-        pipeline: chosen,
-        ...(branch.trim() ? { branch: branch.trim() } : {}),
-      });
+      const run = await unwrap(
+        startPipelineRun<PipelineRun>(project, {
+          pipeline: chosen,
+          ...(branch.trim() ? { branch: branch.trim() } : {}),
+        }),
+      );
       setMessage(`Started ${run.id} at ${run.commitSha.slice(0, 10)}`);
       setSelected(run.id);
       setTick((t) => t + 1);
@@ -136,6 +132,7 @@ export function PipelineRuns({ project, refreshKey }: Props) {
 
   return (
     <div>
+      <SignInHint what="Starting and cancelling pipeline runs" refreshKey={refreshKey} />
       <div className="card">
         <div style={{ display: "flex", alignItems: "center", gap: "1rem", flexWrap: "wrap" }}>
           <h3 style={{ margin: 0 }}>Pipelines</h3>
@@ -327,7 +324,7 @@ function RunPanel({
   const cancel = async () => {
     setCancelError(null);
     try {
-      await post<PipelineRun>(`/api/pipelines/runs/${id}/cancel${query(project)}`);
+      await unwrap(cancelPipelineRun<PipelineRun>(project, id));
       onChanged();
     } catch (e) {
       setCancelError(e instanceof Error ? e.message : String(e));

@@ -8,6 +8,8 @@ import { useDragonsWebSocket } from "../hooks/useWebSocket";
 import { DragonStartDialog } from "./DragonStartDialog";
 import { DragonStopDialog } from "./DragonStopDialog";
 import { canStartDragon, hasStartableDragons } from "../dragon-start";
+import { startDragon, stopDragon } from "../owner-actions";
+import { SignInHint } from "./SignInHint";
 import type {
   Dragon,
   QueueLine,
@@ -77,15 +79,7 @@ export function Dragons({ project, refreshKey }: Props) {
   };
 
   const handleStartDragon = async (request: DragonStartRequest) => {
-    const response = await fetch(
-      `/api/controls/dragon/start?project=${encodeURIComponent(project)}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(request),
-      },
-    );
-    const data = await response.json();
+    const data = await startDragon(project, request);
     if (!data.success) {
       throw new Error(data.error || "Failed to start dragon");
     }
@@ -95,15 +89,7 @@ export function Dragons({ project, refreshKey }: Props) {
   };
 
   const handleStopDragon = async (request: DragonStopRequest) => {
-    const response = await fetch(
-      `/api/controls/dragon/stop?project=${encodeURIComponent(project)}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(request),
-      },
-    );
-    const data = await response.json();
+    const data = await stopDragon(project, request);
     if (!data.success) {
       throw new Error(data.error || "Failed to stop dragon");
     }
@@ -160,6 +146,8 @@ export function Dragons({ project, refreshKey }: Props) {
           </button>
         )}
       </div>
+
+      {!controlsReadOnly && <SignInHint what="Starting and stopping dragons" refreshKey={refreshKey} />}
 
       <div className="card">
         <table className="table">

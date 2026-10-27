@@ -18,6 +18,7 @@ import type {
   ServiceStatus,
 } from "../../shared/delivery-types";
 import { needsConfirmation, needsReason, runDeliveryAction, type DeliveryAction } from "../delivery-api";
+import { SignInHint } from "./SignInHint";
 
 interface Props {
   project: string;
@@ -424,6 +425,7 @@ export function Delivery({ project, refreshKey }: Props) {
         <h2>Delivery</h2>
         {s.readOnly && <span className="badge badge-neutral">Read-only: no actions</span>}
       </div>
+      {!s.readOnly && <SignInHint what="Bringing services up and down, deploying and releasing" refreshKey={refreshKey} />}
       {s.lastError && <div className="error">Last check failed: {s.lastError}</div>}
       {error && !pending && <div className="error">{error}</div>}
       {notice && <p style={{ ...muted, marginBottom: "1rem" }}>{notice}</p>}

@@ -8,6 +8,8 @@
  */
 import { useState, useEffect } from "react";
 import { useApi } from "../hooks/useApi";
+import { processAction } from "../owner-actions";
+import { SignInHint } from "./SignInHint";
 import type {
   ProcessState,
   ProcessListResponse,
@@ -75,11 +77,7 @@ export function Processes({ project, refreshKey }: Props) {
     setActionError(null);
 
     try {
-      const response = await fetch(
-        `/api/processes/${processId}/${action}?project=${encodeURIComponent(project)}`,
-        { method: "POST", headers: { "Content-Type": "application/json" } },
-      );
-      const data = await response.json();
+      const data = await processAction(project, processId, action);
       if (!data.success) {
         setActionError(data.error || `Failed to ${action} process`);
       }
@@ -130,6 +128,8 @@ export function Processes({ project, refreshKey }: Props) {
           </span>
         </div>
       </div>
+
+      {!controlsReadOnly && <SignInHint what="Starting, stopping and restarting processes" refreshKey={refreshKey} />}
 
       {actionError && (
         <div
