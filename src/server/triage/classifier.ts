@@ -112,7 +112,10 @@ function matchInfra(cause: FailureCause, patterns: CompiledPattern[]): Verdict |
 
 /** The root cause, not the top exception: a signature in the message, the "Caused by" chain or the log lines. */
 function matchSignature(cause: FailureCause, settings: TriageSettings): Verdict | null {
-  const found = findSignature(cause, settings.infraSignatures, settings.timeoutSignatures);
+  // A timeout signature counts only while the gate system re-checks (triage.recheck.mode): without a quiet re-check
+  // to tell load from a hang, a timed-out test stays code and goes to its author
+  const timeouts = settings.gateRecheck.mode === "off" ? [] : settings.timeoutSignatures;
+  const found = findSignature(cause, settings.infraSignatures, timeouts);
   if (!found) return null;
   const what = found.timeout ? "timeout" : "infra";
   const evidence = [`${found.where}: ${clip(found.text, 200)} (matches ${what} signature ${found.signature.id})`];

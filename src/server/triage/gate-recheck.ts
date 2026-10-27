@@ -59,6 +59,7 @@ import type { GateRecheckPlaceholder, GateRecheckSettings } from "./gate-recheck
 import { ANSWERABLE, type GateRecheckStore, type NewGateRecheck } from "./gate-recheck-store.js";
 import type { GateEvidence } from "./parsers/index.js";
 import type { Section } from "./service.js";
+import { isAssertion } from "./signatures.js";
 import type { TriageStore } from "./store.js";
 import { clip } from "./text.js";
 
@@ -90,7 +91,11 @@ export interface GateLink {
   origin: TriageRecord;
 }
 
-export type GateLinkResult = { ok: true; link: GateLink } | { ok: false; status: 400 | 409; error: string };
+/**
+ * link: it answers this re-check; plain: it names a re-check that can't take it (answered, refused, another run, another
+ * commit): it is triaged as a plain gate result, with the note, and not re-checked.
+ */
+export type GateLinkResult = { kind: "link"; link: GateLink } | { kind: "plain"; note: string };
 
 /** What the triage service lends this: its store, its queue and the actions of the other classes. */
 export interface GateRecheckHost {
@@ -119,6 +124,8 @@ export interface GateRecheckHost {
 /** The timeout signal: a test (or a context failure) whose error is a timeout. Bounded: each line is clipped first. */
 export function isTestTimeout(cause: FailureCause): boolean {
   if (cause.tests.length === 0 || (cause.kind !== "test" && cause.kind !== "context")) return false;
+  // An assertion that times out waiting for a condition is the test's own verdict ("expected ... within 30 s")
+  if (isAssertion(cause)) return false;
   const head = cause.type ? `${cause.type}: ${cause.message}` : cause.message;
   return [head, cause.rootCause, ...cause.causedBy.slice(0, 5)].some((line) => TEST_TIMEOUT.test(clip(line, 500)));
 }
@@ -296,7 +303,9 @@ export class GateRechecks {
   /**
    * The re-check a result answers, when its recheckId is the id of a result
    * triage re-checks (not a Lair re-check's id). Null: not a gate re-check's
-   * answer (the caller goes on as before).
+   * answer (the caller goes on as before). A signed result that names a
+   * re-check which can't take it is still a true result: it is kept as a
+   * plain gate result, with a note saying why it answers nothing.
    */
   link(ref: string | undefined, resultId: string, sha: string): GateLinkResult | null {
     if (!ref) return null;
@@ -310,14 +319,14 @@ export class GateRechecks {
     if (!latest) return null;
     const recheck = this.rows.latestFor(recordId, ANSWERABLE);
     const name = clip(ref, 80);
-    if (!recheck) {
-      return { ok: false, status: 409, error: `Triage's re-check of ${name} is ${latest.status}: it is not waiting for a result` };
-    }
-    if (recheck.sha !== sha) return { ok: false, status: 400, error: `The re-check of ${name} is for ${recheck.sha}, not ${sha}` };
-    if (recheck.runId && recheck.runId !== resultId) {
-      return { ok: false, status: 409, error: `The re-check of ${name} was queued as ${recheck.runId}: only that result answers it` };
-    }
-    return { ok: true, link: { recheck, origin } };
+    const plain = (why: string): GateLinkResult => ({
+      kind: "plain",
+      note: `names triage's re-check of ${name} (recheckId), but ${why}: triaged as a plain gate result, and not re-checked`,
+    });
+    if (!recheck) return plain(`that re-check is ${latest.status}, not waiting for a result`);
+    if (recheck.sha !== sha) return plain(`that re-check is for ${recheck.sha}, not ${sha}`);
+    if (recheck.runId && recheck.runId !== resultId) return plain(`that re-check was queued as ${recheck.runId}: only that result answers it`);
+    return { kind: "link", link: { recheck, origin } };
   }
 
   /** Decide on a re-check's result (in the ingest's section, after the result is recorded and flaky tests reclassified). */
@@ -367,12 +376,22 @@ export class GateRechecks {
         blocking: true,
         resolution: `re-check ${answerGate} failed the same way: escalated${real > 0 ? " as a real failure" : ""}`,
       });
+      // The same network failure twice at one commit (connection refused, unable to connect: a port or a host the
+      // change may have moved) is as likely the change as the environment: the author hears of it, and real is advised
+      const network = updated.causes.filter(
+        (c) => r.signatures.includes(c.cause.signature) && c.verdict.class === "infra" && c.verdict.infraKind === "network",
+      );
       host.action(target, "recheck", "failed", `re-check ${r.attempt} (${r.kind}) failed the same way (result ${answerGate}): escalated`);
-      this.escalate(r.rootId, origin, `failed the same way on triage's re-check (result ${answerGate})`, s);
-      // Its code causes go back to the author now (the re-check's own result is not routed again)
-      const code = updated.causes.filter((c) => c.verdict.class === "code");
-      if (code.length > 0 && host.settings.actions.code === "route") {
-        host.routeToAuthor(updated, code, s, `it failed the same way on triage's re-check (result ${answerGate})`);
+      this.escalate(r.rootId, origin, `failed the same way on triage's re-check (result ${answerGate})`, s, network.length > 0);
+      // Its code causes (and a network failure) go back to the author now (the re-check's own result is not routed again)
+      const toAuthor = [...updated.causes.filter((c) => c.verdict.class === "code"), ...network];
+      if (toAuthor.length > 0 && host.settings.actions.code === "route") {
+        host.routeToAuthor(
+          updated,
+          toAuthor,
+          s,
+          `it failed the same way on triage's re-check (result ${answerGate})${network.length > 0 ? "; the same network failure twice at one commit may be the change" : ""}`,
+        );
       }
       s.events.push({ type: "triage.recheck_escalated", data: { recheck: this.rows.get(r.id), answerId } });
       return;
@@ -469,11 +488,20 @@ export class GateRechecks {
    * differently): plan a re-check, record why not, or null when
    * triage.recheck.mode is off.
    */
-  plan(record: TriageRecord, classified: ClassifiedCause[], link: GateLink | null, loadPerCore: number | undefined, s: Section): GatePlan | null {
+  plan(
+    record: TriageRecord,
+    classified: ClassifiedCause[],
+    link: GateLink | null,
+    loadPerCore: number | undefined,
+    s: Section,
+    /** It named a re-check that could not take it (GateLinkResult plain): recorded, never re-checked itself */
+    plain?: string,
+  ): GatePlan | null {
     const cfg = this.cfg;
     if (cfg.mode === "off" || !cfg.command) return null;
     const { host } = this;
     const target = { recordId: record.id };
+    if (plain) return { text: "not re-checked: it named a re-check that was not waiting for it", holdRoute: false };
     const rootId = link?.recheck.rootId ?? record.id;
     const chain = this.rows.forRoot(rootId);
     // Escalated: the failure it re-checked went back to its author, so this result is not routed again
@@ -586,7 +614,7 @@ export class GateRechecks {
       `re-check ${n}, ${detail}${cfg.cooldownSeconds > 0 ? `, after a ${cfg.cooldownSeconds} s cool-down` : ""}`,
       built.argv,
     );
-    if (cfg.cooldownSeconds === 0) this.schedule(row.id, s);
+    // pump() runs it, in this same section (pumpSync), once its cool-down is over and max_pending has room
     return { text: `re-check ${n} (${kind}) in the gate system`, holdRoute };
   }
 
@@ -605,14 +633,26 @@ export class GateRechecks {
     return { text: `not re-checked: ${why}`, holdRoute: false };
   }
 
-  /** One decision per chain (the store's claim dedupes it): the owner answers fix-environment or real, rerun, or ignore. */
-  private escalate(rootId: string, failure: TriageRecord, why: string, s: Section): void {
+  /**
+   * One decision per chain (the store's claim dedupes it): the owner answers real or fix-environment, rerun, or
+   * ignore. `network`: the same network failure twice at one commit, so real is advised (and offered first).
+   */
+  private escalate(rootId: string, failure: TriageRecord, why: string, s: Section, network = false): void {
     const { host } = this;
     const cfg = this.cfg;
     const chain = this.rows.forRoot(rootId).filter((r) => r.status !== "refused");
     const left = cfg.maxPerResult - chain.length;
     const root = host.store.getRecord(rootId) ?? failure;
     const infra = chain.some((r) => r.causes.includes("infra"));
+    const real = {
+      id: "real",
+      label: "Treat it as a real failure",
+      consequences: network
+        ? "It stays blocking, and the author checks the change (a host, a port, a connection setting)"
+        : "It stays blocking, and the author fixes it",
+    };
+    const environment = { id: "fix-environment", label: "Fix the environment", consequences: "Nothing more runs; run the gate again once it is fixed" };
+    const first = network ? [real, environment] : infra ? [environment] : [real];
     host.raiseDecision({ recordId: failure.id }, s, {
       project: host.project,
       subject: `recheck:${rootId}`,
@@ -626,16 +666,16 @@ export class GateRechecks {
         `Re-checks: ${chain.map((r) => `#${r.attempt} ${r.kind} ${r.status}`).join("; ") || "none"}.`,
       ],
       options: [
-        infra
-          ? { id: "fix-environment", label: "Fix the environment", consequences: "Nothing more runs; run the gate again once it is fixed" }
-          : { id: "real", label: "Treat it as a real failure", consequences: "It stays blocking, and the author fixes it" },
+        ...first,
         ...(left > 0
           ? [{ id: "rerun", label: "Re-check once more", consequences: `One more re-check (${left} left of max_per_result ${cfg.maxPerResult})` }]
           : []),
         { id: "ignore", label: "Ignore", consequences: "Nothing more runs" },
       ],
-      recommended: infra ? "fix-environment" : "real",
-      why: "Lair re-checks a failure that looks like infrastructure or load; one that fails the same way again, or keeps failing, is not that.",
+      recommended: first[0].id,
+      why: network
+        ? "The same network failure twice at the same commit is as likely the change (a host, a port, a setting) as the machine."
+        : "Lair re-checks a failure that looks like infrastructure or load; one that fails the same way again, or keeps failing, is not that.",
     });
   }
 
@@ -720,6 +760,9 @@ export class GateRechecks {
     const waiting = this.rows.withStatus(project, ["waiting"]);
     if (waiting.length === 0) return;
     const blocked = this.blocked();
+    // max_pending: re-checks running or queued in the gate system, and the ones this process is about to run
+    let taken = this.inGateSystem() + waiting.filter((r) => this.scheduled.has(r.id)).length;
+    const full = `waiting: max_pending (${this.cfg.maxPending}) re-checks are running or queued in the gate system`;
     for (const r of waiting) {
       if (blocked) {
         this.rows.update(r.id, { status: "would", detail: `${r.detail} (not run: ${blocked})` });
@@ -727,8 +770,19 @@ export class GateRechecks {
         s.events.push({ type: "triage.recheck_would", data: { recheck: this.rows.get(r.id) } });
         continue;
       }
-      if ((this.rows.times(r.id)?.notBeforeMs ?? now) <= now) this.schedule(r.id, s);
+      if (this.scheduled.has(r.id) || (this.rows.times(r.id)?.notBeforeMs ?? now) > now) continue;
+      if (taken >= this.cfg.maxPending) {
+        if (!r.detail.endsWith(full)) this.rows.update(r.id, { detail: `${r.detail}; ${full}` });
+        continue;
+      }
+      taken++;
+      this.schedule(r.id, s);
     }
+  }
+
+  /** Re-checks the gate system holds now: their command running, or queued there. */
+  private inGateSystem(): number {
+    return this.rows.withStatus(this.host.project, ["running", "queued"]).length;
   }
 
   private schedule(id: string, s: Section): void {
@@ -746,6 +800,7 @@ export class GateRechecks {
           const r = this.rows.get(id);
           const times = this.rows.times(id);
           if (!r || !times || !r.argv || r.status !== "waiting" || this.blocked() || times.notBeforeMs > host.now()) return null;
+          if (this.inGateSystem() >= this.cfg.maxPending) return null;
           this.rows.update(id, { status: "running", startedMs: host.now() });
           this.running.add(id);
           return r;

@@ -631,12 +631,11 @@ export class TriageService {
     let recheck: Recheck | null = null;
     // A re-check in the project's own gate system names the result it re-checks (gate-recheck.ts)
     const gateLink = this.gateRechecks.link(context.recheckId, result.id, sha);
-    if (gateLink && !gateLink.ok) {
-      throw gateLink.status === 400 ? new TriageInputError(gateLink.error) : new TriageConflictError(gateLink.error);
-    }
-    const linked = gateLink?.ok ? gateLink.link : null;
+    const linked = gateLink?.kind === "link" ? gateLink.link : null;
+    // It named one that can't take it: still a true result, kept as a plain gate result with a note
+    const plainNote = gateLink?.kind === "plain" ? gateLink.note : undefined;
     // Without a re-check id, a result still answers the waiting re-check whose id or run id it carries
-    const recheckId = linked
+    const recheckId = gateLink
       ? undefined
       : (context.recheckId ?? store.answerableRecheck(project, [result.id, ...(runId ? [runId] : [])], sha, result.branch, ANSWERABLE)?.id);
     if (recheckId) {
@@ -765,6 +764,7 @@ export class TriageService {
       });
       if (classified.length > 0) store.insertCauses(id, classified);
       if (branchNote) this.action({ recordId: id }, "note", "recorded", branchNote);
+      if (plainNote) this.action({ recordId: id }, "note", "recorded", plainNote);
 
       // Which tests passed: listed as passed by a report, or (a gate run) failed
       // at this commit in a step this run ran and passed
@@ -794,7 +794,7 @@ export class TriageService {
 
       const record = store.getRecord(id)!;
       if (failed && purpose !== "bisect") {
-        this.act(record, classified, origin, this.gateRechecks.plan(record, classified, linked, context.loadPerCore, s), s);
+        this.act(record, classified, origin, this.gateRechecks.plan(record, classified, linked, context.loadPerCore, s, plainNote), s);
       } else if (failed) {
         store.updateRecord(id, { verdict: overallClass(classified) ?? null, blocking: false, resolution: "bisect probe" });
       }

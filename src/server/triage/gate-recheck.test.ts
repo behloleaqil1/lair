@@ -368,6 +368,21 @@ describe("which re-check, by the classification", () => {
     expect(answer.statusCode).toBe(404);
     expect((await off.app.inject({ url: "/api/triage/status" })).json().data.gateRecheck).toEqual({ mode: "off", blocked: null, pending: 0 });
   });
+
+  it("timeout signatures count only while the gate system re-checks: with mode off a TimeoutException stays code, for its author", async () => {
+    const off = await boot({ mode: "off" });
+    await post(off, result("gate-hung", sha("hg"), failedTest), [timeoutReport(["createsOrder()"])]);
+    const hung = await failure(off, "gate-hung");
+    expect(hung.record.causes[0].verdict).toMatchObject({ class: "code", rule: "new-failure" });
+    expect(hung.record).toMatchObject({ verdict: "code", blocking: true, resolution: "code: back to the author" });
+    // Infra signatures still apply with mode off: the root cause, not the top exception
+    await post(off, result("gate-refused", sha("hr"), [step("test", "failed", "ERROR: Connection to localhost:5432 refused. Check the host\n", 1)]));
+    expect((await failure(off, "gate-refused")).record.causes[0].verdict).toMatchObject({ class: "infra" });
+
+    const on = await boot({ mode: "observe" });
+    await post(on, result("gate-hung", sha("hg"), failedTest), [timeoutReport(["createsOrder()"])]);
+    expect((await failure(on, "gate-hung")).record.causes[0].verdict).toMatchObject({ class: "infra", rule: "timeout-signature:timeout-exception" });
+  });
 });
 
 describe("budget and safety", () => {
@@ -473,13 +488,20 @@ describe("the re-check's result", () => {
     const pass = (id: string, commit = S) =>
       gate({ id, sha: commit, branch: BRANCH, pipelineId: "kiro-backend-targeted", status: "passed", steps: [step("test", "passed")] });
 
-    // Not the run the command queued, or not the same commit: refused, nothing changes
+    // Not the run the command queued, or not the same commit: it answers nothing, but a signed result is kept, as a
+    // plain gate result with a note saying why
     const other = await post(b, pass("someone-elses-run"), [passing], "gate-t");
-    expect(other.statusCode).toBe(409);
-    expect(other.json().error).toBe("The re-check of gate-t was queued as run-1: only that result answers it");
-    const elsewhere = await post(b, pass("run-1", sha("t9")), [passing], "gate-t");
-    expect(elsewhere.statusCode).toBe(400);
+    expect(other.statusCode).toBe(200);
+    expect(other.json().data.record).toMatchObject({ purpose: "gate", gateId: "someone-elses-run" });
+    expect(other.json().data.actions.map((a: { kind: string; detail: string }) => a.detail)).toContain(
+      "names triage's re-check of gate-t (recheckId), but that re-check was queued as run-1: only that result answers it: triaged as a plain gate result, and not re-checked",
+    );
+    const elsewhere = await post(b, pass("run-at-t9", sha("t9")), [passing], "gate-t");
+    expect(elsewhere.json().data.actions.map((a: { detail: string }) => a.detail).join("\n")).toContain(
+      `but that re-check is for ${S}, not ${sha("t9")}`,
+    );
     expect((await failure(b, "gate-t")).record.blocking).toBe(true);
+    expect((await rechecks(b))[0].status).toBe("queued");
 
     const answer = await post(b, pass("run-1"), [passing], "gate-t");
     expect(answer.statusCode).toBe(200);
@@ -501,10 +523,13 @@ describe("the re-check's result", () => {
     expect(eventsOf(b, "triage.recheck_resolved")).toMatchObject([
       { outcome: "passed", flaky: ["OrderServiceTest#createsOrder()", "OrderServiceTest#listsOrders()"] },
     ]);
-    // Answered: a second answer is refused
+    // Answered: a second answer answers nothing (kept as a plain result)
     const again = await post(b, pass("run-1b"), [passing], "gate-t");
-    expect(again.statusCode).toBe(409);
-    expect(again.json().error).toBe("Triage's re-check of gate-t is passed: it is not waiting for a result");
+    expect(again.statusCode).toBe(200);
+    expect(again.json().data.actions.map((a: { detail: string }) => a.detail).join("\n")).toContain(
+      "but that re-check is passed, not waiting for a result",
+    );
+    expect((await rechecks(b))[0]).toMatchObject({ status: "passed", answerId: answer.json().data.record.id });
   });
 
   it("an infra failure whose same re-run passes is resolved as infrastructure, its tests not flaky", async () => {
@@ -571,10 +596,62 @@ describe("the re-check's result", () => {
     );
     expect(decisions[0]).toContain("Options: Treat it as a real failure | Re-check once more | Ignore");
     expect(eventsOf(b, "triage.recheck_escalated")).toHaveLength(1);
-    // Nothing waits for an answer now
+    // Nothing waits for an answer now: a late one is kept as a plain result, and not re-checked
     const late = await post(b, result("run-1b", S, failedTest, "kiro-backend-targeted"), [timeoutReport(["createsOrder()"])], "gate-t");
-    expect(late.statusCode).toBe(409);
+    expect(late.statusCode).toBe(200);
+    expect(late.json().data.record.resolution).toBe("infra: not re-checked: it named a re-check that was not waiting for it");
+    expect(b.runner.callsTo(PROGRAM)).toHaveLength(1);
     expect(b.decisions()).toHaveLength(1);
+  });
+
+  it("the same network failure twice at one commit: real is advised, and the author hears of it", async () => {
+    const b = await boot(
+      {},
+      { triage: { mode: "act", commands: { notify_agent: ["/opt/bin/notify", "{agent}", "{message}"] } } },
+    );
+    enqueues(b);
+    const S = sha("nw");
+    const refused = [step("lint", "passed"), step("test", "failed", "ERROR: Connection to localhost:5432 refused. Check the host and port\n", 1)];
+    await b.events.emit("gate.completed", { project: "demo", result: result("gate-db", S, refused), context: { agent: "worker-a" } });
+    await b.manager.idle();
+    expect(b.runner.callsTo(PROGRAM)[0][3]).toBe("same");
+    expect(b.runner.callsTo("/opt/bin/notify")).toEqual([]);
+    await b.events.emit("gate.completed", {
+      project: "demo",
+      result: result("run-1", S, refused),
+      context: { recheckId: "gate-db" },
+    });
+    await b.manager.idle();
+
+    const decisions = b.decisions();
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toContain("Options: Treat it as a real failure | Fix the environment | Re-check once more | Ignore (recommended: Treat it as a real failure)");
+    const notified = b.runner.callsTo("/opt/bin/notify");
+    expect(notified).toHaveLength(1);
+    expect(notified[0][1]).toBe("worker-a");
+    expect(notified[0][2]).toContain("the same network failure twice at one commit may be the change");
+    // A container runtime that is down twice is still the environment's
+    const env = await boot({});
+    enqueues(env);
+    await post(env, result("gate-docker", sha("dk"), dockerDown()));
+    await post(env, result("run-1", sha("dk"), dockerDown()), [], "gate-docker");
+    expect(env.decisions()[0]).toContain("Options: Fix the environment | Re-check once more | Ignore (recommended: Fix the environment)");
+  });
+
+  it("max_pending: no more re-checks running or queued in the gate system at once; the next waits its turn", async () => {
+    const b = await boot({ max_pending: 1 });
+    enqueues(b);
+    await post(b, result("gate-1", sha("q1"), dockerDown()));
+    await post(b, result("gate-2", sha("q2"), dockerDown()));
+    await b.tick();
+    expect(b.runner.callsTo(PROGRAM).map((a) => a[4])).toEqual(["gate-1"]);
+    const second = (await rechecks(b)).find((r) => r.gateId === "gate-2")!;
+    expect(second.status).toBe("waiting");
+    expect(second.detail).toContain("waiting: max_pending (1) re-checks are running or queued in the gate system");
+    // gate-1's re-check answers: gate-2's runs
+    await post(b, gate({ id: "run-1", sha: sha("q1"), branch: BRANCH, pipelineId: "backend", status: "passed", steps: [step("lint", "passed"), step("test", "passed")] }), [], "gate-1");
+    expect(b.runner.callsTo(PROGRAM).map((a) => a[4])).toEqual(["gate-1", "gate-2"]);
+    expect((await rechecks(b)).find((r) => r.gateId === "gate-2")?.status).toBe("queued");
   });
 });
 
@@ -684,9 +761,16 @@ describe("classified by the root cause, not the top exception", () => {
       },
     ]);
     await post(b, result("gate-compile", sha("cp"), [step("build", "failed", fixture("gradle-compile.txt"), 1)]));
+    // An assertion that waited for a condition and "timed out after": the test's own verdict, not a timeout to re-check
+    await post(b, result("gate-wait", sha("aw"), failedTest), [
+      assertionReport("com.example.shop.SearchIT", "findsItems()", "Timed out after 30 seconds waiting for the index"),
+    ]);
     expect((await failure(b, "gate-assert")).record.causes[0].verdict.class).toBe("code");
     const compile = (await failure(b, "gate-compile")).record.causes[0];
     expect(compile).toMatchObject({ cause: { kind: "build" }, verdict: { class: "code" } });
+    const wait = await failure(b, "gate-wait");
+    expect(wait.record).toMatchObject({ verdict: "code", resolution: "code: back to the author" });
+    expect(wait.gateRechecks).toEqual([]);
     expect(b.runner.callsTo(PROGRAM)).toEqual([]);
   });
 
@@ -788,6 +872,7 @@ describe("placeholders and the command", () => {
       expireHours: 3,
       kinds: { infra: "same", timeout: "failed_tests", flaky: "failed_tests" },
       maxTests: 8,
+      maxPending: 3,
     });
   });
 

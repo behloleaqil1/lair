@@ -153,7 +153,8 @@ const TrustedBody = z.object({
       changedFiles: z.array(z.string().min(1).max(1000)).max(10_000).optional(),
       agent: z.string().regex(AGENT, "not an agent id").optional(),
       pr: z.number().int().positive().optional(),
-      recheckId: z.string().regex(UUID, "not a re-check id").optional(),
+      // A Lair re-check's id, or the id of the result a gate system re-checks (gate-recheck.ts)
+      recheckId: z.string().regex(GATE_ID, "not a re-check id or a gate result id").optional(),
       runId: z.string().min(1).max(300).optional(),
       loadPerCore: z.number().min(0).optional(),
     })

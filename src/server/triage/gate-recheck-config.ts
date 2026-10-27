@@ -33,6 +33,8 @@ export const GATE_RECHECK_KEYS = {
     .strict()
     .default({}),
   max_tests: z.number().int().min(1).max(100).default(8),
+  /** Project-wide: at most this many re-checks running or queued in the gate system at once; more wait their turn */
+  max_pending: z.number().int().min(1).max(50).default(3),
 };
 
 const GateRecheckSchema = z.object(GATE_RECHECK_KEYS);
@@ -47,6 +49,7 @@ export interface GateRecheckSettings {
   expireHours: number;
   kinds: { infra: GateRecheckKindSetting; timeout: GateRecheckKindSetting; flaky: GateRecheckKindSetting };
   maxTests: number;
+  maxPending: number;
 }
 
 /** The settings, or config errors in `errors`. */
@@ -77,5 +80,6 @@ export function parseGateRecheck(raw: RawGateRecheck, errors: string[]): GateRec
     expireHours: raw.expire_hours,
     kinds: { infra: raw.kinds.infra, timeout: raw.kinds.timeout, flaky: raw.kinds.flaky },
     maxTests: raw.max_tests,
+    maxPending: raw.max_pending,
   };
 }
