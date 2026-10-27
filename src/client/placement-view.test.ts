@@ -58,10 +58,13 @@ function status(overrides: Partial<PlacementStatus> = {}): PlacementStatus {
 
 describe("placement view", () => {
   it("shows the advice, or why a job stays", () => {
-    const advice = { to: "remote", gainSeconds: 34 * 60, explanation: "x", quiet: false };
+    const advice = { to: "remote", gainSeconds: 34 * 60, explanation: "x", quiet: false, stuck: false };
     expect(adviceText(job({ advice }), "observe")).toBe("would move to remote: −34 min");
     expect(adviceText(job({ advice: { ...advice, gainSeconds: -12 * 60, quiet: true } }), "observe")).toBe(
       "would move to remote: +12 min (quiet re-check)",
+    );
+    expect(adviceText(job({ advice: { ...advice, gainSeconds: 0, stuck: true } }), "act")).toBe(
+      "moving to remote: heavy never runs it",
     );
     expect(adviceText(job({ held: "taken by the quick lane" }), "act")).toBe("taken by the quick lane");
     expect(adviceText(undefined, "act")).toBe("-");

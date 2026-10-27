@@ -11,7 +11,11 @@ import { dirname } from "path";
 import { randomUUID } from "crypto";
 import type { PlacementMove, PlacementMoveStatus } from "../../shared/placement-types.js";
 
-const SCHEMA_VERSION = 1;
+// 2: placement_samples.rc (the run's exit code; NULL for a sample learned by version 1)
+const SCHEMA_VERSION = 2;
+
+/** Version 1 to 2, on a file made by version 1 */
+const MIGRATE_1_TO_2 = `ALTER TABLE placement_samples ADD COLUMN rc INTEGER;`;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS placement_moves (
@@ -57,6 +61,7 @@ const SCHEMA = `
     factor REAL,
     finished_at INTEGER NOT NULL,
     source TEXT NOT NULL,
+    rc INTEGER,
     PRIMARY KEY (project, gate_id)
   );
   CREATE INDEX IF NOT EXISTS idx_pl_samples ON placement_samples(project, finished_at);
@@ -121,6 +126,8 @@ export interface Sample {
   factor: number | null;
   finishedAt: number;
   source: "observed" | "history";
+  /** The run's exit code (null: learned before Lair kept it) */
+  rc: number | null;
 }
 
 function toMove(row: MoveRow): StoredMove {
@@ -181,9 +188,12 @@ export class PlacementStore {
       throw new Error(`${dbPath} has schema version ${version}, newer than this Lair (${SCHEMA_VERSION})`);
     }
     if (version < SCHEMA_VERSION) {
-      // Version 1 is the first: every statement is IF NOT EXISTS, so a later version adds to it
-      this.db.exec(SCHEMA);
-      this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+      // A new file gets the whole schema; a version 1 file gets the columns added since
+      this.db.transaction(() => {
+        if (version === 1) this.db.exec(MIGRATE_1_TO_2);
+        this.db.exec(SCHEMA);
+        this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+      })();
     }
   }
 
@@ -245,18 +255,22 @@ export class PlacementStore {
   }
 
   /**
-   * When each gate was last moved or tried (act mode: moved, failed,
-   * interrupted, moving) at or after `since`. Advice (would_move) is not a move.
+   * Each gate's moves and tries (act mode: moved, failed, interrupted, gone,
+   * moving) at or after `since`, oldest first. Advice (would_move) is not a move.
    */
-  lastAttempts(project: string, since: number): Map<string, StoredMove> {
+  attemptsSince(project: string, since: number): Map<string, StoredMove[]> {
     const rows = this.db
       .prepare(
         `SELECT * FROM placement_moves WHERE project = ? AND mode = 'act' AND status != 'would_move'
-           AND created_at >= ? ORDER BY created_at`,
+           AND created_at >= ? ORDER BY created_at, rowid`,
       )
       .all(project, since) as MoveRow[];
-    const out = new Map<string, StoredMove>();
-    for (const row of rows) out.set(row.gate_id, toMove(row));
+    const out = new Map<string, StoredMove[]>();
+    for (const row of rows) {
+      const list = out.get(row.gate_id) ?? [];
+      list.push(toMove(row));
+      out.set(row.gate_id, list);
+    }
     return out;
   }
 
@@ -317,19 +331,30 @@ export class PlacementStore {
 
   // ============ SAMPLES ============
 
-  hasSample(project: string, gateId: string): boolean {
+  /** True when the gate id has a sample of a run that passed (rc 0): nothing better can replace it. */
+  hasPassedSample(project: string, gateId: string): boolean {
     return (
-      this.db.prepare(`SELECT 1 FROM placement_samples WHERE project = ? AND gate_id = ?`).get(project, gateId) !==
-      undefined
+      this.db
+        .prepare(`SELECT 1 FROM placement_samples WHERE project = ? AND gate_id = ? AND rc = 0`)
+        .get(project, gateId) !== undefined
     );
   }
 
-  /** Learn one finished run; a gate id learned before is kept as it was. */
-  addSample(project: string, sample: Sample): void {
-    this.db
+  /**
+   * Learn one finished run. One sample per gate id: a later run of the same
+   * id replaces it only when that run passed (rc 0) and the kept one did not
+   * (or has no rc), so a fragment (a run killed early, then re-queued under
+   * the same id) gives way to the full run. Returns whether it was stored.
+   */
+  addSample(project: string, sample: Sample): boolean {
+    const result = this.db
       .prepare(
-        `INSERT OR IGNORE INTO placement_samples (project, gate_id, class, machine, seconds, factor, finished_at, source)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO placement_samples (project, gate_id, class, machine, seconds, factor, finished_at, source, rc)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(project, gate_id) DO UPDATE SET class = excluded.class, machine = excluded.machine,
+           seconds = excluded.seconds, factor = excluded.factor, finished_at = excluded.finished_at,
+           source = excluded.source, rc = excluded.rc
+         WHERE excluded.rc = 0 AND (placement_samples.rc IS NULL OR placement_samples.rc != 0)`,
       )
       .run(
         project,
@@ -340,7 +365,9 @@ export class PlacementStore {
         sample.factor,
         sample.finishedAt,
         sample.source,
+        sample.rc,
       );
+    return result.changes > 0;
   }
 
   /** The newest samples first, at most `limit`. */
@@ -355,6 +382,7 @@ export class PlacementStore {
       factor: number | null;
       finished_at: number;
       source: string;
+      rc: number | null;
     }[];
     return rows.map((r) => ({
       gateId: r.gate_id,
@@ -364,6 +392,7 @@ export class PlacementStore {
       factor: r.factor,
       finishedAt: r.finished_at,
       source: r.source === "observed" ? "observed" : "history",
+      rc: r.rc,
     }));
   }
 

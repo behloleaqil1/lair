@@ -40,9 +40,9 @@ import {
   type PlacementSettings,
 } from "./config.js";
 import { classify, readQueue, type QueueJob } from "./queue.js";
-import { median, readResult, readRunnerLog, runnerLogPath } from "./history.js";
+import { SampleIndex, readResult, readRunnerLog, runnerLogPath } from "./history.js";
 import { decide, planAll, servingLane, type Candidate, type DurationFn, type ModelJob, type ModelLane, type Plan } from "./estimate.js";
-import { PlacementStore, moveForApi, type StoredMove } from "./store.js";
+import { PlacementStore, moveForApi, type Sample, type StoredMove } from "./store.js";
 import { systemPlacementProbes, type CommandOutput, type PlacementProbes } from "./probes.js";
 
 /** The first bytes of a probe's or load command's output that are read */
@@ -53,8 +53,15 @@ const RUN_FORGET_MS = 6 * 3_600_000;
 const MAX_CTIME_AGE_MS = 7 * 86_400_000;
 /** A result written this much before a run's start is an older run's */
 const RESULT_SKEW_MS = 5 * 60_000;
-/** History ids looked at before the set is cleared (each is looked at once per process) */
+/** History lines looked at before the set is cleared (each is looked at once per process) */
 const MAX_HISTORY_IDS = 20_000;
+/** A runner log line and the result it describes are written within this of each other */
+const HISTORY_SKEW_MS = 10 * 60_000;
+/** A failed run shorter than this share of its class's usual time is a fragment, not learned */
+const FRAGMENT_SHARE = 0.5;
+const DAY_MS = 86_400_000;
+/** The longest history of moves read for the cool-downs (moves are kept 30 days) */
+const MAX_ATTEMPT_WINDOW_MS = 30 * DAY_MS;
 const OUTPUT_TAIL = 500;
 /** Moves shown in the status */
 const RECENT_MOVES = 20;
@@ -136,6 +143,8 @@ export class Placement {
   private lastTickAt: number | null = null;
   private historyChecked = new Set<string>();
   private historyMark: string | null = null;
+  /** Jobs the per-job cap holds, already reported (placement.job_held) */
+  private heldReported = new Set<string>();
   private recovered = false;
   private snapshot: Snapshot | null = null;
   private timer: NodeJS.Timeout | null = null;
@@ -212,6 +221,8 @@ export class Placement {
           this.run(m.probe, timeoutMs),
           m.loadCmd ? this.run(m.loadCmd, timeoutMs) : Promise.resolve(null),
         ]);
+        // A stop (or a reload) cut the probe short: that says nothing about the machine
+        if (this.abort.signal.aborted) return;
         await this.updateMachine(m, probe, load, now);
       }),
     );
@@ -276,8 +287,29 @@ export class Placement {
 
   // ============ 3. LEARNING ============
 
+  /**
+   * Learn one finished run (store.addSample keeps one sample per gate id). A
+   * run that failed (rc not 0) in less than half the time its class usually
+   * takes on that machine (the median of passed runs there, else on any
+   * machine) is a fragment: a preflight that failed, a run killed when its
+   * machine went away. It is not learned.
+   */
+  private learn(index: SampleIndex, sample: Sample): void {
+    if (sample.rc !== 0) {
+      const usual = index.reference(sample.class, sample.machine);
+      if (usual !== null && sample.seconds < usual * FRAGMENT_SHARE) return;
+    }
+    if (this.store.addSample(this.project, sample)) index.addNewest(sample);
+  }
+
+  private sampleIndex(): SampleIndex {
+    const index = new SampleIndex(this.settings.history.samples);
+    for (const s of this.store.recentSamples(this.project)) index.add(s);
+    return index;
+  }
+
   /** Track the running jobs; a run that ended with a result becomes a duration sample. */
-  private observeRuns(queue: QueueJob[], now: number): void {
+  private observeRuns(queue: QueueJob[], now: number, index: SampleIndex): void {
     const { store, project } = this;
     const runs = new Map(store.runs(project).map((r) => [r.gateId, r] as const));
     const queued = new Set(queue.filter((j) => j.status === "queued").map((j) => j.id));
@@ -331,7 +363,7 @@ export class Placement {
           else seconds = null;
         }
         if (seconds !== null && seconds > 0) {
-          store.addSample(project, {
+          this.learn(index, {
             gateId: run.gateId,
             class: run.class,
             machine: run.machine,
@@ -339,6 +371,7 @@ export class Placement {
             factor: run.loadSamples > 0 ? run.loadSum / run.loadSamples : null,
             finishedAt: result.finishedAtMs,
             source: "observed",
+            rc: result.rc,
           });
         }
         store.deleteRun(project, run.gateId);
@@ -348,8 +381,14 @@ export class Placement {
     }
   }
 
-  /** Learn the runner log's finished runs that Lair did not see (each id once). */
-  private learnHistory(): void {
+  /**
+   * Learn the runner log's finished runs that Lair did not see, each line
+   * once. An id can have several lines (a run killed, then re-queued under
+   * the same id); its result files hold its latest run only, so a line is
+   * learned only when the result agrees with it (the same rc, written within
+   * a few minutes of the line).
+   */
+  private learnHistory(index: SampleIndex): void {
     const history = this.settings.history;
     if (!history.runnerLog) return;
     const path = runnerLogPath(this.gatesDir, history.runnerLog);
@@ -360,13 +399,16 @@ export class Placement {
     this.historyMark = mark;
     if (this.historyChecked.size > MAX_HISTORY_IDS) this.historyChecked.clear();
     for (const line of readRunnerLog(this.probes.files, path, history.columns)) {
-      if (this.historyChecked.has(line.id)) continue;
-      this.historyChecked.add(line.id);
+      const key = `${line.id}\t${line.lane}\t${line.rc}\t${line.atMs ?? ""}`;
+      if (this.historyChecked.has(key)) continue;
+      this.historyChecked.add(key);
       const lane = this.laneOf(line.lane);
-      if (!lane || this.store.hasSample(this.project, line.id)) continue;
+      if (!lane || this.store.hasPassedSample(this.project, line.id)) continue;
       const result = readResult(this.probes.files, this.gatesDir, line.id, history.durationPattern);
       if (!result || result.logSeconds === null || result.logSeconds <= 0) continue;
-      this.store.addSample(this.project, {
+      if (result.rc !== line.rc) continue;
+      if (line.atMs !== null && Math.abs(result.finishedAtMs - line.atMs) > HISTORY_SKEW_MS) continue;
+      this.learn(index, {
         gateId: line.id,
         class: classify(line.command, this.settings.classes) ?? "",
         machine: lane.machine,
@@ -374,13 +416,15 @@ export class Placement {
         factor: null,
         finishedAt: result.finishedAtMs,
         source: "history",
+        rc: line.rc,
       });
     }
   }
 
   /**
-   * Expected durations: the median of the newest `history.samples` runs of
-   * the class on the machine, else of the class on any machine, else of any
+   * Expected durations (SampleIndex.base): the median of the newest
+   * `history.samples` passed runs of the class on the machine, else on any
+   * machine, else of all its runs there, else on any machine, else of any
    * class on the machine, else `default_seconds`. A machine loaded above its
    * usual load while it runs gates runs them slower: the median is
    * multiplied by max(1, load factor now ÷ usual load factor), where the
@@ -388,38 +432,12 @@ export class Placement {
    * (1 until it has some).
    */
   private durations(): DurationModel {
-    const n = this.settings.history.samples;
-    const samples = this.store.recentSamples(this.project);
-    const push = (map: Map<string, number[]>, key: string, value: number) => {
-      const list = map.get(key) ?? [];
-      if (list.length < n) list.push(value);
-      map.set(key, list);
+    const index = this.sampleIndex();
+    const adjust = (machine: string) => Math.max(1, this.factor(machine) / index.usualFactor(machine));
+    return {
+      fn: (cls, machine) => (index.base(cls ?? "", machine) ?? this.settings.defaultSeconds) * adjust(machine),
+      table: index.table(),
     };
-    const byKey = new Map<string, number[]>();
-    const byClass = new Map<string, number[]>();
-    const byMachine = new Map<string, number[]>();
-    const factors = new Map<string, number[]>();
-    for (const s of samples) {
-      push(byKey, `${s.class}\u0000${s.machine}`, s.seconds);
-      push(byClass, s.class, s.seconds);
-      push(byMachine, s.machine, s.seconds);
-      if (s.factor !== null) push(factors, s.machine, s.factor);
-    }
-    const base = (cls: string, machine: string) =>
-      median(byKey.get(`${cls}\u0000${machine}`) ?? []) ??
-      median(byClass.get(cls) ?? []) ??
-      median(byMachine.get(machine) ?? []) ??
-      this.settings.defaultSeconds;
-    const adjust = (machine: string) => {
-      const usual = Math.max(1, median(factors.get(machine) ?? []) ?? 1);
-      return Math.max(1, this.factor(machine) / usual);
-    };
-    const table: PlacementDuration[] = [...byKey.entries()].map(([key, values]) => {
-      const [cls, machine] = key.split("\u0000");
-      return { class: cls, machine, medianSeconds: Math.round(median(values) ?? 0), samples: values.length };
-    });
-    table.sort((a, b) => a.class.localeCompare(b.class) || a.machine.localeCompare(b.machine));
-    return { fn: (cls, machine) => base(cls ?? "", machine) * adjust(machine), table };
   }
 
   // ============ 4. THE MODEL ============
@@ -459,7 +477,7 @@ export class Placement {
   }
 
   /** Why a queued job stays where it is, or null. */
-  private heldReason(job: ModelJob, attempts: Map<string, StoredMove>, now: number): string | null {
+  private heldReason(job: ModelJob, attempts: Map<string, StoredMove[]>, now: number): string | null {
     if (job.status !== "queued") return null;
     if (job.runsOn !== job.lane) return `taken by the ${job.runsOn} lane`;
     const lane = this.laneOf(job.lane);
@@ -469,9 +487,15 @@ export class Placement {
     if (machine?.state !== "up") {
       return `${lane.machine} is ${machine?.state === "starting" ? "not up long enough yet" : (machine?.state ?? "unknown")}: its own fallback is in charge`;
     }
-    const last = attempts.get(job.id);
+    const list = attempts.get(job.id) ?? [];
+    const recent = list.filter((m) => m.createdAt >= now - DAY_MS).length;
+    if (recent >= this.settings.maxMovesPerJob) {
+      return `moved or tried ${recent} times in 24 h: held (max_moves_per_job is ${this.settings.maxMovesPerJob})`;
+    }
+    const last = list[list.length - 1];
     if (last) {
-      const until = last.createdAt + this.settings.cooldownSeconds * 1000;
+      // The cool-down doubles with every earlier move of the job in 24 hours
+      const until = last.createdAt + this.cooldownMs(Math.max(0, recent - 1));
       if (until > now) {
         const what = last.status === "moved" ? `moved ${last.from}→${last.to}` : `move ${last.status}`;
         return `${what}; cool-down for ${formatSpan(until - now)}`;
@@ -481,12 +505,45 @@ export class Placement {
     return null;
   }
 
+  /** The cool-down after a move that had `earlier` moves of the same job before it in 24 hours. */
+  private cooldownMs(earlier: number): number {
+    return this.settings.cooldownSeconds * 1000 * 2 ** earlier;
+  }
+
+  /** The moves and tries recent enough to hold a job (24 hours, or the longest cool-down). */
+  private attempts(now: number): Map<string, StoredMove[]> {
+    const window = Math.min(MAX_ATTEMPT_WINDOW_MS, Math.max(DAY_MS, this.cooldownMs(this.settings.maxMovesPerJob - 1)));
+    return this.store.attemptsSince(this.project, now - window);
+  }
+
+  /** Report each job the per-job cap holds, once while it is held. */
+  private async reportHeld(jobs: ModelJob[], attempts: Map<string, StoredMove[]>, now: number): Promise<void> {
+    const held = new Set<string>();
+    for (const job of jobs) {
+      if (job.status !== "queued") continue;
+      const recent = (attempts.get(job.id) ?? []).filter((m) => m.createdAt >= now - DAY_MS).length;
+      if (recent < this.settings.maxMovesPerJob) continue;
+      held.add(job.id);
+      if (this.heldReported.has(job.id)) continue;
+      this.heldReported.add(job.id);
+      await this.events?.emit("placement.job_held", {
+        project: this.project,
+        gateId: job.id,
+        lane: job.lane,
+        moves: recent,
+        reason: `moved or tried ${recent} times in 24 h (max_moves_per_job is ${this.settings.maxMovesPerJob}): placement leaves it where it is`,
+      });
+    }
+    for (const id of [...this.heldReported]) if (!held.has(id)) this.heldReported.delete(id);
+  }
+
   private explain(c: Candidate, verb: string, now: number): string {
     const from = this.laneOf(c.from);
     const to = this.laneOf(c.to);
     const fromMachine = from?.machine ?? c.from;
     const toMachine = to?.machine ?? c.to;
     const parts: string[] = [];
+    if (c.stuck) parts.push(`${c.from} never runs ${c.job.class ?? "it"}`);
     if (c.quiet) {
       const fu = this.utilization(fromMachine);
       const tu = this.utilization(toMachine);
@@ -509,7 +566,9 @@ export class Placement {
   /** A request of `id` in `lane` (queued or already claimed there). */
   private landed(lane: string, priority: number, id: string): boolean {
     const dir = join(this.gatesDir, "queue");
-    return [".req", ".req.run"].some((suffix) => this.probes.files.stat(join(dir, `${lane}.${priority}.${id}${suffix}`)) !== null);
+    return [".req", ".req.run"].some(
+      (suffix) => this.probes.files.stat(join(dir, `${lane}.${priority}.${id}${suffix}`))?.isFile === true,
+    );
   }
 
   private moveVars(c: Candidate): Record<string, string> {
@@ -620,16 +679,20 @@ export class Placement {
     const summary: PlacementTick = { at: new Date(now).toISOString(), moves: 0, wouldMoves: 0, failures: 0 };
 
     await this.probeMachines(now);
+    // Stopping (or reloading): a probe cut short is no evidence, so nothing is decided on it
+    if (this.abort.signal.aborted) return summary;
     let queue = readQueue(probes.files, this.gatesDir, settings);
     if (!this.recovered) {
       this.recoverMoves(queue, now);
       this.recovered = true;
     }
-    this.observeRuns(queue, now);
-    this.learnHistory();
+    const learned = this.sampleIndex();
+    this.observeRuns(queue, now, learned);
+    this.learnHistory(learned);
     const durations = this.durations();
     let { lanes, jobs } = this.model(queue, now);
-    let attempts = store.lastAttempts(project, now - settings.cooldownSeconds * 1000);
+    let attempts = this.attempts(now);
+    await this.reportHeld(jobs, attempts, now);
 
     const decision = decide({
       now,
@@ -660,14 +723,20 @@ export class Placement {
       if (summary.moves > 0 || summary.failures > 0) {
         queue = readQueue(probes.files, this.gatesDir, settings);
         ({ lanes, jobs } = this.model(queue, now));
-        attempts = store.lastAttempts(project, now - settings.cooldownSeconds * 1000);
+        attempts = this.attempts(now);
         plan = planAll(now, lanes, jobs, durations.fn);
       }
     } else {
       const current = new Set<string>();
       for (const c of decision.moves) {
         const explanation = this.explain(c, "would move", now);
-        advice.set(c.job.id, { to: c.to, gainSeconds: Math.round(c.gainSeconds), explanation, quiet: c.quiet });
+        advice.set(c.job.id, {
+          to: c.to,
+          gainSeconds: Math.round(c.gainSeconds),
+          explanation,
+          quiet: c.quiet,
+          stuck: c.stuck,
+        });
         current.add(c.job.id);
         const key = `${c.from}>${c.to}`;
         if (this.advice.get(c.job.id) === key) continue;
@@ -707,7 +776,7 @@ export class Placement {
     jobs: ModelJob[],
     plan: Plan,
     advice: Map<string, PlacementAdvice>,
-    attempts: Map<string, StoredMove>,
+    attempts: Map<string, StoredMove[]>,
     durations: PlacementDuration[],
     now: number,
   ): Snapshot {

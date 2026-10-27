@@ -121,3 +121,107 @@ export function median(values: readonly number[]): number | null {
   const mid = Math.floor(sorted.length / 2);
   return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
+
+/** One learned run, as the index needs it. */
+export interface IndexedSample {
+  class: string;
+  machine: string;
+  seconds: number;
+  /** The load factor while it ran, when measured */
+  factor: number | null;
+  /** Its exit code; null for a sample learned before rc was kept */
+  rc: number | null;
+}
+
+export interface DurationRow {
+  class: string;
+  machine: string;
+  medianSeconds: number;
+  samples: number;
+}
+
+/**
+ * The newest `n` samples per class and machine (and per class, per machine),
+ * passed runs (rc 0) apart from all runs: durations come from passed runs
+ * when there are any, so a failed run's time counts only while nothing
+ * better is known.
+ */
+export class SampleIndex {
+  private passed = new Map<string, number[]>();
+  private passedClass = new Map<string, number[]>();
+  private all = new Map<string, number[]>();
+  private allClass = new Map<string, number[]>();
+  private allMachine = new Map<string, number[]>();
+  private factors = new Map<string, number[]>();
+
+  constructor(private n: number) {}
+
+  private static key(cls: string, machine: string): string {
+    return `${cls}\u0000${machine}`;
+  }
+
+  private put(map: Map<string, number[]>, key: string, value: number, newest: boolean): void {
+    const list = map.get(key) ?? [];
+    if (newest) {
+      list.unshift(value);
+      if (list.length > this.n) list.length = this.n;
+    } else if (list.length < this.n) {
+      list.push(value);
+    }
+    map.set(key, list);
+  }
+
+  private insert(s: IndexedSample, newest: boolean): void {
+    const key = SampleIndex.key(s.class, s.machine);
+    if (s.rc === 0) {
+      this.put(this.passed, key, s.seconds, newest);
+      this.put(this.passedClass, s.class, s.seconds, newest);
+    }
+    this.put(this.all, key, s.seconds, newest);
+    this.put(this.allClass, s.class, s.seconds, newest);
+    this.put(this.allMachine, s.machine, s.seconds, newest);
+    if (s.factor !== null) this.put(this.factors, s.machine, s.factor, newest);
+  }
+
+  /** Add samples newest first (as the store lists them). */
+  add(s: IndexedSample): void {
+    this.insert(s, false);
+  }
+
+  /** Add one just learned: newer than all the others. */
+  addNewest(s: IndexedSample): void {
+    this.insert(s, true);
+  }
+
+  /** What a run of the class usually takes on the machine: passed runs there, else on any machine. */
+  reference(cls: string, machine: string): number | null {
+    return median(this.passed.get(SampleIndex.key(cls, machine)) ?? []) ?? median(this.passedClass.get(cls) ?? []);
+  }
+
+  /** The expected duration before load, or null when nothing is learned. */
+  base(cls: string, machine: string): number | null {
+    const key = SampleIndex.key(cls, machine);
+    return (
+      median(this.passed.get(key) ?? []) ??
+      median(this.passedClass.get(cls) ?? []) ??
+      median(this.all.get(key) ?? []) ??
+      median(this.allClass.get(cls) ?? []) ??
+      median(this.allMachine.get(machine) ?? [])
+    );
+  }
+
+  /** The machine's usual load factor while running gates (at least 1). */
+  usualFactor(machine: string): number {
+    return Math.max(1, median(this.factors.get(machine) ?? []) ?? 1);
+  }
+
+  /** Per class and machine: the median used (passed runs when there are any) and how many runs it is of. */
+  table(): DurationRow[] {
+    const rows = [...this.all.entries()].map(([key, values]) => {
+      const [cls, machine] = key.split("\u0000");
+      const used = this.passed.get(key) ?? values;
+      return { class: cls, machine, medianSeconds: Math.round(median(used) ?? 0), samples: used.length };
+    });
+    return rows.sort((a, b) => a.class.localeCompare(b.class) || a.machine.localeCompare(b.machine));
+  }
+}

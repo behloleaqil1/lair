@@ -270,7 +270,8 @@ export type EventType =
   | "placement.would_move"
   | "placement.move_failed"
   | "placement.machine_up"
-  | "placement.machine_down";
+  | "placement.machine_down"
+  | "placement.job_held";
 
 /** Event stored in the database */
 export interface Event {

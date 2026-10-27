@@ -42,6 +42,7 @@ export function adviceText(job: PlacementJob | undefined, mode: PlacementStatus[
   if (!job) return "-";
   if (job.advice) {
     const verb = mode === "act" ? "moving to" : "would move to";
+    if (job.advice.stuck) return `${verb} ${job.advice.to}: ${job.lane} never runs it`;
     const quiet = job.advice.quiet ? " (quiet re-check)" : "";
     // A quiet re-check may finish later on the quieter machine: "+12 min"
     const sign = job.advice.gainSeconds >= 0 ? "−" : "+";

@@ -30,6 +30,7 @@ describe("placement config", () => {
       maxMovesPerTick: 2,
       minGainSeconds: 600,
       cooldownSeconds: 1800,
+      maxMovesPerJob: 3,
       commandLine: 1,
     });
     expect(parsed.settings.machines[0]).toMatchObject({ id: "a", minUpSeconds: 240 });

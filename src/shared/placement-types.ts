@@ -49,6 +49,8 @@ export interface PlacementAdvice {
   explanation: string;
   /** A quiet re-check (prefer_quiet): placed by load, not by finish time */
   quiet: boolean;
+  /** Its own lane never runs its class (a limit of 0 there): gainSeconds is 0, any lane that can is better */
+  stuck: boolean;
 }
 
 export interface PlacementJob {

@@ -16,10 +16,12 @@ import {
   readdirSync,
   renameSync,
   rmSync,
+  symlinkSync,
   unlinkSync,
   utimesSync,
   writeFileSync,
 } from "fs";
+import Database from "better-sqlite3";
 import { tmpdir } from "os";
 import { join } from "path";
 import Fastify from "fastify";
@@ -31,6 +33,7 @@ import { ExecFileRunner, type CommandOutput, type CommandRunner, type RunOptions
 import { PlacementManager, type Placement } from "./service.js";
 import { NodeQueueFiles, type PlacementProbes } from "./probes.js";
 import { registerPlacementRoutes } from "./routes.js";
+import { PlacementStore } from "./store.js";
 
 // ============ BOUNDARY FAKES ============
 
@@ -49,6 +52,8 @@ class FakeClock {
 
 interface World {
   laptopUp: boolean;
+  /** The laptop's probe answers only when the run is aborted (a stop or reload during a probe) */
+  laptopHangs?: boolean;
   /** What each machine's load command prints (null: it fails) */
   loads: Record<string, string | null>;
   mover: {
@@ -92,6 +97,13 @@ class FakeRunner implements CommandRunner {
     const ok = (stdout: string): CommandOutput => ({ code: 0, stdout, stderr: "" });
     if (cmd === "probe-workstation") return ok("");
     if (cmd === "probe-laptop") {
+      if (this.world.laptopHangs) {
+        return new Promise<CommandOutput>((resolve) => {
+          options.signal?.addEventListener("abort", () => resolve({ code: -1, stdout: "", stderr: "aborted" }), {
+            once: true,
+          });
+        });
+      }
       return this.world.laptopUp
         ? ok("ok\r\n")
         : { code: 255, stdout: "", stderr: "ssh: connect to host laptop.example port 22: Operation timed out" };
@@ -756,5 +768,292 @@ describe("placement: status route", () => {
     expect((other.json() as { data: PlacementStatus }).data).toMatchObject({ enabled: false, jobs: [] });
     const write = await app.inject({ method: "POST", url: "/api/placement/status" });
     expect(write.statusCode).toBe(404);
+  });
+});
+
+// ============ REVIEW FIXES ============
+
+/** A store file in its own temp dir, so a test can read what was learned */
+function storeFile(): string {
+  const dir = mkdtempSync(join(tmpdir(), "lair-placement-db-"));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  return join(dir, "placement.db");
+}
+
+function samplesIn(dbPath: string): { gate_id: string; machine: string; rc: number | null; seconds: number }[] {
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    return db
+      .prepare(`SELECT gate_id, machine, rc, seconds FROM placement_samples ORDER BY gate_id`)
+      .all() as { gate_id: string; machine: string; rc: number | null; seconds: number }[];
+  } finally {
+    db.close();
+  }
+}
+
+/** Three passed suites on the workstation (50 min each) in the runner log, and its log lines for more runs */
+function suiteHistory(h: Harness): (line: string) => void {
+  const lines: string[] = [];
+  ["h1", "h2", "h3"].forEach((id, i) => {
+    const end = NOW - (10 - i) * 60 * MIN;
+    h.result(id, 0, 3000, end);
+    lines.push(`${at(end)}\t${id}\t0\twork/run suite /tmp/wt/${id}\theavy`);
+  });
+  const path = join(h.gates, "runner.log");
+  writeFileSync(path, lines.join("\n") + "\n");
+  return (line: string) => {
+    lines.push(line);
+    writeFileSync(path, lines.join("\n") + "\n");
+  };
+}
+
+describe("placement: learning keeps the full runs, not the fragments", () => {
+  it("does not learn a failed run far shorter than its class's passed runs", async () => {
+    const dbPath = storeFile();
+    const h = new Harness(placementConfig({ history: { runner_log: "runner.log" } }), { dbPath });
+    h.world.laptopUp = false;
+    const log = suiteHistory(h);
+    await h.tick();
+
+    // A preflight that failed after 110 s, seen start and end
+    h.request("heavy", 5, "f1", "run suite");
+    await h.tick();
+    h.clock.advance(MIN);
+    h.rename("heavy.5.f1.req", "heavy.5.f1.req.run");
+    await h.tick();
+    h.clock.advance(2 * MIN);
+    unlinkSync(join(h.queue, "heavy.5.f1.req.run"));
+    h.result("f1", 1, 110);
+    await h.tick();
+
+    // A remote run killed after 5 minutes (the laptop went away), from the runner log
+    h.result("x9", 3, 300);
+    log(`${at(h.clock.now())}\tx9\t3\twork/run suite {WT}\tremote`);
+    h.clock.advance(MIN);
+    await h.tick();
+
+    expect(samplesIn(dbPath).map((s) => s.gate_id)).toEqual(["h1", "h2", "h3"]);
+    expect(h.status().durations).toEqual([{ class: "big", machine: "workstation", medianSeconds: 3000, samples: 3 }]);
+  });
+
+  it("lets a later passed run of the same id replace a failed one, never the other way round", async () => {
+    const dbPath = storeFile();
+    const h = new Harness(placementConfig({ history: { runner_log: "runner.log" } }), { dbPath });
+    h.world.laptopUp = false;
+    const log = suiteHistory(h);
+
+    // A failed run long enough to count (40 of the usual 50 min)
+    h.result("x1", 1, 2400);
+    log(`${at(h.clock.now())}\tx1\t1\twork/run suite /tmp/wt/x1\theavy`);
+    await h.tick();
+    expect(samplesIn(dbPath).find((s) => s.gate_id === "x1")).toMatchObject({ rc: 1, seconds: 2400 });
+
+    // The same id runs again and passes: its result files now hold that run
+    h.clock.advance(60 * MIN);
+    h.result("x1", 0, 2700);
+    log(`${at(h.clock.now())}\tx1\t0\twork/run suite /tmp/wt/x1\theavy`);
+    await h.tick();
+    expect(samplesIn(dbPath).find((s) => s.gate_id === "x1")).toMatchObject({ rc: 0, seconds: 2700 });
+
+    // A later failure of it does not replace the passed run
+    h.clock.advance(60 * MIN);
+    h.result("x1", 2, 600);
+    log(`${at(h.clock.now())}\tx1\t2\twork/run suite /tmp/wt/x1\theavy`);
+    await h.tick();
+    expect(samplesIn(dbPath).find((s) => s.gate_id === "x1")).toMatchObject({ rc: 0, seconds: 2700 });
+    expect(h.status().durations).toEqual([{ class: "big", machine: "workstation", medianSeconds: 3000, samples: 4 }]);
+  });
+
+  it("learns the full run of a job re-queued under the same id after its machine went away", async () => {
+    const dbPath = storeFile();
+    const h = new Harness(placementConfig(), { dbPath });
+    h.world.laptopUp = false;
+    h.request("remote", 5, "x2", "run suite");
+    await h.tick();
+    h.clock.advance(MIN);
+    h.rename("remote.5.x2.req", "remote.5.x2.req.run");
+    await h.tick();
+    // Killed after 5 minutes: rc 3, and the same id back in the heavy queue
+    h.clock.advance(5 * MIN);
+    h.result("x2", 3, 300);
+    h.rename("remote.5.x2.req.run", "heavy.5.x2.req");
+    await h.tick();
+    h.clock.advance(MIN);
+    h.rename("heavy.5.x2.req", "heavy.5.x2.req.run");
+    await h.tick();
+    h.clock.advance(47 * MIN);
+    unlinkSync(join(h.queue, "heavy.5.x2.req.run"));
+    h.result("x2", 0, 2810);
+    await h.tick();
+
+    expect(samplesIn(dbPath)).toEqual([{ gate_id: "x2", machine: "workstation", rc: 0, seconds: 2810 }]);
+  });
+
+  it("migrates a version 1 store: its samples get rc (unknown) and a passed run replaces them", () => {
+    const dbPath = storeFile();
+    const v1 = new Database(dbPath);
+    v1.exec(`CREATE TABLE placement_samples (project TEXT NOT NULL, gate_id TEXT NOT NULL, class TEXT NOT NULL,
+      machine TEXT NOT NULL, seconds REAL NOT NULL, factor REAL, finished_at INTEGER NOT NULL, source TEXT NOT NULL,
+      PRIMARY KEY (project, gate_id))`);
+    v1.prepare(`INSERT INTO placement_samples VALUES ('demo', 'old', 'big', 'workstation', 300, NULL, ?, 'history')`).run(NOW);
+    v1.pragma("user_version = 1");
+    v1.close();
+
+    const store = new PlacementStore(dbPath);
+    cleanups.push(() => store.close());
+    expect(store.recentSamples("demo")).toMatchObject([{ gateId: "old", seconds: 300, rc: null }]);
+    const sample = { gateId: "old", class: "big", machine: "workstation", factor: null, finishedAt: NOW + MIN, source: "observed" as const };
+    expect(store.addSample("demo", { ...sample, seconds: 200, rc: 1 })).toBe(false);
+    expect(store.addSample("demo", { ...sample, seconds: 2900, rc: 0 })).toBe(true);
+    expect(store.recentSamples("demo")).toMatchObject([{ gateId: "old", seconds: 2900, rc: 0 }]);
+    const check = new Database(dbPath, { readonly: true });
+    expect(check.pragma("user_version", { simple: true })).toBe(2);
+    check.close();
+  });
+});
+
+describe("placement: a job is not bounced forever", () => {
+  it("doubles the cool-down per earlier move and holds a job after max_moves_per_job moves in 24 h", async () => {
+    const h = new Harness(placementConfig({ default_seconds: 7200, cooldown_seconds: 1800 }));
+    h.request("heavy", 5, "r1", "run suite", ".run");
+    h.request("heavy", 5, "q1", "run suite");
+    // The project's own fallback sends it back every time
+    const sendBack = () => h.rename("remote.5.q1.req", "heavy.5.q1.req");
+
+    await h.tick(); // move 1: next cool-down 30 min
+    sendBack();
+    h.clock.advance(31 * MIN);
+    await h.tick(); // move 2: next cool-down 60 min
+    sendBack();
+    h.clock.advance(31 * MIN);
+    await h.tick();
+    expect(h.moved()).toHaveLength(2);
+    expect(h.job("q1")?.held).toBe("moved heavy→remote; cool-down for 29 min");
+
+    h.clock.advance(30 * MIN);
+    await h.tick(); // move 3
+    expect(h.moved()).toHaveLength(3);
+    sendBack();
+    h.clock.advance(208 * MIN);
+    await h.tick();
+    h.clock.advance(MIN);
+    await h.tick();
+
+    // Still a 12 min gain, but it was moved three times today: held, and reported once
+    expect(h.moved()).toHaveLength(3);
+    expect(h.job("q1")?.held).toBe("moved or tried 3 times in 24 h: held (max_moves_per_job is 3)");
+    const held = h.eventsOf("placement.job_held");
+    expect(held).toHaveLength(1);
+    expect(held[0].data).toMatchObject({ gateId: "q1", lane: "heavy", moves: 3 });
+
+    // A day after its first move, it may move again
+    h.clock.advance(24 * 60 * MIN);
+    await h.tick();
+    expect(h.moved()).toHaveLength(4);
+  });
+});
+
+describe("placement: a stop is not evidence", () => {
+  it("a stop during a probe changes no machine and emits no machine_down", async () => {
+    const h = new Harness(placementConfig());
+    await h.tick();
+    expect(h.status().machines.find((m) => m.id === "laptop")).toMatchObject({ state: "up", upSince: at(NOW) });
+
+    h.world.laptopHangs = true;
+    h.clock.advance(MIN);
+    const probes = () => h.runner.calls.filter((c) => c.argv[0] === "probe-laptop").length;
+    const tick = h.tick();
+    await until(() => probes() === 2);
+    await h.placement.stop();
+    await tick;
+    expect(h.eventsOf("placement.machine_down")).toHaveLength(0);
+
+    // Started again, the laptop is still the one that has been up since the first tick
+    h.world.laptopHangs = false;
+    h.placement.start();
+    h.clock.advance(MIN);
+    await h.tick();
+    expect(h.status().machines.find((m) => m.id === "laptop")).toMatchObject({ state: "up", upSince: at(NOW), lastError: null });
+    expect(h.eventsOf("placement.machine_down")).toHaveLength(0);
+  });
+});
+
+describe("placement: symbolic links are never followed", () => {
+  it("ignores a request or a result that is a symbolic link", async () => {
+    const h = new Harness(placementConfig());
+    h.request("heavy", 5, "r1", "run suite", ".run");
+    h.request("heavy", 5, "q1", "run suite");
+    writeFileSync(join(h.root, "elsewhere.req"), "t\nabcdef12\nrun suite\n");
+    symlinkSync(join(h.root, "elsewhere.req"), join(h.queue, "heavy.4.ln.req"));
+
+    await h.tick();
+    expect(h.moved()).toEqual([["mover", "q1", "heavy", "remote"]]);
+    expect(h.status().jobs.map((j) => j.id).sort()).toEqual(["q1", "r1"]);
+
+    // r1 ends, but its result is a link to a file elsewhere: not learned
+    h.clock.advance(30 * MIN);
+    unlinkSync(join(h.queue, "heavy.5.r1.req.run"));
+    writeFileSync(join(h.root, "elsewhere.rc"), "0\n");
+    writeFileSync(join(h.results, "r1.log"), "[runner] r1 rc=0 time=1800s\n");
+    symlinkSync(join(h.root, "elsewhere.rc"), join(h.results, "r1.rc"));
+    await h.tick();
+    expect(h.status().durations).toEqual([]);
+  });
+});
+
+describe("placement: quiet re-checks below quiet_margin", () => {
+  const quiet = () => placementConfig({ prefer_quiet: ["*QUIET=1*"] });
+
+  it("are placed by time on a machine no busier than their own", async () => {
+    const h = new Harness(quiet());
+    h.world.loads = { workstation: "{ 5.00 4.00 3.00 }\n10\n", laptop: "3.20 3.00 2.00 1/200 999\n8\n" };
+    h.request("heavy", 5, "r1", "run suite", ".run");
+    h.request("heavy", 5, "k1", "QUIET=1 run targeted");
+    await h.tick();
+    // 0.4/cpu vs 0.5/cpu is under the margin: an ordinary move by time
+    expect(h.moved()).toEqual([["mover", "k1", "heavy", "remote"]]);
+    expect(h.eventsOf("placement.moved")[0].data.explanation).toBe(
+      "moved k1 heavy→remote: est. 2 h 0 min → 60 min; remote idle",
+    );
+  });
+
+  it("are never sent by time to a busier machine, though other jobs are", async () => {
+    const h = new Harness(quiet());
+    h.world.loads = { workstation: "{ 3.00 3.00 3.00 }\n10\n", laptop: "7.20 7.00 7.00 1/200 999\n8\n" };
+    h.request("heavy", 5, "r1", "run suite", ".run");
+    h.request("heavy", 5, "k1", "QUIET=1 run targeted");
+    h.request("heavy", 5, "n1", "run targeted");
+    await h.tick();
+    expect(h.moved()).toEqual([["mover", "n1", "heavy", "remote"]]);
+    expect(h.exists("heavy.5.k1.req")).toBe(true);
+  });
+});
+
+describe("placement: a job its lane never runs", () => {
+  const blocked = (mode: string) =>
+    placementConfig({
+      mode,
+      lanes: {
+        heavy: { machine: "workstation", slots: 1, limits: { big: 0 } },
+        remote: { machine: "laptop", slots: 2, limits: { big: 1 } },
+      },
+    });
+
+  it("goes to a lane that can run it, whatever min_gain says", async () => {
+    const h = new Harness(blocked("act"));
+    h.request("heavy", 5, "q1", "run suite");
+    await h.tick();
+    expect(h.moved()).toEqual([["mover", "q1", "heavy", "remote"]]);
+    expect(h.eventsOf("placement.moved")[0].data).toMatchObject({
+      gainSeconds: 0,
+      explanation: "moved q1 heavy→remote: est. never → 60 min; heavy never runs big, remote idle",
+    });
+  });
+
+  it("is advised as such in observe mode", async () => {
+    const h = new Harness(blocked("observe"));
+    h.request("heavy", 5, "q1", "run suite");
+    await h.tick();
+    expect(h.job("q1")).toMatchObject({ expectedStart: null, advice: { to: "remote", gainSeconds: 0, stuck: true } });
   });
 });

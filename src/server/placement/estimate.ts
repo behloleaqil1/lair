@@ -139,11 +139,13 @@ export interface Candidate {
   /** Expected finish (ms) where it is and where it would go */
   fromFinish: number;
   toFinish: number;
-  /** fromFinish - toFinish, in seconds */
+  /** fromFinish - toFinish, in seconds (0 when it can't run where it is: see `stuck`) */
   gainSeconds: number;
   /** The gain less what it costs the jobs of the same or a more urgent priority on both lanes */
   netSeconds: number;
   quiet: boolean;
+  /** Its own lane can never run it (a class limit of 0 there): any lane that can is a gain */
+  stuck: boolean;
   /** The target lane before the move: its running and queued jobs */
   targetRunning: number;
   targetQueued: number;
@@ -203,7 +205,11 @@ function replan(
  * moves before it leave:
  * - a quiet re-check (prefer_quiet, loads known) goes to the least-loaded
  *   eligible machine when its load per cpu is at least `quietMargin` below
- *   the current one's, whatever the times;
+ *   the current one's, whatever the times (min_gain and the net rule don't
+ *   apply). Without such a machine it is placed by time as below, but only
+ *   on machines no busier than its own;
+ * - a job its own lane can never run (a class limit of 0 there) goes to the
+ *   lane that can run it soonest, before any move by time;
  * - any other queued job goes where it is expected to finish at least
  *   `minGainSeconds` sooner, when the move also saves that much in all
  *   (what it costs the jobs of the same or a more urgent priority on both
@@ -232,8 +238,9 @@ export function decide(options: DecideOptions): Decision {
       const fromSlot = plan.get(job.id);
       if (!fromSlot) continue;
       const cls = job.class;
-      const targets = lanes.filter((l) => l.name !== job.lane && l.up && l.serves.length === 0 && l.eligible.has(cls));
+      let targets = lanes.filter((l) => l.name !== job.lane && l.up && l.serves.length === 0 && l.eligible.has(cls));
       if (targets.length === 0) continue;
+      const stuck = !Number.isFinite(fromSlot.finish);
 
       const trial = (to: ModelLane) => {
         const trialJobs = relocate(lanes, jobs, job, to.name);
@@ -256,9 +263,10 @@ export function decide(options: DecideOptions): Decision {
           to: to.name,
           fromFinish: fromSlot.finish,
           toFinish,
-          gainSeconds: (fromSlot.finish - toFinish) / 1000,
-          netSeconds: net,
+          gainSeconds: stuck ? 0 : (fromSlot.finish - toFinish) / 1000,
+          netSeconds: stuck ? 0 : net,
           quiet: false,
+          stuck,
           targetRunning: jobs.filter((j) => j.runsOn === to.name && j.status === "running").length,
           targetQueued: jobs.filter((j) => j.runsOn === to.name && j.status === "queued").length,
         };
@@ -274,25 +282,37 @@ export function decide(options: DecideOptions): Decision {
           if (util === null) continue;
           if (!quietest || util < quietest.util) quietest = { lane, util };
         }
-        if (quietest) {
-          if (fromUtil - quietest.util < options.quietMargin) continue;
+        if (quietest && fromUtil - quietest.util >= options.quietMargin) {
           const result = trial(quietest.lane);
-          if (!Number.isFinite(result.candidate.toFinish)) continue;
-          result.candidate.quiet = true;
-          // Quiet moves first, the quietest gap first
-          const score = 1e12 + (fromUtil - quietest.util) * 1e6;
-          if (!best || score > best.score) best = { ...result, score };
-          continue;
+          if (Number.isFinite(result.candidate.toFinish)) {
+            result.candidate.quiet = true;
+            // Quiet moves first, the quietest gap first
+            const score = 1e12 + (fromUtil - quietest.util) * 1e6;
+            if (!best || score > best.score) best = { ...result, score };
+            continue;
+          }
         }
-        // No target's load is known: placed by time as any other job
+        // No machine quiet enough: placed by time, but never on a busier machine
+        // (one whose load is unknown counts as busier)
+        targets = targets.filter((l) => {
+          const util = options.utilization(l.machine);
+          return quietest === null ? true : util !== null && util <= fromUtil;
+        });
       }
 
       for (const to of targets) {
         const result = trial(to);
-        const { gainSeconds, netSeconds } = result.candidate;
-        if (!Number.isFinite(gainSeconds)) continue;
-        if (gainSeconds < options.minGainSeconds || netSeconds < options.minGainSeconds) continue;
-        if (!best || gainSeconds > best.score) best = { ...result, score: gainSeconds };
+        const { gainSeconds, netSeconds, toFinish } = result.candidate;
+        if (!Number.isFinite(toFinish)) continue;
+        let score: number;
+        if (stuck) {
+          // Any lane that can run it gains everything: the one that runs it soonest first
+          score = 1e11 - (toFinish - now) / 1000;
+        } else {
+          if (gainSeconds < options.minGainSeconds || netSeconds < options.minGainSeconds) continue;
+          score = gainSeconds;
+        }
+        if (!best || score > best.score) best = { ...result, score };
       }
     }
     if (!best) break;

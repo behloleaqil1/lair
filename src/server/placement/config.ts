@@ -73,6 +73,8 @@ const PlacementSchema = z
     max_moves_per_tick: z.number().int().min(0).max(50).default(2),
     min_gain_seconds: z.number().int().min(0).max(86_400).default(600),
     cooldown_seconds: z.number().int().min(0).max(7 * 86_400).default(1800),
+    /** A job moved or tried this many times in 24 hours is held where it is */
+    max_moves_per_job: z.number().int().min(1).max(100).default(3),
     default_seconds: z.number().int().min(1).max(7 * 86_400).default(1800),
     /** The request file's line where its command starts (the rest of the file is the command) */
     command_line: z.number().int().min(1).max(100).default(1),
@@ -128,7 +130,9 @@ export interface PlacementSettings {
   moveCmd?: string[];
   maxMovesPerTick: number;
   minGainSeconds: number;
+  /** The first cool-down; it doubles with every earlier move of the job in 24 hours */
   cooldownSeconds: number;
+  maxMovesPerJob: number;
   defaultSeconds: number;
   commandLine: number;
   history: HistorySettings;
@@ -319,6 +323,7 @@ export function parsePlacementConfig(raw: unknown): ParseResult {
       maxMovesPerTick: value.max_moves_per_tick,
       minGainSeconds: value.min_gain_seconds,
       cooldownSeconds: value.cooldown_seconds,
+      maxMovesPerJob: value.max_moves_per_job,
       defaultSeconds: value.default_seconds,
       commandLine: value.command_line,
       history: {

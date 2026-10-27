@@ -6,7 +6,7 @@
  * through QueueFiles, with bounded reads. Tests replace the runner and the
  * clock, and use real files in a temp dir.
  */
-import { closeSync, constants, fstatSync, openSync, readSync, readdirSync, statSync } from "fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, readdirSync } from "fs";
 import { ExecFileRunner, systemClock, type Clock, type CommandRunner } from "../watchdog/probes.js";
 
 export type { CommandRunner, CommandOutput, RunOptions } from "../watchdog/probes.js";
@@ -16,13 +16,19 @@ export interface FileInfo {
   /** When the file's name or metadata last changed: a rename (a runner's claim) sets it */
   ctimeMs: number;
   size: number;
+  /** A regular file; a symbolic link is not one, whatever it points to */
   isFile: boolean;
 }
 
-/** Bounded, read-only file access. Every read is a regular file only, opened without blocking. */
+/**
+ * Bounded, read-only file access. Every read is of a regular file only,
+ * opened without blocking and without following a symbolic link: a link
+ * planted in the queue or results directory is never read through.
+ */
 export interface QueueFiles {
   /** Entry names in a directory, at most `max`; [] when it can't be read */
   list(dir: string, max: number): string[];
+  /** The entry itself (a symbolic link is not followed), or null */
   stat(path: string): FileInfo | null;
   /** The first `maxBytes` of a regular file, or null */
   head(path: string, maxBytes: number): string | null;
@@ -39,8 +45,9 @@ export interface PlacementProbes {
 function readPart(path: string, maxBytes: number, from: "head" | "tail"): string | null {
   let fd: number | null = null;
   try {
-    // O_NONBLOCK: a FIFO planted where a file should be can't hang the server
-    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+    // O_NONBLOCK: a FIFO planted where a file should be can't hang the server;
+    // O_NOFOLLOW: a symbolic link fails to open instead of being read through
+    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | (constants.O_NOFOLLOW ?? 0));
     const st = fstatSync(fd);
     if (!st.isFile()) return null;
     const length = Math.max(0, Math.min(st.size, maxBytes));
@@ -67,7 +74,7 @@ export class NodeQueueFiles implements QueueFiles {
 
   stat(path: string): FileInfo | null {
     try {
-      const st = statSync(path);
+      const st = lstatSync(path);
       return { mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, size: st.size, isFile: st.isFile() };
     } catch {
       return null;
