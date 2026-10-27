@@ -699,6 +699,14 @@ export class ReviewStore {
     return rows.map(holdOf);
   }
 
+  /** Every unreleased hold of the project (project-wide and per PR), oldest first. */
+  unreleasedHolds(project: string): MergeHold[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM review_holds WHERE project = ? AND released_at IS NULL ORDER BY rowid`)
+      .all(project) as HoldRow[];
+    return rows.map(holdOf);
+  }
+
   listHolds(project: string, limit = 100): MergeHold[] {
     const rows = this.db
       .prepare(`SELECT * FROM review_holds WHERE project = ? ORDER BY rowid DESC LIMIT ?`)

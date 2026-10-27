@@ -75,6 +75,8 @@ export interface DeliveryContext {
   signal: AbortSignal;
   /** Set by Delivery.drain() (a config reload): no new operation starts, the one running finishes */
   closing?: boolean;
+  /** A hold was set or released: its one Decision Inbox item is raised or withdrawn (Delivery) */
+  holdsChanged?: () => void;
 }
 
 export interface OperationRequest {
@@ -529,6 +531,7 @@ export class EnvironmentController {
       if (!hold) return { ok: false, code: 409, error: `service ${target} is not held` };
       store.releaseHold(project, env, target);
       void this.ctx.events?.emit("delivery.released", { project, environment: env, service: target, by: req.by });
+      this.ctx.holdsChanged?.();
       return {
         ok: true,
         operation: store.createOperation({
@@ -601,6 +604,7 @@ export class EnvironmentController {
         this.record(operation, steps, { action: "hold", service: name, status: "succeeded", detail: `held (${source}): ${reason}` });
         void this.ctx.events?.emit("delivery.held", { project, environment: env, service: name, reason, source });
       }
+      this.ctx.holdsChanged?.();
     }
     return this.launch(operation, steps, { beside });
   }
@@ -811,6 +815,7 @@ export class EnvironmentController {
         detail: `the environment Up releases the environment Down's hold (${hold.reason})`,
       });
       void this.ctx.events?.emit("delivery.released", { project, environment: this.env.name, service: hold.service, by: op.requestedBy });
+      this.ctx.holdsChanged?.();
     }
     const services = this.env.services;
     for (let i = 0; i < services.length; i++) {

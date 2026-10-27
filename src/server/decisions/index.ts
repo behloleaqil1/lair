@@ -10,6 +10,8 @@ export { DecisionStore } from "./store.js";
 export { registerDecisionRoutes } from "./routes.js";
 export { maxOpenFromEnv, maxOpenHttpFromEnv, mountDecisions } from "./mount.js";
 export { InboxDecisionHook, listenForDecisionRequests, toDecisionInput } from "./request-bridge.js";
+export { HOLD_KEEP, HOLD_RELEASE, HoldDecisions } from "./holds.js";
+export type { OwnerHold } from "./holds.js";
 export type { MountDecisionsOptions, DecisionConsumer } from "./mount.js";
 export { MemorySecretStore, SecretStoreUnavailableError } from "./secrets.js";
 export type { SecretStore } from "./secrets.js";

@@ -18,7 +18,16 @@ import { parseDeliveryConfig, type DeliverySettings } from "./config.js";
 import { EnvironmentController, type DeliveryContext } from "./environment.js";
 import { systemDeliveryProbes, type DeliveryProbes } from "./probes.js";
 import { DeliveryStore } from "./store.js";
-import type { DeliveryProjectStatus, EnvironmentStatus } from "./types.js";
+import type { DeliveryProjectStatus, EnvironmentStatus, Hold } from "./types.js";
+import { asContextText, HoldDecisions, type OwnerHold } from "../decisions/holds.js";
+import type { DecisionProducer } from "../decisions/types.js";
+
+/** The module delivery's hold decisions are raised as */
+export const DELIVERY_DECISION_MODULE = "delivery";
+
+/** One decision per held service and hold (a Down after a release is a new hold) */
+export const deliveryHoldKey = (hold: Pick<Hold, "environment" | "service" | "heldAt">) =>
+  `hold:${hold.environment}:${hold.service}:${hold.heldAt}`;
 
 export interface DeliveryOptions {
   project: string;
@@ -37,10 +46,15 @@ export class Delivery {
   private timer: NodeJS.Timeout | null = null;
   private ticking: Promise<void> | null = null;
   private stopped = true;
+  /** One decision per held service: only the owner releases one */
+  private readonly holdDecisions: HoldDecisions;
+  private reconciling: Promise<void> | null = null;
+  private reconcileAgain = false;
   lastError?: string;
 
   constructor(options: DeliveryOptions) {
     this.project = options.project;
+    this.holdDecisions = new HoldDecisions(DELIVERY_DECISION_MODULE, options.project);
     this.ctx = {
       project: options.project,
       config: options.config,
@@ -49,6 +63,7 @@ export class Delivery {
       probes: options.probes,
       events: options.events,
       signal: this.abort.signal,
+      holdsChanged: () => void this.reconcileHolds(),
     };
     // Operations a previous run left marked running were cut off by its stop
     options.store.failInterrupted(options.project, new Date(options.probes.clock.now()).toISOString());
@@ -69,6 +84,73 @@ export class Delivery {
 
   environment(name: string): EnvironmentController | undefined {
     return this.environments.find((env) => env.name === name);
+  }
+
+  /**
+   * Ask through the Decision Inbox: every held service gets its one decision
+   * (also one held while Lair was down), and answering "Release it"
+   * releases it as the owner, as the Release button does.
+   */
+  async useDecisions(producer: DecisionProducer): Promise<void> {
+    this.holdDecisions.use(producer, async (key) => {
+      const hold = this.ctx.store.holds(this.project).find((h) => deliveryHoldKey(h) === key);
+      if (!hold) return; // released meanwhile, or held again since (a new hold, with its own decision)
+      const result = this.environment(hold.environment)?.request({ kind: "release", service: hold.service, by: "human" });
+      if (result && !result.ok) {
+        console.warn(`[delivery] ${this.project}: could not release ${hold.environment}/${hold.service} as answered: ${result.error}`);
+      }
+    });
+    await this.reconcileHolds();
+  }
+
+  /**
+   * Every hold has its decision and every decision a hold: raised when a
+   * service is held, withdrawn when it is released (in Delivery, or by an
+   * environment Up). One at a time; a change meanwhile reconciles again.
+   */
+  reconcileHolds(): Promise<void> {
+    if (this.reconciling) {
+      this.reconcileAgain = true;
+      return this.reconciling;
+    }
+    this.reconciling = (async () => {
+      do {
+        this.reconcileAgain = false;
+        try {
+          const holds = this.ctx.store.holds(this.project).map((hold) => this.holdQuestion(hold));
+          await this.holdDecisions.reconcile(holds, () => "The service was released.");
+        } catch (e) {
+          console.warn(`[delivery] ${this.project}: could not match the holds' decisions: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      } while (this.reconcileAgain);
+    })().finally(() => {
+      this.reconciling = null;
+    });
+    return this.reconciling;
+  }
+
+  /** A held service's decision, in plain words (the Down's reason is the owner's own text: in the context). */
+  private holdQuestion(hold: Hold): OwnerHold {
+    const where = `${hold.service} in ${hold.environment}`;
+    return {
+      key: deliveryHoldKey(hold),
+      ref: `${hold.environment}/${hold.service}`,
+      title: `${where} is stopped and held: Up and deploys skip it until you release it`,
+      context: [
+        `${hold.source === "environment" ? `An environment Down of ${hold.environment}` : `A Down of ${hold.service}`} held it at ${hold.heldAt}, with this reason:`,
+        "",
+        "```text",
+        asContextText(hold.reason),
+        "```",
+        "",
+        "Lair never starts a held service: not an Up, a deploy, a restart or the watchdog.",
+      ].join("\n"),
+      releaseLabel: "Release it",
+      releaseConsequences: `${where} is no longer held: the next Up or deploy starts it again (releasing doesn't start it by itself).`,
+      keepLabel: "Keep it held",
+      keepConsequences: "It stays stopped until you release it in Delivery. Nothing more is asked about it.",
+      blocks: [`delivery:${this.project}:${hold.environment}:${hold.service}`],
+    };
   }
 
   /** Run one tick. Concurrent calls share the tick in progress. */
@@ -92,6 +174,8 @@ export class Delivery {
       }
     }
     this.lastError = errors.length > 0 ? errors.join("; ") : undefined;
+    // What a raise that failed (or a crash between a hold and its decision) left behind
+    await this.reconcileHolds();
   }
 
   /** Resolves once no environment has an operation running. */
@@ -136,6 +220,9 @@ export class Delivery {
     }
     await this.ticking?.catch(() => undefined);
     await this.idle();
+    await this.reconciling;
+    // Answers given from now on wait in the inbox for the next Delivery (a reload, a restart)
+    this.holdDecisions.close();
   }
 
   /**
@@ -202,6 +289,8 @@ export class DeliveryManager implements ContainerServices {
   private store: DeliveryStore | null = null;
   /** "started" between start() and stop(); a reload never runs once "stopped" */
   private phase: "loaded" | "started" | "stopped" = "loaded";
+  /** The Decision Inbox, once useDecisions() connected it */
+  private producer: DecisionProducer | null = null;
 
   constructor(
     private options: {
@@ -237,6 +326,28 @@ export class DeliveryManager implements ContainerServices {
           events: this.options.events,
         }),
       );
+      // A project loaded after the inbox was connected (a reload) follows its holds' decisions too
+      const loaded = this.deliveries.get(entry.name);
+      if (loaded && this.producer) void this.follow(loaded);
+    }
+  }
+
+  /**
+   * Follow the held services through the Decision Inbox (src/server/index.ts
+   * calls this once the inbox is mounted): every hold gets its one decision,
+   * and answering one releases its service.
+   */
+  useDecisions(producer: DecisionProducer): Promise<void> {
+    this.producer = producer;
+    return Promise.all([...this.deliveries.values()].map((delivery) => this.follow(delivery))).then(() => undefined);
+  }
+
+  private async follow(delivery: Delivery): Promise<void> {
+    if (!this.producer) return;
+    try {
+      await delivery.useDecisions(this.producer);
+    } catch (e) {
+      console.warn(`[delivery] ${delivery.project}: could not follow its holds' decisions: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 

@@ -52,6 +52,14 @@ import {
   type ReviewerRuns,
 } from "./ports.js";
 import type { SignedGateResult } from "../../shared/policy-types.js";
+import { asContextText, HoldDecisions, type OwnerHold } from "../decisions/holds.js";
+import type { DecisionProducer } from "../decisions/types.js";
+
+/** The module merge holds' decisions are raised as (apart from review's other questions, which nobody follows) */
+export const HOLD_DECISION_MODULE = "review-holds";
+const HOLD_KEY_PREFIX = "hold:";
+/** One decision per merge hold */
+export const holdDecisionKey = (id: string) => `${HOLD_KEY_PREFIX}${id}`;
 
 export interface Clock {
   now(): number;
@@ -156,9 +164,13 @@ export class ReviewService {
   /** Called when the merge in progress ends */
   private mergeWaiters: (() => void)[] = [];
 
+  /** One decision per merge hold: only the owner releases one */
+  private readonly holdDecisions: HoldDecisions;
+
   constructor(private readonly o: ReviewServiceOptions) {
     this.project = o.project;
     this.settings = o.settings;
+    this.holdDecisions = new HoldDecisions(HOLD_DECISION_MODULE, o.project);
     const gate = o.settings.merge.gate;
     this.gateSource =
       gate.source === "checks"
@@ -746,16 +758,68 @@ export class ReviewService {
       .find((f) => f.id === id)!;
   }
 
-  addHold(pr: number | null, reason: string, by: string): MergeHold {
-    return this.o.store.addHold(this.project, pr, reason, by, this.now());
+  /** Hold merges (of one PR, or all): anyone may, and the owner is asked at once whether to release it. */
+  async addHold(pr: number | null, reason: string, by: string): Promise<MergeHold> {
+    const hold = this.o.store.addHold(this.project, pr, reason, by, this.now());
+    await this.holdDecisions.ensure(this.holdQuestion(hold));
+    return hold;
   }
 
-  releaseHold(id: string, by: string): MergeHold {
+  /** Release a hold (the owner only: the route checks the session); its open decision is withdrawn. */
+  async releaseHold(id: string, by: string): Promise<MergeHold> {
     if (!this.o.store.releaseHold(this.project, id, by, this.now())) {
       const hold = this.o.store.getHold(this.project, id);
       throw new ReviewError(hold ? `Hold ${id} is already released` : `No hold ${id}`, hold ? 409 : 404);
     }
+    await this.holdDecisions.lifted(holdDecisionKey(id), `The hold was released (by ${by}).`);
     return this.o.store.getHold(this.project, id)!;
+  }
+
+  /**
+   * Ask through the Decision Inbox: every unreleased hold gets its one
+   * decision (also one held while Lair was down), and answering "Release the
+   * hold" releases it as the owner, as the Release button does.
+   */
+  async useDecisions(producer: DecisionProducer): Promise<void> {
+    this.holdDecisions.use(producer, async (key) => {
+      const id = key.startsWith(HOLD_KEY_PREFIX) ? key.slice(HOLD_KEY_PREFIX.length) : null;
+      const hold = id ? this.o.store.getHold(this.project, id) : null;
+      if (!hold || hold.releasedAt !== null) return; // released meanwhile: nothing to do
+      await this.releaseHold(hold.id, "owner");
+    });
+    await this.holdDecisions.reconcile(
+      this.o.store.unreleasedHolds(this.project).map((hold) => this.holdQuestion(hold)),
+      () => "The hold is no longer there.",
+    );
+  }
+
+  /** Stop following the hold decisions' answers (a reload or shutdown); they wait in the inbox. */
+  stopDecisions(): void {
+    this.holdDecisions.close();
+  }
+
+  /** The hold's decision, in plain words: the hold's reason is the holder's text, so it stays in the context. */
+  private holdQuestion(hold: MergeHold): OwnerHold {
+    const what = hold.pr === null ? `Every merge in ${this.project}` : `PR #${hold.pr}`;
+    return {
+      key: holdDecisionKey(hold.id),
+      ref: hold.pr === null ? `holds:${this.project}` : `pr:${hold.pr}`,
+      title: `${what} ${hold.pr === null ? "is" : "can't merge: it is"} held by ${hold.createdBy}`,
+      context: [
+        `${hold.createdBy} held ${hold.pr === null ? "every merge in this project" : `the merge of PR #${hold.pr}`} at ${hold.createdAt}. Their reason:`,
+        "",
+        "```text",
+        asContextText(hold.reason),
+        "```",
+        "",
+        "Only you release a hold. Nothing merges while it is on, by the policy or by you.",
+      ].join("\n"),
+      releaseLabel: "Release the hold",
+      releaseConsequences: `${what} may merge again once the policy allows it (as the Release button in PRs does).`,
+      keepLabel: "Keep it held",
+      keepConsequences: "The hold stays until you release it in PRs. Nothing more is asked about it.",
+      blocks: [hold.pr === null ? `review:${this.project}:merges` : `review:${this.project}:pr:${hold.pr}`],
+    };
   }
 
   listHolds(): MergeHold[] {
@@ -1155,12 +1219,34 @@ export class ReviewManager {
   private agentAssigner: AgentReviewAssigner | null = null;
   private autoTimer: NodeJS.Timeout | null = null;
   private scanning: Promise<void> | null = null;
+  /** The Decision Inbox, once useDecisions() connected it */
+  private producer: DecisionProducer | null = null;
 
   constructor(private readonly options: ReviewManagerOptions) {}
 
   /** The agent assigner, when a project has reviews by agents on. */
   get agentReviews(): AgentReviewAssigner | null {
     return this.agentAssigner;
+  }
+
+  /**
+   * Follow the merge holds through the Decision Inbox (src/server/index.ts
+   * calls this once the inbox is mounted): each project's unreleased holds
+   * get their one decision, and answering one releases its hold. Projects
+   * loaded later (a reload) follow it too.
+   */
+  useDecisions(producer: DecisionProducer): Promise<void> {
+    this.producer = producer;
+    return Promise.all([...this.services.values()].map((service) => this.follow(service))).then(() => undefined);
+  }
+
+  private async follow(service: ReviewService): Promise<void> {
+    if (!this.producer) return;
+    try {
+      await service.useDecisions(this.producer);
+    } catch (e) {
+      console.warn(`[review] ${service.project}: could not follow its holds' decisions: ${e instanceof Error ? e.message : e}`);
+    }
   }
 
   /**
@@ -1175,6 +1261,7 @@ export class ReviewManager {
     if (this.closed) return;
     await this.services.get(entry.name)?.drain();
     if (this.closed) return;
+    this.services.get(entry.name)?.stopDecisions();
     this.services.delete(entry.name);
     this.problems.delete(entry.name);
     this.configs.delete(entry.name);
@@ -1284,6 +1371,9 @@ export class ReviewManager {
           cwd: this.options.cwd ?? process.cwd(),
         }),
       );
+      // A project loaded after the inbox was connected (a reload) follows its holds' decisions too
+      const loaded = this.services.get(entry.name);
+      if (loaded && this.producer) void this.follow(loaded);
     }
     const every = this.options.agentCheckMs ?? CHECK_INTERVAL_MS;
     if (this.agentAssigner && every > 0) this.agentAssigner.start(every);
@@ -1336,6 +1426,7 @@ export class ReviewManager {
     this.autoTimer = null;
     this.agentAssigner?.stop();
     this.agentAssigner = null;
+    for (const service of this.services.values()) service.stopDecisions();
     this.store?.close();
     this.store = null;
     this.services.clear();

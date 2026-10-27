@@ -447,6 +447,10 @@ const reviews = new ReviewManager({
   decisions: inboxDecisionSink(decisionInbox),
 });
 reviews.load(projectEntries);
+// Every merge hold has one decision (only the owner releases a hold); answering it releases the hold
+await reviews.useDecisions(decisionInbox);
+// The same for delivery's held services: answering releases the service, as its Release button does
+await delivery.useDecisions(decisionInbox);
 // Merges, human reviews, finding resolutions and hold releases need the owner's session
 await registerReviewRoutes(fastify, reviews, () => getDefaultProject(), humanAuth);
 
