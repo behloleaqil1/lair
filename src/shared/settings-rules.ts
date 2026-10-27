@@ -146,6 +146,8 @@ export interface SecretFinding {
   path: string;
   /** Why: the key's name, or what the value looks like */
   why: string;
+  /** The value itself, to redact it from messages (never sent anywhere) */
+  value: string;
 }
 
 /** The fields of a config that hold (or look like they hold) a secret. */
@@ -155,12 +157,12 @@ export function findSecrets(root: unknown): SecretFinding[] {
     if (depth > MAX_DEPTH) return;
     if (typeof node === "string" || typeof node === "number") {
       if (key !== null && isSecretKey(key) && String(node).length > 0) {
-        findings.push({ path: pathKey(path), why: `its name (${key}) says it holds a secret` });
+        findings.push({ path: pathKey(path), why: `its name (${key}) says it holds a secret`, value: String(node) });
         return;
       }
       if (typeof node === "string") {
         const kind = secretValueKind(node);
-        if (kind) findings.push({ path: pathKey(path), why: `the value looks like ${kind}` });
+        if (kind) findings.push({ path: pathKey(path), why: `the value looks like ${kind}`, value: node });
       }
       return;
     }
@@ -174,4 +176,34 @@ export function findSecrets(root: unknown): SecretFinding[] {
   };
   walk(root, [], null, 0);
   return findings;
+}
+
+/** The same patterns, global, for redaction */
+const SECRET_VALUES_GLOBAL = SECRET_VALUES.map(({ pattern }) => new RegExp(pattern.source, `${pattern.flags}g`));
+
+/**
+ * The lines of a YAML text whose comment holds a value shaped like a
+ * secret (a comment has no key, so only the value patterns apply). The
+ * comment starts at a `#` that begins the line or follows a space or tab.
+ */
+export function commentSecrets(text: string): { line: number; why: string }[] {
+  const found: { line: number; why: string }[] = [];
+  // The text is bounded already (a project file is at most 1 MiB); each line is cut before the patterns
+  const lines = text.split("\n");
+  lines.forEach((raw, i) => {
+    const line = raw.length > MAX_SCANNED ? raw.slice(0, MAX_SCANNED) : raw;
+    const start = /^\s*#/.test(line) ? line.indexOf("#") : line.search(/[ \t]#/);
+    if (start < 0) return;
+    const kind = secretValueKind(line.slice(start));
+    if (kind) found.push({ line: i + 1, why: `a comment looks like ${kind}` });
+  });
+  return found;
+}
+
+/** `text` with every value shaped like a secret, and each of `known` (values found by their key), replaced by [hidden]. */
+export function redactSecrets(text: string, known: readonly string[] = []): string {
+  let out = text;
+  for (const value of known) if (value.length > 0) out = out.split(value).join("[hidden]");
+  for (const pattern of SECRET_VALUES_GLOBAL) out = out.replace(pattern, "[hidden]");
+  return out;
 }

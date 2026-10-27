@@ -351,6 +351,11 @@ function FieldRow({ field, shared }: { field: FieldModel; shared: Shared }) {
         )}
         {field.required && <span style={{ color: "var(--warning)" }}>required</span>}
         {field.command && <span className="badge badge-warning">runs a command</span>}
+        {field.sensitive && !field.command && (
+          <span className="badge badge-warning" title="It decides what Lair runs or where it sends code and tokens">
+            confirmed on save
+          </span>
+        )}
         {field.readOnly && <span className="badge badge-neutral">read-only: edit in the YAML tab</span>}
         {inside > 0 && <span className="badge badge-error">{inside} error(s) inside</span>}
         {field.value !== undefined && !field.required && !field.readOnly && (

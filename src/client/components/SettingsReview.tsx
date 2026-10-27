@@ -72,8 +72,11 @@ export function SettingsReview({ check, confirmed, onConfirm, onSave, saving, sa
       <DiffView diff={check.diff} empty="The file would not change" />
       {check.commands.length > 0 && (
         <div data-settings-commands="" style={{ marginTop: "0.75rem", borderLeft: "3px solid var(--warning)", paddingLeft: "0.75rem" }}>
-          <strong style={{ color: "var(--warning)" }}>Lair will run these commands</strong>
-          <p style={muted}>Each is an argv (no shell). Check every argument before you confirm.</p>
+          <strong style={{ color: "var(--warning)" }}>Confirm these changes</strong>
+          <p style={muted}>
+            What Lair will run (each argv as it runs, no shell) and where it connects or sends code and tokens. Check
+            every value before you confirm.
+          </p>
           {check.commands.map((c) => (
             <div key={c.path} style={{ margin: "0.5rem 0" }}>
               <code>{c.path}</code>
@@ -83,7 +86,7 @@ export function SettingsReview({ check, confirmed, onConfirm, onSave, saving, sa
           ))}
           <label>
             <input type="checkbox" checked={confirmed} onChange={(e) => onConfirm(e.target.checked)} /> I checked these
-            commands; Lair may run them
+            values; Lair may use them
           </label>
         </div>
       )}

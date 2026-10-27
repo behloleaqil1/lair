@@ -95,7 +95,12 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
     root: true,
     schema: MachinesSchema,
     docs: "#machines",
-    hints: { "machines.*.key": { widget: "path", help: "The private key's path (never the key itself)" } },
+    hints: {
+      // Where Lair connects and runs gates and agents, as whom
+      "machines.*.host": { sensitive: true },
+      "machines.*.user": { sensitive: true },
+      "machines.*.key": { widget: "path", sensitive: true, help: "The private key's path (never the key itself)" },
+    },
   },
   { key: "processes", title: "Processes", root: true, schema: ProcessesSchema, docs: "#process-manager" },
   {
@@ -128,6 +133,10 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       command_timeout_seconds: timeouts,
       build_timeout_seconds: timeouts,
       "environments.*.deploy.prepare_cmd": { help: "Placeholders: {sha}, {ref}, {environment}, {project}" },
+      // What docker compose builds and runs, and the repository a deploy builds from
+      "environments.*.compose_files": { sensitive: true },
+      "environments.*.project_directory": { sensitive: true },
+      "environments.*.deploy.repo": { sensitive: true },
     },
   },
   { key: "pipelines", title: "Gate pipelines", schema: PipelinesSchema, docs: "#gate-pipelines" },
@@ -136,7 +145,10 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
     title: "Gate executors",
     schema: ExecutorsSchema,
     docs: "#executor-options",
-    hints: { "github.token_env": { help: "The variable that holds the token (never the token)" } },
+    hints: {
+      "github.token_env": { help: "The variable that holds the token (never the token)" },
+      "github.checkout_action": { sensitive: true, help: "Runs in CI with the repository's token" },
+    },
   },
   {
     key: "review",
@@ -146,7 +158,8 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
     hints: {
       token_env: { help: "The variable that holds the token (never the token)" },
       reviewers: { help: "Per tier: human, peer, self or agent:<id>, or {any_of: [...], different_model: true}" },
-      api_url: timeouts,
+      api_url: { advanced: true, sensitive: true, help: "Where the GitHub token is sent" },
+      "merge.clone_url": { sensitive: true, help: "Where a local merge pushes" },
     },
   },
   {

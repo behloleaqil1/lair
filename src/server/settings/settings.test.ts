@@ -50,7 +50,7 @@ import {
   saveProjectSettings,
 } from "../../client/settings-api";
 import { diffValues, fieldsOf, sectionFields, type FieldModel } from "../../client/settings-form";
-import type { SettingsCheck } from "../../shared/settings-types.js";
+import type { SettingsChange, SettingsCheck } from "../../shared/settings-types.js";
 import { SETTINGS_BODY_LIMIT, SettingsService, registerSettingsUiRoutes } from "./index.js";
 
 const BROWSER = { origin: "http://localhost:4777", "sec-fetch-site": "same-origin" };
@@ -431,7 +431,27 @@ describe("saving", () => {
       expect(e.message).not.toContain(token);
     }
 
-    const pem = ["-----BEGIN ", "PRIVATE KEY-----\nAAAA\n-----END ", "PRIVATE KEY-----"].join("");
+    // A parser that quotes the value it refused (zod's "received '...'") quotes no secret
+    const inEnum = await saveProjectSettings("shop", {
+      baseHash: await hashOf(),
+      changes: [{ path: ["watchdog", "mode"], value: token }],
+    });
+    expect(inEnum.status).toBe(422);
+    const atMode = inEnum.check!.errors.filter((e) => e.path === "watchdog.mode").map((e) => e.message);
+    expect(atMode).toContainEqual(expect.stringContaining("received '[hidden]'"));
+    expect(JSON.stringify(inEnum.check!.errors)).not.toContain(token);
+    // By its key too: the value is known, wherever a message would quote it
+    const keyed = await saveProjectSettings("shop", {
+      baseHash: await hashOf(),
+      changes: [
+        { path: ["watchdog", "mode"], value: "plain-looking-value" },
+        { path: ["api_token"], value: "plain-looking-value" },
+      ],
+    });
+    expect(keyed.status).toBe(422);
+    expect(JSON.stringify(keyed.check!.errors)).not.toContain("plain-looking-value");
+
+    const pem =["-----BEGIN ", "PRIVATE KEY-----\nAAAA\n-----END ", "PRIVATE KEY-----"].join("");
     const inYaml = await saveProjectSettings("shop", {
       baseHash: await hashOf(),
       yaml: `${h.original}signing_key: ${JSON.stringify(pem)}\n`,
@@ -446,6 +466,106 @@ describe("saving", () => {
     expect(view.secrets).toContainEqual({ label: "Owner token", where: "data/owner.token", set: true });
     expect(view.secrets).toContainEqual({ label: "lair-node token", where: "env LAIR_NODE_TOKEN", set: false });
     expect(JSON.stringify(view.secrets)).not.toContain(readFileSync(join(h.data, "owner.token"), "utf-8").trim());
+  });
+
+  it("never copies a hand edit that holds a secret into the history: only a note of it", async () => {
+    const h = await setup();
+    await h.owner();
+    const token = ["ghp", "_", "R".repeat(36)].join("");
+    const inComment = ["glpat", "-", "c".repeat(24)].join("");
+
+    // A hand edit put a token in a value; the owner removes it from the form
+    writeFileSync(h.file, `${h.original}notes: "ci uses ${token}"\n`);
+    const view = (await loadProjectSettings("shop")).data!;
+    expect(view.errors).toContainEqual({ path: "notes", message: expect.stringContaining("a GitHub token") });
+    const saved = await saveProjectSettings("shop", { baseHash: view.hash, changes: [{ path: ["notes"], remove: true }] });
+    expect(saved.status).toBe(200);
+    expect(readFileSync(h.file, "utf-8")).toBe(h.original);
+    const versions = (await loadHistory("shop")).data!.versions;
+    expect(versions.map((v) => [v.action, v.redacted === true, v.bytes === 0])).toEqual([
+      ["save", false, false],
+      ["file", true, true],
+    ]);
+    // The note can't be shown or restored: there is no text to give
+    expect(await loadVersion("shop", versions[1].version)).toMatchObject({ status: 404, code: "not_kept" });
+    expect((await restoreVersion("shop", versions[1].version, { baseHash: await hashOf() })).status).toBe(404);
+
+    // A token in a comment: a form save keeps comments, so it is refused; the YAML tab removes it
+    writeFileSync(h.file, `${h.original}# deploys with ${inComment}\n`);
+    const commented = (await loadProjectSettings("shop")).data!;
+    const viaForm = await saveProjectSettings("shop", {
+      baseHash: commented.hash,
+      changes: [{ path: ["watchdog", "mode"], value: "act" }],
+    });
+    expect(viaForm.status).toBe(422);
+    expect(viaForm.check!.errors).toContainEqual({
+      path: "",
+      message: expect.stringMatching(/^line \d+: a comment looks like a GitLab token/),
+    });
+    const viaYaml = await saveProjectSettings("shop", { baseHash: commented.hash, yaml: h.original });
+    expect(viaYaml.status).toBe(200);
+    expect((await loadHistory("shop")).data!.versions[1]).toMatchObject({ action: "file", redacted: true });
+
+    for (const file of readdirSync(h.historyDir)) {
+      const text = readFileSync(join(h.historyDir, file), "utf-8");
+      expect(text, file).not.toContain(token);
+      expect(text, file).not.toContain(inComment);
+    }
+    expect(readdirSync(h.historyDir).filter((f) => f.endsWith(".yaml"))).toHaveLength(2);
+  });
+
+  it("needs the confirmation for fields that decide where Lair connects or sends code and tokens", async () => {
+    const h = await setup();
+    await h.owner();
+    const cases: [SettingsChange[], string[]][] = [
+      [
+        [{ path: ["machines", "build"], value: { type: "ssh", host: "198.51.100.7", user: "deploy", key: "~/.ssh/id_example" } }],
+        ["machines.build.host", "machines.build.key", "machines.build.user"],
+      ],
+      [
+        [{ path: ["delivery", "environments", "local", "compose_files"], value: ["./deploy/other.yaml"] }],
+        ["delivery.environments.local.compose_files"],
+      ],
+      [
+        [{ path: ["delivery", "environments", "local", "project_directory"], value: "./deploy" }],
+        ["delivery.environments.local.project_directory"],
+      ],
+      [
+        [{ path: ["delivery", "environments", "local", "deploy"], value: { repo: "/srv/other-checkout" } }],
+        ["delivery.environments.local.deploy.repo"],
+      ],
+      [[{ path: ["executors"], value: { github: { checkout_action: "example/checkout@v1" } } }], ["executors.github.checkout_action"]],
+      [[{ path: ["review"], value: { api_url: "https://github.example.com/api/v3" } }], ["review.api_url"]],
+    ];
+    for (const [changes, paths] of cases) {
+      const before = readFileSync(h.file, "utf-8");
+      const refused = await saveProjectSettings("shop", { baseHash: await hashOf(), changes });
+      expect(refused.status, paths.join(", ")).toBe(428);
+      expect(refused.check!.commands.map((c) => c.path)).toEqual(paths);
+      expect(readFileSync(h.file, "utf-8")).toBe(before);
+      const accepted = await saveProjectSettings("shop", {
+        baseHash: await hashOf(),
+        changes,
+        confirmCommands: refused.check!.commandsDigest,
+      });
+      expect(accepted.status, paths.join(", ")).toBe(200);
+    }
+
+    // The form marks them
+    const sections = (await loadSections()).data!.sections;
+    const field = (key: string, path: string[]) => {
+      const section = sections.find((s) => s.key === key)!;
+      let fields = sectionFields(section, null, null);
+      let found: FieldModel | undefined;
+      for (const [i, segment] of path.entries()) {
+        found = fields.find((f) => f.key === segment);
+        if (!found || i === path.length - 1) break;
+        fields = fieldsOf(found.schema, undefined, found.path, found.pattern.split("."), { section, known: null });
+      }
+      return found;
+    };
+    expect(field("review", ["api_url"])).toMatchObject({ sensitive: true, command: false });
+    expect(field("executors", ["github", "checkout_action"])).toMatchObject({ sensitive: true });
   });
 
   it("keeps unknown keys as they are and lists them read-only", async () => {

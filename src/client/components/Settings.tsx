@@ -219,7 +219,6 @@ export function Settings({ project, refreshKey }: Props) {
         {view && (
           <span style={muted}>
             {view.file}
-            {view.local ? "" : " (tracked in git: consider projects/local/)"}
           </span>
         )}
       </div>
@@ -263,6 +262,15 @@ export function Settings({ project, refreshKey }: Props) {
               </button>
             ))}
           </div>
+
+          {!view.local && tab !== "history" && (
+            <div className="card" data-tracked-hint="" style={{ borderColor: "var(--warning)", marginBottom: "1rem" }}>
+              <strong>This file is tracked by git.</strong> <code>{view.file}</code> is in <code>projects/</code>, which
+              git tracks in Lair's checkout: saving changes it there, and git shows the change. To keep this
+              project's settings private, copy it to <code>projects/local/{view.id}.yaml</code> (git-ignored); Settings
+              then edits that file.
+            </div>
+          )}
 
           {general.length > 0 && (
             <div className="error" style={{ marginBottom: "1rem" }}>

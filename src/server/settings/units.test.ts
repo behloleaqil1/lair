@@ -10,7 +10,7 @@ import { toJsonSchema } from "./json-schema.js";
 import { ChangeError, applyChanges, newConfigText } from "./yaml-doc.js";
 import { commandChanges, fieldErrors } from "./checks.js";
 import { githubOf } from "./service.js";
-import { collectCommands, findSecrets, isSecretKey } from "../../shared/settings-rules.js";
+import { collectCommands, commentSecrets, findSecrets, isSecretKey, redactSecrets } from "../../shared/settings-rules.js";
 import { formatDiff, lineDiff } from "../../shared/line-diff.js";
 import { diffValues, kindOf, setIn, textToList, textToNumber } from "../../client/settings-form";
 
@@ -193,6 +193,17 @@ describe("secrets", () => {
       },
     });
     expect(findings.map((f) => f.path)).toEqual(["a.1", "b.clone_url"]);
+  });
+
+  it("hides secrets in messages, and finds those in comments", () => {
+    const token = ["ghp", "_", "S".repeat(36)].join("");
+    expect(redactSecrets(`received '${token}'`)).toBe("received '[hidden]'");
+    expect(redactSecrets("received 'plain-value'", ["plain-value"])).toBe("received '[hidden]'");
+    const text = [`a: 1`, `  # old: ${token}`, `b: "x #y"`, `url: "https://example.com/#frag"`, `c: 2 # ${token}`].join("\n");
+    expect(commentSecrets(text)).toEqual([
+      { line: 2, why: "a comment looks like a GitHub token" },
+      { line: 5, why: "a comment looks like a GitHub token" },
+    ]);
   });
 });
 

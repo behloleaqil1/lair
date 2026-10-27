@@ -65,6 +65,9 @@ command changes, so the UI previews a save before it is made.
   `<version>.json` beside it: when, what (`create`, `save`, `restore`, or `file` for a version found on disk that
   Settings had not written, such as a hand edit, recorded before the save that replaces it), the file's hash, and who:
   the owner session's public id, never its value. The newest 50 versions are kept.
+- A version found on disk that holds anything that is or looks like a secret (a value by its key or shape, any line
+  by its shape, comments included) is never copied: only a note of it is kept (when, its hash), and it can't be
+  shown or restored.
 - Each version shows its diff from the version before it and to the current file. **Restore** saves that version's
   text through the same path as any save: validation, command confirmation, the 409 check, a new history entry.
 
@@ -97,7 +100,10 @@ and `move_cmd`, ...), when it is an argv under `actions`, `commands`, `probes` o
 commands), a step's `run`, a process's `command`, a placement machine's `probe`, or one of `gate_script`, `kiro_cli`,
 `ssh_cmd`; and a step's or process's `env` and `cwd`. The
 rule is in `src/shared/settings-rules.ts`, by key name and value shape, so blocks that other modules add later are
-covered; a hint can mark any other field.
+covered; a hint can mark any other field. Hints mark the fields that are not commands but decide what Lair
+runs or where it sends code and tokens as `sensitive`, which needs the same confirmation: a machine's `host`, `user`
+and `key`, an environment's `compose_files`, `project_directory` and `deploy.repo`, `executors.github.checkout_action`
+(it runs in CI with the repository's token), `review.api_url` (where the token is sent) and `review.merge.clone_url`.
 
 A save that adds or changes one of them is refused with HTTP 428 and the exact before and after of each (the argv
 lists as they will run), plus a digest of that list. The UI shows them and the owner confirms; the save is sent again
@@ -113,6 +119,10 @@ it looks like one wherever it is: a private key block, a known token format (Git
 variables, which the config names instead. The page shows "set" or "not set" for the secrets Lair knows: the owner
 token file, the environment variables the config names (`token_env` keys, with their defaults), and
 `LAIR_NODE_TOKEN`. Values never leave the server.
+
+Comments are scanned for values shaped like a secret too (a comment has no key). No error message quotes a secret: a
+parser's message (an enum's "received '...'") has every secret value of the config replaced by `[hidden]`, and a YAML
+error keeps only its first line, not the source lines it quotes.
 
 ### Owner only, bounded
 
@@ -150,6 +160,8 @@ the project exists), and live reload starts its modules.
 ### UI
 
 - **Settings** in the nav. Signed out, the view shows the sign-in hint and requests nothing.
+- A project whose file is in `projects/` (tracked by git in Lair's checkout, unlike `projects/local/`) shows that
+  saving changes a tracked file, and how to move it to `projects/local/`.
 - A project list with **New project**, and per project the tabs **Form**, **YAML** and **History**.
 - **Review changes** shows the diff, every error at its field and in a list, and the command changes with a
   confirmation box; **Save** is enabled only when the dry run passed. A 409 shows what changed and offers to review

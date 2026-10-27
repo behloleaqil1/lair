@@ -21,7 +21,7 @@ import {
   type Node as YamlNode,
 } from "yaml";
 import type { PathSegment, SettingsChange } from "../../shared/settings-types.js";
-import { isPlainObject, pathKey } from "../../shared/settings-rules.js";
+import { isPlainObject, pathKey, redactSecrets } from "../../shared/settings-rules.js";
 
 /** A change that can't be applied to the file (HTTP 400, nothing written). */
 export class ChangeError extends Error {
@@ -238,7 +238,8 @@ export function checkChanges(changes: unknown): SettingsChange[] {
 export function applyChanges(text: string, changes: SettingsChange[]): string {
   const { doc, errors } = parseConfigDocument(text);
   if (errors.length > 0) {
-    throw new ChangeError(`the file has YAML errors; fix them in the YAML tab first: ${errors[0]}`);
+    // The first line only: the lines a YAML error quotes could hold a secret
+    throw new ChangeError(`the file has YAML errors; fix them in the YAML tab first: ${redactSecrets(errors[0].split("\n")[0])}`);
   }
   for (const change of checkChanges(changes)) applyOne(doc, change);
   return doc.toString(TO_STRING);

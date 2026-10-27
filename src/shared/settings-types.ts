@@ -50,6 +50,12 @@ export interface FieldHint {
   advanced?: boolean;
   /** Makes Lair execute something (most are recognized by key: src/shared/settings-rules.ts) */
   command?: boolean;
+  /**
+   * Decides what Lair runs or where it sends code and tokens without being a
+   * command itself (a host, a checkout action, an API URL): a change to it
+   * needs the owner's confirmation like a command's
+   */
+  sensitive?: boolean;
 }
 
 /** One section of the forms: a module's block, or a group of top-level keys. */
@@ -218,6 +224,8 @@ export interface HistoryVersion {
   hash: string;
   bytes: number;
   restoredFrom?: string;
+  /** A version found on disk with a secret in it: only this note is kept, never its text */
+  redacted?: boolean;
 }
 
 export interface HistoryDetail {

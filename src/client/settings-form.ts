@@ -35,6 +35,8 @@ export interface FieldModel {
   advanced: boolean;
   /** Lair may run what this holds: changes to it are confirmed before a save */
   command: boolean;
+  /** Decides what Lair runs or where it sends code and tokens: confirmed before a save too */
+  sensitive: boolean;
   /** For a select: the allowed values; for text and lists: values to pick from */
   options?: string[];
   /** A key no schema knows: kept as it is, shown read-only */
@@ -150,6 +152,7 @@ export function fieldFor(
     help: hint?.help ?? s.description,
     advanced: hint?.advanced === true,
     command,
+    sensitive: hint?.sensitive === true,
     options: optionsFor(key, s, hint, ctx.known),
     readOnly: false,
   };
@@ -180,6 +183,7 @@ export function fieldsOf(schema: JsonSchema, value: unknown, path: PathSegment[]
         required: false,
         advanced: false,
         command: false,
+        sensitive: false,
         readOnly: true,
       });
     }

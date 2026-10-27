@@ -31,7 +31,7 @@ import type {
   SettingsCheck,
   SettingsSection,
 } from "../../shared/settings-types.js";
-import { isPlainObject } from "../../shared/settings-rules.js";
+import { isPlainObject, redactSecrets } from "../../shared/settings-rules.js";
 import { lineDiff } from "../../shared/line-diff.js";
 import type { ProjectConfig } from "../../shared/types.js";
 import {
@@ -45,7 +45,15 @@ import {
 import { parseDragonRegistry, parseAvailableModels } from "../parsers/dragon-config.js";
 import { BUILTIN_ADAPTERS } from "../services/adapters.js";
 import { configuredTokenEnvs } from "../restart/secrets.js";
-import { commandChanges, commandsDigest, fieldErrors, requiredErrors, secretErrors } from "./checks.js";
+import {
+  commandChanges,
+  commandsDigest,
+  fieldErrors,
+  holdsSecrets,
+  redactErrors,
+  requiredErrors,
+  secretErrors,
+} from "./checks.js";
 import { UnsafeFileError, checkDirectory, fileProblem, readProjectFile, sha256, writeFileAtomic } from "./files.js";
 import { ConfigHistory, VERSION_PATTERN } from "./history.js";
 import { ownedKeys, settingsSections } from "./registry.js";
@@ -225,12 +233,16 @@ export class SettingsService {
   validateText(id: string, text: string, shown: string): { values: Record<string, unknown> | null; errors: FieldError[] } {
     const { errors: yamlErrors } = parseConfigDocument(text);
     if (yamlErrors.length > 0) {
-      return { values: null, errors: yamlErrors.slice(0, 20).map((m) => ({ path: "", message: `YAML: ${m}` })) };
+      // Only a YAML error's first line (where it is): the lines it quotes after it could hold a secret
+      const errors = yamlErrors
+        .slice(0, 20)
+        .map((m) => ({ path: "", message: redactSecrets(`YAML: ${m.split("\n")[0]}`) }));
+      return { values: null, errors: [...errors, ...secretErrors({}, text)] };
     }
     const values = parseValues(text);
     if (!values) return { values: null, errors: [{ path: "", message: "the file's top level must be a mapping (key: value)" }] };
 
-    const errors: FieldError[] = [...secretErrors(values), ...requiredErrors(values)];
+    const errors: FieldError[] = [...secretErrors(values, text), ...requiredErrors(values)];
     let config: ProjectConfig | null = null;
     try {
       config = parseProjectConfig(text, id, shown);
@@ -242,7 +254,8 @@ export class SettingsService {
       else if (!problem.includes("missing required fields")) errors.push(...fieldErrors([problem]));
     }
     if (config) errors.push(...fieldErrors(this.options.validate(config)));
-    return { values, errors };
+    // A parser may quote the value it refused (an enum's "received '...'"): never a secret
+    return { values, errors: redactErrors(errors, values) };
   }
 
   private candidate(id: string, shown: string, before: Record<string, unknown> | null, text: string): Candidate {
@@ -450,9 +463,19 @@ export class SettingsService {
     return { hash: sha256(candidate.text), version: version.version, diff, reloadProblem: this.reloadNow(id) };
   }
 
-  /** The file as it is on disk, when Settings has not recorded it (a hand edit), so it can be restored. */
+  /**
+   * The file as it is on disk, when Settings has not recorded it (a hand
+   * edit), so it can be restored. A file that holds anything that is or
+   * looks like a secret is never copied into the history: only a note of it
+   * is kept, with its hash, so it is not noted again.
+   */
   private keepFoundOnDisk(id: string, current: string, hash: string): void {
-    if (this.history.list(id)[0]?.hash !== hash) this.history.record(id, current, { action: "file", by: null });
+    if (this.history.list(id)[0]?.hash === hash) return;
+    if (holdsSecrets(parseValues(current) ?? {}, current)) {
+      this.history.record(id, null, { action: "file", by: null, hash });
+    } else {
+      this.history.record(id, current, { action: "file", by: null });
+    }
   }
 
   private reloadNow(id: string): string | null {
@@ -476,6 +499,13 @@ export class SettingsService {
     if (!VERSION_PATTERN.test(version)) throw new SettingsError(400, "Invalid version", "bad_request");
     const found = this.history.read(id, version);
     if (!found) throw new SettingsError(404, `No version ${version} of ${id}`, "unknown_version");
+    if (found.yaml === null) {
+      throw new SettingsError(
+        404,
+        `Version ${version} of ${id} is not kept: the file held what looks like a secret when Settings found it, so only a note of it was kept`,
+        "not_kept",
+      );
+    }
     const list = this.history.list(id);
     const older = list.find((v) => v.version < version);
     const previous = older ? this.history.read(id, older.version) : null;
@@ -483,7 +513,7 @@ export class SettingsService {
     return {
       info: found.info,
       yaml: found.yaml,
-      fromPrevious: previous ? lineDiff(previous.yaml, found.yaml) : null,
+      fromPrevious: previous && previous.yaml !== null ? lineDiff(previous.yaml, found.yaml) : null,
       restoreDiff: lineDiff(current, found.yaml),
     };
   }

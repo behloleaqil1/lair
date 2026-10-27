@@ -105,11 +105,12 @@ export function SettingsHistory({ project, baseHash, onRestored }: Props) {
                 <td>
                   {ACTION_LABEL[v.action]}
                   {v.restoredFrom ? ` (from ${v.restoredFrom})` : ""}
+                  {v.redacted ? " (not kept: it held what looks like a secret)" : ""}
                 </td>
                 <td style={muted}>{v.by ? `owner session ${v.by.slice(0, 8)}` : "—"}</td>
                 <td style={muted}>{v.bytes} B</td>
                 <td>
-                  <button style={smallButton} onClick={() => void open(v.version)}>
+                  <button style={smallButton} disabled={v.redacted === true} onClick={() => void open(v.version)}>
                     Show
                   </button>
                 </td>

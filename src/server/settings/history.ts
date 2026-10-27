@@ -81,12 +81,16 @@ export class ConfigHistory {
     return versions.sort((a, b) => b.version.localeCompare(a.version));
   }
 
-  /** A version's text and record, or null when it is not kept. */
-  read(project: string, version: string): { info: HistoryVersion; yaml: string } | null {
+  /**
+   * A version's record and text, or null when it is not kept. A note (a
+   * version found on disk with a secret in it) has a record and no text.
+   */
+  read(project: string, version: string): { info: HistoryVersion; yaml: string | null } | null {
     if (!VERSION_PATTERN.test(version)) return null;
     const info = this.list(project).find((v) => v.version === version);
     const dir = this.dirOf(project, false);
     if (!info || !dir) return null;
+    if (info.redacted) return { info, yaml: null };
     const yaml = readProjectFile(join(dir, `${version}.yaml`), `${version}.yaml`, this.options.maxBytes);
     return yaml === null ? null : { info, yaml };
   }
@@ -102,8 +106,16 @@ export class ConfigHistory {
     return `${stamp}-${random}`;
   }
 
-  /** Keep `yaml` as a new version; older ones past `keep` are removed. */
-  record(project: string, yaml: string, meta: { action: HistoryAction; by: string | null; restoredFrom?: string }): HistoryVersion {
+  /**
+   * Keep `yaml` as a new version; older ones past `keep` are removed. With
+   * `yaml` null, only a note is kept (when, what, the hash of the text in
+   * `meta.hash`): the text is never written.
+   */
+  record(
+    project: string,
+    yaml: string | null,
+    meta: { action: HistoryAction; by: string | null; restoredFrom?: string; hash?: string },
+  ): HistoryVersion {
     const dir = this.dirOf(project, true)!;
     const version = this.nextVersion();
     const info: HistoryVersion = {
@@ -111,11 +123,12 @@ export class ConfigHistory {
       at: new Date(this.clock.now()).toISOString(),
       action: meta.action,
       by: meta.by,
-      hash: sha256(yaml),
-      bytes: Buffer.byteLength(yaml, "utf-8"),
+      hash: yaml === null ? (meta.hash ?? "") : sha256(yaml),
+      bytes: yaml === null ? 0 : Buffer.byteLength(yaml, "utf-8"),
       ...(meta.restoredFrom ? { restoredFrom: meta.restoredFrom } : {}),
+      ...(yaml === null ? { redacted: true } : {}),
     };
-    writeFileAtomic(join(dir, `${version}.yaml`), yaml, { mode: 0o600 });
+    if (yaml !== null) writeFileAtomic(join(dir, `${version}.yaml`), yaml, { mode: 0o600 });
     writeFileAtomic(join(dir, `${version}.json`), `${JSON.stringify(info, null, 2)}\n`, { mode: 0o600 });
     this.prune(dir, project);
     return info;

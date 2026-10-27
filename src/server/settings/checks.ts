@@ -5,7 +5,15 @@
  */
 import { createHash } from "crypto";
 import type { CommandChange, FieldError, PathSegment, SettingsSection } from "../../shared/settings-types.js";
-import { collectCommands, findSecrets, isPlainObject, pathKey } from "../../shared/settings-rules.js";
+import {
+  collectCommands,
+  commentSecrets,
+  findSecrets,
+  isPlainObject,
+  pathKey,
+  redactSecrets,
+  secretValueKind,
+} from "../../shared/settings-rules.js";
 import { stableJson } from "../reload/modules.js";
 
 /** The keys loadProjectConfig requires */
@@ -55,26 +63,48 @@ export function requiredErrors(values: Record<string, unknown>): FieldError[] {
   );
 }
 
-/** One error per field that holds a secret; the message never repeats the value. */
-export function secretErrors(values: unknown): FieldError[] {
-  return findSecrets(values).map((finding) => ({
-    path: finding.path,
-    message:
-      `${finding.why}. Secrets never go in the project file: keep it in a file under data/ (mode 0600) or in an ` +
-      `environment variable, and name that here instead (a *_env or *_file key)`,
-  }));
+const SECRET_ADVICE =
+  "Secrets never go in the project file: keep it in a file under data/ (mode 0600) or in an environment variable, " +
+  "and name that here instead (a *_env or *_file key)";
+
+/** One error per field that holds a secret, and per comment line that looks like one; never the value. */
+export function secretErrors(values: unknown, text = ""): FieldError[] {
+  return [
+    ...findSecrets(values).map((finding) => ({ path: finding.path, message: `${finding.why}. ${SECRET_ADVICE}` })),
+    ...commentSecrets(text).map((found) => ({ path: "", message: `line ${found.line}: ${found.why}. ${SECRET_ADVICE}` })),
+  ];
+}
+
+/**
+ * Whether a file, as it is on disk, holds anything that is or looks like a
+ * secret: a value by its key or its shape, or any line (comments included,
+ * and a file that doesn't parse) by its shape.
+ */
+export function holdsSecrets(values: unknown, text: string): boolean {
+  if (findSecrets(values).length > 0) return true;
+  return text.split("\n").some((line) => secretValueKind(line) !== null);
+}
+
+/**
+ * The errors with every secret the config holds hidden: a parser's message
+ * may quote the value it refused (an enum's "received '...'", a YAML
+ * error's line), and none may reach the answer.
+ */
+export function redactErrors(errors: FieldError[], values: unknown): FieldError[] {
+  const known = findSecrets(values).map((f) => f.value);
+  return errors.map((e) => ({ path: e.path, message: redactSecrets(e.message, known) }));
 }
 
 function matches(pattern: string[], path: PathSegment[]): boolean {
   return pattern.length === path.length && pattern.every((p, i) => p === "*" || p === String(path[i]));
 }
 
-/** Fields a section's hints mark as commands, beyond the shared rule. */
+/** Fields a section's hints mark as commands or as sensitive, beyond the shared rule. */
 function hintedCommands(values: unknown, sections: readonly SettingsSection[]): Map<string, unknown> {
   const patterns: string[][] = [];
   for (const section of sections) {
     for (const [field, hint] of Object.entries(section.hints)) {
-      if (!hint.command) continue;
+      if (!hint.command && !hint.sensitive) continue;
       const rel = field.split(".");
       patterns.push(section.root ? rel : [section.key, ...rel]);
     }
