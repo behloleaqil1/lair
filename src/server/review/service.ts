@@ -828,9 +828,15 @@ export class ReviewService {
     }
   }
 
+  /** True while a merge runs (a restart waits for it) */
+  get mergeInProgress(): boolean {
+    return this.merging;
+  }
+
   /**
-   * Stop for a config reload: a merge in progress and the test integrity
-   * checks running now finish; a merge asked for from now on gets 503.
+   * Stop for a config reload or a shutdown: a merge in progress and the
+   * test integrity checks running now finish; a merge asked for from now on
+   * gets 503.
    */
   async drain(): Promise<void> {
     this.closing = true;
@@ -950,6 +956,21 @@ export class ReviewManager {
       repo: service ? service.settings.repo : null,
       readOnly: this.configs.get(project)?.read_only === true,
     };
+  }
+
+  /** The merges running now, as "a merge in <project>" (a restart waits for them). */
+  busy(): string[] {
+    return [...this.services.entries()].filter(([, s]) => s.mergeInProgress).map(([project]) => `a merge in ${project}`);
+  }
+
+  /**
+   * Shut down: every merge in progress finishes (new ones get 503), so its
+   * record is written before the store closes; then close().
+   */
+  async stop(): Promise<void> {
+    this.closed = true;
+    await Promise.all([...this.services.values()].map((s) => s.drain()));
+    this.close();
   }
 
   close(): void {

@@ -5,13 +5,23 @@
  */
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { execFileSync } from "child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import type { ProjectConfig } from "../../shared/types.js";
 import { HumanAuth, OWNER_SESSION_HEADER, registerOwnerRoutes } from "../human-auth/index.js";
 import { signIn } from "../../client/owner-session";
 import { requestRestart, restartQuestion, restartStatus } from "../../client/server-controls";
-import { RestartController, parseServerConfig, registerRestartRoutes, serviceManagerOf } from "./index.js";
+import {
+  RestartController,
+  configuredTokenEnvs,
+  loadServerConfig,
+  parseServerConfig,
+  registerRestartRoutes,
+  serviceManagerOf,
+  type RestartControllerOptions,
+} from "./index.js";
 
 /** The dashboard in a browser, as requests carry it (no session yet) */
 const BROWSER = { origin: "http://localhost:4777", "sec-fetch-site": "same-origin" };
@@ -40,11 +50,14 @@ afterEach(async () => {
   harness = null;
 });
 
-async function setup(server?: unknown, env: NodeJS.ProcessEnv = process.env): Promise<Harness> {
+async function setup(server?: unknown, extra: Partial<RestartControllerOptions> = {}): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), "lair-restart-"));
   const configPath = join(dir, "server.yaml");
-  // YAML is a superset of JSON
-  if (server !== undefined) writeFileSync(configPath, JSON.stringify(server));
+  // YAML is a superset of JSON; the file must be the owner's and not group/other-writable
+  if (server !== undefined) {
+    writeFileSync(configPath, JSON.stringify(server));
+    chmodSync(configPath, 0o600);
+  }
   const calls: string[] = [];
   const shutdown = vi.fn(async () => {
     calls.push("shutdown");
@@ -52,7 +65,17 @@ async function setup(server?: unknown, env: NodeJS.ProcessEnv = process.env): Pr
   const exit = vi.fn((code: number) => {
     calls.push(`exit ${code}`);
   });
-  const controller = new RestartController({ shutdown, exit, configPath, cwd: dir, env, platform: "linux", delayMs: 0, log: quiet });
+  const controller = new RestartController({
+    shutdown,
+    exit,
+    configPath,
+    cwd: dir,
+    env: process.env,
+    platform: "linux",
+    delayMs: 0,
+    log: quiet,
+    ...extra,
+  });
   const app = Fastify({ logger: false });
   const tokenPath = join(dir, "owner.token");
   const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
@@ -189,15 +212,66 @@ describe("POST /api/owner/restart", () => {
     expect(invalid.calls).toEqual([]);
   });
 
-  it("runs the update without Lair's own variables", async () => {
+  it("runs the update without Lair's own variables and without the projects' token variables", async () => {
     const h = await setup(
-      { server: { update_cmd: [step("console.log(String(process.env.LAIR_GITHUB_TOKEN), process.env.KEEP_ME)")] } },
-      { ...process.env, LAIR_GITHUB_TOKEN: "s3cret", KEEP_ME: "kept" },
+      {
+        server: {
+          update_cmd: [
+            step("console.log(String(process.env.LAIR_GITHUB_TOKEN), String(process.env.REVIEW_TOKEN), process.env.KEEP_ME)"),
+          ],
+        },
+      },
+      {
+        env: { ...process.env, LAIR_GITHUB_TOKEN: "s3cret", REVIEW_TOKEN: "s3cret-too", KEEP_ME: "kept" },
+        secretEnv: () => ["REVIEW_TOKEN"],
+      },
     );
     await post(h, { update: true }, h.owner);
     await h.controller.settled();
-    expect(h.controller.status().output).toContain("undefined kept");
+    expect(h.controller.status().output).toContain("undefined undefined kept");
     expect(h.controller.status().output.join("\n")).not.toContain("s3cret");
+  });
+
+  it("answers 409 while a merge or a delivery operation runs, and restarts nothing", async () => {
+    let busy = ["a merge in shop", "deploy of shop/local (since 2026-03-02T12:00:00.000Z)"];
+    const h = await setup({ server: { update_cmd: [step("console.log('ok')")] } }, { busy: () => busy });
+    for (const payload of [{}, { update: true }]) {
+      const res = await post(h, payload, h.owner);
+      expect(res.statusCode).toBe(409);
+      expect(res.json().error).toBe(
+        "Not now: a merge in shop; deploy of shop/local (since 2026-03-02T12:00:00.000Z). Restart when it has finished",
+      );
+    }
+    await h.controller.settled();
+    expect(h.calls).toEqual([]);
+    expect(h.controller.status().state).toBe("idle");
+
+    busy = [];
+    expect((await post(h, {}, h.owner)).statusCode).toBe(202);
+    await h.controller.settled();
+    expect(h.calls).toEqual(["shutdown", "exit 0"]);
+  });
+
+  it("after an update, waits for work that started meanwhile before shutting down (bounded)", async () => {
+    let checks = 0;
+    // Free at the request (check 1); busy at checks 2 and 3, after the update; free again at check 4
+    const h = await setup(
+      { server: { update_cmd: [step("console.log('ok')")] } },
+      { busy: () => (++checks >= 2 && checks <= 3 ? ["a merge in shop"] : []), busyWaitMs: 10_000 },
+    );
+    expect((await post(h, { update: true }, h.owner)).statusCode).toBe(202);
+    await h.controller.settled();
+    expect(h.controller.status().output).toContain("Waiting for: a merge in shop");
+    expect(checks).toBe(4);
+    expect(h.calls).toEqual(["shutdown", "exit 0"]);
+  });
+
+  it("exits with code 0 when the shutdown hangs past its deadline", async () => {
+    const h = await setup(undefined, { shutdownTimeoutMs: 50 });
+    h.shutdown.mockImplementationOnce(() => new Promise(() => undefined));
+    expect((await post(h, {}, h.owner)).statusCode).toBe(202);
+    await h.controller.settled();
+    expect(h.exit).toHaveBeenCalledWith(0);
   });
 
   it("the dashboard's helpers send the same requests (owner only)", async () => {
@@ -249,15 +323,93 @@ describe("server config", () => {
   });
 });
 
-describe("serviceManagerOf", () => {
-  it("prefers server.service_manager", () => {
-    expect(serviceManagerOf("launchd", {}, "linux")).toMatchObject({ name: "launchd", source: "configured" });
-    expect(serviceManagerOf("none", { INVOCATION_ID: "abc" }, "linux")).toMatchObject({ name: null, source: "configured" });
+describe("data/server.yaml file checks", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+  const SERVER = JSON.stringify({ server: { update_cmd: [["git", "pull"]] } });
+  function file(mode = 0o600): { dir: string; path: string } {
+    const dir = mkdtempSync(join(tmpdir(), "lair-server-config-"));
+    dirs.push(dir);
+    const path = join(dir, "server.yaml");
+    writeFileSync(path, SERVER);
+    chmodSync(path, mode);
+    return { dir, path };
+  }
+  const linux = { platform: "linux" as const };
+  const refusal = (result: ReturnType<typeof loadServerConfig>) => (result.ok ? null : result.errors.join("; "));
+
+  it("reads the owner's regular file, mode 600 or 644", () => {
+    expect(loadServerConfig(file(0o600).path, linux)).toMatchObject({ ok: true, settings: { updateSteps: [["git", "pull"]] } });
+    expect(loadServerConfig(file(0o644).path, linux).ok).toBe(true);
+    expect(loadServerConfig(join(tmpdir(), "lair-no-such-dir", "server.yaml"), linux)).toMatchObject({ ok: true });
   });
 
-  it("detects systemd and launchd from their environment", () => {
-    expect(serviceManagerOf(null, { INVOCATION_ID: "abc" }, "linux")).toMatchObject({ name: "systemd", source: "detected" });
-    expect(serviceManagerOf(null, { XPC_SERVICE_NAME: "dev.lair.server" }, "darwin")).toMatchObject({
+  it("refuses a symbolic link, a group- or other-writable file, another user's file and a directory", () => {
+    const real = file();
+    const link = join(real.dir, "link.yaml");
+    symlinkSync(real.path, link);
+    expect(refusal(loadServerConfig(link, linux))).toBe("refused: it is a symbolic link");
+    expect(refusal(loadServerConfig(file(0o664).path, linux))).toBe("refused: its group or other users may write it (mode 664): chmod 600 it");
+    expect(refusal(loadServerConfig(file(0o602).path, linux))).toContain("refused: its group or other users may write it");
+    const uid = (process.getuid?.() ?? 0) + 1;
+    expect(refusal(loadServerConfig(real.path, { ...linux, uid }))).toContain("refused: it is owned by another user");
+    const dir = join(real.dir, "dir.yaml");
+    mkdirSync(dir);
+    expect(refusal(loadServerConfig(dir, linux))).toBe("refused: it is not a regular file");
+  });
+
+  it.skipIf(process.platform === "win32")("refuses a FIFO without blocking on it", () => {
+    const { dir } = file();
+    const fifo = join(dir, "fifo.yaml");
+    execFileSync("mkfifo", [fifo]);
+    expect(refusal(loadServerConfig(fifo, linux))).toBe("refused: it is not a regular file");
+  });
+
+  it("an Update and restart with a refused file is a 400, and Restart says why in its status", async () => {
+    const h = await setup({ server: { update_cmd: [step("console.log('ok')")] } });
+    chmodSync(join(h.dir, "server.yaml"), 0o666);
+    const res = await post(h, { update: true }, h.owner);
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toContain("refused: its group or other users may write it");
+    expect(h.controller.status().configError).toContain("refused");
+    expect(h.calls).toEqual([]);
+  });
+});
+
+describe("configuredTokenEnvs", () => {
+  const base = { name: "x", repo: "/r", github: "o/r", queue_file: "/q", agents_dir: "/a", gates_dir: "/g", machines: {} };
+  it("names the token variables of the modules that are on", () => {
+    const configs = [
+      { ...base, review: { enabled: true, token_env: "REVIEW_TOKEN", merge: { gate: { source: "checks", required: ["build"] } } } },
+      { ...base, executors: { github: { token_env: "CI_TOKEN" } } },
+      { ...base, review: { enabled: false, token_env: "UNUSED_TOKEN" } },
+    ] as unknown as ProjectConfig[];
+    expect(configuredTokenEnvs(configs)).toEqual(["CI_TOKEN", "REVIEW_TOKEN"]);
+  });
+});
+
+describe("serviceManagerOf", () => {
+  it("prefers server.service_manager", () => {
+    expect(serviceManagerOf("launchd", {}, "linux", 999)).toMatchObject({ name: "launchd", source: "configured" });
+    expect(serviceManagerOf("none", { INVOCATION_ID: "abc", JOURNAL_STREAM: "8:1" }, "linux", 1)).toMatchObject({
+      name: null,
+      source: "configured",
+    });
+  });
+
+  it("takes systemd's INVOCATION_ID only beside JOURNAL_STREAM or a parent pid of 1, and says probably", () => {
+    expect(serviceManagerOf(null, { INVOCATION_ID: "abc", JOURNAL_STREAM: "8:1" }, "linux", 999)).toMatchObject({
+      name: "systemd",
+      source: "detected",
+    });
+    const viaPid1 = serviceManagerOf(null, { INVOCATION_ID: "abc" }, "linux", 1);
+    expect(viaPid1).toMatchObject({ name: "systemd", source: "detected" });
+    expect(viaPid1.note).toMatch(/^Probably started by systemd/);
+    // A terminal of a systemd user session inherits INVOCATION_ID alone
+    expect(serviceManagerOf(null, { INVOCATION_ID: "abc" }, "linux", 999)).toMatchObject({ name: null, source: "unknown" });
+    expect(serviceManagerOf(null, { XPC_SERVICE_NAME: "dev.lair.server" }, "darwin", 999)).toMatchObject({
       name: "launchd",
       source: "detected",
     });
@@ -265,10 +417,10 @@ describe("serviceManagerOf", () => {
 
   it("says when it can't tell", () => {
     for (const env of [{}, { XPC_SERVICE_NAME: "0" }, { XPC_SERVICE_NAME: "application.com.apple.Terminal.1" }]) {
-      const view = serviceManagerOf(null, env, "darwin");
+      const view = serviceManagerOf(null, env, "darwin", 999);
       expect(view).toMatchObject({ name: null, source: "unknown" });
       expect(view.note).toContain("can't tell");
     }
-    expect(serviceManagerOf(null, { XPC_SERVICE_NAME: "dev.lair.server" }, "linux").source).toBe("unknown");
+    expect(serviceManagerOf(null, { XPC_SERVICE_NAME: "dev.lair.server" }, "linux", 999).source).toBe("unknown");
   });
 });

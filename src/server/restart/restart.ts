@@ -17,11 +17,19 @@ import { spawn } from "child_process";
 import { relative, sep } from "path";
 import type { EventBus } from "../core/event-bus.js";
 import type { RestartState, RestartStatusView } from "../../shared/lifecycle-types.js";
-import { loadServerConfig, serviceManagerOf, type ServerSettings } from "./server-config.js";
+import {
+  loadServerConfig,
+  serviceManagerOf,
+  type ServerConfigFileOptions,
+  type ServerSettings,
+} from "./server-config.js";
 
 const MAX_LINES = 400;
 const MAX_LINE = 2000;
 const KILL_GRACE_MS = 5000;
+/** A graceful shutdown that takes longer than this is given up on, and the process exits anyway */
+export const SHUTDOWN_DEADLINE_MS = 60_000;
+const BUSY_POLL_MS = 1000;
 
 export interface RestartControllerOptions {
   /** The server's graceful shutdown (stops the modules, closes the stores and Fastify) */
@@ -34,10 +42,54 @@ export interface RestartControllerOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
+  /** The parent pid, for the service manager hint (default: process.ppid) */
+  ppid?: number;
+  /** Who must own data/server.yaml (tests) */
+  fileOptions?: ServerConfigFileOptions;
+  /**
+   * Work a restart would cut off (a merge, a delivery operation): while any
+   * runs, Restart answers 409; after an update, the restart waits for it
+   * (at most busyWaitMs)
+   */
+  busy?: () => string[];
+  /** Environment variables the update must not get besides LAIR_* (the projects' token variables) */
+  secretEnv?: () => string[];
   /** Pause between the 202 and the shutdown, so the answer reaches the browser (default 250 ms) */
   delayMs?: number;
+  /** How long the restart after an update waits for busy work to end (default 120 s) */
+  busyWaitMs?: number;
+  /** How long the graceful shutdown may take before the process exits anyway (default 60 s) */
+  shutdownTimeoutMs?: number;
   events?: EventBus;
   log?: Pick<Console, "log" | "warn" | "error">;
+}
+
+/**
+ * `work`, or give up on it after `ms`: resolves true when it finished in
+ * time (or failed: `onError` gets the error), false at the deadline.
+ */
+export async function withDeadline(
+  work: Promise<unknown>,
+  ms: number,
+  onError: (e: unknown) => void = () => undefined,
+): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+    timer.unref();
+  });
+  const done = work.then(
+    () => true as const,
+    (e) => {
+      onError(e);
+      return true as const;
+    },
+  );
+  try {
+    return await Promise.race([done, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export type RestartRequestResult = { ok: true; status: RestartStatusView } | { ok: false; code: number; error: string };
@@ -50,11 +102,15 @@ export interface StepResult {
   error?: string;
 }
 
-/** The server's environment for the update, without Lair's own variables (tokens among them). */
-export function updateEnvironment(source: NodeJS.ProcessEnv): Record<string, string> {
+/**
+ * The server's environment for the update, without Lair's own variables
+ * (LAIR_*) and without `secrets` (the token variables the projects name).
+ */
+export function updateEnvironment(source: NodeJS.ProcessEnv, secrets: readonly string[] = []): Record<string, string> {
+  const strip = new Set(secrets);
   const env: Record<string, string> = {};
   for (const [name, value] of Object.entries(source)) {
-    if (value !== undefined && !name.toUpperCase().startsWith("LAIR_")) env[name] = value;
+    if (value !== undefined && !name.toUpperCase().startsWith("LAIR_") && !strip.has(name)) env[name] = value;
   }
   return env;
 }
@@ -165,8 +221,20 @@ export class RestartController {
     return rel && !rel.startsWith("..") ? rel.split(sep).join("/") : this.options.configPath;
   }
 
+  private loadConfig() {
+    return loadServerConfig(this.options.configPath, { platform: this.options.platform, ...this.options.fileOptions });
+  }
+
+  private busyWork(): string[] {
+    try {
+      return this.options.busy?.() ?? [];
+    } catch (e) {
+      return [`can't tell what runs (${e instanceof Error ? e.message : String(e)})`];
+    }
+  }
+
   status(): RestartStatusView {
-    const loaded = loadServerConfig(this.options.configPath);
+    const loaded = this.loadConfig();
     return {
       state: this.state,
       startedAt: this.startedAt,
@@ -177,7 +245,12 @@ export class RestartController {
         steps: loaded.settings.updateSteps,
         timeoutSeconds: loaded.settings.updateTimeoutSeconds,
       },
-      serviceManager: serviceManagerOf(loaded.settings.serviceManager, this.options.env, this.options.platform),
+      serviceManager: serviceManagerOf(
+        loaded.settings.serviceManager,
+        this.options.env,
+        this.options.platform,
+        this.options.ppid,
+      ),
       output: [...this.output],
       error: this.error,
       requestedAt: this.requestedAt,
@@ -187,15 +260,20 @@ export class RestartController {
   /**
    * Restart (after the update when `update`). The answer is immediate; the
    * update and the shutdown run after it. Refused (409) while one is under
-   * way, and (400) for an update without a valid server.update_cmd.
+   * way or while work a restart would cut off runs (a merge, a delivery
+   * operation), and (400) for an update without a valid server.update_cmd.
    */
   request(options: { update: boolean }): RestartRequestResult {
     if (this.state === "updating" || this.state === "restarting") {
       return { ok: false, code: 409, error: `Lair is already ${this.state}` };
     }
+    const busy = this.busyWork();
+    if (busy.length > 0) {
+      return { ok: false, code: 409, error: `Not now: ${busy.join("; ")}. Restart when it has finished` };
+    }
     let settings: ServerSettings | null = null;
     if (options.update) {
-      const loaded = loadServerConfig(this.options.configPath);
+      const loaded = this.loadConfig();
       if (!loaded.ok) return { ok: false, code: 400, error: `${this.configFile} has an error: ${loaded.errors.join("; ")}` };
       if (loaded.settings.updateSteps.length === 0) {
         return { ok: false, code: 400, error: `There is no server.update_cmd in ${this.configFile}: set one, or use Restart` };
@@ -225,7 +303,13 @@ export class RestartController {
 
   private async run(settings: ServerSettings | null): Promise<void> {
     if (settings) {
-      const env = updateEnvironment(this.options.env ?? process.env);
+      let secrets: string[] = [];
+      try {
+        secrets = this.options.secretEnv?.() ?? [];
+      } catch (e) {
+        this.log.warn("[restart] could not list the projects' token variables:", e);
+      }
+      const env = updateEnvironment(this.options.env ?? process.env, secrets);
       const steps = settings.updateSteps;
       for (const [i, argv] of steps.entries()) {
         this.line(`$ ${argv.join(" ")}`);
@@ -244,16 +328,25 @@ export class RestartController {
         }
       }
       this.line("Update finished: restarting");
+      // A merge or a delivery operation may have started while it ran: let it end (bounded)
+      const until = Date.now() + (this.options.busyWaitMs ?? 120_000);
+      let busy = this.busyWork();
+      if (busy.length > 0) this.line(`Waiting for: ${busy.join("; ")}`);
+      while (busy.length > 0 && Date.now() < until) {
+        await new Promise((resolve) => setTimeout(resolve, BUSY_POLL_MS));
+        busy = this.busyWork();
+      }
+      if (busy.length > 0) this.line(`Still running, restarting anyway: ${busy.join("; ")}`);
     }
     this.state = "restarting";
     this.log.log("[restart] The owner asked for a restart: shutting down, then exiting with code 0");
     void this.options.events?.emit("server.restarting", { update: settings !== null });
     await new Promise((resolve) => setTimeout(resolve, this.options.delayMs ?? 250));
-    try {
-      await this.options.shutdown();
-    } catch (e) {
+    const deadline = this.options.shutdownTimeoutMs ?? SHUTDOWN_DEADLINE_MS;
+    const finished = await withDeadline(this.options.shutdown(), deadline, (e) => {
       this.log.error("[restart] the shutdown failed; exiting anyway:", e);
-    }
+    });
+    if (!finished) this.log.error(`[restart] the shutdown took more than ${deadline / 1000} s; exiting anyway`);
     this.options.exit(0);
   }
 }

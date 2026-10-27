@@ -133,16 +133,50 @@ export function stableJson(value: unknown): string {
 }
 
 /**
+ * Top-level keys none of these modules reads: the dashboard's controls and
+ * commands, the merge bar, the process manager, the orchestrator, the model
+ * list. A change to them reloads nothing. Any other key no module owns
+ * (name, repo, read_only, dragons, machines, agents_dir, an undeclared key
+ * such as agent_adapters...) may be read by any module, so a change to it
+ * reloads them all. modules.test.ts checks this list against the modules'
+ * code.
+ */
+export const UNREAD_KEYS: ReadonlySet<string> = new Set([
+  "status_cmd",
+  "orchestrator",
+  "allow_direct_assign",
+  "outbox_file",
+  "backlog_file",
+  "ask_cmd",
+  "tick_now_cmd",
+  "pause_cmd",
+  "resume_cmd",
+  "agent_run_cmd",
+  "agent_stop_cmd",
+  "agent_release_cmd",
+  "gate_submit_cmd",
+  "gate_stuck_cmd",
+  "merge_cmd",
+  "merge_bar",
+  "processes",
+  "available_models",
+  "gate_runner",
+  "dragon_start_cmd",
+  "dragon_stop_cmd",
+  "dragon_release_cmd",
+]);
+
+/**
  * What `module` reads of `config`: its own blocks, the blocks it also
  * reads, and every top-level key no module owns (name, repo, read_only,
- * dragons, machines...), which any module may read. Two configs with the
- * same fingerprint run the module the same way.
+ * dragons, machines...) except UNREAD_KEYS. Two configs with the same
+ * fingerprint run the module the same way.
  */
 export function fingerprint(module: ReloadableModule, config: ProjectConfig, owned: ReadonlySet<string>): string {
   const mine = new Set([...module.blocks, ...(module.reads ?? [])]);
   const slice: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(config)) {
-    if (mine.has(key) || !owned.has(key)) slice[key] = value;
+    if (mine.has(key) || (!owned.has(key) && !UNREAD_KEYS.has(key))) slice[key] = value;
   }
   return stableJson(slice);
 }

@@ -20,6 +20,7 @@
  * again with the previous one, so none is left half-started.
  */
 import { watch, type FSWatcher } from "chokidar";
+import { existsSync } from "fs";
 import { relative, sep } from "path";
 import type { EventBus } from "../core/event-bus.js";
 import type { ProjectConfig } from "../../shared/types.js";
@@ -76,6 +77,8 @@ export class ConfigReloader {
   private timers = new Map<string, NodeJS.Timeout>();
   /** project -> the latest valid config and its file */
   private desired = new Map<string, { config: ProjectConfig; file: string }>();
+  /** project -> the file (absolute) whose config the modules run */
+  private paths = new Map<string, string>();
   /** project\0module -> what that module runs for the project */
   private running = new Map<string, Running>();
   private slots = new Map<string, Slot>();
@@ -91,7 +94,9 @@ export class ConfigReloader {
     for (const entry of options.initial) {
       if (!entry.config) continue;
       try {
-        this.desired.set(entry.name, { config: entry.config, file: this.display(getConfigPath(entry.name, this.dir)) });
+        const path = getConfigPath(entry.name, this.dir);
+        this.paths.set(entry.name, path);
+        this.desired.set(entry.name, { config: entry.config, file: this.display(path) });
       } catch {
         // Not a file of this directory: it is only compared against
       }
@@ -131,7 +136,15 @@ export class ConfigReloader {
       this.log.warn(`[config] watching ${this.display(this.dir)} failed: ${message(error)}`);
     });
     this.readyPromise = new Promise<void>((resolve) => {
-      watcher.once("ready", () => resolve());
+      watcher.once("ready", () => {
+        // A file changed between the startup load and now is seen here
+        try {
+          for (const project of listProjects(this.dir)) this.apply(project, { quiet: true });
+        } catch (e) {
+          this.log.warn(`[config] checking ${this.display(this.dir)} at startup failed: ${message(e)}`);
+        }
+        resolve();
+      });
     });
     this.watcher = watcher;
   }
@@ -213,20 +226,42 @@ export class ConfigReloader {
     return [...this.running.entries()].some(([k, r]) => k.startsWith(`${project}\0`) && r.entry.config !== undefined);
   }
 
-  /** Read and check the project's file; when it is valid, reload the modules whose part changed. */
-  apply(project: string): void {
+  /**
+   * Read and check the project's file; when it is valid, reload the modules
+   * whose part changed. The modules keep running the file they run now:
+   * when that file is gone, or another one takes its place (deleting
+   * projects/local/x.yaml would fall back to projects/x.yaml; a new
+   * projects/local/x.yaml would win over it), nothing changes until a
+   * restart, and the banner says so.
+   */
+  apply(project: string, options: { quiet?: boolean } = {}): void {
     if (this.stopped) return;
     const previousRunning = this.runsSomething(project);
+    const runningPath = this.paths.get(project);
     if (!listProjects(this.dir).includes(project)) {
       if (previousRunning) {
-        const file = this.desired.get(project)?.file ?? `projects/${project}.yaml`;
+        const file = runningPath ? this.display(runningPath) : `projects/${project}.yaml`;
         this.problem(project, file, "the file was removed; Lair keeps running the previous config until it restarts", true);
       } else {
         this.problems.delete(project);
       }
       return;
     }
-    const file = this.display(getConfigPath(project, this.dir));
+    const path = getConfigPath(project, this.dir);
+    if (previousRunning && runningPath && runningPath !== path) {
+      const running = this.display(runningPath);
+      const instead = this.display(path);
+      this.problem(
+        project,
+        running,
+        existsSync(runningPath)
+          ? `${instead} now takes its place; Lair keeps running ${running} until it restarts`
+          : `the file was removed, so ${instead} would apply instead; Lair keeps running the previous config until it restarts`,
+        true,
+      );
+      return;
+    }
+    const file = this.display(path);
     let config: ProjectConfig;
     try {
       config = loadProjectConfig(project, this.dir);
@@ -249,16 +284,22 @@ export class ConfigReloader {
     }
     this.problems.delete(project);
     this.desired.set(project, { config, file });
+    this.paths.set(project, path);
     try {
       this.options.onAccepted?.(project, config);
     } catch (e) {
       this.log.warn(`[config] ${file}: ${message(e)}`);
     }
+    // A module whose reload is in flight is queued too: it is applying an
+    // older version, and the latest (even one equal to what ran before it)
+    // must follow it. reloadOne() skips a module that already runs it.
     const changed = this.options.modules.filter(
-      (m) => this.running.get(this.key(project, m))?.fingerprint !== this.fingerprintOf(m, config),
+      (m) =>
+        this.slots.get(this.key(project, m))?.running ||
+        this.running.get(this.key(project, m))?.fingerprint !== this.fingerprintOf(m, config),
     );
     if (changed.length === 0) {
-      this.log.log(`[config] ${file} changed; no module's settings did`);
+      if (!options.quiet) this.log.log(`[config] ${file} changed; no module's settings did`);
       return;
     }
     for (const module of changed) this.queue(project, module);

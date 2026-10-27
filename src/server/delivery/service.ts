@@ -251,6 +251,16 @@ export class DeliveryManager implements ContainerServices {
     return this.phase === phase;
   }
 
+  /** The operations running now, e.g. "deploy of shop/local (since ...)" (a restart waits for them). */
+  busy(): string[] {
+    return [...this.deliveries.entries()].flatMap(([project, delivery]) =>
+      delivery.environments.flatMap((env) => {
+        const op = env.busy;
+        return op ? [`${op.kind} of ${project}/${env.name} (since ${op.startedAt})`] : [];
+      }),
+    );
+  }
+
   /**
    * Apply a project's new config (src/server/reload/): its delivery drains
    * (the operation in progress finishes, new ones get 409), then the new one

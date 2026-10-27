@@ -44,7 +44,13 @@ import { getBudgetManager } from "./fleet/budget.js";
 import { ReviewManager, registerReviewRoutes } from "./review/index.js";
 import { mountTriage } from "./triage/index.js";
 import { ConfigReloader, registerReloadRoutes, serverModules } from "./reload/index.js";
-import { RestartController, registerRestartRoutes } from "./restart/index.js";
+import {
+  RestartController,
+  SHUTDOWN_DEADLINE_MS,
+  configuredTokenEnvs,
+  registerRestartRoutes,
+  withDeadline,
+} from "./restart/index.js";
 import { join } from "path";
 import type { ApiResponse, ProjectConfig } from "../shared/types.js";
 
@@ -484,6 +490,19 @@ const restart = new RestartController({
   configPath: join(process.cwd(), "data", "server.yaml"),
   shutdown: () => shutdown("a restart"),
   exit: (code) => process.exit(code),
+  // A merge or a delivery operation running now: Restart answers 409
+  busy: () => [...reviews.busy(), ...delivery.busy()],
+  // The update gets no token the projects name
+  secretEnv: () =>
+    configuredTokenEnvs(
+      listProjects().flatMap((name) => {
+        try {
+          return [loadProjectConfig(name)];
+        } catch {
+          return [];
+        }
+      }),
+    ),
   events: getEventBus(),
 });
 await registerRestartRoutes(fastify, humanAuth, restart);
@@ -529,8 +548,8 @@ const stopServer = async (reason: string) => {
   // Stop pipeline jobs: in-flight attempts stay recorded and resume on restart
   await pipelines.stop();
 
-  // Close the review store
-  reviews.close();
+  // Let a merge in progress finish and record itself, then close the review store
+  await reviews.stop();
 
   // Stop agent supervision (the agents themselves keep running)
   await agents.stop();
@@ -577,10 +596,15 @@ const stopServer = async (reason: string) => {
   await fastify.close();
 };
 
+// A shutdown that hangs (a merge or a store that never ends) is given up on
+// after SHUTDOWN_DEADLINE_MS, as the owner's Restart does
 const exitOnSignal = (signal: string) => {
-  shutdown(`received ${signal}`)
-    .catch((err) => console.error("Error during shutdown:", err))
-    .finally(() => process.exit(0));
+  void withDeadline(shutdown(`received ${signal}`), SHUTDOWN_DEADLINE_MS, (err) =>
+    console.error("Error during shutdown:", err),
+  ).then((finished) => {
+    if (!finished) console.error(`Shutdown took more than ${SHUTDOWN_DEADLINE_MS / 1000} s; exiting anyway`);
+    process.exit(0);
+  });
 };
 process.on("SIGTERM", () => exitOnSignal("SIGTERM"));
 process.on("SIGINT", () => exitOnSignal("SIGINT"));

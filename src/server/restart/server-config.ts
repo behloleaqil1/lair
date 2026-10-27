@@ -15,14 +15,20 @@
  *     # (default: detected from the environment, when Lair can tell)
  *     service_manager: launchd
  *
- * It lives in data/, beside the owner token, and not in any project's
- * repository: the update command runs with the server's rights, so nothing
- * an agent can write may change it.
+ * The update command runs with the server's rights, so whoever can write
+ * this file can run code as Lair. It lives in data/, beside the owner
+ * token, and in no project's repository; loadServerConfig() also refuses a
+ * symbolic link, anything but a regular file, a file another user owns, and
+ * a file its group or others may write. That protects it only as far as
+ * Lair's directory is protected: the agents Lair supervises run as the same
+ * OS user unless they are sandboxed, and such an agent can write any file
+ * that user can.
  */
-import { existsSync, readFileSync, statSync } from "fs";
+import { lstatSync, type Stats } from "fs";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import type { ServiceManagerView } from "../../shared/lifecycle-types.js";
+import { readRegularFile } from "../read-file.js";
 
 const MAX_BYTES = 64 * 1024;
 
@@ -88,14 +94,62 @@ export function parseServerConfig(raw: unknown): ServerConfigResult {
   };
 }
 
-/** Read the server config; a missing file is the defaults. */
-export function loadServerConfig(path: string): ServerConfigResult {
-  if (!existsSync(path)) return { ok: true, settings: DEFAULT_SERVER_SETTINGS };
+export interface ServerConfigFileOptions {
+  /** The user who must own the file (default: this process's; tests pass another) */
+  uid?: number;
+  platform?: NodeJS.Platform;
+}
+
+/** Why the server config file can't be trusted, or null. */
+function fileProblem(stat: Stats, options: ServerConfigFileOptions): string | null {
+  if (stat.isSymbolicLink()) return "it is a symbolic link";
+  if (!stat.isFile()) return "it is not a regular file";
+  if ((options.platform ?? process.platform) === "win32") return null;
+  if ((stat.mode & 0o022) !== 0) {
+    return `its group or other users may write it (mode ${(stat.mode & 0o777).toString(8)}): chmod 600 it`;
+  }
+  const uid = options.uid ?? process.getuid?.();
+  if (uid !== undefined && stat.uid !== uid) return `it is owned by another user (uid ${stat.uid}, not ${uid})`;
+  return null;
+}
+
+/**
+ * Read the server config; a missing file is the defaults. The file must be
+ * a regular file (not a symbolic link) of this user that its group and
+ * others can't write; it is checked again on the open descriptor, so the
+ * file checked is the file read.
+ */
+export function loadServerConfig(path: string, options: ServerConfigFileOptions = {}): ServerConfigResult {
+  const refuse = (why: string): ServerConfigResult => ({
+    ok: false,
+    errors: [`refused: ${why}`],
+    settings: DEFAULT_SERVER_SETTINGS,
+  });
+  let link: Stats;
   try {
-    if (statSync(path).size > MAX_BYTES) {
-      return { ok: false, errors: [`larger than ${MAX_BYTES / 1024} KiB`], settings: DEFAULT_SERVER_SETTINGS };
-    }
-    return parseServerConfig(parseYaml(readFileSync(path, "utf-8")));
+    link = lstatSync(path);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { ok: true, settings: DEFAULT_SERVER_SETTINGS };
+    return refuse(e instanceof Error ? e.message : String(e));
+  }
+  const problem = fileProblem(link, options);
+  if (problem) return refuse(problem);
+  let text: string;
+  try {
+    text = readRegularFile(path, {
+      maxBytes: MAX_BYTES,
+      noFollow: true,
+      check: (open) => {
+        if (open.ino !== link.ino || open.dev !== link.dev) throw new Error("it was replaced while it was read");
+        const again = fileProblem(open, options);
+        if (again) throw new Error(again);
+      },
+    });
+  } catch (e) {
+    return refuse(e instanceof Error ? e.message : String(e));
+  }
+  try {
+    return parseServerConfig(parseYaml(text));
   } catch (e) {
     return { ok: false, errors: [e instanceof Error ? e.message : String(e)], settings: DEFAULT_SERVER_SETTINGS };
   }
@@ -106,13 +160,17 @@ const NO_MANAGER =
 
 /**
  * Who starts Lair again after Restart exits: server.service_manager when
- * set, else what the environment shows (systemd sets INVOCATION_ID for its
- * units; launchd sets XPC_SERVICE_NAME to the job's label), else unknown.
+ * set, else what the environment suggests, else unknown. The environment is
+ * only a hint: systemd sets INVOCATION_ID for its units, but a terminal of a
+ * systemd user session inherits it too, so it counts only beside
+ * JOURNAL_STREAM or a parent pid of 1; launchd sets XPC_SERVICE_NAME to the
+ * job's label.
  */
 export function serviceManagerOf(
   configured: ServiceManagerName | null,
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
+  ppid: number = process.ppid,
 ): ServiceManagerView {
   if (configured === "none") {
     return { name: null, source: "configured", note: `server.service_manager is none: Restart stops Lair, and ${NO_MANAGER}` };
@@ -127,12 +185,21 @@ export function serviceManagerOf(
           : "systemd starts Lair again (server.service_manager), if its unit has Restart=always",
     };
   }
-  if (env.INVOCATION_ID) {
-    return { name: "systemd", source: "detected", note: "Started by systemd: it starts Lair again if the unit has Restart=always" };
+  const sure = " (set server.service_manager to be sure)";
+  if (env.INVOCATION_ID && (env.JOURNAL_STREAM || ppid === 1)) {
+    return {
+      name: "systemd",
+      source: "detected",
+      note: `Probably started by systemd: it starts Lair again if the unit has Restart=always${sure}`,
+    };
   }
   const label = env.XPC_SERVICE_NAME;
   if (platform === "darwin" && label && label !== "0" && !label.startsWith("application.")) {
-    return { name: "launchd", source: "detected", note: "Started by launchd: it starts Lair again if the job has KeepAlive set" };
+    return {
+      name: "launchd",
+      source: "detected",
+      note: `Probably started by launchd: it starts Lair again if the job has KeepAlive set${sure}`,
+    };
   }
   return {
     name: null,

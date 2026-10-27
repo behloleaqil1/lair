@@ -1373,8 +1373,11 @@ Project names (the file name without `.yaml` or `.yml`) must start with a letter
 
 The server watches `projects/` and `projects/local/`. When a project file changes (or a new one appears), it waits until the file has been quiet for a second, then reads it and checks it with every module's own parser, the same checks as at startup:
 
-- **Valid:** only the modules whose part of the file changed are reloaded, each for that project only. A module's part is its own block (`watchdog:`, `delivery:`, `pipelines:` and `executors:`, `review:`, `agents:`, `triage:`), the blocks it also reads (the agents module reads `watchdog:`), and every top-level key that is no module's block (`repo`, `read_only`, `dragons`, `machines`...), so a change to one of those reloads every module of the project. Editing only a comment reloads nothing. The dashboard's reads use the new file from the next request.
-- **Invalid** (YAML errors, missing required fields, any module's parser refusing its block): nothing changes, and the modules keep running the previous config. The error is logged, emitted as a `config.invalid` event, and shown in a banner on the dashboard: "projects/x.yaml has an error; the previous config is still running: ..." until the file is fixed.
+- **Valid:** only the modules whose part of the file changed are reloaded, each for that project only. A module's part is its own block (`watchdog:`, `delivery:`, `pipelines:` and `executors:`, `review:`, `agents:`, `triage:`), the blocks it also reads (the agents module reads `watchdog:`), and every other top-level key a module may read (`repo`, `read_only`, `dragons`, `machines`, `agents_dir`...), so a change to one of those reloads every module of the project. Keys no module reads reload nothing: the dashboard's commands (`*_cmd`, `allow_direct_assign`, `outbox_file`, `backlog_file`), `merge_bar`, `processes`, `orchestrator`, `available_models` and `gate_runner`. Editing only a comment reloads nothing. The dashboard's reads use the new file from the next request.
+- **Invalid** (YAML errors, missing required fields, any module's parser refusing its block, a file that is not a regular file or is over 1 MiB): nothing changes, and the modules keep running the previous config. The error is logged, emitted as a `config.invalid` event, and shown in a banner on the dashboard: "projects/x.yaml has an error; the previous config is still running: ..." until the file is fixed.
+- **Another file:** the modules keep running the file they started with. When it is deleted (deleting `projects/local/x.yaml` would otherwise fall back to the public `projects/x.yaml`), or a new file takes its place (a new `projects/local/x.yaml`), nothing changes and the banner says so; restart Lair to switch files. Deleting a project's only file also keeps its previous config running until a restart.
+
+Files changed between the server's startup and the moment it starts watching are checked once the watcher is ready, so no change is missed.
 
 A module is reloaded by stopping its instance for the project cleanly and starting it with the new config:
 
@@ -1383,11 +1386,11 @@ A module is reloaded by stopping its instance for the project cleanly and starti
 | watchdog | As on shutdown: a tick in progress ends early and no further action starts |
 | delivery | The operation in progress (Up, Deploy...) runs to the end, its commands are not killed; new operations get HTTP 409 until the new config runs |
 | pipelines | Jobs in flight keep running: the attempt running now finishes with the settings it started with, and the job's next step uses the new ones |
-| review | A merge in progress finishes; a merge asked for meanwhile gets HTTP 503 |
+| review | A merge in progress finishes; a merge asked for meanwhile gets HTTP 503 (a shutdown waits for it too, so its record is written) |
 | agents | The agents keep running; the new config re-adopts them by pid, as after a restart |
 | triage | The tick, ingests and outbox in progress finish first |
 
-Reloads of one module for one project never overlap: a change made while one runs is applied after it, with the latest file. A module that fails to start with the new config (for example, its store can't be opened) is started again with the previous one, and the banner says so; it is never left half-started.
+Reloads of one module for one project never overlap: a change made while one runs is applied after it, with the latest file (also when the latest file is the one that ran before). A module that fails to start with the new config (for example, its store can't be opened) is started again with the previous one, and the banner says so; it is never left half-started.
 
 Not reloaded: the process manager (`processes:`, read at startup for the default project) and the dashboard's project list (reload the page to see a new project). Restart Lair for those (see [Restart and update](#restart-and-update)). `GET /api/config/status` lists the files whose latest version is not running and the latest reloads.
 
@@ -1395,9 +1398,11 @@ Not reloaded: the process manager (`processes:`, read at startup for the default
 
 The footer of the dashboard has **Restart** and, when `server.update_cmd` is set, **Update and restart**. Both are for the owner only (`POST /api/owner/restart`, which needs the owner's session) and ask for confirmation.
 
-Restart answers HTTP 202, then shuts Lair down gracefully (as on `SIGTERM`: the modules stop, the agents keep running, the managed processes are stopped) and exits with code 0. **Something must start it again**: a service manager such as launchd with `KeepAlive` set to true, or systemd with `Restart=always`. Without one the process just exits. Lair looks for one (systemd sets `INVOCATION_ID`, launchd sets `XPC_SERVICE_NAME`) and the dashboard says so beside the buttons when it can't tell. Note that launchd's `KeepAlive` with `SuccessfulExit: false` and systemd's `Restart=on-failure` do **not** restart after exit code 0.
+Restart answers HTTP 202, then shuts Lair down gracefully (as on `SIGTERM`: the modules stop, a merge in progress finishes, the agents keep running, the managed processes are stopped) and exits with code 0. A shutdown that takes more than 60 seconds is given up on, and the process exits anyway (on `SIGTERM` and `SIGINT` too). While a merge or a delivery operation runs, Restart answers HTTP 409 and names it; after an update, the restart waits up to two minutes for one that started meanwhile.
 
-Update and restart first runs `server.update_cmd` from `data/server.yaml`, Lair's own config (beside the owner token, in no project's repository, so nothing an agent can write changes it):
+**Something must start it again**: a service manager such as launchd with `KeepAlive` set to true, or systemd with `Restart=always`. Without one the process just exits. Lair looks for one: systemd sets `INVOCATION_ID`, but a terminal of a systemd user session inherits it, so it counts only beside `JOURNAL_STREAM` or a parent pid of 1; launchd sets `XPC_SERVICE_NAME`. What it finds is only probable, and the dashboard says so beside the buttons when it can't tell; set `server.service_manager` to be sure. Note that launchd's `KeepAlive` with `SuccessfulExit: false` and systemd's `Restart=on-failure` do **not** restart after exit code 0.
+
+Update and restart first runs `server.update_cmd` from `data/server.yaml`, Lair's own config. Whoever can write that file can run commands as Lair, so Lair reads it only when it is a regular file (not a symbolic link, a FIFO or a directory), owned by the user Lair runs as, and not writable by its group or others (`chmod 600 data/server.yaml`); otherwise Update and restart is refused and the dashboard shows why. That protects it only as far as Lair's directory is protected: it sits beside the owner token and in no project's repository, but the agents Lair supervises run as the same OS user unless you sandbox them, and such an agent can write any file that user can.
 
 ```yaml
 server:
@@ -1417,7 +1422,7 @@ server:
 | `update_timeout_seconds` | integer | `900` | A step still running after this long is stopped (with its child processes), and the update fails |
 | `service_manager` | `launchd`, `systemd` or `none` | detected | Says what starts Lair again, when the detection is wrong |
 
-The steps get the server's environment without its `LAIR_*` variables (tokens among them). Their output goes to the server's log line by line and is shown in the dashboard. When a step fails (a non-zero exit, a timeout, a command that can't start), the update stops there, nothing restarts, and the error is shown. The file is read at each use, so changing it needs no restart. `GET /api/owner/restart` (owner only) returns the state, the steps, the service manager and the update's latest output.
+The steps get the server's environment without its `LAIR_*` variables and without the token variables the projects name (`review.token_env` where reviews are on, `executors.github.token_env` where pipelines are configured, `agents.env_passthrough` where the agents module is on). Their output goes to the server's log line by line and is shown in the dashboard. When a step fails (a non-zero exit, a timeout, a command that can't start), the update stops there, nothing restarts, and the error is shown. The file is read at each use, so changing it needs no restart. `GET /api/owner/restart` (owner only) returns the state, the steps, the service manager and the update's latest output.
 
 ## Environment variables
 

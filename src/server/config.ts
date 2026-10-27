@@ -1,9 +1,10 @@
 /**
  * Configuration loader - reads project YAML files
  */
-import { readFileSync, existsSync, readdirSync, statSync } from "fs";
+import { existsSync, readdirSync } from "fs";
 import { join } from "path";
 import { parse as parseYaml } from "yaml";
+import { readRegularFile } from "./read-file.js";
 import type { ProjectConfig, DragonConfig, AIModel } from "../shared/types.js";
 import {
   parseDragonRegistry,
@@ -80,11 +81,13 @@ export function loadProjectConfig(name: string, projectsDir: string = PROJECTS_D
   if (!existsSync(configPath)) {
     throw new Error(`Project config not found: ${configPath}`);
   }
-  if (statSync(configPath).size > MAX_CONFIG_BYTES) {
-    throw new Error(`Invalid project config: ${configPath} is larger than ${MAX_CONFIG_BYTES / 1024} KiB`);
+  // One open: a regular file (not a FIFO or a directory), at most MAX_CONFIG_BYTES
+  let content: string;
+  try {
+    content = readRegularFile(configPath, { maxBytes: MAX_CONFIG_BYTES });
+  } catch (e) {
+    throw new Error(`Invalid project config: ${e instanceof Error ? e.message : String(e)}`);
   }
-
-  const content = readFileSync(configPath, "utf-8");
   const config = parseYaml(content) as ProjectConfig | null;
 
   // Validate required fields

@@ -5,7 +5,7 @@
  * docker (FakeDocker) and the clock are fake.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { stringify } from "yaml";
@@ -19,6 +19,7 @@ import { NodeFileSystem } from "../watchdog/probes.js";
 import { WatchdogManager } from "../watchdog/service.js";
 import { problemText } from "../../client/server-controls";
 import { ConfigReloader, fingerprint, serverModules, type ReloadableModule } from "./index.js";
+import { UNREAD_KEYS } from "./modules.js";
 
 const DEBOUNCE_MS = 200;
 const quiet = { log: () => undefined, warn: () => undefined };
@@ -55,12 +56,22 @@ interface Blocks {
   [key: string]: unknown;
 }
 
-async function setup(blocks: Blocks, options: { deliveryDb?: (root: string) => string } = {}) {
+interface SetupOptions {
+  deliveryDb?: (root: string) => string;
+  /** Start from projects/local/shop.yaml, with a public projects/shop.yaml of these blocks beside it */
+  publicBeside?: Blocks;
+  /** Runs after the modules loaded the file, before the watcher starts */
+  beforeWatch?: (write: (b: Blocks | string) => void) => void;
+}
+
+async function setup(blocks: Blocks, options: SetupOptions = {}) {
   const root = mkdtempSync(join(tmpdir(), "lair-reload-"));
   const projects = join(root, "projects");
   mkdirSync(join(projects, "local"), { recursive: true });
   mkdirSync(join(root, "agents"));
-  const file = join(projects, "shop.yaml");
+  const publicFile = join(projects, "shop.yaml");
+  const localFile = join(projects, "local", "shop.yaml");
+  const file = options.publicBeside ? localFile : publicFile;
   const yaml = (b: Blocks) =>
     stringify({
       name: "Shop",
@@ -73,8 +84,10 @@ async function setup(blocks: Blocks, options: { deliveryDb?: (root: string) => s
       machines: {},
       ...b,
     });
-  const write = (b: Blocks | string) => writeFileSync(file, typeof b === "string" ? b : yaml(b));
+  const writeTo = (path: string, b: Blocks | string) => writeFileSync(path, typeof b === "string" ? b : yaml(b));
+  const write = (b: Blocks | string) => writeTo(file, b);
   write(blocks);
+  if (options.publicBeside) writeTo(publicFile, options.publicBeside);
 
   const docker = new FakeDocker("shop-local", { web: {} });
   const clock = new FakeClock();
@@ -92,6 +105,7 @@ async function setup(blocks: Blocks, options: { deliveryDb?: (root: string) => s
   watchdogs.load(initial);
   deliveries.start();
   watchdogs.start();
+  options.beforeWatch?.(write);
 
   const bus = new EventBus();
   const events: Event[] = [];
@@ -117,7 +131,19 @@ async function setup(blocks: Blocks, options: { deliveryDb?: (root: string) => s
   };
   const reloads = (module?: string) =>
     events.filter((e) => e.type === "config.reloaded" && (module === undefined || e.data.module === module));
-  return { root, write, docker, deliveries, watchdogs, reloader, events, reloads };
+  return {
+    root,
+    write,
+    writeTo,
+    publicFile,
+    localFile,
+    docker,
+    deliveries,
+    watchdogs,
+    reloader,
+    events,
+    reloads,
+  };
 }
 
 describe("live config reload", () => {
@@ -271,6 +297,153 @@ describe("live config reload", () => {
     expect(h.deliveries.get("shop")).toBeUndefined();
     expect(h.watchdogs.get("shop")).toBe(oldWatchdog);
     expect(h.reloads()).toEqual([]);
+  });
+
+  it("a save back to the old config while a reload runs is applied after it (the file wins)", async () => {
+    const h = await setup({ watchdog: watchdog(60), delivery: delivery(30) });
+    const old = h.deliveries.get("shop")!;
+    const isUp = (argv: string[]) => argv.includes("up");
+    const release = h.docker.delay(isUp);
+    const started = old.environment("local")!.request({ kind: "up", by: "human" });
+    if (!started.ok) throw new Error(started.error);
+    await waitFor("docker compose up", () => h.docker.calls.some(isUp));
+
+    // Save A: delivery drains for as long as the operation runs
+    h.write({ watchdog: watchdog(60), delivery: delivery(40) });
+    await waitFor("the drain", () => !old.running);
+    // Save the original back while A is still being applied
+    h.write({ watchdog: watchdog(60), delivery: delivery(30) });
+    await sleep(DEBOUNCE_MS * 3);
+    release();
+    await waitFor("two reloads", () => h.reloads("delivery").length === 2);
+    await h.reloader.settled();
+
+    // What runs is what the file says, not A
+    expect(h.deliveries.get("shop")!.settings.intervalSeconds).toBe(30);
+    expect(h.deliveries.get("shop")!.running).toBe(true);
+    expect(h.reloader.status().problems).toEqual([]);
+  });
+
+  it("deleting projects/local/x.yaml does not apply the public projects/x.yaml: the previous config keeps running", async () => {
+    const h = await setup({ watchdog: watchdog(60), delivery: delivery(30) }, { publicBeside: { watchdog: watchdog(300) } });
+    const oldWatchdog = h.watchdogs.get("shop")!;
+    const oldDelivery = h.deliveries.get("shop")!;
+
+    rmSync(h.localFile);
+    await waitFor("the problem", () => h.reloader.status().problems.length > 0);
+    await h.reloader.settled();
+    expect(h.reloader.status().problems).toEqual([
+      expect.objectContaining({
+        project: "shop",
+        file: "projects/local/shop.yaml",
+        previousRunning: true,
+        error:
+          "the file was removed, so projects/shop.yaml would apply instead; Lair keeps running the previous config until it restarts",
+      }),
+    ]);
+    expect(h.watchdogs.get("shop")).toBe(oldWatchdog);
+    expect(oldWatchdog.settings.intervalSeconds).toBe(60);
+    expect(h.deliveries.get("shop")).toBe(oldDelivery);
+    expect(h.reloads()).toEqual([]);
+
+    // Put back: it runs again, and a change to it is taken
+    h.writeTo(h.localFile, { watchdog: watchdog(90), delivery: delivery(30) });
+    await waitFor("the reload", () => h.watchdogs.get("shop") !== oldWatchdog);
+    await h.reloader.settled();
+    expect(h.reloader.status().problems).toEqual([]);
+    expect(h.watchdogs.get("shop")!.settings.intervalSeconds).toBe(90);
+  });
+
+  it("a new projects/local/x.yaml does not take over from the running projects/x.yaml until a restart", async () => {
+    const h = await setup({ watchdog: watchdog(60), delivery: delivery(30) });
+    const oldWatchdog = h.watchdogs.get("shop")!;
+
+    h.writeTo(h.localFile, { watchdog: watchdog(300), delivery: delivery(30) });
+    await waitFor("the problem", () => h.reloader.status().problems.length > 0);
+    await h.reloader.settled();
+    expect(h.reloader.status().problems).toEqual([
+      expect.objectContaining({
+        file: "projects/shop.yaml",
+        error: "projects/local/shop.yaml now takes its place; Lair keeps running projects/shop.yaml until it restarts",
+      }),
+    ]);
+    expect(h.watchdogs.get("shop")).toBe(oldWatchdog);
+    expect(h.reloads()).toEqual([]);
+  });
+
+  it("a removed project file keeps the previous config running and says so", async () => {
+    const h = await setup({ watchdog: watchdog(60), delivery: delivery(30) });
+    const oldWatchdog = h.watchdogs.get("shop")!;
+    const oldDelivery = h.deliveries.get("shop")!;
+
+    rmSync(h.publicFile);
+    await waitFor("the problem", () => h.reloader.status().problems.length > 0);
+    await h.reloader.settled();
+    const [problem] = h.reloader.status().problems;
+    expect(problem).toMatchObject({ file: "projects/shop.yaml", previousRunning: true });
+    expect(problemText(problem)).toBe(
+      "projects/shop.yaml has an error; the previous config is still running: the file was removed; Lair keeps running the previous config until it restarts",
+    );
+    expect(h.watchdogs.get("shop")).toBe(oldWatchdog);
+    expect(oldWatchdog.running).toBe(true);
+    expect(h.deliveries.get("shop")).toBe(oldDelivery);
+    expect(oldDelivery.running).toBe(true);
+    expect(h.reloads()).toEqual([]);
+  });
+
+  it("sees a change made between the startup load and the watcher being ready", async () => {
+    const h = await setup(
+      { watchdog: watchdog(60), delivery: delivery(30) },
+      { beforeWatch: (write) => write({ watchdog: watchdog(75), delivery: delivery(30) }) },
+    );
+    await waitFor("the reload", () => h.watchdogs.get("shop")?.settings.intervalSeconds === 75);
+    await h.reloader.settled();
+    expect(h.reloads().map((e) => e.data.module)).toEqual(["watchdog"]);
+  });
+
+  it("reloads nothing for keys no module reads, and every module for one they may read", async () => {
+    const h = await setup({ watchdog: watchdog(60), delivery: delivery(30) });
+    const oldWatchdog = h.watchdogs.get("shop")!;
+    const oldDelivery = h.deliveries.get("shop")!;
+
+    h.write({ watchdog: watchdog(60), delivery: delivery(30), merge_bar: { required_steps: ["lint"], require_review: true } });
+    await sleep(DEBOUNCE_MS * 3);
+    await h.reloader.settled();
+    expect(h.reloads()).toEqual([]);
+    expect(h.watchdogs.get("shop")).toBe(oldWatchdog);
+
+    h.write({ watchdog: watchdog(60), delivery: delivery(30), read_only: true });
+    await waitFor("both reloads", () => h.reloads().length === 2);
+    await h.reloader.settled();
+    expect(h.reloads().map((e) => e.data.module).sort()).toEqual(["delivery", "watchdog"]);
+    expect(h.deliveries.get("shop")).not.toBe(oldDelivery);
+    expect(h.deliveries.get("shop")!.readOnly).toBe(true);
+  });
+});
+
+describe("UNREAD_KEYS", () => {
+  /** The modules' code and the helpers they read a project config with */
+  const SOURCES = [
+    ...["watchdog", "delivery", "gates", "review", "agents", "triage"].map((d) => join("src", "server", d)),
+    join("src", "server", "services", "adapters.ts"),
+    join("src", "server", "services", "dragon-registry.ts"),
+  ];
+  const files = (path: string): string[] =>
+    statSync(path).isDirectory()
+      ? readdirSync(path).flatMap((f) => (f === "testing" ? [] : files(join(path, f))))
+      : path.endsWith(".ts") && !path.endsWith(".test.ts")
+        ? [path]
+        : [];
+
+  it("lists only keys no module reads", () => {
+    const code = SOURCES.flatMap(files).map((f) => [f, readFileSync(f, "utf-8")] as const);
+    expect(code.length).toBeGreaterThan(20);
+    const reads: string[] = [];
+    for (const key of UNREAD_KEYS) {
+      const access = new RegExp(`(config|project)\\??\\.${key}\\b|\\[["']${key}["']\\]`);
+      for (const [file, text] of code) if (access.test(text)) reads.push(`${key} in ${file}`);
+    }
+    expect(reads).toEqual([]);
   });
 });
 
