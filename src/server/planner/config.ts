@@ -492,9 +492,8 @@ export function parsePlannerConfig(raw: unknown, project: ProjectConfig): Planne
     }
     // What the planner reads is only as trustworthy as whoever can write it
     for (const source of sources) {
-      const inRepo = (source.kind === "markdown_plan" || source.kind === "backlog_file" ? source.paths : [source.path]).filter((p) =>
-        isInside(repo, realish(p)),
-      );
+      const paths = "paths" in source ? source.paths : [source.path];
+      const inRepo = paths.filter((p) => isInside(repo, realish(p)));
       if (inRepo.length === 0) continue;
       if (source.kind === "markdown_plan" || source.kind === "backlog_file") {
         warnings.push(
