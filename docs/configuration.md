@@ -1685,7 +1685,7 @@ Plan and backlog files are read whole up to `max_bytes` (a larger one is refused
 - In `act` mode the tasks file is written atomically (a new file in its directory, then a rename) and only if it still has the content the change was made from; a tasks file that is a symlink is never written. In `observe` mode nothing is written: each change is recorded once as `planned`.
 - Every change is recorded with its reason and diff (`GET /api/planner/history`, and the Planner view). An edit someone else makes is accepted and recorded as `external`.
 
-**The planner agent** (`agent:`, optional: without it only the rules run) is an agent of the project that fill never starts (it must not be in `agents.fill.agents`), run through the agents module like any run (claims, locks, recovery, failover and budgets apply). A run starts on a **trigger**: an allowlisted agent reports `DONE` and has no open line left; an agent reports `BLOCKED` for a task problem (below); allowlisted agents are idle with no line (once per idle set and tasks file); a new owner message; a plan or backlog file changed. Triggers wait until the newest is `debounce_seconds` old, and a run starts at least `min_interval_seconds` after the previous one; there is one at a time. Its prompt is `prompt_file` (inside `prompts_dir`, read as fill reads prompt files), then what Lair adds: the path of its proposal file, the rules, and the context as JSON data (the triggers, the allowlist and idle agents, the tasks file, open plan and backlog tasks, recent queue events, unanswered owner messages and blocked tasks; every string cleaned and cut, the whole cut to `context_max_bytes`).
+**The planner agent** (`agent:`, optional: without it only the rules run) is an agent of the project that fill never starts (it must not be in `agents.fill.agents`), run through the agents module like any run (claims, locks, recovery, failover and budgets apply). A run starts on a **trigger**: an allowlisted agent reports `DONE` and has no open line left; an agent reports `BLOCKED` for a task problem (below); allowlisted agents are idle with no line (once per idle set: an edit of the tasks file that leaves the same agents idle is no new trigger); a new owner message; a plan or backlog file changed. Triggers wait until the newest is `debounce_seconds` old, and a run starts at least `min_interval_seconds` after the previous one and only while fewer than `max_runs_per_day` runs started in the 24 hours before; there is one at a time. Its prompt is `prompt_file` (inside `prompts_dir`, read as fill reads prompt files), then what Lair adds: the path of its proposal file, the rules, and the context as JSON data (the triggers, the allowlist and idle agents, the tasks file, open plan and backlog tasks, recent queue events, unanswered owner messages and blocked tasks; every string cleaned and cut, the whole cut to `context_max_bytes`).
 
 Its **only output** is the proposal file, `<work_dir>/<run id>/proposals.json`:
 
@@ -1693,15 +1693,16 @@ Its **only output** is the proposal file, `<work_dir>/<run id>/proposals.json`:
 {"proposals": [{"op": "add", "task": "feat-search", "agent": "worker-b", "text": "Search page", "reason": "ready in the plan; worker-b is idle"}]}
 ```
 
-- `op`: `add` (a new task id, an allowlisted `agent`, and `text`, the line's description), `finish` (mark it done), `reassign` (another allowlisted `agent`), `reword` (new `text`), `drop` (remove the line), `unblock` (release fill's `no_done` hold on it, never an `owner` hold, and clear the planner's blocked record); `reason` always.
+- `op`: `add` (a new task id, an allowlisted `agent`, and `text`, the line's description), `finish` (mark it done), `reassign` (another allowlisted `agent`), `reword` (new `text`), `drop` (remove the line), `unblock` (release fill's `no_done` hold on it, never an `owner` hold, and clear the planner's blocked record); `reason` always. An `unblock` needs a task the planner recorded as blocked by a task problem (not by its environment, nor one needing you), with an attempt left (`attempts_per_task`): applying it spends one. Neither `unblock` nor `reword` may touch a task you chose to leave blocked.
 - Each proposal is checked in order: the schema (unknown keys are refused), fill's task-id rules and `task_id_pattern`, the allowlist (never the planner agent), the tasks file as the proposals before it leave it (`add` needs a new id, not a done one; the others an open line; `reassign` and `drop` wait while the task has an active run), one proposal per task, `text` one line of at most 500 characters, and `max_proposals` (the rest are refused). A refused proposal is kept with its reason. A run whose agent didn't complete, wrote no file, a file over 256 KB, a symlink or not `{"proposals": [...]}` fails; its triggers wait for the next run, and after `max_failed_runs` failures in a row planner runs pause and you are asked once.
-- In `act` mode accepted proposals are applied at once, except ops with `approval: always` (default: `drop` and `reassign`); in `observe` mode all of them wait. Waiting proposals are listed in the Planner view, where you approve or reject each one or a whole run, and each run with waiting proposals raises one [Decision Inbox](#decision-inbox) decision ("Apply them all" or "Reject them all"). An approval is checked again against the tasks file as it is then. **Approving writes the tasks file, in observe mode too.**
+- In `act` mode accepted proposals are applied at once, except ops with `approval: always` (default: `finish`, `reassign`, `drop` and `unblock`; only `add` and `reword` apply by themselves); in `observe` mode all of them wait. A task the queue reports done is the rules' to mark, so a `finish` of the planner's own has no done line behind it, and an `unblock` starts again work fill held: you see each one. Waiting proposals are listed in the Planner view, where you approve or reject each one or a whole run, and each run with waiting proposals raises one [Decision Inbox](#decision-inbox) decision ("Apply them all" or "Reject them all"). An approval is checked again against the tasks file as it is then. **Approving writes the tasks file, in observe mode too.**
 - **The planner agent can't edit the tasks file.** In `act` mode a change to it while a planner run is active is put back, that run's proposals are refused, and you get a decision with the diff (go on, or pause planner runs). In `observe` mode, where another tool may still write the file, the change is recorded and kept. Running agents as a separate OS user is what makes the file unwritable for them. Its `text` only becomes a description, which fill shows and never puts into a prompt.
 
 **BLOCKED lines.** A new `BLOCKED` queue line is matched to a task (an id it names, else the reporting agent's only open line), and its reason (the text after the first `: `) is classified by `blocked.owner_patterns`, then `blocked.environment_patterns` (case-insensitive; the defaults cover approvals, decisions, credentials, accounts and money, then permissions, disk, memory, containers, network, timeouts, load, locks and stuck runners):
 
 - needs you, or the environment: one decision per task and class ("It's sorted: let the task go on", which unblocks it, or "Leave it blocked"), and a `planner.blocked` event;
-- anything else is a task problem: a planner run (it may `reword` or `unblock`), at most `attempts_per_task` of them per task; then one decision ("Let the planner try again" or "Leave it to me"). A task you leave blocked is left alone until its line changes.
+- anything else is a task problem: a planner run (it may `reword` or `unblock`), with `attempts_per_task` attempts per task, each planner run for it and each unblock applied spending one; then one decision ("Let the planner try again" or "Leave it to me"). So a task that keeps getting blocked, or that fill keeps holding for runs without a done line, reaches you instead of a loop of planner runs.
+- A task you leave blocked ("Leave it blocked", "Leave it to me") is left alone until its line changes: its BLOCKED lines ask nothing, and the planner's `reword` and `unblock` of it are refused. Rewording the line yourself (editing the tasks file) is what clears that.
 
 ```yaml
 agents:
@@ -1730,7 +1731,7 @@ planner:
     prompt_file: planner.md           # in prompts_dir
     min_interval_seconds: 600
     max_proposals: 10
-  approval: { drop: always, reassign: always }
+  approval: { finish: always, reassign: always, drop: always, unblock: always }   # the defaults
   attempts_per_task: 2
 ```
 
@@ -1751,18 +1752,21 @@ planner:
 | `agent.min_interval_seconds` | number | `600` | Least time between two planner runs' starts |
 | `agent.debounce_seconds` | number | `60` | A run starts once the newest trigger is this old |
 | `agent.max_proposals` | number | `10` | Proposals a run may make (at most 50) |
-| `approval.<op>` | `never` \| `always` | `drop`, `reassign`: `always`; the rest `never` | Ops that wait for you in `act` mode |
+| `agent.max_runs_per_day` | number | `24` | Planner runs that may start in any 24 hours, whatever triggers them |
+| `approval.<op>` | `never` \| `always` | `finish`, `reassign`, `drop`, `unblock`: `always`; `add`, `reword`: `never` | Ops that wait for you in `act` mode |
 | `attempts_per_task` | number | `2` | Planner runs per blocked task; then you decide |
 | `max_failed_runs` | number | `3` | Failed planner runs in a row before runs pause |
 | `blocked.owner_patterns`, `blocked.environment_patterns` | array | see above | Regular expressions for a BLOCKED reason |
 | `context_max_bytes` | number | `64000` | The context bundle's size |
 | `task_id_pattern` | string | — | A regular expression the task ids of proposals must match too |
 
-Config errors (an unknown key, an invalid pattern or one without its group, a `tasks_file` other than fill's, a planner agent that is unknown or in `agents.fill.agents`, a `..` in `prompt_file`, a repeated source name, two `owner_messages` or `queue_events` sources) turn the planner off for that project; `GET /api/planner/status` shows them. A tasks file, `prompts_dir` or `work_dir` inside `repo` is a warning: whoever writes the tasks file or the planner's prompt chooses what the agents work on.
+Config errors (an unknown key, an invalid pattern or one without its group, a `tasks_file` other than fill's, a planner agent that is unknown or in `agents.fill.agents`, a `..` in `prompt_file`, a repeated source name, two `owner_messages` or `queue_events` sources) turn the planner off for that project; `GET /api/planner/status` shows them. A tasks file, `prompts_dir` or `work_dir` inside `repo` is a warning: whoever writes the tasks file or the planner's prompt chooses what the agents work on. So is a plan, backlog or owner-message file inside `repo`: an agent could change what the planner reads, write "owner" messages, or, with `drop_plan_done`, drop a task from the tasks file by ticking it `[x]`. Owner messages are only as trustworthy as the file they come from, and the planner agent is told so.
 
 ### Planner API
 
-`?project=` defaults to the default project. `GET /api/planner/status` is open: enabled, mode, whether runs are paused, the last check and error, config errors and warnings, and counts (sources, open and ready tasks, waiting proposals, runs); it holds no plan or task text. Everything else needs the owner's session, from the dashboard (HTTP 403 otherwise; `/api/planner` gets no CORS), because it shows plan text or changes something:
+`?project=` defaults to the default project. Every route needs the owner's session, from the dashboard (HTTP 403 otherwise; `/api/planner` gets no CORS), because it shows plan or task text, paths on this machine, or changes something:
+
+- `GET /api/planner/status`: enabled, mode, whether runs are paused, the last check and error, config errors and warnings, and counts (sources, open and ready tasks, waiting proposals, runs)
 
 - `GET /api/planner/overview`: the sources and their parse status, the tasks file's lines and done tasks, open plan and backlog tasks (ready or what they wait on), pending triggers, blocked tasks and how each was routed, idle agents, the planner agent and when its next run can start
 - `GET /api/planner/proposals?status=pending|applied|rejected|declined&limit=100`, `GET /api/planner/runs?limit=100`, `GET /api/planner/history?limit=100`

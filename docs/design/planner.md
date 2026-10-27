@@ -75,13 +75,15 @@ diff.
 
 - an allowlisted agent reports `DONE` and has no open line left;
 - an agent reports `BLOCKED` and the reason reads as a task problem (see below);
-- allowlisted agents are idle: no active run and no open line (once per idle set and tasks file content);
+- allowlisted agents are idle: no active run and no open line (once per idle set: an edit of the tasks file that
+  leaves the same agents idle is no new trigger);
 - a new owner message;
 - a plan or backlog file changed.
 
 The first cycle only records a baseline (the queue's end, the messages and file hashes it sees), so history never
 triggers. Triggers are kept in the store. A run starts when the newest trigger is `debounce_seconds` old, at least
-`min_interval_seconds` after the previous run started, and no planner run is active: many triggers make one run.
+`min_interval_seconds` after the previous run started, fewer than `max_runs_per_day` runs started in the 24 hours
+before, and no planner run is active: many triggers make one run, and no stream of them makes more than the cap.
 
 ### The run
 
@@ -117,6 +119,8 @@ valid JSON) and checks each proposal in order against:
 - the allowlist (`agents.fill.agents`; never the planner agent);
 - the tasks file: `add` needs a new task id (not an open line, not a done line); the others need an open line;
   `reassign` and `drop` are refused while the task has an active run; one proposal per task per run;
+- blocked tasks: `unblock` needs a task the planner recorded as blocked by a task problem, with an attempt left;
+  neither `unblock` nor `reword` may touch a task the owner chose to leave blocked;
 - bounds: `text` is one line of at most 500 characters after cleaning; `reason` at most 500; the cap of
   `max_proposals` (the rest are refused); the file's own bounds after the edit.
 
@@ -126,8 +130,10 @@ is asked once.
 
 ### Applying
 
-- **act**: accepted proposals are applied, except ops marked `approval: always` (default: `drop` and `reassign`),
-  which wait for the owner;
+- **act**: accepted proposals are applied, except ops marked `approval: always`, which wait for the owner. By
+  default only `add` and `reword` apply by themselves: `finish` waits (a done line in the queue is the rules' job, so
+  a finish of the planner's own has none behind it), and so do `reassign`, `drop` and `unblock` (it starts again work
+  fill held);
 - **observe**: every accepted proposal waits for the owner.
 
 Waiting proposals are listed in the Planner view, where the owner approves or rejects each one, or a whole run, with a
@@ -151,7 +157,11 @@ planner's blocked record.
   prompt. What a worker does comes from its prompt files and its task id, and task ids carry no instructions (a
   restricted character set, 128 characters). The planner agent's own text reaches its next run only inside the JSON
   bundle.
-- **Decide for the owner.** Drops and reassignments wait for approval by default; observe mode waits for everything.
+- **Decide for the owner.** Finishes, reassignments, drops and unblocks wait for approval by default; observe mode
+  waits for everything. A task the owner left blocked is out of its reach.
+- **Pass off a file anyone can write as the owner's.** Owner messages are only as trustworthy as the file they come
+  from, and its prompt says so; a plan, backlog or message file inside the repository is a config warning (an agent
+  could write it, and with `drop_plan_done` a ticked `[x]` drops a task).
 
 ## BLOCKED handling
 
@@ -166,8 +176,11 @@ checked in this order:
 3. anything else is a **task** problem (wording, scope, a dependency): a planner run that may propose `reword` or
    `unblock`.
 
-Never a loop: each task has `attempts_per_task` planner runs; once spent, the next `BLOCKED` raises one decision
-("let the planner try again" or "leave it to me"). A task the owner kept is left alone until its line changes. A
+Never a loop: each task has `attempts_per_task` attempts. A planner run for it spends one, and so does an applied
+`unblock`, so fill's own cycle (runs without a done line, a `no_done` hold, an unblock that releases it, runs again)
+can't go on by itself: once the attempts are spent, the next `BLOCKED` raises one decision ("let the planner try again"
+or "leave it to me"). A task the owner kept is left alone until its line changes: its `BLOCKED` lines ask nothing,
+and the planner's `reword` and `unblock` of it are refused; the owner rewording the line is what clears it. A
 decision's dedupe key is per task, so a task that reports `BLOCKED` every few minutes asks once.
 
 ## Surfaces
@@ -175,9 +188,8 @@ decision's dedupe key is per task, so a task that reports `BLOCKED` every few mi
 - **Planner view** (owner only, since it shows plan text): sources and their parse status, open tasks, the planner
   agent and its next possible run, pending proposals with approve and reject, recent runs, and history with each
   change's diff. A "Check now" button runs a cycle.
-- **Routes** under `/api/planner` (in `OWNER_ONLY_PREFIXES`, no CORS): `GET /status` is open and holds no plan text
-  (enabled, mode, counts, errors); every other read and every write needs an owner session; writes also need
-  `confirm: true`.
+- **Routes** under `/api/planner` (in `OWNER_ONLY_PREFIXES`, no CORS): every read and every write needs an owner
+  session (the status too: its errors and warnings name paths on the machine); writes also need `confirm: true`.
 - **Events**: `planner.changed`, `planner.run_started`, `planner.run_finished`, `planner.proposals_pending`,
   `planner.blocked`, `planner.tasks_file_restored`.
 - **Decisions** as module `planner`.
