@@ -2166,8 +2166,10 @@ export class AgentsService {
    * about is still the task's latest: a release seen after the task moved on
    * (the owner answered its escalation with a fresh session, say) would lift
    * a hold the owner never saw, so it is refused, as the decision's answer is.
+   * The planner (src/server/planner/, in-process: an unblock it applies) may
+   * release only a no_done hold: an owner hold stays the owner's.
    */
-  releaseFillHold(task: string): Promise<{ task: string; runId: string | null }> {
+  releaseFillHold(task: string, by: "owner" | "planner" = "owner"): Promise<{ task: string; runId: string | null }> {
     return this.exclusive(async () => {
       if (!this.fill) throw new AgentsError(404, `agents.fill is off for ${this.project}`);
       if (this.readOnly) throw new AgentsError(403, "The project is read_only");
@@ -2178,6 +2180,9 @@ export class AgentsService {
           `Task ${task} is not held for the owner at fill's last check${line ? ` (it is ${line.state}${line.hold ? `: ${line.hold}` : ""})` : ""}`,
         );
       }
+      if (by === "planner" && line.hold !== "no_done") {
+        throw new AgentsError(409, `Task ${task} is held for the owner (${line.hold}): only the owner releases that hold`);
+      }
       const latest = this.store.latestRunForTask(this.project, task);
       if (line.runId !== (latest?.id ?? null)) {
         throw new AgentsError(
@@ -2185,20 +2190,28 @@ export class AgentsService {
           `Task ${task} has moved on since fill's last check: its latest run is ${latest ? `${short(latest.id)} (${latest.state})` : "gone"}, not ${line.runId ? short(line.runId) : "none"}; nothing to release`,
         );
       }
-      await this.recordFillRelease(task, latest, "owner", this.probes.clock.now());
+      await this.recordFillRelease(task, latest, by, this.probes.clock.now());
       return { task, runId: latest?.id ?? null };
     });
   }
 
   /** Lift fill's owner hold on `task` for its latest run and chain (see fill.ts). */
-  private async recordFillRelease(task: string, latest: AgentRun | null, by: "owner" | "decision", now: number): Promise<void> {
+  private async recordFillRelease(
+    task: string,
+    latest: AgentRun | null,
+    by: "owner" | "decision" | "planner",
+    now: number,
+  ): Promise<void> {
     await this.record(
       "fill_released",
       {
         agent: latest?.agent,
         task,
         runId: latest?.id,
-        summary: `the owner released fill's hold on ${task}${by === "decision" ? " (a decision)" : ""}: fill starts it again`,
+        summary:
+          by === "planner"
+            ? `the planner released fill's hold on ${task} (an unblock it applied): fill starts it again`
+            : `the owner released fill's hold on ${task}${by === "decision" ? " (a decision)" : ""}: fill starts it again`,
         data: { by, runId: latest?.id ?? null, chainId: latest?.chainId ?? null },
       },
       now,

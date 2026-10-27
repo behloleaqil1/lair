@@ -122,14 +122,15 @@ function asData(text: string, max = 300): string[] {
 
 // ============ FILES ============
 
-type Opened = { fd: number; size: number } | { error: string };
+export type Opened = { fd: number; size: number } | { error: string };
 
 /**
  * Open a regular file for reading. O_NONBLOCK, so a FIFO put in its place
  * doesn't block the server (it is refused as not a regular file);
- * `noFollow` refuses a symlink as the last component.
+ * `noFollow` refuses a symlink as the last component. Shared with the
+ * planner's source reads (src/server/planner/files.ts).
  */
-function openRegular(path: string, noFollow: boolean): Opened {
+export function openRegular(path: string, noFollow: boolean): Opened {
   let fd: number;
   try {
     const flags = constants.O_RDONLY | (constants.O_NONBLOCK ?? 0) | (noFollow ? (constants.O_NOFOLLOW ?? 0) : 0);
@@ -153,7 +154,7 @@ function openRegular(path: string, noFollow: boolean): Opened {
   }
 }
 
-function readAt(fd: number, position: number, length: number): Buffer {
+export function readAt(fd: number, position: number, length: number): Buffer {
   const buffer = Buffer.alloc(length);
   let done = 0;
   while (done < length) {
@@ -165,7 +166,7 @@ function readAt(fd: number, position: number, length: number): Buffer {
 }
 
 /** A whole regular file of at most `maxBytes`, as text. */
-function readBounded(path: string, maxBytes: number, noFollow: boolean): { ok: true; text: string } | { ok: false; reason: string } {
+export function readBounded(path: string, maxBytes: number, noFollow: boolean): { ok: true; text: string } | { ok: false; reason: string } {
   const opened = openRegular(path, noFollow);
   if ("error" in opened) return { ok: false, reason: opened.error };
   try {
@@ -214,8 +215,11 @@ type WaitState =
 /** How many of a task's newest chains the no-done count and the wait streak look at */
 const MAX_CHAINS_LOOKED_AT = 50;
 
-/** The queue file's lines at one check (its last 4 MB), trimmed, each with the offset it starts at. */
-class QueueLines {
+/**
+ * The queue file's lines at one check (its last 4 MB), trimmed, each with
+ * the offset it starts at. Fill and the planner (checkDone) read it.
+ */
+export class QueueLines {
   private lines: { start: number; text: string }[] = [];
   private size = 0;
   private usableMarks = new Map<string, boolean>();
@@ -421,6 +425,75 @@ export function parseTasksFile(content: string, onePerAgent = false): TasksFileE
 /** A tasks_file line as written (its fields trimmed): a done task stays done while it is unchanged. */
 function lineHash(entry: { agent: string; name: string; task: string; description: string }): string {
   return sha256(Buffer.from([entry.agent, entry.name, entry.task, entry.description].join("\u0000"), "utf-8")).slice(0, 16);
+}
+
+/** The fields of a tasks_file line. */
+export type TaskLineFields = { agent: string; name: string; task: string; description: string };
+
+/** The key of the fill_done event that keeps a task done for its latest run and this line as written. */
+function fillDoneKey(task: string, latestRunId: string | null, entry: TaskLineFields): string {
+  return `fill_done:${task}:${latestRunId ?? "none"}:${lineHash(entry)}`;
+}
+
+/** A task fill judges done: from its kept record, or from a queue line. null: not done. */
+export type DoneCheck = { kind: "kept"; line: string; at: number } | { kind: "queue"; line: string } | null;
+
+/**
+ * Where a line's queue window ends: with patterns that match by agent, the
+ * agent's next run on another task (its lines after that are about that
+ * task); otherwise nowhere. Fill and the planner both use it.
+ */
+export function queueWindowEnd(
+  store: Pick<AgentsStore, "firstRunForAgentAfter">,
+  project: string,
+  settings: Pick<FillSettings, "donePattern" | "waitingPattern" | "blockedPattern">,
+  entry: Pick<TaskLineFields, "agent" | "task">,
+  latest: AgentRun | null,
+): QueueMark | undefined {
+  return matchesByAgent(settings) && latest ? store.firstRunForAgentAfter(project, entry.agent, entry.task, latest)?.queueMark : undefined;
+}
+
+/**
+ * Fill's done check for one tasks_file line, shared with the planner
+ * (src/server/planner/): the fill_done record kept for the task's latest run
+ * and this line as written, else the queue lines written since that run's
+ * chain was requested (the whole window for a task with no run, when the
+ * pattern names the task). A done_pattern that names the task decides by
+ * itself; one that names only the agent counts only when the agent's last
+ * DONE, WAITING or BLOCKED line (up to `until`, queueWindowEnd) is the DONE
+ * one. Throws when a pattern doesn't compile for this task.
+ */
+export function checkDone(
+  store: Pick<AgentsStore, "getEventByKey">,
+  project: string,
+  queue: QueueLines,
+  settings: Pick<FillSettings, "donePattern" | "waitingPattern" | "blockedPattern">,
+  entry: TaskLineFields,
+  latest: AgentRun | null,
+  until: QueueMark | undefined,
+): DoneCheck {
+  const kept = store.getEventByKey(project, fillDoneKey(entry.task, latest?.id ?? null, entry));
+  if (kept) return { kind: "kept", line: String(kept.data.line ?? ""), at: kept.at };
+  const donePattern = fillPatternFor(settings.donePattern, entry.task, entry.agent);
+  let line: string | null;
+  if (donePattern.task !== null) {
+    // A line that names the task: done is done, whatever came after it
+    line = queue.find(donePattern, latest?.queueMark, until);
+  } else {
+    // A line by the agent only says where it is now: its last DONE, WAITING or BLOCKED line decides
+    // ("- DONE row 1 by kiro-A", then "- WAITING <gate> by kiro-A" is waiting, not done)
+    const last = queue.lastOf<"done" | "waiting" | "blocked">(
+      [
+        { kind: "done", pattern: donePattern },
+        { kind: "waiting", pattern: fillPatternFor(settings.waitingPattern, entry.task, entry.agent) },
+        { kind: "blocked", pattern: fillPatternFor(settings.blockedPattern, entry.task, entry.agent) },
+      ],
+      latest?.queueMark,
+      until,
+    );
+    line = last?.kind === "done" ? last.line : null;
+  }
+  return line === null ? null : { kind: "queue", line };
 }
 
 // ============ PROMPTS ============
@@ -769,40 +842,22 @@ export class AgentsFill {
       }
 
       // Lines that name only the agent end where its next run on another task began (an owner's run, say)
-      const until = byAgent && latest ? store.firstRunForAgentAfter(project, agent, task, latest)?.queueMark : undefined;
+      const until = queueWindowEnd(store, project, settings, entry, latest);
 
       // Done: kept once seen (for this latest run and this line as written), else from the queue file
-      const doneKey = `fill_done:${task}:${latest?.id ?? "none"}:${lineHash(entry)}`;
-      const kept = store.getEventByKey(project, doneKey);
-      if (kept) {
-        show("done", `done: ${oneLine(String(kept.data.line ?? ""))} (seen ${iso(kept.at)})`, latest?.id ?? null);
-        continue;
-      }
-      let done: string | null;
+      let check: DoneCheck;
       try {
-        const donePattern = fillPatternFor(settings.donePattern, task, agent);
-        if (donePattern.task !== null) {
-          // A line that names the task: done is done, whatever came after it
-          done = queue.find(donePattern, latest?.queueMark, until);
-        } else {
-          // A line by the agent only says where it is now: its last DONE, WAITING or BLOCKED line decides
-          // ("- DONE row 1 by kiro-A", then "- WAITING <gate> by kiro-A" is waiting, not done)
-          const last = queue.lastOf<"done" | "waiting" | "blocked">(
-            [
-              { kind: "done", pattern: donePattern },
-              { kind: "waiting", pattern: fillPatternFor(settings.waitingPattern, task, agent) },
-              { kind: "blocked", pattern: fillPatternFor(settings.blockedPattern, task, agent) },
-            ],
-            latest?.queueMark,
-            until,
-          );
-          done = last?.kind === "done" ? last.line : null;
-        }
+        check = checkDone(store, project, queue, settings, entry, latest, until);
       } catch (e) {
         await hold("refused", `done_pattern: ${message(e)}`);
         continue;
       }
-      if (done !== null) {
+      if (check?.kind === "kept") {
+        show("done", `done: ${oneLine(check.line)} (seen ${iso(check.at)})`, latest?.id ?? null);
+        continue;
+      }
+      if (check?.kind === "queue") {
+        const done = check.line;
         await this.options.record(
           "fill_done",
           {
@@ -812,7 +867,7 @@ export class AgentsFill {
             summary: `fill: ${task} is done: ${oneLine(done)}`,
             evidence: [done],
             data: { line: done, runId: latest?.id ?? null, lineHash: lineHash(entry) },
-            dedupeKey: doneKey,
+            dedupeKey: fillDoneKey(task, latest?.id ?? null, entry),
           },
           probes.clock.now(),
         );
