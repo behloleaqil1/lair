@@ -569,6 +569,21 @@ describe("results", () => {
     expect(ciRun.jobs[0].log).not.toContain(TOKEN);
   });
 
+  it("are announced as gate.completed with the job's result, once per finished job", async () => {
+    const h = await harness({ token: false, pipelines: THREE_STEPS });
+    h.spawner.results.set("npm test", { exitCode: 1, stdout: "1 test failed" });
+    const completed: Event[] = [];
+    h.events.on("gate.completed", (e) => {
+      completed.push(e);
+    });
+    const run = await h.run();
+
+    expect(completed).toHaveLength(1);
+    const data = completed[0].data as { project: string; result: GateResult };
+    expect(data).toEqual({ project: "demo", result: run.jobs[0].result });
+    expect(data.result).toMatchObject({ commitSha: SHA, status: "failed" });
+  });
+
   it("fail when the CI run is missing a step, even if its log has a marker for it", async () => {
     const h = await harness({ visibility: "public", scripts: [{ omitSteps: ["test"] }] });
     const run = await h.run();
