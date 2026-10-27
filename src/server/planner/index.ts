@@ -6,7 +6,7 @@
  *
  * mountPlanner() is what src/server/index.ts calls: it loads every project's
  * `planner:` block and registers the routes, with the owner credential
- * guarding all but the text-free status. The server then connects the
+ * guarding every one. The server then connects the
  * Decision Inbox (useDecisions) and starts it.
  */
 import type { FastifyInstance } from "fastify";

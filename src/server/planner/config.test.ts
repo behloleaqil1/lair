@@ -43,7 +43,7 @@ const errorsOf = (config: ProjectConfig) => {
 };
 
 describe("planner config", () => {
-  it("defaults: observe mode, fill's tasks file, allowlist and done pattern; drop and reassign need approval", () => {
+  it("defaults: observe mode, fill's tasks file, allowlist and done pattern; only add and reword apply without approval", () => {
     const config = project({ enabled: true, agent: { id: "planner", prompt_file: "planner.md" } }, undefined);
     const parsed = parsePlannerConfig(config.planner, config);
     if (!parsed.ok) throw new Error(parsed.errors.join("; "));
@@ -52,7 +52,8 @@ describe("planner config", () => {
     expect(s.tasksFile).toBe((config.agents as { fill: { tasks_file: string } }).fill.tasks_file);
     expect(s.allowlist).toEqual(["worker-a"]);
     expect(s.donePattern).toBe("^-\\s+DONE\\s+{task}(?=\\s|$)");
-    expect(s.approval).toEqual({ add: "never", finish: "never", reassign: "always", reword: "never", drop: "always", unblock: "never" });
+    expect(s.approval).toEqual({ add: "never", finish: "always", reassign: "always", reword: "never", drop: "always", unblock: "always" });
+    expect(s.agent).toMatchObject({ maxRunsPerDay: 24, minIntervalSeconds: 600 });
     expect(s.workDir).toBe(join(config.agents_dir, "lair-planner"));
     expect(s.doneMarker).toBe("#done ");
     expect(s.warnings).toEqual([]);
@@ -100,5 +101,31 @@ describe("planner config", () => {
       expect.stringContaining("the tasks file"),
       expect.stringContaining("prompts_dir"),
     ]);
+  });
+
+  it("warns when a plan or the owner's messages come from inside the repository: an agent could write them", () => {
+    const config = project(
+      {
+        enabled: true,
+        agent: { id: "planner", prompt_file: "planner.md" },
+        sources: [
+          { kind: "markdown_plan", paths: ["docs/plan.md"] },
+          { kind: "owner_messages", path: "inbox.md" },
+          { kind: "backlog_file", paths: ["/elsewhere/backlog.md"] },
+        ],
+      },
+      undefined,
+    );
+    const parsed = parsePlannerConfig(config.planner, config);
+    if (!parsed.ok) throw new Error(parsed.errors.join("; "));
+    expect(parsed.settings.warnings).toEqual([
+      expect.stringMatching(/^source markdown-plan: .*docs\/plan\.md is inside the repository .*drop a task from the tasks file by ticking it \[x\] \(drop_plan_done\)$/),
+      expect.stringMatching(/^source owner-messages: .*inbox\.md is inside the repository the agents work in: an agent can write "owner" messages$/),
+    ]);
+    // Without drop_plan_done the plan can't remove a line, but it still steers the planner
+    const noDrop = project({ ...(config.planner as object), drop_plan_done: false }, undefined);
+    const quiet = parsePlannerConfig(noDrop.planner, noDrop);
+    if (!quiet.ok) throw new Error(quiet.errors.join("; "));
+    expect(quiet.settings.warnings[0]).toMatch(/an agent can change what the planner reads$/);
   });
 });

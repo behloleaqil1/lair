@@ -7,7 +7,7 @@
  * before these checks, and its text only ever becomes a description.
  */
 import { z } from "zod";
-import { PLANNER_OPS, type PlannerOp } from "../../shared/planner-types.js";
+import { PLANNER_OPS, type BlockedClass, type PlannerOp } from "../../shared/planner-types.js";
 import { isValidTaskId } from "../agents/types.js";
 import { isValidDragonId } from "../parsers/dragon-config.js";
 import { clean, readInside } from "./files.js";
@@ -76,6 +76,13 @@ export interface CheckContext {
   nameOf: (agent: string) => string;
   /** The active run of a task, if any */
   activeRun: (task: string) => { id: string; agent: string } | null;
+  /**
+   * The planner's record of a blocked task, if it has one: how the BLOCKED
+   * line was classified, whether the owner keeps it blocked (for its line as
+   * it is now), and the planner attempts spent on it
+   */
+  blocked: (task: string) => { class: BlockedClass; kept: boolean; attempts: number } | null;
+  attemptsPerTask: number;
 }
 
 function field(value: unknown, max: number): string {
@@ -111,6 +118,21 @@ function refusalOf(p: z.infer<typeof ProposalSchema>, text: string | null, ctx: 
   if (p.op === "reassign" || p.op === "drop") {
     const active = ctx.activeRun(p.task);
     if (active) return `task ${p.task} has an active run (${active.id.slice(0, 8)} of ${active.agent}): ${p.op} it once that run ends`;
+  }
+  const blocked = ctx.blocked(p.task);
+  // "Leave it blocked" is the owner's: until the line changes (the owner rewords it), the planner doesn't touch it
+  if ((p.op === "reword" || p.op === "unblock") && blocked?.kept) {
+    return `the owner keeps task ${p.task} blocked: the planner leaves it alone until its line changes`;
+  }
+  if (p.op === "unblock") {
+    if (!blocked) return `task ${p.task} is not blocked: no BLOCKED line for it since it was last unblocked`;
+    if (blocked.class !== "task") {
+      return `task ${p.task} is blocked by ${blocked.class === "owner" ? "something only the owner decides" : "its environment"}: the owner unblocks it`;
+    }
+    // An unblock spends an attempt, so it needs one left
+    if (blocked.attempts >= ctx.attemptsPerTask) {
+      return `the planner's attempts on task ${p.task} are spent (${blocked.attempts} of ${ctx.attemptsPerTask}): the owner decides`;
+    }
   }
   return null;
 }

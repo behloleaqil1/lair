@@ -2,9 +2,9 @@
  * Planner routes. `?project=` is validated by the root guards
  * (src/server/root-guards.ts); without it the default project is used.
  *
- *   GET  /api/planner/status                     open: enabled, mode, counts, errors (no plan or task text)
- *
- * Owner only (every one shows plan or task text, or changes something):
+ * Every route is the owner's: each shows plan or task text, or paths on this
+ * machine (the status's errors and warnings), or changes something.
+ *   GET  /api/planner/status                     enabled, mode, counts, errors and warnings
  *   GET  /api/planner/overview                   sources, open tasks, the tasks file, triggers, blocked tasks
  *   GET  /api/planner/proposals?status=&limit=
  *   GET  /api/planner/runs?limit=
@@ -74,7 +74,7 @@ export async function registerPlannerRoutes(
     const handle = (reply: FastifyReply, e: unknown) =>
       e instanceof PlannerError ? fail(reply, e.statusCode, e.message) : fail(reply, 500, e instanceof Error ? e.message : "Unknown error");
 
-    app.get("/api/planner/status", async (request, reply) => {
+    app.get("/api/planner/status", ownerOnly, async (request, reply) => {
       const query = ProjectQuery.safeParse(request.query ?? {});
       if (!query.success) return fail(reply, 400, "Invalid query");
       return respond(manager.status(projectOf(query.data)));

@@ -480,7 +480,7 @@ triage.useDecisions(decisionInbox);
 
 // The planner: Lair keeps agents.fill's tasks file itself (docs/design/planner.md). One per project with
 // `planner.enabled: true` (off by default). Its planner agent runs through the agents module, in-process; every
-// route but its text-free status needs the owner's session; approvals and blocked tasks go to the Decision Inbox.
+// route needs the owner's session; approvals and blocked tasks go to the Decision Inbox.
 const planner = await mountPlanner(fastify, {
   dbPath: join(process.cwd(), "data", "planner.db"),
   agents: plannerAgentsFrom(agents),

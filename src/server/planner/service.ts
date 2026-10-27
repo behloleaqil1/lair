@@ -75,6 +75,7 @@ const MAX_TRIGGERS = 50;
 const MAX_RECENT_EVENTS = 100;
 const MAX_SEEN_MESSAGES = 500;
 const MAX_BLOCKED = 200;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 /** An error with the HTTP status the routes answer with. */
 export class PlannerError extends Error {
@@ -695,7 +696,8 @@ export class PlannerService {
         !agentsStore?.activeRunForAgent(this.project, agent) &&
         !doc.tasks.some((t) => t.agent === agent && !settled.has(t.task)),
     );
-    const fingerprint = this.idle.length > 0 ? sha256(`${this.idle.join(",")}\n${doc.hash}`) : "";
+    // The idle set alone: an edit of the tasks file that leaves the same agents idle is no new reason to plan
+    const fingerprint = this.idle.length > 0 ? sha256(this.idle.join(",")) : "";
     if (fingerprint !== "" && fingerprint !== this.state<string>(IDLE)) {
       this.addTrigger("idle", now, { detail: `idle with no open line: ${this.idle.join(", ")}` });
     }
@@ -704,19 +706,32 @@ export class PlannerService {
 
   // ============ PLANNER RUNS ============
 
-  private nextRunAt(): number | null {
+  /** Planner runs started in the 24 hours before `now`, oldest first. */
+  private runsInDay(now: number): number[] {
+    return this.store.runStartsSince(this.project, now - DAY_MS);
+  }
+
+  /**
+   * When a run can start, given the pending triggers (null: none pending):
+   * the newest trigger debounce_seconds old, min_interval_seconds after the
+   * last run, and fewer than max_runs_per_day runs in the 24 hours before.
+   */
+  private nextRunAt(now: number): number | null {
     const triggers = this.state<TriggerView[]>(TRIGGERS) ?? [];
     const agent = this.settings.agent;
     if (!agent || triggers.length === 0) return null;
     const lastTrigger = this.state<number>(LAST_TRIGGER) ?? 0;
     const lastRun = this.state<number>(LAST_RUN);
-    return Math.max(lastTrigger + agent.debounceSeconds * 1000, lastRun === null ? 0 : lastRun + agent.minIntervalSeconds * 1000);
+    const day = this.runsInDay(now);
+    // At the cap: once the oldest run of the window is 24 hours old (the one that makes room)
+    const dayFree = day.length >= agent.maxRunsPerDay ? day[day.length - agent.maxRunsPerDay] + DAY_MS : 0;
+    return Math.max(lastTrigger + agent.debounceSeconds * 1000, lastRun === null ? 0 : lastRun + agent.minIntervalSeconds * 1000, dayFree);
   }
 
   private async maybeStart(doc: TasksDoc, now: number): Promise<void> {
     const agent = this.settings.agent;
     if (!agent || this.state(PAUSED) || this.config.read_only === true) return;
-    const at = this.nextRunAt();
+    const at = this.nextRunAt(now);
     if (at === null || now < at) return;
     await this.startRun(doc, now);
   }
@@ -862,6 +877,9 @@ export class PlannerService {
       // Recorded, but the request's answer was lost (a restart): find its run by task id
       const found = agentsStore.latestRunForTask(this.project, run.task);
       if (found) {
+        // agentRunId is the chain's first run, as requestRun returned it on the normal path; `found` is the task's
+        // latest run, which may be a later attempt of that chain (a retry or a fresh session), and its chain id is
+        // that first run's id
         run.agentRunId = found.chainId;
         run.chainId = found.chainId;
         this.store.saveRun(run);
@@ -911,6 +929,16 @@ export class PlannerService {
         const latest = agentsStore?.latestRunForTask(this.project, task);
         return latest && isActive(latest.state) ? { id: latest.id, agent: latest.agent } : null;
       },
+      blocked: (task) => {
+        const record = (this.state<Record<string, BlockedRecord>>(BLOCKED) ?? {})[task];
+        if (!record) return null;
+        return {
+          class: record.class,
+          kept: record.kept !== undefined && record.kept === this.lineKey(doc, task),
+          attempts: this.store.attempts(this.project, task),
+        };
+      },
+      attemptsPerTask: this.settings.attemptsPerTask,
     };
   }
 
@@ -1042,8 +1070,14 @@ export class PlannerService {
     }
   }
 
-  /** Unblock: release fill's no_done hold (never an owner hold) and clear the planner's record. */
+  /**
+   * Unblock: release fill's no_done hold (never an owner hold) and clear the
+   * planner's record. One the planner proposed spends an attempt on the task,
+   * so a task that keeps getting blocked reaches the owner's decision instead
+   * of a loop of runs (fill's release counts its runs without done from zero).
+   */
   private async unblock(task: string, reason: string, now: number, ref: { runId?: string; proposalId?: string; by: string }): Promise<string> {
+    if (ref.proposalId) this.store.addAttempt(this.project, task, now);
     const line = this.agents.fillLines(this.project).find((l) => l.task === task);
     let outcome: string;
     if (line && line.state === "held" && line.hold === "no_done") {
@@ -1293,7 +1327,8 @@ export class PlannerService {
   overview(): PlannerOverviewView {
     const doc = this.doc;
     const agent = this.settings.agent;
-    const next = this.nextRunAt();
+    const now = this.clock.now();
+    const next = this.nextRunAt(now);
     return {
       ...this.status(),
       tasksFile: this.settings.tasksFile,
@@ -1313,6 +1348,8 @@ export class PlannerService {
             minIntervalSeconds: agent.minIntervalSeconds,
             debounceSeconds: agent.debounceSeconds,
             maxProposals: agent.maxProposals,
+            maxRunsPerDay: agent.maxRunsPerDay,
+            runsInDay: this.runsInDay(now).length,
             nextRunAt: next === null ? null : iso(next),
           }
         : null,

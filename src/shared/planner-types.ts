@@ -151,7 +151,7 @@ export interface ChangeView {
   proposalId: string | null;
 }
 
-/** GET /api/planner/status: no plan or task text, so it is open to every local client. */
+/** GET /api/planner/status (owner only: its errors and warnings name paths on this machine). */
 export interface PlannerStatusView {
   project: string;
   enabled: boolean;
@@ -192,6 +192,9 @@ export interface PlannerOverviewView extends PlannerStatusView {
     minIntervalSeconds: number;
     debounceSeconds: number;
     maxProposals: number;
+    maxRunsPerDay: number;
+    /** Planner runs started in the last 24 hours */
+    runsInDay: number;
     /** When a run could start, given the pending triggers (null: none pending) */
     nextRunAt: string | null;
   } | null;

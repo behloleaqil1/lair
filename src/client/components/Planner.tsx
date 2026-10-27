@@ -129,7 +129,8 @@ export function Planner({ project, refreshKey }: Props) {
         {o.agent ? (
           <p style={muted}>
             Planner agent <code>{o.agent.id}</code> (prompt <code>{o.agent.promptFile}</code>, at most {o.agent.maxProposals} proposals,
-            every {o.agent.minIntervalSeconds} s at most) · next run: {o.agent.nextRunAt ? time(o.agent.nextRunAt) : "no trigger pending"}
+            every {o.agent.minIntervalSeconds} s at most, {o.agent.runsInDay} of {o.agent.maxRunsPerDay} runs in the last 24 h) · next
+            run: {o.agent.nextRunAt ? time(o.agent.nextRunAt) : "no trigger pending"}
             {o.activeRun && <> · running since {time(o.activeRun.requestedAt)}</>}
           </p>
         ) : (

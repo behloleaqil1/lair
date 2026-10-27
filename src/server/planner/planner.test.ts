@@ -27,8 +27,11 @@ import {
   tasksText,
   writeProposals,
   type Harness,
+  type Paths,
 } from "./testing/harness.js";
 import { OWNER_SESSION_HEADER } from "../human-auth/index.js";
+import { sha256 } from "./files.js";
+import { PlannerStore } from "./store.js";
 
 afterEach(cleanup);
 
@@ -413,6 +416,47 @@ describe("proposals", () => {
     expect(h.service.status().paused).toBe(false);
   });
 
+  it("finish and reassign wait for the owner by default, in act mode too, and apply once approved", async () => {
+    const h = await plannedRun("act", {
+      proposals: [
+        { op: "finish", task: "feat-login", reason: "merged as #12" },
+        { op: "reassign", task: "feat-old", agent: "worker-b", reason: "worker-b is idle" },
+      ],
+    });
+    const before = tasksText(h);
+    expect(h.service.proposals().map((p) => [p.op, p.status])).toEqual([
+      ["finish", "pending"],
+      ["reassign", "pending"],
+    ]);
+    const runId = runsOf(h)[0].id;
+    const approved = await post(h, `/api/planner/runs/${runId}/approve?project=demo`);
+    expect(approved.statusCode).toBe(200);
+    expect((approved.json().data as ProposalView[]).map((p) => p.status)).toEqual(["applied", "applied"]);
+    expect(before).not.toBe(tasksText(h));
+    expect(tasksText(h)).toContain("\n#done worker-a|Alice|feat-login|Login form\n");
+    expect(tasksText(h)).toContain("\nworker-b|Bob|feat-old|Old work\n");
+    expect(taskIds(h)).toEqual(["feat-old"]);
+    // The run's decision is moot now: withdrawn
+    expect(open(h)).toEqual([]);
+  });
+
+  it("a proposal that went stale is refused when the owner approves it, with the reason", async () => {
+    const h = await plannedRun("observe", {
+      proposals: [{ op: "add", task: "feat-search", agent: "worker-b", text: "Search page", reason: "ready in the plan" }],
+    });
+    const [pending] = h.service.proposals({ status: "pending" });
+    // Someone adds the task meanwhile
+    tasks(h, "worker-a|Alice|feat-login|Login form", "worker-a|Alice|feat-old|Old work", "worker-a|Alice|feat-search|Added by hand");
+    const res = await post(h, `/api/planner/proposals/${pending.id}/approve?project=demo`);
+    expect(res.statusCode).toBe(200);
+    expect(res.json().data).toMatchObject({
+      status: "rejected",
+      refusal: "no longer valid: task feat-search is already in the tasks file (line 4)",
+    });
+    expect(tasksText(h)).toContain("worker-a|Alice|feat-search|Added by hand");
+    expect(tasksText(h)).not.toContain("worker-b|Bob|feat-search");
+  });
+
   it("the planner agent can't edit the tasks file: act mode puts Lair's version back, refuses the run's proposals and asks the owner", async () => {
     const p = makePaths();
     tasks(p, "worker-a|Alice|feat-login|Login form");
@@ -522,7 +566,7 @@ describe("BLOCKED handling", () => {
 // ============ ROUTES, RELOAD, RESTART ============
 
 describe("routes, reload and restart", () => {
-  it("every write and every read with plan text is the owner's: 403 for scripts, a signed-out dashboard and a made-up session", async () => {
+  it("every route is the owner's, the status too: 403 for scripts, a signed-out dashboard and a made-up session", async () => {
     const p = makePaths();
     writeFileSync(p.planFile, "- [ ] secret-feature: The unannounced pricing page\n");
     tasks(p, "worker-a|Alice|feat-login|Login form");
@@ -544,18 +588,18 @@ describe("routes, reload and restart", () => {
         expect(res.statusCode, `${url} ${JSON.stringify(Object.keys(headers))}`).toBe(403);
       }
     }
-    for (const url of ["/api/planner/overview", "/api/planner/proposals", "/api/planner/runs", "/api/planner/history"]) {
+    // The status too: its errors and warnings name paths on this machine
+    const reads = ["/api/planner/status", "/api/planner/overview", "/api/planner/proposals", "/api/planner/runs", "/api/planner/history"];
+    for (const url of reads) {
       for (const headers of strangers) {
         const res = await get(h, `${url}?project=demo`, headers);
         expect(res.statusCode, url).toBe(403);
         expect(res.body).not.toContain("unannounced");
+        expect(res.body).not.toContain(p.dir);
       }
     }
-    // The status is open and holds no plan or task text
-    const status = await get(h, "/api/planner/status?project=demo", {});
+    const status = await get(h, "/api/planner/status?project=demo");
     expect(status.statusCode).toBe(200);
-    expect(status.body).not.toContain("unannounced");
-    expect(status.body).not.toContain("feat-login");
     expect(status.json().data).toMatchObject({ enabled: true, mode: "act", counts: { openTasks: 1 } });
 
     // The owner sees it
@@ -635,5 +679,227 @@ describe("run directories", () => {
     const call = await runPlannerAgent(h, (c) => writeProposals(c, { proposals: [] }));
     const path = /: (\S+proposals\.json)/.exec(promptOf(call))?.[1] ?? "";
     expect(path).toBe(join(p.work, "planner-runs", runsOf(h)[0].id, "proposals.json"));
+  });
+});
+
+// ============ BLOCKED TASKS, FILL'S HOLDS, RECOVERY AND COST ============
+
+/** The agents block with fill on: one run without a done line holds the task (no_done), no backoff. */
+const fillOn = (p: Paths) =>
+  ({
+    agents: {
+      enabled: true,
+      interval_seconds: 1,
+      dead_on_start_seconds: 30,
+      fill: {
+        enabled: true,
+        tasks_file: p.tasksFile,
+        agents: ["worker-a", "worker-b"],
+        prompt_files: ["{prompts_dir}/worker.txt"],
+        max_completions_without_done: 1,
+        backoff_seconds: 0,
+      },
+    },
+  }) as never;
+
+/** A worker's run, as fill started it: it runs, writes a queue line, and exits 0 two minutes later. */
+async function workerRun(h: Harness, line: string): Promise<void> {
+  const before = h.spawner.calls.length;
+  await h.agentsService.tick();
+  const call = h.spawner.calls[before];
+  if (!call) throw new Error("no worker run was spawned");
+  queue(h, line);
+  h.clock.t += 2 * MIN;
+  appendFileSync(call.logPath, "worked\n");
+  h.spawner.exit(call.pid, 0);
+  await h.agentsService.tick();
+}
+
+describe("blocked tasks, fill's holds, recovery and cost", () => {
+  it("an unblock waits for the owner and spends an attempt: fill's no_done holds end at one owner decision, not a loop of runs", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-cart|Cart");
+    const h = await setup(p, plannerBlock(p), { extra: fillOn(p) });
+    await h.service.cycle();
+    await h.agentsService.checkFill(); // fill starts worker-a on feat-cart
+    await workerRun(h, "- BLOCKED feat-cart by worker-a 12:01Z: the scope is unclear");
+    expect((await h.agentsService.checkFill()).lines[0]).toMatchObject({ task: "feat-cart", state: "held", hold: "no_done" });
+
+    await h.service.cycle(); // the BLOCKED line: a task problem, so a planner run (attempt 1 of 2)
+    at(h, 5 * MIN);
+    await h.service.cycle();
+    expect(runsOf(h)).toHaveLength(1);
+    await runPlannerAgent(h, (c) =>
+      writeProposals(c, { proposals: [{ op: "unblock", task: "feat-cart", reason: "the plan's cart section settles the scope" }] }),
+    );
+    await h.service.cycle();
+    // approval.unblock is "always" by default: it waits, in act mode too
+    expect(h.service.proposals().map((x) => [x.op, x.status])).toEqual([["unblock", "pending"]]);
+    expect(h.agentsStore.listEvents("demo", { kinds: ["fill_released"] })).toEqual([]);
+    const approval = open(h).find((d) => d.key.startsWith("approve:"));
+    expect(await h.answer(approval?.id ?? "", "approve_all")).toBe(200);
+    // Applied: fill's hold released as the planner, and the unblock spent the task's second attempt
+    expect(h.agentsStore.listEvents("demo", { kinds: ["fill_released"] }).map((e) => e.data.by)).toEqual(["planner"]);
+    expect(history(h)[0]).toMatchObject({ op: "unblock", task: "feat-cart" });
+    expect(history(h)[0].reason).toContain("released fill's no_done hold");
+
+    // Fill starts it again; it reports BLOCKED again and is held again
+    expect((await h.agentsService.checkFill()).lines[0]).toMatchObject({ task: "feat-cart", state: "started" });
+    await workerRun(h, "- BLOCKED feat-cart by worker-a 12:20Z: still unclear");
+    await h.agentsService.checkFill();
+    at(h, 30 * MIN);
+    await h.service.cycle();
+    // The attempts are spent: one owner decision, and no more planner runs for it however long it waits
+    expect(open(h).map((d) => d.key)).toEqual(["attempts:feat-cart"]);
+    expect(h.service.overview().blocked.find((b) => b.task === "feat-cart")).toMatchObject({
+      attempts: 2,
+      route: "a decision: the planner's attempts are spent",
+    });
+    at(h, 5 * 60 * MIN);
+    await h.service.cycle();
+    expect(runsOf(h)).toHaveLength(1);
+  });
+
+  it("the planner may release fill's no_done hold, never an owner hold", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    const h = await setup(p, plannerBlock(p, { agent: undefined }), { extra: fillOn(p) });
+    await h.agentsService.checkFill();
+    await h.agentsService.tick(); // worker-a runs
+    // The owner releases its claim: the run stops itself, and fill leaves the task to the owner
+    await h.agentsService.releaseClaim("feat-login");
+    for (const step of [SEC, SEC, 40 * SEC]) {
+      h.clock.t += step;
+      await h.agentsService.tick();
+    }
+    expect((await h.agentsService.checkFill()).lines[0]).toMatchObject({ task: "feat-login", state: "held", hold: "owner" });
+
+    await expect(h.agentsService.releaseFillHold("feat-login", "planner")).rejects.toMatchObject({
+      statusCode: 409,
+      message: "Task feat-login is held for the owner (owner): only the owner releases that hold",
+    });
+    expect(h.agentsStore.listEvents("demo", { kinds: ["fill_released"] })).toEqual([]);
+    // The owner's own release goes through
+    await expect(h.agentsService.releaseFillHold("feat-login")).resolves.toMatchObject({ task: "feat-login" });
+    expect(h.agentsStore.listEvents("demo", { kinds: ["fill_released"] }).map((e) => e.data.by)).toEqual(["owner"]);
+  });
+
+  it("a write a restart interrupted is finished when its rename happened, and dropped when it didn't", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    const h = await setup(p, plannerBlock(p, { agent: undefined }));
+    await h.service.cycle();
+    // As if Lair stopped right after renaming its new file into place, before recording the change
+    const after = tasksText(h).replace("worker-a|Alice|feat-login|Login form", "#done worker-a|Alice|feat-login|Login form");
+    writeFileSync(p.tasksFile, after);
+    const side = new PlannerStore(h.dbs.planner);
+    const change = {
+      project: "demo",
+      at: NOW,
+      source: "deterministic",
+      outcome: "applied",
+      op: "mark_done",
+      task: "feat-login",
+      agent: "worker-a",
+      reason: "the queue reports it done",
+      diff: ["-2 worker-a|Alice|feat-login|Login form", "+2 #done worker-a|Alice|feat-login|Login form"],
+    };
+    side.set("demo", "intent", { afterHash: sha256(after), text: after, changes: [change] });
+    await h.service.cycle();
+    // Recorded as Lair's own change, not as someone else's edit
+    expect(history(h).map((c) => [c.source, c.op, c.task])).toEqual([["deterministic", "mark_done", "feat-login"]]);
+    expect(side.get("demo", "intent")).toBeNull();
+
+    // A write whose rename never happened: nothing is recorded, and the file is still what Lair last knew
+    side.set("demo", "intent", { afterHash: sha256("never written\n"), text: "never written\n", changes: [{ ...change, op: "drop" }] });
+    await h.service.cycle();
+    expect(history(h)).toHaveLength(1);
+    expect(side.get("demo", "intent")).toBeNull();
+    expect(tasksText(h)).toBe(after);
+    side.close();
+  });
+
+  it("the owner's 'Leave it blocked' holds: later BLOCKED lines ask nothing and the planner can't reword or unblock it, until its line changes", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form", "worker-b|Bob|feat-search|Search page");
+    const h = await setup(p, plannerBlock(p));
+    await h.service.cycle();
+    queue(p, "- BLOCKED feat-search by worker-b 12:01Z: docker daemon is down");
+    await h.service.cycle();
+    const [asked] = open(h);
+    expect(asked.key).toBe("blocked:feat-search:environment");
+    expect(await h.answer(asked.id, "keep")).toBe(200);
+    queue(p, "- BLOCKED feat-search by worker-b 12:10Z: docker daemon is down");
+    await h.service.cycle();
+    expect(open(h)).toEqual([]);
+    expect(h.service.overview().blocked[0]).toMatchObject({ task: "feat-search", route: expect.stringContaining("left to you") });
+
+    // A planner run (the owner asks for one) may neither reword nor unblock it
+    appendFileSync(p.inboxFile, "- OWNER 2026-03-02T12:11:00Z [m1]: Get search moving again\n");
+    at(h, 11 * MIN);
+    await h.service.cycle();
+    at(h, 12 * MIN);
+    await h.service.cycle();
+    expect(runsOf(h)).toHaveLength(1);
+    await runPlannerAgent(h, (c) =>
+      writeProposals(c, {
+        proposals: [
+          { op: "reword", task: "feat-search", text: "Search page, without docker", reason: "the owner asked" },
+          { op: "unblock", task: "feat-login", reason: "the owner asked" },
+        ],
+      }),
+    );
+    await h.service.cycle();
+    expect(h.service.proposals().map((x) => x.refusal)).toEqual([
+      "the owner keeps task feat-search blocked: the planner leaves it alone until its line changes",
+      "task feat-login is not blocked: no BLOCKED line for it since it was last unblocked",
+    ]);
+    expect(tasksText(h)).toContain("worker-b|Bob|feat-search|Search page\n");
+
+    // The owner rewords the line: the keep no longer applies, and the next BLOCKED asks again
+    tasks(p, "worker-a|Alice|feat-login|Login form", "worker-b|Bob|feat-search|Search page, without docker");
+    queue(p, "- BLOCKED feat-search by worker-b 12:30Z: docker daemon is down");
+    at(h, 30 * MIN);
+    await h.service.cycle();
+    expect(open(h).map((d) => d.key)).toEqual(["blocked:feat-search:environment"]);
+  });
+
+  it("the same idle agents after an edit of the tasks file are no new trigger; max_runs_per_day caps runs in any 24 hours", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    const agent = { id: "planner", prompt_file: "planner.md", min_interval_seconds: 0, debounce_seconds: 0, max_runs_per_day: 2 };
+    const h = await setup(p, plannerBlock(p, { agent }));
+    await h.service.cycle(); // worker-b is idle: a trigger, and a run at once (no debounce, no interval)
+    expect(runsOf(h)).toHaveLength(1);
+    await runPlannerAgent(h, (c) => writeProposals(c, { proposals: [] }));
+    await h.service.cycle();
+
+    // Someone rewords worker-a's line: worker-b is still the one idle agent, so nothing to plan again
+    tasks(p, "worker-a|Alice|feat-login|Login form, with the reset link");
+    await h.service.cycle();
+    expect(h.service.overview().triggers).toEqual([]);
+    expect(runsOf(h)).toHaveLength(1);
+
+    // A plan change is a trigger: a second run; a third waits until the first is 24 hours old
+    appendFileSync(p.planFile, "- [ ] feat-cart: Cart\n");
+    await h.service.cycle();
+    expect(runsOf(h)).toHaveLength(2);
+    await runPlannerAgent(h, (c) => writeProposals(c, { proposals: [] }));
+    await h.service.cycle();
+    appendFileSync(p.planFile, "- [ ] feat-pay: Payments\n");
+    at(h, 60 * MIN);
+    await h.service.cycle();
+    expect(runsOf(h)).toHaveLength(2);
+    expect(h.service.overview().agent).toMatchObject({
+      maxRunsPerDay: 2,
+      runsInDay: 2,
+      nextRunAt: new Date(NOW + 24 * 60 * MIN).toISOString(),
+    });
+    at(h, 24 * 60 * MIN - SEC);
+    await h.service.cycle();
+    expect(runsOf(h)).toHaveLength(2);
+    at(h, 24 * 60 * MIN);
+    await h.service.cycle();
+    expect(runsOf(h)).toHaveLength(3);
   });
 });

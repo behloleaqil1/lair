@@ -129,6 +129,8 @@ const AgentSchema = z
     min_interval_seconds: z.number().int().min(0).max(86_400).default(600),
     debounce_seconds: z.number().int().min(0).max(3600).default(60),
     max_proposals: z.number().int().min(1).max(50).default(10),
+    /** Planner runs started in any 24 hours, whatever triggers them */
+    max_runs_per_day: z.number().int().min(1).max(1000).default(24),
   })
   .strict();
 
@@ -156,11 +158,13 @@ const PlannerSchema = z
     approval: z
       .object({
         add: Approval.default("never"),
-        finish: Approval.default("never"),
+        // A done line the queue reports is the rules' job: a finish of the planner's own has no such evidence
+        finish: Approval.default("always"),
         reassign: Approval.default("always"),
         reword: Approval.default("never"),
         drop: Approval.default("always"),
-        unblock: Approval.default("never"),
+        // An unblock starts again work fill held: the owner sees each one
+        unblock: Approval.default("always"),
       })
       .strict()
       .default({}),
@@ -224,6 +228,7 @@ export interface PlannerAgentSettings {
   minIntervalSeconds: number;
   debounceSeconds: number;
   maxProposals: number;
+  maxRunsPerDay: number;
 }
 
 export interface PlannerSettings {
@@ -356,6 +361,7 @@ export function parsePlannerConfig(raw: unknown, project: ProjectConfig): Planne
       minIntervalSeconds: a.min_interval_seconds,
       debounceSeconds: a.debounce_seconds,
       maxProposals: a.max_proposals,
+      maxRunsPerDay: a.max_runs_per_day,
     };
   }
 
@@ -468,6 +474,22 @@ export function parsePlannerConfig(raw: unknown, project: ProjectConfig): Planne
     }
     if (isInside(repo, realish(workDir))) {
       warnings.push(`planner.work_dir ${workDir} is inside the repository: planner runs would show up in git status`);
+    }
+    // What the planner reads is only as trustworthy as whoever can write it
+    for (const source of sources) {
+      const inRepo = (source.kind === "markdown_plan" || source.kind === "backlog_file" ? source.paths : [source.path]).filter((p) =>
+        isInside(repo, realish(p)),
+      );
+      if (inRepo.length === 0) continue;
+      if (source.kind === "markdown_plan" || source.kind === "backlog_file") {
+        warnings.push(
+          `source ${source.name}: ${inRepo.join(", ")} is inside the repository the agents work in: an agent can change what the planner reads${
+            value.drop_plan_done ? ", and drop a task from the tasks file by ticking it [x] (drop_plan_done)" : ""
+          }`,
+        );
+      } else if (source.kind === "owner_messages") {
+        warnings.push(`source ${source.name}: ${inRepo.join(", ")} is inside the repository the agents work in: an agent can write "owner" messages`);
+      }
     }
     if (!agent) warnings.push("planner.agent is not set: only the deterministic part runs (no planner agent)");
   }

@@ -25,7 +25,7 @@ export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/review",
   "/api/agents",
   "/api/triage/owner",
-  // Every planner route but its text-free status needs the owner: its reads show plan text
+  // Every planner route needs the owner: its reads show plan text and paths on this machine
   "/api/planner",
   // Modules whose writes need the owner (requireOwnerForChanges); their reads stay open but get no CORS either
   "/api/delivery",

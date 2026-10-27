@@ -359,6 +359,14 @@ export class PlannerStore {
     return (this.db.prepare(`SELECT COUNT(*) AS n FROM planner_runs WHERE project = ?`).get(project) as { n: number }).n;
   }
 
+  /** When the project's runs requested after `since` started, oldest first (max_runs_per_day). */
+  runStartsSince(project: string, since: number): number[] {
+    const rows = this.db
+      .prepare(`SELECT requested_at FROM planner_runs WHERE project = ? AND requested_at > ? ORDER BY requested_at`)
+      .all(project, since) as { requested_at: number }[];
+    return rows.map((row) => row.requested_at);
+  }
+
   runView(run: StoredRun): PlannerRunView {
     const counts = this.db
       .prepare(`SELECT status, COUNT(*) AS n FROM planner_proposals WHERE run_id = ? GROUP BY status`)
