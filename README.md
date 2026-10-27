@@ -70,7 +70,7 @@ machines:
     runners: [heavy, light]
 ```
 
-Project files end in `.yaml` or `.yml` (both the server and the bus load either; `.yaml` wins if both exist). Restart the server after adding a project. To open your project by default instead of `example`, start the server with `LAIR_PROJECT=myproject` (an unknown name logs a warning and is ignored). See [Getting Started](docs/getting-started.md) for a walkthrough and [Configuration](docs/configuration.md) for every option (machines over SSH, controls, merge bar, dragons, process manager).
+Project files end in `.yaml` or `.yml` (both the server and the bus load either; `.yaml` wins if both exist). The server picks up new and changed project files without a restart, and an invalid change keeps the previous config running with a banner saying why ([Live config reload](docs/configuration.md#live-config-reload)). The owner can restart Lair from the dashboard's footer when a service manager runs it ([Restart and update](docs/configuration.md#restart-and-update)). To open your project by default instead of `example`, start the server with `LAIR_PROJECT=myproject` (an unknown name logs a warning and is ignored). See [Getting Started](docs/getting-started.md) for a walkthrough and [Configuration](docs/configuration.md) for every option (machines over SSH, controls, merge bar, dragons, process manager).
 
 ## Connect an agent
 

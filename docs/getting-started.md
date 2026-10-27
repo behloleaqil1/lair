@@ -64,7 +64,7 @@ agents_dir: /path/to/agents
 gates_dir: /path/to/gates
 ```
 
-The file name (without `.yaml` or `.yml`) is the project name. A file in `projects/local/` takes precedence over one with the same name in `projects/`, and `.yaml` over `.yml` in the same directory. Restart the server after adding a project.
+The file name (without `.yaml` or `.yml`) is the project name. A file in `projects/local/` takes precedence over one with the same name in `projects/`, and `.yaml` over `.yml` in the same directory. The server picks up new and changed project files without a restart (see [Live config reload](configuration.md#live-config-reload)); reload the dashboard to see a new project in its list.
 
 See [Configuration](configuration.md) for all available options.
 
@@ -95,8 +95,8 @@ See [Configuration](configuration.md) for all available options.
 - Ensure the YAML file is in `projects/` or `projects/local/`
 - Check that the file name ends in `.yaml` or `.yml`
 - Check the project name (the file name without the extension): it must start with a letter or digit and contain only letters, digits, `.`, `_` and `-`. Other files are not listed
-- Verify the YAML syntax is valid
-- Restart the server after adding the file
+- Verify the YAML syntax is valid: an invalid file shows in a banner on the dashboard, with the error
+- Reload the dashboard after adding the file
 
 ### Can't connect to the UI
 
