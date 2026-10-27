@@ -124,6 +124,7 @@ export type AgentEventKind =
   | "failover"
   | "budget_warning"
   | "budget_exceeded"
+  | "budget_override"
   | "decision";
 
 /** Recovery and audit record: what happened, why, and the evidence. */

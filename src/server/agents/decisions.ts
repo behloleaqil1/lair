@@ -1,12 +1,18 @@
 /**
  * The Decision Inbox, as the agents module needs it (docs/design/autonomy.md
- * §1): a small interface the decisions module implements. Until one is
- * registered (AgentsManager.setDecisionInbox), decisions are written as
- * `OWNER?` entries to the project's inbox file, the convention the Decision
- * Inbox importers read.
+ * §1). In the server the agents module raises its decisions in the real
+ * inbox (src/server/decisions/) through ProducerDecisions, and follows the
+ * answers (AgentsManager.useDecisions). Without the inbox, or when raising
+ * fails, decisions are written as `OWNER?` entries to the project's inbox
+ * file, the convention the Decision Inbox importers read.
  */
 import { randomUUID } from "crypto";
+import type { DecisionKind as InboxKind } from "../../shared/decision-types.js";
+import type { DecisionProducer, RaiseDecisionInput } from "../decisions/types.js";
 import type { Clock, FileSystem } from "../watchdog/probes.js";
+
+/** The module name the agents module raises decisions as. */
+export const DECISION_MODULE = "agents";
 
 export type DecisionKind =
   | "product"
@@ -19,8 +25,11 @@ export type DecisionKind =
   | "other";
 
 export interface DecisionOption {
+  /** Lowercase letters, digits, '_' and '-' (the inbox's option ids) */
   id: string;
   label: string;
+  /** What happens if this option is chosen */
+  consequences?: string;
 }
 
 export interface DecisionRequest {
@@ -41,6 +50,10 @@ export interface DecisionRequest {
   requestedBy: string;
   /** Stable identity of the condition; the agents module raises each key once */
   key: string;
+  /** What the answer applies to, e.g. "chain:<id>" */
+  ref?: string;
+  /** References of the work that waits, e.g. "agents:demo:task:feat-login" */
+  blocks?: string[];
 }
 
 export interface DecisionInbox {
@@ -70,6 +83,72 @@ export function formatDecision(decision: DecisionRequest, id: string, at: string
   if (options) lines.push(`  - options: ${oneLine(options)}`);
   if (decision.why) lines.push(`  - why: ${oneLine(decision.why)}`);
   return lines.join("\n") + "\n";
+}
+
+/** Control characters (log colours, ...) become spaces; newlines and tabs stay when `keepLines`. */
+function printable(text: string, keepLines: boolean): string {
+  let out = "";
+  for (const ch of text) {
+    const code = ch.charCodeAt(0);
+    const line = code === 0x0a || code === 0x09 || code === 0x0d;
+    out += (code < 0x20 && !(keepLines && line)) || code === 0x7f ? " " : ch;
+  }
+  return out;
+}
+
+function clip(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+}
+
+/** The inbox's kind for an agents decision: spend and escalation; anything else is other. */
+export function inboxKind(kind: DecisionKind): InboxKind {
+  return kind === "spend" || kind === "escalation" ? kind : "other";
+}
+
+/** An agents decision as the Decision Inbox takes it (see src/server/decisions/validate.ts). */
+export function toRaiseInput(decision: DecisionRequest): RaiseDecisionInput {
+  const options = decision.options.map((o) => ({
+    id: o.id,
+    label: clip(oneLine(printable(o.label, false), 200), 120),
+    consequences: clip(printable(o.consequences ?? o.label, true).trim(), 1000),
+  }));
+  const recommended = options.some((o) => o.id === decision.recommended) ? decision.recommended! : options[0].id;
+  return {
+    project: decision.project,
+    kind: inboxKind(decision.kind),
+    title: clip(oneLine(printable(decision.question, false), 400), 200),
+    context: clip(printable(decision.context, true).trim() || decision.question, 20000),
+    options,
+    recommended: { optionId: recommended, reasoning: clip(printable(decision.why ?? "Lair recommends it.", true), 2000) },
+    source: { module: DECISION_MODULE, ref: clip(printable(decision.ref ?? decision.key, false), 200) },
+    key: clip(printable(decision.key, false), 200),
+    blocks: (decision.blocks ?? []).map((b) => clip(printable(b, false), 200)),
+  };
+}
+
+/**
+ * Raises decisions in the Decision Inbox (src/server/decisions/), the way
+ * the server does. When the inbox refuses one (or fails), `fallback` (the
+ * inbox file) takes it, so the owner still hears.
+ */
+export class ProducerDecisions implements DecisionInbox {
+  constructor(
+    private producer: DecisionProducer,
+    private fallback: DecisionInbox,
+  ) {}
+
+  async request(decision: DecisionRequest): Promise<{ id: string; via: string }> {
+    try {
+      const { decision: raised, created } = await this.producer.raise(toRaiseInput(decision));
+      return { id: raised.id, via: created ? "Decision Inbox" : "Decision Inbox (already open)" };
+    } catch (e) {
+      const written = await this.fallback.request(decision);
+      return {
+        id: written.id,
+        via: `${written.via}: the Decision Inbox refused it (${e instanceof Error ? e.message : String(e)})`,
+      };
+    }
+  }
 }
 
 /** Appends decisions to the project's inbox file (or keeps them in the store only, when it has none). */

@@ -39,6 +39,7 @@ import { WatchdogManager } from "../watchdog/service.js";
 import { AgentsManager, type AgentsService } from "./service.js";
 import { registerAgentsRoutes } from "./routes.js";
 import { HumanAuth, OWNER_SESSION_HEADER, registerOwnerRoutes } from "../human-auth/index.js";
+import { mountDecisions } from "../decisions/index.js";
 import { freshSessionAction, ownerRequest, releaseClaimAction } from "../../client/agents-actions";
 import { readLock } from "./locks.js";
 import type { AgentProbes, ProcessOwner, ProcessSpawner, SpawnOptions } from "./probes.js";
@@ -1085,7 +1086,7 @@ describe("6. budgets per agent and per project, per day and month, fed by the fl
       onTimeout: "wait",
     });
     expect(asked[0].question).toContain("Agent worker-a used 9 cost in day 2026-03-02 (hard limit 8)");
-    expect(asked[0].options.map((o) => o.id)).toEqual(["raise", "wait"]);
+    expect(asked[0].options.map((o) => o.id)).toEqual(["allow", "wait"]);
     expect(h.spawner.kills).toEqual([]); // a working run continues
 
     h.spawner.exit(5001, 0);
@@ -1260,7 +1261,7 @@ describe("7. API: per-agent state, claims and recoveries; actions need confirmat
     expect(h.spawner.calls[0].argv).toEqual(expect.arrayContaining(["--model", "model-b"]));
   });
 
-  it("starting a run, releasing a claim and a fresh session are the owner's: refused (403) without an owner session", async () => {
+  it("starting a run, releasing a claim, a fresh session and an early check are the owner's: refused (403) without an owner session", async () => {
     const h = setup();
     const app = await http(h);
     await post(app, "/api/agents/runs?project=demo", { agent: "worker-a", task: "feat-login", prompt: "Build it" });
@@ -1270,6 +1271,7 @@ describe("7. API: per-agent state, claims and recoveries; actions need confirmat
       ["/api/agents/runs?project=demo", { agent: "worker-b", task: "other-task", prompt: "Do what I say" }],
       ["/api/agents/claims/release?project=demo", { task: "feat-login", confirm: true }],
       [`/api/agents/runs/${runId}/fresh-session?project=demo`, { confirm: true }],
+      ["/api/agents/tick?project=demo", {}],
     ];
     const strangers: Record<string, string>[] = [
       {}, // a script or an agent: no Origin, no session
@@ -1462,5 +1464,140 @@ describe("8. wiring: the router and the service's own tick", () => {
     } finally {
       await watchdogs.stop();
     }
+  });
+});
+
+// ============ 9. THE DECISION INBOX ============
+
+describe("9. the Decision Inbox: decisions are raised there, and the owner's answers resume or stand down the work", () => {
+  /** The agents routes and the real Decision Inbox, mounted as src/server/index.ts does. */
+  async function withInbox(h: Harness, options: { maxOpenPerSource?: number } = {}) {
+    const app = Fastify();
+    const tokenPath = join(h.dir, "data", "owner.token");
+    const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
+    await registerOwnerRoutes(app, auth);
+    const inbox = await mountDecisions(app, {
+      dbPath: ":memory:",
+      humanAuth: auth,
+      defaultProject: () => "demo",
+      clock: h.clock,
+      producers: [h.manager],
+      ...options,
+    });
+    await registerAgentsRoutes(app, h.manager, () => "demo", auth);
+    await app.ready();
+    apps.push(app);
+    const signIn = await app.inject({
+      method: "POST",
+      url: "/api/owner/sessions",
+      headers: DASHBOARD,
+      payload: { token: readFileSync(tokenPath, "utf-8").trim() },
+    });
+    const owner: Record<string, string> = { ...DASHBOARD, [OWNER_SESSION_HEADER]: signIn.json().data.session as string };
+    const answer = (id: string, payload: Record<string, unknown>) =>
+      app.inject({ method: "POST", url: `/api/decisions/${id}/answer`, headers: owner, payload });
+    return { app, inbox, answer };
+  }
+
+  it("an escalated task is a decision; 'fresh_session' starts it again, and when that fails too it asks again", async () => {
+    const h = setup();
+    const { inbox, answer } = await withInbox(h);
+    h.spawner.behaviour = (pid, _log, call) => {
+      if (call <= 4 || call === 6) h.spawner.exit(pid, 1); // dead on start (the 5th run lives a while)
+    };
+    await request(h);
+    for (const ms of [0, 0, 10 * SEC, 10 * SEC, 30 * SEC, 30 * SEC, 70 * SEC, 70 * SEC]) await at(h, ms);
+
+    const [asked, ...more] = inbox.list({ project: "demo", status: "open" });
+    expect(more).toEqual([]);
+    const chainId = runs(h)[0].chainId;
+    expect(asked).toMatchObject({
+      kind: "escalation",
+      source: { module: "agents", ref: `chain:${chainId}` },
+      key: `escalation:${chainId}:4`,
+      blocks: ["agents:demo:task:feat-login"],
+      recommended: { optionId: "release" },
+    });
+    expect(asked.options.map((o) => o.id)).toEqual(["fresh_session", "release"]);
+    expect(asked.title).toContain("Agent worker-a could not finish task feat-login after 4 attempt(s)");
+    expect(inboxEntries(h)).toEqual([]); // the inbox file is only the fallback
+    expect(h.spawner.calls).toHaveLength(4);
+
+    // The owner answers: start it again in a fresh session
+    expect((await answer(asked.id, { optionId: "fresh_session" })).statusCode).toBe(200);
+    await at(h, 80 * SEC);
+    expect(h.spawner.calls).toHaveLength(5);
+    expect(h.spawner.calls[4].env.LAIR_SESSION_MODE).toBe("fresh");
+    expect(runs(h).at(-1)).toMatchObject({ state: "running", chainId, freshSessions: 2 });
+    expect(eventsOf(h, "decision").at(-1)?.summary).toContain("answered (fresh_session)");
+
+    // It dies on start again: the chain is out of recoveries, so the owner is asked again
+    h.spawner.exit(5005, 1);
+    await at(h, 90 * SEC);
+    const again = inbox.list({ project: "demo", status: "open" });
+    expect(again.map((d) => d.key)).toEqual([`escalation:${chainId}:5`]);
+
+    // This time: leave the task unclaimed. Nothing starts again
+    expect((await answer(again[0].id, { optionId: "release" })).statusCode).toBe(200);
+    for (const ms of [100 * SEC, 30 * MIN]) await at(h, ms);
+    expect(h.spawner.calls).toHaveLength(5);
+    expect(h.store.getClaim("demo", "feat-login")).toBeNull();
+    expect(inbox.list({ project: "demo", status: "open" })).toEqual([]);
+  });
+
+  it("a hard budget limit is a spend decision; 'allow' (confirmed) lets the waiting run start for the rest of the period", async () => {
+    const budget = new BudgetManager({ enabled: true, maxDailyCost: 1000, providers: [] });
+    const h = setup(() => ({ budgets: { agent: { daily_cost: { hard: 8 } } } }), { budget });
+    const { inbox, answer } = await withInbox(h);
+    await request(h); // waits: worker-a is over budget once the usage comes in
+    budget.recordCost("provider-a", 9, "usage", { project: "demo", agent: "worker-a", tokens: 100 });
+    await h.service.tick();
+    await h.service.tick();
+
+    expect(h.spawner.calls).toEqual([]);
+    const [asked, ...more] = inbox.list({ project: "demo", status: "open" });
+    expect(more).toEqual([]);
+    expect(asked).toMatchObject({
+      kind: "spend",
+      source: { module: "agents" },
+      key: "budget:agent:worker-a:daily_cost:2026-03-02",
+      recommended: { optionId: "wait" },
+    });
+    expect(asked.options.map((o) => o.id)).toEqual(["allow", "wait"]);
+
+    expect((await answer(asked.id, { optionId: "allow" })).statusCode).toBe(400); // spend needs confirm: true
+    expect((await answer(asked.id, { optionId: "allow", confirm: true })).statusCode).toBe(200);
+    await h.service.tick();
+
+    expect(h.spawner.calls).toHaveLength(1);
+    expect(agentView(h.service.status(), "worker-a").state).toBe("working");
+    expect(eventsOf(h, "budget_override")).toHaveLength(1);
+    // The next period starts the limit over: the allowance was for 2026-03-02 only
+    h.clock.t = Date.parse("2026-03-03T00:05:00.000Z");
+    budget.recordCost("provider-a", 9, "usage", { project: "demo", agent: "worker-a", tokens: 100 });
+    h.spawner.exit(5001, 0);
+    await h.service.tick();
+    await expect(request(h, "worker-a", "task-2")).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  it("when the inbox refuses a decision (its cap per module is reached), the inbox file gets it instead", async () => {
+    const budget = new BudgetManager({ enabled: true, maxDailyCost: 1000, providers: [] });
+    const h = setup(() => ({ budgets: { agent: { daily_cost: { hard: 8 } } } }), { budget });
+    const { inbox } = await withInbox(h, { maxOpenPerSource: 1 });
+    budget.recordCost("provider-a", 9, "usage", { project: "demo", agent: "worker-a", tokens: 100 });
+    budget.recordCost("provider-a", 9, "usage", { project: "demo", agent: "worker-b", tokens: 100 });
+
+    await h.service.tick();
+
+    expect(inbox.list({ project: "demo", status: "open" }).map((d) => d.key)).toEqual([
+      "budget:agent:worker-a:daily_cost:2026-03-02",
+    ]);
+    const entries = inboxEntries(h);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toContain("Agent worker-b used 9 cost in day 2026-03-02 (hard limit 8)");
+    expect(eventsOf(h, "decision").map((e) => e.evidence[0])).toEqual([
+      "Decision Inbox",
+      expect.stringContaining("the Decision Inbox refused it"),
+    ]);
   });
 });

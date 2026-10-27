@@ -395,14 +395,15 @@ humanAuth.announce(dashboardUrlFor(HOST, PORT));
 await registerOwnerRoutes(fastify, humanAuth);
 
 // Decision Inbox: the one place Lair asks the human (data/decisions.db). The
-// watchdog's escalations become decisions, and their answers resume it.
+// watchdog's and the agents module's escalations (and the agents' spend decisions) become
+// decisions, and their answers resume them.
 // Closed by fastify.close() in shutdown().
 await mountDecisions(fastify, {
   dbPath: join(process.cwd(), "data", "decisions.db"),
   humanAuth,
   defaultProject: () => getDefaultProject(),
   events: getEventBus(),
-  producers: [watchdogs],
+  producers: [watchdogs, agents],
 });
 
 // Reviews and policy merge: one per project with `review.enabled: true`

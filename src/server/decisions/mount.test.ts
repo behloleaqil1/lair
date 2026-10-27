@@ -194,11 +194,13 @@ describe("mountDecisions (the server's wiring)", () => {
     );
     expect(index).toContain("await registerOwnerRoutes(fastify, humanAuth);");
     expect(index).toMatch(
-      /await mountDecisions\(fastify, \{\s*dbPath: join\(process\.cwd\(\), "data", "decisions\.db"\),\s*humanAuth,[\s\S]*?producers: \[watchdogs\],\s*\}\);/,
+      /await mountDecisions\(fastify, \{\s*dbPath: join\(process\.cwd\(\), "data", "decisions\.db"\),\s*humanAuth,[\s\S]*?producers: \[watchdogs, agents\],\s*\}\);/,
     );
     expect(index).toMatch(/await fastify\.register\(\s*cors,\s*corsOptionsWithout\(\[[^\]]*\], OWNER_ONLY_PREFIXES\),\s*\);/);
     // Mounted before the server starts the watchdogs, so no escalation goes elsewhere
     expect(index.indexOf("await mountDecisions(")).toBeLessThan(index.indexOf("watchdogs.start()"));
+    // ... and before it starts agent supervision, which raises decisions too
+    expect(index.indexOf("await mountDecisions(")).toBeLessThan(index.indexOf("agents.start()"));
   });
 
   it("drives raise -> list -> answer -> producer resumed over HTTP", async () => {

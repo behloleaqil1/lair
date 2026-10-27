@@ -34,10 +34,12 @@ import type {
   AgentsStatusView,
   AgentsTickSummary,
   AgentView,
+  BudgetLine,
   BudgetScopeView,
   LockView,
   StopReason,
 } from "../../shared/agents-types.js";
+import type { DecisionProducer, DecisionResolution } from "../decisions/types.js";
 import { buildStartCommand, getAdapter } from "../services/adapters.js";
 import { knownDragonIds, loadKnownDragons } from "../services/dragon-registry.js";
 import { isValidDragonId } from "../parsers/dragon-config.js";
@@ -56,7 +58,13 @@ import {
   periodEnd,
   type FleetBudget,
 } from "./budgets.js";
-import { InboxFileDecisions, type DecisionInbox, type DecisionRequest } from "./decisions.js";
+import {
+  DECISION_MODULE,
+  InboxFileDecisions,
+  ProducerDecisions,
+  type DecisionInbox,
+  type DecisionRequest,
+} from "./decisions.js";
 import { chooseProfile, matchFailover, profileLabel, profilesFor } from "./failover.js";
 import {
   createLock,
@@ -114,6 +122,13 @@ export function isValidTaskId(task: unknown): task is string {
 }
 const MAX_PROMPT_CHARS = 200_000;
 
+/** The options of this module's decisions (see followAnswer) */
+export const DECISION_FRESH = "fresh_session";
+export const DECISION_RELEASE = "release";
+export const DECISION_WAIT = "wait";
+export const DECISION_STOP = "stop";
+export const DECISION_ALLOW = "allow";
+
 /** The events shown as an agent's recoveries. */
 export const RECOVERY_KINDS: readonly AgentEventKind[] = [
   "claim_released",
@@ -129,6 +144,7 @@ export const RECOVERY_KINDS: readonly AgentEventKind[] = [
   "failover",
   "budget_warning",
   "budget_exceeded",
+  "budget_override",
   "decision",
 ];
 
@@ -455,6 +471,86 @@ export class AgentsService {
     return recorded;
   }
 
+  /**
+   * An answer from the Decision Inbox to one of this module's decisions
+   * (AgentsManager.useDecisions delivers them):
+   * - an escalated task: "fresh_session" starts it again in a fresh session
+   *   (if that fails too, Lair asks again), "release" leaves it unclaimed;
+   * - every profile failing: "wait" keeps the run waiting for the cooldown,
+   *   "stop" ends it and frees the task;
+   * - a hard budget limit: "allow" lets runs start past it until the period
+   *   ends, "wait" keeps them waiting.
+   * A resume that can't happen (the task was claimed meanwhile, say) is
+   * recorded, not retried, so the answer still counts as delivered.
+   */
+  followAnswer(resolution: DecisionResolution): Promise<void> {
+    return this.exclusive(async () => {
+      const { decision, optionId } = resolution;
+      const t = await this.newTick(this.probes.clock.now());
+      let outcome: string;
+      try {
+        outcome = await this.applyAnswer(decision.key, decision.source.ref, optionId, t);
+      } catch (e) {
+        outcome = `could not act on it: ${message(e)}`;
+      }
+      await this.record(
+        "decision",
+        {
+          subject: decision.kind,
+          summary: `answered (${optionId}): ${decision.title}; ${outcome}`,
+          evidence: [`by ${resolution.by}`, ...(resolution.note ? [`note: ${oneLine(resolution.note)}`] : [])],
+          data: { decisionId: decision.id, key: decision.key, optionId, outcome, resolution: resolution.outcome },
+        },
+        t.now,
+      );
+    });
+  }
+
+  private async applyAnswer(key: string, ref: string, optionId: string, t: Tick): Promise<string> {
+    if (key.startsWith("budget:")) {
+      const budgetKey = key.slice("budget:".length);
+      if (optionId !== DECISION_ALLOW) return "runs keep waiting until the period ends";
+      await this.record(
+        "budget_override",
+        {
+          subject: budgetKey,
+          summary: `the owner allowed runs past ${budgetKey} until the period ends`,
+          data: { key: budgetKey },
+          dedupeKey: `budget_override:${budgetKey}`,
+        },
+        t.now,
+      );
+      return `runs may start past ${budgetKey} until the period ends`;
+    }
+    const chain = ref.startsWith("chain:") ? this.store.chainRuns(ref.slice("chain:".length)) : [];
+    const latest = chain[chain.length - 1];
+    if (!latest) return "its task is gone";
+    if (key.startsWith("escalation:")) {
+      if (optionId !== DECISION_FRESH) return "the task stays unclaimed";
+      const next = await this.restartFresh(latest, t, "the owner chose a fresh session");
+      return `started again as run ${short(next.id)} in a fresh session`;
+    }
+    if (key.startsWith("exhausted:")) {
+      if (optionId !== DECISION_STOP) return "the run keeps waiting for the cooldown";
+      const waiting = chain.find((r) => r.state === "queued" || r.state === "waiting_lock");
+      if (!waiting) return "nothing was waiting any more";
+      waiting.state = "failed";
+      waiting.endedAt = t.now;
+      waiting.waitingLock = undefined;
+      waiting.detail = "stopped by the owner while every profile was failing";
+      this.store.saveRun(waiting);
+      this.store.releaseClaim(this.project, waiting.task, waiting.id);
+      return `run ${short(waiting.id)} stopped; the task is free`;
+    }
+    return "nothing to do";
+  }
+
+  /** A budget line the owner allowed runs past, for its period. */
+  private overridden(scope: BudgetScopeView, line: BudgetLine): boolean {
+    const scopeKey = scope.scope === "project" ? "project" : `agent:${scope.agent}`;
+    return this.store.hasEvent(this.project, `budget_override:${scopeKey}:${line.metric}:${line.period}`);
+  }
+
   // ============ TICK ============
 
   /** Run one tick. Concurrent calls share the tick in progress. */
@@ -545,8 +641,10 @@ export class AgentsService {
       evaluateBudget(this.store, this.project, agent, agentLimits(this.settings, agent), now),
     ];
     for (const scope of scopes) {
-      const line = scope?.lines.find((l) => l.level === "hard");
-      if (scope && line) return describeUsage(scope, line, "hard");
+      if (!scope) continue;
+      // A limit the owner allowed runs past (a spend decision) doesn't block, for its period
+      const line = scope.lines.find((l) => l.level === "hard" && !this.overridden(scope, l));
+      if (line) return describeUsage(scope, line, "hard");
     }
     return null;
   }
@@ -741,7 +839,7 @@ export class AgentsService {
     };
     if (run.profile.model) own.MODEL = run.profile.model;
     const adapter = getAdapter(run.profile.adapter, this.config);
-    if (adapter?.session_id_env && !adapter.session_id_env.startsWith("LAIR_")) {
+    if (adapter?.session_id_env && !adapter.session_id_env.toUpperCase().startsWith("LAIR_")) {
       own[adapter.session_id_env] = run.sessionId;
     }
     return agentEnvironment(process.env, this.settings.envPassthrough, own);
@@ -1323,7 +1421,10 @@ export class AgentsService {
     await this.raise(
       {
         kind: "escalation",
-        key: `escalation:${run.chainId}`,
+        // Per chain and escalation: a chain the owner resumed can ask again when it fails again
+        key: `escalation:${run.chainId}:${chain.length}`,
+        ref: `chain:${run.chainId}`,
+        blocks: [`agents:${this.project}:task:${run.task}`],
         question: `Agent ${run.agent} could not finish task ${run.task} after ${chain.length} attempt(s): ${oneLine(why, 200)}`,
         context: [
           "Attempts:",
@@ -1331,10 +1432,18 @@ export class AgentsService {
           ...(output.length > 0 ? ["", "Last output:", ...output.map((line) => `- ${oneLine(line)}`)] : []),
         ].join("\n"),
         options: [
-          { id: "fresh_session", label: "Start it again in a fresh session (Agents view)" },
-          { id: "release", label: "Leave the task unclaimed for another agent" },
+          {
+            id: DECISION_FRESH,
+            label: "Start it again in a fresh session",
+            consequences: `Lair starts ${run.task} again for ${run.agent} in a fresh session (the old one moved aside), with a resume summary. If that fails too, Lair asks again.`,
+          },
+          {
+            id: DECISION_RELEASE,
+            label: "Leave the task unclaimed",
+            consequences: `Lair starts nothing more for ${run.task}; the task is free for another run.`,
+          },
         ],
-        recommended: "release",
+        recommended: DECISION_RELEASE,
         why: "Every automatic recovery was used; starting again the same way would repeat the loop.",
         reversible: true,
       },
@@ -1435,13 +1544,23 @@ export class AgentsService {
       {
         kind: "escalation",
         key: `exhausted:${run.chainId}`,
+        ref: `chain:${run.chainId}`,
+        blocks: [`agents:${this.project}:task:${run.task}`],
         question: `Every configured agent profile for ${run.agent} is failing or rate limited; task ${run.task} waits until ${iso(run.notBefore)}`,
         context: ["Profiles:", ...skipped.map((s) => `- ${s}`)].join("\n"),
         options: [
-          { id: "wait", label: "Wait: Lair retries when a provider's cooldown ends" },
-          { id: "add_fallback", label: "Add a fallback profile in agents.fallbacks" },
+          {
+            id: DECISION_WAIT,
+            label: "Wait for the cooldown",
+            consequences: `${run.task} starts again when a provider's cooldown ends (add a fallback in agents.fallbacks to widen the choice).`,
+          },
+          {
+            id: DECISION_STOP,
+            label: "Stop the task",
+            consequences: `Lair stops waiting: the waiting run of ${run.task} ends and the task is free for another run.`,
+          },
         ],
-        recommended: "wait",
+        recommended: DECISION_WAIT,
         why: "Rate limits and provider errors usually clear on their own.",
         reversible: true,
       },
@@ -1551,7 +1670,9 @@ export class AgentsService {
           {
             kind: "spend",
             key: `budget:${key}`,
-            question: `${text.charAt(0).toUpperCase()}${text.slice(1)}. No new runs ${scope.scope === "project" ? "in this project" : `for ${scope.agent}`} until ${until}. Raise the limit?`,
+            ref: `budget:${key}`,
+            blocks: [`agents:${this.project}:budget:${scopeKey}`],
+            question: `${text.charAt(0).toUpperCase()}${text.slice(1)}. No new runs ${scope.scope === "project" ? "in this project" : `for ${scope.agent}`} until ${until}. Allow runs over the limit?`,
             context: [
               `Scope: ${scopeKey}`,
               `Metric: ${line.metric} for ${line.period}`,
@@ -1559,10 +1680,18 @@ export class AgentsService {
               "Runs already working continue; new runs and restarts wait.",
             ].join("\n"),
             options: [
-              { id: "raise", label: "Raise the limit (agents.budgets in the project config)" },
-              { id: "wait", label: `Wait until ${until}` },
+              {
+                id: DECISION_ALLOW,
+                label: `Allow runs over the limit until ${until}`,
+                consequences: `New runs and restarts ${scope.scope === "project" ? "in this project" : `for ${scope.agent}`} start again, past the ${line.metric} hard limit, until ${until}. To change the limit itself, edit agents.budgets.`,
+              },
+              {
+                id: DECISION_WAIT,
+                label: `Wait until ${until}`,
+                consequences: `Nothing new starts ${scope.scope === "project" ? "in this project" : `for ${scope.agent}`} until the period ends.`,
+              },
             ],
-            recommended: "wait",
+            recommended: DECISION_WAIT,
             why: "A hard budget limit is the owner's call to change.",
             reversible: true,
             onTimeout: "wait",
@@ -1777,19 +1906,24 @@ export class AgentsService {
       if (latest && latest.id !== run.id) {
         throw new AgentsError(409, `Run ${short(run.id)} is not the latest of its task; use run ${short(latest.id)}`);
       }
-      if (run.state === "completed") throw new AgentsError(409, `Run ${short(run.id)} completed its task`);
-      const busy = this.store.activeRunForAgent(this.project, run.agent);
-      if (busy) throw new AgentsError(409, `Agent ${run.agent} is busy with task ${busy.task}`);
-      const blocked = this.budgetBlock(run.agent, now);
-      if (blocked) throw new AgentsError(403, `Over budget: ${blocked}`);
-      const next = this.followUp(run, now, now);
-      next.startRetries = 0;
-      const claimed = await this.claimFor(t, run.task, next.id, run.agent);
-      if (!claimed.ok) throw new AgentsError(409, `Task ${run.task} is claimed by run ${short(claimed.holder.runId)}`);
-      await this.switchToFresh(next, run, t, "a fresh session was requested");
-      this.store.insertRun(next);
-      return runView(next);
+      return runView(await this.restartFresh(run, t, "a fresh session was requested"));
     });
+  }
+
+  /** Start an ended run's task again in a fresh session: the next attempt of its chain. */
+  private async restartFresh(run: AgentRun, t: Tick, why: string): Promise<AgentRun> {
+    if (run.state === "completed") throw new AgentsError(409, `Run ${short(run.id)} completed its task`);
+    const busy = this.store.activeRunForAgent(this.project, run.agent);
+    if (busy) throw new AgentsError(409, `Agent ${run.agent} is busy with task ${busy.task}`);
+    const blocked = this.budgetBlock(run.agent, t.now);
+    if (blocked) throw new AgentsError(403, `Over budget: ${blocked}`);
+    const next = this.followUp(run, t.now, t.now);
+    next.startRetries = 0;
+    const claimed = await this.claimFor(t, run.task, next.id, run.agent);
+    if (!claimed.ok) throw new AgentsError(409, `Task ${run.task} is claimed by run ${short(claimed.holder.runId)}`);
+    await this.switchToFresh(next, run, t, why);
+    this.store.insertRun(next);
+    return next;
   }
 
   /** Make `next` a fresh session: move the session aside, a new session id, a resume summary. */
@@ -1843,7 +1977,7 @@ export class AgentsService {
     const alive = (pid: number, started: number): boolean | null => (snap ? snap.isAlive(pid, started) : null);
     const claims = this.store.listClaims(this.project);
     const projectBudget = evaluateBudget(this.store, this.project, null, this.settings.budgets.project, now);
-    const agents = this.agentIds().map((id) => this.agentView(id, claims, projectBudget, now, alive));
+    const agents = this.agentIds().map((id) => this.agentView(id, claims, now, alive));
     return {
       project: this.project,
       enabled: true,
@@ -1863,16 +1997,14 @@ export class AgentsService {
   private agentView(
     id: string,
     claims: Claim[],
-    projectBudget: BudgetScopeView | null,
     now: number,
     alive: (pid: number, started: number) => boolean | null,
   ): AgentView {
     const active = this.store.activeRunForAgent(this.project, id);
     const latest = active ?? this.store.latestRunForAgent(this.project, id);
     const budget = evaluateBudget(this.store, this.project, id, agentLimits(this.settings, id), now);
-    const over = [projectBudget, budget].find((scope) => scope?.blocked);
-    const overLine = over?.lines.find((line) => line.level === "hard");
-    const overBudget = over && overLine ? describeUsage(over, overLine, "hard") : null;
+    // Over budget is what blocks new runs: a hard limit the owner didn't allow runs past
+    const overBudget = this.budgetBlock(id, now);
     const previous = active?.previousRunId ? this.store.getRun(active.previousRunId) : null;
     const { state, detail } = deriveState(active, latest, previous, overBudget);
     return {
@@ -2018,14 +2150,30 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
   private probes: AgentProbes | null = null;
   private decisions: DecisionInbox | null;
   private fallbackInbox: DecisionInbox | null = null;
+  private stopFollowing: (() => void)[] = [];
 
   constructor(private options: AgentsManagerOptions) {
     this.decisions = options.decisions ?? null;
   }
 
-  /** The decisions module registers its Decision Inbox here; until then decisions go to inbox files. */
+  /** Raise decisions through `inbox` instead (a stand-in for the Decision Inbox, in tests). */
   setDecisionInbox(inbox: DecisionInbox): void {
     this.decisions = inbox;
+  }
+
+  /**
+   * Ask through the Decision Inbox (src/server/decisions/; mountDecisions
+   * calls this for its producers) and follow the answers: each service gets
+   * its project's answers (AgentsService.followAnswer), also those given
+   * while the server was down. A decision the inbox refuses goes to the
+   * project's inbox file instead.
+   */
+  useDecisions(decisions: DecisionProducer): void {
+    for (const stop of this.stopFollowing.splice(0)) stop();
+    this.decisions = new ProducerDecisions(decisions, this.fileInbox());
+    for (const [project, service] of this.services) {
+      this.stopFollowing.push(decisions.onResolved(DECISION_MODULE, (r) => service.followAnswer(r), { project }));
+    }
   }
 
   private getProbes(): AgentProbes {
@@ -2033,11 +2181,14 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
     return this.probes;
   }
 
-  private inbox(): DecisionInbox {
-    if (this.decisions) return this.decisions;
+  private fileInbox(): DecisionInbox {
     const probes = this.getProbes();
     this.fallbackInbox ??= new InboxFileDecisions((project) => this.configs.get(project)?.inbox_file, probes.fs, probes.clock);
     return this.fallbackInbox;
+  }
+
+  private inbox(): DecisionInbox {
+    return this.decisions ?? this.fileInbox();
   }
 
   load(projects: ProjectEntry[]): void {
@@ -2078,6 +2229,7 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
 
   /** Stop every service, wait for work in progress, then close the store. */
   async stop(): Promise<void> {
+    for (const stop of this.stopFollowing.splice(0)) stop();
     await Promise.all([...this.services.values()].map((service) => service.stop()));
     for (const service of this.services.values()) service.dispose();
     this.services.clear();
