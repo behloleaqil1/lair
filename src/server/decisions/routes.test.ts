@@ -338,6 +338,8 @@ describe("decision routes", () => {
     expect(summary.data).toEqual({
       open: 2,
       overdue: 1,
+      action: 2,
+      notices: 0,
       secretStore: "server memory only (never written to disk; asked again after a restart)",
     });
     const list = (await app.inject({ url: "/api/decisions" })).json();

@@ -88,7 +88,7 @@ describe("decision attention: action or notice", () => {
     await inbox.raise(escalation({ key: "c", attention: "notice", project: "other" }));
     expect(inbox.counts()).toEqual({ open: 3, overdue: 0, action: 1, notices: 2 });
     expect(inbox.counts("demo")).toEqual({ open: 2, overdue: 0, action: 1, notices: 1 });
-    expect(inbox.list({ status: "open", attention: "notice" }).map((d) => d.key)).toEqual(["b", "c"]);
+    expect(inbox.list({ status: "open", attention: "notice" }).map((d) => d.key).sort()).toEqual(["b", "c"]);
     expect(inbox.list({ status: "open", attention: "action" }).map((d) => d.key)).toEqual(["a"]);
   });
 

@@ -1132,7 +1132,8 @@ describe("5. provider errors and rate limits fail over to the next configured pr
     await at(h, 10 * SEC); // a rate limit again: the cap (1) is reached
     expect(h.spawner.calls.map((c) => c.argv[0])).toEqual(["agent-cli", "agent-cli", "other-cli"]);
     expect(eventsOf(h, "escalated")).toHaveLength(1);
-    expect(inboxEntries(h)[0]).toContain("2 provider errors or rate limits in a row (failover.max_failovers is 1)");
+    expect(inboxEntries(h)[0]).toContain("worker-a is paused on feat-login: it failed");
+    expect(inboxText(h)).toContain("Why it stopped: 2 provider errors or rate limits in a row (failover.max_failovers is 1)");
 
     // provider-a cools down for worker-a only: worker-b still starts on it
     await request(h, "worker-b", "task-b");
