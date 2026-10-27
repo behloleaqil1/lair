@@ -240,6 +240,37 @@ export interface RunRequest {
   task: unknown;
   prompt: unknown;
   model?: unknown;
+  /**
+   * Run variables from the module that requests the run, in-process only (the
+   * HTTP body can't carry them): names from MODULE_RUN_VARIABLES only. They
+   * are kept in memory, never in the store, and reach the run's environment
+   * only; a run whose variables a restart lost ends instead of starting.
+   */
+  variables?: unknown;
+}
+
+/**
+ * Run variables another module may give a run: the review module's, for a
+ * review run (src/server/review/agent-assigner.ts). LAIR_REVIEW_TOKEN is the
+ * review's assignment token, so none of them is ever written to disk.
+ */
+export const MODULE_RUN_VARIABLES: readonly string[] = ["LAIR_REVIEW_TOKEN", "LAIR_REVIEW_PROJECT", "LAIR_URL"];
+const MAX_RUN_VARIABLE_CHARS = 1000;
+
+/** Validated module run variables, or the reason they are refused. */
+function moduleVariables(value: unknown): Record<string, string> | string {
+  if (value === undefined) return {};
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return "variables must be an object";
+  const out: Record<string, string> = {};
+  for (const [name, v] of Object.entries(value)) {
+    if (!MODULE_RUN_VARIABLES.includes(name)) return `${name} is not one of ${MODULE_RUN_VARIABLES.join(", ")}`;
+    // eslint-disable-next-line no-control-regex
+    if (typeof v !== "string" || v.length === 0 || v.length > MAX_RUN_VARIABLE_CHARS || /[\x00-\x1f\x7f]/.test(v)) {
+      return `${name} must be 1-${MAX_RUN_VARIABLE_CHARS} characters, without control characters`;
+    }
+    out[name] = v;
+  }
+  return out;
 }
 
 export interface AgentsServiceOptions {
@@ -288,6 +319,8 @@ export class AgentsService {
   private staleSeen = new Map<string, string>();
   /** agents.fill: starts runs from tasks_file through requestRun (null when off) */
   private fill: AgentsFill | null = null;
+  /** Module run variables per chain (RunRequest.variables): in memory only, dropped once the chain ends */
+  private moduleVars = new Map<string, Record<string, string>>();
   lastTick?: AgentsTickSummary;
   lastError?: string;
 
@@ -621,6 +654,8 @@ export class AgentsService {
       }
       await this.reapClaims(t);
       await this.reapLocks(t);
+      const activeChains = new Set(this.store.activeRuns(this.project).map((run) => run.chainId));
+      for (const chain of this.moduleVars.keys()) if (!activeChains.has(chain)) this.moduleVars.delete(chain);
     }
     this.lastTick = t.summary;
     this.lastError = undefined;
@@ -693,6 +728,12 @@ export class AgentsService {
 
   private async launch(run: AgentRun, t: Tick): Promise<void> {
     if (run.notBefore > t.now) return;
+
+    // Module run variables live only in memory: without them (after a restart) the run ends, and its module asks again
+    const lost = (run.variableNames ?? []).filter((name) => this.moduleVars.get(run.chainId)?.[name] === undefined);
+    if (lost.length > 0) {
+      return this.endRun(run, "failed", `not started: its run variables (${lost.join(", ")}) were lost in a restart`, t, true);
+    }
 
     // No new runs past a hard budget limit (the wait doesn't count as a start attempt)
     const blocked = this.budgetBlock(run.agent, t.now);
@@ -872,6 +913,7 @@ export class AgentsService {
    */
   private env(run: AgentRun): Record<string, string> {
     const own: Record<string, string> = {
+      ...this.moduleVars.get(run.chainId),
       LAIR_RUN_ID: run.id,
       LAIR_TASK: run.task,
       LAIR_AGENT: run.agent,
@@ -1109,6 +1151,7 @@ export class AgentsService {
       agent: prev.agent,
       prompt: prev.prompt,
       requestModel: prev.requestModel,
+      variableNames: prev.variableNames,
       chainId: prev.chainId,
       previousRunId: prev.id,
       attempt: prev.attempt + 1,
@@ -1291,7 +1334,7 @@ export class AgentsService {
 
   private async endRun(
     run: AgentRun,
-    state: "completed" | "lost_claim" | "superseded",
+    state: "completed" | "lost_claim" | "superseded" | "failed",
     detail: string,
     t: Tick,
     releaseClaim: boolean,
@@ -1804,6 +1847,8 @@ export class AgentsService {
     return this.exclusive(async () => {
       if (this.readOnly) throw new AgentsError(403, "The project is read_only: Lair starts no agents");
       const { agent, task, prompt, model } = input;
+      const variables = moduleVariables(input.variables);
+      if (typeof variables === "string") throw new AgentsError(400, `Invalid run variables: ${variables}`);
       if (typeof agent !== "string" || !isValidDragonId(agent) || !knownDragonIds(this.config).has(agent)) {
         throw new AgentsError(400, `Unknown agent: ${String(agent)}`);
       }
@@ -1848,6 +1893,7 @@ export class AgentsService {
         agent,
         prompt,
         requestModel: model,
+        variableNames: Object.keys(variables).length > 0 ? Object.keys(variables) : undefined,
         chainId: id,
         attempt: 1,
         profileIndex: 0,
@@ -1876,6 +1922,7 @@ export class AgentsService {
         );
       }
       this.store.insertRun(run);
+      if (run.variableNames) this.moduleVars.set(id, variables);
       if (claimed.replaced) await this.claimReleased(claimed.replaced, t, "a new run claimed the task");
       await this.record(
         "requested",

@@ -70,6 +70,8 @@ export interface AgentRun {
   prompt: string;
   /** The model the request asked for (overrides the agent's own) */
   requestModel?: string;
+  /** The module run variables the chain was requested with, by name (their values are only in memory) */
+  variableNames?: string[];
   chainId: string;
   previousRunId?: string;
   attempt: number;
