@@ -11,7 +11,8 @@
  * - done when done_pattern matches a queue line written since the task's
  *   last chain was requested (the whole file for a task with no run, when
  *   the pattern names the task; one that names only the agent counts only
- *   that agent's own lines, and only since a start). Once
+ *   that agent's own lines, only since a start, and only when its last DONE,
+ *   WAITING or BLOCKED line is the DONE one). Once
  *   seen, done is kept in the store (a fill_done event for the task's latest
  *   run and the line as written), so a rotated or truncated queue file never
  *   restarts a finished task. An edited line drops that record, but the queue
@@ -27,10 +28,15 @@
  *     latest of its WAITING and BLOCKED lines): held at once, with one
  *     decision carrying the line (as data, never in a prompt);
  *   - waiting: its last run exited 0 on a WAITING line. With a (?<wake>...)
- *     capture and fill.wake.file it starts again once that file exists (a
- *     gate's result, say: a plain name, inside wake.root); otherwise after
- *     wake.fallback_seconds. No backoff, and it isn't counted as a run
- *     without progress. Waiting past wake.max_wait_minutes raises one decision;
+ *     capture and fill.wake.file (a plain name, inside wake.root) it starts
+ *     again once that file appears (a gate's result, say), with no backoff
+ *     and nothing counted. A wait on nothing that came (no capture, a refused
+ *     one, or a file already there when the run ended) counts as a run
+ *     without progress: it starts again after wake.fallback_seconds and the
+ *     backoff, and toward the no_done hold;
+ *   - waited_too_long: its runs have been waiting, in a row, longer than
+ *     wake.max_wait_minutes (counted from the store, across restarts):
+ *     held, with one decision;
  *   - no_done / backoff: its runs exited 0 without reporting it done. It is
  *     started again after a backoff (fill.backoff_seconds, doubling), and
  *     after fill.max_completions_without_done of them in a row it is held and
@@ -90,7 +96,7 @@ const MARK_TAIL_BYTES = 256;
 export const DECISION_FILL_START = "start_again";
 export const DECISION_FILL_KEEP = "keep_held";
 /** Holds the owner lifts (POST /api/agents/fill/release, or the decision); a waiting one also ends by itself */
-export const OWNER_HOLDS: readonly FillHold[] = ["owner", "no_done", "blocked", "waiting"];
+export const OWNER_HOLDS: readonly FillHold[] = ["owner", "no_done", "blocked", "waiting", "waited_too_long"];
 
 const short = (id: string) => id.slice(0, 8);
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -198,6 +204,15 @@ interface RunStatus {
   wake: string | null;
 }
 
+/** What a waiting run waits on (see AgentsFill.classifyWait); `named` is a wake that resolved to a file, else null. */
+type WaitState =
+  | { kind: "pending"; named: string | null; view: FillWaitingView; detail: string }
+  | { kind: "woken"; named: string | null; file: string }
+  | { kind: "weak"; named: string | null; view: FillWaitingView; detail: string; fallbackAt: number | null };
+
+/** How many of a task's newest chains the no-done count and the wait streak look at */
+const MAX_CHAINS_LOOKED_AT = 50;
+
 /** The queue file's lines at one check (its last 4 MB), trimmed, each with the offset it starts at. */
 class QueueLines {
   private lines: { start: number; text: string }[] = [];
@@ -256,23 +271,45 @@ class QueueLines {
   }
 
   /**
-   * The last line written after `mark` that reports the task waiting or
-   * blocked (taskLineMatch): the latest such line wins. A waiting line's
-   * (?<wake>...) is what it waits on.
+   * The last line written after `mark` that one of the patterns matches
+   * (taskLineMatch; a line takes the first pattern that matches it): the
+   * latest such line wins.
    */
-  lastStatus(waiting: FillPattern, blocked: FillPattern, mark: QueueMark | undefined): RunStatus | null {
-    const fromWaiting = this.from(waiting, mark);
-    const fromBlocked = this.from(blocked, mark);
-    let last: RunStatus | null = null;
+  lastOf<K extends string>(
+    patterns: { kind: K; pattern: FillPattern }[],
+    mark: QueueMark | undefined,
+  ): { kind: K; line: string; match: RegExpExecArray } | null {
+    const from = patterns.map(({ pattern }) => this.from(pattern, mark));
+    let last: { kind: K; line: string; match: RegExpExecArray } | null = null;
     for (const line of this.lines) {
-      const wait = fromWaiting !== null && line.start >= fromWaiting ? taskLineMatch(waiting, line.text) : null;
-      if (wait) {
-        last = { kind: "waiting", line: line.text, wake: wait.groups?.wake?.trim() || null };
-      } else if (fromBlocked !== null && line.start >= fromBlocked && taskLineMatch(blocked, line.text)) {
-        last = { kind: "blocked", line: line.text, wake: null };
+      for (let i = 0; i < patterns.length; i++) {
+        const start = from[i];
+        if (start === null || line.start < start) continue;
+        const match = taskLineMatch(patterns[i].pattern, line.text);
+        if (match) {
+          last = { kind: patterns[i].kind, line: line.text, match };
+          break;
+        }
       }
     }
     return last;
+  }
+
+  /**
+   * The last line written after `mark` that reports the task waiting or
+   * blocked: the latest such line wins. A waiting line's (?<wake>...) is
+   * what it waits on.
+   */
+  lastStatus(waiting: FillPattern, blocked: FillPattern, mark: QueueMark | undefined): RunStatus | null {
+    const last = this.lastOf<"waiting" | "blocked">(
+      [
+        { kind: "waiting", pattern: waiting },
+        { kind: "blocked", pattern: blocked },
+      ],
+      mark,
+    );
+    if (!last) return null;
+    return { kind: last.kind, line: last.line, wake: last.kind === "waiting" ? last.match.groups?.wake?.trim() || null : null };
   }
 
   /** A mark still describes this file: it isn't past its end and the bytes before it are unchanged. */
@@ -571,22 +608,27 @@ export class AgentsFill {
   }
 
   /**
-   * The task's chains in a row, newest first, whose last run completed (exit
-   * 0) without reporting it done: since the owner last released it, since a
-   * run that ended waiting or blocked (that one made progress: it isn't
-   * counted), and up to and including a chain the owner started (a new start
-   * counts afresh).
+   * The task's runs in a row, newest first, that completed (exit 0) without
+   * progress: no done line, or a WAITING line on nothing that came (no wake,
+   * a refused one, or a result already there when the run ended). A run
+   * whose wake really came (fill_woken) neither counts nor ends the row; a
+   * blocked one ends it (only the owner's release starts it again). The row
+   * starts after the owner's last release, and a chain the owner started is
+   * its first (a new start counts afresh).
    */
   private completionsWithoutDone(task: string, releasedChain: string | null): AgentRun[] {
     const { store, project, settings } = this.options;
     const counted: AgentRun[] = [];
-    for (const head of store.chainHeadsForTask(project, task, settings.maxCompletionsWithoutDone + 1)) {
+    for (const head of store.chainHeadsForTask(project, task, MAX_CHAINS_LOOKED_AT)) {
       if (head.chainId === releasedChain) break;
       const last = store.chainRuns(head.chainId).at(-1);
       if (!last || last.state !== "completed") break;
-      if (store.listEvents(project, { kinds: ["fill_waiting", "fill_blocked"], task, runId: last.id, limit: 1 }).length > 0) break;
-      counted.push(last);
-      if (head.origin !== "fill") break;
+      const kinds = new Set(
+        store.listEvents(project, { kinds: ["fill_blocked", "fill_woken"], task, runId: last.id, limit: 10 }).map((e) => e.kind),
+      );
+      if (kinds.has("fill_blocked")) break;
+      if (!kinds.has("fill_woken")) counted.push(last);
+      if (head.origin !== "fill" || counted.length >= settings.maxCompletionsWithoutDone) break;
     }
     return counted;
   }
@@ -689,7 +731,23 @@ export class AgentsFill {
       }
       let done: string | null;
       try {
-        done = queue.find(fillPatternFor(settings.donePattern, task, agent), latest?.queueMark);
+        const donePattern = fillPatternFor(settings.donePattern, task, agent);
+        if (donePattern.task !== null) {
+          // A line that names the task: done is done, whatever came after it
+          done = queue.find(donePattern, latest?.queueMark);
+        } else {
+          // A line by the agent only says where it is now: its last DONE, WAITING or BLOCKED line decides
+          // ("- DONE row 1 by kiro-A", then "- WAITING <gate> by kiro-A" is waiting, not done)
+          const last = queue.lastOf<"done" | "waiting" | "blocked">(
+            [
+              { kind: "done", pattern: donePattern },
+              { kind: "waiting", pattern: fillPatternFor(settings.waitingPattern, task, agent) },
+              { kind: "blocked", pattern: fillPatternFor(settings.blockedPattern, task, agent) },
+            ],
+            latest?.queueMark,
+          );
+          done = last?.kind === "done" ? last.line : null;
+        }
       } catch (e) {
         await hold("refused", `done_pattern: ${message(e)}`);
         continue;
@@ -750,51 +808,99 @@ export class AgentsFill {
         });
         continue;
       }
+      // N runs in a row without progress: held, and one decision with them and the last output
+      const holdNoDone = async (run: AgentRun, completions: AgentRun[]) => {
+        const count = completions.length;
+        await hold(
+          "no_done",
+          `its last ${count} run(s) exited 0 without progress (no done line, or waiting on nothing that came; agents.fill.max_completions_without_done is ${settings.maxCompletionsWithoutDone}): fill leaves the task to you`,
+          run.id,
+        );
+        await this.raiseHold(run, agent, task, {
+          question: `Fill holds task ${task}: ${agent}'s last ${count} run(s) exited 0 without reporting it done`,
+          context: [
+            "Runs:",
+            ...completions.map(
+              (r) => `- Run ${short(r.id)} (${r.origin === "fill" ? "fill" : "requested"}): ended ${iso(r.endedAt ?? r.requestedAt)}: ${oneLine(r.detail)}`,
+            ),
+          ],
+        });
+      };
       if (latest && status?.kind === "waiting") {
-        const waiting = this.waitFor(latest, task, status, now);
-        if (waiting) {
-          let detail = waiting.detail;
-          const waitedMs = now - (latest.endedAt ?? latest.requestedAt);
-          if (waitedMs >= settings.wake.maxWaitMinutes * 60000) {
-            detail = `${detail}; waiting over ${settings.wake.maxWaitMinutes} min: asked you`;
-            const on = waiting.view.wake ?? "its WAITING line";
-            await this.raiseHold(latest, agent, task, {
-              kind: "waiting",
-              question: `Fill: ${agent} is waiting too long on ${oneLine(on, 100)} (task ${task}, since ${waiting.view.since})`,
-              context: [
-                `Run ${short(latest.id)} ended ${waiting.view.since} on this line:`,
-                "",
-                ...asData(status.line),
-                "",
-                waiting.file ? `Fill starts it again once ${waiting.file} exists.` : `Fill starts it again at ${waiting.view.fallbackAt}.`,
-              ],
-              startLabel: "Start it again now",
-              startConsequences: `Fill starts ${task} for ${agent} again on its next check, without waiting any longer.`,
-              keepLabel: "Keep waiting",
-              keepConsequences: `Fill keeps waiting, and starts ${task} once what it waits on is there.`,
-              why: "A gate or a review usually finishes on its own; a wait this long may mean it never will.",
-              withOutput: false,
-            });
-          }
-          await hold("waiting", detail, latest.id, waiting.view);
+        const since = latest.endedAt ?? latest.requestedAt;
+        const wait = this.classifyWait(latest, task, status, now);
+        // Waiting on nothing that came is a run without progress: N of them hold the task (and that hold stays)
+        const completions = wait.kind === "weak" ? this.completionsWithoutDone(task, releasedChain) : [];
+        if (completions.length >= settings.maxCompletionsWithoutDone) {
+          await holdNoDone(latest, completions);
           continue;
         }
-        // What it waited on is there (or the fallback is up): it starts again now, without a backoff
+        // A wait budget across restarts: from the first run of this streak of waiting runs
+        const streakStart = this.waitStreakStart(task, releasedChain) ?? since;
+        if (now - streakStart >= settings.wake.maxWaitMinutes * 60000) {
+          const on = wait.named ?? "its WAITING line";
+          const view = wait.kind === "woken" ? null : wait.view;
+          const what = wait.kind === "woken" ? `waiting: ${on} since ${iso(since)}` : wait.detail;
+          await hold(
+            "waited_too_long",
+            `${what}; its runs have been waiting since ${iso(streakStart)}, over agents.fill.wake.max_wait_minutes (${settings.wake.maxWaitMinutes}): fill leaves the task to you`,
+            latest.id,
+            view,
+          );
+          await this.raiseHold(latest, agent, task, {
+            kind: "waiting",
+            question: `Fill: ${agent} is waiting too long on ${on} (task ${task}, since ${iso(streakStart)})`,
+            context: [
+              `Run ${short(latest.id)} ended ${iso(since)} on this line:`,
+              "",
+              ...asData(status.line),
+              "",
+              `Its runs have been waiting since ${iso(streakStart)}; fill holds the task until you answer.`,
+            ],
+            startLabel: "Start it again now",
+            startConsequences: `Fill starts ${task} for ${agent} again on its next check, and the wait counts from zero.`,
+            why: "A gate or a review usually finishes on its own; a wait this long may mean it never will.",
+            withOutput: false,
+          });
+          continue;
+        }
+        if (wait.kind === "woken") {
+          // What it waited on came after the run ended: it starts again now, with no backoff and nothing counted
+          await this.options.record(
+            "fill_woken",
+            {
+              agent,
+              task,
+              runId: latest.id,
+              summary: `fill: ${wait.file} is there: ${agent} starts on ${task} again`,
+              evidence: [wait.file],
+              data: { file: wait.file },
+              dedupeKey: `fill_woken:${task}:${latest.id}`,
+            },
+            probes.clock.now(),
+          );
+        } else if (wait.kind === "pending") {
+          await hold("waiting", wait.detail, latest.id, wait.view);
+          continue;
+        } else {
+          // Waiting on nothing that came: a run without progress, counted and backed off
+          const count = completions.length;
+          const at = Math.max(wait.fallbackAt ?? 0, since + backoffMs(Math.max(count, 1), settings.backoffSeconds, settings.maxBackoffSeconds));
+          if (now < at) {
+            await hold(
+              "waiting",
+              `${wait.detail}; counted as a run without progress (${count} of ${settings.maxCompletionsWithoutDone}): starting it again at ${iso(at)}`,
+              latest.id,
+              { ...wait.view, fallbackAt: iso(at) },
+            );
+            continue;
+          }
+        }
       } else if (latest && latest.state === "completed") {
         const completions = this.completionsWithoutDone(task, releasedChain);
         const count = completions.length;
         if (count >= settings.maxCompletionsWithoutDone) {
-          const reason = `its last ${count} run(s) exited 0 without reporting it done (agents.fill.max_completions_without_done is ${settings.maxCompletionsWithoutDone}): fill leaves the task to you`;
-          await hold("no_done", reason, latest.id);
-          await this.raiseHold(latest, agent, task, {
-            question: `Fill holds task ${task}: ${agent}'s last ${count} run(s) exited 0 without reporting it done`,
-            context: [
-              "Runs:",
-              ...completions.map(
-                (run) => `- Run ${short(run.id)} (${run.origin === "fill" ? "fill" : "requested"}): ended ${iso(run.endedAt ?? run.requestedAt)}: ${oneLine(run.detail)}`,
-              ),
-            ],
-          });
+          await holdNoDone(latest, completions);
           continue;
         }
         if (count >= 1) {
@@ -965,44 +1071,85 @@ export class AgentsFill {
   }
 
   /**
-   * A waiting run: null when it may start again (the wake file exists, or the
-   * fallback is up), else what it waits for. A wake that isn't a plain name,
-   * or whose file would be outside wake.root, is refused (and shown): the run
-   * waits fallback_seconds instead.
+   * What a waiting run waits on:
+   * - pending: a wake file that isn't there yet (a real wait: nothing counted);
+   * - woken: that file appeared after the run ended (it starts again at once,
+   *   and the run counts neither for nor against the no-done count);
+   * - weak: nothing to wait on (no capture, no wake.file, a refused capture,
+   *   or a result file that was already there when the run ended, so naming it
+   *   was no wait at all): it counts as a run without progress, and starts
+   *   again after fallback_seconds (when nothing was named) and the backoff.
+   * A capture that isn't a plain name, or whose file would be outside
+   * wake.root, is refused, and shown.
    */
-  private waitFor(
-    latest: AgentRun,
-    task: string,
-    status: RunStatus,
-    now: number,
-  ): { detail: string; view: FillWaitingView; file: string | null } | null {
-    const wake = this.options.settings.wake;
+  private classifyWait(latest: AgentRun, task: string, status: RunStatus, now: number): WaitState {
+    const { settings, store, project } = this.options;
     const since = latest.endedAt ?? latest.requestedAt;
     let file: string | null = null;
     let refused: string | null = null;
-    if (status.wake !== null && wake.file) {
+    if (status.wake !== null && settings.wake.file) {
       const resolved = this.wakePath(status.wake);
       if (resolved.ok) file = resolved.path;
       else refused = resolved.reason;
     }
-    const pollKey = `${task}|${latest.id}`;
-    this.waitingSeen.add(pollKey);
-    if (file !== null && this.wakeExists(pollKey, file, now)) return null;
-    const fallbackAt = file === null ? since + wake.fallbackSeconds * 1000 : null;
-    if (fallbackAt !== null && now >= fallbackAt) return null;
     const shown = status.wake === null ? null : oneLine(status.wake, 100);
-    const view: FillWaitingView = {
+    // Only a wake that resolved to a file names anything a decision may repeat
+    const named = file !== null ? shown : null;
+    const view = (fallbackAt: number | null): FillWaitingView => ({
       wake: shown,
       since: iso(since),
       fallbackAt: fallbackAt === null ? null : iso(fallbackAt),
       refused,
+    });
+    if (file !== null) {
+      if (store.listEvents(project, { kinds: ["fill_woken"], task, runId: latest.id, limit: 1 }).length > 0) {
+        return { kind: "woken", file, named };
+      }
+      const pollKey = `${task}|${latest.id}`;
+      this.waitingSeen.add(pollKey);
+      const mtime = this.wakeFile(pollKey, file, now);
+      if (mtime !== null && mtime > since) return { kind: "woken", file, named };
+      if (mtime !== null) {
+        return {
+          kind: "weak",
+          named,
+          fallbackAt: null,
+          view: view(null),
+          detail: `waiting: ${shown} since ${iso(since)}; its result ${file} was there before the run ended, so that was no wait`,
+        };
+      }
+      return { kind: "pending", named, view: view(null), detail: `waiting: ${shown} since ${iso(since)}; starts again once ${file} exists` };
+    }
+    const fallbackAt = since + settings.wake.fallbackSeconds * 1000;
+    return {
+      kind: "weak",
+      named,
+      fallbackAt,
+      view: view(fallbackAt),
+      detail: [`waiting: ${shown ?? "(nothing named)"} since ${iso(since)}`, ...(refused !== null ? [`wake "${shown}" refused: ${refused}`] : [])].join(
+        "; ",
+      ),
     };
-    const detail = [
-      `waiting: ${shown ?? "(nothing named)"} since ${view.since}`,
-      file !== null ? `starts again once ${file} exists` : `starting it again at ${view.fallbackAt}`,
-      ...(refused !== null ? [`wake "${shown}" refused: ${refused}`] : []),
-    ].join("; ");
-    return { detail, view, file };
+  }
+
+  /**
+   * When the task's current streak of waiting runs began: the end of the
+   * first of the runs in a row, newest first, that ended waiting (since the
+   * owner last released it, and up to a chain the owner started), from the
+   * store, so it holds across restarts of Lair and of the task.
+   */
+  private waitStreakStart(task: string, releasedChain: string | null): number | null {
+    const { store, project } = this.options;
+    let start: number | null = null;
+    for (const head of store.chainHeadsForTask(project, task, MAX_CHAINS_LOOKED_AT)) {
+      if (head.chainId === releasedChain) break;
+      const last = store.chainRuns(head.chainId).at(-1);
+      if (!last || last.state !== "completed") break;
+      if (store.listEvents(project, { kinds: ["fill_waiting"], task, runId: last.id, limit: 1 }).length === 0) break;
+      start = last.endedAt ?? last.requestedAt;
+      if (head.origin !== "fill") break;
+    }
+    return start;
   }
 
   /** The wake file for a waiting line's capture: a plain name, inside wake.root. */
@@ -1020,20 +1167,19 @@ export class AgentsFill {
     return { ok: true, path };
   }
 
-  /** The wake file exists; looked for at most every wake.poll_seconds per waiting run. */
-  private wakeExists(key: string, path: string, now: number): boolean {
+  /** The wake file's mtime when it exists, else null; looked for at most every wake.poll_seconds per waiting run. */
+  private wakeFile(key: string, path: string, now: number): number | null {
     const last = this.polled.get(key);
-    if (last !== undefined && now - last < this.options.settings.wake.pollSeconds * 1000) return false;
-    let exists = false;
+    if (last !== undefined && now - last < this.options.settings.wake.pollSeconds * 1000) return null;
+    let mtime: number | null = null;
     try {
-      lstatSync(path);
-      exists = true;
+      mtime = lstatSync(path).mtimeMs;
     } catch {
-      exists = false;
+      mtime = null;
     }
-    if (exists) this.polled.delete(key);
+    if (mtime !== null) this.polled.delete(key);
     else this.polled.set(key, now);
-    return exists;
+    return mtime;
   }
 
   /** null when capacity_cmd exits 0; otherwise why fill holds (a timeout holds too). */

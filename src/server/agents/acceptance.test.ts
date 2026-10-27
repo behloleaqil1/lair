@@ -2512,6 +2512,15 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     fill({ agents: ["worker-a"], waiting_pattern: WAITS_ON_GATE, wake: { file: "{gates_dir}/results/{wake}.rc", ...wake } });
   const FILL_PROMPT = `${ADDENDUM}\n\nYou are worker A: build what the task says.\n`;
 
+  /** A gate's result file, written as of NOW + ms (its mtime is what tells a real wake from a stale one) */
+  function resultAt(h: Paths, gate: string, ms: number): string {
+    const file = join(h.gatesDir, "results", `${gate}.rc`);
+    writeFileSync(file, "0\n");
+    const t = new Date(NOW + ms);
+    utimesSync(file, t, t);
+    return file;
+  }
+
   /** Fill starts feat-login at NOW (pid 5001), which writes `queueLine` and exits 0; the tick at +1 min sees it end. */
   async function runEndingWith(h: Harness, queueLine: string): Promise<AgentRun> {
     await check(h);
@@ -2546,21 +2555,23 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     }
     expect(runs(h)).toHaveLength(1);
 
-    // The gate's result arrives: the task starts again, once
-    writeFileSync(resultFile, "0\n");
+    // The gate's result arrives after the run ended: a real wake, so the task starts again, once
+    resultAt(h, GATE, 61 * MIN + 30 * SEC);
     h.clock.t = NOW + 62 * MIN;
     expect(lineOf(await check(h), "feat-login").state).toBe("started");
+    expect(eventsOf(h, "fill_woken")).toHaveLength(1);
     await at(h, 62 * MIN); // pid 5002
     h.spawner.exit(5002, 0); // it ends without a WAITING line of its own
     await at(h, 63 * MIN);
     line = lineOf(await check(h), "feat-login");
+    // The real wait isn't counted: this is the first run without progress
     expect(line).toMatchObject({ state: "held", hold: "backoff" });
     expect(line.detail).toContain("(1 of 3)");
     expect(runs(h)).toHaveLength(2);
     expect(h.spawner.calls).toHaveLength(2);
   });
 
-  it("a WAITING run that names nothing starts again after wake.fallback_seconds", async () => {
+  it("a WAITING run that names nothing is a run without progress: it starts again after wake.fallback_seconds", async () => {
     const h = setup(fill({ agents: ["worker-a"], wake: { fallback_seconds: 900 } }));
     prompts(h);
     tasks(h, "worker-a|Alice|feat-login|Login form");
@@ -2572,7 +2583,9 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
       hold: "waiting",
       waiting: { wake: null, since: "2026-03-02T12:01:00.000Z", fallbackAt: "2026-03-02T12:16:00.000Z" },
     });
-    expect(line.detail).toBe("waiting: (nothing named) since 2026-03-02T12:01:00.000Z; starting it again at 2026-03-02T12:16:00.000Z");
+    expect(line.detail).toBe(
+      "waiting: (nothing named) since 2026-03-02T12:01:00.000Z; counted as a run without progress (1 of 3): starting it again at 2026-03-02T12:16:00.000Z",
+    );
     h.clock.t = NOW + 15 * MIN;
     expect(lineOf(await check(h), "feat-login").hold).toBe("waiting");
     h.clock.t = NOW + 16 * MIN;
@@ -2580,66 +2593,182 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(runs(h)).toHaveLength(2);
   });
 
-  it("runs that end waiting never count toward the no-done hold", async () => {
-    const h = setup(fill({ agents: ["worker-a"], max_completions_without_done: 2, wake: { fallback_seconds: 60 } }));
-    prompts(h);
-    tasks(h, "worker-a|Alice|feat-login|Login form");
-    // Every run waits on something and exits 0
-    h.spawner.behaviour = (pid) => {
-      appendFileSync(h.queueFile, "- WAITING feat-login by worker-a: gate queued\n");
+  /** Each run fill starts writes lines[call] (1-based; none: nothing), then exits 0. */
+  const endsWith = (h: Harness, lines: Record<number, string>) => {
+    h.spawner.behaviour = (pid, _log, call) => {
+      if (lines[call]) appendFileSync(h.queueFile, `${lines[call]}\n`);
       h.spawner.exit(pid, 0);
     };
+  };
 
-    for (let i = 0; i < 5; i++) {
-      h.clock.t = NOW + i * 2 * MIN;
-      expect(lineOf(await check(h), "feat-login").state).toBe("started");
-      await at(h, i * 2 * MIN);
-      await at(h, i * 2 * MIN + MIN);
-      expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "held", hold: "waiting" });
-    }
-
-    expect(runs(h).map((r) => r.state)).toEqual(["completed", "completed", "completed", "completed", "completed"]);
-    expect(eventsOf(h, "fill_held").map((e) => e.data.hold)).not.toContain("no_done");
-    expect(eventsOf(h, "fill_held").map((e) => e.data.hold)).not.toContain("backoff");
-    expect(inboxEntries(h)).toEqual([]);
-    // The first run after them that ends without one is the first without progress
-    h.spawner.behaviour = (pid) => h.spawner.exit(pid, 0);
-    h.clock.t = NOW + 10 * MIN;
+  /** Start feat-login at NOW + `startMin` (the check requests it, the tick spawns it), and let it end a minute later. */
+  async function runAt(h: Harness, startMin: number): Promise<void> {
+    h.clock.t = NOW + startMin * MIN;
     expect(lineOf(await check(h), "feat-login").state).toBe("started");
-    await at(h, 10 * MIN);
-    await at(h, 11 * MIN);
+    await at(h, startMin * MIN);
+    await at(h, (startMin + 1) * MIN);
+  }
+
+  it("a WAITING run that never names a gate is counted and backed off, then held after N with one decision", async () => {
+    const h = setup(fill({ agents: ["worker-a"], max_completions_without_done: 3, backoff_seconds: 60, wake: { fallback_seconds: 60 } }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    const waiting = "- WAITING feat-login by worker-a: waiting on a review";
+    endsWith(h, { 1: waiting, 2: waiting, 3: waiting, 4: waiting });
+
+    await runAt(h, 0); // ends at +1 min
+    expect(lineOf(await check(h), "feat-login").detail).toContain("(1 of 3): starting it again at 2026-03-02T12:02:00.000Z");
+    await runAt(h, 2); // ends at +3 min: the backoff doubles past the fallback
+    expect(lineOf(await check(h), "feat-login").detail).toContain("(2 of 3): starting it again at 2026-03-02T12:05:00.000Z");
+    await runAt(h, 5); // the third in a row
+
     const line = lineOf(await check(h), "feat-login");
-    expect(line).toMatchObject({ state: "held", hold: "backoff" });
-    expect(line.detail).toContain("(1 of 2)");
+    expect(line).toMatchObject({ state: "held", hold: "no_done", releasable: true });
+    for (const minute of [60, 600]) {
+      h.clock.t = NOW + minute * MIN;
+      await check(h);
+      await h.service.tick();
+    }
+    expect(runs(h)).toHaveLength(3);
+    const entries = inboxEntries(h);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toContain("Fill holds task feat-login: worker-a's last 3 run(s) exited 0 without reporting it done");
   });
 
-  it("waiting past wake.max_wait_minutes raises one decision; starting it again from there works", async () => {
+  it("a stale wake (its result was there before the run ended) is counted and backed off, then held", async () => {
+    const h = setup(gateFill({ max_wait_minutes: 600 }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    // Every run names a gate whose result is already there
+    resultAt(h, GATE, -10 * MIN);
+    const waiting = `- WAITING feat-login ${GATE} by worker-a: gate queued`;
+    endsWith(h, { 1: waiting, 2: waiting, 3: waiting, 4: waiting });
+
+    await runAt(h, 0);
+    let line = lineOf(await check(h), "feat-login");
+    expect(line).toMatchObject({ state: "held", hold: "waiting" });
+    expect(line.detail).toContain(`its result ${join(h.gatesDir, "results", `${GATE}.rc`)} was there before the run ended`);
+    expect(line.detail).toContain("(1 of 3): starting it again at 2026-03-02T12:02:00.000Z");
+    await runAt(h, 2);
+    expect(lineOf(await check(h), "feat-login").detail).toContain("(2 of 3): starting it again at 2026-03-02T12:05:00.000Z");
+    await runAt(h, 5);
+    line = lineOf(await check(h), "feat-login");
+    expect(line).toMatchObject({ state: "held", hold: "no_done" });
+    expect(runs(h)).toHaveLength(3);
+    expect(eventsOf(h, "fill_woken")).toEqual([]);
+  });
+
+  it("alternating runs without a line and WAITING runs on nothing are all counted: held after N", async () => {
+    const h = setup(fill({ agents: ["worker-a"], max_completions_without_done: 3, backoff_seconds: 60, wake: { fallback_seconds: 60 } }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    const waiting = "- WAITING feat-login by worker-a: waiting on a review";
+    endsWith(h, { 1: waiting, 3: waiting }); // run 2 writes nothing
+
+    await runAt(h, 0); // waiting on nothing: 1
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ hold: "waiting" });
+    await runAt(h, 2); // no line: 2
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ hold: "backoff" });
+    await runAt(h, 5); // waiting on nothing: 3
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "held", hold: "no_done" });
+    expect(runs(h)).toHaveLength(3);
+  });
+
+  it("a real wake neither counts nor resets the count: runs without progress around real waits are held after N", async () => {
+    const h = setup(gateFill()); // max_completions_without_done 3, backoff_seconds 60: the defaults
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    const gate2 = "20260302T120300Z-feat-login-abcdef12-2";
+    const gate4 = "20260302T121400Z-feat-login-abcdef12-4";
+    endsWith(h, { 2: `- WAITING feat-login ${gate2} by worker-a: gate queued`, 4: `- WAITING feat-login ${gate4} by worker-a: gate queued` });
+
+    await runAt(h, 0); // no line: 1
+    await runAt(h, 2); // waits on gate2
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ hold: "waiting", waiting: { wake: gate2 } });
+    resultAt(h, gate2, 9 * MIN);
+    await runAt(h, 10); // woken at once (no backoff), and ends without a line: 2
+    expect(lineOf(await check(h), "feat-login").detail).toContain("(2 of 3)");
+    await runAt(h, 13); // waits on gate4
+    resultAt(h, gate4, 19 * MIN);
+    await runAt(h, 20); // woken, ends without a line: 3
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "held", hold: "no_done" });
+    expect(runs(h)).toHaveLength(5);
+    expect(eventsOf(h, "fill_woken")).toHaveLength(2);
+  });
+
+  it("the wait budget is cumulative across restarts: the streak's first wait counts, and the hold stays until the owner answers", async () => {
     const h = setup(gateFill({ max_wait_minutes: 60 }));
     const { inbox, answer } = await withInbox(h);
     prompts(h);
     tasks(h, "worker-a|Alice|feat-login|Login form");
-    const run = await runEndingWith(h, `- WAITING feat-login ${GATE} by worker-a 12:01Z: gate queued`);
+    const gate1 = "20260302T120000Z-feat-login-abcdef12-1";
+    const gate2 = "20260302T123000Z-feat-login-abcdef12-2";
+    endsWith(h, { 1: `- WAITING feat-login ${gate1} by worker-a: gate queued`, 2: `- WAITING feat-login ${gate2} by worker-a: gate queued` });
 
-    h.clock.t = NOW + 60 * MIN; // 59 min of waiting
+    await runAt(h, 0); // waits on gate1 from +1 min
+    resultAt(h, gate1, 29 * MIN);
+    await runAt(h, 30); // woken; waits on gate2 from +31 min
+    h.clock.t = NOW + 60 * MIN; // 59 min since the streak's first wait
     expect(lineOf(await check(h), "feat-login").hold).toBe("waiting");
     expect(inbox.list({ project: "demo", status: "open" })).toEqual([]);
     h.clock.t = NOW + 61 * MIN;
     const line = lineOf(await check(h), "feat-login");
-    expect(line).toMatchObject({ state: "held", hold: "waiting" });
-    expect(line.detail).toContain("waiting over 60 min: asked you");
-    for (const minute of [120, 240]) {
+    expect(line).toMatchObject({ state: "held", hold: "waited_too_long", releasable: true });
+    expect(line.detail).toContain("its runs have been waiting since 2026-03-02T12:01:00.000Z");
+    // Held: its wake coming late doesn't start it, and there is one decision
+    resultAt(h, gate2, 70 * MIN);
+    for (const minute of [71, 120, 240]) {
       h.clock.t = NOW + minute * MIN;
-      await check(h);
+      expect(lineOf(await check(h), "feat-login").hold).toBe("waited_too_long");
     }
+    expect(runs(h)).toHaveLength(2);
     const [asked, ...more] = inbox.list({ project: "demo", status: "open" });
     expect(more).toEqual([]);
-    expect(asked).toMatchObject({ key: `fill:feat-login:waiting:${run.id}`, source: { ref: "fill:feat-login" } });
-    expect(asked.title).toBe(`Fill: worker-a is waiting too long on ${GATE} (task feat-login, since 2026-03-02T12:01:00.000Z)`);
-    expect(asked.options.map((o) => o.label)).toEqual(["Start it again now", "Keep waiting"]);
-    expect(asked.context).toContain(`- WAITING feat-login ${GATE} by worker-a 12:01Z: gate queued`);
+    expect(asked).toMatchObject({ key: `fill:feat-login:waiting:${runs(h)[1].id}`, source: { ref: "fill:feat-login" } });
+    expect(asked.title).toBe(`Fill: worker-a is waiting too long on ${gate2} (task feat-login, since 2026-03-02T12:01:00.000Z)`);
+    expect(asked.options.map((o) => o.label)).toEqual(["Start it again now", "Keep it held"]);
+    expect(asked.context).toContain(`- WAITING feat-login ${gate2} by worker-a: gate queued`);
 
     expect((await answer(asked.id, { optionId: "start_again" })).statusCode).toBe(200);
     expect(lineOf(await check(h), "feat-login").state).toBe("started");
+  });
+
+  it("a wake that was refused never goes into a decision's title", async () => {
+    const anyWake = "^-\\s+WAITING\\s+{task}\\s+(?<wake>\\S+)";
+    const h = setup(fill({ agents: ["worker-a"], waiting_pattern: anyWake, wake: { file: "{gates_dir}/results/{wake}.rc", max_wait_minutes: 10 } }));
+    const { inbox } = await withInbox(h);
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    await runEndingWith(h, "- WAITING feat-login ../../owner.token by worker-a");
+
+    h.clock.t = NOW + 11 * MIN;
+    expect(lineOf(await check(h), "feat-login").hold).toBe("waited_too_long");
+    const [asked] = inbox.list({ project: "demo", status: "open" });
+    expect(asked.title).toBe("Fill: worker-a is waiting too long on its WAITING line (task feat-login, since 2026-03-02T12:01:00.000Z)");
+    expect(asked.title).not.toContain("owner.token");
+  });
+
+  it("a wait survives a restart of Lair and a rotated queue file: the wake still starts the task once", async () => {
+    const h = setup(gateFill());
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    await runEndingWith(h, `- WAITING feat-login ${GATE} by worker-a 12:01Z: gate queued`);
+    expect(lineOf(await check(h), "feat-login").hold).toBe("waiting");
+
+    // Lair restarts (a new server on the same data), and the queue file is rotated meanwhile
+    const h2 = setup(gateFill(), { paths: h, self: { pid: 200, startedAt: NOW + 20 * MIN } });
+    writeFileSync(h.queueFile, "# Queue (rotated)\n");
+    h2.clock.t = NOW + 30 * MIN;
+    expect(lineOf(await check(h2), "feat-login")).toMatchObject({
+      state: "held",
+      hold: "waiting",
+      waiting: { wake: GATE, since: "2026-03-02T12:01:00.000Z" },
+    });
+    resultAt(h, GATE, 40 * MIN);
+    h2.clock.t = NOW + 41 * MIN;
+    expect(lineOf(await check(h2), "feat-login").state).toBe("started");
+    expect(lineOf(await check(h2), "feat-login").state).toBe("started");
+    expect(runs(h2)).toHaveLength(2);
   });
 
   it("a wake that isn't a plain name ('../x', an absolute path, a leading '-') or leaves wake.root is refused and shown", async () => {
@@ -2781,7 +2910,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(lineOf(status, "kiro/sf-storage")).toMatchObject({ state: "held", hold: "blocked" });
 
     // The gate's result arrives: it starts again, and then its agent reports it done
-    writeFileSync(join(h.gatesDir, "results", `${gate}.rc`), "0\n");
+    resultAt(h, gate, 90 * SEC);
     h.clock.t = NOW + 2 * MIN;
     expect(lineOf(await check(h), "kiro/currency-enforcement").state).toBe("started");
     await at(h, 2 * MIN); // 5003
@@ -2814,6 +2943,36 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(eventsOf(h, "fill_done")).toEqual([]);
     h.clock.t = NOW + 16 * MIN;
     expect(lineOf(await check(h), "kiro/trial-allowance").state).toBe("started");
+  });
+
+  it("patterns by agent: the agent's last line decides, so DONE for a row then WAITING is waiting, and WAITING then DONE is done", async () => {
+    const h = setup(fill({ ...BY_AGENT, wake: { file: "{gates_dir}/results/{wake}.rc" } }));
+    prompts(h);
+    tasks(h, "worker-a|Viserion|kiro/L-08|Three rows", "worker-b|Glaurung|kiro/L-09|One row");
+    await check(h);
+    await at(h, 0); // 5001, 5002
+    const gate = "20261027T064438Z-L-08-ab12cd34-5150";
+    appendFileSync(
+      h.queueFile,
+      // worker-a finished row 1 of its task and waits on the gate for row 2
+      "- DONE L-08 row 1 by worker-a (Viserion) 06:10Z: merged\n" +
+        `- WAITING L-08 row 2 ${gate} by worker-a (Viserion) 06:20Z: gate queued\n` +
+        // worker-b waited, and then finished
+        "- WAITING L-09 by worker-b (Glaurung) 06:21Z: review requested\n" +
+        "- DONE L-09 by worker-b (Glaurung) 06:40Z: merged\n",
+    );
+    h.spawner.exit(5001, 0);
+    h.spawner.exit(5002, 0);
+    await at(h, MIN);
+
+    const status = await check(h);
+    expect(lineOf(status, "kiro/L-08")).toMatchObject({ state: "held", hold: "waiting", waiting: { wake: gate } });
+    expect(lineOf(status, "kiro/L-09")).toMatchObject({ state: "done", detail: "done: - DONE L-09 by worker-b (Glaurung) 06:40Z: merged" });
+    expect(eventsOf(h, "fill_done").map((e) => e.task)).toEqual(["kiro/L-09"]);
+    // Row 2's gate comes: L-08 starts again, its rows not skipped
+    resultAt(h, gate, 30 * MIN);
+    h.clock.t = NOW + 31 * MIN;
+    expect(lineOf(await check(h), "kiro/L-08").state).toBe("started");
   });
 
   it("a store from before fill (schema version 1) gains the task index; its runs are found by task", () => {

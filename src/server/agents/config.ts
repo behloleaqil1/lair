@@ -581,11 +581,23 @@ function checkFill(value: RawSettings, errors: string[]): void {
   if (wake.root.split(/[\\/]/).includes("..")) errors.push('agents.fill.wake.root: a ".." segment is refused');
 }
 
-/** A fill pattern: {task} and {agent} only, at least one of them, and it compiles. */
+/** What must come right before {agent} in a pattern: "by" and whitespace, the line's author (as "... by <agent> (Name)") */
+const BY_BEFORE_AGENT = /(?:^|[^a-z]|\\b)by(?:\\s[+*]?|\s+)$/i;
+
+/**
+ * A fill pattern: {task} and {agent} only, at least one of them, every
+ * {agent} right after "by\s+" (so only a line the agent wrote can match, not
+ * one that names it, like "merged kiro-A's PR"), and it compiles.
+ */
 function checkTaskPattern(pattern: string, key: string, what: string, errors: string[]): void {
   checkPlaceholders(pattern, ["task", "agent"], `agents.fill.${key}`, errors);
   if (!pattern.includes("{task}") && !pattern.includes("{agent}")) {
     errors.push(`agents.fill.${key}: needs {task} or {agent} (without either one ${what} line would match every task)`);
+    return;
+  }
+  const parts = pattern.split("{agent}");
+  if (parts.slice(0, -1).some((before) => !BY_BEFORE_AGENT.test(before))) {
+    errors.push(`agents.fill.${key}: {agent} must come right after "by\\s+" (the line's author: "... by {agent}")`);
     return;
   }
   try {

@@ -169,8 +169,15 @@ describe("agents config", () => {
       expect(errorsOf(withFill({ [key]: "^- WAITING " }))).toEqual([
         `agents.fill.${key}: needs {task} or {agent} (without either one ${key === "waiting_pattern" ? "waiting" : "blocked"} line would match every task)`,
       ]);
-      // {agent} alone is enough
+      // {agent} alone is enough, right after "by\s+" (the line's author)
       expect(errorsOf(withFill({ [key]: "^- WAITING .*\\bby\\s+{agent}(?=[\\s(]|$)" }))).toEqual([]);
+      expect(errorsOf(withFill({ [key]: "^- WAITING .* by {agent}(?=[\\s(]|$)" }))).toEqual([]);
+      // Anywhere else it could match a line that only names the agent ("merged kiro-A's PR")
+      for (const pattern of ["^- DONE merged {agent}'s PR", "^- DONE .*{agent}", "^- DONE .*\\bbaby\\s+{agent}"]) {
+        expect(errorsOf(withFill({ [key]: pattern }))).toEqual([
+          `agents.fill.${key}: {agent} must come right after "by\\s+" (the line's author: "... by {agent}")`,
+        ]);
+      }
       expect(errorsOf(withFill({ [key]: "^- BLOCKED ({task}" }))[0]).toContain(`agents.fill.${key}: not a valid regular expression`);
       expect(errorsOf(withFill({ [key]: "^- BLOCKED {task} {gate}" }))[0]).toContain(`agents.fill.${key}: unknown placeholder {gate}`);
     }

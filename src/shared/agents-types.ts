@@ -136,7 +136,8 @@ export type AgentEventKind =
   | "fill_done"
   | "fill_released"
   | "fill_waiting"
-  | "fill_blocked";
+  | "fill_blocked"
+  | "fill_woken";
 
 /** Recovery and audit record: what happened, why, and the evidence. */
 export interface AgentEventView {
@@ -245,20 +246,24 @@ export type FillLineState = "started" | "done" | "held" | "claimed" | "not_allow
 /**
  * Why a line is held:
  * - owner: the task's last run ended other than completed (escalated, stopped, its claim lost)
- * - no_done: its runs exited 0 without reporting it done fill.max_completions_without_done times in a row
+ * - no_done: its runs exited 0 without progress fill.max_completions_without_done times in a row
+ *   (no done line, or a WAITING line on nothing that came: see waiting)
  * - backoff: its last run exited 0 without reporting it done; it starts again after a backoff
- * - waiting: its last run ended on a WAITING line; it starts again once what it waits on is there
- *   (fill.wake.file), or after fill.wake.fallback_seconds
+ * - waiting: its last run ended on a WAITING line. On a wake file that isn't there yet it starts
+ *   again once the file appears; on nothing (no wake, a refused one, or a result already there when
+ *   the run ended) it counts as a run without progress and starts again after the fallback and backoff
+ * - waited_too_long: its runs have been waiting longer than fill.wake.max_wait_minutes in a row
  * - blocked: its last run ended on a BLOCKED line: it needs someone else first
  * - busy, read_only, max_active, capacity, prompt (a refused prompt file), refused (the run request)
- * owner, no_done, blocked and waiting are the owner's to release (POST /api/agents/fill/release, or
- * the decision); a waiting one also ends by itself.
+ * owner, no_done, blocked, waiting and waited_too_long are the owner's to release (POST
+ * /api/agents/fill/release, or the decision); a waiting one also ends by itself.
  */
 export type FillHold =
   | "owner"
   | "no_done"
   | "backoff"
   | "waiting"
+  | "waited_too_long"
   | "blocked"
   | "busy"
   | "read_only"
