@@ -46,7 +46,8 @@ export function parseOutboxLine(line: string): OutboxReply | null {
   }
 
   // Match: - REPLY abc123 2026-10-24T12:35:00Z by kiro-A: Did the thing
-  const match = trimmed.match(/^- REPLY\s+(\S+)\s+(\S+)\s+by\s+(\S+):\s*(.+)$/);
+  // The id may be written bracketed, as OWNER lines write it (- REPLY [abc123] ...): the brackets are not part of it
+  const match = trimmed.match(/^- REPLY\s+\[?([^\s\]]+)\]?\s+(\S+)\s+by\s+(\S+):\s*(.+)$/);
 
   if (!match) {
     return null;

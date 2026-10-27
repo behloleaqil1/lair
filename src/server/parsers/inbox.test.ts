@@ -72,6 +72,14 @@ describe("parseOutboxLine", () => {
     expect(parseOutboxLine("- DONE task")).toBeNull();
   });
 
+  it("reads a bracketed reply id, as OWNER lines write it, without the brackets", () => {
+    const result = parseOutboxLine("- REPLY [2] 22:17Z by Claude: assigned to a dragon");
+    expect(result).not.toBeNull();
+    expect(result!.id).toBe("2");
+    expect(result!.agent).toBe("Claude");
+    expect(parseInboxFile("- OWNER 22:09Z [2]: please do it", "- REPLY [2] 22:17Z by Claude: done")[0].status).toBe("answered");
+  });
+
   it("handles multi-word reply text", () => {
     const line =
       "- REPLY x1 12:00Z by kiro-B: The task is done, rc=0, merged PR #123";
