@@ -10,9 +10,11 @@
  *   same rules as the Decisions view: inlineAnswer) and a link to its full
  *   context.
  * - FYI (collapsed): what is worth knowing but asks nothing: notices, agents
- *   whose state needs a look, failed gates and PRs ready to merge.
+ *   whose state needs a look, providers the agents module waits out after
+ *   transient errors, failed gates and PRs ready to merge.
  */
 import { CONFIRM_KINDS, type Decision, type DecisionOption } from "../shared/decision-types";
+import type { ProviderUnreachableView } from "../shared/agents-types";
 import type { ConfigProblem } from "../shared/lifecycle-types";
 import type { FailedGate } from "./gate-detail-view";
 import type { PrRow } from "./pr-view";
@@ -70,6 +72,8 @@ export interface NeedsInput {
   work: readonly WorkRow[];
   /** This browser is signed in as the owner (null: not known yet) */
   signedIn: boolean | null;
+  /** Providers the agents module waits out after transient errors (GET /api/agents/status `unreachable`) */
+  unreachable?: readonly ProviderUnreachableView[];
 }
 
 export interface NeedsView {
@@ -178,6 +182,19 @@ export function needsYou(input: NeedsInput): NeedsView {
       linkLabel: "Open",
       tone: "error",
       at: null,
+    });
+  }
+  // A provider Lair waits out after transient errors: nothing to answer yet (its decision comes if it lasts)
+  for (const u of input.unreachable ?? []) {
+    fyi.push({
+      kind: "agent",
+      key: `agent:provider:${u.provider}`,
+      title: `Provider ${u.provider} is unreachable`,
+      detail: `${u.fleet ? "Every agent waits" : `${u.agents.join(", ")} wait${u.agents.length === 1 ? "s" : ""}`}: ${u.waiting} run(s), ${u.failures} transient failure(s); Lair tries one start at a time`,
+      href: linkTo("work"),
+      linkLabel: "Open",
+      tone: "neutral",
+      at: u.since,
     });
   }
   for (const f of input.failures) {

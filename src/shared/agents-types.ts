@@ -144,7 +144,11 @@ export type AgentEventKind =
   | "fill_blocked"
   | "fill_woken"
   | "fill_weak"
-  | "fill_wake_absent";
+  | "fill_wake_absent"
+  | "fill_gate_queued"
+  | "fill_gate_gone"
+  | "transient"
+  | "transient_cleared";
 
 /** Recovery and audit record: what happened, why, and the evidence. */
 export interface AgentEventView {
@@ -237,6 +241,33 @@ export interface AgentsStatusView {
   projectBudget: BudgetScopeView | null;
   /** agents.fill, whenever the module runs for the project */
   fill?: FillStatusView;
+  /** Providers Lair holds new starts on: their runs died of transient errors (agents.transient_patterns) */
+  unreachable?: ProviderUnreachableView[];
+}
+
+/**
+ * A provider whose runs died of a transient network or provider error, with
+ * nothing on it working since: starts on it wait (only those of the agents
+ * whose runs died, until the outage is the fleet's), a fallback on another
+ * provider is used when there is one, and one start tries it per backoff
+ * step (60 s doubling, up to 15 min).
+ */
+export interface ProviderUnreachableView {
+  provider: string;
+  /** The first transient failure of this outage */
+  since: string;
+  /** Transient failures in this outage */
+  failures: number;
+  /** When the next start may try it */
+  nextTryAt: string;
+  /** The log line that matched (the agent CLI's output: data) */
+  line: string;
+  /** Every agent's starts wait: two agents' runs died of it close together, or a retry failed too */
+  fleet: boolean;
+  /** The agents whose runs died of it */
+  agents: string[];
+  /** Active runs on it that wait */
+  waiting: number;
 }
 
 /**
@@ -259,7 +290,9 @@ export type FillLineState = "started" | "done" | "held" | "claimed" | "not_allow
  * - waiting: its last run ended on a WAITING line. On a wake file that isn't there yet it starts
  *   again once the file appears; on nothing (no wake, a refused one, or a result already there when
  *   the run ended) it counts as a run without progress and starts again after the fallback and backoff
- * - waited_too_long: its runs have been waiting longer than fill.wake.max_wait_minutes in a row
+ * - waited_too_long: its runs have been waiting longer than fill.wake.max_wait_minutes in a row (time
+ *   while the gate it waits on was still in the gate queue doesn't count), or longer than
+ *   fill.wake.max_queue_wait_minutes in all
  * - blocked: its last run ended on a BLOCKED line: it needs someone else first
  * - busy, read_only, max_active, capacity, prompt (a refused prompt file), refused (the run request,
  *   or done_pattern)
@@ -316,6 +349,20 @@ export interface FillWaitingView {
   fallbackAt: string | null;
   /** Why the captured wake isn't used, if it isn't */
   refused: string | null;
+  /** The gate it waits on is still in the gate queue (it, or the id it was re-queued as): the wait is alive */
+  queued?: FillQueuedGateView | null;
+}
+
+export interface FillQueuedGateView {
+  /** The gate id whose request is in the queue */
+  gate: string;
+  /** The id the waiting line named, when the request is a re-queue of it under a new id (wake.requeue_marker) */
+  requeuedFrom: string | null;
+  lane: string;
+  /** queued: <lane>.<pri>.<id>.req; running: .req.run */
+  status: "queued" | "running";
+  /** When the request file was written */
+  since: string;
 }
 
 export interface FillStatusView {

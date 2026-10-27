@@ -5,6 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 import type { Decision } from "../shared/decision-types";
+import type { ProviderUnreachableView } from "../shared/agents-types";
 import { NOTHING_NEEDS_YOU, SIGN_IN_TO_ANSWER, inlineAnswer, needsYou, type NeedsInput } from "./home-view";
 import type { WorkRow } from "./work-view";
 import type { PrRow } from "./pr-view";
@@ -175,5 +176,46 @@ describe("answering from Home: the Decisions view's rules", () => {
     expect(inlineAnswer(decision({}), null)).toMatchObject({ mode: "buttons", disabledReason: SIGN_IN_TO_ANSWER });
     const { items } = needsYou({ ...empty, signedIn: false, decisions: [decision({})] });
     expect(items[0].answer).toMatchObject({ disabledReason: SIGN_IN_TO_ANSWER });
+  });
+
+  it("tells about a provider Lair waits out after transient errors in FYI, never as something that needs the owner", () => {
+    const outage = (provider: string, over: Partial<ProviderUnreachableView> = {}): ProviderUnreachableView => ({
+      provider,
+      since: "2026-10-27T11:30:00.000Z",
+      failures: 6,
+      nextTryAt: "2026-10-27T12:15:00.000Z",
+      line: "Error: A network error occurred.",
+      fleet: true,
+      agents: ["kiro-A", "kiro-B"],
+      waiting: 4,
+      ...over,
+    });
+    const { items, fyi } = needsYou({
+      ...empty,
+      decisions: [decision({ id: "d-open" })],
+      unreachable: [
+        outage("provider-a"),
+        outage("provider-b", { since: "2026-10-27T11:58:00.000Z", failures: 1, fleet: false, agents: ["kiro-C"], waiting: 1 }),
+      ],
+    });
+    expect(items.map((i) => i.key)).toEqual(["decision:d-open"]);
+    expect(fyi.map((i) => [i.kind, i.tone, i.title, i.detail, i.href, i.at])).toEqual([
+      [
+        "agent",
+        "neutral",
+        "Provider provider-b is unreachable",
+        "kiro-C waits: 1 run(s), 1 transient failure(s); Lair tries one start at a time",
+        "#/work",
+        "2026-10-27T11:58:00.000Z",
+      ],
+      [
+        "agent",
+        "neutral",
+        "Provider provider-a is unreachable",
+        "Every agent waits: 4 run(s), 6 transient failure(s); Lair tries one start at a time",
+        "#/work",
+        "2026-10-27T11:30:00.000Z",
+      ],
+    ]);
   });
 });

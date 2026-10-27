@@ -262,6 +262,7 @@ function HomeOverview({ project, refreshKey, modules }: SectionProps) {
     configProblems: config.data?.problems ?? [],
     work,
     signedIn,
+    unreachable: agentsView?.unreachable ?? [],
   });
 
   const counts = workCounts(work);

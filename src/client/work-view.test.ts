@@ -11,6 +11,7 @@ import {
   fillItem,
   fillStateText,
   fillWaitingText,
+  unreachableText,
   waitingText,
   workCounts,
   workRows,
@@ -217,6 +218,50 @@ describe("agent detail", () => {
     const detail = agentDetail("kiro-A", [dragon()], status([agent({ run: undefined, claims: [] })], [waitingLine]), [], [], NOW)!;
     expect(detail.waiting).toBe("Waiting on gate-9 since 10 min ago");
     expect(detail.holds[0]).toMatchObject({ state: "held: waiting", releasable: true, waiting: "Waiting on gate-9 since 10 min ago" });
+  });
+
+  it("says when the gate a task waits on is still in the gate queue, and which providers Lair waits out", () => {
+    const since = "2026-10-27T09:00:00.000Z";
+    expect(
+      fillWaitingText(
+        {
+          wake: "gate-123",
+          since,
+          fallbackAt: null,
+          refused: null,
+          queued: { gate: "gate-123", requeuedFrom: null, lane: "remote", status: "queued", since: "2026-10-27T08:59:00.000Z" },
+        },
+        NOW,
+      ),
+    ).toBe("Waiting on gate-123 since 3 h ago; still queued in remote since 3 h ago");
+    expect(
+      fillWaitingText(
+        {
+          wake: "gate-123",
+          since,
+          fallbackAt: null,
+          refused: null,
+          queued: { gate: "gate-124", requeuedFrom: "gate-123", lane: "heavy", status: "running", since: "2026-10-27T11:40:00.000Z" },
+        },
+        NOW,
+      ),
+    ).toBe("Waiting on gate-123 since 3 h ago; re-queued as gate-124, still running in heavy since 20 min ago");
+    const outage = {
+      provider: "provider-a",
+      since: "2026-10-27T11:30:00.000Z",
+      failures: 6,
+      nextTryAt: "2026-10-27T12:15:00.000Z",
+      line: "Error: A network error occurred.",
+      fleet: true,
+      agents: ["kiro-A", "kiro-B"],
+      waiting: 4,
+    };
+    expect(unreachableText(outage, NOW)).toBe(
+      "Provider provider-a unreachable since 30 min ago (6 transient failures): every agent waits, 4 runs waiting; next try in 15 min",
+    );
+    expect(unreachableText({ ...outage, fleet: false, agents: ["kiro-C"], failures: 1, waiting: 1 }, NOW)).toBe(
+      "Provider provider-a unreachable since 30 min ago (1 transient failure): kiro-C waits, 1 run waiting; next try in 15 min",
+    );
   });
 
   it("is null for an agent nobody knows", () => {

@@ -35,8 +35,13 @@
  *     without progress: it starts again after wake.fallback_seconds and the
  *     backoff, and toward the no_done hold;
  *   - waited_too_long: its runs have been waiting, in a row, longer than
- *     wake.max_wait_minutes (counted from the store, across restarts):
- *     held, with one decision;
+ *     wake.max_wait_minutes (counted from the store, across restarts),
+ *     not counting the time the gate the latest one waits on was still in
+ *     the gate queue (<lane>.<pri>.<id>.req or .req.run, under its id or one
+ *     wake.requeue_marker names it re-queued as): such a live wait is held
+ *     only past wake.max_queue_wait_minutes. Held, with one decision, until
+ *     the owner answers. A wake fill finds there ends the wait instead: a
+ *     woken task is never newly held, only one already held stays so;
  *   - no_done / backoff: its runs exited 0 without reporting it done. It is
  *     started again after a backoff (fill.backoff_seconds, doubling), and
  *     after fill.max_completions_without_done of them in a row it is held and
@@ -55,8 +60,8 @@
  * characters and trimmed before done_pattern sees them).
  */
 import { createHash } from "crypto";
-import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync } from "fs";
-import { isAbsolute, relative, resolve, sep } from "path";
+import { closeSync, constants, fstatSync, lstatSync, opendirSync, openSync, readSync, realpathSync, type Dir } from "fs";
+import { isAbsolute, join, relative, resolve, sep } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { Decision } from "../../shared/decision-types.js";
 import type {
@@ -65,10 +70,12 @@ import type {
   FillHold,
   FillLineState,
   FillLineView,
+  FillQueuedGateView,
   FillStatusView,
   FillWaitingView,
 } from "../../shared/agents-types.js";
 import { isValidDragonId } from "../parsers/dragon-config.js";
+import { parseGateFilename } from "../parsers/gates.js";
 import { getPromptsDir } from "../routes/controls.js";
 import {
   backoffMs,
@@ -245,12 +252,104 @@ interface RunStatus {
 
 /** What a waiting run waits on (see AgentsFill.classifyWait); `named` is a wake that resolved to a file, else null. */
 type WaitState =
-  | { kind: "pending"; named: string | null; view: FillWaitingView; detail: string }
+  | { kind: "pending"; named: string | null; view: FillWaitingView; detail: string; file: string }
   | { kind: "woken"; named: string | null; file: string }
   | { kind: "weak"; named: string | null; view: FillWaitingView; detail: string; fallbackAt: number | null };
 
 /** How many of a task's newest chains the no-done count and the wait streak look at */
 const MAX_CHAINS_LOOKED_AT = 50;
+
+// ============ THE GATE QUEUE ============
+
+/** At most this many entries of gates_dir/queue are looked at per check */
+const GATE_QUEUE_MAX_ENTRIES = 20_000;
+/** A re-queue marker's first line is read from at most this many bytes */
+const MARKER_MAX_BYTES = 512;
+/** At most this many ids are followed from a waiting line's gate through re-queue markers */
+export const MAX_REQUEUE_IDS = 10;
+/** {n} in wake.requeue_marker takes 1 to this */
+const MAX_MARKER_N = 9;
+
+/** A gate request in gates_dir/queue: queued (<lane>.<pri>.<id>.req) or running (.req.run). */
+export interface QueuedRequest {
+  lane: string;
+  status: "queued" | "running";
+  path: string;
+}
+
+/**
+ * The gate queue's queued and running requests by gate id, read with the
+ * gates parser (any other status, such as .req.stuck, is not in the queue).
+ * Bounded: the first GATE_QUEUE_MAX_ENTRIES entries; a directory or a
+ * symlink is never a request. A running request wins over a queued one.
+ */
+export function readGateQueue(gatesDir: string): Map<string, QueuedRequest> {
+  const requests = new Map<string, QueuedRequest>();
+  const dir = join(gatesDir, "queue");
+  let handle: Dir;
+  try {
+    handle = opendirSync(dir);
+  } catch {
+    return requests;
+  }
+  try {
+    for (let i = 0; i < GATE_QUEUE_MAX_ENTRIES; i++) {
+      const entry = handle.readSync();
+      if (entry === null) break;
+      if (entry.isDirectory() || entry.isSymbolicLink()) continue;
+      const gate = parseGateFilename(entry.name);
+      if (!gate || (gate.status !== "queued" && gate.status !== "running")) continue;
+      if (requests.get(gate.id)?.status === "running") continue;
+      requests.set(gate.id, { lane: gate.lane, status: gate.status === "running" ? "running" : "queued", path: join(dir, entry.name) });
+    }
+  } catch {
+    // What was read before the error stands
+  } finally {
+    handle.closeSync();
+  }
+  return requests;
+}
+
+/** A waiting run's gate that is still in the gate queue: the wait is alive. */
+interface QueuedGate {
+  gate: string;
+  /** The id the waiting line named, when `gate` is what a re-queue marker says it became */
+  requeuedFrom: string | null;
+  lane: string;
+  status: "queued" | "running";
+  path: string;
+  /** The request file's mtime: when it was written */
+  since: number;
+}
+
+const queuedGateView = (q: QueuedGate): FillQueuedGateView => ({
+  gate: q.gate,
+  requeuedFrom: q.requeuedFrom,
+  lane: q.lane,
+  status: q.status,
+  since: iso(q.since),
+});
+
+/** "<gate> still queued in <lane> since <time>" */
+const queuedText = (q: QueuedGate) =>
+  `${q.gate}${q.requeuedFrom ? ` (re-queued from ${q.requeuedFrom})` : ""} still ${q.status} in ${q.lane} since ${iso(q.since)}`;
+
+/** What a waiting line may name and fill may look up: one plain name (WAKE_VALUE), no ".." */
+const isPlainWake = (value: string) => WAKE_VALUE.test(value) && !value.includes("..");
+
+/** The first line of a small regular file (no symlink as its last part), trimmed; null when it can't be read. */
+function firstLineOf(path: string, maxBytes: number): string | null {
+  const opened = openRegular(path, true);
+  if ("error" in opened) return null;
+  try {
+    const text = readAt(opened.fd, 0, Math.min(opened.size, maxBytes)).toString("utf-8");
+    return text.split("\n")[0].replace(/\r$/, "").trim();
+  } catch {
+    return null;
+  } finally {
+    closeSync(opened.fd);
+  }
+}
 
 /**
  * The queue file's lines at one check (its last 4 MB), trimmed, each with
@@ -707,6 +806,8 @@ export class AgentsFill {
   private waitingSeen = new Set<string>();
   /** Open decisions whose line is gone from the tasks file: in how many checks in a row (key -> checks) */
   private lineGone = new Map<string, number>();
+  /** When fill last saw a waiting run's gate in the gate queue (task|run -> time); the store keeps the first and last sightings */
+  private lastQueued = new Map<string, number>();
 
   constructor(private options: AgentsFillOptions) {}
 
@@ -862,6 +963,9 @@ export class AgentsFill {
     const entries = parseTasksFile(read.text, byAgent);
     const allowed = new Set(settings.agents);
     const queue = new QueueLines(config.queue_file);
+    // The gate queue, read at most once per check, and only when a waiting line names a gate
+    let gateRequests: Map<string, QueuedRequest> | null = null;
+    const gateQueue = () => (gateRequests ??= readGateQueue(config.gates_dir));
     const promptsDir = getPromptsDir(config);
     let active = this.activeCount();
     let noCapacity: string | null = null;
@@ -1106,30 +1210,67 @@ export class AgentsFill {
           await holdNoDone(latest, completions);
           continue;
         }
+        // The gate it waits on is still in the gate queue (under its id, or one it was re-queued as): a live wait
+        const pollKey = `${task}|${latest.id}`;
+        this.waitingSeen.add(pollKey);
+        const queued = wait.kind === "woken" ? null : this.queuedGate(status.wake, gateQueue);
+        await this.noteQueued(latest, agent, task, pollKey, queued, now);
+        const queuedView = queued ? queuedGateView(queued) : null;
         // A wait budget across restarts: from the first run of this streak of waiting runs
-        const streakStart = this.waitStreakStart(task, releasedChain) ?? since;
-        if (now - streakStart >= settings.wake.maxWaitMinutes * 60000) {
+        const streak = this.waitStreak(task, releasedChain);
+        const streakStart = streak?.start ?? since;
+        const maxWait = settings.wake.maxWaitMinutes;
+        const maxQueueWait = Math.max(settings.wake.maxQueueWaitMinutes, maxWait);
+        // Once held for waiting too long, it stays held while its decision is open or was answered "Keep it paused"
+        // (holdDecision). A withdrawn one doesn't hold: it is asked again once the wait is over its budget again.
+        // Without a Decision Inbox to ask, while the decision was raised (the inbox file can't say more)
+        const waitingKey = fillDecisionKey(task, latest.id, "waiting");
+        const decided = this.holdDecision(waitingKey);
+        const heldBefore =
+          decided.status === "open" ||
+          (decided.status === "answered" && decided.optionId === DECISION_FILL_KEEP) ||
+          (decided.status === "unknown" && store.hasEvent(project, `decision:${waitingKey}`));
+        // Alive, only max_queue_wait_minutes holds it. Otherwise the time its gates were in the gate queue doesn't
+        // count (from the streak's start, or the last sighting there), and a wake that came ends the wait
+        const from = queued ? streakStart : Math.max(streakStart, this.lastQueuedAt(task, streak?.runs ?? [latest]) ?? streakStart);
+        const overQueue = queued !== null && now - streakStart >= maxQueueWait * 60000;
+        const overWait = queued === null && wait.kind !== "woken" && now - from >= maxWait * 60000;
+        const over = overQueue
+          ? `agents.fill.wake.max_queue_wait_minutes (${maxQueueWait}), though its gate is still in the gate queue`
+          : overWait
+            ? `agents.fill.wake.max_wait_minutes (${maxWait})${from > streakStart ? ` counted from ${iso(from)}, when its gate was last in the gate queue` : ""}`
+            : heldBefore
+              ? `its wait budget (agents.fill.wake.max_wait_minutes ${maxWait}, max_queue_wait_minutes ${maxQueueWait}) earlier`
+              : null;
+        if (over !== null) {
           const on = wait.named ?? "its WAITING line";
-          const view = wait.kind === "woken" ? null : wait.view;
-          const what = wait.kind === "woken" ? `waiting: ${on} since ${iso(since)}` : wait.detail;
+          const view = wait.kind === "woken" ? null : { ...wait.view, queued: queuedView };
+          const what = queued
+            ? `waiting: ${queuedText(queued)}`
+            : wait.kind === "woken"
+              ? `waiting: ${on} since ${iso(since)}`
+              : wait.detail;
           await hold(
             "waited_too_long",
-            `${what}; its runs have been waiting since ${iso(streakStart)}, over agents.fill.wake.max_wait_minutes (${settings.wake.maxWaitMinutes}): fill leaves the task to you`,
+            `${what}; its runs have been waiting since ${iso(streakStart)}, over ${over}: fill leaves the task to you`,
             latest.id,
             view,
           );
-          await ask(latest, fillDecisionKey(task, latest.id, "waiting"), {
+          await ask(latest, waitingKey, {
             question: `${agent} is paused on ${task}: it has waited on ${on} since ${iso(streakStart)}`,
             context: [
               `Run ${short(latest.id)} ended ${iso(since)} on this line:`,
               "",
               ...asData(status.line),
               "",
+              ...(queued ? [`The gate it waits on: ${queuedText(queued)}.`, ""] : []),
               `Its runs have been waiting since ${iso(streakStart)}; fill holds the task until you answer.`,
             ],
             startLabel: "Start it again now",
             startConsequences: `Fill starts ${task} for ${agent} again on its next check, and the wait counts from zero.`,
-            why: "A gate or a review usually finishes on its own; a wait this long may mean it never will.",
+            why: queued
+              ? "Its gate has been in the gate queue longer than max_queue_wait_minutes: a machine or runner may be down, or the queue stuck."
+              : "A gate or a review usually finishes on its own; a wait this long may mean it never will.",
             withOutput: false,
           });
           continue;
@@ -1150,7 +1291,8 @@ export class AgentsFill {
             probes.clock.now(),
           );
         } else if (wait.kind === "pending") {
-          await hold("waiting", wait.detail, latest.id, wait.view);
+          const detail = queued ? `waiting: ${queuedText(queued)}; starts again once ${wait.file} exists` : wait.detail;
+          await hold("waiting", detail, latest.id, { ...wait.view, queued: queuedView });
           continue;
         } else {
           // Waiting on nothing that came: a run without progress, counted and backed off
@@ -1159,9 +1301,9 @@ export class AgentsFill {
           if (now < at) {
             await hold(
               "waiting",
-              `${wait.detail}; counted as a run without progress (${count} of ${settings.maxCompletionsWithoutDone}): starting it again at ${iso(at)}`,
+              `${wait.detail}${queued ? `; ${queuedText(queued)}` : ""}; counted as a run without progress (${count} of ${settings.maxCompletionsWithoutDone}): starting it again at ${iso(at)}`,
               latest.id,
-              { ...wait.view, fallbackAt: iso(at) },
+              { ...wait.view, fallbackAt: iso(at), queued: queuedView },
             );
             continue;
           }
@@ -1255,6 +1397,9 @@ export class AgentsFill {
     }
     for (const key of [...this.polled.keys()]) {
       if (!this.waitingSeen.has(key)) this.polled.delete(key);
+    }
+    for (const key of [...this.lastQueued.keys()]) {
+      if (!this.waitingSeen.has(key)) this.lastQueued.delete(key);
     }
     // A check cut short saw only some lines: what it didn't see may still be held
     if (!signal.aborted) await this.withdrawLifted(views, wanted);
@@ -1428,9 +1573,10 @@ export class AgentsFill {
    * What a waiting run waits on:
    * - pending: a wake file that isn't there yet (a real wait: nothing counted);
    * - woken: that file came: fill saw it absent before, or it is newer than
-   *   the run's start (the gate the run queued finished, however soon). It
-   *   starts again at once, and the run counts neither for nor against the
-   *   no-done count;
+   *   the run's start (the gate the run queued finished, however soon). With
+   *   wake.requeue_marker, so does the result of an id its gate was re-queued
+   *   as, once it is newer than the chain's first start. It starts again at
+   *   once, and the run counts neither for nor against the no-done count;
    * - weak: nothing to wait on (no capture, no wake.file, a refused capture,
    *   or a result older than the run, so naming it was no wait at all): it
    *   counts as a run without progress, and starts again after
@@ -1487,9 +1633,18 @@ export class AgentsFill {
         );
       if (found.state === "absent") {
         await note("fill_wake_absent", `fill: ${file} isn't there yet: ${agent} waits on it for ${task}`);
+        // Its gate re-queued under a new id (wake.requeue_marker): that run's result, newer than the chain, wakes it too
+        const requeued = status.wake !== null ? this.requeuedResult(status.wake, this.chainStart(latest)) : null;
+        if (requeued !== null) return { kind: "woken", file: requeued, named };
       }
       if (found.state !== "present") {
-        return { kind: "pending", named, view: view(null), detail: `waiting: ${shown} since ${iso(since)}; starts again once ${file} exists` };
+        return {
+          kind: "pending",
+          named,
+          file,
+          view: view(null),
+          detail: `waiting: ${shown} since ${iso(since)}; starts again once ${file} exists`,
+        };
       }
       // It came: fill saw it absent before (whatever its mtime says: a copy may keep an old one), or it is newer than
       // the chain's first start (an earlier attempt of the same chain may have queued the gate the last one waits on)
@@ -1512,36 +1667,177 @@ export class AgentsFill {
   }
 
   /**
-   * When the task's current streak of waiting runs began: the end of the
-   * first of the runs in a row, newest first, that ended waiting (since the
-   * owner last released it, and up to a chain the owner started), from the
-   * store, so it holds across restarts of Lair and of the task.
+   * The task's current streak of waiting runs: the last run of each chain in
+   * a row, newest first, that ended waiting (since the owner last released
+   * it, and up to a chain the owner started), and when it began (the end of
+   * the first of them), from the store, so it holds across restarts of Lair
+   * and of the task.
    */
-  private waitStreakStart(task: string, releasedChain: string | null): number | null {
+  private waitStreak(task: string, releasedChain: string | null): { start: number; runs: AgentRun[] } | null {
     const { store, project } = this.options;
+    const runs: AgentRun[] = [];
     let start: number | null = null;
     for (const head of store.chainHeadsForTask(project, task, MAX_CHAINS_LOOKED_AT)) {
       if (head.chainId === releasedChain) break;
       const last = store.chainRuns(head.chainId).at(-1);
       if (!last || last.state !== "completed") break;
       if (store.listEvents(project, { kinds: ["fill_waiting"], task, runId: last.id, limit: 1 }).length === 0) break;
+      runs.push(last);
       start = last.endedAt ?? last.requestedAt;
       if (head.origin !== "fill") break;
     }
-    return start;
+    return start === null ? null : { start, runs };
+  }
+
+  /**
+   * The gate a waiting line names, when its request is still in the gate
+   * queue (queued or running): under its own id, else under an id a
+   * re-queue marker says it became (the newest first). null for a wake that
+   * isn't a plain name, or a gate the queue no longer has.
+   */
+  private queuedGate(wake: string | null, gateQueue: () => Map<string, QueuedRequest>): QueuedGate | null {
+    if (wake === null || !isPlainWake(wake)) return null;
+    const queue = gateQueue();
+    let gate = wake;
+    let request = queue.get(wake);
+    if (!request) {
+      for (const id of this.requeuedIds(wake).slice(1).reverse()) {
+        request = queue.get(id);
+        if (request) {
+          gate = id;
+          break;
+        }
+      }
+    }
+    if (!request) return null;
+    let since: number;
+    try {
+      since = lstatSync(request.path).mtimeMs;
+    } catch {
+      return null; // it left the queue since the listing
+    }
+    return { gate, requeuedFrom: gate === wake ? null : wake, lane: request.lane, status: request.status, path: request.path, since };
+  }
+
+  /**
+   * Keep what fill saw of a waiting run's gate in the gate queue, for the
+   * wait budget: fill_gate_queued when it first sees it there, and
+   * fill_gate_gone, with when it was last seen there, when it first finds it
+   * gone (or the wake came). In between the last sighting is in memory; after
+   * a restart, a gate seen queued before and gone now counts as seen until now.
+   */
+  private async noteQueued(run: AgentRun, agent: string, task: string, key: string, queued: QueuedGate | null, now: number): Promise<void> {
+    const { store, project, probes } = this.options;
+    const queuedKey = `fill_gate_queued:${task}:${run.id}`;
+    if (queued) {
+      this.lastQueued.set(key, now);
+      if (store.hasEvent(project, queuedKey)) return;
+      await this.options.record(
+        "fill_gate_queued",
+        {
+          agent,
+          task,
+          runId: run.id,
+          summary: `fill: ${agent} waits on ${task}'s gate ${queuedText(queued)}: the wait is alive`,
+          evidence: [queued.path],
+          data: { gate: queued.gate, requeuedFrom: queued.requeuedFrom, lane: queued.lane, status: queued.status, path: queued.path },
+          dedupeKey: queuedKey,
+        },
+        probes.clock.now(),
+      );
+      return;
+    }
+    const goneKey = `fill_gate_gone:${task}:${run.id}`;
+    const last = this.lastQueued.get(key);
+    if (store.hasEvent(project, goneKey) || (last === undefined && !store.hasEvent(project, queuedKey))) return;
+    await this.options.record(
+      "fill_gate_gone",
+      {
+        agent,
+        task,
+        runId: run.id,
+        summary: `fill: ${agent}'s gate for ${task} is no longer in the gate queue (last seen there ${iso(last ?? now)})`,
+        data: { lastQueuedAt: last ?? now },
+        dedupeKey: goneKey,
+      },
+      probes.clock.now(),
+    );
+  }
+
+  /** The last time fill saw the gate of one of these waiting runs in the gate queue, from memory and the store. */
+  private lastQueuedAt(task: string, runs: AgentRun[]): number | null {
+    const { store, project } = this.options;
+    const times: number[] = [];
+    for (const run of runs) {
+      const seen = this.lastQueued.get(`${task}|${run.id}`);
+      if (seen !== undefined) times.push(seen);
+      for (const event of store.listEvents(project, { kinds: ["fill_gate_queued", "fill_gate_gone"], task, runId: run.id, limit: 10 })) {
+        times.push(event.kind === "fill_gate_gone" ? Number(event.data.lastQueuedAt) : event.at);
+      }
+    }
+    const known = times.filter((t) => Number.isFinite(t));
+    return known.length > 0 ? Math.max(...known) : null;
+  }
+
+  /**
+   * The ids a waiting line's gate goes by: its own, then (with
+   * wake.requeue_marker) each id a marker says it was re-queued or
+   * re-checked as, breadth first, at most MAX_REQUEUE_IDS. A marker is a
+   * regular file inside wake.root (not a symlink) whose first line is a
+   * plain name; any other is passed over. Without the setting: its own only.
+   */
+  private requeuedIds(wake: string): string[] {
+    const template = this.options.settings.wake.requeueMarker;
+    const ids = [wake];
+    if (!template) return ids;
+    const ns: (string | undefined)[] = template.includes("{n}")
+      ? Array.from({ length: MAX_MARKER_N }, (_, i) => String(i + 1))
+      : [undefined];
+    for (let i = 0; i < ids.length && ids.length < MAX_REQUEUE_IDS; i++) {
+      for (const n of ns) {
+        const marker = this.templatePath(template, ids[i], n);
+        if (!marker.ok) continue;
+        const next = firstLineOf(marker.path, MARKER_MAX_BYTES);
+        if (next === null || !isPlainWake(next) || ids.includes(next)) continue;
+        ids.push(next);
+        if (ids.length >= MAX_REQUEUE_IDS) break;
+      }
+    }
+    return ids;
+  }
+
+  /** The wake file of an id the waiting line's gate was re-queued as, when it exists and is newer than `after`. */
+  private requeuedResult(wake: string, after: number): string | null {
+    if (!isPlainWake(wake) || !this.options.settings.wake.file) return null;
+    for (const id of this.requeuedIds(wake).slice(1)) {
+      const resolved = this.wakePath(id);
+      if (!resolved.ok) continue;
+      try {
+        if (lstatSync(resolved.path).mtimeMs > after) return resolved.path;
+      } catch {
+        // Not there yet
+      }
+    }
+    return null;
   }
 
   /** The wake file for a waiting line's capture: a plain name, inside wake.root. */
   private wakePath(value: string): { ok: true; path: string } | { ok: false; reason: string } {
-    if (!WAKE_VALUE.test(value) || value.includes("..")) {
+    if (!isPlainWake(value)) {
       return { ok: false, reason: "not a plain name (letters, digits, '.', '_' and '-', no '..', '/' or leading '-')" };
     }
+    return this.templatePath(this.options.settings.wake.file ?? "", value);
+  }
+
+  /** A wake template (wake.file, wake.requeue_marker) for one id: its placeholders filled, relative to repo, inside wake.root. */
+  private templatePath(template: string, wake: string, n?: string): { ok: true; path: string } | { ok: false; reason: string } {
     const { config, settings } = this.options;
-    const vars: Record<string, string> = { wake: value, gates_dir: config.gates_dir, agents_dir: config.agents_dir, repo: config.repo };
-    const fill = (template: string) => template.replace(/\{(wake|gates_dir|agents_dir|repo)\}/g, (match, name: string) => vars[name] ?? match);
+    const vars: Record<string, string> = { wake, gates_dir: config.gates_dir, agents_dir: config.agents_dir, repo: config.repo };
+    if (n !== undefined) vars.n = n;
+    const fill = (text: string) => text.replace(/\{(wake|n|gates_dir|agents_dir|repo)\}/g, (match, name: string) => vars[name] ?? match);
     const absolute = (path: string) => (isAbsolute(path) ? resolve(path) : resolve(config.repo, path));
     const root = absolute(fill(settings.wake.root));
-    const path = absolute(fill(settings.wake.file ?? ""));
+    const path = absolute(fill(template));
     if (!within(root, path)) return { ok: false, reason: `${path} is outside wake.root (${root})` };
     return { ok: true, path };
   }

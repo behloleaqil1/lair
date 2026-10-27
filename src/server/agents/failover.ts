@@ -56,6 +56,25 @@ export function matchFailover(lines: string[], settings: AgentsSettings): Failov
   return null;
 }
 
+/** How many of a dead run's last non-empty log lines are read for a transient error: the CLI's own last words */
+export const TRANSIENT_TAIL_LINES = 3;
+/** Each line is cut to this many characters before a pattern sees it */
+export const TRANSIENT_LINE_CHARS = 500;
+
+/**
+ * A transient network or provider error among a dead run's last log lines
+ * (newest first wins), by agents.transient_patterns: the line, or null.
+ * Bounded: the caller passes at most TRANSIENT_TAIL_LINES lines, and each
+ * is trimmed and cut to TRANSIENT_LINE_CHARS characters first.
+ */
+export function matchTransient(lines: string[], settings: AgentsSettings): string | null {
+  for (let i = lines.length - 1; i >= Math.max(0, lines.length - TRANSIENT_TAIL_LINES); i--) {
+    const line = lines[i].trim().slice(0, TRANSIENT_LINE_CHARS);
+    if (settings.transient.patterns.some((pattern) => pattern.test(line))) return line;
+  }
+  return null;
+}
+
 export interface ProfileChoice {
   /** The usable profile, or null when there is none */
   chosen: { index: number; profile: AgentProfile } | null;

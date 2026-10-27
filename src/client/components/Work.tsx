@@ -10,7 +10,7 @@
 import { useMemo, useState } from "react";
 import { useApi } from "../hooks/useApi";
 import { useDragonsWebSocket } from "../hooks/useWebSocket";
-import { fillDecisionHref, fillStateText, fillWaitingText, workRows, type WorkRow } from "../work-view";
+import { fillDecisionHref, fillStateText, fillWaitingText, unreachableText, workRows, type WorkRow } from "../work-view";
 import { hasStartableDragons } from "../dragon-start";
 import { startDragon } from "../owner-actions";
 import { failureMessage, postJson, releaseFillHoldAction, runConfirmed } from "../agents-actions";
@@ -185,6 +185,11 @@ export function Work({ project, refreshKey, route, modules, readOnly, open }: Se
           {message}
         </div>
       )}
+      {agents?.unreachable?.map((u) => (
+        <div key={u.provider} className="card" role="status" data-card="unreachable">
+          {unreachableText(u)}
+        </div>
+      ))}
       {showStart && agents && agents.agents.length > 0 && (
         <StartRunForm project={project} agents={agents.agents} refreshKey={refreshKey} onStarted={() => setBump((n) => n + 1)} />
       )}

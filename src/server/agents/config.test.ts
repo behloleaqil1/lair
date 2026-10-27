@@ -9,12 +9,14 @@ import {
   backoffMs,
   DEFAULT_BLOCKED_PATTERN,
   DEFAULT_DONE_PATTERN,
+  DEFAULT_TRANSIENT_PATTERNS,
   DEFAULT_WAITING_PATTERN,
   doneLineMatches,
   fillPatternFor,
   parseAgentsConfig,
   taskLineMatch,
 } from "./config.js";
+import { matchTransient } from "./failover.js";
 
 const project = {
   name: "Demo",
@@ -144,7 +146,15 @@ describe("agents config", () => {
       maxBackoffSeconds: 1800,
       waitingPattern: DEFAULT_WAITING_PATTERN,
       blockedPattern: DEFAULT_BLOCKED_PATTERN,
-      wake: { file: undefined, root: "{gates_dir}", pollSeconds: 60, maxWaitMinutes: 240, fallbackSeconds: 900 },
+      wake: {
+        file: undefined,
+        root: "{gates_dir}",
+        pollSeconds: 60,
+        maxWaitMinutes: 240,
+        maxQueueWaitMinutes: 1440,
+        requeueMarker: undefined,
+        fallbackSeconds: 900,
+      },
     });
     expect(errorsOf({ fill: { enabled: true } })).toEqual([
       "agents.fill.enabled: fill needs agents.enabled: true",
@@ -203,6 +213,16 @@ describe("agents config", () => {
     expect(errorsOf(wake({ root: "{wake}" }))[0]).toContain("agents.fill.wake.root: unknown placeholder {wake}");
     expect(errorsOf(wake({ poll_seconds: 0 }))[0]).toContain("agents.fill.wake.poll_seconds");
     expect(errorsOf(wake({ every: 1 }))[0]).toContain("agents.fill.wake");
+    // A re-queue marker: {wake} required, {n} allowed, inside the directories fill may read
+    expect(errorsOf(wake({ requeue_marker: "{gates_dir}/results/{wake}.recheck-{n}", max_queue_wait_minutes: 600 }))).toEqual([]);
+    expect(errorsOf(wake({ requeue_marker: "{gates_dir}/results/latest.recheck" }))).toEqual([
+      "agents.fill.wake.requeue_marker: needs {wake} (the gate id the marker is about)",
+    ]);
+    expect(errorsOf(wake({ requeue_marker: "{gates_dir}/../{wake}.recheck" }))).toEqual([
+      'agents.fill.wake.requeue_marker: a ".." segment is refused',
+    ]);
+    expect(errorsOf(wake({ requeue_marker: "{home}/{wake}" }))[0]).toContain("agents.fill.wake.requeue_marker: unknown placeholder {home}");
+    expect(errorsOf(wake({ max_queue_wait_minutes: 0 }))[0]).toContain("agents.fill.wake.max_queue_wait_minutes");
   });
 
   it("the default waiting and blocked patterns: the task's own line, the task id exact", () => {
@@ -323,6 +343,67 @@ describe("agents config", () => {
     expect(done("- DONE feat-login by worker-a 12:05Z: merged", "feat-login")).toBe(true);
     expect(done("- DONE feat-login-2 by worker-a", "feat-login")).toBe(false);
     expect(done("- DONE feat:login by worker-a", "feat")).toBe(false);
+  });
+
+  it("transient_patterns: defaults that look for an error, bounded in number and length, matched on a dead run's last 3 lines cut to 500 characters", () => {
+    const parsed = parseAgentsConfig({}, project);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const { settings } = parsed;
+    expect(settings.transient.patterns.map((p) => p.source)).toEqual(DEFAULT_TRANSIENT_PATTERNS);
+    expect(settings.transient.patterns.every((p) => p.flags === "i")).toBe(true);
+    expect(settings.transient).toMatchObject({ maxMinutes: 120, maxRetries: 5 });
+
+    // The line a real provider outage printed, and the usual network errors
+    const outage =
+      'Error: A network error occurred. Please check your connection and try again. (code -32000): {"errorType":"ClientNetworkError","retryErrorType":"TRANSIENT"}';
+    expect(matchTransient(["working on step 3", outage], settings)).toBe(outage);
+    for (const line of [
+      'retry failed: {"retryErrorType": "TRANSIENT"}',
+      "Error: read ECONNRESET",
+      "Error: connect ETIMEDOUT 10.0.0.1:443",
+      "Error: connect ECONNREFUSED 127.0.0.1:8443",
+      "getaddrinfo EAI_AGAIN api.example.com",
+      "Error: connection refused",
+      "HTTP 503 Service Unavailable",
+      "API returned status: 502",
+      "502 Bad Gateway",
+    ]) {
+      expect(matchTransient([line], settings)).toBe(line);
+    }
+    // An agent's own output in the same log: a word alone, or a test's assertion, is no outage
+    for (const line of [
+      "processed 1503 files",
+      "AssertionError: expected 503 to equal 200",
+      "expected 503 to equal 200",
+      "1 failed: the TRANSIENT retry case",
+      "handles ECONNRESET by retrying",
+      "Error: assertion failed in step 3",
+      "all 42 tests passed",
+    ]) {
+      expect(matchTransient([line], settings)).toBeNull();
+    }
+    // Bounded: the last 3 lines only, newest first, each trimmed and cut to 500 characters before a pattern sees it
+    expect(matchTransient([outage, "ok", "ok", "ok"], settings)).toBeNull();
+    expect(matchTransient([outage, "ok", "ok"], settings)).toBe(outage);
+    expect(matchTransient([`${"x".repeat(500)} ClientNetworkError`], settings)).toBeNull();
+    expect(matchTransient([`   ${"x".repeat(470)} ClientNetworkError   `], settings)).toBe(`${"x".repeat(470)} ClientNetworkError`);
+    // The retries per task are bounded too
+    expect(errorsOf({ transient_max_retries: 0 })).toEqual([]);
+    expect(errorsOf({ transient_max_retries: 51 })[0]).toMatch(/^agents\.transient_max_retries: /);
+    expect(errorsOf({ transient_max_retries: 1.5 })[0]).toMatch(/^agents\.transient_max_retries: /);
+    // Off with an empty list
+    const off = parseAgentsConfig({ transient_patterns: [] }, project);
+    expect(off.ok && matchTransient([outage], off.settings)).toBeNull();
+
+    // At most 50 patterns, each at most 300 characters, each a regular expression
+    expect(errorsOf({ transient_patterns: Array.from({ length: 50 }, (_, i) => `error ${i}`) })).toEqual([]);
+    expect(errorsOf({ transient_patterns: Array.from({ length: 51 }, (_, i) => `error ${i}`) })[0]).toMatch(/^agents\.transient_patterns: /);
+    expect(errorsOf({ transient_patterns: ["x".repeat(300)] })).toEqual([]);
+    expect(errorsOf({ transient_patterns: ["x".repeat(301)] })[0]).toMatch(/^agents\.transient_patterns\.0: /);
+    expect(errorsOf({ transient_patterns: ["", "ok"] })[0]).toMatch(/^agents\.transient_patterns\.0: /);
+    expect(errorsOf({ transient_patterns: ["(unclosed"] })[0]).toContain("agents.transient_patterns[0]: not a valid regular expression");
+    expect(errorsOf({ transient_max_minutes: 0 })[0]).toMatch(/^agents\.transient_max_minutes: /);
   });
 
   it("backs off exponentially, capped", () => {

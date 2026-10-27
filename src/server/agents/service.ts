@@ -19,8 +19,13 @@
  * - stopping: SIGTERM, then SIGKILL after stop_grace_seconds.
  * Failures restart with the same session up to recovery.same_session_restarts
  * times, then in a fresh session (the old one moved aside) with a resume
- * summary, then escalate to the Decision Inbox. Finally claims and locks whose
- * owner is dead are released and broken. Every step is recorded as an event.
+ * summary, then escalate to the Decision Inbox. A run that died of a
+ * transient network or provider error (agents.transient_patterns) is none of
+ * these: its provider is marked unreachable, starts on it wait (one tries it
+ * per backoff step, 60 s doubling to 15 min) until one works, nothing is
+ * counted, and only an outage past agents.transient_max_minutes raises one
+ * decision for the project. Finally claims and locks whose owner is dead are
+ * released and broken. Every step is recorded as an event.
  *
  * With agents.fill on, a second loop (fill.ts) requests runs itself from a
  * task list, through requestRun like any other in-process caller.
@@ -45,6 +50,7 @@ import type {
   FillLineView,
   FillStatusView,
   LockView,
+  ProviderUnreachableView,
   RunOrigin,
   StopReason,
 } from "../../shared/agents-types.js";
@@ -76,7 +82,7 @@ import {
   type DecisionInbox,
   type DecisionRequest,
 } from "./decisions.js";
-import { chooseProfile, matchFailover, profileLabel, profilesFor } from "./failover.js";
+import { chooseProfile, matchFailover, matchTransient, profileLabel, profilesFor, TRANSIENT_TAIL_LINES } from "./failover.js";
 import {
   AgentsFill,
   DECISION_FILL_KEEP,
@@ -142,6 +148,39 @@ export const DECISION_RELEASE = "release";
 export const DECISION_WAIT = "wait";
 export const DECISION_STOP = "stop";
 export const DECISION_ALLOW = "allow";
+export const DECISION_RETRY_NOW = "retry_now";
+
+/** A provider marked unreachable is tried by one start after this long, doubling per failed try, up to the max */
+export const TRANSIENT_BACKOFF_SECONDS = 60;
+export const TRANSIENT_MAX_BACKOFF_SECONDS = 900;
+/** Two agents' runs dying of transient errors this close together make the outage the fleet's */
+export const TRANSIENT_FLEET_WINDOW_SECONDS = 900;
+
+/**
+ * A provider's outage: runs on it died of transient errors
+ * (agents.transient_patterns), and nothing on it has worked since. Kept on
+ * each `transient` event (its data), so the newest one says where it stands.
+ * Until it is the fleet's, only the agents whose runs died wait.
+ */
+interface Outage {
+  provider: string;
+  /** The first transient failure of the outage */
+  since: number;
+  failures: number;
+  /** Backoff steps: the first failure, then each one at or after the next try (a try that failed) */
+  steps: number;
+  /** When one start may try the provider again */
+  nextTryAt: number;
+  /** The log line that matched last (agent CLI output: data) */
+  line: string;
+  /** The agents whose runs died of it (at most 50) */
+  agents: string[];
+  /** Every agent waits: two agents' runs died within TRANSIENT_FLEET_WINDOW_SECONDS, or a retry failed too */
+  fleet: boolean;
+  /** The latest failure, and whose run it was */
+  lastAt: number;
+  lastAgent: string;
+}
 
 /** The events shown as an agent's recoveries. */
 export const RECOVERY_KINDS: readonly AgentEventKind[] = [
@@ -161,6 +200,8 @@ export const RECOVERY_KINDS: readonly AgentEventKind[] = [
   "budget_exceeded",
   "budget_override",
   "decision",
+  "transient",
+  "transient_cleared",
 ];
 
 const BUS_EVENTS: Partial<Record<AgentEventKind, EventType>> = {
@@ -519,8 +560,9 @@ export class AgentsService {
     request: Omit<DecisionRequest, "project" | "requestedBy">,
     t: Tick,
     run?: AgentRun,
+    again = false,
   ): Promise<boolean> {
-    const raised = await this.raiseAt(request, t.now, run);
+    const raised = await this.raiseAt(request, t.now, run, again);
     if (raised) t.summary.escalations++;
     return raised;
   }
@@ -530,15 +572,18 @@ export class AgentsService {
    * while it is open or once it was answered. One the module withdrew (its
    * condition lifted) is raised again if the condition comes back, once per
    * withdrawn decision, so a refused inbox can't make it write the inbox
-   * file on every check. True when this call raised it.
+   * file on every check. With `again`, one that was answered is asked again
+   * too (once per answered decision, never while one is open): for a
+   * condition that outlasts its answer. True when this call raised it.
    */
   private async raiseAt(
     request: Omit<DecisionRequest, "project" | "requestedBy">,
     now: number,
     run?: AgentRun,
+    again = false,
   ): Promise<boolean> {
     const known = this.decisions().find?.(this.project, request.key) ?? null;
-    if (known && known.status !== "withdrawn") return false;
+    if (known && (known.status === "open" || (known.status !== "withdrawn" && !again))) return false;
     const dedupeKey = known ? `decision:${request.key}:after:${known.id}` : `decision:${request.key}`;
     if (this.store.hasEvent(this.project, dedupeKey)) return false;
     const full: DecisionRequest = { ...request, project: this.project, requestedBy: "agents" };
@@ -608,7 +653,21 @@ export class AgentsService {
    */
   private readonly mootBy: ReadonlyMap<string, (decision: Decision, rest: string) => string | null> = new Map([
     ["chain", (decision: Decision, chainId: string) => this.chainMoot(decision, chainId)],
+    ["transient", (decision: Decision, provider: string) => this.outageMoot(decision, provider)],
   ]);
+
+  /**
+   * A provider outage's decision (key `transient:<provider>:<since>`) is moot
+   * once that outage is over: a start worked (transient_cleared), or a newer
+   * outage of the provider began since.
+   */
+  private outageMoot(decision: Decision, provider: string): string | null {
+    const since = Number(decision.key.slice(decision.key.lastIndexOf(":") + 1));
+    const outage = this.outage(provider);
+    if (!outage) return `provider ${provider} is reachable again`;
+    if (outage.since !== since) return `that outage of provider ${provider} ended (another began ${iso(outage.since)})`;
+    return null;
+  }
 
   /**
    * A run chain's escalation or "every profile is failing" decision is moot
@@ -680,7 +739,9 @@ export class AgentsService {
    *   ends, "wait" keeps them waiting;
    * - a task fill holds for the owner: "start_again" releases the hold (if
    *   the run it was about is still the task's latest), "keep_held" makes it
-   *   the owner's pause (`paused`).
+   *   the owner's pause (`paused`);
+   * - a provider unreachable too long: "retry_now" lets every run waiting on
+   *   it start on the next check, "wait" keeps trying one start at a time.
    * A resume that can't happen (the task was claimed meanwhile, say) is
    * recorded, not retried, so the answer still counts as delivered.
    */
@@ -738,6 +799,22 @@ export class AgentsService {
       if (this.readOnly) return "the project is read_only: Lair starts no agents";
       await this.recordFillRelease(task, latest, "decision", t.now);
       return "fill starts the task again on its next check";
+    }
+    if (key.startsWith("transient:") && ref.startsWith("transient:")) {
+      if (optionId !== DECISION_RETRY_NOW) return "Lair keeps trying one start at a time";
+      const provider = ref.slice("transient:".length);
+      const outage = this.outage(provider);
+      if (!outage) return `provider ${provider} is reachable again: nothing to do`;
+      await this.record(
+        "transient_cleared",
+        {
+          subject: provider,
+          summary: `the owner chose to try provider ${provider} now: the runs waiting on it start on the next check`,
+          data: { provider, since: outage.since, failures: outage.failures, by: "owner" },
+        },
+        t.now,
+      );
+      return "the runs waiting on the provider start on the next check";
     }
     const chain = ref.startsWith("chain:") ? this.store.chainRuns(ref.slice("chain:".length)) : [];
     const latest = chain[chain.length - 1];
@@ -801,6 +878,7 @@ export class AgentsService {
         t.touchedTasks.add(run.task);
         await this.advance(run, t);
       }
+      await this.checkOutages(t);
       await this.reapClaims(t);
       await this.reapLocks(t);
       const activeChains = new Set(this.store.activeRuns(this.project).map((run) => run.chainId));
@@ -851,13 +929,24 @@ export class AgentsService {
     return until > now ? until : null;
   }
 
-  /** Why a profile can't be used now by `agent`, or null. */
-  private unusable(profile: AgentProfile, agent: string, now: number): string | null {
+  /**
+   * Why a profile can't be used now by `agent`, or null. A provider
+   * unreachable after transient errors (for this agent, or for every agent
+   * once the outage is the fleet's) is passed over like one cooling down, so
+   * a fallback on another provider wins; `outages: false` leaves that out.
+   */
+  private unusable(profile: AgentProfile, agent: string, now: number, outages = true): string | null {
     if (!getAdapter(profile.adapter, this.config)) return `adapter ${profile.adapter} is not defined`;
     const until = this.coolingUntil(profile.provider, agent, now);
     if (until !== null) return `provider ${profile.provider} is cooling down until ${iso(until)}`;
     if (this.budget && !this.budget.isProviderAvailable(profile.provider)) {
       return `the fleet budget has provider ${profile.provider} paused or rate limited`;
+    }
+    if (outages) {
+      const outage = this.outage(profile.provider);
+      if (outage && this.downFor(outage, agent)) {
+        return `provider ${profile.provider} unreachable since ${iso(outage.since)} (transient errors)`;
+      }
     }
     return null;
   }
@@ -908,9 +997,37 @@ export class AgentsService {
       await this.escalate(run, run.detail, t);
       return;
     }
-    const { chosen, skipped } = chooseProfile(profiles, Math.min(run.profileIndex, profiles.length - 1), true, (p) =>
-      this.unusable(p, run.agent, t.now),
-    );
+    // A provider unreachable after transient errors is passed over (unusable), so a fallback on another provider wins
+    const from = Math.min(run.profileIndex, profiles.length - 1);
+    const unreachable = (p: AgentProfile): Outage | null => {
+      const outage = this.outage(p.provider);
+      return outage && this.downFor(outage, run.agent) ? outage : null;
+    };
+    const choice = chooseProfile(profiles, from, true, (p) => this.unusable(p, run.agent, t.now));
+    let chosen = choice.chosen;
+    const skipped = choice.skipped;
+    if (!chosen) {
+      // With no other profile, the run waits the outage out on the first profile it is the only problem of: one start
+      // per backoff step tries it (the wait doesn't count toward start_timeout_minutes, and nothing is counted)
+      const order = [...profiles.keys()].slice(from).concat([...profiles.keys()].slice(0, from));
+      const index = order.find((i) => this.unusable(profiles[i], run.agent, t.now, false) === null && unreachable(profiles[i]) !== null);
+      const outage = index === undefined ? null : unreachable(profiles[index]);
+      if (index !== undefined && outage) {
+        const due = t.now >= outage.nextTryAt;
+        if (!due || this.probeInFlight(run, outage)) {
+          const detail = `not starting: provider ${outage.provider} unreachable since ${iso(outage.since)} (${outage.failures} transient failure(s)); ${due ? "another start is trying it now" : `next try at ${iso(outage.nextTryAt)}`}`;
+          if (run.state !== "queued" || run.detail !== detail || run.launchingSince !== undefined || run.waitingLock) {
+            run.state = "queued";
+            run.launchingSince = undefined;
+            run.waitingLock = undefined;
+            run.detail = detail;
+            this.store.saveRun(run);
+          }
+          return;
+        }
+        chosen = { index, profile: profiles[index] };
+      }
+    }
     if (!chosen) {
       const ends = profiles
         .map((p) => this.coolingUntil(p.provider, run.agent, t.now))
@@ -1315,6 +1432,7 @@ export class AgentsService {
       startRetries: prev.startRetries,
       launchFailures: 0,
       failovers: prev.failovers ?? 0,
+      transientRetries: prev.transientRetries,
       origin: prev.origin,
       queueMark: prev.queueMark,
       // A summary that never reached a running agent is still owed
@@ -1340,6 +1458,9 @@ export class AgentsService {
         : `its claim on task ${run.task} was released`;
       return this.stopRun(run, "lost_claim", why, [why], t);
     }
+
+    // A start that has lived past dead_on_start_seconds on a provider marked unreachable: it is reachable again
+    await this.noteReachable(run, t, false);
 
     // A rate limit or provider error at the end of a silent log
     const failover = this.failoverWhileAlive(run, t.now);
@@ -1369,7 +1490,11 @@ export class AgentsService {
       return null;
     }
     if (now - mtime < this.settings.failover.silenceSeconds * 1000) return null;
-    return matchFailover(lastLines(readTail(run.logPath, 8192), 1), this.settings);
+    const last = lastLines(readTail(run.logPath, 8192), 1);
+    // A transient error is handled as at an exit (finishStop): its provider counts as unreachable, nothing is counted
+    const transient = matchTransient(last, this.settings);
+    if (transient !== null) return { kind: "provider_error", line: transient, transient: true };
+    return matchFailover(last, this.settings);
   }
 
   private async stopRun(run: AgentRun, reason: StopReason, detail: string, evidence: string[], t: Tick): Promise<void> {
@@ -1415,8 +1540,15 @@ export class AgentsService {
     switch (run.stopReason) {
       case "lost_claim":
         return this.endRun(run, "lost_claim", `stopped: ${detail}`, t, false);
-      case "failover":
-        return this.failover(run, run.failover ?? { kind: "provider_error", line: detail }, t);
+      case "failover": {
+        const info: FailoverInfo = run.failover ?? { kind: "provider_error", line: detail };
+        // Its silent log ended on a transient error: waited out as at an exit, while the chain has transient retries left
+        const used = this.transientRetriesUsed(run, t.now);
+        if (info.transient && used < this.settings.transient.maxRetries) {
+          return this.transientRetry(run, info.line, "stopped: its log went silent on it", used, t);
+        }
+        return this.failover(run, info, t);
+      }
       case "fresh_session":
         return this.recover(run, "fresh_session", detail, evidence, t);
       default:
@@ -1459,16 +1591,28 @@ export class AgentsService {
       // Its claim went first: the task isn't this run's to restart
       return this.endRun(run, "lost_claim", "the process ended after its claim was released", t, false);
     }
-    if (code === 0) return this.endRun(run, "completed", "exited 0", t, true);
+    if (code === 0) {
+      await this.noteReachable(run, t, true);
+      return this.endRun(run, "completed", "exited 0", t, true);
+    }
     if (code === undefined) return this.unsupervisedExit(run, t);
     const tail = run.logPath ? readTail(run.logPath, 64 * 1024) : "";
+    const exit = code === null ? "ended by a signal" : `exit code ${code}`;
+    // A transient network or provider error is waited out, never a recovery attempt, while the chain has transient
+    // retries left (its provider counts as unreachable, so the next attempt moves to a fallback when there is one)
+    const transient = matchTransient(lastLines(tail, TRANSIENT_TAIL_LINES), this.settings);
+    const used = this.transientRetriesUsed(run, t.now);
+    if (transient !== null && used < this.settings.transient.maxRetries) return this.transientRetry(run, transient, exit, used, t);
     const failover = matchFailover(lastLines(tail, 20), this.settings);
     if (failover) return this.failover(run, failover, t);
 
-    const exit = code === null ? "ended by a signal" : `exit code ${code}`;
     const lived = t.now - (run.spawnedAt ?? t.now);
     const empty = run.logPath ? fileSize(run.logPath) === 0 : true;
-    const evidence = [`pid ${run.pid} ${exit}`, ...lastLines(tail, 10).map((line) => `log: ${oneLine(line)}`)];
+    const evidence = [
+      `pid ${run.pid} ${exit}`,
+      ...this.transientCapNote(transient, used),
+      ...lastLines(tail, 10).map((line) => `log: ${oneLine(line)}`),
+    ];
     if (empty || lived < this.settings.deadOnStartSeconds * 1000) {
       const why = empty
         ? `died with an empty log ${seconds(lived)} after it started (${exit})`
@@ -1501,9 +1645,15 @@ export class AgentsService {
       });
     }
     const tail = run.logPath ? readTail(run.logPath, 64 * 1024) : "";
+    const transient = matchTransient(lastLines(tail, TRANSIENT_TAIL_LINES), this.settings);
+    const used = this.transientRetriesUsed(run, t.now);
+    if (transient !== null && used < this.settings.transient.maxRetries) {
+      return this.transientRetry(run, transient, "its exit status is unknown", used, t);
+    }
     const evidence = [
       `pid ${run.pid}: its exit status is unknown (it ended while Lair wasn't supervising it)`,
       "no DONE, WAITING or BLOCKED line of its own for the task since its chain was requested",
+      ...this.transientCapNote(transient, used),
       ...lastLines(tail, 10).map((line) => `log: ${oneLine(line)}`),
     ];
     return this.recover(
@@ -1841,6 +1991,285 @@ export class AgentsService {
       t,
       run,
     );
+  }
+
+  // ============ TRANSIENT ERRORS ============
+
+  /** The provider's outage now (its newest transient or transient_cleared event decides), or null when it is reachable. */
+  private outage(provider: string): Outage | null {
+    const [latest] = this.store.listEvents(this.project, { kinds: ["transient", "transient_cleared"], subject: provider, limit: 1 });
+    if (!latest || latest.kind !== "transient") return null;
+    const data = latest.data;
+    const num = (value: unknown, fallback: number) => (typeof value === "number" && Number.isFinite(value) ? value : fallback);
+    const agents = Array.isArray(data.agents) ? data.agents.filter((a): a is string => typeof a === "string") : [];
+    return {
+      provider,
+      since: num(data.since, latest.at),
+      failures: num(data.failures, 1),
+      steps: num(data.steps, 1),
+      nextTryAt: num(data.nextTryAt, latest.at),
+      line: typeof data.line === "string" ? data.line : "",
+      agents: agents.length > 0 ? agents : latest.agent ? [latest.agent] : [],
+      fleet: data.fleet === true,
+      lastAt: latest.at,
+      lastAgent: latest.agent ?? "",
+    };
+  }
+
+  /** Whether `agent`'s starts on the provider wait: every agent's once the outage is the fleet's, else only its own. */
+  private downFor(outage: Outage, agent: string): boolean {
+    return outage.fleet || outage.agents.includes(agent);
+  }
+
+  /**
+   * Another run already tries the provider in this backoff step: running (or
+   * stopping), started at or after the step's next try. For an outage that
+   * is only some agents' so far, only the agent's own runs count. A run that
+   * waits on a lock is no try: it holds nothing up.
+   */
+  private probeInFlight(run: AgentRun, outage: Outage): boolean {
+    return this.store
+      .activeRuns(this.project)
+      .some(
+        (other) =>
+          other.id !== run.id &&
+          other.profile.provider === outage.provider &&
+          (outage.fleet || other.agent === run.agent) &&
+          (other.state === "running" || other.state === "stopping") &&
+          other.spawnedAt !== undefined &&
+          other.spawnedAt >= outage.nextTryAt,
+      );
+  }
+
+  /** The run's log was written after `after`, and its newest lines are not a transient error (a CLI retrying on its own). */
+  private wroteSince(run: AgentRun, after: number): boolean {
+    if (!run.logPath) return false;
+    try {
+      if (statSync(run.logPath).mtimeMs <= after) return false;
+    } catch {
+      return false;
+    }
+    return matchTransient(lastLines(readTail(run.logPath, 8192), TRANSIENT_TAIL_LINES), this.settings) === null;
+  }
+
+  /**
+   * A live run shows the provider works: one started during the outage that
+   * is alive past dead_on_start_seconds (or exited 0), or one started before
+   * it that is still writing its log since the latest transient failure. The
+   * provider is reachable again for every agent: the runs waiting on it
+   * start on the next check, and the next outage's backoff starts afresh.
+   */
+  private async noteReachable(run: AgentRun, t: Tick, exitedZero: boolean): Promise<void> {
+    if (run.spawnedAt === undefined) return;
+    const outage = this.outage(run.profile.provider);
+    if (!outage) return;
+    const lived = t.now - run.spawnedAt;
+    const startedSince = run.spawnedAt >= outage.since;
+    const how =
+      startedSince && (exitedZero || lived >= this.settings.deadOnStartSeconds * 1000)
+        ? exitedZero
+          ? "exited 0"
+          : `has run ${seconds(lived)}`
+        : !startedSince && this.wroteSince(run, outage.lastAt)
+          ? "is still writing its log"
+          : null;
+    if (how === null) return;
+    await this.record(
+      "transient_cleared",
+      {
+        agent: run.agent,
+        task: run.task,
+        runId: run.id,
+        subject: outage.provider,
+        summary: `provider ${outage.provider} is reachable again: run ${short(run.id)} of ${run.agent} ${how}; starts on it go ahead`,
+        evidence: [`unreachable since ${iso(outage.since)}, ${outage.failures} transient failure(s)`],
+        data: { provider: outage.provider, since: outage.since, failures: outage.failures, by: startedSince ? "start" : "log" },
+      },
+      t.now,
+    );
+  }
+
+  /**
+   * The transient retries the run's chain has used, which the run may add
+   * one to while under agents.transient_max_retries: every attempt of the
+   * chain carries the count, and only a run that lived
+   * agents.transient_max_minutes (real work before this outage) starts it
+   * again. So an agent whose own output looks transient gets a few retries,
+   * then normal recovery and escalation.
+   */
+  private transientRetriesUsed(run: AgentRun, now: number): number {
+    const lived = run.spawnedAt === undefined ? 0 : now - run.spawnedAt;
+    return lived >= this.settings.transient.maxMinutes * 60000 ? 0 : (run.transientRetries ?? 0);
+  }
+
+  /** The note a recovery event gets when a transient match no longer counts: the chain used its transient retries. */
+  private transientCapNote(line: string | null, used: number): string[] {
+    if (line === null) return [];
+    return [
+      `a transient error, but this task used its transient retries (${used} of agents.transient_max_retries ${this.settings.transient.maxRetries}): ${oneLine(line)}`,
+    ];
+  }
+
+  /**
+   * A run that died of a transient network or provider error
+   * (agents.transient_patterns), while its chain has transient retries left:
+   * not a recovery attempt. The provider is marked unreachable for the
+   * run's agent, and for every agent once the outage is the fleet's: a
+   * second agent's run dies the same way within TRANSIENT_FLEET_WINDOW, or a
+   * retry fails too. A failure at or after the next try is a failed try, and
+   * the backoff doubles. The task's next attempt is queued at once with the
+   * same counters and goes through launch, where a fallback on another
+   * provider wins and, with none, it waits its turn. Nothing counts toward
+   * recovery, failover or escalation. A run that died on start starts again
+   * as it would have (with any resume summary it was owed); one that ran a
+   * while resumes its session.
+   */
+  private async transientRetry(run: AgentRun, line: string, exit: string, used: number, t: Tick): Promise<void> {
+    const provider = run.profile.provider;
+    const lived = run.spawnedAt === undefined ? 0 : t.now - run.spawnedAt;
+    run.state = "failed";
+    run.endedAt = t.now;
+    run.detail = `transient: provider ${provider} unreachable (${exit}): ${oneLine(line)}`;
+    this.releaseRunLocks(run);
+    // The server keeps the task between attempts
+    this.store.transferClaim(this.project, run.task, run.id, run.id, this.probes.self);
+    t.summary.ended++;
+
+    const previous = this.outage(provider);
+    const tried = previous !== null && t.now >= previous.nextTryAt;
+    const steps = previous === null ? 1 : tried ? previous.steps + 1 : previous.steps;
+    const since = previous?.since ?? t.now;
+    const nextTryAt =
+      previous !== null && !tried ? previous.nextTryAt : t.now + backoffMs(steps, TRANSIENT_BACKOFF_SECONDS, TRANSIENT_MAX_BACKOFF_SECONDS);
+    const failures = (previous?.failures ?? 0) + 1;
+    const agents = previous === null ? [run.agent] : previous.agents.includes(run.agent) ? previous.agents : [...previous.agents, run.agent].slice(-50);
+    // The fleet's outage: a second agent within the window, or a try (this agent's own retry) that failed too
+    const fleet =
+      previous !== null &&
+      (previous.fleet ||
+        (tried && previous.agents.includes(run.agent)) ||
+        (previous.lastAgent !== run.agent && t.now - previous.lastAt <= TRANSIENT_FLEET_WINDOW_SECONDS * 1000));
+    await this.record(
+      "transient",
+      {
+        agent: run.agent,
+        task: run.task,
+        runId: run.id,
+        subject: provider,
+        summary: `${run.agent} on ${run.task}: provider ${provider} unreachable (${exit}); waiting it out${fleet ? " (every agent)" : ""}, next try at ${iso(nextTryAt)} (not counted as a recovery; transient retry ${used + 1} of ${this.settings.transient.maxRetries})`,
+        evidence: [`pid ${run.pid} ${exit} after ${seconds(lived)}`, `log: ${oneLine(line)}`],
+        data: { provider, line: oneLine(line, 500), since, failures, steps, nextTryAt, agents, fleet, exitCode: run.exitCode ?? null },
+      },
+      t.now,
+    );
+
+    const next = this.followUp(run, t.now, t.now);
+    next.transientRetries = used + 1;
+    if (run.spawnedAt !== undefined && lived >= this.settings.deadOnStartSeconds * 1000) {
+      next.sessionMode = "resume";
+    } else {
+      // It never got going: what it was owed (a fresh session's summary) is still owed
+      next.resumeSummary = run.resumeSummary;
+    }
+    next.detail = `waiting: provider ${provider} unreachable since ${iso(since)}; next try at ${iso(nextTryAt)}`;
+    this.store.saveRun(run);
+    this.store.insertRun(next);
+    this.store.transferClaim(this.project, run.task, run.id, next.id, this.probes.self);
+  }
+
+  /**
+   * A provider unreachable for the fleet for agents.transient_max_minutes,
+   * with runs waiting on it: one decision for the project per outage (per
+   * provider and outage start), never one per agent or task. While it is
+   * open, nothing more is raised; once answered ("Keep waiting"), it is
+   * asked again after each further transient_max_minutes. Once the outage
+   * is over, an open one is withdrawn (mootBy).
+   */
+  private async checkOutages(t: Tick): Promise<void> {
+    const waiting = new Map<string, AgentRun[]>();
+    for (const run of this.store.activeRuns(this.project)) {
+      if (run.state !== "queued" && run.state !== "waiting_lock") continue;
+      waiting.set(run.profile.provider, [...(waiting.get(run.profile.provider) ?? []), run]);
+    }
+    const max = this.settings.transient.maxMinutes * 60000;
+    for (const [provider, runs] of waiting) {
+      const outage = this.outage(provider);
+      if (!outage || !outage.fleet || t.now - outage.since < max) continue;
+      const minutes = Math.round((t.now - outage.since) / 60000);
+      const key = `transient:${provider}:${outage.since}`;
+      // Answered ("Keep waiting") and the outage goes on: asked again once another transient_max_minutes has passed
+      const known = this.decisions().find?.(this.project, key) ?? null;
+      const answered = known !== null && known.status !== "open" && known.status !== "withdrawn";
+      if (known && answered && t.now - Date.parse(known.answeredAt ?? known.closedAt ?? known.createdAt) < max) continue;
+      await this.raise(
+        {
+          kind: "escalation",
+          key,
+          ref: `transient:${provider}`,
+          blocks: runs.slice(0, 50).map((r) => `agents:${this.project}:task:${r.task}`),
+          question: `Provider ${provider} has been unreachable for ${minutes} min (since ${iso(outage.since)}): ${runs.length} run(s) wait for it`,
+          context: [
+            `${outage.failures} start(s) on ${provider} died of a transient network or provider error (agents.transient_patterns), and none has worked since ${iso(outage.since)}. Nothing was counted as a failure.`,
+            `Lair tries one start at a time, every ${TRANSIENT_MAX_BACKOFF_SECONDS / 60} minutes at most; the next at ${iso(outage.nextTryAt)}.`,
+            "",
+            "The last error line:",
+            "",
+            "```text",
+            oneLine(outage.line, 300).replace(/`/g, "'"),
+            "```",
+            "",
+            "Waiting:",
+            ...runs.slice(0, 20).map((r) => `- ${r.agent} on ${r.task} (run ${short(r.id)})`),
+            ...(runs.length > 20 ? [`- and ${runs.length - 20} more`] : []),
+          ].join("\n"),
+          options: [
+            {
+              id: DECISION_WAIT,
+              label: "Keep waiting",
+              consequences: `Lair keeps trying one start on ${provider} at a time; the waiting runs start once one works. If it is still down after another ${this.settings.transient.maxMinutes} minutes, Lair asks again.`,
+            },
+            {
+              id: DECISION_RETRY_NOW,
+              label: "Try now",
+              consequences: `Every run waiting on ${provider} starts on the next check (choose this once the network or the provider is back). If they fail the same way, they wait again.`,
+            },
+          ],
+          recommended: DECISION_WAIT,
+          why: `Network and provider outages usually end on their own, and nothing waiting is counted against a task; this one has lasted longer than agents.transient_max_minutes (${this.settings.transient.maxMinutes}).`,
+          reversible: true,
+        },
+        t,
+        undefined,
+        answered,
+      );
+    }
+  }
+
+  /** The providers marked unreachable now (any of the agents' profiles or active runs), for the status view. */
+  private unreachableViews(agents: AgentView[]): ProviderUnreachableView[] {
+    const active = this.store.activeRuns(this.project);
+    const providers = new Set([...agents.flatMap((a) => a.profiles.map((p) => p.provider)), ...active.map((r) => r.profile.provider)]);
+    const views: ProviderUnreachableView[] = [];
+    for (const provider of [...providers].sort()) {
+      const outage = this.outage(provider);
+      if (!outage) continue;
+      views.push({
+        provider,
+        since: iso(outage.since),
+        failures: outage.failures,
+        nextTryAt: iso(outage.nextTryAt),
+        line: outage.line,
+        fleet: outage.fleet,
+        agents: outage.agents,
+        waiting: active.filter(
+          (r) =>
+            r.profile.provider === provider &&
+            (r.state === "queued" || r.state === "waiting_lock") &&
+            this.downFor(outage, r.agent),
+        ).length,
+      });
+    }
+    return views;
   }
 
   // ============ USAGE AND BUDGETS ============
@@ -2289,6 +2718,7 @@ export class AgentsService {
       locks: this.lockViews(snap),
       projectBudget,
       fill: this.fillStatus(),
+      unreachable: this.unreachableViews(agents),
     };
   }
 

@@ -15,6 +15,7 @@ import type {
   ClaimView,
   FillLineView,
   FillWaitingView,
+  ProviderUnreachableView,
 } from "../shared/agents-types";
 import { modelLabel, runningLabel } from "./dragon-view";
 import { linkTo } from "./router";
@@ -162,14 +163,28 @@ export function fillDecisionHref(line: Pick<FillLineView, "decisionId">): string
   return line.decisionId ? linkTo("decisions", line.decisionId) : null;
 }
 
-/** A WAITING line's wait in one line: what it names, since when, and when fill starts it again without it. */
+/**
+ * A WAITING line's wait in one line: what it names, since when, whether its
+ * gate is still in the gate queue (a live wait), and when fill starts it
+ * again without it.
+ */
 export function fillWaitingText(waiting: FillWaitingView | null, now: number = Date.now()): string | null {
   if (!waiting) return null;
   const on = waiting.wake ? `Waiting on ${waiting.wake}` : "Waiting on nothing it named";
   const parts = [`${on} since ${relativeTime(waiting.since, now)}`];
+  const q = waiting.queued;
+  if (q) parts.push(`${q.requeuedFrom ? `re-queued as ${q.gate}, ` : ""}still ${q.status} in ${q.lane} since ${relativeTime(q.since, now)}`);
   if (waiting.refused) parts.push(`not used: ${waiting.refused}`);
   if (waiting.fallbackAt) parts.push(`fill starts it again ${relativeTime(waiting.fallbackAt, now)} without it`);
   return parts.join("; ");
+}
+
+/** A provider whose starts wait after transient errors, in one line. */
+export function unreachableText(u: ProviderUnreachableView, now: number = Date.now()): string {
+  const who = u.fleet ? "every agent waits" : `${u.agents.join(", ")} wait${u.agents.length === 1 ? "s" : ""}`;
+  const failures = `${u.failures} transient failure${u.failures === 1 ? "" : "s"}`;
+  const runs = `${u.waiting} run${u.waiting === 1 ? "" : "s"} waiting`;
+  return `Provider ${u.provider} unreachable since ${relativeTime(u.since, now)} (${failures}): ${who}, ${runs}; next try ${relativeTime(u.nextTryAt, now)}`;
 }
 
 const FILL_BADGE: Record<string, string> = {

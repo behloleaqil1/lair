@@ -59,6 +59,8 @@ export interface StoredLockWait {
 export interface FailoverInfo {
   kind: "rate_limit" | "provider_error";
   line: string;
+  /** The line is a transient error (agents.transient_patterns): waited out, not failed over */
+  transient?: boolean;
 }
 
 export interface AgentRun {
@@ -114,6 +116,11 @@ export interface AgentRun {
   origin?: RunOrigin;
   /** The queue file when the chain was requested (kept by every attempt) */
   queueMark?: QueueMark;
+  /**
+   * Transient retries the chain has used (agents.transient_max_retries):
+   * kept by every attempt, so an agent's own output can't buy endless ones
+   */
+  transientRetries?: number;
 }
 
 export interface Claim {

@@ -38,6 +38,28 @@ export const DEFAULT_PROVIDER_ERROR_PATTERNS = [
   "\\b(status|http)\\W*5(00|02|03|04|29)\\b",
 ];
 
+/**
+ * Lines that mean the provider or the network is unreachable for a while
+ * (matched case-insensitively against a dead run's last 3 log lines): the
+ * run is waited out and tried again, not counted as a recovery or a
+ * failover. Like the failover patterns they look for an error, not a word
+ * alone: an agent's own test output ("expected 503 to equal 200") is mixed
+ * into the same log.
+ */
+export const DEFAULT_TRANSIENT_PATTERNS = [
+  '"retryErrorType"\\s*:\\s*"TRANSIENT"',
+  "\\bClientNetworkError\\b",
+  "\\bnetwork error occurred\\b",
+  "\\berror\\b.*\\b(ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN)\\b",
+  "\\bgetaddrinfo\\s+(EAI_AGAIN|ENOTFOUND)\\b",
+  "\\berror\\b.*\\bconnection (refused|reset)\\b",
+  "\\b(status|http)\\W*50[23]\\b",
+  "\\b(502 bad gateway|503 service unavailable)\\b",
+];
+/** At most this many transient_patterns, each at most this many characters */
+export const MAX_TRANSIENT_PATTERNS = 50;
+export const MAX_TRANSIENT_PATTERN_CHARS = 300;
+
 const LimitSchema = z
   .object({
     soft: z.number().positive().optional(),
@@ -91,8 +113,15 @@ const WakeSchema = z
     root: z.string().min(1).default("{gates_dir}"),
     /** How often fill looks for the file, per task */
     poll_seconds: z.number().int().min(1).max(3600).default(60),
-    /** Waiting this long raises one decision */
+    /** Waiting this long raises one decision (time while the awaited gate is still in the gate queue doesn't count) */
     max_wait_minutes: z.number().positive().default(240),
+    /** Waiting this long holds the task even while its gate is still in the gate queue (never less than max_wait_minutes) */
+    max_queue_wait_minutes: z.number().positive().default(1440),
+    /**
+     * A marker naming, on its first line, the id a gate was re-queued (or re-checked) as: {wake} (required),
+     * {n} (1-9), {gates_dir}, {agents_dir}, {repo}; inside wake.root
+     */
+    requeue_marker: z.string().min(1).max(500).optional(),
     /** With nothing to wait on (no capture, or no wake.file), the task starts again after this long */
     fallback_seconds: z.number().min(0).default(900),
   })
@@ -192,6 +221,15 @@ export const AgentsSchema = z
       })
       .strict()
       .default({}),
+    /** A dead run whose last log lines match one of these waits the outage out (not a recovery, failover or escalation) */
+    transient_patterns: z
+      .array(z.string().min(1).max(MAX_TRANSIENT_PATTERN_CHARS))
+      .max(MAX_TRANSIENT_PATTERNS)
+      .default(DEFAULT_TRANSIENT_PATTERNS),
+    /** A provider failing transiently this long, with no start that worked, raises one decision for the project */
+    transient_max_minutes: z.number().positive().default(120),
+    /** Transient retries per task (chain of runs); past them a transient death is recovered and escalated as any other */
+    transient_max_retries: z.number().int().min(0).max(50).default(5),
     /** Regular expressions with named groups (?<tokens>...) and/or (?<cost>...), read from run logs */
     usage_patterns: z.array(z.string().min(1)).default([]),
     /** Adapter id -> provider name (default: the adapter id) */
@@ -233,6 +271,8 @@ export interface FillSettings {
     root: string;
     pollSeconds: number;
     maxWaitMinutes: number;
+    maxQueueWaitMinutes: number;
+    requeueMarker?: string;
     fallbackSeconds: number;
   };
 }
@@ -358,6 +398,8 @@ export interface AgentsSettings {
     cooldownMinutes: number;
     maxFailovers: number;
   };
+  /** agents.transient_patterns (compiled case-insensitive), agents.transient_max_minutes and agents.transient_max_retries */
+  transient: { patterns: RegExp[]; maxMinutes: number; maxRetries: number };
   /** Usage patterns, compiled case-insensitive and global */
   usagePatterns: RegExp[];
   providers: Record<string, string>;
@@ -427,6 +469,7 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
     "agents.failover.provider_error_patterns",
     errors,
   );
+  const transientPatterns = compile(value.transient_patterns, "i", "agents.transient_patterns", errors);
   const usagePatterns = compile(value.usage_patterns, "gi", "agents.usage_patterns", errors);
   value.usage_patterns.forEach((pattern, i) => {
     if (!pattern.includes("(?<tokens>") && !pattern.includes("(?<cost>")) {
@@ -521,6 +564,7 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         cooldownMinutes: value.failover.cooldown_minutes,
         maxFailovers: value.failover.max_failovers,
       },
+      transient: { patterns: transientPatterns, maxMinutes: value.transient_max_minutes, maxRetries: value.transient_max_retries },
       usagePatterns,
       providers: value.providers,
       fallbacks: value.fallbacks,
@@ -548,6 +592,8 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
           root: value.fill.wake.root,
           pollSeconds: value.fill.wake.poll_seconds,
           maxWaitMinutes: value.fill.wake.max_wait_minutes,
+          maxQueueWaitMinutes: value.fill.wake.max_queue_wait_minutes,
+          requeueMarker: value.fill.wake.requeue_marker,
           fallbackSeconds: value.fill.wake.fallback_seconds,
         },
       },
@@ -588,6 +634,12 @@ function checkFill(value: RawSettings, errors: string[]): void {
   }
   checkPlaceholders(wake.root, ["gates_dir", "agents_dir", "repo"], "agents.fill.wake.root", errors);
   if (wake.root.split(/[\\/]/).includes("..")) errors.push('agents.fill.wake.root: a ".." segment is refused');
+  if (wake.requeue_marker !== undefined) {
+    const where = "agents.fill.wake.requeue_marker";
+    checkPlaceholders(wake.requeue_marker, ["wake", "n", "gates_dir", "agents_dir", "repo"], where, errors);
+    if (!wake.requeue_marker.includes("{wake}")) errors.push(`${where}: needs {wake} (the gate id the marker is about)`);
+    if (wake.requeue_marker.split(/[\\/]/).includes("..")) errors.push(`${where}: a ".." segment is refused`);
+  }
 }
 
 /**

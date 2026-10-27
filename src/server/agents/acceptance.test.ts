@@ -18,8 +18,10 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
 } from "fs";
@@ -295,7 +297,12 @@ function makePaths(): Paths {
   return paths;
 }
 
-function projectConfig(paths: Paths, agents: Record<string, unknown> | undefined, readOnly = false): ProjectConfig {
+function projectConfig(
+  paths: Paths,
+  agents: Record<string, unknown> | undefined,
+  readOnly = false,
+  moreDragons: Record<string, unknown> = {},
+): ProjectConfig {
   const config = {
     name: "Demo",
     repo: paths.dir,
@@ -310,6 +317,7 @@ function projectConfig(paths: Paths, agents: Record<string, unknown> | undefined
     dragons: {
       "worker-a": { name: "A", model: "model-a", machine: "local", instructions: "", adapter: "test-cli" },
       "worker-b": { name: "B", model: "model-a", machine: "local", instructions: "", adapter: "test-cli" },
+      ...moreDragons,
     },
     agent_adapters: ADAPTERS,
     agents,
@@ -319,10 +327,18 @@ function projectConfig(paths: Paths, agents: Record<string, unknown> | undefined
 
 function setup(
   agents: (p: Paths) => Record<string, unknown> = () => ({}),
-  options: { paths?: Paths; self?: ProcessOwner; readOnly?: boolean; budget?: BudgetManager; decisions?: DecisionInbox } = {},
+  options: {
+    paths?: Paths;
+    self?: ProcessOwner;
+    readOnly?: boolean;
+    budget?: BudgetManager;
+    decisions?: DecisionInbox;
+    /** Dragons beside worker-a and worker-b */
+    dragons?: Record<string, unknown>;
+  } = {},
 ): Harness {
   const paths = options.paths ?? makePaths();
-  const config = projectConfig(paths, { ...BASE, ...agents(paths) }, options.readOnly);
+  const config = projectConfig(paths, { ...BASE, ...agents(paths) }, options.readOnly, options.dragons);
   const clock = new FakeClock();
   const procs = new FakeProcessTable(clock);
   const spawner = new FakeSpawner(procs, clock);
@@ -1142,6 +1158,336 @@ describe("5. provider errors and rate limits fail over to the next configured pr
     expect(h.spawner.calls).toHaveLength(4);
     expect(h.spawner.calls[3]).toMatchObject({ argv: expect.arrayContaining(["agent-cli"]), env: expect.objectContaining({ LAIR_AGENT: "worker-b" }) });
     expect(eventsOf(h, "failover").filter((e) => e.agent === "worker-b")).toEqual([]);
+  });
+});
+
+// ============ 5a. TRANSIENT ERRORS ============
+
+describe("5a. transient provider and network errors are waited out, within bounds", () => {
+  /** What an agent CLI prints when the provider's network is down, then it exits 1 within seconds */
+  const NETWORK_ERROR =
+    'Error: A network error occurred. Please check your connection and try again. (code -32000): {"errorType":"ClientNetworkError","retryErrorType":"TRANSIENT"}';
+  /** Every start writes the network error and dies at once */
+  const networkDown = (h: Harness) => {
+    h.spawner.behaviour = (pid, log) => {
+      writeLog(h.clock, log, `${NETWORK_ERROR}\n`);
+      h.spawner.exit(pid, 1);
+    };
+  };
+  const NOT_COUNTED: AgentEventKind[] = ["dead_on_start", "crashed", "restart_same_session", "fresh_session", "failover", "escalated"];
+  const dragon = (id: string) => ({ name: id, model: "model-a", machine: "local", instructions: "", adapter: "test-cli" });
+  const iso = (ms: number) => new Date(NOW + ms).toISOString();
+
+  it("a run that dies on a transient error waits it out with backoff (60 s doubling, up to 15 min), counted nowhere, until its task's transient retries are used up", async () => {
+    const h = setup();
+    networkDown(h);
+    const spawnedAt: number[] = [];
+    const behaviour = h.spawner.behaviour;
+    h.spawner.behaviour = (pid, log, call) => {
+      spawnedAt.push((h.clock.now() - NOW) / SEC);
+      behaviour?.(pid, log, call);
+    };
+    const run = await request(h);
+    await at(h, 0); // it starts, and dies at once
+    await at(h, 0); // its end is seen: a transient failure, not a death on start
+
+    const [first, next] = runs(h);
+    expect(first).toMatchObject({ state: "failed" });
+    expect(first.detail).toBe(`transient: provider provider-a unreachable (exit code 1): ${NETWORK_ERROR}`);
+    expect(next).toMatchObject({ state: "queued", chainId: run.chainId, sessionMode: "new", sameSessionRestarts: 0, freshSessions: 0, failovers: 0, transientRetries: 1 });
+    expect(next.detail).toBe("waiting: provider provider-a unreachable since 2026-03-02T12:00:00.000Z; next try at 2026-03-02T12:01:00.000Z");
+    expect(h.store.getClaim("demo", "feat-login")).toMatchObject({ runId: next.id, ownerPid: SELF.pid });
+    // One agent's death is its own wait, not yet the fleet's
+    expect(h.service.status().unreachable).toMatchObject([{ provider: "provider-a", fleet: false, agents: ["worker-a"], waiting: 1 }]);
+
+    // Checks every 10 s for 33 minutes
+    for (let s = 10; s <= 1960; s += 10) {
+      await at(h, s * SEC);
+      if (s === 1000) {
+        // Five transient failures so far, none counted; its own retry failed too, so the outage is the fleet's
+        for (const kind of NOT_COUNTED) expect(eventsOf(h, kind)).toEqual([]);
+        const status = h.service.status();
+        expect(status.unreachable).toEqual([
+          {
+            provider: "provider-a",
+            since: iso(0),
+            failures: 5,
+            nextTryAt: iso(1840 * SEC),
+            line: NETWORK_ERROR,
+            fleet: true,
+            agents: ["worker-a"],
+            waiting: 1,
+          },
+        ]);
+        expect(agentView(status, "worker-a").detail).toBe(
+          `not starting: provider provider-a unreachable since ${iso(0)} (5 transient failure(s)); next try at ${iso(1840 * SEC)}`,
+        );
+      }
+    }
+
+    // One try per step: 60 s, then doubling, capped at 15 minutes
+    const failures = eventsOf(h, "transient");
+    expect(failures.map((e) => ((e.data.nextTryAt as number) - e.at) / SEC)).toEqual([60, 120, 240, 480, 900]);
+    expect(failures.map((e) => [e.data.steps, e.data.fleet])).toEqual([
+      [1, false],
+      [2, true],
+      [3, true],
+      [4, true],
+      [5, true],
+    ]);
+    // Its sixth transient death is past agents.transient_max_retries (5): recovered as any death, then escalated
+    expect(spawnedAt).toEqual([0, 60, 190, 440, 930, 1840, 1860, 1890, 1940]);
+    const deaths = eventsOf(h, "dead_on_start");
+    expect(deaths).toHaveLength(4);
+    expect(deaths[0].evidence).toContain(
+      `a transient error, but this task used its transient retries (5 of agents.transient_max_retries 5): ${NETWORK_ERROR}`,
+    );
+    expect(eventsOf(h, "restart_same_session")).toHaveLength(2);
+    expect(eventsOf(h, "fresh_session")).toHaveLength(1);
+    expect(eventsOf(h, "escalated")).toHaveLength(1);
+    expect(inboxEntries(h)).toHaveLength(1);
+    expect(runs(h).slice(0, 6).every((r) => r.sameSessionRestarts === 0 && r.chainId === run.chainId)).toBe(true);
+  });
+
+  it("five agents during an outage: one start tries the provider per step, and one decision for the project only after transient_max_minutes", async () => {
+    const more = Object.fromEntries(["worker-c", "worker-d", "worker-e"].map((id) => [id, dragon(id)]));
+    const h = setup(() => ({ transient_max_minutes: 30 }), { dragons: more });
+    const { inbox, answer } = await withInbox(h);
+    networkDown(h);
+    const agents = ["worker-a", "worker-b", "worker-c", "worker-d", "worker-e"];
+    for (const agent of agents) await request(h, agent, `task-${agent}`);
+    await at(h, 0); // all five start, and die at once
+    await at(h, 0);
+    // The second agent's death makes it the fleet's outage
+    expect(eventsOf(h, "transient").map((e) => [e.agent, e.data.steps, e.data.nextTryAt, e.data.fleet])).toEqual(
+      agents.map((agent, i) => [agent, 1, NOW + 60 * SEC, i > 0]),
+    );
+
+    for (let s = 30; s < 30 * 60; s += 30) {
+      const before = h.spawner.calls.length;
+      await at(h, s * SEC);
+      expect(h.spawner.calls.length - before).toBeLessThanOrEqual(1);
+    }
+    // 29.5 minutes: four tries since the outage began (at +1, +3.5, +8 and +16.5 min), one at a time, and no decision yet
+    expect(h.spawner.calls).toHaveLength(9);
+    expect(inbox.list({ project: "demo", status: "open" })).toEqual([]);
+
+    // At 30 minutes one decision; another period on, with it still open, nothing more
+    for (const minute of [30, 31, 45, 60]) await at(h, minute * MIN);
+    const [asked, ...others] = inbox.list({ project: "demo", status: "open" });
+    expect(others).toEqual([]);
+    expect(asked).toMatchObject({ key: `transient:provider-a:${NOW}`, source: { ref: "transient:provider-a" } });
+    expect(asked.title).toBe("Provider provider-a has been unreachable for 30 min (since 2026-03-02T12:00:00.000Z): 5 run(s) wait for it");
+    expect(asked.options.map((o) => o.id)).toEqual(["wait", "retry_now"]);
+    expect(asked.context).toContain(NETWORK_ERROR);
+    for (const agent of agents) expect(asked.context).toContain(`- ${agent} on task-${agent}`);
+    for (const kind of NOT_COUNTED) expect(eventsOf(h, kind)).toEqual([]);
+
+    // "Try now": every waiting run starts on the next check
+    expect((await answer(asked.id, { optionId: "retry_now" })).statusCode).toBe(200);
+    const before = h.spawner.calls.length;
+    await at(h, 61 * MIN);
+    expect(eventsOf(h, "transient_cleared").map((e) => e.data.by)).toEqual(["owner"]);
+    expect(h.spawner.calls.length - before).toBe(5);
+  });
+
+  it("an outage that lasts after 'Keep waiting' asks again once another transient_max_minutes has passed", async () => {
+    const h = setup(() => ({ transient_max_minutes: 30 }));
+    const { inbox, answer } = await withInbox(h);
+    networkDown(h);
+    await request(h, "worker-a", "task-a");
+    await request(h, "worker-b", "task-b");
+    await at(h, 0);
+    await at(h, 0);
+    for (let minute = 1; minute <= 30; minute++) await at(h, minute * MIN);
+    const [first, ...more] = inbox.list({ project: "demo", status: "open" });
+    expect(more).toEqual([]);
+    expect(first.title).toBe("Provider provider-a has been unreachable for 30 min (since 2026-03-02T12:00:00.000Z): 2 run(s) wait for it");
+    expect((await answer(first.id, { optionId: "wait" })).statusCode).toBe(200);
+
+    for (let minute = 31; minute < 60; minute++) await at(h, minute * MIN);
+    expect(inbox.list({ project: "demo", status: "open" })).toEqual([]);
+    await at(h, 60 * MIN);
+    const [again, ...extra] = inbox.list({ project: "demo", status: "open" });
+    expect(extra).toEqual([]);
+    expect(again.id).not.toBe(first.id);
+    expect(again).toMatchObject({ key: `transient:provider-a:${NOW}` });
+    expect(again.title).toBe("Provider provider-a has been unreachable for 60 min (since 2026-03-02T12:00:00.000Z): 2 run(s) wait for it");
+    for (const kind of NOT_COUNTED) expect(eventsOf(h, kind)).toEqual([]);
+  });
+
+  it("the outage's decision is withdrawn once the outage is over: a start worked (transient_cleared)", async () => {
+    const h = setup(() => ({ transient_max_minutes: 30 }));
+    const { inbox } = await withInbox(h);
+    networkDown(h);
+    await request(h, "worker-a", "task-a");
+    await request(h, "worker-b", "task-b");
+    await at(h, 0);
+    await at(h, 0);
+    for (let minute = 1; minute <= 30; minute++) await at(h, minute * MIN);
+    const [asked, ...more] = inbox.list({ project: "demo", status: "open" });
+    expect(more).toEqual([]);
+    expect(asked).toMatchObject({ key: `transient:provider-a:${NOW}`, source: { ref: "transient:provider-a" } });
+
+    // The network is back: the next try (at +34 min) works, and once it has run a minute the provider is reachable
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
+    for (let minute = 31; minute <= 34; minute++) await at(h, minute * MIN);
+    expect(inbox.get(asked.id)?.status).toBe("open");
+    await at(h, 35 * MIN);
+    expect(eventsOf(h, "transient_cleared").map((e) => e.data.by)).toEqual(["start"]);
+    expect(inbox.get(asked.id)).toMatchObject({ status: "withdrawn", withdrawnReason: "It moved on: provider provider-a is reachable again." });
+    expect(inbox.list({ project: "demo", status: "open" })).toEqual([]);
+    expect(eventsOf(h, "decision").filter((e) => e.data.withdrawn === true).map((e) => e.data.key)).toEqual([`transient:provider-a:${NOW}`]);
+  });
+
+  it("recovery resumes: a start that works clears the outage for every agent, and the next outage's backoff starts afresh", async () => {
+    const h = setup();
+    networkDown(h);
+    await request(h, "worker-a", "task-a");
+    await request(h, "worker-b", "task-b");
+    await at(h, 0);
+    await at(h, 0); // both died: the fleet's outage, next try at +60 s
+    expect(h.service.status().unreachable?.map((u) => [u.provider, u.failures, u.fleet, u.waiting])).toEqual([["provider-a", 2, true, 2]]);
+
+    // The network is back: agents start and keep working
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
+    await at(h, 30 * SEC);
+    expect(h.spawner.calls).toHaveLength(2);
+    await at(h, 60 * SEC); // one start tries it
+    expect(h.spawner.calls).toHaveLength(3);
+    await at(h, 90 * SEC);
+    expect(h.spawner.calls).toHaveLength(3);
+    expect(agentView(h.service.status(), "worker-b").detail).toBe(
+      "not starting: provider provider-a unreachable since 2026-03-02T12:00:00.000Z (2 transient failure(s)); another start is trying it now",
+    );
+    await at(h, 121 * SEC); // the try has lived past dead_on_start_seconds: reachable again, for everyone
+    await at(h, 122 * SEC);
+    expect(h.spawner.calls).toHaveLength(4);
+    const [cleared] = eventsOf(h, "transient_cleared");
+    expect(cleared).toMatchObject({ subject: "provider-a", agent: "worker-a", data: { by: "start", failures: 2, since: NOW } });
+    expect(h.service.status().unreachable).toEqual([]);
+    expect(runs(h).filter((r) => r.state === "running").map((r) => r.agent).sort()).toEqual(["worker-a", "worker-b"]);
+    for (const kind of NOT_COUNTED) expect(eventsOf(h, kind)).toEqual([]);
+
+    // A later outage: both die again after working a while. Its backoff starts at 60 s again, and they resume their sessions
+    for (const call of h.spawner.calls.slice(2)) writeLog(h.clock, call.logPath, `${NETWORK_ERROR}\n`);
+    h.spawner.exit(5003, 1);
+    h.spawner.exit(5004, 1);
+    await at(h, 10 * MIN);
+    const again = eventsOf(h, "transient").slice(2);
+    expect(again.map((e) => [e.data.since, e.data.steps, e.data.nextTryAt, e.data.failures, e.data.fleet])).toEqual([
+      [NOW + 10 * MIN, 1, NOW + 10 * MIN + 60 * SEC, 1, false],
+      [NOW + 10 * MIN, 1, NOW + 10 * MIN + 60 * SEC, 2, true],
+    ]);
+    const waiting = runs(h).filter((r) => r.state === "queued");
+    expect(waiting.map((r) => [r.agent, r.sessionMode, r.sameSessionRestarts, r.transientRetries])).toEqual([
+      ["worker-a", "resume", 0, 2],
+      ["worker-b", "resume", 0, 2],
+    ]);
+  });
+
+  it("one agent's transient death holds only its own starts; a run still writing its log clears the outage", async () => {
+    const h = setup(() => ({}), { dragons: { "worker-c": dragon("worker-c") } });
+    // worker-c started before the outage and keeps working
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
+    await request(h, "worker-c", "task-c");
+    await at(h, 0);
+    const cLog = h.spawner.calls[0].logPath;
+
+    networkDown(h);
+    await request(h, "worker-a", "task-a");
+    await at(h, 10 * SEC); // worker-a starts and dies
+    await at(h, 20 * SEC); // a transient failure: worker-a's own wait
+    expect(h.service.status().unreachable).toMatchObject([{ fleet: false, agents: ["worker-a"], waiting: 1 }]);
+    // worker-b starts on the same provider at once: one agent's output doesn't stall the others
+    await request(h, "worker-b", "task-b");
+    await at(h, 30 * SEC);
+    expect(h.spawner.calls.map((c) => c.env.LAIR_AGENT)).toEqual(["worker-c", "worker-a", "worker-b"]);
+    await at(h, 40 * SEC); // it dies the same way within the window: now the fleet's outage
+    expect(h.service.status().unreachable).toMatchObject([{ fleet: true, agents: ["worker-a", "worker-b"], waiting: 2 }]);
+
+    // worker-c is still getting answers: its log written after the latest failure clears it, and both start again
+    h.clock.t = NOW + 50 * SEC;
+    writeLog(h.clock, cLog, "step 2 of 9\n");
+    await h.service.tick();
+    const [cleared] = eventsOf(h, "transient_cleared");
+    expect(cleared).toMatchObject({ subject: "provider-a", agent: "worker-c", data: { by: "log" } });
+    expect(h.spawner.calls.map((c) => c.env.LAIR_AGENT)).toEqual(["worker-c", "worker-a", "worker-b", "worker-a", "worker-b"]);
+  });
+
+  it("a fleet with a fallback on another provider moves to it on a 503, without counting a failover; an agent without one is not held", async () => {
+    const h = setup(() => FALLBACK);
+    h.spawner.behaviour = (pid, log, call) => {
+      if (call === 1) {
+        writeLog(h.clock, log, "Error: HTTP 503 Service Unavailable\n");
+        h.spawner.exit(pid, 1);
+      } else {
+        writeLog(h.clock, log, "working\n");
+      }
+    };
+    await request(h);
+    await at(h, 0); // test-cli on provider-a: 503
+    await at(h, 0);
+    expect(eventsOf(h, "transient")).toHaveLength(1);
+    await at(h, 10 * SEC);
+
+    expect(h.spawner.calls.map((c) => c.argv[0])).toEqual(["agent-cli", "other-cli"]);
+    const [switched] = eventsOf(h, "failover");
+    expect(switched.data).toMatchObject({ kind: "unavailable", toIndex: 1 });
+    expect(switched.evidence.join(" ")).toContain("provider provider-a unreachable since 2026-03-02T12:00:00.000Z (transient errors)");
+    expect(runs(h)[1]).toMatchObject({ state: "running", profileIndex: 1, failovers: 0, transientRetries: 1 });
+    for (const kind of ["dead_on_start", "crashed", "restart_same_session", "escalated"] as AgentEventKind[]) expect(eventsOf(h, kind)).toEqual([]);
+
+    // worker-b has no fallback; provider-a is down only for worker-a so far, so it starts there
+    await request(h, "worker-b", "task-b");
+    await at(h, 20 * SEC);
+    expect(h.spawner.calls.map((c) => [c.argv[0], c.env.LAIR_AGENT])).toEqual([
+      ["agent-cli", "worker-a"],
+      ["other-cli", "worker-a"],
+      ["agent-cli", "worker-b"],
+    ]);
+  });
+
+  it("a genuine crash with a transient-looking word in its tail is not an outage; a line above the last 3 doesn't count", async () => {
+    const h = setup();
+    const output = [
+      "Error: read ECONNRESET while loading a fixture",
+      "step 1 of 3",
+      "FAIL src/api.test.ts > returns 200",
+      "AssertionError: expected 503 to equal 200",
+      "1 failed: the TRANSIENT retry case",
+    ];
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, `${output.join("\n")}\n`);
+    await request(h);
+    await request(h, "worker-b", "task-b");
+    await at(h, 0);
+    h.spawner.exit(5001, 2);
+    h.spawner.exit(5002, 2);
+    await at(h, 5 * MIN);
+
+    expect(eventsOf(h, "transient")).toEqual([]);
+    expect(eventsOf(h, "crashed").map((e) => e.summary)).toEqual([
+      "worker-a on feat-login the process ended after 300 s (exit code 2)",
+      "worker-b on task-b the process ended after 300 s (exit code 2)",
+    ]);
+    expect(eventsOf(h, "restart_same_session")).toHaveLength(2);
+    expect(runs(h).filter((r) => r.state === "queued").map((r) => [r.agent, r.sessionMode, r.sameSessionRestarts])).toEqual([
+      ["worker-a", "resume", 1],
+      ["worker-b", "resume", 1],
+    ]);
+    expect(h.service.status().unreachable).toEqual([]);
+
+    // A death on start without a transient line is one too, and the loop still ends in an escalation
+    const d = setup();
+    d.spawner.behaviour = (pid, log) => {
+      writeLog(d.clock, log, "Error: unknown option --frobnicate\n");
+      d.spawner.exit(pid, 1);
+    };
+    await request(d);
+    for (const ms of [0, 0, 10 * SEC, 10 * SEC, 30 * SEC, 30 * SEC, 70 * SEC, 70 * SEC, 60 * MIN, 120 * MIN]) await at(d, ms);
+    expect(eventsOf(d, "dead_on_start")).toHaveLength(4);
+    expect(eventsOf(d, "escalated")).toHaveLength(1);
+    expect(eventsOf(d, "transient")).toEqual([]);
   });
 });
 
@@ -2886,6 +3232,205 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     const [asked] = inbox.list({ project: "demo", status: "open" });
     expect(asked.title).toBe("worker-a is paused on feat-login: it has waited on its WAITING line since 2026-03-02T12:01:00.000Z");
     expect(asked.title).not.toContain("owner.token");
+  });
+
+  // ---- A gate still in the gate queue is a live wait ----
+
+  /** A gate request in gates_dir/queue (<lane>.<pri>.<id>.req, or .req.run), written as of NOW + ms */
+  function requestAt(p: Paths, name: string, ms: number): string {
+    const dir = join(p.gatesDir, "queue");
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, name);
+    writeFileSync(file, "feat-login\nabcdef12\n./gate.sh\n");
+    const t = new Date(NOW + ms);
+    utimesSync(file, t, t);
+    return file;
+  }
+
+  it("a gate still in the gate queue is a live wait: past max_wait it keeps waiting, shown in its lane, and is held only after max_queue_wait", async () => {
+    const h = setup(gateFill({ max_wait_minutes: 60, max_queue_wait_minutes: 180 }));
+    const { inbox } = await withInbox(h);
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    const resultFile = join(h.gatesDir, "results", `${GATE}.rc`);
+    // The gate is queued on a lane whose machine is offline: it sits in the queue for hours
+    const queued = requestAt(h, `remote.1.${GATE}.req`, 30 * SEC);
+    await runEndingWith(h, `- WAITING feat-login ${GATE} by worker-a 12:01Z: gate queued`);
+
+    for (const minute of [30, 61, 120]) {
+      h.clock.t = NOW + minute * MIN;
+      const line = lineOf(await check(h), "feat-login");
+      expect(line).toMatchObject({
+        state: "held",
+        hold: "waiting",
+        waiting: { wake: GATE, queued: { gate: GATE, requeuedFrom: null, lane: "remote", status: "queued", since: "2026-03-02T12:00:30.000Z" } },
+      });
+      expect(line.detail).toBe(`waiting: ${GATE} still queued in remote since 2026-03-02T12:00:30.000Z; starts again once ${resultFile} exists`);
+    }
+    // Moved to another lane, where it runs: still alive
+    renameSync(queued, join(h.gatesDir, "queue", `heavy.1.${GATE}.req.run`));
+    h.clock.t = NOW + 150 * MIN;
+    let line = lineOf(await check(h), "feat-login");
+    expect(line.hold).toBe("waiting");
+    expect(line.detail).toContain(`waiting: ${GATE} still running in heavy since 2026-03-02T12:00:30.000Z`);
+    expect(inbox.list({ project: "demo", status: "open" })).toEqual([]);
+    expect(eventsOf(h, "fill_gate_queued")).toHaveLength(1);
+    expect(runs(h)).toHaveLength(1);
+
+    // A day of it is too long anyway: past max_queue_wait_minutes (counted from the streak's start) it is held, once
+    h.clock.t = NOW + 180 * MIN;
+    expect(lineOf(await check(h), "feat-login").hold).toBe("waiting");
+    h.clock.t = NOW + 181 * MIN;
+    line = lineOf(await check(h), "feat-login");
+    expect(line).toMatchObject({ state: "held", hold: "waited_too_long", releasable: true, waiting: { queued: { lane: "heavy", status: "running" } } });
+    expect(line.detail).toBe(
+      `waiting: ${GATE} still running in heavy since 2026-03-02T12:00:30.000Z; its runs have been waiting since 2026-03-02T12:01:00.000Z, over agents.fill.wake.max_queue_wait_minutes (180), though its gate is still in the gate queue: fill leaves the task to you`,
+    );
+    h.clock.t = NOW + 200 * MIN;
+    expect(lineOf(await check(h), "feat-login").hold).toBe("waited_too_long");
+    const [asked, ...more] = inbox.list({ project: "demo", status: "open" });
+    expect(more).toEqual([]);
+    expect(asked.title).toBe(`worker-a is paused on feat-login: it has waited on ${GATE} since 2026-03-02T12:01:00.000Z`);
+    expect(asked.context).toContain(`The gate it waits on: ${GATE} still running in heavy since 2026-03-02T12:00:30.000Z.`);
+    expect(runs(h)).toHaveLength(1);
+  });
+
+  it("a gate that left the queue with no result counts again from its last sighting there, across a restart; one never queued is held at max_wait as before", async () => {
+    const h = setup(gateFill({ max_wait_minutes: 60 }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    const running = requestAt(h, `heavy.1.${GATE}.req.run`, 0);
+    await runEndingWith(h, `- WAITING feat-login ${GATE} by worker-a: gate queued`);
+    for (const minute of [30, 90]) {
+      h.clock.t = NOW + minute * MIN;
+      expect(lineOf(await check(h), "feat-login").detail).toContain(`waiting: ${GATE} still running in heavy`);
+    }
+    // Its runner dies and the request goes with it: no result ever comes
+    unlinkSync(running);
+    h.clock.t = NOW + 100 * MIN;
+    let line = lineOf(await check(h), "feat-login");
+    expect(line).toMatchObject({ hold: "waiting", waiting: { queued: null } });
+    expect(line.detail).toBe(
+      `waiting: ${GATE} since 2026-03-02T12:01:00.000Z; starts again once ${join(h.gatesDir, "results", `${GATE}.rc`)} exists`,
+    );
+    expect(eventsOf(h, "fill_gate_gone").map((e) => e.data.lastQueuedAt)).toEqual([NOW + 90 * MIN]);
+
+    // Lair restarts: the last sighting is in the store, so the budget runs from +90 min
+    const h2 = setup(gateFill({ max_wait_minutes: 60 }), { paths: h });
+    h2.clock.t = NOW + 149 * MIN;
+    expect(lineOf(await check(h2), "feat-login").hold).toBe("waiting");
+    h2.clock.t = NOW + 150 * MIN;
+    line = lineOf(await check(h2), "feat-login");
+    expect(line).toMatchObject({ state: "held", hold: "waited_too_long" });
+    expect(line.detail).toContain(
+      "its runs have been waiting since 2026-03-02T12:01:00.000Z, over agents.fill.wake.max_wait_minutes (60) counted from 2026-03-02T13:30:00.000Z, when its gate was last in the gate queue",
+    );
+    expect(runs(h2)).toHaveLength(1);
+
+    // A gate that was never in the queue, and no result: held at max_wait_minutes from the streak's start, as before
+    const never = setup(gateFill({ max_wait_minutes: 60 }));
+    prompts(never);
+    tasks(never, "worker-a|Alice|feat-login|Login form");
+    await runEndingWith(never, `- WAITING feat-login ${GATE} by worker-a: gate queued`);
+    never.clock.t = NOW + 60 * MIN;
+    expect(lineOf(await check(never), "feat-login").hold).toBe("waiting");
+    never.clock.t = NOW + 61 * MIN;
+    line = lineOf(await check(never), "feat-login");
+    expect(line).toMatchObject({ state: "held", hold: "waited_too_long", waiting: { queued: null } });
+    expect(line.detail).toContain(
+      "its runs have been waiting since 2026-03-02T12:01:00.000Z, over agents.fill.wake.max_wait_minutes (60): fill leaves the task to you",
+    );
+    expect(eventsOf(never, "fill_gate_queued")).toEqual([]);
+  });
+
+  it("a gate re-queued under a new id (wake.requeue_marker) is followed: its request keeps the wait alive, and its result wakes the task", async () => {
+    const marker = "{gates_dir}/results/{wake}.recheck-{n}";
+    const h = setup(gateFill({ max_wait_minutes: 60, requeue_marker: marker }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    const NEW = "20260302T121500Z-feat-login-tr1-abcdef12-7";
+    await runEndingWith(h, `- WAITING feat-login ${GATE} by worker-a: gate queued`);
+    // The gate system re-checked it as NEW: its marker names NEW on its first line. A marker still being claimed,
+    // or one whose first line isn't a plain name, is passed over
+    writeFileSync(join(h.gatesDir, "results", `${GATE}.recheck-1`), `${NEW}\nbackend\n`);
+    writeFileSync(join(h.gatesDir, "results", `${GATE}.recheck-2`), "claim 4242 1772452800\n");
+    writeFileSync(join(h.gatesDir, "results", `${GATE}.recheck-3`), "../../owner.token\n");
+    requestAt(h, `heavy.1.${NEW}.req`, 15 * MIN);
+
+    for (const minute of [30, 61, 120]) {
+      h.clock.t = NOW + minute * MIN;
+      const line = lineOf(await check(h), "feat-login");
+      expect(line).toMatchObject({ hold: "waiting", waiting: { wake: GATE, queued: { gate: NEW, requeuedFrom: GATE, lane: "heavy", status: "queued" } } });
+      expect(line.detail).toBe(
+        `waiting: ${NEW} (re-queued from ${GATE}) still queued in heavy since 2026-03-02T12:15:00.000Z; starts again once ${join(h.gatesDir, "results", `${GATE}.rc`)} exists`,
+      );
+    }
+    // NEW finishes: its request leaves the queue and its result comes; that wakes the task, once
+    unlinkSync(join(h.gatesDir, "queue", `heavy.1.${NEW}.req`));
+    const newResult = resultAt(h, NEW, 125 * MIN);
+    h.clock.t = NOW + 126 * MIN;
+    expect(lineOf(await check(h), "feat-login").state).toBe("started");
+    expect(eventsOf(h, "fill_woken").map((e) => e.data.file)).toEqual([newResult]);
+    expect(eventsOf(h, "fill_held").filter((e) => e.data.hold === "waited_too_long")).toEqual([]);
+
+    // Without requeue_marker the markers mean nothing: the wait on GATE is not alive, and is held at max_wait
+    const plain = setup(gateFill({ max_wait_minutes: 60 }));
+    prompts(plain);
+    tasks(plain, "worker-a|Alice|feat-login|Login form");
+    await runEndingWith(plain, `- WAITING feat-login ${GATE} by worker-a: gate queued`);
+    writeFileSync(join(plain.gatesDir, "results", `${GATE}.recheck-1`), `${NEW}\n`);
+    requestAt(plain, `heavy.1.${NEW}.req`, 15 * MIN);
+    plain.clock.t = NOW + 61 * MIN;
+    expect(lineOf(await check(plain), "feat-login")).toMatchObject({ hold: "waited_too_long", waiting: { queued: null } });
+  });
+
+  it("a waited_too_long hold stays only while its decision is open; withdrawn, it holds nothing, and a wait over its budget again asks again", async () => {
+    const h = setup(gateFill({ max_wait_minutes: 60 }));
+    const { inbox } = await withInbox(h);
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    await runEndingWith(h, `- WAITING feat-login ${GATE} by worker-a: gate queued`);
+    h.clock.t = NOW + 61 * MIN;
+    expect(lineOf(await check(h), "feat-login").hold).toBe("waited_too_long");
+    const [first, ...others] = inbox.list({ project: "demo", status: "open" });
+    expect(others).toEqual([]);
+    expect(h.service.fillHoldDecision(first.key)).toEqual({ status: "open", id: first.id });
+
+    // While its decision is open the hold stays, even once its gate shows up in the queue (a live wait)
+    const request = requestAt(h, `remote.1.${GATE}.req`, 61 * MIN + 30 * SEC);
+    h.clock.t = NOW + 62 * MIN;
+    let line = lineOf(await check(h), "feat-login");
+    expect(line).toMatchObject({ hold: "waited_too_long", decisionId: first.id, waiting: { queued: { gate: GATE, lane: "remote" } } });
+
+    // Its line out of the tasks file for LINE_GONE_CHECKS checks in a row: the decision is withdrawn
+    tasks(h, "# feat-login is no longer planned");
+    for (let i = 0; i < LINE_GONE_CHECKS; i++) {
+      h.clock.t = NOW + (63 + i) * MIN;
+      await check(h);
+    }
+    expect(h.service.fillHoldDecision(first.key)).toEqual({ status: "withdrawn", id: first.id });
+
+    // Back again: a withdrawn decision holds nothing, so the live wait just waits, with nothing open
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    h.clock.t = NOW + 66 * MIN;
+    line = lineOf(await check(h), "feat-login");
+    expect(line).toMatchObject({ state: "held", hold: "waiting", decisionId: null, waiting: { queued: { gate: GATE } } });
+    expect(inbox.list({ project: "demo", status: "open" })).toEqual([]);
+
+    // Its gate leaves the queue with no result: 60 minutes after its last sighting the wait is over its budget again,
+    // and the same hold asks again (one open decision, a new one)
+    unlinkSync(request);
+    h.clock.t = NOW + 68 * MIN;
+    expect(lineOf(await check(h), "feat-login").hold).toBe("waiting");
+    h.clock.t = NOW + 125 * MIN;
+    expect(lineOf(await check(h), "feat-login").hold).toBe("waiting");
+    h.clock.t = NOW + 126 * MIN;
+    line = lineOf(await check(h), "feat-login");
+    const [again, ...more] = inbox.list({ project: "demo", status: "open" });
+    expect(more).toEqual([]);
+    expect(again.id).not.toBe(first.id);
+    expect(again.key).toBe(first.key);
+    expect(line).toMatchObject({ hold: "waited_too_long", decisionId: again.id });
   });
 
   it("a wait survives a restart of Lair and a rotated queue file: the wake still starts the task once", async () => {
