@@ -128,12 +128,12 @@ export interface ReviewerRuns {
  * `review`. A request without a key gets one from its project and question,
  * so the same question is not asked twice while it is open.
  */
-export function inboxDecisionSink(inbox: Pick<DecisionProducer, "raise" | "blockedOn" | "withdraw">): DecisionSink {
+export function inboxDecisionSink(inbox: Pick<DecisionProducer, "raise" | "find" | "withdraw">): DecisionSink {
   return {
     async withdraw(project, key, reason) {
-      // A decision raised here blocks on its key (toDecisionInput)
-      const open = inbox.blockedOn(key);
-      if (!open || open.project !== project || open.source.module !== "review" || open.status !== "open") return false;
+      // The one review raised in the server with this key: never one an HTTP caller raised under its name
+      const open = inbox.find(project, "review", key);
+      if (!open || open.status !== "open") return false;
       await inbox.withdraw(open.id, { module: "review", reason: reason.slice(0, 500) });
       return true;
     },

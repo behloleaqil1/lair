@@ -263,6 +263,34 @@ describe("notifications: what is sent, and when", () => {
     ]);
   });
 
+  it("the same hold asked again soon after it was notified (withdrawn, then raised again) doesn't push twice", async () => {
+    const h = await setup({ yaml: ON });
+    const { decision: first } = await ask(h, "feat-a");
+    await h.time.advance(5 * SEC);
+    expect(h.runner.calls).toHaveLength(1);
+
+    // Its line is taken out of the tasks file and put back: withdrawn, then raised again under the same key
+    await h.inbox.withdraw(first.id, { module: "agents", reason: "The hold lifted." });
+    const { decision: again } = await ask(h, "feat-a");
+    expect(again.id).not.toBe(first.id);
+    await h.time.advance(2 * MIN);
+    expect(h.runner.calls).toHaveLength(1);
+    // Another hold still notifies
+    await ask(h, "feat-b");
+    await h.time.advance(MIN);
+    expect(shown(h).map(([title]) => title)).toEqual([expect.stringContaining("feat-a"), expect.stringContaining("feat-b")]);
+
+    // Past the window (reminder_hours), asked again: it notifies again
+    await h.time.advance(5 * HOUR);
+    await h.inbox.withdraw(again.id, { module: "agents", reason: "The hold lifted." });
+    await ask(h, "feat-a");
+    await h.time.advance(2 * MIN);
+    const asked = shown(h)
+      .map(([title]) => title)
+      .filter((title) => title.includes("feat-a") && title.endsWith(", needs you"));
+    expect(asked).toHaveLength(2);
+  });
+
   it("never notifies for a notice, and sends nothing while notifications are off (the default)", async () => {
     const on = await setup({ yaml: ON });
     await ask(on, "breach", {
@@ -442,10 +470,20 @@ describe("notifications: config and file checks", () => {
       { ntfy: { url: "ftp://ntfy.example.com/t" } },
       { ntfy: { url: "https://user:pass@ntfy.example.com/t" } },
       { ntfy: { url: "https://ntfy.example.com/" } },
+      // Plain http only to this machine: a token or a title never crosses a network in the clear
+      { ntfy: { url: "http://ntfy.example.com/t" } },
+      { ntfy: { url: "http://192.168.1.20:8080/t" } },
+      { ntfy: { url: "http://127.0.0.1.nip.io/t" } },
       { reminder_hours: 1000 },
     ]) {
       expect(parseNotificationConfig({ notifications: bad }, "/data")).toMatchObject({ ok: false, settings: { desktop: false, ntfy: null } });
     }
+    for (const local of ["http://localhost:8090/t", "http://127.0.0.1/t", "http://[::1]:2586/t"]) {
+      expect(parseNotificationConfig({ notifications: { ntfy: { url: local } } }, "/data")).toMatchObject({ ok: true });
+    }
+    expect(parseNotificationConfig({ notifications: { ntfy: { url: "http://ntfy.example.com/t" } } }, "/data")).toMatchObject({
+      errors: [expect.stringContaining("must be https")],
+    });
     // Restart reads the same file: the section is not its business
     expect(parseServerConfig({ server: {}, notifications: { desktop: "yes" } }).ok).toBe(true);
   });

@@ -57,13 +57,22 @@ function deliveryOn(store: DeliveryStore, docker: FakeDocker): Delivery {
   return delivery;
 }
 
+/** The inbox's clock, moved by the tests */
+const clock = {
+  t: NOW,
+  now(): number {
+    return this.t;
+  },
+};
+
 function inboxOn(dbPath: string): DecisionInbox {
   const store = new DecisionStore(dbPath);
   closers.push(() => store.close());
-  return new DecisionInbox({ store, secrets: new MemorySecretStore(), clock: { now: () => NOW } });
+  return new DecisionInbox({ store, secrets: new MemorySecretStore(), clock });
 }
 
 function setup() {
+  clock.t = NOW;
   dir = mkdtempSync(join(tmpdir(), "lair-delivery-holds-"));
   const deliveryDb = join(dir, "delivery.db");
   const decisionsDb = join(dir, "decisions.db");
@@ -151,5 +160,37 @@ describe("held services: one decision per hold", () => {
 
     await run(h.delivery, { kind: "release", service: "db", by: "human" });
     expect(open(h.inbox)).toEqual([]);
+  });
+
+  it("an HTTP caller can't release a held service or stand in for its decision: its default never applies", async () => {
+    const h = setup();
+    await run(h.delivery, { kind: "down", service: "api", by: "human", reason: "profiling" });
+    const hold = h.store.getHold("shop", "local", "api")!;
+    // Before delivery follows its answers, a local process raises a decision under its name and key, defaulting to "release"
+    const forgery = (key: string) => ({
+      project: "shop",
+      kind: "other" as const,
+      title: "api in local is held",
+      context: "Forged.",
+      options: [{ id: "release", label: "Release it", consequences: "Released." }],
+      recommended: { optionId: "release", reasoning: "r" },
+      source: { module: DELIVERY_DECISION_MODULE, ref: "local/api" },
+      key,
+      expiresAt: new Date(clock.t + 1000).toISOString(),
+      defaultOptionId: "release",
+    });
+    const forged = await h.inbox.raiseFromHttp(forgery(deliveryHoldKey(hold)));
+
+    await h.delivery.useDecisions(h.inbox);
+    const real = open(h.inbox).filter((d) => d.raisedVia === "server");
+    expect(real.map((d) => d.key)).toEqual([deliveryHoldKey(hold)]);
+
+    clock.t = NOW + 5000;
+    await h.inbox.sweep();
+    await h.delivery.reconcileHolds();
+    expect(h.inbox.get(forged.decision.id)).toMatchObject({ status: "expired" });
+    expect(h.store.getHold("shop", "local", "api")).not.toBeNull();
+    expect(open(h.inbox).map((d) => d.id)).toEqual([real[0].id]);
+    await expect(h.inbox.raiseFromHttp(forgery("hold:local:web:x"))).rejects.toMatchObject({ statusCode: 403 });
   });
 });

@@ -201,13 +201,9 @@ describe("raising over HTTP", () => {
 
 
 describe("decision routes", () => {
-  it("raise, list open first, detail with audit, answer; the producer resumes", async () => {
+  it("raise, list open first, detail with audit, answer; the caller reads the answer, and no module inside Lair gets it", async () => {
     const { app, inbox, answerToken } = await build();
     const browser = await unlock(app, answerToken);
-    const resumed: DecisionResolution[] = [];
-    inbox.onResolved("delivery", (r) => {
-      resumed.push(r);
-    });
 
     const raised = await post(app, "/api/decisions?project=example", budget);
     expect(raised.statusCode).toBe(201);
@@ -220,6 +216,11 @@ describe("decision routes", () => {
 
     const other = await post(app, "/api/decisions", { ...budget, kind: "other", key: "other", title: "Other" });
     const otherId = other.json().data.decision.id as string;
+    // A module of that name starts following answers inside Lair: it never gets these (their module name is the caller's word)
+    const resumed: DecisionResolution[] = [];
+    inbox.onResolved("delivery", (r) => {
+      resumed.push(r);
+    });
     await post(app, `/api/decisions/${otherId}/answer`, { optionId: "decline" }, browser);
 
     const list = (await app.inject({ url: "/api/decisions" })).json();
@@ -236,11 +237,13 @@ describe("decision routes", () => {
       answer: { optionId: "approve", note: "ok" },
       answeredBy: "owner",
     });
-    expect(resumed.map((r) => [r.decision.id, r.optionId])).toEqual([
-      [otherId, "decline"],
-      [id, "approve"],
-    ]);
+    expect(resumed).toEqual([]);
+    expect(answer.json().data.audit.at(-1).detail).toContain("not handed to delivery: it was raised over HTTP");
     expect(inbox.blockedOn("deploy:staging")).toBeNull();
+    // Now that a module inside Lair follows answers as "delivery", nobody else may ask in its name
+    const squat = await post(app, "/api/decisions", { ...budget, key: "budget:again" });
+    expect(squat.statusCode).toBe(403);
+    expect(squat.json().error).toContain("delivery is a module inside Lair");
 
     const open = (await app.inject({ url: "/api/decisions?status=open" })).json();
     expect(open.data).toEqual([]);

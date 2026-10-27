@@ -93,6 +93,16 @@ export const MAX_TASK_LINE_CHARS = 2000;
 const QUEUE_MAX_BYTES = 4 * 1024 * 1024;
 const QUEUE_LINE_CHARS = 1000;
 const MARK_TAIL_BYTES = 256;
+/** Checks in a row a held line must be gone from the tasks file before its decision is withdrawn */
+export const LINE_GONE_CHECKS = 3;
+
+/** Where a hold's decision stands (AgentsFill.holdDecision) */
+export type HoldDecisionState =
+  | { status: "unknown" }
+  | { status: "none" }
+  | { status: "open"; id: string }
+  | { status: "withdrawn"; id: string }
+  | { status: "answered"; id: string; optionId: string | null };
 
 /**
  * The decision options fill offers for a task it holds for the owner:
@@ -695,6 +705,8 @@ export class AgentsFill {
   private polled = new Map<string, number>();
   /** The waiting runs seen in the check in progress (to forget the others' polls) */
   private waitingSeen = new Set<string>();
+  /** Open decisions whose line is gone from the tasks file: in how many checks in a row (key -> checks) */
+  private lineGone = new Map<string, number>();
 
   constructor(private options: AgentsFillOptions) {}
 
@@ -1267,11 +1279,15 @@ export class AgentsFill {
    * Withdraw the open decisions whose hold lifted: fill's own that no line
    * of this check stands on (released in Work, the task done, started or
    * claimed, its line removed), and a run's escalation once its task is done.
-   * An escalation whose chain moved on is the tick's to withdraw.
+   * An escalation whose chain moved on is the tick's to withdraw. A line
+   * that is gone from the tasks file (or doesn't parse) counts only after
+   * LINE_GONE_CHECKS checks in a row: an edit that takes it out and puts it
+   * back (the planner's, say) neither withdraws its decision nor asks again.
    */
   private async withdrawLifted(views: FillLineView[], wanted: Set<string>): Promise<void> {
     const prefix = `agents:${this.options.project}:task:`;
     const lines = new Map(views.filter((v) => v.task !== null).map((v) => [v.task as string, v]));
+    const gone = new Map<string, number>();
     for (const decision of this.options.openDecisions()) {
       if (wanted.has(decision.key)) continue;
       const own = decision.key.startsWith("fill:") && decision.source.ref.startsWith("fill:");
@@ -1283,6 +1299,11 @@ export class AgentsFill {
       if (task === null) continue;
       const line = lines.get(task);
       if (!own && line?.state !== "done") continue;
+      if (!line) {
+        const checks = (this.lineGone.get(decision.key) ?? 0) + 1;
+        gone.set(decision.key, checks);
+        if (checks < LINE_GONE_CHECKS) continue;
+      }
       let reason: string;
       if (!line) reason = `${task} is no longer in the tasks file`;
       else if (line.state === "done") reason = `${task} is done`;
@@ -1290,8 +1311,26 @@ export class AgentsFill {
       else if (line.state === "held") reason = `${task} is held for another reason now (${line.hold})`;
       else if (line.state === "started") reason = `${task} started again`;
       else reason = `${task} is ${line.state.replace(/_/g, " ")} now`;
+      gone.delete(decision.key);
       await this.options.withdraw(decision, `The hold lifted: ${reason}.`);
     }
+    // Counted again from zero once its line is back (or its decision closed)
+    this.lineGone = gone;
+  }
+
+  /**
+   * Where the decision of a hold stands (`key`: fillDecisionKey, or the
+   * run's escalationDecisionKey): open, answered (with the option), withdrawn,
+   * or none (never raised in the Decision Inbox; unknown without one). For
+   * code that keeps a hold only while its decision says so.
+   */
+  holdDecision(key: string): HoldDecisionState {
+    const decision = this.options.findDecision(key);
+    if (decision === undefined) return { status: "unknown" };
+    if (decision === null) return { status: "none" };
+    if (decision.status === "open") return { status: "open", id: decision.id };
+    if (decision.status === "withdrawn") return { status: "withdrawn", id: decision.id };
+    return { status: "answered", id: decision.id, optionId: decision.answer?.optionId ?? null };
   }
 
   /**

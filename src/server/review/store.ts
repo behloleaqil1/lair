@@ -29,8 +29,12 @@ import type { SignedGateResult } from "../../shared/policy-types.js";
  *    a new round, and the earlier rounds' records stay) and `model` (the
  *    model the assigned agent runs on); review_agent_assignments (reviews by
  *    agents: each round's run, attempts and state).
+ * 3: review_holds.by_owner: the hold was added from a browser signed in as
+ *    the owner (its decision needs an answer; anyone else's is a notice).
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
+
+const SCHEMA_3 = `ALTER TABLE review_holds ADD COLUMN by_owner INTEGER NOT NULL DEFAULT 0;`;
 
 const SCHEMA_2 = `
   CREATE TABLE review_requests_2 (
@@ -287,6 +291,7 @@ interface HoldRow {
   created_at: string;
   released_at: string | null;
   released_by: string | null;
+  by_owner: number;
 }
 
 interface MergeRow {
@@ -451,6 +456,7 @@ function holdOf(row: HoldRow): MergeHold {
     createdAt: row.created_at,
     releasedAt: row.released_at,
     releasedBy: row.released_by,
+    byOwner: row.by_owner === 1,
   };
 }
 
@@ -475,6 +481,8 @@ export class ReviewStore {
         this.db.exec(SCHEMA_1);
         // 1 -> 2: review_requests is rebuilt with `round` in its key (its rows become round 1)
         if (version < 2) this.db.exec(SCHEMA_2);
+        // 2 -> 3: holds added before it are counted as not the owner's (their decisions are notices)
+        if (version < 3) this.db.exec(SCHEMA_3);
         this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
       })();
     }
@@ -665,11 +673,14 @@ export class ReviewStore {
 
   // ============ HOLDS ============
 
-  addHold(project: string, pr: number | null, reason: string, by: string, at: string): MergeHold {
+  /** `byOwner`: added from a browser signed in as the owner (the server checked, not `by`) */
+  addHold(project: string, pr: number | null, reason: string, by: string, at: string, byOwner = false): MergeHold {
     const id = shortId("hold");
     this.db
-      .prepare(`INSERT INTO review_holds (id, project, pr, reason, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
-      .run(id, project, pr, reason, by, at);
+      .prepare(
+        `INSERT INTO review_holds (id, project, pr, reason, created_by, created_at, by_owner) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(id, project, pr, reason, by, at, byOwner ? 1 : 0);
     return this.getHold(project, id)!;
   }
 

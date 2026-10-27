@@ -61,8 +61,8 @@ const SCHEMA = `
     raised_via TEXT NOT NULL DEFAULT 'server',
     attention TEXT NOT NULL DEFAULT 'action'
   );
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_open_key
-    ON decisions(project, source_module, dedupe_key) WHERE status = 'open';
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_open_key_via
+    ON decisions(project, source_module, dedupe_key, raised_via) WHERE status = 'open';
   CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(status, project);
 
   CREATE TABLE IF NOT EXISTS decision_blocks (
@@ -185,6 +185,8 @@ export class DecisionStore {
         if (version >= 1 && version <= 2) {
           this.db.exec(`ALTER TABLE decisions ADD COLUMN attention TEXT NOT NULL DEFAULT 'action'`);
         }
+        // One open decision per key and per way in: an HTTP caller's key never stands for a module's own
+        this.db.exec(`DROP INDEX IF EXISTS idx_decisions_open_key`);
         this.db.exec(SCHEMA);
         this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
       })();
@@ -206,11 +208,13 @@ export class DecisionStore {
   raise(input: ValidRaise, at: string, limits: RaiseLimits = { via: "server" }): RaiseOutcome {
     const maxOpen = limits.maxOpenPerSource ?? Number.POSITIVE_INFINITY;
     return this.db.transaction((): RaiseOutcome => {
+      // Only a decision raised the same way: one raised over HTTP never answers for a module's own (and back)
       const existing = this.db
         .prepare(
-          `SELECT id FROM decisions WHERE project = ? AND source_module = ? AND dedupe_key = ? AND status = 'open'`,
+          `SELECT id FROM decisions WHERE project = ? AND source_module = ? AND dedupe_key = ? AND status = 'open'
+             AND raised_via = ?`,
         )
-        .get(input.project, input.source.module, input.key) as { id: string } | undefined;
+        .get(input.project, input.source.module, input.key, limits.via) as { id: string } | undefined;
       if (existing) {
         const known = new Set(this.blocksOf(existing.id));
         const added = input.blocks.filter((ref) => !known.has(ref));
@@ -320,22 +324,28 @@ export class DecisionStore {
     return { open: row.open, overdue: row.overdue, action: row.action, notices: row.open - row.action };
   }
 
-  /** The latest decision of this module with this key in the project (an open one first), or null. */
+  /**
+   * The latest decision this module raised in the server with this key in the
+   * project (an open one first), or null. Decisions raised over HTTP never
+   * count: their module name is only what the caller said.
+   */
   find(project: string, module: string, key: string, now?: string): Decision | null {
     const row = this.db
       .prepare(
         `SELECT * FROM decisions d WHERE d.project = ? AND d.source_module = ? AND d.dedupe_key = ?
+           AND d.raised_via = 'server'
          ORDER BY (d.status = 'open') DESC, d.rowid DESC LIMIT 1`,
       )
       .get(project, module, key) as DecisionRow | undefined;
     return row ? this.toDecision(row, now) : null;
   }
 
-  /** The module's open decisions in the project, oldest first. */
+  /** The module's open decisions in the project that it raised in the server, oldest first. */
   openOf(project: string, module: string, now?: string): Decision[] {
     const rows = this.db
       .prepare(
-        `SELECT * FROM decisions d WHERE d.project = ? AND d.source_module = ? AND d.status = 'open' ORDER BY d.rowid`,
+        `SELECT * FROM decisions d WHERE d.project = ? AND d.source_module = ? AND d.status = 'open'
+           AND d.raised_via = 'server' ORDER BY d.rowid`,
       )
       .all(project, module) as DecisionRow[];
     return rows.map((row) => this.toDecision(row, now));

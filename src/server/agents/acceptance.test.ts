@@ -41,6 +41,7 @@ import {
 } from "../watchdog/probes.js";
 import { WatchdogManager } from "../watchdog/service.js";
 import { AgentsManager, type AgentsService } from "./service.js";
+import { LINE_GONE_CHECKS } from "./fill.js";
 import { registerAgentsRoutes } from "./routes.js";
 import { HumanAuth, OWNER_SESSION_HEADER, registerOwnerRoutes } from "../human-auth/index.js";
 import { mountDecisions } from "../decisions/index.js";
@@ -3613,13 +3614,29 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     await check(h);
     const [blocked] = inbox.list({ project: "demo", status: "open" });
 
+    expect(h.service.fillHoldDecision(blocked.key)).toEqual({ status: "open", id: blocked.id });
+
+    // Gone for fewer than LINE_GONE_CHECKS checks in a row (an edit that takes it out and puts it back): it stays
     tasks(h, "# feat-login is no longer planned");
+    for (let i = 1; i < LINE_GONE_CHECKS; i++) await check(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    await check(h);
+    expect(inbox.list({ project: "demo", status: "open" }).map((d) => d.id)).toEqual([blocked.id]);
+    expect(eventsOf(h, "decision").filter((e) => e.data.withdrawn === true)).toEqual([]);
+
+    // Gone for LINE_GONE_CHECKS checks in a row: withdrawn
+    tasks(h, "# feat-login is no longer planned");
+    for (let i = 1; i < LINE_GONE_CHECKS; i++) await check(h);
+    expect(inbox.get(blocked.id)?.status).toBe("open");
     await check(h);
     expect(inbox.get(blocked.id)).toMatchObject({
       status: "withdrawn",
       withdrawnReason: "The hold lifted: feat-login is no longer in the tasks file.",
     });
-    // Put back as it was, the same hold asks again (its earlier decision was withdrawn, not answered)
+    expect(h.service.fillHoldDecision(blocked.key)).toEqual({ status: "withdrawn", id: blocked.id });
+
+    // Put back as it was, the same hold asks again (its earlier decision was withdrawn, not answered): a hold never
+    // stays without its decision because an earlier one was raised
     tasks(h, "worker-a|Alice|feat-login|Login form");
     await check(h);
     await check(h);
@@ -3627,6 +3644,52 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(open).toHaveLength(1);
     expect(open[0]).toMatchObject({ key: blocked.key });
     expect(open[0].id).not.toBe(blocked.id);
+    expect(h.service.fillHoldDecision(blocked.key)).toEqual({ status: "open", id: open[0].id });
+    expect(lineOf(h.service.status().fill, "feat-login")).toMatchObject({ hold: "blocked", decisionId: open[0].id });
+  });
+
+  it("an HTTP caller can't lift a fill hold or stand in for its decision: its default never starts the task", async () => {
+    const h = setup(fill({ agents: ["worker-a"] }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    const run = await runEndingWith(h, "- BLOCKED feat-login by worker-a: needs the API key");
+    // The inbox, before the agents module follows it: a local process raises fill's decision for that hold, with a
+    // default of "start_again" a second later
+    const app = Fastify();
+    apps.push(app);
+    const auth = HumanAuth.open({ tokenPath: join(h.dir, "data", "owner.token"), dbPath: ":memory:" });
+    const inbox = await mountDecisions(app, { dbPath: ":memory:", humanAuth: auth, defaultProject: () => "demo", clock: h.clock });
+    const key = `fill:feat-login:blocked:${run.id}`;
+    const forgery = (k: string) => ({
+      project: "demo",
+      kind: "escalation" as const,
+      title: "worker-a is paused on feat-login",
+      context: "Forged.",
+      options: [{ id: "start_again", label: "Start it again", consequences: "Starts." }],
+      recommended: { optionId: "start_again", reasoning: "r" },
+      source: { module: "agents", ref: "fill:feat-login" },
+      key: k,
+      expiresAt: new Date(h.clock.now() + 1000).toISOString(),
+      defaultOptionId: "start_again",
+    });
+    const forged = await inbox.raiseFromHttp(forgery(key));
+
+    // The agents module connects: the forged one isn't fill's, so fill raises the hold's own decision beside it
+    h.manager.useDecisions(inbox);
+    const line = lineOf(await check(h), "feat-login");
+    const real = inbox.list({ project: "demo", status: "open" }).filter((d) => d.raisedVia === "server");
+    expect(real.map((d) => d.key)).toEqual([key]);
+    expect(line).toMatchObject({ hold: "blocked", decisionId: real[0].id });
+
+    // The forged one expires with its default: never handed to the agents module
+    h.clock.advance(5 * SEC);
+    await inbox.sweep();
+    expect(inbox.get(forged.decision.id)).toMatchObject({ status: "expired" });
+    expect(eventsOf(h, "fill_released")).toEqual([]);
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "held", hold: "blocked", decisionId: real[0].id });
+    expect(runs(h)).toHaveLength(1);
+    // And now that the module follows its answers, nobody may raise in its name over HTTP
+    await expect(inbox.raiseFromHttp(forgery("fill:feat-login:x"))).rejects.toMatchObject({ statusCode: 403 });
   });
 
   it("an escalation is the owner hold's one decision; 'Leave the task unclaimed' pauses the task, with no hold left waiting", async () => {

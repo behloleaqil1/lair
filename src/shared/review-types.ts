@@ -170,6 +170,8 @@ export interface MergeHold {
   createdAt: string;
   releasedAt: string | null;
   releasedBy: string | null;
+  /** Added from a browser signed in as the owner (the server checked; `createdBy` is only what the caller said) */
+  byOwner?: boolean;
 }
 
 export type MergeConditionId =

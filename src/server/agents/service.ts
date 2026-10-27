@@ -86,6 +86,7 @@ import {
   queueMark,
   queueWindowEnd,
   reportedOutcome,
+  type HoldDecisionState,
   type ReportedOutcome,
 } from "./fill.js";
 import {
@@ -599,32 +600,56 @@ export class AgentsService {
   }
 
   /**
-   * Withdraw the escalations and "every profile is failing" decisions whose
-   * run chain moved on: started again some other way (the owner's run or a
-   * fresh session from Work, fill after the owner released its hold), or no
-   * longer waiting for a provider.
+   * Why an open decision of this module is moot, by what its ref is about
+   * (the part before the first ':'), or null while it still stands. Each
+   * kind of ref the tick follows has one entry; a module part that raises
+   * decisions about something else adds its own (`transient:<provider>`,
+   * say). Fill's `fill:` decisions are fill's to withdraw (it sees the lines).
    */
+  private readonly mootBy: ReadonlyMap<string, (decision: Decision, rest: string) => string | null> = new Map([
+    ["chain", (decision: Decision, chainId: string) => this.chainMoot(decision, chainId)],
+  ]);
+
+  /**
+   * A run chain's escalation or "every profile is failing" decision is moot
+   * once the chain moved on: started again some other way (the owner's run
+   * or a fresh session from Work, fill after the owner released its hold),
+   * or no longer waiting for a provider.
+   */
+  private chainMoot(decision: Decision, chainId: string): string | null {
+    const chain = this.store.chainRuns(chainId);
+    const last = chain[chain.length - 1];
+    if (!last) return "its runs are gone";
+    if (decision.key.startsWith("escalation:")) {
+      const attempts = Number(decision.key.slice(decision.key.lastIndexOf(":") + 1));
+      const latest = this.store.latestRunForTask(this.project, last.task);
+      if (chain.length > attempts || isActive(last.state)) return `${last.task} started again (run ${short(last.id)})`;
+      if (latest && latest.chainId !== chainId) return `${last.task} started again as run ${short(latest.id)}`;
+      return null;
+    }
+    if (decision.key.startsWith("exhausted:") && !chain.some((r) => r.state === "queued" || r.state === "waiting_lock")) {
+      return `nothing of ${last.task} waits for a provider any more (run ${short(last.id)} is ${last.state})`;
+    }
+    return null;
+  }
+
+  /** Withdraw this module's open decisions that are moot (mootBy), every tick. */
   private async withdrawMoot(t: Tick): Promise<void> {
     for (const decision of this.decisions().open?.(this.project) ?? []) {
-      if (!decision.source.ref.startsWith("chain:")) continue;
-      const chainId = decision.source.ref.slice("chain:".length);
-      const chain = this.store.chainRuns(chainId);
-      const last = chain[chain.length - 1];
-      let why: string | null = null;
-      if (!last) {
-        why = "its runs are gone";
-      } else if (decision.key.startsWith("escalation:")) {
-        const attempts = Number(decision.key.slice(decision.key.lastIndexOf(":") + 1));
-        const latest = this.store.latestRunForTask(this.project, last.task);
-        if (chain.length > attempts || isActive(last.state)) why = `${last.task} started again (run ${short(last.id)})`;
-        else if (latest && latest.chainId !== chainId) why = `${last.task} started again as run ${short(latest.id)}`;
-      } else if (decision.key.startsWith("exhausted:")) {
-        if (!chain.some((r) => r.state === "queued" || r.state === "waiting_lock")) {
-          why = `nothing of ${last.task} waits for a provider any more (run ${short(last.id)} is ${last.state})`;
-        }
-      }
+      const at = decision.source.ref.indexOf(":");
+      if (at <= 0) continue;
+      const why = this.mootBy.get(decision.source.ref.slice(0, at))?.(decision, decision.source.ref.slice(at + 1)) ?? null;
       if (why) await this.withdrawDecision(decision, `It moved on: ${why}.`, t.now);
     }
+  }
+
+  /**
+   * Where the decision of one of fill's holds stands (fill.ts holdDecision;
+   * `key` from fillDecisionKey or escalationDecisionKey): for code that keeps
+   * a hold only while its decision is open or was answered "keep".
+   */
+  fillHoldDecision(key: string): HoldDecisionState {
+    return this.fill ? this.fill.holdDecision(key) : { status: "unknown" };
   }
 
   /** The owner's pause of `task` (fill's `paused` hold): fill starts it again once they release it. */

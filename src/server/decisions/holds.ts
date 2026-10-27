@@ -18,7 +18,7 @@
  * inbox, so a refused or failed raise is logged and tried again on the next
  * reconcile.
  */
-import type { Decision, DecisionLink } from "../../shared/decision-types.js";
+import type { Decision, DecisionAttention, DecisionLink } from "../../shared/decision-types.js";
 import type { DecisionProducer } from "./types.js";
 
 /** The option that lifts the hold */
@@ -31,6 +31,8 @@ export interface OwnerHold {
   key: string;
   /** What the hold is about, e.g. "pr:12" */
   ref: string;
+  /** action (the default): it needs the owner; notice: someone else's hold, for their information */
+  attention?: DecisionAttention;
   /** One plain sentence: what is held and what that stops */
   title: string;
   /** Who held it, why, and what each answer does (markdown) */
@@ -108,6 +110,7 @@ export class HoldDecisions {
       const { created } = await producer.raise({
         project: this.project,
         kind: "other",
+        attention: hold.attention ?? "action",
         title: hold.title,
         context: hold.context,
         options: [

@@ -76,8 +76,9 @@ export function formFrom(view: NotificationStatusView): NotificationForm {
 /** The PUT body for the form, or what to fix first. */
 export function updateFromForm(form: NotificationForm): { ok: true; update: NotificationSettingsUpdate } | { ok: false; error: string } {
   const url = form.ntfyUrl.trim();
-  if (url !== "" && !/^https?:\/\/[^/\s]+\/\S+$/.test(url)) {
-    return { ok: false, error: "The ntfy topic must be an http or https URL with the topic, e.g. https://ntfy.sh/<topic>" };
+  // https, or plain http to this machine only (the server checks the same)
+  if (url !== "" && !/^(?:https:\/\/[^/\s]+|http:\/\/(?:localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\])(?::\d+)?)\/\S+$/.test(url)) {
+    return { ok: false, error: "The ntfy topic must be an https URL with the topic, e.g. https://ntfy.sh/<topic> (http only to localhost)" };
   }
   const text = form.reminderHours.trim();
   const hours = Number(text);

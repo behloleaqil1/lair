@@ -57,9 +57,13 @@ import type { DecisionProducer } from "../decisions/types.js";
 
 /** The module merge holds' decisions are raised as (apart from review's other questions, which nobody follows) */
 export const HOLD_DECISION_MODULE = "review-holds";
-const HOLD_KEY_PREFIX = "hold:";
-/** One decision per merge hold */
-export const holdDecisionKey = (id: string) => `${HOLD_KEY_PREFIX}${id}`;
+/**
+ * One decision per PR on hold (and one for holds of every merge), however
+ * many holds it has: keyed by what it holds and its oldest unreleased hold,
+ * so more holds join it, and a PR held again after all were released asks again.
+ */
+export const holdGroupKey = (group: readonly Pick<MergeHold, "id" | "pr">[]) =>
+  `holds:${group[0].pr === null ? "all" : `pr:${group[0].pr}`}:${group[0].id}`;
 
 export interface Clock {
   now(): number;
@@ -758,39 +762,42 @@ export class ReviewService {
       .find((f) => f.id === id)!;
   }
 
-  /** Hold merges (of one PR, or all): anyone may, and the owner is asked at once whether to release it. */
-  async addHold(pr: number | null, reason: string, by: string): Promise<MergeHold> {
-    const hold = this.o.store.addHold(this.project, pr, reason, by, this.now());
-    await this.holdDecisions.ensure(this.holdQuestion(hold));
+  /**
+   * Hold merges (of one PR, or all). Anyone may; `byOwner` says the server
+   * found the owner's session on the request (`by` is only the caller's
+   * word). The PR's holds have one decision: an action item when one of them
+   * is the owner's, else a notice (an agent's hold never pushes the owner).
+   */
+  async addHold(pr: number | null, reason: string, by: string, byOwner = false): Promise<MergeHold> {
+    const hold = this.o.store.addHold(this.project, pr, reason, by, this.now(), byOwner);
+    await this.reconcileHolds();
     return hold;
   }
 
-  /** Release a hold (the owner only: the route checks the session); its open decision is withdrawn. */
+  /** Release a hold (the owner only: the route checks the session); the PR's decision follows. */
   async releaseHold(id: string, by: string): Promise<MergeHold> {
     if (!this.o.store.releaseHold(this.project, id, by, this.now())) {
       const hold = this.o.store.getHold(this.project, id);
       throw new ReviewError(hold ? `Hold ${id} is already released` : `No hold ${id}`, hold ? 409 : 404);
     }
-    await this.holdDecisions.lifted(holdDecisionKey(id), `The hold was released (by ${by}).`);
+    await this.reconcileHolds();
     return this.o.store.getHold(this.project, id)!;
   }
 
   /**
-   * Ask through the Decision Inbox: every unreleased hold gets its one
-   * decision (also one held while Lair was down), and answering "Release the
-   * hold" releases it as the owner, as the Release button does.
+   * Ask through the Decision Inbox: every PR with unreleased holds (and the
+   * project, for holds of every merge) gets its one decision, also for holds
+   * added while Lair was down; answering "Release the hold" releases them as
+   * the owner, as the Release button does.
    */
   async useDecisions(producer: DecisionProducer): Promise<void> {
     this.holdDecisions.use(producer, async (key) => {
-      const id = key.startsWith(HOLD_KEY_PREFIX) ? key.slice(HOLD_KEY_PREFIX.length) : null;
-      const hold = id ? this.o.store.getHold(this.project, id) : null;
-      if (!hold || hold.releasedAt !== null) return; // released meanwhile: nothing to do
-      await this.releaseHold(hold.id, "owner");
+      // Only the group the decision is about, as it still is (a hold added or released since changes its key)
+      const group = this.holdGroups().find((g) => holdGroupKey(g) === key);
+      for (const hold of group ?? []) this.o.store.releaseHold(this.project, hold.id, "owner", this.now());
+      await this.reconcileHolds();
     });
-    await this.holdDecisions.reconcile(
-      this.o.store.unreleasedHolds(this.project).map((hold) => this.holdQuestion(hold)),
-      () => "The hold is no longer there.",
-    );
+    await this.reconcileHolds();
   }
 
   /** Stop following the hold decisions' answers (a reload or shutdown); they wait in the inbox. */
@@ -798,27 +805,53 @@ export class ReviewService {
     this.holdDecisions.close();
   }
 
-  /** The hold's decision, in plain words: the hold's reason is the holder's text, so it stays in the context. */
-  private holdQuestion(hold: MergeHold): OwnerHold {
-    const what = hold.pr === null ? `Every merge in ${this.project}` : `PR #${hold.pr}`;
+  /** The unreleased holds by what they hold (a PR, or every merge), oldest first. */
+  private holdGroups(): MergeHold[][] {
+    const groups = new Map<string, MergeHold[]>();
+    for (const hold of this.o.store.unreleasedHolds(this.project)) {
+      const scope = hold.pr === null ? "all" : String(hold.pr);
+      groups.set(scope, [...(groups.get(scope) ?? []), hold]);
+    }
+    return [...groups.values()];
+  }
+
+  private reconcileHolds(): Promise<void> {
+    return this.holdDecisions.reconcile(
+      this.holdGroups().map((group) => this.holdQuestion(group)),
+      () => "The holds it was about changed: released, or the one it was raised for is no longer the oldest.",
+    );
+  }
+
+  /** A PR's holds' decision, in plain words: what the holders wrote stays in the context, as data. */
+  private holdQuestion(group: MergeHold[]): OwnerHold {
+    const first = group[0];
+    const what = first.pr === null ? `Every merge in ${this.project}` : `PR #${first.pr}`;
+    const by = group.length === 1 ? first.createdBy : `${first.createdBy} and ${group.length - 1} more`;
+    const shown = group.slice(0, 20);
     return {
-      key: holdDecisionKey(hold.id),
-      ref: hold.pr === null ? `holds:${this.project}` : `pr:${hold.pr}`,
-      title: `${what} ${hold.pr === null ? "is" : "can't merge: it is"} held by ${hold.createdBy}`,
+      key: holdGroupKey(group),
+      ref: first.pr === null ? `holds:${this.project}` : `pr:${first.pr}`,
+      // Anyone may add a hold: one added without the owner's session is for their information only
+      attention: group.some((hold) => hold.byOwner === true) ? "action" : "notice",
+      title: `${what} ${first.pr === null ? "is" : "can't merge: it is"} held by ${by}`,
       context: [
-        `${hold.createdBy} held ${hold.pr === null ? "every merge in this project" : `the merge of PR #${hold.pr}`} at ${hold.createdAt}. Their reason:`,
+        `${what} ${group.length === 1 ? "has one hold" : `has ${group.length} holds`}. What the holders wrote:`,
+        ...shown.flatMap((hold) => [
+          "",
+          `${hold.createdBy}${hold.byOwner ? " (you)" : ""}, at ${hold.createdAt}:`,
+          "```text",
+          asContextText(hold.reason, 500),
+          "```",
+        ]),
+        ...(group.length > shown.length ? ["", `... and ${group.length - shown.length} more (see PRs).`] : []),
         "",
-        "```text",
-        asContextText(hold.reason),
-        "```",
-        "",
-        "Only you release a hold. Nothing merges while it is on, by the policy or by you.",
+        "Only you release a hold. Nothing merges while one is on, by the policy or by you.",
       ].join("\n"),
       releaseLabel: "Release the hold",
-      releaseConsequences: `${what} may merge again once the policy allows it (as the Release button in PRs does).`,
+      releaseConsequences: `Lair releases every hold on ${first.pr === null ? "every merge" : `PR #${first.pr}`} (as the Release button in PRs does), so it may merge again once the policy allows it.`,
       keepLabel: "Keep it held",
-      keepConsequences: "The hold stays until you release it in PRs. Nothing more is asked about it.",
-      blocks: [hold.pr === null ? `review:${this.project}:merges` : `review:${this.project}:pr:${hold.pr}`],
+      keepConsequences: "The holds stay until you release them in PRs. Nothing more is asked about them.",
+      blocks: [first.pr === null ? `review:${this.project}:merges` : `review:${this.project}:pr:${first.pr}`],
     };
   }
 

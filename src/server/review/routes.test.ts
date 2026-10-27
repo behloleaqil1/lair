@@ -20,6 +20,9 @@ import { signIn } from "../../client/owner-session";
 import { mergePr, prStatus, releaseHold, resolveFinding, submitOwnerReview } from "../../client/review-api";
 import { readinessOf } from "../../client/pr-readiness";
 import { FakeClock, FakeGit, FakeRemote, fakeGitHubApi, type FakeFile, type Person } from "./testing/fakes.js";
+import { DecisionInbox } from "../decisions/service.js";
+import { DecisionStore } from "../decisions/store.js";
+import { MemorySecretStore } from "../decisions/secrets.js";
 
 const NOW = Date.parse("2026-03-02T12:00:00.000Z");
 const OWNER: Person = { name: "Example Owner", email: "owner@example.com" };
@@ -596,6 +599,32 @@ describe("review routes: review, policy, merge", () => {
     expect(after.data.findings.find((f: { id: string }) => f.id === finding.id).status).toBe("open");
     expect(after.data.holds).toHaveLength(1);
     expect(remote.branches.get("main")).toBe(base);
+  });
+
+  it("a hold from anyone but the owner's browser is a notice, whatever `by` says; one item per PR however many holds", async () => {
+    const { app, owner } = await boot();
+    const store = new DecisionStore(":memory:");
+    const inbox = new DecisionInbox({ store, secrets: new MemorySecretStore(), clock: { now: () => NOW } });
+    try {
+      await manager!.useDecisions(inbox);
+      const hold = (pr: number, by: string, headers: Record<string, string> = {}) =>
+        app.inject({ method: "POST", url: "/api/review/holds", headers, payload: { reason: "wait", pr, by } });
+
+      // An agent (or any local process) claiming to be the owner: a notice, never counted or pushed
+      for (let i = 0; i < 50; i++) expect((await hold(7, "owner")).statusCode).toBe(200);
+      let open = inbox.list({ project: "demo", status: "open" });
+      expect(open.map((d) => [d.source.ref, d.attention])).toEqual([["pr:7", "notice"]]);
+      expect(inbox.counts()).toMatchObject({ action: 0, notices: 1 });
+
+      // The owner's own hold, from their signed-in browser: an action item
+      expect((await hold(8, "owner", owner)).statusCode).toBe(200);
+      open = inbox.list({ project: "demo", status: "open" });
+      expect(open.find((d) => d.source.ref === "pr:8")).toMatchObject({ attention: "action", title: "PR #8 can't merge: it is held by owner" });
+      expect(inbox.counts()).toMatchObject({ action: 1, notices: 1 });
+    } finally {
+      manager!.get("demo")?.stopDecisions();
+      store.close();
+    }
   });
 
   it("lets the owner review, resolve, release and merge through the dashboard's client helpers", async () => {

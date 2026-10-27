@@ -55,7 +55,7 @@ describe("review.db: schema 1 to 2", () => {
       const version = reader.pragma("user_version", { simple: true });
       reader.close();
       expect(version).toBe(SCHEMA_VERSION);
-      expect(SCHEMA_VERSION).toBe(2);
+      expect(SCHEMA_VERSION).toBe(3);
 
       const used = store.getRequest("demo", 7, HEAD, 0)!;
       expect(used).toMatchObject({
@@ -79,7 +79,8 @@ describe("review.db: schema 1 to 2", () => {
       ]);
       expect(store.getAuthor("demo", 7)).toEqual({ id: "worker-a", kind: "agent" });
       expect(store.currentHead("demo", 7)).toBe(HEAD);
-      expect(store.activeHolds("demo", 7)).toEqual([expect.objectContaining({ id: "hold-1", reason: "freeze" })]);
+      // A hold from before by_owner says "owner" only in its text: it isn't counted as the owner's
+      expect(store.activeHolds("demo", 7)).toEqual([expect.objectContaining({ id: "hold-1", reason: "freeze", byOwner: false })]);
 
       // A new request for slot 0 is round 2, next to round 1; the agent table works
       const round = store.recordRequest("demo", 7, HEAD, 0, "agents", "rev-b: run", "2026-03-02T12:00:00.000Z", {

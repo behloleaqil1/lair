@@ -38,8 +38,19 @@ describe("the notification form", () => {
   });
 
   it("asks for a topic URL and whole hours before sending anything", () => {
-    for (const ntfyUrl of ["ntfy.sh/topic", "https://ntfy.sh/", "ftp://ntfy.sh/topic", "https://ntfy.sh/a b"]) {
+    for (const ntfyUrl of [
+      "ntfy.sh/topic",
+      "https://ntfy.sh/",
+      "ftp://ntfy.sh/topic",
+      "https://ntfy.sh/a b",
+      "http://ntfy.sh/topic",
+      "http://192.168.1.5/topic",
+    ]) {
       expect(updateFromForm({ desktop: false, ntfyUrl, reminderHours: "4" })).toMatchObject({ ok: false });
+    }
+    // Plain http only to this machine
+    for (const ntfyUrl of ["http://localhost:8090/topic", "http://127.0.0.1/topic"]) {
+      expect(updateFromForm({ desktop: false, ntfyUrl, reminderHours: "4" })).toMatchObject({ ok: true });
     }
     for (const reminderHours of ["", "1.5", "-1", "169", "four"]) {
       expect(updateFromForm({ desktop: false, ntfyUrl: "", reminderHours })).toMatchObject({ ok: false });

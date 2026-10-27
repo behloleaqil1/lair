@@ -85,8 +85,14 @@ export class Notifier {
   private timers: Timers;
   private log: (line: string) => void;
   private base: string;
-  /** Action items raised since the last notification: id -> title */
-  private pending = new Map<string, string>();
+  /** Action items raised since the last notification: id -> title, and what it is about (project, module, key) */
+  private pending = new Map<string, { title: string; about: string | null }>();
+  /**
+   * When each condition (project, module, key) was last in a notification: a
+   * decision withdrawn and raised again for the same hold (a line taken out
+   * of the tasks file and put back) doesn't notify again within the window
+   */
+  private notifiedAbout = new Map<string, number>();
   private lastSentAt: number | null = null;
   private cancelFlush: (() => void) | null = null;
   private cancelReminder: (() => void) | null = null;
@@ -153,10 +159,30 @@ export class Notifier {
     if (this.stopped || data.attention !== "action") return;
     const id = typeof data.decisionId === "string" ? data.decisionId.slice(0, 100) : null;
     if (!id) return;
-    if (!notificationsOn(this.current())) return;
+    const settings = this.current();
+    if (!notificationsOn(settings)) return;
+    const about =
+      typeof data.project === "string" && typeof data.module === "string" && typeof data.key === "string"
+        ? `${data.project}\n${data.module}\n${data.key}`.slice(0, 600)
+        : null;
+    // The same condition asked again soon after it was notified (withdrawn, then raised again): no second push
+    const told = about ? this.notifiedAbout.get(about) : undefined;
+    if (told !== undefined && this.clock.now() - told < this.repeatWindow(settings)) return;
     if (!this.pending.has(id) && this.pending.size >= MAX_PENDING) return;
-    this.pending.set(id, typeof data.title === "string" ? data.title.slice(0, 1000) : "");
+    this.pending.set(id, { title: typeof data.title === "string" ? data.title.slice(0, 1000) : "", about });
     this.scheduleFlush();
+  }
+
+  /** How long a condition that was notified isn't notified again: the reminder's hours (a day without one), at least the batch. */
+  private repeatWindow(settings: NotificationSettings): number {
+    return Math.max(BATCH_MS, settings.reminderHours > 0 ? settings.reminderHours * 60 * 60_000 : DAY_MS);
+  }
+
+  private rememberNotified(abouts: (string | null)[], at: number): void {
+    for (const about of abouts) if (about) this.notifiedAbout.set(about, at);
+    if (this.notifiedAbout.size > MAX_PENDING) {
+      for (const [about, t] of this.notifiedAbout) if (at - t >= DAY_MS) this.notifiedAbout.delete(about);
+    }
   }
 
   private scheduleFlush(): void {
@@ -197,9 +223,10 @@ export class Notifier {
     if (still.length === 0) return;
     const message: NotificationMessage =
       still.length === 1
-        ? { title: titled(still[0][1], ", needs you", "a decision"), body: `Open ${this.link(still[0][0])}`, link: this.link(still[0][0]) }
+        ? { title: titled(still[0][1].title, ", needs you", "a decision"), body: `Open ${this.link(still[0][0])}`, link: this.link(still[0][0]) }
         : { title: `${HEAD}${still.length} things need you`, body: `Open ${this.link()}`, link: this.link() };
     await this.deliver("batch", message, settings);
+    this.rememberNotified(still.map(([, item]) => item.about), this.clock.now());
   }
 
   /** Send through every channel on; never throws. */

@@ -327,8 +327,10 @@ export async function registerReviewRoutes(
     app.post("/api/review/holds", async (request, reply) => {
       const body = HoldBody.safeParse(request.body);
       if (!body.success) return fail(reply, 400, `Invalid hold: ${firstIssue(body.error)}`);
+      // Anyone may hold; only a hold from the owner's signed-in browser asks for their answer (`by` is the caller's word)
+      const byOwner = auth.verifyRequest(request.headers, { method: request.method }).ok;
       return withService(request.query, reply, async (service) =>
-        service.addHold(body.data.pr, body.data.reason, body.data.by),
+        service.addHold(body.data.pr, body.data.reason, body.data.by, byOwner),
       );
     });
 

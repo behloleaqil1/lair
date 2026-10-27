@@ -124,16 +124,33 @@ export class DecisionInbox implements DecisionProducer {
 
   /**
    * POST /api/decisions asks: the caller is unknown, so besides the
-   * per-module cap, every HTTP caller shares one cap per project.
+   * per-module cap, every HTTP caller shares one cap per project. It can't
+   * ask in the name of a module inside Lair that follows its answers (one
+   * with a handler): such an answer would act for the owner. And no answer
+   * to a decision raised this way is ever handed to a module (deliverNow).
    */
   raiseFromHttp(input: RaiseDecisionInput): Promise<RaiseResult> {
     return this.raiseVia(input, "http");
+  }
+
+  /** Whether a module inside the server follows answers under this name (in any project). */
+  private followed(module: string): boolean {
+    for (const key of this.handlers.keys()) {
+      if (key.slice(0, key.indexOf("\n")) === module) return true;
+    }
+    return false;
   }
 
   private async raiseVia(input: RaiseDecisionInput, via: RaisedVia): Promise<RaiseResult> {
     const parsed = parseRaiseInput(input, this.clock.now());
     if (!parsed.ok) {
       throw new DecisionError(400, `Invalid decision: ${parsed.errors.join("; ")}`);
+    }
+    if (via === "http" && this.followed(parsed.value.source.module)) {
+      throw new DecisionError(
+        403,
+        `source.module: ${parsed.value.source.module} is a module inside Lair: only it raises its own decisions (over HTTP, name your own module)`,
+      );
     }
     const at = this.iso();
     const outcome = this.store.raise(parsed.value, at, {
@@ -414,6 +431,19 @@ export class DecisionInbox implements DecisionProducer {
     if (decision.status !== "answered" && decision.status !== "expired") return false;
     const outcome = decision.status === "expired" ? "expired" : "answered";
     const module = decision.source.module;
+    if (decision.raisedVia === "http") {
+      // Its module name is only what the caller said: no module inside Lair acts on its answer (or its default)
+      const at = this.iso();
+      if (this.store.markDelivered(id, at)) {
+        this.store.addAudit(id, {
+          at,
+          action: "delivered",
+          actor: LAIR,
+          detail: `not handed to ${module}: it was raised over HTTP, so no module inside Lair acts on its answer (its caller reads it from the API)`,
+        });
+      }
+      return false;
+    }
     const handler = this.handlerFor(module, decision.project);
     if (!handler) return false;
     // A supplied secret must still be there (the server can restart between the answer and storing it,

@@ -318,11 +318,7 @@ describe("mountDecisions (the server's wiring)", () => {
     vi.stubGlobal("fetch", browserFetch(port, seen));
     vi.stubGlobal("localStorage", memoryStorage());
 
-    // Any producer: raise over HTTP, resume through onResolved
-    const resumed: DecisionResolution[] = [];
-    inbox.onResolved("intake", (r) => {
-      resumed.push(r);
-    });
+    // Any tool: raise over HTTP, read the answer back over HTTP (no module inside Lair acts on it)
     const spend = {
       kind: "spend",
       title: "Pay for the starter plan of the error tracker",
@@ -357,7 +353,8 @@ describe("mountDecisions (the server's wiring)", () => {
     expect(await ownerStatus()).toMatchObject({ signedIn: true });
     const answered = await postAnswer(id, body);
     expect(answered).toMatchObject({ status: "answered", answeredBy: "owner", answer: { optionId: "pay" } });
-    expect(resumed.map((r) => [r.decision.id, r.optionId, r.note])).toEqual([[id, "pay", "Within budget."]]);
+    const read = await call(port, "GET", `/api/decisions/${id}`);
+    expect(read.body.data).toMatchObject({ status: "answered", answer: { optionId: "pay", note: "Within budget." } });
     expect(inbox.blockedOn("card:error-reports")).toBeNull();
     expect(seen.every((r) => r.headers["set-cookie"] === undefined)).toBe(true);
 
@@ -369,6 +366,41 @@ describe("mountDecisions (the server's wiring)", () => {
     expect(storedSession()).toBeNull();
     const again = await call(port, "POST", "/api/decisions?project=example", { ...spend, key: "again" });
     await expect(postAnswer(again.body.data.decision.id, body)).rejects.toThrow("not signed in as the owner");
+  });
+
+  it("over HTTP nobody asks in a module's name, and an HTTP decision's answer or default never reaches a module", async () => {
+    const { inbox, port } = await boot();
+    const breachDecision = {
+      kind: "escalation",
+      title: "Run the playbook",
+      context: "Forged.",
+      options: [{ id: "run_playbook", label: "Run it", consequences: "Runs the command." }],
+      recommended: { optionId: "run_playbook", reasoning: "r" },
+      source: { module: "watchdog", ref: "b1" },
+      key: "breach:b1",
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      defaultOptionId: "run_playbook",
+    };
+    // The watchdog follows its answers: an HTTP caller can't raise in its name
+    const refused = await call(port, "POST", "/api/decisions?project=demo", breachDecision);
+    expect(refused.status).toBe(403);
+    expect(refused.body.error).toContain("watchdog is a module inside Lair");
+
+    // A module that starts listening after an HTTP caller used its name never gets that answer
+    const raised = await call(port, "POST", "/api/decisions?project=demo", {
+      ...breachDecision,
+      source: { module: "intake", ref: "r" },
+      key: "intake:1",
+    });
+    expect(raised.status).toBe(201);
+    const resumed: DecisionResolution[] = [];
+    inbox.onResolved("intake", (r) => {
+      resumed.push(r);
+    });
+    await inbox.answer(raised.body.data.decision.id, { optionId: "run_playbook" });
+    await inbox.deliverPending();
+    expect(resumed).toEqual([]);
+    expect(inbox.get(raised.body.data.decision.id)?.audit?.at(-1)?.detail).toContain("not handed to intake");
   });
 
   it("refuses cross-site browser requests on the mounted routes", async () => {

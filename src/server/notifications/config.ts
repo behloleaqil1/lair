@@ -49,16 +49,31 @@ export type NotificationConfigResult =
   | { ok: true; settings: NotificationSettings }
   | { ok: false; errors: string[]; settings: NotificationSettings };
 
-/** An http(s) URL with a host, without credentials in it (a token goes in token_file), or why not. */
+/** This machine: plain http stays on it, so nothing (the token, the titles) crosses a network unencrypted. */
+function isLoopback(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.+$/, "");
+  if (host === "localhost" || host.endsWith(".localhost") || host === "::1") return true;
+  const parts = host.split(".");
+  return parts.length === 4 && parts[0] === "127" && parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255);
+}
+
+/**
+ * An https URL with a host (plain http only to this machine: a self-hosted
+ * ntfy behind a local proxy), without credentials in it (a token goes in
+ * token_file), or why not.
+ */
 export function ntfyUrlProblem(value: string): string | null {
   let url: URL;
   try {
     url = new URL(value);
   } catch {
-    return "must be an http or https URL";
+    return "must be an https URL";
   }
-  if (url.protocol !== "http:" && url.protocol !== "https:") return "must be an http or https URL";
+  if (url.protocol !== "http:" && url.protocol !== "https:") return "must be an https URL";
   if (!url.hostname) return "must name a host";
+  if (url.protocol === "http:" && !isLoopback(url.hostname)) {
+    return "must be https (plain http only to this machine: localhost or 127.0.0.1), so the token and titles aren't sent in the clear";
+  }
   if (url.username || url.password) return "must not carry a user or password (put a token in ntfy.token_file)";
   if (url.pathname === "/" || url.pathname === "") return "must name the topic, e.g. https://ntfy.sh/<topic>";
   return null;
