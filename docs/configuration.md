@@ -1905,6 +1905,34 @@ server:
 
 The steps get the server's environment without its `LAIR_*` variables and without the token variables the projects name (`review.token_env` where reviews are on, `executors.github.token_env` where pipelines are configured, `agents.env_passthrough` where the agents module is on). Their output goes to the server's log line by line and is shown in the dashboard. When a step fails (a non-zero exit, a timeout, a command that can't start), the update stops there, nothing restarts, and the error is shown. The file is read at each use, so changing it needs no restart. `GET /api/owner/restart` (owner only) returns the state, the steps, the service manager and the update's latest output.
 
+## Notifications
+
+Lair can tell you when something needs your answer, on this machine's desktop and on your phone (through [ntfy](https://ntfy.sh)), so you don't have to keep the dashboard open. It is off until you turn a channel on, in **Settings → Notifications** (the owner only) or in `data/server.yaml`, Lair's own config. Notifications are never configured in a project's YAML.
+
+```yaml
+notifications:
+  desktop: true                        # macOS: osascript; Linux: notify-send, when it is installed
+  ntfy:                                # optional phone push
+    url: https://ntfy.sh/<topic>       # or your self-hosted ntfy
+    token_file: ntfy.token             # optional; relative to data/
+  reminder_hours: 4                    # daily reminder while action items stay open longer (0: off)
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `desktop` | boolean | `false` | Show a desktop notification. On macOS through `osascript`, on Linux through `notify-send` (libnotify) when it is on `PATH`; elsewhere this channel reports that it can't |
+| `ntfy.url` | http(s) URL | — | Your ntfy topic: `https://ntfy.sh/<topic>` or a self-hosted server. Use a topic nobody can guess, or a protected one with `token_file`. No user or password in the URL |
+| `ntfy.token_file` | path | — | A file holding an ntfy access token, sent as `Authorization: Bearer`. It is never shown in the dashboard, returned by the API or logged |
+| `reminder_hours` | integer, 0 to 168 | `4` | Remind you once a day while action items have been open longer than this; `0` turns the reminder off |
+
+**When Lair notifies.** A new decision that needs your answer (an **action** item, see [Decision Inbox](#decision-inbox)) notifies within a minute. A **notice** (for your information, nothing to choose) never notifies. At most one notification goes out per minute: items raised together, or within a minute of the last notification, go out as one, as "Lair: 3 things need you". One item reads "Lair: kiro-7 is paused: its last run failed while Lair was restarting, needs you". An item answered or withdrawn before its turn is left out. While action items stay open longer than `reminder_hours`, Lair reminds you once a day ("Lair: 2 things still need you"); the time of the last reminder is kept in `data/notifications-state.json`, so a restart doesn't send another. Each notification links to the dashboard: the decision itself (`#/decisions/<id>`) for one item, the Decision Inbox for several.
+
+**What a notification holds.** The item's title (a plain sentence, at most 120 characters with control characters removed) and the dashboard link. Never a decision's context, a log line or a secret.
+
+**Safety.** `data/server.yaml` is read again at every use (a change needs no restart) through the same checks as for Restart: a regular file, not a symbolic link, owned by the user Lair runs as, and not writable by its group or others; a file that fails them turns notifications off, and Settings says why. The token file gets the same checks, and must not be readable by its group or others either (`chmod 600`). Commands are argv arrays, never a shell: on macOS the title and text reach a constant AppleScript only as its arguments (`osascript -e 'on run argv' ... <title> <text>`), and `notify-send` gets them after `--`. Each command and each ntfy request has a 10 second timeout. A channel that fails (an error, a non-zero exit, no answer, an HTTP error) is logged once per distinct problem and never holds anything up.
+
+**Settings.** The Notifications card turns desktop notifications on or off, sets the ntfy topic and the reminder hours, and has **Send test notification**, which sends "Lair: test notification" through every channel that is on and shows what each did. Saving writes only the `notifications:` section of `data/server.yaml` (every other key and comment stays as it was, a `token_file` set in the file is kept) atomically, and leaves the file `0600`; a file that fails the checks above is refused, not overwritten. The routes are owner only: `GET /api/owner/notifications` (the settings, why the file was refused, whether desktop notifications work here, and the last send's results), `PUT /api/owner/notifications` (`{desktop, ntfyUrl, reminderHours}`), and `POST /api/owner/notifications/test` (`409` while notifications are off).
+
 ## Environment variables
 
 | Variable | Used by | Description |

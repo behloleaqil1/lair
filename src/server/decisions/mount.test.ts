@@ -201,6 +201,15 @@ describe("mountDecisions (the server's wiring)", () => {
     expect(index.indexOf("await mountDecisions(")).toBeLessThan(index.indexOf("watchdogs.start()"));
     // ... and before it starts agent supervision, which raises decisions too
     expect(index.indexOf("await mountDecisions(")).toBeLessThan(index.indexOf("agents.start()"));
+    // Notifications follow the same inbox, from data/server.yaml, before anything raises a decision
+    expect(index).toMatch(
+      /await mountNotifications\(fastify, \{\s*configPath: join\(process\.cwd\(\), "data", "server\.yaml"\),\s*statePath: join\(process\.cwd\(\), "data", "notifications-state\.json"\),\s*events: getEventBus\(\),\s*inbox: decisionInbox,\s*humanAuth,/,
+    );
+    expect(index.indexOf("await mountNotifications(")).toBeLessThan(index.indexOf("watchdogs.start()"));
+    expect(index.indexOf("await mountNotifications(")).toBeLessThan(index.indexOf("agents.start()"));
+    // The other hold owners follow their holds' decisions through the same inbox
+    expect(index).toContain("delivery.useDecisions(decisionInbox);");
+    expect(index).toContain("reviews.useDecisions(decisionInbox);");
   });
 
   it("drives raise -> list -> answer -> producer resumed over HTTP", async () => {

@@ -13,6 +13,7 @@ import { DataService } from "./services/data.js";
 import { isValidDragonId } from "./parsers/dragon-config.js";
 import { registerRootGuards, requireValidIdParam } from "./root-guards.js";
 import { mountDecisions } from "./decisions/index.js";
+import { mountNotifications } from "./notifications/index.js";
 import {
   HumanAuth,
   OWNER_ONLY_PREFIXES,
@@ -421,6 +422,18 @@ const decisionInbox = await mountDecisions(fastify, {
   defaultProject: () => getDefaultProject(),
   events: getEventBus(),
   producers: [watchdogs, agents],
+});
+
+// Notifications (src/server/notifications/): opt-in desktop and ntfy pushes when a new action item opens,
+// batched (one a minute at most), with a daily reminder; configured in data/server.yaml. Owner-only routes under
+// /api/owner. Notices are never notified
+await mountNotifications(fastify, {
+  configPath: join(process.cwd(), "data", "server.yaml"),
+  statePath: join(process.cwd(), "data", "notifications-state.json"),
+  events: getEventBus(),
+  inbox: decisionInbox,
+  humanAuth,
+  dashboardUrl: dashboardUrlFor(HOST, PORT),
 });
 
 // Reviews and policy merge: one per project with `review.enabled: true`;

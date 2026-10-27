@@ -14,6 +14,9 @@
  *     # What starts Lair again after Restart: launchd | systemd | none
  *     # (default: detected from the environment, when Lair can tell)
  *     service_manager: launchd
+ *   # Desktop and phone notifications: src/server/notifications/config.ts
+ *   notifications:
+ *     desktop: true
  *
  * The update command runs with the server's rights, so whoever can write
  * this file can run code as Lair. It lives in data/, beside the owner
@@ -71,6 +74,9 @@ const ServerSchema = z
       })
       .strict()
       .default({}),
+    // The notifications module's own section (src/server/notifications/config.ts): parsed there, so a
+    // mistake in it never stops a restart
+    notifications: z.unknown().optional(),
   })
   .strict();
 
@@ -100,17 +106,65 @@ export interface ServerConfigFileOptions {
   platform?: NodeJS.Platform;
 }
 
-/** Why the server config file can't be trusted, or null. */
-function fileProblem(stat: Stats, options: ServerConfigFileOptions): string | null {
+export interface CheckedFileOptions extends ServerConfigFileOptions {
+  /** A secret (a token file): its group and others may not read it either */
+  secret?: boolean;
+}
+
+/**
+ * Why a file of Lair's own (data/server.yaml, or a token file it names)
+ * can't be trusted, or null: a symbolic link, not a regular file, writable
+ * by its group or others (for a secret, readable by them too), or another
+ * user's.
+ */
+export function serverFileProblem(stat: Stats, options: CheckedFileOptions = {}): string | null {
   if (stat.isSymbolicLink()) return "it is a symbolic link";
   if (!stat.isFile()) return "it is not a regular file";
   if ((options.platform ?? process.platform) === "win32") return null;
   if ((stat.mode & 0o022) !== 0) {
     return `its group or other users may write it (mode ${(stat.mode & 0o777).toString(8)}): chmod 600 it`;
   }
+  if (options.secret && (stat.mode & 0o044) !== 0) {
+    return `its group or other users may read it (mode ${(stat.mode & 0o777).toString(8)}): chmod 600 it`;
+  }
   const uid = options.uid ?? process.getuid?.();
   if (uid !== undefined && stat.uid !== uid) return `it is owned by another user (uid ${stat.uid}, not ${uid})`;
   return null;
+}
+
+/** A checked file's text (null when it doesn't exist), or why it was refused ("refused: ..."). */
+export type CheckedRead = { ok: true; text: string | null } | { ok: false; error: string };
+
+/**
+ * Read a file of Lair's own after serverFileProblem() passes, checked again
+ * on the open descriptor, so the file checked is the file read. A missing
+ * file is `text: null`.
+ */
+export function readCheckedFile(path: string, options: CheckedFileOptions = {}, maxBytes = MAX_BYTES): CheckedRead {
+  const refuse = (why: string): CheckedRead => ({ ok: false, error: `refused: ${why}` });
+  let link: Stats;
+  try {
+    link = lstatSync(path);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { ok: true, text: null };
+    return refuse(e instanceof Error ? e.message : String(e));
+  }
+  const problem = serverFileProblem(link, options);
+  if (problem) return refuse(problem);
+  try {
+    const text = readRegularFile(path, {
+      maxBytes,
+      noFollow: true,
+      check: (open) => {
+        if (open.ino !== link.ino || open.dev !== link.dev) throw new Error("it was replaced while it was read");
+        const again = serverFileProblem(open, options);
+        if (again) throw new Error(again);
+      },
+    });
+    return { ok: true, text };
+  } catch (e) {
+    return refuse(e instanceof Error ? e.message : String(e));
+  }
 }
 
 /**
@@ -120,36 +174,11 @@ function fileProblem(stat: Stats, options: ServerConfigFileOptions): string | nu
  * file checked is the file read.
  */
 export function loadServerConfig(path: string, options: ServerConfigFileOptions = {}): ServerConfigResult {
-  const refuse = (why: string): ServerConfigResult => ({
-    ok: false,
-    errors: [`refused: ${why}`],
-    settings: DEFAULT_SERVER_SETTINGS,
-  });
-  let link: Stats;
+  const read = readCheckedFile(path, options);
+  if (!read.ok) return { ok: false, errors: [read.error], settings: DEFAULT_SERVER_SETTINGS };
+  if (read.text === null) return { ok: true, settings: DEFAULT_SERVER_SETTINGS };
   try {
-    link = lstatSync(path);
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { ok: true, settings: DEFAULT_SERVER_SETTINGS };
-    return refuse(e instanceof Error ? e.message : String(e));
-  }
-  const problem = fileProblem(link, options);
-  if (problem) return refuse(problem);
-  let text: string;
-  try {
-    text = readRegularFile(path, {
-      maxBytes: MAX_BYTES,
-      noFollow: true,
-      check: (open) => {
-        if (open.ino !== link.ino || open.dev !== link.dev) throw new Error("it was replaced while it was read");
-        const again = fileProblem(open, options);
-        if (again) throw new Error(again);
-      },
-    });
-  } catch (e) {
-    return refuse(e instanceof Error ? e.message : String(e));
-  }
-  try {
-    return parseServerConfig(parseYaml(text));
+    return parseServerConfig(parseYaml(read.text));
   } catch (e) {
     return { ok: false, errors: [e instanceof Error ? e.message : String(e)], settings: DEFAULT_SERVER_SETTINGS };
   }

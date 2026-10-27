@@ -31,6 +31,7 @@ import { SettingsForm, inputStyle, smallButton } from "./SettingsForm";
 import { SettingsHistory } from "./SettingsHistory";
 import { SettingsReview } from "./SettingsReview";
 import { ProjectWizard } from "./ProjectWizard";
+import { NotificationSettings } from "./NotificationSettings";
 
 interface Props {
   project: string;
@@ -366,6 +367,9 @@ export function Settings({ project, refreshKey }: Props) {
           )}
         </>
       )}
+
+      {/* Lair's own settings (data/server.yaml), apart from the project's */}
+      <NotificationSettings />
     </div>
   );
 }
