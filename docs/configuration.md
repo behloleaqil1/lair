@@ -1198,6 +1198,48 @@ A node signs the whole gate result (`src/shared/policy-types.ts` `GateResult`, w
 
 Commit shas are full (40 or 64 hex characters), and a result id is accepted once. The answer is the triage record, its actions, its re-checks and the pipeline's open incident on the default branch.
 
+### Results from an existing gate system
+
+A project whose gates run in its own queue and runner scripts (not Lair pipelines) can still be triaged: after each gate, its runner calls `lair-node gate-result submit`, which builds the `GateResult`, digests the reports, signs it with the same `signGateResult()` and sends it as above. The runner is the node: it holds the private key, and Lair trusts its public key.
+
+1. **Once:** make the node's key pair where agents can't write (not in any repository), and trust it:
+
+   ```bash
+   lair-node keygen --out ./data/keys/ci-gates     # writes ci-gates (private, mode 0600) and ci-gates.pub
+   ```
+
+   ```yaml
+   triage:
+     enabled: true
+     mode: observe
+     trusted_nodes:
+       - id: ci-gates
+         public_key_file: ./data/keys/ci-gates.pub
+   ```
+
+   An existing key is never overwritten, and `submit` refuses a private key that other users can read.
+
+2. **After each gate:**
+
+   ```bash
+   lair-node gate-result submit --key ./data/keys/ci-gates --node ci-gates --project my-app \
+     --id 20260302T120000Z-backend-1a2b3c4d --pipeline backend \
+     --sha 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b --branch feat/orders --status failed \
+     --step lint:0:12000 --step test:1:95000 --output test=./out/test.log \
+     --report-dir ./out/test-results --report-step test \
+     --started 2026-03-02T11:58:00Z --finished 2026-03-02T12:00:00Z
+   ```
+
+   Or `--result result.json` with `GateResult`'s field names (`id`, `pipelineId`, `commitSha`, `branch`, `status`, `steps`, `startedAt`, `completedAt`, `pipelineVersion`) plus `reports` and `reportDirs` (paths relative to the file, each a path or `{path, step}`); flags override the file. `lair-node gate-result submit --help` lists every option, and `--dry-run` prints the signed request instead of sending it. From a checkout, run it as `npm run node -- gate-result submit ...`, or `node dist/cli/node.js gate-result submit ...` after `npm run build`.
+
+- **Steps.** `--step <name>:<exit code>[:<duration ms>]`, once per step, in order: exit 0 is `passed`, any other code `failed`; `<name>:skipped` and `<name>:timeout[:<ms>]` are also taken. `--output <step>=<file>` attaches a step's console output (its last 20,000 lines, at most 2 MiB), which triage parses for causes when the step failed. A `passed` status with a failed step is a usage error.
+- **Pipeline.** Passes, flaky windows and default-branch incidents are per `pipelineId`, so give each kind of gate (each track of your queue) its own, and keep it stable.
+- **Times.** The gate's duration is `--finished` minus `--started` (ISO 8601 or Unix seconds). Without them, `--finished` is now and `--started` is that minus the steps' durations.
+- **Reports.** `--report <file>` and `--report-dir <dir>` (every `*.xml` under it; symlinks are not followed) take JUnit XML. Each report's SHA-256 goes into the signed `result.reports`, so the signature covers it. Reports with failures are sent first, up to 20 MiB in all, and a file over 8 MiB is left out with a warning. More files than a result takes (50; Gradle writes one per test class) are bundled per step into `<testsuites>` documents of at most 6 MiB each: the bundles are what is signed and sent.
+- **Exit codes:** `0` accepted (it prints the triage record), `1` refused (it prints the server's reason: an untrusted node or key, a repeated result id, triage off for the project), `2` usage (a missing or bad flag, an unreadable file or key), `3` the server is unreachable (`--timeout`, default 30 seconds). A runner should **fail open**: log a refusal or an unreachable server and go on, never change the gate's own result because of it.
+
+`review.merge.gate.source: signed` verifies the same kind of signed result, posted to `POST /api/review/gate-results` (this command sends to triage only). It also checks the `pipelineVersion` against `merge.gate.pipeline_versions` (`--pipeline-version`), and it does not take a passed result with a skipped step or a passed step that took under 10 ms.
+
 ### Triage API
 
 `?project=` defaults to the default project:

@@ -7,6 +7,9 @@
  *   lair-node start [--server <url>] [--foreground] - Run the node daemon
  *   lair-node stop                      - Stop the daemon
  *   lair-node status                    - Show node status
+ *   lair-node keygen --out <file>       - Write an Ed25519 key pair for signed gate results
+ *   lair-node gate-result submit ...    - Sign a finished gate result and send it to triage
+ *                                         (src/cli/gate-result.ts)
  */
 import { spawn } from "child_process";
 import { closeSync, openSync } from "fs";
@@ -22,6 +25,7 @@ import {
 } from "../node/registration.js";
 import { measureCapacity, getSystemInfo } from "../node/capacity.js";
 import type { NodeStatusOutput } from "../shared/node-types.js";
+import { gateResultCommand, keygenCommand, processIo } from "./gate-result.js";
 
 const DEFAULT_SERVER_URL = "http://localhost:4777";
 
@@ -281,6 +285,15 @@ Commands:
       Configure this node to connect to a lair-server.
       Example: lair-node join http://localhost:4777
 
+  keygen --out <file>
+      Write an Ed25519 key pair (<file>, mode 0600, and <file>.pub) for
+      signing gate results. Not a placeholder: triage verifies these.
+
+  gate-result submit --key <file> --node <id> --project <id> [options]
+      Sign a finished gate result from an existing gate system and send it
+      to triage (POST /api/triage/results). See: gate-result submit --help.
+      Exit codes: 0 accepted, 1 refused, 2 usage, 3 server unreachable.
+
 Options:
   --server, -s <url>     Server URL to connect to
   --foreground, -f       Run daemon in foreground (for debugging)
@@ -294,7 +307,19 @@ Configuration:
  * Main entry point.
  */
 async function main(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2));
+  // Commands with their own flags and exit codes (src/cli/gate-result.ts).
+  // exitCode, not exit(): stdout may be a pipe that is still being written.
+  const argv = process.argv.slice(2);
+  if (argv[0] === "keygen") {
+    process.exitCode = keygenCommand(argv.slice(1), processIo);
+    return;
+  }
+  if (argv[0] === "gate-result") {
+    process.exitCode = await gateResultCommand(argv.slice(1), processIo);
+    return;
+  }
+
+  const args = parseArgs(argv);
 
   try {
     switch (args.command) {

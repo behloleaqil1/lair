@@ -302,7 +302,8 @@ MCP server (stdio) for direct agent-to-Lair communication. Run it with `npm run 
 
 ### Node daemon (`src/node/`, `src/cli/`), experimental
 
-- **`cli/node.ts`**: `lair-node` CLI (`join`, `start`, `stop`, `status`)
+- **`cli/node.ts`**: `lair-node` CLI (`join`, `start`, `stop`, `status`, `keygen`, `gate-result submit`)
+- **`cli/gate-result.ts`**: `keygen` (a node's Ed25519 key pair) and `gate-result submit`: an existing gate system's result, signed and sent to triage (not experimental)
 - **`node/index.ts`**: the daemon: connects to `/ws/node`, registers, sends heartbeats, runs jobs
 - **`node/registration.ts`**: node identity and config in `~/.lair/node/`
 - **`node/capacity.ts`**: CPU, memory, disk and container runtime detection
