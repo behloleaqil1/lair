@@ -68,7 +68,7 @@ describe("placement config", () => {
   });
 
   it("reads globs and /regex/ patterns, first class in the order written", () => {
-    expect(compilePattern("*gate.sh*backend*").test("x work/bin/gate.sh kiro-backend {WT}")).toBe(true);
+    expect(compilePattern("*gate.sh*backend*").test("x scripts/gate.sh full-backend {WT}")).toBe(true);
     expect(compilePattern("*gate.sh*backend*").test("gate.sh docs")).toBe(false);
     expect(compilePattern("a?c").test("abc")).toBe(true);
     expect(compilePattern("a.c").test("abc")).toBe(false);
