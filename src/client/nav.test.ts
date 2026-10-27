@@ -18,6 +18,7 @@ import {
 const OFF: ModuleFlags = {
   agents: false,
   fill: false,
+  planner: false,
   review: false,
   triage: false,
   placement: false,
@@ -86,6 +87,13 @@ describe("section tabs", () => {
     expect(visibleTabs("work", OFF)).toEqual([]);
     expect(visibleTabs("work", { ...OFF, agents: true }).map((t) => t.id)).toEqual([null, "locks"]);
     expect(visibleTabs("work", { ...OFF, agents: true, fill: true }).map((t) => t.id)).toEqual([null, "tasks", "locks"]);
+    expect(visibleTabs("work", { ...OFF, agents: true, fill: true, planner: true }).map((t) => t.label)).toEqual([
+      "Agents",
+      "Tasks",
+      "Planner",
+      "Locks and budget",
+    ]);
+    expect(tabAvailable("work", "planner", OFF)).toBe(false);
     expect(visibleTabs("home", OFF).map((t) => t.id)).toEqual([null, "activity"]);
     expect(visibleTabs("home", { ...OFF, watchdog: true }).map((t) => t.id)).toEqual([null, "activity", "health"]);
     expect(tabAvailable("gates", "triage", OFF)).toBe(false);

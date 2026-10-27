@@ -3,8 +3,9 @@
  * the agent with its current run or task; a row opens the agent's detail
  * (#/work/<agent>). With the agents module on, the Tasks tab lists fill's
  * tasks_file lines and "Locks and budget" the launch locks and the project's
- * budget. Starting a run, and the start and stop commands of a project's own
- * launcher, are the owner's.
+ * budget; with the planner on (planner.enabled), the Planner tab shows how
+ * Lair keeps that file. Starting a run, and the start and stop commands of a
+ * project's own launcher, are the owner's.
  */
 import { useMemo, useState } from "react";
 import { useApi } from "../hooks/useApi";
@@ -22,6 +23,7 @@ import { SectionHeader, type SectionProps } from "./Section";
 import { AgentDetail } from "./AgentDetail";
 import { StartRunForm } from "./StartRunForm";
 import { DragonStartDialog } from "./DragonStartDialog";
+import { Planner } from "./Planner";
 import { EmptyState, ErrorState, Loading, ModuleOff, Time, muted, useOwnerSignedIn } from "./ui";
 
 const actionButton = {
@@ -141,6 +143,8 @@ export function Work({ project, refreshKey, route, modules, readOnly, open }: Se
   };
 
   const body = () => {
+    // The planner (planner.enabled) keeps the tasks file: its own view, the owner's (it shows plan text)
+    if (route.tab === "planner") return <Planner project={project} refreshKey={refreshKey} />;
     if (route.tab === "tasks") return <FillTab status={agents} readOnly={readOnly} signedIn={signedIn} onRelease={releaseHold} open={open} />;
     if (route.tab === "locks") return <LocksTab status={agents} />;
     if (dragonsApi.loading && !dragonsApi.data && rows.length === 0) return <Loading what="agents" />;

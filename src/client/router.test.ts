@@ -49,12 +49,13 @@ describe("old view ids redirect to the section that replaced them", () => {
     expect(where("orchestrator")).toBe("#/home?tab=activity");
     expect(where("triage")).toBe("#/gates?tab=triage");
     expect(where("inbox")).toBe("#/decisions?tab=messages");
+    expect(where("planner")).toBe("#/work?tab=planner");
     // The sections that kept their name
     for (const id of ["gates", "prs", "machines", "decisions", "delivery", "processes", "settings"]) {
       expect(where(id)).toBe(`#/${id}`);
     }
     expect(Object.keys(LEGACY_VIEWS).sort()).toEqual(
-      ["activity", "agents", "dragons", "health", "inbox", "nodes", "orchestrator", "overview", "reviews", "triage"],
+      ["activity", "agents", "dragons", "health", "inbox", "nodes", "orchestrator", "overview", "planner", "reviews", "triage"],
     );
   });
 

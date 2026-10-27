@@ -32,7 +32,7 @@ export const SECTION_IDS: readonly SectionId[] = [
 /** Each section's tabs besides its first (the default, tab null) */
 export const SECTION_TABS: Record<SectionId, readonly string[]> = {
   home: ["activity", "health"],
-  work: ["tasks", "locks"],
+  work: ["tasks", "planner", "locks"],
   gates: ["results", "pipelines", "triage", "placement"],
   prs: [],
   machines: ["nodes"],
@@ -63,6 +63,7 @@ export const LEGACY_VIEWS: Readonly<Record<string, { section: SectionId; tab: st
   orchestrator: { section: "home", tab: "activity" },
   dragons: { section: "work", tab: null },
   agents: { section: "work", tab: null },
+  planner: { section: "work", tab: "planner" },
   triage: { section: "gates", tab: "triage" },
   reviews: { section: "prs", tab: null },
   nodes: { section: "machines", tab: "nodes" },

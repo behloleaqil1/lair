@@ -108,6 +108,13 @@ const TABS: Record<SectionId, readonly TabDef[]> = {
       enable: "Set agents.enabled: true and agents.fill.enabled: true with a tasks_file, and Lair starts runs from it.",
     },
     {
+      id: "planner",
+      label: "Planner",
+      needs: (m) => m.planner,
+      enable:
+        "Set planner.enabled: true in the project's YAML: Lair then keeps fill's tasks file itself, with an optional supervised planner agent (docs/configuration.md#planner).",
+    },
+    {
       id: "locks",
       label: "Locks and budget",
       needs: (m) => m.agents,

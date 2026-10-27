@@ -255,6 +255,7 @@ describe("GET /api/dashboard/modules", () => {
       modules: {
         agents: true,
         fill: true,
+        planner: false,
         review: true,
         triage: false,
         placement: false,
@@ -349,7 +350,8 @@ describe("GET /api/dashboard/gates/:id", () => {
 
 describe("GET /api/dashboard/gates/:id/output (owner only)", () => {
   it("403 without the owner's session, and nothing of the log or the tests in the refusal", async () => {
-    for (const headers of [{}, { origin: "http://localhost:4777", "sec-fetch-site": "same-origin" }, { [OWNER_SESSION_HEADER]: session }]) {
+    const refused: Record<string, string>[] = [{}, { origin: "http://localhost:4777", "sec-fetch-site": "same-origin" }, { [OWNER_SESSION_HEADER]: session }];
+    for (const headers of refused) {
       const res = await get(`/api/dashboard/gates/${FAILED}/output?project=${PROJECT}`, headers);
       expect(res.status).toBe(403);
       expect(res.raw).not.toContain("output line");

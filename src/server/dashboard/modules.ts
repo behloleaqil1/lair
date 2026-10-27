@@ -25,6 +25,7 @@ export function moduleFlags(config: ProjectConfig, nodeCount: number): ModuleFla
   return {
     agents: enabled(config.agents),
     fill: enabled(config.agents) && enabled(block(config.agents)?.fill),
+    planner: enabled(config.planner),
     review: enabled(config.review),
     triage: enabled(config.triage),
     placement: enabled(config.placement),
@@ -42,6 +43,7 @@ export function moduleFlags(config: ProjectConfig, nodeCount: number): ModuleFla
 export const NO_MODULES: ModuleFlags = {
   agents: false,
   fill: false,
+  planner: false,
   review: false,
   triage: false,
   placement: false,

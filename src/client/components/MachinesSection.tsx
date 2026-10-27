@@ -50,7 +50,8 @@ export function MachinesSection({ project, refreshKey, route, modules, open }: S
   const { machines: wsMachines, connected } = useMachinesWebSocket(project, restMachines);
   const placement = usePlacement(project, refreshKey, modules?.placement !== true);
   const nodesApi = useApi<ListNodesResponse>("/nodes", "", refreshKey, { skip: route.tab !== "nodes" });
-  const statuses = connected ? wsMachines : restMachines;
+  // The WebSocket sends what GET /api/machines does; its hook types the runner lanes loosely
+  const statuses = connected ? (wsMachines as MachineStatus[]) : restMachines;
   const rows = useMemo(() => machineRows(statuses, placement.data), [statuses, placement.data]);
   const nodes = nodeRows(nodesApi.data?.nodes ?? []);
 

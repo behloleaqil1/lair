@@ -78,7 +78,7 @@ Logs and test output are the owner's (`/api/dashboard/*`, `src/server/dashboard/
 | Before | Now |
 |---|---|
 | **Overview**, **Health**, **Activity** | **Home**: what needs you, the fleet at a glance, problems, recent activity; Activity and Health (watchdog) are its tabs |
-| **Dragons** (the roster; Start and Stop through the project's own start command) and **Agents** (runs Lair supervises) | **Work**: one row per agent, Lair's state when it supervises the agent, else the launcher's; the agent's detail has its task, run, claims, holds, fill's wait, recent runs and the log; the launcher's Start and Stop stay for agents Lair doesn't run |
+| **Dragons** (the roster; Start and Stop through the project's own start command) and **Agents** (runs Lair supervises) | **Work**: one row per agent (the Planner is its tab when on), Lair's state when it supervises the agent, else the launcher's; the agent's detail has its task, run, claims, holds, fill's wait, recent runs and the log; the launcher's Start and Stop stay for agents Lair doesn't run |
 | **Gates** (an external gate queue), **Pipelines**, **Triage**, **Placement** | **Gates**: the queue and results, with Pipelines, Triage and Placement as tabs; one gate detail for a queue gate and a pipeline run |
 | **PRs** (mergeable and gate) and **Reviews** (tier, reviewers, findings, merge policy) | **PRs**: one list, "merge ready" from the review policy when it is on; a PR's detail has the tier, slots, findings, gate and merge |
 | **Machines** (SSH machines) and **Nodes** (lair-node) | **Machines**, with Nodes as a tab |

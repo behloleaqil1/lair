@@ -13,6 +13,8 @@ export interface ModuleFlags {
   agents: boolean;
   /** agents.fill.enabled: Lair starts runs from a tasks file */
   fill: boolean;
+  /** planner.enabled: Lair keeps fill's tasks file, with a supervised planner agent */
+  planner: boolean;
   /** review.enabled: risk tiers, required reviews and policy merge */
   review: boolean;
   /** triage.enabled */
