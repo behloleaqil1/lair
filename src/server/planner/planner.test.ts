@@ -684,8 +684,8 @@ describe("run directories", () => {
 
 // ============ BLOCKED TASKS, FILL'S HOLDS, RECOVERY AND COST ============
 
-/** The agents block with fill on: one run without a done line holds the task (no_done), no backoff. */
-const fillOn = (p: Paths) =>
+/** The agents block with fill on: by default one run without a done line holds the task (no_done), no backoff. */
+const fillOn = (p: Paths, fill: Record<string, unknown> = {}) =>
   ({
     agents: {
       enabled: true,
@@ -698,6 +698,7 @@ const fillOn = (p: Paths) =>
         prompt_files: ["{prompts_dir}/worker.txt"],
         max_completions_without_done: 1,
         backoff_seconds: 0,
+        ...fill,
       },
     },
   }) as never;
@@ -802,6 +803,30 @@ describe("blocked tasks, fill's holds, recovery and cost", () => {
     // A blocked hold is one the planner may release (an unblock it applies)
     await expect(h.agentsService.releaseFillHold("feat-login", "planner")).resolves.toMatchObject({ task: "feat-login" });
     expect(h.agentsStore.listEvents("demo", { kinds: ["fill_released"], limit: 5 }).map((e) => e.data.by)).toEqual(["planner", "owner"]);
+  });
+
+  it("a BLOCKED line fill's blocked_pattern doesn't match asks the owner at once through the planner, not after fill's restarts", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-cart|Cart");
+    // Fill's usual setting: three runs without a done line before it holds the task, with a backoff between them
+    const h = await setup(p, plannerBlock(p, { agent: undefined }), {
+      extra: fillOn(p, { max_completions_without_done: 3, backoff_seconds: 600 }),
+    });
+    await h.service.cycle();
+    await h.agentsService.checkFill();
+    // The line doesn't name the task, so fill's default blocked_pattern ({task}) misses it: to fill it is a run
+    // without a done line, which it starts again after the backoff
+    await workerRun(h, "- BLOCKED cart work by worker-a 12:01Z: the payment account needs the owner's approval");
+    expect((await h.agentsService.checkFill()).lines[0]).toMatchObject({ task: "feat-cart", state: "held", hold: "backoff" });
+    await h.service.cycle();
+    // The planner maps it to worker-a's only open line and asks the owner now, after that one run
+    expect(open(h).map((d) => d.key)).toEqual(["blocked:feat-cart:owner"]);
+    expect(h.spawner.calls).toHaveLength(1);
+    expect(h.service.overview().blocked[0]).toMatchObject({
+      task: "feat-cart",
+      class: "owner",
+      route: "a decision (owner): fill's blocked_pattern doesn't match this line, so fill won't hold it and ask you",
+    });
   });
 
   it("a write a restart interrupted is finished when its rename happened, and dropped when it didn't", async () => {

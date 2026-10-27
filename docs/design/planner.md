@@ -176,16 +176,19 @@ checked in this order:
 3. anything else is a **task** problem (wording, scope, a dependency): a planner run that may propose `reword` or
    `unblock`.
 
-Fill holds a run of its own that ended on a BLOCKED line for its task (its `blocked` hold) and raises its decision.
-For a task fill runs, the planner raises no owner or environment decision of its own for that line, so one line asks
-the owner once; it records the route and still handles task problems.
+Fill holds a run of its own that ended on a BLOCKED line its `blocked_pattern` matches (its `blocked` hold) and raises
+its decision. For such a line, the planner raises no owner or environment decision of its own, so one line asks the
+owner once; it records the route and still handles task problems. The planner maps more lines to a task than that
+pattern does (by the reporting agent's only open line); fill takes those for runs without a done line and starts them
+again, so for them the planner asks the owner itself, at once, and its route says why.
 
 Never a loop: each task has `attempts_per_task` attempts. A planner run for it spends one, and so does an applied
 `unblock`, so fill's own cycle (runs without a done line, a `no_done` hold, an unblock that releases it, runs again)
 can't go on by itself: once the attempts are spent, the next `BLOCKED` raises one decision ("let the planner try again"
 or "leave it to me"). A task the owner kept is left alone until its line changes: its `BLOCKED` lines ask nothing,
-and the planner's `reword` and `unblock` of it are refused; the owner rewording the line is what clears it. A
-decision's dedupe key is per task, so a task that reports `BLOCKED` every few minutes asks once.
+and the planner's `reword` and `unblock` of it are refused; the owner rewording the line is what clears it, and only
+that: the attempts count from zero again only when the owner answers "let the planner try again". A decision's
+dedupe key is per task, so a task that reports `BLOCKED` every few minutes asks once.
 
 ## Surfaces
 

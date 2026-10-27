@@ -43,6 +43,7 @@ import type {
 } from "../../shared/planner-types.js";
 import type { DecisionProducer, DecisionResolution, RaiseDecisionInput } from "../decisions/types.js";
 import { buildPrompt, checkDone, MAX_TASKS_FILE_BYTES, QueueLines, queueWindowEnd, type DoneCheck } from "../agents/fill.js";
+import { doneLineMatches, fillPatternFor } from "../agents/config.js";
 import { utcStamp } from "../agents/sessions.js";
 import { isActive, type QueueMark } from "../agents/types.js";
 import { getPromptsDir } from "../routes/controls.js";
@@ -610,8 +611,12 @@ export class PlannerService {
     await this.emit("planner.blocked", { task, agent: event.agent, class: c.class, rule: c.rule });
     const lineAgent = findTask(doc, task)?.agent ?? null;
     const fillRunsIt = this.settings.fillEnabled && lineAgent !== null && this.settings.allowlist.includes(lineAgent);
-    if ((c.class === "owner" || c.class === "environment") && fillRunsIt) {
-      // Fill holds a run that ended on a BLOCKED line and asks the owner itself: one decision for one line
+    // Fill holds the run, and asks the owner itself, only when its blocked_pattern matches this line for this task.
+    // The planner maps more lines to a task (by the agent's only open line), and those fill takes for runs without
+    // a done line: it would start them again before it asks
+    const fillHoldsIt = fillRunsIt && lineAgent !== null && this.fillBlockedPatternMatches(event.text, task, lineAgent);
+    if ((c.class === "owner" || c.class === "environment") && fillHoldsIt) {
+      // One decision for one line: fill's
       record.route = `${c.class === "owner" ? "needs you" : "its environment"}: fill holds the task and asks you (its decision, in the Agents view)`;
     } else if (c.class === "owner" || c.class === "environment") {
       const id = await this.raise({
@@ -632,14 +637,15 @@ export class PlannerService {
           {
             id: "unblock",
             label: "It's sorted: let the task go on",
-            consequences: `The planner records ${task} as unblocked, and releases fill's no_done hold on it if there is one, so fill starts it again.`,
+            consequences: `The planner records ${task} as unblocked, and releases fill's blocked or no_done hold on it if there is one, so fill starts it again.`,
           },
           { id: "keep", label: "Leave it blocked", consequences: `The planner leaves ${task} alone until its line in the tasks file changes.` },
         ],
         recommended: { optionId: "keep", reasoning: "Only you know whether the blocker is gone." },
         blocks: [`planner:${this.project}:task:${task}`],
       });
-      record.route = id ? `a decision (${c.class})` : `a decision (${c.class}), not delivered: no Decision Inbox`;
+      const why = fillRunsIt ? ": fill's blocked_pattern doesn't match this line, so fill won't hold it and ask you" : "";
+      record.route = id ? `a decision (${c.class})${why}` : `a decision (${c.class}), not delivered: no Decision Inbox${why}`;
     } else {
       const attempts = this.store.attempts(this.project, task);
       if (attempts >= this.settings.attemptsPerTask) {
@@ -670,6 +676,15 @@ export class PlannerService {
     }
     blocked[task] = record;
     this.saveBlocked(blocked);
+  }
+
+  /** Whether fill's blocked_pattern, for this task and agent, matches the queue line (fill's own match). */
+  private fillBlockedPatternMatches(line: string, task: string, agent: string): boolean {
+    try {
+      return doneLineMatches(fillPatternFor(this.settings.fillPatterns.blockedPattern, task, agent), line);
+    } catch {
+      return false;
+    }
   }
 
   private saveBlocked(blocked: Record<string, BlockedRecord>): void {
