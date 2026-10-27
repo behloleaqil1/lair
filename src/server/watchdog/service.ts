@@ -503,6 +503,9 @@ export class WatchdogManager {
   private watchdogs = new Map<string, Watchdog>();
   private problems = new Map<string, string[]>();
   private store: WatchdogStore | null = null;
+  private decisions?: DecisionProducer;
+  /** "started" between start() and stop(); a reload never runs once "stopped" */
+  private phase: "loaded" | "started" | "stopped" = "loaded";
 
   constructor(
     private options: {
@@ -547,12 +550,41 @@ export class WatchdogManager {
   }
 
   start(): string[] {
+    this.phase = "started";
     for (const watchdog of this.watchdogs.values()) watchdog.start();
     return [...this.watchdogs.keys()];
   }
 
+  /**
+   * Apply a project's new config (src/server/reload/): its watchdog stops as
+   * on shutdown (a tick in progress ends early and no further action
+   * starts), then the new one starts. Other projects are not touched. A
+   * watchdog that fails to start is stopped and removed before the error is
+   * thrown, so the project's watchdog is either running or off.
+   */
+  async reloadProject(entry: ProjectEntry): Promise<void> {
+    if (this.phase === "stopped") return;
+    const old = this.watchdogs.get(entry.name);
+    if (old) await old.stop();
+    if (this.phase === "stopped") return;
+    this.watchdogs.delete(entry.name);
+    this.problems.delete(entry.name);
+    this.load([entry]);
+    const next = this.watchdogs.get(entry.name);
+    if (!next) return;
+    try {
+      if (this.decisions) next.useDecisions(this.decisions);
+      if (this.phase === "started") next.start();
+    } catch (e) {
+      await next.stop();
+      this.watchdogs.delete(entry.name);
+      throw e;
+    }
+  }
+
   /** Stop every watchdog, wait for ticks in progress, then close the store. */
   async stop(): Promise<void> {
+    this.phase = "stopped";
     await Promise.all([...this.watchdogs.values()].map((watchdog) => watchdog.stop()));
     this.store?.close();
     this.store = null;
@@ -572,6 +604,7 @@ export class WatchdogManager {
    * through it and follows the answers. src/server/decisions/mount.ts does it.
    */
   useDecisions(decisions: DecisionProducer): void {
+    this.decisions = decisions;
     for (const watchdog of this.watchdogs.values()) watchdog.useDecisions(decisions);
   }
 

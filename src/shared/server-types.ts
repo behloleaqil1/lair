@@ -258,7 +258,13 @@ export type EventType =
   | "triage.incident_opened"
   | "triage.incident_resolved"
   | "triage.culprit_found"
-  | "triage.revert_requested";
+  | "triage.revert_requested"
+  // Live config reload (src/server/reload/): {project, file, module} / {project, file, error}
+  | "config.reloaded"
+  | "config.invalid"
+  // The owner's Restart (src/server/restart/)
+  | "server.restarting"
+  | "server.update_failed";
 
 /** Event stored in the database */
 export interface Event {

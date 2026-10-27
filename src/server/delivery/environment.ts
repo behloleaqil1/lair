@@ -73,6 +73,8 @@ export interface DeliveryContext {
   events?: EventBus;
   /** Aborted by Delivery.stop(): running commands are killed, waits end, no further command starts */
   signal: AbortSignal;
+  /** Set by Delivery.drain() (a config reload): no new operation starts, the one running finishes */
+  closing?: boolean;
 }
 
 export interface OperationRequest {
@@ -514,6 +516,7 @@ export class EnvironmentController {
     const env = this.env.name;
     if (this.readOnly) return { ok: false, code: 403, error: "the project is read_only" };
     if (this.ctx.signal.aborted) return { ok: false, code: 409, error: "delivery is stopping" };
+    if (this.ctx.closing) return { ok: false, code: 409, error: "delivery is reloading its config: try again in a moment" };
     const target = req.service;
     if (target !== undefined && !this.service(target)) {
       return { ok: false, code: 404, error: `no service ${target} in environment ${env}` };
@@ -1099,7 +1102,7 @@ export class EnvironmentController {
    * merge brings them. One interrupted deploy per tick.
    */
   async recoverInterrupted(): Promise<void> {
-    if (this.readOnly || this.current) return;
+    if (this.readOnly || this.current || this.ctx.closing) return;
     const { store, project } = this.ctx;
     for (const op of store.interruptedDeploys(project, this.env.name)) {
       const unverified = this.unverified(op);

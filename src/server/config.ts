@@ -1,7 +1,7 @@
 /**
  * Configuration loader - reads project YAML files
  */
-import { readFileSync, existsSync, readdirSync } from "fs";
+import { readFileSync, existsSync, readdirSync, statSync } from "fs";
 import { join } from "path";
 import { parse as parseYaml } from "yaml";
 import type { ProjectConfig, DragonConfig, AIModel } from "../shared/types.js";
@@ -12,7 +12,10 @@ import {
   validateDragonDefaults,
 } from "./parsers/dragon-config.js";
 
-const PROJECTS_DIR = join(process.cwd(), "projects");
+export const PROJECTS_DIR = join(process.cwd(), "projects");
+
+/** A project config larger than this is refused unread (bounded input). */
+export const MAX_CONFIG_BYTES = 1024 * 1024;
 
 /**
  * Project names come from file names in projects/ (and projects/local/).
@@ -21,6 +24,11 @@ const PROJECTS_DIR = join(process.cwd(), "projects");
  * listProjects() returns.
  */
 const SAFE_PROJECT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
+
+/** Whether `name` has the shape of a project name (it may still be unknown). */
+export function isSafeProjectName(name: string): boolean {
+  return SAFE_PROJECT_NAME.test(name);
+}
 
 /**
  * Thrown when a project name is malformed or unknown. Routes map it to HTTP 400.
@@ -36,15 +44,16 @@ export class InvalidProjectError extends Error {
 
 /**
  * Return an error message if `name` is not a safe, known project name, else null.
+ * `projectsDir` is for tests.
  */
-export function projectNameError(name: unknown): string | null {
+export function projectNameError(name: unknown, projectsDir: string = PROJECTS_DIR): string | null {
   if (typeof name !== "string" || name.length === 0) {
     return "Missing project parameter";
   }
   if (!SAFE_PROJECT_NAME.test(name)) {
     return "Invalid project name";
   }
-  if (!listProjects().includes(name)) {
+  if (!listProjects(projectsDir).includes(name)) {
     return `Unknown project: ${name}`;
   }
   return null;
@@ -54,8 +63,8 @@ export function projectNameError(name: unknown): string | null {
  * Validate a project name (safe pattern AND membership in listProjects()).
  * Throws InvalidProjectError when it is not valid.
  */
-export function assertValidProject(name: unknown): string {
-  const error = projectNameError(name);
+export function assertValidProject(name: unknown, projectsDir: string = PROJECTS_DIR): string {
+  const error = projectNameError(name, projectsDir);
   if (error) {
     throw new InvalidProjectError(error);
   }
@@ -63,20 +72,25 @@ export function assertValidProject(name: unknown): string {
 }
 
 /**
- * Load a project configuration from YAML
+ * Load a project configuration from YAML. `projectsDir` is for tests.
  */
-export function loadProjectConfig(name: string): ProjectConfig {
-  const configPath = getConfigPath(name);
+export function loadProjectConfig(name: string, projectsDir: string = PROJECTS_DIR): ProjectConfig {
+  const configPath = getConfigPath(name, projectsDir);
 
   if (!existsSync(configPath)) {
     throw new Error(`Project config not found: ${configPath}`);
   }
+  if (statSync(configPath).size > MAX_CONFIG_BYTES) {
+    throw new Error(`Invalid project config: ${configPath} is larger than ${MAX_CONFIG_BYTES / 1024} KiB`);
+  }
 
   const content = readFileSync(configPath, "utf-8");
-  const config = parseYaml(content) as ProjectConfig;
+  const config = parseYaml(content) as ProjectConfig | null;
 
   // Validate required fields
   if (
+    !config ||
+    typeof config !== "object" ||
     !config.name ||
     !config.repo ||
     !config.queue_file ||
@@ -182,15 +196,16 @@ export function getDefaultProject(
 /**
  * Get the config file path for a project.
  * Returns the local path if it exists, otherwise the public path.
+ * `projectsDir` is for tests.
  */
-export function getConfigPath(name: string): string {
-  assertValidProject(name);
+export function getConfigPath(name: string, projectsDir: string = PROJECTS_DIR): string {
+  assertValidProject(name, projectsDir);
   // A private config in projects/local/ (gitignored) wins over the public example of the same name
   const candidates = [
-    join(PROJECTS_DIR, "local", `${name}.yaml`),
-    join(PROJECTS_DIR, "local", `${name}.yml`),
-    join(PROJECTS_DIR, `${name}.yaml`),
-    join(PROJECTS_DIR, `${name}.yml`),
+    join(projectsDir, "local", `${name}.yaml`),
+    join(projectsDir, "local", `${name}.yml`),
+    join(projectsDir, `${name}.yaml`),
+    join(projectsDir, `${name}.yml`),
   ];
   return candidates.find((p) => existsSync(p)) ?? candidates[2];
 }

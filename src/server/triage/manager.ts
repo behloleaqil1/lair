@@ -59,11 +59,28 @@ export class TriageManager {
   private problems = new Map<string, string[]>();
   private store: TriageStore | null = null;
   private timers = new Map<string, NodeJS.Timeout>();
+  /** Per project: the tick in progress */
+  private ticks = new Map<string, Promise<void>>();
+  /** Services a reload is replacing: they tick no more */
+  private retired = new WeakSet<TriageService>();
   private running = false;
+  private closed = false;
+  private decisions?: DecisionProducer;
   /** gate.completed ingests in progress (they don't hold up the module that emitted them) */
   private pending = new Set<Promise<unknown>>();
 
   constructor(private options: TriageManagerOptions) {}
+
+  /**
+   * What load() would refuse in a project's config: the `triage:` block
+   * (parseTriageConfig) and, when it is enabled, the trusted nodes' keys.
+   */
+  validate(config: ProjectConfig): string[] {
+    const parsed = parseTriageConfig(config.triage);
+    if (!parsed.ok) return parsed.errors;
+    if (!parsed.settings.enabled) return [];
+    return this.nodeKeys(parsed.settings.trustedNodes, config.repo).errors;
+  }
 
   /**
    * The trusted nodes' keys, or the errors reading them. A relative path is
@@ -140,31 +157,66 @@ export class TriageManager {
   /** Tick every service every interval_seconds; returns the projects started. */
   start(): string[] {
     this.running = true;
-    for (const [name, service] of this.services) {
-      const loop = async () => {
-        if (!this.running) return;
-        try {
-          await service.tick();
-        } catch (e) {
-          console.error(`[triage] ${name}: tick failed:`, e);
-        }
-        if (!this.running) return;
-        const timer = setTimeout(loop, service.settings.intervalSeconds * 1000);
-        timer.unref();
-        this.timers.set(name, timer);
-      };
-      const timer = setTimeout(loop, 1000);
+    for (const [name, service] of this.services) this.schedule(name, service);
+    return [...this.services.keys()];
+  }
+
+  /** Tick `service` soon, then every interval_seconds, while it is the project's running service. */
+  private schedule(name: string, service: TriageService): void {
+    const current = () => this.running && this.services.get(name) === service && !this.retired.has(service);
+    const loop = async () => {
+      if (!current()) return;
+      const tick = service.tick().catch((e) => {
+        console.error(`[triage] ${name}: tick failed:`, e);
+      });
+      this.ticks.set(name, tick);
+      await tick;
+      if (this.ticks.get(name) === tick) this.ticks.delete(name);
+      if (!current()) return;
+      const timer = setTimeout(loop, service.settings.intervalSeconds * 1000);
       timer.unref();
       this.timers.set(name, timer);
+    };
+    const timer = setTimeout(loop, 1000);
+    timer.unref();
+    this.timers.set(name, timer);
+  }
+
+  /**
+   * Apply a project's new config (src/server/reload/): its service stops
+   * ticking, the tick, ingests and outbox in progress finish, then the new
+   * service takes over (connected to the Decision Inbox, ticking when the
+   * manager runs). Other projects are not touched.
+   */
+  async reloadProject(entry: ProjectEntry): Promise<void> {
+    if (this.closed) return;
+    const old = this.services.get(entry.name);
+    if (old) this.retired.add(old);
+    clearTimeout(this.timers.get(entry.name));
+    this.timers.delete(entry.name);
+    if (old) {
+      await this.ticks.get(entry.name);
+      while (this.pending.size > 0) await Promise.allSettled([...this.pending]);
+      await old.idle();
+      if (this.closed) return;
+      old.close();
     }
-    return [...this.services.keys()];
+    this.services.delete(entry.name);
+    this.problems.delete(entry.name);
+    this.load([entry]);
+    const next = this.services.get(entry.name);
+    if (!next) return;
+    if (this.decisions) next.useDecisions(this.decisions);
+    if (this.running) this.schedule(entry.name, next);
   }
 
   /** Stop ticking, wait for calls in progress, then close the store. */
   async stop(): Promise<void> {
+    this.closed = true;
     this.running = false;
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
+    await Promise.all(this.ticks.values());
     await this.idle();
     for (const service of this.services.values()) service.close();
     this.store?.close();
@@ -186,6 +238,7 @@ export class TriageManager {
 
   /** Raise decisions in the Decision Inbox and follow their answers (the server's mountDecisions calls this). */
   useDecisions(inbox: DecisionProducer): void {
+    this.decisions = inbox;
     for (const service of this.services.values()) service.useDecisions(inbox);
   }
 

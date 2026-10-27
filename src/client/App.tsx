@@ -23,6 +23,8 @@ import type { CommandMode, ControlsStatus } from "../shared/types";
 import { LAIR_VERSION } from "../shared/version";
 import { DecisionInbox, DecisionsBadge } from "./components/DecisionInbox";
 import { VIEWS, type View } from "./nav";
+import { ConfigBanner } from "./components/ConfigBanner";
+import { ServerControls } from "./components/ServerControls";
 import "./App.css";
 
 export function App() {
@@ -166,6 +168,8 @@ export function App() {
         ))}
       </nav>
 
+      <ConfigBanner refreshKey={lastRefresh.getTime()} />
+
       <main className="main">{renderView()}</main>
 
       <footer className="footer">
@@ -178,6 +182,7 @@ export function App() {
             <span>⏸ Paused</span>
           </>
         )}
+        <ServerControls refreshKey={lastRefresh.getTime()} />
       </footer>
     </div>
   );

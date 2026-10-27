@@ -2301,7 +2301,11 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
   private probes: AgentProbes | null = null;
   private decisions: DecisionInbox | null;
   private fallbackInbox: DecisionInbox | null = null;
-  private stopFollowing: (() => void)[] = [];
+  /** Per project: stop following its answers */
+  private stopFollowing = new Map<string, () => void>();
+  private producer: DecisionProducer | null = null;
+  /** "started" between start() and stop(); a reload never runs once "stopped" */
+  private phase: "loaded" | "started" | "stopped" = "loaded";
 
   constructor(private options: AgentsManagerOptions) {
     this.decisions = options.decisions ?? null;
@@ -2320,11 +2324,16 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
    * project's inbox file instead.
    */
   useDecisions(decisions: DecisionProducer): void {
-    for (const stop of this.stopFollowing.splice(0)) stop();
+    for (const stop of this.stopFollowing.values()) stop();
+    this.stopFollowing.clear();
+    this.producer = decisions;
     this.decisions = new ProducerDecisions(decisions, this.fileInbox());
-    for (const [project, service] of this.services) {
-      this.stopFollowing.push(decisions.onResolved(DECISION_MODULE, (r) => service.followAnswer(r), { project }));
-    }
+    for (const [project, service] of this.services) this.follow(project, service);
+  }
+
+  private follow(project: string, service: AgentsService): void {
+    if (!this.producer) return;
+    this.stopFollowing.set(project, this.producer.onResolved(DECISION_MODULE, (r) => service.followAnswer(r), { project }));
   }
 
   private getProbes(): AgentProbes {
@@ -2374,13 +2383,52 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
   }
 
   start(): string[] {
+    this.phase = "started";
     for (const service of this.services.values()) service.start();
     return [...this.services.keys()];
   }
 
+  /**
+   * Apply a project's new config (src/server/reload/): its service stops as
+   * on shutdown (the tick or action in progress finishes; the agents keep
+   * running), then the new one starts and re-adopts them by pid from the
+   * store, as after a restart. Other projects are not touched. A service
+   * that fails to start is stopped and removed before the error is thrown.
+   */
+  async reloadProject(entry: ProjectEntry): Promise<void> {
+    if (this.phase === "stopped") return;
+    this.stopFollowing.get(entry.name)?.();
+    this.stopFollowing.delete(entry.name);
+    const old = this.services.get(entry.name);
+    if (old) {
+      await old.stop();
+      old.dispose();
+    }
+    if (this.phase === "stopped") return;
+    this.services.delete(entry.name);
+    this.problems.delete(entry.name);
+    this.configs.delete(entry.name);
+    this.load([entry]);
+    const next = this.services.get(entry.name);
+    if (!next) return;
+    try {
+      this.follow(entry.name, next);
+      if (this.phase === "started") next.start();
+    } catch (e) {
+      this.stopFollowing.get(entry.name)?.();
+      this.stopFollowing.delete(entry.name);
+      await next.stop();
+      next.dispose();
+      this.services.delete(entry.name);
+      throw e;
+    }
+  }
+
   /** Stop every service, wait for work in progress, then close the store. */
   async stop(): Promise<void> {
-    for (const stop of this.stopFollowing.splice(0)) stop();
+    this.phase = "stopped";
+    for (const stop of this.stopFollowing.values()) stop();
+    this.stopFollowing.clear();
     await Promise.all([...this.services.values()].map((service) => service.stop()));
     for (const service of this.services.values()) service.dispose();
     this.services.clear();

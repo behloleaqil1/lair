@@ -138,6 +138,8 @@ export class PipelineManager {
   /** Expected minutes of hosted attempts in flight, per project (budget reservations) */
   private hostedReserved = new Map<string, number>();
   private stopped = false;
+  /** Set by start(): from then on a reload launches the project's waiting jobs */
+  private started = false;
 
   constructor(private options: PipelineManagerOptions) {
     this.clock = options.clock ?? systemClock;
@@ -213,6 +215,7 @@ export class PipelineManager {
    * Nothing runs yet, so every job worktree found here is an orphan.
    */
   async start(): Promise<string[]> {
+    this.started = true;
     if (this.projects.size === 0) return [];
     for (const p of this.projects.values()) {
       try {
@@ -228,6 +231,29 @@ export class PipelineManager {
       if (this.projects.has(job.project) && !this.active.has(job.id)) this.launch(job.project, job.id);
     }
     return [...this.projects.keys()];
+  }
+
+  /**
+   * Apply a project's new `pipelines:` and `executors:` (src/server/reload/).
+   * A job in flight is not cut off: the attempt running now finishes with
+   * the settings it started with, and the job's next step reads the new ones
+   * (a job whose lane is gone ends with an error; a project without
+   * pipelines any more leaves its jobs recorded, as a stop does). Jobs the
+   * store holds for the project are then launched, as start() does.
+   */
+  async reloadProject(entry: PipelineProjectEntry): Promise<void> {
+    if (this.stopped) return;
+    const before = this.projects.get(entry.name);
+    if (before && before.settings.executors.github.monthlyMinutes > 0) {
+      this.options.budget?.removeProviderBudget(budgetProvider(entry.name));
+    }
+    this.projects.delete(entry.name);
+    this.problems.delete(entry.name);
+    this.load([entry]);
+    if (!this.started || !this.projects.has(entry.name)) return;
+    for (const job of this.store.activeJobs()) {
+      if (job.project === entry.name && !this.active.has(job.id)) this.launch(job.project, job.id);
+    }
   }
 
   /** Stop: in-flight attempts stay recorded and resume on the next start */

@@ -117,6 +117,10 @@ export class ReviewService {
   private repoInfo: { at: number; repo: HostRepo | null } | null = null;
   private integrityRuns = new Map<string, Promise<void>>();
   private merging = false;
+  /** Set by drain() (a config reload): no merge starts here any more */
+  private closing = false;
+  /** Called when the merge in progress ends */
+  private mergeWaiters: (() => void)[] = [];
 
   constructor(private readonly o: ReviewServiceOptions) {
     this.project = o.project;
@@ -706,6 +710,7 @@ export class ReviewService {
   ): Promise<MergeResponse> {
     if (this.readOnly) throw new ReviewError("The project is read-only (read_only: true): Lair does not merge", 403);
     if (request.confirm !== true) throw new ReviewError("Confirm the merge: send confirm: true", 400);
+    if (this.closing) throw new ReviewError("Reviews are reloading this project's config: try again in a moment", 503);
     if (this.merging) throw new ReviewError("Another merge is running for this project", 409);
     this.merging = true;
     try {
@@ -819,7 +824,18 @@ export class ReviewService {
       return { merged: true, record, reasons: [] };
     } finally {
       this.merging = false;
+      for (const done of this.mergeWaiters.splice(0)) done();
     }
+  }
+
+  /**
+   * Stop for a config reload: a merge in progress and the test integrity
+   * checks running now finish; a merge asked for from now on gets 503.
+   */
+  async drain(): Promise<void> {
+    this.closing = true;
+    if (this.merging) await new Promise<void>((resolve) => this.mergeWaiters.push(resolve));
+    await Promise.allSettled([...this.integrityRuns.values()]);
   }
 }
 
@@ -853,8 +869,24 @@ export class ReviewManager {
   private problems = new Map<string, string[]>();
   private configs = new Map<string, ProjectConfig>();
   private store: ReviewStore | null = null;
+  private closed = false;
 
   constructor(private readonly options: ReviewManagerOptions) {}
+
+  /**
+   * Apply a project's new config (src/server/reload/): a merge in progress
+   * finishes on the old settings (a new one gets 503 meanwhile), then the
+   * project's reviews use the new ones. Other projects are not touched.
+   */
+  async reloadProject(entry: ProjectEntry): Promise<void> {
+    if (this.closed) return;
+    await this.services.get(entry.name)?.drain();
+    if (this.closed) return;
+    this.services.delete(entry.name);
+    this.problems.delete(entry.name);
+    this.configs.delete(entry.name);
+    this.load([entry]);
+  }
 
   load(projects: ProjectEntry[]): void {
     for (const entry of projects) {
@@ -921,6 +953,7 @@ export class ReviewManager {
   }
 
   close(): void {
+    this.closed = true;
     this.store?.close();
     this.store = null;
     this.services.clear();

@@ -138,6 +138,23 @@ export class Delivery {
     await this.idle();
   }
 
+  /**
+   * Stop for a config reload: no new tick or operation starts (requests get
+   * 409), while the tick and the operation in progress run to the end; their
+   * commands are not killed. Then stop() as usual.
+   */
+  async drain(): Promise<void> {
+    this.ctx.closing = true;
+    this.stopped = true;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    await this.ticking?.catch(() => undefined);
+    await this.idle();
+    await this.stop();
+  }
+
   async status(errors: string[] = []): Promise<DeliveryProjectStatus> {
     const environments: EnvironmentStatus[] = [];
     for (const env of this.environments) environments.push(await env.status());
@@ -183,6 +200,8 @@ export class DeliveryManager implements ContainerServices {
   private problems = new Map<string, string[]>();
   private readOnly = new Map<string, boolean>();
   private store: DeliveryStore | null = null;
+  /** "started" between start() and stop(); a reload never runs once "stopped" */
+  private phase: "loaded" | "started" | "stopped" = "loaded";
 
   constructor(
     private options: {
@@ -222,12 +241,41 @@ export class DeliveryManager implements ContainerServices {
   }
 
   start(): string[] {
+    this.phase = "started";
     for (const delivery of this.deliveries.values()) delivery.start();
     return [...this.deliveries.keys()];
   }
 
+  /**
+   * Apply a project's new config (src/server/reload/): its delivery drains
+   * (the operation in progress finishes, new ones get 409), then the new one
+   * starts. Other projects are not touched. A delivery that fails to start is
+   * stopped and removed before the error is thrown, so the project's
+   * delivery is either running or off. A shutdown during the drain wins.
+   */
+  async reloadProject(entry: ProjectEntry): Promise<void> {
+    if (this.phase === "stopped") return;
+    const old = this.deliveries.get(entry.name);
+    if (old) await old.drain();
+    if (this.phase === "stopped") return;
+    this.deliveries.delete(entry.name);
+    this.problems.delete(entry.name);
+    this.readOnly.delete(entry.name);
+    this.load([entry]);
+    const next = this.deliveries.get(entry.name);
+    if (!next || this.phase !== "started") return;
+    try {
+      next.start();
+    } catch (e) {
+      await next.stop();
+      this.deliveries.delete(entry.name);
+      throw e;
+    }
+  }
+
   /** Stop every delivery, wait for ticks and operations in progress, then close the store. */
   async stop(): Promise<void> {
+    this.phase = "stopped";
     await Promise.all([...this.deliveries.values()].map((delivery) => delivery.stop()));
     this.deliveries.clear();
     this.store?.close();

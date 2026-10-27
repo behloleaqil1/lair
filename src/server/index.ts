@@ -43,8 +43,10 @@ import { AgentsManager, registerAgentsRoutes } from "./agents/index.js";
 import { getBudgetManager } from "./fleet/budget.js";
 import { ReviewManager, registerReviewRoutes } from "./review/index.js";
 import { mountTriage } from "./triage/index.js";
+import { ConfigReloader, registerReloadRoutes, serverModules } from "./reload/index.js";
+import { RestartController, registerRestartRoutes } from "./restart/index.js";
 import { join } from "path";
-import type { ApiResponse } from "../shared/types.js";
+import type { ApiResponse, ProjectConfig } from "../shared/types.js";
 
 const PORT = 4777;
 const HOST = process.env.LAIR_HOST || "127.0.0.1";
@@ -111,6 +113,20 @@ function getDataService(project?: string): DataService {
 // WebSocket server and file watchers (initialized after server starts)
 let wsServer: LairWebSocketServer | null = null;
 const fileWatchers = new Map<string, FileWatcherService>();
+/** Per project: the paths its file watcher watches */
+const watchedPaths = new Map<string, string>();
+const watchKey = (config: ProjectConfig) =>
+  JSON.stringify([config.name, config.agents_dir, config.gates_dir, config.queue_file]);
+
+/** After a config reload: watch the project's new paths, when they changed. */
+function refreshFileWatcher(project: string, config: ProjectConfig): void {
+  const paths = watchKey(config);
+  if (!wsServer || watchedPaths.get(project) === paths) return;
+  const old = fileWatchers.get(project);
+  fileWatchers.set(project, createFileWatcher(wsServer, config));
+  watchedPaths.set(project, paths);
+  void old?.stop();
+}
 
 // ============ ROUTES ============
 
@@ -448,6 +464,30 @@ const triage = await mountTriage(fastify, {
 });
 triage.useDecisions(decisionInbox);
 
+// Live config reload (src/server/reload/): a changed project file reaches
+// the modules whose part of it changed, without a restart; an invalid one
+// keeps the previous config running and shows in the dashboard's banner
+const reloader = new ConfigReloader({
+  modules: serverModules({ delivery, watchdogs, pipelines, reviews, agents, triage }),
+  initial: projectEntries,
+  events: getEventBus(),
+  onAccepted: (project, config) => {
+    dataServices.delete(project);
+    refreshFileWatcher(project, config);
+  },
+});
+await registerReloadRoutes(fastify, reloader);
+
+// The owner's Restart and "Update and restart" (src/server/restart/): the
+// graceful shutdown below, then exit code 0 for the service manager
+const restart = new RestartController({
+  configPath: join(process.cwd(), "data", "server.yaml"),
+  shutdown: () => shutdown("a restart"),
+  exit: (code) => process.exit(code),
+  events: getEventBus(),
+});
+await registerRestartRoutes(fastify, humanAuth, restart);
+
 // Serve the built web UI (dist/client) with an SPA fallback, when it exists.
 // In development the UI comes from the Vite dev server on port 5173 instead.
 const clientDir = resolveClientDir();
@@ -468,9 +508,16 @@ const initSupervisor = async () => {
   }
 };
 
-// Graceful shutdown handler
-const shutdown = async (signal: string) => {
-  console.log(`Received ${signal}, shutting down gracefully...`);
+// Graceful shutdown, once (a signal and the owner's Restart share it); the
+// caller exits after it
+let stopping: Promise<void> | null = null;
+const shutdown = (reason: string): Promise<void> => (stopping ??= stopServer(reason));
+
+const stopServer = async (reason: string) => {
+  console.log(`Shutting down gracefully (${reason})...`);
+
+  // Stop watching the project files: no reload starts from now on
+  await reloader.stop();
 
   // Stop watchdogs: wait for a tick in progress, then close their store
   await watchdogs.stop();
@@ -528,11 +575,15 @@ const shutdown = async (signal: string) => {
 
   // Close fastify
   await fastify.close();
-  process.exit(0);
 };
 
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+const exitOnSignal = (signal: string) => {
+  shutdown(`received ${signal}`)
+    .catch((err) => console.error("Error during shutdown:", err))
+    .finally(() => process.exit(0));
+};
+process.on("SIGTERM", () => exitOnSignal("SIGTERM"));
+process.on("SIGINT", () => exitOnSignal("SIGINT"));
 
 // Start server
 const start = async () => {
@@ -621,10 +672,15 @@ const start = async () => {
         const config = loadProjectConfig(projectName);
         const watcher = createFileWatcher(wsServer, config);
         fileWatchers.set(projectName, watcher);
+        watchedPaths.set(projectName, watchKey(config));
       } catch (err) {
         console.warn(`Failed to start file watcher for ${projectName}:`, err);
       }
     }
+
+    // Reload the modules when a project file changes
+    reloader.start();
+    console.log("[config] Watching projects/ and projects/local/: changes reload the modules they affect");
 
     console.log(`WebSocket server ready at ws://${HOST}:${PORT}/ws`);
     console.log(`Node WebSocket ready at ws://${HOST}:${PORT}/ws/node`);
