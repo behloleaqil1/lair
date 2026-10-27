@@ -61,6 +61,8 @@ export interface CommandOutput {
 
 export interface RunOptions {
   timeoutMs?: number;
+  /** The most stdout or stderr the command may write (default 1 MB); more ends it with code -1 */
+  maxBufferBytes?: number;
   /** Kills the command when it aborts (it then answers with code -1) */
   signal?: AbortSignal;
 }
@@ -103,7 +105,7 @@ export class ExecFileRunner implements CommandRunner {
         args,
         {
           timeout: options.timeoutMs ?? this.defaultTimeoutMs,
-          maxBuffer: MAX_OUTPUT_BYTES,
+          maxBuffer: options.maxBufferBytes ?? MAX_OUTPUT_BYTES,
           encoding: "utf-8",
           shell: false,
           signal: options.signal,
@@ -131,11 +133,19 @@ export class ExecFileRunner implements CommandRunner {
 /** `ps -A -ww -o pid=,ppid=,etime=,args=` (works on Linux and macOS). */
 export const PS_ARGV = ["ps", "-A", "-ww", "-o", "pid=,ppid=,etime=,args="];
 
+/**
+ * ps prints every argument in full (`-ww`), and some processes have huge ones: a JVM test worker's classpath alone can be
+ * tens of KB, so a busy build machine passes 1 MB. The table gets its own, larger cap, and each line is cut to
+ * PS_LINE_MAX before it is parsed: the program and the first arguments, which is what matching needs, come first.
+ */
+export const PS_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+export const PS_LINE_MAX = 8192;
+
 export class PsProcessTable implements ProcessTable {
   constructor(private runner: CommandRunner = new ExecFileRunner(10_000)) {}
 
   async list(): Promise<ProcessInfo[]> {
-    const out = await this.runner.run(PS_ARGV, { timeoutMs: 10_000 });
+    const out = await this.runner.run(PS_ARGV, { timeoutMs: 10_000, maxBufferBytes: PS_MAX_OUTPUT_BYTES });
     if (out.code !== 0) {
       throw new Error(`ps failed (${out.code}): ${out.stderr.trim()}`);
     }
@@ -149,7 +159,8 @@ export class PsProcessTable implements ProcessTable {
  */
 export function parsePsOutput(output: string): ProcessInfo[] {
   const processes: ProcessInfo[] = [];
-  for (const line of output.split("\n")) {
+  for (const raw of output.split("\n")) {
+    const line = raw.length > PS_LINE_MAX ? raw.slice(0, PS_LINE_MAX) : raw;
     const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*\S)\s*$/);
     if (!match) continue;
     const elapsed = parseElapsed(match[3]);

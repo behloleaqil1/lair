@@ -6,6 +6,8 @@ import {
   ExecFileRunner,
   NodeFileSystem,
   PS_ARGV,
+  PS_LINE_MAX,
+  PS_MAX_OUTPUT_BYTES,
   PsProcessTable,
   parseElapsed,
   parsePsOutput,
@@ -58,6 +60,18 @@ describe("parsePsOutput", () => {
   });
 });
 
+describe("parsePsOutput with huge argument lists", () => {
+  it("cuts each line to PS_LINE_MAX before parsing and keeps the program and first arguments", () => {
+    const classpath = "/a/lib.jar:".repeat(20_000);
+    const out = `  42  1  01:02:03 /usr/bin/java -cp ${classpath} Worker\n  7  1  00:10 sleep 100\n`;
+    const procs = parsePsOutput(out);
+    expect(procs.map((p) => p.pid)).toEqual([42, 7]);
+    expect(procs[0].argv.slice(0, 2)).toEqual(["/usr/bin/java", "-cp"]);
+    expect(procs[0].command.length).toBeLessThanOrEqual(PS_LINE_MAX);
+    expect(procs[0].elapsedSeconds).toBe(3723);
+  });
+});
+
 describe("PsProcessTable", () => {
   it("runs ps with an argv array and parses its output", async () => {
     const calls: string[][] = [];
@@ -70,6 +84,19 @@ describe("PsProcessTable", () => {
     const procs = await new PsProcessTable(runner).list();
     expect(calls).toEqual([PS_ARGV]);
     expect(procs.map((p) => p.pid)).toEqual([7]);
+  });
+
+  it("gives ps its own large output cap: JVM classpaths alone pass the 1 MB default on a busy machine", async () => {
+    const seen: Array<number | undefined> = [];
+    const runner: CommandRunner = {
+      async run(_argv, options): Promise<CommandOutput> {
+        seen.push(options?.maxBufferBytes);
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    await new PsProcessTable(runner).list();
+    expect(seen).toEqual([PS_MAX_OUTPUT_BYTES]);
+    expect(PS_MAX_OUTPUT_BYTES).toBeGreaterThan(1024 * 1024);
   });
 
   it("throws when ps fails, so detectors report an error instead of 'no processes'", async () => {
@@ -94,6 +121,14 @@ describe("ExecFileRunner", () => {
   it("never uses a shell: shell syntax in an argument stays literal", async () => {
     const out = await new ExecFileRunner(5000).run([process.execPath, "-e", "process.stdout.write(process.argv[1])", "$(echo hi); rm -rf x"]);
     expect(out).toEqual({ code: 0, stdout: "$(echo hi); rm -rf x", stderr: "" });
+  });
+
+  it("ends output past the 1 MB default with -1, and takes a larger cap per call", async () => {
+    const big = [process.execPath, "-e", "process.stdout.write('x'.repeat(2 * 1024 * 1024))"];
+    expect((await new ExecFileRunner(20_000).run(big)).code).toBe(-1);
+    const out = await new ExecFileRunner(20_000).run(big, { maxBufferBytes: 4 * 1024 * 1024 });
+    expect(out.code).toBe(0);
+    expect(out.stdout.length).toBe(2 * 1024 * 1024);
   });
 
   it("reports a non-zero exit code", async () => {
