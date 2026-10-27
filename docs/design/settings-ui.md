@@ -53,7 +53,7 @@ HTTP 422 and errors per field (`{path, message}`; a message no field owns has an
 2. secrets (below);
 3. `parseProjectConfig`, the text half of `loadProjectConfig` (required fields, `dragon_defaults`);
 4. every module's own parser, through `ConfigReloader.validate()`: the exact checks live reload runs on a changed
-   file (`serverModules`: delivery, watchdog, pipelines and executors, review, agents, triage).
+   file (`serverModules`: delivery, watchdog, pipelines and executors, review, agents, triage, placement).
 
 The parsers' messages already start with the field's path (`watchdog.interval_seconds: ...`), which is how errors are
 shown under the field. `POST /api/settings/validate` runs all of this as a dry run and also returns the diff and the
@@ -92,9 +92,10 @@ command changes, so the UI previews a save before it is made.
 ### Command-bearing fields
 
 A field makes Lair execute something when its key is `*_cmd` (`dragon_start_cmd`, `branch_state_cmd`, `capacity_cmd`,
-`update_cmd`, adapters' `start_cmd` and `stop_cmd`, delivery's `fetch_cmd` and `prepare_cmd`, ...), when it is an argv
-under `actions`, `commands`, `probes` or `hooks` (watchdog actions, triage commands, machine probes), a step's `run`,
-a process's `command`, or one of `gate_script`, `kiro_cli`, `ssh_cmd`; and a step's or process's `env` and `cwd`. The
+`update_cmd`, adapters' `start_cmd` and `stop_cmd`, delivery's `fetch_cmd` and `prepare_cmd`, placement's `load_cmd`
+and `move_cmd`, ...), when it is an argv under `actions`, `commands`, `probes` or `hooks` (watchdog actions, triage
+commands), a step's `run`, a process's `command`, a placement machine's `probe`, or one of `gate_script`, `kiro_cli`,
+`ssh_cmd`; and a step's or process's `env` and `cwd`. The
 rule is in `src/shared/settings-rules.ts`, by key name and value shape, so blocks that other modules add later are
 covered; a hint can mark any other field.
 

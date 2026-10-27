@@ -11,10 +11,10 @@ import type { PathSegment } from "./settings-types.js";
 /** `ask_cmd`, `start_cmd`, `branch_state_cmd`, `update_cmd`, `cmd`... (any value shape) */
 const COMMAND_KEY = /(^|_)cmds?$/;
 /** Keys whose value is the command itself, when it is a string or an argv */
-const RUN_KEYS = new Set(["run", "command", "argv"]);
+const RUN_KEYS = new Set(["run", "command", "argv", "probe"]);
 /** Keys naming a program or script Lair runs */
 const PROGRAM_KEYS = new Set(["gate_script", "kiro_cli", "script", "program", "executable"]);
-/** Containers whose argv children are commands (watchdog actions, triage commands, machine probes) */
+/** Containers whose argv children are commands (watchdog actions, triage commands, probes) */
 const COMMAND_CONTAINERS = new Set(["actions", "commands", "probes", "hooks"]);
 /** Siblings of a run/command key that change what runs */
 const COMMAND_CONTEXT = new Set(["env", "cwd"]);

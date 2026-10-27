@@ -140,6 +140,7 @@ describe("command-bearing fields", () => {
       processes: { api: { command: ["node", "server.js"], cwd: "/srv" } },
       machines: { box: { type: "ssh", gate_script: "/opt/gate.sh", key: "~/.ssh/id" } },
       server: { update_cmd: [["git", "pull"], ["npm", "ci"]] },
+      placement: { machines: { m1: { probe: ["ssh", "m1", "true"], load_cmd: ["ssh", "m1", "uptime"], cpus: 8 } }, move_cmd: ["./move", "{id}"] },
     };
     expect([...collectCommands(config).keys()].sort()).toEqual([
       "agent_adapters.mine.start_cmd",
@@ -148,6 +149,9 @@ describe("command-bearing fields", () => {
       "machines.box.gate_script",
       "pipelines.ci.steps.0.env",
       "pipelines.ci.steps.0.run",
+      "placement.machines.m1.load_cmd",
+      "placement.machines.m1.probe",
+      "placement.move_cmd",
       "processes.api.command",
       "processes.api.cwd",
       "server.update_cmd",

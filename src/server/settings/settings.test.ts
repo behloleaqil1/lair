@@ -30,6 +30,7 @@ import type { AgentsManager } from "../agents/service.js";
 import type { PipelineManager } from "../gates/pipeline-service.js";
 import type { ReviewManager } from "../review/service.js";
 import type { TriageManager } from "../triage/manager.js";
+import type { PlacementManager } from "../placement/service.js";
 import { NodeFileSystem } from "../watchdog/probes.js";
 import { WatchdogManager } from "../watchdog/service.js";
 import { HumanAuth, OWNER_SESSION_HEADER, registerOwnerRoutes } from "../human-auth/index.js";
@@ -601,11 +602,12 @@ describe("forms", () => {
       reviews: {} as ReviewManager,
       agents: {} as AgentsManager,
       triage: {} as TriageManager,
+      placements: {} as PlacementManager,
     });
     const blocks = sections.flatMap((s) => s.blocks);
     for (const module of all) for (const block of module.blocks) expect(blocks, block).toContain(block);
     expect(sections.filter((s) => s.toggle).map((s) => s.key)).toEqual(
-      expect.arrayContaining(["watchdog", "delivery", "review", "agents", "triage"]),
+      expect.arrayContaining(["watchdog", "delivery", "review", "agents", "triage", "placement"]),
     );
 
     const view = (await loadProjectSettings("shop")).data!;
@@ -641,6 +643,9 @@ describe("forms", () => {
     expect(triage.get("triage.recheck.capacity_cmd")).toMatchObject({ kind: "argv", command: true });
     const dragons = byPath("dragons");
     expect(dragons.get("dragon_start_cmd")).toMatchObject({ kind: "argv", command: true });
+    const placement = byPath("placement");
+    expect(placement.get("placement.move_cmd")).toMatchObject({ kind: "argv", command: true });
+    expect(placement.get("placement.machines")).toMatchObject({ kind: "record" });
     const adapters = byPath("adapters");
     expect(adapters.get("agent_adapters")).toMatchObject({ kind: "record" });
   });

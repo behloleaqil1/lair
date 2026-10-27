@@ -56,7 +56,7 @@ const HistorySchema = z
   })
   .strict();
 
-const PlacementSchema = z
+export const PlacementSchema = z
   .object({
     enabled: z.boolean().default(false),
     mode: z.enum(["observe", "act"]).default("observe"),

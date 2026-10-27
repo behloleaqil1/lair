@@ -14,6 +14,7 @@ import type { FieldHint, JsonSchema, SettingsSection } from "../../shared/settin
 import { AgentsSchema } from "../agents/config.js";
 import { DeliverySchema } from "../delivery/config.js";
 import { ExecutorsSchema, PipelinesSchema } from "../gates/project-pipelines.js";
+import { PlacementSchema } from "../placement/config.js";
 import { ReviewSchema } from "../review/config.js";
 import { TriageSchema } from "../triage/config.js";
 import { WatchdogSchema } from "../watchdog/config.js";
@@ -178,6 +179,22 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       context_patterns: { advanced: true },
       command_timeout_seconds: timeouts,
       base_max_age_hours: timeouts,
+    },
+  },
+  {
+    key: "placement",
+    title: "Placement",
+    schema: PlacementSchema,
+    docs: "#placement",
+    hints: {
+      mode: { help: "observe says where each job would finish soonest; act moves it with move_cmd" },
+      "machines.*.probe": { help: "Exit 0 (and stdout starting with expect, when set) means the machine answers" },
+      "machines.*.load_cmd": { help: "Prints the 1-minute load first and the cpu count last" },
+      move_cmd: { help: "Placeholders: {id}, {from}, {to}, {file}, {priority}, {project}" },
+      probe_timeout_seconds: timeouts,
+      command_timeout_seconds: timeouts,
+      command_line: timeouts,
+      history: { advanced: true },
     },
   },
 ];
