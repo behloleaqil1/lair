@@ -1,0 +1,123 @@
+/**
+ * What the project's files say about finished runs, for learning durations:
+ *
+ * - a result is `gates_dir/results/<id>.rc`; its mtime is when the run
+ *   ended (as the Gates view reads it);
+ * - the result's log `results/<id>.log` often prints the run's seconds
+ *   (`history.duration_pattern`, by default `time=<N>s`): the last match in
+ *   its tail counts;
+ * - a runner log (`history.runner_log`, optional) has one tab-separated line
+ *   per finished run with its id, exit code, command and lane, in the order
+ *   `history.columns` names them. It gives the command and lane of runs
+ *   that ended before Lair watched them.
+ *
+ * All reads are bounded: tails only, lines cut before any pattern runs.
+ */
+import { isAbsolute, join } from "path";
+import { isSafeGateId } from "../services/data.js";
+import type { HistoryColumn } from "./config.js";
+import type { QueueFiles } from "./probes.js";
+
+const RC_BYTES = 64;
+const LOG_TAIL_BYTES = 16 * 1024;
+const MAX_LINE = 1000;
+/** The runner log's tail that is read, and at most this many lines of it */
+const RUNNER_LOG_TAIL_BYTES = 1024 * 1024;
+const RUNNER_LOG_LINES = 2000;
+const MAX_RUNNER_LINE = 8192;
+const SAFE_LANE = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
+
+export interface ResultInfo {
+  rc: number;
+  /** The .rc file's mtime */
+  finishedAtMs: number;
+  /** The seconds the result's log prints, when it prints them */
+  logSeconds: number | null;
+}
+
+/** A result for `id`, or null when it has none (yet). */
+export function readResult(
+  files: QueueFiles,
+  gatesDir: string,
+  id: string,
+  durationPattern: RegExp,
+): ResultInfo | null {
+  if (!isSafeGateId(id)) return null;
+  const resultsDir = join(gatesDir, "results");
+  const rcPath = join(resultsDir, `${id}.rc`);
+  const st = files.stat(rcPath);
+  if (!st || !st.isFile) return null;
+  const rc = Number.parseInt((files.head(rcPath, RC_BYTES) ?? "").trim(), 10);
+  if (!Number.isFinite(rc)) return null;
+  return { rc, finishedAtMs: st.mtimeMs, logSeconds: logSeconds(files, join(resultsDir, `${id}.log`), durationPattern) };
+}
+
+/** The last duration the log's tail prints, in seconds, or null. */
+export function logSeconds(files: QueueFiles, path: string, pattern: RegExp): number | null {
+  const text = files.tail(path, LOG_TAIL_BYTES);
+  if (!text) return null;
+  const global = new RegExp(pattern.source, pattern.flags.replace(/[gy]/g, "") + "g");
+  let seconds: number | null = null;
+  for (const raw of text.split("\n")) {
+    const line = raw.slice(0, MAX_LINE);
+    global.lastIndex = 0;
+    for (const match of line.matchAll(global)) {
+      const value = Number(match[1]);
+      if (Number.isFinite(value) && value >= 0) seconds = value;
+    }
+  }
+  return seconds;
+}
+
+export interface RunnerLogLine {
+  id: string;
+  rc: number;
+  command: string;
+  lane: string;
+  /** The time column, when there is one and it parses */
+  atMs: number | null;
+}
+
+/** The runner log's path: relative paths are under gates_dir. */
+export function runnerLogPath(gatesDir: string, path: string): string {
+  return isAbsolute(path) ? path : join(gatesDir, path);
+}
+
+/**
+ * The finished runs in the runner log's tail, oldest first: lines whose rc
+ * column is an integer and whose id and lane are safe names. Other lines
+ * (starts, waits, notes) are skipped.
+ */
+export function readRunnerLog(files: QueueFiles, path: string, columns: readonly HistoryColumn[]): RunnerLogLine[] {
+  const text = files.tail(path, RUNNER_LOG_TAIL_BYTES);
+  if (!text) return [];
+  const lines = text.split("\n");
+  // The first line of a tail may be cut: skip it unless the whole file was read
+  const start = text.length >= RUNNER_LOG_TAIL_BYTES ? 1 : 0;
+  const out: RunnerLogLine[] = [];
+  for (const raw of lines.slice(Math.max(start, lines.length - RUNNER_LOG_LINES))) {
+    const fields = raw.slice(0, MAX_RUNNER_LINE).replace(/\r$/, "").split("\t");
+    if (fields.length < columns.length - 1) continue;
+    const get = (name: HistoryColumn) => {
+      const i = columns.indexOf(name);
+      return i >= 0 && i < fields.length ? fields[i] : undefined;
+    };
+    const id = get("id")?.trim();
+    const rcText = get("rc")?.trim();
+    const lane = get("lane")?.trim();
+    const command = get("command") ?? "";
+    if (!id || !isSafeGateId(id) || !lane || !SAFE_LANE.test(lane)) continue;
+    if (!rcText || !/^-?\d{1,4}$/.test(rcText)) continue;
+    const time = get("time");
+    const atMs = time ? Date.parse(time.trim()) : NaN;
+    out.push({ id, rc: Number(rcText), command, lane, atMs: Number.isFinite(atMs) ? atMs : null });
+  }
+  return out;
+}
+
+export function median(values: readonly number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}

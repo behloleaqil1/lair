@@ -84,6 +84,12 @@ export interface ProjectConfig {
    * parseTriageConfig; see docs/configuration.md#triage
    */
   triage?: Record<string, unknown>;
+  /**
+   * Placement: which machine runs each queued job of the gate queue
+   * (src/server/placement/). Validated by parsePlacementConfig; see
+   * docs/configuration.md#placement
+   */
+  placement?: Record<string, unknown>;
 }
 
 // Process configuration as it appears in YAML (before defaults applied)

@@ -424,7 +424,7 @@ describe("live config reload", () => {
 describe("UNREAD_KEYS", () => {
   /** The modules' code and the helpers they read a project config with */
   const SOURCES = [
-    ...["watchdog", "delivery", "gates", "review", "agents", "triage"].map((d) => join("src", "server", d)),
+    ...["watchdog", "delivery", "gates", "review", "agents", "triage", "placement"].map((d) => join("src", "server", d)),
     join("src", "server", "services", "adapters.ts"),
     join("src", "server", "services", "dragon-registry.ts"),
   ];

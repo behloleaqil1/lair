@@ -1,9 +1,11 @@
 /**
- * Machines view - machine and runner status
+ * Machines view - machine and runner status, and (with placement on) each
+ * placement machine's probe state, load and lanes.
  * Uses WebSocket for real-time updates with REST polling as fallback.
  */
 import { useApi } from "../hooks/useApi";
 import { useMachinesWebSocket } from "../hooks/useWebSocket";
+import { PlacementMachines } from "./Placement";
 import type { MachineStatus } from "../../shared/types";
 
 interface Props {
@@ -166,6 +168,10 @@ export function Machines({ project, refreshKey }: Props) {
           </p>
         </div>
       )}
+
+      {/* Placement: probe state (up since, down since), load, slots in use per lane */}
+      <PlacementMachines project={project} refreshKey={refreshKey} />
+
     </div>
   );
 }

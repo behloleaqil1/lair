@@ -12,6 +12,7 @@ import type { PipelineManager } from "../gates/pipeline-service.js";
 import { parseReviewConfig } from "../review/config.js";
 import type { ReviewManager } from "../review/service.js";
 import type { TriageManager } from "../triage/manager.js";
+import type { PlacementManager } from "../placement/service.js";
 import { parseWatchdogConfig } from "../watchdog/config.js";
 import type { WatchdogManager } from "../watchdog/service.js";
 
@@ -46,6 +47,7 @@ export interface ServerModules {
   reviews?: ReviewManager;
   agents?: AgentsManager;
   triage?: TriageManager;
+  placements?: PlacementManager;
 }
 
 function errorsOf(result: { ok: true } | { ok: false; errors: string[] }): string[] {
@@ -55,7 +57,7 @@ function errorsOf(result: { ok: true } | { ok: false; errors: string[] }): strin
 /** The server's modules, as src/server/index.ts wires them. */
 export function serverModules(m: ServerModules): ReloadableModule[] {
   const modules: ReloadableModule[] = [];
-  const { delivery, watchdogs, pipelines, reviews, agents, triage } = m;
+  const { delivery, watchdogs, pipelines, reviews, agents, triage, placements } = m;
   if (delivery) {
     modules.push({
       name: "delivery",
@@ -107,6 +109,14 @@ export function serverModules(m: ServerModules): ReloadableModule[] {
       blocks: ["triage"],
       validate: (config) => triage.validate(config),
       reload: (entry) => triage.reloadProject(entry),
+    });
+  }
+  if (placements) {
+    modules.push({
+      name: "placement",
+      blocks: ["placement"],
+      validate: (config) => placements.validate(config),
+      reload: (entry) => placements.reloadProject(entry),
     });
   }
   return modules;

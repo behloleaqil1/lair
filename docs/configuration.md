@@ -1323,6 +1323,122 @@ The owner only (the owner's session from [the owner credential](#decision-inbox)
 - `POST /api/triage/owner/protected` with `{"sha": "<full sha>", "note": "..."}`, `DELETE /api/triage/owner/protected/<sha>`
 - `DELETE /api/triage/owner/flaky/<test key>`: release a quarantined test
 
+## Placement
+
+> Off by default. With `enabled: true` and the default `mode: observe`, placement probes your machines, estimates when every queued job finishes, and shows where it would move each one. It runs none of your commands except the probes.
+
+Placement is for projects that keep their own gate queue and runners: the request files under `gates_dir/queue/` that the Gates view reads, one lane per runner. It decides which machine runs each queued job, for any number of machines, and moves a job to another lane when it is expected to finish sooner there. Lair never renames a request itself. In act mode it runs your `move_cmd`, which validates and moves the request, and then checks that the request landed.
+
+A two-machine example: a workstation with a `heavy` lane and a second runner of that lane (`quick`), and a laptop reachable over SSH with a `remote` lane that has two runners and takes one full suite at a time:
+
+```yaml
+placement:
+  enabled: true
+  mode: observe                  # observe (default) | act
+  machines:
+    workstation:
+      probe: ["true"]
+      load_cmd: ["sysctl", "-n", "vm.loadavg", "hw.ncpu"]      # Linux: ["sh", "-c", "cat /proc/loadavg; nproc"]
+      min_up_seconds: 0
+    laptop:
+      probe: ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "builder@laptop.example", "echo", "ok"]
+      expect: "ok"
+      load_cmd: ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "builder@laptop.example", "cat /proc/loadavg; nproc"]
+      min_up_seconds: 240
+  lanes:
+    heavy: { machine: workstation, slots: 1 }
+    quick: { machine: workstation, slots: 1, serves: [heavy], max_priority: 3 }
+    remote: { machine: laptop, slots: 2, limits: { big: 1 } }
+  classes:                       # the first class whose pattern matches, in this order
+    quick: ['/^TESTS=\S+ \./run-tests\.sh \{WT\}$/']
+    small: ["*run-tests.sh*"]
+    big: ["*run-suite.sh*"]
+  eligible:
+    heavy: [quick, small, big]
+    quick: [quick]
+    remote: [quick, small, big]
+  prefer_quiet: ["*RECHECK=timeouts*"]
+  move_cmd: ["./scripts/gate-move.sh", "{id}", "{from}", "{to}"]
+  command_line: 3                # the request file's command starts on its third line
+  history:
+    runner_log: runner.log       # gates_dir/runner.log
+    columns: [time, id, rc, command, lane]
+```
+
+### How placement decides
+
+Every `interval_seconds`:
+
+1. **Machines.** Every machine's `probe` (and `load_cmd`) runs, all machines in parallel, as argv with no shell, each with `probe_timeout_seconds`. A probe passes when it exits 0 and, with `expect`, its output starts with that text. A machine is **up** only once its probes have passed for `min_up_seconds` in a row, so a flapping link does not bounce jobs: one failed probe makes it **down**, and the count starts again. A machine that is not up gets nothing new, and nothing is moved away from it either: jobs already in its lanes stay with your project's own fallback (for example a runner that sends its jobs elsewhere after a while unreachable). The Machines view shows each machine's state, since when, and its last error. Probe history is kept in memory, so after a restart a machine is up again only after `min_up_seconds`.
+2. **The queue.** Only the configured lanes are read. A request with no status suffix (`<lane>.<pri>.<id>.req`) is queued and may be moved; `.req.run` is running and is **never** moved; any other suffix (`.stuck`, `.superseded`, ...) is ignored. A request's command is its file from line `command_line` on, and its class is the first class (in the order written) with a pattern that matches the command. A pattern is a glob (`*` is any text, `?` one character, everything else literal; it matches the whole command) or a regular expression written `/.../` (flags `i`, `m`, `s`, `u`). A job with no class is estimated but never moved.
+3. **Learning.** Durations are learned per class and machine. Lair records every run it sees start (its request renamed to `.run`; its start is the rename time when Lair saw it queued just before, or the file's change time) and end (`results/<id>.rc` appears; the `.rc` file's time is the end). The run's seconds are the last `history.duration_pattern` match in the tail of `results/<id>.log` (by default `time=<N>s`), else the time Lair saw it run. A result whose log says it ran much longer than Lair saw it run is from an earlier run (a result shared between identical requests), and is not learned. With `history.runner_log`, finished runs that Lair did not see are learned too: each tab-separated line whose `rc` column is a number gives the run's id, command and lane, in the order `history.columns` names them (use `ignore` for a column to skip), and its seconds come from its result log. A job's expected duration is the median of the newest `history.samples` runs of its class on that machine, else of its class on any machine, else of any class on that machine, else `default_seconds`.
+4. **Load.** `load_cmd` prints the 1-minute load average first and the cpu count last (`sysctl -n vm.loadavg hw.ncpu` and `cat /proc/loadavg; nproc` both do; `cpus:` overrides the count). A machine's load factor is `max(1, load ÷ cpus)`. A machine runs jobs slower when its load factor is above the one it usually has while running gates: the expected duration is multiplied by `max(1, factor now ÷ usual factor)`, where the usual factor is the median of the factors Lair measured during the runs it learned from (1 until it has some). Without `load_cmd` the factor is 1.
+5. **Estimates.** Each lane runs its jobs in its own order (lower priority digit first, then the id, which usually starts with a UTC time) on `slots` runners, with at most `limits.<class>` jobs of a class at a time, and no job starts before the one ahead of it (a runner takes the head of its queue). A running job ends its expected duration after it started; one that is past it is expected to need a tenth of it more. A **pseudo-lane** (`serves:`) is a second runner that takes jobs from other lanes' queues: a queued job of a lane it serves, at or below its `max_priority`, whose class is in `eligible.<pseudo-lane>`, is estimated on the pseudo-lane and is **never moved** (its runner takes it beside the main one). The Gates view shows every queued job's expected start and finish.
+6. **Moves.** A queued job moves to another lane when it is expected to finish at least `min_gain_seconds` sooner there, and the move saves at least that much in all: what it costs the jobs of the same or a more urgent priority on both lanes is counted against it. The target lane must be up, list the job's class in `eligible`, and not be a pseudo-lane. The job that gains most moves first, then the next one on the state that leaves, up to `max_moves_per_tick`. A job moved (or tried) less than `cooldown_seconds` ago is not moved again, whatever the estimates say.
+7. **Quiet re-checks.** A job whose id or command matches a `prefer_quiet` pattern (for example a re-check of tests that failed by timeout) goes to the eligible up machine with the lowest load per cpu, when that is at least `quiet_margin` lower than its current machine's, even if it finishes later there. When no target's load is known, it is placed by time like any other job.
+
+Each decision is explained in one line, for example `moved 20260101T000000Z-fix-a1b2c3d4-1 heavy→remote: est. 52 min → 18 min; remote idle, workstation load 3.1×`.
+
+**Act mode.** With `mode: act` (and a project that is not `read_only`), each move runs `move_cmd` with `command_timeout_seconds`. Right before it runs, Lair checks that the request is still queued where it was (a runner may have claimed it meanwhile); afterwards, that `move_cmd` exited 0, the request is gone from its lane and is in the target lane (queued or already running). Anything else is a failed move: it is recorded with the command's output, emits `placement.move_failed`, no further move runs in that tick, and the job waits its cool-down before it is tried again. A move cut short by a server stop is found again on the next start: Lair looks where the request is and records it as moved, interrupted or gone (an interrupted one also waits its cool-down). Act mode is switched in the config only (a [live reload](#live-config-reload) applies it); there is no route for it.
+
+**Your `move_cmd`** is the one place a request is renamed, so it must check everything itself: the lanes, that the request exists with no status suffix, its command, that the target machine answers, and then rename it atomically (one `mv` within the queue directory). Placeholders: `{id}`, `{from}`, `{to}`, `{file}` (the request's path), `{priority}`, `{project}`. A value that would start an argument with `-` is refused.
+
+**Trust.** The queue, the result logs and the runner log are files any local process can write, so estimates are only as good as those files. That is why the mover validates every move on its own.
+
+### Placement options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Run placement for this project |
+| `mode` | `observe` \| `act` | `observe` | `observe` records and shows advice (`would_move`); `act` runs `move_cmd`, unless the project is `read_only: true` |
+| `interval_seconds` | number | `60` | Seconds between ticks (10 to 3600) |
+| `probe_timeout_seconds` | number | `15` | Timeout of each probe and load command |
+| `command_timeout_seconds` | number | `60` | Timeout of `move_cmd` |
+| `machines` | map | `{}` | Machine id → machine options (below) |
+| `lanes` | map | `{}` | Lane name (as in the request file names) → lane options (below). At least one when enabled. Lanes not listed are never read or moved |
+| `classes` | map | `{}` | Class name → patterns matched against a request's command. The first class, in the order written, wins |
+| `eligible` | map | `{}` | Lane → the classes it can run. A job moves only to a lane that lists its class |
+| `prefer_quiet` | array | `[]` | Patterns matched against a job's id and command: such a job goes to the least-loaded machine |
+| `quiet_margin` | number | `0.25` | How much lower (load per cpu) the quieter machine must be |
+| `move_cmd` | array | — | Your mover, as argv. Required for `mode: act` |
+| `max_moves_per_tick` | number | `2` | At most this many moves (or advice lines) per tick |
+| `min_gain_seconds` | number | `600` | A move must make the job finish at least this much sooner |
+| `cooldown_seconds` | number | `1800` | A job moved or tried is not moved again for this long |
+| `default_seconds` | number | `1800` | The expected duration before anything is learned |
+| `command_line` | number | `1` | The request file's line where its command starts |
+| `history.runner_log` | string | — | A tab-separated runner log, relative to `gates_dir` unless absolute; its tail (1 MB, 2000 lines) is read |
+| `history.columns` | array | `[time, id, rc, command, lane]` | The runner log's columns (`time`, `id`, `rc`, `command`, `lane`, `ignore`), in order |
+| `history.duration_pattern` | string | `\btime=(\d+)s\b` | Regular expression for a run's seconds in its result log; the first group is the seconds |
+| `history.samples` | number | `20` | Recent runs per class and machine in the median |
+
+Machine options:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `probe` | array | — | Argv that exits 0 when the machine answers |
+| `expect` | string | — | The probe's output must start with this (leading whitespace ignored). For an SSH host whose shell is Windows `cmd`, probe with `echo ok` |
+| `load_cmd` | array | — | Argv that prints the 1-minute load first and the cpu count last. Over SSH, the remote command is one string the remote shell parses |
+| `cpus` | number | — | The cpu count, instead of the one `load_cmd` prints |
+| `min_up_seconds` | number | `240` | Passing probes needed in a row before the machine counts as up (`0` for the machine Lair runs on) |
+
+Lane options:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `machine` | string | — | The machine id whose runners serve this lane |
+| `slots` | number | `1` | Runners of the lane: jobs it runs at once |
+| `limits` | map | `{}` | Class → at most this many running at once in the lane |
+| `serves` | array | `[]` | A pseudo-lane: the lanes whose queues its runner takes jobs from |
+| `max_priority` | number | — | A pseudo-lane takes only jobs at this priority digit or lower |
+
+Unknown keys, a lane on an unknown machine, an unknown class in `limits` or `eligible`, an invalid pattern, an unknown placeholder in `move_cmd`, or `mode: act` without `move_cmd` are config errors: the project's placement does not start, and `GET /api/placement/status` shows the errors.
+
+### Placement API
+
+`GET /api/placement/status?project=` (read-only): the mode and why act mode is off, config errors, the last tick, every machine's probe state (up, starting, down; since when; load and cpus), every lane's slots in use and per-class limits, every job's class, expected start and finish, advice and why it stays where it is, the latest moves (moved, failed, interrupted, gone, would_move, each with its argv and explanation), and the learned durations.
+
+Events on the bus: `placement.moved`, `placement.would_move`, `placement.move_failed`, `placement.machine_up`, `placement.machine_down`.
+
 ## Example complete configuration
 
 ```yaml
@@ -1373,7 +1489,7 @@ Project names (the file name without `.yaml` or `.yml`) must start with a letter
 
 The server watches `projects/` and `projects/local/`. When a project file changes (or a new one appears), it waits until the file has been quiet for a second, then reads it and checks it with every module's own parser, the same checks as at startup:
 
-- **Valid:** only the modules whose part of the file changed are reloaded, each for that project only. A module's part is its own block (`watchdog:`, `delivery:`, `pipelines:` and `executors:`, `review:`, `agents:`, `triage:`), the blocks it also reads (the agents module reads `watchdog:`), and every other top-level key a module may read (`repo`, `read_only`, `dragons`, `machines`, `agents_dir`...), so a change to one of those reloads every module of the project. Keys no module reads reload nothing: the dashboard's commands (`*_cmd`, `allow_direct_assign`, `outbox_file`, `backlog_file`), `merge_bar`, `processes`, `orchestrator`, `available_models` and `gate_runner`. Editing only a comment reloads nothing. The dashboard's reads use the new file from the next request.
+- **Valid:** only the modules whose part of the file changed are reloaded, each for that project only. A module's part is its own block (`watchdog:`, `delivery:`, `pipelines:` and `executors:`, `review:`, `agents:`, `triage:`, `placement:`), the blocks it also reads (the agents module reads `watchdog:`), and every other top-level key a module may read (`repo`, `read_only`, `dragons`, `machines`, `agents_dir`...), so a change to one of those reloads every module of the project. Keys no module reads reload nothing: the dashboard's commands (`*_cmd`, `allow_direct_assign`, `outbox_file`, `backlog_file`), `merge_bar`, `processes`, `orchestrator`, `available_models` and `gate_runner`. Editing only a comment reloads nothing. The dashboard's reads use the new file from the next request.
 - **Invalid** (YAML errors, missing required fields, any module's parser refusing its block, a file that is not a regular file or is over 1 MiB): nothing changes, and the modules keep running the previous config. The error is logged, emitted as a `config.invalid` event, and shown in a banner on the dashboard: "projects/x.yaml has an error; the previous config is still running: ..." until the file is fixed.
 - **Another file:** the modules keep running the file they started with. When it is deleted (deleting `projects/local/x.yaml` would otherwise fall back to the public `projects/x.yaml`), or a new file takes its place (a new `projects/local/x.yaml`), nothing changes and the banner says so; restart Lair to switch files. Deleting a project's only file also keeps its previous config running until a restart.
 
@@ -1389,6 +1505,7 @@ A module is reloaded by stopping its instance for the project cleanly and starti
 | review | A merge in progress finishes; a merge asked for meanwhile gets HTTP 503 (a shutdown waits for it too, so its record is written) |
 | agents | The agents keep running; the new config re-adopts them by pid, as after a restart |
 | triage | The tick, ingests and outbox in progress finish first |
+| placement | As on shutdown: a probe or `move_cmd` in progress is cut short, and a move it cut short is found again by the new instance's first tick. Learned durations, moves and cool-downs are kept (they are in the store); probe history starts again, so a machine is up again only after `min_up_seconds` |
 
 Reloads of one module for one project never overlap: a change made while one runs is applied after it, with the latest file (also when the latest file is the one that ran before). A module that fails to start with the new config (for example, its store can't be opened) is started again with the previous one, and the banner says so; it is never left half-started.
 

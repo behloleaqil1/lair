@@ -199,6 +199,17 @@ Failure triage, bisect and revert ([configuration](configuration.md#triage)). It
 - **`manager.ts`**, **`routes.ts`**, **`index.ts`**: the projects' lifecycle and trusted node keys, the `/api/triage/*` routes (signed results; `/api/triage/owner/*` for the owner), and `mountTriage()`
 - **`testing/harness.ts`**: the fakes the tests use (command runner, clock, git), a signing node, and result builders
 
+#### Placement (`placement/`)
+
+Which machine runs each queued job of a project's own gate queue ([configuration](configuration.md#placement)). Off unless a project sets `placement.enabled`, and advice only unless it sets `mode: act`.
+
+- **`config.ts`**: the validated `placement:` block (machines, lanes, pseudo-lanes, classes, eligibility, the mover), globs and `/regex/` patterns, and the `move_cmd` argv builder
+- **`probes.ts`**: the system boundary: the watchdog's `CommandRunner` (argv, timeouts) and `Clock`, and bounded `QueueFiles` reads
+- **`queue.ts`**, **`history.ts`**: the configured lanes' requests with their command and class; results (`.rc` time, the seconds a log prints) and the runner log's finished runs
+- **`estimate.ts`**: per-lane simulation (order, slots, class limits, pseudo-lanes) and the greedy move decisions, quiet re-checks included
+- **`store.ts`**: moves, the runs Lair saw start, and learned durations in SQLite (`data/placement.db`)
+- **`service.ts`**, **`routes.ts`**: the per-project tick (probes, learning, estimates, act or observe, recovery of a move cut short) started and stopped by `index.ts`, and the read-only `GET /api/placement/status`
+
 #### Store (`store/`)
 
 - **`store.ts`**: SQLite store (better-sqlite3) for nodes, tasks, jobs, events and agent runs, at `data/lair.db`
@@ -248,6 +259,7 @@ Each view is a standalone component:
 - **`OwnerSessions.tsx`**: the signed-in browsers, each with Sign out
 - **`Dragons.tsx`**, **`DragonStartDialog.tsx`**, **`DragonStopDialog.tsx`**: agent list (running also for a run of the agents module, "managed by Lair"; the effective model, "(default)" when from `dragon_defaults`; the newest log's time), start and stop dialogs (view logic in `dragon-view.ts`)
 - **`Gates.tsx`**, **`PipelineRuns.tsx`**: gate queue by lane (every lane the request files name), results of the last 24 hours newest first (view logic in `gates-view.ts`); pipeline runs with where each step ran, fallback reasons, CI minutes, executor availability and the workflow file
+- **`Placement.tsx`**: placement in the Gates view (each queued job's expected start, finish and advice; the mode and latest moves) and the Machines view (probe state, load, slots in use per lane); view logic in `placement-view.ts`
 - **`PRs.tsx`**: pull requests with gate status and merge readiness. With the review module on, readiness is that module's evaluation of each PR at its head (`GET /api/review/prs/:number`: "Merge ready" only when `canMerge`, else `Waiting: <first reason>`), asked again when the head changes, after 5 minutes or on Re-check readiness; without it the first group is "Gate passed". The rules are in `pr-readiness.ts`
 - **`Orchestrator.tsx`**: orchestrator ticks, STOP file, service status
 - **`Machines.tsx`**: machine health, runner status

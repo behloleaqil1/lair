@@ -264,7 +264,13 @@ export type EventType =
   | "config.invalid"
   // The owner's Restart (src/server/restart/)
   | "server.restarting"
-  | "server.update_failed";
+  | "server.update_failed"
+  // Placement (src/server/placement/)
+  | "placement.moved"
+  | "placement.would_move"
+  | "placement.move_failed"
+  | "placement.machine_up"
+  | "placement.machine_down";
 
 /** Event stored in the database */
 export interface Event {

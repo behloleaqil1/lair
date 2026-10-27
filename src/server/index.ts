@@ -43,6 +43,7 @@ import { AgentsManager, registerAgentsRoutes } from "./agents/index.js";
 import { getBudgetManager } from "./fleet/budget.js";
 import { ReviewManager, registerReviewRoutes } from "./review/index.js";
 import { mountTriage } from "./triage/index.js";
+import { PlacementManager, registerPlacementRoutes } from "./placement/index.js";
 import { ConfigReloader, registerReloadRoutes, serverModules } from "./reload/index.js";
 import {
   RestartController,
@@ -470,11 +471,23 @@ const triage = await mountTriage(fastify, {
 });
 triage.useDecisions(decisionInbox);
 
+// Placement: one per project with `placement.enabled: true` (off by
+// default). It probes the project's machines, estimates when each queued
+// job of the project's own gate queue finishes on each lane, and moves jobs
+// that would finish sooner elsewhere through the project's move_cmd (act
+// mode), or only says so (observe mode). Its route is read-only.
+const placements = new PlacementManager({
+  dbPath: join(process.cwd(), "data", "placement.db"),
+  events: getEventBus(),
+});
+placements.load(projectEntries);
+await registerPlacementRoutes(fastify, placements, () => getDefaultProject());
+
 // Live config reload (src/server/reload/): a changed project file reaches
 // the modules whose part of it changed, without a restart; an invalid one
 // keeps the previous config running and shows in the dashboard's banner
 const reloader = new ConfigReloader({
-  modules: serverModules({ delivery, watchdogs, pipelines, reviews, agents, triage }),
+  modules: serverModules({ delivery, watchdogs, pipelines, reviews, agents, triage, placements }),
   initial: projectEntries,
   events: getEventBus(),
   onAccepted: (project, config) => {
@@ -555,6 +568,9 @@ const stopServer = async (reason: string) => {
   await agents.stop();
   // Stop triage: wait for calls in progress, then close its store
   await triage.stop();
+
+  // Stop placement: a move in progress is cut short and found again on the next start
+  await placements.stop();
 
   // Stop healer
   stopHealer();
@@ -687,6 +703,14 @@ const start = async () => {
       triaged.length > 0
         ? `[triage] Triaging: ${triaged.join(", ")}`
         : "[triage] Off (no project sets triage.enabled)",
+    );
+
+    // Start placement (machine probes, estimates, moves or advice)
+    const placed = placements.start();
+    console.log(
+      placed.length > 0
+        ? `[placement] Placing jobs for: ${placed.join(", ")}`
+        : "[placement] Off (no project sets placement.enabled)",
     );
 
     // Start file watchers for all projects

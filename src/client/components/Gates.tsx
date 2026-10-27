@@ -2,14 +2,18 @@
  * Gates view - queue and results, and the pipelines section (runs and where
  * they ran). The lanes are those the queue's request files name (any lane,
  * not a fixed list), and the recent results those of the last 24 hours,
- * newest first (gates-view.ts).
+ * newest first (gates-view.ts). With placement on, each queued job shows
+ * its expected start and finish and its placement advice, and the latest
+ * moves have their own card (placement-view.ts).
  * Uses WebSocket for real-time updates with REST polling as fallback.
  */
 import { useMemo, useState } from "react";
 import { useApi } from "../hooks/useApi";
 import { useGatesWebSocket } from "../hooks/useWebSocket";
 import { PipelineRuns } from "./PipelineRuns";
+import { PlacementMoves, usePlacement } from "./Placement";
 import { ago, laneGates, queueLanes, recentResults, statusBadge } from "../gates-view";
+import { adviceText, eta, jobsById } from "../placement-view";
 import type { Gate, GateResult } from "../../shared/types";
 
 interface GatesData {
@@ -32,6 +36,10 @@ export function Gates({ project, refreshKey }: Props) {
   const [selectedGate, setSelectedGate] = useState<string | null>(null);
   // One array per REST answer, so the WebSocket hook isn't reset on every render
   const restQueue = useMemo(() => restData?.queue ?? [], [restData]);
+  // Placement's estimates and advice per job (empty when placement is off)
+  const { data: placement } = usePlacement(project, refreshKey);
+  const placed = useMemo(() => jobsById(placement), [placement]);
+  const showPlacement = placement?.enabled === true;
 
   // Use WebSocket for real-time gate queue updates
   const { gates: wsGates, connected: wsConnected } = useGatesWebSocket(
@@ -129,22 +137,44 @@ export function Gates({ project, refreshKey }: Props) {
                   <th>Pri</th>
                   <th>Lane</th>
                   <th>Track</th>
+                  {showPlacement && (
+                    <>
+                      <th>Start</th>
+                      <th>Finish</th>
+                      <th>Placement</th>
+                    </>
+                  )}
                 </tr>
               </thead>
               <tbody>
-                {queued.slice(0, 10).map((gate) => (
-                  <tr
-                    key={gate.id}
-                    className="clickable"
-                    onClick={() => setSelectedGate(gate.id)}
-                  >
-                    <td>{gate.priority}</td>
-                    <td>
-                      <span className="badge badge-neutral">{gate.lane}</span>
-                    </td>
-                    <td>{gate.track ?? gate.id}</td>
-                  </tr>
-                ))}
+                {queued.slice(0, 10).map((gate) => {
+                  const job = placed.get(gate.id);
+                  return (
+                    <tr
+                      key={gate.id}
+                      className="clickable"
+                      onClick={() => setSelectedGate(gate.id)}
+                    >
+                      <td>{gate.priority}</td>
+                      <td>
+                        <span className="badge badge-neutral">{gate.lane}</span>
+                      </td>
+                      <td>{gate.track ?? gate.id}</td>
+                      {showPlacement && (
+                        <>
+                          <td style={{ fontSize: "0.85rem" }}>{eta(job?.expectedStart)}</td>
+                          <td style={{ fontSize: "0.85rem" }}>{eta(job?.expectedFinish)}</td>
+                          <td
+                            style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}
+                            title={job?.advice?.explanation}
+                          >
+                            {adviceText(job, placement?.mode ?? null)}
+                          </td>
+                        </>
+                      )}
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           )}
@@ -191,6 +221,9 @@ export function Gates({ project, refreshKey }: Props) {
           </div>
         )}
       </div>
+
+      {/* Placement: mode and the latest moves (or advice) */}
+      <PlacementMoves status={placement} />
 
       {/* Recent results */}
       <div className="card">
