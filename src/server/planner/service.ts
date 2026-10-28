@@ -1007,6 +1007,7 @@ export class PlannerService {
         createdAt: now,
         verifierVerdict: null,
         verifierReason: null,
+        verifierEvidence: null,
       }),
     );
     const accepted = stored.filter((p) => p.status === "pending");
@@ -1369,7 +1370,7 @@ export class PlannerService {
     }
 
     // Build recommendation (H1: proper recommendations, no "passed Lair's checks")
-    let recommended: { optionId: string; reasoning: string } | undefined;
+    let recommended: { optionId: string; reasoning: string };
     let contextNote: string;
 
     if (hasDrop) {
@@ -1393,7 +1394,8 @@ export class PlannerService {
       recommended = { optionId: "follow_verifier", reasoning: "Some proposals passed the verifier's review; others did not." };
       contextNote = "Mixed verdicts: some proposals approved, others rejected or uncertain.";
     } else {
-      // Fallback (should not happen with properly configured verifier)
+      // Fallback (rare case: all proposals have null verdict somehow)
+      recommended = { optionId: "reject_all", reasoning: "Review these proposals before applying them." };
       contextNote = "Review these proposals and decide.";
     }
 

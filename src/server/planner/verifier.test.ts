@@ -397,7 +397,7 @@ describe("verifier acceptance tests", () => {
     expect(decision.options.some((o: { id: string }) => o.id === "follow_verifier")).toBe(true);
 
     // Answer follow_verifier
-    await h.inbox.answer(decision.id, "follow_verifier");
+    await h.inbox.answer(decision.id, { optionId: "follow_verifier" });
     await h.service.cycle();
 
     // Approved proposal applied, rejected proposal declined
