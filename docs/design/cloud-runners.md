@@ -113,16 +113,14 @@ the next executor. Keep-alive tolerance is minutes, not seconds: the remote work
 - Every routing decision and fallback is recorded on the job ("ran on cloud-1: the self-hosted runner had 2 waiting").
 
 ## 8. Setup (Settings, guided)
-1. **Provider and credentials:** a temporary setup credential (create the machine, the budget and its actions) and a
-   permanent runtime credential (start, stop and describe the tagged machine; read costs). Both go to Lair's write-only
-   key store; the wizard ends by asking the human to delete the setup credential.
-2. **Network:** join the machine to the private network with a one-time key or a login link; the machine's firewall
-   allows no inbound traffic.
-3. **Machine:** size, region, disk; tags that the runtime policy matches; stop (not terminate) on power-off.
-4. **Toolchain:** detected from the repository and pipeline; installed and checked.
-5. **Money:** the limit, the credits period, the 80% alert; the provider budget and its two actions; a test of the
-   action against a small test budget.
-6. **Proof:** one targeted gate and one full suite on the machine; the results are compared with the same gates on the
+The account, credentials, network baseline, budget and its actions come from [cloud-accounts.md §1](cloud-accounts.md)
+(a generated template the owner creates in their own console; no admin keys in Lair). Gate machines add:
+1. **Machine:** a size recommended from the project's measured gate durations (a speed and price table per size,
+   checked against the account's quotas), region, disk; stop (not terminate) on power-off.
+2. **Reach:** the provider's control channel by default ([cloud-accounts.md §3](cloud-accounts.md)); a private network
+   with SSH or lair-node otherwise.
+3. **Toolchain:** the project's machine image ([cloud-accounts.md §4](cloud-accounts.md)), with the self power-off timer.
+4. **Proof:** one targeted gate and one full suite on the machine; the results are compared with the same gates on the
    project's usual executor.
 
 ## 9. Configuration sketch
