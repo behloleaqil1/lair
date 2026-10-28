@@ -532,6 +532,7 @@ class FakeDecisionInbox implements DecisionInbox {
       id,
       project: decision.project,
       kind: decision.kind === "escalation" ? "escalation" : "other",
+      attention: "action",
       title: decision.question,
       context: decision.context,
       options: decision.options.map(o => ({ id: o.id, label: o.label, consequences: o.consequences ?? o.label })),
@@ -539,17 +540,13 @@ class FakeDecisionInbox implements DecisionInbox {
       source: { module: decision.requestedBy, ref: decision.ref ?? decision.key },
       key: decision.key,
       blocks: decision.blocks ?? [],
+      links: [],
       status: "open",
+      overdue: false,
       createdAt: new Date().toISOString(),
-      raisedVia: "test",
-      expiresAt: null,
-      defaultOptionId: null,
-      answeredAt: null,
-      closedAt: null,
-      answer: null,
-      withdrawnReason: null,
+      raisedVia: "server",
     });
-    return { id, via: "test" };
+    return { id, via: "server" };
   }
 
   find(project: string, key: string): Decision | null {
