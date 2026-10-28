@@ -18,13 +18,15 @@ import { getScheduler, stopScheduler } from "../scheduler/scheduler.js";
 import { getBudgetManager, resetBudgetManager } from "../fleet/budget.js";
 import { getSupervisor } from "../services/supervisor.js";
 import { registerControlRoutes } from "./controls.js";
-import { registerBusRoutes } from "./bus.js";
+import { registerBusRoutes, type BusRoutesOptions } from "./bus.js";
 import { registerProcessRoutes } from "./processes.js";
 import { registerSettingsRoutes } from "./settings.js";
 import { registerSchedulerRoutes } from "./scheduler.js";
 import { registerFleetRoutes } from "./fleet.js";
 import { signIn } from "../../client/owner-session";
 import { processAction, runCommand, sendBusMessage, startDragon } from "../../client/owner-actions";
+import { loadProjectConfig } from "../config.js";
+import type { AgentsManager } from "../agents/index.js";
 
 const DATA = join(process.cwd(), "data");
 const TMP = join(DATA, "test-owner-routes");
@@ -78,13 +80,28 @@ beforeAll(async () => {
   // The scheduler reads the global store: keep it in memory, out of data/lair.db
   getStore({ dbPath: ":memory:" });
 
+  // Mock agents manager for bus routes
+  const mockAgentsManager = (): AgentsManager => ({
+    get: () => null,
+    getStore: () => null,
+  } as unknown as AgentsManager);
+
+  const busOptions: BusRoutesOptions = {
+    agents: mockAgentsManager(),
+    dataDir: TMP,
+    getConfig: (project: string) => {
+      const config = loadProjectConfig(project);
+      return { ...config, mail_dir: undefined, wake_file: undefined };
+    },
+  };
+
   app = Fastify({ logger: false });
   // The owner's credential, as src/server/index.ts wires it; app.close() closes it
   const tokenPath = join(TMP, "owner.token");
   const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
   await registerOwnerRoutes(app, auth);
   await registerControlRoutes(app, auth);
-  await registerBusRoutes(app, auth);
+  await registerBusRoutes(app, auth, busOptions);
   await registerProcessRoutes(app, auth);
   await registerSettingsRoutes(app, auth);
   await registerSchedulerRoutes(app, auth);

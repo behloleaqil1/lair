@@ -15,13 +15,14 @@ import {
   InvalidProjectError,
 } from "../config.js";
 import { registerSettingsRoutes } from "./settings.js";
-import { registerBusRoutes } from "./bus.js";
+import { registerBusRoutes, type BusRoutesOptions } from "./bus.js";
 import { registerControlRoutes, getPromptsDir } from "./controls.js";
 import { registerFleetRoutes } from "./fleet.js";
 import { registerProcessRoutes } from "./processes.js";
 import { registerSchedulerRoutes } from "./scheduler.js";
 import { HumanAuth, OWNER_SESSION_HEADER } from "../human-auth/index.js";
 import type { ProjectConfig } from "../../shared/types.js";
+import type { AgentsManager } from "../agents/index.js";
 
 const TMP = join(process.cwd(), "data", "test-project-guard");
 const LOCAL_DIR = join(process.cwd(), "projects", "local");
@@ -96,10 +97,30 @@ afterAll(() => {
   }
 });
 
+// Mock agents manager for bus routes
+function mockAgentsManager(): AgentsManager {
+  return {
+    get: () => null,
+    getStore: () => null,
+  } as unknown as AgentsManager;
+}
+
+// Mock bus options for tests
+function mockBusOptions(): BusRoutesOptions {
+  return {
+    agents: mockAgentsManager(),
+    dataDir: TMP,
+    getConfig: (project: string) => {
+      const config = loadProjectConfig(project);
+      return { ...config, mail_dir: undefined, wake_file: undefined };
+    },
+  };
+}
+
 async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({ logger: false });
   await registerControlRoutes(app, auth);
-  await registerBusRoutes(app, auth);
+  await registerBusRoutes(app, auth, mockBusOptions());
   await registerSettingsRoutes(app, auth);
   await registerFleetRoutes(app, auth);
   await app.ready();
@@ -339,7 +360,7 @@ describe("bus SSE CORS", () => {
   beforeAll(async () => {
     app = Fastify({ logger: false, forceCloseConnections: true });
     await app.register(cors, { origin: ["http://localhost:5173"] });
-    await registerBusRoutes(app, auth);
+    await registerBusRoutes(app, auth, mockBusOptions());
     await app.listen({ port: 0, host: "127.0.0.1" });
     port = (app.server.address() as AddressInfo).port;
   });
