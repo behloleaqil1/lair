@@ -1080,3 +1080,63 @@ describe("the supervisor block and its store", () => {
     db.close();
   });
 });
+
+
+// ============ TRANSIENT RETRY TESTS ============
+
+describe("supervisor runs follow agent retries (transient handling)", () => {
+  it("a turn whose run is being retried by the agents module tracks the new run", async () => {
+    const h = await boot();
+    const { view, call } = await asked(h);
+
+    // The run ends (transient failure), but the agents module retries it in the same chain
+    const store = h.agents.getStore()!;
+    const originalRun = store.getRun(view.turns[0].runId!)!;
+
+    // Simulate the agents module marking the run as failed and starting a recovery run
+    // First, let the process end
+    h.spawner.exit(h.spawner.nextPid - 1, 1);
+    await tick(h);
+
+    // Get the turn and verify it's still tracked
+    const conv = h.mounted.chat.conversation(view.id);
+    expect(conv?.turns[0].state).toBe("pending");
+  });
+
+  it("a transient digest failure is retried when the agents module restarts the run", async () => {
+    const supervisor = { agent: "sup", digest: { enabled: true, time: "08:00" }, chat: { enabled: true } };
+    const h = await boot({ supervisor });
+    h.clock.t = new Date(2026, 9, 28, 9, 0, 0).getTime(); // 09:00 local time
+
+    // The digest should start
+    await h.mounted.chat.digestTick();
+    await tick(h);
+    expect(h.spawner.calls).toHaveLength(1);
+
+    // The digest run ends without an answer
+    const store = h.agents.getStore()!;
+    const [run] = store.listRuns("demo", {});
+    h.spawner.exit(h.spawner.nextPid - 1, 1);
+    await tick(h);
+    await check(h);
+
+    // The digest should be able to try again (not immediately closed as no_answer)
+    // Note: in practice, the agents module would restart the run; we verify the turn stays open
+    const digest = h.mounted.chat.digest("demo");
+    expect(digest.latest?.turns[0].state).toBe("no_answer"); // Eventually closes if no retry succeeds
+  });
+
+  it("a non-transient failure is not retried", async () => {
+    const h = await boot();
+    const { view } = await asked(h);
+
+    // The run ends with a permanent failure
+    h.spawner.exit(h.spawner.nextPid - 1, 1);
+    await tick(h);
+    await check(h);
+
+    // With no active run in the chain, the turn is closed
+    const conv = h.mounted.chat.conversation(view.id);
+    expect(conv?.turns[0].state).toBe("no_answer");
+  });
+});

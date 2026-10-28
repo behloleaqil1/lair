@@ -1499,3 +1499,71 @@ describe("Decision Inbox: an escalation is a decision, and its answer drives the
     expect(breaches(after)[0]).toMatchObject({ status: "resolved", resolution: "recovered" });
   });
 });
+
+
+// ============ 12. ORPHAN CLAIM WITH LIVE PID ============
+
+describe("12. orphan claim: live pid that doesn't match the pattern", () => {
+  it("a claim with a live pid that doesn't match agent_command is not an orphan", async () => {
+    const h = setup(act("orphan_claim"));
+    // Create a claim file with pid recorded
+    const claimDir = join(h.agentsDir, "worker-b.running");
+    mkdirSync(claimDir, { recursive: true });
+    writeFileSync(join(claimDir, "pid"), "pid=4999\nstarted=2026-03-02T11:00:00.000Z\n");
+    // The claim is old enough
+    const t = new Date(NOW - 20 * 60 * 1000);
+    utimesSync(claimDir, t, t);
+    // The pid is alive but doesn't match the agent_command pattern
+    h.procs.add(4999, "/different/path/to/agent --id worker-b", { upMinutes: 20 });
+
+    await h.wd.tick();
+
+    // No breach: the live pid means the agent is running
+    expect(breaches(h)).toEqual([]);
+    expect(h.runner.calls).toEqual([]);
+    expect(sloState(h, "orphan_claim")).toBe("ok");
+  });
+
+  it("a claim with a dead recorded pid is an orphan as before", async () => {
+    const h = setup(act("orphan_claim"));
+    const claimDir = join(h.agentsDir, "worker-b.running");
+    mkdirSync(claimDir, { recursive: true });
+    writeFileSync(join(claimDir, "pid"), "pid=4999\nstarted=2026-03-02T10:00:00.000Z\n");
+    const t = new Date(NOW - 20 * 60 * 1000);
+    utimesSync(claimDir, t, t);
+    // No process with pid 4999 is running
+    h.runner.when((a) => a[0] === "./bin/release-claim", {
+      effect: (a) => rmSync(a[2], { recursive: true, force: true }),
+    });
+
+    await h.wd.tick();
+
+    expect(h.runner.calls).toEqual([["./bin/release-claim", "worker-b", claimDir]]);
+    expect(breaches(h)[0]).toMatchObject({ detector: "orphan_claim" });
+  });
+
+  it("release_claim guard: a live pid not matching the pattern is a false positive, not a failure", async () => {
+    const h = setup(act("orphan_claim"));
+    // Initial detection: no process matches the pattern
+    const claimDir = join(h.agentsDir, "worker-b.running");
+    mkdirSync(claimDir, { recursive: true });
+    writeFileSync(join(claimDir, "pid"), "pid=4999\nstarted=2026-03-02T11:00:00.000Z\n");
+    const t = new Date(NOW - 20 * 60 * 1000);
+    utimesSync(claimDir, t, t);
+    // At detection time, no live process
+
+    await h.wd.tick();
+    expect(breaches(h)).toHaveLength(1);
+
+    // Before the act step runs, the process comes alive (with a different path)
+    h.procs.add(4999, "/different/path/to/agent --id worker-b", { upMinutes: 1 });
+
+    // Next tick: diagnose finds it still, act's guard sees the live pid as a false positive
+    h.clock.advance(5 * 60 * 1000);
+    await h.wd.tick();
+
+    // The breach should be cleared (false positive), not failed
+    expect(breaches(h)[0]).toMatchObject({ status: "resolved", resolution: "cleared" });
+    expect(h.runner.calls).toEqual([]); // release_claim never ran
+  });
+});

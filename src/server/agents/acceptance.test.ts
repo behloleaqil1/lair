@@ -4303,3 +4303,100 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(inbox.list({ project: "demo", status: "open" })).toEqual([]);
   });
 });
+
+
+// ============ 10. HUNG RUN INFO FOR NEXT RUN ============
+
+describe("10. hung run info: the next run knows what the previous hung on", () => {
+  it("a run stopped as hung records its last lines; the next run's prompt contains them", async () => {
+    const h = setup(() => ({ hung_minutes: 45 }));
+    h.spawner.behaviour = (pid, log) => {
+      writeLog(h.clock, log, "Starting task...\n");
+      writeLog(h.clock, log, "Searching for files in /Users/dev/workspace...\n");
+      writeLog(h.clock, log, "Running grep -r pattern /Users/dev/workspace...\n");
+    };
+    await request(h);
+    await at(h, 0); // spawn, write log
+
+    h.clock.advance(46 * MIN);
+    await at(h, 0); // hung: SIGTERM
+    h.spawner.exit(5001, null); // killed
+    await at(h, 0); // finishStop -> recover
+
+    // Wait for the backoff and next attempt
+    h.clock.advance(20 * SEC);
+    h.spawner.behaviour = undefined;
+    await at(h, 0); // spawn attempt 2
+
+    expect(h.spawner.calls).toHaveLength(2);
+    const prompt2 = promptOf(h.spawner.calls[1]);
+    expect(prompt2).toContain("<hung_run_warning>");
+    expect(prompt2).toContain("Your previous run was stopped as hung");
+    expect(prompt2).toContain("Do not repeat the step that hung");
+    expect(prompt2).toContain("grep -r pattern");
+    expect(prompt2).toContain("</hung_run_warning>");
+  });
+
+  it("a run with ANSI escapes and very long lines in its log stays bounded in hung info", async () => {
+    const h = setup(() => ({ hung_minutes: 45 }));
+    h.spawner.behaviour = (pid, log) => {
+      // Log with ANSI escape codes and a very long line
+      writeLog(h.clock, log, "\x1b[32mStarting task...\x1b[0m\n");
+      writeLog(h.clock, log, "A".repeat(5000) + "\n"); // very long line
+      writeLog(h.clock, log, "\x1b[31mSearching for files...\x1b[0m\n");
+    };
+    await request(h);
+    await at(h, 0);
+
+    h.clock.advance(46 * MIN);
+    await at(h, 0);
+    h.spawner.exit(5001, null);
+    await at(h, 0);
+
+    h.clock.advance(20 * SEC);
+    h.spawner.behaviour = undefined;
+    await at(h, 0);
+
+    const prompt2 = promptOf(h.spawner.calls[1]);
+    // ANSI codes should be removed
+    expect(prompt2).not.toContain("\x1b[");
+    // Content should be bounded
+    expect(prompt2.length).toBeLessThan(250_000);
+    expect(prompt2).toContain("Starting task...");
+    expect(prompt2).toContain("Searching for files...");
+  });
+
+  it("a normal completion clears the hung info record", async () => {
+    const h = setup(() => ({ hung_minutes: 45 }));
+    h.spawner.behaviour = (pid, log) => {
+      writeLog(h.clock, log, "Starting...\n");
+    };
+    await request(h);
+    await at(h, 0);
+
+    // First run hangs
+    h.clock.advance(46 * MIN);
+    await at(h, 0);
+    h.spawner.exit(5001, null);
+    await at(h, 0);
+
+    // Second run completes normally
+    h.clock.advance(20 * SEC);
+    h.spawner.behaviour = (pid, log) => {
+      writeLog(h.clock, log, "Done!\n");
+    };
+    await at(h, 0);
+    h.spawner.exit(5002, 0);
+    await at(h, 0);
+
+    // Third run should NOT have hung info (cleared by normal completion)
+    h.spawner.behaviour = undefined;
+    await request(h, "worker-a", "feat-login", "Same task again");
+    await at(h, 0);
+
+    expect(h.spawner.calls).toHaveLength(3);
+    const prompt3 = promptOf(h.spawner.calls[2]);
+    expect(prompt3).not.toContain("<hung_run_warning>");
+    expect(prompt3).not.toContain("Your previous run was stopped as hung");
+  });
+});
