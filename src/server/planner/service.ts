@@ -1048,6 +1048,13 @@ export class PlannerService {
     const verifier = this.settings.verifier;
     if (!verifier) return false;
 
+    // M3: Enforce max_runs_per_day for verifier
+    const verifierRuns = this.store.verifierRunsSince(this.project, now - DAY_MS);
+    if (verifierRuns >= verifier.maxRunsPerDay) {
+      console.warn(`[planner] ${this.project}: verifier runs at daily limit (${verifier.maxRunsPerDay})`);
+      return false;
+    }
+
     const verifyDir = join(run.dir, "verify");
     const verdictsFile = join(verifyDir, VERDICTS_FILE);
     const id = randomUUID();

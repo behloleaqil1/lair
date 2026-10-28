@@ -431,6 +431,14 @@ export class PlannerStore {
     return rows.map((row) => row.requested_at);
   }
 
+  /** Count verifier runs started after `since` (for max_runs_per_day enforcement). */
+  verifierRunsSince(project: string, since: number): number {
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS n FROM planner_runs WHERE project = ? AND requested_at > ? AND verifier_run_id IS NOT NULL`)
+      .get(project, since) as { n: number };
+    return row.n;
+  }
+
   runView(run: StoredRun): PlannerRunView {
     const counts = this.db
       .prepare(`SELECT status, COUNT(*) AS n FROM planner_proposals WHERE run_id = ? GROUP BY status`)
