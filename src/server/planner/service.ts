@@ -798,6 +798,10 @@ export class PlannerService {
       detail: "requested",
       tampered: false,
       decisionId: null,
+      verifierState: null,
+      verifierRunId: null,
+      verifierChainId: null,
+      verifierTask: null,
     };
     this.setState(LAST_RUN, now);
     const fail = async (detail: string) => {
