@@ -1284,9 +1284,9 @@ export class PlannerService {
       }
     }
 
-    // Auto-reject proposals
+    // Auto-reject proposals (use "declined" to match owner rejections for agreement calculation)
     for (const p of toAutoReject) {
-      this.store.decide(p.id, "rejected", "lair:verifier", now, `verifier: ${p.verifierReason ?? "rejected"}`);
+      this.store.decide(p.id, "declined", "lair:verifier", now, `verifier: ${p.verifierReason ?? "rejected"}`);
     }
 
     const pending = this.store.runProposals(run.id).filter((p) => p.status === "pending");
