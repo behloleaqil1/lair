@@ -196,11 +196,7 @@ export class BusService {
 
     // Emit event
     if (this.events) {
-      this.events.emit({
-        type: "bus.report",
-        project: binding.project,
-        data: { id, agent: binding.agent, kind, task, gateId, pr, sha },
-      });
+      this.events.emit("bus.report", { project: binding.project, id, agent: binding.agent, kind, task, gateId, pr, sha });
     }
 
     // Wake on DONE or BLOCKED
@@ -274,11 +270,7 @@ export class BusService {
 
     // Emit event
     if (this.events) {
-      this.events.emit({
-        type: "bus.message",
-        project: binding.project,
-        data: { id: messageId, from: binding.agent, to, priority: priority ?? 5 },
-      });
+      this.events.emit("bus.message", { project: binding.project, id: messageId, from: binding.agent, to, priority: priority ?? 5 });
     }
 
     return { ok: true, data: { messageId, to } };
@@ -298,11 +290,7 @@ export class BusService {
 
     // Emit event
     if (this.events) {
-      this.events.emit({
-        type: "bus.message",
-        project: this.store.project,
-        data: { id: messageId, from: OWNER_ID, to, priority: priority ?? 5 },
-      });
+      this.events.emit("bus.message", { project: this.store.project, id: messageId, from: OWNER_ID, to, priority: priority ?? 5 });
     }
 
     // Wake on owner message

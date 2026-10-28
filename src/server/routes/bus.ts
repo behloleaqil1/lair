@@ -103,8 +103,13 @@ export interface BusRoutesOptions {
   events?: EventBus;
   /** Data directory for bus databases */
   dataDir: string;
-  /** Get project config */
-  getConfig: (project: string) => ProjectConfig;
+  /** Get project config (returns ProjectConfig plus optional bus fields) */
+  getConfig: (project: string) => ProjectConfig & {
+    /** Directory for per-agent mailbox files (optional bus feature) */
+    mail_dir?: string;
+    /** File to touch when dragons should wake (optional bus feature) */
+    wake_file?: string;
+  };
 }
 
 function getBusService(
@@ -241,7 +246,6 @@ async function busRoutes(
     }
 
     // Execute tool
-    const toolArgs = parsed.data;
     let result;
 
     switch (tool as ToolName) {
@@ -249,29 +253,35 @@ async function busRoutes(
         result = service.whoami(binding);
         break;
 
-      case "report":
+      case "report": {
+        const reportArgs = parsed.data as z.infer<typeof toolSchemas.report>;
         result = service.report(
           binding,
-          toolArgs.kind as ReportKind,
-          toolArgs.task,
-          toolArgs.summary,
-          toolArgs.gate_id,
-          toolArgs.pr,
-          toolArgs.sha,
+          reportArgs.kind as ReportKind,
+          reportArgs.task,
+          reportArgs.summary,
+          reportArgs.gate_id,
+          reportArgs.pr,
+          reportArgs.sha,
         );
         break;
+      }
 
       case "inbox":
         result = service.inbox(binding);
         break;
 
-      case "ack":
-        result = service.ack(binding, toolArgs.message_id, toolArgs.note);
+      case "ack": {
+        const ackArgs = parsed.data as z.infer<typeof toolSchemas.ack>;
+        result = service.ack(binding, ackArgs.message_id, ackArgs.note);
         break;
+      }
 
-      case "send":
-        result = service.send(binding, toolArgs.to, toolArgs.text, toolArgs.priority);
+      case "send": {
+        const sendArgs = parsed.data as z.infer<typeof toolSchemas.send>;
+        result = service.send(binding, sendArgs.to, sendArgs.text, sendArgs.priority);
         break;
+      }
 
       case "board":
         result = service.board();
