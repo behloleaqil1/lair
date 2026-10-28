@@ -181,6 +181,7 @@ const orphanClaim: Detector = {
     const findings: Finding[] = [];
     const remote: string[] = [];
     const supervised: string[] = [];
+    const livePid: string[] = [];
     for (const claim of view.claims()) {
       // A remote agent's process is not in the local process table: unknown, never "dead"
       if (!view.isLocalAgent(claim.agent)) {
@@ -193,6 +194,15 @@ const orphanClaim: Detector = {
         continue;
       }
       if ((await view.agentProcesses(claim.agent)).length > 0) continue; // live agent: never touched
+
+      // Check the claim file's recorded pid: if it is alive, the agent is running
+      // (even if it doesn't match watchdog.agent_command, e.g. started with a different path)
+      const claimPid = view.claimPid(claim);
+      if (claimPid !== null && (await view.isAlive(claimPid.pid))) {
+        livePid.push(`${claim.agent} (pid ${claimPid.pid})`);
+        continue;
+      }
+
       const age = view.minutesSince(claim.mtimeMs);
       if (age < view.settings.claimGraceMinutes) continue;
       findings.push({
@@ -202,6 +212,7 @@ const orphanClaim: Detector = {
         evidence: [
           `claim ${claim.path} is ${minutes(age)} old`,
           `no process matches watchdog.agent_command for ${claim.agent}`,
+          ...(claimPid !== null ? [`claim's recorded pid ${claimPid.pid} is not running`] : []),
         ],
         vars: { agent: claim.agent, claim: claim.path },
       });
@@ -209,6 +220,7 @@ const orphanClaim: Detector = {
     const details = [
       ...(remote.length > 0 ? [`not checked (remote agents): ${remote.join(", ")}`] : []),
       ...(supervised.length > 0 ? [supervisedDetail(supervised) ?? ""] : []),
+      ...(livePid.length > 0 ? [`live by recorded pid (pattern mismatch): ${livePid.join(", ")}`] : []),
     ];
     return { findings, detail: details.length > 0 ? details.join("; ") : undefined };
   },

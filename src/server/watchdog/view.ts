@@ -50,6 +50,11 @@ export interface Claim {
   mtimeMs: number;
 }
 
+export interface ClaimPid {
+  pid: number;
+  startedAt: number | null;
+}
+
 export interface GateRequest {
   name: string;
   path: string;
@@ -256,6 +261,26 @@ export class ProjectView {
       }
       return claims.sort((a, b) => a.name.localeCompare(b.name));
     });
+  }
+
+  /**
+   * The pid recorded in a claim file (a file or directory with a pid file).
+   * Returns null when no pid is recorded. The claim format matches the lock
+   * format: either `pid=1234\nstarted=...\n` or just a bare pid.
+   */
+  claimPid(claim: Claim): ClaimPid | null {
+    const st = this.fs.stat(claim.path);
+    if (!st) return null;
+    const isDirectory = st.isDirectory;
+    const pidFile = isDirectory ? join(claim.path, "pid") : claim.path;
+    const content = this.fs.read(pidFile, SMALL_FILE_BYTES);
+    if (!content) return null;
+    const pid = parsePid(content);
+    if (pid === null) return null;
+    // Parse the started time if present (Lair's lock format)
+    const started = content.match(/^\s*started\s*[=:]\s*(\S+)\s*$/im);
+    const startedAt = started ? Date.parse(started[1]) : null;
+    return { pid, startedAt: Number.isNaN(startedAt) ? null : startedAt };
   }
 
   // ============ QUEUE FILE ============

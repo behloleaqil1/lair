@@ -119,6 +119,10 @@ export class PlaybookEngine {
       } else if (step.type === "diagnose" && result.cleared) {
         outcome = "cleared";
         stopped = true;
+      } else if (step.type === "act" && result.falsePositive) {
+        // The guard found a false positive: the breach is not real (e.g. live pid not matching the pattern)
+        outcome = "cleared";
+        stopped = true;
       } else if (step.type === "verify") {
         outcome = result.deferred ? "acted" : "recovered";
       }

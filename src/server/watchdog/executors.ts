@@ -24,6 +24,8 @@ export interface StepOutcome {
   cleared?: boolean;
   /** verify: nothing to check right away */
   deferred?: boolean;
+  /** act: the guard found a false positive (e.g. live pid not matching the pattern) */
+  falsePositive?: boolean;
 }
 
 /** Per-run state shared by a run's steps. */
@@ -125,9 +127,13 @@ export class StepExecutors {
     if (!template) {
       return { status: "failed", error: `watchdog.actions.${action} is not configured` };
     }
-    const refusal = await this.guard(action, state.vars);
-    if (refusal) {
-      return { status: "failed", error: `refused: ${refusal}` };
+    const guardResult = await this.guard(action, state.vars);
+    if (guardResult.refused) {
+      // A false positive (agent running by pid check): close the breach, no decision
+      if (guardResult.falsePositive) {
+        return { status: "succeeded", falsePositive: true, output: `false positive: ${guardResult.reason}` };
+      }
+      return { status: "failed", error: `refused: ${guardResult.reason}` };
     }
     const built = buildArgv(action, template, this.varsFor(state));
     if ("error" in built) {
@@ -148,12 +154,15 @@ export class StepExecutors {
     return { status: "succeeded", command, output: tail(out.stdout.trim()) };
   }
 
-  /** Why an action must not run on the current state, or null. */
-  private async guard(action: ActionId, vars: Record<string, string>): Promise<string | null> {
+  /** Why an action must not run on the current state; falsePositive means the breach is a false alarm */
+  private async guard(
+    action: ActionId,
+    vars: Record<string, string>,
+  ): Promise<{ refused: false } | { refused: true; reason: string; falsePositive?: boolean }> {
     // A container whose delivery service a human holds gets no command at all
     if (vars.container) {
       const held = this.ctx.services?.heldReason(this.ctx.project, vars.container);
-      if (held) return held;
+      if (held) return { refused: true, reason: held };
     }
     const view = this.freshView();
     const pid = vars.pid ? Number(vars.pid) : null;
@@ -162,39 +171,55 @@ export class StepExecutors {
       case "stop_duplicate": {
         const agent = vars.agent;
         if (!agent || !view.agentIds().includes(agent)) {
-          return `${agent ?? "(none)"} is not a configured agent`;
+          return { refused: true, reason: `${agent ?? "(none)"} is not a configured agent` };
         }
         if (!view.isLocalAgent(agent)) {
-          return `agent ${agent} runs on ${view.agentMachine(agent).machine}, whose processes are not visible here`;
+          return { refused: true, reason: `agent ${agent} runs on ${view.agentMachine(agent).machine}, whose processes are not visible here` };
         }
         const procs = await view.agentProcesses(agent);
         if (pid === null || !procs.some((p) => p.pid === pid)) {
-          return `pid ${vars.pid ?? "(none)"} is not a live process of agent ${agent}`;
+          return { refused: true, reason: `pid ${vars.pid ?? "(none)"} is not a live process of agent ${agent}` };
         }
         if (action === "restart_agent") {
           const gate = view.waitingOn(agent);
-          if (gate) return `agent ${agent} is WAITING on gate ${gate}`;
+          if (gate) return { refused: true, reason: `agent ${agent} is WAITING on gate ${gate}` };
         } else if (procs.length < 2 || procs[0].pid === pid) {
-          return `pid ${pid} is not a duplicate of agent ${agent}`;
+          return { refused: true, reason: `pid ${pid} is not a duplicate of agent ${agent}` };
         }
-        return null;
+        return { refused: false };
       }
       case "release_claim": {
-        if (!view.hasAgentPattern()) return "watchdog.agent_command is not set";
+        if (!view.hasAgentPattern()) return { refused: true, reason: "watchdog.agent_command is not set" };
         if (!view.isLocalAgent(vars.agent ?? "")) {
-          return `agent ${vars.agent} runs on ${view.agentMachine(vars.agent ?? "").machine}, so its liveness is unknown here`;
+          return { refused: true, reason: `agent ${vars.agent} runs on ${view.agentMachine(vars.agent ?? "").machine}, so its liveness is unknown here` };
         }
         const live = await view.agentProcesses(vars.agent ?? "");
-        return live.length > 0 ? `agent ${vars.agent} has a live process (pid ${live[0].pid})` : null;
+        if (live.length > 0) {
+          return { refused: true, reason: `agent ${vars.agent} has a live process (pid ${live[0].pid})` };
+        }
+        // Also check the claim file's recorded pid: if it is alive, the agent is running
+        // (even if it doesn't match watchdog.agent_command)
+        const claim = view.claims().find((c) => c.agent === vars.agent);
+        if (claim) {
+          const claimPid = view.claimPid(claim);
+          if (claimPid !== null && (await view.isAlive(claimPid.pid))) {
+            return {
+              refused: true,
+              reason: `agent ${vars.agent} is running (claim's recorded pid ${claimPid.pid} is alive, though it doesn't match the pattern)`,
+              falsePositive: true,
+            };
+          }
+        }
+        return { refused: false };
       }
       case "break_lock":
       case "requeue_gate":
         if (pid !== null && (await view.isAlive(pid))) {
-          return `holder pid ${pid} is running`;
+          return { refused: true, reason: `holder pid ${pid} is running` };
         }
-        return null;
+        return { refused: false };
       default:
-        return null;
+        return { refused: false };
     }
   }
 
