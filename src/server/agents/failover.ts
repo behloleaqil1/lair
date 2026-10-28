@@ -29,8 +29,8 @@ export function profilesFor(
   if (!dragon) return [];
   const adapter = getDragonAdapter(dragon, config);
   if (!adapter) return [];
-  // An agent_adapters entry may leave `id` out: its key is its id
-  const adapterId = adapter.id || dragon.adapter || "kiro";
+  // The key it was looked up by is its id: an agent_adapters entry may leave `id` out, or name another
+  const adapterId = dragon.adapter || "kiro";
   const provider = (id: string, given?: string) => given ?? settings.providers[id] ?? id;
   const primaryModel = model ?? (dragon.model ? dragon.model : undefined);
   const own = dragon.profile ? aiProfiles(config).get(dragon.profile) : undefined;

@@ -133,11 +133,11 @@ Agent runs with claims, locks, session recovery, failover and budgets ([configur
 Any tool, any model, per role ([configuration](configuration.md#ai-tools-profiles-and-roles), [design](design/ai-roles.md)). Every key is optional.
 
 - **`profiles.ts`**: `ai.profiles` and `ai.roles` as the other modules read them: a dragon's tool and model (the dragon registry), its fallbacks along its role (`agents/failover.ts`), and the agents of a `role:<role>` reviewer pool (`review/service.ts`). It imports no other module, so the registry can use it
-- **`config.ts`**: the `ai:` schema (the Settings section) and `validateAiConfig`, which `config.ts` runs when a project loads: unknown tools and profiles, a dragon's `profile:`, and an adapter's model and sign-in commands (argv, no placeholders)
+- **`config.ts`**: the `ai:` schema (the Settings section) and `validateAiConfig`, which `config.ts` runs when a project loads: unknown tools and profiles, a dragon's `profile:`, an adapter's model and sign-in commands (argv, no placeholders), and a review role that no dragon runs while reviews by agents are on
 - **`parsers.ts`**: model list readers, bounded (`kiro` for `kiro-cli chat --list-models`, `lines` for one model per line)
 - **`runner.ts`**: the one boundary: a tool's own commands as argv, no shell, a timeout, bounded output, the agents' environment only
-- **`tools.ts`**: per tool and machine (a PATH lookup here, ssh for an SSH machine), installed, version and sign-in state, and the models (cached: an hour, a minute for statuses and failures); the agents module asks it before each start (`ToolReadiness`), so a signed-out tool starts nothing here, with one decision per tool
-- **`routes.ts`**: `/api/ai/*`, all the owner's (reads included)
+- **`tools.ts`**: per tool and machine (a PATH lookup here, ssh for an SSH machine), installed, version and sign-in state, and the models (cached: an hour, a minute for statuses and failures); the agents module asks it before each start (`ToolReadiness`) without waiting, from sign-in checks that run in the background, so a signed-out tool starts nothing here, with one decision per tool
+- **`scrub.ts`**: what of a tool's output may be shown: sign-in details are fixed words and failures their category; other texts lose URLs, ARNs and long digit runs- **`routes.ts`**: `/api/ai/*`, all the owner's (reads included)
 
 #### Decisions (`decisions/`)
 

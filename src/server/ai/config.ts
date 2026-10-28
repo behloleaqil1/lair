@@ -10,6 +10,7 @@
  */
 import { z } from "zod";
 import type { ProjectConfig } from "../../shared/types.js";
+import { parseDragonRegistry } from "../parsers/dragon-config.js";
 import { BUILTIN_ADAPTERS, getAdapter } from "../services/adapters.js";
 import {
   MAX_PROFILE_ARGS,
@@ -20,6 +21,9 @@ import {
   TOOL_ID,
   isProfileArg,
   rawRole,
+  roleAgents,
+  roleProfiles,
+  type RolePath,
 } from "./profiles.js";
 
 const PROFILE_ID_RULE = "profile ids: a letter, then letters, digits, '.', '_' or '-' (at most 64 characters)";
@@ -210,6 +214,38 @@ export function validateAiConfig(config: ProjectConfig): string[] {
     for (const [id, adapter] of Object.entries(adapters)) {
       if (isObject(adapter)) errors.push(...adapterErrors(id.slice(0, 64), adapter));
     }
+  }
+  if (errors.length === 0) errors.push(...unrunReviewRoles(config));
+  return errors;
+}
+
+const REVIEW_ROLES: readonly { tier: string; role: RolePath }[] = [
+  { tier: "red", role: "review.red" },
+  { tier: "amber", role: "review.amber" },
+  { tier: "green", role: "review.green" },
+];
+
+/**
+ * With reviews by agents on (review.enabled and review.prompt_file), a
+ * review role is the dragons that run its profiles: one that no dragon
+ * runs would leave its tier's reviews to nobody. A dragons.txt dragon runs
+ * the build role's first profile, so a review role with that profile counts
+ * as run.
+ */
+function unrunReviewRoles(config: ProjectConfig): string[] {
+  const review: unknown = config.review;
+  if (!isObject(review) || review.enabled !== true || typeof review.prompt_file !== "string") return [];
+  const dragons = [...parseDragonRegistry(config).values()];
+  const buildFirst = roleProfiles(config, "build")[0];
+  const errors: string[] = [];
+  for (const { tier, role } of REVIEW_ROLES) {
+    const profiles = roleProfiles(config, role);
+    if (profiles.length === 0 || roleAgents(config, role, dragons).length > 0) continue;
+    if (buildFirst && profiles.some((p) => p.id === buildFirst.id)) continue;
+    const ids = profiles.map((p) => p.id).join(", ");
+    errors.push(
+      `ai.roles.review.${tier}: no dragon runs ${profiles.length === 1 ? "this profile" : "these profiles"} (${ids}), and reviews by agents are on (review.prompt_file): give a reviewer dragon profile: ${profiles[0].id}`,
+    );
   }
   return errors;
 }

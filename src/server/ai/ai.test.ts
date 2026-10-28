@@ -65,12 +65,11 @@ function binWith(...programs: string[]): string {
 /** The command runner: what the tools' commands (and ssh) answer. Unanswered: the program is not installed. */
 class FakeRunner implements ToolRunner {
   calls: { argv: string[]; options: ToolRunOptions }[] = [];
-  constructor(public answer: (argv: string[]) => ToolRunOutput | undefined = () => undefined) {}
+  constructor(public answer: (argv: string[]) => ToolRunOutput | Promise<ToolRunOutput> | undefined = () => undefined) {}
   async run(argv: string[], options: ToolRunOptions): Promise<ToolRunOutput> {
     this.calls.push({ argv: [...argv], options });
-    return (
-      this.answer(argv) ?? { code: -1, stdout: "", stderr: "", failure: "not_found", message: `spawn ${argv[0]} ENOENT` }
-    );
+    const answered = await this.answer(argv);
+    return answered ?? { code: -1, stdout: "", stderr: "", failure: "not_found", message: `spawn ${argv[0]} ENOENT` };
   }
   commands(): string[] {
     return this.calls.map((c) => c.argv.join(" "));
@@ -78,6 +77,20 @@ class FakeRunner implements ToolRunner {
 }
 
 const out = (stdout: string, code = 0, stderr = ""): ToolRunOutput => ({ code, stdout, stderr });
+
+/**
+ * What a real `kiro-cli whoami` prints (a made-up organisation, profile and
+ * account): none of it may reach the API, the dashboard or a decision.
+ */
+const WHOAMI_SIGNED_IN =
+  "Logged in with IAM Identity Center (https://example-org.awsapps.com/start/)\n" +
+  "Profile: arn:aws:codewhisperer:us-east-1:123456789012:profile/EXAMPLEPROFILE\n";
+const WHOAMI_SIGNED_OUT =
+  "Not logged in. Sign in again at https://example-org.awsapps.com/start/ " +
+  "(profile arn:aws:codewhisperer:us-east-1:123456789012:profile/EXAMPLEPROFILE)\n";
+/** What must never be shown: the portal, the ARN, the account id */
+const PRIVATE = ["awsapps", "example-org", "arn:", "123456789012", "EXAMPLEPROFILE", "https://"];
+const leaks = (text: string) => PRIVATE.filter((p) => text.includes(p));
 
 const TEST_CLI: AgentAdapter = {
   id: "test-cli",
@@ -202,6 +215,19 @@ describe("the ai: block and the keys it adds are checked when the project loads"
     expect(refusal(dir, { ai: { profiles: { p: { tool: "kiro", model: "-rf" } } } })).toContain("ai.profiles.p.model: a model id");
     // Nothing new: nothing to say
     expect(validateAiConfig(load(dir, { dragons: { a: { name: "A", adapter: "kiro", model: "auto" } } }))).toEqual([]);
+  });
+
+  it("refuses a review role no dragon runs while reviews by agents are on", () => {
+    const dir = tempDir("lair-ai-");
+    const ai = { profiles: { rv: { tool: "kiro", model: "auto" }, other: { tool: "test-cli", model: "model-x" } }, roles: { review: { amber: ["rv"] } } };
+    const agentReviews = { enabled: true, prompt_file: "review-prompt.md" };
+    expect(refusal(dir, { ai, review: agentReviews, dragons: { a: { name: "A", adapter: "kiro", model: "auto" } } })).toContain(
+      "ai.roles.review.amber: no dragon runs this profile (rv), and reviews by agents are on (review.prompt_file): give a reviewer dragon profile: rv",
+    );
+    // A dragon on it, reviews by agents off, or the build role's first profile (a dragons.txt dragon runs it): loads
+    expect(refusal(dir, { ai, review: agentReviews, dragons: { r: { name: "R", profile: "rv" } } })).toBe("");
+    expect(refusal(dir, { ai, review: { enabled: true }, dragons: {} })).toBe("");
+    expect(refusal(dir, { ai: { ...ai, roles: { build: ["rv"], review: { amber: ["rv"] } } }, review: agentReviews })).toBe("");
   });
 
   it("loads the documented example: a dragon on its profile, one on its role's, and the role's failover", () => {
@@ -330,6 +356,19 @@ describe("a dragon runs on its profile, its adapter and model, or its role's fir
       { adapter: "kiro", model: "claude-opus-4.5", provider: "kiro", profile: "kiro-opus" },
       { adapter: "test-cli", model: "model-z", provider: "test-cli" },
     ]);
+  });
+
+  it("names a dragon's tool by the adapter's key: an agent_adapters entry with another id keeps its own commands and checks", () => {
+    const dir = tempDir("lair-ai-");
+    const config = load(dir, {
+      agent_adapters: { "test-cli": TEST_CLI, "kiro-custom": { ...TEST_CLI, id: "kiro", name: "My Kiro" } },
+      dragons: { mine: { name: "Mine", adapter: "kiro-custom", model: "model-m" } },
+    });
+    expect(profilesFor(config, settingsOf(config), "mine")).toStrictEqual([
+      { adapter: "kiro-custom", model: "model-m", provider: "kiro-custom" },
+    ]);
+    // Not the built-in kiro's sign-in check
+    expect(new AiToolsService({ runner: new FakeRunner(), env: { PATH: binWith("agent-cli") } }).signInRefusal("kiro-custom", config)).toBeNull();
   });
 
   it("leaves a project without ai: exactly as it was", () => {
@@ -473,6 +512,28 @@ describe("model lists", () => {
     expect(parseKiroModels(noisy)).toEqual(parseKiroModels(KIRO_SAMPLE));
   });
 
+  it("takes an indented * as the default too", () => {
+    const indented = ["  * auto  1.00x credits  Models chosen…", "    claude-opus-4.5  2.20x credits  Claude Opus 4.5 model"].join("\n");
+    expect(parseKiroModels(indented)).toEqual(parseKiroModels(KIRO_SAMPLE));
+    expect(parseKiroModels(indented)[0]).toMatchObject({ id: "auto", default: true });
+  });
+
+  it("shows nothing of a list that could name an account: no URL or ARN as a model, none in a label", () => {
+    const listed = parseKiroModels(
+      [
+        "* auto  1.00x credits  Chosen for https://example-org.awsapps.com/start/",
+        "  arn:aws:bedrock:us-east-1:123456789012:model/x  1.00x credits  An ARN",
+        "  https://example-org.awsapps.com/start  1.00x credits  A URL",
+        "  claude-3-5-sonnet-20241022  1.00x credits  Account 123456789012",
+      ].join("\n"),
+    );
+    // A dated model id stays as it is
+    expect(listed.map((m) => m.id)).toEqual(["auto", "claude-3-5-sonnet-20241022"]);
+    expect(listed.map((m) => m.label)).toEqual(["Chosen for", "Account"]);
+    expect(leaks(JSON.stringify(listed))).toEqual([]);
+    expect(leaks(JSON.stringify(parseLineModels("https://example-org.awsapps.com/x\nmodel-a Profile arn:aws:x:123456789012")))).toEqual([]);
+  });
+
   it("is bounded: a huge line or a flood of lines reads quickly, to at most MAX_MODELS models", () => {
     const flood = Array.from({ length: 5000 }, (_, i) => `  model-${i}  1.00x credits  Model ${i}`).join("\n");
     const started = Date.now();
@@ -529,14 +590,16 @@ describe("model lists", () => {
     expect(a).toEqual(b);
     expect(runner.calls.every((c) => c.options.timeoutMs > 0 && c.options.maxBytes > 0)).toBe(true);
 
-    // A list command that fails: the preset's known list, with the reason, read again a minute later
-    runner.answer = (argv) => (argv[0] === "kiro-cli" ? out("", 1, "boom") : undefined);
+    // A list command that fails: the preset's known list, with the reason (its category, never its output), read
+    // again a minute later
+    runner.answer = (argv) => (argv[0] === "kiro-cli" ? out("", 1, WHOAMI_SIGNED_OUT) : undefined);
     const failing = await service.models(config, "kiro", undefined, true);
     expect(failing).toMatchObject({
       source: "preset",
       fetchedAt: null,
-      error: "`kiro-cli chat --list-models` gave no list: it exited 1: boom",
+      error: "`kiro-cli chat --list-models` gave no list: exit code 1",
     });
+    expect(leaks(JSON.stringify(failing))).toEqual([]);
     expect(failing.models[0]).toEqual({ id: "auto", label: "Models chosen by task", notes: "", default: true });
     expect(failing.models.map((m) => m.id)).toContain("claude-opus-4.5");
     const calls = runner.calls.length;
@@ -562,7 +625,7 @@ describe("model lists", () => {
       models: [],
       source: "none",
       fetchedAt: null,
-      error: "`opencode models` gave no list: its program is not installed",
+      error: "`opencode models` gave no list: not installed",
     });
 
     // An edited command is never answered from the old one's cache
@@ -580,7 +643,7 @@ describe("model lists", () => {
 // ============ 5. SIGN-IN AND INSTALLED STATE ============
 
 describe("sign-in status: the tool's own check, never its token files", () => {
-  it("maps a check's answer: exit 0 is signed in, a signed-out message is signed out, anything else is unknown", () => {
+  it("maps a check's answer: exit 0 is signed in, a signed-out first line is signed out, anything else is unknown", () => {
     expect(signInFrom(out("Logged in with Builder ID\n"), "kiro-cli login")).toEqual({
       state: "signed_in",
       as: "Logged in with Builder ID",
@@ -590,25 +653,47 @@ describe("sign-in status: the tool's own check, never its token files", () => {
     expect(signInFrom(out("", 1, "error: Not logged in\n"), "kiro-cli login")).toEqual({
       state: "signed_out",
       as: null,
-      detail: "not signed in (error: Not logged in)",
+      detail: "not signed in",
       fix: "kiro-cli login",
     });
     expect(signInFrom(out("You are not signed in. Run login first.", 1), null).state).toBe("signed_out");
-    // A failure that doesn't say so never stops the agents
+    // A failure that doesn't say so never stops the agents: its category only, never its output
     expect(signInFrom(out("", 2, "error: unrecognized subcommand 'whoami'"), null)).toEqual({
       state: "unknown",
       as: null,
-      detail: "can't tell: the sign-in check failed (it exited 2: error: unrecognized subcommand 'whoami')",
+      detail: "can't tell: the sign-in check failed (exit code 2)",
       fix: null,
     });
-    expect(signInFrom({ code: -1, stdout: "", stderr: "", failure: "timeout", message: "no answer after 15 s" }, null)).toMatchObject({
+    expect(signInFrom({ code: -1, stdout: "", stderr: "", failure: "timeout", message: "no answer after 5 s" }, null)).toMatchObject({
       state: "unknown",
-      detail: "can't tell: the sign-in check failed (it timed out (no answer after 15 s))",
+      detail: "can't tell: the sign-in check failed (timed out)",
     });
     expect(signInFrom(out("", 255, "ssh: connect to host build.example port 22: Connection refused"), null, true)).toMatchObject({
       state: "unknown",
-      detail: "the machine didn't answer (ssh: ssh: connect to host build.example port 22: Connection refused)",
+      detail: "the machine didn't answer (ssh exit code 255)",
     });
+    // A transient failure that mentions logging in on a later line is not "signed out"
+    expect(signInFrom(out("", 1, "Error: the service did not answer\nplease log in again if this persists\n"), null).state).toBe("unknown");
+  });
+
+  it("never shows a check's own output: a known kind of sign-in at most, nothing of an account or organisation", () => {
+    const signedIn = signInFrom(out(WHOAMI_SIGNED_IN), "kiro-cli login");
+    expect(signedIn).toEqual({
+      state: "signed_in",
+      as: "Logged in with IAM Identity Center",
+      detail: "signed in (Logged in with IAM Identity Center)",
+      fix: "kiro-cli login",
+    });
+    // A sign-in line Lair doesn't know: signed in, and nothing of the line
+    expect(signInFrom(out("Logged in as someone@example.com (account 123456789012)\n"), null)).toEqual({
+      state: "signed_in",
+      as: null,
+      detail: "signed in",
+      fix: null,
+    });
+    const signedOut = signInFrom(out("", 1, WHOAMI_SIGNED_OUT), "kiro-cli login");
+    expect(signedOut).toEqual({ state: "signed_out", as: null, detail: "not signed in", fix: "kiro-cli login" });
+    expect(leaks(JSON.stringify([signedIn, signedOut, signInFrom(out(WHOAMI_SIGNED_OUT, 3), null)]))).toEqual([]);
   });
 
   it("reports per tool and machine: installed, version and sign-in with the fix, in the agents' environment, cached briefly", async () => {
@@ -659,10 +744,13 @@ describe("sign-in status: the tool's own check, never its token files", () => {
         installed: true,
         path: join(bin, "kiro-cli"),
         version: "kiro-cli 1.20.0",
-        signIn: { state: "signed_out", as: null, detail: "not signed in (Not logged in)", fix: "kiro-cli login" },
+        signIn: { state: "signed_out", as: null, detail: "not signed in", fix: "kiro-cli login" },
         checkedAt: iso(NOW),
       },
     ]);
+    // A sign-in check gets 5 s; the version, only shown here, the usual 15 s
+    expect(runner.calls.find((c) => c.argv[1] === "whoami")!.options.timeoutMs).toBe(5000);
+    expect(runner.calls.find((c) => c.argv[1] === "--version")!.options.timeoutMs).toBe(15000);
     const claude = view.tools.find((t) => t.id === "claude-code")!;
     expect(claude).toMatchObject({ experimental: true, program: "claude", signInCheck: false, inUse: false });
     expect(claude.machines[0]).toEqual({
@@ -725,15 +813,19 @@ describe("sign-in status: the tool's own check, never its token files", () => {
 // ============ 6. ROUTES ============
 
 describe("the AI tools API is the owner's, reads included", () => {
-  async function serve() {
+  async function serve(
+    answer: (argv: string[]) => ToolRunOutput | undefined = (argv) =>
+      argv.join(" ") === "kiro-cli chat --list-models" ? out(KIRO_SAMPLE) : undefined,
+    path = binWith(),
+  ) {
     const root = tempDir("lair-ai-routes-");
     const projects = join(root, "projects");
     mkdirSync(projects);
     writeFileSync(join(projects, "demo.yaml"), projectYaml(root, {}));
     const tokenPath = join(root, "data", "owner.token");
     const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
-    const runner = new FakeRunner((argv) => (argv.join(" ") === "kiro-cli chat --list-models" ? out(KIRO_SAMPLE) : undefined));
-    const service = new AiToolsService({ runner, clock: new SharedClock(NOW), env: { PATH: binWith() } });
+    const runner = new FakeRunner(answer);
+    const service = new AiToolsService({ runner, clock: new SharedClock(NOW), env: { PATH: path } });
     const app: FastifyInstance = Fastify({ logger: false });
     await registerOwnerRoutes(app, auth);
     await registerAiRoutes(app, {
@@ -789,12 +881,35 @@ describe("the AI tools API is the owner's, reads included", () => {
     expect((await app.inject({ url: "/api/ai/tools?project=../etc", headers: owner })).statusCode).toBe(400);
     expect((await app.inject({ url: "/api/ai/tools?project=other", headers: owner })).statusCode).toBe(400);
   });
+
+  it("never answers with a tool's own output: the sign-in portal, profile ARN and account stay out", async () => {
+    const { app, owner } = await serve((argv) => {
+      const command = argv.join(" ");
+      if (command === "kiro-cli whoami") return out(WHOAMI_SIGNED_IN);
+      if (command === "kiro-cli --version") return out("kiro-cli 1.20.0 https://example-org.awsapps.com/start/ 123456789012\n");
+      if (command === "kiro-cli chat --list-models") return out("", 1, WHOAMI_SIGNED_OUT);
+      return undefined;
+    }, binWith("kiro-cli"));
+    const tools = await app.inject({ url: "/api/ai/tools?project=demo", headers: owner });
+    expect(tools.statusCode).toBe(200);
+    const kiro = tools.json().data.tools.find((t: { id: string }) => t.id === "kiro");
+    expect(kiro.machines[0]).toMatchObject({
+      installed: true,
+      version: "kiro-cli 1.20.0",
+      signIn: { state: "signed_in", as: "Logged in with IAM Identity Center", detail: "signed in (Logged in with IAM Identity Center)" },
+    });
+    expect(leaks(tools.body)).toEqual([]);
+    const models = await app.inject({ url: "/api/ai/models?tool=kiro", headers: owner });
+    expect(models.json().data).toMatchObject({ source: "preset", error: "`kiro-cli chat --list-models` gave no list: exit code 1" });
+    expect(leaks(models.body)).toEqual([]);
+  });
 });
 
 // ============ 7. THE AGENTS MODULE REFUSES STARTS ON A SIGNED-OUT TOOL ============
 
 describe("a tool signed out on this machine starts no run here", () => {
-  it("holds every run on it with the fix, raises one decision for the project, and starts them once signed in", async () => {
+  /** The agents module and the Decision Inbox as the server wires them, with the tools service over `answer` */
+  async function agentsWith(answer: (argv: string[]) => ToolRunOutput | Promise<ToolRunOutput> | undefined) {
     const dir = tempDir("lair-ai-agents-");
     mkdirSync(join(dir, "agents"));
     mkdirSync(join(dir, "gates"));
@@ -816,13 +931,7 @@ describe("a tool signed out on this machine starts no run here", () => {
       },
     });
     const clock = new SharedClock(NOW);
-    let signedIn = false;
-    const runner = new FakeRunner((argv) => {
-      const command = argv.join(" ");
-      if (command === "kiro-cli --version") return out("kiro-cli 1.20.0\n");
-      if (command === "kiro-cli whoami") return signedIn ? out("Logged in with Builder ID\n") : out("", 1, "Not logged in\n");
-      return undefined;
-    });
+    const runner = new FakeRunner(answer);
     const tools = new AiToolsService({ runner, clock, env: { PATH: binWith("kiro-cli"), HOME: dir } });
     const procs = new FakeProcessTable(clock);
     const spawner = new FakeSpawner(procs, clock);
@@ -833,7 +942,8 @@ describe("a tool signed out on this machine starts no run here", () => {
     });
     agents.load([{ name: "demo", config }]);
     const app = Fastify();
-    const auth = HumanAuth.open({ tokenPath: join(dir, "data", "owner.token"), dbPath: ":memory:" });
+    const tokenPath = join(dir, "data", "owner.token");
+    const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
     const inbox = await mountDecisions(app, { dbPath: ":memory:", humanAuth: auth, defaultProject: () => "demo", clock, producers: [agents] });
     cleanups.push(async () => {
       await agents.stop();
@@ -843,54 +953,116 @@ describe("a tool signed out on this machine starts no run here", () => {
     const service = agents.get("demo");
     const store = agents.getStore();
     if (!service || !store) throw new Error(agents.status("demo").errors.join("; "));
-    const runs = Object.fromEntries(
-      await Promise.all(
-        ["worker-a", "worker-b", "worker-c", "worker-f"].map(async (agent) => [
-          agent,
-          (await service.requestRun({ agent, task: `task-${agent}`, prompt: "Do the task" })).id,
-        ]),
-      ),
-    ) as Record<string, string>;
+    const owner = { ...BROWSER, [OWNER_SESSION_HEADER]: auth.createSession(readFileSync(tokenPath, "utf-8").trim())!.session };
+    const request = async (...agentIds: string[]) => {
+      const ids: Record<string, string> = {};
+      for (const agent of agentIds) ids[agent] = (await service.requestRun({ agent, task: `task-${agent}`, prompt: "Do the task" })).id;
+      return ids;
+    };
     const signInDecisions = () => inbox.list({ project: "demo" }).filter((d) => d.key === "signin:kiro:local");
+    const whoamis = () => runner.commands().filter((c) => c === "kiro-cli whoami").length;
+    /** Move the clock on, tick, and let the sign-in checks it started finish */
+    const at = async (ms: number) => {
+      clock.t = NOW + ms;
+      await service.tick();
+      await tools.idle();
+    };
+    return { app, owner, clock, runner, tools, spawner, service, store, inbox, request, signInDecisions, whoamis, at };
+  }
 
-    await service.tick();
+  it("holds every run on it with the fix, raises one decision for the project, and starts them once signed in", async () => {
+    let signedIn = false;
+    const h = await agentsWith((argv) => {
+      const command = argv.join(" ");
+      if (command === "kiro-cli whoami") return signedIn ? out(WHOAMI_SIGNED_IN) : out("", 1, WHOAMI_SIGNED_OUT);
+      return undefined;
+    });
+    const runs = await h.request("worker-a", "worker-b", "worker-c", "worker-f");
+    // The requests started the check in the background: one for the tool, not one per run
+    await h.tools.idle();
+    expect(h.whoamis()).toBe(1);
+
+    await h.at(0);
     // The runs on kiro wait, saying why and what to run; the run on another tool, and the one with a fallback on it, start
-    expect(spawner.calls.map((c) => [c.env.LAIR_AGENT, c.argv[0]]).sort()).toEqual([
+    expect(h.spawner.calls.map((c) => [c.env.LAIR_AGENT, c.argv[0]]).sort()).toEqual([
       ["worker-c", "agent-cli"],
       ["worker-f", "agent-cli"],
     ]);
     for (const agent of ["worker-a", "worker-b"]) {
-      const run = store.getRun(runs[agent])!;
+      const run = h.store.getRun(runs[agent])!;
       expect(run.state).toBe("queued");
       expect(run.detail).toContain("Kiro CLI (kiro) is not signed in on this machine: run `kiro-cli login` in a terminal on it");
+      expect(leaks(run.detail)).toEqual([]);
     }
-    expect(store.getRun(runs["worker-f"])!.profile).toMatchObject({ adapter: "test-cli", model: "model-f" });
+    expect(h.store.getRun(runs["worker-f"])!.profile).toMatchObject({ adapter: "test-cli", model: "model-f" });
     // One decision for the tool, not one per agent or run, and never "every profile is failing"
-    expect(signInDecisions()).toHaveLength(1);
-    expect(signInDecisions()[0]).toMatchObject({ status: "open", source: { module: "agents", ref: "signin:kiro" } });
-    expect(signInDecisions()[0].title).toBe("Kiro CLI is not signed in on this machine: Lair starts no agent on it here");
-    expect(signInDecisions()[0].context).toContain("run `kiro-cli login` in a terminal on this machine");
-    expect(signInDecisions()[0].context).toContain("worker-a on task-worker-a");
-    expect(inbox.list({ project: "demo" }).filter((d) => d.key.startsWith("exhausted:"))).toEqual([]);
-    // The check ran once for both runs
-    expect(runner.commands().filter((c) => c === "kiro-cli whoami")).toHaveLength(1);
+    const [decision] = h.signInDecisions();
+    expect(h.signInDecisions()).toHaveLength(1);
+    expect(decision).toMatchObject({ status: "open", kind: "other", source: { module: "agents", ref: "signin:kiro" } });
+    expect(decision.title).toBe("Kiro CLI is not signed in on this machine: Lair starts no agent on it here");
+    expect(decision.context).toContain("Its sign-in check (`kiro-cli whoami`) says it is not signed in on this machine.");
+    expect(decision.context).toContain("run `kiro-cli login` in a terminal on this machine");
+    expect(decision.context).toContain("worker-a on task-worker-a");
+    // Nothing of the check's output: not the portal, the ARN or the account
+    expect(leaks(JSON.stringify(h.inbox.list({ project: "demo" })))).toEqual([]);
+    expect(h.inbox.list({ project: "demo" }).filter((d) => d.key.startsWith("exhausted:"))).toEqual([]);
+    // The agents module runs the sign-in check alone, with its own 5 s; never the version
+    expect(h.runner.commands().some((c) => c.includes("--version"))).toBe(false);
+    expect(h.runner.calls.every((c) => c.options.timeoutMs === 5000)).toBe(true);
 
-    // A minute later it is checked again: still signed out, still one decision
-    clock.t = NOW + 61 * SEC;
-    await service.tick();
-    expect(spawner.calls).toHaveLength(2);
-    expect(runner.commands().filter((c) => c === "kiro-cli whoami")).toHaveLength(2);
-    expect(inbox.list({ project: "demo" }).filter((d) => d.source.module === "agents")).toHaveLength(1);
+    // Looked at again 30 s later: the next check starts while the last answer still stands
+    await h.at(31 * SEC);
+    expect(h.spawner.calls).toHaveLength(2);
+    expect(h.whoamis()).toBe(2);
+    expect(h.inbox.list({ project: "demo" }).filter((d) => d.source.module === "agents")).toHaveLength(1);
 
-    // Signed in: the next check starts them, and the decision is withdrawn
+    // Signed in: once a check after it has answered they start, and the decision is withdrawn
     signedIn = true;
-    clock.t = NOW + 122 * SEC;
-    await service.tick();
-    expect(spawner.calls.slice(2).map((c) => [c.env.LAIR_AGENT, c.argv[0]]).sort()).toEqual([
+    await h.at(62 * SEC);
+    await h.at(93 * SEC);
+    expect(h.spawner.calls.slice(2).map((c) => [c.env.LAIR_AGENT, c.argv[0]]).sort()).toEqual([
       ["worker-a", "kiro-cli"],
       ["worker-b", "kiro-cli"],
     ]);
-    expect(signInDecisions()).toHaveLength(1);
-    expect(signInDecisions()[0].status).toBe("withdrawn");
+    expect(h.signInDecisions()).toHaveLength(1);
+    expect(h.signInDecisions()[0].status).toBe("withdrawn");
+  });
+
+  it("is not asked again after Keep waiting, while it stays signed out", async () => {
+    const h = await agentsWith((argv) => (argv.join(" ") === "kiro-cli whoami" ? out("", 1, "Not logged in\n") : undefined));
+    await h.request("worker-a");
+    await h.tools.idle();
+    await h.at(0);
+    const [decision] = h.signInDecisions();
+    const answered = await h.app.inject({
+      method: "POST",
+      url: `/api/decisions/${decision.id}/answer`,
+      headers: h.owner,
+      payload: { optionId: "wait" },
+    });
+    expect(answered.statusCode).toBe(200);
+    for (const ms of [31 * SEC, 62 * SEC, 93 * SEC, 124 * SEC]) await h.at(ms);
+    expect(h.whoamis()).toBeGreaterThanOrEqual(4);
+    expect(h.spawner.calls).toHaveLength(0);
+    // Still the one answered decision: no new one every minute
+    expect(h.inbox.list({ project: "demo" }).filter((d) => d.source.module === "agents")).toEqual([
+      expect.objectContaining({ key: "signin:kiro:local", status: "answered" }),
+    ]);
+  });
+
+  it("never waits for a check: a hung sign-in check delays no tick, and a start with no answer yet goes ahead", async () => {
+    // The check never answers (the runner's 5 s timeout is the boundary's; here it hangs for good)
+    const h = await agentsWith((argv) => (argv.join(" ") === "kiro-cli whoami" ? new Promise<ToolRunOutput>(() => undefined) : undefined));
+    await h.request("worker-a");
+    // A tick that awaited the check would never resolve
+    const ticked = await Promise.race([
+      h.service.tick().then(() => "ticked"),
+      new Promise((resolve) => setTimeout(() => resolve("stalled"), 2000)),
+    ]);
+    expect(ticked).toBe("ticked");
+    // Unknown never holds a start
+    expect(h.spawner.calls.map((c) => [c.env.LAIR_AGENT, c.argv[0]])).toEqual([["worker-a", "kiro-cli"]]);
+    // One check, started by the request, with the 5 s timeout; the tick started no second one
+    expect(h.runner.calls.map((c) => [c.argv.join(" "), c.options.timeoutMs])).toEqual([["kiro-cli whoami", 5000]]);
   });
 });

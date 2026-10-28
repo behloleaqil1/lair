@@ -6,6 +6,7 @@
  * an option), and labels and notes are plain one-line text.
  */
 import type { ToolModel, ToolModelsParser } from "../../shared/types.js";
+import { isShownModelId, scrub } from "./scrub.js";
 
 export const MAX_MODEL_LINES = 2000;
 export const MAX_MODEL_LINE_CHARS = 400;
@@ -39,9 +40,12 @@ function cleanLines(output: string): string[] {
   return lines;
 }
 
-const plain = (text: string) => text.replace(/\s+/g, " ").trim().slice(0, MAX_TEXT);
+/** A label or a note: one line, bounded, without what could name an account or an organisation (scrub) */
+const plain = (text: string) => scrub(text).slice(0, MAX_TEXT);
 
 function add(models: ParsedModel[], model: ParsedModel): void {
+  // A "model" that is a URL or an ARN is not shown (scrub.ts)
+  if (!isShownModelId(model.id)) return;
   if (models.length >= MAX_MODELS || models.some((m) => m.id === model.id)) return;
   models.push(model);
 }
@@ -52,7 +56,7 @@ const COST = /^\d+(?:\.\d+)?x\b/i;
 /**
  * `kiro-cli chat --list-models`: one model per line, indented, the default
  * marked with "*", then columns separated by two or more spaces: the cost
- * multiplier and a description.
+ * multiplier and a description. The "*" may be indented too.
  *
  *     * auto                 1.00x credits  Models chosen by task for optimal usage
  *       claude-opus-4.5      2.20x credits  Claude Opus 4.5 model
@@ -62,11 +66,11 @@ const COST = /^\d+(?:\.\d+)?x\b/i;
 export function parseKiroModels(output: string): ParsedModel[] {
   const models: ParsedModel[] = [];
   for (const line of cleanLines(output)) {
-    const match = /^(?:(\*)\s+|\s+)(\S+)(?:\s{2,}(.*))?$/.exec(line.replace(/\s+$/, ""));
+    const match = /^(?:\s*(\*)\s+|\s+)(\S+)(?:\s{2,}(.*))?$/.exec(line.replace(/\s+$/, ""));
     if (!match || !MODEL_ID.test(match[2])) continue;
     const columns = (match[3] ?? "").split(/\s{2,}/).map(plain).filter((c) => c.length > 0);
     let notes = "";
-    let label = match[2];
+    let label = "";
     if (columns.length >= 2) {
       notes = columns.slice(0, -1).join(" · ");
       label = columns[columns.length - 1];
@@ -74,7 +78,7 @@ export function parseKiroModels(output: string): ParsedModel[] {
       if (COST.test(columns[0])) notes = columns[0];
       else label = columns[0];
     }
-    add(models, { id: match[2], label: plain(label), notes: plain(notes), default: match[1] === "*" });
+    add(models, { id: match[2], label: label || match[2], notes, default: match[1] === "*" });
   }
   // One default at most: the first one marked
   let seen = false;
@@ -123,7 +127,7 @@ export function knownModels(models: readonly ToolModel[] | undefined): ParsedMod
     if (typeof model?.id !== "string" || !MODEL_ID.test(model.id)) continue;
     add(out, {
       id: model.id,
-      label: typeof model.label === "string" && model.label.trim() ? plain(model.label) : model.id,
+      label: (typeof model.label === "string" ? plain(model.label) : "") || model.id,
       notes: typeof model.notes === "string" ? plain(model.notes) : "",
       default: model.default === true,
     });

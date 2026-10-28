@@ -336,7 +336,7 @@ Profile ids start with a letter and use letters, digits, `.`, `_` and `-` (at mo
 
 ### Reviewers by role
 
-A reviewer pool (`review.reviewers_pool.<tier>`, or a slot's `pool`) may name a role: `role:review.amber` stands for the agents whose profile is in `ai.roles.review.amber`, in the role's order (the agents on its first profile first). It can be the whole pool (`amber: role:review.amber`) or one entry beside agent ids. A tier with no pool of its own takes `role:review.<tier>` when that role is set, so setting `ai.roles.review.amber` is enough to have AMBER reviews done by those agents. A failing first profile falls back to the next: a review run that ends without a review is retried by an agent not tried yet, which is the role's next agent. `different_model` compares every model of both sides, their role fallbacks included: a reviewer is skipped when any of its profiles shares a model with any of the author's. A `role:` entry for a role the project doesn't set is a config error.
+A reviewer pool (`review.reviewers_pool.<tier>`, or a slot's `pool`) may name a role: `role:review.amber` stands for the dragons that run a profile of `ai.roles.review.amber` (their own `profile:`, or their role's), in the role's order (the dragons on its first profile first). A role is not an agent of its own: give your reviewer dragons `profile: <one of the role's profiles>`. With reviews by agents on (`review.enabled` and `review.prompt_file`), a review role that no dragon runs keeps the project from loading (`ai.roles.review.<tier>: no dragon runs this profile ...`); a role with the build role's first profile counts as run, since a `dragons.txt` dragon runs it. It can be the whole pool (`amber: role:review.amber`) or one entry beside agent ids. A tier with no pool of its own takes `role:review.<tier>` when that role is set, so setting `ai.roles.review.amber` is enough to have AMBER reviews done by those agents. A failing first profile falls back to the next: a review run that ends without a review is retried by an agent not tried yet, which is the role's next agent. `different_model` compares every model of both sides, their role fallbacks included: a reviewer is skipped when any of its profiles shares a model with any of the author's. A `role:` entry for a role the project doesn't set is a config error.
 
 ### Tool presets
 
@@ -361,22 +361,31 @@ An adapter (a preset, or one of your `agent_adapters`) may set these keys:
 | Key | Type | Description |
 |-----|------|-------------|
 | `models_cmd` | array | Lists the tool's models: an argv, run on each machine |
-| `models_parser` | `kiro` \| `lines` | How its output is read: `kiro` (indented lines, the default marked with `*`, then the cost and a description, separated by two or more spaces) or `lines` (the default: one model per line, its first word the id and the rest its label; `#` lines are skipped, a leading `* ` marks the default) |
+| `models_parser` | `kiro` \| `lines` | How its output is read: `kiro` (indented lines, the default marked with `*`, indented or not, then the cost and a description, separated by two or more spaces) or `lines` (the default: one model per line, its first word the id and the rest its label; `#` lines are skipped, a leading `* ` marks the default) |
 | `models` | array | Known models (`{id, label?, notes?, default?}`): the list when there is no `models_cmd`, or when it fails |
 | `auth_check_cmd` | array | Exits 0 when the tool is signed in on the machine: an argv |
 | `login_hint` | string | What you run in a terminal to sign in, shown as the fix. Lair never runs it |
 | `version_cmd` | array | Prints the tool's version: an argv |
 | `experimental` | boolean | Shown as experimental |
 
-These commands are run as written: argv arrays, never through a shell, with no `{placeholder}` and a program that doesn't start with `-` (a config error otherwise). Each runs with a 15-second timeout and at most 256 KiB of output, in the environment an agent of the project gets (`PATH`, `HOME` and the like, plus `agents.env_passthrough`), never the rest of Lair's. Lair never reads a tool's token files: the tool's own check answers. A check's answer is:
+These commands are run as written: argv arrays, never through a shell, with no `{placeholder}` and a program that doesn't start with `-` (a config error otherwise). Each runs with at most 256 KiB of output and a timeout (5 seconds for a sign-in check, 15 for the others), in the environment an agent of the project gets (`PATH`, `HOME` and the like, plus `agents.env_passthrough`), never the rest of Lair's. Lair never reads a tool's token files: the tool's own check answers. A check's answer is:
 
-- exit 0: **signed in** (its first line is shown, e.g. "Logged in with Builder ID");
-- another exit code with a message that says so ("not logged in", "not signed in", "login required", ...): **not signed in**, with the preset's `login_hint` as the fix;
+- exit 0: **signed in**;
+- another exit code whose first line (of its output, or of its errors) says so ("not logged in", "not signed in", "login required", ...): **not signed in**, with the preset's `login_hint` as the fix. A later line doesn't count: a transient error may suggest logging in again;
 - anything else (a timeout, a crash, a missing subcommand, ssh failing): **unknown**. Unknown never stops an agent.
+
+**Nothing of a tool's output is shown as it is.** A sign-in check's output can name your organisation's sign-in portal, a profile ARN and an account, so the API, the dashboard and the Decision Inbox get the state and fixed words only ("signed in", "not signed in", "can't tell: the sign-in check failed (timed out)"): a failure is given by its category (not installed, timed out, exit code N, too much output), never by a line of its output. A known kind of sign-in is shown as "signed in (Logged in with IAM Identity Center)": those words, never what follows them. Every other text taken from a tool's output (a version line, a model's label and notes) has URLs, ARNs and runs of six or more digits taken out, and a model id that is a URL or an ARN is not listed.
 
 **Machines.** On this machine a tool is installed when its start command's program is on `PATH` (a lookup, nothing is run). An SSH machine (`machines:`) is asked through `ssh` (`command -v`, then the tool's commands, each argument quoted for the remote shell), and only about the tools of the dragons whose `machine` is that one. A non-interactive SSH shell may have a shorter `PATH` than your login shell. The agents module starts its runs on this machine, so only this machine's sign-in state refuses a start.
 
-**A tool that is not signed in starts nothing here.** When a tool's check says it is not signed in on this machine, the agents module starts no run on it: each run on that tool waits, with "not signed in on this machine: run `<login_hint>` ..." as its detail, and is checked again every minute; a run with a fallback on another tool (`agents.fallbacks`, or its role) starts on that one. The Decision Inbox gets one decision per tool for the project, not one per agent or run: "I signed it in: check again now" (the runs waiting on it start on the next check once it is signed in) or "Keep waiting". It is withdrawn once the check says the tool is signed in, and asked again if it is still signed out after you answered.
+**A tool that is not signed in starts nothing here.** The agents module never waits for a check. A request for a run starts its tools' sign-in checks in the background (the sign-in check alone, never the version), and a start goes by the last answer. An answer is good for a minute; once it is 30 seconds old, the next look starts another check in the background while it still stands. A tool not checked yet, or whose answer is older than a minute, counts as unknown, which never holds a start. When a tool's last check says it is not signed in on this machine, the agents module starts no run on it: each run on that tool waits, with "not signed in on this machine: run `<login_hint>` ..." as its detail, and looks again every 30 seconds; a run with a fallback on another tool (`agents.fallbacks`, or its role) starts on that one. The Decision Inbox gets one decision per tool for the project, not one per agent or run:
+
+- "I signed it in: check again now": the tool is checked again at once, the runs waiting on it start once it is signed in, and you are asked again if a check after your answer still says it isn't;
+- "Keep waiting": Lair keeps checking and starts the runs once it is signed in, without asking again.
+
+The decision is withdrawn once a check says the tool is signed in, and raised again if it is signed out again after that.
+
+The adapter a dragon names (its key under `agent_adapters`, or a preset's) is its tool, with that entry's own start command and checks, also when the entry's `id:` names another.
 
 ### AI API
 
@@ -385,7 +394,7 @@ Every route is the owner's, reads included (they run the tools' own commands and
 | Method | Route | Description |
 |--------|-------|-------------|
 | `GET` | `/api/ai/tools?project=<name>` | Every tool the project can use: `{project, tools: [{id, name, experimental, program, signInCheck, modelsCmd, knownModels, inUse, machines: [{machine, installed, path, version, signIn: {state, as, detail, fix}, checkedAt}]}], notes}`. `state` is `signed_in`, `signed_out` or `unknown`; `installed` is null when a machine didn't answer. Cached for a minute |
-| `GET` | `/api/ai/models?tool=<id>&project=<name>&machine=<id>` | `{tool, machine, models: [{id, label, notes, default}], source, fetchedAt, error?}`. `source` is `cmd` (its `models_cmd`, cached for an hour), `preset` (its known list; `error` says why the command gave none, tried again after a minute) or `none` |
+| `GET` | `/api/ai/models?tool=<id>&project=<name>&machine=<id>` | `{tool, machine, models: [{id, label, notes, default}], source, fetchedAt, error?}`. `source` is `cmd` (its `models_cmd`, cached for an hour), `preset` (its known list; `error` says why the command gave none, by its category only, and it is tried again after a minute) or `none` |
 | `POST` | `/api/ai/models/refresh` | Body `{tool, project?, machine?}`: the list read again now, the same answer |
 
 ## Gate runner

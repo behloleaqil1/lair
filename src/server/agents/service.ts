@@ -153,8 +153,12 @@ export const DECISION_RETRY_NOW = "retry_now";
 
 /** In the detail of a run that waits for its tool's sign-in */
 const SIGNED_OUT_DETAIL = "not signed in on this machine";
-/** A run whose every profile's tool is signed out checks again after this long */
-const SIGNED_OUT_RECHECK_MS = 60_000;
+/**
+ * A run whose every profile's tool is signed out looks again after this
+ * long: half the life of a sign-in state, so each look starts the next
+ * background check while the last answer still stands
+ */
+const SIGNED_OUT_RECHECK_MS = 30_000;
 
 /** Why a profile on a signed-out tool can't start, with the fix */
 function signedOutDetail(refusal: SignInRefusal): string {
@@ -823,17 +827,20 @@ export class AgentsService {
       return "fill starts the task again on its next check";
     }
     if (key.startsWith("signin:") && ref.startsWith("signin:")) {
-      if (optionId !== DECISION_RETRY_NOW) return "the runs on it keep waiting; Lair checks the sign-in again every minute";
+      if (optionId !== DECISION_RETRY_NOW) {
+        return "the runs on it keep waiting; Lair keeps checking its sign-in, and asks again only if it changes";
+      }
       const tool = ref.slice("signin:".length);
-      this.tools?.forget(tool);
-      // The runs waiting on it start on the next check (a run waiting for something else keeps its time)
+      // Checked again now, in the background; until it answers, the last answer stands
+      this.tools?.recheck(tool, this.config);
+      // The runs waiting on it look again on the next check (a run waiting for something else keeps its time)
       for (const run of this.store.activeRuns(this.project)) {
         if (run.state !== "queued" || run.notBefore <= t.now || !run.detail.includes(SIGNED_OUT_DETAIL)) continue;
         if (!this.profiles(run.agent, run.requestModel).some((p) => p.adapter === tool)) continue;
         run.notBefore = t.now;
         this.store.saveRun(run);
       }
-      return `the next start on ${tool} checks its sign-in again`;
+      return `${tool}'s sign-in is checked again now; the runs waiting on it start once it is signed in`;
     }
     if (key.startsWith("transient:") && ref.startsWith("transient:")) {
       if (optionId !== DECISION_RETRY_NOW) return "Lair keeps trying one start at a time";
@@ -1038,9 +1045,10 @@ export class AgentsService {
       const outage = this.outage(p.provider);
       return outage && this.downFor(outage, run.agent) ? outage : null;
     };
-    // A tool whose sign-in check says it is signed out here starts nothing on this machine: passed over like a
-    // provider cooling down, with one decision per tool for the project (not one per agent or run)
-    const signedOut = await this.signInRefusals(profiles);
+    // A tool whose last sign-in check says it is signed out here starts nothing on this machine: passed over like a
+    // provider cooling down, with one decision per tool for the project (not one per agent or run). Nothing waits
+    // for a check: they run in the background, and a tool not checked yet (or not lately) is not held
+    const signedOut = this.signInRefusals(profiles);
     const usable = (p: AgentProfile, outages = true): string | null => {
       const refusal = signedOut.get(p.adapter);
       return refusal ? signedOutDetail(refusal) : this.unusable(p, run.agent, t.now, outages);
@@ -1054,7 +1062,7 @@ export class AgentsService {
       run.launchingSince = undefined;
       run.waitingLock = undefined;
       run.notBefore = t.now + SIGNED_OUT_RECHECK_MS;
-      run.detail = `not starting: ${[...signedOut.values()].map(signedOutDetail).join("; ")}; checked again at ${iso(run.notBefore)}`;
+      run.detail = `not starting: ${[...signedOut.values()].map(signedOutDetail).join("; ")}; looked at again at ${iso(run.notBefore)}`;
       this.store.saveRun(run);
       return;
     }
@@ -2015,13 +2023,16 @@ export class AgentsService {
     if (!chosen) await this.raiseExhausted(next, skipped, t);
   }
 
-  /** The tools among `profiles` whose sign-in check says they are signed out here (none without the AI module). */
-  private async signInRefusals(profiles: AgentProfile[]): Promise<Map<string, SignInRefusal>> {
+  /**
+   * The tools among `profiles` whose last sign-in check says they are signed
+   * out here (none without the AI module). It never waits for a check.
+   */
+  private signInRefusals(profiles: AgentProfile[]): Map<string, SignInRefusal> {
     const refusals = new Map<string, SignInRefusal>();
     if (!this.tools) return refusals;
     for (const tool of new Set(profiles.map((p) => p.adapter))) {
       try {
-        const refusal = await this.tools.signInRefusal(tool, this.config);
+        const refusal = this.tools.signInRefusal(tool, this.config);
         if (refusal) refusals.set(tool, refusal);
       } catch (e) {
         // A check that fails says nothing about the sign-in: the start goes ahead
@@ -2031,13 +2042,35 @@ export class AgentsService {
     return refusals;
   }
 
+  /** Start background sign-in checks of an agent's tools, when not fresh: a run on them was just requested. */
+  private primeSignIn(profiles: AgentProfile[]): void {
+    for (const tool of new Set(profiles.map((p) => p.adapter))) {
+      try {
+        this.tools?.prime(tool, this.config);
+      } catch {
+        // Only a head start: the launch asks again
+      }
+    }
+  }
+
   /**
    * One decision per signed-out tool for the project (its key has no agent
    * or run in it, so the agents and runs that wait on the tool share it). It
-   * is withdrawn once the tool's check says it is signed in (signInMoot).
+   * is withdrawn once the tool's check says it is signed in (signInMoot), and
+   * raised again when it is signed out after that. After an answer it is
+   * asked again only when the owner said "check again now" and a check since
+   * that answer still says signed out: "Keep waiting" is not asked again.
    */
   private async raiseSignedOut(refusals: SignInRefusal[], t: Tick): Promise<void> {
     for (const refusal of refusals) {
+      const key = `signin:${refusal.tool}:${refusal.machine}`;
+      const known = this.decisions().find?.(this.project, key) ?? null;
+      const answeredAt = known?.answeredAt ? Date.parse(known.answeredAt) : NaN;
+      const again =
+        known?.status === "answered" &&
+        known.answer?.optionId === DECISION_RETRY_NOW &&
+        Number.isFinite(answeredAt) &&
+        refusal.checkedAt > answeredAt;
       const waiting = this.store
         .activeRuns(this.project)
         .filter((run) => run.state === "queued" || run.state === "waiting_lock")
@@ -2045,12 +2078,13 @@ export class AgentsService {
       await this.raise(
         {
           kind: "credential",
-          key: `signin:${refusal.tool}:${refusal.machine}`,
+          key,
           ref: `signin:${refusal.tool}`,
           blocks: [`agents:${this.project}:tool:${refusal.tool}`],
           question: `${refusal.name} is not signed in on this machine: Lair starts no agent on it here`,
           context: [
-            `Its sign-in check (\`${refusal.check.join(" ")}\`) says: ${oneLine(refusal.detail, 200)}.`,
+            // Fixed words only: the check's own output can name an account or an organisation
+            `Its sign-in check (\`${refusal.check.join(" ")}\`) says it is not signed in on this machine.`,
             "",
             refusal.fix
               ? `To fix it, run \`${refusal.fix}\` in a terminal on this machine, as the user Lair runs as. Lair never signs in for you and never reads the tool's own token files.`
@@ -2062,12 +2096,12 @@ export class AgentsService {
             {
               id: DECISION_RETRY_NOW,
               label: "I signed it in: check again now",
-              consequences: `Lair checks ${refusal.tool}'s sign-in again at its next start, and the runs waiting on it start once it is signed in.`,
+              consequences: `Lair checks ${refusal.tool}'s sign-in again now; the runs waiting on it start once it is signed in, and you are asked again if it still isn't.`,
             },
             {
               id: DECISION_WAIT,
               label: "Keep waiting",
-              consequences: `Lair checks again every minute; the runs on ${refusal.tool} start once it is signed in, and this is withdrawn.`,
+              consequences: `Lair keeps checking; the runs on ${refusal.tool} start once it is signed in. You are not asked again unless it signs in and out again.`,
             },
           ],
           recommended: DECISION_RETRY_NOW,
@@ -2076,8 +2110,7 @@ export class AgentsService {
         },
         t,
         undefined,
-        // Asked again if it is still signed out after the owner answered
-        true,
+        again,
       );
     }
   }
@@ -2622,6 +2655,8 @@ export class AgentsService {
       if (blocked) throw new AgentsError(403, `Over budget: ${blocked}`);
       const profiles = this.profiles(agent, model);
       if (profiles.length === 0) throw new AgentsError(400, `Agent ${agent} has no adapter to start it with`);
+      // Its tools' sign-in is checked in the background meanwhile, so the start has an answer to go by
+      this.primeSignIn(profiles);
 
       const t = await this.newTick(now);
       const id = randomUUID();
