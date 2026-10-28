@@ -43,6 +43,10 @@ Lair is designed with security in mind:
 - **lair-node peers**: `/ws/node` accepts connections from the server's own machine (loopback). Any other peer is refused unless the server has `LAIR_NODE_TOKEN` set and the node presents the same value (`Authorization: Bearer <token>`, or `?token=<token>`); the comparison is constant-time
 - **Request parameters** naming files are validated: an invalid or unknown `?project=`, unsafe gate or dragon IDs in API paths, and a dragon start/stop request for a dragon that is neither in the YAML `dragons:` map nor in `dragons.txt` get HTTP 400
 
+### The owner session (answering decisions)
+
+Answering a Decision Inbox item is the one action that needs a signed-in owner. Signing in needs the owner token in `data/owner.token`, created at first start and readable only by your OS user; the server prints a one-time setup link to its output. The browser keeps its session in the dashboard origin's storage and sends it in a header, never a cookie, so other programs (agents and other local apps included) can't approve the work a decision holds back. A program running as your OS user can read that file and the server's output: run agents as a separate OS user to close that gap. Signed-in browsers are listed in the Decisions view, where you can sign each out ([details](docs/configuration.md#decision-inbox)).
+
 ### Command execution safety
 
 - Controls, dragon start/stop, the process manager and local gate scripts run their commands as argument arrays, never through a shell

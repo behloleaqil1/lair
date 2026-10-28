@@ -2,6 +2,21 @@
 
 Thank you for your interest in contributing to Lair! This document provides guidelines for contributing to the project.
 
+## Where to start
+
+- **Pick an issue.** [Good first issues](https://github.com/behloleaqil1/lair/issues?q=is%3Aopen+label%3A%22good+first+issue%22)
+  are small, with the files to read and what "done" means. [Help wanted](https://github.com/behloleaqil1/lair/issues?q=is%3Aopen+label%3A%22help+wanted%22)
+  issues are bigger or need a setup we don't have (for example testing an agent adapter with the agent CLI you use).
+- **Say you're on it.** Comment on the issue before you start, so two people don't do the same work. If you stop,
+  say so and someone else can take it.
+- **Ask anything** in [Discussions](https://github.com/behloleaqil1/lair/discussions), including "how does X work?"
+  and "would you take a PR for Y?".
+- **Bigger changes** start from their design note in [docs/design/](docs/design/) and the order in the
+  [roadmap](docs/design/ROADMAP.md). Open a discussion or an issue first if there is no design note yet.
+- **Small pull requests win.** One change per pull request, with its tests. CI (typecheck, lint, tests and build on
+  Node 22 and 24, and gitleaks) must be green before review.
+- New to the vocabulary? The [glossary](docs/glossary.md) explains dragons, lanes, claims and the rest.
+
 ## Getting Started
 
 1. Fork the repository

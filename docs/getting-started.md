@@ -72,14 +72,16 @@ See [Configuration](configuration.md) for all available options.
 
 1. Open `http://localhost:4777` (or `http://localhost:5173` in dev mode)
 2. If you have more than one project, pick it from the project selector in the header. The dashboard opens the project named in `LAIR_PROJECT` (for example `LAIR_PROJECT=myproject npm start`), else `example` when it exists, else the first project
-3. Check the Overview page for any detected problems
-4. Verify that your repository status is showing correctly
+3. Check **Home**: its "needs you" list shows config problems (a path that doesn't exist, a file Lair can't read) with what to fix
+4. Open **PRs**: with `github:` set and the [GitHub CLI](https://cli.github.com/) signed in, your open pull requests are listed; open **Gates** and **Work** to see what Lair reads from your gates directory and queue file
 
 ## Next steps
 
+- Connect your agents: the fleet bus (MCP) or the queue file, in [Agents](agents.md)
+- Learn the words Lair uses in the [Glossary](glossary.md)
 - Read the [Configuration](configuration.md) guide to customize your project
-- Learn about [Agents](agents.md) to connect your AI coding tools
 - Explore the [Architecture](architecture.md) to understand how Lair works
+- Want to help? Pick a [good first issue](https://github.com/behloleaqil1/lair/issues?q=is%3Aopen+label%3A%22good+first+issue%22) and read [CONTRIBUTING.md](../CONTRIBUTING.md)
 
 ## Troubleshooting
 
@@ -88,7 +90,7 @@ See [Configuration](configuration.md) for all available options.
 - Check that port 4777 is not in use: `lsof -i :4777`
 - Verify Node.js version: `node --version` (should be 22 or 24)
 - If `npm install` failed on `better-sqlite3`, install the C/C++ toolchain listed under Prerequisites and run `npm install` again
-- Check logs for errors
+- Read the server's output in the terminal where you ran `npm start` (a service manager writes it to its log file instead); each module logs its start and any config error with a `[module]` prefix
 
 ### Project not showing
 

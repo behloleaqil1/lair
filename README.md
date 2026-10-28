@@ -1,12 +1,80 @@
 # Lair
 
-Lair is a local web dashboard and control room for a fleet of AI coding agents ("dragons"). It shows what each agent is doing, the queue of CI gates, open pull requests and the health of your machines, and it can optionally start and stop agents and run your own scripts from one place.
+**Run a fleet of AI coding agents, and only merge what is proven to work.**
 
-It's for developers who run several AI coding agents in parallel against a repository, with a file-based workflow: agents append status lines to a queue file, gate runners drop result files into a directory, and an orchestrator ties it together. Lair reads those files; it doesn't replace your agents or your CI.
+[![CI](https://github.com/behloleaqil1/lair/actions/workflows/ci.yml/badge.svg)](https://github.com/behloleaqil1/lair/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Node 22 | 24](https://img.shields.io/badge/node-22%20%7C%2024-brightgreen.svg)
+[![Good first issues](https://img.shields.io/github/issues/behloleaqil1/lair/good%20first%20issue.svg?label=good%20first%20issues)](https://github.com/behloleaqil1/lair/issues?q=is%3Aopen+label%3A%22good+first+issue%22)
 
-Lair is **agent-agnostic**: agents are started by commands you configure, so any CLI-based agent can be wired in. Kiro is the only agent it has been tested with so far.
+AI agents can write code quickly; the hard part is knowing that what they ship actually works. Lair is a self-hosted
+control room for many agents working on one repository at once. It supervises their runs, runs and triages the quality
+gates, reviews changes by risk tier, merges only on evidence, and asks you only the decisions that are yours.
 
-## What it shows
+![How Lair works: agents build in parallel; Lair supervises them, runs and triages the gates, reviews by risk tier and merges only on evidence](docs/assets/how-lair-works.svg)
+
+- **Many agents, one repository.** Claims so no two agents take the same task, recovery of hung or crashed runs,
+  failover between agent CLIs on rate limits, and token and cost budgets.
+- **Gates you can trust.** The gate queue across your machines, each failure triaged as infrastructure, flaky,
+  pre-existing or a real failure of the change, and one automatic re-check of infrastructure failures.
+- **Reviews and merges by policy.** Each pull request gets a risk tier with its required reviews (by agents or humans)
+  and merges only at a head whose gate passed.
+- **You decide only what is yours.** Spend, accounts, credentials and go/no-go wait in one Decision Inbox, each with
+  its options and a recommendation.
+
+Lair is **agent-agnostic** (agents are started by commands you configure) and **early (0.x)**: it is used every day
+to build a real multi-service product, and much of the [design](docs/design/) is still ahead. New words such as
+"dragon" or "lane" are in the [glossary](docs/glossary.md).
+
+## Quick start
+
+You need macOS or Linux, Node.js 22 or 24, npm and Git.
+
+```bash
+git clone https://github.com/behloleaqil1/lair.git
+cd lair
+npm install
+npm run build
+npm start
+```
+
+Open `http://localhost:4777`. Lair starts with the bundled `example` project, which reads synthetic files in
+`fixtures/`, so you can click through every section right away. Start Lair from the repository root: it reads
+`projects/` and writes its state to `data/` relative to the current directory. [Getting Started](docs/getting-started.md)
+walks through your first own project.
+
+## Use it with your own agents
+
+Lair works from files and commands you already have, so it fits beside your agents and CI instead of replacing them:
+
+1. **Point Lair at your project:** in the dashboard, **Settings > New project** checks your repository and writes the
+   project file; or copy `projects/example.yaml` to `projects/local/<name>.yaml` and edit the paths
+   ([Configure your project](#configure-your-project)).
+2. **Get your agents' status in**, either way:
+   - **the fleet bus**, an MCP server most agent CLIs can start from their MCP config; agents then call `claim`,
+     `report` and `send` ([Fleet bus](docs/agents.md#fleet-bus-mcp)); or
+   - **a queue file** the agent or a small wrapper appends lines to, such as `- DONE fix-login by agent-A 14:35Z: summary`
+     ([Queue file format](docs/agents.md#queue-file-format)).
+3. **Optionally let Lair start agents and run gates** by setting the commands in the project file (controls are off by
+   default).
+
+**Agent support:** the default adapter has been tested with Kiro. Adapters for **Claude Code, Cursor and Aider** exist
+but need testers: if you use one of them, trying it and reporting what breaks is one of the most useful contributions
+right now ([help wanted](https://github.com/behloleaqil1/lair/issues?q=is%3Aopen+label%3A%22help+wanted%22)).
+
+## Contributing
+
+Contributions are very welcome, from a typo fix to a module.
+
+- **Start here:** [good first issues](https://github.com/behloleaqil1/lair/issues?q=is%3Aopen+label%3A%22good+first+issue%22)
+  and [help wanted](https://github.com/behloleaqil1/lair/issues?q=is%3Aopen+label%3A%22help+wanted%22).
+- **Questions and ideas:** [Discussions](https://github.com/behloleaqil1/lair/discussions).
+- **How we work:** [CONTRIBUTING.md](CONTRIBUTING.md) (setup, checks, commit messages, the no-private-details rule)
+  and the [Code of Conduct](CODE_OF_CONDUCT.md). Bigger features start from their design note in
+  [docs/design/](docs/design/) and the order in the [roadmap](docs/design/ROADMAP.md).
+
+<details>
+<summary><strong>What each section of the dashboard does</strong></summary>
 
 Home, Work, Gates, PRs, Machines, Decisions, Delivery, Processes and Settings; a section whose module is off for the project is left out of the nav. Every row opens its detail, with a URL you can share (`#/work/<agent>`, `#/gates/<id>`, `#/prs/<n>`, `#/decisions/<id>`); logs and test output are shown to the owner only.
 
@@ -24,6 +92,8 @@ Home, Work, Gates, PRs, Machines, Decisions, Delivery, Processes and Settings; a
 - **Placement** (in Gates and Machines): for a project with its own gate queue and runners on several machines, which machine runs each queued job. Lair probes the machines (a machine counts as up only after a few minutes of passing probes), learns how long each kind of job takes on each machine, estimates every job's start and finish, and moves a job to another machine's lane through your own mover when it would finish sooner there. Observe-only until you opt in ([configuration](docs/configuration.md#placement))
 - **Settings**: every project setting from the dashboard, for the owner only: forms drawn from each module's schema and a YAML tab, each change checked by the same parsers as the server before it is written, commands it adds confirmed, secrets refused, a hand edit never overwritten, every version kept with Restore, and **New project** ([configuration](docs/configuration.md#settings))
 
+</details>
+
 ## Requirements
 
 - macOS or Linux
@@ -31,21 +101,7 @@ Home, Work, Gates, PRs, Machines, Decisions, Delivery, Processes and Settings; a
 - Git
 - A C/C++ toolchain only if npm can't download a prebuilt `better-sqlite3` binary for your platform
 
-Everything works on macOS and Linux.
-
-## Install and first run
-
-```bash
-git clone https://github.com/behloleaqil1/lair.git
-cd lair
-npm install
-npm run build
-npm start
-```
-
-Open `http://localhost:4777`. The server serves the API and the built UI on that port, and starts with the bundled `example` project, which reads the synthetic files in `fixtures/`, so there is something to look at right away. Always start Lair from the repository root: it reads `projects/` and writes its state to `data/` relative to the current directory.
-
-For development with hot reload, run `npm run dev` and open `http://localhost:5173` instead.
+For development with hot reload, run `npm run dev` and open `http://localhost:5173` instead of port 4777.
 
 ## Configure your project
 
@@ -112,20 +168,19 @@ Lair is early software (0.x). The dashboard, the controls listed above and the f
 - **Kiro conventions** remain in a few defaults: a dragon without `adapter:` uses the `kiro` adapter; the queue parser finds non-kiro agent IDs only in the `by <agent-id>` position (or a `(<agent-id>, ...)` prefix), while `kiro-X` IDs are recognised anywhere in a line; and the command bar's `tell <dragon-id> ...` form needs an ID with a `-` (`@<dragon-id> ...` works for any ID). Dragon IDs themselves can be any letter-first name (see [Configuration](docs/configuration.md#dragons-agents)).
 - The design notes in [docs/design/](docs/design/) describe much more than is built.
 
-**Upgrade note: watchdog escalations moved to the Decision Inbox.** A watchdog escalation is now a decision in the Decisions view, and is **no longer appended to `inbox_file`**. If you set `watchdog.escalation_file`, it still gets a copy of every escalation as an `- OWNER? ...` entry. `inbox_file` gets one only when a decision can't be raised. See [Watchdog](docs/configuration.md#watchdog).
+Changes that need action when you upgrade are in [CHANGELOG.md](CHANGELOG.md).
 
 ## Security
 
-- The server binds to `127.0.0.1:4777` by default.
-- **There is no authentication.** Anyone who can reach the port can read your project data and, with controls enabled, run the configured commands.
-- The one exception is **answering decisions**: only a browser signed in as the owner can answer. Signing in needs the owner token in `data/owner.token` (created at first start, readable only by your OS user; the server prints a one-time setup link to its output). The browser keeps its session in the dashboard origin's storage and sends it in a header, never a cookie, so other programs, agents and other local apps included, can't approve the work a decision holds back. A program running as your OS user can read that file and the server's output: run agents as a separate OS user to close that gap. Signed-in browsers are listed in the Decisions view, where you can sign each out ([details](docs/configuration.md#decision-inbox)).
-- The server refuses (HTTP 403) cross-site browser requests, that is any `Origin` other than its own loopback origins on ports 4777 and 5173, and requests whose `Host` header names another host, which blocks DNS rebinding. WebSocket handshakes get the same `Origin` check. Clients without an `Origin` header (`curl`, lair-node) are allowed.
-- `LAIR_HOST` changes the bind address and adds that host to the allowed origins and `Host` headers, so a browser that opens `http://<LAIR_HOST>:4777` gets the full dashboard. A wildcard (`LAIR_HOST=0.0.0.0` or `::`) listens on every interface and switches the `Host` check off, but a wildcard is not an origin, so it adds none: a browser on another machine gets only the read-only GET requests, while its POSTs (every control) get HTTP 403 and its WebSocket is refused (no live updates). To use the dashboard from another machine, set `LAIR_HOST` to the address that machine's browser opens. **Either way this is unsafe on an untrusted network: never set `LAIR_HOST` to a network or wildcard address there.**
-- lair-node connections from other machines are refused unless the server has `LAIR_NODE_TOKEN` set and the node sends the same token. The connection is still unencrypted.
-- Controls are off by default (`read_only: true`) and run only commands from your config, as argument arrays. The legacy `ssh_cmd` machine setting and remote gate commands over SSH do go through a shell; see [SECURITY.md](SECURITY.md#command-execution-safety).
-- Lair never reads `.env` or credential files. SSH keys are paths in the config; Lair never stores key contents.
+In short: Lair listens on `127.0.0.1:4777` only, **has no authentication** (anyone who can reach the port can read your project data, and run the configured commands when controls are on), keeps controls off by default, and lets only a browser signed in as the owner answer decisions.
 
-See [SECURITY.md](SECURITY.md) for details and how to report a vulnerability privately.
+- The server binds to `127.0.0.1:4777` by default; `LAIR_HOST` changes the bind address. **Never set `LAIR_HOST` to a network or wildcard address on an untrusted network.**
+- Answering decisions needs the owner token in `data/owner.token` (created at first start, readable only by your OS user). Run agents as a separate OS user so they can't read it.
+- Cross-site browser requests and unexpected `Host` headers are refused (HTTP 403), which blocks DNS rebinding.
+- lair-node connections from other machines need `LAIR_NODE_TOKEN`; the connection is still unencrypted.
+- Controls run only commands from your config, as argument arrays. Lair never reads `.env` or credential files, and never stores SSH key contents.
+
+[SECURITY.md](SECURITY.md) has the details (remote hosts, command execution, the owner session) and how to report a vulnerability privately.
 
 ## Scripts
 
@@ -143,14 +198,11 @@ See [SECURITY.md](SECURITY.md) for details and how to report a vulnerability pri
 ## Documentation
 
 - [Getting Started](docs/getting-started.md): installation and first project setup
+- [Glossary](docs/glossary.md): the words Lair uses
 - [Configuration](docs/configuration.md): full reference for all config options
 - [Agents](docs/agents.md): connecting AI coding tools
 - [Architecture](docs/architecture.md): components and data flow
 - [Design notes](docs/design/): plans and feature designs (much of it not built yet)
-
-## Contributing
-
-Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, checks and the no-private-details rule, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ## License
 

@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="420" viewBox="0 0 1000 420" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+  <title>How Lair works: AI agents build in parallel; Lair supervises them, runs and triages the gates, reviews by risk tier and merges only on evidence</title>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <rect width="1000" height="420" rx="16" fill="#f8fafc"/>
+
+  <!-- agents -->
+  <rect x="30" y="120" width="190" height="170" rx="14" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
+  <text x="125" y="160" font-size="19" font-weight="700" fill="#0f172a" text-anchor="middle">Your AI agents</text>
+  <text x="125" y="188" font-size="15" fill="#475569" text-anchor="middle">any CLI agent,</text>
+  <text x="125" y="208" font-size="15" fill="#475569" text-anchor="middle">many in parallel</text>
+  <rect x="62" y="228" width="40" height="40" rx="8" fill="#e0e7ff"/>
+  <rect x="106" y="228" width="40" height="40" rx="8" fill="#e0e7ff"/>
+  <rect x="150" y="228" width="40" height="40" rx="8" fill="#e0e7ff"/>
+
+  <line x1="225" y1="205" x2="268" y2="205" stroke="#475569" stroke-width="3" marker-end="url(#a)"/>
+
+  <!-- lair -->
+  <rect x="275" y="40" width="530" height="340" rx="18" fill="#eef2ff" stroke="#6366f1" stroke-width="2"/>
+  <text x="300" y="78" font-size="24" font-weight="800" fill="#3730a3">Lair</text>
+  <text x="362" y="78" font-size="15" fill="#4338ca">self-hosted, open source</text>
+
+  <rect x="300" y="100" width="230" height="78" rx="12" fill="#ffffff" stroke="#c7d2fe"/>
+  <text x="315" y="130" font-size="17" font-weight="700" fill="#1e1b4b">1. Supervise the work</text>
+  <text x="315" y="155" font-size="14" fill="#475569">claims, recovery, budgets</text>
+
+  <rect x="550" y="100" width="230" height="78" rx="12" fill="#ffffff" stroke="#c7d2fe"/>
+  <text x="565" y="130" font-size="17" font-weight="700" fill="#1e1b4b">2. Run the gates</text>
+  <text x="565" y="155" font-size="14" fill="#475569">on the right machine</text>
+
+  <rect x="300" y="196" width="230" height="78" rx="12" fill="#ffffff" stroke="#c7d2fe"/>
+  <text x="315" y="226" font-size="17" font-weight="700" fill="#1e1b4b">3. Triage failures</text>
+  <text x="315" y="251" font-size="14" fill="#475569">infra, flaky or real</text>
+
+  <rect x="550" y="196" width="230" height="78" rx="12" fill="#ffffff" stroke="#c7d2fe"/>
+  <text x="565" y="226" font-size="17" font-weight="700" fill="#1e1b4b">4. Review by risk tier</text>
+  <text x="565" y="251" font-size="14" fill="#475569">agents or humans per rule</text>
+
+  <rect x="300" y="292" width="480" height="66" rx="12" fill="#fef3c7" stroke="#fcd34d"/>
+  <text x="315" y="320" font-size="17" font-weight="700" fill="#78350f">Decision Inbox</text>
+  <text x="315" y="343" font-size="14" fill="#92400e">asks you only what is yours to decide: spend, accounts, go / no-go</text>
+
+  <line x1="810" y1="205" x2="853" y2="205" stroke="#475569" stroke-width="3" marker-end="url(#a)"/>
+
+  <!-- merge -->
+  <rect x="860" y="120" width="115" height="170" rx="14" fill="#ecfdf5" stroke="#34d399" stroke-width="2"/>
+  <text x="917" y="175" font-size="18" font-weight="700" fill="#065f46" text-anchor="middle">Merge</text>
+  <text x="917" y="200" font-size="14" fill="#047857" text-anchor="middle">only on</text>
+  <text x="917" y="220" font-size="14" fill="#047857" text-anchor="middle">evidence</text>
+  <text x="917" y="255" font-size="26" fill="#059669" text-anchor="middle">✓</text>
+</svg>
