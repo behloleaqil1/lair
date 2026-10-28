@@ -58,13 +58,24 @@ const ITEM = /^ {0,3}([-*+]|\d{1,9}[.)])\s+(.*)$/;
 const QUOTE = /^ {0,3}>\s?(.*)$/;
 const ROUTE = /^#\/[A-Za-z0-9\-._~/?=&%:@]{0,300}$/;
 
+const char = (code: number) => String.fromCharCode(code);
+/**
+ * Control characters but newline and tab, the line and paragraph
+ * separators, and the bidirectional overrides and isolates (text that reads
+ * other than it is), built from their codes
+ */
+const INVISIBLE = new RegExp(
+  `[${char(0)}-${char(8)}${char(0x0b)}${char(0x0c)}${char(0x0e)}-${char(0x1f)}${char(0x7f)}` +
+    `${char(0x2028)}${char(0x2029)}${char(0x202a)}-${char(0x202e)}${char(0x2066)}-${char(0x2069)}]`,
+  "g",
+);
+
 /** Text without control characters (newlines and tabs stay), with \r\n as \n, cut to `max`. */
 export function plainText(text: string, max: number = MAX_MARKDOWN_CHARS): string {
   const out = text
     .slice(0, max + 1000)
     .replace(/\r\n?/g, "\n")
-    // eslint-disable-next-line no-control-regex
-    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f  ‪-‮⁦-⁩]/g, "");
+    .replace(INVISIBLE, "");
   return out.length > max ? out.slice(0, max) : out;
 }
 

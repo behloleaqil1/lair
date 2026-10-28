@@ -110,7 +110,8 @@ export function sanitizeEvidence(value: unknown): { ok: true; evidence: Evidence
     if (!isObject(item)) return { ok: false, error: `${at}: an object {tool, args, note}` };
     const unknown = Object.keys(item).find((k) => !["tool", "args", "note"].includes(k));
     if (unknown) return { ok: false, error: `${at}: unknown key ${redactText(unknown, 40)}` };
-    if (typeof item.tool !== "string" || !opsTool(item.tool)) {
+    const tool = item.tool;
+    if (typeof tool !== "string" || !opsTool(tool)) {
       return { ok: false, error: `${at}.tool: one of the ops tools (status.<module>, events.query, decisions.list, ...)` };
     }
     const args = item.args === undefined ? {} : item.args;
@@ -119,7 +120,7 @@ export function sanitizeEvidence(value: unknown): { ok: true; evidence: Evidence
     const note = item.note === undefined ? "" : item.note;
     if (typeof note !== "string" || note.length > MAX_NOTE) return { ok: false, error: `${at}.note: text of at most ${MAX_NOTE} characters` };
     evidence.push({
-      tool: item.tool,
+      tool,
       args: sanitize(args, { depth: 4, items: 20, keys: 20, text: 300 }) as Record<string, unknown>,
       note: redactSecrets(plainText(note, MAX_NOTE).replace(/\s+/g, " ").trim()),
     });

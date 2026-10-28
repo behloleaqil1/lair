@@ -31,7 +31,9 @@ import { FakeProcessTable, FakeSpawner, NoCommands, SharedClock, type SpawnCall 
 import { sanitizeAnswer, sanitizeEvidence } from "./answers.js";
 import { MAX_HISTORY_ANSWER } from "./chat-prompt.js";
 import { DEFAULT_PROMPT_PATH, localDate } from "./chat.js";
-import { parseSupervisorConfig } from "./config.js";
+import { parseSupervisorConfig, supervisorAgent } from "./config.js";
+import { agentRole, dragonAi } from "../ai/profiles.js";
+import { parse as parseYaml } from "yaml";
 import { RequestLatency, mountSupervisor, type SupervisorModule } from "./index.js";
 import type { OsMeasures } from "./measures.js";
 import { SupervisorStore } from "./store.js";
@@ -855,6 +857,21 @@ describe("the supervisor block and its store", () => {
     expect(errors({ digest: { time: "25:00" } })).toEqual(["supervisor.digest.time: a local time of day, HH:MM (24 hours)"]);
     expect(errors({ chat: { enabled: true, surprise: 1 } })[0]).toMatch(/^supervisor\.chat/);
     expect(errors({ agent: "sup", chat: { enabled: true }, prompt_file: "supervisor.md" })).toEqual([]);
+  });
+
+  it("loads the documented example: the supervisor agent on ai.roles.supervise's first profile", () => {
+    const doc = readFileSync(new URL("../../../docs/configuration.md", import.meta.url), "utf-8");
+    const section = doc.slice(doc.indexOf("## Supervisor chat and digest"));
+    const start = section.indexOf("```yaml") + "```yaml".length;
+    const example = parseYaml(section.slice(start, section.indexOf("```", start))) as Record<string, unknown>;
+    const config = project(example);
+    const parsed = parseSupervisorConfig(config.supervisor, config);
+    if (!parsed.ok) throw new Error(parsed.errors.join("; "));
+    expect(parsed.settings).toMatchObject({ agent: "lair-sup", chat: { enabled: true }, digest: { enabled: true, time: "08:00" } });
+    expect(supervisorAgent(config, parsed.settings)).toEqual({ agent: "lair-sup" });
+    expect(agentRole(config, "lair-sup")).toBe("supervise");
+    const own = (config.dragons as Record<string, Record<string, unknown>>)["lair-sup"];
+    expect(dragonAi(config, "lair-sup", own, {})).toEqual({ adapter: "kiro", model: "claude-opus-4.5", profile: "kiro-opus" });
   });
 
   it("migrates a version 1 store, keeping its audit", () => {
