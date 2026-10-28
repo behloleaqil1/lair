@@ -7,6 +7,7 @@
  */
 import { useApi } from "../hooks/useApi";
 import { SelfChecks } from "./SelfChecks";
+import { Badge } from "../ui/Badge";
 
 interface Props {
   project: string;
@@ -81,8 +82,6 @@ const OUTCOME_BADGE: Record<string, string> = {
   observed: "badge-neutral",
 };
 
-const muted = { color: "var(--text-secondary)", fontSize: "0.85rem" };
-
 function time(iso: string | undefined): string {
   return iso ? new Date(iso).toLocaleString() : "—";
 }
@@ -116,14 +115,14 @@ function WatchdogHealth({ project, refreshKey }: Props) {
   if (!s.enabled) {
     return (
       <div>
-        <h2 style={{ marginBottom: "1.5rem" }}>Watchdog</h2>
+        <h2 className="mb-6">Watchdog</h2>
         <div className="card">
           <p>
             The watchdog is off for this project. Set <code>watchdog.enabled: true</code> in its YAML;
             it starts in observe mode, which only detects and escalates.
           </p>
           {s.errors.map((e) => (
-            <p key={e} className="error" style={{ marginTop: "1rem" }}>
+            <p key={e} className="error spaced-lg">
               {e}
             </p>
           ))}
@@ -138,13 +137,13 @@ function WatchdogHealth({ project, refreshKey }: Props) {
 
   return (
     <div>
-      <div style={{ display: "flex", alignItems: "center", gap: "1rem", marginBottom: "1.5rem" }}>
+      <div className="section-head">
         <h2>Watchdog</h2>
         <span className={`badge ${acting ? "badge-warning" : "badge-neutral"}`}>
           {acting ? "Act" : "Observe"}
         </span>
-        {s.actBlocked && s.mode === "act" && <span style={muted}>Not acting: {s.actBlocked}</span>}
-        <span style={muted}>Last check: {time(s.lastTick?.at)}</span>
+        {s.actBlocked && s.mode === "act" && <span className="muted small">Not acting: {s.actBlocked}</span>}
+        <span className="muted small">Last check: {time(s.lastTick?.at)}</span>
       </div>
 
       {s.lastError && <div className="error">Last tick failed: {s.lastError}</div>}
@@ -167,15 +166,15 @@ function WatchdogHealth({ project, refreshKey }: Props) {
                   <code>{slo.detector}</code>
                 </td>
                 <td>
-                  <span className={`badge ${STATE_BADGE[slo.state] ?? "badge-neutral"}`}>{slo.state}</span>
+                  <Badge tone={STATE_BADGE[slo.state] ?? "badge-neutral"}>{slo.state}</Badge>
                 </td>
                 <td>{slo.openBreaches}</td>
-                <td style={muted}>{slo.detail}</td>
+                <td className="muted small">{slo.detail}</td>
               </tr>
             ))}
             {s.slos.length === 0 && (
               <tr>
-                <td colSpan={4} style={muted}>
+                <td colSpan={4} className="muted small">
                   No check has run yet
                 </td>
               </tr>
@@ -187,7 +186,7 @@ function WatchdogHealth({ project, refreshKey }: Props) {
       <div className="card">
         <h3>Open breaches ({open.length})</h3>
         {open.length === 0 ? (
-          <p style={muted}>None</p>
+          <p className="muted small">None</p>
         ) : (
           <table className="table">
             <thead>
@@ -201,19 +200,19 @@ function WatchdogHealth({ project, refreshKey }: Props) {
             <tbody>
               {open.map((b) => (
                 <tr key={b.id}>
-                  <td style={muted}>{time(b.detectedAt)}</td>
+                  <td className="muted small">{time(b.detectedAt)}</td>
                   <td>
                     <code>{b.detector}</code>
                   </td>
                   <td>
                     {b.summary}
-                    <ul style={{ ...muted, margin: "0.25rem 0 0 1rem" }}>
+                    <ul className="muted small sub-list">
                       {b.evidence.slice(0, 4).map((e, i) => (
                         <li key={i}>{e}</li>
                       ))}
                     </ul>
                   </td>
-                  <td style={muted}>{b.escalatedAt ? time(b.escalatedAt) : "no"}</td>
+                  <td className="muted small">{b.escalatedAt ? time(b.escalatedAt) : "no"}</td>
                 </tr>
               ))}
             </tbody>
@@ -224,7 +223,7 @@ function WatchdogHealth({ project, refreshKey }: Props) {
       <div className="card">
         <h3>Playbook runs</h3>
         {(runs.data ?? []).length === 0 ? (
-          <p style={muted}>None</p>
+          <p className="muted small">None</p>
         ) : (
           <table className="table">
             <thead>
@@ -238,19 +237,19 @@ function WatchdogHealth({ project, refreshKey }: Props) {
             <tbody>
               {(runs.data ?? []).slice(0, 25).map((run) => (
                 <tr key={run.id}>
-                  <td style={muted}>{time(run.startedAt)}</td>
+                  <td className="muted small">{time(run.startedAt)}</td>
                   <td>
                     <code>{run.playbookId}</code>
-                    {run.mode === "act" && <span style={muted}> #{run.attempt}</span>}
+                    {run.mode === "act" && <span className="muted small"> #{run.attempt}</span>}
                   </td>
                   <td>
                     <span className={`badge ${OUTCOME_BADGE[run.outcome ?? run.status] ?? "badge-neutral"}`}>
                       {run.outcome ?? run.status}
                     </span>
-                    {run.error && <div style={muted}>{run.error}</div>}
+                    {run.error && <div className="muted small">{run.error}</div>}
                   </td>
                   <td>
-                    <code style={{ fontSize: "0.8rem" }}>{commandOf(run)}</code>
+                    <code className="small">{commandOf(run)}</code>
                   </td>
                 </tr>
               ))}
@@ -266,12 +265,12 @@ function WatchdogHealth({ project, refreshKey }: Props) {
             <tbody>
               {resolved.map((b) => (
                 <tr key={b.id}>
-                  <td style={muted}>{time(b.resolvedAt)}</td>
+                  <td className="muted small">{time(b.resolvedAt)}</td>
                   <td>
                     <code>{b.detector}</code>
                   </td>
                   <td>{b.summary}</td>
-                  <td style={muted}>{b.resolution}</td>
+                  <td className="muted small">{b.resolution}</td>
                 </tr>
               ))}
             </tbody>

@@ -19,6 +19,12 @@ import type {
 } from "../../shared/delivery-types";
 import { needsConfirmation, needsReason, runDeliveryAction, type DeliveryAction } from "../delivery-api";
 import { SignInHint } from "./SignInHint";
+import { Badge } from "../ui/Badge";
+import { Button, type ButtonVariant } from "../ui/Button";
+import { Dialog } from "../ui/Dialog";
+import { Field, Input } from "../ui/Field";
+import { PageHeader } from "../ui/PageHeader";
+import { CodeBlock } from "../ui/CodeBlock";
 
 interface Props {
   project: string;
@@ -55,15 +61,14 @@ const ACTION_LABEL: Record<DeliveryAction, string> = {
   release: "Release",
 };
 
-const ACTION_COLOR: Record<DeliveryAction, string> = {
-  up: "var(--success)",
-  down: "var(--error)",
-  restart: "var(--warning)",
-  deploy: "var(--accent, var(--warning))",
-  release: "var(--text-secondary)",
+/** Each action's button: Down stops things, Up and Deploy are the main ones, Restart and Release the rest */
+const ACTION_VARIANT: Record<DeliveryAction, ButtonVariant> = {
+  up: "primary",
+  down: "danger",
+  restart: "secondary",
+  deploy: "primary",
+  release: "secondary",
 };
-
-const muted = { color: "var(--text-secondary)", fontSize: "0.85rem" };
 
 function time(iso: string | null | undefined): string {
   return iso ? new Date(iso).toLocaleString() : "—";
@@ -100,23 +105,9 @@ function ActionButton({
   onClick: () => void;
 }) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={disabled}
-      style={{
-        padding: "0.25rem 0.5rem",
-        borderRadius: "4px",
-        border: `1px solid ${ACTION_COLOR[action]}`,
-        background: "transparent",
-        color: ACTION_COLOR[action],
-        cursor: disabled ? "not-allowed" : "pointer",
-        fontSize: "0.85rem",
-        opacity: disabled ? 0.5 : 1,
-      }}
-    >
+    <Button size="sm" variant={ACTION_VARIANT[action]} onClick={onClick} disabled={disabled}>
       {ACTION_LABEL[action]}
-    </button>
+    </Button>
   );
 }
 
@@ -142,48 +133,37 @@ function ConfirmDialog({
   };
 
   return (
-    <>
-      <div className="overlay" onClick={onClose} />
-      <div className="detail-panel" style={{ maxWidth: "450px" }}>
-        <div className="detail-panel-header">
-          <h2>
-            {ACTION_LABEL[pending.action]} {targetLabel(pending)}?
-          </h2>
-          <button className="detail-panel-close" onClick={onClose}>
-            ×
-          </button>
-        </div>
-        <p style={{ ...muted, marginBottom: "1rem" }}>{warning(pending)}</p>
-        {needsReason(pending.action) && (
-          <label style={{ display: "block", marginBottom: "1rem" }}>
-            <span style={muted}>Reason (shown on the hold)</span>
-            <input
-              type="text"
-              value={reason}
-              maxLength={500}
-              onChange={(e) => setReason(e.target.value)}
-              placeholder="e.g. debugging the database by hand"
-              style={{ display: "block", width: "100%", marginTop: "0.25rem", padding: "0.4rem" }}
-            />
-          </label>
-        )}
-        {error && (
-          <p className="error" style={{ marginBottom: "1rem" }}>
-            {error}
-          </p>
-        )}
-        <div style={{ display: "flex", gap: "0.5rem", justifyContent: "flex-end" }}>
-          <button type="button" onClick={onClose} disabled={submitting}>
+    <Dialog
+      title={`${ACTION_LABEL[pending.action]} ${targetLabel(pending)}?`}
+      role="alertdialog"
+      size="sm"
+      onClose={onClose}
+      footer={
+        <>
+          <Button onClick={onClose} disabled={submitting}>
             Cancel
-          </button>
-          <ActionButton
-            action={pending.action}
-            disabled={submitting || reasonMissing}
-            onClick={() => void confirm()}
+          </Button>
+          <ActionButton action={pending.action} disabled={submitting || reasonMissing} onClick={() => void confirm()} />
+        </>
+      }
+    >
+      <p className="muted small section-intro">{warning(pending)}</p>
+      {needsReason(pending.action) && (
+        <Field label="Reason (shown on the hold)">
+          <Input
+            value={reason}
+            maxLength={500}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="e.g. debugging the database by hand"
           />
-        </div>
-      </div>
-    </>
+        </Field>
+      )}
+      {error && (
+        <p className="error" role="alert">
+          {error}
+        </p>
+      )}
+    </Dialog>
   );
 }
 
@@ -209,24 +189,18 @@ function ServiceRow({
         <code>{service.name}</code>
       </td>
       <td>
-        <span className={`badge ${STATE_BADGE[service.state]}`}>{service.state}</span>
+        <Badge tone={STATE_BADGE[service.state]}>{service.state}</Badge>
         {held && (
-          <span className="badge badge-neutral" style={{ marginLeft: "0.25rem" }}>
-            held
-          </span>
+          <Badge tone="neutral">held</Badge>
         )}
         {service.crashLoop && (
-          <span className="badge badge-error" style={{ marginLeft: "0.25rem" }}>
-            crash loop
-          </span>
+          <Badge tone="danger">crash loop</Badge>
         )}
         {service.behind && (
-          <span className="badge badge-warning" style={{ marginLeft: "0.25rem" }}>
-            behind
-          </span>
+          <Badge tone="warning">behind</Badge>
         )}
       </td>
-      <td style={muted}>
+      <td className="muted small">
         {service.healthDetail}
         {service.held && (
           <div>
@@ -247,14 +221,14 @@ function ServiceRow({
           </div>
         )}
         {service.lastErrorLines.length > 0 && (
-          <pre className="code" style={{ marginTop: "0.5rem", maxHeight: "160px", padding: "0.5rem" }}>
+          <CodeBlock label={`${service.name}: last errors`} maxHeight={160}>
             {service.lastErrorLines.join("\n")}
-          </pre>
+          </CodeBlock>
         )}
       </td>
       <td>{service.restartCount}</td>
       <td>
-        <div style={{ display: "flex", gap: "0.25rem", flexWrap: "wrap" }}>
+        <div className="row">
           {held ? (
             <ActionButton action="release" disabled={readOnly} onClick={() => onAction("release")} />
           ) : (
@@ -290,11 +264,11 @@ function EnvironmentCard({
   const locked = busy || readOnly || unreadable;
   return (
     <div className="card">
-      <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" }}>
-        <h3 style={{ margin: 0 }}>{env.environment}</h3>
-        <code style={muted}>{env.composeProject}</code>
-        <span style={muted}>Checked: {time(env.checkedAt)}</span>
-        <div style={{ display: "flex", gap: "0.25rem", marginLeft: "auto" }}>
+      <div className="env-head">
+        <h3>{env.environment}</h3>
+        <code className="muted small">{env.composeProject}</code>
+        <span className="muted small">Checked: {time(env.checkedAt)}</span>
+        <div className="row env-actions">
           {(["up", "restart", "down"] as const).map((action) => (
             <ActionButton
               key={action}
@@ -306,28 +280,28 @@ function EnvironmentCard({
         </div>
       </div>
       {env.error && (
-        <div className="error" style={{ marginTop: "0.75rem" }}>
+        <div className="error decision-error">
           Can't read the environment, so its state is unknown and Up, Restart and Deploy wait: {env.error}
         </div>
       )}
       {!env.error && env.checkedAt === null && (
-        <p style={{ ...muted, marginTop: "0.75rem" }}>Not read yet: Lair reads it every interval_seconds.</p>
+        <p className="muted small spaced">Not read yet: Lair reads it every interval_seconds.</p>
       )}
       {env.operation && (
-        <p style={{ ...muted, marginTop: "0.75rem" }}>
+        <p className="muted small spaced">
           Running: {env.operation.kind}
           {env.operation.services.length > 0 ? ` ${env.operation.services.join(", ")}` : ""} since{" "}
           {time(env.operation.startedAt)}
         </p>
       )}
       {env.autoDeploy.enabled && (
-        <p style={{ ...muted, marginTop: "0.5rem" }}>
+        <p className="muted small spaced-sm">
           Deploys after merges to <code>{env.autoDeploy.ref}</code>
           {env.autoDeploy.lastSha ? ` (last seen ${env.autoDeploy.lastSha.slice(0, 12)})` : ""}
           {env.autoDeploy.blocked ? `; not acting: ${env.autoDeploy.blocked}` : ""}
         </p>
       )}
-      <table className="table" style={{ marginTop: "0.75rem" }}>
+      <table className="table spaced">
         <thead>
           <tr>
             <th>Service</th>
@@ -403,14 +377,14 @@ export function Delivery({ project, refreshKey }: Props) {
   if (!s.enabled) {
     return (
       <div>
-        <h2 style={{ marginBottom: "1.5rem" }}>Delivery</h2>
+        <PageHeader title="Delivery" />
         <div className="card">
           <p>
             Delivery is off for this project. Add a <code>delivery:</code> block with an environment (a docker
             compose project) and <code>enabled: true</code> to its YAML.
           </p>
           {s.errors.map((e) => (
-            <p key={e} className="error" style={{ marginTop: "1rem" }}>
+            <p key={e} className="error spaced">
               {e}
             </p>
           ))}
@@ -421,14 +395,15 @@ export function Delivery({ project, refreshKey }: Props) {
 
   return (
     <div>
-      <div style={{ display: "flex", alignItems: "center", gap: "1rem", marginBottom: "1.5rem" }}>
-        <h2>Delivery</h2>
-        {s.readOnly && <span className="badge badge-neutral">Read-only: no actions</span>}
-      </div>
+      <PageHeader title="Delivery" status={s.readOnly ? <Badge tone="neutral">Read-only: no actions</Badge> : undefined} />
       {!s.readOnly && <SignInHint what="Bringing services up and down, deploying and releasing" refreshKey={refreshKey} />}
       {s.lastError && <div className="error">Last check failed: {s.lastError}</div>}
       {error && !pending && <div className="error">{error}</div>}
-      {notice && <p style={{ ...muted, marginBottom: "1rem" }}>{notice}</p>}
+      {notice && (
+        <p className="muted small section-intro" role="status">
+          {notice}
+        </p>
+      )}
 
       {s.environments.map((env) => (
         <EnvironmentCard key={env.environment} env={env} readOnly={s.readOnly} onAction={onAction} />
@@ -437,7 +412,7 @@ export function Delivery({ project, refreshKey }: Props) {
       <div className="card">
         <h3>Operations</h3>
         {(operations.data ?? []).length === 0 ? (
-          <p style={muted}>None</p>
+          <p className="muted small">None</p>
         ) : (
           <table className="table">
             <thead>
@@ -451,21 +426,21 @@ export function Delivery({ project, refreshKey }: Props) {
             <tbody>
               {(operations.data ?? []).slice(0, 20).map((op) => (
                 <tr key={op.id}>
-                  <td style={muted}>{time(op.startedAt)}</td>
+                  <td className="muted small">{time(op.startedAt)}</td>
                   <td>
                     <code>
                       {op.environment} {op.kind}
                       {op.services.length > 0 ? ` ${op.services.join(", ")}` : ""}
                     </code>
-                    <span style={muted}> by {op.requestedBy}</span>
-                    {op.sha && <span style={muted}> @ {op.sha.slice(0, 12)}</span>}
+                    <span className="muted small"> by {op.requestedBy}</span>
+                    {op.sha && <span className="muted small"> @ {op.sha.slice(0, 12)}</span>}
                   </td>
                   <td>
-                    <span className={`badge ${OPERATION_BADGE[op.status]}`}>{op.status}</span>
-                    {op.error && <div style={muted}>{op.error}</div>}
+                    <Badge tone={OPERATION_BADGE[op.status]}>{op.status}</Badge>
+                    {op.error && <div className="muted small">{op.error}</div>}
                   </td>
                   <td>
-                    <code style={{ fontSize: "0.8rem" }}>{stepLine(op)}</code>
+                    <code className="small">{stepLine(op)}</code>
                   </td>
                 </tr>
               ))}

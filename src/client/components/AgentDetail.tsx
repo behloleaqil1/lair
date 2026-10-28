@@ -26,7 +26,10 @@ import { DetailPanel, DetailSection } from "./DetailPanel";
 import { DragonStartDialog } from "./DragonStartDialog";
 import { DragonStopDialog } from "./DragonStopDialog";
 import { BudgetLines } from "./Budget";
-import { EmptyState, ErrorState, KeyValues, Loading, OwnerOnlyNotice, Time, muted, useOwnerSignedIn } from "./ui";
+import { EmptyState, ErrorState, KeyValues, Loading, OwnerOnlyNotice, Time, useOwnerSignedIn } from "./ui";
+import { Badge } from "../ui/Badge";
+import { Button, ButtonLink } from "../ui/Button";
+import { CodeBlock } from "../ui/CodeBlock";
 
 interface Props {
   id: string;
@@ -134,20 +137,20 @@ export function AgentDetailView({
     <DetailPanel
       title={
         <>
-          {model.name} <span style={muted}>({id})</span>
+          {model.name} <span className="muted small">({id})</span>
         </>
       }
       subtitle={
         <>
-          <span className={`badge ${model.badge}`}>{model.state}</span>{" "}
-          {model.stateDetail && <span style={muted}>{model.stateDetail}</span>}
-          {!model.managed && <span style={muted}> · run by the project&apos;s own launcher</span>}
+          <Badge tone={model.badge}>{model.state}</Badge>{" "}
+          {model.stateDetail && <span className="muted small">{model.stateDetail}</span>}
+          {!model.managed && <span className="muted small"> · run by the project&apos;s own launcher</span>}
         </>
       }
       onClose={onClose}
     >
       {message && (
-        <div className={message.ok ? "card" : "error"} role="status" style={message.ok ? muted : undefined}>
+        <div className={message.ok ? "card muted small" : "error"} role="status">
           {message.text}
         </div>
       )}
@@ -159,10 +162,10 @@ export function AgentDetailView({
             <code>{model.task}</code>
           </p>
         ) : (
-          <p style={muted}>No task right now.</p>
+          <p className="muted small">No task right now.</p>
         )}
         {model.description && <p>{model.description}</p>}
-        {model.instructions && <p style={{ ...muted, fontStyle: "italic" }}>Standing instructions: {model.instructions}</p>}
+        {model.instructions && <p className="muted small italic">Standing instructions: {model.instructions}</p>}
         <KeyValues
           rows={[
             ["Adapter", model.adapter],
@@ -175,14 +178,14 @@ export function AgentDetailView({
         {!readOnly && !model.managed && (
           <div className="button-row">
             {startable && !dragon?.running && (
-              <button type="button" className="small-button" disabled={signedIn !== true} onClick={() => setStarting(true)}>
+              <Button size="sm" disabled={signedIn !== true} onClick={() => setStarting(true)}>
                 Start
-              </button>
+              </Button>
             )}
             {dragon?.running && (
-              <button type="button" className="small-button danger" disabled={signedIn !== true} onClick={() => setStopping(true)}>
+              <Button size="sm" variant="danger" disabled={signedIn !== true} onClick={() => setStopping(true)}>
                 Stop
-              </button>
+              </Button>
             )}
           </div>
         )}
@@ -193,9 +196,9 @@ export function AgentDetailView({
           title="Current run"
           actions={
             owner && run?.active ? (
-              <button type="button" className="small-button" onClick={() => void act(freshSessionAction(project, run.id, id, run.task))}>
+              <Button size="sm" onClick={() => void act(freshSessionAction(project, run.id, id, run.task))}>
                 Fresh session
-              </button>
+              </Button>
             ) : undefined
           }
         >
@@ -207,7 +210,7 @@ export function AgentDetailView({
                   ["State", <span key="s" className={`badge ${run.badge}`}>{run.state}</span>],
                   ["Task", <code key="t">{run.task}</code>],
                   ["Model", `${run.adapter}${run.model ? ` / ${run.model}` : ""}`],
-                  ["Started", run.startedAt ? <Time iso={run.startedAt} /> : <span style={muted}>not yet (asked <Time iso={run.requestedAt} />)</span>],
+                  ["Started", run.startedAt ? <Time iso={run.startedAt} /> : <span className="muted small">not yet (asked <Time iso={run.requestedAt} />)</span>],
                   ["Ended", run.endedAt ? <Time iso={run.endedAt} /> : null],
                   ["Attempt", String(run.attempt)],
                   ["Session", run.session],
@@ -220,11 +223,11 @@ export function AgentDetailView({
               />
             </>
           ) : (
-            <p style={muted}>The agents module has not run it yet.</p>
+            <p className="muted small">The agents module has not run it yet.</p>
           )}
           <h4>Claims</h4>
           {model.claims.length === 0 ? (
-            <p style={muted}>None.</p>
+            <p className="muted small">None.</p>
           ) : (
             <ul className="plain-list">
               {model.claims.map((claim) => (
@@ -232,9 +235,9 @@ export function AgentDetailView({
                   <code>{claim.task}</code> by run {claim.runId.slice(0, 8)}, owner pid {claim.ownerPid}
                   {claim.ownerAlive === null ? "" : claim.ownerAlive ? " (alive)" : " (dead)"}, since <Time iso={claim.claimedAt} />{" "}
                   {owner && (
-                    <button type="button" className="small-button" onClick={() => void act(releaseClaimAction(project, claim.task, id))}>
+                    <Button size="sm" onClick={() => void act(releaseClaimAction(project, claim.task, id))}>
                       Release
-                    </button>
+                    </Button>
                   )}
                 </li>
               ))}
@@ -248,25 +251,24 @@ export function AgentDetailView({
           <ul className="plain-list">
             {model.holds.map((hold) => (
               <li key={hold.line}>
-                <span className={`badge ${hold.badge}`}>{hold.state}</span> <code>{hold.task ?? `line ${hold.line}`}</code>{" "}
-                <span style={muted}>{hold.detail}</span>{" "}
+                <Badge tone={hold.badge}>{hold.state}</Badge> <code>{hold.task ?? `line ${hold.line}`}</code>{" "}
+                <span className="muted small">{hold.detail}</span>{" "}
                 {hold.waiting && <span className="waiting">{hold.waiting} </span>}
                 {hold.decisionHref && (
                   <>
-                    <a href={hold.decisionHref} className="small-button" data-hold-decision="answer">
+                    <ButtonLink size="sm" href={hold.decisionHref} data-hold-decision="answer">
                       Answer it
-                    </a>{" "}
+                    </ButtonLink>{" "}
                   </>
                 )}
                 {hold.releasable && owner && (
-                  <button
-                    type="button"
-                    className="small-button"
+                  <Button
+                    size="sm"
                     onClick={() => releaseHold(hold)}
                     title={hold.hold === "paused" ? "Fill starts it again on its next check" : undefined}
                   >
                     {hold.hold === "paused" ? "Release (start it again)" : "Release"}
-                  </button>
+                  </Button>
                 )}
               </li>
             ))}
@@ -280,14 +282,14 @@ export function AgentDetailView({
             <tbody>
               {model.fill.map((item) => (
                 <tr key={item.line}>
-                  <td style={muted}>line {item.line}</td>
+                  <td className="muted small">line {item.line}</td>
                   <td>
                     {item.task ? <code>{item.task}</code> : "—"}
-                    {item.description && <div style={muted}>{item.description}</div>}
+                    {item.description && <div className="muted small">{item.description}</div>}
                   </td>
                   <td>
-                    <span className={`badge ${item.badge}`}>{item.state}</span>
-                    <div style={muted}>{item.detail}</div>
+                    <Badge tone={item.badge}>{item.state}</Badge>
+                    <div className="muted small">{item.detail}</div>
                     {item.waiting && <div className="waiting">{item.waiting}</div>}
                   </td>
                 </tr>
@@ -307,7 +309,7 @@ export function AgentDetailView({
         <DetailSection title="Recent runs">
           {runs.error && <ErrorState what="its runs" error={runs.error} />}
           {model.recentRuns.length === 0 ? (
-            <p style={muted}>{runs.loading ? "Loading…" : "No runs yet."}</p>
+            <p className="muted small">{runs.loading ? "Loading…" : "No runs yet."}</p>
           ) : (
             <table className="table">
               <thead>
@@ -328,10 +330,10 @@ export function AgentDetailView({
                       <code>{r.task}</code>
                     </td>
                     <td>
-                      <span className={`badge ${r.badge}`}>{r.state}</span>
-                      {r.exitCode !== null && <span style={muted}> exit {r.exitCode}</span>}
+                      <Badge tone={r.badge}>{r.state}</Badge>
+                      {r.exitCode !== null && <span className="muted small"> exit {r.exitCode}</span>}
                     </td>
-                    <td style={muted}>{r.model ?? r.adapter}</td>
+                    <td className="muted small">{r.model ?? r.adapter}</td>
                   </tr>
                 ))}
               </tbody>
@@ -368,7 +370,7 @@ export function AgentDetailView({
 
       <DetailSection title="Recent reports">
         {model.reports.length === 0 ? (
-          <p style={muted}>{queue.loading ? "Loading…" : "No reports in the queue file."}</p>
+          <p className="muted small">{queue.loading ? "Loading…" : "No reports in the queue file."}</p>
         ) : (
           <ul className="plain-list">
             {model.reports.map((line, i) => (
@@ -376,7 +378,7 @@ export function AgentDetailView({
                 <span className={`badge ${line.type === "DONE" ? "badge-success" : line.type === "BLOCKED" ? "badge-error" : line.type === "WAITING" ? "badge-warning" : "badge-neutral"}`}>
                   {line.type}
                 </span>{" "}
-                {line.timestamp && <span style={muted}>{line.timestamp} </span>}
+                {line.timestamp && <span className="muted small">{line.timestamp} </span>}
                 {line.task ?? line.message}
               </li>
             ))}
@@ -392,15 +394,15 @@ export function AgentDetailView({
         ) : !log.data ? (
           <Loading what="the log" />
         ) : !log.data.log ? (
-          <p style={muted}>No log yet: Lair looks for {id}.log or {id}-&lt;UTC time&gt;.log in the project&apos;s agents_dir.</p>
+          <p className="muted small">No log yet: Lair looks for {id}.log or {id}-&lt;UTC time&gt;.log in the project&apos;s agents_dir.</p>
         ) : (
           <>
-            <p style={muted}>
+            <p className="muted small">
               {log.data.log.file}, written <Time iso={log.data.log.modifiedAt} />
               {log.data.source === "run" ? " (the agents module's run)" : ""}
               {log.data.log.truncated ? `; the last ${log.data.log.lines.length} lines` : ""}
             </p>
-            <pre className="code">{log.data.log.lines.join("\n")}</pre>
+            <CodeBlock label="Run log">{log.data.log.lines.join("\n")}</CodeBlock>
           </>
         )}
       </DetailSection>

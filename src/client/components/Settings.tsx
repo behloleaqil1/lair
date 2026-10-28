@@ -27,11 +27,13 @@ import {
 } from "../settings-api";
 import { diffValues, generalErrors, setIn } from "../settings-form";
 import { SignInHint } from "./SignInHint";
-import { SettingsForm, inputStyle, smallButton } from "./SettingsForm";
+import { SettingsForm } from "./SettingsForm";
 import { SettingsHistory } from "./SettingsHistory";
 import { SettingsReview } from "./SettingsReview";
 import { ProjectWizard } from "./ProjectWizard";
 import { NotificationSettings } from "./NotificationSettings";
+import { Badge } from "../ui/Badge";
+import { Button } from "../ui/Button";
 
 interface Props {
   project: string;
@@ -39,14 +41,6 @@ interface Props {
 }
 
 type Tab = "form" | "yaml" | "history";
-
-const muted = { color: "var(--text-secondary)", fontSize: "0.85rem" };
-const tabButton = (active: boolean) => ({
-  ...smallButton,
-  fontSize: "0.9rem",
-  borderColor: active ? "var(--accent)" : "var(--border)",
-  color: active ? "var(--accent)" : "var(--text-primary)",
-});
 
 function applyChangesLocally(values: Record<string, unknown>, request: SaveRequest): Record<string, unknown> {
   let next: unknown = values;
@@ -123,9 +117,9 @@ export function Settings({ project, refreshKey }: Props) {
   if (signedIn !== true) {
     return (
       <div>
-        <h2 style={{ marginBottom: "1rem" }}>Settings</h2>
+        <h2 className="section-intro">Settings</h2>
         <SignInHint what="Reading and changing settings" refreshKey={refreshKey} onStatus={setSignedIn} />
-        {signedIn === null && <p style={muted}>Checking this browser's owner session...</p>}
+        {signedIn === null && <p className="muted small">Checking this browser's owner session...</p>}
       </div>
     );
   }
@@ -196,10 +190,10 @@ export function Settings({ project, refreshKey }: Props) {
 
   return (
     <div data-settings-view="">
-      <div style={{ display: "flex", alignItems: "center", gap: "1rem", marginBottom: "1rem", flexWrap: "wrap" }}>
+      <div className="row row-lg mb-4">
         <h2>Settings</h2>
         <select
-          style={{ ...inputStyle, width: "auto" }}
+          className="input" style={{ width: "auto" }}
           value={selected}
           onChange={(e) => {
             if (dirty && !window.confirm("Discard your unsaved changes?")) return;
@@ -214,11 +208,11 @@ export function Settings({ project, refreshKey }: Props) {
             </option>
           ))}
         </select>
-        <button style={smallButton} onClick={() => setCreating(true)}>
+        <Button size="sm" onClick={() => setCreating(true)}>
           New project
-        </button>
+        </Button>
         {view && (
-          <span style={muted}>
+          <span className="muted small">
             {view.file}
           </span>
         )}
@@ -239,16 +233,18 @@ export function Settings({ project, refreshKey }: Props) {
         />
       )}
 
-      {message && <p style={{ color: "var(--success)", margin: "0.5rem 0" }}>{message}</p>}
+      {message && <p className="text-success stack-sm">{message}</p>}
       {error && <p className="error">{error}</p>}
 
       {view && !creating && (
         <>
-          <div style={{ display: "flex", gap: "0.5rem", marginBottom: "1rem" }}>
+          <div className="segmented mb-4" role="group" aria-label="Settings view">
             {(["form", "yaml", "history"] as const).map((t) => (
               <button
                 key={t}
-                style={tabButton(tab === t)}
+                type="button"
+                className="mode-button"
+                aria-pressed={tab === t}
                 onClick={() => {
                   if (t !== tab && dirty && !window.confirm("Switching tabs drops the unsaved changes of this one. Go on?")) {
                     return;
@@ -265,7 +261,7 @@ export function Settings({ project, refreshKey }: Props) {
           </div>
 
           {!view.local && tab !== "history" && (
-            <div className="card" data-tracked-hint="" style={{ borderColor: "var(--warning)", marginBottom: "1rem" }}>
+            <div className="card card-warning mb-4" data-tracked-hint="">
               <strong>This file is tracked by git.</strong> <code>{view.file}</code> is in <code>projects/</code>, which
               git tracks in Lair's checkout: saving changes it there, and git shows the change. To keep this
               project's settings private, copy it to <code>projects/local/{view.id}.yaml</code> (git-ignored); Settings
@@ -274,7 +270,7 @@ export function Settings({ project, refreshKey }: Props) {
           )}
 
           {general.length > 0 && (
-            <div className="error" style={{ marginBottom: "1rem" }}>
+            <div className="error section-intro">
               {general.map((e, i) => (
                 <div key={i}>
                   {e.path ? <code>{e.path}</code> : "file"}: {e.message}
@@ -288,12 +284,12 @@ export function Settings({ project, refreshKey }: Props) {
               <p className="error">The file doesn't parse as YAML; fix it in the YAML tab.</p>
             ) : (
               <>
-                <div className="card" style={{ marginBottom: "1rem" }}>
+                <div className="card section-intro">
                   <strong>Secrets</strong>
-                  <p style={muted}>Never in the YAML: Lair reads them from data/ files and environment variables.</p>
+                  <p className="muted small">Never in the YAML: Lair reads them from data/ files and environment variables.</p>
                   {view.secrets.map((s) => (
-                    <div key={`${s.where}${s.label}`} style={muted}>
-                      <span className={`badge ${s.set ? "badge-success" : "badge-neutral"}`}>{s.set ? "set" : "not set"}</span>{" "}
+                    <div key={`${s.where}${s.label}`} className="muted small">
+                      <Badge tone={s.set ? "badge-success" : "badge-neutral"}>{s.set ? "set" : "not set"}</Badge>{" "}
                       {s.label}: <code>{s.where}</code>
                     </div>
                   ))}
@@ -313,7 +309,7 @@ export function Settings({ project, refreshKey }: Props) {
           {tab === "yaml" && (
             <textarea
               data-settings-yaml=""
-              style={{ ...inputStyle, fontFamily: "monospace", fontSize: "0.85rem", minHeight: "28rem" }}
+              className="input textarea mono" style={{ fontSize: "var(--text-sm)", minHeight: "28rem" }}
               value={yaml}
               spellCheck={false}
               onChange={(e) => {
@@ -335,12 +331,12 @@ export function Settings({ project, refreshKey }: Props) {
           )}
 
           {tab !== "history" && (
-            <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginTop: "1rem" }}>
-              <button style={smallButton} disabled={!dirty || busy} onClick={() => void runReview()}>
+            <div className="row mt-4">
+              <Button size="sm" disabled={!dirty || busy} onClick={() => void runReview()}>
                 Review changes{tab === "form" && changes.length > 0 ? ` (${changes.length})` : ""}
-              </button>
-              <button
-                style={smallButton}
+              </Button>
+              <Button
+                size="sm"
                 disabled={!dirty || busy}
                 onClick={() => {
                   setDraft(view.values ?? {});
@@ -349,8 +345,8 @@ export function Settings({ project, refreshKey }: Props) {
                 }}
               >
                 Discard
-              </button>
-              {!dirty && <span style={muted}>No unsaved changes</span>}
+              </Button>
+              {!dirty && <span className="muted small">No unsaved changes</span>}
             </div>
           )}
 

@@ -14,7 +14,7 @@
  * give). Answering works only once this browser is signed in as the owner
  * (UnlockAnswering, or the setup link the nav badge picks up; owner-session.ts).
  */
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import type { Decision, DecisionAuditEntry, DecisionCounts, DecisionOption } from "../../shared/decision-types";
 import {
   KIND_LABELS,
@@ -35,36 +35,9 @@ import { OwnerSessions } from "./OwnerSessions";
 import { DataTable, type Column } from "./DataTable";
 import { DetailPanel } from "./DetailPanel";
 import { Time } from "./ui";
-
-const muted = { color: "var(--text-secondary)", fontSize: "0.85rem" };
-
-const field = {
-  display: "block",
-  width: "100%",
-  marginTop: "0.25rem",
-  padding: "0.5rem",
-  borderRadius: "4px",
-  border: "1px solid var(--border)",
-  background: "var(--bg-primary)",
-  color: "var(--text-primary)",
-};
-
-const primaryButton = {
-  padding: "0.5rem 1rem",
-  borderRadius: "4px",
-  border: "none",
-  background: "var(--accent)",
-  color: "white",
-  cursor: "pointer",
-  whiteSpace: "nowrap" as const,
-};
-
-const secondaryButton = {
-  ...primaryButton,
-  border: "1px solid var(--border)",
-  background: "transparent",
-  color: "var(--text-primary)",
-};
+import { Badge } from "../ui/Badge";
+import { Button } from "../ui/Button";
+import { Icon } from "../ui/Icon";
 
 const KIND_BADGE: Record<string, string> = {
   spend: "badge-error",
@@ -110,19 +83,20 @@ export function DecisionCardView(p: DecisionCardViewProps) {
   const { decision } = p;
   const expiry = expiryText(decision, p.now);
   const recommended = decision.options.find((o) => o.id === decision.recommended.optionId);
+  const confirmId = useId();
   return (
     <div className="card" data-decision={decision.id}>
-      <div style={{ display: "flex", gap: "0.75rem", alignItems: "center", flexWrap: "wrap", marginBottom: "0.25rem" }}>
-        <span className={`badge ${KIND_BADGE[decision.kind] ?? "badge-neutral"}`}>{KIND_LABELS[decision.kind]}</span>
-        {isNoticeDecision(decision) && <span className="badge badge-neutral">FYI</span>}
-        <h3 style={{ margin: 0 }}>{decision.title}</h3>
+      <div className="decision-head">
+        <Badge tone={KIND_BADGE[decision.kind] ?? "badge-neutral"}>{KIND_LABELS[decision.kind]}</Badge>
+        {isNoticeDecision(decision) && <Badge tone="neutral">FYI</Badge>}
+        <h3 className="decision-title">{decision.title}</h3>
       </div>
       {isNoticeDecision(decision) && (
-        <div style={muted} data-attention="notice">
+        <div className="muted small" data-attention="notice">
           For your information: nothing waits on your answer. It goes away by itself once it no longer applies.
         </div>
       )}
-      <div style={muted}>
+      <div className="muted small">
         {decision.project} · raised by <code>{decision.source.module}</code> ({decision.source.ref}) ·{" "}
         {time(decision.createdAt)}
         {decision.raisedVia === "http" && (
@@ -130,46 +104,45 @@ export function DecisionCardView(p: DecisionCardViewProps) {
         )}
       </div>
       {expiry && (
-        <div style={{ ...muted, color: decision.overdue ? "var(--error)" : "var(--warning)" }}>{expiry}</div>
+        <div className={`small ${decision.overdue ? "text-danger" : "text-warning"}`}>{expiry}</div>
       )}
 
-      <p style={{ whiteSpace: "pre-wrap", margin: "0.75rem 0" }}>{decision.context}</p>
+      <p className="decision-context">{decision.context}</p>
       {/* Links are text to copy, never clickable: a decision's links come from whoever raised it */}
       {decision.links.length > 0 && (
-        <ul style={{ ...muted, margin: "0 0 0.75rem 1rem" }} data-links="text">
+        <ul className="muted small decision-links" data-links="text">
           {decision.links.map((link) => (
             <li key={link.url}>
               {link.label}: <code>{link.url}</code>{" "}
-              <button
-                type="button"
+              <Button
+                size="sm"
                 onClick={() => void navigator.clipboard?.writeText(link.url)}
-                style={{ ...secondaryButton, padding: "0.1rem 0.4rem", fontSize: "0.75rem" }}
                 title="Copy the address, then check it before you open it"
               >
                 Copy
-              </button>
+              </Button>
             </li>
           ))}
         </ul>
       )}
       {decision.blocks.length > 0 && (
-        <div style={muted}>
+        <div className="muted small">
           Waiting on this:{" "}
           {decision.blocks.map((ref) => (
-            <code key={ref} style={{ marginRight: "0.5rem" }}>
+            <code key={ref} className="decision-ref">
               {ref}
             </code>
           ))}
         </div>
       )}
-      <div style={{ margin: "0.75rem 0" }}>
+      <div className="decision-recommended">
         <strong>Recommended: {recommended?.label ?? decision.recommended.optionId}.</strong>{" "}
-        <span style={muted}>{decision.recommended.reasoning}</span>
+        <span className="muted small">{decision.recommended.reasoning}</span>
       </div>
 
       {decision.kind === "credentials" && (
-        <label style={{ display: "block", margin: "0.75rem 0" }}>
-          <span style={muted}>
+        <label className="label-stack">
+          <span className="muted small">
             Secret for <code>{decision.secretName}</code>. It goes to the secret store ({p.secretStore}) and is
             never shown again.
           </span>
@@ -179,40 +152,42 @@ export function DecisionCardView(p: DecisionCardViewProps) {
             name={`secret-${decision.id}`}
             onChange={(e) => p.onSecret(e.target.value)}
             disabled={p.submitting}
-            style={field}
+            className="input"
           />
         </label>
       )}
       {/* No note on credentials decisions: a secret could end up in it */}
       {decision.kind !== "credentials" && (
         <textarea
+          aria-label="Note"
           placeholder="Note (optional)"
           rows={2}
           onChange={(e) => p.onNote(e.target.value)}
           disabled={p.submitting}
-          style={field}
+          className="input textarea"
         />
       )}
 
       {p.stage === "confirm" && p.pending ? (
-        <div
-          className="card"
-          role="alertdialog"
-          style={{ marginTop: "0.75rem", borderColor: "var(--warning)", background: "rgba(255, 152, 0, 0.1)" }}
-        >
-          <p style={{ margin: 0, fontWeight: "bold", color: "var(--warning)" }}>Confirm your answer</p>
-          <p style={{ margin: "0.5rem 0" }}>{confirmationText(decision, p.pending)}</p>
-          <div style={{ display: "flex", gap: "0.5rem" }}>
-            <button type="button" onClick={p.onCancel} disabled={p.submitting} style={secondaryButton}>
-              Cancel
-            </button>
-            <button type="button" onClick={p.onConfirm} disabled={p.submitting} style={primaryButton}>
-              {p.submitting ? "Sending..." : `Confirm: ${p.pending.label}`}
-            </button>
+        <div className="callout callout-warning decision-confirm" role="alertdialog" aria-labelledby={confirmId}>
+          <Icon name="alert" className="callout-icon" />
+          <div className="callout-body">
+            <p id={confirmId} className="callout-title text-warning">
+              Confirm your answer
+            </p>
+            <p>{confirmationText(decision, p.pending)}</p>
+            <div className="button-row">
+              <Button onClick={p.onCancel} disabled={p.submitting}>
+                Cancel
+              </Button>
+              <Button variant="primary" onClick={p.onConfirm} disabled={p.submitting}>
+                {p.submitting ? "Sending..." : `Confirm: ${p.pending.label}`}
+              </Button>
+            </div>
           </div>
         </div>
       ) : (
-        <div style={{ display: "grid", gap: "0.5rem", marginTop: "0.75rem" }}>
+        <div className="decision-options">
           {decision.options.map((option) => {
             const isRecommended = option.id === decision.recommended.optionId;
             const needsSecret = option.suppliesSecret === true && !p.hasSecret;
@@ -222,18 +197,17 @@ export function DecisionCardView(p: DecisionCardViewProps) {
                 ? "Enter the secret first"
                 : undefined;
             return (
-              <div key={option.id} style={{ display: "flex", gap: "0.75rem", alignItems: "flex-start" }}>
-                <button
-                  type="button"
+              <div key={option.id} className="decision-option">
+                <Button
+                  variant={isRecommended ? "primary" : "secondary"}
                   onClick={() => p.onChoose(option)}
                   disabled={p.submitting || blockedBy !== undefined}
                   title={blockedBy}
-                  style={isRecommended ? primaryButton : secondaryButton}
                 >
                   {option.label}
                   {isRecommended ? " (recommended)" : ""}
-                </button>
-                <span style={muted}>
+                </Button>
+                <span className="muted small">
                   {option.consequences}
                   {decision.defaultOptionId === option.id ? " Applied if nobody answers before it expires." : ""}
                 </span>
@@ -243,7 +217,7 @@ export function DecisionCardView(p: DecisionCardViewProps) {
         </div>
       )}
       {p.error && (
-        <div className="error" style={{ marginTop: "0.75rem" }}>
+        <div className="error decision-error" role="alert">
           {p.error}
         </div>
       )}
@@ -352,14 +326,10 @@ function AuditToggle({ id }: { id: string }) {
   }, [id, open]);
 
   return (
-    <div style={{ marginTop: "0.5rem" }}>
-      <button
-        type="button"
-        onClick={() => setOpen(!open)}
-        style={{ ...secondaryButton, padding: "0.25rem 0.5rem", fontSize: "0.8rem" }}
-      >
+    <div className="decision-history">
+      <Button size="sm" variant="ghost" aria-expanded={open} onClick={() => setOpen(!open)}>
         {open ? "Hide history" : "History"}
-      </button>
+      </Button>
       {open && error && <div className="error">{error}</div>}
       {open && entries && <AuditList entries={entries} />}
     </div>
@@ -368,7 +338,7 @@ function AuditToggle({ id }: { id: string }) {
 
 export function AuditList({ entries }: { entries: DecisionAuditEntry[] }) {
   return (
-    <ul style={{ ...muted, margin: "0.5rem 0 0 1rem" }}>
+    <ul className="muted small decision-audit">
       {entries.map((entry, i) => (
         <li key={i}>
           {time(entry.at)} <code>{entry.action}</code> by {entry.actor}: {entry.detail}
@@ -400,9 +370,9 @@ export function UnlockAnswering({ onUnlock }: { onUnlock: (token: string) => Pro
     }
   };
   return (
-    <div className="card" data-unlock="answering" style={{ borderColor: "var(--warning)" }}>
+    <div className="card card-warning" data-unlock="answering">
       <h3>Unlock answering</h3>
-      <p style={muted}>
+      <p className="muted small">
         Only you answer decisions, so this browser has to sign in as the owner, once, with the owner token Lair keeps
         in <code>data/owner.token</code>. Open the setup link the server printed when it first started, or paste the
         token here.
@@ -418,18 +388,21 @@ export function UnlockAnswering({ onUnlock }: { onUnlock: (token: string) => Pro
         type="password"
         autoComplete="off"
         name="owner-token"
+        aria-label="Owner token"
         placeholder="Owner token"
         onChange={(e) => {
           token.current = e.target.value;
         }}
         disabled={busy}
-        style={field}
+        className="input"
       />
-      <button type="button" onClick={() => void unlock()} disabled={busy} style={{ ...primaryButton, marginTop: "0.5rem" }}>
-        {busy ? "Unlocking..." : "Unlock answering"}
-      </button>
+      <div className="button-row">
+        <Button variant="primary" onClick={() => void unlock()} disabled={busy}>
+          {busy ? "Unlocking..." : "Unlock answering"}
+        </Button>
+      </div>
       {error && (
-        <div className="error" style={{ marginTop: "0.5rem" }}>
+        <div className="error" role="alert">
           {error}
         </div>
       )}
@@ -442,7 +415,7 @@ const DECISION_COLUMNS: Column<Decision>[] = [
     key: "kind",
     label: "Kind",
     sort: (d) => KIND_LABELS[d.kind],
-    render: (d) => <span className={`badge ${KIND_BADGE[d.kind] ?? "badge-neutral"}`}>{KIND_LABELS[d.kind]}</span>,
+    render: (d) => <Badge tone={KIND_BADGE[d.kind] ?? "badge-neutral"}>{KIND_LABELS[d.kind]}</Badge>,
   },
   {
     key: "title",
@@ -451,7 +424,7 @@ const DECISION_COLUMNS: Column<Decision>[] = [
     render: (d) => (
       <>
         {d.title}
-        <div style={muted}>
+        <div className="muted small">
           {d.project} · {d.source.module}
         </div>
       </>
@@ -469,10 +442,10 @@ const DECISION_COLUMNS: Column<Decision>[] = [
             FYI
           </span>
         ) : (
-          <span className={`badge ${d.overdue ? "badge-error" : "badge-warning"}`}>{d.overdue ? "overdue" : "needs you"}</span>
+          <Badge tone={d.overdue ? "badge-error" : "badge-warning"}>{d.overdue ? "overdue" : "needs you"}</Badge>
         )
       ) : (
-        <span style={muted}>{outcomeText(d)}</span>
+        <span className="muted small">{outcomeText(d)}</span>
       ),
   },
 ];
@@ -498,8 +471,8 @@ export function DecisionDetail({
       title={decision.title}
       subtitle={
         <>
-          <span className={`badge ${KIND_BADGE[decision.kind] ?? "badge-neutral"}`}>{KIND_LABELS[decision.kind]}</span>{" "}
-          <span style={muted}>
+          <Badge tone={KIND_BADGE[decision.kind] ?? "badge-neutral"}>{KIND_LABELS[decision.kind]}</Badge>{" "}
+          <span className="muted small">
             {decision.status === "open" ? "open" : decision.status} · raised <Time iso={decision.createdAt} now={now} />
           </span>
         </>
@@ -510,11 +483,11 @@ export function DecisionDetail({
         <DecisionCard decision={decision} now={now} secretStore={secretStore} canAnswer={answering} onAnswered={onAnswered} />
       ) : (
         <div className="card" data-decision={decision.id}>
-          <div style={muted}>
+          <div className="muted small">
             {decision.project} · raised by <code>{decision.source.module}</code> ({decision.source.ref})
           </div>
-          <p style={{ whiteSpace: "pre-wrap", margin: "0.75rem 0" }}>{decision.context}</p>
-          <ul style={{ ...muted, margin: "0 0 0.75rem 1rem" }}>
+          <p className="decision-context">{decision.context}</p>
+          <ul className="muted small decision-links">
             {decision.options.map((o) => (
               <li key={o.id}>
                 <strong>{o.label}</strong>: {o.consequences}
@@ -524,13 +497,13 @@ export function DecisionDetail({
           <p>
             <strong>Outcome:</strong> {outcomeText(decision)}
             {decision.closedAt && (
-              <span style={muted}>
+              <span className="muted small">
                 {" "}
                 (<Time iso={decision.closedAt} now={now} />)
               </span>
             )}
           </p>
-          {decision.answer?.note && <p style={muted}>Note: {decision.answer.note}</p>}
+          {decision.answer?.note && <p className="muted small">Note: {decision.answer.note}</p>}
           <AuditToggle id={decision.id} />
         </div>
       )}
@@ -569,7 +542,7 @@ export function DecisionInboxView({
   const current = selected ? (decisions.find((d) => d.id === selected) ?? null) : null;
   return (
     <div>
-      <p style={{ ...muted, marginBottom: "1rem" }}>
+      <p className="muted small section-intro">
         {`Decisions (${action.length} ${action.length === 1 ? "needs" : "need"} you${notices.length > 0 ? `, ${notices.length} FYI` : ""})`}
         : only what Lair can&apos;t decide for you: pricing, legal,
         spend, accounts, credentials, go/no-go, holds only you can lift, and problems its playbooks couldn&apos;t fix. FYI
@@ -580,7 +553,7 @@ export function DecisionInboxView({
 
       {action.length === 0 && (
         <div className="card" data-empty="needs-you">
-          <p style={muted}>Nothing needs you.</p>
+          <p className="muted small">Nothing needs you.</p>
         </div>
       )}
 
@@ -592,7 +565,7 @@ export function DecisionInboxView({
           rowKey={(d) => d.id}
           onOpen={(d) => onOpen(d.id)}
           selected={selected}
-          empty={<p style={muted}>No decisions yet: modules raise them here when they need you.</p>}
+          empty={<p className="muted small">No decisions yet: modules raise them here when they need you.</p>}
         />
       </div>
 
@@ -608,7 +581,7 @@ export function DecisionInboxView({
       )}
       {selected && !current && (
         <DetailPanel title="Decision" onClose={() => onOpen(null)}>
-          <p style={muted}>
+          <p className="muted small">
             No decision <code>{selected}</code> in the latest {decisions.length}: it may be older, or the link may be wrong.
           </p>
         </DetailPanel>
@@ -623,11 +596,11 @@ export function DecisionCountBadge(counts: Pick<DecisionCounts, "open" | "overdu
   if (count <= 0) return null;
   return (
     <span
-      className={`badge ${overdue ? "badge-error" : "badge-warning"}`}
-      style={{ marginLeft: "0.4rem" }}
+      className={`badge count-badge ${overdue ? "badge-error" : "badge-warning"}`}
       title={`${count} ${count === 1 ? "thing needs" : "things need"} you${overdue ? `, ${counts.overdue} overdue` : ""}`}
     >
       {count}
+      <span className="visually-hidden"> need you</span>
     </span>
   );
 }

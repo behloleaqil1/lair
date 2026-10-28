@@ -4,26 +4,6 @@
  * ui/kit.css.
  */
 
-/* The names older views use, on the tokens; views moved onto the kit name the tokens themselves */
-:root {
-  --bg-primary: var(--color-bg);
-  --bg-secondary: var(--color-surface);
-  --bg-card: var(--color-surface);
-  --text-primary: var(--color-text);
-  --text-secondary: var(--color-text-muted);
-  --accent: var(--color-accent);
-  --success: var(--color-success);
-  --warning: var(--color-warning);
-  --error: var(--color-danger);
-  --border: var(--color-border);
-  --hover: var(--color-surface-hover);
-  --neutral-bg: var(--color-neutral-subtle);
-  --selected: var(--color-selected);
-  --link: var(--color-accent);
-  --text: var(--color-text);
-  --primary: var(--color-accent);
-}
-
 /* ============ The shell ============ */
 
 .app-shell {
@@ -616,14 +596,6 @@ a.tile:hover {
   margin-bottom: var(--space-5);
 }
 
-.section-title {
-  display: flex;
-  align-items: center;
-  gap: var(--space-4);
-  flex-wrap: wrap;
-  margin-bottom: var(--space-3);
-}
-
 .grid {
   display: grid;
   gap: var(--stack-gap);
@@ -820,115 +792,6 @@ span.error {
   text-decoration: underline;
 }
 
-/* Buttons of views not yet on the kit's Button */
-.small-button {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-  min-height: var(--control-height-sm);
-  padding: 0 var(--space-3);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-md);
-  background: var(--color-surface);
-  color: var(--color-text);
-  font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
-  text-decoration: none;
-  cursor: pointer;
-}
-
-.small-button:hover:not(:disabled) {
-  background: var(--color-surface-hover);
-}
-
-.small-button:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-}
-
-.small-button.primary {
-  background: var(--color-accent);
-  border-color: var(--color-accent);
-  color: var(--color-text-on-accent);
-}
-
-.small-button.danger {
-  border-color: var(--color-danger);
-  color: var(--color-danger);
-}
-
-.command-input {
-  min-height: var(--control-height);
-  padding: 0 var(--control-pad-x);
-  background: var(--color-surface);
-  color: var(--color-text);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-md);
-  font-size: var(--text-md);
-}
-
-.command-input:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-
-.command-input.block {
-  display: block;
-  width: 100%;
-  min-height: 3rem;
-  margin-bottom: var(--space-2);
-  padding: var(--space-2) var(--control-pad-x);
-}
-
-/* Side panels of views not yet on the kit's Drawer */
-.detail-panel {
-  position: fixed;
-  top: 0;
-  right: 0;
-  z-index: var(--z-drawer);
-  width: min(640px, 100%);
-  height: 100vh;
-  padding: var(--space-6);
-  overflow-y: auto;
-  background: var(--color-surface);
-  border-left: 1px solid var(--color-border);
-  box-shadow: var(--shadow-3);
-}
-
-.detail-panel:focus {
-  outline: none;
-}
-
-.detail-panel-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: var(--space-5);
-}
-
-.detail-panel-subtitle {
-  margin-top: var(--space-1);
-  font-size: var(--text-sm);
-}
-
-.detail-panel-close {
-  border: none;
-  background: transparent;
-  color: var(--color-text-muted);
-  font-size: var(--text-2xl);
-  cursor: pointer;
-}
-
-.detail-panel-close:hover {
-  color: var(--color-text);
-}
-
-.overlay {
-  position: fixed;
-  inset: 0;
-  z-index: calc(var(--z-drawer) - 1);
-  background: var(--color-scrim);
-}
 
 /* Owner messages */
 .inbox-list {
@@ -1156,4 +1019,165 @@ span.error {
 
 .home-heads {
   margin-top: var(--space-3);
+}
+
+/* Processes: a process's detail under its row */
+.process-detail {
+  padding: var(--space-4);
+  background: var(--color-surface-sunken);
+  border-top: 1px solid var(--color-border);
+}
+
+.process-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+.process-fact {
+  margin: 0 0 var(--space-2);
+  color: var(--color-text-muted);
+}
+
+.log-line {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.log-time {
+  margin-right: var(--space-2);
+}
+
+/* Decisions */
+.decision-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-1);
+}
+
+.decision-title {
+  margin: 0;
+}
+
+.decision-context {
+  margin: var(--space-3) 0;
+  white-space: pre-wrap;
+}
+
+.decision-links {
+  margin: 0 0 var(--space-3) var(--space-4);
+}
+
+.decision-ref {
+  margin-right: var(--space-2);
+}
+
+.decision-recommended {
+  margin: var(--space-3) 0;
+}
+
+.decision-confirm {
+  margin-top: var(--space-3);
+}
+
+.decision-options {
+  display: grid;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+
+.decision-option {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+
+.decision-error {
+  margin-top: var(--space-3);
+}
+
+.decision-history {
+  margin-top: var(--space-2);
+}
+
+.decision-audit {
+  margin: var(--space-2) 0 0 var(--space-4);
+}
+
+.section-intro {
+  margin-bottom: var(--space-4);
+}
+
+.card-warning {
+  border-color: var(--color-warning);
+}
+
+.count-badge {
+  min-width: 1.5rem;
+  justify-content: center;
+}
+
+/* Delivery */
+.env-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.env-head h3 {
+  margin: 0;
+}
+
+.env-actions {
+  margin-left: auto;
+}
+
+.spaced {
+  margin-top: var(--space-3);
+}
+
+.spaced-sm {
+  margin-top: var(--space-2);
+}
+
+/* A small group of toggle buttons (the command bar's modes, Settings' views) */
+.segmented {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--color-surface-sunken);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.truncate {
+  max-width: 400px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.measure {
+  max-width: 22rem;
+}
+
+.faded {
+  opacity: 0.55;
+}
+
+.warning-rail {
+  padding-left: var(--space-3);
+  border-left: 3px solid var(--color-warning);
+}
+
+.diff {
+  max-height: 24rem;
+}
+
+.diff-line {
+  white-space: pre;
 }

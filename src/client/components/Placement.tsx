@@ -8,7 +8,8 @@ import { useApi } from "../hooks/useApi";
 import { latestMoves, modeText, moveBadge } from "../placement-view";
 import type { PlacementMove, PlacementStatus } from "../../shared/placement-types";
 import { DataTable, type Column } from "./DataTable";
-import { Time, muted } from "./ui";
+import { Time } from "./ui";
+import { Badge } from "../ui/Badge";
 
 export function usePlacement(project: string, refreshKey: number, skip = false) {
   return useApi<PlacementStatus>("/placement/status", project, refreshKey, { skip });
@@ -20,16 +21,16 @@ const MOVE_COLUMNS: Column<PlacementMove>[] = [
     key: "status",
     label: "Status",
     sort: (m) => m.status,
-    render: (m) => <span className={`badge ${moveBadge(m)}`}>{m.status.replace("_", " ")}</span>,
+    render: (m) => <Badge tone={moveBadge(m)}>{m.status.replace("_", " ")}</Badge>,
   },
   { key: "gate", label: "Gate", sort: (m) => m.gateId, render: (m) => <code>{m.gateId}</code> },
   {
     key: "decision",
     label: "Decision",
     render: (m) => (
-      <span style={{ fontSize: "0.85rem" }}>
+      <span className="small">
         {m.explanation}
-        {m.error && <span style={{ display: "block", color: "var(--error)" }}>{m.error}</span>}
+        {m.error && <span className="text-danger block">{m.error}</span>}
       </span>
     ),
   },
@@ -40,7 +41,7 @@ export function PlacementMoves({ status, openGate }: { status: PlacementStatus |
   if (!status) return null;
   return (
     <div className="card">
-      <p style={muted}>
+      <p className="muted small">
         Mode: {modeText(status)}
         {status.lastTick && (
           <>
@@ -50,20 +51,20 @@ export function PlacementMoves({ status, openGate }: { status: PlacementStatus |
         )}
       </p>
       {status.errors.length > 0 && (
-        <ul style={{ color: "var(--error)", fontSize: "0.85rem" }}>
+        <ul className="text-danger small">
           {status.errors.map((e) => (
             <li key={e}>{e}</li>
           ))}
         </ul>
       )}
-      {status.lastError && <p style={{ color: "var(--error)", fontSize: "0.85rem" }}>{status.lastError}</p>}
+      {status.lastError && <p className="text-danger small">{status.lastError}</p>}
       <DataTable
         label="Placement moves"
         columns={MOVE_COLUMNS}
         rows={latestMoves(status, 50)}
         rowKey={(m) => m.id}
         onOpen={(m) => openGate(m.gateId)}
-        empty={<p style={muted}>No moves yet: placement moves (or, in observe mode, advises) a queued job when another lane would finish it sooner.</p>}
+        empty={<p className="muted small">No moves yet: placement moves (or, in observe mode, advises) a queued job when another lane would finish it sooner.</p>}
       />
     </div>
   );

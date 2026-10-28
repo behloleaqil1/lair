@@ -15,7 +15,10 @@ import { GATE_BADGE, TIER_BADGE, findingLocation, parseFindingLines, shortSha } 
 import { prDetail } from "../pr-view";
 import { linkTo } from "../router";
 import { DetailPanel, DetailSection } from "./DetailPanel";
-import { EmptyState, ErrorState, KeyValues, Loading, OwnerOnlyNotice, Time, muted, useOwnerSignedIn } from "./ui";
+import { EmptyState, ErrorState, KeyValues, Loading, OwnerOnlyNotice, Time, useOwnerSignedIn } from "./ui";
+import { Badge } from "../ui/Badge";
+import { Button } from "../ui/Button";
+import { Select } from "../ui/Select";
 
 interface Props {
   /** null: the URL's id is not a PR number */
@@ -31,7 +34,11 @@ interface Props {
 }
 
 function Flag({ ok }: { ok: boolean }) {
-  return <span className={`badge ${ok ? "badge-success" : "badge-error"}`}>{ok ? "✓" : "✗"}</span>;
+  return (
+    <Badge tone={ok ? "success" : "danger"}>
+      <span className="visually-hidden">{ok ? "yes" : "no"}</span>
+    </Badge>
+  );
 }
 
 export function PrDetail({ number, raw, project, refreshKey, reviewOn, readOnly, hostPr, onClose }: Props) {
@@ -110,9 +117,9 @@ export function PrDetail({ number, raw, project, refreshKey, reviewOn, readOnly,
       <DetailPanel title={`#${number}`} onClose={onClose}>
         {error ? <ErrorState what={`#${number}`} error={error} hint="The review module reads it from the git host; check its token, then Evaluate again." /> : <Loading what={`#${number} (the review module asks the git host)`} />}
         {error && (
-          <button type="button" className="small-button" onClick={refresh}>
+          <Button size="sm" onClick={refresh}>
             Evaluate again
-          </button>
+          </Button>
         )}
       </DetailPanel>
     );
@@ -147,20 +154,20 @@ export function PrDetail({ number, raw, project, refreshKey, reviewOn, readOnly,
       title={`#${status.number} ${status.title}`}
       subtitle={
         <>
-          <span className={`badge ${TIER_BADGE[model.tier]}`}>{model.tier}</span>{" "}
-          <span className={`badge ${status.canMerge ? "badge-success" : "badge-neutral"}`}>{status.canMerge ? "merge ready" : "waiting"}</span>{" "}
-          <span style={muted}>
+          <Badge tone={TIER_BADGE[model.tier]}>{model.tier}</Badge>{" "}
+          <Badge tone={status.canMerge ? "badge-success" : "badge-neutral"}>{status.canMerge ? "merge ready" : "waiting"}</Badge>{" "}
+          <span className="muted small">
             evaluated <Time iso={status.evaluatedAt} />
           </span>{" "}
-          <button type="button" className="small-button" onClick={refresh} disabled={busy}>
+          <Button size="sm" onClick={refresh} disabled={busy}>
             Evaluate again
-          </button>
+          </Button>
         </>
       }
       onClose={onClose}
     >
       {message && (
-        <div className={message.ok ? "card" : "error"} role="status" style={message.ok ? { color: "var(--success)" } : { whiteSpace: "pre-wrap" }}>
+        <div className={message.ok ? "card text-success" : "error pre-wrap"} role="status">
           {message.text}
         </div>
       )}
@@ -179,7 +186,7 @@ export function PrDetail({ number, raw, project, refreshKey, reviewOn, readOnly,
 
       <DetailSection title="Risk tier">
         {model.rules.length === 0 ? (
-          <p style={muted}>No rule matched: the default tier ({status.risk.defaultTier}) applies.</p>
+          <p className="muted small">No rule matched: the default tier ({status.risk.defaultTier}) applies.</p>
         ) : (
           <table className="table">
             <tbody>
@@ -187,12 +194,12 @@ export function PrDetail({ number, raw, project, refreshKey, reviewOn, readOnly,
                 <tr key={r.id}>
                   <td>
                     <code>{r.id}</code>
-                    {r.description && <div style={muted}>{r.description}</div>}
+                    {r.description && <div className="muted small">{r.description}</div>}
                   </td>
                   <td>
-                    <span className={`badge ${TIER_BADGE[r.tier]}`}>{r.tier}</span>
+                    <Badge tone={TIER_BADGE[r.tier]}>{r.tier}</Badge>
                   </td>
-                  <td style={{ fontSize: "0.85rem" }}>{r.reasons.join("; ")}</td>
+                  <td className="small">{r.reasons.join("; ")}</td>
                 </tr>
               ))}
             </tbody>
@@ -204,14 +211,14 @@ export function PrDetail({ number, raw, project, refreshKey, reviewOn, readOnly,
         title="Required reviews"
         actions={
           owner && !model.reviewsComplete ? (
-            <button type="button" className="small-button" disabled={busy} onClick={() => void act("Request reviews", () => requestReviews(project, status.number))}>
+            <Button size="sm" disabled={busy} onClick={() => void act("Request reviews", () => requestReviews(project, status.number))}>
               Request missing reviews
-            </button>
+            </Button>
           ) : undefined
         }
       >
         {model.slots.length === 0 ? (
-          <p style={muted}>None required for the {model.tier} tier.</p>
+          <p className="muted small">None required for the {model.tier} tier.</p>
         ) : (
           <table className="table">
             <thead>
@@ -226,17 +233,17 @@ export function PrDetail({ number, raw, project, refreshKey, reviewOn, readOnly,
                 <tr key={i}>
                   <td>
                     <Flag ok={s.filled} /> {s.label}
-                    <div style={muted}>{s.detail}</div>
+                    <div className="muted small">{s.detail}</div>
                   </td>
-                  <td>{s.holder ?? <span style={muted}>nobody yet</span>}</td>
-                  <td style={{ fontSize: "0.85rem" }}>
+                  <td>{s.holder ?? <span className="muted small">nobody yet</span>}</td>
+                  <td className="small">
                     {s.request ? (
                       <>
-                        <span className={`badge ${s.request.badge}`}>{s.request.text}</span>
-                        <div style={muted}>{s.request.detail}</div>
+                        <Badge tone={s.request.badge}>{s.request.text}</Badge>
+                        <div className="muted small">{s.request.detail}</div>
                       </>
                     ) : (
-                      <span style={muted}>not requested</span>
+                      <span className="muted small">not requested</span>
                     )}
                   </td>
                 </tr>
@@ -245,7 +252,7 @@ export function PrDetail({ number, raw, project, refreshKey, reviewOn, readOnly,
           </table>
         )}
         {status.reviews.length > 0 && (
-          <table className="table" style={{ marginTop: "0.75rem" }}>
+          <table className="table spaced">
             <thead>
               <tr>
                 <th>Review</th>
@@ -255,10 +262,10 @@ export function PrDetail({ number, raw, project, refreshKey, reviewOn, readOnly,
             </thead>
             <tbody>
               {status.reviews.map((r) => (
-                <tr key={r.id} style={r.stale || r.superseded ? { opacity: 0.55 } : undefined}>
+                <tr key={r.id} className={r.stale || r.superseded ? "faded" : undefined}>
                   <td>
-                    {r.reviewer.id} <span style={muted}>({r.reviewer.kind}{r.reviewer.model ? `, ${r.reviewer.model}` : ""})</span>
-                    <div style={muted}>
+                    {r.reviewer.id} <span className="muted small">({r.reviewer.kind}{r.reviewer.model ? `, ${r.reviewer.model}` : ""})</span>
+                    <div className="muted small">
                       at <code>{shortSha(r.headSha)}</code>, <Time iso={r.createdAt} />
                       {r.stale ? " · stale" : ""}
                       {r.superseded ? " · replaced" : ""}
@@ -269,7 +276,7 @@ export function PrDetail({ number, raw, project, refreshKey, reviewOn, readOnly,
                       {r.verdict === "approve" ? "approve" : "request changes"}
                     </span>
                   </td>
-                  <td style={{ fontSize: "0.85rem" }}>{r.summary}</td>
+                  <td className="small">{r.summary}</td>
                 </tr>
               ))}
             </tbody>
@@ -279,21 +286,21 @@ export function PrDetail({ number, raw, project, refreshKey, reviewOn, readOnly,
 
       <DetailSection title={`Findings (${model.openFindings.length} open, ${model.blockingFindings} blocking)`}>
         {status.findings.length === 0 ? (
-          <p style={muted}>No findings.</p>
+          <p className="muted small">No findings.</p>
         ) : (
           <table className="table">
             <tbody>
               {status.findings.map((f) => (
-                <tr key={f.id} style={f.superseded || f.status !== "open" ? { opacity: 0.55 } : undefined}>
+                <tr key={f.id} className={f.superseded || f.status !== "open" ? "faded" : undefined}>
                   <td>
                     <span className={`badge ${f.severity === "critical" || f.severity === "high" ? "badge-error" : f.severity === "medium" ? "badge-warning" : "badge-neutral"}`}>
                       {f.severity}
                     </span>
-                    {f.blocking && <div style={muted}>blocking</div>}
+                    {f.blocking && <div className="muted small">blocking</div>}
                   </td>
-                  <td style={{ fontSize: "0.85rem" }}>
+                  <td className="small">
                     <code>{findingLocation(f)}</code> {f.text}
-                    <div style={muted}>
+                    <div className="muted small">
                       {f.reviewer.id}
                       {f.rule ? ` · ${f.rule}` : ""} · {f.superseded ? "replaced" : f.status}
                       {f.resolution ? ` · ${f.resolution}` : ""}
@@ -301,9 +308,9 @@ export function PrDetail({ number, raw, project, refreshKey, reviewOn, readOnly,
                   </td>
                   <td>
                     {owner && f.status === "open" && !f.superseded && (
-                      <button type="button" className="small-button" disabled={busy} onClick={() => resolve(f)}>
+                      <Button size="sm" disabled={busy} onClick={() => resolve(f)}>
                         Resolve
-                      </button>
+                      </Button>
                     )}
                   </td>
                 </tr>
@@ -322,9 +329,9 @@ export function PrDetail({ number, raw, project, refreshKey, reviewOn, readOnly,
                   <code>{g.name}</code>
                 </td>
                 <td>
-                  <span className={`badge ${GATE_BADGE[g.status]}`}>{g.status}</span>
+                  <Badge tone={GATE_BADGE[g.status]}>{g.status}</Badge>
                 </td>
-                <td style={{ fontSize: "0.85rem" }}>
+                <td className="small">
                   {g.url ? (
                     <a href={g.url} target="_blank" rel="noreferrer">
                       {g.detail}
@@ -344,11 +351,11 @@ export function PrDetail({ number, raw, project, refreshKey, reviewOn, readOnly,
           <ul className="plain-list">
             {model.holds.map((h) => (
               <li key={h.id}>
-                {h.reason} <span style={muted}>({h.pr === null ? "every PR" : `PR #${h.pr}`}, by {h.createdBy}, <Time iso={h.createdAt} />)</span>{" "}
+                {h.reason} <span className="muted small">({h.pr === null ? "every PR" : `PR #${h.pr}`}, by {h.createdBy}, <Time iso={h.createdAt} />)</span>{" "}
                 {owner && (
-                  <button type="button" className="small-button" disabled={busy} onClick={() => release(h)}>
+                  <Button size="sm" disabled={busy} onClick={() => release(h)}>
                     Release
-                  </button>
+                  </Button>
                 )}
               </li>
             ))}
@@ -365,17 +372,17 @@ export function PrDetail({ number, raw, project, refreshKey, reviewOn, readOnly,
                   <Flag ok={c.ok} />
                 </td>
                 <td>{c.label}</td>
-                <td style={{ fontSize: "0.85rem" }}>{c.detail}</td>
+                <td className="small">{c.detail}</td>
               </tr>
             ))}
           </tbody>
         </table>
-        <p style={muted}>
+        <p className="muted small">
           Method: {status.plan.method} ({status.plan.strategy}): {status.plan.reason}
         </p>
-        {status.plan.refusal && <p style={{ color: "var(--error)", fontSize: "0.85rem" }}>{status.plan.refusal}</p>}
+        {status.plan.refusal && <p className="text-danger small">{status.plan.refusal}</p>}
         {status.plan.warnings.map((w) => (
-          <p key={w} style={{ color: "var(--warning)", fontSize: "0.85rem" }}>
+          <p key={w} className="text-warning small">
             {w}
           </p>
         ))}
@@ -386,27 +393,27 @@ export function PrDetail({ number, raw, project, refreshKey, reviewOn, readOnly,
               Lair checks the policy and every published commit&apos;s emails again first.
             </p>
             <div className="button-row">
-              <button type="button" className="small-button" onClick={() => setConfirming(false)}>
+              <Button size="sm" onClick={() => setConfirming(false)}>
                 Cancel
-              </button>
-              <button type="button" className="small-button danger" disabled={busy} onClick={merge}>
+              </Button>
+              <Button size="sm" variant="danger" disabled={busy} onClick={merge}>
                 Merge
-              </button>
+              </Button>
             </div>
           </div>
         ) : (
-          <button
-            type="button"
-            className="small-button primary"
+          <Button
+            size="sm"
+            variant="primary"
             disabled={!model.merge.enabled || !owner}
             title={model.merge.reasons.join("\n") || (owner ? undefined : "Sign in as the owner from Decisions first")}
             onClick={() => setConfirming(true)}
           >
             {model.merge.label}
-          </button>
+          </Button>
         )}
         {model.merge.reasons.length > 0 && (
-          <ul style={{ ...muted, marginTop: "0.5rem" }}>
+          <ul className="muted small mt-2">
             {model.merge.reasons.map((r) => (
               <li key={r}>{r}</li>
             ))}
@@ -416,27 +423,27 @@ export function PrDetail({ number, raw, project, refreshKey, reviewOn, readOnly,
 
       {owner && (
         <DetailSection title="Your review">
-          <p style={muted}>
+          <p className="muted small">
             Binds to head <code>{shortSha(status.headSha)}</code>: a new push makes it stale.
           </p>
           <div className="button-row">
-            <input className="command-input" value={reviewer} onChange={(e) => setReviewer(e.target.value)} placeholder="Your name" aria-label="Reviewer name" />
-            <select className="project-select" value={verdict} onChange={(e) => setVerdict(e.target.value as "approve" | "request_changes")} aria-label="Verdict">
+            <input className="input" value={reviewer} onChange={(e) => setReviewer(e.target.value)} placeholder="Your name" aria-label="Reviewer name" />
+            <Select value={verdict} onChange={(e) => setVerdict(e.target.value as "approve" | "request_changes")} aria-label="Verdict">
               <option value="approve">Approve</option>
               <option value="request_changes">Request changes</option>
-            </select>
+            </Select>
           </div>
-          <textarea className="command-input block" value={summary} onChange={(e) => setSummary(e.target.value)} placeholder="Summary" aria-label="Summary" />
+          <textarea className="input textarea" value={summary} onChange={(e) => setSummary(e.target.value)} placeholder="Summary" aria-label="Summary" />
           <textarea
-            className="command-input block"
+            className="input textarea"
             value={findingText}
             onChange={(e) => setFindingText(e.target.value)}
             placeholder={"Findings, one per line: path/to/file.ts:42: what is wrong\n(blocking when you request changes)"}
             aria-label="Findings"
           />
-          <button type="button" className="small-button" disabled={busy || !reviewer} onClick={submitReview}>
+          <Button size="sm" disabled={busy || !reviewer} onClick={submitReview}>
             Submit review
-          </button>
+          </Button>
         </DetailSection>
       )}
     </DetailPanel>

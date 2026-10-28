@@ -10,6 +10,10 @@ import { useState, useEffect } from "react";
 import { useApi } from "../hooks/useApi";
 import { processAction } from "../owner-actions";
 import { SignInHint } from "./SignInHint";
+import { Badge, StatusBadge } from "../ui/Badge";
+import { Button } from "../ui/Button";
+import { Callout } from "../ui/Card";
+import { PageHeader } from "../ui/PageHeader";
 import type {
   ProcessState,
   ProcessListResponse,
@@ -29,15 +33,6 @@ const STATUS_BADGE_CLASS: Record<ProcessStatus, string> = {
   stopping: "badge-warning",
   failed: "badge-error",
   unhealthy: "badge-error",
-};
-
-const STATUS_ICONS: Record<ProcessStatus, string> = {
-  running: "▶",
-  stopped: "■",
-  starting: "⟳",
-  stopping: "⏳",
-  failed: "✗",
-  unhealthy: "⚠",
 };
 
 export function Processes({ project, refreshKey }: Props) {
@@ -102,51 +97,29 @@ export function Processes({ project, refreshKey }: Props) {
 
   return (
     <div>
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          marginBottom: "1.5rem",
-        }}
-      >
-        <div style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
-          <h2>Processes ({processes.length})</h2>
-          <span
-            className="badge badge-neutral"
-            style={{ fontSize: "0.7rem" }}
-            title="Polling mode - refresh interval 10s"
-          >
-            📡 Polling
-          </span>
-        </div>
-        <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
-          <span
-            className={`badge ${supervisorRunning ? "badge-success" : "badge-error"}`}
-          >
-            Supervisor: {supervisorRunning ? "Running" : "Stopped"}
-          </span>
-        </div>
-      </div>
+      <PageHeader
+        title={`Processes (${processes.length})`}
+        status={
+          <Badge tone="info" title="Polling mode - refresh interval 10s">
+            Polling
+          </Badge>
+        }
+        actions={
+          <Badge tone={supervisorRunning ? "success" : "danger"}>Supervisor: {supervisorRunning ? "Running" : "Stopped"}</Badge>
+        }
+      />
 
       {!controlsReadOnly && <SignInHint what="Starting, stopping and restarting processes" refreshKey={refreshKey} />}
 
       {actionError && (
-        <div
-          className="card"
-          style={{
-            background: "rgba(239, 68, 68, 0.1)",
-            borderColor: "var(--error)",
-            marginBottom: "1rem",
-          }}
-        >
-          <p style={{ color: "var(--error)", margin: 0 }}>{actionError}</p>
-        </div>
+        <Callout tone="danger" alert>
+          {actionError}
+        </Callout>
       )}
 
       {processes.length === 0 ? (
         <div className="card">
-          <p style={{ color: "var(--text-secondary)" }}>
+          <p className="muted">
             No processes configured. Add a <code>processes</code> section to
             your project YAML to manage background processes.
           </p>
@@ -170,30 +143,16 @@ export function Processes({ project, refreshKey }: Props) {
                 <>
                   <tr
                     key={proc.id}
-                    className="clickable"
+                    className={`clickable${expandedProcess === proc.id ? " selected" : ""}`}
                     onClick={() => toggleExpand(proc.id)}
-                    style={
-                      expandedProcess === proc.id
-                        ? { background: "rgba(233, 69, 96, 0.1)" }
-                        : {}
-                    }
                   >
                     <td>
-                      <span
-                        className={`badge ${STATUS_BADGE_CLASS[proc.status]}`}
-                      >
-                        {STATUS_ICONS[proc.status]} {proc.status}
-                      </span>
+                      <Badge tone={STATUS_BADGE_CLASS[proc.status]}>{proc.status}</Badge>
                     </td>
                     <td>
                       <strong>{proc.name}</strong>
                       <br />
-                      <code
-                        style={{
-                          fontSize: "0.8rem",
-                          color: "var(--text-secondary)",
-                        }}
-                      >
+                      <code className="muted small">
                         {proc.id}
                       </code>
                     </td>
@@ -201,7 +160,7 @@ export function Processes({ project, refreshKey }: Props) {
                       {proc.pid ? (
                         <code>{proc.pid}</code>
                       ) : (
-                        <span style={{ color: "var(--text-secondary)" }}>
+                        <span className="muted">
                           -
                         </span>
                       )}
@@ -211,118 +170,61 @@ export function Processes({ project, refreshKey }: Props) {
                       proc.metrics.uptimeMs > 0 ? (
                         formatUptime(proc.metrics.uptimeMs)
                       ) : (
-                        <span style={{ color: "var(--text-secondary)" }}>
+                        <span className="muted">
                           -
                         </span>
                       )}
                     </td>
                     <td>
                       {proc.restartCount > 0 ? (
-                        <span
-                          style={{
-                            color:
-                              proc.restartCount > 5
-                                ? "var(--error)"
-                                : "var(--text-secondary)",
-                          }}
-                        >
+                        <span className={proc.restartCount > 5 ? "text-danger" : "muted"}>
                           {proc.restartCount}
                         </span>
                       ) : (
-                        <span style={{ color: "var(--text-secondary)" }}>
+                        <span className="muted">
                           0
                         </span>
                       )}
                     </td>
                     <td>
                       {proc.config.healthCheck ? (
-                        <span
-                          className={`badge ${proc.healthy ? "badge-success" : "badge-error"}`}
-                        >
-                          {proc.healthy ? "✓" : "✗"}
-                        </span>
+                        <StatusBadge status={proc.healthy ? "ok" : "failing"} />
                       ) : (
-                        <span style={{ color: "var(--text-secondary)" }}>
+                        <span className="muted">
                           -
                         </span>
                       )}
                     </td>
                     {!controlsReadOnly && (
                       <td onClick={(e) => e.stopPropagation()}>
-                        <div style={{ display: "flex", gap: "0.25rem" }}>
+                        <div className="row">
                           {proc.status === "running" ? (
                             <>
-                              <button
+                              <Button
+                                size="sm"
+                                variant="danger"
                                 onClick={() => handleAction(proc.id, "stop")}
                                 disabled={actionLoading === `${proc.id}-stop`}
-                                style={{
-                                  padding: "0.25rem 0.5rem",
-                                  borderRadius: "4px",
-                                  border: "none",
-                                  background: "var(--error)",
-                                  color: "white",
-                                  cursor: "pointer",
-                                  fontSize: "0.85rem",
-                                  opacity:
-                                    actionLoading === `${proc.id}-stop`
-                                      ? 0.6
-                                      : 1,
-                                }}
                               >
-                                {actionLoading === `${proc.id}-stop`
-                                  ? "..."
-                                  : "Stop"}
-                              </button>
-                              <button
+                                {actionLoading === `${proc.id}-stop` ? "..." : "Stop"}
+                              </Button>
+                              <Button
+                                size="sm"
                                 onClick={() => handleAction(proc.id, "restart")}
-                                disabled={
-                                  actionLoading === `${proc.id}-restart`
-                                }
-                                style={{
-                                  padding: "0.25rem 0.5rem",
-                                  borderRadius: "4px",
-                                  border: "1px solid var(--warning)",
-                                  background: "transparent",
-                                  color: "var(--warning)",
-                                  cursor: "pointer",
-                                  fontSize: "0.85rem",
-                                  opacity:
-                                    actionLoading === `${proc.id}-restart`
-                                      ? 0.6
-                                      : 1,
-                                }}
+                                disabled={actionLoading === `${proc.id}-restart`}
                               >
-                                {actionLoading === `${proc.id}-restart`
-                                  ? "..."
-                                  : "Restart"}
-                              </button>
+                                {actionLoading === `${proc.id}-restart` ? "..." : "Restart"}
+                              </Button>
                             </>
                           ) : (
-                            <button
+                            <Button
+                              size="sm"
+                              variant="primary"
                               onClick={() => handleAction(proc.id, "start")}
-                              disabled={
-                                actionLoading === `${proc.id}-start` ||
-                                proc.status === "starting"
-                              }
-                              style={{
-                                padding: "0.25rem 0.5rem",
-                                borderRadius: "4px",
-                                border: "none",
-                                background: "var(--success)",
-                                color: "white",
-                                cursor: "pointer",
-                                fontSize: "0.85rem",
-                                opacity:
-                                  actionLoading === `${proc.id}-start` ||
-                                  proc.status === "starting"
-                                    ? 0.6
-                                    : 1,
-                              }}
+                              disabled={actionLoading === `${proc.id}-start` || proc.status === "starting"}
                             >
-                              {actionLoading === `${proc.id}-start`
-                                ? "..."
-                                : "Start"}
-                            </button>
+                              {actionLoading === `${proc.id}-start` ? "..." : "Start"}
+                            </Button>
                           )}
                         </div>
                       </td>
@@ -366,46 +268,27 @@ function ProcessDetail({ process, project, refreshKey }: ProcessDetailProps) {
   );
 
   return (
-    <div
-      style={{
-        padding: "1rem",
-        background: "rgba(0, 0, 0, 0.2)",
-        borderTop: "1px solid var(--border)",
-      }}
-    >
+    <div className="process-detail">
       {/* Process Info */}
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
-          gap: "1rem",
-          marginBottom: "1rem",
-        }}
-      >
+      <div className="process-facts">
         <div>
-          <h4
-            style={{ margin: "0 0 0.5rem 0", color: "var(--text-secondary)" }}
-          >
+          <h4 className="process-fact">
             Command
           </h4>
-          <code style={{ fontSize: "0.85rem", wordBreak: "break-all" }}>
+          <code className="small">
             {process.config.command.join(" ")}
           </code>
         </div>
         {process.config.cwd && (
           <div>
-            <h4
-              style={{ margin: "0 0 0.5rem 0", color: "var(--text-secondary)" }}
-            >
+            <h4 className="process-fact">
               Working Directory
             </h4>
-            <code style={{ fontSize: "0.85rem" }}>{process.config.cwd}</code>
+            <code className="small">{process.config.cwd}</code>
           </div>
         )}
         <div>
-          <h4
-            style={{ margin: "0 0 0.5rem 0", color: "var(--text-secondary)" }}
-          >
+          <h4 className="process-fact">
             Restart Policy
           </h4>
           <span>
@@ -416,29 +299,20 @@ function ProcessDetail({ process, project, refreshKey }: ProcessDetailProps) {
         </div>
         {process.lastRestartReason && (
           <div>
-            <h4
-              style={{ margin: "0 0 0.5rem 0", color: "var(--text-secondary)" }}
-            >
+            <h4 className="process-fact">
               Last Restart Reason
             </h4>
-            <span style={{ color: "var(--warning)" }}>
+            <span className="text-warning">
               {process.lastRestartReason}
             </span>
           </div>
         )}
         {process.exitCode !== undefined && (
           <div>
-            <h4
-              style={{ margin: "0 0 0.5rem 0", color: "var(--text-secondary)" }}
-            >
+            <h4 className="process-fact">
               Last Exit Code
             </h4>
-            <span
-              style={{
-                color:
-                  process.exitCode === 0 ? "var(--success)" : "var(--error)",
-              }}
-            >
+            <span className={process.exitCode === 0 ? "text-success" : "text-danger"}>
               {process.exitCode}
               {process.exitSignal && ` (${process.exitSignal})`}
             </span>
@@ -446,15 +320,13 @@ function ProcessDetail({ process, project, refreshKey }: ProcessDetailProps) {
         )}
         {process.config.healthCheck && (
           <div>
-            <h4
-              style={{ margin: "0 0 0.5rem 0", color: "var(--text-secondary)" }}
-            >
+            <h4 className="process-fact">
               Health Check
             </h4>
             <span>
               {process.config.healthCheck.type}
               {process.metrics.healthCheckFailures > 0 && (
-                <span style={{ color: "var(--error)", marginLeft: "0.5rem" }}>
+                <span className="text-danger"> 
                   ({process.metrics.healthCheckFailures} failures)
                 </span>
               )}
@@ -465,42 +337,21 @@ function ProcessDetail({ process, project, refreshKey }: ProcessDetailProps) {
 
       {/* Logs */}
       <div>
-        <h4 style={{ margin: "0 0 0.5rem 0", color: "var(--text-secondary)" }}>
+        <h4 className="process-fact">
           Recent Logs
         </h4>
-        <div
-          className="code"
-          style={{
-            maxHeight: "300px",
-            overflow: "auto",
-            fontSize: "0.8rem",
-            fontFamily: "monospace",
-          }}
-        >
+        <div className="code" style={{ maxHeight: "300px" }} tabIndex={0} role="region" aria-label="Recent logs">
           {logsData?.logs && logsData.logs.length > 0 ? (
             logsData.logs.map((line, i) => (
-              <div
-                key={i}
-                style={{
-                  color:
-                    line.stream === "stderr" ? "var(--error)" : "var(--text)",
-                  whiteSpace: "pre-wrap",
-                  wordBreak: "break-all",
-                }}
-              >
-                <span
-                  style={{
-                    color: "var(--text-secondary)",
-                    marginRight: "0.5rem",
-                  }}
-                >
+              <div key={i} className={line.stream === "stderr" ? "log-line text-danger" : "log-line"}>
+                <span className="log-time muted">
                   {new Date(line.timestamp).toLocaleTimeString()}
                 </span>
                 {line.text}
               </div>
             ))
           ) : (
-            <span style={{ color: "var(--text-secondary)" }}>
+            <span className="muted">
               No logs available
             </span>
           )}

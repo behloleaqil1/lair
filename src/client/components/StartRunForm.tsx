@@ -18,25 +18,7 @@ import {
 } from "../agents-actions";
 import { SignInHint } from "./SignInHint";
 import type { AgentView, PromptFileView } from "../../shared/agents-types";
-
-const muted = { color: "var(--text-secondary)", fontSize: "0.85rem" };
-const actionButton = {
-  padding: "0.4rem 0.9rem",
-  borderRadius: "4px",
-  border: "1px solid var(--warning)",
-  background: "transparent",
-  color: "var(--warning)",
-  cursor: "pointer",
-  fontSize: "0.8rem",
-};
-const field = {
-  padding: "0.4rem",
-  borderRadius: "4px",
-  border: "1px solid var(--border)",
-  background: "var(--bg-secondary)",
-  color: "var(--text)",
-};
-const fieldLabel = { display: "flex", flexDirection: "column" as const, gap: "0.25rem", ...muted };
+import { Button } from "../ui/Button";
 
 /**
  * Start a run (POST /api/agents/runs, owner only): the task is claimed when
@@ -130,11 +112,11 @@ export function StartRunForm({
     <div className="card" data-form="start-run">
       <h3>Start a run</h3>
       <SignInHint what="Starting a run" refreshKey={refreshKey} onStatus={setSignedIn} />
-      <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", marginBottom: "0.75rem" }}>
-        <label style={fieldLabel}>
+      <div className="row row-lg mb-3">
+        <label className="label-stack">
           Agent
           <select
-            style={field}
+            className="input"
             value={agent?.id ?? ""}
             disabled={disabled}
             onChange={(e) => {
@@ -149,10 +131,10 @@ export function StartRunForm({
             ))}
           </select>
         </label>
-        <label style={fieldLabel}>
+        <label className="label-stack">
           Task
           <input
-            style={field}
+            className="input"
             value={task}
             disabled={disabled}
             maxLength={128}
@@ -160,9 +142,9 @@ export function StartRunForm({
             onChange={(e) => setTask(e.target.value)}
           />
         </label>
-        <label style={fieldLabel}>
+        <label className="label-stack">
           Model
-          <select style={field} value={chosenModel} disabled={disabled} onChange={(e) => setModel(e.target.value)}>
+          <select className="input" value={chosenModel} disabled={disabled} onChange={(e) => setModel(e.target.value)}>
             <option value="">Default{models[0] ? ` (${models[0]})` : ""}</option>
             {models.map((m) => (
               <option key={m} value={m}>
@@ -171,9 +153,9 @@ export function StartRunForm({
             ))}
           </select>
         </label>
-        <label style={fieldLabel}>
+        <label className="label-stack">
           Load a prompt (optional)
-          <select style={field} value={file} disabled={disabled} onChange={(e) => void load(e.target.value)}>
+          <select className="input" value={file} disabled={disabled} onChange={(e) => void load(e.target.value)}>
             <option value="">{files.length === 0 ? "No files in prompts_dir" : "Choose a file"}</option>
             {files.map((f) => (
               <option key={f.name} value={f.name} disabled={f.tooLarge}>
@@ -184,28 +166,28 @@ export function StartRunForm({
           </select>
         </label>
       </div>
-      <label style={fieldLabel}>
+      <label className="label-stack">
         Prompt
         <textarea
-          style={{ ...field, minHeight: "8rem", fontFamily: "monospace" }}
+          className="input textarea mono" style={{ minHeight: "8rem" }}
           value={prompt}
           disabled={disabled}
           onChange={(e) => setPrompt(e.target.value)}
         />
       </label>
-      <div style={{ display: "flex", alignItems: "center", gap: "1rem", marginTop: "0.75rem" }}>
-        <button style={{ ...actionButton, padding: "0.4rem 0.9rem" }} disabled={disabled || !ready} onClick={() => void start()}>
+      <div className="row row-lg mt-3">
+        <Button size="sm" disabled={disabled || !ready} onClick={() => void start()}>
           {busy ? "Starting..." : "Start run"}
-        </button>
-        <span style={muted}>{prompt.length} characters</span>
+        </Button>
+        <span className="muted small">{prompt.length} characters</span>
       </div>
       {fileError && (
-        <div className="error" style={{ marginTop: "0.75rem" }}>
+        <div className="error spaced">
           {fileError}
         </div>
       )}
       {result && (
-        <div className={result.ok ? undefined : "error"} style={{ ...(result.ok ? muted : {}), marginTop: "0.75rem" }}>
+        <div className={result.ok ? "muted small mt-3" : "error mt-3"}>
           {result.text}
         </div>
       )}

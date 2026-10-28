@@ -18,7 +18,9 @@ import type { PrSummary, ReviewProjectInfo } from "../../shared/review-types";
 import { DataTable, type Column } from "./DataTable";
 import { SectionHeader, type SectionProps } from "./Section";
 import { PrDetail } from "./PrDetail";
-import { EmptyState, ErrorState, Loading, Time, muted, useOwnerSignedIn } from "./ui";
+import { EmptyState, ErrorState, Loading, Time, useOwnerSignedIn } from "./ui";
+import { Badge } from "../ui/Badge";
+import { Button } from "../ui/Button";
 
 /**
  * Evaluate, one at a time, the PRs of the review list not evaluated at their
@@ -88,7 +90,7 @@ export function PullRequests({ project, refreshKey, route, modules, readOnly, op
   const ready = rows.filter((r) => r.readiness.group === "ready").length;
 
   const columns: Column<PrRow>[] = [
-    { key: "number", label: "#", align: "right", sort: (r) => r.number, render: (r) => <span className="badge badge-neutral">#{r.number}</span> },
+    { key: "number", label: "#", align: "right", sort: (r) => r.number, render: (r) => <Badge tone="neutral">#{r.number}</Badge> },
     { key: "title", label: "Title", sort: (r) => r.title, render: (r) => r.title },
     {
       key: "branch",
@@ -97,7 +99,7 @@ export function PullRequests({ project, refreshKey, route, modules, readOnly, op
       render: (r) => (
         <>
           <code>{r.branch}</code>
-          <div style={muted}>{shortSha(r.headSha)}</div>
+          <div className="muted small">{shortSha(r.headSha)}</div>
         </>
       ),
     },
@@ -108,7 +110,7 @@ export function PullRequests({ project, refreshKey, route, modules, readOnly, op
             key: "tier",
             label: "Tier",
             sort: (r: PrRow) => (r.tier === "red" ? 0 : r.tier === "amber" ? 1 : r.tier === "green" ? 2 : null),
-            render: (r: PrRow) => (r.tier ? <span className={`badge ${TIER_BADGE[r.tier]}`}>{r.tier}</span> : <span style={muted}>—</span>),
+            render: (r: PrRow) => (r.tier ? <Badge tone={TIER_BADGE[r.tier]}>{r.tier}</Badge> : <span className="muted small">—</span>),
           },
         ]
       : []),
@@ -117,9 +119,7 @@ export function PullRequests({ project, refreshKey, route, modules, readOnly, op
       label: reviewOn ? "Merge" : "Gate",
       sort: (r) => (r.readiness.group === "ready" ? 0 : 1),
       render: (r) => (
-        <span className={r.readiness.group === "ready" ? "badge badge-success" : undefined} style={r.readiness.group === "ready" ? undefined : muted}>
-          {r.readiness.label}
-        </span>
+        r.readiness.group === "ready" ? <Badge tone="success">{r.readiness.label}</Badge> : <span className="muted small">{r.readiness.label}</span>
       ),
     },
   ];
@@ -155,11 +155,11 @@ export function PullRequests({ project, refreshKey, route, modules, readOnly, op
   return (
     <div>
       <SectionHeader title="Pull requests" section="prs" route={route} modules={modules}>
-        <span style={muted}>
+        <span className="muted small">
           {rows.length} open, {ready} {reviewOn ? "ready to merge" : "with a passed gate"}
           {info.data?.repo ? ` · ${info.data.repo}` : ""}
         </span>
-        {info.data?.readOnly && <span className="badge badge-neutral">read-only: no merges</span>}
+        {info.data?.readOnly && <Badge tone="neutral">read-only: no merges</Badge>}
         {reviewOn && (
           <RecheckAllButton
             count={rows.length}
@@ -209,9 +209,8 @@ export function RecheckAllButton({
 }) {
   const owner = signedIn === true;
   return (
-    <button
-      type="button"
-      className="small-button"
+    <Button
+      size="sm"
       data-action="recheck-all"
       disabled={!owner || count === 0}
       title={owner ? "Evaluate every open PR again" : "Sign this browser in as the owner from Decisions first"}
@@ -220,6 +219,6 @@ export function RecheckAllButton({
       }}
     >
       Re-check all
-    </button>
+    </Button>
   );
 }

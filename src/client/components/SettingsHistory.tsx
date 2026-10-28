@@ -8,9 +8,7 @@ import type { HistoryDetail, HistoryVersion, SettingsCheck } from "../../shared/
 import { checkRestore, loadHistory, loadVersion, restoreVersion } from "../settings-api";
 import { DiffView } from "./DiffView";
 import { SettingsReview } from "./SettingsReview";
-import { smallButton } from "./SettingsForm";
-
-const muted = { color: "var(--text-secondary)", fontSize: "0.85rem" };
+import { Button } from "../ui/Button";
 
 const ACTION_LABEL: Record<HistoryVersion["action"], string> = {
   create: "created",
@@ -86,7 +84,7 @@ export function SettingsHistory({ project, baseHash, onRestored }: Props) {
     <div data-settings-history="">
       {error && <p className="error">{error}</p>}
       {versions.length === 0 ? (
-        <p style={muted}>No versions yet: every save from Settings keeps one here (the newest 50).</p>
+        <p className="muted small">No versions yet: every save from Settings keeps one here (the newest 50).</p>
       ) : (
         <table className="table">
           <thead>
@@ -107,12 +105,12 @@ export function SettingsHistory({ project, baseHash, onRestored }: Props) {
                   {v.restoredFrom ? ` (from ${v.restoredFrom})` : ""}
                   {v.redacted ? " (not kept: it held what looks like a secret)" : ""}
                 </td>
-                <td style={muted}>{v.by ? `owner session ${v.by.slice(0, 8)}` : "—"}</td>
-                <td style={muted}>{v.bytes} B</td>
+                <td className="muted small">{v.by ? `owner session ${v.by.slice(0, 8)}` : "—"}</td>
+                <td className="muted small">{v.bytes} B</td>
                 <td>
-                  <button style={smallButton} disabled={v.redacted === true} onClick={() => void open(v.version)}>
+                  <Button size="sm" disabled={v.redacted === true} onClick={() => void open(v.version)}>
                     Show
-                  </button>
+                  </Button>
                 </td>
               </tr>
             ))}
@@ -120,17 +118,17 @@ export function SettingsHistory({ project, baseHash, onRestored }: Props) {
         </table>
       )}
       {detail && (
-        <div className="card" style={{ marginTop: "1rem" }}>
-          <h3 style={{ fontSize: "1rem" }}>
+        <div className="card spaced-lg">
+          <h3>
             {detail.info.version} ({ACTION_LABEL[detail.info.action]})
           </h3>
-          <p style={muted}>Changes from the version before it:</p>
-          {detail.fromPrevious ? <DiffView diff={detail.fromPrevious} /> : <p style={muted}>The oldest version kept.</p>}
-          <p style={muted}>Restoring it would change the current file like this:</p>
+          <p className="muted small">Changes from the version before it:</p>
+          {detail.fromPrevious ? <DiffView diff={detail.fromPrevious} /> : <p className="muted small">The oldest version kept.</p>}
+          <p className="muted small">Restoring it would change the current file like this:</p>
           <DiffView diff={detail.restoreDiff} empty="It is the current file" />
-          <button style={{ ...smallButton, marginTop: "0.5rem" }} onClick={() => void reviewRestore()}>
+          <Button size="sm" className="spaced-sm" onClick={() => void reviewRestore()}>
             Restore...
-          </button>
+          </Button>
           {review && (
             <SettingsReview
               check={review}

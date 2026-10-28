@@ -5,18 +5,7 @@
  */
 import { useEffect, useState } from "react";
 import { listOwnerSessions, revokeOwnerSession, type OwnerSessionInfo } from "../owner-session";
-
-const muted = { color: "var(--text-secondary)", fontSize: "0.85rem" };
-
-const smallButton = {
-  padding: "0.2rem 0.6rem",
-  borderRadius: "4px",
-  border: "1px solid var(--border)",
-  background: "transparent",
-  color: "var(--text-primary)",
-  cursor: "pointer",
-  fontSize: "0.8rem",
-};
+import { Button } from "../ui/Button";
 
 function time(iso: string): string {
   return new Date(iso).toLocaleString();
@@ -46,14 +35,14 @@ export function OwnerSessionList({
           <tr key={s.id}>
             <td>
               {s.userAgent || "unknown browser"}
-              {s.current && <span className="badge badge-success" style={{ marginLeft: "0.5rem" }}>this browser</span>}
+              {s.current && <span className="badge badge-success ml-2">this browser</span>}
             </td>
-            <td style={muted}>{time(s.createdAt)}</td>
-            <td style={muted}>{time(s.lastUsedAt)}</td>
+            <td className="muted small">{time(s.createdAt)}</td>
+            <td className="muted small">{time(s.lastUsedAt)}</td>
             <td>
-              <button type="button" disabled={busy} onClick={() => onRevoke(s)} style={smallButton}>
+              <Button size="sm" disabled={busy} onClick={() => onRevoke(s)}>
                 Sign out
-              </button>
+              </Button>
             </td>
           </tr>
         ))}
@@ -101,12 +90,12 @@ export function OwnerSessions({ onSignedOut }: { onSignedOut: () => void }) {
 
   return (
     <div className="card" data-owner-sessions="card">
-      <div style={{ display: "flex", alignItems: "baseline", gap: "1rem" }}>
+      <div className="row row-lg">
         <h3>Signed-in browsers</h3>
-        <span style={muted}>This browser is signed in as the owner, so you can answer.</span>
-        <button type="button" onClick={() => setOpen(!open)} style={smallButton}>
+        <span className="muted small">This browser is signed in as the owner, so you can answer.</span>
+        <Button size="sm" onClick={() => setOpen(!open)}>
           {open ? "Hide" : "Show"}
-        </button>
+        </Button>
       </div>
       {open && error && <div className="error">{error}</div>}
       {open && sessions && <OwnerSessionList sessions={sessions} busy={busy} onRevoke={(s) => void revoke(s)} />}

@@ -6,6 +6,8 @@
 import { useApi } from "../hooks/useApi";
 import { OWNER_MESSAGES_LABEL, OWNER_MESSAGES_SUBTITLE } from "../nav";
 import type { InboxItem } from "../../shared/types";
+import { Badge } from "../ui/Badge";
+import { PageHeader } from "../ui/PageHeader";
 
 interface Props {
   project: string;
@@ -28,34 +30,21 @@ export function Inbox({ project, refreshKey }: Props) {
 
   return (
     <div>
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: "1rem",
-          marginBottom: "0.5rem",
-        }}
-      >
-        <h2>
-          {OWNER_MESSAGES_LABEL} ({pending.length} pending)
-        </h2>
-        <span
-          className="badge badge-neutral"
-          style={{ fontSize: "0.7rem" }}
-          title="Polling mode - refresh interval 10s"
-        >
-          📡 Polling
-        </span>
-      </div>
-      <p style={{ color: "var(--text-secondary)", fontSize: "0.85rem", marginBottom: "1.5rem" }}>
-        {OWNER_MESSAGES_SUBTITLE}
-      </p>
+      <PageHeader
+        title={`${OWNER_MESSAGES_LABEL} (${pending.length} pending)`}
+        status={
+          <Badge tone="info" title="Polling mode - refresh interval 10s">
+            Polling
+          </Badge>
+        }
+        subtitle={OWNER_MESSAGES_SUBTITLE}
+      />
 
       {/* Pending items */}
       <div className="card">
         <h3>Pending Instructions</h3>
         {pending.length === 0 ? (
-          <p style={{ color: "var(--text-secondary)" }}>
+          <p className="muted">
             No pending instructions
           </p>
         ) : (
@@ -63,7 +52,7 @@ export function Inbox({ project, refreshKey }: Props) {
             {pending.map((item) => (
               <li key={item.id} className="inbox-item pending">
                 <div className="inbox-header">
-                  <span className="badge badge-warning">PENDING</span>
+                  <Badge tone="warning">PENDING</Badge>
                   <span className="inbox-id">[{item.id}]</span>
                   <span className="inbox-time">{item.timestamp}</span>
                 </div>
@@ -78,7 +67,7 @@ export function Inbox({ project, refreshKey }: Props) {
       <div className="card">
         <h3>Answered</h3>
         {answered.length === 0 ? (
-          <p style={{ color: "var(--text-secondary)" }}>No answered items</p>
+          <p className="muted">No answered items</p>
         ) : (
           <ul className="inbox-list">
             {answered
@@ -88,7 +77,7 @@ export function Inbox({ project, refreshKey }: Props) {
               .map((item) => (
                 <li key={item.id} className="inbox-item answered">
                   <div className="inbox-header">
-                    <span className="badge badge-success">ANSWERED</span>
+                    <Badge tone="success">ANSWERED</Badge>
                     <span className="inbox-id">[{item.id}]</span>
                     <span className="inbox-time">{item.timestamp}</span>
                   </div>

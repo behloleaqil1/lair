@@ -13,7 +13,9 @@ import type { GateDetailView, GateOutputView } from "../../shared/dashboard-type
 import { DetailPanel, DetailSection } from "./DetailPanel";
 import { PipelineJobs } from "./PipelineRuns";
 import { TriageRecordDetail } from "./Triage";
-import { ErrorState, KeyValues, Loading, OwnerOnlyNotice, Time, muted, useOwnerSignedIn } from "./ui";
+import { ErrorState, KeyValues, Loading, OwnerOnlyNotice, Time, useOwnerSignedIn } from "./ui";
+import { Badge } from "../ui/Badge";
+import { CodeBlock } from "../ui/CodeBlock";
 
 interface Props {
   id: string;
@@ -52,7 +54,7 @@ export function GateDetail({ id, project, refreshKey, readOnly, triageOn, onClos
       title={gate.track ?? gate.pipeline ?? "Gate"}
       subtitle={
         <>
-          <span className={`badge ${gateBadge(gate.status)}`}>{gate.status}</span> <code style={muted}>{id}</code>
+          <Badge tone={gateBadge(gate.status)}>{gate.status}</Badge> <code className="muted small">{id}</code>
         </>
       }
       onClose={onClose}
@@ -68,7 +70,7 @@ export function GateDetail({ id, project, refreshKey, readOnly, triageOn, onClos
 
       <DetailSection title="Steps">
         {gate.steps.length === 0 ? (
-          <p style={muted}>
+          <p className="muted small">
             {gate.hasLog ? "Its log names no steps Lair can read." : "No log yet: steps show once the gate writes its log."}
           </p>
         ) : (
@@ -77,7 +79,7 @@ export function GateDetail({ id, project, refreshKey, readOnly, triageOn, onClos
               <tr>
                 <th>Step</th>
                 <th>Result</th>
-                <th style={{ textAlign: "right" }}>Duration</th>
+                <th className="align-right">Duration</th>
                 {gate.source === "pipeline" && <th>Where</th>}
               </tr>
             </thead>
@@ -86,15 +88,15 @@ export function GateDetail({ id, project, refreshKey, readOnly, triageOn, onClos
                 <tr key={`${step.lane ?? ""}/${step.name}`}>
                   <td>
                     <code>{step.name}</code>
-                    {step.lane && gate.source === "pipeline" && <span style={muted}> ({step.lane})</span>}
+                    {step.lane && gate.source === "pipeline" && <span className="muted small"> ({step.lane})</span>}
                   </td>
                   <td>
-                    <span className={`badge ${STEP_BADGE[step.state]}`}>{step.state.replace("_", " ")}</span>
-                    {step.exitCode !== undefined && <span style={muted}> exit {step.exitCode}</span>}
-                    {step.error && <div style={muted}>{step.error}</div>}
+                    <Badge tone={STEP_BADGE[step.state]}>{step.state.replace("_", " ")}</Badge>
+                    {step.exitCode !== undefined && <span className="muted small"> exit {step.exitCode}</span>}
+                    {step.error && <div className="muted small">{step.error}</div>}
                   </td>
-                  <td style={{ textAlign: "right" }}>{durationText(step.durationSeconds)}</td>
-                  {gate.source === "pipeline" && <td style={muted}>{step.where ?? "—"}</td>}
+                  <td className="align-right">{durationText(step.durationSeconds)}</td>
+                  {gate.source === "pipeline" && <td className="muted small">{step.where ?? "—"}</td>}
                 </tr>
               ))}
             </tbody>
@@ -106,9 +108,9 @@ export function GateDetail({ id, project, refreshKey, readOnly, triageOn, onClos
         <DetailSection title="Triage">
           <p>
             {gate.triage.verdict ? (
-              <span className={`badge ${CLASS_BADGE[gate.triage.verdict]}`}>{gate.triage.verdict}</span>
+              <Badge tone={CLASS_BADGE[gate.triage.verdict]}>{gate.triage.verdict}</Badge>
             ) : (
-              <span style={muted}>no verdict</span>
+              <span className="muted small">no verdict</span>
             )}{" "}
             {gate.triage.blocking ? "blocks a merge" : "does not block a merge"}
           </p>
@@ -124,11 +126,11 @@ export function GateDetail({ id, project, refreshKey, readOnly, triageOn, onClos
               {gate.triage.causes.map((c, i) => (
                 <tr key={i}>
                   <td>
-                    <span className={`badge ${CLASS_BADGE[c.class]}`}>{c.class}</span>
+                    <Badge tone={CLASS_BADGE[c.class]}>{c.class}</Badge>
                   </td>
                   <td>
                     {c.summary}
-                    <div style={muted}>
+                    <div className="muted small">
                       {c.kind}
                       {c.step ? ` in ${c.step}` : ""}
                       {c.testCount > 0 ? ` · ${c.testCount} test(s)` : ""} · confidence {c.confidence}
@@ -148,7 +150,7 @@ export function GateDetail({ id, project, refreshKey, readOnly, triageOn, onClos
         gate.status !== "running" &&
         gate.status !== "queued" && (
           <DetailSection title="Triage">
-            <p style={muted}>Triage has no record of this result{gate.source === "queue" ? " (send it with lair gate-result)" : ""}.</p>
+            <p className="muted small">Triage has no record of this result{gate.source === "queue" ? " (send it with lair gate-result)" : ""}.</p>
           </DetailSection>
         )
       )}
@@ -156,8 +158,8 @@ export function GateDetail({ id, project, refreshKey, readOnly, triageOn, onClos
       {gate.placement && (
         <DetailSection title="Placement">
           <p>{placement ?? (gate.placement.job ? "No advice: it stays where it is." : "Placement does not see it in the queue.")}</p>
-          {gate.placement.job?.advice && <p style={muted}>{gate.placement.job.advice.explanation}</p>}
-          {gate.placement.job?.held && <p style={muted}>Never moved: {gate.placement.job.held}</p>}
+          {gate.placement.job?.advice && <p className="muted small">{gate.placement.job.advice.explanation}</p>}
+          {gate.placement.job?.held && <p className="muted small">Never moved: {gate.placement.job.held}</p>}
         </DetailSection>
       )}
 
@@ -185,14 +187,14 @@ export function GateDetail({ id, project, refreshKey, readOnly, triageOn, onClos
                       <tr key={`${t.id}-${t.step ?? ""}`}>
                         <td>
                           <code>{t.name}</code>
-                          <div style={muted}>
+                          <div className="muted small">
                             {t.suite}
                             {t.file && t.file !== t.suite ? ` · ${t.file}` : ""}
                             {t.step ? ` · ${t.step}` : ""}
                           </div>
                         </td>
-                        <td style={{ fontSize: "0.85rem" }}>
-                          {t.class && <span className={`badge ${CLASS_BADGE[t.class]}`}>{t.class}</span>} {t.message}
+                        <td className="small">
+                          {t.class && <Badge tone={CLASS_BADGE[t.class]}>{t.class}</Badge>} {t.message}
                         </td>
                       </tr>
                     ))}
@@ -203,20 +205,20 @@ export function GateDetail({ id, project, refreshKey, readOnly, triageOn, onClos
             {output.data.evidence.length > 0 && (
               <>
                 <h4>Evidence</h4>
-                <pre className="code">{output.data.evidence.join("\n")}</pre>
+                <CodeBlock label="Evidence">{output.data.evidence.join("\n")}</CodeBlock>
               </>
             )}
             {output.data.log ? (
               <>
                 <h4>Log</h4>
-                <p style={muted}>
+                <p className="muted small">
                   {output.data.log.file}, written <Time iso={output.data.log.modifiedAt} />
                   {output.data.log.truncated ? `; the last ${output.data.log.lines.length} lines` : ""}
                 </p>
-                <pre className="code">{output.data.log.lines.join("\n")}</pre>
+                <CodeBlock label="Gate log">{output.data.log.lines.join("\n")}</CodeBlock>
               </>
             ) : (
-              <p style={muted}>No log for this gate.</p>
+              <p className="muted small">No log for this gate.</p>
             )}
           </>
         )}

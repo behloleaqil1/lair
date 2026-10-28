@@ -1034,3 +1034,51 @@
 .breadcrumbs a:hover {
   color: var(--color-text);
 }
+
+/* A label that wraps its control: the text above it */
+.label-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-bottom: var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+
+.label-stack .input,
+.label-stack .select {
+  color: var(--color-text);
+}
+
+.fieldset {
+  margin-bottom: var(--space-3);
+  padding: var(--space-2) var(--space-3) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.check-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-right: var(--space-4);
+  white-space: nowrap;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+}
+
+.muted-details {
+  margin: 0 0 var(--space-3);
+}
+
+/* Buttons side by side in running text or a table cell (flex rows space them with gap) */
+:not(.button-row):not(.row):not(.dialog-footer):not(.dialog-actions):not(.server-controls):not(.need-answers):not(.need-confirm):not(.page-header-actions):not(.card-actions):not(.drawer-actions)
+  > .btn
+  + .btn {
+  margin-left: var(--space-2);
+}

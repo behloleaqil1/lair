@@ -15,9 +15,26 @@ import { fixtureFetch } from "./a11y-fixtures";
 import { signIn } from "./owner-session";
 import { applyPreferences } from "./ui/preferences";
 
-/** Each top-level view: its URL, and a text that says it rendered with its data */
+/** Each top-level view and detail: its URL, and a text that says it rendered with its data */
 const VIEWS: { name: string; hash: string; shows: string }[] = [
   { name: "Home", hash: "#/", shows: "worker-a is paused" },
+  { name: "Home, Activity", hash: "#/?tab=activity", shows: "Live Feed" },
+  { name: "Home, Health", hash: "#/?tab=health", shows: "self-checks" },
+  { name: "Work", hash: "#/work", shows: "worker-a" },
+  { name: "Work, an agent's detail", hash: "#/work/worker-a", shows: "worker-a" },
+  { name: "Gates", hash: "#/gates", shows: "feat-y" },
+  { name: "Gates, Results", hash: "#/gates?tab=results", shows: "g-1" },
+  { name: "Gates, a gate's detail", hash: "#/gates/g-1", shows: "g-1" },
+  { name: "PRs", hash: "#/prs", shows: "the export button" },
+  { name: "PRs, a PR's detail", hash: "#/prs/7", shows: "the export button" },
+  { name: "Machines", hash: "#/machines", shows: "build-2" },
+  { name: "Machines, Nodes", hash: "#/machines?tab=nodes", shows: "Nodes" },
+  { name: "Decisions", hash: "#/decisions", shows: "worker-a is paused" },
+  { name: "Decisions, a decision's detail", hash: "#/decisions/0b5c2c3e-7a43-4f7e-9d2a-0d4b1f2e3a4b", shows: "Start it again" },
+  { name: "Decisions, Owner messages", hash: "#/decisions?tab=messages", shows: "Pause the heavy lane tonight" },
+  { name: "Delivery", hash: "#/delivery", shows: "demo-staging" },
+  { name: "Processes", hash: "#/processes", shows: "Docs server" },
+  { name: "Settings", hash: "#/settings", shows: "Settings" },
 ];
 
 class InertEventSource {
@@ -95,7 +112,7 @@ describe("accessibility: axe on every view", () => {
   for (const view of VIEWS) {
     it(`${view.name}, signed out: no serious or critical violations`, async () => {
       const el = await renderAt(view.hash);
-      expect(el.textContent).toContain(view.shows);
+      expect(el.textContent, el.textContent?.slice(0, 1500)).toContain(view.shows);
       expect(await seriousViolations()).toEqual([]);
     });
 
@@ -103,13 +120,33 @@ describe("accessibility: axe on every view", () => {
       await signIn("owner-token");
       applyPreferences({ theme: "dark", density: "compact" });
       const el = await renderAt(view.hash);
-      expect(el.textContent).toContain(view.shows);
+      expect(el.textContent, el.textContent?.slice(0, 1500)).toContain(view.shows);
       // The owner's footer controls are there, so the signed-in markup is the one checked
       expect(el.querySelector('[data-server-controls="owner"]')).not.toBeNull();
       expect(await seriousViolations()).toEqual([]);
       applyPreferences({ theme: "system", density: "comfortable" });
     });
   }
+
+  it("the supervisor's chat panel, opened from Home's Ask Lair card: no serious or critical violations", async () => {
+    await signIn("owner-token");
+    const el = await renderAt("#/");
+    const input = el.querySelector<HTMLInputElement>('input[aria-label="A question for Lair"]');
+    expect(input, el.textContent?.slice(0, 1500)).not.toBeNull();
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+      setter.call(input, "Why is nothing merging?");
+      input!.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    act(() => {
+      input!.form!.requestSubmit();
+    });
+    await settle();
+    const panel = el.querySelector('[data-panel="chat"]');
+    expect(panel).not.toBeNull();
+    expect(panel?.textContent).toContain("Why is nothing merging?");
+    expect(await seriousViolations()).toEqual([]);
+  });
 
   it("the shell: a labelled nav with the current section, the project's status and the look toggles", async () => {
     const el = await renderAt("#/");

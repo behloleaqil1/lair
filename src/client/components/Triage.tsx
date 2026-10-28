@@ -18,6 +18,8 @@ import { useApi } from "../hooks/useApi";
 import { ownerHeaders } from "../owner-session";
 import { DataTable, type Column } from "./DataTable";
 import { Time } from "./ui";
+import { Badge } from "../ui/Badge";
+import { Button } from "../ui/Button";
 import type {
   GateRecheck,
   GateRecheckStatus,
@@ -74,19 +76,19 @@ function GateRechecks({ rechecks }: { rechecks: GateRecheck[] }) {
       <tbody>
         {rechecks.map((r) => (
           <tr key={r.id}>
-            <td style={{ whiteSpace: "nowrap" }}>{time(r.createdAt)}</td>
+            <td className="nowrap">{time(r.createdAt)}</td>
             <td>
-              {r.gateId} <span style={muted}>#{r.attempt} {r.kind}</span>
+              {r.gateId} <span className="muted small">#{r.attempt} {r.kind}</span>
             </td>
             <td>
               <GateRecheckBadge recheck={r} />
             </td>
             <td>
               {r.detail}
-              {r.runId && <div style={muted}>its result: {r.runId}</div>}
-              {r.passedTests.length > 0 && <div style={muted}>passed: {r.passedTests.join(", ")}</div>}
+              {r.runId && <div className="muted small">its result: {r.runId}</div>}
+              {r.passedTests.length > 0 && <div className="muted small">passed: {r.passedTests.join(", ")}</div>}
               {r.argv && (
-                <div style={muted}>
+                <div className="muted small">
                   <code>{r.argv.join(" ")}</code>
                 </div>
               )}
@@ -119,16 +121,6 @@ const ACTION_BADGE: Record<string, string> = {
   skipped: "badge-neutral",
 };
 
-const muted = { color: "var(--text-secondary)", fontSize: "0.85rem" };
-const button = {
-  padding: "0.4rem 0.9rem",
-  borderRadius: "4px",
-  border: "none",
-  background: "var(--primary)",
-  color: "white",
-  cursor: "pointer",
-};
-
 function time(iso: string | undefined): string {
   return iso ? new Date(iso).toLocaleString() : "—";
 }
@@ -153,21 +145,21 @@ async function post(path: string, project: string, body: unknown): Promise<strin
 }
 
 function Actions({ actions }: { actions: TriageAction[] }) {
-  if (actions.length === 0) return <p style={muted}>No actions.</p>;
+  if (actions.length === 0) return <p className="muted small">No actions.</p>;
   return (
     <table className="table">
       <tbody>
         {actions.map((a) => (
           <tr key={a.id}>
-            <td style={{ whiteSpace: "nowrap" }}>{time(a.at)}</td>
+            <td className="nowrap">{time(a.at)}</td>
             <td>{a.kind}</td>
             <td>
-              <span className={`badge ${ACTION_BADGE[a.status] ?? "badge-neutral"}`}>{a.status}</span>
+              <Badge tone={ACTION_BADGE[a.status] ?? "badge-neutral"}>{a.status}</Badge>
             </td>
             <td>
               {a.detail}
-              {a.actor && <div style={muted}>by {a.actor}</div>}
-              {a.argv && <div style={muted}><code>{a.argv.join(" ")}</code></div>}
+              {a.actor && <div className="muted small">by {a.actor}</div>}
+              {a.argv && <div className="muted small"><code>{a.argv.join(" ")}</code></div>}
             </td>
           </tr>
         ))}
@@ -189,20 +181,20 @@ export function TriageRecordDetail({ id, project, refreshKey }: { id: string; pr
     project,
     refreshKey,
   );
-  if (!detail.data) return <p style={muted}>{detail.error ?? "Loading..."}</p>;
+  if (!detail.data) return <p className="muted small">{detail.error ?? "Loading..."}</p>;
   const { record, actions, rechecks } = detail.data;
   const gateRechecks = detail.data.gateRechecks ?? [];
   return (
     <div>
-      {record.resolution && <p style={muted}>{record.resolution}</p>}
-      <p style={muted}>
+      {record.resolution && <p className="muted small">{record.resolution}</p>}
+      <p className="muted small">
         Retries: {record.retries}
         {rechecks.length > 0 &&
           ` · re-checks: ${rechecks.map((r) => `#${r.attempt} ${r.status}${r.reason ? ` (${r.reason})` : ""}`).join("; ")}`}
       </p>
       {gateRechecks.length > 0 && (
         <>
-          <p style={muted}>Re-checks in the gate system:</p>
+          <p className="muted small">Re-checks in the gate system:</p>
           <GateRechecks rechecks={gateRechecks} />
         </>
       )}
@@ -236,16 +228,16 @@ function IncidentCard({ incident, project, onChange }: { incident: Incident; pro
   };
   return (
     <div className="card">
-      <div style={{ display: "flex", gap: "0.75rem", alignItems: "center", flexWrap: "wrap" }}>
-        <h3 style={{ margin: 0 }}>
+      <div className="row">
+        <h3 className="m-0">
           {incident.branch} {incident.status === "open" ? "is red" : "was red"}
         </h3>
-        <span className={`badge ${incident.status === "open" ? "badge-error" : "badge-success"}`}>{incident.status}</span>
-        <span style={muted}>
+        <Badge tone={incident.status === "open" ? "badge-error" : "badge-success"}>{incident.status}</Badge>
+        <span className="muted small">
           red at {short(incident.redSha)} · last green {short(incident.lastGreenSha)} · opened {time(incident.openedAt)}
         </span>
       </div>
-      <p style={{ margin: "0.5rem 0" }}>
+      <p className="stack-sm">
         Bisect: <strong>{b.status}</strong> · {b.candidates.length} commit(s) · {b.detail}
       </p>
       {culprit && (
@@ -257,7 +249,7 @@ function IncidentCard({ incident, project, onChange }: { incident: Incident; pro
           {incident.revert.by ? ` · asked by ${incident.revert.by}` : ""}
         </p>
       )}
-      {b.suspects && b.suspects.length > 1 && <p style={muted}>Suspects: {b.suspects.map(short).join(", ")}</p>}
+      {b.suspects && b.suspects.length > 1 && <p className="muted small">Suspects: {b.suspects.map(short).join(", ")}</p>}
       {b.probes.length > 0 && (
         <table className="table">
           <thead>
@@ -276,7 +268,7 @@ function IncidentCard({ incident, project, onChange }: { incident: Incident; pro
                 <td>{p.recheckId ? (p.confirm ? "confirmation" : "probe") : "red gate"}</td>
                 <td>
                   {p.outcome}
-                  {p.detail ? <span style={muted}> · {p.detail}</span> : null}
+                  {p.detail ? <span className="muted small"> · {p.detail}</span> : null}
                 </td>
               </tr>
             ))}
@@ -284,17 +276,17 @@ function IncidentCard({ incident, project, onChange }: { incident: Incident; pro
         </table>
       )}
       {incident.status === "open" && culprit && (
-        <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
+        <div className="row mt-2">
           {incident.revert.status !== "opened" && incident.revert.status !== "opening" && (
-            <button style={button} onClick={() => revert(culprit)}>
+            <Button size="sm" variant="primary" onClick={() => revert(culprit)}>
               Open revert of {short(culprit)}
               {b.proven ? "" : " (not proven)"}
-            </button>
+            </Button>
           )}
           {!incident.revert.protected && (
-            <button style={button} onClick={() => protect(culprit)}>
+            <Button size="sm" variant="primary" onClick={() => protect(culprit)}>
               Protect {short(culprit)}
-            </button>
+            </Button>
           )}
         </div>
       )}
@@ -314,7 +306,7 @@ function failureColumns(withRecheck: boolean, latest: ReadonlyMap<string, GateRe
       render: (r) => (
         <>
           {r.gateId}
-          {r.purpose !== "gate" && <span style={muted}> ({r.purpose})</span>}
+          {r.purpose !== "gate" && <span className="muted small"> ({r.purpose})</span>}
         </>
       ),
     },
@@ -323,7 +315,7 @@ function failureColumns(withRecheck: boolean, latest: ReadonlyMap<string, GateRe
       label: "Commit",
       render: (r) => (
         <>
-          <code>{short(r.sha)}</code> <span style={muted}>{r.branch}</span>
+          <code>{short(r.sha)}</code> <span className="muted small">{r.branch}</span>
         </>
       ),
     },
@@ -331,7 +323,7 @@ function failureColumns(withRecheck: boolean, latest: ReadonlyMap<string, GateRe
       key: "verdict",
       label: "Verdict",
       sort: (r) => r.verdict,
-      render: (r) => (r.verdict ? <span className={`badge ${CLASS_BADGE[r.verdict]}`}>{r.verdict}</span> : "—"),
+      render: (r) => (r.verdict ? <Badge tone={CLASS_BADGE[r.verdict]}>{r.verdict}</Badge> : "—"),
     },
     { key: "blocking", label: "Blocking", sort: (r) => r.blocking, render: (r) => (r.blocking ? "yes" : "no") },
     { key: "retries", label: "Retries", align: "right", sort: (r) => r.retries, render: (r) => r.retries },
@@ -347,7 +339,7 @@ function failureColumns(withRecheck: boolean, latest: ReadonlyMap<string, GateRe
           },
         ]
       : []),
-    { key: "status", label: "Status", render: (r) => <span style={muted}>{r.resolution ?? ""}</span> },
+    { key: "status", label: "Status", render: (r) => <span className="muted small">{r.resolution ?? ""}</span> },
   ];
 }
 
@@ -368,7 +360,7 @@ export function Triage({ project, refreshKey, openGate }: Props & { openGate: (g
   if (!s.enabled) {
     return (
       <div>
-        <h2 style={{ marginBottom: "1.5rem" }}>Triage</h2>
+        <h2 className="mb-6">Triage</h2>
         <div className="card">
           <p>
             Triage is off for this project. Set <code>triage.enabled: true</code> in its YAML. It reads the results of
@@ -376,7 +368,7 @@ export function Triage({ project, refreshKey, openGate }: Props & { openGate: (g
             observe mode: it classifies and records, and runs none of your commands.
           </p>
           {s.errors.map((e) => (
-            <p key={e} className="error" style={{ marginTop: "1rem" }}>
+            <p key={e} className="error spaced-lg">
               {e}
             </p>
           ))}
@@ -392,10 +384,10 @@ export function Triage({ project, refreshKey, openGate }: Props & { openGate: (g
   for (const r of gateRechecks.data ?? []) if (!latestRecheck.has(r.recordId)) latestRecheck.set(r.recordId, r);
   return (
     <div>
-      <div style={{ display: "flex", alignItems: "center", gap: "1rem", marginBottom: "1.5rem", flexWrap: "wrap" }}>
-        <span className={`badge ${acting ? "badge-warning" : "badge-neutral"}`}>{acting ? "Act" : "Observe"}</span>
-        {s.actBlocked && s.mode === "act" && <span style={muted}>Not acting: {s.actBlocked}</span>}
-        <span style={muted}>
+      <div className="section-head">
+        <Badge tone={acting ? "badge-warning" : "badge-neutral"}>{acting ? "Act" : "Observe"}</Badge>
+        {s.actBlocked && s.mode === "act" && <span className="muted small">Not acting: {s.actBlocked}</span>}
+        <span className="muted small">
           {s.counts.failures} failure(s), {s.counts.blocking} blocking · {s.pendingRechecks} re-check(s) pending ·{" "}
           {s.openTasks} open task(s) · {s.quarantined}/{s.quarantineCap ?? 0} quarantined
         </span>
@@ -411,7 +403,7 @@ export function Triage({ project, refreshKey, openGate }: Props & { openGate: (g
           rows={failures.data ?? []}
           rowKey={(r) => r.id}
           onOpen={(r) => openGate(r.gateId)}
-          empty={<p style={muted}>No failed gate results yet: triage lists them as the results come in.</p>}
+          empty={<p className="muted small">No failed gate results yet: triage lists them as the results come in.</p>}
         />
       </div>
 
@@ -425,7 +417,7 @@ export function Triage({ project, refreshKey, openGate }: Props & { openGate: (g
                   <td>{t.kind}</td>
                   <td>{t.title}</td>
                   <td>{t.status}</td>
-                  <td style={muted}>{t.ref ?? ""}</td>
+                  <td className="muted small">{t.ref ?? ""}</td>
                 </tr>
               ))}
             </tbody>
@@ -435,15 +427,15 @@ export function Triage({ project, refreshKey, openGate }: Props & { openGate: (g
 
       {gate && (
         <div className="card">
-          <div style={{ display: "flex", alignItems: "center", gap: "1rem", flexWrap: "wrap" }}>
-            <h3 style={{ margin: 0 }}>Re-checks in the gate system</h3>
-            <span className={`badge ${gate.blocked ? "badge-neutral" : "badge-warning"}`}>{gate.blocked ? "Observe" : "Act"}</span>
-            <span style={muted}>
+          <div className="row row-lg">
+            <h3 className="m-0">Re-checks in the gate system</h3>
+            <Badge tone={gate.blocked ? "badge-neutral" : "badge-warning"}>{gate.blocked ? "Observe" : "Act"}</Badge>
+            <span className="muted small">
               {gate.pending} pending{gate.blocked ? ` · not run: ${gate.blocked}` : ""}
             </span>
           </div>
           {(gateRechecks.data ?? []).length === 0 ? (
-            <p style={muted}>No re-checks yet: infra, timeout and flaky failures are re-checked; real failures never are.</p>
+            <p className="muted small">No re-checks yet: infra, timeout and flaky failures are re-checked; real failures never are.</p>
           ) : (
             <GateRechecks rechecks={gateRechecks.data ?? []} />
           )}
@@ -453,7 +445,7 @@ export function Triage({ project, refreshKey, openGate }: Props & { openGate: (g
       {gate && (flaky.data ?? []).length === 0 && (
         <div className="card">
           <h3>Flaky tests</h3>
-          <p style={muted}>None yet. A test that timed out and passed on a quiet re-check is listed here.</p>
+          <p className="muted small">None yet. A test that timed out and passed on a quiet re-check is listed here.</p>
         </div>
       )}
 

@@ -17,11 +17,8 @@ import {
   updateFromForm,
   type NotificationForm,
 } from "../notifications-api";
-import { inputStyle, smallButton } from "./SettingsForm";
 import { Time } from "./ui";
-
-const muted = { color: "var(--text-secondary)", fontSize: "0.85rem" };
-const row = { display: "flex", gap: "0.5rem", alignItems: "center", flexWrap: "wrap" as const, marginTop: "0.5rem" };
+import { Button } from "../ui/Button";
 
 export function NotificationSettings() {
   const [view, setView] = useState<NotificationStatusView | null>(null);
@@ -84,19 +81,19 @@ export function NotificationSettings() {
     (saved.desktop !== form.desktop || saved.ntfyUrl !== form.ntfyUrl.trim() || saved.reminderHours !== form.reminderHours.trim());
 
   return (
-    <div className="card" data-notification-settings="" style={{ marginTop: "1rem" }}>
+    <div className="card spaced-lg" data-notification-settings="">
       <h3>Notifications</h3>
-      <p style={muted}>
+      <p className="muted small">
         Lair tells you when something needs your answer: one notification per minute at most, several items together,
         never for notices, and a reminder once a day while items wait longer than the hours below. Off until you turn a
         channel on. Kept in Lair&apos;s own <code>data/server.yaml</code>.
       </p>
       {view?.errors.map((e) => (
-        <div key={e} className="error" style={{ marginBottom: "0.5rem" }}>
+        <div key={e} className="error mb-2">
           {e}
         </div>
       ))}
-      <label style={row}>
+      <label className="row mt-2">
         <input
           type="checkbox"
           checked={form.desktop}
@@ -105,13 +102,13 @@ export function NotificationSettings() {
         />
         Desktop notifications on this machine
         {view && (
-          <span style={{ ...muted, color: view.desktopAvailable.ok ? "var(--text-secondary)" : "var(--warning)" }}>
+          <span className={view.desktopAvailable.ok ? "muted small" : "text-warning small"}>
             ({view.desktopAvailable.detail})
           </span>
         )}
       </label>
-      <label style={{ display: "block", marginTop: "0.75rem" }}>
-        <span style={muted}>
+      <label className="label-stack mt-3">
+        <span className="muted small">
           Phone push: your ntfy topic URL (https://ntfy.sh/&lt;topic&gt;, or a self-hosted ntfy). Empty: none.
           {view?.settings.ntfyTokenFile ? " An access token is set in ntfy.token_file." : ""}
         </span>
@@ -121,11 +118,11 @@ export function NotificationSettings() {
           placeholder="https://ntfy.sh/your-private-topic"
           disabled={busy || !view}
           onChange={(e) => setForm({ ...form, ntfyUrl: e.target.value })}
-          style={inputStyle}
+          className="input"
         />
       </label>
-      <label style={{ display: "block", marginTop: "0.75rem" }}>
-        <span style={muted}>Daily reminder after this many hours (0: no reminder)</span>
+      <label className="label-stack mt-3">
+        <span className="muted small">Daily reminder after this many hours (0: no reminder)</span>
         <input
           type="number"
           min={0}
@@ -134,39 +131,39 @@ export function NotificationSettings() {
           value={form.reminderHours}
           disabled={busy || !view}
           onChange={(e) => setForm({ ...form, reminderHours: e.target.value })}
-          style={{ ...inputStyle, width: "6rem", display: "block" }}
+          className="input" style={{ width: "6rem", display: "block" }}
         />
       </label>
-      <div style={row}>
-        <button style={smallButton} disabled={busy || !view || !dirty} onClick={() => void save()}>
+      <div className="row mt-2">
+        <Button size="sm" disabled={busy || !view || !dirty} onClick={() => void save()}>
           Save
-        </button>
-        <button
-          style={smallButton}
+        </Button>
+        <Button
+          size="sm"
           disabled={busy || !view?.settings.enabled || dirty}
           title={dirty ? "Save first" : !view?.settings.enabled ? "Turn a channel on first" : undefined}
           onClick={() => void test()}
         >
           Send test notification
-        </button>
-        {message && <span style={muted}>{message}</span>}
+        </Button>
+        {message && <span className="muted small">{message}</span>}
       </div>
       {error && (
-        <div className="error" style={{ marginTop: "0.5rem" }}>
+        <div className="error spaced-sm">
           {error}
         </div>
       )}
       {results && (
-        <ul style={{ ...muted, margin: "0.5rem 0 0 1rem" }} data-test-results="">
+        <ul className="muted small decision-audit" data-test-results="">
           {results.map((r) => (
-            <li key={r.channel} style={{ color: r.ok ? "var(--success)" : "var(--error)" }}>
+            <li key={r.channel} className={r.ok ? "text-success" : "text-danger"}>
               {resultLine(r)}
             </li>
           ))}
         </ul>
       )}
       {view?.last && !results && (
-        <p style={{ ...muted, marginTop: "0.5rem" }}>
+        <p className="muted small mt-2">
           Last sent <Time iso={view.last.at} />: {view.last.title} ({view.last.results.map(resultLine).join("; ") || "no channel"})
         </p>
       )}

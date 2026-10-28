@@ -9,8 +9,12 @@ import type { Dragon, Gate, GateResult, MachineStatus, OverviewData, PullRequest
 import type { DashboardModules, ModuleFlags } from "../shared/dashboard-types";
 import type { Decision } from "../shared/decision-types";
 import type { ConfigStatusView, RestartStatusView } from "../shared/lifecycle-types";
-import type { ChatStatusView, DigestView } from "../shared/supervisor-types";
+import type { ChatStatusView, ConversationView, DigestView } from "../shared/supervisor-types";
 import type { DecisionSummary } from "./decisions-api";
+import type { DeliveryProjectStatus } from "../shared/delivery-types";
+import type { ProcessListResponse } from "../shared/process-types";
+import type { ProjectFileInfo, ProjectSettingsView, SettingsSection } from "../shared/settings-types";
+import type { AuditEntry, InboxItem } from "../shared/types";
 
 export const FIXTURE_NOW = "2026-10-27T10:00:00Z";
 
@@ -22,9 +26,9 @@ export const FIXTURE_MODULES: ModuleFlags = {
   triage: false,
   placement: false,
   pipelines: false,
-  delivery: false,
+  delivery: true,
   watchdog: false,
-  processes: false,
+  processes: true,
   github: true,
   machines: true,
   nodes: false,
@@ -138,11 +142,130 @@ const chat: ChatStatusView = {
 
 const digest: DigestView = { project: "demo", enabled: true, time: "08:00", latest: null };
 
+const conversation: ConversationView = {
+  id: "conv-1",
+  project: "demo",
+  kind: "chat",
+  digestDate: null,
+  createdAt: FIXTURE_NOW,
+  updatedAt: FIXTURE_NOW,
+  repoUrl: "https://github.com/example-org/demo",
+  turns: [
+    {
+      id: "t1",
+      seq: 1,
+      question: "Why is nothing merging?",
+      askedAt: FIXTURE_NOW,
+      state: "answered",
+      runId: "run-1",
+      agent: "worker-a",
+      deadlineAt: FIXTURE_NOW,
+      answer: "Gate **g-1** failed its tests: see [its run](#/gates/g-1).",
+      evidence: [{ tool: "gates.results", args: { limit: 5 }, note: "g-1 rc 1" }],
+      answeredAt: FIXTURE_NOW,
+      reason: null,
+    },
+  ],
+};
+
 const summary: DecisionSummary = { open: 2, overdue: 0, action: 1, notices: 1, secretStore: "server memory only" };
 
 const config: ConfigStatusView = { watching: true, problems: [], recent: [] };
 
 const modules: DashboardModules = { project: "demo", readOnly: false, error: null, modules: FIXTURE_MODULES };
+
+const delivery: DeliveryProjectStatus = {
+  project: "demo",
+  enabled: true,
+  running: true,
+  readOnly: false,
+  errors: [],
+  lastError: null,
+  environments: [
+    {
+      environment: "staging",
+      composeProject: "demo-staging",
+      checkedAt: FIXTURE_NOW,
+      error: null,
+      operation: null,
+      autoDeploy: { enabled: false, ref: "main", lastSha: null, blocked: null },
+      services: [
+        {
+          name: "api",
+          state: "running",
+          health: "healthy",
+          healthDetail: "GET http://localhost:8080/health: 200",
+          restartCount: 0,
+          containers: [{ id: "c1", name: "demo-api-1", state: "running", status: "Up 2 hours (healthy)", exitCode: 0, restartCount: 0 }],
+          held: null,
+          crashLoop: null,
+          lastErrorLines: [],
+          buildable: true,
+          deployedSha: null,
+          behind: false,
+        },
+      ],
+    },
+  ],
+};
+
+const processes: ProcessListResponse = {
+  supervisorRunning: true,
+  processes: [
+    {
+      id: "docs-server",
+      name: "Docs server",
+      status: "running",
+      pid: 4242,
+      healthy: true,
+      restartCount: 0,
+      metrics: { startCount: 1, restartCount: 0, healthCheckFailures: 0, uptimeMs: 3_600_000 },
+      config: {
+        id: "docs-server",
+        name: "Docs server",
+        command: ["npm", "run", "docs"],
+        restart: "on-failure",
+        restartDelay: 1000,
+        maxRestarts: 10,
+        backoffMultiplier: 2,
+        maxBackoff: 300000,
+        logMaxLines: 1000,
+        autostart: true,
+      },
+    },
+  ],
+};
+
+const settingsFile: ProjectFileInfo = { id: "demo", file: "projects/local/demo.yaml", local: true, writable: true };
+
+const settingsSections: SettingsSection[] = [
+  {
+    key: "core",
+    title: "Project",
+    root: true,
+    blocks: ["name", "github"],
+    schema: { type: "object", properties: { name: { type: "string" }, github: { type: "string" } } },
+    hints: { name: { help: "The name the dashboard shows" } },
+    toggle: false,
+  },
+];
+
+const settingsView: ProjectSettingsView = {
+  ...settingsFile,
+  hash: "h1",
+  yaml: "name: Demo\ngithub: example-org/demo\n",
+  values: { name: "Demo", github: "example-org/demo" },
+  errors: [],
+  unknownKeys: [],
+  known: { agents: ["worker-a"], adapters: [], models: [], lanes: ["heavy"], machines: ["local"], profiles: [] },
+  secrets: [],
+};
+
+const inbox: InboxItem[] = [{ id: "m1", timestamp: FIXTURE_NOW, text: "Pause the heavy lane tonight", status: "pending" }];
+
+const audit: AuditEntry[] = [
+  { id: "a1", timestamp: FIXTURE_NOW, action: "dragon/start", command: ["dragon-start.sh", "worker-a"], exitCode: 0, outputTail: "started" },
+];
 
 /** The data of each GET route, by path (no query) */
 export const FIXTURE_ROUTES: Record<string, unknown> = {
@@ -155,6 +278,8 @@ export const FIXTURE_ROUTES: Record<string, unknown> = {
   "/api/owner/restart": restart,
   "/api/supervisor/chat": chat,
   "/api/supervisor/digest": digest,
+  "/api/supervisor/ask": { conversation },
+  "/api/supervisor/conversations/conv-1": conversation,
   "/api/decisions/summary": summary,
   "/api/decisions": decisions,
   "/api/config/status": config,
@@ -163,6 +288,14 @@ export const FIXTURE_ROUTES: Record<string, unknown> = {
   "/api/gates": { queue, results },
   "/api/machines": machines,
   "/api/prs": prs,
+  "/api/delivery/status": delivery,
+  "/api/delivery/operations": [],
+  "/api/processes": processes,
+  "/api/settings/modules": { sections: settingsSections },
+  "/api/settings/projects": { projects: [settingsFile] },
+  "/api/settings/projects/demo": settingsView,
+  "/api/controls/inbox": inbox,
+  "/api/controls/audit": audit,
 };
 
 /** A fetch that answers from FIXTURE_ROUTES (and `extra`, which wins) */

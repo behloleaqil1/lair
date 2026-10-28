@@ -8,11 +8,8 @@
 import { useState } from "react";
 import type { CreateProjectRequest, RepoCheck, SettingsCheck, SettingsSection } from "../../shared/settings-types";
 import { checkNewProject, checkRepository, createProject } from "../settings-api";
-import { inputStyle, smallButton } from "./SettingsForm";
 import { SettingsReview } from "./SettingsReview";
-
-const muted = { color: "var(--text-secondary)", fontSize: "0.85rem" };
-const labelStyle = { display: "flex", flexDirection: "column" as const, gap: "0.2rem", marginBottom: "0.6rem", ...muted };
+import { Button } from "../ui/Button";
 
 interface Props {
   sections: SettingsSection[];
@@ -98,29 +95,29 @@ export function ProjectWizard({ sections, onCreated, onCancel }: Props) {
 
   return (
     <div className="card" data-project-wizard="">
-      <h3 style={{ fontSize: "1rem", marginBottom: "0.75rem" }}>New project</h3>
+      <h3>New project</h3>
       {error && <p className="error">{error}</p>}
-      <label style={labelStyle}>
+      <label className="label-stack">
         Id (the file name: letters, digits, '.', '_', '-')
-        <input style={inputStyle} value={id} onChange={(e) => {
+        <input className="input" value={id} onChange={(e) => {
             setId(e.target.value);
             edited();
           }} placeholder="my-app" />
         {errorLine("id")}
       </label>
-      <label style={labelStyle}>
+      <label className="label-stack">
         Name
-        <input style={inputStyle} value={name} onChange={(e) => {
+        <input className="input" value={name} onChange={(e) => {
             setName(e.target.value);
             edited();
           }} placeholder="My App" />
         {errorLine("name")}
       </label>
-      <label style={labelStyle}>
+      <label className="label-stack">
         Repository path (a git work tree)
-        <div style={{ display: "flex", gap: "0.5rem" }}>
+        <div className="row">
           <input
-            style={{ ...inputStyle, fontFamily: "monospace" }}
+            className="input mono"
             value={repo}
             onChange={(e) => {
               setRepo(e.target.value);
@@ -129,15 +126,15 @@ export function ProjectWizard({ sections, onCreated, onCancel }: Props) {
             }}
             placeholder="/home/user/my-app"
           />
-          <button style={smallButton} disabled={repo.trim() === ""} onClick={() => void check()}>
+          <Button size="sm" disabled={repo.trim() === ""} onClick={() => void check()}>
             Check
-          </button>
+          </Button>
         </div>
         {repoCheck &&
           (repoCheck.problem ? (
             <span className="error">{repoCheck.problem}</span>
           ) : (
-            <span style={{ color: "var(--success)" }}>
+            <span className="text-success">
               A git work tree
               {repoCheck.remotes.length > 0
                 ? `; remotes: ${repoCheck.remotes.map((r) => `${r.name} ${r.url}`).join(", ")}`
@@ -146,19 +143,19 @@ export function ProjectWizard({ sections, onCreated, onCancel }: Props) {
           ))}
         {errorLine("repo")}
       </label>
-      <label style={labelStyle}>
+      <label className="label-stack">
         GitHub repository (owner/name; detected from the remotes)
-        <input style={inputStyle} value={github} onChange={(e) => {
+        <input className="input" value={github} onChange={(e) => {
             setGithub(e.target.value);
             edited();
           }} placeholder="owner/name" />
         {errorLine("github")}
       </label>
       {(["queue_file", "agents_dir", "gates_dir"] as const).map((key) => (
-        <label key={key} style={labelStyle}>
+        <label key={key} className="label-stack">
           {key}
           <input
-            style={{ ...inputStyle, fontFamily: "monospace" }}
+            className="input mono"
             value={paths[key]}
             onChange={(e) => {
               const value = e.target.value;
@@ -170,10 +167,10 @@ export function ProjectWizard({ sections, onCreated, onCancel }: Props) {
           {errorLine(key)}
         </label>
       ))}
-      <fieldset style={{ border: "1px solid var(--border)", borderRadius: "4px", padding: "0.5rem 0.75rem", marginBottom: "0.75rem" }}>
-        <legend style={muted}>Switch on (with their defaults; configure them after)</legend>
+      <fieldset className="fieldset">
+        <legend className="muted small">Switch on (with their defaults; configure them after)</legend>
         {toggles.map((s) => (
-          <label key={s.key} style={{ marginRight: "1rem", whiteSpace: "nowrap" }}>
+          <label key={s.key} className="check-label">
             <input
               type="checkbox"
               checked={modules.includes(s.key)}
@@ -187,13 +184,13 @@ export function ProjectWizard({ sections, onCreated, onCancel }: Props) {
         ))}
         {errorLine("modules")}
       </fieldset>
-      <div style={{ display: "flex", gap: "0.5rem" }}>
-        <button style={smallButton} onClick={() => void runReview()}>
+      <div className="button-row">
+        <Button size="sm" onClick={() => void runReview()}>
           Review
-        </button>
-        <button style={smallButton} onClick={onCancel}>
+        </Button>
+        <Button size="sm" onClick={onCancel}>
           Cancel
-        </button>
+        </Button>
       </div>
       {review && (
         <SettingsReview

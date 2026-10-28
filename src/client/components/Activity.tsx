@@ -10,6 +10,7 @@ import { useApi } from "../hooks/useApi";
 import { useBusEvents, getReportKindDisplay } from "../hooks/useBusEvents";
 import type { AuditEntry } from "../../shared/types";
 import type { BusReport } from "../../shared/bus-types";
+import { Icon } from "../ui/Icon";
 
 interface Props {
   project: string;
@@ -33,25 +34,26 @@ export function Activity({ project, refreshKey }: Props) {
 
   return (
     <div>
-      <div style={{ display: "flex", alignItems: "center", gap: "1rem", marginBottom: "1.5rem" }}>
-        <h2 style={{ margin: 0 }}>Activity</h2>
-        <div className="mode-selector" style={{ display: "flex", gap: "0.5rem" }}>
+      <div className="section-head">
+        <h2 className="m-0">Activity</h2>
+        <div className="segmented" role="group" aria-label="Activity view">
           <button
-            className={`mode-button ${viewMode === "live" ? "active" : ""}`}
+            type="button"
+            className="mode-button"
+            aria-pressed={viewMode === "live"}
             onClick={() => setViewMode("live")}
           >
-            🔴 Live Feed
-            {busState.connected && (
-              <span style={{ marginLeft: "0.5rem", fontSize: "0.75rem", opacity: 0.7 }}>
-                connected
-              </span>
-            )}
+            <Icon name="dot" size={10} className={busState.connected ? "text-success" : "text-danger"} />
+            Live Feed
+            {busState.connected && <span className="muted xsmall">connected</span>}
           </button>
           <button
-            className={`mode-button ${viewMode === "audit" ? "active" : ""}`}
+            type="button"
+            className="mode-button"
+            aria-pressed={viewMode === "audit"}
             onClick={() => setViewMode("audit")}
           >
-            📋 Audit Log
+            Audit Log
           </button>
         </div>
       </div>
@@ -88,10 +90,10 @@ function LiveFeed({
   if (error && !connected) {
     return (
       <div className="card">
-        <div className="error" style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
-          <span>⚠️</span>
+        <div className="error row">
+          <Icon name="alert" />
           <span>Connection error: {error}</span>
-          <span style={{ opacity: 0.7, fontSize: "0.85rem" }}>Reconnecting...</span>
+          <span className="muted small">Reconnecting...</span>
         </div>
       </div>
     );
@@ -100,7 +102,7 @@ function LiveFeed({
   if (reports.length === 0) {
     return (
       <div className="card">
-        <p style={{ color: "var(--text-secondary)" }}>
+        <p className="muted">
           {connected
             ? "No activity yet. Reports from dragons will appear here."
             : "Connecting to bus..."}
@@ -191,7 +193,7 @@ function AuditLog({
   return (
     <div className="card">
       {entries.length === 0 ? (
-        <p style={{ color: "var(--text-secondary)" }}>No audit entries recorded</p>
+        <p className="muted">No audit entries recorded</p>
       ) : (
         <table className="table">
           <thead>
@@ -208,7 +210,7 @@ function AuditLog({
               .reverse()
               .map((entry) => (
                 <tr key={entry.id}>
-                  <td style={{ fontSize: "0.85rem", whiteSpace: "nowrap" }}>
+                  <td className="small nowrap">
                     {new Date(entry.timestamp).toLocaleString()}
                   </td>
                   <td>
@@ -221,16 +223,7 @@ function AuditLog({
                       {entry.exitCode}
                     </span>
                   </td>
-                  <td
-                    style={{
-                      maxWidth: "400px",
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                      fontSize: "0.85rem",
-                      color: "var(--text-secondary)",
-                    }}
-                  >
+                  <td className="muted small truncate">
                     {entry.outputTail || "-"}
                   </td>
                 </tr>

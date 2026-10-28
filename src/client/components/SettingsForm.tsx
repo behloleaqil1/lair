@@ -9,6 +9,8 @@ import { useEffect, useState } from "react";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import type { FieldError, KnownValues, PathSegment, SettingsSection } from "../../shared/settings-types";
 import { isPlainObject } from "../../shared/settings-rules";
+import { Badge } from "../ui/Badge";
+import { Button } from "../ui/Button";
 import {
   defaultLabel,
   entryFields,
@@ -22,28 +24,6 @@ import {
   type FieldContext,
   type FieldModel,
 } from "../settings-form";
-
-const muted = { color: "var(--text-secondary)", fontSize: "0.85rem" };
-export const inputStyle = {
-  padding: "0.35rem",
-  borderRadius: "4px",
-  border: "1px solid var(--border)",
-  background: "var(--bg-secondary)",
-  color: "var(--text-primary)",
-  fontFamily: "inherit",
-  width: "100%",
-};
-const mono = { ...inputStyle, fontFamily: "monospace", fontSize: "0.85rem" };
-export const smallButton = {
-  padding: "0.2rem 0.5rem",
-  borderRadius: "4px",
-  border: "1px solid var(--border)",
-  background: "transparent",
-  color: "var(--text-primary)",
-  cursor: "pointer",
-  fontSize: "0.8rem",
-};
-const linkButton = { ...smallButton, border: "none", padding: 0, fontSize: "1rem", fontWeight: 600 };
 
 type OnChange = (path: PathSegment[], value: unknown) => void;
 
@@ -95,7 +75,7 @@ const numberText = (v: unknown) => (v === undefined ? "" : String(v));
 function ErrorLines({ messages }: { messages: string[] }) {
   if (messages.length === 0) return null;
   return (
-    <div className="error" data-field-error="" style={{ fontSize: "0.8rem", marginTop: "0.2rem" }}>
+    <div className="error small mt-1" data-field-error="">
       {messages.map((m, i) => (
         <div key={i}>{m}</div>
       ))}
@@ -108,7 +88,7 @@ function ListEditor({ field, disabled, onChange }: { field: FieldModel; disabled
   const lines = Math.min(12, Math.max(2, text.split("\n").length + 1));
   return (
     <textarea
-      style={mono}
+      className="input textarea mono"
       rows={lines}
       value={text}
       disabled={disabled}
@@ -127,7 +107,7 @@ function NumberEditor({ field, disabled, onChange }: { field: FieldModel; disabl
   const [text, setText] = useLocalText(field.value, numberText, textToNumber);
   return (
     <input
-      style={{ ...inputStyle, maxWidth: "12rem" }}
+      className="input" style={{ maxWidth: "12rem" }}
       inputMode="decimal"
       value={text}
       disabled={disabled}
@@ -146,7 +126,7 @@ function YamlEditor({ field, disabled, onChange }: { field: FieldModel; disabled
   return (
     <>
       <textarea
-        style={mono}
+        className="input textarea mono"
         rows={Math.min(14, Math.max(2, text.split("\n").length + 1))}
         value={text}
         disabled={disabled || field.readOnly}
@@ -179,7 +159,7 @@ function Leaf({ field, disabled, onChange }: { field: FieldModel; disabled: bool
     case "toggle": {
       const checked = typeof field.value === "boolean" ? field.value : field.defaultValue === true;
       return (
-        <label style={muted}>
+        <label className="muted small">
           <input
             type="checkbox"
             checked={checked}
@@ -196,7 +176,7 @@ function Leaf({ field, disabled, onChange }: { field: FieldModel; disabled: bool
       const values = (field.schema.enum ?? (field.schema.const !== undefined ? [field.schema.const] : [])) as unknown[];
       return (
         <select
-          style={{ ...inputStyle, maxWidth: "20rem" }}
+          className="input" style={{ maxWidth: "20rem" }}
           value={field.value === undefined ? "" : String(field.value)}
           disabled={disabled}
           onChange={(e) => {
@@ -219,13 +199,13 @@ function Leaf({ field, disabled, onChange }: { field: FieldModel; disabled: bool
       return (
         <>
           <ListEditor field={field} disabled={disabled} onChange={onChange} />
-          {field.options && field.options.length > 0 && <p style={muted}>Known: {field.options.join(", ")}</p>}
+          {field.options && field.options.length > 0 && <p className="muted small">Known: {field.options.join(", ")}</p>}
         </>
       );
     case "textarea":
       return (
         <textarea
-          style={inputStyle}
+          className="input textarea"
           rows={4}
           value={typeof field.value === "string" ? field.value : ""}
           disabled={disabled}
@@ -238,7 +218,7 @@ function Leaf({ field, disabled, onChange }: { field: FieldModel; disabled: bool
       return (
         <>
           <input
-            style={field.kind === "path" ? mono : inputStyle}
+            className={field.kind === "path" ? "input mono" : "input"}
             list={listId}
             value={typeof field.value === "string" ? field.value : field.value === undefined ? "" : String(field.value)}
             disabled={disabled}
@@ -273,26 +253,26 @@ function Collection({ field, shared }: { field: FieldModel; shared: Shared }) {
     return (
       <div>
         {entries.map(([key, value]) => (
-          <div key={key} style={{ borderLeft: "2px solid var(--border)", paddingLeft: "0.75rem", margin: "0.5rem 0" }}>
-            <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+          <div key={key} className="nested">
+            <div className="row">
               <code>{key}</code>
-              <button style={smallButton} disabled={disabled} onClick={() => onChange([...field.path, key], undefined)}>
+              <Button size="sm" disabled={disabled} onClick={() => onChange([...field.path, key], undefined)}>
                 Remove
-              </button>
+              </Button>
             </div>
             <FieldList fields={entryFields(field, key, value, ctx)} shared={shared} />
           </div>
         ))}
-        <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.25rem" }}>
+        <div className="row mt-1">
           <input
-            style={{ ...inputStyle, maxWidth: "14rem" }}
+            className="input" style={{ maxWidth: "14rem" }}
             value={adding}
             disabled={disabled}
             placeholder={`new ${field.key} entry`}
             onChange={(e) => setAdding(e.target.value.trim())}
           />
-          <button
-            style={smallButton}
+          <Button
+            size="sm"
             disabled={disabled || adding === "" || entries.some(([k]) => k === adding)}
             onClick={() => {
               onChange([...field.path, adding], blank);
@@ -300,7 +280,7 @@ function Collection({ field, shared }: { field: FieldModel; shared: Shared }) {
             }}
           >
             Add
-          </button>
+          </Button>
         </div>
       </div>
     );
@@ -309,11 +289,11 @@ function Collection({ field, shared }: { field: FieldModel; shared: Shared }) {
   return (
     <div>
       {items.map((item, i) => (
-        <div key={i} style={{ borderLeft: "2px solid var(--border)", paddingLeft: "0.75rem", margin: "0.5rem 0" }}>
-          <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
-            <span style={muted}>#{i + 1}</span>
-            <button
-              style={smallButton}
+        <div key={i} className="nested">
+          <div className="row">
+            <span className="muted small">#{i + 1}</span>
+            <Button
+              size="sm"
               disabled={disabled}
               onClick={() =>
                 onChange(
@@ -323,14 +303,14 @@ function Collection({ field, shared }: { field: FieldModel; shared: Shared }) {
               }
             >
               Remove
-            </button>
+            </Button>
           </div>
           <FieldList fields={entryFields(field, i, item, ctx)} shared={shared} />
         </div>
       ))}
-      <button style={smallButton} disabled={disabled} onClick={() => onChange(field.path, [...items, blank])}>
+      <Button size="sm" disabled={disabled} onClick={() => onChange(field.path, [...items, blank])}>
         Add
-      </button>
+      </Button>
     </div>
   );
 }
@@ -340,37 +320,36 @@ function FieldRow({ field, shared }: { field: FieldModel; shared: Shared }) {
   const collection = field.kind === "object" || field.kind === "record" || field.kind === "objects";
   const [open, setOpen] = useState(field.value !== undefined || inside > 0);
   return (
-    <div data-field={field.path.join(".")} style={{ margin: "0.6rem 0" }}>
-      <div style={{ display: "flex", gap: "0.5rem", alignItems: "baseline", flexWrap: "wrap" }}>
+    <div data-field={field.path.join(".")} className="stack-sm">
+      <div className="row">
         {collection ? (
-          <button style={{ ...linkButton, fontSize: "0.9rem" }} onClick={() => setOpen(!open)}>
+          <Button size="sm" variant="link" onClick={() => setOpen(!open)}>
             {open ? "▾" : "▸"} <code>{field.key}</code>
-          </button>
+          </Button>
         ) : (
           <code>{field.key}</code>
         )}
-        {field.required && <span style={{ color: "var(--warning)" }}>required</span>}
-        {field.command && <span className="badge badge-warning">runs a command</span>}
+        {field.required && <span className="text-warning">required</span>}
+        {field.command && <Badge tone="warning">runs a command</Badge>}
         {field.sensitive && !field.command && (
           <span className="badge badge-warning" title="It decides what Lair runs or where it sends code and tokens">
             confirmed on save
           </span>
         )}
-        {field.readOnly && <span className="badge badge-neutral">read-only: edit in the YAML tab</span>}
-        {inside > 0 && <span className="badge badge-error">{inside} error(s) inside</span>}
+        {field.readOnly && <Badge tone="neutral">read-only: edit in the YAML tab</Badge>}
+        {inside > 0 && <Badge tone="error">{inside} error(s) inside</Badge>}
         {field.value !== undefined && !field.required && !field.readOnly && (
-          <button
-            style={{ ...smallButton, border: "none", color: "var(--text-secondary)" }}
+          <Button size="sm" variant="ghost"
             disabled={shared.disabled}
             title="Remove the key: its default applies"
             onClick={() => shared.onChange(field.path, undefined)}
           >
             reset
-          </button>
+          </Button>
         )}
       </div>
-      {field.help && <div style={muted}>{field.help}</div>}
-      <div style={{ marginTop: "0.2rem" }}>
+      {field.help && <div className="muted small">{field.help}</div>}
+      <div className="spaced-xs">
         {collection ? (
           open && <Collection field={field} shared={shared} />
         ) : (
@@ -388,11 +367,11 @@ function FieldList({ fields, shared }: { fields: FieldModel[]; shared: Shared })
   );
   const hidden = fields.length - shown.length;
   return (
-    <div style={{ paddingLeft: "0.25rem" }}>
+    <div className="pl-1">
       {shown.map((field) => (
         <FieldRow key={field.path.join("\0")} field={field} shared={shared} />
       ))}
-      {hidden > 0 && <div style={muted}>{hidden} advanced field(s) hidden</div>}
+      {hidden > 0 && <div className="muted small">{hidden} advanced field(s) hidden</div>}
     </div>
   );
 }
@@ -416,13 +395,13 @@ function SectionCard({ section, draft, known, errors, disabled, onChange }: Sect
   );
   const shared: Shared = { ctx: { section, known }, errors, disabled, showAdvanced, onChange };
   return (
-    <div className="card" data-settings-section={section.key} style={{ marginBottom: "1rem" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: "1rem", flexWrap: "wrap" }}>
-        <button style={linkButton} onClick={() => setOpen(!open)}>
+    <div className="card section-intro" data-settings-section={section.key}>
+      <div className="row row-lg">
+        <Button variant="link" onClick={() => setOpen(!open)}>
           {open ? "▾" : "▸"} {section.title}
-        </button>
+        </Button>
         {section.toggle && (
-          <label style={muted}>
+          <label className="muted small">
             <input
               type="checkbox"
               checked={sectionEnabled(section, draft)}
@@ -432,13 +411,13 @@ function SectionCard({ section, draft, known, errors, disabled, onChange }: Sect
             enabled
           </label>
         )}
-        {!configured && <span className="badge badge-neutral">not set: defaults</span>}
-        {count > 0 && <span className="badge badge-error">{count} error(s)</span>}
-        {section.docs && <span style={muted}>{section.docs}</span>}
+        {!configured && <Badge tone="neutral">not set: defaults</Badge>}
+        {count > 0 && <Badge tone="error">{count} error(s)</Badge>}
+        {section.docs && <span className="muted small">{section.docs}</span>}
       </div>
       {open && (
-        <div style={{ marginTop: "0.5rem" }}>
-          <label style={muted}>
+        <div className="spaced-sm">
+          <label className="muted small">
             <input type="checkbox" checked={showAdvanced} onChange={(e) => setShowAdvanced(e.target.checked)} /> Show
             advanced
           </label>
@@ -474,13 +453,13 @@ export function SettingsForm({ sections, draft, known, errors, unknownKeys, disa
         />
       ))}
       {unknownKeys.length > 0 && (
-        <div className="card" data-settings-section="unknown" style={{ marginBottom: "1rem" }}>
-          <h3 style={{ fontSize: "1rem" }}>Other keys</h3>
-          <p style={muted}>No section knows these keys. Settings keeps them as they are; edit them in the YAML tab.</p>
+        <div className="card section-intro" data-settings-section="unknown">
+          <h3>Other keys</h3>
+          <p className="muted small">No section knows these keys. Settings keeps them as they are; edit them in the YAML tab.</p>
           {unknownKeys.map((key) => (
-            <div key={key} style={{ margin: "0.5rem 0" }}>
+            <div key={key} className="stack-sm">
               <code>{key}</code>
-              <pre style={{ ...mono, whiteSpace: "pre-wrap" }}>{yamlText(draft[key])}</pre>
+              <pre className="code-block">{yamlText(draft[key])}</pre>
             </div>
           ))}
         </div>

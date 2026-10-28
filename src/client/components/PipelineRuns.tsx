@@ -10,7 +10,12 @@ import { useApi } from "../hooks/useApi";
 import { cancelPipelineRun, startPipelineRun, type ApiEnvelope } from "../owner-actions";
 import { SignInHint } from "./SignInHint";
 import { DataTable, type Column } from "./DataTable";
+import { DetailPanel } from "./DetailPanel";
 import { Time } from "./ui";
+import { Badge } from "../ui/Badge";
+import { Button } from "../ui/Button";
+import { CodeBlock } from "../ui/CodeBlock";
+import { Select } from "../ui/Select";
 import type {
   PipelineAttempt,
   PipelineRun,
@@ -31,8 +36,6 @@ interface WorkflowFile {
   instructions: string[];
 }
 
-const muted = { color: "var(--text-secondary)", fontSize: "0.85rem" };
-
 const STATUS_BADGE: Record<string, string> = {
   passed: "badge-success",
   completed: "badge-success",
@@ -52,7 +55,7 @@ const STATUS_BADGE: Record<string, string> = {
 };
 
 function badge(status: string) {
-  return <span className={`badge ${STATUS_BADGE[status] ?? "badge-neutral"}`}>{status.replace("_", " ")}</span>;
+  return <Badge tone={STATUS_BADGE[status] ?? "badge-neutral"}>{status.replace("_", " ")}</Badge>;
 }
 
 function time(iso: string | undefined): string {
@@ -97,12 +100,12 @@ export function PipelineRuns({ project, refreshKey, openRun }: Props & { openRun
     return (
       <div className="card">
         <h3>Pipelines</h3>
-        <p style={muted}>
+        <p className="muted small">
           No pipelines for this project. Add a <code>pipelines:</code> block to its YAML: Lair runs each job on the
           repository&apos;s CI runners first (GitHub Actions) and on this machine last.
         </p>
         {s.errors.map((e) => (
-          <p key={e} className="error" style={{ marginTop: "0.5rem" }}>
+          <p key={e} className="error spaced-sm">
             {e}
           </p>
         ))}
@@ -135,25 +138,25 @@ export function PipelineRuns({ project, refreshKey, openRun }: Props & { openRun
     <div>
       <SignInHint what="Starting and cancelling pipeline runs" refreshKey={refreshKey} />
       <div className="card">
-        <div style={{ display: "flex", alignItems: "center", gap: "1rem", flexWrap: "wrap" }}>
-          <h3 style={{ margin: 0 }}>Pipelines</h3>
-          <span style={muted}>Order: {s.order.join(" → ")}</span>
-          <span style={muted}>
+        <div className="row row-lg">
+          <h3 className="m-0">Pipelines</h3>
+          <span className="muted small">Order: {s.order.join(" → ")}</span>
+          <span className="muted small">
             GitHub-hosted minutes this month: {s.minutes.usedThisMonth}
             {s.minutes.budget > 0 ? ` of ${s.minutes.budget}` : ""}
           </span>
-          <button className="nav-button" onClick={() => setShowWorkflow(true)}>
+          <Button size="sm" onClick={() => setShowWorkflow(true)}>
             Workflow file
-          </button>
+          </Button>
         </div>
 
         {s.github.warnings.map((w) => (
-          <p key={w} className="error" style={{ marginTop: "0.75rem" }}>
+          <p key={w} className="error spaced">
             {w}
           </p>
         ))}
 
-        <table className="table" style={{ marginTop: "0.75rem" }}>
+        <table className="table spaced">
           <thead>
             <tr>
               <th>Executor</th>
@@ -172,7 +175,7 @@ export function PipelineRuns({ project, refreshKey, openRun }: Props & { openRun
                     {e.available ? "yes" : "no"}
                   </span>
                 </td>
-                <td style={muted}>
+                <td className="muted small">
                   {e.reason ?? ""}
                   {e.unavailableUntil ? ` (until ${time(e.unavailableUntil)})` : ""}
                 </td>
@@ -180,7 +183,7 @@ export function PipelineRuns({ project, refreshKey, openRun }: Props & { openRun
             ))}
           </tbody>
         </table>
-        <p style={{ ...muted, marginTop: "0.5rem" }}>
+        <p className="muted small mt-2">
           GitHub: {s.github.repo ?? "no repository"} · token {s.github.tokenEnv}{" "}
           {s.github.tokenSet ? "set" : "not set"}
           {s.github.visibility ? ` · ${s.github.visibility}` : ""}
@@ -189,35 +192,35 @@ export function PipelineRuns({ project, refreshKey, openRun }: Props & { openRun
             : ""}
         </p>
         {s.decisions.length > 0 && (
-          <div style={{ marginTop: "0.5rem" }}>
+          <div className="spaced-sm">
             {s.decisions.map((d) => (
-              <p key={d.id} style={muted}>
+              <p key={d.id} className="muted small">
                 Needs a decision ({d.kind}): {d.question}
               </p>
             ))}
           </div>
         )}
 
-        <div style={{ display: "flex", gap: "0.5rem", marginTop: "1rem", alignItems: "center", flexWrap: "wrap" }}>
-          <select className="project-select" value={chosen} onChange={(e) => setPipeline(e.target.value)}>
+        <div className="row mt-4">
+          <Select value={chosen} onChange={(e) => setPipeline(e.target.value)} aria-label="Pipeline">
             {s.pipelines.map((p) => (
               <option key={p.name} value={p.name}>
                 {p.name} ({p.lanes.map((l) => l.name).join(", ")})
               </option>
             ))}
-          </select>
+          </Select>
           <input
-            className="command-input"
+            className="input"
             style={{ maxWidth: "16rem" }}
             placeholder="branch (default: HEAD)"
             value={branch}
             onChange={(e) => setBranch(e.target.value)}
           />
-          <button className="command-submit" disabled={busy || s.readOnly || !chosen} onClick={start}>
+          <Button variant="primary" disabled={busy || s.readOnly || !chosen} onClick={start}>
             Run
-          </button>
-          {s.readOnly && <span style={muted}>Read-only project: runs can't be started here</span>}
-          {message && <span style={muted}>{message}</span>}
+          </Button>
+          {s.readOnly && <span className="muted small">Read-only project: runs can't be started here</span>}
+          {message && <span className="muted small">{message}</span>}
         </div>
       </div>
 
@@ -229,16 +232,11 @@ export function PipelineRuns({ project, refreshKey, openRun }: Props & { openRun
           rows={(runs.data ?? []).slice(0, 50)}
           rowKey={(run) => run.id}
           onOpen={(run) => openRun(run.id)}
-          empty={<p style={muted}>No runs yet: start one above, or let a module start them.</p>}
+          empty={<p className="muted small">No runs yet: start one above, or let a module start them.</p>}
         />
       </div>
 
-      {showWorkflow && (
-        <>
-          <div className="overlay" onClick={() => setShowWorkflow(false)} />
-          <WorkflowPanel project={project} refreshKey={key} onClose={() => setShowWorkflow(false)} />
-        </>
-      )}
+      {showWorkflow && <WorkflowPanel project={project} refreshKey={key} onClose={() => setShowWorkflow(false)} />}
     </div>
   );
 }
@@ -248,7 +246,7 @@ const RUN_COLUMNS: Column<PipelineRun>[] = [
   { key: "pipeline", label: "Pipeline", sort: (run) => run.pipeline, render: (run) => run.pipeline },
   { key: "commit", label: "Commit", render: (run) => <code>{run.commitSha.slice(0, 10)}</code> },
   { key: "status", label: "Status", sort: (run) => run.status, render: (run) => badge(run.status) },
-  { key: "where", label: "Where", render: (run) => <span style={muted}>{whereOf(run)}</span> },
+  { key: "where", label: "Where", render: (run) => <span className="muted small">{whereOf(run)}</span> },
   {
     key: "minutes",
     label: "Minutes",
@@ -265,7 +263,7 @@ function AttemptRow({ attempt }: { attempt: PipelineAttempt }) {
         <code>{attempt.executor}</code>
       </td>
       <td>{badge(attempt.status)}</td>
-      <td style={muted}>
+      <td className="muted small">
         {attempt.reason ?? attempt.where ?? ""}
         {attempt.ciRunUrl && (
           <>
@@ -314,25 +312,25 @@ export function PipelineJobs({
   };
 
   if (error) return <div className="error">Could not load run {id}: {error}</div>;
-  if (!run) return <p style={muted}>Loading the run's jobs…</p>;
+  if (!run) return <p className="muted small">Loading the run's jobs…</p>;
   return (
     <>
-      <p style={muted}>
+      <p className="muted small">
         {run.minutes} CI minute(s){run.billedMinutes > 0 ? `, ${run.billedMinutes} billed` : ""}
       </p>
       {run.error && <p className="error">{run.error}</p>}
       {!run.completedAt && !readOnly && (
-        <button type="button" className="small-button danger" onClick={() => void cancel()}>
+        <Button size="sm" variant="danger" onClick={() => void cancel()}>
           Cancel run
-        </button>
+        </Button>
       )}
       {cancelError && <p className="error">{cancelError}</p>}
       {run.jobs.map((job) => (
-        <div key={job.id} style={{ marginTop: "1rem" }}>
+        <div key={job.id} className="spaced-lg">
           <h4>
-            Lane {job.lane} {badge(job.status)} <span style={muted}>{duration(job.minutes * 60_000)}</span>
+            Lane {job.lane} {badge(job.status)} <span className="muted small">{duration(job.minutes * 60_000)}</span>
           </h4>
-          {job.waitReason && <p style={muted}>{job.waitReason}</p>}
+          {job.waitReason && <p className="muted small">{job.waitReason}</p>}
           {job.error && <p className="error">{job.error}</p>}
           <table className="table">
             <thead>
@@ -350,7 +348,7 @@ export function PipelineJobs({
             </tbody>
           </table>
           {job.artifacts.length > 0 && (
-            <p style={muted}>Artifacts: {job.artifacts.map((a) => `${a.name} (${a.sizeBytes} bytes)`).join(", ")}</p>
+            <p className="muted small">Artifacts: {job.artifacts.map((a) => `${a.name} (${a.sizeBytes} bytes)`).join(", ")}</p>
           )}
         </div>
       ))}
@@ -369,29 +367,25 @@ function WorkflowPanel({
 }) {
   const { data, error } = useApi<WorkflowFile>("/pipelines/workflow", project, refreshKey);
   return (
-    <div className="detail-panel">
-      <div className="detail-panel-header">
-        <h2>Workflow file</h2>
-        <button className="detail-panel-close" onClick={onClose}>
-          ×
-        </button>
-      </div>
+    <DetailPanel title="Workflow file" crumbs={[{ label: "Gates" }, { label: "Pipelines" }, { label: "Workflow file" }]} onClose={onClose}>
       {error && <div className="error">{error}</div>}
       {data && (
         <>
-          <ol style={{ ...muted, paddingLeft: "1.25rem" }}>
+          <ol className="muted small">
             {data.instructions.map((line) => (
-              <li key={line} style={{ marginBottom: "0.5rem" }}>
+              <li key={line} className="mb-2">
                 {line}
               </li>
             ))}
           </ol>
-          <p style={muted}>
+          <p className="muted small">
             <code>{data.path}</code> · version {data.version}
           </p>
-          <div className="code">{data.content}</div>
+          <CodeBlock label="Workflow file" wrap={false}>
+            {data.content}
+          </CodeBlock>
         </>
       )}
-    </div>
+    </DetailPanel>
   );
 }

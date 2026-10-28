@@ -24,16 +24,9 @@ import { AgentDetail } from "./AgentDetail";
 import { StartRunForm } from "./StartRunForm";
 import { DragonStartDialog } from "./DragonStartDialog";
 import { Planner } from "./Planner";
-import { EmptyState, ErrorState, Loading, ModuleOff, Time, muted, useOwnerSignedIn } from "./ui";
-
-const actionButton = {
-  padding: "0.4rem 0.9rem",
-  borderRadius: "4px",
-  border: "1px solid var(--accent)",
-  background: "transparent",
-  color: "var(--text-primary)",
-  cursor: "pointer",
-};
+import { EmptyState, ErrorState, Loading, ModuleOff, Time, useOwnerSignedIn } from "./ui";
+import { Badge } from "../ui/Badge";
+import { Button, ButtonLink } from "../ui/Button";
 
 const COLUMNS: Column<WorkRow>[] = [
   {
@@ -43,7 +36,7 @@ const COLUMNS: Column<WorkRow>[] = [
     render: (r) => (
       <>
         <code>{r.id}</code>
-        {r.name !== r.id && <div style={muted}>{r.name}</div>}
+        {r.name !== r.id && <div className="muted small">{r.name}</div>}
       </>
     ),
   },
@@ -53,14 +46,14 @@ const COLUMNS: Column<WorkRow>[] = [
     sort: (r) => (r.attention ? 0 : r.badge === "badge-success" ? 1 : 2),
     render: (r) => (
       <>
-        <span className={`badge ${r.badge}`}>{r.state}</span>
-        {r.detail && <div style={{ ...muted, maxWidth: "22rem" }}>{r.detail}</div>}
+        <Badge tone={r.badge}>{r.state}</Badge>
+        {r.detail && <div className="muted small measure">{r.detail}</div>}
       </>
     ),
   },
-  { key: "task", label: "Task", sort: (r) => r.task, render: (r) => (r.task ? <code>{r.task}</code> : <span style={muted}>—</span>) },
-  { key: "model", label: "Model", sort: (r) => r.model, render: (r) => <span style={muted}>{r.model ?? "—"}</span> },
-  { key: "machine", label: "Machine", sort: (r) => r.machine, render: (r) => <span style={muted}>{r.machine ?? "—"}</span> },
+  { key: "task", label: "Task", sort: (r) => r.task, render: (r) => (r.task ? <code>{r.task}</code> : <span className="muted small">—</span>) },
+  { key: "model", label: "Model", sort: (r) => r.model, render: (r) => <span className="muted small">{r.model ?? "—"}</span> },
+  { key: "machine", label: "Machine", sort: (r) => r.machine, render: (r) => <span className="muted small">{r.machine ?? "—"}</span> },
   {
     key: "log",
     label: "Last log",
@@ -69,7 +62,7 @@ const COLUMNS: Column<WorkRow>[] = [
       r.lastLogTime ? (
         <Time iso={r.lastLogTime} />
       ) : (
-        <span style={muted} title="No log of it (<id>.log or <id>-<UTC time>.log) in agents_dir">
+        <span className="muted small" title="No log of it (<id>.log or <id>-<UTC time>.log) in agents_dir">
           unknown
         </span>
       ),
@@ -101,17 +94,17 @@ export function Work({ project, refreshKey, route, modules, readOnly, open }: Se
   const header = (
     <SectionHeader title="Work" section="work" route={route} modules={modules}>
       {agents && !readOnly && (
-        <button type="button" style={actionButton} onClick={() => setShowStart((s) => !s)} disabled={signedIn !== true}>
+        <Button size="sm" onClick={() => setShowStart((s) => !s)} disabled={signedIn !== true}>
           {showStart ? "Close the form" : "Start a run"}
-        </button>
+        </Button>
       )}
       {!agentsOn && !readOnly && hasStartableDragons(dragonConfig.data?.dragons) && (
-        <button type="button" style={actionButton} onClick={() => setShowDragonStart(true)} disabled={signedIn !== true}>
+        <Button size="sm" onClick={() => setShowDragonStart(true)} disabled={signedIn !== true}>
           Start an agent
-        </button>
+        </Button>
       )}
       {agents?.lastTick && (
-        <span style={muted}>
+        <span className="muted small">
           Last check <Time iso={agents.lastTick.at} />
         </span>
       )}
@@ -181,7 +174,7 @@ export function Work({ project, refreshKey, route, modules, readOnly, open }: Se
         </div>
       ))}
       {message && (
-        <div className="card" style={muted} role="status">
+        <div className="card muted small" role="status">
           {message}
         </div>
       )}
@@ -255,7 +248,7 @@ function FillTab({
       render: (l) => (
         <>
           {l.task ? <code>{l.task}</code> : "—"}
-          {l.description && <div style={muted}>{l.description}</div>}
+          {l.description && <div className="muted small">{l.description}</div>}
         </>
       ),
     },
@@ -276,19 +269,18 @@ function FillTab({
       key: "detail",
       label: "Detail",
       render: (l) => (
-        <span style={muted}>
+        <span className="muted small">
           {l.detail}{" "}
           {fillDecisionHref(l) && (
             <>
-              <a href={fillDecisionHref(l) ?? undefined} className="small-button" onClick={(e) => e.stopPropagation()}>
+              <ButtonLink size="sm" href={fillDecisionHref(l) ?? undefined} onClick={(e) => e.stopPropagation()}>
                 Answer it
-              </a>{" "}
+              </ButtonLink>{" "}
             </>
           )}
           {l.releasable && !readOnly && (
-            <button
-              type="button"
-              className="small-button"
+            <Button
+              size="sm"
               disabled={signedIn !== true}
               title={signedIn === true ? undefined : "Sign in as the owner from Decisions first"}
               onClick={(e) => {
@@ -297,7 +289,7 @@ function FillTab({
               }}
             >
               {l.hold === "paused" ? "Release (start it again)" : "Release hold"}
-            </button>
+            </Button>
           )}
         </span>
       ),
@@ -305,7 +297,7 @@ function FillTab({
   ];
   return (
     <div className="card">
-      <p style={muted}>
+      <p className="muted small">
         {fill.tasksFile ?? "no tasks_file"}: last check <Time iso={fill.lastCheck} />, {fill.active} of {fill.maxActive} run(s)
         active, agents {fill.agents.join(", ") || "none"}
         {fill.running ? "" : " (not running)"}
@@ -330,7 +322,7 @@ function LocksTab({ status }: { status: AgentsStatusView | null }) {
       <div className="card">
         <h3>Launch locks</h3>
         {status.locks.length === 0 ? (
-          <p style={muted}>No agents.locks configured.</p>
+          <p className="muted small">No agents.locks configured.</p>
         ) : (
           <table className="table">
             <thead>
@@ -346,7 +338,7 @@ function LocksTab({ status }: { status: AgentsStatusView | null }) {
                 <tr key={lock.name}>
                   <td>
                     <code>{lock.name}</code>
-                    <div style={muted}>
+                    <div className="muted small">
                       {lock.path} (hold: {lock.hold})
                     </div>
                   </td>
@@ -358,7 +350,7 @@ function LocksTab({ status }: { status: AgentsStatusView | null }) {
                         : `pid ${lock.holderPid}${lock.holderAlive === null ? "" : lock.holderAlive ? " (alive)" : " (dead)"}`}
                   </td>
                   <td>{lock.breaks}</td>
-                  <td style={muted}>{lock.detail}</td>
+                  <td className="muted small">{lock.detail}</td>
                 </tr>
               ))}
             </tbody>

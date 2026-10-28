@@ -18,7 +18,8 @@ import { GateDetail } from "./GateDetail";
 import { PipelineRuns } from "./PipelineRuns";
 import { Triage } from "./Triage";
 import { PlacementMoves, usePlacement } from "./Placement";
-import { EmptyState, ErrorState, Loading, ModuleOff, Time, muted } from "./ui";
+import { EmptyState, ErrorState, Loading, ModuleOff, Time } from "./ui";
+import { Badge } from "../ui/Badge";
 
 interface GatesData {
   queue: Gate[];
@@ -30,15 +31,15 @@ const RESULT_COLUMNS: Column<GateResult>[] = [
     key: "result",
     label: "Result",
     sort: (r) => r.rc,
-    render: (r) => <span className={`badge ${r.rc === 0 ? "badge-success" : "badge-error"}`}>{r.rc === 0 ? "passed" : `failed (${r.rc})`}</span>,
+    render: (r) => <Badge tone={r.rc === 0 ? "badge-success" : "badge-error"}>{r.rc === 0 ? "passed" : `failed (${r.rc})`}</Badge>,
   },
   { key: "finished", label: "Finished", sort: (r) => r.finishedAt, render: (r) => <Time iso={r.finishedAt} /> },
   { key: "track", label: "Track", sort: (r) => trackOf(r.id), render: (r) => trackOf(r.id) },
-  { key: "id", label: "Gate", render: (r) => <code style={{ fontSize: "0.8rem" }}>{r.id}</code> },
+  { key: "id", label: "Gate", render: (r) => <code className="small">{r.id}</code> },
   {
     key: "failed",
     label: "Failed steps",
-    render: (r) => <span style={{ color: "var(--error)", fontSize: "0.85rem" }}>{r.failedSteps?.join(", ") || "—"}</span>,
+    render: (r) => <span className="text-danger small">{r.failedSteps?.join(", ") || "—"}</span>,
   },
 ];
 
@@ -60,12 +61,12 @@ export function GatesSection({ project, refreshKey, route, modules, readOnly, op
       key: "status",
       label: "Status",
       sort: (g) => (g.status === "running" ? 0 : g.status === "queued" ? 1 : 2),
-      render: (g) => <span className={`badge ${statusBadge(g.status)}`}>{g.status}</span>,
+      render: (g) => <Badge tone={statusBadge(g.status)}>{g.status}</Badge>,
     },
     { key: "lane", label: "Lane", sort: (g) => g.lane, render: (g) => g.lane },
     { key: "priority", label: "Priority", align: "right", sort: (g) => g.priority, render: (g) => g.priority },
     { key: "track", label: "Track", sort: (g) => g.track ?? g.id, render: (g) => g.track ?? <code>{g.id}</code> },
-    { key: "step", label: "Step", render: (g) => <span style={muted}>{g.currentStep ?? "—"}</span> },
+    { key: "step", label: "Step", render: (g) => <span className="muted small">{g.currentStep ?? "—"}</span> },
     { key: "age", label: "Submitted", sort: (g) => g.startTime, render: (g) => <Time iso={g.startTime} /> },
     ...(placementOn
       ? [
@@ -73,7 +74,7 @@ export function GatesSection({ project, refreshKey, route, modules, readOnly, op
             key: "placement",
             label: "Placement",
             render: (g: Gate) => (
-              <span style={muted} title={placed.get(g.id)?.advice?.explanation}>
+              <span className="muted small" title={placed.get(g.id)?.advice?.explanation}>
                 {adviceText(placed.get(g.id), placement.data?.mode ?? null)}
               </span>
             ),
@@ -142,7 +143,7 @@ export function GatesSection({ project, refreshKey, route, modules, readOnly, op
   return (
     <div>
       <SectionHeader title="Gates" section="gates" route={route} modules={modules}>
-        <span style={muted}>
+        <span className="muted small">
           {running} running, {queued} queued
           {queueLanes(queue).length > 0 &&
             ` · ${queueLanes(queue)

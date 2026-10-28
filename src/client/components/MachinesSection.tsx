@@ -18,27 +18,28 @@ import { DataTable, type Column } from "./DataTable";
 import { DetailPanel, DetailSection } from "./DetailPanel";
 import { SectionHeader, type SectionProps } from "./Section";
 import { usePlacement } from "./Placement";
-import { EmptyState, ErrorState, KeyValues, Loading, Time, muted } from "./ui";
+import { EmptyState, ErrorState, KeyValues, Loading, Time } from "./ui";
+import { Badge } from "../ui/Badge";
 
 const MACHINE_COLUMNS: Column<MachineRow>[] = [
   { key: "id", label: "Machine", sort: (r) => r.id, render: (r) => <strong>{r.id}</strong> },
-  { key: "type", label: "Type", sort: (r) => r.type, render: (r) => <span style={muted}>{r.type}</span> },
+  { key: "type", label: "Type", sort: (r) => r.type, render: (r) => <span className="muted small">{r.type}</span> },
   {
     key: "state",
     label: "State",
     sort: (r) => (r.badge === "badge-success" ? 0 : r.badge === "badge-warning" ? 1 : 2),
-    render: (r) => <span className={`badge ${r.badge}`}>{r.state}</span>,
+    render: (r) => <Badge tone={r.badge}>{r.state}</Badge>,
   },
-  { key: "runners", label: "Runners", render: (r) => <span style={muted}>{r.runners}</span> },
-  { key: "load", label: "Load", render: (r) => <span style={muted}>{r.load}</span> },
+  { key: "runners", label: "Runners", render: (r) => <span className="muted small">{r.runners}</span> },
+  { key: "load", label: "Load", render: (r) => <span className="muted small">{r.load}</span> },
   { key: "checked", label: "Checked", sort: (r) => r.lastCheck, render: (r) => <Time iso={r.lastCheck} /> },
 ];
 
 const NODE_COLUMNS: Column<NodeRow>[] = [
   { key: "name", label: "Node", sort: (r) => r.name, render: (r) => <strong>{r.name}</strong> },
-  { key: "status", label: "Status", sort: (r) => r.status, render: (r) => <span className={`badge ${r.badge}`}>{r.status}</span> },
-  { key: "capacity", label: "Capacity", render: (r) => <span style={muted}>{r.capacity}</span> },
-  { key: "used", label: "In use", render: (r) => <span style={muted}>{r.used}</span> },
+  { key: "status", label: "Status", sort: (r) => r.status, render: (r) => <Badge tone={r.badge}>{r.status}</Badge> },
+  { key: "capacity", label: "Capacity", render: (r) => <span className="muted small">{r.capacity}</span> },
+  { key: "used", label: "In use", render: (r) => <span className="muted small">{r.used}</span> },
   { key: "jobs", label: "Jobs", align: "right", sort: (r) => r.jobs, render: (r) => r.jobs },
   { key: "heartbeat", label: "Heartbeat", sort: (r) => r.lastHeartbeat, render: (r) => <Time iso={r.lastHeartbeat} /> },
 ];
@@ -63,7 +64,7 @@ export function MachinesSection({ project, refreshKey, route, modules, open }: S
       return (
         <>
           {scheduler && (
-            <p style={muted}>
+            <p className="muted small">
               Scheduler {scheduler.running ? "running" : "stopped"} · {scheduler.nodesOnline}/{scheduler.nodesTotal} nodes online ·{" "}
               {scheduler.queuedTasks} task(s) queued, {scheduler.runningJobs} job(s) running · agents {scheduler.activeAgents}/
               {scheduler.maxAgents}
@@ -109,7 +110,7 @@ export function MachinesSection({ project, refreshKey, route, modules, open }: S
   return (
     <div>
       <SectionHeader title="Machines" section="machines" route={route} modules={modules}>
-        {placement.data?.enabled && <span style={muted}>Placement: {placement.data.mode ?? "off"}</span>}
+        {placement.data?.enabled && <span className="muted small">Placement: {placement.data.mode ?? "off"}</span>}
       </SectionHeader>
       {body()}
       {route.detail && route.tab !== "nodes" && (
@@ -144,7 +145,7 @@ function MachineDetailPanel({
   const { row, lanes, jobs } = model;
   const probe = row.probe;
   return (
-    <DetailPanel title={row.id} subtitle={<span className={`badge ${row.badge}`}>{row.state}</span>} onClose={onClose}>
+    <DetailPanel title={row.id} subtitle={<Badge tone={row.badge}>{row.state}</Badge>} onClose={onClose}>
       <KeyValues
         rows={[
           ["Type", row.type],
@@ -183,7 +184,7 @@ function MachineDetailPanel({
       {lanes.length > 0 && (
         <DetailSection title="Jobs on its lanes">
           {jobs.length === 0 ? (
-            <p style={muted}>None queued or running.</p>
+            <p className="muted small">None queued or running.</p>
           ) : (
             <table className="table">
               <tbody>
@@ -193,11 +194,11 @@ function MachineDetailPanel({
                       <a href={linkTo("gates", job.id)}>
                         <code>{job.id}</code>
                       </a>
-                      <div style={muted}>
+                      <div className="muted small">
                         {job.lane} · {job.status}
                       </div>
                     </td>
-                    <td style={muted}>
+                    <td className="muted small">
                       {job.status === "queued" ? `starts ${eta(job.expectedStart)}` : `finishes ${eta(job.expectedFinish)}`}
                       <div>{adviceText(job, placement?.mode ?? null)}</div>
                     </td>
@@ -223,7 +224,7 @@ function NodeDetailPanel({ id, rows, loading, onClose }: { id: string; rows: Nod
   }
   const node = row.node;
   return (
-    <DetailPanel title={row.name} subtitle={<span className={`badge ${row.badge}`}>{row.status}</span>} onClose={onClose}>
+    <DetailPanel title={row.name} subtitle={<Badge tone={row.badge}>{row.status}</Badge>} onClose={onClose}>
       <KeyValues
         rows={[
           ["Id", <code key="i">{node.id}</code>],

@@ -17,7 +17,7 @@ export const muted = { color: "var(--color-text-muted)", fontSize: "var(--text-s
 
 /** "5 min ago", with the absolute time on hover. */
 export function Time({ iso, now }: { iso: string | null | undefined; now?: number }) {
-  if (!iso) return <span style={muted}>—</span>;
+  if (!iso) return <span className="muted small">—</span>;
   return (
     <time dateTime={iso} title={absoluteTime(iso)}>
       {relativeTime(iso, now)}
@@ -110,7 +110,7 @@ export function useOwnerSignedIn(refreshKey?: number): boolean | null {
  */
 export function OwnerOnlyNotice({ text }: { text: string }) {
   return (
-    <p className="owner-only" data-owner-only="signed-out" style={muted}>
+    <p className="owner-only muted small" data-owner-only="signed-out">
       {text} Sign this browser in as the owner from <a href={linkTo("decisions")}>Decisions</a>.
     </p>
   );

@@ -22,7 +22,9 @@ import {
   turnStatus,
 } from "../supervisor-chat";
 import { SafeMarkdown } from "./SafeMarkdown";
-import { Badge, ErrorState, OwnerOnlyNotice, Time, muted, useOwnerSignedIn } from "./ui";
+import { Badge, ErrorState, OwnerOnlyNotice, Time, useOwnerSignedIn } from "./ui";
+import { Button } from "../ui/Button";
+import { Icon } from "../ui/Icon";
 
 /** Open the chat panel: on a conversation, and/or with a question to ask */
 export interface ChatRequest {
@@ -41,7 +43,7 @@ function EvidenceList({ turn }: { turn: ConversationTurn }) {
       <ul className="plain-list">
         {turn.evidence.map((item, i) => (
           <li key={i}>
-            <code>{item.tool}</code> <code style={muted}>{JSON.stringify(item.args)}</code>
+            <code>{item.tool}</code> <code className="muted small">{JSON.stringify(item.args)}</code>
             {item.note && <div>{item.note}</div>}
           </li>
         ))}
@@ -56,14 +58,14 @@ export function TurnView({ turn, policy }: { turn: ConversationTurn; policy: Lin
   return (
     <li className="chat-turn" data-turn={turn.state}>
       <div className="chat-question">
-        <span style={muted}>
+        <span className="muted small">
           You, <Time iso={turn.askedAt} />
         </span>
-        <div style={{ whiteSpace: "pre-wrap" }}>{turn.question}</div>
+        <div className="pre-wrap">{turn.question}</div>
       </div>
       <div className="chat-answer">
         {turn.state === "pending" && (
-          <p className="chat-looking" style={muted} data-looking="true">
+          <p className="chat-looking muted small" data-looking="true">
             {status.label}
           </p>
         )}
@@ -71,7 +73,7 @@ export function TurnView({ turn, policy }: { turn: ConversationTurn; policy: Lin
           <>
             <SafeMarkdown text={turn.answer} policy={policy} />
             <EvidenceList turn={turn} />
-            <p style={muted}>
+            <p className="muted small">
               {turn.agent ? `${turn.agent}, ` : ""}
               {turn.answeredAt && <Time iso={turn.answeredAt} />}
             </p>
@@ -79,7 +81,7 @@ export function TurnView({ turn, policy }: { turn: ConversationTurn; policy: Lin
         )}
         {turn.state === "no_answer" && (
           <p data-no-answer="true">
-            <Badge tone={status.tone}>{status.label}</Badge> <span style={muted}>{turn.reason}</span>
+            <Badge tone={status.tone}>{status.label}</Badge> <span className="muted small">{turn.reason}</span>
           </p>
         )}
       </div>
@@ -187,24 +189,24 @@ export function SupervisorChatPanel({
         <h3>Ask Lair</h3>
         <span>
           {conversation && (
-            <button type="button" className="small-button" onClick={() => setConversation(null)} disabled={sending}>
+            <Button size="sm" onClick={() => setConversation(null)} disabled={sending}>
               New conversation
-            </button>
+            </Button>
           )}{" "}
-          <button type="button" className="result-close" onClick={onClose} aria-label="Close">
-            ×
-          </button>
+          <Button variant="ghost" size="sm" className="icon-button" onClick={onClose} aria-label="Close">
+            <Icon name="close" />
+          </Button>
         </span>
       </div>
       {conversation ? (
         <ConversationTurns conversation={conversation} />
       ) : (
-        <p style={muted}>
+        <p className="muted small">
           Ask about this project and the fleet: why an agent is held, why nothing merges, which gates failed and why. Lair's
           supervisor answers from Lair's own records and cites them; it changes nothing.
         </p>
       )}
-      {sending && !conversation && <p style={muted}>Asking…</p>}
+      {sending && !conversation && <p className="muted small">Asking…</p>}
       {problem && (
         <p className="warning" data-problem="chat">
           {`Questions can't be answered now: ${problem}`}
@@ -225,9 +227,9 @@ export function SupervisorChatPanel({
           onChange={(e) => setText(e.target.value)}
           disabled={sending || pending}
         />
-        <button type="submit" className="small-button primary" disabled={sending || pending || !text.trim()}>
+        <Button size="sm" variant="primary" type="submit" disabled={sending || pending || !text.trim()}>
           {sending ? "Asking…" : "Ask"}
-        </button>
+        </Button>
       </form>
     </aside>
   );
@@ -249,7 +251,7 @@ export function AskLairCardView({
     <div className="card" data-card="ask-lair">
       <h3>Ask Lair</h3>
       {hint ? (
-        <p style={muted} data-hint="chat">
+        <p className="muted small" data-hint="chat">
           {hint}
         </p>
       ) : (
@@ -271,9 +273,9 @@ export function AskLairCardView({
             value={text}
             onChange={(e) => setText(e.target.value)}
           />
-          <button type="submit" className="small-button primary" disabled={!text.trim()}>
+          <Button size="sm" variant="primary" type="submit" disabled={!text.trim()}>
             Ask
-          </button>
+          </Button>
         </form>
       )}
       {status.conversations.length > 0 && (
@@ -283,7 +285,7 @@ export function AskLairCardView({
               <button type="button" className="link-button" onClick={() => onOpen(c.id)}>
                 {c.title || "(a question)"}
               </button>{" "}
-              <span style={muted}>
+              <span className="muted small">
                 {c.state === "pending" ? "looking…" : c.state === "no_answer" ? "no answer" : `${c.turns} question(s)`},{" "}
                 <Time iso={c.updatedAt} />
               </span>
@@ -291,7 +293,7 @@ export function AskLairCardView({
           ))}
         </ul>
       )}
-      {!hint && <p style={muted}>{limitsLine(status)}</p>}
+      {!hint && <p className="muted small">{limitsLine(status)}</p>}
     </div>
   );
 }
@@ -326,7 +328,7 @@ export function DigestCardView({ view }: { view: DigestView }) {
     <div className="card" data-card="digest">
       <h3>{`Today's digest${view.latest?.digestDate ? ` (${view.latest.digestDate})` : ""}`}</h3>
       {!turn ? (
-        <p style={muted}>{`No digest yet: the supervisor writes one every day at ${view.time} (this machine's local time).`}</p>
+        <p className="muted small">{`No digest yet: the supervisor writes one every day at ${view.time} (this machine's local time).`}</p>
       ) : (
         <ConversationAnswer turn={turn} policy={{ repoUrl: view.latest?.repoUrl ?? null }} />
       )}
@@ -336,11 +338,11 @@ export function DigestCardView({ view }: { view: DigestView }) {
 
 /** A digest's answer, without the request Lair made. */
 function ConversationAnswer({ turn, policy }: { turn: ConversationTurn; policy: LinkPolicy }) {
-  if (turn.state === "pending") return <p style={muted}>Lair is writing today's digest…</p>;
+  if (turn.state === "pending") return <p className="muted small">Lair is writing today's digest…</p>;
   if (turn.state === "no_answer") {
     return (
       <p>
-        <Badge tone="warning">No digest</Badge> <span style={muted}>{turn.reason}</span>
+        <Badge tone="warning">No digest</Badge> <span className="muted small">{turn.reason}</span>
       </p>
     );
   }

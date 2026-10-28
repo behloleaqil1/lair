@@ -3,12 +3,12 @@
  * budgets): what was used this period against the soft and hard limits.
  */
 import type { BudgetScopeView } from "../../shared/agents-types";
-import { Badge, muted } from "./ui";
+import { Badge } from "./ui";
 
 export function BudgetLines({ budget }: { budget: BudgetScopeView | null }) {
-  if (!budget || budget.lines.length === 0) return <span style={muted}>No limits set</span>;
+  if (!budget || budget.lines.length === 0) return <span className="muted small">No limits set</span>;
   return (
-    <ul style={{ ...muted, margin: 0, paddingLeft: "1rem" }}>
+    <ul className="muted small m-0">
       {budget.lines.map((line) => (
         <li key={line.metric}>
           <Badge tone={line.level === "hard" ? "error" : line.level === "soft" ? "warning" : "neutral"}>{line.level}</Badge>{" "}

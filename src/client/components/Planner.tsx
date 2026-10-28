@@ -9,6 +9,8 @@
  */
 import { useEffect, useState } from "react";
 import type { ChangeView, PlannerOverviewView, PlannerRunView, ProposalView } from "../../shared/planner-types";
+import { Badge } from "../ui/Badge";
+import { Button } from "../ui/Button";
 import {
   checkNowAction,
   getHistory,
@@ -26,17 +28,6 @@ interface Props {
   project: string;
   refreshKey: number;
 }
-
-const muted = { color: "var(--text-secondary)", fontSize: "0.85rem" };
-const button = {
-  padding: "0.3rem 0.7rem",
-  borderRadius: "4px",
-  border: "none",
-  background: "var(--primary)",
-  color: "white",
-  cursor: "pointer",
-  marginRight: "0.4rem",
-};
 
 const STATUS_BADGE: Record<string, string> = {
   pending: "badge-warning",
@@ -102,7 +93,7 @@ export function Planner({ project, refreshKey }: Props) {
       <div className="card">
         <h2>Planner</h2>
         <p>{error}</p>
-        <p style={muted}>The Planner view shows plan text, so it needs this browser signed in as the owner (Decisions view).</p>
+        <p className="muted small">The Planner view shows plan text, so it needs this browser signed in as the owner (Decisions view).</p>
       </div>
     );
   }
@@ -114,7 +105,7 @@ export function Planner({ project, refreshKey }: Props) {
       <div className="card">
         <h2>Planner</h2>
         <p>
-          <span className={`badge ${o.mode === "act" ? "badge-warning" : "badge-neutral"}`}>{o.mode}</span>{" "}
+          <Badge tone={o.mode === "act" ? "badge-warning" : "badge-neutral"}>{o.mode}</Badge>{" "}
           {o.running ? "running" : "stopped"} · last cycle {time(o.lastCycle)}
           {o.paused && <> · <strong>planner runs paused</strong>{o.pausedReason ? `: ${o.pausedReason}` : ""}</>}
         </p>
@@ -123,28 +114,28 @@ export function Planner({ project, refreshKey }: Props) {
           <p key={e} className="error">{e}</p>
         ))}
         {o.warnings.map((w) => (
-          <p key={w} style={muted}>Warning: {w}</p>
+          <p key={w} className="muted small">Warning: {w}</p>
         ))}
-        <p style={muted}>Tasks file: <code>{o.tasksFile}</code> · allowlist: {o.allowlist.join(", ") || "none"} · idle: {o.idleAgents.join(", ") || "none"}</p>
+        <p className="muted small">Tasks file: <code>{o.tasksFile}</code> · allowlist: {o.allowlist.join(", ") || "none"} · idle: {o.idleAgents.join(", ") || "none"}</p>
         {o.agent ? (
-          <p style={muted}>
+          <p className="muted small">
             Planner agent <code>{o.agent.id}</code> (prompt <code>{o.agent.promptFile}</code>, at most {o.agent.maxProposals} proposals,
             every {o.agent.minIntervalSeconds} s at most, {o.agent.runsInDay} of {o.agent.maxRunsPerDay} runs in the last 24 h) · next
             run: {o.agent.nextRunAt ? time(o.agent.nextRunAt) : "no trigger pending"}
             {o.activeRun && <> · running since {time(o.activeRun.requestedAt)}</>}
           </p>
         ) : (
-          <p style={muted}>No planner agent: only the rules run.</p>
+          <p className="muted small">No planner agent: only the rules run.</p>
         )}
-        <button style={button} onClick={checkNow}>Check now</button>
-        {o.paused && <button style={button} onClick={() => act(resumeAction(project))}>Resume planner runs</button>}
-        {notice && <span style={muted}>{notice}</span>}
+        <Button size="sm" variant="primary" onClick={checkNow}>Check now</Button>
+        {o.paused && <Button size="sm" variant="primary" onClick={() => act(resumeAction(project))}>Resume planner runs</Button>}
+        {notice && <span className="muted small">{notice}</span>}
       </div>
 
       <div className="card">
         <h3>Waiting for you ({pending.length})</h3>
         {pending.length === 0 ? (
-          <p style={muted}>No proposal waits.</p>
+          <p className="muted small">No proposal waits.</p>
         ) : (
           <table className="table">
             <tbody>
@@ -152,10 +143,10 @@ export function Planner({ project, refreshKey }: Props) {
                 <tr key={p.id}>
                   <td><code>{p.op}</code></td>
                   <td><code>{p.task}</code>{p.agent && <> → {p.agent}</>}</td>
-                  <td>{p.text && <div>“{p.text}”</div>}<div style={muted}>{p.reason}</div></td>
-                  <td style={{ whiteSpace: "nowrap" }}>
-                    <button style={button} onClick={() => act(proposalAction(project, p, "approve"))}>Approve</button>
-                    <button style={{ ...button, background: "var(--text-secondary)" }} onClick={() => act(proposalAction(project, p, "reject"))}>Reject</button>
+                  <td>{p.text && <div>“{p.text}”</div>}<div className="muted small">{p.reason}</div></td>
+                  <td className="nowrap">
+                    <Button size="sm" variant="primary" onClick={() => act(proposalAction(project, p, "approve"))}>Approve</Button>
+                    <Button size="sm" onClick={() => act(proposalAction(project, p, "reject"))}>Reject</Button>
                   </td>
                 </tr>
               ))}
@@ -170,14 +161,14 @@ export function Planner({ project, refreshKey }: Props) {
           <tbody>
             {o.sources.map((s) => (
               <tr key={s.name}>
-                <td><code>{s.name}</code> <span style={muted}>{s.kind}</span></td>
-                <td><span className={`badge ${s.ok ? "badge-success" : "badge-error"}`}>{s.ok ? "ok" : "error"}</span></td>
+                <td><code>{s.name}</code> <span className="muted small">{s.kind}</span></td>
+                <td><Badge tone={s.ok ? "badge-success" : "badge-error"}>{s.ok ? "ok" : "error"}</Badge></td>
                 <td>
                   {s.kind === "markdown_plan" || s.kind === "backlog_file"
                     ? `${s.tasks} tasks: ${s.open} open, ${s.done} done, ${s.withoutId} without an id, ${s.duplicates} duplicate ids`
                     : `${s.items} item(s)`}
                   {s.files.map((f) => (
-                    <div key={f.path} style={muted}>
+                    <div key={f.path} className="muted small">
                       <code>{f.path}</code> {f.ok ? `${f.bytes} bytes, ${f.lines} lines${f.truncated ? " (cut)" : ""}` : f.error}
                     </div>
                   ))}
@@ -197,7 +188,7 @@ export function Planner({ project, refreshKey }: Props) {
                 <td>{l.line}</td>
                 <td>{l.agent}</td>
                 <td><code>{l.task}</code></td>
-                <td style={muted}>{l.description}</td>
+                <td className="muted small">{l.description}</td>
               </tr>
             ))}
           </tbody>
@@ -211,12 +202,12 @@ export function Planner({ project, refreshKey }: Props) {
         <div className="card">
           <h3>Triggers and blocked tasks</h3>
           {o.triggers.map((t, i) => (
-            <p key={`t${i}`} style={muted}><code>{t.kind}</code> {t.agent ?? ""} {t.task ?? ""}: {t.detail}</p>
+            <p key={`t${i}`} className="muted small"><code>{t.kind}</code> {t.agent ?? ""} {t.task ?? ""}: {t.detail}</p>
           ))}
           {o.blocked.map((b) => (
             <p key={b.task}>
-              <code>{b.task}</code> ({b.agent ?? "?"}): <span className="badge badge-neutral">{b.class}</span> {b.reason}
-              <span style={muted}> · {b.route} · attempts {b.attempts}</span>
+              <code>{b.task}</code> ({b.agent ?? "?"}): <Badge tone="neutral">{b.class}</Badge> {b.reason}
+              <span className="muted small"> · {b.route} · attempts {b.attempts}</span>
             </p>
           ))}
         </div>
@@ -228,9 +219,9 @@ export function Planner({ project, refreshKey }: Props) {
           <tbody>
             {o.openTasks.slice(0, 100).map((t) => (
               <tr key={`${t.file}:${t.line}`}>
-                <td>{t.id ? <code>{t.id}</code> : <span style={muted}>line {t.line}</span>}</td>
-                <td>{t.ready ? <span className="badge badge-success">ready</span> : <span style={muted}>waits on {t.waitingOn.join(", ")}</span>}</td>
-                <td>{t.text}<div style={muted}>{t.section}</div></td>
+                <td>{t.id ? <code>{t.id}</code> : <span className="muted small">line {t.line}</span>}</td>
+                <td>{t.ready ? <Badge tone="success">ready</Badge> : <span className="muted small">waits on {t.waitingOn.join(", ")}</span>}</td>
+                <td>{t.text}<div className="muted small">{t.section}</div></td>
               </tr>
             ))}
           </tbody>
@@ -243,17 +234,17 @@ export function Planner({ project, refreshKey }: Props) {
           <tbody>
             {runs.map((r) => (
               <tr key={r.id}>
-                <td style={{ whiteSpace: "nowrap" }}>{time(r.requestedAt)}</td>
-                <td><span className={`badge ${STATUS_BADGE[r.state] ?? "badge-neutral"}`}>{r.state}</span></td>
+                <td className="nowrap">{time(r.requestedAt)}</td>
+                <td><Badge tone={STATUS_BADGE[r.state] ?? "badge-neutral"}>{r.state}</Badge></td>
                 <td>
                   {r.triggers.map((t) => t.kind).join(", ") || "—"}
-                  <div style={muted}>{r.detail}</div>
+                  <div className="muted small">{r.detail}</div>
                 </td>
-                <td style={{ whiteSpace: "nowrap" }}>
+                <td className="nowrap">
                   {r.pending > 0 && (
                     <>
-                      <button style={button} onClick={() => act(runAction(project, r.id, r.pending, "approve"))}>Approve all</button>
-                      <button style={{ ...button, background: "var(--text-secondary)" }} onClick={() => act(runAction(project, r.id, r.pending, "reject"))}>Reject all</button>
+                      <Button size="sm" variant="primary" onClick={() => act(runAction(project, r.id, r.pending, "approve"))}>Approve all</Button>
+                      <Button size="sm" onClick={() => act(runAction(project, r.id, r.pending, "reject"))}>Reject all</Button>
                     </>
                   )}
                 </td>
@@ -265,8 +256,8 @@ export function Planner({ project, refreshKey }: Props) {
           <>
             <h4>Decided proposals</h4>
             {recent.map((p) => (
-              <p key={p.id} style={muted}>
-                <span className={`badge ${STATUS_BADGE[p.status] ?? "badge-neutral"}`}>{p.status}</span> {p.op} {p.task}
+              <p key={p.id} className="muted small">
+                <Badge tone={STATUS_BADGE[p.status] ?? "badge-neutral"}>{p.status}</Badge> {p.op} {p.task}
                 {p.refusal ? `: ${p.refusal}` : ""}
               </p>
             ))}
@@ -276,15 +267,15 @@ export function Planner({ project, refreshKey }: Props) {
 
       <div className="card">
         <h3>History</h3>
-        {history.length === 0 && <p style={muted}>No change yet.</p>}
+        {history.length === 0 && <p className="muted small">No change yet.</p>}
         {history.map((c) => (
-          <div key={c.id} style={{ marginBottom: "0.75rem" }}>
+          <div key={c.id} className="mb-3">
             <div>
-              <span className={`badge ${STATUS_BADGE[c.outcome] ?? "badge-neutral"}`}>{c.outcome}</span> <code>{c.op}</code> {c.task ?? ""}{" "}
-              <span style={muted}>· {c.source} · {time(c.at)}</span>
+              <Badge tone={STATUS_BADGE[c.outcome] ?? "badge-neutral"}>{c.outcome}</Badge> <code>{c.op}</code> {c.task ?? ""}{" "}
+              <span className="muted small">· {c.source} · {time(c.at)}</span>
             </div>
-            <div style={muted}>{c.reason}</div>
-            {c.diff.length > 0 && <pre style={{ fontSize: "0.8rem", whiteSpace: "pre-wrap" }}>{c.diff.join("\n")}</pre>}
+            <div className="muted small">{c.reason}</div>
+            {c.diff.length > 0 && <pre className="code-block">{c.diff.join("\n")}</pre>}
           </div>
         ))}
       </div>
