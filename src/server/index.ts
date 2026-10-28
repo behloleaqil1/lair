@@ -41,7 +41,7 @@ import { getEventBus } from "./core/event-bus.js";
 import { WatchdogManager, registerWatchdogRoutes } from "./watchdog/index.js";
 import { DeliveryManager, registerDeliveryRoutes } from "./delivery/index.js";
 import { PipelineManager, registerPipelineRoutes } from "./gates/index.js";
-import { AgentsManager, registerAgentsRoutes } from "./agents/index.js";
+import { AgentsManager, registerAgentsRoutes, systemAgentProbesWithCache } from "./agents/index.js";
 import { isActive } from "./agents/types.js";
 import { AiToolsService, registerAiRoutes } from "./ai/index.js";
 import { getBudgetManager } from "./fleet/budget.js";
@@ -64,6 +64,9 @@ import { SettingsService, registerSettingsUiRoutes } from "./settings/index.js";
 import { mountPlanner, plannerAgentsFrom } from "./planner/index.js";
 import { join } from "path";
 import type { ApiResponse, ProjectConfig } from "../shared/types.js";
+import { initProcessCache, disposeProcessCache, CachedProcessTable } from "./core/process-cache.js";
+import { systemProbesWithCache } from "./watchdog/probes.js";
+import { DataCacheManager, type CachedData } from "./services/data-cache.js";
 
 const PORT = 4777;
 const HOST = process.env.LAIR_HOST || "127.0.0.1";
@@ -108,6 +111,21 @@ function respondError(error: string): ApiResponse<never> {
   };
 }
 
+/** Response with cache metadata for expensive routes */
+function respondCached<T>(cached: CachedData<T>): ApiResponse<T> & { cache: { ageMs: number; stale: boolean; refreshedAt: string; error?: string } } {
+  return {
+    success: true,
+    data: cached.value,
+    timestamp: new Date().toISOString(),
+    cache: {
+      ageMs: cached.ageMs,
+      stale: cached.stale,
+      refreshedAt: cached.refreshedAt,
+      ...(cached.error ? { error: cached.error } : {}),
+    },
+  };
+}
+
 // Get data service for project (cached per request cycle)
 const dataServices = new Map<string, DataService>();
 
@@ -129,6 +147,13 @@ function getDataService(project?: string): DataService {
   }
 
   return dataServices.get(projectName)!;
+}
+
+/** Get the data cache for a project (expensive operations use this). */
+function getDataCache(project?: string) {
+  const projectName = project || getDefaultProject();
+  const config = loadProjectConfig(projectName);
+  return dataCacheManager.getCache(config);
 }
 
 // WebSocket server and file watchers (initialized after server starts)
@@ -298,13 +323,14 @@ fastify.get<{ Querystring: { project?: string; types?: string } }>(
   },
 );
 
-// PRs
+// PRs - uses async data cache to avoid blocking the event loop
 fastify.get<{ Querystring: { project?: string } }>(
   "/api/prs",
   async (request) => {
     try {
-      const service = getDataService(request.query.project);
-      return respond(service.getPullRequests());
+      const cache = getDataCache(request.query.project);
+      const cached = await cache.getPullRequests();
+      return respondCached(cached);
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -403,11 +429,31 @@ await registerAiRoutes(fastify, {
 // per-agent and per-project budgets through the fleet budget. A tool whose
 // sign-in check says it is signed out on this machine starts no run here.
 // Its routes are registered below, once the owner's credential exists.
+
+// Shared process cache: one ps call per interval for all modules (agents,
+// watchdog, health checks). Under load, each module calling ps itself piled
+// up and timed out; now they all read from this cache. Started here, stopped
+// in shutdown().
+const processCache = initProcessCache({
+  refreshIntervalMs: 5_000,
+  maxAgeMs: 10_000,
+  psTimeoutMs: 15_000,
+});
+processCache.start();
+
+// The cached process table adapter for modules that need a ProcessTable
+const cachedProcessTable = new CachedProcessTable(processCache);
+
+// Cached data service for expensive dashboard operations (gh and git commands).
+// Routes read from the cache immediately; refreshes happen in the background.
+const dataCacheManager = new DataCacheManager();
+
 const agents = new AgentsManager({
   dbPath: join(process.cwd(), "data", "agents.db"),
   events: getEventBus(),
   budget: getBudgetManager(),
   tools: aiTools,
+  probes: systemAgentProbesWithCache(processCache),
 });
 agents.load(projectEntries);
 managedRuns = agents;
@@ -421,6 +467,7 @@ const watchdogs = new WatchdogManager({
   events: getEventBus(),
   services: delivery,
   agents,
+  probes: systemProbesWithCache(cachedProcessTable),
 });
 watchdogs.load(projectEntries);
 await registerWatchdogRoutes(fastify, watchdogs, () => getDefaultProject());
@@ -713,6 +760,12 @@ const stopServer = async (reason: string) => {
 
   // Stop placement: a move in progress is cut short and found again on the next start
   await placements.stop();
+
+  // Stop the shared process cache (all modules have stopped, so no one reads it)
+  disposeProcessCache();
+
+  // Stop the data cache manager
+  dataCacheManager.stopAll();
 
   // Stop healer
   stopHealer();

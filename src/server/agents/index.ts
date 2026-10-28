@@ -12,5 +12,5 @@ export { AgentsStore } from "./store.js";
 export { InboxFileDecisions } from "./decisions.js";
 export type { DecisionInbox, DecisionRequest, DecisionKind, DecisionOption } from "./decisions.js";
 export type { FleetBudget } from "./budgets.js";
-export { systemAgentProbes, ChildProcessSpawner, ProcessSnapshot, agentEnvironment, BASE_ENV } from "./probes.js";
+export { systemAgentProbes, systemAgentProbesWithCache, ChildProcessSpawner, ProcessSnapshot, agentEnvironment, BASE_ENV } from "./probes.js";
 export type { AgentProbes, ProcessSpawner, ProcessOwner, SpawnOptions } from "./probes.js";
