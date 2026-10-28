@@ -525,7 +525,7 @@ describe("a conversation goes on, within its bounds", () => {
     const soon = await ask(h, "Two?");
     expect(soon.statusCode).toBe(429);
     expect(soon.json().error).toBe(
-      `The last supervisor run started less than supervisor.chat.min_interval_seconds (60) ago: try again at ${new Date(NOW + 60 * SEC).toISOString()}`,
+      `The last supervisor run started less than supervisor.chat.min_interval_seconds (60 s) ago: try again at ${new Date(NOW + 60 * SEC).toISOString()}`,
     );
     h.clock.t = NOW + 61 * SEC;
     const second = await asked(h, "Two?");

@@ -273,7 +273,7 @@ export async function registerSupervisorRoutes(fastify: FastifyInstance, options
     });
 
     // The run's answer to its own question (`lair supervisor answer`): the chat checks the token is that run's
-    app.post("/api/ops/answer", { bodyLimit: 128 * 1024 }, async (request, reply) => {
+    app.post("/api/ops/answer", { bodyLimit: 256 * 1024 }, async (request, reply) => {
       const record = verified.get(request)!;
       const started = clock();
       const body = (request.body ?? {}) as { conversation?: unknown; answer?: unknown; evidence?: unknown };

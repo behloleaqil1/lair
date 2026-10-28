@@ -38,7 +38,7 @@ export const ANSWER_USAGE = [
 ].join("\n");
 
 const MAX_ANSWER_CHARS = 20_000;
-const MAX_EVIDENCE_BYTES = 128 * 1024;
+const MAX_EVIDENCE_BYTES = 96 * 1024;
 const MAX_RESPONSE_CHARS = 64 * 1024;
 const TIMEOUT_MS = 30_000;
 const TOKEN = /^lairops_[A-Za-z0-9_-]{43}$/;
