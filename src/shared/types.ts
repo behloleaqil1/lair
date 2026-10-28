@@ -39,6 +39,8 @@ export interface ProjectConfig {
    * Validated by validateDragonDefaults; see docs/configuration.md
    */
   dragon_defaults?: { model?: string; adapter?: string };
+  /** AI profiles and roles, validated by src/server/ai/config.ts; see docs/configuration.md */
+  ai?: AiConfigYaml;
   available_models?: AIModel[];
   default_instructions?: string;
   gate_runner?: GateRunnerConfig;
@@ -168,6 +170,17 @@ export interface MachineHealthResult {
   error?: string;
 }
 
+/** The `ai:` block as written in YAML (validated by src/server/ai/config.ts). */
+export interface AiConfigYaml {
+  profiles?: Record<string, { tool: string; model: string; options?: { args?: string[] } }>;
+  roles?: {
+    build?: string[];
+    review?: { red?: string[]; amber?: string[]; green?: string[] };
+    plan?: string[];
+    supervise?: string[];
+  };
+}
+
 // Dragon config in project YAML (phase 4)
 export interface DragonConfig {
   id: string; // e.g. "kiro-A" or "aider-1": letter first, then letters, digits, _ or -, max 64 (isValidDragonId)
@@ -176,6 +189,12 @@ export interface DragonConfig {
   machine: string; // Machine ID to run on
   instructions: string; // Standing instructions for this dragon
   adapter?: string; // Agent adapter ID (e.g., "kiro", "aider") - defaults to "kiro"
+  /**
+   * An ai.profiles id. In YAML: the dragon's own choice, instead of adapter
+   * and model. Resolved (parseDragonRegistry): the profile its tool and model
+   * came from, its own or its role's first (ai.roles) for a dragon that names none
+   */
+  profile?: string;
 }
 
 // Available AI model definition
@@ -537,6 +556,34 @@ export interface AgentAdapter {
   session_id_env?: string;
   /** Flag to resume a session, with {session_id} placeholder */
   resume_flag?: string;
+  // Model discovery and sign-in checks (docs/configuration.md "AI tools, profiles and roles"):
+  /** Lists the tool's models: an argv run on each machine, without placeholders, read by `models_parser` */
+  models_cmd?: string[];
+  /** How models_cmd's output is read: "kiro" (`kiro-cli chat --list-models`) or "lines" (one model per line, the default) */
+  models_parser?: ToolModelsParser;
+  /** The tool's known models: the list when it has no models_cmd, or when that command fails */
+  models?: ToolModel[];
+  /** Exits 0 when the tool is signed in on the machine: an argv, without placeholders */
+  auth_check_cmd?: string[];
+  /** The command the owner runs in a terminal to sign in: shown as the fix, never run by Lair */
+  login_hint?: string;
+  /** Prints the tool's version: an argv, without placeholders */
+  version_cmd?: string[];
+  /** Not verified end to end: its flags and conventions may need adapting */
+  experimental?: boolean;
+}
+
+/** How a tool's models_cmd output is read (src/server/ai/parsers.ts). */
+export type ToolModelsParser = "kiro" | "lines";
+
+/** One model a tool offers. */
+export interface ToolModel {
+  id: string;
+  label?: string;
+  /** The tool's own notes: a cost multiplier, a context size... */
+  notes?: string;
+  /** The tool's default model */
+  default?: boolean;
 }
 
 /**

@@ -351,12 +351,15 @@ export class SettingsService {
         }
       }
     }
+    const ai = isPlainObject(values.ai) ? values.ai : {};
+    const profiles = isPlainObject(ai.profiles) ? Object.keys(ai.profiles) : [];
     return {
       agents: set(agents),
       adapters: set(adapters),
       models: set(models),
       lanes: set(lanes),
       machines: set(["local", ...Object.keys(machines)]),
+      profiles: set(profiles),
     };
   }
 

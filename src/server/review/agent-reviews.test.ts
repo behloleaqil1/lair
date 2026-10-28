@@ -91,6 +91,10 @@ interface BootOptions {
   headRef?: string;
   baseRef?: string;
   template?: string | null;
+  /** The project's ai: block (profiles and roles) */
+  ai?: Record<string, unknown>;
+  /** Dragons beside (or instead of) the default ones */
+  dragons?: Record<string, unknown>;
 }
 
 interface Stack {
@@ -196,7 +200,9 @@ async function boot(options: BootOptions = {}): Promise<Harness> {
       "rev-c": dragon("model-a"),
       "rev-d": dragon("model-b"),
       "rev-e": dragon("model-c"),
+      ...options.dragons,
     },
+    ...(options.ai ? { ai: options.ai } : {}),
     agent_adapters: { "test-cli": ADAPTER },
     agents: {
       enabled: true,
@@ -1250,5 +1256,91 @@ describe("a request round interrupted before its hand-over", () => {
     await tick(h);
     expect(h.spawner.calls).toHaveLength(1);
     expect((await submit(h, h.spawner.calls[0].env)).code).toBe(EXIT_OK);
+  });
+});
+
+// ============ REVIEWERS BY AI ROLE ============
+
+describe("reviewers by AI role (ai.roles.review.<tier>)", () => {
+  /** A reviewer that runs on an ai.profiles profile */
+  const onProfile = (profile: string) => ({ name: profile, profile, machine: "local", instructions: "" });
+  const modelOf = (call: { argv: string[] }) => call.argv[call.argv.indexOf("--model") + 1];
+
+  it("gives a tier with no pool its role's agents, in the role's order; a failing first profile falls back to the second", async () => {
+    const h = await boot({
+      ai: {
+        profiles: { strong: { tool: "test-cli", model: "model-s" }, cheap: { tool: "test-cli", model: "model-k" } },
+        roles: { review: { amber: ["strong", "cheap"] } },
+      },
+      // rev-k comes first in the file: the role's order decides
+      dragons: { "rev-k": onProfile("cheap"), "rev-s": onProfile("strong") },
+      review: { reviewers_pool: {} },
+    });
+    const first = await assignedRun(h);
+    expect(first.env.LAIR_AGENT).toBe("rev-s");
+    expect(modelOf(first)).toBe("model-s");
+
+    h.spawner.exit(first.pid, 0); // ends without a review
+    await tick(h);
+    await check(h);
+    h.clock.t = NOW + 61 * SEC;
+    await check(h);
+    await tick(h);
+    expect(h.spawner.calls).toHaveLength(2);
+    const second = h.spawner.calls[1];
+    expect(second.env.LAIR_AGENT).toBe("rev-k");
+    expect(modelOf(second)).toBe("model-k");
+    expect((await statusOf(h)).assignments![0]).toMatchObject({ state: "assigned", agent: "rev-k", attempts: 2 });
+  });
+
+  it("takes role:<role> in a pool, beside agent ids", async () => {
+    const h = await boot({
+      ai: { profiles: { strong: { tool: "test-cli", model: "model-s" } }, roles: { review: { red: ["strong"] } } },
+      dragons: { "rev-s": onProfile("strong") },
+      review: { reviewers_pool: { amber: ["role:review.red", "rev-b"] } },
+    });
+    const call = await assignedRun(h);
+    expect(call.env.LAIR_AGENT).toBe("rev-s");
+    expect(modelOf(call)).toBe("model-s");
+  });
+
+  it("keeps different_model across every profile: neither side's role fallback may land on a model the other runs on", async () => {
+    const h = await boot({
+      ai: {
+        profiles: {
+          strong: { tool: "test-cli", model: "model-s" },
+          lead: { tool: "test-cli", model: "model-l" },
+          spare: { tool: "test-cli", model: "model-x" },
+          xray: { tool: "test-cli", model: "model-x" },
+          zeta: { tool: "test-cli", model: "model-z" },
+        },
+        roles: {
+          // Builders fail over along it: rev-s (strong) to the author's model-l, the author (lead) to model-x
+          build: ["strong", "lead", "spare"],
+          review: { amber: ["strong", "xray", "zeta"] },
+        },
+      },
+      dragons: {
+        "worker-a": { name: "Author", profile: "lead", machine: "local", instructions: "" },
+        "rev-s": onProfile("strong"),
+        "rev-x": onProfile("xray"),
+        "rev-z": onProfile("zeta"),
+      },
+      review: { reviewers_pool: {}, reviewers: { amber: [{ any_of: ["peer"], different_model: true }] } },
+    });
+    const models = (agent: string) =>
+      h.agents
+        .status("demo")
+        .agents.find((a) => a.id === agent)!
+        .profiles.map((p) => p.model);
+    expect(models("rev-s")).toEqual(["model-s", "model-l", "model-x"]);
+    expect(models("worker-a")).toEqual(["model-l", "model-x"]);
+    expect(models("rev-x")).toEqual(["model-x"]);
+
+    const call = await assignedRun(h);
+    expect(call.env.LAIR_AGENT).toBe("rev-z");
+    expect(modelOf(call)).toBe("model-z");
+    // The author's model is its profile's
+    expect((await statusOf(h)).author).toEqual({ id: "worker-a", kind: "agent", model: "model-l" });
   });
 });

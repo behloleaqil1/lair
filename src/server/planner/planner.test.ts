@@ -948,3 +948,37 @@ describe("blocked tasks, fill's holds, recovery and cost", () => {
     expect(runsOf(h)).toHaveLength(3);
   });
 });
+
+describe("the planner agent's AI role", () => {
+  it("runs the planner agent on ai.roles.plan's first profile when it names no adapter, model or profile", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    const dragon = (id: string, name: string) => ({ id, name, model: "model-a", machine: "local", instructions: "", adapter: "test-cli" });
+    const h = await setup(p, plannerBlock(p), {
+      extra: {
+        ai: {
+          profiles: { planning: { tool: "test-cli", model: "model-plan" }, builder: { tool: "test-cli", model: "model-build" } },
+          roles: { plan: ["planning"], build: ["builder"] },
+        },
+        dragons: {
+          "worker-a": dragon("worker-a", "Alice"),
+          "worker-b": dragon("worker-b", "Bob"),
+          planner: { id: "planner", name: "Planner", machine: "local", instructions: "" },
+        },
+      } as never,
+    });
+    // Its profile is the plan role's; the workers keep their own adapter and model
+    const profiles = (agent: string) => h.agentsService.status().agents.find((a) => a.id === agent)!.profiles;
+    expect(profiles("planner")).toEqual([{ adapter: "test-cli", model: "model-plan", provider: "test-cli", profile: "planning" }]);
+    expect(profiles("worker-a")).toStrictEqual([{ adapter: "test-cli", model: "model-a", provider: "test-cli" }]);
+
+    await h.service.cycle(); // baseline; worker-b is idle: a trigger
+    await startPlannerRun(h, 41 * SEC);
+    await h.service.cycle();
+    const call = await runPlannerAgent(h, (c) => writeProposals(c, { proposals: [] }));
+    expect(call.env.LAIR_AGENT).toBe("planner");
+    expect(call.argv[call.argv.indexOf("--model") + 1]).toBe("model-plan");
+    await h.service.cycle();
+    expect(runsOf(h)[0]).toMatchObject({ state: "done", agent: "planner" });
+  });
+});

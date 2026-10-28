@@ -41,6 +41,7 @@ import { WatchdogManager, registerWatchdogRoutes } from "./watchdog/index.js";
 import { DeliveryManager, registerDeliveryRoutes } from "./delivery/index.js";
 import { PipelineManager, registerPipelineRoutes } from "./gates/index.js";
 import { AgentsManager, registerAgentsRoutes } from "./agents/index.js";
+import { AiToolsService, registerAiRoutes } from "./ai/index.js";
 import { getBudgetManager } from "./fleet/budget.js";
 import { ReviewManager, inboxDecisionSink, registerReviewRoutes } from "./review/index.js";
 import { mountTriage } from "./triage/index.js";
@@ -376,14 +377,27 @@ delivery.load(projectEntries);
 // Up, Down, Restart, Deploy and Release need the owner's session
 await registerDeliveryRoutes(fastify, delivery, () => getDefaultProject(), humanAuth);
 
+// AI tools (src/server/ai/): per machine, whether each tool is installed and
+// signed in, and the models it offers, from the tools' own commands (bounded,
+// timed out, cached). Every route is the owner's, reads included.
+const aiTools = new AiToolsService();
+await registerAiRoutes(fastify, {
+  service: aiTools,
+  auth: humanAuth,
+  defaultProject: () => getDefaultProject(),
+  config: (project) => loadProjectConfig(project),
+});
+
 // Agent runs (claims, locks, recovery, failover, budgets): one service per
 // project with `agents.enabled: true` (off by default). Costs reach its
-// per-agent and per-project budgets through the fleet budget. Its routes are
-// registered below, once the owner's credential exists.
+// per-agent and per-project budgets through the fleet budget. A tool whose
+// sign-in check says it is signed out on this machine starts no run here.
+// Its routes are registered below, once the owner's credential exists.
 const agents = new AgentsManager({
   dbPath: join(process.cwd(), "data", "agents.db"),
   events: getEventBus(),
   budget: getBudgetManager(),
+  tools: aiTools,
 });
 agents.load(projectEntries);
 managedRuns = agents;

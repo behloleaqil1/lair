@@ -7,14 +7,22 @@ import type { ProjectConfig } from "../../shared/types.js";
 import type { ReviewerOption, ReviewSlot, Tier } from "../../shared/review-types.js";
 import { DEFAULT_FILE_KINDS, DEFAULT_RISK_RULES, type RiskRule } from "../policy/risk-rules.js";
 import { isValidPromptName, PROMPT_NAME_RULE } from "../agents/prompts.js";
+import { ROLE_REF, roleIsSet, type RolePath } from "../ai/profiles.js";
 import { compileBranchGlob, type BranchGlob } from "./authors.js";
 
 const TierSchema = z.enum(["red", "amber", "green"]);
 const RULE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const AGENT_ID = "[A-Za-z0-9][A-Za-z0-9._-]{0,63}";
 const AgentId = z.string().regex(new RegExp(`^${AGENT_ID}$`), "agent ids use letters, digits, '.', '_' and '-'");
-/** Reviewer agents the agent assigner may pick from */
-const Pool = z.array(AgentId).min(1).max(50);
+/** An agent id, or `role:<role>`: the agents whose ai.profiles profile is in that role (ai.roles), in its order */
+const PoolEntry = z
+  .string()
+  .regex(
+    new RegExp(`^(?:${AGENT_ID}|${ROLE_REF.source.slice(1, -1)})$`),
+    "agent ids (letters, digits, '.', '_' and '-'), or role:<role> such as role:review.amber",
+  );
+/** Reviewer agents the agent assigner may pick from; one `role:<role>` alone stands for a list of it */
+const Pool = z.preprocess((value) => (typeof value === "string" ? [value] : value), z.array(PoolEntry).min(1).max(50));
 const globs = z.array(z.string().min(1));
 
 const RuleSchema = z
@@ -403,9 +411,26 @@ function cloneUrlFor(apiUrl: string, repo: string): string {
 }
 
 /** Validate a project's `review:` block (undefined means disabled). */
+/**
+ * review.reviewers_pool, with a tier that has no pool of its own taking its
+ * review role's agents (`role:review.<tier>`) when the project sets that role.
+ */
+function reviewerPools(
+  own: Partial<Record<Tier, string[]>>,
+  project: Partial<Pick<ProjectConfig, "ai">>,
+): Partial<Record<Tier, string[]>> {
+  const pools: Partial<Record<Tier, string[]>> = {};
+  for (const tier of ["red", "amber", "green"] as const) {
+    const role: RolePath = tier === "red" ? "review.red" : tier === "amber" ? "review.amber" : "review.green";
+    const pool = own[tier] ?? (roleIsSet(project, role) ? [`role:${role}`] : undefined);
+    if (pool) pools[tier] = pool;
+  }
+  return pools;
+}
+
 export function parseReviewConfig(
   raw: unknown,
-  project: Pick<ProjectConfig, "github"> & Partial<Pick<ProjectConfig, "agents">>,
+  project: Pick<ProjectConfig, "github"> & Partial<Pick<ProjectConfig, "agents" | "ai">>,
 ): ParseResult {
   const parsed = ReviewSchema.safeParse(raw ?? {});
   if (!parsed.success) {
@@ -453,6 +478,22 @@ export function parseReviewConfig(
   const retries = value.retries;
   if (retries.backoff_seconds > retries.max_backoff_seconds) {
     errors.push("review.retries.backoff_seconds: more than max_backoff_seconds");
+  }
+
+  // A pool's role:<role> names a role the project sets (ai.roles)
+  const unsetRoles = (pool: string[] | undefined, where: string) => {
+    for (const entry of pool ?? []) {
+      const role = ROLE_REF.exec(entry)?.[1] as RolePath | undefined;
+      if (role && !roleIsSet(project, role)) {
+        errors.push(`${where}: ${entry} names a role the project doesn't set (ai.roles.${role})`);
+      }
+    }
+  };
+  for (const tier of ["red", "amber", "green"] as const) {
+    unsetRoles(value.reviewers_pool[tier], `review.reviewers_pool.${tier}`);
+    value.reviewers[tier]?.forEach((slot, i) => {
+      if (typeof slot !== "string") unsetRoles(slot.pool, `review.reviewers.${tier}[${i}].pool`);
+    });
   }
 
   const fileKinds = { ...DEFAULT_FILE_KINDS, ...value.tiers.file_kinds };
@@ -543,7 +584,7 @@ export function parseReviewConfig(
       reviewers,
       agentReviews: {
         promptFile: value.prompt_file ?? null,
-        pools: value.reviewers_pool,
+        pools: reviewerPools(value.reviewers_pool, project),
         maxAttempts: retries.max_attempts,
         backoffSeconds: retries.backoff_seconds,
         maxBackoffSeconds: retries.max_backoff_seconds,

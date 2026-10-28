@@ -232,6 +232,7 @@ Any other key, or a value that doesn't fit, stops the project from loading, with
 | `model` | string | `dragon_defaults.model`, else `claude-sonnet-4` | AI model ID to use |
 | `machine` | string | `local` | Machine ID where this agent runs |
 | `adapter` | string | `dragon_defaults.adapter`, else `kiro` | Agent adapter ID (see [Agents](agents.md)) |
+| `profile` | string | — | An [AI profile](#ai-tools-profiles-and-roles) (`ai.profiles`): its tool and model, instead of `adapter` and `model` (name one or the other, not both). A dragon that names none of the three runs on its role's first profile when that role is set |
 | `instructions` | string | `""` | Standing instructions for this agent |
 
 ### Dragon commands
@@ -271,7 +272,7 @@ If not specified, Lair provides default Claude models.
 
 ## Agent adapters
 
-Lair ships built-in adapters for `kiro`, `aider`, `claude-code` and `cursor-agent`; only `kiro` is tested, the others are experimental. Define custom adapters, or override a built-in one by reusing its ID:
+Lair ships built-in adapters (presets) for `kiro`, `aider`, `claude-code`, `cursor-agent`, `codex`, `gemini`, `opencode`, `goose` and `copilot`; only `kiro` is tested, the others are experimental (see [Tool presets](#tool-presets)). Define custom adapters, or override a built-in one by reusing its ID:
 
 ```yaml
 agent_adapters:
@@ -285,6 +286,107 @@ agent_adapters:
 ```
 
 Adapters are listed in the Settings view and each dragon names one with `adapter:` (default `kiro`). Dragons are started and stopped with `dragon_start_cmd` and `dragon_stop_cmd`, not with the adapter templates. See [Agents](agents.md#agent-adapters) for all adapter options and placeholders.
+
+## AI tools, profiles and roles
+
+> Every key is optional: a project without them runs exactly as before. Design: [ai-roles.md](design/ai-roles.md).
+
+A **tool** is an agent CLI, through its adapter (the presets below, or one of your `agent_adapters`). A **profile** is a named tool and model. A **role** is a job Lair gives an AI, and lists the profiles that do it, in order: the first is used, the next ones are its fallbacks.
+
+```yaml
+ai:
+  profiles:
+    kiro-opus:   { tool: kiro, model: claude-opus-4.5 }
+    kiro-cheap:  { tool: kiro, model: claude-haiku-4.5 }
+    claude-best: { tool: claude-code, model: opus, options: { args: ["--verbose"] } }
+  roles:
+    build: [kiro-opus, kiro-cheap]
+    review:
+      red:   [claude-best, kiro-opus]   # the strongest reviewer first
+      amber: [kiro-opus]
+      green: [kiro-cheap]
+    plan: [kiro-opus]
+
+dragons:
+  kiro-A: { name: Smaug, profile: kiro-opus }
+  rev-1:  { name: Glaurung, profile: claude-best }
+  kiro-B: { name: Saphira }   # names nothing: the build role's first profile
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `profiles.<id>.tool` | string | A built-in tool (`kiro`, `claude-code`, `codex`, ...) or one of `agent_adapters` |
+| `profiles.<id>.model` | string | Any model id the tool takes (letters, digits, `.`, `_`, `:`, `/`, `@` and `-`, not starting with `-`). `GET /api/ai/models` lists what the tool offers |
+| `profiles.<id>.options.args` | array | Literal arguments added to the tool's start command, after its own and before the resume flag (at most 20, no `{placeholder}`). Changing them is confirmed like a command |
+| `roles.build` | array | Profile ids for the dragons that name no profile, adapter or model |
+| `roles.review.red`, `.amber`, `.green` | array | Profile ids of the reviewers per risk tier (see [Reviewers by role](#reviewers-by-role)) |
+| `roles.plan` | array | Profile ids for the planner agent (`planner.agent.id`) when it names none |
+| `roles.supervise` | array | Profile ids for the supervisor ([supervisor.md](design/supervisor.md)): accepted and checked, not used yet |
+
+Profile ids start with a letter and use letters, digits, `.`, `_` and `-` (at most 64). A mistake keeps the project from loading, with the key's path: `ai.profiles.<id>.tool: unknown tool ...`, `ai.roles.review.amber[1]: unknown profile ...`, a profile listed twice in a role, `dragons.<id>.profile: unknown profile ...`, and a dragon that names a profile and an adapter or a model.
+
+**How a dragon's tool and model are chosen**, first match wins:
+
+1. its own `profile:`;
+2. its own `adapter` and `model`, each falling back to `dragon_defaults` (as before profiles);
+3. naming none of them: the first profile of its role, when that role is set: `ai.roles.plan` for the planner agent, `ai.roles.build` for every other dragon (a `dragons.txt` dragon too);
+4. `dragon_defaults`, else the built-in default (`kiro`, `claude-sonnet-4`).
+
+**Failover.** A dragon on a profile fails over to the profiles after its own in its role (for the build role above: `kiro-opus`, then `kiro-cheap`), with the [agents module's failover](#agents) unchanged: cooldowns, transient errors and `max_failovers`. `agents.fallbacks.<id>`, when set, replaces those fallbacks.
+
+### Reviewers by role
+
+A reviewer pool (`review.reviewers_pool.<tier>`, or a slot's `pool`) may name a role: `role:review.amber` stands for the agents whose profile is in `ai.roles.review.amber`, in the role's order (the agents on its first profile first). It can be the whole pool (`amber: role:review.amber`) or one entry beside agent ids. A tier with no pool of its own takes `role:review.<tier>` when that role is set, so setting `ai.roles.review.amber` is enough to have AMBER reviews done by those agents. A failing first profile falls back to the next: a review run that ends without a review is retried by an agent not tried yet, which is the role's next agent. `different_model` compares every model of both sides, their role fallbacks included: a reviewer is skipped when any of its profiles shares a model with any of the author's. A `role:` entry for a role the project doesn't set is a config error.
+
+### Tool presets
+
+A preset is a tested start command (only Kiro's is tested end to end; the others follow each CLI's public reference and are marked experimental), and how Lair lists the tool's models and checks its sign-in. Lair never installs a tool and never signs in for you.
+
+| ID | Tool | Models | Sign-in check | Sign in with |
+|----|------|--------|---------------|--------------|
+| `kiro` | Kiro CLI | `kiro-cli chat --list-models` (parser `kiro`); a known list when it fails | `kiro-cli whoami` | `kiro-cli login` |
+| `aider` | Aider | none: aider takes its model from its own configuration | none | (API keys: a later part, A6-2) |
+| `claude-code` | Claude Code | known: `opus`, `sonnet`, `haiku` (the CLI's aliases) | none | `claude`, then `/login` |
+| `cursor-agent` | Cursor Agent | known: `auto`, `sonnet-4.5`, `gpt-5` | none | `agent login` |
+| `codex` | Codex CLI | known: `gpt-5-codex`, `gpt-5` | `codex login status` | `codex login` |
+| `gemini` | Gemini CLI | known: `gemini-2.5-pro`, `gemini-2.5-flash` | none | `gemini`, then Login with Google |
+| `opencode` | OpenCode | `opencode models` (parser `lines`) | none | `opencode auth login` |
+| `goose` | Goose | none: goose takes its model from its own configuration (`goose configure`) | none | `goose configure` |
+| `copilot` | GitHub Copilot CLI | known: `claude-sonnet-4.5`, `claude-sonnet-4`, `gpt-5` | none | `copilot`, then `/login` |
+
+Every preset also has a `version_cmd` (`<program> --version`). A model a tool doesn't list can still be used: model lists are shown, never enforced.
+
+An adapter (a preset, or one of your `agent_adapters`) may set these keys:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `models_cmd` | array | Lists the tool's models: an argv, run on each machine |
+| `models_parser` | `kiro` \| `lines` | How its output is read: `kiro` (indented lines, the default marked with `*`, then the cost and a description, separated by two or more spaces) or `lines` (the default: one model per line, its first word the id and the rest its label; `#` lines are skipped, a leading `* ` marks the default) |
+| `models` | array | Known models (`{id, label?, notes?, default?}`): the list when there is no `models_cmd`, or when it fails |
+| `auth_check_cmd` | array | Exits 0 when the tool is signed in on the machine: an argv |
+| `login_hint` | string | What you run in a terminal to sign in, shown as the fix. Lair never runs it |
+| `version_cmd` | array | Prints the tool's version: an argv |
+| `experimental` | boolean | Shown as experimental |
+
+These commands are run as written: argv arrays, never through a shell, with no `{placeholder}` and a program that doesn't start with `-` (a config error otherwise). Each runs with a 15-second timeout and at most 256 KiB of output, in the environment an agent of the project gets (`PATH`, `HOME` and the like, plus `agents.env_passthrough`), never the rest of Lair's. Lair never reads a tool's token files: the tool's own check answers. A check's answer is:
+
+- exit 0: **signed in** (its first line is shown, e.g. "Logged in with Builder ID");
+- another exit code with a message that says so ("not logged in", "not signed in", "login required", ...): **not signed in**, with the preset's `login_hint` as the fix;
+- anything else (a timeout, a crash, a missing subcommand, ssh failing): **unknown**. Unknown never stops an agent.
+
+**Machines.** On this machine a tool is installed when its start command's program is on `PATH` (a lookup, nothing is run). An SSH machine (`machines:`) is asked through `ssh` (`command -v`, then the tool's commands, each argument quoted for the remote shell), and only about the tools of the dragons whose `machine` is that one. A non-interactive SSH shell may have a shorter `PATH` than your login shell. The agents module starts its runs on this machine, so only this machine's sign-in state refuses a start.
+
+**A tool that is not signed in starts nothing here.** When a tool's check says it is not signed in on this machine, the agents module starts no run on it: each run on that tool waits, with "not signed in on this machine: run `<login_hint>` ..." as its detail, and is checked again every minute; a run with a fallback on another tool (`agents.fallbacks`, or its role) starts on that one. The Decision Inbox gets one decision per tool for the project, not one per agent or run: "I signed it in: check again now" (the runs waiting on it start on the next check once it is signed in) or "Keep waiting". It is withdrawn once the check says the tool is signed in, and asked again if it is still signed out after you answered.
+
+### AI API
+
+Every route is the owner's, reads included (they run the tools' own commands and show who is signed in): `/api/ai` is in `OWNER_ONLY_PREFIXES`. `project` defaults to the default project; `machine` to `local`.
+
+| Method | Route | Description |
+|--------|-------|-------------|
+| `GET` | `/api/ai/tools?project=<name>` | Every tool the project can use: `{project, tools: [{id, name, experimental, program, signInCheck, modelsCmd, knownModels, inUse, machines: [{machine, installed, path, version, signIn: {state, as, detail, fix}, checkedAt}]}], notes}`. `state` is `signed_in`, `signed_out` or `unknown`; `installed` is null when a machine didn't answer. Cached for a minute |
+| `GET` | `/api/ai/models?tool=<id>&project=<name>&machine=<id>` | `{tool, machine, models: [{id, label, notes, default}], source, fetchedAt, error?}`. `source` is `cmd` (its `models_cmd`, cached for an hour), `preset` (its known list; `error` says why the command gave none, tried again after a minute) or `none` |
+| `POST` | `/api/ai/models/refresh` | Body `{tool, project?, machine?}`: the list read again now, the same answer |
 
 ## Gate runner
 
@@ -593,7 +695,7 @@ Errors: 400 for invalid input, 403 for a cross-site request or an answer without
 
 ## Owner-only routes
 
-Every route that changes something only you should change needs the owner's session, the same one the Decision Inbox uses (see "Only you answer"): the `X-Lair-Owner-Session` header, from the dashboard's own origin, in a same-origin browser request. Without it the answer is HTTP 403, before the request's body is read, and nothing changes. `curl`, scripts, agents and other local programs can still read: every `GET` stays open, except the two that read prompt files from disk (`/api/agents/prompts`), the Settings API (`/api/settings`), whose reads reveal paths and commands, and logs and test output (`/api/dashboard/.../output` and `.../log`, and the logs in pipeline runs), which can hold anything a test or an agent printed. No CORS is granted under these prefixes (`OWNER_ONLY_PREFIXES` in `src/server/human-auth/cors.ts`). The dashboard's views send the session once this browser is signed in, and show "sign in from Decisions" until it is.
+Every route that changes something only you should change needs the owner's session, the same one the Decision Inbox uses (see "Only you answer"): the `X-Lair-Owner-Session` header, from the dashboard's own origin, in a same-origin browser request. Without it the answer is HTTP 403, before the request's body is read, and nothing changes. `curl`, scripts, agents and other local programs can still read: every `GET` stays open, except the two that read prompt files from disk (`/api/agents/prompts`), the Settings API (`/api/settings`), whose reads reveal paths and commands, the AI tools API (`/api/ai`), whose reads run the tools' own commands, and logs and test output (`/api/dashboard/.../output` and `.../log`, and the logs in pipeline runs), which can hold anything a test or an agent printed. No CORS is granted under these prefixes (`OWNER_ONLY_PREFIXES` in `src/server/human-auth/cors.ts`). The dashboard's views send the session once this browser is signed in, and show "sign in from Decisions" until it is.
 
 | Prefix | Owner only | Open |
 |--------|------------|------|
@@ -610,6 +712,7 @@ Every route that changes something only you should change needs the owner's sess
 | `/api/delivery` | Up, Down, Restart, Deploy, Release | status and operations |
 | `/api/pipelines` | starting and cancelling runs; a job's log tail and its steps' output | status, the workflow file, runs (without logs and output) |
 | `/api/dashboard` | a gate's log tail and failing tests (`/gates/:id/output`), an agent's log tail (`/agents/:id/log`) | the modules a project turns on, a gate's detail |
+| `/api/ai` | everything: the tools' installed and sign-in state per machine, their models, refreshing a list ([AI API](#ai-api)) | nothing |
 
 The watchdog's routes are all reads; it acts only inside the server. Lair's own work doesn't go through these routes either: delivery's automatic deploys, the scheduler, the healer and the watchdog's playbooks run inside the server, server code starts pipeline runs with `PipelineManager.startRun` and creates tasks with the job manager, and agents use the fleet bus (`npm run bus`), which works on the bus database directly. The `lair-node` daemon connects over `/ws/node`, not these routes.
 

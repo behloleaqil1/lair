@@ -53,6 +53,13 @@ Today adapters are **descriptive**: Lair lists them in the Settings view and in 
 | `aider` | Aider | `file` | Experimental, untested |
 | `claude-code` | Claude Code | `stdout` | Experimental, untested |
 | `cursor-agent` | Cursor Agent | `mcp` | Experimental, untested |
+| `codex` | Codex CLI | `file` | Experimental, untested |
+| `gemini` | Gemini CLI | `file` | Experimental, untested |
+| `opencode` | OpenCode | `file` | Experimental, untested |
+| `goose` | Goose | `file` | Experimental, untested |
+| `copilot` | GitHub Copilot CLI | `file` | Experimental, untested |
+
+How each one lists its models and checks its sign-in: [Tool presets](configuration.md#tool-presets). A dragon can also name an [AI profile](configuration.md#ai-tools-profiles-and-roles) (a tool and a model) instead of an adapter and a model.
 
 The exact command templates may change between releases; the current definitions are in [`src/server/services/adapters.ts`](../src/server/services/adapters.ts). Check them against your tool's own CLI documentation before relying on them, and override any built-in adapter in your project config (below) if its flags don't match your installed version.
 
@@ -88,6 +95,10 @@ agent_adapters:
 | `mcp_endpoint` | string | MCP endpoint, e.g. `stdio` (for `mcp`) |
 | `session_id_env` | string | Environment variable that carries the session ID |
 | `resume_flag` | string | Flag to resume a session, with a `{session_id}` placeholder |
+| `models_cmd`, `models_parser`, `models` | | How the tool's models are listed ([Tool presets](configuration.md#tool-presets)) |
+| `auth_check_cmd`, `login_hint`, `version_cmd`, `experimental` | | Its sign-in check, the command that signs it in, its version, and whether it is experimental |
+
+The program (a template's first argument) never comes from a placeholder, and a placeholder that starts an argument is refused when its value starts with `-`, so no value becomes the program or an option.
 
 ### Command placeholders
 

@@ -57,6 +57,8 @@ import {
 import type { SignedGateResult } from "../../shared/policy-types.js";
 import { asContextText, HoldDecisions, type OwnerHold } from "../decisions/holds.js";
 import type { DecisionProducer } from "../decisions/types.js";
+import { aiProfiles, resolvePool } from "../ai/profiles.js";
+import { loadKnownDragons } from "../services/dragon-registry.js";
 
 /** The module merge holds' decisions are raised as (apart from review's other questions, which nobody follows) */
 export const HOLD_DECISION_MODULE = "review-holds";
@@ -240,10 +242,23 @@ export class ReviewService {
     return repo;
   }
 
-  /** Fill in an agent's model from the config when the caller didn't give it. */
+  /**
+   * A slot's pool as agent ids: each `role:<role>` entry becomes the agents
+   * whose ai.profiles profile is in that role, in the role's order (read now,
+   * so dragons.txt and a reload count).
+   */
+  private reviewerPool(pool: string[] | null): string[] | null {
+    if (!pool) return null;
+    if (!pool.some((entry) => entry.startsWith("role:"))) return pool;
+    return resolvePool(pool, this.o.config, loadKnownDragons(this.o.config).values());
+  }
+
+  /** Fill in an agent's model from the config when the caller didn't give it (its own, or its own profile's). */
   private withModel(ref: ReviewerRef): ReviewerRef {
     if (ref.model || ref.kind !== "agent") return ref;
-    const model = this.settings.authors.models[ref.id] ?? this.o.config.dragons?.[ref.id]?.model;
+    const own = this.o.config.dragons?.[ref.id];
+    const profile = own?.profile ? aiProfiles(this.o.config).get(own.profile) : undefined;
+    const model = this.settings.authors.models[ref.id] ?? own?.model ?? profile?.model;
     return model ? { ...ref, model } : ref;
   }
 
@@ -1259,7 +1274,7 @@ export class ReviewService {
           slot: index,
           round,
           author: status.author.id,
-          pool: slot.slot.pool ?? this.settings.agentReviews.pools[status.risk.tier] ?? null,
+          pool: this.reviewerPool(slot.slot.pool ?? this.settings.agentReviews.pools[status.risk.tier] ?? null),
           repo: this.settings.repo,
           base: status.baseRef,
           url: status.url,

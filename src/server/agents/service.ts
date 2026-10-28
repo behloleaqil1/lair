@@ -56,6 +56,7 @@ import type {
 } from "../../shared/agents-types.js";
 import type { Decision } from "../../shared/decision-types.js";
 import type { DecisionProducer, DecisionResolution } from "../decisions/types.js";
+import type { SignInRefusal, ToolReadiness } from "../ai/types.js";
 import { buildStartCommand, getAdapter } from "../services/adapters.js";
 import { knownDragonIds, loadKnownDragons } from "../services/dragon-registry.js";
 import { isValidDragonId } from "../parsers/dragon-config.js";
@@ -149,6 +150,17 @@ export const DECISION_WAIT = "wait";
 export const DECISION_STOP = "stop";
 export const DECISION_ALLOW = "allow";
 export const DECISION_RETRY_NOW = "retry_now";
+
+/** In the detail of a run that waits for its tool's sign-in */
+const SIGNED_OUT_DETAIL = "not signed in on this machine";
+/** A run whose every profile's tool is signed out checks again after this long */
+const SIGNED_OUT_RECHECK_MS = 60_000;
+
+/** Why a profile on a signed-out tool can't start, with the fix */
+function signedOutDetail(refusal: SignInRefusal): string {
+  const fix = refusal.fix ? `: run \`${refusal.fix}\` in a terminal on it, as the user Lair runs as` : "";
+  return `${refusal.name} (${refusal.tool}) is ${SIGNED_OUT_DETAIL}${fix}`;
+}
 
 /** A provider marked unreachable is tried by one start after this long, doubling per failed try, up to the max */
 export const TRANSIENT_BACKOFF_SECONDS = 60;
@@ -347,6 +359,8 @@ export interface AgentsServiceOptions {
   decisions: () => DecisionInbox;
   budget?: FleetBudget;
   events?: EventBus;
+  /** Whether a tool is signed in on this machine (src/server/ai/): a signed-out tool starts nothing here */
+  tools?: ToolReadiness;
 }
 
 interface EventInput {
@@ -371,6 +385,7 @@ export class AgentsService {
   private decisions: () => DecisionInbox;
   private budget?: FleetBudget;
   private events?: EventBus;
+  private tools?: ToolReadiness;
   private watchdogSettings: WatchdogSettings;
   private watchdogStore: WatchdogStore | null = null;
   private unsubscribe: (() => void) | null = null;
@@ -397,6 +412,7 @@ export class AgentsService {
     this.decisions = options.decisions;
     this.budget = options.budget;
     this.events = options.events;
+    this.tools = options.tools;
     this.watchdogSettings = watchdogSettingsFor(options.config, options.settings.hungMinutes);
     // Usage reaches the per-agent and per-project budgets through the fleet budget
     this.unsubscribe =
@@ -654,7 +670,13 @@ export class AgentsService {
   private readonly mootBy: ReadonlyMap<string, (decision: Decision, rest: string) => string | null> = new Map([
     ["chain", (decision: Decision, chainId: string) => this.chainMoot(decision, chainId)],
     ["transient", (decision: Decision, provider: string) => this.outageMoot(decision, provider)],
+    ["signin", (_decision: Decision, tool: string) => this.signInMoot(tool)],
   ]);
+
+  /** A tool's sign-in decision (ref `signin:<tool>`) is moot once its check says it is signed in here. */
+  private signInMoot(tool: string): string | null {
+    return this.tools?.lastSignIn(tool, this.config) === "signed_in" ? `${tool} is signed in on this machine now` : null;
+  }
 
   /**
    * A provider outage's decision (key `transient:<provider>:<since>`) is moot
@@ -799,6 +821,19 @@ export class AgentsService {
       if (this.readOnly) return "the project is read_only: Lair starts no agents";
       await this.recordFillRelease(task, latest, "decision", t.now);
       return "fill starts the task again on its next check";
+    }
+    if (key.startsWith("signin:") && ref.startsWith("signin:")) {
+      if (optionId !== DECISION_RETRY_NOW) return "the runs on it keep waiting; Lair checks the sign-in again every minute";
+      const tool = ref.slice("signin:".length);
+      this.tools?.forget(tool);
+      // The runs waiting on it start on the next check (a run waiting for something else keeps its time)
+      for (const run of this.store.activeRuns(this.project)) {
+        if (run.state !== "queued" || run.notBefore <= t.now || !run.detail.includes(SIGNED_OUT_DETAIL)) continue;
+        if (!this.profiles(run.agent, run.requestModel).some((p) => p.adapter === tool)) continue;
+        run.notBefore = t.now;
+        this.store.saveRun(run);
+      }
+      return `the next start on ${tool} checks its sign-in again`;
     }
     if (key.startsWith("transient:") && ref.startsWith("transient:")) {
       if (optionId !== DECISION_RETRY_NOW) return "Lair keeps trying one start at a time";
@@ -1003,14 +1038,31 @@ export class AgentsService {
       const outage = this.outage(p.provider);
       return outage && this.downFor(outage, run.agent) ? outage : null;
     };
-    const choice = chooseProfile(profiles, from, true, (p) => this.unusable(p, run.agent, t.now));
+    // A tool whose sign-in check says it is signed out here starts nothing on this machine: passed over like a
+    // provider cooling down, with one decision per tool for the project (not one per agent or run)
+    const signedOut = await this.signInRefusals(profiles);
+    const usable = (p: AgentProfile, outages = true): string | null => {
+      const refusal = signedOut.get(p.adapter);
+      return refusal ? signedOutDetail(refusal) : this.unusable(p, run.agent, t.now, outages);
+    };
+    if (signedOut.size > 0) await this.raiseSignedOut([...signedOut.values()], t);
+    const choice = chooseProfile(profiles, from, true, (p) => usable(p));
     let chosen = choice.chosen;
     const skipped = choice.skipped;
+    if (!chosen && profiles.every((p) => signedOut.has(p.adapter))) {
+      run.state = "queued";
+      run.launchingSince = undefined;
+      run.waitingLock = undefined;
+      run.notBefore = t.now + SIGNED_OUT_RECHECK_MS;
+      run.detail = `not starting: ${[...signedOut.values()].map(signedOutDetail).join("; ")}; checked again at ${iso(run.notBefore)}`;
+      this.store.saveRun(run);
+      return;
+    }
     if (!chosen) {
       // With no other profile, the run waits the outage out on the first profile it is the only problem of: one start
       // per backoff step tries it (the wait doesn't count toward start_timeout_minutes, and nothing is counted)
       const order = [...profiles.keys()].slice(from).concat([...profiles.keys()].slice(0, from));
-      const index = order.find((i) => this.unusable(profiles[i], run.agent, t.now, false) === null && unreachable(profiles[i]) !== null);
+      const index = order.find((i) => usable(profiles[i], false) === null && unreachable(profiles[i]) !== null);
       const outage = index === undefined ? null : unreachable(profiles[index]);
       if (index !== undefined && outage) {
         const due = t.now >= outage.nextTryAt;
@@ -1167,6 +1219,7 @@ export class AgentsService {
       sessionDir: sessionDirFor(this.settings, this.config, run.agent) ?? undefined,
       outputDir: this.config.agents_dir,
       agentProfile: run.agent,
+      extraArgs: run.profile.args,
     });
     if (built.warnings.length > 0 || built.command.length === 0) {
       throw new Error(`cannot build the start command of adapter ${adapter.id}: ${built.warnings.join("; ") || "empty"}`);
@@ -1960,6 +2013,73 @@ export class AgentsService {
     this.store.insertRun(next);
     this.store.transferClaim(this.project, run.task, run.id, next.id, this.probes.self);
     if (!chosen) await this.raiseExhausted(next, skipped, t);
+  }
+
+  /** The tools among `profiles` whose sign-in check says they are signed out here (none without the AI module). */
+  private async signInRefusals(profiles: AgentProfile[]): Promise<Map<string, SignInRefusal>> {
+    const refusals = new Map<string, SignInRefusal>();
+    if (!this.tools) return refusals;
+    for (const tool of new Set(profiles.map((p) => p.adapter))) {
+      try {
+        const refusal = await this.tools.signInRefusal(tool, this.config);
+        if (refusal) refusals.set(tool, refusal);
+      } catch (e) {
+        // A check that fails says nothing about the sign-in: the start goes ahead
+        this.lastError = `the sign-in check of ${tool} failed: ${message(e)}`;
+      }
+    }
+    return refusals;
+  }
+
+  /**
+   * One decision per signed-out tool for the project (its key has no agent
+   * or run in it, so the agents and runs that wait on the tool share it). It
+   * is withdrawn once the tool's check says it is signed in (signInMoot).
+   */
+  private async raiseSignedOut(refusals: SignInRefusal[], t: Tick): Promise<void> {
+    for (const refusal of refusals) {
+      const waiting = this.store
+        .activeRuns(this.project)
+        .filter((run) => run.state === "queued" || run.state === "waiting_lock")
+        .filter((run) => this.profiles(run.agent, run.requestModel).some((p) => p.adapter === refusal.tool));
+      await this.raise(
+        {
+          kind: "credential",
+          key: `signin:${refusal.tool}:${refusal.machine}`,
+          ref: `signin:${refusal.tool}`,
+          blocks: [`agents:${this.project}:tool:${refusal.tool}`],
+          question: `${refusal.name} is not signed in on this machine: Lair starts no agent on it here`,
+          context: [
+            `Its sign-in check (\`${refusal.check.join(" ")}\`) says: ${oneLine(refusal.detail, 200)}.`,
+            "",
+            refusal.fix
+              ? `To fix it, run \`${refusal.fix}\` in a terminal on this machine, as the user Lair runs as. Lair never signs in for you and never reads the tool's own token files.`
+              : "Sign the tool in on this machine, as the user Lair runs as. Lair never signs in for you and never reads the tool's own token files.",
+            "",
+            `Waiting for it: ${waiting.map((run) => `${run.agent} on ${run.task}`).join(", ") || "no run yet"}. A run with a fallback on another tool starts on that one.`,
+          ].join("\n"),
+          options: [
+            {
+              id: DECISION_RETRY_NOW,
+              label: "I signed it in: check again now",
+              consequences: `Lair checks ${refusal.tool}'s sign-in again at its next start, and the runs waiting on it start once it is signed in.`,
+            },
+            {
+              id: DECISION_WAIT,
+              label: "Keep waiting",
+              consequences: `Lair checks again every minute; the runs on ${refusal.tool} start once it is signed in, and this is withdrawn.`,
+            },
+          ],
+          recommended: DECISION_RETRY_NOW,
+          why: "Only you can sign a tool in, with your own account.",
+          reversible: true,
+        },
+        t,
+        undefined,
+        // Asked again if it is still signed out after the owner answered
+        true,
+      );
+    }
   }
 
   /** Every profile is unusable: the only time the owner hears about failover. */
@@ -2973,6 +3093,8 @@ export interface AgentsManagerOptions {
   events?: EventBus;
   budget?: FleetBudget;
   decisions?: DecisionInbox;
+  /** Tool sign-in checks (src/server/ai/): a tool signed out on this machine starts no run here */
+  tools?: ToolReadiness;
 }
 
 /**
@@ -3068,6 +3190,7 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
           decisions: () => this.inbox(),
           budget: this.options.budget,
           events: this.options.events,
+          tools: this.options.tools,
         }),
       );
     }

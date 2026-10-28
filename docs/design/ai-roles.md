@@ -1,7 +1,22 @@
 # AI roles: any tool, any model
 
-> Status: design. Roadmap: [ROADMAP.md](ROADMAP.md) A6. Related: [supervisor.md](supervisor.md), [settings-v2.md](settings-v2.md),
-> [autonomy.md §5-6](autonomy.md) (reviews, agents).
+> Status: part built (A6-1, below). Roadmap: [ROADMAP.md](ROADMAP.md) A6. Related: [supervisor.md](supervisor.md),
+> [settings-v2.md](settings-v2.md), [autonomy.md §5-6](autonomy.md) (reviews, agents). Reference:
+> [configuration.md](../configuration.md#ai-tools-profiles-and-roles).
+
+## What is built, and what remains
+
+| Part | What | State |
+|---|---|---|
+| **A6-1** | `ai.profiles` and `ai.roles`, checked when the project loads (errors name the key); a dragon's `profile:`; a dragon that names nothing runs on its role's first profile (`build`, or `plan` for the planner agent); failover along the role; reviewer pools by role (`role:review.<tier>`; a tier without a pool takes its role), with `different_model` across every profile and fallback; the presets Codex CLI, Gemini CLI, OpenCode, Goose and GitHub Copilot CLI (experimental); model lists (`models_cmd` with a parser, `kiro` or `lines`, else a known list), cached for an hour; sign-in checks (`auth_check_cmd`, `login_hint`) per machine, here and over SSH; a tool signed out on this machine starts nothing here, with one decision per tool; `GET /api/ai/tools`, `GET /api/ai/models` and `POST /api/ai/models/refresh` (owner only); the Settings registry entry | built (`src/server/ai/`) |
+| **A6-2** | The write-only secret store for API-key tools (OS keychain, Secret Service, else a 0600 file), a profile's `secret_env`, rotation and removal | to do |
+| **A6-3** | Usage and cost per profile and role, budgets per role; reviewer calibration, and the warning for a weak profile on RED | to do |
+| **A6-4** | The supervisor started through `ai.roles.supervise` (with the supervisor, A3); ACP adapters; the conformance suite for every preset (B3) | to do |
+| **A7** | The UI: Settings → AI (tools and sign-in per machine, model dropdowns refilled per tool, "Other…" with its warning, "not offered any more", profiles, role dropdowns), on the APIs above | to do ([settings-v2.md](settings-v2.md)) |
+
+Not in A6-1: a model a tool no longer lists is not yet flagged on the dragons and roles that use it (the lists are there; the check
+is A7's), and the agents module starts its runs on this machine only, so only this machine's sign-in state refuses a start (SSH
+machines are checked and shown).
 
 Lair must not depend on one AI vendor, one agent tool or one model. A team on Kiro, a team on Claude Code, a team on
 Cursor, Codex, Gemini CLI or Aider, a team running local models: each should get the same Lair. Today a dragon names

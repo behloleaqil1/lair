@@ -12,6 +12,7 @@
 import type { ZodTypeAny } from "zod";
 import type { FieldHint, JsonSchema, SettingsSection } from "../../shared/settings-types.js";
 import { AgentsSchema } from "../agents/config.js";
+import { AiSchema } from "../ai/config.js";
 import { DeliverySchema } from "../delivery/config.js";
 import { ExecutorsSchema, PipelinesSchema } from "../gates/project-pipelines.js";
 import { PlacementSchema } from "../placement/config.js";
@@ -76,9 +77,28 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
     hints: {
       "dragons.*.adapter": { options: "adapters" },
       "dragons.*.machine": { options: "machines" },
+      "dragons.*.profile": { options: "profiles", help: "An AI profile (ai.profiles), instead of adapter and model" },
       "dragons.*.instructions": { widget: "textarea" },
       default_instructions: { widget: "textarea" },
       dragon_start_cmd: { help: "Placeholders: {dragon}, {task}, {prompt_file}" },
+    },
+  },
+  {
+    key: "ai",
+    title: "AI tools, profiles and roles",
+    schema: AiSchema,
+    docs: "#ai-tools-profiles-and-roles",
+    hints: {
+      profiles: { help: "Named tool + model: a dragon or a role names one" },
+      "profiles.*.tool": { options: "adapters", help: "A built-in tool (kiro, claude-code, codex, ...) or one of agent_adapters" },
+      "profiles.*.model": { help: "Any model the tool offers (GET /api/ai/models lists them)" },
+      // Added to what Lair starts: confirmed like a command
+      "profiles.*.options.args": { sensitive: true, help: "Literal arguments added to the tool's start command" },
+      roles: { help: "Per job, profile ids in order: the first is used, the next ones are its fallbacks" },
+      "roles.build": { help: "Dragons that name no profile, adapter or model run on this" },
+      "roles.review": { help: "A tier's reviewer pool with no agents of its own takes the agents on these profiles" },
+      "roles.plan": { help: "The planner agent's profile, when it names none" },
+      "roles.supervise": { help: "Not used yet: the supervisor (A3) will start on it" },
     },
   },
   {
@@ -87,7 +107,12 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
     root: true,
     schema: AdaptersSchema,
     docs: "#agent-adapters",
-    hints: { "agent_adapters.*.start_cmd": { help: "A template; placeholders such as {prompt_file}, {pid}" } },
+    hints: {
+      "agent_adapters.*.start_cmd": { help: "A template; placeholders such as {prompt_file}, {pid}" },
+      "agent_adapters.*.models_cmd": { help: "Lists the tool's models (no placeholders); read by models_parser" },
+      "agent_adapters.*.auth_check_cmd": { help: "Exits 0 when the tool is signed in (no placeholders)" },
+      "agent_adapters.*.login_hint": { help: "The command you run in a terminal to sign in (Lair never runs it)" },
+    },
   },
   {
     key: "machines",

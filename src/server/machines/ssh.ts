@@ -82,6 +82,20 @@ export function buildHealthCheckCommand(machine: SSHMachineConfig): string[] {
 }
 
 /**
+ * SSH arguments that run `argv` on the machine as one command: every
+ * element is single-quoted for the remote shell, so none of them is parsed
+ * there (no word splitting, globbing or substitution).
+ */
+export function buildRemoteArgvCommand(machine: SSHMachineConfig, argv: string[]): string[] {
+  return buildSSHCommand(machine, argv.map(shellQuote).join(" "));
+}
+
+/** SSH arguments that print where `program` is on the machine's PATH (exit 0), or exit 1 when it isn't there. */
+export function buildRemoteLookupCommand(machine: SSHMachineConfig, program: string): string[] {
+  return buildSSHCommand(machine, `command -v ${shellQuote(program)}`);
+}
+
+/**
  * Build a remote gate execution command
  *
  * @param machine - SSH machine configuration

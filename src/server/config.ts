@@ -12,6 +12,7 @@ import {
   validateAllDragons,
   validateDragonDefaults,
 } from "./parsers/dragon-config.js";
+import { validateAiConfig } from "./ai/config.js";
 
 export const PROJECTS_DIR = join(process.cwd(), "projects");
 
@@ -117,8 +118,9 @@ export function parseProjectConfig(content: string, name: string, configPath: st
     );
   }
 
-  // Optional keys that apply to every dragon: a mistake there fails loudly
-  const problems = validateDragonDefaults(config);
+  // Optional keys that apply to every dragon (its defaults, and the AI
+  // profiles and roles it may run on): a mistake there fails loudly
+  const problems = [...validateDragonDefaults(config), ...validateAiConfig(config)];
   if (problems.length > 0) {
     throw new Error(`Invalid project config ${name}: ${problems.join("; ")}`);
   }

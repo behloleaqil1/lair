@@ -29,6 +29,8 @@ export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/planner",
   // The dashboard's own reads: its log tails and test output are the owner's
   "/api/dashboard",
+  // AI tools: every route, reads included, runs the tools' own commands and shows who is signed in
+  "/api/ai",
   // Modules whose writes need the owner (requireOwnerForChanges); their reads stay open but get no CORS either
   "/api/delivery",
   "/api/controls",

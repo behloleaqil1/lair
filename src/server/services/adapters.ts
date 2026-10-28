@@ -2,8 +2,13 @@
  * Agent Adapter Service
  *
  * Provides infrastructure for orchestrating any AI coding agent, not just Kiro.
- * Built-in adapters for Kiro, Aider, Claude Code, and Cursor Agent.
- * Custom adapters can be defined in project config.
+ * Built-in adapters (presets) for Kiro, Aider, Claude Code, Cursor Agent,
+ * Codex CLI, Gemini CLI, OpenCode, Goose and GitHub Copilot CLI; only Kiro
+ * is tested end to end, the others are marked experimental. Custom adapters
+ * can be defined in project config. A preset may also say how to list the
+ * tool's models (models_cmd and models_parser, else a known `models` list),
+ * how to check that it is signed in (auth_check_cmd, login_hint) and how to
+ * read its version (version_cmd): src/server/ai/ runs those.
  */
 import type {
   AgentAdapter,
@@ -36,7 +41,23 @@ export const BUILTIN_ADAPTERS: Record<string, AgentAdapter> = {
     log_dir: "work/logs/",
     session_id_env: "KIRO_SESSION_ID",
     resume_flag: "--resume-id {session_id}",
+    // Lines like "* auto  1.00x credits  Models chosen by task..." (the default marked with *)
+    models_cmd: ["kiro-cli", "chat", "--list-models"],
+    models_parser: "kiro",
+    // Shown only when the list command fails
+    models: [
+      { id: "auto", label: "Models chosen by task", default: true },
+      { id: "claude-opus-4.5", label: "Claude Opus 4.5" },
+      { id: "claude-sonnet-4.5", label: "Claude Sonnet 4.5" },
+      { id: "claude-sonnet-4", label: "Claude Sonnet 4" },
+      { id: "claude-haiku-4.5", label: "Claude Haiku 4.5" },
+    ],
+    auth_check_cmd: ["kiro-cli", "whoami"],
+    login_hint: "kiro-cli login",
+    version_cmd: ["kiro-cli", "--version"],
   },
+  // The model is not part of the start command: aider takes it from its own
+  // configuration (.aider.conf.yml or its environment variables)
   aider: {
     id: "aider",
     name: "Aider",
@@ -44,6 +65,7 @@ export const BUILTIN_ADAPTERS: Record<string, AgentAdapter> = {
     stop_cmd: "kill -INT {pid}",
     status_method: "file",
     queue_file: ".aider/status.md",
+    version_cmd: ["aider", "--version"],
   },
   // EXPERIMENTAL example. Flags checked against the public Claude Code CLI
   // reference: the binary is `claude`, `-p` runs non-interactively, `--model`,
@@ -61,6 +83,15 @@ export const BUILTIN_ADAPTERS: Record<string, AgentAdapter> = {
     status_method: "stdout",
     status_pattern: '^\\{"status":',
     resume_flag: "--resume {session_id}",
+    // The CLI's model aliases (a full model name works too); no list command
+    models: [
+      { id: "opus", label: "Claude Opus (the latest)" },
+      { id: "sonnet", label: "Claude Sonnet (the latest)" },
+      { id: "haiku", label: "Claude Haiku (the latest)" },
+    ],
+    login_hint: "claude, then /login",
+    version_cmd: ["claude", "--version"],
+    experimental: true,
   },
   // EXPERIMENTAL example. Per the public Cursor CLI parameter reference the
   // binary is `agent`, `-p` runs non-interactively and the prompt is a
@@ -77,6 +108,98 @@ export const BUILTIN_ADAPTERS: Record<string, AgentAdapter> = {
     status_method: "mcp",
     mcp_endpoint: "stdio",
     resume_flag: "--resume {session_id}",
+    models: [{ id: "auto", label: "Chosen by Cursor", default: true }, { id: "sonnet-4.5" }, { id: "gpt-5" }],
+    login_hint: "agent login",
+    version_cmd: ["agent", "--version"],
+    experimental: true,
+  },
+  // EXPERIMENTAL presets: start commands from each CLI's public reference,
+  // not run end to end by Lair's tests. None of them reads the prompt from a
+  // file, so the prompt names the file for the agent to read, and stopping
+  // sends SIGTERM. Adapt them (permission flags, resume) in `agent_adapters`.
+  //
+  // Codex CLI: `codex exec` runs non-interactively, `--model` picks the model
+  // and `--full-auto` lets it edit the workspace; `codex login status` exits 0
+  // when signed in
+  codex: {
+    id: "codex",
+    name: "Codex CLI (experimental)",
+    start_cmd:
+      'codex exec --full-auto --model {model} "Read the file {prompt_file} and carry out the task it describes."',
+    stop_cmd: "kill -TERM {pid}",
+    status_method: "file",
+    queue_file: "work/queue.md",
+    models: [{ id: "gpt-5-codex", label: "GPT-5-Codex", default: true }, { id: "gpt-5", label: "GPT-5" }],
+    auth_check_cmd: ["codex", "login", "status"],
+    login_hint: "codex login",
+    version_cmd: ["codex", "--version"],
+    experimental: true,
+  },
+  // Gemini CLI: `--prompt` runs non-interactively, `--model` picks the model,
+  // `--yolo` accepts its tool calls
+  gemini: {
+    id: "gemini",
+    name: "Gemini CLI (experimental)",
+    start_cmd:
+      'gemini --model {model} --yolo --prompt "Read the file {prompt_file} and carry out the task it describes."',
+    stop_cmd: "kill -TERM {pid}",
+    status_method: "file",
+    queue_file: "work/queue.md",
+    models: [
+      { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", default: true },
+      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
+    ],
+    login_hint: "gemini, then choose Login with Google",
+    version_cmd: ["gemini", "--version"],
+    experimental: true,
+  },
+  // OpenCode: `opencode run` runs non-interactively, `--model` takes
+  // provider/model, and `opencode models` lists them one per line
+  opencode: {
+    id: "opencode",
+    name: "OpenCode (experimental)",
+    start_cmd: 'opencode run --model {model} "Read the file {prompt_file} and carry out the task it describes."',
+    stop_cmd: "kill -TERM {pid}",
+    status_method: "file",
+    queue_file: "work/queue.md",
+    models_cmd: ["opencode", "models"],
+    models_parser: "lines",
+    login_hint: "opencode auth login",
+    version_cmd: ["opencode", "--version"],
+    experimental: true,
+  },
+  // Goose: `goose run --instructions <file>` runs the file's instructions. The
+  // model is not part of the start command: goose takes it from its own
+  // configuration (`goose configure`)
+  goose: {
+    id: "goose",
+    name: "Goose (experimental)",
+    start_cmd: "goose run --instructions {prompt_file}",
+    stop_cmd: "kill -TERM {pid}",
+    status_method: "file",
+    queue_file: "work/queue.md",
+    login_hint: "goose configure",
+    version_cmd: ["goose", "--version"],
+    experimental: true,
+  },
+  // GitHub Copilot CLI: `--prompt` runs non-interactively, `--model` picks
+  // the model, and `--allow-all-tools` lets it use its tools without asking
+  copilot: {
+    id: "copilot",
+    name: "GitHub Copilot CLI (experimental)",
+    start_cmd:
+      'copilot --model {model} --allow-all-tools --prompt "Read the file {prompt_file} and carry out the task it describes."',
+    stop_cmd: "kill -TERM {pid}",
+    status_method: "file",
+    queue_file: "work/queue.md",
+    models: [
+      { id: "claude-sonnet-4.5", label: "Claude Sonnet 4.5", default: true },
+      { id: "claude-sonnet-4", label: "Claude Sonnet 4" },
+      { id: "gpt-5", label: "GPT-5" },
+    ],
+    login_hint: "copilot, then /login",
+    version_cmd: ["copilot", "--version"],
+    experimental: true,
   },
 };
 
@@ -257,27 +380,56 @@ export function tokenizeTemplate(template: string): string[] {
 }
 
 /**
+ * Why a placeholder in these tokens would put a value where only the
+ * template may decide: the program (the first token) never holds one, and a
+ * token that starts with one is refused when its value starts with "-" (it
+ * would become an option).
+ */
+function placementWarnings(tokens: string[], vars: Record<string, string>): string[] {
+  const warnings: string[] = [];
+  tokens.forEach((token, i) => {
+    if (i === 0) {
+      const named = /\{([a-z_]+)\}/.exec(token);
+      if (named) warnings.push(`The program can't come from a placeholder ({${named[1]}})`);
+      return;
+    }
+    const lead = /^\{([a-z_]+)\}/.exec(token);
+    if (lead && Object.prototype.hasOwnProperty.call(vars, lead[1]) && vars[lead[1]].startsWith("-")) {
+      warnings.push(`Variable {${lead[1]}} would become an option: "${vars[lead[1]].slice(0, 60)}"`);
+    }
+  });
+  return warnings;
+}
+
+/**
  * Tokenize templates, then substitute placeholders inside each token, so a
- * value (a path with spaces, say) always stays one argument.
+ * value (a path with spaces, say) always stays one argument. `extraArgs`
+ * (a profile's options.args) are literal arguments that go after the first
+ * template's, never substituted.
  */
 function buildArgv(
   templates: string[],
   vars: Record<string, string>,
+  extraArgs: readonly string[] = [],
 ): AdapterCommandResult {
-  let tokens: string[];
+  let groups: string[][];
   try {
-    tokens = templates.flatMap((t) => tokenizeTemplate(t));
+    groups = templates.map((t) => tokenizeTemplate(t));
   } catch (e) {
     // validateAdapter reports this too; never hand back a half-parsed command
     return { command: [], warnings: [e instanceof Error ? e.message : String(e)] };
   }
+  const tokens = groups.flat();
   const warnings = unsafeValueWarnings(vars);
   if (warnings.length > 0) {
     // Same rule as substituteVariables: unsafe values are not substituted
     return { command: tokens, warnings };
   }
-  const command = tokens.map((token) => replacePlaceholders(token, vars));
-  warnings.push(...unsubstitutedWarnings(command));
+  const misplaced = placementWarnings(tokens, vars);
+  if (misplaced.length > 0) return { command: tokens, warnings: misplaced };
+  const substituted = groups.map((group) => group.map((token) => replacePlaceholders(token, vars)));
+  const command = [...(substituted[0] ?? []), ...extraArgs, ...substituted.slice(1).flat()];
+  warnings.push(...unsubstitutedWarnings(substituted.flat()));
   return { command, warnings };
 }
 
@@ -341,11 +493,14 @@ export function validateAdapter(adapter: AgentAdapter): AdapterValidationResult 
     errors.push("Adapter must have a string 'stop_cmd'");
   }
 
-  // Command templates must tokenize (balanced quotes)
+  // Command templates must tokenize (balanced quotes), and the program is never a placeholder
   for (const template of [adapter.start_cmd, adapter.stop_cmd, adapter.resume_flag]) {
     if (typeof template !== "string") continue;
     try {
-      tokenizeTemplate(template);
+      const program = tokenizeTemplate(template)[0] ?? "";
+      if (template !== adapter.resume_flag && /\{[a-z_]+\}/.test(program)) {
+        errors.push(`The program of "${template.slice(0, 80)}" can't come from a placeholder`);
+      }
     } catch (e) {
       errors.push(e instanceof Error ? e.message : String(e));
     }
@@ -409,6 +564,8 @@ export interface StartCommandInput {
   sessionDir?: string;
   outputDir?: string;
   agentProfile?: string;
+  /** Literal arguments after the start command's (an ai.profiles entry's options.args), before the resume flag */
+  extraArgs?: readonly string[];
 }
 
 /**
@@ -451,7 +608,7 @@ export function buildStartCommand(
     templates.push(adapter.resume_flag);
   }
 
-  return buildArgv(templates, vars);
+  return buildArgv(templates, vars, input.extraArgs);
 }
 
 /**

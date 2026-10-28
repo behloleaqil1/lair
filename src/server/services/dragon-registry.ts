@@ -9,6 +9,7 @@ import { join } from "path";
 import type { DragonConfig, ProjectConfig } from "../../shared/types.js";
 import { dragonDefaults, isValidDragonId, parseDragonRegistry } from "../parsers/dragon-config.js";
 import { parseDragonsFile } from "../parsers/dragons.js";
+import { dragonAi } from "../ai/profiles.js";
 
 /** Content of `<agents_dir>/dragons.txt`, or "" if it can't be read. */
 export function readDragonsFile(config: ProjectConfig): string {
@@ -24,10 +25,11 @@ export function readDragonsFile(config: ProjectConfig): string {
  *
  * - A YAML dragon keeps its fields, with the usual defaults filled in
  *   (parseDragonRegistry), also when dragons.txt lists it too.
- * - A dragon only in dragons.txt gets its dragons.txt name and the
- *   project's dragon_defaults model and adapter (without them: no model, and
- *   the default adapter applies), and no machine or instructions, which is
- *   how the dragons table shows it.
+ * - A dragon only in dragons.txt names nothing itself: it gets its
+ *   dragons.txt name, the first profile of its role when that role is set
+ *   (ai.roles; dragonAi), else the project's dragon_defaults model and
+ *   adapter (without them: no model, and the default adapter applies), and
+ *   no machine or instructions, which is how the dragons table shows it.
  * - IDs that fail isValidDragonId are dropped from either source.
  */
 export function mergeDragonRegistry(
@@ -40,13 +42,15 @@ export function mergeDragonRegistry(
     if (!isValidDragonId(id) || dragons.has(id)) {
       continue;
     }
+    const ai = dragonAi(config, id, undefined, defaults);
     dragons.set(id, {
       id,
       name: name || id,
-      model: defaults.model ?? "",
+      model: ai.model ?? "",
       machine: "",
       instructions: "",
-      ...(defaults.adapter ? { adapter: defaults.adapter } : {}),
+      ...(ai.adapter ? { adapter: ai.adapter } : {}),
+      ...(ai.profile ? { profile: ai.profile } : {}),
     });
   }
   return dragons;

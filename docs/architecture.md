@@ -128,6 +128,17 @@ Agent runs with claims, locks, session recovery, failover and budgets ([configur
 - **`service.ts`**, **`routes.ts`**: the per-project tick (launch, supervise, recover, reap) started and stopped by `index.ts`, and `/api/agents/*`
 - **`prompts.ts`**: the prompt files in `prompts_dir` for the Work section's start-run form (owner only): basenames, regular files directly in the directory, capped at a run's prompt size
 
+#### AI tools, profiles and roles (`ai/`)
+
+Any tool, any model, per role ([configuration](configuration.md#ai-tools-profiles-and-roles), [design](design/ai-roles.md)). Every key is optional.
+
+- **`profiles.ts`**: `ai.profiles` and `ai.roles` as the other modules read them: a dragon's tool and model (the dragon registry), its fallbacks along its role (`agents/failover.ts`), and the agents of a `role:<role>` reviewer pool (`review/service.ts`). It imports no other module, so the registry can use it
+- **`config.ts`**: the `ai:` schema (the Settings section) and `validateAiConfig`, which `config.ts` runs when a project loads: unknown tools and profiles, a dragon's `profile:`, and an adapter's model and sign-in commands (argv, no placeholders)
+- **`parsers.ts`**: model list readers, bounded (`kiro` for `kiro-cli chat --list-models`, `lines` for one model per line)
+- **`runner.ts`**: the one boundary: a tool's own commands as argv, no shell, a timeout, bounded output, the agents' environment only
+- **`tools.ts`**: per tool and machine (a PATH lookup here, ssh for an SSH machine), installed, version and sign-in state, and the models (cached: an hour, a minute for statuses and failures); the agents module asks it before each start (`ToolReadiness`), so a signed-out tool starts nothing here, with one decision per tool
+- **`routes.ts`**: `/api/ai/*`, all the owner's (reads included)
+
 #### Decisions (`decisions/`)
 
 The Decision Inbox ([configuration](configuration.md#decision-inbox)): the one place Lair asks the human. Always mounted.

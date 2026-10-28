@@ -40,7 +40,7 @@ export interface JsonSchema {
 export type FieldWidget = "text" | "textarea" | "number" | "toggle" | "select" | "argv" | "list" | "globs" | "path" | "yaml";
 
 /** Values a field can pick from, read from the project's own config. */
-export type KnownSource = "agents" | "adapters" | "models" | "lanes" | "machines";
+export type KnownSource = "agents" | "adapters" | "models" | "lanes" | "machines" | "profiles";
 
 export interface FieldHint {
   help?: string;
@@ -131,6 +131,8 @@ export interface KnownValues {
   models: string[];
   lanes: string[];
   machines: string[];
+  /** ai.profiles ids */
+  profiles: string[];
 }
 
 export interface ProjectFileInfo {

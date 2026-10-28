@@ -10,6 +10,7 @@ import type {
   AIModel,
 } from "../../shared/types.js";
 import { getAdapter } from "../services/adapters.js";
+import { dragonAi, namesOwnProfile } from "../ai/profiles.js";
 
 // Default models if none configured
 const DEFAULT_MODELS: AIModel[] = [
@@ -97,17 +98,19 @@ export function validateDragonDefaults(config: ProjectConfig): string[] {
   return errors;
 }
 
-/** True when the YAML `dragons:` entry for `id` names its own model. */
+/** True when the YAML `dragons:` entry for `id` names its own model, or its own profile (ai.profiles). */
 export function hasOwnModel(config: ProjectConfig, id: string): boolean {
   const own: unknown = config.dragons?.[id]?.model;
-  return typeof own === "string" && own.length > 0;
+  return (typeof own === "string" && own.length > 0) || namesOwnProfile(config, config.dragons?.[id]);
 }
 
 /**
  * Parse dragon registry from project config.
- * Returns full DragonConfig objects with all fields populated: an entry's
- * own model and adapter, else dragon_defaults', else the built-in default
- * model (and no adapter: 'kiro' at runtime).
+ * Returns full DragonConfig objects with all fields populated (dragonAi): an
+ * entry's own profile, else its own model and adapter (each else
+ * dragon_defaults'), else its role's first profile (ai.roles), else
+ * dragon_defaults', else the built-in default model (and no adapter: 'kiro'
+ * at runtime).
  */
 export function parseDragonRegistry(
   config: ProjectConfig,
@@ -121,13 +124,15 @@ export function parseDragonRegistry(
       continue; // Skip invalid IDs
     }
 
+    const ai = dragonAi(config, id, rawConfig, defaults);
     const dragon: DragonConfig = {
       id,
       name: rawConfig.name || id,
-      model: rawConfig.model || defaults.model || DEFAULT_MODEL_ID,
+      model: ai.model || DEFAULT_MODEL_ID,
       machine: rawConfig.machine || DEFAULT_MACHINE,
       instructions: rawConfig.instructions || "",
-      adapter: rawConfig.adapter || defaults.adapter, // optional, defaults to 'kiro' at runtime
+      adapter: ai.adapter, // optional, defaults to 'kiro' at runtime
+      ...(ai.profile ? { profile: ai.profile } : {}),
     };
 
     dragons.set(id, dragon);

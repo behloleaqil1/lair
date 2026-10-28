@@ -57,6 +57,10 @@ export interface AgentProfile {
   adapter: string;
   model?: string;
   provider: string;
+  /** The ai.profiles id it came from, when it came from one */
+  profile?: string;
+  /** That profile's extra start arguments (options.args), when it has any */
+  args?: string[];
 }
 
 /** What a run waiting on a lock is waiting for. Never a silent wait. */

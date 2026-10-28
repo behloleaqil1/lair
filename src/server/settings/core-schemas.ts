@@ -48,6 +48,8 @@ const DragonSchema = z
     model: text.optional(),
     machine: text.default("local"),
     adapter: text.optional(),
+    /** An ai.profiles id, instead of adapter and model */
+    profile: text.optional(),
     instructions: text.default(""),
   })
   .passthrough();
@@ -79,6 +81,20 @@ const AdapterSchema = z
     mcp_endpoint: text.optional(),
     session_id_env: text.optional(),
     resume_flag: text.optional(),
+    // Model discovery and sign-in checks (src/server/ai/ checks them when the project loads)
+    models_cmd: argv.optional(),
+    models_parser: z.enum(["kiro", "lines"]).optional(),
+    models: z
+      .array(
+        z
+          .object({ id: z.string().min(1), label: text.optional(), notes: text.optional(), default: z.boolean().optional() })
+          .strict(),
+      )
+      .optional(),
+    auth_check_cmd: argv.optional(),
+    login_hint: text.optional(),
+    version_cmd: argv.optional(),
+    experimental: z.boolean().optional(),
   })
   .passthrough();
 

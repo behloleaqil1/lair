@@ -26,6 +26,7 @@ any machines.
 | Dashboard | [architecture.md](../architecture.md) | `src/client/`, `src/server/dashboard/` | Eight sections, a detail view with a URL for every row, owner-only logs |
 | Needs you and notifications | configuration.md "Needs you", "Notifications" | `src/server/notifications/`, `src/server/decisions/` | One decision per owner hold; action items vs notices; Home "Needs you"; desktop and phone notifications |
 | No false holds | configuration.md "Fill", "Agents" | `src/server/agents/` | A wait on a gate still queued is not "too long"; transient provider errors are waited out, with a retry cap and failover first |
+| AI roles, part 1 (A6-1) | [ai-roles.md](ai-roles.md) | `src/server/ai/` | Profiles (tool + model) and roles per job; dragons, failover, reviewer pools and the planner agent on them; model lists and sign-in checks per machine; a signed-out tool starts nothing |
 
 ## Next, in order
 

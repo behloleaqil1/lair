@@ -1,10 +1,12 @@
 /**
  * Failover: the profiles an agent can run with (its own adapter and model,
- * then agents.fallbacks.<id>), spotting a provider error or rate limit in a
- * run's output, and picking the next profile whose provider is usable.
+ * then agents.fallbacks.<id>, else its role's next ai.profiles), spotting a
+ * provider error or rate limit in a run's output, and picking the next
+ * profile whose provider is usable.
  */
 import type { ProjectConfig } from "../../shared/types.js";
 import type { AgentProfile } from "../../shared/agents-types.js";
+import { aiProfiles, roleFallbacks, type AiProfile } from "../ai/profiles.js";
 import { getDragonAdapter } from "../services/adapters.js";
 import { loadKnownDragons } from "../services/dragon-registry.js";
 import type { AgentsSettings } from "./config.js";
@@ -13,7 +15,9 @@ import type { FailoverInfo } from "./types.js";
 /**
  * The agent's profiles in failover order: [its own, ...fallbacks]. Empty
  * when the agent is unknown or its adapter doesn't exist. `model` overrides
- * the first profile's model (a run request may set it).
+ * the first profile's model (a run request may set it). The fallbacks are
+ * agents.fallbacks.<id> when it is set; else, for a dragon on an ai.profiles
+ * profile, the profiles after it in its role (roleFallbacks).
  */
 export function profilesFor(
   config: ProjectConfig,
@@ -25,16 +29,37 @@ export function profilesFor(
   if (!dragon) return [];
   const adapter = getDragonAdapter(dragon, config);
   if (!adapter) return [];
+  // An agent_adapters entry may leave `id` out: its key is its id
+  const adapterId = adapter.id || dragon.adapter || "kiro";
   const provider = (id: string, given?: string) => given ?? settings.providers[id] ?? id;
   const primaryModel = model ?? (dragon.model ? dragon.model : undefined);
+  const own = dragon.profile ? aiProfiles(config).get(dragon.profile) : undefined;
+  const explicit = settings.fallbacks[agent] ?? [];
+  const fallbacks: AgentProfile[] =
+    explicit.length > 0
+      ? explicit.map((p) => ({ adapter: p.adapter, model: p.model, provider: provider(p.adapter, p.provider) }))
+      : roleFallbacks(config, dragon).map((p) => fromProfile(p, provider(p.tool)));
   return [
-    { adapter: adapter.id, model: primaryModel, provider: provider(adapter.id) },
-    ...(settings.fallbacks[agent] ?? []).map((p) => ({
-      adapter: p.adapter,
-      model: p.model,
-      provider: provider(p.adapter, p.provider),
-    })),
+    {
+      adapter: adapterId,
+      model: primaryModel,
+      provider: provider(adapterId),
+      ...(own ? { profile: own.id } : {}),
+      ...(own && own.args.length > 0 ? { args: own.args } : {}),
+    },
+    ...fallbacks,
   ];
+}
+
+/** An ai.profiles entry as an agent profile. */
+function fromProfile(profile: AiProfile, provider: string): AgentProfile {
+  return {
+    adapter: profile.tool,
+    model: profile.model,
+    provider,
+    profile: profile.id,
+    ...(profile.args.length > 0 ? { args: profile.args } : {}),
+  };
 }
 
 export function profileLabel(profile: AgentProfile): string {
