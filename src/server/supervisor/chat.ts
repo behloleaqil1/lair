@@ -532,7 +532,7 @@ export class SupervisorChat {
   private async checkNow(): Promise<void> {
     if (this.stopped) return;
     const now = this.o.clock();
-    const runs = this.o.agents?.getStore() ?? null;
+    const store = this.o.agents?.getStore() ?? null;
     for (const turn of this.o.store.pendingTurns()) {
       if (now >= turn.deadlineAt) {
         const minutes = Math.round((turn.deadlineAt - turn.askedAt) / 60_000);
@@ -543,8 +543,20 @@ export class SupervisorChat {
         await this.close(turn, "its run never started");
         continue;
       }
-      const run = runs?.getRun(turn.runId) ?? null;
+      const run = store?.getRun(turn.runId) ?? null;
       if (run && isActive(run.state)) continue;
+
+      // Check if the run is being retried by the agents module (a new run in the same chain is active)
+      if (run && store) {
+        const chainRuns = store.chainRuns(run.chainId);
+        const activeRun = chainRuns.find((r) => isActive(r.state));
+        if (activeRun) {
+          // A recovery or restart is in progress: update the turn to track the new run
+          this.o.store.updateTurnRunId(turn.id, activeRun.id);
+          continue;
+        }
+      }
+
       const how = run ? `its run ended ${run.state} (${oneLine(run.detail)})` : "its run is gone";
       // A failover or a recovery goes on in a new run, without a token that works: it is stopped
       await this.close(turn, `no answer: ${how}`);

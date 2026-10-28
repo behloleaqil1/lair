@@ -393,6 +393,11 @@ export class SupervisorStore {
     })();
   }
 
+  /** Update a turn's run_id to track a new run in the same chain (after agents module restarts it). */
+  updateTurnRunId(turnId: string, runId: string): boolean {
+    return this.db.prepare(`UPDATE turns SET run_id = ? WHERE id = ? AND state = 'pending'`).run(runId, turnId).changes === 1;
+  }
+
   /** Supervisor runs a project started since `since` (questions and digests whose run was requested). */
   runsSince(project: string, since: number): number {
     const row = this.db
