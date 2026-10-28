@@ -16,7 +16,7 @@ import { stringify } from "yaml";
 import type { OpsAuditEntry } from "../../shared/supervisor-types.js";
 import { runOpsMcp } from "../../cli/ops-mcp.js";
 import { AgentsStore } from "../agents/store.js";
-import { runView, type AgentRun } from "../agents/types.js";
+import { isActive, runView, type AgentRun } from "../agents/types.js";
 import { loadProjectConfig } from "../config.js";
 import { EventBus } from "../core/event-bus.js";
 import type { DashboardSources } from "../dashboard/routes.js";
@@ -45,7 +45,11 @@ const fakeArn = ["arn", "aws", "iam", "", fakeAccount, "role/Deploy"].join(":");
 const fakeDigits = ["4488", "12345678"].join("");
 const fakeHook = ["https://hooks.example.com/services", "T0", "B0", "z".repeat(24)].join("/");
 const bearerLine = ["Author", "ization: Bearer ", fakeGh].join("");
-const PLANTED = [fakeGh, fakePass, fakeArn, fakeAccount, fakeDigits, "z".repeat(24)];
+// Email addresses: a git Author line in the logs, and the review identity and allowed list in the config
+const authorEmail = "someone@example.com";
+const identityEmail = "review-bot@example.com";
+const allowedEmail = "teammate@example.org";
+const PLANTED = [fakeGh, fakePass, fakeArn, fakeAccount, fakeDigits, "z".repeat(24), authorEmail, identityEmail, allowedEmail];
 
 const leaks = (text: string) => PLANTED.filter((p) => text.includes(p));
 
@@ -113,7 +117,7 @@ async function serve(options: { listen?: boolean } = {}) {
         machines: {},
         status_cmd: ["curl", "-H", bearerLine, fakeUrl],
         processes: { web: { command: ["node", "server.js"], env: { DEPLOY_HOOK: fakeHook } } },
-        review: { token_env: "LAIR_GITHUB_TOKEN" },
+        review: { token_env: "LAIR_GITHUB_TOKEN", identity: { name: "Review Bot", email: identityEmail }, allowed_emails: [allowedEmail] },
       }),
     );
   }
@@ -126,12 +130,16 @@ async function serve(options: { listen?: boolean } = {}) {
       `[09:00:03] assumed ${fakeArn}`,
       `[09:00:04] ${bearerLine}`,
       `[09:00:05] account ${fakeDigits} billed`,
+      `[09:00:05] Author: A Person <${authorEmail}>`,
       `[09:00:06] ok: build finished`,
       "",
     ].join("\n"),
   );
   writeFileSync(join(demo, "gates", "results", "gate-1.rc"), "1\n");
-  writeFileSync(join(demo, "gates", "results", "gate-1.log"), `=== test\nFAIL fetching ${fakeUrl} with ${fakeGh}\n`);
+  writeFileSync(
+    join(demo, "gates", "results", "gate-1.log"),
+    `=== test\ncommit 1f2e3d4c\nAuthor: A Person <${authorEmail}>\nFAIL fetching ${fakeUrl} with ${fakeGh}\n`,
+  );
 
   const clock = { t: T0, now() {
     return this.t;
@@ -196,6 +204,11 @@ async function serve(options: { listen?: boolean } = {}) {
     measures,
     clock,
     projectsDir: projects,
+    // As the server wires it: a run token lives while the agents module's store has its run active
+    runActive: (runId) => {
+      const found = agentsStore.getRun(runId);
+      return found !== null && isActive(found.state);
+    },
   });
   if (options.listen) await app.listen({ port: 0, host: "127.0.0.1" });
   else await app.ready();
@@ -209,7 +222,13 @@ async function serve(options: { listen?: boolean } = {}) {
   const owner = { ...BROWSER, [OWNER_SESSION_HEADER]: auth.createSession(readFileSync(tokenPath, "utf-8").trim())!.session };
   const call = (token: string, tool: string, args: Record<string, unknown> = {}) =>
     app.inject({ method: "POST", url: "/api/ops/call", headers: { authorization: `Bearer ${token}` }, payload: { tool, args } });
-  return { app, root, demo, clock, mounted, owner, events, call };
+  /** A supervisor run the agents module is running now, in its store */
+  const activeRun = (id: string): AgentRun => {
+    const r = run({ id, chainId: id, task: `supervise-${id}`, agent: "supervisor", state: "running", detail: "running" });
+    agentsStore.insertRun(r);
+    return r;
+  };
+  return { app, root, demo, clock, mounted, owner, events, call, agentsStore, activeRun };
 }
 
 describe("the diagnostics route", () => {
@@ -258,7 +277,8 @@ describe("the diagnostics route", () => {
 
 describe("ops tokens", () => {
   it("are scoped and read-only, expire, end with their run, and are refused anywhere else", async () => {
-    const { app, owner, mounted, events, clock, call } = await serve();
+    const { app, owner, mounted, events, clock, call, activeRun } = await serve();
+    for (const id of ["sup-run-1", "sup-run-2", "sup-run-3"]) activeRun(id);
 
     // The owner's, for an interactive session: shown once, for an hour by default, never listed
     const minted = await app.inject({ method: "POST", url: "/api/supervisor/tokens", headers: owner, payload: {} });
@@ -314,8 +334,41 @@ describe("ops tokens", () => {
     expect((await call(fresh.token, "runs.get", { id: "-rf" })).statusCode).toBe(400);
   });
 
+  it("of a run stop working however the run ends: a failover, an owner's stop, no run at all", async () => {
+    const { mounted, events, call, agentsStore, activeRun } = await serve();
+
+    // The agents module fails the run over: it ends failed, a fallback run carries the task on (agent.failover)
+    const failing = activeRun("sup-run-f");
+    const failedOver = mounted.tokens.mintForRun("sup-run-f", "demo", 30 * MIN);
+    expect((await call(failedOver.token, "config.get")).statusCode).toBe(200);
+    agentsStore.saveRun({ ...failing, state: "failed", endedAt: T0, detail: "rate limit on kiro: provider said 429" });
+    agentsStore.insertRun(run({ id: "sup-run-f2", chainId: "sup-run-f", previousRunId: "sup-run-f", attempt: 2, state: "queued" }));
+    await events.emit("agent.failover", { project: "demo", kind: "failover", runId: "sup-run-f" });
+    expect((await call(failedOver.token, "config.get")).statusCode).toBe(401);
+
+    // A run that starts on its next profile is a failover event too, and goes on: its token stays good
+    activeRun("sup-run-s");
+    const switched = mounted.tokens.mintForRun("sup-run-s", "demo", 30 * MIN);
+    await events.emit("agent.failover", { project: "demo", kind: "failover", runId: "sup-run-s" });
+    expect((await call(switched.token, "config.get")).statusCode).toBe(200);
+
+    // The owner stops the run: it ends with no event the supervisor hears, and its token is refused all the same
+    const stopping = activeRun("sup-run-o");
+    const stopped = mounted.tokens.mintForRun("sup-run-o", "demo", 30 * MIN);
+    expect((await call(stopped.token, "config.get")).statusCode).toBe(200);
+    agentsStore.saveRun({ ...stopping, state: "failed", endedAt: T0, detail: "stopped by the owner" });
+    expect((await call(stopped.token, "config.get")).statusCode).toBe(401);
+    // And it stays refused (gone, not only refused once)
+    expect(mounted.tokens.list().map((t) => t.runId)).not.toContain("sup-run-o");
+
+    // A run the agents module doesn't know
+    const unknown = mounted.tokens.mintForRun("no-such-run", "demo", 30 * MIN);
+    expect((await call(unknown.token, "config.get")).statusCode).toBe(401);
+  });
+
   it("audit every call: who, when, the tool and its arguments, and how it ended; never a token", async () => {
-    const { app, owner, mounted, call, clock } = await serve();
+    const { app, owner, mounted, call, clock, activeRun } = await serve();
+    activeRun("sup-run-9");
     const minted = (await app.inject({ method: "POST", url: "/api/supervisor/tokens", headers: owner, payload: { ttl_minutes: 30, label: "my terminal" } })).json().data;
     const forRun = mounted.tokens.mintForRun("sup-run-9", "demo", 30 * MIN);
     await call(minted.token, "config.get", { project: "other" });
@@ -385,12 +438,16 @@ describe("the ops tools", () => {
       expect.arrayContaining(["[09:00:01] cloning https://git.example.com/[...]", "[09:00:06] ok: build finished", "[09:00:07] done"]),
     );
     expect(agentLog.log.lines.find((l) => l.includes("account"))).toBe("[09:00:05] account [digits] billed");
+    // A git Author line keeps the name and the domain, never the address
+    expect(agentLog.log.lines).toContain("[09:00:05] Author: A Person <***@example.com>");
+    const gateLog = answers[`logs.tail {"gate":"gate-1"}`] as { log: { lines: string[] } };
+    expect(gateLog.log.lines).toContain("Author: A Person <***@example.com>");
     // A long line is cut
     expect(Math.max(...agentLog.log.lines.map((l) => l.length))).toBeLessThanOrEqual(503);
 
     const config = (answers["config.get {}"] as { config: Record<string, unknown> }).config;
     expect(config.processes).toEqual({ web: { command: ["node", "server.js"], env: "[removed: a command's environment]" } });
-    expect(config.review).toEqual({ token_env: "LAIR_GITHUB_TOKEN" });
+    expect(config.review).toEqual({ token_env: "LAIR_GITHUB_TOKEN", identity: { name: "Review Bot", email: "[redacted]" }, allowed_emails: "[redacted]" });
     expect(config.status_cmd).toEqual(["curl", "-H", "Authorization: [redacted]", "https://git.example.com/[...]"]);
 
     const events = (answers[`events.query {"kinds":["transient"]}`] as { events: { summary: string; runId: string }[] }).events;
@@ -413,6 +470,32 @@ describe("the ops tools", () => {
     expect((await call(token, "runs.get", { id: "no-such-run" })).statusCode).toBe(404);
   });
 
+  it("keep a token to its project's server events: events that name no project only for an owner token that names none", async () => {
+    const { mounted, call, events, activeRun } = await serve();
+    await events.emit("job.created", { project: "demo", jobId: "job-demo" });
+    await events.emit("job.created", { project: "other", jobId: "job-other" });
+    await events.emit("task.created", { taskId: "task-1", title: "Rotate the keys of the billing service" });
+    await events.emit("node.registered", { nodeId: "node-1", hostname: "builder" });
+    // The bus stamps its events with the real time
+    const range = { source: "server", since: new Date(Date.now() - MIN).toISOString(), until: new Date(Date.now() + MIN).toISOString() };
+    const seen = async (token: string, args: Record<string, unknown>) => {
+      const res = await call(token, "events.query", { ...range, ...args });
+      expect(res.statusCode, res.body.slice(0, 200)).toBe(200);
+      const found = res.json().data.result.events as { data: Record<string, string> }[];
+      return found.map((e) => e.data.jobId ?? e.data.taskId ?? e.data.nodeId).sort();
+    };
+
+    activeRun("sup-run-e");
+    const forRun = mounted.tokens.mintForRun("sup-run-e", "demo", 30 * MIN);
+    expect(await seen(forRun.token, {})).toEqual(["job-demo"]);
+    expect(await seen(forRun.token, { project: "demo" })).toEqual(["job-demo"]);
+
+    const owner = mounted.tokens.mintSession();
+    expect(await seen(owner.token, {})).toEqual(["job-demo", "node-1", "task-1"]);
+    expect(await seen(owner.token, { project: "demo" })).toEqual(["job-demo"]);
+    expect(await seen(owner.token, { project: "other" })).toEqual(["job-other"]);
+  });
+
   it("redact text and configs by the same rules", () => {
     expect(redactText(`see ${fakeUrl}?token=abc and ${fakeArn}`)).toBe("see https://git.example.com/[...] and [arn]");
     expect(redactText(`export GITHUB_TOKEN=${fakeGh}`)).toBe("export GITHUB_TOKEN=[secret]");
@@ -421,11 +504,24 @@ describe("the ops tools", () => {
     expect(redactText(`commit ${"a1b2c3d4".repeat(5)} on ${"0123456789abcdef".repeat(2)}`)).toBe(`commit ${"a1b2c3d4".repeat(5)} on [secret]`);
     expect(redactText("run 0b5c2c3e-7a43-4f7e-9d2a-0d4b1f2e3a4b ok")).toBe("run 0b5c2c3e-7a43-4f7e-9d2a-0d4b1f2e3a4b ok");
     expect(redactText(`key ${"Ab3".repeat(12)}`)).toBe("key [secret]");
+    // A commit-id-shaped secret next to a key-like name goes; a bare commit id stays
+    const hex40 = "a1b2c3d4".repeat(5);
+    expect(redactText(`token=${hex40} key=${hex40} signing_key: ${hex40} at ${hex40}`)).toBe(
+      `token=[redacted] key=[redacted] signing_key: [redacted] at ${hex40}`,
+    );
+    // Emails: the local part goes, the domain stays; a URL's credentials go with the URL rule first
+    expect(redactText(`Author: A Person <${authorEmail}>, cc ${identityEmail}`)).toBe("Author: A Person <***@example.com>, cc ***@example.com");
+    expect(redactText("git@github.com:org/repo.git and pkg@1.2.3")).toBe("***@github.com:org/repo.git and pkg@1.2.3");
     expect(redactText("x".repeat(5000)).length).toBe(1003);
     expect(
-      redactConfig({ review: { token_env: "LAIR_GITHUB_TOKEN" }, ntfy: { token_file: "ntfy.token" }, deploy: { password: "hunter" }, processes: { a: { env: { A: "b" } } } }),
+      redactConfig({
+        review: { token_env: "LAIR_GITHUB_TOKEN", identity: { email: identityEmail }, allowed_emails: [allowedEmail] },
+        ntfy: { token_file: "ntfy.token" },
+        deploy: { password: "hunter" },
+        processes: { a: { env: { A: "b" } } },
+      }),
     ).toEqual({
-      review: { token_env: "LAIR_GITHUB_TOKEN" },
+      review: { token_env: "LAIR_GITHUB_TOKEN", identity: { email: "[redacted]" }, allowed_emails: "[redacted]" },
       ntfy: { token_file: "ntfy.token" },
       deploy: { password: "[redacted]" },
       processes: { a: { env: "[removed: a command's environment]" } },
@@ -488,7 +584,7 @@ describe("lair ops-mcp", () => {
     const called = await reply(3);
     expect(called.result.isError).toBeFalsy();
     const text = called.result.content[0].text as string;
-    expect(JSON.parse(text).result.config.review).toEqual({ token_env: "LAIR_GITHUB_TOKEN" });
+    expect(JSON.parse(text).result.config.review).toMatchObject({ token_env: "LAIR_GITHUB_TOKEN", allowed_emails: "[redacted]" });
     expect(leaks(text)).toEqual([]);
 
     // Over a bound: refused before Lair is asked

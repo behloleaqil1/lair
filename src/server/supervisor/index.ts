@@ -49,7 +49,15 @@ export interface MountSupervisorOptions {
   clock?: Clock;
   projectsDir?: string;
   callTimeoutMs?: number;
+  /**
+   * Whether a run is still active, from the agents module's store: a run
+   * token is refused once its run has ended, however it ended
+   */
+  runActive?: (runId: string) => boolean;
 }
+
+/** The agents module's events after which a run is over: its tokens end at once (runActive is the backstop) */
+const RUN_OVER_EVENTS = ["agent.run.ended", "agent.recovery", "agent.failover"] as const;
 
 export interface SupervisorModule {
   supervisor: Supervisor;
@@ -61,7 +69,7 @@ export async function mountSupervisor(fastify: FastifyInstance, options: MountSu
   const clock = options.clock ?? { now: () => Date.now() };
   const measures = options.measures ?? new SystemMeasures();
   const store = new SupervisorStore(options.dbPath);
-  const tokens = new OpsTokens(() => clock.now());
+  const tokens = new OpsTokens(() => clock.now(), { runActive: options.runActive });
   const supervisor = new Supervisor({
     sources: options.checks,
     defaultProject: options.defaultProject,
@@ -92,11 +100,14 @@ export async function mountSupervisor(fastify: FastifyInstance, options: MountSu
     },
   });
 
-  // A run's tokens end with the run: when the agents module says it ended, or ended in a recovery
-  const unsubscribe = ["agent.run.ended", "agent.recovery"].map((type) =>
-    options.events?.on(type as "agent.run.ended", (event) => {
+  // A run's tokens end with the run: when the agents module says it ended, ended in a recovery, or failed over. A
+  // failover is also recorded when a run starts on its next profile and goes on: then the store still has it active
+  const unsubscribe = RUN_OVER_EVENTS.map((type) =>
+    options.events?.on(type, (event) => {
       const runId = event.data.runId;
-      if (typeof runId === "string") tokens.endRun(runId);
+      if (typeof runId !== "string") return;
+      if (type === "agent.failover" && options.runActive?.(runId)) return;
+      tokens.endRun(runId);
     }),
   );
 

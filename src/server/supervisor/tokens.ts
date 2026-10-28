@@ -3,8 +3,9 @@
  * Never written to disk, so a restart ends every one.
  *
  * - A run token is minted for one supervisor run, bound to its project. It
- *   ends with the run (endRun(), when the agents module says the run ended)
- *   or at its TTL, whichever comes first.
+ *   is accepted only while the agents module's store has that run active,
+ *   ends at once on the module's events for the run (endRun()), and at its
+ *   TTL, whichever comes first.
  * - A session token is minted by the owner, from a signed-in dashboard, for
  *   an interactive session of any MCP-capable tool (1 hour by default). It
  *   reads every project. The owner can revoke it.
@@ -40,10 +41,24 @@ const TOKEN_SHAPE = /^lairops_[A-Za-z0-9_-]{43}$/;
 
 const hash = (token: string) => createHash("sha256").update(token).digest("hex");
 
+export interface OpsTokensOptions {
+  /**
+   * Whether a run is still going (queued, waiting on a lock, running or
+   * stopping), from the agents module's store: a run token is accepted only
+   * while its run is, however the run ended (completed, failed over, stopped
+   * by the owner, recovered into a new run). Without it, a run token ends on
+   * the agents module's events and at its TTL only.
+   */
+  runActive?: (runId: string) => boolean;
+}
+
 export class OpsTokens {
   private byHash = new Map<string, OpsToken>();
 
-  constructor(private readonly now: () => number = Date.now) {}
+  constructor(
+    private readonly now: () => number = Date.now,
+    private readonly options: OpsTokensOptions = {},
+  ) {}
 
   private mint(input: Omit<OpsToken, "id" | "createdAt" | "lastUsedAt" | "calls" | "expiresAt">, ttlMs: number): { token: string; info: OpsTokenView } {
     this.prune();
@@ -83,6 +98,11 @@ export class OpsTokens {
     if (!record) return null;
     const now = this.now();
     if (now >= record.expiresAt) {
+      this.byHash.delete(key);
+      return null;
+    }
+    // A run token lives only as long as its run, whatever event its end raised (or none)
+    if (record.runId !== null && this.options.runActive && !this.options.runActive(record.runId)) {
       this.byHash.delete(key);
       return null;
     }

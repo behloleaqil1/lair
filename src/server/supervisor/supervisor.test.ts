@@ -635,6 +635,27 @@ describe("the OS measures", () => {
     expect(countLsofDescriptors(lsof)).toBe(3);
   });
 
+  it("read the process report's open-files limit once for the process's life, however often files are counted", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    let reads = 0;
+    const report = () => {
+      reads++;
+      return { userLimits: { open_files: { soft: 4096, hard: "unlimited" } } };
+    };
+    // Where /dev/fd can't be listed, lsof (a fake spawner here) counts them
+    const lsof = { run: async () => ({ code: 0, stdout: "COMMAND PID USER FD TYPE\nnode 1 me 3u REG\n", stderr: "" }) };
+    const m = new SystemMeasures(lsof, "darwin", report);
+    cleanups.push(() => m.dispose());
+    const [a, b] = await Promise.all([m.openFiles(), m.openFiles()]);
+    expect(a?.limit).toBe(4096);
+    expect(b?.limit).toBe(4096);
+    vi.setSystemTime(Date.now() + 11 * MIN);
+    await m.openFiles();
+    vi.setSystemTime(Date.now() + 24 * 60 * MIN);
+    expect((await m.openFiles())?.limit).toBe(4096);
+    expect(reads).toBe(1);
+  });
+
   it("measure this process: its open files, its event loop's delay, a disk's free space", async () => {
     const m = new SystemMeasures();
     cleanups.push(() => m.dispose());

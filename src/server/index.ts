@@ -41,6 +41,7 @@ import { WatchdogManager, registerWatchdogRoutes } from "./watchdog/index.js";
 import { DeliveryManager, registerDeliveryRoutes } from "./delivery/index.js";
 import { PipelineManager, registerPipelineRoutes } from "./gates/index.js";
 import { AgentsManager, registerAgentsRoutes } from "./agents/index.js";
+import { isActive } from "./agents/types.js";
 import { AiToolsService, registerAiRoutes } from "./ai/index.js";
 import { getBudgetManager } from "./fleet/budget.js";
 import { ReviewManager, inboxDecisionSink, registerReviewRoutes } from "./review/index.js";
@@ -551,6 +552,11 @@ const { supervisor: selfChecks } = await mountSupervisor(fastify, {
   latency,
   events: getEventBus(),
   decisions: decisionInbox,
+  // A run token is accepted only while the agents module has its run active
+  runActive: (runId) => {
+    const run = agents.getStore()?.getRun(runId);
+    return run !== null && run !== undefined && isActive(run.state);
+  },
   checks: {
     dataDir: join(process.cwd(), "data"),
     config: (project) => loadProjectConfig(project),

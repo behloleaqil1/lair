@@ -6,9 +6,11 @@
  *
  * Open files: Linux counts /proc/self/fd and reads the limit from
  * /proc/self/limits; macOS counts /dev/fd and reads the limit from the
- * process report (cached, as `ulimit -n` would be); anywhere else, or when
- * those fail, `lsof -p <pid>` is run with a timeout. A measure that isn't
- * available here is null: its check reports unknown.
+ * process report; anywhere else, or when those fail, `lsof -p <pid>` is run
+ * with a timeout. The limit is read once, the first time it is needed, and
+ * kept for the process's life: it doesn't change while the process runs,
+ * and the report blocks the event loop while it is gathered. A measure that
+ * isn't available here is null: its check reports unknown.
  */
 import { monitorEventLoopDelay, type IntervalHistogram } from "perf_hooks";
 import { readFile, readdir, statfs } from "fs/promises";
@@ -45,7 +47,6 @@ export interface OsMeasures {
 
 /** How often the event loop is sampled (ms): Node's histogram records each whole interval, so this is taken off */
 const LOOP_RESOLUTION_MS = 20;
-const LIMIT_CACHE_MS = 10 * 60_000;
 const LSOF_TIMEOUT_MS = 5000;
 const LSOF_MAX_BYTES = 8 * 1024 * 1024;
 
@@ -69,33 +70,42 @@ export function countLsofDescriptors(output: string): number {
   return n;
 }
 
-/** The soft open-files limit from Node's own process report (macOS and other systems without /proc). */
-function reportLimit(): number | null {
-  const report = process.report as unknown as {
-    excludeNetwork?: boolean;
-    getReport(): unknown;
-  };
+/**
+ * Node's own process report (synchronous: it blocks the event loop while it
+ * gathers), without its network section, so no DNS lookups.
+ */
+export function processReport(): unknown {
+  const report = process.report as unknown as { excludeNetwork?: boolean; getReport(): unknown };
   const previous = report.excludeNetwork;
   try {
-    // No DNS lookups for the report's network section
     report.excludeNetwork = true;
-    const data = report.getReport() as { userLimits?: { open_files?: { soft?: unknown } } };
-    const soft = data.userLimits?.open_files?.soft;
-    return typeof soft === "number" && Number.isSafeInteger(soft) && soft > 0 ? soft : null;
-  } catch {
-    return null;
+    return report.getReport();
   } finally {
     report.excludeNetwork = previous;
   }
 }
 
+/** The soft open-files limit in a process report (`userLimits.open_files.soft`), or null. */
+function reportLimit(readReport: () => unknown): number | null {
+  try {
+    const data = readReport() as { userLimits?: { open_files?: { soft?: unknown } } } | null;
+    const soft = data?.userLimits?.open_files?.soft;
+    return typeof soft === "number" && Number.isSafeInteger(soft) && soft > 0 ? soft : null;
+  } catch {
+    return null;
+  }
+}
+
 export class SystemMeasures implements OsMeasures {
   private histogram: IntervalHistogram | null = null;
-  private limit: { value: number | null; at: number } | null = null;
+  /** The soft limit, read once: a process's limit doesn't change while it runs (the server makes one SystemMeasures) */
+  private limit: Promise<number | null> | null = null;
 
   constructor(
     private readonly runner: ToolRunner = new SpawnToolRunner(),
     private readonly platform: NodeJS.Platform = process.platform,
+    /** Where the limit comes from without /proc (macOS): the process report, read once */
+    private readonly readReport: () => unknown = processReport,
   ) {
     try {
       this.histogram = monitorEventLoopDelay({ resolution: LOOP_RESOLUTION_MS });
@@ -139,20 +149,21 @@ export class SystemMeasures implements OsMeasures {
     return { open: countLsofDescriptors(out.stdout), limit: await this.softLimit(), source: "lsof" };
   }
 
-  private async softLimit(): Promise<number | null> {
-    const now = Date.now();
-    if (this.limit && now - this.limit.at < LIMIT_CACHE_MS) return this.limit.value;
-    let value: number | null = null;
+  private softLimit(): Promise<number | null> {
+    this.limit ??= this.readLimit();
+    return this.limit;
+  }
+
+  private async readLimit(): Promise<number | null> {
     if (this.platform === "linux") {
       try {
-        value = parseProcLimits((await readFile("/proc/self/limits", "utf-8")).slice(0, 8192));
+        const value = parseProcLimits((await readFile("/proc/self/limits", "utf-8")).slice(0, 8192));
+        if (value !== null) return value;
       } catch {
-        value = null;
+        // The report below
       }
     }
-    value ??= reportLimit();
-    this.limit = { value, at: now };
-    return value;
+    return reportLimit(this.readReport);
   }
 
   async diskSpace(path: string): Promise<DiskSpace | null> {

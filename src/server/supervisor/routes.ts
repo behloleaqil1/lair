@@ -168,6 +168,8 @@ export async function registerSupervisorRoutes(fastify: FastifyInstance, options
       };
 
       const now = clock();
+      // Tokens with no call in the last minute (ended ones among them) are forgotten
+      for (const [id, times] of calls) if (id !== record.id && times.every((t) => now - t >= 60_000)) calls.delete(id);
       const recent = (calls.get(record.id) ?? []).filter((t) => now - t < 60_000);
       if (recent.length >= MAX_CALLS_PER_MINUTE) return refused(429, `more than ${MAX_CALLS_PER_MINUTE} calls a minute with this token: slow down`);
       recent.push(now);
@@ -186,7 +188,8 @@ export async function registerSupervisorRoutes(fastify: FastifyInstance, options
       }
 
       try {
-        const result = await within(runOpsTool(spec, project, parsed.args, options.ops), options.callTimeoutMs ?? 20_000);
+        const caller = { allProjects: record.projects === "*", projectGiven: typeof parsed.args.project === "string" };
+        const result = await within(runOpsTool(spec, project, parsed.args, options.ops, caller), options.callTimeoutMs ?? 20_000);
         const out = bounded(result, MAX_RESULT_BYTES);
         audit("ok", out.truncated ? "the answer was cut to fit" : null);
         return reply.send(ok({ tool, project, truncated: out.truncated, result: out.value }));

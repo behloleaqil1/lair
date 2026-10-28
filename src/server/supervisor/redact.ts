@@ -1,7 +1,8 @@
 /**
  * What the ops API hands an AI supervisor, made safe to hand over: text
  * without what looks like a secret, a token, a URL's credentials, path or
- * query, an ARN or a long run of digits (an account id), and values cut to a
+ * query, an email address's local part, an ARN or a long run of digits (an
+ * account id), and values cut to a
  * size, in structures cut to a depth and length. The supervisor is an agent,
  * and agents are the untrusted party (docs/design/ROADMAP.md, rules 2 and 5).
  *
@@ -19,9 +20,14 @@ const ARN = /\barn:[^\s'"`]+/gi;
 const PRIVATE_KEY = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g;
 const AUTH_HEADER = /\b((?:proxy-)?authorization|x-[a-z0-9-]*(?:token|key|secret|session)[a-z0-9-]*)(\s*[:=]\s*)("?)[^\r\n"]*/gi;
 const BEARER = /\b(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]{8,}/gi;
-/** name=value, name: value and "name": "value" where the name says it holds a secret (a value already taken out stays) */
+/** An email address (a git Author line, an identity): its local part goes, its domain stays */
+const EMAIL = /\b[A-Za-z0-9._%+-]{1,64}@((?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63})\b/g;
+/**
+ * name=value, name: value and "name": "value" where the name says it holds a secret or a key (a value already
+ * taken out stays): so a commit-id-shaped secret next to `token=` or `key=` goes too, while a bare commit id stays
+ */
 const SECRET_PAIR =
-  /\b([A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|pwd|api[_-]?key|access[_-]?key|private[_-]?key|credential|cookie)[A-Za-z0-9_.-]*)("?\s*[:=]\s*"?)((?!\[)[^\s"',;&)}\]]+)/gi;
+  /\b([A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|pwd|key|credential|cookie)[A-Za-z0-9_.-]*)("?\s*[:=]\s*"?)((?!\[)[^\s"',;&)}\]]+)/gi;
 /** Known shapes: GitHub, OpenAI-style and Slack tokens, AWS and Google keys, JWTs, Lair's own ops tokens */
 const KNOWN_TOKEN =
   /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{16,}|xox[abprs]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|lairops_[A-Za-z0-9_-]{16,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})/g;
@@ -55,6 +61,7 @@ export function redactText(text: string, max: number = MAX_TEXT): string {
     .replace(PRIVATE_KEY, "[private key]")
     .replace(URL, (_m, scheme: string, rest: string) => url(scheme, rest))
     .replace(ARN, "[arn]")
+    .replace(EMAIL, (_m, domain: string) => `***@${domain}`)
     .replace(AUTH_HEADER, (_m, name: string, sep: string, quote: string) => `${name}${sep}${quote}[redacted]`)
     .replace(BEARER, (_m, word: string, space: string) => `${word}${space}[redacted]`)
     .replace(KNOWN_TOKEN, "[secret]")
@@ -125,8 +132,8 @@ export function bounded(value: unknown, maxBytes: number): { value: unknown; tru
   return { value: "[too large: ask for less]", truncated: true };
 }
 
-/** Keys whose values are secrets in a project's config; the name of an env variable or of a file is not */
-const SECRET_KEY = /(token|secret|passw(?:or)?d|api[_-]?key|private[_-]?key|credential)/i;
+/** Keys whose values are secrets or personal (an email) in a project's config; the name of an env variable or of a file is not */
+const SECRET_KEY = /(token|secret|passw(?:or)?d|api[_-]?key|private[_-]?key|credential|e-?mail)/i;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,99}$/;
 
 /**

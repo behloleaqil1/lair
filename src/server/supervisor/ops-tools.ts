@@ -66,8 +66,11 @@ function time(value: unknown, fallback: number, what: string): number {
   return t;
 }
 
-async function eventsQuery(project: string, args: Args, s: OpsSources) {
+async function eventsQuery(project: string, args: Args, s: OpsSources, caller: OpsCaller) {
   const now = (s.clock ?? Date.now)();
+  // Server events that name no project (nodes, jobs, tasks...) are Lair-wide: only a token for every project sees
+  // them, and only when it asks about no project in particular
+  const unscoped = caller.allProjects && !caller.projectGiven;
   const until = time(args.until, now, "until");
   const since = time(args.since, until - DAY, "since");
   if (since > until) throw new OpsError(400, "since is after until");
@@ -85,7 +88,7 @@ async function eventsQuery(project: string, args: Args, s: OpsSources) {
         return (
           at >= since &&
           at <= until &&
-          (d.project === undefined || d.project === project) &&
+          (d.project === project || (unscoped && d.project === undefined)) &&
           (!kinds || kinds.includes(e.type)) &&
           (agent === undefined || d.agent === agent) &&
           (task === undefined || d.task === task) &&
@@ -215,8 +218,25 @@ function triageRecord(project: string, args: Args, s: OpsSources) {
   return { project, records: (gate === undefined ? records : records.filter((r) => r.gateId === gate)).slice(0, limit) };
 }
 
+/** Who calls, as far as a tool's answer depends on it */
+export interface OpsCaller {
+  /** The token reads every project (an owner's session token), not one project (a run's) */
+  allProjects: boolean;
+  /** The call named its project (else the default project was taken) */
+  projectGiven: boolean;
+}
+
+/** The narrowest caller: one project, named */
+const SCOPED: OpsCaller = { allProjects: false, projectGiven: true };
+
 /** Run one tool for `project` (already checked against the token). Throws OpsError for a refusal. */
-export async function runOpsTool(spec: OpsToolSpec, project: string, args: Args, s: OpsSources): Promise<unknown> {
+export async function runOpsTool(
+  spec: OpsToolSpec,
+  project: string,
+  args: Args,
+  s: OpsSources,
+  caller: OpsCaller = SCOPED,
+): Promise<unknown> {
   if (spec.name.startsWith("status.")) {
     const module = spec.name.slice("status.".length) as StatusModule;
     if (!STATUS_MODULES.includes(module)) throw new OpsError(404, `unknown tool ${spec.name}`);
@@ -226,7 +246,7 @@ export async function runOpsTool(spec: OpsToolSpec, project: string, args: Args,
   }
   switch (spec.name) {
     case "events.query":
-      return eventsQuery(project, args, s);
+      return eventsQuery(project, args, s, caller);
     case "decisions.list":
       return decisionsList(project, args, s);
     case "runs.get":
