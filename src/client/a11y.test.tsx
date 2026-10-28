@@ -71,7 +71,8 @@ beforeEach(() => {
   vi.stubGlobal("EventSource", InertEventSource);
   vi.stubGlobal("WebSocket", InertWebSocket);
   // Mock Date.now to use the fixture time, so time-based filters (e.g., results in the last 24 hours) work
-  vi.useFakeTimers({ now: Date.parse(FIXTURE_NOW) });
+  const fixtureTime = Date.parse(FIXTURE_NOW);
+  vi.spyOn(Date, "now").mockReturnValue(fixtureTime);
 });
 
 afterEach(() => {
@@ -80,7 +81,7 @@ afterEach(() => {
   root = null;
   host = null;
   vi.unstubAllGlobals();
-  vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 /** Let the fetches answer and the effects settle */
