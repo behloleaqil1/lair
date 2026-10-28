@@ -62,4 +62,3 @@ export function useFocusTrap(ref: RefObject<HTMLElement>, onClose: () => void, i
     // Once per opening: ref and initial are stable refs
   }, []);
 }
-| null)[] = [];
