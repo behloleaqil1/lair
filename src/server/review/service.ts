@@ -1146,7 +1146,7 @@ export class ReviewService {
       // The head moved, or the policy changed, since the evaluation: the next scan looks again
       if (result.refusedBy === "head" || result.refusedBy === "policy") return outcome("skipped", result.reasons);
       // An email refusal raised its own security decision in merge()
-      if (result.refusedBy !== "emails") await this.raiseAutoMergeFailure(status, result.reasons);
+      if (result.refusedBy !== "emails") await this.raiseAutoMergeFailure(status, result.reasons, result.refusedBy);
       return outcome("failed", result.reasons);
     } finally {
       this.o.store.runningAutoMerges.delete(running);
@@ -1190,9 +1190,26 @@ export class ReviewService {
     }
   }
 
-  /** One decision per PR and head for an automatic merge that was refused or failed. */
-  private async raiseAutoMergeFailure(status: PrReviewStatus, reasons: string[]): Promise<void> {
+  /**
+   * One decision per PR and head for an automatic merge that was refused or failed.
+   * @param refusedBy What refused the merge: "check" for the pre-merge check_cmd,
+   *   "executor" for clone/push/host errors, or undefined for exceptions.
+   *   When the refusal is from check_cmd, merging manually would hit the same block;
+   *   for transient failures (executor, exceptions), a manual merge may succeed.
+   */
+  private async raiseAutoMergeFailure(
+    status: PrReviewStatus,
+    reasons: string[],
+    refusedBy?: MergeRefusal,
+  ): Promise<void> {
     const n = status.number;
+    // A check_cmd refusal is intentional: the pre-merge check blocked this PR.
+    // Recommending a manual merge would bypass what the check refused.
+    const isDeliberateRefusal = refusedBy === "check";
+    const recommended = isDeliberateRefusal ? "Leave it unmerged" : "Merge it from the PR's page";
+    const guidance = isDeliberateRefusal
+      ? "The pre-merge check (merge.check_cmd) blocked this PR. Fix the cause and push a new head, or remove the check."
+      : "Lair does not try again at this head. Merge it from its page in PRs once the cause is fixed, or push a new head.";
     try {
       await this.o.decisions.raise({
         project: this.project,
@@ -1206,10 +1223,10 @@ export class ReviewService {
           asContextText(reasons.join("\n"), 2000),
           "```",
           "",
-          "Lair does not try again at this head. Merge it from its page in PRs once the cause is fixed, or push a new head.",
+          guidance,
         ].join("\n"),
         options: ["Merge it from the PR's page", "Leave it unmerged"],
-        recommended: "Merge it from the PR's page",
+        recommended,
         why: "An automatic merge that failed is not retried at the same head.",
         kind: "other",
         reversible: true,

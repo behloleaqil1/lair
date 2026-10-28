@@ -59,6 +59,7 @@ function status(overrides: Partial<PrReviewStatus> = {}): PrReviewStatus {
     conditions: [],
     canMerge: true,
     reasons: [],
+    autoMergeStatus: "auto",
     plan: { method: "local", strategy: "ff-only", reason: "local by default", warnings: [], refusal: null },
     readOnly: false,
     evaluatedAt: "2026-03-02T12:00:00.000Z",

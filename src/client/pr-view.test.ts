@@ -94,6 +94,7 @@ function status(over: Partial<PrReviewStatus> = {}): PrReviewStatus {
     conditions: [],
     canMerge: false,
     reasons: ["a required review is missing"],
+    autoMergeStatus: "auto",
     plan: { method: "host", strategy: "squash", refusal: null, reason: "default", warnings: [] },
     readOnly: false,
     evaluatedAt: "2026-10-27T10:00:00Z",

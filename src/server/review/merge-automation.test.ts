@@ -837,3 +837,79 @@ describe("merge.auto_tiers", () => {
     expect(second.decisions).toEqual([]);
   });
 });
+
+// ============ raiseAutoMergeFailure recommendations ============
+
+describe("raiseAutoMergeFailure recommendation", () => {
+  it("recommends 'Leave it unmerged' when check_cmd fails: merging manually would hit the same block", async () => {
+    const { service, remote, base, head, scan, spawner, decisions } = boot(repo(), {
+      auto: true,
+      check_cmd: ["/opt/checks/migration-order", "--pr", "{pr}"],
+    });
+    spawner.reply = () => ({ code: 1, stdout: "migration V12 conflicts\n", stderr: "", timedOut: false });
+    service.addGateResult(signed(head));
+
+    await scan();
+    expect(remote.branches.get("main")).toBe(base);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({
+      key: autoMergeDecisionKey(3, head),
+      question: `Automatic merge of PR #3 failed at ${head.slice(0, 7)}`,
+      recommended: "Leave it unmerged",
+    });
+    expect(decisions[0].context).toContain("The pre-merge check (merge.check_cmd) blocked this PR");
+    expect(decisions[0].context).toContain("Fix the cause and push a new head");
+  });
+
+  it("recommends 'Merge it from the PR's page' when the executor fails: transient errors may not recur", async () => {
+    const at = repo();
+    // Make the merge fail at the executor stage (push failure)
+    const api = fakeGitHubApi(at.remote);
+    let pushFails = true;
+    const fetch: FetchLike = async (url, init) => {
+      // The local merger doesn't use the API to push, but we can make the
+      // PR state check fail to simulate a transient host error
+      if ((init?.method ?? "GET") === "GET" && new URL(url).pathname.endsWith("/pulls/3") && pushFails) {
+        // First evaluation succeeds, second (in merge) fails
+        const reads = at.remote.requests.filter((r) => r.path.endsWith("/pulls/3")).length;
+        if (reads >= 1) {
+          throw new Error("GitHub API timeout");
+        }
+      }
+      return api(url, init);
+    };
+    const { service, remote, base, head, scan, decisions } = boot(at, { auto: true }, { fetch });
+    service.addGateResult(signed(head));
+
+    // The scan evaluates the PR successfully, then the merge's own evaluation fails
+    await scan();
+    expect(remote.branches.get("main")).toBe(base);
+    // This is caught as an exception (not a refusal), so it recommends merge from page
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({
+      recommended: "Merge it from the PR's page",
+    });
+    expect(decisions[0].context).toContain("Lair does not try again at this head");
+    expect(decisions[0].context).toContain("Merge it from its page in PRs once the cause is fixed");
+  });
+
+  it("recommends 'Merge it from the PR's page' when check_cmd times out: the check didn't refuse, it just didn't finish", async () => {
+    const { service, remote, base, head, scan, spawner, decisions } = boot(repo(), {
+      auto: true,
+      check_cmd: ["/opt/checks/slow-check"],
+      check_timeout_seconds: 1,
+    });
+    spawner.reply = () => ({ code: null, stdout: "still running...\n", stderr: "", timedOut: true });
+    service.addGateResult(signed(head));
+
+    await scan();
+    expect(remote.branches.get("main")).toBe(base);
+    expect(decisions).toHaveLength(1);
+    // A timeout is still a "check" refusal, so it recommends leaving unmerged
+    // because the check might refuse it on a longer timeout
+    expect(decisions[0]).toMatchObject({
+      recommended: "Leave it unmerged",
+    });
+    expect(decisions[0].context).toContain("The pre-merge check (merge.check_cmd) blocked this PR");
+  });
+});
