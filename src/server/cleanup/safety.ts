@@ -173,6 +173,16 @@ export async function checkPathSafety(
     };
   }
 
+  // Check the real path is not a configured root itself
+  for (const root of configuredRoots) {
+    if (path.normalize(realPath) === path.normalize(root)) {
+      return {
+        safe: false,
+        violation: { path: targetPath, reason: "path is a configured root" },
+      };
+    }
+  }
+
   // Check the real path is inside a configured root
   const inRoot = configuredRoots.some((root) => isInsidePath(realPath, root));
   if (!inRoot) {
@@ -183,16 +193,6 @@ export async function checkPathSafety(
         reason: `path is outside configured roots (resolved to ${realPath})`,
       },
     };
-  }
-
-  // Check the real path is not a configured root itself
-  for (const root of configuredRoots) {
-    if (path.normalize(realPath) === path.normalize(root)) {
-      return {
-        safe: false,
-        violation: { path: targetPath, reason: "path is a configured root" },
-      };
-    }
   }
 
   // Check for path traversal attempts

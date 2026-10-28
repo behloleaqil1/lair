@@ -219,6 +219,34 @@ describe("Cleanup acceptance tests", () => {
       fsys.files.set("/repo/.git/worktrees", { isDir: true, isSymlink: false, mtimeMs: now });
       // Feature worktree - merged, clean, pushed, idle 48h
       setupWorktree("/repo-feature", "feature", 48);
+
+      // Override cmd.run to provide explicit worktree list
+      cmd.run = async (c, args, _opts) => {
+        if (args.includes("worktree") && args.includes("list")) {
+          return {
+            stdout: "worktree /repo\nHEAD main123\nbranch refs/heads/main\n\nworktree /repo-feature\nHEAD feature123\nbranch refs/heads/feature\n",
+            stderr: "",
+            code: 0,
+          };
+        }
+        if (args.includes("worktree") && args.includes("remove")) {
+          cmd.removedWorktrees.push(args[args.length - 1]);
+          return { stdout: "", stderr: "", code: 0 };
+        }
+        if (args.includes("worktree") && args.includes("prune")) {
+          return { stdout: "", stderr: "", code: 0 };
+        }
+        if (args.includes("status")) {
+          return { stdout: "", stderr: "", code: 0 };
+        }
+        if (args.includes("--contains")) {
+          return { stdout: "origin/feature", stderr: "", code: 0 };
+        }
+        if (args.includes("remote") && args.includes("get-url")) {
+          return { stdout: "https://github.com/owner/repo.git", stderr: "", code: 0 };
+        }
+        return { stdout: "", stderr: "", code: 0 };
+      };
     });
 
     it("removes merged worktree in act mode", async () => {
@@ -346,7 +374,26 @@ describe("Cleanup acceptance tests", () => {
 
     it("does not remove with active agent run", async () => {
       setupWorktree("/repo-active", "active", 48);
-      agents.hasActiveRunAt = async (p, path) => path === "/repo-active";
+      agents.hasActiveRunAt = async (p, wpath) => wpath === "/repo-active";
+      cmd.run = async (c, args) => {
+        if (args.includes("worktree") && args.includes("list")) {
+          return {
+            stdout: "worktree /repo\nHEAD main\nbranch refs/heads/main\n\nworktree /repo-active\nHEAD active\nbranch refs/heads/active\n",
+            stderr: "",
+            code: 0,
+          };
+        }
+        if (args.includes("status")) {
+          return { stdout: "", stderr: "", code: 0 };
+        }
+        if (args.includes("--contains")) {
+          return { stdout: "origin/active", stderr: "", code: 0 };
+        }
+        if (args.includes("remote") && args.includes("get-url")) {
+          return { stdout: "https://github.com/owner/repo.git", stderr: "", code: 0 };
+        }
+        return { stdout: "", stderr: "", code: 0 };
+      };
 
       const service = new CleanupService(
         "test",
@@ -367,6 +414,25 @@ describe("Cleanup acceptance tests", () => {
 
     it("does not remove when modified within min_idle_hours", async () => {
       setupWorktree("/repo-recent", "recent", 2); // Only 2 hours idle
+      cmd.run = async (c, args) => {
+        if (args.includes("worktree") && args.includes("list")) {
+          return {
+            stdout: "worktree /repo\nHEAD main\nbranch refs/heads/main\n\nworktree /repo-recent\nHEAD recent\nbranch refs/heads/recent\n",
+            stderr: "",
+            code: 0,
+          };
+        }
+        if (args.includes("status")) {
+          return { stdout: "", stderr: "", code: 0 };
+        }
+        if (args.includes("--contains")) {
+          return { stdout: "origin/recent", stderr: "", code: 0 };
+        }
+        if (args.includes("remote") && args.includes("get-url")) {
+          return { stdout: "https://github.com/owner/repo.git", stderr: "", code: 0 };
+        }
+        return { stdout: "", stderr: "", code: 0 };
+      };
 
       const service = new CleanupService(
         "test",
@@ -388,6 +454,25 @@ describe("Cleanup acceptance tests", () => {
     it("does not remove when PR is still open", async () => {
       setupWorktree("/repo-open", "open", 48);
       gitHost.getPrByBranch = async () => ({ number: 42, state: "open", headSha: "abc" });
+      cmd.run = async (c, args) => {
+        if (args.includes("worktree") && args.includes("list")) {
+          return {
+            stdout: "worktree /repo\nHEAD main\nbranch refs/heads/main\n\nworktree /repo-open\nHEAD open\nbranch refs/heads/open\n",
+            stderr: "",
+            code: 0,
+          };
+        }
+        if (args.includes("status")) {
+          return { stdout: "", stderr: "", code: 0 };
+        }
+        if (args.includes("--contains")) {
+          return { stdout: "origin/open", stderr: "", code: 0 };
+        }
+        if (args.includes("remote") && args.includes("get-url")) {
+          return { stdout: "https://github.com/owner/repo.git", stderr: "", code: 0 };
+        }
+        return { stdout: "", stderr: "", code: 0 };
+      };
 
       const service = new CleanupService(
         "test",
