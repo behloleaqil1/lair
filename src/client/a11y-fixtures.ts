@@ -196,7 +196,7 @@ const delivery: DeliveryProjectStatus = {
           health: "healthy",
           healthDetail: "GET http://localhost:8080/health: 200",
           restartCount: 0,
-          containers: [{ id: "c1", name: "demo-api-1", state: "running", status: "Up 2 hours (healthy)", exitCode: 0, restartCount: 0 }],
+          containers: [{ id: "c1", name: "demo-api-1", state: "running", status: "Up 2 hours (healthy)", exitCode: 0, restartCount: 0, health: "healthy" }],
           held: null,
           crashLoop: null,
           lastErrorLines: [],
