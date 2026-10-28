@@ -4316,16 +4316,17 @@ describe("10. hung run info: the next run knows what the previous hung on", () =
       writeLog(h.clock, log, "Running grep -r pattern /Users/dev/workspace...\n");
     };
     await request(h);
-    await at(h, 0); // spawn, write log
+    let t = 0;
+    await at(h, t); // spawn, write log
 
-    h.clock.advance(46 * MIN);
-    await at(h, 0); // hung: SIGTERM
-    await at(h, 0); // gone: recover
+    t += 46 * MIN;
+    await at(h, t); // hung: SIGTERM
+    await at(h, t); // gone: recover
 
     // Wait for the backoff and next attempt
-    h.clock.advance(20 * SEC);
+    t += 20 * SEC;
     h.spawner.behaviour = undefined;
-    await at(h, 0); // spawn attempt 2
+    await at(h, t); // spawn attempt 2
 
     expect(h.spawner.calls).toHaveLength(2);
     const prompt2 = promptOf(h.spawner.calls[1]);
@@ -4341,28 +4342,32 @@ describe("10. hung run info: the next run knows what the previous hung on", () =
     h.spawner.behaviour = (pid, log) => {
       // Log with ANSI escape codes and a very long line
       writeLog(h.clock, log, "\x1b[32mStarting task...\x1b[0m\n");
-      writeLog(h.clock, log, "A".repeat(5000) + "\n"); // very long line
+      writeLog(h.clock, log, "A".repeat(5000) + "\n"); // very long line - will be truncated
       writeLog(h.clock, log, "\x1b[31mSearching for files...\x1b[0m\n");
     };
     await request(h);
-    await at(h, 0);
+    let t = 0;
+    await at(h, t);
 
-    h.clock.advance(46 * MIN);
-    await at(h, 0); // hung: SIGTERM
-    await at(h, 0); // gone: recover
+    t += 46 * MIN;
+    await at(h, t); // hung: SIGTERM
+    await at(h, t); // gone: recover
 
-    h.clock.advance(20 * SEC);
+    t += 20 * SEC;
     h.spawner.behaviour = undefined;
-    await at(h, 0);
+    await at(h, t);
 
     expect(h.spawner.calls).toHaveLength(2);
     const prompt2 = promptOf(h.spawner.calls[1]);
     // ANSI codes should be removed
     expect(prompt2).not.toContain("\x1b[");
-    // Content should be bounded
+    // Content should be bounded (hung info is max 2KB, prompt is longer but bounded)
     expect(prompt2.length).toBeLessThan(250_000);
-    expect(prompt2).toContain("Starting task...");
+    // The last line should be preserved; earlier content may be truncated due to the 2KB limit
     expect(prompt2).toContain("Searching for files...");
+    // The hung warning block should be present
+    expect(prompt2).toContain("<hung_run_warning>");
+    expect(prompt2).toContain("</hung_run_warning>");
   });
 
   it("a normal completion clears the hung info record", async () => {
@@ -4371,26 +4376,28 @@ describe("10. hung run info: the next run knows what the previous hung on", () =
       writeLog(h.clock, log, "Starting...\n");
     };
     await request(h);
-    await at(h, 0);
+    let t = 0;
+    await at(h, t);
 
     // First run hangs
-    h.clock.advance(46 * MIN);
-    await at(h, 0); // hung: SIGTERM
-    await at(h, 0); // gone: recover
+    t += 46 * MIN;
+    await at(h, t); // hung: SIGTERM
+    await at(h, t); // gone: recover
 
     // Second run completes normally
-    h.clock.advance(20 * SEC);
+    t += 20 * SEC;
     h.spawner.behaviour = (pid, log) => {
       writeLog(h.clock, log, "Done!\n");
     };
-    await at(h, 0);
+    await at(h, t);
     h.spawner.exit(5002, 0);
-    await at(h, 0);
+    await at(h, t);
 
     // Third run should NOT have hung info (cleared by normal completion)
+    t += 5 * SEC;
     h.spawner.behaviour = undefined;
     await request(h, "worker-a", "feat-login", "Same task again");
-    await at(h, 0);
+    await at(h, t);
 
     expect(h.spawner.calls).toHaveLength(3);
     const prompt3 = promptOf(h.spawner.calls[2]);

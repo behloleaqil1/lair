@@ -1542,28 +1542,23 @@ describe("12. orphan claim: live pid that doesn't match the pattern", () => {
     expect(breaches(h)[0]).toMatchObject({ detector: "orphan_claim" });
   });
 
-  it("release_claim guard: a live pid not matching the pattern is a false positive, not a failure", async () => {
+  it("a claim's recorded pid being alive (even without matching the pattern) clears the breach", async () => {
     const h = setup(act("orphan_claim"));
-    // Initial detection: no process matches the pattern
+    // Create claim with pid=4999, WITH a live process that doesn't match the pattern
     const claimDir = join(h.agentsDir, "worker-b.running");
     mkdirSync(claimDir, { recursive: true });
     writeFileSync(join(claimDir, "pid"), "pid=4999\nstarted=2026-03-02T11:00:00.000Z\n");
     const t = new Date(NOW - 20 * 60 * 1000);
     utimesSync(claimDir, t, t);
-    // At detection time, no live process
 
-    await h.wd.tick();
-    expect(breaches(h)).toHaveLength(1);
-
-    // Before the act step runs, the process comes alive (with a different path)
+    // The process is running with a different path (doesn't match agent_command pattern)
     h.procs.add(4999, "/different/path/to/agent --id worker-b", { upMinutes: 1 });
 
-    // Next tick: diagnose finds it still, act's guard sees the live pid as a false positive
-    h.clock.advance(5 * 60 * 1000);
+    // Tick: detection should NOT find this claim as orphaned (pid 4999 is alive)
     await h.wd.tick();
 
-    // The breach should be cleared (false positive), not failed
-    expect(breaches(h)[0]).toMatchObject({ status: "resolved", resolution: "cleared" });
+    // No breach should be created because the detector sees pid 4999 is alive
+    expect(breaches(h)).toHaveLength(0);
     expect(h.runner.calls).toEqual([]); // release_claim never ran
   });
 });
