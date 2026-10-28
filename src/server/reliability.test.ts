@@ -705,7 +705,7 @@ describe("production-path: agents tick with failing/slow process lister", () => 
 
   it("tick completes within reasonable time even with slow process lister when using cache", async () => {
     // Test the cache behavior: subsequent gets are fast
-    let now = 0;
+    const now = 0;
     const cache = new AsyncCache({
       refresh: async () => {
         await new Promise(r => setTimeout(r, 50)); // Simulate slow refresh
