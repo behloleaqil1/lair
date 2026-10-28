@@ -85,6 +85,33 @@ export class OpsTokens {
     return this.mint({ kind: "run", label: `run ${runId.slice(0, 64)}`, projects: [project], runId }, ttlMs);
   }
 
+  /**
+   * A run token for a run not requested yet: the token goes into the run's
+   * environment when it is requested, so it exists first. It reads nothing
+   * until bindRun() binds it to that run; revoke() it if the request fails.
+   */
+  mintForPendingRun(project: string, ttlMs: number): { token: string; info: OpsTokenView } {
+    return this.mint({ kind: "run", label: "run (being requested)", projects: [project], runId: null }, ttlMs);
+  }
+
+  /** Bind a pending run token to its run: from now on it lives as long as that run. False when it is gone. */
+  bindRun(id: string, runId: string): boolean {
+    for (const record of this.byHash.values()) {
+      if (record.id === id && record.kind === "run" && record.runId === null) {
+        record.runId = runId;
+        record.label = `run ${runId.slice(0, 64)}`;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** The live record of a token by its id (never the token). */
+  byId(id: string): OpsToken | null {
+    for (const record of this.byHash.values()) if (record.id === id) return record;
+    return null;
+  }
+
   /** A token for the owner's interactive session, over every project. */
   mintSession(ttlMs: number = SESSION_TTL_MS, label = "owner session"): { token: string; info: OpsTokenView } {
     return this.mint({ kind: "session", label: label.slice(0, 80), projects: "*", runId: null }, ttlMs);
@@ -101,6 +128,8 @@ export class OpsTokens {
       this.byHash.delete(key);
       return null;
     }
+    // A run token minted before its run was requested reads nothing until it is bound to that run
+    if (record.kind === "run" && record.runId === null) return null;
     // A run token lives only as long as its run, whatever event its end raised (or none)
     if (record.runId !== null && this.options.runActive && !this.options.runActive(record.runId)) {
       this.byHash.delete(key);

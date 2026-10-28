@@ -2,6 +2,11 @@
  * Command Bar - Always-visible input for Ask / Instruct / Message / Task
  *
  * Phase 3: "Instruct" and "Message" now send through the bus with delivery state tracking.
+ *
+ * Ask: with the supervisor's chat on (supervisor.chat.enabled), a question
+ * opens the chat panel and is answered by a supervisor run
+ * (SupervisorChat.tsx); otherwise it goes to the orchestrator's ask command
+ * as before. "@<dragon-id> ..." is a message to that dragon either way.
  */
 import { useState, useCallback } from "react";
 import type { CommandMode, CommandResult } from "../../shared/types";
@@ -16,6 +21,8 @@ interface Props {
   readOnly: boolean;
   prefill?: string;
   onPrefillUsed?: () => void;
+  /** Ask the supervisor instead of the orchestrator (supervisor.chat is on and can answer) */
+  onAskSupervisor?: (question: string) => void;
 }
 
 // Extended result for bus messages
@@ -41,6 +48,7 @@ export function CommandBar({
   readOnly,
   prefill,
   onPrefillUsed,
+  onAskSupervisor,
 }: Props) {
   const [text, setText] = useState(prefill || "");
   const [loading, setLoading] = useState(false);
@@ -107,6 +115,14 @@ export function CommandBar({
           return;
         }
 
+        // A question for the supervisor: the chat panel asks it and shows the answer
+        if (mode === "ask" && onAskSupervisor) {
+          onAskSupervisor(text.trim());
+          setText("");
+          setShowResult(false);
+          return;
+        }
+
         // Legacy command handling: ask the orchestrator, or run a task
         const data =
           mode === "task"
@@ -149,7 +165,7 @@ export function CommandBar({
         setLoading(false);
       }
     },
-    [text, mode, project, loading, readOnly],
+    [text, mode, project, loading, readOnly, onAskSupervisor],
   );
 
   const modeLabels: Record<CommandMode, string> = {
@@ -159,7 +175,9 @@ export function CommandBar({
   };
 
   const placeholders: Record<CommandMode, string> = {
-    ask: "Ask a question, or @<dragon-id> to message a dragon...",
+    ask: onAskSupervisor
+      ? "Ask Lair a question (its supervisor answers), or @<dragon-id> to message a dragon..."
+      : "Ask a question, or @<dragon-id> to message a dragon...",
     instruct: "Send an instruction to the orchestrator via bus...",
     task: "Branch name to assign to a dragon...",
   };

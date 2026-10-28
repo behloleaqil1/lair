@@ -123,14 +123,23 @@ function plannerAgent(config: ProjectConfig): string | null {
   return typeof planner.agent.id === "string" ? planner.agent.id : null;
 }
 
+/** The supervisor agent's id (supervisor.agent), when the project names one. */
+function supervisorAgent(config: ProjectConfig): string | null {
+  const supervisor: unknown = config.supervisor;
+  if (!isObject(supervisor)) return null;
+  return typeof supervisor.agent === "string" ? supervisor.agent : null;
+}
+
 /**
- * The role a dragon works in: "plan" for the planner agent, "build" for
- * every other. A dragon that names no profile, adapter or model runs on its
- * role's first profile, and a dragon whose profile is in its role falls back
- * to the profiles after it there.
+ * The role a dragon works in: "plan" for the planner agent, "supervise" for
+ * the supervisor agent (supervisor.agent), "build" for every other. A dragon
+ * that names no profile, adapter or model runs on its role's first profile,
+ * and a dragon whose profile is in its role falls back to the profiles after
+ * it there.
  */
-export function agentRole(config: ProjectConfig, agent: string): "plan" | "build" {
-  return plannerAgent(config) === agent ? "plan" : "build";
+export function agentRole(config: ProjectConfig, agent: string): "plan" | "supervise" | "build" {
+  if (plannerAgent(config) === agent) return "plan";
+  return supervisorAgent(config) === agent ? "supervise" : "build";
 }
 
 /** What a dragon names itself in YAML: a profile, or an adapter and a model. */

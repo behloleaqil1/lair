@@ -114,3 +114,103 @@ export interface OpsAuditEntry {
   detail: string | null;
   durationMs: number;
 }
+
+// ============ CHAT AND DIGEST (S1-2) ============
+
+/** pending: its supervisor run is looking; no_answer: the run ended, timed out or never started, with the reason */
+export type TurnState = "pending" | "answered" | "no_answer";
+
+/** chat: the owner's questions; digest: one daily digest */
+export type ConversationKind = "chat" | "digest";
+
+/** One tool call an answer cites: an ops tool, its arguments and what it showed */
+export interface EvidenceItem {
+  tool: string;
+  args: Record<string, unknown>;
+  note: string;
+}
+
+/** One question and its answer */
+export interface ConversationTurn {
+  id: string;
+  /** 1 for the first question of the conversation */
+  seq: number;
+  question: string;
+  askedAt: string;
+  state: TurnState;
+  /** The agents module's run that answers it (null: it never started) */
+  runId: string | null;
+  agent: string | null;
+  /** When it is closed without an answer, if none came */
+  deadlineAt: string;
+  /**
+   * The answer, Markdown as Lair keeps it: no HTML, links only to the
+   * dashboard's routes and to the repository's host (agent output: the
+   * dashboard renders it as untrusted)
+   */
+  answer: string | null;
+  evidence: EvidenceItem[];
+  answeredAt: string | null;
+  /** Why there is no answer (no_answer) */
+  reason: string | null;
+}
+
+export interface ConversationView {
+  id: string;
+  project: string;
+  kind: ConversationKind;
+  /** The local date a digest is for (YYYY-MM-DD) */
+  digestDate: string | null;
+  createdAt: string;
+  updatedAt: string;
+  turns: ConversationTurn[];
+  /** The repository's web address, the one host answers may link to (null: none) */
+  repoUrl: string | null;
+}
+
+export interface ConversationSummary {
+  id: string;
+  kind: ConversationKind;
+  /** Its first question, cut */
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  turns: number;
+  /** Its latest question's state */
+  state: TurnState;
+}
+
+export interface ChatLimits {
+  maxRunsPerDay: number;
+  minIntervalSeconds: number;
+  maxConversationTurns: number;
+  answerTimeoutMinutes: number;
+}
+
+/** GET /api/supervisor/chat (owner only) */
+export interface ChatStatusView {
+  project: string;
+  /** supervisor.chat.enabled */
+  enabled: boolean;
+  digest: { enabled: boolean; time: string };
+  /** The agent supervisor runs start on (supervisor.agent, else the dragon on ai.roles.supervise's first profile) */
+  agent: string | null;
+  /** Why a question can't be asked now (the block's errors, no agent, the agents module off) */
+  problem: string | null;
+  limits: ChatLimits;
+  /** Supervisor runs (questions and digests) started in the last 24 hours */
+  runsToday: number;
+  /** The earliest the next run may start (min_interval_seconds), when that is later than now */
+  nextRunAt: string | null;
+  conversations: ConversationSummary[];
+  repoUrl: string | null;
+}
+
+/** GET /api/supervisor/digest (owner only) */
+export interface DigestView {
+  project: string;
+  enabled: boolean;
+  /** HH:MM, local time */
+  time: string;
+  latest: ConversationView | null;
+}

@@ -11,17 +11,26 @@
  *   GET  /api/supervisor/tokens                the live tokens (never the tokens themselves)
  *   POST /api/supervisor/tokens/:id/revoke     end one
  *   GET  /api/supervisor/audit?limit=&token=   the ops API's audit trail
+ *   POST /api/supervisor/ask {project?, question, conversationId?}
+ *                                              a question for a supervisor run (202: the conversation)
+ *   GET  /api/supervisor/chat?project=         whether questions are on, the bounds, the conversations
+ *   GET  /api/supervisor/conversations/:id     one conversation: its questions, answers and evidence
+ *   GET  /api/supervisor/digest?project=       the latest daily digest
  *
  * The ops API, for an AI supervisor: an ops token (Authorization: Bearer),
- * never the owner's session. Read tools only. Every call is audited.
+ * never the owner's session. Read tools only, and the answer to the run's
+ * own question. Every call is audited.
  *
  *   POST /api/ops/call {tool, args}            one tool of ops-catalog.ts
+ *   POST /api/ops/answer {conversation, answer, evidence?}
+ *                                              the run's answer to its question, once (a run token only)
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { projectNameError } from "../config.js";
 import type { HumanAuth } from "../human-auth/index.js";
 import { rejectCrossSiteRequests } from "../origin.js";
 import type { OpsCallOutcome } from "../../shared/supervisor-types.js";
+import { ChatError, type SupervisorChat } from "./chat.js";
 import { opsTool } from "./ops-catalog.js";
 import { OpsError, parseArgs, runOpsTool, type OpsSources } from "./ops-tools.js";
 import { bounded, redactText } from "./redact.js";
@@ -35,6 +44,8 @@ export interface SupervisorRoutesOptions {
   store: SupervisorStore;
   auth: HumanAuth;
   ops: OpsSources;
+  /** Questions and digests answered by supervisor runs */
+  chat?: SupervisorChat;
   defaultProject(): string;
   /** For tests: where projects are (projectNameError's projectsDir) */
   projectsDir?: string;
@@ -127,6 +138,56 @@ export async function registerSupervisorRoutes(fastify: FastifyInstance, options
       if (token !== undefined && !/^[0-9a-f-]{36}$/.test(token)) return refuse(reply, 400, "Invalid token id");
       return reply.send(ok(store.list(Number.isFinite(limit) ? limit : 100, token)));
     });
+
+    // ---- Questions and digests (S1-2) ----
+
+    /** The project a request names, checked; or the default project */
+    const projectOf = (value: unknown, reply: FastifyReply): string | null => {
+      const project = typeof value === "string" && value !== "" ? value : options.defaultProject();
+      const problem = projectNameError(project, options.projectsDir);
+      if (problem) {
+        void refuse(reply, 400, problem);
+        return null;
+      }
+      return project;
+    };
+    const chat = options.chat;
+    const noChat = (reply: FastifyReply) => refuse(reply, 503, "The supervisor's runs don't run in this server");
+
+    app.post("/api/supervisor/ask", { bodyLimit: 16 * 1024 }, async (request, reply) => {
+      if (!chat) return noChat(reply);
+      const body = (request.body ?? {}) as { project?: unknown; question?: unknown; conversationId?: unknown };
+      const project = projectOf(body.project, reply);
+      if (project === null) return reply;
+      try {
+        const conversation = await chat.ask({ project, question: body.question, conversationId: body.conversationId });
+        return reply.code(202).send(ok({ conversation }));
+      } catch (e) {
+        if (e instanceof ChatError) return refuse(reply, e.statusCode, e.message);
+        throw e;
+      }
+    });
+
+    app.get<{ Querystring: { project?: string } }>("/api/supervisor/chat", async (request, reply) => {
+      if (!chat) return noChat(reply);
+      const project = projectOf(request.query.project, reply);
+      if (project === null) return reply;
+      return reply.send(ok(chat.status(project)));
+    });
+
+    app.get<{ Params: { id: string } }>("/api/supervisor/conversations/:id", async (request, reply) => {
+      if (!chat) return noChat(reply);
+      const view = chat.conversation(request.params.id);
+      if (!view) return refuse(reply, 404, "No such conversation");
+      return reply.send(ok(view));
+    });
+
+    app.get<{ Querystring: { project?: string } }>("/api/supervisor/digest", async (request, reply) => {
+      if (!chat) return noChat(reply);
+      const project = projectOf(request.query.project, reply);
+      if (project === null) return reply;
+      return reply.send(ok(chat.digest(project)));
+    });
   });
 
   // ============ THE OPS API ============
@@ -180,7 +241,13 @@ export async function registerSupervisorRoutes(fastify: FastifyInstance, options
       const parsed = parseArgs(spec, body.args);
       if (!parsed.ok) return refused(400, `invalid arguments: ${redactText(parsed.error, 300)}`);
       argsText = redactText(JSON.stringify(parsed.args), 300);
-      const project = typeof parsed.args.project === "string" ? parsed.args.project : options.defaultProject();
+      // A token that reads one project (a run's) defaults to it; one that reads every project, to the default project
+      const project =
+        typeof parsed.args.project === "string"
+          ? parsed.args.project
+          : record.projects !== "*" && record.projects.length === 1
+            ? record.projects[0]
+            : options.defaultProject();
       const problem = projectNameError(project, options.projectsDir);
       if (problem) return refused(400, problem);
       if (record.projects !== "*" && !record.projects.includes(project)) {
@@ -202,6 +269,33 @@ export async function registerSupervisorRoutes(fastify: FastifyInstance, options
         request.log.error({ err: e, tool }, "ops: a tool failed");
         audit("error", "the tool failed");
         return refuse(reply, 500, "The tool failed: the server log says why");
+      }
+    });
+
+    // The run's answer to its own question (`lair supervisor answer`): the chat checks the token is that run's
+    app.post("/api/ops/answer", { bodyLimit: 128 * 1024 }, async (request, reply) => {
+      const record = verified.get(request)!;
+      const started = clock();
+      const body = (request.body ?? {}) as { conversation?: unknown; answer?: unknown; evidence?: unknown };
+      const conversation = typeof body.conversation === "string" ? redactText(body.conversation, 64) : "-";
+      const audit = (outcome: OpsCallOutcome, detail: string | null) =>
+        store.audit({ at: started, tokenId: record.id, who: record.label, tool: "(answer)", args: `conversation=${conversation}`, outcome, detail, durationMs: clock() - started });
+      if (!options.chat) {
+        audit("refused", "no supervisor runs here");
+        return refuse(reply, 503, "The supervisor's runs don't run in this server");
+      }
+      try {
+        const result = await options.chat.answer({ token: record, conversation: body.conversation, answer: body.answer, evidence: body.evidence });
+        audit("ok", null);
+        return reply.send(ok(result));
+      } catch (e) {
+        if (e instanceof ChatError) {
+          audit("refused", redactText(e.message, 300));
+          return refuse(reply, e.statusCode, e.message);
+        }
+        request.log.error({ err: e }, "ops: an answer could not be taken");
+        audit("error", "the answer could not be taken");
+        return refuse(reply, 500, "The answer could not be taken: the server log says why");
       }
     });
   });

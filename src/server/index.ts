@@ -13,7 +13,8 @@ import { DataService } from "./services/data.js";
 import { isValidDragonId } from "./parsers/dragon-config.js";
 import { registerRootGuards, requireValidIdParam } from "./root-guards.js";
 import { mountDecisions } from "./decisions/index.js";
-import { mountNotifications } from "./notifications/index.js";
+import { loadNotificationConfig, mountNotifications } from "./notifications/index.js";
+import { notificationsOn } from "./notifications/config.js";
 import {
   HumanAuth,
   OWNER_ONLY_PREFIXES,
@@ -538,13 +539,15 @@ const dashboardSources: DashboardSources = {
 };
 await registerDashboardRoutes(fastify, dashboardSources, humanAuth);
 
-// The supervisor, part 1 (src/server/supervisor/): Lair's self-checks on a
-// schedule, off the request path (GET /api/health/diagnostics and Home →
-// Health, the owner's); a check failing for a while is one notice in the
-// Decision Inbox; and the read-only ops API an AI supervisor uses
-// (POST /api/ops/call, `lair ops-mcp`), on scoped tokens kept in memory,
-// every call audited in data/supervisor.db
-const { supervisor: selfChecks } = await mountSupervisor(fastify, {
+// The supervisor (src/server/supervisor/): Lair's self-checks on a schedule,
+// off the request path (GET /api/health/diagnostics and Home → Health, the
+// owner's); a check failing for a while is one notice in the Decision Inbox;
+// the read-only ops API an AI supervisor uses (POST /api/ops/call,
+// `lair ops-mcp`, `lair ops call`), on scoped tokens kept in memory, every
+// call audited in data/supervisor.db; and (off by default) the owner's
+// questions and the daily digest, answered by supervisor runs the agents
+// module starts in-process, each with a run token in its environment
+const { supervisor: selfChecks, chat: supervisorChat } = await mountSupervisor(fastify, {
   dbPath: join(process.cwd(), "data", "supervisor.db"),
   humanAuth,
   defaultProject: () => getDefaultProject(),
@@ -552,6 +555,14 @@ const { supervisor: selfChecks } = await mountSupervisor(fastify, {
   latency,
   events: getEventBus(),
   decisions: decisionInbox,
+  agents: {
+    requestRun: (project, input) => agents.requestRun(project, input),
+    getStore: () => agents.getStore(),
+    releaseClaim: async (project, task, why) => agents.get(project)?.releaseClaim(task, why),
+  },
+  serverUrl: dashboardUrlFor(HOST, PORT),
+  // The digest's notice is raised only with notifications on (read again each time, as the notifier does)
+  notificationsOn: () => notificationsOn(loadNotificationConfig(join(process.cwd(), "data", "server.yaml")).settings),
   // A run token is accepted only while the agents module has its run active
   runActive: (runId) => {
     const run = agents.getStore()?.getRun(runId);
@@ -675,7 +686,8 @@ const stopServer = async (reason: string) => {
   // Stop watching the project files: no reload starts from now on
   await reloader.stop();
 
-  // Stop the self-checks first: they read the other modules (its store closes with fastify)
+  // Stop the self-checks and the supervisor's runs first: they read the other modules (its store closes with fastify)
+  await supervisorChat.stop();
   await selfChecks.stop();
 
   // Stop watchdogs: wait for a tick in progress, then close their store
@@ -871,6 +883,8 @@ const start = async () => {
         ? `[supervisor] Self-checks for: ${checked.join(", ")}`
         : "[supervisor] Self-checks off (supervisor.checks.enabled: false)",
     );
+    // The supervisor's questions and digests: following their runs, and the digest's schedule
+    supervisorChat.start();
 
     // Reload the modules when a project file changes
     reloader.start();

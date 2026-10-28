@@ -331,10 +331,18 @@ export interface RunRequest {
 
 /**
  * Run variables another module may give a run: the review module's, for a
- * review run (src/server/review/agent-assigner.ts). LAIR_REVIEW_TOKEN is the
- * review's assignment token, so none of them is ever written to disk.
+ * review run (src/server/review/agent-assigner.ts), and the supervisor's, for
+ * a supervisor run (src/server/supervisor/chat.ts). LAIR_REVIEW_TOKEN is the
+ * review's assignment token and LAIR_OPS_TOKEN the run's ops token, so none
+ * of them is ever written to disk.
  */
-export const MODULE_RUN_VARIABLES: readonly string[] = ["LAIR_REVIEW_TOKEN", "LAIR_REVIEW_PROJECT", "LAIR_URL"];
+export const MODULE_RUN_VARIABLES: readonly string[] = [
+  "LAIR_REVIEW_TOKEN",
+  "LAIR_REVIEW_PROJECT",
+  "LAIR_URL",
+  "LAIR_OPS_TOKEN",
+  "LAIR_SUPERVISOR_CONVERSATION",
+];
 const MAX_RUN_VARIABLE_CHARS = 1000;
 
 /** Validated module run variables, or the reason they are refused. */

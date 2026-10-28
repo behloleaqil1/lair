@@ -138,6 +138,8 @@ export function serverModules(m: ServerModules): ReloadableModule[] {
     modules.push({
       name: "supervisor",
       blocks: ["supervisor"],
+      // Its agent must be one of the project's, not one fill starts nor the planner agent, with the agents module on
+      reads: ["agents", "dragons", "ai", "planner"],
       validate: (config) => supervisor.validate(config),
       reload: (entry) => supervisor.reloadProject(entry),
     });

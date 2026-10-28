@@ -71,6 +71,26 @@ export function redactText(text: string, max: number = MAX_TEXT): string {
   return out.length > max ? `${out.slice(0, max)}...` : out;
 }
 
+/** A URL's credentials (user:password@): the rest of the URL stays */
+const URL_USERINFO = /\b([a-z][a-z0-9+.-]{1,15}:\/\/)[^\s/?#@'"<>`]{1,200}@/gi;
+
+/**
+ * Prose an agent wrote for the owner (a supervisor's answer): secrets of
+ * known shapes, private keys, Authorization and Bearer values, long
+ * secret-looking runs and URL credentials taken out. Unlike redactText, a
+ * URL keeps its path (a link to the repository is the point of it), and
+ * nothing is cut: the caller bounds the text first.
+ */
+export function redactSecrets(text: string): string {
+  return text
+    .replace(PRIVATE_KEY, "[private key]")
+    .replace(URL_USERINFO, "$1")
+    .replace(AUTH_HEADER, (_m, name: string, sep: string, quote: string) => `${name}${sep}${quote}[redacted]`)
+    .replace(BEARER, (_m, word: string, space: string) => `${word}${space}[redacted]`)
+    .replace(KNOWN_TOKEN, "[secret]")
+    .replace(LONG_RUN, (run) => (looksSecret(run) ? "[secret]" : run));
+}
+
 export interface Limits {
   /** Nested objects and arrays below this depth become "[...]" */
   depth: number;

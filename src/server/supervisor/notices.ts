@@ -143,7 +143,8 @@ export class Notices {
     if (!inbox) return;
     try {
       for (const decision of inbox.openOf(project, NOTICE_MODULE)) {
-        if (active.has(decision.key)) continue;
+        // Only the checks' own notices: the digest's are the chat's (chat.ts)
+        if (!decision.key.startsWith("check:") || active.has(decision.key)) continue;
         this.failing.delete(decision.key);
         await inbox.withdraw(decision.id, { module: NOTICE_MODULE, reason: "The check no longer runs (turned off, or not checked here any more)." });
       }

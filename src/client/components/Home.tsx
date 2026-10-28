@@ -35,6 +35,7 @@ import { LiveFeed } from "./LiveFeed";
 import { Activity } from "./Activity";
 import { Health } from "./Health";
 import { ErrorState, Loading, ModuleOff, Time, muted, useOwnerSignedIn } from "./ui";
+import { AskLairCard, DigestCard } from "./SupervisorChat";
 
 interface WatchdogSummary {
   enabled: boolean;
@@ -279,6 +280,10 @@ function HomeOverview({ project, refreshKey, modules }: SectionProps) {
         error={decisions.error && !decisions.data ? <ErrorState what="the decisions" error={decisions.error} /> : undefined}
         onAnswered={() => setAnswered((n) => n + 1)}
       />
+
+      {/* Ask Lair (the supervisor's chat) and its latest digest: the owner's, each shown once its route answers */}
+      <AskLairCard project={project} refreshKey={slowKey} />
+      <DigestCard project={project} refreshKey={slowKey} />
 
       <div className="grid grid-4 tiles">
         <Tile

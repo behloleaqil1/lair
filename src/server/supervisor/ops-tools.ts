@@ -5,7 +5,6 @@
  * token and the project, audits the call, times it out, and redacts and
  * bounds what is returned (redact.ts).
  */
-import { z } from "zod";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { Decision } from "../../shared/decision-types.js";
 import type { Event } from "../../shared/server-types.js";
@@ -19,7 +18,7 @@ import type { ListOptions } from "../decisions/store.js";
 import { agentLogTail, gateLogTail, lookUpGate, type DashboardSources } from "../dashboard/routes.js";
 import { isSafeGateId } from "../services/data.js";
 import { isValidDragonId } from "../parsers/dragon-config.js";
-import { STATUS_MODULES, type OpsToolSpec, type StatusModule } from "./ops-catalog.js";
+import { STATUS_MODULES, parseOpsArgs, type OpsToolSpec, type StatusModule } from "./ops-catalog.js";
 import { redactConfig, redactText } from "./redact.js";
 
 export class OpsError extends Error {
@@ -270,13 +269,5 @@ export async function runOpsTool(
 
 /** The arguments as the tool takes them: unknown ones refused. */
 export function parseArgs(spec: OpsToolSpec, raw: unknown): { ok: true; args: Args } | { ok: false; error: string } {
-  const parsed = z.object(spec.shape).strict().safeParse(raw ?? {});
-  if (parsed.success) return { ok: true, args: parsed.data as Args };
-  return {
-    ok: false,
-    error: parsed.error.issues
-      .slice(0, 5)
-      .map((i) => `${i.path.join(".") || "(arguments)"}: ${i.message}`)
-      .join("; "),
-  };
+  return parseOpsArgs(spec, raw);
 }

@@ -99,7 +99,7 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       "roles.build": { help: "Dragons that name no profile, adapter or model run on this" },
       "roles.review": { help: "A tier's reviewer pool with no agents of its own takes the agents on these profiles" },
       "roles.plan": { help: "The planner agent's profile, when it names none" },
-      "roles.supervise": { help: "Not used yet: the supervisor (A3) will start on it" },
+      "roles.supervise": { help: "The supervisor's runs (questions, the digest), when supervisor.agent names no profile" },
     },
   },
   {
@@ -241,7 +241,7 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
   },
   {
     key: "supervisor",
-    title: "Supervisor: self-checks",
+    title: "Supervisor: self-checks, questions and the digest",
     schema: SupervisorSchema,
     docs: "#supervisor-self-checks-and-the-ops-api",
     hints: {
@@ -250,6 +250,15 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       "checks.disabled": { help: "Check ids to skip" },
       "checks.timeout_seconds": timeouts,
       "checks.notice_cooldown_minutes": { advanced: true },
+      agent: { help: "The agent supervisor runs start on; empty: the dragon on ai.roles.supervise's first profile" },
+      prompt_file: { help: "The supervisor's prompt, a file in prompts_dir; empty: Lair's own" },
+      "chat.enabled": { help: "Questions from the Ask box are answered by supervisor runs (each one costs a run)" },
+      "chat.max_runs_per_day": { help: "Supervisor runs (questions and digests) in any 24 hours" },
+      "chat.answer_timeout_minutes": { help: "A question with no answer by then is closed and its run stopped" },
+      "chat.min_interval_seconds": { advanced: true },
+      "chat.max_conversation_turns": { advanced: true },
+      "digest.enabled": { help: "A supervisor run writes a digest once a day; Home shows the latest" },
+      "digest.time": { help: "When, in this machine's local time (HH:MM)" },
     },
   },
 ];

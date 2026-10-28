@@ -124,3 +124,16 @@ export const OPS_TOOLS: readonly OpsToolSpec[] = [
 export function opsTool(name: string): OpsToolSpec | undefined {
   return OPS_TOOLS.find((t) => t.name === name);
 }
+
+/** The arguments as the tool takes them: unknown ones refused. The server and the CLI both check with this. */
+export function parseOpsArgs(spec: OpsToolSpec, raw: unknown): { ok: true; args: Record<string, unknown> } | { ok: false; error: string } {
+  const parsed = z.object(spec.shape).strict().safeParse(raw ?? {});
+  if (parsed.success) return { ok: true, args: parsed.data as Record<string, unknown> };
+  return {
+    ok: false,
+    error: parsed.error.issues
+      .slice(0, 5)
+      .map((i) => `${i.path.join(".") || "(arguments)"}: ${i.message}`)
+      .join("; "),
+  };
+}

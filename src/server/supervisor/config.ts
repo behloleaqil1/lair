@@ -1,14 +1,23 @@
 /**
  * The `supervisor:` block of a project config, validated with defaults
- * applied. In this version it holds the self-checks' settings
- * (`supervisor.checks`); see docs/configuration.md#supervisor-self-checks-and-the-ops-api.
+ * applied: the self-checks' settings (`supervisor.checks`), and the
+ * supervisor's runs: its agent, its prompt, questions from the dashboard
+ * (`supervisor.chat`) and the daily digest (`supervisor.digest`); see
+ * docs/configuration.md#supervisor-self-checks-and-the-ops-api and
+ * #supervisor-chat-and-digest.
  *
  * The server's own checks (event loop, latency, files, disk, stores,
  * command timeouts) follow the default project's block; a project's checks
  * follow its own.
  */
 import { z } from "zod";
+import type { ProjectConfig } from "../../shared/types.js";
 import { CHECK_IDS, type CheckId } from "../../shared/supervisor-types.js";
+import { parseAgentsConfig } from "../agents/config.js";
+import { isValidPromptName, PROMPT_NAME_RULE } from "../agents/prompts.js";
+import { roleAgents } from "../ai/profiles.js";
+import { isValidDragonId } from "../parsers/dragon-config.js";
+import { knownDragonIds, loadKnownDragons } from "../services/dragon-registry.js";
 
 const ms = (fallback: number) => z.number().int().min(1).max(600_000).default(fallback);
 const percent = (fallback: number) => z.number().min(0).max(100).default(fallback);
@@ -83,12 +92,102 @@ export const ChecksSchema = z
   })
   .strict();
 
-export const SupervisorSchema = z.object({ checks: ChecksSchema.default({}) }).strict();
+/** Questions from the dashboard, answered by supervisor runs (S1-2). Off by default */
+export const ChatSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    /** Supervisor runs (questions and digests) started in any 24 hours */
+    max_runs_per_day: z.number().int().min(1).max(500).default(20),
+    /** Between the starts of two supervisor runs */
+    min_interval_seconds: z.number().int().min(0).max(86_400).default(30),
+    /** Questions in one conversation; then a new one starts */
+    max_conversation_turns: z.number().int().min(1).max(50).default(10),
+    /** A question with no answer this long after it was asked is closed, and its run stopped */
+    answer_timeout_minutes: z.number().int().min(1).max(240).default(15),
+  })
+  .strict();
+
+/** One digest a day, written by a supervisor run at `time` (local). Off by default */
+export const DigestSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    time: z
+      .string()
+      .regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/, "a local time of day, HH:MM (24 hours)")
+      .default("08:00"),
+  })
+  .strict();
+
+export const SupervisorSchema = z
+  .object({
+    checks: ChecksSchema.default({}),
+    /** The supervisor agent (a dragon of the project); else the dragon on ai.roles.supervise's first profile */
+    agent: z.string().min(1).max(100).optional(),
+    /** The supervisor's prompt template, a file name in prompts_dir; else Lair's own (prompts/supervisor.md) */
+    prompt_file: z.string().min(1).max(255).optional(),
+    chat: ChatSchema.default({}),
+    digest: DigestSchema.default({}),
+  })
+  .strict();
 
 export type ChecksSettings = z.infer<typeof ChecksSchema>;
+export type ChatSettings = z.infer<typeof ChatSchema>;
+export type DigestSettings = z.infer<typeof DigestSchema>;
 
 export interface SupervisorSettings {
   checks: ChecksSettings;
+  agent: string | null;
+  promptFile: string | null;
+  chat: ChatSettings;
+  digest: DigestSettings;
+}
+
+/** Supervisor runs are on for the project: questions, or the digest. */
+export function runsEnabled(settings: SupervisorSettings): boolean {
+  return settings.chat.enabled || settings.digest.enabled;
+}
+
+/**
+ * The agent supervisor runs start on: supervisor.agent; else the first
+ * dragon on a profile of ai.roles.supervise (in the role's order) that fill
+ * doesn't start and isn't the planner agent. A reason when there is none.
+ */
+export function supervisorAgent(
+  project: ProjectConfig,
+  settings: Pick<SupervisorSettings, "agent">,
+  options: { runs: boolean } = { runs: true },
+): { agent: string } | { problem: string } {
+  const agents = parseAgentsConfig(project.agents, project);
+  if (options.runs) {
+    if (!agents.ok) return { problem: "the agents block has errors (GET /api/agents/status says which)" };
+    if (!agents.settings.enabled) return { problem: "supervisor runs need agents.enabled: true" };
+  }
+  const fill = agents.ok ? agents.settings.fill.agents : [];
+  const planner = plannerAgentOf(project);
+  if (settings.agent) {
+    if (!isValidDragonId(settings.agent)) return { problem: `supervisor.agent: ${settings.agent} is not a valid agent id` };
+    if (!knownDragonIds(project).has(settings.agent)) return { problem: `supervisor.agent: ${settings.agent} is not one of the project's agents` };
+    if (fill.includes(settings.agent)) {
+      return { problem: `supervisor.agent: ${settings.agent} is in agents.fill.agents: the supervisor must not be an agent fill starts` };
+    }
+    if (planner === settings.agent) return { problem: `supervisor.agent: ${settings.agent} is the planner agent` };
+    return { agent: settings.agent };
+  }
+  const candidates = roleAgents(project, "supervise", loadKnownDragons(project).values()).filter((id) => !fill.includes(id) && id !== planner);
+  if (candidates.length > 0) return { agent: candidates[0] };
+  return {
+    problem:
+      "no supervisor agent: set supervisor.agent to one of the project's agents, or give a dragon (not one fill starts) a profile of ai.roles.supervise",
+  };
+}
+
+function plannerAgentOf(project: ProjectConfig): string | null {
+  const planner: unknown = project.planner;
+  if (typeof planner !== "object" || planner === null) return null;
+  const agent = (planner as { agent?: unknown }).agent;
+  if (typeof agent !== "object" || agent === null) return null;
+  const id = (agent as { id?: unknown }).id;
+  return typeof id === "string" ? id : null;
 }
 
 export type ParseResult = { ok: true; settings: SupervisorSettings } | { ok: false; errors: string[] };
@@ -116,8 +215,13 @@ function orderErrors(c: ChecksSettings): string[] {
   return errors;
 }
 
-/** Parse a project's `supervisor:` block (absent: every default). */
-export function parseSupervisorConfig(raw: unknown): ParseResult {
+/**
+ * Parse a project's `supervisor:` block (absent: every default). With the
+ * project's config, what the block names is checked against it too: the
+ * supervisor agent, the prompt file's name, and, with chat or the digest
+ * on, that supervisor runs can start (the agents module on, an agent).
+ */
+export function parseSupervisorConfig(raw: unknown, project?: ProjectConfig): ParseResult {
   const parsed = SupervisorSchema.safeParse(raw ?? {});
   if (!parsed.success) {
     return {
@@ -125,9 +229,28 @@ export function parseSupervisorConfig(raw: unknown): ParseResult {
       errors: parsed.error.issues.map((issue) => `supervisor.${issue.path.join(".") || "(root)"}: ${issue.message}`),
     };
   }
-  const errors = orderErrors(parsed.data.checks);
+  const value = parsed.data;
+  const errors = orderErrors(value.checks);
+  if (value.prompt_file !== undefined && !isValidPromptName(value.prompt_file)) {
+    errors.push(`supervisor.prompt_file: ${PROMPT_NAME_RULE} (a file directly in prompts_dir)`);
+  }
+  const settings: SupervisorSettings = {
+    checks: value.checks,
+    agent: value.agent ?? null,
+    promptFile: value.prompt_file ?? null,
+    chat: value.chat,
+    digest: value.digest,
+  };
+  // A named agent must be one the project has whenever it is set; that runs can start matters once they are on
+  if (project && (settings.agent !== null || runsEnabled(settings))) {
+    const found = supervisorAgent(project, settings, { runs: runsEnabled(settings) });
+    if ("problem" in found) {
+      const key = settings.chat.enabled ? "supervisor.chat.enabled" : "supervisor.digest.enabled";
+      errors.push(found.problem.startsWith("supervisor.") ? found.problem : `${key}: ${found.problem}`);
+    }
+  }
   if (errors.length > 0) return { ok: false, errors };
-  return { ok: true, settings: { checks: parsed.data.checks } };
+  return { ok: true, settings };
 }
 
 /** Every default (a project without the block, or one whose block is invalid, for the server's checks). */

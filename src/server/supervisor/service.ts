@@ -114,7 +114,7 @@ export class Supervisor {
 
   /** What load() would refuse in a project's config ([] when valid). */
   validate(config: ProjectConfig): string[] {
-    const parsed = parseSupervisorConfig(config.supervisor);
+    const parsed = parseSupervisorConfig(config.supervisor, config);
     return parsed.ok ? [] : parsed.errors;
   }
 
@@ -130,13 +130,28 @@ export class Supervisor {
       if (entry.error) this.problems.set(entry.name, [entry.error]);
       return;
     }
-    const parsed = parseSupervisorConfig(entry.config.supervisor);
+    const parsed = parseSupervisorConfig(entry.config.supervisor, entry.config);
     if (!parsed.ok) {
       this.problems.set(entry.name, parsed.errors);
       this.log.warn(`[supervisor] ${entry.name}: its checks don't run: ${parsed.errors.join("; ")}`);
       return;
     }
     this.settings.set(entry.name, parsed.settings);
+  }
+
+  /** A project's valid supervisor settings (null: not loaded, or its block is invalid). */
+  settingsOf(project: string): SupervisorSettings | null {
+    return this.settings.get(project) ?? null;
+  }
+
+  /** Why a project's block is not in effect ([] when it is). */
+  problemsOf(project: string): string[] {
+    return this.problems.get(project) ?? [];
+  }
+
+  /** The projects loaded, in order. */
+  projects(): string[] {
+    return [...this.projectNames];
   }
 
   /** The Decision Inbox: failing checks raise their notices there. */
