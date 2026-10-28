@@ -865,11 +865,10 @@ describe("raiseAutoMergeFailure recommendation", () => {
     const at = repo();
     // Make the merge fail at the executor stage (push failure)
     const api = fakeGitHubApi(at.remote);
-    let pushFails = true;
     const fetch: FetchLike = async (url, init) => {
       // The local merger doesn't use the API to push, but we can make the
       // PR state check fail to simulate a transient host error
-      if ((init?.method ?? "GET") === "GET" && new URL(url).pathname.endsWith("/pulls/3") && pushFails) {
+      if ((init?.method ?? "GET") === "GET" && new URL(url).pathname.endsWith("/pulls/3")) {
         // First evaluation succeeds, second (in merge) fails
         const reads = at.remote.requests.filter((r) => r.path.endsWith("/pulls/3")).length;
         if (reads >= 1) {
