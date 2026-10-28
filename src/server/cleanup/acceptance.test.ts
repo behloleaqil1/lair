@@ -94,15 +94,23 @@ function createFakeCmd(fsys: ReturnType<typeof createFakeFs>): CommandRunner & {
         // List worktrees from the fake fs
         const repo = opts?.cwd ?? "/repo";
         let output = `worktree ${repo}\nHEAD main123\nbranch refs/heads/main\n\n`;
-        // Find other worktrees
+
+        // Find worktrees by looking at /repo/.git/worktrees/*/HEAD
+        // and then finding the corresponding .git file that points to them
+        const worktreesDir = `${repo}/.git/worktrees`;
         for (const key of fsys.files.keys()) {
-          if (key.startsWith(repo) && key !== repo && key.endsWith("/.git")) {
-            const wtPath = key.replace("/.git", "");
-            const gitContent = fsys.files.get(key)?.content ?? "";
-            if (gitContent.startsWith("gitdir:")) {
-              // It's a linked worktree
-              const branch = wtPath.split("/").pop() ?? "unknown";
-              output += `worktree ${wtPath}\nHEAD ${branch}123\nbranch refs/heads/${branch}\n\n`;
+          if (key.startsWith(worktreesDir + "/") && key.endsWith("/HEAD")) {
+            // Extract branch name from path like /repo/.git/worktrees/feature/HEAD
+            const parts = key.split("/");
+            const branch = parts[parts.length - 2];
+
+            // Find the worktree path by looking for .git files that point to this gitdir
+            for (const [path, file] of fsys.files.entries()) {
+              if (path.endsWith("/.git") && file.content?.includes(`worktrees/${branch}`)) {
+                const wtPath = path.replace("/.git", "");
+                output += `worktree ${wtPath}\nHEAD ${branch}123\nbranch refs/heads/${branch}\n\n`;
+                break;
+              }
             }
           }
         }

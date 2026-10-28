@@ -66,18 +66,22 @@ async function estimateSize(
 
 /**
  * Check if an entry name appears in any reference file.
+ * Matches the entry name OR the basename without extension.
  */
 async function isReferenced(
   fsys: FileSystem,
   entryName: string,
   skipPatterns: string[],
 ): Promise<boolean> {
+  // Also match without extension (e.g., "gate-abc.log" matches if "gate-abc" is referenced)
+  const baseName = entryName.replace(/\.[^.]+$/, "");
+
   for (const pattern of skipPatterns) {
     try {
       const files = await fsys.glob(pattern);
       for (const file of files) {
         const content = await fsys.readFile(file);
-        if (content.includes(entryName)) {
+        if (content.includes(entryName) || content.includes(baseName)) {
           return true;
         }
       }

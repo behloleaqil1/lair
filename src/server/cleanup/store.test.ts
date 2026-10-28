@@ -109,7 +109,12 @@ describe("CleanupStore", () => {
       const cycle1 = store.startCycle("test", "observe");
       store.finishCycle(cycle1.id, 1, 100, 0);
 
+      // Add a small delay to ensure different finished_at timestamps
       const cycle2 = store.startCycle("test", "act");
+      // Manually update the started_at to ensure it's later (so finished_at is also later)
+      store["db"]
+        .prepare("UPDATE cleanup_cycles SET started_at = started_at + 1 WHERE id = ?")
+        .run(cycle2.id);
       store.finishCycle(cycle2.id, 2, 200, 1);
 
       store.startCycle("test", "observe"); // Incomplete

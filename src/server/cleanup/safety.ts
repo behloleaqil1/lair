@@ -169,8 +169,17 @@ export async function checkPathSafety(
  * Handles trailing slashes and normalization.
  */
 export function isInsidePath(childPath: string, parentPath: string): boolean {
-  const normalizedChild = path.normalize(childPath);
-  const normalizedParent = path.normalize(parentPath);
+  // Normalize and strip trailing slashes for comparison
+  let normalizedChild = path.normalize(childPath);
+  let normalizedParent = path.normalize(parentPath);
+
+  // Remove trailing slashes for consistent comparison
+  if (normalizedChild.length > 1 && normalizedChild.endsWith("/")) {
+    normalizedChild = normalizedChild.slice(0, -1);
+  }
+  if (normalizedParent.length > 1 && normalizedParent.endsWith("/")) {
+    normalizedParent = normalizedParent.slice(0, -1);
+  }
 
   // Must be strictly inside, not equal
   if (normalizedChild === normalizedParent) {
@@ -178,9 +187,7 @@ export function isInsidePath(childPath: string, parentPath: string): boolean {
   }
 
   // Add trailing slash to parent for proper prefix check
-  const parentPrefix = normalizedParent.endsWith("/")
-    ? normalizedParent
-    : normalizedParent + "/";
+  const parentPrefix = normalizedParent + "/";
 
   return normalizedChild.startsWith(parentPrefix);
 }

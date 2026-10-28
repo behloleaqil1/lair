@@ -86,7 +86,7 @@ describe("checkPathSafety", () => {
   });
 
   it("rejects relative paths", async () => {
-    const result = await checkPathSafety(fsys, "relative/path", ["/root"]);
+    const result = await checkPathSafety(fsys, "relative/path", ["/myroot"]);
     expect(result.safe).toBe(false);
     if (result.safe) throw new Error("expected unsafe");
     expect(result.violation.reason).toBe("path is not absolute");
@@ -94,7 +94,7 @@ describe("checkPathSafety", () => {
 
   it("rejects system directories", async () => {
     fsys.files.set("/", { isDir: true, isSymlink: false, mtimeMs: 0 });
-    const result = await checkPathSafety(fsys, "/", ["/root"]);
+    const result = await checkPathSafety(fsys, "/", ["/myroot"]);
     expect(result.safe).toBe(false);
     if (result.safe) throw new Error("expected unsafe");
     expect(result.violation.reason).toBe("path is a system directory");
@@ -110,7 +110,7 @@ describe("checkPathSafety", () => {
   });
 
   it("rejects non-existent paths", async () => {
-    const result = await checkPathSafety(fsys, "/root/missing", ["/root"]);
+    const result = await checkPathSafety(fsys, "/myroot/missing", ["/myroot"]);
     expect(result.safe).toBe(false);
     if (result.safe) throw new Error("expected unsafe");
     expect(result.violation.reason).toBe("path does not exist");
@@ -118,43 +118,44 @@ describe("checkPathSafety", () => {
 
   it("rejects paths outside configured roots", async () => {
     fsys.files.set("/other/path", { isDir: true, isSymlink: false, mtimeMs: 0 });
-    const result = await checkPathSafety(fsys, "/other/path", ["/root"]);
+    const result = await checkPathSafety(fsys, "/other/path", ["/myroot"]);
     expect(result.safe).toBe(false);
     if (result.safe) throw new Error("expected unsafe");
     expect(result.violation.reason).toContain("outside configured roots");
   });
 
   it("rejects the configured root itself", async () => {
-    fsys.files.set("/root", { isDir: true, isSymlink: false, mtimeMs: 0 });
-    const result = await checkPathSafety(fsys, "/root", ["/root"]);
+    // Use a non-system directory path (not in FORBIDDEN_PATHS like /root which is a system dir)
+    fsys.files.set("/myproject", { isDir: true, isSymlink: false, mtimeMs: 0 });
+    const result = await checkPathSafety(fsys, "/myproject", ["/myproject"]);
     expect(result.safe).toBe(false);
     if (result.safe) throw new Error("expected unsafe");
     expect(result.violation.reason).toBe("path is a configured root");
   });
 
   it("accepts paths inside configured roots", async () => {
-    fsys.files.set("/root/subdir", { isDir: true, isSymlink: false, mtimeMs: 0 });
-    const result = await checkPathSafety(fsys, "/root/subdir", ["/root"]);
+    fsys.files.set("/myroot/subdir", { isDir: true, isSymlink: false, mtimeMs: 0 });
+    const result = await checkPathSafety(fsys, "/myroot/subdir", ["/myroot"]);
     expect(result.safe).toBe(true);
     if (!result.safe) throw new Error("expected safe");
-    expect(result.realPath).toBe("/root/subdir");
+    expect(result.realPath).toBe("/myroot/subdir");
   });
 
   it("accepts paths inside any of multiple roots", async () => {
-    fsys.files.set("/root2/file", { isDir: false, isSymlink: false, mtimeMs: 0 });
-    const result = await checkPathSafety(fsys, "/root2/file", ["/root1", "/root2"]);
+    fsys.files.set("/myroot2/file", { isDir: false, isSymlink: false, mtimeMs: 0 });
+    const result = await checkPathSafety(fsys, "/myroot2/file", ["/myroot1", "/myroot2"]);
     expect(result.safe).toBe(true);
   });
 
   it("rejects symlinks pointing outside roots", async () => {
     fsys.files.set("/outside/target", { isDir: true, isSymlink: false, mtimeMs: 0 });
-    fsys.files.set("/root/link", {
+    fsys.files.set("/myroot/link", {
       isDir: false,
       isSymlink: true,
       target: "/outside/target",
       mtimeMs: 0,
     });
-    const result = await checkPathSafety(fsys, "/root/link", ["/root"]);
+    const result = await checkPathSafety(fsys, "/myroot/link", ["/myroot"]);
     expect(result.safe).toBe(false);
     if (result.safe) throw new Error("expected unsafe");
     expect(result.violation.reason).toContain("symlink target");
@@ -162,33 +163,33 @@ describe("checkPathSafety", () => {
   });
 
   it("accepts symlinks pointing inside roots", async () => {
-    fsys.files.set("/root/target", { isDir: true, isSymlink: false, mtimeMs: 0 });
-    fsys.files.set("/root/link", {
+    fsys.files.set("/myroot/target", { isDir: true, isSymlink: false, mtimeMs: 0 });
+    fsys.files.set("/myroot/link", {
       isDir: false,
       isSymlink: true,
-      target: "/root/target",
+      target: "/myroot/target",
       mtimeMs: 0,
     });
-    const result = await checkPathSafety(fsys, "/root/link", ["/root"]);
+    const result = await checkPathSafety(fsys, "/myroot/link", ["/myroot"]);
     expect(result.safe).toBe(true);
     if (!result.safe) throw new Error("expected safe");
-    expect(result.realPath).toBe("/root/target");
+    expect(result.realPath).toBe("/myroot/target");
   });
 
   it("rejects broken symlinks", async () => {
-    fsys.files.set("/root/link", {
+    fsys.files.set("/myroot/link", {
       isDir: false,
       isSymlink: true,
-      target: "/root/missing",
+      target: "/myroot/missing",
       mtimeMs: 0,
     });
     // realpath will throw because target doesn't exist
     const origRealpath = fsys.realpath;
     fsys.realpath = async (p) => {
-      if (p === "/root/link") throw new Error("ENOENT");
+      if (p === "/myroot/link") throw new Error("ENOENT");
       return origRealpath(p);
     };
-    const result = await checkPathSafety(fsys, "/root/link", ["/root"]);
+    const result = await checkPathSafety(fsys, "/myroot/link", ["/myroot"]);
     expect(result.safe).toBe(false);
     if (result.safe) throw new Error("expected unsafe");
     expect(result.violation.reason).toBe("symlink target does not exist");
