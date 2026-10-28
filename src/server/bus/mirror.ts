@@ -35,8 +35,8 @@ const MAX_SHA = 64;
 function sanitize(value: string, max: number): string {
   /* eslint-disable no-control-regex */
   return value
+    .replace(/\x1b\[[0-9;]*[A-Za-z]/g, "") // ANSI escapes (must be first)
     .replace(/[\x00-\x1f\x7f]/g, " ") // control chars -> space
-    .replace(/\x1b\[[0-9;]*[A-Za-z]/g, "") // ANSI escapes
     .replace(/\s+/g, " ") // collapse whitespace
     .trim()
     .slice(0, max);

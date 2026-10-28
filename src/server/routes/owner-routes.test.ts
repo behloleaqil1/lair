@@ -12,7 +12,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { HumanAuth, OWNER_SESSION_HEADER, registerOwnerRoutes } from "../human-auth/index.js";
-import { BusStorage } from "../../bus/storage.js";
+import { getBusStore, closeBusStores } from "../bus/store.js";
 import { getStore, closeStore } from "../store/store.js";
 import { getScheduler, stopScheduler } from "../scheduler/scheduler.js";
 import { getBudgetManager, resetBudgetManager } from "../fleet/budget.js";
@@ -120,6 +120,7 @@ afterAll(async () => {
   await app.close();
   stopScheduler();
   closeStore();
+  closeBusStores();
   resetBudgetManager();
   rmSync(PROJECT_FILE, { force: true });
   for (const file of existsSync(LOCAL_DIR) ? readdirSync(LOCAL_DIR) : []) {
@@ -206,19 +207,20 @@ describe("controls: commands and dragon start/stop", () => {
 });
 
 describe("bus: messages sent as the owner", () => {
-  async function unread(agent: string) {
-    const storage = new BusStorage(PROJECT, DATA);
-    await storage.init();
-    try {
-      return storage.getUnreadMessages(agent);
-    } finally {
-      storage.close();
-    }
+  function unread(agent: string) {
+    // Read from the server-owned bus store
+    const store = getBusStore(PROJECT, join(TMP, "bus"));
+    const now = Date.now();
+    return store.getUnreadMessages(agent, now).map((m) => ({
+      from_id: m.fromId,
+      to_id: m.toId,
+      text: m.text,
+    }));
   }
 
   it("refuses a message without the owner's session, and sends nothing", async () => {
     expectRefused(await post(`/api/bus/send${p}`, { to: "orchestrator", text: "refused" }));
-    expect(await unread("orchestrator")).toEqual([]);
+    expect(unread("orchestrator")).toEqual([]);
     expect((await app.inject({ url: `/api/bus/board${p}` })).statusCode).toBe(200);
   });
 
@@ -227,7 +229,7 @@ describe("bus: messages sent as the owner", () => {
     await signIn(ownerToken);
     const sent = await sendBusMessage(PROJECT, "worker-a", "rebase on main");
     expect(sent).toMatchObject({ success: true, data: { to: "worker-a" } });
-    expect(await unread("worker-a")).toMatchObject([{ from_id: "owner", to_id: "worker-a", text: "rebase on main" }]);
+    expect(unread("worker-a")).toMatchObject([{ from_id: "owner", to_id: "worker-a", text: "rebase on main" }]);
   });
 });
 
