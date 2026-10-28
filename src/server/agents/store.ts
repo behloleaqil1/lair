@@ -21,7 +21,7 @@ import type { ProcessOwner } from "./probes.js";
  * runs, releases and claim releases on every check). Every statement is IF
  * NOT EXISTS, so running SCHEMA migrates any older version.
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS agents_runs (
@@ -82,6 +82,17 @@ const SCHEMA = `
     reason TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_agents_usage ON agents_usage(project, at);
+
+  CREATE TABLE IF NOT EXISTS agents_hung_info (
+    project TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    task TEXT NOT NULL,
+    last_lines TEXT NOT NULL,
+    last_tool TEXT,
+    hung_minutes INTEGER NOT NULL,
+    recorded_at INTEGER NOT NULL,
+    PRIMARY KEY (project, agent, task)
+  );
 `;
 
 interface ClaimRow {
@@ -107,6 +118,42 @@ interface EventRow {
   data: string;
   dedupe_key: string | null;
   at: number;
+}
+
+interface HungInfoRow {
+  project: string;
+  agent: string;
+  task: string;
+  last_lines: string;
+  last_tool: string | null;
+  hung_minutes: number;
+  recorded_at: number;
+}
+
+/** Info about a hung run, recorded for the next run to see. */
+export interface HungInfo {
+  project: string;
+  agent: string;
+  task: string;
+  /** Cleaned last lines from the hung run's log (control chars removed, bounded) */
+  lastLines: string;
+  /** The last tool call the adapter's log shows, if any */
+  lastTool: string | null;
+  /** How many minutes the run was hung for */
+  hungMinutes: number;
+  recordedAt: number;
+}
+
+function toHungInfo(row: HungInfoRow): HungInfo {
+  return {
+    project: row.project,
+    agent: row.agent,
+    task: row.task,
+    lastLines: row.last_lines,
+    lastTool: row.last_tool,
+    hungMinutes: row.hung_minutes,
+    recordedAt: row.recorded_at,
+  };
 }
 
 function toClaim(row: ClaimRow): Claim {
@@ -521,5 +568,34 @@ export class AgentsStore {
             .get(project, agent, since)
     ) as { tokens: number; cost: number };
     return { tokens: row.tokens, cost: row.cost };
+  }
+
+  // ============ HUNG INFO ============
+
+  /** Record hung run info for the next run to see. */
+  recordHungInfo(info: HungInfo): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO agents_hung_info
+           (project, agent, task, last_lines, last_tool, hung_minutes, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(info.project, info.agent, info.task, info.lastLines, info.lastTool ?? null, info.hungMinutes, info.recordedAt);
+  }
+
+  /** Get hung info for an agent+task pair; null if none or cleared. */
+  getHungInfo(project: string, agent: string, task: string): HungInfo | null {
+    const row = this.db
+      .prepare(`SELECT * FROM agents_hung_info WHERE project = ? AND agent = ? AND task = ?`)
+      .get(project, agent, task) as HungInfoRow | undefined;
+    return row ? toHungInfo(row) : null;
+  }
+
+  /** Clear hung info after a normal completion. */
+  clearHungInfo(project: string, agent: string, task: string): boolean {
+    const result = this.db
+      .prepare(`DELETE FROM agents_hung_info WHERE project = ? AND agent = ? AND task = ?`)
+      .run(project, agent, task);
+    return result.changes > 0;
   }
 }

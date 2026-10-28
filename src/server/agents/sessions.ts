@@ -61,6 +61,69 @@ export function lastLines(text: string, count: number): string[] {
     .slice(-count);
 }
 
+/** Max bytes of log to read for hung info */
+const HUNG_LOG_MAX_BYTES = 16 * 1024;
+/** Max lines of log to include in hung info */
+const HUNG_MAX_LINES = 20;
+/** Max characters of hung info */
+const HUNG_MAX_CHARS = 2048;
+
+/**
+ * Clean text for hung info: remove control characters and ANSI escapes,
+ * bound to at most maxChars.
+ */
+export function cleanForHungInfo(text: string, maxChars: number = HUNG_MAX_CHARS): string {
+  // Remove ANSI escape sequences and control characters
+  let cleaned = text
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "") // ANSI escape sequences
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "") // Control chars except \t \n \r
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+  if (cleaned.length > maxChars) {
+    cleaned = cleaned.slice(-maxChars);
+  }
+  return cleaned;
+}
+
+/**
+ * Extract bounded, cleaned last lines from a log for hung info.
+ * Returns at most HUNG_MAX_LINES lines, at most HUNG_MAX_CHARS total.
+ */
+export function extractHungLogLines(logPath: string | undefined): string {
+  if (!logPath) return "";
+  const raw = readTail(logPath, HUNG_LOG_MAX_BYTES);
+  if (!raw) return "";
+  const cleaned = cleanForHungInfo(raw);
+  const lines = lastLines(cleaned, HUNG_MAX_LINES);
+  return lines.join("\n");
+}
+
+/**
+ * Try to extract the last tool call from an adapter log.
+ * Returns a one-line description or null.
+ */
+export function extractLastTool(logPath: string | undefined): string | null {
+  if (!logPath) return null;
+  const raw = readTail(logPath, 32 * 1024);
+  if (!raw) return null;
+  // Look for common tool call patterns in agent logs
+  const patterns = [
+    /\btool[_\s]?call[:\s]+([^\n]{1,200})/i,
+    /\b(?:calling|executing|running)[:\s]+([^\n]{1,200})/i,
+    /\bfunction[:\s]+([A-Za-z_][A-Za-z0-9_]*)/i,
+  ];
+  for (const pattern of patterns) {
+    const matches = [...raw.matchAll(new RegExp(pattern, "gi"))];
+    if (matches.length > 0) {
+      const last = matches[matches.length - 1];
+      return last[1]?.trim().slice(0, 200) ?? null;
+    }
+  }
+  return null;
+}
+
 export interface SummaryInput {
   run: AgentRun;
   /** The runs of the chain so far, first first */

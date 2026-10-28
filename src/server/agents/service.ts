@@ -114,8 +114,8 @@ import {
   type AgentProbes,
   type ProcessOwner,
 } from "./probes.js";
-import { lastLines, moveSessionAside, readTail, resumeSummary, sessionDirFor, utcStamp } from "./sessions.js";
-import { AgentsStore, type ClaimResult } from "./store.js";
+import { cleanForHungInfo, extractHungLogLines, extractLastTool, lastLines, moveSessionAside, readTail, resumeSummary, sessionDirFor, utcStamp } from "./sessions.js";
+import { AgentsStore, type ClaimResult, type HungInfo } from "./store.js";
 import {
   claimView,
   eventView,
@@ -1224,9 +1224,34 @@ export class AgentsService {
     const parts = [run.ownPrompt ? undefined : this.config.default_instructions, dragon?.instructions, run.resumeSummary, run.prompt]
       .map((part) => part?.trim())
       .filter((part): part is string => typeof part === "string" && part.length > 0);
+    // If the previous run on this task was hung, include the info as a data block
+    const hungInfo = this.store.getHungInfo(this.project, run.agent, run.task);
+    if (hungInfo) {
+      parts.push(this.formatHungInfo(hungInfo));
+    }
     const file = join(dir, `${run.task.replace(/[^A-Za-z0-9_-]/g, "-")}-${run.agent}-${short(run.id)}.txt`);
     writeFileSync(file, parts.join("\n\n") + "\n", "utf-8");
     return file;
+  }
+
+  /** Format hung info as a fenced data block that can't start a line of its own */
+  private formatHungInfo(info: HungInfo): string {
+    const parts: string[] = [
+      `<hung_run_warning>`,
+      `Your previous run was stopped as hung after ${info.hungMinutes} minutes.`,
+      `Do not repeat the step that hung; if it was a search or a long command, narrow it or add a timeout.`,
+    ];
+    if (info.lastTool) {
+      parts.push(`Last tool call: ${info.lastTool}`);
+    }
+    if (info.lastLines) {
+      parts.push(`Last output before it hung:`);
+      parts.push("```");
+      parts.push(info.lastLines);
+      parts.push("```");
+    }
+    parts.push(`</hung_run_warning>`);
+    return parts.join("\n");
   }
 
   /** The adapter's start command for this run: the resume flag only when resuming the same session. */
@@ -1599,6 +1624,21 @@ export class AgentsService {
         t.now,
       );
     }
+    // Record hung info for the next run to see
+    if (reason === "hung") {
+      const hungMinutes = Math.round((t.now - (run.spawnedAt ?? run.requestedAt)) / 60000);
+      const lastLines = extractHungLogLines(run.logPath);
+      const lastTool = extractLastTool(run.logPath);
+      this.store.recordHungInfo({
+        project: this.project,
+        agent: run.agent,
+        task: run.task,
+        lastLines,
+        lastTool,
+        hungMinutes,
+        recordedAt: t.now,
+      });
+    }
   }
 
   private async finishStop(run: AgentRun, t: Tick): Promise<void> {
@@ -1760,6 +1800,8 @@ export class AgentsService {
     this.store.saveRun(run);
     t.summary.ended++;
     if (state === "completed") {
+      // Clear hung info after a normal completion
+      this.store.clearHungInfo(this.project, run.agent, run.task);
       await this.record(
         "completed",
         { agent: run.agent, task: run.task, runId: run.id, summary: `${run.agent} finished ${run.task}: ${detail}`, ...event },
