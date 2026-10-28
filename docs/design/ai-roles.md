@@ -11,7 +11,7 @@
 | **A6-1** | `ai.profiles` and `ai.roles`, checked when the project loads (errors name the key); a dragon's `profile:`; a dragon that names nothing runs on its role's first profile (`build`, or `plan` for the planner agent); failover along the role; reviewer pools by role (`role:review.<tier>`; a tier without a pool takes its role), with `different_model` across every profile and fallback; the presets Codex CLI, Gemini CLI, OpenCode, Goose and GitHub Copilot CLI (experimental); model lists (`models_cmd` with a parser, `kiro` or `lines`, else a known list), cached for an hour; sign-in checks (`auth_check_cmd`, `login_hint`) per machine, here and over SSH; a tool signed out on this machine starts nothing here, with one decision per tool; `GET /api/ai/tools`, `GET /api/ai/models` and `POST /api/ai/models/refresh` (owner only); the Settings registry entry | built (`src/server/ai/`) |
 | **A6-2** | The write-only secret store for API-key tools (OS keychain, Secret Service, else a 0600 file), a profile's `secret_env`, rotation and removal | to do |
 | **A6-3** | Usage and cost per profile and role, budgets per role; reviewer calibration, and the warning for a weak profile on RED | to do |
-| **A6-4** | The supervisor started through `ai.roles.supervise` (with the supervisor, A3); ACP adapters; the conformance suite for every preset (B3) | to do |
+| **A6-4** | The supervisor started through `ai.roles.supervise` (with the supervisor, A3): built with S1-2 (`supervisor.agent` runs on the role's first profile and fails over along it; without it, the dragon on the role's first profile is the supervisor). ACP adapters; the conformance suite for every preset (B3): to do | part built |
 | **A7** | The UI: Settings → AI (tools and sign-in per machine, model dropdowns refilled per tool, "Other…" with its warning, "not offered any more", profiles, role dropdowns), on the APIs above | to do ([settings-v2.md](settings-v2.md)) |
 
 Not in A6-1: a model a tool no longer lists is not yet flagged on the dragons and roles that use it (the lists are there; the check
@@ -120,7 +120,8 @@ signed in on the build box.
 
 The supervisor ([supervisor.md](supervisor.md)) is started like any other role, through `ai.roles.supervise`, so it
 runs on whatever tool and model the team uses: Kiro for a Kiro team, a local model for an offline team. It talks to
-Lair through the ops API (MCP), which any MCP-capable tool can use.
+Lair through the ops API: over MCP (`lair ops-mcp`) for an MCP-capable tool, or with `lair ops call` from any tool that
+can run a command.
 
 ## Acceptance
 

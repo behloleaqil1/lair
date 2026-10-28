@@ -321,7 +321,7 @@ dragons:
 | `roles.build` | array | Profile ids for the dragons that name no profile, adapter or model |
 | `roles.review.red`, `.amber`, `.green` | array | Profile ids of the reviewers per risk tier (see [Reviewers by role](#reviewers-by-role)) |
 | `roles.plan` | array | Profile ids for the planner agent (`planner.agent.id`) when it names none |
-| `roles.supervise` | array | Profile ids for the supervisor ([supervisor.md](design/supervisor.md)): accepted and checked, not used yet (its runs come with S1-2; its [ops API](#the-ops-api) is built) |
+| `roles.supervise` | array | Profile ids for the supervisor's runs ([Supervisor chat and digest](#supervisor-chat-and-digest)): the supervisor agent (`supervisor.agent`) runs on the first when it names no profile, and fails over along the role; without `supervisor.agent`, the first dragon on one of these profiles is the supervisor |
 
 Profile ids start with a letter and use letters, digits, `.`, `_` and `-` (at most 64). A mistake keeps the project from loading, with the key's path: `ai.profiles.<id>.tool: unknown tool ...`, `ai.roles.review.amber[1]: unknown profile ...`, a profile listed twice in a role, `dragons.<id>.profile: unknown profile ...`, and a dragon that names a profile and an adapter or a model.
 
@@ -851,7 +851,7 @@ Read-only routes. `?project=` defaults to the default project:
 
 ## Supervisor: self-checks and the ops API
 
-> The self-checks are on by default, with nothing to set. Design: [supervisor.md](design/supervisor.md). This is part S1-1: the checks, their notices and the read-only ops API. The supervisor's own runs (answers to your questions, the hourly review, the daily digest) come with S1-2.
+> The self-checks are on by default, with nothing to set. Design: [supervisor.md](design/supervisor.md). This is part S1-1: the checks, their notices and the read-only ops API. The supervisor's own runs (answers to your questions and the daily digest, S1-2) are off by default: see [Supervisor chat and digest](#supervisor-chat-and-digest).
 
 Lair checks itself, in code, every `interval_seconds` (60 s by default), off the request path, and shows the results in **Home → Health** (yours only). Each result has an id, a status (`ok`, `warning`, `failing`, or `unknown` when it couldn't be measured this round), its measured values and thresholds, a one-line explanation and what to do about it. Its words are Lair's own (a count, a module, a lane, a config key), never a line of a log or of a command's output.
 
@@ -901,7 +901,7 @@ Unknown keys and check ids, and a warning threshold past its failing one (above 
 
 ### The ops API
 
-The ops API is what an AI supervisor reads Lair through: read tools only (`proposals.submit`, the one write tool, comes with S2). Any MCP-capable tool gets it from `lair ops-mcp`, an MCP server over stdio; each tool call is one `POST /api/ops/call` to Lair, which checks, audits, redacts and bounds it.
+The ops API is what an AI supervisor reads Lair through: read tools only (`proposals.submit`, the one write tool, comes with S2). Any MCP-capable tool gets it from `lair ops-mcp`, an MCP server over stdio; any tool that can run a command gets it from `lair ops call <tool> [--args <json>]`, which prints the answer as JSON. Each tool call is one `POST /api/ops/call` to Lair, which checks, audits, redacts and bounds it.
 
 | Tool | Arguments | Answer |
 |------|-----------|--------|
@@ -916,13 +916,13 @@ The ops API is what an AI supervisor reads Lair through: read tools only (`propo
 | `config.get` | `project` | The project's config, redacted |
 | `diagnostics.run` | `project` | The self-checks, run now (at most every 10 s) |
 
-`project` defaults to the default project. Arguments are checked by the same list on both sides: an unknown one, an id that starts with `-` or a count past its limit is refused (HTTP 400), never cut.
+`project` defaults to the token's project for a run token, and to the default project for a session token. Arguments are checked by the same list on both sides: an unknown one, an id that starts with `-` or a count past its limit is refused (HTTP 400), never cut.
 
 **Redacted and bounded.** Every string of every answer goes through the same rules. Out go: tokens of known shapes (GitHub, Slack, OpenAI-style, AWS and Google keys, JWTs, Lair's own ops tokens); `Authorization` and `Bearer` values; the value of a `name=value` or `name: value` whose name says token, secret, password, key, credential or cookie (so a commit-id-shaped secret after `token=` goes too); long runs that mix cases and digits, and long hex runs (a bare 40-digit commit id stays); a URL's credentials, path and query (`https://git.example.com/[...]` stays); an email address's local part (`***@example.com` stays: a git `Author:` line, an identity); ARNs; runs of six or more digits. Strings are cut to 1000 characters (log lines to 500), lists to 100 items, and an answer to 256 KiB: a bigger one comes back with tighter limits, marked `truncated`. `config.get` also removes every `env` map (a command's environment), and replaces a value whose key names a secret or an email (`identity.email`, `allowed_emails`); a `*_env` key that names a variable and a `*_file` path stay.
 
 **Tokens.** The ops API takes an ops token (`Authorization: Bearer lairops_...`), never the owner's session, and no other route takes one.
 
-- A **run token** is minted by Lair for one supervisor run (S1-2 starts those runs). It reads that run's project only, and is accepted only while the agents module's store has that run active (queued, waiting on a lock, running or stopping): it stops working however the run ends (completed, failed over, stopped by you, recovered into a new run), at once on the agents module's events for the run, and at its TTL.
+- A **run token** is minted by Lair for one supervisor run ([Supervisor chat and digest](#supervisor-chat-and-digest)), and is in that run's environment only (`LAIR_OPS_TOKEN`). It reads that run's project only, and is accepted only while the agents module's store has that run active (queued, waiting on a lock, running or stopping): it stops working however the run ends (completed, failed over, stopped by you, recovered into a new run), at once on the agents module's events for the run, and at its TTL (the question's `answer_timeout_minutes`). Besides the read tools it can do one thing: submit that run's answer to its own question, once (`POST /api/ops/answer`).
 - A **session token** is yours, for an interactive session of any MCP-capable tool (below). It reads every project, for one hour by default (5 minutes to 8 hours), and you can revoke it.
 
 Tokens live in the server's memory, never on disk: a restart ends them all. Only their SHA-256 is kept. At most 50 are alive at once (minting another drops the one that expires soonest), and each makes at most 120 calls a minute (HTTP 429 past that).
@@ -961,6 +961,127 @@ The token stops working after its hour, when you revoke it, or when Lair restart
 | `POST` | `/api/supervisor/tokens/:id/revoke` | Owner only |
 | `GET` | `/api/supervisor/audit?limit=&token=<id>` | Owner only. The audit, newest first (at most 1000) |
 | `POST` | `/api/ops/call` | An ops token. Body `{tool, args}`: `{tool, project, truncated, result}`. 401 without a live token, 403 for a project the token doesn't read, 404 for an unknown tool, 400 for invalid arguments, 429 past the rate, 504 after 20 s |
+
+The chat's and the digest's routes are in [Supervisor chat and digest](#chat-and-digest-api).
+
+## Supervisor chat and digest
+
+> Off by default: nothing changes until you set `supervisor.chat.enabled` or `supervisor.digest.enabled`. Design: [supervisor.md](design/supervisor.md) (S1-2). Each question and each digest is one run of an AI agent, so each costs what a run of that tool and model costs; the bounds below and the [agents module's budgets](#agents) cap how many there are.
+
+You ask Lair a question in the dashboard, from the **Ask** tab of the command bar or the **Ask Lair** card on Home ("why is worker-a held?", "why is nothing merging?", "which gates failed because of the infrastructure today?"). A supervisor run reads Lair's own records through the [ops API](#the-ops-api) and answers, citing what it read. Once a day, a supervisor run can also write a digest of the project, shown on Home.
+
+### Turning it on
+
+```yaml
+ai:
+  profiles:
+    kiro-opus: { tool: kiro, model: claude-opus-4.5 }
+  roles:
+    supervise: [kiro-opus]
+
+dragons:
+  lair-sup: { name: Supervisor }   # names no profile: runs on ai.roles.supervise's first
+
+agents:
+  enabled: true
+
+supervisor:
+  agent: lair-sup
+  chat:
+    enabled: true
+  digest:
+    enabled: true
+    time: "08:00"
+```
+
+**Choosing the AI.** The supervisor is a role ([ai-roles.md](design/ai-roles.md)), so it runs on whatever tool and model you choose:
+
+- `supervisor.agent` names the supervisor agent, one of the project's dragons. When it names no profile, adapter or model, it runs on the first profile of `ai.roles.supervise` and fails over along the role, as any dragon does along its own role. It can't be an agent fill starts (`agents.fill.agents`) or the planner agent.
+- Without `supervisor.agent`, the supervisor is the first dragon whose `profile:` is in `ai.roles.supervise` (the dragons on the role's first profile first), leaving out fill's agents and the planner agent.
+- The prompt names no tool: an agent that can run commands reads Lair with `lair ops call`, and an MCP-capable one may use `lair ops-mcp` instead (the variables it needs are already in its environment).
+
+With `supervisor.chat.enabled` and a supervisor agent, the Ask tab sends questions to the supervisor (a message to `@<dragon-id>` still goes to that dragon); otherwise it asks the orchestrator's `ask_cmd` as before. Home's **Ask Lair** card says what is missing until questions can be asked.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `agent` | string | — | The supervisor agent: a dragon of the project, not one fill starts nor the planner agent |
+| `prompt_file` | string | — | The supervisor's prompt template: one file name in `prompts_dir` (as `review.prompt_file`). Without it, Lair's own, [`prompts/supervisor.md`](../prompts/supervisor.md) |
+| `chat.enabled` | boolean | `false` | Questions from the dashboard are answered by supervisor runs |
+| `chat.max_runs_per_day` | number | `20` | Supervisor runs, questions and digests together, started in any 24 hours (1 to 500) |
+| `chat.min_interval_seconds` | number | `30` | Between the starts of two supervisor runs (0 to 86400) |
+| `chat.max_conversation_turns` | number | `10` | Questions in one conversation; then you start a new one (1 to 50) |
+| `chat.answer_timeout_minutes` | number | `15` | A question with no answer this long after it was asked is closed, and its run stopped (1 to 240) |
+| `digest.enabled` | boolean | `false` | A supervisor run writes a digest once a day |
+| `digest.time` | `HH:MM` | `"08:00"` | When, in this machine's local time (24 hours) |
+
+These are config errors that name the key: chat or the digest on without `agents.enabled: true`, or with no supervisor agent; `supervisor.agent` naming an agent the project doesn't have, one fill starts, or the planner agent; a `prompt_file` that isn't one plain file name; a `time` that isn't `HH:MM`; an unknown key. Like the rest of the `supervisor:` block, an error keeps the project's self-checks from running too, and shows in Home → Health. The block is reloaded live (also when the agents, dragons, AI or planner blocks change) and edited in Settings.
+
+### A supervisor run
+
+A question starts a conversation, or continues the one the chat panel has open, and is one run of the supervisor agent, requested through the agents module like any module's run: claims, locks, recovery, failover and budgets apply. Its task is `supervisor-ask-<the conversation's first 8 characters>-<n>` (`supervisor-digest-<YYYYMMDD>` for a digest). One question waits at a time in a conversation, and the supervisor agent takes one run at a time (a question while it is busy is refused with why).
+
+**Its prompt** is the template (`prompt_file`, else `prompts/supervisor.md`: it tells the agent that it is Lair's operator, to answer only from tool results and cite them, to say "I don't know" rather than guess, never to write anything, and to give next steps marked "for the owner" or "Lair can do"), then what Lair adds for the run:
+
+- which run it is: the project, the conversation's id, the time it has;
+- Lair's tools and how to call them;
+- how to submit the answer;
+- the context, as JSON data under a heading that says it is data: the self-checks that need a look (with their values and fixes) and the ids of those that pass, the project's open decisions (at most 30: id, kind, title, the module that raised it, since when), and the conversation so far (each question cut to 1000 characters and each answer to 3000, at most 12000 in all, the oldest dropped first). Every string is redacted as the ops API's answers are;
+- the question, or for a digest what Lair asks for.
+
+**Its environment** has what the agents module gives every run, and three of its own, kept in the agents module's memory only (never in its store, the prompt file or a log):
+
+- `LAIR_OPS_TOKEN`: a [run token](#the-ops-api) minted for this run: it reads this project only, and stops working when the run ends, however it ends, or at `answer_timeout_minutes`;
+- `LAIR_URL`: this server;
+- `LAIR_SUPERVISOR_CONVERSATION`: the conversation's id.
+
+**Submitting the answer.** The run writes its answer as Markdown in a file, and the evidence it cites as a JSON list of `{tool, args, note}` (each `tool` an ops tool, its `args` as called, and a note of what it showed; at most 30), then runs:
+
+```
+lair supervisor answer --conversation <id> --file answer.md [--evidence-file evidence.json]
+```
+
+It is `node <lair>/dist/cli/lair.js supervisor answer ...` after `npm run build` (the prompt gives the exact command), and reads `LAIR_OPS_TOKEN`, `LAIR_URL` (default `http://127.0.0.1:4777`) and, without `--conversation`, `LAIR_SUPERVISOR_CONVERSATION`. It posts to `POST /api/ops/answer`. Lair takes an answer once per question, only under the token of the run that was asked, and only while that run is active; the token is never printed. Exit codes: `0` recorded; `1` refused (an ended, another run's or the owner's token, an answer already given, an invalid answer: Lair says which); `2` a usage or input error, and nothing was sent; `3` Lair could not be reached, or answered with a server error.
+
+`lair ops call <tool> [--args <json>]` is the same kind of command for the read tools: it checks the tool and its arguments with the server's own list before sending anything, and prints Lair's answer as JSON (`{tool, project, truncated, result}`), with the same exit codes.
+
+**Answers are untrusted.** They are agent output, so Lair cleans them before keeping them, and the dashboard renders them with the same Markdown reader:
+
+- Markdown only (headings, paragraphs, lists, code, quotes, emphasis, links), cut to 20000 characters; outside code every HTML tag and comment is removed, and the dashboard never makes HTML from the text;
+- images are their alt text: nothing is loaded;
+- links go only to the dashboard's own pages (`#/work/<agent>`, `#/decisions/<id>`, ...) and to the repository's host (`https://github.com/<owner>/<name>/...`, or the review module's API host); any other link is its text, not clickable;
+- secrets of known shapes, `Authorization` and `Bearer` values and a URL's credentials are taken out, of the evidence's notes and arguments too.
+
+**No answer.** A question is closed as "no answer", with the reason, when its run ends without answering (it exited, crashed, failed over or was recovered into a new run, whose token no longer works, or you stopped it), when `answer_timeout_minutes` pass, or when Lair restarts before the answer comes (tokens live in memory only). Its token ends, and whatever still runs of its task is stopped (its claim released). Nothing is retried on its own: ask again. An answered question whose run is still going at its deadline is stopped too.
+
+**Bounds.** A question that would start a run past `max_runs_per_day` (in the 24 hours before), or sooner than `min_interval_seconds` after the last supervisor run started, is refused with why and when to try again (HTTP 429); so is a question past `max_conversation_turns` (409). A refused question leaves nothing behind. The agents module's budgets apply on top: an agent over its budget starts nothing.
+
+### The daily digest
+
+With `digest.enabled`, a supervisor run writes a digest each day at `digest.time`, this machine's local time (or as soon as Lair runs after it, the same day). Lair asks it for what moved; what is stuck, and since when; the holds and decisions waiting for you; failures that repeat; the self-checks failing; and the trend against the days before. The run, its prompt, its token and its answer are as for a question; its context has no conversation.
+
+- **Home** shows the latest digest, with its evidence, and "No digest yet" before the first.
+- **One notice**, "Today's digest is ready (<date>)", is raised in the Decision Inbox when the digest's answer comes, if Lair's [notifications](#notifications) are on. Like every notice it is listed under FYI and never pushed; the previous day's, if still open, is withdrawn.
+- **The same bounds.** A digest run counts toward `max_runs_per_day` and waits for `min_interval_seconds`. One that can't start yet (the supervisor agent busy, too soon after another run) is tried again a minute later; one refused for good (the day's runs used up, the budget, the config) is skipped for the day, and Home says why. A digest run that ends without an answer is "no digest" for that day: it is not started again.
+
+### What the supervisor can and can't do
+
+- **It can** read this project through the ops API's read tools, redacted and bounded, every call audited, while its run lasts; and submit one answer per question.
+- **It can't**, through Lair: write anything (the ops API has no write tool yet: proposals come with S2, acting with S3), answer your decisions, use your owner session, start or stop agents, or read another project. Its answers change nothing; a "Lair can do" step is a suggestion you carry out.
+- **It is still an agent process on this machine.** Lair starts it as it starts any agent, as your OS user unless you run agents as another one, so Lair can't keep it from editing files or running git: the prompt tells it not to, and running agents as a separate OS user ([design](design/autonomy.md#6-agents-budgets-failover-and-session-recovery-module-agents)) makes it so. Everything it reads from the fleet (logs, queue lines, PR text, decisions) is data; its prompt says so, and its answer is shown as untrusted text.
+
+### Chat and digest API
+
+Every route is the owner's (`/api/supervisor` is in `OWNER_ONLY_PREFIXES`), except the answer, which takes the run's ops token. `project` defaults to the default project.
+
+| Method | Route | Description |
+|--------|-------|-------------|
+| `POST` | `/api/supervisor/ask` | Body `{project?, question, conversationId?}` (a question of at most 2000 characters): `{conversation}` (202), the question pending. 409 when questions are off, there is no supervisor agent, the conversation's last question still waits or it has `max_conversation_turns`, or the agent is busy; 429 past the bounds; 403 over budget or `read_only`; 404 for a conversation of another project |
+| `GET` | `/api/supervisor/chat?project=<name>` | `{project, enabled, digest: {enabled, time}, agent, problem, limits, runsToday, nextRunAt, conversations: [{id, kind, title, createdAt, updatedAt, turns, state}], repoUrl}` |
+| `GET` | `/api/supervisor/conversations/:id` | `{id, project, kind, digestDate, createdAt, updatedAt, repoUrl, turns: [{id, seq, question, askedAt, state, runId, agent, deadlineAt, answer, evidence, answeredAt, reason}]}`; `state` is `pending`, `answered` or `no_answer` |
+| `GET` | `/api/supervisor/digest?project=<name>` | `{project, enabled, time, latest}`: the latest digest, a conversation as above |
+| `POST` | `/api/ops/answer` | A run token. Body `{conversation, answer, evidence?}`: `{conversation, turn}`. 401 without a live token, 403 for a token that isn't the asked run's, 404 for an unknown conversation, 409 for an answer already given or a closed question, 400 for an invalid answer or evidence |
+
+The conversations are kept in `data/supervisor.db` (schema version 2), for 90 days after their last change.
 
 ## Delivery
 
@@ -1394,7 +1515,7 @@ The tasks file is on the agents' side of the trust boundary: agents can write it
 
 A run is requested for an agent (a `dragons:` entry or a `dragons.txt` line) and a task, with a prompt: by the owner (`POST /api/agents/runs`, with an owner session) or by another Lair module, in-process. Lair starts it with the agent's adapter (`start_cmd`, see [Agents](agents.md#agent-adapters)), its model, and the prompt file (`prompts_dir`). The process's output goes to `agents_dir/<agent>-<UTC>.log`, the log the dashboard and the watchdog read. The command must run the agent in the foreground: Lair supervises the process it started, so a launcher that starts the agent in the background and exits looks like an agent that died on start. A request's `model`, when given, must be one the project names for that agent (its own, or a fallback's).
 
-**The agent's environment is built, not inherited.** It gets `PATH`, `HOME`, `USER`, `LANG`, `TMPDIR`, `TERM` and `SHELL` from the server's environment, the variables listed in `env_passthrough` (a provider API key its CLI needs, say), and its run's own: `LAIR_RUN_ID`, `LAIR_TASK`, `LAIR_AGENT`, `LAIR_SESSION_ID`, `LAIR_SESSION_MODE` (`new`, `resume`, `fresh`), `TASK`, `MODEL`, and the adapter's `session_id_env` set to the session id. Nothing else of the server's environment reaches an agent: no `LAIR_NODE_TOKEN`, no other `LAIR_*` variable in any letter case (`env_passthrough` refuses them), and nothing else you exported before starting Lair.
+**The agent's environment is built, not inherited.** It gets `PATH`, `HOME`, `USER`, `LANG`, `TMPDIR`, `TERM` and `SHELL` from the server's environment, the variables listed in `env_passthrough` (a provider API key its CLI needs, say), and its run's own: `LAIR_RUN_ID`, `LAIR_TASK`, `LAIR_AGENT`, `LAIR_SESSION_ID`, `LAIR_SESSION_MODE` (`new`, `resume`, `fresh`), `TASK`, `MODEL`, and the adapter's `session_id_env` set to the session id. A run another module requests also gets that module's run variables, kept in memory only: a review run's `LAIR_REVIEW_TOKEN`, `LAIR_REVIEW_PROJECT` and `LAIR_URL` ([Reviews by agents](#reviews-by-agents)), a supervisor run's `LAIR_OPS_TOKEN`, `LAIR_SUPERVISOR_CONVERSATION` and `LAIR_URL` ([Supervisor chat and digest](#supervisor-chat-and-digest)). Nothing else of the server's environment reaches an agent: no `LAIR_NODE_TOKEN`, no other `LAIR_*` variable in any letter case (`env_passthrough` refuses them), and nothing else you exported before starting Lair.
 
 - **Claims.** A task is claimed by exactly one run. The claim is owned by a process: the Lair server while the run starts, then the agent's process. An owner is a pid **and** that process's start time, so a pid the system gave to another process is not the owner. A second request for a claimed task is refused (HTTP 409) while the owner lives; a claim whose owner is dead is released and logged. An owner is only judged dead on a process reading taken after its claim was read, so one that claimed a task a moment ago is never mistaken for a dead one. A run that loses its claim (released from the Work section, say) stops itself. One agent runs one task at a time. Task ids are 1 to 128 letters, digits, `.`, `_`, `-`, `/`, `:` or `#`, start with a letter or digit, and have no `.` or `..` segment.
 - **Locks.** `agents.locks` are lock files every run takes before it starts (`hold: launch`, released once the agent runs) or for as long as the agent runs (`hold: run`, owned by the agent's process). Lair writes `pid=<pid>`, `started=<ISO time>` and `owner=<who>` and creates the file exclusively. A lock whose holder is dead (not running, or its pid now belongs to a process that started later) is broken: at once when a run waits on it, and on the second check in a row that finds it dead when none does (an external launcher's lock, say). A holder is only judged dead on a process reading taken after its lock was read. Every break is logged as a `lock_broken` event with the holder, and counted. Legacy locks are read too: a file holding only a pid, or a directory with a `<pid_file>` (as the watchdog's locks), is broken when that pid is dead; one with no pid at all is broken once it is `stale_minutes` old, and only when a run waits on it, unless the lock sets `break_without_waiter: true`. A lock directory is removed only when it holds nothing but its pid file (nothing is deleted recursively); one with other files is left in place. A run that waits on a lock shows the lock, its holder pid and whether it is alive, and, for a lock with no pid, when it will be broken.

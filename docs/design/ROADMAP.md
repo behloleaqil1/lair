@@ -28,6 +28,7 @@ any machines.
 | No false holds | configuration.md "Fill", "Agents" | `src/server/agents/` | A wait on a gate still queued is not "too long"; transient provider errors are waited out, with a retry cap and failover first |
 | AI roles, part 1 (A6-1) | [ai-roles.md](ai-roles.md) | `src/server/ai/` | Profiles (tool + model) and roles per job; dragons, failover, reviewer pools and the planner agent on them; model lists and sign-in checks per machine; a signed-out tool starts nothing |
 | Supervisor, part 1 (S1-1) | [supervisor.md](supervisor.md) | `src/server/supervisor/`, `src/cli/ops-mcp.ts` | Deterministic self-checks of Lair and each project on Home → Health and `GET /api/health/diagnostics`; a check that keeps failing is one notice; the read-only ops API for an AI supervisor (MCP over stdio), on scoped in-memory tokens, every call audited |
+| Supervisor, part 2 (S1-2) | [supervisor.md](supervisor.md) | `src/server/supervisor/chat.ts`, `src/cli/ops-call.ts`, `src/cli/supervisor-answer.ts` | Ask Lair: a question from the dashboard is one supervisor run (on `ai.roles.supervise`) that reads Lair through the ops API and answers once with cited evidence, shown sanitised in a chat panel; bounded runs, "no answer" with the reason; the daily digest on Home. Off by default |
 
 ## Next, in order
 
@@ -57,7 +58,7 @@ Each step lists what must exist first. One module per pull request, each with it
 | # | Step | Spec | Needs first | Acceptance (summary) |
 |---|---|---|---|---|
 | A2 | **Reliability**: dashboard probes off the request path (async, cached); retention for results and logs in watched folders | [#38](https://github.com/behloleaqil1/lair/issues/38) | — | No synchronous command on a request; a 30-minute provider outage escalates nothing; a watched folder past its retention limit is archived |
-| A3 | **Supervisor S1–S2**: self-checks, the ops API, answers, the daily digest, proposals as decisions (S1-1, the self-checks and the read-only ops API, is built; S1-2, the supervisor's runs, answers and digest, is next) | [supervisor.md](supervisor.md) | A2 | See supervisor.md |
+| A3 | **Supervisor S1–S2**: self-checks, the ops API, answers, the daily digest, proposals as decisions (S1-1, the self-checks and the read-only ops API, and S1-2, the supervisor's runs, answers and digest, are built; S1-3, the hourly review and diagnoses, is next) | [supervisor.md](supervisor.md) | A2 | See supervisor.md |
 | A6 | **AI roles**: any tool, any model, per role (build, review per tier, plan, supervise); sign-in status per machine; a write-only key store for API-key tools; reviewer calibration | [ai-roles.md](ai-roles.md) | — | See ai-roles.md |
 | A7 | **Look and feel, then Settings v2**: design tokens, light/dark, a component kit for every view (T1); Settings by task, with plain language, levels, search, templates and test buttons (S2-1 to S2-3) | [settings-v2.md](settings-v2.md) | T1 first; S2-1 needs A6 | See settings-v2.md |
 | A4 | **Supervisor S3**: an allowlist of acting fixes | [supervisor.md](supervisor.md) | A3 | See supervisor.md |

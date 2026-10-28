@@ -1,16 +1,19 @@
 # Supervisor: Lair's operator
 
-> Status: part built (S1-1, below). Phases S1–S4 below. Roadmap: [ROADMAP.md](ROADMAP.md). The supervisor runs on whatever AI tool and model `ai.roles.supervise` names ([ai-roles.md](ai-roles.md)). Reference: [configuration.md](../configuration.md#supervisor-self-checks-and-the-ops-api).
+> Status: part built (S1-1 and S1-2, below). Phases S1–S4 below. Roadmap: [ROADMAP.md](ROADMAP.md). The supervisor runs on whatever AI tool and model `ai.roles.supervise` names ([ai-roles.md](ai-roles.md)). Reference: [configuration.md](../configuration.md#supervisor-self-checks-and-the-ops-api) and [Supervisor chat and digest](../configuration.md#supervisor-chat-and-digest).
 
 ## What is built, and what remains
 
 | Part | What | State |
 |---|---|---|
 | **S1-1** | The self-checks below, deterministic and in code, on a schedule off the request path, each with its own timeout (`supervisor.checks`, thresholds per check); `GET /api/health/diagnostics` (owner only) and Home → Health; a check failing for `notice_minutes` raises one notice, withdrawn when it recovers; the ops API's read tools over `POST /api/ops/call`, served to MCP tools by `lair ops-mcp` (stdio), on scoped tokens kept in memory (a run's, bound to its project and ended with the run; or the owner's, for an hour), every call audited in `data/supervisor.db`, answers redacted and bounded | built (`src/server/supervisor/`, `src/cli/ops-mcp.ts`) |
-| **S1-2** | Supervisor runs through `ai.roles.supervise` (a run token in the run's environment): the Ask box and Owner messages answered with cited evidence, the hourly review and the daily digest, diagnoses of failing checks | next |
+| **S1-2** | Supervisor runs through the agents module, on `supervisor.agent` or the dragon on `ai.roles.supervise`'s first profile, with a run token, `LAIR_URL` and the conversation in the run's environment only: the Ask tab and Home's "Ask Lair" card start a conversation (`POST /api/supervisor/ask`, owner only), each question one run whose prompt is `prompts/supervisor.md` (or `supervisor.prompt_file`) plus the context Lair builds (self-checks, open decisions, the conversation so far, bounded); the run reads Lair with `lair ops call` (or `lair ops-mcp`) and answers once with `lair supervisor answer`, only while it is active; answers and their evidence cleaned (no HTML, links only to the dashboard and the repository's host) and shown in a chat panel; `supervisor.chat` bounds (runs per day, interval, questions per conversation, answer timeout), "no answer" with the reason and no hot retry; the daily digest (`supervisor.digest`), on Home with one notice when notifications are on; conversations in `data/supervisor.db` (schema 2) | built (`src/server/supervisor/chat.ts`, `src/cli/ops-call.ts`, `src/cli/supervisor-answer.ts`, `src/client/components/SupervisorChat.tsx`) |
+| **S1-3** | The hourly review; diagnoses of failing checks and repeated failure classes; Owner messages answered by the supervisor | next |
 | **S2** | `proposals.submit` and proposals as decisions | to do |
 | **S3** | `supervisor.act`: the allowlist of acting fixes | to do |
 | **S4** | Repair of Lair's own defects | to do |
+
+Not in S1-2: a supervisor run that fails over or is recovered into a new run ends its question (its token was the first run's, and a chain's run variables are fixed when it is requested), so a question is never answered by a second attempt; ACP streaming of the run's progress into the chat (the panel polls the conversation while it waits).
 
 Not in S1-1: the ops API is served over stdio only (`lair ops-mcp` talks to Lair's HTTP route; an MCP endpoint that Lair serves itself over local HTTP can come when a tool needs it), and the retention check measures each watched folder's entries against the check's own limit, since retention itself (roadmap A2) isn't built yet.
 
