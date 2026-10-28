@@ -706,7 +706,7 @@ describe("verifier acceptance tests", () => {
 
     // Should count all 3 runs (the verifier state doesn't filter the runs count,
     // the service uses this to decide whether to start verifiers)
-    expect(runsToday).toBe(3);
+    expect(runsToday.length).toBe(3);
 
     // Insert an old run (more than 24 hours ago)
     store.insertRun({
@@ -731,7 +731,7 @@ describe("verifier acceptance tests", () => {
     });
 
     // Old run shouldn't be counted
-    expect(store.runStartsSince(project, dayAgo)).toBe(3);
+    expect(store.runStartsSince(project, dayAgo).length).toBe(3);
 
     store.close();
   });
