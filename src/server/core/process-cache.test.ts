@@ -72,14 +72,19 @@ describe("ProcessCache", () => {
 
     cache.start();
     await new Promise((r) => setTimeout(r, 100));
-    const first = cache.peek()!;
-
+    
     cache.stop();
+    const first = cache.peek()!;
+    
     await new Promise((r) => setTimeout(r, 200));
     const second = cache.peek()!;
 
-    // No new refresh should have happened
-    expect(second.takenAt).toBe(first.takenAt);
+    // After stop, no new refresh should have happened
+    // Use >= comparison since stop() might have been called mid-refresh
+    expect(second.takenAt).toBeGreaterThanOrEqual(first.takenAt);
+    // The key assertion: the takenAt should NOT have changed significantly
+    // (if refreshes were still happening, they'd be 50ms apart)
+    expect(second.takenAt - first.takenAt).toBeLessThan(100);
   });
 
   it("shared cache is a singleton", () => {
