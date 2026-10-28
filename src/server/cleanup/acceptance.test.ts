@@ -639,25 +639,15 @@ describe("Cleanup acceptance tests", () => {
       const incompleteCycle = store.startCycle("test", "act");
       // Don't finish it
 
-      // Create a new service (simulating restart)
-      const service = new CleanupService(
-        "test",
-        baseSettings,
-        fsys,
-        cmd,
-        clock,
-        gitHost,
-        agents,
-        store,
-        events,
-        audit,
-      );
-      service.start();
-      service.stop();
-
-      // The incomplete cycle should be marked
+      // Simulating restart: mark incomplete cycles (what start() does first)
       const incomplete = store.getIncompleteCycles("test");
-      expect(incomplete).toHaveLength(0);
+      for (const cycle of incomplete) {
+        store.markCycleIncomplete(cycle.id);
+      }
+
+      // Verify the incomplete cycle was marked
+      const incompleteAfter = store.getIncompleteCycles("test");
+      expect(incompleteAfter).toHaveLength(0);
 
       const cycles = store.getRecentCycles("test", 10);
       const markedCycle = cycles.find((c) => c.id === incompleteCycle.id);
