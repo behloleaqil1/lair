@@ -36,11 +36,15 @@ export interface DiskSpace {
 export interface OsMeasures {
   /** The event loop's delay since the last call (then the histogram starts over); null when it can't be measured */
   eventLoopDelay(): LoopDelay | null;
+  /** Forget the delays measured so far (the server's own start-up, say) */
+  resetEventLoopDelay?(): void;
   openFiles(): Promise<OpenFiles | null>;
   /** The free and total space of the filesystem that holds `path` */
   diskSpace(path: string): Promise<DiskSpace | null>;
 }
 
+/** How often the event loop is sampled (ms): Node's histogram records each whole interval, so this is taken off */
+const LOOP_RESOLUTION_MS = 20;
 const LIMIT_CACHE_MS = 10 * 60_000;
 const LSOF_TIMEOUT_MS = 5000;
 const LSOF_MAX_BYTES = 8 * 1024 * 1024;
@@ -94,7 +98,7 @@ export class SystemMeasures implements OsMeasures {
     private readonly platform: NodeJS.Platform = process.platform,
   ) {
     try {
-      this.histogram = monitorEventLoopDelay({ resolution: 20 });
+      this.histogram = monitorEventLoopDelay({ resolution: LOOP_RESOLUTION_MS });
       this.histogram.enable();
     } catch {
       this.histogram = null;
@@ -104,10 +108,15 @@ export class SystemMeasures implements OsMeasures {
   eventLoopDelay(): LoopDelay | null {
     const h = this.histogram;
     if (!h) return null;
-    const ns = 1e6;
-    const delay = { p99Ms: h.percentile(99) / ns, maxMs: h.max / ns, meanMs: Number.isFinite(h.mean) ? h.mean / ns : 0 };
+    // Nanoseconds of a whole sampling interval: the delay is what goes past the interval
+    const late = (ns: number) => (Number.isFinite(ns) ? Math.max(0, ns / 1e6 - LOOP_RESOLUTION_MS) : 0);
+    const delay = h.count === 0 ? { p99Ms: 0, maxMs: 0, meanMs: 0 } : { p99Ms: late(h.percentile(99)), maxMs: late(h.max), meanMs: late(h.mean) };
     h.reset();
     return delay;
+  }
+
+  resetEventLoopDelay(): void {
+    this.histogram?.reset();
   }
 
   async openFiles(): Promise<OpenFiles | null> {

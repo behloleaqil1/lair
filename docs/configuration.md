@@ -857,7 +857,7 @@ Lair checks itself, in code, every `interval_seconds` (60 s by default), off the
 
 | Check | Of | What it measures | Warning / failing (defaults) |
 |-------|----|------------------|------------------------------|
-| `event_loop_lag` | Lair | The event loop's delay since the last round (p99) | 200 ms / 1000 ms |
+| `event_loop_lag` | Lair | How late the event loop was since the last round (p99; sampled every 20 ms, from the start of the schedule, so the server's own start-up doesn't count) | 200 ms / 1000 ms |
 | `request_latency` | Lair | The p95 duration of the requests answered in the last `window_minutes` (5), and the slowest route; fewer than `min_requests` (20) are too few to judge. The bus's event stream is left out | 1000 ms / 5000 ms |
 | `open_files` | Lair | This process's open files against its soft limit: `/proc/self/fd` and `/proc/self/limits` on Linux, `/dev/fd` and Node's process report on macOS (the limit is cached for 10 minutes), else `lsof -p` with a 5 s timeout. Without a known limit it is `unknown` | 70% / 90% |
 | `disk_free` | Lair | The free space of the disk that holds `data/` | 10% or 5 GiB / 5% or 1 GiB |

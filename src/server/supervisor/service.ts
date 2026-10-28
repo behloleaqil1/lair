@@ -172,6 +172,8 @@ export class Supervisor {
   start(): string[] {
     if (this.phase !== "loaded") return [];
     this.phase = "started";
+    // The server's own start-up blocked the event loop: that is not lag to report
+    this.options.measures.resetEventLoopDelay?.();
     const first = this.clock.now() + FIRST_ROUND_MS;
     for (const { scope } of this.scopes()) this.nextAt.set(scope, first);
     this.timer = setInterval(() => this.tick(), TICK_MS);
