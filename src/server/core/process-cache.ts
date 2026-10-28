@@ -11,8 +11,8 @@
  */
 import { execFile } from "child_process";
 import type { ProcessInfo } from "../watchdog/probes.js";
-import { parsePsOutput, PS_ARGV, PS_LINE_MAX } from "../watchdog/probes.js";
-import { AsyncCache, type CacheEntry } from "./async-cache.js";
+import { parsePsOutput, PS_ARGV } from "../watchdog/probes.js";
+import { AsyncCache } from "./async-cache.js";
 
 export interface ProcessSnapshotEntry {
   /** The process list */
@@ -58,8 +58,6 @@ async function runPs(timeoutMs: number, maxBytes: number): Promise<ProcessInfo[]
       return;
     }
 
-    const chunks: Buffer[] = [];
-    let totalBytes = 0;
     let timedOut = false;
 
     const child = execFile(
@@ -69,7 +67,6 @@ async function runPs(timeoutMs: number, maxBytes: number): Promise<ProcessInfo[]
         timeout: timeoutMs,
         maxBuffer: maxBytes,
         encoding: "buffer",
-        shell: false,
       },
       (error, stdout) => {
         // If the child exited with output but the timer fired after, treat

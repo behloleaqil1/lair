@@ -10,7 +10,7 @@
  * execFileSync."
  */
 import { describe, expect, it } from "vitest";
-import { readFileSync, readdirSync, statSync } from "fs";
+import { readFileSync, statSync } from "fs";
 import { join, resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 

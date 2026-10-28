@@ -16,7 +16,7 @@
  * 5. The single-flight refresher never runs two refreshes at once; a slow
  *    refresh doesn't pile up.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { AsyncCache } from "./core/async-cache.js";
 import { ProcessCache } from "./core/process-cache.js";
 
@@ -24,17 +24,6 @@ import { ProcessCache } from "./core/process-cache.js";
 
 const NOW = Date.parse("2026-03-02T12:00:00.000Z");
 const SEC = 1000;
-const MIN = 60 * SEC;
-
-class FakeClock {
-  t = NOW;
-  now(): number {
-    return this.t;
-  }
-  advance(ms: number): void {
-    this.t += ms;
-  }
-}
 
 describe("AsyncCache single-flight", () => {
   it("acceptance 5: single-flight refresher never runs two at once", async () => {
@@ -67,7 +56,7 @@ describe("AsyncCache single-flight", () => {
   it("acceptance 5: slow refresh doesn't pile up", async () => {
     let now = 0;
     let refreshCount = 0;
-    let resolvers: (() => void)[] = [];
+    const resolvers: (() => void)[] = [];
 
     const cache = new AsyncCache({
       refresh: async () => {
@@ -158,35 +147,6 @@ describe("ProcessCache stale handling", () => {
     // Repopulate first
     shouldFail = false;
     await cache.get();
-    
-    // Now make future refreshes fail but don't clear
-    shouldFail = true;
-    // Force cache to be stale by mocking time
-    const cacheWithClock = new AsyncCache({
-      refresh: async () => {
-        if (shouldFail) throw new Error("ps failed");
-        return [{ pid: 1, command: "init" }];
-      },
-      maxAgeMs: 100,
-      clock: () => 0,
-    });
-    
-    // Get initial value
-    shouldFail = false;
-    await cacheWithClock.get();
-    
-    // Make stale by advancing clock
-    shouldFail = true;
-    const cacheWithAdvancedClock = new AsyncCache({
-      refresh: async () => {
-        throw new Error("ps failed");
-      },
-      maxAgeMs: 100,
-      clock: () => 200,
-    });
-    
-    // Pre-populate via peek (cheat: set internal state)
-    // Actually, let's test this properly with a single cache
   });
 
   it("acceptance 2: stale value returned on refresh failure", async () => {
@@ -221,12 +181,9 @@ describe("ProcessCache stale handling", () => {
 
 describe("dashboard response time with slow process lister", () => {
   it("acceptance 1: cached data answers within 200ms even with 10s refresh", async () => {
-    let refreshTime = 0;
     const cache = new AsyncCache({
       refresh: async () => {
-        const start = Date.now();
         await new Promise((r) => setTimeout(r, 100)); // Simulate slow refresh
-        refreshTime = Date.now() - start;
         return { data: "cached" };
       },
       maxAgeMs: 60_000,

@@ -11,8 +11,6 @@
  * Part of reliability A2: dashboard probes off the request path.
  */
 import { execFile } from "child_process";
-import { readFile, readdir, stat as fsStat } from "fs/promises";
-import { join } from "path";
 import { AsyncCache, type CacheEntry } from "../core/async-cache.js";
 import type { ProjectConfig, PullRequest, MergedPR } from "../../shared/types.js";
 
@@ -81,28 +79,6 @@ async function execAsync(
       },
     );
   });
-}
-
-/**
- * Safe async file read.
- */
-async function safeReadFileAsync(path: string): Promise<string | null> {
-  try {
-    return await readFile(path, "utf-8");
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Safe async directory list.
- */
-async function safeListDirAsync(path: string): Promise<string[]> {
-  try {
-    return await readdir(path);
-  } catch {
-    return [];
-  }
 }
 
 interface GitInfo {
