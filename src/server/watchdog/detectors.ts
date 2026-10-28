@@ -195,12 +195,31 @@ const orphanClaim: Detector = {
       }
       if ((await view.agentProcesses(claim.agent)).length > 0) continue; // live agent: never touched
 
-      // Check the claim file's recorded pid: if it is alive, the agent is running
-      // (even if it doesn't match watchdog.agent_command, e.g. started with a different path)
+      // Check the claim file's recorded pid: if it is alive AND belongs to this agent, skip it.
+      // A live pid alone is not enough: after the agent dies, the OS can reuse that pid for
+      // an unrelated process, so we verify the process matches the agent.
       const claimPid = view.claimPid(claim);
-      if (claimPid !== null && (await view.isAlive(claimPid.pid))) {
-        livePid.push(`${claim.agent} (pid ${claimPid.pid})`);
-        continue;
+      if (claimPid !== null) {
+        const proc = await view.getProcess(claimPid.pid);
+        if (proc !== null) {
+          // The pid is alive. Check if it belongs to this agent:
+          // 1. If the claim has a start time, the process uptime should roughly match
+          //    (the process should have been running since approximately that time)
+          // 2. Or, the process command contains the agent id
+          const expectedUptimeMs = claimPid.startedAt !== null ? view.now - claimPid.startedAt : null;
+          const actualUptimeMs = proc.elapsedSeconds * 1000;
+          // Allow 10% tolerance plus 60 seconds for timing differences
+          const toleranceMs = expectedUptimeMs !== null ? Math.max(60000, expectedUptimeMs * 0.1) : 0;
+          const startMatch =
+            expectedUptimeMs !== null &&
+            Math.abs(actualUptimeMs - expectedUptimeMs) <= toleranceMs;
+          const commandMatch = proc.command.includes(claim.agent);
+          if (startMatch || commandMatch) {
+            livePid.push(`${claim.agent} (pid ${claimPid.pid})`);
+            continue;
+          }
+          // The pid is alive but doesn't match the agent: it's a reused pid, treat as orphan
+        }
       }
 
       const age = view.minutesSince(claim.mtimeMs);
@@ -212,7 +231,7 @@ const orphanClaim: Detector = {
         evidence: [
           `claim ${claim.path} is ${minutes(age)} old`,
           `no process matches watchdog.agent_command for ${claim.agent}`,
-          ...(claimPid !== null ? [`claim's recorded pid ${claimPid.pid} is not running`] : []),
+          ...(claimPid !== null ? [`claim's recorded pid ${claimPid.pid} is not running or doesn't match the agent`] : []),
         ],
         vars: { agent: claim.agent, claim: claim.path },
       });

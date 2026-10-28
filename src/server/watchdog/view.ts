@@ -139,6 +139,11 @@ export class ProjectView {
     return (await this.processByPid()).has(pid);
   }
 
+  /** Get process info by pid, or null if not running. */
+  async getProcess(pid: number): Promise<ProcessInfo | null> {
+    return (await this.processByPid()).get(pid) ?? null;
+  }
+
   // ============ AGENTS ============
 
   /** Agent ids from the YAML dragons: map and agents_dir/dragons.txt. */

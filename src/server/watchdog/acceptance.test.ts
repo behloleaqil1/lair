@@ -1504,7 +1504,7 @@ describe("Decision Inbox: an escalation is a decision, and its answer drives the
 // ============ 12. ORPHAN CLAIM WITH LIVE PID ============
 
 describe("12. orphan claim: live pid that doesn't match the pattern", () => {
-  it("a claim with a live pid that doesn't match agent_command is not an orphan", async () => {
+  it("a claim with a live pid that matches by command is not an orphan", async () => {
     const h = setup(act("orphan_claim"));
     // Create a claim file with pid recorded
     const claimDir = join(h.agentsDir, "worker-b.running");
@@ -1513,12 +1513,12 @@ describe("12. orphan claim: live pid that doesn't match the pattern", () => {
     // The claim is old enough
     const t = new Date(NOW - 20 * 60 * 1000);
     utimesSync(claimDir, t, t);
-    // The pid is alive but doesn't match the agent_command pattern
+    // The pid is alive and its command contains the agent id (worker-b)
     h.procs.add(4999, "/different/path/to/agent --id worker-b", { upMinutes: 20 });
 
     await h.wd.tick();
 
-    // No breach: the live pid means the agent is running
+    // No breach: the live pid's command contains the agent id
     expect(breaches(h)).toEqual([]);
     expect(h.runner.calls).toEqual([]);
     expect(sloState(h, "orphan_claim")).toBe("ok");
@@ -1542,23 +1542,53 @@ describe("12. orphan claim: live pid that doesn't match the pattern", () => {
     expect(breaches(h)[0]).toMatchObject({ detector: "orphan_claim" });
   });
 
-  it("a claim's recorded pid being alive (even without matching the pattern) clears the breach", async () => {
+  it("a claim's recorded pid matching by command clears the breach", async () => {
     const h = setup(act("orphan_claim"));
-    // Create claim with pid=4999, WITH a live process that doesn't match the pattern
+    // Create claim with pid=4999, WITH a live process whose command contains the agent id
     const claimDir = join(h.agentsDir, "worker-b.running");
     mkdirSync(claimDir, { recursive: true });
     writeFileSync(join(claimDir, "pid"), "pid=4999\nstarted=2026-03-02T11:00:00.000Z\n");
     const t = new Date(NOW - 20 * 60 * 1000);
     utimesSync(claimDir, t, t);
 
-    // The process is running with a different path (doesn't match agent_command pattern)
+    // The process is running with the agent id in the command
     h.procs.add(4999, "/different/path/to/agent --id worker-b", { upMinutes: 1 });
 
-    // Tick: detection should NOT find this claim as orphaned (pid 4999 is alive)
+    // Tick: detection should NOT find this claim as orphaned (pid 4999 matches by command)
     await h.wd.tick();
 
-    // No breach should be created because the detector sees pid 4999 is alive
+    // No breach should be created because the process command contains worker-b
     expect(breaches(h)).toHaveLength(0);
     expect(h.runner.calls).toEqual([]); // release_claim never ran
+  });
+
+  it("a claim with a live pid that belongs to a different process is an orphan (pid reuse)", async () => {
+    const h = setup(act("orphan_claim"));
+    // Create claim with pid=4999 for worker-b
+    const claimDir = join(h.agentsDir, "worker-b.running");
+    mkdirSync(claimDir, { recursive: true });
+    // The claim says pid 4999, started at 11:00:00
+    writeFileSync(join(claimDir, "pid"), "pid=4999\nstarted=2026-03-02T11:00:00.000Z\n");
+    const t = new Date(NOW - 20 * 60 * 1000);
+    utimesSync(claimDir, t, t);
+
+    // Pid 4999 IS alive, but it's a DIFFERENT process (no worker-b in command, wrong uptime)
+    // The process started 5 minutes ago, but the claim's started time is older
+    h.procs.add(4999, "/usr/bin/some-unrelated-process", { upMinutes: 5 });
+
+    // Set up the release-claim playbook to remove the claim
+    h.runner.when((a) => a[0] === "./bin/release-claim", {
+      effect: (a) => rmSync(a[2], { recursive: true, force: true }),
+    });
+
+    await h.wd.tick();
+
+    // This should be detected as an orphan because:
+    // - The pid 4999 is alive BUT
+    // - The command doesn't contain "worker-b"
+    // - The process uptime (5 min) doesn't match the claim's start time (would be 20 min old)
+    expect(breaches(h)).toHaveLength(1);
+    expect(breaches(h)[0]).toMatchObject({ detector: "orphan_claim" });
+    expect(h.runner.calls).toEqual([["./bin/release-claim", "worker-b", claimDir]]);
   });
 });
