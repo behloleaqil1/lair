@@ -22,6 +22,7 @@
 | [phase3-bus.md](phase3-bus.md) | Phase 3: Fleet bus (MCP server) | Built: `src/bus/` is a stdio MCP server (`whoami`, `claim`, `release`, `report`, `inbox`, `ack`, `send`, `board`) with per-project SQLite storage (sql.js) and text-file mirroring; `src/server/routes/bus.ts` serves the board, an SSE live feed and owner messages |
 | [phase4-fleet.md](phase4-fleet.md) | Phase 4: SSH machines, distributed gates, agent management | Partly built: SSH machines, gate distribution, agent adapters (only `kiro` is tested), budgets and self-healing; the manager chat view is not built |
 | [phase5-deploy.md](phase5-deploy.md) | Phase 5: Deployment, GitHub integration, kickstart | Planned, not built |
+| [sandbox.md](sandbox.md) | Agent sandboxing: threat model, isolation options, per-agent OS users, scoped credentials, migration | Planned; design for ROADMAP.md B4 |
 
 ## Principles
 
