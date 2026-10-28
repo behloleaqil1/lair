@@ -4029,7 +4029,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     const reopened = new Database(paths.dbPath);
     try {
       expect(reopened.pragma("user_version", { simple: true })).toBe(SCHEMA_VERSION);
-      expect(SCHEMA_VERSION).toBe(2);
+      expect(SCHEMA_VERSION).toBe(3);
       expect(reopened.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_agents_runs_task'").get()).toEqual({
         name: "idx_agents_runs_task",
       });
@@ -4320,8 +4320,7 @@ describe("10. hung run info: the next run knows what the previous hung on", () =
 
     h.clock.advance(46 * MIN);
     await at(h, 0); // hung: SIGTERM
-    h.spawner.exit(5001, null); // killed
-    await at(h, 0); // finishStop -> recover
+    await at(h, 0); // gone: recover
 
     // Wait for the backoff and next attempt
     h.clock.advance(20 * SEC);
@@ -4349,14 +4348,14 @@ describe("10. hung run info: the next run knows what the previous hung on", () =
     await at(h, 0);
 
     h.clock.advance(46 * MIN);
-    await at(h, 0);
-    h.spawner.exit(5001, null);
-    await at(h, 0);
+    await at(h, 0); // hung: SIGTERM
+    await at(h, 0); // gone: recover
 
     h.clock.advance(20 * SEC);
     h.spawner.behaviour = undefined;
     await at(h, 0);
 
+    expect(h.spawner.calls).toHaveLength(2);
     const prompt2 = promptOf(h.spawner.calls[1]);
     // ANSI codes should be removed
     expect(prompt2).not.toContain("\x1b[");
@@ -4376,9 +4375,8 @@ describe("10. hung run info: the next run knows what the previous hung on", () =
 
     // First run hangs
     h.clock.advance(46 * MIN);
-    await at(h, 0);
-    h.spawner.exit(5001, null);
-    await at(h, 0);
+    await at(h, 0); // hung: SIGTERM
+    await at(h, 0); // gone: recover
 
     // Second run completes normally
     h.clock.advance(20 * SEC);
