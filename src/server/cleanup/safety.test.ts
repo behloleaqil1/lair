@@ -203,16 +203,18 @@ describe("isGitRepoRoot", () => {
     fsys = createFakeFs();
   });
 
-  it("returns true for directory with .git dir", async () => {
+  it("returns true for directory with .git dir (main repo)", async () => {
     fsys.files.set("/repo", { isDir: true, isSymlink: false, mtimeMs: 0 });
     fsys.files.set("/repo/.git", { isDir: true, isSymlink: false, mtimeMs: 0 });
     expect(await isGitRepoRoot(fsys, "/repo")).toBe(true);
   });
 
-  it("returns true for worktree with .git file", async () => {
+  it("returns false for worktree with .git file (linked worktree)", async () => {
+    // Linked worktrees have a .git FILE that points to the main repo's gitdir
+    // These are safe to remove, so isGitRepoRoot returns false
     fsys.files.set("/worktree", { isDir: true, isSymlink: false, mtimeMs: 0 });
     fsys.files.set("/worktree/.git", { isDir: false, isSymlink: false, mtimeMs: 0 });
-    expect(await isGitRepoRoot(fsys, "/worktree")).toBe(true);
+    expect(await isGitRepoRoot(fsys, "/worktree")).toBe(false);
   });
 
   it("returns false for directory without .git", async () => {
