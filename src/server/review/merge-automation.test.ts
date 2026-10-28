@@ -892,7 +892,7 @@ describe("raiseAutoMergeFailure recommendation", () => {
     expect(decisions[0].context).toContain("Merge it from its page in PRs once the cause is fixed");
   });
 
-  it("recommends 'Merge it from the PR's page' when check_cmd times out: the check didn't refuse, it just didn't finish", async () => {
+  it("recommends 'Leave it unmerged' when check_cmd times out: the check didn't finish, and might refuse with more time", async () => {
     const { service, remote, base, head, scan, spawner, decisions } = boot(repo(), {
       auto: true,
       check_cmd: ["/opt/checks/slow-check"],
@@ -904,8 +904,7 @@ describe("raiseAutoMergeFailure recommendation", () => {
     await scan();
     expect(remote.branches.get("main")).toBe(base);
     expect(decisions).toHaveLength(1);
-    // A timeout is still a "check" refusal, so it recommends leaving unmerged
-    // because the check might refuse it on a longer timeout
+    // A timeout is still a "check" refusal: the check might refuse it on a longer timeout
     expect(decisions[0]).toMatchObject({
       recommended: "Leave it unmerged",
     });
