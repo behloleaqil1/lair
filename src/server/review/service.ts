@@ -633,6 +633,7 @@ export class ReviewService {
       hostUser: pr.user,
       canMerge: policy.allowed && !plan.refusal && !this.readOnly,
       reasons,
+      autoMergeStatus: this.autoMergeStatusFor(risk.tier),
       plan,
       readOnly: this.readOnly,
       evaluatedAt: this.now(),
@@ -1074,6 +1075,8 @@ export class ReviewService {
       evaluated++;
       const { status, defaultBranchRed, redSlots } = await this.evaluate(pr.number);
       if (!status.canMerge || status.headSha !== pr.headSha) continue;
+      // Check if this tier is in auto_tiers (null means all tiers allowed)
+      if (!this.isAutoMergeTier(status.risk.tier)) continue;
       if (this.autoMergeHeld(defaultBranchRed, redSlots)) continue;
       // At most one per scan
       return this.attemptAutoMerge(status);
@@ -1093,6 +1096,26 @@ export class ReviewService {
     const missing = redSlots.filter((s) => s.satisfiedBy === null);
     if (missing.length === 0) return null;
     return `the default branch is red: the red tier's reviews are missing (${missing.map((s) => s.label).join("; ")})`;
+  }
+
+  /**
+   * Whether a tier is in auto_tiers (null means all tiers allowed, the default).
+   * When auto_tiers is set, only listed tiers merge automatically.
+   */
+  private isAutoMergeTier(tier: Tier): boolean {
+    const autoTiers = this.settings.merge.autoTiers;
+    return autoTiers === null || autoTiers.includes(tier);
+  }
+
+  /**
+   * The auto-merge status for a PR of the given tier:
+   * - "auto": merge.auto is on and the tier would auto-merge
+   * - "manual": merge.auto is on but the tier is not in auto_tiers
+   * - null: merge.auto is off
+   */
+  private autoMergeStatusFor(tier: Tier): "auto" | "manual" | null {
+    if (!this.settings.merge.auto) return null;
+    return this.isAutoMergeTier(tier) ? "auto" : "manual";
   }
 
   private async attemptAutoMerge(status: PrReviewStatus): Promise<AutoMergeOutcome> {

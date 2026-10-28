@@ -240,6 +240,13 @@ export interface PrReviewStatus {
   canMerge: boolean;
   /** One line per failed condition */
   reasons: string[];
+  /**
+   * Whether this PR would auto-merge from the periodic scan:
+   * - "auto": auto-merge enabled and tier is in auto_tiers (or auto_tiers absent)
+   * - "manual": auto-merge enabled but tier is not in auto_tiers
+   * - null: auto-merge not enabled (merge.auto: false)
+   */
+  autoMergeStatus: "auto" | "manual" | null;
   plan: MergePlan;
   readOnly: boolean;
   evaluatedAt: string;
