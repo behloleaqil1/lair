@@ -541,24 +541,28 @@ describe("verifier acceptance tests", () => {
     });
 
     // The verifier process is "still running" in the new harness - simulate completion
-    // Write the verdicts file manually (the process was spawned before restart)
-    const runDir = run.dir;
-    const { mkdirSync: mkdirSyncFs, writeFileSync: writeFileSyncFs } = await import("fs");
-    const verifyDir = join(runDir, "verify");
-    mkdirSyncFs(verifyDir, { recursive: true });
-    writeFileSyncFs(join(verifyDir, "verdicts.json"), JSON.stringify({
+    // The verdicts file path is in the verifier's prompt file, extract it from there
+    const promptFile = verifierCall.argv[verifierCall.argv.indexOf("--prompt") + 1];
+    const promptContent = readFileSync(promptFile, "utf-8");
+    const verdictsMatch = /Write your verdicts as JSON to this file, and nothing else: (\S+)/.exec(promptContent);
+    expect(verdictsMatch).not.toBeNull();
+    const verdictsPath = verdictsMatch![1];
+
+    // Ensure the directory exists and write verdicts
+    const { mkdirSync: mkdirSyncFs } = await import("fs");
+    const verdictsDir = join(verdictsPath, "..");
+    mkdirSyncFs(verdictsDir, { recursive: true });
+    writeFileSync(verdictsPath, JSON.stringify({
       verdicts: [{ proposal: 0, verdict: "approve", reason: "ready" }],
     }));
 
     // Complete the verifier run by exiting it and letting the agents service see it
-    // The new harness's spawner doesn't know about the old process, so we need to
-    // simulate the agents store seeing the run as completed
     h2.clock.t += 2 * MIN;
     const { appendFileSync, utimesSync } = await import("fs");
     appendFileSync(verifierCall.logPath, "verified\n");
     const t = new Date(h2.clock.now());
     utimesSync(verifierCall.logPath, t, t);
-    // Exit via h's spawner (it knows the pid) and then transfer state
+    // Exit via h's spawner (it knows the pid)
     h.spawner.exit(verifierCall.pid, 0);
     // The new harness needs to see the process ended - tick agents
     await h2.agentsService.tick();
