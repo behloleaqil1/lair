@@ -236,12 +236,19 @@ export function isInsidePath(childPath: string, parentPath: string): boolean {
 
 /**
  * Check if removing a path would be removing a git repository root.
- * A git repo root has a .git directory (main worktree) or .git file (linked worktree).
+ * A git repo root has a .git DIRECTORY (the main worktree).
+ * Linked worktrees have a .git FILE that points to the main repo's gitdir,
+ * and those are safe to remove.
  */
 export async function isGitRepoRoot(fsys: FileSystem, targetPath: string): Promise<boolean> {
   try {
     const gitPath = path.join(targetPath, ".git");
-    return await fsys.exists(gitPath);
+    const exists = await fsys.exists(gitPath);
+    if (!exists) return false;
+
+    // Check if it's a directory (main repo) or file (linked worktree)
+    const stat = await fsys.lstat(gitPath);
+    return stat.isDirectory;
   } catch {
     return false;
   }
