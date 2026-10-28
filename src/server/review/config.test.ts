@@ -159,3 +159,45 @@ describe("branch templates", () => {
     expect(compileBranchTemplate("{agent}-{agent}")).toBe("needs {agent} exactly once");
   });
 });
+
+describe("auto_tiers", () => {
+  it("accepts a list of tiers and defaults to null (all tiers)", () => {
+    const all = parseReviewConfig({ enabled: true, merge: { ...gate, auto: true } }, project);
+    expect(all.ok && all.settings.merge.autoTiers).toBeNull();
+
+    const amberGreen = parseReviewConfig(
+      { enabled: true, merge: { ...gate, auto: true, auto_tiers: ["amber", "green"] } },
+      project,
+    );
+    expect(amberGreen.ok && amberGreen.settings.merge.autoTiers).toEqual(["amber", "green"]);
+
+    const redOnly = parseReviewConfig(
+      { enabled: true, merge: { ...gate, auto: true, auto_tiers: ["red"] } },
+      project,
+    );
+    expect(redOnly.ok && redOnly.settings.merge.autoTiers).toEqual(["red"]);
+  });
+
+  it("is a config error with an empty array (use auto: false instead)", () => {
+    const empty = parseReviewConfig(
+      { enabled: true, merge: { ...gate, auto: true, auto_tiers: [] } },
+      project,
+    );
+    expect(empty.ok).toBe(false);
+    if (empty.ok) return;
+    expect(empty.errors).toEqual([
+      "review.merge.auto_tiers: an empty array is a config error; use auto: false instead",
+    ]);
+  });
+
+  it("is a config error with an unknown tier name", () => {
+    const unknown = parseReviewConfig(
+      { enabled: true, merge: { ...gate, auto: true, auto_tiers: ["amber", "yellow"] } },
+      project,
+    );
+    expect(unknown.ok).toBe(false);
+    if (unknown.ok) return;
+    expect(unknown.errors[0]).toContain("auto_tiers");
+    expect(unknown.errors[0]).toContain("yellow");
+  });
+});
