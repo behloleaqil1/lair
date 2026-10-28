@@ -74,6 +74,8 @@ export interface AgentRun {
   requestModel?: string;
   /** The module run variables the chain was requested with, by name (their values are only in memory) */
   variableNames?: string[];
+  /** The requesting module's prompt is the whole task: no default_instructions before it (RunRequest.ownPrompt) */
+  ownPrompt?: boolean;
   chainId: string;
   previousRunId?: string;
   attempt: number;

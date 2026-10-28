@@ -26,6 +26,7 @@ import type { DecisionProducer } from "../decisions/types.js";
 import { CHECKS, type CheckDefinition, type CheckSources, type Measured } from "./checks.js";
 import {
   checkDisabled,
+  checksOnlySettings,
   defaultSupervisorSettings,
   parseSupervisorConfig,
   type ChecksSettings,
@@ -94,6 +95,8 @@ export class Supervisor {
   private settings = new Map<string, SupervisorSettings>();
   private problems = new Map<string, string[]>();
   private projectNames: string[] = [];
+  /** project -> how many times its config was loaded */
+  private generations = new Map<string, number>();
   /** scope -> check -> its latest result */
   private results = new Map<string, Map<CheckId, CheckResult>>();
   private lastRun = new Map<string, number>();
@@ -114,7 +117,7 @@ export class Supervisor {
 
   /** What load() would refuse in a project's config ([] when valid). */
   validate(config: ProjectConfig): string[] {
-    const parsed = parseSupervisorConfig(config.supervisor, config);
+    const parsed = parseSupervisorConfig(config.supervisor);
     return parsed.ok ? [] : parsed.errors;
   }
 
@@ -124,24 +127,40 @@ export class Supervisor {
 
   private loadOne(entry: ProjectEntry): void {
     if (!this.projectNames.includes(entry.name)) this.projectNames.push(entry.name);
+    this.generations.set(entry.name, (this.generations.get(entry.name) ?? 0) + 1);
     this.settings.delete(entry.name);
     this.problems.delete(entry.name);
     if (!entry.config) {
       if (entry.error) this.problems.set(entry.name, [entry.error]);
       return;
     }
-    const parsed = parseSupervisorConfig(entry.config.supervisor, entry.config);
+    const parsed = parseSupervisorConfig(entry.config.supervisor);
     if (!parsed.ok) {
       this.problems.set(entry.name, parsed.errors);
-      this.log.warn(`[supervisor] ${entry.name}: its checks don't run: ${parsed.errors.join("; ")}`);
+      // The self-checks don't depend on the rest of the block: they run on a valid checks part, questions and digest off
+      const checksOnly = checksOnlySettings(entry.config.supervisor);
+      if (checksOnly) {
+        this.settings.set(entry.name, checksOnly);
+        this.log.warn(`[supervisor] ${entry.name}: its questions and digest are off: ${parsed.errors.join("; ")}`);
+      } else {
+        this.log.warn(`[supervisor] ${entry.name}: its checks don't run: ${parsed.errors.join("; ")}`);
+      }
       return;
     }
     this.settings.set(entry.name, parsed.settings);
   }
 
-  /** A project's valid supervisor settings (null: not loaded, or its block is invalid). */
+  /**
+   * A project's supervisor settings in effect (null: not loaded, or its checks
+   * part is invalid). With problemsOf() not empty, these are the checks only.
+   */
   settingsOf(project: string): SupervisorSettings | null {
     return this.settings.get(project) ?? null;
+  }
+
+  /** Counts the project's (re)loads: what was read from its config before a higher one is out of date. */
+  generationOf(project: string): number {
+    return this.generations.get(project) ?? 0;
   }
 
   /** Why a project's block is not in effect ([] when it is). */

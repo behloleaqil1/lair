@@ -310,6 +310,8 @@ export class AgentReviewAssigner implements ReviewAssigner {
           task: reviewTaskId(record.pr, record.headSha, record.slot),
           prompt: prompt.prompt,
           variables: this.variables(record.project, token),
+          // The review prompt is the whole task: the builders' default_instructions don't go before it
+          ownPrompt: true,
         });
         record.state = "assigned";
         record.agent = candidate.id;

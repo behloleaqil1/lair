@@ -142,27 +142,21 @@ export interface SupervisorSettings {
   digest: DigestSettings;
 }
 
-/** Supervisor runs are on for the project: questions, or the digest. */
-export function runsEnabled(settings: SupervisorSettings): boolean {
-  return settings.chat.enabled || settings.digest.enabled;
-}
-
 /**
  * The agent supervisor runs start on: supervisor.agent; else the first
  * dragon on a profile of ai.roles.supervise (in the role's order) that fill
  * doesn't start and isn't the planner agent. A reason when there is none.
+ *
+ * This is read when a run is about to start (and for the chat's status),
+ * never as a config error: what it depends on is other modules' blocks
+ * (agents, dragons, ai, planner), and a change there must never keep the
+ * project's file from loading, or its self-checks from running.
  */
-export function supervisorAgent(
-  project: ProjectConfig,
-  settings: Pick<SupervisorSettings, "agent">,
-  options: { runs: boolean } = { runs: true },
-): { agent: string } | { problem: string } {
+export function supervisorAgent(project: ProjectConfig, settings: Pick<SupervisorSettings, "agent">): { agent: string } | { problem: string } {
   const agents = parseAgentsConfig(project.agents, project);
-  if (options.runs) {
-    if (!agents.ok) return { problem: "the agents block has errors (GET /api/agents/status says which)" };
-    if (!agents.settings.enabled) return { problem: "supervisor runs need agents.enabled: true" };
-  }
-  const fill = agents.ok ? agents.settings.fill.agents : [];
+  if (!agents.ok) return { problem: "the agents block has errors (GET /api/agents/status says which)" };
+  if (!agents.settings.enabled) return { problem: "supervisor runs need agents.enabled: true" };
+  const fill = agents.settings.fill.agents;
   const planner = plannerAgentOf(project);
   if (settings.agent) {
     if (!isValidDragonId(settings.agent)) return { problem: `supervisor.agent: ${settings.agent} is not a valid agent id` };
@@ -216,12 +210,13 @@ function orderErrors(c: ChecksSettings): string[] {
 }
 
 /**
- * Parse a project's `supervisor:` block (absent: every default). With the
- * project's config, what the block names is checked against it too: the
- * supervisor agent, the prompt file's name, and, with chat or the digest
- * on, that supervisor runs can start (the agents module on, an agent).
+ * Parse a project's `supervisor:` block (absent: every default). Only the
+ * block itself is checked (its keys, types, ranges, threshold order and the
+ * prompt file's name): whether supervisor runs can start (an agent, the
+ * agents module on) depends on other blocks, so it is no config error but
+ * the chat's `problem` (supervisorAgent(), read when a run would start).
  */
-export function parseSupervisorConfig(raw: unknown, project?: ProjectConfig): ParseResult {
+export function parseSupervisorConfig(raw: unknown): ParseResult {
   const parsed = SupervisorSchema.safeParse(raw ?? {});
   if (!parsed.success) {
     return {
@@ -241,16 +236,20 @@ export function parseSupervisorConfig(raw: unknown, project?: ProjectConfig): Pa
     chat: value.chat,
     digest: value.digest,
   };
-  // A named agent must be one the project has whenever it is set; that runs can start matters once they are on
-  if (project && (settings.agent !== null || runsEnabled(settings))) {
-    const found = supervisorAgent(project, settings, { runs: runsEnabled(settings) });
-    if ("problem" in found) {
-      const key = settings.chat.enabled ? "supervisor.chat.enabled" : "supervisor.digest.enabled";
-      errors.push(found.problem.startsWith("supervisor.") ? found.problem : `${key}: ${found.problem}`);
-    }
-  }
   if (errors.length > 0) return { ok: false, errors };
   return { ok: true, settings };
+}
+
+/**
+ * When the block is invalid elsewhere (a mistake under chat, digest, agent or
+ * prompt_file), the self-checks still run on `supervisor.checks` when that
+ * part is valid, with questions and the digest off. Null when the checks'
+ * own part is invalid.
+ */
+export function checksOnlySettings(raw: unknown): SupervisorSettings | null {
+  const checks = typeof raw === "object" && raw !== null && !Array.isArray(raw) ? (raw as { checks?: unknown }).checks : undefined;
+  const parsed = parseSupervisorConfig(checks === undefined ? {} : { checks });
+  return parsed.ok ? parsed.settings : null;
 }
 
 /** Every default (a project without the block, or one whose block is invalid, for the server's checks). */

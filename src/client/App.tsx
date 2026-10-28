@@ -212,7 +212,12 @@ export function App() {
       )}
 
       {currentProject && chatRequest && (
-        <SupervisorChatPanel project={currentProject} request={chatRequest} onClose={() => setChatRequest(null)} />
+        <SupervisorChatPanel
+          project={currentProject}
+          request={chatRequest}
+          onClose={() => setChatRequest(null)}
+          problem={chatStatus.data?.enabled ? chatStatus.data.problem : null}
+        />
       )}
 
       <nav className="nav" aria-label="Sections">

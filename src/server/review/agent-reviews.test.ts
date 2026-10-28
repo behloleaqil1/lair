@@ -95,6 +95,8 @@ interface BootOptions {
   ai?: Record<string, unknown>;
   /** Dragons beside (or instead of) the default ones */
   dragons?: Record<string, unknown>;
+  /** Other top-level keys of the project config (default_instructions, say) */
+  extra?: Record<string, unknown>;
 }
 
 interface Stack {
@@ -204,6 +206,7 @@ async function boot(options: BootOptions = {}): Promise<Harness> {
     },
     ...(options.ai ? { ai: options.ai } : {}),
     agent_adapters: { "test-cli": ADAPTER },
+    ...options.extra,
     agents: {
       enabled: true,
       interval_seconds: 1,
@@ -552,6 +555,19 @@ describe("lair review submit: the reviewer's review fills the slot", () => {
       expect.objectContaining({ state: "reviewed", agent: "rev-b", detail: "reviewed by rev-b" }),
     ]);
     expect(h.agents.managedRuns("demo").has("rev-b")).toBe(false);
+  });
+
+  it("gives the reviewer its review prompt without the builders' default_instructions", async () => {
+    const h = await boot({ extra: { default_instructions: "STANDING ORDERS: commit your work and open a pull request." } });
+    const call = await assignedRun(h);
+    const prompt = promptOf(call);
+    expect(prompt).not.toContain("STANDING ORDERS");
+    expect(prompt.startsWith(`Review PR 7 of example-org/demo at ${h.head}`)).toBe(true);
+    // A builder's run still starts with them
+    const run = await h.agents.requestRun("demo", { agent: "rev-e", task: "feat-y", prompt: "build it" });
+    await tick(h);
+    const builder = h.spawner.calls.find((c) => c.env.LAIR_RUN_ID === run.id)!;
+    expect(promptOf(builder)).toBe("STANDING ORDERS: commit your work and open a pull request.\n\nbuild it\n");
   });
 
   it("takes a review only while the run it was given to is running", async () => {

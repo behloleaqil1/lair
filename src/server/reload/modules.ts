@@ -138,7 +138,8 @@ export function serverModules(m: ServerModules): ReloadableModule[] {
     modules.push({
       name: "supervisor",
       blocks: ["supervisor"],
-      // Its agent must be one of the project's, not one fill starts nor the planner agent, with the agents module on
+      // Which agent supervisor runs start on comes from these blocks: a change there makes the chat read it again.
+      // It is never a config error (the chat's problem instead), so a change there can't keep the file from loading
       reads: ["agents", "dragons", "ai", "planner"],
       validate: (config) => supervisor.validate(config),
       reload: (entry) => supervisor.reloadProject(entry),

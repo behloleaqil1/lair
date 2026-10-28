@@ -104,11 +104,14 @@ export function SupervisorChatPanel({
   project,
   request,
   onClose,
+  problem = null,
 }: {
   project: string;
   /** What opened it; a new object opens again */
   request: ChatRequest;
   onClose: () => void;
+  /** Why questions can't be answered now (the chat's status), shown above the box */
+  problem?: string | null;
 }) {
   const [conversation, setConversation] = useState<ConversationView | null>(null);
   const [text, setText] = useState("");
@@ -202,6 +205,11 @@ export function SupervisorChatPanel({
         </p>
       )}
       {sending && !conversation && <p style={muted}>Asking…</p>}
+      {problem && (
+        <p className="warning" data-problem="chat">
+          {`Questions can't be answered now: ${problem}`}
+        </p>
+      )}
       {error && (
         <p className="error" role="alert">
           {error}

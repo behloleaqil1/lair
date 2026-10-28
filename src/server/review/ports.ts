@@ -106,7 +106,7 @@ export interface ReviewAssigner {
 export interface ReviewerRuns {
   requestRun(
     project: string,
-    input: { agent: string; task: string; prompt: string; variables: Record<string, string> },
+    input: { agent: string; task: string; prompt: string; variables: Record<string, string>; ownPrompt?: boolean },
   ): Promise<AgentRunView>;
   status(project: string): AgentsStatusView;
   managedRuns(project: string): ReadonlyMap<string, unknown>;

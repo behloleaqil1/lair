@@ -327,6 +327,13 @@ export interface RunRequest {
    * only; a run whose variables a restart lost ends instead of starting.
    */
   variables?: unknown;
+  /**
+   * The requesting module's prompt is the whole task (a supervisor run's, a
+   * review run's): the project's default_instructions, the builders' standing
+   * orders, don't go before it. The agent's own `instructions` still do.
+   * In-process only, like `variables`.
+   */
+  ownPrompt?: boolean;
 }
 
 /**
@@ -1213,7 +1220,8 @@ export class AgentsService {
     const dir = getPromptsDir(this.config);
     mkdirSync(dir, { recursive: true });
     const dragon = loadKnownDragons(this.config).get(run.agent);
-    const parts = [this.config.default_instructions, dragon?.instructions, run.resumeSummary, run.prompt]
+    // A module's own prompt (ownPrompt) gets no default_instructions: those are the builders' standing orders
+    const parts = [run.ownPrompt ? undefined : this.config.default_instructions, dragon?.instructions, run.resumeSummary, run.prompt]
       .map((part) => part?.trim())
       .filter((part): part is string => typeof part === "string" && part.length > 0);
     const file = join(dir, `${run.task.replace(/[^A-Za-z0-9_-]/g, "-")}-${run.agent}-${short(run.id)}.txt`);
@@ -1489,6 +1497,7 @@ export class AgentsService {
       prompt: prev.prompt,
       requestModel: prev.requestModel,
       variableNames: prev.variableNames,
+      ownPrompt: prev.ownPrompt,
       chainId: prev.chainId,
       previousRunId: prev.id,
       attempt: prev.attempt + 1,
@@ -2676,6 +2685,7 @@ export class AgentsService {
         prompt,
         requestModel: model,
         variableNames: Object.keys(variables).length > 0 ? Object.keys(variables) : undefined,
+        ownPrompt: input.ownPrompt === true ? true : undefined,
         chainId: id,
         attempt: 1,
         profileIndex: 0,

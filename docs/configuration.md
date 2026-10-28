@@ -242,7 +242,7 @@ Any other key, or a value that doesn't fit, stops the project from loading, with
 | `dragon_start_cmd` | array | — | Command to start an agent. Placeholders: `{dragon}`, `{task}`, `{prompt_file}` |
 | `dragon_stop_cmd` | array | — | Command to stop an agent. Placeholder: `{dragon}` |
 | `dragon_release_cmd` | array | — | Command to release an agent's task. Placeholder: `{dragon}` |
-| `default_instructions` | string | `""` | Default instructions applied to all agents |
+| `default_instructions` | string | `""` | Default instructions applied to all agents: they go first in every run's prompt, except the runs a Lair module requests with its own prompt, a supervisor run's and a review run's ([Supervisor chat and digest](#supervisor-chat-and-digest), [Reviews by agents](#reviews-by-agents)) |
 | `prompts_dir` | string | `data/prompts` | Directory where Lair writes the prompt file it passes as `{prompt_file}`. A relative path is resolved against the directory Lair was started from |
 
 ## Available models
@@ -1000,7 +1000,7 @@ supervisor:
 - Without `supervisor.agent`, the supervisor is the first dragon whose `profile:` is in `ai.roles.supervise` (the dragons on the role's first profile first), leaving out fill's agents and the planner agent.
 - The prompt names no tool: an agent that can run commands reads Lair with `lair ops call`, and an MCP-capable one may use `lair ops-mcp` instead (the variables it needs are already in its environment).
 
-With `supervisor.chat.enabled` and a supervisor agent, the Ask tab sends questions to the supervisor (a message to `@<dragon-id>` still goes to that dragon); otherwise it asks the orchestrator's `ask_cmd` as before. Home's **Ask Lair** card says what is missing until questions can be asked.
+With `supervisor.chat.enabled`, the Ask tab sends questions to the supervisor (a message to `@<dragon-id>` still goes to that dragon); otherwise it asks the orchestrator's `ask_cmd` as before. When a question can't be answered now, the chat panel and Home's **Ask Lair** card say why.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -1014,13 +1014,15 @@ With `supervisor.chat.enabled` and a supervisor agent, the Ask tab sends questio
 | `digest.enabled` | boolean | `false` | A supervisor run writes a digest once a day |
 | `digest.time` | `HH:MM` | `"08:00"` | When, in this machine's local time (24 hours) |
 
-These are config errors that name the key: chat or the digest on without `agents.enabled: true`, or with no supervisor agent; `supervisor.agent` naming an agent the project doesn't have, one fill starts, or the planner agent; a `prompt_file` that isn't one plain file name; a `time` that isn't `HH:MM`; an unknown key. Like the rest of the `supervisor:` block, an error keeps the project's self-checks from running too, and shows in Home → Health. The block is reloaded live (also when the agents, dragons, AI or planner blocks change) and edited in Settings.
+**Config errors are the block's own mistakes only:** an unknown key, a value of the wrong type or out of its range, a `prompt_file` that isn't one plain file name, a `time` that isn't `HH:MM`. Each names its key, and like any module's mistake it keeps an edited file from being taken. Even then the self-checks keep running on a valid `supervisor.checks` (questions and the digest wait for the fix), and Home → Health shows the error.
+
+**Whether a supervisor run can start is not a config error**, since it depends on other blocks: the agents module off (`agents.enabled`), no supervisor agent, a `supervisor.agent` the project doesn't have, one fill starts (`agents.fill.agents`) or the planner agent. A change to those blocks always loads. The chat's status (`problem`, below) says what is wrong, Home's Ask Lair card and the chat panel show it, a question is refused with it (HTTP 409), and the day's digest is skipped with it. The block is reloaded live, and also when the agents, dragons, AI or planner blocks change, and is edited in Settings.
 
 ### A supervisor run
 
 A question starts a conversation, or continues the one the chat panel has open, and is one run of the supervisor agent, requested through the agents module like any module's run: claims, locks, recovery, failover and budgets apply. Its task is `supervisor-ask-<the conversation's first 8 characters>-<n>` (`supervisor-digest-<YYYYMMDD>` for a digest). One question waits at a time in a conversation, and the supervisor agent takes one run at a time (a question while it is busy is refused with why).
 
-**Its prompt** is the template (`prompt_file`, else `prompts/supervisor.md`: it tells the agent that it is Lair's operator, to answer only from tool results and cite them, to say "I don't know" rather than guess, never to write anything, and to give next steps marked "for the owner" or "Lair can do"), then what Lair adds for the run:
+**Its prompt** is the template (`prompt_file`, else `prompts/supervisor.md`: it tells the agent that it is Lair's operator, to answer only from tool results and cite them, to say "I don't know" rather than guess, never to write anything, the repository it may be started in included, and to give next steps marked "for the owner" or "Lair can do"), then what Lair adds for the run. The project's `default_instructions` don't go before it: they are the builders' standing orders ("commit, open a PR"), and a supervisor run gets only its own prompt, after the supervisor agent's own `instructions` if you gave it some. Lair adds:
 
 - which run it is: the project, the conversation's id, the time it has;
 - Lair's tools and how to call them;
@@ -1034,10 +1036,10 @@ A question starts a conversation, or continues the one the chat panel has open, 
 - `LAIR_URL`: this server;
 - `LAIR_SUPERVISOR_CONVERSATION`: the conversation's id.
 
-**Submitting the answer.** The run writes its answer as Markdown in a file, and the evidence it cites as a JSON list of `{tool, args, note}` (each `tool` an ops tool, its `args` as called, and a note of what it showed; at most 30), then runs:
+**Submitting the answer.** The run writes its answer as Markdown in a file, and the evidence it cites as a JSON list of `{tool, args, note}` (each `tool` an ops tool, its `args` as called, and a note of what it showed; at most 30), both outside the repository (the prompt says `$TMPDIR`), then runs:
 
 ```
-lair supervisor answer --conversation <id> --file answer.md [--evidence-file evidence.json]
+lair supervisor answer --conversation <id> --file "$TMPDIR/answer.md" [--evidence-file "$TMPDIR/evidence.json"]
 ```
 
 It is `node <lair>/dist/cli/lair.js supervisor answer ...` after `npm run build` (the prompt gives the exact command), and reads `LAIR_OPS_TOKEN`, `LAIR_URL` (default `http://127.0.0.1:4777`) and, without `--conversation`, `LAIR_SUPERVISOR_CONVERSATION`. It posts to `POST /api/ops/answer`. Lair takes an answer once per question, only under the token of the run that was asked, and only while that run is active; the token is never printed. Exit codes: `0` recorded; `1` refused (an ended, another run's or the owner's token, an answer already given, an invalid answer: Lair says which); `2` a usage or input error, and nothing was sent; `3` Lair could not be reached, or answered with a server error.
@@ -1061,7 +1063,7 @@ With `digest.enabled`, a supervisor run writes a digest each day at `digest.time
 
 - **Home** shows the latest digest, with its evidence, and "No digest yet" before the first.
 - **One notice**, "Today's digest is ready (<date>)", is raised in the Decision Inbox when the digest's answer comes, if Lair's [notifications](#notifications) are on. Like every notice it is listed under FYI and never pushed; the previous day's, if still open, is withdrawn.
-- **The same bounds.** A digest run counts toward `max_runs_per_day` and waits for `min_interval_seconds`. One that can't start yet (the supervisor agent busy, too soon after another run) is tried again a minute later; one refused for good (the day's runs used up, the budget, the config) is skipped for the day, and Home says why. A digest run that ends without an answer is "no digest" for that day: it is not started again.
+- **The same bounds.** A digest run counts toward `max_runs_per_day` and waits for `min_interval_seconds`. One that can't start yet because the supervisor agent is busy with another run, or it is too soon after another supervisor run, is tried again a minute later (no token is minted for a try that doesn't start). Any other refusal is for the day: the day's runs used up, the budget, no supervisor agent, its task claimed by another run, the agent held by another module; the day's digest is skipped, and Home says why. A digest run that ends without an answer is "no digest" for that day: it is not started again.
 
 ### What the supervisor can and can't do
 
@@ -1439,7 +1441,7 @@ review:
 
 An agent whose run on the slot already ended without a review comes last. With no agent free, the slot stays `requested` and is tried again on the next check (every 15 seconds), which doesn't use up an attempt. When no agent can ever take it (every pooled agent sharing a model with the author, no pool), the slot fails with the reason. When the configuration is why, Lair also raises one Decision Inbox item for the project and reason, however many PRs hit it while it is open: no pool; no pooled agent but the author itself, or ones that share a model with the author, have a profile without a model, or are not agents of the project; a refused `prompt_file`; the agents module off. When this PR is why (an agent already reviewed this head, or the tasks file left it as a possible author), the slot just fails. Runs are bounded by the pool, the agents module's budgets and `retries.max_attempts`.
 
-**The run.** Lair requests the run in-process, for task `review-<pr>-<head8>` (with `-2`, `-3`, ... for a tier's further slots), so claims, locks, budgets, recovery and failover apply as to any run. Its prompt is `prompt_file`: one file name directly in `prompts_dir` (no path, and a symlink only to a file in the same directory), a regular file of at most 200 KB. The file is used verbatim except for these placeholders, each replaced in one pass:
+**The run.** Lair requests the run in-process, for task `review-<pr>-<head8>` (with `-2`, `-3`, ... for a tier's further slots), so claims, locks, budgets, recovery and failover apply as to any run. Its prompt is `prompt_file`: one file name directly in `prompts_dir` (no path, and a symlink only to a file in the same directory), a regular file of at most 200 KB. The project's `default_instructions` (the builders' standing orders) don't go before it; the reviewer agent's own `instructions` do. The file is used verbatim except for these placeholders, each replaced in one pass:
 
 | Placeholder | Value |
 |---|---|

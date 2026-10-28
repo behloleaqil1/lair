@@ -11,7 +11,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import type { ChatStatusView, ConversationTurn, DigestView } from "../../shared/supervisor-types";
 import { askGoesToSupervisor, chatHint, hasPending, LOOKING, turnStatus } from "../supervisor-chat";
 import { SafeMarkdown } from "./SafeMarkdown";
-import { AskLairCardView, DigestCardView, TurnView } from "./SupervisorChat";
+import { AskLairCardView, DigestCardView, SupervisorChatPanel, TurnView } from "./SupervisorChat";
 
 const policy = { repoUrl: "https://github.com/example-org/demo" };
 const noop = () => undefined;
@@ -116,7 +116,7 @@ describe("a question in the chat panel", () => {
     expect(none).toContain("no answer within 15 minutes: Lair stopped its run");
   });
 
-  it("is read again while a question waits, and the Ask tab goes to the supervisor only when it can answer", () => {
+  it("is read again while a question waits, and the Ask tab goes to the supervisor once questions are on", () => {
     const view = { id: "c", project: "demo", kind: "chat" as const, digestDate: null, createdAt: "", updatedAt: "", repoUrl: null };
     expect(hasPending({ ...view, turns: [turn({ state: "answered" }), turn({ state: "pending" })] })).toBe(true);
     expect(hasPending({ ...view, turns: [turn({ state: "no_answer" })] })).toBe(false);
@@ -124,8 +124,14 @@ describe("a question in the chat panel", () => {
     expect(turnStatus(turn({ state: "answered" }))).toEqual({ label: "Answered", tone: "success" });
     expect(askGoesToSupervisor(status())).toBe(true);
     expect(askGoesToSupervisor(status({ enabled: false }))).toBe(false);
-    expect(askGoesToSupervisor(status({ problem: "no supervisor agent" }))).toBe(false);
+    // With questions on but no agent that can answer, the panel opens and says why
+    expect(askGoesToSupervisor(status({ problem: "no supervisor agent" }))).toBe(true);
     expect(askGoesToSupervisor(null)).toBe(false);
+    const PROBLEM = "supervisor.agent: sup is in agents.fill.agents: the supervisor must not be an agent fill starts";
+    const panel = render(createElement(SupervisorChatPanel, { project: "demo", request: {}, onClose: noop, problem: PROBLEM }));
+    expect(panel).toContain('data-problem="chat"');
+    expect(panel).toContain(PROBLEM);
+    expect(render(createElement(SupervisorChatPanel, { project: "demo", request: {}, onClose: noop }))).not.toContain("data-problem");
   });
 });
 

@@ -68,6 +68,8 @@ export const DIGEST_RETRY_MS = 60_000;
 const DAY = 86_400_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const MAX_TEMPLATE_CHARS = 100_000;
+/** How long the chat's status keeps the supervisor agent it found (a reload of the project forgets it at once) */
+export const AGENT_CACHE_MS = 30_000;
 
 /** Lair's own prompt, at the repository's top level (three levels up from src/ and from dist/) */
 export const DEFAULT_PROMPT_PATH = fileURLToPath(new URL("../../../prompts/supervisor.md", import.meta.url));
@@ -139,9 +141,13 @@ export class ChatError extends Error {
 export interface ChatAgents {
   requestRun(
     project: string,
-    input: { agent: string; task: string; prompt: string; variables: Record<string, string> },
+    input: { agent: string; task: string; prompt: string; variables: Record<string, string>; ownPrompt?: boolean },
   ): Promise<AgentRunView>;
-  getStore(): { getRun(id: string): AgentRun | null; chainRuns(chainId: string): AgentRun[] } | null;
+  getStore(): {
+    getRun(id: string): AgentRun | null;
+    chainRuns(chainId: string): AgentRun[];
+    activeRunForAgent(project: string, agent: string): AgentRun | null;
+  } | null;
   /** Stop a task's run: its claim is released, and the run stops on the agents module's next check */
   releaseClaim(project: string, task: string, why: string): Promise<unknown>;
 }
@@ -178,6 +184,8 @@ export class SupervisorChat {
   private digestTried = new Map<string, { date: string; at: number }>();
   /** Answered turns whose runs were already stopped past their deadline */
   private stoppedAfterAnswer = new Set<string>();
+  /** project -> the supervisor agent as the status last read it */
+  private agentCache = new Map<string, { generation: number; at: number; value: { agent: string } | { problem: string } }>();
   private readonly cli: string;
   private readonly log: Pick<Console, "warn">;
 
@@ -197,11 +205,27 @@ export class SupervisorChat {
 
   private settingsFor(project: string): SupervisorSettings {
     const settings = this.o.supervisor.settingsOf(project);
-    if (!settings) {
-      const problems = this.o.supervisor.problemsOf(project);
-      throw new ChatError(409, problems.length > 0 ? `The supervisor block of ${project} has errors: ${problems.join("; ")}` : `No project ${project}`);
-    }
+    const problems = this.o.supervisor.problemsOf(project);
+    // With errors in the block, only its checks are in effect: questions and the digest wait for the fix
+    if (problems.length > 0) throw new ChatError(409, `The supervisor block of ${project} has errors: ${problems.join("; ")}`);
+    if (!settings) throw new ChatError(409, `No project ${project}`);
     return settings;
+  }
+
+  /**
+   * The supervisor agent for the chat's status, read again at most every
+   * AGENT_CACHE_MS, and at once after the project's config was reloaded
+   * (its agents, dragons, ai or planner block changed). A run's start
+   * always reads it afresh.
+   */
+  private cachedAgent(project: string, settings: SupervisorSettings): { agent: string } | { problem: string } {
+    const now = this.o.clock();
+    const generation = this.o.supervisor.generationOf(project);
+    const cached = this.agentCache.get(project);
+    if (cached && cached.generation === generation && now - cached.at < AGENT_CACHE_MS) return cached.value;
+    const value = supervisorAgent(this.o.config(project), settings);
+    this.agentCache.set(project, { generation, at: now, value });
+    return value;
   }
 
   private configOf(project: string): ProjectConfig {
@@ -274,6 +298,15 @@ export class SupervisorChat {
     const found = supervisorAgent(config, p.settings);
     if ("problem" in found) throw new ChatError(409, found.problem);
     this.checkLimits(p.project, p.settings.chat, now);
+    // The agent busy with another run is the one wait that passes by itself (a digest tries again soon); no token yet
+    const busy = agents.getStore()?.activeRunForAgent(p.project, found.agent) ?? null;
+    if (busy) {
+      throw new ChatError(
+        409,
+        `The supervisor agent ${found.agent} is busy: run ${busy.id.slice(0, 8)} on task ${busy.task} is ${busy.state}`,
+        true,
+      );
+    }
     const template = this.template(config, p.settings);
 
     const conversationId = p.conversation?.id ?? randomUUID();
@@ -313,12 +346,15 @@ export class SupervisorChat {
           LAIR_SUPERVISOR_CONVERSATION: conversationId,
           ...(this.o.serverUrl ? { LAIR_URL: this.o.serverUrl } : {}),
         },
+        // The supervisor's prompt is the whole task: not the builders' default_instructions before it
+        ownPrompt: true,
       });
     } catch (e) {
       this.o.tokens.revoke(minted.info.id);
       const status = typeof (e as { statusCode?: unknown }).statusCode === "number" ? (e as { statusCode: number }).statusCode : 500;
-      // The agent busy, or the task claimed: a digest tries again soon
-      throw new ChatError(status, `The supervisor run could not start: ${message(e)}`, status === 409);
+      // Only the agent becoming busy meanwhile passes by itself; a claimed task, a held agent, the budget don't
+      const nowBusy = status === 409 && (agents.getStore()?.activeRunForAgent(p.project, found.agent) ?? null) !== null;
+      throw new ChatError(status, `The supervisor run could not start: ${message(e)}`, nowBusy);
     }
     this.o.tokens.bindRun(minted.info.id, run.id);
 
@@ -640,7 +676,7 @@ export class SupervisorChat {
     let problem: string | null = problems.length > 0 ? `The supervisor block has errors: ${problems.join("; ")}` : null;
     if (settings && problem === null) {
       try {
-        const found = supervisorAgent(this.o.config(project), settings);
+        const found = this.cachedAgent(project, settings);
         if ("agent" in found) agent = found.agent;
         else problem = found.problem;
       } catch (e) {

@@ -42,9 +42,13 @@ export function turnStatus(turn: ConversationTurn): { label: string; tone: "neut
   return { label: "No answer", tone: "warning" };
 }
 
-/** The Ask tab starts a supervisor conversation (rather than the orchestrator's ask command). */
+/**
+ * The Ask tab starts a supervisor conversation (rather than the orchestrator's
+ * ask command) once questions are on: when they can't be answered now (no
+ * supervisor agent, the agents module off), the chat panel says why.
+ */
 export function askGoesToSupervisor(status: ChatStatusView | null | undefined): boolean {
-  return status?.enabled === true && status.problem === null;
+  return status?.enabled === true;
 }
 
 /** Why the owner can't ask now, in a line; null when they can. */
