@@ -11,9 +11,8 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, existsSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { BusStore, getBusStore, closeBusStores, BUS_SCHEMA_VERSION } from "./store.js";
+import { BusStore, getBusStore, closeBusStores } from "./store.js";
 import { hashBusToken, newBusToken } from "./tokens.js";
-import type { ReportKind } from "../../bus/types.js";
 
 describe("BusStore", () => {
   let tempDir: string;

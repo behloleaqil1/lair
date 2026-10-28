@@ -5,7 +5,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, existsSync, readFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { BusMirror, type BusMirrorConfig } from "./mirror.js";
+import { BusMirror } from "./mirror.js";
 
 describe("BusMirror", () => {
   let tempDir: string;
@@ -88,6 +88,7 @@ describe("BusMirror", () => {
 
       const content = readFileSync(queueFile, "utf-8");
       // No control chars, no ANSI escapes
+      // eslint-disable-next-line no-control-regex
       expect(content).not.toMatch(/[\x00-\x1f\x7f]/);
       expect(content).not.toContain("\x1b");
       // Newlines replaced with spaces and collapsed
@@ -195,17 +196,18 @@ describe("BusMirror", () => {
     it("updates mtime if wake file exists", async () => {
       const wakeFile = join(tempDir, "wake");
       const mirror = new BusMirror({});
+      const fs = await import("fs");
 
       // Create file and wait a bit
       mirror.touchWake(wakeFile);
-      const stat1 = require("fs").statSync(wakeFile);
+      const stat1 = fs.statSync(wakeFile);
       const mtime1 = stat1.mtimeMs;
 
       // Wait a small amount and touch again
       await new Promise((r) => setTimeout(r, 50));
       mirror.touchWake(wakeFile);
 
-      const stat2 = require("fs").statSync(wakeFile);
+      const stat2 = fs.statSync(wakeFile);
       const mtime2 = stat2.mtimeMs;
 
       expect(mtime2).toBeGreaterThan(mtime1);

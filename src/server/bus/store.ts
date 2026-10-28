@@ -15,7 +15,7 @@ import { existsSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
 import { randomUUID } from "crypto";
 import type { ReportKind } from "../../bus/types.js";
-import { hashBusToken, type BusTokenBinding } from "./tokens.js";
+import type { BusTokenBinding } from "./tokens.js";
 
 // ============ Schema ============
 

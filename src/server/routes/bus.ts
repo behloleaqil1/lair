@@ -15,7 +15,7 @@
  * Claims have ONE source of truth: the agents module's claims. The bus does
  * not keep its own claim table.
  */
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyInstance } from "fastify";
 import { projectQueryGuard } from "./project-guard.js";
 import { rejectCrossSiteRequests } from "../origin.js";
 import type { HumanAuth } from "../human-auth/index.js";

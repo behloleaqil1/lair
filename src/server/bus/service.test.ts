@@ -16,7 +16,6 @@ import { join } from "path";
 import { BusService } from "./service.js";
 import { BusStore } from "./store.js";
 import { newBusToken, hashBusToken, type BusTokenBinding } from "./tokens.js";
-import type { ReportKind } from "../../bus/types.js";
 
 describe("BusService", () => {
   let tempDir: string;

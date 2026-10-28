@@ -3,15 +3,11 @@
  */
 import { describe, it, expect } from "vitest";
 import {
-  BUS_MCP_USAGE,
-  DEFAULT_SERVER_URL,
-  EXIT_OK,
   EXIT_USAGE,
   httpBusClient,
-  type BusCallResult,
   type BusMcpDeps,
 } from "./bus-mcp.js";
-import { newBusToken, BUS_TOKEN_PREFIX } from "../server/bus/tokens.js";
+import { newBusToken } from "../server/bus/tokens.js";
 
 class Capture {
   stderr = "";

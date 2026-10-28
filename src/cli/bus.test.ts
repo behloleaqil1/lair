@@ -7,14 +7,13 @@ import { tmpdir } from "os";
 import { join } from "path";
 import {
   busCli,
-  USAGE,
   EXIT_OK,
   EXIT_REFUSED,
   EXIT_USAGE,
   EXIT_UNAVAILABLE,
   type BusCliDeps,
 } from "./bus.js";
-import { newBusToken, BUS_TOKEN_PREFIX } from "../server/bus/tokens.js";
+import { newBusToken } from "../server/bus/tokens.js";
 
 class Capture {
   stdout = "";

@@ -33,13 +33,14 @@ const MAX_SHA = 64;
 
 /** Remove newlines, control chars, ANSI escapes; cap length */
 function sanitize(value: string, max: number): string {
-  // eslint-disable-next-line no-control-regex
+  /* eslint-disable no-control-regex */
   return value
     .replace(/[\x00-\x1f\x7f]/g, " ") // control chars -> space
     .replace(/\x1b\[[0-9;]*[A-Za-z]/g, "") // ANSI escapes
     .replace(/\s+/g, " ") // collapse whitespace
     .trim()
     .slice(0, max);
+  /* eslint-enable no-control-regex */
 }
 
 /** Ensure a file's parent directory exists */
