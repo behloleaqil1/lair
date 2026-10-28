@@ -694,3 +694,220 @@ describe("merge.auto", () => {
     expect(at.remote.branches.get("main")).toBe(at.base);
   });
 });
+
+// ============ M8: auto_tiers ============
+
+/** A file that triggers red tier (auth). */
+const AUTH_FILE: FakeFile = {
+  filename: "src/auth/session.ts",
+  status: "modified",
+  additions: 5,
+  deletions: 2,
+  patch: "@@ -1,2 +1,5 @@\n // auth\n-old\n+new",
+};
+
+/** A repo with PR #3 as a RED tier change (auth file). */
+function redRepo(): Repo {
+  dir ??= mkdtempSync(join(tmpdir(), "lair-review-auto-tiers-"));
+  const remote = new FakeRemote();
+  const base = remote.commit([], AGENT, "initial");
+  remote.branches.set("main", base);
+  const head = remote.commit([base], AGENT, "auth change");
+  remote.openPull({
+    number: 3,
+    title: "Update auth session",
+    headRef: "agent/worker-a/auth-fix",
+    headSha: head,
+    files: [AUTH_FILE],
+    labels: [],
+  });
+  return { remote, base, head };
+}
+
+describe("merge.auto_tiers", () => {
+  it("does not auto-merge a red tier PR when auto_tiers is [amber, green], and raises no decision", async () => {
+    const at = redRepo();
+    const { service, remote, base, head, clock, scan, decisions } = boot(at, {
+      auto: true,
+      auto_tiers: ["amber", "green"],
+    }, {
+      // Red tier requires a human review by default; skip it so canMerge is true
+      reviewers: { red: [] },
+    });
+    service.addGateResult(signed(head));
+
+    // The PR is ready to merge (canMerge: true), but should not auto-merge
+    const status = await service.status(3);
+    expect(status.risk.tier).toBe("red");
+    expect(status.canMerge).toBe(true);
+    expect(status.autoMergeStatus).toBe("manual");
+
+    // Multiple scans: it is never auto-merged and no decision is raised
+    for (let i = 0; i < 3; i++) {
+      await scan();
+      clock.advance(10 * MINUTE);
+    }
+    expect(remote.branches.get("main")).toBe(base);
+    expect(service.listMerges()).toEqual([]);
+    expect(decisions).toEqual([]);
+  });
+
+  it("auto-merges amber and green tier PRs when auto_tiers is [amber, green]", async () => {
+    // Green tier: docs
+    const at = repo();
+    const { service, remote, head, scan } = boot(at, {
+      auto: true,
+      auto_tiers: ["amber", "green"],
+    });
+    service.addGateResult(signed(head));
+
+    const status = await service.status(3);
+    expect(status.risk.tier).toBe("green");
+    expect(status.autoMergeStatus).toBe("auto");
+
+    await scan();
+    expect(remote.branches.get("main")).toBe(head);
+    expect(service.listMerges()).toEqual([
+      expect.objectContaining({ pr: 3, initiatedBy: "lair:policy" }),
+    ]);
+  });
+
+  it("allows owner's Merge to work for red tier PR even with auto_tiers [amber, green]", async () => {
+    const at = redRepo();
+    const { service, remote, head } = boot(at, {
+      auto: true,
+      auto_tiers: ["amber", "green"],
+    }, {
+      reviewers: { red: [] },
+    });
+    service.addGateResult(signed(head));
+
+    const status = await service.status(3);
+    expect(status.risk.tier).toBe("red");
+    expect(status.canMerge).toBe(true);
+
+    // The owner can still merge it manually
+    const result = await service.merge(3, { confirm: true, headSha: head, by: "owner" });
+    expect(result.merged).toBe(true);
+    expect(remote.branches.get("main")).toBe(head);
+  });
+
+  it("reports autoMergeStatus as null when auto is false", async () => {
+    const { service, head } = boot(repo(), { auto: false });
+    service.addGateResult(signed(head));
+
+    const status = await service.status(3);
+    expect(status.autoMergeStatus).toBeNull();
+  });
+
+  it("reports autoMergeStatus as 'auto' for all tiers when auto_tiers is absent (default)", async () => {
+    // Test with red tier - should be 'auto' when auto_tiers is not set
+    const at = redRepo();
+    const { service, head } = boot(at, { auto: true }, { reviewers: { red: [] } });
+    service.addGateResult(signed(head));
+
+    const status = await service.status(3);
+    expect(status.risk.tier).toBe("red");
+    expect(status.autoMergeStatus).toBe("auto");
+  });
+
+  it("stops auto-merging a tier when a config reload removes it from auto_tiers", async () => {
+    const at = redRepo();
+    const dbPath = join(dir!, "review.db");
+    // First: auto_tiers includes red
+    const first = boot(at, { auto: true, auto_tiers: ["red", "amber", "green"] }, { dbPath, reviewers: { red: [] } });
+    first.service.addGateResult(signed(at.head));
+
+    let status = await first.service.status(3);
+    expect(status.autoMergeStatus).toBe("auto");
+    first.manager.close();
+
+    // Reload with red removed from auto_tiers
+    const second = boot(at, { auto: true, auto_tiers: ["amber", "green"] }, { dbPath, reviewers: { red: [] } });
+    second.service.addGateResult(signed(at.head));
+
+    status = await second.service.status(3);
+    expect(status.autoMergeStatus).toBe("manual");
+
+    // Scan does not auto-merge
+    await second.scan();
+    second.clock.advance(10 * MINUTE);
+    await second.scan();
+    expect(at.remote.branches.get("main")).toBe(at.base);
+    expect(second.decisions).toEqual([]);
+  });
+});
+
+// ============ raiseAutoMergeFailure recommendations ============
+
+describe("raiseAutoMergeFailure recommendation", () => {
+  it("recommends 'Leave it unmerged' when check_cmd fails: merging manually would hit the same block", async () => {
+    const { service, remote, base, head, scan, spawner, decisions } = boot(repo(), {
+      auto: true,
+      check_cmd: ["/opt/checks/migration-order", "--pr", "{pr}"],
+    });
+    spawner.reply = () => ({ code: 1, stdout: "migration V12 conflicts\n", stderr: "", timedOut: false });
+    service.addGateResult(signed(head));
+
+    await scan();
+    expect(remote.branches.get("main")).toBe(base);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({
+      key: autoMergeDecisionKey(3, head),
+      question: `Automatic merge of PR #3 failed at ${head.slice(0, 7)}`,
+      recommended: "Leave it unmerged",
+    });
+    expect(decisions[0].context).toContain("The pre-merge check (merge.check_cmd) blocked this PR");
+    expect(decisions[0].context).toContain("Fix the cause and push a new head");
+  });
+
+  it("recommends 'Merge it from the PR's page' when the executor fails: transient errors may not recur", async () => {
+    const at = repo();
+    // Make the merge fail at the executor stage (push failure)
+    const api = fakeGitHubApi(at.remote);
+    const fetch: FetchLike = async (url, init) => {
+      // The local merger doesn't use the API to push, but we can make the
+      // PR state check fail to simulate a transient host error
+      if ((init?.method ?? "GET") === "GET" && new URL(url).pathname.endsWith("/pulls/3")) {
+        // First evaluation succeeds, second (in merge) fails
+        const reads = at.remote.requests.filter((r) => r.path.endsWith("/pulls/3")).length;
+        if (reads >= 1) {
+          throw new Error("GitHub API timeout");
+        }
+      }
+      return api(url, init);
+    };
+    const { service, remote, base, head, scan, decisions } = boot(at, { auto: true }, { fetch });
+    service.addGateResult(signed(head));
+
+    // The scan evaluates the PR successfully, then the merge's own evaluation fails
+    await scan();
+    expect(remote.branches.get("main")).toBe(base);
+    // This is caught as an exception (not a refusal), so it recommends merge from page
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({
+      recommended: "Merge it from the PR's page",
+    });
+    expect(decisions[0].context).toContain("Lair does not try again at this head");
+    expect(decisions[0].context).toContain("Merge it from its page in PRs once the cause is fixed");
+  });
+
+  it("recommends 'Leave it unmerged' when check_cmd times out: the check didn't finish, and might refuse with more time", async () => {
+    const { service, remote, base, head, scan, spawner, decisions } = boot(repo(), {
+      auto: true,
+      check_cmd: ["/opt/checks/slow-check"],
+      check_timeout_seconds: 1,
+    });
+    spawner.reply = () => ({ code: null, stdout: "still running...\n", stderr: "", timedOut: true });
+    service.addGateResult(signed(head));
+
+    await scan();
+    expect(remote.branches.get("main")).toBe(base);
+    expect(decisions).toHaveLength(1);
+    // A timeout is still a "check" refusal: the check might refuse it on a longer timeout
+    expect(decisions[0]).toMatchObject({
+      recommended: "Leave it unmerged",
+    });
+    expect(decisions[0].context).toContain("The pre-merge check (merge.check_cmd) blocked this PR");
+  });
+});

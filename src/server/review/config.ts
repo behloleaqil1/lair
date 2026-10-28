@@ -149,6 +149,8 @@ const MergeSchema = z
     check_timeout_seconds: z.number().int().min(1).max(3600).default(300),
     /** Merge every PR the policy allows, from the periodic scan of open PRs */
     auto: z.boolean().default(false),
+    /** Tiers automatic merge applies to: default is all tiers; an empty array is a config error (use auto: false) */
+    auto_tiers: z.array(TierSchema).optional(),
     /** The least time between two automatic merges of the project */
     auto_min_interval_seconds: z.number().int().min(0).max(86_400).default(120),
   })
@@ -269,6 +271,8 @@ export interface MergeSettings {
   checkTimeoutSeconds: number;
   /** Merge the PRs the policy allows from the periodic scan of open PRs */
   auto: boolean;
+  /** Tiers automatic merge applies to; null means all tiers */
+  autoTiers: Tier[] | null;
   autoMinIntervalSeconds: number;
 }
 
@@ -545,6 +549,10 @@ export function parseReviewConfig(
     errors.push("review.merge.identity: required for a local squash merge (the squash commit's author)");
   }
   if (merge?.check_cmd) errors.push(...checkCommandErrors(merge.check_cmd));
+  // auto_tiers validation: if set, must not be empty (that's auto: false)
+  if (merge?.auto_tiers !== undefined && merge.auto_tiers.length === 0) {
+    errors.push("review.merge.auto_tiers: an empty array is a config error; use auto: false instead");
+  }
 
   if (errors.length > 0) return { ok: false, errors };
 
@@ -613,6 +621,7 @@ export function parseReviewConfig(
         checkCmd: merge?.check_cmd ?? null,
         checkTimeoutSeconds: merge?.check_timeout_seconds ?? 300,
         auto: merge?.auto ?? false,
+        autoTiers: merge?.auto_tiers ?? null,
         autoMinIntervalSeconds: merge?.auto_min_interval_seconds ?? 120,
       },
     },
