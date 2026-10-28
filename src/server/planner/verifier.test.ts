@@ -119,6 +119,9 @@ describe("verifier acceptance tests", () => {
     expect(run.verifierState).toBe("running");
     expect(run.state).toBe("running");
 
+    // Tick agents to spawn the verifier
+    await h.agentsService.tick();
+
     // Verifier agent should have been requested
     expect(h.spawner.calls.some((c) => c.env.LAIR_AGENT === "verifier")).toBe(true);
   });

@@ -1256,7 +1256,9 @@ export class PlannerService {
       if (run.verifierState === "done") {
         verifierNote = ` (verifier: ${verdictCounts.pass} pass, ${verdictCounts.fail} fail, ${verdictCounts.defer} defer)`;
       } else if (run.verifierState === "failed") {
-        verifierNote = " (verifier failed)";
+        // Preserve the error detail if set (e.g., "verifier: the verdicts file is not JSON")
+        const reason = run.detail?.startsWith("verifier:") ? run.detail : "verifier failed";
+        verifierNote = ` (${reason})`;
       } else if (run.verifierState === "skipped") {
         verifierNote = " (verification skipped)";
       }
