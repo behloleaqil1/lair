@@ -38,9 +38,11 @@ import { fieldIndex, fieldTarget, type SearchEntry } from "../settings-search";
 import { SignInHint } from "./SignInHint";
 import { SettingsForm, type FormFocus } from "./SettingsForm";
 import { SettingsHistory } from "./SettingsHistory";
+import { SettingsAi } from "./SettingsAi";
 import { SettingsOverview } from "./SettingsOverview";
 import { SettingsReview } from "./SettingsReview";
 import { SettingsSearch } from "./SettingsSearch";
+import { SettingsTeam } from "./SettingsTeam";
 import { ProjectWizard } from "./ProjectWizard";
 import { NotificationSettings } from "./NotificationSettings";
 import { Badge } from "../ui/Badge";
@@ -244,6 +246,13 @@ export function Settings({ project, refreshKey, route, go }: Props) {
     clearReview();
   };
 
+  // The AI and Team pages hand back the whole draft
+  const onDraft = (next: Record<string, unknown>) => {
+    setDraft(next);
+    clearReview();
+  };
+  const pageFocus = route.detail && (page === "ai" || page === "team") ? { key: route.detail, nonce } : null;
+
   const onPick = (entry: SearchEntry) => {
     setNonce((n) => n + 1);
     go({ section: "settings", tab: tabOf(entry.page), detail: entry.key, project: route.project });
@@ -258,6 +267,31 @@ export function Settings({ project, refreshKey, route, go }: Props) {
     switch (page) {
       case "overview":
         return <SettingsOverview view={view} project={route.project} />;
+      case "ai":
+        return (
+          <SettingsAi
+            project={view.id}
+            draft={draft}
+            sections={sections}
+            known={view.known.adapters}
+            errors={errors}
+            disabled={busy || yamlDirty || view.values === null}
+            onDraft={onDraft}
+            focus={pageFocus}
+          />
+        );
+      case "team":
+        return (
+          <SettingsTeam
+            project={view.id}
+            draft={draft}
+            known={view.known}
+            errors={errors}
+            disabled={busy || yamlDirty || view.values === null}
+            onDraft={onDraft}
+            focus={pageFocus}
+          />
+        );
       case "classic":
         return (
           <>

@@ -1,8 +1,9 @@
 # Settings v2, and Lair's look and feel
 
-> Status: T1 built; S2-1 in part (the shell, search, save bar and Overview: `src/client/components/Settings.tsx`), the
-> AI and Team pages next. Roadmap: [ROADMAP.md](ROADMAP.md) A7. Builds on [settings-ui.md](settings-ui.md) (phase 1:
-> the write path, validation, history and the schema registry stay as they are). Related: [ai-roles.md](ai-roles.md).
+> Status: T1 and S2-1 built (`src/client/ui/`; `src/client/components/Settings.tsx` and its pages); S2-2 and S2-3 to
+> do. Roadmap: [ROADMAP.md](ROADMAP.md) A7. Builds on [settings-ui.md](settings-ui.md) (phase 1: the write path,
+> validation, history and the schema registry stay as they are). Related: [ai-roles.md](ai-roles.md). Reference:
+> [configuration.md](../configuration.md#settings).
 
 Phase 1 made every setting editable from the dashboard. But its forms mirror the YAML file: one section per
 top-level key, field names as labels, and everything shown at once. An engineer has to know the file to use the page.
@@ -100,6 +101,27 @@ A template fills the forms. It never hides anything.
 | Phase | Delivers | Acceptance (summary) |
 |---|---|---|
 | T1 (built) | Tokens, themes, the component kit; the existing views moved onto it with no behaviour change (`src/client/ui/`) | Every view renders with the kit in light and dark; axe is clean on every view; no client test changes behaviour |
-| S2-1 (part built: the shell, search, save bar and Overview; the AI and Team pages next) | The new Settings shell: page list, search, sticky save bar, drawers; Overview checklist; AI and Team pages ([ai-roles.md](ai-roles.md) roles and sign-in status) | A new user sets the reviewer for AMBER from a dropdown and saves, with no YAML seen. The diff shows exactly that key |
+| S2-1 (built) | The new Settings shell: page list, search, sticky save bar, drawers; Overview checklist; AI and Team pages ([ai-roles.md](ai-roles.md) roles and sign-in status) | A new user sets the reviewer for AMBER from a dropdown and saves, with no YAML seen. The diff shows exactly that key |
 | S2-2 | The remaining pages (Work, Gates, Machines, Reviews and merging, Notifications, Delivery, Advanced); registry levels and help for every field; templates | Every field of the schema is reachable from a page or search; every field has a label, help and a default; round-trip tests UI → YAML → UI |
 | S2-3 | Test-it buttons (AI sign-in, models, machines, notifications, pipelines); guided "add a machine" and "add an AI tool" | Each button runs its check through the module's own route, with a timeout, and shows the result and the fix |
+
+### S2-1, as built
+
+- **Pages** (`settings-pages.ts`): Overview, AI, Team, then All settings (classic), YAML and History. Each page is the
+  URL's tab and the URL's detail is the field to show. Every page edits one draft. The forms and the YAML are edited
+  one at a time: the other waits until the change is saved or discarded.
+- **Search** (`settings-search.ts`, `SettingsSearch.tsx`): an index of every field of the registry (record entries as
+  `*`), ranked by key, then label, then help, at every level. A pick opens the field's page, unfolds what holds it and
+  focuses it.
+- **Save bar and review drawer** (`Settings.tsx`): the count of changes, Review and save, Discard. The drawer runs
+  `POST /api/settings/validate` and shows the keys, the diff, the errors and the confirmation; then `PUT`. A 409 offers
+  to check the same changes again on the current file.
+- **Registry hints:** `label`, `level`, `group`, `example`. The AI and dragons fields have labels; S2-2 gives every
+  field its label and help.
+- **Overview** (`setup-checklist.ts`): one row per part, from the project's values and problems, the repository check,
+  `GET /api/ai/tools`, `GET /api/machines` and the notification settings.
+- **AI** (`SettingsAi.tsx`, `ModelPicker.tsx`, `ai-settings.ts`): the tools per machine, with Refresh
+  (`POST /api/ai/tools/refresh`); the profiles in a drawer; the roles as ordered lists.
+- **Team** (`SettingsTeam.tsx`): the agents table, an agent's drawer, and the bulk move to a profile.
+- **Not yet:** "not offered any more" on a model a tool stopped listing, and models per remote machine (the
+  dropdowns read this machine's list); the API keys of A6-2. These remain in [ai-roles.md](ai-roles.md) A7.

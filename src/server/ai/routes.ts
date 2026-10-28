@@ -6,6 +6,7 @@
  * granted either.
  *
  *   GET  /api/ai/tools?project=<name>                      every tool, per machine
+ *   POST /api/ai/tools/refresh   {project?}                 the same, checked again now
  *   GET  /api/ai/models?tool=<id>&project=<name>&machine=<id>
  *   POST /api/ai/models/refresh  {tool, project?, machine?}  the list read again now
  */
@@ -73,6 +74,13 @@ async function aiRoutes(app: FastifyInstance, options: AiRoutesOptions): Promise
     handle(reply, async () => {
       const { project, config } = projectOf(request.query.project);
       return service.tools(project, config);
+    }),
+  );
+
+  app.post("/api/ai/tools/refresh", { bodyLimit: 4096 }, async (request, reply) =>
+    handle(reply, async () => {
+      const { project, config } = projectOf(body(request).project);
+      return service.tools(project, config, true);
     }),
   );
 

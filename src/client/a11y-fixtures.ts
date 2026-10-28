@@ -8,7 +8,7 @@
  */
 import { stringify } from "yaml";
 import type { Dragon, Gate, GateResult, MachineStatus, OverviewData, PullRequest } from "../shared/types";
-import type { AiToolsView } from "../shared/ai-types";
+import type { AiModelsView, AiToolsView } from "../shared/ai-types";
 import type { DashboardModules, ModuleFlags } from "../shared/dashboard-types";
 import type { Decision } from "../shared/decision-types";
 import type { ConfigStatusView, RestartStatusView } from "../shared/lifecycle-types";
@@ -351,6 +351,18 @@ const aiTools: AiToolsView = {
   ],
 };
 
+const aiModels: AiModelsView = {
+  tool: "kiro",
+  machine: "local",
+  source: "cmd",
+  fetchedAt: FIXTURE_NOW,
+  models: [
+    { id: "auto", label: "Models chosen by task", notes: "1.00x credits", default: true },
+    { id: "claude-opus-4.5", label: "Claude Opus 4.5", notes: "2.20x credits", default: false },
+    { id: "claude-haiku-4.5", label: "Claude Haiku 4.5", notes: "0.40x credits", default: false },
+  ],
+};
+
 const notifications: NotificationStatusView = {
   settings: { desktop: true, ntfyUrl: null, ntfyTokenFile: false, reminderHours: 4, enabled: true },
   errors: [],
@@ -437,6 +449,7 @@ export const FIXTURE_ROUTES: Record<string, unknown> = {
   "/api/settings/repo": repoCheck,
   "/api/settings/validate": FIXTURE_SETTINGS_CHECK,
   "/api/ai/tools": aiTools,
+  "/api/ai/models": aiModels,
   "/api/owner/notifications": notifications,
   "/api/controls/inbox": inbox,
   "/api/controls/audit": audit,

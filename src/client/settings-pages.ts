@@ -7,7 +7,7 @@
  */
 import { routeHash } from "./router";
 
-export type SettingsPage = "overview" | "classic" | "yaml" | "history";
+export type SettingsPage = "overview" | "ai" | "team" | "classic" | "yaml" | "history";
 
 export interface PageDef {
   id: SettingsPage;
@@ -21,6 +21,17 @@ export const SETTINGS_PAGES: readonly PageDef[] = [
     id: "overview",
     label: "Overview",
     about: "What this project has set up, what needs you, and a link to where each part is fixed. Nothing here changes a setting.",
+  },
+  {
+    id: "ai",
+    label: "AI",
+    about:
+      "The AI tools Lair can start and whether each is signed in, the profiles (a tool and a model with a name), and the roles: who builds, who reviews each risk tier, who plans and who supervises.",
+  },
+  {
+    id: "team",
+    label: "Team",
+    about: "The agents (dragons): what each runs on and where. Select several to move them to another profile at once.",
   },
   {
     id: "classic",
@@ -54,9 +65,12 @@ export function pageHref(page: SettingsPage, detail: string | null = null, proje
   return routeHash({ section: "settings", tab: tabOf(page), detail, project });
 }
 
-/** The page that edits a YAML key (dotted, from the top level). */
+/** The page that edits a YAML key (dotted, from the top level): AI for the profiles and roles, Team for the agents. */
 export function pageForKey(key: string): SettingsPage {
-  return key === "" ? "overview" : "classic";
+  if (key === "") return "overview";
+  if (key === "ai" || key.startsWith("ai.profiles") || key.startsWith("ai.roles")) return "ai";
+  if (key === "dragons" || key.startsWith("dragons.")) return "team";
+  return "classic";
 }
 
 /** "1 unsaved change", "3 unsaved changes". */

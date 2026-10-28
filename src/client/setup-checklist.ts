@@ -89,8 +89,8 @@ export function setupChecklist(input: ChecklistInput): ChecklistItem[] {
   });
   return [
     repository(input, item("repository", "Repository", { label: "Project settings", href: link("classic", "project") })),
-    aiTools(input, item("ai", "AI tools signed in", { label: "AI settings", href: link("classic", "ai") })),
-    agents(input, item("agents", "Agents", { label: "Agents", href: link("classic", "dragons") })),
+    aiTools(input, item("ai", "AI tools signed in", { label: "AI", href: link("ai") })),
+    agents(input, item("agents", "Agents", { label: "Team", href: link("team") })),
     gates(input, item("gates", "Gates", { label: "Gate pipelines", href: link("classic", "pipelines") })),
     machines(input, item("machines", "Machines", { label: "Machines", href: link("classic", "machines") })),
     notifications(input, item("notifications", "Notifications", { label: "Notifications", href: link("classic", "notifications") })),

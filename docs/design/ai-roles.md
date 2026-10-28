@@ -12,7 +12,7 @@
 | **A6-2** | The write-only secret store for API-key tools (OS keychain, Secret Service, else a 0600 file), a profile's `secret_env`, rotation and removal | to do |
 | **A6-3** | Usage and cost per profile and role, budgets per role; reviewer calibration, and the warning for a weak profile on RED | to do |
 | **A6-4** | The supervisor started through `ai.roles.supervise` (with the supervisor, A3): built with S1-2 (`supervisor.agent` runs on the role's first profile and fails over along it; without it, the dragon on the role's first profile is the supervisor). ACP adapters; the conformance suite for every preset (B3): to do | part built |
-| **A7** | The UI: Settings → AI (tools and sign-in per machine, model dropdowns refilled per tool, "Other…" with its warning, "not offered any more", profiles, role dropdowns), on the APIs above | to do ([settings-v2.md](settings-v2.md)) |
+| **A7** | The UI: Settings → AI (tools and sign-in per machine, model dropdowns refilled per tool, "Other…" with its warning, "not offered any more", profiles, role dropdowns), on the APIs above | part built with S2-1 ([settings-v2.md](settings-v2.md)): the tools per machine with the fix and Refresh (`POST /api/ai/tools/refresh`), profiles in a drawer with the tool's own models and "Other…" with its warning, the roles as ordered lists, Team's model dropdowns. To do: "not offered any more", models per remote machine |
 
 Not in A6-1: a model a tool no longer lists is not yet flagged on the dragons and roles that use it (the lists are there; the check
 is A7's), and the agents module starts its runs on this machine only, so only this machine's sign-in state refuses a start (SSH

@@ -188,6 +188,8 @@ const ALL_ON = Object.fromEntries(Object.keys(FIXTURE_MODULES).map((k) => [k, tr
 /** Settings' own pages (settings-pages.ts), with the real registry's sections and the fixture project's settings */
 const SETTINGS_PAGES: { name: string; hash: string; shows: string }[] = [
   { name: "Overview", hash: "#/settings", shows: "build-2 doesn't answer" },
+  { name: "AI: tools, profiles and roles", hash: "#/settings?tab=ai", shows: "Reviewer for AMBER" },
+  { name: "Team: the agents", hash: "#/settings?tab=team", shows: "kiro-opus (kiro + claude-opus-4.5)" },
   { name: "All settings (classic), a field shown by the search", hash: "#/settings/watchdog.interval_seconds?tab=classic", shows: "Secrets" },
   { name: "YAML", hash: "#/settings?tab=yaml", shows: "The project's file" },
   { name: "History", hash: "#/settings?tab=history", shows: "saved from Settings" },
@@ -246,6 +248,40 @@ describe("accessibility: the Settings pages, signed in, with the modules on", ()
     await settle();
     const drawer = el.querySelector('[role="dialog"]')!;
     expect(drawer.querySelector("[data-settings-commands]")).not.toBeNull();
+    expect(await seriousViolations()).toEqual([]);
+  });
+
+  it("a profile's drawer, its model dropdown filled, then Other… with its warning: no serious or critical violations", async () => {
+    vi.stubGlobal("fetch", settingsFetch());
+    await signIn("owner-token");
+    const el = await renderAt("#/settings?tab=ai");
+    const row = [...el.querySelectorAll<HTMLElement>("[data-ai-profiles] tbody tr")].find((r) => r.textContent?.includes("kiro-opus"))!;
+    act(() => row.click());
+    await settle();
+    const drawer = el.querySelector('[role="dialog"]')!;
+    const model = drawer.querySelector<HTMLSelectElement>("[data-model-select]")!;
+    expect([...model.options].map((o) => o.value)).toContain("claude-opus-4.5");
+    expect(await seriousViolations()).toEqual([]);
+    act(() => {
+      model.value = "\u0000other";
+      model.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    type(drawer.querySelector<HTMLInputElement>("[data-model-other]")!, "a-new-model");
+    expect(drawer.querySelector("[data-model-warning]")).not.toBeNull();
+    expect(await seriousViolations()).toEqual([]);
+  });
+
+  it("Team: rows selected for a bulk move, and an agent's drawer: no serious or critical violations", async () => {
+    vi.stubGlobal("fetch", settingsFetch());
+    await signIn("owner-token");
+    const el = await renderAt("#/settings?tab=team");
+    act(() => el.querySelector<HTMLInputElement>('[data-select-agent="worker-a"]')!.click());
+    expect(el.querySelector("[data-bulk]")).not.toBeNull();
+    expect(await seriousViolations()).toEqual([]);
+    const row = [...el.querySelectorAll<HTMLElement>("[data-team-agents] tbody tr")].find((r) => r.textContent?.includes("worker-b"))!;
+    act(() => row.click());
+    await settle();
+    expect(el.querySelector('[role="dialog"]')?.querySelector("[data-model-select]")).not.toBeNull();
     expect(await seriousViolations()).toEqual([]);
   });
 });

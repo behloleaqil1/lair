@@ -6,34 +6,36 @@
  * routes (testing/settings-server.ts): real files, the real parsers, the
  * real history. Only the tools' command runner is fake.
  */
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { act, useEffect, useState } from "react";
-import { createRoot, type Root } from "react-dom/client";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { act } from "react";
 import { writeFileSync } from "fs";
 import { join } from "path";
-import { Settings } from "./components/Settings";
-import { parseRoute, routeHash } from "./router";
+import { parseRoute } from "./router";
 import { fieldIndex, searchSettings } from "./settings-search";
 import { setupChecklist, type ChecklistInput } from "./setup-checklist";
 import { settingsSections } from "../server/settings/index.js";
 import { answer, settingsServer, type SettingsServer, type SettingsServerOptions } from "./testing/settings-server";
+import {
+  button,
+  click,
+  drawer,
+  goTo,
+  key,
+  mountSettings,
+  saveBar,
+  setValue,
+  settle,
+  unmountSettings,
+  until,
+} from "./testing/settings-dom";
 
-let root: Root | null = null;
-let host: HTMLElement | null = null;
 let server: SettingsServer | null = null;
 
 // Each test starts a server and runs git: more than the default five seconds on a slow runner
 vi.setConfig({ testTimeout: 30_000 });
 
-beforeAll(() => {
-  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-});
-
 afterEach(async () => {
-  act(() => root?.unmount());
-  host?.remove();
-  root = null;
-  host = null;
+  unmountSettings();
   vi.unstubAllGlobals();
   await server?.close();
   server = null;
@@ -61,89 +63,12 @@ function shopYaml(dir: string, extra = ""): string {
   ].join("\n");
 }
 
-async function settle(rounds = 12) {
-  for (let i = 0; i < rounds; i++) {
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-  }
-}
-
-/** Wait for a condition the page reaches after its requests answer (a git or a tool's check among them). */
-async function until(what: string, done: () => boolean, rounds = 400) {
-  for (let i = 0; i < rounds && !done(); i++) {
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    });
-  }
-  if (!done()) throw new Error(`timed out waiting for ${what}\n${document.body.textContent?.slice(0, 2000)}`);
-}
-
-/** Settings as App.tsx mounts it: its route is the URL's hash, and `go` sets the hash. */
-function Page() {
-  const [route, setRoute] = useState(() => parseRoute(window.location.hash));
-  useEffect(() => {
-    const sync = () => setRoute(parseRoute(window.location.hash));
-    window.addEventListener("hashchange", sync);
-    return () => window.removeEventListener("hashchange", sync);
-  }, []);
-  return (
-    <Settings
-      project="shop"
-      refreshKey={0}
-      route={route}
-      go={(next) => {
-        window.location.hash = routeHash(next);
-      }}
-    />
-  );
-}
-
 async function open(options: Partial<SettingsServerOptions> & { hash?: string; owner?: boolean } = {}): Promise<HTMLElement> {
   server = await settingsServer({ yaml: (dir) => shopYaml(dir), ...options });
   vi.stubGlobal("fetch", server.fetch);
   if (options.owner !== false) await server.signIn();
-  window.history.replaceState(null, "", `/${options.hash ?? "#/settings"}`);
-  host = document.createElement("div");
-  document.body.appendChild(host);
-  root = createRoot(host);
-  act(() => root!.render(<Page />));
-  await settle();
-  return host;
+  return mountSettings(options.hash ?? "#/settings");
 }
-
-async function goTo(hash: string) {
-  act(() => {
-    window.location.hash = hash;
-  });
-  await settle();
-}
-
-function setValue(el: HTMLInputElement | HTMLTextAreaElement, value: string) {
-  const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-  act(() => {
-    Object.getOwnPropertyDescriptor(proto, "value")!.set!.call(el, value);
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-  });
-}
-
-function click(el: Element | null | undefined) {
-  expect(el, "the element to click").toBeTruthy();
-  act(() => {
-    (el as HTMLElement).click();
-  });
-}
-
-function key(el: Element, k: string) {
-  act(() => {
-    el.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, cancelable: true }));
-  });
-}
-
-const button = (within: ParentNode, text: string) =>
-  [...within.querySelectorAll("button")].find((b) => b.textContent?.trim() === text) as HTMLButtonElement | undefined;
-const drawer = () => document.querySelector<HTMLElement>('[role="dialog"]');
-const saveBar = () => document.querySelector<HTMLElement>("[data-settings-savebar]");
 
 describe("Settings is the owner's", () => {
   it("signed out, shows the sign-in hint and reads nothing of the project, the tools or the notifications", async () => {

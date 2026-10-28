@@ -468,9 +468,11 @@ export class AiToolsService implements ToolReadiness {
   /**
    * Every tool of the project, on this machine and on each SSH machine a
    * dragon of the project runs on (there, only that dragon's tools are
-   * checked, so no machine is asked about tools it never runs).
+   * checked, so no machine is asked about tools it never runs). `fresh`:
+   * check again now rather than answer from the last minute's checks
+   * (Settings → AI's Refresh).
    */
-  async tools(project: string, config: ProjectConfig | null): Promise<AiToolsView> {
+  async tools(project: string, config: ProjectConfig | null, fresh = false): Promise<AiToolsView> {
     const tools = this.toolList(config);
     const machines = this.machineList(config);
     const use = this.inUse(config);
@@ -490,7 +492,7 @@ export class AiToolsService implements ToolReadiness {
           modelsCmd: tool.modelsCmd !== undefined,
           knownModels: knownModels(tool.adapter.models).length,
           inUse: use.all.has(tool.id),
-          machines: await Promise.all(on.map((machine) => this.status(machine, tool, config))),
+          machines: await Promise.all(on.map((machine) => this.status(machine, tool, config, fresh))),
         };
       }),
     );

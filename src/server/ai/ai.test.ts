@@ -848,6 +848,7 @@ describe("the AI tools API is the owner's, reads included", () => {
     const { app, runner, owner } = await serve();
     const routes: ["GET" | "POST", string, unknown?][] = [
       ["GET", "/api/ai/tools?project=demo"],
+      ["POST", "/api/ai/tools/refresh", { project: "demo" }],
       ["GET", "/api/ai/models?tool=kiro&project=demo"],
       ["POST", "/api/ai/models/refresh", { tool: "kiro", project: "demo" }],
     ];
@@ -880,6 +881,25 @@ describe("the AI tools API is the owner's, reads included", () => {
     expect((await app.inject({ url: "/api/ai/models?tool=-x", headers: owner })).statusCode).toBe(400);
     expect((await app.inject({ url: "/api/ai/tools?project=../etc", headers: owner })).statusCode).toBe(400);
     expect((await app.inject({ url: "/api/ai/tools?project=other", headers: owner })).statusCode).toBe(400);
+  });
+
+  it("Refresh (Settings → AI) checks again now: a tool signed in since the last check shows signed in", async () => {
+    let signedIn = false;
+    const { app, runner, owner } = await serve((argv) => {
+      if (argv.join(" ") !== "kiro-cli whoami") return undefined;
+      return signedIn ? out("Logged in with Builder ID\n") : out("Not logged in\n", 1);
+    }, binWith("kiro-cli"));
+    const kiro = (body: string): string =>
+      JSON.parse(body).data.tools.find((t: { id: string }) => t.id === "kiro").machines[0].signIn.state;
+    expect(kiro((await app.inject({ url: "/api/ai/tools?project=demo", headers: owner })).body)).toBe("signed_out");
+    signedIn = true;
+    // Within the minute: the last check's answer
+    expect(kiro((await app.inject({ url: "/api/ai/tools?project=demo", headers: owner })).body)).toBe("signed_out");
+    const refreshed = await app.inject({ method: "POST", url: "/api/ai/tools/refresh", headers: owner, payload: { project: "demo" } });
+    expect(refreshed.statusCode).toBe(200);
+    expect(kiro(refreshed.body)).toBe("signed_in");
+    expect(runner.commands().filter((c) => c === "kiro-cli whoami")).toHaveLength(2);
+    expect((await app.inject({ method: "POST", url: "/api/ai/tools/refresh", headers: owner, payload: { project: "../etc" } })).statusCode).toBe(400);
   });
 
   it("never answers with a tool's own output: the sign-in portal, profile ARN and account stay out", async () => {
