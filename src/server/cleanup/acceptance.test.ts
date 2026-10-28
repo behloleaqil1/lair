@@ -587,7 +587,7 @@ describe("Cleanup acceptance tests", () => {
         audit,
       );
 
-      const result = await service.runCycle();
+      await service.runCycle();
       // Main worktree is always skipped
       expect(cmd.removedWorktrees).not.toContain("/repo");
     });
@@ -715,7 +715,7 @@ describe("Cleanup acceptance tests", () => {
       setupWorktree("/repo-feature", "feature", 48);
 
       let pruneCount = 0;
-      cmd.run = async (c, args, opts) => {
+      cmd.run = async (c, args, _opts) => {
         if (args.includes("worktree") && args.includes("prune")) {
           pruneCount++;
           return { stdout: "", stderr: "", code: 0 };

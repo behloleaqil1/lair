@@ -1,7 +1,6 @@
 /**
  * Cleanup service: the tick loop that runs cleanup cycles.
  */
-import * as path from "path";
 import type { Clock, FileSystem, CommandRunner, GitHost } from "./probes.js";
 import type { CleanupSettings } from "./config.js";
 import { getConfiguredRoots } from "./config.js";

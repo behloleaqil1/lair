@@ -2,7 +2,6 @@ import { describe, it, expect, beforeEach } from "vitest";
 import {
   parseGithubRemote,
   checkWorktreeRemovability,
-  listWorktrees,
 } from "./worktree.js";
 import type { Clock, FileSystem, CommandRunner, GitHost, WorktreeInfo } from "./probes.js";
 import { parseWorktreeList } from "./probes.js";

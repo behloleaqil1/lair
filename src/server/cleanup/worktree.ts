@@ -1,7 +1,6 @@
 /**
  * Worktree enumeration and removability checks.
  */
-import * as path from "path";
 import type {
   Clock,
   FileSystem,

@@ -136,7 +136,7 @@ export async function cleanupRoutes(
         },
       },
     },
-    async (req, reply) => {
+    async (req, _reply) => {
       const { project, limit } = req.query;
       const limitNum = Math.min(parseInt(limit || "100", 10), 500);
 
@@ -170,7 +170,7 @@ export async function cleanupRoutes(
         },
       },
     },
-    async (req, reply) => {
+    async (req, _reply) => {
       const { project, limit } = req.query;
       const limitNum = Math.min(parseInt(limit || "20", 10), 100);
 
@@ -202,7 +202,7 @@ export async function cleanupRoutes(
         },
       },
     },
-    async (req, reply) => {
+    async (req, _reply) => {
       const { project } = req.query;
 
       const now = Date.now();

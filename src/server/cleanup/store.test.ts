@@ -112,7 +112,7 @@ describe("CleanupStore", () => {
       const cycle2 = store.startCycle("test", "act");
       store.finishCycle(cycle2.id, 2, 200, 1);
 
-      const cycle3 = store.startCycle("test", "observe"); // Incomplete
+      store.startCycle("test", "observe"); // Incomplete
 
       const last = store.getLastCompletedCycle("test");
       expect(last).toBeTruthy();
