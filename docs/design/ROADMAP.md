@@ -44,6 +44,19 @@ Lair now runs its first project's development day to day, so Lair itself is the 
 - **automating the whole of development organically**, from version control, planning and code through tests,
   reviews and merges to deployments and product analytics.
 
+**One place for every level.** Lair runs the whole of building an application, each level with its own stage, its
+gates and the human decisions that are the owner's:
+
+| Level | What Lair does | Design |
+|---|---|---|
+| Design | users, journeys, screens, a design system as code, accessibility and visual checks on every change | [app-design.md](app-design.md) |
+| Architecture | requirements to quality attributes, options with prices, ADRs, infrastructure as code, fitness functions | [app-architecture.md](app-architecture.md) |
+| Development | parallel agents by AI role, the planner, fill, gates, reviews by risk tier, merges | [ai-roles.md](ai-roles.md), [planner.md](planner.md), [runners.md](runners.md) |
+| QA | test integrity, contracts, migrations, security, performance, exploratory testing, triage | [quality.md](quality.md), [autonomy.md](autonomy.md) |
+| Deployment | preview, staging and production environments, releases, rollbacks | [phase5-deploy.md](phase5-deploy.md) |
+| Cloud and cost | connected accounts, machines that exist only while needed, hard money limits | [cloud-accounts.md](cloud-accounts.md), [cloud-runners.md](cloud-runners.md) |
+| Operations and analytics | health, incidents, product analytics, launch readiness | [launch-kit.md](launch-kit.md), [supervisor.md](supervisor.md) |
+
 The engineer, of any level, describes the application (or points Lair at a repository), picks the AI tools and models
 they have, and answers only the decisions that are theirs. Every step below is judged against that. The order:
 

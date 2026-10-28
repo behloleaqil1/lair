@@ -58,6 +58,28 @@ layout, fitness functions and a delivery setup.
   - backups and DR;
   - cost budgets.
 
+## Cloud services, cost and environments
+
+The architecture is not done until it names where each part runs and what it costs. With the project's cloud account
+connected ([cloud-accounts.md](cloud-accounts.md)):
+
+- **Parts to services.** Lair reasons in provider-neutral parts (compute, database, cache, queue, object storage, CDN,
+  email, identity, secrets, observability) and maps each to the services of the chosen provider, or to the project's
+  own servers. The owner can override any pick; the ADR records why.
+- **Options with prices.** Each option shows a monthly cost from the provider's price list at today's expected load and
+  at ten times that, plus operating effort, scaling limits and lock-in. A cheap single-machine start that can grow is
+  always one of the options for a new product.
+- **Checked against the provider's guidance.** Security, reliability, performance, cost and operations checks in the
+  spirit of the providers' well-architected frameworks run on every option, and the findings go into the ADR.
+- **Infrastructure as code in the repository.** The chosen architecture becomes infrastructure code (Terraform, CDK,
+  CloudFormation or the provider's own format), gated and reviewed like any code: policy checks for misconfiguration,
+  and a cost diff on every pull request ([cloud-accounts.md §6](cloud-accounts.md)).
+- **Environments.** Preview environments per pull request, staging and production, each with its own budget, deployed
+  by Lair's pipelines ([phase5-deploy.md](phase5-deploy.md)).
+- **Right-sizing and evolution.** Real metrics and bills feed back: Lair suggests a smaller database or a cache, and a
+  change of load, features or cost starts a new ADR with a migration plan, through the loop below. It never changes the
+  architecture silently.
+
 ## How the stage runs
 
 1. **Gather.** The architect agent drafts requirements and quality attributes from the owner's description (or from
