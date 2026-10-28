@@ -704,9 +704,6 @@ describe("verifier acceptance tests", () => {
     await h.service.cycle();
 
     // Second verifier should be SKIPPED (max_runs_per_day: 1)
-    // Check run state
-    const runs = runsOf(h);
-    const secondRun = runs.find((r) => r.state === "done" || r.state === "running" && r.verifierState !== "running");
     // The verifier should not be spawned again
     const verifierCountAfter = h.spawner.calls.filter((c) => c.env.LAIR_AGENT === "verifier").length;
     expect(verifierCountAfter).toBe(1); // Still just 1
