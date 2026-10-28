@@ -133,6 +133,14 @@ function scanFile(relativePath: string): string[] {
 }
 
 describe("route handlers must not use synchronous child-process APIs", () => {
+  /**
+   * Files scanned:
+   * - All route files listed in ROUTE_FILES
+   * - All service files listed in SERVICE_FILES
+   *
+   * The test ensures that route handlers don't block the event loop
+   * with synchronous child-process calls.
+   */
   it("route files do not call execSync, execFileSync or spawnSync", () => {
     const issues: string[] = [];
     
@@ -143,6 +151,7 @@ describe("route handlers must not use synchronous child-process APIs", () => {
     if (issues.length > 0) {
       throw new Error(
         `Found synchronous child-process calls in route handlers:\n${issues.join("\n")}\n\n` +
+        `Scanned files: ${ROUTE_FILES.join(", ")}\n` +
         "Route handlers must not block the event loop. Use async alternatives or the process cache."
       );
     }
@@ -157,6 +166,8 @@ describe("route handlers must not use synchronous child-process APIs", () => {
     // as follow-up work.
     //
     // When the migration is complete, change this back to `it(...)`.
+    //
+    // Files scanned: services/data.ts, services/log-tail.ts
     const issues: string[] = [];
     
     for (const file of SERVICE_FILES) {
@@ -166,6 +177,7 @@ describe("route handlers must not use synchronous child-process APIs", () => {
     if (issues.length > 0) {
       throw new Error(
         `Found synchronous child-process calls in service files:\n${issues.join("\n")}\n\n` +
+        `Scanned files: ${SERVICE_FILES.join(", ")}\n` +
         "Service files called from routes must not block the event loop. " +
         "Move these to background refreshers with the AsyncCache."
       );

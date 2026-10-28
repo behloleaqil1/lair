@@ -18,7 +18,8 @@
  */
 import { describe, expect, it } from "vitest";
 import { AsyncCache } from "./core/async-cache.js";
-import { ProcessCache } from "./core/process-cache.js";
+import { ProcessCache, CachedProcessTable } from "./core/process-cache.js";
+import { ProjectDataCache, DataCacheManager } from "./services/data-cache.js";
 
 describe("AsyncCache single-flight", () => {
   it("acceptance 5: single-flight refresher never runs two at once", async () => {
@@ -103,47 +104,6 @@ describe("ProcessCache bounded output", () => {
 });
 
 describe("ProcessCache stale handling", () => {
-  it("acceptance 2: failing snapshot keeps last good one marked stale", async () => {
-    let shouldFail = false;
-    let refreshCount = 0;
-    
-    // We need to test the cache behavior, so we'll create a mock-like test
-    const cache = new AsyncCache({
-      refresh: async () => {
-        refreshCount++;
-        if (shouldFail) throw new Error("ps failed");
-        return [{ pid: 1, command: "init" }];
-      },
-      maxAgeMs: 100,
-    });
-
-    // First get succeeds
-    const first = await cache.get();
-    expect(first.value).toHaveLength(1);
-    expect(first.stale).toBe(false);
-    expect(refreshCount).toBe(1);
-
-    // Make refresh fail
-    shouldFail = true;
-
-    // Clear cache to force refresh
-    cache.clear();
-
-    // Should return stale value (but we cleared it, so it will throw)
-    // Let's test with the cache not cleared - advance time instead
-    shouldFail = false;
-    const second = await cache.get();
-    expect(second.value).toHaveLength(1);
-    
-    // Now with a cached value, make it fail
-    shouldFail = true;
-    cache.clear();
-    
-    // Repopulate first
-    shouldFail = false;
-    await cache.get();
-  });
-
   it("acceptance 2: stale value returned on refresh failure", async () => {
     let now = 0;
     let shouldFail = false;
@@ -171,6 +131,35 @@ describe("ProcessCache stale handling", () => {
     expect(second.value).toHaveLength(1);
     expect(second.stale).toBe(true);
     expect(second.error).toContain("ps failed");
+  });
+});
+
+describe("CachedProcessTable adapter", () => {
+  it("adapts ProcessCache to ProcessTable interface", async () => {
+    // Create a mock cache that returns known processes
+    const mockCache = new AsyncCache({
+      refresh: async () => [
+        { pid: 1, ppid: 0, elapsedSeconds: 100, argv: ["init"], command: "init" },
+        { pid: 42, ppid: 1, elapsedSeconds: 50, argv: ["node"], command: "node server.js" },
+      ],
+      maxAgeMs: 60_000,
+    });
+    
+    // Create a ProcessCache-like wrapper for the test
+    const cache = {
+      async get() {
+        const entry = await mockCache.get();
+        return { processes: entry.value, takenAt: entry.refreshedAt, stale: entry.stale, ageMs: entry.ageMs };
+      },
+    };
+    
+    const table = new CachedProcessTable(cache as ProcessCache);
+    
+    // list() should return the cached processes
+    const processes = await table.list();
+    expect(processes).toHaveLength(2);
+    expect(processes[0].pid).toBe(1);
+    expect(processes[1].pid).toBe(42);
   });
 });
 
@@ -203,8 +192,9 @@ describe("transient outage handling", () => {
    * Acceptance test 4: A 25-minute transient outage across 5 agents raises
    * no decision. A 40-minute one raises exactly one, naming the provider.
    *
-   * This test verifies the transient outage behavior by testing the
-   * configuration and the decision-raising logic.
+   * This test verifies the transient outage configuration is parsed correctly
+   * and has the right defaults. The actual decision-raising logic is tested
+   * in the agents module's acceptance tests.
    */
   it("acceptance 4: transient outage timing and single decision", async () => {
     // The agents module already has transient handling with transient_max_minutes
@@ -293,5 +283,38 @@ describe("cache age tracking", () => {
     const peeked = cache.peek();
     expect(peeked?.ageMs).toBe(1000);
     expect(refreshCount).toBe(1);
+  });
+});
+
+describe("DataCacheManager", () => {
+  it("manages caches for multiple projects", () => {
+    const manager = new DataCacheManager();
+    
+    // Create cache for two projects
+    const config1 = { name: "project1", repo: "/tmp/repo1", agents_dir: "/tmp/a1", gates_dir: "/tmp/g1", queue_file: "/tmp/q1" };
+    const config2 = { name: "project2", repo: "/tmp/repo2", agents_dir: "/tmp/a2", gates_dir: "/tmp/g2", queue_file: "/tmp/q2" };
+    
+    const cache1 = manager.getCache(config1 as any);
+    const cache2 = manager.getCache(config2 as any);
+    
+    // Same config returns same cache
+    expect(manager.getCache(config1 as any)).toBe(cache1);
+    expect(manager.getCache(config2 as any)).toBe(cache2);
+    
+    // Different projects have different caches
+    expect(cache1).not.toBe(cache2);
+    
+    // Cleanup
+    manager.stopAll();
+  });
+  
+  it("stops all caches on stopAll", () => {
+    const manager = new DataCacheManager();
+    
+    const config = { name: "test", repo: "/tmp", agents_dir: "/tmp", gates_dir: "/tmp", queue_file: "/tmp/q" };
+    manager.getCache(config as any);
+    
+    // Should not throw
+    manager.stopAll();
   });
 });

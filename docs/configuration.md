@@ -965,6 +965,30 @@ The token stops working after its hour, when you revoke it, or when Lair restart
 
 The chat's and the digest's routes are in [Supervisor chat and digest](#chat-and-digest-api).
 
+### Process cache (A2)
+
+Lair uses a single, shared process cache for all modules that need the process table (agents, watchdog, health checks). Under load, each module calling `ps` itself would pile up and time out when the event loop was blocked for more than 10 seconds. Now one cache refreshes in the background every 5 seconds, and every module reads from it immediately.
+
+**Behavior:**
+- A failed `ps` keeps the last good snapshot, marked stale. Routes answer from the stale cache, not with an error.
+- A `ps` timeout that fires after the child has already exited (the event loop was blocked, not `ps` itself) counts as success if the output is valid.
+- A cache older than 10 seconds shows as stale; the dashboard shows the cache age.
+
+**Configuration** (environment variables; these are server-wide, not per project):
+
+| Name | Default | Description |
+|------|---------|-------------|
+| `LAIR_PROCESS_CACHE_INTERVAL_MS` | `5000` | How often to refresh the cache in the background |
+| `LAIR_PROCESS_CACHE_MAX_AGE_MS` | `10000` | Maximum age before the cache is considered stale |
+| `LAIR_PROCESS_CACHE_TIMEOUT_MS` | `15000` | Timeout for the ps command |
+
+**Data cache.** Dashboard routes that call `gh` or `git` (which can take seconds under load) also use an async cache:
+- Pull requests (`/api/prs`): refreshed every 30 seconds, max age 60 seconds.
+- Merged PRs: refreshed every 30 seconds, max age 120 seconds.
+- Git info (main head): refreshed every 30 seconds, max age 30 seconds.
+
+The response includes a `cache` object with `ageMs`, `stale`, `refreshedAt` and (on failure) `error`.
+
 ## Supervisor chat and digest
 
 > Off by default: nothing changes until you set `supervisor.chat.enabled` or `supervisor.digest.enabled`. Design: [supervisor.md](design/supervisor.md) (S1-2). Each question and each digest is one run of an AI agent, so each costs what a run of that tool and model costs; the bounds below and the [agents module's budgets](#agents) cap how many there are.
