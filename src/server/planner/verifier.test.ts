@@ -7,16 +7,14 @@
  * doesn't exist.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { readFileSync, writeFileSync } from "fs";
 import { join } from "path";
-import type { ProposalView } from "../../shared/planner-types.js";
 import {
   at,
   cleanup,
   makePaths,
   MIN,
   plannerBlock,
-  promptOf,
   runPlannerAgent,
   SEC,
   setup,
