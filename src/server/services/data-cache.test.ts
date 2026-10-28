@@ -76,12 +76,17 @@ describe("ProjectDataCache", () => {
       gitTimeoutMs: 100,
     });
 
-    cache.start(50);
-    await new Promise((r) => setTimeout(r, 100));
+    cache.start(100);
+    // Wait for initial refresh to complete (not just start)
+    await new Promise((r) => setTimeout(r, 200));
+    
+    // Capture timestamp after refreshes have settled
     const first = cache.peekPullRequests()?.refreshedAt;
 
     cache.stop();
-    await new Promise((r) => setTimeout(r, 200));
+    
+    // Wait longer than the refresh interval to verify no new refreshes
+    await new Promise((r) => setTimeout(r, 300));
 
     // Should be same as before stop
     const after = cache.peekPullRequests()?.refreshedAt;
