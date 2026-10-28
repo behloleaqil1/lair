@@ -201,7 +201,7 @@ describe("Settings → AI", () => {
     await until("the profiles", () => el.querySelector("[data-ai-profiles] tbody tr") !== null);
     click(button(el.querySelector("[data-ai-profiles]")!, "Add a profile"));
     setValue(drawer()!.querySelector<HTMLInputElement>("[data-profile-name]")!, "custom");
-    choose(drawer()!.querySelector("[data-tool-select]"), "test-cli");
+    choose(drawer()!.querySelector<HTMLSelectElement>("[data-tool-select]"), "test-cli");
     const model = () => drawer()!.querySelector<HTMLSelectElement>("[data-model-select]");
     await until("test-cli's models", () => values(model()).includes("model-x"));
     expect(drawer()!.querySelector("[data-model-warning]")).toBeNull();
@@ -274,7 +274,7 @@ describe("Settings → Team", () => {
     click(button(el.querySelector("[data-team-agents]")!, "Add an agent"));
     setValue(drawer()!.querySelector<HTMLInputElement>("[data-agent-id]")!, "worker-d");
     click(drawer()!.querySelector('[data-runs-on="own"]'));
-    choose(drawer()!.querySelector("[data-tool-select]"), "test-cli");
+    choose(drawer()!.querySelector<HTMLSelectElement>("[data-tool-select]"), "test-cli");
     const model = () => drawer()!.querySelector<HTMLSelectElement>("[data-model-select]");
     await until("test-cli's models", () => values(model()).includes("model-y"));
     choose(model(), "model-y");
