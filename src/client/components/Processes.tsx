@@ -6,7 +6,7 @@
  * - Start/Stop/Restart buttons
  * - Expandable log viewer per process
  */
-import { useState, useEffect } from "react";
+import { Fragment, useState, useEffect } from "react";
 import { useApi } from "../hooks/useApi";
 import { processAction } from "../owner-actions";
 import { SignInHint } from "./SignInHint";
@@ -140,7 +140,7 @@ export function Processes({ project, refreshKey }: Props) {
             </thead>
             <tbody>
               {processes.map((proc) => (
-                <>
+                <Fragment key={proc.id}>
                   <tr
                     key={proc.id}
                     className={`clickable${expandedProcess === proc.id ? " selected" : ""}`}
@@ -244,7 +244,7 @@ export function Processes({ project, refreshKey }: Props) {
                       </td>
                     </tr>
                   )}
-                </>
+                </Fragment>
               ))}
             </tbody>
           </table>

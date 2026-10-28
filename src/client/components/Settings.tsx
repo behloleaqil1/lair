@@ -193,7 +193,9 @@ export function Settings({ project, refreshKey }: Props) {
       <div className="row row-lg mb-4">
         <h2>Settings</h2>
         <select
-          className="input" style={{ width: "auto" }}
+          className="input"
+          style={{ width: "auto" }}
+          aria-label="Project"
           value={selected}
           onChange={(e) => {
             if (dirty && !window.confirm("Discard your unsaved changes?")) return;
