@@ -11,6 +11,7 @@ const mockConfig: ProjectConfig = {
   agents_dir: "/tmp/test-agents",
   gates_dir: "/tmp/test-gates",
   queue_file: "/tmp/test-queue.md",
+  github: "example/test-repo",
   machines: {},
 };
 
