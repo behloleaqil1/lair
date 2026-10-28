@@ -2180,11 +2180,11 @@ Its **only output** is the proposal file, `<work_dir>/<run id>/proposals.json`:
 - In `act` mode accepted proposals are applied at once, except ops with `approval: always` (default: `finish`, `reassign`, `drop` and `unblock`; only `add` and `reword` apply by themselves); in `observe` mode all of them wait. A task the queue reports done is the rules' to mark, so a `finish` of the planner's own has no done line behind it, and an `unblock` starts again work fill held: you see each one. Waiting proposals are listed in the Planner view, where you approve or reject each one or a whole run, and each run with waiting proposals raises one [Decision Inbox](#decision-inbox) decision ("Apply them all" or "Reject them all"). An approval is checked again against the tasks file as it is then. **Approving writes the tasks file, in observe mode too.**
 
 **The verifier** (`verifier:`, optional) is a second agent that reviews accepted proposals before they are applied or sent to you. After the planner's proposals pass Lair's schema and rule checks, the verifier runs and returns per-proposal verdicts:
-- `pass`: the proposal makes sense in context; it proceeds to auto-apply (if `approval: never`) or waits for you (if `approval: always`);
-- `fail`: the proposal conflicts with reality; it is refused with the verifier's reason;
-- `defer`: the verifier can't tell; the proposal waits for you even when `approval: never`.
+- `approve`: the proposal makes sense in context; it proceeds to auto-apply (if listed in `auto_apply` and in act mode) or waits for you;
+- `reject`: the proposal conflicts with reality (the task is done, a dependency isn't ready, the scope is wrong); the proposal waits for you with the verifier's reason shown, and is auto-rejected only if the op is listed in `auto_reject` and the project is in act mode;
+- `unsure`: the verifier can't tell; the proposal waits for you even when its op is in `auto_apply`.
 
-Proposals without a verdict are treated as `defer`. Ops in `skip_ops` (default: `["finish"]`) bypass verification entirely. A malformed verdicts file fails the verifier run, but proposals proceed as `defer`. The decision context shows each proposal's verdict.
+Proposals without a verdict are treated as `unverified`. When verification is off or all attempts fail, every proposal is `unverified` and the decision says "Not verified: Lair only checked the format" with a `reject_all` recommendation. A malformed verdicts file fails the verifier run; the proposals proceed as `unverified`. The decision context shows each proposal's verdict, reason and evidence. When verdicts are mixed, the decision offers a **follow_verifier** option: apply the approved ones, reject the rest with the verifier's reasons. `drop` may never be in `auto_apply` (config error).
 
 - **The planner agent can't edit the tasks file.** In `act` mode a change to it while a planner run is active is put back, that run's proposals are refused, and you get a decision with the diff (go on, or pause planner runs). In `observe` mode, where another tool may still write the file, the change is recorded and kept. Running agents as a separate OS user is what makes the file unwritable for them. Its `text` only becomes a description, which fill shows and never puts into a prompt.
 
@@ -2246,7 +2246,11 @@ planner:
 | `verifier.id` | string | — | The verifier agent (optional): a known agent, not in `agents.fill.agents`, not the planner agent |
 | `verifier.prompt_file` | string | — | Its prompt template, in `prompts_dir`. `{prompts_dir}`, `{agent}`, `{task}` |
 | `verifier.max_runs_per_day` | number | `48` | Verifier runs that may start in any 24 hours |
-| `verifier.skip_ops` | array | `["finish"]` | Ops that skip verification and proceed straight to approval rules |
+| `verifier.skip_ops` | array | `[]` | Ops that skip verification and proceed straight to approval rules |
+| `verifier.auto_apply` | array | `[]` | In act mode, ops whose approved proposals apply without the owner. `drop` may never be listed (config error) |
+| `verifier.auto_reject` | array | `[]` | In act mode, ops whose rejected proposals are declined without the owner |
+| `verifier.timeout_seconds` | number | `900` | How long a verifier run may take before it is retried |
+| `verifier.attempts` | number | `2` | How many times to retry a failed or timed-out verifier run |
 | `approval.<op>` | `never` \| `always` | `finish`, `reassign`, `drop`, `unblock`: `always`; `add`, `reword`: `never` | Ops that wait for you in `act` mode |
 | `attempts_per_task` | number | `2` | Planner runs per blocked task; then you decide |
 | `max_failed_runs` | number | `3` | Failed planner runs in a row before runs pause |

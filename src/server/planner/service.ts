@@ -1774,6 +1774,12 @@ export class PlannerService {
     return this.store.listChanges(this.project, limit);
   }
 
+  /** Verifier agreement stats for the last 7 days: how often the owner's decision matched the verifier's verdict. */
+  verifierAgreement(): { agreed: number; total: number } {
+    const sevenDaysAgo = this.clock.now() - 7 * 24 * 60 * 60 * 1000;
+    return this.store.verifierAgreement(this.project, sevenDaysAgo);
+  }
+
   // ============ LIFECYCLE ============
 
   /** Cycle soon, then every interval_seconds, until stop(). */

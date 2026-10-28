@@ -234,48 +234,60 @@ that directory, valid JSON.
 The verifier writes a JSON file:
 
 ```json
-{"verdicts": [{"proposal": 0, "verdict": "pass", "reason": "the plan shows feat-search ready"}]}
+{"verdicts": [{"proposal": 0, "verdict": "approve", "reason": "the plan shows feat-search ready", "evidence": ["plan.md line 42: feat-search depends on feat-auth (done)"]}]}
 ```
 
 Each item names a proposal by its index (0-based, in the order the planner proposed them) and one of three verdicts:
 
-- **pass**: the proposal makes sense in context. If its op has `approval: never`, it applies without asking the
-  owner; otherwise it waits as usual.
-- **fail**: the proposal conflicts with reality (the task is actually done, the dependency isn't ready, the scope is
-  wrong). The proposal is refused with the verifier's reason.
-- **defer**: the verifier can't tell; the owner decides even when `approval: never` (turned into `always` for this
-  proposal).
+- **approve**: the proposal makes sense in context. If its op is in `auto_apply` (act mode only), it applies without
+  asking the owner; otherwise it waits.
+- **reject**: the proposal conflicts with reality (the task is actually done, the dependency isn't ready, the scope is
+  wrong). The proposal **waits for the owner** with the verifier's reason shown (no silent rejection). If its op is
+  in `auto_reject` (act mode only), it is declined automatically.
+- **unsure**: the verifier can't tell; the owner decides even when the op is in `auto_apply`.
 
-An accepted proposal without a verdict is treated as `defer` (the verifier said nothing about it). A verdict for a
-proposal the checks already refused is ignored. The verifier's text (reason) only ever becomes part of the stored
-refusal or a note in the decision; it never reaches any prompt.
+An accepted proposal without a verdict is treated as **unverified**. A verdict for a proposal the checks already
+refused is ignored. The verifier's text (reason) and evidence lines become part of the stored verdict and the
+decision context; they never reach any prompt.
 
 ### Applying with verification
 
 After the verifier run ends:
 
-1. Each verdict is recorded on its proposal (`verifier_verdict`, `verifier_reason`).
+1. Each verdict is recorded on its proposal (`verifier_verdict`, `verifier_reason`, `verifier_evidence`).
 2. For each accepted proposal (not refused by checks):
-   - `fail`: the proposal is refused, with the verifier's reason as the refusal.
-   - `pass` and `approval: never`: the proposal is applied without asking.
-   - `pass` and `approval: always`, or `defer`: the proposal waits for the owner.
-3. If proposals wait, the decision shows them with their verdicts ("the verifier passed 2, deferred 1, failed 1").
+   - `approve` and op in `auto_apply` (act mode): the proposal is applied without asking.
+   - `reject` and op in `auto_reject` (act mode): the proposal is declined with the verifier's reason.
+   - Everything else waits for the owner.
+3. If proposals wait, the decision shows them with their verdicts, reasons and evidence.
 
-The decision context lists each proposal with its verdict and reason, so the owner knows what the verifier thought.
+The decision offers three options:
+
+- **approve_all**: apply every waiting proposal (checked again against the tasks file as it is then).
+- **reject_all**: decline all of them.
+- **follow_verifier** (only when verdicts are mixed): apply the approved ones, decline the rest with the verifier's reasons.
+
+Recommendations:
+
+- All approved → `approve_all`.
+- All rejected or unsure → `reject_all`.
+- Mixed → `follow_verifier`.
+- Not verified (verifier off, or all attempts failed) → `reject_all` with the reason: "Rejecting costs an idle agent
+  until the next planner run; approving an unchecked change can start the wrong work."
 
 ### What the verifier can't do
 
 The same restrictions as the planner agent: it can't edit the tasks file (Lair keeps the content), it can't reach a
 worker's prompt (its reason text stays in the store and the decision), and it can't pass off an arbitrary file as
 verdicts (path-checked, bounded, schema-checked). A malformed verdicts file fails the verifier run; the proposals
-proceed as if the verifier said `defer` for all of them (the owner sees a note), and after `max_failed_runs` verifier
-failures the owner is asked once ("disable verifier" or "retry").
+proceed as `unverified` (the owner sees "Not verified"), and after all `attempts` are exhausted the decision
+recommends `reject_all`.
 
 ### Skipping verification
 
 Verification runs only when `planner.verifier` is configured. A project that doesn't need it leaves the block out.
 The verifier can also be disabled per-op: `planner.verifier.skip_ops` lists ops that bypass the verifier and proceed
-straight to approval rules (default: `["finish"]` — a finish has no plan context to verify).
+straight to approval rules (default: `[]`). `drop` may never appear in `auto_apply` (config error).
 
 ## Not built
 

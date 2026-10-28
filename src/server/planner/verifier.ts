@@ -135,9 +135,17 @@ export function verifierSection(input: {
     reason: p.reason,
   }));
 
+  // Guard against corrupt context.json (minor fix from review)
+  let contextData: unknown;
+  try {
+    contextData = JSON.parse(input.context.json);
+  } catch {
+    contextData = { note: "context.json was corrupt and could not be parsed" };
+  }
+
   const dataBundle = {
     proposals: proposalsData,
-    context: JSON.parse(input.context.json),
+    context: contextData,
   };
 
   const lines = [
@@ -149,7 +157,7 @@ export function verifierSection(input: {
     "",
     "For each proposal, decide:",
     "- **approve**: the proposal makes sense; it should be applied (or wait for the owner, depending on its op)",
-    "- **reject**: the proposal conflicts with reality (the task is done, a dependency isn't ready, scope is wrong); it will be refused with your reason",
+    "- **reject**: the proposal conflicts with reality (the task is done, a dependency isn't ready, scope is wrong); shown to the owner with your reason (auto-rejected only if the project opts in)",
     "- **unsure**: you can't tell; the owner will decide even if this op would normally auto-apply",
     "",
     "If you don't return a verdict for a proposal, it's treated as unsure.",

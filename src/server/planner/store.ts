@@ -612,4 +612,28 @@ export class PlannerStore {
   resetAttempts(project: string, task: string): void {
     this.db.prepare(`DELETE FROM planner_attempts WHERE project = ? AND task = ?`).run(project, task);
   }
+
+  /**
+   * Verifier agreement stats for the last 7 days: how often the owner's final
+   * decision matched the verifier's verdict. Only counts proposals the owner
+   * decided (decided_by starts with "owner").
+   */
+  verifierAgreement(project: string, since: number): { agreed: number; total: number } {
+    const rows = this.db
+      .prepare(
+        `SELECT verifier_verdict, status FROM planner_proposals
+         WHERE project = ? AND decided_at > ? AND decided_by LIKE 'owner%' AND verifier_verdict IS NOT NULL`,
+      )
+      .all(project, since) as { verifier_verdict: string; status: string }[];
+
+    let agreed = 0;
+    let total = 0;
+    for (const row of rows) {
+      total++;
+      // Agreement: verifier approved and owner applied, or verifier rejected/unsure and owner declined
+      if (row.verifier_verdict === "approve" && row.status === "applied") agreed++;
+      else if ((row.verifier_verdict === "reject" || row.verifier_verdict === "unsure") && row.status === "declined") agreed++;
+    }
+    return { agreed, total };
+  }
 }
