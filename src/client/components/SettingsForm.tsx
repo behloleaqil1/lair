@@ -4,8 +4,10 @@
  * its enable switch, defaults as placeholders, advanced fields folded,
  * commands marked, errors under their field, and keys no schema knows shown
  * read-only. Edits go up as (path, value) pairs; undefined removes a key.
+ * `focus` (a Settings search pick, or a link) opens a section, unfolds what
+ * holds the field, and scrolls to it and focuses it.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import type { FieldError, KnownValues, PathSegment, SettingsSection } from "../../shared/settings-types";
 import { isPlainObject } from "../../shared/settings-rules";
@@ -27,13 +29,32 @@ import {
 
 type OnChange = (path: PathSegment[], value: unknown) => void;
 
+/** A field (or a whole section, path "") to show: `nonce` changes on every pick, so the same one is shown again. */
+export interface FormFocus {
+  section: string;
+  /** The field's path, dotted ("" for the section itself) */
+  path: string;
+  nonce: number;
+}
+
 interface Shared {
   ctx: FieldContext;
   errors: FieldError[];
   disabled: boolean;
   showAdvanced: boolean;
   onChange: OnChange;
+  focus: FormFocus | null;
 }
+
+/** Scroll an element into view (jsdom has no scrollIntoView) and focus its first control. */
+function reveal(el: HTMLElement | null, control: string): void {
+  if (!el) return;
+  if (typeof el.scrollIntoView === "function") el.scrollIntoView({ block: "center" });
+  el.querySelector<HTMLElement>(control)?.focus();
+}
+
+/** A leaf field's own control (in its .spaced-xs box), not its reset button */
+const LEAF_CONTROLS = ".spaced-xs input, .spaced-xs select, .spaced-xs textarea";
 
 /**
  * Text the field shows, kept locally while typed, so a half-typed value
@@ -83,11 +104,18 @@ function ErrorLines({ messages }: { messages: string[] }) {
   );
 }
 
+/** A control's accessible name: its label in words and its YAML key, or the key. */
+function controlName(field: FieldModel): string {
+  const key = field.path.join(".");
+  return field.label ? `${field.label} (${key})` : key;
+}
+
 function ListEditor({ field, disabled, onChange }: { field: FieldModel; disabled: boolean; onChange: OnChange }) {
   const [text, setText] = useLocalText(field.value, listToText, textToList);
   const lines = Math.min(12, Math.max(2, text.split("\n").length + 1));
   return (
     <textarea
+      aria-label={controlName(field)}
       className="input textarea mono"
       rows={lines}
       value={text}
@@ -107,6 +135,7 @@ function NumberEditor({ field, disabled, onChange }: { field: FieldModel; disabl
   const [text, setText] = useLocalText(field.value, numberText, textToNumber);
   return (
     <input
+      aria-label={controlName(field)}
       className="input" style={{ maxWidth: "12rem" }}
       inputMode="decimal"
       value={text}
@@ -126,6 +155,7 @@ function YamlEditor({ field, disabled, onChange }: { field: FieldModel; disabled
   return (
     <>
       <textarea
+        aria-label={controlName(field)}
         className="input textarea mono"
         rows={Math.min(14, Math.max(2, text.split("\n").length + 1))}
         value={text}
@@ -162,6 +192,7 @@ function Leaf({ field, disabled, onChange }: { field: FieldModel; disabled: bool
         <label className="muted small">
           <input
             type="checkbox"
+            aria-label={controlName(field)}
             checked={checked}
             disabled={disabled}
             onChange={(e) => onChange(field.path, e.target.checked)}
@@ -176,6 +207,7 @@ function Leaf({ field, disabled, onChange }: { field: FieldModel; disabled: bool
       const values = (field.schema.enum ?? (field.schema.const !== undefined ? [field.schema.const] : [])) as unknown[];
       return (
         <select
+          aria-label={controlName(field)}
           className="input" style={{ maxWidth: "20rem" }}
           value={field.value === undefined ? "" : String(field.value)}
           disabled={disabled}
@@ -205,6 +237,7 @@ function Leaf({ field, disabled, onChange }: { field: FieldModel; disabled: bool
     case "textarea":
       return (
         <textarea
+          aria-label={controlName(field)}
           className="input textarea"
           rows={4}
           value={typeof field.value === "string" ? field.value : ""}
@@ -218,6 +251,7 @@ function Leaf({ field, disabled, onChange }: { field: FieldModel; disabled: bool
       return (
         <>
           <input
+            aria-label={controlName(field)}
             className={field.kind === "path" ? "input mono" : "input"}
             list={listId}
             value={typeof field.value === "string" ? field.value : field.value === undefined ? "" : String(field.value)}
@@ -265,6 +299,7 @@ function Collection({ field, shared }: { field: FieldModel; shared: Shared }) {
         ))}
         <div className="row mt-1">
           <input
+            aria-label={`A new entry of ${field.path.join(".")}`}
             className="input" style={{ maxWidth: "14rem" }}
             value={adding}
             disabled={disabled}
@@ -318,16 +353,30 @@ function Collection({ field, shared }: { field: FieldModel; shared: Shared }) {
 function FieldRow({ field, shared }: { field: FieldModel; shared: Shared }) {
   const { here, inside } = errorsAt(shared.errors, field.path);
   const collection = field.kind === "object" || field.kind === "record" || field.kind === "objects";
-  const [open, setOpen] = useState(field.value !== undefined || inside > 0);
+  const joined = field.path.join(".");
+  const focused = shared.focus !== null && shared.focus.path === joined;
+  const holdsFocus = shared.focus !== null && shared.focus.path.startsWith(`${joined}.`);
+  const [open, setOpen] = useState(field.value !== undefined || inside > 0 || holdsFocus);
+  const row = useRef<HTMLDivElement>(null);
+  const nonce = shared.focus?.nonce;
+  useEffect(() => {
+    if (holdsFocus) setOpen(true);
+    // A leaf: its control; a collection: its toggle
+    if (focused) reveal(row.current, collection ? "button" : LEAF_CONTROLS);
+    // On each pick (nonce), not on every render
+  }, [nonce, focused, holdsFocus]);
   return (
-    <div data-field={field.path.join(".")} className="stack-sm">
+    <div data-field={joined} data-focused={focused ? "" : undefined} className="stack-sm" ref={row}>
       <div className="row">
         {collection ? (
           <Button size="sm" variant="link" onClick={() => setOpen(!open)}>
-            {open ? "▾" : "▸"} <code>{field.key}</code>
+            {open ? "▾" : "▸"} {field.label && <span>{field.label}</span>} <code>{field.key}</code>
           </Button>
         ) : (
-          <code>{field.key}</code>
+          <>
+            {field.label && <span className="field-row-label">{field.label}</span>}
+            <code>{field.key}</code>
+          </>
         )}
         {field.required && <span className="text-warning">required</span>}
         {field.command && <Badge tone="warning">runs a command</Badge>}
@@ -362,8 +411,13 @@ function FieldRow({ field, shared }: { field: FieldModel; shared: Shared }) {
 }
 
 function FieldList({ fields, shared }: { fields: FieldModel[]; shared: Shared }) {
+  const targeted = (f: FieldModel) => {
+    const path = f.path.join(".");
+    return shared.focus !== null && (shared.focus.path === path || shared.focus.path.startsWith(`${path}.`));
+  };
   const shown = fields.filter(
-    (f) => !f.advanced || shared.showAdvanced || f.value !== undefined || errorsAt(shared.errors, f.path).here.length > 0,
+    (f) =>
+      !f.advanced || shared.showAdvanced || f.value !== undefined || errorsAt(shared.errors, f.path).here.length > 0 || targeted(f),
   );
   const hidden = fields.length - shown.length;
   return (
@@ -383,19 +437,32 @@ interface SectionProps {
   errors: FieldError[];
   disabled: boolean;
   onChange: OnChange;
+  /** Set when the focus is in this section */
+  focus: FormFocus | null;
 }
 
-function SectionCard({ section, draft, known, errors, disabled, onChange }: SectionProps) {
+function SectionCard({ section, draft, known, errors, disabled, onChange, focus }: SectionProps) {
   const count = errors.filter((e) => section.blocks.includes(e.path.split(".")[0])).length;
-  const [open, setOpen] = useState(count > 0);
-  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [open, setOpen] = useState(count > 0 || focus !== null);
+  // A field picked by the search may be advanced: its section shows them
+  const [showAdvanced, setShowAdvanced] = useState(focus !== null && focus.path !== "");
+  const card = useRef<HTMLDivElement>(null);
+  const nonce = focus?.nonce;
+  const target = focus?.path;
+  useEffect(() => {
+    if (!focus) return;
+    setOpen(true);
+    if (focus.path !== "") setShowAdvanced(true);
+    else reveal(card.current, "button");
+    // On each pick (nonce) and each new target, not on every render
+  }, [nonce, target]);
   const configured = section.blocks.some((b) => draft[b] !== undefined);
   const fields = sectionFields(section, draft, known).filter(
     (f) => !(section.toggle && f.path.length === 2 && f.key === "enabled"),
   );
-  const shared: Shared = { ctx: { section, known }, errors, disabled, showAdvanced, onChange };
+  const shared: Shared = { ctx: { section, known }, errors, disabled, showAdvanced, onChange, focus };
   return (
-    <div className="card section-intro" data-settings-section={section.key}>
+    <div className="card section-intro" data-settings-section={section.key} ref={card}>
       <div className="row row-lg">
         <Button variant="link" onClick={() => setOpen(!open)}>
           {open ? "▾" : "▸"} {section.title}
@@ -436,9 +503,11 @@ export interface SettingsFormProps {
   unknownKeys: string[];
   disabled: boolean;
   onChange: OnChange;
+  /** A field or section to show (a search pick) */
+  focus?: FormFocus | null;
 }
 
-export function SettingsForm({ sections, draft, known, errors, unknownKeys, disabled, onChange }: SettingsFormProps) {
+export function SettingsForm({ sections, draft, known, errors, unknownKeys, disabled, onChange, focus = null }: SettingsFormProps) {
   return (
     <div data-settings-form="">
       {sections.map((section) => (
@@ -450,6 +519,7 @@ export function SettingsForm({ sections, draft, known, errors, unknownKeys, disa
           errors={errors}
           disabled={disabled}
           onChange={onChange}
+          focus={focus?.section === section.key ? focus : null}
         />
       ))}
       {unknownKeys.length > 0 && (

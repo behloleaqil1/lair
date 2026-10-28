@@ -201,8 +201,9 @@ export function App() {
       case "processes":
         return <Processes project={currentProject} refreshKey={refreshKey} />;
       case "settings":
-        // Settings (src/client/components/Settings.tsx) is keyed by project: a switch starts it afresh
-        return <Settings key={currentProject} project={currentProject} refreshKey={refreshKey} />;
+        // Settings (src/client/components/Settings.tsx) is keyed by project: a switch starts it afresh. Its pages are
+        // the URL's tab, so moving between them keeps the draft
+        return <Settings key={currentProject} project={currentProject} refreshKey={refreshKey} route={route} go={go} />;
     }
   };
 

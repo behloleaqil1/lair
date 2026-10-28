@@ -1181,3 +1181,183 @@ span.error {
 .diff-line {
   white-space: pre;
 }
+
+/* Settings: the page list, the search, the save bar (components/Settings.tsx) */
+.settings-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-5);
+}
+
+.settings-search {
+  flex: 1 1 20rem;
+  max-width: 40rem;
+}
+
+.settings-search .input {
+  padding-left: calc(var(--control-pad-x) + 22px);
+}
+
+.settings-search-icon {
+  position: absolute;
+  left: var(--space-3);
+  top: calc(var(--control-height) / 2);
+  transform: translateY(-50%);
+  color: var(--color-text-muted);
+  pointer-events: none;
+}
+
+.settings-search-results {
+  max-height: 22rem;
+}
+
+.settings-search-results .combobox-option {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-search-key {
+  font-size: var(--text-xs);
+}
+
+.settings-layout {
+  display: grid;
+  grid-template-columns: 13rem minmax(0, 1fr);
+  gap: var(--space-6);
+  align-items: start;
+}
+
+.settings-nav ul {
+  position: sticky;
+  top: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.settings-nav-link {
+  display: block;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  color: var(--color-text-muted);
+  font-weight: var(--weight-medium);
+  text-decoration: none;
+}
+
+.settings-nav-link:hover {
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+}
+
+.settings-nav-link.active {
+  background: var(--color-selected);
+  color: var(--color-accent);
+  box-shadow: inset 3px 0 0 var(--color-accent);
+}
+
+@media (max-width: 800px) {
+  .settings-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-nav ul {
+    position: static;
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+}
+
+.settings-page-title {
+  margin: 0 0 var(--space-1);
+}
+
+.settings-page-about {
+  margin: 0 0 var(--space-4);
+}
+
+.settings-yaml {
+  min-height: 28rem;
+  font-size: var(--text-sm);
+}
+
+.settings-savebar {
+  position: sticky;
+  bottom: var(--space-3);
+  z-index: var(--z-sticky);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-top: var(--space-6);
+  padding: var(--space-3) var(--space-4);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-2);
+}
+
+.settings-savebar-count {
+  font-weight: var(--weight-semibold);
+}
+
+.settings-changed-keys {
+  margin: var(--space-1) 0 0;
+  padding-left: var(--space-5);
+}
+
+.field-row-label {
+  font-weight: var(--weight-medium);
+}
+
+[data-field][data-focused] {
+  outline: var(--focus-ring-width) solid var(--color-focus);
+  outline-offset: var(--space-1);
+  border-radius: var(--radius-sm);
+}
+
+/* Settings → Overview: the setup checklist */
+.checklist {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.checklist-item {
+  display: grid;
+  grid-template-columns: 7.5rem minmax(0, 1fr) auto;
+  gap: var(--space-3);
+  align-items: center;
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.checklist-item:last-child {
+  border-bottom: 0;
+}
+
+.checklist-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.checklist-detail {
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 640px) {
+  .checklist-item {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

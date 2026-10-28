@@ -11,9 +11,11 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import axe from "axe-core";
 import { App } from "./App";
-import { fixtureFetch } from "./a11y-fixtures";
+import { FIXTURE_MODULES, fixtureFetch } from "./a11y-fixtures";
 import { signIn } from "./owner-session";
 import { applyPreferences } from "./ui/preferences";
+import { settingsSections } from "../server/settings/index.js";
+import type { ModuleFlags } from "../shared/dashboard-types";
 
 /** Each top-level view and detail: its URL, and a text that says it rendered with its data */
 const VIEWS: { name: string; hash: string; shows: string }[] = [
@@ -177,5 +179,73 @@ describe("accessibility: axe on every view", () => {
     act(() => (el.querySelector('[role="switch"]') as HTMLElement).click());
     expect(document.documentElement.hasAttribute("data-theme")).toBe(false);
     expect(document.documentElement.hasAttribute("data-density")).toBe(false);
+  });
+});
+
+/** Every module on: the Settings pages draw everything they have */
+const ALL_ON = Object.fromEntries(Object.keys(FIXTURE_MODULES).map((k) => [k, true])) as unknown as ModuleFlags;
+
+/** Settings' own pages (settings-pages.ts), with the real registry's sections and the fixture project's settings */
+const SETTINGS_PAGES: { name: string; hash: string; shows: string }[] = [
+  { name: "Overview", hash: "#/settings", shows: "build-2 doesn't answer" },
+  { name: "All settings (classic), a field shown by the search", hash: "#/settings/watchdog.interval_seconds?tab=classic", shows: "Secrets" },
+  { name: "YAML", hash: "#/settings?tab=yaml", shows: "The project's file" },
+  { name: "History", hash: "#/settings?tab=history", shows: "saved from Settings" },
+];
+
+describe("accessibility: the Settings pages, signed in, with the modules on", () => {
+  const settingsFetch = () =>
+    fixtureFetch({
+      "/api/settings/modules": { sections: settingsSections() },
+      "/api/dashboard/modules": { project: "demo", readOnly: false, error: null, modules: ALL_ON },
+    });
+
+  function type(el: HTMLInputElement | HTMLTextAreaElement, value: string) {
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    act(() => {
+      Object.getOwnPropertyDescriptor(proto, "value")!.set!.call(el, value);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  }
+
+  for (const page of SETTINGS_PAGES) {
+    for (const theme of ["light", "dark"] as const) {
+      it(`${page.name}, ${theme}: no serious or critical violations`, async () => {
+        vi.stubGlobal("fetch", settingsFetch());
+        await signIn("owner-token");
+        applyPreferences({ theme, density: theme === "dark" ? "compact" : "comfortable" });
+        const el = await renderAt(page.hash);
+        expect(el.textContent, el.textContent?.slice(0, 1500)).toContain(page.shows);
+        expect(el.querySelector('nav[aria-label="Settings pages"] [aria-current="page"]')).not.toBeNull();
+        expect(await seriousViolations()).toEqual([]);
+        applyPreferences({ theme: "system", density: "comfortable" });
+      });
+    }
+  }
+
+  it("the search's open list of matches: no serious or critical violations", async () => {
+    vi.stubGlobal("fetch", settingsFetch());
+    await signIn("owner-token");
+    const el = await renderAt("#/settings");
+    const box = el.querySelector<HTMLInputElement>('input[aria-label="Search settings"]')!;
+    act(() => box.focus());
+    type(box, "reviewer");
+    expect(document.getElementById(box.getAttribute("aria-controls")!)!.querySelectorAll('[role="option"]').length).toBeGreaterThan(0);
+    expect(await seriousViolations()).toEqual([]);
+  });
+
+  it("the save bar and the review drawer, with a command to confirm: no serious or critical violations", async () => {
+    vi.stubGlobal("fetch", settingsFetch());
+    await signIn("owner-token");
+    const el = await renderAt("#/settings?tab=yaml");
+    const text = el.querySelector<HTMLTextAreaElement>("[data-settings-yaml]")!;
+    type(text, `${text.value}dragon_start_cmd: ["./bin/start", "{dragon}"]\n`);
+    const bar = el.querySelector("[data-settings-savebar]")!;
+    expect(bar.textContent).toContain("The YAML is edited");
+    act(() => [...bar.querySelectorAll("button")].find((b) => b.textContent === "Review and save")!.click());
+    await settle();
+    const drawer = el.querySelector('[role="dialog"]')!;
+    expect(drawer.querySelector("[data-settings-commands]")).not.toBeNull();
+    expect(await seriousViolations()).toEqual([]);
   });
 });

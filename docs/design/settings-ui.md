@@ -85,7 +85,9 @@ command changes, so the UI previews a save before it is made.
   `path`, `textarea`, `select`, `yaml`), known values to pick from (`agents`, `adapters`, `models`, `lanes`,
   `machines`) and `advanced`. Most widgets are inferred from the schema and the key (`*_cmd` and lists of strings
   under `actions`, `commands` or `probes` are argv lists, `paths` is a glob list, `adapter` picks an adapter), so
-  hints stay few.
+  hints stay few. Settings v2 ([settings-v2.md](settings-v2.md)) adds a `label` in words, a `level` (`basic`,
+  `advanced` or `expert`; `advanced: true` is the level `advanced`), a `group` and an `example`; its search reads
+  them all.
 - Forms render from the JSON Schema: a section per entry, its `enabled` switch in the header, defaults shown as
   placeholders ("default: 60") and restored by clearing the field, advanced fields folded, unions and other shapes a
   form can't draw edited as a YAML snippet. Keys that no section knows (top level, or inside a block that allows them)

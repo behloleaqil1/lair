@@ -33,12 +33,18 @@ function isCheck(value: unknown): value is SettingsCheck {
   return typeof value === "object" && value !== null && "errors" in value && "diff" in value;
 }
 
-async function call<T>(method: "GET" | "PUT" | "POST", url: string, body?: unknown): Promise<SettingsReply<T>> {
-  const res = await fetch(url, {
-    method,
-    headers: { ...(body === undefined ? {} : { "Content-Type": "application/json" }), ...ownerHeaders() },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
+/** An owner request, answered as a SettingsReply (also used for the AI tools API: ai-api.ts). */
+export async function ownerCall<T>(method: "GET" | "PUT" | "POST", url: string, body?: unknown): Promise<SettingsReply<T>> {
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method,
+      headers: { ...(body === undefined ? {} : { "Content-Type": "application/json" }), ...ownerHeaders() },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch (e) {
+    return { status: 0, success: false, error: e instanceof Error ? e.message : "Network error" };
+  }
   let payload: { success?: boolean; data?: unknown; error?: string; message?: string; code?: string } = {};
   try {
     payload = (await res.json()) as typeof payload;
@@ -59,48 +65,48 @@ async function call<T>(method: "GET" | "PUT" | "POST", url: string, body?: unkno
 const project = (id: string) => `/api/settings/projects/${encodeURIComponent(id)}`;
 
 export function loadSections(): Promise<SettingsReply<{ sections: SettingsSection[] }>> {
-  return call("GET", "/api/settings/modules");
+  return ownerCall("GET", "/api/settings/modules");
 }
 
 export function listSettingsProjects(): Promise<SettingsReply<{ projects: ProjectFileInfo[] }>> {
-  return call("GET", "/api/settings/projects");
+  return ownerCall("GET", "/api/settings/projects");
 }
 
 export function loadProjectSettings(id: string): Promise<SettingsReply<ProjectSettingsView>> {
-  return call("GET", project(id));
+  return ownerCall("GET", project(id));
 }
 
 export function saveProjectSettings(id: string, request: SaveRequest): Promise<SettingsReply<SaveResult>> {
-  return call("PUT", project(id), request);
+  return ownerCall("PUT", project(id), request);
 }
 
 /** A save's dry run: the diff, the errors and the command changes, nothing written. */
 export function checkProjectSettings(id: string, request: SaveRequest): Promise<SettingsReply<SettingsCheck>> {
-  return call("POST", "/api/settings/validate", { project: id, ...request });
+  return ownerCall("POST", "/api/settings/validate", { project: id, ...request });
 }
 
 export function checkNewProject(request: CreateProjectRequest): Promise<SettingsReply<SettingsCheck>> {
-  return call("POST", "/api/settings/validate", { create: request });
+  return ownerCall("POST", "/api/settings/validate", { create: request });
 }
 
 export function createProject(request: CreateProjectRequest): Promise<SettingsReply<SaveResult & { id: string; file: string }>> {
-  return call("POST", "/api/settings/projects", request);
+  return ownerCall("POST", "/api/settings/projects", request);
 }
 
 export function checkRepository(path: string): Promise<SettingsReply<RepoCheck>> {
-  return call("POST", "/api/settings/repo", { path });
+  return ownerCall("POST", "/api/settings/repo", { path });
 }
 
 export function loadHistory(id: string): Promise<SettingsReply<{ versions: HistoryVersion[] }>> {
-  return call("GET", `${project(id)}/history`);
+  return ownerCall("GET", `${project(id)}/history`);
 }
 
 export function loadVersion(id: string, version: string): Promise<SettingsReply<HistoryDetail>> {
-  return call("GET", `${project(id)}/history/${encodeURIComponent(version)}`);
+  return ownerCall("GET", `${project(id)}/history/${encodeURIComponent(version)}`);
 }
 
 export function checkRestore(id: string, version: string, baseHash: string): Promise<SettingsReply<SettingsCheck>> {
-  return call("POST", "/api/settings/validate", { project: id, restore: version, baseHash });
+  return ownerCall("POST", "/api/settings/validate", { project: id, restore: version, baseHash });
 }
 
 export function restoreVersion(
@@ -108,5 +114,5 @@ export function restoreVersion(
   version: string,
   request: { baseHash: string; confirmCommands?: string },
 ): Promise<SettingsReply<SaveResult>> {
-  return call("POST", `${project(id)}/history/${encodeURIComponent(version)}/restore`, request);
+  return ownerCall("POST", `${project(id)}/history/${encodeURIComponent(version)}/restore`, request);
 }

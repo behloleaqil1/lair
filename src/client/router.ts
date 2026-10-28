@@ -6,6 +6,7 @@
  *   #/work/<agent>             Work, with that agent's detail open
  *   #/gates/<id>?tab=triage    Gates on its Triage tab, with gate <id> open
  *   #/prs/<n>, #/decisions/<id>, #/machines/<name>, ...
+ *   #/settings/<key>?tab=classic  a Settings page, with the field or section <key> shown
  *   ...&project=<name>         the project, when the server has several
  *
  * The views before the sections had ids of their own (Dragons, Agents,
@@ -39,7 +40,8 @@ export const SECTION_TABS: Record<SectionId, readonly string[]> = {
   decisions: ["messages"],
   delivery: [],
   processes: [],
-  settings: [],
+  // Settings' own pages after Overview (settings-pages.ts), shown in its page list rather than as tabs
+  settings: ["classic", "yaml", "history"],
 };
 
 export interface Route {

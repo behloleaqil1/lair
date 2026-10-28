@@ -1,19 +1,30 @@
 /**
  * Fixture answers for the dashboard's API routes, for tests that render the
  * whole app in a DOM (a11y.test.tsx): a small project with a few agents, a
- * failed gate, a pull request and two decisions. `fixtureFetch` answers by
+ * failed gate, a pull request and two decisions, and its settings (AI
+ * profiles and roles, agents, a machine, reviews). `fixtureFetch` answers by
  * path; a route without a fixture answers as a server error would, so the
  * view shows its error state (which is checked too).
  */
+import { stringify } from "yaml";
 import type { Dragon, Gate, GateResult, MachineStatus, OverviewData, PullRequest } from "../shared/types";
+import type { AiToolsView } from "../shared/ai-types";
 import type { DashboardModules, ModuleFlags } from "../shared/dashboard-types";
 import type { Decision } from "../shared/decision-types";
 import type { ConfigStatusView, RestartStatusView } from "../shared/lifecycle-types";
 import type { ChatStatusView, ConversationView, DigestView } from "../shared/supervisor-types";
 import type { DecisionSummary } from "./decisions-api";
 import type { DeliveryProjectStatus } from "../shared/delivery-types";
+import type { NotificationStatusView } from "../shared/notification-types";
 import type { ProcessListResponse } from "../shared/process-types";
-import type { ProjectFileInfo, ProjectSettingsView, SettingsSection } from "../shared/settings-types";
+import type {
+  HistoryVersion,
+  ProjectFileInfo,
+  ProjectSettingsView,
+  RepoCheck,
+  SettingsCheck,
+  SettingsSection,
+} from "../shared/settings-types";
 import type { AuditEntry, InboxItem } from "../shared/types";
 
 export const FIXTURE_NOW = "2026-10-27T10:00:00Z";
@@ -250,16 +261,144 @@ const settingsSections: SettingsSection[] = [
   },
 ];
 
+/** The project's file, with the modules the Settings pages edit turned on */
+export const FIXTURE_SETTINGS_VALUES: Record<string, unknown> = {
+  name: "Demo",
+  repo: "/work/demo",
+  github: "example-org/demo",
+  queue_file: "/work/demo/work/queue.md",
+  agents_dir: "/work/demo/work/agents",
+  gates_dir: "/work/demo/work/gates",
+  machines: { "build-2": { type: "ssh", host: "build-2.lan", user: "ci", runners: ["heavy"] } },
+  ai: {
+    profiles: {
+      "kiro-opus": { tool: "kiro", model: "claude-opus-4.5" },
+      "kiro-cheap": { tool: "kiro", model: "claude-haiku-4.5" },
+    },
+    roles: { build: ["kiro-opus", "kiro-cheap"], review: { amber: ["kiro-opus"] } },
+  },
+  dragons: {
+    "worker-a": { name: "Worker A", profile: "kiro-opus" },
+    "worker-b": { name: "Worker B", adapter: "kiro", model: "claude-haiku-4.5", machine: "build-2" },
+  },
+  agents: { enabled: true },
+  review: { enabled: true },
+  watchdog: { enabled: true, interval_seconds: 60 },
+};
+
 const settingsView: ProjectSettingsView = {
   ...settingsFile,
   hash: "h1",
-  yaml: "name: Demo\ngithub: example-org/demo\n",
-  values: { name: "Demo", github: "example-org/demo" },
+  yaml: stringify(FIXTURE_SETTINGS_VALUES),
+  values: FIXTURE_SETTINGS_VALUES,
   errors: [],
   unknownKeys: [],
-  known: { agents: ["worker-a"], adapters: [], models: [], lanes: ["heavy"], machines: ["local"], profiles: [] },
-  secrets: [],
+  known: {
+    agents: ["worker-a", "worker-b"],
+    adapters: ["claude-code", "kiro"],
+    models: ["claude-haiku-4.5", "claude-opus-4.5"],
+    lanes: ["heavy"],
+    machines: ["build-2", "local"],
+    profiles: ["kiro-cheap", "kiro-opus"],
+  },
+  secrets: [{ label: "Owner token", where: "data/owner.token", set: true }],
 };
+
+const aiTools: AiToolsView = {
+  project: "demo",
+  notes: ["build-2: no dragon runs there, so its tools were not checked"],
+  tools: [
+    {
+      id: "kiro",
+      name: "Kiro CLI",
+      experimental: false,
+      program: "kiro-cli",
+      signInCheck: true,
+      modelsCmd: true,
+      knownModels: 2,
+      inUse: true,
+      machines: [
+        {
+          machine: "local",
+          installed: true,
+          path: "/usr/local/bin/kiro-cli",
+          version: "kiro-cli 1.2.3",
+          signIn: { state: "signed_out", as: null, detail: "not signed in", fix: "kiro-cli login" },
+          checkedAt: FIXTURE_NOW,
+        },
+      ],
+    },
+    {
+      id: "claude-code",
+      name: "Claude Code",
+      experimental: false,
+      program: "claude",
+      signInCheck: false,
+      modelsCmd: false,
+      knownModels: 3,
+      inUse: false,
+      machines: [
+        {
+          machine: "local",
+          installed: false,
+          path: null,
+          version: null,
+          signIn: { state: "unknown", as: null, detail: "not installed: claude is not on PATH", fix: "claude, then /login" },
+          checkedAt: FIXTURE_NOW,
+        },
+      ],
+    },
+  ],
+};
+
+const notifications: NotificationStatusView = {
+  settings: { desktop: true, ntfyUrl: null, ntfyTokenFile: false, reminderHours: 4, enabled: true },
+  errors: [],
+  desktopAvailable: { ok: true, detail: "osascript" },
+  last: null,
+  lastReminderAt: null,
+};
+
+const repoCheck: RepoCheck = {
+  path: "/work/demo",
+  exists: true,
+  gitRepo: true,
+  github: "example-org/demo",
+  remotes: [{ name: "origin", url: "https://github.com/example-org/demo.git", github: "example-org/demo" }],
+  suggested: { queue_file: "/work/demo/work/queue.md", agents_dir: "/work/demo/work/agents", gates_dir: "/work/demo/work/gates" },
+};
+
+/** A dry run's answer: one change, and a command to confirm */
+export const FIXTURE_SETTINGS_CHECK: SettingsCheck = {
+  ok: true,
+  errors: [],
+  diff: {
+    hunks: [
+      {
+        oldStart: 1,
+        oldLines: 1,
+        newStart: 1,
+        newLines: 2,
+        lines: [
+          { op: "-", text: "name: Demo" },
+          { op: "+", text: "name: Demo app" },
+          { op: "+", text: 'dragon_start_cmd: ["./bin/start", "{dragon}"]' },
+        ],
+      },
+    ],
+    added: 2,
+    removed: 1,
+  },
+  yaml: "name: Demo app\n",
+  commands: [{ path: "dragon_start_cmd", before: null, after: ["./bin/start", "{dragon}"] }],
+  commandsDigest: "d1",
+  conflict: false,
+  currentHash: "h1",
+};
+
+const history: HistoryVersion[] = [
+  { version: "20261027T100000000Z-abcdef", at: FIXTURE_NOW, action: "save", by: "s-1", hash: "h0", bytes: 120 },
+];
 
 const inbox: InboxItem[] = [{ id: "m1", timestamp: FIXTURE_NOW, text: "Pause the heavy lane tonight", status: "pending" }];
 
@@ -294,6 +433,11 @@ export const FIXTURE_ROUTES: Record<string, unknown> = {
   "/api/settings/modules": { sections: settingsSections },
   "/api/settings/projects": { projects: [settingsFile] },
   "/api/settings/projects/demo": settingsView,
+  "/api/settings/projects/demo/history": { versions: history },
+  "/api/settings/repo": repoCheck,
+  "/api/settings/validate": FIXTURE_SETTINGS_CHECK,
+  "/api/ai/tools": aiTools,
+  "/api/owner/notifications": notifications,
   "/api/controls/inbox": inbox,
   "/api/controls/audit": audit,
 };

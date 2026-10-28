@@ -325,7 +325,7 @@ Logs and test output are the owner's: a detail asks for them only once this brow
 - **`Processes.tsx`**: managed processes and their logs
 - **`SignInHint.tsx`**: the "sign in from Decisions" notice above forms with owner-only actions. Writes go through `owner-actions.ts` (and `delivery-api.ts`), which add the owner session
 - **`CommandBar.tsx`**: ask / instruct / task command bar
-- **`Settings.tsx`**: the Settings view (owner only): a project's Form, YAML and History tabs and New project. `SettingsForm.tsx` draws each section from its JSON Schema (fields and widgets from `settings-form.ts`), `SettingsReview.tsx` shows a save's diff, errors and commands to confirm, `SettingsHistory.tsx` the versions and Restore, `ProjectWizard.tsx` the new project; requests in `settings-api.ts`
+- **`Settings.tsx`**: the Settings view (owner only, [settings-v2.md](design/settings-v2.md)): the page list (`settings-pages.ts`; each page is the URL's tab), one draft for every page, the sticky save bar and the review drawer (the dry run, then the save), and New project. `SettingsSearch.tsx` is the ⌘K search over every field of the registry (`settings-search.ts`), `SettingsOverview.tsx` the setup checklist (`setup-checklist.ts`), `SettingsForm.tsx` the classic page, drawing each section from its JSON Schema (fields, widgets and levels from `settings-form.ts`), `SettingsReview.tsx` a save's diff, errors and commands to confirm, `SettingsHistory.tsx` the versions and Restore, `ProjectWizard.tsx` the new project; requests in `settings-api.ts` and `ai-api.ts`. `testing/settings-server.ts` serves the real Settings, AI tools and notification routes to the DOM tests
 
 #### Hooks (`hooks/`)
 

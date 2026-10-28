@@ -7,7 +7,9 @@
  *
  * Hints are keyed by the field's path within the section ("*" for any record
  * key or list index). Most widgets are inferred (src/client/settings-form.ts),
- * so hints are help text and the occasional `advanced`.
+ * so hints are a label, help text, an example and a level: basic fields show
+ * by default, advanced and expert ones are folded (docs/design/settings-v2.md).
+ * The Settings search finds a field by its label, help or key.
  */
 import type { ZodTypeAny } from "zod";
 import type { FieldHint, JsonSchema, SettingsSection } from "../../shared/settings-types.js";
@@ -43,7 +45,7 @@ export interface SectionEntry {
   docs?: string;
 }
 
-const timeouts: FieldHint = { advanced: true };
+const timeouts: FieldHint = { level: "advanced", group: "Timeouts" };
 
 export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
   {
@@ -76,11 +78,16 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
     schema: DragonsSchema,
     docs: "#dragons-agents",
     hints: {
-      "dragons.*.adapter": { options: "adapters" },
-      "dragons.*.machine": { options: "machines" },
-      "dragons.*.profile": { options: "profiles", help: "An AI profile (ai.profiles), instead of adapter and model" },
-      "dragons.*.instructions": { widget: "textarea" },
+      dragons: { label: "Agents", help: "The project's agents (dragons), by id" },
+      "dragons.*.name": { label: "Name" },
+      "dragons.*.adapter": { label: "Tool", options: "adapters", help: "The tool it runs on, when it names no profile" },
+      "dragons.*.model": { label: "Model", help: "The model it runs, when it names no profile", example: "claude-opus-4.5" },
+      "dragons.*.machine": { label: "Machine", options: "machines" },
+      "dragons.*.profile": { label: "AI profile", options: "profiles", help: "An AI profile (ai.profiles), instead of adapter and model" },
+      "dragons.*.instructions": { label: "Instructions", widget: "textarea" },
       default_instructions: { widget: "textarea" },
+      dragon_defaults: { level: "advanced" },
+      available_models: { level: "advanced" },
       dragon_start_cmd: { help: "Placeholders: {dragon}, {task}, {prompt_file}" },
     },
   },
@@ -90,16 +97,41 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
     schema: AiSchema,
     docs: "#ai-tools-profiles-and-roles",
     hints: {
-      profiles: { help: "Named tool + model: a dragon or a role names one" },
-      "profiles.*.tool": { options: "adapters", help: "A built-in tool (kiro, claude-code, codex, ...) or one of agent_adapters" },
-      "profiles.*.model": { help: "Any model the tool offers (GET /api/ai/models lists them)" },
+      profiles: { label: "Profiles", group: "Profiles", help: "Named tool + model: a dragon or a role names one" },
+      "profiles.*.tool": {
+        label: "Tool",
+        options: "adapters",
+        help: "A built-in tool (kiro, claude-code, codex, ...) or one of agent_adapters",
+        example: "kiro",
+      },
+      "profiles.*.model": {
+        label: "Model",
+        help: "Any model the tool offers (GET /api/ai/models lists them)",
+        example: "claude-opus-4.5",
+      },
       // Added to what Lair starts: confirmed like a command
-      "profiles.*.options.args": { sensitive: true, help: "Literal arguments added to the tool's start command" },
-      roles: { help: "Per job, profile ids in order: the first is used, the next ones are its fallbacks" },
-      "roles.build": { help: "Dragons that name no profile, adapter or model run on this" },
-      "roles.review": { help: "A tier's reviewer pool with no agents of its own takes the agents on these profiles" },
-      "roles.plan": { help: "The planner agent's profile, when it names none" },
-      "roles.supervise": { help: "The supervisor's runs (questions, the digest), when supervisor.agent names no profile" },
+      "profiles.*.options.args": {
+        label: "Extra arguments",
+        level: "advanced",
+        sensitive: true,
+        help: "Literal arguments added to the tool's start command",
+      },
+      roles: { label: "Roles", group: "Roles", help: "Per job, profile ids in order: the first is used, the next ones are its fallbacks" },
+      "roles.build": { label: "Who builds", group: "Roles", help: "Dragons that name no profile, adapter or model run on this" },
+      "roles.review": {
+        label: "Who reviews",
+        group: "Roles",
+        help: "A tier's reviewer pool with no agents of its own takes the agents on these profiles",
+      },
+      "roles.review.red": { label: "Reviewer for RED", group: "Roles", help: "Who reviews the riskiest changes, the strongest first" },
+      "roles.review.amber": { label: "Reviewer for AMBER", group: "Roles", help: "Who reviews changes of the default tier" },
+      "roles.review.green": { label: "Reviewer for GREEN", group: "Roles", help: "Who reviews low-risk changes" },
+      "roles.plan": { label: "Who plans", group: "Roles", help: "The planner agent's profile, when it names none" },
+      "roles.supervise": {
+        label: "Who supervises",
+        group: "Roles",
+        help: "The supervisor's runs (questions, the digest), when supervisor.agent names no profile",
+      },
     },
   },
   {

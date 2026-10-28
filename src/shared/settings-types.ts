@@ -42,11 +42,26 @@ export type FieldWidget = "text" | "textarea" | "number" | "toggle" | "select" |
 /** Values a field can pick from, read from the project's own config. */
 export type KnownSource = "agents" | "adapters" | "models" | "lanes" | "machines" | "profiles";
 
+/**
+ * Where a field shows (docs/design/settings-v2.md, "Progressive
+ * disclosure"): basic fields by default, advanced and expert ones folded.
+ * Search finds every level.
+ */
+export type FieldLevel = "basic" | "advanced" | "expert";
+
 export interface FieldHint {
+  /** The field's name in words (default: its key, in words) */
+  label?: string;
   help?: string;
+  /** Default basic; `advanced: true` is the same as level advanced */
+  level?: FieldLevel;
+  /** The group it belongs to on its page ("Timeouts", "Roles") */
+  group?: string;
+  /** A value shown as an example when the field has no default */
+  example?: string;
   widget?: FieldWidget;
   options?: KnownSource;
-  /** Folded under "Show advanced" */
+  /** Folded under "Show advanced" (the same as level advanced) */
   advanced?: boolean;
   /** Makes Lair execute something (most are recognized by key: src/shared/settings-rules.ts) */
   command?: boolean;

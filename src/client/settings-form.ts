@@ -7,6 +7,7 @@
 import type {
   FieldError,
   FieldHint,
+  FieldLevel,
   FieldWidget,
   JsonSchema,
   KnownSource,
@@ -31,7 +32,13 @@ export interface FieldModel {
   value: unknown;
   defaultValue: unknown;
   required: boolean;
+  /** Its name in words, when the registry gives one (the key is shown beside it) */
+  label?: string;
   help?: string;
+  /** An example value, for the placeholder of a field with no default */
+  example?: string;
+  level: FieldLevel;
+  /** Folded until "Show advanced": every level but basic */
   advanced: boolean;
   /** Lair may run what this holds: changes to it are confirmed before a save */
   command: boolean;
@@ -107,7 +114,12 @@ export function kindOf(key: string, schema: JsonSchema, hint: FieldHint | undefi
 }
 
 function hintFor(section: SettingsSection, pattern: string): FieldHint | undefined {
-  return section.hints[pattern];
+  return Object.prototype.hasOwnProperty.call(section.hints, pattern) ? section.hints[pattern] : undefined;
+}
+
+/** A hint's level: its own, else advanced for `advanced: true`, else basic. */
+export function levelOf(hint: FieldHint | undefined): FieldLevel {
+  return hint?.level ?? (hint?.advanced === true ? "advanced" : "basic");
 }
 
 function optionsFor(key: string, s: JsonSchema, hint: FieldHint | undefined, known: KnownValues | null): string[] | undefined {
@@ -140,6 +152,7 @@ export function fieldFor(
   const command =
     hint?.command === true ||
     (isCommandKey(key, container) && ["argv", "text", "textarea", "path", "yaml", "list"].includes(kind));
+  const level = levelOf(hint);
   return {
     key,
     path,
@@ -149,8 +162,11 @@ export function fieldFor(
     value,
     defaultValue: s.default,
     required,
+    label: hint?.label,
     help: hint?.help ?? s.description,
-    advanced: hint?.advanced === true,
+    example: hint?.example,
+    level,
+    advanced: level !== "basic",
     command,
     sensitive: hint?.sensitive === true,
     options: optionsFor(key, s, hint, ctx.known),
@@ -181,6 +197,7 @@ export function fieldsOf(schema: JsonSchema, value: unknown, path: PathSegment[]
         value: child,
         defaultValue: undefined,
         required: false,
+        level: "basic",
         advanced: false,
         command: false,
         sensitive: false,
@@ -317,10 +334,10 @@ export function textToNumber(text: string): number | string | undefined {
   return Number.isFinite(n) ? n : trimmed;
 }
 
-/** "default: 60" for a field's placeholder, or "". */
+/** "default: 60" for a field's placeholder ("e.g. ..." from its example when it has no default), or "". */
 export function defaultLabel(field: FieldModel): string {
   const d = field.defaultValue;
-  if (d === undefined) return "";
+  if (d === undefined) return field.example ? `e.g. ${field.example}` : "";
   if (Array.isArray(d)) return d.length === 0 ? "default: none" : `default: ${d.join(" ")}`;
   if (isPlainObject(d)) return Object.keys(d).length === 0 ? "" : `default: ${JSON.stringify(d)}`;
   return `default: ${String(d)}`;
