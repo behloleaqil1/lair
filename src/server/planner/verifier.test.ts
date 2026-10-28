@@ -613,8 +613,6 @@ describe("verifier acceptance tests", () => {
     await h.service.cycle();
 
     // Verifier should be skipped due to max_runs_per_day
-    const runs = runsOf(h);
-    const secondRun = runs.find((r) => r.detail.includes("cart") || r.proposals > 0);
     // The second run should have proposals marked unverified or skipped verifier
     const pending = h.service.proposals({ status: "pending" });
     const cartProposal = pending.find((p) => p.task === "feat-cart");
