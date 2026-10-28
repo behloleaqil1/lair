@@ -20,11 +20,6 @@ import { describe, expect, it } from "vitest";
 import { AsyncCache } from "./core/async-cache.js";
 import { ProcessCache } from "./core/process-cache.js";
 
-// ============ BOUNDARY FAKES ============
-
-const NOW = Date.parse("2026-03-02T12:00:00.000Z");
-const SEC = 1000;
-
 describe("AsyncCache single-flight", () => {
   it("acceptance 5: single-flight refresher never runs two at once", async () => {
     let concurrentRefreshes = 0;
