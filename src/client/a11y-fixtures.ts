@@ -27,7 +27,8 @@ import type {
 } from "../shared/settings-types";
 import type { AuditEntry, InboxItem } from "../shared/types";
 
-export const FIXTURE_NOW = "2026-10-27T10:00:00Z";
+/** A fixture timestamp within the last 24 hours for time-dependent tests. */
+export const FIXTURE_NOW = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
 
 export const FIXTURE_MODULES: ModuleFlags = {
   agents: false,
