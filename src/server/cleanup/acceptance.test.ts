@@ -105,9 +105,9 @@ function createFakeCmd(fsys: ReturnType<typeof createFakeFs>): CommandRunner & {
             const branch = parts[parts.length - 2];
 
             // Find the worktree path by looking for .git files that point to this gitdir
-            for (const [path, file] of fsys.files.entries()) {
-              if (path.endsWith("/.git") && file.content?.includes(`worktrees/${branch}`)) {
-                const wtPath = path.replace("/.git", "");
+            for (const [filePath, file] of fsys.files.entries()) {
+              if (filePath.endsWith("/.git") && file.content?.includes(`worktrees/${branch}`)) {
+                const wtPath = filePath.replace("/.git", "");
                 output += `worktree ${wtPath}\nHEAD ${branch}123\nbranch refs/heads/${branch}\n\n`;
                 break;
               }

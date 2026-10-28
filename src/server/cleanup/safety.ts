@@ -44,6 +44,48 @@ export type SafetyResult =
   | { safe: false; violation: SafetyViolation };
 
 /**
+ * Check if a path is safe for worktree removal.
+ * This is simpler than the general path safety check because:
+ * - Git has already verified this is a registered worktree
+ * - We've already verified it's not the main worktree
+ * - We just need to ensure it's not a system path
+ */
+export function checkWorktreeSafety(
+  targetPath: string,
+): SafetyResult {
+  const home = os.homedir();
+
+  // Must be absolute
+  if (!path.isAbsolute(targetPath)) {
+    return {
+      safe: false,
+      violation: { path: targetPath, reason: "path is not absolute" },
+    };
+  }
+
+  // Normalize the path
+  const normalized = path.normalize(targetPath);
+
+  // Check forbidden paths
+  if (FORBIDDEN_PATHS.has(normalized)) {
+    return {
+      safe: false,
+      violation: { path: targetPath, reason: "path is a system directory" },
+    };
+  }
+
+  // Check home directory
+  if (normalized === home) {
+    return {
+      safe: false,
+      violation: { path: targetPath, reason: "path is the home directory" },
+    };
+  }
+
+  return { safe: true, realPath: normalized };
+}
+
+/**
  * Check if a path is safe to remove. Returns the real path if safe.
  *
  * A path is safe when:

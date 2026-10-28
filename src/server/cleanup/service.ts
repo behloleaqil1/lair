@@ -4,7 +4,7 @@
 import type { Clock, FileSystem, CommandRunner, GitHost } from "./probes.js";
 import type { CleanupSettings } from "./config.js";
 import { getConfiguredRoots } from "./config.js";
-import { checkPathSafety, isGitRepoRoot, type SafetyViolation } from "./safety.js";
+import { checkPathSafety, checkWorktreeSafety, isGitRepoRoot, type SafetyViolation } from "./safety.js";
 import {
   getWorktreeCandidates,
   removeWorktree,
@@ -186,16 +186,6 @@ export class CleanupService {
           this.settings.worktrees,
         );
 
-        // For worktree safety checks, allow paths that are registered worktrees of this repo.
-        // Get the parent directory of each worktree candidate as an allowed root.
-        const worktreeRoots = new Set(roots);
-        for (const candidate of candidates) {
-          // Add the parent directory of each worktree as an allowed root
-          const parentDir = candidate.path.split("/").slice(0, -1).join("/") || "/";
-          worktreeRoots.add(parentDir);
-        }
-        const worktreeRootsArray = Array.from(worktreeRoots);
-
         for (const candidate of candidates) {
           if (shouldStop()) break;
           if (!candidate.removable) {
@@ -208,8 +198,8 @@ export class CleanupService {
             continue;
           }
 
-          // Safety check - use extended roots that include worktree parent directories
-          const safety = await checkPathSafety(this.fsys, candidate.path, worktreeRootsArray);
+          // Simple safety check for worktrees - they're already registered with git
+          const safety = checkWorktreeSafety(candidate.path);
           if (!safety.safe) {
             safetyViolations.push(safety.violation);
             this.events.emit({
