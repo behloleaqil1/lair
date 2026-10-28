@@ -87,11 +87,11 @@ describe("BusMirror", () => {
       );
 
       const content = readFileSync(queueFile, "utf-8");
-      // No control chars, no ANSI escapes
+      // Lines end with newline, but no other control chars or ANSI escapes
       // eslint-disable-next-line no-control-regex
-      expect(content).not.toMatch(/[\x00-\x1f\x7f]/);
+      expect(content.trimEnd()).not.toMatch(/[\x00-\x1f\x7f]/);
       expect(content).not.toContain("\x1b");
-      // Newlines replaced with spaces and collapsed
+      // Newlines in input replaced with spaces and collapsed
       expect(content).toContain("task with newlines");
     });
 
