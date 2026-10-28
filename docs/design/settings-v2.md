@@ -98,7 +98,7 @@ A template fills the forms. It never hides anything.
 
 | Phase | Delivers | Acceptance (summary) |
 |---|---|---|
-| T1 | Tokens, themes, the component kit; the existing views moved onto it with no behaviour change | Every view renders with the kit in light and dark; axe is clean on every view; no client test changes behaviour |
+| T1 (built) | Tokens, themes, the component kit; the existing views moved onto it with no behaviour change (`src/client/ui/`) | Every view renders with the kit in light and dark; axe is clean on every view; no client test changes behaviour |
 | S2-1 | The new Settings shell: page list, search, sticky save bar, drawers; Overview checklist; AI and Team pages ([ai-roles.md](ai-roles.md) roles and sign-in status) | A new user sets the reviewer for AMBER from a dropdown and saves, with no YAML seen. The diff shows exactly that key |
 | S2-2 | The remaining pages (Work, Gates, Machines, Reviews and merging, Notifications, Delivery, Advanced); registry levels and help for every field; templates | Every field of the schema is reachable from a page or search; every field has a label, help and a default; round-trip tests UI → YAML → UI |
 | S2-3 | Test-it buttons (AI sign-in, models, machines, notifications, pipelines); guided "add a machine" and "add an AI tool" | Each button runs its check through the module's own route, with a timeout, and shows the result and the fix |

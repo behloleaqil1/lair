@@ -295,7 +295,7 @@ React-based frontend built with Vite. No UI framework: its own component kit (`u
 - **`preferences.ts`**: the theme (system, light, dark) and density, kept in `localStorage` when the browser allows it, set as `data-theme` and `data-density` on `<html>` (`index.html` sets them before the first paint)
 - **`base.css`**, **`kit.css`**: the page and the components; reduced motion turns every transition off
 - `Button` and `ButtonLink`, `Field` (label, help, error) with `Input` and `TextArea`, `Select`, `Combobox`, `Switch`, `Table` (sortable, sticky header), `Badge` and `StatusBadge` (an icon and a word with every status colour), `Drawer` and `Dialog` (modal: focus in, Tab kept inside, Esc closes, focus back; `focus.ts`), `Tabs` and `TabLinks`, `Toast`, `Tooltip`, `EmptyState`, `CodeBlock`, `Skeleton`, `PageHeader` and `Breadcrumbs`, `Card` and `Callout`, `Icon`
-- **`a11y.test.tsx`** (in `src/client/`): renders the app in jsdom with the fixture answers of `a11y-fixtures.ts` and runs axe on the views it lists, signed in and out; serious and critical violations fail CI
+- **`a11y.test.tsx`** (in `src/client/`): renders the app in jsdom with the fixture answers of `a11y-fixtures.ts` and runs axe on every view and detail, and on the supervisor's chat panel, signed in and out; serious and critical violations fail CI
 
 | Section | What it shows | Detail (a row's click, Enter or Space) |
 |---|---|---|
