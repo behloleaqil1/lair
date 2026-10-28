@@ -60,7 +60,7 @@ const decisions: Decision[] = [
     title: "No merge for 4.2 h",
     context: "",
     options: [{ id: "stand_down", label: "Leave it to me", consequences: "Nothing changes." }],
-    recommended: null,
+    recommended: { optionId: "stand_down", reasoning: "" },
     source: { module: "watchdog", ref: "merge-gap" },
     key: "k2",
     blocks: [],

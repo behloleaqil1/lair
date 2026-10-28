@@ -1,14 +1,4 @@
-        <Button
-          key={option.id}
-          size="sm"
-          variant={recommended ? "primary" : "secondary"}
-          disabled={p.submitting || answer.disabledReason !== null}
-          title={answer.disabledReason ?? option.consequences}
-          onClick={() => p.onChoose(option, confirm)}
-        >
-          {option.label}
-          {recommended ? " (recommended)" : ""}
-        </Button>/**
+/**
  * Home: what needs the owner ("Needs you": the open action items of the
  * Decision Inbox, newest first, each a plain sentence with its answer
  * buttons inline and a link to its full context, and config errors; below
@@ -96,17 +86,17 @@ export function NeedAnswerView(p: NeedAnswerViewProps) {
   return (
     <span className="need-answers" data-answer="buttons">
       {answer.options.map(({ option, recommended, confirm }) => (
-        <button
+        <Button
           key={option.id}
-          type="button"
-          className={`small-button${recommended ? " primary" : ""}`}
+          size="sm"
+          variant={recommended ? "primary" : "secondary"}
           disabled={p.submitting || answer.disabledReason !== null}
           title={answer.disabledReason ?? option.consequences}
           onClick={() => p.onChoose(option, confirm)}
         >
           {option.label}
           {recommended ? " (recommended)" : ""}
-        </button>
+        </Button>
       ))}
       {answer.disabledReason !== null && (
         <span className="muted small">
