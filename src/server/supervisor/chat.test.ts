@@ -1087,11 +1087,7 @@ describe("the supervisor block and its store", () => {
 describe("supervisor runs follow agent retries (transient handling)", () => {
   it("a turn whose run is being retried by the agents module tracks the new run", async () => {
     const h = await boot();
-    const { view, call } = await asked(h);
-
-    // The run ends (transient failure), but the agents module retries it in the same chain
-    const store = h.agents.getStore()!;
-    const originalRun = store.getRun(view.turns[0].runId!)!;
+    const { view } = await asked(h);
 
     // Simulate the agents module marking the run as failed and starting a recovery run
     // First, let the process end
@@ -1114,8 +1110,6 @@ describe("supervisor runs follow agent retries (transient handling)", () => {
     expect(h.spawner.calls).toHaveLength(1);
 
     // The digest run ends without an answer
-    const store = h.agents.getStore()!;
-    const [run] = store.listRuns("demo", {});
     h.spawner.exit(h.spawner.nextPid - 1, 1);
     await tick(h);
     await check(h);
