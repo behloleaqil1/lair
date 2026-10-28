@@ -1234,23 +1234,27 @@ export class AgentsService {
     return file;
   }
 
-  /** Format hung info as a fenced data block that can't start a line of its own */
+  /**
+   * Format hung info as a JSON data block that can't be escaped by log content.
+   * The data is JSON-stringified so no log text (backticks, closing tags, etc.)
+   * can break out of the block.
+   */
   private formatHungInfo(info: HungInfo): string {
+    const data = {
+      hung_minutes: info.hungMinutes,
+      last_tool: info.lastTool ?? null,
+      last_lines: info.lastLines ? info.lastLines.split("\n") : [],
+    };
     const parts: string[] = [
       `<hung_run_warning>`,
       `Your previous run was stopped as hung after ${info.hungMinutes} minutes.`,
       `Do not repeat the step that hung; if it was a search or a long command, narrow it or add a timeout.`,
+      ``,
+      `\`\`\`json`,
+      JSON.stringify(data, null, 2),
+      `\`\`\``,
+      `</hung_run_warning>`,
     ];
-    if (info.lastTool) {
-      parts.push(`Last tool call: ${info.lastTool}`);
-    }
-    if (info.lastLines) {
-      parts.push(`Last output before it hung:`);
-      parts.push("```");
-      parts.push(info.lastLines);
-      parts.push("```");
-    }
-    parts.push(`</hung_run_warning>`);
     return parts.join("\n");
   }
 
