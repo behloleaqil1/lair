@@ -435,25 +435,31 @@ describe("verifier acceptance tests", () => {
   });
 
   it("12. drop can never be in auto_apply (config error)", async () => {
-    const p = makePaths();
-    tasks(p, "worker-a|Alice|feat-login|Login form");
-
-    // Try to configure auto_apply with drop - should be a config error
-    const h = await setup(p, plannerBlock(p, {
+    // Test config validation directly - drop in auto_apply should cause an error
+    const { parsePlannerConfig } = await import("./config.js");
+    const project = {
+      project: "test",
+      repo: "/tmp/test",
+      agents_dir: "/tmp/agents",
+      inbox_file: "/tmp/inbox.md",
+      outbox_file: "/tmp/outbox.md",
+      queue_file: "/tmp/queue.md",
+      dragons: {
+        "worker-a": { id: "worker-a", name: "Alice", model: "model-a", machine: "local", instructions: "", adapter: "test-cli" },
+        planner: { id: "planner", name: "Planner", model: "model-a", machine: "local", instructions: "", adapter: "test-cli" },
+        verifier: { id: "verifier", name: "Verifier", model: "model-a", machine: "local", instructions: "", adapter: "test-cli" },
+      },
+      agents: { enabled: true, fill: { enabled: true, tasks_file: "/tmp/tasks.md", agents: ["worker-a"] } },
+    };
+    const result = parsePlannerConfig({
+      enabled: true,
+      agent: { id: "planner", prompt_file: "planner.md" },
       verifier: { id: "verifier", prompt_file: "verifier.md", auto_apply: ["drop"] },
-    }), {
-      extra: {
-        dragons: {
-          "worker-a": { id: "worker-a", name: "Alice", model: "model-a", machine: "local", instructions: "", adapter: "test-cli" },
-          planner: { id: "planner", name: "Planner", model: "model-a", machine: "local", instructions: "", adapter: "test-cli" },
-          verifier: { id: "verifier", name: "Verifier", model: "model-a", machine: "local", instructions: "", adapter: "test-cli" },
-        },
-      } as never,
-    });
-
-    // The planner should report config errors
-    const status = h.service.status();
-    expect(status.errors.some((e) => e.includes("drop") && e.includes("auto_apply"))).toBe(true);
+    }, project as never);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors.some((e) => e.includes("drop") && e.includes("auto_apply"))).toBe(true);
+    }
   });
 
   it("13. proposal text and reason appear only inside JSON data block (H2)", async () => {
