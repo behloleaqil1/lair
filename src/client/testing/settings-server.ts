@@ -21,7 +21,6 @@ import { DecisionStore } from "../../server/decisions/store.js";
 import { HumanAuth, registerOwnerRoutes } from "../../server/human-auth/index.js";
 import { mountNotifications } from "../../server/notifications/mount.js";
 import { ConfigReloader, serverModules } from "../../server/reload/index.js";
-import { registerRootGuards } from "../../server/root-guards.js";
 import { SettingsService, registerSettingsUiRoutes } from "../../server/settings/index.js";
 import { AiToolsService, registerAiRoutes, type ToolRunner, type ToolRunOptions, type ToolRunOutput } from "../../server/ai/index.js";
 import { signIn } from "../owner-session";
@@ -114,8 +113,9 @@ export async function settingsServer(options: SettingsServerOptions): Promise<Se
   const store = new DecisionStore(":memory:");
   const bus = new EventBus();
 
+  // Each route module refuses cross-site requests itself. Not the root guards: they check ?project= against Lair's own
+  // projects/, and this server's projects are in a temporary directory (the AI routes check them there)
   const app = Fastify({ logger: false });
-  registerRootGuards(app);
   await registerOwnerRoutes(app, auth);
   await registerSettingsUiRoutes(app, { service: settings, auth });
   await registerAiRoutes(app, {
