@@ -132,7 +132,7 @@ const eventLoopLag: CheckDefinition = {
   id: "event_loop_lag",
   scope: "server",
   title: "Event-loop lag",
-  async measure({ measures, settings }) {
+  async measure({ measures, settings }: CheckContext): Promise<Measured | null> {
     const t = settings.event_loop_lag;
     const thresholds = { warning_ms: t.warning_ms, failing_ms: t.failing_ms };
     const delay = measures.eventLoopDelay();
@@ -158,7 +158,7 @@ const requestLatency: CheckDefinition = {
   id: "request_latency",
   scope: "server",
   title: "Request latency (p95)",
-  async measure({ latency, settings }) {
+  async measure({ latency, settings }: CheckContext): Promise<Measured | null> {
     const t = settings.request_latency;
     const thresholds = { warning_ms: t.warning_ms, failing_ms: t.failing_ms, min_requests: t.min_requests, window_minutes: t.window_minutes };
     const s = latency.summary(t.window_minutes * 60_000);
@@ -190,7 +190,7 @@ const openFiles: CheckDefinition = {
   id: "open_files",
   scope: "server",
   title: "Open files",
-  async measure({ measures, settings }) {
+  async measure({ measures, settings }: CheckContext): Promise<Measured | null> {
     const t = settings.open_files;
     const thresholds = { warning_percent: t.warning_percent, failing_percent: t.failing_percent };
     const files = await measures.openFiles();
@@ -219,7 +219,7 @@ const diskFree: CheckDefinition = {
   id: "disk_free",
   scope: "server",
   title: "Free disk",
-  async measure({ measures, settings, sources }) {
+  async measure({ measures, settings, sources }: CheckContext): Promise<Measured | null> {
     const t = settings.disk_free;
     const thresholds = { warning_percent: t.warning_percent, failing_percent: t.failing_percent, warning_gib: t.warning_gib, failing_gib: t.failing_gib };
     const space = await measures.diskSpace(sources.dataDir);
@@ -262,7 +262,7 @@ const storeSize: CheckDefinition = {
   id: "store_size",
   scope: "server",
   title: "Store sizes",
-  async measure({ settings, sources, previous }) {
+  async measure({ settings, sources, previous }: CheckContext): Promise<Measured | null> {
     const t = settings.store_size;
     const thresholds = { warning_mb: t.warning_mb, failing_mb: t.failing_mb, wal_warning_mb: t.wal_warning_mb, wal_failing_mb: t.wal_failing_mb };
     let stores: { name: string; bytes: number; walBytes: number }[];
@@ -304,7 +304,7 @@ const commandTimeouts: CheckDefinition = {
   id: "command_timeouts",
   scope: "server",
   title: "Commands that time out",
-  async measure({ timeouts, settings, now }) {
+  async measure({ timeouts, settings, now }: CheckContext): Promise<Measured | null> {
     const t = settings.command_timeouts;
     const thresholds = { warning: t.warning, failing: t.failing, window_minutes: t.window_minutes };
     const recent = timeouts.since(now - t.window_minutes * 60_000);
@@ -333,7 +333,7 @@ const moduleErrors: CheckDefinition = {
   id: "module_errors",
   scope: "project",
   title: "Module start failures and errors",
-  async measure({ sources, project }) {
+  async measure({ sources, project }: CheckContext): Promise<Measured | null> {
     if (!project || !sources.modules) return null;
     const reports = await sources.modules(project);
     const on = reports.filter((r) => r.on);
@@ -364,7 +364,7 @@ const watcherMode: CheckDefinition = {
   id: "watcher_mode",
   scope: "project",
   title: "File watcher",
-  async measure({ sources, project }) {
+  async measure({ sources, project }: CheckContext): Promise<Measured | null> {
     if (!project || !sources.watchers) return null;
     const watched = sources.watchers(project);
     if (!watched || watched.length === 0) return null;
@@ -416,7 +416,7 @@ const infraHolds: CheckDefinition = {
   id: "infra_holds",
   scope: "project",
   title: "Holds caused by the infrastructure",
-  async measure({ sources, project, settings }) {
+  async measure({ sources, project, settings }: CheckContext): Promise<Measured | null> {
     if (!project || !sources.agentsOn?.(project)) return null;
     const store = sources.agentsStore?.() ?? null;
     if (!store) return null;
@@ -455,7 +455,7 @@ const machines: CheckDefinition = {
   id: "machines",
   scope: "project",
   title: "Unreachable machines",
-  async measure({ sources, project, settings, now }) {
+  async measure({ sources, project, settings, now }: CheckContext): Promise<Measured | null> {
     if (!project || !sources.placement) return null;
     const status = sources.placement(project);
     if (!status || !status.enabled || status.machines.length === 0) return null;
@@ -492,7 +492,7 @@ const gateQueueAge: CheckDefinition = {
   id: "gate_queue_age",
   scope: "project",
   title: "Gate queue age",
-  async measure({ sources, project, settings, now }) {
+  async measure({ sources, project, settings, now }: CheckContext): Promise<Measured | null> {
     if (!project) return null;
     const config = sources.config(project);
     if (!config.gates_dir) return null;
@@ -559,7 +559,7 @@ const retention: CheckDefinition = {
   id: "retention",
   scope: "project",
   title: "Files per watched folder",
-  async measure({ sources, project, settings }) {
+  async measure({ sources, project, settings }: CheckContext): Promise<Measured | null> {
     if (!project) return null;
     const config = sources.config(project);
     const t = settings.retention;

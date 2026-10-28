@@ -24,7 +24,7 @@ export function SelfChecksCard({ view, project }: { view: DiagnosticsView; proje
         <p style={muted}>No check has run yet: the first round runs shortly after Lair starts.</p>
       ) : rows.length === 0 ? (
         <p style={{ color: "var(--success)" }} data-empty="self-checks">
-          ✓ All {summary.total - summary.unknown} measured checks pass{summary.unknown > 0 ? ` (${summary.unknown} could not be measured)` : ""}.
+          {`✓ All ${summary.total - summary.unknown} measured checks pass${summary.unknown > 0 ? ` (${summary.unknown} could not be measured)` : ""}.`}
         </p>
       ) : (
         <ul className="plain-list" data-list="self-checks">
@@ -32,7 +32,7 @@ export function SelfChecksCard({ view, project }: { view: DiagnosticsView; proje
             <li key={row.key} data-check={row.key} style={{ marginBottom: "0.75rem" }}>
               <Badge tone={TONE[row.status]}>{row.status}</Badge> <strong>{row.title}</strong> <span style={muted}>({row.where})</span>
               <div>{row.explanation}</div>
-              {row.fix && <div style={muted}>Fix: {row.fix}</div>}
+              {row.fix && <div style={muted}>{`Fix: ${row.fix}`}</div>}
               {row.failingSince && (
                 <div style={muted}>
                   Failing since <Time iso={row.failingSince} />
