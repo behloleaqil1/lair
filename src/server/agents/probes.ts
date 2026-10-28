@@ -6,8 +6,8 @@
 import { spawn } from "child_process";
 import { closeSync, mkdirSync, openSync } from "fs";
 import { dirname } from "path";
-import { systemProbes, type ProcessInfo, type ProcessTable, type Probes } from "../watchdog/probes.js";
-import { CachedProcessTable, getProcessCache, type ProcessCache } from "../core/process-cache.js";
+import { systemProbes, type ProcessInfo, type Probes } from "../watchdog/probes.js";
+import { CachedProcessTable, type ProcessCache } from "../core/process-cache.js";
 
 /** A process identity that survives pid reuse: the pid and when that process started. */
 export interface ProcessOwner {

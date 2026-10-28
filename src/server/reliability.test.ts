@@ -19,7 +19,7 @@
 import { describe, expect, it } from "vitest";
 import { AsyncCache } from "./core/async-cache.js";
 import { ProcessCache, CachedProcessTable } from "./core/process-cache.js";
-import { ProjectDataCache, DataCacheManager } from "./services/data-cache.js";
+import { DataCacheManager } from "./services/data-cache.js";
 
 describe("AsyncCache single-flight", () => {
   it("acceptance 5: single-flight refresher never runs two at once", async () => {
