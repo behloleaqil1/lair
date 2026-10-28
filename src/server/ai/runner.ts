@@ -45,15 +45,15 @@ export class SpawnToolRunner implements ToolRunner {
       let failure: ToolRunFailure | undefined;
       let message: string | undefined;
       let settled = false;
-      let timer: NodeJS.Timeout | undefined;
-      let grace: NodeJS.Timeout | undefined;
+      /** The timeout, and the grace after a kill (set once each; finish may run before either is) */
+      const timers: { timeout?: NodeJS.Timeout; grace?: NodeJS.Timeout } = {};
       let child: ChildProcess | undefined;
 
       const finish = (code: number) => {
         if (settled) return;
         settled = true;
-        if (timer) clearTimeout(timer);
-        if (grace) clearTimeout(grace);
+        if (timers.timeout) clearTimeout(timers.timeout);
+        if (timers.grace) clearTimeout(timers.grace);
         resolve({ code: failure ? -1 : code, stdout, stderr, ...(failure ? { failure, message } : {}) });
       };
       const stop = (why: ToolRunFailure, text: string) => {
@@ -67,7 +67,7 @@ export class SpawnToolRunner implements ToolRunner {
         } catch {
           child?.kill("SIGKILL");
         }
-        grace ??= setTimeout(() => finish(-1), KILL_GRACE_MS);
+        timers.grace ??= setTimeout(() => finish(-1), KILL_GRACE_MS);
       };
 
       try {
@@ -78,7 +78,7 @@ export class SpawnToolRunner implements ToolRunner {
         finish(-1);
         return;
       }
-      timer = setTimeout(() => stop("timeout", `no answer after ${Math.round(options.timeoutMs / 1000)} s`), options.timeoutMs);
+      timers.timeout = setTimeout(() => stop("timeout", `no answer after ${Math.round(options.timeoutMs / 1000)} s`), options.timeoutMs);
       const take = (into: "out" | "err") => (chunk: Buffer) => {
         if (failure) return;
         bytes += chunk.length;
