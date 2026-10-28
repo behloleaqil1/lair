@@ -28,7 +28,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { AsyncCache } from "./core/async-cache.js";
 import { ProcessCache, CachedProcessTable } from "./core/process-cache.js";
-import { DataCacheManager, ProjectDataCache } from "./services/data-cache.js";
+import { DataCacheManager } from "./services/data-cache.js";
 import { AgentsManager, type AgentsService } from "./agents/service.js";
 import { EventBus } from "./core/event-bus.js";
 import {
@@ -702,7 +702,6 @@ describe("production-path: GET /api/prs route with slow data source", () => {
 
     let now = 0;
     let fetchCallCount = 0;
-    const SLOW_FETCH_MS = 10_000;
 
     // Create a cache with a slow fetcher and controllable clock
     const cache = new AsyncCache({
