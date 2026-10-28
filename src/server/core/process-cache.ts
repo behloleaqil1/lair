@@ -10,7 +10,7 @@
  * the output is valid.
  */
 import { execFile } from "child_process";
-import type { ProcessInfo } from "../watchdog/probes.js";
+import type { ProcessInfo, ProcessTable } from "../watchdog/probes.js";
 import { parsePsOutput, PS_ARGV } from "../watchdog/probes.js";
 import { AsyncCache } from "./async-cache.js";
 
@@ -248,5 +248,19 @@ export function disposeProcessCache(): void {
   if (sharedCache) {
     sharedCache.stop();
     sharedCache = null;
+  }
+}
+
+/**
+ * A ProcessTable implementation that reads from the shared ProcessCache.
+ * This adapter allows the agents and watchdog modules to use the cache
+ * without changing their ProcessTable interface.
+ */
+export class CachedProcessTable implements ProcessTable {
+  constructor(private cache: ProcessCache) {}
+
+  async list(): Promise<ProcessInfo[]> {
+    const entry = await this.cache.get();
+    return entry.processes;
   }
 }
