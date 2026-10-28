@@ -278,6 +278,11 @@ export class PipelineManager {
     return this.projects.has(project);
   }
 
+  /** The project's config errors, without asking GitHub (the supervisor's module_errors check). */
+  errors(project: string): string[] {
+    return this.problems.get(project) ?? [];
+  }
+
   private require(project: string): LoadedProject {
     const p = this.projects.get(project);
     if (p) return p;

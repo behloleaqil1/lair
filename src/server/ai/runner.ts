@@ -5,6 +5,7 @@
  * the rest of this server's. Tests replace this one boundary.
  */
 import { spawn, type ChildProcess } from "child_process";
+import { noteCommandTimeout } from "../core/command-timeouts.js";
 
 export type ToolRunFailure = "not_found" | "timeout" | "too_large" | "spawn";
 
@@ -78,7 +79,10 @@ export class SpawnToolRunner implements ToolRunner {
         finish(-1);
         return;
       }
-      timers.timeout = setTimeout(() => stop("timeout", `no answer after ${Math.round(options.timeoutMs / 1000)} s`), options.timeoutMs);
+      timers.timeout = setTimeout(() => {
+        noteCommandTimeout("tool", file);
+        stop("timeout", `no answer after ${Math.round(options.timeoutMs / 1000)} s`);
+      }, options.timeoutMs);
       const take = (into: "out" | "err") => (chunk: Buffer) => {
         if (failure) return;
         bytes += chunk.length;

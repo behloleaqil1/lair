@@ -31,6 +31,11 @@ export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/dashboard",
   // AI tools: every route, reads included, runs the tools' own commands and shows who is signed in
   "/api/ai",
+  // The supervisor: Lair's diagnostics, and the ops tokens and their audit (every route the owner's)
+  "/api/health/diagnostics",
+  "/api/supervisor",
+  // The ops API takes an ops token, not the owner session; no browser page may call it either
+  "/api/ops",
   // Modules whose writes need the owner (requireOwnerForChanges); their reads stay open but get no CORS either
   "/api/delivery",
   "/api/controls",

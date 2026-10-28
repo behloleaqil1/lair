@@ -97,6 +97,12 @@ export interface ProjectConfig {
    * Validated by parsePlannerConfig; see docs/configuration.md#planner
    */
   planner?: Record<string, unknown>;
+  /**
+   * The supervisor: Lair's self-checks (src/server/supervisor/). Validated
+   * by parseSupervisorConfig; see
+   * docs/configuration.md#supervisor-self-checks-and-the-ops-api
+   */
+  supervisor?: Record<string, unknown>;
 }
 
 // Process configuration as it appears in YAML (before defaults applied)

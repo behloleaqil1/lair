@@ -47,6 +47,9 @@ import { ReviewManager, inboxDecisionSink, registerReviewRoutes } from "./review
 import { mountTriage } from "./triage/index.js";
 import { PlacementManager, registerPlacementRoutes } from "./placement/index.js";
 import { registerDashboardRoutes } from "./dashboard/index.js";
+import type { DashboardSources } from "./dashboard/routes.js";
+import { RequestLatency, mountSupervisor, registerLatencyHook } from "./supervisor/index.js";
+import { moduleReports } from "./supervisor/modules.js";
 import { ConfigReloader, registerReloadRoutes, serverModules } from "./reload/index.js";
 import {
   RestartController,
@@ -77,6 +80,11 @@ await fastify.register(
 // Refuse cross-site browser requests and foreign Host headers (403) on every
 // route, and unsafe or unknown ?project= names on API routes (400)
 registerRootGuards(fastify);
+
+// Every request's duration, for the supervisor's request_latency check
+// (src/server/supervisor/): before any route, so every route has it
+const latency = new RequestLatency();
+registerLatencyHook(fastify, latency);
 
 // Path ids are matched against files on disk: refuse unsafe ones with 400
 const dragonIdGuard = requireValidIdParam(isValidDragonId, "dragon");
@@ -517,26 +525,75 @@ await registerPlacementRoutes(fastify, placements, () => getDefaultProject());
 // The dashboard's own reads (src/server/dashboard/): the nav's module flags,
 // a gate's detail from the queue, the pipelines, triage and placement, and
 // the owner-only log tails and failing tests
-await registerDashboardRoutes(
-  fastify,
-  {
-    defaultProject: () => getDefaultProject(),
+const dashboardSources: DashboardSources = {
+  defaultProject: () => getDefaultProject(),
+  config: (project) => loadProjectConfig(project),
+  data: (project) => getDataService(project),
+  agentRuns: (project, limit) => agents.get(project)?.runs(limit) ?? [],
+  pipelineRuns: (project, limit) => pipelines.listRuns(project, limit),
+  triageRecords: (project, limit) => triage.getStore()?.listRecords(project, { limit }) ?? [],
+  placement: (project) => placements.status(project),
+  nodeCount: () => getStore().listNodes().length,
+};
+await registerDashboardRoutes(fastify, dashboardSources, humanAuth);
+
+// The supervisor, part 1 (src/server/supervisor/): Lair's self-checks on a
+// schedule, off the request path (GET /api/health/diagnostics and Home →
+// Health, the owner's); a check failing for a while is one notice in the
+// Decision Inbox; and the read-only ops API an AI supervisor uses
+// (POST /api/ops/call, `lair ops-mcp`), on scoped tokens kept in memory,
+// every call audited in data/supervisor.db
+const { supervisor: selfChecks } = await mountSupervisor(fastify, {
+  dbPath: join(process.cwd(), "data", "supervisor.db"),
+  humanAuth,
+  defaultProject: () => getDefaultProject(),
+  projects: projectEntries,
+  latency,
+  events: getEventBus(),
+  decisions: decisionInbox,
+  checks: {
+    dataDir: join(process.cwd(), "data"),
     config: (project) => loadProjectConfig(project),
-    data: (project) => getDataService(project),
-    agentRuns: (project, limit) => agents.get(project)?.runs(limit) ?? [],
-    pipelineRuns: (project, limit) => pipelines.listRuns(project, limit),
+    watchers: (project) => fileWatchers.get(project)?.watched() ?? null,
+    modules: (project) => {
+      let config: ProjectConfig | null = null;
+      try {
+        config = loadProjectConfig(project);
+      } catch {
+        config = null;
+      }
+      return moduleReports({ watchdogs, agents, triage, placements, planner, reviews, delivery, pipelines }, project, config);
+    },
+    agentsStore: () => agents.getStore(),
+    agentsOn: (project) => agents.get(project) !== undefined,
+    agentDecisions: (project) => decisionInbox.openOf(project, "agents"),
+    placement: (project) => placements.status(project),
+  },
+  ops: {
+    config: (project) => loadProjectConfig(project),
+    status: {
+      watchdog: (project) => watchdogs.status(project),
+      agents: (project) => agents.status(project),
+      triage: (project) => triage.status(project),
+      delivery: (project) => delivery.status(project),
+      pipelines: (project) => pipelines.status(project),
+      review: (project) => reviews.info(project),
+      planner: (project) => planner.status(project),
+    },
+    agentsStore: () => agents.getStore(),
+    serverEvents: () => getEventBus().getRecentEvents(undefined, 1000),
+    decisions: (options) => decisionInbox.list(options),
+    dashboard: dashboardSources,
     triageRecords: (project, limit) => triage.getStore()?.listRecords(project, { limit }) ?? [],
     placement: (project) => placements.status(project),
-    nodeCount: () => getStore().listNodes().length,
   },
-  humanAuth,
-);
+});
 
 // Live config reload (src/server/reload/): a changed project file reaches
 // the modules whose part of it changed, without a restart; an invalid one
 // keeps the previous config running and shows in the dashboard's banner
 const reloader = new ConfigReloader({
-  modules: serverModules({ delivery, watchdogs, pipelines, reviews, agents, triage, placements, planner }),
+  modules: serverModules({ delivery, watchdogs, pipelines, reviews, agents, triage, placements, planner, supervisor: selfChecks }),
   initial: projectEntries,
   events: getEventBus(),
   onAccepted: (project, config) => {
@@ -611,6 +668,9 @@ const stopServer = async (reason: string) => {
 
   // Stop watching the project files: no reload starts from now on
   await reloader.stop();
+
+  // Stop the self-checks first: they read the other modules (its store closes with fastify)
+  await selfChecks.stop();
 
   // Stop watchdogs: wait for a tick in progress, then close their store
   await watchdogs.stop();
@@ -797,6 +857,14 @@ const start = async () => {
         console.warn(`Failed to start file watcher for ${projectName}:`, err);
       }
     }
+
+    // Lair's self-checks (after the modules and the file watchers they read)
+    const checked = selfChecks.start();
+    console.log(
+      checked.length > 0
+        ? `[supervisor] Self-checks for: ${checked.join(", ")}`
+        : "[supervisor] Self-checks off (supervisor.checks.enabled: false)",
+    );
 
     // Reload the modules when a project file changes
     reloader.start();

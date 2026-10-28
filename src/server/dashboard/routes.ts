@@ -31,7 +31,13 @@ import type { AgentRunView } from "../../shared/agents-types.js";
 import type { PipelineRun } from "../../shared/pipeline-types.js";
 import type { PlacementStatus } from "../../shared/placement-types.js";
 import type { TriageRecord } from "../../shared/triage-types.js";
-import type { AgentLogView, DashboardModules, GateDetailView, GateOutputView } from "../../shared/dashboard-types.js";
+import type {
+  AgentLogView,
+  DashboardModules,
+  GateDetailView,
+  GateOutputView,
+  LogTailView,
+} from "../../shared/dashboard-types.js";
 import { NO_MODULES, moduleFlags } from "./modules.js";
 import {
   findPipelineRun,
@@ -53,7 +59,9 @@ export interface DashboardSources {
   /** The project's config; throws when it can't be read */
   config(project: string): ProjectConfig;
   /** The project's gates_dir and agents_dir reader */
-  data(project: string): Pick<DataService, "getGateRecord" | "getGateLogText" | "getGateLogTail" | "getDragonLogPath">;
+  data(
+    project: string,
+  ): Pick<DataService, "getGateRecord" | "getGateLogText" | "getGateLogTail" | "getDragonLogPath" | "getRecentGateResults">;
   /** The agents module's runs, newest first ([] when it is off) */
   agentRuns?(project: string, limit: number): AgentRunView[];
   /** Lair pipeline runs, newest first */
@@ -119,6 +127,65 @@ function mtimeOf(path: string): number {
   }
 }
 
+export interface FoundGate {
+  detail: GateDetailView;
+  triage: TriageRecord | null;
+  logText: string | null;
+  run: PipelineRun | null;
+}
+
+/**
+ * The gate an id names (the queue and its results, then Lair's pipeline
+ * runs, then triage), and what is needed for its output; null when none
+ * knows it. The dashboard's routes and the supervisor's ops API read it.
+ */
+export function lookUpGate(sources: DashboardSources, project: string, id: string): FoundGate | null {
+  const data = sources.data(project);
+  const records = tryRead(() => sources.triageRecords?.(project, LOOKUP_LIMIT) ?? [], [] as TriageRecord[]);
+  const placement = tryRead(() => sources.placement?.(project) ?? null, null as PlacementStatus | null);
+  const record = data.getGateRecord(id);
+  if (record.gate || record.result || record.logPath) {
+    const logText = data.getGateLogText(id);
+    const triage = triageRecordFor(records, [id]);
+    const detail = queueGateDetail(project, id, { ...record, logText }, { triage, placement });
+    return { detail, triage, logText, run: null };
+  }
+  const runs = tryRead(() => sources.pipelineRuns?.(project, LOOKUP_LIMIT) ?? [], [] as PipelineRun[]);
+  const run = findPipelineRun(runs, id);
+  if (run) {
+    const triage = triageRecordFor(records, pipelineIds(run));
+    return { detail: pipelineGateDetail(project, id, run, { triage, placement }), triage, logText: null, run };
+  }
+  const triage = triageRecordFor(records, [id]);
+  if (triage) return { detail: triageGateDetail(project, id, triage), triage, logText: null, run: null };
+  return null;
+}
+
+/** A found gate's log tail: a pipeline run's job log, else the queue's log file; null without one. */
+export function gateLogTail(sources: DashboardSources, project: string, id: string, found: FoundGate, lines: number): LogTailView | null {
+  if (found.run) return pipelineLog(found.run, lines);
+  return found.detail.source === "queue" ? sources.data(project).getGateLogTail(id, lines) : null;
+}
+
+/**
+ * An agent's log tail: its newest run's log (the agents module names it;
+ * only one inside agents_dir is read) or its launcher's newest log in
+ * agents_dir, whichever was written last.
+ */
+export function agentLogTail(sources: DashboardSources, project: string, id: string, lines: number): AgentLogView {
+  const config = sources.config(project);
+  const runs = tryRead(() => sources.agentRuns?.(project, LOOKUP_LIMIT) ?? [], [] as AgentRunView[]);
+  const run = runs.find((r) => r.agent === id && typeof r.logPath === "string" && inside(config.agents_dir, r.logPath));
+  const runPath = run?.logPath ?? null;
+  const dragonPath = sources.data(project).getDragonLogPath(id);
+  // The newer of the two (a launcher outside Lair may have written since)
+  if (runPath && (!dragonPath || runPath === dragonPath || mtimeOf(runPath) >= mtimeOf(dragonPath))) {
+    return { agent: id, source: "run", runId: run?.id ?? null, log: readLogTail(runPath, lines) };
+  }
+  if (dragonPath) return { agent: id, source: "dragon", runId: null, log: readLogTail(dragonPath, lines) };
+  return { agent: id, source: null, runId: null, log: null };
+}
+
 export async function registerDashboardRoutes(
   fastify: FastifyInstance,
   sources: DashboardSources,
@@ -132,29 +199,7 @@ export async function registerDashboardRoutes(
     const agentId = requireValidIdParam(isValidDragonId, "agent");
 
     const projectOf = (query: { project?: string }) => query.project ?? sources.defaultProject();
-
-    /** The gate an id names, and what is needed for its output. */
-    const lookUp = (project: string, id: string) => {
-      const data = sources.data(project);
-      const records = tryRead(() => sources.triageRecords?.(project, LOOKUP_LIMIT) ?? [], [] as TriageRecord[]);
-      const placement = tryRead(() => sources.placement?.(project) ?? null, null as PlacementStatus | null);
-      const record = data.getGateRecord(id);
-      if (record.gate || record.result || record.logPath) {
-        const logText = data.getGateLogText(id);
-        const triage = triageRecordFor(records, [id]);
-        const detail = queueGateDetail(project, id, { ...record, logText }, { triage, placement });
-        return { detail, triage, logText, run: null as PipelineRun | null };
-      }
-      const runs = tryRead(() => sources.pipelineRuns?.(project, LOOKUP_LIMIT) ?? [], [] as PipelineRun[]);
-      const run = findPipelineRun(runs, id);
-      if (run) {
-        const triage = triageRecordFor(records, pipelineIds(run));
-        return { detail: pipelineGateDetail(project, id, run, { triage, placement }), triage, logText: null, run };
-      }
-      const triage = triageRecordFor(records, [id]);
-      if (triage) return { detail: triageGateDetail(project, id, triage), triage, logText: null, run: null };
-      return null;
-    };
+    const lookUp = (project: string, id: string) => lookUpGate(sources, project, id);
 
     app.get("/api/dashboard/modules", async (request, reply) => {
       const query = ProjectQuery.safeParse(request.query ?? {});
@@ -198,11 +243,7 @@ export async function registerDashboardRoutes(
           const found = lookUp(project, request.params.id);
           if (!found) return fail(reply, 404, `No gate ${request.params.id} in ${project}`);
           const id = request.params.id;
-          const log = found.run
-            ? pipelineLog(found.run, lines)
-            : found.detail.source === "queue"
-              ? sources.data(project).getGateLogTail(id, lines)
-              : null;
+          const log = gateLogTail(sources, project, id, found, lines);
           const output: GateOutputView = gateOutput(id, log, found.triage, {
             logText: found.logText,
             failedSteps: found.detail.failedSteps,
@@ -225,20 +266,7 @@ export async function registerDashboardRoutes(
         const lines = clampLines(query.data.lines);
         const id = request.params.id;
         try {
-          const config = sources.config(project);
-          const runs = tryRead(() => sources.agentRuns?.(project, LOOKUP_LIMIT) ?? [], [] as AgentRunView[]);
-          // The agents module names its run logs; only one in agents_dir is read
-          const run = runs.find((r) => r.agent === id && typeof r.logPath === "string" && inside(config.agents_dir, r.logPath));
-          const runPath = run?.logPath ?? null;
-          const dragonPath = sources.data(project).getDragonLogPath(id);
-          let view: AgentLogView = { agent: id, source: null, runId: null, log: null };
-          // The newer of the two (a launcher outside Lair may have written since)
-          if (runPath && (!dragonPath || runPath === dragonPath || mtimeOf(runPath) >= mtimeOf(dragonPath))) {
-            view = { agent: id, source: "run", runId: run?.id ?? null, log: readLogTail(runPath, lines) };
-          } else if (dragonPath) {
-            view = { agent: id, source: "dragon", runId: null, log: readLogTail(dragonPath, lines) };
-          }
-          return respond(view);
+          return respond(agentLogTail(sources, project, id, lines));
         } catch (e) {
           request.log.error({ err: e }, "dashboard: an owner read failed");
           return fail(reply, 500, READ_FAILED);

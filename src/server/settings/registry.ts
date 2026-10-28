@@ -17,6 +17,7 @@ import { DeliverySchema } from "../delivery/config.js";
 import { ExecutorsSchema, PipelinesSchema } from "../gates/project-pipelines.js";
 import { PlacementSchema } from "../placement/config.js";
 import { ReviewSchema } from "../review/config.js";
+import { SupervisorSchema } from "../supervisor/config.js";
 import { TriageSchema } from "../triage/config.js";
 import { WatchdogSchema } from "../watchdog/config.js";
 import {
@@ -236,6 +237,19 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       command_timeout_seconds: timeouts,
       command_line: timeouts,
       history: { advanced: true },
+    },
+  },
+  {
+    key: "supervisor",
+    title: "Supervisor: self-checks",
+    schema: SupervisorSchema,
+    docs: "#supervisor-self-checks-and-the-ops-api",
+    hints: {
+      "checks.enabled": { help: "Lair checks itself on a schedule; Home → Health shows the results" },
+      "checks.notice_minutes": { help: "A check failing this long raises one notice in the Decision Inbox" },
+      "checks.disabled": { help: "Check ids to skip" },
+      "checks.timeout_seconds": timeouts,
+      "checks.notice_cooldown_minutes": { advanced: true },
     },
   },
 ];

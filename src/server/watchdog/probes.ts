@@ -7,6 +7,7 @@
  * real files in a temp dir).
  */
 import { execFile } from "child_process";
+import { kindOfProgram, noteCommandTimeout } from "../core/command-timeouts.js";
 import {
   appendFileSync,
   closeSync,
@@ -119,6 +120,8 @@ export class ExecFileRunner implements CommandRunner {
             typeof (error as { code?: unknown }).code === "number"
               ? ((error as { code: number }).code)
               : -1;
+          // Killed without an abort: its timeout ended it (the supervisor's command_timeouts check counts these)
+          if (error.killed && !options.signal?.aborted) noteCommandTimeout(kindOfProgram(file), file);
           resolve({
             code: error.killed ? -1 : code,
             stdout: stdout ?? "",

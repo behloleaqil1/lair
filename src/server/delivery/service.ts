@@ -412,6 +412,11 @@ export class DeliveryManager implements ContainerServices {
     return this.deliveries.get(project);
   }
 
+  /** The project's config errors and its last error, without asking its environments (the supervisor's module_errors check). */
+  report(project: string): { errors: string[]; lastError: string | null } {
+    return { errors: this.problems.get(project) ?? [], lastError: this.deliveries.get(project)?.lastError ?? null };
+  }
+
   getStore(): DeliveryStore | null {
     return this.store;
   }

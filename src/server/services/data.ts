@@ -16,6 +16,7 @@ import {
 } from "fs";
 import { join } from "path";
 import { execSync, execFileSync } from "child_process";
+import { noteCommandTimeout } from "../core/command-timeouts.js";
 import type {
   ProjectConfig,
   Dragon,
@@ -100,7 +101,9 @@ function safeExecFile(
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],
     });
-  } catch {
+  } catch (e) {
+    // The supervisor's command_timeouts check counts the status commands that time out
+    if ((e as NodeJS.ErrnoException).code === "ETIMEDOUT") noteCommandTimeout("status", file);
     return null;
   }
 }

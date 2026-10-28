@@ -92,12 +92,8 @@ const TABS: Record<SectionId, readonly TabDef[]> = {
   home: [
     { id: null, label: "Overview", needs: null, enable: "" },
     { id: "activity", label: "Activity", needs: null, enable: "" },
-    {
-      id: "health",
-      label: "Health",
-      needs: (m) => m.watchdog,
-      enable: "Set watchdog.enabled: true in the project's YAML; it starts in observe mode, which only detects and escalates.",
-    },
+    // Lair's self-checks are always there; the watchdog's part says how to turn it on
+    { id: "health", label: "Health", needs: null, enable: "" },
   ],
   work: [
     { id: null, label: "Agents", needs: null, enable: "" },

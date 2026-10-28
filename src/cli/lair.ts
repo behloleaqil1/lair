@@ -4,11 +4,14 @@
  *
  *   lair review submit --pr <n> --head <sha> --verdict approve|request_changes
  *                      --summary-file <file> [--findings-file <file>]
+ *   lair ops-mcp       Lair's read-only ops API as an MCP server over stdio
+ *                      (LAIR_OPS_TOKEN, LAIR_URL)
  *
  * From the Lair repository: `npm run --silent lair -- review submit ...`, or
  * `node dist/cli/lair.js review submit ...` after `npm run build`.
  */
 import { EXIT_USAGE, reviewSubmit, USAGE } from "./review-submit.js";
+import { OPS_MCP_USAGE, runOpsMcp } from "./ops-mcp.js";
 
 async function main(argv: string[]): Promise<number> {
   const [command, subcommand, ...rest] = argv;
@@ -20,7 +23,14 @@ async function main(argv: string[]): Promise<number> {
       err: (line) => process.stderr.write(`${line}\n`),
     });
   }
-  process.stderr.write(`${USAGE}\n`);
+  if (command === "ops-mcp" && subcommand === undefined) {
+    return runOpsMcp({
+      env: process.env,
+      fetch: (url, init) => fetch(url, init),
+      err: (line) => process.stderr.write(`${line}\n`),
+    });
+  }
+  process.stderr.write(`${USAGE}\n\n${OPS_MCP_USAGE}\n`);
   return EXIT_USAGE;
 }
 

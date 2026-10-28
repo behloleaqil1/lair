@@ -1,9 +1,12 @@
 /**
- * Health view - the progress watchdog: SLO status per detector, breaches and
- * playbook runs. Read-only; the watchdog is configured in the project YAML
- * (watchdog:, see docs/configuration.md#watchdog).
+ * Home → Health: Lair's own self-checks (the failing and warning ones with
+ * their fix; SelfChecks.tsx, the owner's), then the progress watchdog: SLO
+ * status per detector, breaches and playbook runs. Read-only; the watchdog
+ * is configured in the project YAML (watchdog:, see
+ * docs/configuration.md#watchdog), the self-checks in its supervisor: block.
  */
 import { useApi } from "../hooks/useApi";
+import { SelfChecks } from "./SelfChecks";
 
 interface Props {
   project: string;
@@ -92,6 +95,15 @@ function commandOf(run: PlaybookRun): string {
 }
 
 export function Health({ project, refreshKey }: Props) {
+  return (
+    <div>
+      <SelfChecks project={project} refreshKey={refreshKey} />
+      <WatchdogHealth project={project} refreshKey={refreshKey} />
+    </div>
+  );
+}
+
+function WatchdogHealth({ project, refreshKey }: Props) {
   const status = useApi<WatchdogStatus>("/watchdog/status", project, refreshKey);
   const breaches = useApi<Breach[]>("/watchdog/breaches", project, refreshKey);
   const runs = useApi<PlaybookRun[]>("/watchdog/runs", project, refreshKey);
@@ -104,7 +116,7 @@ export function Health({ project, refreshKey }: Props) {
   if (!s.enabled) {
     return (
       <div>
-        <h2 style={{ marginBottom: "1.5rem" }}>Health</h2>
+        <h2 style={{ marginBottom: "1.5rem" }}>Watchdog</h2>
         <div className="card">
           <p>
             The watchdog is off for this project. Set <code>watchdog.enabled: true</code> in its YAML;
@@ -127,7 +139,7 @@ export function Health({ project, refreshKey }: Props) {
   return (
     <div>
       <div style={{ display: "flex", alignItems: "center", gap: "1rem", marginBottom: "1.5rem" }}>
-        <h2>Health</h2>
+        <h2>Watchdog</h2>
         <span className={`badge ${acting ? "badge-warning" : "badge-neutral"}`}>
           {acting ? "Act" : "Observe"}
         </span>
