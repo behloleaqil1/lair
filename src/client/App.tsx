@@ -1,10 +1,13 @@
 /**
- * Lair - the dashboard: a header with the project, the command bar, the nav
- * of sections (nav.ts: only those whose module the project turns on), and
+ * Lair - the dashboard, on the component kit (src/client/ui/): a left nav
+ * with the project switcher at the top, the sections (nav.ts: only those
+ * whose module the project turns on), and Lair's status, the owner's
+ * state and the look (theme, density) at the bottom; the command bar above
  * the section the URL names (router.ts: #/<section>[/<detail>][?tab=]).
- * Old view ids in the URL redirect to the section that replaced them.
+ * On a narrow screen the nav folds away behind the Menu button. Old view
+ * ids in the URL redirect to the section that replaced them.
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Home } from "./components/Home";
 import { Work } from "./components/Work";
 import { GatesSection } from "./components/GatesSection";
@@ -30,7 +33,24 @@ import type { SectionProps } from "./components/Section";
 import { ChatContext, SupervisorChatPanel, type ChatRequest } from "./components/SupervisorChat";
 import { askGoesToSupervisor } from "./supervisor-chat";
 import type { ChatStatusView } from "../shared/supervisor-types";
+import { Button } from "./ui/Button";
+import { Callout } from "./ui/Card";
+import { Field } from "./ui/Field";
+import { Icon } from "./ui/Icon";
+import { Select } from "./ui/Select";
+import { Switch } from "./ui/Switch";
+import { ToastProvider } from "./ui/Toast";
+import { usePreferences, type ThemeChoice } from "./ui/preferences";
+import "./ui/tokens.css";
+import "./ui/base.css";
+import "./ui/kit.css";
 import "./App.css";
+
+const THEME_OPTIONS = [
+  { value: "system", label: "System" },
+  { value: "light", label: "Light" },
+  { value: "dark", label: "Dark" },
+];
 
 /** Follow the location hash: canonical routes only (old view ids are replaced in place). */
 function useRoute(): [Route, (next: Route) => void] {
@@ -64,6 +84,21 @@ export function App() {
     tickRunning: false,
   });
   const refreshKey = lastRefresh.getTime();
+  const [prefs, setPrefs] = usePreferences();
+  // The nav on a narrow screen: folded until the Menu button opens it; Esc or a pick closes it
+  const [navOpen, setNavOpen] = useState(false);
+  const mainRef = useRef<HTMLElement>(null);
+  const menuRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!navOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setNavOpen(false);
+      menuRef.current?.focus();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [navOpen]);
 
   // Load projects on mount: the one the URL names, else the server's default (LAIR_PROJECT)
   useEffect(() => {
@@ -173,92 +208,151 @@ export function App() {
 
   return (
     <ChatContext.Provider value={chatControl}>
-    <div className="app">
-      <header className="header">
-        <h1>
-          <a href={linkTo("home")} className="brand">
-            🐉 Lair
-          </a>
-        </h1>
-        <div className="header-controls">
-          {projects.length > 1 && (
-            <select
-              value={currentProject}
-              onChange={(e) => switchProject(e.target.value)}
-              className="project-select"
-              aria-label="Project"
-            >
-              {projects.map((p) => (
-                <option key={p} value={p}>
-                  {p}
-                </option>
+      <ToastProvider>
+        <div className="app-shell" data-nav-open={navOpen ? "true" : "false"}>
+          <button type="button" className="skip-link" onClick={() => mainRef.current?.focus()}>
+            Skip to content
+          </button>
+
+          <aside className="sidebar" id="lair-sidebar" aria-label="Lair">
+            <div className="sidebar-top">
+              <h1 className="brand-heading">
+                <a href={linkTo("home")} className="brand" onClick={() => setNavOpen(false)}>
+                  <img src="/dragon.svg" alt="" width={22} height={22} />
+                  Lair
+                </a>
+              </h1>
+              {projects.length > 1 && (
+                <Field label="Project" className="project-field">
+                  <Select
+                    value={currentProject}
+                    onChange={(e) => switchProject(e.target.value)}
+                    className="project-select"
+                    options={projects.map((p) => ({ value: p, label: p }))}
+                  />
+                </Field>
+              )}
+              {projects.length === 1 && currentProject && (
+                <div className="project-name" title="Project">
+                  {currentProject}
+                </div>
+              )}
+            </div>
+
+            <nav className="nav" aria-label="Sections">
+              {visibleSections(modules).map((section) => (
+                <a
+                  key={section.id}
+                  href={linkTo(section.id)}
+                  className={`nav-link${route.section === section.id ? " active" : ""}`}
+                  aria-current={route.section === section.id ? "page" : undefined}
+                  onClick={() => setNavOpen(false)}
+                >
+                  <span>{section.label}</span>
+                  {section.id === "decisions" && <DecisionsBadge refreshKey={refreshKey} />}
+                </a>
               ))}
-            </select>
-          )}
-          <span className="last-refresh" title={lastRefresh.toLocaleString()}>
-            Updated {lastRefresh.toLocaleTimeString()}
-          </span>
-        </div>
-      </header>
+            </nav>
 
-      {currentProject && (
-        <CommandBar
-          project={currentProject}
-          mode={commandMode}
-          onModeChange={setCommandMode}
-          readOnly={controlsStatus.readOnly}
-          onAskSupervisor={askGoesToSupervisor(chatStatus.data) ? (question) => chatControl.open({ question }) : undefined}
-        />
-      )}
+            <footer className="footer sidebar-footer">
+              <ul className="status-lines" aria-label="Lair status">
+                <li>
+                  <Icon name={readOnly ? "lock" : "unlock"} />
+                  {readOnly ? "Read-only" : "Control"}
+                </li>
+                {controlsStatus.orchestratorPaused && (
+                  <li>
+                    <Icon name="pause" />
+                    Paused
+                  </li>
+                )}
+                {signedIn !== null && (
+                  <li data-owner-state={signedIn ? "signed-in" : "signed-out"}>
+                    <Icon name="user" />
+                    {signedIn ? (
+                      "Signed in as the owner"
+                    ) : (
+                      <span>
+                        Not signed in as the owner · <a href={linkTo("decisions")}>Sign in</a>
+                      </span>
+                    )}
+                  </li>
+                )}
+              </ul>
+              <ServerControls refreshKey={refreshKey} />
+              <div className="preferences">
+                <Field label="Theme" className="preference-field">
+                  <Select
+                    compact
+                    value={prefs.theme}
+                    onChange={(e) => setPrefs({ theme: e.target.value as ThemeChoice })}
+                    options={THEME_OPTIONS}
+                  />
+                </Field>
+                <Switch
+                  label="Compact"
+                  description="Denser rows, for big fleets"
+                  checked={prefs.density === "compact"}
+                  onChange={(on) => setPrefs({ density: on ? "compact" : "comfortable" })}
+                />
+              </div>
+              <div className="footer-meta">
+                <span>Lair v{LAIR_VERSION}</span>
+                <span className="last-refresh" title={lastRefresh.toLocaleString()}>
+                  Updated {lastRefresh.toLocaleTimeString()}
+                </span>
+              </div>
+            </footer>
+          </aside>
+          {navOpen && <div className="nav-scrim" onClick={() => setNavOpen(false)} />}
 
-      {currentProject && chatRequest && (
-        <SupervisorChatPanel
-          project={currentProject}
-          request={chatRequest}
-          onClose={() => setChatRequest(null)}
-          problem={chatStatus.data?.enabled ? chatStatus.data.problem : null}
-        />
-      )}
+          <div className="app-body">
+            <header className="topbar">
+              <Button
+                variant="ghost"
+                className="menu-button icon-button"
+                aria-label="Menu"
+                aria-expanded={navOpen}
+                aria-controls="lair-sidebar"
+                onClick={() => setNavOpen(!navOpen)}
+                ref={menuRef}
+              >
+                <Icon name="menu" size={20} />
+              </Button>
+              {currentProject && (
+                <CommandBar
+                  project={currentProject}
+                  mode={commandMode}
+                  onModeChange={setCommandMode}
+                  readOnly={controlsStatus.readOnly}
+                  onAskSupervisor={askGoesToSupervisor(chatStatus.data) ? (question) => chatControl.open({ question }) : undefined}
+                />
+              )}
+            </header>
 
-      <nav className="nav" aria-label="Sections">
-        {visibleSections(modules).map((section) => (
-          <a
-            key={section.id}
-            href={linkTo(section.id)}
-            className={`nav-button ${route.section === section.id ? "active" : ""}`}
-            aria-current={route.section === section.id ? "page" : undefined}
-          >
-            {section.label}
-            {section.id === "decisions" && <DecisionsBadge refreshKey={refreshKey} />}
-          </a>
-        ))}
-      </nav>
+            <ConfigBanner refreshKey={refreshKey} />
 
-      <ConfigBanner refreshKey={refreshKey} />
-
-      <main className="main">
-        {modulesApi.error && !modulesApi.data && (
-          <div className="error" role="alert">
-            Could not read which modules {currentProject} turns on ({modulesApi.error}): only the sections every project
-            has are shown.
+            <main className="main" id="main" tabIndex={-1} ref={mainRef}>
+              {modulesApi.error && !modulesApi.data && (
+                <Callout tone="danger" alert className="error">
+                  Could not read which modules {currentProject} turns on ({modulesApi.error}): only the sections every
+                  project has are shown.
+                </Callout>
+              )}
+              {renderSection()}
+            </main>
           </div>
-        )}
-        {renderSection()}
-      </main>
 
-      <footer className="footer">
-        <span>Lair v{LAIR_VERSION}</span>
-        <span>•</span>
-        <span>{readOnly ? "🔒 Read-only" : "🔓 Control"}</span>
-        {controlsStatus.orchestratorPaused && (
-          <>
-            <span>•</span>
-            <span>⏸ Paused</span>
-          </>
-        )}
-        <ServerControls refreshKey={refreshKey} />
-      </footer>
-    </div>
+          {currentProject && chatRequest && (
+            <SupervisorChatPanel
+              project={currentProject}
+              request={chatRequest}
+              onClose={() => setChatRequest(null)}
+              problem={chatStatus.data?.enabled ? chatStatus.data.problem : null}
+            />
+          )}
+        </div>
+      </ToastProvider>
     </ChatContext.Provider>
   );
 }

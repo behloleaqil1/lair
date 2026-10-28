@@ -6,6 +6,7 @@
 import { useEffect, useState } from "react";
 import type { ConfigProblem } from "../../shared/lifecycle-types";
 import { configStatus, problemText } from "../server-controls";
+import { Callout } from "../ui/Card";
 
 export function ConfigBanner({ refreshKey }: { refreshKey?: number }) {
   const [problems, setProblems] = useState<ConfigProblem[]>([]);
@@ -26,17 +27,11 @@ export function ConfigBanner({ refreshKey }: { refreshKey?: number }) {
 
   if (problems.length === 0) return null;
   return (
-    <div style={{ padding: "0 2rem", maxWidth: "1400px", width: "100%", margin: "1rem auto 0" }}>
+    <div className="config-banner">
       {problems.map((p) => (
-        <div
-          key={p.project}
-          className="card"
-          role="alert"
-          data-config-problem={p.project}
-          style={{ border: "1px solid var(--error)", marginBottom: "0.5rem", padding: "0.75rem 1rem", whiteSpace: "pre-wrap" }}
-        >
+        <Callout key={p.project} tone="danger" alert data-config-problem={p.project}>
           {problemText(p)}
-        </div>
+        </Callout>
       ))}
     </div>
   );

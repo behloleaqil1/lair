@@ -1,0 +1,215 @@
+/*
+ * Lair's design tokens: the one place for colour, spacing, type, radius,
+ * elevation, motion and layers (docs/design/settings-v2.md, "Look and feel").
+ * The kit (src/client/ui/) and the views use these custom properties instead
+ * of raw values; tokens.ts names them for TypeScript.
+ *
+ * Themes: light is the default. Dark applies under <html data-theme="dark">,
+ * or when the reader chose "system" (no data-theme) and the system prefers
+ * dark. Densities: comfortable is the default, compact applies under
+ * <html data-density="compact">. preferences.ts sets both attributes.
+ *
+ * tokens.test.ts reads this file and checks the contrast of each theme's text,
+ * status and border pairs (WCAG AA), and that the two dark blocks are equal.
+ * Colours are solid hex so that the test computes them exactly.
+ */
+
+:root {
+  /* Spacing: a 4 px scale */
+  --space-0: 0;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  /* Type: the system's own faces, no font is downloaded (Lair is local-first) */
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", "Liberation Sans", Arial,
+    sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
+    monospace;
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-md: 0.875rem;
+  --text-lg: 1rem;
+  --text-xl: 1.25rem;
+  --text-2xl: 1.5rem;
+  --text-3xl: 2rem;
+  --leading-tight: 1.25;
+  --leading-normal: 1.5;
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  /* Radius */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --radius-full: 999px;
+
+  /* Motion (all 0 ms when the reader prefers reduced motion) */
+  --duration-fast: 120ms;
+  --duration-base: 200ms;
+  --duration-slow: 320ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+
+  /* Layers, lowest first */
+  --z-base: 0;
+  --z-sticky: 10;
+  --z-nav: 20;
+  --z-popover: 40;
+  --z-chat: 50;
+  --z-overlay: 90;
+  --z-drawer: 100;
+  --z-dialog: 110;
+  --z-toast: 120;
+  --z-tooltip: 130;
+
+  /* Layout */
+  --nav-width: 232px;
+  --content-max: 1400px;
+  --focus-ring-width: 2px;
+
+  /* Density: comfortable */
+  --control-height: 36px;
+  --control-height-sm: 28px;
+  --control-pad-x: var(--space-3);
+  --cell-pad-y: var(--space-3);
+  --cell-pad-x: var(--space-3);
+  --card-pad: var(--space-5);
+  --stack-gap: var(--space-5);
+}
+
+:root[data-density="compact"] {
+  --control-height: 30px;
+  --control-height-sm: 24px;
+  --control-pad-x: var(--space-2);
+  --cell-pad-y: var(--space-1);
+  --cell-pad-x: var(--space-2);
+  --card-pad: var(--space-3);
+  --stack-gap: var(--space-3);
+}
+
+/* Light: a calm neutral base, one accent (indigo), and the four semantic colours */
+:root {
+  color-scheme: light;
+  --color-bg: #f6f7f9;
+  --color-surface: #ffffff;
+  --color-surface-sunken: #eef0f3;
+  --color-surface-hover: #f0f1f4;
+  --color-selected: #eceefd;
+  --color-text: #1f2328;
+  --color-text-muted: #59636e;
+  --color-border: #d8dce1;
+  --color-border-strong: #757d88;
+  --color-accent: #4c4fd8;
+  --color-accent-hover: #3d3fc0;
+  --color-text-on-accent: #ffffff;
+  --color-focus: #4c4fd8;
+  --color-success: #1a7431;
+  --color-success-subtle: #e8f5ec;
+  --color-warning: #875700;
+  --color-warning-subtle: #fcf3dc;
+  --color-danger: #b42323;
+  --color-danger-subtle: #fdecec;
+  --color-text-on-danger: #ffffff;
+  --color-info: #0b62a8;
+  --color-info-subtle: #e8f1fb;
+  --color-neutral: #59636e;
+  --color-neutral-subtle: #eef0f3;
+  --color-scrim: rgba(15, 17, 21, 0.45);
+  --shadow-1: 0 1px 2px rgba(16, 24, 40, 0.06), 0 1px 3px rgba(16, 24, 40, 0.08);
+  --shadow-2: 0 4px 12px rgba(16, 24, 40, 0.12);
+  --shadow-3: 0 16px 40px rgba(16, 24, 40, 0.2);
+}
+
+/* Dark, when the system asks for it and the reader chose "system" */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --color-bg: #0f1115;
+    --color-surface: #16191e;
+    --color-surface-sunken: #0b0d10;
+    --color-surface-hover: #1d2127;
+    --color-selected: #262b33;
+    --color-text: #e6e8eb;
+    --color-text-muted: #9da5b0;
+    --color-border: #2b3038;
+    --color-border-strong: #6e7781;
+    --color-accent: #9ea1fb;
+    --color-accent-hover: #b6b8fc;
+    --color-text-on-accent: #0f1115;
+    --color-focus: #9ea1fb;
+    --color-success: #57c278;
+    --color-success-subtle: #11261a;
+    --color-warning: #d9aa3a;
+    --color-warning-subtle: #2a2112;
+    --color-danger: #f47a70;
+    --color-danger-subtle: #2e1618;
+    --color-text-on-danger: #0f1115;
+    --color-info: #6cb0ff;
+    --color-info-subtle: #0e2238;
+    --color-neutral: #9da5b0;
+    --color-neutral-subtle: #1d2127;
+    --color-scrim: rgba(0, 0, 0, 0.6);
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-2: 0 4px 12px rgba(0, 0, 0, 0.45);
+    --shadow-3: 0 16px 40px rgba(0, 0, 0, 0.55);
+  }
+}
+
+/* Dark, chosen by the reader (the same values as above) */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --color-bg: #0f1115;
+  --color-surface: #16191e;
+  --color-surface-sunken: #0b0d10;
+  --color-surface-hover: #1d2127;
+  --color-selected: #262b33;
+  --color-text: #e6e8eb;
+  --color-text-muted: #9da5b0;
+  --color-border: #2b3038;
+  --color-border-strong: #6e7781;
+  --color-accent: #9ea1fb;
+  --color-accent-hover: #b6b8fc;
+  --color-text-on-accent: #0f1115;
+  --color-focus: #9ea1fb;
+  --color-success: #57c278;
+  --color-success-subtle: #11261a;
+  --color-warning: #d9aa3a;
+  --color-warning-subtle: #2a2112;
+  --color-danger: #f47a70;
+  --color-danger-subtle: #2e1618;
+  --color-text-on-danger: #0f1115;
+  --color-info: #6cb0ff;
+  --color-info-subtle: #0e2238;
+  --color-neutral: #9da5b0;
+  --color-neutral-subtle: #1d2127;
+  --color-scrim: rgba(0, 0, 0, 0.6);
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-2: 0 4px 12px rgba(0, 0, 0, 0.45);
+  --shadow-3: 0 16px 40px rgba(0, 0, 0, 0.55);
+}
+
+/* Reduced motion: no transitions or animations anywhere */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-fast: 0ms;
+    --duration-base: 0ms;
+    --duration-slow: 0ms;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

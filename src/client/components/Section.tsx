@@ -1,12 +1,13 @@
 /**
- * What every section gets from App.tsx, and its header: the title, its tabs
- * (links, so each has a URL) and its actions.
+ * What every section gets from App.tsx, and its header (the kit's PageHeader):
+ * the title, its actions, and its tabs (links, so each has a URL).
  */
 import type { ReactNode } from "react";
 import type { ModuleFlags } from "../../shared/dashboard-types";
 import { routeHash, type Route, type SectionId } from "../router";
 import { visibleTabs } from "../nav";
 import { Tabs } from "./ui";
+import { PageHeader } from "../ui/PageHeader";
 
 export interface SectionProps {
   project: string;
@@ -41,12 +42,8 @@ export function SectionHeader({
 }) {
   const tabs = visibleTabs(section, modules).map((t) => ({ id: t.id, label: t.label, href: tabHref(route, t.id) }));
   return (
-    <div className="section-header">
-      <div className="section-title">
-        <h2>{title}</h2>
-        {children}
-      </div>
+    <PageHeader title={title} actions={children}>
       <Tabs tabs={tabs} active={route.tab} label={`${typeof title === "string" ? title : "Section"} tabs`} />
-    </div>
+    </PageHeader>
   );
 }

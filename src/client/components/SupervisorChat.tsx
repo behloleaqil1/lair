@@ -265,6 +265,7 @@ export function AskLairCardView({
           <input
             type="text"
             className="chat-input"
+            aria-label="A question for Lair"
             maxLength={2000}
             placeholder="Why is an agent held? Why is nothing merging?"
             value={text}

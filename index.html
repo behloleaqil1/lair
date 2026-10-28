@@ -4,7 +4,18 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/dragon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
     <title>Lair</title>
+    <script>
+      // The reader's theme and density before the first paint, so a chosen dark theme doesn't flash light
+      // (src/client/ui/preferences.ts keeps them; storage may be unavailable)
+      try {
+        var theme = localStorage.getItem("lair.theme");
+        var density = localStorage.getItem("lair.density");
+        if (theme === "light" || theme === "dark") document.documentElement.setAttribute("data-theme", theme);
+        if (density === "compact") document.documentElement.setAttribute("data-density", "compact");
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="root"></div>

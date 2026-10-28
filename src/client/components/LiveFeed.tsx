@@ -13,6 +13,8 @@ import { EventStream } from "../hooks/event-stream";
 import { connectionLabel, type ConnectionStatus } from "../hooks/reconnect";
 import { linkTo } from "../router";
 import { Time } from "./ui";
+import { Badge } from "../ui/Badge";
+import type { Tone } from "../ui/tokens";
 
 interface LiveFeedProps {
   project: string;
@@ -33,20 +35,13 @@ interface FeedEvent {
   sha?: string;
 }
 
-const KIND_COLORS: Record<ReportKind, string> = {
-  DONE: "#4caf50",
-  WAITING: "#ff9800",
-  BLOCKED: "#f44336",
-  PROGRESS: "#2196f3",
-  TICK: "#9e9e9e",
-};
-
-const KIND_ICONS: Record<ReportKind, string> = {
-  DONE: "✅",
-  WAITING: "⏳",
-  BLOCKED: "🚫",
-  PROGRESS: "🔄",
-  TICK: "⏱️",
+/** Each report kind's tone: its colour and icon beside the word */
+const KIND_TONE: Record<ReportKind, Tone> = {
+  DONE: "success",
+  WAITING: "warning",
+  BLOCKED: "danger",
+  PROGRESS: "info",
+  TICK: "neutral",
 };
 
 export function LiveFeed({ project, limit = 20 }: LiveFeedProps) {
@@ -178,24 +173,27 @@ export function LiveFeed({ project, limit = 20 }: LiveFeedProps) {
   }
 
   return (
-    <div className="live-feed">
-      <div className="live-feed-header">
-        <h3>
-          Recent activity
-          <span
-            className={`connection-status ${status === "connected" ? "connected" : status === "closed" ? "disconnected" : "reconnecting"}`}
-            title={retryInMs !== null ? `Next try in ${Math.ceil(retryInMs / 1000)} s` : undefined}
-          >
-            {connectionLabel(status)}
-          </span>
-        </h3>
+    <div className="card live-feed">
+      <div className="feed-header">
+        <h3>Recent activity</h3>
+        <Badge
+          tone={status === "connected" ? "success" : status === "closed" ? "danger" : "warning"}
+          title={retryInMs !== null ? `Next try in ${Math.ceil(retryInMs / 1000)} s` : undefined}
+          className={`connection-status ${status === "connected" ? "connected" : status === "closed" ? "disconnected" : "reconnecting"}`}
+        >
+          {connectionLabel(status)}
+        </Badge>
       </div>
 
-      {error && <div className="live-feed-error">{error}</div>}
+      {error && (
+        <div className="error live-feed-error" role="alert">
+          {error}
+        </div>
+      )}
 
       <div className="live-feed-events">
         {events.length === 0 ? (
-          <div className="live-feed-empty">
+          <div className="live-feed-empty muted">
             No recent activity: agents&apos; reports (WAITING, DONE, BLOCKED) show here as they write them.
           </div>
         ) : (
@@ -206,16 +204,15 @@ export function LiveFeed({ project, limit = 20 }: LiveFeedProps) {
               </span>
 
               {event.type === "report" && event.kind && (
-                <span
-                  className="feed-kind"
-                  style={{ backgroundColor: KIND_COLORS[event.kind] }}
-                >
-                  {KIND_ICONS[event.kind]} {event.kind}
-                </span>
+                <Badge tone={KIND_TONE[event.kind]} className="feed-kind">
+                  {event.kind}
+                </Badge>
               )}
 
               {event.type === "claim" && (
-                <span className="feed-kind feed-claim">🎯 CLAIM</span>
+                <Badge tone="info" className="feed-kind feed-claim">
+                  CLAIM
+                </Badge>
               )}
 
               <span className="feed-task">{event.task}</span>
@@ -232,7 +229,7 @@ export function LiveFeed({ project, limit = 20 }: LiveFeedProps) {
 
               {event.gate_id && (
                 <a className="feed-gate" href={linkTo("gates", event.gate_id)} title={event.gate_id}>
-                  🚦 Gate
+                  Gate
                 </a>
               )}
 
@@ -252,136 +249,6 @@ export function LiveFeed({ project, limit = 20 }: LiveFeedProps) {
         )}
       </div>
 
-      <style>{`
-        .live-feed {
-          background: var(--bg-secondary, #1e1e1e);
-          border-radius: 8px;
-          padding: 16px;
-          margin-bottom: 16px;
-        }
-
-        .live-feed-header {
-          display: flex;
-          align-items: center;
-          margin-bottom: 12px;
-        }
-
-        .live-feed-header h3 {
-          margin: 0;
-          display: flex;
-          align-items: center;
-          gap: 8px;
-        }
-
-        .connection-status {
-          font-size: 12px;
-          padding: 2px 8px;
-          border-radius: 12px;
-          font-weight: normal;
-        }
-
-        .connection-status.connected {
-          background: #4caf50;
-          color: white;
-        }
-
-        .connection-status.disconnected {
-          background: #f44336;
-          color: white;
-        }
-
-        .connection-status.reconnecting {
-          background: #ff9800;
-          color: white;
-        }
-
-        .live-feed-error {
-          background: #f44336;
-          color: white;
-          padding: 8px;
-          border-radius: 4px;
-          margin-bottom: 12px;
-        }
-
-        .live-feed-summary {
-          display: flex;
-          gap: 16px;
-          margin-bottom: 12px;
-          font-size: 14px;
-          color: var(--text-secondary, #888);
-        }
-
-        .live-feed-events {
-          max-height: 400px;
-          overflow-y: auto;
-        }
-
-        .live-feed-empty {
-          text-align: center;
-          color: var(--text-secondary, #888);
-          padding: 20px;
-        }
-
-        .feed-event {
-          display: flex;
-          flex-wrap: wrap;
-          align-items: center;
-          gap: 8px;
-          padding: 8px;
-          border-bottom: 1px solid var(--border-color, #333);
-          font-size: 14px;
-        }
-
-        .feed-event:last-child {
-          border-bottom: none;
-        }
-
-        .feed-time {
-          color: var(--text-secondary, #888);
-          font-family: monospace;
-          min-width: 70px;
-        }
-
-        .feed-kind {
-          padding: 2px 8px;
-          border-radius: 4px;
-          color: white;
-          font-size: 12px;
-          font-weight: bold;
-        }
-
-        .feed-claim {
-          background: #9c27b0;
-        }
-
-        .feed-task {
-          font-weight: bold;
-          color: var(--text-primary, #fff);
-        }
-
-        .feed-agent {
-          color: var(--text-secondary, #888);
-        }
-
-        .feed-summary {
-          color: var(--text-secondary, #aaa);
-          flex: 1;
-          min-width: 200px;
-        }
-
-        .feed-gate,
-        .feed-pr,
-        .feed-sha {
-          font-size: 12px;
-          padding: 2px 6px;
-          border-radius: 4px;
-          background: var(--bg-tertiary, #2d2d2d);
-        }
-
-        .feed-sha {
-          font-family: monospace;
-        }
-      `}</style>
     </div>
   );
 }

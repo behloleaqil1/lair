@@ -13,6 +13,8 @@ import type { CommandMode, CommandResult } from "../../shared/types";
 import type { MessageDeliveryState } from "../../shared/bus-types";
 import { runCommand, sendBusMessage } from "../owner-actions";
 import { SignInHint } from "./SignInHint";
+import { Button } from "../ui/Button";
+import { Icon, type IconName } from "../ui/Icon";
 
 interface Props {
   project: string;
@@ -187,33 +189,36 @@ export function CommandBar({
   return (
     <div className="command-bar">
       <form onSubmit={handleSubmit} className="command-form">
-        <div className="command-mode-selector">
+        <div className="command-mode-selector" role="group" aria-label="Command type">
           {(["ask", "instruct", "task"] as CommandMode[]).map((m) => (
             <button
               key={m}
               type="button"
-              className={`mode-button ${mode === m ? "active" : ""} ${m !== "ask" && readOnly ? "disabled" : ""}`}
+              className="mode-button"
+              aria-pressed={mode === m}
               onClick={() => onModeChange(m)}
               disabled={m !== "ask" && readOnly}
+              title={m !== "ask" && readOnly ? "The project is read-only" : undefined}
             >
               {modeLabels[m]}
-              {m !== "ask" && readOnly && " 🔒"}
+              {m !== "ask" && readOnly && <Icon name="lock" size={12} label="read-only" />}
             </button>
           ))}
         </div>
 
         <input
           type="text"
-          className="command-input"
+          className="input command-input"
+          aria-label={`Command (${modeLabels[mode]})`}
           placeholder={placeholders[mode]}
           value={text}
           onChange={(e) => setText(e.target.value)}
           disabled={loading || (mode !== "ask" && readOnly)}
         />
 
-        <button type="submit" className="command-submit" disabled={isDisabled}>
+        <Button type="submit" variant="primary" disabled={isDisabled}>
           {loading ? "..." : "Send"}
-        </button>
+        </Button>
       </form>
 
       {/* Questions, instructions, messages and tasks all go out as the owner's */}
@@ -228,12 +233,9 @@ export function CommandBar({
             ) : (
               <CommandResultHeader data={result.data} mode={mode} />
             )}
-            <button
-              className="result-close"
-              onClick={() => setShowResult(false)}
-            >
-              ×
-            </button>
+            <Button variant="ghost" size="sm" className="icon-button" aria-label="Close the result" onClick={() => setShowResult(false)}>
+              <Icon name="close" size={14} />
+            </Button>
           </div>
           <div className="result-content">
             {result.type === "bus" ? (
@@ -253,14 +255,20 @@ export function CommandBar({
  */
 function BusResultHeader({ data }: { data: BusMessageResult }) {
   if (!data.success) {
-    return <span className="error">✗ Failed</span>;
+    return (
+      <span className="result-status failed">
+        <Icon name="x-circle" />
+        Failed
+      </span>
+    );
   }
 
   const stateDisplay = getDeliveryStateDisplay(data.state || "sent");
 
   return (
-    <span className={`success ${stateDisplay.className}`}>
-      {stateDisplay.icon} Message {stateDisplay.label}
+    <span className={`result-status success ${stateDisplay.className}`}>
+      <Icon name={stateDisplay.icon} />
+      Message {stateDisplay.label}
     </span>
   );
 }
@@ -302,8 +310,9 @@ function CommandResultHeader({
   mode: CommandMode;
 }) {
   return (
-    <span className={data.success ? "success" : "error"}>
-      {data.success ? "✓" : "✗"} {mode === "ask" ? "Answer" : "Result"}
+    <span className={`result-status ${data.success ? "success" : "failed"}`}>
+      <Icon name={data.success ? "check-circle" : "x-circle"} />
+      {mode === "ask" ? "Answer" : "Result"}
     </span>
   );
 }
@@ -328,7 +337,7 @@ function DeliveryStateIndicator({ state }: { state: MessageDeliveryState }) {
 
   return (
     <span className={`delivery-state ${display.className}`}>
-      <span className="state-icon">{display.icon}</span>
+      <Icon name={display.icon} className="state-icon" />
       <span className="state-label">{display.label}</span>
       {state === "sent" && (
         <span className="state-progress">Waiting for read...</span>
@@ -344,16 +353,16 @@ function DeliveryStateIndicator({ state }: { state: MessageDeliveryState }) {
  * Get delivery state display info
  */
 function getDeliveryStateDisplay(state: MessageDeliveryState): {
-  icon: string;
+  icon: IconName;
   label: string;
   className: string;
 } {
   switch (state) {
     case "sent":
-      return { icon: "📤", label: "Sent", className: "state-sent" };
+      return { icon: "arrow-up", label: "Sent", className: "state-sent" };
     case "read":
-      return { icon: "👁", label: "Read", className: "state-read" };
+      return { icon: "eye", label: "Read", className: "state-read" };
     case "ack":
-      return { icon: "✓", label: "Acknowledged", className: "state-ack" };
+      return { icon: "check-circle", label: "Acknowledged", className: "state-ack" };
   }
 }

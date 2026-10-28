@@ -1,6 +1,6 @@
 /**
  * The owner's "Restart" and "Update and restart" (src/server/restart/), in
- * the footer. Shown only to a browser signed in as the owner. Each asks for
+ * the footer at the bottom of the nav. Shown only to a browser signed in as the owner. Each asks for
  * confirmation; while the update runs its output is shown, a failed update
  * shows its error (nothing restarted), and after the restart the dashboard
  * waits for the new server to answer.
@@ -9,32 +9,12 @@ import { useEffect, useRef, useState } from "react";
 import type { RestartStatusView } from "../../shared/lifecycle-types";
 import { ownerStatus } from "../owner-session";
 import { managerWarning, requestRestart, restartQuestion, restartStatus } from "../server-controls";
+import { Button } from "../ui/Button";
+import { CodeBlock } from "../ui/CodeBlock";
 
 const POLL_MS = 1000;
 /** How long to wait for the new server before saying it has not come back */
 const COMEBACK_MS = 120_000;
-
-const button = {
-  padding: "0.1rem 0.5rem",
-  borderRadius: "4px",
-  border: "1px solid var(--border)",
-  background: "transparent",
-  color: "var(--text-primary)",
-  cursor: "pointer",
-  fontSize: "0.8rem",
-};
-
-const panel = {
-  position: "fixed" as const,
-  right: "1rem",
-  bottom: "3.5rem",
-  width: "min(40rem, calc(100vw - 2rem))",
-  maxHeight: "50vh",
-  overflow: "auto",
-  textAlign: "left" as const,
-  zIndex: 10,
-  border: "1px solid var(--border)",
-};
 
 export function ServerControls({ refreshKey }: { refreshKey?: number }) {
   const [status, setStatus] = useState<RestartStatusView | null>(null);
@@ -119,37 +99,36 @@ export function ServerControls({ refreshKey }: { refreshKey?: number }) {
   const log = status.output.length > 0 || status.error;
   return (
     <>
-      <span>•</span>
-      <span data-server-controls="owner">
-        <button type="button" style={button} disabled={busy} onClick={() => void ask(false)}>
+      <span className="server-controls" data-server-controls="owner">
+        <Button size="sm" disabled={busy} onClick={() => void ask(false)}>
           Restart
-        </button>{" "}
+        </Button>
         {status.update.configured && (
-          <button type="button" style={button} disabled={busy} onClick={() => void ask(true)}>
+          <Button size="sm" disabled={busy} onClick={() => void ask(true)}>
             Update and restart
-          </button>
-        )}{" "}
+          </Button>
+        )}
         {log && (
-          <button type="button" style={button} onClick={() => setShowLog(!showLog)}>
+          <Button size="sm" variant="ghost" aria-expanded={showLog} onClick={() => setShowLog(!showLog)}>
             {showLog ? "Hide update log" : "Update log"}
-          </button>
+          </Button>
         )}
       </span>
       {status.state === "failed" && status.error && (
-        <span style={{ color: "var(--error)" }} data-server-update="failed">
+        <span className="server-note text-danger" data-server-update="failed">
           {status.error}
         </span>
       )}
-      {notice && <span>{notice}</span>}
+      {notice && <span className="server-note" role="status">{notice}</span>}
       {warning && !busy && (
-        <span title={warning} style={{ color: "var(--warning)" }}>
+        <span className="server-note waiting" title={warning}>
           (no service manager seen: Restart may only stop Lair)
         </span>
       )}
       {showLog && log && (
-        <div className="card" style={panel} data-server-update="log">
-          {status.error && <div style={{ color: "var(--error)", marginBottom: "0.5rem" }}>{status.error}</div>}
-          <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: "0.8rem" }}>{status.output.join("\n")}</pre>
+        <div className="card server-log" data-server-update="log">
+          {status.error && <p className="text-danger">{status.error}</p>}
+          <CodeBlock label="Update log">{status.output.join("\n")}</CodeBlock>
         </div>
       )}
     </>

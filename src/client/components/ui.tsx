@@ -1,14 +1,19 @@
 /**
- * Small pieces every section uses: times, the loading, error and empty
- * states (each says what to do), key-value lists, the tab bar and the
- * owner-only notice.
+ * Small pieces every section uses, on the component kit (src/client/ui/):
+ * times, the loading, error and empty states (each says what to do),
+ * key-value lists, the tab bar and the owner-only notice.
  */
 import { useEffect, useState, type ReactNode } from "react";
 import { absoluteTime, relativeTime } from "../time";
 import { ownerStatus } from "../owner-session";
 import { linkTo } from "../router";
+import { Badge as KitBadge } from "../ui/Badge";
+import { Callout } from "../ui/Card";
+import { EmptyState as KitEmptyState } from "../ui/EmptyState";
+import { TabLinks, type TabLink } from "../ui/Tabs";
 
-export const muted = { color: "var(--text-secondary)", fontSize: "0.85rem" } as const;
+/** Secondary text: the muted colour, the small size */
+export const muted = { color: "var(--color-text-muted)", fontSize: "var(--text-sm)" } as const;
 
 /** "5 min ago", with the absolute time on hover. */
 export function Time({ iso, now }: { iso: string | null | undefined; now?: number }) {
@@ -23,6 +28,7 @@ export function Time({ iso, now }: { iso: string | null | undefined; now?: numbe
 export function Loading({ what }: { what: string }) {
   return (
     <div className="loading" role="status" aria-live="polite">
+      <span className="spinner" aria-hidden="true" />
       Loading {what}…
     </div>
   );
@@ -34,20 +40,15 @@ export const RETRY_HINT =
 
 export function ErrorState({ what, error, hint = RETRY_HINT }: { what: string; error: string; hint?: string }) {
   return (
-    <div className="error" role="alert">
+    <Callout tone="danger" alert className="error-state">
       <strong>Could not load {what}:</strong> {error}
-      <div style={{ marginTop: "0.25rem", fontSize: "0.85rem" }}>{hint}</div>
-    </div>
+      <div className="callout-hint">{hint}</div>
+    </Callout>
   );
 }
 
 export function EmptyState({ title, children }: { title: string; children?: ReactNode }) {
-  return (
-    <div className="card empty-state">
-      <h3>{title}</h3>
-      {children && <p style={muted}>{children}</p>}
-    </div>
-  );
+  return <KitEmptyState title={title}>{children}</KitEmptyState>;
 }
 
 /** A section's module is off: what to set, and where. */
@@ -76,29 +77,11 @@ export function KeyValues({ rows }: { rows: [string, ReactNode | null | undefine
   );
 }
 
-export interface TabLink {
-  id: string | null;
-  label: string;
-  href: string;
-}
+export type { TabLink };
 
 /** The tab bar of a section: links, so each tab has a URL. */
 export function Tabs({ tabs, active, label }: { tabs: TabLink[]; active: string | null; label: string }) {
-  if (tabs.length === 0) return null;
-  return (
-    <nav className="tabs" aria-label={label}>
-      {tabs.map((tab) => (
-        <a
-          key={tab.id ?? "_"}
-          href={tab.href}
-          className={`tab ${tab.id === active ? "active" : ""}`}
-          aria-current={tab.id === active ? "page" : undefined}
-        >
-          {tab.label}
-        </a>
-      ))}
-    </nav>
-  );
+  return <TabLinks tabs={tabs} active={active} label={label} />;
 }
 
 /** Is this browser signed in as the owner? null until the server answers. Re-checked when `refreshKey` changes. */
@@ -133,11 +116,11 @@ export function OwnerOnlyNotice({ text }: { text: string }) {
   );
 }
 
-/** A badge with the house colours: success, warning, error, neutral. */
+/** A badge in a tone (success, warning, error, neutral, or a view model's badge-<tone> class), with the tone's icon. */
 export function Badge({ tone, children, title }: { tone: string; children: ReactNode; title?: string }) {
   return (
-    <span className={`badge ${tone.startsWith("badge-") ? tone : `badge-${tone}`}`} title={title}>
+    <KitBadge tone={tone} title={title}>
       {children}
-    </span>
+    </KitBadge>
   );
 }

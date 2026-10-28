@@ -1,4 +1,14 @@
-/**
+        <Button
+          key={option.id}
+          size="sm"
+          variant={recommended ? "primary" : "secondary"}
+          disabled={p.submitting || answer.disabledReason !== null}
+          title={answer.disabledReason ?? option.consequences}
+          onClick={() => p.onChoose(option, confirm)}
+        >
+          {option.label}
+          {recommended ? " (recommended)" : ""}
+        </Button>/**
  * Home: what needs the owner ("Needs you": the open action items of the
  * Decision Inbox, newest first, each a plain sentence with its answer
  * buttons inline and a link to its full context, and config errors; below
@@ -13,7 +23,7 @@
  * (its secret is typed in that view), and nothing is answered until this
  * browser is signed in as the owner.
  */
-import { useMemo, useState, type ReactNode } from "react";
+import { useId, useMemo, useState, type ReactNode } from "react";
 import { useApi } from "../hooks/useApi";
 import { gitDateToIso } from "../time";
 import { NOTHING_NEEDS_YOU, needsYou, type InlineAnswer, type NeedItem } from "../home-view";
@@ -34,7 +44,10 @@ import { SectionHeader, type SectionProps } from "./Section";
 import { LiveFeed } from "./LiveFeed";
 import { Activity } from "./Activity";
 import { Health } from "./Health";
-import { ErrorState, Loading, ModuleOff, Time, muted, useOwnerSignedIn } from "./ui";
+import { ErrorState, Loading, ModuleOff, Time, useOwnerSignedIn } from "./ui";
+import { Button, ButtonLink } from "../ui/Button";
+import { Card } from "../ui/Card";
+import { Icon, type IconName } from "../ui/Icon";
 import { AskLairCard, DigestCard } from "./SupervisorChat";
 
 interface WatchdogSummary {
@@ -42,7 +55,7 @@ interface WatchdogSummary {
   slos: { state: string; openBreaches: number }[];
 }
 
-const TONE_ICON: Record<NeedItem["tone"], string> = { error: "🔴", warning: "🟡", neutral: "⚪" };
+const TONE_ICON: Record<NeedItem["tone"], IconName> = { error: "x-circle", warning: "alert", neutral: "dot" };
 
 export interface NeedAnswerViewProps {
   decision: Decision;
@@ -59,23 +72,24 @@ export interface NeedAnswerViewProps {
 /** A decision's answer buttons on Home. Stateless: NeedAnswer holds the state. */
 export function NeedAnswerView(p: NeedAnswerViewProps) {
   const { answer } = p;
+  const confirmId = useId();
   if (answer.mode === "link") {
     return (
-      <a href={linkTo("decisions", p.decision.id)} className="small-button" title={answer.reason} data-answer="link">
+      <ButtonLink size="sm" href={linkTo("decisions", p.decision.id)} title={answer.reason} data-answer="link">
         {answer.label}
-      </a>
+      </ButtonLink>
     );
   }
   if (p.pending) {
     return (
-      <span role="alertdialog" className="need-confirm" data-answer="confirm">
-        <span>{confirmationText(p.decision, p.pending)}</span>{" "}
-        <button type="button" className="small-button" onClick={p.onCancel} disabled={p.submitting}>
+      <span role="alertdialog" aria-labelledby={confirmId} className="need-confirm" data-answer="confirm">
+        <span id={confirmId}>{confirmationText(p.decision, p.pending)}</span>{" "}
+        <Button size="sm" onClick={p.onCancel} disabled={p.submitting}>
           Cancel
-        </button>{" "}
-        <button type="button" className="small-button primary" onClick={p.onConfirm} disabled={p.submitting}>
+        </Button>{" "}
+        <Button size="sm" variant="primary" onClick={p.onConfirm} disabled={p.submitting}>
           {p.submitting ? "Sending..." : `Confirm: ${p.pending.label}`}
-        </button>
+        </Button>
       </span>
     );
   }
@@ -95,12 +109,12 @@ export function NeedAnswerView(p: NeedAnswerViewProps) {
         </button>
       ))}
       {answer.disabledReason !== null && (
-        <span style={muted}>
+        <span className="muted small">
           {" "}
           <a href={linkTo("decisions")}>Sign in</a> to answer here.
         </span>
       )}
-      {p.error && <span className="error"> {p.error}</span>}
+      {p.error && <span className="error text-danger"> {p.error}</span>}
     </span>
   );
 }
@@ -147,14 +161,14 @@ function NeedAnswer({ decision, answer, onAnswered }: { decision: Decision; answ
 export function NeedRow({ item, onAnswered }: { item: NeedItem; onAnswered: () => void }) {
   return (
     <li className={`need need-${item.tone}`} data-need={item.kind}>
-      <span aria-hidden="true">{TONE_ICON[item.tone]}</span>
+      <Icon name={TONE_ICON[item.tone]} className="need-icon" />
       <span className="need-title">{item.title}</span>
       {item.decision && item.answer && (
         <NeedAnswer decision={item.decision} answer={item.answer} onAnswered={onAnswered} />
       )}
-      {item.detail && <span style={muted}>{item.detail}</span>}
+      {item.detail && <span className="muted small">{item.detail}</span>}
       {item.at && (
-        <span style={muted}>
+        <span className="muted small">
           <Time iso={item.at} />
         </span>
       )}
@@ -176,12 +190,12 @@ export function NeedsYouCard({
   onAnswered: () => void;
 }) {
   return (
-    <div className="card" data-card="needs-you">
-      <h3>Needs you</h3>
+    <Card title="Needs you" data-card="needs-you">
       {error}
       {items.length === 0 ? (
-        <p style={{ color: "var(--success)" }} data-empty="needs-you">
-          ✓ {NOTHING_NEEDS_YOU}
+        <p className="all-clear" data-empty="needs-you">
+          <Icon name="check-circle" />
+          {NOTHING_NEEDS_YOU}
         </p>
       ) : (
         <ul className="needs-list">
@@ -200,14 +214,17 @@ export function NeedsYouCard({
           </ul>
         </details>
       )}
-    </div>
+    </Card>
   );
 }
 
-function Tile({ href, value, label, detail, tone }: { href: string; value: string; label: string; detail?: string; tone?: string }) {
+const TILE_ICON: Record<string, IconName> = { error: "x-circle", warning: "alert" };
+
+function Tile({ href, value, label, detail, tone }: { href: string; value: string; label: string; detail?: string; tone?: "error" | "warning" }) {
   return (
     <a href={href} className="card stat tile">
-      <div className="stat-value" style={tone ? { color: `var(--${tone})` } : undefined}>
+      <div className={`stat-value tile-value${tone ? ` tile-${tone}` : ""}`}>
+        {tone && <Icon name={TILE_ICON[tone]} size={20} />}
         {value}
       </div>
       <div className="stat-label">{label}</div>
@@ -324,18 +341,20 @@ function HomeOverview({ project, refreshKey, modules }: SectionProps) {
       </div>
 
       <div className="grid grid-2">
-        <div className="card">
-          <h3>Problems</h3>
+        <Card title="Problems">
           {overview.loading && !overview.data ? (
             <Loading what="the overview" />
           ) : overview.error && !overview.data ? (
             <ErrorState what="the overview" error={overview.error} />
           ) : (overview.data?.problems ?? []).length === 0 ? (
-            <p style={{ color: "var(--success)" }}>✓ No problems detected</p>
+            <p className="all-clear">
+              <Icon name="check-circle" />
+              No problems detected
+            </p>
           ) : (
             (overview.data?.problems ?? []).map((problem, i) => (
               <div key={i} className={`problem problem-${problem.severity}`}>
-                <span className="problem-icon">{problem.severity === "error" ? "🔴" : "🟡"}</span>
+                <Icon name={problem.severity === "error" ? "x-circle" : "alert"} className="problem-icon" />
                 <div className="problem-content">
                   <div className="problem-message">{problem.message}</div>
                   {problem.details && <div className="problem-details">{problem.details}</div>}
@@ -344,7 +363,7 @@ function HomeOverview({ project, refreshKey, modules }: SectionProps) {
             ))
           )}
           {overview.data && (
-            <p style={{ ...muted, marginTop: "0.75rem" }}>
+            <p className="muted small home-heads">
               main at <code>{overview.data.mainHead}</code>
               {gitDateToIso(overview.data.mainDate) && (
                 <>
@@ -359,28 +378,27 @@ function HomeOverview({ project, refreshKey, modules }: SectionProps) {
               )}
             </p>
           )}
-        </div>
-        <div className="card">
-          <h3>Merged in the last 24 hours</h3>
+        </Card>
+        <Card title="Merged in the last 24 hours">
           {(overview.data?.recentMerges ?? []).length === 0 ? (
-            <p style={muted}>No merges in the last 24 hours.</p>
+            <p className="muted">No merges in the last 24 hours.</p>
           ) : (
             <ul className="plain-list">
               {(overview.data?.recentMerges ?? []).slice(0, 8).map((pr) => (
                 <li key={pr.number}>
-                  <span style={muted}>#{pr.number}</span> {pr.title}{" "}
-                  <span style={muted}>
+                  <span className="muted mono">#{pr.number}</span> {pr.title}{" "}
+                  <span className="muted small">
                     <Time iso={pr.mergedAt} />
                   </span>
                 </li>
               ))}
             </ul>
           )}
-        </div>
+        </Card>
       </div>
 
       <LiveFeed project={project} limit={10} />
-      <p style={muted}>
+      <p className="small">
         <a href={linkTo("home", null, "activity")}>All activity</a>
       </p>
     </>

@@ -7,6 +7,7 @@
  */
 import { useEffect, useRef, useState } from "react";
 import { ownerStatus } from "../owner-session";
+import { Callout } from "../ui/Card";
 
 interface Props {
   /** What needs the session, e.g. "Starting and stopping dragons" */
@@ -39,12 +40,8 @@ export function SignInHint({ what, refreshKey, onStatus }: Props) {
 
   if (signedIn !== false) return null;
   return (
-    <div
-      className="card"
-      data-owner-hint="signed-out"
-      style={{ borderColor: "var(--warning)", color: "var(--text-secondary)", marginBottom: "1rem" }}
-    >
+    <Callout tone="warning" className="sign-in-hint" data-owner-hint="signed-out">
       {what} needs this browser to be signed in as the owner: sign in from Decisions.
-    </div>
+    </Callout>
   );
 }
