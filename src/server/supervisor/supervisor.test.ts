@@ -9,18 +9,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, truncateSync, utimesSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
+import { basename, join } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { CheckResult } from "../../shared/supervisor-types.js";
 import type { AgentRun } from "../agents/types.js";
 import { AgentsStore } from "../agents/store.js";
-import { CommandTimeoutLog } from "../core/command-timeouts.js";
+import { SpawnToolRunner } from "../ai/runner.js";
+import { CommandTimeoutLog, commandTimeouts } from "../core/command-timeouts.js";
 import { DecisionInbox } from "../decisions/service.js";
 import { DecisionStore } from "../decisions/store.js";
 import { MemorySecretStore } from "../decisions/secrets.js";
 import { PlacementManager } from "../placement/service.js";
 import { NodeQueueFiles } from "../placement/probes.js";
-import type { CommandOutput, CommandRunner } from "../watchdog/probes.js";
+import { ExecFileRunner, type CommandOutput, type CommandRunner } from "../watchdog/probes.js";
 import { WatchdogManager } from "../watchdog/service.js";
 import { FileWatcherService } from "../services/file-watcher.js";
 import type { LairWebSocketServer } from "../websocket.js";
@@ -643,5 +644,26 @@ describe("the OS measures", () => {
     }
     expect(m.eventLoopDelay()).not.toBeNull();
     expect((await m.diskSpace(tmpdir()))?.totalBytes).toBeGreaterThan(0);
+  });
+});
+
+describe("commands that time out", () => {
+  it("are counted by the runners that time them out, and only those", async () => {
+    const before = Date.now();
+    const hang = [process.execPath, "-e", "setTimeout(() => {}, 5000)"];
+    const probe = await new ExecFileRunner(200).run(hang);
+    expect(probe.code).toBe(-1);
+    const tool = await new SpawnToolRunner().run(hang, { timeoutMs: 200, maxBytes: 4096, env: { PATH: process.env.PATH ?? "" } });
+    expect(tool.failure).toBe("timeout");
+    // A command that ends by itself, or that prints too much, is no timeout
+    await new ExecFileRunner(5000).run([process.execPath, "-e", "process.exit(3)"]);
+    await new ExecFileRunner(5000).run([process.execPath, "-e", "process.stdout.write('x'.repeat(4096))"], { maxBufferBytes: 16 });
+    const noted = commandTimeouts()
+      .since(before)
+      .map((e) => [e.kind, e.program]);
+    expect(noted).toEqual([
+      ["probe", basename(process.execPath)],
+      ["tool", basename(process.execPath)],
+    ]);
   });
 });

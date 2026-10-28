@@ -120,8 +120,11 @@ export class ExecFileRunner implements CommandRunner {
             typeof (error as { code?: unknown }).code === "number"
               ? ((error as { code: number }).code)
               : -1;
-          // Killed without an abort: its timeout ended it (the supervisor's command_timeouts check counts these)
-          if (error.killed && !options.signal?.aborted) noteCommandTimeout(kindOfProgram(file), file);
+          // Killed, neither by an abort nor for too much output: its timeout ended it (the supervisor's
+          // command_timeouts check counts these)
+          if (error.killed && !options.signal?.aborted && error.code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+            noteCommandTimeout(kindOfProgram(file), file);
+          }
           resolve({
             code: error.killed ? -1 : code,
             stdout: stdout ?? "",

@@ -1,6 +1,18 @@
 # Supervisor: Lair's operator
 
-> Status: design. Phases S1–S4 below; nothing is built yet. Roadmap: [ROADMAP.md](ROADMAP.md). The supervisor runs on whatever AI tool and model `ai.roles.supervise` names ([ai-roles.md](ai-roles.md)).
+> Status: part built (S1-1, below). Phases S1–S4 below. Roadmap: [ROADMAP.md](ROADMAP.md). The supervisor runs on whatever AI tool and model `ai.roles.supervise` names ([ai-roles.md](ai-roles.md)). Reference: [configuration.md](../configuration.md#supervisor-self-checks-and-the-ops-api).
+
+## What is built, and what remains
+
+| Part | What | State |
+|---|---|---|
+| **S1-1** | The self-checks below, deterministic and in code, on a schedule off the request path, each with its own timeout (`supervisor.checks`, thresholds per check); `GET /api/health/diagnostics` (owner only) and Home → Health; a check failing for `notice_minutes` raises one notice, withdrawn when it recovers; the ops API's read tools over `POST /api/ops/call`, served to MCP tools by `lair ops-mcp` (stdio), on scoped tokens kept in memory (a run's, bound to its project and ended with the run; or the owner's, for an hour), every call audited in `data/supervisor.db`, answers redacted and bounded | built (`src/server/supervisor/`, `src/cli/ops-mcp.ts`) |
+| **S1-2** | Supervisor runs through `ai.roles.supervise` (a run token in the run's environment): the Ask box and Owner messages answered with cited evidence, the hourly review and the daily digest, diagnoses of failing checks | next |
+| **S2** | `proposals.submit` and proposals as decisions | to do |
+| **S3** | `supervisor.act`: the allowlist of acting fixes | to do |
+| **S4** | Repair of Lair's own defects | to do |
+
+Not in S1-1: the ops API is served over stdio only (`lair ops-mcp` talks to Lair's HTTP route; an MCP endpoint that Lair serves itself over local HTTP can come when a tool needs it), and the retention check measures each watched folder's entries against the check's own limit, since retention itself (roadmap A2) isn't built yet.
 
 A developer running Lair should not need someone at a terminal to answer "why is this agent paused?", to notice that
 the server is slow or leaking file handles, or to work around an outage at night. Today the owner, or a coding

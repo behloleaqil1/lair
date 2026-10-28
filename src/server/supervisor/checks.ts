@@ -497,15 +497,10 @@ const gateQueueAge: CheckDefinition = {
     const config = sources.config(project);
     if (!config.gates_dir) return null;
     const dir = join(config.gates_dir, "queue");
-    let names: string[];
-    try {
-      names = await readdir(dir);
-    } catch {
-      return null;
-    }
+    const queued = await namesIn(dir, (n) => n.endsWith(".req"), MAX_QUEUE_FILES);
+    if (queued === null) return null;
     const t = settings.gate_queue_age;
     const thresholds = { warning_minutes: t.warning_minutes, failing_minutes: t.failing_minutes };
-    const queued = names.filter((n) => n.endsWith(".req")).slice(0, MAX_QUEUE_FILES);
     let oldest: { name: string; at: number } | null = null;
     for (const name of queued) {
       try {
@@ -533,6 +528,26 @@ const gateQueueAge: CheckDefinition = {
     };
   },
 };
+
+/** The names in `dir` that `accept` takes, at most `cap` of them (the folder is read only that far); null when it can't be read. */
+async function namesIn(dir: string, accept: (name: string) => boolean, cap: number): Promise<string[] | null> {
+  let handle: Dir;
+  try {
+    handle = await opendir(dir, { bufferSize: 256 });
+  } catch {
+    return null;
+  }
+  const names: string[] = [];
+  try {
+    for await (const entry of handle) {
+      if (accept(entry.name)) names.push(entry.name);
+      if (names.length >= cap) break;
+    }
+  } catch {
+    // The folder went away while it was read: what was listed stands
+  }
+  return names;
+}
 
 /** Entries in `dir`, counting up to `cap`; null when it can't be read. */
 async function countEntries(dir: string, cap: number): Promise<{ count: number; capped: boolean } | null> {

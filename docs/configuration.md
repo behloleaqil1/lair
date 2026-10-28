@@ -321,7 +321,7 @@ dragons:
 | `roles.build` | array | Profile ids for the dragons that name no profile, adapter or model |
 | `roles.review.red`, `.amber`, `.green` | array | Profile ids of the reviewers per risk tier (see [Reviewers by role](#reviewers-by-role)) |
 | `roles.plan` | array | Profile ids for the planner agent (`planner.agent.id`) when it names none |
-| `roles.supervise` | array | Profile ids for the supervisor ([supervisor.md](design/supervisor.md)): accepted and checked, not used yet |
+| `roles.supervise` | array | Profile ids for the supervisor ([supervisor.md](design/supervisor.md)): accepted and checked, not used yet (its runs come with S1-2; its [ops API](#the-ops-api) is built) |
 
 Profile ids start with a letter and use letters, digits, `.`, `_` and `-` (at most 64). A mistake keeps the project from loading, with the key's path: `ai.profiles.<id>.tool: unknown tool ...`, `ai.roles.review.amber[1]: unknown profile ...`, a profile listed twice in a role, `dragons.<id>.profile: unknown profile ...`, and a dragon that names a profile and an adapter or a model.
 
@@ -704,7 +704,7 @@ Errors: 400 for invalid input, 403 for a cross-site request or an answer without
 
 ## Owner-only routes
 
-Every route that changes something only you should change needs the owner's session, the same one the Decision Inbox uses (see "Only you answer"): the `X-Lair-Owner-Session` header, from the dashboard's own origin, in a same-origin browser request. Without it the answer is HTTP 403, before the request's body is read, and nothing changes. `curl`, scripts, agents and other local programs can still read: every `GET` stays open, except the two that read prompt files from disk (`/api/agents/prompts`), the Settings API (`/api/settings`), whose reads reveal paths and commands, the AI tools API (`/api/ai`), whose reads run the tools' own commands, and logs and test output (`/api/dashboard/.../output` and `.../log`, and the logs in pipeline runs), which can hold anything a test or an agent printed. No CORS is granted under these prefixes (`OWNER_ONLY_PREFIXES` in `src/server/human-auth/cors.ts`). The dashboard's views send the session once this browser is signed in, and show "sign in from Decisions" until it is.
+Every route that changes something only you should change needs the owner's session, the same one the Decision Inbox uses (see "Only you answer"): the `X-Lair-Owner-Session` header, from the dashboard's own origin, in a same-origin browser request. Without it the answer is HTTP 403, before the request's body is read, and nothing changes. `curl`, scripts, agents and other local programs can still read: every `GET` stays open, except the two that read prompt files from disk (`/api/agents/prompts`), the Settings API (`/api/settings`), whose reads reveal paths and commands, the AI tools API (`/api/ai`), whose reads run the tools' own commands, Lair's diagnostics and the ops tokens and their audit (`/api/health/diagnostics`, `/api/supervisor`), and logs and test output (`/api/dashboard/.../output` and `.../log`, and the logs in pipeline runs), which can hold anything a test or an agent printed. No CORS is granted under these prefixes (`OWNER_ONLY_PREFIXES` in `src/server/human-auth/cors.ts`). The dashboard's views send the session once this browser is signed in, and show "sign in from Decisions" until it is.
 
 | Prefix | Owner only | Open |
 |--------|------------|------|
@@ -722,6 +722,8 @@ Every route that changes something only you should change needs the owner's sess
 | `/api/pipelines` | starting and cancelling runs; a job's log tail and its steps' output | status, the workflow file, runs (without logs and output) |
 | `/api/dashboard` | a gate's log tail and failing tests (`/gates/:id/output`), an agent's log tail (`/agents/:id/log`) | the modules a project turns on, a gate's detail |
 | `/api/ai` | everything: the tools' installed and sign-in state per machine, their models, refreshing a list ([AI API](#ai-api)) | nothing |
+| `/api/health/diagnostics`, `/api/supervisor` | everything: the self-checks' results, minting, listing and revoking ops tokens, their audit ([Supervisor API](#supervisor-api)) | nothing (`/api/health` itself stays open) |
+| `/api/ops` | nothing: it takes an [ops token](#the-ops-api), never the owner's session, and grants no CORS | — |
 
 The watchdog's routes are all reads; it acts only inside the server. Lair's own work doesn't go through these routes either: delivery's automatic deploys, the scheduler, the healer and the watchdog's playbooks run inside the server, server code starts pipeline runs with `PipelineManager.startRun` and creates tasks with the job manager, and agents use the fleet bus (`npm run bus`), which works on the bus database directly. The `lair-node` daemon connects over `/ws/node`, not these routes.
 
@@ -846,6 +848,119 @@ Read-only routes. `?project=` defaults to the default project:
 - `GET /api/watchdog/breaches?status=open|resolved|all&limit=100`
 - `GET /api/watchdog/runs?limit=100`: playbook runs with each step's output and the argv that ran (or, when observed, would have run)
 - `GET /api/watchdog/escalations?limit=100`: each with the `decisionId` it raised in the Decision Inbox
+
+## Supervisor: self-checks and the ops API
+
+> The self-checks are on by default, with nothing to set. Design: [supervisor.md](design/supervisor.md). This is part S1-1: the checks, their notices and the read-only ops API. The supervisor's own runs (answers to your questions, the hourly review, the daily digest) come with S1-2.
+
+Lair checks itself, in code, every `interval_seconds` (60 s by default), off the request path, and shows the results in **Home → Health** (yours only). Each result has an id, a status (`ok`, `warning`, `failing`, or `unknown` when it couldn't be measured this round), its measured values and thresholds, a one-line explanation and what to do about it. Its words are Lair's own (a count, a module, a lane, a config key), never a line of a log or of a command's output.
+
+| Check | Of | What it measures | Warning / failing (defaults) |
+|-------|----|------------------|------------------------------|
+| `event_loop_lag` | Lair | The event loop's delay since the last round (p99) | 200 ms / 1000 ms |
+| `request_latency` | Lair | The p95 duration of the requests answered in the last `window_minutes` (5), and the slowest route; fewer than `min_requests` (20) are too few to judge. The bus's event stream is left out | 1000 ms / 5000 ms |
+| `open_files` | Lair | This process's open files against its soft limit: `/proc/self/fd` and `/proc/self/limits` on Linux, `/dev/fd` and Node's process report on macOS (the limit is cached for 10 minutes), else `lsof -p` with a 5 s timeout. Without a known limit it is `unknown` | 70% / 90% |
+| `disk_free` | Lair | The free space of the disk that holds `data/` | 10% or 5 GiB / 5% or 1 GiB |
+| `store_size` | Lair | The largest store in `data/`, the largest WAL file, and how much the WAL files grew since the last round | 500 MB / 2000 MB; WAL 64 MB / 512 MB |
+| `command_timeouts` | Lair | Commands Lair gave up on in the last `window_minutes` (15): the dashboard's status commands, the modules' probes, git, the AI tools' checks | 3 / 10 |
+| `module_errors` | a project | Modules its YAML turns on that did not start (config errors: failing) or that report an error from their last round (warning) | — |
+| `watcher_mode` | a project | Folders the file watcher polls instead of watching (a missing folder, one the system can't watch): warning | — |
+| `infra_holds` | a project | Open holds and escalations of the agents module whose evidence, in the agents module's own events, points at the infrastructure: a transient provider or network error, a restart of Lair, a stale gate result; and provider outages | 1 / 3 |
+| `machines` | a project | Placement's machines that fail their probe (with placement on) | one down / one down for 10 min |
+| `gate_queue_age` | a project | The oldest request waiting in `gates_dir/queue` (with a gate queue folder) | 60 min / 180 min |
+| `retention` | a project | Entries in `agents_dir`, `gates_dir/results` and `gates_dir/queue`: the fullest one | 5000 / 20000 |
+
+A check that doesn't apply to a project (no placement, no gate queue folder) isn't listed. Lair's own checks follow the default project's `supervisor:` block; each project's checks follow its own.
+
+**Never in the way.** Each check has its own timeout (`timeout_seconds`, 10 s): one still running then reports `unknown`, and isn't started again until it settles. A check that fails reports `unknown` (its error goes to the server log, never into the result); the others run as usual. A round never overlaps the next. Reading the results runs nothing. They are kept in memory: after a restart, the first round runs 15 s after the start.
+
+**A failing check becomes a notice.** A check failing for `notice_minutes` (5) in a row raises one [notice](#action-items-and-notices) in the Decision Inbox (listed under FYI, never counted or notified), with what it measured, what to do and since when. There is one per check: it is withdrawn when the check recovers (`ok` or `warning`), and the same check raises none again within `notice_cooldown_minutes` (60) of a withdrawal. **Noted** closes it, and it isn't raised again until the check recovers and then fails again. A check turned off withdraws its notice. Lair's own checks raise theirs in the default project. How long a check has been failing is counted in memory, so a restart starts the count again; a notice already open stays open until the check recovers.
+
+```yaml
+supervisor:
+  checks:
+    enabled: true                 # default
+    interval_seconds: 60
+    timeout_seconds: 10
+    notice_minutes: 5
+    notice_cooldown_minutes: 60
+    disabled: [retention]          # check ids to skip
+    event_loop_lag: { warning_ms: 200, failing_ms: 1000 }
+    request_latency: { warning_ms: 1000, failing_ms: 5000, min_requests: 20, window_minutes: 5 }
+    open_files: { warning_percent: 70, failing_percent: 90 }
+    disk_free: { warning_percent: 10, failing_percent: 5, warning_gib: 5, failing_gib: 1 }
+    store_size: { warning_mb: 500, failing_mb: 2000, wal_warning_mb: 64, wal_failing_mb: 512 }
+    command_timeouts: { window_minutes: 15, warning: 3, failing: 10 }
+    infra_holds: { warning: 1, failing: 3 }
+    machines: { failing_minutes: 10 }
+    gate_queue_age: { warning_minutes: 60, failing_minutes: 180 }
+    retention: { warning_entries: 5000, failing_entries: 20000 }
+```
+
+Unknown keys and check ids, and a warning threshold past its failing one (above it; below it for free disk), are config errors that name the key: `supervisor.checks.open_files: the warning threshold (95) is above the failing one (90)`. A project whose block is invalid runs none of its checks, and shows the error in Home → Health. The block is reloaded live, and edited in Settings.
+
+### The ops API
+
+The ops API is what an AI supervisor reads Lair through: read tools only (`proposals.submit`, the one write tool, comes with S2). Any MCP-capable tool gets it from `lair ops-mcp`, an MCP server over stdio; each tool call is one `POST /api/ops/call` to Lair, which checks, audits, redacts and bounds it.
+
+| Tool | Arguments | Answer |
+|------|-----------|--------|
+| `status.watchdog`, `status.agents`, `status.triage`, `status.delivery`, `status.pipelines`, `status.review`, `status.planner` | `project` | The module's own status for the project |
+| `events.query` | `project`; `source`: `agents` (the agents module's stored events, the default) or `server` (the server's recent events, in memory); `since` and `until` (ISO times: the last 24 hours by default, at most 7 days); `kinds` (at most 20); `agent`, `task`, `run_id`; `limit` (at most 200, default 50) | Events, newest first |
+| `decisions.list` | `project`, `status` (default `open`), `attention`, `limit` (at most 100, default 25) | Decision Inbox items, their context cut to 1500 characters |
+| `runs.get` | `project` and `id` (a run), or `agent` and `limit` (at most 20, default 5) | The run with its chain's attempts and its events, or the agent's latest runs |
+| `logs.tail` | `project`, `agent` or `gate`, `lines` (at most 200, default 50) | The log's last lines |
+| `gates.result` | `project` and `id`, or `hours` (at most 72) and `limit` (at most 50) | A gate's steps, verdict and where it ran, or the latest results |
+| `triage.record` | `project`, and `id` or `gate`; `limit` (at most 50) | Triage's records |
+| `placement.status` | `project` | Machines, lanes, queued jobs and recent moves |
+| `config.get` | `project` | The project's config, redacted |
+| `diagnostics.run` | `project` | The self-checks, run now (at most every 10 s) |
+
+`project` defaults to the default project. Arguments are checked by the same list on both sides: an unknown one, an id that starts with `-` or a count past its limit is refused (HTTP 400), never cut.
+
+**Redacted and bounded.** Every string of every answer goes through the same rules. Out go: tokens of known shapes (GitHub, Slack, OpenAI-style, AWS and Google keys, JWTs, Lair's own ops tokens); `Authorization` and `Bearer` values; the value of a `name=value` or `name: value` whose name says token, secret, password, key, credential or cookie; long runs that mix cases and digits, and long hex runs (a 40-digit commit id stays); a URL's credentials, path and query (`https://git.example.com/[...]` stays); ARNs; runs of six or more digits. Strings are cut to 1000 characters (log lines to 500), lists to 100 items, and an answer to 256 KiB: a bigger one comes back with tighter limits, marked `truncated`. `config.get` also removes every `env` map (a command's environment), and replaces a value whose key names a secret; a `*_env` key that names a variable and a `*_file` path stay.
+
+**Tokens.** The ops API takes an ops token (`Authorization: Bearer lairops_...`), never the owner's session, and no other route takes one.
+
+- A **run token** is minted by Lair for one supervisor run (S1-2 starts those runs). It reads that run's project only, and ends when the agents module reports the run ended, or at its TTL.
+- A **session token** is yours, for an interactive session of any MCP-capable tool (below). It reads every project, for one hour by default (5 minutes to 8 hours), and you can revoke it.
+
+Tokens live in the server's memory, never on disk: a restart ends them all. Only their SHA-256 is kept. At most 50 are alive at once (minting another drops the one that expires soonest), and each makes at most 120 calls a minute (HTTP 429 past that).
+
+**Audit.** Every call is recorded in `data/supervisor.db`: when, the token's id and label ("run <id>", or the session's label), the tool, its arguments (redacted and cut), how it ended (`ok`; `refused`, with why; `error`) and how long it took. So are each token minted or revoked, and calls without a valid token (at most 30 a minute). A token never is. Rows are kept for 30 days, at most 50,000.
+
+### Connecting an MCP-capable tool
+
+1. In **Home → Health**, signed in as the owner, choose **Get a token for one hour** under "Connect an AI tool". The token is shown once, in the config to paste.
+2. Add Lair to the tool's MCP servers, with the token in the server's environment:
+
+   ```json
+   {
+     "mcpServers": {
+       "lair": {
+         "command": "lair",
+         "args": ["ops-mcp"],
+         "env": { "LAIR_OPS_TOKEN": "lairops_...", "LAIR_URL": "http://127.0.0.1:4777" }
+       }
+     }
+   }
+   ```
+
+   From a checkout without the `lair` command on `PATH`, use `"command": "node"` and `"args": ["<Lair's folder>/dist/cli/lair.js", "ops-mcp"]` after `npm run build`. Tools that take a command line instead of a config file take the same command and variables.
+3. Ask the tool about Lair ("why is kiro-A paused?", "which checks fail?"): it lists Lair's tools and calls them, and gets the redacted answers above.
+
+The token stops working after its hour, when you revoke it, or when Lair restarts; mint another then. While it lives, it reads every project's statuses, redacted logs, decisions and redacted config: keep it in that tool's own config on your machine, out of shared files and repositories.
+
+### Supervisor API
+
+| Method | Route | Description |
+|--------|-------|-------------|
+| `GET` | `/api/health/diagnostics?project=<name>` | Owner only. The latest results: `{enabled, intervalSeconds, lastRunAt, server: [check], projects: [{project, enabled, errors, lastRunAt, checks: [check]}], counts}`; each check `{id, scope, title, status, values, thresholds, explanation, fix, measuredAt, durationMs, failingSince, noticeId}`. Reading runs nothing |
+| `POST` | `/api/supervisor/tokens` | Owner only. Body `{ttl_minutes?, label?}`: `{token, info}` (201), the token this once |
+| `GET` | `/api/supervisor/tokens` | Owner only. The live tokens: `{id, kind, label, projects, scope, runId, createdAt, expiresAt, lastUsedAt, calls}`, never a token |
+| `POST` | `/api/supervisor/tokens/:id/revoke` | Owner only |
+| `GET` | `/api/supervisor/audit?limit=&token=<id>` | Owner only. The audit, newest first (at most 1000) |
+| `POST` | `/api/ops/call` | An ops token. Body `{tool, args}`: `{tool, project, truncated, result}`. 401 without a live token, 403 for a project the token doesn't read, 404 for an unknown tool, 400 for invalid arguments, 429 past the rate, 504 after 20 s |
 
 ## Delivery
 
@@ -2092,7 +2207,7 @@ Project names (the file name without `.yaml` or `.yml`) must start with a letter
 
 The server watches `projects/` and `projects/local/`. When a project file changes (or a new one appears), it waits until the file has been quiet for a second, then reads it and checks it with every module's own parser, the same checks as at startup:
 
-- **Valid:** only the modules whose part of the file changed are reloaded, each for that project only. A module's part is its own block (`watchdog:`, `delivery:`, `pipelines:` and `executors:`, `review:`, `agents:`, `triage:`, `placement:`, `planner:`), the blocks it also reads (the agents module reads `watchdog:`, the planner `agents:`), and every other top-level key a module may read (`repo`, `read_only`, `dragons`, `machines`, `agents_dir`, `outbox_file`...), so a change to one of those reloads every module of the project. Keys no module reads reload nothing: the dashboard's commands (`*_cmd`, `allow_direct_assign`, `backlog_file`), `merge_bar`, `processes`, `orchestrator`, `available_models` and `gate_runner`. Editing only a comment reloads nothing. The dashboard's reads use the new file from the next request.
+- **Valid:** only the modules whose part of the file changed are reloaded, each for that project only. A module's part is its own block (`watchdog:`, `delivery:`, `pipelines:` and `executors:`, `review:`, `agents:`, `triage:`, `placement:`, `planner:`, `supervisor:`), the blocks it also reads (the agents module reads `watchdog:`, the planner `agents:`), and every other top-level key a module may read (`repo`, `read_only`, `dragons`, `machines`, `agents_dir`, `outbox_file`...), so a change to one of those reloads every module of the project. Keys no module reads reload nothing: the dashboard's commands (`*_cmd`, `allow_direct_assign`, `backlog_file`), `merge_bar`, `processes`, `orchestrator`, `available_models` and `gate_runner`. Editing only a comment reloads nothing. The dashboard's reads use the new file from the next request.
 - **Invalid** (YAML errors, missing required fields, any module's parser refusing its block, a file that is not a regular file or is over 1 MiB): nothing changes, and the modules keep running the previous config. The error is logged, emitted as a `config.invalid` event, and shown in a banner on the dashboard: "projects/x.yaml has an error; the previous config is still running: ..." until the file is fixed.
 - **Another file:** the modules keep running the file they started with. When it is deleted (deleting `projects/local/x.yaml` would otherwise fall back to the public `projects/x.yaml`), or a new file takes its place (a new `projects/local/x.yaml`), nothing changes and the banner says so; restart Lair to switch files. Deleting a project's only file also keeps its previous config running until a restart.
 
@@ -2109,6 +2224,7 @@ A module is reloaded by stopping its instance for the project cleanly and starti
 | agents | The agents keep running; the new config re-adopts them by pid, as after a restart |
 | triage | The tick, ingests and outbox in progress finish first |
 | placement | As on shutdown: a probe or `move_cmd` in progress is cut short, and a move it cut short is found again by the new instance's first tick. Learned durations, moves and cool-downs are kept (they are in the store); probe history starts again, so a machine is up again only after `min_up_seconds` |
+| supervisor | A round of checks in progress finishes; the next one, a few seconds later, runs with the new settings. A check turned off withdraws its open notice |
 
 Reloads of one module for one project never overlap: a change made while one runs is applied after it, with the latest file (also when the latest file is the one that ran before). A module that fails to start with the new config (for example, its store can't be opened) is started again with the previous one, and the banner says so; it is never left half-started.
 
@@ -2183,6 +2299,8 @@ notifications:
 | `LAIR_DECISIONS_MAX_OPEN` | server | How many open decisions one module may have per project in the [Decision Inbox](#decision-inbox) (default `50`). More are refused with HTTP 429 |
 | `LAIR_DECISIONS_MAX_OPEN_HTTP` | server | How many open decisions raised over HTTP one project may have, whatever module they name (default `20`). More are refused with HTTP 429 |
 | `LAIR_AGENT_ID` | lair-bus | The calling agent's ID (required) |
+| `LAIR_OPS_TOKEN` | lair ops-mcp | An [ops token](#the-ops-api): one minted for a supervisor run, or yours from Home → Health (required). Never printed |
+| `LAIR_URL` | lair ops-mcp, lair review submit | The Lair server (default `http://127.0.0.1:4777`) |
 | `LAIR_GITHUB_TOKEN` | server | A fine-grained GitHub token for running gate pipelines on GitHub Actions (see [Gate pipelines](#gate-pipelines)). A project can name another variable with `executors.github.token_env`. Never passed to local steps |
 
 The server refuses, with HTTP 403, browser requests whose `Origin` is not one of its own (`http://localhost`, `http://127.0.0.1` or `http://[::1]` on port 4777 or 5173, plus `LAIR_HOST`) and requests whose `Host` header names another host (DNS rebinding). Requests without an `Origin` header, such as `curl` or lair-node, are allowed. WebSocket handshakes get the same `Origin` check.
