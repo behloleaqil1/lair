@@ -1,11 +1,20 @@
 /**
- * Form changes applied to a project file through the yaml library's
- * Document API, so what nobody changed stays as it was: comments, key
- * order, quoting, flow or block style, and keys no form knows.
+ * Form changes applied to a project file, so what nobody changed stays as it
+ * was: comments, key order, quoting, flow or block style, and keys no form
+ * knows.
  *
- * A changed scalar keeps its node (its comments and quoting); a map or list
+ * Every change is applied through the yaml library's Document API first: it
+ * decides what the file means afterwards and refuses what can't apply. A
+ * changed scalar keeps its node (its comments and quoting); a map or list
  * set to a new value is updated key by key and item by item; a node whose
  * kind changes (a scalar becoming a map) is replaced, keeping its comments.
+ *
+ * The text written is then, whenever it can be, the file's own text with
+ * only the changed tokens edited (yaml-cst.ts), so the spacing of the lines
+ * nobody touched stays byte for byte. That text is used only when it reads
+ * as exactly the values the Document API gives; otherwise (a list that grows,
+ * a new map) the document is written from its nodes, with flow maps padded
+ * as the file pads them.
  */
 import {
   Pair,
@@ -22,6 +31,7 @@ import {
 } from "yaml";
 import type { PathSegment, SettingsChange } from "../../shared/settings-types.js";
 import { isPlainObject, pathKey, redactSecrets } from "../../shared/settings-rules.js";
+import { editInPlace, paddedFlowMaps } from "./yaml-cst.js";
 
 /** A change that can't be applied to the file (HTTP 400, nothing written). */
 export class ChangeError extends Error {
@@ -241,8 +251,29 @@ export function applyChanges(text: string, changes: SettingsChange[]): string {
     // The first line only: the lines a YAML error quotes could hold a secret
     throw new ChangeError(`the file has YAML errors; fix them in the YAML tab first: ${redactSecrets(errors[0].split("\n")[0])}`);
   }
-  for (const change of checkChanges(changes)) applyOne(doc, change);
-  return doc.toString(TO_STRING);
+  const checked = checkChanges(changes);
+  for (const change of checked) applyOne(doc, change);
+  let expected: string | null = null;
+  try {
+    expected = JSON.stringify(doc.toJS());
+  } catch {
+    // Too many aliases to resolve, say: only the write from the nodes
+  }
+  // The file's own text with the changed tokens edited, when it means exactly that
+  const inPlace = expected === null ? null : editInPlace(text, checked);
+  if (inPlace !== null && expected !== null && readsAs(inPlace, expected)) return inPlace;
+  return doc.toString({ ...TO_STRING, flowCollectionPadding: paddedFlowMaps(text) });
+}
+
+/** Whether `text` parses, with no error, to the values whose JSON is `expected`. */
+function readsAs(text: string, expected: string): boolean {
+  const { doc, errors } = parseConfigDocument(text);
+  if (errors.length > 0) return false;
+  try {
+    return JSON.stringify(doc.toJS()) === expected;
+  } catch {
+    return false;
+  }
 }
 
 /** A new document from a plain object (key order kept), with a comment at the top. */

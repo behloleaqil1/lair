@@ -25,12 +25,22 @@ afterEach(async () => {
   server = null;
 });
 
-const AMBER_LINE = "      amber: [kiro-opus] # the default tier";
+const AMBER_LINE = "      amber: [ kiro-opus ]   # the default tier";
+const PROFILES = [
+  "    kiro-opus:  { tool: kiro, model: claude-opus-4.5 }     # the strongest",
+  "    kiro-cheap: { tool: kiro, model: claude-haiku-4.5 }    # the cheap one",
+];
+const AGENTS = [
+  "  worker-a: { name: Worker A, profile: kiro-opus }                      # builds",
+  "  worker-b: { name: Worker B, adapter: kiro, model: claude-haiku-4.5 }  # builds too",
+  // Named by its id, on purpose
+  "  worker-c: { name: worker-c }",
+];
 
 /**
  * A project with two profiles, its roles, three agents and a custom tool
- * with its own model list. Flow maps are written as Settings prints them
- * (no padding inside the braces), so a save changes only what it changes.
+ * with its own model list, written as people write these files by hand:
+ * padded flow maps, comments aligned by several spaces, keys aligned.
  */
 function teamYaml(dir: string): string {
   const q = JSON.stringify;
@@ -54,16 +64,15 @@ function teamYaml(dir: string): string {
     "    models_parser: lines",
     "ai:",
     "  profiles:",
-    "    kiro-opus: {tool: kiro, model: claude-opus-4.5}",
-    "    kiro-cheap: {tool: kiro, model: claude-haiku-4.5}",
+    ...PROFILES,
     "  roles:",
-    "    build: [kiro-opus, kiro-cheap]",
+    "    build: [ kiro-opus, kiro-cheap ]",
     "    review:",
     AMBER_LINE,
+    "",
+    "# The agents",
     "dragons:",
-    "  worker-a: {name: Worker A, profile: kiro-opus}",
-    "  worker-b: {name: Worker B, adapter: kiro, model: claude-haiku-4.5}",
-    "  worker-c: {name: Worker C}",
+    ...AGENTS,
     "",
   ].join("\n");
 }
@@ -75,6 +84,8 @@ const KIRO_MODELS = [
 ].join("\n");
 
 let signedIn = false;
+/** The AI tools' clock: their checks are cached, and a refresh within 5 seconds answers from the last one */
+let now = Date.parse("2026-10-28T09:00:00Z");
 
 /** What the tools' own commands answer: their model lists, and Kiro's sign-in check. */
 function tools(argv: string[]): ToolRunOutput | undefined {
@@ -92,7 +103,7 @@ function tools(argv: string[]): ToolRunOutput | undefined {
 
 async function open(hash: string, owner = true): Promise<HTMLElement> {
   signedIn = false;
-  server = await settingsServer({ yaml: teamYaml, tools, programs: ["kiro-cli"] });
+  server = await settingsServer({ yaml: teamYaml, tools, programs: ["kiro-cli"], clock: { now: () => now } });
   vi.stubGlobal("fetch", server.fetch);
   if (owner) await server.signIn();
   return mountSettings(hash);
@@ -132,9 +143,11 @@ describe("acceptance (settings-v2.md, S2-1)", () => {
     const shown = await reviewAndSave();
 
     expect(shown.keys).toEqual(["ai.roles.review.amber"]);
+    // Exactly that line, written as it was: its padding and its aligned comment kept
+    const after = "      amber: [ kiro-cheap ]   # the default tier";
     expect(shown.removed).toEqual([`-${AMBER_LINE}`]);
-    expect(shown.added).toEqual(["+      amber: [kiro-cheap] # the default tier"]);
-    expect(server!.read()).toBe(before.replace(AMBER_LINE, "      amber: [kiro-cheap] # the default tier"));
+    expect(shown.added).toEqual([`+${after}`]);
+    expect(server!.read()).toBe(before.replace(AMBER_LINE, after));
     // No YAML was seen: the YAML page was never opened, and no page showed the file as text
     expect(window.location.hash).toBe("#/settings?tab=ai");
     expect(server!.requests.some((r) => r.includes("tab=yaml"))).toBe(false);
@@ -165,6 +178,7 @@ describe("Settings → AI", () => {
     expect(tools.querySelector("details")?.textContent).toContain("Test CLI");
 
     signedIn = true;
+    now += 5_000;
     click(button(tools, "Refresh"));
     await until("the check again", () => tools.querySelector('[data-sign-in="signed_in"]') !== null);
     expect(server!.requests).toContain("POST /api/ai/tools/refresh");
@@ -213,10 +227,13 @@ describe("Settings → AI", () => {
     expect(drawer()).toBeNull();
     expect(el.querySelector("[data-ai-profiles]")!.textContent).toContain("model-z");
 
+    const before = server!.read();
     const shown = await reviewAndSave();
     expect(shown.keys).toEqual(["ai.profiles.custom"]);
-    // Saved as typed: a warning, never a refusal
+    // Saved as typed (a warning, never a refusal), as a line like its siblings', and nothing else changed
     expect(filed().ai.profiles.custom).toEqual({ tool: "test-cli", model: "model-z" });
+    expect(server!.read()).toBe(before.replace(`${PROFILES[1]}\n`, `${PROFILES[1]}\n    custom: { tool: test-cli, model: model-z }\n`));
+    expect(shown.removed).toEqual([]);
   });
 
   it("Roles: an ordered list per role; the editor saves the new order", async () => {
@@ -231,7 +248,7 @@ describe("Settings → AI", () => {
 
     const shown = await reviewAndSave();
     expect(shown.keys).toEqual(["ai.roles.build"]);
-    expect(server!.read()).toBe(before.replace("build: [kiro-opus, kiro-cheap]", "build: [kiro-cheap, kiro-opus]"));
+    expect(server!.read()).toBe(before.replace("build: [ kiro-opus, kiro-cheap ]", "build: [ kiro-cheap, kiro-opus ]"));
   });
 });
 
@@ -260,12 +277,17 @@ describe("Settings → Team", () => {
     expect(el.querySelector("[data-bulk]")).toBeNull();
     expect(el.querySelector('[data-runs="worker-b"]')?.textContent).toBe("kiro-cheap (kiro + claude-haiku-4.5)");
 
+    const before = server!.read();
     const shown = await reviewAndSave();
     expect(shown.keys).toEqual(expect.arrayContaining(["dragons.worker-b.profile", "dragons.worker-b.adapter", "dragons.worker-c.profile"]));
-    const dragons = filed().dragons;
-    expect(dragons["worker-b"]).toEqual({ name: "Worker B", profile: "kiro-cheap" });
-    expect(dragons["worker-c"]).toEqual({ name: "Worker C", profile: "kiro-cheap" });
-    expect(dragons["worker-a"]).toEqual({ name: "Worker A", profile: "kiro-opus" });
+    // Their two lines, padding and comments kept; nothing else
+    expect(server!.read()).toBe(
+      before
+        .replace(AGENTS[1], "  worker-b: { name: Worker B, profile: kiro-cheap }  # builds too")
+        .replace(AGENTS[2], "  worker-c: { name: worker-c, profile: kiro-cheap }"),
+    );
+    expect(shown.removed).toHaveLength(2);
+    expect(shown.added).toHaveLength(2);
   });
 
   it("adds an agent in a drawer, on a tool and a model from that tool's own list", async () => {
@@ -281,7 +303,25 @@ describe("Settings → Team", () => {
     click(button(drawer()!, "Add"));
     expect(el.querySelector('[data-runs="worker-d"]')?.textContent).toBe("test-cli + model-y");
 
+    const before = server!.read();
     await reviewAndSave();
     expect(filed().dragons["worker-d"]).toEqual({ adapter: "test-cli", model: "model-y" });
+    // One new line, a flow map like its siblings'
+    expect(server!.read()).toBe(before.replace(`${AGENTS[2]}\n`, `${AGENTS[2]}\n  worker-d: { adapter: test-cli, model: model-y }\n`));
+  });
+
+  it("applying an agent's drawer keeps a name the owner gave it, also one equal to its id", async () => {
+    const el = await open("#/settings?tab=team");
+    await until("the agents", () => el.querySelectorAll("[data-team-agents] tbody tr").length === 3);
+    const row = [...el.querySelectorAll<HTMLElement>("[data-team-agents] tbody tr")].find((r) => r.querySelector('[data-runs="worker-c"]'))!;
+    click(row);
+    expect(drawer()?.textContent).toContain("Agent worker-c");
+    click(drawer()!.querySelector('[data-runs-on="profile"]'));
+    choose(drawer()!.querySelector<HTMLSelectElement>("[data-agent-profile]"), "kiro-cheap");
+    click(button(drawer()!, "Apply"));
+    const before = server!.read();
+    const shown = await reviewAndSave();
+    expect(shown.keys).toEqual(["dragons.worker-c.profile"]);
+    expect(server!.read()).toBe(before.replace(AGENTS[2], "  worker-c: { name: worker-c, profile: kiro-cheap }"));
   });
 });

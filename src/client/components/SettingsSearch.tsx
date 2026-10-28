@@ -25,10 +25,11 @@ export function SettingsSearch({ index, onPick }: SettingsSearchProps) {
   const [active, setActive] = useState(-1);
   const hits = useMemo(() => searchSettings(index, query), [index, query]);
 
-  // ⌘K / Ctrl+K while Settings is open
+  // ⌘K / Ctrl+K while Settings is open, unless a drawer or a dialog is: the focus stays in a modal layer
   useEffect(() => {
     const onKey = (event: globalThis.KeyboardEvent) => {
       if (!(event.metaKey || event.ctrlKey) || event.altKey || event.key.toLowerCase() !== "k") return;
+      if (document.querySelector('[aria-modal="true"]')) return;
       event.preventDefault();
       input.current?.focus();
       input.current?.select();

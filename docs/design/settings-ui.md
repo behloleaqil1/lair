@@ -33,6 +33,12 @@ The rules in [ROADMAP.md](ROADMAP.md#rules-every-new-module-follows) apply to al
   uses), node by node: a scalar is changed in place, so its comments, quoting and position stay; maps and lists are
   updated item by item. Keys nobody changed are never touched, unknown keys included. The raw YAML tab saves the text
   as typed.
+- What is written is then the file's own text with only the changed tokens edited (`yaml-cst.ts`, on the library's
+  CST): a scalar's value (its quoting kept, double-quoted when plain would read as another type), a list of the same
+  length item by item, a key removed from or added to a block or flow map, and a new map of scalars among flow-map
+  siblings as a flow map like theirs. Every other byte stays. That text is used only when it parses to exactly the
+  values the Document API gives. Otherwise (a list that grows, a new nested map) the document is printed from its
+  nodes, with `flowCollectionPadding` on when most of the file's flow maps are padded.
 - Writes are atomic: a temporary file in the same directory (`O_EXCL`, the old file's mode, else 0600), `fsync`,
   `rename` over the file, then `fsync` of the directory. A crash leaves the old file or the new one, never half of
   one.

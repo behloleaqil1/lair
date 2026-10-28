@@ -13,7 +13,9 @@ import type {
   KnownSource,
   KnownValues,
   PathSegment,
+  SaveRequest,
   SettingsChange,
+  SettingsCheck,
   SettingsSection,
 } from "../shared/settings-types";
 import { isCommandKey, isPlainObject, pathKey } from "../shared/settings-rules";
@@ -357,6 +359,18 @@ export function errorsAt(errors: FieldError[], path: PathSegment[]): { here: str
 export function generalErrors(errors: FieldError[], sections: SettingsSection[]): FieldError[] {
   const blocks = new Set(sections.flatMap((s) => s.blocks));
   return errors.filter((e) => e.path === "" || !blocks.has(e.path.split(".")[0]));
+}
+
+/**
+ * What Save sends after a review: the reviewed request, with the digest of
+ * its command changes only when the owner ticked the confirmation. Without
+ * it, the server refuses a save that changes a command (HTTP 428).
+ */
+export function saveRequestOf(reviewed: SaveRequest, check: SettingsCheck, confirmed: boolean): SaveRequest {
+  const request: SaveRequest = { ...reviewed };
+  delete request.confirmCommands;
+  if (confirmed && check.commandsDigest) request.confirmCommands = check.commandsDigest;
+  return request;
 }
 
 /** The section a top-level key belongs to. */

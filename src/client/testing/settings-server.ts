@@ -51,6 +51,8 @@ export interface SettingsServerOptions {
   serverYaml?: string;
   /** The repository's origin (it is a git work tree either way) */
   origin?: string;
+  /** The AI tools' clock (their checks' cache and its refresh limit); default the real one */
+  clock?: { now(): number };
 }
 
 export interface SettingsServer {
@@ -109,7 +111,7 @@ export async function settingsServer(options: SettingsServerOptions): Promise<Se
     env: {},
   });
   const runner = new FakeToolRunner(options.tools);
-  const tools = new AiToolsService({ runner, env: { PATH: bin, HOME: dir } });
+  const tools = new AiToolsService({ runner, env: { PATH: bin, HOME: dir }, clock: options.clock });
   const store = new DecisionStore(":memory:");
   const bus = new EventBus();
 

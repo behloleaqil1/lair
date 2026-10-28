@@ -12,7 +12,8 @@ import { commandChanges, fieldErrors } from "./checks.js";
 import { githubOf } from "./service.js";
 import { collectCommands, commentSecrets, findSecrets, isSecretKey, redactSecrets } from "../../shared/settings-rules.js";
 import { formatDiff, lineDiff } from "../../shared/line-diff.js";
-import { diffValues, kindOf, setIn, textToList, textToNumber } from "../../client/settings-form";
+import { diffValues, kindOf, saveRequestOf, setIn, textToList, textToNumber } from "../../client/settings-form";
+import type { SettingsCheck } from "../../shared/settings-types.js";
 
 describe("toJsonSchema", () => {
   it("converts the zod features the config parsers use", () => {
@@ -125,6 +126,119 @@ describe("applyChanges", () => {
     const out = newConfigText({ name: "Demo", repo: "/srv/demo", skip: undefined, watchdog: { enabled: true } }, " made here");
     expect(out.startsWith("# made here\n\nname: Demo\n")).toBe(true);
     expect(parseYaml(out)).toEqual({ name: "Demo", repo: "/srv/demo", watchdog: { enabled: true } });
+  });
+});
+
+describe("Save after a review", () => {
+  it("sends the command changes' confirmation only when the owner ticked it", () => {
+    const changes = [{ path: ["dragon_start_cmd"], value: ["./bin/start", "{dragon}"] }];
+    const check: SettingsCheck = {
+      ok: true,
+      errors: [],
+      diff: { hunks: [], added: 0, removed: 0 },
+      yaml: "",
+      commands: [{ path: "dragon_start_cmd", before: null, after: ["./bin/start", "{dragon}"] }],
+      commandsDigest: "d1",
+      conflict: false,
+      currentHash: "h",
+    };
+    // A request carried over with a digest is not confirmed by that
+    const reviewed = { baseHash: "h", changes, confirmCommands: "stale" };
+    expect(saveRequestOf(reviewed, check, false)).toEqual({ baseHash: "h", changes });
+    expect(saveRequestOf(reviewed, check, true)).toEqual({ baseHash: "h", changes, confirmCommands: "d1" });
+    expect(saveRequestOf(reviewed, { ...check, commands: [], commandsDigest: "" }, true)).toEqual({ baseHash: "h", changes });
+  });
+});
+
+describe("a save changes only the lines it changes, in a file written by hand", () => {
+  // A real project file's shape: padded flow maps with comments aligned by several spaces, a block comment, a quoted
+  // string, a multi-line flow map, a padded flow list and a list at its key's indentation (`key:\n- a`)
+  const kiroA = '  kiro-A: { id: kiro-A, name: Smaug, model: claude-opus-4.5, machine: mac, instructions: "", adapter: kiro-lair }   # builds';
+  const kiroB = "  kiro-B: { id: kiro-B, name: Glaurung, model: claude-sonnet-4, machine: mac, adapter: kiro-lair }    # reviews";
+  const file = [
+    "# The project's own file",
+    "name: Lair",
+    "",
+    "# The agents, one line each",
+    "dragons:",
+    kiroA,
+    kiroB,
+    "  kiro-C: {",
+    "    id: kiro-C,",
+    "    name: Saphira,",
+    "    model: claude-haiku-4.5",
+    "  }",
+    "machines:",
+    "  mac: { type: local, runners: [ heavy, light ] }      # this one",
+    "watchdog:",
+    "  enabled: true          # on",
+    "  interval_seconds: 60   # once a minute",
+    "  mode: 'observe'",
+    "agents:",
+    "  env_passthrough:",
+    "  - LANG",
+    "  - TZ",
+    'prompts_dir: "data/prompts"',
+    "",
+  ].join("\n");
+
+  /** The save changed exactly this line, and nothing else */
+  const onlyLine = (out: string, from: string, to: string) => {
+    expect(file.split(from)).toHaveLength(2);
+    expect(out).toBe(file.replace(from, to));
+    expect(lineDiff(file, out)).toMatchObject({ added: 1, removed: 1 });
+  };
+
+  it("a model changed: one line, with its padding, its other keys and its aligned comment as they were", () => {
+    const out = applyChanges(file, [{ path: ["dragons", "kiro-A", "model"], value: "claude-opus-4.6" }]);
+    onlyLine(out, kiroA, kiroA.replace("claude-opus-4.5", "claude-opus-4.6"));
+  });
+
+  it("values in a multi-line flow map, a number before an aligned comment, a quoted string, a padded flow list", () => {
+    onlyLine(
+      applyChanges(file, [{ path: ["dragons", "kiro-C", "model"], value: "claude-sonnet-4.5" }]),
+      "    model: claude-haiku-4.5",
+      "    model: claude-sonnet-4.5",
+    );
+    onlyLine(applyChanges(file, [{ path: ["watchdog", "interval_seconds"], value: 90 }]), "interval_seconds: 60   #", "interval_seconds: 90   #");
+    onlyLine(applyChanges(file, [{ path: ["prompts_dir"], value: "prompts" }]), 'prompts_dir: "data/prompts"', 'prompts_dir: "prompts"');
+    onlyLine(applyChanges(file, [{ path: ["machines", "mac", "runners"], value: ["heavy", "gpu"] }]), "[ heavy, light ]", "[ heavy, gpu ]");
+    // A string that would read as a number is quoted, so it stays a string
+    const quoted = applyChanges(file, [{ path: ["dragons", "kiro-A", "machine"], value: "60" }]);
+    onlyLine(quoted, "machine: mac, instructions", 'machine: "60", instructions');
+    expect(parseYaml(quoted).dragons["kiro-A"].machine).toBe("60");
+  });
+
+  it("keys removed from and added to a padded flow map (a move to a profile): its line only", () => {
+    const moved = applyChanges(file, [
+      { path: ["dragons", "kiro-B", "model"], remove: true },
+      { path: ["dragons", "kiro-B", "adapter"], remove: true },
+      { path: ["dragons", "kiro-B", "profile"], value: "kiro-cheap" },
+    ]);
+    onlyLine(moved, kiroB, "  kiro-B: { id: kiro-B, name: Glaurung, machine: mac, profile: kiro-cheap }    # reviews");
+    // The first key of a padded flow map
+    onlyLine(applyChanges(file, [{ path: ["dragons", "kiro-A", "id"], remove: true }]), "{ id: kiro-A, name: Smaug", "{ name: Smaug");
+  });
+
+  it("a key removed from a block map takes its own line, aligned comment included", () => {
+    const out = applyChanges(file, [{ path: ["watchdog", "enabled"], remove: true }]);
+    expect(out).toBe(file.replace("  enabled: true          # on\n", ""));
+    expect(lineDiff(file, out)).toMatchObject({ added: 0, removed: 1 });
+  });
+
+  it("a new key, and a new agent among flow-map siblings (written like them), each add one line", () => {
+    const key = applyChanges(file, [{ path: ["watchdog", "command_timeout_seconds"], value: 30 }]);
+    expect(key).toBe(file.replace("  mode: 'observe'\n", "  mode: 'observe'\n  command_timeout_seconds: 30\n"));
+    const agent = applyChanges(file, [{ path: ["dragons", "kiro-D"], value: { name: "Fafnir", profile: "kiro-cheap" } }]);
+    expect(agent).toBe(file.replace("  }\nmachines:", "  }\n  kiro-D: { name: Fafnir, profile: kiro-cheap }\nmachines:"));
+    expect(lineDiff(file, agent)).toMatchObject({ added: 1, removed: 0 });
+  });
+
+  it("a change it can't make in place (a list that grows) writes the file from its nodes, its flow maps still padded", () => {
+    const out = applyChanges(file, [{ path: ["machines", "mac", "runners"], value: ["heavy", "light", "gpu"] }]);
+    expect(parseYaml(out)).toEqual({ ...parseYaml(file), machines: { mac: { type: "local", runners: ["heavy", "light", "gpu"] } } });
+    expect(out).toContain("kiro-B: { id: kiro-B, name: Glaurung,");
+    expect(out).toContain("# The agents, one line each");
   });
 });
 

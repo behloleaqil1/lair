@@ -825,7 +825,8 @@ describe("the AI tools API is the owner's, reads included", () => {
     const tokenPath = join(root, "data", "owner.token");
     const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
     const runner = new FakeRunner(answer);
-    const service = new AiToolsService({ runner, clock: new SharedClock(NOW), env: { PATH: path } });
+    const clock = new SharedClock(NOW);
+    const service = new AiToolsService({ runner, clock, env: { PATH: path } });
     const app: FastifyInstance = Fastify({ logger: false });
     await registerOwnerRoutes(app, auth);
     await registerAiRoutes(app, {
@@ -841,7 +842,7 @@ describe("the AI tools API is the owner's, reads included", () => {
       auth.close();
     });
     const owner = { ...BROWSER, [OWNER_SESSION_HEADER]: auth.createSession(readFileSync(tokenPath, "utf-8").trim())!.session };
-    return { app, runner, owner };
+    return { app, runner, owner, clock };
   }
 
   it("answers 403 to no session, a browser not signed in and an invalid session, and runs nothing", async () => {
@@ -883,22 +884,33 @@ describe("the AI tools API is the owner's, reads included", () => {
     expect((await app.inject({ url: "/api/ai/tools?project=other", headers: owner })).statusCode).toBe(400);
   });
 
-  it("Refresh (Settings → AI) checks again now: a tool signed in since the last check shows signed in", async () => {
+  it("Refresh (Settings → AI) checks again: a tool signed in since the last check shows signed in", async () => {
     let signedIn = false;
-    const { app, runner, owner } = await serve((argv) => {
+    const { app, runner, owner, clock } = await serve((argv) => {
       if (argv.join(" ") !== "kiro-cli whoami") return undefined;
       return signedIn ? out("Logged in with Builder ID\n") : out("Not logged in\n", 1);
     }, binWith("kiro-cli"));
     const kiro = (body: string): string =>
       JSON.parse(body).data.tools.find((t: { id: string }) => t.id === "kiro").machines[0].signIn.state;
+    const refresh = () => app.inject({ method: "POST", url: "/api/ai/tools/refresh", headers: owner, payload: { project: "demo" } });
+    const whoamis = () => runner.commands().filter((c) => c === "kiro-cli whoami").length;
     expect(kiro((await app.inject({ url: "/api/ai/tools?project=demo", headers: owner })).body)).toBe("signed_out");
     signedIn = true;
     // Within the minute: the last check's answer
     expect(kiro((await app.inject({ url: "/api/ai/tools?project=demo", headers: owner })).body)).toBe("signed_out");
-    const refreshed = await app.inject({ method: "POST", url: "/api/ai/tools/refresh", headers: owner, payload: { project: "demo" } });
-    expect(refreshed.statusCode).toBe(200);
-    expect(kiro(refreshed.body)).toBe("signed_in");
-    expect(runner.commands().filter((c) => c === "kiro-cli whoami")).toHaveLength(2);
+    // A refresh within 5 seconds of the last check answers from it, however often it is asked: no check runs
+    const soon = await Promise.all([refresh(), refresh(), refresh()]);
+    expect(soon.map((r) => [r.statusCode, kiro(r.body)])).toEqual([
+      [200, "signed_out"],
+      [200, "signed_out"],
+      [200, "signed_out"],
+    ]);
+    expect(whoamis()).toBe(1);
+    clock.advance(5_000);
+    // Then it checks again, once for refreshes that come together
+    const later = await Promise.all([refresh(), refresh()]);
+    expect(later.map((r) => kiro(r.body))).toEqual(["signed_in", "signed_in"]);
+    expect(whoamis()).toBe(2);
     expect((await app.inject({ method: "POST", url: "/api/ai/tools/refresh", headers: owner, payload: { project: "../etc" } })).statusCode).toBe(400);
   });
 

@@ -173,7 +173,10 @@ export type RunsOn =
 
 export interface AgentRow {
   id: string;
+  /** What the table shows: its name, else its id */
   name: string;
+  /** Its own `name:` as the file has it ("" when it has none) */
+  ownName: string;
   /** The role it works in: plan for the planner agent, supervise for the supervisor's, else build */
   role: "build" | "plan" | "supervise";
   runsOn: RunsOn;
@@ -212,7 +215,7 @@ export function agentsOf(draft: Draft): AgentRow[] {
       const first = strings(getIn(draft, ["ai", "roles", role]))[0];
       runs = first ? `${first}, its role's first profile` : "the defaults (dragon_defaults)";
     }
-    return { id, name: text(d.name) || id, role, runsOn, runs, machine: text(d.machine) || "local" };
+    return { id, name: text(d.name) || id, ownName: text(d.name), role, runsOn, runs, machine: text(d.machine) || "local" };
   });
 }
 
@@ -230,11 +233,27 @@ export function setRunsOn(draft: Draft, id: string, on: RunsOn): Draft {
   return next;
 }
 
-/** The draft with agent `id` (new or not) named `name` on `machine` ("local" is left out when it was not set). */
+/**
+ * The draft with agent `id` (new or not) named `name` on `machine`. Only
+ * what differs is touched: a name the agent has (one equal to its id too)
+ * stays unless it was changed or cleared, and "local" is left out when the
+ * agent did not set a machine.
+ */
 export function setAgent(draft: Draft, id: string, name: string, machine: string): Draft {
   const at = ["dragons", id];
   let next = isPlainObject(getIn(draft, at)) ? draft : (setIn(draft, at, {}) as Draft);
-  next = setIn(next, [...at, "name"], name.trim() === "" ? undefined : name.trim()) as Draft;
+  const wanted = name.trim();
+  const had = getIn(next, [...at, "name"]);
+  if (wanted !== "") {
+    if (had !== wanted) next = setIn(next, [...at, "name"], wanted) as Draft;
+  } else if (had !== undefined) {
+    next = setIn(next, [...at, "name"], undefined) as Draft;
+  }
+  return withMachine(next, at, machine);
+}
+
+function withMachine(draft: Draft, at: string[], machine: string): Draft {
+  const next = draft;
   const had = getIn(next, [...at, "machine"]) !== undefined;
   if (machine === "" || (machine === "local" && !had)) return setIn(next, [...at, "machine"], undefined) as Draft;
   return setIn(next, [...at, "machine"], machine) as Draft;

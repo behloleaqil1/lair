@@ -49,6 +49,8 @@ export const LOCAL_MACHINE = "local";
 export const MODELS_TTL_MS = 60 * 60_000;
 /** A sign-in state (and a tools status) is good this long; past half of it, the next use checks again in the background */
 export const STATUS_TTL_MS = 60_000;
+/** A refresh of the tools (Settings → AI) younger than this is answered from the last check, so it can't be used to run the checks in a loop */
+export const MIN_REFRESH_MS = 5_000;
 export const COMMAND_TIMEOUT_MS = 15_000;
 /** A sign-in check gets this long */
 export const SIGN_IN_TIMEOUT_MS = 5_000;
@@ -101,6 +103,8 @@ export interface AiToolsOptions {
   env?: NodeJS.ProcessEnv;
   modelsTtlMs?: number;
   statusTtlMs?: number;
+  /** A fresh tools check answers from a check younger than this (default MIN_REFRESH_MS) */
+  minRefreshMs?: number;
   timeoutMs?: number;
   signInTimeoutMs?: number;
   maxOutputBytes?: number;
@@ -248,6 +252,7 @@ export class AiToolsService implements ToolReadiness {
   private readonly env: NodeJS.ProcessEnv;
   private readonly modelsTtlMs: number;
   private readonly statusTtlMs: number;
+  private readonly minRefreshMs: number;
   private readonly timeoutMs: number;
   private readonly signInTimeoutMs: number;
   private readonly maxOutputBytes: number;
@@ -264,6 +269,7 @@ export class AiToolsService implements ToolReadiness {
     this.env = options.env ?? process.env;
     this.modelsTtlMs = options.modelsTtlMs ?? MODELS_TTL_MS;
     this.statusTtlMs = options.statusTtlMs ?? STATUS_TTL_MS;
+    this.minRefreshMs = options.minRefreshMs ?? MIN_REFRESH_MS;
     this.timeoutMs = options.timeoutMs ?? COMMAND_TIMEOUT_MS;
     this.signInTimeoutMs = options.signInTimeoutMs ?? SIGN_IN_TIMEOUT_MS;
     this.maxOutputBytes = options.maxOutputBytes ?? MAX_OUTPUT_BYTES;
@@ -369,15 +375,21 @@ export class AiToolsService implements ToolReadiness {
 
   // ============ CACHE ============
 
-  /** The cached value under `key` while it is fresh, else the value `load` gives (one load per key at a time). */
+  /**
+   * The cached value under `key` while it is fresh, else the value `load`
+   * gives (one load per key at a time, its callers sharing it). `fresh`
+   * loads again, unless the value is younger than `minFreshMs`.
+   */
   private async cached<T>(
     key: string,
     tool: string,
     fresh: boolean,
     load: () => Promise<{ value: T; ttl: number }>,
+    minFreshMs = 0,
   ): Promise<T> {
     const entry = this.cache.get(key) as CacheEntry<T> | undefined;
-    if (!fresh && entry && this.clock.now() - entry.at < entry.ttl) return entry.value;
+    const age = entry ? this.clock.now() - entry.at : Infinity;
+    if (entry && age < (fresh ? Math.min(minFreshMs, entry.ttl) : entry.ttl)) return entry.value;
     const pending = this.running.get(key) as Promise<T> | undefined;
     if (pending) return pending;
     const loading = (async () => {
@@ -419,7 +431,13 @@ export class AiToolsService implements ToolReadiness {
 
   private status(machine: Machine, tool: Tool, config: ProjectConfig | null, fresh = false): Promise<ToolMachineStatus> {
     const key = this.key("status", machine, tool, [tool.authCheckCmd, tool.versionCmd, tool.loginHint]);
-    return this.cached(key, tool.id, fresh, async () => ({ value: await this.check(machine, tool, config), ttl: this.statusTtlMs }));
+    return this.cached(
+      key,
+      tool.id,
+      fresh,
+      async () => ({ value: await this.check(machine, tool, config), ttl: this.statusTtlMs }),
+      this.minRefreshMs,
+    );
   }
 
   private async check(machine: Machine, tool: Tool, config: ProjectConfig | null): Promise<ToolMachineStatus> {

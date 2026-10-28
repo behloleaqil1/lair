@@ -32,7 +32,7 @@ import {
   loadSections,
   saveProjectSettings,
 } from "../settings-api";
-import { diffValues, generalErrors, setIn } from "../settings-form";
+import { diffValues, generalErrors, saveRequestOf, setIn } from "../settings-form";
 import { SETTINGS_PAGES, pageHref, pageOf, tabOf, unsavedText } from "../settings-pages";
 import { fieldIndex, fieldTarget, type SearchEntry } from "../settings-search";
 import { SignInHint } from "./SignInHint";
@@ -196,7 +196,8 @@ export function Settings({ project, refreshKey, route, go }: Props) {
   const save = async () => {
     if (!view || !review || !reviewed) return;
     setBusy(true);
-    const reply = await saveProjectSettings(view.id, { ...reviewed, confirmCommands: review.commandsDigest || undefined });
+    // The command changes' digest only when the owner ticked their confirmation
+    const reply = await saveProjectSettings(view.id, saveRequestOf(reviewed, review, confirmed));
     setBusy(false);
     if (reply.success && reply.data) {
       const result = reply.data;

@@ -127,6 +127,23 @@ describe("the search", () => {
     expect(field.hasAttribute("data-focused")).toBe(true);
     expect(field.contains(document.activeElement)).toBe(true);
   });
+
+  it("⌘K leaves the focus in an open drawer: the search box behind it is not focused", async () => {
+    const el = await open({ hash: "#/settings/watchdog.interval_seconds?tab=classic" });
+    await until("the watchdog field", () => el.querySelector('[data-field="watchdog.interval_seconds"] input') !== null);
+    setValue(el.querySelector<HTMLInputElement>('[data-field="watchdog.interval_seconds"] input')!, "120");
+    click(button(saveBar()!, "Review and save"));
+    await until("the dry run", () => drawer()?.querySelector("[data-settings-review]") != null);
+    const box = el.querySelector<HTMLInputElement>('input[aria-label="Search settings"]')!;
+    const inDrawer = drawer()!.querySelector<HTMLButtonElement>("button")!;
+    act(() => inDrawer.focus());
+    act(() => {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true, cancelable: true }));
+    });
+    expect(document.activeElement).not.toBe(box);
+    expect(drawer()!.contains(document.activeElement)).toBe(true);
+    expect(box.getAttribute("aria-expanded")).toBe("false");
+  });
 });
 
 describe("the save bar: one draft for every page, saved through the phase-1 path", () => {

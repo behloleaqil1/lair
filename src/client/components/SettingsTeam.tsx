@@ -239,7 +239,8 @@ function AgentDrawer({
 }) {
   const start = row?.runsOn ?? { kind: "role" as const };
   const [id, setId] = useState("");
-  const [name, setName] = useState(row?.name === row?.id ? "" : (row?.name ?? ""));
+  // Its own name as the file has it, also one equal to its id: applying the drawer changes only what was changed
+  const [name, setName] = useState(row?.ownName ?? "");
   const [machine, setMachine] = useState(row?.machine ?? "local");
   const [kind, setKind] = useState<RunsOn["kind"]>(start.kind);
   const [profile, setProfile] = useState(start.kind === "profile" ? start.profile : (profiles[0] ?? ""));
