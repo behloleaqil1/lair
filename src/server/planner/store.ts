@@ -105,6 +105,7 @@ const MIGRATE_V1_TO_V2 = `
   ALTER TABLE planner_runs ADD COLUMN verifier_task TEXT;
   ALTER TABLE planner_proposals ADD COLUMN verifier_verdict TEXT;
   ALTER TABLE planner_proposals ADD COLUMN verifier_reason TEXT;
+  ALTER TABLE planner_proposals ADD COLUMN verifier_evidence TEXT;
 `;
 
 export interface StoredRun {
@@ -147,10 +148,12 @@ export interface StoredProposal {
   decidedBy: string | null;
   decidedAt: number | null;
   createdAt: number;
-  /** The verifier's verdict: "pass", "fail", "defer", or null */
+  /** The verifier's verdict: "approve", "reject", "unsure", "unverified", or null */
   verifierVerdict: VerifierVerdict | null;
   /** The verifier's reason for its verdict */
   verifierReason: string | null;
+  /** Evidence the verifier cited */
+  verifierEvidence: string[] | null;
 }
 
 export interface ChangeInput {
@@ -207,6 +210,7 @@ interface ProposalRow {
   created_at: number;
   verifier_verdict: string | null;
   verifier_reason: string | null;
+  verifier_evidence: string | null;
 }
 
 interface ChangeRow {
@@ -266,6 +270,7 @@ function toProposal(row: ProposalRow): StoredProposal {
     createdAt: row.created_at,
     verifierVerdict: row.verifier_verdict as VerifierVerdict | null,
     verifierReason: row.verifier_reason,
+    verifierEvidence: row.verifier_evidence ? JSON.parse(row.verifier_evidence) : null,
   };
 }
 
@@ -286,6 +291,7 @@ export function proposalView(p: StoredProposal): ProposalView {
     createdAt: iso(p.createdAt),
     verifierVerdict: p.verifierVerdict,
     verifierReason: p.verifierReason,
+    verifierEvidence: p.verifierEvidence,
   };
 }
 
@@ -486,10 +492,10 @@ export class PlannerStore {
       .run(status, by, at, refusal, id);
   }
 
-  setVerifierVerdict(id: string, verdict: VerifierVerdict, reason: string | null): void {
+  setVerifierVerdict(id: string, verdict: VerifierVerdict, reason: string | null, evidence: string[] | null): void {
     this.db
-      .prepare(`UPDATE planner_proposals SET verifier_verdict = ?, verifier_reason = ? WHERE id = ?`)
-      .run(verdict, reason, id);
+      .prepare(`UPDATE planner_proposals SET verifier_verdict = ?, verifier_reason = ?, verifier_evidence = ? WHERE id = ?`)
+      .run(verdict, reason, evidence ? JSON.stringify(evidence) : null, id);
   }
 
   getProposal(id: string): StoredProposal | null {

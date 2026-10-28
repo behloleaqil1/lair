@@ -21,7 +21,7 @@
  * Cycles and the owner's actions run one at a time.
  */
 import { randomUUID } from "crypto";
-import { mkdirSync, writeFileSync } from "fs";
+import { mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import type { EventBus } from "../core/event-bus.js";
 import type { EventType } from "../../shared/server-types.js";
@@ -1070,7 +1070,6 @@ export class PlannerService {
     let contextJson = "{}";
     try {
       const contextPath = join(run.dir, "context.json");
-      const { readFileSync } = await import("fs");
       contextJson = readFileSync(contextPath, "utf-8");
     } catch {
       // Context not available; verifier runs with minimal context
@@ -1094,17 +1093,38 @@ export class PlannerService {
 
     let prompt = `${template.text}\n\n${section}`;
     if (prompt.length > PROMPT_LIMIT) {
-      // Truncate context if prompt is too long
+      // L1: Truncate context properly to produce valid JSON
       const room = PROMPT_LIMIT - template.text.length - 4000;
       if (room < 4096) {
         console.warn(`[planner] ${this.project}: verifier prompt template is too long`);
         return false;
       }
+      // Try to parse and truncate the context as valid JSON
+      let truncatedContext = "{}";
+      try {
+        const parsed = JSON.parse(contextJson);
+        // Remove large arrays/objects to fit, keeping structure valid
+        if (typeof parsed === "object" && parsed !== null) {
+          const truncated = { ...parsed, _truncated: "context was truncated to fit prompt limit" };
+          // Remove the largest keys until it fits
+          const keys = Object.keys(truncated).filter((k) => k !== "_truncated");
+          while (JSON.stringify(truncated).length > room && keys.length > 0) {
+            const largest = keys.reduce((a, b) =>
+              JSON.stringify(truncated[a]).length > JSON.stringify(truncated[b]).length ? a : b,
+            );
+            delete truncated[largest];
+            keys.splice(keys.indexOf(largest), 1);
+          }
+          truncatedContext = JSON.stringify(truncated);
+        }
+      } catch {
+        truncatedContext = JSON.stringify({ _truncated: "context could not be parsed", _error: true });
+      }
       const truncatedSection = verifierSection({
         runId: run.id,
         verdictsFile,
         proposals,
-        context: { json: contextJson.slice(0, room) },
+        context: { json: truncatedContext },
       });
       prompt = `${template.text}\n\n${truncatedSection}`;
     }
@@ -1158,7 +1178,7 @@ export class PlannerService {
     await this.applyVerdicts(run, now);
   }
 
-  /** Read verifier verdicts and apply them to proposals. */
+  /** Read verifier verdicts and store them on proposals (H3: don't auto-reject, keep pending). */
   private async applyVerdicts(run: StoredRun, now: number): Promise<void> {
     const verifyDir = join(run.dir, "verify");
     const verdictsFile = join(verifyDir, VERDICTS_FILE);
@@ -1168,6 +1188,12 @@ export class PlannerService {
       run.verifierState = "failed";
       run.detail = `verifier: ${file.reason}`;
       this.store.saveRun(run);
+      // Mark all pending proposals as unverified
+      for (const p of this.store.runProposals(run.id)) {
+        if (p.status === "pending") {
+          this.store.setVerifierVerdict(p.id, "unverified", "verification failed", null);
+        }
+      }
       await this.finishAfterVerification(run, now);
       return;
     }
@@ -1177,27 +1203,23 @@ export class PlannerService {
     const verdicts = parseVerdicts(file.items, acceptedIndices);
 
     // Build a map of proposal index to verdict
-    const verdictMap = new Map<number, { verdict: VerifierVerdict; reason: string }>();
+    const verdictMap = new Map<number, { verdict: VerifierVerdict; reason: string; evidence: string[] }>();
     for (const v of verdicts) {
       if (v.refusal === null) {
-        verdictMap.set(v.proposal, { verdict: v.verdict, reason: v.reason });
+        verdictMap.set(v.proposal, { verdict: v.verdict, reason: v.reason, evidence: v.evidence });
       }
     }
 
-    // Apply verdicts to proposals
+    // Store verdicts on proposals (H3: DON'T auto-reject on "reject" verdict - keep pending for owner)
     for (const p of proposals) {
       if (p.status !== "pending") continue;
 
       const v = verdictMap.get(p.index);
       if (v) {
-        this.store.setVerifierVerdict(p.id, v.verdict, v.reason);
-        if (v.verdict === "fail") {
-          // Fail: reject the proposal with the verifier's reason
-          this.store.decide(p.id, "rejected", "verifier", now, `verifier: ${v.reason}`);
-        }
+        this.store.setVerifierVerdict(p.id, v.verdict, v.reason, v.evidence);
       } else {
-        // No verdict: treat as defer
-        this.store.setVerifierVerdict(p.id, "defer", "no verdict from verifier");
+        // No verdict: treat as unsure
+        this.store.setVerifierVerdict(p.id, "unsure", "no verdict from verifier", null);
       }
     }
 
@@ -1213,27 +1235,50 @@ export class PlannerService {
     const accepted = proposals.filter((p) => p.status === "pending");
     const verifier = this.settings.verifier;
 
-    // Determine which proposals to apply immediately
-    // - Without verifier: apply if approval[op] === "never"
-    // - With verifier: apply if approval[op] === "never" AND (verdict === "pass" OR op in skip_ops)
-    const immediate = accepted.filter((p) => {
-      if (!this.writes || !isOp(p.op)) return false;
-      if (this.settings.approval[p.op] !== "never") return false;
+    // Determine which proposals to auto-apply or auto-reject
+    // Auto-apply requires: mode=act, approval[op]=never, op in auto_apply, verdict=approve
+    // Auto-reject requires: mode=act, op in auto_reject, verdict=reject
+    const toAutoApply: StoredProposal[] = [];
+    const toAutoReject: StoredProposal[] = [];
 
-      if (!verifier) return true;
+    for (const p of accepted) {
+      if (!this.writes || !isOp(p.op)) continue;
 
-      // With verifier
-      if (verifier.skipOps.includes(p.op as never)) return true;
-      return p.verifierVerdict === "pass";
-    });
+      // Check auto-apply (requires verifier with auto_apply config)
+      if (verifier && this.settings.approval[p.op] === "never") {
+        if (verifier.autoApply.includes(p.op) && p.verifierVerdict === "approve") {
+          toAutoApply.push(p);
+          continue;
+        }
+        // Skipped ops: apply if approval=never (legacy behavior for ops not going through verifier)
+        if (verifier.skipOps.includes(p.op) && p.verifierVerdict === null) {
+          toAutoApply.push(p);
+          continue;
+        }
+      } else if (!verifier && this.settings.approval[p.op] === "never") {
+        // No verifier: apply if approval=never
+        toAutoApply.push(p);
+        continue;
+      }
+
+      // Check auto-reject (requires verifier with auto_reject config)
+      if (verifier && verifier.autoReject.includes(p.op) && p.verifierVerdict === "reject") {
+        toAutoReject.push(p);
+      }
+    }
 
     let note = "";
-    if (immediate.length > 0) {
+    if (toAutoApply.length > 0) {
       try {
-        await this.apply(immediate, "planner", now);
+        await this.apply(toAutoApply, "lair:verifier", now);
       } catch (e) {
         note = `; applying failed (${message(e)}), so they wait for you`;
       }
+    }
+
+    // Auto-reject proposals
+    for (const p of toAutoReject) {
+      this.store.decide(p.id, "rejected", "lair:verifier", now, `verifier: ${p.verifierReason ?? "rejected"}`);
     }
 
     const pending = this.store.runProposals(run.id).filter((p) => p.status === "pending");
@@ -1249,12 +1294,13 @@ export class PlannerService {
     let verifierNote = "";
     if (verifier && run.verifierState) {
       const verdictCounts = {
-        pass: after.filter((p) => p.verifierVerdict === "pass").length,
-        fail: after.filter((p) => p.verifierVerdict === "fail").length,
-        defer: after.filter((p) => p.verifierVerdict === "defer").length,
+        approve: after.filter((p) => p.verifierVerdict === "approve").length,
+        reject: after.filter((p) => p.verifierVerdict === "reject").length,
+        unsure: after.filter((p) => p.verifierVerdict === "unsure").length,
+        unverified: after.filter((p) => p.verifierVerdict === "unverified").length,
       };
       if (run.verifierState === "done") {
-        verifierNote = ` (verifier: ${verdictCounts.pass} pass, ${verdictCounts.fail} fail, ${verdictCounts.defer} defer)`;
+        verifierNote = ` (verifier: ${verdictCounts.approve} approve, ${verdictCounts.reject} reject, ${verdictCounts.unsure} unsure)`;
       } else if (run.verifierState === "failed") {
         // Preserve the error detail if set (e.g., "verifier: the verdicts file is not JSON")
         const reason = run.detail?.startsWith("verifier:") ? run.detail : "verifier failed";
@@ -1276,30 +1322,72 @@ export class PlannerService {
     await this.emit("planner.run_finished", { runId: run.id, state: run.state, detail: run.detail });
   }
 
-  /** One decision for a run's waiting proposals. */
+  /** One decision for a run's waiting proposals. (H1: proper recommendations, M1: follow_verifier option) */
   private async askApproval(run: StoredRun, pending: StoredProposal[]): Promise<string | null> {
     const hasDrop = pending.some((p) => p.op === "drop");
     const verifier = this.settings.verifier;
 
-    // Build list with verifier verdicts if available
+    // Determine verification status
+    const hasVerifier = verifier !== null;
+    const allApprove = hasVerifier && pending.every((p) => p.verifierVerdict === "approve");
+    const allReject = hasVerifier && pending.every((p) => p.verifierVerdict === "reject" || p.verifierVerdict === "unsure");
+    const anyReject = hasVerifier && pending.some((p) => p.verifierVerdict === "reject");
+    const anyUnsure = hasVerifier && pending.some((p) => p.verifierVerdict === "unsure");
+    const anyUnverified = hasVerifier && pending.some((p) => p.verifierVerdict === "unverified" || p.verifierVerdict === null);
+    const isNotVerified = !hasVerifier || run.verifierState === "failed" || run.verifierState === "skipped" || anyUnverified;
+    const hasMixedVerdicts = hasVerifier && !allApprove && !allReject && (anyReject || anyUnsure);
+
+    // Build list with verifier verdicts and evidence (M1: include evidence)
     const list = pending.map((p) => {
       const base = `- ${p.op} ${p.task}${p.agent ? ` -> ${p.agent}` : ""}${p.text ? `: "${p.text}"` : ""} (why: ${p.reason})`;
-      if (verifier && p.verifierVerdict) {
-        return `${base} [verifier: ${p.verifierVerdict}${p.verifierReason ? ` - ${p.verifierReason}` : ""}]`;
+      if (hasVerifier && p.verifierVerdict) {
+        const evidencePart = p.verifierEvidence?.length ? ` [${p.verifierEvidence.slice(0, 2).join("; ")}]` : "";
+        return `${base}\n  Verifier: ${p.verifierVerdict}${p.verifierReason ? ` - ${p.verifierReason}` : ""}${evidencePart}`;
       }
       return base;
     });
 
-    // Adjust recommendation based on verifier verdicts
-    let recommended: { optionId: string; reasoning: string };
+    // Build options (M1: add follow_verifier when there are mixed verdicts)
+    const options: { id: string; label: string; consequences: string }[] = [
+      { id: "approve_all", label: "Apply them all", consequences: "Lair checks each against the tasks file as it is now and applies those that still pass." },
+      { id: "reject_all", label: "Reject them all", consequences: "Nothing changes; the next planner run sees the same state." },
+    ];
+
+    if (hasVerifier && hasMixedVerdicts) {
+      options.push({
+        id: "follow_verifier",
+        label: "Follow the verifier",
+        consequences: "Apply the ones the verifier approved; reject the rest (rejected and unsure).",
+      });
+    }
+
+    // Build recommendation (H1: proper recommendations, no "passed Lair's checks")
+    let recommended: { optionId: string; reasoning: string } | undefined;
+    let contextNote: string;
+
     if (hasDrop) {
+      // Drop always needs owner review
       recommended = { optionId: "reject_all", reasoning: "A drop removes a task: look at it in the Planner view, where you can approve the others one by one." };
-    } else if (verifier && pending.some((p) => p.verifierVerdict === "fail")) {
-      recommended = { optionId: "reject_all", reasoning: "The verifier flagged at least one proposal as failing: review them in the Planner view." };
-    } else if (verifier && pending.every((p) => p.verifierVerdict === "pass")) {
+      contextNote = "Review carefully: at least one proposal removes a task.";
+    } else if (isNotVerified) {
+      // H1: Not verified -> reject_all recommended with the brief's reason
+      recommended = { optionId: "reject_all", reasoning: "Rejecting costs an idle agent until the next planner run; approving an unchecked change can start the wrong work." };
+      contextNote = "Not verified: Lair only checked the format, not whether these changes make sense.";
+    } else if (allApprove) {
+      // All approve -> approve_all
       recommended = { optionId: "approve_all", reasoning: "Every proposal passed the verifier's review." };
+      contextNote = "The verifier approved every proposal.";
+    } else if (allReject) {
+      // All reject/unsure -> reject_all
+      recommended = { optionId: "reject_all", reasoning: "The verifier flagged every proposal as problematic or uncertain." };
+      contextNote = "The verifier did not approve any proposal.";
+    } else if (hasMixedVerdicts) {
+      // Mixed -> follow_verifier
+      recommended = { optionId: "follow_verifier", reasoning: "Some proposals passed the verifier's review; others did not." };
+      contextNote = "Mixed verdicts: some proposals approved, others rejected or uncertain.";
     } else {
-      recommended = { optionId: "approve_all", reasoning: "Every proposal passed Lair's checks; look them over first." };
+      // Fallback (should not happen with properly configured verifier)
+      contextNote = "Review these proposals and decide.";
     }
 
     return this.raise({
@@ -1312,12 +1400,11 @@ export class PlannerService {
         "",
         ...list,
         "",
-        "Each passed Lair's checks. Approving applies them to the tasks file (checked again first); you can also decide them one by one in the Planner view.",
+        contextNote,
+        "",
+        "You can also decide each proposal one by one in the Planner view.",
       ].join("\n"),
-      options: [
-        { id: "approve_all", label: "Apply them all", consequences: "Lair checks each against the tasks file as it is now and applies those that still pass." },
-        { id: "reject_all", label: "Reject them all", consequences: "Nothing changes; the next planner run sees the same state." },
-      ],
+      options,
       recommended,
     });
   }
@@ -1469,6 +1556,22 @@ export class PlannerService {
             // They stay pending: the Planner view shows them, and the owner approves them once the file can be written
             this.lastError = `approved proposals of run ${short(runId)} were not applied: ${message(e)}`;
             console.warn(`[planner] ${this.project}: ${this.lastError}`);
+          }
+        } else if (optionId === "follow_verifier") {
+          // M1: Apply approved proposals, reject the rest (rejected and unsure)
+          const toApply = pending.filter((p) => p.verifierVerdict === "approve");
+          const toReject = pending.filter((p) => p.verifierVerdict !== "approve");
+          if (toApply.length > 0) {
+            try {
+              await this.apply(toApply, by, now);
+            } catch (e) {
+              this.lastError = `follow_verifier: approved proposals of run ${short(runId)} were not applied: ${message(e)}`;
+              console.warn(`[planner] ${this.project}: ${this.lastError}`);
+            }
+          }
+          for (const p of toReject) {
+            const reason = p.verifierReason ? `verifier: ${p.verifierReason}` : "rejected by verifier";
+            this.store.decide(p.id, "declined", by, now, reason);
           }
         } else {
           for (const p of pending) this.store.decide(p.id, "declined", by, now, "rejected by the owner");

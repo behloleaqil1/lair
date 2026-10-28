@@ -148,8 +148,16 @@ const VerifierSchema = z
     prompt_file: z.string().min(1).max(4096),
     /** Verifier runs started in any 24 hours */
     max_runs_per_day: z.number().int().min(1).max(1000).default(48),
-    /** Ops that skip verification and proceed straight to approval rules */
-    skip_ops: z.array(z.enum(PLANNER_OPS)).default(["finish"]),
+    /** Ops that skip verification and proceed straight to approval rules (drop can never be skipped) */
+    skip_ops: z.array(z.enum(PLANNER_OPS)).default([]),
+    /** Ops where a pass verdict applies without owner (never includes drop); requires mode: act */
+    auto_apply: z.array(z.enum(PLANNER_OPS)).default([]),
+    /** Ops where a reject verdict rejects without owner; requires mode: act */
+    auto_reject: z.array(z.enum(PLANNER_OPS)).default([]),
+    /** Timeout for verifier runs in seconds */
+    timeout_seconds: z.number().int().min(60).max(3600).default(900),
+    /** How many times to retry verifier on transient failure */
+    attempts: z.number().int().min(1).max(5).default(2),
   })
   .strict();
 
@@ -257,6 +265,14 @@ export interface VerifierAgentSettings {
   maxRunsPerDay: number;
   /** Ops that skip verification and proceed straight to approval rules */
   skipOps: PlannerOp[];
+  /** Ops where a pass verdict applies without owner (never includes drop); requires mode: act */
+  autoApply: PlannerOp[];
+  /** Ops where a reject verdict rejects without owner; requires mode: act */
+  autoReject: PlannerOp[];
+  /** Timeout for verifier runs in seconds */
+  timeoutSeconds: number;
+  /** How many times to retry verifier on transient failure */
+  attempts: number;
 }
 
 export interface PlannerSettings {
@@ -427,7 +443,18 @@ export function parsePlannerConfig(raw: unknown, project: ProjectConfig): Planne
       promptFile: v.prompt_file,
       maxRunsPerDay: v.max_runs_per_day,
       skipOps: v.skip_ops,
+      autoApply: v.auto_apply,
+      autoReject: v.auto_reject,
+      timeoutSeconds: v.timeout_seconds,
+      attempts: v.attempts,
     };
+    // drop can never be in skip_ops or auto_apply (it needs explicit owner approval)
+    if (verifier.skipOps.includes("drop")) {
+      errors.push("planner.verifier.skip_ops: drop can never be skipped: it needs explicit owner approval");
+    }
+    if (verifier.autoApply.includes("drop")) {
+      errors.push("planner.verifier.auto_apply: drop can never be auto-applied: it needs explicit owner approval");
+    }
   }
 
   for (const name of placeholdersIn([value.work_dir])) {

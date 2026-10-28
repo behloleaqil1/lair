@@ -116,7 +116,8 @@ export type VerifierState = "pending" | "running" | "done" | "failed" | "skipped
 
 export type ProposalStatus = "pending" | "applied" | "rejected" | "declined";
 
-export type VerifierVerdict = "pass" | "fail" | "defer";
+/** Verifier verdicts: approve, reject, unsure (explicitly deferred), or unverified (never checked) */
+export type VerifierVerdict = "approve" | "reject" | "unsure" | "unverified";
 
 export interface ProposalView {
   id: string;
@@ -137,6 +138,8 @@ export interface ProposalView {
   verifierVerdict: VerifierVerdict | null;
   /** The verifier's reason for its verdict */
   verifierReason: string | null;
+  /** Evidence the verifier cited (e.g., "gh pr view 194: MERGED 2026-10-23") */
+  verifierEvidence: string[] | null;
 }
 
 /**
