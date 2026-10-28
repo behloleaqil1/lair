@@ -140,6 +140,19 @@ const AgentSchema = z
   })
   .strict();
 
+const VerifierSchema = z
+  .object({
+    /** The verifier agent: a known agent, not one fill starts, not the planner agent */
+    id: z.string(),
+    /** Its prompt template, inside prompts_dir */
+    prompt_file: z.string().min(1).max(4096),
+    /** Verifier runs started in any 24 hours */
+    max_runs_per_day: z.number().int().min(1).max(1000).default(48),
+    /** Ops that skip verification and proceed straight to approval rules */
+    skip_ops: z.array(z.enum(PLANNER_OPS)).default(["finish"]),
+  })
+  .strict();
+
 const PlannerSchema = z
   .object({
     enabled: z.boolean().default(false),
@@ -161,6 +174,7 @@ const PlannerSchema = z
     roots: z.array(z.string().min(1).max(4096)).max(20).default([]),
     sources: z.array(SourceSchema).max(20).default([]),
     agent: AgentSchema.optional(),
+    verifier: VerifierSchema.optional(),
     approval: z
       .object({
         add: Approval.default("never"),
@@ -237,6 +251,14 @@ export interface PlannerAgentSettings {
   maxRunsPerDay: number;
 }
 
+export interface VerifierAgentSettings {
+  id: string;
+  promptFile: string;
+  maxRunsPerDay: number;
+  /** Ops that skip verification and proceed straight to approval rules */
+  skipOps: PlannerOp[];
+}
+
 export interface PlannerSettings {
   enabled: boolean;
   mode: PlannerMode;
@@ -252,6 +274,7 @@ export interface PlannerSettings {
   roots: string[];
   sources: SourceSettings[];
   agent: PlannerAgentSettings | null;
+  verifier: VerifierAgentSettings | null;
   approval: Record<PlannerOp, "never" | "always">;
   attemptsPerTask: number;
   maxFailedRuns: number;
@@ -377,6 +400,33 @@ export function parsePlannerConfig(raw: unknown, project: ProjectConfig): Planne
       debounceSeconds: a.debounce_seconds,
       maxProposals: a.max_proposals,
       maxRunsPerDay: a.max_runs_per_day,
+    };
+  }
+
+  let verifier: VerifierAgentSettings | null = null;
+  if (value.verifier) {
+    const v = value.verifier;
+    if (!isValidDragonId(v.id)) errors.push(`planner.verifier.id: ${v.id || "(empty)"} is not a valid agent id`);
+    else if (!known.has(v.id)) errors.push(`planner.verifier.id: ${v.id} is not one of the project's agents`);
+    if (allowlist.includes(v.id)) {
+      errors.push(`planner.verifier.id: ${v.id} is in agents.fill.agents: the verifier agent must not be an agent fill starts`);
+    }
+    if (agent && v.id === agent.id) {
+      errors.push(`planner.verifier.id: ${v.id} is the planner agent: the verifier must be a different agent`);
+    }
+    if (v.prompt_file.split(/[\\/]/).includes("..")) {
+      errors.push('planner.verifier.prompt_file: a ".." segment is refused (it stays inside prompts_dir)');
+    }
+    for (const name of placeholdersIn([v.prompt_file])) {
+      if (!["prompts_dir", "agent", "task"].includes(name)) {
+        errors.push(`planner.verifier.prompt_file: unknown placeholder {${name}} (allowed: {prompts_dir}, {agent}, {task})`);
+      }
+    }
+    verifier = {
+      id: v.id,
+      promptFile: v.prompt_file,
+      maxRunsPerDay: v.max_runs_per_day,
+      skipOps: v.skip_ops,
     };
   }
 
@@ -523,6 +573,7 @@ export function parsePlannerConfig(raw: unknown, project: ProjectConfig): Planne
       roots,
       sources,
       agent,
+      verifier,
       approval: Object.fromEntries(PLANNER_OPS.map((op) => [op, value.approval[op]])) as Record<PlannerOp, "never" | "always">,
       attemptsPerTask: value.attempts_per_task,
       maxFailedRuns: value.max_failed_runs,

@@ -106,9 +106,17 @@ export interface PlannerRunView {
   applied: number;
   pending: number;
   rejected: number;
+  /** Verification state: "pending", "running", "done", "failed", or null if not configured */
+  verifierState: VerifierState | null;
+  /** The verifier agent's run id */
+  verifierRunId: string | null;
 }
 
+export type VerifierState = "pending" | "running" | "done" | "failed" | "skipped";
+
 export type ProposalStatus = "pending" | "applied" | "rejected" | "declined";
+
+export type VerifierVerdict = "pass" | "fail" | "defer";
 
 export interface ProposalView {
   id: string;
@@ -125,6 +133,10 @@ export interface ProposalView {
   decidedBy: string | null;
   decidedAt: string | null;
   createdAt: string;
+  /** The verifier's verdict, if verification ran */
+  verifierVerdict: VerifierVerdict | null;
+  /** The verifier's reason for its verdict */
+  verifierReason: string | null;
 }
 
 /**

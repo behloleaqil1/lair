@@ -209,6 +209,74 @@ picked up again from the agents store after a restart; pending approvals stay pe
 Lair was down are delivered when it starts. `PlannerManager.reloadProject()` has the shape of the other modules'
 (stop the project's service, start it from the new config, leave the others alone).
 
+## Verification
+
+After a planner run passes Lair's checks (the schema, task-id rules, allowlist, bounds), a **verifier run** reviews
+each accepted proposal against the project's actual state before the owner is asked. The verifier is a second agent
+that reads the same context the planner saw plus the proposals and returns per-proposal verdicts. It catches what
+rules can't: a proposal that sounds reasonable but conflicts with what's actually in the codebase.
+
+### Verifier agent
+
+The verifier is configured in `planner.verifier` with the same shape as `planner.agent`: an agent id (must be a known
+agent, must not be in `agents.fill.agents`, must not be the planner agent), a prompt template, bounds on runs per day,
+interval and debounce (the last two unused for now; one verifier run per planner run). When not configured, proposals
+proceed directly to approval as before.
+
+Its prompt is the template file, then a section Lair writes: the verdicts file path, the schema, the rules, and the
+context bundle extended with the planner run's accepted proposals (those not yet refused by checks). JSON in a fenced
+block, introduced as data. The bundle is written to `context.json` in a subdirectory of the planner run's directory
+(`verify/`), which also holds the verdicts file. The same bounds apply: 256 KB max, must be a regular file inside
+that directory, valid JSON.
+
+### Verdicts
+
+The verifier writes a JSON file:
+
+```json
+{"verdicts": [{"proposal": 0, "verdict": "pass", "reason": "the plan shows feat-search ready"}]}
+```
+
+Each item names a proposal by its index (0-based, in the order the planner proposed them) and one of three verdicts:
+
+- **pass**: the proposal makes sense in context. If its op has `approval: never`, it applies without asking the
+  owner; otherwise it waits as usual.
+- **fail**: the proposal conflicts with reality (the task is actually done, the dependency isn't ready, the scope is
+  wrong). The proposal is refused with the verifier's reason.
+- **defer**: the verifier can't tell; the owner decides even when `approval: never` (turned into `always` for this
+  proposal).
+
+An accepted proposal without a verdict is treated as `defer` (the verifier said nothing about it). A verdict for a
+proposal the checks already refused is ignored. The verifier's text (reason) only ever becomes part of the stored
+refusal or a note in the decision; it never reaches any prompt.
+
+### Applying with verification
+
+After the verifier run ends:
+
+1. Each verdict is recorded on its proposal (`verifier_verdict`, `verifier_reason`).
+2. For each accepted proposal (not refused by checks):
+   - `fail`: the proposal is refused, with the verifier's reason as the refusal.
+   - `pass` and `approval: never`: the proposal is applied without asking.
+   - `pass` and `approval: always`, or `defer`: the proposal waits for the owner.
+3. If proposals wait, the decision shows them with their verdicts ("the verifier passed 2, deferred 1, failed 1").
+
+The decision context lists each proposal with its verdict and reason, so the owner knows what the verifier thought.
+
+### What the verifier can't do
+
+The same restrictions as the planner agent: it can't edit the tasks file (Lair keeps the content), it can't reach a
+worker's prompt (its reason text stays in the store and the decision), and it can't pass off an arbitrary file as
+verdicts (path-checked, bounded, schema-checked). A malformed verdicts file fails the verifier run; the proposals
+proceed as if the verifier said `defer` for all of them (the owner sees a note), and after `max_failed_runs` verifier
+failures the owner is asked once ("disable verifier" or "retry").
+
+### Skipping verification
+
+Verification runs only when `planner.verifier` is configured. A project that doesn't need it leaves the block out.
+The verifier can also be disabled per-op: `planner.verifier.skip_ops` lists ops that bypass the verifier and proceed
+straight to approval rules (default: `["finish"]` — a finish has no plan context to verify).
+
 ## Not built
 
 Task cards with acceptance criteria and size budgets, a dependency graph across documents, stacked-branch rebases,

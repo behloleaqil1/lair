@@ -18,12 +18,14 @@ import type {
   ProposalStatus,
   ProposalView,
   TriggerView,
+  VerifierState,
+  VerifierVerdict,
 } from "../../shared/planner-types.js";
 
-/** 1: state, runs, proposals, changes, attempts. */
-export const SCHEMA_VERSION = 1;
+/** 2: added verifier columns to runs and proposals. */
+export const SCHEMA_VERSION = 2;
 
-const SCHEMA = `
+const SCHEMA_V1 = `
   CREATE TABLE IF NOT EXISTS planner_state (
     project TEXT NOT NULL,
     key TEXT NOT NULL,
@@ -96,6 +98,15 @@ const SCHEMA = `
   );
 `;
 
+const MIGRATE_V1_TO_V2 = `
+  ALTER TABLE planner_runs ADD COLUMN verifier_state TEXT;
+  ALTER TABLE planner_runs ADD COLUMN verifier_run_id TEXT;
+  ALTER TABLE planner_runs ADD COLUMN verifier_chain_id TEXT;
+  ALTER TABLE planner_runs ADD COLUMN verifier_task TEXT;
+  ALTER TABLE planner_proposals ADD COLUMN verifier_verdict TEXT;
+  ALTER TABLE planner_proposals ADD COLUMN verifier_reason TEXT;
+`;
+
 export interface StoredRun {
   id: string;
   project: string;
@@ -111,6 +122,14 @@ export interface StoredRun {
   detail: string;
   tampered: boolean;
   decisionId: string | null;
+  /** Verification state: "pending", "running", "done", "failed", "skipped", or null if not configured */
+  verifierState: VerifierState | null;
+  /** The verifier agent's run id (the chain's first run) */
+  verifierRunId: string | null;
+  /** The verifier's chain id */
+  verifierChainId: string | null;
+  /** The verifier's task id */
+  verifierTask: string | null;
 }
 
 export interface StoredProposal {
@@ -128,6 +147,10 @@ export interface StoredProposal {
   decidedBy: string | null;
   decidedAt: number | null;
   createdAt: number;
+  /** The verifier's verdict: "pass", "fail", "defer", or null */
+  verifierVerdict: VerifierVerdict | null;
+  /** The verifier's reason for its verdict */
+  verifierReason: string | null;
 }
 
 export interface ChangeInput {
@@ -161,6 +184,10 @@ interface RunRow {
   detail: string;
   tampered: number;
   decision_id: string | null;
+  verifier_state: string | null;
+  verifier_run_id: string | null;
+  verifier_chain_id: string | null;
+  verifier_task: string | null;
 }
 
 interface ProposalRow {
@@ -178,6 +205,8 @@ interface ProposalRow {
   decided_by: string | null;
   decided_at: number | null;
   created_at: number;
+  verifier_verdict: string | null;
+  verifier_reason: string | null;
 }
 
 interface ChangeRow {
@@ -212,6 +241,10 @@ function toRun(row: RunRow): StoredRun {
     detail: row.detail,
     tampered: row.tampered === 1,
     decisionId: row.decision_id,
+    verifierState: row.verifier_state as VerifierState | null,
+    verifierRunId: row.verifier_run_id,
+    verifierChainId: row.verifier_chain_id,
+    verifierTask: row.verifier_task,
   };
 }
 
@@ -231,6 +264,8 @@ function toProposal(row: ProposalRow): StoredProposal {
     decidedBy: row.decided_by,
     decidedAt: row.decided_at,
     createdAt: row.created_at,
+    verifierVerdict: row.verifier_verdict as VerifierVerdict | null,
+    verifierReason: row.verifier_reason,
   };
 }
 
@@ -249,6 +284,8 @@ export function proposalView(p: StoredProposal): ProposalView {
     decidedBy: p.decidedBy,
     decidedAt: p.decidedAt === null ? null : iso(p.decidedAt),
     createdAt: iso(p.createdAt),
+    verifierVerdict: p.verifierVerdict,
+    verifierReason: p.verifierReason,
   };
 }
 
@@ -267,8 +304,12 @@ export class PlannerStore {
       this.db.pragma("busy_timeout = 5000");
     }
     const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version < SCHEMA_VERSION) {
-      this.db.exec(SCHEMA);
+    if (version < 1) {
+      this.db.exec(SCHEMA_V1);
+      this.db.pragma("user_version = 1");
+    }
+    if (version < 2) {
+      this.db.exec(MIGRATE_V1_TO_V2);
       this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
     }
   }
@@ -305,8 +346,8 @@ export class PlannerStore {
     this.db
       .prepare(
         `INSERT INTO planner_runs (id, project, state, agent, task, agent_run_id, chain_id, dir, triggers, requested_at,
-           ended_at, detail, tampered, decision_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           ended_at, detail, tampered, decision_id, verifier_state, verifier_run_id, verifier_chain_id, verifier_task)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         run.id,
@@ -323,6 +364,10 @@ export class PlannerStore {
         run.detail,
         run.tampered ? 1 : 0,
         run.decisionId,
+        run.verifierState,
+        run.verifierRunId,
+        run.verifierChainId,
+        run.verifierTask,
       );
   }
 
@@ -330,9 +375,22 @@ export class PlannerStore {
     this.db
       .prepare(
         `UPDATE planner_runs SET state = ?, agent_run_id = ?, chain_id = ?, ended_at = ?, detail = ?, tampered = ?,
-           decision_id = ? WHERE id = ?`,
+           decision_id = ?, verifier_state = ?, verifier_run_id = ?, verifier_chain_id = ?, verifier_task = ? WHERE id = ?`,
       )
-      .run(run.state, run.agentRunId, run.chainId, run.endedAt, run.detail, run.tampered ? 1 : 0, run.decisionId, run.id);
+      .run(
+        run.state,
+        run.agentRunId,
+        run.chainId,
+        run.endedAt,
+        run.detail,
+        run.tampered ? 1 : 0,
+        run.decisionId,
+        run.verifierState,
+        run.verifierRunId,
+        run.verifierChainId,
+        run.verifierTask,
+        run.id,
+      );
   }
 
   getRun(id: string): StoredRun | null {
@@ -386,6 +444,8 @@ export class PlannerStore {
       applied: n("applied"),
       pending: n("pending"),
       rejected: n("rejected") + n("declined"),
+      verifierState: run.verifierState,
+      verifierRunId: run.verifierRunId,
     };
   }
 
@@ -396,8 +456,8 @@ export class PlannerStore {
     this.db
       .prepare(
         `INSERT INTO planner_proposals (id, project, run_id, idx, op, task, agent, text, reason, status, refusal,
-           decided_by, decided_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           decided_by, decided_at, created_at, verifier_verdict, verifier_reason)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         stored.id,
@@ -414,6 +474,8 @@ export class PlannerStore {
         stored.decidedBy,
         stored.decidedAt,
         stored.createdAt,
+        stored.verifierVerdict,
+        stored.verifierReason,
       );
     return stored;
   }
@@ -422,6 +484,12 @@ export class PlannerStore {
     this.db
       .prepare(`UPDATE planner_proposals SET status = ?, decided_by = ?, decided_at = ?, refusal = COALESCE(?, refusal) WHERE id = ?`)
       .run(status, by, at, refusal, id);
+  }
+
+  setVerifierVerdict(id: string, verdict: VerifierVerdict, reason: string | null): void {
+    this.db
+      .prepare(`UPDATE planner_proposals SET verifier_verdict = ?, verifier_reason = ? WHERE id = ?`)
+      .run(verdict, reason, id);
   }
 
   getProposal(id: string): StoredProposal | null {

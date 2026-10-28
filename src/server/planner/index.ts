@@ -20,9 +20,10 @@ export { PlannerService, PlannerError, DECISION_MODULE } from "./service.js";
 export { plannerAgentsFrom } from "./agents.js";
 export type { PlannerAgents } from "./agents.js";
 export { parsePlannerConfig } from "./config.js";
-export type { PlannerSettings } from "./config.js";
+export type { PlannerSettings, VerifierAgentSettings } from "./config.js";
 export { PlannerStore } from "./store.js";
 export { registerPlannerRoutes } from "./routes.js";
+export { parseVerdicts, readVerdictsFile, verifierSection, VERDICTS_FILE } from "./verifier.js";
 
 export interface MountPlannerOptions extends PlannerManagerOptions {
   projects: ProjectEntry[];
