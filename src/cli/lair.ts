@@ -18,6 +18,8 @@ import { EXIT_USAGE, reviewSubmit, USAGE } from "./review-submit.js";
 import { OPS_MCP_USAGE, runOpsMcp } from "./ops-mcp.js";
 import { OPS_CALL_USAGE, opsCall } from "./ops-call.js";
 import { ANSWER_USAGE, supervisorAnswer } from "./supervisor-answer.js";
+import { BUS_MCP_USAGE, runBusMcp } from "./bus-mcp.js";
+import { USAGE as BUS_USAGE, busCli } from "./bus.js";
 
 async function main(argv: string[]): Promise<number> {
   const [command, subcommand, ...rest] = argv;
@@ -52,7 +54,22 @@ async function main(argv: string[]): Promise<number> {
       err: (line) => process.stderr.write(`${line}\n`),
     });
   }
-  process.stderr.write(`${USAGE}\n\n${OPS_MCP_USAGE}\n\n${OPS_CALL_USAGE}\n\n${ANSWER_USAGE}\n`);
+  if (command === "bus-mcp" && subcommand === undefined) {
+    return runBusMcp({
+      env: process.env,
+      fetch: (url, init) => fetch(url, init),
+      err: (line) => process.stderr.write(`${line}\n`),
+    });
+  }
+  if (command === "bus") {
+    return busCli(subcommand ? [subcommand, ...rest] : [], {
+      env: process.env,
+      fetch: (url, init) => fetch(url, init),
+      out: (line) => process.stdout.write(`${line}\n`),
+      err: (line) => process.stderr.write(`${line}\n`),
+    });
+  }
+  process.stderr.write(`${USAGE}\n\n${OPS_MCP_USAGE}\n\n${OPS_CALL_USAGE}\n\n${ANSWER_USAGE}\n\n${BUS_MCP_USAGE}\n\n${BUS_USAGE}\n`);
   return EXIT_USAGE;
 }
 
