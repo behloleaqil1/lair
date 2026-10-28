@@ -278,15 +278,24 @@ Library modules with tests, not exposed through the API yet:
 
 ### Client (`src/client/`)
 
-React-based frontend built with Vite. No UI framework: CSS variables in `App.css` (a dark scheme, and a light one when the system asks for it), one table component and one detail panel.
+React-based frontend built with Vite. No UI framework: its own component kit (`ui/`) on design tokens (`ui/tokens.css`), with light, dark and system themes and two densities ([settings-v2.md](design/settings-v2.md), "Look and feel").
 
 - **`main.tsx`**: entry point
-- **`App.tsx`**: the header (project), the command bar, the nav of sections and the section the URL names; old view ids in the URL are replaced by their section (`router.ts`)
+- **`App.tsx`**: the shell: a left nav (the project switcher at the top; the sections; Lair's status, the owner's state, the theme and the density at the bottom; folded behind a Menu button on a narrow screen), the command bar, and the section the URL names; old view ids in the URL are replaced by their section (`router.ts`)
 - **`router.ts`**: hash routes, one per section with an optional tab and open detail: `#/work/<agent>`, `#/gates/<id>?tab=triage`, `#/prs/<n>`, `#/decisions/<id>`, `#/machines/<name>`; `&project=<name>` when the server has several projects. `LEGACY_VIEWS` maps the old views (Dragons, Agents, Reviews, Nodes, Health, Activity, Triage, Owner messages, Orchestrator) to where each went; `#owner-token=` (the setup link) is not a route and is left alone
 - **`nav.ts`**: the sections and their tabs, and which the nav shows: a section or tab whose module is off for the project (`GET /api/dashboard/modules`) is hidden, and opened by its URL it says what to set to turn it on
 - **`time.ts`**: "5 min ago", with the absolute time on hover (`<Time>`); durations
-- **`table.ts`**: the sort and keyboard rules of `DataTable`
-- **`App.css`**: styles
+- **`table.ts`**: the sort and keyboard rules of the kit's `Table`
+- **`crumbs.ts`**: a detail's breadcrumbs (its section and tab, from the URL)
+- **`App.css`**: the shell's and the views' own classes, on the tokens
+
+#### The component kit (`ui/`)
+
+- **`tokens.css`**, **`tokens.ts`**: colour (a neutral base, one accent, success, warning, danger and info), a 4 px spacing scale, type (the system UI and monospace stacks: no font is downloaded), radius, elevation, motion and layers; the light and dark themes and the compact density. `tokens.test.ts` computes the AA contrast of each theme's text, status and border pairs from the values
+- **`preferences.ts`**: the theme (system, light, dark) and density, kept in `localStorage` when the browser allows it, set as `data-theme` and `data-density` on `<html>` (`index.html` sets them before the first paint)
+- **`base.css`**, **`kit.css`**: the page and the components; reduced motion turns every transition off
+- `Button` and `ButtonLink`, `Field` (label, help, error) with `Input` and `TextArea`, `Select`, `Combobox`, `Switch`, `Table` (sortable, sticky header), `Badge` and `StatusBadge` (an icon and a word with every status colour), `Drawer` and `Dialog` (modal: focus in, Tab kept inside, Esc closes, focus back; `focus.ts`), `Tabs` and `TabLinks`, `Toast`, `Tooltip`, `EmptyState`, `CodeBlock`, `Skeleton`, `PageHeader` and `Breadcrumbs`, `Card` and `Callout`, `Icon`
+- **`a11y.test.tsx`** (in `src/client/`): renders the app in jsdom with the fixture answers of `a11y-fixtures.ts` and runs axe on the views it lists, signed in and out; serious and critical violations fail CI
 
 | Section | What it shows | Detail (a row's click, Enter or Space) |
 |---|---|---|
@@ -302,9 +311,9 @@ Logs and test output are the owner's: a detail asks for them only once this brow
 
 #### Components (`components/`)
 
-- **`Section.tsx`**: the props every section gets, and its header (title and tab links)
-- **`DataTable.tsx`**: the one table: sortable headers, rows that open their detail, arrow keys between rows
-- **`DetailPanel.tsx`**: the side panel a detail opens in: it takes the focus and gives it back, Esc closes it, Tab stays inside
+- **`Section.tsx`**: the props every section gets, and its header (the kit's `PageHeader`: title, actions and tab links)
+- **`DataTable.tsx`**: the kit's `Table` under its older name: sortable headers, rows that open their detail, arrow keys between rows
+- **`DetailPanel.tsx`**: a detail, in the kit's `Drawer` with breadcrumbs back to its section: it takes the focus and gives it back, Esc closes it, Tab stays inside
 - **`ui.tsx`**: `Time`, the loading, error and empty states (each says what to do), `ModuleOff`, `KeyValues`, `Tabs`, `OwnerOnlyNotice`, `useOwnerSignedIn`
 - **`Home.tsx`**, **`LiveFeed.tsx`**, **`Activity.tsx`**, **`Health.tsx`**: Home, its recent activity (the bus's reports, linked to their agent, gate and PR), the Activity tab (bus reports and the control audit log) and the Health tab (watchdog SLOs, breaches, playbook runs)
 - **`Work.tsx`**, **`AgentDetail.tsx`**, **`StartRunForm.tsx`**, **`Budget.tsx`**, **`Planner.tsx`** (its tab: sources, open tasks, the planner agent, proposals to approve or reject, runs and history; requests in `planner-api.ts`), **`DragonStartDialog.tsx`**, **`DragonStopDialog.tsx`**: Work, an agent's detail (`AgentDetailView` renders what `AgentDetail` reads), the owner's "Start a run" (`agents-actions.ts`), budget lines, and the start and stop commands of a project's own launcher (`dragon-view.ts`, `dragon-start.ts`)
