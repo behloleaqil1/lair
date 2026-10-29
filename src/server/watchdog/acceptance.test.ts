@@ -1597,19 +1597,19 @@ describe("12. orphan claim: live pid that doesn't match the pattern", () => {
     // Create claim with pid=4999 for worker-b
     const claimDir = join(h.agentsDir, "worker-b.running");
     mkdirSync(claimDir, { recursive: true });
-    // The claim says pid 4999, started at 11:00:00 (20 minutes ago from NOW)
+    // The claim says pid 4999, started at 11:00:00 (60 minutes ago from NOW=12:00:00)
     writeFileSync(join(claimDir, "pid"), "pid=4999\nstarted=2026-03-02T11:00:00.000Z\n");
     const t = new Date(NOW - 20 * 60 * 1000);
     utimesSync(claimDir, t, t);
 
-    // Pid 4999 IS alive, has the RIGHT uptime (20 minutes), but the command doesn't contain worker-b
+    // Pid 4999 IS alive, has the RIGHT uptime (60 minutes = since 11:00:00), but the command doesn't contain worker-b
     // This simulates an agent started via a different path/wrapper
-    h.procs.add(4999, "/usr/bin/some-wrapper-script", { upMinutes: 20 });
+    h.procs.add(4999, "/usr/bin/some-wrapper-script", { upMinutes: 60 });
 
     await h.wd.tick();
 
-    // The start time matches (both 20 min), so we trust it's the original process even though
-    // the command pattern doesn't match. The agent could have been started with a different
+    // The start time matches (process started at 11:00:00, claim says 11:00:00), so we trust it's the original
+    // process even though the command pattern doesn't match. The agent could have been started with a different
     // command than watchdog.agent_command.
     expect(breaches(h)).toHaveLength(0);
     expect(h.runner.calls).toEqual([]);
