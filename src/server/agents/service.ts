@@ -349,6 +349,7 @@ export const MODULE_RUN_VARIABLES: readonly string[] = [
   "LAIR_URL",
   "LAIR_OPS_TOKEN",
   "LAIR_SUPERVISOR_CONVERSATION",
+  "LAIR_BUS_TOKEN",
 ];
 const MAX_RUN_VARIABLE_CHARS = 1000;
 
@@ -380,6 +381,10 @@ export interface AgentsServiceOptions {
   events?: EventBus;
   /** Whether a tool is signed in on this machine (src/server/ai/): a signed-out tool starts nothing here */
   tools?: ToolReadiness;
+  /** Mint a bus token for a run. Returns the plaintext token (to give to the agent) and stores its hash. */
+  mintBusToken?: (runId: string, agent: string) => string;
+  /** Revoke a run's bus token when the run ends */
+  revokeBusToken?: (runId: string) => void;
 }
 
 interface EventInput {
@@ -405,6 +410,8 @@ export class AgentsService {
   private budget?: FleetBudget;
   private events?: EventBus;
   private tools?: ToolReadiness;
+  private mintBusToken?: (runId: string, agent: string) => string;
+  private revokeBusToken?: (runId: string) => void;
   private watchdogSettings: WatchdogSettings;
   private watchdogStore: WatchdogStore | null = null;
   private unsubscribe: (() => void) | null = null;
@@ -432,6 +439,8 @@ export class AgentsService {
     this.budget = options.budget;
     this.events = options.events;
     this.tools = options.tools;
+    this.mintBusToken = options.mintBusToken;
+    this.revokeBusToken = options.revokeBusToken;
     this.watchdogSettings = watchdogSettingsFor(options.config, options.settings.hungMinutes);
     // Usage reaches the per-agent and per-project budgets through the fleet budget
     this.unsubscribe =
@@ -1300,6 +1309,10 @@ export class AgentsService {
     if (adapter?.session_id_env && !adapter.session_id_env.toUpperCase().startsWith("LAIR_")) {
       own[adapter.session_id_env] = run.sessionId;
     }
+    // Mint a bus token for this run (the token itself is never logged or stored)
+    if (this.mintBusToken) {
+      own.LAIR_BUS_TOKEN = this.mintBusToken(run.id, run.agent);
+    }
     return agentEnvironment(process.env, this.settings.envPassthrough, own);
   }
 
@@ -1801,6 +1814,8 @@ export class AgentsService {
     run.waitingLock = undefined;
     this.releaseRunLocks(run);
     if (releaseClaim) this.store.releaseClaim(this.project, run.task, run.id);
+    // Revoke the run's bus token so it can't be used after the run ends
+    this.revokeBusToken?.(run.id);
     this.store.saveRun(run);
     t.summary.ended++;
     if (state === "completed") {

@@ -67,6 +67,8 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  vi.setSystemTime(new Date(FIXTURE_NOW));
   vi.stubGlobal("fetch", fixtureFetch());
   vi.stubGlobal("EventSource", InertEventSource);
   vi.stubGlobal("WebSocket", InertWebSocket);
@@ -80,6 +82,7 @@ afterEach(() => {
   host?.remove();
   root = null;
   host = null;
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });

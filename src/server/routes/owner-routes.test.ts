@@ -12,19 +12,21 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { HumanAuth, OWNER_SESSION_HEADER, registerOwnerRoutes } from "../human-auth/index.js";
-import { BusStorage } from "../../bus/storage.js";
+import { getBusStore, closeBusStores } from "../bus/store.js";
 import { getStore, closeStore } from "../store/store.js";
 import { getScheduler, stopScheduler } from "../scheduler/scheduler.js";
 import { getBudgetManager, resetBudgetManager } from "../fleet/budget.js";
 import { getSupervisor } from "../services/supervisor.js";
 import { registerControlRoutes } from "./controls.js";
-import { registerBusRoutes } from "./bus.js";
+import { registerBusRoutes, type BusRoutesOptions } from "./bus.js";
 import { registerProcessRoutes } from "./processes.js";
 import { registerSettingsRoutes } from "./settings.js";
 import { registerSchedulerRoutes } from "./scheduler.js";
 import { registerFleetRoutes } from "./fleet.js";
 import { signIn } from "../../client/owner-session";
 import { processAction, runCommand, sendBusMessage, startDragon } from "../../client/owner-actions";
+import { loadProjectConfig } from "../config.js";
+import type { AgentsManager } from "../agents/index.js";
 
 const DATA = join(process.cwd(), "data");
 const TMP = join(DATA, "test-owner-routes");
@@ -78,13 +80,28 @@ beforeAll(async () => {
   // The scheduler reads the global store: keep it in memory, out of data/lair.db
   getStore({ dbPath: ":memory:" });
 
+  // Mock agents manager for bus routes
+  const mockAgentsManager = (): AgentsManager => ({
+    get: () => null,
+    getStore: () => null,
+  } as unknown as AgentsManager);
+
+  const busOptions: BusRoutesOptions = {
+    agents: mockAgentsManager(),
+    dataDir: TMP,
+    getConfig: (project: string) => {
+      const config = loadProjectConfig(project);
+      return { ...config, mail_dir: undefined, wake_file: undefined };
+    },
+  };
+
   app = Fastify({ logger: false });
   // The owner's credential, as src/server/index.ts wires it; app.close() closes it
   const tokenPath = join(TMP, "owner.token");
   const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
   await registerOwnerRoutes(app, auth);
   await registerControlRoutes(app, auth);
-  await registerBusRoutes(app, auth);
+  await registerBusRoutes(app, auth, busOptions);
   await registerProcessRoutes(app, auth);
   await registerSettingsRoutes(app, auth);
   await registerSchedulerRoutes(app, auth);
@@ -103,6 +120,7 @@ afterAll(async () => {
   await app.close();
   stopScheduler();
   closeStore();
+  closeBusStores();
   resetBudgetManager();
   rmSync(PROJECT_FILE, { force: true });
   for (const file of existsSync(LOCAL_DIR) ? readdirSync(LOCAL_DIR) : []) {
@@ -189,19 +207,20 @@ describe("controls: commands and dragon start/stop", () => {
 });
 
 describe("bus: messages sent as the owner", () => {
-  async function unread(agent: string) {
-    const storage = new BusStorage(PROJECT, DATA);
-    await storage.init();
-    try {
-      return storage.getUnreadMessages(agent);
-    } finally {
-      storage.close();
-    }
+  function unread(agent: string) {
+    // Read from the server-owned bus store
+    const store = getBusStore(PROJECT, join(TMP, "bus"));
+    const now = Date.now();
+    return store.getUnreadMessages(agent, now).map((m) => ({
+      from_id: m.fromId,
+      to_id: m.toId,
+      text: m.text,
+    }));
   }
 
   it("refuses a message without the owner's session, and sends nothing", async () => {
     expectRefused(await post(`/api/bus/send${p}`, { to: "orchestrator", text: "refused" }));
-    expect(await unread("orchestrator")).toEqual([]);
+    expect(unread("orchestrator")).toEqual([]);
     expect((await app.inject({ url: `/api/bus/board${p}` })).statusCode).toBe(200);
   });
 
@@ -210,7 +229,7 @@ describe("bus: messages sent as the owner", () => {
     await signIn(ownerToken);
     const sent = await sendBusMessage(PROJECT, "worker-a", "rebase on main");
     expect(sent).toMatchObject({ success: true, data: { to: "worker-a" } });
-    expect(await unread("worker-a")).toMatchObject([{ from_id: "owner", to_id: "worker-a", text: "rebase on main" }]);
+    expect(unread("worker-a")).toMatchObject([{ from_id: "owner", to_id: "worker-a", text: "rebase on main" }]);
   });
 });
 

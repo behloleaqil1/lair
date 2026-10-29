@@ -285,7 +285,10 @@ export type EventType =
   | "planner.blocked"
   | "planner.tasks_file_restored"
   | "planner.verifier_started"
-  | "planner.verifier_finished";
+  | "planner.verifier_finished"
+  // Bus (src/server/bus/)
+  | "bus.report"
+  | "bus.message";
 
 /** Event stored in the database */
 export interface Event {
