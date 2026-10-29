@@ -7,6 +7,7 @@ import { spawn } from "child_process";
 import { closeSync, mkdirSync, openSync } from "fs";
 import { dirname } from "path";
 import { systemProbes, type ProcessInfo, type Probes } from "../watchdog/probes.js";
+import { CachedProcessTable, type ProcessCache } from "../core/process-cache.js";
 
 /** A process identity that survives pid reuse: the pid and when that process started. */
 export interface ProcessOwner {
@@ -230,6 +231,17 @@ export class ChildProcessSpawner implements ProcessSpawner {
 export function systemAgentProbes(commandTimeoutMs = 30_000): AgentProbes {
   return {
     ...systemProbes(commandTimeoutMs),
+    spawner: new ChildProcessSpawner(),
+    self: { pid: process.pid, startedAt: Date.now() - Math.round(process.uptime() * 1000) },
+  };
+}
+
+/** The real probes, using the shared process cache for better performance under load. */
+export function systemAgentProbesWithCache(cache: ProcessCache, commandTimeoutMs = 30_000): AgentProbes {
+  const base = systemProbes(commandTimeoutMs);
+  return {
+    ...base,
+    processes: new CachedProcessTable(cache),
     spawner: new ChildProcessSpawner(),
     self: { pid: process.pid, startedAt: Date.now() - Math.round(process.uptime() * 1000) },
   };

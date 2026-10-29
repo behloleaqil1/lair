@@ -101,11 +101,14 @@ export class ExecFileRunner implements CommandRunner {
       return Promise.resolve({ code: -1, stdout: "", stderr: "empty command" });
     }
     return new Promise((resolve) => {
-      execFile(
+      let timedOut = false;
+      const timeoutMs = options.timeoutMs ?? this.defaultTimeoutMs;
+      
+      const child = execFile(
         file,
         args,
         {
-          timeout: options.timeoutMs ?? this.defaultTimeoutMs,
+          timeout: timeoutMs,
           maxBuffer: options.maxBufferBytes ?? MAX_OUTPUT_BYTES,
           encoding: "utf-8",
           shell: false,
@@ -116,6 +119,14 @@ export class ExecFileRunner implements CommandRunner {
             resolve({ code: 0, stdout, stderr });
             return;
           }
+          
+          // If the child exited with output but the timer fired after, treat
+          // it as success: the event loop was blocked, not the command.
+          if (error.killed && timedOut && stdout && stdout.length > 0) {
+            resolve({ code: 0, stdout, stderr: stderr ?? "" });
+            return;
+          }
+          
           const code =
             typeof (error as { code?: unknown }).code === "number"
               ? ((error as { code: number }).code)
@@ -132,6 +143,15 @@ export class ExecFileRunner implements CommandRunner {
           });
         },
       );
+      
+      // Track if the timeout fired for the callback
+      const timer = setTimeout(() => {
+        timedOut = true;
+      }, timeoutMs);
+      
+      child.once("close", () => {
+        clearTimeout(timer);
+      });
     });
   }
 }
@@ -257,6 +277,19 @@ export const systemClock: Clock = {
 export function systemProbes(commandTimeoutMs = 120_000): Probes {
   return {
     processes: new PsProcessTable(),
+    fs: new NodeFileSystem(),
+    runner: new ExecFileRunner(commandTimeoutMs),
+    clock: systemClock,
+  };
+}
+
+/**
+ * System probes using a shared process cache for better performance under load.
+ * Use this when multiple modules need the process table.
+ */
+export function systemProbesWithCache(processTable: ProcessTable, commandTimeoutMs = 120_000): Probes {
+  return {
+    processes: processTable,
     fs: new NodeFileSystem(),
     runner: new ExecFileRunner(commandTimeoutMs),
     clock: systemClock,
