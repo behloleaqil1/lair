@@ -212,7 +212,7 @@ describe("Combobox", () => {
         options={["claude-opus", "claude-sonnet", "kiro"]}
         value={value}
         allowCustom={allowCustom}
-        onChange={(v) => {
+        onChange={(v: string) => {
           setValue(v);
           onPick?.(v);
         }}

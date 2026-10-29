@@ -8,7 +8,7 @@
  */
 import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { searchSettings, type SearchEntry } from "../settings-search";
-import { moveHighlight } from "../ui/combobox";
+import { moveHighlight } from "../ui/combobox-utils";
 import { Icon } from "../ui/Icon";
 
 export interface SettingsSearchProps {

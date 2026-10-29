@@ -20,7 +20,7 @@ import { Switch } from "./Switch";
 import { Table } from "./Table";
 import { TabLinks, Tabs, tabKeyTarget } from "./Tabs";
 import { Tooltip } from "./Tooltip";
-import { filterOptions, moveHighlight, toOptions } from "./combobox";
+import { filterOptions, moveHighlight, toOptions } from "./combobox-utils";
 import { STATUS, space, toneOf } from "./tokens";
 
 const html = (node: ReactElement) => renderToStaticMarkup(node);

@@ -7,7 +7,7 @@
  * without it, only an option can be picked.
  */
 import { useId, useMemo, useState, type KeyboardEvent } from "react";
-import { filterOptions, moveHighlight, toOptions, type ComboOption } from "./combobox";
+import { filterOptions, moveHighlight, toOptions, type ComboOption } from "./combobox-utils";
 
 export interface ComboboxProps {
   options: readonly (string | ComboOption)[];
