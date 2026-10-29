@@ -2172,6 +2172,95 @@ Unknown keys, a lane on an unknown machine, an unknown class in `limits` or `eli
 
 Events on the bus: `placement.moved`, `placement.would_move`, `placement.move_failed`, `placement.machine_up`, `placement.machine_down`, `placement.job_held`.
 
+## Cleanup
+
+> Off by default. With `enabled: true`, Lair removes stale worktrees and old entries from watched folders. In `observe` mode (the default) it logs what it would remove; in `act` mode it removes.
+
+Agents and gate systems leave checkouts behind: gate snapshots that a runner reuses per track and never deletes, and agent worktrees for PRs merged long ago. Disk fills, file indexing and backups slow down, and nobody knows what is safe to delete. The cleanup module handles this automatically.
+
+```yaml
+cleanup:
+  enabled: true
+  mode: observe              # observe | act
+  interval_seconds: 3600     # how often the cleanup cycle runs (default 1 hour)
+  max_entries_per_cycle: 50  # bound removals per tick
+
+  worktrees:
+    repos:
+      - /Users/dev/my-project
+    after_merge: true
+    min_idle_hours: 24
+
+  retention:
+    - path: /Users/dev/my-project/work/gates/snapshots
+      keep_days: 2
+      kind: worktree
+      skip_if_referenced:
+        - /Users/dev/my-project/work/gates/queue/*.req
+        - /Users/dev/my-project/work/gates/queue/*.req.run
+
+    - path: /Users/dev/my-project/work/gates/results
+      keep_days: 30
+      kind: file
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Enable the cleanup module |
+| `mode` | `observe` \| `act` | `observe` | `observe` logs removals without executing; `act` removes |
+| `interval_seconds` | number | `3600` | Seconds between cleanup cycles |
+| `max_entries_per_cycle` | number | `50` | Maximum entries removed per cycle (safety bound) |
+| `max_seconds_per_cycle` | number | `600` | Maximum seconds per cycle before stopping |
+
+### Worktrees
+
+A worktree of a configured repo is removable when all of these hold: its branch's PR is merged or closed; no uncommitted or untracked changes; every commit is on the remote; no active agent run uses it; nothing in it was modified within `min_idle_hours`; and it isn't the main worktree.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `worktrees.repos` | string[] | `[]` | Paths to repositories whose worktrees are managed |
+| `worktrees.after_merge` | boolean | `true` | Remove worktrees whose branch's PR is merged or closed |
+| `worktrees.min_idle_hours` | number | `24` | Hours since last modification before a worktree is eligible |
+
+### Retention
+
+Each retention entry scans a directory and removes entries older than `keep_days` unless they are referenced.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `retention[].path` | string | required | Directory to scan |
+| `retention[].keep_days` | number | required | Days to keep entries (based on last use, not mtime) |
+| `retention[].kind` | `worktree` \| `dir` \| `file` | required | What the entries are |
+| `retention[].skip_if_referenced` | string[] | `[]` | Glob patterns of files whose content names entries to keep |
+
+For worktree entries, "last use" is the gitdir `HEAD` file's mtime (the last checkout), not the folder's mtime. For example, a gate snapshot directory that is still referenced by a queued gate request file is kept even if it is old.
+
+### Safety
+
+Before removing anything, the cleanup module checks that the path:
+- Resolves to a real path (no broken symlinks)
+- Is inside a configured root (`worktrees.repos` or a `retention[].path`)
+- Is not `/`, `$HOME`, the repository root, or a configured root itself
+- If a symlink, the target is also inside a configured root
+
+Removals are bounded per cycle and time-bounded. Every removal is recorded in the store with its reason and bytes freed.
+
+### Cleanup API
+
+Read-only routes:
+
+| Route | What |
+|-------|------|
+| `GET /api/cleanup/status?project=` | Current mode, last cycle summary, pending entries |
+| `GET /api/cleanup/pending?project=` | Detailed list of what cleanup would remove |
+| `GET /api/cleanup/removals?project=&limit=` | Recent removals |
+| `GET /api/cleanup/cycles?project=&limit=` | Recent cleanup cycles |
+| `GET /api/cleanup/stats?project=` | Summary statistics (all time, 24h, 7d) |
+
+Events on the bus: `cleanup.removed`, `cleanup.cycle`, `cleanup.safety_violation`.
+
+The Health tab shows "Would free N GB (M entries)" in observe mode, and "Last cleanup: freed N GB (M entries)" in act mode, with links to the removals list.
+
 ## Planner
 
 > Off by default. With `enabled: true`, Lair keeps [fill](#fill)'s tasks file itself: it marks tasks done, drops the ones the plan marks done, and runs a supervised planner agent when something happens, whose proposals it checks before anything changes ([design](design/planner.md)). A project then needs no free-running orchestrator agent that edits the tasks file.
