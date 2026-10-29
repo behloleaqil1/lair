@@ -203,18 +203,17 @@ const orphanClaim: Detector = {
         const proc = await view.getProcess(claimPid.pid);
         if (proc !== null) {
           // The pid is alive. Check if it belongs to this agent:
-          // 1. If the claim has a start time, the process uptime should roughly match
-          //    (the process should have been running since approximately that time)
-          // 2. Or, the process command contains the agent id
-          const expectedUptimeMs = claimPid.startedAt !== null ? view.now - claimPid.startedAt : null;
-          const actualUptimeMs = proc.elapsedSeconds * 1000;
-          // Allow 10% tolerance plus 60 seconds for timing differences
-          const toleranceMs = expectedUptimeMs !== null ? Math.max(60000, expectedUptimeMs * 0.1) : 0;
-          const startMatch =
-            expectedUptimeMs !== null &&
-            Math.abs(actualUptimeMs - expectedUptimeMs) <= toleranceMs;
+          // 1. The process start time is NOT significantly after the claim was written
+          //    (if the process started after the claim, it's a reused PID)
+          // 2. Or, the process command contains the agent id or the adapter's program
+          const processStartedAt = view.now - proc.elapsedSeconds * 1000;
+          const claimStartedAt = claimPid.startedAt;
+          // Allow 60 seconds tolerance for timing differences between claim and process start
+          const toleranceMs = 60000;
+          // A reused PID is one where the process started significantly after the claim was written
+          const isReusedByTime = claimStartedAt !== null && processStartedAt > claimStartedAt + toleranceMs;
           const commandMatch = proc.command.includes(claim.agent);
-          if (startMatch || commandMatch) {
+          if (!isReusedByTime || commandMatch) {
             livePid.push(`${claim.agent} (pid ${claimPid.pid})`);
             continue;
           }
