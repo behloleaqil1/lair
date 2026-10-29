@@ -18,12 +18,14 @@ import type {
   ProposalStatus,
   ProposalView,
   TriggerView,
+  VerifierState,
+  VerifierVerdict,
 } from "../../shared/planner-types.js";
 
-/** 1: state, runs, proposals, changes, attempts. */
-export const SCHEMA_VERSION = 1;
+/** 2: added verifier columns to runs and proposals. */
+export const SCHEMA_VERSION = 2;
 
-const SCHEMA = `
+const SCHEMA_V1 = `
   CREATE TABLE IF NOT EXISTS planner_state (
     project TEXT NOT NULL,
     key TEXT NOT NULL,
@@ -96,6 +98,16 @@ const SCHEMA = `
   );
 `;
 
+const MIGRATE_V1_TO_V2 = `
+  ALTER TABLE planner_runs ADD COLUMN verifier_state TEXT;
+  ALTER TABLE planner_runs ADD COLUMN verifier_run_id TEXT;
+  ALTER TABLE planner_runs ADD COLUMN verifier_chain_id TEXT;
+  ALTER TABLE planner_runs ADD COLUMN verifier_task TEXT;
+  ALTER TABLE planner_proposals ADD COLUMN verifier_verdict TEXT;
+  ALTER TABLE planner_proposals ADD COLUMN verifier_reason TEXT;
+  ALTER TABLE planner_proposals ADD COLUMN verifier_evidence TEXT;
+`;
+
 export interface StoredRun {
   id: string;
   project: string;
@@ -111,6 +123,14 @@ export interface StoredRun {
   detail: string;
   tampered: boolean;
   decisionId: string | null;
+  /** Verification state: "pending", "running", "done", "failed", "skipped", or null if not configured */
+  verifierState: VerifierState | null;
+  /** The verifier agent's run id (the chain's first run) */
+  verifierRunId: string | null;
+  /** The verifier's chain id */
+  verifierChainId: string | null;
+  /** The verifier's task id */
+  verifierTask: string | null;
 }
 
 export interface StoredProposal {
@@ -128,6 +148,12 @@ export interface StoredProposal {
   decidedBy: string | null;
   decidedAt: number | null;
   createdAt: number;
+  /** The verifier's verdict: "approve", "reject", "unsure", "unverified", or null */
+  verifierVerdict: VerifierVerdict | null;
+  /** The verifier's reason for its verdict */
+  verifierReason: string | null;
+  /** Evidence the verifier cited */
+  verifierEvidence: string[] | null;
 }
 
 export interface ChangeInput {
@@ -161,6 +187,10 @@ interface RunRow {
   detail: string;
   tampered: number;
   decision_id: string | null;
+  verifier_state: string | null;
+  verifier_run_id: string | null;
+  verifier_chain_id: string | null;
+  verifier_task: string | null;
 }
 
 interface ProposalRow {
@@ -178,6 +208,9 @@ interface ProposalRow {
   decided_by: string | null;
   decided_at: number | null;
   created_at: number;
+  verifier_verdict: string | null;
+  verifier_reason: string | null;
+  verifier_evidence: string | null;
 }
 
 interface ChangeRow {
@@ -212,6 +245,10 @@ function toRun(row: RunRow): StoredRun {
     detail: row.detail,
     tampered: row.tampered === 1,
     decisionId: row.decision_id,
+    verifierState: row.verifier_state as VerifierState | null,
+    verifierRunId: row.verifier_run_id,
+    verifierChainId: row.verifier_chain_id,
+    verifierTask: row.verifier_task,
   };
 }
 
@@ -231,6 +268,9 @@ function toProposal(row: ProposalRow): StoredProposal {
     decidedBy: row.decided_by,
     decidedAt: row.decided_at,
     createdAt: row.created_at,
+    verifierVerdict: row.verifier_verdict as VerifierVerdict | null,
+    verifierReason: row.verifier_reason,
+    verifierEvidence: row.verifier_evidence ? JSON.parse(row.verifier_evidence) : null,
   };
 }
 
@@ -249,6 +289,9 @@ export function proposalView(p: StoredProposal): ProposalView {
     decidedBy: p.decidedBy,
     decidedAt: p.decidedAt === null ? null : iso(p.decidedAt),
     createdAt: iso(p.createdAt),
+    verifierVerdict: p.verifierVerdict,
+    verifierReason: p.verifierReason,
+    verifierEvidence: p.verifierEvidence,
   };
 }
 
@@ -267,8 +310,12 @@ export class PlannerStore {
       this.db.pragma("busy_timeout = 5000");
     }
     const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version < SCHEMA_VERSION) {
-      this.db.exec(SCHEMA);
+    if (version < 1) {
+      this.db.exec(SCHEMA_V1);
+      this.db.pragma("user_version = 1");
+    }
+    if (version < 2) {
+      this.db.exec(MIGRATE_V1_TO_V2);
       this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
     }
   }
@@ -305,8 +352,8 @@ export class PlannerStore {
     this.db
       .prepare(
         `INSERT INTO planner_runs (id, project, state, agent, task, agent_run_id, chain_id, dir, triggers, requested_at,
-           ended_at, detail, tampered, decision_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           ended_at, detail, tampered, decision_id, verifier_state, verifier_run_id, verifier_chain_id, verifier_task)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         run.id,
@@ -323,6 +370,10 @@ export class PlannerStore {
         run.detail,
         run.tampered ? 1 : 0,
         run.decisionId,
+        run.verifierState,
+        run.verifierRunId,
+        run.verifierChainId,
+        run.verifierTask,
       );
   }
 
@@ -330,9 +381,22 @@ export class PlannerStore {
     this.db
       .prepare(
         `UPDATE planner_runs SET state = ?, agent_run_id = ?, chain_id = ?, ended_at = ?, detail = ?, tampered = ?,
-           decision_id = ? WHERE id = ?`,
+           decision_id = ?, verifier_state = ?, verifier_run_id = ?, verifier_chain_id = ?, verifier_task = ? WHERE id = ?`,
       )
-      .run(run.state, run.agentRunId, run.chainId, run.endedAt, run.detail, run.tampered ? 1 : 0, run.decisionId, run.id);
+      .run(
+        run.state,
+        run.agentRunId,
+        run.chainId,
+        run.endedAt,
+        run.detail,
+        run.tampered ? 1 : 0,
+        run.decisionId,
+        run.verifierState,
+        run.verifierRunId,
+        run.verifierChainId,
+        run.verifierTask,
+        run.id,
+      );
   }
 
   getRun(id: string): StoredRun | null {
@@ -367,6 +431,14 @@ export class PlannerStore {
     return rows.map((row) => row.requested_at);
   }
 
+  /** Count verifier runs started after `since` (for max_runs_per_day enforcement). */
+  verifierRunsSince(project: string, since: number): number {
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS n FROM planner_runs WHERE project = ? AND requested_at > ? AND verifier_run_id IS NOT NULL`)
+      .get(project, since) as { n: number };
+    return row.n;
+  }
+
   runView(run: StoredRun): PlannerRunView {
     const counts = this.db
       .prepare(`SELECT status, COUNT(*) AS n FROM planner_proposals WHERE run_id = ? GROUP BY status`)
@@ -386,6 +458,8 @@ export class PlannerStore {
       applied: n("applied"),
       pending: n("pending"),
       rejected: n("rejected") + n("declined"),
+      verifierState: run.verifierState,
+      verifierRunId: run.verifierRunId,
     };
   }
 
@@ -396,8 +470,8 @@ export class PlannerStore {
     this.db
       .prepare(
         `INSERT INTO planner_proposals (id, project, run_id, idx, op, task, agent, text, reason, status, refusal,
-           decided_by, decided_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           decided_by, decided_at, created_at, verifier_verdict, verifier_reason)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         stored.id,
@@ -414,6 +488,8 @@ export class PlannerStore {
         stored.decidedBy,
         stored.decidedAt,
         stored.createdAt,
+        stored.verifierVerdict,
+        stored.verifierReason,
       );
     return stored;
   }
@@ -422,6 +498,12 @@ export class PlannerStore {
     this.db
       .prepare(`UPDATE planner_proposals SET status = ?, decided_by = ?, decided_at = ?, refusal = COALESCE(?, refusal) WHERE id = ?`)
       .run(status, by, at, refusal, id);
+  }
+
+  setVerifierVerdict(id: string, verdict: VerifierVerdict, reason: string | null, evidence: string[] | null): void {
+    this.db
+      .prepare(`UPDATE planner_proposals SET verifier_verdict = ?, verifier_reason = ?, verifier_evidence = ? WHERE id = ?`)
+      .run(verdict, reason, evidence ? JSON.stringify(evidence) : null, id);
   }
 
   getProposal(id: string): StoredProposal | null {
@@ -529,5 +611,29 @@ export class PlannerStore {
 
   resetAttempts(project: string, task: string): void {
     this.db.prepare(`DELETE FROM planner_attempts WHERE project = ? AND task = ?`).run(project, task);
+  }
+
+  /**
+   * Verifier agreement stats for the last 7 days: how often the owner's final
+   * decision matched the verifier's verdict. Only counts proposals the owner
+   * decided (decided_by starts with "owner").
+   */
+  verifierAgreement(project: string, since: number): { agreed: number; total: number } {
+    const rows = this.db
+      .prepare(
+        `SELECT verifier_verdict, status FROM planner_proposals
+         WHERE project = ? AND decided_at > ? AND decided_by LIKE 'owner%' AND verifier_verdict IS NOT NULL`,
+      )
+      .all(project, since) as { verifier_verdict: string; status: string }[];
+
+    let agreed = 0;
+    let total = 0;
+    for (const row of rows) {
+      total++;
+      // Agreement: verifier approved and owner applied, or verifier rejected/unsure and owner declined
+      if (row.verifier_verdict === "approve" && row.status === "applied") agreed++;
+      else if ((row.verifier_verdict === "reject" || row.verifier_verdict === "unsure") && row.status === "declined") agreed++;
+    }
+    return { agreed, total };
   }
 }

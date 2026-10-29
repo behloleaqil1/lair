@@ -17,11 +17,13 @@ import {
   getOverview,
   getProposals,
   getRuns,
+  getVerifierAgreement,
   proposalAction,
   resumeAction,
   runAction,
   send,
   type PlannerAction,
+  type VerifierAgreementStats,
 } from "../planner-api";
 
 interface Props {
@@ -40,6 +42,13 @@ const STATUS_BADGE: Record<string, string> = {
   running: "badge-warning",
 };
 
+const VERDICT_BADGE: Record<string, string> = {
+  approve: "badge-success",
+  reject: "badge-error",
+  unsure: "badge-warning",
+  unverified: "badge-neutral",
+};
+
 function time(iso: string | null): string {
   return iso ? new Date(iso).toLocaleString() : "—";
 }
@@ -50,6 +59,7 @@ interface Data {
   recent: ProposalView[];
   runs: PlannerRunView[];
   history: ChangeView[];
+  agreement: VerifierAgreementStats | null;
 }
 
 export function Planner({ project, refreshKey }: Props) {
@@ -61,10 +71,17 @@ export function Planner({ project, refreshKey }: Props) {
   useEffect(() => {
     if (!project) return;
     let live = true;
-    Promise.all([getOverview(project), getProposals(project, "pending"), getProposals(project), getRuns(project), getHistory(project)])
-      .then(([overview, pending, recent, runs, history]) => {
+    Promise.all([
+      getOverview(project),
+      getProposals(project, "pending"),
+      getProposals(project),
+      getRuns(project),
+      getHistory(project),
+      getVerifierAgreement(project).catch(() => null),
+    ])
+      .then(([overview, pending, recent, runs, history, agreement]) => {
         if (!live) return;
-        setData({ overview, pending, recent: recent.filter((p) => p.status !== "pending").slice(0, 50), runs, history });
+        setData({ overview, pending, recent: recent.filter((p) => p.status !== "pending").slice(0, 50), runs, history, agreement });
         setError(null);
       })
       .catch((e: unknown) => {
@@ -98,7 +115,7 @@ export function Planner({ project, refreshKey }: Props) {
     );
   }
   if (!data) return <div className="loading">Loading the planner...</div>;
-  const { overview: o, pending, recent, runs, history } = data;
+  const { overview: o, pending, recent, runs, history, agreement } = data;
 
   return (
     <div>
@@ -134,6 +151,11 @@ export function Planner({ project, refreshKey }: Props) {
 
       <div className="card">
         <h3>Waiting for you ({pending.length})</h3>
+        {agreement && agreement.total > 0 && (
+          <p className="muted small" data-testid="verifier-agreement">
+            Verifier agreed with you on {agreement.agreed} of {agreement.total} in the last 7 days
+          </p>
+        )}
         {pending.length === 0 ? (
           <p className="muted small">No proposal waits.</p>
         ) : (
@@ -143,7 +165,21 @@ export function Planner({ project, refreshKey }: Props) {
                 <tr key={p.id}>
                   <td><code>{p.op}</code></td>
                   <td><code>{p.task}</code>{p.agent && <> → {p.agent}</>}</td>
-                  <td>{p.text && <div>“{p.text}”</div>}<div className="muted small">{p.reason}</div></td>
+                  <td>
+                    {p.text && <div>"{p.text}"</div>}
+                    <div className="muted small">{p.reason}</div>
+                    {p.verifierVerdict && (
+                      <div className="mt-1">
+                        <Badge tone={VERDICT_BADGE[p.verifierVerdict] ?? "badge-neutral"}>{p.verifierVerdict}</Badge>
+                        {p.verifierReason && <span className="muted small"> {p.verifierReason}</span>}
+                        {p.verifierEvidence && p.verifierEvidence.length > 0 && (
+                          <ul className="muted small" style={{ marginTop: "0.25em", marginBottom: 0, paddingLeft: "1.2em" }}>
+                            {p.verifierEvidence.slice(0, 3).map((e, i) => <li key={i}>{e}</li>)}
+                          </ul>
+                        )}
+                      </div>
+                    )}
+                  </td>
                   <td className="nowrap">
                     <Button size="sm" variant="primary" onClick={() => act(proposalAction(project, p, "approve"))}>Approve</Button>
                     <Button size="sm" onClick={() => act(proposalAction(project, p, "reject"))}>Reject</Button>

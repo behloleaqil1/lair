@@ -283,7 +283,9 @@ export type EventType =
   | "planner.run_finished"
   | "planner.proposals_pending"
   | "planner.blocked"
-  | "planner.tasks_file_restored";
+  | "planner.tasks_file_restored"
+  | "planner.verifier_started"
+  | "planner.verifier_finished";
 
 /** Event stored in the database */
 export interface Event {

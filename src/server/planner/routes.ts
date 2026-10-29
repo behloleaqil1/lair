@@ -112,6 +112,14 @@ export async function registerPlannerRoutes(
       return respond(service.history(query.data.limit));
     });
 
+    app.get("/api/planner/verifier-agreement", ownerOnly, async (request, reply) => {
+      const query = ProjectQuery.safeParse(request.query ?? {});
+      if (!query.success) return fail(reply, 400, "Invalid query");
+      const service = serviceOf(reply, projectOf(query.data));
+      if (!service) return reply;
+      return respond(service.verifierAgreement());
+    });
+
     app.post("/api/planner/check", ownerOnly, async (request, reply) => {
       const query = ProjectQuery.safeParse(request.query ?? {});
       if (!query.success) return fail(reply, 400, "Invalid query");

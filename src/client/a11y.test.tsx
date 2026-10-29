@@ -11,7 +11,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import axe from "axe-core";
 import { App } from "./App";
-import { FIXTURE_MODULES, fixtureFetch } from "./a11y-fixtures";
+import { FIXTURE_MODULES, FIXTURE_NOW, fixtureFetch } from "./a11y-fixtures";
 import { signIn } from "./owner-session";
 import { applyPreferences } from "./ui/preferences";
 import { settingsSections } from "../server/settings/index.js";
@@ -70,6 +70,9 @@ beforeEach(() => {
   vi.stubGlobal("fetch", fixtureFetch());
   vi.stubGlobal("EventSource", InertEventSource);
   vi.stubGlobal("WebSocket", InertWebSocket);
+  // Mock Date.now to use the fixture time, so time-based filters (e.g., results in the last 24 hours) work
+  const fixtureTime = Date.parse(FIXTURE_NOW);
+  vi.spyOn(Date, "now").mockReturnValue(fixtureTime);
 });
 
 afterEach(() => {
@@ -78,6 +81,7 @@ afterEach(() => {
   root = null;
   host = null;
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 /** Let the fetches answer and the effects settle */

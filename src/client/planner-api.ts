@@ -85,3 +85,13 @@ export async function send(action: { url: string; body: Record<string, unknown> 
 export function checkNowAction(project: string): { url: string; body: Record<string, unknown> } {
   return { url: withProject("/api/planner/check", project), body: {} };
 }
+
+/** Verifier agreement stats: how often the owner's final decision matched the verifier's verdict in the last 7 days. */
+export interface VerifierAgreementStats {
+  agreed: number;
+  total: number;
+}
+
+export function getVerifierAgreement(project: string): Promise<VerifierAgreementStats> {
+  return fetchApi<VerifierAgreementStats>(withProject("/api/planner/verifier-agreement", project), { headers: ownerHeaders() });
+}
