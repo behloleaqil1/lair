@@ -77,7 +77,9 @@ export async function registerChecksRoutes(
 
   await fastify.register(async (app) => {
     app.addHook("onRequest", rejectCrossSiteRequests);
-    app.addHook("onRequest", projectQueryGuard());
+    // Project is optional for checks routes - POST derives it from the token binding,
+    // GET/list routes use the default project when not specified.
+    app.addHook("onRequest", projectQueryGuard({ optional: true }));
 
     const projectOf = (query: { project?: string }) => query.project ?? defaultProject();
 
