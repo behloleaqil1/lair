@@ -268,4 +268,4 @@ export function checkDisabled(settings: ChecksSettings, id: CheckId): boolean {
   return settings.disabled.includes(id);
 }
 
-export { ActSettings } from "./act-config.js";
+export type { ActSettings } from "./act-config.js";

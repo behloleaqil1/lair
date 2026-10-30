@@ -43,7 +43,8 @@ export { parseActConfig, defaultActSettings, actEnabled, opAllowed, ACT_OPS, typ
 export type { ChatAgents } from "./chat.js";
 export type { CheckSources, ModuleReport } from "./checks.js";
 export type { OpsSources } from "./ops-tools.js";
-export type { ActEvidence, ActResult, ActModules } from "./act-ops.js";
+export type { ActResult, ActModules } from "./act-ops.js";
+export type { ActEvidence } from "./act-detectors.js";
 
 export interface MountSupervisorOptions {
   /** data/supervisor.db in the server; ":memory:" in tests */
