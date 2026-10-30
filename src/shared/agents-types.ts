@@ -47,7 +47,7 @@ export type AgentState =
 /** new: the first session; resume: the same session again; fresh: a new session, the old one moved aside */
 export type SessionMode = "new" | "resume" | "fresh";
 
-export type StopReason = "hung" | "failover" | "lost_claim" | "fresh_session";
+export type StopReason = "hung" | "failover" | "lost_claim" | "fresh_session" | "server_shutdown";
 
 /** What started a run's chain, when not the owner or another module: "fill" (agents.fill) */
 export type RunOrigin = "fill";
@@ -142,6 +142,7 @@ export type AgentEventKind =
   | "fill_started"
   | "fill_held"
   | "fill_done"
+  | "fill_conflict"
   | "fill_released"
   | "fill_paused"
   | "fill_waiting"
@@ -152,7 +153,9 @@ export type AgentEventKind =
   | "fill_gate_queued"
   | "fill_gate_gone"
   | "transient"
-  | "transient_cleared";
+  | "transient_cleared"
+  | "run_adopted"
+  | "run_lost";
 
 /** Recovery and audit record: what happened, why, and the evidence. */
 export interface AgentEventView {
@@ -319,6 +322,7 @@ export type FillHold =
   | "read_only"
   | "max_active"
   | "capacity"
+  | "conflict"
   | "prompt"
   | "refused";
 

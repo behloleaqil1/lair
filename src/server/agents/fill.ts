@@ -93,6 +93,7 @@ import { MAX_PROMPT_FILE_BYTES } from "./prompts.js";
 import { lastLines, readTail } from "./sessions.js";
 import type { AgentsStore } from "./store.js";
 import { isActive, isValidTaskId, type AgentRun, type QueueMark } from "./types.js";
+import { checkForConflictingProcess } from "./reconcile.js";
 
 export const MAX_TASKS_FILE_BYTES = 256 * 1024;
 export const MAX_TASK_LINES = 200;
@@ -1358,6 +1359,33 @@ export class AgentsFill {
           await hold("capacity", reason);
           continue;
         }
+      }
+
+      // Belt-and-braces check: refuse to start if a live process already runs the task
+      // (in case reconciliation missed something, e.g. a run from an older Lair version)
+      const promptFilePrefix = prompt.files[0] ?? "";
+      const processList = await probes.processes.list();
+      const conflict = checkForConflictingProcess(
+        task,
+        agent,
+        promptFilePrefix,
+        processList.map((p) => ({ pid: p.pid, command: p.command })),
+        probes.self.pid,
+      );
+      if (conflict.hasConflict) {
+        await this.options.record(
+          "fill_conflict",
+          {
+            agent,
+            task,
+            summary: `fill: ${agent} can't start ${task}: ${conflict.reason}`,
+            evidence: [conflict.reason ?? `pid ${conflict.conflictingPid} appears to be running the task`],
+            data: { conflictingPid: conflict.conflictingPid },
+          },
+          probes.clock.now(),
+        );
+        await hold("conflict", conflict.reason ?? `pid ${conflict.conflictingPid} appears to be running the task`);
+        continue;
       }
 
       let run: AgentRunView;

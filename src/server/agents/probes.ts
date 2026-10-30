@@ -14,6 +14,8 @@ export interface ProcessOwner {
   pid: number;
   /** Milliseconds since the epoch */
   startedAt: number;
+  /** Process group id (for signalling the process and its children); equals pid for detached processes */
+  pgid?: number;
 }
 
 export interface SpawnOptions {
@@ -183,7 +185,8 @@ export class ChildProcessSpawner implements ProcessSpawner {
           }
           child.unref();
           this.started.add(pid);
-          resolve({ pid, startedAt: Date.now() });
+          // With detached: true, the child is its own process group leader (pgid = pid)
+          resolve({ pid, startedAt: Date.now(), pgid: pid });
         });
         child.once("error", (error) => {
           close();

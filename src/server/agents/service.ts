@@ -127,6 +127,11 @@ import {
   type FailoverInfo,
   type StoredLockWait,
 } from "./types.js";
+import {
+  commandFingerprint,
+  reconcileActiveRuns,
+  type ReconcileResult,
+} from "./reconcile.js";
 
 export { TASK_ID, isValidTaskId } from "./types.js";
 
@@ -426,6 +431,10 @@ export class AgentsService {
   private fill: AgentsFill | null = null;
   /** Module run variables per chain (RunRequest.variables): in memory only, dropped once the chain ends */
   private moduleVars = new Map<string, Record<string, string>>();
+  /** Set to true once reconciliation has finished; fill waits on this before its first tick */
+  private reconciled = false;
+  /** The result of reconciliation on startup */
+  private reconcileResult?: ReconcileResult;
   lastTick?: AgentsTickSummary;
   lastError?: string;
 
@@ -1195,7 +1204,9 @@ export class AgentsService {
     }
     t.snap.addSpawned(spawned);
     run.pid = spawned.pid;
+    run.pgid = spawned.pgid ?? spawned.pid;
     run.pidStartedAt = spawned.startedAt;
+    run.commandFingerprint = commandFingerprint(argv);
     run.spawnedAt = t.now;
     run.state = "running";
     run.detail = `working (pid ${spawned.pid})`;
@@ -1215,6 +1226,7 @@ export class AgentsService {
         data: {
           argv,
           pid: spawned.pid,
+          pgid: spawned.pgid ?? spawned.pid,
           sessionId: run.sessionId,
           sessionMode: run.sessionMode,
           profile: run.profile,
@@ -3124,7 +3136,11 @@ export class AgentsService {
   start(): void {
     if (!this.stopped) return;
     this.stopped = false;
-    this.fill?.start();
+    // Reconcile active runs BEFORE fill starts, so fill knows which tasks are already running
+    this.reconcileOnStartup().then(() => {
+      if (this.stopped) return;
+      this.fill?.start();
+    });
     const loop = async () => {
       if (this.stopped) return;
       try {
@@ -3142,6 +3158,82 @@ export class AgentsService {
   }
 
   /**
+   * Reconcile active runs on startup: for each run the store says is active,
+   * check if its process is still alive and provably the same one. Adopted
+   * runs stay active; lost and ended runs are marked accordingly. Fill waits
+   * for this before its first tick.
+   */
+  private async reconcileOnStartup(): Promise<void> {
+    try {
+      this.reconcileResult = await reconcileActiveRuns(
+        this.project,
+        this.store,
+        this.probes,
+        this.settings.pidStartToleranceSeconds,
+      );
+      const { adopted, lost, ended } = this.reconcileResult;
+      if (adopted.length > 0 || lost.length > 0 || ended.length > 0) {
+        console.log(
+          `[agents] ${this.project}: reconciled ${adopted.length + lost.length + ended.length} runs on startup: ` +
+            `${adopted.length} adopted, ${lost.length} lost (pid reused), ${ended.length} ended`,
+        );
+        // Record an event for each outcome
+        const now = this.probes.clock.now();
+        for (const a of adopted) {
+          await this.record(
+            "run_adopted",
+            {
+              agent: a.agent,
+              task: a.task,
+              runId: a.runId,
+              summary: `adopted run ${short(a.runId)} on restart (pid ${a.pid} is alive)`,
+              data: { pid: a.pid },
+            },
+            now,
+          );
+        }
+        for (const l of lost) {
+          await this.record(
+            "run_lost",
+            {
+              agent: l.agent,
+              task: l.task,
+              runId: l.runId,
+              summary: `run ${short(l.runId)} lost in restart: ${l.reason}`,
+              evidence: [l.reason],
+              data: { reason: l.reason },
+            },
+            now,
+          );
+        }
+        for (const e of ended) {
+          await this.record(
+            "exit_unknown",
+            {
+              agent: e.agent,
+              task: e.task,
+              runId: e.runId,
+              summary: `run ${short(e.runId)} ended while Lair was restarting: ${e.reason}`,
+              evidence: [e.reason],
+              data: { reason: e.reason },
+            },
+            now,
+          );
+        }
+      }
+    } catch (e) {
+      console.error(`[agents] ${this.project}: reconciliation failed:`, e);
+    } finally {
+      this.reconciled = true;
+    }
+  }
+
+  /** Whether reconciliation has finished (fill waits on this). */
+  isReconciled(): boolean {
+    return this.reconciled;
+  }
+
+  /**
    * Stop ticking and filling; resolves once the fill check, tick or action in
    * progress has finished (fill first, so it requests nothing more).
    */
@@ -3154,6 +3246,31 @@ export class AgentsService {
     }
     await this.ticking?.catch(() => undefined);
     await this.queue;
+  }
+
+  /**
+   * Signal all active runs on a planned shutdown when on_restart is "stop".
+   * Called by the server's shutdown before stop() when on_restart is "stop".
+   * Returns the result: which runs were signalled and which timed out.
+   */
+  async signalRunsForShutdown(): Promise<{ signalled: string[]; timedOut: string[] }> {
+    if (this.settings.onRestart !== "stop") {
+      return { signalled: [], timedOut: [] };
+    }
+    const { signalActiveRuns } = await import("./reconcile.js");
+    const result = await signalActiveRuns(
+      this.project,
+      this.store,
+      this.probes,
+      this.settings.stopGraceSeconds,
+    );
+    if (result.signalled.length > 0 || result.timedOut.length > 0) {
+      console.log(
+        `[agents] ${this.project}: signalled ${result.signalled.length} runs for shutdown, ` +
+          `${result.timedOut.length} timed out and were killed`,
+      );
+    }
+    return result;
   }
 
   /** Drop the fleet budget subscription and the watchdog view's scratch store. */

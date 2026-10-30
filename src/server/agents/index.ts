@@ -14,3 +14,5 @@ export type { DecisionInbox, DecisionRequest, DecisionKind, DecisionOption } fro
 export type { FleetBudget } from "./budgets.js";
 export { systemAgentProbes, systemAgentProbesWithCache, ChildProcessSpawner, ProcessSnapshot, agentEnvironment, BASE_ENV } from "./probes.js";
 export type { AgentProbes, ProcessSpawner, ProcessOwner, SpawnOptions } from "./probes.js";
+export { reconcileActiveRuns, signalActiveRuns, commandFingerprint } from "./reconcile.js";
+export type { ReconcileResult, ReconcileOutcome } from "./reconcile.js";

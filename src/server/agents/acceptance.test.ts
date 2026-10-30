@@ -1021,6 +1021,192 @@ describe("4. hung and dead-on-start: same session K times, then a fresh one, the
   });
 });
 
+// ============ 4a. RESTART RECONCILIATION ============
+
+describe("4a. restart reconciliation: a restart adopts or ends runs the previous server started", () => {
+  it("a run with matching pid, pgid and start time is adopted after a restart; fill does NOT start a second", async () => {
+    const h1 = setup((p) => ({
+      fill: {
+        enabled: true,
+        tasks_file: join(p.dir, "tasks.txt"),
+        agents: ["worker-a"],
+        prompt_files: ["{prompts_dir}/{agent}.txt"],
+      },
+    }));
+    writeFileSync(join(h1.promptsDir, "worker-a.txt"), "Work on it\n");
+    writeFileSync(join(h1.dir, "tasks.txt"), "worker-a|A|feat-login|Build it\n");
+
+    // Start a run via fill
+    await h1.service.tick();
+    await h1.service.tick();
+    await h1.service.fill?.check();
+    await h1.service.tick();
+
+    const [runBefore] = runs(h1);
+    expect(runBefore).toMatchObject({ agent: "worker-a", state: "running" });
+    const pid = runBefore.pid!;
+
+    // Simulate a restart: the process keeps running with the same pid and start time
+    const h2 = setup(
+      (p) => ({
+        fill: {
+          enabled: true,
+          tasks_file: join(p.dir, "tasks.txt"),
+          agents: ["worker-a"],
+          prompt_files: ["{prompts_dir}/{agent}.txt"],
+        },
+      }),
+      { paths: h1, self: { pid: 200, startedAt: NOW + 5 * MIN } },
+    );
+    h2.procs.add(pid, h1.spawner.calls[0].argv.join(" "), NOW);
+
+    // The new server reconciles and adopts the run
+    h2.service.start();
+    await at(h2, 5 * MIN);
+    await h2.service.fill?.check();
+
+    // The run is still running (adopted), and fill did NOT start a second
+    const runsAfter = runs(h2);
+    expect(runsAfter.filter((r) => r.state === "running")).toHaveLength(1);
+    expect(h2.spawner.calls).toEqual([]); // No new spawns
+
+    const adopted = eventsOf(h2, "run_adopted");
+    expect(adopted).toHaveLength(1);
+    expect(adopted[0].summary).toContain("adopted run");
+    expect(adopted[0].data.pid).toBe(pid);
+  });
+
+  it("a run whose pid was reused (different start time) is marked lost, NOT killed, and NOT adopted", async () => {
+    const h1 = setup();
+    await request(h1, "worker-a", "feat-login");
+    await h1.service.tick();
+
+    const [runBefore] = runs(h1);
+    expect(runBefore).toMatchObject({ agent: "worker-a", state: "running" });
+    const pid = runBefore.pid!;
+
+    // Simulate a restart: the pid is reused by a DIFFERENT process (different start time)
+    const h2 = setup(() => ({}), { paths: h1, self: { pid: 200, startedAt: NOW + 5 * MIN } });
+    // Add the pid with a DIFFERENT start time (much later than the original)
+    h2.procs.add(pid, "unrelated-process", NOW + 10 * MIN);
+
+    h2.service.start();
+    await at(h2, 5 * MIN);
+    await h2.service.tick();
+
+    // The run is marked lost (not adopted)
+    const [runAfter] = runs(h2);
+    expect(runAfter.state).toBe("failed");
+    expect(runAfter.detail).toContain("lost in restart");
+
+    const lost = eventsOf(h2, "run_lost");
+    expect(lost).toHaveLength(1);
+    expect(lost[0].summary).toContain("lost in restart");
+
+    // The process was NOT killed (it's not ours)
+    expect(h2.spawner.kills).toEqual([]);
+  });
+
+  it("on_restart: stop signals each run's process group and records them", async () => {
+    const h = setup(() => ({ on_restart: "stop" }));
+    await request(h, "worker-a", "feat-login");
+    await request(h, "worker-b", "feat-search");
+    await h.service.tick();
+
+    expect(runs(h).filter((r) => r.state === "running")).toHaveLength(2);
+
+    // Signal runs for shutdown
+    const result = await h.service.signalRunsForShutdown();
+
+    expect(result.signalled).toHaveLength(2);
+    expect(h.spawner.kills.filter((k) => k.signal === "SIGTERM")).toHaveLength(2);
+
+    // The runs are now in stopping state
+    const runsAfter = runs(h);
+    expect(runsAfter.filter((r) => r.state === "stopping")).toHaveLength(2);
+    expect(runsAfter[0].stopReason).toBe("server_shutdown");
+    expect(runsAfter[1].stopReason).toBe("server_shutdown");
+  });
+
+  it("fill waits for reconciliation before its first tick (no run started before reconciliation)", async () => {
+    const h1 = setup((p) => ({
+      fill: {
+        enabled: true,
+        tasks_file: join(p.dir, "tasks.txt"),
+        agents: ["worker-a"],
+        prompt_files: ["{prompts_dir}/{agent}.txt"],
+      },
+    }));
+    writeFileSync(join(h1.promptsDir, "worker-a.txt"), "Work on it\n");
+    writeFileSync(join(h1.dir, "tasks.txt"), "worker-a|A|feat-login|Build it\n");
+
+    // Start a run via fill
+    await h1.service.tick();
+    await h1.service.fill?.check();
+    await h1.service.tick();
+
+    const [runBefore] = runs(h1);
+    expect(runBefore).toMatchObject({ agent: "worker-a", state: "running" });
+    const pid = runBefore.pid!;
+
+    // Simulate a restart with the process still running
+    const h2 = setup(
+      (p) => ({
+        fill: {
+          enabled: true,
+          tasks_file: join(p.dir, "tasks.txt"),
+          agents: ["worker-a"],
+          prompt_files: ["{prompts_dir}/{agent}.txt"],
+        },
+      }),
+      { paths: h1, self: { pid: 200, startedAt: NOW + 5 * MIN } },
+    );
+    h2.procs.add(pid, h1.spawner.calls[0].argv.join(" "), NOW);
+
+    // The service reconciles before fill runs
+    h2.service.start();
+    expect(h2.service.isReconciled()).toBe(false);
+    await at(h2, 5 * MIN); // Wait for reconciliation
+    expect(h2.service.isReconciled()).toBe(true);
+
+    // After reconciliation, fill can run and sees the adopted run
+    await h2.service.fill?.check();
+    expect(h2.spawner.calls).toEqual([]); // No new spawns - the task is already running
+  });
+
+  it("belt-and-braces: a live process with the task's prompt prefix blocks a new start and raises a notice", async () => {
+    const h = setup((p) => ({
+      fill: {
+        enabled: true,
+        tasks_file: join(p.dir, "tasks.txt"),
+        agents: ["worker-a"],
+        prompt_files: ["{prompts_dir}/{agent}.txt"],
+      },
+    }));
+    writeFileSync(join(h.promptsDir, "worker-a.txt"), "Work on it\n");
+    writeFileSync(join(h.dir, "tasks.txt"), "worker-a|A|feat-login|Build it\n");
+
+    // A rogue process is running with the task in its command line (from an older server)
+    const rogueCmd = `LAIR_TASK=feat-login LAIR_AGENT=worker-a node agent-cli`;
+    h.procs.add(9999, rogueCmd, NOW - 60 * 1000); // Started before this server
+
+    await h.service.tick();
+    await h.service.tick();
+    await h.service.fill?.check();
+    await h.service.tick();
+
+    // Fill did NOT start a run; the rogue blocks it
+    expect(h.spawner.calls).toEqual([]);
+    expect(runs(h).filter((r) => r.state === "running")).toHaveLength(0);
+
+    // A fill_conflict notice was raised
+    const conflicts = eventsOf(h, "fill_conflict");
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0].summary).toContain("can't start feat-login");
+    expect(conflicts[0].data.conflictingPid).toBe(9999);
+  });
+});
+
 // ============ 5. FAILOVER ============
 
 describe("5. provider errors and rate limits fail over to the next configured profile", () => {
