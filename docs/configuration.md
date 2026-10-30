@@ -2087,7 +2087,7 @@ The owner only (the owner's session from [the owner credential](#decision-inbox)
 
 ## Placement
 
-> Off by default. With `enabled: true` and the default `mode: observe`, placement probes your machines, estimates when every queued job finishes, and shows where it would move each one. It runs none of your commands except the probes.
+> Off by default. With `enabled: true` and the default `mode: observe`, placement probes your machines, estimates when every queued job finishes, and shows where it would move each one. It runs none of your commands except the probes and, for an [on-demand machine](#on-demand-machines), its `state_cmd` and `guard_cmd` checks.
 
 Placement is for projects that keep their own gate queue and runners: the request files under `gates_dir/queue/` that the Gates section reads, one lane per runner. It decides which machine runs each queued job, for any number of machines, and moves a job to another lane when it is expected to finish sooner there. Lair never renames a request itself. In act mode it runs your `move_cmd`, which validates and moves the request, and then checks that the request landed.
 
@@ -2158,7 +2158,7 @@ Each decision is explained in one line, for example `moved 20260101T000000Z-fix-
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | boolean | `false` | Run placement for this project |
-| `mode` | `observe` \| `act` | `observe` | `observe` records and shows advice (`would_move`); `act` runs `move_cmd`, unless the project is `read_only: true` |
+| `mode` | `observe` \| `act` | `observe` | `observe` records and shows advice (`would_move`); `act` runs `move_cmd` and an on-demand machine's `touch_cmd`, unless the project is `read_only: true` |
 | `interval_seconds` | number | `60` | Seconds between ticks (10 to 3600) |
 | `probe_timeout_seconds` | number | `15` | Timeout of each probe and load command |
 | `command_timeout_seconds` | number | `60` | Timeout of `move_cmd` and of an on-demand machine's `state_cmd`, `guard_cmd` and `touch_cmd` |
@@ -2202,7 +2202,7 @@ On-demand machine options (the `on_demand` block; see [On-demand machines](#on-d
 | `cost_per_hour` | number | — | Shown in the status; of two moves that are equally good, the one to the cheaper lane wins |
 | `check_seconds` | number | `300` | Minimum seconds between state and guard checks (the guard may call paid APIs) |
 | `speed_factor` | number | `1.0` | While the machine has no run of a class yet, its expected duration is this times what the class takes on the other machines (`0.5`: twice as fast) |
-| `touch_cmd` | array | — | Argv that refreshes the machine's activity mark (or lease), run while a job runs in one of its lanes |
+| `touch_cmd` | array | — | Argv that refreshes the machine's activity mark (or lease), run while a job runs in one of its lanes, in act mode only |
 | `touch_seconds` | number | `60` | How often `touch_cmd` runs while a job runs there. A touch runs at most once per tick, so this may not be shorter than `interval_seconds` |
 
 Lane options:
@@ -2231,8 +2231,8 @@ A machine with an `on_demand` block is one your project starts when a job lands 
 
 - **Available.** A machine whose state is `stopped` and whose guard says ok is **available**: its lanes are planned as if it were up, with `boot_seconds` added to every estimate there (once). Running, it counts like any machine, through its probes and `min_up_seconds`. A refusing guard, an unknown state, or a command that fails or times out makes it **unavailable**, with the reason shown; so do `pending` and `stopping`.
 - **Starting it.** A lane on an available machine is a target only through `routing`: a lane's `overflow_to` lists it, or the lane has `prefer_when_faster`. A move there needs a free slot and a gain above 0 of at least the routing's `min_gain_seconds`, in all too; with `overflow_to` alone the job must also be waiting (it would not start now where it is). These moves go before moves by time. In act mode, right before such a move the guard runs again (unless it ran in this tick): a refusal cancels the move (`placement.move_failed`, the job waits its cool-down) and the machine stays unavailable until its next check.
-- **Moving back.** A job queued in its lane while the guard refuses or the state is unknown goes back, before any other move, to a lane whose `overflow_to` lists that lane (else to any up lane that runs its class): `moved back q1 aws→heavy: est. never → 60 min; aws guard refused: spend 181 >= limit 180; heavy idle`. Its cool-down and `max_moves_per_job` still apply. A machine that is `pending` or `stopping` keeps its jobs.
-- **Keeping it alive.** While a job runs in one of its lanes, `touch_cmd` runs every `touch_seconds`, so the machine's idle timer does not stop it during a long phase of the job that does not use it. A check that finds the machine `stopped` (or `stopping`) after it had answered, while jobs run in its lanes, emits `placement.machine_stopped_under_job` once per job; when the runner puts such a job back in that lane while the machine is not up, it moves back once (`aws stopped under it`).
+- **Moving back.** A job queued in its lane while the guard refuses or the state is unknown goes back, before any other move, to a lane whose `overflow_to` lists that lane (else to any up lane that runs its class): `moved back q1 aws→heavy: est. never → 60 min; aws guard refused: spend 181 >= limit 180; heavy idle`. Its cool-down and `max_moves_per_job` still apply, so a job moved in and refused straight after waits out the cool-down of that move (30 min by default) before it goes back, and one that reached `max_moves_per_job` is held where it is. A machine that is `pending` or `stopping` keeps its jobs.
+- **Keeping it alive.** While a job runs in one of its lanes, `touch_cmd` runs every `touch_seconds`, so the machine's idle timer does not stop it during a long phase of the job that does not use it. A touch keeps a paid machine on, so it runs in act mode only: in observe mode or on a `read_only` project it never runs, and the status shows why (`touchError: not touched: placement.mode is observe`). A check that finds the machine `stopped` (or `stopping`) after it had answered, while jobs run in its lanes, emits `placement.machine_stopped_under_job` once per job; when the runner puts such a job back in that lane while the machine is not up, it moves back once (`aws stopped under it`). The state is checked at most every `check_seconds`, so the notice can come up to `check_seconds` (5 min by default) after the machine stopped, not within a minute; a job its runner already put back in the queue by then gets no notice and is planned like any job queued for that machine.
 - **Shown.** The Machines section shows the on-demand state next to the probe state: `on demand: stopped, guard ok, 150 s boot`, `on demand: starting`, `on demand: running`, `on demand: refused (guard refused: ...)`. The status (`onDemand`) has the power state, availability and reason, the last check and the last touch with its error. A move explains itself: `moved q1 heavy→aws: est. 2 h 0 min → 63 min; aws stopped, guard ok, 150 s boot; overflow: heavy had 1 waiting; aws idle`.
 
 ```yaml

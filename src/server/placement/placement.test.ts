@@ -1176,8 +1176,12 @@ interface FakeOnDemand {
 class OnDemandHarness extends Harness {
   readonly od: Record<string, FakeOnDemand>;
 
-  constructor(config: Record<string, unknown> = onDemandConfig(), machines: string[] = ["aws"]) {
-    super(config);
+  constructor(
+    config: Record<string, unknown> = onDemandConfig(),
+    machines: string[] = ["aws"],
+    extra: Partial<ProjectConfig> = {},
+  ) {
+    super(config, { extra });
     this.od = Object.fromEntries(machines.map((m) => [m, { state: "stopped", guardOk: true, lastActivityAt: NOW }]));
     // probe-<m>, load-<m>, <m>-state, <m>-guard and <m>-touch answer for the on-demand machines
     const originalRun = this.runner.run.bind(this.runner);
@@ -1771,6 +1775,38 @@ describe("placement: on-demand moves back, gains and keep-alive", () => {
     await h.tick();
     expect(h.callsOf("aws-touch")).toBe(11);
     expect(h.awsState).toBe("stopped");
+  });
+
+  it("observe mode and a read_only project never run touch_cmd, and still report the machine stopped under a job", async () => {
+    const machines = {
+      workstation: WORKSTATION,
+      aws: onDemandMachine("aws", { touch_cmd: ["aws-touch"], touch_seconds: 60 }),
+    };
+    const cases: [Record<string, unknown>, Partial<ProjectConfig>, string][] = [
+      [onDemandConfig({ mode: "observe", machines }), {}, "placement.mode is observe"],
+      [onDemandConfig({ machines }), { read_only: true }, "the project is read_only"],
+    ];
+    for (const [config, extra, blocked] of cases) {
+      const h = new OnDemandHarness(config, ["aws"], extra);
+      h.awsState = "running";
+      h.od.aws.idleLimitMs = 5 * MIN;
+      h.request("aws", 5, "r1", "run suite", ".run");
+
+      // Ten minutes with a job running there: a touch would keep the paid machine on
+      for (let i = 0; i <= 10; i++) {
+        await h.tick();
+        h.clock.advance(MIN);
+      }
+
+      expect(h.status().actBlocked).toBe(blocked);
+      expect(h.callsOf("aws-touch")).toBe(0);
+      expect(h.awsState).toBe("stopped");
+      expect(h.awsMachine()?.onDemand).toMatchObject({ lastTouchAt: null, touchError: `not touched: ${blocked}` });
+      const notices = h.eventsOf("placement.machine_stopped_under_job");
+      expect(notices).toHaveLength(1);
+      expect(notices[0].data).toMatchObject({ machine: "aws", gateId: "r1", lane: "aws", state: "stopped" });
+      expect(h.moved()).toEqual([]);
+    }
   });
 
   it("a machine found stopped under a running job raises one notice, and the job goes back once when queued again", async () => {
