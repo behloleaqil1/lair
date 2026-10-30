@@ -182,9 +182,11 @@ Rules for all stages:
 4. Brain bench in the learning-loop store; stage B model in shadow for C5-C9.
 5. Stage C classifier once a few hundred labelled decisions exist; stage D when the label count and the bench justify it.
 
-## 9. Open questions for the owner
+## 9. Owner decisions (30 Oct 2026)
 
-- The default bars in section 5 (95%/90%, 30 comparisons): confirm or change.
-- Whether C9 (`request_agent_reviews_again` on a start failure) may ever reach `act`, or stays at `suggest`.
-- Whether the answered-by-orchestrator decisions count as the owner's labels (this design assumes yes, with `outcome` marking the ones that turned out wrong).
-- Whether a cleaned dataset and a fine-tuned adapter are published (stage D), and under what licence.
+The owner approved this design on 30 Oct 2026 and answered its open questions:
+
+- **Bars (section 5):** approved as written: at least 30 comparisons, at least 95% agreement for rules and 90% for models, no unsafe disagreement, and the owner's approval for the first promotion of any class to `act`.
+- **C9 (`request_agent_reviews_again` after a reviewer failed to start):** may reach `act` once it meets the bars. Its `max_tier` is 2.
+- **Labels:** decisions answered by the orchestrating session count as the owner's labels; `outcome` marks the ones that turned out wrong, which become negative examples.
+- **Stage D (publishing a cleaned dataset and a fine-tuned adapter):** decided later, when there is a model worth sharing.
