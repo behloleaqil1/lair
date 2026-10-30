@@ -412,6 +412,47 @@ describe("cloud: the money guard", () => {
   });
 });
 
+describe("cloud: only the current instance starts, and only through the guard", () => {
+  it("a stopped or replaced instance starts and stops nothing, a start queued before its stop included", async () => {
+    const h = new Harness(cloudBlock());
+    h.instance("stopped", NOW - 28 * HOUR, NOW - 26 * HOUR);
+    const old = h.machines;
+    const reload = serverModules({ clouds: h.manager }).find((m) => m.name === "cloud");
+    // Queued first, its turn comes after the reload stopped the instance
+    const queued = old.startMachine("cloud-1");
+    const reloaded = reload?.reload({ name: PROJECT, config: h.config(cloudBlock({ limit: 50 })) });
+    expect(await queued).toMatchObject({ allowed: false, reason: expect.stringMatching(/was stopped \(its config was reloaded/) });
+    await reloaded;
+    expect(h.machines).not.toBe(old);
+
+    const sent = h.aws.sent.length;
+    expect(await old.startMachine("cloud-1")).toMatchObject({ allowed: false });
+    await expect(old.stopMachine("cloud-1")).rejects.toThrow(/was stopped/);
+    expect(await old.check()).toMatchObject({ state: "refused", allowed: false });
+    old.start();
+    expect(old.running).toBe(false);
+    // Not one provider call from the old instance
+    expect(h.aws.sent).toHaveLength(sent);
+    expect(h.aws.named("StartInstances")).toHaveLength(0);
+
+    // The current one, from the manager, starts
+    expect(await h.machines.startMachine("cloud-1")).toMatchObject({ allowed: true, state: "pending" });
+    expect(h.aws.named("StartInstances")).toHaveLength(1);
+  });
+
+  it("the module exports no provider or SDK clients: nothing outside it can call a provider's start", async () => {
+    const barrel = await import("./index.js");
+    expect(Object.keys(barrel).sort()).toEqual([
+      "CloudMachines",
+      "CloudManager",
+      "CloudSchema",
+      "CloudStore",
+      "parseCloudConfig",
+      "registerCloudRoutes",
+    ]);
+  });
+});
+
 describe("cloud: configuration", () => {
   it("is off by default: no client is made and nothing is called", async () => {
     for (const cloud of [undefined, {}, { ...cloudBlock(), enabled: false }]) {

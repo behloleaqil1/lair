@@ -111,6 +111,8 @@ export class CloudMachines {
   private timer: NodeJS.Timeout | null = null;
   private ticking: Promise<void> | null = null;
   private stopped = true;
+  /** stop() ran: a reload replaced this instance, or Lair is stopping. It calls no provider again. */
+  private retired = false;
 
   constructor(options: {
     project: string;
@@ -164,19 +166,31 @@ export class CloudMachines {
     return run;
   }
 
+  private get retiredReason(): string {
+    return `this cloud instance of ${this.project} was stopped (its config was reloaded, or Lair is stopping): ask CloudManager.get() for the current one`;
+  }
+
   /** Describe every machine, read the cost when due, and run the guard. */
   check(): Promise<GuardVerdict> {
-    return this.serial(() => this.refresh());
+    return this.serial(async (): Promise<GuardVerdict> => {
+      if (this.retired) {
+        return { state: "refused", allowed: false, reason: this.retiredReason, spend: null, providerAmount: null, trips: false };
+      }
+      return this.refresh();
+    });
   }
 
   /**
    * Start a machine. The guard runs first, on fresh readings: every machine
    * is described again, and the cost is read if its reading is due. A
    * refusal or a spend that can't be told means no start; an error before
-   * the provider's start does too.
+   * the provider's start does too. A stopped instance (replaced by a reload,
+   * or Lair stopping) starts nothing: callers ask CloudManager.get() each time.
    */
   startMachine(id: string): Promise<StartResult> {
-    return this.serial(async () => {
+    return this.serial(async (): Promise<StartResult> => {
+      // Checked when the start's turn comes, so a start queued before stop() is refused too
+      if (this.retired) return { allowed: false, state: this.runtime.get(id)?.state ?? "unknown", reason: this.retiredReason };
       const machine = this.machine(id);
       const verdict = await this.refresh();
       const rt = this.runtime.get(id) as MachineRuntime;
@@ -190,9 +204,10 @@ export class CloudMachines {
     });
   }
 
-  /** Stop a machine. Never guarded: stopping only saves money. */
+  /** Stop a machine. Never guarded: stopping only saves money. A stopped instance stops nothing (ask the manager). */
   stopMachine(id: string): Promise<PowerState> {
     return this.serial(async () => {
+      if (this.retired) throw new Error(this.retiredReason);
       const machine = this.machine(id);
       const state = await withTimeout(this.provider(machine).stop(machine), this.timeoutMs, `stop ${id}`);
       (this.runtime.get(id) as MachineRuntime).state = state;
@@ -291,7 +306,7 @@ export class CloudMachines {
   }
 
   start(): void {
-    if (!this.stopped) return;
+    if (!this.stopped || this.retired) return;
     this.stopped = false;
     this.store.pruneRuns(this.clock.now());
     const loop = async () => {
@@ -315,9 +330,14 @@ export class CloudMachines {
     this.timer.unref();
   }
 
-  /** Stop checking; a check, start or stop in progress finishes first. */
+  /**
+   * Stop checking; a check, start or stop in progress finishes first, and
+   * one queued behind it is refused: a stopped instance calls no provider
+   * again (the manager makes a new one on a reload).
+   */
   async stop(): Promise<void> {
     this.stopped = true;
+    this.retired = true;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
