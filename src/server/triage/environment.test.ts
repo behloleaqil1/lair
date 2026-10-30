@@ -145,7 +145,7 @@ describe("environment triage integration", () => {
 
     probePass = true;
     h.clock.advance(10 * 1000);
-    await h.manager.tick();
+    await h.service.tick();
     await h.manager.idle();
 
     expect(store.getEnvironmentWait(waits[0].id)?.status).toBe("resolved");
@@ -175,7 +175,7 @@ describe("environment triage integration", () => {
     }
 
     h.clock.advance(6 * MIN);
-    await h.manager.tick();
+    await h.service.tick();
     await h.manager.idle();
 
     const decisionLines = h.inbox().split("\n").filter((l) => l.includes("OWNER?"));
@@ -238,7 +238,7 @@ describe("environment triage integration", () => {
     });
 
     h.clock.advance(10 * 1000);
-    await h.manager.tick();
+    await h.service.tick();
     await h.manager.idle();
 
     const rechecks = h.manager.getStore()!.rechecksFor({ recordId: out.record.id });
