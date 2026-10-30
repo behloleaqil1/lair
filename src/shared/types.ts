@@ -76,6 +76,11 @@ export interface ProjectConfig {
    */
   plan_sandbox?: Record<string, unknown>;
   /**
+   * Plan and apply of an approved plan file (src/server/tofu-runner/).
+   * Validated by parseTofuRunnerConfig; see docs/configuration.md#opentofu-runner
+   */
+  tofu_runner?: Record<string, unknown>;
+  /**
    * Gate pipelines and where they run (src/server/gates/). Validated by
    * parsePipelineConfig; see docs/configuration.md#gate-pipelines
    */

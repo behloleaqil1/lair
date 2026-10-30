@@ -6,7 +6,7 @@
 export { parsePlanSandboxConfig, PLAN_ROLE_SECONDS } from "./config.js";
 export type { PlanSandboxSettings } from "./config.js";
 export { BlockedPlanSandbox, PlanSandbox, PlanSandboxManager, sandboxEnv } from "./service.js";
-export type { PlanOutcome, PlanSandboxDeps } from "./service.js";
+export type { ApplyJob, ApplyOutcome, PlanJob, PlanOutcome, PlanSandboxDeps, StateBackend } from "./service.js";
 export { AwsCliIssuer, DockerSpawner, dockerArgs } from "./spawners.js";
 export { sweepLeftovers } from "./sweep.js";
 export type { PlanCredentialIssuer, PlanCredentials, SandboxResult, SandboxSpawner, SandboxSpec } from "./types.js";

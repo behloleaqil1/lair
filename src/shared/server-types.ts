@@ -282,6 +282,11 @@ export type EventType =
   | "cloud.guard_tripped"
   // The owner cleared the trip: {project, trippedAt, limit, spend, by (owner session id), note}
   | "cloud.trip_cleared"
+  // OpenTofu runner (src/server/tofu-runner/): {project, env, root, planId, outcome, reason, by (owner session id)}
+  | "tofu.plan"
+  | "tofu.apply.refused"
+  | "tofu.apply.started"
+  | "tofu.apply.finished"
   // Planner (src/server/planner/)
   | "planner.changed"
   | "planner.run_started"
