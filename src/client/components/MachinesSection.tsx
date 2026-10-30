@@ -1,19 +1,22 @@
 /**
  * Machines (the old Machines and Nodes views): the project's machines with
  * their gate runners and, with placement on, its probe of each (up since,
- * load, lanes and the jobs on them); and on the Nodes tab the lair-node
- * machines registered with this server and the scheduler. A row opens its
- * detail (#/machines/<name>, #/machines/<node id>?tab=nodes).
+ * load, lanes and the jobs on them); with cloud on, its cloud machines'
+ * power state, the spend and the money guard (read-only); and on the Nodes
+ * tab the lair-node machines registered with this server and the
+ * scheduler. A row opens its detail (#/machines/<name>,
+ * #/machines/<node id>?tab=nodes).
  */
 import { useMemo } from "react";
 import { useApi } from "../hooks/useApi";
 import { useMachinesWebSocket } from "../hooks/useWebSocket";
-import { machineDetail, machineRows, nodeRows, type MachineRow, type NodeRow } from "../machines-view";
+import { cloudBudget, cloudState, machineDetail, machineRows, nodeRows, type MachineRow, type NodeRow } from "../machines-view";
 import { adviceText, eta } from "../placement-view";
 import { linkTo } from "../router";
 import type { MachineStatus } from "../../shared/types";
 import type { ListNodesResponse } from "../../shared/server-types";
 import type { PlacementStatus } from "../../shared/placement-types";
+import type { CloudBudgetStatus, CloudMachineStatus, CloudProviderSpend, CloudStatus } from "../../shared/cloud-types";
 import { DataTable, type Column } from "./DataTable";
 import { DetailPanel, DetailSection } from "./DetailPanel";
 import { SectionHeader, type SectionProps } from "./Section";
@@ -50,10 +53,12 @@ export function MachinesSection({ project, refreshKey, route, modules, open }: S
   const restMachines = useMemo(() => machinesApi.data ?? [], [machinesApi.data]);
   const { machines: wsMachines, connected } = useMachinesWebSocket(project, restMachines);
   const placement = usePlacement(project, refreshKey, modules?.placement !== true);
+  const cloud = useApi<CloudStatus>("/cloud/status", project, refreshKey, { skip: modules?.cloud !== true });
   const nodesApi = useApi<ListNodesResponse>("/nodes", "", refreshKey, { skip: route.tab !== "nodes" });
   // The WebSocket sends what GET /api/machines does; its hook types the runner lanes loosely
   const statuses = connected ? (wsMachines as MachineStatus[]) : restMachines;
-  const rows = useMemo(() => machineRows(statuses, placement.data), [statuses, placement.data]);
+  const rows = useMemo(() => machineRows(statuses, placement.data, cloud.data), [statuses, placement.data, cloud.data]);
+  const budget = cloudBudget(cloud.data);
   const nodes = nodeRows(nodesApi.data?.nodes ?? []);
 
   const body = () => {
@@ -94,6 +99,8 @@ export function MachinesSection({ project, refreshKey, route, modules, open }: S
     if (machinesApi.error && !machinesApi.data) return <ErrorState what="machines" error={machinesApi.error} />;
     return (
       <div className="card">
+        {budget && <p className="muted small">Money guard: {budget.reason}</p>}
+        {cloud.data && cloud.data.errors.length > 0 && <p className="muted small">Cloud config: {cloud.data.errors.join("; ")}</p>}
         <DataTable
           label="Machines"
           columns={MACHINE_COLUMNS}
@@ -111,10 +118,21 @@ export function MachinesSection({ project, refreshKey, route, modules, open }: S
     <div>
       <SectionHeader title="Machines" section="machines" route={route} modules={modules}>
         {placement.data?.enabled && <span className="muted small">Placement: {placement.data.mode ?? "off"}</span>}
+        {budget && (
+          <Badge tone={budget.badge} title={budget.reason}>
+            {budget.text}
+          </Badge>
+        )}
       </SectionHeader>
       {body()}
       {route.detail && route.tab !== "nodes" && (
-        <MachineDetailPanel id={route.detail} rows={rows} placement={placement.data} onClose={() => open(null)} />
+        <MachineDetailPanel
+          id={route.detail}
+          rows={rows}
+          placement={placement.data}
+          budget={cloud.data?.enabled ? cloud.data.budget : null}
+          onClose={() => open(null)}
+        />
       )}
       {route.detail && route.tab === "nodes" && (
         <NodeDetailPanel id={route.detail} rows={nodes} loading={nodesApi.loading} onClose={() => open(null)} />
@@ -127,11 +145,13 @@ function MachineDetailPanel({
   id,
   rows,
   placement,
+  budget,
   onClose,
 }: {
   id: string;
   rows: MachineRow[];
   placement: PlacementStatus | null;
+  budget: CloudBudgetStatus | null;
   onClose: () => void;
 }) {
   const model = machineDetail(id, rows, placement);
@@ -169,6 +189,7 @@ function MachineDetailPanel({
           />
         </DetailSection>
       )}
+      {row.cloud && <CloudMachineDetail machine={row.cloud} budget={budget} />}
       {lanes.length > 0 && (
         <DetailSection title="Lanes">
           <ul className="plain-list">
@@ -210,6 +231,60 @@ function MachineDetailPanel({
         </DetailSection>
       )}
     </DetailPanel>
+  );
+}
+
+function money(amount: number | null): string | null {
+  return amount === null ? null : `$${amount.toFixed(2)}`;
+}
+
+function providerReading(r: CloudProviderSpend): string {
+  if (r.state === "amount") return money(r.amount) ?? "-";
+  if (r.state === "unknown") return `no data yet (${r.detail ?? "the provider has none"})`;
+  if (r.state === "error") return `failed: ${r.detail ?? "no detail"}`;
+  return r.detail ?? "not read yet";
+}
+
+/** A cloud machine's provider state, and the project's spend and money guard (read-only) */
+function CloudMachineDetail({ machine, budget }: { machine: CloudMachineStatus; budget: CloudBudgetStatus | null }) {
+  const meter = budget?.meter ?? null;
+  return (
+    <>
+      <DetailSection title="Cloud machine">
+        <KeyValues
+          rows={[
+            ["Provider", `${machine.provider}, ${machine.region}`],
+            ["Instance", `${machine.instanceId} (tag ${machine.tag})`],
+            ["Power state", cloudState(machine)],
+            ["Launched", machine.launchedAt ? <Time iso={machine.launchedAt} /> : null],
+            ["Stopped", machine.stoppedAt ? <Time iso={machine.stoppedAt} /> : null],
+            ["Price", `${money(machine.pricePerHour)}/hour, storage ${money(machine.storagePerMonth)}/month`],
+            ["Last check", machine.lastCheckAt ? <Time iso={machine.lastCheckAt} /> : null],
+            ["Last error", machine.lastError],
+          ]}
+        />
+      </DetailSection>
+      {budget && (
+        <DetailSection title="Spend and money guard">
+          <KeyValues
+            rows={[
+              ["Guard", `${budget.guard.state}: ${budget.guard.reason}`],
+              ["Spend", budget.spend === null ? "unknown" : `${money(budget.spend)} of ${money(budget.limit)}`],
+              ["Period", `${budget.period.start} to ${budget.period.end}`],
+              [
+                "Meter",
+                meter
+                  ? `${money(meter.total)} (compute ${money(meter.compute)}, storage ${money(meter.storage)}, start ${money(meter.start)}); today ${money(meter.today)}`
+                  : budget.meterError,
+              ],
+              ...budget.provider.map((r): [string, string] => [`Provider (${r.profile})`, providerReading(r)]),
+              ["Tripped", budget.guard.trip ? `${money(budget.guard.trip.spend)} on ${budget.guard.trip.at}` : null],
+              ["Checked", budget.guard.checkedAt ? <Time iso={budget.guard.checkedAt} /> : null],
+            ]}
+          />
+        </DetailSection>
+      )}
+    </>
   );
 }
 
