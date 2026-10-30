@@ -21,6 +21,8 @@ export interface ModuleFlags {
   triage: boolean;
   /** placement.enabled */
   placement: boolean;
+  /** host_services.enabled */
+  hostServices: boolean;
   /** pipelines: names at least one pipeline */
   pipelines: boolean;
   /** delivery.enabled */

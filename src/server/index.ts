@@ -519,6 +519,14 @@ const reviews = new ReviewManager({
   decisions: inboxDecisionSink(decisionInbox),
 });
 reviews.load(projectEntries);
+
+// Host services: per-machine services with probe and start (duty D13).
+// One per project with `host_services.enabled: true` (off by default).
+// It probes services (Docker, tunnel daemons) every minute and starts them
+// when down (in act mode, with backoff), holding lanes that need them.
+const hostServices = new HostServicesManager({ events: getEventBus() });
+hostServices.load(projectEntries);
+
 // Every merge hold has one decision (only the owner releases a hold); answering it releases the hold
 await reviews.useDecisions(decisionInbox);
 // The same for delivery's held services: answering releases the service, as its Release button does
@@ -574,12 +582,7 @@ const placements = new PlacementManager({
 placements.load(projectEntries);
 await registerPlacementRoutes(fastify, placements, () => getDefaultProject());
 
-// Host services: per-machine services with probe and start (duty D13).
-// One per project with `host_services.enabled: true` (off by default).
-// It probes services (Docker, tunnel daemons) every minute and starts them
-// when down (in act mode, with backoff), holding lanes that need them.
-const hostServices = new HostServicesManager({ events: getEventBus() });
-hostServices.load(projectEntries);
+// Host services routes
 registerHostServicesRoutes(fastify, hostServices);
 
 // The dashboard's own reads (src/server/dashboard/): the nav's module flags,

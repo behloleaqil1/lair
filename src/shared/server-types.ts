@@ -288,7 +288,12 @@ export type EventType =
   | "planner.verifier_finished"
   // Bus (src/server/bus/)
   | "bus.report"
-  | "bus.message";
+  | "bus.message"
+  // Host services (src/server/host-services/)
+  | "host-service.up"
+  | "host-service.down"
+  | "host-service.starting"
+  | "host-service.decision";
 
 /** Event stored in the database */
 export interface Event {

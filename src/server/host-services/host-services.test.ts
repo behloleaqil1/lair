@@ -12,6 +12,7 @@
  * - A start that keeps failing -> one decision: max attempts
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Decision } from "../../shared/decision-types.js";
 import type { ProjectConfig } from "../../shared/types.js";
 import { EventBus } from "../core/event-bus.js";
 import type { DecisionProducer, DecisionResolution, RaiseDecisionInput, WithdrawInput } from "../decisions/types.js";
@@ -98,17 +99,66 @@ class FakeDecisions implements DecisionProducer {
   withdrawn: { id: string; input: WithdrawInput }[] = [];
   private nextId = 1;
 
-  async raise(input: RaiseDecisionInput): Promise<{ created: boolean; decision: { id: string } }> {
+  async raise(input: RaiseDecisionInput): Promise<{ created: boolean; decision: Decision }> {
     this.raised.push(input);
     const id = `decision-${this.nextId++}`;
-    return { created: true, decision: { id } };
+    const decision: Decision = {
+      id,
+      project: input.project,
+      kind: input.kind,
+      attention: input.attention ?? "action",
+      title: input.title,
+      context: input.context,
+      options: input.options,
+      recommended: input.recommended,
+      source: input.source,
+      key: input.key,
+      blocks: input.blocks ?? [],
+      links: input.links ?? [],
+      createdAt: new Date().toISOString(),
+      overdue: false,
+      status: "open",
+      raisedVia: "server",
+    };
+    return { created: true, decision };
   }
 
-  async withdraw(id: string, input: WithdrawInput): Promise<void> {
+  async withdraw(id: string, input: WithdrawInput): Promise<Decision> {
     this.withdrawn.push({ id, input });
+    return {
+      id,
+      project: "test-project",
+      kind: "other",
+      attention: "action",
+      title: "test",
+      context: "test",
+      options: [],
+      recommended: { optionId: "", reasoning: "" },
+      source: { module: input.module, ref: "" },
+      key: "",
+      blocks: [],
+      links: [],
+      createdAt: new Date().toISOString(),
+      overdue: false,
+      status: "withdrawn",
+      withdrawnReason: input.reason,
+      raisedVia: "server",
+    };
   }
 
-  onResolved(module: string, callback: (r: DecisionResolution) => void): () => void {
+  blockedOn(_ref: string): Decision | null {
+    return null;
+  }
+
+  find(_project: string, _module: string, _key: string): Decision | null {
+    return null;
+  }
+
+  openOf(_project: string, _module: string): Decision[] {
+    return [];
+  }
+
+  onResolved(_module: string, _callback: (r: DecisionResolution) => void): () => void {
     return () => {};
   }
 }
@@ -127,6 +177,7 @@ function makeConfig(
     queue_file: "/tmp/queue.md",
     agents_dir: "/tmp/agents",
     gates_dir: "/tmp/gates",
+    machines: {},
     host_services: {
       enabled: true,
       mode: "act",
