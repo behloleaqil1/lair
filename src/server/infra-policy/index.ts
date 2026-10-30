@@ -6,7 +6,7 @@
 export { parseInfraPolicyConfig } from "./config.js";
 export type { InfraPolicySettings } from "./config.js";
 export { scanRoot, agentMessage, normalizeProviderSource } from "./scan.js";
-export type { Rule, ScanResult, Violation } from "./scan.js";
-export { InfraPolicy, InfraPolicyManager } from "./service.js";
-export type { GuardResult } from "./service.js";
+export type { Rule, ScanOptions, ScanResult, Violation } from "./scan.js";
+export { BlockedInfraPolicy, InfraPolicy, InfraPolicyManager } from "./service.js";
+export type { GuardResult, PolicyGate } from "./service.js";
 export { registerInfraPolicyRoutes } from "./routes.js";

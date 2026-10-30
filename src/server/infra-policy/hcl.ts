@@ -4,6 +4,7 @@
  * never evaluates anything. Input it cannot read throws HclError, and the
  * scan treats that as a violation (fail closed).
  */
+import { createHash } from "crypto";
 
 export class HclError extends Error {
   constructor(
@@ -57,8 +58,22 @@ function tokenize(src: string): Token[] {
       if (c === "\n") throw new HclError("unterminated string", start);
       if (c === "\\") {
         const next = src[i + 1] ?? "";
-        v += next === "n" ? "\n" : next === "t" ? "\t" : next;
-        i += 2;
+        const simple: Record<string, string> = { n: "\n", r: "\r", t: "\t", '"': '"', "\\": "\\" };
+        if (next in simple) {
+          v += simple[next];
+          i += 2;
+        } else if (next === "u" || next === "U") {
+          // \uNNNN and \UNNNNNNNN, as HCL decodes them
+          const digits = next === "u" ? 4 : 8;
+          const hex = src.slice(i + 2, i + 2 + digits);
+          const code = hex.length === digits && /^[0-9A-Fa-f]+$/.test(hex) ? parseInt(hex, 16) : NaN;
+          if (!(code <= 0x10ffff) || (code >= 0xd800 && code <= 0xdfff)) throw new HclError(`bad \\${next} escape`, start);
+          v += String.fromCodePoint(code);
+          i += 2 + digits;
+        } else {
+          // an escape we do not decode could hide a name: refuse it
+          throw new HclError("unsupported escape in a string", start);
+        }
         continue;
       }
       if ((c === "$" || c === "%") && src[i + 1] === c && src[i + 2] === "{") {
@@ -207,6 +222,7 @@ class Parser {
       for (;;) {
         const next = this.peek();
         if (next?.t === "string") {
+          if (next.interpolated) throw new HclError("a block label cannot hold an interpolation", next.line);
           labels.push(next.v);
           this.pos++;
         } else if (next?.t === "ident") {
@@ -305,6 +321,10 @@ export function parseHcl(src: string): Block[] {
   return new Parser(tokenize(src)).parseBody(true).blocks;
 }
 
+
+/** Top-level block types that hold nothing the scan reads */
+export const BENIGN_BLOCKS = new Set(["terraform", "locals", "variable", "output", "moved", "import"]);
+
 /** Turn a .tf.json document into the same blocks (only what the scan reads). */
 export function parseHclJson(src: string): Block[] {
   let doc: unknown;
@@ -321,43 +341,79 @@ export function parseHclJson(src: string): Block[] {
     if (isObj(v)) return { kind: "object", attrs: new Map(Object.entries(v).map(([k, x]) => [k, toValue(x)])) };
     return { kind: "other", raw: JSON.stringify(v) };
   };
-  /** JSON allows an object or an array of objects wherever HCL has one block */
-  const each = (v: unknown): Record<string, unknown>[] =>
-    Array.isArray(v) ? v.filter(isObj) : isObj(v) ? [v] : [];
-  const NESTED = new Set(["provisioner", "required_providers"]);
+  /** JSON allows an object or an array of objects wherever HCL has one block; anything else is refused */
+  const each = (v: unknown): Record<string, unknown>[] => {
+    const items = Array.isArray(v) ? v : [v];
+    for (const item of items) if (!isObj(item)) throw new HclError("expected an object", 1);
+    return items as Record<string, unknown>[];
+  };
   const bodyOf = (type: string, labels: string[], body: Record<string, unknown>): Block => {
     const attrs = new Map<string, Value>();
     const blocks: Block[] = [];
     for (const [key, val] of Object.entries(body)) {
-      if (NESTED.has(key)) {
-        // provisioner: [{ "local-exec": {...} }]; required_providers: {...}
-        if (key === "provisioner") {
-          for (const p of each(val)) for (const [kind, inner] of Object.entries(p)) blocks.push(bodyOf("provisioner", [kind], isObj(inner) ? inner : {}));
-        } else for (const e of each(val)) blocks.push(bodyOf(key, [], e));
+      if (key === "provisioner") {
+        // provisioner: [{ "local-exec": {...} }]
+        for (const p of each(val)) for (const [kind, inner] of Object.entries(p)) for (const b of each(inner)) blocks.push(bodyOf("provisioner", [kind], b));
+      } else if (key === "required_providers") {
+        for (const e of each(val)) blocks.push(bodyOf(key, [], e));
+      } else if (key === "data" && type === "check") {
+        blocks.push(...twoLabels("data", val));
       } else attrs.set(key, toValue(val));
     }
     return { type, labels, line: 1, attrs, blocks };
   };
+  /** `{ "<type>": { "<name>": body } }`: resource and data sections */
+  const twoLabels = (section: string, content: unknown): Block[] => {
+    const out: Block[] = [];
+    for (const group of each(content)) {
+      for (const [rtype, named] of Object.entries(group)) {
+        for (const inst of each(named)) {
+          for (const [name, body] of Object.entries(inst)) for (const b of each(body)) out.push(bodyOf(section, [rtype, name], b));
+        }
+      }
+    }
+    return out;
+  };
+  /** `{ "<name>": body }`: module, provider and check sections */
+  const oneLabel = (section: string, content: unknown): Block[] => {
+    const out: Block[] = [];
+    for (const group of each(content)) {
+      for (const [name, body] of Object.entries(group)) for (const b of each(body)) out.push(bodyOf(section, [name], b));
+    }
+    return out;
+  };
 
   const out: Block[] = [];
   for (const [section, content] of Object.entries(doc)) {
-    for (const group of each(content)) {
-      if (section === "resource" || section === "data") {
-        for (const [rtype, named] of Object.entries(group)) {
-          for (const inst of each(named)) {
-            for (const [name, body] of Object.entries(inst)) {
-              for (const b of each(body)) out.push(bodyOf(section, [rtype, name], b));
-            }
-          }
-        }
-      } else if (section === "module" || section === "provider") {
-        for (const [name, body] of Object.entries(group)) {
-          for (const b of each(body)) out.push(bodyOf(section, [name], b));
-        }
-      } else if (section === "terraform") {
-        out.push(bodyOf("terraform", [], group));
-      }
+    if (section === "resource" || section === "data") out.push(...twoLabels(section, content));
+    else if (section === "module" || section === "provider" || section === "check") out.push(...oneLabel(section, content));
+    else if (section === "terraform" || section === "removed") for (const group of each(content)) out.push(bodyOf(section, [], group));
+    else {
+      // other sections hold nothing the scan reads; an unknown one is kept so the scan can refuse it
+      out.push({ type: section, labels: [], line: 1, attrs: new Map(), blocks: [] });
     }
   }
   return out;
+}
+
+const byKey = ([a]: [string, unknown], [b]: [string, unknown]) => (a < b ? -1 : a > b ? 1 : 0);
+
+function canonicalValue(v: Value): unknown {
+  if (v.kind === "string") return ["s", v.value, v.interpolated];
+  if (v.kind === "object") return ["o", [...v.attrs].sort(byKey).map(([k, x]) => [k, canonicalValue(x)])];
+  return ["r", v.raw];
+}
+
+function canonicalBlock(b: Block): unknown {
+  const attrs = [...b.attrs].sort(byKey).map(([k, x]) => [k, canonicalValue(x)]);
+  return [b.type, b.labels, attrs, b.blocks.map(canonicalBlock)];
+}
+
+/**
+ * A hash of a block's content (type, labels, attributes, nested blocks), not
+ * of its position or formatting. An `allow` entry names it, so an allowed
+ * block that is edited is no longer allowed.
+ */
+export function blockHash(b: Block): string {
+  return createHash("sha256").update(JSON.stringify(canonicalBlock(b))).digest("hex");
 }

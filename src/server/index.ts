@@ -419,7 +419,7 @@ await registerDeliveryRoutes(fastify, delivery, () => getDefaultProject(), human
 // and runs nothing; the plan step of a later change goes through its guard.
 const infraPolicy = new InfraPolicyManager();
 infraPolicy.load(projectEntries);
-await registerInfraPolicyRoutes(fastify, infraPolicy, () => getDefaultProject());
+await registerInfraPolicyRoutes(fastify, infraPolicy, () => getDefaultProject(), humanAuth);
 
 // AI tools (src/server/ai/): per machine, whether each tool is installed and
 // signed in, and the models it offers, from the tools' own commands (bounded,

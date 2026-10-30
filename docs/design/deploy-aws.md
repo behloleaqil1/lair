@@ -90,10 +90,24 @@ A scan failure stops the pipeline before plan runs; the agent sees only "policy 
 **As built (PR 1, `src/server/infra-policy/`):** a static scanner of its own instead of OPA/Conftest, so Lair needs no
 extra binary; it reads `.tf`, `.tofu` and their `.json` forms, follows local modules inside the root, and refuses
 anything it cannot read. The allowlists and the per-address `allow` list live in the project's `infra_policy:` block
-(see [configuration](../configuration.md#infrastructure-policy-scan)). It is off by default. `InfraPolicy.guardPlan` is
+(see [configuration](../configuration.md#infrastructure-policy-scan)). It is off by default. `guardPlan` of the project's policy is
 what the OpenTofu runner (PR 3) calls: it does not start the plan when the scan fails. Not in this PR: the lock-file
 hash check ("or locked in `.terraform.lock.hcl`"), which belongs to the plan sandbox (PR 2) where providers are
 installed, and scanning remote modules (allowlisted sources are trusted as pinned).
+
+The scan also refuses every provisioner (`local-exec`, `remote-exec`, `file`, any other), reads `check` blocks (a
+scoped `data` source runs on plan) and `removed` blocks (a destroy-time provisioner runs on apply), decodes `\uNNNN`
+escapes in labels before matching, and refuses a block type it does not know. It is asynchronous and bounded: 1 MiB per
+file, 8 MiB in total, 500 files, 8 module levels and a 10 second deadline; a breach is a refusal (`unreadable`, detail
+`scan limit`). An `allow` entry names a root, an address and the hash of the block's content, so editing an allowed
+block (a changed `url` or `command`) ends the allowance; the scan reports it as changed. A project whose
+`infra_policy` block is invalid, and is not explicitly `enabled: false`, holds a blocked policy: `guardPlan` always
+refuses (rule `invalid-config`) and the runner asks `requires(project)` to know a scan is wanted. The scan routes are the
+owner's: only `guardPlan` tells an agent anything, and that is the rule names.
+
+**Time of check, time of use:** the scan reads the live directory and `plan` runs after it, so code could change between
+the two. The plan runner (PR 2 and 3) must plan a copy taken after the scan (or compare a content hash before and
+after), never the live directory.
 
 ### 2.2 Plan (isolated)
 
