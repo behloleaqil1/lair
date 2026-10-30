@@ -1,7 +1,7 @@
 # Work store: tasks, events, briefs and messages in Lair's database
 
-> Status: design. This document covers what the work store is and how it will be built. Claude reviews it as RED
-> before code begins. Roadmap: [ROADMAP.md](ROADMAP.md) A (follows the bus). Relates to:
+> Status: design. This document covers what the work store is and how it will be built. A reviewer reads it line by
+> line, and the owner approves it, before code begins. Roadmap: [ROADMAP.md](ROADMAP.md) A (follows the bus). Relates to:
 > [phase3-bus.md](phase3-bus.md) (agents report through the bus), [planner.md](planner.md) (proposals become tasks),
 > [autonomy.md §4](autonomy.md) (the planner module), [autonomy.md §6](autonomy.md) (agents),
 > [configuration.md](../configuration.md#fill) (fill's tasks file).
@@ -16,9 +16,6 @@ Today work lives in project files:
 | queue file | Free-text lines: `DONE`, `WAITING`, `BLOCKED`, `PROGRESS` | Loose pattern matching closed 6 unrelated tasks in one day; no structured schema |
 | brief files | Markdown documents per task | Prompts reference stale versions; no history |
 | per-agent prompt files | The prompt template for an agent's runs | Agents follow outdated prompts when files change mid-run |
-
-On 30 Oct alone: stale "DONE" lines matched loosely and closed six new tasks; agents followed outdated prompt files;
-several writers edited the same files.
 
 This is also not a product: "write your tasks in this exact line format" is one project's habit, not something Lair
 can offer to others.
@@ -641,8 +638,8 @@ A task's `externalRef` links it to a GitHub issue:
 ```typescript
 interface ExternalRef {
   provider: 'github';
-  owner: string;      // e.g. 'behloleaqil1'
-  repo: string;       // e.g. 'lair'
+  owner: string;      // e.g. 'example-org'
+  repo: string;       // e.g. 'example-repo'
   number: number;     // Issue number
   url: string;        // Full URL
 }
@@ -686,7 +683,7 @@ not an automatic override. This preserves the principle that Lair is the source 
 
 ### 12.6 Tracker module compatibility
 
-The `tracker` module (lair-tracker-github.md) builds the sync against today's task model. This design
+The tracker module (its own design doc, when it lands) builds the sync against today's task model. This design
 ensures the tracker can move onto the work store with no behaviour change:
 
 - The tracker reads tasks from the work store instead of files.
