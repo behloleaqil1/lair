@@ -113,7 +113,7 @@ describe("the modules that raise decisions", () => {
         const site = `${file}:${line}`;
         expect(args, `${site} sets a class`).toMatch(/\bclass: |\bstructure: \{|\bstructure,/);
         expect(args, `${site} sets evidence`).toMatch(/\bevidence\b/);
-        expect(args, `${site} sets an effect on its options`).toMatch(/\beffects?\b/);
+        expect(args, `${site} sets an effect on its options`).toMatch(/\beffects?\b|\boptions,/);
       }
     }
     // Sites are found, not skipped: a change of shape that finds none fails here

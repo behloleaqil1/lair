@@ -87,18 +87,18 @@ describe("decision class, evidence and option effects", () => {
     expect(inbox.get(decision.id)).toMatchObject({ class: "agents.provider_limit", options: decision.options });
   });
 
-  it("an invalid evidence object is refused at raise time, naming the field", async () => {
+  it("an invalid evidence object is refused over HTTP, naming the field (a module inside Lair raises it plain: structure-fallback.test.ts)", async () => {
     const { inbox } = setup();
     const bad = (evidence: unknown) => structured({ evidence: evidence as RaiseDecisionInput["evidence"] });
     const ok = structured().evidence!;
-    await expect(inbox.raise(bad({ ...ok, code: "Provider Limit" }))).rejects.toThrow(/evidence\.code/);
-    await expect(inbox.raise(bad({ ...ok, cause_cleared: "no" }))).rejects.toThrow(/evidence\.cause_cleared/);
-    await expect(inbox.raise(bad({ ...ok, linked_issue: 0 }))).rejects.toThrow(/evidence\.linked_issue/);
-    await expect(inbox.raise(bad({ ...ok, facts: { nested: { a: 1 } } }))).rejects.toThrow(/evidence\.facts\.nested/);
-    await expect(inbox.raise(bad({ ...ok, facts: { "Bad Name": 1 } }))).rejects.toThrow(/evidence\.facts/);
-    await expect(inbox.raise(bad({ ...ok, facts: { n: Number.NaN } }))).rejects.toThrow(/evidence\.facts\.n/);
-    await expect(inbox.raise(bad({ ...ok, extra: 1 }))).rejects.toThrow(/evidence/);
-    await expect(inbox.raise(bad({ code: "provider_rate_limit" }))).rejects.toBeInstanceOf(DecisionError);
+    await expect(inbox.raiseFromHttp(bad({ ...ok, code: "Provider Limit" }))).rejects.toThrow(/evidence\.code/);
+    await expect(inbox.raiseFromHttp(bad({ ...ok, cause_cleared: "no" }))).rejects.toThrow(/evidence\.cause_cleared/);
+    await expect(inbox.raiseFromHttp(bad({ ...ok, linked_issue: 0 }))).rejects.toThrow(/evidence\.linked_issue/);
+    await expect(inbox.raiseFromHttp(bad({ ...ok, facts: { nested: { a: 1 } } }))).rejects.toThrow(/evidence\.facts\.nested/);
+    await expect(inbox.raiseFromHttp(bad({ ...ok, facts: { "Bad Name": 1 } }))).rejects.toThrow(/evidence\.facts/);
+    await expect(inbox.raiseFromHttp(bad({ ...ok, facts: { n: Number.NaN } }))).rejects.toThrow(/evidence\.facts\.n/);
+    await expect(inbox.raiseFromHttp(bad({ ...ok, extra: 1 }))).rejects.toThrow(/evidence/);
+    await expect(inbox.raiseFromHttp(bad({ code: "provider_rate_limit" }))).rejects.toBeInstanceOf(DecisionError);
     expect(inbox.counts().open).toBe(0);
   });
 
