@@ -1241,10 +1241,9 @@ export class TriageStore {
 
   /** Get gates associated with an environment wait. */
   getEnvironmentWaitGates(waitId: string): { gateId: string; recordId: string }[] {
-    return this.db.prepare(`SELECT gate_id, record_id FROM triage_env_wait_gates WHERE wait_id = ?`).all(waitId) as {
-      gateId: string;
-      recordId: string;
-    }[];
+    return this.db
+      .prepare(`SELECT gate_id AS gateId, record_id AS recordId FROM triage_env_wait_gates WHERE wait_id = ?`)
+      .all(waitId) as { gateId: string; recordId: string }[];
   }
 
   /** Update environment wait after a probe attempt. */
