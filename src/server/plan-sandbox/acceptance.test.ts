@@ -166,7 +166,7 @@ describe("the plan cannot read a secret", () => {
     for (const spec of r.spawner.specs) {
       expect(Object.keys(spec.env).sort()).toEqual([
         "AWS_ACCESS_KEY_ID", "AWS_EC2_METADATA_DISABLED", "AWS_REGION", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
-        "CHECKPOINT_DISABLE", "HOME", "PATH", "TF_IN_AUTOMATION", "TF_INPUT",
+        "CHECKPOINT_DISABLE", "HOME", "PATH", "TF_INPUT", "TF_IN_AUTOMATION",
       ]);
       const everything = JSON.stringify(spec);
       for (const secret of ["control-plane-token", "AKIAAPPLYROLEKEY", "apply-role-secret", "postgres://user:pw@db/app"]) {
