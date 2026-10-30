@@ -10,7 +10,7 @@
  * 4. `off` behaves byte-for-byte as main (the file reader only).
  * 5. An event for an unknown task or agent is ignored and audited.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, beforeAll, vi } from "vitest";
 import { BusConsumers, extractBusId, type BusReportEvent, type BusMessageEvent, type BusConsumeMode } from "./consumers.js";
 import { EventBus } from "../core/event-bus.js";
 
@@ -434,8 +434,13 @@ describe("BusConsumers", () => {
 });
 
 describe("bus config", () => {
-  // Import here to avoid circular dependencies
-  const { parseBusConfig } = await import("./config.js");
+  let parseBusConfig: (raw: Record<string, unknown> | undefined) => { consume: string };
+
+  beforeAll(async () => {
+    // Import here to avoid circular dependencies
+    const module = await import("./config.js");
+    parseBusConfig = module.parseBusConfig;
+  });
 
   it("returns defaults for undefined config", () => {
     const settings = parseBusConfig(undefined);

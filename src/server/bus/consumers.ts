@@ -279,7 +279,7 @@ export class BusConsumers {
   // ============ Event handlers ============
 
   private handleReport(project: string, event: Event, state: ConsumerState): void {
-    const data = event.data as BusReportEvent;
+    const data = event.data as unknown as BusReportEvent;
     if (data.project !== project) return;
 
     // Call the handler with the mode
@@ -292,7 +292,7 @@ export class BusConsumers {
   }
 
   private handleMessage(project: string, event: Event, state: ConsumerState): void {
-    const data = event.data as BusMessageEvent;
+    const data = event.data as unknown as BusMessageEvent;
     if (data.project !== project) return;
 
     // Call the handler with the mode
