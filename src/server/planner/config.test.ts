@@ -55,6 +55,7 @@ describe("planner config", () => {
       donePattern: "^-\\s+DONE\\s+{task}(?=\\s|$)",
       waitingPattern: "^-\\s+WAITING\\s+{task}(?=\\s|$)",
       blockedPattern: "^-\\s+BLOCKED\\s+{task}(?=\\s|$)",
+      doneMatch: "task_id",
     });
     expect(s).toMatchObject({ onePerAgent: false, fillEnabled: false });
     expect(s.approval).toEqual({ add: "never", finish: "always", reassign: "always", reword: "never", drop: "always", unblock: "always" });
