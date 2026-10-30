@@ -3,9 +3,10 @@
  * launch and stop, as the provider described them, times the machine's
  * hourly price, plus storage for every month of the period begun so far,
  * plus the spend before the meter's first run (meter_start). It errs high:
- * each run is rounded up to whole minutes, a run with no known stop counts
- * up to when Lair saw it stopped (or up to now while it runs), and a month
- * of storage counts from its first day.
+ * each run is rounded up to whole minutes and counts one at least, a run
+ * with no known stop counts up to when Lair saw it stopped (or up to now
+ * while it runs), a stop the provider dated after this machine's clock is
+ * not cut back to now, and a month of storage counts from its first day.
  */
 import type { CloudMeterSpend } from "../../shared/cloud-types.js";
 import type { CloudBudgetSettings, CloudMachineSettings } from "./config.js";
@@ -39,6 +40,16 @@ export function billedHours(from: number, to: number): number {
   return to > from ? Math.ceil((to - from) / MINUTE_MS) / 60 : 0;
 }
 
+/**
+ * Where a run's billing ends: a known stop as the provider dated it (never
+ * clipped to this machine's clock, which may be behind the provider's), an
+ * open run at now; and a minute after the launch at the earliest (EC2 bills
+ * a minute at least per start), so a launch dated after now still counts.
+ */
+export function runEnd(run: Pick<MeterRun, "launchedAt" | "stoppedAt">, now: number): number {
+  return Math.max(run.stoppedAt ?? now, run.launchedAt + MINUTE_MS);
+}
+
 /** Calendar months (UTC) of [startMs, endMs) begun by `now`, counting the current one */
 export function monthsBegun(startMs: number, endMs: number, now: number): number {
   const last = Math.min(now, endMs - 1);
@@ -57,7 +68,7 @@ export function meterSpend(input: MeterInput): CloudMeterSpend {
   for (const run of input.runs) {
     // A price raised in the config since counts for earlier runs too
     const perHour = Math.max(run.pricePerHour, price.get(run.machine) ?? 0);
-    const end = Math.min(run.stoppedAt ?? now, now);
+    const end = runEnd(run, now);
     compute += billedHours(Math.max(run.launchedAt, budget.startMs), Math.min(end, budget.endMs)) * perHour;
     todays += billedHours(Math.max(run.launchedAt, today), end) * perHour;
   }

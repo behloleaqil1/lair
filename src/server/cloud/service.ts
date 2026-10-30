@@ -34,6 +34,11 @@ import { AwsEc2Provider, providerText, sdkClients, type AwsClients, type CloudPr
 import { CloudStore, type StoredSpend } from "./store.js";
 
 const HOUR_MS = 3_600_000;
+/**
+ * A provider time this far after this machine's clock means the clock is
+ * behind: the meter would count runs short, so the spend can't be told.
+ */
+const CLOCK_AHEAD_MS = 60_000;
 
 export interface ProjectEntry {
   name: string;
@@ -229,6 +234,13 @@ export class CloudMachines {
           rt.launchedAt = desc.launchedAt;
           rt.stoppedAt = desc.stoppedAt;
           rt.lastError = null;
+          // A clock behind the provider's would count runs short: not recorded, and the spend can't be told
+          const ahead = Math.max(desc.launchedAt ?? -Infinity, desc.stoppedAt ?? -Infinity) - now;
+          if (ahead > CLOCK_AHEAD_MS) {
+            throw new Error(
+              `the provider dates its last launch or stop ${Math.round(ahead / 1000)} s after this machine's clock: check the clock`,
+            );
+          }
           this.store.recordDescription(this.project, m, desc, now);
         } catch (e) {
           // A machine Lair can't see may be running: the meter can't be told

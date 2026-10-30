@@ -412,6 +412,32 @@ describe("cloud: the money guard", () => {
   });
 });
 
+describe("cloud: the meter never counts short", () => {
+  it("with this machine's clock behind the provider's: a run counts a minute at least, a later stop is kept, a launch over a minute ahead refuses", async () => {
+    // Launched 30 s after this machine's clock: a minute at $0.50, not nothing
+    const ahead = new Harness(cloudBlock());
+    ahead.instance("running", NOW + 30_000);
+    await ahead.machines.check();
+    expect(ahead.status().budget?.meter?.compute).toBe(0.01);
+
+    // A stop dated 30 s after now: 60.5 minutes billed as 61, not cut back to 60
+    const stopped = new Harness(cloudBlock());
+    stopped.instance("stopped", NOW - HOUR, NOW + 30_000);
+    await stopped.machines.check();
+    expect(stopped.status().budget?.meter?.compute).toBe(0.51);
+
+    // Two minutes ahead: the clock is wrong, so the spend can't be told and nothing starts
+    const wrong = new Harness(cloudBlock());
+    wrong.instance("stopped", NOW + 2 * 60_000, NOW + 3 * 60_000);
+    const result = await wrong.machines.startMachine("cloud-1");
+    expect(result).toMatchObject({ allowed: false });
+    expect(result.reason).toMatch(/^spend unknown: describe failed for cloud-1: the provider dates its last launch or stop 180 s after this machine's clock/);
+    expect(wrong.status().budget?.meter).toBeNull();
+    expect(wrong.aws.named("StartInstances")).toHaveLength(0);
+    expect(wrong.trips()).toEqual([]);
+  });
+});
+
 describe("cloud: only the current instance starts, and only through the guard", () => {
   it("a stopped or replaced instance starts and stops nothing, a start queued before its stop included", async () => {
     const h = new Harness(cloudBlock());
