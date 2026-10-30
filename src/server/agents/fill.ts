@@ -762,6 +762,8 @@ interface HoldQuestion {
   keepConsequences?: string;
   why?: string;
   withOutput?: boolean;
+  /** The evidence code: why the task is held (agents.gave_up, or agents.cannot_start for probe_failed and fill_waiting) */
+  code: "probe_failed" | "fill_waiting" | "repeated_failure" | "exit0_no_report" | "blocked_reported";
 }
 
 export interface AgentsFillOptions {
@@ -1103,6 +1105,7 @@ export class AgentsFill {
         }
         await hold("refused", reason);
         await ask(latest, fillRefusedKey(task, release?.id ?? "0", latest?.id ?? null), {
+          code: "probe_failed",
           question,
           context,
           startLabel: "Start it again",
@@ -1172,6 +1175,7 @@ export class AgentsFill {
           const reason = `its run ${short(latest.id)} lost its claim (${oneLine(latest.detail)}), not released by you: fill leaves the task to you`;
           await hold("owner", reason, latest.id);
           await ask(latest, fillDecisionKey(task, latest.id), {
+            code: "repeated_failure",
             question: `${agent} is paused on ${task}: its run lost its claim to the task, and you did not release it`,
             context: runs,
           });
@@ -1192,6 +1196,7 @@ export class AgentsFill {
           continue;
         }
         await ask(latest, fillDecisionKey(task, latest.id), {
+          code: "repeated_failure",
           question: `${agent} is paused on ${task}: ${howItEnded(latest)}`,
           context: [
             ...runs,
@@ -1210,6 +1215,7 @@ export class AgentsFill {
         const reason = `blocked: ${oneLine(status.line)}: fill leaves the task to you (release the hold once it is unblocked)`;
         await hold("blocked", reason, latest.id);
         await ask(latest, fillDecisionKey(task, latest.id, "blocked"), {
+          code: "blocked_reported",
           question: `${agent} is paused on ${task}: it reported the task blocked`,
           context: [`Run ${short(latest.id)} ended ${iso(latest.endedAt ?? latest.requestedAt)} on this line:`, "", ...asData(status.line)],
           startConsequences: `Fill starts ${task} for ${agent} again on its next check: choose this once what blocked it is cleared.`,
@@ -1226,6 +1232,7 @@ export class AgentsFill {
           run.id,
         );
         await ask(run, fillDecisionKey(task, run.id), {
+          code: "exit0_no_report",
           question: `${agent} is paused on ${task}: its last ${count} run(s) ended without reporting it done`,
           context: [
             "Runs:",
@@ -1291,6 +1298,7 @@ export class AgentsFill {
             view,
           );
           await ask(latest, waitingKey, {
+            code: "fill_waiting",
             question: `${agent} is paused on ${task}: it has waited on ${on} since ${iso(streakStart)}`,
             context: [
               `Run ${short(latest.id)} ended ${iso(since)} on this line:`,
@@ -1612,11 +1620,13 @@ export class AgentsFill {
           {
             id: DECISION_FILL_START,
             label: ask.startLabel ?? "Start it again",
+            effect: "reversible",
             consequences: ask.startConsequences ?? `Fill starts ${task} for ${agent} again on its next check, counting from zero.`,
           },
           {
             id: DECISION_FILL_KEEP,
             label: "Keep it paused",
+            effect: "reversible",
             consequences:
               ask.keepConsequences ??
               `Fill leaves ${task} paused until you start a run of it, or release it in Work. Nothing more is asked about it.`,
@@ -1627,6 +1637,15 @@ export class AgentsFill {
           ask.why ??
           "A run that stops the same way again and again usually needs a change a restart won't make (a usage limit, a missing done line, a prompt).",
         reversible: true,
+        structure: {
+          class: ask.code === "probe_failed" || ask.code === "fill_waiting" ? "agents.cannot_start" : "agents.gave_up",
+          evidence: {
+            code: ask.code,
+            facts: { agent, task, attempt_count: latest?.attempt ?? null, last_exit: latest?.exitCode ?? null },
+            cause_cleared: false,
+            linked_issue: null,
+          },
+        },
       },
       latest,
     );
