@@ -287,8 +287,7 @@ Total: ~2,050 lines across 7 PRs.
 
 ## 9. ROADMAP update
 
-C7 (Kubernetes and PaaS deploy targets) moves up because a first project (the one that prompted ADR 0030 in the
-LeadForge repository) needs AWS deployment before launch. The new order:
+C7 (Kubernetes and PaaS deploy targets) moves up because a first project needs AWS deployment before its launch. The new order:
 
 | Before | After |
 |--------|-------|
