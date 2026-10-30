@@ -3353,18 +3353,32 @@ export class AgentsService {
    * provably its own gets SIGTERM to its process group; up to stop_grace_seconds (never more than `maxWaitMs`)
    * for them to end, then SIGKILL; each signal is recorded. The runs stay stopping: the next server's first tick
    * ends them by their queue line. With on_restart: adopt (the default) nothing is signalled.
+   *
+   * A run this server started is judged by the spawner alone (its exit status). Any other (adopted after a
+   * restart) only on a fresh reading of the process table, never the cached one: a reading seconds old would keep
+   * a run that ended on SIGTERM waiting for the SIGKILL, or drop a live one before it. When a fresh reading fails,
+   * an adopted run is not signalled (it can't be proven the run's), and while waiting it counts as still running.
    */
   async stopRunsForShutdown(maxWaitMs: number): Promise<{ signalled: number; killed: number }> {
     if (this.settings.onRestart !== "stop" || this.readOnly) return { signalled: 0, killed: 0 };
     return this.exclusive(async () => {
-      const t = await this.newTick();
-      const own = this.store
-        .activeRuns(this.project)
-        .filter(
-          (run) =>
-            (run.state === "running" || run.state === "stopping") &&
-            reconcileRun(run, t.snap, run.pid !== undefined && this.probes.spawner.knows(run.pid)).kind === "adopted",
-        );
+      const known = (run: AgentRun) => run.pid !== undefined && this.probes.spawner.knows(run.pid);
+      const exited = (run: AgentRun) => run.pid === undefined || this.probes.spawner.exitCode(run.pid) !== undefined;
+      const active = this.store.activeRuns(this.project).filter((run) => run.state === "running" || run.state === "stopping");
+      const fresh = async (): Promise<ProcessSnapshot | null> => {
+        if (active.every(known)) return null; // nothing to read for
+        try {
+          return await this.readSnapshot(true);
+        } catch (e) {
+          console.warn(`[agents] ${this.project}: reading the process table for the shutdown failed: ${message(e)}`);
+          return null;
+        }
+      };
+      const first = await fresh();
+      const t = this.tickOn(first ?? new ProcessSnapshot([], this.probes.clock.now(), this.probes.self, this.settings.pidStartToleranceSeconds));
+      const own = active.filter(
+        (run) => !exited(run) && (known(run) || (first !== null && reconcileRun(run, first, false).kind === "adopted")),
+      );
       const recordSignal = (run: AgentRun, signal: "SIGTERM" | "SIGKILL", at: number) =>
         this.record(
           "stopped_for_shutdown",
@@ -3389,17 +3403,23 @@ export class AgentsService {
       }
       const until = t.now + Math.min(this.settings.stopGraceSeconds * 1000, maxWaitMs);
       let alive = own;
+      /** The latest reading of the table: an adopted run is SIGKILLed only when it shows the run's process */
+      let reading = first;
       while (alive.length > 0 && this.probes.clock.now() < until) {
         await this.probes.clock.sleep(Math.min(SHUTDOWN_POLL_MS, until - this.probes.clock.now()));
-        let list: ProcessInfo[];
-        try {
-          list = await this.probes.processes.list();
-        } catch {
-          continue; // unread: they count as alive until a reading says otherwise
-        }
-        const snap = new ProcessSnapshot(list, this.probes.clock.now(), this.probes.self, this.settings.pidStartToleranceSeconds);
-        alive = alive.filter(
-          (run) => run.pid !== undefined && this.probes.spawner.exitCode(run.pid) === undefined && snap.isAlive(run.pid, run.pidStartedAt),
+        if (!alive.every(known)) reading = await fresh();
+        alive = alive.filter((run) => {
+          if (exited(run)) return false;
+          if (known(run) || reading === null) return true; // unread: alive until a reading says otherwise
+          return run.pid !== undefined && reading.isAlive(run.pid, run.pidStartedAt);
+        });
+      }
+      // A run that looked alive only because the table couldn't be read is not proven its run's process: no SIGKILL
+      const unproven = reading === null ? alive.filter((run) => !known(run)) : [];
+      alive = alive.filter((run) => !unproven.includes(run));
+      for (const run of unproven) {
+        console.warn(
+          `[agents] ${this.project}: no SIGKILL to pid ${run.pid} (run ${short(run.id)}): the process table couldn't be read to prove it the run's`,
         );
       }
       for (const run of alive) {

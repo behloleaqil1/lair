@@ -1530,6 +1530,70 @@ describe("4a. a restart never leaves two runs of one task: the previous server's
     expect(h2.psCache?.peek()?.error).toContain("part-way");
     unchanged();
   });
+
+  it("on_restart: stop waits on an adopted run with fresh readings, never the cached one: one that ends on SIGTERM is not SIGKILLed", async () => {
+    const h1 = setup(() => ({ on_restart: "stop" }));
+    await request(h1);
+    await h1.service.tick(); // pid 5001
+    const [before] = runs(h1);
+
+    // The next server adopts the run, reading ps through the shared cache
+    const h2 = setup(() => ({ on_restart: "stop" }), { paths: h1, self: RESTARTED, cachedPs: true });
+    h2.procs.add(5001, h1.spawner.calls[0].argv.join(" "), NOW);
+    await restart(h2);
+    expect(eventsOf(h2, "run_adopted").map((e) => e.runId)).toEqual([before.id]);
+
+    // It shuts down: the agent ends on SIGTERM, which the cached reading (10 s max age) would not show yet
+    const stopping = h2.clock.now();
+    await h2.manager.stop({ planned: true });
+    expect(h2.spawner.kills).toEqual([{ pid: 5001, signal: "SIGTERM" }]);
+    expect(h2.clock.now() - stopping).toBe(1 * SEC);
+
+    const h3 = setup(() => ({ on_restart: "stop" }), { paths: h1, self: { pid: 300, startedAt: NOW + 10 * MIN } });
+    expect(eventsOf(h3, "stopped_for_shutdown").map((e) => [e.runId, e.data.signal])).toEqual([[before.id, "SIGTERM"]]);
+    expect(runs(h3)[0]).toMatchObject({ id: before.id, state: "stopping", stopReason: "server_shutdown" });
+    expect(runs(h3)[0].killed).not.toBe(true);
+    expect(runs(h3)[0].detail).not.toContain("SIGKILL");
+  });
+
+  it("on_restart: stop SIGKILLs an adopted run that outlives the wait only on a reading that shows it: an unreadable table proves nothing", async () => {
+    /** A run the next server adopted, whose agent ignores SIGTERM */
+    async function adopted(): Promise<Harness> {
+      const h1 = setup(() => ({ on_restart: "stop" }));
+      await request(h1);
+      await h1.service.tick(); // pid 5001
+      const h2 = setup(() => ({ on_restart: "stop" }), { paths: h1, self: RESTARTED, cachedPs: true });
+      h2.procs.add(5001, h1.spawner.calls[0].argv.join(" "), NOW);
+      h2.spawner.ignoreTermFor.add(5001);
+      await restart(h2);
+      expect(eventsOf(h2, "run_adopted")).toHaveLength(1);
+      return h2;
+    }
+
+    // The table reads through the wait, and shows the process still running at its end: SIGKILL
+    const readable = await adopted();
+    await readable.manager.stop({ planned: true });
+    expect(readable.spawner.kills).toEqual([
+      { pid: 5001, signal: "SIGTERM" },
+      { pid: 5001, signal: "SIGKILL" },
+    ]);
+    expect(readable.clock.now() - RESTARTED.startedAt).toBe(20 * SEC);
+
+    // ps fails from the first reading after the SIGTERM on: the run counts as running to the end of the wait, but
+    // nothing proves the pid still the run's, so it gets no SIGKILL
+    const unreadable = await adopted();
+    unreadable.procs.afterList = () => {
+      if (unreadable.spawner.kills.length > 0) unreadable.ps.failing = true;
+    };
+    await unreadable.manager.stop({ planned: true });
+    expect(unreadable.spawner.kills).toEqual([{ pid: 5001, signal: "SIGTERM" }]);
+    expect(unreadable.clock.now() - RESTARTED.startedAt).toBe(20 * SEC);
+    expect(unreadable.procs.has(5001)).toBe(true);
+    const next = setup(() => ({ on_restart: "stop" }), { paths: unreadable, self: { pid: 300, startedAt: NOW + 10 * MIN } });
+    expect(eventsOf(next, "stopped_for_shutdown").map((e) => e.data.signal)).toEqual(["SIGTERM"]);
+    expect(runs(next)[0]).toMatchObject({ state: "stopping", stopReason: "server_shutdown" });
+    expect(runs(next)[0].killed).not.toBe(true);
+  });
 });
 
 // ============ 5. FAILOVER ============
