@@ -298,6 +298,40 @@ describe("changes", () => {
   });
 });
 
+describe("the first read", () => {
+  it("is waited for at most the given time when it hangs, then the cache serves what it has", async () => {
+    writeFileSync(QUEUE, line("worker-1", 1));
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const reader: QueueFileReader = {
+      stat: (p) => fsQueueFileReader.stat(p),
+      read: async (p, max) => {
+        await gate; // a stalled mount: the first read does not come back
+        return fsQueueFileReader.read(p, max);
+      },
+    };
+    const cache = new QueueCache(QUEUE, { reader });
+    caches.push(cache);
+    void cache.start();
+
+    const started = performance.now();
+    expect(await cache.readyWithin(50)).toBe(false);
+    expect(performance.now() - started).toBeLessThan(5_000);
+    expect(cache.getLines()).toEqual([]); // empty, not blocked
+
+    // The read carried on in the background and lands when the disk answers
+    release();
+    expect(await cache.readyWithin(5_000)).toBe(true);
+    expect(cache.getLines()).toHaveLength(1);
+  });
+
+  it("returns true at once when the file is read in time", async () => {
+    writeFileSync(QUEUE, line("worker-1", 1));
+    const cache = await started();
+    expect(await cache.readyWithin(5_000)).toBe(true);
+  });
+});
+
 describe("the cache manager", () => {
   it("gives a project one cache, and a new one when its queue file moves", async () => {
     writeFileSync(QUEUE, line("worker-1", 1));

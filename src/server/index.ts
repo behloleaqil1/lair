@@ -130,7 +130,10 @@ function respondCached<T>(cached: CachedData<T>): ApiResponse<T> & { cache: { ag
 // Get data service for project (cached per request cycle)
 const dataServices = new Map<string, DataService>();
 const queueCaches = new QueueCacheManager();
-const queueReady = new Map<string, () => Promise<void>>();
+const queueReady = new Map<string, () => Promise<boolean>>();
+/** The first read of the queue file is waited for this long; then requests get what the cache has */
+const QUEUE_FIRST_READ_MS = 2_000;
+const queueSlowLogged = new Set<string>();
 
 // The agents module's runs, for the Dragons view: a dragon it runs is
 // running, "managed by Lair". Set once the module is loaded, below.
@@ -143,7 +146,7 @@ function getDataService(project?: string): DataService {
     const config = loadProjectConfig(projectName);
     // The queue file is parsed once per change, never on a request
     const queue = queueCaches.get(projectName, config.queue_file);
-    queueReady.set(projectName, () => queue.ready());
+    queueReady.set(projectName, () => queue.readyWithin(QUEUE_FIRST_READ_MS));
     dataServices.set(
       projectName,
       new DataService(config, {
@@ -164,7 +167,11 @@ fastify.addHook("preHandler", async (request) => {
   try {
     const name = typeof asked === "string" && asked ? asked : getDefaultProject();
     getDataService(name);
-    await queueReady.get(name)?.();
+    const ready = await queueReady.get(name)?.();
+    if (ready === false && !queueSlowLogged.has(name)) {
+      queueSlowLogged.add(name);
+      console.warn(`The queue file of project ${name} is slow to read; serving what is cached`);
+    }
   } catch {
     // An unknown project or an unreadable config: the handler reports it
   }

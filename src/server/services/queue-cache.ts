@@ -168,6 +168,23 @@ export class QueueCache {
     return this.settled ? Promise.resolve() : (this.inFlight ?? this.refresh());
   }
 
+  /**
+   * Wait for the first read, but at most `timeoutMs`. False means the read is
+   * still going (it carries on in the background) and the lines are what the
+   * cache has so far, so one hung disk cannot hold every request.
+   */
+  async readyWithin(timeoutMs: number): Promise<boolean> {
+    let timer: NodeJS.Timeout | undefined;
+    const late = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), timeoutMs);
+    });
+    try {
+      return await Promise.race([this.ready().then(() => true as const), late]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   /** Read the file now. One read at a time: a call during a read waits for it and for one more read after it. */
   refresh(): Promise<void> {
     if (this.inFlight) {
