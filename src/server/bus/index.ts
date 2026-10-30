@@ -30,7 +30,7 @@ export type { BusTokenBinding } from "./tokens.js";
 export { BusMirror } from "./mirror.js";
 export type { BusMirrorConfig } from "./mirror.js";
 
-export { BusConsumers, extractBusId } from "./consumers.js";
+export { BusConsumers, extractBusId, validateBusReportEvent, validateBusMessageEvent } from "./consumers.js";
 export type {
   BusConsumeMode,
   BusReportEvent,

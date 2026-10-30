@@ -11,7 +11,7 @@
  * 5. An event for an unknown task or agent is ignored and audited.
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, vi } from "vitest";
-import { BusConsumers, extractBusId } from "./consumers.js";
+import { BusConsumers, extractBusId, validateBusReportEvent, validateBusMessageEvent } from "./consumers.js";
 import { EventBus } from "../core/event-bus.js";
 
 describe("BusConsumers", () => {
@@ -20,6 +20,7 @@ describe("BusConsumers", () => {
   let currentTime: number;
   let reportHandler: ReturnType<typeof vi.fn>;
   let messageHandler: ReturnType<typeof vi.fn>;
+  let invalidEventHandler: ReturnType<typeof vi.fn>;
   let consumers: BusConsumers;
 
   beforeEach(() => {
@@ -28,11 +29,13 @@ describe("BusConsumers", () => {
     clock = { now: () => currentTime };
     reportHandler = vi.fn();
     messageHandler = vi.fn();
+    invalidEventHandler = vi.fn();
     consumers = new BusConsumers({
       events: eventBus,
       clock,
       onReport: reportHandler,
       onMessage: messageHandler,
+      onInvalidEvent: invalidEventHandler,
     });
   });
 
@@ -271,16 +274,9 @@ describe("BusConsumers", () => {
       expect(consumers.wasConsumed("test-project", 42)).toBe(true);
     });
 
-    it("consumed events expire after TTL", async () => {
+    it("consumed events expire after TTL", () => {
       consumers.setMode("test-project", "on");
-
-      await eventBus.emit("bus.report", {
-        project: "test-project",
-        id: 42,
-        agent: "worker-a",
-        kind: "DONE",
-        task: "feat-search",
-      });
+      consumers.markConsumed("test-project", 42);
 
       // Advance time past TTL (24 hours)
       currentTime += 25 * 60 * 60 * 1000;
@@ -431,6 +427,151 @@ describe("BusConsumers", () => {
       expect(reportHandler).not.toHaveBeenCalled();
     });
   });
+
+  // ============ Runtime validation (M3) ============
+
+  describe("runtime validation (ACCEPTANCE TEST 5)", () => {
+    it("ignores and audits invalid report events", async () => {
+      consumers.setMode("test-project", "on");
+
+      // Missing required field
+      await eventBus.emit("bus.report", {
+        project: "test-project",
+        id: 1,
+        agent: "worker-a",
+        // missing kind
+        task: "feat-search",
+      });
+
+      expect(reportHandler).not.toHaveBeenCalled();
+      expect(invalidEventHandler).toHaveBeenCalledWith(
+        "test-project",
+        "invalid bus.report event data",
+        expect.objectContaining({ project: "test-project" }),
+      );
+    });
+
+    it("ignores report events with invalid kind", async () => {
+      consumers.setMode("test-project", "on");
+
+      await eventBus.emit("bus.report", {
+        project: "test-project",
+        id: 1,
+        agent: "worker-a",
+        kind: "INVALID_KIND",
+        task: "feat-search",
+      });
+
+      expect(reportHandler).not.toHaveBeenCalled();
+      expect(invalidEventHandler).toHaveBeenCalled();
+    });
+
+    it("ignores report events with non-integer id", async () => {
+      consumers.setMode("test-project", "on");
+
+      await eventBus.emit("bus.report", {
+        project: "test-project",
+        id: "not-a-number",
+        agent: "worker-a",
+        kind: "DONE",
+        task: "feat-search",
+      });
+
+      expect(reportHandler).not.toHaveBeenCalled();
+      expect(invalidEventHandler).toHaveBeenCalled();
+    });
+
+    it("ignores and audits invalid message events", async () => {
+      consumers.setMode("test-project", "on");
+
+      // Missing required field
+      await eventBus.emit("bus.message", {
+        project: "test-project",
+        id: "msg-1",
+        from: "worker-a",
+        // missing 'to'
+        priority: 5,
+      });
+
+      expect(messageHandler).not.toHaveBeenCalled();
+      expect(invalidEventHandler).toHaveBeenCalledWith(
+        "test-project",
+        "invalid bus.message event data",
+        expect.objectContaining({ project: "test-project" }),
+      );
+    });
+
+    it("accepts valid report events with all fields", async () => {
+      consumers.setMode("test-project", "on");
+
+      await eventBus.emit("bus.report", {
+        project: "test-project",
+        id: 42,
+        agent: "worker-a",
+        kind: "DONE",
+        task: "feat-search",
+        gateId: "gate-123",
+        pr: 456,
+        sha: "abc1234",
+      });
+
+      expect(reportHandler).toHaveBeenCalledWith(
+        "test-project",
+        expect.objectContaining({
+          id: 42,
+          gateId: "gate-123",
+          pr: 456,
+          sha: "abc1234",
+        }),
+        "on",
+      );
+      expect(invalidEventHandler).not.toHaveBeenCalled();
+    });
+  });
+
+  // ============ Persistence (M2) ============
+
+  describe("persistence", () => {
+    it("loads consumed ids on setMode", () => {
+      const loadConsumed = vi.fn().mockReturnValue(new Map([[42, 1700000000000]]));
+      const saveConsumed = vi.fn();
+      
+      const persistentConsumers = new BusConsumers({
+        events: eventBus,
+        clock,
+        onReport: reportHandler,
+        onMessage: messageHandler,
+        loadConsumed,
+        saveConsumed,
+      });
+
+      persistentConsumers.setMode("test-project", "on");
+
+      expect(loadConsumed).toHaveBeenCalledWith("test-project");
+      expect(persistentConsumers.wasConsumed("test-project", 42)).toBe(true);
+    });
+
+    it("saves consumed ids when marking", () => {
+      const loadConsumed = vi.fn().mockReturnValue(new Map());
+      const saveConsumed = vi.fn();
+      
+      const persistentConsumers = new BusConsumers({
+        events: eventBus,
+        clock,
+        onReport: reportHandler,
+        onMessage: messageHandler,
+        loadConsumed,
+        saveConsumed,
+      });
+
+      persistentConsumers.setMode("test-project", "on");
+      persistentConsumers.markConsumed("test-project", 42);
+
+      expect(saveConsumed).toHaveBeenCalledWith("test-project", expect.any(Map));
+      const savedMap = saveConsumed.mock.calls[0][1];
+      expect(savedMap.has(42)).toBe(true);
+    });
+  });
 });
 
 describe("bus config", () => {
@@ -462,5 +603,179 @@ describe("bus config", () => {
   it("throws for wrong type", () => {
     expect(() => parseBusConfig({ consume: 42 })).toThrow();
     expect(() => parseBusConfig({ consume: true })).toThrow();
+  });
+});
+
+describe("validateBusReportEvent", () => {
+  it("validates a minimal valid report event", () => {
+    const result = validateBusReportEvent({
+      project: "test",
+      id: 1,
+      agent: "worker-a",
+      kind: "DONE",
+      task: "feat-search",
+    });
+
+    expect(result).toEqual({
+      project: "test",
+      id: 1,
+      agent: "worker-a",
+      kind: "DONE",
+      task: "feat-search",
+      gateId: undefined,
+      pr: undefined,
+      sha: undefined,
+    });
+  });
+
+  it("validates a report event with all optional fields", () => {
+    const result = validateBusReportEvent({
+      project: "test",
+      id: 42,
+      agent: "worker-a",
+      kind: "WAITING",
+      task: "feat-search",
+      gateId: "gate-123",
+      pr: 456,
+      sha: "abc1234",
+    });
+
+    expect(result).toEqual({
+      project: "test",
+      id: 42,
+      agent: "worker-a",
+      kind: "WAITING",
+      task: "feat-search",
+      gateId: "gate-123",
+      pr: 456,
+      sha: "abc1234",
+    });
+  });
+
+  it("accepts all valid report kinds", () => {
+    for (const kind of ["DONE", "WAITING", "BLOCKED", "PROGRESS"]) {
+      const result = validateBusReportEvent({
+        project: "test",
+        id: 1,
+        agent: "worker-a",
+        kind,
+        task: "feat-search",
+      });
+      expect(result).not.toBeNull();
+      expect(result!.kind).toBe(kind);
+    }
+  });
+
+  it("rejects missing project", () => {
+    expect(validateBusReportEvent({
+      id: 1,
+      agent: "worker-a",
+      kind: "DONE",
+      task: "feat-search",
+    })).toBeNull();
+  });
+
+  it("rejects non-integer id", () => {
+    expect(validateBusReportEvent({
+      project: "test",
+      id: 1.5,
+      agent: "worker-a",
+      kind: "DONE",
+      task: "feat-search",
+    })).toBeNull();
+
+    expect(validateBusReportEvent({
+      project: "test",
+      id: "not-a-number",
+      agent: "worker-a",
+      kind: "DONE",
+      task: "feat-search",
+    })).toBeNull();
+  });
+
+  it("rejects invalid kind", () => {
+    expect(validateBusReportEvent({
+      project: "test",
+      id: 1,
+      agent: "worker-a",
+      kind: "INVALID",
+      task: "feat-search",
+    })).toBeNull();
+  });
+
+  it("rejects invalid optional field types", () => {
+    expect(validateBusReportEvent({
+      project: "test",
+      id: 1,
+      agent: "worker-a",
+      kind: "DONE",
+      task: "feat-search",
+      pr: "not-a-number",
+    })).toBeNull();
+
+    expect(validateBusReportEvent({
+      project: "test",
+      id: 1,
+      agent: "worker-a",
+      kind: "DONE",
+      task: "feat-search",
+      gateId: 123,
+    })).toBeNull();
+  });
+});
+
+describe("validateBusMessageEvent", () => {
+  it("validates a valid message event", () => {
+    const result = validateBusMessageEvent({
+      project: "test",
+      id: "msg-1",
+      from: "worker-a",
+      to: "orchestrator",
+      priority: 5,
+    });
+
+    expect(result).toEqual({
+      project: "test",
+      id: "msg-1",
+      from: "worker-a",
+      to: "orchestrator",
+      priority: 5,
+    });
+  });
+
+  it("rejects missing required fields", () => {
+    expect(validateBusMessageEvent({
+      project: "test",
+      id: "msg-1",
+      from: "worker-a",
+      // missing 'to'
+      priority: 5,
+    })).toBeNull();
+
+    expect(validateBusMessageEvent({
+      project: "test",
+      id: "msg-1",
+      from: "worker-a",
+      to: "orchestrator",
+      // missing 'priority'
+    })).toBeNull();
+  });
+
+  it("rejects wrong types", () => {
+    expect(validateBusMessageEvent({
+      project: "test",
+      id: 123, // should be string
+      from: "worker-a",
+      to: "orchestrator",
+      priority: 5,
+    })).toBeNull();
+
+    expect(validateBusMessageEvent({
+      project: "test",
+      id: "msg-1",
+      from: "worker-a",
+      to: "orchestrator",
+      priority: "high", // should be number
+    })).toBeNull();
   });
 });
