@@ -569,13 +569,16 @@ export class DecisionInbox implements DecisionProducer {
 /** The same input without class, evidence and the effect of each option. */
 function withoutStructure(input: unknown): unknown {
   if (typeof input !== "object" || input === null) return input;
-  const { class: _class, evidence: _evidence, ...rest } = input as Record<string, unknown>;
-  const options = Array.isArray(rest.options)
-    ? rest.options.map((o) => {
-        if (typeof o !== "object" || o === null) return o;
-        const { effect: _effect, ...option } = o as Record<string, unknown>;
-        return option;
-      })
-    : rest.options;
-  return { ...rest, options };
+  const rest: Record<string, unknown> = { ...(input as Record<string, unknown>) };
+  delete rest.class;
+  delete rest.evidence;
+  if (Array.isArray(rest.options)) {
+    rest.options = rest.options.map((o) => {
+      if (typeof o !== "object" || o === null) return o;
+      const option: Record<string, unknown> = { ...(o as Record<string, unknown>) };
+      delete option.effect;
+      return option;
+    });
+  }
+  return rest;
 }
