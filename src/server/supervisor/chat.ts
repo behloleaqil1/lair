@@ -16,11 +16,16 @@
  *   `lair supervisor answer`. It is taken once per question, only while the
  *   run is active (the token checks that), and only from the run that was
  *   asked. The answer and its evidence are cleaned (answers.ts).
+ * - answerFromFile(): Lair watches for answer.json in the run's directory.
+ *   When it appears (or when the run ends and it exists), Lair reads and
+ *   validates it. The CLI answer and file answer race: whichever arrives
+ *   first wins, and the second is ignored and audited.
  * - check(): a question whose run ended without an answer (exited, failed
  *   over, recovered into a new run, stopped) or that reached
  *   answer_timeout_minutes is closed as "no answer" with the reason, its
  *   token ends, and a run still going on its task is stopped (its claim
- *   released). Nothing is retried: the owner asks again.
+ *   released). Before closing, check() looks for an answer.json to use.
+ *   Nothing is retried: the owner asks again.
  * - digestTick(): with supervisor.digest.enabled, once a day at
  *   supervisor.digest.time (local), a digest run; its answer is kept as the
  *   day's digest, and with notifications on, one notice says it is ready.
@@ -34,6 +39,7 @@
  * answer" and stops its run.
  */
 import { existsSync, readFileSync } from "fs";
+import { dirname, join } from "path";
 import { randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 import type { ProjectConfig } from "../../shared/types.js";
@@ -54,6 +60,7 @@ import { getPromptsDir } from "../routes/controls.js";
 import { supervisorAgent, type ChatSettings, type SupervisorSettings } from "./config.js";
 import { buildSupervisorPrompt } from "./chat-prompt.js";
 import { sanitizeAnswer, sanitizeEvidence } from "./answers.js";
+import { readAnswerFile } from "./answer-file.js";
 import { NOTICE_MODULE } from "./notices.js";
 import { redactText } from "./redact.js";
 import type { Supervisor } from "./service.js";
@@ -477,8 +484,51 @@ export class SupervisorChat {
         throw new ChatError(409, "This question was already answered or closed");
       }
       if (conversation.kind === "digest") await this.noticeDigest(conversation);
-      return { conversation: id, turn: turn.seq };
+      return { conversation: id, turn: turn.seq, source: "cli" as const };
     });
+  }
+
+  /**
+   * Try to take an answer from answer.json in the run's directory. Returns true if it took the answer,
+   * false if there was no file or it was invalid, or if the turn was already answered.
+   */
+  private tryAnswerFromFile(turn: StoredTurn & { project: string }, run: AgentRun | null): { taken: boolean; error?: string } {
+    if (turn.state !== "pending") {
+      return { taken: false, error: "turn is not pending" };
+    }
+    if (!run?.logPath) {
+      return { taken: false, error: "no log path" };
+    }
+    const runDir = dirname(run.logPath);
+    const answerFilePath = join(runDir, "answer.json");
+
+    const parsed = readAnswerFile(answerFilePath, runDir);
+    if (!parsed.ok) {
+      if (parsed.error.includes("does not exist") || parsed.error.includes("cannot be read")) {
+        return { taken: false }; // No file, not an error
+      }
+      return { taken: false, error: parsed.error };
+    }
+
+    const now = this.o.clock();
+    const conversation = this.o.store.getConversation(turn.conversationId);
+    if (!conversation) {
+      return { taken: false, error: "conversation not found" };
+    }
+
+    const clean = sanitizeAnswer(parsed.content.answer, this.policy(conversation.project));
+    if (clean.length === 0) {
+      return { taken: false, error: "answer: nothing is left of it once cleaned (no HTML is kept)" };
+    }
+
+    if (!this.o.store.answerTurn(turn.id, clean, parsed.content.evidence, now)) {
+      // Already answered (by CLI) - this is audited elsewhere
+      return { taken: false, error: "turn was already answered or closed" };
+    }
+
+    // Log that the answer was taken from a file
+    this.log.warn(`[supervisor] answer.json taken for turn ${turn.id.slice(0, 8)} from ${answerFilePath}`);
+    return { taken: true };
   }
 
   /** One notice, with notifications on: "Today's digest is ready". Yesterday's, if still open, is withdrawn. */
@@ -534,9 +584,23 @@ export class SupervisorChat {
     const now = this.o.clock();
     const store = this.o.agents?.getStore() ?? null;
     for (const turn of this.o.store.pendingTurns()) {
+      // Timeout case: check for answer.json before closing
       if (now >= turn.deadlineAt) {
+        const run = turn.runId ? store?.getRun(turn.runId) ?? null : null;
+        const fromFile = this.tryAnswerFromFile(turn, run);
+        if (fromFile.taken) {
+          // Answer taken from file - handle digest notice if needed
+          const conversation = this.o.store.getConversation(turn.conversationId);
+          if (conversation?.kind === "digest") await this.noticeDigest(conversation);
+          // Stop the run since we have the answer
+          await this.stopRun(turn, "answered from answer.json at timeout");
+          continue;
+        }
         const minutes = Math.round((turn.deadlineAt - turn.askedAt) / 60_000);
-        await this.close(turn, `no answer within ${minutes} minutes (supervisor.chat.answer_timeout_minutes): Lair stopped its run`);
+        const reason = fromFile.error
+          ? `no answer within ${minutes} minutes, and answer.json was invalid: ${fromFile.error}`
+          : `no answer within ${minutes} minutes (supervisor.chat.answer_timeout_minutes)`;
+        await this.close(turn, reason);
         continue;
       }
       if (turn.runId === null) {
@@ -544,7 +608,16 @@ export class SupervisorChat {
         continue;
       }
       const run = store?.getRun(turn.runId) ?? null;
-      if (run && isActive(run.state)) continue;
+      if (run && isActive(run.state)) {
+        // Run still active - check for answer.json (debounced by check interval)
+        const fromFile = this.tryAnswerFromFile(turn, run);
+        if (fromFile.taken) {
+          const conversation = this.o.store.getConversation(turn.conversationId);
+          if (conversation?.kind === "digest") await this.noticeDigest(conversation);
+          // Don't stop the run yet - it may do cleanup. The deadline check will stop it if needed.
+        }
+        continue;
+      }
 
       // Check if the run is being retried by the agents module (a new run in the same chain is active)
       if (run && store) {
@@ -557,9 +630,21 @@ export class SupervisorChat {
         }
       }
 
+      // Run ended: check for answer.json before closing as no_answer
+      const fromFile = this.tryAnswerFromFile(turn, run);
+      if (fromFile.taken) {
+        const conversation = this.o.store.getConversation(turn.conversationId);
+        if (conversation?.kind === "digest") await this.noticeDigest(conversation);
+        if (turn.runId) this.o.tokens.endRun(turn.runId);
+        continue;
+      }
+
       const how = run ? `its run ended ${run.state} (${oneLine(run.detail)})` : "its run is gone";
+      const reason = fromFile.error
+        ? `no answer: ${how}, and answer.json was invalid: ${fromFile.error}`
+        : `no answer: ${how}`;
       // A failover or a recovery goes on in a new run, without a token that works: it is stopped
-      await this.close(turn, `no answer: ${how}`);
+      await this.close(turn, reason);
     }
     // An answered question whose run still goes past its deadline: the run is stopped
     for (const turn of this.o.store.answeredPastDeadline(now, now - DAY)) {
