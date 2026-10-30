@@ -320,6 +320,27 @@ describe("providers are locked", () => {
     const r = rig(path, {});
     expect(await r.sandbox.get(PROJECT)!.plan(path)).toMatchObject({ status: "refused", reason: "lock-missing" });
   });
+
+  it("checks a provider that follows a block closed with an indented brace", async () => {
+    const hidden = `provider "registry.opentofu.org/hashicorp/aws" {\n  version = "5.40.0"\n  hashes = [\n    "h1:abcdefghijklmnopqrstuv=",\n  ]\n  }\nprovider "registry.opentofu.org/someone/evil" {\n  version = "1.0.0"\n  hashes = [\n    "h1:abcdefghijklmnopqrstuv=",\n  ]\n}\n`;
+    const path = root(AWS, hidden);
+    const r = rig(path, {});
+    const out = await r.sandbox.get(PROJECT)!.plan(path);
+    expect(out).toMatchObject({ status: "refused", reason: "provider-not-allowed", detail: [expect.stringContaining("someone/evil")] });
+    expect(r.issuer.requests).toHaveLength(0);
+    expect(r.spawner.specs).toHaveLength(0);
+  });
+
+  it.each([
+    ["a block that never closes", `provider "registry.opentofu.org/hashicorp/aws" {\n  version = "5.40.0"\n`],
+    ["a block with its brace on the next line", `provider "registry.opentofu.org/hashicorp/aws"\n{\n  version = "5.40.0"\n  hashes = ["h1:abcdefghijklmnopqrstuv="]\n}\n`],
+  ])("refuses a lock file it cannot read in full: %s", async (_name, lock) => {
+    const path = root(AWS, lock);
+    const r = rig(path, {});
+    expect(await r.sandbox.get(PROJECT)!.plan(path)).toMatchObject({ status: "refused", reason: "lock-malformed" });
+    expect(r.issuer.requests).toHaveLength(0);
+    expect(r.spawner.specs).toHaveLength(0);
+  });
 });
 
 describe("a failed or slow run", () => {
