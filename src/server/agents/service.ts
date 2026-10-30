@@ -1675,7 +1675,7 @@ export class AgentsService {
     }
 
     // Hung: the watchdog's rule (never for an agent WAITING on a gate)
-    const proc = t.snap.get(run.pid);
+    const proc = run.pid !== undefined ? t.snap.get(run.pid) : undefined;
     const hung = proc ? hungFinding(this.view(t), run.agent, proc, this.watchdogSettings.hungMinutes) : null;
     if (hung) return this.stopRun(run, "hung", hung.summary, hung.evidence, t);
 
