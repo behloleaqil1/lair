@@ -313,7 +313,8 @@ describe("Checks module acceptance tests", () => {
       payload: { kind: "backend-targeted", sha: "a".repeat(40), tests: ["TestA"] },
     });
     expect(res1.statusCode).toBe(201);
-    const id1 = JSON.parse(res1.body).data.id;
+    // id1 unused but request must succeed to show concurrent requests work
+    JSON.parse(res1.body).data.id;
 
     // Wait for first to start
     await new Promise((r) => setTimeout(r, 20));

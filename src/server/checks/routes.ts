@@ -11,7 +11,7 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
 import { rejectCrossSiteRequests } from "../origin.js";
 import { projectQueryGuard } from "../routes/project-guard.js";
-import { hashBusToken, isBusTokenFormat, redactBusToken, type BusTokenBinding } from "../bus/index.js";
+import { hashBusToken, isBusTokenFormat, redactBusToken } from "../bus/index.js";
 import type { BusStore } from "../bus/store.js";
 import type { ChecksService, CheckError } from "./service.js";
 
