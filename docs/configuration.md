@@ -2297,6 +2297,46 @@ Events on the bus: `cleanup.removed`, `cleanup.cycle`, `cleanup.safety_violation
 
 The Health tab shows "Would free N GB (M entries)" in observe mode, and "Last cleanup: freed N GB (M entries)" in act mode, with links to the removals list.
 
+## Infrastructure policy scan
+
+Before any `plan` runs on infrastructure code, a static scan reads the code and refuses what it must not run ([design](design/deploy-aws.md#21-policy-scan-before-plan)). The scan reads files only: it never runs OpenTofu, a provider or a program. It is off unless you turn it on.
+
+```yaml
+infra_policy:
+  enabled: true                       # default false
+  roots:                              # absolute paths of the directories the scan reads
+    - /srv/infra/staging
+  allowed_providers:                  # provider sources that may be used
+    - hashicorp/aws
+  allowed_modules:                    # remote module sources: an exact source, or a prefix ending in /
+    - terraform-aws-modules/vpc/aws
+    - git::https://example.com/org/
+  allow:                              # denied blocks you accept, by address
+    - data.http.health
+    - module.net.null_resource.notify
+```
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `enabled` | boolean | `false` | Turn the scan on for this project |
+| `roots` | list of absolute paths | `[]` | Directories of infrastructure code; required when enabled |
+| `allowed_providers` | list | `[]` | Provider sources; `hashicorp/aws` and `registry.opentofu.org/hashicorp/aws` are the same provider. Every provider the code declares or implies (from a resource, data or provider block) must be listed |
+| `allowed_modules` | list | `[]` | Remote module sources. Local modules (`./` or `../`) need no entry: they are scanned like the root, and must stay inside it |
+| `allow` | list | `[]` | Addresses of denied blocks to accept, as in `data.http.health`; a block in a local module is `module.<name>.` plus its address |
+
+Refused, unless allowed: `external` and `http` data sources, a `local-exec` provisioner on any resource (`null_resource`, `terraform_data`, ...), a provider not in `allowed_providers`, a remote module not in `allowed_modules`, a local module outside its root, a `source` that is not a plain string, and code the scan cannot read (`.tf`, `.tofu`, `.tf.json` and `.tofu.json` files, at most 1 MiB each). An allowed use is not refused but is listed as `allowed`. Unknown keys, relative roots, or `enabled` without roots are config errors: the project's scan stays off and `GET /api/infra-policy/status` shows the errors. Lair reads this block at startup.
+
+The rule names are what an agent sees of a refusal (`policy violation: denied-external-data`); the file, line and address are for you. Rules: `denied-external-data`, `denied-http-data`, `denied-local-exec`, `provider-not-allowed`, `module-not-allowed`, `module-outside-root`, `source-not-literal`, `unreadable`. The scan does not read remote modules: allow only sources you have pinned and reviewed. Checking the lock file's hashes belongs to the plan sandbox, not this scan.
+
+### Infrastructure policy API
+
+| Route | Meaning |
+|-------|---------|
+| `GET /api/infra-policy/status?project=` | Whether the scan is on, the roots, and the last scan of each |
+| `GET /api/infra-policy/scan?project=&root=` | Scan a configured root (all roots without `root=`); 404 when the scan is off, 400 for a root that is not configured |
+
+The routes read files and run nothing. Server code that plans runs it through `InfraPolicy.guardPlan`, which does not start the plan when the scan fails.
+
 ## Planner
 
 > Off by default. With `enabled: true`, Lair keeps [fill](#fill)'s tasks file itself: it marks tasks done, drops the ones the plan marks done, and runs a supervised planner agent when something happens, whose proposals it checks before anything changes ([design](design/planner.md)). A project then needs no free-running orchestrator agent that edits the tasks file.

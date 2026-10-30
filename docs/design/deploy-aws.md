@@ -87,6 +87,14 @@ Before any plan runs, a static policy scan checks the change:
 
 A scan failure stops the pipeline before plan runs; the agent sees only "policy violation" with the rule name.
 
+**As built (PR 1, `src/server/infra-policy/`):** a static scanner of its own instead of OPA/Conftest, so Lair needs no
+extra binary; it reads `.tf`, `.tofu` and their `.json` forms, follows local modules inside the root, and refuses
+anything it cannot read. The allowlists and the per-address `allow` list live in the project's `infra_policy:` block
+(see [configuration](../configuration.md#infrastructure-policy-scan)). It is off by default. `InfraPolicy.guardPlan` is
+what the OpenTofu runner (PR 3) calls: it does not start the plan when the scan fails. Not in this PR: the lock-file
+hash check ("or locked in `.terraform.lock.hcl`"), which belongs to the plan sandbox (PR 2) where providers are
+installed, and scanning remote modules (allowlisted sources are trusted as pinned).
+
 ### 2.2 Plan (isolated)
 
 `tofu plan` runs in an isolated plan runner:

@@ -40,6 +40,7 @@ import { registerClientStatic, resolveClientDir } from "./static.js";
 import { getEventBus } from "./core/event-bus.js";
 import { WatchdogManager, registerWatchdogRoutes } from "./watchdog/index.js";
 import { DeliveryManager, registerDeliveryRoutes } from "./delivery/index.js";
+import { InfraPolicyManager, registerInfraPolicyRoutes } from "./infra-policy/index.js";
 import { PipelineManager, registerPipelineRoutes } from "./gates/index.js";
 import { AgentsManager, registerAgentsRoutes, systemAgentProbesWithCache } from "./agents/index.js";
 import { isActive } from "./agents/types.js";
@@ -412,6 +413,13 @@ const delivery = new DeliveryManager({
 delivery.load(projectEntries);
 // Up, Down, Restart, Deploy and Release need the owner's session
 await registerDeliveryRoutes(fastify, delivery, () => getDefaultProject(), humanAuth);
+
+// Infrastructure policy scan: a static check of infrastructure code, one per
+// project with `infra_policy.enabled: true` (off by default). It reads files
+// and runs nothing; the plan step of a later change goes through its guard.
+const infraPolicy = new InfraPolicyManager();
+infraPolicy.load(projectEntries);
+await registerInfraPolicyRoutes(fastify, infraPolicy, () => getDefaultProject());
 
 // AI tools (src/server/ai/): per machine, whether each tool is installed and
 // signed in, and the models it offers, from the tools' own commands (bounded,
