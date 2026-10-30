@@ -48,6 +48,7 @@ import { getBudgetManager } from "./fleet/budget.js";
 import { ReviewManager, inboxDecisionSink, registerReviewRoutes } from "./review/index.js";
 import { mountTriage } from "./triage/index.js";
 import { PlacementManager, registerPlacementRoutes } from "./placement/index.js";
+import { HostServicesManager, registerHostServicesRoutes } from "./host-services/index.js";
 import { registerDashboardRoutes } from "./dashboard/index.js";
 import type { DashboardSources } from "./dashboard/routes.js";
 import { RequestLatency, mountSupervisor, registerLatencyHook } from "./supervisor/index.js";
@@ -522,6 +523,8 @@ reviews.load(projectEntries);
 await reviews.useDecisions(decisionInbox);
 // The same for delivery's held services: answering releases the service, as its Release button does
 await delivery.useDecisions(decisionInbox);
+// Host services decisions: a service that keeps failing raises one; recovering withdraws it
+hostServices.useDecisions(decisionInbox);
 // Merges, human reviews, finding resolutions and hold releases need the owner's session
 await registerReviewRoutes(fastify, reviews, () => getDefaultProject(), humanAuth);
 
@@ -570,6 +573,14 @@ const placements = new PlacementManager({
 });
 placements.load(projectEntries);
 await registerPlacementRoutes(fastify, placements, () => getDefaultProject());
+
+// Host services: per-machine services with probe and start (duty D13).
+// One per project with `host_services.enabled: true` (off by default).
+// It probes services (Docker, tunnel daemons) every minute and starts them
+// when down (in act mode, with backoff), holding lanes that need them.
+const hostServices = new HostServicesManager({ events: getEventBus() });
+hostServices.load(projectEntries);
+registerHostServicesRoutes(fastify, hostServices);
 
 // The dashboard's own reads (src/server/dashboard/): the nav's module flags,
 // a gate's detail from the queue, the pipelines, triage and placement, and
@@ -626,7 +637,7 @@ const { supervisor: selfChecks, chat: supervisorChat } = await mountSupervisor(f
       } catch {
         config = null;
       }
-      return moduleReports({ watchdogs, agents, triage, placements, planner, reviews, delivery, pipelines }, project, config);
+      return moduleReports({ watchdogs, agents, triage, placements, hostServices, planner, reviews, delivery, pipelines }, project, config);
     },
     agentsStore: () => agents.getStore(),
     agentsOn: (project) => agents.get(project) !== undefined,
@@ -657,7 +668,7 @@ const { supervisor: selfChecks, chat: supervisorChat } = await mountSupervisor(f
 // the modules whose part of it changed, without a restart; an invalid one
 // keeps the previous config running and shows in the dashboard's banner
 const reloader = new ConfigReloader({
-  modules: serverModules({ delivery, watchdogs, pipelines, reviews, agents, triage, placements, planner, supervisor: selfChecks }),
+  modules: serverModules({ delivery, watchdogs, pipelines, reviews, agents, triage, placements, hostServices, planner, supervisor: selfChecks }),
   initial: projectEntries,
   events: getEventBus(),
   onAccepted: (project, config) => {
@@ -760,6 +771,9 @@ const stopServer = async (reason: string) => {
 
   // Stop placement: a move in progress is cut short and found again on the next start
   await placements.stop();
+
+  // Stop host services: probes in progress are cut short
+  await hostServices.stop();
 
   // Stop the shared process cache (all modules have stopped, so no one reads it)
   disposeProcessCache();
@@ -914,6 +928,14 @@ const start = async () => {
       placed.length > 0
         ? `[placement] Placing jobs for: ${placed.join(", ")}`
         : "[placement] Off (no project sets placement.enabled)",
+    );
+
+    // Start host services (service probes, starts in act mode, lane holds)
+    const hosting = hostServices.start();
+    console.log(
+      hosting.length > 0
+        ? `[host-services] Watching services for: ${hosting.join(", ")}`
+        : "[host-services] Off (no project sets host_services.enabled)",
     );
 
     // Start file watchers for all projects

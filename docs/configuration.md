@@ -2172,6 +2172,95 @@ Unknown keys, a lane on an unknown machine, an unknown class in `limits` or `eli
 
 Events on the bus: `placement.moved`, `placement.would_move`, `placement.move_failed`, `placement.machine_up`, `placement.machine_down`, `placement.job_held`.
 
+## Host services
+
+> Off by default. With `enabled: true`, Lair monitors services on each machine that work needs (Docker, tunnel daemons). In `observe` mode (the default) it detects outages; in `act` mode it also restarts failing services.
+
+Gates and pipelines need host services to be running: Docker for containerized runs, tunnel daemons for cloud machines. When a service is down, jobs fail with unhelpful errors ("Cannot connect to the Docker daemon"). The host-services module detects outages, holds the lanes that need them, and restarts services automatically.
+
+```yaml
+host_services:
+  enabled: true
+  mode: observe                    # observe | act
+  interval_seconds: 60             # probe every minute
+  probe_timeout_seconds: 15
+  start_timeout_seconds: 30
+  start_delay_seconds: 10          # wait after start before probing again
+  max_start_attempts: 3
+
+  machines:
+    workstation:
+      - name: docker
+        probe: ["docker", "info"]
+        start: ["open", "-a", "Docker"]
+        needed_by: [heavy, light]
+
+      - name: cloudflared
+        probe: ["pgrep", "-x", "cloudflared"]
+        start: ["launchctl", "start", "com.cloudflare.cloudflared"]
+        needed_by: [aws-lane]
+
+    dell:
+      - name: docker
+        probe: ["docker", "info"]
+        start: ["sudo", "systemctl", "start", "docker"]
+        needed_by: [remote]
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Enable host services monitoring |
+| `mode` | `observe` \| `act` | `observe` | `observe` probes and holds lanes; `act` also starts services |
+| `interval_seconds` | number | `60` | Seconds between probe cycles (10–3600) |
+| `probe_timeout_seconds` | number | `15` | Seconds before a probe is killed (1–120) |
+| `start_timeout_seconds` | number | `30` | Seconds before a start command is killed (1–300) |
+| `start_delay_seconds` | number | `10` | Seconds to wait after start before probing again (1–300) |
+| `max_start_attempts` | number | `3` | Start attempts before escalating to a decision (1–20) |
+| `machines` | map | `{}` | Per-machine service lists (machine id → service array) |
+
+### Service options
+
+Each service is a map with:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `name` | string | required | Display name (letters, digits, `_`, `-`; max 32) |
+| `probe` | array | required | Argv that exits 0 when the service is up |
+| `start` | array | required | Argv to start the service (act mode only) |
+| `needed_by` | array | `[]` | Lane or pipeline names that need this service |
+
+The probe and start commands run directly (no shell). The probe's exit code decides: 0 = up, anything else = down.
+
+### How host services works
+
+Every `interval_seconds`, for each configured machine:
+
+1. **Probe**: run each service's `probe`. Record the result.
+2. **Hold lanes**: lanes in a down service's `needed_by` are held. Held lanes accept no new jobs until the service is up. Jobs already running are not stopped.
+3. **Start** (act mode only): when a service is down, run its `start` command, wait `start_delay_seconds`, then probe again. Repeat up to `max_start_attempts`.
+4. **Escalate**: if the service stays down after all attempts, raise a decision in the [Decision Inbox](#decision-inbox). Lanes stay held until the service recovers.
+5. **Recover**: when a probe passes, the service is up, lanes are released, and any open decision is withdrawn.
+
+A service can be in one of four states:
+- **up**: probe passed; lanes available
+- **down**: probe failed; lanes held; waiting for first start attempt
+- **starting**: start command ran; waiting for probe
+- **failing**: max attempts reached; decision raised; lanes held until manual fix
+
+### Host services API
+
+`GET /api/host-services/:project` (read-only): enabled, running, mode, actBlocked reason, config errors, the last tick summaries, services per machine (state, last probe, last start, attempts, holds, decision), and held lanes.
+
+`GET /api/host-services/:project/machines/:machine`: services for one machine.
+
+`GET /api/host-services/:project/holds`: all lanes currently held by down services.
+
+`GET /api/host-services/:project/holds/check?lane=`: whether a specific lane is held and why.
+
+`POST /api/host-services/:project/tick` (owner only): trigger an immediate probe cycle.
+
+Events on the bus: `host-service.up`, `host-service.down`, `host-service.starting`, `host-service.decision`.
+
 ## Cleanup
 
 > Off by default. With `enabled: true`, Lair removes stale worktrees and old entries from watched folders. In `observe` mode (the default) it logs what it would remove; in `act` mode it removes.

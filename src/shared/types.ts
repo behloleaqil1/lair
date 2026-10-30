@@ -93,6 +93,12 @@ export interface ProjectConfig {
    */
   placement?: Record<string, unknown>;
   /**
+   * Host services: per-machine services with probe and start
+   * (src/server/host-services/). Validated by parseHostServicesConfig; see
+   * docs/configuration.md#host-services
+   */
+  host_services?: Record<string, unknown>;
+  /**
    * The planner: Lair keeps agents.fill's tasks file (src/server/planner/).
    * Validated by parsePlannerConfig; see docs/configuration.md#planner
    */
