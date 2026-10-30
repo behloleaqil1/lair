@@ -2388,6 +2388,122 @@ Config errors (an unknown key, an invalid pattern or one without its group, a `t
 
 Events: `planner.changed`, `planner.run_started`, `planner.run_finished`, `planner.proposals_pending`, `planner.blocked`, `planner.tasks_file_restored`. Decisions are raised as module `planner`. Everything is kept in `data/planner.db`: a restart keeps the pending triggers, the planner run in progress, waiting proposals and the history.
 
+## Tracker
+
+The tracker module keeps GitHub issues, Projects v2 boards and milestones in sync with Lair's tasks, runs and PRs. It is off unless a project sets `tracker.enabled: true`. Design: [docs/design/tracker.md](design/tracker.md).
+
+```yaml
+tracker:
+  enabled: true
+  mode: observe  # off | observe | act
+  repo: owner/repo  # or inherited from project.github
+  project:
+    owner: my-org
+    number: 1
+  status_field: Status
+  status_options:
+    backlog: Backlog
+    ready: Ready
+    in_progress: In progress
+    in_review: In review
+    done: Done
+  agent_field: Agent
+  create_issues_for_new_tasks: false
+  labels: [enhancement]
+  tier_labels:
+    red: "tier: red"
+    amber: "tier: amber"
+    green: "tier: green"
+  milestones:
+    from: label
+    close_when_complete: true
+  redact_patterns:
+    - "/private/"
+  reconcile_interval_seconds: 900
+  write_budget_per_minute: 30
+  token_env: GITHUB_TOKEN
+  api_url: https://api.github.com
+```
+
+### Mode
+
+- `off`: Module is loaded but does nothing.
+- `observe`: Records what would be written but sends nothing to GitHub. Useful for dry-run verification before enabling.
+- `act`: Writes to GitHub (moves cards, closes issues, adds labels).
+
+### Linking tasks to issues
+
+A task is linked to an issue by:
+
+1. The task description naming `Closes #N`, `#N` or an issue URL.
+2. An exact title match (adopt an existing issue, so no duplicate is created).
+3. Creating a new issue when `create_issues_for_new_tasks: true` and `mode: act`.
+
+Links persist across restarts in `data/tracker.db`.
+
+### Event-driven updates
+
+| Event | Board action |
+|-------|-------------|
+| `agent.run.started` | Move to In progress, set Agent field |
+| `agent.run.ended` (done) | Move to Done, close issue |
+| `agent.run.ended` (blocked) | Add `blocked` label, comment with reason |
+| `review.merged` | Move to Done, close linked issue |
+| `planner.changed` (added) | Link task, move to Backlog or Ready |
+| `planner.changed` (done) | Move to Done, close issue |
+
+All updates are idempotent: a second event for the same state is a no-op.
+
+### Reconciliation
+
+A periodic full reconcile (default every 15 minutes) fixes drift: if someone moves a card by hand to the wrong column, reconcile moves it back to the expected status. Every drift fix is counted and auditable.
+
+### Milestones
+
+- Milestones with zero open issues are closed when `close_when_complete: true`.
+- A milestone is reopened if an issue under it reopens.
+- Due dates are the owner's: Lair never sets or changes them.
+
+### Security
+
+- The token never reaches agents.
+- Text from agents (descriptions, blocked reasons) is bounded (500 characters) and redacted before it goes to GitHub.
+- `redact_patterns` is applied to every outgoing text. Patterns are case-insensitive regular expressions.
+
+### Tracker options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Enable the tracker module |
+| `mode` | `off` \| `observe` \| `act` | `off` | How the tracker operates |
+| `repo` | string | (project.github) | GitHub owner/repo |
+| `project.owner` | string | — | Owner (user or org) of the Projects v2 board |
+| `project.number` | number | — | Project number (from its URL) |
+| `status_field` | string | `Status` | Name of the single-select Status field on the board |
+| `status_options` | object | see above | Maps internal status names to the board's option names |
+| `agent_field` | string | — | Name of the text field to show which agent is working |
+| `create_issues_for_new_tasks` | boolean | `false` | Create issues for tasks that have none |
+| `labels` | array | `[]` | Default labels for created issues |
+| `tier_labels` | object | — | Maps risk tiers (red, amber, green) to GitHub labels |
+| `milestones.from` | `label` \| `section` | `label` | Where milestone names come from |
+| `milestones.close_when_complete` | boolean | `true` | Close milestones with zero open issues |
+| `redact_patterns` | array | `[]` | Regular expressions for text to redact |
+| `reconcile_interval_seconds` | number | `900` | How often to run a full reconcile (60–86400) |
+| `write_budget_per_minute` | number | `30` | Max writes per minute to respect rate limits (1–100) |
+| `token_env` | string | — | Environment variable holding the GitHub token |
+| `token_cmd` | array | — | Command to get the GitHub token (alternative to token_env) |
+| `api_url` | string | `https://api.github.com` | GitHub API URL (for GitHub Enterprise) |
+
+The token needs `repo` and `project` scopes. A missing scope is detected and reported clearly. Config errors turn the tracker off for that project.
+
+### Tracker API
+
+`?project=` defaults to the default project. Every route needs the owner's session:
+
+- `GET /api/tracker/status`: enabled, mode, repo, project URL, sync state (last reconcile, drift count, errors), links (task-to-issue mappings), recent writes, warnings and errors
+
+Events: `tracker.status_changed`, `tracker.drift_fixed`, `tracker.error`. Everything is kept in `data/tracker.db`.
+
 ## Example complete configuration
 
 ```yaml
