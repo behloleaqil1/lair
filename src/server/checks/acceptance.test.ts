@@ -104,7 +104,7 @@ interface TestContext {
   service: ChecksService;
 }
 
-async function createTestContext(config = VALID_CONFIG): Promise<TestContext> {
+async function createTestContext(config: typeof VALID_CONFIG | undefined = VALID_CONFIG): Promise<TestContext> {
   mkdirSync(TEST_DATA_DIR, { recursive: true });
 
   const checksStore = new ChecksStore(TEST_PROJECT, join(TEST_DATA_DIR, "checks.db"));
@@ -543,7 +543,7 @@ describe("Checks module acceptance tests", () => {
     ctx.checksStore.close();
     ctx.busStore.close();
     await ctx.app.close();
-    ctx = await createTestContext({}); // Empty config
+    ctx = await createTestContext(undefined); // No config
 
     const token = createToken(ctx, "worker-a");
 
