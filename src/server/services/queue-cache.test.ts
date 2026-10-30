@@ -25,7 +25,7 @@ function makeConfig(): ProjectConfig {
     agents_dir: TMP,
     gates_dir: join(TMP, "gates"),
     machines: { local: { name: "Local", type: "local" } },
-  } as ProjectConfig;
+  } as unknown as ProjectConfig;
 }
 
 const line = (agent: string, n: number) =>
