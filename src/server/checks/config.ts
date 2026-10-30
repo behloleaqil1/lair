@@ -1,0 +1,261 @@
+/**
+ * Checks module configuration: parsing and validation for `checks:` in project config.
+ *
+ * Each project defines named check kinds, each with:
+ * - command: argv template with placeholders ({sha}, {branch}, {tests}, {agent}, {check_id})
+ * - tests: selector validation (pattern, max_count, max_length)
+ * - timeout_seconds, max_concurrent, max_per_agent_per_hour
+ * - parse: exit code semantics and optional JUnit path
+ * - budget: daily limit and guard_cmd
+ */
+import { z } from "zod";
+
+// ============ Constants ============
+
+export const DEFAULT_TIMEOUT_SECONDS = 300;
+export const DEFAULT_MAX_CONCURRENT = 2;
+export const DEFAULT_MAX_PER_AGENT_PER_HOUR = 10;
+export const DEFAULT_SELECTOR_PATTERN = "^[A-Za-z0-9_.*#]+$";
+export const DEFAULT_SELECTOR_MAX_COUNT = 50;
+export const DEFAULT_SELECTOR_MAX_LENGTH = 5000;
+
+/**
+ * Exit codes:
+ * - 0: pass
+ * - 1: test failures
+ * - 3: infrastructure error
+ * - 4: refused by guard
+ */
+export const EXIT_PASS = 0;
+export const EXIT_FAIL = 1;
+export const EXIT_INFRASTRUCTURE = 3;
+export const EXIT_GUARD_REFUSED = 4;
+
+// ============ Schemas ============
+
+const SelectorSchema = z.object({
+  pattern: z.string().default(DEFAULT_SELECTOR_PATTERN),
+  max_count: z.number().int().positive().default(DEFAULT_SELECTOR_MAX_COUNT),
+  max_length: z.number().int().positive().default(DEFAULT_SELECTOR_MAX_LENGTH),
+});
+
+const ParseSchema = z
+  .object({
+    junit_path: z.string().optional(),
+  })
+  .default({});
+
+const BudgetSchema = z
+  .object({
+    daily_limit: z.number().int().positive().optional(),
+    guard_cmd: z.array(z.string()).optional(),
+  })
+  .default({});
+
+const CheckKindSchema = z.object({
+  command: z.array(z.string()).min(1),
+  tests: SelectorSchema.default({}),
+  timeout_seconds: z.number().int().positive().default(DEFAULT_TIMEOUT_SECONDS),
+  max_concurrent: z.number().int().positive().default(DEFAULT_MAX_CONCURRENT),
+  max_per_agent_per_hour: z.number().int().positive().default(DEFAULT_MAX_PER_AGENT_PER_HOUR),
+  parse: ParseSchema,
+  budget: BudgetSchema,
+});
+
+export const ChecksConfigSchema = z.record(z.string(), CheckKindSchema);
+
+// ============ Types ============
+
+export type SelectorConfig = z.infer<typeof SelectorSchema>;
+export type ParseConfig = z.infer<typeof ParseSchema>;
+export type BudgetConfig = z.infer<typeof BudgetSchema>;
+export type CheckKindConfig = z.infer<typeof CheckKindSchema>;
+export type ChecksConfig = z.infer<typeof ChecksConfigSchema>;
+
+export interface ParsedChecksConfig {
+  kinds: Map<string, CheckKindConfig>;
+}
+
+// ============ Parsing ============
+
+export type ParseChecksResult =
+  | { ok: true; config: ParsedChecksConfig }
+  | { ok: false; error: string };
+
+/**
+ * Parse and validate checks configuration.
+ * Returns an error string if invalid.
+ */
+export function parseChecksConfig(raw: unknown): ParseChecksResult {
+  if (raw === undefined || raw === null) {
+    return { ok: true, config: { kinds: new Map() } };
+  }
+
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    return { ok: false, error: "checks must be an object" };
+  }
+
+  const parsed = ChecksConfigSchema.safeParse(raw);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const path = issue.path.join(".");
+    return { ok: false, error: `checks.${path}: ${issue.message}` };
+  }
+
+  const kinds = new Map<string, CheckKindConfig>();
+  for (const [name, kind] of Object.entries(parsed.data)) {
+    // Validate kind name: lowercase letters, digits, hyphens only
+    if (!/^[a-z][a-z0-9-]*$/.test(name)) {
+      return {
+        ok: false,
+        error: `checks.${name}: kind name must start with a lowercase letter and contain only lowercase letters, digits, and hyphens`,
+      };
+    }
+
+    // Validate command has no shell metacharacters
+    for (const arg of kind.command) {
+      if (containsShellMetachars(arg)) {
+        return {
+          ok: false,
+          error: `checks.${name}.command: argument "${arg.slice(0, 40)}" contains shell metacharacters`,
+        };
+      }
+    }
+
+    // Validate guard_cmd if present
+    if (kind.budget.guard_cmd) {
+      for (const arg of kind.budget.guard_cmd) {
+        if (containsShellMetachars(arg)) {
+          return {
+            ok: false,
+            error: `checks.${name}.budget.guard_cmd: argument "${arg.slice(0, 40)}" contains shell metacharacters`,
+          };
+        }
+      }
+    }
+
+    // Validate selector pattern is a valid regex
+    try {
+      new RegExp(kind.tests.pattern);
+    } catch {
+      return {
+        ok: false,
+        error: `checks.${name}.tests.pattern: invalid regex "${kind.tests.pattern}"`,
+      };
+    }
+
+    kinds.set(name, kind);
+  }
+
+  return { ok: true, config: { kinds } };
+}
+
+// ============ Validation helpers ============
+
+/** Characters that have special meaning in shells. Never run through a shell anyway, but reject them for safety. */
+const SHELL_METACHARS = /[;&|`$(){}[\]<>*?!'"\\]/;
+
+function containsShellMetachars(text: string): boolean {
+  return SHELL_METACHARS.test(text);
+}
+
+/** Dangerous patterns in test selectors that could be injection attempts */
+const DANGEROUS_PATTERNS = [";", "$(", "`", "|", "&", " ", "/", "\\", "..", "\n", "\r"];
+
+/**
+ * Validate a test selector item against the kind's pattern and dangerous patterns.
+ */
+export function validateSelectorItem(
+  item: string,
+  config: SelectorConfig,
+): { valid: true } | { valid: false; reason: string } {
+  // Check for dangerous patterns
+  for (const pattern of DANGEROUS_PATTERNS) {
+    if (item.includes(pattern)) {
+      return { valid: false, reason: `selector contains forbidden pattern "${pattern}"` };
+    }
+  }
+
+  // Check against allowlist pattern
+  const regex = new RegExp(config.pattern);
+  if (!regex.test(item)) {
+    return { valid: false, reason: `selector item "${item.slice(0, 40)}" does not match pattern ${config.pattern}` };
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Validate an entire tests array against the kind's configuration.
+ */
+export function validateSelector(
+  tests: string[],
+  config: SelectorConfig,
+): { valid: true } | { valid: false; reason: string } {
+  // Check count
+  if (tests.length > config.max_count) {
+    return { valid: false, reason: `too many tests: ${tests.length} > ${config.max_count}` };
+  }
+
+  // Check total length
+  const totalLength = tests.join(" ").length;
+  if (totalLength > config.max_length) {
+    return { valid: false, reason: `tests total length ${totalLength} > ${config.max_length}` };
+  }
+
+  // Check each item
+  for (const item of tests) {
+    const result = validateSelectorItem(item, config);
+    if (!result.valid) {
+      return result;
+    }
+  }
+
+  return { valid: true };
+}
+
+// ============ Command building ============
+
+export interface CommandPlaceholders {
+  sha: string;
+  branch?: string;
+  tests: string;
+  agent: string;
+  check_id: string;
+}
+
+/**
+ * Build the command argv by substituting placeholders.
+ * Never runs through a shell. Returns null if a placeholder value is invalid.
+ */
+export function buildCommand(
+  template: string[],
+  placeholders: CommandPlaceholders,
+): string[] | null {
+  const result: string[] = [];
+
+  for (const arg of template) {
+    let substituted = arg;
+
+    // Substitute each placeholder
+    substituted = substituted.replace(/\{sha\}/g, placeholders.sha);
+    substituted = substituted.replace(/\{branch\}/g, placeholders.branch ?? "");
+    substituted = substituted.replace(/\{tests\}/g, placeholders.tests);
+    substituted = substituted.replace(/\{agent\}/g, placeholders.agent);
+    substituted = substituted.replace(/\{check_id\}/g, placeholders.check_id);
+
+    // Reject if result contains shell metachars (defense in depth)
+    if (containsShellMetachars(substituted)) {
+      return null;
+    }
+
+    // Reject if a placeholder that starts an argument produced a value starting with -
+    if (arg.startsWith("{") && substituted.startsWith("-")) {
+      return null;
+    }
+
+    result.push(substituted);
+  }
+
+  return result;
+}

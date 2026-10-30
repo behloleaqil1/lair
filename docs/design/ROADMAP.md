@@ -74,6 +74,7 @@ Each step lists what must exist first. One module per pull request, each with it
 
 | # | Step | Spec | Needs first | Acceptance (summary) |
 |---|---|---|---|---|
+| A1 | **Checks**: agents test on a runner before they gate | [checks.md](checks.md) | bus, agents | A request with a valid selector runs the configured argv (no shell); refusals for bad selectors, rate limits and guards are audited; results fenced for prompt safety |
 | A2 | **Reliability**: dashboard probes off the request path (async, cached); retention for results and logs in watched folders (cleanup module, built: [cleanup.md](cleanup.md)) | [#38](https://github.com/behloleaqil1/lair/issues/38), PR #70 | — | No synchronous command on a request; a 30-minute provider outage escalates nothing; a watched folder past its retention limit is archived. **Built (PR #70)**: shared process cache, data cache for expensive routes, transient outage handling. **Cleanup module built.**
 | A3 | **Supervisor S1–S2**: self-checks, the ops API, answers, the daily digest, proposals as decisions (S1-1, the self-checks and the read-only ops API, and S1-2, the supervisor's runs, answers and digest, are built; S1-3, the hourly review and diagnoses, is next) | [supervisor.md](supervisor.md) | A2 | See supervisor.md |
 | A6 | **AI roles**: any tool, any model, per role (build, review per tier, plan, supervise); sign-in status per machine; a write-only key store for API-key tools; reviewer calibration | [ai-roles.md](ai-roles.md) | — | See ai-roles.md |

@@ -216,6 +216,38 @@ After `npm run build` you can use `node /path/to/lair/dist/bus/cli.js --project 
 
 The fleet bus ensures atomic task claims (no two agents can claim the same task) and provides instant updates to the UI.
 
+## Checks: test before you gate
+
+Agents can run targeted tests before submitting a gate, using the HTTP API with their bus token. This is faster and cheaper than a full gate (the same tests that take 15 min on a loaded machine take ~2.5 min on a dedicated runner).
+
+### Requesting a check with curl
+
+Agents without MCP can use plain `curl`:
+
+```bash
+# Request a check
+CHECK_ID=$(curl -s -X POST "http://127.0.0.1:4777/api/checks" \
+  -H "Authorization: Bearer $LAIR_BUS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"kind":"backend-targeted","sha":"'"$SHA"'","tests":["TestClassA","TestClassB"]}' \
+  | jq -r '.data.id')
+
+# Long-poll for result (up to 10 minutes)
+curl -s "http://127.0.0.1:4777/api/checks/$CHECK_ID?wait=600"
+```
+
+The `LAIR_BUS_TOKEN` and `LAIR_URL` environment variables are set by Lair for every agent run.
+
+### Check results
+
+The result includes:
+- `status`: `pass`, `fail`, `infrastructure`, `timeout`, `guard`, or `refused`
+- `durationMs`: how long the check took
+- `failingTests`: test names parsed from JUnit XML (when configured)
+- `logTail`: the last 40 lines of output (fenced for safety)
+
+See [configuration.md#checks](configuration.md#checks) for the project configuration.
+
 ## Monitoring agent health
 
 Lair detects common problems:

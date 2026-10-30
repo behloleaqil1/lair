@@ -531,6 +531,54 @@ Unknown keys and invalid values are config errors; a project with an invalid blo
 - `POST /api/pipelines/runs` with `{"pipeline": "gate", "sha": "<40 hex>"}` or `{"pipeline": "gate", "branch": "main"}` (default: the repository's `HEAD`): starts a run, HTTP 202
 - `POST /api/pipelines/runs/<id>/cancel`: cancels a run; CI runs in flight are asked to cancel
 
+## Checks
+
+Agents can run targeted tests before submitting a gate. Define check kinds per project:
+
+```yaml
+checks:
+  backend-targeted:
+    command: ["./run-tests.sh", "{sha}", "{tests}"]
+    tests:
+      pattern: "^[A-Za-z0-9_.*#]+$"
+      max_count: 50
+      max_length: 5000
+    timeout_seconds: 300
+    max_concurrent: 2
+    max_per_agent_per_hour: 10
+    parse:
+      junit_path: build/test-results/test/TEST-*.xml
+    budget:
+      daily_limit: 100
+      guard_cmd: ["./check-aws-spend.sh"]
+```
+
+### Check kind options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `command` | array | required | The argv with placeholders: `{sha}`, `{branch}`, `{tests}`, `{agent}`, `{check_id}` |
+| `tests.pattern` | string | `^[A-Za-z0-9_.*#]+$` | Regex allowlist for each test selector item |
+| `tests.max_count` | number | `50` | Maximum number of test items |
+| `tests.max_length` | number | `5000` | Maximum total length of tests joined |
+| `timeout_seconds` | number | `300` | Time limit for the check |
+| `max_concurrent` | number | `2` | Checks of this kind running at once |
+| `max_per_agent_per_hour` | number | `10` | Per-agent hourly rate limit |
+| `parse.junit_path` | string | — | JUnit XML path for failing test names |
+| `budget.daily_limit` | number | — | Daily check limit |
+| `budget.guard_cmd` | array | — | Command that must exit 0 before a check starts |
+
+Exit codes: 0 pass, 1 test failures, 3 infrastructure (retried once), 4 refused by guard.
+
+### Checks API
+
+Agents request checks with their bus token. See [docs/agents.md](agents.md) for the curl example.
+
+- `POST /api/checks` with `{"kind": "...", "sha": "...", "tests": ["..."]}` and `Authorization: Bearer <bus token>`: request a check, returns `{"id": "..."}`
+- `GET /api/checks/:id?wait=600`: get result, optionally long-polling up to N seconds
+- `GET /api/checks?kind=&agent=&status=&limit=`: list checks (for the Work view)
+- `GET /api/checks/stats`: counts by status and kind (for the Health view)
+
 ## Process manager
 
 Define processes for Lair to manage (starting, stopping and restarting them from the dashboard needs the owner's session, see [Owner-only routes](#owner-only-routes)):
