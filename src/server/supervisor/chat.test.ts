@@ -832,8 +832,10 @@ describe("the prompt instructs runs to write answer.json, not run CLI commands",
     expect(prompt).toContain('"evidence":');
 
     // Should NOT instruct to run node, npm, or CLI for submitting
-    expect(prompt).not.toMatch(/run.*node.*answer/i);
-    expect(prompt).not.toMatch(/run.*npm.*answer/i);
+    // (These regexes check for "run" followed by the command name in an instructive context,
+    // not as part of file paths like supervisor-runs/run-xxx)
+    expect(prompt).not.toMatch(/\brun `?node`?.*to.*answer/i);
+    expect(prompt).not.toMatch(/\brun `?npm`?.*to.*answer/i);
     expect(prompt).not.toMatch(/lair supervisor answer/);
 
     // Should warn against host restriction workarounds
