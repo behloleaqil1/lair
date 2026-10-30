@@ -18,7 +18,6 @@ import type {
   LiveTopic,
   ChangeKind,
   LiveUpdate,
-  DragonLiveData,
   GateLiveData,
   DecisionLiveData,
   MachineLiveData,

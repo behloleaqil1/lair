@@ -4,7 +4,7 @@
  * Tests the coalescing, topic subscription, and live list merging logic.
  * Does not render React hooks; tests the underlying logic only.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import type { LiveTopic, ChangeKind } from "../../shared/live-types";
 
 // ============ COALESCE LOGIC ============
@@ -235,12 +235,6 @@ describe("refresh handling", () => {
 
 describe("connection state", () => {
   type Status = "connecting" | "connected" | "reconnecting" | "closed";
-
-  interface LiveState {
-    status: Status;
-    live: boolean;
-    error: string | null;
-  }
 
   function computeLive(status: Status): boolean {
     return status === "connected";

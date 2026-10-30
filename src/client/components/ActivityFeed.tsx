@@ -13,7 +13,7 @@
  *
  * Receives live updates via useLiveUpdates hook.
  */
-import { useMemo, useState, useCallback } from "react";
+import { useMemo, useState } from "react";
 import { useApi } from "../hooks/useApi";
 import { useLiveUpdates, type LiveUpdateHandler } from "../hooks/useLiveUpdates";
 import { getReportKindDisplay, getDeliveryStateDisplay } from "../hooks/useBusEvents";
