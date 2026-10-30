@@ -112,9 +112,9 @@ export function parseChecksConfig(raw: unknown): ParseChecksResult {
       };
     }
 
-    // Validate command has no shell metacharacters
+    // Validate command has no shell metacharacters (except valid placeholders)
     for (const arg of kind.command) {
-      if (containsShellMetachars(arg)) {
+      if (containsShellMetacharsInTemplate(arg)) {
         return {
           ok: false,
           error: `checks.${name}.command: argument "${arg.slice(0, 40)}" contains shell metacharacters`,
@@ -122,7 +122,7 @@ export function parseChecksConfig(raw: unknown): ParseChecksResult {
       }
     }
 
-    // Validate guard_cmd if present
+    // Validate guard_cmd if present (no placeholders allowed here)
     if (kind.budget.guard_cmd) {
       for (const arg of kind.budget.guard_cmd) {
         if (containsShellMetachars(arg)) {
@@ -153,10 +153,45 @@ export function parseChecksConfig(raw: unknown): ParseChecksResult {
 // ============ Validation helpers ============
 
 /** Characters that have special meaning in shells. Never run through a shell anyway, but reject them for safety. */
-const SHELL_METACHARS = /[;&|`$(){}[\]<>*?!'"\\]/;
+const SHELL_METACHARS_WITH_BRACES = /[;&|`$(){}[\]<>*?!'"\\]/;
+const SHELL_METACHARS_NO_BRACES = /[;&|`$()[\]<>*?!'"\\]/;
 
+/**
+ * Valid placeholder pattern: {word} where word is lowercase letters/underscores.
+ * We allow placeholders like {sha}, {tests}, {branch}, {agent}, {check_id}.
+ */
+const VALID_PLACEHOLDERS = new Set(["sha", "branch", "tests", "agent", "check_id"]);
+
+/**
+ * Check if text contains shell metacharacters in a command template.
+ * Allows known placeholders like {sha} but rejects arbitrary braces and other metachars.
+ */
+function containsShellMetacharsInTemplate(text: string): boolean {
+  // Check for non-brace metachars first
+  if (SHELL_METACHARS_NO_BRACES.test(text)) {
+    return true;
+  }
+
+  // Check for braces: only allow known placeholders
+  const bracePattern = /\{([^}]*)\}/g;
+  let match;
+  while ((match = bracePattern.exec(text)) !== null) {
+    const placeholder = match[1];
+    if (!VALID_PLACEHOLDERS.has(placeholder)) {
+      // Unknown or invalid brace pattern
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Check if text contains shell metacharacters in a substituted value.
+ * After substitution, no braces should remain.
+ */
 function containsShellMetachars(text: string): boolean {
-  return SHELL_METACHARS.test(text);
+  return SHELL_METACHARS_WITH_BRACES.test(text);
 }
 
 /** Dangerous patterns in test selectors that could be injection attempts */
