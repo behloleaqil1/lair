@@ -98,12 +98,27 @@ export function parseTrx(xml: string, options: ParseOptions): ParseOutput {
     const stdOut = output ? childText(output, "StdOut") : "";
 
     const lines = bodyLines([message, stackTrace, stdOut].filter((s) => s).join("\n"));
-    const head = parseThrowable(message.split("\n")[0] ?? "");
+
+    // Try to extract .NET exception type from the message
+    // Format: "System.Data.SqlClient.SqlException : message" (space before colon)
+    // Or: "Xunit.Sdk.EqualException : message"
+    const dotnetExMatch = message.match(/^((?:[A-Za-z_][\w]*\.)+[A-Za-z_][\w]*(?:Exception|Error|Failure)?)\s*:\s*(.*)$/s);
+    let errorType: string | undefined;
+    let errorMessage: string;
+
+    if (dotnetExMatch) {
+      errorType = dotnetExMatch[1];
+      errorMessage = dotnetExMatch[2].trim() || message.slice(0, 200);
+    } else {
+      const head = parseThrowable(message.split("\n")[0] ?? "");
+      errorType = head.type;
+      errorMessage = head.message || message.slice(0, 200);
+    }
 
     raws.push({
       test,
-      type: head.type,
-      message: head.message || message.slice(0, 200),
+      type: errorType,
+      message: errorMessage,
       lines,
       parser: "trx",
       step: options.step,

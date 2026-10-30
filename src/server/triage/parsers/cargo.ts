@@ -18,8 +18,9 @@ const SECTION_HEADER = /^----\s+(\S+)\s+stdout\s+----$/;
 const SUMMARY = /^test result:\s+(ok|FAILED)\.\s+(\d+)\s+passed;\s+(\d+)\s+failed/;
 // Rust compiler error: "error[E0425]: cannot find value `x` in this scope"
 const COMPILER_ERROR = /^error\[E\d+\]:\s+(.+)$/;
-// Panic message: "thread 'test_name' panicked at 'assertion failed: ...'"
-const PANIC = /^thread\s+'[^']+'\s+panicked\s+at\s+'([^']+)'/;
+// "thread 'test_name' panicked at 'assertion failed: ...'" or "thread 'test_name' panicked at 'message', loc"
+// Note: the message may continue on the next line, so we capture everything after "panicked at '"
+const PANIC = /^thread\s+'[^']+'\s+panicked\s+at\s+'(.+)$/;
 // Location in panic: "src/lib.rs:42:5"
 const PANIC_LOCATION = /^(\S+\.rs):(\d+):\d+$/;
 

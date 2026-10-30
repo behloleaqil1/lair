@@ -98,10 +98,14 @@ export function parseGoTest(text: string, options: ParseOptions): ParseOutput {
           const outputs = testOutputs.get(key) ?? [];
           failures.push({ pkg, test, outputs: [...outputs] });
         } else if (!test) {
-          // Package-level failure (build error, etc.)
-          const outputs = testOutputs.get(key) ?? [];
-          if (outputs.length > 0 && failures.length < MAX_ENTRIES) {
-            failures.push({ pkg, test: "(package)", outputs: [...outputs] });
+          // Package-level failure: only include if no tests in this package failed
+          // (a package "fail" with test failures is just a summary, not a build error)
+          const hasTestFailures = failures.some((f) => f.pkg === pkg && f.test !== "(package)");
+          if (!hasTestFailures) {
+            const outputs = testOutputs.get(key) ?? [];
+            if (outputs.length > 0 && failures.length < MAX_ENTRIES) {
+              failures.push({ pkg, test: "(package)", outputs: [...outputs] });
+            }
           }
         }
         break;
