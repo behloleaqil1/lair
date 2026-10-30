@@ -188,7 +188,6 @@ export function detectEscalationInfra(
   if (decision.kind !== "escalation") return null;
 
   // Check if the context mentions infrastructure
-  const context = decision.context.toLowerCase();
   const infraCheck = isInfraFailure(decision.context);
 
   if (!infraCheck.isInfra) return null;

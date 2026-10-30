@@ -12,18 +12,15 @@
  * h) the supervisor never calls the decisions answer route or holds an owner session
  */
 import { describe, it, expect, beforeEach } from "vitest";
-import { SupervisorStore, type ActAuditEntry } from "./store.js";
+import { SupervisorStore } from "./store.js";
 import { SupervisorAct } from "./act.js";
 import { parseActConfig, type ActSettings } from "./act-config.js";
 import {
   detectHoldInfra,
-  detectEscalationInfra,
   detectDuplicateProposal,
   isInfraFailure,
-  matchesInfraPattern,
-  matchesCodeFailure,
 } from "./act-detectors.js";
-import { releaseHold, closeInfraEscalation, rejectDuplicateProposal } from "./act-ops.js";
+import { releaseHold, rejectDuplicateProposal } from "./act-ops.js";
 import type { Decision } from "../../shared/decision-types.js";
 
 // ============ HELPERS ============
@@ -298,7 +295,7 @@ describe("releaseHold", () => {
         released = true;
         return { task, runId: "run-123" };
       },
-      runCommand: async (cmd: string, args: string[]) => {
+      runCommand: async (_cmd: string, _args: string[]) => {
         return { exitCode: 1, output: "Cannot connect to the Docker daemon" };
       },
     };
@@ -529,7 +526,7 @@ describe("SupervisorAct", () => {
       cooldown_minutes: 30,
     };
 
-    let answerCalled = false;
+    const answerCalled = false;
     let releaseCalled = false;
     let withdrawCalled = false;
 

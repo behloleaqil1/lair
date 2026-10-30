@@ -6,7 +6,6 @@
  * route that carries it out, with that route's checks.
  */
 import type { Decision } from "../../shared/decision-types.js";
-import type { DecisionProducer } from "../decisions/types.js";
 import type { ActOp, ActSettings } from "./act-config.js";
 import type { ActEvidence } from "./act-detectors.js";
 import { isInfraFailure, checkDocker } from "./act-detectors.js";
