@@ -103,6 +103,11 @@ export interface AgentProbes extends Probes {
  * One reading of the process table. A pid is alive for an owner only when a
  * process with that pid runs AND started when the owner says it did: a pid
  * the system handed to a new process is not the old owner.
+ *
+ * Start times count back from when the reading was taken (`takenAt`), never
+ * from the time it is used: a reading from the shared cache may be seconds
+ * old. `spreadMs`: how long `ps` took to answer; the elapsed times were read
+ * somewhere in that span, so a start may be up to that much earlier.
  */
 export class ProcessSnapshot {
   private byPid: Map<number, ProcessInfo>;
@@ -112,9 +117,10 @@ export class ProcessSnapshot {
 
   constructor(
     list: ProcessInfo[],
-    readonly now: number,
+    readonly takenAt: number,
     readonly self: ProcessOwner,
     toleranceSeconds: number,
+    readonly spreadMs = 0,
   ) {
     this.byPid = new Map(list.map((p) => [p.pid, p] as const));
     // ps reports elapsed time in whole seconds
@@ -141,7 +147,7 @@ export class ProcessSnapshot {
     if (spawned !== undefined) return spawned;
     if (pid === this.self.pid && !this.byPid.has(pid)) return this.self.startedAt;
     const proc = this.byPid.get(pid);
-    return proc ? this.now - proc.elapsedSeconds * 1000 : null;
+    return proc ? this.takenAt - proc.elapsedSeconds * 1000 : null;
   }
 
   /** Alive: a process with this pid runs and, when `startedAt` is given, started then. */
@@ -149,7 +155,13 @@ export class ProcessSnapshot {
     const actual = this.startedAt(pid);
     if (actual === null) return false;
     if (startedAt === undefined || startedAt === null) return true;
-    return Math.abs(actual - startedAt) <= this.toleranceMs;
+    return this.sameStart(actual, startedAt);
+  }
+
+  /** `actual` (from this reading) is the start time an owner recorded, within the tolerance and the reading's spread. */
+  private sameStart(actual: number, recorded: number): boolean {
+    const diff = recorded - actual;
+    return diff <= this.toleranceMs && diff >= -(this.toleranceMs + this.spreadMs);
   }
 
   /** Why an owner is alive or not, for evidence. */
@@ -157,7 +169,7 @@ export class ProcessSnapshot {
     const actual = this.startedAt(pid);
     if (actual === null) return `pid ${pid} is not running`;
     if (startedAt === undefined || startedAt === null) return `pid ${pid} is running`;
-    if (Math.abs(actual - startedAt) <= this.toleranceMs) {
+    if (this.sameStart(actual, startedAt)) {
       return `pid ${pid} is running (started ${new Date(actual).toISOString()})`;
     }
     return `pid ${pid} is a different process now: it started ${new Date(actual).toISOString()}, the owner started ${new Date(startedAt).toISOString()}`;

@@ -4,14 +4,19 @@
  * two runs of one task.
  *
  * A run the previous server started is:
- * - adopted when its pid runs, started when the run's pid started, and runs
- *   the command the run was started with: supervised from here on as if this
- *   server had started it (its claim stays, fill counts it as active);
- * - lost when its pid runs but can't be proven the run's (another start
- *   time: the pid was reused; or another command). That process is never
- *   signalled, and the run ends;
+ * - adopted when its pid runs and started when the run's pid started:
+ *   supervised from here on as if this server had started it (its claim
+ *   stays, fill counts it as active). The command is checked too, but a
+ *   difference only goes in the evidence: a start script that execs the CLI,
+ *   or a CLI that rewrites its process title, shows another command line,
+ *   and pid and start time already identify the process;
+ * - lost when its pid runs but started at another time: the pid was reused.
+ *   That process is never signalled, and the run ends, its task free;
  * - gone when nothing runs under its pid: the first tick classifies its exit
  *   as for any re-adopted run that ended unseen (its queue line decides).
+ *
+ * The service never ends a run on one reading: lost and gone need a second,
+ * fresh one to agree (AgentsService.reconcile).
  */
 import { createHash } from "crypto";
 import { join } from "path";
@@ -45,13 +50,9 @@ export function commandMatches(fingerprint: string, command: string): boolean {
 }
 
 export type ReconcileVerdict =
-  | { kind: "adopted"; evidence: string }
-  /**
-   * claimFree: the process started at another time, so the run's claim (owned by its pid and start time) is
-   * free. When only the command differs, the claim stays with that process until it ends: it may be the run's
-   * after all (a program can rewrite its command line), and a second run of the task must not start beside it.
-   */
-  | { kind: "lost"; reason: string; claimFree: boolean }
+  /** commandDiffers: pid and start time match, the command line shown now doesn't (noted, not held against it) */
+  | { kind: "adopted"; evidence: string; commandDiffers: boolean }
+  | { kind: "lost"; reason: string }
   | { kind: "gone"; reason: string };
 
 /**
@@ -65,21 +66,25 @@ export function reconcileRun(run: AgentRun, snap: ProcessSnapshot, startedHere: 
   const pid = run.pid;
   if (pid === undefined) return { kind: "gone", reason: "no pid was recorded" };
   if (snap.startedAt(pid) === null) return { kind: "gone", reason: `pid ${pid} is not running` };
-  if (!snap.isAlive(pid, run.pidStartedAt)) {
-    return { kind: "lost", reason: snap.describe(pid, run.pidStartedAt), claimFree: true };
+  if (!snap.isAlive(pid, run.pidStartedAt)) return { kind: "lost", reason: snap.describe(pid, run.pidStartedAt) };
+  const running = snap.describe(pid, run.pidStartedAt);
+  if (startedHere) return { kind: "adopted", evidence: `${running}: this server process started it`, commandDiffers: false };
+  if (run.commandFingerprint === undefined) {
+    const proof = "its start time matches (the run was recorded without its process group and command)";
+    return { kind: "adopted", evidence: `${running}: ${proof}`, commandDiffers: false };
   }
-  if (startedHere) return { kind: "adopted", evidence: `${snap.describe(pid, run.pidStartedAt)}: this server process started it` };
-  if (run.commandFingerprint !== undefined) {
-    const command = snap.get(pid)?.command;
-    if (command === undefined || !commandMatches(run.commandFingerprint, command)) {
-      return { kind: "lost", reason: `pid ${pid} started then, but runs another command now`, claimFree: false };
-    }
+  const group = run.pgid !== undefined ? ` (process group ${run.pgid})` : "";
+  const command = snap.get(pid)?.command;
+  if (command !== undefined && commandMatches(run.commandFingerprint, command)) {
+    return { kind: "adopted", evidence: `${running}: its start time and command match${group}`, commandDiffers: false };
   }
-  const proof =
-    run.commandFingerprint !== undefined && run.pgid !== undefined
-      ? `its start time and command match (process group ${run.pgid})`
-      : "its start time matches (the run was recorded without its process group and command)";
-  return { kind: "adopted", evidence: `${snap.describe(pid, run.pidStartedAt)}: ${proof}` };
+  return {
+    kind: "adopted",
+    evidence:
+      `${running}: its start time matches${group}; its command line differs from the one it was started with ` +
+      "(a start script that execs the agent, or a program that rewrites its title, shows another one)",
+    commandDiffers: true,
+  };
 }
 
 /** The file name of a run's prompt (in prompts_dir): the run's marker on its agent's command line. */

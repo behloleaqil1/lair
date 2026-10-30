@@ -128,7 +128,7 @@ import {
   type StoredLockWait,
 } from "./types.js";
 import { commandFingerprint, findTaskProcess, reconcileRun, runPromptFileName } from "./reconcile.js";
-import type { ProcessInfo } from "../watchdog/probes.js";
+import type { ProcessInfo, ProcessReading } from "../watchdog/probes.js";
 
 export { TASK_ID, isValidTaskId } from "./types.js";
 
@@ -301,7 +301,12 @@ function watchdogSettingsFor(config: ProjectConfig, hungMinutes?: number): Watch
 /** One tick's (or one action's) view of the world. */
 interface Tick {
   now: number;
+  /** The latest reading of the process table */
   snap: ProcessSnapshot;
+  /** The tick's own first reading (it may come from the shared cache) */
+  first: ProcessSnapshot;
+  /** A fresh reading taken after `first` (relist); null when one was tried and failed */
+  confirmed?: ProcessSnapshot | null;
   summary: AgentsTickSummary;
   /** Tasks and locks handled this tick: the reapers leave them alone */
   touchedTasks: Set<string>;
@@ -437,6 +442,8 @@ export class AgentsService {
   private moduleVars = new Map<string, Record<string, string>>();
   /** start() reconciles the runs the store says are active first: until that has finished, fill starts nothing */
   private reconcilePending = false;
+  /** The runs reconciliation has given a verdict since start() */
+  private reconciled = new Set<string>();
   lastTick?: AgentsTickSummary;
   lastError?: string;
 
@@ -479,7 +486,8 @@ export class AgentsService {
         store: this.store,
         probes: this.probes,
         readOnly: () => this.readOnly,
-        ready: () => !this.reconcilePending,
+        // A read_only project starts nothing: it has no runs to reconcile first
+        ready: () => this.readOnly || !this.reconcilePending,
         taskProcess: (task) => this.taskProcess(task),
         // The in-process path every module uses: claims, locks, retries and budgets apply
         requestRun: (input) => this.requestRun(input, { origin: "fill" }),
@@ -519,13 +527,18 @@ export class AgentsService {
     return result;
   }
 
-  private async newTick(now: number): Promise<Tick> {
-    const list = await this.probes.processes.list();
-    const snap = new ProcessSnapshot(list, now, this.probes.self, this.settings.pidStartToleranceSeconds);
+  /** A tick on a new reading of the process table; its time is taken after the reading (a slow `ps` takes seconds). */
+  private async newTick(fresh = false): Promise<Tick> {
+    return this.tickOn(await this.readSnapshot(fresh));
+  }
+
+  private tickOn(snap: ProcessSnapshot): Tick {
+    const now = this.probes.clock.now();
     this.snapshot = snap;
     return {
       now,
       snap,
+      first: snap,
       summary: emptySummary(now),
       touchedTasks: new Set(),
       touchedLocks: new Set(),
@@ -533,19 +546,71 @@ export class AgentsService {
   }
 
   /**
-   * Read the process table again. A holder (of a lock or a claim) is only
-   * judged dead on a reading taken AFTER its lock or claim was read: a
-   * process that took it after the tick's first reading isn't in that one.
-   * Callers read the lock or claim first, then call this. The processes this
-   * tick started stay alive in the new reading.
+   * Read the process table. Start times count back from when the reading was taken: the shared cache hands out
+   * readings up to seconds old, and `ps` itself may take seconds under load, so neither makes a live process look
+   * like another one. A table that doesn't say when it read is timed here, around the call. `fresh`: a reading
+   * started now, never one the cache kept.
+   */
+  private async readSnapshot(fresh: boolean): Promise<ProcessSnapshot> {
+    const table = this.probes.processes;
+    const asked = this.probes.clock.now();
+    let reading: ProcessReading;
+    if (table.read) {
+      reading = await table.read({ fresh });
+    } else {
+      const processes = await table.list();
+      reading = { processes, startedAt: asked, takenAt: this.probes.clock.now() };
+    }
+    const spread = Math.max(0, reading.takenAt - reading.startedAt);
+    return new ProcessSnapshot(reading.processes, reading.takenAt, this.probes.self, this.settings.pidStartToleranceSeconds, spread);
+  }
+
+  /**
+   * Read the process table again, fresh (never the cached reading). A holder
+   * (of a lock or a claim) is only judged dead on a reading taken AFTER its
+   * lock or claim was read: a process that took it after the tick's first
+   * reading isn't in that one. Callers read the lock or claim first, then
+   * call this. The processes this tick started stay alive in the new reading.
    */
   private async relist(t: Tick): Promise<ProcessSnapshot> {
-    const list = await this.probes.processes.list();
-    const fresh = new ProcessSnapshot(list, this.probes.clock.now(), this.probes.self, this.settings.pidStartToleranceSeconds);
+    const fresh = await this.readSnapshot(true);
     for (const owner of t.snap.spawnedOwners()) fresh.addSpawned(owner);
     t.snap = fresh;
+    t.confirmed = fresh;
     this.snapshot = fresh;
     return fresh;
+  }
+
+  /**
+   * A second reading for the tick, fresh and taken after its first: once per tick. Null when it failed: then
+   * nothing may be judged ended on this tick's readings.
+   */
+  private async confirmingReading(t: Tick): Promise<ProcessSnapshot | null> {
+    if (t.confirmed === undefined) {
+      try {
+        await this.relist(t);
+      } catch (e) {
+        t.confirmed = null;
+        console.warn(`[agents] ${this.project}: a second reading of the process table failed: ${message(e)}`);
+      }
+    }
+    return t.confirmed ?? null;
+  }
+
+  /**
+   * Whether a run's process still runs. One that this server started is judged as before (its exit status comes
+   * from the spawner). Any other (a run adopted after a restart) is ended only when two readings agree: the tick's
+   * own and a fresh one taken after it. A slow, old or cut-short reading never ends a live run: when the fresh
+   * reading fails the answer is "unknown", and the run is left as it is until the next tick.
+   */
+  private async processState(run: AgentRun, t: Tick): Promise<"alive" | "ended" | "unknown"> {
+    const pid = run.pid;
+    if (pid === undefined) return "ended";
+    if (t.snap.isAlive(pid, run.pidStartedAt)) return "alive";
+    if (this.probes.spawner.knows(pid) || this.probes.spawner.exitCode(pid) !== undefined) return "ended";
+    const confirmed = await this.confirmingReading(t);
+    if (!confirmed) return "unknown";
+    return t.first.isAlive(pid, run.pidStartedAt) || confirmed.isAlive(pid, run.pidStartedAt) ? "alive" : "ended";
   }
 
   /**
@@ -811,7 +876,7 @@ export class AgentsService {
   followAnswer(resolution: DecisionResolution): Promise<void> {
     return this.exclusive(async () => {
       const { decision, optionId } = resolution;
-      const t = await this.newTick(this.probes.clock.now());
+      const t = await this.newTick();
       let outcome: string;
       try {
         outcome = await this.applyAnswer(decision.key, decision.source.ref, optionId, t);
@@ -945,11 +1010,9 @@ export class AgentsService {
 
   private async runTick(): Promise<AgentsTickSummary> {
     // A failed `ps` fails the tick: nothing is judged on data that couldn't be read
-    const t = await this.newTick(this.probes.clock.now());
-    if (this.reconcilePending) {
-      if (!this.readOnly) await this.reconcile(t);
-      this.reconcilePending = false;
-    }
+    const t = await this.newTick();
+    // Until every run found active has a verdict (a read_only project judges none), the next tick tries again
+    if (this.reconcilePending && !this.readOnly) this.reconcilePending = !(await this.reconcile(t));
     if (!this.readOnly) {
       for (const run of this.store.activeRuns(this.project)) {
         if (run.state === "running" || run.state === "stopping") this.readUsage(run);
@@ -1588,7 +1651,9 @@ export class AgentsService {
   // ============ SUPERVISION ============
 
   private async supervise(run: AgentRun, t: Tick): Promise<void> {
-    if (run.pid === undefined || !t.snap.isAlive(run.pid, run.pidStartedAt)) return this.onExit(run, t);
+    const state = await this.processState(run, t);
+    if (state === "unknown") return; // judged again on the next tick's readings
+    if (state === "ended") return this.onExit(run, t);
 
     // A run that lost its claim stops itself
     const claim = this.store.getClaim(this.project, run.task);
@@ -1679,7 +1744,9 @@ export class AgentsService {
   }
 
   private async finishStop(run: AgentRun, t: Tick): Promise<void> {
-    if (run.pid !== undefined && t.snap.isAlive(run.pid, run.pidStartedAt)) {
+    const state = await this.processState(run, t);
+    if (state === "unknown") return; // not signalled, not ended: the next tick reads again
+    if (state === "alive" && run.pid !== undefined) {
       const since = run.stopRequestedAt ?? t.now;
       if (!run.killed && t.now - since >= this.settings.stopGraceSeconds * 1000) {
         this.probes.spawner.kill(run.pid, "SIGKILL");
@@ -2710,7 +2777,7 @@ export class AgentsService {
     for (const claim of claims) {
       const run = this.store.getRun(claim.runId);
       const alive = snap.isAlive(claim.ownerPid, claim.ownerStartedAt);
-      if (alive && (!run || isActive(run.state) || run.claimKeptByProcess)) continue;
+      if (alive && (!run || isActive(run.state))) continue;
       const why = !alive ? "no live process owns it" : `its run ${short(claim.runId)} has ended (${run?.state})`;
       if (this.store.releaseClaim(this.project, claim.task, claim.runId)) await this.claimReleased(claim, t, why);
     }
@@ -2776,7 +2843,7 @@ export class AgentsService {
       // Its tools' sign-in is checked in the background meanwhile, so the start has an answer to go by
       this.primeSignIn(profiles);
 
-      const t = await this.newTick(now);
+      const t = await this.newTick();
       const id = randomUUID();
       const run: AgentRun = {
         id,
@@ -2886,8 +2953,7 @@ export class AgentsService {
       if (this.readOnly) throw new AgentsError(403, "The project is read_only");
       const run = this.store.getRun(runId);
       if (!run || run.project !== this.project) throw new AgentsError(404, `Unknown run: ${runId}`);
-      const now = this.probes.clock.now();
-      const t = await this.newTick(now);
+      const t = await this.newTick();
       if (run.state === "running") {
         await this.stopRun(run, "fresh_session", "a fresh session was requested", ["requested through the API (Agents view)"], t);
         return runView(run);
@@ -3168,6 +3234,7 @@ export class AgentsService {
     if (!this.stopped) return;
     this.stopped = false;
     this.reconcilePending = true;
+    this.reconciled.clear();
     this.fill?.start();
     const loop = async () => {
       if (this.stopped) return;
@@ -3187,18 +3254,32 @@ export class AgentsService {
 
   /**
    * The runs the store says are running, against the process table, before the first tick after start() judges
-   * anything (docs/design/autonomy.md §6). A run whose process is provably its own (pid, start time, command) is
-   * adopted: supervised from here on, its claim kept. One whose pid another process has now is lost: ended, its
-   * task free, and that process never signalled. One whose process is gone is left to the tick, which classifies
-   * its exit by its queue line as before.
+   * anything (docs/design/autonomy.md §6). A run whose process is provably its own (pid and start time) is
+   * adopted: supervised from here on, its claim kept. One whose pid another process has now (another start time)
+   * is lost: ended, its task free, and that process never signalled. One whose process is gone is left to the
+   * tick, which classifies its exit by its queue line as before.
+   *
+   * Lost and gone need two readings to agree: the tick's own (which may come from the shared cache) and a fresh
+   * one taken after it. When the fresh one fails, the run has no verdict yet: it keeps its state, claim and locks,
+   * and the next tick tries again. True once every run has its verdict.
    */
-  private async reconcile(t: Tick): Promise<void> {
-    const counts = { adopted: 0, lost: 0, gone: 0 };
+  private async reconcile(t: Tick): Promise<boolean> {
+    const counts = { adopted: 0, lost: 0, gone: 0, unknown: 0 };
     for (const run of this.store.activeRuns(this.project)) {
       if (run.state !== "running" && run.state !== "stopping") continue;
+      if (this.reconciled.has(run.id)) continue; // a verdict on an earlier tick
       // A config reload hands over the runs this server process started
       const startedHere = run.pid !== undefined && this.probes.spawner.knows(run.pid);
-      const verdict = reconcileRun(run, t.snap, startedHere);
+      let verdict = reconcileRun(run, t.first, startedHere);
+      if (verdict.kind !== "adopted") {
+        const confirmed = await this.confirmingReading(t);
+        if (!confirmed) {
+          counts.unknown++;
+          continue;
+        }
+        verdict = reconcileRun(run, confirmed, startedHere);
+      }
+      this.reconciled.add(run.id);
       counts[verdict.kind]++;
       if (verdict.kind === "adopted") {
         if (startedHere) continue; // not a restart: nothing to record
@@ -3210,17 +3291,13 @@ export class AgentsService {
             runId: run.id,
             summary: `adopted ${run.agent}'s run ${short(run.id)} on ${run.task} after a restart (pid ${run.pid})`,
             evidence: [verdict.evidence],
-            data: { pid: run.pid ?? null, pgid: run.pgid ?? null },
+            data: { pid: run.pid ?? null, pgid: run.pgid ?? null, commandDiffers: verdict.commandDiffers },
           },
           t.now,
         );
       } else if (verdict.kind === "lost") {
-        const detail = verdict.claimFree
-          ? `lost in a restart: ${verdict.reason}; that process isn't the run's, so Lair leaves it alone`
-          : `lost in a restart: ${verdict.reason}; Lair leaves that process alone, and the task stays claimed until it ends`;
-        // The claim stays with a process that may be the run's: no second run of the task beside it
-        if (!verdict.claimFree) run.claimKeptByProcess = true;
-        await this.endRun(run, "failed", detail, t, verdict.claimFree);
+        const detail = `lost in a restart: ${verdict.reason}; that process isn't the run's, so Lair leaves it alone`;
+        await this.endRun(run, "failed", detail, t, true);
         await this.record(
           "run_lost",
           {
@@ -3235,12 +3312,14 @@ export class AgentsService {
         );
       }
     }
-    if (counts.adopted + counts.lost + counts.gone > 0) {
+    if (counts.adopted + counts.lost + counts.gone + counts.unknown > 0) {
       console.log(
         `[agents] ${this.project}: reconciled the active runs: ${counts.adopted} adopted, ${counts.lost} lost, ` +
-          `${counts.gone} gone (their exit is classified by their queue line)`,
+          `${counts.gone} gone (their exit is classified by their queue line)` +
+          (counts.unknown > 0 ? `, ${counts.unknown} not yet (the second reading failed: the next tick tries again)` : ""),
       );
     }
+    return counts.unknown === 0;
   }
 
   /**
@@ -3278,7 +3357,7 @@ export class AgentsService {
   async stopRunsForShutdown(maxWaitMs: number): Promise<{ signalled: number; killed: number }> {
     if (this.settings.onRestart !== "stop" || this.readOnly) return { signalled: 0, killed: 0 };
     return this.exclusive(async () => {
-      const t = await this.newTick(this.probes.clock.now());
+      const t = await this.newTick();
       const own = this.store
         .activeRuns(this.project)
         .filter(
