@@ -937,7 +937,7 @@ describe("the run's decision tells the owner which options cannot be undone", ()
   const DROP = { op: "drop", task: "feat-login", reason: "superseded" };
 
   /** One observe-mode run whose proposals get these verdicts; the effect of each option of its decision. */
-  async function effectsOf(proposals: unknown[], verdicts: ("approve" | "reject")[]): Promise<Record<string, string>> {
+  async function effectsOf(proposals: unknown[], verdicts: ("approve" | "reject")[]): Promise<Record<string, string | undefined>> {
     const p = makePaths();
     tasks(p, "worker-a|Alice|feat-login|Login form");
     const h = await setupWithVerifier(p, { mode: "observe" });
