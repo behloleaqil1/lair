@@ -124,15 +124,18 @@ interface SpendRow {
   amount_at: number | null;
 }
 
+/** What a reading says; its data end and the meter since are worked out at each check, not stored */
+type SpendFields = Omit<CloudProviderSpend, "dataUntil" | "meterSince">;
+
 /** A cost reading as read: what it says, and when */
-export type SpendReadingRecord = Omit<CloudProviderSpend, "readAt"> & {
+export type SpendReadingRecord = Omit<SpendFields, "readAt"> & {
   readAtMs: number;
   /** An "unknown" whose answer held no cost at all */
   empty: boolean;
 };
 
 /** A cost reading as stored, with the account's history: its first reading ever and its last amount */
-export type StoredSpend = CloudProviderSpend & {
+export type StoredSpend = SpendFields & {
   readAtMs: number | null;
   empty: boolean;
   firstReadAtMs: number | null;
