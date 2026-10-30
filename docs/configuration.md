@@ -170,12 +170,37 @@ Configure the MCP fleet bus for agent communication:
 ```yaml
 mail_dir: /path/to/mail
 wake_file: /path/to/wake
+bus:
+  consume: off  # off | observe | on
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `mail_dir` | string | — | Directory for per-agent mailbox files |
 | `wake_file` | string | — | File to touch to wake the orchestrator |
+| `bus.consume` | `off` \| `observe` \| `on` | `off` | How fill and the planner react to bus events |
+
+### Bus consume modes
+
+| Mode | Behavior |
+|------|----------|
+| `off` | File reader only: events are not consumed (current behavior) |
+| `observe` | Record what events would do, without acting, for comparison on Home → Health |
+| `on` | Events drive state changes; mirrored lines are skipped |
+
+In `observe` mode, every bus event records what the consumer would have done. When the file reader processes the mirrored
+line, it records what it did. Home → Health shows the comparison: matches, mismatches, and pending observations. Use this
+to verify the bus consumers match the file reader before switching a project to `on`.
+
+In `on` mode, mirrored lines carry a marker (`[bus:<id>]`). When a consumer processes an event, it records the bus id;
+when the file reader sees a line with that marker, it skips it. Hand-written lines (agents without the bus) still work
+exactly as before.
+
+### Note: agent node path
+
+On a host that blocks node for agents (macOS privacy controls, corporate policy), the MCP server is started by the
+agent tool from the owner's MCP config with an absolute node path. It runs Lair's own code, not agent-chosen code; the
+owner installs it.
 
 ## Dragons (agents)
 

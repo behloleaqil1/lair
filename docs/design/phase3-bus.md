@@ -44,3 +44,34 @@ built (`src/bus/`, plus `src/server/routes/bus.ts` for the UI side); see [docs/a
 Unit tests for every tool; a concurrency test (20 parallel claims of one task: exactly one winner); schema tests (bad
 input refused with a clear error); a mirror test (bus writes produce exactly the expected text lines); an end-to-end
 test with two fake agents and a fake orchestrator over stdio; the SSE feed test. `npm test`, lint and typecheck pass.
+
+## 5. Bus consumers (PR 2a)
+
+Fill and the planner subscribe to `bus.report` and `bus.message` events: a DONE or BLOCKED reaches fill's state in under
+2 seconds (event-driven, no file poll in the path). Configuration (per project, `bus.consume`):
+
+| Mode | Behavior |
+|------|----------|
+| `off` | File reader only; events are not consumed (default, matches main) |
+| `observe` | Record what events would do, without acting, for comparison on Home → Health |
+| `on` | Events drive state changes; mirrored lines are skipped |
+
+### 5.1 No double counting
+
+The mirror appends a marker (`[bus:<id>]`) to mirrored lines. When a consumer processes an event, it records the bus id;
+when the file reader sees a line with a marker whose id was already consumed, it skips it. Hand-written lines (agents
+without the bus) still work exactly as before.
+
+Tests:
+- The event first, then the line: one transition.
+- The line only: one transition.
+- A restart between the two: one transition.
+
+### 5.2 Observe mode
+
+In `observe` mode, consumers record what each event would have done next to what the file reader did, exposed on
+Home → Health. This lets Claude compare the two before switching a project to `on`.
+
+### 5.3 Latency
+
+A DONE or BLOCKED over the bus reaches fill's state in under 2 seconds. Measured with a fake clock in tests.

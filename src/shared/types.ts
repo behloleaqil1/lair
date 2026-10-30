@@ -125,6 +125,16 @@ export interface ProjectConfig {
    * docs/configuration.md#supervisor-self-checks-and-the-ops-api
    */
   supervisor?: Record<string, unknown>;
+  /**
+   * Fleet bus consumers (src/server/bus/consumers.ts): how fill and the
+   * planner react to bus events. Validated by parseBusConfig; see
+   * docs/configuration.md#fleet-bus
+   */
+  bus?: Record<string, unknown>;
+  /** Directory for per-agent mailbox files (bus mirror) */
+  mail_dir?: string;
+  /** File to touch when dragons should wake (bus mirror) */
+  wake_file?: string;
 }
 
 // Process configuration as it appears in YAML (before defaults applied)

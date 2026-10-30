@@ -216,6 +216,27 @@ After `npm run build` you can use `node /path/to/lair/dist/bus/cli.js --project 
 
 The fleet bus ensures atomic task claims (no two agents can claim the same task) and provides instant updates to the UI.
 
+### On a host that blocks node for agents
+
+On a host where agents cannot run node directly (macOS privacy controls, corporate policy, sandboxing), the MCP server
+is started by the agent tool from the **owner's** MCP config with an absolute node path. It runs Lair's own code, not
+agent-chosen code. The owner installs it:
+
+```json
+{
+  "mcpServers": {
+    "lair": {
+      "command": "/usr/local/bin/node",
+      "args": ["/path/to/lair/dist/bus/cli.js", "--project", "myproject"],
+      "env": { "LAIR_AGENT_ID": "kiro-A" }
+    }
+  }
+}
+```
+
+This is secure: the agent cannot change which code runs (the path is in the owner's config) and cannot access the bus
+database directly (only through the MCP protocol, which validates every request).
+
 ## Monitoring agent health
 
 Lair detects common problems:

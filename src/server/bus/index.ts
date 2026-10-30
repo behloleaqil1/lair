@@ -29,3 +29,15 @@ export type { BusTokenBinding } from "./tokens.js";
 
 export { BusMirror } from "./mirror.js";
 export type { BusMirrorConfig } from "./mirror.js";
+
+export { BusConsumers, extractBusId } from "./consumers.js";
+export type {
+  BusConsumeMode,
+  BusReportEvent,
+  BusMessageEvent,
+  ObservedTransition,
+  BusConsumersOptions,
+} from "./consumers.js";
+
+export { parseBusConfig, consumeModeDescription } from "./config.js";
+export type { BusSettings } from "./config.js";
