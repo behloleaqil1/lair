@@ -22,8 +22,8 @@ import type {
   TurnState,
 } from "../../shared/supervisor-types.js";
 
-// 1: ops_audit; 2: conversations and turns (S1-2)
-const SCHEMA_VERSION = 2;
+// 1: ops_audit; 2: conversations and turns (S1-2); 3: act_audit (S3)
+const SCHEMA_VERSION = 3;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS ops_audit (
@@ -38,6 +38,20 @@ const SCHEMA = `
     duration_ms INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_ops_audit_at ON ops_audit(at);
+  CREATE TABLE IF NOT EXISTS act_audit (
+    id TEXT PRIMARY KEY,
+    at INTEGER NOT NULL,
+    project TEXT NOT NULL,
+    op TEXT NOT NULL,
+    target TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    cleared_check_output TEXT,
+    mode TEXT NOT NULL,
+    result TEXT NOT NULL,
+    detail TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_act_audit_at ON act_audit(at);
+  CREATE INDEX IF NOT EXISTS idx_act_audit_project ON act_audit(project, at);
   CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     project TEXT NOT NULL,
@@ -469,7 +483,118 @@ export class SupervisorStore {
       this.db.prepare(`DELETE FROM conversations WHERE updated_at < ?`).run(before);
     })();
   }
+
+  // ============ ACT AUDIT (S3) ============
+
+  /** Record a supervisor acting operation */
+  recordActAudit(entry: ActAuditEntry): void {
+    this.db
+      .prepare(
+        `INSERT INTO act_audit (id, at, project, op, target, evidence, cleared_check_output, mode, result, detail)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        entry.id,
+        new Date(entry.at).getTime(),
+        entry.project.slice(0, 200),
+        entry.op,
+        entry.target.slice(0, 500),
+        JSON.stringify(entry.evidence).slice(0, 5000),
+        entry.clearedCheckOutput?.slice(0, 1000) ?? null,
+        entry.mode,
+        entry.result,
+        entry.detail?.slice(0, 1000) ?? null,
+      );
+    this.pruneActAudit(new Date(entry.at).getTime());
+  }
+
+  /** Get recent act audit entries for a project */
+  getActAuditHistory(project: string, limit = 20): ActAuditEntry[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM act_audit WHERE project = ? ORDER BY at DESC, rowid DESC LIMIT ?`)
+      .all(project, Math.min(Math.max(1, Math.floor(limit)), 100)) as ActAuditRow[];
+    return rows.map(toActEntry);
+  }
+
+  /** Get counts of act audit entries for the UI */
+  getActCounts(project: string): { wouldAct: number; acted: number; failed: number } {
+    const hourAgo = Date.now() - 3600_000;
+    const rows = this.db
+      .prepare(
+        `SELECT mode, result, COUNT(*) as count FROM act_audit
+         WHERE project = ? AND at > ? GROUP BY mode, result`,
+      )
+      .all(project, hourAgo) as { mode: string; result: string; count: number }[];
+
+    let wouldAct = 0;
+    let acted = 0;
+    let failed = 0;
+    for (const row of rows) {
+      if (row.mode === "observe" && row.result === "success") wouldAct += row.count;
+      else if (row.mode === "act" && row.result === "success") acted += row.count;
+      else if (row.result === "failed") failed += row.count;
+    }
+    return { wouldAct, acted, failed };
+  }
+
+  /** Prune old act audit entries */
+  private pruneActAudit(now: number): void {
+    if (this.inserts % PRUNE_EVERY !== 0) return;
+    this.db.prepare(`DELETE FROM act_audit WHERE at < ?`).run(now - RETENTION_MS);
+    this.db
+      .prepare(`DELETE FROM act_audit WHERE rowid NOT IN (SELECT rowid FROM act_audit ORDER BY at DESC, rowid DESC LIMIT ?)`)
+      .run(MAX_ROWS);
+  }
 }
+
+/** A supervisor acting audit entry */
+export interface ActAuditEntry {
+  id: string;
+  at: string;
+  project: string;
+  op: string;
+  target: string;
+  evidence: string[];
+  clearedCheckOutput: string;
+  mode: "observe" | "act";
+  result: "success" | "failed" | "skipped";
+  detail: string;
+}
+
+interface ActAuditRow {
+  id: string;
+  at: number;
+  project: string;
+  op: string;
+  target: string;
+  evidence: string;
+  cleared_check_output: string | null;
+  mode: string;
+  result: string;
+  detail: string | null;
+}
+
+function toActEntry(row: ActAuditRow): ActAuditEntry {
+  let evidence: string[] = [];
+  try {
+    evidence = JSON.parse(row.evidence);
+  } catch {
+    evidence = [];
+  }
+  return {
+    id: row.id,
+    at: new Date(row.at).toISOString(),
+    project: row.project,
+    op: row.op,
+    target: row.target,
+    evidence,
+    clearedCheckOutput: row.cleared_check_output ?? "",
+    mode: row.mode === "act" ? "act" : "observe",
+    result: row.result === "success" ? "success" : row.result === "skipped" ? "skipped" : "failed",
+    detail: row.detail ?? "",
+  };
+}
+
 
 function toEntry(row: AuditRow): OpsAuditEntry {
   return {

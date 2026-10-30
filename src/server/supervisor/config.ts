@@ -18,6 +18,7 @@ import { isValidPromptName, PROMPT_NAME_RULE } from "../agents/prompts.js";
 import { roleAgents } from "../ai/profiles.js";
 import { isValidDragonId } from "../parsers/dragon-config.js";
 import { knownDragonIds, loadKnownDragons } from "../services/dragon-registry.js";
+import { ActSchema, parseActConfig, defaultActSettings, type ActSettings } from "./act-config.js";
 
 const ms = (fallback: number) => z.number().int().min(1).max(600_000).default(fallback);
 const percent = (fallback: number) => z.number().min(0).max(100).default(fallback);
@@ -127,6 +128,8 @@ export const SupervisorSchema = z
     prompt_file: z.string().min(1).max(255).optional(),
     chat: ChatSchema.default({}),
     digest: DigestSchema.default({}),
+    /** S3: acting fixes by evidence (docs/design/supervisor.md) */
+    act: ActSchema.default({}),
   })
   .strict();
 
@@ -140,6 +143,7 @@ export interface SupervisorSettings {
   promptFile: string | null;
   chat: ChatSettings;
   digest: DigestSettings;
+  act: ActSettings;
 }
 
 /**
@@ -235,6 +239,7 @@ export function parseSupervisorConfig(raw: unknown): ParseResult {
     promptFile: value.prompt_file ?? null,
     chat: value.chat,
     digest: value.digest,
+    act: value.act,
   };
   if (errors.length > 0) return { ok: false, errors };
   return { ok: true, settings };
@@ -262,3 +267,5 @@ export function defaultSupervisorSettings(): SupervisorSettings {
 export function checkDisabled(settings: ChecksSettings, id: CheckId): boolean {
   return settings.disabled.includes(id);
 }
+
+export { ActSettings } from "./act-config.js";

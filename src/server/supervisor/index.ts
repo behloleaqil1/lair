@@ -36,11 +36,14 @@ import type { CommandTimeoutLog } from "../core/command-timeouts.js";
 export { Supervisor, SERVER_SCOPE } from "./service.js";
 export { RequestLatency, registerLatencyHook } from "./latency.js";
 export { OpsTokens } from "./tokens.js";
-export { parseSupervisorConfig, SupervisorSchema } from "./config.js";
+export { parseSupervisorConfig, SupervisorSchema, type ActSettings } from "./config.js";
 export { SupervisorChat, ChatError } from "./chat.js";
+export { SupervisorAct } from "./act.js";
+export { parseActConfig, defaultActSettings, actEnabled, opAllowed, ACT_OPS, type ActOp } from "./act-config.js";
 export type { ChatAgents } from "./chat.js";
 export type { CheckSources, ModuleReport } from "./checks.js";
 export type { OpsSources } from "./ops-tools.js";
+export type { ActEvidence, ActResult, ActModules } from "./act-ops.js";
 
 export interface MountSupervisorOptions {
   /** data/supervisor.db in the server; ":memory:" in tests */

@@ -33,6 +33,7 @@ any machines.
 | Look and feel (T1) | [settings-v2.md](settings-v2.md) | `src/client/ui/` | Design tokens with light, dark and system themes and two densities (AA contrast checked from the values), a component kit, the app shell (left nav, breadcrumbs and page headers) and every view on them; axe runs on every view in CI |
 | Settings v2, part 1 (S2-1) | [settings-v2.md](settings-v2.md) | `src/client/components/Settings*.tsx` | Settings by task: Overview (a setup checklist), AI (tools signed in per machine, profiles with each tool's own models, roles as ordered lists) and Team (agents, bulk moves), the classic form for the rest; a search over every field; one save bar through the phase-1 review |
 | Cleanup | [cleanup.md](cleanup.md) | `src/server/cleanup/` | Retention and removal for worktrees (after merge) and watched folders (results, logs, gate snapshots); configurable keep_days and skip_if_referenced; observe and act modes; bounded per cycle; every removal audited |
+| Supervisor S3: acting fixes (A4) | [supervisor.md](supervisor.md) | `src/server/supervisor/act*.ts` | Evidence detectors for infra-caused holds and escalations (deterministic, in code); three acting ops (`release_hold`, `close_infra_escalation`, `reject_duplicate_proposal`) through the owning module's own path; `supervisor.act` config (mode: off/observe/act, allow: the allowlist, max_per_hour, cooldown_minutes); every would-act and act audited; withdrawn decisions record the evidence; builds ahead of S1-3 because the owner chose "Lair answers by evidence" and no AI run is needed |
 
 ## Next, in order
 
@@ -78,7 +79,7 @@ Each step lists what must exist first. One module per pull request, each with it
 | A3 | **Supervisor S1–S2**: self-checks, the ops API, answers, the daily digest, proposals as decisions (S1-1, the self-checks and the read-only ops API, and S1-2, the supervisor's runs, answers and digest, are built; S1-3, the hourly review and diagnoses, is next) | [supervisor.md](supervisor.md) | A2 | See supervisor.md |
 | A6 | **AI roles**: any tool, any model, per role (build, review per tier, plan, supervise); sign-in status per machine; a write-only key store for API-key tools; reviewer calibration | [ai-roles.md](ai-roles.md) | — | See ai-roles.md |
 | A7 | **Look and feel, then Settings v2**: design tokens, light/dark, a component kit for every view (T1, built); Settings by task, with plain language, levels, search, templates and test buttons (S2-1 built; S2-2 and S2-3 to do) | [settings-v2.md](settings-v2.md) | T1 first; S2-1 needs A6 | See settings-v2.md |
-| A4 | **Supervisor S3**: an allowlist of acting fixes | [supervisor.md](supervisor.md) | A3 | See supervisor.md |
+| A4 | **Supervisor S3**: acting fixes by evidence (deterministic-first) | [supervisor.md](supervisor.md) | A2 | See supervisor.md. **Built**: evidence detectors, acting ops, config and audit. A4 moved ahead of A3's S1-3 (owner's decision: "Lair answers by evidence") |
 | A5 | **Hands-off day** (end-to-end acceptance) | [autonomy.md §11](autonomy.md) | A2–A4 | A project runs a full day with no human input except Decision Inbox answers |
 
 ### B. A proper open-source project

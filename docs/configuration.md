@@ -1108,7 +1108,45 @@ Every route is the owner's (`/api/supervisor` is in `OWNER_ONLY_PREFIXES`), exce
 | `GET` | `/api/supervisor/digest?project=<name>` | `{project, enabled, time, latest}`: the latest digest, a conversation as above |
 | `POST` | `/api/ops/answer` | A run token. Body `{conversation, answer, evidence?}`: `{conversation, turn}`. 401 without a live token, 403 for a token that isn't the asked run's, 404 for an unknown conversation, 409 for an answer already given or a closed question, 400 for an invalid answer or evidence |
 
-The conversations are kept in `data/supervisor.db` (schema version 2), for 90 days after their last change.
+The conversations are kept in `data/supervisor.db` (schema version 3), for 90 days after their last change.
+
+## Supervisor acting (S3)
+
+> Off by default: nothing changes until you set `supervisor.act.mode: observe` or `act`. Design: [supervisor.md](design/supervisor.md) (S3). Acting fixes are deterministic, in code, with no AI run needed. Each op goes through the owning module's own function, with that module's checks.
+
+Supervisor S3 lets Lair release holds and close escalations whose evidence points at the infrastructure, automatically, once the infrastructure is back. The causes are found by code (the same evidence S1-1's `infra_holds` check reads), and acting ops re-check the evidence when they act. The owner never needs to click through 14 "Start it again" decisions after a Mac reboot where Docker wasn't running.
+
+The three acting ops:
+
+- **`release_hold`**: releases an agent hold caused by infrastructure (BLOCKED with Docker daemon error, SSH timeout, etc.). Uses the agents module's `releaseFillHold`, the same as "Start it again" in the Agents view.
+- **`close_infra_escalation`**: closes a triage escalation that was "failed the same way" because of infrastructure. Withdraws the decision.
+- **`reject_duplicate_proposal`**: rejects a pending planner decision whose proposals are identical to a newer pending one.
+
+Evidence detectors run in code. A hold is infra-caused only when EVERY failed step matches an infra pattern (Docker errors, SSH errors, exit code 125) AND no text matches a code failure pattern (test failures, compile errors). A single test failure in the evidence means it is NOT infrastructure.
+
+```yaml
+supervisor:
+  act:
+    mode: observe            # off | observe (record "would act") | act
+    allow: [release_hold, close_infra_escalation, reject_duplicate_proposal]
+    max_per_hour: 20         # all acting ops together; over it, nothing acts and one notice is raised
+    cooldown_minutes: 30     # never the same op on the same target twice inside this window
+```
+
+The default is `mode: off` with an empty `allow`. In `observe` mode, Lair records what it would do without changing anything (Home → Health shows the counts). In `act` mode, ops in `allow` run by themselves; ops not in `allow` are recorded as would-act.
+
+Every would-act and act is audited in `data/supervisor.db`. A decision withdrawn by acting records the evidence: `resolved by supervisor (release_hold): matched infra pattern "docker" in: Cannot connect to Docker`.
+
+A fix that didn't work (the same target is held again within the cooldown) escalates as a notice instead of repeating.
+
+### Acting options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `mode` | string | `"off"` | `off`: nothing runs; `observe`: record "would act"; `act`: run ops in `allow` |
+| `allow` | array | `[]` | Which ops may run: `release_hold`, `close_infra_escalation`, `reject_duplicate_proposal` |
+| `max_per_hour` | number | `20` | All acting ops together; over this, nothing acts and one notice is raised |
+| `cooldown_minutes` | number | `30` | Never the same op on the same target twice inside this window |
 
 ## Delivery
 
