@@ -29,12 +29,16 @@ const OnDemandSchema = z
     guard_cmd: argv,
     /** Added to the estimate while the machine is not running (seconds) */
     boot_seconds: z.number().int().min(0).max(3600).default(150),
-    /** Shown in the UI; used as a tie-break */
+    /** Shown in the status; breaks a tie between two equally good moves */
     cost_per_hour: z.number().min(0).max(1000).optional(),
     /** How often state/guard run at most (seconds); the guard may read paid APIs, so cache it */
     check_seconds: z.number().int().min(10).max(3600).default(300),
-    /** Speed factor for this machine vs others when no history exists (default 1.0) */
+    /** Multiplies a class's duration learned on other machines while this one has no run of it */
     speed_factor: z.number().min(0.1).max(10).default(1.0),
+    /** Refreshes the machine's activity mark (or lease) while a job runs in one of its lanes */
+    touch_cmd: argv.optional(),
+    /** How often touch_cmd runs while a job runs there (seconds) */
+    touch_seconds: z.number().int().min(10).max(3600).default(60),
   })
   .strict();
 
@@ -120,6 +124,8 @@ export interface OnDemandSettings {
   costPerHour?: number;
   checkSeconds: number;
   speedFactor: number;
+  touchCmd?: string[];
+  touchSeconds: number;
 }
 
 export interface MachineSettings {
@@ -294,10 +300,20 @@ export function parsePlacementConfig(raw: unknown): ParseResult {
           costPerHour: m.on_demand.cost_per_hour,
           checkSeconds: m.on_demand.check_seconds,
           speedFactor: m.on_demand.speed_factor,
+          touchCmd: m.on_demand.touch_cmd,
+          touchSeconds: m.on_demand.touch_seconds,
         }
       : undefined,
   }));
   const machineIds = new Set(machines.map((m) => m.id));
+  for (const m of machines) {
+    // A touch runs at most once per tick: a longer tick would let the machine's idle timer win
+    if (m.onDemand?.touchCmd && m.onDemand.touchSeconds < value.interval_seconds) {
+      errors.push(
+        `placement.machines.${m.id}.on_demand.touch_seconds: ${m.onDemand.touchSeconds} is shorter than interval_seconds (${value.interval_seconds}); a touch runs at most once per tick`,
+      );
+    }
+  }
 
   const lanes: LaneSettings[] = [];
   const laneNames = new Set(Object.keys(value.lanes));

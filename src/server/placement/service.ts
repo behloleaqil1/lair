@@ -78,6 +78,15 @@ interface OnDemandRuntime {
   unavailableReason: string | null;
   /** When state and guard were last checked */
   lastCheckAt: number | null;
+  /** When the guard last ran right before a move into its lanes */
+  guardedAt: number | null;
+  /** It answered (a passing probe, or a state of running or pending) since the last check */
+  alive: boolean;
+  /** When a check last found it stopped (or stopping) after it had been alive */
+  stoppedAt: number | null;
+  /** When touch_cmd last ran, and why it failed */
+  lastTouchAt: number | null;
+  touchError: string | null;
 }
 
 interface MachineRuntime {
@@ -145,6 +154,14 @@ function tail(text: string): string {
   return trimmed.length > OUTPUT_TAIL ? trimmed.slice(-OUTPUT_TAIL) : trimmed;
 }
 
+/** A guard_cmd's answer: null when it allows a start (exit 0, "guard: ok"), else why not, with what it printed. */
+function guardVerdict(out: CommandOutput): string | null {
+  if (out.code === 0 && out.stdout.trimStart().toLowerCase().startsWith("guard: ok")) return null;
+  const said = tail(out.stdout) || tail(out.stderr) || "no reason given";
+  if (out.code === 0) return `guard refused: ${said}`;
+  return `guard refused (${out.code === -1 ? "no answer" : `exit ${out.code}`}): ${said}`;
+}
+
 export class Placement {
   readonly project: string;
   readonly settings: PlacementSettings;
@@ -159,6 +176,8 @@ export class Placement {
   private lastTickAt: number | null = null;
   private historyChecked = new Set<string>();
   private historyMark: string | null = null;
+  /** Jobs whose on-demand machine stopped while they ran: gate id → the lane they ran in */
+  private stoppedUnder = new Map<string, string>();
   private recovered = false;
   private snapshot: Snapshot | null = null;
   private timer: NodeJS.Timeout | null = null;
@@ -191,6 +210,11 @@ export class Placement {
               guardOk: false,
               unavailableReason: "not yet checked",
               lastCheckAt: null,
+              guardedAt: null,
+              alive: false,
+              stoppedAt: null,
+              lastTouchAt: null,
+              touchError: null,
             }
           : null,
       });
@@ -279,44 +303,125 @@ export class Placement {
           if (this.abort.signal.aborted) return;
 
           od.lastCheckAt = now;
+          const wasAlive = od.alive;
 
           // Parse state_cmd output
           const stateOut = stateResult.stdout.trim().toLowerCase();
+          let stateReason: string | null = null;
           if (stateResult.code !== 0) {
             od.powerState = "unknown";
-            od.unavailableReason = `state_cmd failed: ${tail(stateResult.stderr || `exit ${stateResult.code}`)}`;
-            od.guardOk = false;
+            stateReason = `state_cmd failed: ${tail(stateResult.stderr || stateResult.stdout) || `exit ${stateResult.code}`}`;
           } else if (stateOut.startsWith("running")) {
             od.powerState = "running";
-            od.unavailableReason = null;
           } else if (stateOut.startsWith("stopped")) {
             od.powerState = "stopped";
-            od.unavailableReason = null;
           } else if (stateOut.startsWith("pending")) {
             od.powerState = "pending";
-            od.unavailableReason = null;
           } else if (stateOut.startsWith("stopping")) {
             od.powerState = "stopping";
-            od.unavailableReason = null;
           } else {
             od.powerState = "unknown";
-            od.unavailableReason = `state_cmd returned unknown state: ${stateOut.slice(0, 50)}`;
+            stateReason = `state_cmd returned unknown state: ${stateOut.slice(0, 50)}`;
           }
+          od.alive = od.powerState === "running" || od.powerState === "pending";
+          // Stopped after it answered: whatever ran on it lost its machine (keepAlive reports it)
+          const down = od.powerState === "stopped" || od.powerState === "stopping";
+          od.stoppedAt = wasAlive && down ? now : null;
 
-          // Parse guard_cmd output: exit 0 + stdout starting with "guard: ok"
-          if (guardResult.code === 0 && guardResult.stdout.trimStart().toLowerCase().startsWith("guard: ok")) {
-            od.guardOk = true;
-          } else if (guardResult.code === 0) {
-            od.guardOk = false;
-            od.unavailableReason = `guard refused: ${tail(guardResult.stdout) || "no reason given"}`;
-          } else {
-            od.guardOk = false;
-            if (!od.unavailableReason) {
-              od.unavailableReason = `guard_cmd failed: ${tail(guardResult.stderr || `exit ${guardResult.code}`)}`;
-            }
-          }
+          const guardReason = guardVerdict(guardResult);
+          od.guardOk = guardReason === null;
+          od.unavailableReason = [stateReason, guardReason].filter((r) => r !== null).join("; ") || null;
         }),
     );
+  }
+
+  /**
+   * Why queued jobs leave this machine's lanes: an on-demand machine that is
+   * not up and can't be started for them (its guard refused, its state is
+   * unknown), or null. One that is starting or stopping keeps its jobs.
+   */
+  private backReason(machineId: string): string | null {
+    const rt = this.machines.get(machineId);
+    const od = rt?.onDemand;
+    if (!rt || !od || rt.state === "up") return null;
+    if (od.powerState === "unknown" || (od.powerState === "stopped" && !od.guardOk)) {
+      return `${machineId} ${od.unavailableReason ?? "not checked yet"}`;
+    }
+    return null;
+  }
+
+  /**
+   * Right before a move into a lane whose on-demand machine is not up (the
+   * move starts it), the guard runs again unless it ran this tick: a cached
+   * "ok" may be check_seconds old. Null when the start is allowed, else why
+   * not; a refusal leaves the machine unavailable until its next check.
+   */
+  private async guardBeforeStart(c: Candidate, now: number): Promise<string | null> {
+    const lane = this.laneOf(c.to);
+    const m = lane ? this.settings.machines.find((x) => x.id === lane.machine) : undefined;
+    const rt = lane ? this.machines.get(lane.machine) : undefined;
+    const od = rt?.onDemand;
+    if (!lane || !m?.onDemand || !rt || !od || rt.state === "up") return null;
+    if (od.lastCheckAt !== now && od.guardedAt !== now) {
+      const out = await this.run(m.onDemand.guardCmd, this.settings.commandTimeoutSeconds * 1000);
+      if (this.abort.signal.aborted) return null;
+      od.guardedAt = now;
+      const refused = guardVerdict(out);
+      if (refused !== null) {
+        od.guardOk = false;
+        od.unavailableReason = refused;
+      }
+    }
+    return od.guardOk ? null : `${lane.machine} ${od.unavailableReason ?? "guard refused"}`;
+  }
+
+  /**
+   * While a job runs in an on-demand machine's lanes, keep the machine alive:
+   * touch_cmd every touch_seconds. A check that found the machine stopped
+   * after it had answered is an infrastructure event: one
+   * placement.machine_stopped_under_job per job running there, and the job
+   * goes back once if it is queued there again while the machine is not up.
+   */
+  private async keepAlive(queue: QueueJob[], now: number): Promise<void> {
+    const timeoutMs = this.settings.commandTimeoutSeconds * 1000;
+    await Promise.all(
+      this.settings.machines.map(async (m) => {
+        const od = this.machines.get(m.id)?.onDemand;
+        if (!od || !m.onDemand) return;
+        const lanes = new Set(this.settings.lanes.filter((l) => l.machine === m.id).map((l) => l.name));
+        const running = queue.filter((j) => j.status === "running" && lanes.has(j.lane));
+        if (od.stoppedAt === now) {
+          for (const job of running) {
+            if (this.stoppedUnder.has(job.id)) continue;
+            this.stoppedUnder.set(job.id, job.lane);
+            await this.events?.emit("placement.machine_stopped_under_job", {
+              project: this.project,
+              machine: m.id,
+              gateId: job.id,
+              lane: job.lane,
+              state: od.powerState,
+            });
+          }
+        }
+        const touch = m.onDemand.touchCmd;
+        if (!touch || running.length === 0) return;
+        if (od.lastTouchAt !== null && now - od.lastTouchAt < m.onDemand.touchSeconds * 1000) return;
+        const out = await this.run(touch, timeoutMs);
+        if (this.abort.signal.aborted) return;
+        od.lastTouchAt = now;
+        od.touchError =
+          out.code === 0
+            ? null
+            : `touch_cmd ${out.code === -1 ? "gave no answer" : `exited ${out.code}`}${out.stderr.trim() ? `: ${tail(out.stderr)}` : ""}`;
+      }),
+    );
+    for (const [id, lane] of this.stoppedUnder) {
+      const job = queue.find((j) => j.id === id && j.lane === lane);
+      const machine = this.laneOf(lane)?.machine;
+      // It left that lane (moved back, finished), or it is queued there with its machine up again
+      const up = machine !== undefined && this.machines.get(machine)?.state === "up";
+      if (!job || (job.status === "queued" && up)) this.stoppedUnder.delete(id);
+    }
   }
 
   /**
@@ -372,6 +477,7 @@ export class Placement {
     const passed = probe.code === 0 && (m.expect === undefined || out.startsWith(m.expect));
     rt.lastProbeAt = now;
     if (passed) {
+      if (rt.onDemand) rt.onDemand.alive = true;
       rt.lastError = null;
       rt.passingSince ??= now;
       if (rt.state !== "up") {
@@ -562,13 +668,23 @@ export class Placement {
    * usual load while it runs gates runs them slower: the median is
    * multiplied by max(1, load factor now ÷ usual load factor), where the
    * usual factor is the median Lair measured during the runs it learned
-   * (1 until it has some).
+   * (1 until it has some). An on-demand machine with no run of the class
+   * yet takes `speed_factor` times what the class takes on other machines.
    */
   private durations(): DurationModel {
     const index = this.sampleIndex();
     const adjust = (machine: string) => Math.max(1, this.factor(machine) / index.usualFactor(machine));
+    const speed = new Map(this.settings.machines.map((m) => [m.id, m.onDemand?.speedFactor] as const));
     return {
-      fn: (cls, machine) => (index.base(cls ?? "", machine) ?? this.settings.defaultSeconds) * adjust(machine),
+      fn: (cls, machine) => {
+        const factor = speed.get(machine);
+        const elsewhere = factor === undefined ? null : index.elsewhere(cls ?? "", machine);
+        const base =
+          factor !== undefined && elsewhere !== null
+            ? elsewhere * factor
+            : (index.base(cls ?? "", machine) ?? this.settings.defaultSeconds);
+        return base * adjust(machine);
+      },
       table: index.table(),
     };
   }
@@ -593,8 +709,18 @@ export class Placement {
         routingMinGainSeconds: l.routing.minGainSeconds,
         onDemandAvailable: onDemandAvail.available,
         bootSeconds: this.onDemandBootTime(l.machine),
+        costPerHour: this.settings.machines.find((m) => m.id === l.machine)?.onDemand?.costPerHour ?? null,
       };
     });
+    const back = (job: QueueJob): string | null => {
+      const machine = this.laneOf(job.lane)?.machine;
+      if (job.status !== "queued" || machine === undefined) return null;
+      const reason = this.backReason(machine);
+      if (reason !== null) return reason;
+      // Its machine stopped while it ran there and the runner put it back: it goes back once
+      const up = this.machines.get(machine)?.state === "up";
+      return this.stoppedUnder.get(job.id) === job.lane && !up ? `${machine} stopped under it` : null;
+    };
     const runs = new Map(this.store.runs(this.project).map((r) => [r.gateId, r] as const));
     const seen = new Set<string>();
     const jobs: ModelJob[] = [];
@@ -611,6 +737,7 @@ export class Placement {
         quiet: job.quiet,
         startedAt: job.status === "running" ? (runs.get(job.id)?.startedAt ?? now) : null,
         runsOn: job.lane,
+        back: back(job),
       };
       if (mj.status === "queued") mj.runsOn = servingLane(lanes, mj)?.name ?? job.lane;
       jobs.push(mj);
@@ -626,21 +753,10 @@ export class Placement {
     if (!lane) return null;
     if (lane.serves.length > 0) return `${job.lane} is a pseudo-lane`;
     const machine = this.machines.get(lane.machine);
-    const m = this.settings.machines.find((m) => m.id === lane.machine);
-
-    // Check if machine is up or on-demand available
-    const isUp = machine?.state === "up";
-    const onDemandAvail = this.onDemandAvailability(lane.machine);
-
-    if (!isUp && !onDemandAvail.available) {
-      // For on-demand machines that are unavailable, give specific reason
-      if (m?.onDemand && machine?.onDemand) {
-        const od = machine.onDemand;
-        if (od.powerState === "unknown") {
-          return `${lane.machine} state unknown: ${onDemandAvail.reason}`;
-        } else if (!od.guardOk) {
-          return `${lane.machine} guard refused: ${onDemandAvail.reason}`;
-        }
+    // A job going back out of an on-demand lane is held only by its cool-down and the per-job cap
+    if (machine?.state !== "up" && !this.onDemandAvailability(lane.machine).available && job.back === null) {
+      if (machine?.onDemand) {
+        return `${lane.machine} is ${machine.onDemand.powerState}${machine.state === "starting" ? " and not up long enough yet" : ""}: its jobs wait for it`;
       }
       return `${lane.machine} is ${machine?.state === "starting" ? "not up long enough yet" : (machine?.state ?? "unknown")}: its own fallback is in charge`;
     }
@@ -718,7 +834,18 @@ export class Placement {
       const f = this.factor(machine);
       if (f >= 1.05) parts.push(`${machine} load ${f.toFixed(1)}×`);
     }
-    return `${verb} ${c.job.id} ${c.from}→${c.to}: est. ${formatSpan(c.fromFinish - now)} → ${formatSpan(c.toFinish - now)}; ${parts.join(", ")}`;
+    // On-demand moves: why, and what starting the machine adds ("aws stopped, guard ok, 150 s boot")
+    const why: string[] = [];
+    if (c.route === "back") why.push(c.job.back ?? `${c.from} can't run it`);
+    const od = this.machines.get(toMachine)?.onDemand;
+    const boot = this.settings.machines.find((m) => m.id === toMachine)?.onDemand?.bootSeconds;
+    if (od && boot !== undefined && this.machines.get(toMachine)?.state !== "up") {
+      why.push(`${toMachine} ${od.powerState}, guard ${od.guardOk ? "ok" : "refused"}, ${boot} s boot`);
+    }
+    if (c.route === "overflow") why.push(`overflow: ${c.from} had ${c.sourceWaiting} waiting`);
+    if (c.route === "faster") why.push(`prefer_when_faster`);
+    const head = `${verb}${c.route === "back" ? " back" : ""} ${c.job.id} ${c.from}→${c.to}`;
+    return `${head}: est. ${formatSpan(c.fromFinish - now)} → ${formatSpan(c.toFinish - now)}; ${[...why, parts.join(", ")].join("; ")}`;
   }
 
   // ============ 5. MOVES ============
@@ -754,8 +881,12 @@ export class Placement {
     const vars = this.moveVars(c);
     // Right before it runs: still queued where it was (a runner may have claimed it meanwhile)
     if (!this.probes.files.stat(vars.file)?.isFile) return "skipped";
+    // A move that starts an on-demand machine asks its guard again first
+    const refused = await this.guardBeforeStart(c, now);
+    if (this.abort.signal.aborted) return "stopped";
     const explanation = this.explain(c, "moved", now);
-    const built = buildMoveArgv(this.settings.moveCmd ?? [], vars);
+    const built: { argv: string[] } | { error: string } =
+      refused === null ? buildMoveArgv(this.settings.moveCmd ?? [], vars) : { error: `not moved: ${refused}` };
     if ("error" in built) {
       const failed = this.store.addMove(this.project, {
         gateId: c.job.id,
@@ -854,6 +985,8 @@ export class Placement {
     const learned = this.sampleIndex();
     this.observeRuns(queue, now, learned);
     this.learnHistory(learned);
+    await this.keepAlive(queue, now);
+    if (this.abort.signal.aborted) return summary;
     const durations = this.durations();
     let { lanes, jobs } = this.model(queue, now);
     let attempts = this.attempts(now);
@@ -901,6 +1034,7 @@ export class Placement {
           explanation,
           quiet: c.quiet,
           stuck: c.stuck,
+          ...(c.route === "back" && c.job.back !== null ? { back: c.job.back } : {}),
         });
         current.add(c.job.id);
         const key = `${c.from}>${c.to}`;
@@ -987,16 +1121,19 @@ export class Placement {
     return this.settings.machines.map((m) => {
       const rt = this.machines.get(m.id) as MachineRuntime;
       const utilization = this.utilization(m.id);
+      const availability = this.onDemandAvailability(m.id);
       const onDemandStatus: OnDemandStatus | null =
         rt.onDemand && m.onDemand
           ? {
               powerState: rt.onDemand.powerState,
-              availability: this.onDemandAvailability(m.id).available ? "available" : "unavailable",
-              unavailableReason: this.onDemandAvailability(m.id).reason,
+              availability: availability.available ? "available" : "unavailable",
+              unavailableReason: availability.reason,
               guardOk: rt.onDemand.guardOk,
               lastCheckAt: iso(rt.onDemand.lastCheckAt),
               bootSeconds: m.onDemand.bootSeconds,
               costPerHour: m.onDemand.costPerHour ?? null,
+              lastTouchAt: iso(rt.onDemand.lastTouchAt),
+              touchError: rt.onDemand.touchError,
             }
           : null;
       return {

@@ -30,12 +30,12 @@ export interface ModelLane {
   preferWhenFaster: boolean;
   /** On-demand routing: minimum gain in seconds for prefer_when_faster */
   routingMinGainSeconds?: number;
-  /** On-demand: machine is available (stopped + guard ok) */
+  /** On-demand: its machine is stopped and the guard allows a start (a job moved here starts it) */
   onDemandAvailable: boolean;
-  /** On-demand: boot time to add to estimates (seconds) */
+  /** On-demand: boot time added to the estimates while the machine is not up (seconds) */
   bootSeconds: number;
-  /** Lane the job originally came from, for move-back */
-  originalLane?: string;
+  /** On-demand: cost per hour, breaks a tie between two equally good moves (null: free) */
+  costPerHour: number | null;
 }
 
 export interface ModelJob {
@@ -50,6 +50,8 @@ export interface ModelJob {
   startedAt: number | null;
   /** The lane whose runner runs it: its own, or the pseudo-lane that takes it */
   runsOn: string;
+  /** Queued in an on-demand lane that can't run it (guard refused, state unknown, machine stopped under it): why it goes back */
+  back: string | null;
 }
 
 /** A job's expected duration (seconds, load included) on a machine. */
@@ -177,6 +179,14 @@ export interface Candidate {
   /** The target lane before the move: its running and queued jobs */
   targetRunning: number;
   targetQueued: number;
+  /** Queued jobs in the source lane before the move that don't start now */
+  sourceWaiting: number;
+  /**
+   * An on-demand move: `overflow` (overflow_to, the job waits), `faster`
+   * (prefer_when_faster), `back` (out of an on-demand lane that can't run it,
+   * see ModelJob.back); null for any other move
+   */
+  route: "overflow" | "faster" | "back" | null;
 }
 
 export interface DecideOptions {
@@ -222,7 +232,7 @@ function replan(
       jobs.filter((j) => j.runsOn === lane.name),
       duration,
     )) {
-      // Add boot time for on-demand machines not yet running
+      // Add boot time for on-demand machines not yet running (the only place a trial adds it)
       if (!lane.up && lane.onDemandAvailable && lane.bootSeconds > 0) {
         const bootMs = lane.bootSeconds * 1000;
         out.set(id, { start: slot.start + bootMs, finish: slot.finish + bootMs });
@@ -237,6 +247,10 @@ function replan(
 /**
  * The moves, best first, at most `maxMoves`. Each is chosen on the state the
  * moves before it leave:
+ * - a job queued in an on-demand lane that can't run it (`ModelJob.back`:
+ *   guard refused, state unknown, the machine stopped under it) goes back,
+ *   before any other move, to an up lane whose `overflowTo` lists that lane
+ *   (else to any up lane that runs its class): the one it finishes soonest on;
  * - a quiet re-check (prefer_quiet, loads known) goes to the least-loaded
  *   eligible machine when its load per cpu is at least `quietMargin` below
  *   the current one's, whatever the times (min_gain and the net rule don't
@@ -249,18 +263,18 @@ function replan(
  *   `minGainSeconds` sooner, when the move also saves that much in all
  *   (what it costs the jobs of the same or a more urgent priority on both
  *   lanes counted); the job that gains most goes first.
- * - ON-DEMAND OVERFLOW: a job in a lane with overflow_to configured goes to
- *   an on-demand lane when that lane is available (stopped + guard ok) and
- *   has a free slot.
- * - ON-DEMAND PREFER_WHEN_FASTER: a job moves to an on-demand lane when
- *   it would finish sooner there (including boot time) by at least
- *   min_gain_seconds.
- * - ON-DEMAND MOVE-BACK: a job in an on-demand lane that is unavailable
- *   (guard refused, unknown state) moves back to the lane it came from.
+ * A lane on a stopped on-demand machine (`onDemandAvailable`: a move there
+ * starts a paid machine, its boot time is in the estimate) is a target only
+ * through routing: the source lane's `overflowTo` lists it, or the source
+ * lane has `preferWhenFaster`. It needs a free slot, and a gain above 0 of
+ * at least the routing's `min_gain_seconds` (else `minGainSeconds`), in all
+ * too; without `preferWhenFaster` the job must also be waiting (not about
+ * to start on its own lane). These moves go before moves by time.
+ * Of two equally good moves, the one to the cheaper lane (`costPerHour`) wins.
  * Never a running job, a job a pseudo-lane takes, a job without a class, a
- * held job, or a job on a lane whose machine is not up; never to a lane that
- * is not up or on-demand available, does not list the job's class in
- * `eligible`, or is a pseudo-lane.
+ * held job, or (but for a move back) a job on a lane whose machine is
+ * neither up nor an available on-demand one; never to such a lane, to one
+ * that does not list the job's class in `eligible`, or to a pseudo-lane.
  */
 export function decide(options: DecideOptions): Decision {
   const { now, lanes, duration } = options;
@@ -271,82 +285,93 @@ export function decide(options: DecideOptions): Decision {
   const moves: Candidate[] = [];
   const movedIds = new Set<string>();
 
+  type Choice = { candidate: Candidate; score: number; jobs: ModelJob[]; plan: Plan };
+  const cost = (lane: string) => byName.get(lane)?.costPerHour ?? 0;
+  // The higher score; of two equal ones, the cheaper target
+  const better = (best: Choice | null, next: Choice): Choice =>
+    !best ||
+    next.score > best.score ||
+    (next.score === best.score && cost(next.candidate.to) < cost(best.candidate.to))
+      ? next
+      : best;
+
   while (moves.length < options.maxMoves) {
-    let best: { candidate: Candidate; score: number; jobs: ModelJob[]; plan: Plan } | null = null;
+    let best: Choice | null = null;
+
+    // `job` from where it would finish at `fromFinish` (Infinity: it can't run there) to `to`
+    const trial = (job: ModelJob, fromFinish: number, to: ModelLane) => {
+      const stuck = !Number.isFinite(fromFinish);
+      const trialJobs = relocate(lanes, jobs, job, to.name);
+      const movedJob = trialJobs.find((j) => j.id === job.id && j.lane === to.name) as ModelJob;
+      const affected = new Set([job.lane, movedJob.runsOn]);
+      const trialPlan = replan(now, lanes, trialJobs, duration, plan, affected);
+      const toFinish = trialPlan.get(job.id)?.finish ?? Infinity;
+      let net = (fromFinish - toFinish) / 1000;
+      for (const other of jobs) {
+        if (other === job || other.priority > job.priority) continue;
+        if (!affected.has(other.runsOn)) continue;
+        const before = plan.get(other.id)?.finish;
+        const after = trialPlan.get(other.id)?.finish;
+        if (before === undefined || after === undefined || !Number.isFinite(before) || !Number.isFinite(after)) continue;
+        net += (before - after) / 1000;
+      }
+      const candidate: Candidate = {
+        job,
+        from: job.lane,
+        to: to.name,
+        fromFinish,
+        toFinish,
+        gainSeconds: stuck ? 0 : (fromFinish - toFinish) / 1000,
+        netSeconds: stuck ? 0 : net,
+        quiet: false,
+        stuck,
+        targetRunning: jobs.filter((j) => j.runsOn === to.name && j.status === "running").length,
+        targetQueued: jobs.filter((j) => j.runsOn === to.name && j.status === "queued").length,
+        sourceWaiting: jobs.filter(
+          (j) => j.runsOn === job.lane && j.status === "queued" && (plan.get(j.id)?.start ?? Infinity) > now,
+        ).length,
+        route: null,
+      };
+      return { candidate, jobs: trialJobs, plan: trialPlan };
+    };
+
     for (const job of jobs) {
       if (job.status !== "queued" || job.runsOn !== job.lane || job.class === null) continue;
       if (movedIds.has(job.id)) continue;
       const from = byName.get(job.lane);
       if (!from || from.serves.length > 0) continue;
-      // The source lane must be up or on-demand available
-      if (!from.up && !from.onDemandAvailable) continue;
       if (options.held(job)) continue;
-      const fromSlot = plan.get(job.id);
-      if (!fromSlot) continue;
       const cls = job.class;
+      const runsIt = (l: ModelLane) => l.name !== job.lane && l.serves.length === 0 && l.eligible.has(cls);
 
-      // Determine valid targets: up or on-demand available, not a pseudo-lane, class is eligible
-      let targets = lanes.filter(
-        (l) =>
-          l.name !== job.lane &&
-          isLaneAvailable(l) &&
-          l.serves.length === 0 &&
-          l.eligible.has(cls),
-      );
-
-      // ON-DEMAND MOVE-BACK: if the source is an on-demand lane that is unavailable,
-      // and there's a job queued there, move it back to its overflow source
-      if (from.onDemandAvailable === false && !from.up && from.originalLane) {
-        const backLane = byName.get(from.originalLane);
-        if (backLane && isLaneAvailable(backLane) && backLane.eligible.has(cls)) {
-          targets = [backLane];
+      if (job.back !== null) {
+        // Back where it came from: a lane that overflows to its lane, else any up lane that runs it
+        const up = lanes.filter((l) => runsIt(l) && l.up);
+        const sources = up.filter((l) => l.overflowTo.includes(job.lane));
+        for (const to of sources.length > 0 ? sources : up) {
+          const result = trial(job, plan.get(job.id)?.finish ?? Infinity, to);
+          const c = result.candidate;
+          if (!Number.isFinite(c.toFinish)) continue;
+          // Not a move by time: it goes back whatever the gain, the soonest finish first
+          c.gainSeconds = 0;
+          c.netSeconds = 0;
+          c.stuck = false;
+          c.route = "back";
+          best = better(best, { ...result, score: 1e13 - (c.toFinish - now) / 1000 });
         }
+        continue;
       }
 
-      if (targets.length === 0) continue;
+      // Not planned: its machine is neither up nor an available on-demand one
+      const fromSlot = plan.get(job.id);
+      if (!fromSlot) continue;
+      let targets = lanes.filter((l) => runsIt(l) && l.up);
+      // A move to a stopped on-demand machine starts it: only through routing
+      const starting = lanes.filter(
+        (l) => runsIt(l) && !l.up && l.onDemandAvailable && (from.overflowTo.includes(l.name) || from.preferWhenFaster),
+      );
+      if (targets.length === 0 && starting.length === 0) continue;
       const stuck = !Number.isFinite(fromSlot.finish);
-
-      // Check if this is an overflow scenario
-      const overflowTargets = from.overflowTo.length > 0
-        ? targets.filter((t) => from.overflowTo.includes(t.name))
-        : [];
-
-      const trial = (to: ModelLane, _isOverflow = false) => {
-        const trialJobs = relocate(lanes, jobs, job, to.name);
-        const movedJob = trialJobs.find((j) => j.id === job.id && j.lane === to.name) as ModelJob;
-        const affected = new Set([job.lane, movedJob.runsOn]);
-        const trialPlan = replan(now, lanes, trialJobs, duration, plan, affected);
-        let toFinish = trialPlan.get(job.id)?.finish ?? Infinity;
-
-        // Add boot time for on-demand machines not yet running
-        if (!to.up && to.onDemandAvailable && to.bootSeconds > 0) {
-          toFinish += to.bootSeconds * 1000;
-        }
-
-        let net = (fromSlot.finish - toFinish) / 1000;
-        for (const other of jobs) {
-          if (other === job || other.priority > job.priority) continue;
-          if (!affected.has(other.runsOn)) continue;
-          const before = plan.get(other.id)?.finish;
-          const after = trialPlan.get(other.id)?.finish;
-          if (before === undefined || after === undefined || !Number.isFinite(before) || !Number.isFinite(after)) continue;
-          net += (before - after) / 1000;
-        }
-        const candidate: Candidate = {
-          job,
-          from: job.lane,
-          to: to.name,
-          fromFinish: fromSlot.finish,
-          toFinish,
-          gainSeconds: stuck ? 0 : (fromSlot.finish - toFinish) / 1000,
-          netSeconds: stuck ? 0 : net,
-          quiet: false,
-          stuck,
-          targetRunning: jobs.filter((j) => j.runsOn === to.name && j.status === "running").length,
-          targetQueued: jobs.filter((j) => j.runsOn === to.name && j.status === "queued").length,
-        };
-        return { candidate, jobs: trialJobs, plan: trialPlan };
-      };
 
       const fromUtil = options.utilization(from.machine);
       // A job its lane never runs goes wherever it can run, quiet re-check or not
@@ -354,57 +379,49 @@ export function decide(options: DecideOptions): Decision {
         // Quiet re-check: the least-loaded eligible machine, by load per cpu
         let quietest: { lane: ModelLane; util: number } | null = null;
         for (const lane of targets) {
-          // Skip on-demand machines not running for quiet checks (load unknown)
-          if (!lane.up) continue;
           const util = options.utilization(lane.machine);
           if (util === null) continue;
           if (!quietest || util < quietest.util) quietest = { lane, util };
         }
         if (quietest && fromUtil - quietest.util >= options.quietMargin) {
-          const result = trial(quietest.lane);
+          const result = trial(job, fromSlot.finish, quietest.lane);
           if (Number.isFinite(result.candidate.toFinish)) {
             result.candidate.quiet = true;
             // Quiet moves first, the quietest gap first
-            const score = 1e12 + (fromUtil - quietest.util) * 1e6;
-            if (!best || score > best.score) best = { ...result, score };
+            best = better(best, { ...result, score: 1e12 + (fromUtil - quietest.util) * 1e6 });
             continue;
           }
         }
         // No machine quiet enough: placed by time, but never on a busier machine
         // (one whose load is unknown counts as busier)
         targets = targets.filter((l) => {
-          if (!l.up) return false; // Skip non-running on-demand for quiet
           const util = options.utilization(l.machine);
           return quietest === null ? true : util !== null && util <= fromUtil;
         });
       }
 
-      // OVERFLOW: check overflow targets first
-      for (const to of overflowTargets) {
-        // Check if overflow lane has a free slot
-        const running = jobs.filter((j) => j.runsOn === to.name && j.status === "running").length;
-        if (running >= to.slots) continue; // No free slot
-
-        const result = trial(to, true);
-        const { gainSeconds, toFinish } = result.candidate;
+      for (const to of starting) {
+        if (jobs.filter((j) => j.runsOn === to.name && j.status === "running").length >= to.slots) continue;
+        const result = trial(job, fromSlot.finish, to);
+        const { gainSeconds, netSeconds, toFinish } = result.candidate;
         if (!Number.isFinite(toFinish)) continue;
-
-        // For overflow, check if prefer_when_faster is set
-        if (from.preferWhenFaster) {
+        let score: number;
+        if (stuck) {
+          score = 1e11 - (toFinish - now) / 1000;
+        } else {
+          // Never start a paid machine for nothing
           const minGain = from.routingMinGainSeconds ?? options.minGainSeconds;
-          if (gainSeconds < minGain) continue;
+          if (gainSeconds <= 0 || gainSeconds < minGain || netSeconds < minGain) continue;
+          // An overflow is for a job that waits; prefer_when_faster also moves one about to start
+          if (!from.preferWhenFaster && fromSlot.start <= now) continue;
+          score = 1e10 + gainSeconds;
         }
-
-        // Overflow with free slot: higher priority than regular moves
-        const score = 1e10 + gainSeconds;
-        if (!best || score > best.score) best = { ...result, score };
+        result.candidate.route = from.overflowTo.includes(to.name) && fromSlot.start > now ? "overflow" : "faster";
+        best = better(best, { ...result, score });
       }
 
       for (const to of targets) {
-        // Skip if already handled as overflow
-        if (overflowTargets.some((t) => t.name === to.name)) continue;
-
-        const result = trial(to);
+        const result = trial(job, fromSlot.finish, to);
         const { gainSeconds, netSeconds, toFinish } = result.candidate;
         if (!Number.isFinite(toFinish)) continue;
         let score: number;
@@ -415,7 +432,7 @@ export function decide(options: DecideOptions): Decision {
           if (gainSeconds < options.minGainSeconds || netSeconds < options.minGainSeconds) continue;
           score = gainSeconds;
         }
-        if (!best || score > best.score) best = { ...result, score };
+        best = better(best, { ...result, score });
       }
     }
     if (!best) break;

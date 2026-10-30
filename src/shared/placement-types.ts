@@ -26,8 +26,11 @@ export interface OnDemandStatus {
   lastCheckAt: string | null;
   /** Boot time added to estimates (seconds) */
   bootSeconds: number;
-  /** Cost per hour (for display) */
+  /** Cost per hour (shown; breaks a tie between two equally good moves) */
   costPerHour: number | null;
+  /** When touch_cmd last ran (a job was running there), and why it failed */
+  lastTouchAt: string | null;
+  touchError: string | null;
 }
 
 export interface PlacementMachine {
@@ -76,6 +79,8 @@ export interface PlacementAdvice {
   quiet: boolean;
   /** Its own lane never runs its class (a limit of 0 there): gainSeconds is 0, any lane that can is better */
   stuck: boolean;
+  /** It goes back out of an on-demand lane that can't run it, and why (gainSeconds is 0) */
+  back?: string;
 }
 
 export interface PlacementJob {
