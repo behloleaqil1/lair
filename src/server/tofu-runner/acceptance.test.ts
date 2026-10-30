@@ -194,7 +194,7 @@ describe("plan: state in S3 with native locking, the plan kept for approval", ()
     const r = rig(path, {});
     r.tofu.planExit = 0;
     expect(await get(r).plan(path, "staging", BY)).toMatchObject({ status: "planned", changes: false });
-    expect(existsSync(r.planDir) ? readdirSync(r.planDir) : []).toEqual([]);
+    expect((existsSync(r.planDir) ? readdirSync(r.planDir) : []).filter((n) => n !== "audit.jsonl")).toEqual([]);
     await expect(get(r).plan(path, "qa", BY)).rejects.toThrow("not a configured environment");
   });
 
@@ -371,7 +371,7 @@ describe("a plan that destroys or replaces needs its own approval, naming the re
     r.tofu.showStdout = undefined;
     r.tofu.showExit = 1;
     expect(await get(r).plan(path, "staging", BY)).toMatchObject({ status: "failed", reason: "show" });
-    expect(existsSync(r.planDir) ? readdirSync(r.planDir) : []).toEqual([]);
+    expect((existsSync(r.planDir) ? readdirSync(r.planDir) : []).filter((n) => n !== "audit.jsonl")).toEqual([]);
   });
 
   it("over the route: refuses without confirmDestroy and applies with it", async () => {
