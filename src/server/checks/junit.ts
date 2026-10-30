@@ -19,7 +19,8 @@ export function parseJUnitFailures(xml: string): string[] {
   // Match testcase elements with failure or error children
   // Pattern: <testcase ... name="..." ...> ... <failure|error ...> ... </testcase>
   // Use word boundary \b before 'name' to avoid matching 'classname'
-  const testcaseRegex = /<testcase[^>]*\bname="([^"]+)"[^>]*>([\s\S]*?)<\/testcase>/gi;
+  // Use [^/>] before > to skip self-closing tags like <testcase .../>
+  const testcaseRegex = /<testcase[^>]*\bname="([^"]+)"[^/>]*>([\s\S]*?)<\/testcase>/gi;
 
   let match: RegExpExecArray | null;
   while ((match = testcaseRegex.exec(bounded)) !== null && failures.length < MAX_FAILURES) {
