@@ -971,7 +971,9 @@ Lair uses a single, shared process cache for all modules that need the process t
 
 **Behavior:**
 - A failed `ps` keeps the last good snapshot, marked stale. Routes answer from the stale cache, not with an error.
-- A `ps` timeout that fires after the child has already exited (the event loop was blocked, not `ps` itself) counts as success if the output is valid.
+- A `ps` that its timeout (or the output cap) stopped has failed, whatever it printed: its table may stop part-way, and a process missing from it is no proof that it ended. A `ps` that exited by itself counts as success even when its timer fired late (the event loop was blocked, not `ps`).
+- A table without the Lair server's own pid is not complete and fails the same way; so does one without pid 1, once a snapshot has shown pid 1 (a host that hides other users' processes never shows it).
+- Each snapshot keeps when its `ps` started and when it answered. The agents module counts process start times back from that, never from the time it reads the cache, so a snapshot seconds old doesn't make a live process look like another one. When it is about to end a run on a snapshot, it reads `ps` again first, bypassing the cache (see [Restarts and hosts](#agents)).
 - A cache older than 10 seconds shows as stale; the dashboard shows the cache age.
 
 **Configuration** (environment variables; these are server-wide, not per project):
