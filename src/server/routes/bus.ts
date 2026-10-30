@@ -524,7 +524,7 @@ async function busRoutes(
     return respond(
       reports.map((r) => ({
         id: r.id,
-        agent: r.agentId,
+        agent: r.agent,
         kind: r.kind,
         task: r.task,
         summary: r.summary,

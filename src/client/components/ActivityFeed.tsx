@@ -196,19 +196,19 @@ function ReportCard({ report }: { report: BusReport }) {
         <div className="activity-links">
           {report.gateId && (
             <a href={linkTo("gates", report.gateId)} className="activity-link">
-              <Icon name="box" size={14} />
+              <Icon name="info" size={14} />
               <code>{report.gateId}</code>
             </a>
           )}
           {report.prNumber && (
             <a href={linkTo("prs", String(report.prNumber))} className="activity-link">
-              <Icon name="git-pull-request" size={14} />
+              <Icon name="eye" size={14} />
               PR #{report.prNumber}
             </a>
           )}
           {report.sha && (
             <span className="activity-link">
-              <Icon name="git-commit" size={14} />
+              <Icon name="dot" size={14} />
               <code>{report.sha.slice(0, 7)}</code>
             </span>
           )}
@@ -225,10 +225,10 @@ function MessageCard({ message }: { message: BusMessage }) {
     <li className="activity-card activity-message">
       <div className="activity-header">
         <span className="activity-kind">
-          <Icon name="mail" size={14} />
+          <Icon name="user" size={14} />
           <span className="message-direction">
             <code>{message.from}</code>
-            <Icon name="arrow-right" size={12} />
+            <Icon name="chevron-right" size={12} />
             <code>{message.to}</code>
           </span>
         </span>
@@ -250,7 +250,7 @@ function MessageCard({ message }: { message: BusMessage }) {
 
       {message.ackNote && (
         <div className="message-ack-note">
-          <Icon name="check" size={12} />
+          <Icon name="check-circle" size={12} />
           {message.ackNote}
         </div>
       )}

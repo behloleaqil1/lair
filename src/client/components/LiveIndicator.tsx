@@ -29,7 +29,7 @@ export function LiveIndicator({ status, live }: LiveIndicatorProps) {
   if (status === "reconnecting") {
     return (
       <span className="live-indicator live-indicator-reconnecting" aria-label="Reconnecting">
-        <Icon name="loader" size={12} className="live-spinner" />
+        <Icon name="clock" size={12} className="live-spinner" />
         Reconnecting…
       </span>
     );
