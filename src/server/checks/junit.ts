@@ -18,7 +18,8 @@ export function parseJUnitFailures(xml: string): string[] {
 
   // Match testcase elements with failure or error children
   // Pattern: <testcase ... name="..." ...> ... <failure|error ...> ... </testcase>
-  const testcaseRegex = /<testcase[^>]*name="([^"]+)"[^>]*>([\s\S]*?)<\/testcase>/gi;
+  // Use word boundary \b before 'name' to avoid matching 'classname'
+  const testcaseRegex = /<testcase[^>]*\bname="([^"]+)"[^>]*>([\s\S]*?)<\/testcase>/gi;
 
   let match: RegExpExecArray | null;
   while ((match = testcaseRegex.exec(bounded)) !== null && failures.length < MAX_FAILURES) {
