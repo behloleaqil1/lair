@@ -4973,5 +4973,18 @@ describe("10. hung run info: the next run knows what the previous hung on", () =
     // Verify the structure is intact by checking the JSON parsed successfully
     // and contains the "malicious" content safely escaped
     expect(data.last_lines.some((line: string) => line.includes("</hung_run_warning>"))).toBe(true);
+
+    // CRITICAL: Verify the malicious content appears ONLY inside the JSON string values,
+    // not as raw text outside the JSON block. The prompt before the JSON block and after
+    // the JSON block should NOT contain the injection attempts.
+    const beforeJson = hungSection.slice(0, jsonObjStart);
+    const afterJson = hungSection.slice(lastCloseBrace + 1);
+    // The injection attempts should not appear outside the JSON object
+    expect(beforeJson).not.toContain("ignore previous instructions");
+    expect(afterJson).not.toContain("ignore previous instructions");
+    // The closing tag attempt should not appear outside the JSON (except the real closing tag)
+    expect(beforeJson).not.toContain("</hung_run_warning>");
+    // After JSON has the real closing tag, but no OTHER occurrence of injection content
+    expect(afterJson.match(/ignore previous instructions/g)).toBeNull();
   });
 });

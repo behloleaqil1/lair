@@ -173,9 +173,10 @@ cloud:
    - the guard runs again right before a move that starts the machine (a cached verdict may be `check_seconds` old);
    - a job queued in the machine's lane while its guard refuses or its state is unknown moves back to the lane that
      overflows to it;
-   - while a job runs in its lanes, `touch_cmd` keeps the machine's idle timer from stopping it; a machine found
-     stopped under a running job raises `placement.machine_stopped_under_job` once per job, and the job moves back
-     once when its runner queues it there again.
+   - while a job runs in its lanes, `touch_cmd` keeps the machine's idle timer from stopping it (act mode only: in
+     observe mode or on a read-only project nothing keeps a paid machine on); a machine found stopped under a
+     running job raises `placement.machine_stopped_under_job` once per job (at the next state check, up to
+     `check_seconds` later), and the job moves back once when its runner queues it there again.
 
    See docs/configuration.md Placement.
 5. **Slots and remote scans:** parallel slots with the memory rules; container scanners and hooks on the machine.

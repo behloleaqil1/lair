@@ -775,7 +775,7 @@ watchdog:
 | `lock_holder_dead` | A configured lock's recorded holder pid is not running, or the lock has no pid and is older than `lease_minutes`, while an agent is WAITING or a gate request is queued | `stale_lock` | `break_lock` | the lock is gone or held by a live process |
 | `duplicate_agent` | More than one process matches `agent_command` for one agent id (a wrapper and its child count once). One breach for each process except the oldest | `duplicate_agent` | `stop_duplicate` | one process left |
 | `agent_hung` | The agent's process is alive, but neither its newest log nor the process itself has changed for `hung_minutes`, **and** the agent is not WAITING. WAITING means its latest queue line is a `WAITING` line naming a gate id that has no `<gate-id>.rc` result yet; such an agent is never hung | `agent_stuck` | `restart_agent` | the old pid is gone and the agent has a live process |
-| `orphan_claim` | A claim `agents_dir/<id>.running` older than `claim_grace_minutes` whose agent has no live process. A live agent's claim is never touched | `orphan_claim` | `release_claim` | the claim is gone |
+| `orphan_claim` | A claim `agents_dir/<id>.running` older than `claim_grace_minutes` whose agent has no live process. A live agent's claim is never touched. A pid recorded in the claim (the file, or its `pid` file: `pid=<pid>` with an optional `started=<ISO time>`, or a bare pid) keeps it only while that pid runs as the agent, since the OS may give a dead agent's pid to another process: its command names the agent id; or, with `started=`, it started no more than 60 s after that time; or, for a bare pid, it runs the agent's adapter program (the first word of the adapter's `start_cmd`). The `release_claim` guard re-checks with the same rule | `orphan_claim` | `release_claim` | the claim is gone |
 | `infra_signature` | The same normalised failure text (timestamps, hashes, numbers and the gate's own ids removed) in at least `infra_min_tracks` finished, failed gates of different tracks on one lane within `infra_window_minutes` | `lane_broken` | `mark_lane_broken` | later ticks |
 | `gate_owner_gone` | A running gate request (`.req.run`) whose runner pid (in the `.req.run` file, else `gates_dir/runner-<lane>.pid`) is not running, or that has no runner pid at all, and whose log has been silent for `gate_lease_minutes` | `gate_owner_gone` | `requeue_gate` | the request is no longer running |
 | `idle_capacity` | Ready work (queued gate requests plus `ready_tasks_cmd` tasks) and free capacity (no agent running, or fewer than `max_agents`), with nothing started (no claim, running gate or agent process) for `idle_minutes` | `idle_capacity` | `fill_capacity` | later ticks |
@@ -2099,7 +2099,7 @@ The owner only (the owner's session from [the owner credential](#decision-inbox)
 
 ## Placement
 
-> Off by default. With `enabled: true` and the default `mode: observe`, placement probes your machines, estimates when every queued job finishes, and shows where it would move each one. It runs none of your commands except the probes.
+> Off by default. With `enabled: true` and the default `mode: observe`, placement probes your machines, estimates when every queued job finishes, and shows where it would move each one. It runs none of your commands except the probes and, for an [on-demand machine](#on-demand-machines), its `state_cmd` and `guard_cmd` checks.
 
 Placement is for projects that keep their own gate queue and runners: the request files under `gates_dir/queue/` that the Gates section reads, one lane per runner. It decides which machine runs each queued job, for any number of machines, and moves a job to another lane when it is expected to finish sooner there. Lair never renames a request itself. In act mode it runs your `move_cmd`, which validates and moves the request, and then checks that the request landed.
 
@@ -2170,7 +2170,7 @@ Each decision is explained in one line, for example `moved 20260101T000000Z-fix-
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | boolean | `false` | Run placement for this project |
-| `mode` | `observe` \| `act` | `observe` | `observe` records and shows advice (`would_move`); `act` runs `move_cmd`, unless the project is `read_only: true` |
+| `mode` | `observe` \| `act` | `observe` | `observe` records and shows advice (`would_move`); `act` runs `move_cmd` and an on-demand machine's `touch_cmd`, unless the project is `read_only: true` |
 | `interval_seconds` | number | `60` | Seconds between ticks (10 to 3600) |
 | `probe_timeout_seconds` | number | `15` | Timeout of each probe and load command |
 | `command_timeout_seconds` | number | `60` | Timeout of `move_cmd` and of an on-demand machine's `state_cmd`, `guard_cmd` and `touch_cmd` |
@@ -2214,7 +2214,7 @@ On-demand machine options (the `on_demand` block; see [On-demand machines](#on-d
 | `cost_per_hour` | number | — | Shown in the status; of two moves that are equally good, the one to the cheaper lane wins |
 | `check_seconds` | number | `300` | Minimum seconds between state and guard checks (the guard may call paid APIs) |
 | `speed_factor` | number | `1.0` | While the machine has no run of a class yet, its expected duration is this times what the class takes on the other machines (`0.5`: twice as fast) |
-| `touch_cmd` | array | — | Argv that refreshes the machine's activity mark (or lease), run while a job runs in one of its lanes |
+| `touch_cmd` | array | — | Argv that refreshes the machine's activity mark (or lease), run while a job runs in one of its lanes, in act mode only |
 | `touch_seconds` | number | `60` | How often `touch_cmd` runs while a job runs there. A touch runs at most once per tick, so this may not be shorter than `interval_seconds` |
 
 Lane options:
@@ -2243,8 +2243,8 @@ A machine with an `on_demand` block is one your project starts when a job lands 
 
 - **Available.** A machine whose state is `stopped` and whose guard says ok is **available**: its lanes are planned as if it were up, with `boot_seconds` added to every estimate there (once). Running, it counts like any machine, through its probes and `min_up_seconds`. A refusing guard, an unknown state, or a command that fails or times out makes it **unavailable**, with the reason shown; so do `pending` and `stopping`.
 - **Starting it.** A lane on an available machine is a target only through `routing`: a lane's `overflow_to` lists it, or the lane has `prefer_when_faster`. A move there needs a free slot and a gain above 0 of at least the routing's `min_gain_seconds`, in all too; with `overflow_to` alone the job must also be waiting (it would not start now where it is). These moves go before moves by time. In act mode, right before such a move the guard runs again (unless it ran in this tick): a refusal cancels the move (`placement.move_failed`, the job waits its cool-down) and the machine stays unavailable until its next check.
-- **Moving back.** A job queued in its lane while the guard refuses or the state is unknown goes back, before any other move, to a lane whose `overflow_to` lists that lane (else to any up lane that runs its class): `moved back q1 aws→heavy: est. never → 60 min; aws guard refused: spend 181 >= limit 180; heavy idle`. Its cool-down and `max_moves_per_job` still apply. A machine that is `pending` or `stopping` keeps its jobs.
-- **Keeping it alive.** While a job runs in one of its lanes, `touch_cmd` runs every `touch_seconds`, so the machine's idle timer does not stop it during a long phase of the job that does not use it. A check that finds the machine `stopped` (or `stopping`) after it had answered, while jobs run in its lanes, emits `placement.machine_stopped_under_job` once per job; when the runner puts such a job back in that lane while the machine is not up, it moves back once (`aws stopped under it`).
+- **Moving back.** A job queued in its lane while the guard refuses or the state is unknown goes back, before any other move, to a lane whose `overflow_to` lists that lane (else to any up lane that runs its class): `moved back q1 aws→heavy: est. never → 60 min; aws guard refused: spend 181 >= limit 180; heavy idle`. Its cool-down and `max_moves_per_job` still apply, so a job moved in and refused straight after waits out the cool-down of that move (30 min by default) before it goes back, and one that reached `max_moves_per_job` is held where it is. A machine that is `pending` or `stopping` keeps its jobs.
+- **Keeping it alive.** While a job runs in one of its lanes, `touch_cmd` runs every `touch_seconds`, so the machine's idle timer does not stop it during a long phase of the job that does not use it. A touch keeps a paid machine on, so it runs in act mode only: in observe mode or on a `read_only` project it never runs, and the status shows why (`touchError: not touched: placement.mode is observe`). A check that finds the machine `stopped` (or `stopping`) after it had answered, while jobs run in its lanes, emits `placement.machine_stopped_under_job` once per job; when the runner puts such a job back in that lane while the machine is not up, it moves back once (`aws stopped under it`). The state is checked at most every `check_seconds`, so the notice can come up to `check_seconds` (5 min by default) after the machine stopped, not within a minute; a job its runner already put back in the queue by then gets no notice and is planned like any job queued for that machine.
 - **Shown.** The Machines section shows the on-demand state next to the probe state: `on demand: stopped, guard ok, 150 s boot`, `on demand: starting`, `on demand: running`, `on demand: refused (guard refused: ...)`. The status (`onDemand`) has the power state, availability and reason, the last check and the last touch with its error. A move explains itself: `moved q1 heavy→aws: est. 2 h 0 min → 63 min; aws stopped, guard ok, 150 s boot; overflow: heavy had 1 waiting; aws idle`.
 
 ```yaml
@@ -2417,6 +2417,51 @@ Both routes are the owner's (signed in on the dashboard), reads included, and ge
 | `GET /api/infra-policy/scan?project=&root=` | Scan a configured root (all roots without `root=`); 404 when the scan is off, 409 when the project is blocked, 400 for a root that is not configured |
 
 The routes read files and run nothing. Server code that plans asks `InfraPolicyManager.requires(project)` and, when true, plans only through `get(project).guardPlan`, which does not start the plan when the scan fails (or when the config is blocked).
+
+## Plan sandbox
+
+`tofu plan` is not read-only: it runs every provider and data source in the code ([design](design/deploy-aws.md#22-plan-isolated)). The plan sandbox runs it in an isolated container with the read-only plan role and nothing else. It is off unless you turn it on, and it needs the [policy scan](#infrastructure-policy-scan) on for the project: a plan never starts on code the scan did not pass.
+
+```yaml
+plan_sandbox:
+  enabled: true                       # default false
+  plan_role_arn: arn:aws:iam::123456789012:role/lair-plan
+  external_id: lair-plan-1            # required; what the role's trust policy asks for
+  image: plan-runner:1                # container image with the tofu binary
+  plugin_dir: /srv/infra/provider-mirror
+  provider_api_hosts: ["*.amazonaws.com"]
+  registry_hosts: [registry.opentofu.org]
+  egress_network: plan-egress         # optional; without it the plan has no network
+```
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `enabled` | boolean | `false` | Turn the sandbox on for this project |
+| `plan_role_arn` | IAM role ARN | none | The read-only role every plan assumes; required when enabled. Lair asks STS for 15 minutes (900 s, the shortest STS issues) and never stores the credentials |
+| `external_id` | string | none | Required when enabled: the external id for the assume-role call, so the role is never assumed without one. Not a secret |
+| `region` | string | `us-east-1` | Region of the credentials |
+| `image` | string | none | Image the plan runs in; required when enabled (a plain image reference) |
+| `plugin_dir` | absolute path | none | The provider mirror, mounted read-only. Providers come from here with `init -lockfile=readonly`; nothing is downloaded at plan time. Required when enabled; a plain path, no `:` or `,` |
+| `provider_api_hosts` | list of hosts | `[]` | Hosts the plan may reach: the provider APIs. A host, or `*.` plus a domain |
+| `registry_hosts` | list of hosts | `[registry.opentofu.org]` | Hosts the plan may reach: the module and provider registries |
+| `egress_network` | container network | none | A network whose only exit is a proxy or firewall that lets exactly the two host lists through. **Lair does not run that proxy and does not filter by hostname**: with this key set the isolation is only as good as your proxy (hostname enforcement is follow-up #203). `host`, `bridge`, `default` and `container:` are refused; `none` or no key gives the container no network at all (`--network none`, enforced by docker) and a plan that needs the cloud fails |
+| `timeout_seconds` | integer | `600` | 10 to 900; a step that runs longer is killed, and never longer than the credentials' life |
+| `max_output_bytes` | integer | `262144` | Output kept for the owner; the rest is cut |
+
+**What a run does,** in this order, each step ending the run before the next: Lair copies the root (leaving out `.git`, `.terraform`, `*.tfstate*` and `.env*`; a symlink or special file refuses the copy), the policy scan reads the root, the root is hashed again and must still match the copy, `.terraform.lock.hcl` must pin every provider with a version and verified hashes, each on `infra_policy.allowed_providers`, and only then are the plan role's credentials issued. `tofu init -lockfile=readonly -plugin-dir=/plugins` and `tofu plan -lock=false -detailed-exitcode` then run in the copy. The container is read-only, drops every capability, has a memory and process limit, and its whole environment is the plan role's credentials plus fixed settings: no variable of Lair's own reaches it. The credentials are removed from the output before it is shown. Fixed settings (`PATH`, `HOME`, the tofu switches, the region) go to the container with explicit values; the credentials go by name only, so they are not in the process list; the docker client gets only its own settings (`PATH`, `HOME`, `DOCKER_*`), and `aws sts` gets only `AWS_*`, `PATH` and `HOME`.
+
+**Image requirement and crash cleanup.** The command runs under `timeout -s KILL`, a few seconds after Lair's own limit, so a container cannot outlive a dead Lair by more than that: the image needs a `timeout` command (coreutils or busybox). At startup, when a project has the sandbox on, Lair removes leftover `lair-plan-*` temp copies and containers (it assumes one Lair per machine). Output past 8 MiB stops the run and is reported as `output`, not as a timeout.
+
+An invalid block (unknown keys, no role, no mirror, a relative path, a bad host or a timeout over 900) never turns the sandbox off: unless the block says `enabled: false`, every plan is refused with `invalid-config` and `GET /api/plan-sandbox/status` shows the errors. Lair reads this block at startup.
+
+### Plan sandbox API
+
+Both routes are the owner's (signed in on the dashboard) and get no CORS.
+
+| Route | Meaning |
+|-------|---------|
+| `GET /api/plan-sandbox/status?project=` | Whether the sandbox is on or blocked (with the errors), the role, the declared egress hosts (`declaredEgressHosts`, with `egressHostsEnforcedByLair: false`) and the limits; no credential |
+| `POST /api/plan-sandbox/plan?project=&root=` | Plan one of the project's `infra_policy.roots` through the scan and the sandbox; 404 when the sandbox is off, 400 for a root that is not configured. The answer is `refused` (with the reason), `failed` (init, plan, timeout, output or credentials) or `planned` (`changes`, the output, when the credentials expire) |
 
 ## Planner
 
