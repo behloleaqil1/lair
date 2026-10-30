@@ -1112,7 +1112,7 @@ export class TriageService {
    * expire waits that have been waiting too long, and raise decisions for expired waits.
    */
   private processEnvironmentWaits(s: Section): void {
-    const { store, settings, project } = this.o;
+    const { store, project } = this.o;
     const nowMs = this.now();
     const nowIso = this.iso(nowMs);
 
@@ -1133,7 +1133,7 @@ export class TriageService {
    */
   private async runEnvironmentProbe(waitId: string): Promise<void> {
     await this.serial(async () => {
-      const { store, settings, project } = this.o;
+      const { store, settings } = this.o;
       const wait = store.getEnvironmentWait(waitId);
       if (!wait || wait.status !== "waiting") return;
 
@@ -1176,7 +1176,7 @@ export class TriageService {
    * Resolve an environment wait after its probe passes. Triggers re-checks for all waiting gates.
    */
   private resolveEnvironmentWait(wait: EnvironmentWaitRow, s: Section): void {
-    const { store, settings, project } = this.o;
+    const { store, project } = this.o;
     const nowIso = this.iso();
 
     store.resolveEnvironmentWait(wait.id, "resolved", nowIso);

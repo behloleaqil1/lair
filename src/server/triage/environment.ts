@@ -15,8 +15,6 @@
  * Re-checks after an environment wait don't count against `max_per_result`.
  */
 
-import type { CompiledPattern, InfraKind } from "./config.js";
-
 /**
  * Environment pattern for detecting outages (Docker, disk, network, SSH).
  * More specific than the general infra patterns: these are conditions where

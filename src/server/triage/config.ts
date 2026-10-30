@@ -8,8 +8,6 @@ import { GATE_RECHECK_KEYS, parseGateRecheck, type GateRecheckSettings } from ".
 import { DEFAULT_INFRA_SIGNATURES, DEFAULT_TIMEOUT_SIGNATURES, type CompiledSignature, type SignatureDef } from "./signatures.js";
 import {
   compileEnvironmentPatterns,
-  DEFAULT_ENVIRONMENT_PATTERNS,
-  type CompiledEnvironmentPattern,
   type EnvironmentPattern,
   type EnvironmentSettings,
 } from "./environment.js";
