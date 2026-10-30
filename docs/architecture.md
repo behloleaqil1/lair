@@ -97,6 +97,7 @@ Pure functions that parse project files into typed structures:
 - **`adapters.ts`**: built-in agent adapter definitions and command builders (adapters are listed in the UI; dragons are started with `dragon_start_cmd`)
 - **`supervisor.ts`**, **`managed-process.ts`**, **`ring-buffer.ts`**: process manager for long-running services and their logs
 - **`file-watcher.ts`**: watches a project's folders (agents_dir, the gate queue and results, the queue file's folder) and broadcasts changes over the WebSocket
+- **`queue-cache.ts`**: the queue file, read once per change with async IO (at most its last 4 MB) and parsed into memory; the dashboard's queue, dragon and overview views read the parsed lines, never the file. A failed read keeps the last good lines; a change is seen by a folder watch and a 5 s size/mtime check
 - **`dir-watch.ts`**: one folder's watch (fs.watch on the folder, never on its files), with polling where the folder can't be watched; the file watcher and the config reloader use it
 - **`gate-runner.ts`**, **`gate-distribution.ts`**, **`remote-gate.ts`**: optional gate runner, lane-to-machine distribution and remote gate execution over SSH (library code with tests; not started by the server yet)
 
