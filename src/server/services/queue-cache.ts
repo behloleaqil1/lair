@@ -16,10 +16,11 @@
  * Changes are seen by a folder watch (so a replaced file is seen too) and by
  * a slow size/mtime check, for systems where watching is not reliable.
  */
-import { constants, watch, type FSWatcher } from "fs";
+import { constants } from "fs";
 import { open, stat } from "fs/promises";
 import { basename, dirname } from "path";
 import type { QueueLine, QueueLineType } from "../../shared/types.js";
+import { DirWatch } from "./dir-watch.js";
 import { parseQueueFile, filterByAgent, filterByType } from "../parsers/queue.js";
 
 /** At most this much of the end of the queue file is read (4 MB, as fill reads it) */
@@ -91,7 +92,7 @@ export class QueueCache {
   private lines: QueueLine[] = [];
   private state: QueueCacheState = { refreshedAt: 0, size: 0, truncated: false };
   private seen = { size: -1, mtimeMs: -1 };
-  private watcher: FSWatcher | null = null;
+  private watcher: DirWatch | null = null;
   private checkTimer: NodeJS.Timeout | null = null;
   private debounceTimer: NodeJS.Timeout | null = null;
   private inFlight: Promise<void> | null = null;
@@ -123,7 +124,7 @@ export class QueueCache {
 
   stop(): void {
     this.stopped = true;
-    this.watcher?.close();
+    this.watcher?.stop();
     this.watcher = null;
     if (this.checkTimer) clearInterval(this.checkTimer);
     this.checkTimer = null;
@@ -197,19 +198,15 @@ export class QueueCache {
   }
 
   private startWatching(): void {
-    try {
-      // The folder, not the file, so a rename over the file is seen
-      const name = basename(this.path);
-      this.watcher = watch(dirname(this.path), { persistent: false }, (_event, filename) => {
-        if (filename === null || filename === undefined || filename.toString() === name) this.scheduleRefresh();
-      });
-      this.watcher.on("error", () => {
-        this.watcher?.close();
-        this.watcher = null;
-      });
-    } catch {
-      this.watcher = null;
-    }
+    // The folder, not the file, so a rename over the file is seen; DirWatch
+    // polls the folder where it can't be watched
+    const name = basename(this.path);
+    this.watcher = new DirWatch(dirname(this.path), {
+      accept: (entry) => entry === name,
+      onEvent: () => this.scheduleRefresh(),
+      debounceMs: this.debounceMs,
+    });
+    this.watcher.start();
     this.checkTimer = setInterval(() => void this.checkForChange(), this.checkMs);
     this.checkTimer.unref();
   }
