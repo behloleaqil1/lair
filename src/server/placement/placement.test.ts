@@ -1171,6 +1171,8 @@ class OnDemandHarness extends Harness {
     const originalRun = this.runner.run.bind(this.runner);
     this.runner.run = async (argv: string[], options) => {
       const [cmd] = argv;
+      // Track the call for all commands (so tests can count calls)
+      this.runner.calls.push({ argv: [...argv], timeoutMs: options?.timeoutMs });
       if (cmd === "probe-aws") {
         // AWS probe passes only when running
         if (this.awsState === "running") {
@@ -1193,6 +1195,8 @@ class OnDemandHarness extends Harness {
         }
         return { code: 0, stdout: "guard: refused - cost limit reached\n", stderr: "" };
       }
+      // For other commands, the original run will also push to calls, so pop our push
+      this.runner.calls.pop();
       return originalRun(argv, options);
     };
   }
