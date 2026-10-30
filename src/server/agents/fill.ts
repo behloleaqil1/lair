@@ -96,6 +96,7 @@ import { lastLines, readTail } from "./sessions.js";
 import type { AgentsStore } from "./store.js";
 import { isActive, isValidTaskId, type AgentRun, type QueueMark } from "./types.js";
 import type { ProcessInfo } from "../watchdog/probes.js";
+import { evaluateReady, parseReadyReport, type ReadyFactsSource } from "../ready-guard/guard.js";
 
 export const MAX_TASKS_FILE_BYTES = 256 * 1024;
 export const MAX_TASK_LINES = 200;
@@ -788,6 +789,8 @@ export interface AgentsFillOptions {
   findDecision: (key: string) => Decision | null | undefined;
   /** Withdraw a decision whose hold lifted (never throws) */
   withdraw: (decision: Decision, reason: string) => Promise<void>;
+  /** The ready guard's source for this project's PRs (used when settings.readyGuard is on); undefined: none, nothing is refused */
+  readyFacts?: () => ReadyFactsSource | undefined;
 }
 
 function firstLine(text: string): string | null {
@@ -1126,7 +1129,14 @@ export class AgentsFill {
         show("done", `done: ${oneLine(check.line)} (seen ${iso(check.at)})`, latest?.id ?? null);
         continue;
       }
-      if (check?.kind === "queue") {
+      // A DONE line that names a PR counts only when the PR is ready to review (settings.readyGuard)
+      const refusal = check?.kind === "queue" ? await this.guardReport(agent, task, check.line, latest) : null;
+      if (refusal?.retry) {
+        // Only time can fix it (CI running): not done, no new run, checked again on the next check
+        await hold("report_refused", `done line not accepted yet: ${refusal.problems.map((p) => oneLine(p, 160)).join("; ")}; checked again on the next check`, latest?.id ?? null);
+        continue;
+      }
+      if (check?.kind === "queue" && !refusal) {
         const done = check.line;
         await this.options.record(
           "fill_done",
@@ -1414,7 +1424,9 @@ export class AgentsFill {
 
       let run: AgentRunView;
       try {
-        run = await this.options.requestRun({ agent, task, prompt: prompt.text });
+        // A refused DONE report of the last run is this run's first instruction
+        const refused = latest ? this.refusalNote(latest) : null;
+        run = await this.options.requestRun({ agent, task, prompt: refused ? `${prompt.text}\n\n${refused}\n` : prompt.text });
       } catch (e) {
         const why = message(e);
         if (why.startsWith("Over budget")) {
@@ -1457,6 +1469,49 @@ export class AgentsFill {
     // A check cut short saw only some lines: what it didn't see may still be held
     if (!signal.aborted) await this.withdrawLifted(views, wanted);
     return views;
+  }
+
+  /**
+   * The ready guard's verdict on a DONE line: null when it is accepted (the
+   * guard is off, the line names no PR, or the PR is ready). A refusal that
+   * only time can fix (`retry`) is just returned; any other is recorded once
+   * (fill_report_refused) with the instruction the agent gets next. Nothing
+   * here marks the task done or sends anything to review.
+   */
+  private async guardReport(
+    agent: string,
+    task: string,
+    line: string,
+    latest: AgentRun | null,
+  ): Promise<{ retry: boolean; problems: string[] } | null> {
+    const source = this.options.settings.readyGuard ? this.options.readyFacts?.() : undefined;
+    const report = parseReadyReport(line);
+    if (!source || !report) return null;
+    const verdict = await evaluateReady(report, source);
+    if (verdict.ok) return null;
+    if (!verdict.retry) {
+      await this.options.record(
+        "fill_report_refused",
+        {
+          agent,
+          task,
+          runId: latest?.id,
+          summary: `fill: ${agent}'s done report for ${task} (PR #${report.pr}) was refused: ${verdict.reason}`,
+          evidence: verdict.problems,
+          data: { pr: report.pr, reason: verdict.reason, instruction: verdict.instruction },
+          dedupeKey: `fill_report_refused:${task}:${latest?.id ?? "none"}:${createHash("sha256").update(verdict.instruction).digest("hex").slice(0, 16)}`,
+        },
+        this.options.probes.clock.now(),
+      );
+    }
+    return { retry: verdict.retry, problems: verdict.problems };
+  }
+
+  /** The instruction of the run's last refused DONE report, or null. */
+  private refusalNote(run: AgentRun): string | null {
+    const { store, project } = this.options;
+    const event = store.listEvents(project, { kinds: ["fill_report_refused"], task: run.task, runId: run.id, limit: 1 })[0];
+    return typeof event?.data.instruction === "string" ? event.data.instruction : null;
   }
 
   /**

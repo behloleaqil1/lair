@@ -3584,6 +3584,99 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(runs(h)).toHaveLength(4);
   });
 
+  describe("ready guard: a DONE line that names a PR counts only when the PR is ready to review", () => {
+    const green = {
+      state: "open" as const,
+      headSha: "abc1234def5678",
+      baseRef: "main",
+      mergeable: true,
+      behindBy: 0,
+      body: "",
+      checks: [{ name: "build", state: "success" as "success" | "failure" | "pending" }],
+      commitShas: ["abc1234def5678"],
+      gate: null,
+      findingIds: [] as string[],
+    };
+    const DONE = "- DONE feat-login by worker-a 12:05Z: PR #7 at abc1234 ready";
+
+    /** worker-a starts feat-login, writes the DONE line, and exits 0; facts() is what the host says. */
+    async function finished(facts: () => typeof green, guard = true) {
+      const h = setup(fill({ agents: ["worker-a"], ready_guard: guard }));
+      prompts(h);
+      h.manager.useReadyFacts(() => ({ facts: async () => facts() }));
+      tasks(h, "worker-a|Alice|feat-login|Login form");
+      await check(h);
+      await at(h, 0); // pid 5001
+      appendFileSync(h.queueFile, `${DONE}\n`);
+      h.spawner.exit(5001, 0);
+      await at(h, MIN);
+      return h;
+    }
+
+    it("a refused report (red CI) never marks the task done, sends nothing to review, and is the next run's first instruction", async () => {
+      const facts = { ...green, checks: [{ name: "build-22", state: "failure" as const }] };
+      const h = await finished(() => facts);
+
+      expect(lineOf(await check(h), "feat-login").state).not.toBe("done");
+      expect(eventsOf(h, "fill_done")).toEqual([]);
+      const [refused] = eventsOf(h, "fill_report_refused");
+      expect(refused).toMatchObject({ task: "feat-login", agent: "worker-a" });
+      expect(refused.data).toMatchObject({ pr: 7, reason: "ci_failed" });
+      expect(String(refused.data.instruction)).toContain("CI is not green at the head: build-22");
+
+      // Checked again every time; the same refusal is recorded once
+      await check(h);
+      expect(eventsOf(h, "fill_report_refused")).toHaveLength(1);
+
+      // The next run starts with the reason
+      h.clock.t = NOW + 10 * MIN;
+      await check(h);
+      await h.service.tick();
+      expect(runs(h)).toHaveLength(2);
+      expect(promptOf(h.spawner.calls[1])).toContain("Your report for PR #7 was refused");
+      expect(promptOf(h.spawner.calls[1])).toContain("build-22");
+    });
+
+    it("pending CI is refused for now and checked again: not done, no new run, then done once CI is green", async () => {
+      let facts: typeof green = { ...green, checks: [{ name: "build-22", state: "pending" }] };
+      const h = await finished(() => facts);
+
+      for (let i = 0; i < 3; i++) {
+        const held = lineOf(await check(h), "feat-login");
+        expect(held).toMatchObject({ state: "held", hold: "report_refused" });
+        expect(held.detail).toContain("CI is still running at the head: build-22");
+      }
+      expect(eventsOf(h, "fill_done")).toEqual([]);
+      expect(eventsOf(h, "fill_report_refused")).toEqual([]);
+      expect(runs(h)).toHaveLength(1);
+
+      facts = { ...green };
+      expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "done" });
+      expect(eventsOf(h, "fill_done")).toHaveLength(1);
+      expect(runs(h)).toHaveLength(1);
+    });
+
+    it("a ready PR is accepted as done", async () => {
+      const h = await finished(() => green);
+      expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "done" });
+      expect(eventsOf(h, "fill_done")).toHaveLength(1);
+      expect(eventsOf(h, "fill_report_refused")).toEqual([]);
+    });
+
+    it("a branch behind its base is refused with the reason", async () => {
+      const h = await finished(() => ({ ...green, behindBy: 3 }));
+      await check(h);
+      expect(eventsOf(h, "fill_done")).toEqual([]);
+      expect(eventsOf(h, "fill_report_refused")[0].data).toMatchObject({ reason: "behind_base" });
+    });
+
+    it("with the guard off nothing is checked", async () => {
+      const h = await finished(() => ({ ...green, checks: [{ name: "build", state: "failure" as const }] }), false);
+      expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "done" });
+      expect(eventsOf(h, "fill_report_refused")).toEqual([]);
+    });
+  });
+
   it("done is kept once seen: a rotated or truncated queue file doesn't restart the task; an edited line clears it", async () => {
     const h = setup(fill({ agents: ["worker-a"] }));
     prompts(h);

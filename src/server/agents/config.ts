@@ -195,6 +195,8 @@ const FillSchema = z
     /** A run that ended on such a line is held for the owner at once */
     blocked_pattern: z.string().min(1).max(500).default(DEFAULT_BLOCKED_PATTERN),
     wake: WakeSchema.default({}),
+    /** Refuse a DONE line that names a PR unless the PR is ready to review (CI, branch, gate, finding map) */
+    ready_guard: z.boolean().default(false),
   })
   .strict();
 
@@ -308,6 +310,8 @@ export interface FillSettings {
   maxBackoffSeconds: number;
   waitingPattern: string;
   blockedPattern: string;
+  /** Refuse a DONE line that names a PR unless the PR is ready to review (src/server/ready-guard/) */
+  readyGuard: boolean;
   wake: {
     file?: string;
     root: string;
@@ -688,6 +692,7 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         maxBackoffSeconds: value.fill.max_backoff_seconds,
         waitingPattern: value.fill.waiting_pattern,
         blockedPattern: value.fill.blocked_pattern,
+        readyGuard: value.fill.ready_guard,
         wake: {
           file: value.fill.wake.file,
           root: value.fill.wake.root,

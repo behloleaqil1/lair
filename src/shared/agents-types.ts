@@ -150,6 +150,7 @@ export type AgentEventKind =
   | "fill_woken"
   | "fill_weak"
   | "fill_wake_absent"
+  | "fill_report_refused"
   | "fill_gate_queued"
   | "fill_gate_gone"
   | "transient"
@@ -332,7 +333,8 @@ export type FillHold =
   | "capacity_probe"
   | "conflict"
   | "prompt"
-  | "refused";
+  | "refused"
+  | "report_refused";
 
 export interface FillLineView {
   /** 1-based line number in tasks_file */

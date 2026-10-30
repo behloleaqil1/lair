@@ -66,6 +66,7 @@ interface GhPull {
   user?: { login?: string } | null;
   labels?: { name?: string }[];
   mergeable?: boolean | null;
+  body?: string | null;
   updated_at?: string;
 }
 
@@ -134,6 +135,7 @@ function mapPull(p: GhPull): HostPullRequest {
     labels: (p.labels ?? []).map((l) => l.name ?? "").filter(Boolean),
     mergeable: typeof p.mergeable === "boolean" ? p.mergeable : null,
     updatedAt: p.updated_at ?? null,
+    body: typeof p.body === "string" ? p.body : null,
   };
 }
 

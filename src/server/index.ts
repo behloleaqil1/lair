@@ -586,6 +586,11 @@ const reviews = new ReviewManager({
   decisions: inboxDecisionSink(decisionInbox),
 });
 reviews.load(projectEntries);
+// The ready guard (agents.fill.ready_guard) reads a project's PRs from its review module's git host
+agents.useReadyFacts((project) => {
+  const review = reviews.get(project);
+  return review ? { facts: (pr) => review.readyFacts(pr) } : undefined;
+});
 // Every merge hold has one decision (only the owner releases a hold); answering it releases the hold
 await reviews.useDecisions(decisionInbox);
 // The same for delivery's held services: answering releases the service, as its Release button does

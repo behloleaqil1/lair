@@ -154,6 +154,7 @@ describe("agents config", () => {
       maxBackoffSeconds: 1800,
       waitingPattern: DEFAULT_WAITING_PATTERN,
       blockedPattern: DEFAULT_BLOCKED_PATTERN,
+      readyGuard: false,
       wake: {
         file: undefined,
         root: "{gates_dir}",

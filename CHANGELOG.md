@@ -5,6 +5,11 @@ file lists what needs action on your side.
 
 ## Unreleased
 
+- **Ready guard (off by default).** `agents.fill.ready_guard: true` refuses a done line that names a PR whose CI is
+  red or pending, whose branch is behind or conflicting, whose gate did not pass at the head, or that lacks a
+  finding-to-commit map; the agent gets the reason as its next instruction. See
+  [Fill](docs/configuration.md#fill).
+
 - **Brain trainer (off by default).** `brain_trainer:` in `data/server.yaml` turns on a nightly shadow-trained
   classifier for decisions; it needs the image built from `brain-trainer/` (named in the config by its `sha256:` id,
   never by a tag) and a non-root Lair user, and it never answers a decision. See
