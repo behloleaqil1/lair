@@ -64,7 +64,7 @@ export class PlanSandbox {
 
   /** Plan a configured root of the project's infra_policy. */
   async plan(root: string): Promise<PlanOutcome> {
-    const { infra, spawner, issuer } = this.deps;
+    const { infra } = this.deps;
     const now = this.deps.now ?? (() => new Date());
     const policy = infra.get(this.project);
     if (!policy || !(policy instanceof InfraPolicy)) {
