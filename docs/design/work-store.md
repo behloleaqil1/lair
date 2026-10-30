@@ -754,7 +754,7 @@ Design targets:
 | Tasks | 5,000 per project | Indexed by state, agent, priority |
 | Events | 200,000 per project | Indexed by task, kind; archived past retention |
 | Agents | 50 concurrent | One task per agent (wip_limit); separate runs |
-| Query paths | < 10 ms | Indexes on common queries; no full scans |
+| Query paths | < 10 ms | The seven queries in 3.7, each with its named index; no full scans |
 
 The SQLite store handles this easily. Postgres (M6) handles more.
 
@@ -775,23 +775,25 @@ Each step is a config change; no data migration needed (the importer runs once a
 
 ## 10. PR plan
 
-Five PRs, each with acceptance tests that fail on main:
+Seven PRs, each under about 400 lines with its tests, each with two or three **acceptance tests** that drive the
+real entry point and fail on main:
 
-| PR | Module | What | Lines | Tests |
-|---|---|---|---|---|
-| W1 | store | WorkStore, importer, read-only API and UI | ~400 | Store CRUD, import parsing, API routes |
-| W2 | agents | `task()` and `report()` tools, fill reads store | ~300 | Bus tools work, fill sees ready tasks |
-| W3 | planner | Proposals write to store, Work board writes | ~350 | Planner proposals create tasks, board drag works |
-| W4 | mirror | Mirror mode, conflict detection | ~250 | Mirror writes files, detects conflicts |
-| W5 | briefs | Brief versioning, export | ~200 | Brief history, JSON/MD export |
+| PR | Module | What | Acceptance tests (fail on main) |
+|---|---|---|---|
+| W1a | store | Schema, `SqliteWorkStore`, importer dry run (reusing fill's parser) | The importer accepts `Feat-1.2` and `area/topic#3` (`isValidTaskId`) and warns on a malformed line; a dry run writes nothing; a transition missing its required field is refused |
+| W1b | api, UI | Read API (owner-only prefix), board read-only on the `work` live topic | `GET /api/work/tasks` without an owner session is 403 before any handler work; a derived `running` shows for a task with a claim and no write to the row |
+| W2 | agents | `task()` and `report()` through token binding, derived holder | A report after the claim was released is refused; a claim replaced by failover shows the new holder with no write to the task row; a report with another run's id in the body is bound to the token's run |
+| W3a | planner | `WorkStoreProducer`; proposals write to the store in `db` mode | A proposal creates a task through the producer; the planner agent has no route to the store; external edits become owner events |
+| W3b | board | Owner transitions from the board | `PATCH /api/work/tasks/:id` without the owner session is 403 before the body is read; reopen is owner-only |
+| W4 | mirror | Mirror mode, hash detection, intent rows | A foreign line in the queue file survives the next mirror write; exactly one notice for ten repeated edits; the server killed between the run insert and the event write leaves one state and one run after restart |
+| W5 | briefs | Brief versioning, export | An agent sees the brief version current at run start; JSON export round-trips |
 
-Each PR adds its own tests. Acceptance tests must fail on main before the change: the PR body says how the
-author checked.
+Each PR adds its own tests. The PR body says how each acceptance test was checked to fail on main.
 
 ## 11. Open questions for the owner
 
-1. **Event retention**: 90 days default. Does that work, or should it be longer?
-   - **Recommendation**: 90 days is enough for debugging; archived events are still accessible.
+1. **Event retention**: 90 days after a task is terminal (3.6). Does that work, or should it be longer?
+   - **Recommendation**: 90 days is enough for debugging; archived events stay readable on the task page.
 
 2. **WIP limit default**: 1 task per agent. Should this be configurable per agent?
    - **Recommendation**: Per-project is enough. An agent that needs more can be exempt in config.
@@ -819,6 +821,16 @@ interface ExternalRef {
 ```
 
 ### 12.2 Status mapping
+
+**Options.**
+
+| Option | For | Against |
+|---|---|---|
+| A. One `status/*` label per state, issue open or closed by done/dropped (recommended) | Every state is visible in the issue list and filterable; closing follows the terminal states | Nine labels to create; `assigned` and `running` labels follow the derived state (1.5), so they can flip when a claim is lost |
+| B. Only open/closed | No labels to maintain | The issue list says nothing about progress |
+| C. A Projects board column per state | Native board view | Needs a board per repo and extra API scopes; the labels already carry the same data |
+
+Recommendation: A. The tracker reads the *derived* state from the read model, never from a stored holder.
 
 | Task state | GitHub issue state | GitHub label |
 |---|---|---|
