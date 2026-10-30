@@ -528,7 +528,6 @@ describe("SupervisorAct", () => {
 
     const answerCalled = false;
     let releaseCalled = false;
-    let withdrawCalled = false;
 
     const service = new SupervisorAct({
       project: "test",
@@ -539,8 +538,7 @@ describe("SupervisorAct", () => {
           releaseCalled = true;
           return { task, runId: null };
         },
-        withdrawDecision: async (id: string, reason: string) => {
-          withdrawCalled = true;
+        withdrawDecision: async (_id: string, _reason: string) => {
           // This is OK - it's the producer interface, not the answer route
         },
         // We do NOT provide any answer route interface

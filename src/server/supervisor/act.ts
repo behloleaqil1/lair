@@ -12,7 +12,6 @@ import type { DecisionProducer } from "../decisions/types.js";
 import type { AgentsStore } from "../agents/store.js";
 import {
   actEnabled,
-  opAllowed,
   type ActOp,
   type ActSettings,
 } from "./act-config.js";
@@ -205,7 +204,6 @@ export class SupervisorAct {
 
   /** Check if a fix that didn't work comes back (for escalation) */
   checkRepeat(op: ActOp, target: string): boolean {
-    const settings = this.options.settings();
     const now = this.clock();
     const cooldownKey = `${op}:${target}`;
     const cooldownUntil = this.rateLimit.cooldowns.get(cooldownKey) ?? 0;

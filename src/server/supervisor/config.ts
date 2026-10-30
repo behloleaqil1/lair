@@ -18,7 +18,7 @@ import { isValidPromptName, PROMPT_NAME_RULE } from "../agents/prompts.js";
 import { roleAgents } from "../ai/profiles.js";
 import { isValidDragonId } from "../parsers/dragon-config.js";
 import { knownDragonIds, loadKnownDragons } from "../services/dragon-registry.js";
-import { ActSchema, parseActConfig, defaultActSettings, type ActSettings } from "./act-config.js";
+import { ActSchema, type ActSettings } from "./act-config.js";
 
 const ms = (fallback: number) => z.number().int().min(1).max(600_000).default(fallback);
 const percent = (fallback: number) => z.number().min(0).max(100).default(fallback);
