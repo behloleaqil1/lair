@@ -327,7 +327,7 @@ describe("E2E: Full agent cycle on a fake project", () => {
     writeFileSync(paths.tasks, "feat-search|Fix search results\n");
 
     // 2. Set up the spawner to simulate an agent that completes its task
-    spawner.onSpawn = (pid, call) => {
+    spawner.onSpawn = (pid, _call) => {
       clock.advance(5 * MIN);
       const queueLine = `- DONE feat-search by worker-a 10:05Z: implemented search fix\n`;
       appendFileSync(paths.queue, queueLine);
@@ -356,7 +356,7 @@ describe("E2E: Full agent cycle on a fake project", () => {
 
     writeFileSync(paths.tasks, "feat-api|Add new API endpoint\n");
 
-    spawner.onSpawn = (pid, _call) => {
+    spawner.onSpawn = (_pid, _call) => {
       clock.advance(2 * MIN);
       appendFileSync(
         paths.queue,
@@ -446,7 +446,7 @@ feat-three|Third task
     );
 
     let tasksDone = 0;
-    spawner.onSpawn = (pid, call) => {
+    spawner.onSpawn = (_pid, call) => {
       tasksDone++;
       const task = call.env.LAIR_TASK;
       clock.advance(2 * MIN);
@@ -454,7 +454,7 @@ feat-three|Third task
         paths.queue,
         `- DONE ${task} by worker-a 10:0${tasksDone * 2}Z: completed\n`,
       );
-      spawner.exit(pid, 0);
+      spawner.exit(spawner.nextPid - 1, 0);
     };
 
     // Run through the tasks
