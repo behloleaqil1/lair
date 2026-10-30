@@ -1701,6 +1701,7 @@ worker-b|Bob|feat-search|Search page
 | `fill.prompt_files` | array | `[]` | Required when enabled. Files whose contents, in order, make the prompt. `{prompts_dir}`, `{agent}`, `{task}` |
 | `fill.max_active` | number | `1` | Runs fill started that may be active at once (restarts and retries count) |
 | `fill.done_pattern` | string | `^-\s+DONE\s+{task}(?=\s\|$)` | Regular expression for a queue line that reports the task done, matched case-insensitively against each trimmed line; the task id must be in the matched text exactly. Must contain `{task}`, `{agent}` or both ([Matching by agent](#matching-by-agent)), inserted as literal text. End the task id at whitespace, not `\b`, `:` or `-`: task ids can contain `-` and `:` |
+| `fill.done_match` | string | `task_id` | How fill matches a DONE line to a task: `task_id` (the default) requires the line to name THIS task's id; a line naming another task is an unmatched report (recorded, shown on Health, one notice per agent per hour) and doesn't close the task. `agent_legacy` keeps the old behaviour (match by agent only, with a startup warning): not recommended, as a stale DONE line can close a new task |
 | `fill.capacity_cmd` | array | — | Exit 0: capacity available; anything else holds, with its first output line as the reason |
 | `fill.interval_seconds` | number | `60` | Seconds between fill checks |
 | `fill.max_completions_without_done` | number | `3` | Runs in a row that exit 0 without the done line; then fill holds the task and asks you |

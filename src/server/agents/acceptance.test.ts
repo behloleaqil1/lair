@@ -4302,6 +4302,171 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(withdrawn?.withdrawnReason).toContain("It moved on: feat-login started again as run");
     expect(inbox.list({ project: "demo", status: "open" })).toEqual([]);
   });
+
+  // ============ done_match: unmatched reports ============
+
+  it("with done_match task_id (default), a DONE line naming another task is an unmatched report: the open task stays open", async () => {
+    const h = setup(fill());
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+
+    // The agent starts and runs
+    await check(h);
+    const [run] = runs(h);
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 1 * MIN);
+    expect(run.state).toBe("completed");
+
+    // The agent reports DONE for a DIFFERENT task than its open one
+    appendFileSync(h.queueFile, "- DONE old-task by worker-a 12:05Z: merged #12\n");
+    const status = await check(h);
+
+    // The task stays open (not done)
+    expect(lineOf(status, "feat-login").state).not.toBe("done");
+    // An unmatched report is recorded
+    expect(status.unmatchedReports).toHaveLength(1);
+    expect(status.unmatchedReports[0]).toMatchObject({
+      agent: "worker-a",
+      openTask: "feat-login",
+      reportedTask: "old-task",
+      kind: "done",
+    });
+    // A fill_unmatched event is recorded
+    const unmatched = eventsOf(h, "fill_unmatched");
+    expect(unmatched.length).toBeGreaterThanOrEqual(1);
+    expect(unmatched[0]).toMatchObject({
+      agent: "worker-a",
+      task: "feat-login",
+      data: { kind: "done", reportedTask: "old-task", openTask: "feat-login" },
+    });
+  });
+
+  it("with done_match task_id, a DONE line naming the correct task closes it", async () => {
+    const h = setup(fill());
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+
+    await check(h);
+    const [run] = runs(h);
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 1 * MIN);
+    expect(run.state).toBe("completed");
+
+    // The agent reports DONE for its correct task
+    appendFileSync(h.queueFile, "- DONE feat-login by worker-a 12:05Z: merged #12\n");
+    const status = await check(h);
+
+    // The task is done
+    expect(lineOf(status, "feat-login")).toMatchObject({ state: "done" });
+    // No unmatched reports
+    expect(status.unmatchedReports).toHaveLength(0);
+  });
+
+  it("with done_match task_id, a WAITING line naming another task is not attached to the open task", async () => {
+    const h = setup(fill({ wake: { file: "{gates_dir}/results/{wake}.rc" } }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+
+    await check(h);
+    const [run] = runs(h);
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 1 * MIN);
+    expect(run.state).toBe("completed");
+
+    // The agent reports WAITING for a DIFFERENT task
+    appendFileSync(h.queueFile, "- WAITING old-task gate-123 by worker-a 12:05Z: queued\n");
+    const status = await check(h);
+
+    // The open task is NOT held: waiting
+    expect(lineOf(status, "feat-login").hold).not.toBe("waiting");
+    // Unmatched report recorded
+    expect(status.unmatchedReports).toHaveLength(1);
+    expect(status.unmatchedReports[0]).toMatchObject({
+      agent: "worker-a",
+      openTask: "feat-login",
+      reportedTask: "old-task",
+      kind: "waiting",
+    });
+  });
+
+  it("a run with only unmatched reports takes the no_done path: bounded retries, then hold", async () => {
+    const h = setup(fill({ max_completions_without_done: 2, backoff_seconds: 10, max_backoff_seconds: 30 }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+
+    // First run: reports wrong task
+    await check(h);
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 1 * MIN);
+    appendFileSync(h.queueFile, "- DONE old-task by worker-a 12:05Z: merged\n");
+
+    // After backoff, it restarts (counted as no_done)
+    await at(h, 2 * MIN);
+    expect(lineOf(await check(h), "feat-login").state).toBe("held");
+    expect(lineOf(await check(h), "feat-login").hold).toBe("backoff");
+
+    // After backoff passes, restart
+    await at(h, 3 * MIN);
+    expect(lineOf(await check(h), "feat-login").state).toBe("started");
+
+    // Second run: also reports wrong task
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 4 * MIN);
+    appendFileSync(h.queueFile, "- DONE another-task by worker-a 12:10Z: done\n");
+
+    // After max_completions_without_done, held: no_done
+    await at(h, 5 * MIN);
+    const line = lineOf(await check(h), "feat-login");
+    expect(line.hold).toBe("no_done");
+  });
+
+  it("the next prompt after an unmatched report contains a data line about it", async () => {
+    const h = setup(fill({ backoff_seconds: 10 }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+
+    // First run
+    await check(h);
+    await h.service.tick();
+    const firstPrompt = promptOf(h.spawner.calls[0]);
+    expect(firstPrompt).not.toContain("Your previous run reported");
+
+    // The run ends and reports wrong task
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 1 * MIN);
+    appendFileSync(h.queueFile, "- DONE old-task by worker-a 12:05Z: merged\n");
+    await check(h);
+
+    // Second run starts after backoff
+    await at(h, 2 * MIN);
+    await check(h);
+    await h.service.tick();
+    const secondPrompt = promptOf(h.spawner.calls[1]);
+
+    // It contains the data line
+    expect(secondPrompt).toContain("Your previous run reported old-task; your task is feat-login.");
+  });
+
+  it("with done_match agent_legacy, the old behaviour is kept: a DONE line by agent closes the task", async () => {
+    const h = setup(fill({ done_match: "agent_legacy" }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+
+    await check(h);
+    const [run] = runs(h);
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 1 * MIN);
+    expect(run.state).toBe("completed");
+
+    // The agent reports DONE for a different task, but with agent_legacy it matches by agent
+    appendFileSync(h.queueFile, "- DONE old-task by worker-a 12:05Z: merged #12\n");
+    const status = await check(h);
+
+    // With agent_legacy, this closes the task (old behaviour)
+    expect(lineOf(status, "feat-login")).toMatchObject({ state: "done" });
+    // No unmatched reports in agent_legacy mode
+    expect(status.unmatchedReports).toHaveLength(0);
+  });
 });
 
 

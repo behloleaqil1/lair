@@ -282,6 +282,11 @@ planner (§4) turns documents into work; this module WRITES and maintains those 
   in-process request, so a project needs no launcher loop; a task done since its last start (kept once seen) or left
   to the owner is never started again, and one whose runs keep exiting 0 without the done line backs off, then waits
   on one decision.
+- **Unmatched reports:** a DONE, WAITING or BLOCKED line that names a task other than the agent's open task is an
+  unmatched report. Fill records it, shows it on Health, raises one notice per agent per hour, and doesn't close the
+  task. The next prompt tells the agent: "Your previous run reported <other>; your task is <open>". A run that ends
+  with only unmatched reports takes the no-done path (bounded retries, then hold). Set `done_match: agent_legacy` to
+  keep the old behaviour (with a startup warning); the default `task_id` is recommended.
 - **Budgets are advisory until adapters report usage:** today usage is read from run logs by pattern, text the agent
   itself writes, so it can under-report. Budgets become enforcement once providers or adapters report usage to the
   fleet budget directly; until then keep a spending limit at the provider too.

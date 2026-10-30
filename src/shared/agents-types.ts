@@ -151,6 +151,7 @@ export type AgentEventKind =
   | "fill_wake_absent"
   | "fill_gate_queued"
   | "fill_gate_gone"
+  | "fill_unmatched"
   | "transient"
   | "transient_cleared";
 
@@ -382,6 +383,24 @@ export interface FillStatusView {
   lastCheck: string | null;
   lastError: string | null;
   lines: FillLineView[];
+  /** Unmatched DONE/WAITING/BLOCKED reports: a report naming a different task than the agent's open task */
+  unmatchedReports: FillUnmatchedReportView[];
+}
+
+/** A report (DONE/WAITING/BLOCKED) that named a different task than the agent's open task. */
+export interface FillUnmatchedReportView {
+  /** The agent that wrote the report */
+  agent: string;
+  /** What the agent's open task is */
+  openTask: string;
+  /** The task id the report named (from the queue line) */
+  reportedTask: string;
+  /** The kind of report: done, waiting or blocked */
+  kind: "done" | "waiting" | "blocked";
+  /** The queue line as written */
+  line: string;
+  /** When it was recorded */
+  at: string;
 }
 
 /**

@@ -144,6 +144,12 @@ const FillSchema = z
      * be in the matched text exactly as written)
      */
     done_pattern: z.string().min(1).max(500).default(DEFAULT_DONE_PATTERN),
+    /**
+     * How fill matches a DONE line to a task: "task_id" requires the task id in
+     * the line (patterns with {task}); "agent_legacy" matches by agent only
+     * (today's behaviour, not recommended). Default "task_id".
+     */
+    done_match: z.enum(["task_id", "agent_legacy"]).default("task_id"),
     /** Exit 0: capacity available; anything else (a timeout too) holds, its first output line the reason */
     capacity_cmd: argv.optional(),
     interval_seconds: z.number().int().min(1).max(3600).default(60),
@@ -259,6 +265,14 @@ export interface FillSettings {
   promptFiles: string[];
   maxActive: number;
   donePattern: string;
+  /**
+   * How fill matches a DONE line to a task:
+   * - "task_id": the line must name THIS task's id (patterns with {task}); a
+   *   line that names another task or no task is an unmatched report
+   * - "agent_legacy": matches by agent only (today's behaviour, with a startup
+   *   warning; not recommended)
+   */
+  doneMatch: "task_id" | "agent_legacy";
   capacityCmd?: string[];
   intervalSeconds: number;
   maxCompletionsWithoutDone: number;
@@ -587,6 +601,7 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         maxBackoffSeconds: value.fill.max_backoff_seconds,
         waitingPattern: value.fill.waiting_pattern,
         blockedPattern: value.fill.blocked_pattern,
+        doneMatch: value.fill.done_match,
         wake: {
           file: value.fill.wake.file,
           root: value.fill.wake.root,
@@ -611,6 +626,13 @@ function checkFill(value: RawSettings, errors: string[]): void {
     }
     if (fill.prompt_files.length === 0) {
       errors.push("agents.fill.prompt_files: at least one prompt file is required when fill is enabled");
+    }
+    // Warn when done_match is task_id but done_pattern doesn't have {task}
+    if (fill.done_match === "task_id" && !fill.done_pattern.includes("{task}")) {
+      errors.push(
+        `agents.fill.done_pattern: with done_match "task_id" (the default), done_pattern needs {task}; ` +
+        `use done_match "agent_legacy" to match by agent only (with a startup warning)`
+      );
     }
   }
   fill.agents.forEach((agent, i) => {

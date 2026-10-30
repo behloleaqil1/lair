@@ -72,6 +72,7 @@ import type {
   FillLineView,
   FillQueuedGateView,
   FillStatusView,
+  FillUnmatchedReportView,
   FillWaitingView,
 } from "../../shared/agents-types.js";
 import { isValidDragonId } from "../parsers/dragon-config.js";
@@ -574,6 +575,16 @@ function fillDoneKey(task: string, latestRunId: string | null, entry: TaskLineFi
 /** A task fill judges done: from its kept record, or from a queue line. null: not done. */
 export type DoneCheck = { kind: "kept"; line: string; at: number } | { kind: "queue"; line: string } | null;
 
+/** An unmatched report: a DONE/WAITING/BLOCKED line naming a different task than the agent's open task. */
+export interface UnmatchedReport {
+  /** The kind of report */
+  kind: "done" | "waiting" | "blocked";
+  /** The task id the line names */
+  reportedTask: string;
+  /** The line as written */
+  line: string;
+}
+
 /**
  * Where a line's queue window ends: with patterns that match by agent, the
  * agent's next run on another task (its lines after that are about that
@@ -597,13 +608,15 @@ export function queueWindowEnd(
  * pattern names the task). A done_pattern that names the task decides by
  * itself; one that names only the agent counts only when the agent's last
  * DONE, WAITING or BLOCKED line (up to `until`, queueWindowEnd) is the DONE
- * one. Throws when a pattern doesn't compile for this task.
+ * one. With doneMatch "task_id" (the default), only lines naming THIS task
+ * count, even if the pattern could match by agent. Throws when a pattern
+ * doesn't compile for this task.
  */
 export function checkDone(
   store: Pick<AgentsStore, "getEventByKey">,
   project: string,
   queue: QueueLines,
-  settings: Pick<FillSettings, "donePattern" | "waitingPattern" | "blockedPattern">,
+  settings: Pick<FillSettings, "donePattern" | "waitingPattern" | "blockedPattern" | "doneMatch">,
   entry: TaskLineFields,
   latest: AgentRun | null,
   until: QueueMark | undefined,
@@ -612,7 +625,10 @@ export function checkDone(
   if (kept) return { kind: "kept", line: String(kept.data.line ?? ""), at: kept.at };
   const donePattern = fillPatternFor(settings.donePattern, entry.task, entry.agent);
   let line: string | null;
-  if (donePattern.task !== null) {
+  // In task_id mode, only lines naming THIS task count (the pattern must have {task}, enforced by config)
+  // In agent_legacy mode, keep today's behaviour
+  const useTaskIdMatching = settings.doneMatch === "task_id" || donePattern.task !== null;
+  if (useTaskIdMatching) {
     // A line that names the task: done is done, whatever came after it
     line = queue.find(donePattern, latest?.queueMark, until);
   } else {
@@ -630,6 +646,56 @@ export function checkDone(
     line = last?.kind === "done" ? last.line : null;
   }
   return line === null ? null : { kind: "queue", line };
+}
+
+/**
+ * Extract the task id a DONE/WAITING/BLOCKED line names from its text. Looks for
+ * a word after the keyword (DONE, WAITING, BLOCKED) that matches the standard format.
+ * Returns null if no task id can be extracted.
+ */
+export function extractReportedTask(line: string): string | null {
+  // Match "- DONE <task>", "- WAITING <task>", "- BLOCKED <task>" patterns
+  // Task id: letters, digits, '.', '_', '-' and ':', not starting with '-'
+  const match = /^-\s+(DONE|WAITING|BLOCKED)\s+([A-Za-z0-9][A-Za-z0-9._:-]*)/i.exec(line.trim());
+  return match ? match[2] : null;
+}
+
+/**
+ * Find unmatched reports for an agent: DONE/WAITING/BLOCKED lines the agent
+ * wrote (by attribution) that name a task other than `openTask`. Returns the
+ * latest such line, if any, in the queue window since the run's mark.
+ */
+export function findUnmatchedReport(
+  queue: QueueLines,
+  settings: Pick<FillSettings, "donePattern" | "waitingPattern" | "blockedPattern">,
+  agent: string,
+  openTask: string,
+  mark: QueueMark | undefined,
+  until: QueueMark | undefined,
+): UnmatchedReport | null {
+  // Look for any DONE/WAITING/BLOCKED line by this agent
+  // We use a generic pattern that matches by agent only
+  const agentDone: FillPattern = { ...fillPatternFor(settings.donePattern, openTask, agent), agent, task: null };
+  const agentWaiting: FillPattern = { ...fillPatternFor(settings.waitingPattern, openTask, agent), agent, task: null };
+  const agentBlocked: FillPattern = { ...fillPatternFor(settings.blockedPattern, openTask, agent), agent, task: null };
+
+  // Find the agent's latest DONE/WAITING/BLOCKED line
+  const last = queue.lastOf<"done" | "waiting" | "blocked">(
+    [
+      { kind: "done", pattern: agentDone },
+      { kind: "waiting", pattern: agentWaiting },
+      { kind: "blocked", pattern: agentBlocked },
+    ],
+    mark,
+    until,
+  );
+  if (!last) return null;
+
+  // Extract what task it names
+  const reportedTask = extractReportedTask(last.line);
+  if (!reportedTask || reportedTask === openTask) return null;
+
+  return { kind: last.kind, reportedTask, line: last.line };
 }
 
 /** How a run ended by its own queue line: DONE, WAITING or BLOCKED, and the line as written (data, never a prompt). */
@@ -808,6 +874,10 @@ export class AgentsFill {
   private lineGone = new Map<string, number>();
   /** When fill last saw a waiting run's gate in the gate queue (task|run -> time); the store keeps the first and last sightings */
   private lastQueued = new Map<string, number>();
+  /** Unmatched reports at the last check: reports naming a different task than the agent's open task */
+  private unmatchedReports: FillUnmatchedReportView[] = [];
+  /** When a notice was last raised for an agent's unmatched report (agent -> time); one per agent per hour */
+  private unmatchedNoticeAt = new Map<string, number>();
 
   constructor(private options: AgentsFillOptions) {}
 
@@ -834,6 +904,7 @@ export class AgentsFill {
       lastCheck: this.lastCheck === null ? null : iso(this.lastCheck),
       lastError: this.lastError,
       lines: this.lines,
+      unmatchedReports: this.unmatchedReports,
     };
   }
 
@@ -971,6 +1042,7 @@ export class AgentsFill {
     let noCapacity: string | null = null;
     this.waitingSeen.clear();
     const views: FillLineView[] = [];
+    const unmatchedThisCheck: FillUnmatchedReportView[] = [];
     const seen = new Set<string>();
     /** The keys of the decisions that the holds of this check stand on (fill's own, or a run's escalation) */
     const wanted = new Set<string>();
@@ -1119,6 +1191,22 @@ export class AgentsFill {
         );
         show("done", `done: ${oneLine(done)}`, latest?.id ?? null);
         continue;
+      }
+
+      // In task_id mode: check for unmatched reports (DONE line naming a different task)
+      if (settings.doneMatch === "task_id" && latest && latest.state === "completed") {
+        const unmatched = findUnmatchedReport(queue, settings, agent, task, latest.queueMark, until);
+        if (unmatched) {
+          await this.recordUnmatchedReport(agent, task, unmatched, latest.id, now);
+          unmatchedThisCheck.push({
+            agent,
+            openTask: task,
+            reportedTask: unmatched.reportedTask,
+            kind: unmatched.kind,
+            line: oneLine(unmatched.line, 300),
+            at: iso(now),
+          });
+        }
       }
 
       // The owner chose to leave it: nothing waits for them, and nothing starts until they release it
@@ -1350,6 +1438,17 @@ export class AgentsFill {
         await hold("prompt", prompt.reason);
         continue;
       }
+
+      // Add a data line if the previous run had an unmatched report
+      let promptText = prompt.text;
+      if (latest && settings.doneMatch === "task_id") {
+        const unmatchedEvent = store.listEvents(project, { kinds: ["fill_unmatched"], task, runId: latest.id, limit: 1 })[0];
+        if (unmatchedEvent && typeof unmatchedEvent.data?.reportedTask === "string") {
+          const reportedTask = unmatchedEvent.data.reportedTask;
+          promptText = `${prompt.text}\n\n---\nYour previous run reported ${reportedTask}; your task is ${task}.\n---`;
+        }
+      }
+
       if (settings.capacityCmd) {
         const reason = await this.capacity(settings.capacityCmd, signal);
         if (signal.aborted) break;
@@ -1362,7 +1461,7 @@ export class AgentsFill {
 
       let run: AgentRunView;
       try {
-        run = await this.options.requestRun({ agent, task, prompt: prompt.text });
+        run = await this.options.requestRun({ agent, task, prompt: promptText });
       } catch (e) {
         const why = message(e);
         if (why.startsWith("Over budget")) {
@@ -1403,7 +1502,69 @@ export class AgentsFill {
     }
     // A check cut short saw only some lines: what it didn't see may still be held
     if (!signal.aborted) await this.withdrawLifted(views, wanted);
+    // Update the unmatched reports view (only from complete checks)
+    if (!signal.aborted) this.unmatchedReports = unmatchedThisCheck;
     return views;
+  }
+
+  /**
+   * Record an unmatched report: a DONE/WAITING/BLOCKED line that named a task
+   * other than the agent's open task. Stores a fill_unmatched event and raises
+   * one notice per agent per hour.
+   */
+  private async recordUnmatchedReport(
+    agent: string,
+    openTask: string,
+    unmatched: UnmatchedReport,
+    runId: string,
+    now: number,
+  ): Promise<void> {
+    const { probes } = this.options;
+    // Record the event
+    await this.options.record(
+      "fill_unmatched",
+      {
+        agent,
+        task: openTask,
+        runId,
+        summary: `fill: ${agent} reported ${unmatched.kind.toUpperCase()} for ${unmatched.reportedTask}, not its open task ${openTask}`,
+        evidence: [unmatched.line],
+        data: {
+          kind: unmatched.kind,
+          reportedTask: unmatched.reportedTask,
+          openTask,
+          line: unmatched.line,
+        },
+        dedupeKey: `fill_unmatched:${openTask}:${runId}:${unmatched.kind}:${unmatched.reportedTask}`,
+      },
+      probes.clock.now(),
+    );
+
+    // One notice per agent per hour
+    const lastNotice = this.unmatchedNoticeAt.get(agent) ?? 0;
+    if (now - lastNotice >= 3600_000) {
+      this.unmatchedNoticeAt.set(agent, now);
+      // The notice is a recorded event with a distinctive summary (the Health view reads it)
+      await this.options.record(
+        "fill_unmatched",
+        {
+          agent,
+          task: openTask,
+          runId,
+          summary: `NOTICE: ${agent} reported ${unmatched.kind.toUpperCase()} for ${unmatched.reportedTask}, which is not its open task ${openTask}`,
+          evidence: [unmatched.line],
+          data: {
+            kind: unmatched.kind,
+            reportedTask: unmatched.reportedTask,
+            openTask,
+            line: unmatched.line,
+            notice: true,
+          },
+          dedupeKey: `fill_unmatched_notice:${agent}:${Math.floor(now / 3600_000)}`,
+        },
+        probes.clock.now(),
+      );
+    }
   }
 
   /**

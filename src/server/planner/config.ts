@@ -300,7 +300,7 @@ export interface PlannerSettings {
   /** agents.fill.agents: the agents proposals may name */
   allowlist: string[];
   /** agents.fill's done, waiting and blocked patterns (fill's done check reads them) */
-  fillPatterns: { donePattern: string; waitingPattern: string; blockedPattern: string };
+  fillPatterns: { donePattern: string; waitingPattern: string; blockedPattern: string; doneMatch: "task_id" | "agent_legacy" };
   /** Fill's patterns match by agent: one open line per agent, as fill parses the file */
   onePerAgent: boolean;
   /** agents.fill.enabled: fill runs the allowlisted agents' lines (and holds their BLOCKED runs for the owner) */
@@ -391,6 +391,7 @@ export function parsePlannerConfig(raw: unknown, project: ProjectConfig): Planne
     donePattern: fill?.donePattern ?? DEFAULT_DONE_PATTERN,
     waitingPattern: fill?.waitingPattern ?? DEFAULT_WAITING_PATTERN,
     blockedPattern: fill?.blockedPattern ?? DEFAULT_BLOCKED_PATTERN,
+    doneMatch: fill?.doneMatch ?? "task_id" as const,
   };
   const known = knownDragonIds(project);
   let agent: PlannerAgentSettings | null = null;

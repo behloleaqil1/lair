@@ -191,6 +191,38 @@ describe("the deterministic part", () => {
     expect(h.service.status().lastError).toContain("is a symlink");
     expect(readFileSync(real, "utf-8")).toBe("worker-a|Alice|feat-login|Login\n");
   });
+
+  it("with done_match task_id (default), a DONE line naming another task does not mark the open task done", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    // done_match defaults to task_id in fill config
+    const h = await setup(p, plannerBlock(p, { agent: undefined }));
+    await h.service.cycle();
+
+    // A DONE line for a DIFFERENT task
+    queue(p, "- DONE old-task by worker-a 12:05Z: merged");
+    await h.service.cycle();
+
+    // The task is NOT marked done: the DONE line named a different task
+    expect(taskIds(h)).toEqual(["feat-login"]);
+    expect(history(h)).toEqual([]);
+  });
+
+  it("with done_match task_id, a DONE line naming the correct task marks it done", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    const h = await setup(p, plannerBlock(p, { agent: undefined }));
+    await h.service.cycle();
+
+    // A DONE line for the correct task
+    queue(p, "- DONE feat-login by worker-a 12:05Z: merged");
+    await h.service.cycle();
+
+    // The task is marked done
+    expect(taskIds(h)).toEqual([]);
+    expect(history(h)).toHaveLength(1);
+    expect(history(h)[0]).toMatchObject({ op: "mark_done", task: "feat-login" });
+  });
 });
 
 // ============ TRIGGERS AND PLANNER RUNS ============
