@@ -21,6 +21,23 @@ const laneName = z.string().regex(LANE, "lane names use a letter, then letters, 
 const name = z.string().regex(NAME, "names use a letter, then letters, digits, '_' or '-' (at most 32)");
 const pattern = z.string().min(1).max(MAX_PATTERN);
 
+const OnDemandSchema = z
+  .object({
+    /** Prints running|stopped|pending|stopping */
+    state_cmd: argv,
+    /** Exit 0 + stdout starting with "guard: ok" = a start is allowed */
+    guard_cmd: argv,
+    /** Added to the estimate while the machine is not running (seconds) */
+    boot_seconds: z.number().int().min(0).max(3600).default(150),
+    /** Shown in the UI; used as a tie-break */
+    cost_per_hour: z.number().min(0).max(1000).optional(),
+    /** How often state/guard run at most (seconds); the guard may read paid APIs, so cache it */
+    check_seconds: z.number().int().min(10).max(3600).default(300),
+    /** Speed factor for this machine vs others when no history exists (default 1.0) */
+    speed_factor: z.number().min(0.1).max(10).default(1.0),
+  })
+  .strict();
+
 const MachineSchema = z
   .object({
     /** Exit 0 (and, with `expect`, stdout starting with it) means the machine answers */
@@ -30,6 +47,8 @@ const MachineSchema = z
     load_cmd: argv.optional(),
     cpus: z.number().int().min(1).max(4096).optional(),
     min_up_seconds: z.number().int().min(0).max(86_400).default(240),
+    /** On-demand machine: Lair tracks its state and considers it for placement even when stopped */
+    on_demand: OnDemandSchema.optional(),
   })
   .strict();
 
@@ -42,6 +61,17 @@ const LaneSchema = z
     serves: z.array(laneName).max(16).default([]),
     /** A pseudo-lane takes only jobs at this priority or more urgent */
     max_priority: z.number().int().min(0).max(999_999_999).optional(),
+  })
+  .strict();
+
+const RoutingSchema = z
+  .object({
+    /** Lanes to overflow to when this lane has waiting jobs */
+    overflow_to: z.array(laneName).max(16).default([]),
+    /** Move to overflow lanes when they finish sooner */
+    prefer_when_faster: z.boolean().default(false),
+    /** Minimum gain in seconds to justify a prefer_when_faster move (default from placement) */
+    min_gain_seconds: z.number().int().min(0).max(86_400).optional(),
   })
   .strict();
 
@@ -65,6 +95,7 @@ export const PlacementSchema = z
     command_timeout_seconds: z.number().int().min(1).max(600).default(60),
     machines: z.record(name, MachineSchema).default({}),
     lanes: z.record(laneName, LaneSchema).default({}),
+    routing: z.record(laneName, RoutingSchema).default({}),
     classes: z.record(name, z.array(pattern).min(1).max(32)).default({}),
     eligible: z.record(laneName, z.array(name).max(64)).default({}),
     prefer_quiet: z.array(pattern).max(32).default([]),
@@ -82,6 +113,15 @@ export const PlacementSchema = z
   })
   .strict();
 
+export interface OnDemandSettings {
+  stateCmd: string[];
+  guardCmd: string[];
+  bootSeconds: number;
+  costPerHour?: number;
+  checkSeconds: number;
+  speedFactor: number;
+}
+
 export interface MachineSettings {
   id: string;
   probe: string[];
@@ -89,6 +129,16 @@ export interface MachineSettings {
   loadCmd?: string[];
   cpus?: number;
   minUpSeconds: number;
+  onDemand?: OnDemandSettings;
+}
+
+export interface RoutingSettings {
+  /** Lanes to overflow to when this lane has waiting jobs */
+  overflowTo: string[];
+  /** Move to overflow lanes when they finish sooner */
+  preferWhenFaster: boolean;
+  /** Minimum gain in seconds to justify a prefer_when_faster move */
+  minGainSeconds?: number;
 }
 
 export interface LaneSettings {
@@ -100,6 +150,8 @@ export interface LaneSettings {
   maxPriority?: number;
   /** The classes this lane can run (eligible.<lane>) */
   eligible: string[];
+  /** Routing settings for this lane */
+  routing: RoutingSettings;
 }
 
 export interface ClassSettings {
@@ -234,10 +286,21 @@ export function parsePlacementConfig(raw: unknown): ParseResult {
     loadCmd: m.load_cmd,
     cpus: m.cpus,
     minUpSeconds: m.min_up_seconds,
+    onDemand: m.on_demand
+      ? {
+          stateCmd: m.on_demand.state_cmd,
+          guardCmd: m.on_demand.guard_cmd,
+          bootSeconds: m.on_demand.boot_seconds,
+          costPerHour: m.on_demand.cost_per_hour,
+          checkSeconds: m.on_demand.check_seconds,
+          speedFactor: m.on_demand.speed_factor,
+        }
+      : undefined,
   }));
   const machineIds = new Set(machines.map((m) => m.id));
 
   const lanes: LaneSettings[] = [];
+  const laneNames = new Set(Object.keys(value.lanes));
   for (const [laneId, lane] of Object.entries(value.lanes)) {
     if (!machineIds.has(lane.machine)) {
       errors.push(`placement.lanes.${laneId}.machine: ${lane.machine} is not in placement.machines`);
@@ -254,6 +317,15 @@ export function parsePlacementConfig(raw: unknown): ParseResult {
     if (lane.max_priority !== undefined && lane.serves.length === 0) {
       errors.push(`placement.lanes.${laneId}.max_priority: only a lane with serves takes jobs by priority`);
     }
+    const routing = value.routing[laneId] ?? { overflow_to: [], prefer_when_faster: false };
+    for (const target of routing.overflow_to) {
+      if (!laneNames.has(target)) {
+        errors.push(`placement.routing.${laneId}.overflow_to: ${target} is not in placement.lanes`);
+      }
+      if (target === laneId) {
+        errors.push(`placement.routing.${laneId}.overflow_to: a lane can't overflow to itself`);
+      }
+    }
     lanes.push({
       name: laneId,
       machine: lane.machine,
@@ -262,7 +334,18 @@ export function parsePlacementConfig(raw: unknown): ParseResult {
       serves: lane.serves,
       maxPriority: lane.max_priority,
       eligible: value.eligible[laneId] ?? [],
+      routing: {
+        overflowTo: routing.overflow_to,
+        preferWhenFaster: routing.prefer_when_faster,
+        minGainSeconds: routing.min_gain_seconds,
+      },
     });
+  }
+  // Validate routing targets that reference lanes not yet parsed
+  for (const [laneId, routing] of Object.entries(value.routing)) {
+    if (!laneNames.has(laneId)) {
+      errors.push(`placement.routing.${laneId}: ${laneId} is not in placement.lanes`);
+    }
   }
   for (const [laneId, list] of Object.entries(value.eligible)) {
     if (!value.lanes[laneId]) errors.push(`placement.eligible.${laneId}: ${laneId} is not in placement.lanes`);
