@@ -23,6 +23,9 @@ import { join } from "path";
 import type { EventBus } from "../core/event-bus.js";
 import type { ProjectConfig } from "../../shared/types.js";
 import type {
+  OnDemandAvailability,
+  OnDemandPowerState,
+  OnDemandStatus,
   PlacementAdvice,
   PlacementDuration,
   PlacementJob,
@@ -37,11 +40,12 @@ import {
   buildMoveArgv,
   parsePlacementConfig,
   type MachineSettings,
+  type OnDemandSettings,
   type PlacementSettings,
 } from "./config.js";
 import { classify, readQueue, type QueueJob } from "./queue.js";
 import { SampleIndex, readResult, readRunnerLog, runnerLogPath } from "./history.js";
-import { decide, planAll, servingLane, type Candidate, type DurationFn, type ModelJob, type ModelLane, type Plan } from "./estimate.js";
+import { decide, isLaneAvailable, planAll, servingLane, type Candidate, type DurationFn, type ModelJob, type ModelLane, type Plan } from "./estimate.js";
 import { PlacementStore, moveForApi, type Sample, type StoredMove } from "./store.js";
 import { systemPlacementProbes, type CommandOutput, type PlacementProbes } from "./probes.js";
 
@@ -66,6 +70,17 @@ const OUTPUT_TAIL = 500;
 /** Moves shown in the status */
 const RECENT_MOVES = 20;
 
+interface OnDemandRuntime {
+  /** The power state from state_cmd */
+  powerState: OnDemandPowerState;
+  /** Whether the guard allows starting */
+  guardOk: boolean;
+  /** Why unavailable, when it is */
+  unavailableReason: string | null;
+  /** When state and guard were last checked */
+  lastCheckAt: number | null;
+}
+
 interface MachineRuntime {
   state: PlacementMachineState;
   passingSince: number | null;
@@ -75,6 +90,8 @@ interface MachineRuntime {
   lastError: string | null;
   load: number | null;
   cpus: number | null;
+  /** On-demand state, when configured */
+  onDemand: OnDemandRuntime | null;
 }
 
 interface Snapshot {
@@ -169,6 +186,14 @@ export class Placement {
         lastError: null,
         load: null,
         cpus: m.cpus ?? null,
+        onDemand: m.onDemand
+          ? {
+              powerState: "unknown",
+              guardOk: false,
+              unavailableReason: "not yet checked",
+              lastCheckAt: null,
+            }
+          : null,
       });
     }
   }
@@ -224,6 +249,118 @@ export class Placement {
         await this.updateMachine(m, probe, load, now);
       }),
     );
+  }
+
+  /**
+   * Check on-demand machines' state and guard, respecting check_seconds.
+   * This runs after probeMachines; an on-demand machine that is running
+   * and up still has its on-demand state checked to track when it stops.
+   */
+  private async checkOnDemandMachines(now: number): Promise<void> {
+    const timeoutMs = this.settings.commandTimeoutSeconds * 1000;
+    await Promise.all(
+      this.settings.machines
+        .filter((m) => m.onDemand !== undefined)
+        .map(async (m) => {
+          const rt = this.machines.get(m.id) as MachineRuntime;
+          const od = rt.onDemand;
+          if (!od) return;
+          const settings = m.onDemand as OnDemandSettings;
+
+          // Respect check_seconds: don't check too often
+          if (od.lastCheckAt !== null && now - od.lastCheckAt < settings.checkSeconds * 1000) {
+            return;
+          }
+
+          const [stateResult, guardResult] = await Promise.all([
+            this.run(settings.stateCmd, timeoutMs),
+            this.run(settings.guardCmd, timeoutMs),
+          ]);
+
+          if (this.abort.signal.aborted) return;
+
+          od.lastCheckAt = now;
+
+          // Parse state_cmd output
+          const stateOut = stateResult.stdout.trim().toLowerCase();
+          if (stateResult.code !== 0) {
+            od.powerState = "unknown";
+            od.unavailableReason = `state_cmd failed: ${tail(stateResult.stderr || `exit ${stateResult.code}`)}`;
+            od.guardOk = false;
+          } else if (stateOut.startsWith("running")) {
+            od.powerState = "running";
+            od.unavailableReason = null;
+          } else if (stateOut.startsWith("stopped")) {
+            od.powerState = "stopped";
+            od.unavailableReason = null;
+          } else if (stateOut.startsWith("pending")) {
+            od.powerState = "pending";
+            od.unavailableReason = null;
+          } else if (stateOut.startsWith("stopping")) {
+            od.powerState = "stopping";
+            od.unavailableReason = null;
+          } else {
+            od.powerState = "unknown";
+            od.unavailableReason = `state_cmd returned unknown state: ${stateOut.slice(0, 50)}`;
+          }
+
+          // Parse guard_cmd output: exit 0 + stdout starting with "guard: ok"
+          if (guardResult.code === 0 && guardResult.stdout.trimStart().toLowerCase().startsWith("guard: ok")) {
+            od.guardOk = true;
+          } else if (guardResult.code === 0) {
+            od.guardOk = false;
+            od.unavailableReason = `guard refused: ${tail(guardResult.stdout) || "no reason given"}`;
+          } else {
+            od.guardOk = false;
+            if (!od.unavailableReason) {
+              od.unavailableReason = `guard_cmd failed: ${tail(guardResult.stderr || `exit ${guardResult.code}`)}`;
+            }
+          }
+        }),
+    );
+  }
+
+  /**
+   * Returns the on-demand availability for a machine: available if stopped
+   * and guard ok, unavailable otherwise (with a reason).
+   */
+  private onDemandAvailability(machineId: string): { available: boolean; reason: string | null } {
+    const rt = this.machines.get(machineId);
+    const m = this.settings.machines.find((m) => m.id === machineId);
+    if (!rt?.onDemand || !m?.onDemand) {
+      return { available: false, reason: "not an on-demand machine" };
+    }
+    const od = rt.onDemand;
+    const settings = m.onDemand;
+
+    // Running machines are available via probes, not on-demand
+    if (od.powerState === "running") {
+      return { available: false, reason: "machine is running (use probe state)" };
+    }
+
+    // Stopped + guard ok = available
+    if (od.powerState === "stopped" && od.guardOk) {
+      return { available: true, reason: null };
+    }
+
+    // Otherwise unavailable
+    return {
+      available: false,
+      reason: od.unavailableReason ?? `power state is ${od.powerState}, guard ${od.guardOk ? "ok" : "not ok"}`,
+    };
+  }
+
+  /**
+   * Returns the boot time to add to estimates for an on-demand machine.
+   * Returns 0 if the machine is already running.
+   */
+  private onDemandBootTime(machineId: string): number {
+    const rt = this.machines.get(machineId);
+    const m = this.settings.machines.find((m) => m.id === machineId);
+    if (!rt?.onDemand || !m?.onDemand) return 0;
+    // If running, no boot time
+    if (rt.onDemand.powerState === "running") return 0;
+    return m.onDemand.bootSeconds;
   }
 
   private async updateMachine(
@@ -441,16 +578,26 @@ export class Placement {
   // ============ 4. THE MODEL ============
 
   private model(queue: QueueJob[], now: number): { lanes: ModelLane[]; jobs: ModelJob[] } {
-    const lanes: ModelLane[] = this.settings.lanes.map((l) => ({
-      name: l.name,
-      machine: l.machine,
-      slots: l.slots,
-      limits: l.limits,
-      serves: l.serves,
-      maxPriority: l.maxPriority,
-      eligible: new Set(l.eligible),
-      up: this.machines.get(l.machine)?.state === "up",
-    }));
+    const lanes: ModelLane[] = this.settings.lanes.map((l) => {
+      const rt = this.machines.get(l.machine);
+      const m = this.settings.machines.find((m) => m.id === l.machine);
+      const onDemandAvail = this.onDemandAvailability(l.machine);
+      return {
+        name: l.name,
+        machine: l.machine,
+        slots: l.slots,
+        limits: l.limits,
+        serves: l.serves,
+        maxPriority: l.maxPriority,
+        eligible: new Set(l.eligible),
+        up: rt?.state === "up",
+        overflowTo: l.routing.overflowTo,
+        preferWhenFaster: l.routing.preferWhenFaster,
+        routingMinGainSeconds: l.routing.minGainSeconds,
+        onDemandAvailable: onDemandAvail.available,
+        bootSeconds: this.onDemandBootTime(l.machine),
+      };
+    });
     const runs = new Map(this.store.runs(this.project).map((r) => [r.gateId, r] as const));
     const seen = new Set<string>();
     const jobs: ModelJob[] = [];
@@ -482,7 +629,22 @@ export class Placement {
     if (!lane) return null;
     if (lane.serves.length > 0) return `${job.lane} is a pseudo-lane`;
     const machine = this.machines.get(lane.machine);
-    if (machine?.state !== "up") {
+    const m = this.settings.machines.find((m) => m.id === lane.machine);
+
+    // Check if machine is up or on-demand available
+    const isUp = machine?.state === "up";
+    const onDemandAvail = this.onDemandAvailability(lane.machine);
+
+    if (!isUp && !onDemandAvail.available) {
+      // For on-demand machines that are unavailable, give specific reason
+      if (m?.onDemand && machine?.onDemand) {
+        const od = machine.onDemand;
+        if (od.powerState === "unknown") {
+          return `${lane.machine} state unknown: ${onDemandAvail.reason}`;
+        } else if (!od.guardOk) {
+          return `${lane.machine} guard refused: ${onDemandAvail.reason}`;
+        }
+      }
       return `${lane.machine} is ${machine?.state === "starting" ? "not up long enough yet" : (machine?.state ?? "unknown")}: its own fallback is in charge`;
     }
     const list = attempts.get(job.id) ?? [];
@@ -682,6 +844,11 @@ export class Placement {
     await this.probeMachines(now);
     // Stopping (or reloading): a probe cut short is no evidence, so nothing is decided on it
     if (this.abort.signal.aborted) return summary;
+
+    // Check on-demand machines' state and guard
+    await this.checkOnDemandMachines(now);
+    if (this.abort.signal.aborted) return summary;
+
     let queue = readQueue(probes.files, this.gatesDir, settings);
     if (!this.recovered) {
       this.recoverMoves(queue, now);
@@ -823,6 +990,18 @@ export class Placement {
     return this.settings.machines.map((m) => {
       const rt = this.machines.get(m.id) as MachineRuntime;
       const utilization = this.utilization(m.id);
+      const onDemandStatus: OnDemandStatus | null =
+        rt.onDemand && m.onDemand
+          ? {
+              powerState: rt.onDemand.powerState,
+              availability: this.onDemandAvailability(m.id).available ? "available" : "unavailable",
+              unavailableReason: this.onDemandAvailability(m.id).reason,
+              guardOk: rt.onDemand.guardOk,
+              lastCheckAt: iso(rt.onDemand.lastCheckAt),
+              bootSeconds: m.onDemand.bootSeconds,
+              costPerHour: m.onDemand.costPerHour ?? null,
+            }
+          : null;
       return {
         id: m.id,
         state: rt.state,
@@ -835,6 +1014,7 @@ export class Placement {
         cpus: rt.cpus,
         utilization: utilization === null ? null : Math.round(utilization * 100) / 100,
         factor: Math.round(this.factor(m.id) * 100) / 100,
+        onDemand: onDemandStatus,
       };
     });
   }
