@@ -11,7 +11,7 @@
  * 5. An event for an unknown task or agent is ignored and audited.
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, vi } from "vitest";
-import { BusConsumers, extractBusId, type BusReportEvent, type BusMessageEvent, type BusConsumeMode } from "./consumers.js";
+import { BusConsumers, extractBusId } from "./consumers.js";
 import { EventBus } from "../core/event-bus.js";
 
 describe("BusConsumers", () => {
