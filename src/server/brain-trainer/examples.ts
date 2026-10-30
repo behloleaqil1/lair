@@ -57,7 +57,8 @@ export function exampleFromDecision(d: Decision): Example | null {
   const shape = label === null ? null : shapeOf(d);
   if (shape === null || label === null) return null;
   const answeredAt = d.answeredAt && validTime(d.answeredAt) ? new Date(d.answeredAt).toISOString() : undefined;
-  return { ...shape, label, outcome: "unknown", ...(answeredAt ? { answeredAt } : {}) };
+  // The outcome tracker's verdict (off by default: then there is none and the answer is unknown)
+  return { ...shape, label, outcome: d.outcome ?? "unknown", ...(answeredAt ? { answeredAt } : {}) };
 }
 
 /** An example from a bench case that carries a time (`at`) and maybe an outcome. */

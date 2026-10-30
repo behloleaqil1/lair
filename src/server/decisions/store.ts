@@ -21,13 +21,15 @@ import type {
   DecisionKind,
   DecisionLink,
   DecisionOption,
+  DecisionOutcome,
   DecisionStatus,
 } from "../../shared/decision-types.js";
 import type { ValidRaise } from "./validate.js";
 
 // 2: decisions.raised_via (server | http), for the per-project cap on HTTP callers
 // 3: decisions.attention (action | notice): what needs the owner's answer, and what is for their information
-export const SCHEMA_VERSION = 3;
+// 4: decisions.outcome, outcome_at, outcome_evidence: the outcome tracker's verdict on an answered decision
+export const SCHEMA_VERSION = 4;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS decisions (
@@ -59,7 +61,10 @@ const SCHEMA = `
     delivered_at TEXT,
     delivery_error TEXT,
     raised_via TEXT NOT NULL DEFAULT 'server',
-    attention TEXT NOT NULL DEFAULT 'action'
+    attention TEXT NOT NULL DEFAULT 'action',
+    outcome TEXT,
+    outcome_at TEXT,
+    outcome_evidence TEXT
   );
   CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_open_key_via
     ON decisions(project, source_module, dedupe_key, raised_via) WHERE status = 'open';
@@ -113,6 +118,9 @@ interface DecisionRow {
   delivery_error: string | null;
   raised_via: string;
   attention: string;
+  outcome: string | null;
+  outcome_at: string | null;
+  outcome_evidence: string | null;
 }
 
 /** Open first, by urgency (soonest expiry, then oldest); then the rest, newest first. */
@@ -161,6 +169,16 @@ export interface Closing {
   delivered?: boolean;
 }
 
+function parseEvidence(text: string | null): Decision["outcomeEvidence"] {
+  if (text === null) return {};
+  try {
+    const value: unknown = JSON.parse(text);
+    return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Decision["outcomeEvidence"]) : {};
+  } catch {
+    return {};
+  }
+}
+
 export class DecisionStore {
   private db: Database.Database;
 
@@ -184,6 +202,12 @@ export class DecisionStore {
         // Versions 1 and 2 lack attention: every decision then asked for an answer
         if (version >= 1 && version <= 2) {
           this.db.exec(`ALTER TABLE decisions ADD COLUMN attention TEXT NOT NULL DEFAULT 'action'`);
+        }
+        // Versions 1 to 3 lack the outcome columns
+        if (version >= 1 && version <= 3) {
+          for (const column of ["outcome", "outcome_at", "outcome_evidence"]) {
+            this.db.exec(`ALTER TABLE decisions ADD COLUMN ${column} TEXT`);
+          }
         }
         // One open decision per key and per way in: an HTTP caller's key never stands for a module's own
         this.db.exec(`DROP INDEX IF EXISTS idx_decisions_open_key`);
@@ -414,10 +438,38 @@ export class DecisionStore {
       this.db
         .prepare(
           `UPDATE decisions SET status = 'open', closed_at = NULL, answer_option = NULL, answer_note = NULL,
-             answer_secret_supplied = 0, answered_by = NULL, answered_at = NULL
+             answer_secret_supplied = 0, answered_by = NULL, answered_at = NULL,
+             outcome = NULL, outcome_at = NULL, outcome_evidence = NULL
            WHERE id = ? AND status = 'answered' AND answered_at = ? AND delivered_at IS NULL`,
         )
         .run(id, answeredAt).changes > 0
+    );
+  }
+
+  /** Answered decisions (by a person) with no outcome yet, oldest answer first. */
+  awaitingOutcome(limit: number): Decision[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM decisions d WHERE d.status = 'answered' AND d.outcome IS NULL AND d.answered_by <> 'lair'
+         AND d.answer_option IS NOT NULL ORDER BY d.answered_at, d.rowid LIMIT ?`,
+      )
+      .all(limit) as DecisionRow[];
+    return rows.map((row) => this.toDecision(row));
+  }
+
+  /**
+   * Record the outcome of an answer, once: only while it has none, and only
+   * for the answer made at `answeredAt` (an answer undone and given again is
+   * judged on its own). False when it did not apply.
+   */
+  setOutcome(id: string, answeredAt: string, outcome: DecisionOutcome, at: string, evidence: Record<string, unknown>): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE decisions SET outcome = ?, outcome_at = ?, outcome_evidence = ?
+           WHERE id = ? AND status = 'answered' AND answered_at = ? AND outcome IS NULL`,
+        )
+        .run(outcome, at, JSON.stringify(evidence), id, answeredAt).changes > 0
     );
   }
 
@@ -510,6 +562,9 @@ export class DecisionStore {
       closedAt: row.closed_at ?? undefined,
       deliveredAt: row.delivered_at ?? undefined,
       raisedVia: row.raised_via === "http" ? "http" : "server",
+      ...(row.outcome === "good" || row.outcome === "bad" || row.outcome === "unknown"
+        ? { outcome: row.outcome, outcomeAt: row.outcome_at ?? undefined, outcomeEvidence: parseEvidence(row.outcome_evidence) }
+        : {}),
     };
   }
 }

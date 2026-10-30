@@ -20,6 +20,7 @@ import {
   type Decision,
   type DecisionAnswer,
   type DecisionCounts,
+  type DecisionOutcome,
 } from "../../shared/decision-types.js";
 import type { DecisionStore, ListOptions, RaisedVia } from "./store.js";
 import { SecretStoreUnavailableError, type SecretStore } from "./secrets.js";
@@ -269,6 +270,22 @@ export class DecisionInbox implements DecisionProducer {
 
   counts(project?: string): DecisionCounts {
     return this.store.counts(this.iso(), project);
+  }
+
+  // ============ OUTCOMES (the outcome tracker) ============
+
+  /** Answered decisions with no outcome yet, oldest answer first. */
+  awaitingOutcome(limit: number): Decision[] {
+    return this.store.awaitingOutcome(limit);
+  }
+
+  /**
+   * Record how the answer made at `answeredAt` turned out. Once per answer:
+   * false when it has an outcome already, or the decision was reopened and
+   * answered again since. It changes nothing else about the decision.
+   */
+  recordOutcome(id: string, answeredAt: string, outcome: DecisionOutcome, evidence: Record<string, unknown>): boolean {
+    return this.store.setOutcome(id, answeredAt, outcome, this.iso(), evidence);
   }
 
   // ============ ANSWERS ============

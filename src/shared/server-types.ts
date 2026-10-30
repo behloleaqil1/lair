@@ -208,6 +208,8 @@ export type EventType =
   | "decision.answered"
   | "decision.expired"
   | "decision.withdrawn"
+  // The outcome tracker recorded how an answer turned out (src/server/outcomes/): {decisionId, project, module, optionId, outcome, evidence}
+  | "decision.outcome"
   // Watchdog (src/server/watchdog/)
   | "slo.breached"
   | "slo.recovered"
