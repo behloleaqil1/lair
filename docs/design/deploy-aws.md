@@ -139,6 +139,16 @@ with an `aws sts assume-role` and a `docker run` implementation. Egress: the con
 `egress_network` is configured, a network the owner builds with a proxy that passes only the configured hosts; Lair does
 not run that proxy and does not filter by hostname, so with an `egress_network` the isolation is only as good as that proxy (hostname enforcement: follow-up #203). `host`, `bridge` and `default` are refused, `external_id` is required, and `/status` reports the hosts as declared, not enforced. Off by default; see [configuration](../configuration.md#plan-sandbox).
 
+**As built (PR 3, `src/server/tofu-runner/`):** `TofuRunnerManager` plans and applies through `PlanSandbox` only (the
+sandbox gained `plan(root, { backend, keepPlanFile })` and `apply(root, job)`; both run the same copy, `guardPlan`,
+re-hash and lock-file steps before any credential). State is the S3 backend, `<project>/<env>/terraform.tfstate`, with
+`use_lockfile=true`; the plan role reads it with `-lock=false`, the apply role takes the native lock. A plan with changes is
+stored with the SHA-256 of the plan file and the hash of the code; `apply(planId, hash)` runs only that file, only in
+`act` mode, only when the hash matches the record and the file, only on unchanged code, once. OpenTofu refuses a plan made
+on a changed state. A failed or stale apply is not undone: the plan is spent and the runner re-plans from the new state,
+which needs a new approval. Decision Inbox wiring (the approval that carries the hash) is a later PR; until then the owner
+calls the apply route with the hash. Off by default; see [configuration](../configuration.md#opentofu-runner).
+
 ### 2.3 Cost estimate
 
 Lair runs Infracost on the plan. The estimate shows:

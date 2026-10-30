@@ -42,6 +42,7 @@ import { getEventBus } from "./core/event-bus.js";
 import { WatchdogManager, registerWatchdogRoutes } from "./watchdog/index.js";
 import { DeliveryManager, registerDeliveryRoutes } from "./delivery/index.js";
 import { InfraPolicyManager, registerInfraPolicyRoutes } from "./infra-policy/index.js";
+import { registerTofuRunnerRoutes, TofuRunnerManager } from "./tofu-runner/index.js";
 import { AwsCliIssuer, DockerSpawner, PlanSandboxManager, registerPlanSandboxRoutes, sweepLeftovers } from "./plan-sandbox/index.js";
 import { PipelineManager, registerPipelineRoutes } from "./gates/index.js";
 import { AgentsManager, registerAgentsRoutes, systemAgentProbesWithCache } from "./agents/index.js";
@@ -457,6 +458,14 @@ const planSandbox = new PlanSandboxManager({ spawner: new DockerSpawner(), issue
 planSandbox.load(projectEntries);
 await planSandbox.startupSweep();
 await registerPlanSandboxRoutes(fastify, planSandbox, () => getDefaultProject(), humanAuth);
+
+// OpenTofu runner: plan with the state in S3 and apply an approved plan file
+// with the separate apply role, always through the policy scan and the plan
+// sandbox. One per project with `tofu_runner.enabled: true` (off by default,
+// and `observe` mode does not apply).
+const tofuRunner = new TofuRunnerManager({ sandbox: planSandbox });
+tofuRunner.load(projectEntries);
+await registerTofuRunnerRoutes(fastify, tofuRunner, () => getDefaultProject(), humanAuth);
 
 // AI tools (src/server/ai/): per machine, whether each tool is installed and
 // signed in, and the models it offers, from the tools' own commands (bounded,

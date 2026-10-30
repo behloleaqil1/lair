@@ -12,7 +12,7 @@
  *   6. `tofu init -lockfile=readonly -plugin-dir=...` and `tofu plan` run
  *      in the copy, with an environment of exactly the names in `sandboxEnv`.
  */
-import { mkdtemp, rm } from "fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { InfraPolicy, type InfraPolicyManager } from "../infra-policy/index.js";
@@ -24,7 +24,48 @@ import type { PlanCredentialIssuer, PlanCredentials, SandboxSpawner } from "./ty
 export type PlanOutcome =
   | { status: "refused"; reason: string; message: string; detail?: string[] }
   | { status: "failed"; reason: "init" | "plan" | "timeout" | "output" | "credentials"; message: string; output: string }
-  | { status: "planned"; changes: boolean; output: string; credentialsExpireAt: string };
+  | { status: "planned"; changes: boolean; output: string; credentialsExpireAt: string; codeHash: string; planFile?: Buffer };
+
+export type ApplyOutcome =
+  | { status: "refused"; reason: string; message: string; detail?: string[] }
+  | { status: "failed"; reason: "init" | "apply" | "stale" | "timeout" | "output" | "credentials"; message: string; output: string }
+  | { status: "applied"; output: string };
+
+/** The S3 state of one environment (§1.2); the values are passed to `tofu init` as -backend-config */
+export interface StateBackend {
+  bucket: string;
+  key: string;
+  region: string;
+}
+
+/** Plan with the state read from S3 and the plan written to a file the caller keeps */
+export interface PlanJob {
+  backend?: StateBackend;
+  keepPlanFile?: boolean;
+}
+
+/** Apply exactly this plan file, with this role, on code that still has this hash */
+export interface ApplyJob {
+  backend: StateBackend;
+  roleArn: string;
+  externalId?: string;
+  seconds: number;
+  timeoutSeconds: number;
+  planFile: Buffer;
+  codeHash: string;
+}
+
+const PLAN_FILE = "lair.tfplan";
+const MAX_PLAN_FILE_BYTES = 64 * 1024 * 1024;
+
+function initArgs(backend?: StateBackend): string[] {
+  const args = ["tofu", "init", "-input=false", "-no-color", "-lockfile=readonly", "-plugin-dir=/plugins"];
+  if (backend) {
+    args.push(`-backend-config=bucket=${backend.bucket}`, `-backend-config=key=${backend.key}`, `-backend-config=region=${backend.region}`);
+    args.push("-backend-config=use_lockfile=true", "-backend-config=encrypt=true");
+  }
+  return args;
+}
 
 /** The whole environment of the sandboxed process. Nothing of Lair's own is in it. */
 export function sandboxEnv(creds: PlanCredentials, region: string): Record<string, string> {
@@ -65,9 +106,46 @@ export class PlanSandbox {
   ) {}
 
   /** Plan a configured root of the project's infra_policy. */
-  async plan(root: string): Promise<PlanOutcome> {
+  async plan(root: string, job: PlanJob = {}): Promise<PlanOutcome> {
+    return this.guarded<PlanOutcome>(root, async (copy, copyHash) =>
+      this.run(copy, copyHash, job),
+    );
+  }
+
+  /**
+   * Apply an approved plan file with the apply role (§2.6). The same copy, scan
+   * and lock-file steps as a plan run first, and the code must be the code that
+   * was planned.
+   */
+  async apply(root: string, job: ApplyJob): Promise<ApplyOutcome> {
+    return this.guarded<ApplyOutcome>(root, async (copy, copyHash) => {
+      if (copyHash !== job.codeHash) {
+        return { status: "refused", reason: "code-changed-since-plan", message: "apply: the code is not the code that was planned" };
+      }
+      const session = await this.session(copy, { roleArn: job.roleArn, externalId: job.externalId, seconds: job.seconds, name: "apply", timeoutSeconds: job.timeoutSeconds });
+      if (!session.ok) return { status: "failed", reason: "credentials", message: "apply: the apply role could not be assumed", output: "" };
+      const { step, text } = session;
+      const init = await step(initArgs(job.backend));
+      if (init.outputOverflow) return { status: "failed", reason: "output", message: "apply: init wrote more output than allowed and was stopped", output: text(init) };
+      if (init.timedOut) return { status: "failed", reason: "timeout", message: "apply: init timed out", output: text(init) };
+      if (init.exitCode !== 0) return { status: "failed", reason: "init", message: "apply: init failed", output: text(init) };
+      await writeFile(join(copy, PLAN_FILE), job.planFile, { mode: 0o600 });
+      const applied = await step(["tofu", "apply", "-input=false", "-no-color", "-lock-timeout=60s", PLAN_FILE]);
+      if (applied.outputOverflow) return { status: "failed", reason: "output", message: "apply: apply wrote more output than allowed and was stopped", output: text(applied) };
+      if (applied.timedOut) return { status: "failed", reason: "timeout", message: "apply: apply timed out", output: text(applied) };
+      if (applied.exitCode !== 0) {
+        const out = text(applied);
+        // OpenTofu itself refuses a plan made on a state that has since changed
+        const stale = /saved plan is stale|plan file.*stale/i.test(out);
+        return { status: "failed", reason: stale ? "stale" : "apply", message: stale ? "apply: the state changed since the plan" : "apply: apply failed", output: out };
+      }
+      return { status: "applied", output: text(applied) };
+    });
+  }
+
+  /** Copy, scan, re-hash and lock check; only then `work` runs. Shared by plan and apply. */
+  private async guarded<T extends { status: string }>(root: string, work: (copy: string, copyHash: string) => Promise<T>): Promise<T | { status: "refused"; reason: string; message: string; detail?: string[] }> {
     const { infra } = this.deps;
-    const now = this.deps.now ?? (() => new Date());
     const policy = infra.get(this.project);
     if (!policy || !(policy instanceof InfraPolicy)) {
       return { status: "refused", reason: "scan-required", message: "plan sandbox: the policy scan must be enabled and valid" };
@@ -84,7 +162,7 @@ export class PlanSandbox {
         if (e instanceof SnapshotRefused) return { status: "refused", reason: "unreadable", message: "plan sandbox: root cannot be copied", detail: [e.message] };
         throw e;
       }
-      const guarded = await policy.guardPlan<PlanOutcome>(root, async () => {
+      const guarded = await policy.guardPlan<T | { status: "refused"; reason: string; message: string; detail?: string[] }>(root, async () => {
         if ((await snapshotRoot(root)) !== copyHash) {
           return { status: "refused", reason: "changed", message: "plan sandbox: the code changed during the scan" };
         }
@@ -92,7 +170,7 @@ export class PlanSandbox {
         if (problems.length > 0) {
           return { status: "refused", reason: problems[0]!.rule, message: `plan sandbox: ${problems[0]!.rule}`, detail: problems.map((p) => `${p.rule}: ${p.detail}`) };
         }
-        return this.run(copy, now);
+        return work(copy, copyHash);
       });
       return guarded.status === "refused"
         ? { status: "refused", reason: "policy", message: guarded.message }
@@ -102,19 +180,21 @@ export class PlanSandbox {
     }
   }
 
-  private async run(copy: string, now: () => Date): Promise<PlanOutcome> {
+  /** Credentials of one role and a step runner holding exactly the sandbox environment */
+  private async session(copy: string, role: { roleArn: string; externalId?: string; seconds: number; name: string; timeoutSeconds: number }) {
     const s = this.settings;
+    const now = this.deps.now ?? (() => new Date());
     let creds: PlanCredentials;
     try {
       creds = await this.deps.issuer.issue({
-        roleArn: s.planRoleArn,
-        externalId: s.externalId,
-        sessionName: `lair-plan-${this.project}`.slice(0, 64),
-        seconds: PLAN_ROLE_SECONDS,
+        roleArn: role.roleArn,
+        externalId: role.externalId,
+        sessionName: `lair-${role.name}-${this.project}`.slice(0, 64),
+        seconds: role.seconds,
         region: s.region,
       });
     } catch {
-      return { status: "failed", reason: "credentials", message: "plan sandbox: the plan role could not be assumed", output: "" };
+      return { ok: false as const };
     }
     const secrets = [creds.accessKeyId, creds.secretAccessKey, creds.sessionToken];
     const env = sandboxEnv(creds, s.region);
@@ -128,21 +208,37 @@ export class PlanSandbox {
         pluginDir: s.pluginDir,
         env,
         egress,
-        timeoutMs: Math.max(1000, Math.min(s.timeoutSeconds * 1000, left)),
+        timeoutMs: Math.max(1000, Math.min(role.timeoutSeconds * 1000, left)),
       });
     };
     const text = (r: { stdout: string; stderr: string }) => redact(`${r.stdout}${r.stderr}`, secrets, s.maxOutputBytes);
+    return { ok: true as const, creds, step, text };
+  }
 
-    const init = await step(["tofu", "init", "-input=false", "-no-color", "-lockfile=readonly", "-plugin-dir=/plugins"]);
+  private async run(copy: string, codeHash: string, job: PlanJob): Promise<PlanOutcome> {
+    const s = this.settings;
+    const session = await this.session(copy, { roleArn: s.planRoleArn, externalId: s.externalId, seconds: PLAN_ROLE_SECONDS, name: "plan", timeoutSeconds: s.timeoutSeconds });
+    if (!session.ok) return { status: "failed", reason: "credentials", message: "plan sandbox: the plan role could not be assumed", output: "" };
+    const { creds, step, text } = session;
+
+    const init = await step(initArgs(job.backend));
     if (init.outputOverflow) return { status: "failed", reason: "output", message: "plan sandbox: init wrote more output than allowed and was stopped", output: text(init) };
     if (init.timedOut) return { status: "failed", reason: "timeout", message: "plan sandbox: init timed out", output: text(init) };
     if (init.exitCode !== 0) return { status: "failed", reason: "init", message: "plan sandbox: init failed", output: text(init) };
 
-    const plan = await step(["tofu", "plan", "-input=false", "-no-color", "-lock=false", "-detailed-exitcode"]);
+    const planArgs = ["tofu", "plan", "-input=false", "-no-color", "-lock=false", "-detailed-exitcode"];
+    if (job.keepPlanFile) planArgs.push(`-out=${PLAN_FILE}`);
+    const plan = await step(planArgs);
     if (plan.outputOverflow) return { status: "failed", reason: "output", message: "plan sandbox: plan wrote more output than allowed and was stopped", output: text(plan) };
     if (plan.timedOut) return { status: "failed", reason: "timeout", message: "plan sandbox: plan timed out", output: text(plan) };
     if (plan.exitCode !== 0 && plan.exitCode !== 2) return { status: "failed", reason: "plan", message: "plan sandbox: plan failed", output: text(plan) };
-    return { status: "planned", changes: plan.exitCode === 2, output: text(plan), credentialsExpireAt: creds.expiresAt };
+    const outcome: PlanOutcome = { status: "planned", changes: plan.exitCode === 2, output: text(plan), credentialsExpireAt: creds.expiresAt, codeHash };
+    if (job.keepPlanFile && outcome.changes) {
+      const file = join(copy, PLAN_FILE);
+      if ((await stat(file)).size > MAX_PLAN_FILE_BYTES) return { status: "failed", reason: "output", message: "plan sandbox: the plan file is too large", output: "" };
+      outcome.planFile = await readFile(file);
+    }
+    return outcome;
   }
 
   status() {
@@ -169,6 +265,9 @@ export class BlockedPlanSandbox {
     readonly errors: string[],
   ) {}
   async plan(): Promise<PlanOutcome> {
+    return { status: "refused", reason: "invalid-config", message: "plan sandbox: invalid-config" };
+  }
+  async apply(): Promise<ApplyOutcome> {
     return { status: "refused", reason: "invalid-config", message: "plan sandbox: invalid-config" };
   }
   status() {

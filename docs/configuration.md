@@ -2451,6 +2451,51 @@ Both routes are the owner's (signed in on the dashboard) and get no CORS.
 | `GET /api/plan-sandbox/status?project=` | Whether the sandbox is on or blocked (with the errors), the role, the declared egress hosts (`declaredEgressHosts`, with `egressHostsEnforcedByLair: false`) and the limits; no credential |
 | `POST /api/plan-sandbox/plan?project=&root=` | Plan one of the project's `infra_policy.roots` through the scan and the sandbox; 404 when the sandbox is off, 400 for a root that is not configured. The answer is `refused` (with the reason), `failed` (init, plan, timeout, output or credentials) or `planned` (`changes`, the output, when the credentials expire) |
 
+## OpenTofu runner
+
+Plans and applies infrastructure from the control plane ([design](design/deploy-aws.md#26-apply)). It adds no execution path of its own: every plan and every apply goes through the [policy scan](#infrastructure-policy-scan) and the [plan sandbox](#plan-sandbox) (copy, scan, lock-file check, then credentials), so the project needs both on. Off unless you turn it on; `observe` mode, the default, plans and never applies.
+
+```yaml
+tofu_runner:
+  enabled: true                       # default false
+  mode: observe                       # observe (plan only) or act (apply an approved plan)
+  apply_role_arn: arn:aws:iam::123456789012:role/lair-apply
+  external_id: lair-apply-1
+  state_bucket: lair-state-123456789012
+  environments: [staging, production]
+  plan_dir: /var/lib/lair/tofu-plans
+```
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `enabled` | boolean | `false` | Turn the runner on for this project |
+| `mode` | `observe` or `act` | `observe` | `observe` refuses every apply; `act` applies a plan the owner approved |
+| `apply_role_arn` | IAM role ARN | none | The role `tofu apply` assumes (1 hour); required when enabled and never the plan role (the block is then invalid). Not used for a plan |
+| `external_id` | string | none | Required when enabled: the apply role's external id. Not a secret |
+| `state_bucket` | S3 bucket name | none | Required when enabled. Each environment's state is `<project>/<env>/terraform.tfstate`, with `use_lockfile=true` (OpenTofu 1.8+ native locking, no lock table) and `encrypt=true`; the code declares an empty `backend "s3" {}` and Lair passes these as `-backend-config` |
+| `environments` | list of names | `[]` | The environments that can be planned and applied; at least one when enabled |
+| `plan_dir` | absolute path | none | Where plan files and their records are kept (mode 0600). Required when enabled; keep it outside any repository |
+| `apply_timeout_seconds` | integer | `1800` | 60 to 3600; never longer than the apply role's hour |
+
+**Plan.** The sandbox runs `tofu init` with the S3 backend, then `tofu plan -lock=false -out=lair.tfplan` with the plan role (which reads state, never writes). A plan with changes is kept as `<id>.tfplan` with a record (project, root, environment, the plan file's SHA-256, the hash of the code it was made on). A newer plan of the same root and environment supersedes the older, which can then no longer be applied. A plan with no changes keeps nothing.
+
+**Apply.** Only `act` mode, only a plan that is still `planned`, and only when the hash sent with the approval equals the recorded hash and the file on disk still hashes to it. Then the sandbox repeats copy, scan and lock-file check, refuses when the code is not the code that was planned, and runs `tofu apply lair.tfplan` with the apply role. OpenTofu itself refuses a plan made on a state that has since changed. A plan is applied once; two applies of the same plan at once start one.
+
+**A failed apply is not rolled back.** Resources the apply created or changed stay, and the state records them. The plan is spent (`failed`, or `stale` when the state or code changed), its file removed, and the runner re-plans from the state as it now is; the answer carries that new plan, which needs a new approval. Nothing runs `destroy` on its own. Each outcome is logged with the plan hash and the time.
+
+An invalid block (or an `apply_role_arn` equal to the plan role) never turns the runner off: unless the block says `enabled: false`, every call is refused with `invalid-config` and `status` shows the errors. Lair reads this block at startup.
+
+### OpenTofu runner API
+
+All routes are the owner's (signed in on the dashboard) and get no CORS. A project without `tofu_runner.enabled` answers 404 (400 for a missing or unknown `root`, `env`, `plan` or `hash`).
+
+| Route | Meaning |
+|-------|---------|
+| `GET /api/tofu-runner/status?project=` | On or blocked (with the errors), mode, apply role, bucket, environments; no credential or external id |
+| `GET /api/tofu-runner/plans?project=` | The plan records: id, root, environment, plan hash, status (`planned`, `applying`, `applied`, `failed`, `stale`, `superseded`) and times. Never the plan file |
+| `POST /api/tofu-runner/plan?project=&root=&env=` | Plan one environment of a configured root. `refused`, `failed`, or `planned` (`changes`; with changes also `planId` and `planHash` to approve) |
+| `POST /api/tofu-runner/apply?project=&plan=&hash=` | Apply the plan `plan` whose approved hash is `hash`. `applied`, `refused` (`observe-mode`, `unknown-plan`, `not-approvable`, `hash-mismatch`, `plan-file-changed`, `policy`, ...) or `not-applied` (with `replan`) |
+
 ## Planner
 
 > Off by default. With `enabled: true`, Lair keeps [fill](#fill)'s tasks file itself: it marks tasks done, drops the ones the plan marks done, and runs a supervised planner agent when something happens, whose proposals it checks before anything changes ([design](design/planner.md)). A project then needs no free-running orchestrator agent that edits the tasks file.
