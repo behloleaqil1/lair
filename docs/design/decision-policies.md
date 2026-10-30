@@ -86,8 +86,8 @@ Today the evidence is prose in `context` and the option list carries free-text l
   "class": "agents.provider_limit",
   "evidence": {
     "code": "provider_rate_limit",
-    "facts": {"agent": "kiro-N", "profiles_failing": 2, "attempts": 3,
-              "limit_resets_at": "2026-10-31T00:00:00Z", "task": "launch-metrics"},
+    "facts": {"agent": "agent-a", "profiles_failing": 2, "attempts": 3,
+              "limit_resets_at": "2026-10-31T00:00:00Z", "task": "task-42"},
     "cause_cleared": false,
     "linked_issue": null
   },
