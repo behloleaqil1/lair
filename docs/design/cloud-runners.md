@@ -162,7 +162,11 @@ cloud:
 2. **Lifecycle:** start on demand, idle stop with retries, the self power-off install, quota and spend Decisions.
 3. **Phase A execution:** the `cloud` executor for pipelines (bare repository push, per-job folders, remote build and
    test steps, results back, infrastructure retry).
-4. **Placement and routing:** cloud machines as placement machines with overflow rules for external gate queues.
+4. **Placement and routing (external phase, built):** cloud machines as placement machines with overflow rules for
+   external gate queues. The external phase uses project commands (`state_cmd`, `guard_cmd`) and the project's runner
+   starts the machine; Lair does not call AWS directly yet. Configuration: `placement.machines.<id>.on_demand` with
+   `state_cmd`, `guard_cmd`, `boot_seconds`, `cost_per_hour`, `check_seconds`; `placement.routing.<lane>` with
+   `overflow_to`, `prefer_when_faster`, `min_gain_seconds`. See docs/configuration.md Placement.
 5. **Slots and remote scans:** parallel slots with the memory rules; container scanners and hooks on the machine.
 6. **Setup wizard** in Settings (§8).
 7. **Phase B:** lair-node on cloud machines.

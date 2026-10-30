@@ -2153,6 +2153,20 @@ Machine options:
 | `load_cmd` | array | — | Argv that prints the 1-minute load first and the cpu count last. Over SSH, the remote command is one string the remote shell parses |
 | `cpus` | number | — | The cpu count, instead of the one `load_cmd` prints |
 | `min_up_seconds` | number | `240` | Passing probes needed in a row before the machine counts as up (`0` for the machine Lair runs on) |
+| `on_demand` | object | — | On-demand machine settings (see below) |
+
+On-demand machine options (the `on_demand` block):
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `state_cmd` | array | — | Argv that prints the machine's power state: `running`, `stopped`, `pending`, or `stopping` |
+| `guard_cmd` | array | — | Argv that exits 0 with output starting `guard: ok` when starting the machine is allowed |
+| `boot_seconds` | number | `150` | Seconds added to estimates while the machine is not running |
+| `cost_per_hour` | number | — | Displayed cost; used as a tie-break between equally fast on-demand machines |
+| `check_seconds` | number | `300` | Minimum seconds between state and guard checks (the guard may call paid APIs) |
+| `speed_factor` | number | `1.0` | Speed multiplier for estimates when no history exists for this machine |
+
+An on-demand machine is **available** when its `state_cmd` prints `stopped` and its `guard_cmd` passes (exit 0 + `guard: ok`). Available machines are considered for placement even though their probes fail: they will start when the project's runner sees a job land in their lane. The `boot_seconds` is added to every estimate on an on-demand machine that is not yet running.
 
 Lane options:
 
@@ -2163,6 +2177,58 @@ Lane options:
 | `limits` | map | `{}` | Class → at most this many running at once in the lane (`0`: the lane never runs that class, so placement moves such a job to a lane that does) |
 | `serves` | array | `[]` | A pseudo-lane: the lanes whose queues its runner takes jobs from |
 | `max_priority` | number | — | A pseudo-lane takes only jobs at this priority digit or lower |
+
+Routing options (the `routing` block, per lane):
+
+```yaml
+routing:
+  heavy:
+    overflow_to: [aws]
+    prefer_when_faster: true
+    min_gain_seconds: 300
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `overflow_to` | array | `[]` | Lanes to move jobs to when they have a free slot. Use for on-demand overflow |
+| `prefer_when_faster` | boolean | `false` | Move jobs to overflow lanes when they finish sooner (including boot time) |
+| `min_gain_seconds` | number | — | Minimum time saved to justify a `prefer_when_faster` move (defaults to the global `min_gain_seconds`) |
+
+**On-demand routing example:**
+
+```yaml
+placement:
+  machines:
+    workstation:
+      probe: ["true"]
+      min_up_seconds: 0
+    aws:
+      probe: ["ssh", "aws-gate", "echo", "ok"]
+      expect: "ok"
+      on_demand:
+        state_cmd: ["/path/to/aws-gate.sh", "state"]   # prints running|stopped|pending|stopping
+        guard_cmd: ["/path/to/aws-gate.sh", "guard"]   # exit 0 + "guard: ok" = start allowed
+        boot_seconds: 150
+        cost_per_hour: 0.35
+        check_seconds: 300
+  lanes:
+    heavy: { machine: workstation, slots: 1 }
+    aws: { machine: aws, slots: 2, limits: { big: 1 } }
+  routing:
+    heavy:
+      overflow_to: [aws]
+      prefer_when_faster: true
+      min_gain_seconds: 300
+  eligible:
+    heavy: [small, big]
+    aws: [small, big]
+```
+
+With this configuration:
+- Jobs in `heavy` overflow to `aws` when AWS has a free slot and the guard allows starting.
+- With `prefer_when_faster: true`, a job moves to AWS when it would finish at least 5 minutes sooner there (including the 150-second boot time).
+- If the AWS guard refuses (cost limit, quota), jobs stay in `heavy`.
+- The Machines view shows AWS's power state (`running`, `stopped`, etc.), guard status, and availability.
 
 Unknown keys, a lane on an unknown machine, an unknown class in `limits` or `eligible`, an invalid pattern, an unknown placeholder in `move_cmd`, or `mode: act` without `move_cmd` are config errors: the project's placement does not start, and `GET /api/placement/status` shows the errors.
 
