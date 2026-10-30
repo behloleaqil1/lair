@@ -40,11 +40,11 @@ A task is a unit of work an agent can claim and complete.
 
 ```typescript
 interface Task {
-  id: string;                   // Unique id, 1-128 chars, [a-z0-9-], no leading dash
+  id: string;                   // Valid per isValidTaskId (agents module), see the id rule below
   project: string;              // Project this task belongs to
   title: string;                // Short description, max 200 chars
-  state: TaskState;             // See 1.2 below
-  agent: string | null;         // Assigned agent id, or null if unassigned
+  state: TaskState;             // See 2.1; `assigned` and `running` are derived, see 1.5
+  agent: string | null;         // Intended assignee (today's agent column). NEVER the holder, see 1.5
   priority: number;             // 1-999, lower = higher priority
   tier: RiskTier;               // red, amber, green
   source: TaskSource;           // Where this task came from
@@ -75,6 +75,12 @@ interface ExternalRef {
   url: string;
 }
 ```
+
+**One id rule.** There is one task-id rule in Lair: `isValidTaskId` from the agents module, which wraps
+`TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._/#:-]{0,127}$/` (`agents/types.ts`). Fill, the planner's proposals and the
+queue matching already enforce it, so ids such as `Feat-1.2` or `area/topic#3` exist in real task files. The store,
+the routes and the importer call that function; none defines its own pattern. (Ids contain `/`: route handlers
+URL-decode `:id` and the store treats it as an opaque string.)
 
 ### 1.2 Task events
 
@@ -133,18 +139,42 @@ current when their run started.
 
 ### 1.4 Messages
 
-The bus store (`src/server/bus/store.ts`) already holds messages. This design does not move them: messages stay in
-the bus store. The work store holds task-related data; the bus holds communication.
+**Options.**
 
-### 1.5 Relations to existing stores
+| Option | For | Against |
+|---|---|---|
+| A. Leave messages in the bus store (recommended) | Already built, with unread tracking and the per-run token model; no migration; the bus keeps working in `files` mode | The task page joins two stores by task id |
+| B. Copy messages into the work store | One query for the task page | Two copies to keep equal; bus 2a's consumers read the bus store |
+| C. Move messages into the work store | One store | Breaks every bus consumer and the mirror; the bus must then depend on the work store |
+
+Recommendation: A. The work store holds task data; the bus holds communication. The task page reads the task's
+messages from the bus store by task id (read-only join in the route, not in SQL).
+
+### 1.5 Relations to existing stores, and who holds a task
+
+**`agents_claims` is the ONE source of truth for who holds a task** (`bus/service.ts`: "Claims have ONE source of
+truth: the agents module's claims"). The work store never copies holder state:
+
+- `task.agent` is the *intended* assignee: the same meaning as the agent column in today's tasks file. It says who
+  should take the task, not who has it.
+- The store keeps no run id and no holder column. `assigned` and `running` are *derived at read time* by joining
+  the agents module's claims (`getClaimedTask`, `getAllClaims`), as the bus board does. A task whose stored state is
+  `ready` and that has an active claim is shown as `running`; the stored value moves only for facts the work store
+  owns (see 2.1).
+- A report is bound by `getClaimedTask(binding.runId) === taskId`, exactly as `BusService.report` does today. The
+  work route reuses that check; it has no check of its own.
+- A claim that is released (`POST /api/agents/claims/release`, which fill already reads as `claim_released`), lost,
+  or replaced after its owner died (failover, restart adoption) produces a task event written by the agents module
+  through the producer interface, and the task goes back to `ready` (or `blocked` when the reason is a block) with
+  that reason in the event. A claim replaced by failover changes the derived holder with no write to the task row.
 
 | Store | What it holds | How work store relates |
 |---|---|---|
-| agents | Runs, claims, events, usage | Tasks reference runs by `runId`; claims reference tasks by `taskId` |
-| planner | Runs, proposals, changes | Proposals create/modify tasks via the work store interface |
-| decisions | Owner decisions, blocks | A decision can block a task (existing `blocks[]` references `task:<id>`) |
-| bus | Messages, reports, tokens | Reports reference tasks; work store subscribes to `report` events |
-| review | Reviews, tiers, policy | Reviews reference tasks by their PR; work store stores `tier` on tasks |
+| agents | Runs, claims, events, usage | Source of truth for holders. Tasks reference nothing of it; the join is by `taskId` at read time |
+| planner | Runs, proposals, changes | Proposals create/modify tasks via the producer interface (4.3) |
+| decisions | Owner decisions, blocks | Fill blocks on `agents:<project>:task:<task>` (`fill.ts`). The work store defines no second key: it looks up that one |
+| bus | Messages, reports, tokens | Reports reference tasks; the store consumes the bus's report events; messages stay there (1.4) |
+| review | Reviews, tiers, policy | Reviews reference tasks by their PR; the store keeps `tier` on tasks |
 | triage | Gate results, classification | Triage events can update task state |
 
 ## 2. States and workflow
@@ -174,16 +204,35 @@ Transitions:
 | From | To | Who | When |
 |---|---|---|---|
 | open | ready | system | All dependencies are done |
-| ready | assigned | fill | Agent assigned |
-| assigned | running | agents | Run started |
+| ready | assigned | fill | Fill claimed the task for a run (derived from the claim, 1.5) |
+| assigned | running | agents | Run started (derived from the claim) |
 | running | waiting | agent | Reports `WAITING` with gate |
 | waiting | running | system | Gate result received |
 | running | blocked | agent | Reports `BLOCKED` |
-| blocked | running | owner/planner | Unblocked |
+| blocked | ready | owner/planner | Unblocked; fill picks it up again |
 | running | in_review | agent | Reports `DONE` with PR |
 | in_review | done | review/merge | PR merged |
+| assigned/running/waiting | ready | agents (claim released, lost or replaced) | The claim is gone, reason in the event |
 | * | dropped | owner | Owner drops the task |
 | dropped/done | open | owner | Owner reopens |
+
+`assigned` and `running` are the two states the work store does not own: they follow the claim. The stored state
+stays `ready` until the claim exists, and the read model shows the derived state. Every other state is stored.
+
+**Required fields per state** (checked on the transition; a missing field refuses it with a named error):
+
+| State | Required |
+|---|---|
+| `open` | `title`, `source` |
+| `ready` | `open` requirements, every dependency `done`, `briefId` (a brief, even a one-line one, exists) |
+| `waiting` | `gateId` (the gate the run waits on) |
+| `blocked` | `blockedReason` (non-empty, 1-500 chars) |
+| `in_review` | `pr` (number) and `sha` |
+| `done` | `pr` and `sha` when the task came from a PR flow; for tasks closed by the owner, an `owner` actor and a reason |
+| `dropped` | a reason (1-500 chars) and an `owner` or `planner` actor |
+
+The required values live on the transition's event payload and are copied to the task row only where the model has
+a column (`blocked_reason`).
 
 ### 2.2 Configurable per project
 
@@ -196,18 +245,22 @@ work_store:
       transitions: [ready, dropped]
     ready:
       transitions: [assigned, dropped]
-    assigned:
-      transitions: [running, dropped]
+      required: [briefId]
+    assigned:  # derived from the claim, never written by callers
+      transitions: [running, ready, dropped]
       wip_limit: 1  # Per agent
-    running:
-      transitions: [waiting, blocked, in_review]
+    running:   # derived from the claim
+      transitions: [waiting, blocked, in_review, ready]
     waiting:
-      transitions: [running, blocked]
+      transitions: [running, blocked, ready]
+      required: [gateId]
       timeout_minutes: 60
     blocked:
-      transitions: [running, dropped]
+      transitions: [ready, dropped]
+      required: [blockedReason]
     in_review:
       transitions: [done, running, dropped]  # running = fix requested
+      required: [pr, sha]
     done:
       terminal: true
       transitions: [open]  # reopen
@@ -220,9 +273,14 @@ work_store:
     ready_to_assigned: [fill, owner]
     assigned_to_running: [agents]
     running_to_blocked: [agents]
-    blocked_to_running: [owner, planner]
+    blocked_to_ready: [owner, planner]
     '*_to_dropped': [owner]
 ```
+
+Callers named in `transitions` are modules, each with one producer interface (4.3): `fill` and `agents` write
+claim-related facts through the agents module's interface, `planner` through `WorkStoreProducer`, `review/merge`
+through a `ReviewProducer` (`markInReview`, `markMerged`). The role names are checked against the route-derived
+actor (7.2), never against a field the caller sends.
 
 ## 3. Storage
 
@@ -547,9 +605,11 @@ work_store:
 
 ### 7.1 Agents are untrusted
 
-- An agent's report is bound to the task its run holds. It cannot report for another task, even if it knows
-  the id.
-- The bus token is scoped to one run; the store checks `token.runId` matches the task's current run.
+- An agent's report is bound to the task its run holds, by `getClaimedTask(binding.runId) === taskId` (the same
+  check `BusService.report` makes today). It cannot report for another task, even if it knows the id. A report after
+  the claim was released is refused.
+- The bus token is scoped to one run; agent, run and task come from the token binding only. The work store keeps no
+  run id of its own to compare with (1.5).
 - An agent cannot read another agent's brief or task details (task() returns only its own).
 
 ### 7.2 Owner-only transitions
