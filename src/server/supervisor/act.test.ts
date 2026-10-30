@@ -44,15 +44,8 @@ function makeDecision(overrides: Partial<Decision> = {}): Decision {
     links: [],
     status: "open",
     createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    answeredAt: undefined,
-    answeredBy: undefined,
-    answeredOptionId: undefined,
-    answeredNote: undefined,
-    withdrawnAt: undefined,
-    withdrawnBy: undefined,
-    withdrawnReason: undefined,
-    expiresAt: undefined,
+    overdue: false,
+    raisedVia: "server",
     ...overrides,
   };
 }
