@@ -214,7 +214,8 @@ const orphanClaim: Detector = {
           `no process matches watchdog.agent_command for ${claim.agent}`,
           ...(claimPid !== null ? [`claim's recorded pid ${claimPid.pid} is not running or doesn't match the agent`] : []),
         ],
-        vars: { agent: claim.agent, claim: claim.path },
+        // process_found: only a claim whose agent has no live process (nor a live recorded pid) is reported
+        vars: { agent: claim.agent, claim: claim.path, claim_age_min: String(Math.round(age)), process_found: "false" },
       });
     }
     const details = [
@@ -442,6 +443,7 @@ const idleCapacity: Detector = {
             ready: String(ready.length),
             queued: String(queued.length),
             running: String(running),
+            last_start: lastStart === -Infinity ? "" : iso(lastStart),
           },
         },
       ],

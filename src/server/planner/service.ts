@@ -450,7 +450,8 @@ export class PlannerService {
         evidence: {
           code: "tasks_file_changed",
           facts: { run: active.id, restored: restored.ok },
-          cause_cleared: false,
+          // The change was undone when the file was put back
+          cause_cleared: restored.ok,
           linked_issue: null,
         },
       });
@@ -1386,15 +1387,22 @@ export class PlannerService {
     });
 
     // Build options (M1: add follow_verifier when there are mixed verdicts)
+    // A drop or a reword is not undone by the owner (rewording a done task reopens it), so applying one is irreversible
+    const rewrites = (p: StoredProposal): boolean => p.op === "drop" || p.op === "reword";
     const options: { id: string; label: string; consequences: string; effect: DecisionEffect }[] = [
-      { id: "approve_all", label: "Apply them all", consequences: "Lair checks each against the tasks file as it is now and applies those that still pass.", effect: "reversible" },
+      {
+        id: "approve_all",
+        label: "Apply them all",
+        consequences: "Lair checks each against the tasks file as it is now and applies those that still pass.",
+        effect: pending.some(rewrites) ? "irreversible" : "reversible",
+      },
       { id: "reject_all", label: "Reject them all", consequences: "Nothing changes; the next planner run sees the same state.", effect: "reversible" },
     ];
 
     if (hasVerifier && hasMixedVerdicts) {
       options.push({
         id: "follow_verifier",
-        effect: "reversible",
+        effect: pending.some((p) => p.verifierVerdict === "approve" && rewrites(p)) ? "irreversible" : "reversible",
         label: "Follow the verifier",
         consequences: "Apply the ones the verifier approved; reject the rest (rejected and unsure).",
       });

@@ -117,6 +117,7 @@ export interface DecisionAnswer {
 export type DecisionAuditAction =
   | "raised"
   | "raised_again"
+  | "structure_refused"
   | "answered"
   | "overdue"
   | "expired"

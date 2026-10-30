@@ -1244,7 +1244,7 @@ export class ReviewService {
           class: "review.merge_failed",
           evidence: {
             code: "merge_error",
-            facts: { pr: n, head_sha: status.headSha, refused_by: refusedBy ?? null },
+            facts: { pr: n, head_sha: status.headSha, refused_by: refusedBy ?? null, merge_error_code: refusedBy ?? "exception" },
             cause_cleared: false,
             linked_issue: null,
           },

@@ -39,14 +39,13 @@ function describe(values: Record<string, unknown>): string {
     .join(", ");
 }
 
-/** The numbers, strings and booleans of a check's values as flat facts: `value_latency_ms`. */
-function flatFacts(prefix: string, values: Record<string, unknown>): Record<string, string | number | boolean> {
-  const out: Record<string, string | number | boolean> = {};
+/** The numbers and booleans of a check's values as flat facts: `value_latency_ms`. Strings are names, not facts. */
+function flatFacts(prefix: string, values: Record<string, unknown>): Record<string, number | boolean> {
+  const out: Record<string, number | boolean> = {};
   for (const [name, v] of Object.entries(values)) {
     const key = `${prefix}_${name.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`.slice(0, 60);
     if (typeof v === "number" && Number.isFinite(v)) out[key] = v;
     else if (typeof v === "boolean") out[key] = v;
-    else if (typeof v === "string") out[key] = [...v].map((ch) => (ch < " " || ch === "\u007f" ? " " : ch)).join("").slice(0, 200);
   }
   return out;
 }

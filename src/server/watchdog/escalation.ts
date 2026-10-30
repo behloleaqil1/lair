@@ -105,6 +105,35 @@ export function runnablePlaybook(ctx: WatchdogContext, breach: Breach): Playbook
   );
 }
 
+/** The numbers a policy rule reads for idle_capacity (C3) and orphan_claim (C4); codes and numbers only. */
+function detectorFacts(breach: Breach, run?: PlaybookRun): Record<string, string | number | boolean | null> {
+  const num = (name: string): number | null => {
+    const raw = breach.vars[name];
+    const n = raw === undefined || raw === "" ? NaN : Number(raw);
+    return Number.isFinite(n) ? n : null;
+  };
+  if (breach.detector === "idle_capacity") {
+    const last = breach.vars.last_start;
+    return {
+      ready_count: num("ready"),
+      queued_count: num("queued"),
+      running_count: num("running"),
+      last_start: last === undefined || last === "" ? null : last,
+    };
+  }
+  if (breach.detector === "orphan_claim") {
+    const commands = (run?.steps ?? []).flatMap((s) => (s.command ? [s.command] : []));
+    const failedStep = (run?.steps ?? []).some((s) => s.status === "failed");
+    return {
+      claim_age_min: num("claim_age_min"),
+      process_found: breach.vars.process_found === "true",
+      release_exit_code: commands.length > 0 ? commands[commands.length - 1].code : null,
+      release_refusal: run === undefined || run.mode !== "act" ? "not_run" : failedStep ? "step_failed" : "none",
+    };
+  }
+  return {};
+}
+
 /**
  * The Decision Inbox item for an escalated breach. "Run once" is offered
  * only when a playbook command is configured and the project isn't
@@ -185,6 +214,7 @@ export function decisionFor(
         playbook_available: playbook !== undefined,
         read_only: readOnly,
         detected_at: breach.detectedAt,
+        ...detectorFacts(breach, run),
       },
       cause_cleared: false,
       linked_issue: null,

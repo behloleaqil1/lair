@@ -208,6 +208,7 @@ export type EventType =
   | "decision.answered"
   | "decision.expired"
   | "decision.withdrawn"
+  | "decision.structure_refused"
   // Watchdog (src/server/watchdog/)
   | "slo.breached"
   | "slo.recovered"
