@@ -217,6 +217,7 @@ function projectConfig(paths: Paths): ProjectConfig {
   return {
     name: "E2E Test",
     repo: paths.repo,
+    github: "example/e2e-test",
     queue_file: paths.queue,
     agents_dir: paths.agents,
     gates_dir: paths.gates,
