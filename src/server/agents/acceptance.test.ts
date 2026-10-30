@@ -2590,7 +2590,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     // Both agents are held due to memory pressure
     expect(lineOf(status, "feat-search")).toMatchObject({ state: "held", hold: "capacity_memory" });
     expect(lineOf(status, "feat-login")).toMatchObject({ state: "held", hold: "capacity_memory" });
-    expect(lineOf(status, "feat-search").detail).toContain("available memory 6.2% is below capacity.memory.available_min_pct (20%)");
+    expect(lineOf(status, "feat-search").detail).toContain("available memory 6.3% is below capacity.memory.available_min_pct (20%)");
     expect(runs(h)).toEqual([]);
 
     // Once memory is available, both start

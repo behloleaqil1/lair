@@ -140,6 +140,13 @@ describe("agents config", () => {
       promptFiles: [],
       maxActive: 1,
       donePattern: DEFAULT_DONE_PATTERN,
+      capacity: {
+        loadPerCpuMax: undefined,
+        memory: { pressureMax: undefined, availableMinPct: undefined },
+        heavyWork: { detect: [], maxActive: 1 },
+        agentClass: {},
+        defaultClass: "local",
+      },
       capacityCmd: undefined,
       intervalSeconds: 60,
       maxCompletionsWithoutDone: 3,
