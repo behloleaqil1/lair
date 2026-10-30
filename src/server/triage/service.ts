@@ -969,21 +969,23 @@ export class TriageService {
 
       // Check if this is an environment outage (all infra, no code, all steps match env patterns)
       const envResult = this.checkEnvironmentOutage(record, infra, code);
-      if (envResult.isEnvironment && settings.environment.mode !== "off") {
-        // Environment outage detected
-        if (settings.environment.mode === "observe") {
-          this.action(
-            { recordId: record.id },
-            "note",
-            "recorded",
-            `environment outage detected: ${envResult.patternId} (observe mode: would wait for probe to pass)`,
-          );
-          pending.push(`infra: environment outage (${envResult.patternId}), observe mode`);
-        } else {
-          // act mode: add to environment wait
-          const waitResult = this.addToEnvironmentWait(record, envResult.patternId!, envResult.probe!, s);
-          pending.push(waitResult);
-        }
+      const isEnvActMode = envResult.isEnvironment && settings.environment.mode === "act";
+
+      if (envResult.isEnvironment && settings.environment.mode === "observe") {
+        // Environment outage detected in observe mode: record what we would do
+        this.action(
+          { recordId: record.id },
+          "note",
+          "recorded",
+          `environment outage detected: ${envResult.patternId} (observe mode: would wait for probe to pass)`,
+        );
+        // In observe mode, continue with normal flow (fall through to recheck/route)
+      }
+
+      if (isEnvActMode) {
+        // act mode: add to environment wait (this blocks the normal recheck flow)
+        const waitResult = this.addToEnvironmentWait(record, envResult.patternId!, envResult.probe!, s);
+        pending.push(waitResult);
       } else if (gate) {
         // The project's gate system re-checks it, in place of a re-check Lair runs
         if (gate.text) pending.push(`infra: ${gate.text}`);

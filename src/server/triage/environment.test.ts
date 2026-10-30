@@ -155,7 +155,7 @@ describe("environment triage integration", () => {
   it("probe never passes: exactly ONE decision listing the gates", async () => {
     h = harness(
       actingTriage({
-        environment: { mode: "act", max_wait_minutes: 5, initial_backoff_seconds: 1 },
+        environment: { mode: "act", max_wait_minutes: 5, initial_backoff_seconds: 5 },
       }),
     );
 
