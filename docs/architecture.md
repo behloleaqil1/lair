@@ -232,7 +232,7 @@ Cloud machines, their spend and the money guard ([configuration](configuration.m
 - **`provider.ts`**: the provider interface and the AWS EC2 provider (describe, start and stop a tagged instance; the account's cost before credits and refunds), built on `AwsClients`, the AWS SDK clients for one named profile: the boundary tests fake
 - **`meter.ts`**, **`guard.ts`**: Lair's meter (runs times price, storage per month, the starting amount) and the guard's verdict (the larger of the provider's reading and the meter against the limit; fail closed)
 - **`store.ts`**: runs, the last cost reading per account and the trips in SQLite (`data/cloud.db`)
-- **`service.ts`**, **`routes.ts`**: the per-project check and the guarded start (`startMachine`), started and stopped by `index.ts`, and the read-only `GET /api/cloud/status`
+- **`service.ts`**, **`routes.ts`**: the per-project check and the guarded start (`startMachine`), started and stopped by `index.ts`, and `GET /api/cloud/status`, the owner's only (`/api/cloud` is in `OWNER_ONLY_PREFIXES`); provider error text is kept with the account hidden (`providerText`)
 
 #### Settings (`settings/`)
 

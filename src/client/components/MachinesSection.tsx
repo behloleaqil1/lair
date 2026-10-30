@@ -21,7 +21,7 @@ import { DataTable, type Column } from "./DataTable";
 import { DetailPanel, DetailSection } from "./DetailPanel";
 import { SectionHeader, type SectionProps } from "./Section";
 import { usePlacement } from "./Placement";
-import { EmptyState, ErrorState, KeyValues, Loading, Time } from "./ui";
+import { EmptyState, ErrorState, KeyValues, Loading, OwnerOnlyNotice, Time, useOwnerSignedIn } from "./ui";
 import { Badge } from "../ui/Badge";
 
 const MACHINE_COLUMNS: Column<MachineRow>[] = [
@@ -53,7 +53,9 @@ export function MachinesSection({ project, refreshKey, route, modules, open }: S
   const restMachines = useMemo(() => machinesApi.data ?? [], [machinesApi.data]);
   const { machines: wsMachines, connected } = useMachinesWebSocket(project, restMachines);
   const placement = usePlacement(project, refreshKey, modules?.placement !== true);
-  const cloud = useApi<CloudStatus>("/cloud/status", project, refreshKey, { skip: modules?.cloud !== true });
+  // The cloud status is the owner's (it names the account's instances and spend)
+  const signedIn = useOwnerSignedIn(refreshKey);
+  const cloud = useApi<CloudStatus>("/cloud/status", project, refreshKey, { owner: true, skip: modules?.cloud !== true || signedIn !== true });
   const nodesApi = useApi<ListNodesResponse>("/nodes", "", refreshKey, { skip: route.tab !== "nodes" });
   // The WebSocket sends what GET /api/machines does; its hook types the runner lanes loosely
   const statuses = connected ? (wsMachines as MachineStatus[]) : restMachines;
@@ -99,6 +101,7 @@ export function MachinesSection({ project, refreshKey, route, modules, open }: S
     if (machinesApi.error && !machinesApi.data) return <ErrorState what="machines" error={machinesApi.error} />;
     return (
       <div className="card">
+        {modules?.cloud === true && signedIn === false && <OwnerOnlyNotice text="Cloud machines and their spend are shown to the owner only." />}
         {budget && <p className="muted small">Money guard: {budget.reason}</p>}
         {cloud.data && cloud.data.errors.length > 0 && <p className="muted small">Cloud config: {cloud.data.errors.join("; ")}</p>}
         <DataTable

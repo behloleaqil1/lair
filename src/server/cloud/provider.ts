@@ -40,6 +40,11 @@ const MAX_COST_PAGES = 10;
 /** The longest provider text kept in an error */
 const MAX_TEXT = 300;
 
+/** Provider text that names the account: ARNs (any partition), access key ids, 12-digit account ids */
+const ARN = /\barn:aws[a-z-]*:[^\s"'`,;()<>]*/gi;
+const ACCESS_KEY_ID = /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g;
+const ACCOUNT_ID = /(?<![0-9A-Za-z])[0-9]{12}(?![0-9A-Za-z])/g;
+
 export interface MachineDescription {
   state: PowerState;
   /** The last launch (start), from the provider */
@@ -92,8 +97,22 @@ export function sdkClients(profile: string, timeoutMs: number): AwsClients {
   };
 }
 
+/**
+ * Provider text as Lair keeps, logs and shows it: ARNs, access key ids and
+ * account ids hidden (an AWS error such as AccessDenied names the account
+ * and the role), at most 300 characters.
+ */
+export function providerText(value: unknown): string {
+  return String(value)
+    .slice(0, 8192)
+    .replace(ARN, "arn:(hidden)")
+    .replace(ACCESS_KEY_ID, "(key id hidden)")
+    .replace(ACCOUNT_ID, "(account id hidden)")
+    .slice(0, MAX_TEXT);
+}
+
 function text(value: unknown): string {
-  return String(value).slice(0, MAX_TEXT);
+  return providerText(value);
 }
 
 function powerState(value: unknown): PowerState | null {

@@ -30,11 +30,10 @@ import type {
 import { parseCloudConfig, type CloudBudgetSettings, type CloudMachineSettings, type CloudSettings } from "./config.js";
 import { evaluateGuard, type GuardVerdict } from "./guard.js";
 import { meterSpend } from "./meter.js";
-import { AwsEc2Provider, sdkClients, type AwsClients, type CloudProvider, type PowerState } from "./provider.js";
+import { AwsEc2Provider, providerText, sdkClients, type AwsClients, type CloudProvider, type PowerState } from "./provider.js";
 import { CloudStore, type StoredSpend } from "./store.js";
 
 const HOUR_MS = 3_600_000;
-const MAX_ERROR = 300;
 
 export interface ProjectEntry {
   name: string;
@@ -69,8 +68,9 @@ interface Check {
   verdict: GuardVerdict;
 }
 
+/** An error as Lair keeps, logs and shows it: no ARN, account id or key id (providerText) */
 function message(e: unknown): string {
-  return (e instanceof Error ? e.message : String(e)).slice(0, MAX_ERROR);
+  return providerText(e instanceof Error ? e.message : String(e));
 }
 
 function iso(ms: number | null): string | null {
@@ -301,8 +301,9 @@ export class CloudMachines {
           this.lastError = null;
         },
         (e) => {
+          // The text only: the error object would print the provider's own message, account and all
           this.lastError = message(e);
-          console.error(`[cloud] ${this.project}: check failed:`, e);
+          console.error(`[cloud] ${this.project}: check failed: ${this.lastError}`);
         },
       );
       await this.ticking;

@@ -621,13 +621,13 @@ await registerPlacementRoutes(fastify, placements, () => getDefaultProject());
 // default). It describes each machine's tagged instance through its
 // provider (AWS EC2, credentials from a named profile only), meters the
 // spend, reads the provider's cost, and runs the money guard that every
-// start goes through. Its route is read-only.
+// start goes through. Its routes are the owner's, reads included.
 const clouds = new CloudManager({
   dbPath: join(process.cwd(), "data", "cloud.db"),
   events: getEventBus(),
 });
 clouds.load(projectEntries);
-await registerCloudRoutes(fastify, clouds, () => getDefaultProject());
+await registerCloudRoutes(fastify, clouds, () => getDefaultProject(), humanAuth);
 
 // The dashboard's own reads (src/server/dashboard/): the nav's module flags,
 // a gate's detail from the queue, the pipelines, triage and placement, and

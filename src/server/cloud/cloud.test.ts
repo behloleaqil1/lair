@@ -6,11 +6,11 @@
  * client that answer like AWS), with a fake clock and a real store in a
  * temp dir.
  */
-import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "fs";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import Fastify from "fastify";
+import Fastify, { type FastifyInstance } from "fastify";
 import {
   DescribeInstancesCommand,
   StartInstancesCommand,
@@ -21,17 +21,20 @@ import { GetCostAndUsageCommand, type CostExplorerClient } from "@aws-sdk/client
 import type { ProjectConfig } from "../../shared/types.js";
 import type { CloudStatus } from "../../shared/cloud-types.js";
 import { EventBus } from "../core/event-bus.js";
+import { HumanAuth, OWNER_ONLY_PREFIXES, OWNER_SESSION_HEADER, isUnder } from "../human-auth/index.js";
 import { serverModules } from "../reload/modules.js";
 import { CloudManager, type CloudMachines } from "./service.js";
 import { parseCloudConfig } from "./config.js";
 import { registerCloudRoutes } from "./routes.js";
-import type { AwsClients } from "./provider.js";
+import { providerText, type AwsClients } from "./provider.js";
 
 const PROJECT = "shop";
 const INSTANCE = "i-0123456789abcdef0";
 const HOUR = 3_600_000;
 /** 10 March 2027, 12:00 UTC: the third month of a 2027 budget */
 const NOW = Date.UTC(2027, 2, 10, 12, 0, 0);
+/** A same-origin request from the dashboard */
+const BROWSER = { origin: "http://localhost:4777", "sec-fetch-site": "same-origin" };
 
 interface FakeInstance {
   state: string;
@@ -194,6 +197,21 @@ class Harness {
 
   trips(): unknown[] {
     return this.bus.getRecentEvents("cloud.guard_tripped").map((e) => e.data);
+  }
+
+  /** The cloud routes as the server mounts them, and the headers of a browser signed in as the owner */
+  async serve(): Promise<{ app: FastifyInstance; owner: Record<string, string> }> {
+    const tokenPath = join(this.dir, "owner.token");
+    const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
+    const app = Fastify();
+    cleanups.push(async () => {
+      await app.close();
+      auth.close();
+    });
+    await registerCloudRoutes(app, this.manager, () => PROJECT, auth);
+    const session = auth.createSession(readFileSync(tokenPath, "utf-8").trim());
+    if (!session) throw new Error("no owner session");
+    return { app, owner: { ...BROWSER, [OWNER_SESSION_HEADER]: session.session } };
   }
 }
 
@@ -436,16 +454,79 @@ describe("cloud: configuration", () => {
 });
 
 describe("cloud: status route", () => {
+  it("GET /api/cloud/status is the owner's: no session, a browser not signed in or an invalid session gets 403", async () => {
+    const h = new Harness(cloudBlock());
+    h.instance("stopped", NOW - 4 * HOUR, NOW - 2 * HOUR);
+    await h.machines.check();
+    const { app, owner } = await h.serve();
+    const url = `/api/cloud/status?project=${PROJECT}`;
+    // The whole prefix: no CORS for the dashboard's dev origin, and a later route under it is covered too
+    expect(isUnder(url, OWNER_ONLY_PREFIXES)).toBe(true);
+    expect(isUnder("/api/cloud/machines/cloud-1/start", OWNER_ONLY_PREFIXES)).toBe(true);
+    const strangers: [string, Record<string, string>][] = [
+      ["no session", {}],
+      ["a browser not signed in", BROWSER],
+      ["an invalid session", { ...BROWSER, [OWNER_SESSION_HEADER]: "x".repeat(43) }],
+    ];
+    for (const [who, headers] of strangers) {
+      const res = await app.inject({ method: "GET", url, headers });
+      expect(res.statusCode, who).toBe(403);
+      expect(res.body, who).not.toContain(INSTANCE);
+    }
+    const res = await app.inject({ method: "GET", url, headers: owner });
+    expect(res.statusCode).toBe(200);
+    expect((res.json() as { data: CloudStatus }).data.machines[0].instanceId).toBe(INSTANCE);
+  });
+
+  it("hides the account in provider errors: no ARN, account id or key id in the status, the guard's reason or the log", async () => {
+    const h = new Harness(cloudBlock());
+    h.instance("stopped", NOW - 4 * HOUR, NOW - 2 * HOUR);
+    const account = "123456789012";
+    const role = `arn:aws:sts::${account}:assumed-role/gate-runner-role/session-1`;
+    const keyId = ["AS", "IA", "Q".repeat(16)].join("");
+    h.aws.describeError = Object.assign(
+      new Error(`User: ${role} is not authorized to perform: ec2:DescribeInstances with key ${keyId}`),
+      { name: "UnauthorizedOperation" },
+    );
+    h.aws.cost = Object.assign(
+      new Error(`User: ${role} is not authorized to perform: ce:GetCostAndUsage on resource: arn:aws:ce:us-east-1:${account}:/GetCostAndUsage`),
+      { name: "AccessDeniedException" },
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    cleanups.push(() => {
+      warn.mockRestore();
+      error.mockRestore();
+    });
+
+    const result = await h.machines.startMachine("cloud-1");
+    expect(result.allowed).toBe(false);
+    expect(h.aws.named("StartInstances")).toHaveLength(0);
+    const { app, owner } = await h.serve();
+    const res = await app.inject({ method: "GET", url: `/api/cloud/status?project=${PROJECT}`, headers: owner });
+    const shown = [res.body, JSON.stringify(result), JSON.stringify(warn.mock.calls), JSON.stringify(error.mock.calls)].join("\n");
+    for (const secret of [account, "arn:aws", "gate-runner-role", keyId]) expect(shown).not.toContain(secret);
+    expect(warn).toHaveBeenCalled();
+    const status = (res.json() as { data: CloudStatus }).data;
+    expect(status.machines[0].lastError).toBe(
+      "User: arn:(hidden) is not authorized to perform: ec2:DescribeInstances with key (key id hidden)",
+    );
+    expect(status.budget?.provider[0].detail).toBe(
+      "User: arn:(hidden) is not authorized to perform: ce:GetCostAndUsage on resource: arn:(hidden)",
+    );
+    expect(status.budget?.guard.reason).toContain("describe failed for cloud-1: User: arn:(hidden) is not authorized");
+    // An account id on its own is hidden too; an instance id is not an account id
+    expect(providerText(`account ${account} has no access to ${INSTANCE}`)).toBe(`account (account id hidden) has no access to ${INSTANCE}`);
+  });
+
   it("GET /api/cloud/status shows each machine's state, the spend and the guard, and nothing else answers", async () => {
     const h = new Harness(cloudBlock({ limit: 20, meter_start: 1 }));
     h.instance("stopped", NOW - 4 * HOUR, NOW - 2 * HOUR);
     h.aws.cost = "3";
     await h.machines.check();
-    const app = Fastify();
-    cleanups.push(() => app.close());
-    await registerCloudRoutes(app, h.manager, () => PROJECT);
+    const { app, owner } = await h.serve();
 
-    const res = await app.inject({ method: "GET", url: `/api/cloud/status?project=${PROJECT}` });
+    const res = await app.inject({ method: "GET", url: `/api/cloud/status?project=${PROJECT}`, headers: owner });
     expect(res.statusCode).toBe(200);
     const data = (res.json() as { data: CloudStatus }).data;
     expect(data).toMatchObject({
@@ -463,16 +544,17 @@ describe("cloud: status route", () => {
         guard: { state: "tripped", allowed: false, trip: { limit: 20, spend: 20 } },
       },
     });
-    const other = await app.inject({ method: "GET", url: "/api/cloud/status?project=other" });
+    const other = await app.inject({ method: "GET", url: "/api/cloud/status?project=other", headers: owner });
     expect((other.json() as { data: CloudStatus }).data).toMatchObject({ enabled: false, budget: null });
 
+    // No route starts a machine or changes the budget, for the owner either
     for (const [method, url] of [
       ["POST", "/api/cloud/status"],
       ["POST", "/api/cloud/machines/cloud-1/start"],
       ["PUT", "/api/cloud/budget"],
       ["DELETE", "/api/cloud/trip"],
     ] as const) {
-      expect((await app.inject({ method, url })).statusCode, `${method} ${url}`).toBe(404);
+      expect((await app.inject({ method, url, headers: owner })).statusCode, `${method} ${url}`).toBe(404);
     }
     expect(h.aws.named("StartInstances")).toHaveLength(0);
   });

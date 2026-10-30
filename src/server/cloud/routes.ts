@@ -1,7 +1,8 @@
 /**
- * Cloud routes: read-only. Machines, the budget and the guard are
- * configured in the project YAML (cloud:); only a human changes them there
- * (or in Settings), so there are no mutation routes.
+ * Cloud routes: the owner's, reads included (the status names the account's
+ * instances, regions and spend). /api/cloud is in OWNER_ONLY_PREFIXES, so no
+ * CORS is granted under it either. Machines, the budget and the guard are
+ * configured in the project YAML (cloud:), or in Settings.
  *
  *   GET /api/cloud/status?project=   each machine's power state, the spend
  *                                     (provider reading and meter) and the
@@ -12,6 +13,7 @@
  */
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
+import type { HumanAuth } from "../human-auth/index.js";
 import { rejectCrossSiteRequests } from "../origin.js";
 import type { CloudManager } from "./service.js";
 
@@ -29,10 +31,13 @@ export async function registerCloudRoutes(
   fastify: FastifyInstance,
   manager: CloudManager,
   defaultProject: () => string,
+  /** Every route is the owner's, reads included */
+  auth: HumanAuth,
 ): Promise<void> {
-  // Encapsulated so the cross-site guard applies to these routes too
+  // Encapsulated so the cross-site guard and the owner check apply to these routes only
   await fastify.register(async (app) => {
     app.addHook("onRequest", rejectCrossSiteRequests);
+    app.addHook("onRequest", auth.requireOwner("Only the owner can see cloud machines and their spend, from the dashboard"));
 
     app.get("/api/cloud/status", async (request, reply) => {
       const query = StatusQuery.safeParse(request.query ?? {});
