@@ -1,6 +1,6 @@
 """Fit the brain trainer's classifier: gradient-boosted trees over numeric features.
 
-    python train.py <input.json> <model.json> <fit.json>
+    python train.py <input.json> <model.json> <fit.json> [deadline_seconds]
 
 input.json  {"rows": [{"features": {name: number}, "label": str}], "params": {...}}
 model.json  the trees, in the format src/server/brain-trainer/model.ts evaluates
@@ -10,6 +10,7 @@ No network and no state: the same input gives the same model.
 """
 import json
 import math
+import signal
 import sys
 
 import numpy as np
@@ -105,9 +106,23 @@ def build(rows, params):
     return model, fit_info
 
 
+def set_deadline(text):
+    """The container's own time limit: SIGALRM has no handler, so it ends the process whatever the fit is doing."""
+    seconds = int(text)
+    if not 1 <= seconds <= 86_400:
+        raise ValueError("deadline_seconds must be 1-86400")
+    signal.alarm(seconds)
+
+
 def main(argv):
-    if len(argv) != 4:
-        print("usage: train.py <input.json> <model.json> <fit.json>", file=sys.stderr)
+    if len(argv) not in (4, 5):
+        print("usage: train.py <input.json> <model.json> <fit.json> [deadline_seconds]", file=sys.stderr)
+        return 2
+    try:
+        if len(argv) == 5:
+            set_deadline(argv[4])
+    except ValueError as e:
+        print(f"train.py: {e}", file=sys.stderr)
         return 2
     try:
         rows, params = read_input(argv[1])

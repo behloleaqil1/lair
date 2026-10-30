@@ -2,6 +2,7 @@
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
 
@@ -112,3 +113,26 @@ def test_bad_input_is_refused_without_writing_a_model(tmp_path, payload):
     result = run_cli(tmp_path, payload)
     assert result.returncode == 2
     assert not (tmp_path / "model.json").exists()
+
+
+def run_with_deadline(tmp_path, payload, deadline):
+    (tmp_path / "input.json").write_text(json.dumps(payload))
+    return subprocess.run(
+        [sys.executable, os.path.join(HERE, "train.py"), str(tmp_path / "input.json"), str(tmp_path / "m.json"), str(tmp_path / "f.json"), deadline],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def test_the_deadline_ends_a_run_that_has_not_finished(tmp_path):
+    big = [{"features": {f"f{j}": float((i * j) % 7) for j in range(40)}, "label": "ab"[i % 2]} for i in range(3000)]
+    result = run_with_deadline(tmp_path, {"rows": big, "params": {"nEstimators": 5000, "maxDepth": 6}}, "1")
+    assert result.returncode == -signal.SIGALRM
+    assert not (tmp_path / "m.json").exists()
+
+
+@pytest.mark.parametrize("bad", ["0", "x", "99999999"])
+def test_a_bad_deadline_is_refused(tmp_path, bad):
+    result = run_with_deadline(tmp_path, {"rows": rows(), "params": {}}, bad)
+    assert result.returncode == 2
