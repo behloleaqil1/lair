@@ -80,9 +80,9 @@ export class BrainTrainer {
       this.store,
       options.decisions,
       () => this.settings().settings.confidenceFloor,
+      () => this.vetoes(),
       this.clock,
       this.log,
-      () => this.vetoes(),
     );
   }
 
