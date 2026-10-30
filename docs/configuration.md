@@ -2342,6 +2342,49 @@ Both routes are the owner's (signed in on the dashboard), reads included, and ge
 
 The routes read files and run nothing. Server code that plans asks `InfraPolicyManager.requires(project)` and, when true, plans only through `get(project).guardPlan`, which does not start the plan when the scan fails (or when the config is blocked).
 
+## Plan sandbox
+
+`tofu plan` is not read-only: it runs every provider and data source in the code ([design](design/deploy-aws.md#22-plan-isolated)). The plan sandbox runs it in an isolated container with the read-only plan role and nothing else. It is off unless you turn it on, and it needs the [policy scan](#infrastructure-policy-scan) on for the project: a plan never starts on code the scan did not pass.
+
+```yaml
+plan_sandbox:
+  enabled: true                       # default false
+  plan_role_arn: arn:aws:iam::123456789012:role/lair-plan
+  external_id: lair-plan-1            # optional; what the role's trust policy asks for
+  image: plan-runner:1                # container image with the tofu binary
+  plugin_dir: /srv/infra/provider-mirror
+  provider_api_hosts: ["*.amazonaws.com"]
+  registry_hosts: [registry.opentofu.org]
+  egress_network: plan-egress         # optional; without it the plan has no network
+```
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `enabled` | boolean | `false` | Turn the sandbox on for this project |
+| `plan_role_arn` | IAM role ARN | none | The read-only role every plan assumes; required when enabled. Lair asks STS for 15 minutes (900 s, the shortest STS issues) and never stores the credentials |
+| `external_id` | string | none | The external id for the assume-role call. Not a secret |
+| `region` | string | `us-east-1` | Region of the credentials |
+| `image` | string | none | Image the plan runs in; required when enabled |
+| `plugin_dir` | absolute path | none | The provider mirror, mounted read-only. Providers come from here with `init -lockfile=readonly`; nothing is downloaded at plan time. Required when enabled |
+| `provider_api_hosts` | list of hosts | `[]` | Hosts the plan may reach: the provider APIs. A host, or `*.` plus a domain |
+| `registry_hosts` | list of hosts | `[registry.opentofu.org]` | Hosts the plan may reach: the module and provider registries |
+| `egress_network` | container network | none | A network whose only exit is a proxy or firewall that lets exactly the two host lists through. Lair does not run that proxy; without this key the container gets no network at all (`--network none`) and a plan that needs the cloud fails |
+| `timeout_seconds` | integer | `600` | 10 to 900; a step that runs longer is killed, and never longer than the credentials' life |
+| `max_output_bytes` | integer | `262144` | Output kept for the owner; the rest is cut |
+
+**What a run does,** in this order, each step ending the run before the next: Lair copies the root (leaving out `.git`, `.terraform`, `*.tfstate*` and `.env*`; a symlink or special file refuses the copy), the policy scan reads the root, the root is hashed again and must still match the copy, `.terraform.lock.hcl` must pin every provider with a version and verified hashes, each on `infra_policy.allowed_providers`, and only then are the plan role's credentials issued. `tofu init -lockfile=readonly -plugin-dir=/plugins` and `tofu plan -lock=false -detailed-exitcode` then run in the copy. The container is read-only, drops every capability, has a memory and process limit, and its whole environment is the plan role's credentials plus fixed settings: no variable of Lair's own reaches it. The credentials are removed from the output before it is shown.
+
+An invalid block (unknown keys, no role, no mirror, a relative path, a bad host or a timeout over 900) never turns the sandbox off: unless the block says `enabled: false`, every plan is refused with `invalid-config` and `GET /api/plan-sandbox/status` shows the errors. Lair reads this block at startup.
+
+### Plan sandbox API
+
+Both routes are the owner's (signed in on the dashboard) and get no CORS.
+
+| Route | Meaning |
+|-------|---------|
+| `GET /api/plan-sandbox/status?project=` | Whether the sandbox is on or blocked (with the errors), the role, the egress hosts and the limits; no credential |
+| `POST /api/plan-sandbox/plan?project=&root=` | Plan one of the project's `infra_policy.roots` through the scan and the sandbox; 404 when the sandbox is off, 400 for a root that is not configured. The answer is `refused` (with the reason), `failed` (init, plan, timeout or credentials) or `planned` (`changes`, the output, when the credentials expire) |
+
 ## Planner
 
 > Off by default. With `enabled: true`, Lair keeps [fill](#fill)'s tasks file itself: it marks tasks done, drops the ones the plan marks done, and runs a supervised planner agent when something happens, whose proposals it checks before anything changes ([design](design/planner.md)). A project then needs no free-running orchestrator agent that edits the tasks file.

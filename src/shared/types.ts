@@ -71,6 +71,11 @@ export interface ProjectConfig {
    */
   infra_policy?: Record<string, unknown>;
   /**
+   * Isolated `tofu plan` with the read-only plan role (src/server/plan-sandbox/).
+   * Validated by parsePlanSandboxConfig; see docs/configuration.md#plan-sandbox
+   */
+  plan_sandbox?: Record<string, unknown>;
+  /**
    * Gate pipelines and where they run (src/server/gates/). Validated by
    * parsePipelineConfig; see docs/configuration.md#gate-pipelines
    */

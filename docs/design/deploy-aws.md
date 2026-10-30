@@ -129,6 +129,16 @@ The plan shows:
 change. An `external` data source runs any program; an `http` data source calls any URL; a provider from an untrusted
 source runs its own code. Without isolation, agent-written code could exfiltrate credentials.
 
+**As built (PR 2, `src/server/plan-sandbox/`):** `PlanSandboxManager.plan(root)` is what the OpenTofu runner (PR 3) calls.
+It copies the root first, plans only through the project's `guardPlan` (so the PR 1 scan decides), re-hashes the root to
+close the time-of-check gap, checks the lock file (`.terraform.lock.hcl` pins every provider with a version and hashes,
+all on `allowed_providers`: the check PR 1 left to this PR), then asks STS for the plan role (900 s) and runs
+`tofu init -lockfile=readonly -plugin-dir` and `tofu plan -lock=false` in a read-only container whose environment is the
+role's credentials and fixed settings only. The two boundaries are interfaces (`PlanCredentialIssuer`, `SandboxSpawner`)
+with an `aws sts assume-role` and a `docker run` implementation. Egress: the container has no network unless an
+`egress_network` is configured, a network the owner builds with a proxy that passes only the configured hosts; Lair does
+not run that proxy (follow-up). Off by default; see [configuration](../configuration.md#plan-sandbox).
+
 ### 2.3 Cost estimate
 
 Lair runs Infracost on the plan. The estimate shows:

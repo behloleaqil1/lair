@@ -33,6 +33,8 @@ export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/ai",
   // The infrastructure policy scan: every route is the owner's (a scan answer names files, lines and addresses)
   "/api/infra-policy",
+  // The plan sandbox: a plan shows resource names and the cloud's answers (every route the owner's)
+  "/api/plan-sandbox",
   // The supervisor: Lair's diagnostics, and the ops tokens and their audit (every route the owner's)
   "/api/health/diagnostics",
   "/api/supervisor",
