@@ -23,9 +23,18 @@ interface GoTestEvent {
 function parseEvent(line: string): GoTestEvent | null {
   if (!line.startsWith("{")) return null;
   try {
-    const event = JSON.parse(line) as Record<string, unknown>;
-    if (typeof event.Action !== "string") return null;
-    return event as GoTestEvent;
+    const event = JSON.parse(line) as unknown;
+    if (typeof event !== "object" || event === null) return null;
+    const obj = event as Record<string, unknown>;
+    if (typeof obj.Action !== "string") return null;
+    return {
+      Time: typeof obj.Time === "string" ? obj.Time : undefined,
+      Action: obj.Action,
+      Package: typeof obj.Package === "string" ? obj.Package : undefined,
+      Test: typeof obj.Test === "string" ? obj.Test : undefined,
+      Output: typeof obj.Output === "string" ? obj.Output : undefined,
+      Elapsed: typeof obj.Elapsed === "number" ? obj.Elapsed : undefined,
+    };
   } catch {
     return null;
   }
