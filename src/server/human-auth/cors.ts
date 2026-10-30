@@ -31,6 +31,8 @@ export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/dashboard",
   // AI tools: every route, reads included, runs the tools' own commands and shows who is signed in
   "/api/ai",
+  // The infrastructure policy scan: every route is the owner's (a scan answer names files, lines and addresses)
+  "/api/infra-policy",
   // The supervisor: Lair's diagnostics, and the ops tokens and their audit (every route the owner's)
   "/api/health/diagnostics",
   "/api/supervisor",

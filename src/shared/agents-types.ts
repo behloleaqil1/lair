@@ -301,8 +301,9 @@ export type FillLineState = "started" | "done" | "held" | "claimed" | "not_allow
  *   while the gate it waits on was still in the gate queue doesn't count), or longer than
  *   fill.wake.max_queue_wait_minutes in all
  * - blocked: its last run ended on a BLOCKED line: it needs someone else first
- * - busy, read_only, max_active, capacity, prompt (a refused prompt file), refused (the run request,
- *   or done_pattern)
+ * - busy, read_only, max_active, capacity, capacity_load (load too high for local agent),
+ *   capacity_memory (memory pressure/low), capacity_heavy (heavy work limit), prompt (a refused
+ *   prompt file), refused (the run request, or done_pattern)
  * - paused: you chose to leave it ("Keep it paused" on its decision, or "Leave the task unclaimed" on
  *   its run's escalation): nothing waits for you, and fill starts it again once you release it
  * owner, no_done, blocked, waiting, waited_too_long and paused are the owner's to release (POST
@@ -322,6 +323,10 @@ export type FillHold =
   | "read_only"
   | "max_active"
   | "capacity"
+  | "capacity_load"
+  | "capacity_memory"
+  | "capacity_heavy"
+  | "capacity_probe"
   | "conflict"
   | "prompt"
   | "refused";
@@ -386,6 +391,48 @@ export interface FillStatusView {
   lastCheck: string | null;
   lastError: string | null;
   lines: FillLineView[];
+  /** Current capacity state (native capacity checks) */
+  capacity?: FillCapacityView;
+}
+
+/** Current capacity state from native checks */
+export interface FillCapacityView {
+  /** Current system load (1-minute average) */
+  load?: number;
+  /** Number of CPUs */
+  cpus?: number;
+  /** Load per CPU */
+  loadPerCpu?: number;
+  /** Configured load_per_cpu_max */
+  loadPerCpuMax?: number;
+  /** Whether load is over the limit */
+  loadOverLimit: boolean;
+  /** Current memory state */
+  memory?: {
+    /** Total memory in bytes */
+    total: number;
+    /** Available memory in bytes */
+    available: number;
+    /** Available as percentage of total */
+    availablePct: number;
+    /** Whether memory is under the minimum */
+    underMin: boolean;
+    /** Configured available_min_pct */
+    availableMinPct?: number;
+    /** Memory pressure in percent, when pressure_max is set */
+    pressurePct?: number;
+    /** Configured pressure_max */
+    pressureMax?: number;
+  };
+  /** Heavy work state */
+  heavyWork?: {
+    /** Number of currently active heavy work items */
+    active: number;
+    /** Configured max_active */
+    maxActive: number;
+    /** Whether heavy work is at the limit */
+    atLimit: boolean;
+  };
 }
 
 /**

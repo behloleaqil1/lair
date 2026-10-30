@@ -10,6 +10,7 @@ import {
   listProjects,
 } from "./config.js";
 import { DataService } from "./services/data.js";
+import { QueueCacheManager } from "./services/queue-cache.js";
 import { isValidDragonId } from "./parsers/dragon-config.js";
 import { registerRootGuards, requireValidIdParam } from "./root-guards.js";
 import { mountDecisions } from "./decisions/index.js";
@@ -40,6 +41,7 @@ import { registerClientStatic, resolveClientDir } from "./static.js";
 import { getEventBus } from "./core/event-bus.js";
 import { WatchdogManager, registerWatchdogRoutes } from "./watchdog/index.js";
 import { DeliveryManager, registerDeliveryRoutes } from "./delivery/index.js";
+import { InfraPolicyManager, registerInfraPolicyRoutes } from "./infra-policy/index.js";
 import { PipelineManager, registerPipelineRoutes } from "./gates/index.js";
 import { AgentsManager, registerAgentsRoutes, systemAgentProbesWithCache } from "./agents/index.js";
 import { isActive } from "./agents/types.js";
@@ -128,6 +130,11 @@ function respondCached<T>(cached: CachedData<T>): ApiResponse<T> & { cache: { ag
 
 // Get data service for project (cached per request cycle)
 const dataServices = new Map<string, DataService>();
+const queueCaches = new QueueCacheManager();
+const queueReady = new Map<string, () => Promise<boolean>>();
+/** The first read of the queue file is waited for this long; then requests get what the cache has */
+const QUEUE_FIRST_READ_MS = 2_000;
+const queueSlowLogged = new Set<string>();
 
 // The agents module's runs, for the Dragons view: a dragon it runs is
 // running, "managed by Lair". Set once the module is loaded, below.
@@ -138,16 +145,38 @@ function getDataService(project?: string): DataService {
 
   if (!dataServices.has(projectName)) {
     const config = loadProjectConfig(projectName);
+    // The queue file is parsed once per change, never on a request
+    const queue = queueCaches.get(projectName, config.queue_file);
+    queueReady.set(projectName, () => queue.readyWithin(QUEUE_FIRST_READ_MS));
     dataServices.set(
       projectName,
       new DataService(config, {
         managedRuns: () => managedRuns?.managedRuns(projectName) ?? new Map(),
+        queue: () => queue.getLines(),
       }),
     );
   }
 
   return dataServices.get(projectName)!;
 }
+
+// A request waits for the first read of its project's queue file, then every
+// handler reads the parsed lines from memory
+fastify.addHook("preHandler", async (request) => {
+  if (!request.url.startsWith("/api/")) return;
+  const asked = (request.query as { project?: unknown } | undefined)?.project;
+  try {
+    const name = typeof asked === "string" && asked ? asked : getDefaultProject();
+    getDataService(name);
+    const ready = await queueReady.get(name)?.();
+    if (ready === false && !queueSlowLogged.has(name)) {
+      queueSlowLogged.add(name);
+      console.warn(`The queue file of project ${name} is slow to read; serving what is cached`);
+    }
+  } catch {
+    // An unknown project or an unreadable config: the handler reports it
+  }
+});
 
 /** Get the data cache for a project (expensive operations use this). */
 function getDataCache(project?: string) {
@@ -412,6 +441,13 @@ const delivery = new DeliveryManager({
 delivery.load(projectEntries);
 // Up, Down, Restart, Deploy and Release need the owner's session
 await registerDeliveryRoutes(fastify, delivery, () => getDefaultProject(), humanAuth);
+
+// Infrastructure policy scan: a static check of infrastructure code, one per
+// project with `infra_policy.enabled: true` (off by default). It reads files
+// and runs nothing; the plan step of a later change goes through its guard.
+const infraPolicy = new InfraPolicyManager();
+infraPolicy.load(projectEntries);
+await registerInfraPolicyRoutes(fastify, infraPolicy, () => getDefaultProject(), humanAuth);
 
 // AI tools (src/server/ai/): per machine, whether each tool is installed and
 // signed in, and the models it offers, from the tools' own commands (bounded,
@@ -766,6 +802,7 @@ const stopServer = async (reason: string) => {
 
   // Stop the data cache manager
   dataCacheManager.stopAll();
+  queueCaches.stopAll();
 
   // Stop healer
   stopHealer();

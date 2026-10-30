@@ -1665,7 +1665,7 @@ Unknown keys, invalid regular expressions, more than 50 `transient_patterns` or 
 - A refused start (`held: refused`: the run request was refused, or `done_pattern` couldn't be checked) has one decision too, except when the refusal is a hard budget limit, which has its own `spend` decision. The line shows the decision of its hold (`decisionId`).
 - `held: paused` is your own pause: you answered "Keep it paused", or "Leave the task unclaimed" on the escalation of a task fill runs. Nothing waits for you and nothing more is asked; fill starts it again once you release it.
 - You lift an `owner`, `no_done`, `blocked`, `waiting`, `waited_too_long` or `paused` hold with the decision's answer, or with "Release hold" in the Work section (`POST /api/agents/fill/release`, owner only); requesting a run of the task yourself works too. Either lifts the hold only while the run it is about is still the task's latest: once the task has moved on (you answered its escalation with a fresh session, say), the release is refused and the next check shows where the task is now. The planner may release only a `no_done` or `blocked` hold.
-- Otherwise the task is started when its agent has no active run, fewer than `max_active` runs fill started are active, and `capacity_cmd` (when set) exits 0. Its prompt is the contents of `prompt_files`, in order, separated by a blank line (`default_instructions` and the agent's `instructions` come first, as for every run). It is requested through the module's in-process request, never over HTTP. A line that waits for any of these is `held`, with the reason: `busy`, `max_active`, `capacity` (the capacity command's first output line), `prompt` (a refused prompt file), `read_only`, or `refused` (the refused request: over budget, say).
+- Otherwise the task is started when its agent has no active run, fewer than `max_active` runs fill started are active, native capacity checks pass (when configured), and `capacity_cmd` (when set) exits 0. Its prompt is the contents of `prompt_files`, in order, separated by a blank line (`default_instructions` and the agent's `instructions` come first, as for every run). It is requested through the module's in-process request, never over HTTP. A line that waits for any of these is `held`, with the reason: `busy`, `max_active`, `capacity` (the capacity command's first output line), `capacity_load` (load per CPU over limit), `capacity_memory` (available memory below minimum, or pressure above the maximum), `capacity_heavy` (this heavy task, with heavy work at limit), `capacity_probe` (the machine could not be measured: fill fails closed), `prompt` (a refused prompt file), `read_only`, or `refused` (the refused request: over budget, say).
 - A line that doesn't parse, names an invalid agent or task id, or repeats a task is `malformed`: it is reported, and the other lines are still filled.
 
 The Work section shows fill's lines, with each line's state, why it is held (for a waiting one, `waiting: <wake> since <time>`, or `waiting: <gate> still queued in <lane> since <time>` while its gate is in the gate queue), and a "Release hold" button for the holds that are yours to lift.
@@ -1673,6 +1673,12 @@ The Work section shows fill's lines, with each line's state, why it is held (for
 **Prompt files stay inside `prompts_dir`.** In each path `{prompts_dir}`, `{agent}` and `{task}` are replaced, and a relative path is relative to `prompts_dir`. A path with a `..` segment is a config error; at run time a path outside `prompts_dir`, a symlink that leads out of it (one that stays inside is fine), anything but a regular file, or a file over 200 KB is refused and the line is held with the reason. Their text is used as it is: placeholders are not replaced inside it (the agent gets `LAIR_TASK` and `LAIR_AGENT` in its environment), and a line's description is shown in the status, never put into a prompt. Keep `tasks_file` and `prompts_dir` where the agents can't write (not in the repository they work in): whoever edits them chooses what the allowlisted agents work on.
 
 **The capacity command** is an argv, run without a shell before each start, with `command_timeout_seconds` as its timeout. Exit 0 means there is capacity; any other exit code, or a timeout, holds every line that would start in that check, with its first output line as the reason.
+
+**Native capacity checks** let fill decide capacity itself without an external command. Set `fill.capacity.load_per_cpu_max` to hold local agents when the 1-minute load average per CPU exceeds it. Set `fill.capacity.memory.available_min_pct` to hold all agents when available memory drops below that percentage of total. Set `fill.capacity.heavy_work.detect` to a list of task globs that count as heavy work, and `fill.capacity.heavy_work.max_active` to limit how many may run at once.
+
+Agents are either `local` (held by load) or `remote` (not held by load). Set `fill.capacity.default_class` to the default (`"local"`), and `fill.capacity.agent_class` to override it per agent. A remote agent (one that only pushes to GitHub CI, say) starts even under high load, since it doesn't add to the machine's workload.
+
+Memory checks and heavy-work limits apply to both classes. `capacity_cmd` is still honoured as an extra check, after native checks pass.
 
 `agents.fill_started` and `agents.fill_held` events go on the event bus (and into the agents store): one when fill starts a task, and one when a line becomes held or is held for another kind of reason, not on every check. `fill_done` (a task seen done) and `fill_released` (you lifted a hold) are kept in the agents store. Bounds: the tasks file is read up to 256 KB, 200 tasks and 2,000 characters a line; the queue file's last 4 MB are searched, each line cut at 1,000 characters. A queue file that was rewritten (not appended to) since a task's start is searched whole. Task ids are not reused: a task that is done stays done.
 
@@ -1694,6 +1700,29 @@ agents:
     interval_seconds: 60
 ```
 
+With native capacity checks:
+
+```yaml
+agents:
+  fill:
+    enabled: true
+    tasks_file: work/tasks.txt
+    agents: [worker-a, worker-b, worker-c]
+    prompt_files: ["{prompts_dir}/{agent}.txt"]
+    max_active: 4
+    capacity:
+      load_per_cpu_max: 1.5              # hold local agents when load/cpu > 1.5
+      memory:
+        available_min_pct: 15            # hold all agents when memory < 15%
+        pressure_max: 60                 # ...or when memory pressure > 60%
+      heavy_work:
+        detect: ["*-backend-gate", "*-e2e-*"]   # these tasks count as heavy work
+        max_active: 2                    # at most 2 heavy tasks at once
+      agent_class:
+        worker-c: remote                 # worker-c only pushes to CI; not held by load
+      default_class: local               # the default
+```
+
 ```text
 # agent|name|task|description
 worker-a|Alice|feat-login|Build the login form
@@ -1709,6 +1738,13 @@ worker-b|Bob|feat-search|Search page
 | `fill.max_active` | number | `1` | Runs fill started that may be active at once (restarts and retries count) |
 | `fill.done_pattern` | string | `^-\s+DONE\s+{task}(?=\s\|$)` | Regular expression for a queue line that reports the task done, matched case-insensitively against each trimmed line; the task id must be in the matched text exactly. Must contain `{task}`, `{agent}` or both ([Matching by agent](#matching-by-agent)), inserted as literal text. End the task id at whitespace, not `\b`, `:` or `-`: task ids can contain `-` and `:` |
 | `fill.capacity_cmd` | array | — | Exit 0: capacity available; anything else holds, with its first output line as the reason |
+| `fill.capacity.load_per_cpu_max` | number | — | Maximum 1-minute load average per CPU before holding local agents. Remote agents are not held by load |
+| `fill.capacity.memory.pressure_max` | number | — | Hold new starts (local and remote) while memory pressure is above this percentage (0-100). Linux: `some avg10` of `/proc/pressure/memory`. macOS: 100 minus `kern.memorystatus_level`. A read that fails or times out holds with `capacity_probe` |
+| `fill.capacity.memory.available_min_pct` | number | — | Hold new starts (local and remote) below this available memory as a percentage of total (0-100). Linux: `MemAvailable`. macOS: free + inactive + speculative + purgeable pages from `vm_stat` (not just free pages). A read that fails or times out holds with `capacity_probe` |
+| `fill.capacity.heavy_work.detect` | array | `[]` | Task-id globs (`*` any text, `?` one character; every other character is literal) that mark heavy work, e.g. container gates. Only a task that matches is held when `max_active` is reached; other tasks, local or remote, are not |
+| `fill.capacity.heavy_work.max_active` | number | `1` | Maximum concurrent heavy runs across all agents (counted once per check; a heavy run started in the check counts at once) |
+| `fill.capacity.agent_class` | map | `{}` | Per-agent class override: agent id (it must be in `fill.agents`) → `"local"` or `"remote"`. There is no per-task class label yet |
+| `fill.capacity.default_class` | string | `"local"` | Default class for agents not in `agent_class`. `"local"` agents are held by load; `"remote"` agents are not |
 | `fill.interval_seconds` | number | `60` | Seconds between fill checks |
 | `fill.max_completions_without_done` | number | `3` | Runs in a row that exit 0 without the done line; then fill holds the task and asks you |
 | `fill.backoff_seconds` | number | `60` | Wait after such a run before fill starts the task again, doubling |
@@ -2109,7 +2145,7 @@ Every `interval_seconds`:
    One sample is kept per gate id, with its exit code. A run that failed (exit code not 0) in less than half the time its class usually takes (the median of passed runs on that machine, else on any machine) is a fragment, such as a preflight that failed or a run killed when its machine went away, and is not learned. A later passed run of the same id (a job re-queued under its id) replaces a failed one, never the other way round. A job's expected duration is the median of the newest `history.samples` passed runs of its class on that machine, else on any machine; else of all its runs on that machine, else on any machine; else of any class on that machine; else `default_seconds`.
 4. **Load.** `load_cmd` prints the 1-minute load average first and the cpu count last (`sysctl -n vm.loadavg hw.ncpu` and `cat /proc/loadavg; nproc` both do; `cpus:` overrides the count). A machine's load factor is `max(1, load ÷ cpus)`. A machine runs jobs slower when its load factor is above the one it usually has while running gates: the expected duration is multiplied by `max(1, factor now ÷ usual factor)`, where the usual factor is the median of the factors Lair measured during the runs it learned from (1 until it has some). Without `load_cmd` the factor is 1.
 5. **Estimates.** Each lane runs its jobs in its own order (lower priority digit first, then the id, which usually starts with a UTC time) on `slots` runners, with at most `limits.<class>` jobs of a class at a time, and no job starts before the one ahead of it (a runner takes the head of its queue). A running job ends its expected duration after it started, but always has at least a tenth of that left (so one past its duration is expected to need a tenth of it more). A job its lane never runs (a class limit of `0` there) has no expected finish on it. A **pseudo-lane** (`serves:`) is a second runner that takes jobs from other lanes' queues: a queued job of a lane it serves, at or below its `max_priority`, whose class is in `eligible.<pseudo-lane>`, is estimated on the pseudo-lane and is **never moved** (its runner takes it beside the main one). The Gates section shows every queued job's expected start and finish.
-6. **Moves.** A queued job moves to another lane when it is expected to finish at least `min_gain_seconds` sooner there, and the move saves at least that much in all: what it costs the jobs of the same or a more urgent priority on both lanes is counted against it. The target lane must be up, list the job's class in `eligible`, and not be a pseudo-lane. The job that gains most moves first, then the next one on the state that leaves, up to `max_moves_per_tick`. A job its lane never runs goes, before any of those, to the lane that can run it soonest (its gain shows as 0 and its estimate as `never → ...`); this holds for a quiet re-check too, whatever the loads.
+6. **Moves.** A queued job moves to another lane when it is expected to finish at least `min_gain_seconds` sooner there, and the move saves at least that much in all: what it costs the jobs of the same or a more urgent priority on both lanes is counted against it. The target lane must be up (or be on an available [on-demand machine](#on-demand-machines), through `routing` only), list the job's class in `eligible`, and not be a pseudo-lane. The job that gains most moves first, then the next one on the state that leaves, up to `max_moves_per_tick`; of two moves that are equally good, the one to the lane with the lower `cost_per_hour` wins. A job its lane never runs goes, before any of those, to the lane that can run it soonest (its gain shows as 0 and its estimate as `never → ...`); this holds for a quiet re-check too, whatever the loads.
 
    **Cool-downs.** A job moved (or tried) is not moved again for `cooldown_seconds`, whatever the estimates say, and the cool-down doubles with every earlier move of that job in the last 24 hours (30 min, then 60, then 120 by default). After `max_moves_per_job` moves or tries in 24 hours the job is **held**: placement stops moving it, says why in the Gates section, and emits `placement.job_held` once for that hold (the store remembers it, so a restart doesn't report it again; a job held again after it left the queue is reported again). So a job a flapping link keeps sending back (your fallback moves it home, placement moves it out again) settles instead of bouncing forever.
 7. **Quiet re-checks.** A job whose id or command matches a `prefer_quiet` pattern (for example a re-check of tests that failed by timeout) goes to the eligible up machine with the lowest load per cpu, when that is at least `quiet_margin` lower than its current machine's, even if it finishes later there: `min_gain_seconds` and the in-all rule don't apply to that move. When no machine is that much quieter, it is placed by time like any other job, but only on machines no busier than its own (a machine whose load is unknown counts as busier). When no target's load is known at all, it is placed by time on any eligible machine.
@@ -2132,9 +2168,10 @@ Each decision is explained in one line, for example `moved 20260101T000000Z-fix-
 | `mode` | `observe` \| `act` | `observe` | `observe` records and shows advice (`would_move`); `act` runs `move_cmd`, unless the project is `read_only: true` |
 | `interval_seconds` | number | `60` | Seconds between ticks (10 to 3600) |
 | `probe_timeout_seconds` | number | `15` | Timeout of each probe and load command |
-| `command_timeout_seconds` | number | `60` | Timeout of `move_cmd` |
+| `command_timeout_seconds` | number | `60` | Timeout of `move_cmd` and of an on-demand machine's `state_cmd`, `guard_cmd` and `touch_cmd` |
 | `machines` | map | `{}` | Machine id → machine options (below) |
 | `lanes` | map | `{}` | Lane name (as in the request file names) → lane options (below). At least one when enabled. Lanes not listed are never read or moved |
+| `routing` | map | `{}` | Lane name → routing options (below): where its jobs may go on an on-demand machine |
 | `classes` | map | `{}` | Class name → patterns matched against a request's command. The first class, in the order written, wins |
 | `eligible` | map | `{}` | Lane → the classes it can run. A job moves only to a lane that lists its class |
 | `prefer_quiet` | array | `[]` | Patterns matched against a job's id and command: such a job goes to the least-loaded machine |
@@ -2160,6 +2197,20 @@ Machine options:
 | `load_cmd` | array | — | Argv that prints the 1-minute load first and the cpu count last. Over SSH, the remote command is one string the remote shell parses |
 | `cpus` | number | — | The cpu count, instead of the one `load_cmd` prints |
 | `min_up_seconds` | number | `240` | Passing probes needed in a row before the machine counts as up (`0` for the machine Lair runs on) |
+| `on_demand` | object | — | On-demand machine settings (see below) |
+
+On-demand machine options (the `on_demand` block; see [On-demand machines](#on-demand-machines)):
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `state_cmd` | array | — | Argv that prints the machine's power state: `running`, `stopped`, `pending`, or `stopping` |
+| `guard_cmd` | array | — | Argv that exits 0 with output starting `guard: ok` when starting the machine is allowed |
+| `boot_seconds` | number | `150` | Seconds added to estimates while the machine is not up |
+| `cost_per_hour` | number | — | Shown in the status; of two moves that are equally good, the one to the cheaper lane wins |
+| `check_seconds` | number | `300` | Minimum seconds between state and guard checks (the guard may call paid APIs) |
+| `speed_factor` | number | `1.0` | While the machine has no run of a class yet, its expected duration is this times what the class takes on the other machines (`0.5`: twice as fast) |
+| `touch_cmd` | array | — | Argv that refreshes the machine's activity mark (or lease), run while a job runs in one of its lanes |
+| `touch_seconds` | number | `60` | How often `touch_cmd` runs while a job runs there. A touch runs at most once per tick, so this may not be shorter than `interval_seconds` |
 
 Lane options:
 
@@ -2171,13 +2222,62 @@ Lane options:
 | `serves` | array | `[]` | A pseudo-lane: the lanes whose queues its runner takes jobs from |
 | `max_priority` | number | — | A pseudo-lane takes only jobs at this priority digit or lower |
 
-Unknown keys, a lane on an unknown machine, an unknown class in `limits` or `eligible`, an invalid pattern, an unknown placeholder in `move_cmd`, or `mode: act` without `move_cmd` are config errors: the project's placement does not start, and `GET /api/placement/status` shows the errors.
+Routing options (the `routing` block, per lane):
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `overflow_to` | array | `[]` | On-demand lanes this lane's waiting jobs may go to while their machine is stopped |
+| `prefer_when_faster` | boolean | `false` | A job of this lane also goes to an on-demand lane (listed or not) when it would finish sooner there, boot time included, even if it would start now where it is |
+| `min_gain_seconds` | number | — | How much sooner a job must finish to start an on-demand machine for it (defaults to the global `min_gain_seconds`) |
+
+Unknown keys, a lane on an unknown machine, an unknown class in `limits` or `eligible`, an invalid pattern, an unknown placeholder in `move_cmd`, `mode: act` without `move_cmd`, a `routing` or `overflow_to` lane that is not in `lanes`, or a `touch_seconds` shorter than `interval_seconds` are config errors: the project's placement does not start, and `GET /api/placement/status` shows the errors.
+
+### On-demand machines
+
+A machine with an `on_demand` block is one your project starts when a job lands in its lane (a cloud machine that powers itself off when idle, say). Placement never starts or stops it: it moves a job into its lane, and your project's runner starts it. Lair reads the machine's power state with `state_cmd` and asks `guard_cmd` (your spend and quota check) whether a start is allowed, at most every `check_seconds` (both may call paid APIs).
+
+- **Available.** A machine whose state is `stopped` and whose guard says ok is **available**: its lanes are planned as if it were up, with `boot_seconds` added to every estimate there (once). Running, it counts like any machine, through its probes and `min_up_seconds`. A refusing guard, an unknown state, or a command that fails or times out makes it **unavailable**, with the reason shown; so do `pending` and `stopping`.
+- **Starting it.** A lane on an available machine is a target only through `routing`: a lane's `overflow_to` lists it, or the lane has `prefer_when_faster`. A move there needs a free slot and a gain above 0 of at least the routing's `min_gain_seconds`, in all too; with `overflow_to` alone the job must also be waiting (it would not start now where it is). These moves go before moves by time. In act mode, right before such a move the guard runs again (unless it ran in this tick): a refusal cancels the move (`placement.move_failed`, the job waits its cool-down) and the machine stays unavailable until its next check.
+- **Moving back.** A job queued in its lane while the guard refuses or the state is unknown goes back, before any other move, to a lane whose `overflow_to` lists that lane (else to any up lane that runs its class): `moved back q1 aws→heavy: est. never → 60 min; aws guard refused: spend 181 >= limit 180; heavy idle`. Its cool-down and `max_moves_per_job` still apply. A machine that is `pending` or `stopping` keeps its jobs.
+- **Keeping it alive.** While a job runs in one of its lanes, `touch_cmd` runs every `touch_seconds`, so the machine's idle timer does not stop it during a long phase of the job that does not use it. A check that finds the machine `stopped` (or `stopping`) after it had answered, while jobs run in its lanes, emits `placement.machine_stopped_under_job` once per job; when the runner puts such a job back in that lane while the machine is not up, it moves back once (`aws stopped under it`).
+- **Shown.** The Machines section shows the on-demand state next to the probe state: `on demand: stopped, guard ok, 150 s boot`, `on demand: starting`, `on demand: running`, `on demand: refused (guard refused: ...)`. The status (`onDemand`) has the power state, availability and reason, the last check and the last touch with its error. A move explains itself: `moved q1 heavy→aws: est. 2 h 0 min → 63 min; aws stopped, guard ok, 150 s boot; overflow: heavy had 1 waiting; aws idle`.
+
+```yaml
+placement:
+  machines:
+    workstation:
+      probe: ["true"]
+      min_up_seconds: 0
+    aws:
+      probe: ["ssh", "aws-gate", "echo", "ok"]
+      expect: "ok"
+      on_demand:
+        state_cmd: ["/path/to/aws-gate.sh", "state"]   # prints running|stopped|pending|stopping
+        guard_cmd: ["/path/to/aws-gate.sh", "guard"]   # exit 0 + "guard: ok" = start allowed
+        touch_cmd: ["/path/to/aws-gate.sh", "touch"]   # refreshes the machine's idle timer
+        boot_seconds: 150
+        cost_per_hour: 0.35
+        check_seconds: 300
+  lanes:
+    heavy: { machine: workstation, slots: 1 }
+    aws: { machine: aws, slots: 2, limits: { big: 1 } }
+  routing:
+    heavy:
+      overflow_to: [aws]
+      prefer_when_faster: true
+      min_gain_seconds: 300
+  eligible:
+    heavy: [small, big]
+    aws: [small, big]
+```
+
+With this configuration a job waiting in `heavy` goes to `aws` when it would finish at least 5 minutes sooner there, the 150-second boot included (with `prefer_when_faster`, so does one that would start now on `heavy` but finishes 5 minutes sooner on `aws`). While the guard refuses, nothing goes to `aws` and what is queued there comes back to `heavy`.
 
 ### Placement API
 
-`GET /api/placement/status?project=` (read-only): the mode and why act mode is off, config errors, the last tick, every machine's probe state (up, starting, down; since when; load and cpus), every lane's slots in use and per-class limits, every job's class, expected start and finish, advice and why it stays where it is, the latest moves (moved, failed, interrupted, gone, would_move, each with its argv and explanation), and the learned durations.
+`GET /api/placement/status?project=` (read-only): the mode and why act mode is off, config errors, the last tick, every machine's probe state (up, starting, down; since when; load and cpus) and, for an on-demand machine, its power state, availability and reason, last check and last touch, every lane's slots in use and per-class limits, every job's class, expected start and finish, advice and why it stays where it is, the latest moves (moved, failed, interrupted, gone, would_move, each with its argv and explanation), and the learned durations.
 
-Events on the bus: `placement.moved`, `placement.would_move`, `placement.move_failed`, `placement.machine_up`, `placement.machine_down`, `placement.job_held`.
+Events on the bus: `placement.moved`, `placement.would_move`, `placement.move_failed`, `placement.machine_up`, `placement.machine_down`, `placement.job_held`, `placement.machine_stopped_under_job` (`{project, machine, gateId, lane, state}`).
 
 ## Cleanup
 
@@ -2267,6 +2367,51 @@ Read-only routes:
 Events on the bus: `cleanup.removed`, `cleanup.cycle`, `cleanup.safety_violation`.
 
 The Health tab shows "Would free N GB (M entries)" in observe mode, and "Last cleanup: freed N GB (M entries)" in act mode, with links to the removals list.
+
+## Infrastructure policy scan
+
+Before any `plan` runs on infrastructure code, a static scan reads the code and refuses what it must not run ([design](design/deploy-aws.md#21-policy-scan-before-plan)). The scan reads files only: it never runs OpenTofu, a provider or a program. It is off unless you turn it on.
+
+```yaml
+infra_policy:
+  enabled: true                       # default false
+  roots:                              # absolute paths of the directories the scan reads
+    - /srv/infra/staging
+  allowed_providers:                  # provider sources that may be used
+    - hashicorp/aws
+  allowed_modules:                    # remote module sources: an exact source, or a prefix ending in /
+    - terraform-aws-modules/vpc/aws
+    - git::https://example.com/org/
+  allow:                              # denied blocks you accept: root, address and the block's content hash
+    - root: /srv/infra/staging
+      address: data.http.health
+      hash: 3b1c0f5a9d2e4c7b8a6f1e0d9c8b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b
+```
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `enabled` | boolean | `false` | Turn the scan on for this project |
+| `roots` | list of absolute paths | `[]` | Directories of infrastructure code; required when enabled |
+| `allowed_providers` | list | `[]` | Provider sources, `namespace/type` or `host/namespace/type`; `hashicorp/aws` and `registry.opentofu.org/hashicorp/aws` are the same provider. Every provider the code declares or implies (from a resource, data or provider block, or a `provider` meta-argument) must be listed |
+| `allowed_modules` | list | `[]` | Remote module sources. An exact source, or a prefix ending in `/` that names a host and at least one path segment (`git::https://example.com/org/`). A bare scheme, a host (`https://github.com/`) or `/` is a config error, and a source with a `..` segment never matches. Local modules (`./` or `../`) need no entry: they are scanned like the root, and must stay inside it |
+| `allow` | list | `[]` | Denied blocks to accept. Each entry has `root` (one of `roots`), `address` (`data.http.health`; a block in a local module is `module.<name>.` plus its address) and `hash`, the content hash the scan reports for that block. Editing the block (a changed `url` or `command`) changes its hash and ends the allowance: the scan then refuses it and marks it `changedSinceAllowed`. The same address in another root is not allowed |
+
+Refused, unless allowed: `external` and `http` data sources (also inside a `check` block), any provisioner (`local-exec`, `remote-exec`, `file`, others) on any resource or in a `removed` block, a provider not in `allowed_providers`, a remote module not in `allowed_modules`, a local module outside its root, a `source` that is not a plain string, a block of a type the scan does not know or with the wrong number of labels (`unknown-block`), and code the scan cannot read: `.tf`, `.tofu`, `.tf.json` and `.tofu.json` files, at most 1 MiB each, 8 MiB and 500 files in total, 8 module levels, and a 10 second deadline; a string escape it does not decode (it decodes `\n`, `\r`, `\t`, `\"`, `\\`, `\uNNNN`, `\UNNNNNNNN`) is unreadable too. An allowed use is not refused but is listed as `allowed`.
+
+An invalid block (unknown keys, relative roots, `enabled` without roots, a bad `allowed_*` entry or `allow` entry) never turns the scan off: unless the block says `enabled: false`, the project is **blocked**, every `guardPlan` refuses with `invalid-config`, and `GET /api/infra-policy/status` shows the errors. Lair reads this block at startup.
+
+The rule names are what an agent sees of a refusal (`policy violation: denied-external-data`); the file, line, address and hash are for you. Rules: `denied-external-data`, `denied-http-data`, `denied-local-exec`, `denied-remote-exec`, `denied-file-provisioner`, `denied-provisioner`, `provider-not-allowed`, `module-not-allowed`, `module-outside-root`, `source-not-literal`, `unknown-block`, `invalid-config`, `unreadable`. The scan does not read remote modules: allow only sources you have pinned and reviewed. Checking the lock file's hashes belongs to the plan sandbox, not this scan.
+
+### Infrastructure policy API
+
+Both routes are the owner's (signed in on the dashboard), reads included, and get no CORS.
+
+| Route | Meaning |
+|-------|---------|
+| `GET /api/infra-policy/status?project=` | Whether the scan is on or blocked (with the errors), the roots, and the last scan of each |
+| `GET /api/infra-policy/scan?project=&root=` | Scan a configured root (all roots without `root=`); 404 when the scan is off, 409 when the project is blocked, 400 for a root that is not configured |
+
+The routes read files and run nothing. Server code that plans asks `InfraPolicyManager.requires(project)` and, when true, plans only through `get(project).guardPlan`, which does not start the plan when the scan fails (or when the config is blocked).
 
 ## Planner
 
