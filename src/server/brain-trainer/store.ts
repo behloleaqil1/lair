@@ -83,8 +83,12 @@ export class ModelStore {
   }
 
   loadReport(version: string): RunReport | null {
-    const text = readBounded(join(this.versionDir(version), "report.json"), MAX_REPORT_BYTES);
-    return text === null ? null : (JSON.parse(text) as RunReport);
+    try {
+      const text = readBounded(join(this.versionDir(version), "report.json"), MAX_REPORT_BYTES);
+      return text === null ? null : (JSON.parse(text) as RunReport);
+    } catch {
+      return null;
+    }
   }
 
   /** Every run, trained or not, oldest first: the curve is drawn from it. */
@@ -94,17 +98,42 @@ export class ModelStore {
   }
 
   runs(limit = 500): RunReport[] {
-    const text = readBounded(join(this.root, "runs.jsonl"), 8 * 1024 * 1024);
-    if (text === null) return [];
-    const lines = text.split("\n").filter((l) => l.trim() !== "");
-    return lines.slice(-limit).map((l) => JSON.parse(l) as RunReport);
+    return this.readRuns(limit).runs;
+  }
+
+  /** The newest `limit` runs; a line that is not a run is skipped and counted, never an error. */
+  readRuns(limit = 500): { runs: RunReport[]; skipped: number } {
+    let text: string | null;
+    try {
+      text = readBounded(join(this.root, "runs.jsonl"), 8 * 1024 * 1024);
+    } catch {
+      return { runs: [], skipped: 1 };
+    }
+    if (text === null) return { runs: [], skipped: 0 };
+    const runs: RunReport[] = [];
+    let skipped = 0;
+    for (const line of text.split("\n")) {
+      if (line.trim() === "") continue;
+      try {
+        const parsed: unknown = JSON.parse(line);
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed) || typeof (parsed as RunReport).status !== "string") throw new Error("not a run");
+        runs.push(parsed as RunReport);
+      } catch {
+        skipped++;
+      }
+    }
+    return { runs: runs.slice(-limit), skipped };
   }
 
   best(): BestPointer | null {
-    const text = readBounded(join(this.root, "best.json"), 4096);
-    if (text === null) return null;
-    const raw = JSON.parse(text) as BestPointer;
-    return isVersion(raw.version) ? raw : null;
+    try {
+      const text = readBounded(join(this.root, "best.json"), 4096);
+      if (text === null) return null;
+      const raw = JSON.parse(text) as BestPointer;
+      return typeof raw?.version === "string" && isVersion(raw.version) ? raw : null;
+    } catch {
+      return null;
+    }
   }
 
   setBest(version: string, at: string): void {

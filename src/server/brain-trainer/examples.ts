@@ -29,7 +29,13 @@ export function labelOf(d: Decision): string | null {
 /** What a decision looks like to a model: structured fields only (no title, context or note). */
 export type Shape = Omit<Example, "label" | "outcome">;
 
+/** A decision with fewer than two options is an acknowledgement, not a choice: nothing to label or propose. */
+export function isNotice(d: Decision): boolean {
+  return d.options.length < 2;
+}
+
 export function shapeOf(d: Decision): Shape | null {
+  if (isNotice(d)) return null;
   if (!validTime(d.createdAt)) return null;
   if (!d.options.every((o) => CLASS_PART.test(o.id))) return null;
   const optionIds = d.options.map((o) => o.id);
@@ -49,7 +55,9 @@ export function shapeOf(d: Decision): Shape | null {
 export function exampleFromDecision(d: Decision): Example | null {
   const label = labelOf(d);
   const shape = label === null ? null : shapeOf(d);
-  return shape === null || label === null ? null : { ...shape, label, outcome: "unknown" };
+  if (shape === null || label === null) return null;
+  const answeredAt = d.answeredAt && validTime(d.answeredAt) ? new Date(d.answeredAt).toISOString() : undefined;
+  return { ...shape, label, outcome: "unknown", ...(answeredAt ? { answeredAt } : {}) };
 }
 
 /** An example from a bench case that carries a time (`at`) and maybe an outcome. */

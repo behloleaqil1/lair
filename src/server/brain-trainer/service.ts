@@ -10,10 +10,10 @@ import type { EventBus } from "../core/event-bus.js";
 import { readCheckedFile, type ServerConfigFileOptions } from "../restart/server-config.js";
 import { loadBrainTrainerConfig, type BrainTrainerSettings } from "./config.js";
 import type { TrainerContainer } from "./container.js";
-import { exampleFromDecision, examplesFromCases, queryOf, splitLabels } from "./examples.js";
+import { exampleFromDecision, examplesFromCases, isNotice, queryOf, splitLabels } from "./examples.js";
 import { featuresOf } from "./features.js";
 import { avoidSet } from "./model.js";
-import { ShadowRecorder, type AgreementRow, type DecisionReader } from "./shadow.js";
+import { readOnlyDecisions, ShadowRecorder, type AgreementRow, type DecisionReader } from "./shadow.js";
 import { ModelStore, type BestPointer } from "./store.js";
 import { DEFAULT_PARAMS, runTraining } from "./trainer.js";
 import type { Example, RunReport } from "./types.js";
@@ -57,6 +57,8 @@ export interface BrainTrainerStatus {
   best: (BestPointer & { report: RunReport | null }) | null;
   /** Oldest first: accuracy, abstain rate and wrong-but-confident per class over time are drawn from these */
   runs: RunReport[];
+  /** Lines in runs.jsonl and shadow-trace.jsonl that could not be read and were skipped */
+  skipped: { runs: number; trace: number };
   /** Shadow proposals compared with the answers, per class and model version */
   agreement: AgreementRow[];
 }
@@ -71,14 +73,18 @@ export class BrainTrainer {
   private cancelTimer: (() => void) | null = null;
   private vetoCache: ReadonlySet<string> | null = null;
 
+  /** What the trainer reads decisions through: exactly get and list, whatever it was handed */
+  private readonly decisions: DecisionReader;
+
   constructor(private readonly options: BrainTrainerOptions) {
+    this.decisions = readOnlyDecisions(options.decisions);
     this.store = new ModelStore(options.dataDir);
     this.clock = options.clock ?? (() => new Date());
     this.timers = options.timers ?? realTimers;
     this.log = options.log ?? (() => undefined);
     this.shadow = new ShadowRecorder(
       this.store,
-      options.decisions,
+      this.decisions,
       () => this.settings().settings.confidenceFloor,
       () => this.vetoes(),
       this.clock,
@@ -90,10 +96,15 @@ export class BrainTrainer {
     return loadBrainTrainerConfig(this.options.configPath, this.options.fileOptions);
   }
 
-  private loadExamples(settings: BrainTrainerSettings): { examples: Example[]; unusable: number } {
+  private loadExamples(settings: BrainTrainerSettings): { examples: Example[]; unusable: number; notices: number } {
     const examples: Example[] = [];
     let unusable = 0;
-    for (const d of this.options.decisions.list({ status: "answered", limit: MAX_DECISIONS })) {
+    let notices = 0;
+    for (const d of this.decisions.list({ status: "answered", limit: MAX_DECISIONS })) {
+      if (isNotice(d)) {
+        notices++;
+        continue;
+      }
       const e = exampleFromDecision(d);
       if (e) examples.push(e);
       else unusable++;
@@ -107,7 +118,7 @@ export class BrainTrainer {
         unusable += fromCases.unusable;
       }
     }
-    return { examples, unusable };
+    return { examples, unusable, notices };
   }
 
   private vetoes(): ReadonlySet<string> {
@@ -148,11 +159,14 @@ export class BrainTrainer {
         now: this.clock,
       });
     } catch (e) {
+      // The detail (a path, a file name) stays in Lair's log; the report and the route carry a fixed sentence
+      this.log(`brain trainer: run failed: ${e instanceof Error ? e.message : String(e)}`);
       const report: RunReport = {
         at: this.clock().toISOString(),
         version: null,
         status: "failed",
-        reason: e instanceof Error ? e.message : String(e),
+        reasonCode: "run_error",
+        reason: "the run failed before it finished: see Lair's log",
         labels: { total: 0, used: 0, negative: 0, pending: 0, unusable: 0 },
         confidenceFloor: s.confidenceFloor,
       };
@@ -204,6 +218,7 @@ export class BrainTrainer {
   status(): BrainTrainerStatus {
     const config = this.settings();
     const best = this.store.best();
+    const runs = this.store.readRuns(200);
     return {
       enabled: config.settings.enabled,
       errors: config.ok ? [] : config.errors,
@@ -212,7 +227,8 @@ export class BrainTrainer {
       confidenceFloor: config.settings.confidenceFloor,
       minLabels: config.settings.minLabels,
       best: best ? { ...best, report: this.store.loadReport(best.version) } : null,
-      runs: this.store.runs(200),
+      runs: runs.runs,
+      skipped: { runs: runs.skipped, trace: this.shadow.readProposals().skipped },
       agreement: this.shadow.agreement(),
     };
   }

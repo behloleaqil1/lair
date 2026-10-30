@@ -33,6 +33,18 @@ export interface DecisionReader {
   list(options: { status?: "answered"; limit?: number }): Decision[];
 }
 
+/**
+ * A real get/list-only wrapper, not the inbox typed as a reader: the object
+ * the trainer holds has exactly these two methods, so there is nothing to cast
+ * to (`answer`, `withdraw` and `raise` do not exist on it).
+ */
+export function readOnlyDecisions(source: DecisionReader): DecisionReader {
+  return Object.freeze({
+    get: (id: string) => source.get(id),
+    list: (options: { status?: "answered"; limit?: number }) => source.list(options),
+  });
+}
+
 interface Loaded {
   version: string;
   model: TreeModel;
@@ -97,12 +109,27 @@ export class ShadowRecorder {
   }
 
   proposals(): ShadowProposal[] {
+    return this.readProposals().proposals;
+  }
+
+  /** The trace; a line that is not a proposal is skipped and counted, never an error. */
+  readProposals(): { proposals: ShadowProposal[]; skipped: number } {
     const path = this.store.shadowTracePath;
-    if (!existsSync(path) || statSync(path).size > MAX_TRACE_BYTES * 2) return [];
-    return readFileSync(path, "utf8")
-      .split("\n")
-      .filter((l) => l.trim() !== "")
-      .map((l) => JSON.parse(l) as ShadowProposal);
+    if (!existsSync(path)) return { proposals: [], skipped: 0 };
+    if (statSync(path).size > MAX_TRACE_BYTES * 2) return { proposals: [], skipped: 1 };
+    const proposals: ShadowProposal[] = [];
+    let skipped = 0;
+    for (const line of readFileSync(path, "utf8").split("\n")) {
+      if (line.trim() === "") continue;
+      try {
+        const o = JSON.parse(line) as ShadowProposal | null;
+        if (typeof o !== "object" || o === null || typeof o.decisionId !== "string" || typeof o.class !== "string" || typeof o.version !== "string") throw new Error("not a proposal");
+        proposals.push(o);
+      } catch {
+        skipped++;
+      }
+    }
+    return { proposals, skipped };
   }
 
   /** Per class and model version: proposals compared with the answers given. Open decisions are left out. */

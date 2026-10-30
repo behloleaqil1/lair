@@ -21,7 +21,7 @@ export interface MountBrainTrainerOptions {
   configPath: string;
   /** data/brain */
   dataDir: string;
-  /** Read-only: the trainer never receives the means to answer */
+  /** The trainer wraps it in a get/list-only object, so it never holds the means to answer */
   decisions: DecisionReader;
   events: EventBus;
   humanAuth: HumanAuth;
@@ -34,6 +34,7 @@ export interface MountBrainTrainerOptions {
 
 export async function mountBrainTrainer(fastify: FastifyInstance, options: MountBrainTrainerOptions): Promise<BrainTrainer> {
   const trainer = new BrainTrainer({ ...options, container: options.container ?? new DockerTrainerContainer() });
+  // (BrainTrainer reads decisions only through readOnlyDecisions: an object with get and list and nothing else)
   await registerBrainTrainerRoutes(fastify, options.humanAuth, trainer);
   const unsubscribe = trainer.subscribe();
   trainer.start();

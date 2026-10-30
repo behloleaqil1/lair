@@ -5,7 +5,7 @@
  *
  *   brain_trainer:
  *     enabled: true
- *     image: lair-brain-trainer:1     # built from brain-trainer/ beforehand; never pulled
+ *     image: sha256:<64 hex>          # required when enabled: the id `docker build -q brain-trainer/` prints, or name@sha256:<digest>
  *     run_hour: 3                     # local hour of the nightly run
  *     min_labels: 100                 # fewer usable labels: the run only reports
  *     test_fraction: 0.2              # newest share held out for the bench
@@ -34,7 +34,7 @@ export interface BrainTrainerSettings {
 
 export const BRAIN_TRAINER_OFF: BrainTrainerSettings = {
   enabled: false,
-  image: "lair-brain-trainer:1",
+  image: "",
   runHour: 3,
   minLabels: 100,
   testFraction: 0.2,
@@ -52,7 +52,7 @@ export type BrainTrainerConfigResult =
 const Schema = z
   .object({
     enabled: z.boolean().default(false),
-    image: z.string().max(300).refine(validImage, "must be an image name such as lair-brain-trainer:1").default(BRAIN_TRAINER_OFF.image),
+    image: z.string().max(300).refine(validImage, "must name the image by content: sha256:<64 hex> or name@sha256:<digest>, never a tag").optional(),
     run_hour: z.number().int().min(0).max(23).default(BRAIN_TRAINER_OFF.runHour),
     min_labels: z.number().int().min(20).max(100_000).default(BRAIN_TRAINER_OFF.minLabels),
     test_fraction: z.number().min(0.05).max(0.5).default(BRAIN_TRAINER_OFF.testFraction),
@@ -81,11 +81,18 @@ export function parseBrainTrainerConfig(raw: unknown): BrainTrainerConfigResult 
     };
   }
   const v = parsed.data;
+  if (v.enabled && !v.image) {
+    return {
+      ok: false,
+      errors: ["brain_trainer.image: required when enabled; name the image you built by content (sha256:<64 hex> or name@sha256:<digest>)"],
+      settings: BRAIN_TRAINER_OFF,
+    };
+  }
   return {
     ok: true,
     settings: {
       enabled: v.enabled,
-      image: v.image,
+      image: v.image ?? "",
       runHour: v.run_hour,
       minLabels: v.min_labels,
       testFraction: v.test_fraction,

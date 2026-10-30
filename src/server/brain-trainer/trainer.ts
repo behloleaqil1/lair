@@ -4,7 +4,7 @@
  * window, and keep it as a new version. A run with too few labels only
  * reports. Nothing here answers a decision or promotes a model.
  */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { runBench } from "../brain-bench/run.js";
 import type { ModelReport } from "../brain-bench/types.js";
@@ -33,7 +33,7 @@ export const DEFAULT_PARAMS: TrainParams = { nEstimators: 100, maxDepth: 3, lear
 export interface TrainerDeps {
   settings: TrainerSettings;
   /** The labelled examples, answered and (where known) with their outcome */
-  loadExamples(): { examples: Example[]; unusable: number };
+  loadExamples(): { examples: Example[]; unusable: number; notices?: number };
   store: ModelStore;
   container: TrainerContainer;
   /** A directory where a run keeps its input and output; removed after */
@@ -47,22 +47,27 @@ function better(a: ModelReport, b: ModelReport): boolean {
   return x.accuracy > y.accuracy || (x.accuracy === y.accuracy && x.wrongConfidentRate < y.wrongConfidentRate);
 }
 
+/** The container's output is untrusted: a regular file (never a link to something on the host) under the size limit. */
 function readFileBounded(path: string, max: number): string {
-  if (statSync(path).size > max) throw new Error("the container wrote a file over the size limit");
+  const info = lstatSync(path);
+  if (!info.isFile()) throw new Error("the container wrote something that is not a plain file");
+  if (info.size > max) throw new Error("the container wrote a file over the size limit");
   return readFileSync(path, "utf8");
 }
 
 export async function runTraining(deps: TrainerDeps): Promise<RunReport> {
   const { settings, store } = deps;
   const at = deps.now().toISOString();
-  const { examples, unusable } = deps.loadExamples();
+  const { examples, unusable, notices = 0 } = deps.loadExamples();
   const sets = splitLabels(examples);
   const labels = {
-    total: examples.length + unusable,
+    total: examples.length + unusable + notices,
     used: sets.positive.length,
     negative: sets.negative.length,
     pending: sets.pending.length,
     unusable,
+    notices,
+    lateAnswers: 0,
   };
   const base = { at, labels, confidenceFloor: settings.confidenceFloor, version: null };
   const finish = (report: RunReport): RunReport => {
@@ -74,27 +79,40 @@ export async function runTraining(deps: TrainerDeps): Promise<RunReport> {
     return finish({
       ...base,
       status: "too_few_labels",
+      reasonCode: "too_few_labels",
       reason: `${sets.positive.length} usable labels, the floor is ${settings.minLabels}`,
     });
   }
   const split = timeSplit(sets.positive, { testFraction: settings.testFraction, minTest: settings.minTest });
-  if (!split.ok) return finish({ ...base, status: "split_too_small", reason: split.reason });
+  if (!split.ok) return finish({ ...base, status: "split_too_small", reasonCode: "split_too_small", reason: split.reason });
 
-  const rows: TrainingRow[] = split.train.map((e) => ({ features: featuresOf(toBenchCase(e)), label: e.label }));
+  // A decision created before the cutoff but answered at or after it: its label was not known when the test window began
+  const cutoff = Date.parse(split.cutoffAt);
+  const trainable = split.train.filter((e) => e.answeredAt === undefined || Date.parse(e.answeredAt) < cutoff);
+  labels.lateAnswers = split.train.length - trainable.length;
+  if (trainable.length === 0) return finish({ ...base, status: "split_too_small", reasonCode: "no_rows_before_cutoff", reason: "no training row was answered before the cutoff" });
+
+  const rows: TrainingRow[] = trainable.map((e) => ({ features: featuresOf(toBenchCase(e)), label: e.label }));
   mkdirSync(deps.workRoot, { recursive: true, mode: 0o700 });
   const workdir = mkdtempSync(join(deps.workRoot, "run-"));
+  const inputDir = join(workdir, "in");
+  const outputDir = join(workdir, "out");
   try {
-    writeFileSync(join(workdir, "input.json"), JSON.stringify({ rows, params: settings.params }), { mode: 0o600 });
-    const result = await deps.container.run({ image: settings.image, workdir, timeoutMs: settings.timeoutMs });
-    if (result.timedOut) return finish({ ...base, status: "failed", reason: "the trainer container timed out" });
+    mkdirSync(inputDir, { mode: 0o700 });
+    mkdirSync(outputDir, { mode: 0o700 });
+    writeFileSync(join(inputDir, "input.json"), JSON.stringify({ rows, params: settings.params }), { mode: 0o600 });
+    const result = await deps.container.run({ image: settings.image, inputDir, outputDir, timeoutMs: settings.timeoutMs });
+    // Reasons are fixed sentences: no path, no container output (the detail would carry host paths)
+    if (result.cleanupFailed) return finish({ ...base, status: "failed", reasonCode: "container_not_stopped", reason: "the trainer container could not be stopped: check docker" });
+    if (result.timedOut) return finish({ ...base, status: "failed", reasonCode: "timed_out", reason: "the trainer container timed out" });
     if (result.exitCode !== 0) {
-      return finish({ ...base, status: "failed", reason: `the trainer container exited with ${result.exitCode}: ${result.stderr.trim().slice(-300)}` });
+      return finish({ ...base, status: "failed", reasonCode: "container_exit", reason: `the trainer container exited with ${result.exitCode}` });
     }
     let model;
     try {
-      model = parseModel(readFileBounded(join(workdir, "model.json"), MAX_MODEL_BYTES));
-    } catch (e) {
-      return finish({ ...base, status: "failed", reason: `the trainer's model was refused: ${e instanceof Error ? e.message : String(e)}` });
+      model = parseModel(readFileBounded(join(outputDir, "model.json"), MAX_MODEL_BYTES));
+    } catch {
+      return finish({ ...base, status: "failed", reasonCode: "model_refused", reason: "the trainer's model was refused" });
     }
 
     // Answers marked bad before the cutoff veto a repeat; later ones are not looked at
@@ -111,7 +129,7 @@ export async function runTraining(deps: TrainerDeps): Promise<RunReport> {
       version,
       status: "trained",
       cutoffAt: split.cutoffAt,
-      trainCount: split.train.length,
+      trainCount: trainable.length,
       testCount: split.test.length,
       classifier: bench.models[0],
       baseline: bench.models[1],

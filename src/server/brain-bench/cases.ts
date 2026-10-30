@@ -38,14 +38,11 @@ export function parseCase(value: unknown): BenchCase {
   const label = text(value.label, "label", 64);
   if (!seen.has(label)) throw new Error(`label ${label} is not one of the option ids`);
   const reason = value.reason === undefined || value.reason === "" ? undefined : text(value.reason, "reason", 2000);
-  const at = value.at === undefined || value.at === "" ? undefined : text(value.at, "at", 40);
-  if (at !== undefined && !Number.isFinite(Date.parse(at))) throw new Error("at must be an ISO-8601 time");
-  const recommended = value.recommended === undefined || value.recommended === "" ? undefined : text(value.recommended, "recommended", 64);
-  if (recommended !== undefined && !seen.has(recommended)) throw new Error(`recommended ${recommended} is not one of the option ids`);
-  const outcome = value.outcome === undefined || value.outcome === "" ? undefined : value.outcome;
-  if (outcome !== undefined && outcome !== "good" && outcome !== "bad" && outcome !== "pending") {
-    throw new Error("outcome must be good, bad or pending");
-  }
+  // `at`, `recommended` and `outcome` are for the brain trainer only: an invalid value is left out (the trainer
+  // counts a case without a usable time as unusable), so a cases file that scored before still scores.
+  const at = typeof value.at === "string" && value.at.length <= 40 && Number.isFinite(Date.parse(value.at)) ? value.at : undefined;
+  const recommended = typeof value.recommended === "string" && seen.has(value.recommended) ? value.recommended : undefined;
+  const outcome = value.outcome === "good" || value.outcome === "bad" || value.outcome === "pending" ? value.outcome : undefined;
   return {
     id,
     kind,

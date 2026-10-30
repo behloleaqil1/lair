@@ -22,6 +22,8 @@ export interface Example {
   recommended?: string;
   /** The answered option id */
   label: string;
+  /** ISO-8601: when it was answered, if known (a case file has no such time) */
+  answeredAt?: string;
   outcome: Outcome;
 }
 
@@ -79,9 +81,22 @@ export type RunStatus = "trained" | "too_few_labels" | "split_too_small" | "fail
 export interface RunReport {
   version: string | null;
   status: RunStatus;
+  /** A fixed, host-free sentence for `status`; the detail goes to Lair's log only */
   reason?: string;
+  /** A short stable code for `reason` */
+  reasonCode?: string;
   at: string;
-  labels: { total: number; used: number; negative: number; pending: number; unusable: number };
+  labels: {
+    total: number;
+    used: number;
+    negative: number;
+    pending: number;
+    unusable: number;
+    /** Answered one-option decisions (acknowledgements): not choices, never labels */
+    notices?: number;
+    /** Created before the cutoff but answered at or after it: their label was not known yet, so they are not training rows */
+    lateAnswers?: number;
+  };
   /** The oldest decision in the test window: nothing at or after it was trained on */
   cutoffAt?: string;
   trainCount?: number;
