@@ -286,7 +286,14 @@ actor (7.2), never against a field the caller sends.
 
 ### 3.1 Architecture
 
-One store per project, like the bus store: `data/work/<project>.db`.
+**Options.**
+
+| Option | For | Against |
+|---|---|---|
+| A. One database per project, `data/work/<project>.db` (recommended) | Same as the bus store (`getBusStore`); a project's data is one file to back up, export or delete; no cross-project lock contention; project isolation is structural | Cross-project views (a global board) read several files |
+| B. One shared database with a `project` column | One connection; global queries are simple | One writer lock for all projects; a bug in a `WHERE project` clause leaks across projects; backup and delete are per-row |
+
+Recommendation: A. The `project` column stays in every table anyway (it keeps rows self-describing in exports).
 
 ```
 src/server/work/
@@ -301,24 +308,20 @@ src/server/work/
 
 ### 3.2 SQLite now, Postgres later
 
-The store uses SQLite with WAL mode, like every other Lair store. A `StoreBackend` interface allows Postgres for
-teams (M6, platform.md):
+**Options.**
 
-```typescript
-interface StoreBackend {
-  transaction<T>(fn: () => T): T;
-  query<T>(sql: string, params: unknown[]): T[];
-  exec(sql: string, params: unknown[]): { changes: number };
-}
+| Option | For | Against |
+|---|---|---|
+| A. SQLite only, behind a repository interface (recommended) | Same as every Lair store; the interface is at the level of domain operations, so a Postgres implementation can follow (M6, platform.md) without touching callers | One more layer than the other stores |
+| B. A generic SQL backend (`query`, `exec`, `transaction`) | Looks small | A SQL-level interface cannot be synchronous for Postgres (no Node client is), and SQLite's `better-sqlite3` is. A synchronous interface rules Postgres out; an async one makes every caller async for no gain today |
+| C. SQLite calls directly in the store, no interface | Least code | Postgres later means a rewrite of every caller |
 
-// SQLite implementation
-class SqliteBackend implements StoreBackend { ... }
-
-// Future: Postgres implementation
-class PostgresBackend implements StoreBackend { ... }
-```
-
-The work store takes a backend at construction; SQLite is the default.
+Recommendation: A. The boundary is an **async `WorkStore` repository interface** (`createTask`, `transition`,
+`appendEvent`, `listByState`, `readyByPriority`, `timeline`, `dependents`, `byExternalRef`, ...). The first
+implementation is `SqliteWorkStore` (its methods return resolved promises; transactions are internal to one
+method). A `PostgresWorkStore` is a second implementation of the same interface. Cost: every caller `await`s, which
+the HTTP routes and the planner already do. A transition that spans repository calls (4.5, 7.4) is expressed as one
+repository method, never as a caller holding a transaction.
 
 ### 3.3 Schema
 
@@ -336,7 +339,7 @@ CREATE TABLE work_tasks (
   source_ref TEXT NOT NULL,
   labels TEXT NOT NULL DEFAULT '[]',  -- JSON array
   brief_id TEXT,
-  dependencies TEXT NOT NULL DEFAULT '[]',  -- JSON array of task ids
+  dependencies TEXT NOT NULL DEFAULT '[]',  -- JSON array, display copy; work_task_deps is queried
   blocked_reason TEXT,
   external_provider TEXT,
   external_owner TEXT,
@@ -351,6 +354,17 @@ CREATE TABLE work_tasks (
 CREATE INDEX idx_work_tasks_state ON work_tasks(project, state);
 CREATE INDEX idx_work_tasks_agent ON work_tasks(project, agent) WHERE agent IS NOT NULL;
 CREATE INDEX idx_work_tasks_priority ON work_tasks(project, state, priority) WHERE state IN ('open', 'ready');
+CREATE UNIQUE INDEX idx_work_tasks_external
+  ON work_tasks(project, external_provider, external_owner, external_repo, external_number)
+  WHERE external_number IS NOT NULL;
+
+CREATE TABLE work_task_deps (
+  project TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  depends_on TEXT NOT NULL,
+  PRIMARY KEY (project, task_id, depends_on)
+);
+CREATE INDEX idx_work_task_deps_reverse ON work_task_deps(project, depends_on);
 
 CREATE TABLE work_events (
   id TEXT PRIMARY KEY,
@@ -401,14 +415,47 @@ constructor(dbPath: string) {
 
 ### 3.5 Backups and export
 
-- **Backup**: SQLite's `.backup()` before destructive operations and on schedule (cleanup module pattern).
+- **Backup**: new; no Lair store calls `.backup()` on main today, and the cleanup module covers worktrees and
+  watched folders only (ROADMAP B1 lists store backups as not built). This design defines it for the work store
+  and B1 may later generalise it:
+  - *when*: before an import apply, before an archive run, and daily (`work_store.backup.daily: true`);
+  - *where*: `data/backups/work/<project>-<timestamp>.db`, written with SQLite's online `.backup()`;
+  - *retention*: the last 7 daily copies plus every pre-import and pre-archive copy younger than 30 days; removals
+    are audited like the cleanup module's;
+  - *restore*: owner-only (`POST /api/work/restore`, `requireOwnerForChanges`), takes a backup name from the list,
+    stops writes for the project, swaps the file and starts the start-up reconcile (7.4).
 - **Export**: JSON and Markdown export via routes. JSON is the full store; Markdown is a human-readable task list.
 
 ### 3.6 Retention
 
-Events older than `retention_days` (default 90) are archived to `data/work/archive/<project>-<year>.db`, keeping
-only the latest event per task in the main store. The cleanup module pattern applies: bounded per cycle, every
-removal audited.
+**Options.**
+
+| Option | For | Against |
+|---|---|---|
+| A. By task: archive the events of tasks terminal (`done`, `dropped`) for more than `retention_days` (recommended) | An open task keeps its whole history; "full history" holds for every live task | Long-open tasks keep growing |
+| B. By event age, keep the latest per task | Simple | An open task older than the window loses `created` and `assigned`; the task page and 7.3 break |
+| C. No archive | Nothing lost | 200,000 events per project becomes unbounded |
+
+Recommendation: A. Events of a task that has been `done` or `dropped` for more than `retention_days` (default 90;
+a reopened task is not terminal) move to `data/work/archive/<project>-<year>.db`, leaving its `created` and its
+terminal event in the main store. Never an open task's events. The task page reads the archive on demand through
+`timeline(project, taskId, { includeArchive: true })`, which reads the main store, then the archive file for the
+task's terminal year. Bounded per cycle, every removal audited, a backup first (3.5).
+
+### 3.7 Query paths
+
+| Query | Used by | Index |
+|---|---|---|
+| Board: tasks by state | UI board | `idx_work_tasks_state` |
+| Ready list by priority | fill | `idx_work_tasks_priority` |
+| A task's timeline | task page | `idx_work_events_task` |
+| Latest event per task | board cards | `idx_work_events_task` (last row per task, `LIMIT 1`) |
+| Dependents of a finished task | `open` to `ready` on completion | `idx_work_task_deps_reverse` (`depends_on`), no JSON scan |
+| Task by external ref | tracker sync | `idx_work_tasks_external` (unique) |
+| Tasks of an agent | owner page | `idx_work_tasks_agent` |
+
+`dependencies` JSON on the task row is a display copy written in the same transaction as `work_task_deps`; the
+table is what queries read. The "< 10 ms" target in section 8 holds for these seven.
 
 ## 4. Access
 
