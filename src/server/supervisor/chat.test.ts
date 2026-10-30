@@ -1076,7 +1076,7 @@ describe("the supervisor block and its store", () => {
     expect(store.pendingTurns().map((t) => [t.id, t.project])).toEqual([["t-1", "demo"]]);
     store.close();
     const db = new Database(path, { readonly: true });
-    expect(db.pragma("user_version", { simple: true })).toBe(2);
+    expect(db.pragma("user_version", { simple: true })).toBe(3);
     db.close();
   });
 });

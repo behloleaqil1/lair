@@ -70,33 +70,36 @@ export const DEFAULT_INFRA_PATTERNS: readonly string[] = [
 /**
  * Patterns that indicate a code failure (not infra). If any of these appear,
  * the cause is NOT infrastructure.
+ *
+ * These are more specific to avoid false positives - e.g., "Command failed
+ * with rc=125" should NOT match even though it contains "failed".
  */
 export const CODE_FAILURE_PATTERNS: readonly string[] = [
-  // Test failures
-  "FAILED",
-  "FAILURE",
+  // Test failures - specific to test output
+  "\\btest.*failed\\b",
+  "\\btests?.*FAILED\\b",
+  "\\bFAILURE\\b",
   "AssertionError",
-  "Expected",
-  "expected",
   "assertion failed",
-  // Compile errors
-  "error:",
-  "Error:",
-  "compile error",
-  "compilation failed",
-  "syntax error",
+  "expected.*to (be|equal|match|have)",
+  "\\bExpected\\b.*\\bReceived\\b",
+  // Compile/type errors
+  "\\berror: Cannot find",
+  "\\berror: Module",
+  "\\berror TS\\d+:",
+  "\\bcompile error\\b",
+  "\\bcompilation failed\\b",
+  "\\bsyntax error\\b",
   "SyntaxError",
-  "TypeError",
-  "ReferenceError",
+  "TypeError:",
+  "ReferenceError:",
   // Lint errors
-  "lint",
-  "eslint",
-  "prettier",
-  "tsc error",
-  "type error",
-  // General test output
-  "tests? failed",
-  "\\d+ failing",
+  "\\beslint\\b",
+  "\\bprettier.*error\\b",
+  "\\btsc.*error\\b",
+  // Test runner output patterns
+  "\\d+ passing.*\\d+ failing",
+  "\\d+ tests?.*\\d+ failure",
 ];
 
 export interface ActParseResult {
