@@ -45,6 +45,10 @@ class FakeTofu implements SandboxSpawner {
   /** What `tofu plan -out` writes; change it between plans to make a different plan */
   planContent = "plan-file-v1";
   planExit = 2;
+  /** What `tofu show -json` reports for the plan: each resource and what the plan does to it */
+  resourceChanges: { address: string; actions: string[] }[] = [{ address: "aws_s3_bucket.logs", actions: ["create"] }];
+  showExit = 0;
+  showStdout: string | undefined;
   /** Exit and stderr of `tofu apply` */
   applyExit = 0;
   applyStderr = "";
@@ -58,6 +62,10 @@ class FakeTofu implements SandboxSpawner {
       const out = spec.argv.find((a) => a.startsWith("-out="));
       if (out && this.planExit === 2) writeFileSync(join(spec.workdir, out.slice(5)), this.planContent);
       return { exitCode: this.planExit, stdout: this.planExit === 2 ? "Plan: 1 to add" : "No changes", stderr: "", timedOut: false };
+    }
+    if (verb === "show") {
+      const stdout = this.showStdout ?? JSON.stringify({ format_version: "1.2", resource_changes: this.resourceChanges.map((c) => ({ address: c.address, change: { actions: c.actions } })) });
+      return { exitCode: this.showExit, stdout: this.showExit === 0 ? stdout : "", stderr: this.showExit === 0 ? "" : "Error: unreadable plan", timedOut: false };
     }
     if (verb === "apply") {
       await new Promise((r) => setTimeout(r, 5));
@@ -119,6 +127,20 @@ function get(r: Rig) {
   const runner = r.runner.get(PROJECT);
   if (!runner) throw new Error("no runner");
   return runner;
+}
+
+async function serveRoutes(r: Rig): Promise<{ app: FastifyInstance; owner: Record<string, string> }> {
+  const fastify = Fastify();
+  await registerRootGuards(fastify);
+  const tokenPath = join(tmp("tofu-runner-auth-"), "owner.token");
+  const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
+  await registerOwnerRoutes(fastify, auth);
+  await registerTofuRunnerRoutes(fastify, r.runner, () => PROJECT, auth);
+  await fastify.ready();
+  app = fastify;
+  const signIn = await fastify.inject({ method: "POST", url: "/api/owner/sessions", headers: BROWSER, payload: { token: readFileSync(tokenPath, "utf-8").trim() } });
+  expect(signIn.statusCode).toBe(201);
+  return { app: fastify, owner: { ...BROWSER, [OWNER_SESSION_HEADER]: signIn.json().data.session as string } };
 }
 
 type Planned = { status: "planned"; changes: true; planId: string; planHash: string };
@@ -185,12 +207,12 @@ describe("apply runs only the approved plan file, with the apply role", () => {
     const apply = r.issuer.requests.at(-1)!;
     expect(apply).toMatchObject({ roleArn: APPLY_ROLE, externalId: "lair-apply-ext", seconds: 3600 });
     // the apply steps hold the apply role's keys, not the plan role's
-    for (const spec of r.tofu.specs.slice(2)) {
+    for (const spec of r.tofu.specs.slice(3)) {
       expect(spec.env.AWS_ACCESS_KEY_ID).toBe(APPLY_CREDS.accessKeyId);
       expect(JSON.stringify(spec)).not.toContain(PLAN_CREDS.secretAccessKey);
     }
     // and the apply init reads the same state
-    expect(r.tofu.specs[2]!.argv).toContain("-backend-config=key=example/staging/terraform.tfstate");
+    expect(r.tofu.specs[3]!.argv).toContain("-backend-config=key=example/staging/terraform.tfstate");
   });
 
   it("applies a plan once", async () => {
@@ -263,6 +285,96 @@ describe("apply runs only the approved plan file, with the apply role", () => {
   });
 });
 
+describe("a plan that destroys or replaces needs its own approval, naming the resources", () => {
+  const DESTROYS = [
+    { address: "aws_db_instance.main", actions: ["delete"] },
+    { address: "aws_s3_bucket.logs", actions: ["create", "delete"] },
+    { address: "aws_s3_bucket.new", actions: ["create"] },
+  ];
+
+  it("flags what the plan deletes and replaces, and returns a confirmation bound to them", async () => {
+    const path = root();
+    const r = rig(path, {});
+    r.tofu.resourceChanges = DESTROYS;
+    const p = (await planned(r, path)) as Planned & { destroys: string[]; replaces: string[]; destroyConfirmation?: string };
+    expect(p.destroys).toEqual(["aws_db_instance.main"]);
+    expect(p.replaces).toEqual(["aws_s3_bucket.logs"]);
+    expect(p.destroyConfirmation).toMatch(/^[a-f0-9]{64}$/);
+    expect(r.tofu.verbs()).toEqual(["init", "plan", "show"]);
+    expect((await get(r).plans())[0]).toMatchObject({ destroys: ["aws_db_instance.main"], replaces: ["aws_s3_bucket.logs"] });
+  });
+
+  it("refuses an apply with the hash alone, naming the resources, with no credential issued", async () => {
+    const path = root();
+    const r = rig(path, {});
+    r.tofu.resourceChanges = DESTROYS;
+    const p = await planned(r, path);
+    const issued = r.issuer.requests.length;
+    const out = await get(r).apply(p.planId, p.planHash);
+    expect(out).toMatchObject({ status: "refused", reason: "destroy-not-confirmed" });
+    expect((out as { message: string }).message).toContain("destroy aws_db_instance.main");
+    expect((out as { message: string }).message).toContain("replace aws_s3_bucket.logs");
+    expect(await get(r).apply(p.planId, p.planHash, "0".repeat(64))).toMatchObject({ status: "refused", reason: "destroy-not-confirmed" });
+    expect(r.issuer.requests).toHaveLength(issued);
+    expect(r.tofu.applied).toEqual([]);
+    // the plan is still approvable: the refusal spent nothing
+    expect((await get(r).plans())[0]).toMatchObject({ status: "planned" });
+  });
+
+  it("applies with the confirmation that was returned with the plan", async () => {
+    const path = root();
+    const r = rig(path, {});
+    r.tofu.resourceChanges = DESTROYS;
+    const p = (await planned(r, path)) as Planned & { destroyConfirmation: string };
+    expect(await get(r).apply(p.planId, p.planHash, p.destroyConfirmation)).toMatchObject({ status: "applied" });
+    expect(r.tofu.applied).toEqual(["plan-file-v1"]);
+  });
+
+  it("a confirmation for another plan does not confirm this one", async () => {
+    const path = root();
+    const r = rig(path, {});
+    r.tofu.resourceChanges = DESTROYS;
+    const a = (await planned(r, path, "staging")) as Planned & { destroyConfirmation: string };
+    r.tofu.planContent = "plan-file-for-production";
+    const b = await planned(r, path, "production");
+    expect(await get(r).apply(b.planId, b.planHash, a.destroyConfirmation)).toMatchObject({ status: "refused", reason: "destroy-not-confirmed" });
+  });
+
+  it("asks for no confirmation, and returns none, when the plan only adds or changes", async () => {
+    const path = root();
+    const r = rig(path, {});
+    r.tofu.resourceChanges = [{ address: "aws_s3_bucket.logs", actions: ["update"] }];
+    const p = await planned(r, path);
+    expect(p).toMatchObject({ destroys: [], replaces: [] });
+    expect(p).not.toHaveProperty("destroyConfirmation");
+    expect(await get(r).apply(p.planId, p.planHash)).toMatchObject({ status: "applied" });
+  });
+
+  it("refuses to keep a plan whose changes cannot be read, or whose show fails", async () => {
+    const path = root();
+    const r = rig(path, {});
+    r.tofu.showStdout = "not json";
+    expect(await get(r).plan(path, "staging")).toMatchObject({ status: "refused", reason: "plan-unreadable" });
+    r.tofu.showStdout = undefined;
+    r.tofu.showExit = 1;
+    expect(await get(r).plan(path, "staging")).toMatchObject({ status: "failed", reason: "show" });
+    expect(existsSync(r.planDir) ? readdirSync(r.planDir) : []).toEqual([]);
+  });
+
+  it("over the route: refuses without confirmDestroy and applies with it", async () => {
+    const path = root();
+    const rg = rig(path, {});
+    rg.tofu.resourceChanges = DESTROYS;
+    const { app: a, owner } = await serveRoutes(rg);
+    const plan = await a.inject({ method: "POST", url: `/api/tofu-runner/plan?project=${PROJECT}&root=${encodeURIComponent(path)}&env=staging`, headers: owner });
+    const { planId, planHash, destroyConfirmation, destroys } = plan.json().data;
+    expect(destroys).toEqual(["aws_db_instance.main"]);
+    const base = `/api/tofu-runner/apply?project=${PROJECT}&plan=${planId}&hash=${planHash}`;
+    expect((await a.inject({ method: "POST", url: base, headers: owner })).json().data).toMatchObject({ status: "refused", reason: "destroy-not-confirmed" });
+    expect((await a.inject({ method: "POST", url: `${base}&confirmDestroy=${destroyConfirmation}`, headers: owner })).json().data).toMatchObject({ status: "applied" });
+  });
+});
+
 describe("a stale plan is refused", () => {
   it("when the state changed (tofu refuses the plan), nothing is rolled back and the runner re-plans", async () => {
     const path = root();
@@ -322,7 +434,7 @@ describe("a failed apply is not rolled back but re-planned", () => {
       replan: { status: "planned", changes: true },
     });
     // init, plan, then init, apply, then the re-plan's init and plan: nothing else
-    expect(r.tofu.verbs()).toEqual(["init", "plan", "init", "apply", "init", "plan"]);
+    expect(r.tofu.verbs()).toEqual(["init", "plan", "show", "init", "apply", "init", "plan", "show"]);
     expect(JSON.stringify(r.tofu.specs.map((s) => s.argv))).not.toMatch(/destroy|-replace|rollback/);
     const record = (await get(r).plans()).find((x) => x.id === p.planId);
     expect(record).toMatchObject({ status: "failed", finishedAt: NOW });
@@ -375,19 +487,7 @@ describe("off by default, and never half on", () => {
 });
 
 describe("routes (owner only)", () => {
-  async function serve(r: Rig): Promise<{ app: FastifyInstance; owner: Record<string, string> }> {
-    const fastify = Fastify();
-    await registerRootGuards(fastify);
-    const tokenPath = join(tmp("tofu-runner-auth-"), "owner.token");
-    const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
-    await registerOwnerRoutes(fastify, auth);
-    await registerTofuRunnerRoutes(fastify, r.runner, () => PROJECT, auth);
-    await fastify.ready();
-    app = fastify;
-    const signIn = await fastify.inject({ method: "POST", url: "/api/owner/sessions", headers: BROWSER, payload: { token: readFileSync(tokenPath, "utf-8").trim() } });
-    expect(signIn.statusCode).toBe(201);
-    return { app: fastify, owner: { ...BROWSER, [OWNER_SESSION_HEADER]: signIn.json().data.session as string } };
-  }
+  const serve = serveRoutes;
 
   it("plans, then applies the approved plan for the owner, without the plan file in any answer", async () => {
     const path = root();

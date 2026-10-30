@@ -23,8 +23,17 @@ import type { PlanCredentialIssuer, PlanCredentials, SandboxSpawner } from "./ty
 
 export type PlanOutcome =
   | { status: "refused"; reason: string; message: string; detail?: string[] }
-  | { status: "failed"; reason: "init" | "plan" | "timeout" | "output" | "credentials"; message: string; output: string }
-  | { status: "planned"; changes: boolean; output: string; credentialsExpireAt: string; codeHash: string; planFile?: Buffer };
+  | { status: "failed"; reason: "init" | "plan" | "show" | "timeout" | "output" | "credentials"; message: string; output: string }
+  | {
+      status: "planned";
+      changes: boolean;
+      output: string;
+      credentialsExpireAt: string;
+      codeHash: string;
+      planFile?: Buffer;
+      /** `tofu show -json` of the kept plan file: what the plan does to each resource. Not redacted or cut; the caller reads it and does not show it */
+      planJson?: string;
+    };
 
 export type ApplyOutcome =
   | { status: "refused"; reason: string; message: string; detail?: string[] }
@@ -237,6 +246,12 @@ export class PlanSandbox {
       const file = join(copy, PLAN_FILE);
       if ((await stat(file)).size > MAX_PLAN_FILE_BYTES) return { status: "failed", reason: "output", message: "plan sandbox: the plan file is too large", output: "" };
       outcome.planFile = await readFile(file);
+      // What the plan does to each resource, read by the caller before it can be approved
+      const shown = await step(["tofu", "show", "-json", "-no-color", PLAN_FILE]);
+      if (shown.outputOverflow) return { status: "failed", reason: "output", message: "plan sandbox: show wrote more output than allowed and was stopped", output: "" };
+      if (shown.timedOut) return { status: "failed", reason: "timeout", message: "plan sandbox: show timed out", output: "" };
+      if (shown.exitCode !== 0) return { status: "failed", reason: "show", message: "plan sandbox: the plan could not be read back", output: text(shown) };
+      outcome.planJson = shown.stdout;
     }
     return outcome;
   }

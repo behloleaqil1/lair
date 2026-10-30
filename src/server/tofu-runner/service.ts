@@ -22,7 +22,49 @@ import { PlanStore, sha256, type PlanRecord } from "./store.js";
 export type RunnerPlanOutcome =
   | Extract<PlanOutcome, { status: "refused" | "failed" }>
   | { status: "planned"; changes: false; output: string }
-  | { status: "planned"; changes: true; output: string; planId: string; planHash: string };
+  | {
+      status: "planned";
+      changes: true;
+      output: string;
+      planId: string;
+      planHash: string;
+      /** What the plan deletes, and what it replaces; when either is not empty, apply also needs `destroyConfirmation` */
+      destroys: string[];
+      replaces: string[];
+      destroyConfirmation?: string;
+    };
+
+/**
+ * What the plan does to each resource, from `tofu show -json`. A resource whose
+ * actions include `delete` is destroyed (or, with `create` too, replaced). A plan
+ * that cannot be read is refused: nothing that is not understood is approvable.
+ */
+export function readPlanChanges(planJson: string | undefined): { destroys: string[]; replaces: string[] } | undefined {
+  if (planJson === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(planJson);
+  } catch {
+    return undefined;
+  }
+  const changes = (parsed as { resource_changes?: unknown } | null)?.resource_changes;
+  if (changes === undefined) return { destroys: [], replaces: [] };
+  if (!Array.isArray(changes)) return undefined;
+  const destroys: string[] = [];
+  const replaces: string[] = [];
+  for (const c of changes as { address?: unknown; change?: { actions?: unknown } }[]) {
+    const actions = c?.change?.actions;
+    if (typeof c?.address !== "string" || !Array.isArray(actions)) return undefined;
+    if (!actions.includes("delete")) continue;
+    (actions.includes("create") ? replaces : destroys).push(c.address);
+  }
+  return { destroys: destroys.sort(), replaces: replaces.sort() };
+}
+
+/** The second approval of a plan that destroys or replaces: bound to the plan hash and the resources it names */
+export function destroyConfirmation(record: Pick<PlanRecord, "planHash" | "destroys" | "replaces">): string {
+  return sha256(Buffer.from(`destroy:${record.planHash}:${record.destroys.join(",")}:${record.replaces.join(",")}`));
+}
 
 export type RunnerApplyOutcome =
   | { status: "refused"; reason: string; message: string }
@@ -75,6 +117,8 @@ export class TofuRunner {
     const out = await sandbox.plan(root, { backend: this.backend(env, sandbox.settings.region), keepPlanFile: true });
     if (out.status !== "planned") return out;
     if (!out.changes || !out.planFile) return { status: "planned", changes: false, output: out.output };
+    const planChanges = readPlanChanges(out.planJson);
+    if (!planChanges) return { status: "refused", reason: "plan-unreadable", message: "tofu runner: the plan's changes could not be read, so it cannot be approved" };
     const planHash = sha256(out.planFile);
     const record: PlanRecord = {
       id: randomBytes(12).toString("hex"),
@@ -85,13 +129,28 @@ export class TofuRunner {
       codeHash: out.codeHash,
       createdAt: this.now().toISOString(),
       status: "planned",
+      ...planChanges,
     };
     await this.store.save(record, out.planFile);
-    return { status: "planned", changes: true, output: out.output, planId: record.id, planHash };
+    const risky = record.destroys.length + record.replaces.length > 0;
+    return {
+      status: "planned",
+      changes: true,
+      output: out.output,
+      planId: record.id,
+      planHash,
+      destroys: record.destroys,
+      replaces: record.replaces,
+      ...(risky ? { destroyConfirmation: destroyConfirmation(record) } : {}),
+    };
   }
 
-  /** Apply the approved plan `planId`; `approvedHash` is the hash the approval carries. */
-  async apply(planId: string, approvedHash: string): Promise<RunnerApplyOutcome> {
+  /**
+   * Apply the approved plan `planId`; `approvedHash` is the hash the approval carries.
+   * A plan that destroys or replaces also needs `confirmDestroy`, the confirmation
+   * returned with that plan, which names the resources.
+   */
+  async apply(planId: string, approvedHash: string, confirmDestroy?: string): Promise<RunnerApplyOutcome> {
     const refuse = (reason: string, message: string): RunnerApplyOutcome => ({ status: "refused", reason, message: `tofu runner: ${message}` });
     if (this.settings.mode !== "act") return refuse("observe-mode", "apply is off in observe mode");
     const sandbox = this.sandbox();
@@ -105,6 +164,10 @@ export class TofuRunner {
       if (approvedHash !== record.planHash) return refuse("hash-mismatch", "the approval is for a different plan");
       const file = await this.store.file(planId);
       if (!file || sha256(file) !== record.planHash) return refuse("plan-file-changed", "the plan file is not the approved one");
+      const named = [...record.destroys.map((a) => `destroy ${a}`), ...record.replaces.map((a) => `replace ${a}`)];
+      if (named.length > 0 && confirmDestroy !== destroyConfirmation(record)) {
+        return refuse("destroy-not-confirmed", `this plan would ${named.join(", ")}; it needs its own confirmation (confirmDestroy) naming them`);
+      }
 
       await this.store.update({ ...record, status: "applying" });
       const out = await sandbox.apply(record.root, {

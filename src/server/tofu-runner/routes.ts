@@ -31,6 +31,7 @@ const Query = z.object({
   env: z.string().min(1).max(32).optional(),
   plan: z.string().min(1).max(64).optional(),
   hash: z.string().min(1).max(128).optional(),
+  confirmDestroy: z.string().min(1).max(128).optional(),
 });
 
 export async function registerTofuRunnerRoutes(
@@ -77,7 +78,7 @@ export async function registerTofuRunnerRoutes(
       if (!query.success || !query.data.plan || !query.data.hash) return fail(reply, 400, "Invalid query");
       const runner = manager.get(query.data.project ?? defaultProject());
       if (!runner) return fail(reply, 404, "tofu_runner is not enabled for this project");
-      return respond(await runner.apply(query.data.plan, query.data.hash));
+      return respond(await runner.apply(query.data.plan, query.data.hash, query.data.confirmDestroy));
     });
   });
 }

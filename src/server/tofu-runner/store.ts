@@ -21,6 +21,9 @@ export interface PlanRecord {
   createdAt: string;
   status: PlanStatus;
   finishedAt?: string;
+  /** Addresses the plan deletes, and those it replaces (delete and create): either needs its own confirmation to apply */
+  destroys: string[];
+  replaces: string[];
 }
 
 const ID = /^[a-f0-9]{24}$/;
