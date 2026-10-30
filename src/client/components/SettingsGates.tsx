@@ -150,7 +150,7 @@ export function SettingsGates({ project, draft, sections, known, errors, disable
             {triageEnabled ? (
               <>
                 <span className="badge badge-success">enabled</span>
-                <span className="badge badge-neutral">{triageMode}</span>
+                <span className="badge badge-neutral">{String(triageMode)}</span>
               </>
             ) : (
               <span className="badge badge-neutral">disabled</span>
@@ -176,7 +176,7 @@ export function SettingsGates({ project, draft, sections, known, errors, disable
             {placementEnabled ? (
               <>
                 <span className="badge badge-success">enabled</span>
-                <span className="badge badge-neutral">{placementMode}</span>
+                <span className="badge badge-neutral">{String(placementMode)}</span>
               </>
             ) : (
               <span className="badge badge-neutral">disabled</span>
