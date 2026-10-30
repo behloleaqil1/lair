@@ -14,6 +14,7 @@ import { QueueCacheManager } from "./services/queue-cache.js";
 import { isValidDragonId } from "./parsers/dragon-config.js";
 import { registerRootGuards, requireValidIdParam } from "./root-guards.js";
 import { mountDecisions } from "./decisions/index.js";
+import { mountBrainTrainer } from "./brain-trainer/index.js";
 import { loadNotificationConfig, mountNotifications } from "./notifications/index.js";
 import { notificationsOn } from "./notifications/config.js";
 import {
@@ -561,6 +562,17 @@ await mountNotifications(fastify, {
   inbox: decisionInbox,
   humanAuth,
   dashboardUrl: dashboardUrlFor(HOST, PORT),
+});
+
+// Brain trainer (src/server/brain-trainer/): off unless data/server.yaml sets brain_trainer.enabled. A nightly
+// classifier trained in a container on the answered decisions, scored on the brain bench, versioned, and run in
+// shadow mode only: it is given a read-only view of the inbox and nothing it produces answers a decision.
+await mountBrainTrainer(fastify, {
+  configPath: join(process.cwd(), "data", "server.yaml"),
+  dataDir: join(process.cwd(), "data", "brain"),
+  decisions: decisionInbox,
+  events: getEventBus(),
+  humanAuth,
 });
 
 // Reviews and policy merge: one per project with `review.enabled: true`;

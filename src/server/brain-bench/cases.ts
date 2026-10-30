@@ -38,7 +38,23 @@ export function parseCase(value: unknown): BenchCase {
   const label = text(value.label, "label", 64);
   if (!seen.has(label)) throw new Error(`label ${label} is not one of the option ids`);
   const reason = value.reason === undefined || value.reason === "" ? undefined : text(value.reason, "reason", 2000);
-  return { id, kind, module: mod, evidence: value.evidence, options, label, ...(reason ? { reason } : {}) };
+  // `at`, `recommended` and `outcome` are for the brain trainer only: an invalid value is left out (the trainer
+  // counts a case without a usable time as unusable), so a cases file that scored before still scores.
+  const at = typeof value.at === "string" && value.at.length <= 40 && Number.isFinite(Date.parse(value.at)) ? value.at : undefined;
+  const recommended = typeof value.recommended === "string" && seen.has(value.recommended) ? value.recommended : undefined;
+  const outcome = value.outcome === "good" || value.outcome === "bad" || value.outcome === "pending" ? value.outcome : undefined;
+  return {
+    id,
+    kind,
+    module: mod,
+    evidence: value.evidence,
+    options,
+    label,
+    ...(reason ? { reason } : {}),
+    ...(at ? { at } : {}),
+    ...(recommended ? { recommended } : {}),
+    ...(outcome ? { outcome } : {}),
+  };
 }
 
 /** Parse JSON Lines text. Throws with the line number on the first bad line, and on a repeated id. */

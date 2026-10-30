@@ -23,6 +23,12 @@ export interface BenchCase {
   label: string;
   /** Why it was answered so (not shown to the model) */
   reason?: string;
+  /** ISO-8601 time of the decision: the brain trainer splits on it. Never shown to a model */
+  at?: string;
+  /** The option id the decision recommended. Never shown to a model */
+  recommended?: string;
+  /** Whether the answer later turned out right. Never shown to a model */
+  outcome?: "good" | "bad" | "pending";
 }
 
 export interface ModelAnswer {

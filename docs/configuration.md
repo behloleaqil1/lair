@@ -2774,7 +2774,7 @@ lair brain-bench --cases cases.jsonl --model ollama:qwen3:4b --model rules:rules
  "label": "wait", "reason": "the cooldown ends soon"}
 ```
 
-`evidence` holds structured fields (codes, counts, flags), not prose. `label` is the option id that was answered. `reason` is kept for people and never sent to a model. Other fields are ignored. A bad line stops the run with its line number.
+`evidence` holds structured fields (codes, counts, flags), not prose. `label` is the option id that was answered. `reason` is kept for people and never sent to a model. Three optional fields serve the [brain trainer](#brain-trainer) and are never sent to a model either: `at` (the decision's ISO-8601 time, for the time split), `recommended` (the option id Lair recommended) and `outcome` (`good`, `bad` or `pending`). An invalid value of one of these three is ignored (the field is left out, and the trainer counts a case without a usable `at` as unusable), so a file that scored before still scores. Other fields are ignored. A bad line stops the run with its line number.
 
 **Models** (`--model`, repeat it to compare):
 
@@ -2798,6 +2798,53 @@ The model is asked for `{"option", "reason_code", "confidence"}` with `option` l
 | latency | mean, p50 and p95 per case, in milliseconds |
 
 `--json` prints the report as JSON. Exit code 0 means the bench ran; 2 means bad input and nothing ran. Cases are asked one at a time per model.
+
+## Brain trainer
+
+The brain trainer starts the training that [decision-policies.md](design/decision-policies.md) §6 calls stage C, and keeps it going: every night it rebuilds the labelled set from the answered decisions, trains a small classifier, scores it on the [brain bench](#brain-bench) against the newest decisions, and keeps the result as a new version. The model that scores best then writes a **proposal into a trace** for each decision raised afterwards. **No model ever answers a decision**: the trainer is handed a read-only view of the Decision Inbox, nothing it produces is shown with a decision, and promoting a model past `shadow` is the owner's decision under the bars in §5 (30 comparisons, 90% agreement for a model, no unsafe disagreement, coverage 60%). It is off until `data/server.yaml` says otherwise.
+
+```yaml
+brain_trainer:
+  enabled: true
+  image: sha256:<64 hex>             # required: the id `docker build -q brain-trainer/` prints; Lair never pulls it
+  run_hour: 3                        # local hour of the nightly run
+  min_labels: 100                    # fewer usable labels: the run only writes its report
+  test_fraction: 0.2                 # the newest share is held out for the bench
+  min_test: 10                       # a newest window smaller than this is not scored
+  confidence_floor: 0.7              # a proposal below it is an abstain
+  timeout_minutes: 15
+  shadow: true                       # the best model writes proposals into the trace
+  cases_file: /abs/path/cases.jsonl  # optional: more labelled cases, in the brain bench format with "at"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Nothing runs, is written or is subscribed to while this is off |
+| `image` | `sha256:<64 hex>` or `name@sha256:<digest>` | none; required when `enabled` | The trainer image, named by content: a tag is refused, because a tag can be moved. Build it once with `docker build -q brain-trainer/` and put the id it prints here; a rebuilt image has a new id, so the config changes with it |
+| `run_hour` | integer 0-23 | `3` | The nightly run starts at this local hour, once a day |
+| `min_labels` | integer 20-100000 | `100` | Below this many usable labels a run only writes its report: no container starts, no model is made |
+| `test_fraction` | number 0.05-0.5 | `0.2` | The newest share of the decisions, by time, held out as the test window |
+| `min_test` | integer | `10` | A test window under this is not scored (the run reports `split_too_small`) |
+| `confidence_floor` | number 0-1 | `0.7` | A proposal below it is an abstain, in the bench and in the trace |
+| `timeout_minutes` | integer 1-240 | `15` | The container ends itself ten seconds sooner (an alarm inside it); one still running after this is killed by its exact name (then `docker rm -f`), and the run fails. A container that cannot be stopped is a failed run that says so |
+| `shadow` | boolean | `true` | Whether the best model writes proposals into the trace |
+| `cases_file` | absolute path | none | Extra labelled cases (the bench's JSON Lines, each with `at`, and `outcome` where known), read through the same file checks as `server.yaml` |
+
+The file is read again at every use, through the checks of the rest of `server.yaml`; a refused file turns the trainer off and the status says why.
+
+**Labels.** An answered decision is a label when a person chose its option; a default applied at expiry, a withdrawn decision and an open one are not. A decision with a single option is an acknowledgement, not a choice: it is never a label and the report counts it as `notices`. A decision raised before the cutoff but answered after it is not a training row (`lateAnswers`). An inbox decision has no outcome yet, so negative labels (`outcome: bad`) come only from the cases file. `outcome: bad` on a case marks an answer that turned out wrong: it is never a positive label, and a proposal equal to it for the same evidence (the same class and features, older than the test window) is refused as an abstain. `outcome: pending` is not a label until it is resolved. Only structured fields become features: the class (`module/kind/option ids`), the module, the offered and the recommended option ids, the evidence fields of a case (numbers, flags, and short identifier-like strings), and the hour of the day. A title, a context or a note never reaches a feature.
+
+**The time split.** Decisions are sorted by the time they were raised, and cut at a time, not at a position: everything strictly before the cutoff trains, everything at or after it tests. Decisions of the same instant therefore never fall on both sides, and no newer decision can reach the training set. The run keeps the cutoff in its report.
+
+**The container.** The fit runs in `lair-brain-trainer` (`brain-trainer/`: Python with scikit-learn's gradient boosting, every dependency pinned in `requirements.txt`). The image is built from a base pinned by digest, and its dependencies are installed with `--require-hashes` (every wheel's sha256 is in `requirements.txt`). Lair starts it with `--network none`, `--pull never`, a read-only root, all capabilities dropped, 2 GB of memory with no swap, 2 CPUs and 256 processes, no environment from the host, and two mounts: the input rows read-only at `/in`, and a separate directory at `/out` that receives `model.json`. It never runs as root: it runs as Lair's own user, and Lair refuses to start it when that is uid 0 (run Lair as a regular user). A file the container writes must be a plain file under the size limit, never a link. The model comes back as trees in a JSON file, which Lair validates as untrusted input (bounded size, node counts, child indexes that always point forward) and evaluates itself: no Python is needed to make a proposal, and each proposal takes microseconds.
+
+**Versions.** Each trained run keeps `data/brain/models/m-<UTC time>/model.json` and `report.json`; a version is never overwritten (a second run in the same second becomes `...-2`), and `data/brain/runs.jsonl` lists every run, including the ones that only reported. `data/brain/best.json` names the model that shadows: it moves to a new model only when that model is strictly better on its own test window (accuracy, then fewer wrong-but-confident answers). That is not a promotion: it changes only which model writes proposals.
+
+**The report** is the brain bench's, per class (`module/kind/option ids`, or the `class`/`title_class` a case carries): accuracy, abstain rate and wrong-but-confident rate for the classifier and, beside it, for Lair's own recommended option on the same window, which is the bar to beat. **The shadow trace** (`data/brain/shadow-trace.jsonl`) holds `{decisionId, class, proposer, version, option, reasonCode, confidence, at}` per decision raised (`option` is `null` for an abstain); once a decision is answered, the status compares them: per class and version, proposals compared, agreed, abstained and wrong-but-confident.
+
+**Routes (owner only).** `GET /api/owner/brain-trainer` returns the status: whether it is on, the runs over time with their reports (the curve), the model that shadows, the shadow agreement per class, and `skipped`, the number of lines in the run history and the trace that could not be read and were left out. A run's `reason` is a fixed sentence with a `reasonCode`; paths and the container's own output stay out of it (the detail goes to Lair's log). `POST /api/owner/brain-trainer/run` starts a run now in the background (`202`; `409` while it is off or a run is going).
+
+**Not built yet:** the weekly LoRA run for a local language model (stage D), and the Decisions view's chart of the curve; both are tracked as follow-ups.
 
 ## Example complete configuration
 
