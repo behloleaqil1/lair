@@ -2172,6 +2172,76 @@ Unknown keys, a lane on an unknown machine, an unknown class in `limits` or `eli
 
 Events on the bus: `placement.moved`, `placement.would_move`, `placement.move_failed`, `placement.machine_up`, `placement.machine_down`, `placement.job_held`.
 
+## Infrastructure Monitor
+
+> Off by default. With `enabled: true` and the default `mode: observe`, the infrastructure monitor watches running jobs' machines and raises notices when infrastructure problems occur. In `act` mode, it can re-queue jobs to alternative lanes.
+
+The infrastructure monitor detects three classes of problems:
+
+1. **Job machine down**: A job is running on a machine that has become unreachable. After the configured threshold, a notice is raised and, in act mode, the job is re-queued to another lane.
+
+2. **Duplicate runner slots**: Two or more runner processes claim the same lane's slot (multiple `runner-<lane>.pid` files). This usually indicates a configuration or race condition problem.
+
+3. **Dead runner**: A lane's machine is unreachable while jobs are queued to that lane. The jobs cannot be picked up until the machine recovers.
+
+```yaml
+infra_monitor:
+  enabled: true
+  mode: observe               # observe | act
+  interval_seconds: 60        # how often to check (default 60s, min 10s, max 3600s)
+  down_threshold_seconds: 120 # how long a machine must be down before noticing (default 120s)
+  probe_cmd: ["ssh", "-o", "ConnectTimeout=5", "{machine}", "echo", "ok"]
+  probe_timeout_seconds: 10
+  requeue_cmd: ["./bin/requeue-gate", "{gate}", "{from_lane}", "{to_lane}"]
+  requeue_timeout_seconds: 30
+```
+
+### Options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Run the infrastructure monitor for this project |
+| `mode` | `observe` \| `act` | `observe` | `observe` raises notices only; `act` also re-queues jobs |
+| `interval_seconds` | number | `60` | Seconds between checks (10–3600) |
+| `down_threshold_seconds` | number | `120` | Seconds a machine must be down before a notice is raised (30–1800) |
+| `probe_cmd` | string[] | — | Command to probe a machine's reachability; `{machine}` is replaced with the machine id |
+| `probe_timeout_seconds` | number | `10` | Timeout for probe commands (1–60) |
+| `requeue_cmd` | string[] | — | Command to re-queue a job; placeholders: `{gate}`, `{from_lane}`, `{to_lane}` |
+| `requeue_timeout_seconds` | number | `30` | Timeout for re-queue commands (1–120) |
+
+### How it works
+
+Every `interval_seconds`:
+
+1. **Probe machines.** Each machine used by the project's lanes is probed with `probe_cmd`. A machine is considered down when its probe fails and has been failing for at least `down_threshold_seconds`.
+
+2. **Track jobs.** The gate queue is read for running jobs (`.req.run` files). Each running job is tracked with its lane, machine, and start time.
+
+3. **Detect problems.** The detectors check for:
+   - Jobs running on machines that are down
+   - Multiple runner pid files for the same lane
+   - Lanes with queued jobs whose machine is down
+
+4. **Raise notices.** Each finding raises one notice to the Decision Inbox. Notices are deduplicated: the same finding is not raised again until it is resolved.
+
+5. **Act mode.** When `mode: act` and a job is running on a down machine, `requeue_cmd` is called once for that job. A successful re-queue (exit 0) clears the notification so it can fire again if the job ends up on another failing machine.
+
+**Command safety.** Command arrays must not contain shell metacharacters (`;&|`\`$(){}`) except placeholders (`{machine}`, `{gate}`, etc.). The first element must not start with `-`. Unreplaced placeholders are an error.
+
+**Machines.** The monitor uses the `machines:` configuration to map lanes to machines. A lane not assigned to any machine is treated as local and is not probed.
+
+### Infrastructure Monitor API
+
+`GET /api/infra-monitor/status?project=` (read-only): whether the monitor is enabled and running, its mode, the last tick summary, monitored jobs, machine states, and active notices.
+
+`GET /api/infra-monitor/jobs?project=`: Running jobs currently being monitored.
+
+`GET /api/infra-monitor/machines?project=`: Machine states (reachable, last probe time, down since, last error).
+
+`GET /api/infra-monitor/notices?project=`: Active infrastructure notices.
+
+Events on the bus: `decision.needed` when a notice is raised; `placement.moved` when a job is re-queued in act mode.
+
 ## Cleanup
 
 > Off by default. With `enabled: true`, Lair removes stale worktrees and old entries from watched folders. In `observe` mode (the default) it logs what it would remove; in `act` mode it removes.
@@ -2471,7 +2541,7 @@ Project names (the file name without `.yaml` or `.yml`) must start with a letter
 
 The server watches `projects/` and `projects/local/`. When a project file changes (or a new one appears), it waits until the file has been quiet for a second, then reads it and checks it with every module's own parser, the same checks as at startup:
 
-- **Valid:** only the modules whose part of the file changed are reloaded, each for that project only. A module's part is its own block (`watchdog:`, `delivery:`, `pipelines:` and `executors:`, `review:`, `agents:`, `triage:`, `placement:`, `planner:`, `supervisor:`), the blocks it also reads (the agents module reads `watchdog:`, the planner `agents:`), and every other top-level key a module may read (`repo`, `read_only`, `dragons`, `machines`, `agents_dir`, `outbox_file`...), so a change to one of those reloads every module of the project. Keys no module reads reload nothing: the dashboard's commands (`*_cmd`, `allow_direct_assign`, `backlog_file`), `merge_bar`, `processes`, `orchestrator`, `available_models` and `gate_runner`. Editing only a comment reloads nothing. The dashboard's reads use the new file from the next request.
+- **Valid:** only the modules whose part of the file changed are reloaded, each for that project only. A module's part is its own block (`watchdog:`, `delivery:`, `pipelines:` and `executors:`, `review:`, `agents:`, `triage:`, `placement:`, `planner:`, `supervisor:`, `infra_monitor:`), the blocks it also reads (the agents module reads `watchdog:`, the planner `agents:`, the infra monitor `machines:`), and every other top-level key a module may read (`repo`, `read_only`, `dragons`, `machines`, `agents_dir`, `outbox_file`...), so a change to one of those reloads every module of the project. Keys no module reads reload nothing: the dashboard's commands (`*_cmd`, `allow_direct_assign`, `backlog_file`), `merge_bar`, `processes`, `orchestrator`, `available_models` and `gate_runner`. Editing only a comment reloads nothing. The dashboard's reads use the new file from the next request.
 - **Invalid** (YAML errors, missing required fields, any module's parser refusing its block, a file that is not a regular file or is over 1 MiB): nothing changes, and the modules keep running the previous config. The error is logged, emitted as a `config.invalid` event, and shown in a banner on the dashboard: "projects/x.yaml has an error; the previous config is still running: ..." until the file is fixed.
 - **Another file:** the modules keep running the file they started with. When it is deleted (deleting `projects/local/x.yaml` would otherwise fall back to the public `projects/x.yaml`), or a new file takes its place (a new `projects/local/x.yaml`), nothing changes and the banner says so; restart Lair to switch files. Deleting a project's only file also keeps its previous config running until a restart.
 
@@ -2489,6 +2559,7 @@ A module is reloaded by stopping its instance for the project cleanly and starti
 | triage | The tick, ingests and outbox in progress finish first |
 | placement | As on shutdown: a probe or `move_cmd` in progress is cut short, and a move it cut short is found again by the new instance's first tick. Learned durations, moves and cool-downs are kept (they are in the store); probe history starts again, so a machine is up again only after `min_up_seconds` |
 | supervisor | A round of checks in progress finishes; the next one, a few seconds later, runs with the new settings. A check turned off withdraws its open notice |
+| infra_monitor | A tick in progress is cut short. Machine states and notices are kept in memory; they start fresh after the reload |
 
 Reloads of one module for one project never overlap: a change made while one runs is applied after it, with the latest file (also when the latest file is the one that ran before). A module that fails to start with the new config (for example, its store can't be opened) is started again with the previous one, and the banner says so; it is never left half-started.
 

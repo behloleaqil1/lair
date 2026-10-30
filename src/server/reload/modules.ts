@@ -18,6 +18,8 @@ import type { PlannerManager } from "../planner/manager.js";
 import { parseWatchdogConfig } from "../watchdog/config.js";
 import type { WatchdogManager } from "../watchdog/service.js";
 import type { Supervisor } from "../supervisor/service.js";
+import { parseInfraMonitorConfig } from "../infra-monitor/config.js";
+import type { InfraMonitorManager } from "../infra-monitor/service.js";
 
 export interface ProjectEntry {
   name: string;
@@ -53,6 +55,7 @@ export interface ServerModules {
   placements?: PlacementManager;
   planner?: PlannerManager;
   supervisor?: Supervisor;
+  infraMonitor?: InfraMonitorManager;
 }
 
 function errorsOf(result: { ok: true } | { ok: false; errors: string[] }): string[] {
@@ -62,7 +65,7 @@ function errorsOf(result: { ok: true } | { ok: false; errors: string[] }): strin
 /** The server's modules, as src/server/index.ts wires them. */
 export function serverModules(m: ServerModules): ReloadableModule[] {
   const modules: ReloadableModule[] = [];
-  const { delivery, watchdogs, pipelines, reviews, agents, triage, placements, planner, supervisor } = m;
+  const { delivery, watchdogs, pipelines, reviews, agents, triage, placements, planner, supervisor, infraMonitor } = m;
   if (delivery) {
     modules.push({
       name: "delivery",
@@ -143,6 +146,16 @@ export function serverModules(m: ServerModules): ReloadableModule[] {
       reads: ["agents", "dragons", "ai", "planner"],
       validate: (config) => supervisor.validate(config),
       reload: (entry) => supervisor.reloadProject(entry),
+    });
+  }
+  if (infraMonitor) {
+    modules.push({
+      name: "infra_monitor",
+      blocks: ["infra_monitor"],
+      // Reads the machines config for lane-to-machine mapping
+      reads: ["machines"],
+      validate: (config) => errorsOf(parseInfraMonitorConfig(config.infra_monitor)),
+      reload: (entry) => infraMonitor.reloadProject(entry),
     });
   }
   return modules;

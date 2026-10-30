@@ -103,6 +103,12 @@ export interface ProjectConfig {
    * docs/configuration.md#supervisor-self-checks-and-the-ops-api
    */
   supervisor?: Record<string, unknown>;
+  /**
+   * Infrastructure monitor: watch running jobs' machines
+   * (src/server/infra-monitor/). Validated by parseInfraMonitorConfig; see
+   * docs/configuration.md#infra-monitor
+   */
+  infra_monitor?: Record<string, unknown>;
 }
 
 // Process configuration as it appears in YAML (before defaults applied)

@@ -48,6 +48,7 @@ import { getBudgetManager } from "./fleet/budget.js";
 import { ReviewManager, inboxDecisionSink, registerReviewRoutes } from "./review/index.js";
 import { mountTriage } from "./triage/index.js";
 import { PlacementManager, registerPlacementRoutes } from "./placement/index.js";
+import { InfraMonitorManager, registerInfraMonitorRoutes } from "./infra-monitor/index.js";
 import { registerDashboardRoutes } from "./dashboard/index.js";
 import type { DashboardSources } from "./dashboard/routes.js";
 import { RequestLatency, mountSupervisor, registerLatencyHook } from "./supervisor/index.js";
@@ -571,6 +572,16 @@ const placements = new PlacementManager({
 placements.load(projectEntries);
 await registerPlacementRoutes(fastify, placements, () => getDefaultProject());
 
+// Infrastructure monitor: watch running jobs' machines for infrastructure
+// problems (machine down, duplicate runners, dead runner with queued jobs).
+// Off unless a project sets `infra_monitor.enabled: true`.
+const infraMonitor = new InfraMonitorManager({
+  events: getEventBus(),
+});
+infraMonitor.load(projectEntries);
+infraMonitor.useDecisions(decisionInbox);
+await registerInfraMonitorRoutes(fastify, infraMonitor, () => getDefaultProject());
+
 // The dashboard's own reads (src/server/dashboard/): the nav's module flags,
 // a gate's detail from the queue, the pipelines, triage and placement, and
 // the owner-only log tails and failing tests
@@ -657,7 +668,7 @@ const { supervisor: selfChecks, chat: supervisorChat } = await mountSupervisor(f
 // the modules whose part of it changed, without a restart; an invalid one
 // keeps the previous config running and shows in the dashboard's banner
 const reloader = new ConfigReloader({
-  modules: serverModules({ delivery, watchdogs, pipelines, reviews, agents, triage, placements, planner, supervisor: selfChecks }),
+  modules: serverModules({ delivery, watchdogs, pipelines, reviews, agents, triage, placements, planner, supervisor: selfChecks, infraMonitor }),
   initial: projectEntries,
   events: getEventBus(),
   onAccepted: (project, config) => {
@@ -760,6 +771,9 @@ const stopServer = async (reason: string) => {
 
   // Stop placement: a move in progress is cut short and found again on the next start
   await placements.stop();
+
+  // Stop infra monitor: any tick in progress is cut short
+  await infraMonitor.stop();
 
   // Stop the shared process cache (all modules have stopped, so no one reads it)
   disposeProcessCache();
@@ -914,6 +928,14 @@ const start = async () => {
       placed.length > 0
         ? `[placement] Placing jobs for: ${placed.join(", ")}`
         : "[placement] Off (no project sets placement.enabled)",
+    );
+
+    // Start infra monitor (machine probes, job tracking, notice raising)
+    const infraMonitored = infraMonitor.start();
+    console.log(
+      infraMonitored.length > 0
+        ? `[infra-monitor] Watching jobs for: ${infraMonitored.join(", ")}`
+        : "[infra-monitor] Off (no project sets infra_monitor.enabled)",
     );
 
     // Start file watchers for all projects
