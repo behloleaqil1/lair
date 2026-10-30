@@ -84,12 +84,12 @@ interface Rig {
   infra: InfraPolicyManager;
 }
 
-function rig(path: string, sandboxBlock: Record<string, unknown> | undefined, infra?: InfraPolicyManager): Rig {
+function rig(path: string, sandboxBlock: Record<string, unknown> | undefined, infra?: InfraPolicyManager, clock = "2026-10-30T12:00:00.000Z"): Rig {
   const policy = infra ?? new InfraPolicyManager();
   if (!infra) policy.load([{ name: PROJECT, config: { infra_policy: { enabled: true, roots: [path], allowed_providers: ["hashicorp/aws"] } } }]);
   const issuer = new FakeIssuer();
   const spawner = new FakeSpawner();
-  const sandbox = new PlanSandboxManager({ spawner, issuer, infra: policy, now: () => new Date("2026-10-30T12:00:00.000Z") });
+  const sandbox = new PlanSandboxManager({ spawner, issuer, infra: policy, now: () => new Date(clock) });
   const block = sandboxBlock && {
     enabled: true,
     plan_role_arn: ROLE,
@@ -147,6 +147,14 @@ describe("the plan runs with the read-only plan role", () => {
     const short = rig(path, { timeout_seconds: 60 });
     await short.sandbox.get(PROJECT)!.plan(path);
     expect(short.spawner.specs.every((s) => s.timeoutMs === 60_000)).toBe(true);
+  });
+
+  it("stops a step when the credentials end, if that is sooner than the timeout", async () => {
+    const path = root(AWS);
+    // the credentials end at 12:15:00 and it is 12:10:00: 300 s are left, less than the 600 s setting
+    const r = rig(path, { timeout_seconds: 600 }, undefined, "2026-10-30T12:10:00.000Z");
+    await r.sandbox.get(PROJECT)!.plan(path);
+    expect(r.spawner.specs.map((s) => s.timeoutMs)).toEqual([300_000, 300_000]);
   });
 
   it("fails without running anything when the role cannot be assumed", async () => {
@@ -353,6 +361,16 @@ describe("a failed or slow run", () => {
     r.spawner.results.push({ exitCode: 0, stdout: "", stderr: "", timedOut: false }, { exitCode: 1, stdout: "", stderr: "", timedOut: true });
     expect(await r.sandbox.get(PROJECT)!.plan(path)).toMatchObject({ status: "failed", reason: "timeout" });
   });
+
+  it("reports output that overflows the buffer as an overflow, not a timeout", async () => {
+    const path = root(AWS);
+    const r = rig(path, {});
+    r.spawner.results.push({ exitCode: 1, stdout: "x", stderr: "", timedOut: false, outputOverflow: true });
+    expect(await r.sandbox.get(PROJECT)!.plan(path)).toMatchObject({ status: "failed", reason: "output" });
+    expect(r.spawner.specs).toHaveLength(1);
+    r.spawner.results.push({ exitCode: 0, stdout: "", stderr: "", timedOut: false }, { exitCode: 1, stdout: "x", stderr: "", timedOut: false, outputOverflow: true });
+    expect(await r.sandbox.get(PROJECT)!.plan(path)).toMatchObject({ status: "failed", reason: "output" });
+  });
 });
 
 describe("off by default", () => {
@@ -392,6 +410,30 @@ describe("off by default", () => {
     expect(await r.sandbox.get(PROJECT)!.plan(path)).toMatchObject({ status: "refused", reason: "invalid-config" });
     expect(r.issuer.requests).toHaveLength(0);
     expect(r.spawner.specs).toHaveLength(0);
+  });
+});
+
+describe("the startup sweep", () => {
+  const make = (block: Record<string, unknown> | undefined) => {
+    let swept = 0;
+    const m = new PlanSandboxManager({ spawner: new FakeSpawner(), issuer: new FakeIssuer(), infra: new InfraPolicyManager(), sweep: async () => void swept++ });
+    m.load([{ name: PROJECT, config: block ? { plan_sandbox: block } : {} }]);
+    return { m, swept: () => swept };
+  };
+  const on = { enabled: true, plan_role_arn: ROLE, external_id: "lair-ext-1", image: "plan-runner:1", plugin_dir: "/srv/mirror" };
+
+  it("runs once when a project has the sandbox on", async () => {
+    const s = make(on);
+    await s.m.startupSweep();
+    expect(s.swept()).toBe(1);
+  });
+
+  it("does not touch docker or the temp directory when no project has it on, or the block is invalid", async () => {
+    for (const block of [undefined, { enabled: false }, { ...on, image: undefined }]) {
+      const s = make(block);
+      await s.m.startupSweep();
+      expect(s.swept()).toBe(0);
+    }
   });
 });
 

@@ -23,7 +23,7 @@ import type { PlanCredentialIssuer, PlanCredentials, SandboxSpawner } from "./ty
 
 export type PlanOutcome =
   | { status: "refused"; reason: string; message: string; detail?: string[] }
-  | { status: "failed"; reason: "init" | "plan" | "timeout" | "credentials"; message: string; output: string }
+  | { status: "failed"; reason: "init" | "plan" | "timeout" | "output" | "credentials"; message: string; output: string }
   | { status: "planned"; changes: boolean; output: string; credentialsExpireAt: string };
 
 /** The whole environment of the sandboxed process. Nothing of Lair's own is in it. */
@@ -47,6 +47,8 @@ export interface PlanSandboxDeps {
   issuer: PlanCredentialIssuer;
   infra: InfraPolicyManager;
   now?: () => Date;
+  /** Removes what a crashed run left (temp copies, containers); run once by `startupSweep` */
+  sweep?: () => Promise<unknown>;
 }
 
 function redact(text: string, secrets: string[], limit: number): string {
@@ -132,10 +134,12 @@ export class PlanSandbox {
     const text = (r: { stdout: string; stderr: string }) => redact(`${r.stdout}${r.stderr}`, secrets, s.maxOutputBytes);
 
     const init = await step(["tofu", "init", "-input=false", "-no-color", "-lockfile=readonly", "-plugin-dir=/plugins"]);
+    if (init.outputOverflow) return { status: "failed", reason: "output", message: "plan sandbox: init wrote more output than allowed and was stopped", output: text(init) };
     if (init.timedOut) return { status: "failed", reason: "timeout", message: "plan sandbox: init timed out", output: text(init) };
     if (init.exitCode !== 0) return { status: "failed", reason: "init", message: "plan sandbox: init failed", output: text(init) };
 
     const plan = await step(["tofu", "plan", "-input=false", "-no-color", "-lock=false", "-detailed-exitcode"]);
+    if (plan.outputOverflow) return { status: "failed", reason: "output", message: "plan sandbox: plan wrote more output than allowed and was stopped", output: text(plan) };
     if (plan.timedOut) return { status: "failed", reason: "timeout", message: "plan sandbox: plan timed out", output: text(plan) };
     if (plan.exitCode !== 0 && plan.exitCode !== 2) return { status: "failed", reason: "plan", message: "plan sandbox: plan failed", output: text(plan) };
     return { status: "planned", changes: plan.exitCode === 2, output: text(plan), credentialsExpireAt: creds.expiresAt };
@@ -194,6 +198,17 @@ export class PlanSandboxManager {
         continue;
       }
       if (parsed.settings.enabled) this.sandboxes.set(entry.name, new PlanSandbox(entry.name, parsed.settings, this.deps));
+    }
+  }
+
+  /** Once at startup, only when some project has the sandbox on: remove what a crash left behind */
+  async startupSweep(): Promise<void> {
+    if (!this.deps.sweep) return;
+    if (![...this.sandboxes.values()].some((s) => s instanceof PlanSandbox)) return;
+    try {
+      await this.deps.sweep();
+    } catch (e) {
+      console.warn(`[plan-sandbox] startup sweep failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 

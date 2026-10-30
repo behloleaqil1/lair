@@ -41,7 +41,7 @@ import { getEventBus } from "./core/event-bus.js";
 import { WatchdogManager, registerWatchdogRoutes } from "./watchdog/index.js";
 import { DeliveryManager, registerDeliveryRoutes } from "./delivery/index.js";
 import { InfraPolicyManager, registerInfraPolicyRoutes } from "./infra-policy/index.js";
-import { AwsCliIssuer, DockerSpawner, PlanSandboxManager, registerPlanSandboxRoutes } from "./plan-sandbox/index.js";
+import { AwsCliIssuer, DockerSpawner, PlanSandboxManager, registerPlanSandboxRoutes, sweepLeftovers } from "./plan-sandbox/index.js";
 import { PipelineManager, registerPipelineRoutes } from "./gates/index.js";
 import { AgentsManager, registerAgentsRoutes, systemAgentProbesWithCache } from "./agents/index.js";
 import { isActive } from "./agents/types.js";
@@ -425,8 +425,9 @@ await registerInfraPolicyRoutes(fastify, infraPolicy, () => getDefaultProject(),
 // Plan sandbox: `tofu plan` in an isolated container with the read-only plan
 // role, only after the policy scan passes. One per project with
 // `plan_sandbox.enabled: true` (off by default).
-const planSandbox = new PlanSandboxManager({ spawner: new DockerSpawner(), issuer: new AwsCliIssuer(), infra: infraPolicy });
+const planSandbox = new PlanSandboxManager({ spawner: new DockerSpawner(), issuer: new AwsCliIssuer(), infra: infraPolicy, sweep: () => sweepLeftovers() });
 planSandbox.load(projectEntries);
+await planSandbox.startupSweep();
 await registerPlanSandboxRoutes(fastify, planSandbox, () => getDefaultProject(), humanAuth);
 
 // AI tools (src/server/ai/): per machine, whether each tool is installed and

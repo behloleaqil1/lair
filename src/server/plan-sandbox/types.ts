@@ -33,8 +33,25 @@ export interface SandboxResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /** The process wrote more than the buffer holds and was stopped: not a timeout */
+  outputOverflow?: boolean;
 }
 
 export interface SandboxSpawner {
   run(spec: SandboxSpec): Promise<SandboxResult>;
 }
+
+/**
+ * The only environment names whose values are not secret. Their values go to the
+ * container explicitly (`-e NAME=value`); every other name is a credential and
+ * is passed by name only (`-e NAME`), so it never appears in the process list.
+ */
+export const PLAIN_ENV_NAMES: ReadonlySet<string> = new Set([
+  "PATH",
+  "HOME",
+  "TF_IN_AUTOMATION",
+  "TF_INPUT",
+  "CHECKPOINT_DISABLE",
+  "AWS_EC2_METADATA_DISABLED",
+  "AWS_REGION",
+]);
