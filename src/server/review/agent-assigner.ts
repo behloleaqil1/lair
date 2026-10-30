@@ -589,6 +589,16 @@ export class AgentReviewAssigner implements ReviewAssigner {
         why: "The configuration can't satisfy the slot, so every PR that needs it waits.",
         kind: "other",
         reversible: true,
+        structure: {
+          class: "review.config",
+          evidence: {
+            code: "config_unsatisfiable",
+            facts: { pr: record.pr, head_sha: record.headSha, slot: record.slot },
+            cause_cleared: false,
+            linked_issue: null,
+          },
+          effects: ["reversible", "outward"],
+        },
         requestedBy: "review",
         links: record.spec.url ? [{ label: `PR #${record.pr}`, url: record.spec.url }] : [],
         key,
@@ -623,6 +633,16 @@ export class AgentReviewAssigner implements ReviewAssigner {
         why: `Every reviewer run ended without a review, and the ${spec.tier} tier needs one before it can merge.`,
         kind: "escalation",
         reversible: true,
+        structure: {
+          class: "review.stuck",
+          evidence: {
+            code: "no_reviewer",
+            facts: { pr: record.pr, head_sha: record.headSha, tier: spec.tier, reviewers_tried: spec.tried.length, attempts: record.attempts },
+            cause_cleared: false,
+            linked_issue: null,
+          },
+          effects: ["outward", "reversible"],
+        },
         requestedBy: "review",
         links: spec.url ? [{ label: `PR #${record.pr}`, url: spec.url }] : [],
         key: `review:agents:${record.pr}:${record.headSha}:${record.slot}:${record.round}`,

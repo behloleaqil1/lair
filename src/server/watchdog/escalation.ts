@@ -127,6 +127,7 @@ export function decisionFor(
     options.push({
       id: DECISION_RUN,
       label: `Run "${playbook.name}" once`,
+      effect: "outward",
       consequences:
         `Lair runs the ${playbook.id} playbook for this breach once, now, also in observe mode: it re-checks the ` +
         "breach on fresh data, runs the configured watchdog.actions command only if the breach is still there, " +
@@ -136,6 +137,7 @@ export function decisionFor(
   options.push({
     id: DECISION_STAND_DOWN,
     label: "Leave it to me",
+    effect: "reversible",
     consequences:
       "Lair runs nothing more for this breach and doesn't ask again. The breach closes when the detector stops reporting it.",
   });
@@ -174,6 +176,19 @@ export function decisionFor(
     options,
     recommended: { optionId: recommendRun ? DECISION_RUN : DECISION_STAND_DOWN, reasoning },
     source: { module: DECISION_MODULE, ref: breach.id },
+    class: `watchdog.${breach.detector}`,
+    evidence: {
+      code: breach.detector === "orphan_claim" ? "claim_orphan" : breach.detector,
+      facts: {
+        detector: breach.detector,
+        playbook_attempts: run?.attempt ?? 0,
+        playbook_available: playbook !== undefined,
+        read_only: readOnly,
+        detected_at: breach.detectedAt,
+      },
+      cause_cleared: false,
+      linked_issue: null,
+    },
     key: `breach:${breach.id}`,
     blocks: [clip(printable(`watchdog:${project}:${breach.key}`), 200)],
   };

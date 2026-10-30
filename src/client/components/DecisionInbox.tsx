@@ -108,6 +108,7 @@ export function DecisionCardView(p: DecisionCardViewProps) {
       )}
 
       <p className="decision-context">{decision.context}</p>
+      <DecisionStructureLine decision={decision} />
       {/* Links are text to copy, never clickable: a decision's links come from whoever raised it */}
       {decision.links.length > 0 && (
         <ul className="muted small decision-links" data-links="text">
@@ -209,6 +210,7 @@ export function DecisionCardView(p: DecisionCardViewProps) {
                 </Button>
                 <span className="muted small">
                   {option.consequences}
+                  {option.effect ? ` (${option.effect.replace("_", " ")})` : ""}
                   {decision.defaultOptionId === option.id ? " Applied if nobody answers before it expires." : ""}
                 </span>
               </div>
@@ -487,10 +489,11 @@ export function DecisionDetail({
             {decision.project} · raised by <code>{decision.source.module}</code> ({decision.source.ref})
           </div>
           <p className="decision-context">{decision.context}</p>
+          <DecisionStructureLine decision={decision} />
           <ul className="muted small decision-links">
             {decision.options.map((o) => (
               <li key={o.id}>
-                <strong>{o.label}</strong>: {o.consequences}
+                <strong>{o.label}</strong>: {o.consequences}{o.effect ? ` (${o.effect.replace("_", " ")})` : ""}
               </li>
             ))}
           </ul>
@@ -632,4 +635,24 @@ export function DecisionsBadge({ refreshKey }: { refreshKey: number }) {
     };
   }, [refreshKey]);
   return counts ? <DecisionCountBadge {...counts} /> : null;
+}
+
+/**
+ * What a module recorded for rules to read: the class, the evidence code and
+ * its facts, under the prose. Nothing is shown for a decision without them.
+ */
+export function DecisionStructureLine({ decision }: { decision: Decision }) {
+  if (!decision.class || !decision.evidence) return null;
+  const { evidence } = decision;
+  const facts = Object.entries(evidence.facts)
+    .map(([name, value]) => `${name}=${String(value)}`)
+    .join(", ");
+  return (
+    <p className="muted small" data-decision-class={decision.class}>
+      Class <code>{decision.class}</code>
+      {decision.classKnown === false ? " (not in the policy table)" : ""} · evidence <code>{evidence.code}</code>
+      {facts ? ` (${facts})` : ""} · cause {evidence.cause_cleared ? "cleared" : "not cleared"}
+      {evidence.linked_issue !== null ? ` · issue #${evidence.linked_issue}` : ""}
+    </p>
+  );
 }

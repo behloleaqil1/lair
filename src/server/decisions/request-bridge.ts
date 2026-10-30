@@ -44,6 +44,8 @@ const RequestSchema = z.object({
   reversible: z.boolean(),
   onTimeout: z.enum(["wait", "recommended", "cancel"]),
   requestedBy: z.string().min(1),
+  // Shape-checked by the inbox when it is raised
+  structure: z.custom<NonNullable<DecisionRequest["structure"]>>((v) => typeof v === "object" && v !== null).optional(),
 });
 
 function printable(text: string, keepNewlines: boolean): string {
@@ -91,6 +93,7 @@ export function toDecisionInput(request: DecisionRequest): RaiseDecisionInput {
     id: ids[i],
     label: oneLine(label, 120),
     consequences: clip(printable(label, true), 1000),
+    ...(request.structure ? { effect: request.structure.effects[i] } : {}),
   }));
   const recommended = Math.max(0, request.options.indexOf(request.recommended));
   const module = /^[a-z][a-z0-9_-]{0,39}$/.test(request.requestedBy) ? request.requestedBy : "other";
@@ -107,6 +110,7 @@ export function toDecisionInput(request: DecisionRequest): RaiseDecisionInput {
     source: { module, ref: oneLine(request.key, 200) },
     key: oneLine(request.key, 200),
     blocks: [oneLine(request.key, 200)],
+    ...(request.structure ? { class: request.structure.class, evidence: request.structure.evidence } : {}),
   };
 }
 

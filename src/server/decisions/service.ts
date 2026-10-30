@@ -88,6 +88,8 @@ export class DecisionInbox implements DecisionProducer {
   private clock: Clock;
   private sweepSeconds: number;
   private handlers = new Map<string, ResolutionHandler>();
+  /** Classes outside the policy table already warned about */
+  private flaggedClasses = new Set<string>();
   private inflight = new Map<string, Promise<boolean>>();
   private sweeping: Promise<void> | null = null;
   private timer: NodeJS.Timeout | null = null;
@@ -170,6 +172,10 @@ export class DecisionInbox implements DecisionProducer {
     const created = outcome.kind === "created";
     const { module, ref } = decision.source;
     if (created) {
+      if (decision.class !== undefined && decision.classKnown === false && !this.flaggedClasses.has(decision.class)) {
+        this.flaggedClasses.add(decision.class);
+        console.warn(`[decisions] ${module} raised class ${decision.class}, which is not in the policy table (docs/design/decision-policies.md §2)`);
+      }
       const expiry = decision.expiresAt
         ? `; expires ${decision.expiresAt}${decision.defaultOptionId ? `, then ${decision.defaultOptionId} applies` : ", then it keeps waiting"}`
         : "";
@@ -177,7 +183,7 @@ export class DecisionInbox implements DecisionProducer {
         at,
         action: "raised",
         actor: module,
-        detail: `${decision.attention === "notice" ? "notice" : `${decision.kind} decision`} raised by ${module} (${ref}), recommending ${decision.recommended.optionId}${expiry}`,
+        detail: `${decision.attention === "notice" ? "notice" : `${decision.kind} decision`} raised by ${module} (${ref}), recommending ${decision.recommended.optionId}${expiry}${decision.class !== undefined && decision.classKnown === false ? `; class ${decision.class} is not in the policy table` : ""}`,
       });
       await this.events?.emit("decision.raised", {
         decisionId: decision.id,
