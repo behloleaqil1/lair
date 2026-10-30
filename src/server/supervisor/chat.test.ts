@@ -12,10 +12,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
 import Database from "better-sqlite3";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, symlinkSync } from "fs";
 import { createServer } from "net";
 import { tmpdir } from "os";
-import { join } from "path";
+import { join, dirname } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { ChatStatusView, ConversationView, DigestView } from "../../shared/supervisor-types.js";
 import { parseMarkdown } from "../../shared/safe-markdown.js";

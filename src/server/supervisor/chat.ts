@@ -177,7 +177,7 @@ export interface SupervisorChatOptions {
   cli?: string;
   /** Lair's own prompt template (default: prompts/supervisor.md) */
   defaultPromptPath?: string;
-  log?: Pick<Console, "warn">;
+  log?: Pick<Console, "info" | "warn">;
 }
 
 export class SupervisorChat {
