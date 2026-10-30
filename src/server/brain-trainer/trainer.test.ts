@@ -25,7 +25,7 @@ import { parseModel, propose, probabilities } from "./model.js";
 import { timeSplit } from "./split.js";
 import { ModelStore } from "./store.js";
 import { DEFAULT_PARAMS, runTraining, type TrainerSettings } from "./trainer.js";
-import type { Example, TreeModel } from "./types.js";
+import type { Example, RunReport, TreeModel } from "./types.js";
 
 const BROWSER = { origin: "http://localhost:4777", "sec-fetch-site": "same-origin" };
 
@@ -348,10 +348,10 @@ function pick(i: number, small: boolean): RaiseDecisionInput {
   };
 }
 
-async function server(yaml: string | undefined = "brain_trainer:\n  enabled: true\n  min_labels: 20\n  min_test: 3\n") {
+async function server(yaml: string | null = "brain_trainer:\n  enabled: true\n  min_labels: 20\n  min_test: 3\n") {
   const dir = tempDir();
   const configPath = join(dir, "server.yaml");
-  if (yaml !== undefined) {
+  if (yaml !== null) {
     writeFileSync(configPath, yaml);
     chmodSync(configPath, 0o600);
   }
@@ -415,7 +415,7 @@ describe("the server wiring", () => {
   });
 
   it("is off by default: nothing runs, nothing is written, and the routes say so", async () => {
-    const h = await server(undefined);
+    const h = await server(null);
     await h.answered(25);
     expect(await h.trainer.runNow()).toEqual({ refused: "the brain trainer is off" });
     const run = await h.app.inject({ method: "POST", url: "/api/owner/brain-trainer/run", headers: h.owner, payload: {} });
@@ -437,7 +437,7 @@ describe("the server wiring", () => {
   it("trains on the answered decisions, scores the newest window and exposes the curve to the owner", async () => {
     const h = await server();
     await h.answered(40);
-    const report = (await h.trainer.runNow()) as { status: string; version: string; testCount: number; cutoffAt: string };
+    const report = await trained(h);
     expect(report.status).toBe("trained");
     expect(report.testCount).toBe(8);
     expect(h.container.inputs[0].rows).toHaveLength(32);
@@ -479,6 +479,12 @@ describe("the server wiring", () => {
   });
 });
 
+async function trained(h: { trainer: { runNow(): Promise<RunReport | { refused: string }> } }): Promise<RunReport> {
+  const r = await h.trainer.runNow();
+  if ("refused" in r) throw new Error(r.refused);
+  return r;
+}
+
 function clockAdvance(h: { clock: FakeClock }): void {
   h.clock.t += 3600_000;
 }
@@ -487,13 +493,13 @@ describe("shadow mode never answers", () => {
   it("writes a proposal into the trace when a decision is raised, leaves the decision open, and compares after the answer", async () => {
     const h = await server();
     await h.answered(40);
-    const trained = (await h.trainer.runNow()) as { version: string };
+    const model = await trained(h);
     clockAdvance(h);
     const { decision } = await h.inbox.raise(pick(100, true));
     const proposals = h.trainer["shadow"].proposals();
     expect(proposals).toHaveLength(1);
     expect(proposals[0]).toMatchObject({
-      decisionId: decision.id, class: "planner/other/large+small", proposer: "classifier", version: trained.version, option: "small", reasonCode: "classifier_gbt",
+      decisionId: decision.id, class: "planner/other/large+small", proposer: "classifier", version: model.version, option: "small", reasonCode: "classifier_gbt",
     });
     expect(proposals[0].confidence).toBeGreaterThanOrEqual(0.7);
     // Nobody answered: still open, no answer, no audit entry of an answer
@@ -506,7 +512,7 @@ describe("shadow mode never answers", () => {
     expect(h.trainer.status().agreement).toEqual([]);
     await h.inbox.answer(decision.id, { optionId: "small" });
     expect(h.trainer.status().agreement).toEqual([
-      { class: "planner/other/large+small", version: trained.version, compared: 1, agreed: 1, abstained: 0, wrongConfident: 0 },
+      { class: "planner/other/large+small", version: model.version, compared: 1, agreed: 1, abstained: 0, wrongConfident: 0 },
     ]);
   });
 
