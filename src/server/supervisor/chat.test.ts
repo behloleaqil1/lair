@@ -682,7 +682,6 @@ describe("answer.json: answers from a file in the run's per-turn folder", () => 
 
     // Create a symlink in the run folder pointing to the outside file
     const answerPath = call.env.LAIR_ANSWER_FILE!;
-    const runFolder = dirname(answerPath);
     try {
       symlinkSync(join(outsideDir, "secret.json"), answerPath);
     } catch {
