@@ -5,6 +5,7 @@
  */
 import { spawn } from "child_process";
 import { closeSync, mkdirSync, openSync } from "fs";
+import { cpus, freemem, loadavg, totalmem } from "os";
 import { dirname } from "path";
 import { systemProbes, type ProcessInfo, type Probes } from "../watchdog/probes.js";
 import { CachedProcessTable, type ProcessCache } from "../core/process-cache.js";
@@ -67,10 +68,24 @@ export interface ProcessSpawner {
   forget(pid: number): void;
 }
 
+/** System resource information for native capacity checks. */
+export interface SystemInfo {
+  /** Number of CPUs */
+  cpuCount(): number;
+  /** 1-minute load average */
+  loadAvg1(): number;
+  /** Total memory in bytes */
+  totalMemory(): number;
+  /** Free memory in bytes */
+  freeMemory(): number;
+}
+
 export interface AgentProbes extends Probes {
   spawner: ProcessSpawner;
   /** This server process: the owner of claims and launch locks while a run starts */
   self: ProcessOwner;
+  /** System resource information for native capacity checks */
+  systemInfo: SystemInfo;
 }
 
 /**
@@ -227,12 +242,29 @@ export class ChildProcessSpawner implements ProcessSpawner {
   }
 }
 
+/** The real system info: reads from os module. */
+export class NodeSystemInfo implements SystemInfo {
+  cpuCount(): number {
+    return cpus().length;
+  }
+  loadAvg1(): number {
+    return loadavg()[0];
+  }
+  totalMemory(): number {
+    return totalmem();
+  }
+  freeMemory(): number {
+    return freemem();
+  }
+}
+
 /** The real probes. */
 export function systemAgentProbes(commandTimeoutMs = 30_000): AgentProbes {
   return {
     ...systemProbes(commandTimeoutMs),
     spawner: new ChildProcessSpawner(),
     self: { pid: process.pid, startedAt: Date.now() - Math.round(process.uptime() * 1000) },
+    systemInfo: new NodeSystemInfo(),
   };
 }
 
@@ -244,5 +276,6 @@ export function systemAgentProbesWithCache(cache: ProcessCache, commandTimeoutMs
     processes: new CachedProcessTable(cache),
     spawner: new ChildProcessSpawner(),
     self: { pid: process.pid, startedAt: Date.now() - Math.round(process.uptime() * 1000) },
+    systemInfo: new NodeSystemInfo(),
   };
 }

@@ -13,6 +13,7 @@ import {
   DEFAULT_WAITING_PATTERN,
   doneLineMatches,
   fillPatternFor,
+  getAgentClass,
   parseAgentsConfig,
   taskLineMatch,
 } from "./config.js";
@@ -408,5 +409,81 @@ describe("agents config", () => {
 
   it("backs off exponentially, capped", () => {
     expect([1, 2, 3, 4].map((n) => backoffMs(n, 10, 60))).toEqual([10_000, 20_000, 40_000, 60_000]);
+  });
+
+  it("fill.capacity: native capacity settings with load, memory, heavy_work, and agent_class", () => {
+    const fill = {
+      enabled: true,
+      tasks_file: "work/tasks.txt",
+      agents: ["worker-a", "worker-b"],
+      prompt_files: ["{prompts_dir}/{agent}.txt"],
+    };
+    const withFill = (extra: Record<string, unknown>) => ({ enabled: true, fill: { ...fill, ...extra } });
+    
+    // Defaults: no native capacity checks enabled
+    const defaults = parseAgentsConfig(withFill({}), project);
+    expect(defaults.ok).toBe(true);
+    if (!defaults.ok) return;
+    expect(defaults.settings.fill.capacity).toEqual({
+      loadPerCpuMax: undefined,
+      memory: { pressureMax: undefined, availableMinPct: undefined },
+      heavyWork: { detect: [], maxActive: 1 },
+      agentClass: {},
+      defaultClass: "local",
+    });
+
+    // Full capacity config
+    const full = parseAgentsConfig(withFill({
+      capacity: {
+        load_per_cpu_max: 0.8,
+        memory: { available_min_pct: 10 },
+        heavy_work: { detect: ["*-gate", "backend-*"], max_active: 2 },
+        agent_class: { "worker-a": "remote" },
+        default_class: "local",
+      },
+    }), project);
+    expect(full.ok).toBe(true);
+    if (!full.ok) return;
+    expect(full.settings.fill.capacity).toEqual({
+      loadPerCpuMax: 0.8,
+      memory: { pressureMax: undefined, availableMinPct: 10 },
+      heavyWork: { detect: ["*-gate", "backend-*"], maxActive: 2 },
+      agentClass: { "worker-a": "remote" },
+      defaultClass: "local",
+    });
+
+    // Invalid agent id in agent_class
+    expect(errorsOf(withFill({
+      capacity: { agent_class: { "not an id": "remote" } },
+    }))).toEqual(["agents.fill.capacity.agent_class.not an id: not a valid agent id"]);
+
+    // Invalid values for limits
+    expect(errorsOf(withFill({ capacity: { load_per_cpu_max: 0 } }))[0]).toContain("agents.fill.capacity.load_per_cpu_max");
+    expect(errorsOf(withFill({ capacity: { load_per_cpu_max: -1 } }))[0]).toContain("agents.fill.capacity.load_per_cpu_max");
+    expect(errorsOf(withFill({ capacity: { memory: { available_min_pct: -1 } } }))[0]).toContain("agents.fill.capacity.memory.available_min_pct");
+    expect(errorsOf(withFill({ capacity: { memory: { available_min_pct: 101 } } }))[0]).toContain("agents.fill.capacity.memory.available_min_pct");
+    expect(errorsOf(withFill({ capacity: { heavy_work: { max_active: 0 } } }))[0]).toContain("agents.fill.capacity.heavy_work.max_active");
+
+    // Invalid class value
+    expect(errorsOf(withFill({ capacity: { default_class: "hybrid" } }))[0]).toContain("agents.fill.capacity.default_class");
+    expect(errorsOf(withFill({ capacity: { agent_class: { "worker-a": "hybrid" } } }))[0]).toContain("agents.fill.capacity.agent_class.worker-a");
+  });
+
+  it("getAgentClass returns the agent-specific class or the default", () => {
+    const capacity = {
+      loadPerCpuMax: 0.8,
+      memory: { pressureMax: undefined, availableMinPct: undefined },
+      heavyWork: { detect: [], maxActive: 1 },
+      agentClass: { "worker-a": "remote" as const },
+      defaultClass: "local" as const,
+    };
+    expect(getAgentClass(capacity, "worker-a")).toBe("remote");
+    expect(getAgentClass(capacity, "worker-b")).toBe("local");
+    expect(getAgentClass(capacity, "unknown")).toBe("local");
+    
+    // With default_class: remote
+    const remoteDefault = { ...capacity, defaultClass: "remote" as const };
+    expect(getAgentClass(remoteDefault, "worker-a")).toBe("remote");
+    expect(getAgentClass(remoteDefault, "worker-b")).toBe("remote");
   });
 });

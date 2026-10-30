@@ -59,7 +59,7 @@ import {
 import { readLock } from "./locks.js";
 import { DataService } from "../services/data.js";
 import { listPromptFiles, MAX_PROMPT_FILE_BYTES, PromptFileError, readPromptFile } from "./prompts.js";
-import type { AgentProbes, ProcessOwner, ProcessSpawner, SpawnOptions } from "./probes.js";
+import type { AgentProbes, ProcessOwner, ProcessSpawner, SpawnOptions, SystemInfo } from "./probes.js";
 import type { DecisionInbox, DecisionRequest } from "./decisions.js";
 import { AgentsStore, SCHEMA_VERSION } from "./store.js";
 import type { AgentEvent, AgentRun } from "./types.js";
@@ -114,6 +114,31 @@ class FakeProcessTable implements ProcessTable {
     }));
     this.afterList?.(this.listCalls);
     return reading;
+  }
+}
+
+/** Fake system info for native capacity checks: returns configurable values. */
+class FakeSystemInfo implements SystemInfo {
+  /** Number of CPUs to report */
+  cpus = 4;
+  /** 1-minute load average to report */
+  load = 0.5;
+  /** Total memory in bytes (16 GB default) */
+  total = 16 * 1024 * 1024 * 1024;
+  /** Free memory in bytes (8 GB default = 50% available) */
+  free = 8 * 1024 * 1024 * 1024;
+
+  cpuCount(): number {
+    return this.cpus;
+  }
+  loadAvg1(): number {
+    return this.load;
+  }
+  totalMemory(): number {
+    return this.total;
+  }
+  freeMemory(): number {
+    return this.free;
   }
 }
 
@@ -259,6 +284,7 @@ interface Harness extends Paths {
   procs: FakeProcessTable;
   spawner: FakeSpawner;
   runner: FakeCommandRunner;
+  systemInfo: FakeSystemInfo;
   manager: AgentsManager;
   service: AgentsService;
   store: AgentsStore;
@@ -348,6 +374,7 @@ function setup(
   events.on("*", (event) => {
     bus.push(event.type);
   });
+  const systemInfo = new FakeSystemInfo();
   const probes: AgentProbes = {
     processes: procs,
     fs: new NodeFileSystem(),
@@ -355,6 +382,7 @@ function setup(
     clock,
     spawner,
     self: options.self ?? SELF,
+    systemInfo,
   };
   const manager = new AgentsManager({
     dbPath: paths.dbPath,
@@ -368,7 +396,7 @@ function setup(
   const service = manager.get("demo");
   const store = manager.getStore();
   if (!service || !store) throw new Error(`agents not enabled: ${manager.status("demo").errors.join("; ")}`);
-  return { ...paths, config, clock, procs, spawner, runner, manager, service, store, bus };
+  return { ...paths, config, clock, procs, spawner, runner, systemInfo, manager, service, store, bus };
 }
 
 const request = (h: Harness, agent = "worker-a", task = "feat-login", prompt = "Build the login form") =>
@@ -2505,6 +2533,152 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(lineOf(status, "feat-login")).toMatchObject({ state: "done" });
     expect(lineOf(status, "feat-search")).toMatchObject({ state: "started" });
     expect(runs(h).map((r) => r.task)).toEqual(["feat-login", "feat-search"]);
+  });
+
+  it("native capacity: a remote agent starts under high load, a local one is held", async () => {
+    // worker-a is remote (starts under high load), worker-b is local (held by load)
+    const h = setup(fill({
+      max_active: 4,
+      capacity: {
+        load_per_cpu_max: 1.0,
+        agent_class: { "worker-a": "remote" },
+        default_class: "local",
+      },
+    }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-search|Search page", "worker-b|Bob|feat-login|Login form");
+    // High load: 8.0 load on 4 CPUs = 2.0 per CPU (above 1.0)
+    h.systemInfo.load = 8.0;
+    h.systemInfo.cpus = 4;
+
+    const status = await check(h);
+
+    // Remote agent (worker-a) starts despite high load
+    expect(lineOf(status, "feat-search")).toMatchObject({ state: "started" });
+    // Local agent (worker-b) is held
+    expect(lineOf(status, "feat-login")).toMatchObject({
+      state: "held",
+      hold: "capacity_load",
+    });
+    expect(lineOf(status, "feat-login").detail).toContain("load per CPU 2.00 exceeds capacity.load_per_cpu_max (1)");
+    expect(runs(h).map((r) => r.task)).toEqual(["feat-search"]);
+
+    // Once load drops, local agent starts too
+    h.systemInfo.load = 2.0; // 0.5 per CPU
+    const statusAfter = await check(h);
+    expect(lineOf(statusAfter, "feat-login")).toMatchObject({ state: "started" });
+    expect(runs(h).map((r) => r.task)).toEqual(["feat-search", "feat-login"]);
+  });
+
+  it("native capacity: memory pressure holds both local and remote agents", async () => {
+    const h = setup(fill({
+      max_active: 4,
+      capacity: {
+        memory: { available_min_pct: 20 },
+        agent_class: { "worker-a": "remote" },
+        default_class: "local",
+      },
+    }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-search|Search page", "worker-b|Bob|feat-login|Login form");
+    // Low memory: 1 GB free out of 16 GB = 6.25% available (below 20%)
+    h.systemInfo.total = 16 * 1024 * 1024 * 1024;
+    h.systemInfo.free = 1 * 1024 * 1024 * 1024;
+
+    const status = await check(h);
+
+    // Both agents are held due to memory pressure
+    expect(lineOf(status, "feat-search")).toMatchObject({ state: "held", hold: "capacity_memory" });
+    expect(lineOf(status, "feat-login")).toMatchObject({ state: "held", hold: "capacity_memory" });
+    expect(lineOf(status, "feat-search").detail).toContain("available memory 6.2% is below capacity.memory.available_min_pct (20%)");
+    expect(runs(h)).toEqual([]);
+
+    // Once memory is available, both start
+    h.systemInfo.free = 8 * 1024 * 1024 * 1024; // 50% available
+    const statusAfter = await check(h);
+    expect(lineOf(statusAfter, "feat-search")).toMatchObject({ state: "started" });
+    expect(lineOf(statusAfter, "feat-login")).toMatchObject({ state: "started" });
+  });
+
+  it("native capacity: capacity_cmd is still honoured alongside native checks", async () => {
+    const h = setup(fill({
+      max_active: 4,
+      capacity: { load_per_cpu_max: 2.0 },
+      capacity_cmd: ["capacity-check"],
+    }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-search|Search page");
+    // Good load (below 2.0 per CPU)
+    h.systemInfo.load = 4.0;
+    h.systemInfo.cpus = 4;
+    // But capacity_cmd says no
+    h.runner.answer = (argv) => {
+      if (argv[0] === "capacity-check") return { code: 1, stdout: "custom capacity check failed", stderr: "" };
+      return undefined;
+    };
+
+    const status = await check(h);
+
+    // Held by capacity_cmd even though native checks pass
+    expect(lineOf(status, "feat-search")).toMatchObject({ state: "held", hold: "capacity" });
+    expect(lineOf(status, "feat-search").detail).toContain("custom capacity check failed");
+
+    // Once capacity_cmd passes, agent starts
+    h.runner.answer = (argv) => {
+      if (argv[0] === "capacity-check") return { code: 0, stdout: "", stderr: "" };
+      return undefined;
+    };
+    const statusAfter = await check(h);
+    expect(lineOf(statusAfter, "feat-search")).toMatchObject({ state: "started" });
+  });
+
+  it("native capacity: defaults equal today's behaviour (no capacity checks without config)", async () => {
+    const h = setup(fill({ max_active: 4 })); // No capacity config
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-search|Search page", "worker-b|Bob|feat-login|Login form");
+    // Very high load
+    h.systemInfo.load = 100.0;
+    h.systemInfo.cpus = 4;
+    // Very low memory
+    h.systemInfo.free = 100 * 1024 * 1024; // 100 MB out of 16 GB
+
+    const status = await check(h);
+
+    // With no capacity config, both start (defaults are undefined/disabled)
+    expect(lineOf(status, "feat-search")).toMatchObject({ state: "started" });
+    expect(lineOf(status, "feat-login")).toMatchObject({ state: "started" });
+    expect(runs(h).map((r) => r.task)).toEqual(["feat-search", "feat-login"]);
+  });
+
+  it("native capacity: Health shows capacity state including the hold reason", async () => {
+    const h = setup(fill({
+      max_active: 4,
+      capacity: { load_per_cpu_max: 1.0 },
+    }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-search|Search page");
+    h.systemInfo.load = 8.0;
+    h.systemInfo.cpus = 4;
+    h.systemInfo.total = 16 * 1024 * 1024 * 1024;
+    h.systemInfo.free = 8 * 1024 * 1024 * 1024;
+
+    await check(h);
+    const view = h.service.status().fill;
+
+    // The capacity view is populated
+    expect(view?.capacity).toMatchObject({
+      load: 8.0,
+      cpus: 4,
+      loadPerCpu: 2.0,
+      loadPerCpuMax: 1.0,
+      loadOverLimit: true,
+      memory: {
+        total: 16 * 1024 * 1024 * 1024,
+        available: 8 * 1024 * 1024 * 1024,
+        availablePct: 50,
+        underMin: false,
+      },
+    });
   });
 
   it("refuses prompt files outside prompts_dir: '..' in a task, a symlink out, a directory, an oversized file, a path outside", async () => {

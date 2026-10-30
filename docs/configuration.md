@@ -1658,7 +1658,7 @@ Unknown keys, invalid regular expressions, more than 50 `transient_patterns` or 
 - A refused start (`held: refused`: the run request was refused, or `done_pattern` couldn't be checked) has one decision too, except when the refusal is a hard budget limit, which has its own `spend` decision. The line shows the decision of its hold (`decisionId`).
 - `held: paused` is your own pause: you answered "Keep it paused", or "Leave the task unclaimed" on the escalation of a task fill runs. Nothing waits for you and nothing more is asked; fill starts it again once you release it.
 - You lift an `owner`, `no_done`, `blocked`, `waiting`, `waited_too_long` or `paused` hold with the decision's answer, or with "Release hold" in the Work section (`POST /api/agents/fill/release`, owner only); requesting a run of the task yourself works too. Either lifts the hold only while the run it is about is still the task's latest: once the task has moved on (you answered its escalation with a fresh session, say), the release is refused and the next check shows where the task is now. The planner may release only a `no_done` or `blocked` hold.
-- Otherwise the task is started when its agent has no active run, fewer than `max_active` runs fill started are active, and `capacity_cmd` (when set) exits 0. Its prompt is the contents of `prompt_files`, in order, separated by a blank line (`default_instructions` and the agent's `instructions` come first, as for every run). It is requested through the module's in-process request, never over HTTP. A line that waits for any of these is `held`, with the reason: `busy`, `max_active`, `capacity` (the capacity command's first output line), `prompt` (a refused prompt file), `read_only`, or `refused` (the refused request: over budget, say).
+- Otherwise the task is started when its agent has no active run, fewer than `max_active` runs fill started are active, native capacity checks pass (when configured), and `capacity_cmd` (when set) exits 0. Its prompt is the contents of `prompt_files`, in order, separated by a blank line (`default_instructions` and the agent's `instructions` come first, as for every run). It is requested through the module's in-process request, never over HTTP. A line that waits for any of these is `held`, with the reason: `busy`, `max_active`, `capacity` (the capacity command's first output line), `capacity_load` (load per CPU over limit), `capacity_memory` (available memory below minimum), `capacity_heavy` (heavy work at limit), `prompt` (a refused prompt file), `read_only`, or `refused` (the refused request: over budget, say).
 - A line that doesn't parse, names an invalid agent or task id, or repeats a task is `malformed`: it is reported, and the other lines are still filled.
 
 The Work section shows fill's lines, with each line's state, why it is held (for a waiting one, `waiting: <wake> since <time>`, or `waiting: <gate> still queued in <lane> since <time>` while its gate is in the gate queue), and a "Release hold" button for the holds that are yours to lift.
@@ -1666,6 +1666,12 @@ The Work section shows fill's lines, with each line's state, why it is held (for
 **Prompt files stay inside `prompts_dir`.** In each path `{prompts_dir}`, `{agent}` and `{task}` are replaced, and a relative path is relative to `prompts_dir`. A path with a `..` segment is a config error; at run time a path outside `prompts_dir`, a symlink that leads out of it (one that stays inside is fine), anything but a regular file, or a file over 200 KB is refused and the line is held with the reason. Their text is used as it is: placeholders are not replaced inside it (the agent gets `LAIR_TASK` and `LAIR_AGENT` in its environment), and a line's description is shown in the status, never put into a prompt. Keep `tasks_file` and `prompts_dir` where the agents can't write (not in the repository they work in): whoever edits them chooses what the allowlisted agents work on.
 
 **The capacity command** is an argv, run without a shell before each start, with `command_timeout_seconds` as its timeout. Exit 0 means there is capacity; any other exit code, or a timeout, holds every line that would start in that check, with its first output line as the reason.
+
+**Native capacity checks** let fill decide capacity itself without an external command. Set `fill.capacity.load_per_cpu_max` to hold local agents when the 1-minute load average per CPU exceeds it. Set `fill.capacity.memory.available_min_pct` to hold all agents when available memory drops below that percentage of total. Set `fill.capacity.heavy_work.detect` to a list of task globs that count as heavy work, and `fill.capacity.heavy_work.max_active` to limit how many may run at once.
+
+Agents are either `local` (held by load) or `remote` (not held by load). Set `fill.capacity.default_class` to the default (`"local"`), and `fill.capacity.agent_class` to override it per agent. A remote agent (one that only pushes to GitHub CI, say) starts even under high load, since it doesn't add to the machine's workload.
+
+Memory checks and heavy-work limits apply to both classes. `capacity_cmd` is still honoured as an extra check, after native checks pass.
 
 `agents.fill_started` and `agents.fill_held` events go on the event bus (and into the agents store): one when fill starts a task, and one when a line becomes held or is held for another kind of reason, not on every check. `fill_done` (a task seen done) and `fill_released` (you lifted a hold) are kept in the agents store. Bounds: the tasks file is read up to 256 KB, 200 tasks and 2,000 characters a line; the queue file's last 4 MB are searched, each line cut at 1,000 characters. A queue file that was rewritten (not appended to) since a task's start is searched whole. Task ids are not reused: a task that is done stays done.
 
@@ -1687,6 +1693,28 @@ agents:
     interval_seconds: 60
 ```
 
+With native capacity checks:
+
+```yaml
+agents:
+  fill:
+    enabled: true
+    tasks_file: work/tasks.txt
+    agents: [worker-a, worker-b, worker-c]
+    prompt_files: ["{prompts_dir}/{agent}.txt"]
+    max_active: 4
+    capacity:
+      load_per_cpu_max: 1.5              # hold local agents when load/cpu > 1.5
+      memory:
+        available_min_pct: 15            # hold all agents when memory < 15%
+      heavy_work:
+        detect: ["*-backend-gate", "*-e2e-*"]   # these tasks count as heavy work
+        max_active: 2                    # at most 2 heavy tasks at once
+      agent_class:
+        worker-c: remote                 # worker-c only pushes to CI; not held by load
+      default_class: local               # the default
+```
+
 ```text
 # agent|name|task|description
 worker-a|Alice|feat-login|Build the login form
@@ -1702,6 +1730,13 @@ worker-b|Bob|feat-search|Search page
 | `fill.max_active` | number | `1` | Runs fill started that may be active at once (restarts and retries count) |
 | `fill.done_pattern` | string | `^-\s+DONE\s+{task}(?=\s\|$)` | Regular expression for a queue line that reports the task done, matched case-insensitively against each trimmed line; the task id must be in the matched text exactly. Must contain `{task}`, `{agent}` or both ([Matching by agent](#matching-by-agent)), inserted as literal text. End the task id at whitespace, not `\b`, `:` or `-`: task ids can contain `-` and `:` |
 | `fill.capacity_cmd` | array | — | Exit 0: capacity available; anything else holds, with its first output line as the reason |
+| `fill.capacity.load_per_cpu_max` | number | — | Maximum 1-minute load average per CPU before holding local agents. Remote agents are not held by load |
+| `fill.capacity.memory.pressure_max` | number | — | Maximum memory pressure percentage (0-100) before holding new starts |
+| `fill.capacity.memory.available_min_pct` | number | — | Minimum available memory as percentage of total (0-100) before holding new starts |
+| `fill.capacity.heavy_work.detect` | array | `[]` | Globs or commands that indicate heavy work (container gates, builds). When a task matches, it is counted as heavy work |
+| `fill.capacity.heavy_work.max_active` | number | `1` | Maximum concurrent heavy work items across all agents |
+| `fill.capacity.agent_class` | map | `{}` | Per-agent class override: agent id → `"local"` or `"remote"` |
+| `fill.capacity.default_class` | string | `"local"` | Default class for agents not in `agent_class`. `"local"` agents are held by load; `"remote"` agents are not |
 | `fill.interval_seconds` | number | `60` | Seconds between fill checks |
 | `fill.max_completions_without_done` | number | `3` | Runs in a row that exit 0 without the done line; then fill holds the task and asks you |
 | `fill.backoff_seconds` | number | `60` | Wait after such a run before fill starts the task again, doubling |

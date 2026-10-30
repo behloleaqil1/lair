@@ -67,6 +67,7 @@ import type { Decision } from "../../shared/decision-types.js";
 import type {
   AgentEventKind,
   AgentRunView,
+  FillCapacityView,
   FillHold,
   FillLineState,
   FillLineView,
@@ -81,6 +82,7 @@ import {
   backoffMs,
   doneLineMatches,
   fillPatternFor,
+  getAgentClass,
   matchesByAgent,
   taskLineMatch,
   WAKE_VALUE,
@@ -808,6 +810,8 @@ export class AgentsFill {
   private lineGone = new Map<string, number>();
   /** When fill last saw a waiting run's gate in the gate queue (task|run -> time); the store keeps the first and last sightings */
   private lastQueued = new Map<string, number>();
+  /** Last capacity check state for the view */
+  private lastCapacity: FillCapacityView | null = null;
 
   constructor(private options: AgentsFillOptions) {}
 
@@ -834,6 +838,7 @@ export class AgentsFill {
       lastCheck: this.lastCheck === null ? null : iso(this.lastCheck),
       lastError: this.lastError,
       lines: this.lines,
+      capacity: this.lastCapacity ?? undefined,
     };
   }
 
@@ -1341,6 +1346,13 @@ export class AgentsFill {
         await hold("max_active", `max_active: ${active} run(s) fill started are active (max_active ${settings.maxActive})`);
         continue;
       }
+      // Native capacity checks (per-agent, based on class)
+      const nativeCapacity = this.checkNativeCapacity(agent);
+      if (nativeCapacity !== null) {
+        await hold(nativeCapacity.hold, nativeCapacity.reason);
+        continue;
+      }
+      // Legacy capacity_cmd check (same for all agents)
       if (noCapacity !== null) {
         await hold("capacity", noCapacity);
         continue;
@@ -1867,6 +1879,101 @@ export class AgentsFill {
       this.polled.set(key, now);
       return { state: "absent" };
     }
+  }
+
+  /**
+   * Native capacity check result for one agent.
+   * Returns null if capacity is available, otherwise the hold type and reason.
+   */
+  private checkNativeCapacity(agent: string): { hold: FillHold; reason: string } | null {
+    const { settings, probes } = this.options;
+    const cap = settings.capacity;
+    const agentClass = getAgentClass(cap, agent);
+    const sysInfo = probes.systemInfo;
+
+    // Get current system state
+    const numCpus = sysInfo.cpuCount();
+    const load1 = sysInfo.loadAvg1();
+    const loadPerCpu = load1 / numCpus;
+
+    const totalMem = sysInfo.totalMemory();
+    const freeMem = sysInfo.freeMemory();
+    const availablePct = (freeMem / totalMem) * 100;
+
+    // Update capacity view state
+    this.lastCapacity = {
+      load: load1,
+      cpus: numCpus,
+      loadPerCpu,
+      loadPerCpuMax: cap.loadPerCpuMax,
+      loadOverLimit: cap.loadPerCpuMax !== undefined && loadPerCpu > cap.loadPerCpuMax,
+      memory: {
+        total: totalMem,
+        available: freeMem,
+        availablePct,
+        underMin: cap.memory.availableMinPct !== undefined && availablePct < cap.memory.availableMinPct,
+        availableMinPct: cap.memory.availableMinPct,
+      },
+      heavyWork: cap.heavyWork.detect.length > 0 ? {
+        active: this.countHeavyWork(),
+        maxActive: cap.heavyWork.maxActive,
+        atLimit: this.countHeavyWork() >= cap.heavyWork.maxActive,
+      } : undefined,
+    };
+
+    // Memory checks apply to both local and remote agents
+    if (cap.memory.availableMinPct !== undefined && availablePct < cap.memory.availableMinPct) {
+      return {
+        hold: "capacity_memory",
+        reason: `no capacity: available memory ${availablePct.toFixed(1)}% is below capacity.memory.available_min_pct (${cap.memory.availableMinPct}%)`,
+      };
+    }
+
+    // Load checks apply only to local agents
+    if (agentClass === "local" && cap.loadPerCpuMax !== undefined && loadPerCpu > cap.loadPerCpuMax) {
+      return {
+        hold: "capacity_load",
+        reason: `no capacity: load per CPU ${loadPerCpu.toFixed(2)} exceeds capacity.load_per_cpu_max (${cap.loadPerCpuMax})`,
+      };
+    }
+
+    // Heavy work checks apply to both local and remote agents
+    if (cap.heavyWork.detect.length > 0) {
+      const heavyActive = this.countHeavyWork();
+      if (heavyActive >= cap.heavyWork.maxActive) {
+        return {
+          hold: "capacity_heavy",
+          reason: `no capacity: ${heavyActive} heavy work item(s) active (capacity.heavy_work.max_active is ${cap.heavyWork.maxActive})`,
+        };
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Count active heavy work items.
+   * Heavy work is detected by matching active runs' tasks against the detect globs.
+   */
+  private countHeavyWork(): number {
+    const { settings, store, project } = this.options;
+    const patterns = settings.capacity.heavyWork.detect;
+    if (patterns.length === 0) return 0;
+
+    const activeRuns = store.activeRuns(project);
+    let count = 0;
+    for (const run of activeRuns) {
+      // Check if any pattern matches the task
+      for (const pattern of patterns) {
+        // Simple glob matching: * matches anything
+        const regex = new RegExp(`^${pattern.replace(/\*/g, ".*").replace(/\?/g, ".")}$`);
+        if (regex.test(run.task)) {
+          count++;
+          break;
+        }
+      }
+    }
+    return count;
   }
 
   /** null when capacity_cmd exits 0; otherwise why fill holds (a timeout holds too). */
