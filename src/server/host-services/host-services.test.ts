@@ -97,6 +97,7 @@ class FakeRunner implements CommandRunner {
 class FakeDecisions implements DecisionProducer {
   raised: RaiseDecisionInput[] = [];
   withdrawn: { id: string; input: WithdrawInput }[] = [];
+  private decisions = new Map<string, Decision>();
   private nextId = 1;
 
   async raise(input: RaiseDecisionInput): Promise<{ created: boolean; decision: Decision }> {
@@ -120,12 +121,14 @@ class FakeDecisions implements DecisionProducer {
       status: "open",
       raisedVia: "server",
     };
+    this.decisions.set(id, decision);
     return { created: true, decision };
   }
 
   async withdraw(id: string, input: WithdrawInput): Promise<Decision> {
     this.withdrawn.push({ id, input });
-    return {
+    const existing = this.decisions.get(id);
+    const decision: Decision = existing ?? {
       id,
       project: "test-project",
       kind: "other",
@@ -144,6 +147,9 @@ class FakeDecisions implements DecisionProducer {
       withdrawnReason: input.reason,
       raisedVia: "server",
     };
+    decision.status = "withdrawn";
+    decision.withdrawnReason = input.reason;
+    return decision;
   }
 
   blockedOn(_ref: string): Decision | null {
@@ -158,7 +164,7 @@ class FakeDecisions implements DecisionProducer {
     return [];
   }
 
-  onResolved(_module: string, _callback: (r: DecisionResolution) => void): () => void {
+  onResolved(_module: string, _callback: (r: DecisionResolution) => void, _options?: { project?: string }): () => void {
     return () => {};
   }
 }
