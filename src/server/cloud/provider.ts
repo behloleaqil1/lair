@@ -39,6 +39,8 @@ const DAY_MS = 86_400_000;
 const MAX_COST_PAGES = 10;
 /** The longest provider text kept in an error */
 const MAX_TEXT = 300;
+/** Cost Explorer's data is at most a day late: a reading taken at T holds the spend up to T minus this */
+export const AWS_COST_LAG_MS = DAY_MS;
 
 /** Provider text that names the account: ARNs (any partition), access key ids, 12-digit account ids */
 const ARN = /\barn:aws[a-z-]*:[^\s"'`,;()<>]*/gi;
@@ -47,8 +49,8 @@ const ACCOUNT_ID = /(?<![0-9A-Za-z])[0-9]{12}(?![0-9A-Za-z])/g;
 
 export interface MachineDescription {
   state: PowerState;
-  /** The last launch (start), from the provider */
-  launchedAt: number | null;
+  /** The last launch (start), from the provider: the meter can't count a machine without it */
+  launchedAt: number;
   /** The last stop, from the provider; null while running, or when the provider does not say */
   stoppedAt: number | null;
 }
@@ -62,6 +64,8 @@ export interface MachineDescription {
 export type SpendReading = { kind: "amount"; amount: number } | { kind: "unknown"; reason: string; empty: boolean };
 
 export interface CloudProvider {
+  /** How late the cost data may be: a reading taken at T holds the spend up to T minus this */
+  readonly costLagMs: number;
   describe(machine: CloudMachineSettings): Promise<MachineDescription>;
   /**
    * Starts a stopped machine; a running or pending one is left as it is. Returns the state after.
@@ -143,6 +147,8 @@ function day(ms: number): string {
 
 /** AWS EC2: one profile's instances, by id and tag, in any region. */
 export class AwsEc2Provider implements CloudProvider {
+  readonly costLagMs = AWS_COST_LAG_MS;
+
   constructor(private clients: AwsClients) {}
 
   /**
@@ -173,9 +179,11 @@ export class AwsEc2Provider implements CloudProvider {
     const state = powerState(instance.State?.Name);
     if (!state) throw new Error(`${machine.instanceId}: unknown state ${text(instance.State?.Name)}`);
     const launch = instance.LaunchTime instanceof Date ? instance.LaunchTime.getTime() : NaN;
+    // EC2 dates every instance's last launch: without it the meter can't count the machine
+    if (!Number.isFinite(launch)) throw new Error(`${machine.instanceId}: the provider gave no launch time`);
     return {
       state,
-      launchedAt: Number.isFinite(launch) ? launch : null,
+      launchedAt: launch,
       stoppedAt: STOPPED_STATES.has(state) ? transitionTime(instance.StateTransitionReason) : null,
     };
   }

@@ -4,16 +4,18 @@
  * `cloud.enabled: true` (off by default). Every `check_seconds` it
  *
  * 1. describes each machine's tagged instance (power state, last launch and
- *    stop) and records the run for the meter;
+ *    stop) and records the run for the meter, and the time since the last
+ *    sighting in which it may have run unseen (a gap: counted, or blind);
  * 2. reads the account's cost from the provider when the last reading is
  *    older than `budget.spend_check_hours` (each read may cost money);
- * 3. runs the money guard on both, and records a trip at the limit.
+ * 3. runs the money guard on both (the reading plus what the meter counted
+ *    since its data ends), and records a trip at the limit.
  *
  * startMachine() is the only way to a provider's start, and it runs the same
  * check first, on fresh readings: a refusal, a spend that can't be told or
  * an error means no start. Checks and starts run one at a time. Starting on
  * demand and stopping when idle (step 2) call it; until then the module only
- * observes, and its route is read-only.
+ * observes. Its routes are the owner's: the status, and clearing a trip.
  */
 import type { EventBus } from "../core/event-bus.js";
 import { systemClock, type Clock } from "../watchdog/probes.js";
@@ -30,7 +32,7 @@ import type {
 } from "../../shared/cloud-types.js";
 import { parseCloudConfig, type CloudBudgetSettings, type CloudMachineSettings, type CloudSettings } from "./config.js";
 import { dollars, evaluateGuard, type GuardVerdict, type StoredTrip } from "./guard.js";
-import { meterSpend } from "./meter.js";
+import { meterSince, meterSpend } from "./meter.js";
 import { AwsEc2Provider, providerText, sdkClients, type AwsClients, type CloudProvider, type PowerState } from "./provider.js";
 import { CloudStore, type SpendReadingRecord, type StoredSpend } from "./store.js";
 
@@ -121,7 +123,15 @@ export function tripView(trip: StoredTrip): CloudTrip {
 }
 
 function publicSpend(reading: StoredSpend): CloudProviderSpend {
-  return { profile: reading.profile, state: reading.state, amount: reading.amount, detail: reading.detail, readAt: reading.readAt };
+  return {
+    profile: reading.profile,
+    state: reading.state,
+    amount: reading.amount,
+    detail: reading.detail,
+    readAt: reading.readAt,
+    dataUntil: null,
+    meterSince: null,
+  };
 }
 
 /**
@@ -315,13 +325,14 @@ export class CloudMachines {
           rt.stoppedAt = desc.stoppedAt;
           rt.lastError = null;
           // A clock behind the provider's would count runs short: not recorded, and the spend can't be told
-          const ahead = Math.max(desc.launchedAt ?? -Infinity, desc.stoppedAt ?? -Infinity) - now;
+          const ahead = Math.max(desc.launchedAt, desc.stoppedAt ?? -Infinity) - now;
           if (ahead > CLOCK_AHEAD_MS) {
             throw new Error(
               `the provider dates its last launch or stop ${Math.round(ahead / 1000)} s after this machine's clock: check the clock`,
             );
           }
-          this.store.recordDescription(this.project, m, desc, now);
+          // A gap since the last sighting up to two checks long is counted at the price; a longer one is blind
+          this.store.recordDescription(this.project, m, desc, now, 2 * this.settings.checkSeconds * 1000);
         } catch (e) {
           // A machine Lair can't see may be running: the meter can't be told
           rt.state = "unknown";
@@ -331,13 +342,19 @@ export class CloudMachines {
       }),
     );
     const readings = await this.readSpend(now);
-    const meter =
-      failures.length > 0
-        ? null
-        : meterSpend({ runs: this.store.runs(this.project, budget.startMs, budget.endMs), machines: this.settings.machines, budget, now });
-    const provider = readings.map((r) => judged(r, now, meter));
+    const runs = failures.length > 0 ? [] : this.store.runs(this.project, budget.startMs, budget.endMs);
+    const meter = failures.length > 0 ? null : meterSpend({ runs, machines: this.settings.machines, budget, now });
+    const provider = readings.map((r): CloudProviderSpend => {
+      const shown = judged(r, now, meter);
+      if (shown.state !== "amount" || r.readAtMs === null || meter === null) return shown;
+      // The reading lags: what this account's machines ran since its data ends is added to it
+      const machines = this.settings.machines.filter((m) => m.profile === r.profile);
+      const dataUntil = r.readAtMs - this.provider(machines[0]).costLagMs;
+      return { ...shown, dataUntil: iso(dataUntil), meterSince: meterSince({ runs, machines, budget, now }, dataUntil) };
+    });
     const meterError = failures.length > 0 ? `describe failed for ${failures.join("; ")}` : null;
-    const input = { budget, now, meter: meter?.total ?? null, meterError, provider };
+    const blind = meter === null ? [] : this.blindSpots(provider);
+    const input = { budget, now, meter: meter?.total ?? null, meterError, provider, blind };
     let verdict = evaluateGuard({ ...input, trip: this.store.trip(this.project) });
     if (verdict.trips && verdict.spend !== null) {
       if (this.store.addTrip(this.project, budget, verdict.spend, verdict.reason, now)) {
@@ -354,6 +371,31 @@ export class CloudMachines {
     }
     this.last = { at: now, meter, meterError, provider, verdict };
     return verdict;
+  }
+
+  /**
+   * Time Lair did not see a machine that may have run (a long gap between
+   * sightings, or what ran before the first one) that no cost reading
+   * covers yet: an amount covers it once its data reaches the gap's end.
+   * Until then a start waits, whatever the meter says.
+   */
+  private blindSpots(provider: readonly CloudProviderSpend[]): string[] {
+    const budget = this.budget;
+    const spots: string[] = [];
+    for (const w of this.store.blindWindows(this.project, budget.startMs, budget.endMs)) {
+      const machine = this.settings.machines.find((m) => m.id === w.machine && m.instanceId === w.instanceId);
+      // An instance no longer in the config: Lair neither meters nor starts it
+      if (!machine) continue;
+      const reading = provider.find((r) => r.profile === machine.profile);
+      if (reading?.state === "amount" && reading.dataUntil !== null && Date.parse(reading.dataUntil) >= w.to) continue;
+      const what =
+        w.from <= 0
+          ? `what ${w.machine} ran before Lair first saw it (its launch on ${iso(w.to)})`
+          : `${w.machine} from ${iso(w.from)} to its launch on ${iso(w.to)}`;
+      const after = iso(w.to + this.provider(machine).costLagMs);
+      spots.push(`Lair did not see ${what}, and it may have run: no start until a cost reading taken after ${after} covers it`);
+    }
+    return spots;
   }
 
   /** Each account's cost reading: the stored one while fresh, else a new read */

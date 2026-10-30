@@ -44,6 +44,10 @@ export interface CloudProviderSpend {
   amount: number | null;
   detail: string | null;
   readAt: string | null;
+  /** An amount holds the spend up to here at least: its read time less the provider's lag (a day for AWS) */
+  dataUntil: string | null;
+  /** What the meter counted since dataUntil, for this account's machines: the guard adds it to the amount */
+  meterSince: number | null;
 }
 
 export interface CloudMeterSpend {

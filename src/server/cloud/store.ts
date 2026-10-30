@@ -12,7 +12,7 @@ import type { CloudProviderSpend } from "../../shared/cloud-types.js";
 import type { CloudBudgetSettings, CloudMachineSettings } from "./config.js";
 import type { StoredTrip } from "./guard.js";
 import type { MeterRun } from "./meter.js";
-import { STOPPED_STATES, type MachineDescription } from "./provider.js";
+import { STOPPED_STATES, type MachineDescription, type PowerState } from "./provider.js";
 
 const SCHEMA_VERSION = 1;
 
@@ -29,6 +29,29 @@ const SCHEMA = `
     PRIMARY KEY (project, instance_id, launched_at)
   );
   CREATE INDEX IF NOT EXISTS idx_cloud_runs_open ON cloud_runs(project, instance_id, stopped_at);
+
+  -- Each instance as Lair last saw it (a successful describe): what may have run unseen since is a gap
+  CREATE TABLE IF NOT EXISTS cloud_seen (
+    project TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    seen_at INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    launched_at INTEGER NOT NULL,
+    PRIMARY KEY (project, instance_id)
+  );
+
+  -- Time Lair did not see an instance that may have run: counted at its price (a short gap), or blind (a long one,
+  -- or the time before Lair first saw it) until a cost reading covers it
+  CREATE TABLE IF NOT EXISTS cloud_gaps (
+    project TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    machine TEXT NOT NULL,
+    from_ms INTEGER NOT NULL,
+    to_ms INTEGER NOT NULL,
+    counted INTEGER NOT NULL,
+    price_per_hour REAL NOT NULL,
+    PRIMARY KEY (project, instance_id, from_ms)
+  );
 
   CREATE TABLE IF NOT EXISTS cloud_spend (
     project TEXT NOT NULL,
@@ -66,12 +89,25 @@ const SCHEMA = `
 
 /** Runs that ended this long ago are dropped (a period is at most a few years) */
 const RUN_RETENTION_MS = 3 * 366 * 86_400_000;
+/**
+ * A gap starts this long before the sighting it follows: a clock up to a
+ * minute ahead of the provider's would otherwise make it short.
+ */
+const GAP_MARGIN_MS = 60_000;
+
+/** Time Lair did not see an instance that may have run, which only a cost reading can cover */
+export interface BlindWindow {
+  machine: string;
+  instanceId: string;
+  /** 0: everything before the first sighting */
+  from: number;
+  to: number;
+}
 
 interface RunRow {
   machine: string;
   launched_at: number;
   stopped_at: number | null;
-  stop_known: number;
   price_per_hour: number;
 }
 
@@ -153,11 +189,45 @@ export class CloudStore {
    * while the machine is not stopped the run is open. A stop the provider
    * does not date is taken as the moment Lair first saw it stopped, and an
    * older run still open ends at the newer launch at the latest.
+   *
+   * Then what Lair did not see. The provider dates only the last launch, so
+   * a launch newer than the one Lair saw last, after it last saw the machine
+   * stopped, may hide runs between that sighting and the launch: a gap. A
+   * gap up to `countUpToMs` long (about two checks) is counted at the
+   * machine's price, as if it ran throughout; a longer one (Lair was down,
+   * or describes failed) is blind: the guard refuses until a cost reading
+   * covers it. The first sighting of an instance is blind up to its launch:
+   * Lair can't know what ran before.
    */
-  recordDescription(project: string, machine: CloudMachineSettings, desc: MachineDescription, now: number): void {
+  recordDescription(project: string, machine: CloudMachineSettings, desc: MachineDescription, now: number, countUpToMs: number): void {
     const launchedAt = desc.launchedAt;
-    if (launchedAt === null) return;
     this.db.transaction(() => {
+      const seen = this.db
+        .prepare(`SELECT seen_at, state, launched_at FROM cloud_seen WHERE project = ? AND instance_id = ?`)
+        .get(project, machine.instanceId) as { seen_at: number; state: string; launched_at: number } | undefined;
+      let gap: { from: number; counted: boolean } | null = null;
+      if (!seen) {
+        gap = { from: 0, counted: false };
+      } else if (launchedAt > seen.launched_at && STOPPED_STATES.has(seen.state as PowerState)) {
+        const from = seen.seen_at - GAP_MARGIN_MS;
+        if (launchedAt > from) gap = { from, counted: launchedAt - from <= countUpToMs };
+      }
+      if (gap) {
+        this.db
+          .prepare(
+            `INSERT OR IGNORE INTO cloud_gaps (project, instance_id, machine, from_ms, to_ms, counted, price_per_hour)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(project, machine.instanceId, machine.id, gap.from, launchedAt, gap.counted ? 1 : 0, machine.pricePerHour);
+      }
+      this.db
+        .prepare(
+          `INSERT INTO cloud_seen (project, instance_id, seen_at, state, launched_at) VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT (project, instance_id) DO UPDATE SET
+             seen_at = excluded.seen_at, state = excluded.state, launched_at = MAX(launched_at, excluded.launched_at)`,
+        )
+        .run(project, machine.instanceId, now, desc.state, launchedAt);
+
       this.db
         .prepare(
           `UPDATE cloud_runs SET stopped_at = ?, stop_known = 0
@@ -195,15 +265,18 @@ export class CloudStore {
     })();
   }
 
-  /** The runs of a project that overlap [startMs, endMs) */
+  /** The runs of a project that overlap [startMs, endMs), counted gaps included (as runs from gap to launch) */
   runs(project: string, startMs: number, endMs: number): MeterRun[] {
     const rows = this.db
       .prepare(
-        `SELECT machine, launched_at, stopped_at, stop_known, price_per_hour FROM cloud_runs
+        `SELECT machine, launched_at, stopped_at, price_per_hour FROM cloud_runs
          WHERE project = ? AND launched_at < ? AND (stopped_at IS NULL OR stopped_at > ?)
+         UNION ALL
+         SELECT machine, from_ms AS launched_at, to_ms AS stopped_at, price_per_hour FROM cloud_gaps
+         WHERE project = ? AND counted = 1 AND from_ms < ? AND to_ms > ?
          ORDER BY launched_at`,
       )
-      .all(project, endMs, startMs) as RunRow[];
+      .all(project, endMs, startMs, project, endMs, startMs) as RunRow[];
     return rows.map((r) => ({
       machine: r.machine,
       launchedAt: r.launched_at,
@@ -212,9 +285,22 @@ export class CloudStore {
     }));
   }
 
-  /** Drop runs that ended long ago */
+  /** The blind gaps of a project that overlap [startMs, endMs): only a cost reading covers them */
+  blindWindows(project: string, startMs: number, endMs: number): BlindWindow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT machine, instance_id, from_ms, to_ms FROM cloud_gaps
+         WHERE project = ? AND counted = 0 AND from_ms < ? AND to_ms > ?
+         ORDER BY to_ms`,
+      )
+      .all(project, endMs, startMs) as { machine: string; instance_id: string; from_ms: number; to_ms: number }[];
+    return rows.map((r) => ({ machine: r.machine, instanceId: r.instance_id, from: r.from_ms, to: r.to_ms }));
+  }
+
+  /** Drop runs and gaps that ended long ago */
   pruneRuns(now: number): void {
     this.db.prepare(`DELETE FROM cloud_runs WHERE stopped_at IS NOT NULL AND stopped_at < ?`).run(now - RUN_RETENTION_MS);
+    this.db.prepare(`DELETE FROM cloud_gaps WHERE to_ms < ?`).run(now - RUN_RETENTION_MS);
   }
 
   // ============ COST READINGS ============

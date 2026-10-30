@@ -255,7 +255,10 @@ function money(amount: number | null): string | null {
 }
 
 function providerReading(r: CloudProviderSpend): string {
-  if (r.state === "amount") return money(r.amount) ?? "-";
+  if (r.state === "amount") {
+    const lag = r.dataUntil && r.meterSince !== null ? ` (its data ends ${r.dataUntil}; + ${money(r.meterSince)} metered since)` : "";
+    return `${money(r.amount) ?? "-"}${lag}`;
+  }
   if (r.state === "unknown") return `no data yet (${r.detail ?? "the provider has none"})`;
   if (r.state === "error") return `failed: ${r.detail ?? "no detail"}`;
   return r.detail ?? "not read yet";

@@ -13,6 +13,8 @@ import type { CloudBudgetSettings, CloudMachineSettings } from "./config.js";
 
 const MINUTE_MS = 60_000;
 const DAY_MS = 86_400_000;
+/** Storage by the hour errs high at February's rate: a month's price over its fewest hours */
+const SHORTEST_MONTH_MS = 28 * DAY_MS;
 
 export interface MeterRun {
   machine: string;
@@ -81,4 +83,29 @@ export function meterSpend(input: MeterInput): CloudMeterSpend {
     start: budget.meterStart,
     today: centsUp(todays),
   };
+}
+
+/**
+ * What the meter counts from `since` on, for the machines given (their runs
+ * and counted gaps, and their storage by the hour at the shortest month's
+ * rate): the spend a provider reading whose data ends at `since` does not
+ * hold yet. The guard adds it to that reading, so the provider's lag never
+ * hides a run.
+ */
+export function meterSince(input: MeterInput, since: number): number {
+  const { budget, now } = input;
+  const from = Math.max(since, budget.startMs);
+  const price = new Map(input.machines.map((m) => [m.id, m.pricePerHour]));
+  let compute = 0;
+  for (const run of input.runs) {
+    const current = price.get(run.machine);
+    // Another account's machine: its own reading holds it
+    if (current === undefined) continue;
+    const perHour = Math.max(run.pricePerHour, current);
+    compute += billedHours(Math.max(run.launchedAt, from), Math.min(runEnd(run, now), budget.endMs)) * perHour;
+  }
+  const until = Math.min(now, budget.endMs);
+  const perMonth = input.machines.reduce((sum, m) => sum + m.storagePerMonth, 0);
+  const storage = until > from ? (perMonth * (until - from)) / SHORTEST_MONTH_MS : 0;
+  return centsUp(compute + storage);
 }

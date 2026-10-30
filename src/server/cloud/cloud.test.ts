@@ -238,7 +238,12 @@ describe("cloud: the AWS EC2 provider and the meter", () => {
       region: "us-east-1",
       input: { InstanceIds: [INSTANCE], Filters: [{ Name: "tag:role", Values: ["gate-server"] }] },
     });
-    expect(verdict).toMatchObject({ state: "ok", allowed: true });
+    // Launched in the period before Lair first saw it: what ran before is for a cost reading to cover
+    expect(verdict).toMatchObject({ state: "refused", allowed: false });
+    expect(verdict.reason).toBe(
+      "spend unknown: Lair did not see what cloud-1 ran before Lair first saw it (its launch on 2027-03-10T10:00:00.000Z), " +
+        "and it may have run: no start until a cost reading taken after 2027-03-11T10:00:00.000Z covers it",
+    );
     let status = h.status();
     expect(status.machines).toEqual([
       expect.objectContaining({ id: "cloud-1", state: "running", instanceId: INSTANCE, tag: "role=gate-server", lastError: null }),
@@ -267,7 +272,7 @@ describe("cloud: the AWS EC2 provider and the meter", () => {
 
   it("starts a stopped instance and stops a running one; a running one is not started again", async () => {
     const h = new Harness(cloudBlock());
-    h.instance("stopped", NOW - 5 * HOUR, NOW - 4 * HOUR);
+    h.instance("stopped", NOW - 29 * HOUR, NOW - 28 * HOUR);
     const started = await h.machines.startMachine("cloud-1");
     expect(started).toMatchObject({ allowed: true, state: "pending" });
     expect(h.aws.named("StartInstances").map((s) => s.input)).toEqual([{ InstanceIds: [INSTANCE] }]);
@@ -282,7 +287,7 @@ describe("cloud: the AWS EC2 provider and the meter", () => {
 
   it("reads the cost before credits and refunds at most every spend_check_hours, across a restart", async () => {
     const h = new Harness(cloudBlock());
-    h.instance("stopped", NOW - 5 * HOUR, NOW - 4 * HOUR);
+    h.instance("stopped", NOW - 29 * HOUR, NOW - 28 * HOUR);
     h.aws.cost = "12.5";
     await h.machines.check();
     expect(h.aws.named("GetCostAndUsage").map((s) => s.input)).toEqual([
@@ -294,8 +299,12 @@ describe("cloud: the AWS EC2 provider and the meter", () => {
         NextPageToken: undefined,
       },
     ]);
-    // Spend is the larger reading: the provider's $12.50 over the meter's $18.50
-    expect(h.status().budget).toMatchObject({ spend: 18.5, provider: [{ profile: "gates", state: "amount", amount: 12.5 }] });
+    // Spend is the larger: the meter's $18.50, over the provider's $12.50 plus the day its data lags
+    // (no run in it, a day of storage at $6 a 28-day month: $0.22)
+    expect(h.status().budget).toMatchObject({
+      spend: 18.5,
+      provider: [{ profile: "gates", state: "amount", amount: 12.5, dataUntil: new Date(NOW - DAY).toISOString(), meterSince: 0.22 }],
+    });
 
     h.now = NOW + HOUR;
     await h.machines.check();
@@ -307,7 +316,8 @@ describe("cloud: the AWS EC2 provider and the meter", () => {
     h.aws.cost = "30";
     await h.machines.check();
     expect(h.aws.named("GetCostAndUsage")).toHaveLength(2);
-    expect(h.status().budget?.spend).toBe(30);
+    // $30 and the day its data lags (storage $0.22)
+    expect(h.status().budget?.spend).toBe(30.22);
   });
 });
 
@@ -321,7 +331,7 @@ describe("cloud: the money guard", () => {
 
     const refused = await h.machines.startMachine("cloud-1");
     expect(refused.allowed).toBe(false);
-    expect(refused.reason).toContain("spend $20.00 reached the limit $20.00 (provider $3.00, meter $20.00)");
+    expect(refused.reason).toContain("spend $20.00 reached the limit $20.00 (provider $3.00 + $0.22 metered since its data, meter $20.00)");
     expect(h.aws.named("StartInstances")).toHaveLength(0);
     expect(h.trips()).toEqual([expect.objectContaining({ project: PROJECT, limit: 20, spend: 20 })]);
     expect(h.status().budget?.guard).toMatchObject({
@@ -556,6 +566,102 @@ describe("cloud: the meter never counts short", () => {
   });
 });
 
+describe("cloud: what Lair did not see, and what the provider's reading does not hold yet", () => {
+  it("a short gap between checks counts at the price; Lair down while a stopped machine ran refuses until a reading covers it", async () => {
+    const h = new Harness(cloudBlock());
+    h.instance("stopped", EVE_LAUNCH, EVE_STOP);
+    expect(await h.machines.check()).toMatchObject({ allowed: true });
+    expect(h.status().budget?.meter?.compute).toBe(1);
+
+    // Started from the console 2 minutes after a check, seen running 5 minutes after it: the 3 minutes
+    // since a minute before that check count as if it ran, then the run itself
+    h.instance("running", NOW + 2 * MINUTE);
+    h.now = NOW + 5 * MINUTE;
+    expect(await h.machines.check()).toMatchObject({ allowed: true });
+    expect(h.status().budget?.meter?.compute).toBe(1.05);
+    h.instance("stopped", NOW + 2 * MINUTE, NOW + 10 * MINUTE);
+    h.now = NOW + 15 * MINUTE;
+    await h.machines.check();
+
+    // Lair down for hours; meanwhile the machine was started (once, or many times: the provider dates only the last)
+    h.instance("stopped", NOW + 6 * HOUR, NOW + 7 * HOUR);
+    h.now = NOW + 8 * HOUR + 15 * MINUTE;
+    const blind = await h.machines.startMachine("cloud-1");
+    expect(blind).toMatchObject({ allowed: false });
+    expect(blind.reason).toBe(
+      "spend unknown: Lair did not see cloud-1 from 2027-03-10T12:14:00.000Z to its launch on 2027-03-10T18:00:00.000Z, " +
+        "and it may have run: no start until a cost reading taken after 2027-03-11T18:00:00.000Z covers it",
+    );
+    expect(h.aws.named("StartInstances")).toHaveLength(0);
+    expect(h.trips()).toEqual([]);
+    // A restart does not forget it
+    await h.restart(cloudBlock());
+    expect(await h.machines.startMachine("cloud-1")).toMatchObject({ allowed: false, reason: blind.reason });
+
+    // A reading taken a day after that launch holds whatever ran unseen: the start goes ahead
+    h.now = NOW + 30 * HOUR;
+    h.aws.cost = "4";
+    expect(await h.machines.startMachine("cloud-1")).toMatchObject({ allowed: true });
+    expect(h.aws.named("StartInstances")).toHaveLength(1);
+    const budget = h.status().budget;
+    // The meter: the eve's 2 h, the 3 counted minutes, 8 and 60 minutes of runs; never the blind hours
+    expect(budget?.meter?.compute).toBe(1.6);
+    // The reading's data ends at the launch; the hour run since and a day of storage come on top of it
+    expect(budget?.provider[0]).toMatchObject({ amount: 4, dataUntil: new Date(NOW + 6 * HOUR).toISOString(), meterSince: 0.72 });
+  });
+
+  it("Lair down 8 hours with the machine running before and after: the whole time counts", async () => {
+    const h = new Harness(cloudBlock());
+    h.instance("running", NOW - 30 * HOUR);
+    await h.machines.check();
+    // Stopped and started again while Lair was down: running before and after, with a new launch
+    h.instance("running", NOW + 7 * HOUR);
+    h.now = NOW + 8 * HOUR;
+    expect(await h.machines.check()).toMatchObject({ allowed: true });
+    // From the first launch to now: 38 h at $0.50, the time it may have been stopped included
+    expect(h.status().budget?.meter?.compute).toBe(19);
+  });
+
+  it("the provider's reading misses its last day: the runs Lair metered since its data ends count on top of it", async () => {
+    const h = new Harness(cloudBlock({ limit: 30 }));
+    h.instance("stopped", EVE_LAUNCH, EVE_STOP);
+    h.aws.cost = "20";
+    h.now = NOW - 18 * HOUR;
+    await h.machines.check();
+    // A 10-hour run that Lair saw, in the last day
+    h.instance("running", NOW - 18 * HOUR + MINUTE);
+    h.now = NOW - 18 * HOUR + 4 * MINUTE;
+    await h.machines.check();
+    h.instance("stopped", NOW - 18 * HOUR + MINUTE, NOW - 8 * HOUR + MINUTE);
+    h.now = NOW - 8 * HOUR + 3 * MINUTE;
+    await h.machines.check();
+
+    // Read now, the provider says $25: its data ends a day ago, before the run. Alone it and the meter ($24.02) are
+    // under $30; with the 602 minutes metered since its data ends and a day of storage ($5.24), they are not
+    h.now = NOW;
+    h.aws.cost = "25";
+    const refused = await h.machines.startMachine("cloud-1");
+    expect(refused).toMatchObject({ allowed: false });
+    expect(refused.reason).toBe(
+      "spend $30.24 reached the limit $30.00 (provider $25.00 + $5.24 metered since its data, meter $24.02)",
+    );
+    expect(h.aws.named("StartInstances")).toHaveLength(0);
+    expect(h.trips()).toEqual([expect.objectContaining({ spend: 30.24 })]);
+  });
+
+  it("the first sighting: a machine launched in the period waits for a reading taken a day after that launch", async () => {
+    const h = new Harness(cloudBlock());
+    h.instance("stopped", NOW - 5 * HOUR, NOW - 4 * HOUR);
+    const first = await h.machines.startMachine("cloud-1");
+    expect(first).toMatchObject({ allowed: false });
+    expect(first.reason).toMatch(/^spend unknown: Lair did not see what cloud-1 ran before Lair first saw it/);
+    // Read again 19 hours on: its data ends at the launch, and covers what ran before it
+    h.now = NOW + 19 * HOUR;
+    expect(await h.machines.startMachine("cloud-1")).toMatchObject({ allowed: true, state: "pending" });
+    expect(h.aws.named("StartInstances")).toHaveLength(1);
+  });
+});
+
 describe("cloud: only the current instance starts, and only through the guard", () => {
   it("a stopped or replaced instance starts and stops nothing, a start queued before its stop included", async () => {
     const h = new Harness(cloudBlock());
@@ -724,7 +830,7 @@ describe("cloud: status route", () => {
 
   it("GET /api/cloud/status shows each machine's state, the spend and the guard, and nothing else answers", async () => {
     const h = new Harness(cloudBlock({ limit: 20, meter_start: 1 }));
-    h.instance("stopped", NOW - 4 * HOUR, NOW - 2 * HOUR);
+    h.instance("stopped", NOW - 28 * HOUR, NOW - 26 * HOUR);
     h.aws.cost = "3";
     await h.machines.check();
     const { app, owner } = await h.serve();

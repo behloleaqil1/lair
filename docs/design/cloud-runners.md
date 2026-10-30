@@ -58,10 +58,15 @@ Tests fake only this boundary (Lair rule: fake remote APIs, the clock and the pr
 
 ## 4. The money guard
 - **Spend** is the larger of two readings:
-  1. the provider's cost reading (`spend`), cached for hours (each call may cost money; provider data lags);
+  1. the provider's cost reading (`spend`), cached for hours (each call may cost money), plus what the meter counted
+     since the reading's data ends (provider data lags: Cost Explorer up to a day), so the lag never hides a run;
   2. Lair's own meter: every run's launch and stop times from `describe` (so a stop by the backstop or in the console
      still counts, and an unknown stop time counts up to now), times the hourly price, plus storage for each month of
      the period, plus a starting amount for spend before the meter existed.
+- **What Lair did not see.** `describe` dates only the last launch. A newer launch after Lair last saw the machine
+  stopped means it may have run unseen since that sighting: a short gap (two checks) counts at the price, a longer one
+  (Lair down, describes failing) and the time before Lair first saw a machine refuse starts until a cost reading taken
+  a day after the launch covers them (decided in the review of step 1).
 - **Refuse at the limit.** At `limit` or above, Lair does not start the machine; it records the trip, moves the
   machine's jobs to the next executor and raises a `spend` Decision. Only a human clears a trip, and only by an
   authenticated owner action: the owner session's `POST /api/cloud/trip/clear` (Clear the trip in the Machines view),
@@ -177,7 +182,13 @@ cloud:
      its first reading, before any amount, and for an answer with no cost only while nothing is metered), then counts
      as a failed reading (§12 "no data yet" bounded);
    - the meter records each launch the provider describes; a stop it does not date ends at the check that saw it
-     stopped, and an open run ends at the next launch at the latest;
+     stopped, and an open run ends at the next launch at the latest; every run counts a minute at least, and a stop
+     dated after the local clock is kept (a launch or stop over a minute ahead of it refuses: the clock is wrong);
+   - each instance's last sighting is kept: a newer launch after a stopped sighting makes a gap from that sighting
+     (less a minute) to the launch, counted at the price up to `2 × check_seconds` and blind beyond; the first sighting
+     is blind up to the launch; a blind gap refuses starts until an amount whose data (read time less the provider's
+     `costLagMs`, a day for AWS) reaches its end;
+   - spend is the larger of the meter and, per account, the reading plus the meter since its data ends (`meterSince`);
    - the guard refuses (fails closed) when a machine could not be described in the check, a cost reading failed, or the
      day is outside the period; a trip stands per project, whatever the limit or period says later, until the owner
      clears it with `POST /api/cloud/trip/clear` (owner session, naming the trip's time; recorded with the session id

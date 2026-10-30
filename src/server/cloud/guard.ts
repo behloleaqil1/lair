@@ -1,15 +1,20 @@
 /**
  * The money guard (docs/design/cloud-runners.md §4). Spend is the larger of
- * the provider's cost reading and Lair's meter; at the limit or above no
- * machine starts, and the trip stands until the owner clears it (an owner
- * session's request, POST /api/cloud/trip/clear): a higher limit or a new
- * period alone does not. It fails closed: a spend Lair can't tell (a machine
- * it could not describe, a cost reading that failed) or a day outside the
- * period refuses a start too. A provider reading of "unknown" (no data yet)
- * leaves the meter to decide.
+ * two: Lair's meter, and the provider's cost reading plus what the meter
+ * counted since the reading's data ends (provider data lags: a reading taken
+ * at T holds the spend up to T less the provider's lag, so a run in that lag
+ * is never left out). At the limit or above no machine starts, and the trip
+ * stands until the owner clears it (an owner session's request, POST
+ * /api/cloud/trip/clear): a higher limit or a new period alone does not. It
+ * fails closed: a spend Lair can't tell (a machine it could not describe, a
+ * cost reading that failed, time Lair did not see a machine that no cost
+ * reading covers yet) or a day outside the period refuses a start too. A
+ * provider reading of "unknown" (no data yet, a new account) leaves the meter
+ * to decide.
  */
 import type { CloudGuardState, CloudProviderSpend } from "../../shared/cloud-types.js";
 import type { CloudBudgetSettings } from "./config.js";
+import { centsUp } from "./meter.js";
 
 export interface StoredTrip {
   /** The limit and period when it tripped */
@@ -31,7 +36,10 @@ export interface GuardInput {
   /** The meter's total, or null when it can't be told */
   meter: number | null;
   meterError: string | null;
+  /** Each account's reading; an amount carries what the meter counted since its data ends (meterSince) */
   provider: readonly CloudProviderSpend[];
+  /** Time Lair did not see a machine that may have run, that no cost reading covers yet (each said in words) */
+  blind: readonly string[];
   /** The trip that stands (not cleared by the owner), whatever the limit and period are now */
   trip: StoredTrip | null;
 }
@@ -71,6 +79,7 @@ export function evaluateGuard(input: GuardInput): GuardVerdict {
     return refuse("refused", `spend unknown: ${input.meterError ?? "the meter has not read every machine yet"}`);
   }
   let providerAmount = 0;
+  let recent = 0;
   const unknown: string[] = [];
   for (const reading of input.provider) {
     if (reading.state === "error") {
@@ -84,10 +93,20 @@ export function evaluateGuard(input: GuardInput): GuardVerdict {
     if (reading.amount === null || !Number.isFinite(reading.amount)) {
       return refuse("refused", `spend unknown: the cost reading for profile ${reading.profile} has no amount`);
     }
+    if (reading.meterSince === null || !Number.isFinite(reading.meterSince)) {
+      return refuse("refused", `spend unknown: what the meter counted since the cost reading for profile ${reading.profile} is not known`);
+    }
     providerAmount += reading.amount;
+    recent += reading.meterSince;
   }
-  const spend = Math.max(providerAmount, input.meter);
-  const parts = `provider ${dollars(providerAmount)}${unknown.length > 0 ? ` (no data yet: ${unknown.join(", ")})` : ""}, meter ${dollars(input.meter)}`;
+  if (input.blind.length > 0) {
+    const more = input.blind.length > 1 ? ` (and ${input.blind.length - 1} more)` : "";
+    return refuse("refused", `spend unknown: ${input.blind[0]}${more}`);
+  }
+  // The reading, and what ran since its data ends: never less than the reading alone
+  const spend = Math.max(centsUp(providerAmount + recent), input.meter);
+  const lagged = recent > 0 ? ` + ${dollars(recent)} metered since its data` : "";
+  const parts = `provider ${dollars(providerAmount)}${lagged}${unknown.length > 0 ? ` (no data yet: ${unknown.join(", ")})` : ""}, meter ${dollars(input.meter)}`;
   if (spend >= budget.limit) {
     return {
       state: "tripped",
