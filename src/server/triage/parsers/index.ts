@@ -17,10 +17,13 @@
 import type { GateResult, GateStepResult } from "../../../shared/policy-types.js";
 import type { FailureCause, TestRef } from "../../../shared/triage-types.js";
 import { MAX_EVIDENCE, absorbFollowers, boundedLines, causedByChain, clip, groupFailures, mergeCauses } from "../text.js";
+import { cargoTestParser } from "./cargo.js";
+import { goTestParser } from "./go.js";
 import { gradleParser } from "./gradle.js";
 import { jestParser, vitestParser } from "./js.js";
 import { junitParser } from "./junit.js";
 import { pytestParser } from "./pytest.js";
+import { trxParser } from "./trx.js";
 import type { EvidenceParser } from "./types.js";
 
 export type { EvidenceParser, ParseOptions, ParseOutput } from "./types.js";
@@ -28,10 +31,26 @@ export { parseJUnit } from "./junit.js";
 export { parseGradle } from "./gradle.js";
 export { parseVitest, parseJest } from "./js.js";
 export { parsePytest } from "./pytest.js";
+export { parseGoTest, goTestParser } from "./go.js";
+export { parseCargoTest, cargoTestParser } from "./cargo.js";
+export { parseTrx, trxParser } from "./trx.js";
+export { createCustomParser, validateCustomParserConfig, type CustomParserConfig } from "./custom.js";
 export { parseXml } from "./xml.js";
 
-/** Console parsers are tried in this order; the first that recognises a step's output reads it. */
-export const BUILTIN_PARSERS: EvidenceParser[] = [junitParser, gradleParser, vitestParser, jestParser, pytestParser];
+/**
+ * Built-in parsers tried in order. Report parsers (junit, trx) are tried first
+ * on report content; console parsers are tried on step output.
+ */
+export const BUILTIN_PARSERS: EvidenceParser[] = [
+  junitParser,
+  trxParser,
+  gradleParser,
+  vitestParser,
+  jestParser,
+  pytestParser,
+  goTestParser,
+  cargoTestParser,
+];
 
 /** A machine-readable report sent with a gate result. */
 export interface ReportInput {

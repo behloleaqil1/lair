@@ -5,7 +5,20 @@
  */
 import { describe, expect, it } from "vitest";
 import { DEFAULT_CONTEXT_PATTERNS } from "./config.js";
-import { parseGateEvidence, parseGradle, parseJUnit, parseJest, parsePytest, parseVitest, parseXml } from "./parsers/index.js";
+import {
+  parseGateEvidence,
+  parseGradle,
+  parseJUnit,
+  parseJest,
+  parsePytest,
+  parseVitest,
+  parseXml,
+  parseGoTest,
+  parseCargoTest,
+  parseTrx,
+  createCustomParser,
+  validateCustomParserConfig,
+} from "./parsers/index.js";
 import { fixture, gate, sha, step } from "./testing/harness.js";
 
 const options = { contextPatterns: DEFAULT_CONTEXT_PATTERNS.map((p) => new RegExp(p, "i")) };
@@ -157,6 +170,42 @@ describe("console summaries", () => {
     expect(assertion.evidence).toContain("assert 100 == 108");
     expect(assertion.locations).toContainEqual({ file: "tests/test_orders.py", line: 9 });
   });
+
+  it("go test -json: parses JSON events and extracts failures", () => {
+    const out = parseGoTest(fixture("go-test-json.txt"), options);
+    expect(out.failedCount).toBe(2);
+    expect(out.causes).toHaveLength(2);
+    const [total, connect] = out.causes;
+    expect(total.tests[0]).toMatchObject({
+      suite: "example.com/shop/orders",
+      name: "TestCalculateTotal",
+    });
+    expect(total.message).toContain("expected 108, got 100");
+    expect(connect.tests[0]).toMatchObject({
+      suite: "example.com/shop/orders",
+      name: "TestConnectDB",
+    });
+    expect(connect.type).toBe("panic");
+    expect(connect.message).toContain("connection refused");
+  });
+
+  it("cargo test: parses Rust test output with failures section", () => {
+    const out = parseCargoTest(fixture("cargo-test.txt"), options);
+    expect(out.failedCount).toBe(2);
+    expect(out.causes).toHaveLength(2);
+    const [total, connect] = out.causes;
+    expect(total.tests[0]).toMatchObject({
+      suite: "orders::tests",
+      name: "test_calculate_total",
+    });
+    expect(total.type).toBe("panic");
+    expect(total.message).toContain("assertion failed");
+    expect(connect.tests[0]).toMatchObject({
+      suite: "db::tests",
+      name: "test_connect",
+    });
+    expect(connect.message).toContain("connection failed");
+  });
 });
 
 describe("parseGateEvidence", () => {
@@ -240,4 +289,88 @@ describe("output written by the code under test", () => {
     expect(junit?.tests[0].suite.length).toBeLessThanOrEqual(500);
     expect(junit?.message).toBe("m");
   }, 30_000);
+});
+
+describe(".NET TRX reports", () => {
+  it("parses failed and passed tests from trx XML", () => {
+    const out = parseTrx(fixture("dotnet-trx.xml"), options);
+    expect(out.failedCount).toBe(2);
+    expect(out.causes).toHaveLength(2);
+    const [assertion, connection] = out.causes;
+    expect(assertion.tests[0]).toMatchObject({
+      suite: "Shop.Orders.Tests.OrderServiceTests",
+      name: "CalculateTotal_WithTax_ReturnsCorrectAmount",
+    });
+    expect(assertion.message).toContain("Assert.Equal() Failure");
+    expect(connection.tests[0]).toMatchObject({
+      suite: "Shop.Data.Tests.ConnectionTests",
+      name: "ConnectToDatabase_WhenDown_ThrowsException",
+    });
+    expect(connection.type).toBe("System.Data.SqlClient.SqlException");
+    expect(out.passed.map((t) => t.name)).toEqual([
+      "ApplyDiscount_ValidCode_ReducesTotal",
+      "ValidateOrder_EmptyCart_ReturnsFalse",
+    ]);
+  });
+});
+
+describe("custom regex parser", () => {
+  it("validates config and rejects invalid patterns", () => {
+    expect(validateCustomParserConfig(null)).toContain("custom parser config must be an object");
+    expect(validateCustomParserConfig({})).toContain("custom parser requires a non-empty 'name' field");
+    expect(validateCustomParserConfig({ name: "test", detect: "x" })).toContain(
+      "custom parser requires a non-empty 'fail_pattern'",
+    );
+    expect(
+      validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "(?<other>x)" }),
+    ).toContain("custom parser 'fail_pattern' must include a (?<name>...) capture group");
+    expect(
+      validateCustomParserConfig({ name: "test", detect: "[", fail_pattern: "(?<name>x)" }),
+    ).toContain("custom parser 'detect' pattern is not a valid regex");
+    expect(
+      validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "(?<name>x)" }),
+    ).toEqual([]);
+  });
+
+  it("parses test output with custom patterns", () => {
+    const parser = createCustomParser({
+      name: "mytest",
+      detect: "MyTest Framework",
+      fail_pattern: "FAIL:\\s+(?<suite>[^:]+)::(?<name>\\S+)\\s+-\\s+(?<message>.+)",
+      summary_pattern: "(?<failed>\\d+) failed, (?<passed>\\d+) passed",
+    });
+    expect(parser).not.toBeNull();
+
+    const output = `
+MyTest Framework v1.0
+Running tests...
+PASS: orders::test_create
+FAIL: orders::test_total - expected 108 but got 100
+PASS: orders::test_delete
+FAIL: db::test_connect - connection refused
+Summary: 2 failed, 2 passed
+`;
+    const out = parser!.parse(output, options);
+    expect(out.failedCount).toBe(2);
+    expect(out.causes).toHaveLength(2);
+    expect(out.causes[0].tests[0]).toMatchObject({ suite: "orders", name: "test_total" });
+    expect(out.causes[0].message).toBe("expected 108 but got 100");
+    expect(out.causes[1].tests[0]).toMatchObject({ suite: "db", name: "test_connect" });
+  });
+
+  it("bounds input to prevent regex attacks", () => {
+    const parser = createCustomParser({
+      name: "bounded",
+      detect: "test",
+      fail_pattern: "FAIL:\\s+(?<name>\\S+)",
+    });
+    expect(parser).not.toBeNull();
+
+    // A huge input should not cause timeout or memory issues
+    const started = Date.now();
+    const hugeOutput = "test\n" + "FAIL: test_" + "a".repeat(100_000) + "\n".repeat(1000);
+    const out = parser!.parse(hugeOutput, options);
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(out.causes.length).toBeLessThanOrEqual(5000);
+  });
 });
