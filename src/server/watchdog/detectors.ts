@@ -195,30 +195,12 @@ const orphanClaim: Detector = {
       }
       if ((await view.agentProcesses(claim.agent)).length > 0) continue; // live agent: never touched
 
-      // Check the claim file's recorded pid: if it is alive AND belongs to this agent, skip it.
-      // A live pid alone is not enough: after the agent dies, the OS can reuse that pid for
-      // an unrelated process, so we verify the process matches the agent.
+      // The claim's recorded pid, when it is alive AND the agent's: a live pid alone is not
+      // enough, since the OS can give a dead agent's pid to an unrelated process (claimPidBelongsTo)
       const claimPid = view.claimPid(claim);
-      if (claimPid !== null) {
-        const proc = await view.getProcess(claimPid.pid);
-        if (proc !== null) {
-          // The pid is alive. Check if it belongs to this agent:
-          // 1. The process start time is NOT significantly after the claim was written
-          //    (if the process started after the claim, it's a reused PID)
-          // 2. Or, the process command contains the agent id or the adapter's program
-          const processStartedAt = view.now - proc.elapsedSeconds * 1000;
-          const claimStartedAt = claimPid.startedAt;
-          // Allow 60 seconds tolerance for timing differences between claim and process start
-          const toleranceMs = 60000;
-          // A reused PID is one where the process started significantly after the claim was written
-          const isReusedByTime = claimStartedAt !== null && processStartedAt > claimStartedAt + toleranceMs;
-          const commandMatch = proc.command.includes(claim.agent);
-          if (!isReusedByTime || commandMatch) {
-            livePid.push(`${claim.agent} (pid ${claimPid.pid})`);
-            continue;
-          }
-          // The pid is alive but doesn't match the agent: it's a reused pid, treat as orphan
-        }
+      if (claimPid !== null && (await view.claimPidIsAgents(claim, claimPid))) {
+        livePid.push(`${claim.agent} (pid ${claimPid.pid})`);
+        continue;
       }
 
       const age = view.minutesSince(claim.mtimeMs);
