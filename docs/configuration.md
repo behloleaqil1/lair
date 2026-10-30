@@ -2350,7 +2350,7 @@ The routes read files and run nothing. Server code that plans asks `InfraPolicyM
 plan_sandbox:
   enabled: true                       # default false
   plan_role_arn: arn:aws:iam::123456789012:role/lair-plan
-  external_id: lair-plan-1            # optional; what the role's trust policy asks for
+  external_id: lair-plan-1            # required; what the role's trust policy asks for
   image: plan-runner:1                # container image with the tofu binary
   plugin_dir: /srv/infra/provider-mirror
   provider_api_hosts: ["*.amazonaws.com"]
@@ -2362,13 +2362,13 @@ plan_sandbox:
 |-----|------|---------|---------|
 | `enabled` | boolean | `false` | Turn the sandbox on for this project |
 | `plan_role_arn` | IAM role ARN | none | The read-only role every plan assumes; required when enabled. Lair asks STS for 15 minutes (900 s, the shortest STS issues) and never stores the credentials |
-| `external_id` | string | none | The external id for the assume-role call. Not a secret |
+| `external_id` | string | none | Required when enabled: the external id for the assume-role call, so the role is never assumed without one. Not a secret |
 | `region` | string | `us-east-1` | Region of the credentials |
-| `image` | string | none | Image the plan runs in; required when enabled |
-| `plugin_dir` | absolute path | none | The provider mirror, mounted read-only. Providers come from here with `init -lockfile=readonly`; nothing is downloaded at plan time. Required when enabled |
+| `image` | string | none | Image the plan runs in; required when enabled (a plain image reference) |
+| `plugin_dir` | absolute path | none | The provider mirror, mounted read-only. Providers come from here with `init -lockfile=readonly`; nothing is downloaded at plan time. Required when enabled; a plain path, no `:` or `,` |
 | `provider_api_hosts` | list of hosts | `[]` | Hosts the plan may reach: the provider APIs. A host, or `*.` plus a domain |
 | `registry_hosts` | list of hosts | `[registry.opentofu.org]` | Hosts the plan may reach: the module and provider registries |
-| `egress_network` | container network | none | A network whose only exit is a proxy or firewall that lets exactly the two host lists through. Lair does not run that proxy; without this key the container gets no network at all (`--network none`) and a plan that needs the cloud fails |
+| `egress_network` | container network | none | A network whose only exit is a proxy or firewall that lets exactly the two host lists through. **Lair does not run that proxy and does not filter by hostname**: with this key set the isolation is only as good as your proxy (hostname enforcement is follow-up #203). `host`, `bridge`, `default` and `container:` are refused; `none` or no key gives the container no network at all (`--network none`, enforced by docker) and a plan that needs the cloud fails |
 | `timeout_seconds` | integer | `600` | 10 to 900; a step that runs longer is killed, and never longer than the credentials' life |
 | `max_output_bytes` | integer | `262144` | Output kept for the owner; the rest is cut |
 
@@ -2382,7 +2382,7 @@ Both routes are the owner's (signed in on the dashboard) and get no CORS.
 
 | Route | Meaning |
 |-------|---------|
-| `GET /api/plan-sandbox/status?project=` | Whether the sandbox is on or blocked (with the errors), the role, the egress hosts and the limits; no credential |
+| `GET /api/plan-sandbox/status?project=` | Whether the sandbox is on or blocked (with the errors), the role, the declared egress hosts (`declaredEgressHosts`, with `egressHostsEnforcedByLair: false`) and the limits; no credential |
 | `POST /api/plan-sandbox/plan?project=&root=` | Plan one of the project's `infra_policy.roots` through the scan and the sandbox; 404 when the sandbox is off, 400 for a root that is not configured. The answer is `refused` (with the reason), `failed` (init, plan, timeout or credentials) or `planned` (`changes`, the output, when the credentials expire) |
 
 ## Planner

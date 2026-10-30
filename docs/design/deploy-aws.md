@@ -137,7 +137,7 @@ all on `allowed_providers`: the check PR 1 left to this PR), then asks STS for t
 role's credentials and fixed settings only. The two boundaries are interfaces (`PlanCredentialIssuer`, `SandboxSpawner`)
 with an `aws sts assume-role` and a `docker run` implementation. Egress: the container has no network unless an
 `egress_network` is configured, a network the owner builds with a proxy that passes only the configured hosts; Lair does
-not run that proxy (follow-up). Off by default; see [configuration](../configuration.md#plan-sandbox).
+not run that proxy and does not filter by hostname, so with an `egress_network` the isolation is only as good as that proxy (hostname enforcement: follow-up #203). `host`, `bridge` and `default` are refused, `external_id` is required, and `/status` reports the hosts as declared, not enforced. Off by default; see [configuration](../configuration.md#plan-sandbox).
 
 ### 2.3 Cost estimate
 

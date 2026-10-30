@@ -148,7 +148,9 @@ export class PlanSandbox {
       blocked: false as const,
       planRoleArn: s.planRoleArn,
       region: s.region,
-      egressHosts: [...s.providerApiHosts, ...s.registryHosts],
+      // Declared for the owner's proxy; Lair passes them on but does not filter by hostname (follow-up #203)
+      declaredEgressHosts: [...s.providerApiHosts, ...s.registryHosts],
+      egressHostsEnforcedByLair: false as const,
       egressNetwork: s.egressNetwork ?? null,
       credentialSeconds: PLAN_ROLE_SECONDS,
       timeoutSeconds: s.timeoutSeconds,

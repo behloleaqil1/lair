@@ -230,6 +230,13 @@ describe("network egress is limited to the configured hosts", () => {
     await r.sandbox.get(PROJECT)!.plan(path);
     expect(r.spawner.specs[0]!.egress.network).toBeUndefined();
   });
+
+  it("treats egress_network none as no network", async () => {
+    const path = root(AWS);
+    const r = rig(path, { egress_network: "none" });
+    await r.sandbox.get(PROJECT)!.plan(path);
+    expect(r.spawner.specs[0]!.egress.network).toBeUndefined();
+  });
 });
 
 describe("the plan runs only after the policy scan passes", () => {
@@ -348,6 +355,15 @@ describe("off by default", () => {
     ["a relative provider mirror", { plugin_dir: "mirror" }],
     ["a timeout longer than the role's life", { timeout_seconds: 901 }],
     ["a bad host", { provider_api_hosts: ["https://api.example.com/"] }],
+    ["no external id", { external_id: undefined }],
+    ["the host network", { egress_network: "host" }],
+    ["the default bridge network", { egress_network: "bridge" }],
+    ["the default network", { egress_network: "default" }],
+    ["another container's network", { egress_network: "container:abc" }],
+    ["an image that is a docker option", { image: "--privileged" }],
+    ["a mirror path with mount options", { plugin_dir: "/srv/mirror:rw,bind-propagation=shared" }],
+    ["a mirror path with a comma", { plugin_dir: "/srv/mirror,ro" }],
+    ["a mirror path that climbs", { plugin_dir: "/srv/../etc" }],
   ])("an invalid block (%s) refuses every plan and starts nothing", async (_name, block) => {
     const path = root(AWS);
     const r = rig(path, block);
@@ -416,7 +432,8 @@ describe("routes (owner only)", () => {
     const path = root(AWS);
     const { app: a, owner } = await serve(rig(path, { egress_network: "plan-egress" }));
     const res = await a.inject({ method: "GET", url: `/api/plan-sandbox/status?project=${PROJECT}`, headers: owner });
-    expect(res.json().data).toMatchObject({ enabled: true, blocked: false, planRoleArn: ROLE, credentialSeconds: 900, egressNetwork: "plan-egress", egressHosts: ["*.amazonaws.com", "registry.opentofu.org"] });
+    expect(res.json().data).toMatchObject({ enabled: true, blocked: false, planRoleArn: ROLE, credentialSeconds: 900, egressNetwork: "plan-egress", declaredEgressHosts: ["*.amazonaws.com", "registry.opentofu.org"], egressHostsEnforcedByLair: false });
+    expect(res.json().data).not.toHaveProperty("egressHosts");
     expect(res.body).not.toContain("lair-ext-1");
   });
 });
