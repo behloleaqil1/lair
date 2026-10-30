@@ -91,6 +91,7 @@ import { escalationDecisionKey, type DecisionRequest } from "./decisions.js";
 import {
   computeIdleStates,
   findReadyWork,
+  idleExplanation,
   idleStateView,
   shouldNotice,
   type IdleState,
@@ -975,9 +976,8 @@ export class AgentsFill {
           "fill_idle_notice",
           {
             agent: state.agent,
-            task: null,
             summary: `${state.agent} idle for ${durationMin} min while ready work exists`,
-            evidence: [state.explanation],
+            evidence: [idleExplanation(state)],
             data: { reason: state.reason, durationMinutes: durationMin },
           },
           now,
