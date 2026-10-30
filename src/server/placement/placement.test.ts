@@ -1159,51 +1159,98 @@ function onDemandConfig(overrides: Record<string, unknown> = {}) {
   };
 }
 
-class OnDemandHarness extends Harness {
-  /** AWS state: running|stopped|pending|stopping */
-  awsState = "stopped";
-  /** Guard response: true = "guard: ok", false = refuses */
-  awsGuardOk = true;
+/** A fake on-demand machine: what its state, guard and touch commands answer. */
+interface FakeOnDemand {
+  /** running|stopped|pending|stopping (or anything else: an unknown state) */
+  state: string;
+  /** true = "guard: ok", false = refuses */
+  guardOk: boolean;
+  /** Replaces the state or guard command's answer (a failure, a timeout, a refusal with exit 1) */
+  stateOutput?: CommandOutput;
+  guardOutput?: CommandOutput;
+  /** Its idle timer: it powers itself off after this long without activity (a touch) */
+  idleLimitMs?: number;
+  lastActivityAt: number;
+}
 
-  constructor(config: Record<string, unknown> = onDemandConfig()) {
+class OnDemandHarness extends Harness {
+  readonly od: Record<string, FakeOnDemand>;
+
+  constructor(config: Record<string, unknown> = onDemandConfig(), machines: string[] = ["aws"]) {
     super(config);
-    // Override the runner to handle AWS commands
+    this.od = Object.fromEntries(machines.map((m) => [m, { state: "stopped", guardOk: true, lastActivityAt: NOW }]));
+    // probe-<m>, load-<m>, <m>-state, <m>-guard and <m>-touch answer for the on-demand machines
     const originalRun = this.runner.run.bind(this.runner);
     this.runner.run = async (argv: string[], options) => {
-      const [cmd] = argv;
-      // Track the call for all commands (so tests can count calls)
+      const answer = this.answer(argv[0]);
+      if (answer === null) return originalRun(argv, options);
+      // Track the call (so tests can count calls)
       this.runner.calls.push({ argv: [...argv], timeoutMs: options?.timeoutMs });
-      if (cmd === "probe-aws") {
-        // AWS probe passes only when running
-        if (this.awsState === "running") {
-          return { code: 0, stdout: "ok\n", stderr: "" };
-        }
-        return { code: 255, stdout: "", stderr: "Connection refused" };
-      }
-      if (cmd === "load-aws") {
-        if (this.awsState === "running") {
-          return { code: 0, stdout: "0.50 0.40 0.30\n8\n", stderr: "" };
-        }
-        return { code: 1, stdout: "", stderr: "not running" };
-      }
-      if (cmd === "aws-state") {
-        return { code: 0, stdout: `${this.awsState}\n`, stderr: "" };
-      }
-      if (cmd === "aws-guard") {
-        if (this.awsGuardOk) {
-          return { code: 0, stdout: "guard: ok\n", stderr: "" };
-        }
-        return { code: 0, stdout: "guard: refused - cost limit reached\n", stderr: "" };
-      }
-      // For other commands, the original run will also push to calls, so pop our push
-      this.runner.calls.pop();
-      return originalRun(argv, options);
+      return answer;
     };
+  }
+
+  private answer(cmd: string): CommandOutput | null {
+    const match = /^(probe|load)-(\w+)$/.exec(cmd) ?? /^(\w+)-(state|guard|touch)$/.exec(cmd);
+    if (!match) return null;
+    const [what, id] = match[1] === "probe" || match[1] === "load" ? [match[1], match[2]] : [match[2], match[1]];
+    const m = this.od[id];
+    if (!m) return null;
+    const ok = (stdout: string): CommandOutput => ({ code: 0, stdout, stderr: "" });
+    // The machine's own idle timer
+    if (m.state === "running" && m.idleLimitMs !== undefined && this.clock.now() - m.lastActivityAt > m.idleLimitMs) {
+      m.state = "stopped";
+    }
+    switch (what) {
+      case "probe":
+        // The probe passes only while it runs
+        return m.state === "running" ? ok("ok\n") : { code: 255, stdout: "", stderr: "Connection refused" };
+      case "load":
+        return m.state === "running" ? ok("0.50 0.40 0.30\n8\n") : { code: 1, stdout: "", stderr: "not running" };
+      case "state":
+        return m.stateOutput ?? ok(`${m.state}\n`);
+      case "guard":
+        return m.guardOutput ?? (m.guardOk ? ok("guard: ok\n") : ok("guard: refused - cost limit reached\n"));
+      default:
+        m.lastActivityAt = this.clock.now();
+        return ok("");
+    }
+  }
+
+  get awsState(): string {
+    return this.od.aws.state;
+  }
+
+  set awsState(state: string) {
+    this.od.aws.state = state;
+  }
+
+  get awsGuardOk(): boolean {
+    return this.od.aws.guardOk;
+  }
+
+  set awsGuardOk(ok: boolean) {
+    this.od.aws.guardOk = ok;
   }
 
   awsMachine() {
     return this.status().machines.find((m) => m.id === "aws");
   }
+
+  callsOf(cmd: string): number {
+    return this.runner.calls.filter((c) => c.argv[0] === cmd).length;
+  }
+}
+
+/** A stopped on-demand machine as a test writes it: its commands, boot and cost */
+function onDemandMachine(id: string, onDemand: Record<string, unknown> = {}) {
+  return {
+    probe: [`probe-${id}`],
+    expect: "ok",
+    load_cmd: [`load-${id}`],
+    min_up_seconds: 0,
+    on_demand: { state_cmd: [`${id}-state`], guard_cmd: [`${id}-guard`], boot_seconds: 150, check_seconds: 300, ...onDemand },
+  };
 }
 
 describe("placement: on-demand machines", () => {
@@ -1251,6 +1298,15 @@ describe("placement: on-demand machines", () => {
     // Job should NOT move to aws
     expect(h.moved()).toEqual([]);
     expect(h.exists("heavy.5.q1.req")).toBe(true);
+
+    // A job queued in aws while the guard refuses goes back to heavy (the lane that overflows to aws)
+    h.request("aws", 5, "a1", "run suite");
+    h.clock.advance(MIN);
+    await h.tick();
+    expect(h.moved()).toEqual([["mover", "a1", "aws", "heavy"]]);
+    expect(h.exists("heavy.5.a1.req")).toBe(true);
+    expect(h.eventsOf("placement.moved")[0].data.explanation).toContain("aws guard refused: guard: refused - cost limit reached");
+    expect(h.exists("heavy.5.q1.req")).toBe(true);
   });
 
   it("c) prefer_when_faster: a gain under the minimum stays, over the minimum moves", async () => {
@@ -1261,18 +1317,14 @@ describe("placement: on-demand machines", () => {
     h1.request("heavy", 5, "q1", "run suite");
 
     await h1.tick();
+    // Heavy is idle: q1 starts there now and finishes 2.5 min (the boot) sooner than on aws
+    expect(h1.moved()).toEqual([]);
 
-    // With 150s boot + 60min runtime on AWS vs 60min on heavy, the gain is small
-    // But heavy is idle, so the job just starts there
-    // Actually, with min_gain_seconds: 1800 (30 min), even with boot time,
-    // if both lanes are idle the gain would need to be significant
-    // Let's make heavy busy to test properly
+    // Heavy gets busy: q1 waits an hour there, and aws saves 57.5 min, over the 30 min minimum
     h1.request("heavy", 5, "r1", "run suite", ".run");
     h1.clock.advance(60_000);
     await h1.tick();
-    // Should not move because gain is under 1800s
-    // (AWS: boot 150s + 60min vs heavy: wait 60min + 60min = gain ~60min - 2.5min = 57.5min)
-    // Actually this should move... let me reconsider
+    expect(h1.moved()).toEqual([["mover", "q1", "heavy", "aws"]]);
 
     // Test with a very high min_gain that won't be met
     const h2 = new OnDemandHarness(onDemandConfig({ routing: { heavy: { overflow_to: ["aws"], prefer_when_faster: true, min_gain_seconds: 7200 } } }));
@@ -1310,10 +1362,21 @@ describe("placement: on-demand machines", () => {
     await h.tick();
 
     // Only one big job should be on AWS due to limits.big: 1
-    // a1 is already running there, so b1 and b2 should not move
-    // Actually, they can move but only one at a time
+    // a1 runs there: b2 (last on heavy) still gains by waiting for a1, b1 would then wait for b2 too
     const movedIds = h.moved().map((m) => m[1]);
     expect(movedIds.filter((id) => id === "b1" || id === "b2").length).toBeLessThanOrEqual(1);
+    expect(h.moved()).toEqual([["mover", "b2", "heavy", "aws"]]);
+    expect(h.exists("heavy.5.b1.req")).toBe(true);
+
+    // Stopped with the guard ok: the first big job starts it, the second would wait for the first there
+    const stopped = new OnDemandHarness();
+    stopped.request("heavy", 5, "r1", "run suite", ".run");
+    stopped.request("heavy", 5, "b1", "run suite");
+    stopped.request("heavy", 5, "b2", "run suite");
+    await stopped.tick();
+    expect(stopped.moved()).toEqual([["mover", "b2", "heavy", "aws"]]);
+    expect(stopped.exists("heavy.5.b1.req")).toBe(true);
+    expect(stopped.status().lanes.find((l) => l.name === "aws")).toMatchObject({ queued: 1, limits: [{ class: "big", limit: 1 }] });
   });
 
   it("e) a running job is never moved", async () => {
@@ -1406,5 +1469,336 @@ describe("placement: on-demand machines", () => {
     expect(moved).toHaveLength(1);
     // The explanation should include the on-demand details
     expect(moved[0].data.explanation).toMatch(/heavy.*aws/);
+    expect(moved[0].data.explanation).toBe(
+      "moved q1 heavy→aws: est. 2 h 0 min → 63 min; aws stopped, guard ok, 150 s boot; overflow: heavy had 1 waiting; aws idle",
+    );
+  });
+});
+
+const WORKSTATION = { probe: ["probe-workstation"], load_cmd: ["load-workstation"], min_up_seconds: 0 };
+
+/** Three passed suite runs of `seconds` on `lane`, in the runner log and the results */
+function learnSuites(h: Harness, lane: string, seconds: number): void {
+  const lines = ["s1", "s2", "s3"].map((id, i) => {
+    const end = NOW - (5 - i) * 60 * MIN;
+    h.result(id, 0, seconds, end);
+    return `${at(end)}\t${id}\t0\twork/run suite\t${lane}`;
+  });
+  writeFileSync(join(h.gates, "runner.log"), lines.join("\n") + "\n");
+}
+
+describe("placement: on-demand moves back, gains and keep-alive", () => {
+  it("moves a job queued in aws back to heavy while the guard refuses or the state is unknown", async () => {
+    const h = new OnDemandHarness();
+    h.awsGuardOk = false;
+    h.request("aws", 5, "q1", "run suite");
+
+    await h.tick();
+
+    expect(h.moved()).toEqual([["mover", "q1", "aws", "heavy"]]);
+    expect(h.eventsOf("placement.moved")[0].data.explanation).toBe(
+      "moved back q1 aws→heavy: est. never → 60 min; aws guard refused: guard: refused - cost limit reached; heavy idle",
+    );
+
+    const unknown = new OnDemandHarness();
+    unknown.awsState = "hibernated";
+    unknown.request("aws", 5, "q2", "run suite");
+    await unknown.tick();
+    expect(unknown.moved()).toEqual([["mover", "q2", "aws", "heavy"]]);
+    expect(unknown.eventsOf("placement.moved")[0].data.explanation).toContain(
+      "aws state_cmd returned unknown state: hibernated",
+    );
+  });
+
+  it("keeps the jobs of a machine that is starting or stopping where they are", async () => {
+    for (const state of ["pending", "stopping"]) {
+      const h = new OnDemandHarness();
+      h.awsState = state;
+      h.request("aws", 5, "a1", "run suite");
+      h.request("heavy", 5, "r1", "run suite", ".run");
+      h.request("heavy", 5, "q1", "run suite");
+
+      await h.tick();
+
+      expect(h.moved()).toEqual([]);
+      expect(h.awsMachine()?.onDemand).toMatchObject({ powerState: state, availability: "unavailable" });
+      expect(h.job("a1")?.held).toBe(`aws is ${state}: its jobs wait for it`);
+    }
+  });
+
+  it("a state_cmd that fails or times out makes the machine unavailable, cached for check_seconds", async () => {
+    const h = new OnDemandHarness();
+    h.od.aws.stateOutput = { code: -1, stdout: "", stderr: "timed out" };
+    h.request("heavy", 5, "r1", "run suite", ".run");
+    h.request("heavy", 5, "q1", "run suite");
+
+    await h.tick();
+    expect(h.awsMachine()?.onDemand).toMatchObject({ powerState: "unknown", availability: "unavailable" });
+    expect(h.awsMachine()?.onDemand?.unavailableReason).toBe("state_cmd failed: timed out");
+    expect(h.moved()).toEqual([]);
+
+    h.od.aws.stateOutput = { code: 2, stdout: "", stderr: "" };
+    h.clock.advance(MIN);
+    await h.tick();
+    expect(h.callsOf("aws-state")).toBe(1);
+    expect(h.moved()).toEqual([]);
+
+    h.clock.advance(5 * MIN);
+    await h.tick();
+    expect(h.callsOf("aws-state")).toBe(2);
+    expect(h.awsMachine()?.onDemand?.unavailableReason).toBe("state_cmd failed: exit 2");
+    expect(h.moved()).toEqual([]);
+  });
+
+  it("keeps the reason of a guard that refuses with a non-zero exit", async () => {
+    const h = new OnDemandHarness();
+    h.od.aws.guardOutput = { code: 1, stdout: "guard: REFUSED: spend 181 >= limit 180\n", stderr: "" };
+
+    await h.tick();
+
+    expect(h.awsMachine()?.onDemand).toMatchObject({ availability: "unavailable", guardOk: false });
+    expect(h.awsMachine()?.onDemand?.unavailableReason).toBe(
+      "guard refused (exit 1): guard: REFUSED: spend 181 >= limit 180",
+    );
+  });
+
+  it("overflow never starts the machine for a job that would start now, or for no gain", async () => {
+    // overflow_to only (no prefer_when_faster): heavy is idle, q1 starts there now
+    const h = new OnDemandHarness(onDemandConfig({ routing: { heavy: { overflow_to: ["aws"] } } }));
+    h.request("heavy", 5, "q1", "run suite");
+    await h.tick();
+    expect(h.moved()).toEqual([]);
+
+    // Waiting behind r1 with a 10 min boot on aws: it would finish later there, so even a minimum of 0 keeps it
+    const slow = new OnDemandHarness(
+      onDemandConfig({
+        machines: { workstation: WORKSTATION, aws: onDemandMachine("aws", { boot_seconds: 600 }) },
+        routing: { heavy: { overflow_to: ["aws"], min_gain_seconds: 0 } },
+      }),
+    );
+    slow.request("heavy", 5, "r1", "run suite", ".run");
+    await slow.tick();
+    slow.clock.advance(59 * MIN);
+    slow.request("heavy", 5, "q2", "run suite");
+    await slow.tick();
+    // heavy: r1's last 6 min, then an hour (66 min); aws: 10 min boot and an hour (70 min)
+    expect(slow.job("q2")).toMatchObject({ expectedFinish: at(NOW + 59 * MIN + 66 * MIN) });
+    expect(slow.moved()).toEqual([]);
+
+    // Waiting behind r1 with an hour left: it overflows
+    h.request("heavy", 5, "r1", "run suite", ".run");
+    h.clock.advance(MIN);
+    await h.tick();
+    expect(h.moved()).toEqual([["mover", "q1", "heavy", "aws"]]);
+    expect(h.eventsOf("placement.moved")[0].data.explanation).toContain("overflow: heavy had 1 waiting");
+  });
+
+  it("counts the boot time once: a gain just over min_gain_seconds moves", async () => {
+    const h = new OnDemandHarness(
+      onDemandConfig({
+        machines: { workstation: WORKSTATION, aws: onDemandMachine("aws", { boot_seconds: 600 }) },
+        routing: { heavy: { overflow_to: ["aws"], min_gain_seconds: 2700 } },
+      }),
+    );
+    h.request("heavy", 5, "r1", "run suite", ".run");
+    h.request("heavy", 5, "q1", "run suite");
+
+    await h.tick();
+
+    // heavy: an hour of r1, then an hour; aws: 10 min boot, then an hour: 50 min sooner, over 45
+    expect(h.moved()).toEqual([["mover", "q1", "heavy", "aws"]]);
+    expect(h.eventsOf("placement.moved")[0].data.explanation).toContain("est. 2 h 0 min → 70 min");
+  });
+
+  it("speed_factor scales what a class takes elsewhere while aws has no run of it", async () => {
+    const config = (routing: Record<string, unknown>) =>
+      onDemandConfig({
+        history: { runner_log: "runner.log" },
+        machines: { workstation: WORKSTATION, aws: onDemandMachine("aws", { speed_factor: 0.5 }) },
+        routing: { heavy: routing },
+      });
+    // prefer_when_faster: q1 would start now on heavy (an hour); on aws 2.5 min boot and half an hour
+    const h = new OnDemandHarness(config({ overflow_to: ["aws"], prefer_when_faster: true, min_gain_seconds: 1200 }));
+    learnSuites(h, "heavy", 3600);
+    h.request("heavy", 5, "q1", "run suite");
+
+    await h.tick();
+
+    expect(h.status().durations).toEqual([{ class: "big", machine: "workstation", medianSeconds: 3600, samples: 3 }]);
+    expect(h.moved()).toEqual([["mover", "q1", "heavy", "aws"]]);
+    expect(h.eventsOf("placement.moved")[0].data.explanation).toBe(
+      "moved q1 heavy→aws: est. 60 min → 33 min; aws stopped, guard ok, 150 s boot; prefer_when_faster; aws idle",
+    );
+
+    // overflow_to alone moves only a job that waits, however much faster aws is
+    const overflow = new OnDemandHarness(config({ overflow_to: ["aws"], min_gain_seconds: 1200 }));
+    learnSuites(overflow, "heavy", 3600);
+    overflow.request("heavy", 5, "q2", "run suite");
+    await overflow.tick();
+    expect(overflow.moved()).toEqual([]);
+  });
+
+  it("asks the guard again right before a move starts the machine: a refusal since the cached check cancels it", async () => {
+    const h = new OnDemandHarness();
+    h.request("heavy", 5, "r1", "run suite", ".run");
+    await h.tick();
+    expect(h.callsOf("aws-guard")).toBe(1);
+
+    // The spend limit is reached after the cached check
+    h.awsGuardOk = false;
+    h.request("heavy", 5, "q1", "run suite");
+    h.clock.advance(MIN);
+    await h.tick();
+
+    expect(h.callsOf("aws-guard")).toBe(2);
+    expect(h.moved()).toEqual([]);
+    expect(h.exists("heavy.5.q1.req")).toBe(true);
+    expect(h.awsMachine()?.onDemand).toMatchObject({ availability: "unavailable", guardOk: false });
+    const failed = h.eventsOf("placement.move_failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0].data).toMatchObject({
+      gateId: "q1",
+      from: "heavy",
+      to: "aws",
+      error: "not moved: aws guard refused: guard: refused - cost limit reached",
+    });
+
+    // The refusal holds until the next check: the guard does not run on every tick
+    h.clock.advance(MIN);
+    await h.tick();
+    expect(h.callsOf("aws-guard")).toBe(2);
+    expect(h.moved()).toEqual([]);
+  });
+
+  it("observe mode records on-demand advice, a move back too, and never runs move_cmd or the extra guard", async () => {
+    const h = new OnDemandHarness(onDemandConfig({ mode: "observe" }));
+    h.request("heavy", 5, "r1", "run suite", ".run");
+    h.request("heavy", 5, "q1", "run suite");
+
+    await h.tick();
+    h.clock.advance(MIN);
+    await h.tick();
+
+    expect(h.moved()).toEqual([]);
+    expect(h.callsOf("aws-guard")).toBe(1);
+    const advice = h.eventsOf("placement.would_move");
+    expect(advice).toHaveLength(1);
+    expect(advice[0].data.explanation).toBe(
+      "would move q1 heavy→aws: est. 2 h 0 min → 63 min; aws stopped, guard ok, 150 s boot; overflow: heavy had 1 waiting; aws idle",
+    );
+    expect(h.job("q1")?.advice).toMatchObject({ to: "aws", stuck: false });
+
+    const back = new OnDemandHarness(onDemandConfig({ mode: "observe" }));
+    back.awsGuardOk = false;
+    back.request("aws", 5, "a1", "run suite");
+    await back.tick();
+    expect(back.moved()).toEqual([]);
+    expect(back.job("a1")?.advice).toMatchObject({
+      to: "heavy",
+      gainSeconds: 0,
+      back: "aws guard refused: guard: refused - cost limit reached",
+    });
+  });
+
+  it("max_moves_per_tick: 1 sends one of two waiting jobs", async () => {
+    const h = new OnDemandHarness(onDemandConfig({ max_moves_per_tick: 1 }));
+    h.request("heavy", 5, "r1", "run suite", ".run");
+    h.request("heavy", 5, "s1", "run targeted");
+    h.request("heavy", 5, "s2", "run targeted");
+
+    await h.tick();
+
+    // s2 waits longest (two hours): it goes; s1 stays for a later tick
+    expect(h.moved()).toEqual([["mover", "s2", "heavy", "aws"]]);
+    expect(h.exists("heavy.5.s1.req")).toBe(true);
+  });
+
+  it("of two equally good on-demand lanes, the cheaper one gets the job (cost_per_hour)", async () => {
+    const config = (awsCost: number, spotCost: number) =>
+      onDemandConfig({
+        machines: {
+          workstation: WORKSTATION,
+          aws: onDemandMachine("aws", { cost_per_hour: awsCost }),
+          spot: onDemandMachine("spot", { cost_per_hour: spotCost }),
+        },
+        lanes: {
+          heavy: { machine: "workstation", slots: 1 },
+          aws: { machine: "aws", slots: 2 },
+          spot: { machine: "spot", slots: 2 },
+        },
+        routing: { heavy: { overflow_to: ["aws", "spot"] } },
+        eligible: { heavy: ["small", "big"], aws: ["small", "big"], spot: ["small", "big"] },
+      });
+    for (const [awsCost, spotCost, cheaper] of [
+      [0.35, 0.2, "spot"],
+      [0.2, 0.35, "aws"],
+    ] as const) {
+      const h = new OnDemandHarness(config(awsCost, spotCost), ["aws", "spot"]);
+      h.request("heavy", 5, "r1", "run suite", ".run");
+      h.request("heavy", 5, "q1", "run suite");
+      await h.tick();
+      expect(h.moved()).toEqual([["mover", "q1", "heavy", cheaper]]);
+    }
+  });
+
+  it("keeps the machine alive while a job runs there: a local phase longer than the idle limit still finds it running", async () => {
+    const h = new OnDemandHarness(
+      onDemandConfig({
+        machines: { workstation: WORKSTATION, aws: onDemandMachine("aws", { touch_cmd: ["aws-touch"], touch_seconds: 60 }) },
+      }),
+    );
+    h.awsState = "running";
+    // The machine powers itself off after 5 idle minutes
+    h.od.aws.idleLimitMs = 5 * MIN;
+    h.request("aws", 5, "r1", "run suite", ".run");
+
+    // Ten minutes of a phase that never touches the machine itself: twice its idle limit
+    for (let i = 0; i <= 10; i++) {
+      await h.tick();
+      h.clock.advance(MIN);
+    }
+
+    expect(h.callsOf("aws-touch")).toBe(11);
+    expect(h.awsState).toBe("running");
+    expect(h.awsMachine()).toMatchObject({ state: "up" });
+    expect(h.awsMachine()?.onDemand).toMatchObject({ lastTouchAt: at(NOW + 10 * MIN), touchError: null });
+    expect(h.eventsOf("placement.machine_stopped_under_job")).toEqual([]);
+
+    // The job ended: nothing is touched, and the idle timer stops the machine
+    unlinkSync(join(h.queue, h.name("aws", 5, "r1", ".run")));
+    await h.tick();
+    h.clock.advance(5 * MIN);
+    await h.tick();
+    expect(h.callsOf("aws-touch")).toBe(11);
+    expect(h.awsState).toBe("stopped");
+  });
+
+  it("a machine found stopped under a running job raises one notice, and the job goes back once when queued again", async () => {
+    const h = new OnDemandHarness();
+    h.awsState = "running";
+    h.od.aws.idleLimitMs = 5 * MIN;
+    h.request("aws", 5, "r1", "run suite", ".run");
+
+    // No touch_cmd: the idle timer stops the machine under r1 after 6 minutes; the 10-minute check sees it
+    for (let i = 0; i <= 10; i++) {
+      await h.tick();
+      h.clock.advance(MIN);
+    }
+
+    expect(h.awsState).toBe("stopped");
+    const notices = () => h.eventsOf("placement.machine_stopped_under_job");
+    expect(notices()).toHaveLength(1);
+    expect(notices()[0].data).toMatchObject({ project: "demo", machine: "aws", gateId: "r1", lane: "aws", state: "stopped" });
+
+    // Its runner puts it back in the queue: it goes back to heavy, once
+    h.rename(h.name("aws", 5, "r1", ".run"), h.name("aws", 5, "r1"));
+    await h.tick();
+    expect(h.moved()).toEqual([["mover", "r1", "aws", "heavy"]]);
+    expect(h.eventsOf("placement.moved")[0].data.explanation).toContain("aws stopped under it");
+
+    h.clock.advance(MIN);
+    await h.tick();
+    expect(h.moved()).toHaveLength(1);
+    expect(notices()).toHaveLength(1);
   });
 });
