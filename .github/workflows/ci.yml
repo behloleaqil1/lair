@@ -11,10 +11,11 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest]
         node-version: ['22', '24']
 
     steps:
@@ -34,6 +35,9 @@ jobs:
 
       - name: Lint
         run: npm run lint
+
+      - name: Genericity guard
+        run: npm run check:generic
 
       - name: Test
         run: npm test
