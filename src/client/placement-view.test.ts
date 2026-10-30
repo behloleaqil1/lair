@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { adviceText, eta, laneSlots, latestMoves, machineLoad, machineState, modeText } from "./placement-view";
+import {
+  adviceText,
+  eta,
+  laneSlots,
+  latestMoves,
+  machineBadge,
+  machineLoad,
+  machineState,
+  modeText,
+  onDemandText,
+} from "./placement-view";
 import type { PlacementJob, PlacementMachine, PlacementStatus } from "../shared/placement-types";
 
 const NOW = Date.parse("2026-03-02T12:00:00.000Z");
@@ -94,6 +104,41 @@ describe("placement view", () => {
         serves: [],
       }),
     ).toBe("1/2 in use, 3 queued; big 1/1");
+  });
+
+  it("shows an on-demand machine's power state and a move back out of it", () => {
+    const onDemand = {
+      powerState: "stopped" as const,
+      availability: "available" as const,
+      unavailableReason: null,
+      guardOk: true,
+      lastCheckAt: null,
+      bootSeconds: 150,
+      costPerHour: 0.35,
+      lastTouchAt: null,
+      touchError: null,
+    };
+    const stopped = machine({ id: "aws", state: "down", downSince: null, onDemand });
+    expect(machineState(stopped)).toBe("down since ? · on demand: stopped, guard ok, 150 s boot");
+    expect(machineBadge(stopped)).toBe("badge-neutral");
+    const refused = machine({
+      state: "down",
+      downSince: null,
+      onDemand: { ...onDemand, availability: "unavailable", guardOk: false, unavailableReason: "guard refused: spend 181 >= 180" },
+    });
+    expect(onDemandText(refused)).toBe("on demand: refused (guard refused: spend 181 >= 180)");
+    expect(machineBadge(refused)).toBe("badge-error");
+    expect(onDemandText(machine({ onDemand: { ...onDemand, availability: "unavailable", powerState: "pending" } }))).toBe(
+      "on demand: starting",
+    );
+    expect(onDemandText(machine({ onDemand: { ...onDemand, availability: "unavailable", powerState: "running" } }))).toBe(
+      "on demand: running",
+    );
+    expect(onDemandText(machine())).toBeNull();
+    expect(machineState(machine({ state: "unknown" }))).toBe("not probed yet");
+
+    const advice = { to: "heavy", gainSeconds: 0, explanation: "x", quiet: false, stuck: false, back: "aws guard refused: spend" };
+    expect(adviceText(job({ lane: "aws", advice }), "observe")).toBe("would move to heavy: aws guard refused: spend");
   });
 
   it("names the mode and lists the newest moves first", () => {
