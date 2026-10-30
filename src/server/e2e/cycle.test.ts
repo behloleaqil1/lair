@@ -224,7 +224,12 @@ function projectConfig(paths: Paths): ProjectConfig {
     read_only: false,
     prompts_dir: paths.prompts,
     dragons: {
-      "worker-a": { name: "TestAgent", machine: "local" },
+      "worker-a": {
+        name: "TestAgent",
+        machine: "local",
+        model: "test-model",
+        instructions: "",
+      },
     },
     dragon_start_cmd: ["/bin/echo", "start", "{dragon}", "{task}"],
     dragon_stop_cmd: ["/bin/echo", "stop", "{dragon}"],
