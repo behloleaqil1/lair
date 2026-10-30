@@ -311,7 +311,7 @@ export function decide(options: DecideOptions): Decision {
         ? targets.filter((t) => from.overflowTo.includes(t.name))
         : [];
 
-      const trial = (to: ModelLane, isOverflow = false) => {
+      const trial = (to: ModelLane, _isOverflow = false) => {
         const trialJobs = relocate(lanes, jobs, job, to.name);
         const movedJob = trialJobs.find((j) => j.id === job.id && j.lane === to.name) as ModelJob;
         const affected = new Set([job.lane, movedJob.runsOn]);
@@ -383,7 +383,6 @@ export function decide(options: DecideOptions): Decision {
       for (const to of overflowTargets) {
         // Check if overflow lane has a free slot
         const running = jobs.filter((j) => j.runsOn === to.name && j.status === "running").length;
-        const queued = jobs.filter((j) => j.runsOn === to.name && j.status === "queued").length;
         if (running >= to.slots) continue; // No free slot
 
         const result = trial(to, true);

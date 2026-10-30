@@ -23,7 +23,6 @@ import { join } from "path";
 import type { EventBus } from "../core/event-bus.js";
 import type { ProjectConfig } from "../../shared/types.js";
 import type {
-  OnDemandAvailability,
   OnDemandPowerState,
   OnDemandStatus,
   PlacementAdvice,
@@ -45,7 +44,7 @@ import {
 } from "./config.js";
 import { classify, readQueue, type QueueJob } from "./queue.js";
 import { SampleIndex, readResult, readRunnerLog, runnerLogPath } from "./history.js";
-import { decide, isLaneAvailable, planAll, servingLane, type Candidate, type DurationFn, type ModelJob, type ModelLane, type Plan } from "./estimate.js";
+import { decide, planAll, servingLane, type Candidate, type DurationFn, type ModelJob, type ModelLane, type Plan } from "./estimate.js";
 import { PlacementStore, moveForApi, type Sample, type StoredMove } from "./store.js";
 import { systemPlacementProbes, type CommandOutput, type PlacementProbes } from "./probes.js";
 
@@ -331,7 +330,6 @@ export class Placement {
       return { available: false, reason: "not an on-demand machine" };
     }
     const od = rt.onDemand;
-    const settings = m.onDemand;
 
     // Running machines are available via probes, not on-demand
     if (od.powerState === "running") {
@@ -580,7 +578,6 @@ export class Placement {
   private model(queue: QueueJob[], now: number): { lanes: ModelLane[]; jobs: ModelJob[] } {
     const lanes: ModelLane[] = this.settings.lanes.map((l) => {
       const rt = this.machines.get(l.machine);
-      const m = this.settings.machines.find((m) => m.id === l.machine);
       const onDemandAvail = this.onDemandAvailability(l.machine);
       return {
         name: l.name,

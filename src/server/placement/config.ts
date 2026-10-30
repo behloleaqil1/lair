@@ -342,7 +342,7 @@ export function parsePlacementConfig(raw: unknown): ParseResult {
     });
   }
   // Validate routing targets that reference lanes not yet parsed
-  for (const [laneId, routing] of Object.entries(value.routing)) {
+  for (const [laneId] of Object.entries(value.routing)) {
     if (!laneNames.has(laneId)) {
       errors.push(`placement.routing.${laneId}: ${laneId} is not in placement.lanes`);
     }
