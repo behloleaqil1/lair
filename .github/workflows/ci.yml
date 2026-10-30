@@ -54,7 +54,7 @@ jobs:
           cache-dependency-path: brain-trainer/requirements-dev.txt
 
       - name: Install dependencies pinned by hash
-        run: pip install --require-hashes --no-deps --only-binary=:all: -r brain-trainer/requirements-dev.txt
+        run: "pip install --require-hashes --no-deps --only-binary=:all: -r brain-trainer/requirements-dev.txt"
 
       - name: Test the trainer
         run: python -m pytest brain-trainer -q
