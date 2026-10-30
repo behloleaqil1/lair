@@ -228,9 +228,7 @@ function projectConfig(paths: Paths): ProjectConfig {
     },
     dragon_start_cmd: ["/bin/echo", "start", "{dragon}", "{task}"],
     dragon_stop_cmd: ["/bin/echo", "stop", "{dragon}"],
-    machines: {
-      local: { name: "Local", type: "local" as const },
-    },
+    machines: {},
     agents: {
       enabled: true,
       tasks_file: paths.tasks,
