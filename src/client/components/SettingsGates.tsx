@@ -44,6 +44,7 @@ function setIn(draft: Record<string, unknown>, path: PathSegment[], value: unkno
   const key = String(head);
   if (rest.length === 0) {
     if (value === undefined) {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
       const { [key]: _, ...remaining } = draft;
       return remaining;
     }
@@ -54,7 +55,7 @@ function setIn(draft: Record<string, unknown>, path: PathSegment[], value: unkno
   return { ...draft, [key]: setIn(nextChild, rest, value) };
 }
 
-export function SettingsGates({ project, draft, sections, known, errors, disabled, onDraft, focus }: Props) {
+export function SettingsGates({ project: _project, draft, sections, known, errors, disabled, onDraft, focus }: Props) {
   const root = useRef<HTMLDivElement>(null);
 
   // Handle focus from search picks
