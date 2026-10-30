@@ -179,7 +179,7 @@ const email = "private@company.com";`,
 
     const result = runCheck();
     expect(result.code).toBe(1);
-    expect(result.stdout).toContain("3 violation");
+    expect(result.stdout).toContain("3 NEW violation");
   });
 
   it("checks .md files in docs directory", () => {

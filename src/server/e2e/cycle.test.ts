@@ -78,6 +78,8 @@ function makePaths(): Paths {
 
   writeFileSync(queue, "# Agent queue\n");
   writeFileSync(tasks, "");
+  // Prompt file for worker-a (required by fill config)
+  writeFileSync(join(prompts, "worker-a.txt"), "You are worker-a.\n");
 
   return { root, repo, queue, agents, gates, tasks, data, prompts };
 }
@@ -236,10 +238,12 @@ function projectConfig(paths: Paths): ProjectConfig {
     machines: {},
     agents: {
       enabled: true,
-      tasks_file: paths.tasks,
       fill: {
         enabled: true,
-        tick_seconds: 60,
+        tasks_file: paths.tasks,
+        agents: ["worker-a"],
+        prompt_files: ["{prompts_dir}/{agent}.txt"],
+        interval_seconds: 60,
       },
     },
   } as ProjectConfig;
