@@ -1,9 +1,9 @@
 /**
  * Cloud store (data/cloud.db): the runs the meter counts (each launch and
  * stop the provider described), the provider's last cost reading per
- * account, and the guard's trips. SQLite, so the meter, the reading's cache
- * (each read may cost money) and a trip survive a restart. Times are the
- * cloud Clock's milliseconds.
+ * account, and the guard's trips (each kept, with who cleared it). SQLite,
+ * so the meter, the reading's cache (each read may cost money) and a trip
+ * survive a restart. Times are the cloud Clock's milliseconds.
  */
 import Database from "better-sqlite3";
 import { existsSync, mkdirSync } from "fs";
@@ -43,6 +43,7 @@ const SCHEMA = `
   );
 
   CREATE TABLE IF NOT EXISTS cloud_trips (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     project TEXT NOT NULL,
     limit_amount REAL NOT NULL,
     period_start TEXT NOT NULL,
@@ -50,8 +51,12 @@ const SCHEMA = `
     spend REAL NOT NULL,
     reason TEXT NOT NULL,
     tripped_at INTEGER NOT NULL,
-    PRIMARY KEY (project, limit_amount, period_start, period_end)
+    cleared_at INTEGER,
+    cleared_by TEXT,
+    clear_note TEXT
   );
+  -- One trip stands per project until the owner clears it, whatever the limit or the period says now
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_cloud_trips_standing ON cloud_trips(project) WHERE cleared_at IS NULL;
 `;
 
 /** Runs that ended this long ago are dropped (a period is at most a few years) */
@@ -218,20 +223,21 @@ export class CloudStore {
 
   // ============ TRIPS ============
 
-  /** The trip recorded for this limit and period */
-  trip(project: string, budget: CloudBudgetSettings): StoredTrip | null {
+  /**
+   * The trip that stands for the project: recorded and not cleared by the
+   * owner. A new limit or period does not end it.
+   */
+  trip(project: string): StoredTrip | null {
     const row = this.db
       .prepare(
-        `SELECT limit_amount, spend, reason, tripped_at FROM cloud_trips
-         WHERE project = ? AND limit_amount = ? AND period_start = ? AND period_end = ?`,
+        `SELECT limit_amount, period_start, period_end, spend, reason, tripped_at FROM cloud_trips
+         WHERE project = ? AND cleared_at IS NULL`,
       )
-      .get(project, budget.limit, budget.periodStart, budget.periodEnd) as
-      | { limit_amount: number; spend: number; reason: string; tripped_at: number }
-      | undefined;
-    return row ? { limit: row.limit_amount, spend: row.spend, reason: row.reason, at: row.tripped_at } : null;
+      .get(project) as TripRow | undefined;
+    return row ? toTrip(row) : null;
   }
 
-  /** Record a trip; the first one for a limit and period stands. True when this one was new. */
+  /** Record a trip; while one stands it stays the only one. True when this one was new. */
   addTrip(project: string, budget: CloudBudgetSettings, spend: number, reason: string, now: number): boolean {
     const result = this.db
       .prepare(
@@ -241,4 +247,45 @@ export class CloudStore {
       .run(project, budget.limit, budget.periodStart, budget.periodEnd, spend, reason, now);
     return result.changes > 0;
   }
+
+  /**
+   * The owner clears the standing trip, named by when it tripped (so a
+   * newer trip is never cleared by mistake). Kept with who cleared it,
+   * when, and why. The trip, or null when no standing trip has that time.
+   */
+  clearTrip(project: string, trippedAt: number, by: string, note: string | null, now: number): StoredTrip | null {
+    return this.db.transaction(() => {
+      const row = this.db
+        .prepare(
+          `SELECT id, limit_amount, period_start, period_end, spend, reason, tripped_at FROM cloud_trips
+           WHERE project = ? AND cleared_at IS NULL`,
+        )
+        .get(project) as (TripRow & { id: number }) | undefined;
+      if (!row || row.tripped_at !== trippedAt) return null;
+      this.db
+        .prepare(`UPDATE cloud_trips SET cleared_at = ?, cleared_by = ?, clear_note = ? WHERE id = ?`)
+        .run(now, by, note, row.id);
+      return toTrip(row);
+    })();
+  }
+}
+
+interface TripRow {
+  limit_amount: number;
+  period_start: string;
+  period_end: string;
+  spend: number;
+  reason: string;
+  tripped_at: number;
+}
+
+function toTrip(row: TripRow): StoredTrip {
+  return {
+    limit: row.limit_amount,
+    periodStart: row.period_start,
+    periodEnd: row.period_end,
+    spend: row.spend,
+    reason: row.reason,
+    at: row.tripped_at,
+  };
 }

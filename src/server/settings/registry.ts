@@ -287,9 +287,9 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       "machines.*.price_per_hour": { help: "Rounded up; the meter counts every run at this price" },
       "budget.limit": {
         sensitive: true,
-        help: "No start at or above this spend (US dollars); change it here and in the provider's budget together",
+        help: "No start at or above this spend (US dollars); change it here and in the provider's budget together. A higher limit does not clear a trip: the owner does, in Machines",
       },
-      "budget.period": { sensitive: true, help: "The days the limit covers (UTC); a new period clears a trip" },
+      "budget.period": { sensitive: true, help: "The days the limit covers (UTC); a new period does not clear a trip: only the owner does, in Machines" },
       "budget.meter_start": { help: "Spend before the meter's first run" },
       "budget.spend_check_hours": { help: "How old the provider's cost reading may be (1 to 24 hours); each reading may cost money" },
       request_timeout_seconds: timeouts,

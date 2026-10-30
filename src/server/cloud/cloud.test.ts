@@ -30,7 +30,8 @@ import { providerText, type AwsClients } from "./provider.js";
 
 const PROJECT = "shop";
 const INSTANCE = "i-0123456789abcdef0";
-const HOUR = 3_600_000;
+const MINUTE = 60_000;
+const HOUR = 60 * MINUTE;
 /** 10 March 2027, 12:00 UTC: the third month of a 2027 budget */
 const NOW = Date.UTC(2027, 2, 10, 12, 0, 0);
 /** A same-origin request from the dashboard */
@@ -200,7 +201,7 @@ class Harness {
   }
 
   /** The cloud routes as the server mounts them, and the headers of a browser signed in as the owner */
-  async serve(): Promise<{ app: FastifyInstance; owner: Record<string, string> }> {
+  async serve(): Promise<{ app: FastifyInstance; owner: Record<string, string>; sessionId: string }> {
     const tokenPath = join(this.dir, "owner.token");
     const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
     const app = Fastify();
@@ -211,7 +212,7 @@ class Harness {
     await registerCloudRoutes(app, this.manager, () => PROJECT, auth);
     const session = auth.createSession(readFileSync(tokenPath, "utf-8").trim());
     if (!session) throw new Error("no owner session");
-    return { app, owner: { ...BROWSER, [OWNER_SESSION_HEADER]: session.session } };
+    return { app, owner: { ...BROWSER, [OWNER_SESSION_HEADER]: session.session }, sessionId: session.info.id };
   }
 }
 
@@ -305,7 +306,7 @@ describe("cloud: the money guard", () => {
     // Storage $18 + 2 h at $0.50 + $1 before the meter = $20: the limit
     const block = cloudBlock({ limit: 20, meter_start: 1 });
     const h = new Harness(block);
-    h.instance("stopped", NOW - 4 * HOUR, NOW - 2 * HOUR);
+    h.instance("stopped", NOW - 28 * HOUR, NOW - 26 * HOUR);
     h.aws.cost = "3";
 
     const refused = await h.machines.startMachine("cloud-1");
@@ -313,14 +314,18 @@ describe("cloud: the money guard", () => {
     expect(refused.reason).toContain("spend $20.00 reached the limit $20.00 (provider $3.00, meter $20.00)");
     expect(h.aws.named("StartInstances")).toHaveLength(0);
     expect(h.trips()).toEqual([expect.objectContaining({ project: PROJECT, limit: 20, spend: 20 })]);
-    expect(h.status().budget?.guard).toMatchObject({ state: "tripped", allowed: false, trip: { limit: 20, spend: 20 } });
+    expect(h.status().budget?.guard).toMatchObject({
+      state: "tripped",
+      allowed: false,
+      trip: { limit: 20, spend: 20, period: { start: "2027-01-01", end: "2027-12-31" }, at: new Date(NOW).toISOString() },
+    });
 
     // Lower readings later (the provider says $0, a period's meter can't fall) don't clear it: no start
     h.aws.cost = "0";
     h.now = NOW + 7 * HOUR;
     const again = await h.machines.startMachine("cloud-1");
     expect(again).toMatchObject({ allowed: false });
-    expect(again.reason).toMatch(/^tripped on .*only a human clears it/);
+    expect(again.reason).toMatch(/^tripped on 2027-03-10T12:00:00.000Z: .*; only the owner clears it/);
     expect(h.aws.named("StartInstances")).toHaveLength(0);
 
     // A restart keeps the trip, and records it once
@@ -329,18 +334,72 @@ describe("cloud: the money guard", () => {
     expect(h.aws.named("StartInstances")).toHaveLength(0);
     expect(h.trips()).toHaveLength(1);
 
-    // Stopping is never refused
-    h.instance("running", NOW + 6 * HOUR);
+    // Stopping is never refused (started from the provider's console meanwhile)
+    h.instance("running", NOW + 7 * HOUR + 2 * MINUTE);
+    h.now = NOW + 7 * HOUR + 5 * MINUTE;
     expect(await h.machines.stopMachine("cloud-1")).toBe("stopping");
+    h.instance("stopped", NOW + 7 * HOUR + 2 * MINUTE, NOW + 7 * HOUR + 10 * MINUTE);
 
-    // Only a human clears it: a higher limit, through the config's live reload
-    h.instance("stopped", NOW + 6 * HOUR, NOW + 7 * HOUR);
+    // A higher limit or a new period, by hand in the YAML (live reload), does not clear it
+    h.now = NOW + 8 * HOUR;
     const reload = serverModules({ clouds: h.manager }).find((m) => m.name === "cloud");
     expect(reload?.blocks).toEqual(["cloud"]);
     await reload?.reload({ name: PROJECT, config: h.config(cloudBlock({ limit: 50, meter_start: 1 })) });
+    expect(await h.machines.startMachine("cloud-1")).toMatchObject({ allowed: false, reason: expect.stringMatching(/^tripped on /) });
+    const newPeriod = cloudBlock({ limit: 50, meter_start: 1, period: { start: "2027-02-01", end: "2027-12-31" } });
+    await reload?.reload({ name: PROJECT, config: h.config(newPeriod) });
+    expect(await h.machines.startMachine("cloud-1")).toMatchObject({ allowed: false, reason: expect.stringMatching(/^tripped on /) });
+    expect(h.aws.named("StartInstances")).toHaveLength(0);
+
+    // Only the owner clears it, naming the trip; nobody else can
+    const { app, owner, sessionId } = await h.serve();
+    const url = `/api/cloud/trip/clear?project=${PROJECT}`;
+    const trippedAt = h.status().budget?.guard.trip?.at;
+    expect(trippedAt).toBe(new Date(NOW).toISOString());
+    expect(isUnder(url, OWNER_ONLY_PREFIXES)).toBe(true);
+    for (const headers of [{}, BROWSER, { ...BROWSER, [OWNER_SESSION_HEADER]: "x".repeat(43) }]) {
+      expect((await app.inject({ method: "POST", url, headers, payload: { trippedAt } })).statusCode).toBe(403);
+    }
+    // Another trip's time (a stale page) clears nothing
+    const stale = await app.inject({ method: "POST", url, headers: owner, payload: { trippedAt: new Date(NOW - HOUR).toISOString() } });
+    expect(stale.statusCode).toBe(409);
+    expect(await h.machines.startMachine("cloud-1")).toMatchObject({ allowed: false });
+    expect(h.bus.getRecentEvents("cloud.trip_cleared")).toEqual([]);
+
+    const cleared = await app.inject({ method: "POST", url, headers: owner, payload: { trippedAt, note: "raised the limit\nto 50" } });
+    expect(cleared.statusCode).toBe(200);
+    expect(cleared.json().data).toEqual({
+      cleared: { limit: 20, period: { start: "2027-01-01", end: "2027-12-31" }, spend: 20, at: trippedAt, reason: expect.any(String) },
+      by: sessionId,
+    });
+    expect(h.bus.getRecentEvents("cloud.trip_cleared").map((e) => e.data)).toEqual([
+      { project: PROJECT, trippedAt, limit: 20, spend: 20, by: sessionId, note: "raised the limit to 50" },
+    ]);
+    expect(h.status().budget?.guard.trip).toBeNull();
+    // Cleared once: the same request again finds no trip
+    expect((await app.inject({ method: "POST", url, headers: owner, payload: { trippedAt } })).statusCode).toBe(409);
+
+    // Under the new limit the next start is allowed
     const allowed = await h.machines.startMachine("cloud-1");
     expect(allowed).toMatchObject({ allowed: true, state: "pending" });
     expect(h.aws.named("StartInstances").map((s) => s.input)).toEqual([{ InstanceIds: [INSTANCE] }]);
+  });
+
+  it("a trip cleared while the spend is still at the limit trips again at the next check", async () => {
+    const h = new Harness(cloudBlock({ limit: 20, meter_start: 1 }));
+    h.instance("stopped", NOW - 28 * HOUR, NOW - 26 * HOUR);
+    expect(await h.machines.startMachine("cloud-1")).toMatchObject({ allowed: false });
+    const { app, owner } = await h.serve();
+    const trippedAt = h.status().budget?.guard.trip?.at;
+    const url = `/api/cloud/trip/clear?project=${PROJECT}`;
+    expect((await app.inject({ method: "POST", url, headers: owner, payload: { trippedAt } })).statusCode).toBe(200);
+
+    h.now = NOW + HOUR;
+    const again = await h.machines.startMachine("cloud-1");
+    expect(again).toMatchObject({ allowed: false, reason: expect.stringContaining("reached the limit $20.00") });
+    expect(h.aws.named("StartInstances")).toHaveLength(0);
+    expect(h.trips()).toHaveLength(2);
+    expect(h.status().budget?.guard.trip?.at).toBe(new Date(NOW + HOUR).toISOString());
   });
 
   it("a provider with no data yet leaves the meter to decide; a meter at the limit refuses even when the provider says less", async () => {

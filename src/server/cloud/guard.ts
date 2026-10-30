@@ -1,21 +1,29 @@
 /**
  * The money guard (docs/design/cloud-runners.md §4). Spend is the larger of
  * the provider's cost reading and Lair's meter; at the limit or above no
- * machine starts, and the trip stays until a human sets a higher limit or a
- * new period. It fails closed: a spend Lair can't tell (a machine it could
- * not describe, a cost reading that failed) or a day outside the period
- * refuses a start too. A provider reading of "unknown" (no data yet) leaves
- * the meter to decide.
+ * machine starts, and the trip stands until the owner clears it (an owner
+ * session's request, POST /api/cloud/trip/clear): a higher limit or a new
+ * period alone does not. It fails closed: a spend Lair can't tell (a machine
+ * it could not describe, a cost reading that failed) or a day outside the
+ * period refuses a start too. A provider reading of "unknown" (no data yet)
+ * leaves the meter to decide.
  */
 import type { CloudGuardState, CloudProviderSpend } from "../../shared/cloud-types.js";
 import type { CloudBudgetSettings } from "./config.js";
 
 export interface StoredTrip {
+  /** The limit and period when it tripped */
   limit: number;
+  periodStart: string;
+  periodEnd: string;
   spend: number;
   reason: string;
   at: number;
 }
+
+/** What the owner does to clear a trip */
+export const CLEAR_TRIP_HINT =
+  "only the owner clears it (Machines, the machine's detail, Clear the trip): a higher cloud.budget.limit or a new period alone does not";
 
 export interface GuardInput {
   budget: CloudBudgetSettings;
@@ -24,7 +32,7 @@ export interface GuardInput {
   meter: number | null;
   meterError: string | null;
   provider: readonly CloudProviderSpend[];
-  /** The trip recorded for this limit and period, if any */
+  /** The trip that stands (not cleared by the owner), whatever the limit and period are now */
   trip: StoredTrip | null;
 }
 
@@ -53,7 +61,7 @@ export function evaluateGuard(input: GuardInput): GuardVerdict {
   if (input.trip) {
     return refuse(
       "tripped",
-      `tripped on ${new Date(input.trip.at).toISOString()}: ${input.trip.reason}; only a human clears it, with a higher cloud.budget.limit or a new period`,
+      `tripped on ${new Date(input.trip.at).toISOString()}: ${input.trip.reason}; ${CLEAR_TRIP_HINT}`,
       input.trip.spend,
     );
   }

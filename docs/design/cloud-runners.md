@@ -63,7 +63,10 @@ Tests fake only this boundary (Lair rule: fake remote APIs, the clock and the pr
      still counts, and an unknown stop time counts up to now), times the hourly price, plus storage for each month of
      the period, plus a starting amount for spend before the meter existed.
 - **Refuse at the limit.** At `limit` or above, Lair does not start the machine; it records the trip, moves the
-  machine's jobs to the next executor and raises a `spend` Decision. Only a human clears a trip.
+  machine's jobs to the next executor and raises a `spend` Decision. Only a human clears a trip, and only by an
+  authenticated owner action: the owner session's `POST /api/cloud/trip/clear` (Clear the trip in the Machines view),
+  recorded with the session and a note. Editing `budget.limit` or `budget.period` never clears it (decided in the
+  review of step 1: the project file can be written by an agent or a bad merge, and live reload applies it at once).
 - **The provider's own guard.** Setup creates a provider budget for the same limit with automatic actions: stop the
   machine and deny starts to the runtime credentials. If Lair is wrong or down, the provider still stops.
 - **Credits.** For promotional credits the budget counts usage before credits over a custom period that covers the
@@ -173,10 +176,13 @@ cloud:
    - the meter records each launch the provider describes; a stop it does not date ends at the check that saw it
      stopped, and an open run ends at the next launch at the latest;
    - the guard refuses (fails closed) when a machine could not be described in the check, a cost reading failed, or the
-     day is outside the period; a trip is stored per limit and period, so only a new limit or period (a human's change
-     to the YAML or Settings, applied by live reload) clears it; `cloud.guard_tripped` is emitted once;
+     day is outside the period; a trip stands per project, whatever the limit or period says later, until the owner
+     clears it with `POST /api/cloud/trip/clear` (owner session, naming the trip's time; recorded with the session id
+     and a note, `cloud.trip_cleared`); `cloud.guard_tripped` is emitted once per trip;
    - `startMachine` runs the check on fresh readings before the provider's start, one at a time with checks and
-     stops; nothing calls it yet (step 2 does), and there are no write routes: `GET /api/cloud/status` is read-only.
+     stops; nothing calls it yet (step 2 does); a stopped or replaced instance starts nothing, and the module exports
+     no provider. Every route is the owner's (`/api/cloud` in `OWNER_ONLY_PREFIXES`): `GET /api/cloud/status`, and the
+     trip's clear; none starts or stops a machine. Provider error text is kept with ARNs and account ids hidden.
 
    See docs/configuration.md Cloud machines.
 2. **Lifecycle:** start on demand, idle stop with retries, the self power-off install, quota and spend Decisions.

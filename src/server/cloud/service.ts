@@ -26,12 +26,23 @@ import type {
   CloudPowerState,
   CloudProviderSpend,
   CloudStatus,
+  CloudTrip,
 } from "../../shared/cloud-types.js";
 import { parseCloudConfig, type CloudBudgetSettings, type CloudMachineSettings, type CloudSettings } from "./config.js";
-import { evaluateGuard, type GuardVerdict } from "./guard.js";
+import { dollars, evaluateGuard, type GuardVerdict, type StoredTrip } from "./guard.js";
 import { meterSpend } from "./meter.js";
 import { AwsEc2Provider, providerText, sdkClients, type AwsClients, type CloudProvider, type PowerState } from "./provider.js";
 import { CloudStore, type StoredSpend } from "./store.js";
+
+/** A request the module refuses, with the HTTP status the route answers */
+export class CloudError extends Error {
+  constructor(
+    readonly statusCode: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
 
 const HOUR_MS = 3_600_000;
 /**
@@ -94,6 +105,16 @@ async function withTimeout<T>(work: Promise<T>, ms: number, what: string): Promi
   } finally {
     clearTimeout(timer);
   }
+}
+
+export function tripView(trip: StoredTrip): CloudTrip {
+  return {
+    limit: trip.limit,
+    period: { start: trip.periodStart, end: trip.periodEnd },
+    spend: trip.spend,
+    at: new Date(trip.at).toISOString(),
+    reason: trip.reason,
+  };
 }
 
 function publicSpend(reading: StoredSpend): CloudProviderSpend {
@@ -220,6 +241,39 @@ export class CloudMachines {
     });
   }
 
+  /**
+   * The owner clears the standing trip, named by when it tripped: the only
+   * way a trip ends (a new limit or period does not). Recorded with the
+   * owner session's public id and the note, logged, and emitted as
+   * `cloud.trip_cleared`. The next check judges the spend again, and trips
+   * again if it is still at the limit.
+   */
+  clearTrip(trippedAt: number, by: string, note: string | null): Promise<StoredTrip> {
+    return this.serial(async () => {
+      if (this.retired) throw new CloudError(409, this.retiredReason);
+      const standing = this.store.trip(this.project);
+      if (!standing) throw new CloudError(409, "no trip stands for this project");
+      if (standing.at !== trippedAt) {
+        throw new CloudError(409, `the trip that stands tripped on ${new Date(standing.at).toISOString()}, not on the time given`);
+      }
+      const cleared = this.store.clearTrip(this.project, trippedAt, by, note, this.clock.now());
+      if (!cleared) throw new CloudError(409, "the trip was not cleared");
+      const at = new Date(cleared.at).toISOString();
+      console.warn(`[cloud] ${this.project}: the owner (session ${by}) cleared the trip of ${at} (spend ${dollars(cleared.spend)}, limit ${dollars(cleared.limit)})`);
+      // The verdict shown was the trip's: the next check gives a new one
+      this.last = null;
+      await this.events?.emit("cloud.trip_cleared", {
+        project: this.project,
+        trippedAt: at,
+        limit: cleared.limit,
+        spend: cleared.spend,
+        by,
+        note,
+      });
+      return cleared;
+    });
+  }
+
   private async refresh(): Promise<GuardVerdict> {
     const now = this.clock.now();
     const budget = this.budget;
@@ -257,7 +311,7 @@ export class CloudMachines {
         : meterSpend({ runs: this.store.runs(this.project, budget.startMs, budget.endMs), machines: this.settings.machines, budget, now });
     const meterError = failures.length > 0 ? `describe failed for ${failures.join("; ")}` : null;
     const input = { budget, now, meter: meter?.total ?? null, meterError, provider };
-    let verdict = evaluateGuard({ ...input, trip: this.store.trip(this.project, budget) });
+    let verdict = evaluateGuard({ ...input, trip: this.store.trip(this.project) });
     if (verdict.trips && verdict.spend !== null) {
       if (this.store.addTrip(this.project, budget, verdict.spend, verdict.reason, now)) {
         console.warn(`[cloud] ${this.project}: money guard tripped: ${verdict.reason}`);
@@ -269,7 +323,7 @@ export class CloudMachines {
         });
       }
       // From here on the recorded trip decides, whatever the next readings say
-      verdict = evaluateGuard({ ...input, trip: this.store.trip(this.project, budget) });
+      verdict = evaluateGuard({ ...input, trip: this.store.trip(this.project) });
     }
     this.last = { at: now, meter, meterError, provider, verdict };
     return verdict;
@@ -385,11 +439,11 @@ export class CloudMachines {
   budgetStatus(): CloudBudgetStatus {
     const b = this.budget;
     const last = this.last;
-    const trip = this.store.trip(this.project, b);
+    const trip = this.store.trip(this.project);
     const guard: CloudGuardStatus = last
       ? { state: last.verdict.state, allowed: last.verdict.allowed, reason: last.verdict.reason, trip: null, checkedAt: iso(last.at) }
       : { state: trip ? "tripped" : "refused", allowed: false, reason: "not checked yet", trip: null, checkedAt: null };
-    guard.trip = trip ? { limit: trip.limit, spend: trip.spend, at: new Date(trip.at).toISOString(), reason: trip.reason } : null;
+    guard.trip = trip ? tripView(trip) : null;
     const spend = last?.verdict.spend ?? null;
     return {
       limit: b.limit,
@@ -484,6 +538,13 @@ export class CloudManager {
 
   get(project: string): CloudMachines | undefined {
     return this.instances.get(project);
+  }
+
+  /** The owner clears a project's standing trip (CloudMachines.clearTrip); the route checked the owner. */
+  clearTrip(project: string, trippedAt: number, by: string, note: string | null): Promise<StoredTrip> {
+    const instance = this.instances.get(project);
+    if (!instance) return Promise.reject(new CloudError(404, `cloud is not enabled for ${project}`));
+    return instance.clearTrip(trippedAt, by, note);
   }
 
   status(project: string): CloudStatus {

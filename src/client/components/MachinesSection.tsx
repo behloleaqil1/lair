@@ -7,10 +7,11 @@
  * scheduler. A row opens its detail (#/machines/<name>,
  * #/machines/<node id>?tab=nodes).
  */
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useApi } from "../hooks/useApi";
 import { useMachinesWebSocket } from "../hooks/useWebSocket";
 import { cloudBudget, cloudState, machineDetail, machineRows, nodeRows, type MachineRow, type NodeRow } from "../machines-view";
+import { clearCloudTrip } from "../owner-actions";
 import { adviceText, eta } from "../placement-view";
 import { linkTo } from "../router";
 import type { MachineStatus } from "../../shared/types";
@@ -23,6 +24,7 @@ import { SectionHeader, type SectionProps } from "./Section";
 import { usePlacement } from "./Placement";
 import { EmptyState, ErrorState, KeyValues, Loading, OwnerOnlyNotice, Time, useOwnerSignedIn } from "./ui";
 import { Badge } from "../ui/Badge";
+import { Button } from "../ui/Button";
 
 const MACHINE_COLUMNS: Column<MachineRow>[] = [
   { key: "id", label: "Machine", sort: (r) => r.id, render: (r) => <strong>{r.id}</strong> },
@@ -55,7 +57,12 @@ export function MachinesSection({ project, refreshKey, route, modules, open }: S
   const placement = usePlacement(project, refreshKey, modules?.placement !== true);
   // The cloud status is the owner's (it names the account's instances and spend)
   const signedIn = useOwnerSignedIn(refreshKey);
-  const cloud = useApi<CloudStatus>("/cloud/status", project, refreshKey, { owner: true, skip: modules?.cloud !== true || signedIn !== true });
+  // Bumped after the owner clears a trip, so the status is read again at once
+  const [cloudTick, setCloudTick] = useState(0);
+  const cloud = useApi<CloudStatus>("/cloud/status", project, refreshKey + cloudTick, {
+    owner: true,
+    skip: modules?.cloud !== true || signedIn !== true,
+  });
   const nodesApi = useApi<ListNodesResponse>("/nodes", "", refreshKey, { skip: route.tab !== "nodes" });
   // The WebSocket sends what GET /api/machines does; its hook types the runner lanes loosely
   const statuses = connected ? (wsMachines as MachineStatus[]) : restMachines;
@@ -134,6 +141,8 @@ export function MachinesSection({ project, refreshKey, route, modules, open }: S
           rows={rows}
           placement={placement.data}
           budget={cloud.data?.enabled ? cloud.data.budget : null}
+          project={project}
+          onTripCleared={() => setCloudTick((t) => t + 1)}
           onClose={() => open(null)}
         />
       )}
@@ -149,12 +158,16 @@ function MachineDetailPanel({
   rows,
   placement,
   budget,
+  project,
+  onTripCleared,
   onClose,
 }: {
   id: string;
   rows: MachineRow[];
   placement: PlacementStatus | null;
   budget: CloudBudgetStatus | null;
+  project: string;
+  onTripCleared: () => void;
   onClose: () => void;
 }) {
   const model = machineDetail(id, rows, placement);
@@ -192,7 +205,7 @@ function MachineDetailPanel({
           />
         </DetailSection>
       )}
-      {row.cloud && <CloudMachineDetail machine={row.cloud} budget={budget} />}
+      {row.cloud && <CloudMachineDetail machine={row.cloud} budget={budget} project={project} onTripCleared={onTripCleared} />}
       {lanes.length > 0 && (
         <DetailSection title="Lanes">
           <ul className="plain-list">
@@ -248,9 +261,40 @@ function providerReading(r: CloudProviderSpend): string {
   return r.detail ?? "not read yet";
 }
 
-/** A cloud machine's provider state, and the project's spend and money guard (read-only) */
-function CloudMachineDetail({ machine, budget }: { machine: CloudMachineStatus; budget: CloudBudgetStatus | null }) {
+/** A cloud machine's provider state, and the project's spend and money guard; the owner clears a trip here */
+function CloudMachineDetail({
+  machine,
+  budget,
+  project,
+  onTripCleared,
+}: {
+  machine: CloudMachineStatus;
+  budget: CloudBudgetStatus | null;
+  project: string;
+  onTripCleared: () => void;
+}) {
   const meter = budget?.meter ?? null;
+  const trip = budget?.guard.trip ?? null;
+  const [clearing, setClearing] = useState(false);
+  const [clearError, setClearError] = useState<string | null>(null);
+  const clear = async () => {
+    if (!trip || !budget) return;
+    const question =
+      `Clear the money guard's trip of ${trip.at}? Starts are allowed again only while the spend stays under the limit ` +
+      `(${money(budget.limit)} now): if it is still reached, raise cloud.budget.limit and the provider's budget first, or the guard trips again.`;
+    if (!window.confirm(question)) return;
+    setClearing(true);
+    setClearError(null);
+    try {
+      const answer = await clearCloudTrip(project, trip.at);
+      if (answer.success) onTripCleared();
+      else setClearError(answer.error ?? "Not cleared");
+    } catch (e) {
+      setClearError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setClearing(false);
+    }
+  };
   return (
     <>
       <DetailSection title="Cloud machine">
@@ -281,10 +325,22 @@ function CloudMachineDetail({ machine, budget }: { machine: CloudMachineStatus; 
                   : budget.meterError,
               ],
               ...budget.provider.map((r): [string, string] => [`Provider (${r.profile})`, providerReading(r)]),
-              ["Tripped", budget.guard.trip ? `${money(budget.guard.trip.spend)} on ${budget.guard.trip.at}` : null],
+              [
+                "Tripped",
+                trip ? `${money(trip.spend)} on ${trip.at} (limit ${money(trip.limit)}, ${trip.period.start} to ${trip.period.end})` : null,
+              ],
               ["Checked", budget.guard.checkedAt ? <Time iso={budget.guard.checkedAt} /> : null],
             ]}
           />
+          {trip && (
+            <p>
+              <Button size="sm" variant="danger" disabled={clearing} onClick={() => void clear()}>
+                Clear the trip
+              </Button>{" "}
+              <span className="muted small">Only you clear it; a higher limit or a new period alone does not.</span>
+            </p>
+          )}
+          {clearError && <p className="error">{clearError}</p>}
         </DetailSection>
       )}
     </>

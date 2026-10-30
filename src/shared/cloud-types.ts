@@ -57,16 +57,28 @@ export interface CloudMeterSpend {
 
 /**
  * ok: a start is allowed; warning: allowed, at warn_percent or more;
- * tripped: spend reached the limit (only a human clears it: a new limit or
- * period); refused: spend unknown, a reading failed, or outside the period.
+ * tripped: spend reached the limit (only the owner clears it, with POST
+ * /api/cloud/trip/clear; a new limit or period alone does not); refused:
+ * spend unknown, a reading failed, or outside the period.
  */
 export type CloudGuardState = "ok" | "warning" | "tripped" | "refused";
 
+/** A trip that stands until the owner clears it */
 export interface CloudTrip {
+  /** The limit and period when it tripped */
   limit: number;
+  period: { start: string; end: string };
   spend: number;
+  /** When it tripped (ISO): the clear request names it */
   at: string;
   reason: string;
+}
+
+/** POST /api/cloud/trip/clear's answer */
+export interface CloudTripCleared {
+  cleared: CloudTrip;
+  /** The owner session's public id */
+  by: string;
 }
 
 export interface CloudGuardStatus {
