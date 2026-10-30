@@ -74,6 +74,8 @@ export interface QueueCacheOptions {
   debounceMs?: number;
   checkMs?: number;
   maxBytes?: number;
+  /** Watch the folder for changes (default true); false leaves only the slow size/mtime check */
+  watch?: boolean;
 }
 
 export interface QueueCacheState {
@@ -103,6 +105,7 @@ export class QueueCache {
   private readonly debounceMs: number;
   private readonly checkMs: number;
   private readonly maxBytes: number;
+  private readonly watch: boolean;
 
   constructor(
     private readonly path: string,
@@ -113,6 +116,7 @@ export class QueueCache {
     this.debounceMs = options.debounceMs ?? DEBOUNCE_MS;
     this.checkMs = options.checkMs ?? CHECK_MS;
     this.maxBytes = options.maxBytes ?? MAX_QUEUE_BYTES;
+    this.watch = options.watch ?? true;
   }
 
   /** Load the file once and start watching it. */
@@ -120,6 +124,11 @@ export class QueueCache {
     if (this.stopped) return;
     this.startWatching();
     await this.refresh();
+  }
+
+  /** True while a watcher or a timer is alive */
+  get active(): boolean {
+    return this.watcher !== null || this.checkTimer !== null || this.debounceTimer !== null;
   }
 
   stop(): void {
@@ -198,15 +207,17 @@ export class QueueCache {
   }
 
   private startWatching(): void {
-    // The folder, not the file, so a rename over the file is seen; DirWatch
-    // polls the folder where it can't be watched
-    const name = basename(this.path);
-    this.watcher = new DirWatch(dirname(this.path), {
-      accept: (entry) => entry === name,
-      onEvent: () => this.scheduleRefresh(),
-      debounceMs: this.debounceMs,
-    });
-    this.watcher.start();
+    if (this.watch) {
+      // The folder, not the file, so a rename over the file is seen; DirWatch
+      // polls the folder where it can't be watched
+      const name = basename(this.path);
+      this.watcher = new DirWatch(dirname(this.path), {
+        accept: (entry) => entry === name,
+        onEvent: () => this.scheduleRefresh(),
+        debounceMs: this.debounceMs,
+      });
+      this.watcher.start();
+    }
     this.checkTimer = setInterval(() => void this.checkForChange(), this.checkMs);
     this.checkTimer.unref();
   }

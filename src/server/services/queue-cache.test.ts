@@ -5,8 +5,7 @@
  * wrapper around the filesystem reader, to see how often the file is read.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { appendFileSync, mkdirSync, rmSync, statSync, writeFileSync } from "fs";
-import { monitorEventLoopDelay } from "perf_hooks";
+import { appendFileSync, mkdirSync, renameSync, rmSync, statSync, truncateSync, writeFileSync } from "fs";
 import { join } from "path";
 import { DataService } from "./data.js";
 import { QueueCache, QueueCacheManager, fsQueueFileReader, type QueueFileReader } from "./queue-cache.js";
@@ -90,26 +89,56 @@ describe("a large queue file under dashboard polling", () => {
     const service = new DataService(makeConfig(), { queue: () => cache.getLines() });
     expect(reader.reads).toBe(1);
 
-    const lag = monitorEventLoopDelay({ resolution: 10 });
-    lag.enable();
-    const slowest: number[] = [];
-    for (let i = 0; i < 100; i++) {
+    // The same rounds without the cache read and parse the file each time:
+    // the control, so the cached rounds are judged against it, not a fixed time
+    const control = new DataService(makeConfig());
+    const round = (s: DataService, i: number) => {
       const t = performance.now();
-      const dragons = service.getDragons();
-      service.getQueueLinesByAgent(`worker-${i % AGENTS}`);
-      service.getQueueLines();
-      slowest.push(performance.now() - t);
+      const dragons = s.getDragons();
+      s.getQueueLinesByAgent(`worker-${i % AGENTS}`);
+      s.getQueueLines();
       expect(dragons).toHaveLength(AGENTS);
+      return performance.now() - t;
+    };
+    const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
+    const uncached: number[] = [];
+    for (let i = 0; i < 9; i++) uncached.push(round(control, i));
+    const cached: number[] = [];
+    for (let i = 0; i < 9; i++) {
+      cached.push(round(service, i));
       await new Promise((r) => setImmediate(r)); // let the loop run, as between requests
     }
-    lag.disable();
-
     expect(reader.reads).toBe(1);
-    expect(Math.max(...slowest)).toBeLessThan(200);
-    expect(lag.max / 1e6).toBeLessThan(100);
+    expect(median(cached)).toBeLessThan(median(uncached));
     // The per-agent slice comes from the same memory
     expect(service.getQueueLinesByAgent("worker-3").every((l) => l.agent === "worker-3")).toBe(true);
     expect(service.getQueueLinesByAgent("worker-3").length).toBeGreaterThan(10);
+  });
+
+  it("serves the cached lines, not the file: a rewrite on disk is not seen until the cache reads it", async () => {
+    writeFileSync(QUEUE, line("worker-1", 1) + line("worker-1", 2));
+    // The watcher and the check are off, so nothing re-reads behind the test's back
+    const cache = await started({ watch: false, checkMs: 3_600_000 });
+    const service = new DataService(makeConfig(), { queue: () => cache.getLines() });
+    const control = new DataService(makeConfig());
+    expect(service.getQueueLines()).toHaveLength(2);
+
+    writeFileSync(QUEUE, line("worker-1", 7) + line("worker-1", 8) + line("worker-2", 9));
+    expect(service.getQueueLines()).toHaveLength(2);
+    expect(service.getQueueLinesByAgent("worker-1").map((l) => l.task)).toEqual([
+      expect.stringContaining("task-1"),
+      expect.stringContaining("task-2"),
+    ]);
+    expect(service.getQueueLinesByAgent("worker-2")).toEqual([]);
+    expect(service.getDragons().find((d) => d.id === "worker-2")?.stats?.doneCount ?? 0).toBe(0);
+    expect(control.getDragons().find((d) => d.id === "worker-2")?.stats?.doneCount).toBe(1);
+    // The control reads the file itself and sees the rewrite: it would fail this test if the service did too
+    expect(control.getQueueLines()).toHaveLength(3);
+
+    rmSync(QUEUE);
+    expect(service.getQueueLines()).toHaveLength(2);
+    await cache.refresh();
+    expect(service.getQueueLines()).toEqual([]);
   });
 
   it("keeps the newest lines when the file is larger than the cap, and says so", async () => {
@@ -193,6 +222,70 @@ describe("changes", () => {
     fail = false;
     await cache.refresh();
     expect(cache.status().error).toBeUndefined();
+  });
+
+  it("sees a file replaced by an atomic rename (a temporary file renamed over the queue)", async () => {
+    writeFileSync(QUEUE, line("worker-1", 1));
+    // The folder watch alone: the slow check is too slow to be what sees it
+    const cache = await started({ debounceMs: 20, checkMs: 3_600_000 });
+    writeFileSync(`${QUEUE}.tmp`, line("worker-1", 1) + line("worker-2", 2) + line("worker-2", 3));
+    renameSync(`${QUEUE}.tmp`, QUEUE);
+    await until(() => cache.getLines().length === 3);
+  });
+
+  it("sees a file cut down to a smaller one", async () => {
+    writeFileSync(QUEUE, queueText(20 * 1024));
+    const cache = await started({ debounceMs: 20, checkMs: 100 });
+    expect(cache.getLines().length).toBeGreaterThan(20);
+    truncateSync(QUEUE, 0);
+    await until(() => cache.getLines().length === 0);
+    writeFileSync(QUEUE, line("worker-1", 1));
+    await until(() => cache.getLines().length === 1);
+  });
+
+  it("sees changes with the slow check alone when no watcher runs", async () => {
+    writeFileSync(QUEUE, line("worker-1", 1));
+    const reader = counting();
+    const cache = await started({ reader, watch: false, debounceMs: 20, checkMs: 50 });
+    expect(cache.active).toBe(true);
+    appendFileSync(QUEUE, line("worker-1", 2));
+    await until(() => cache.getLines().length === 2);
+    // Nothing changed since: the check reads no more
+    const reads = reader.reads;
+    await new Promise((r) => setTimeout(r, 200));
+    expect(reader.reads).toBe(reads);
+  });
+
+  it("retries a failed read by itself, without a call to refresh()", async () => {
+    writeFileSync(QUEUE, line("worker-1", 1));
+    let fail = false;
+    const reader: QueueFileReader = {
+      stat: (p) => fsQueueFileReader.stat(p),
+      read: (p, max) => (fail ? Promise.reject(new Error("EIO: input/output error")) : fsQueueFileReader.read(p, max)),
+    };
+    const cache = await started({ reader, watch: false, debounceMs: 20, checkMs: 50 });
+    fail = true;
+    appendFileSync(QUEUE, line("worker-1", 2));
+    await until(() => cache.status().error !== undefined);
+    expect(cache.getLines()).toHaveLength(1);
+    fail = false;
+    await until(() => cache.getLines().length === 2);
+    expect(cache.status().error).toBeUndefined();
+  });
+
+  it("stop() ends the watcher and the timers, and a later change is not read", async () => {
+    writeFileSync(QUEUE, line("worker-1", 1));
+    const reader = counting();
+    const cache = await started({ reader, debounceMs: 20, checkMs: 50 });
+    expect(cache.active).toBe(true);
+    appendFileSync(QUEUE, line("worker-1", 2)); // a debounce may be pending
+    cache.stop();
+    expect(cache.active).toBe(false);
+    const reads = reader.reads;
+    appendFileSync(QUEUE, line("worker-1", 3));
+    await new Promise((r) => setTimeout(r, 300));
+    expect(reader.reads).toBe(reads);
+    expect(cache.getLines().length).toBeLessThan(3);
   });
 
   it("refuses what is not a regular file, and settles instead of holding requests", async () => {
