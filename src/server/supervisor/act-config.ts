@@ -79,6 +79,7 @@ export const CODE_FAILURE_PATTERNS: readonly string[] = [
   "\\btest.*failed\\b",
   "\\btests?.*FAILED\\b",
   "\\bFAILURE\\b",
+  "\\bFAILED\\b.*\\b(to\\s+)?(compil|build|link)",
   "AssertionError",
   "assertion failed",
   "expected.*to (be|equal|match|have)",
