@@ -32,6 +32,7 @@ function machine(overrides: Partial<PlacementMachine> = {}): PlacementMachine {
     cpus: null,
     utilization: null,
     factor: 1,
+    onDemand: null,
     ...overrides,
   };
 }
