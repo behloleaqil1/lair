@@ -10,6 +10,7 @@ import {
   listProjects,
 } from "./config.js";
 import { DataService } from "./services/data.js";
+import { QueueCacheManager } from "./services/queue-cache.js";
 import { isValidDragonId } from "./parsers/dragon-config.js";
 import { registerRootGuards, requireValidIdParam } from "./root-guards.js";
 import { mountDecisions } from "./decisions/index.js";
@@ -128,6 +129,8 @@ function respondCached<T>(cached: CachedData<T>): ApiResponse<T> & { cache: { ag
 
 // Get data service for project (cached per request cycle)
 const dataServices = new Map<string, DataService>();
+const queueCaches = new QueueCacheManager();
+const queueReady = new Map<string, () => Promise<void>>();
 
 // The agents module's runs, for the Dragons view: a dragon it runs is
 // running, "managed by Lair". Set once the module is loaded, below.
@@ -138,16 +141,34 @@ function getDataService(project?: string): DataService {
 
   if (!dataServices.has(projectName)) {
     const config = loadProjectConfig(projectName);
+    // The queue file is parsed once per change, never on a request
+    const queue = queueCaches.get(projectName, config.queue_file);
+    queueReady.set(projectName, () => queue.ready());
     dataServices.set(
       projectName,
       new DataService(config, {
         managedRuns: () => managedRuns?.managedRuns(projectName) ?? new Map(),
+        queue: () => queue.getLines(),
       }),
     );
   }
 
   return dataServices.get(projectName)!;
 }
+
+// A request waits for the first read of its project's queue file, then every
+// handler reads the parsed lines from memory
+fastify.addHook("preHandler", async (request) => {
+  if (!request.url.startsWith("/api/")) return;
+  const asked = (request.query as { project?: unknown } | undefined)?.project;
+  try {
+    const name = typeof asked === "string" && asked ? asked : getDefaultProject();
+    getDataService(name);
+    await queueReady.get(name)?.();
+  } catch {
+    // An unknown project or an unreadable config: the handler reports it
+  }
+});
 
 /** Get the data cache for a project (expensive operations use this). */
 function getDataCache(project?: string) {
@@ -766,6 +787,7 @@ const stopServer = async (reason: string) => {
 
   // Stop the data cache manager
   dataCacheManager.stopAll();
+  queueCaches.stopAll();
 
   // Stop healer
   stopHealer();
