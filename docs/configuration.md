@@ -2746,6 +2746,48 @@ Config errors (an unknown key, an invalid pattern or one without its group, a `t
 
 Events: `planner.changed`, `planner.run_started`, `planner.run_finished`, `planner.proposals_pending`, `planner.blocked`, `planner.tasks_file_restored`. Decisions are raised as module `planner`. Everything is kept in `data/planner.db`: a restart keeps the pending triggers, the planner run in progress, waiting proposals and the history.
 
+## Brain bench
+
+`lair brain-bench` scores candidate "brains" on recorded decisions: a small local model, a hosted model, or a set of deterministic rules. It is a command, not a server feature: there is no configuration key, it is off unless you run it, it never talks to the Lair server and changes nothing. A shadow mode that compares a model with the real answers later reuses the same scoring.
+
+```
+lair brain-bench --cases cases.jsonl --model ollama:qwen3:4b --model rules:rules.json [--endpoint <url>]
+                 [--api-key-env <NAME>] [--threshold 0.5] [--limit <n>] [--json]
+```
+
+**Cases** are JSON Lines, one decision per line (at most 50,000 lines, 32 KB each, 16 MB in all):
+
+```json
+{"id": "d1", "kind": "escalation", "module": "agents", "evidence": {"class": "rate_limited", "attempts": 3},
+ "options": [{"id": "wait", "label": "Wait for the cooldown"}, {"id": "switch", "label": "Switch profile"}],
+ "label": "wait", "reason": "the cooldown ends soon"}
+```
+
+`evidence` holds structured fields (codes, counts, flags), not prose. `label` is the option id that was answered. `reason` is kept for people and never sent to a model. Other fields are ignored. A bad line stops the run with its line number.
+
+**Models** (`--model`, repeat it to compare):
+
+| Spec | What it is |
+|---|---|
+| `ollama:<name>` | An Ollama server (`/api/chat`), the answer constrained with a JSON schema. `--endpoint` defaults to `http://127.0.0.1:11434`. |
+| `openai:<name>` | Any OpenAI-compatible server (`/chat/completions` with a strict `json_schema`): vLLM, LM Studio, llama.cpp, a hosted API. `--endpoint` defaults to `http://127.0.0.1:1234/v1`. `--api-key-env NAME` reads the bearer token from that environment variable; the token is never printed and an endpoint URL with embedded credentials is refused. |
+| `rules:<file.json>` | Deterministic rules scored like a model: `{"rules": [{"when": {"module": "agents", "class": "rate_limited"}, "option": "wait", "reasonCode": "cooldown"}]}`. The first rule whose `when` fields all equal the case's `kind`, `module` or evidence fields answers with confidence 1. No match is an abstain. |
+
+The model is asked for `{"option", "reason_code", "confidence"}` with `option` limited to the case's option ids. The case reaches the prompt as fenced data and is never treated as instructions. A reply that is not valid JSON, names an option the case does not offer, or has no confidence from 0 to 1 counts as an abstain and as an error; so does an endpoint that cannot be reached.
+
+**The report**, overall and for each decision kind, for each model:
+
+| Measure | Meaning |
+|---|---|
+| `accuracy` | correct / all cases (an abstain is not a hit) |
+| `answeredAccuracy` | correct / (correct + wrong) |
+| `abstainRate` | answers below `--threshold` confidence (default 0.5), plus errors |
+| `wrongConfidentRate` | wrong answers at or above the threshold, over all cases: the number to keep near zero before a model may act |
+| `errors` | replies that were unusable (a subset of the abstains) |
+| latency | mean, p50 and p95 per case, in milliseconds |
+
+`--json` prints the report as JSON. Exit code 0 means the bench ran; 2 means bad input and nothing ran. Cases are asked one at a time per model.
+
 ## Example complete configuration
 
 ```yaml

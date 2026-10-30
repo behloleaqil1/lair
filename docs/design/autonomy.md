@@ -315,6 +315,10 @@ planner (§4) turns documents into work; this module WRITES and maintains those 
   incident id and are pruned when unused for 90 days.
 - **Status documents:** the app's status file, plan ticks and changelog are generated from events via docs PRs, never
   hand-maintained.
+- **Brain bench (built):** `lair brain-bench` replays recorded decisions against a model or a rule set and reports
+  accuracy, abstain rate, wrong-but-confident rate and latency per decision kind
+  ([Brain bench](../configuration.md#brain-bench)). A candidate model must keep wrong-but-confident near zero before
+  it may run in shadow mode, which reuses the same scoring.
 - **Daily digest** (§1 notifications, and a Digest view): merges, the throughput trend, SLO state, open decisions, the
   top blocker, and the next 24 h of planned work.
 
