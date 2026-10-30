@@ -155,6 +155,10 @@ describe("agents config", () => {
         requeueMarker: undefined,
         fallbackSeconds: 900,
       },
+      idle: {
+        noticeMinutes: 15,
+        readySources: ["tasks_file"],
+      },
     });
     expect(errorsOf({ fill: { enabled: true } })).toEqual([
       "agents.fill.enabled: fill needs agents.enabled: true",
@@ -408,5 +412,28 @@ describe("agents config", () => {
 
   it("backs off exponentially, capped", () => {
     expect([1, 2, 3, 4].map((n) => backoffMs(n, 10, 60))).toEqual([10_000, 20_000, 40_000, 60_000]);
+  });
+
+  it("fill.idle has documented defaults and validates ready_sources", () => {
+    const parsed = parseAgentsConfig(undefined, project);
+    expect(parsed.ok && parsed.settings.fill.idle).toEqual({
+      noticeMinutes: 15,
+      readySources: ["tasks_file"],
+    });
+
+    // Valid ready_sources
+    const fill = {
+      enabled: true,
+      tasks_file: "work/tasks.txt",
+      agents: ["worker-a"],
+      prompt_files: ["{prompts_dir}/{agent}.txt"],
+    };
+    const withIdle = (idle: Record<string, unknown>) => ({
+      enabled: true,
+      fill: { ...fill, idle },
+    });
+    expect(errorsOf(withIdle({ notice_minutes: 30, ready_sources: ["tasks_file", "backlog"] }))).toEqual([]);
+    expect(errorsOf(withIdle({ notice_minutes: 0 }))).toEqual([]); // 0 = off
+    expect(errorsOf(withIdle({ ready_sources: ["invalid_source"] }))[0]).toContain("agents.fill.idle.ready_sources.0");
   });
 });

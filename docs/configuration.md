@@ -1715,6 +1715,8 @@ worker-b|Bob|feat-search|Search page
 | `fill.wake.max_queue_wait_minutes` | number | `1440` | A task waiting this long in a row is held even while its gate is still in the gate queue (never less than `max_wait_minutes`) |
 | `fill.wake.requeue_marker` | string | — | A marker whose first line is the id the waited-on gate was re-queued or re-checked as, followed for a live wait and its result. `{wake}` (required), `{n}` (1 to 9), `{gates_dir}`, `{agents_dir}`, `{repo}`; inside `wake.root` |
 | `fill.wake.fallback_seconds` | number | `900` | With nothing to wait on (no capture, no `wake.file`, or a refused capture), the task starts again after this long, or after the backoff if that is later: such a run counts toward `max_completions_without_done` |
+| `fill.idle.notice_minutes` | number | `15` | Raise one notice when an agent is idle with ready work for this many minutes; 0 = off |
+| `fill.idle.ready_sources` | array | `["tasks_file"]` | Where to look for ready work: `tasks_file`, `backlog`, `tracker` |
 
 A fill block that is enabled without `agents.enabled`, `tasks_file`, `agents` or `prompt_files`, an invalid agent id in `agents`, a `prompt_files` entry with a `..` segment or an unknown placeholder, a `done_pattern`, `waiting_pattern` or `blocked_pattern` with neither `{task}` nor `{agent}`, with an `{agent}` that doesn't come right after `by\s+`, or that isn't a regular expression, or a `wake.file` or `wake.requeue_marker` without `{wake}` (or a `wake.file`, `wake.root` or `wake.requeue_marker` with a `..` segment or an unknown placeholder) is a config error.
 
@@ -1744,6 +1746,22 @@ agents:
       requeue_marker: "{gates_dir}/results/{wake}.recheck-{n}"   # optional: first line, the id it was re-queued as
       fallback_seconds: 900
 ```
+
+#### Idle detection
+
+Fill tracks why each allowlisted agent is idle and, when ready work exists, raises one notice per incident. The status's `idle` array gives each agent's reason and a human-readable explanation. Reasons:
+
+- `busy`: the agent has an active run.
+- `waiting`: its task is waiting on a gate.
+- `held`: its task is held (with the hold kind).
+- `max_active`: `fill.max_active` is reached.
+- `capacity`: `capacity_cmd` refused.
+- `no_task`: no line in the tasks file for this agent.
+- `task_done`: its task is done, with no next task.
+- `no_ready_work`: idle, but no ready work exists.
+- `ready_work`: idle AND ready work exists (this is the problem).
+
+Ready work is a task with no agent assigned, or one whose agent isn't in `fill.agents`. Set `fill.idle.ready_sources` to check more sources (when wired): `tasks_file` (the default), `backlog`, or `tracker`. When an agent is idle with ready work for `fill.idle.notice_minutes` (15 by default, 0 to disable), fill raises one `fill_idle_notice` event; the notice is cleared when the agent is no longer in the `ready_work` state, and raised again if it returns.
 
 #### Matching by agent
 

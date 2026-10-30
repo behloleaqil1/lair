@@ -127,6 +127,15 @@ const WakeSchema = z
   })
   .strict();
 
+const IdleSchema = z
+  .object({
+    /** Idle past this raises one notice per agent (minutes); 0 = off */
+    notice_minutes: z.number().int().min(0).max(1440).default(15),
+    /** Check for ready work from these sources (tasks_file always included) */
+    ready_sources: z.array(z.enum(["tasks_file", "backlog", "tracker"])).default(["tasks_file"]),
+  })
+  .strict();
+
 const FillSchema = z
   .object({
     enabled: z.boolean().default(false),
@@ -157,6 +166,8 @@ const FillSchema = z
     /** A run that ended on such a line is held for the owner at once */
     blocked_pattern: z.string().min(1).max(500).default(DEFAULT_BLOCKED_PATTERN),
     wake: WakeSchema.default({}),
+    /** Idle detection: notice when an agent is idle while ready work exists */
+    idle: IdleSchema.default({}),
   })
   .strict();
 
@@ -274,6 +285,10 @@ export interface FillSettings {
     maxQueueWaitMinutes: number;
     requeueMarker?: string;
     fallbackSeconds: number;
+  };
+  idle: {
+    noticeMinutes: number;
+    readySources: ("tasks_file" | "backlog" | "tracker")[];
   };
 }
 
@@ -595,6 +610,10 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
           maxQueueWaitMinutes: value.fill.wake.max_queue_wait_minutes,
           requeueMarker: value.fill.wake.requeue_marker,
           fallbackSeconds: value.fill.wake.fallback_seconds,
+        },
+        idle: {
+          noticeMinutes: value.fill.idle.notice_minutes,
+          readySources: value.fill.idle.ready_sources,
         },
       },
     },

@@ -4302,6 +4302,84 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(withdrawn?.withdrawnReason).toContain("It moved on: feat-login started again as run");
     expect(inbox.list({ project: "demo", status: "open" })).toEqual([]);
   });
+
+  // ---- Idle detection ----
+
+  it("returns idle states in the status view: an agent with done task while ready work exists is ready_work", async () => {
+    const h = setup(fill({ idle: { notice_minutes: 5 } }));
+    prompts(h);
+    // worker-a has a task, worker-b has none (ready work)
+    tasks(h, "worker-a|Alice|feat-login|Build the login form", "|Bob|feat-other|Unassigned task");
+    // Complete worker-a's task
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "- DONE feat-login by worker-a 00:01Z: done\n");
+    await check(h);
+    await at(h, 1 * MIN);
+    // Run completes
+    const status = await check(h);
+    expect(status.idle).toBeDefined();
+    // worker-a's task is done, but ready work exists (the unassigned task)
+    const workerAIdle = status.idle?.find((s) => s.agent === "worker-a");
+    expect(workerAIdle).toMatchObject({ agent: "worker-a", reason: "ready_work" });
+    expect(workerAIdle?.explanation).toContain("idle while ready work exists");
+  });
+
+  it("raises one fill_idle_notice event when an agent is idle with ready work past the threshold", async () => {
+    const h = setup(fill({ idle: { notice_minutes: 5 } }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Build the login form", "|Bob|feat-other|Unassigned task");
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "- DONE feat-login by worker-a 00:01Z: done\n");
+    await check(h);
+    await at(h, 1 * MIN);
+    await check(h);
+
+    // Below threshold: no notice
+    await at(h, 4 * MIN);
+    await check(h);
+    expect(eventsOf(h, "fill_idle_notice")).toHaveLength(0);
+
+    // Past threshold: one notice
+    await at(h, 6 * MIN);
+    await check(h);
+    expect(eventsOf(h, "fill_idle_notice")).toHaveLength(1);
+    expect(eventsOf(h, "fill_idle_notice")[0].summary).toContain("idle for");
+    expect(eventsOf(h, "fill_idle_notice")[0].summary).toContain("while ready work exists");
+
+    // Second check: no duplicate notice
+    await at(h, 10 * MIN);
+    await check(h);
+    expect(eventsOf(h, "fill_idle_notice")).toHaveLength(1);
+  });
+
+  it("clears idle notice flag when agent becomes busy again, then raises a new notice on next idle incident", async () => {
+    const h = setup(fill({ idle: { notice_minutes: 1 } }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Build the login form", "|Bob|feat-other|Unassigned task");
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "- DONE feat-login by worker-a 00:01Z: done\n");
+    await check(h);
+    await at(h, 1 * MIN);
+    await check(h);
+
+    // Past threshold: one notice
+    await at(h, 3 * MIN);
+    await check(h);
+    expect(eventsOf(h, "fill_idle_notice")).toHaveLength(1);
+
+    // Agent takes another task (becomes busy)
+    tasks(h, "worker-a|Alice|feat-new|New task", "|Bob|feat-other|Unassigned task");
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
+    await check(h);
+    expect(h.service.fillStatus()?.idle?.find((s) => s.agent === "worker-a")?.reason).toBe("busy");
+
+    // Complete the new task, ready work still exists
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "- DONE feat-new by worker-a 00:05Z: done\n");
+    await at(h, 5 * MIN);
+    await check(h);
+
+    // New idle incident: notice flag was cleared, so a new notice is raised after threshold
+    await at(h, 8 * MIN);
+    await check(h);
+    expect(eventsOf(h, "fill_idle_notice")).toHaveLength(2);
+  });
 });
 
 

@@ -151,6 +151,7 @@ export type AgentEventKind =
   | "fill_wake_absent"
   | "fill_gate_queued"
   | "fill_gate_gone"
+  | "fill_idle_notice"
   | "transient"
   | "transient_cleared";
 
@@ -382,6 +383,36 @@ export interface FillStatusView {
   lastCheck: string | null;
   lastError: string | null;
   lines: FillLineView[];
+  /** Idle states for agents in the allowlist (fill.agents) */
+  idle?: IdleStateView[];
+}
+
+/** Why an agent is idle: one of these, never unexplained. */
+export type IdleReason =
+  | "no_task" // no line in tasks file for this agent
+  | "task_done" // its task is done
+  | "max_active" // fill.max_active reached
+  | "capacity" // capacity_cmd refused
+  | "busy" // agent has another task running
+  | "held" // its task is held (with the hold kind)
+  | "waiting" // its task is waiting on a gate
+  | "no_ready_work" // idle, but no ready work exists
+  | "ready_work"; // idle AND ready work exists (this is the problem)
+
+/** The idle state of one agent. */
+export interface IdleStateView {
+  agent: string;
+  reason: IdleReason;
+  /** The hold kind when reason is "held" */
+  hold?: FillHold;
+  /** The task it would work on, when held or waiting */
+  task?: string;
+  /** When it became idle */
+  since: string;
+  /** How long it has been idle (seconds) */
+  durationSeconds: number;
+  /** Human-readable explanation */
+  explanation: string;
 }
 
 /**

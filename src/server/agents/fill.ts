@@ -88,6 +88,13 @@ import {
   type FillSettings,
 } from "./config.js";
 import { escalationDecisionKey, type DecisionRequest } from "./decisions.js";
+import {
+  computeIdleStates,
+  findReadyWork,
+  idleStateView,
+  shouldNotice,
+  type IdleState,
+} from "./idle.js";
 import type { AgentProbes } from "./probes.js";
 import { MAX_PROMPT_FILE_BYTES } from "./prompts.js";
 import { lastLines, readTail } from "./sessions.js";
@@ -808,6 +815,10 @@ export class AgentsFill {
   private lineGone = new Map<string, number>();
   /** When fill last saw a waiting run's gate in the gate queue (task|run -> time); the store keeps the first and last sightings */
   private lastQueued = new Map<string, number>();
+  /** Idle states for all allowlisted agents (computed after each check) */
+  private idleStates = new Map<string, IdleState>();
+  /** Agents for which we've raised an idle notice (one per incident) */
+  private idleNoticed = new Set<string>();
 
   constructor(private options: AgentsFillOptions) {}
 
@@ -823,6 +834,8 @@ export class AgentsFill {
 
   view(): FillStatusView {
     const { settings } = this.options;
+    // Convert idle states to views
+    const idle = Array.from(this.idleStates.values()).map(idleStateView);
     return {
       enabled: settings.enabled,
       running: this.running,
@@ -834,6 +847,7 @@ export class AgentsFill {
       lastCheck: this.lastCheck === null ? null : iso(this.lastCheck),
       lastError: this.lastError,
       lines: this.lines,
+      idle: idle.length > 0 ? idle : undefined,
     };
   }
 
@@ -909,6 +923,8 @@ export class AgentsFill {
     try {
       this.lines = await this.evaluate(abort.signal, now);
       this.lastError = abort.signal.aborted ? "the check was interrupted: the module stopped" : null;
+      // Compute idle states for all allowlisted agents
+      await this.computeAndNotifyIdleStates(now);
     } catch (e) {
       const error = message(e);
       if (error !== this.lastError) console.warn(`[agents] ${this.options.project}: fill check failed: ${error}`);
@@ -917,6 +933,61 @@ export class AgentsFill {
     } finally {
       this.lastCheck = now;
       if (this.abort === abort) this.abort = null;
+    }
+  }
+
+  /**
+   * Compute idle states for all allowlisted agents and raise notices as needed.
+   * Called after each check to update the idle tracking.
+   */
+  private async computeAndNotifyIdleStates(now: number): Promise<void> {
+    const { settings } = this.options;
+    const { idle: idleSettings } = settings;
+
+    // Find ready work from configured sources
+    const readyWork = findReadyWork(idleSettings.readySources, this.lines);
+
+    // Check if capacity_cmd refused (any held line with hold = "capacity")
+    const capacityRefused = this.lines.some((l) => l.state === "held" && l.hold === "capacity");
+
+    // Compute idle states for all agents
+    const newStates = computeIdleStates(
+      settings.agents,
+      this.lines,
+      this.activeCount(),
+      settings.maxActive,
+      capacityRefused,
+      readyWork,
+      now,
+      this.idleStates,
+    );
+
+    // Update tracked states
+    this.idleStates.clear();
+    for (const state of newStates) {
+      this.idleStates.set(state.agent, state);
+
+      // Raise notice once per incident (when an agent is idle with ready work)
+      if (shouldNotice(state, idleSettings) && !this.idleNoticed.has(state.agent)) {
+        this.idleNoticed.add(state.agent);
+        const durationMin = Math.round(state.duration / 60_000);
+        await this.options.record(
+          "fill_idle_notice",
+          {
+            agent: state.agent,
+            task: null,
+            summary: `${state.agent} idle for ${durationMin} min while ready work exists`,
+            evidence: [state.explanation],
+            data: { reason: state.reason, durationMinutes: durationMin },
+          },
+          now,
+        );
+      }
+
+      // Clear the notice flag when the agent is no longer in the ready_work state
+      if (state.reason !== "ready_work" && this.idleNoticed.has(state.agent)) {
+        this.idleNoticed.delete(state.agent);
+      }
     }
   }
 
