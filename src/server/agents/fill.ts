@@ -95,6 +95,7 @@ import { MAX_PROMPT_FILE_BYTES } from "./prompts.js";
 import { lastLines, readTail } from "./sessions.js";
 import type { AgentsStore } from "./store.js";
 import { isActive, isValidTaskId, type AgentRun, type QueueMark } from "./types.js";
+import type { ProcessInfo } from "../watchdog/probes.js";
 
 export const MAX_TASKS_FILE_BYTES = 256 * 1024;
 export const MAX_TASK_LINES = 200;
@@ -771,6 +772,10 @@ export interface AgentsFillOptions {
   store: AgentsStore;
   probes: AgentProbes;
   readOnly: () => boolean;
+  /** False until AgentsService has reconciled the runs the store says are active (after start()): no check runs */
+  ready: () => boolean;
+  /** A live process running a run of the task that no active run owns (AgentsService's), or null */
+  taskProcess: (task: string) => Promise<ProcessInfo | null>;
   /** AgentsService.requestRun as fill: the module's in-process path */
   requestRun: (input: { agent: string; task: string; prompt: string }) => Promise<AgentRunView>;
   /** Record an event in the store, and on the bus */
@@ -915,9 +920,15 @@ export class AgentsFill {
   }
 
   private async runCheck(): Promise<void> {
+    const now = this.options.probes.clock.now();
+    if (!this.options.ready()) {
+      // A restart: a task whose run the previous server started must not look free before that run is adopted
+      this.lastError = "waiting for the agents module to reconcile the runs it found active: fill starts nothing until then";
+      this.lastCheck = now;
+      return;
+    }
     const abort = new AbortController();
     this.abort = abort;
-    const now = this.options.probes.clock.now();
     try {
       this.lines = await this.evaluate(abort.signal, now);
       this.lastError = abort.signal.aborted ? "the check was interrupted: the module stopped" : null;
@@ -1378,6 +1389,27 @@ export class AgentsFill {
           await hold("capacity", reason);
           continue;
         }
+      }
+
+      // A run of the task the store doesn't know (one reconciliation couldn't adopt) still runs: never a second
+      const other = await this.options.taskProcess(task);
+      if (other) {
+        const reason = `pid ${other.pid} runs ${task} already (a run prompt file of the task is on its command line), though no run here owns it`;
+        await this.options.record(
+          "fill_conflict",
+          {
+            agent,
+            task,
+            summary: `fill: ${agent} doesn't start ${task}: ${reason}`,
+            // Not its command line: another program's arguments are not Lair's to store
+            evidence: [reason],
+            data: { pid: other.pid },
+            dedupeKey: `fill_conflict:${task}:${other.pid}`,
+          },
+          probes.clock.now(),
+        );
+        await hold("conflict", reason);
+        continue;
       }
 
       let run: AgentRunView;

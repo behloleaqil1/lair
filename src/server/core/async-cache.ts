@@ -125,6 +125,18 @@ export class AsyncCache<T> {
   }
 
   /**
+   * A value refreshed after this call, never one cached before it: a refresh
+   * already in flight may have started earlier, so it is waited out first.
+   * Rejects when that refresh fails (no stale value stands in for it).
+   */
+  async fresh(): Promise<CacheEntry<T>> {
+    if (this.inflight) await this.inflight.catch(() => undefined);
+    const value = await this.refresh();
+    const refreshedAt = this.refreshedAt ?? this.clock();
+    return { value, refreshedAt, stale: false, ageMs: this.clock() - refreshedAt };
+  }
+
+  /**
    * Get the cached value without triggering a refresh.
    * Returns undefined if no value has been cached yet.
    */
