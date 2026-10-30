@@ -97,6 +97,7 @@ import type { AgentsStore } from "./store.js";
 import { isActive, isValidTaskId, type AgentRun, type QueueMark } from "./types.js";
 import type { ProcessInfo } from "../watchdog/probes.js";
 import { evaluateReady, isPrWork, parseReadyReport, refuseReport, unverifiable, type ReadyFactsSource, type ReadyVerdict } from "../ready-guard/guard.js";
+import { extractBusId } from "../bus/consumers.js";
 
 export const MAX_TASKS_FILE_BYTES = 256 * 1024;
 export const MAX_TASK_LINES = 200;
@@ -372,8 +373,11 @@ export class QueueLines {
   private lines: { start: number; text: string }[] = [];
   private size = 0;
   private usableMarks = new Map<string, boolean>();
+  /** Optional callback to check if a line should be skipped (for bus consumer integration) */
+  private skipLine?: (line: string) => boolean;
 
-  constructor(private path: string) {
+  constructor(private path: string, options?: { skipLine?: (line: string) => boolean }) {
+    this.skipLine = options?.skipLine;
     const opened = openRegular(path, false);
     if ("error" in opened) return;
     try {
@@ -400,6 +404,11 @@ export class QueueLines {
     } finally {
       closeSync(opened.fd);
     }
+  }
+
+  /** Check if a line should be skipped (for bus consumer integration) */
+  private shouldSkip(line: string): boolean {
+    return this.skipLine?.(line) ?? false;
   }
 
   /**
@@ -434,7 +443,11 @@ export class QueueLines {
     const window = this.window(pattern, mark, until);
     if (window === null) return null;
     for (const line of this.lines) {
-      if (line.start >= window.from && line.start < window.to && doneLineMatches(pattern, line.text)) return line.text;
+      if (line.start >= window.from && line.start < window.to && doneLineMatches(pattern, line.text)) {
+        // Skip lines with consumed bus IDs (bus consumer integration)
+        if (this.shouldSkip(line.text)) continue;
+        return line.text;
+      }
     }
     return null;
   }
@@ -452,6 +465,8 @@ export class QueueLines {
     const windows = patterns.map(({ pattern }) => this.window(pattern, mark, until));
     let last: { kind: K; line: string; match: RegExpExecArray } | null = null;
     for (const line of this.lines) {
+      // Skip lines with consumed bus IDs (bus consumer integration)
+      if (this.shouldSkip(line.text)) continue;
       for (let i = 0; i < patterns.length; i++) {
         const window = windows[i];
         if (window === null || line.start < window.from || line.start >= window.to) continue;
@@ -795,6 +810,11 @@ export interface AgentsFillOptions {
   withdraw: (decision: Decision, reason: string) => Promise<void>;
   /** The ready guard's source for this project's PRs (used when settings.readyGuard is on); undefined: none, nothing is refused */
   readyFacts?: () => ReadyFactsSource | undefined;
+  /**
+   * Bus consumer integration: check if a bus id was consumed (event processed).
+   * When provided and returns true for a line's bus id, the file reader skips it.
+   */
+  wasConsumed?: (busId: number) => boolean;
 }
 
 function firstLine(text: string): string | null {
@@ -994,7 +1014,15 @@ export class AgentsFill {
     const byAgent = matchesByAgent(settings);
     const entries = parseTasksFile(read.text, byAgent);
     const allowed = new Set(settings.agents);
-    const queue = new QueueLines(config.queue_file);
+    // Bus consumer integration: skip lines with consumed bus IDs (events already processed)
+    const { wasConsumed } = this.options;
+    const skipLine = wasConsumed
+      ? (line: string) => {
+          const busId = extractBusId(line);
+          return busId !== null && wasConsumed(busId);
+        }
+      : undefined;
+    const queue = new QueueLines(config.queue_file, { skipLine });
     // The gate queue, read at most once per check, and only when a waiting line names a gate
     let gateRequests: Map<string, QueuedRequest> | null = null;
     const gateQueue = () => (gateRequests ??= readGateQueue(config.gates_dir));
