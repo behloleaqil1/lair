@@ -39,7 +39,8 @@ const SCHEMA = `
     last_match_at INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    feature TEXT
+    feature TEXT,
+    version INTEGER NOT NULL DEFAULT 1
   );
   CREATE INDEX IF NOT EXISTS idx_lessons_status ON lessons(status);
   CREATE INDEX IF NOT EXISTS idx_lessons_scope ON lessons(scope);
@@ -61,6 +62,7 @@ interface LessonRow {
   created_at: number;
   updated_at: number;
   feature: string | null;
+  version: number;
 }
 
 const iso = (ms: number | null): string | null => (ms === null ? null : new Date(ms).toISOString());
@@ -98,6 +100,7 @@ function toLesson(row: LessonRow): Lesson {
     createdAt: iso(row.created_at)!,
     updatedAt: iso(row.updated_at)!,
     feature: row.feature,
+    version: row.version,
   };
 }
 
@@ -125,6 +128,7 @@ export interface LessonInput {
   status?: LessonStatus;
   scope?: LessonScope;
   feature?: string | null;
+  version?: number;
 }
 
 export class LessonsStore {
@@ -154,16 +158,16 @@ export class LessonsStore {
     this.db.close();
   }
 
-  /** Add a lesson (built-in or project). Skips if the id already exists. Returns true if added. */
-  add(input: LessonInput, now: number): boolean {
+  /** Add a lesson (built-in or project). Skips if the id already exists. Returns the id if added, null otherwise. */
+  add(input: LessonInput, now: number): string | null {
     const id = input.id ?? randomUUID();
     const existing = this.get(id);
-    if (existing) return false;
+    if (existing) return null;
 
     this.db
       .prepare(
-        `INSERT INTO lessons (id, title, signal, cause, response, prevention, sources, status, scope, created_at, updated_at, feature)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO lessons (id, title, signal, cause, response, prevention, sources, status, scope, created_at, updated_at, feature, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -178,8 +182,9 @@ export class LessonsStore {
         now,
         now,
         input.feature ?? null,
+        input.version ?? 1,
       );
-    return true;
+    return id;
   }
 
   /** Get a lesson by id */
@@ -242,6 +247,7 @@ export class LessonsStore {
       prevention?: string;
       status?: LessonStatus;
       feature?: string | null;
+      version?: number;
     },
     now: number,
   ): boolean {
@@ -274,6 +280,10 @@ export class LessonsStore {
     if (fields.feature !== undefined) {
       updates.push("feature = ?");
       params.push(fields.feature);
+    }
+    if (fields.version !== undefined) {
+      updates.push("version = ?");
+      params.push(fields.version);
     }
     params.push(id);
     return this.db.prepare(`UPDATE lessons SET ${updates.join(", ")} WHERE id = ?`).run(...params).changes === 1;

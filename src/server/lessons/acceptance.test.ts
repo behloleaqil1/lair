@@ -10,6 +10,8 @@
  * - The list API filters by status and scope
  * - Signal matching finds lessons by their signal
  * - The Knowledge view (GET /api/lessons) returns the lessons with counts
+ * - Versioned built-ins: a new version updates content, preserves owner state
+ * - The propose route returns the created lesson's id directly
  */
 import { afterEach, describe, expect, it } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
@@ -37,12 +39,12 @@ afterEach(async () => {
   dir = null;
 });
 
-async function build() {
+async function build(clockTime = NOW) {
   dir = mkdtempSync(join(tmpdir(), "lair-lessons-"));
   const tokenPath = join(dir, "owner.token");
   const dbPath = join(dir, "lessons.db");
   const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
-  const clock = { t: NOW, now: (): number => clock.t };
+  const clock = { t: clockTime, now: (): number => clock.t };
   app = Fastify();
   registerRootGuards(app);
   await registerOwnerRoutes(app, auth);
@@ -54,7 +56,7 @@ async function build() {
   });
   await app.ready();
   const answerToken = readFileSync(tokenPath, "utf-8").trim();
-  return { app, module, clock, auth, answerToken };
+  return { app, module, clock, auth, answerToken, dbPath };
 }
 
 /** Sign in the way the Knowledge view does; returns headers with the owner session. */
@@ -100,14 +102,13 @@ describe("built-in lessons load on start", () => {
   });
 
   it("does not duplicate built-in lessons on restart", async () => {
-    const { module: m1 } = await build();
+    const { module: m1, dbPath } = await build();
     expect(m1.builtInLoaded).toBe(BUILTIN_LESSONS.length);
     await app?.close();
 
     // Build again with the same db
     app = Fastify();
     const tokenPath = join(dir!, "owner.token");
-    const dbPath = join(dir!, "lessons.db");
     const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
     registerRootGuards(app);
     await registerOwnerRoutes(app, auth);
@@ -118,9 +119,66 @@ describe("built-in lessons load on start", () => {
     });
     await app.ready();
 
-    // Should not load again
+    // Should not load again (all lessons at current version)
     expect(module.builtInLoaded).toBe(0);
     expect(module.store.counts().builtIn).toBe(BUILTIN_LESSONS.length);
+  });
+
+  it("updates built-in lesson content when version increases, preserving owner state", async () => {
+    const { module: m1, dbPath, answerToken, app: a1 } = await build();
+    const browser = await unlock(a1, answerToken);
+
+    // Retire L18 (this is the owner's state we want to preserve)
+    await post(a1, "/api/lessons/L18/retire", {}, browser);
+    const beforeRetire = await get(a1, "/api/lessons/L18", browser);
+    expect(beforeRetire.json().data.lesson.status).toBe("retired");
+    expect(beforeRetire.json().data.lesson.matchCount).toBe(0);
+
+    // Record a match to verify matchCount is preserved
+    await post(a1, "/api/lessons/L18/match", {}, browser);
+    const afterMatch = await get(a1, "/api/lessons/L18", browser);
+    expect(afterMatch.json().data.lesson.matchCount).toBe(1);
+
+    // The original L18 signal was a pattern; it changed to an event in version 2
+    const l18Before = m1.store.get("L18");
+    expect(l18Before?.signal.kind).toBe("event"); // Already updated in this version
+    expect(l18Before?.signal.value).toBe("commit.identity_unallowed");
+
+    await a1.close();
+
+    // Simulate a version upgrade by manually lowering the version
+    // and changing the content, then restarting
+    const { Database } = await import("better-sqlite3");
+    const db = new Database(dbPath);
+    db.prepare("UPDATE lessons SET version = 1, signal = ? WHERE id = 'L18'").run(
+      JSON.stringify({ kind: "pattern", value: "old_pattern" }),
+    );
+    db.close();
+
+    // Restart with same db
+    app = Fastify();
+    const tokenPath2 = join(dir!, "owner.token");
+    const auth2 = HumanAuth.open({ tokenPath: tokenPath2, dbPath: ":memory:" });
+    registerRootGuards(app);
+    await registerOwnerRoutes(app, auth2);
+    module = await mountLessons(app, {
+      dbPath,
+      humanAuth: auth2,
+      defaultProject: () => "example",
+    });
+    await app.ready();
+
+    // L18's content should be updated to version 2
+    expect(module.builtInLoaded).toBeGreaterThan(0);
+    const l18After = module.store.get("L18");
+    expect(l18After?.version).toBe(2);
+    expect(l18After?.signal.kind).toBe("event");
+    expect(l18After?.signal.value).toBe("commit.identity_unallowed");
+
+    // Owner state (status, matchCount, lastMatchAt) should be preserved
+    expect(l18After?.status).toBe("retired");
+    expect(l18After?.matchCount).toBe(1);
+    expect(l18After?.lastMatchAt).not.toBeNull();
   });
 });
 
@@ -154,6 +212,32 @@ describe("owner-only writes", () => {
     expect(created.title).toBe("Test lesson");
     expect(created.status).toBe("proposed");
     expect(created.scope).toBe("project");
+  });
+
+  it("returns the created lesson directly, not by list order", async () => {
+    // Use a clock that is EARLIER than the built-ins' creation time
+    // to ensure the propose route returns the right lesson
+    const EARLY_TIME = Date.parse("2026-10-29T00:00:00.000Z");
+    const { app, answerToken, clock } = await build(EARLY_TIME);
+    const browser = await unlock(app, answerToken);
+
+    // The clock is earlier than built-ins (which use Date.now() in loadBuiltinLessons)
+    // So if we did list({limit:1}), we'd get a built-in, not our proposal
+    const lesson = {
+      title: "Early proposal",
+      signal: { kind: "event", value: "early.proposal" },
+      cause: "Testing early clock",
+      response: "Check the id",
+      prevention: "None",
+    };
+    const res = await post(app, "/api/lessons", lesson, browser);
+    expect(res.statusCode).toBe(201);
+    const created = res.json().data.lesson as Lesson;
+    expect(created.title).toBe("Early proposal");
+    expect(created.signal.value).toBe("early.proposal");
+    expect(created.status).toBe("proposed");
+    // The id should be a UUID, not a built-in id
+    expect(created.id).not.toMatch(/^L\d+$/);
   });
 
   it("allows the owner to approve a proposed lesson", async () => {
@@ -353,6 +437,25 @@ describe("lesson detail view", () => {
     expect(Array.isArray(view.related)).toBe(true);
   });
 
+  it("returns related lessons with same signal", async () => {
+    const { app, answerToken, module: m } = await build();
+    const browser = await unlock(app, answerToken);
+
+    // L10 and L26 both have signal.kind = "check" and signal.value = "event_loop_lag"
+    const l10 = m.store.get("L10");
+    const l26 = m.store.get("L26");
+    expect(l10?.signal.kind).toBe("check");
+    expect(l10?.signal.value).toBe("event_loop_lag");
+    expect(l26?.signal.kind).toBe("check");
+    expect(l26?.signal.value).toBe("event_loop_lag");
+
+    // When viewing L10, L26 should be in related
+    const res = await get(app, "/api/lessons/L10", browser);
+    expect(res.statusCode).toBe(200);
+    const view = res.json().data as LessonDetailView;
+    expect(view.related.some((r) => r.id === "L26")).toBe(true);
+  });
+
   it("returns 404 for unknown lesson", async () => {
     const { app, answerToken } = await build();
     const browser = await unlock(app, answerToken);
@@ -387,5 +490,105 @@ describe("the Knowledge view counts", () => {
     expect(view.counts.retired).toBe(1);
     expect(view.counts.builtIn).toBe(BUILTIN_LESSONS.length);
     expect(view.counts.project).toBe(1);
+  });
+});
+
+describe("pattern signal validation", () => {
+  it("rejects invalid regex patterns", async () => {
+    const { app, answerToken } = await build();
+    const browser = await unlock(app, answerToken);
+
+    const res = await post(app, "/api/lessons", {
+      title: "Invalid pattern",
+      signal: { kind: "pattern", value: "[invalid(regex" },
+      cause: "Test",
+      response: "Test",
+      prevention: "Test",
+    }, browser);
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toContain("invalid regex pattern");
+  });
+
+  it("rejects patterns with nested quantifiers", async () => {
+    const { app, answerToken } = await build();
+    const browser = await unlock(app, answerToken);
+
+    const res = await post(app, "/api/lessons", {
+      title: "Nested quantifiers",
+      signal: { kind: "pattern", value: "(a+)+" },
+      cause: "Test",
+      response: "Test",
+      prevention: "Test",
+    }, browser);
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toContain("nested quantifiers");
+  });
+
+  it("rejects patterns that are too long", async () => {
+    const { app, answerToken } = await build();
+    const browser = await unlock(app, answerToken);
+
+    const longPattern = "a".repeat(201);
+    const res = await post(app, "/api/lessons", {
+      title: "Long pattern",
+      signal: { kind: "pattern", value: longPattern },
+      cause: "Test",
+      response: "Test",
+      prevention: "Test",
+    }, browser);
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toContain("200 characters");
+  });
+
+  it("accepts valid patterns", async () => {
+    const { app, answerToken } = await build();
+    const browser = await unlock(app, answerToken);
+
+    const res = await post(app, "/api/lessons", {
+      title: "Valid pattern",
+      signal: { kind: "pattern", value: "error|failed|timeout" },
+      cause: "Test",
+      response: "Test",
+      prevention: "Test",
+    }, browser);
+    expect(res.statusCode).toBe(201);
+  });
+});
+
+describe("all routes require owner session", () => {
+  it("refuses GET list without owner session (403)", async () => {
+    const { app } = await build();
+    const res = await get(app, "/api/lessons", DASHBOARD);
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("refuses GET detail without owner session (403)", async () => {
+    const { app } = await build();
+    const res = await get(app, "/api/lessons/L1", DASHBOARD);
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("refuses PATCH without owner session (403)", async () => {
+    const { app } = await build();
+    const res = await patch(app, "/api/lessons/L1", { status: "retired" }, DASHBOARD);
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("refuses approve without owner session (403)", async () => {
+    const { app } = await build();
+    const res = await post(app, "/api/lessons/L1/approve", {}, DASHBOARD);
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("refuses retire without owner session (403)", async () => {
+    const { app } = await build();
+    const res = await post(app, "/api/lessons/L1/retire", {}, DASHBOARD);
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("refuses match without owner session (403)", async () => {
+    const { app } = await build();
+    const res = await post(app, "/api/lessons/L1/match", {}, DASHBOARD);
+    expect(res.statusCode).toBe(403);
   });
 });

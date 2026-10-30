@@ -44,6 +44,13 @@ function refuse(reply: FastifyReply, statusCode: number, error: string) {
 
 const VALID_SIGNAL_KINDS = ["check", "event", "metric", "pattern"] as const;
 const VALID_STATUSES: LessonStatus[] = ["proposed", "active", "retired"];
+const MAX_PATTERN_LENGTH = 200;
+
+/** Check for nested quantifiers that can cause catastrophic backtracking */
+function hasNestedQuantifiers(pattern: string): boolean {
+  // Detect patterns like (a+)+, (a*)+, (a+)*, etc.
+  return /\([^)]*[+*][^)]*\)[+*]/.test(pattern) || /\([^)]*\)[+*][+*]/.test(pattern);
+}
 
 function validateSignal(signal: unknown): { ok: true; signal: LessonSignal } | { ok: false; error: string } {
   if (typeof signal !== "object" || signal === null) {
@@ -56,6 +63,25 @@ function validateSignal(signal: unknown): { ok: true; signal: LessonSignal } | {
   if (typeof s.value !== "string" || s.value.trim() === "") {
     return { ok: false, error: "signal.value must be a non-empty string" };
   }
+
+  // Pattern-specific validation
+  if (s.kind === "pattern") {
+    const value = s.value as string;
+    if (value.length > MAX_PATTERN_LENGTH) {
+      return { ok: false, error: `pattern signal value must be <= ${MAX_PATTERN_LENGTH} characters` };
+    }
+    // Validate regex syntax
+    try {
+      new RegExp(value);
+    } catch (e) {
+      return { ok: false, error: `invalid regex pattern: ${e instanceof Error ? e.message : String(e)}` };
+    }
+    // Reject nested quantifiers that can cause catastrophic backtracking
+    if (hasNestedQuantifiers(value)) {
+      return { ok: false, error: "pattern contains nested quantifiers that can cause slow matching" };
+    }
+  }
+
   const validated: LessonSignal = { kind: s.kind as LessonSignal["kind"], value: s.value.slice(0, 500) };
   if (s.kind === "metric") {
     if (s.threshold !== undefined) {
@@ -160,21 +186,31 @@ export async function registerLessonsRoutes(fastify: FastifyInstance, options: L
         return refuse(reply, 400, "prevention is required");
       }
 
-      // Check if a lesson with the same signal already exists
+      // Check if a lesson with the same signal already exists (active or proposed only)
       const existing = store.findBySignal(signalResult.signal.kind, signalResult.signal.value);
-      if (existing.length > 0) {
-        // Reuse the first matching lesson: increment its match count
-        const reused = existing[0];
-        store.recordMatch(reused.id, clock());
+      const reusable = existing.find((l) => l.status === "active" || l.status === "proposed");
+      if (reusable) {
+        // Reuse the matching lesson: increment its match count
+        store.recordMatch(reusable.id, clock());
         const response: ProposeLessonResponse = {
-          lesson: store.get(reused.id)!,
+          lesson: store.get(reusable.id)!,
           reused: true,
         };
         return reply.code(200).send(ok(response));
       }
 
+      // Validate feature if provided
+      if (body.feature !== undefined && body.feature !== null) {
+        if (typeof body.feature !== "string") {
+          return refuse(reply, 400, "feature must be a string or null");
+        }
+        if (body.feature.length > 100) {
+          return refuse(reply, 400, "feature must be <= 100 characters");
+        }
+      }
+
       const now = clock();
-      store.add(
+      const id = store.add(
         {
           title: body.title.trim(),
           signal: signalResult.signal,
@@ -189,10 +225,12 @@ export async function registerLessonsRoutes(fastify: FastifyInstance, options: L
         now,
       );
 
-      // Find the newly created lesson (last created with this title)
-      const lessons = store.list({ limit: 1 });
+      if (!id) {
+        return refuse(reply, 500, "Failed to create lesson");
+      }
+
       const response: ProposeLessonResponse = {
-        lesson: lessons.length > 0 ? store.get(lessons[0].id)! : store.get(body.title)!,
+        lesson: store.get(id)!,
         reused: false,
       };
       return reply.code(201).send(ok(response));
@@ -244,6 +282,12 @@ export async function registerLessonsRoutes(fastify: FastifyInstance, options: L
         updates.status = body.status;
       }
       if (body.feature !== undefined) {
+        if (body.feature !== null && typeof body.feature !== "string") {
+          return refuse(reply, 400, "feature must be a string or null");
+        }
+        if (typeof body.feature === "string" && body.feature.length > 100) {
+          return refuse(reply, 400, "feature must be <= 100 characters");
+        }
         updates.feature = body.feature;
       }
 

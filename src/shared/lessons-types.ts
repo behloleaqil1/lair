@@ -68,6 +68,8 @@ export interface Lesson {
   updatedAt: string;
   /** The feature or duty that makes this automatic (e.g., "D28", "#89") */
   feature: string | null;
+  /** Content version (increment when built-in lesson content changes) */
+  version: number;
 }
 
 /** What the list API returns: a lesson summary */

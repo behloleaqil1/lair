@@ -3,7 +3,9 @@
  * These are loaded once when the lessons module starts, if not already present.
  * Generic wording only (no project names, paths, or private details).
  *
- * From: work/briefs/lair-lessons-seed.md
+ * Versioned: each lesson has a version; on start, missing lessons are inserted
+ * and outdated content is updated (preserving owner state: status, match_count,
+ * last_match_at, sources).
  */
 import type { LessonSignal, LessonSource } from "../../shared/lessons-types.js";
 import type { LessonInput } from "./store.js";
@@ -16,12 +18,15 @@ interface BuiltInLesson {
   response: string;
   prevention: string;
   feature: string | null;
+  /** Increment when the lesson's content changes */
+  version: number;
 }
 
 const SEED_SOURCE: LessonSource = { kind: "manual", ref: "builtin-seed", at: "2026-10-30T00:00:00.000Z" };
 
 /**
  * The built-in lessons. Each has a stable id (L1, L2, ...) that never changes.
+ * Increment the version when updating a lesson's content.
  */
 export const BUILTIN_LESSONS: BuiltInLesson[] = [
   {
@@ -32,6 +37,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Cancel the job's own processes (by its working dir, never a shared process group) and re-place it on the fastest free machine",
     prevention: "A slow-gate check every minute, measured from the job's real start",
     feature: "D28",
+    version: 1,
   },
   {
     id: "L2",
@@ -41,6 +47,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Restart the machine and retry the job once",
     prevention: "A lease refreshed every minute while a job holds the machine; idle timeout >= the longest local phase",
     feature: "D12",
+    version: 1,
   },
   {
     id: "L3",
@@ -50,6 +57,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Start the daemon; hold the lanes that need it",
     prevention: "Host services with probe and start commands, checked after boot",
     feature: "D13",
+    version: 1,
   },
   {
     id: "L4",
@@ -59,6 +67,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Hold the gates; probe the engine; re-check after it answers; ONE notice per outage",
     prevention: "An environment failure class in triage",
     feature: "D14",
+    version: 1,
   },
   {
     id: "L5",
@@ -68,6 +77,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Stop the orphans by process group",
     prevention: "Adopt or stop previous runs before fill's first tick",
     feature: "D10",
+    version: 1,
   },
   {
     id: "L6",
@@ -77,6 +87,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Reopen under a new task id",
     prevention: "Close only on the exact task id; record unmatched reports",
     feature: "D4",
+    version: 1,
   },
   {
     id: "L7",
@@ -86,6 +97,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Replace it with 'your open line is your task'",
     prevention: "Warn when a built prompt names another task id",
     feature: "D6",
+    version: 1,
   },
   {
     id: "L8",
@@ -95,6 +107,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Move all agents to one launcher; raise caps",
     prevention: "Every idle agent gets an explanation; never idle without one",
     feature: "D1",
+    version: 1,
   },
   {
     id: "L9",
@@ -104,6 +117,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Hold only local-heavy work on load",
     prevention: "A per-agent capacity class (local or remote)",
     feature: "D11",
+    version: 1,
   },
   {
     id: "L10",
@@ -113,6 +127,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Rotate the file; close the polling tab",
     prevention: "Cache plus async IO; an event-loop-lag Health check; rotation of append-only files",
     feature: "#160",
+    version: 1,
   },
   {
     id: "L11",
@@ -122,6 +137,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Measure each gate's phases",
     prevention: "Run the whole gate remotely; report the phase breakdown per gate",
     feature: "D20",
+    version: 1,
   },
   {
     id: "L12",
@@ -131,6 +147,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Fix the pattern",
     prevention: "Routing tests per command kind",
     feature: "D23",
+    version: 1,
   },
   {
     id: "L13",
@@ -140,6 +157,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Retry with backoff; a credential cache; report 'pr-needed', not BLOCKED",
     prevention: "Check each agent's environment health (gh, git) before runs",
     feature: "D29",
+    version: 1,
   },
   {
     id: "L14",
@@ -149,6 +167,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Switch to observe; restore the lost lines",
     prevention: "One writer (a DB-backed work store) or a notice for every revert",
     feature: "#96",
+    version: 1,
   },
   {
     id: "L15",
@@ -158,6 +177,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Cancel the obsolete gate",
     prevention: "Review first; merge gates only after approval at the head",
     feature: "D30",
+    version: 1,
   },
   {
     id: "L16",
@@ -167,6 +187,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Run the affected scope at the head",
     prevention: "The merge gate's scope is derived from the changed modules",
     feature: "C9",
+    version: 1,
   },
   {
     id: "L17",
@@ -176,15 +197,17 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Request changes naming the missing item",
     prevention: "The reviewer checks the design's PR scope list (files + required tests) mechanically",
     feature: "D7",
+    version: 1,
   },
   {
     id: "L18",
     title: "Commits show a machine user instead of the owner",
-    signal: { kind: "pattern", value: "author.*machine|author.*dev" },
+    signal: { kind: "event", value: "commit.identity_unallowed" },
     cause: "No identity configured for agent runs; author name or email from the machine's default config",
     response: "Set the identity; squash-merge with the owner identity",
     prevention: "A per-run identity and a Health warning on an unallowed identity",
     feature: "D8",
+    version: 2,
   },
   {
     id: "L19",
@@ -194,6 +217,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Fix the monitor and replay the incident",
     prevention: "Every monitor is tested against a recorded incident",
     feature: "C8",
+    version: 1,
   },
   {
     id: "L20",
@@ -203,6 +227,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Use the job's start marker",
     prevention: "Time fields carry their meaning (queued, started, ended)",
     feature: "D28",
+    version: 1,
   },
   {
     id: "L21",
@@ -212,6 +237,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Run on the machine's native filesystem",
     prevention: "Machine setup checks the filesystem type of the run dir",
     feature: "C6",
+    version: 1,
   },
   {
     id: "L22",
@@ -221,6 +247,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Reject the older duplicate",
     prevention: "Dedupe before raising a decision",
     feature: "#97",
+    version: 1,
   },
   {
     id: "L23",
@@ -230,6 +257,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Verify from another context before acting",
     prevention: "Report verification against evidence",
     feature: "D5",
+    version: 1,
   },
   {
     id: "L24",
@@ -239,6 +267,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Kill by the job's working dir or pattern",
     prevention: "Each job in its own process group",
     feature: "D28",
+    version: 1,
   },
   {
     id: "L25",
@@ -248,6 +277,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Run heavy suites on cloud machines",
     prevention: "Routing prefers cloud for heavy suites",
     feature: "D12",
+    version: 1,
   },
   {
     id: "L26",
@@ -257,6 +287,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Lower the host load; the engine's CPU priority",
     prevention: "Async, bounded IO in every periodic tick; an event-loop-lag Health check; ticks degrade gracefully (skip, do not queue)",
     feature: "#160",
+    version: 1,
   },
   {
     id: "L27",
@@ -266,6 +297,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Check the process directly; stand the escalation down",
     prevention: "A timed-out probe is incomplete: it may prove a process present, never absent",
     feature: "#162",
+    version: 1,
   },
   {
     id: "L28",
@@ -275,6 +307,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     response: "Stop the later run by its process group",
     prevention: "Register manual runs with the orchestrator (claim the task) before starting them; adopt external runs",
     feature: "D10",
+    version: 1,
   },
 ];
 
@@ -293,20 +326,50 @@ export function toInput(lesson: BuiltInLesson): LessonInput {
     status: "active",
     scope: "built-in",
     feature: lesson.feature,
+    version: lesson.version,
   };
 }
 
+export interface BuiltinStoreInterface {
+  add: (input: LessonInput, now: number) => string | null;
+  get: (id: string) => { version?: number; status: string; matchCount: number; lastMatchAt: string | null; sources: unknown[] } | null;
+  update: (id: string, fields: Partial<LessonInput>, now: number) => boolean;
+}
+
 /**
- * Load all built-in lessons into the store if not already present.
- * Returns the number of lessons added.
+ * Load all built-in lessons into the store.
+ * - Missing lessons are inserted.
+ * - Existing lessons with a lower version have their content updated
+ *   (preserving status, matchCount, lastMatchAt, sources).
+ * Returns the number of lessons added or updated.
  */
-export function loadBuiltinLessons(store: { add: (input: LessonInput, now: number) => boolean; hasBuiltIn: () => boolean }): number {
-  // Skip if any built-in lessons already exist
-  if (store.hasBuiltIn()) return 0;
-  const now = Date.now();
-  let added = 0;
+export function loadBuiltinLessons(store: BuiltinStoreInterface, clock?: () => number): number {
+  const now = clock?.() ?? Date.now();
+  let changes = 0;
   for (const lesson of BUILTIN_LESSONS) {
-    if (store.add(toInput(lesson), now)) added++;
+    const existing = store.get(lesson.id);
+    if (!existing) {
+      // New lesson: insert it
+      if (store.add(toInput(lesson), now)) {
+        changes++;
+      }
+    } else if ((existing.version ?? 0) < lesson.version) {
+      // Existing lesson with older version: update content, preserve owner state
+      store.update(
+        lesson.id,
+        {
+          title: lesson.title,
+          signal: lesson.signal,
+          cause: lesson.cause,
+          response: lesson.response,
+          prevention: lesson.prevention,
+          feature: lesson.feature,
+          version: lesson.version,
+        },
+        now,
+      );
+      changes++;
+    }
   }
-  return added;
+  return changes;
 }

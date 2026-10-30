@@ -51,10 +51,10 @@ export async function mountLessons(fastify: FastifyInstance, options: MountLesso
   const clock = options.clock ?? Date.now;
   const store = new LessonsStore(options.dbPath);
 
-  // Load built-in lessons if not already present
-  const builtInLoaded = loadBuiltinLessons(store);
+  // Load built-in lessons (insert missing, update outdated content)
+  const builtInLoaded = loadBuiltinLessons(store, clock);
   if (builtInLoaded > 0) {
-    console.log(`[Lessons] Loaded ${builtInLoaded} built-in lessons`);
+    console.log(`[Lessons] Loaded or updated ${builtInLoaded} built-in lessons`);
   }
 
   const settings = options.settings ?? (() => defaultLessonsSettings());
