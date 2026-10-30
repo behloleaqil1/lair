@@ -2988,6 +2988,7 @@ export class AgentsService {
       lastCheck: null,
       lastError: null,
       lines: [],
+      unmatchedReports: [],
     };
   }
 
