@@ -72,7 +72,6 @@ export function parseGoTest(text: string, options: ParseOptions): ParseOutput {
   const testOutputs = new Map<string, string[]>(); // key: "package::test"
   const failures: { pkg: string; test: string; outputs: string[] }[] = [];
   let failedCount = 0;
-  let passedCount = 0;
 
   for (const line of lines) {
     const event = parseEvent(line);
@@ -108,7 +107,7 @@ export function parseGoTest(text: string, options: ParseOptions): ParseOutput {
         break;
 
       case "pass":
-        if (test) passedCount++;
+        // Track passed tests for future metrics
         break;
     }
   }

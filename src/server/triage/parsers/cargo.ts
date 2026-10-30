@@ -61,7 +61,6 @@ export function parseCargoTest(text: string, options: ParseOptions): ParseOutput
   const compilerErrors: string[] = [];
   let current: Section | null = null;
   let failedCount: number | undefined;
-  let inFailures = false;
 
   for (const line of lines) {
     // Track compiler errors (build failures)
@@ -89,14 +88,12 @@ export function parseCargoTest(text: string, options: ParseOptions): ParseOutput
 
     // Start of failures section
     if (/^failures:$/.test(line.trim())) {
-      inFailures = true;
       current = null;
       continue;
     }
 
     // End of failures section (test result line)
     if (/^test result:/.test(line)) {
-      inFailures = false;
       current = null;
     }
 
