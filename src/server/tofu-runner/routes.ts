@@ -4,8 +4,9 @@
  *
  *   GET  /api/tofu-runner/status?project=
  *   GET  /api/tofu-runner/plans?project=
+ *   GET  /api/tofu-runner/audit?project=&limit=
  *   POST /api/tofu-runner/plan?project=&root=&env=
- *   POST /api/tofu-runner/apply?project=&plan=&hash=
+ *   POST /api/tofu-runner/apply?project=&plan=&hash=&confirmDestroy=
  *
  * `root` must be one of the project's `infra_policy.roots` and `env` one of
  * `tofu_runner.environments`. A project without `tofu_runner.enabled` answers 404.
@@ -32,6 +33,7 @@ const Query = z.object({
   plan: z.string().min(1).max(64).optional(),
   hash: z.string().min(1).max(128).optional(),
   confirmDestroy: z.string().min(1).max(128).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
 });
 
 export async function registerTofuRunnerRoutes(
@@ -59,13 +61,21 @@ export async function registerTofuRunnerRoutes(
       return respond(await runner.plans());
     });
 
+    app.get("/api/tofu-runner/audit", async (request, reply) => {
+      const query = Query.safeParse(request.query ?? {});
+      if (!query.success) return fail(reply, 400, "Invalid query");
+      const runner = manager.get(query.data.project ?? defaultProject());
+      if (!runner) return fail(reply, 404, "tofu_runner is not enabled for this project");
+      return respond(await runner.audit(query.data.limit));
+    });
+
     app.post("/api/tofu-runner/plan", async (request, reply) => {
       const query = Query.safeParse(request.query ?? {});
       if (!query.success || !query.data.root || !query.data.env) return fail(reply, 400, "Invalid query");
       const runner = manager.get(query.data.project ?? defaultProject());
       if (!runner) return fail(reply, 404, "tofu_runner is not enabled for this project");
       try {
-        return respond(await runner.plan(query.data.root, query.data.env));
+        return respond(await runner.plan(query.data.root, query.data.env, auth.sessionOf(request)?.id ?? "unknown"));
       } catch (e) {
         if (e instanceof Error && e.message.startsWith("not a configured root")) return fail(reply, 400, "Unknown root");
         if (e instanceof Error && e.message.startsWith("not a configured environment")) return fail(reply, 400, "Unknown environment");
@@ -78,7 +88,7 @@ export async function registerTofuRunnerRoutes(
       if (!query.success || !query.data.plan || !query.data.hash) return fail(reply, 400, "Invalid query");
       const runner = manager.get(query.data.project ?? defaultProject());
       if (!runner) return fail(reply, 404, "tofu_runner is not enabled for this project");
-      return respond(await runner.apply(query.data.plan, query.data.hash, query.data.confirmDestroy));
+      return respond(await runner.apply(query.data.plan, query.data.hash, auth.sessionOf(request)?.id ?? "unknown", query.data.confirmDestroy));
     });
   });
 }

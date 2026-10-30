@@ -28,6 +28,8 @@ const Schema = z
     /** Absolute directory where plan files are kept (owner-only, outside any repository) */
     plan_dir: z.string().optional(),
     apply_timeout_seconds: z.number().int().min(60).max(APPLY_ROLE_SECONDS).default(1800),
+    /** A plan older than this can no longer be applied; plan again */
+    plan_max_age_seconds: z.number().int().min(60).max(7 * 24 * 3600).default(24 * 3600),
   })
   .strict();
 
@@ -40,6 +42,7 @@ export interface TofuRunnerSettings {
   environments: string[];
   planDir: string;
   applyTimeoutSeconds: number;
+  planMaxAgeSeconds: number;
 }
 
 export type ParseResult = { ok: true; settings: TofuRunnerSettings } | { ok: false; errors: string[] };
@@ -76,6 +79,7 @@ export function parseTofuRunnerConfig(raw: unknown): ParseResult {
       environments: v.environments,
       planDir: v.plan_dir ?? "",
       applyTimeoutSeconds: v.apply_timeout_seconds,
+      planMaxAgeSeconds: v.plan_max_age_seconds,
     },
   };
 }

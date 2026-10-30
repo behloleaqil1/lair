@@ -464,8 +464,9 @@ await registerPlanSandboxRoutes(fastify, planSandbox, () => getDefaultProject(),
 // with the separate apply role, always through the policy scan and the plan
 // sandbox. One per project with `tofu_runner.enabled: true` (off by default,
 // and `observe` mode does not apply).
-const tofuRunner = new TofuRunnerManager({ sandbox: planSandbox });
+const tofuRunner = new TofuRunnerManager({ sandbox: planSandbox, events: getEventBus() });
 tofuRunner.load(projectEntries);
+await tofuRunner.reconcile();
 await registerTofuRunnerRoutes(fastify, tofuRunner, () => getDefaultProject(), humanAuth);
 
 // AI tools (src/server/ai/): per machine, whether each tool is installed and

@@ -13,7 +13,7 @@ const VALID = {
 describe("tofu_runner config", () => {
   it("is off and in observe mode by default", () => {
     expect(parseTofuRunnerConfig(undefined)).toMatchObject({ ok: true, settings: { enabled: false, mode: "observe" } });
-    expect(parseTofuRunnerConfig(VALID)).toMatchObject({ ok: true, settings: { enabled: true, mode: "observe", applyTimeoutSeconds: 1800 } });
+    expect(parseTofuRunnerConfig(VALID)).toMatchObject({ ok: true, settings: { enabled: true, mode: "observe", applyTimeoutSeconds: 1800, planMaxAgeSeconds: 86400 } });
   });
 
   it.each([
@@ -31,6 +31,8 @@ describe("tofu_runner config", () => {
     ["an unknown mode", { mode: "auto" }, "mode"],
     ["an unknown key", { force: true }, "force"],
     ["an apply timeout over the role's hour", { apply_timeout_seconds: 7200 }, "apply_timeout_seconds"],
+    ["a plan age under a minute", { plan_max_age_seconds: 30 }, "plan_max_age_seconds"],
+    ["a plan age over a week", { plan_max_age_seconds: 8 * 24 * 3600 }, "plan_max_age_seconds"],
   ])("refuses %s", (_name, patch, text) => {
     const out = parseTofuRunnerConfig({ ...VALID, ...patch });
     expect(out.ok).toBe(false);

@@ -5,8 +5,10 @@
  */
 export { parseTofuRunnerConfig, APPLY_ROLE_SECONDS } from "./config.js";
 export type { TofuRunnerSettings } from "./config.js";
-export { BlockedTofuRunner, TofuRunner, TofuRunnerManager } from "./service.js";
+export { BlockedTofuRunner, destroyConfirmation, readPlanChanges, stateKey, TofuRunner, TofuRunnerManager } from "./service.js";
 export type { RunnerApplyOutcome, RunnerPlanOutcome, TofuRunnerDeps } from "./service.js";
+export { AuditLog } from "./audit.js";
+export type { AuditAction, AuditEntry } from "./audit.js";
 export { PlanStore, sha256 } from "./store.js";
 export type { PlanRecord, PlanStatus } from "./store.js";
 export { registerTofuRunnerRoutes } from "./routes.js";
