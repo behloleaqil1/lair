@@ -2413,7 +2413,7 @@ All routes require the owner's session from the dashboard (HTTP 403 otherwise):
 
 - `GET /api/lessons?project=&status=&scope=&limit=`: List lessons. `status` is `proposed`, `active`, or `retired`. `scope` is `built-in` or `project`. Returns the lessons list with counts.
 - `GET /api/lessons/:id`: Lesson detail with related lessons (same signal).
-- `POST /api/lessons`: Propose a new lesson. If a lesson with the same signal exists, increments its match count and returns the existing one (`reused: true`). Body: `{title, signal, cause, response, prevention, feature?}`.
+- `POST /api/lessons`: Propose a new lesson. If an active or proposed lesson with the same signal exists, increments its match count and returns the existing one (`reused: true`). Body: `{title, signal, cause, response, prevention, feature?}`.
 - `PATCH /api/lessons/:id`: Update a lesson. Built-in lessons can only have their status changed.
 - `POST /api/lessons/:id/approve`: Approve a proposed lesson (changes status to `active`).
 - `POST /api/lessons/:id/retire`: Retire a lesson (changes status to `retired`).
