@@ -35,6 +35,8 @@ export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/infra-policy",
   // The plan sandbox: a plan shows resource names and the cloud's answers (every route the owner's)
   "/api/plan-sandbox",
+  // The OpenTofu runner: plan answers name resources, and apply changes the cloud (every route the owner's)
+  "/api/tofu-runner",
   // Cloud machines: the status names the account's instances and spend, and the trip is cleared here (every route the owner's)
   "/api/cloud",
   // The supervisor: Lair's diagnostics, and the ops tokens and their audit (every route the owner's)
