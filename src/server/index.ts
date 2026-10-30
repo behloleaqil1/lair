@@ -13,6 +13,7 @@ import { DataService } from "./services/data.js";
 import { isValidDragonId } from "./parsers/dragon-config.js";
 import { registerRootGuards, requireValidIdParam } from "./root-guards.js";
 import { mountDecisions } from "./decisions/index.js";
+import { mountLessons, parseLessonsConfig, defaultLessonsSettings } from "./lessons/index.js";
 import { loadNotificationConfig, mountNotifications } from "./notifications/index.js";
 import { notificationsOn } from "./notifications/config.js";
 import {
@@ -393,6 +394,28 @@ await registerSchedulerRoutes(fastify, humanAuth);
 
 // Register M3 fleet management routes (every change: owner only)
 await registerFleetRoutes(fastify, humanAuth);
+
+// Lessons: what Lair has learned from incidents and operational experience
+// (docs/design/autonomy.md §8). Built-in lessons (L1-L28) ship with Lair;
+// project lessons are proposed by incidents and approved by the owner.
+const lessons = await mountLessons(fastify, {
+  dbPath: join(process.cwd(), "data", "lessons.db"),
+  humanAuth,
+  defaultProject: () => getDefaultProject(),
+  settings: (project) => {
+    try {
+      const config = loadProjectConfig(project);
+      const parsed = parseLessonsConfig(config.lessons);
+      return parsed.ok ? parsed.settings : defaultLessonsSettings();
+    } catch {
+      return defaultLessonsSettings();
+    }
+  },
+  projectsDir: join(process.cwd(), "projects"),
+});
+if (lessons.builtInLoaded > 0) {
+  console.log(`Loaded ${lessons.builtInLoaded} built-in lessons`);
+}
 
 const projectEntries = listProjects().map((name) => {
   try {
