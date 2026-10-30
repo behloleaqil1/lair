@@ -320,7 +320,7 @@ Recommendation: A. The boundary is an **async `WorkStore` repository interface**
 `appendEvent`, `listByState`, `readyByPriority`, `timeline`, `dependents`, `byExternalRef`, ...). The first
 implementation is `SqliteWorkStore` (its methods return resolved promises; transactions are internal to one
 method). A `PostgresWorkStore` is a second implementation of the same interface. Cost: every caller `await`s, which
-the HTTP routes and the planner already do. A transition that spans repository calls (4.5, 7.4) is expressed as one
+the HTTP routes and the planner already do. A transition that spans repository calls (4.4, 7.4) is expressed as one
 repository method, never as a caller holding a transaction.
 
 ### 3.3 Schema
@@ -467,34 +467,46 @@ Agents access tasks through the bus tools, extended:
 // New bus tool: get my task and brief
 task(): {
   task: Task;
-  brief: string;      // The brief content at run start
-  inbox: Message[];   // Unread messages for this agent
-}
+  brief: string;        // The brief content at run start
+  unreadMessages: number; // Count only: task() does NOT mark messages read
+}                         // (inbox() stays the call that reads them and marks them read)
 
-// Modified bus tool: report is bound to the run's task
-report(kind: ReportKind, summary: string, opts?: {
+// Unchanged signature: report stays as agents and bus 2a's consumers call it today
+report(kind: ReportKind, task: string, summary: string, opts?: {
   gateId?: string;
   pr?: number;
   sha?: string;
-}): void;  // Cannot report for another task
+}): void;  // `task` is optional-and-verified: if given and not the run's task, the same refusal and message
 
 // New bus tool: read checks for the task
 check(what: 'gate' | 'review' | 'merge'): CheckResult;
 ```
 
+`report` keeps the `task` argument so no agent or consumer changes. The server refuses a mismatch exactly as
+`BusService.report` does now, with the same message.
+
 HTTP routes for curl access (no node needed):
 
 ```
-GET  /api/work/task?run_id=<id>      # Same as task() tool
+GET  /api/work/task                   # Same as task() tool
 POST /api/work/report                 # Same as report() tool
-GET  /api/work/check?run_id=<id>&what=gate
+GET  /api/work/check?what=gate
 ```
 
-These routes require the run's bus token, issued by the agents module at run start.
+These routes require the run's bus token, issued by the agents module at run start. **Agent, run and task are derived
+from the token binding only.** There is no `run_id` parameter, and a `run_id` or `actor` in a query or body is
+ignored (and logged once as a notice-worthy mismatch if it differs from the binding). Every event the route writes
+records that derived actor, which is the audit trail.
 
 ### 4.2 Owner access
 
-Owner routes require an owner session (`src/server/human-auth/`):
+Owner routes require an owner session (`src/server/human-auth/`). Owner-only is a **route property**, not a store
+check: `/api/work` is added to `OWNER_ONLY_PREFIXES`, reads that expose paths or other projects' data use
+`requireOwner()`, and writes use `requireOwnerForChanges()`. Both run before the body is parsed. The route layer
+builds the actor from the authenticated session (`{ kind: 'owner', id: session.subject }`) and passes it to the
+store as a trusted argument; the store has no way to read an actor from a request body. The agent routes in 4.1
+are the single exception to the prefix: they authenticate by bus token and are mounted under `/api/work/agent/`
+(`/api/work/agent/task`, `/report`, `/check`), outside the owner-only prefix by design.
 
 ```
 GET    /api/work/tasks?project=<p>&state=<s>&limit=<n>
@@ -507,7 +519,7 @@ GET    /api/work/tasks/:id/events
 GET    /api/work/tasks/:id/brief
 POST   /api/work/tasks/:id/brief      # New brief version
 GET    /api/work/export?project=<p>&format=json|md
-POST   /api/work/import               # Import from files
+POST   /api/work/import               # Import from the configured files (6.4); body: { dry_run }
 ```
 
 ### 4.3 Planner access
@@ -524,9 +536,28 @@ interface WorkStoreProducer {
 ```
 
 Proposals (`add`, `finish`, `reassign`, `reword`, `drop`, `unblock`) become calls to this interface, checked by
-planner's own validation first.
+planner's own validation first. The planner agent itself has no write path except this producer interface.
 
-### 4.4 Module subscriptions
+**What replaces the file-based planner parts in `db` mode** (planner.md, `planner/tasks-file.ts`):
+
+| Today (files) | In `db` mode |
+|---|---|
+| Done-marking from queue lines | A `done` fact comes from `report` events through bus 2a, not from reading queue text |
+| `drop_plan_done` | The planner proposes `drop` for tasks whose plan source is complete; applied through `dropTask` |
+| External edits recorded with a diff, known-content hash | Edits made by hand are owner edits through the API (events with the owner actor); the hash exists only in `mirror` mode (6.2) |
+| `mark_done: lair_runs` | A task is `done` when a `merged` fact arrives from review/merge, or by owner edit |
+| "The agent can't edit the tasks file" | The planner agent has no route to the store; only `WorkStoreProducer` is callable, from the planner module |
+
+Each module has its own producer, named in the `transitions` config (2.2): `WorkStoreProducer` (planner),
+`ReviewProducer` (review/merge: `markInReview`, `markMerged`), and the agents module's claim events (1.5). The
+`fill` role never writes a state; it asks the agents module to claim.
+
+### 4.4 Transitions that span stores
+
+A transition with a side effect is one repository method with a fixed write order; 7.4 gives the order and the
+recovery for each.
+
+### 4.5 Module subscriptions
 
 Other modules subscribe to task events:
 
@@ -549,7 +580,7 @@ eventBus.on('work.task.state_changed', ({ task, from, to }) => {
 
 ### 5.1 Work board
 
-A Kanban board with columns per state, live-updated via SSE:
+A Kanban board with columns per state, live-updated through the live module (5.3):
 
 ```
 ┌─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐
@@ -580,8 +611,9 @@ A detail view with everything about a task:
 
 ### 5.3 Live updates
 
-The bus PR 2b pattern: SSE pushes task events to the browser. The board and detail view subscribe to
-`work.task.*` events for their project.
+The `live` module (live UI, PR 2b) is the transport: it replaces main's SSE feed (`/api/bus/events`) with topics,
+coalescing (one update per row per 250 ms) and an 8 KB cap. The work store publishes on a `work` topic keyed by
+project; the board and detail view subscribe to it. No SSE route is added for the work store.
 
 ## 6. Files as adapters
 
