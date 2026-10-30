@@ -2297,6 +2297,51 @@ Events on the bus: `cleanup.removed`, `cleanup.cycle`, `cleanup.safety_violation
 
 The Health tab shows "Would free N GB (M entries)" in observe mode, and "Last cleanup: freed N GB (M entries)" in act mode, with links to the removals list.
 
+## Infrastructure policy scan
+
+Before any `plan` runs on infrastructure code, a static scan reads the code and refuses what it must not run ([design](design/deploy-aws.md#21-policy-scan-before-plan)). The scan reads files only: it never runs OpenTofu, a provider or a program. It is off unless you turn it on.
+
+```yaml
+infra_policy:
+  enabled: true                       # default false
+  roots:                              # absolute paths of the directories the scan reads
+    - /srv/infra/staging
+  allowed_providers:                  # provider sources that may be used
+    - hashicorp/aws
+  allowed_modules:                    # remote module sources: an exact source, or a prefix ending in /
+    - terraform-aws-modules/vpc/aws
+    - git::https://example.com/org/
+  allow:                              # denied blocks you accept: root, address and the block's content hash
+    - root: /srv/infra/staging
+      address: data.http.health
+      hash: 3b1c0f5a9d2e4c7b8a6f1e0d9c8b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b
+```
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `enabled` | boolean | `false` | Turn the scan on for this project |
+| `roots` | list of absolute paths | `[]` | Directories of infrastructure code; required when enabled |
+| `allowed_providers` | list | `[]` | Provider sources, `namespace/type` or `host/namespace/type`; `hashicorp/aws` and `registry.opentofu.org/hashicorp/aws` are the same provider. Every provider the code declares or implies (from a resource, data or provider block, or a `provider` meta-argument) must be listed |
+| `allowed_modules` | list | `[]` | Remote module sources. An exact source, or a prefix ending in `/` that names a host and at least one path segment (`git::https://example.com/org/`). A bare scheme, a host (`https://github.com/`) or `/` is a config error, and a source with a `..` segment never matches. Local modules (`./` or `../`) need no entry: they are scanned like the root, and must stay inside it |
+| `allow` | list | `[]` | Denied blocks to accept. Each entry has `root` (one of `roots`), `address` (`data.http.health`; a block in a local module is `module.<name>.` plus its address) and `hash`, the content hash the scan reports for that block. Editing the block (a changed `url` or `command`) changes its hash and ends the allowance: the scan then refuses it and marks it `changedSinceAllowed`. The same address in another root is not allowed |
+
+Refused, unless allowed: `external` and `http` data sources (also inside a `check` block), any provisioner (`local-exec`, `remote-exec`, `file`, others) on any resource or in a `removed` block, a provider not in `allowed_providers`, a remote module not in `allowed_modules`, a local module outside its root, a `source` that is not a plain string, a block of a type the scan does not know or with the wrong number of labels (`unknown-block`), and code the scan cannot read: `.tf`, `.tofu`, `.tf.json` and `.tofu.json` files, at most 1 MiB each, 8 MiB and 500 files in total, 8 module levels, and a 10 second deadline; a string escape it does not decode (it decodes `\n`, `\r`, `\t`, `\"`, `\\`, `\uNNNN`, `\UNNNNNNNN`) is unreadable too. An allowed use is not refused but is listed as `allowed`.
+
+An invalid block (unknown keys, relative roots, `enabled` without roots, a bad `allowed_*` entry or `allow` entry) never turns the scan off: unless the block says `enabled: false`, the project is **blocked**, every `guardPlan` refuses with `invalid-config`, and `GET /api/infra-policy/status` shows the errors. Lair reads this block at startup.
+
+The rule names are what an agent sees of a refusal (`policy violation: denied-external-data`); the file, line, address and hash are for you. Rules: `denied-external-data`, `denied-http-data`, `denied-local-exec`, `denied-remote-exec`, `denied-file-provisioner`, `denied-provisioner`, `provider-not-allowed`, `module-not-allowed`, `module-outside-root`, `source-not-literal`, `unknown-block`, `invalid-config`, `unreadable`. The scan does not read remote modules: allow only sources you have pinned and reviewed. Checking the lock file's hashes belongs to the plan sandbox, not this scan.
+
+### Infrastructure policy API
+
+Both routes are the owner's (signed in on the dashboard), reads included, and get no CORS.
+
+| Route | Meaning |
+|-------|---------|
+| `GET /api/infra-policy/status?project=` | Whether the scan is on or blocked (with the errors), the roots, and the last scan of each |
+| `GET /api/infra-policy/scan?project=&root=` | Scan a configured root (all roots without `root=`); 404 when the scan is off, 409 when the project is blocked, 400 for a root that is not configured |
+
+The routes read files and run nothing. Server code that plans asks `InfraPolicyManager.requires(project)` and, when true, plans only through `get(project).guardPlan`, which does not start the plan when the scan fails (or when the config is blocked).
+
 ## Planner
 
 > Off by default. With `enabled: true`, Lair keeps [fill](#fill)'s tasks file itself: it marks tasks done, drops the ones the plan marks done, and runs a supervised planner agent when something happens, whose proposals it checks before anything changes ([design](design/planner.md)). A project then needs no free-running orchestrator agent that edits the tasks file.

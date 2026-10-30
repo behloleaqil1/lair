@@ -65,6 +65,12 @@ export interface ProjectConfig {
    */
   delivery?: Record<string, unknown>;
   /**
+   * Static policy scan of infrastructure code before any plan
+   * (src/server/infra-policy/). Validated by parseInfraPolicyConfig; see
+   * docs/configuration.md#infrastructure-policy-scan
+   */
+  infra_policy?: Record<string, unknown>;
+  /**
    * Gate pipelines and where they run (src/server/gates/). Validated by
    * parsePipelineConfig; see docs/configuration.md#gate-pipelines
    */
