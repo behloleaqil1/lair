@@ -103,7 +103,7 @@ describe("an invalid infra_policy block never turns the scan off", () => {
     ["a typo key", { enabled: true, allowed_provider: ["hashicorp/aws"] }],
     ["a typo in enabled", { enable: true }],
     ["a relative root", { enabled: true, roots: ["infra"] }],
-    ["enabled without roots", { enabled: true }],
+    ["enabled without roots", { enabled: true, roots: [] }],
     ["a bad allow entry", { enabled: true, allow: ["data.http.health"] }],
   ])("%s: every plan is refused and never started", async (_name, block) => {
     const path = root(AWS + `resource "aws_s3_bucket" "logs" {\n  bucket = "logs"\n}\n`);
