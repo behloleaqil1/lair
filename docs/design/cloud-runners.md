@@ -4,8 +4,9 @@ Goal: when the developer's machines are busy or too small, Lair runs gates on a 
 stops as soon as the work is done, and it never spends past the limit the human set. Everything is generic: a provider
 interface with AWS EC2 first, any project, any gate system. This extends [runners.md](runners.md) (executor order,
 budgets, one result format), the placement module (machines, lanes, slots) and [node.md](node.md) (running work on
-another host). Status: planned. A reference implementation outside Lair (shell scripts beside a project's own gate
-queue) proved the design in October 2026; this document is what Lair builds so no project needs those scripts.
+another host). Status: step 1 built (provider, meter and guard, §11); the rest planned. A reference implementation
+outside Lair (shell scripts beside a project's own gate queue) proved the design in October 2026; this document is what
+Lair builds so no project needs those scripts.
 
 ## 0. Principles
 1. **Off unless working.** The machine starts when a job needs it and stops when no job is queued or running. It also
@@ -157,8 +158,27 @@ cloud:
 - Logs and reports that come back are treated as untrusted data, as with every executor.
 
 ## 11. Build order (one PR each, reviewed before the next)
-1. **Provider + guard:** the provider interface, the AWS EC2 provider, the meter and the money guard; read-only state,
-   spend and guard in the API and the Machines view.
+1. **Provider + guard (built):** the provider interface, the AWS EC2 provider, the meter and the money guard; read-only
+   state, spend and guard in the API and the Machines view. Configuration: `cloud.enabled` (off by default),
+   `cloud.machines.<id>` with `provider: aws-ec2`, `region`, `profile`, `instance.id`, `instance.tag`, `price_per_hour`,
+   `storage_per_month`, and `cloud.budget` with `limit`, `period`, `meter_start`, `spend_check_hours`, `warn_percent`.
+   As built:
+   - the provider (`src/server/cloud/provider.ts`) has `describe`, `start`, `stop` and `spend`; `waitRunning` and
+     `quota` come with step 2, `resize` later, and `price` is `price_per_hour` from the configuration;
+   - credentials come only from the named profile in the AWS config files (`fromIni`), never from the YAML, the
+     server's environment or an instance role; a credential-shaped key or value in `cloud:` is a config error;
+   - an instance is found by its id and its tag together, so a wrong id never reaches an untagged instance;
+   - the provider's reading is Cost Explorer's unblended cost with credits and refunds left out, for the whole account,
+     cached for `spend_check_hours` in `data/cloud.db` across restarts; `DataUnavailableException` is "unknown";
+   - the meter records each launch the provider describes; a stop it does not date ends at the check that saw it
+     stopped, and an open run ends at the next launch at the latest;
+   - the guard refuses (fails closed) when a machine could not be described in the check, a cost reading failed, or the
+     day is outside the period; a trip is stored per limit and period, so only a new limit or period (a human's change
+     to the YAML or Settings, applied by live reload) clears it; `cloud.guard_tripped` is emitted once;
+   - `startMachine` runs the check on fresh readings before the provider's start, one at a time with checks and
+     stops; nothing calls it yet (step 2 does), and there are no write routes: `GET /api/cloud/status` is read-only.
+
+   See docs/configuration.md Cloud machines.
 2. **Lifecycle:** start on demand, idle stop with retries, the self power-off install, quota and spend Decisions.
 3. **Phase A execution:** the `cloud` executor for pipelines (bare repository push, per-job folders, remote build and
    test steps, results back, infrastructure retry).

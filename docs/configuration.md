@@ -2272,6 +2272,98 @@ With this configuration a job waiting in `heavy` goes to `aws` when it would fin
 
 Events on the bus: `placement.moved`, `placement.would_move`, `placement.move_failed`, `placement.machine_up`, `placement.machine_down`, `placement.job_held`, `placement.machine_stopped_under_job` (`{project, machine, gateId, lane, state}`).
 
+## Cloud machines
+
+> Off by default. With `enabled: true`, Lair describes each cloud machine's instance through its provider, meters what it costs, reads the account's cost, and keeps a money guard that every start goes through. It does not start or stop a machine by itself yet: starting on demand and stopping when idle come next ([cloud runners](design/cloud-runners.md) §11 step 2), through this guard.
+
+```yaml
+cloud:
+  enabled: true
+  check_seconds: 300
+  machines:
+    cloud-1:
+      provider: aws-ec2
+      region: us-east-1
+      profile: lair-gates            # a named profile in your AWS config files; never keys here
+      instance:
+        id: i-0123456789abcdef0
+        tag: { key: role, value: gate-server }
+      price_per_hour: 0.35           # rounded up: the meter counts every run at this price
+      storage_per_month: 6
+  budget:
+    limit: 100                       # US dollars; give the provider's own budget the same limit
+    period: { start: 2027-01-01, end: 2027-12-31 }
+    meter_start: 1
+```
+
+### Cloud options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Watch this project's cloud machines and run the guard. On, it needs at least one machine and a `budget` |
+| `check_seconds` | number | `300` | Seconds between checks (60 to 3600): each machine is described, and the guard runs |
+| `request_timeout_seconds` | number | `30` | Every provider call is cut off after this (5 to 120) |
+| `machines` | map | `{}` | Machine id → machine options (below). An id that is also a machine under `machines:` or `placement.machines` is shown as one machine |
+| `budget` | object | — | The money guard's limit (below) |
+
+Machine options:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `provider` | `aws-ec2` | — | The provider (AWS EC2 for now) |
+| `region` | string | — | The instance's region, such as `us-east-1` |
+| `profile` | string | — | A named profile in your AWS config files: the only source of credentials (see below) |
+| `instance.id` | string | — | The EC2 instance id |
+| `instance.tag` | `{key, value}` | — | A tag the instance must carry. Lair describes, starts and stops only an instance with this id and this tag: one without it is "not found" |
+| `price_per_hour` | number | — | The hourly price, rounded up. The meter counts each run at the higher of the price when Lair recorded it and the current one |
+| `storage_per_month` | number | `0` | The machine's disk per month, counted for every month of the period begun so far |
+
+Budget options:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `limit` | number | — | No start at or above this spend, in US dollars |
+| `period.start`, `period.end` | `YYYY-MM-DD` | — | The days the limit covers, both included (UTC). Outside them no start happens. For promotional credits, cover the credits' validity |
+| `meter_start` | number | `0` | Spend before the meter's first run |
+| `spend_check_hours` | number | `6` | How old the provider's cost reading may get before it is read again (1 to 168): each reading may cost money, and provider data lags anyway |
+| `warn_percent` | number | `80` | From this share of the limit on, the guard says `warning` (a start is still allowed) |
+
+### Credentials
+
+Credentials never go in the project's YAML. A machine names a `profile`, and Lair reads that profile alone from the AWS shared config and credentials files (`~/.aws/config` and `~/.aws/credentials`, or the files `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE` name), SSO, role and `credential_process` profiles included. Keys in the server's environment or an instance role are not used in its place. A key named like a credential anywhere under `cloud:` (`access_key`, `secret`, `session_token`, `password`, `credential`), or a value shaped like an AWS access key id, makes the block invalid; the error names the place, never the value.
+
+The profile needs `ec2:DescribeInstances`, `ec2:StartInstances` and `ec2:StopInstances` (the last two limited to instances with the tag), and `ce:GetCostAndUsage`. For example:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "ec2:DescribeInstances", "Resource": "*" },
+    {
+      "Effect": "Allow",
+      "Action": ["ec2:StartInstances", "ec2:StopInstances"],
+      "Resource": "arn:aws:ec2:*:*:instance/*",
+      "Condition": { "StringEquals": { "aws:ResourceTag/role": "gate-server" } }
+    },
+    { "Effect": "Allow", "Action": "ce:GetCostAndUsage", "Resource": "*" }
+  ]
+}
+```
+
+### The meter and the money guard
+
+- **Spend** is the larger of two readings. The provider's: the account's unblended cost with credits and refunds left out, from `period.start` to today, read at most every `spend_check_hours` and kept in `data/cloud.db`, so a restart does not read it again. Lair's meter: every run of every machine (the launch and stop times the provider reports) at `price_per_hour`, rounded up to whole minutes, plus `storage_per_month` for every month of the period begun so far, plus `meter_start`. A run whose stop the provider does not date counts up to the check that saw it stopped; a run still open when the machine launches again ends at that launch at the latest. A run that started and stopped while Lair was not running is not seen (the provider reports only the last one): the provider's reading covers it.
+- **At the limit** (spend at or above `limit`) the guard trips: no start, the trip is recorded once with its spend and reason, and `cloud.guard_tripped` is emitted. Later readings do not clear it, nor does a restart. Only a human does, with a higher `budget.limit` or a new `period` (in the YAML or in Settings, applied by the live reload); the guard then checks again. Raise the provider's budget together.
+- **It fails closed.** A machine Lair could not describe in this check, a cost reading that failed, or a day outside the period refuses a start too (`refused`, not a trip: starts are allowed again once the readings come back). A new account has no cost data for up to a day: that reading is "no data yet", and the meter decides alone.
+- **Every start** runs the guard first on fresh readings: each machine is described again, and the cost is read if its reading is due. Checks and starts run one at a time. A stop is never refused.
+- **Shown.** The Machines section lists each cloud machine with its power state (`running`, `stopped`, `pending`, `stopping`, or `unknown` with the reason), shows the spend and the guard in its header (`Cloud spend $12.40 of $100.00 (12.4%) · guard ok`), and in a machine's detail its instance and tag, last launch and stop, price, the meter's parts (compute, storage, starting amount, today), each account's reading and any trip.
+
+### Cloud API
+
+`GET /api/cloud/status?project=` (read-only): config errors, the last check, each machine's provider, region, instance and tag, power state, last launch and stop, last check and error, and the budget: limit, period, spend and its share of the limit, the meter's parts, each account's cost reading (`amount`, `unknown`, `error`, `not_read`), and the guard (`ok`, `warning`, `tripped`, `refused`) with its reason and trip. There are no write routes: the machines and the budget are changed in the project's YAML or in Settings.
+
+Events on the bus: `cloud.guard_tripped` (`{project, limit, spend, reason}`).
+
 ## Cleanup
 
 > Off by default. With `enabled: true`, Lair removes stale worktrees and old entries from watched folders. In `observe` mode (the default) it logs what it would remove; in `act` mode it removes.
@@ -2630,7 +2722,7 @@ The **Settings** view edits every key on this page, for the owner only (reads in
 - **Nothing invalid is written.** A change is checked first by the same parsers startup and [live reload](#live-config-reload) use; a refused change leaves the file untouched. A saved change is applied by live reload at once.
 - **Only the changed lines change.** A form save edits the file's own text where it can: a changed value, a key removed from or added to a map (a new entry among one-line `{ ... }` entries is written like them). Every other line stays byte for byte: padded flow maps, comments aligned with several spaces, multi-line flow maps, list indentation. A change that can't be made that way (a list that grows or shrinks, a new nested block) writes the file from its parsed form instead: comments and key order still stay, and flow maps keep their padding when the file pads them. YAML anchors are kept too: changing an anchored value (`&name`) from the form changes every alias of it (`*name`), and changing an alias replaces only that alias with the new value (a key inside an alias is edited in the YAML tab).
 - **No silent overwrite.** A save names the version of the file it started from. If the file changed since (a hand edit, another browser), it is refused (HTTP 409) with what saving would now change, and the review drawer offers to review the same changes again on top of the current file.
-- **Commands are confirmed.** A change that adds or changes something Lair runs (any `*_cmd` key, adapters' `start_cmd` and `stop_cmd`, watchdog `actions`, triage `commands`, placement's `probe`, `load_cmd` and `move_cmd`, a step's `run`, a process's `command`, `gate_script`...) shows the exact argv lists and needs your confirmation; the server refuses it without (HTTP 428). So does a change to a field that decides what Lair runs or where it sends code and tokens: a machine's `host`, `user` and `key`, an environment's `compose_files`, `project_directory` and `deploy.repo`, `executors.github.checkout_action`, `review.api_url` and `review.merge.clone_url`.
+- **Commands are confirmed.** A change that adds or changes something Lair runs (any `*_cmd` key, adapters' `start_cmd` and `stop_cmd`, watchdog `actions`, triage `commands`, placement's `probe`, `load_cmd` and `move_cmd`, a step's `run`, a process's `command`, `gate_script`...) shows the exact argv lists and needs your confirmation; the server refuses it without (HTTP 428). So does a change to a field that decides what Lair runs or where it sends code and tokens: a machine's `host`, `user` and `key`, an environment's `compose_files`, `project_directory` and `deploy.repo`, `executors.github.checkout_action`, `review.api_url` and `review.merge.clone_url`, and a cloud machine's `profile` and `instance` and the cloud budget's `limit` and `period` (which account and instance Lair acts on, and how much it may spend).
 - **No secrets.** A value whose key names a secret (`token`, `password`, `api_key`, `private_key`...) or that looks like one (a private key, a known token format, a URL with a password) is refused. Keep secrets in a file under `data/` (mode 0600) or an environment variable and name it in the config (`token_env`, `*_file`); the view shows whether the ones Lair knows are set, never their values. Comments are scanned too, for values shaped like a secret (a comment has no key to go by), and no error message ever quotes a secret.
 - **History.** Every accepted version is kept in `data/config-history/<project>/` (the newest 50) with when and which owner session (its public id) made it; a version Settings finds on disk that it didn't write, such as a hand edit, is kept too before it is replaced. If that version holds something that is or looks like a secret, only a note of it (when, its hash) is kept, never its text, so it can't be restored. Each shows its diff, and **Restore** saves it again through the same checks.
 - **Files.** Writes are atomic (a temporary file, `fsync`, `rename`). A project file that is a symlink, a `projects/local/` that is one, or anything but a regular file is refused. A save is at most 1 MiB, like the file.
