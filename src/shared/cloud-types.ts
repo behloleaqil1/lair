@@ -36,7 +36,10 @@ export interface CloudMachineStatus {
 /** The provider's cost reading for one account (one profile) */
 export interface CloudProviderSpend {
   profile: string;
-  /** amount: a reading; unknown: the provider has no data yet; error: the read failed; not_read: none yet */
+  /**
+   * amount: a reading; unknown: the provider has no data yet (a new account, two days at most); error: the read
+   * failed, or "no data" stood too long; not_read: none yet
+   */
   state: "amount" | "unknown" | "error" | "not_read";
   amount: number | null;
   detail: string | null;

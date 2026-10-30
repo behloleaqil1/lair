@@ -53,8 +53,13 @@ export interface MachineDescription {
   stoppedAt: number | null;
 }
 
-/** Cost before credits and refunds since the period start, or unknown (no data yet) */
-export type SpendReading = { kind: "amount"; amount: number } | { kind: "unknown"; reason: string };
+/**
+ * Cost before credits and refunds since the period start, or unknown: the
+ * provider has no data yet (`empty: false`), or answered with no cost at all
+ * for the period (`empty: true`). The service decides how long either may
+ * stand.
+ */
+export type SpendReading = { kind: "amount"; amount: number } | { kind: "unknown"; reason: string; empty: boolean };
 
 export interface CloudProvider {
   describe(machine: CloudMachineSettings): Promise<MachineDescription>;
@@ -199,7 +204,9 @@ export class AwsEc2Provider implements CloudProvider {
   /**
    * Unblended cost with credits and refunds left out (the cost before them),
    * summed over the period's months up to today. A new account has no Cost
-   * Explorer data for up to a day: that is "unknown", not an error.
+   * Explorer data for up to a day: that is "unknown", not an error, and so
+   * is an answer with no cost in it (`empty`); the service decides how long
+   * either may stand.
    */
   async spend(period: { start: string; end: string }, now: number): Promise<SpendReading> {
     // End is exclusive: tomorrow, or the day after the period's last day
@@ -234,12 +241,16 @@ export class AwsEc2Provider implements CloudProvider {
       } while (token && pages < MAX_COST_PAGES);
     } catch (e) {
       if ((e as { name?: unknown } | null)?.name === "DataUnavailableException") {
-        return { kind: "unknown", reason: "the provider has no cost data yet (a new account has none for up to a day)" };
+        return {
+          kind: "unknown",
+          reason: "the provider has no cost data yet (a new account has none for up to a day)",
+          empty: false,
+        };
       }
       throw e;
     }
     if (token) throw new Error(`more than ${MAX_COST_PAGES} pages of cost data`);
-    if (!read) return { kind: "unknown", reason: "the provider returned no cost for the period" };
+    if (!read) return { kind: "unknown", reason: "the provider returned no cost for the period", empty: true };
     return { kind: "amount", amount: total };
   }
 }

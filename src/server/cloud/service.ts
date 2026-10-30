@@ -32,7 +32,7 @@ import { parseCloudConfig, type CloudBudgetSettings, type CloudMachineSettings, 
 import { dollars, evaluateGuard, type GuardVerdict, type StoredTrip } from "./guard.js";
 import { meterSpend } from "./meter.js";
 import { AwsEc2Provider, providerText, sdkClients, type AwsClients, type CloudProvider, type PowerState } from "./provider.js";
-import { CloudStore, type StoredSpend } from "./store.js";
+import { CloudStore, type SpendReadingRecord, type StoredSpend } from "./store.js";
 
 /** A request the module refuses, with the HTTP status the route answers */
 export class CloudError extends Error {
@@ -50,6 +50,9 @@ const HOUR_MS = 3_600_000;
  * behind: the meter would count runs short, so the spend can't be told.
  */
 const CLOCK_AHEAD_MS = 60_000;
+const DAY_MS = 24 * HOUR_MS;
+/** How long a new account's provider may have no cost data (AWS: a day at most) before it counts as a failed reading */
+const NO_DATA_GRACE_MS = 2 * DAY_MS;
 
 export interface ProjectEntry {
   name: string;
@@ -119,6 +122,29 @@ export function tripView(trip: StoredTrip): CloudTrip {
 
 function publicSpend(reading: StoredSpend): CloudProviderSpend {
   return { profile: reading.profile, state: reading.state, amount: reading.amount, detail: reading.detail, readAt: reading.readAt };
+}
+
+/**
+ * A reading as the guard takes it. "Unknown" (no cost data yet, or an answer
+ * with no cost in it) leaves the meter to decide only for a new account:
+ * within NO_DATA_GRACE_MS of the account's first reading, before any amount
+ * was ever read, and, for an answer with no cost in it, while the meter has
+ * counted nothing. Otherwise a wrong filter, a changed answer or another
+ * payer account would quietly remove the provider's reading: it counts as a
+ * failed reading, and the guard refuses.
+ */
+function judged(reading: StoredSpend, now: number, meter: CloudMeterSpend | null): CloudProviderSpend {
+  const shown = publicSpend(reading);
+  if (reading.state !== "unknown") return shown;
+  let problem: string | null = null;
+  if (reading.amountAtMs !== null) {
+    problem = `the provider gave an amount on ${iso(reading.amountAtMs)} and none now`;
+  } else if (reading.firstReadAtMs !== null && now - reading.firstReadAtMs >= NO_DATA_GRACE_MS) {
+    problem = `the provider has given no cost since the first reading on ${iso(reading.firstReadAtMs)}, ${NO_DATA_GRACE_MS / DAY_MS} days or more`;
+  } else if (reading.empty && meter !== null && meter.compute + meter.storage > 0) {
+    problem = `the provider gave no cost for the period, but the meter counted ${dollars(meter.compute + meter.storage)}`;
+  }
+  return problem === null ? shown : { ...shown, state: "error", detail: `${problem} (${reading.detail ?? "no detail"})` };
 }
 
 export class CloudMachines {
@@ -304,11 +330,12 @@ export class CloudMachines {
         }
       }),
     );
-    const provider = await this.readSpend(now);
+    const readings = await this.readSpend(now);
     const meter =
       failures.length > 0
         ? null
         : meterSpend({ runs: this.store.runs(this.project, budget.startMs, budget.endMs), machines: this.settings.machines, budget, now });
+    const provider = readings.map((r) => judged(r, now, meter));
     const meterError = failures.length > 0 ? `describe failed for ${failures.join("; ")}` : null;
     const input = { budget, now, meter: meter?.total ?? null, meterError, provider };
     let verdict = evaluateGuard({ ...input, trip: this.store.trip(this.project) });
@@ -330,14 +357,24 @@ export class CloudMachines {
   }
 
   /** Each account's cost reading: the stored one while fresh, else a new read */
-  private async readSpend(now: number): Promise<CloudProviderSpend[]> {
+  private async readSpend(now: number): Promise<StoredSpend[]> {
     const budget = this.budget;
     const profiles = [...new Set(this.settings.machines.map((m) => m.profile))];
     return Promise.all(
-      profiles.map(async (profile): Promise<CloudProviderSpend> => {
+      profiles.map(async (profile): Promise<StoredSpend> => {
         if (now < budget.startMs || now >= budget.endMs) {
           // The guard refuses outside the period anyway: no paid read
-          return { profile, state: "not_read", amount: null, detail: "outside the budget period", readAt: null };
+          return {
+            profile,
+            state: "not_read",
+            amount: null,
+            detail: "outside the budget period",
+            readAt: null,
+            readAtMs: null,
+            empty: false,
+            firstReadAtMs: null,
+            amountAtMs: null,
+          };
         }
         const stored = this.store.spend(this.project, profile, budget);
         if (
@@ -347,11 +384,10 @@ export class CloudMachines {
           stored.readAtMs <= now &&
           now - stored.readAtMs < budget.spendCheckHours * HOUR_MS
         ) {
-          return publicSpend(stored);
+          return stored;
         }
         const machine = this.settings.machines.find((m) => m.profile === profile) as CloudMachineSettings;
-        const at = { readAt: iso(now), readAtMs: now };
-        let reading: StoredSpend;
+        let reading: SpendReadingRecord;
         try {
           const read = await withTimeout(
             this.provider(machine).spend({ start: budget.periodStart, end: budget.periodEnd }, now),
@@ -360,13 +396,12 @@ export class CloudMachines {
           );
           reading =
             read.kind === "amount"
-              ? { profile, state: "amount", amount: read.amount, detail: null, ...at }
-              : { profile, state: "unknown", amount: null, detail: read.reason, ...at };
+              ? { profile, state: "amount", amount: read.amount, detail: null, readAtMs: now, empty: false }
+              : { profile, state: "unknown", amount: null, detail: read.reason, readAtMs: now, empty: read.empty };
         } catch (e) {
-          reading = { profile, state: "error", amount: null, detail: message(e), ...at };
+          reading = { profile, state: "error", amount: null, detail: message(e), readAtMs: now, empty: false };
         }
-        this.store.saveSpend(this.project, budget, reading);
-        return publicSpend(reading);
+        return this.store.saveSpend(this.project, budget, reading);
       }),
     );
   }

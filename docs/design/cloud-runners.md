@@ -172,7 +172,10 @@ cloud:
      server's environment or an instance role; a credential-shaped key or value in `cloud:` is a config error;
    - an instance is found by its id and its tag together, so a wrong id never reaches an untagged instance;
    - the provider's reading is Cost Explorer's unblended cost with credits and refunds left out, for the whole account,
-     cached for `spend_check_hours` in `data/cloud.db` across restarts; `DataUnavailableException` is "unknown";
+     cached for `spend_check_hours` (24 at most) in `data/cloud.db` across restarts; `DataUnavailableException`, or an
+     answer with no cost in it, is "unknown", which leaves the meter to decide only for a new account (two days from
+     its first reading, before any amount, and for an answer with no cost only while nothing is metered), then counts
+     as a failed reading (§12 "no data yet" bounded);
    - the meter records each launch the provider describes; a stop it does not date ends at the check that saw it
      stopped, and an open run ends at the next launch at the latest;
    - the guard refuses (fails closed) when a machine could not be described in the check, a cost reading failed, or the

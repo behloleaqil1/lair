@@ -32,6 +32,10 @@ const PROJECT = "shop";
 const INSTANCE = "i-0123456789abcdef0";
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
+/** A run across the 2027 budget's first midnight: 2 h of it in the period, and its launch before it */
+const EVE_LAUNCH = Date.UTC(2026, 11, 31, 22, 0, 0);
+const EVE_STOP = Date.UTC(2027, 0, 1, 2, 0, 0);
 /** 10 March 2027, 12:00 UTC: the third month of a 2027 budget */
 const NOW = Date.UTC(2027, 2, 10, 12, 0, 0);
 /** A same-origin request from the dashboard */
@@ -56,8 +60,8 @@ class FakeAws {
   sent: Sent[] = [];
   profiles: string[] = [];
   describeError: Error | null = null;
-  /** The cost of the period before credits and refunds, or an error to throw */
-  cost: string | Error = "0";
+  /** The cost of the period before credits and refunds, an error to throw, or null: an answer with no cost in it */
+  cost: string | Error | null = "0";
 
   readonly clients = (profile: string, _timeoutMs: number): AwsClients => {
     this.profiles.push(profile);
@@ -115,8 +119,14 @@ class FakeAws {
     if (!(command instanceof GetCostAndUsageCommand)) throw new Error("unexpected Cost Explorer command");
     this.sent.push({ name: "GetCostAndUsage", input: command.input });
     if (this.cost instanceof Error) throw this.cost;
+    if (this.cost === null) return { ResultsByTime: [{ Total: {}, Estimated: true }] };
     return { ResultsByTime: [{ Total: { UnblendedCost: { Amount: this.cost, Unit: "USD" } }, Estimated: true }] };
   }
+}
+
+/** Cost Explorer's answer for an account with no data yet */
+function noData(): Error {
+  return Object.assign(new Error("Data is not available"), { name: "DataUnavailableException" });
 }
 
 function stopReason(ms: number): string {
@@ -403,21 +413,70 @@ describe("cloud: the money guard", () => {
   });
 
   it("a provider with no data yet leaves the meter to decide; a meter at the limit refuses even when the provider says less", async () => {
+    // Storage $18 + 2 h at $0.50 in the period = $19
     const h = new Harness(cloudBlock({ limit: 25 }));
-    h.instance("stopped", NOW - 4 * HOUR, NOW - 2 * HOUR);
-    h.aws.cost = Object.assign(new Error("Data is not available"), { name: "DataUnavailableException" });
+    h.instance("stopped", EVE_LAUNCH, EVE_STOP);
+    h.aws.cost = noData();
     const started = await h.machines.startMachine("cloud-1");
     expect(started.allowed).toBe(true);
     expect(h.status().budget?.provider[0]).toMatchObject({ state: "unknown", amount: null });
     expect(h.aws.named("StartInstances")).toHaveLength(1);
 
     const low = new Harness(cloudBlock({ limit: 19 }));
-    low.instance("stopped", NOW - 4 * HOUR, NOW - 2 * HOUR);
+    low.instance("stopped", EVE_LAUNCH, EVE_STOP);
     low.aws.cost = "1";
     const refused = await low.machines.startMachine("cloud-1");
     expect(refused.allowed).toBe(false);
     expect(refused.reason).toContain("meter $19.00");
     expect(low.aws.named("StartInstances")).toHaveLength(0);
+  });
+
+  it("no cost data is the meter's to decide only for a new account: two days at most, never after an amount, never empty with spend metered", async () => {
+    const h = new Harness(cloudBlock({ limit: 25 }));
+    h.instance("stopped", EVE_LAUNCH, EVE_STOP);
+    h.aws.cost = noData();
+    expect(await h.machines.check()).toMatchObject({ state: "ok", allowed: true });
+    // Read again every 6 hours: just under two days after the first reading, still the meter's to decide
+    h.now = NOW + 2 * DAY - 1;
+    expect(await h.machines.check()).toMatchObject({ allowed: true });
+    expect(h.aws.named("GetCostAndUsage").length).toBeGreaterThan(1);
+    // Two days: a failed reading, and no start
+    h.now = NOW + 2 * DAY;
+    const late = await h.machines.startMachine("cloud-1");
+    expect(late).toMatchObject({ allowed: false });
+    expect(late.reason).toBe(
+      "spend unknown: the cost reading for profile gates failed: the provider has given no cost since the first reading on " +
+        "2027-03-10T12:00:00.000Z, 2 days or more (the provider has no cost data yet (a new account has none for up to a day))",
+    );
+    expect(h.status().budget?.provider[0]).toMatchObject({ state: "error" });
+
+    // After an amount was read, no data again is a failed reading at once
+    const had = new Harness(cloudBlock({ limit: 25 }));
+    had.instance("stopped", EVE_LAUNCH, EVE_STOP);
+    had.aws.cost = "5";
+    expect(await had.machines.check()).toMatchObject({ allowed: true });
+    had.aws.cost = noData();
+    had.now = NOW + 6 * HOUR;
+    const after = await had.machines.startMachine("cloud-1");
+    expect(after).toMatchObject({ allowed: false });
+    expect(after.reason).toMatch(/^spend unknown: the cost reading for profile gates failed: the provider gave an amount on 2027-03-10T12:00:00.000Z and none now/);
+
+    // An answer with no cost in it while the meter counted storage or runs: a failed reading
+    const empty = new Harness(cloudBlock({ limit: 25 }));
+    empty.instance("stopped", EVE_LAUNCH, EVE_STOP);
+    empty.aws.cost = null;
+    const refused = await empty.machines.startMachine("cloud-1");
+    expect(refused).toMatchObject({ allowed: false });
+    expect(refused.reason).toMatch(/failed: the provider gave no cost for the period, but the meter counted \$19\.00 \(the provider returned no cost/);
+    // With nothing metered (no storage, no run in the period) it is "no data yet"
+    const bare = cloudBlock({ limit: 25 });
+    (bare.machines as Record<string, Record<string, unknown>>)["cloud-1"].storage_per_month = 0;
+    const quiet = new Harness(bare);
+    quiet.instance("stopped", Date.UTC(2026, 11, 1), Date.UTC(2026, 11, 2));
+    quiet.aws.cost = null;
+    expect(await quiet.machines.startMachine("cloud-1")).toMatchObject({ allowed: true });
+    expect(quiet.status().budget?.provider[0]).toMatchObject({ state: "unknown" });
+    for (const x of [h, had, empty]) expect(x.aws.named("StartInstances"), "no start").toHaveLength(0);
   });
 
   it("fails closed: a spend it can't tell, an untagged instance or a day outside the period means no start", async () => {

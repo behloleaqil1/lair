@@ -38,7 +38,12 @@ const SCHEMA = `
     state TEXT NOT NULL,
     amount REAL,
     detail TEXT,
+    -- An "unknown" reading whose answer held no cost at all (not "no data yet")
+    empty INTEGER NOT NULL DEFAULT 0,
     read_at INTEGER NOT NULL,
+    -- Kept across readings and periods: the first reading ever, and the last one with an amount
+    first_read_at INTEGER NOT NULL,
+    amount_at INTEGER,
     PRIMARY KEY (project, profile)
   );
 
@@ -77,10 +82,41 @@ interface SpendRow {
   state: string;
   amount: number | null;
   detail: string | null;
+  empty: number;
   read_at: number;
+  first_read_at: number;
+  amount_at: number | null;
 }
 
-export type StoredSpend = CloudProviderSpend & { readAtMs: number | null };
+/** A cost reading as read: what it says, and when */
+export type SpendReadingRecord = Omit<CloudProviderSpend, "readAt"> & {
+  readAtMs: number;
+  /** An "unknown" whose answer held no cost at all */
+  empty: boolean;
+};
+
+/** A cost reading as stored, with the account's history: its first reading ever and its last amount */
+export type StoredSpend = CloudProviderSpend & {
+  readAtMs: number | null;
+  empty: boolean;
+  firstReadAtMs: number | null;
+  amountAtMs: number | null;
+};
+
+function toSpend(row: SpendRow): StoredSpend {
+  const state = row.state === "amount" || row.state === "unknown" || row.state === "error" ? row.state : "error";
+  return {
+    profile: row.profile,
+    state,
+    amount: row.amount,
+    detail: row.detail,
+    readAt: new Date(row.read_at).toISOString(),
+    readAtMs: row.read_at,
+    empty: row.empty === 1,
+    firstReadAtMs: row.first_read_at,
+    amountAtMs: row.amount_at,
+  };
+}
 
 export class CloudStore {
   private db: Database.Database;
@@ -189,36 +225,44 @@ export class CloudStore {
       .prepare(`SELECT * FROM cloud_spend WHERE project = ? AND profile = ?`)
       .get(project, profile) as SpendRow | undefined;
     if (!row || row.period_start !== budget.periodStart || row.period_end !== budget.periodEnd) return null;
-    const state = row.state === "amount" || row.state === "unknown" || row.state === "error" ? row.state : "error";
-    return {
-      profile: row.profile,
-      state,
-      amount: row.amount,
-      detail: row.detail,
-      readAt: new Date(row.read_at).toISOString(),
-      readAtMs: row.read_at,
-    };
+    return toSpend(row);
   }
 
-  saveSpend(project: string, budget: CloudBudgetSettings, reading: StoredSpend): void {
-    this.db
-      .prepare(
-        `INSERT INTO cloud_spend (project, profile, period_start, period_end, state, amount, detail, read_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (project, profile) DO UPDATE SET
-           period_start = excluded.period_start, period_end = excluded.period_end, state = excluded.state,
-           amount = excluded.amount, detail = excluded.detail, read_at = excluded.read_at`,
-      )
-      .run(
-        project,
-        reading.profile,
-        budget.periodStart,
-        budget.periodEnd,
-        reading.state,
-        reading.amount,
-        reading.detail,
-        reading.readAtMs ?? 0,
-      );
+  /**
+   * Keep a new reading, and answer it as stored: with the account's first
+   * reading ever and its last amount, which outlive readings and periods.
+   */
+  saveSpend(project: string, budget: CloudBudgetSettings, reading: SpendReadingRecord): StoredSpend {
+    return this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO cloud_spend
+             (project, profile, period_start, period_end, state, amount, detail, empty, read_at, first_read_at, amount_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (project, profile) DO UPDATE SET
+             period_start = excluded.period_start, period_end = excluded.period_end, state = excluded.state,
+             amount = excluded.amount, detail = excluded.detail, empty = excluded.empty, read_at = excluded.read_at,
+             first_read_at = MIN(cloud_spend.first_read_at, excluded.first_read_at),
+             amount_at = COALESCE(excluded.amount_at, cloud_spend.amount_at)`,
+        )
+        .run(
+          project,
+          reading.profile,
+          budget.periodStart,
+          budget.periodEnd,
+          reading.state,
+          reading.amount,
+          reading.detail,
+          reading.empty ? 1 : 0,
+          reading.readAtMs,
+          reading.readAtMs,
+          reading.state === "amount" ? reading.readAtMs : null,
+        );
+      const row = this.db
+        .prepare(`SELECT * FROM cloud_spend WHERE project = ? AND profile = ?`)
+        .get(project, reading.profile) as SpendRow;
+      return toSpend(row);
+    })();
   }
 
   // ============ TRIPS ============
