@@ -11,6 +11,12 @@ import { brainBench, readBoundedFile, EXIT_OK, EXIT_USAGE, type BenchCliDeps } f
 import type { FetchLike } from "../server/brain-bench/models.js";
 import type { BenchReport } from "../server/brain-bench/types.js";
 
+interface CallBody {
+  messages: { content: string }[];
+  format: { properties: { option: { enum: string[] } } };
+  response_format?: unknown;
+}
+
 const WAIT = [
   { id: "wait", label: "Wait for the cooldown" },
   { id: "switch", label: "Switch profile" },
@@ -35,7 +41,7 @@ describe("lair brain-bench", () => {
   let dir: string;
   let out: string[];
   let err: string[];
-  let calls: { url: string; body: Record<string, unknown>; headers: Record<string, string> }[];
+  let calls: { url: string; body: CallBody; headers: Record<string, string> }[];
   let clock: number;
 
   beforeEach(() => {
