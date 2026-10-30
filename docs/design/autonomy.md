@@ -117,7 +117,13 @@ Built ([configuration](../configuration.md#triage)):
   it still counts on the default branch. The quarantine ends at the deadline, after 5 passes in a row, or when the owner
   releases it;
 - the bisect per pipeline, with revert by policy. A suspect that is not proven is reverted only on the owner's explicit
-  decision.
+  decision;
+- **environment outage detection** (`triage.environment`): when EVERY failed step matches an environment pattern
+  (Docker daemon unreachable, disk full, DNS/network unreachable, SSH refused) and NO step shows a test/lint/compile
+  failure, triage waits for the environment to recover before re-checking. It polls a probe command (e.g. `docker info`)
+  with backoff; while waiting, it shows one notice and raises NO decision; after the probe passes, it triggers re-checks
+  for all waiting gates (which don't count against `max_per_result`); if the probe never passes, it raises ONE decision
+  for all affected gates.
 
 Trust:
 - results come in-process from the gate pipelines (`gate.completed`), or signed by a node in `triage.trusted_nodes`;

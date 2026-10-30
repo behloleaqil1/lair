@@ -216,6 +216,34 @@ const SCHEMA = `
     created_ms INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_tr_outbox ON triage_outbox(project, created_ms);
+
+  -- Environment waits: gates waiting for the environment to recover
+  CREATE TABLE IF NOT EXISTS triage_env_waits (
+    id TEXT PRIMARY KEY,
+    project TEXT NOT NULL,
+    pattern_id TEXT NOT NULL,
+    probe TEXT NOT NULL,
+    probe_timeout_seconds INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    last_probe_at TEXT,
+    last_probe_result TEXT,
+    probe_pass_count INTEGER NOT NULL DEFAULT 0,
+    next_probe_at TEXT NOT NULL,
+    current_backoff_seconds INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    resolved_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_tr_env_waits_status ON triage_env_waits(project, status);
+
+  -- Gates associated with an environment wait
+  CREATE TABLE IF NOT EXISTS triage_env_wait_gates (
+    wait_id TEXT NOT NULL REFERENCES triage_env_waits(id),
+    gate_id TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    PRIMARY KEY (wait_id, gate_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_tr_env_wait_gates ON triage_env_wait_gates(wait_id);
 `;
 
 interface RecordRow {
@@ -1156,6 +1184,133 @@ export class TriageStore {
   removeOutbox(id: string): boolean {
     return this.db.prepare(`DELETE FROM triage_outbox WHERE id = ?`).run(id).changes > 0;
   }
+
+  // ============ ENVIRONMENT WAITS ============
+
+  /** Create a new environment wait or add gates to an existing one with the same pattern. */
+  addEnvironmentWait(
+    project: string,
+    patternId: string,
+    probe: string[],
+    probeTimeoutSeconds: number,
+    gateIds: string[],
+    recordIds: string[],
+    startedAt: string,
+    expiresAt: string,
+    nextProbeAt: string,
+    initialBackoffSeconds: number,
+  ): string {
+    // Check for existing wait with same pattern that's still waiting
+    const existing = this.db
+      .prepare(`SELECT id FROM triage_env_waits WHERE project = ? AND pattern_id = ? AND status = 'waiting'`)
+      .get(project, patternId) as { id: string } | undefined;
+
+    let waitId: string;
+    if (existing) {
+      waitId = existing.id;
+    } else {
+      waitId = randomUUID();
+      this.db
+        .prepare(
+          `INSERT INTO triage_env_waits (id, project, pattern_id, probe, probe_timeout_seconds, started_at, expires_at, next_probe_at, current_backoff_seconds, status, probe_pass_count)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting', 0)`,
+        )
+        .run(waitId, project, patternId, JSON.stringify(probe), probeTimeoutSeconds, startedAt, expiresAt, nextProbeAt, initialBackoffSeconds);
+    }
+
+    // Add gates to the wait
+    const insert = this.db.prepare(`INSERT OR IGNORE INTO triage_env_wait_gates (wait_id, gate_id, record_id) VALUES (?, ?, ?)`);
+    for (let i = 0; i < gateIds.length; i++) {
+      insert.run(waitId, gateIds[i], recordIds[i]);
+    }
+
+    return waitId;
+  }
+
+  /** Get all active environment waits for a project. */
+  activeEnvironmentWaits(project: string): EnvironmentWaitRow[] {
+    return this.db
+      .prepare(`SELECT * FROM triage_env_waits WHERE project = ? AND status = 'waiting' ORDER BY started_at`)
+      .all(project) as EnvironmentWaitRow[];
+  }
+
+  /** Get an environment wait by id. */
+  getEnvironmentWait(id: string): EnvironmentWaitRow | null {
+    return (this.db.prepare(`SELECT * FROM triage_env_waits WHERE id = ?`).get(id) as EnvironmentWaitRow) ?? null;
+  }
+
+  /** Get gates associated with an environment wait. */
+  getEnvironmentWaitGates(waitId: string): { gateId: string; recordId: string }[] {
+    return this.db.prepare(`SELECT gate_id, record_id FROM triage_env_wait_gates WHERE wait_id = ?`).all(waitId) as {
+      gateId: string;
+      recordId: string;
+    }[];
+  }
+
+  /** Update environment wait after a probe attempt. */
+  updateEnvironmentWaitProbe(
+    id: string,
+    lastProbeAt: string,
+    lastProbeResult: { ok: boolean; output: string },
+    probePassCount: number,
+    nextProbeAt: string,
+    currentBackoffSeconds: number,
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE triage_env_waits SET last_probe_at = ?, last_probe_result = ?, probe_pass_count = ?, next_probe_at = ?, current_backoff_seconds = ? WHERE id = ?`,
+      )
+      .run(lastProbeAt, JSON.stringify(lastProbeResult), probePassCount, nextProbeAt, currentBackoffSeconds, id);
+  }
+
+  /** Mark an environment wait as resolved or expired. */
+  resolveEnvironmentWait(id: string, status: "resolved" | "expired" | "cancelled", resolvedAt: string): void {
+    this.db.prepare(`UPDATE triage_env_waits SET status = ?, resolved_at = ? WHERE id = ?`).run(status, resolvedAt, id);
+  }
+
+  /** Get environment waits that are ready for their next probe attempt. */
+  environmentWaitsReadyForProbe(project: string, now: string): EnvironmentWaitRow[] {
+    return this.db
+      .prepare(`SELECT * FROM triage_env_waits WHERE project = ? AND status = 'waiting' AND next_probe_at <= ?`)
+      .all(project, now) as EnvironmentWaitRow[];
+  }
+
+  /** Get environment waits that have expired. */
+  expiredEnvironmentWaits(project: string, now: string): EnvironmentWaitRow[] {
+    return this.db
+      .prepare(`SELECT * FROM triage_env_waits WHERE project = ? AND status = 'waiting' AND expires_at <= ?`)
+      .all(project, now) as EnvironmentWaitRow[];
+  }
+
+  /** Count total gates waiting for environment across all waits. */
+  countEnvironmentWaitGates(project: string): number {
+    const result = this.db
+      .prepare(
+        `SELECT COUNT(*) as count FROM triage_env_wait_gates g
+         JOIN triage_env_waits w ON g.wait_id = w.id
+         WHERE w.project = ? AND w.status = 'waiting'`,
+      )
+      .get(project) as { count: number };
+    return result.count;
+  }
+}
+
+/** Row type for environment waits */
+export interface EnvironmentWaitRow {
+  id: string;
+  project: string;
+  pattern_id: string;
+  probe: string;
+  probe_timeout_seconds: number;
+  started_at: string;
+  expires_at: string;
+  last_probe_at: string | null;
+  last_probe_result: string | null;
+  probe_pass_count: number;
+  next_probe_at: string;
+  current_backoff_seconds: number;
+  status: string;
+  resolved_at: string | null;
 }
 
 function toAction(row: ActionRow): TriageAction {

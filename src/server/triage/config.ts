@@ -6,6 +6,13 @@ import { z } from "zod";
 import type { ProjectConfig } from "../../shared/types.js";
 import { GATE_RECHECK_KEYS, parseGateRecheck, type GateRecheckSettings } from "./gate-recheck-config.js";
 import { DEFAULT_INFRA_SIGNATURES, DEFAULT_TIMEOUT_SIGNATURES, type CompiledSignature, type SignatureDef } from "./signatures.js";
+import {
+  compileEnvironmentPatterns,
+  DEFAULT_ENVIRONMENT_PATTERNS,
+  type CompiledEnvironmentPattern,
+  type EnvironmentPattern,
+  type EnvironmentSettings,
+} from "./environment.js";
 
 export const INFRA_KINDS = ["network", "container", "oom", "runner", "disk", "load"] as const;
 export type InfraKind = (typeof INFRA_KINDS)[number];
@@ -200,6 +207,36 @@ export const TriageSchema = z
       })
       .strict()
       .default({}),
+    environment: z
+      .object({
+        /** off: disabled, observe: record what would happen, act: wait and re-check */
+        mode: z.enum(["off", "observe", "act"]).default("observe"),
+        /** Environment outage patterns; defaults are used unless default_patterns: false */
+        patterns: z
+          .array(
+            z
+              .object({
+                id: z.string().regex(SAFE_ID, "pattern ids use letters, digits, '.', '_' and '-'"),
+                pattern: z.string().min(1),
+                /** Probe command to check if the condition is resolved */
+                probe: argv.optional(),
+                /** Timeout for the probe command in seconds */
+                probe_timeout_seconds: z.number().int().min(1).max(300).default(30),
+              })
+              .strict(),
+          )
+          .default([]),
+        /** Whether to use default environment patterns */
+        default_patterns: z.boolean().default(true),
+        /** Maximum time to wait for the environment to recover */
+        max_wait_minutes: z.number().int().min(1).max(1440).default(120),
+        /** Initial backoff before first probe retry */
+        initial_backoff_seconds: z.number().int().min(5).max(300).default(30),
+        /** Maximum backoff between probe retries */
+        max_backoff_seconds: z.number().int().min(10).max(600).default(300),
+      })
+      .strict()
+      .default({}),
     commands: z.object(commandsShape).strict().default({}),
     /** Where decisions go when no raise_decision command is set (default: inbox_file) */
     decision_file: z.string().min(1).optional(),
@@ -254,6 +291,7 @@ export interface TriageSettings {
     protectedMerges: string[];
     protectedTrailer: string;
   };
+  environment: EnvironmentSettings;
   commands: Partial<Record<CommandId, string[]>>;
   decisionFile?: string;
 }
@@ -357,6 +395,15 @@ export function parseTriageConfig(raw: unknown): TriageParseResult {
     nodeIds.add(node.id);
   }
 
+  // Environment patterns
+  const envPatterns: EnvironmentPattern[] = value.environment.patterns.map((p) => ({
+    id: p.id,
+    pattern: p.pattern,
+    probe: p.probe,
+    probeTimeoutSeconds: p.probe_timeout_seconds,
+  }));
+  const environmentPatterns = compileEnvironmentPatterns(envPatterns, value.environment.default_patterns, errors);
+
   if (errors.length > 0) return { ok: false, errors };
 
   return {
@@ -403,6 +450,13 @@ export function parseTriageConfig(raw: unknown): TriageParseResult {
         maxCandidates: value.bisect.max_candidates,
         protectedMerges: value.bisect.protected_merges.map((s) => s.toLowerCase()),
         protectedTrailer: value.bisect.protected_trailer,
+      },
+      environment: {
+        mode: value.environment.mode,
+        patterns: environmentPatterns,
+        maxWaitMinutes: value.environment.max_wait_minutes,
+        initialBackoffSeconds: value.environment.initial_backoff_seconds,
+        maxBackoffSeconds: value.environment.max_backoff_seconds,
       },
       commands: value.commands,
       decisionFile: value.decision_file,

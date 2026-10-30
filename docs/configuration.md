@@ -1963,6 +1963,12 @@ The built-in root-cause signatures (case-insensitive; each line is cut to 1,000 
 | `flaky.quarantine` | boolean | `true` | Quarantine a test when its task opens |
 | `flaky.quarantine_cap` | number | `10` | No more quarantined tests than this |
 | `flaky.release_after_passes` | number | `5` | A quarantined test that passes this many times in a row is released |
+| `environment.mode` | `off` \| `observe` \| `act` | `observe` | `off`: environment detection disabled. `observe`: record what would happen without acting. `act`: wait for probe to pass before re-checking |
+| `environment.patterns` | array | `[]` | `{id, pattern, probe, probe_timeout_seconds}`: environment outage patterns. A result is `environment` only if EVERY failed step matches and NO step shows a test/lint/compile failure |
+| `environment.default_patterns` | boolean | `true` | Use the built-in environment patterns (docker-daemon, docker-exit-125, disk-full, dns-unreachable, network-unreachable, ssh-refused) |
+| `environment.max_wait_minutes` | number | `120` | Maximum time to wait for the environment to recover before raising a decision |
+| `environment.initial_backoff_seconds` | number | `30` | Initial delay before first probe retry |
+| `environment.max_backoff_seconds` | number | `300` | Maximum delay between probe retries |
 | `bisect.enabled` | boolean | `true` | Bisect a red default branch |
 | `bisect.revert` | `auto` \| `propose` \| `off` | `propose` | What to do with a proven culprit |
 | `bisect.max_candidates` | number | `64` | Don't bisect more commits than this |
@@ -2042,6 +2048,43 @@ A project whose gates run in its own queue and runner scripts (not Lair pipeline
 - **Exit codes:** `0` accepted (it prints the triage record), `1` refused (it prints the server's reason: an untrusted node or key, a repeated result id, triage off for the project), `2` usage (a missing or bad flag, an unreadable file or key), `3` the server is unreachable (`--timeout`, default 30 seconds). A runner should **fail open**: log a refusal or an unreachable server and go on, never change the gate's own result because of it.
 
 `review.merge.gate.source: signed` verifies the same kind of signed result. This command sends to triage only, and with `review.merge.gate.from_triage: true` the results triage accepts reach the merge gate too ([Gates from an external queue through triage](#gates-from-an-external-queue-through-triage)); without it, the gate takes only results posted to `POST /api/review/gate-results`. The gate also checks the `pipelineVersion` against `merge.gate.pipeline_versions` (`--pipeline-version`), and it does not take a passed result with a skipped step or a passed step that took under 10 ms.
+
+### Environment outage detection
+
+When the environment itself is down (Docker not running, disk full, network unreachable, SSH refused), gates fail before any test runs. Instead of re-checking immediately (which would fail the same way), triage detects environment outages and waits for the environment to recover.
+
+**Classification.** A result is an `environment` outage only when:
+1. **Every** failed step matches an environment pattern (Docker daemon, disk full, DNS, network, SSH); AND
+2. **No** step shows a test, lint or compile failure (those are code failures, not environment).
+
+**Built-in patterns** (case-insensitive, `environment.default_patterns: false` drops them):
+- `docker-daemon`: "Cannot connect to the Docker daemon", "docker: error response from daemon"
+- `docker-exit-125`: exit code 125 from a container step (container could not start)
+- `disk-full`: "no space left on device", "ENOSPC"
+- `dns-unreachable`: "EAI_AGAIN", "could not resolve host"
+- `network-unreachable`: "network is unreachable", "no route to host"
+- `ssh-refused`: "ssh: connect to host ... Connection refused/timed out"
+
+**Probe-based waiting.** Each pattern has an associated probe command (e.g. `docker info` for Docker patterns). When an environment outage is detected:
+1. Triage runs the probe command with backoff (`initial_backoff_seconds`, doubling up to `max_backoff_seconds`).
+2. While waiting, it shows one notice on Home ("waiting for the environment: docker-daemon"), and raises NO decision.
+3. After the probe passes, it triggers re-checks for all waiting gates. These re-checks don't count against `max_per_result`.
+4. If the probe never passes within `max_wait_minutes`, it raises ONE decision listing all affected gates.
+
+**Configuration:**
+```yaml
+triage:
+  environment:
+    mode: act                    # off | observe | act
+    max_wait_minutes: 120        # how long to wait before raising a decision
+    initial_backoff_seconds: 30  # delay before first probe retry
+    max_backoff_seconds: 300     # maximum delay between retries
+    patterns:                    # yours first; one with a built-in id replaces it
+      - id: my-service
+        pattern: "my-service is unreachable"
+        probe: ["curl", "-sf", "http://localhost:8080/health"]
+        probe_timeout_seconds: 10
+```
 
 ### Re-checks for an existing gate system
 
