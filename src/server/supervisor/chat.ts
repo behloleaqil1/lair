@@ -39,7 +39,6 @@
  * answer" and stops its run.
  */
 import { existsSync, readFileSync } from "fs";
-import { dirname, join } from "path";
 import { randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 import type { ProjectConfig } from "../../shared/types.js";
@@ -60,7 +59,7 @@ import { getPromptsDir } from "../routes/controls.js";
 import { supervisorAgent, type ChatSettings, type SupervisorSettings } from "./config.js";
 import { buildSupervisorPrompt } from "./chat-prompt.js";
 import { sanitizeAnswer, sanitizeEvidence } from "./answers.js";
-import { readAnswerFile } from "./answer-file.js";
+import { answerFilePath, answerFileExists, cleanupRunFolder, createRunFolder, takeAnswerFile } from "./answer-file.js";
 import { NOTICE_MODULE } from "./notices.js";
 import { redactText } from "./redact.js";
 import type { Supervisor } from "./service.js";
@@ -193,8 +192,10 @@ export class SupervisorChat {
   private stoppedAfterAnswer = new Set<string>();
   /** project -> the supervisor agent as the status last read it */
   private agentCache = new Map<string, { generation: number; at: number; value: { agent: string } | { problem: string } }>();
+  /** turnId -> per-run folder path for answer files */
+  private runFolders = new Map<string, string>();
   private readonly cli: string;
-  private readonly log: Pick<Console, "warn">;
+  private readonly log: Pick<Console, "info" | "warn">;
 
   constructor(private readonly o: SupervisorChatOptions) {
     this.cli = o.cli ?? defaultCli();
@@ -318,12 +319,18 @@ export class SupervisorChat {
 
     const conversationId = p.conversation?.id ?? randomUUID();
     const seq = p.turns.length + 1;
+    const turnId = randomUUID();
     const task =
       p.kind === "digest" && p.digestDate
         ? `supervisor-digest-${p.digestDate.replace(/-/g, "")}`
         : `supervisor-ask-${conversationId.slice(0, 8)}-${seq}`;
     const timeoutMs = p.settings.chat.answer_timeout_minutes * 60_000;
     const repoUrl = repoWebUrl(config);
+
+    // Create a per-run folder for the answer file before building the prompt
+    const runFolder = createRunFolder(config.agents_dir, turnId);
+    const answerFilePathValue = runFolder ? answerFilePath(runFolder) : null;
+
     const prompt = buildSupervisorPrompt({
       template,
       project: p.project,
@@ -337,6 +344,7 @@ export class SupervisorChat {
       cli: this.cli,
       timeoutMinutes: p.settings.chat.answer_timeout_minutes,
       repoUrl,
+      answerFilePath: answerFilePathValue,
       now,
     });
 
@@ -352,18 +360,26 @@ export class SupervisorChat {
           LAIR_OPS_TOKEN: minted.token,
           LAIR_SUPERVISOR_CONVERSATION: conversationId,
           ...(this.o.serverUrl ? { LAIR_URL: this.o.serverUrl } : {}),
+          ...(answerFilePathValue ? { LAIR_ANSWER_FILE: answerFilePathValue } : {}),
         },
         // The supervisor's prompt is the whole task: not the builders' default_instructions before it
         ownPrompt: true,
       });
     } catch (e) {
       this.o.tokens.revoke(minted.info.id);
+      // Clean up the run folder on failure
+      if (runFolder) cleanupRunFolder(runFolder);
       const status = typeof (e as { statusCode?: unknown }).statusCode === "number" ? (e as { statusCode: number }).statusCode : 500;
       // Only the agent becoming busy meanwhile passes by itself; a claimed task, a held agent, the budget don't
       const nowBusy = status === 409 && (agents.getStore()?.activeRunForAgent(p.project, found.agent) ?? null) !== null;
       throw new ChatError(status, `The supervisor run could not start: ${message(e)}`, nowBusy);
     }
     this.o.tokens.bindRun(minted.info.id, run.id);
+
+    // Track the run folder for this turn
+    if (runFolder) {
+      this.runFolders.set(turnId, runFolder);
+    }
 
     const conversation: StoredConversation = p.conversation ?? {
       id: conversationId,
@@ -374,7 +390,7 @@ export class SupervisorChat {
       updatedAt: now,
     };
     const turn: StoredTurn = {
-      id: randomUUID(),
+      id: turnId,
       conversationId,
       seq,
       question: p.question,
@@ -394,6 +410,11 @@ export class SupervisorChat {
     } catch (e) {
       // Not kept, so never answered: the run goes too
       this.o.tokens.endRun(run.id);
+      // Clean up the run folder
+      if (runFolder) {
+        this.runFolders.delete(turnId);
+        cleanupRunFolder(runFolder);
+      }
       await agents.releaseClaim(p.project, task, "the supervisor: its question could not be stored").catch(() => undefined);
       throw e;
     }
@@ -489,25 +510,38 @@ export class SupervisorChat {
   }
 
   /**
-   * Try to take an answer from answer.json in the run's directory. Returns true if it took the answer,
-   * false if there was no file or it was invalid, or if the turn was already answered.
+   * Try to take an answer from answer.json in the run's dedicated folder.
+   * The folder was created at run start and its path is tracked in runFolders.
+   * Returns true if it took the answer, false if there was no file or it was invalid,
+   * or if the turn was already answered.
+   * M2: Only takes the file after the run has ended, to avoid reading a half-written file.
    */
-  private tryAnswerFromFile(turn: StoredTurn & { project: string }, run: AgentRun | null): { taken: boolean; error?: string } {
+  private tryAnswerFromFile(
+    turn: StoredTurn & { project: string },
+    runEnded: boolean,
+  ): { taken: boolean; error?: string; confidence?: string } {
     if (turn.state !== "pending") {
       return { taken: false, error: "turn is not pending" };
     }
-    if (!run?.logPath) {
-      return { taken: false, error: "no log path" };
-    }
-    const runDir = dirname(run.logPath);
-    const answerFilePath = join(runDir, "answer.json");
 
-    const parsed = readAnswerFile(answerFilePath, runDir);
-    if (!parsed.ok) {
-      if (parsed.error.includes("does not exist") || parsed.error.includes("cannot be read")) {
+    // Get the run folder from our tracking map
+    const runFolder = this.runFolders.get(turn.id);
+    if (!runFolder) {
+      return { taken: false }; // No run folder tracked (legacy or test scenario)
+    }
+
+    // M2: Only take the file after the run has ended to avoid half-written files
+    if (!runEnded && !answerFileExists(runFolder)) {
+      return { taken: false }; // No file yet, wait for run to end
+    }
+
+    // Use takeAnswerFile which reads, validates, and renames to prevent re-reads
+    const result = takeAnswerFile(runFolder);
+    if (!result.ok) {
+      if (result.error.includes("does not exist") || result.error.includes("cannot be read")) {
         return { taken: false }; // No file, not an error
       }
-      return { taken: false, error: parsed.error };
+      return { taken: false, error: result.error };
     }
 
     const now = this.o.clock();
@@ -516,19 +550,32 @@ export class SupervisorChat {
       return { taken: false, error: "conversation not found" };
     }
 
-    const clean = sanitizeAnswer(parsed.content.answer, this.policy(conversation.project));
+    const clean = sanitizeAnswer(result.content.answer, this.policy(conversation.project));
     if (clean.length === 0) {
       return { taken: false, error: "answer: nothing is left of it once cleaned (no HTML is kept)" };
     }
 
-    if (!this.o.store.answerTurn(turn.id, clean, parsed.content.evidence, now)) {
-      // Already answered (by CLI) - this is audited elsewhere
+    if (!this.o.store.answerTurn(turn.id, clean, result.content.evidence, now)) {
+      // Already answered (by CLI) - audit this
+      this.log.info(`[supervisor] answer.json for turn ${turn.id.slice(0, 8)} ignored: already answered via CLI`);
       return { taken: false, error: "turn was already answered or closed" };
     }
 
-    // Log that the answer was taken from a file
-    this.log.warn(`[supervisor] answer.json taken for turn ${turn.id.slice(0, 8)} from ${answerFilePath}`);
-    return { taken: true };
+    // S3: Log as info, not warn (taking an answer is normal)
+    this.log.info(`[supervisor] answer.json taken for turn ${turn.id.slice(0, 8)}${result.renamed ? " (renamed)" : ""}`);
+    // S4: Return confidence for potential storage
+    return { taken: true, confidence: result.content.confidence };
+  }
+
+  /**
+   * Clean up resources for a turn: remove the run folder from tracking and delete it.
+   */
+  private cleanupTurn(turnId: string): void {
+    const runFolder = this.runFolders.get(turnId);
+    if (runFolder) {
+      this.runFolders.delete(turnId);
+      cleanupRunFolder(runFolder);
+    }
   }
 
   /** One notice, with notifications on: "Today's digest is ready". Yesterday's, if still open, is withdrawn. */
@@ -587,13 +634,15 @@ export class SupervisorChat {
       // Timeout case: check for answer.json before closing
       if (now >= turn.deadlineAt) {
         const run = turn.runId ? store?.getRun(turn.runId) ?? null : null;
-        const fromFile = this.tryAnswerFromFile(turn, run);
+        const runEnded = !run || !isActive(run.state);
+        const fromFile = this.tryAnswerFromFile(turn, runEnded);
         if (fromFile.taken) {
           // Answer taken from file - handle digest notice if needed
           const conversation = this.o.store.getConversation(turn.conversationId);
           if (conversation?.kind === "digest") await this.noticeDigest(conversation);
-          // Stop the run since we have the answer
+          // Stop the run since we have the answer, clean up the folder
           await this.stopRun(turn, "answered from answer.json at timeout");
+          this.cleanupTurn(turn.id);
           continue;
         }
         const minutes = Math.round((turn.deadlineAt - turn.askedAt) / 60_000);
@@ -601,21 +650,18 @@ export class SupervisorChat {
           ? `no answer within ${minutes} minutes, and answer.json was invalid: ${fromFile.error}`
           : `no answer within ${minutes} minutes (supervisor.chat.answer_timeout_minutes)`;
         await this.close(turn, reason);
+        this.cleanupTurn(turn.id);
         continue;
       }
       if (turn.runId === null) {
         await this.close(turn, "its run never started");
+        this.cleanupTurn(turn.id);
         continue;
       }
       const run = store?.getRun(turn.runId) ?? null;
       if (run && isActive(run.state)) {
-        // Run still active - check for answer.json (debounced by check interval)
-        const fromFile = this.tryAnswerFromFile(turn, run);
-        if (fromFile.taken) {
-          const conversation = this.o.store.getConversation(turn.conversationId);
-          if (conversation?.kind === "digest") await this.noticeDigest(conversation);
-          // Don't stop the run yet - it may do cleanup. The deadline check will stop it if needed.
-        }
+        // Run still active - don't try to read the file yet (M2: avoid half-written files)
+        // We'll read it when the run ends or at timeout
         continue;
       }
 
@@ -631,11 +677,12 @@ export class SupervisorChat {
       }
 
       // Run ended: check for answer.json before closing as no_answer
-      const fromFile = this.tryAnswerFromFile(turn, run);
+      const fromFile = this.tryAnswerFromFile(turn, true /* runEnded */);
       if (fromFile.taken) {
         const conversation = this.o.store.getConversation(turn.conversationId);
         if (conversation?.kind === "digest") await this.noticeDigest(conversation);
         if (turn.runId) this.o.tokens.endRun(turn.runId);
+        this.cleanupTurn(turn.id);
         continue;
       }
 
@@ -645,12 +692,15 @@ export class SupervisorChat {
         : `no answer: ${how}`;
       // A failover or a recovery goes on in a new run, without a token that works: it is stopped
       await this.close(turn, reason);
+      this.cleanupTurn(turn.id);
     }
     // An answered question whose run still goes past its deadline: the run is stopped
     for (const turn of this.o.store.answeredPastDeadline(now, now - DAY)) {
       if (this.stoppedAfterAnswer.has(turn.id)) continue;
       this.stoppedAfterAnswer.add(turn.id);
       await this.stopRun(turn, "answered, and still running past its deadline");
+      // Clean up even for already-answered turns
+      this.cleanupTurn(turn.id);
     }
   }
 

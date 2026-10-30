@@ -1,25 +1,27 @@
 /**
- * Answer file: parsing, validation and watching for answer.json files that
- * supervisor runs write. The file path: any working directory the run can
- * write to (agents.session_dir, $TMPDIR, or the repository if allowed).
+ * Answer file: parsing, validation and reading of answer.json files that
+ * supervisor runs write. The server creates a per-run folder before spawn,
+ * passes the exact answer file path in LAIR_ANSWER_FILE and the prompt,
+ * and reads only that path.
  *
  * Schema: {answer: string ≤ 8 KB, evidence: [{tool, args, note}] ≤ 20, confidence?}
  * Validation: a regular file ≤ 64 KB, valid JSON, fields match the schema.
  */
-import { closeSync, constants, fstatSync, openSync, readSync, realpathSync, statSync, watch, type FSWatcher } from "fs";
-import { dirname, join, resolve } from "path";
+import { closeSync, constants, fstatSync, mkdirSync, openSync, readSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync } from "fs";
+import { dirname, join } from "path";
+import { randomBytes } from "crypto";
 import type { EvidenceItem } from "../../shared/supervisor-types.js";
 import { sanitizeEvidence } from "./answers.js";
 import { redactText } from "./redact.js";
 
 /** Max file size for answer.json */
 export const MAX_ANSWER_FILE_BYTES = 64 * 1024;
-/** Max answer text length */
+/** Max answer text length in bytes (not UTF-16 code units) */
 export const MAX_ANSWER_TEXT_BYTES = 8 * 1024;
 /** Max evidence items */
 export const MAX_EVIDENCE_ITEMS = 20;
-/** Debounce delay for file watching (ms) */
-export const WATCH_DEBOUNCE_MS = 500;
+/** After taking an answer, wait this long for mtime to stabilise (ms) */
+export const MTIME_STABLE_MS = 500;
 
 export interface AnswerFileContent {
   answer: string;
@@ -52,10 +54,10 @@ export function readAnswerFile(path: string, runDir: string | null): ParseResult
     }
   }
 
-  // Read the file with size limit
+  // Read the file with size limit, O_NOFOLLOW to prevent TOCTOU symlink attacks
   let content: string;
   try {
-    content = readBoundedFile(path, MAX_ANSWER_FILE_BYTES);
+    content = readBoundedFileNoFollow(path, MAX_ANSWER_FILE_BYTES);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return { ok: false, error: `cannot read file: ${redactText(msg, 200)}` };
@@ -84,7 +86,9 @@ export function readAnswerFile(path: string, runDir: string | null): ParseResult
   if (answer.length === 0) {
     return { ok: false, error: "answer: cannot be empty" };
   }
-  if (answer.length > MAX_ANSWER_TEXT_BYTES) {
+  // S2: Use Buffer.byteLength for correct UTF-8 byte counting
+  const answerBytes = Buffer.byteLength(answer, "utf8");
+  if (answerBytes > MAX_ANSWER_TEXT_BYTES) {
     return { ok: false, error: `answer: exceeds ${MAX_ANSWER_TEXT_BYTES} bytes` };
   }
 
@@ -130,15 +134,19 @@ export function readAnswerFile(path: string, runDir: string | null): ParseResult
 }
 
 /**
- * Read a file up to maxBytes, throwing if it exceeds the limit or cannot be read.
+ * Read a file up to maxBytes without following symlinks (O_NOFOLLOW).
+ * Throws if the file is a symlink, exceeds the limit, or cannot be read.
  */
-function readBoundedFile(path: string, maxBytes: number): string {
+function readBoundedFileNoFollow(path: string, maxBytes: number): string {
+  // O_NOFOLLOW is not available on all platforms; fall back to O_RDONLY when not defined
+  const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
   let fd: number;
   try {
-    fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+    fd = openSync(path, flags);
   } catch (e) {
     const code = (e as NodeJS.ErrnoException).code;
     if (code === "ENOENT") throw new Error("file does not exist");
+    if (code === "ELOOP") throw new Error("file is a symlink (O_NOFOLLOW)");
     throw new Error(code ?? "cannot open");
   }
   try {
@@ -170,95 +178,101 @@ function safeRealPath(path: string): string | null {
 }
 
 /**
- * Check if an answer.json file exists and is a regular file.
+ * Create a per-run folder for the supervisor run's answer file.
+ * The folder is created with mode 0700 and an unguessable name.
+ * @param dataDir The supervisor data directory (e.g., config.agents_dir or a supervisor-runs subdir)
+ * @param runId The run's ID
+ * @returns The absolute path to the run folder, or null if creation failed
  */
-export function answerFileExists(dir: string): string | null {
-  const path = join(dir, "answer.json");
+export function createRunFolder(dataDir: string, runId: string): string | null {
+  const random = randomBytes(8).toString("hex");
+  const folderName = `run-${runId.slice(0, 8)}-${random}`;
+  const folderPath = join(dataDir, "supervisor-runs", folderName);
   try {
-    const stats = statSync(path);
-    return stats.isFile() ? path : null;
+    mkdirSync(dirname(folderPath), { recursive: true, mode: 0o755 });
+    mkdirSync(folderPath, { mode: 0o700 });
+    return folderPath;
   } catch {
     return null;
   }
 }
 
 /**
- * Derive the answer file path from a run's log path.
- * The answer file goes in the same directory as the log file.
+ * Get the answer file path for a run folder.
  */
-export function answerFilePathFromLog(logPath: string | undefined): string | null {
-  if (!logPath) return null;
-  return join(dirname(logPath), "answer.json");
+export function answerFilePath(runFolder: string): string {
+  return join(runFolder, "answer.json");
 }
 
 /**
- * Get the run directory from a log path.
+ * Get the path for a taken answer file (renamed after reading).
  */
-export function runDirFromLog(logPath: string | undefined): string | null {
-  if (!logPath) return null;
-  return dirname(logPath);
-}
-
-export interface AnswerFileWatcher {
-  /** Start watching for the answer file in the given directory */
-  watch(dir: string, onAnswer: (path: string) => void): void;
-  /** Stop watching all directories */
-  stop(): void;
+export function takenAnswerFilePath(runFolder: string): string {
+  return join(runFolder, "answer.taken.json");
 }
 
 /**
- * Create a watcher that monitors directories for answer.json files.
- * Uses debouncing to handle multiple rapid file events.
+ * Take an answer file: read it, validate it, and rename it to prevent re-reads.
+ * Returns the parsed content if successful, or an error.
  */
-export function createAnswerFileWatcher(): AnswerFileWatcher {
-  const watchers = new Map<string, FSWatcher>();
-  const timers = new Map<string, NodeJS.Timeout>();
-  let stopped = false;
+export function takeAnswerFile(runFolder: string): ParseResult & { renamed?: boolean } {
+  const path = answerFilePath(runFolder);
+  const takenPath = takenAnswerFilePath(runFolder);
 
-  return {
-    watch(dir: string, onAnswer: (path: string) => void): void {
-      if (stopped) return;
-      if (watchers.has(dir)) return; // Already watching
+  const parsed = readAnswerFile(path, runFolder);
+  if (!parsed.ok) {
+    return parsed;
+  }
 
-      try {
-        const watcher = watch(dir, (event, filename) => {
-          if (stopped) return;
-          if (filename !== "answer.json") return;
-          if (event !== "rename" && event !== "change") return;
+  // Rename to prevent re-reads
+  let renamed = false;
+  try {
+    renameSync(path, takenPath);
+    renamed = true;
+  } catch {
+    // Rename failed, but we have the content; proceed anyway
+  }
 
-          // Debounce: wait for writes to complete
-          const existing = timers.get(dir);
-          if (existing) clearTimeout(existing);
+  return { ...parsed, renamed };
+}
 
-          timers.set(
-            dir,
-            setTimeout(() => {
-              timers.delete(dir);
-              if (stopped) return;
-              const path = join(dir, "answer.json");
-              try {
-                const stats = statSync(path);
-                if (stats.isFile()) {
-                  onAnswer(path);
-                }
-              } catch {
-                // File doesn't exist yet or was deleted
-              }
-            }, WATCH_DEBOUNCE_MS),
-          );
-        });
-        watchers.set(dir, watcher);
-      } catch {
-        // Directory doesn't exist or can't be watched
-      }
-    },
+/**
+ * Check if an answer file exists and is a regular file.
+ */
+export function answerFileExists(runFolder: string): boolean {
+  const path = answerFilePath(runFolder);
+  try {
+    const stats = statSync(path);
+    return stats.isFile();
+  } catch {
+    return false;
+  }
+}
 
-    stop(): void {
-      stopped = true;
-      for (const timer of timers.values()) clearTimeout(timer);
-      timers.clear();
-      for (const watcher of watchers.values()) watcher.close();
-      watchers.clear();
-    },
-  };
+/**
+ * Get the mtime of the answer file, or null if it doesn't exist.
+ */
+export function answerFileMtime(runFolder: string): number | null {
+  const path = answerFilePath(runFolder);
+  try {
+    return statSync(path).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Clean up a run folder: remove the answer files and the folder itself.
+ * Best effort; does not throw on failure.
+ */
+export function cleanupRunFolder(runFolder: string): void {
+  try {
+    const path = answerFilePath(runFolder);
+    const takenPath = takenAnswerFilePath(runFolder);
+    try { unlinkSync(path); } catch { /* ignore */ }
+    try { unlinkSync(takenPath); } catch { /* ignore */ }
+    rmdirSync(runFolder);
+  } catch {
+    // Best effort cleanup
+  }
 }

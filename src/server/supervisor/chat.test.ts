@@ -611,18 +611,17 @@ describe("a question with no answer", () => {
 
 // ============ 5. ANSWER FROM FILE (answer.json) ============
 
-describe("answer.json: answers from a file in the run directory", () => {
-  /** Write answer.json in the run's log directory (simulating what the supervisor run writes). */
-  function writeAnswerFile(h: Harness, call: SpawnCall, content: { answer: string; evidence?: unknown[]; confidence?: string }): string {
-    // The log path is like /tmp/.../logs/sup-YYYYMMDDTHHMMSSZ.log
-    const logDir = join(h.dir, "logs");
-    mkdirSync(logDir, { recursive: true });
-    const answerPath = join(logDir, "answer.json");
+describe("answer.json: answers from a file in the run's per-turn folder", () => {
+  /**
+   * Write answer.json to the path specified in LAIR_ANSWER_FILE env var.
+   * This simulates what a supervisor run writes.
+   */
+  function writeAnswerFile(call: SpawnCall, content: { answer: string; evidence?: unknown[]; confidence?: string }): string {
+    const answerPath = call.env.LAIR_ANSWER_FILE;
+    if (!answerPath) throw new Error("LAIR_ANSWER_FILE not in run environment");
+    // Ensure the parent directory exists (it should, created by startRun)
+    mkdirSync(dirname(answerPath), { recursive: true });
     writeFileSync(answerPath, JSON.stringify(content));
-    // Set the run's logPath so tryAnswerFromFile can find it
-    const run = h.agents.getStore()!.getRun(call.env.LAIR_AGENT_RUN_ID!)!;
-    (run as { logPath: string }).logPath = join(logDir, "run.log");
-    writeFileSync(run.logPath!, "log content");
     return answerPath;
   }
 
@@ -630,8 +629,11 @@ describe("answer.json: answers from a file in the run directory", () => {
     const h = await boot();
     const { view, call } = await asked(h);
 
+    // Verify LAIR_ANSWER_FILE is in the environment
+    expect(call.env.LAIR_ANSWER_FILE).toBeDefined();
+
     // Write the answer file before the run exits
-    writeAnswerFile(h, call, {
+    writeAnswerFile(call, {
       answer: "worker-a is held because of an infrastructure failure.",
       evidence: [{ tool: "events.query", args: { agent: "worker-a" }, note: "saw a restart event at 08:30" }],
       confidence: "high",
@@ -654,7 +656,7 @@ describe("answer.json: answers from a file in the run directory", () => {
     const { view, call } = await asked(h);
 
     // Write the answer file
-    writeAnswerFile(h, call, {
+    writeAnswerFile(call, {
       answer: "Found the issue: gate queue stuck for 2 hours.",
       evidence: [],
     });
@@ -673,43 +675,43 @@ describe("answer.json: answers from a file in the run directory", () => {
     const h = await boot();
     const { view, call } = await asked(h);
 
-    // Write answer file in a different directory and try to symlink
+    // The run folder is a private directory; try to put a symlink there pointing outside
     const outsideDir = join(h.dir, "outside");
     mkdirSync(outsideDir, { recursive: true });
-    writeFileSync(join(outsideDir, "answer.json"), JSON.stringify({ answer: "malicious", evidence: [] }));
+    writeFileSync(join(outsideDir, "secret.json"), JSON.stringify({ answer: "malicious", evidence: [] }));
 
-    // Set up the log path but make answer.json a symlink to outside
-    const logDir = join(h.dir, "logs");
-    mkdirSync(logDir, { recursive: true });
-    const run = h.agents.getStore()!.getRun(call.env.LAIR_AGENT_RUN_ID!)!;
-    (run as { logPath: string }).logPath = join(logDir, "run.log");
-    writeFileSync(run.logPath!, "log");
+    // Create a symlink in the run folder pointing to the outside file
+    const answerPath = call.env.LAIR_ANSWER_FILE!;
+    const runFolder = dirname(answerPath);
+    try {
+      symlinkSync(join(outsideDir, "secret.json"), answerPath);
+    } catch {
+      // Symlinks may not be supported on all platforms; skip this test
+      h.spawner.exit(call.pid, 0);
+      await tick(h);
+      await check(h);
+      return;
+    }
 
-    // Note: We can't easily create a symlink in this test, so we test the path validation
-    // by writing a valid file and checking the error handling for invalid paths
-
-    // Run exits without answering
+    // Run exits without answering via CLI
     h.spawner.exit(call.pid, 0);
     await tick(h);
     await check(h);
 
-    // No symlink attack file was written, so it's just no_answer
+    // The symlink should be detected and refused
     const turn = (await conversation(h, view.id)).turns[0];
     expect(turn.state).toBe("no_answer");
+    expect(turn.reason).toMatch(/symlink|outside/i);
   });
 
   it("refuses malformed answer.json and includes the error in no_answer reason", async () => {
     const h = await boot();
     const { view, call } = await asked(h);
 
-    // Write malformed JSON
-    const logDir = join(h.dir, "logs");
-    mkdirSync(logDir, { recursive: true });
-    const answerPath = join(logDir, "answer.json");
+    // Write malformed JSON to the answer file path
+    const answerPath = call.env.LAIR_ANSWER_FILE!;
+    mkdirSync(dirname(answerPath), { recursive: true });
     writeFileSync(answerPath, "{ not valid json");
-    const run = h.agents.getStore()!.getRun(call.env.LAIR_AGENT_RUN_ID!)!;
-    (run as { logPath: string }).logPath = join(logDir, "run.log");
-    writeFileSync(run.logPath!, "log");
 
     h.spawner.exit(call.pid, 0);
     await tick(h);
@@ -725,12 +727,9 @@ describe("answer.json: answers from a file in the run directory", () => {
     const h = await boot();
     const { view, call } = await asked(h);
 
-    const logDir = join(h.dir, "logs");
-    mkdirSync(logDir, { recursive: true });
-    writeFileSync(join(logDir, "answer.json"), JSON.stringify({ answer: "missing evidence field" }));
-    const run = h.agents.getStore()!.getRun(call.env.LAIR_AGENT_RUN_ID!)!;
-    (run as { logPath: string }).logPath = join(logDir, "run.log");
-    writeFileSync(run.logPath!, "log");
+    const answerPath = call.env.LAIR_ANSWER_FILE!;
+    mkdirSync(dirname(answerPath), { recursive: true });
+    writeFileSync(answerPath, JSON.stringify({ answer: "missing evidence field" }));
 
     h.spawner.exit(call.pid, 0);
     await tick(h);
@@ -753,7 +752,7 @@ describe("answer.json: answers from a file in the run directory", () => {
     expect(cliResult.code).toBe(EXIT_OK);
 
     // Now write the file
-    writeAnswerFile(h, call, {
+    writeAnswerFile(call, {
       answer: "Answer from file (should be ignored)",
       evidence: [],
     });
@@ -769,30 +768,24 @@ describe("answer.json: answers from a file in the run directory", () => {
     expect(turn.answer).toBe("Answer from CLI");
   });
 
-  it("file answer first, then CLI: CLI is refused", async () => {
+  it("file answer after run ends: file wins over no_answer", async () => {
     const h = await boot();
     const { view, call } = await asked(h);
 
-    // Write the file
-    writeAnswerFile(h, call, {
-      answer: "Answer from file",
+    // Write the file after run ends (but before check)
+    h.spawner.exit(call.pid, 0);
+    await tick(h);
+
+    writeAnswerFile(call, {
+      answer: "Answer from file after exit",
       evidence: [],
     });
 
-    // Let check() pick up the file
     await check(h);
 
-    const afterFile = (await conversation(h, view.id)).turns[0];
-    expect(afterFile.state).toBe("answered");
-    expect(afterFile.answer).toBe("Answer from file");
-
-    // CLI answer comes later
-    const cliResult = await answer(h, call.env, {
-      text: "Answer from CLI (should be refused)",
-      evidence: [],
-    });
-    expect(cliResult.code).toBe(EXIT_REFUSED);
-    expect(cliResult.err[0]).toContain("already answered");
+    const turn = (await conversation(h, view.id)).turns[0];
+    expect(turn.state).toBe("answered");
+    expect(turn.answer).toBe("Answer from file after exit");
   });
 
   it("timeout without answer.json: no_answer with timeout reason", async () => {
@@ -806,6 +799,23 @@ describe("answer.json: answers from a file in the run directory", () => {
     expect(turn.state).toBe("no_answer");
     expect(turn.reason).toContain("no answer within 5 minutes");
     expect(turn.reason).not.toContain("answer.json");
+  });
+
+  it("answer file is renamed to answer.taken.json after being read", async () => {
+    const h = await boot();
+    const { call } = await asked(h);
+
+    const answerPath = call.env.LAIR_ANSWER_FILE!;
+    writeAnswerFile(call, { answer: "Test answer", evidence: [] });
+
+    // Run exits
+    h.spawner.exit(call.pid, 0);
+    await tick(h);
+    await check(h);
+
+    // Original file should be renamed
+    expect(existsSync(answerPath)).toBe(false);
+    expect(existsSync(answerPath.replace("answer.json", "answer.taken.json"))).toBe(true);
   });
 });
 

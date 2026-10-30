@@ -1,11 +1,23 @@
 /**
- * Tests for answer-file.ts: parsing and validation of answer.json files.
+ * Tests for answer-file.ts: parsing, validation, and per-run folder management
+ * for answer.json files that supervisor runs write.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync, existsSync, statSync } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
-import { readAnswerFile, MAX_ANSWER_TEXT_BYTES, MAX_ANSWER_FILE_BYTES, MAX_EVIDENCE_ITEMS } from "./answer-file.js";
+import { join, dirname } from "path";
+import {
+  readAnswerFile,
+  createRunFolder,
+  answerFilePath,
+  takenAnswerFilePath,
+  takeAnswerFile,
+  answerFileExists,
+  cleanupRunFolder,
+  MAX_ANSWER_TEXT_BYTES,
+  MAX_ANSWER_FILE_BYTES,
+  MAX_EVIDENCE_ITEMS,
+} from "./answer-file.js";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -68,10 +80,13 @@ describe("readAnswerFile", () => {
     expect(result).toEqual({ ok: false, error: "answer: cannot be empty" });
   });
 
-  it("rejects answer exceeding max size", () => {
+  it("rejects answer exceeding max size in bytes (not UTF-16 code units)", () => {
     const dir = tempDir();
     const path = join(dir, "answer.json");
-    writeFileSync(path, JSON.stringify({ answer: "x".repeat(MAX_ANSWER_TEXT_BYTES + 1), evidence: [] }));
+    // Use multi-byte characters: each emoji is 4 bytes in UTF-8
+    const emoji = "😀";
+    const count = Math.ceil(MAX_ANSWER_TEXT_BYTES / 4) + 1;
+    writeFileSync(path, JSON.stringify({ answer: emoji.repeat(count), evidence: [] }));
     const result = readAnswerFile(path, dir);
     expect(result).toEqual({ ok: false, error: `answer: exceeds ${MAX_ANSWER_TEXT_BYTES} bytes` });
   });
@@ -140,7 +155,7 @@ describe("readAnswerFile", () => {
     const dir = tempDir();
     const result = readAnswerFile(join(dir, "nope.json"), dir);
     expect(result.ok).toBe(false);
-    expect((result as { error: string }).error).toContain("cannot be read");
+    expect((result as { error: string }).error).toContain("cannot read file");
   });
 
   it("rejects file exceeding max size", () => {
@@ -169,7 +184,7 @@ describe("readAnswerFile", () => {
 
     const result = readAnswerFile(symlinkPath, runDir);
     expect(result.ok).toBe(false);
-    expect((result as { error: string }).error).toContain("outside the run directory");
+    expect((result as { error: string }).error).toMatch(/outside the run directory|symlink/i);
   });
 
   it("accepts file when runDir is null (no path check)", () => {
@@ -178,5 +193,113 @@ describe("readAnswerFile", () => {
     writeFileSync(path, JSON.stringify({ answer: "ok", evidence: [] }));
     const result = readAnswerFile(path, null);
     expect(result.ok).toBe(true);
+  });
+});
+
+describe("createRunFolder", () => {
+  it("creates a folder with mode 0700", () => {
+    const dataDir = tempDir();
+    const runFolder = createRunFolder(dataDir, "test-run-id");
+    expect(runFolder).not.toBeNull();
+    expect(existsSync(runFolder!)).toBe(true);
+
+    // Check parent directory exists
+    const parentDir = dirname(runFolder!);
+    expect(existsSync(parentDir)).toBe(true);
+
+    // Check folder mode (on Unix-like systems)
+    if (process.platform !== "win32") {
+      const stats = statSync(runFolder!);
+      expect(stats.mode & 0o777).toBe(0o700);
+    }
+  });
+
+  it("creates folders with unguessable names", () => {
+    const dataDir = tempDir();
+    const folder1 = createRunFolder(dataDir, "run-1");
+    const folder2 = createRunFolder(dataDir, "run-1");
+    expect(folder1).not.toBeNull();
+    expect(folder2).not.toBeNull();
+    expect(folder1).not.toBe(folder2);
+  });
+
+  it("includes run ID prefix in folder name", () => {
+    const dataDir = tempDir();
+    const runFolder = createRunFolder(dataDir, "abcdefgh-1234");
+    expect(runFolder).not.toBeNull();
+    expect(runFolder!).toContain("run-abcdefgh");
+  });
+});
+
+describe("answerFilePath and takenAnswerFilePath", () => {
+  it("returns the correct paths", () => {
+    const runFolder = "/data/supervisor-runs/run-abc-123";
+    expect(answerFilePath(runFolder)).toBe("/data/supervisor-runs/run-abc-123/answer.json");
+    expect(takenAnswerFilePath(runFolder)).toBe("/data/supervisor-runs/run-abc-123/answer.taken.json");
+  });
+});
+
+describe("takeAnswerFile", () => {
+  it("reads, validates, and renames the answer file", () => {
+    const runFolder = tempDir();
+    const path = answerFilePath(runFolder);
+    writeFileSync(path, JSON.stringify({ answer: "Test answer", evidence: [], confidence: "high" }));
+
+    const result = takeAnswerFile(runFolder);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.content.answer).toBe("Test answer");
+      expect(result.content.confidence).toBe("high");
+      expect(result.renamed).toBe(true);
+    }
+
+    // Original file should be renamed
+    expect(existsSync(path)).toBe(false);
+    expect(existsSync(takenAnswerFilePath(runFolder))).toBe(true);
+  });
+
+  it("returns error for invalid file", () => {
+    const runFolder = tempDir();
+    writeFileSync(answerFilePath(runFolder), "not json");
+
+    const result = takeAnswerFile(runFolder);
+    expect(result.ok).toBe(false);
+    expect((result as { error: string }).error).toContain("not valid JSON");
+  });
+
+  it("returns error when file does not exist", () => {
+    const runFolder = tempDir();
+    const result = takeAnswerFile(runFolder);
+    expect(result.ok).toBe(false);
+    expect((result as { error: string }).error).toContain("cannot read file");
+  });
+});
+
+describe("answerFileExists", () => {
+  it("returns true when file exists", () => {
+    const runFolder = tempDir();
+    writeFileSync(answerFilePath(runFolder), "{}");
+    expect(answerFileExists(runFolder)).toBe(true);
+  });
+
+  it("returns false when file does not exist", () => {
+    const runFolder = tempDir();
+    expect(answerFileExists(runFolder)).toBe(false);
+  });
+});
+
+describe("cleanupRunFolder", () => {
+  it("removes the answer files and folder", () => {
+    const runFolder = tempDir();
+    writeFileSync(answerFilePath(runFolder), "{}");
+    writeFileSync(takenAnswerFilePath(runFolder), "{}");
+
+    cleanupRunFolder(runFolder);
+
+    expect(existsSync(runFolder)).toBe(false);
+  });
+
+  it("does not throw when folder does not exist", () => {
+    expect(() => cleanupRunFolder("/nonexistent/folder")).not.toThrow();
   });
 });
