@@ -124,9 +124,6 @@ function toolsSection(cli: string): string {
   ].join("\n");
 }
 
-// Keep the cli parameter for backward compatibility, but it's now only used for the tools section
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-
 function answerSection(repoUrl: string | null): string {
   return [
     "## Submitting your answer",
