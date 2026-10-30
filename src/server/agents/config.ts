@@ -220,6 +220,8 @@ export const AgentsSchema = z
     stop_grace_seconds: z.number().min(0).max(3600).default(30),
     /** How far a process's start time may differ from the one recorded for its pid */
     pid_start_tolerance_seconds: z.number().min(0).max(600).default(5),
+    /** On a planned restart: adopt (re-attach to runs the previous server started) or stop (signal them first) */
+    on_restart: z.enum(["adopt", "stop"]).default("adopt"),
     /** The agent's session directory; {agents_dir}, {agent} and {repo} are replaced */
     session_dir: z.string().min(1).optional(),
     /** Prints the branch state for a resume summary; {task}, {agent} and {repo} are replaced */
@@ -461,6 +463,7 @@ export interface AgentsSettings {
   hungMinutes?: number;
   stopGraceSeconds: number;
   pidStartToleranceSeconds: number;
+  onRestart: "adopt" | "stop";
   sessionDir?: string;
   branchStateCmd?: string[];
   commandTimeoutSeconds: number;
@@ -617,6 +620,7 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
       hungMinutes: value.hung_minutes,
       stopGraceSeconds: value.stop_grace_seconds,
       pidStartToleranceSeconds: value.pid_start_tolerance_seconds,
+      onRestart: value.on_restart,
       sessionDir: value.session_dir,
       branchStateCmd: value.branch_state_cmd,
       commandTimeoutSeconds: value.command_timeout_seconds,

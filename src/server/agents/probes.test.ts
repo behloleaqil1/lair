@@ -88,6 +88,19 @@ describe("ProcessSnapshot", () => {
     snap.addSpawned({ pid: 5001, startedAt: now });
     expect(snap.isAlive(5001, now)).toBe(true);
   });
+
+  it("counts start times back from when the reading was taken, and allows for the time ps took", () => {
+    // Taken 20 s ago, when 4242 had run 600 s: it started 620 s ago
+    const old = new ProcessSnapshot([proc(4242, 600)], now - 20_000, self, 5);
+    expect(old.startedAt(4242)).toBe(now - 620_000);
+    expect(old.isAlive(4242, now - 620_000)).toBe(true);
+    expect(old.isAlive(4242, now - 600_000)).toBe(false); // 20 s later: not that process
+    // ps took 10 s: the elapsed times were read up to 10 s before it answered, so the start may be that much earlier
+    const slow = new ProcessSnapshot([proc(4242, 600)], now, self, 5, 10_000);
+    expect(slow.isAlive(4242, now - 610_000)).toBe(true);
+    expect(slow.isAlive(4242, now - 618_000)).toBe(false);
+    expect(slow.isAlive(4242, now - 590_000)).toBe(false); // never later than the reading allows
+  });
 });
 
 describe("an agent's environment", () => {

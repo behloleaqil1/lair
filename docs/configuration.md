@@ -705,7 +705,7 @@ Errors: 400 for invalid input, 403 for a cross-site request or an answer without
 
 ## Owner-only routes
 
-Every route that changes something only you should change needs the owner's session, the same one the Decision Inbox uses (see "Only you answer"): the `X-Lair-Owner-Session` header, from the dashboard's own origin, in a same-origin browser request. Without it the answer is HTTP 403, before the request's body is read, and nothing changes. `curl`, scripts, agents and other local programs can still read: every `GET` stays open, except the two that read prompt files from disk (`/api/agents/prompts`), the Settings API (`/api/settings`), whose reads reveal paths and commands, the AI tools API (`/api/ai`), whose reads run the tools' own commands, Lair's diagnostics and the ops tokens and their audit (`/api/health/diagnostics`, `/api/supervisor`), and logs and test output (`/api/dashboard/.../output` and `.../log`, and the logs in pipeline runs), which can hold anything a test or an agent printed. No CORS is granted under these prefixes (`OWNER_ONLY_PREFIXES` in `src/server/human-auth/cors.ts`). The dashboard's views send the session once this browser is signed in, and show "sign in from Decisions" until it is.
+Every route that changes something only you should change needs the owner's session, the same one the Decision Inbox uses (see "Only you answer"): the `X-Lair-Owner-Session` header, from the dashboard's own origin, in a same-origin browser request. Without it the answer is HTTP 403, before the request's body is read, and nothing changes. `curl`, scripts, agents and other local programs can still read: every `GET` stays open, except the two that read prompt files from disk (`/api/agents/prompts`), the Settings API (`/api/settings`), whose reads reveal paths and commands, the AI tools API (`/api/ai`), whose reads run the tools' own commands, the cloud machines' status (`/api/cloud`), which names the account's instances and spend, Lair's diagnostics and the ops tokens and their audit (`/api/health/diagnostics`, `/api/supervisor`), and logs and test output (`/api/dashboard/.../output` and `.../log`, and the logs in pipeline runs), which can hold anything a test or an agent printed. No CORS is granted under these prefixes (`OWNER_ONLY_PREFIXES` in `src/server/human-auth/cors.ts`). The dashboard's views send the session once this browser is signed in, and show "sign in from Decisions" until it is.
 
 | Prefix | Owner only | Open |
 |--------|------------|------|
@@ -775,7 +775,7 @@ watchdog:
 | `lock_holder_dead` | A configured lock's recorded holder pid is not running, or the lock has no pid and is older than `lease_minutes`, while an agent is WAITING or a gate request is queued | `stale_lock` | `break_lock` | the lock is gone or held by a live process |
 | `duplicate_agent` | More than one process matches `agent_command` for one agent id (a wrapper and its child count once). One breach for each process except the oldest | `duplicate_agent` | `stop_duplicate` | one process left |
 | `agent_hung` | The agent's process is alive, but neither its newest log nor the process itself has changed for `hung_minutes`, **and** the agent is not WAITING. WAITING means its latest queue line is a `WAITING` line naming a gate id that has no `<gate-id>.rc` result yet; such an agent is never hung | `agent_stuck` | `restart_agent` | the old pid is gone and the agent has a live process |
-| `orphan_claim` | A claim `agents_dir/<id>.running` older than `claim_grace_minutes` whose agent has no live process. A live agent's claim is never touched | `orphan_claim` | `release_claim` | the claim is gone |
+| `orphan_claim` | A claim `agents_dir/<id>.running` older than `claim_grace_minutes` whose agent has no live process. A live agent's claim is never touched. A pid recorded in the claim (the file, or its `pid` file: `pid=<pid>` with an optional `started=<ISO time>`, or a bare pid) keeps it only while that pid runs as the agent, since the OS may give a dead agent's pid to another process: its command names the agent id; or, with `started=`, it started no more than 60 s after that time; or, for a bare pid, it runs the agent's adapter program (the first word of the adapter's `start_cmd`). The `release_claim` guard re-checks with the same rule | `orphan_claim` | `release_claim` | the claim is gone |
 | `infra_signature` | The same normalised failure text (timestamps, hashes, numbers and the gate's own ids removed) in at least `infra_min_tracks` finished, failed gates of different tracks on one lane within `infra_window_minutes` | `lane_broken` | `mark_lane_broken` | later ticks |
 | `gate_owner_gone` | A running gate request (`.req.run`) whose runner pid (in the `.req.run` file, else `gates_dir/runner-<lane>.pid`) is not running, or that has no runner pid at all, and whose log has been silent for `gate_lease_minutes` | `gate_owner_gone` | `requeue_gate` | the request is no longer running |
 | `idle_capacity` | Ready work (queued gate requests plus `ready_tasks_cmd` tasks) and free capacity (no agent running, or fewer than `max_agents`), with nothing started (no claim, running gate or agent process) for `idle_minutes` | `idle_capacity` | `fill_capacity` | later ticks |
@@ -971,7 +971,9 @@ Lair uses a single, shared process cache for all modules that need the process t
 
 **Behavior:**
 - A failed `ps` keeps the last good snapshot, marked stale. Routes answer from the stale cache, not with an error.
-- A `ps` timeout that fires after the child has already exited (the event loop was blocked, not `ps` itself) counts as success if the output is valid.
+- A `ps` that its timeout (or the output cap) stopped has failed, whatever it printed: its table may stop part-way, and a process missing from it is no proof that it ended. A `ps` that exited by itself counts as success even when its timer fired late (the event loop was blocked, not `ps`).
+- A table without the Lair server's own pid is not complete and fails the same way; so does one without pid 1, once a snapshot has shown pid 1 (a host that hides other users' processes never shows it).
+- Each snapshot keeps when its `ps` started and when it answered. The agents module counts process start times back from that, never from the time it reads the cache, so a snapshot seconds old doesn't make a live process look like another one. When it is about to end a run on a snapshot, it reads `ps` again first, bypassing the cache (see [Restarts and hosts](#agents)).
 - A cache older than 10 seconds shows as stale; the dashboard shows the cache age.
 
 **Configuration** (environment variables; these are server-wide, not per project):
@@ -1570,7 +1572,20 @@ A run is requested for an agent (a `dragons:` entry or a `dragons.txt` line) and
   - a provider unreachable for the fleet for `transient_max_minutes` (`escalation`, one open per provider and outage; once answered "wait", asked again after each further `transient_max_minutes`; withdrawn once the outage is over): `wait` keeps trying one start at a time, `retry_now` lets every run waiting on it start on the next check.
   When the inbox refuses a decision (its open-decision cap, say), it is written to `inbox_file` as an `- OWNER? ...` entry with the evidence instead.
 - **The watchdog.** The watchdog's `agent_hung` and `orphan_claim` detectors leave an agent with an active run here to this module (their SLO detail says so), so one failure is never handled twice.
-- **Restarts and hosts.** When the Lair server stops (Restart, Update, a stop and start), the agents keep running. When it starts again it finds each running run's process by pid and start time and carries on supervising it: a process that is still alive is supervised to its end as before (hung, failover, a lost claim), and nothing is started a second time. What the new server can't learn is a re-adopted process's exit code (only the server process that started an agent sees it exit; a config reload keeps it), so when one ends, or ended while Lair was down, the agent's queue line decides:
+- **Restarts and hosts.** When the Lair server stops (Restart, Update, a stop and start), the agents keep running (`on_restart: adopt`, the default). Each run's pid, process group, the start time of its process and a fingerprint of its start command are kept in the store when it starts. Before the new server's first tick judges anything, it reconciles every run the store says is running or stopping against the process table:
+  - **adopted**: a process runs under the run's pid and started when the run's process did (within `pid_start_tolerance_seconds`). Lair supervises it to its end as before (hung, failover, a lost claim), its claim stays, and fill counts it as active (a `run_adopted` event). Its command line is checked too (the whole `ps` command line, or the part after an interpreter for a script), but a difference is only noted in the event (`data.commandDiffers`): a start script that `exec`s the agent, or a program that rewrites its title, shows another command line, and pid and start time already identify the process. A run recorded before process groups and commands were kept is adopted on its pid and start time alone, as before;
+  - **lost**: a process runs under the run's pid but started at another time: the pid was reused. That process is never signalled, the run ends `failed` (`lost in a restart: ...`, a `run_lost` recovery event), and its task is free;
+  - **gone**: nothing runs under the pid. Its exit is classified by its queue line, as below.
+
+  One reading of the process table never ends a run: before a run is lost or gone (here, and whenever a later tick finds a run it didn't start missing), a second, fresh reading taken after the tick's own (never the [shared cache](#process-cache-a2)'s) must say so too. When that reading fails, the run keeps its state, claim and locks, and the next tick reads again. Start times count back from when a reading was taken, allowing for how long `ps` took, so a cached reading seconds old or a `ps` slowed by load doesn't make a live process look like another one; a tick's time is taken after its reading.
+
+  Fill starts nothing until every run has its verdict: a fill check that comes first finds `lastError` saying so and does nothing. A failed `ps` fails the reconciliation as it fails a tick, and the next tick tries again. A `read_only` project reconciles nothing (it starts and stops nothing either).
+
+  With `on_restart: stop`, the server's own shutdown (Restart, Update, SIGTERM or SIGINT) stops the runs too: SIGTERM to each running run's process group (only a process provably the run's), up to `stop_grace_seconds` for them to end, never more than 20 s so the shutdown stays within its 60 s limit, then SIGKILL; every signal is a `stopped_for_shutdown` event. A run this server started is followed by its exit status; a run it adopted, by a fresh reading of the process table every second (never the cache's): one that ends on SIGTERM isn't sent SIGKILL. When the table can't be read, an adopted run isn't signalled, and it gets SIGKILL only when the wait's last reading showed it still running (otherwise it can't be proven the run's). The runs stay `stopping` until the next server's first tick ends them by their queue line: a DONE, WAITING or BLOCKED line completes the run as below; with none it ends `failed` (not counted as a failed attempt) and its task is free, so fill starts a fill task again and any other run is the owner's to start again. With `adopt`, the shutdown never waits on agent runs.
+
+  As a last guard against two runs of one task, fill checks the process table before it starts a task: a live process that no active run owns, whose command line holds one of the task's run prompt files (`<prompts_dir>/<task>-<agent>-<run>.txt`, the file Lair writes for each run and passes as `{prompt_file}`), is a run of the task Lair doesn't know. Fill doesn't start the task (`held: conflict`), records one `fill_conflict` event for that process, and starts it once the process has ended. An adapter whose `start_cmd` doesn't take `{prompt_file}` isn't covered by this check.
+
+  What the new server can't learn is a re-adopted process's exit code (only the server process that started an agent sees it exit; a config reload keeps it), so when one ends, or ended while Lair was down, the agent's queue line decides:
   - a DONE, WAITING or BLOCKED line for the task, written by that agent (by its attribution, `by <agent>`) since the run's chain was requested, completes the run. Its detail says `exit unknown (it ended while Lair was restarting); classified from its queue line: WAITING` (or DONE, BLOCKED), and its `completed` event keeps the line. The line is read with fill's `done_pattern`, `waiting_pattern` and `blocked_pattern` (their defaults when fill is off), so a [fill](#fill) task goes on exactly as after exit 0 on that line: `done`, `held: waiting` until its wake comes, or `held: blocked` with fill's one decision. Nothing is escalated;
   - with no such line, the end counts as one failed attempt (an `exit_unknown` recovery event): the task is restarted with the same session, then in a fresh one, as `recovery` allows, and is escalated only once those restarts are used up, as for a crash.
   Have agents write their DONE, WAITING or BLOCKED line before they exit: across a restart it is the only way Lair can tell a finished run from a crash. Liveness is read from this machine's process table, so one data directory (`data/agents.db`) and its lock files belong to one host: don't share them between machines, or one host would judge the other's processes dead.
@@ -1611,6 +1626,7 @@ agents:
 | `hung_minutes` | number | `watchdog.hung_minutes` (`45`) | Silence limit for a running agent |
 | `stop_grace_seconds` | number | `30` | SIGTERM, then SIGKILL after this long |
 | `pid_start_tolerance_seconds` | number | `5` | How far a process's start time may be from its owner's recorded one |
+| `on_restart` | `adopt` \| `stop` | `adopt` | The server's own shutdown: `adopt` leaves the runs working for the next server to adopt; `stop` stops them (SIGTERM to each run's process group, SIGKILL after `stop_grace_seconds`, 20 s at most). See Restarts and hosts |
 | `session_dir` | string | — | The agent's session directory, moved aside for a fresh session. `{agents_dir}`, `{agent}` and `{repo}` are replaced; relative to `repo` |
 | `branch_state_cmd` | array | — | Prints the branch state for a resume summary. `{task}`, `{agent}`, `{repo}` |
 | `command_timeout_seconds` | number | `30` | Timeout for `branch_state_cmd` |
@@ -2087,7 +2103,7 @@ The owner only (the owner's session from [the owner credential](#decision-inbox)
 
 ## Placement
 
-> Off by default. With `enabled: true` and the default `mode: observe`, placement probes your machines, estimates when every queued job finishes, and shows where it would move each one. It runs none of your commands except the probes.
+> Off by default. With `enabled: true` and the default `mode: observe`, placement probes your machines, estimates when every queued job finishes, and shows where it would move each one. It runs none of your commands except the probes and, for an [on-demand machine](#on-demand-machines), its `state_cmd` and `guard_cmd` checks.
 
 Placement is for projects that keep their own gate queue and runners: the request files under `gates_dir/queue/` that the Gates section reads, one lane per runner. It decides which machine runs each queued job, for any number of machines, and moves a job to another lane when it is expected to finish sooner there. Lair never renames a request itself. In act mode it runs your `move_cmd`, which validates and moves the request, and then checks that the request landed.
 
@@ -2158,7 +2174,7 @@ Each decision is explained in one line, for example `moved 20260101T000000Z-fix-
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | boolean | `false` | Run placement for this project |
-| `mode` | `observe` \| `act` | `observe` | `observe` records and shows advice (`would_move`); `act` runs `move_cmd`, unless the project is `read_only: true` |
+| `mode` | `observe` \| `act` | `observe` | `observe` records and shows advice (`would_move`); `act` runs `move_cmd` and an on-demand machine's `touch_cmd`, unless the project is `read_only: true` |
 | `interval_seconds` | number | `60` | Seconds between ticks (10 to 3600) |
 | `probe_timeout_seconds` | number | `15` | Timeout of each probe and load command |
 | `command_timeout_seconds` | number | `60` | Timeout of `move_cmd` and of an on-demand machine's `state_cmd`, `guard_cmd` and `touch_cmd` |
@@ -2202,7 +2218,7 @@ On-demand machine options (the `on_demand` block; see [On-demand machines](#on-d
 | `cost_per_hour` | number | — | Shown in the status; of two moves that are equally good, the one to the cheaper lane wins |
 | `check_seconds` | number | `300` | Minimum seconds between state and guard checks (the guard may call paid APIs) |
 | `speed_factor` | number | `1.0` | While the machine has no run of a class yet, its expected duration is this times what the class takes on the other machines (`0.5`: twice as fast) |
-| `touch_cmd` | array | — | Argv that refreshes the machine's activity mark (or lease), run while a job runs in one of its lanes |
+| `touch_cmd` | array | — | Argv that refreshes the machine's activity mark (or lease), run while a job runs in one of its lanes, in act mode only |
 | `touch_seconds` | number | `60` | How often `touch_cmd` runs while a job runs there. A touch runs at most once per tick, so this may not be shorter than `interval_seconds` |
 
 Lane options:
@@ -2231,8 +2247,8 @@ A machine with an `on_demand` block is one your project starts when a job lands 
 
 - **Available.** A machine whose state is `stopped` and whose guard says ok is **available**: its lanes are planned as if it were up, with `boot_seconds` added to every estimate there (once). Running, it counts like any machine, through its probes and `min_up_seconds`. A refusing guard, an unknown state, or a command that fails or times out makes it **unavailable**, with the reason shown; so do `pending` and `stopping`.
 - **Starting it.** A lane on an available machine is a target only through `routing`: a lane's `overflow_to` lists it, or the lane has `prefer_when_faster`. A move there needs a free slot and a gain above 0 of at least the routing's `min_gain_seconds`, in all too; with `overflow_to` alone the job must also be waiting (it would not start now where it is). These moves go before moves by time. In act mode, right before such a move the guard runs again (unless it ran in this tick): a refusal cancels the move (`placement.move_failed`, the job waits its cool-down) and the machine stays unavailable until its next check.
-- **Moving back.** A job queued in its lane while the guard refuses or the state is unknown goes back, before any other move, to a lane whose `overflow_to` lists that lane (else to any up lane that runs its class): `moved back q1 aws→heavy: est. never → 60 min; aws guard refused: spend 181 >= limit 180; heavy idle`. Its cool-down and `max_moves_per_job` still apply. A machine that is `pending` or `stopping` keeps its jobs.
-- **Keeping it alive.** While a job runs in one of its lanes, `touch_cmd` runs every `touch_seconds`, so the machine's idle timer does not stop it during a long phase of the job that does not use it. A check that finds the machine `stopped` (or `stopping`) after it had answered, while jobs run in its lanes, emits `placement.machine_stopped_under_job` once per job; when the runner puts such a job back in that lane while the machine is not up, it moves back once (`aws stopped under it`).
+- **Moving back.** A job queued in its lane while the guard refuses or the state is unknown goes back, before any other move, to a lane whose `overflow_to` lists that lane (else to any up lane that runs its class): `moved back q1 aws→heavy: est. never → 60 min; aws guard refused: spend 181 >= limit 180; heavy idle`. Its cool-down and `max_moves_per_job` still apply, so a job moved in and refused straight after waits out the cool-down of that move (30 min by default) before it goes back, and one that reached `max_moves_per_job` is held where it is. A machine that is `pending` or `stopping` keeps its jobs.
+- **Keeping it alive.** While a job runs in one of its lanes, `touch_cmd` runs every `touch_seconds`, so the machine's idle timer does not stop it during a long phase of the job that does not use it. A touch keeps a paid machine on, so it runs in act mode only: in observe mode or on a `read_only` project it never runs, and the status shows why (`touchError: not touched: placement.mode is observe`). A check that finds the machine `stopped` (or `stopping`) after it had answered, while jobs run in its lanes, emits `placement.machine_stopped_under_job` once per job; when the runner puts such a job back in that lane while the machine is not up, it moves back once (`aws stopped under it`). The state is checked at most every `check_seconds`, so the notice can come up to `check_seconds` (5 min by default) after the machine stopped, not within a minute; a job its runner already put back in the queue by then gets no notice and is planned like any job queued for that machine.
 - **Shown.** The Machines section shows the on-demand state next to the probe state: `on demand: stopped, guard ok, 150 s boot`, `on demand: starting`, `on demand: running`, `on demand: refused (guard refused: ...)`. The status (`onDemand`) has the power state, availability and reason, the last check and the last touch with its error. A move explains itself: `moved q1 heavy→aws: est. 2 h 0 min → 63 min; aws stopped, guard ok, 150 s boot; overflow: heavy had 1 waiting; aws idle`.
 
 ```yaml
@@ -2271,6 +2287,107 @@ With this configuration a job waiting in `heavy` goes to `aws` when it would fin
 `GET /api/placement/status?project=` (read-only): the mode and why act mode is off, config errors, the last tick, every machine's probe state (up, starting, down; since when; load and cpus) and, for an on-demand machine, its power state, availability and reason, last check and last touch, every lane's slots in use and per-class limits, every job's class, expected start and finish, advice and why it stays where it is, the latest moves (moved, failed, interrupted, gone, would_move, each with its argv and explanation), and the learned durations.
 
 Events on the bus: `placement.moved`, `placement.would_move`, `placement.move_failed`, `placement.machine_up`, `placement.machine_down`, `placement.job_held`, `placement.machine_stopped_under_job` (`{project, machine, gateId, lane, state}`).
+
+## Cloud machines
+
+> Off by default. With `enabled: true`, Lair describes each cloud machine's instance through its provider, meters what it costs, reads the account's cost, and keeps a money guard that every start goes through. It does not start or stop a machine by itself yet: starting on demand and stopping when idle come next ([cloud runners](design/cloud-runners.md) §11 step 2), through this guard.
+
+```yaml
+cloud:
+  enabled: true
+  check_seconds: 300
+  machines:
+    cloud-1:
+      provider: aws-ec2
+      region: us-east-1
+      profile: lair-gates            # a named profile in your AWS config files; never keys here
+      instance:
+        id: i-0123456789abcdef0
+        tag: { key: role, value: gate-server }
+      price_per_hour: 0.35           # rounded up: the meter counts every run at this price
+      storage_per_month: 6
+  budget:
+    limit: 100                       # US dollars; give the provider's own budget the same limit
+    period: { start: 2027-01-01, end: 2027-12-31 }
+    meter_start: 1
+```
+
+### Cloud options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Watch this project's cloud machines and run the guard. On, it needs at least one machine and a `budget` |
+| `check_seconds` | number | `300` | Seconds between checks (60 to 3600): each machine is described, and the guard runs |
+| `request_timeout_seconds` | number | `30` | Every provider call is cut off after this (5 to 120) |
+| `machines` | map | `{}` | Machine id → machine options (below). An id that is also a machine under `machines:` or `placement.machines` is shown as one machine |
+| `budget` | object | — | The money guard's limit (below) |
+
+Machine options:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `provider` | `aws-ec2` | — | The provider (AWS EC2 for now) |
+| `region` | string | — | The instance's region, such as `us-east-1` |
+| `profile` | string | — | A named profile in your AWS config files: the only source of credentials (see below) |
+| `instance.id` | string | — | The EC2 instance id |
+| `instance.tag` | `{key, value}` | — | A tag the instance must carry. Lair describes, starts and stops only an instance with this id and this tag: one without it is "not found" |
+| `price_per_hour` | number | — | The hourly price, rounded up. The meter counts each run at the higher of the price when Lair recorded it and the current one |
+| `storage_per_month` | number | `0` | The machine's disk per month, counted for every month of the period begun so far |
+
+Budget options:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `limit` | number | — | No start at or above this spend, in US dollars |
+| `period.start`, `period.end` | `YYYY-MM-DD` | — | The days the limit covers, both included (UTC). Outside them no start happens. For promotional credits, cover the credits' validity |
+| `meter_start` | number | `0` | Spend before the meter's first run |
+| `spend_check_hours` | number | `6` | How old the provider's cost reading may get before it is read again (1 to 24): each reading may cost money, and provider data lags anyway. A start never rests on a reading older than a day |
+| `warn_percent` | number | `80` | From this share of the limit on, the guard says `warning` (a start is still allowed) |
+
+### Credentials
+
+Credentials never go in the project's YAML. A machine names a `profile`, and Lair reads that profile alone from the AWS shared config and credentials files (`~/.aws/config` and `~/.aws/credentials`, or the files `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE` name), SSO, role and `credential_process` profiles included. Keys in the server's environment or an instance role are not used in its place. A key named like a credential anywhere under `cloud:` (`access_key`, `secret`, `session_token`, `password`, `credential`), or a value shaped like an AWS access key id, makes the block invalid; the error names the place, never the value.
+
+The profile needs `ec2:DescribeInstances`, `ec2:StartInstances` and `ec2:StopInstances` (the last two limited to instances with the tag), and `ce:GetCostAndUsage`. For example:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "ec2:DescribeInstances", "Resource": "*" },
+    {
+      "Effect": "Allow",
+      "Action": ["ec2:StartInstances", "ec2:StopInstances"],
+      "Resource": "arn:aws:ec2:*:*:instance/*",
+      "Condition": { "StringEquals": { "aws:ResourceTag/role": "gate-server" } }
+    },
+    { "Effect": "Allow", "Action": "ce:GetCostAndUsage", "Resource": "*" }
+  ]
+}
+```
+
+### The meter and the money guard
+
+- **Spend** is the larger of two. Lair's meter: every run of every machine (the launch and stop times the provider reports) at `price_per_hour`, rounded up to whole minutes, plus `storage_per_month` for every month of the period begun so far, plus `meter_start`. A run whose stop the provider does not date counts up to the check that saw it stopped; a run still open when the machine launches again ends at that launch at the latest. And the provider's reading with what the meter counted since that reading's data ends: the reading is the account's unblended cost with credits and refunds left out, from `period.start` to today, read at most every `spend_check_hours` and kept in `data/cloud.db` (a restart does not read it again). Cost Explorer's data can be a day late, so a reading taken at T holds the spend up to T less a day; the meter's runs since then, and storage by the hour (at a 28-day month's rate), are added to it, so the provider's lag never hides a run.
+- **What Lair did not see.** The provider dates only an instance's last launch, so runs that started and stopped while Lair was down, or between two checks, leave nothing but a newer launch. When Lair sees a launch newer than the last one it saw, after it last saw the machine stopped, the time from that sighting (less a minute) to the launch is a gap. A gap up to two checks long (`2 × check_seconds`) counts at `price_per_hour` as if the machine ran throughout (a start Lair makes itself adds about a minute this way). A longer one (Lair was down, or describes failed) is blind: no start happens until a cost reading taken a day after that launch is in, as its data then holds whatever ran. The first time Lair sees a machine is blind up to its last launch: a machine last launched before `period.start` has nothing to wait for, one launched in the period waits up to a day. A machine seen running before and after a gap keeps one run across it, so that whole time counts. Gaps are kept in `data/cloud.db`: a restart forgets none.
+- **At the limit** (spend at or above `limit`) the guard trips: no start, the trip is recorded once with its spend, limit, period and reason, and `cloud.guard_tripped` is emitted. Later readings do not clear it, nor does a restart, nor does any edit of the config: a higher `budget.limit` or a new `period` alone leaves it standing (anything that can write the project file could make that edit). Only the owner clears it: **Clear the trip** in a cloud machine's detail (the Machines section), which sends `POST /api/cloud/trip/clear` with the owner's session and the trip's time. The clear is recorded with the owner session's public id and an optional note, logged, and emitted as `cloud.trip_cleared`; the guard then judges the spend again at the next check or start, and trips again if it is still at the limit. So raise `budget.limit` (and the provider's budget) first, then clear the trip.
+- **The clock.** A clock behind the provider's never makes the meter count short: every run counts a minute at least (as EC2 bills one at least per start), and a stop the provider dates after this machine's clock is kept as dated, not cut back to now. A launch or stop dated more than a minute after this machine's clock means the clock is wrong: that machine's description is not recorded and starts are refused until the clock is fixed.
+- **It fails closed.** A machine Lair could not describe in this check, a cost reading that failed, a blind gap no reading covers yet, or a day outside the period refuses a start too (`refused`, not a trip: starts are allowed again once the readings come back). A new account has no cost data for up to a day: that reading is "no data yet" (`unknown`), and the meter decides alone, but only for a new account: within two days of the account's first reading, while no amount was ever read for it, and, when the answer simply held no cost, while the meter has counted nothing (no storage, no run in the period). Past that, "no data" is a failed reading and refuses starts, so a wrong filter, a changed answer or another payer account never quietly removes the provider's reading.
+- **Every start** runs the guard first on fresh readings: each machine is described again, and the cost is read if its reading is due. Checks and starts run one at a time. A stop is never refused. A config reload replaces the project's cloud instance: the old one calls no provider again (a start queued on it is refused), and the module exports no provider, so nothing in Lair reaches a provider's start but through the guard.
+- **Shown to the owner only.** The Machines section lists each cloud machine with its power state (`running`, `stopped`, `pending`, `stopping`, or `unknown` with the reason), shows the spend and the guard in its header (`Cloud spend $12.40 of $100.00 (12.4%) · guard ok`), and in a machine's detail its instance and tag, last launch and stop, price, the meter's parts (compute, storage, starting amount, today), each account's reading and any trip. A browser not signed in as the owner sees none of it.
+- **The account stays hidden.** A provider's error text names the account and the role (`User: arn:aws:sts::<account>:assumed-role/... is not authorized`). Lair hides every ARN, 12-digit account id and access key id in it (`arn:(hidden)`, `(account id hidden)`) before it keeps, logs or shows it, and keeps at most 300 characters.
+
+### Cloud API
+
+Every route is the owner's, reads included (the status names the account's instances and spend): `/api/cloud` is in `OWNER_ONLY_PREFIXES`, so no CORS is granted under it, and a request without the owner's session gets HTTP 403.
+
+`GET /api/cloud/status?project=` (read-only): config errors, the last check, each machine's provider, region, instance and tag, power state, last launch and stop, last check and error, and the budget: limit, period, spend and its share of the limit, the meter's parts, each account's cost reading (`amount`, `unknown`, `error`, `not_read`), and the guard (`ok`, `warning`, `tripped`, `refused`) with its reason and the trip that stands (`{limit, period, spend, at, reason}`).
+
+`POST /api/cloud/trip/clear?project=` with `{"trippedAt": "<the trip's at>", "note": "..."}` (owner): clears the trip that stands. `trippedAt` must be the standing trip's time, so a page showing an older trip clears nothing (HTTP 409, as when no trip stands). Answers `{cleared, by}` (the trip and the owner session's public id).
+
+No route starts or stops a machine or changes the budget: the machines and the budget are changed in the project's YAML or in Settings.
+
+Events on the bus: `cloud.guard_tripped` (`{project, limit, spend, reason}`), `cloud.trip_cleared` (`{project, trippedAt, limit, spend, by, note}`).
 
 ## Cleanup
 
@@ -2675,7 +2792,7 @@ The **Settings** view edits every key on this page, for the owner only (reads in
 - **Nothing invalid is written.** A change is checked first by the same parsers startup and [live reload](#live-config-reload) use; a refused change leaves the file untouched. A saved change is applied by live reload at once.
 - **Only the changed lines change.** A form save edits the file's own text where it can: a changed value, a key removed from or added to a map (a new entry among one-line `{ ... }` entries is written like them). Every other line stays byte for byte: padded flow maps, comments aligned with several spaces, multi-line flow maps, list indentation. A change that can't be made that way (a list that grows or shrinks, a new nested block) writes the file from its parsed form instead: comments and key order still stay, and flow maps keep their padding when the file pads them. YAML anchors are kept too: changing an anchored value (`&name`) from the form changes every alias of it (`*name`), and changing an alias replaces only that alias with the new value (a key inside an alias is edited in the YAML tab).
 - **No silent overwrite.** A save names the version of the file it started from. If the file changed since (a hand edit, another browser), it is refused (HTTP 409) with what saving would now change, and the review drawer offers to review the same changes again on top of the current file.
-- **Commands are confirmed.** A change that adds or changes something Lair runs (any `*_cmd` key, adapters' `start_cmd` and `stop_cmd`, watchdog `actions`, triage `commands`, placement's `probe`, `load_cmd` and `move_cmd`, a step's `run`, a process's `command`, `gate_script`...) shows the exact argv lists and needs your confirmation; the server refuses it without (HTTP 428). So does a change to a field that decides what Lair runs or where it sends code and tokens: a machine's `host`, `user` and `key`, an environment's `compose_files`, `project_directory` and `deploy.repo`, `executors.github.checkout_action`, `review.api_url` and `review.merge.clone_url`.
+- **Commands are confirmed.** A change that adds or changes something Lair runs (any `*_cmd` key, adapters' `start_cmd` and `stop_cmd`, watchdog `actions`, triage `commands`, placement's `probe`, `load_cmd` and `move_cmd`, a step's `run`, a process's `command`, `gate_script`...) shows the exact argv lists and needs your confirmation; the server refuses it without (HTTP 428). So does a change to a field that decides what Lair runs or where it sends code and tokens: a machine's `host`, `user` and `key`, an environment's `compose_files`, `project_directory` and `deploy.repo`, `executors.github.checkout_action`, `review.api_url` and `review.merge.clone_url`, and a cloud machine's `profile` and `instance` and the cloud budget's `limit` and `period` (which account and instance Lair acts on, and how much it may spend).
 - **No secrets.** A value whose key names a secret (`token`, `password`, `api_key`, `private_key`...) or that looks like one (a private key, a known token format, a URL with a password) is refused. Keep secrets in a file under `data/` (mode 0600) or an environment variable and name it in the config (`token_env`, `*_file`); the view shows whether the ones Lair knows are set, never their values. Comments are scanned too, for values shaped like a secret (a comment has no key to go by), and no error message ever quotes a secret.
 - **History.** Every accepted version is kept in `data/config-history/<project>/` (the newest 50) with when and which owner session (its public id) made it; a version Settings finds on disk that it didn't write, such as a hand edit, is kept too before it is replaced. If that version holds something that is or looks like a secret, only a note of it (when, its hash) is kept, never its text, so it can't be restored. Each shows its diff, and **Restore** saves it again through the same checks.
 - **Files.** Writes are atomic (a temporary file, `fsync`, `rename`). A project file that is a symlink, a `projects/local/` that is one, or anything but a regular file is refused. A save is at most 1 MiB, like the file.

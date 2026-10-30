@@ -377,7 +377,8 @@ export class Placement {
 
   /**
    * While a job runs in an on-demand machine's lanes, keep the machine alive:
-   * touch_cmd every touch_seconds. A check that found the machine stopped
+   * touch_cmd every touch_seconds, in act mode only (observe mode and a
+   * read_only project record why not). A check that found the machine stopped
    * after it had answered is an infrastructure event: one
    * placement.machine_stopped_under_job per job running there, and the job
    * goes back once if it is queued there again while the machine is not up.
@@ -405,6 +406,12 @@ export class Placement {
         }
         const touch = m.onDemand.touchCmd;
         if (!touch || running.length === 0) return;
+        // A touch keeps a paid machine on: act mode only, like a move
+        const blocked = this.actBlocked;
+        if (blocked !== null) {
+          od.touchError = `not touched: ${blocked}`;
+          return;
+        }
         if (od.lastTouchAt !== null && now - od.lastTouchAt < m.onDemand.touchSeconds * 1000) return;
         const out = await this.run(touch, timeoutMs);
         if (this.abort.signal.aborted) return;

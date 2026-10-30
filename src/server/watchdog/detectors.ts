@@ -195,31 +195,12 @@ const orphanClaim: Detector = {
       }
       if ((await view.agentProcesses(claim.agent)).length > 0) continue; // live agent: never touched
 
-      // Check the claim file's recorded pid: if it is alive AND belongs to this agent, skip it.
-      // A live pid alone is not enough: after the agent dies, the OS can reuse that pid for
-      // an unrelated process, so we verify the process matches the agent.
+      // The claim's recorded pid, when it is alive AND the agent's: a live pid alone is not
+      // enough, since the OS can give a dead agent's pid to an unrelated process (claimPidBelongsTo)
       const claimPid = view.claimPid(claim);
-      if (claimPid !== null) {
-        const proc = await view.getProcess(claimPid.pid);
-        if (proc !== null) {
-          // The pid is alive. Check if it belongs to this agent:
-          // 1. If the claim has a start time, the process uptime should roughly match
-          //    (the process should have been running since approximately that time)
-          // 2. Or, the process command contains the agent id
-          const expectedUptimeMs = claimPid.startedAt !== null ? view.now - claimPid.startedAt : null;
-          const actualUptimeMs = proc.elapsedSeconds * 1000;
-          // Allow 10% tolerance plus 60 seconds for timing differences
-          const toleranceMs = expectedUptimeMs !== null ? Math.max(60000, expectedUptimeMs * 0.1) : 0;
-          const startMatch =
-            expectedUptimeMs !== null &&
-            Math.abs(actualUptimeMs - expectedUptimeMs) <= toleranceMs;
-          const commandMatch = proc.command.includes(claim.agent);
-          if (startMatch || commandMatch) {
-            livePid.push(`${claim.agent} (pid ${claimPid.pid})`);
-            continue;
-          }
-          // The pid is alive but doesn't match the agent: it's a reused pid, treat as orphan
-        }
+      if (claimPid !== null && (await view.claimPidIsAgents(claim, claimPid))) {
+        livePid.push(`${claim.agent} (pid ${claimPid.pid})`);
+        continue;
       }
 
       const age = view.minutesSince(claim.mtimeMs);

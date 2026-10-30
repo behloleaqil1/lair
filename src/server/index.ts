@@ -52,6 +52,7 @@ import { getBudgetManager } from "./fleet/budget.js";
 import { ReviewManager, inboxDecisionSink, registerReviewRoutes } from "./review/index.js";
 import { mountTriage } from "./triage/index.js";
 import { PlacementManager, registerPlacementRoutes } from "./placement/index.js";
+import { CloudManager, registerCloudRoutes } from "./cloud/index.js";
 import { registerDashboardRoutes } from "./dashboard/index.js";
 import type { DashboardSources } from "./dashboard/routes.js";
 import { RequestLatency, mountSupervisor, registerLatencyHook } from "./supervisor/index.js";
@@ -625,6 +626,18 @@ const placements = new PlacementManager({
 placements.load(projectEntries);
 await registerPlacementRoutes(fastify, placements, () => getDefaultProject());
 
+// Cloud machines: one per project with `cloud.enabled: true` (off by
+// default). It describes each machine's tagged instance through its
+// provider (AWS EC2, credentials from a named profile only), meters the
+// spend, reads the provider's cost, and runs the money guard that every
+// start goes through. Its routes are the owner's, reads included.
+const clouds = new CloudManager({
+  dbPath: join(process.cwd(), "data", "cloud.db"),
+  events: getEventBus(),
+});
+clouds.load(projectEntries);
+await registerCloudRoutes(fastify, clouds, () => getDefaultProject(), humanAuth);
+
 // The dashboard's own reads (src/server/dashboard/): the nav's module flags,
 // a gate's detail from the queue, the pipelines, triage and placement, and
 // the owner-only log tails and failing tests
@@ -711,7 +724,7 @@ const { supervisor: selfChecks, chat: supervisorChat } = await mountSupervisor(f
 // the modules whose part of it changed, without a restart; an invalid one
 // keeps the previous config running and shows in the dashboard's banner
 const reloader = new ConfigReloader({
-  modules: serverModules({ delivery, watchdogs, pipelines, reviews, agents, triage, placements, planner, supervisor: selfChecks }),
+  modules: serverModules({ delivery, watchdogs, pipelines, reviews, agents, triage, placements, clouds, planner, supervisor: selfChecks }),
   initial: projectEntries,
   events: getEventBus(),
   onAccepted: (project, config) => {
@@ -807,13 +820,16 @@ const stopServer = async (reason: string) => {
   // Stop the planner first: it requests runs from the agents module
   await planner.stop();
 
-  // Stop agent supervision (the agents themselves keep running)
-  await agents.stop();
+  // Stop agent supervision: the agents keep running for the next server to adopt, unless a project sets
+  // agents.on_restart: stop (then their runs are stopped too, within a bounded wait)
+  await agents.stop({ planned: true });
   // Stop triage: wait for calls in progress, then close its store
   await triage.stop();
 
   // Stop placement: a move in progress is cut short and found again on the next start
   await placements.stop();
+  // Stop cloud checks: a check in progress finishes, then the store closes
+  await clouds.stop();
 
   // Stop the shared process cache (all modules have stopped, so no one reads it)
   disposeProcessCache();
@@ -969,6 +985,14 @@ const start = async () => {
       placed.length > 0
         ? `[placement] Placing jobs for: ${placed.join(", ")}`
         : "[placement] Off (no project sets placement.enabled)",
+    );
+
+    // Start cloud checks (describe, meter, cost reading, money guard)
+    const metered = clouds.start();
+    console.log(
+      metered.length > 0
+        ? `[cloud] Watching cloud machines for: ${metered.join(", ")}`
+        : "[cloud] Off (no project sets cloud.enabled)",
     );
 
     // Start file watchers for all projects

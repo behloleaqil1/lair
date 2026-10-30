@@ -42,7 +42,8 @@ import {
   type RunOptions,
 } from "../watchdog/probes.js";
 import { WatchdogManager } from "../watchdog/service.js";
-import { AgentsManager, type AgentsService } from "./service.js";
+import { CachedProcessTable, ProcessCache, type PsRunner } from "../core/process-cache.js";
+import { AgentsManager, RECOVERY_KINDS, type AgentsService } from "./service.js";
 import { LINE_GONE_CHECKS } from "./fill.js";
 import { registerAgentsRoutes } from "./routes.js";
 import { HumanAuth, OWNER_SESSION_HEADER, registerOwnerRoutes } from "../human-auth/index.js";
@@ -102,7 +103,10 @@ class FakeProcessTable implements ProcessTable {
   listCalls = 0;
   /** Runs right after reading n is taken: what happens on the machine between two readings */
   afterList?: (call: number) => void;
+  /** While set, a reading waits for it: a slow `ps` */
+  hold?: Promise<void>;
   async list(): Promise<ProcessInfo[]> {
+    if (this.hold) await this.hold;
     if (this.failing) throw new Error("ps failed (1): cannot read the process table");
     this.listCalls++;
     const reading = [...this.procs.entries()].map(([pid, p]) => ({
@@ -176,6 +180,8 @@ class FakeSpawner implements ProcessSpawner {
   failAll?: string;
   /** A stuck process ignores SIGTERM */
   ignoreTerm = false;
+  /** These processes ignore SIGTERM */
+  ignoreTermFor = new Set<number>();
   /** What a started process does at once: write its log, exit, ... */
   behaviour?: (pid: number, logPath: string, call: number) => void;
 
@@ -207,7 +213,7 @@ class FakeSpawner implements ProcessSpawner {
 
   kill(pid: number, signal: "SIGTERM" | "SIGKILL"): boolean {
     this.kills.push({ pid, signal });
-    if (signal === "SIGKILL" || !this.ignoreTerm) this.exit(pid, null);
+    if (signal === "SIGKILL" || (!this.ignoreTerm && !this.ignoreTermFor.has(pid))) this.exit(pid, null);
     return true;
   }
 
@@ -216,11 +222,56 @@ class FakeSpawner implements ProcessSpawner {
     this.started.delete(pid);
   }
 
-  /** The process ends with this exit code */
+  /** The process ends with this exit code: known only for a process this spawner started, as for the real one */
   exit(pid: number, code: number | null): void {
     this.procs.remove(pid);
-    this.exits.set(pid, code);
+    if (this.started.has(pid)) this.exits.set(pid, code);
   }
+}
+
+/** A `ps` etime: [[dd-]hh:]mm:ss */
+function etime(seconds: number): string {
+  const two = (n: number) => String(n).padStart(2, "0");
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const clock = `${two(Math.floor((seconds % 3600) / 60))}:${two(seconds % 60)}`;
+  if (days > 0) return `${days}-${two(hours)}:${clock}`;
+  return hours > 0 ? `${two(hours)}:${clock}` : clock;
+}
+
+/**
+ * `ps` itself, printing the fake machine's table as text, with pid 1 and this server (which every real table
+ * holds): the real shared cache and parser read it. `cut`: the timeout stops it after that many lines, part-way
+ * through the next one; `withoutSelf`: it prints a whole table that lacks this server's own pid.
+ */
+class FakePs {
+  cut?: number;
+  withoutSelf = false;
+  failing = false;
+  constructor(
+    private procs: FakeProcessTable,
+    private clock: FakeClock,
+    private self: ProcessOwner,
+  ) {}
+
+  run: PsRunner = async () => {
+    if (this.failing) return { stdout: "", code: 1, killed: false, error: "ps: cannot read the process table" };
+    const machine = await this.procs.list();
+    const server = { pid: this.self.pid, ppid: 1, elapsedSeconds: Math.floor((this.clock.now() - this.self.startedAt) / 1000), command: "node lair-server" };
+    const rows = [
+      { pid: 1, ppid: 0, elapsedSeconds: 30 * 86400, command: "/sbin/init" },
+      ...(this.withoutSelf || this.procs.has(this.self.pid) ? [] : [server]),
+      ...machine,
+    ].map((p) => `${String(p.pid).padStart(5)} ${String(p.ppid).padStart(5)} ${etime(p.elapsedSeconds).padStart(11)} ${p.command}`);
+    if (this.cut === undefined) return { stdout: `${rows.join("\n")}\n`, code: 0, killed: false };
+    const next = rows[this.cut] ?? "";
+    return {
+      stdout: `${rows.slice(0, this.cut).join("\n")}\n${next.slice(0, 4)}`,
+      code: null,
+      killed: true,
+      error: "Command failed: ps (timed out)",
+    };
+  };
 }
 
 class FakeCommandRunner implements CommandRunner {
@@ -300,6 +351,9 @@ interface Harness extends Paths {
   service: AgentsService;
   store: AgentsStore;
   bus: string[];
+  /** `ps` (read through the real shared cache with the `cachedPs` option) */
+  ps: FakePs;
+  psCache?: ProcessCache;
 }
 
 const dirs: string[] = [];
@@ -372,6 +426,8 @@ function setup(
     decisions?: DecisionInbox;
     /** Dragons beside worker-a and worker-b */
     dragons?: Record<string, unknown>;
+    /** Read the process table as the server does: `ps` through the shared cache (10 s max age) */
+    cachedPs?: boolean;
   } = {},
 ): Harness {
   const paths = options.paths ?? makePaths();
@@ -386,13 +442,18 @@ function setup(
     bus.push(event.type);
   });
   const systemInfo = new FakeSystemInfo();
+  const self = options.self ?? SELF;
+  const ps = new FakePs(procs, clock, self);
+  const psCache = options.cachedPs
+    ? new ProcessCache({ runPs: ps.run, clock: () => clock.now(), selfPid: self.pid, maxAgeMs: 10_000, psTimeoutMs: 15_000 })
+    : undefined;
   const probes: AgentProbes = {
-    processes: procs,
+    processes: psCache ? new CachedProcessTable(psCache) : procs,
     fs: new NodeFileSystem(),
     runner,
     clock,
     spawner,
-    self: options.self ?? SELF,
+    self,
     systemInfo,
   };
   const manager = new AgentsManager({
@@ -407,7 +468,7 @@ function setup(
   const service = manager.get("demo");
   const store = manager.getStore();
   if (!service || !store) throw new Error(`agents not enabled: ${manager.status("demo").errors.join("; ")}`);
-  return { ...paths, config, clock, procs, spawner, runner, systemInfo, manager, service, store, bus };
+  return { ...paths, config, clock, procs, spawner, runner, systemInfo, manager, service, store, bus, ps, psCache };
 }
 
 const request = (h: Harness, agent = "worker-a", task = "feat-login", prompt = "Build the login form") =>
@@ -1057,6 +1118,481 @@ describe("4. hung and dead-on-start: same session K times, then a fresh one, the
     expect(eventsOf(h2, "escalated")).toEqual([]);
     expect(inboxEntries(h2)).toEqual([]);
     expect(h2.spawner.calls).toEqual([]);
+  });
+});
+
+// ============ 4a. RESTART RECONCILIATION ============
+
+describe("4a. a restart never leaves two runs of one task: the previous server's runs are adopted, lost or stopped", () => {
+  /** The new server after a restart, five minutes on */
+  const RESTARTED: ProcessOwner = { pid: 200, startedAt: NOW + 5 * MIN };
+  const fillOn =
+    (extra: Record<string, unknown> = {}) =>
+    (p: Paths) => ({
+      fill: {
+        enabled: true,
+        tasks_file: join(p.dir, "tasks.txt"),
+        agents: ["worker-a", "worker-b"],
+        prompt_files: ["{prompts_dir}/{agent}.txt"],
+        max_active: 2,
+        interval_seconds: 60,
+      },
+      ...extra,
+    });
+  function fillTasks(p: Paths, ...lines: string[]): void {
+    mkdirSync(p.promptsDir, { recursive: true });
+    writeFileSync(join(p.promptsDir, "worker-a.txt"), "You are worker A.\n");
+    writeFileSync(join(p.promptsDir, "worker-b.txt"), "You are worker B.\n");
+    writeFileSync(join(p.dir, "tasks.txt"), `${lines.join("\n")}\n`);
+  }
+  function lineOf(status: FillStatusView, task: string) {
+    const line = status.lines.find((l) => l.task === task);
+    if (!line) throw new Error(`no fill line for ${task}`);
+    return line;
+  }
+  /** The new server on the same data, started as the server starts it, through its first tick */
+  async function restart(h2: Harness): Promise<void> {
+    h2.clock.t = RESTARTED.startedAt;
+    h2.spawner.nextPid = 6001; // the machine's next pids, not the old server's
+    h2.service.start();
+    await h2.service.tick();
+  }
+
+  it("a run whose process still runs with its pid, start time and command is adopted with its claim, and fill does not start a second", async () => {
+    const h1 = setup(fillOn());
+    fillTasks(h1, "worker-a|A|feat-login|Build it");
+    await h1.service.checkFill();
+    await h1.service.tick();
+    const [before] = runs(h1);
+    expect(before).toMatchObject({ task: "feat-login", state: "running", pid: 5001, pgid: 5001 });
+    expect(before.commandFingerprint).toMatch(/^[0-9a-f]{16}$/);
+
+    // Lair restarts while the agent works: its process goes on
+    const h2 = setup(fillOn(), { paths: h1, self: RESTARTED });
+    h2.procs.add(5001, h1.spawner.calls[0].argv.join(" "), NOW);
+    await restart(h2);
+    await h2.service.checkFill();
+    await at(h2, 6 * MIN);
+
+    expect(runs(h2).map((r) => [r.id, r.state, r.detail])).toEqual([[before.id, "running", "working (pid 5001)"]]);
+    expect(h2.spawner.calls).toEqual([]);
+    expect(h2.store.getClaim("demo", "feat-login")).toMatchObject({ runId: before.id, ownerPid: 5001 });
+    const [adopted] = eventsOf(h2, "run_adopted");
+    expect(adopted).toMatchObject({ agent: "worker-a", task: "feat-login", runId: before.id });
+    expect(adopted.evidence[0]).toContain("its start time and command match (process group 5001)");
+    expect(eventsOf(h2, "exit_unknown")).toEqual([]);
+  });
+
+  it("a run whose pid another process has now (another start time) is lost on two readings: never signalled, never restarted, its task free", async () => {
+    const h1 = setup();
+    await request(h1, "worker-a", "feat-login");
+    await request(h1, "worker-b", "feat-search");
+    await h1.service.tick(); // pids 5001 and 5002
+    const [a, b] = runs(h1);
+
+    const h2 = setup(() => ({}), { paths: h1, self: RESTARTED });
+    // 5001 is a process that started after the run's; 5002 started with its run, but shows another command line
+    // (a start script that execs the agent, or a program that rewrites its title)
+    h2.procs.add(5001, "unrelated-daemon --serve", NOW + 3 * MIN);
+    h2.procs.add(5002, "agent-cli: worker-b (renamed)", NOW);
+    await restart(h2);
+    // The tick's own reading, then a fresh one before anything is ended
+    expect(h2.procs.listCalls).toBeGreaterThanOrEqual(2);
+    await at(h2, 6 * MIN);
+
+    const [lostA, keptB] = runs(h2);
+    expect(lostA).toMatchObject({ id: a.id, state: "failed" });
+    expect(lostA.detail).toContain("lost in a restart: pid 5001 is a different process now");
+    expect(eventsOf(h2, "run_lost").map((e) => e.runId)).toEqual([a.id]);
+    // Pid and start time identify 5002: it is adopted and supervised, the different command line noted
+    expect(keptB).toMatchObject({ id: b.id, state: "running", detail: "working (pid 5002)" });
+    const [adopted] = eventsOf(h2, "run_adopted");
+    expect(adopted).toMatchObject({ runId: b.id, data: { pid: 5002, commandDiffers: true } });
+    expect(adopted.evidence[0]).toContain("its start time matches (process group 5002); its command line differs");
+    // Never signalled, and nothing started in their place
+    expect(h2.spawner.kills).toEqual([]);
+    expect(h2.procs.has(5001) && h2.procs.has(5002)).toBe(true);
+    expect(h2.spawner.calls).toEqual([]);
+    expect(eventsOf(h2, "restart_same_session")).toEqual([]);
+    expect(eventsOf(h2, "exit_unknown")).toEqual([]);
+    // feat-login is free; feat-search stays with its run's process
+    expect(h2.store.listClaims("demo").map((c) => [c.task, c.runId, c.ownerPid])).toEqual([["feat-search", b.id, 5002]]);
+  });
+
+  it("on_restart: stop: the server's shutdown signals each run's process group, SIGKILLs one that outlives the wait, and records each", async () => {
+    const h = setup(() => ({ on_restart: "stop" }));
+    await request(h, "worker-a", "feat-login");
+    await request(h, "worker-b", "feat-search");
+    await h.service.tick(); // pids 5001 and 5002
+    h.spawner.ignoreTermFor.add(5002); // worker-b's CLI ignores SIGTERM
+    appendFileSync(h.queueFile, "- DONE feat-login by worker-a 12:01Z: merged\n");
+
+    await h.manager.stop({ planned: true });
+
+    expect(h.spawner.kills).toEqual([
+      { pid: 5001, signal: "SIGTERM" },
+      { pid: 5002, signal: "SIGTERM" },
+      { pid: 5002, signal: "SIGKILL" },
+    ]);
+    // stop_grace_seconds is 30, but the shutdown waits on runs 20 s at most
+    expect(h.clock.now() - NOW).toBe(20 * SEC);
+
+    // The next server finds the records, and ends both runs by their queue line, starting nothing
+    const h2 = setup(() => ({ on_restart: "stop" }), { paths: h, self: RESTARTED });
+    expect(eventsOf(h2, "stopped_for_shutdown").map((e) => [e.agent, e.data.signal, e.data.pgid])).toEqual([
+      ["worker-a", "SIGTERM", 5001],
+      ["worker-b", "SIGTERM", 5002],
+      ["worker-b", "SIGKILL", 5002],
+    ]);
+    await restart(h2);
+    const [a, b] = runs(h2);
+    expect(a).toMatchObject({ agent: "worker-a", state: "completed", stopReason: "server_shutdown" });
+    expect(a.detail).toContain("classified from its queue line: DONE");
+    expect(b).toMatchObject({ agent: "worker-b", state: "failed", stopReason: "server_shutdown", killed: true });
+    expect(b.detail).toContain("with no queue line for the task: the task is free");
+    expect(h2.spawner.calls).toEqual([]);
+    expect(eventsOf(h2, "restart_same_session")).toEqual([]);
+    expect(h2.store.listClaims("demo")).toEqual([]);
+
+    // With on_restart: adopt (the default) the shutdown signals nothing and doesn't wait
+    const kept = setup();
+    const keptRun = await request(kept);
+    await kept.service.tick();
+    const eventsBefore = kept.store.listEvents("demo", { limit: 500 }).length;
+    await kept.manager.stop({ planned: true });
+    expect(kept.spawner.kills).toEqual([]);
+    expect(kept.clock.now()).toBe(NOW);
+    // ... and marks nothing: the run is still running, as the store has it for the next server (which opens it here)
+    const next = setup(() => ({}), { paths: kept, self: RESTARTED });
+    const [still] = runs(next);
+    expect(still).toMatchObject({ id: keptRun.id, state: "running", pid: 5001, detail: "working (pid 5001)" });
+    expect(still.stopReason).toBeUndefined();
+    expect(still.stopRequestedAt).toBeUndefined();
+    expect(next.store.listEvents("demo", { limit: 500 })).toHaveLength(eventsBefore);
+    expect(next.store.listEvents("demo", { kinds: [...RECOVERY_KINDS, "stopped_for_shutdown"], limit: 500 })).toEqual([]);
+    expect(next.store.getClaim("demo", "feat-login")).toMatchObject({ runId: keptRun.id, ownerPid: 5001 });
+  });
+
+  it("fill starts nothing before the first tick has reconciled the runs, then only what no run owns", async () => {
+    const h1 = setup(fillOn());
+    fillTasks(h1, "worker-a|A|feat-login|Build it");
+    await h1.service.checkFill();
+    await h1.service.tick(); // feat-login runs as pid 5001
+    const [before] = runs(h1);
+
+    // The new server, with a second task in the list, reads a process table that answers slowly
+    const h2 = setup(fillOn(), { paths: h1, self: RESTARTED });
+    fillTasks(h2, "worker-a|A|feat-login|Build it", "worker-b|B|feat-search|Search it");
+    h2.procs.add(5001, h1.spawner.calls[0].argv.join(" "), NOW);
+    h2.clock.t = RESTARTED.startedAt;
+    h2.spawner.nextPid = 6001;
+    let answer!: () => void;
+    h2.procs.hold = new Promise<void>((resolve) => (answer = resolve));
+    h2.service.start();
+    const first = h2.service.tick();
+
+    const waiting = await h2.service.checkFill();
+    expect(waiting.lastError).toContain("fill starts nothing until then");
+    expect(runs(h2).map((r) => r.id)).toEqual([before.id]);
+
+    answer();
+    h2.procs.hold = undefined;
+    await first;
+    expect(eventsOf(h2, "run_adopted").map((e) => e.runId)).toEqual([before.id]);
+    const status = await h2.service.checkFill();
+    await h2.service.tick();
+    expect(status.lastError).toBeNull();
+    expect(h2.spawner.calls.map((c) => c.env.LAIR_TASK)).toEqual(["feat-search"]);
+    expect(runs(h2).map((r) => [r.task, r.state])).toEqual([
+      ["feat-login", "running"],
+      ["feat-search", "running"],
+    ]);
+  });
+
+  it("a live process no run owns, holding one of the task's run prompt files, keeps fill from starting the task, with one notice", async () => {
+    const h = setup(fillOn());
+    fillTasks(h, "worker-a|A|feat-login|Build it", "worker-b|B|feat-login-v2|Build it again");
+    // A run of feat-login the store doesn't know (an older server's, say)
+    const orphan = join(h.promptsDir, "feat-login-worker-a-0a1b2c3d.txt");
+    h.procs.add(9001, `agent-cli run --agent worker-a --model model-a --prompt ${orphan}`, NOW - MIN);
+
+    await h.service.checkFill();
+    const status = await h.service.checkFill();
+    await h.service.tick();
+
+    expect(lineOf(status, "feat-login")).toMatchObject({ state: "held", hold: "conflict" });
+    expect(lineOf(status, "feat-login").detail).toContain("pid 9001 runs feat-login already");
+    // Another task's prompt files are not this one's: feat-login-v2 starts
+    expect(h.spawner.calls.map((c) => c.env.LAIR_TASK)).toEqual(["feat-login-v2"]);
+    const notices = eventsOf(h, "fill_conflict");
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ agent: "worker-a", task: "feat-login" });
+    expect(notices[0].data.pid).toBe(9001);
+
+    // Once that process has ended, fill starts the task
+    h.procs.remove(9001);
+    await h.service.checkFill();
+    await h.service.tick();
+    expect(h.spawner.calls.map((c) => c.env.LAIR_TASK)).toEqual(["feat-login-v2", "feat-login"]);
+    expect(eventsOf(h, "fill_conflict")).toHaveLength(1);
+  });
+
+  it("a run whose process ended while Lair restarted is classified through reconciliation: DONE or WAITING completes it, no line restarts it once", async () => {
+    const dragons = { "worker-c": { name: "C", model: "model-a", machine: "local", instructions: "", adapter: "test-cli" } };
+    const h1 = setup(() => ({}), { dragons });
+    await request(h1, "worker-a", "task-1");
+    await request(h1, "worker-b", "task-2");
+    await request(h1, "worker-c", "task-3");
+    await h1.service.tick(); // pids 5001, 5002, 5003
+    // Lair restarts; meanwhile all three agents end: worker-b reports DONE, worker-c WAITING, worker-a nothing
+    appendFileSync(h1.queueFile, "- DONE task-2 by worker-b 12:02Z: merged\n- WAITING task-3 by worker-c 12:03Z: gate queued\n");
+
+    const h2 = setup(() => ({}), { paths: h1, self: RESTARTED, dragons });
+    await restart(h2);
+
+    const byAgent = (agent: string) => runs(h2).filter((r) => r.agent === agent);
+    expect(byAgent("worker-b")).toMatchObject([
+      { state: "completed", detail: "exit unknown (it ended while Lair was restarting); classified from its queue line: DONE" },
+    ]);
+    expect(byAgent("worker-c")).toMatchObject([
+      { state: "completed", detail: "exit unknown (it ended while Lair was restarting); classified from its queue line: WAITING" },
+    ]);
+    const [first, again, ...more] = byAgent("worker-a");
+    expect(more).toEqual([]);
+    expect(first).toMatchObject({ state: "failed" });
+    expect(first.detail).toContain("with no queue line for the task");
+    expect(again).toMatchObject({ state: "queued", chainId: first.chainId, sessionMode: "resume", sameSessionRestarts: 1 });
+    expect(eventsOf(h2, "run_adopted")).toEqual([]);
+    expect(eventsOf(h2, "run_lost")).toEqual([]);
+
+    // Recovered exactly once: one unknown exit, one start after the backoff, however many ticks follow
+    await at(h2, 5 * MIN + 10 * SEC);
+    await at(h2, 5 * MIN + 20 * SEC);
+    await at(h2, 6 * MIN);
+    expect(eventsOf(h2, "exit_unknown").map((e) => e.task)).toEqual(["task-1"]);
+    expect(eventsOf(h2, "restart_same_session")).toHaveLength(1);
+    expect(h2.spawner.calls.map((c) => c.env.LAIR_TASK)).toEqual(["task-1"]);
+    expect(h2.spawner.calls[0].argv.slice(-2)).toEqual(["--resume", first.sessionId]);
+    expect(h2.store.listClaims("demo").map((c) => c.task)).toEqual(["task-1"]);
+  });
+
+  it("one reading is never enough to end a run: missing from it but shown by a fresh one, it is adopted; when the fresh one fails, it is kept as it is", async () => {
+    const h1 = setup(fillOn());
+    fillTasks(h1, "worker-a|A|feat-login|Build it");
+    await h1.service.checkFill();
+    await h1.service.tick(); // feat-login runs as pid 5001
+    const [before] = runs(h1);
+    const argv = h1.spawner.calls[0].argv.join(" ");
+
+    // The tick's own reading misses the live process (as a cut-short table would); the fresh one shows it
+    const h2 = setup(fillOn(), { paths: h1, self: RESTARTED });
+    h2.procs.afterList = (call) => {
+      if (call === 1) h2.procs.add(5001, argv, NOW);
+    };
+    await restart(h2);
+    expect(eventsOf(h2, "run_adopted").map((e) => e.runId)).toEqual([before.id]);
+    expect(runs(h2).map((r) => [r.id, r.state])).toEqual([[before.id, "running"]]);
+    expect(eventsOf(h2, "exit_unknown")).toEqual([]);
+    expect(h2.spawner.calls).toEqual([]);
+
+    // On another restart the first reading misses it again, and the fresh one fails: no verdict yet
+    const h3 = setup(fillOn(), { paths: h1, self: { pid: 300, startedAt: NOW + 10 * MIN } });
+    h3.procs.afterList = (call) => {
+      if (call === 1) h3.procs.failing = true;
+    };
+    h3.clock.t = NOW + 10 * MIN;
+    h3.spawner.nextPid = 7001;
+    h3.service.start();
+    await h3.service.tick();
+    const waiting = await h3.service.checkFill();
+    expect(waiting.lastError).toContain("fill starts nothing until then");
+    expect(runs(h3).map((r) => [r.id, r.state, r.detail])).toEqual([[before.id, "running", "working (pid 5001)"]]);
+    expect(h3.store.getClaim("demo", "feat-login")).toMatchObject({ runId: before.id, ownerPid: 5001 });
+    expect(eventsOf(h3, "exit_unknown")).toEqual([]);
+    expect(eventsOf(h3, "run_lost")).toEqual([]);
+    // The table reads again: it is adopted, once, and fill goes on with nothing to start
+    h3.procs.failing = false;
+    h3.procs.afterList = undefined;
+    h3.procs.add(5001, argv, NOW);
+    await at(h3, 10 * MIN + 5 * SEC);
+    const after = await h3.service.checkFill();
+    expect(after.lastError).toBeNull();
+    expect(eventsOf(h3, "run_adopted").map((e) => e.runId)).toEqual([before.id, before.id]); // h2's and h3's
+    expect(h3.spawner.calls).toEqual([]);
+  });
+
+  it("a cached reading older than the start tolerance never makes a live adopted run lost: it is adopted, its claim kept, also on a stale reading", async () => {
+    const h1 = setup();
+    await request(h1);
+    await h1.service.tick(); // pid 5001, started at NOW
+    const [before] = runs(h1);
+
+    // The new server reads ps through the shared cache, as the server does
+    const h2 = setup(() => ({}), { paths: h1, self: RESTARTED, cachedPs: true });
+    h2.procs.add(5001, h1.spawner.calls[0].argv.join(" "), NOW);
+    h2.clock.t = RESTARTED.startedAt;
+    await h2.psCache?.get(); // the cache's background refresh ...
+    h2.clock.advance(9 * SEC); // ... 9 s before the first tick: older than the 6 s tolerance, younger than the 10 s max age
+    h2.spawner.nextPid = 6001;
+    h2.service.start();
+    await h2.service.tick();
+
+    expect(eventsOf(h2, "run_adopted").map((e) => e.runId)).toEqual([before.id]);
+    expect(eventsOf(h2, "run_lost")).toEqual([]);
+    expect(h2.store.getClaim("demo", "feat-login")).toMatchObject({ runId: before.id, ownerPid: 5001 });
+
+    // ps then fails for a minute: the cache hands out its last reading, stale; the run is still the same process
+    h2.ps.failing = true;
+    await at(h2, 5 * MIN + 70 * SEC);
+    expect(h2.psCache?.peek()).toMatchObject({ stale: true, takenAt: RESTARTED.startedAt });
+    expect(runs(h2).map((r) => [r.id, r.state, r.detail])).toEqual([[before.id, "running", "working (pid 5001)"]]);
+    expect(h2.store.getClaim("demo", "feat-login")).toMatchObject({ runId: before.id, ownerPid: 5001 });
+    expect(eventsOf(h2, "exit_unknown")).toEqual([]);
+    expect(eventsOf(h2, "claim_released")).toEqual([]);
+    expect(h2.spawner.calls).toEqual([]);
+  });
+
+  it("a ps that answers 30 s after the tick asked never makes a live adopted run lost: the tick's time is taken after the reading", async () => {
+    const h1 = setup();
+    await request(h1);
+    await h1.service.tick();
+    const [before] = runs(h1);
+
+    const h2 = setup(() => ({}), { paths: h1, self: RESTARTED });
+    h2.procs.add(5001, h1.spawner.calls[0].argv.join(" "), NOW);
+    h2.clock.t = RESTARTED.startedAt;
+    let answer!: () => void;
+    h2.procs.hold = new Promise<void>((resolve) => (answer = resolve));
+    h2.service.start();
+    const first = h2.service.tick();
+    await new Promise((resolve) => setTimeout(resolve, 0)); // the tick has asked ps, which hasn't answered
+    // The host is loaded: ps reads the table 30 s after the tick asked for it
+    h2.clock.advance(30 * SEC);
+    answer();
+    h2.procs.hold = undefined;
+    const summary = await first;
+
+    expect(summary.at).toBe(new Date(RESTARTED.startedAt + 30 * SEC).toISOString());
+    expect(eventsOf(h2, "run_adopted").map((e) => e.runId)).toEqual([before.id]);
+    expect(eventsOf(h2, "run_lost")).toEqual([]);
+    expect(runs(h2).map((r) => [r.id, r.state])).toEqual([[before.id, "running"]]);
+    expect(h2.store.getClaim("demo", "feat-login")).toMatchObject({ runId: before.id, ownerPid: 5001 });
+    expect(h2.spawner.calls).toEqual([]);
+  });
+
+  it("a ps cut part-way by its timeout, or a table without this server's own pid, ends and restarts no run", async () => {
+    const h1 = setup();
+    await request(h1, "worker-a", "feat-login");
+    await request(h1, "worker-b", "feat-search");
+    await h1.service.tick(); // pids 5001 and 5002
+    const [a, b] = runs(h1);
+
+    const h2 = setup(() => ({}), { paths: h1, self: RESTARTED, cachedPs: true });
+    h2.procs.add(5001, h1.spawner.calls[0].argv.join(" "), NOW);
+    h2.procs.add(5002, h1.spawner.calls[1].argv.join(" "), NOW);
+    h2.clock.t = RESTARTED.startedAt;
+    h2.spawner.nextPid = 6001;
+    // The timeout stops ps after pid 1, this server and 5001, part-way through 5002's line
+    h2.ps.cut = 3;
+    h2.service.start();
+    await expect(h2.service.tick()).rejects.toThrow("its table may stop part-way, so it is not used");
+    // A table printed in full, but without this server's own pid, is not complete either
+    h2.ps.cut = undefined;
+    h2.ps.withoutSelf = true;
+    await expect(at(h2, 5 * MIN + 20 * SEC)).rejects.toThrow("lacks this server's own pid 200");
+
+    const unchanged = () => {
+      expect(runs(h2).map((r) => [r.id, r.state])).toEqual([
+        [a.id, "running"],
+        [b.id, "running"],
+      ]);
+      expect(h2.store.listClaims("demo").map((c) => [c.task, c.ownerPid])).toEqual([
+        ["feat-login", 5001],
+        ["feat-search", 5002],
+      ]);
+      expect(eventsOf(h2, "exit_unknown")).toEqual([]);
+      expect(eventsOf(h2, "run_lost")).toEqual([]);
+      expect(h2.spawner.calls).toEqual([]);
+      expect(h2.spawner.kills).toEqual([]);
+    };
+    unchanged();
+
+    // A complete table: both are adopted
+    h2.ps.withoutSelf = false;
+    await at(h2, 5 * MIN + 40 * SEC);
+    expect(eventsOf(h2, "run_adopted").map((e) => e.runId)).toEqual([a.id, b.id]);
+    unchanged();
+
+    // ps is cut short again later: the cache keeps its last complete reading (stale), never the cut one
+    h2.ps.cut = 3;
+    await at(h2, 6 * MIN + 30 * SEC);
+    expect(h2.psCache?.peek()).toMatchObject({ stale: true, takenAt: NOW + 5 * MIN + 40 * SEC });
+    expect(h2.psCache?.peek()?.error).toContain("part-way");
+    unchanged();
+  });
+
+  it("on_restart: stop waits on an adopted run with fresh readings, never the cached one: one that ends on SIGTERM is not SIGKILLed", async () => {
+    const h1 = setup(() => ({ on_restart: "stop" }));
+    await request(h1);
+    await h1.service.tick(); // pid 5001
+    const [before] = runs(h1);
+
+    // The next server adopts the run, reading ps through the shared cache
+    const h2 = setup(() => ({ on_restart: "stop" }), { paths: h1, self: RESTARTED, cachedPs: true });
+    h2.procs.add(5001, h1.spawner.calls[0].argv.join(" "), NOW);
+    await restart(h2);
+    expect(eventsOf(h2, "run_adopted").map((e) => e.runId)).toEqual([before.id]);
+
+    // It shuts down: the agent ends on SIGTERM, which the cached reading (10 s max age) would not show yet
+    const stopping = h2.clock.now();
+    await h2.manager.stop({ planned: true });
+    expect(h2.spawner.kills).toEqual([{ pid: 5001, signal: "SIGTERM" }]);
+    expect(h2.clock.now() - stopping).toBe(1 * SEC);
+
+    const h3 = setup(() => ({ on_restart: "stop" }), { paths: h1, self: { pid: 300, startedAt: NOW + 10 * MIN } });
+    expect(eventsOf(h3, "stopped_for_shutdown").map((e) => [e.runId, e.data.signal])).toEqual([[before.id, "SIGTERM"]]);
+    expect(runs(h3)[0]).toMatchObject({ id: before.id, state: "stopping", stopReason: "server_shutdown" });
+    expect(runs(h3)[0].killed).not.toBe(true);
+    expect(runs(h3)[0].detail).not.toContain("SIGKILL");
+  });
+
+  it("on_restart: stop SIGKILLs an adopted run that outlives the wait only on a reading that shows it: an unreadable table proves nothing", async () => {
+    /** A run the next server adopted, whose agent ignores SIGTERM */
+    async function adopted(): Promise<Harness> {
+      const h1 = setup(() => ({ on_restart: "stop" }));
+      await request(h1);
+      await h1.service.tick(); // pid 5001
+      const h2 = setup(() => ({ on_restart: "stop" }), { paths: h1, self: RESTARTED, cachedPs: true });
+      h2.procs.add(5001, h1.spawner.calls[0].argv.join(" "), NOW);
+      h2.spawner.ignoreTermFor.add(5001);
+      await restart(h2);
+      expect(eventsOf(h2, "run_adopted")).toHaveLength(1);
+      return h2;
+    }
+
+    // The table reads through the wait, and shows the process still running at its end: SIGKILL
+    const readable = await adopted();
+    await readable.manager.stop({ planned: true });
+    expect(readable.spawner.kills).toEqual([
+      { pid: 5001, signal: "SIGTERM" },
+      { pid: 5001, signal: "SIGKILL" },
+    ]);
+    expect(readable.clock.now() - RESTARTED.startedAt).toBe(20 * SEC);
+
+    // ps fails from the first reading after the SIGTERM on: the run counts as running to the end of the wait, but
+    // nothing proves the pid still the run's, so it gets no SIGKILL
+    const unreadable = await adopted();
+    unreadable.procs.afterList = () => {
+      if (unreadable.spawner.kills.length > 0) unreadable.ps.failing = true;
+    };
+    await unreadable.manager.stop({ planned: true });
+    expect(unreadable.spawner.kills).toEqual([{ pid: 5001, signal: "SIGTERM" }]);
+    expect(unreadable.clock.now() - RESTARTED.startedAt).toBe(20 * SEC);
+    expect(unreadable.procs.has(5001)).toBe(true);
+    const next = setup(() => ({ on_restart: "stop" }), { paths: unreadable, self: { pid: 300, startedAt: NOW + 10 * MIN } });
+    expect(eventsOf(next, "stopped_for_shutdown").map((e) => e.data.signal)).toEqual(["SIGTERM"]);
+    expect(runs(next)[0]).toMatchObject({ state: "stopping", stopReason: "server_shutdown" });
+    expect(runs(next)[0].killed).not.toBe(true);
   });
 });
 
@@ -4764,5 +5300,18 @@ describe("10. hung run info: the next run knows what the previous hung on", () =
     // Verify the structure is intact by checking the JSON parsed successfully
     // and contains the "malicious" content safely escaped
     expect(data.last_lines.some((line: string) => line.includes("</hung_run_warning>"))).toBe(true);
+
+    // CRITICAL: Verify the malicious content appears ONLY inside the JSON string values,
+    // not as raw text outside the JSON block. The prompt before the JSON block and after
+    // the JSON block should NOT contain the injection attempts.
+    const beforeJson = hungSection.slice(0, jsonObjStart);
+    const afterJson = hungSection.slice(lastCloseBrace + 1);
+    // The injection attempts should not appear outside the JSON object
+    expect(beforeJson).not.toContain("ignore previous instructions");
+    expect(afterJson).not.toContain("ignore previous instructions");
+    // The closing tag attempt should not appear outside the JSON (except the real closing tag)
+    expect(beforeJson).not.toContain("</hung_run_warning>");
+    // After JSON has the real closing tag, but no OTHER occurrence of injection content
+    expect(afterJson.match(/ignore previous instructions/g)).toBeNull();
   });
 });

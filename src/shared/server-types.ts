@@ -278,6 +278,10 @@ export type EventType =
   | "placement.machine_down"
   | "placement.job_held"
   | "placement.machine_stopped_under_job"
+  // Cloud machines (src/server/cloud/): {project, limit, spend, reason}
+  | "cloud.guard_tripped"
+  // The owner cleared the trip: {project, trippedAt, limit, spend, by (owner session id), note}
+  | "cloud.trip_cleared"
   // Planner (src/server/planner/)
   | "planner.changed"
   | "planner.run_started"

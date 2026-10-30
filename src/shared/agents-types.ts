@@ -47,7 +47,7 @@ export type AgentState =
 /** new: the first session; resume: the same session again; fresh: a new session, the old one moved aside */
 export type SessionMode = "new" | "resume" | "fresh";
 
-export type StopReason = "hung" | "failover" | "lost_claim" | "fresh_session";
+export type StopReason = "hung" | "failover" | "lost_claim" | "fresh_session" | "server_shutdown";
 
 /** What started a run's chain, when not the owner or another module: "fill" (agents.fill) */
 export type RunOrigin = "fill";
@@ -142,6 +142,7 @@ export type AgentEventKind =
   | "fill_started"
   | "fill_held"
   | "fill_done"
+  | "fill_conflict"
   | "fill_released"
   | "fill_paused"
   | "fill_waiting"
@@ -152,7 +153,10 @@ export type AgentEventKind =
   | "fill_gate_queued"
   | "fill_gate_gone"
   | "transient"
-  | "transient_cleared";
+  | "transient_cleared"
+  | "run_adopted"
+  | "run_lost"
+  | "stopped_for_shutdown";
 
 /** Recovery and audit record: what happened, why, and the evidence. */
 export interface AgentEventView {
@@ -301,6 +305,8 @@ export type FillLineState = "started" | "done" | "held" | "claimed" | "not_allow
  * - busy, read_only, max_active, capacity, capacity_load (load too high for local agent),
  *   capacity_memory (memory pressure/low), capacity_heavy (heavy work limit), prompt (a refused
  *   prompt file), refused (the run request, or done_pattern)
+ * - conflict: a live process this server has no run for holds one of the task's run prompt files on its
+ *   command line (a run of the task it doesn't know): fill starts the task once that process has ended
  * - paused: you chose to leave it ("Keep it paused" on its decision, or "Leave the task unclaimed" on
  *   its run's escalation): nothing waits for you, and fill starts it again once you release it
  * owner, no_done, blocked, waiting, waited_too_long and paused are the owner's to release (POST
@@ -324,6 +330,7 @@ export type FillHold =
   | "capacity_memory"
   | "capacity_heavy"
   | "capacity_probe"
+  | "conflict"
   | "prompt"
   | "refused";
 

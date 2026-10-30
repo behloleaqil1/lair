@@ -109,6 +109,12 @@ export interface ProjectConfig {
    */
   placement?: Record<string, unknown>;
   /**
+   * Cloud machines: the provider, the spend meter and the money guard
+   * (src/server/cloud/). Validated by parseCloudConfig; see
+   * docs/configuration.md#cloud-machines
+   */
+  cloud?: Record<string, unknown>;
+  /**
    * The planner: Lair keeps agents.fill's tasks file (src/server/planner/).
    * Validated by parsePlannerConfig; see docs/configuration.md#planner
    */
