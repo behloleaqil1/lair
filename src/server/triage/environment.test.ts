@@ -116,6 +116,7 @@ describe("environment triage integration", () => {
     h = harness(
       actingTriage({
         environment: { mode: "act", max_wait_minutes: 120, initial_backoff_seconds: 5 },
+        recheck: { max_concurrent: 10 },
       }),
     );
 
