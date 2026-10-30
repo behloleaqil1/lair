@@ -2710,7 +2710,7 @@ export class AgentsService {
     for (const claim of claims) {
       const run = this.store.getRun(claim.runId);
       const alive = snap.isAlive(claim.ownerPid, claim.ownerStartedAt);
-      if (alive && (!run || isActive(run.state))) continue;
+      if (alive && (!run || isActive(run.state) || run.claimKeptByProcess)) continue;
       const why = !alive ? "no live process owns it" : `its run ${short(claim.runId)} has ended (${run?.state})`;
       if (this.store.releaseClaim(this.project, claim.task, claim.runId)) await this.claimReleased(claim, t, why);
     }
@@ -3219,6 +3219,7 @@ export class AgentsService {
           ? `lost in a restart: ${verdict.reason}; that process isn't the run's, so Lair leaves it alone`
           : `lost in a restart: ${verdict.reason}; Lair leaves that process alone, and the task stays claimed until it ends`;
         // The claim stays with a process that may be the run's: no second run of the task beside it
+        if (!verdict.claimFree) run.claimKeptByProcess = true;
         await this.endRun(run, "failed", detail, t, verdict.claimFree);
         await this.record(
           "run_lost",

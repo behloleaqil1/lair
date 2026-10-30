@@ -104,8 +104,10 @@ export interface AgentRun {
   /** Process group id (for signalling the agent and its children) */
   pgid?: number;
   pidStartedAt?: number;
-  /** A fingerprint of the start command (to detect pid reuse) */
+  /** A fingerprint of the start command as `ps` shows it (reconcile.ts: is a live pid still this run's?) */
   commandFingerprint?: string;
+  /** Lost in a restart while a process that may still be its own runs under its pid: the claim stays until it ends */
+  claimKeptByProcess?: boolean;
   requestedAt: number;
   notBefore: number;
   /** When the current attempt to start began (budget and profile waits don't count) */
