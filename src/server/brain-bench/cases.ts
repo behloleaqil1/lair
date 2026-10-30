@@ -38,7 +38,26 @@ export function parseCase(value: unknown): BenchCase {
   const label = text(value.label, "label", 64);
   if (!seen.has(label)) throw new Error(`label ${label} is not one of the option ids`);
   const reason = value.reason === undefined || value.reason === "" ? undefined : text(value.reason, "reason", 2000);
-  return { id, kind, module: mod, evidence: value.evidence, options, label, ...(reason ? { reason } : {}) };
+  const at = value.at === undefined || value.at === "" ? undefined : text(value.at, "at", 40);
+  if (at !== undefined && !Number.isFinite(Date.parse(at))) throw new Error("at must be an ISO-8601 time");
+  const recommended = value.recommended === undefined || value.recommended === "" ? undefined : text(value.recommended, "recommended", 64);
+  if (recommended !== undefined && !seen.has(recommended)) throw new Error(`recommended ${recommended} is not one of the option ids`);
+  const outcome = value.outcome === undefined || value.outcome === "" ? undefined : value.outcome;
+  if (outcome !== undefined && outcome !== "good" && outcome !== "bad" && outcome !== "pending") {
+    throw new Error("outcome must be good, bad or pending");
+  }
+  return {
+    id,
+    kind,
+    module: mod,
+    evidence: value.evidence,
+    options,
+    label,
+    ...(reason ? { reason } : {}),
+    ...(at ? { at } : {}),
+    ...(recommended ? { recommended } : {}),
+    ...(outcome ? { outcome } : {}),
+  };
 }
 
 /** Parse JSON Lines text. Throws with the line number on the first bad line, and on a repeated id. */

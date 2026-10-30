@@ -190,3 +190,14 @@ The owner approved this design on 30 Oct 2026 and answered its open questions:
 - **C9 (`request_agent_reviews_again` after a reviewer failed to start):** may reach `act` once it meets the bars. Its `max_tier` is 2.
 - **Labels:** decisions answered by the orchestrating session count as the owner's labels; `outcome` marks the ones that turned out wrong, which become negative examples.
 - **Stage D (publishing a cleaned dataset and a fine-tuned adapter):** decided later, when there is a model worth sharing.
+
+## 10. As built: the brain trainer (stage C, shadow only)
+
+Issue #222 (30 Oct 2026). The owner asked to start training now and keep improving, without letting any model act until it earns it. What exists, and where it differs from the design above:
+
+- **Nightly run** (`brain_trainer` in `data/server.yaml`, off by default): labels from the answered decisions (and an optional cases file in the bench format), a time split by cutoff, a gradient-boosted classifier fitted in a container with pinned dependencies and no network, scored with the brain bench's own runner per class, beside Lair's recommended option on the same window. Configuration and files: [Brain trainer](../configuration.md#brain-trainer).
+- **Labels today.** The decisions store has no `class`, `evidence` or `outcome` yet (rollout step 1, §4). Until it has, a decision's class is `module/kind/option ids` and its features are those plus the offered and recommended options, links, blocks and the hour; richer evidence and outcomes come in through the cases file. When step 1 lands, the same code reads the structured fields without a change of interface.
+- **Shadow.** The best model writes `{class, proposer, version, option, reason_code, confidence}` for each decision raised. The §5 `policy_trace` column does not exist yet, so the trace is a file (`data/brain/shadow-trace.jsonl`) with the same fields; moving it to the column is a copy. Agreement is computed against the answer once given.
+- **Never answers.** The trainer is given `get` and `list` of the Decision Inbox and nothing else; a test scans its sources for any import of the inbox's answering code. A model only ever leaves the container as a JSON file of trees that Lair validates and evaluates itself.
+- **Promotion** stays as §5: nothing here moves a class past `shadow`. `best.json` only picks which model writes proposals.
+- **Not built:** stage D (the weekly LoRA run behind its own switch and label floor) and the Decisions view's chart; they need a served adapter to score on the bench and a client change, and are separate issues.
