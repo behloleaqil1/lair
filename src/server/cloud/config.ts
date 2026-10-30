@@ -61,8 +61,11 @@ const BudgetSchema = z
     period: z.object({ start: date, end: date }).strict(),
     /** Spend before the meter's first run (US dollars) */
     meter_start: z.number().min(0).max(1_000_000).default(0),
-    /** How old the provider's cost reading may be (each read may cost money) */
-    spend_check_hours: z.number().int().min(1).max(168).default(6),
+    /**
+     * How old the provider's cost reading may be (each read may cost money).
+     * At most a day: a start never rests on an older reading.
+     */
+    spend_check_hours: z.number().int().min(1).max(24).default(6),
     /** The status warns from this share of the limit on */
     warn_percent: z.number().int().min(1).max(100).default(80),
   })

@@ -291,7 +291,7 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       },
       "budget.period": { sensitive: true, help: "The days the limit covers (UTC); a new period clears a trip" },
       "budget.meter_start": { help: "Spend before the meter's first run" },
-      "budget.spend_check_hours": { help: "How old the provider's cost reading may be; each reading may cost money" },
+      "budget.spend_check_hours": { help: "How old the provider's cost reading may be (1 to 24 hours); each reading may cost money" },
       request_timeout_seconds: timeouts,
     },
   },

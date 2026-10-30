@@ -2325,7 +2325,7 @@ Budget options:
 | `limit` | number | — | No start at or above this spend, in US dollars |
 | `period.start`, `period.end` | `YYYY-MM-DD` | — | The days the limit covers, both included (UTC). Outside them no start happens. For promotional credits, cover the credits' validity |
 | `meter_start` | number | `0` | Spend before the meter's first run |
-| `spend_check_hours` | number | `6` | How old the provider's cost reading may get before it is read again (1 to 168): each reading may cost money, and provider data lags anyway |
+| `spend_check_hours` | number | `6` | How old the provider's cost reading may get before it is read again (1 to 24): each reading may cost money, and provider data lags anyway. A start never rests on a reading older than a day |
 | `warn_percent` | number | `80` | From this share of the limit on, the guard says `warning` (a start is still allowed) |
 
 ### Credentials

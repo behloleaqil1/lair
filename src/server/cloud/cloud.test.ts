@@ -518,6 +518,24 @@ describe("cloud: configuration", () => {
     expect(h.status().errors).toEqual(["cloud.budget: a limit and a period are needed (no start happens without them)"]);
     expect(h.manager.validate(h.config(noBudget))).toHaveLength(1);
   });
+
+  it("a start never rests on a cost reading older than a day: spend_check_hours is 24 at most", async () => {
+    expect(parseCloudConfig(cloudBlock({ spend_check_hours: 24 }))).toMatchObject({ ok: true, settings: { budget: { spendCheckHours: 24 } } });
+    const longer = parseCloudConfig(cloudBlock({ spend_check_hours: 25 }));
+    expect(longer.ok ? [] : longer.errors).toEqual(["cloud.budget.spend_check_hours: Number must be less than or equal to 24"]);
+
+    // At 24 the reading is read again a day after the last one, and a start waits for it
+    const h = new Harness(cloudBlock({ spend_check_hours: 24 }));
+    h.instance("stopped", NOW - 28 * HOUR, NOW - 26 * HOUR);
+    await h.machines.check();
+    h.now = NOW + 24 * HOUR - 1;
+    await h.machines.check();
+    expect(h.aws.named("GetCostAndUsage")).toHaveLength(1);
+    h.now = NOW + 24 * HOUR;
+    expect(await h.machines.startMachine("cloud-1")).toMatchObject({ allowed: true });
+    expect(h.aws.named("GetCostAndUsage")).toHaveLength(2);
+    expect(h.status().budget?.provider[0].readAt).toBe(new Date(NOW + 24 * HOUR).toISOString());
+  });
 });
 
 describe("cloud: status route", () => {
