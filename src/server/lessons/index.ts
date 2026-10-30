@@ -23,7 +23,7 @@ import type { HumanAuth } from "../human-auth/index.js";
 import { LessonsStore } from "./store.js";
 import { loadBuiltinLessons } from "./builtin-lessons.js";
 import { registerLessonsRoutes } from "./routes.js";
-import { parseLessonsConfig, defaultLessonsSettings, type LessonsSettings } from "./config.js";
+import { defaultLessonsSettings, type LessonsSettings } from "./config.js";
 
 export { LessonsStore } from "./store.js";
 export { BUILTIN_LESSONS, loadBuiltinLessons } from "./builtin-lessons.js";

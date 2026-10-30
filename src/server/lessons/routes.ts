@@ -11,7 +11,7 @@
  *   POST /api/lessons/:id/retire                      retire a lesson (owner only)
  *   POST /api/lessons/:id/match                       record a signal match (internal, signed results)
  */
-import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type { FastifyInstance, FastifyReply } from "fastify";
 import { projectNameError } from "../config.js";
 import type { HumanAuth } from "../human-auth/index.js";
 import { rejectCrossSiteRequests } from "../origin.js";

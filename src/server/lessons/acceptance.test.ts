@@ -11,7 +11,7 @@
  * - Signal matching finds lessons by their signal
  * - The Knowledge view (GET /api/lessons) returns the lessons with counts
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
 import { mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
@@ -284,8 +284,7 @@ describe("list and filter lessons", () => {
 
 describe("signal matching", () => {
   it("finds lessons by their signal value", async () => {
-    const { app, answerToken, module } = await build();
-    const browser = await unlock(app, answerToken);
+    const { module } = await build();
 
     // L4 has signal value containing "exit 125"
     const matches = module.store.findBySignal("pattern", "exit 125|Cannot connect to the Docker daemon");
