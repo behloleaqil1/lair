@@ -593,7 +593,9 @@ describe("cloud: the guard's edges, each failing closed", () => {
     at.aws.cost = "19.78";
     const refused = await at.machines.startMachine("cloud-1");
     expect(refused).toMatchObject({ allowed: false });
-    expect(refused.reason).toBe("spend $20.00 reached the limit $20.00 (provider $19.78 + $0.22 metered since its data, meter $19.00)");
+    expect(refused.reason).toMatch(
+      /^tripped on 2027-03-10T12:00:00\.000Z: spend \$20\.00 reached the limit \$20\.00 \(provider \$19\.78 \+ \$0\.22 metered since its data, meter \$19\.00\); /,
+    );
     expect(at.trips()).toEqual([expect.objectContaining({ spend: 20 })]);
     expect(at.aws.named("StartInstances")).toHaveLength(0);
 
@@ -777,8 +779,11 @@ describe("cloud: what Lair did not see, and what the provider's reading does not
     h.aws.cost = "25";
     const refused = await h.machines.startMachine("cloud-1");
     expect(refused).toMatchObject({ allowed: false });
+    // Refused by the trip it just recorded
     expect(refused.reason).toBe(
-      "spend $30.24 reached the limit $30.00 (provider $25.00 + $5.24 metered since its data, meter $24.02)",
+      "tripped on 2027-03-10T12:00:00.000Z: spend $30.24 reached the limit $30.00 " +
+        "(provider $25.00 + $5.24 metered since its data, meter $24.02); " +
+        "only the owner clears it (Machines, the machine's detail, Clear the trip): a higher cloud.budget.limit or a new period alone does not",
     );
     expect(h.aws.named("StartInstances")).toHaveLength(0);
     expect(h.trips()).toEqual([expect.objectContaining({ spend: 30.24 })]);
