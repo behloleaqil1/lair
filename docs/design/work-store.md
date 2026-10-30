@@ -617,7 +617,15 @@ project; the board and detail view subscribe to it. No SSE route is added for th
 
 ## 6. Files as adapters
 
-Three modes, configured per project:
+**Options for how a project moves off the files.**
+
+| Option | For | Against |
+|---|---|---|
+| A. Three modes per project: `files`, `mirror`, `db` (recommended) | Each step is a config change; `files` is today's behaviour, so adoption is opt-in | Three code paths to test (kept small: see below) |
+| B. Big-bang switch with a one-off import | One code path | A project with a legacy writer breaks the day it switches |
+| C. Permanent two-way sync | No retirement needed | Two truths, the conflict class this design exists to remove |
+
+Recommendation: A, with `mirror` as one-way (store to files) and never two-way.
 
 ```yaml
 work_store:
@@ -626,23 +634,38 @@ work_store:
 
 ### 6.1 `files` mode (default for existing projects)
 
-The store reads from and writes to the legacy files. This is today's import path:
-
-- **Read**: parse tasks file, queue file, brief files on each cycle.
-- **Write**: changes go to files, not the database.
-- **Events**: queue lines become events in the database for the timeline.
-
-This mode lets a project adopt the work store without changing anything else.
+`files` is **today's path, with no work store**: fill reads the tasks file, queue matching and bus 2a work as they
+do now, and nothing is written to the database. A project adopts the store by running the importer (6.4) and then
+moving to `mirror`. No new parser of the queue file is added in this mode.
 
 ### 6.2 `mirror` mode (transition)
 
-The database is truth; Lair writes the legacy files read-only for old scripts:
+The database is truth; Lair writes the legacy files for old scripts. Mirror mode is **detect, refuse, one notice**.
 
-- **Read**: from database only.
-- **Write**: to database; then mirror to files as a side effect.
-- **Conflict detection**: if a legacy writer edits a mirrored file, Lair detects the mtime change, logs a
-  warning, and overwrites with the database state. A repeated conflict raises a decision: "disable file
-  mirroring or stop the legacy writer."
+**One writer per file**, so Lair never races itself:
+
+| File | Writer | How |
+|---|---|---|
+| tasks file | the work store's mirror adapter (replacing the planner's rewrite) | Atomic rewrite, only when the file's content hash equals the hash Lair last wrote (the planner's known-content pattern) |
+| queue file | the bus mirror (`BusMirror.mirrorReport`), the existing append-only writer | Append only, lines carry the existing id marker; the work store adds no queue writer |
+| brief files | the mirror adapter | Written once per brief version, never rewritten |
+
+**Detection is by content hash against the last write, not mtime** (Lair's own appends and atomic rewrites move
+mtime). On the next mirror write the adapter compares the file's current hash (for the queue file: the hash of the
+file prefix Lair wrote, so appended foreign lines are found without being touched) with the recorded one.
+
+**On a foreign edit:**
+
+1. **Refuse**: the file is not overwritten. The foreign line in the queue file survives; the tasks file is left as
+   the legacy writer left it, and mirroring of that file pauses.
+2. Record one `external_edit` event with the diff (bounded), actor `system`.
+3. Raise **one** notice with a dedupe key per file (`work:<project>:external_edit:<file>`). Ten more edits to the
+   same file produce no further notice while the first is open.
+4. Offer the owner two actions: **adopt** (import the diff as task changes through the owner path, then resume
+   mirroring) or **discard** (rewrite the file from the database after a backup, then resume).
+
+A `DONE` or `BLOCKED` line written by hand by an agent without the bus therefore stays in the file and is read by
+bus 2a's consumers as before; it is not lost.
 
 Mirror mode lets a project observe the new system before retiring file-based tools.
 
@@ -653,29 +676,27 @@ retired their legacy scripts.
 
 ### 6.4 Importer
 
+A one-off with a dry run, not a parser that lives on. It reads only the project's **configured** files
+(`agents.fill.tasks_file`, `queue_file`, `prompts_dir`), never paths from the request. If a path must be given at
+all, `root-guards.ts` confines it to the project's roots.
+
 ```
-POST /api/work/import
-{
-  "project": "my-project",
-  "dry_run": true,
-  "sources": {
-    "tasks_file": "/path/to/dragons.txt",
-    "queue_file": "/path/to/queue.md",
-    "briefs_dir": "/path/to/briefs/"
-  }
-}
+POST /api/work/import            # owner session, requireOwnerForChanges
+{ "project": "my-project", "dry_run": true }
 ```
 
-Returns a report: tasks to import, briefs to import, queue lines to parse as events, warnings (malformed
-lines, duplicate ids), and what would change. With `dry_run: false`, applies the import.
+It **reuses fill's code**, so there is no third parser: `parseTasksFile` (with its 256 KB and 200-task bounds) for
+tasks, and fill's done detection (`checkDone`, `reportedOutcome`) with the project's existing `done_pattern` for
+queue lines. Each task id is checked with `isValidTaskId` (1.1); a line that fails is a warning in the report, not a
+silent drop. It returns the tasks and briefs it would create (the tasks-file description becomes brief version 1),
+the queue lines it would turn into `report` events, warnings (malformed lines, duplicate ids), and the diff against
+the store. With `dry_run: false` it applies in one transaction after a backup (3.5).
 
-Line formats are configuration, not one project's habit:
+New configuration keys only cover what fill has no setting for, a format for `WAITING` or `BLOCKED` lines:
 
 ```yaml
 work_store:
   import:
-    tasks_format: '<agent>|<name>|<task>|<text>'  # default
-    done_pattern: '^- DONE (?<task>[^ ]+)'
     waiting_pattern: '^- WAITING (?<task>[^ ]+) (?<gate>[^ ]+)'
     blocked_pattern: '^- BLOCKED (?<task>[^ ]+)'
 ```
@@ -697,19 +718,32 @@ Some transitions require an owner session:
 
 - `* → dropped`: only owner
 - `dropped → open` (reopen): only owner
-- `blocked → running` when blocked by owner: only owner
+- `blocked → ready` when blocked by owner: only owner
 
-The store checks `actor.kind === 'owner'` for these.
+The check is made **on the authenticated session in the route layer** (`requireOwnerForChanges`, 4.2), which
+builds the actor. The store takes that actor as a trusted argument from the routes and modules in the same
+process; an `actor` in a request body is never read. ROADMAP rule 1: a name in the request proves nothing.
 
 ### 7.3 Audit trail
 
-Every change is an event with actor, timestamp, and before/after state. The events table is append-only;
-events are never deleted, only archived.
+Every change is an event with actor, timestamp, and before/after state. The events table is append-only. Events
+are never deleted; those of tasks terminal for more than `retention_days` are archived and stay readable (3.6). The
+actor on a process-written event is a role (`agent`, `owner`, `module`, `system`), never a tool or vendor name.
 
 ### 7.4 Restart safety
 
-Like planner.md: writes record their intent in the store first, so a restart in the middle finds out
-whether the change completed.
+A transition spans two databases (`data/work/<project>.db` and `data/agents.db`) and side effects (mirror files,
+tracker sync). No single SQLite transaction covers that, so each has a **write order** and a **recovery on start**.
+The reconcile runs **before fill's first tick** (the same gate the restart-adoption design uses).
+
+| Transition | Write order | Recovery on start |
+|---|---|---|
+| `ready` to `assigned` to `running` | 1. the run is inserted in the agents store; 2. the claim; 3. the work store writes its event (the task row's stored state stays `ready`, 2.1) | A claim whose task has no row raises one notice. An event naming a run with no active run and no claim is closed with a `claim_lost` event; the task shows `ready` again. After a kill between 1 and 3 there is one derived state and one run |
+| Report to `waiting`, `blocked`, `in_review` | 1. the bus store records the report; 2. the work store applies the state and event in one transaction | A report with no matching work event is replayed from the bus's last applied report id (idempotent by report id) |
+| Mirror write | 1. an intent row with the file's expected hash; 2. the file write; 3. the intent is cleared | An intent found at start: if the file hash equals the expected after-hash the write finished (clear it); if it equals the before-hash it is rolled back (retry); otherwise it is a foreign edit (6.2) |
+| Tracker sync | The tracker records the last synced event id per task | Replayed from that id, idempotent by `externalRef` (an update to an issue already in the target state is a no-op) |
+
+Like planner.md's `INTENT` and `afterHash`, but generalised to each side effect above.
 
 ## 8. Scale
 
