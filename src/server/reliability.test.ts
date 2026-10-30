@@ -606,6 +606,7 @@ function setupAgents(
     clock,
     spawner,
     self: SELF,
+    systemInfo: { cpuCount: () => 4, loadAvg1: () => 0.5, totalMemory: () => 16e9, freeMemory: () => 8e9 },
   };
   const manager = new AgentsManager({ dbPath: paths.dbPath, probes, events, decisions: inbox });
   managers.push(manager);
@@ -744,6 +745,7 @@ function setupAgentsWithCache(
     clock,
     spawner,
     self: SELF,
+    systemInfo: { cpuCount: () => 4, loadAvg1: () => 0.5, totalMemory: () => 16e9, freeMemory: () => 8e9 },
   };
   const manager = new AgentsManager({ dbPath: paths.dbPath, probes, events, decisions: inbox });
   managers.push(manager);

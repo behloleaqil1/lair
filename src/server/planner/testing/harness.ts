@@ -265,7 +265,7 @@ export async function setup(
   events.on("*", (event) => {
     bus.push({ type: event.type, data: event.data });
   });
-  const probes: AgentProbes = { processes: procs, fs: new NodeFileSystem(), runner: new FakeRunner(), clock, spawner, self: SELF };
+  const probes: AgentProbes = { processes: procs, fs: new NodeFileSystem(), runner: new FakeRunner(), clock, spawner, self: SELF, systemInfo: { cpuCount: () => 4, loadAvg1: () => 0.5, totalMemory: () => 16e9, freeMemory: () => 8e9 } };
   const dbs = options.dbs ?? {
     agents: join(p.dir, "data", "agents.db"),
     planner: join(p.dir, "data", "planner.db"),

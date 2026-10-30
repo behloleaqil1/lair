@@ -145,6 +145,7 @@ describe("reloading the agents module", () => {
         clock,
         spawner,
         self: { pid: 100, startedAt: NOW - 3600_000 },
+        systemInfo: { cpuCount: () => 4, loadAvg1: () => 0.5, totalMemory: () => 16e9, freeMemory: () => 8e9 },
       },
     });
     const initial = [{ name: "demo", config: loadProjectConfig("demo", projects) }];
