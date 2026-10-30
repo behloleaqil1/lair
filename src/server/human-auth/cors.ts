@@ -18,6 +18,9 @@ import type { FastifyCorsOptions } from "@fastify/cors";
  * added at runtime would not take effect; there is deliberately no helper
  * to add one. Prefer a module's whole prefix (e.g. /api/review) over single
  * routes, so a new owner-only route under it can't be forgotten here.
+ *
+ * route-ownership.test.ts fails for any registered route that is neither
+ * under a prefix here nor on its short public list (with a reason each).
  */
 export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/owner",
