@@ -385,19 +385,45 @@ MCP server (stdio) for direct agent-to-Lair communication. Run it with `npm run 
 
 ## Data flow
 
-### Polling (default)
+### Live updates (default)
+
+The dashboard stays current through topic-based WebSocket updates. Each module emits change events when its state
+changes, and the `LivePublisher` (`src/server/live/`) converts them to typed messages the client applies without a
+full refresh:
 
 ```
-UI → API request → DataService → Parsers → Project files
-                                    ↓
-                              Typed data
-                                    ↓
-UI ← API response ← JSON response ←
+Module emits event (e.g. decision.answered)
+        ↓
+EventBus dispatches to LivePublisher
+        ↓
+LivePublisher coalesces (≤1 update/row/250ms)
+        ↓
+LivePublisher broadcasts to subscribed WebSocket clients
+        ↓
+Client's useLiveUpdates hook receives update
+        ↓
+View patches state (insert/update/delete row)
 ```
 
-The UI polls every 10 seconds by default.
+Topics: `dragons`, `gates`, `decisions`, `machines`, `prs`, `agents`, `bus`, `planner`, `delivery`, `triage`,
+`placement`, `watchdog`. Each topic maps to server events that change the rows the view shows.
 
-### WebSocket (real-time)
+Limits:
+- At most one message per row per 250ms (bursts are coalesced)
+- Messages over 8KB drop their data (the client refetches that row)
+- The client shows "Live" when connected, "Reconnecting…" when not
+
+### Fallback polling
+
+When the WebSocket is down (server restart, network issue), the client falls back to polling every 60 seconds. The
+`useLiveUpdates` hook handles this automatically:
+- Starts a 60-second interval when disconnected
+- Stops the interval when reconnected
+- Triggers a refresh on reconnect to catch missed updates
+
+The reconnect follows exponential backoff (1s, 2s, 4s, ... up to 30s) via `reconnect.ts`.
+
+### File watching
 
 ```
 Project files change

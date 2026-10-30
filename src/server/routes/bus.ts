@@ -509,4 +509,56 @@ async function busRoutes(
       unread: service.countUnread(agentId),
     });
   });
+
+  // ============ GET /api/bus/reports - Recent reports (for Activity Feed) ============
+
+  fastify.get<{
+    Querystring: { project: string; limit?: string };
+  }>("/api/bus/reports", async (request) => {
+    const project = request.query.project;
+    const limit = request.query.limit ? Number(request.query.limit) : 50;
+
+    const { service } = getBusService(project, options);
+    const reports = service.listReports({ limit });
+
+    return respond(
+      reports.map((r) => ({
+        id: r.id,
+        agent: r.agentId,
+        kind: r.kind,
+        task: r.task,
+        summary: r.summary,
+        timestamp: new Date(r.createdAt).toISOString(),
+        gateId: r.gateId,
+        prNumber: r.pr,
+        sha: r.sha,
+      })),
+    );
+  });
+
+  // ============ GET /api/bus/messages - Recent messages (for Activity Feed) ============
+
+  fastify.get<{
+    Querystring: { project: string; limit?: string };
+  }>("/api/bus/messages", async (request) => {
+    const project = request.query.project;
+    const limit = request.query.limit ? Number(request.query.limit) : 50;
+
+    const { service } = getBusService(project, options);
+    // Get recent messages for all agents
+    const messages = service.listMessages("*", { limit });
+
+    return respond(
+      messages.map((m) => ({
+        id: m.id,
+        from: m.fromId,
+        to: m.toId,
+        text: m.text,
+        timestamp: new Date(m.createdAt).toISOString(),
+        priority: m.priority,
+        state: m.ackAt ? "ack" : m.readAt ? "read" : "sent",
+        ackNote: m.ackNote,
+      })),
+    );
+  });
 }

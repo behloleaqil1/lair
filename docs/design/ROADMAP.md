@@ -33,6 +33,7 @@ any machines.
 | Look and feel (T1) | [settings-v2.md](settings-v2.md) | `src/client/ui/` | Design tokens with light, dark and system themes and two densities (AA contrast checked from the values), a component kit, the app shell (left nav, breadcrumbs and page headers) and every view on them; axe runs on every view in CI |
 | Settings v2, part 1 (S2-1) | [settings-v2.md](settings-v2.md) | `src/client/components/Settings*.tsx` | Settings by task: Overview (a setup checklist), AI (tools signed in per machine, profiles with each tool's own models, roles as ordered lists) and Team (agents, bulk moves), the classic form for the rest; a search over every field; one save bar through the phase-1 review |
 | Cleanup | [cleanup.md](cleanup.md) | `src/server/cleanup/` | Retention and removal for worktrees (after merge) and watched folders (results, logs, gate snapshots); configurable keep_days and skip_if_referenced; observe and act modes; bounded per cycle; every removal audited |
+| Dashboard live updates | [architecture.md](../architecture.md#data-flow) | `src/server/live/`, `src/client/hooks/useLiveUpdates.ts` | The UI stays current through topic-based WebSocket updates: each module's change is pushed, the client patches its state instead of refetching everything; 60s fallback poll when the connection is down; coalesced bursts (≤1 update/row/250ms); capped message size (8KB) |
 
 ## Next, in order
 

@@ -394,19 +394,21 @@ export class BusStore {
     return result.changes > 0;
   }
 
-  /** List messages for an agent (sent or received). */
+  /** List messages for an agent (sent or received). Use "*" for all messages. */
   listMessages(agentId: string, options: { direction?: "sent" | "received"; limit?: number } = {}): BusMessage[] {
     const where = ["project = ?"];
     const params: (string | number)[] = [this.project];
-    if (options.direction === "sent") {
-      where.push("from_id = ?");
-      params.push(agentId);
-    } else if (options.direction === "received") {
-      where.push("to_id = ?");
-      params.push(agentId);
-    } else {
-      where.push("(from_id = ? OR to_id = ?)");
-      params.push(agentId, agentId);
+    if (agentId !== "*") {
+      if (options.direction === "sent") {
+        where.push("from_id = ?");
+        params.push(agentId);
+      } else if (options.direction === "received") {
+        where.push("to_id = ?");
+        params.push(agentId);
+      } else {
+        where.push("(from_id = ? OR to_id = ?)");
+        params.push(agentId, agentId);
+      }
     }
     params.push(options.limit ?? 100);
     const rows = this.db

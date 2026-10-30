@@ -1,0 +1,39 @@
+/**
+ * LiveIndicator styles
+ */
+.live-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs, 4px);
+  font-size: var(--font-size-xs, 0.75rem);
+  padding: var(--space-xs, 4px) var(--space-sm, 8px);
+  border-radius: var(--radius-sm, 4px);
+}
+
+.live-indicator-connected {
+  color: var(--color-success, #22c55e);
+  background: var(--color-success-bg, rgba(34, 197, 94, 0.1));
+}
+
+.live-indicator-reconnecting {
+  color: var(--color-warning, #f59e0b);
+  background: var(--color-warning-bg, rgba(245, 158, 11, 0.1));
+}
+
+.live-dot {
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.live-spinner {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}

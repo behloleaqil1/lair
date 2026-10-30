@@ -26,8 +26,10 @@ import { DecisionsBadge } from "./components/DecisionInbox";
 import { sectionAvailable, sectionDef, visibleSections } from "./nav";
 import { linkTo, parseRoute, redirectFor, routeHash, type Route } from "./router";
 import { useApi } from "./hooks/useApi";
+import { useLiveUpdates } from "./hooks/useLiveUpdates";
 import { ConfigBanner } from "./components/ConfigBanner";
 import { ServerControls } from "./components/ServerControls";
+import { LiveIndicator } from "./components/LiveIndicator";
 import { ModuleOff, useOwnerSignedIn } from "./components/ui";
 import type { SectionProps } from "./components/Section";
 import { ChatContext, SupervisorChatPanel, type ChatRequest } from "./components/SupervisorChat";
@@ -142,11 +144,12 @@ export function App() {
       .catch(console.error);
   }, [currentProject, lastRefresh]);
 
-  // Auto-refresh every 10 seconds
+  // Fallback refresh every 60 seconds (used only when live connection is down)
+  // The live update system (useLiveUpdates) handles real-time updates when connected
   useEffect(() => {
     const interval = setInterval(() => {
       setLastRefresh(new Date());
-    }, 10000);
+    }, 60000);
     return () => clearInterval(interval);
   }, []);
 
@@ -163,6 +166,23 @@ export function App() {
   });
   const [chatRequest, setChatRequest] = useState<ChatRequest | null>(null);
   const chatControl = useMemo(() => ({ open: (request: ChatRequest) => setChatRequest({ ...request }) }), []);
+
+  // Live updates connection for real-time dashboard updates
+  // This maintains the WebSocket connection and reports its status
+  const liveState = useLiveUpdates({
+    project: currentProject,
+    topics: ["dragons", "gates", "decisions", "machines", "bus"],
+    handler: {
+      onUpdate: useCallback(() => {
+        // Individual views handle their own updates; this is for the shell's status
+      }, []),
+      onRefresh: useCallback(() => {
+        // Trigger a refresh when connection recovers
+        setLastRefresh(new Date());
+      }, []),
+    },
+    skip: !currentProject,
+  });
 
   const switchProject = (project: string) => {
     setCurrentProject(project);
@@ -298,9 +318,10 @@ export function App() {
                 />
               </div>
               <div className="footer-meta">
+                <LiveIndicator status={liveState.status} live={liveState.live} />
                 <span>Lair v{LAIR_VERSION}</span>
                 <span className="last-refresh" title={lastRefresh.toLocaleString()}>
-                  Updated {lastRefresh.toLocaleTimeString()}
+                  {liveState.polling ? "Polling" : "Updated"} {lastRefresh.toLocaleTimeString()}
                 </span>
               </div>
             </footer>

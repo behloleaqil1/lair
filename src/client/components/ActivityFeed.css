@@ -1,0 +1,174 @@
+/**
+ * ActivityFeed styles
+ */
+.activity-feed {
+  margin-top: var(--space-md, 16px);
+}
+
+.activity-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm, 8px);
+}
+
+.activity-card {
+  padding: var(--space-md, 16px);
+  background: var(--color-surface, #fff);
+  border: 1px solid var(--color-border, #e5e7eb);
+  border-radius: var(--radius-md, 8px);
+  transition: border-color 0.15s ease;
+}
+
+.activity-card:hover {
+  border-color: var(--color-border-hover, #d1d5db);
+}
+
+/* Report cards by kind */
+.activity-report.kind-done {
+  border-left: 3px solid var(--color-success, #22c55e);
+}
+
+.activity-report.kind-waiting {
+  border-left: 3px solid var(--color-warning, #f59e0b);
+}
+
+.activity-report.kind-blocked {
+  border-left: 3px solid var(--color-danger, #ef4444);
+}
+
+.activity-report.kind-progress {
+  border-left: 3px solid var(--color-info, #3b82f6);
+}
+
+.activity-report.kind-tick {
+  border-left: 3px solid var(--color-muted, #9ca3af);
+}
+
+/* Message cards */
+.activity-message {
+  border-left: 3px solid var(--color-info, #3b82f6);
+}
+
+/* Header row */
+.activity-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm, 8px);
+  flex-wrap: wrap;
+  margin-bottom: var(--space-xs, 4px);
+}
+
+.activity-kind {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs, 4px);
+}
+
+.kind-icon {
+  font-size: 1rem;
+}
+
+.activity-agent {
+  font-size: var(--font-size-sm, 0.875rem);
+  color: var(--color-text-secondary, #6b7280);
+}
+
+.activity-time {
+  margin-left: auto;
+  font-size: var(--font-size-xs, 0.75rem);
+  color: var(--color-text-muted, #9ca3af);
+}
+
+/* Task line */
+.activity-task {
+  margin-bottom: var(--space-xs, 4px);
+}
+
+.activity-task code {
+  font-size: var(--font-size-sm, 0.875rem);
+  color: var(--color-text-secondary, #6b7280);
+}
+
+/* Summary / message text */
+.activity-summary {
+  font-size: var(--font-size-sm, 0.875rem);
+  line-height: 1.5;
+  color: var(--color-text, #111827);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.message-text {
+  font-style: italic;
+}
+
+/* Links row */
+.activity-links {
+  display: flex;
+  gap: var(--space-md, 16px);
+  margin-top: var(--space-sm, 8px);
+  flex-wrap: wrap;
+}
+
+.activity-link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs, 4px);
+  font-size: var(--font-size-xs, 0.75rem);
+  color: var(--color-link, #2563eb);
+  text-decoration: none;
+}
+
+.activity-link:hover {
+  text-decoration: underline;
+}
+
+.activity-link code {
+  font-size: var(--font-size-xs, 0.75rem);
+}
+
+/* Message-specific */
+.message-direction {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs, 4px);
+  font-size: var(--font-size-sm, 0.875rem);
+}
+
+.message-direction code {
+  font-size: var(--font-size-sm, 0.875rem);
+}
+
+.message-state {
+  font-size: var(--font-size-xs, 0.75rem);
+}
+
+.message-state.state-sent {
+  color: var(--color-text-muted, #9ca3af);
+}
+
+.message-state.state-read {
+  color: var(--color-info, #3b82f6);
+}
+
+.message-state.state-ack {
+  color: var(--color-success, #22c55e);
+}
+
+.message-priority {
+  margin-top: var(--space-xs, 4px);
+  font-size: var(--font-size-xs, 0.75rem);
+  color: var(--color-warning, #f59e0b);
+}
+
+.message-ack-note {
+  margin-top: var(--space-xs, 4px);
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs, 4px);
+  font-size: var(--font-size-xs, 0.75rem);
+  color: var(--color-success, #22c55e);
+}

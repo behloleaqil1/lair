@@ -55,6 +55,7 @@ import { ReviewManager, inboxDecisionSink, registerReviewRoutes } from "./review
 import { mountTriage } from "./triage/index.js";
 import { PlacementManager, registerPlacementRoutes } from "./placement/index.js";
 import { CloudManager, registerCloudRoutes } from "./cloud/index.js";
+import { LivePublisher } from "./live/index.js";
 import { registerDashboardRoutes } from "./dashboard/index.js";
 import type { DashboardSources } from "./dashboard/routes.js";
 import { RequestLatency, mountSupervisor, registerLatencyHook } from "./supervisor/index.js";
@@ -190,8 +191,9 @@ function getDataCache(project?: string) {
   return dataCacheManager.getCache(config);
 }
 
-// WebSocket server and file watchers (initialized after server starts)
+// WebSocket server, live publisher and file watchers (initialized after server starts)
 let wsServer: LairWebSocketServer | null = null;
+let livePublisher: LivePublisher | null = null;
 const fileWatchers = new Map<string, FileWatcherService>();
 /** Per project: the paths its file watcher watches */
 const watchedPaths = new Map<string, string>();
@@ -888,6 +890,12 @@ const stopServer = async (reason: string) => {
   }
   fileWatchers.clear();
 
+  // Close live publisher
+  if (livePublisher) {
+    livePublisher.close();
+    livePublisher = null;
+  }
+
   // Close WebSocket server
   if (wsServer) {
     wsServer.close();
@@ -943,6 +951,10 @@ const start = async () => {
     // Initialize WebSocket server after HTTP server is ready
     const httpServer = fastify.server;
     wsServer = new LairWebSocketServer(httpServer);
+
+    // Initialize live update publisher for real-time dashboard updates
+    livePublisher = new LivePublisher(wsServer, getEventBus());
+    console.log("[live] Live update publisher started");
 
     // Initialize M1: Node manager WebSocket
     initNodeManager(httpServer);
