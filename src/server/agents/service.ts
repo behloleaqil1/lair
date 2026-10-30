@@ -127,13 +127,15 @@ import {
   type FailoverInfo,
   type StoredLockWait,
 } from "./types.js";
-import {
-  commandFingerprint,
-  reconcileActiveRuns,
-  type ReconcileResult,
-} from "./reconcile.js";
+import { commandFingerprint, findTaskProcess, reconcileRun, runPromptFileName } from "./reconcile.js";
+import type { ProcessInfo } from "../watchdog/probes.js";
 
 export { TASK_ID, isValidTaskId } from "./types.js";
+
+/** How long the server's shutdown may wait on runs it stops (agents.on_restart: stop), at most: it has 60 s in all */
+export const SHUTDOWN_RUN_WAIT_MS = 20_000;
+/** How often that wait reads the process table */
+const SHUTDOWN_POLL_MS = 1_000;
 
 /** An error with the HTTP status the routes answer with. */
 export class AgentsError extends Error {
@@ -223,6 +225,7 @@ export const RECOVERY_KINDS: readonly AgentEventKind[] = [
   "decision",
   "transient",
   "transient_cleared",
+  "run_lost",
 ];
 
 const BUS_EVENTS: Partial<Record<AgentEventKind, EventType>> = {
@@ -240,6 +243,7 @@ const BUS_EVENTS: Partial<Record<AgentEventKind, EventType>> = {
   restart_same_session: "agent.recovery",
   fresh_session: "agent.recovery",
   escalated: "agent.recovery",
+  run_lost: "agent.recovery",
   failover: "agent.failover",
   budget_warning: "agent.budget.warning",
   budget_exceeded: "agent.budget.exceeded",
@@ -431,10 +435,8 @@ export class AgentsService {
   private fill: AgentsFill | null = null;
   /** Module run variables per chain (RunRequest.variables): in memory only, dropped once the chain ends */
   private moduleVars = new Map<string, Record<string, string>>();
-  /** Set to true once reconciliation has finished; fill waits on this before its first tick */
-  private reconciled = false;
-  /** The result of reconciliation on startup */
-  private reconcileResult?: ReconcileResult;
+  /** start() reconciles the runs the store says are active first: until that has finished, fill starts nothing */
+  private reconcilePending = false;
   lastTick?: AgentsTickSummary;
   lastError?: string;
 
@@ -477,6 +479,8 @@ export class AgentsService {
         store: this.store,
         probes: this.probes,
         readOnly: () => this.readOnly,
+        ready: () => !this.reconcilePending,
+        taskProcess: (task) => this.taskProcess(task),
         // The in-process path every module uses: claims, locks, retries and budgets apply
         requestRun: (input) => this.requestRun(input, { origin: "fill" }),
         record: (kind, input, at) => this.record(kind, input, at),
@@ -942,6 +946,10 @@ export class AgentsService {
   private async runTick(): Promise<AgentsTickSummary> {
     // A failed `ps` fails the tick: nothing is judged on data that couldn't be read
     const t = await this.newTick(this.probes.clock.now());
+    if (this.reconcilePending) {
+      if (!this.readOnly) await this.reconcile(t);
+      this.reconcilePending = false;
+    }
     if (!this.readOnly) {
       for (const run of this.store.activeRuns(this.project)) {
         if (run.state === "running" || run.state === "stopping") this.readUsage(run);
@@ -1250,7 +1258,7 @@ export class AgentsService {
     if (hungInfo) {
       parts.push(this.formatHungInfo(hungInfo));
     }
-    const file = join(dir, `${run.task.replace(/[^A-Za-z0-9_-]/g, "-")}-${run.agent}-${short(run.id)}.txt`);
+    const file = join(dir, runPromptFileName(run.task, run.agent, run.id));
     writeFileSync(file, parts.join("\n\n") + "\n", "utf-8");
     return file;
   }
@@ -1698,6 +1706,8 @@ export class AgentsService {
       }
       case "fresh_session":
         return this.recover(run, "fresh_session", detail, evidence, t);
+      case "server_shutdown":
+        return this.stoppedForShutdown(run, t);
       default:
         return this.recover(run, "hung", detail, evidence, t);
     }
@@ -1810,6 +1820,24 @@ export class AgentsService {
       evidence,
       t,
     );
+  }
+
+  /**
+   * A run the previous server stopped for its shutdown (agents.on_restart: stop): its queue line decides, as for
+   * an exit Lair didn't see. With none it ends, not counted as a failed attempt, and its task is free: fill starts
+   * a fill task again; any other run is the owner's to start again.
+   */
+  private async stoppedForShutdown(run: AgentRun, t: Tick): Promise<void> {
+    const outcome = this.reportedOutcome(run);
+    if (outcome) {
+      const detail = `stopped for the server's shutdown (agents.on_restart: stop); classified from its queue line: ${outcome.kind.toUpperCase()}`;
+      return this.endRun(run, "completed", detail, t, true, {
+        evidence: [`queue line: ${oneLine(outcome.line)}`],
+        data: { exit: "stopped_for_shutdown", classifiedAs: outcome.kind, line: outcome.line },
+      });
+    }
+    const detail = "stopped for the server's shutdown (agents.on_restart: stop), with no queue line for the task: the task is free";
+    return this.endRun(run, "failed", detail, t, true);
   }
 
   private async endRun(
@@ -3132,15 +3160,15 @@ export class AgentsService {
 
   // ============ LIFECYCLE ============
 
-  /** Tick soon, then every interval_seconds, until stop(); and the fill loop, when it is on. */
+  /**
+   * Tick at once, then every interval_seconds, until stop(); and the fill loop, when it is on. The first tick
+   * reconciles the runs the store says are active before it judges anything, and fill starts nothing until then.
+   */
   start(): void {
     if (!this.stopped) return;
     this.stopped = false;
-    // Reconcile active runs BEFORE fill starts, so fill knows which tasks are already running
-    this.reconcileOnStartup().then(() => {
-      if (this.stopped) return;
-      this.fill?.start();
-    });
+    this.reconcilePending = true;
+    this.fill?.start();
     const loop = async () => {
       if (this.stopped) return;
       try {
@@ -3153,84 +3181,76 @@ export class AgentsService {
       this.timer = setTimeout(loop, this.settings.intervalSeconds * 1000);
       this.timer.unref();
     };
-    this.timer = setTimeout(loop, Math.min(1000, this.settings.intervalSeconds * 1000));
+    this.timer = setTimeout(loop, 0);
     this.timer.unref();
   }
 
   /**
-   * Reconcile active runs on startup: for each run the store says is active,
-   * check if its process is still alive and provably the same one. Adopted
-   * runs stay active; lost and ended runs are marked accordingly. Fill waits
-   * for this before its first tick.
+   * The runs the store says are running, against the process table, before the first tick after start() judges
+   * anything (docs/design/autonomy.md §6). A run whose process is provably its own (pid, start time, command) is
+   * adopted: supervised from here on, its claim kept. One whose pid another process has now is lost: ended, its
+   * task free, and that process never signalled. One whose process is gone is left to the tick, which classifies
+   * its exit by its queue line as before.
    */
-  private async reconcileOnStartup(): Promise<void> {
-    try {
-      this.reconcileResult = await reconcileActiveRuns(
-        this.project,
-        this.store,
-        this.probes,
-        this.settings.pidStartToleranceSeconds,
-      );
-      const { adopted, lost, ended } = this.reconcileResult;
-      if (adopted.length > 0 || lost.length > 0 || ended.length > 0) {
-        console.log(
-          `[agents] ${this.project}: reconciled ${adopted.length + lost.length + ended.length} runs on startup: ` +
-            `${adopted.length} adopted, ${lost.length} lost (pid reused), ${ended.length} ended`,
+  private async reconcile(t: Tick): Promise<void> {
+    const counts = { adopted: 0, lost: 0, gone: 0 };
+    for (const run of this.store.activeRuns(this.project)) {
+      if (run.state !== "running" && run.state !== "stopping") continue;
+      // A config reload hands over the runs this server process started
+      const startedHere = run.pid !== undefined && this.probes.spawner.knows(run.pid);
+      const verdict = reconcileRun(run, t.snap, startedHere);
+      counts[verdict.kind]++;
+      if (verdict.kind === "adopted") {
+        if (startedHere) continue; // not a restart: nothing to record
+        await this.record(
+          "run_adopted",
+          {
+            agent: run.agent,
+            task: run.task,
+            runId: run.id,
+            summary: `adopted ${run.agent}'s run ${short(run.id)} on ${run.task} after a restart (pid ${run.pid})`,
+            evidence: [verdict.evidence],
+            data: { pid: run.pid ?? null, pgid: run.pgid ?? null },
+          },
+          t.now,
         );
-        // Record an event for each outcome
-        const now = this.probes.clock.now();
-        for (const a of adopted) {
-          await this.record(
-            "run_adopted",
-            {
-              agent: a.agent,
-              task: a.task,
-              runId: a.runId,
-              summary: `adopted run ${short(a.runId)} on restart (pid ${a.pid} is alive)`,
-              data: { pid: a.pid },
-            },
-            now,
-          );
-        }
-        for (const l of lost) {
-          await this.record(
-            "run_lost",
-            {
-              agent: l.agent,
-              task: l.task,
-              runId: l.runId,
-              summary: `run ${short(l.runId)} lost in restart: ${l.reason}`,
-              evidence: [l.reason],
-              data: { reason: l.reason },
-            },
-            now,
-          );
-        }
-        for (const e of ended) {
-          await this.record(
-            "exit_unknown",
-            {
-              agent: e.agent,
-              task: e.task,
-              runId: e.runId,
-              summary: `run ${short(e.runId)} ended while Lair was restarting: ${e.reason}`,
-              evidence: [e.reason],
-              data: { reason: e.reason },
-            },
-            now,
-          );
-        }
+      } else if (verdict.kind === "lost") {
+        const detail = verdict.claimFree
+          ? `lost in a restart: ${verdict.reason}; that process isn't the run's, so Lair leaves it alone`
+          : `lost in a restart: ${verdict.reason}; Lair leaves that process alone, and the task stays claimed until it ends`;
+        // The claim stays with a process that may be the run's: no second run of the task beside it
+        await this.endRun(run, "failed", detail, t, verdict.claimFree);
+        await this.record(
+          "run_lost",
+          {
+            agent: run.agent,
+            task: run.task,
+            runId: run.id,
+            summary: `${run.agent}'s run ${short(run.id)} on ${run.task} was lost in a restart: ${verdict.reason}`,
+            evidence: [verdict.reason],
+            data: { pid: run.pid ?? null, pgid: run.pgid ?? null },
+          },
+          t.now,
+        );
       }
-    } catch (e) {
-      console.error(`[agents] ${this.project}: reconciliation failed:`, e);
-    } finally {
-      this.reconciled = true;
+    }
+    if (counts.adopted + counts.lost + counts.gone > 0) {
+      console.log(
+        `[agents] ${this.project}: reconciled the active runs: ${counts.adopted} adopted, ${counts.lost} lost, ` +
+          `${counts.gone} gone (their exit is classified by their queue line)`,
+      );
     }
   }
 
-  /** Whether reconciliation has finished (fill waits on this). */
-  isReconciled(): boolean {
-    return this.reconciled;
+  /**
+   * A live process that runs a run of `task` no active run here owns: its command line holds one of the task's
+   * run prompt files. Fill starts nothing for the task while there is one.
+   */
+  private async taskProcess(task: string): Promise<ProcessInfo | null> {
+    const ignore = new Set<number>([this.probes.self.pid]);
+    for (const run of this.store.activeRuns(this.project)) if (run.pid !== undefined) ignore.add(run.pid);
+    const agents = [...loadKnownDragons(this.config).keys()];
+    return findTaskProcess(await this.probes.processes.list(), getPromptsDir(this.config), task, agents, ignore);
   }
 
   /**
@@ -3249,28 +3269,72 @@ export class AgentsService {
   }
 
   /**
-   * Signal all active runs on a planned shutdown when on_restart is "stop".
-   * Called by the server's shutdown before stop() when on_restart is "stop".
-   * Returns the result: which runs were signalled and which timed out.
+   * The server's planned shutdown with agents.on_restart: stop (after stop()). Each running run whose process is
+   * provably its own gets SIGTERM to its process group; up to stop_grace_seconds (never more than `maxWaitMs`)
+   * for them to end, then SIGKILL; each signal is recorded. The runs stay stopping: the next server's first tick
+   * ends them by their queue line. With on_restart: adopt (the default) nothing is signalled.
    */
-  async signalRunsForShutdown(): Promise<{ signalled: string[]; timedOut: string[] }> {
-    if (this.settings.onRestart !== "stop") {
-      return { signalled: [], timedOut: [] };
-    }
-    const { signalActiveRuns } = await import("./reconcile.js");
-    const result = await signalActiveRuns(
-      this.project,
-      this.store,
-      this.probes,
-      this.settings.stopGraceSeconds,
-    );
-    if (result.signalled.length > 0 || result.timedOut.length > 0) {
-      console.log(
-        `[agents] ${this.project}: signalled ${result.signalled.length} runs for shutdown, ` +
-          `${result.timedOut.length} timed out and were killed`,
-      );
-    }
-    return result;
+  async stopRunsForShutdown(maxWaitMs: number): Promise<{ signalled: number; killed: number }> {
+    if (this.settings.onRestart !== "stop" || this.readOnly) return { signalled: 0, killed: 0 };
+    return this.exclusive(async () => {
+      const t = await this.newTick(this.probes.clock.now());
+      const own = this.store
+        .activeRuns(this.project)
+        .filter(
+          (run) =>
+            (run.state === "running" || run.state === "stopping") &&
+            reconcileRun(run, t.snap, run.pid !== undefined && this.probes.spawner.knows(run.pid)).kind === "adopted",
+        );
+      const recordSignal = (run: AgentRun, signal: "SIGTERM" | "SIGKILL", at: number) =>
+        this.record(
+          "stopped_for_shutdown",
+          {
+            agent: run.agent,
+            task: run.task,
+            runId: run.id,
+            summary: `${signal} to ${run.agent}'s run ${short(run.id)} on ${run.task} (process group ${run.pgid ?? run.pid}) for the server's shutdown`,
+            evidence: ["agents.on_restart: stop"],
+            data: { pid: run.pid ?? null, pgid: run.pgid ?? null, signal },
+          },
+          at,
+        );
+      for (const run of own) {
+        if (run.state === "running") {
+          await this.stopRun(run, "server_shutdown", "the server is shutting down (agents.on_restart: stop)", [], t);
+        } else if (run.pid !== undefined) {
+          // Already stopping (hung, failover): its reason stays for the next server
+          this.probes.spawner.kill(run.pid, "SIGTERM");
+        }
+        await recordSignal(run, "SIGTERM", t.now);
+      }
+      const until = t.now + Math.min(this.settings.stopGraceSeconds * 1000, maxWaitMs);
+      let alive = own;
+      while (alive.length > 0 && this.probes.clock.now() < until) {
+        await this.probes.clock.sleep(Math.min(SHUTDOWN_POLL_MS, until - this.probes.clock.now()));
+        let list: ProcessInfo[];
+        try {
+          list = await this.probes.processes.list();
+        } catch {
+          continue; // unread: they count as alive until a reading says otherwise
+        }
+        const snap = new ProcessSnapshot(list, this.probes.clock.now(), this.probes.self, this.settings.pidStartToleranceSeconds);
+        alive = alive.filter(
+          (run) => run.pid !== undefined && this.probes.spawner.exitCode(run.pid) === undefined && snap.isAlive(run.pid, run.pidStartedAt),
+        );
+      }
+      for (const run of alive) {
+        if (run.pid === undefined) continue;
+        this.probes.spawner.kill(run.pid, "SIGKILL");
+        run.killed = true;
+        run.detail = `${run.detail} (SIGKILL: still running when the shutdown's wait ended)`;
+        this.store.saveRun(run);
+        await recordSignal(run, "SIGKILL", this.probes.clock.now());
+      }
+      if (own.length > 0) {
+        console.log(`[agents] ${this.project}: stopped ${own.length} run(s) for the shutdown, ${alive.length} with SIGKILL`);
+      }
+      return { signalled: own.length, killed: alive.length };
+    });
   }
 
   /** Drop the fleet budget subscription and the watchdog view's scratch store. */
@@ -3476,12 +3540,24 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
     }
   }
 
-  /** Stop every service, wait for work in progress, then close the store. */
-  async stop(): Promise<void> {
+  /**
+   * Stop every service, wait for work in progress, then close the store. The server's own shutdown is `planned`:
+   * a project with agents.on_restart: stop then stops its runs too, waiting on them SHUTDOWN_RUN_WAIT_MS at most.
+   */
+  async stop(options: { planned?: boolean } = {}): Promise<void> {
     this.phase = "stopped";
     for (const stop of this.stopFollowing.values()) stop();
     this.stopFollowing.clear();
     await Promise.all([...this.services.values()].map((service) => service.stop()));
+    if (options.planned) {
+      await Promise.all(
+        [...this.services.values()].map((service) =>
+          service.stopRunsForShutdown(SHUTDOWN_RUN_WAIT_MS).catch((e) => {
+            console.error(`[agents] ${service.project}: stopping the runs for the shutdown failed:`, e);
+          }),
+        ),
+      );
+    }
     for (const service of this.services.values()) service.dispose();
     this.services.clear();
     this.store?.close();

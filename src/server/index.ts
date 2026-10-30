@@ -789,8 +789,9 @@ const stopServer = async (reason: string) => {
   // Stop the planner first: it requests runs from the agents module
   await planner.stop();
 
-  // Stop agent supervision (the agents themselves keep running)
-  await agents.stop();
+  // Stop agent supervision: the agents keep running for the next server to adopt, unless a project sets
+  // agents.on_restart: stop (then their runs are stopped too, within a bounded wait)
+  await agents.stop({ planned: true });
   // Stop triage: wait for calls in progress, then close its store
   await triage.stop();
 
