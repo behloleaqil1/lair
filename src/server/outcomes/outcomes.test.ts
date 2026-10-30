@@ -454,7 +454,7 @@ describe("one outcome per answer", () => {
     const d = await answered(first, escalation(), "fresh_session");
     first.fact(HOUR, { code: "task_failed", task: TASK });
     first.at(30 * MIN);
-    expect(await first.tracker.sweep()).toBe(0); // the window is open and the failure is not in it yet... it is later
+    expect(await first.tracker.sweep()).toBe(0); // the failure is still in the future: pending
     first.tracker.stop();
     first.facts.close();
     first.store.close();
