@@ -90,7 +90,7 @@ import {
   type FillSettings,
 } from "./config.js";
 import { escalationDecisionKey, type DecisionRequest } from "./decisions.js";
-import type { AgentProbes } from "./probes.js";
+import type { AgentProbes, MemoryReading } from "./probes.js";
 import { MAX_PROMPT_FILE_BYTES } from "./prompts.js";
 import { lastLines, readTail } from "./sessions.js";
 import type { AgentsStore } from "./store.js";
@@ -99,6 +99,13 @@ import { isActive, isValidTaskId, type AgentRun, type QueueMark } from "./types.
 export const MAX_TASKS_FILE_BYTES = 256 * 1024;
 export const MAX_TASK_LINES = 200;
 export const MAX_TASK_LINE_CHARS = 2000;
+const CAPACITY_PROBE_TIMEOUT_MS = 5_000;
+
+/** What one fill check reads of the machine and of the heavy work, once */
+interface CapacityState {
+  machine?: Promise<{ cpus: number; load: number; total: number; memory?: MemoryReading }>;
+  heavy?: number;
+}
 const QUEUE_MAX_BYTES = 4 * 1024 * 1024;
 const QUEUE_LINE_CHARS = 1000;
 const MARK_TAIL_BYTES = 256;
@@ -974,6 +981,7 @@ export class AgentsFill {
     const promptsDir = getPromptsDir(config);
     let active = this.activeCount();
     let noCapacity: string | null = null;
+    const capacityState: CapacityState = {};
     this.waitingSeen.clear();
     const views: FillLineView[] = [];
     const seen = new Set<string>();
@@ -1346,8 +1354,8 @@ export class AgentsFill {
         await hold("max_active", `max_active: ${active} run(s) fill started are active (max_active ${settings.maxActive})`);
         continue;
       }
-      // Native capacity checks (per-agent, based on class)
-      const nativeCapacity = this.checkNativeCapacity(agent);
+      // Native capacity checks (per-agent and per-task, based on class and heavy work)
+      const nativeCapacity = await this.checkNativeCapacity(agent, task, capacityState);
       if (nativeCapacity !== null) {
         await hold(nativeCapacity.hold, nativeCapacity.reason);
         continue;
@@ -1390,6 +1398,7 @@ export class AgentsFill {
         continue;
       }
       active++;
+      if (capacityState.heavy !== undefined && this.isHeavyTask(task)) capacityState.heavy++;
       show("started", `started run ${short(run.id)}`, run.id);
       await this.options.record(
         "fill_started",
@@ -1882,98 +1891,115 @@ export class AgentsFill {
   }
 
   /**
-   * Native capacity check result for one agent.
-   * Returns null if capacity is available, otherwise the hold type and reason.
+   * Native capacity check for one agent starting one task: null when there is capacity, otherwise the hold and
+   * why. Nothing is probed when no capacity limit is configured. The machine is read once per check (`state`),
+   * and the heavy-work count once, kept current as this check starts heavy runs. A probe that fails or returns
+   * nonsense holds ("capacity_probe"): fill never starts agents on a machine it could not measure.
    */
-  private checkNativeCapacity(agent: string): { hold: FillHold; reason: string } | null {
-    const { settings, probes } = this.options;
-    const cap = settings.capacity;
+  private async checkNativeCapacity(
+    agent: string,
+    task: string,
+    state: CapacityState,
+  ): Promise<{ hold: FillHold; reason: string } | null> {
+    const cap = this.options.settings.capacity;
+    const wantsLoad = cap.loadPerCpuMax !== undefined;
+    const wantsMemory = cap.memory.availableMinPct !== undefined;
+    const wantsPressure = cap.memory.pressureMax !== undefined;
+    const wantsHeavy = cap.heavyWork.detect.length > 0;
+    if (!wantsLoad && !wantsMemory && !wantsPressure && !wantsHeavy) return null;
+
+    const sysInfo = this.options.probes.systemInfo;
+    state.machine ??= (async () => {
+      const memory =
+        wantsMemory || wantsPressure
+          ? await sysInfo.memory({ pressure: wantsPressure, timeoutMs: CAPACITY_PROBE_TIMEOUT_MS })
+          : undefined;
+      return { cpus: sysInfo.cpuCount(), load: sysInfo.loadAvg1(), total: sysInfo.totalMemory(), memory };
+    })();
+    const machine = await state.machine;
+    const numCpus = machine.cpus;
+    const load1 = machine.load;
+    const totalMem = machine.total;
+    const available = machine.memory?.available;
+    const pressure = machine.memory?.pressurePct;
+
+    const availablePct =
+      available !== undefined && Number.isFinite(available) && totalMem > 0 ? (available / totalMem) * 100 : undefined;
+    const probeFailed = (what: string) => ({ hold: "capacity_probe" as const, reason: `no capacity: ${what} could not be read` });
+    if (wantsLoad && !(Number.isFinite(numCpus) && numCpus > 0 && Number.isFinite(load1))) return probeFailed("CPU count or load");
+    if (wantsMemory && availablePct === undefined) {
+      return probeFailed("available memory");
+    }
+    if (wantsPressure && !(pressure !== undefined && Number.isFinite(pressure))) return probeFailed("memory pressure");
+
+    const loadPerCpu = wantsLoad ? load1 / numCpus : undefined;
+    state.heavy ??= wantsHeavy ? this.countHeavyWork() : 0;
+    const heavyAtLimit = wantsHeavy && state.heavy >= cap.heavyWork.maxActive;
     const agentClass = getAgentClass(cap, agent);
-    const sysInfo = probes.systemInfo;
 
-    // Get current system state
-    const numCpus = sysInfo.cpuCount();
-    const load1 = sysInfo.loadAvg1();
-    const loadPerCpu = load1 / numCpus;
-
-    const totalMem = sysInfo.totalMemory();
-    const freeMem = sysInfo.freeMemory();
-    const availablePct = (freeMem / totalMem) * 100;
-
-    // Update capacity view state
     this.lastCapacity = {
-      load: load1,
-      cpus: numCpus,
+      load: wantsLoad ? load1 : undefined,
+      cpus: wantsLoad ? numCpus : undefined,
       loadPerCpu,
       loadPerCpuMax: cap.loadPerCpuMax,
-      loadOverLimit: cap.loadPerCpuMax !== undefined && loadPerCpu > cap.loadPerCpuMax,
-      memory: {
-        total: totalMem,
-        available: freeMem,
-        availablePct,
-        underMin: cap.memory.availableMinPct !== undefined && availablePct < cap.memory.availableMinPct,
-        availableMinPct: cap.memory.availableMinPct,
-      },
-      heavyWork: cap.heavyWork.detect.length > 0 ? {
-        active: this.countHeavyWork(),
-        maxActive: cap.heavyWork.maxActive,
-        atLimit: this.countHeavyWork() >= cap.heavyWork.maxActive,
-      } : undefined,
+      loadOverLimit: loadPerCpu !== undefined && cap.loadPerCpuMax !== undefined && loadPerCpu > cap.loadPerCpuMax,
+      memory:
+        availablePct !== undefined
+          ? {
+              total: totalMem,
+              available: available as number,
+              availablePct,
+              underMin: cap.memory.availableMinPct !== undefined && availablePct < cap.memory.availableMinPct,
+              availableMinPct: cap.memory.availableMinPct,
+              pressurePct: pressure,
+              pressureMax: cap.memory.pressureMax,
+            }
+          : undefined,
+      heavyWork: wantsHeavy ? { active: state.heavy, maxActive: cap.heavyWork.maxActive, atLimit: heavyAtLimit } : undefined,
     };
 
-    // Memory checks apply to both local and remote agents
-    if (cap.memory.availableMinPct !== undefined && availablePct < cap.memory.availableMinPct) {
+    // Memory checks hold local and remote agents alike
+    if (availablePct !== undefined && cap.memory.availableMinPct !== undefined && availablePct < cap.memory.availableMinPct) {
       return {
         hold: "capacity_memory",
         reason: `no capacity: available memory ${availablePct.toFixed(1)}% is below capacity.memory.available_min_pct (${cap.memory.availableMinPct}%)`,
       };
     }
+    if (pressure !== undefined && cap.memory.pressureMax !== undefined && pressure > cap.memory.pressureMax) {
+      return {
+        hold: "capacity_memory",
+        reason: `no capacity: memory pressure ${pressure.toFixed(1)}% exceeds capacity.memory.pressure_max (${cap.memory.pressureMax}%)`,
+      };
+    }
 
-    // Load checks apply only to local agents
-    if (agentClass === "local" && cap.loadPerCpuMax !== undefined && loadPerCpu > cap.loadPerCpuMax) {
+    // Load holds local agents only
+    if (agentClass === "local" && loadPerCpu !== undefined && cap.loadPerCpuMax !== undefined && loadPerCpu > cap.loadPerCpuMax) {
       return {
         hold: "capacity_load",
         reason: `no capacity: load per CPU ${loadPerCpu.toFixed(2)} exceeds capacity.load_per_cpu_max (${cap.loadPerCpuMax})`,
       };
     }
 
-    // Heavy work checks apply to both local and remote agents
-    if (cap.heavyWork.detect.length > 0) {
-      const heavyActive = this.countHeavyWork();
-      if (heavyActive >= cap.heavyWork.maxActive) {
-        return {
-          hold: "capacity_heavy",
-          reason: `no capacity: ${heavyActive} heavy work item(s) active (capacity.heavy_work.max_active is ${cap.heavyWork.maxActive})`,
-        };
-      }
+    // Heavy work holds only a task that is itself heavy, whatever agent runs it
+    if (heavyAtLimit && this.isHeavyTask(task)) {
+      return {
+        hold: "capacity_heavy",
+        reason: `no capacity: ${state.heavy} heavy work item(s) active (capacity.heavy_work.max_active is ${cap.heavyWork.maxActive})`,
+      };
     }
 
     return null;
   }
 
-  /**
-   * Count active heavy work items.
-   * Heavy work is detected by matching active runs' tasks against the detect globs.
-   */
-  private countHeavyWork(): number {
-    const { settings, store, project } = this.options;
-    const patterns = settings.capacity.heavyWork.detect;
-    if (patterns.length === 0) return 0;
+  /** True when the task id matches one of the heavy_work.detect globs. */
+  private isHeavyTask(task: string): boolean {
+    return this.options.settings.capacity.heavyWork.detectPatterns.some((pattern) => pattern.test(task));
+  }
 
-    const activeRuns = store.activeRuns(project);
-    let count = 0;
-    for (const run of activeRuns) {
-      // Check if any pattern matches the task
-      for (const pattern of patterns) {
-        // Simple glob matching: * matches anything
-        const regex = new RegExp(`^${pattern.replace(/\*/g, ".*").replace(/\?/g, ".")}$`);
-        if (regex.test(run.task)) {
-          count++;
-          break;
-        }
-      }
-    }
-    return count;
+  /** Active runs whose task matches a heavy_work.detect glob. */
+  private countHeavyWork(): number {
+    const { store, project } = this.options;
+    return store.activeRuns(project).filter((run) => this.isHeavyTask(run.task)).length;
   }
 
   /** null when capacity_cmd exits 0; otherwise why fill holds (a timeout holds too). */

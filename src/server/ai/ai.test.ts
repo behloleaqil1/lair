@@ -969,7 +969,7 @@ describe("a tool signed out on this machine starts no run here", () => {
     const spawner = new FakeSpawner(procs, clock);
     const agents = new AgentsManager({
       dbPath: join(dir, "data", "agents.db"),
-      probes: { processes: procs, fs: new NodeFileSystem(), runner: new NoCommands(), clock, spawner, self: { pid: 100, startedAt: NOW - 60 * MIN }, systemInfo: { cpuCount: () => 4, loadAvg1: () => 0.5, totalMemory: () => 16e9, freeMemory: () => 8e9 } },
+      probes: { processes: procs, fs: new NodeFileSystem(), runner: new NoCommands(), clock, spawner, self: { pid: 100, startedAt: NOW - 60 * MIN }, systemInfo: { cpuCount: () => 4, loadAvg1: () => 0.5, totalMemory: () => 16e9, memory: async () => ({ available: 8e9 }) } },
       tools,
     });
     agents.load([{ name: "demo", config }]);

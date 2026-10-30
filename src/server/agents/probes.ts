@@ -5,9 +5,10 @@
  */
 import { spawn } from "child_process";
 import { closeSync, mkdirSync, openSync } from "fs";
-import { cpus, freemem, loadavg, totalmem } from "os";
+import { readFile } from "fs/promises";
+import { availableParallelism, freemem, loadavg, totalmem } from "os";
 import { dirname } from "path";
-import { systemProbes, type ProcessInfo, type Probes } from "../watchdog/probes.js";
+import { systemProbes, ExecFileRunner, type CommandRunner, type ProcessInfo, type Probes } from "../watchdog/probes.js";
 import { CachedProcessTable, type ProcessCache } from "../core/process-cache.js";
 
 /** A process identity that survives pid reuse: the pid and when that process started. */
@@ -68,6 +69,14 @@ export interface ProcessSpawner {
   forget(pid: number): void;
 }
 
+/** One reading of memory: NaN fields mean the probe failed or timed out (the caller fails closed). */
+export interface MemoryReading {
+  /** Bytes available to new work (see NodeSystemInfo for the figure used per OS) */
+  available: number;
+  /** Memory pressure in percent (0-100); only read when asked for */
+  pressurePct?: number;
+}
+
 /** System resource information for native capacity checks. */
 export interface SystemInfo {
   /** Number of CPUs */
@@ -76,8 +85,8 @@ export interface SystemInfo {
   loadAvg1(): number;
   /** Total memory in bytes */
   totalMemory(): number;
-  /** Free memory in bytes */
-  freeMemory(): number;
+  /** Read available memory (and pressure when asked) within timeoutMs. Never rejects: failures are NaN. */
+  memory(options: { pressure: boolean; timeoutMs: number }): Promise<MemoryReading>;
 }
 
 export interface AgentProbes extends Probes {
@@ -242,19 +251,86 @@ export class ChildProcessSpawner implements ProcessSpawner {
   }
 }
 
-/** The real system info: reads from os module. */
+/** Available bytes on macOS from `vm_stat`: free, inactive, speculative and purgeable pages. NaN when unparsable. */
+export function parseVmStatAvailable(text: string): number {
+  const pageSize = Number(/page size of (\d+) bytes/.exec(text)?.[1] ?? NaN);
+  const pages = (label: string): number => Number(new RegExp(`^Pages ${label}:\\s+(\\d+)`, "m").exec(text)?.[1] ?? NaN);
+  const free = pages("free");
+  const inactive = pages("inactive");
+  if (!Number.isFinite(pageSize) || !Number.isFinite(free) || !Number.isFinite(inactive)) return NaN;
+  const extra = [pages("speculative"), pages("purgeable")].map((n) => (Number.isFinite(n) ? n : 0));
+  return (free + inactive + extra[0] + extra[1]) * pageSize;
+}
+
+/** Memory pressure percent on macOS: 100 minus `kern.memorystatus_level` (the percent of memory available). */
+export function parseMemoryStatusLevel(text: string): number {
+  const level = Number(text.trim());
+  return text.trim() !== "" && Number.isFinite(level) && level >= 0 && level <= 100 ? 100 - level : NaN;
+}
+
+/** `some avg10=` of /proc/pressure/memory (Linux PSI), a percent. NaN when unparsable. */
+export function parsePsiAvg10(text: string): number {
+  return Number(/^some\s+avg10=([\d.]+)/m.exec(text)?.[1] ?? NaN);
+}
+
+/** What NodeSystemInfo reads the machine through: tests replace these, not the logic. */
+export interface SystemInfoDeps {
+  platform: NodeJS.Platform;
+  runner: CommandRunner;
+  readText: (path: string) => Promise<string>;
+  /** os.freemem(): libuv's MemAvailable on Linux (free pages only on macOS, which is why it is not used there) */
+  freemem: () => number;
+}
+
+/**
+ * The real system info. Available memory is MemAvailable on Linux (what os.freemem reports there) and, on macOS,
+ * free + inactive + speculative + purgeable pages from `vm_stat` (os.freemem counts free pages only, so a busy Mac
+ * would look nearly full). Pressure is `some avg10` of /proc/pressure/memory on Linux and 100 minus
+ * kern.memorystatus_level on macOS. Reads are asynchronous with a timeout, never through a shell.
+ */
 export class NodeSystemInfo implements SystemInfo {
+  constructor(
+    private deps: SystemInfoDeps = {
+      platform: process.platform,
+      runner: new ExecFileRunner(5_000),
+      readText: (path) => readFile(path, "utf-8"),
+      freemem,
+    },
+  ) {}
+
   cpuCount(): number {
-    return cpus().length;
+    return availableParallelism();
   }
   loadAvg1(): number {
-    return loadavg()[0];
+    return loadavg()[0] ?? NaN;
   }
   totalMemory(): number {
     return totalmem();
   }
-  freeMemory(): number {
-    return freemem();
+
+  async memory(options: { pressure: boolean; timeoutMs: number }): Promise<MemoryReading> {
+    const { platform, runner, readText } = this.deps;
+    const run = async (argv: string[]): Promise<string> => {
+      const out = await runner.run(argv, { timeoutMs: options.timeoutMs });
+      return out.code === 0 ? out.stdout : "";
+    };
+    const guard = async (read: () => Promise<number>): Promise<number> => {
+      try {
+        return await read();
+      } catch {
+        return NaN;
+      }
+    };
+    if (platform === "darwin") {
+      const available = await guard(async () => parseVmStatAvailable(await run(["vm_stat"])));
+      if (!options.pressure) return { available };
+      const pressurePct = await guard(async () => parseMemoryStatusLevel(await run(["sysctl", "-n", "kern.memorystatus_level"])));
+      return { available, pressurePct };
+    }
+    const available = this.deps.freemem();
+    if (!options.pressure) return { available };
+    const pressurePct = await guard(async () => parsePsiAvg10(await readText("/proc/pressure/memory")));
+    return { available, pressurePct };
   }
 }
 

@@ -143,7 +143,7 @@ describe("agents config", () => {
       capacity: {
         loadPerCpuMax: undefined,
         memory: { pressureMax: undefined, availableMinPct: undefined },
-        heavyWork: { detect: [], maxActive: 1 },
+        heavyWork: { detect: [], detectPatterns: [], maxActive: 1 },
         agentClass: {},
         defaultClass: "local",
       },
@@ -434,7 +434,7 @@ describe("agents config", () => {
     expect(defaults.settings.fill.capacity).toEqual({
       loadPerCpuMax: undefined,
       memory: { pressureMax: undefined, availableMinPct: undefined },
-      heavyWork: { detect: [], maxActive: 1 },
+      heavyWork: { detect: [], detectPatterns: [], maxActive: 1 },
       agentClass: {},
       defaultClass: "local",
     });
@@ -454,7 +454,7 @@ describe("agents config", () => {
     expect(full.settings.fill.capacity).toEqual({
       loadPerCpuMax: 0.8,
       memory: { pressureMax: undefined, availableMinPct: 10 },
-      heavyWork: { detect: ["*-gate", "backend-*"], maxActive: 2 },
+      heavyWork: { detect: ["*-gate", "backend-*"], detectPatterns: [/^.*-gate$/, /^backend-.*$/], maxActive: 2 },
       agentClass: { "worker-a": "remote" },
       defaultClass: "local",
     });
@@ -463,6 +463,28 @@ describe("agents config", () => {
     expect(errorsOf(withFill({
       capacity: { agent_class: { "not an id": "remote" } },
     }))).toEqual(["agents.fill.capacity.agent_class.not an id: not a valid agent id"]);
+
+    // An agent_class key must name an agent fill may start
+    expect(errorsOf(withFill({
+      capacity: { agent_class: { "worker-z": "remote" } },
+    }))).toEqual(["agents.fill.capacity.agent_class.worker-z: not in agents.fill.agents"]);
+
+    // detect entries are task-id globs: regex metacharacters are literal, only * and ? are wildcards
+    const meta = parseAgentsConfig(withFill({ capacity: { heavy_work: { detect: ["gate(backend", "v1.2-*", "x?y"] } } }), project);
+    expect(meta.ok).toBe(true);
+    if (!meta.ok) return;
+    const [paren, dotted, single] = meta.settings.fill.capacity.heavyWork.detectPatterns;
+    expect(paren.test("gate(backend")).toBe(true);
+    expect(paren.test("gateXbackend")).toBe(false);
+    expect(dotted.test("v1.2-run")).toBe(true);
+    expect(dotted.test("v1x2-run")).toBe(false);
+    expect(single.test("xzy")).toBe(true);
+    expect(single.test("xy")).toBe(false);
+
+    // pressure_max is a percentage
+    expect(errorsOf(withFill({ capacity: { memory: { pressure_max: 101 } } }))[0]).toContain("agents.fill.capacity.memory.pressure_max");
+    const pressure = parseAgentsConfig(withFill({ capacity: { memory: { pressure_max: 40 } } }), project);
+    expect(pressure.ok && pressure.settings.fill.capacity.memory.pressureMax).toBe(40);
 
     // Invalid values for limits
     expect(errorsOf(withFill({ capacity: { load_per_cpu_max: 0 } }))[0]).toContain("agents.fill.capacity.load_per_cpu_max");
@@ -480,7 +502,7 @@ describe("agents config", () => {
     const capacity = {
       loadPerCpuMax: 0.8,
       memory: { pressureMax: undefined, availableMinPct: undefined },
-      heavyWork: { detect: [], maxActive: 1 },
+      heavyWork: { detect: [], detectPatterns: [], maxActive: 1 },
       agentClass: { "worker-a": "remote" as const },
       defaultClass: "local" as const,
     };

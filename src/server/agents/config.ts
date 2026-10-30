@@ -328,8 +328,10 @@ export interface CapacitySettings {
     availableMinPct?: number;
   };
   heavyWork: {
-    /** Globs or commands that indicate heavy work */
+    /** Globs (task-id patterns with * and ? wildcards) that indicate heavy work */
     detect: string[];
+    /** Pre-compiled patterns from detect globs (validated at config load) */
+    detectPatterns: RegExp[];
     /** Maximum concurrent heavy work items */
     maxActive: number;
   };
@@ -337,6 +339,20 @@ export interface CapacitySettings {
   agentClass: Record<string, AgentClass>;
   /** Default class for agents */
   defaultClass: AgentClass;
+}
+
+/**
+ * Compile a task-id glob pattern to a RegExp.
+ * Escapes regex metacharacters, then translates * and ? to .* and . respectively.
+ * This ensures patterns like "gate(backend" don't cause regex syntax errors.
+ */
+export function compileTaskGlob(pattern: string): RegExp {
+  // Escape all regex metacharacters first, then translate glob wildcards
+  const escaped = pattern
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")  // Escape regex metacharacters (except * and ?)
+    .replace(/\*/g, ".*")                   // * -> match anything
+    .replace(/\?/g, ".");                   // ? -> match single character
+  return new RegExp(`^${escaped}$`);
 }
 
 /** Get the class for an agent */
@@ -655,6 +671,7 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
           },
           heavyWork: {
             detect: value.fill.capacity.heavy_work.detect,
+            detectPatterns: value.fill.capacity.heavy_work.detect.map(compileTaskGlob),
             maxActive: value.fill.capacity.heavy_work.max_active,
           },
           agentClass: value.fill.capacity.agent_class,
@@ -721,12 +738,25 @@ function checkFill(value: RawSettings, errors: string[]): void {
     if (wake.requeue_marker.split(/[\\/]/).includes("..")) errors.push(`${where}: a ".." segment is refused`);
   }
 
-  // Validate agent_class entries
+  // Validate agent_class entries: must be valid agent ids AND be in fill.agents (F7)
   for (const agent of Object.keys(fill.capacity.agent_class)) {
     if (!isValidDragonId(agent)) {
       errors.push(`agents.fill.capacity.agent_class.${agent}: not a valid agent id`);
+    } else if (!fill.agents.includes(agent)) {
+      errors.push(`agents.fill.capacity.agent_class.${agent}: not in agents.fill.agents`);
     }
   }
+
+  // Validate detect patterns (F4): they must compile as task-id globs
+  fill.capacity.heavy_work.detect.forEach((pattern, i) => {
+    try {
+      compileTaskGlob(pattern);
+    } catch (e) {
+      errors.push(
+        `agents.fill.capacity.heavy_work.detect[${i}]: invalid task-id glob "${pattern}" (${e instanceof Error ? e.message : String(e)})`
+      );
+    }
+  });
 }
 
 /**

@@ -59,7 +59,7 @@ import {
 import { readLock } from "./locks.js";
 import { DataService } from "../services/data.js";
 import { listPromptFiles, MAX_PROMPT_FILE_BYTES, PromptFileError, readPromptFile } from "./prompts.js";
-import type { AgentProbes, ProcessOwner, ProcessSpawner, SpawnOptions, SystemInfo } from "./probes.js";
+import type { AgentProbes, ProcessOwner, ProcessSpawner, SpawnOptions, SystemInfo, MemoryReading } from "./probes.js";
 import type { DecisionInbox, DecisionRequest } from "./decisions.js";
 import { AgentsStore, SCHEMA_VERSION } from "./store.js";
 import type { AgentEvent, AgentRun } from "./types.js";
@@ -117,7 +117,7 @@ class FakeProcessTable implements ProcessTable {
   }
 }
 
-/** Fake system info for native capacity checks: returns configurable values. */
+/** Fake system info for native capacity checks: returns configurable values and counts its reads. */
 class FakeSystemInfo implements SystemInfo {
   /** Number of CPUs to report */
   cpus = 4;
@@ -125,20 +125,31 @@ class FakeSystemInfo implements SystemInfo {
   load = 0.5;
   /** Total memory in bytes (16 GB default) */
   total = 16 * 1024 * 1024 * 1024;
-  /** Free memory in bytes (8 GB default = 50% available) */
+  /** Available memory in bytes (8 GB default = 50% available) */
   free = 8 * 1024 * 1024 * 1024;
+  /** Memory pressure in percent */
+  pressure = 5;
+  /** Reads made, of any kind */
+  reads = 0;
+  /** Asks the memory probes seen */
+  memoryAsks: Array<{ pressure: boolean; timeoutMs: number }> = [];
 
   cpuCount(): number {
+    this.reads++;
     return this.cpus;
   }
   loadAvg1(): number {
+    this.reads++;
     return this.load;
   }
   totalMemory(): number {
+    this.reads++;
     return this.total;
   }
-  freeMemory(): number {
-    return this.free;
+  async memory(options: { pressure: boolean; timeoutMs: number }): Promise<MemoryReading> {
+    this.reads++;
+    this.memoryAsks.push(options);
+    return { available: this.free, pressurePct: options.pressure ? this.pressure : undefined };
   }
 }
 
@@ -2632,28 +2643,120 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(lineOf(statusAfter, "feat-search")).toMatchObject({ state: "started" });
   });
 
-  it("native capacity: defaults equal today's behaviour (no capacity checks without config)", async () => {
-    const h = setup(fill({ max_active: 4 })); // No capacity config
+  it("native capacity: defaults equal today's behaviour (no probe, no view, capacity_cmd called as before)", async () => {
+    const h = setup(fill({ max_active: 4, capacity_cmd: ["capacity-check"] })); // No capacity block
     prompts(h);
     tasks(h, "worker-a|Alice|feat-search|Search page", "worker-b|Bob|feat-login|Login form");
-    // Very high load
+    // Very high load and very low memory: ignored without a capacity block
     h.systemInfo.load = 100.0;
-    h.systemInfo.cpus = 4;
-    // Very low memory
-    h.systemInfo.free = 100 * 1024 * 1024; // 100 MB out of 16 GB
+    h.systemInfo.free = 100 * 1024 * 1024;
 
     const status = await check(h);
 
-    // With no capacity config, both start (defaults are undefined/disabled)
     expect(lineOf(status, "feat-search")).toMatchObject({ state: "started" });
     expect(lineOf(status, "feat-login")).toMatchObject({ state: "started" });
     expect(runs(h).map((r) => r.task)).toEqual(["feat-search", "feat-login"]);
+    // The machine is not read at all, and no view is published
+    expect(h.systemInfo.reads).toBe(0);
+    expect(h.service.status().fill?.capacity).toBeUndefined();
+    // capacity_cmd runs once per start, as it always has
+    expect(h.runner.calls.filter((argv) => argv[0] === "capacity-check")).toHaveLength(2);
+  });
+
+  it("native capacity: heavy_work holds only heavy tasks, for local and remote agents, counted within the tick", async () => {
+    const h = setup(fill({
+      max_active: 4,
+      capacity: {
+        heavy_work: { detect: ["*-gate"], max_active: 1 },
+        agent_class: { "worker-b": "remote" },
+      },
+    }));
+    prompts(h);
+    tasks(
+      h,
+      "worker-a|Alice|build-gate|First heavy",
+      "worker-b|Bob|test-gate|Second heavy",
+      "worker-b|Bob|docs-page|Light work on a remote agent",
+    );
+
+    const status = await check(h);
+
+    expect(lineOf(status, "build-gate")).toMatchObject({ state: "started" });
+    // The second heavy line sees the first one started in this same tick
+    expect(lineOf(status, "test-gate")).toMatchObject({ state: "held", hold: "capacity_heavy" });
+    expect(lineOf(status, "test-gate").detail).toContain("1 heavy work item(s) active (capacity.heavy_work.max_active is 1)");
+    // The light line is not held, although heavy work is at its limit
+    expect(lineOf(status, "docs-page")).toMatchObject({ state: "started" });
+    expect(runs(h).map((r) => r.task)).toEqual(["build-gate", "docs-page"]);
+    expect(h.service.status().fill?.capacity?.heavyWork).toEqual({ active: 1, maxActive: 1, atLimit: true });
+  });
+
+  it("native capacity: a local agent's light task starts while heavy work is at its limit", async () => {
+    const h = setup(fill({
+      max_active: 4,
+      capacity: { heavy_work: { detect: ["*-gate"], max_active: 1 } },
+    }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|build-gate|Heavy", "worker-b|Bob|docs-page|Light");
+
+    const status = await check(h);
+
+    expect(lineOf(status, "build-gate")).toMatchObject({ state: "started" });
+    expect(lineOf(status, "docs-page")).toMatchObject({ state: "started" });
+  });
+
+  it("native capacity: memory pressure above pressure_max holds, and is asked for only when configured", async () => {
+    const h = setup(fill({ max_active: 4, capacity: { memory: { pressure_max: 40 } } }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-search|Search page", "worker-b|Bob|feat-login|Login form");
+    h.systemInfo.pressure = 65;
+
+    const status = await check(h);
+
+    expect(lineOf(status, "feat-search")).toMatchObject({ state: "held", hold: "capacity_memory" });
+    expect(lineOf(status, "feat-login")).toMatchObject({ state: "held", hold: "capacity_memory" });
+    expect(lineOf(status, "feat-search").detail).toContain("memory pressure 65.0% exceeds capacity.memory.pressure_max (40%)");
+    expect(runs(h)).toEqual([]);
+    // One memory read serves the whole check
+    expect(h.systemInfo.memoryAsks).toEqual([{ pressure: true, timeoutMs: expect.any(Number) }]);
+
+    h.systemInfo.pressure = 10;
+    const after = await check(h);
+    expect(lineOf(after, "feat-search")).toMatchObject({ state: "started" });
+  });
+
+  it("native capacity: probes that fail or return nonsense hold instead of starting agents", async () => {
+    const h = setup(fill({
+      max_active: 4,
+      capacity: { load_per_cpu_max: 1.0, memory: { available_min_pct: 10, pressure_max: 90 } },
+    }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-search|Search page");
+
+    h.systemInfo.cpus = 0;
+    expect(lineOf(await check(h), "feat-search")).toMatchObject({ state: "held", hold: "capacity_probe" });
+    h.systemInfo.cpus = 4;
+
+    h.systemInfo.free = NaN; // a memory read that failed or timed out
+    expect(lineOf(await check(h), "feat-search")).toMatchObject({ state: "held", hold: "capacity_probe" });
+    h.systemInfo.free = 8 * 1024 * 1024 * 1024;
+
+    h.systemInfo.total = 0;
+    expect(lineOf(await check(h), "feat-search")).toMatchObject({ state: "held", hold: "capacity_probe" });
+    h.systemInfo.total = 16 * 1024 * 1024 * 1024;
+
+    h.systemInfo.pressure = NaN;
+    expect(lineOf(await check(h), "feat-search")).toMatchObject({ state: "held", hold: "capacity_probe" });
+    expect(runs(h)).toEqual([]);
+
+    h.systemInfo.pressure = 5;
+    expect(lineOf(await check(h), "feat-search")).toMatchObject({ state: "started" });
   });
 
   it("native capacity: Health shows capacity state including the hold reason", async () => {
     const h = setup(fill({
       max_active: 4,
-      capacity: { load_per_cpu_max: 1.0 },
+      capacity: { load_per_cpu_max: 1.0, memory: { available_min_pct: 10 } },
     }));
     prompts(h);
     tasks(h, "worker-a|Alice|feat-search|Search page");

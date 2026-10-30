@@ -249,7 +249,7 @@ async function boot(options: BootOptions = {}): Promise<Harness> {
     await registerOwnerRoutes(app, auth);
     const agents = new AgentsManager({
       dbPath: join(dir, "data", "agents.db"),
-      probes: { processes: procs, fs: new NodeFileSystem(), runner: new NoCommands(), clock, spawner, self: SELF, systemInfo: { cpuCount: () => 4, loadAvg1: () => 0.5, totalMemory: () => 16e9, freeMemory: () => 8e9 } },
+      probes: { processes: procs, fs: new NodeFileSystem(), runner: new NoCommands(), clock, spawner, self: SELF, systemInfo: { cpuCount: () => 4, loadAvg1: () => 0.5, totalMemory: () => 16e9, memory: async () => ({ available: 8e9 }) } },
       events,
     });
     agents.load([{ name: "demo", config }]);

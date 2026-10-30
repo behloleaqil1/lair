@@ -323,6 +323,7 @@ export type FillHold =
   | "capacity_load"
   | "capacity_memory"
   | "capacity_heavy"
+  | "capacity_probe"
   | "prompt"
   | "refused";
 
@@ -414,6 +415,10 @@ export interface FillCapacityView {
     underMin: boolean;
     /** Configured available_min_pct */
     availableMinPct?: number;
+    /** Memory pressure in percent, when pressure_max is set */
+    pressurePct?: number;
+    /** Configured pressure_max */
+    pressureMax?: number;
   };
   /** Heavy work state */
   heavyWork?: {
