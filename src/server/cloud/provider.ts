@@ -58,7 +58,11 @@ export type SpendReading = { kind: "amount"; amount: number } | { kind: "unknown
 
 export interface CloudProvider {
   describe(machine: CloudMachineSettings): Promise<MachineDescription>;
-  /** Starts a stopped machine; a running or pending one is left as it is. Returns the state after. */
+  /**
+   * Starts a stopped machine; a running or pending one is left as it is. Returns the state after.
+   * Guard-only: CloudMachines.startMachine() is its one caller, after the money guard allowed the
+   * start. Nothing else calls it, and the barrel (index.ts) exports no provider to call it on.
+   */
   start(machine: CloudMachineSettings): Promise<PowerState>;
   /** Stops a running or pending machine; a stopped one is left as it is. Returns the state after. */
   stop(machine: CloudMachineSettings): Promise<PowerState>;
