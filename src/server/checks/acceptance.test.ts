@@ -45,12 +45,16 @@ const VALID_CONFIG = {
 class FakeSpawner implements CheckSpawner {
   calls: Array<{ argv: string[]; options: { cwd: string; env: Record<string, string>; timeoutMs: number } }> = [];
   nextResult: SpawnResult = { exitCode: 0, stdout: "ok", stderr: "", timedOut: false, killed: false };
+  delayMs = 0; // Optional delay before returning result
 
   async spawn(
     argv: string[],
     options: { cwd: string; env: Record<string, string>; timeoutMs: number },
   ): Promise<SpawnResult> {
     this.calls.push({ argv, options });
+    if (this.delayMs > 0) {
+      await new Promise((r) => setTimeout(r, this.delayMs));
+    }
     return this.nextResult;
   }
 
@@ -304,6 +308,8 @@ describe("Checks module acceptance tests", () => {
   // Test 4: max_concurrent - second request waits, then runs
   it("max_concurrent 1: second request waits, then runs", async () => {
     const token = createToken(ctx, "worker-a");
+    // Make spawner take 100ms so we can observe the queued state
+    ctx.spawner.delayMs = 100;
 
     // First request
     const res1 = await ctx.app.inject({
@@ -313,10 +319,8 @@ describe("Checks module acceptance tests", () => {
       payload: { kind: "backend-targeted", sha: "a".repeat(40), tests: ["TestA"] },
     });
     expect(res1.statusCode).toBe(201);
-    // id1 unused but request must succeed to show concurrent requests work
-    JSON.parse(res1.body).data.id;
 
-    // Wait for first to start
+    // Wait for first to start but not complete
     await new Promise((r) => setTimeout(r, 20));
 
     // Second request while first is running
@@ -329,15 +333,18 @@ describe("Checks module acceptance tests", () => {
     expect(res2.statusCode).toBe(201);
     const id2 = JSON.parse(res2.body).data.id;
 
-    // Second should be queued
+    // Second should be queued (first is still running)
     const check2 = ctx.checksStore.getCheck(id2);
     expect(check2?.status).toBe("queued");
 
-    // Complete first check
-    await new Promise((r) => setTimeout(r, 50));
+    // Wait for both to complete
+    await new Promise((r) => setTimeout(r, 250));
 
     // Both should have run
     expect(ctx.spawner.calls.length).toBe(2);
+
+    // Reset delay for subsequent tests
+    ctx.spawner.delayMs = 0;
   });
 
   it("per-agent hourly limit is refused with reason", async () => {
@@ -470,8 +477,10 @@ describe("Checks module acceptance tests", () => {
 
     const token = createToken(ctx, "worker-a");
     ctx.spawner.nextResult = { exitCode: EXIT_FAIL, stdout: "", stderr: "", timedOut: false, killed: false };
+    // Add delay so we have time to set up the JUnit file before it's read
+    ctx.spawner.delayMs = 50;
 
-    // Prepare JUnit XML in fake fs
+    // Prepare JUnit XML content
     const junitXml = `<?xml version="1.0"?>
 <testsuite name="TestSuite" tests="3" failures="2">
   <testcase name="testPassing" classname="com.example.Test"/>
@@ -492,17 +501,20 @@ describe("Checks module acceptance tests", () => {
     expect(res.statusCode).toBe(201);
     const id = JSON.parse(res.body).data.id;
 
-    // Set the JUnit file after the check starts
-    await new Promise((r) => setTimeout(r, 20));
+    // Set the JUnit file BEFORE the spawner finishes (spawner has 50ms delay)
     ctx.fs.files.set(`${TEST_DATA_DIR}/${id}/test-results/results.xml`, junitXml);
 
-    await new Promise((r) => setTimeout(r, 50));
+    // Wait for check to complete
+    await new Promise((r) => setTimeout(r, 100));
 
     const check = ctx.checksStore.getCheck(id);
     expect(check?.status).toBe("fail");
     expect(check?.failingTests).toContain("testFailing1");
     expect(check?.failingTests).toContain("testFailing2");
     expect(check?.failingTests).not.toContain("testPassing");
+
+    // Reset delay
+    ctx.spawner.delayMs = 0;
   });
 
   it("malicious log line cannot start a new prompt line (fenced)", async () => {
@@ -544,7 +556,8 @@ describe("Checks module acceptance tests", () => {
     ctx.checksStore.close();
     ctx.busStore.close();
     await ctx.app.close();
-    ctx = await createTestContext(undefined); // No config
+    // Pass empty object to get empty config (no check kinds defined)
+    ctx = await createTestContext({} as typeof VALID_CONFIG);
 
     const token = createToken(ctx, "worker-a");
 
