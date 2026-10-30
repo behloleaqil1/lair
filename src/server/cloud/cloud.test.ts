@@ -11,6 +11,7 @@ import { mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import Fastify, { type FastifyInstance } from "fastify";
+import Database from "better-sqlite3";
 import {
   DescribeInstancesCommand,
   StartInstancesCommand,
@@ -60,6 +61,10 @@ class FakeAws {
   sent: Sent[] = [];
   profiles: string[] = [];
   describeError: Error | null = null;
+  /** Calls that never answer */
+  hang = new Set<"describe" | "cost">();
+  /** EC2 answering with the instance despite the tag filter (the provider must check the tag itself) */
+  ignoreFilters = false;
   /** The cost of the period before credits and refunds, an error to throw, or null: an answer with no cost in it */
   cost: string | Error | null = "0";
 
@@ -78,6 +83,7 @@ class FakeAws {
   private async ec2(region: string, command: unknown): Promise<unknown> {
     if (command instanceof DescribeInstancesCommand) {
       this.sent.push({ name: "DescribeInstances", region, input: command.input });
+      if (this.hang.has("describe")) return new Promise(() => undefined);
       if (this.describeError) throw this.describeError;
       const filters = command.input.Filters ?? [];
       const found = (command.input.InstanceIds ?? []).flatMap((id) => {
@@ -85,7 +91,7 @@ class FakeAws {
         if (!i) return [];
         // EC2 applies the filters: an instance without the tag is not returned
         const tagged = filters.every((f) => (f.Values ?? []).includes(i.tags[(f.Name ?? "").replace(/^tag:/, "")]));
-        if (!tagged) return [];
+        if (!tagged && !this.ignoreFilters) return [];
         return [
           {
             InstanceId: id,
@@ -118,9 +124,20 @@ class FakeAws {
   private async costExplorer(command: unknown): Promise<unknown> {
     if (!(command instanceof GetCostAndUsageCommand)) throw new Error("unexpected Cost Explorer command");
     this.sent.push({ name: "GetCostAndUsage", input: command.input });
+    if (this.hang.has("cost")) return new Promise(() => undefined);
     if (this.cost instanceof Error) throw this.cost;
     if (this.cost === null) return { ResultsByTime: [{ Total: {}, Estimated: true }] };
     return { ResultsByTime: [{ Total: { UnblendedCost: { Amount: this.cost, Unit: "USD" } }, Estimated: true }] };
+  }
+}
+
+/** A store failure: the table goes, through a second connection to the harness's store file */
+function dropTable(h: { dir: string }, table: "cloud_runs" | "cloud_gaps"): void {
+  const db = new Database(join(h.dir, "cloud.db"));
+  try {
+    db.exec(`DROP TABLE ${table}`);
+  } finally {
+    db.close();
   }
 }
 
@@ -537,6 +554,124 @@ describe("cloud: the money guard", () => {
       // A spend Lair can't tell is not a trip: it starts again once the readings come back
       expect(h.trips(), name).toEqual([]);
     }
+  });
+});
+
+describe("cloud: the guard's edges, each failing closed", () => {
+  it("a provider call that never answers is cut off after request_timeout_seconds, and nothing starts", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    cleanups.push(() => {
+      vi.useRealTimers();
+    });
+    const cases: ["describe" | "cost", RegExp][] = [
+      ["describe", /^spend unknown: describe failed for cloud-1: describe cloud-1: no answer in 5 s$/],
+      ["cost", /^spend unknown: the cost reading for profile gates failed: cost reading for gates: no answer in 5 s$/],
+    ];
+    for (const [call, reason] of cases) {
+      const h = new Harness(cloudBlock({}, { request_timeout_seconds: 5 }));
+      h.instance("stopped", NOW - 28 * HOUR, NOW - 26 * HOUR);
+      h.aws.hang.add(call);
+      let settled = false;
+      const pending = h.machines.startMachine("cloud-1").finally(() => {
+        settled = true;
+      });
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(settled, call).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      const result = await pending;
+      expect(result.allowed, call).toBe(false);
+      expect(result.reason, call).toMatch(reason);
+      expect(h.aws.named("StartInstances"), call).toHaveLength(0);
+      expect(h.trips(), call).toEqual([]);
+    }
+  });
+
+  it("the provider's reading alone at the limit refuses with the meter under it; a cent below is allowed", async () => {
+    // Meter $19 (storage $18, 2 h at $0.50); the reading's lag adds a day of storage, $0.22
+    const at = new Harness(cloudBlock({ limit: 20 }));
+    at.instance("stopped", NOW - 28 * HOUR, NOW - 26 * HOUR);
+    at.aws.cost = "19.78";
+    const refused = await at.machines.startMachine("cloud-1");
+    expect(refused).toMatchObject({ allowed: false });
+    expect(refused.reason).toBe("spend $20.00 reached the limit $20.00 (provider $19.78 + $0.22 metered since its data, meter $19.00)");
+    expect(at.trips()).toEqual([expect.objectContaining({ spend: 20 })]);
+    expect(at.aws.named("StartInstances")).toHaveLength(0);
+
+    const below = new Harness(cloudBlock({ limit: 20 }));
+    below.instance("stopped", NOW - 28 * HOUR, NOW - 26 * HOUR);
+    below.aws.cost = "19.77";
+    expect(await below.machines.startMachine("cloud-1")).toMatchObject({ allowed: true, state: "pending" });
+    expect(below.status().budget?.guard).toMatchObject({ state: "warning", reason: expect.stringMatching(/^spend \$19\.99 of \$20\.00/) });
+  });
+
+  it("the meter exactly at the limit refuses; a cent more of limit allows", async () => {
+    // Meter: $1 before it, storage $18, 2 h at $0.50 = $20.00
+    for (const [limit, allowed] of [
+      [20, false],
+      [20.01, true],
+    ] as const) {
+      const h = new Harness(cloudBlock({ limit, meter_start: 1 }));
+      h.instance("stopped", NOW - 28 * HOUR, NOW - 26 * HOUR);
+      const result = await h.machines.startMachine("cloud-1");
+      expect(result.allowed, `limit ${limit}`).toBe(allowed);
+      expect(h.aws.named("StartInstances"), `limit ${limit}`).toHaveLength(allowed ? 1 : 0);
+      expect(h.trips(), `limit ${limit}`).toHaveLength(allowed ? 0 : 1);
+    }
+  });
+
+  it("an instance EC2 returns despite the tag filter but without the tag is not found: no start", async () => {
+    const h = new Harness(cloudBlock());
+    h.instance("stopped", NOW - 28 * HOUR, NOW - 26 * HOUR, { role: "web" });
+    h.aws.ignoreFilters = true;
+    const result = await h.machines.startMachine("cloud-1");
+    expect(result).toMatchObject({ allowed: false });
+    expect(result.reason).toBe(`spend unknown: describe failed for cloud-1: ${INSTANCE} with tag role=gate-server not found in us-east-1`);
+    // EC2 did answer with it: the provider's own check refused it
+    expect(h.aws.named("DescribeInstances")).toHaveLength(1);
+    expect(h.aws.named("StartInstances")).toHaveLength(0);
+  });
+
+  it("one of two machines can't be described: neither starts, until it can", async () => {
+    const other = "i-0fedcba9876543210";
+    const two = cloudBlock();
+    (two.machines as Record<string, unknown>)["cloud-2"] = {
+      provider: "aws-ec2",
+      region: "us-west-2",
+      profile: "gates",
+      instance: { id: other, tag: { key: "role", value: "gate-server" } },
+      price_per_hour: 1,
+    };
+    const h = new Harness(two);
+    h.instance("stopped", NOW - 28 * HOUR, NOW - 26 * HOUR);
+    const refused = await h.machines.startMachine("cloud-1");
+    expect(refused).toMatchObject({ allowed: false });
+    expect(refused.reason).toBe(`spend unknown: describe failed for cloud-2: ${other} with tag role=gate-server not found in us-west-2`);
+    expect(h.status().budget?.meter).toBeNull();
+    expect(h.aws.named("StartInstances")).toHaveLength(0);
+
+    h.aws.instances.set(other, { state: "stopped", launch: new Date(EVE_LAUNCH), reason: stopReason(EVE_STOP), tags: { role: "gate-server" } });
+    expect(await h.machines.startMachine("cloud-1")).toMatchObject({ allowed: true });
+    // Both meter: cloud-1's 2 h at $0.50, cloud-2's 2 h in the period at $1, cloud-1's storage
+    expect(h.status().budget?.meter).toMatchObject({ compute: 3, storage: 18 });
+  });
+
+  it("a store that fails while recording or reading the runs refuses the start", async () => {
+    // Recording: the runs table is gone
+    const recording = new Harness(cloudBlock());
+    recording.instance("stopped", NOW - 28 * HOUR, NOW - 26 * HOUR);
+    dropTable(recording, "cloud_runs");
+    const refused = await recording.machines.startMachine("cloud-1");
+    expect(refused).toMatchObject({ allowed: false });
+    expect(refused.reason).toBe("spend unknown: describe failed for cloud-1: no such table: cloud_runs");
+    expect(recording.aws.named("StartInstances")).toHaveLength(0);
+
+    // Reading: seen once, then the gaps table the meter reads is gone
+    const reading = new Harness(cloudBlock());
+    reading.instance("stopped", NOW - 28 * HOUR, NOW - 26 * HOUR);
+    expect(await reading.machines.check()).toMatchObject({ allowed: true });
+    dropTable(reading, "cloud_gaps");
+    await expect(reading.machines.startMachine("cloud-1")).rejects.toThrow(/no such table: cloud_gaps/);
+    expect(reading.aws.named("StartInstances")).toHaveLength(0);
   });
 });
 
