@@ -26,6 +26,7 @@ import type {
   Tier,
   Verdict,
 } from "../../shared/review-types.js";
+import type { DecisionEvidence } from "../../shared/decision-types.js";
 import type { EventBus } from "../core/event-bus.js";
 import { assessRisk } from "../policy/risk-rules.js";
 import { matchSlots } from "../policy/reviewer-slots.js";
@@ -147,6 +148,20 @@ export const MAX_AUTO_GATE_READS = 20;
  * /api/review/gate-results takes bodies up to 1 MiB).
  */
 export const MAX_TRIAGE_RESULT_BYTES = 8 * 1024 * 1024;
+
+/**
+ * The evidence of a review.merge_failed decision (policy class C10, always the owner's). `merge_error_code`
+ * is why the merge did not happen: the policy that refused it, "interrupted" for a restart that cut it short,
+ * "exception" when the host call threw.
+ */
+export function mergeFailedEvidence(pr: number, headSha: string, refusedBy: string | null): DecisionEvidence {
+  return {
+    code: "merge_error",
+    facts: { pr, head_sha: headSha, refused_by: refusedBy, merge_error_code: refusedBy ?? "exception" },
+    cause_cleared: false,
+    linked_issue: null,
+  };
+}
 
 /** The Decision Inbox key of an automatic merge's failure (or interruption) at one head: one per PR and head. */
 export function autoMergeDecisionKey(pr: number, headSha: string): string {
@@ -1182,12 +1197,7 @@ export class ReviewService {
           reversible: true,
           structure: {
             class: "review.merge_failed",
-            evidence: {
-              code: "merge_error",
-              facts: { pr: attempt.pr, head_sha: attempt.headSha, refused_by: "interrupted" },
-              cause_cleared: false,
-              linked_issue: null,
-            },
+            evidence: mergeFailedEvidence(attempt.pr, attempt.headSha, "interrupted"),
             effects: ["reversible", "reversible"],
           },
           requestedBy: "review",
@@ -1242,12 +1252,7 @@ export class ReviewService {
         reversible: true,
         structure: {
           class: "review.merge_failed",
-          evidence: {
-            code: "merge_error",
-            facts: { pr: n, head_sha: status.headSha, refused_by: refusedBy ?? null, merge_error_code: refusedBy ?? "exception" },
-            cause_cleared: false,
-            linked_issue: null,
-          },
+          evidence: mergeFailedEvidence(n, status.headSha, refusedBy ?? null),
           effects: ["outward", "reversible"],
         },
         requestedBy: "review",

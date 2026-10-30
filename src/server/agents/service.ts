@@ -831,6 +831,26 @@ export class AgentsService {
   }
 
   /**
+   * An open provider-limit decision whose limit has reset (`limit_resets_at` is past) says so: its cause is
+   * cleared. Done at the start of the tick, before the waiting run launches and the decision is withdrawn as
+   * moot. Only its evidence changes, for the policy rules (docs/design/decision-policies.md §4). Never throws.
+   */
+  private async refreshCauses(t: Tick): Promise<void> {
+    const inbox = this.decisions();
+    if (!inbox.causeCleared) return;
+    try {
+      for (const decision of inbox.open?.(this.project) ?? []) {
+        const evidence = decision.evidence;
+        if (decision.class !== "agents.provider_limit" || !evidence || evidence.cause_cleared) continue;
+        const resets = evidence.facts.limit_resets_at;
+        if (typeof resets === "string" && Date.parse(resets) <= t.now) await inbox.causeCleared(decision.id);
+      }
+    } catch (e) {
+      console.warn(`[agents] ${this.project}: could not update the evidence of a decision: ${message(e)}`);
+    }
+  }
+
+  /**
    * Where the decision of one of fill's holds stands (fill.ts holdDecision;
    * `key` from fillDecisionKey or escalationDecisionKey): for code that keeps
    * a hold only while its decision is open or was answered "keep".
@@ -1019,6 +1039,7 @@ export class AgentsService {
       }
     }
     await this.checkBudgets(t);
+    await this.refreshCauses(t);
     if (!this.readOnly) {
       for (const run of this.store.activeRuns(this.project)) {
         t.touchedTasks.add(run.task);

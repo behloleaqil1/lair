@@ -14,6 +14,7 @@ import { QueueCacheManager } from "./services/queue-cache.js";
 import { isValidDragonId } from "./parsers/dragon-config.js";
 import { registerRootGuards, requireValidIdParam } from "./root-guards.js";
 import { mountDecisions } from "./decisions/index.js";
+import { mountDecisionPolicies } from "./decisions/policies/index.js";
 import { mountBrainTrainer } from "./brain-trainer/index.js";
 import { loadNotificationConfig, mountNotifications } from "./notifications/index.js";
 import { notificationsOn } from "./notifications/config.js";
@@ -550,6 +551,17 @@ const decisionInbox = await mountDecisions(fastify, {
   defaultProject: () => getDefaultProject(),
   events: getEventBus(),
   producers: [watchdogs, agents],
+});
+
+// Decision policies (src/server/decisions/policies/): the table in data/policies.yaml (a built-in one without the
+// file), rules C1-C4 and C11 in shadow. Each raised decision gets a proposal in the policy trace, compared with the
+// answer a person gives; nothing here answers, withdraws or changes a decision.
+await mountDecisionPolicies(fastify, {
+  policiesPath: join(process.cwd(), "data", "policies.yaml"),
+  inbox: decisionInbox,
+  events: getEventBus(),
+  humanAuth,
+  log: (line) => console.warn(`[decisions] ${line}`),
 });
 
 // Notifications (src/server/notifications/): opt-in desktop and ntfy pushes when a new action item opens,

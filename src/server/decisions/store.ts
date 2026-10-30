@@ -30,7 +30,8 @@ import type { ValidRaise } from "./validate.js";
 // 2: decisions.raised_via (server | http), for the per-project cap on HTTP callers
 // 3: decisions.attention (action | notice): what needs the owner's answer, and what is for their information
 // 4: decisions.class and decisions.evidence (JSON), nullable: the policy class and its machine-readable evidence
-export const SCHEMA_VERSION = 4;
+// 5: policy_trace: one row per decision, proposer and version (docs/design/decision-policies.md §5); shadow proposals only
+export const SCHEMA_VERSION = 5;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS decisions (
@@ -86,6 +87,19 @@ const SCHEMA = `
     detail TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_decision_audit ON decision_audit(decision_id, id);
+
+  CREATE TABLE IF NOT EXISTS policy_trace (
+    decision_id TEXT NOT NULL REFERENCES decisions(id),
+    proposer TEXT NOT NULL,
+    version TEXT NOT NULL,
+    class TEXT NOT NULL,
+    policy TEXT NOT NULL,
+    option TEXT,
+    reason_code TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    at TEXT NOT NULL,
+    PRIMARY KEY (decision_id, proposer, version)
+  );
 `;
 
 interface DecisionRow {
@@ -166,6 +180,26 @@ export interface Closing {
   withdrawnReason?: string;
   /** Withdrawn decisions need no delivery: the producer took them back itself */
   delivered?: boolean;
+}
+
+/** A proposal as written to the policy trace. `option` is null when the proposer abstained. */
+export interface PolicyTraceRow {
+  decisionId: string;
+  proposer: string;
+  version: string;
+  class: string;
+  policy: string;
+  option: string | null;
+  reasonCode: string;
+  confidence: number;
+  at: string;
+}
+
+export interface PolicyTraceJoined extends PolicyTraceRow {
+  status: DecisionStatus;
+  /** The option a person answered; null while open, withdrawn or expired */
+  answer: string | null;
+  options: DecisionOption[];
 }
 
 export class DecisionStore {
@@ -470,6 +504,72 @@ export class DecisionStore {
       | undefined;
     this.db.prepare(`UPDATE decisions SET delivery_error = ? WHERE id = ?`).run(error, id);
     return row?.delivery_error ?? null;
+  }
+
+  /** Replace an open decision's evidence (the caller changed only cause_cleared / linked_issue). False: not open, or none. */
+  updateEvidence(id: string, evidence: DecisionEvidence): boolean {
+    const r = this.db
+      .prepare(`UPDATE decisions SET evidence = ? WHERE id = ? AND status = 'open' AND evidence IS NOT NULL`)
+      .run(JSON.stringify(evidence), id);
+    return r.changes > 0;
+  }
+
+  /** Record a proposal: one row per decision, proposer and version, so a repeat (a restart) changes nothing. True: a new row. */
+  addTrace(t: PolicyTraceRow): boolean {
+    const r = this.db
+      .prepare(
+        `INSERT OR IGNORE INTO policy_trace (decision_id, proposer, version, class, policy, option, reason_code, confidence, at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(t.decisionId, t.proposer, t.version, t.class, t.policy, t.option, t.reasonCode, t.confidence, t.at);
+    return r.changes > 0;
+  }
+
+  /** Whether this proposer version already has a row for the decision. */
+  hasTrace(decisionId: string, proposer: string, version: string): boolean {
+    return (
+      this.db
+        .prepare(`SELECT 1 FROM policy_trace WHERE decision_id = ? AND proposer = ? AND version = ?`)
+        .get(decisionId, proposer, version) !== undefined
+    );
+  }
+
+  /** Every trace row with its decision's status, the answer a person gave, and the options offered. */
+  traces(): PolicyTraceJoined[] {
+    const rows = this.db
+      .prepare(
+        `SELECT t.decision_id, t.proposer, t.version, t.class, t.policy, t.option, t.reason_code, t.confidence, t.at,
+                d.status, d.answer_option, d.options
+           FROM policy_trace t JOIN decisions d ON d.id = t.decision_id ORDER BY t.at, t.decision_id`,
+      )
+      .all() as {
+      decision_id: string;
+      proposer: string;
+      version: string;
+      class: string;
+      policy: string;
+      option: string | null;
+      reason_code: string;
+      confidence: number;
+      at: string;
+      status: string;
+      answer_option: string | null;
+      options: string;
+    }[];
+    return rows.map((r) => ({
+      decisionId: r.decision_id,
+      proposer: r.proposer,
+      version: r.version,
+      class: r.class,
+      policy: r.policy,
+      option: r.option,
+      reasonCode: r.reason_code,
+      confidence: r.confidence,
+      at: r.at,
+      status: r.status as DecisionStatus,
+      answer: r.status === "answered" ? r.answer_option : null,
+      options: JSON.parse(r.options) as DecisionOption[],
+    }));
   }
 
   addAudit(id: string, entry: { at: string; action: DecisionAuditAction; actor: string; detail: string }): void {

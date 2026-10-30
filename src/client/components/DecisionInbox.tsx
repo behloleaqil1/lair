@@ -32,6 +32,7 @@ import {
 } from "../decisions-api";
 import { sessionSurvivesReload, signIn, tokenFromHash } from "../owner-session";
 import { OwnerSessions } from "./OwnerSessions";
+import { PolicyAgreement } from "./PolicyAgreement";
 import { DataTable, type Column } from "./DataTable";
 import { DetailPanel } from "./DetailPanel";
 import { Time } from "./ui";
@@ -553,6 +554,7 @@ export function DecisionInboxView({
       </p>
 
       {answering ? <OwnerSessions onSignedOut={onSignedOut} /> : <UnlockAnswering onUnlock={onUnlock} />}
+      {answering && <PolicyAgreement />}
 
       {action.length === 0 && (
         <div className="card" data-empty="needs-you">

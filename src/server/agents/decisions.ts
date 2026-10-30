@@ -80,6 +80,8 @@ export interface DecisionInbox {
   open?(project: string): Decision[];
   /** Withdraw an open decision whose condition is gone. Absent: this inbox can't. */
   withdraw?(id: string, reason: string): Promise<void>;
+  /** Tell the inbox an open decision's cause cleared (docs/design/decision-policies.md §4). Absent: this inbox can't. */
+  causeCleared?(id: string): Promise<void>;
 }
 
 function oneLine(text: string, max = 500): string {
@@ -170,6 +172,10 @@ export class ProducerDecisions implements DecisionInbox {
 
   async withdraw(id: string, reason: string): Promise<void> {
     await this.producer.withdraw(id, { module: DECISION_MODULE, reason: clip(printable(reason, false), 1000) });
+  }
+
+  async causeCleared(id: string): Promise<void> {
+    await this.producer.updateEvidence(id, { module: DECISION_MODULE, cause_cleared: true });
   }
 
   async request(decision: DecisionRequest): Promise<{ id: string; via: string }> {

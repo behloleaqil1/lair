@@ -1704,6 +1704,30 @@ describe("5. provider errors and rate limits fail over to the next configured pr
     expect(h.store.getClaim("demo", "feat-login")).toBeNull();
   });
 
+  it("the 'every profile is failing' decision says its cause cleared once the cooldown it named is over", async () => {
+    const h = setup(() => FALLBACK);
+    const { inbox } = await withInbox(h);
+    h.spawner.behaviour = (pid, log) => {
+      writeLog(h.clock, log, "Error: 429 Too Many Requests\n");
+      h.spawner.exit(pid, 1);
+    };
+    await request(h);
+    for (let i = 0; i < 6; i++) await at(h, 0);
+    const [asked] = inbox.list({ project: "demo", status: "open" });
+    expect(asked.class).toBe("agents.provider_limit");
+    expect(asked.evidence).toMatchObject({ cause_cleared: false, facts: { limit_resets_at: new Date(NOW + 30 * MIN).toISOString() } });
+    // the cooldown is not over: the tick leaves the evidence as it was raised
+    await at(h, 29 * MIN);
+    expect(inbox.get(asked.id)?.evidence?.cause_cleared).toBe(false);
+
+    await at(h, 30 * MIN);
+    const cleared = inbox.get(asked.id)!;
+    expect(cleared.evidence?.cause_cleared).toBe(true);
+    expect(cleared.audit?.filter((a) => a.action === "evidence_updated").map((a) => a.detail)).toEqual([
+      "agents updated the evidence: cause_cleared false -> true",
+    ]);
+  });
+
   it("failing over keeps the recovery counters, is capped per task, and cools a provider only for the agent that hit it", async () => {
     const h = setup(() => ({ ...FALLBACK, failover: { max_failovers: 1 } }));
     h.spawner.behaviour = (pid, log, call) => {
