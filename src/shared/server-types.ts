@@ -277,6 +277,7 @@ export type EventType =
   | "placement.machine_up"
   | "placement.machine_down"
   | "placement.job_held"
+  | "placement.machine_stopped_under_job"
   // Planner (src/server/planner/)
   | "planner.changed"
   | "planner.run_started"

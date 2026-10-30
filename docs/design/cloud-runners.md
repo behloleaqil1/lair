@@ -162,7 +162,22 @@ cloud:
 2. **Lifecycle:** start on demand, idle stop with retries, the self power-off install, quota and spend Decisions.
 3. **Phase A execution:** the `cloud` executor for pipelines (bare repository push, per-job folders, remote build and
    test steps, results back, infrastructure retry).
-4. **Placement and routing:** cloud machines as placement machines with overflow rules for external gate queues.
+4. **Placement and routing (external phase, built):** cloud machines as placement machines with overflow rules for
+   external gate queues. The external phase uses project commands (`state_cmd`, `guard_cmd`, `touch_cmd`) and the
+   project's runner starts the machine when a job lands in its lane; Lair does not call the provider directly yet.
+   Configuration: `placement.machines.<id>.on_demand` with `state_cmd`, `guard_cmd`, `boot_seconds`, `cost_per_hour`,
+   `check_seconds`, `speed_factor`, `touch_cmd`, `touch_seconds`; `placement.routing.<lane>` with `overflow_to`,
+   `prefer_when_faster`, `min_gain_seconds`. As built:
+   - a stopped machine whose guard says ok is a target only through routing, and only for a real gain (boot time
+     counted once): an overflow moves a job that waits, `prefer_when_faster` also one that would start now;
+   - the guard runs again right before a move that starts the machine (a cached verdict may be `check_seconds` old);
+   - a job queued in the machine's lane while its guard refuses or its state is unknown moves back to the lane that
+     overflows to it;
+   - while a job runs in its lanes, `touch_cmd` keeps the machine's idle timer from stopping it; a machine found
+     stopped under a running job raises `placement.machine_stopped_under_job` once per job, and the job moves back
+     once when its runner queues it there again.
+
+   See docs/configuration.md Placement.
 5. **Slots and remote scans:** parallel slots with the memory rules; container scanners and hooks on the machine.
 6. **Setup wizard** in Settings (§8).
 7. **Phase B:** lair-node on cloud machines.
