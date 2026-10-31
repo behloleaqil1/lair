@@ -154,6 +154,8 @@ export type AgentEventKind =
   | "fill_report_waiting"
   | "fill_gate_queued"
   | "fill_gate_gone"
+  | "fill_idle_notice"
+  | "fill_idle_resolved"
   | "fill_unmatched"
   | "transient"
   | "transient_cleared"
@@ -288,9 +290,12 @@ export interface ProviderUnreachableView {
  * - held: it would start but doesn't, for the reason in `detail`
  * - claimed: another agent's run, or another claim, holds the task
  * - not_allowlisted: its agent is not in agents.fill.agents, so fill never starts it
+ * - unassigned: the line names no agent (`|<name>|<task>|<description>`), so fill never starts it; `ready`
+ *   says whether it is ready work for any agent (fill.idle). An unassigned task that is done, or has an
+ *   active run or a claim, is `done` or `claimed` instead
  * - malformed: the line doesn't parse; `detail` says why
  */
-export type FillLineState = "started" | "done" | "held" | "claimed" | "not_allowlisted" | "malformed";
+export type FillLineState = "started" | "done" | "held" | "claimed" | "not_allowlisted" | "unassigned" | "malformed";
 
 /**
  * Why a line is held:
@@ -356,6 +361,11 @@ export interface FillLineView {
   runId: string | null;
   /** The open Decision Inbox item of a hold that needs the owner (FILL_OWNER_HOLDS), when it has one */
   decisionId: string | null;
+  /**
+   * Unassigned lines only: true when it is ready work for any agent (open: not done in the queue, no
+   * active run or claim on its task, its last run not waiting or blocked); `detail` says why not
+   */
+  ready?: boolean;
 }
 
 /** The holds that need the owner: each has exactly one open decision while it lasts. */
@@ -398,12 +408,55 @@ export interface FillStatusView {
   lastCheck: string | null;
   lastError: string | null;
   lines: FillLineView[];
+  /** Idle states for agents in the allowlist (fill.agents) */
+  idle?: IdleStateView[];
   /** done_match task_id: per line, its last run's latest report line that names no task it can be about */
   unmatchedReports: FillUnmatchedReportView[];
   /** What in the fill block can make fill close or change a task a line wasn't about (also on Home → Health) */
   warnings: string[];
   /** Current capacity state (native capacity checks) */
   capacity?: FillCapacityView;
+}
+
+/**
+ * Why an allowlisted agent is or isn't working, at fill's last check (fill.idle): never unexplained.
+ * - busy: it has an active run (fill's or anyone's)
+ * - waiting: its line waits on a gate
+ * - held: its line is held for another reason (`hold`), or the project is read_only
+ * - max_active: fill.max_active is reached (its line is held so, or nothing more could start)
+ * - capacity: a capacity check holds its line, or capacity_cmd refused every start
+ * - no_task: it has no line in the tasks file, and no ready work exists
+ * - task_done: its lines are done, and no ready work exists
+ * - no_ready_work: its lines are claimed by other runs, and no ready work exists
+ * - ready_work: idle (no line, its lines done or claimed) while ready work exists: the case a notice is for
+ */
+export type IdleReason =
+  | "busy"
+  | "waiting"
+  | "held"
+  | "max_active"
+  | "capacity"
+  | "no_task"
+  | "task_done"
+  | "no_ready_work"
+  | "ready_work";
+
+/** The idle state of one allowlisted agent. */
+export interface IdleStateView {
+  agent: string;
+  reason: IdleReason;
+  /** The hold of its line when it is held, waiting, at max_active or capacity */
+  hold?: FillHold;
+  /** Its line's task, when it has one in this state */
+  task?: string;
+  /** When it entered this state (kept across a restart only while its notice is open) */
+  since: string;
+  /** How long it has been in this state (seconds) */
+  durationSeconds: number;
+  /** ready_work: the ready tasks (unassigned lines' ids, at most 10) */
+  readyTasks?: string[];
+  /** Plain sentence: why */
+  explanation: string;
 }
 
 /** A DONE, WAITING or BLOCKED line an agent wrote on a run that names no task it can be about: it counts for no task. */

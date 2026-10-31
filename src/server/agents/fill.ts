@@ -6,6 +6,11 @@
  * (`<agent>|<name>|<task>|<description>`) is looked at in file order. It is:
  * - not_allowlisted when its agent isn't in fill.agents (another launcher may
  *   still run that agent): fill never starts it;
+ * - unassigned when it names no agent (`|<name>|<task>|<description>`):
+ *   fill never starts it. It is ready work for any allowlisted agent while
+ *   it is open (no active run or claim on its task, no done line in the
+ *   queue, its last run not waiting or blocked; see unassignedLine), and an
+ *   agent idle while ready work exists raises one notice (fill.idle, idle.ts);
  * - started when a run of its agent on its task is active;
  * - claimed when another agent's run, or any other claim, holds the task;
  * - done when done_pattern matches a queue line written since the task's
@@ -81,6 +86,7 @@ import { parseGateFilename } from "../parsers/gates.js";
 import { attributedAgent } from "../parsers/queue.js";
 import { getPromptsDir } from "../routes/controls.js";
 import {
+  anyAgentPatternFor,
   backoffMs,
   doneLineMatches,
   fillPatternFor,
@@ -94,6 +100,7 @@ import {
   type FillSettings,
 } from "./config.js";
 import { escalationDecisionKey, type DecisionRequest } from "./decisions.js";
+import { computeIdleStates, findReadyWork, idleExplanation, idleStateView, shouldNotice, type IdleInput, type IdleState } from "./idle.js";
 import type { AgentProbes, MemoryReading } from "./probes.js";
 import { MAX_PROMPT_FILE_BYTES } from "./prompts.js";
 import { lastLines, readTail } from "./sessions.js";
@@ -161,6 +168,16 @@ export const fillDecisionKey = (task: string, runId: string, kind?: "blocked" | 
  */
 export const fillRefusedKey = (task: string, since: string, runId: string | null) =>
   `fill:${task}:refused:${since}:${runId ?? "none"}`;
+
+/** The one option of an idle notice (fill.idle): it asks nothing */
+export const IDLE_NOTICE_NOTED = "noted";
+/** The key of an agent's idle notice: one per episode (`since`, when it began idling while ready work existed, in ms). */
+export const idleNoticeKey = (agent: string, since: number) => `fill-idle:${agent}:${since}`;
+/** The agent and episode of an idle notice's key, or null for any other key. */
+export function parseIdleNoticeKey(key: string): { agent: string; since: number } | null {
+  const match = /^fill-idle:([A-Za-z][A-Za-z0-9_-]{0,63}):(\d{1,15})$/.exec(key);
+  return match ? { agent: match[1], since: Number(match[2]) } : null;
+}
 
 /** How a run that ended other than completed ended, in plain words (never its log). */
 function howItEnded(run: AgentRun): string {
@@ -548,16 +565,20 @@ export class QueueLines {
 // ============ THE TASKS FILE ============
 
 export type TasksFileEntry =
-  | { kind: "task"; line: number; agent: string; name: string; task: string; description: string }
+  /** agent null: an unassigned line (an empty agent field), ready work for any agent while it is open */
+  | { kind: "task"; line: number; agent: string | null; name: string; task: string; description: string }
   | { kind: "malformed"; line: number; text: string; reason: string };
 
 /**
  * tasks_file lines: `<agent>|<name>|<task>|<description>` (the description
  * may be empty and may hold "|"). `#` comments and blank lines are skipped.
- * A line that doesn't parse, names an invalid agent or task id, repeats a
- * task, or comes after the 200th task is malformed: reported, not fatal.
- * With `onePerAgent` (patterns that match by agent), so is a second line
- * for an agent: its queue lines couldn't say which of its tasks they're about.
+ * An empty agent field (`|<name>|<task>|<description>`) makes the line
+ * unassigned (agent null): fill starts nothing for it. A line that doesn't
+ * parse, names an invalid agent or task id, repeats a task (unassigned lines
+ * included), or comes after the 200th task is malformed: reported, not
+ * fatal. With `onePerAgent` (patterns that match by agent), so is a second
+ * line for an agent: its queue lines couldn't say which of its tasks they're
+ * about (unassigned lines have no agent, so they never count as one).
  */
 export function parseTasksFile(content: string, onePerAgent = false): TasksFileEntry[] {
   const entries: TasksFileEntry[] = [];
@@ -580,8 +601,8 @@ export function parseTasksFile(content: string, onePerAgent = false): TasksFileE
     }
     const [agent, name, task] = fields.slice(0, 3).map((field) => field.trim());
     const description = fields.slice(3).join("|").trim();
-    if (!isValidDragonId(agent)) {
-      bad(`${agent || "(empty)"} is not a valid agent id`);
+    if (agent !== "" && !isValidDragonId(agent)) {
+      bad(`${agent} is not a valid agent id`);
       continue;
     }
     if (!isValidTaskId(task)) {
@@ -593,7 +614,7 @@ export function parseTasksFile(content: string, onePerAgent = false): TasksFileE
       bad(`task ${task} is already on line ${first}`);
       continue;
     }
-    const agentLine = agentLines.get(agent.toLowerCase());
+    const agentLine = agent === "" ? undefined : agentLines.get(agent.toLowerCase());
     if (onePerAgent && agentLine !== undefined) {
       bad(`${agent} already has a task on line ${agentLine}: with patterns that match by agent, one line per agent`);
       continue;
@@ -603,6 +624,10 @@ export function parseTasksFile(content: string, onePerAgent = false): TasksFileE
       continue;
     }
     taskLines.set(task, line);
+    if (agent === "") {
+      entries.push({ kind: "task", line, agent: null, name, task, description });
+      continue;
+    }
     agentLines.set(agent.toLowerCase(), line);
     entries.push({ kind: "task", line, agent, name: name || agent, task, description });
   }
@@ -786,6 +811,63 @@ export function reportedOutcome(
   return last ? { kind: last.kind, line: last.line } : null;
 }
 
+/** What fill makes of an unassigned line: its state, why, and whether it is ready work (fill.idle). */
+export interface UnassignedLine {
+  state: Extract<FillLineState, "done" | "claimed" | "unassigned">;
+  detail: string;
+  runId: string | null;
+  ready: boolean;
+}
+
+/**
+ * An unassigned tasks_file line (no agent): fill starts nothing for it, and
+ * it is ready work for any allowlisted agent only while it is open. It is
+ * claimed while a run of its task is active or a claim holds it (someone
+ * took it: a run you requested, say); done when a queue line matching
+ * done_pattern names it, written since its latest run was requested (the
+ * whole window when it never ran; `{agent}` then matches any agent, since the
+ * line names none), or when its latest run's own last line is the DONE one;
+ * and not ready while that run's own last line is WAITING or BLOCKED (its
+ * agent still has it). A done line here only keeps the line from counting as
+ * ready work: nothing is recorded, and nothing goes to review. With a
+ * done_pattern that names only the agent, no queue line can name a task
+ * nobody ran: it stays open until it is assigned or taken out of the file.
+ * Throws when a pattern doesn't compile for this task.
+ */
+export function unassignedLine(
+  store: Pick<AgentsStore, "latestRunForTask" | "getClaim" | "firstRunForAgentAfter">,
+  project: string,
+  queue: QueueLines,
+  settings: Pick<FillSettings, "donePattern" | "waitingPattern" | "blockedPattern">,
+  task: string,
+): UnassignedLine {
+  const latest = store.latestRunForTask(project, task);
+  if (latest && isActive(latest.state)) {
+    return { state: "claimed", detail: `run ${short(latest.id)} of agent ${latest.agent} is ${latest.state}: not ready work`, runId: latest.id, ready: false };
+  }
+  const claim = store.getClaim(project, task);
+  if (claim) {
+    return { state: "claimed", detail: `claimed by run ${short(claim.runId)} (agent ${claim.agent}): not ready work`, runId: claim.runId, ready: false };
+  }
+  const donePattern = anyAgentPatternFor(settings.donePattern, task);
+  const doneLine = donePattern ? queue.find(donePattern, latest?.queueMark) : null;
+  if (doneLine !== null) return { state: "done", detail: `done: ${oneLine(doneLine)}`, runId: latest?.id ?? null, ready: false };
+  if (latest) {
+    const until = queueWindowEnd(store, project, settings, { agent: latest.agent, task }, latest);
+    const outcome = reportedOutcome(queue, settings, latest, until);
+    if (outcome?.kind === "done") return { state: "done", detail: `done: ${oneLine(outcome.line)}`, runId: latest.id, ready: false };
+    if (outcome) {
+      return {
+        state: "unassigned",
+        detail: `no agent assigned, and not ready work: its last run ${short(latest.id)} (agent ${latest.agent}) ended on a ${outcome.kind.toUpperCase()} line: ${oneLine(outcome.line)}`,
+        runId: latest.id,
+        ready: false,
+      };
+    }
+  }
+  return { state: "unassigned", detail: "no agent assigned: ready work for any agent in agents.fill.agents", runId: null, ready: true };
+}
+
 // ============ PROMPTS ============
 
 export type PromptResult = { ok: true; text: string; files: string[] } | { ok: false; reason: string };
@@ -931,6 +1013,10 @@ export class AgentsFill {
   private unmatchedReports: FillUnmatchedReportView[] = [];
   /** Last capacity check state for the view */
   private lastCapacity: FillCapacityView | null = null;
+  /** Every allowlisted agent's idle state at the last whole check (fill.idle) */
+  private idleStates = new Map<string, IdleState>();
+  /** Each agent's open idle notice: its episode's start (ms), null for none; read from the store once per agent */
+  private idleNotices = new Map<string, number | null>();
 
   constructor(private options: AgentsFillOptions) {}
 
@@ -957,6 +1043,7 @@ export class AgentsFill {
       lastCheck: this.lastCheck === null ? null : iso(this.lastCheck),
       lastError: this.lastError,
       lines: this.lines,
+      idle: this.idleStates.size > 0 ? [...this.idleStates.values()].map(idleStateView) : undefined,
       unmatchedReports: this.unmatchedReports,
       warnings: settings.warnings,
       capacity: this.lastCapacity ?? undefined,
@@ -1041,6 +1128,8 @@ export class AgentsFill {
     try {
       this.lines = await this.evaluate(abort.signal, now);
       this.lastError = abort.signal.aborted ? "the check was interrupted: the module stopped" : null;
+      // A check cut short saw only some lines: the idle states and notices wait for a whole one
+      if (!abort.signal.aborted) await this.updateIdle(this.lines, now);
     } catch (e) {
       const error = message(e);
       if (error !== this.lastError) console.warn(`[agents] ${this.options.project}: fill check failed: ${error}`);
@@ -1050,6 +1139,158 @@ export class AgentsFill {
       this.lastCheck = now;
       if (this.abort === abort) this.abort = null;
     }
+  }
+
+  /**
+   * After a whole check: every allowlisted agent's idle state (idle.ts), and
+   * its notice (fill.idle). An agent idle while ready work exists for
+   * fill.idle.notice_minutes raises one fill_idle_notice (on the bus too) and,
+   * with the Decision Inbox, one notice there, once per episode. The episode
+   * ends when the agent's state changes (it works, waits or is held, or the
+   * ready work is gone), when notices are turned off, or when it leaves
+   * fill.agents: fill_idle_resolved is recorded and the notice withdrawn. The
+   * store says which notice is open, so a restart neither repeats it nor
+   * leaves it open; how long an agent idles before its notice is counted in
+   * memory, so a restart starts that count again. Reads only the store and
+   * the inbox; never throws (the next check tries again).
+   */
+  private async updateIdle(lines: FillLineView[], now: number): Promise<void> {
+    const { store, project, settings } = this.options;
+    const { idle } = settings;
+    try {
+      const active = store.activeRuns(project);
+      const input: IdleInput = {
+        lines,
+        busy: new Set(active.map((run) => run.agent.toLowerCase())),
+        activeCount: active.filter((run) => run.origin === "fill").length,
+        maxActive: settings.maxActive,
+        capacityRefused: lines.some((l) => l.state === "held" && l.hold === "capacity"),
+        readOnly: this.options.readOnly(),
+      };
+      // After a restart an open notice's episode goes on: its start is kept, so it isn't raised again
+      const previous = new Map<string, Pick<IdleState, "reason" | "since">>(this.idleStates);
+      for (const agent of settings.agents) {
+        const open = this.openIdleNotice(agent);
+        if (open !== null && !previous.has(agent)) previous.set(agent, { reason: "ready_work", since: open });
+      }
+      const ready = findReadyWork(idle.readySources, lines);
+      const states = computeIdleStates(settings.agents, input, ready, now, previous);
+      this.idleStates = new Map(states.map((state) => [state.agent, state]));
+      for (const state of states) {
+        const open = this.openIdleNotice(state.agent);
+        if (open === null) {
+          if (shouldNotice(state, idle)) await this.raiseIdleNotice(state, ready.length, now);
+        } else if (idle.noticeMinutes <= 0) {
+          await this.resolveIdleNotice(state.agent, open, "fill.idle.notice_minutes is 0: idle notices are off", now);
+        } else if (state.reason !== "ready_work") {
+          await this.resolveIdleNotice(state.agent, open, idleExplanation(state), now);
+        }
+      }
+      // Notices that no episode stands on: an agent out of fill.agents, or an episode that ended without its withdrawal
+      for (const decision of this.options.openDecisions()) {
+        const notice = parseIdleNoticeKey(decision.key);
+        if (!notice) continue;
+        if (!settings.agents.includes(notice.agent)) {
+          await this.resolveIdleNotice(notice.agent, notice.since, `${notice.agent} is no longer in agents.fill.agents`, now);
+        } else if (this.openIdleNotice(notice.agent) !== notice.since) {
+          await this.options.withdraw(decision, "The idle episode it was about has ended.");
+        }
+      }
+    } catch (e) {
+      console.warn(`[agents] ${project}: fill's idle check failed: ${message(e)}`);
+    }
+  }
+
+  /** The start (ms) of the agent's open idle notice, or null: the latest of its fill_idle_notice and fill_idle_resolved. */
+  private openIdleNotice(agent: string): number | null {
+    let since = this.idleNotices.get(agent);
+    if (since === undefined) {
+      const last = this.options.store.listEvents(this.options.project, { kinds: ["fill_idle_notice", "fill_idle_resolved"], agent, limit: 1 })[0];
+      since = last?.kind === "fill_idle_notice" && typeof last.data.since === "number" ? last.data.since : null;
+      this.idleNotices.set(agent, since);
+    }
+    return since;
+  }
+
+  /** One notice for an agent idle while ready work exists: the event (and bus), and a notice in the Decision Inbox. */
+  private async raiseIdleNotice(state: IdleState, readyCount: number, now: number): Promise<void> {
+    const { agent, since } = state;
+    const minutes = Math.floor(state.duration / 60_000);
+    const tasks = state.readyTasks ?? [];
+    const explanation = idleExplanation(state);
+    const key = idleNoticeKey(agent, since);
+    await this.options.record(
+      "fill_idle_notice",
+      {
+        agent,
+        summary: `fill: ${agent} has been idle for ${minutes} min while ready work exists (${readyCount} unassigned task(s))`,
+        evidence: [explanation],
+        data: { since, cause: state.cause ?? null, minutes, readyCount, readyTasks: tasks, key },
+        dedupeKey: `fill_idle_notice:${agent}:${since}`,
+      },
+      now,
+    );
+    this.idleNotices.set(agent, since);
+    // Without a Decision Inbox the event is the notice: the inbox file is for questions, and this asks none
+    if (this.options.findDecision(key) === undefined) return;
+    const more = readyCount > tasks.length ? ` (and ${readyCount - tasks.length} more)` : "";
+    await this.options.raise(
+      {
+        kind: "other",
+        attention: "notice",
+        question: `${agent} has been idle for ${minutes} min while ready work exists`,
+        context: [
+          `${explanation}.`,
+          "",
+          `Ready work: ${readyCount} unassigned line(s) in the tasks file: ${tasks.join(", ")}${more}.`,
+          "",
+          `Since ${iso(since)}. Assign one of them to ${agent} (its id in the line's agent field), or let the planner do it. ` +
+            `This notice is withdrawn once ${agent} is no longer idle while ready work exists.`,
+        ].join("\n"),
+        options: [
+          {
+            id: IDLE_NOTICE_NOTED,
+            label: "Noted",
+            consequences: `The notice closes. Fill raises none again until ${agent} stops idling and then idles while ready work exists again.`,
+            effect: "reversible",
+          },
+        ],
+        recommended: IDLE_NOTICE_NOTED,
+        why: "Nothing is decided here: assigning the work is yours (or the planner's), and the notice goes by itself once the agent is no longer idle.",
+        reversible: true,
+        key,
+        ref: `fill-idle:${agent}`,
+        structure: {
+          class: "agents.fill_idle",
+          evidence: {
+            code: "idle_with_ready_work",
+            facts: { agent, idle_minutes: minutes, ready_count: readyCount, cause: state.cause ?? null },
+            cause_cleared: false,
+            linked_issue: null,
+          },
+        },
+      },
+      null,
+    );
+  }
+
+  /** The end of an agent's idle episode: fill_idle_resolved (on the bus too), and its notice withdrawn. */
+  private async resolveIdleNotice(agent: string, since: number, why: string, now: number): Promise<void> {
+    const key = idleNoticeKey(agent, since);
+    await this.options.record(
+      "fill_idle_resolved",
+      {
+        agent,
+        summary: `fill: ${agent}'s idle notice is resolved: ${why}`,
+        evidence: [why],
+        data: { since, key },
+        dedupeKey: `fill_idle_resolved:${agent}:${since}`,
+      },
+      now,
+    );
+    this.idleNotices.set(agent, null);
+    const decision = this.options.findDecision(key);
+    if (decision?.status === "open") await this.options.withdraw(decision, `The idle episode ended: ${why}.`);
   }
 
   /** Whether the owner released the claim of this run (POST /api/agents/claims/release). */
@@ -1112,12 +1353,16 @@ export class AgentsFill {
     const reportsListedTask = (kind: UnmatchedReport["kind"], line: string): boolean =>
       listedTasks.some((other) => {
         if (!line.includes(other.task)) return false;
+        const { agent } = other;
         try {
-          if (taskLineMatch(fillPatternFor(templates[kind], other.task, other.agent), line) === null) return false;
+          // An unassigned task's line may be anyone's (it has no agent): it is that task's, never unmatched
+          const pattern = agent === null ? anyAgentPatternFor(templates[kind], other.task) : fillPatternFor(templates[kind], other.task, agent);
+          if (pattern === null || taskLineMatch(pattern, line) === null) return false;
         } catch {
           return false;
         }
-        const kept = store.getEventByKey(project, fillDoneKey(other.task, store.latestRunForTask(project, other.task)?.id ?? null, other));
+        if (agent === null) return true;
+        const kept = store.getEventByKey(project, fillDoneKey(other.task, store.latestRunForTask(project, other.task)?.id ?? null, { ...other, agent }));
         return kept === null || kept.data.line === line;
       });
     const seen = new Set<string>();
@@ -1144,6 +1389,19 @@ export class AgentsFill {
         continue;
       }
       const { line, agent, name, task, description } = entry;
+      if (agent === null) {
+        // Unassigned: fill starts nothing for it; it is ready work for any allowlisted agent while it is open
+        let found: UnassignedLine;
+        try {
+          found = unassignedLine(store, project, queue, settings, task);
+        } catch (e) {
+          found = { state: "unassigned", detail: `no agent assigned, and not ready work: done_pattern can't be checked for it: ${message(e)}`, runId: null, ready: false };
+        }
+        const { state, detail, runId, ready } = found;
+        views.push({ line, agent, name, task, description, state, detail, hold: null, releasable: false, waiting: null, runId, decisionId: null, ready });
+        continue;
+      }
+      const fields: TaskLineFields = { agent, name, task, description };
       const key = `${agent}|${task}`;
       seen.add(key);
       const show = (
@@ -1212,7 +1470,7 @@ export class AgentsFill {
       }
 
       // Lines that name only the agent end where its next run on another task began (an owner's run, say)
-      const until = queueWindowEnd(store, project, settings, entry, latest);
+      const until = queueWindowEnd(store, project, settings, fields, latest);
 
       // The owner's last release of the task, and their pause (the owner's own hold) when it is newer
       const release = store.listEvents(project, { kinds: ["fill_released"], task, limit: 1 })[0];
@@ -1239,7 +1497,7 @@ export class AgentsFill {
       // Done: kept once seen (for this latest run and this line as written), else from the queue file
       let check: DoneCheck;
       try {
-        check = checkDone(store, project, queue, settings, entry, latest, until);
+        check = checkDone(store, project, queue, settings, fields, latest, until);
       } catch (e) {
         await refused(
           `done_pattern: ${message(e)}`,
@@ -1278,8 +1536,8 @@ export class AgentsFill {
             runId: latest?.id,
             summary: `fill: ${task} is done: ${oneLine(done)}`,
             evidence: [done],
-            data: { line: done, runId: latest?.id ?? null, lineHash: lineHash(entry) },
-            dedupeKey: fillDoneKey(task, latest?.id ?? null, entry),
+            data: { line: done, runId: latest?.id ?? null, lineHash: lineHash(fields) },
+            dedupeKey: fillDoneKey(task, latest?.id ?? null, fields),
           },
           probes.clock.now(),
         );
