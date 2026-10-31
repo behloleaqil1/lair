@@ -311,7 +311,7 @@ describe("InfraMonitor", () => {
       expect(status.activeNotices).toHaveLength(0);
 
       // Third tick: threshold reached (120s default)
-      clock.advance(MIN);
+      clock.advance(2 * MIN);  // Need 120s total since downSince was set
       await monitor.tick();
       status = monitor.status();
       expect(status.activeNotices).toHaveLength(1);
@@ -337,8 +337,12 @@ describe("InfraMonitor", () => {
       // Machine goes down
       world.machines.laptop = false;
 
-      // Wait for threshold
-      clock.advance(3 * MIN);
+      // Second tick: machine detected as down, downSince set
+      clock.advance(MIN);
+      await monitor.tick();
+
+      // Wait for threshold (120s from when downSince was set)
+      clock.advance(2 * MIN);
       await monitor.tick();
 
       let status = monitor.status();
@@ -401,8 +405,12 @@ describe("InfraMonitor", () => {
       // Laptop goes down
       world.machines.laptop = false;
 
+      // Second tick: machine detected as down, downSince set
+      clock.advance(MIN);
+      await monitor.tick();
+
       // Wait for threshold
-      clock.advance(3 * MIN);
+      clock.advance(2 * MIN);
       await monitor.tick();
 
       const status = monitor.status();
@@ -434,8 +442,12 @@ describe("InfraMonitor", () => {
       // Machine goes down
       world.machines.laptop = false;
 
-      // Wait for threshold and tick
-      clock.advance(3 * MIN);
+      // Second tick: machine detected as down, downSince set
+      clock.advance(MIN);
+      await monitor.tick();
+
+      // Wait for threshold (120s from when downSince was set)
+      clock.advance(2 * MIN);
       await monitor.tick();
 
       expect(requeueCalls).toHaveLength(1);
@@ -461,9 +473,18 @@ describe("InfraMonitor", () => {
       manager.start();
       const monitor = manager.get("TestProject")!;
 
+      // First tick
       await monitor.tick();
+
+      // Machine goes down
       world.machines.laptop = false;
-      clock.advance(3 * MIN);
+
+      // Second tick: machine detected as down, downSince set
+      clock.advance(MIN);
+      await monitor.tick();
+
+      // Wait for threshold (120s from when downSince was set)
+      clock.advance(2 * MIN);
       await monitor.tick();
 
       // Notice is raised but no requeue
@@ -489,9 +510,15 @@ describe("InfraMonitor", () => {
       // First tick
       await monitor.tick();
 
-      // Machine goes down, threshold reached
+      // Machine goes down
       world.machines.laptop = false;
-      clock.advance(3 * MIN);
+
+      // Second tick: machine detected as down, downSince set
+      clock.advance(MIN);
+      await monitor.tick();
+
+      // Wait for threshold (120s from when downSince was set)
+      clock.advance(2 * MIN);
       await monitor.tick();
 
       expect(monitor.status().activeNotices).toHaveLength(1);
@@ -517,9 +544,18 @@ describe("InfraMonitor", () => {
       manager.start();
       const monitor = manager.get("TestProject")!;
 
+      // First tick
       await monitor.tick();
+
+      // Machine goes down
       world.machines.laptop = false;
-      clock.advance(3 * MIN);
+
+      // Second tick: machine detected as down, downSince set
+      clock.advance(MIN);
+      await monitor.tick();
+
+      // Wait for threshold (120s from when downSince was set)
+      clock.advance(2 * MIN);
       await monitor.tick();
 
       expect(monitor.status().activeNotices).toHaveLength(1);
