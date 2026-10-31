@@ -15,6 +15,7 @@ import { isValidDragonId } from "./parsers/dragon-config.js";
 import { registerRootGuards, requireValidIdParam } from "./root-guards.js";
 import { mountDecisions } from "./decisions/index.js";
 import { mountBrainTrainer } from "./brain-trainer/index.js";
+import { mountOutcomeTracker } from "./outcomes/index.js";
 import { loadNotificationConfig, mountNotifications } from "./notifications/index.js";
 import { notificationsOn } from "./notifications/config.js";
 import {
@@ -565,6 +566,16 @@ await mountNotifications(fastify, {
   dashboardUrl: dashboardUrlFor(HOST, PORT),
 });
 
+// Outcome tracker (src/server/outcomes/): off unless data/server.yaml sets outcome_tracker.enabled. Records whether each
+// answered decision turned out good, bad or unknown (the labels the brain trainer reads). It listens to events and may
+// only list answers waiting for a verdict and record it: it never answers, retries or reverts anything.
+mountOutcomeTracker(fastify, {
+  configPath: join(process.cwd(), "data", "server.yaml"),
+  dbPath: join(process.cwd(), "data", "outcomes.db"),
+  decisions: decisionInbox,
+  events: getEventBus(),
+});
+
 // Brain trainer (src/server/brain-trainer/): off unless data/server.yaml sets brain_trainer.enabled. A nightly
 // classifier trained in a container on the answered decisions, scored on the brain bench, versioned, and run in
 // shadow mode only: it is given a read-only view of the inbox and nothing it produces answers a decision.
@@ -595,6 +606,11 @@ reviews.load(projectEntries);
 const hostServices = new HostServicesManager({ events: getEventBus() });
 hostServices.load(projectEntries);
 
+// The ready guard (agents.fill.ready_guard) reads a project's PRs from its review module's git host
+agents.useReadyFacts((project) => {
+  const review = reviews.get(project);
+  return review ? { facts: (pr) => review.readyFacts(pr) } : undefined;
+});
 // Every merge hold has one decision (only the owner releases a hold); answering it releases the hold
 await reviews.useDecisions(decisionInbox);
 // The same for delivery's held services: answering releases the service, as its Release button does
