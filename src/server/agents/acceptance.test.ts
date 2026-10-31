@@ -5125,7 +5125,8 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
 
     // The agent starts and runs
     await check(h);
-    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 0); // pid 5001 starts
+    h.spawner.exit(5001, 0); // process exits cleanly
     await at(h, 1 * MIN);
     expect(runs(h)[0].state).toBe("completed");
 
@@ -5159,7 +5160,8 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     tasks(h, "worker-a|Alice|feat-login|Build the login form");
 
     await check(h);
-    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 0); // pid 5001 starts
+    h.spawner.exit(5001, 0); // process exits cleanly
     await at(h, 1 * MIN);
     expect(runs(h)[0].state).toBe("completed");
 
@@ -5179,7 +5181,8 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     tasks(h, "worker-a|Alice|feat-login|Build the login form");
 
     await check(h);
-    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 0); // pid 5001 starts
+    h.spawner.exit(5001, 0); // process exits cleanly
     await at(h, 1 * MIN);
     expect(runs(h)[0].state).toBe("completed");
 
@@ -5206,7 +5209,8 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
 
     // First run: reports wrong task
     await check(h);
-    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 0); // pid 5001 starts
+    h.spawner.exit(5001, 0);
     await at(h, 1 * MIN);
     appendFileSync(h.queueFile, "- DONE old-task by worker-a 12:05Z: merged\n");
 
@@ -5220,8 +5224,9 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(lineOf(await check(h), "feat-login").state).toBe("started");
 
     // Second run: also reports wrong task
-    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
-    await at(h, 4 * MIN);
+    await at(h, 4 * MIN); // pid 5002 starts
+    h.spawner.exit(5002, 0);
+    await at(h, 4 * MIN + 30 * SEC);
     appendFileSync(h.queueFile, "- DONE another-task by worker-a 12:10Z: done\n");
 
     // After max_completions_without_done, held: no_done
@@ -5242,7 +5247,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(firstPrompt).not.toContain("Your previous run reported");
 
     // The run ends and reports wrong task
-    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    h.spawner.exit(5001, 0);
     await at(h, 1 * MIN);
     appendFileSync(h.queueFile, "- DONE old-task by worker-a 12:05Z: merged\n");
     await check(h);
@@ -5263,7 +5268,8 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     tasks(h, "worker-a|Alice|feat-login|Build the login form");
 
     await check(h);
-    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 0); // pid 5001 starts
+    h.spawner.exit(5001, 0);
     await at(h, 1 * MIN);
     expect(runs(h)[0].state).toBe("completed");
 
@@ -5283,7 +5289,8 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     tasks(h, "worker-a|Alice|fix-10|Fix the tenth issue");
 
     await check(h);
-    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 0); // pid 5001 starts
+    h.spawner.exit(5001, 0);
     await at(h, 1 * MIN);
     expect(runs(h)[0].state).toBe("completed");
 
@@ -5304,7 +5311,8 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     tasks(h, "worker-a|Alice|fix-1|Fix the first issue");
 
     await check(h);
-    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 0); // pid 5001 starts
+    h.spawner.exit(5001, 0);
     await at(h, 1 * MIN);
     expect(runs(h)[0].state).toBe("completed");
 
@@ -5325,7 +5333,8 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     tasks(h, "worker-a|Alice|feat-login|Build the login form");
 
     await check(h);
-    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 0); // pid 5001 starts
+    h.spawner.exit(5001, 0);
     await at(h, 1 * MIN);
     expect(runs(h)[0].state).toBe("completed");
 
@@ -5345,7 +5354,8 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     tasks(h, "worker-a|Alice|feat.login_v2:main|Build the login form");
 
     await check(h);
-    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 0); // pid 5001 starts
+    h.spawner.exit(5001, 0);
     await at(h, 1 * MIN);
     expect(runs(h)[0].state).toBe("completed");
 
@@ -5367,7 +5377,8 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     tasks(h, "worker-a|Alice|feat-login|Build the login form");
 
     await check(h);
-    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 0); // pid 5001 starts
+    h.spawner.exit(5001, 0);
     await at(h, 1 * MIN);
     expect(runs(h)[0].state).toBe("completed");
 
@@ -5387,7 +5398,8 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     tasks(h, "worker-a|Alice|feat-login|Build the login form");
 
     await check(h);
-    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 0); // pid 5001 starts
+    h.spawner.exit(5001, 0);
     await at(h, 1 * MIN);
     expect(runs(h)[0].state).toBe("completed");
 
