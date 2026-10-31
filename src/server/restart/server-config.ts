@@ -81,6 +81,8 @@ const ServerSchema = z
     brain_trainer: z.unknown().optional(),
     // The outcome tracker's own section (src/server/outcomes/config.ts), parsed there for the same reason
     outcome_tracker: z.unknown().optional(),
+    // The decision policies' own section (src/server/decisions/policies/config.ts), parsed there for the same reason
+    decision_policies: z.unknown().optional(),
   })
   .strict();
 

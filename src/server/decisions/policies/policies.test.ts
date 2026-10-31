@@ -206,16 +206,27 @@ describe("rule proposer", () => {
   });
 });
 
+/** The shadow's reader over a real inbox, as DecisionPolicies builds it. */
+function reader(inbox: DecisionInbox) {
+  return shadowSource({
+    get: (id) => inbox.get(id),
+    openPage: (after, limit) => inbox.openClassified(after, limit),
+    recordPolicyTrace: (r) => inbox.recordPolicyTrace(r),
+    hasPolicyTrace: (a, b, c) => inbox.hasPolicyTrace(a, b, c),
+  });
+}
+
 describe("shadow: trace and agreement on the real inbox", () => {
-  function wired(dbPath?: string) {
+  async function wired(dbPath?: string) {
     const s = setup(dbPath);
-    const policies = new DecisionPolicies({ policiesPath: join(tempDir(), "none.yaml"), inbox: s.inbox, events: s.events });
+    const policies = new DecisionPolicies({ policiesPath: join(tempDir(), "none.yaml"), inbox: s.inbox, events: s.events, enabled: true });
     const unsubscribe = policies.subscribe();
+    await policies.caughtUp;
     return { ...s, policies, unsubscribe };
   }
 
   it("writes one proposal for a matching decision and changes nothing on it", async () => {
-    const { inbox, policies } = wired();
+    const { inbox, policies } = await wired();
     const { decision: raised } = await inbox.raise(raiseInput({}));
     const traces = inbox.policyTraces();
     expect(traces).toHaveLength(1);
@@ -230,7 +241,7 @@ describe("shadow: trace and agreement on the real inbox", () => {
   });
 
   it("writes nothing for a class without a policy and for a decision without structure", async () => {
-    const { inbox } = wired();
+    const { inbox } = await wired();
     await inbox.raise(raiseInput({ module: "agents", class: "agents.gave_up", evidence: evidence("dead_on_start"), recommended: { optionId: "release", reasoning: "r" }, options: [{ id: "fresh_session", label: "F", consequences: "c", effect: "reversible" }, { id: "release", label: "R", consequences: "c", effect: "frees_task" }] }));
     await inbox.raise({ ...raiseInput({ key: "plain" }), class: undefined, evidence: undefined, options: WAIT_STOP.map(({ effect: _e, ...o }) => o) });
     expect(inbox.policyTraces()).toEqual([]);
@@ -239,7 +250,7 @@ describe("shadow: trace and agreement on the real inbox", () => {
   it("a repeated event or a restart writes no second row; a new table version does", async () => {
     const dir = tempDir();
     const db = join(dir, "decisions.db");
-    const first = wired(db);
+    const first = await wired(db);
     const { decision: raised } = await first.inbox.raise(raiseInput({}));
     await first.events.emit("decision.raised", { decisionId: raised.id });
     await first.events.emit("decision.raised", { decisionId: raised.id });
@@ -247,7 +258,7 @@ describe("shadow: trace and agreement on the real inbox", () => {
     first.unsubscribe();
     first.store.close();
     // restart: the same file, the catch-up at subscribe finds the row there
-    const second = wired(db);
+    const second = await wired(db);
     expect(second.inbox.policyTraces()).toHaveLength(1);
     // a decision raised while Lair was down gets its row at the next start (no event was ever seen)
     second.unsubscribe();
@@ -258,25 +269,25 @@ describe("shadow: trace and agreement on the real inbox", () => {
     stores.push(third);
     const inbox = new DecisionInbox({ store: third, secrets: new MemorySecretStore(), clock: { now: () => NOW.getTime() } });
     const shadow = new PolicyShadow(
-      shadowSource({ get: (id) => inbox.get(id), list: (o) => inbox.list(o), recordPolicyTrace: (r) => inbox.recordPolicyTrace(r), hasPolicyTrace: (a, b, c) => inbox.hasPolicyTrace(a, b, c) }),
+      reader(inbox),
       () => [new RuleProposer(() => parsePolicyTable(DEFAULT_POLICIES_YAML))],
       () => NOW,
     );
-    expect(shadow.catchUp()).toBe(1);
-    expect(shadow.catchUp()).toBe(0);
+    expect(await shadow.catchUp()).toBe(1);
+    expect(await shadow.catchUp()).toBe(0);
     // a changed table is a new version: the open decision is proposed for again, beside the first row
     const changed = parsePolicyTable(DEFAULT_POLICIES_YAML.replace("reason_code: provider_limit_clears", "reason_code: other_code"));
     const shadow2 = new PolicyShadow(
-      shadowSource({ get: (id) => inbox.get(id), list: (o) => inbox.list(o), recordPolicyTrace: (r) => inbox.recordPolicyTrace(r), hasPolicyTrace: (a, b, c) => inbox.hasPolicyTrace(a, b, c) }),
+      reader(inbox),
       () => [new RuleProposer(() => changed)],
       () => NOW,
     );
-    expect(shadow2.catchUp()).toBe(2);
+    expect(await shadow2.catchUp()).toBe(2);
     expect(inbox.policyTraces()).toHaveLength(4);
   });
 
   it("agreement is computed against the answer a person gave; withdrawn and open decisions are counted apart", async () => {
-    const { inbox, policies } = wired();
+    const { inbox, policies } = await wired();
     const a = (await inbox.raise(raiseInput({ key: "a" }))).decision;
     const b = (await inbox.raise(raiseInput({ key: "b" }))).decision;
     const c = (await inbox.raise(raiseInput({ key: "c" }))).decision;
@@ -296,17 +307,78 @@ describe("shadow: trace and agreement on the real inbox", () => {
     expect(inbox.get(b.id)!.answer?.optionId).toBe("stop");
   });
 
-  it("a disagreement on an outward or irreversible proposal counts as unsafe", () => {
-    const rows = agreementRows([
-      { decisionId: "1", proposer: "rules", version: "v", class: "x.y", policy: "p", option: "go", reasonCode: "r", confidence: 1, at: "t", status: "answered", answer: "hold", options: [{ id: "go", label: "g", consequences: "c", effect: "outward" }, { id: "hold", label: "h", consequences: "c", effect: "reversible" }] },
-    ]);
-    expect(rows[0]).toMatchObject({ disagreed: 1, unsafeDisagreements: 1 });
+  it("a disagreement on an outward or irreversible proposal counts as unsafe; one on a reversible option does not", async () => {
+    const { inbox } = setup();
+    const trace = (decisionId: string, option: string) =>
+      inbox.recordPolicyTrace({ decisionId, proposer: "manual", version: "v", class: "agents.provider_limit", policy: "p", option, reasonCode: "r", confidence: 1, at: NOW.toISOString() });
+    const goHold: DecisionOption[] = [
+      { id: "go", label: "Go", consequences: "c", effect: "outward" },
+      { id: "hold", label: "Hold", consequences: "c", effect: "reversible" },
+    ];
+    const unsafe = (await inbox.raise(raiseInput({ key: "u", options: goHold, recommended: { optionId: "hold", reasoning: "r" } }))).decision;
+    const safe = (await inbox.raise(raiseInput({ key: "s" }))).decision;
+    trace(unsafe.id, "go");
+    trace(safe.id, "stop");
+    await inbox.answer(unsafe.id, { optionId: "hold" });
+    await inbox.answer(safe.id, { optionId: "wait" });
+    const [row] = agreementRows(inbox.policyAgreement());
+    expect(row).toMatchObject({ proposer: "manual", traced: 2, compared: 2, agreed: 0, disagreed: 2, unsafeDisagreements: 1, agreement: 0, coverage: 1 });
+  });
+
+  it("status() counts in SQL and never loads the trace rows", async () => {
+    const { inbox, policies } = await wired();
+    for (const key of ["a", "b", "c"]) await inbox.raise(raiseInput({ key }));
+    inbox.policyTraces = () => {
+      throw new Error("the whole trace was read");
+    };
+    expect(policies.status().agreement).toMatchObject([{ class: "agents.provider_limit", traced: 3, pending: 3 }]);
+  });
+
+  it("the catch-up pages through every open decision, yielding to the event loop between pages", async () => {
+    const { inbox } = setup();
+    const ids: string[] = [];
+    for (let i = 0; i < 7; i++) ids.push((await inbox.raise(raiseInput({ key: `k${i}` }))).decision.id);
+    // neither a decision without a class nor a closed one is walked, and neither stops the walk
+    await inbox.raise({ ...raiseInput({ key: "plain" }), class: undefined, evidence: undefined, options: WAIT_STOP.map(({ effect: _e, ...o }) => o) });
+    await inbox.answer(ids[2], { optionId: "wait" });
+    const shadow = new PolicyShadow(reader(inbox), () => [new RuleProposer(() => parsePolicyTable(DEFAULT_POLICIES_YAML))], () => NOW);
+    const walking = shadow.catchUp({ batch: 2 });
+    // only the first page ran before the walk gave the event loop a turn
+    expect(inbox.policyTraces()).toHaveLength(2);
+    expect(await walking).toBe(6);
+    expect(new Set(inbox.policyTraces().map((t) => t.decisionId))).toEqual(new Set(ids.filter((_, i) => i !== 2)));
+  });
+
+  it("the catch-up stops between pages once it is told to (the server is closing)", async () => {
+    const { inbox } = setup();
+    for (let i = 0; i < 5; i++) await inbox.raise(raiseInput({ key: `k${i}` }));
+    const shadow = new PolicyShadow(reader(inbox), () => [new RuleProposer(() => parsePolicyTable(DEFAULT_POLICIES_YAML))], () => NOW);
+    let stopped = false;
+    const walking = shadow.catchUp({ batch: 2, stopped: () => stopped });
+    stopped = true;
+    expect(await walking).toBe(2);
+    expect(inbox.policyTraces()).toHaveLength(2);
+  });
+
+  it("off, it proposes nothing, catches up on nothing and reads no trace", async () => {
+    const s = setup();
+    await s.inbox.raise(raiseInput({ key: "before" }));
+    const policies = new DecisionPolicies({ policiesPath: join(tempDir(), "none.yaml"), inbox: s.inbox, events: s.events, enabled: false });
+    policies.subscribe();
+    expect(await policies.caughtUp).toBe(0);
+    await s.inbox.raise(raiseInput({ key: "after" }));
+    expect(s.inbox.policyTraces()).toEqual([]);
+    s.inbox.policyAgreement = () => {
+      throw new Error("the trace was read");
+    };
+    expect(policies.status()).toMatchObject({ enabled: false, source: "built-in", agreement: [] });
+    expect(policies.status().policies).toHaveLength(5);
   });
 
   it("the shadow holds a reader and a trace writer, and nothing that answers", () => {
     const { inbox } = setup();
-    const src = shadowSource({ get: (id) => inbox.get(id), list: (o) => inbox.list(o), recordPolicyTrace: (r) => inbox.recordPolicyTrace(r), hasPolicyTrace: (a, b, c) => inbox.hasPolicyTrace(a, b, c) });
-    expect(Object.keys(src).sort()).toEqual(["get", "hasPolicyTrace", "list", "recordPolicyTrace"]);
+    const src = reader(inbox);
+    expect(Object.keys(src).sort()).toEqual(["get", "hasPolicyTrace", "openPage", "recordPolicyTrace"]);
     expect(Object.isFrozen(src)).toBe(true);
   });
 
@@ -314,7 +386,7 @@ describe("shadow: trace and agreement on the real inbox", () => {
     const { inbox } = setup();
     const logs: string[] = [];
     const shadow = new PolicyShadow(
-      shadowSource({ get: (id) => inbox.get(id), list: (o) => inbox.list(o), recordPolicyTrace: (r) => inbox.recordPolicyTrace(r), hasPolicyTrace: (a, b, c) => inbox.hasPolicyTrace(a, b, c) }),
+      reader(inbox),
       () => [{ id: "boom", version: () => "1", propose: () => { throw new Error("broken"); } }],
       () => NOW,
       (l) => logs.push(l),

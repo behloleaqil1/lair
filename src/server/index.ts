@@ -554,14 +554,18 @@ const decisionInbox = await mountDecisions(fastify, {
   producers: [watchdogs, agents],
 });
 
-// Decision policies (src/server/decisions/policies/): the table in data/policies.yaml (a built-in one without the
-// file), rules C1-C4 and C11 in shadow. Each raised decision gets a proposal in the policy trace, compared with the
-// answer a person gives; nothing here answers, withdraws or changes a decision.
+// Decision policies (src/server/decisions/policies/): off unless data/server.yaml sets decision_policies.enabled.
+// The table in data/policies.yaml (a built-in one without the file), rules C1-C4 and C11 in shadow. Each raised
+// decision gets a proposal in the policy trace, compared with the answer a person gives; nothing here answers,
+// withdraws or changes a decision. Only while it is on does the agents module update a raised decision's evidence
+// (cause_cleared) for the rules.
 await mountDecisionPolicies(fastify, {
+  configPath: join(process.cwd(), "data", "server.yaml"),
   policiesPath: join(process.cwd(), "data", "policies.yaml"),
   inbox: decisionInbox,
   events: getEventBus(),
   humanAuth,
+  evidenceProducers: [agents],
   log: (line) => console.warn(`[decisions] ${line}`),
 });
 

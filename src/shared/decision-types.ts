@@ -243,10 +243,12 @@ export interface PolicyAgreementRow {
 
 /** GET /api/owner/decision-policies */
 export interface DecisionPoliciesStatus {
+  /** data/server.yaml decision_policies.enabled: off, nothing is proposed or traced and `agreement` is empty */
+  enabled: boolean;
   source: "file" | "built-in";
   version: string;
   policies: { id: string; class: string; codes: string[]; answer: string; state: string; maxTier: number }[];
-  /** Entries of data/policies.yaml that were refused, each naming its policy */
+  /** Entries of data/policies.yaml that were refused, each naming its policy, and a refused decision_policies section */
   errors: string[];
   agreement: PolicyAgreementRow[];
 }

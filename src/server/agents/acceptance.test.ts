@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
 import {
   appendFileSync,
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -48,6 +49,7 @@ import { LINE_GONE_CHECKS } from "./fill.js";
 import { registerAgentsRoutes } from "./routes.js";
 import { HumanAuth, OWNER_SESSION_HEADER, registerOwnerRoutes } from "../human-auth/index.js";
 import { mountDecisions } from "../decisions/index.js";
+import { mountDecisionPolicies } from "../decisions/policies/index.js";
 import {
   freshSessionAction,
   ownerRequest,
@@ -1706,9 +1708,9 @@ describe("5. provider errors and rate limits fail over to the next configured pr
     expect(h.store.getClaim("demo", "feat-login")).toBeNull();
   });
 
-  it("the 'every profile is failing' decision says its cause cleared once the cooldown it named is over", async () => {
+  it("with the decision policies on, the 'every profile is failing' decision says its cause cleared once the cooldown it named is over", async () => {
     const h = setup(() => FALLBACK);
-    const { inbox } = await withInbox(h);
+    const { inbox } = await withInbox(h, { serverYaml: "decision_policies:\n  enabled: true\n" });
     h.spawner.behaviour = (pid, log) => {
       writeLog(h.clock, log, "Error: 429 Too Many Requests\n");
       h.spawner.exit(pid, 1);
@@ -1729,6 +1731,30 @@ describe("5. provider errors and rate limits fail over to the next configured pr
       "agents updated the evidence: cause_cleared false -> true",
     ]);
   });
+
+  for (const [name, serverYaml] of [
+    ["not mounted", undefined],
+    ["without data/server.yaml", null],
+    ["with them disabled", "decision_policies:\n  enabled: false\n"],
+  ] as const) {
+    it(`with the decision policies off (${name}), no decision's evidence changes after it was raised`, async () => {
+      const h = setup(() => FALLBACK);
+      const { inbox } = await withInbox(h, { serverYaml });
+      h.spawner.behaviour = (pid, log) => {
+        writeLog(h.clock, log, "Error: 429 Too Many Requests\n");
+        h.spawner.exit(pid, 1);
+      };
+      await request(h);
+      for (let i = 0; i < 6; i++) await at(h, 0);
+      const [asked] = inbox.list({ project: "demo", status: "open" });
+      expect(asked.class).toBe("agents.provider_limit");
+      await at(h, 30 * MIN);
+      await at(h, 31 * MIN);
+      const after = inbox.get(asked.id)!;
+      expect(after.evidence).toEqual(asked.evidence);
+      expect(after.audit?.map((a) => a.action)).not.toContain("evidence_updated");
+    });
+  }
 
   it("failing over keeps the recovery counters, is capped per task, and cools a provider only for the agent that hit it", async () => {
     const h = setup(() => ({ ...FALLBACK, failover: { max_failovers: 1 } }));
@@ -2520,8 +2546,12 @@ describe("8. wiring: the router and the service's own tick", () => {
 
 // ============ 9. THE DECISION INBOX ============
 
-/** The agents routes and the real Decision Inbox, mounted as src/server/index.ts does. */
-async function withInbox(h: Harness, options: { maxOpenPerSource?: number; dbPath?: string } = {}) {
+/**
+ * The agents routes and the real Decision Inbox, mounted as src/server/index.ts does. `serverYaml`: also mount
+ * the decision policies with that data/server.yaml (null: no file), with the agents module, as index.ts does.
+ */
+async function withInbox(h: Harness, options: { maxOpenPerSource?: number; dbPath?: string; serverYaml?: string | null } = {}) {
+  const { serverYaml, ...inboxOptions } = options;
   const app = Fastify();
   const tokenPath = join(h.dir, "data", "owner.token");
   const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
@@ -2532,8 +2562,24 @@ async function withInbox(h: Harness, options: { maxOpenPerSource?: number; dbPat
     defaultProject: () => "demo",
     clock: h.clock,
     producers: [h.manager],
-    ...options,
+    ...inboxOptions,
   });
+  if (serverYaml !== undefined) {
+    const configPath = join(h.dir, "data", "server.yaml");
+    if (serverYaml !== null) {
+      writeFileSync(configPath, serverYaml);
+      chmodSync(configPath, 0o600);
+    }
+    await mountDecisionPolicies(app, {
+      configPath,
+      policiesPath: join(h.dir, "data", "policies.yaml"),
+      inbox,
+      events: new EventBus(),
+      humanAuth: auth,
+      evidenceProducers: [h.manager],
+      log: () => undefined,
+    });
+  }
   await registerAgentsRoutes(app, h.manager, () => "demo", auth);
   await app.ready();
   apps.push(app);

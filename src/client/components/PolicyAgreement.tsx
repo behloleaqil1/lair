@@ -11,6 +11,12 @@ import { Button } from "../ui/Button";
 export function PolicyAgreementView({ status }: { status: DecisionPoliciesStatus }) {
   return (
     <div data-policy-agreement="view">
+      {!status.enabled && (
+        <p className="muted small" data-policy-agreement="off">
+          Decision policies are off: nothing is proposed or traced. Set <code>decision_policies.enabled: true</code> in
+          data/server.yaml and restart Lair to start the shadow comparison.
+        </p>
+      )}
       <p className="muted small">
         Policy table: {status.source === "file" ? "data/policies.yaml" : "built-in"} ({status.policies.length} policies, all in shadow:
         they propose into a trace and answer nothing). Agreement is the proposals that equal your answer, of those compared.
@@ -22,7 +28,7 @@ export function PolicyAgreementView({ status }: { status: DecisionPoliciesStatus
           ))}
         </div>
       )}
-      {status.agreement.length === 0 ? (
+      {!status.enabled ? null : status.agreement.length === 0 ? (
         <p className="muted small">No proposals yet: one is written when a decision of a covered class is raised.</p>
       ) : (
         <table className="table" aria-label="Shadow agreement per class">

@@ -7,6 +7,7 @@ import { percent } from "../decisions-api";
 import { PolicyAgreement, PolicyAgreementView } from "./PolicyAgreement";
 
 const status = (over: Partial<DecisionPoliciesStatus> = {}): DecisionPoliciesStatus => ({
+  enabled: true,
   source: "built-in",
   version: "ab12cd34",
   policies: [{ id: "c1-wait", class: "agents.provider_limit", codes: [], answer: "wait", state: "shadow", maxTier: 1 }],
@@ -41,6 +42,15 @@ describe("policy agreement", () => {
     expect(html).toContain("data/policies.yaml");
     expect(html).toContain("nope.nope is not in the policy table");
     expect(html).toContain('role="alert"');
+  });
+
+  it("says the policies are off, and how to turn them on, when data/server.yaml has not", () => {
+    const html = renderToStaticMarkup(createElement(PolicyAgreementView, { status: status({ enabled: false }) }));
+    expect(html).toContain('data-policy-agreement="off"');
+    expect(html).toContain("decision_policies.enabled: true");
+    expect(html).not.toContain("No proposals yet");
+    expect(html).not.toContain("Shadow agreement per class");
+    expect(renderToStaticMarkup(createElement(PolicyAgreementView, { status: status() }))).not.toContain('data-policy-agreement="off"');
   });
 
   it("percent shows a dash while there is nothing to compare", () => {

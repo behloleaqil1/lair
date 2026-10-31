@@ -22,7 +22,16 @@ import {
   type DecisionCounts,
   type DecisionOutcome,
 } from "../../shared/decision-types.js";
-import type { DecisionStore, ListOptions, OutcomeCursor, PolicyTraceJoined, PolicyTraceRow, RaisedVia } from "./store.js";
+import type {
+  DecisionStore,
+  ListOptions,
+  OpenDecisionCursor,
+  OutcomeCursor,
+  PolicyAgreementCounts,
+  PolicyTraceJoined,
+  PolicyTraceRow,
+  RaisedVia,
+} from "./store.js";
 import { SecretStoreUnavailableError, type SecretStore } from "./secrets.js";
 import { DecisionError, parseAnswerInput, parseRaiseInput, parseWithdrawInput } from "./validate.js";
 import type {
@@ -317,8 +326,19 @@ export class DecisionInbox implements DecisionProducer {
     return this.store.hasTrace(decisionId, proposer, version);
   }
 
-  policyTraces(): PolicyTraceJoined[] {
-    return this.store.traces();
+  /** Trace rows joined to their decisions, at most `limit` (tests and diagnostics). */
+  policyTraces(limit?: number): PolicyTraceJoined[] {
+    return this.store.traces(limit);
+  }
+
+  /** The agreement counts per class, proposer and version, aggregated in SQL. */
+  policyAgreement(): PolicyAgreementCounts[] {
+    return this.store.policyAgreement();
+  }
+
+  /** A page of open decisions with a class, oldest first, after `after`: the policy catch-up walks these. */
+  openClassified(after: OpenDecisionCursor | null, limit: number): OpenDecisionCursor[] {
+    return this.store.openClassified(after, limit);
   }
 
   /** The most urgent open decision that blocks `ref`, or null when the work may go on. */

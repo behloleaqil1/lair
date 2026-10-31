@@ -157,10 +157,23 @@ export function toRaiseInput(decision: DecisionRequest): RaiseDecisionInput {
  * inbox file) takes it, so the owner still hears.
  */
 export class ProducerDecisions implements DecisionInbox {
+  /**
+   * Present only with `evidenceUpdates` (the decision policies are on, data/server.yaml
+   * decision_policies.enabled): without it the agents module never changes a raised decision's evidence.
+   */
+  readonly causeCleared?: (id: string) => Promise<void>;
+
   constructor(
     private producer: DecisionProducer,
     private fallback: DecisionInbox,
-  ) {}
+    options: { evidenceUpdates?: boolean } = {},
+  ) {
+    if (options.evidenceUpdates) {
+      this.causeCleared = async (id: string) => {
+        await this.producer.updateEvidence(id, { module: DECISION_MODULE, cause_cleared: true });
+      };
+    }
+  }
 
   find(project: string, key: string): Decision | null {
     return this.producer.find(project, DECISION_MODULE, key);
@@ -172,10 +185,6 @@ export class ProducerDecisions implements DecisionInbox {
 
   async withdraw(id: string, reason: string): Promise<void> {
     await this.producer.withdraw(id, { module: DECISION_MODULE, reason: clip(printable(reason, false), 1000) });
-  }
-
-  async causeCleared(id: string): Promise<void> {
-    await this.producer.updateEvidence(id, { module: DECISION_MODULE, cause_cleared: true });
   }
 
   async request(decision: DecisionRequest): Promise<{ id: string; via: string }> {

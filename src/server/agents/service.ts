@@ -837,7 +837,8 @@ export class AgentsService {
   /**
    * An open provider-limit decision whose limit has reset (`limit_resets_at` is past) says so: its cause is
    * cleared. Done at the start of the tick, before the waiting run launches and the decision is withdrawn as
-   * moot. Only its evidence changes, for the policy rules (docs/design/decision-policies.md §4). Never throws.
+   * moot. Only its evidence changes, for the policy rules (docs/design/decision-policies.md §4). Only while the
+   * decision policies are on (the inbox has causeCleared: AgentsManager.useEvidenceUpdates). Never throws.
    */
   private async refreshCauses(t: Tick): Promise<void> {
     const inbox = this.decisions();
@@ -3607,6 +3608,8 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
   /** Per project: stop following its answers */
   private stopFollowing = new Map<string, () => void>();
   private producer: DecisionProducer | null = null;
+  /** useEvidenceUpdates(): off by default */
+  private evidenceUpdates = false;
   /** "started" between start() and stop(); a reload never runs once "stopped" */
   private phase: "loaded" | "started" | "stopped" = "loaded";
 
@@ -3637,8 +3640,19 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
     for (const stop of this.stopFollowing.values()) stop();
     this.stopFollowing.clear();
     this.producer = decisions;
-    this.decisions = new ProducerDecisions(decisions, this.fileInbox());
+    this.decisions = new ProducerDecisions(decisions, this.fileInbox(), { evidenceUpdates: this.evidenceUpdates });
     for (const [project, service] of this.services) this.follow(project, service);
+  }
+
+  /**
+   * Re-evaluate the evidence of decisions this module raised (a provider-limit decision's cause cleared once
+   * its reset time passed: AgentsService.refreshCauses). Off until the decision policies turn it on
+   * (src/server/decisions/policies/, data/server.yaml decision_policies.enabled); off, no decision's evidence
+   * changes after it was raised.
+   */
+  useEvidenceUpdates(on: boolean): void {
+    this.evidenceUpdates = on;
+    if (this.producer) this.decisions = new ProducerDecisions(this.producer, this.fileInbox(), { evidenceUpdates: on });
   }
 
   private follow(project: string, service: AgentsService): void {
