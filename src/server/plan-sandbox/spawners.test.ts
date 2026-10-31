@@ -91,7 +91,7 @@ esac
 }
 
 const read = (dir: string, name: string) => (existsSync(join(dir, name)) ? readFileSync(join(dir, name), "utf-8") : "");
-const hostEnv = { PATH: "/usr/bin:/bin", HOME: "/home/lair", DOCKER_HOST: "unix:///run/docker.sock", LAIR_SECRET_TOKEN: "control-plane-token", DATABASE_URL: "postgres://u:p@db/app" };
+const hostEnv = { PATH: "/usr/bin:/bin", HOME: "/home/user", DOCKER_HOST: "unix:///run/docker.sock", LAIR_SECRET_TOKEN: "control-plane-token", DATABASE_URL: "postgres://u:p@db/app" };
 const runSpec: SandboxSpec = { ...spec, timeoutMs: 5000 };
 
 describe("DockerSpawner.run", () => {
@@ -105,11 +105,11 @@ describe("DockerSpawner.run", () => {
     expect(args).not.toContain("PATH");
     expect(args).not.toContain("HOME");
     const argv = args.join(" ");
-    for (const host of ["control-plane-token", "postgres://", "unix:///run/docker.sock", "/home/lair", "do-not-print"]) expect(argv).not.toContain(host);
+    for (const host of ["control-plane-token", "postgres://", "unix:///run/docker.sock", "/home/user", "do-not-print"]) expect(argv).not.toContain(host);
     // the docker client gets its own settings and the credential by name, and no other host variable
     const env = read(dir, "env");
     expect(env).toContain("PATH=/usr/bin:/bin");
-    expect(env).toContain("HOME=/home/lair");
+    expect(env).toContain("HOME=/home/user");
     expect(env).toContain("DOCKER_HOST=unix:///run/docker.sock");
     expect(env).toContain("AWS_SECRET_ACCESS_KEY=do-not-print");
     expect(env).not.toContain("control-plane-token");
@@ -170,7 +170,7 @@ esac
 
 describe("AwsCliIssuer", () => {
   const req = { roleArn: "arn:aws:iam::123456789012:role/lair-plan", externalId: "lair-ext-1", sessionName: "lair-plan-example", seconds: 900, region: "us-east-1" };
-  const awsHost = { ...hostEnv, AWS_PROFILE: "lair", AWS_CONFIG_FILE: "/home/lair/.aws/config" };
+  const awsHost = { ...hostEnv, AWS_PROFILE: "lair", AWS_CONFIG_FILE: "/home/user/.aws/config" };
 
   it("assumes the role with the exact arguments and parses the credentials", async () => {
     const dir = stubDir();
@@ -189,7 +189,7 @@ describe("AwsCliIssuer", () => {
     await new AwsCliIssuer({ aws: awsStub(dir), hostEnv: awsHost }).issue(req);
     const env = read(dir, "env");
     expect(env).toContain("AWS_PROFILE=lair");
-    expect(env).toContain("AWS_CONFIG_FILE=/home/lair/.aws/config");
+    expect(env).toContain("AWS_CONFIG_FILE=/home/user/.aws/config");
     expect(env).toContain("PATH=/usr/bin:/bin");
     expect(env).not.toContain("LAIR_SECRET_TOKEN");
     expect(env).not.toContain("DATABASE_URL");

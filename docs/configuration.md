@@ -55,7 +55,7 @@ machines:
     connect_timeout: 4
     runners:
       - remote
-    work_dir: /home/deploy/project
+    work_dir: /home/user/project
     sync: rsync
 ```
 

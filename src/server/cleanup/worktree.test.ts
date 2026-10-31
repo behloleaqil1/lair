@@ -32,34 +32,34 @@ describe("parseGithubRemote", () => {
 
 describe("parseWorktreeList", () => {
   it("parses porcelain output", () => {
-    const output = `worktree /Users/dev/repo
+    const output = `worktree /home/user/repo
 HEAD abc123
 branch refs/heads/main
 
-worktree /Users/dev/repo-feature
+worktree /home/user/repo-feature
 HEAD def456
 branch refs/heads/feature
 
-worktree /Users/dev/repo-detached
+worktree /home/user/repo-detached
 HEAD 789abc
 detached
 `;
 
     const result = parseWorktreeList(output);
     expect(result).toEqual([
-      { path: "/Users/dev/repo", head: "abc123", branch: "main", bare: false },
-      { path: "/Users/dev/repo-feature", head: "def456", branch: "feature", bare: false },
-      { path: "/Users/dev/repo-detached", head: "789abc", branch: null, bare: false },
+      { path: "/home/user/repo", head: "abc123", branch: "main", bare: false },
+      { path: "/home/user/repo-feature", head: "def456", branch: "feature", bare: false },
+      { path: "/home/user/repo-detached", head: "789abc", branch: null, bare: false },
     ]);
   });
 
   it("handles bare worktree", () => {
-    const output = `worktree /Users/dev/repo.git
+    const output = `worktree /home/user/repo.git
 bare
 `;
     const result = parseWorktreeList(output);
     expect(result).toEqual([
-      { path: "/Users/dev/repo.git", head: "", branch: null, bare: true },
+      { path: "/home/user/repo.git", head: "", branch: null, bare: true },
     ]);
   });
 });

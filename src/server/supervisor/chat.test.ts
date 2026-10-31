@@ -690,7 +690,7 @@ describe("answers are untrusted: cleaned before they are kept", () => {
     "<script>alert(1)</script>Held since 08:50. <img src=x onerror=alert(1)> <b>bold?</b> <!-- hidden -->",
     "[its run](#/work/worker-a) [PR 7](https://github.com/example-org/demo/pull/7) [phish](https://evil.example.com/login)",
     "[js](javascript:alert(1)) ![pixel](https://evil.example.com/p.png) <https://evil.example.com/a> [look-alike](https://github.com/example-org/demo-evil/x)",
-    "[creds](https://user:pw@github.com/example-org/demo) [plain](http://github.com/example-org/demo) `<b>code</b>`",
+    "[creds](https://user:pw@github.com/example-org/demo) [plain](http://github.com/example-org/demo) `<b>code</b>`", // generic-ignore: a URL with credentials, the input under test
     "```",
     "<div>kept in code</div>",
     "```",
