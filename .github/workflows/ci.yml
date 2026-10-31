@@ -75,3 +75,93 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  revert-checks:
+    # Validates that PR tests actually guard the changes they claim to guard.
+    # Runs only on pull requests, after the build job passes.
+    if: github.event_name == 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history needed to access base branch
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check for docs-only PR
+        id: docs-check
+        run: |
+          CHANGED_FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..${{ github.sha }})
+          DOCS_ONLY=true
+          for file in $CHANGED_FILES; do
+            if [[ ! "$file" =~ \.(md|txt)$ ]] && [[ ! "$file" =~ ^docs/ ]]; then
+              DOCS_ONLY=false
+              break
+            fi
+          done
+          echo "docs_only=$DOCS_ONLY" >> $GITHUB_OUTPUT
+
+      - name: Extract PR body
+        if: steps.docs-check.outputs.docs_only != 'true'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # Write PR body from env var (avoids heredoc injection)
+          # Uses printf to handle embedded newlines safely
+          printf '%s' "$PR_BODY" > pr-body.md
+
+      - name: Check revert-check requirement
+        if: steps.docs-check.outputs.docs_only != 'true'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          CHANGES_SERVER=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..${{ github.sha }} | grep -c '^src/server/' || true)
+          if [[ "$CHANGES_SERVER" -gt 0 ]]; then
+            # Check if title starts with fix( or feat( using pattern matching
+            if [[ "$PR_TITLE" =~ ^(fix|feat)\( ]]; then
+              if ! grep -q '^revert-check:' pr-body.md; then
+                if ! grep -qi 'no revert-check:' pr-body.md && ! grep -qi 'revert-check-exempt:' pr-body.md; then
+                  echo "::error::This PR changes src/server and is a fix/feat. It must include at least one 'revert-check:' line or explain why with 'no revert-check:' or 'revert-check-exempt:'."
+                  exit 1
+                fi
+              fi
+            fi
+          fi
+
+      - name: Run revert checks
+        if: steps.docs-check.outputs.docs_only != 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # Run the BASE version of the script to prevent a PR from grading itself
+          # If the script doesn't exist in base, run the current version
+          if git show "$BASE_SHA:scripts/revert-checks.sh" >/dev/null 2>&1; then
+            SCRIPT_TMP=$(mktemp)
+            git show "$BASE_SHA:scripts/revert-checks.sh" > "$SCRIPT_TMP"
+            chmod +x "$SCRIPT_TMP"
+            "$SCRIPT_TMP" pr-body.md "$BASE_SHA"
+            RC=$?
+            rm -f "$SCRIPT_TMP"
+            exit $RC
+          else
+            # Script is new in this PR - run current version
+            chmod +x scripts/revert-checks.sh
+            scripts/revert-checks.sh pr-body.md "$BASE_SHA"
+          fi
+
+      - name: Skip (docs-only)
+        if: steps.docs-check.outputs.docs_only == 'true'
+        run: echo "Skipping revert checks for docs-only PR"
