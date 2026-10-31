@@ -19,6 +19,8 @@ export interface HostPullRequest {
   /** null: not computed yet */
   mergeable: boolean | null;
   updatedAt: string | null;
+  /** The PR description (absent from hosts that don't return it) */
+  body?: string | null;
 }
 
 export interface HostFile {
