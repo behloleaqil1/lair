@@ -1,14 +1,18 @@
 /**
- * Answer file: parsing, validation and reading of answer.json files that
- * supervisor runs write. The server creates a per-run folder before spawn,
- * passes the exact answer file path in LAIR_ANSWER_FILE and the prompt,
- * and reads only that path.
+ * Answer file (supervisor.chat.answer_file): a supervisor run may answer by
+ * writing answer.json instead of running `lair supervisor answer`. The server
+ * creates a private per-run folder before the run starts, passes the exact
+ * file path in LAIR_ANSWER_FILE and the prompt, and reads only that path,
+ * once the run has ended or at the question's deadline.
  *
- * Schema: {answer: string ≤ 8 KB, evidence: [{tool, args, note}] ≤ 20, confidence?}
- * Validation: a regular file ≤ 64 KB, valid JSON, fields match the schema.
+ * Schema: {answer: string of at most 8 KB, evidence: [{tool, args, note}], at most 20}; nothing else.
+ * Validation: a regular file (no symlink) inside the run folder, at most 64 KB, valid JSON of that shape.
+ *
+ * Every call is async (fs/promises): they run on the chat's check timer and in request paths.
  */
-import { closeSync, constants, fstatSync, mkdirSync, openSync, readSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync } from "fs";
-import { dirname, join } from "path";
+import { constants } from "fs";
+import { lstat, mkdir, open, readdir, realpath, rename, rm } from "fs/promises";
+import { join } from "path";
 import { randomBytes } from "crypto";
 import type { EvidenceItem } from "../../shared/supervisor-types.js";
 import { sanitizeEvidence } from "./answers.js";
@@ -20,129 +24,92 @@ export const MAX_ANSWER_FILE_BYTES = 64 * 1024;
 export const MAX_ANSWER_TEXT_BYTES = 8 * 1024;
 /** Max evidence items */
 export const MAX_EVIDENCE_ITEMS = 20;
-/** After taking an answer, wait this long for mtime to stabilise (ms) */
-export const MTIME_STABLE_MS = 500;
+/** The folder, under a project's agents_dir, that holds the per-run folders */
+export const RUN_FOLDERS_DIR = "supervisor-runs";
+/** A per-run folder's name: run-<first 8 hex of the turn id>-<16 random hex> */
+const RUN_FOLDER_NAME = /^run-[0-9a-f]{8}-[0-9a-f]{16}$/;
 
 export interface AnswerFileContent {
   answer: string;
   evidence: EvidenceItem[];
-  confidence?: string;
 }
 
+/** ok; or missing (no file: not an error); or invalid, with why */
 export type ParseResult =
   | { ok: true; content: AnswerFileContent }
-  | { ok: false; error: string };
+  | { ok: false; missing: boolean; error: string };
+
+const invalid = (error: string): ParseResult => ({ ok: false, missing: false, error });
 
 /**
- * Read and parse an answer.json file with validation.
+ * Read and validate an answer.json file.
  * @param path Absolute path to the file
- * @param runDir The run's directory - the file must be inside it or in a subdirectory
+ * @param runDir The run's folder: the file must resolve inside it
  */
-export function readAnswerFile(path: string, runDir: string | null): ParseResult {
-  // Security: the file must be inside the run directory (no symlink escapes)
-  if (runDir !== null) {
-    const realPath = safeRealPath(path);
-    if (!realPath) {
-      return { ok: false, error: "the file cannot be read or does not exist" };
-    }
-    const realRunDir = safeRealPath(runDir);
-    if (!realRunDir) {
-      return { ok: false, error: "the run directory cannot be verified" };
-    }
-    if (!realPath.startsWith(realRunDir + "/") && realPath !== realRunDir) {
-      return { ok: false, error: "the file is outside the run directory (symlink or path escape)" };
-    }
+export async function readAnswerFile(path: string, runDir: string): Promise<ParseResult> {
+  try {
+    await lstat(path);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { ok: false, missing: true, error: "the file does not exist" };
+    return invalid(`cannot read file: ${(e as NodeJS.ErrnoException).code ?? "cannot stat"}`);
+  }
+  // The file must be inside the run folder (no symlink or path escape)
+  const realPath = await safeRealPath(path);
+  const realRunDir = await safeRealPath(runDir);
+  if (!realRunDir) return invalid("the run directory cannot be verified");
+  if (!realPath || !realPath.startsWith(realRunDir + "/")) {
+    return invalid("the file is outside the run directory (symlink or path escape)");
   }
 
-  // Read the file with size limit, O_NOFOLLOW to prevent TOCTOU symlink attacks
   let content: string;
   try {
-    content = readBoundedFileNoFollow(path, MAX_ANSWER_FILE_BYTES);
+    content = await readBoundedFileNoFollow(path, MAX_ANSWER_FILE_BYTES);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    return { ok: false, error: `cannot read file: ${redactText(msg, 200)}` };
+    return invalid(`cannot read file: ${redactText(msg, 200)}`);
   }
 
-  // Parse JSON
   let json: unknown;
   try {
     json = JSON.parse(content);
   } catch {
-    return { ok: false, error: "the file is not valid JSON" };
+    return invalid("the file is not valid JSON");
   }
-
-  // Validate shape
   if (typeof json !== "object" || json === null || Array.isArray(json)) {
-    return { ok: false, error: "the file must be a JSON object" };
+    return invalid("the file must be a JSON object");
   }
-
   const obj = json as Record<string, unknown>;
 
-  // Validate answer field
+  const unknown = Object.keys(obj).find((k) => k !== "answer" && k !== "evidence");
+  if (unknown !== undefined) return invalid(`unknown field: ${redactText(unknown, 40)}`);
+
   const answer = obj.answer;
-  if (typeof answer !== "string") {
-    return { ok: false, error: "answer: required, must be a string" };
-  }
-  if (answer.length === 0) {
-    return { ok: false, error: "answer: cannot be empty" };
-  }
-  // S2: Use Buffer.byteLength for correct UTF-8 byte counting
-  const answerBytes = Buffer.byteLength(answer, "utf8");
-  if (answerBytes > MAX_ANSWER_TEXT_BYTES) {
-    return { ok: false, error: `answer: exceeds ${MAX_ANSWER_TEXT_BYTES} bytes` };
+  if (typeof answer !== "string") return invalid("answer: required, must be a string");
+  if (answer.length === 0) return invalid("answer: cannot be empty");
+  if (Buffer.byteLength(answer, "utf8") > MAX_ANSWER_TEXT_BYTES) {
+    return invalid(`answer: exceeds ${MAX_ANSWER_TEXT_BYTES} bytes`);
   }
 
-  // Validate evidence field
   const evidence = obj.evidence;
-  if (evidence === undefined) {
-    return { ok: false, error: "evidence: required (use [] if none)" };
-  }
-  if (!Array.isArray(evidence)) {
-    return { ok: false, error: "evidence: must be an array" };
-  }
-  if (evidence.length > MAX_EVIDENCE_ITEMS) {
-    return { ok: false, error: `evidence: exceeds ${MAX_EVIDENCE_ITEMS} items` };
-  }
-
-  // Use the existing sanitizeEvidence function for detailed validation
+  if (evidence === undefined) return invalid("evidence: required (use [] if none)");
+  if (!Array.isArray(evidence)) return invalid("evidence: must be an array");
+  if (evidence.length > MAX_EVIDENCE_ITEMS) return invalid(`evidence: exceeds ${MAX_EVIDENCE_ITEMS} items`);
   const sanitized = sanitizeEvidence(evidence);
-  if (!sanitized.ok) {
-    return { ok: false, error: sanitized.error };
-  }
+  if (!sanitized.ok) return invalid(sanitized.error);
 
-  // Optional confidence field
-  const confidence = obj.confidence;
-  if (confidence !== undefined && typeof confidence !== "string") {
-    return { ok: false, error: "confidence: must be a string if provided" };
-  }
-
-  // Check for unknown fields
-  const knownFields = ["answer", "evidence", "confidence"];
-  const unknown = Object.keys(obj).find((k) => !knownFields.includes(k));
-  if (unknown) {
-    return { ok: false, error: `unknown field: ${redactText(unknown, 40)}` };
-  }
-
-  return {
-    ok: true,
-    content: {
-      answer,
-      evidence: sanitized.evidence,
-      confidence: typeof confidence === "string" ? confidence : undefined,
-    },
-  };
+  return { ok: true, content: { answer, evidence: sanitized.evidence } };
 }
 
 /**
- * Read a file up to maxBytes without following symlinks (O_NOFOLLOW).
- * Throws if the file is a symlink, exceeds the limit, or cannot be read.
+ * Read a file up to maxBytes without following a symlink (O_NOFOLLOW).
+ * Throws if the file is a symlink, not a regular file, over the limit, or cannot be read.
  */
-function readBoundedFileNoFollow(path: string, maxBytes: number): string {
-  // O_NOFOLLOW is not available on all platforms; fall back to O_RDONLY when not defined
+async function readBoundedFileNoFollow(path: string, maxBytes: number): Promise<string> {
+  // O_NOFOLLOW is not defined on every platform; then the realpath check above is the guard
   const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
-  let fd: number;
+  let handle;
   try {
-    fd = openSync(path, flags);
+    handle = await open(path, flags);
   } catch (e) {
     const code = (e as NodeJS.ErrnoException).code;
     if (code === "ENOENT") throw new Error("file does not exist");
@@ -150,129 +117,89 @@ function readBoundedFileNoFollow(path: string, maxBytes: number): string {
     throw new Error(code ?? "cannot open");
   }
   try {
-    const stats = fstatSync(fd);
+    const stats = await handle.stat();
     if (!stats.isFile()) throw new Error("not a regular file");
     if (stats.size > maxBytes) throw new Error(`file is larger than ${maxBytes} bytes`);
-    const buffer = Buffer.alloc(stats.size);
+    // One byte past the limit tells a file that grew after the stat
+    const buffer = Buffer.alloc(maxBytes + 1);
     let length = 0;
     while (length < buffer.length) {
-      const read = readSync(fd, buffer, length, buffer.length - length, null);
-      if (read === 0) break;
-      length += read;
+      const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+      if (bytesRead === 0) break;
+      length += bytesRead;
     }
+    if (length > maxBytes) throw new Error(`file is larger than ${maxBytes} bytes`);
     return buffer.subarray(0, length).toString("utf-8");
   } finally {
-    closeSync(fd);
+    await handle.close();
   }
 }
 
-/**
- * Resolve a path to its real path (following symlinks), or null if it fails.
- */
-function safeRealPath(path: string): string | null {
+async function safeRealPath(path: string): Promise<string | null> {
   try {
-    return realpathSync(path);
+    return await realpath(path);
   } catch {
     return null;
   }
 }
 
 /**
- * Create a per-run folder for the supervisor run's answer file.
- * The folder is created with mode 0700 and an unguessable name.
- * @param dataDir The supervisor data directory (e.g., config.agents_dir or a supervisor-runs subdir)
- * @param runId The run's ID
- * @returns The absolute path to the run folder, or null if creation failed
+ * Create a private per-run folder for the run's answer file: mode 0700, an unguessable name,
+ * under <agentsDir>/supervisor-runs. Returns its absolute path, or null when it can't be made.
  */
-export function createRunFolder(dataDir: string, runId: string): string | null {
-  const random = randomBytes(8).toString("hex");
-  const folderName = `run-${runId.slice(0, 8)}-${random}`;
-  const folderPath = join(dataDir, "supervisor-runs", folderName);
+export async function createRunFolder(agentsDir: string, turnId: string): Promise<string | null> {
+  const prefix = turnId.toLowerCase().replace(/[^0-9a-f]/g, "").slice(0, 8).padEnd(8, "0");
+  const folderPath = join(agentsDir, RUN_FOLDERS_DIR, `run-${prefix}-${randomBytes(8).toString("hex")}`);
   try {
-    mkdirSync(dirname(folderPath), { recursive: true, mode: 0o755 });
-    mkdirSync(folderPath, { mode: 0o700 });
+    await mkdir(join(agentsDir, RUN_FOLDERS_DIR), { recursive: true, mode: 0o755 });
+    await mkdir(folderPath, { mode: 0o700 });
     return folderPath;
   } catch {
     return null;
   }
 }
 
-/**
- * Get the answer file path for a run folder.
- */
+/** The answer file's path in a run folder. */
 export function answerFilePath(runFolder: string): string {
   return join(runFolder, "answer.json");
 }
 
-/**
- * Get the path for a taken answer file (renamed after reading).
- */
+/** Where an answer file is moved once taken, so it is never read twice. */
 export function takenAnswerFilePath(runFolder: string): string {
   return join(runFolder, "answer.taken.json");
 }
 
-/**
- * Take an answer file: read it, validate it, and rename it to prevent re-reads.
- * Returns the parsed content if successful, or an error.
- */
-export function takeAnswerFile(runFolder: string): ParseResult & { renamed?: boolean } {
-  const path = answerFilePath(runFolder);
-  const takenPath = takenAnswerFilePath(runFolder);
+/** Read and validate the run folder's answer file, then move it aside so it is never read twice. */
+export async function takeAnswerFile(runFolder: string): Promise<ParseResult> {
+  const parsed = await readAnswerFile(answerFilePath(runFolder), runFolder);
+  if (!parsed.ok) return parsed;
+  // The content is in hand: a failed move only means the folder's cleanup removes it
+  await rename(answerFilePath(runFolder), takenAnswerFilePath(runFolder)).catch(() => undefined);
+  return parsed;
+}
 
-  const parsed = readAnswerFile(path, runFolder);
-  if (!parsed.ok) {
-    return parsed;
-  }
-
-  // Rename to prevent re-reads
-  let renamed = false;
-  try {
-    renameSync(path, takenPath);
-    renamed = true;
-  } catch {
-    // Rename failed, but we have the content; proceed anyway
-  }
-
-  return { ...parsed, renamed };
+/** Remove a run folder and whatever the run left in it (symlinks are removed, never followed). Never throws. */
+export async function cleanupRunFolder(runFolder: string): Promise<void> {
+  await rm(runFolder, { recursive: true, force: true }).catch(() => undefined);
 }
 
 /**
- * Check if an answer file exists and is a regular file.
+ * Remove every per-run folder under <agentsDir>/supervisor-runs: at start, after recover() closed the
+ * questions still pending, no folder there belongs to a question that can still be answered. Only
+ * directories with a run folder's name are touched. Returns how many were removed; never throws.
  */
-export function answerFileExists(runFolder: string): boolean {
-  const path = answerFilePath(runFolder);
+export async function sweepRunFolders(agentsDir: string): Promise<number> {
+  let entries;
   try {
-    const stats = statSync(path);
-    return stats.isFile();
+    entries = await readdir(join(agentsDir, RUN_FOLDERS_DIR), { withFileTypes: true });
   } catch {
-    return false;
+    return 0;
   }
-}
-
-/**
- * Get the mtime of the answer file, or null if it doesn't exist.
- */
-export function answerFileMtime(runFolder: string): number | null {
-  const path = answerFilePath(runFolder);
-  try {
-    return statSync(path).mtimeMs;
-  } catch {
-    return null;
+  let removed = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !RUN_FOLDER_NAME.test(entry.name)) continue;
+    await cleanupRunFolder(join(agentsDir, RUN_FOLDERS_DIR, entry.name));
+    removed += 1;
   }
-}
-
-/**
- * Clean up a run folder: remove the answer files and the folder itself.
- * Best effort; does not throw on failure.
- */
-export function cleanupRunFolder(runFolder: string): void {
-  try {
-    const path = answerFilePath(runFolder);
-    const takenPath = takenAnswerFilePath(runFolder);
-    try { unlinkSync(path); } catch { /* ignore */ }
-    try { unlinkSync(takenPath); } catch { /* ignore */ }
-    rmdirSync(runFolder);
-  } catch {
-    // Best effort cleanup
-  }
+  return removed;
 }

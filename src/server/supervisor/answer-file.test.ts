@@ -1,22 +1,23 @@
 /**
  * Tests for answer-file.ts: parsing, validation, and per-run folder management
- * for answer.json files that supervisor runs write.
+ * for answer.json files that supervisor runs write (supervisor.chat.answer_file).
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync, existsSync, statSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
-import { join, dirname } from "path";
+import { dirname, join } from "path";
 import {
   readAnswerFile,
   createRunFolder,
   answerFilePath,
   takenAnswerFilePath,
   takeAnswerFile,
-  answerFileExists,
   cleanupRunFolder,
+  sweepRunFolders,
   MAX_ANSWER_TEXT_BYTES,
   MAX_ANSWER_FILE_BYTES,
   MAX_EVIDENCE_ITEMS,
+  RUN_FOLDERS_DIR,
 } from "./answer-file.js";
 
 const cleanups: (() => void)[] = [];
@@ -30,204 +31,147 @@ function tempDir(): string {
   return dir;
 }
 
+/** answer.json in a fresh run folder, with this content */
+function written(content: string): { dir: string; path: string } {
+  const dir = tempDir();
+  const path = join(dir, "answer.json");
+  writeFileSync(path, content);
+  return { dir, path };
+}
+
+const invalid = (error: string) => ({ ok: false, missing: false, error });
+
 describe("readAnswerFile", () => {
-  it("accepts a valid answer.json with all fields", () => {
-    const dir = tempDir();
-    const path = join(dir, "answer.json");
-    writeFileSync(
-      path,
+  it("accepts a valid answer.json", async () => {
+    const { dir, path } = written(
       JSON.stringify({
         answer: "The agent is held because Redis was down.",
         evidence: [{ tool: "events.query", args: { agent: "worker-a" }, note: "restart event at 08:30" }],
-        confidence: "high",
       }),
     );
-    const result = readAnswerFile(path, dir);
-    expect(result).toEqual({
+    expect(await readAnswerFile(path, dir)).toEqual({
       ok: true,
       content: {
         answer: "The agent is held because Redis was down.",
         evidence: [{ tool: "events.query", args: { agent: "worker-a" }, note: "restart event at 08:30" }],
-        confidence: "high",
       },
     });
   });
 
-  it("accepts answer.json without optional confidence field", () => {
-    const dir = tempDir();
-    const path = join(dir, "answer.json");
-    writeFileSync(path, JSON.stringify({ answer: "All clear.", evidence: [] }));
-    const result = readAnswerFile(path, dir);
-    expect(result).toEqual({
-      ok: true,
-      content: { answer: "All clear.", evidence: [], confidence: undefined },
-    });
+  it("rejects missing answer field", async () => {
+    const { dir, path } = written(JSON.stringify({ evidence: [] }));
+    expect(await readAnswerFile(path, dir)).toEqual(invalid("answer: required, must be a string"));
   });
 
-  it("rejects missing answer field", () => {
-    const dir = tempDir();
-    const path = join(dir, "answer.json");
-    writeFileSync(path, JSON.stringify({ evidence: [] }));
-    const result = readAnswerFile(path, dir);
-    expect(result).toEqual({ ok: false, error: "answer: required, must be a string" });
+  it("rejects empty answer", async () => {
+    const { dir, path } = written(JSON.stringify({ answer: "", evidence: [] }));
+    expect(await readAnswerFile(path, dir)).toEqual(invalid("answer: cannot be empty"));
   });
 
-  it("rejects empty answer", () => {
-    const dir = tempDir();
-    const path = join(dir, "answer.json");
-    writeFileSync(path, JSON.stringify({ answer: "", evidence: [] }));
-    const result = readAnswerFile(path, dir);
-    expect(result).toEqual({ ok: false, error: "answer: cannot be empty" });
-  });
-
-  it("rejects answer exceeding max size in bytes (not UTF-16 code units)", () => {
-    const dir = tempDir();
-    const path = join(dir, "answer.json");
-    // Use multi-byte characters: each emoji is 4 bytes in UTF-8
-    const emoji = "😀";
+  it("rejects answer exceeding max size in bytes (not UTF-16 code units)", async () => {
+    // Each emoji is 4 bytes in UTF-8 and 2 UTF-16 code units: under the limit in code units, over it in bytes
     const count = Math.ceil(MAX_ANSWER_TEXT_BYTES / 4) + 1;
-    writeFileSync(path, JSON.stringify({ answer: emoji.repeat(count), evidence: [] }));
-    const result = readAnswerFile(path, dir);
-    expect(result).toEqual({ ok: false, error: `answer: exceeds ${MAX_ANSWER_TEXT_BYTES} bytes` });
+    const { dir, path } = written(JSON.stringify({ answer: "😀".repeat(count), evidence: [] }));
+    expect(await readAnswerFile(path, dir)).toEqual(invalid(`answer: exceeds ${MAX_ANSWER_TEXT_BYTES} bytes`));
   });
 
-  it("rejects missing evidence field", () => {
-    const dir = tempDir();
-    const path = join(dir, "answer.json");
-    writeFileSync(path, JSON.stringify({ answer: "Something" }));
-    const result = readAnswerFile(path, dir);
-    expect(result).toEqual({ ok: false, error: "evidence: required (use [] if none)" });
+  it("rejects missing evidence field", async () => {
+    const { dir, path } = written(JSON.stringify({ answer: "Something" }));
+    expect(await readAnswerFile(path, dir)).toEqual(invalid("evidence: required (use [] if none)"));
   });
 
-  it("rejects evidence that is not an array", () => {
-    const dir = tempDir();
-    const path = join(dir, "answer.json");
-    writeFileSync(path, JSON.stringify({ answer: "Something", evidence: "not an array" }));
-    const result = readAnswerFile(path, dir);
-    expect(result).toEqual({ ok: false, error: "evidence: must be an array" });
+  it("rejects evidence that is not an array", async () => {
+    const { dir, path } = written(JSON.stringify({ answer: "Something", evidence: "not an array" }));
+    expect(await readAnswerFile(path, dir)).toEqual(invalid("evidence: must be an array"));
   });
 
-  it("rejects evidence exceeding max items", () => {
-    const dir = tempDir();
-    const path = join(dir, "answer.json");
-    const evidence = Array(MAX_EVIDENCE_ITEMS + 1)
-      .fill(null)
-      .map(() => ({ tool: "status.agents", args: {}, note: "x" }));
-    writeFileSync(path, JSON.stringify({ answer: "Something", evidence }));
-    const result = readAnswerFile(path, dir);
-    expect(result).toEqual({ ok: false, error: `evidence: exceeds ${MAX_EVIDENCE_ITEMS} items` });
+  it("rejects evidence exceeding max items", async () => {
+    const evidence = Array.from({ length: MAX_EVIDENCE_ITEMS + 1 }, () => ({ tool: "status.agents", args: {}, note: "x" }));
+    const { dir, path } = written(JSON.stringify({ answer: "Something", evidence }));
+    expect(await readAnswerFile(path, dir)).toEqual(invalid(`evidence: exceeds ${MAX_EVIDENCE_ITEMS} items`));
   });
 
-  it("rejects invalid evidence item (unknown tool)", () => {
-    const dir = tempDir();
-    const path = join(dir, "answer.json");
-    writeFileSync(path, JSON.stringify({ answer: "Something", evidence: [{ tool: "not.a.tool", args: {}, note: "x" }] }));
-    const result = readAnswerFile(path, dir);
+  it("rejects invalid evidence item (unknown tool)", async () => {
+    const { dir, path } = written(JSON.stringify({ answer: "Something", evidence: [{ tool: "not.a.tool", args: {}, note: "x" }] }));
+    const result = await readAnswerFile(path, dir);
     expect(result.ok).toBe(false);
     expect((result as { error: string }).error).toContain("evidence[0].tool");
   });
 
-  it("rejects non-string confidence", () => {
-    const dir = tempDir();
-    const path = join(dir, "answer.json");
-    writeFileSync(path, JSON.stringify({ answer: "Something", evidence: [], confidence: 123 }));
-    const result = readAnswerFile(path, dir);
-    expect(result).toEqual({ ok: false, error: "confidence: must be a string if provided" });
+  it("rejects unknown fields, confidence included (it is not part of the schema)", async () => {
+    const extra = written(JSON.stringify({ answer: "Something", evidence: [], extra: "field" }));
+    expect(await readAnswerFile(extra.path, extra.dir)).toEqual(invalid("unknown field: extra"));
+    const confidence = written(JSON.stringify({ answer: "Something", evidence: [], confidence: "high" }));
+    expect(await readAnswerFile(confidence.path, confidence.dir)).toEqual(invalid("unknown field: confidence"));
   });
 
-  it("rejects unknown fields", () => {
-    const dir = tempDir();
-    const path = join(dir, "answer.json");
-    writeFileSync(path, JSON.stringify({ answer: "Something", evidence: [], extra: "field" }));
-    const result = readAnswerFile(path, dir);
-    expect(result).toEqual({ ok: false, error: "unknown field: extra" });
+  it("rejects file that is not valid JSON", async () => {
+    const { dir, path } = written("{ not valid json }");
+    expect(await readAnswerFile(path, dir)).toEqual(invalid("the file is not valid JSON"));
   });
 
-  it("rejects file that is not valid JSON", () => {
+  it("says a file that does not exist is missing (not invalid)", async () => {
     const dir = tempDir();
-    const path = join(dir, "answer.json");
-    writeFileSync(path, "{ not valid json }");
-    const result = readAnswerFile(path, dir);
-    expect(result).toEqual({ ok: false, error: "the file is not valid JSON" });
+    expect(await readAnswerFile(join(dir, "answer.json"), dir)).toEqual({ ok: false, missing: true, error: "the file does not exist" });
   });
 
-  it("rejects file that does not exist", () => {
-    const dir = tempDir();
-    const result = readAnswerFile(join(dir, "nope.json"), dir);
-    expect(result.ok).toBe(false);
-    expect((result as { error: string }).error).toContain("cannot be read or does not exist");
-  });
-
-  it("rejects file exceeding max size", () => {
-    const dir = tempDir();
-    const path = join(dir, "answer.json");
-    // Write a file larger than MAX_ANSWER_FILE_BYTES
-    writeFileSync(path, "x".repeat(MAX_ANSWER_FILE_BYTES + 1));
-    const result = readAnswerFile(path, dir);
+  it("rejects file exceeding max size", async () => {
+    const { dir, path } = written("x".repeat(MAX_ANSWER_FILE_BYTES + 1));
+    const result = await readAnswerFile(path, dir);
     expect(result.ok).toBe(false);
     expect((result as { error: string }).error).toContain("larger than");
   });
 
-  it("rejects file outside the run directory via symlink", () => {
+  it("rejects a directory at the answer path", async () => {
+    const dir = tempDir();
+    mkdirSync(join(dir, "answer.json"));
+    const result = await readAnswerFile(join(dir, "answer.json"), dir);
+    expect(result).toMatchObject({ ok: false, missing: false, error: expect.stringContaining("not a regular file") });
+  });
+
+  it("rejects file outside the run directory via symlink", async () => {
     const runDir = tempDir();
     const outsideDir = tempDir();
     const outsidePath = join(outsideDir, "secret.json");
     writeFileSync(outsidePath, JSON.stringify({ answer: "stolen", evidence: [] }));
-
     const symlinkPath = join(runDir, "answer.json");
-    try {
-      symlinkSync(outsidePath, symlinkPath);
-    } catch {
-      // Symlinks may not be supported on all platforms
-      return;
-    }
-
-    const result = readAnswerFile(symlinkPath, runDir);
-    expect(result.ok).toBe(false);
-    expect((result as { error: string }).error).toMatch(/outside the run directory|symlink/i);
+    symlinkSync(outsidePath, symlinkPath);
+    expect(await readAnswerFile(symlinkPath, runDir)).toEqual(invalid("the file is outside the run directory (symlink or path escape)"));
   });
 
-  it("accepts file when runDir is null (no path check)", () => {
-    const dir = tempDir();
-    const path = join(dir, "answer.json");
-    writeFileSync(path, JSON.stringify({ answer: "ok", evidence: [] }));
-    const result = readAnswerFile(path, null);
-    expect(result.ok).toBe(true);
+  it("rejects a symlink even when it points inside the run directory (O_NOFOLLOW)", async () => {
+    const runDir = tempDir();
+    writeFileSync(join(runDir, "real.json"), JSON.stringify({ answer: "ok", evidence: [] }));
+    symlinkSync(join(runDir, "real.json"), join(runDir, "answer.json"));
+    const result = await readAnswerFile(join(runDir, "answer.json"), runDir);
+    expect(result).toMatchObject({ ok: false, missing: false, error: expect.stringContaining("symlink") });
   });
 });
 
 describe("createRunFolder", () => {
-  it("creates a folder with mode 0700", () => {
-    const dataDir = tempDir();
-    const runFolder = createRunFolder(dataDir, "test-run-id");
+  it("creates a private folder (mode 0700) under supervisor-runs", async () => {
+    const agentsDir = tempDir();
+    const runFolder = await createRunFolder(agentsDir, "0f1e2d3c-aaaa-4bbb-8ccc-123456789abc");
     expect(runFolder).not.toBeNull();
-    expect(existsSync(runFolder!)).toBe(true);
-
-    // Check parent directory exists
-    const parentDir = dirname(runFolder!);
-    expect(existsSync(parentDir)).toBe(true);
-
-    // Check folder mode (on Unix-like systems)
-    if (process.platform !== "win32") {
-      const stats = statSync(runFolder!);
-      expect(stats.mode & 0o777).toBe(0o700);
-    }
+    expect(dirname(runFolder!)).toBe(join(agentsDir, RUN_FOLDERS_DIR));
+    expect(runFolder!).toMatch(/\/run-0f1e2d3c-[0-9a-f]{16}$/);
+    expect(statSync(runFolder!).mode & 0o777).toBe(0o700);
   });
 
-  it("creates folders with unguessable names", () => {
-    const dataDir = tempDir();
-    const folder1 = createRunFolder(dataDir, "run-1");
-    const folder2 = createRunFolder(dataDir, "run-1");
-    expect(folder1).not.toBeNull();
-    expect(folder2).not.toBeNull();
-    expect(folder1).not.toBe(folder2);
+  it("creates folders with unguessable names", async () => {
+    const agentsDir = tempDir();
+    const id = "0f1e2d3c-aaaa-4bbb-8ccc-123456789abc";
+    const a = await createRunFolder(agentsDir, id);
+    const b = await createRunFolder(agentsDir, id);
+    expect(a).not.toBeNull();
+    expect(b).not.toBeNull();
+    expect(a).not.toBe(b);
   });
 
-  it("includes run ID prefix in folder name", () => {
-    const dataDir = tempDir();
-    const runFolder = createRunFolder(dataDir, "abcdefgh-1234");
-    expect(runFolder).not.toBeNull();
-    expect(runFolder!).toContain("run-abcdefgh");
+  it("returns null when the folder can't be made", async () => {
+    const agentsDir = tempDir();
+    writeFileSync(join(agentsDir, RUN_FOLDERS_DIR), "a file where the folder would go");
+    expect(await createRunFolder(agentsDir, "0f1e2d3c-aaaa-4bbb-8ccc-123456789abc")).toBeNull();
   });
 });
 
@@ -240,66 +184,76 @@ describe("answerFilePath and takenAnswerFilePath", () => {
 });
 
 describe("takeAnswerFile", () => {
-  it("reads, validates, and renames the answer file", () => {
+  it("reads, validates, and moves the answer file aside so it is never read twice", async () => {
     const runFolder = tempDir();
-    const path = answerFilePath(runFolder);
-    writeFileSync(path, JSON.stringify({ answer: "Test answer", evidence: [], confidence: "high" }));
-
-    const result = takeAnswerFile(runFolder);
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.content.answer).toBe("Test answer");
-      expect(result.content.confidence).toBe("high");
-      expect(result.renamed).toBe(true);
-    }
-
-    // Original file should be renamed
-    expect(existsSync(path)).toBe(false);
+    writeFileSync(answerFilePath(runFolder), JSON.stringify({ answer: "Test answer", evidence: [] }));
+    expect(await takeAnswerFile(runFolder)).toEqual({ ok: true, content: { answer: "Test answer", evidence: [] } });
+    expect(existsSync(answerFilePath(runFolder))).toBe(false);
     expect(existsSync(takenAnswerFilePath(runFolder))).toBe(true);
+    expect(await takeAnswerFile(runFolder)).toMatchObject({ ok: false, missing: true });
   });
 
-  it("returns error for invalid file", () => {
+  it("returns error for invalid file, and leaves it in place", async () => {
     const runFolder = tempDir();
     writeFileSync(answerFilePath(runFolder), "not json");
-
-    const result = takeAnswerFile(runFolder);
-    expect(result.ok).toBe(false);
-    expect((result as { error: string }).error).toContain("not valid JSON");
+    expect(await takeAnswerFile(runFolder)).toEqual(invalid("the file is not valid JSON"));
+    expect(existsSync(answerFilePath(runFolder))).toBe(true);
   });
 
-  it("returns error when file does not exist", () => {
-    const runFolder = tempDir();
-    const result = takeAnswerFile(runFolder);
-    expect(result.ok).toBe(false);
-    expect((result as { error: string }).error).toContain("cannot be read or does not exist");
-  });
-});
-
-describe("answerFileExists", () => {
-  it("returns true when file exists", () => {
-    const runFolder = tempDir();
-    writeFileSync(answerFilePath(runFolder), "{}");
-    expect(answerFileExists(runFolder)).toBe(true);
-  });
-
-  it("returns false when file does not exist", () => {
-    const runFolder = tempDir();
-    expect(answerFileExists(runFolder)).toBe(false);
+  it("says missing when there is no file", async () => {
+    expect(await takeAnswerFile(tempDir())).toMatchObject({ ok: false, missing: true });
   });
 });
 
 describe("cleanupRunFolder", () => {
-  it("removes the answer files and folder", () => {
-    const runFolder = tempDir();
+  it("removes the folder and whatever the run left in it", async () => {
+    const runFolder = join(tempDir(), "run");
+    mkdirSync(join(runFolder, "scratch"), { recursive: true });
     writeFileSync(answerFilePath(runFolder), "{}");
     writeFileSync(takenAnswerFilePath(runFolder), "{}");
-
-    cleanupRunFolder(runFolder);
-
+    writeFileSync(join(runFolder, "scratch", "notes.txt"), "x");
+    await cleanupRunFolder(runFolder);
     expect(existsSync(runFolder)).toBe(false);
   });
 
-  it("does not throw when folder does not exist", () => {
-    expect(() => cleanupRunFolder("/nonexistent/folder")).not.toThrow();
+  it("removes a symlink in the folder, never what it points to", async () => {
+    const outside = tempDir();
+    writeFileSync(join(outside, "keep.txt"), "keep");
+    const runFolder = join(tempDir(), "run");
+    mkdirSync(runFolder);
+    symlinkSync(outside, join(runFolder, "link"));
+    await cleanupRunFolder(runFolder);
+    expect(existsSync(runFolder)).toBe(false);
+    expect(existsSync(join(outside, "keep.txt"))).toBe(true);
+  });
+
+  it("does not throw when folder does not exist", async () => {
+    await expect(cleanupRunFolder(join(tempDir(), "nonexistent"))).resolves.toBeUndefined();
+  });
+});
+
+describe("sweepRunFolders", () => {
+  it("removes every run folder under supervisor-runs and nothing else", async () => {
+    const agentsDir = tempDir();
+    const a = (await createRunFolder(agentsDir, "0f1e2d3c-aaaa-4bbb-8ccc-123456789abc"))!;
+    const b = (await createRunFolder(agentsDir, "9a8b7c6d-aaaa-4bbb-8ccc-123456789abc"))!;
+    writeFileSync(answerFilePath(a), "{}");
+    const runs = join(agentsDir, RUN_FOLDERS_DIR);
+    mkdirSync(join(runs, "not-a-run-folder"));
+    writeFileSync(join(runs, "run-0f1e2d3c-0123456789abcdef"), "a file with a run folder's name");
+    const outside = tempDir();
+    writeFileSync(join(outside, "keep.txt"), "keep");
+    symlinkSync(outside, join(runs, "run-11111111-0123456789abcdef"));
+
+    expect(await sweepRunFolders(agentsDir)).toBe(2);
+    expect(existsSync(a)).toBe(false);
+    expect(existsSync(b)).toBe(false);
+    expect(existsSync(join(runs, "not-a-run-folder"))).toBe(true);
+    expect(existsSync(join(runs, "run-0f1e2d3c-0123456789abcdef"))).toBe(true);
+    expect(existsSync(join(outside, "keep.txt"))).toBe(true);
+  });
+
+  it("is a no-op without a supervisor-runs folder", async () => {
+    expect(await sweepRunFolders(tempDir())).toBe(0);
   });
 });

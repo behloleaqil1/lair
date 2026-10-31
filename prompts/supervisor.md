@@ -45,5 +45,4 @@ stuck and since when; the holds and decisions waiting for the owner; failures th
 error more than once); the self-checks failing; and the trend against the days before, when the events show one.
 Keep each part to a few lines, and say "nothing" for a part with nothing in it.
 
-Submit your answer by writing `answer.json` as described in the "Submitting your answer" section below. After that,
-stop.
+Submit your answer once, as "Submitting your answer" below says. After that, stop.
