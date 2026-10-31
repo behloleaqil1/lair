@@ -15,8 +15,15 @@ export default tseslint.config(
       sourceType: 'module',
     },
     rules: {
-      '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
+      '@typescript-eslint/no-unused-vars': ['error', { 
+        argsIgnorePattern: '^_',
+        caughtErrorsIgnorePattern: '^_',
+      }],
       'no-empty': ['error', { allowEmptyCatch: true }],
+      // Disable new ESLint 10 rules to preserve existing codebase behavior
+      // These can be enabled incrementally in follow-up PRs
+      'no-useless-assignment': 'off',
+      'preserve-caught-error': 'off',
     },
   },
   {
