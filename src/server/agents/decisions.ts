@@ -82,6 +82,8 @@ export interface DecisionInbox {
   open?(project: string): Decision[];
   /** Withdraw an open decision whose condition is gone. Absent: this inbox can't. */
   withdraw?(id: string, reason: string): Promise<void>;
+  /** Tell the inbox an open decision's cause cleared (docs/design/decision-policies.md §4). Absent: this inbox can't. */
+  causeCleared?(id: string): Promise<void>;
 }
 
 function oneLine(text: string, max = 500): string {
@@ -158,10 +160,23 @@ export function toRaiseInput(decision: DecisionRequest): RaiseDecisionInput {
  * inbox file) takes it, so the owner still hears.
  */
 export class ProducerDecisions implements DecisionInbox {
+  /**
+   * Present only with `evidenceUpdates` (the decision policies are on, data/server.yaml
+   * decision_policies.enabled): without it the agents module never changes a raised decision's evidence.
+   */
+  readonly causeCleared?: (id: string) => Promise<void>;
+
   constructor(
     private producer: DecisionProducer,
     private fallback: DecisionInbox,
-  ) {}
+    options: { evidenceUpdates?: boolean } = {},
+  ) {
+    if (options.evidenceUpdates) {
+      this.causeCleared = async (id: string) => {
+        await this.producer.updateEvidence(id, { module: DECISION_MODULE, cause_cleared: true });
+      };
+    }
+  }
 
   find(project: string, key: string): Decision | null {
     return this.producer.find(project, DECISION_MODULE, key);

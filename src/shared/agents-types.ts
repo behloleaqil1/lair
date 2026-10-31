@@ -156,6 +156,7 @@ export type AgentEventKind =
   | "fill_gate_gone"
   | "fill_idle_notice"
   | "fill_idle_resolved"
+  | "fill_unmatched"
   | "transient"
   | "transient_cleared"
   | "run_adopted"
@@ -409,6 +410,10 @@ export interface FillStatusView {
   lines: FillLineView[];
   /** Idle states for agents in the allowlist (fill.agents) */
   idle?: IdleStateView[];
+  /** done_match task_id: per line, its last run's latest report line that names no task it can be about */
+  unmatchedReports: FillUnmatchedReportView[];
+  /** What in the fill block can make fill close or change a task a line wasn't about (also on Home → Health) */
+  warnings: string[];
   /** Current capacity state (native capacity checks) */
   capacity?: FillCapacityView;
 }
@@ -452,6 +457,22 @@ export interface IdleStateView {
   readyTasks?: string[];
   /** Plain sentence: why */
   explanation: string;
+}
+
+/** A DONE, WAITING or BLOCKED line an agent wrote on a run that names no task it can be about: it counts for no task. */
+export interface FillUnmatchedReportView {
+  /** The agent that wrote the line (by its attribution) */
+  agent: string;
+  /** The task of the run it wrote it on */
+  openTask: string;
+  runId: string;
+  /** The task id the line names, as the pattern reads it ("" when it names none) */
+  reportedTask: string;
+  kind: "done" | "waiting" | "blocked";
+  /** The queue line as written (data, cut at 300 characters) */
+  line: string;
+  /** When fill first saw it */
+  at: string;
 }
 
 /** Current capacity state from native checks */

@@ -224,6 +224,43 @@ describe("the deterministic part", () => {
     expect(h.service.status().lastError).toContain("is a symlink");
     expect(readFileSync(real, "utf-8")).toBe("worker-a|Alice|feat-login|Login\n");
   });
+
+  it("the planner marks a task done by fill's rule (the shared checkDone): with a fleet's DONE or READY pattern, only a line that names it, by its agent", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form", "worker-b|Bob|feat-search|Search page");
+    const fleet = {
+      enabled: true,
+      interval_seconds: 1,
+      fill: {
+        enabled: false,
+        tasks_file: p.tasksFile,
+        agents: ["worker-a", "worker-b"],
+        prompt_files: ["{prompts_dir}/worker.txt"],
+        done_pattern: "^-\\s+(?:DONE|READY)\\s+{task}(?=[\\s:]|$).*\\bby\\s+{agent}(?=[\\s(]|$)",
+        waiting_pattern: "^-\\s+WAITING\\s+.*\\bby\\s+{agent}(?=[\\s(]|$)",
+        blocked_pattern: "^-\\s+BLOCKED\\s+.*\\bby\\s+{agent}(?=[\\s(]|$)",
+      },
+    };
+    const h = await setup(p, plannerBlock(p, { agent: undefined }), { extra: { agents: fleet } as never });
+    await h.service.cycle();
+
+    queue(
+      p,
+      // A stale prompt's line for an old task, a longer id, another agent's line for the task, and a review task's id
+      "- DONE old-task by worker-a (Alice) 12:00Z: merged",
+      "- DONE feat-login-2 by worker-a (Alice) 12:01Z: merged",
+      "- READY feat-login PR #7 at abc1234 by worker-b (Bob) 12:02Z: reviewed",
+      "- DONE review-feat-search by worker-b (Bob) 12:03Z: approved",
+    );
+    await h.service.cycle();
+    expect(taskIds(h)).toEqual(["feat-login", "feat-search"]);
+    expect(history(h)).toEqual([]);
+
+    queue(p, "- READY feat-login PR #7 at abc1234 by worker-a (Alice) 12:04Z: all findings fixed");
+    await h.service.cycle();
+    expect(taskIds(h)).toEqual(["feat-search"]);
+    expect(history(h)).toMatchObject([{ source: "deterministic", outcome: "applied", op: "mark_done", task: "feat-login", agent: "worker-a" }]);
+  });
 });
 
 // ============ TRIGGERS AND PLANNER RUNS ============

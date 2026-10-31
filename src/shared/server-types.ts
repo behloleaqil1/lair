@@ -253,6 +253,7 @@ export type EventType =
   // fill.idle: an allowlisted agent idle while ready work exists, and the end of that episode
   | "agents.fill_idle_notice"
   | "agents.fill_idle_resolved"
+  | "agents.fill_unmatched"
   // Gate results, for triage: {project, result: GateResult, reports?, context?}
   | "gate.completed"
   // Triage (src/server/triage/)
