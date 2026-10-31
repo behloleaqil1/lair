@@ -41,6 +41,8 @@ import type {
   ProcessSpawner,
   SpawnOptions,
   AgentProbes,
+  SystemInfo,
+  MemoryReading,
 } from "../agents/probes.js";
 import { AgentsManager, type AgentsService } from "../agents/service.js";
 
@@ -215,6 +217,21 @@ class FakeCommandRunner implements CommandRunner {
   }
 }
 
+class FakeSystemInfo implements SystemInfo {
+  cpuCount(): number {
+    return 4;
+  }
+  loadAvg1(): number {
+    return 0.5;
+  }
+  totalMemory(): number {
+    return 16 * 1024 * 1024 * 1024; // 16GB
+  }
+  async memory(_options: { pressure: boolean; timeoutMs: number }): Promise<MemoryReading> {
+    return { available: 8 * 1024 * 1024 * 1024, pressurePct: 25 }; // 8GB available
+  }
+}
+
 function projectConfig(paths: Paths): ProjectConfig {
   return {
     name: "E2E Test",
@@ -278,6 +295,7 @@ async function setup(): Promise<TestHarness> {
     clock,
     spawner,
     self: SELF,
+    systemInfo: new FakeSystemInfo(),
   };
 
   const dbPath = join(paths.data, "agents.db");
