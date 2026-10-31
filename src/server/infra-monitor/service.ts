@@ -267,10 +267,21 @@ export class InfraMonitor {
             "",
             ...finding.evidence.map((e) => `- ${e}`),
           ].join("\n"),
-          options: [{ id: "acknowledged", label: "Acknowledged", consequences: "The notice is acknowledged but no automated action is taken." }],
+          options: [{ id: "acknowledged", label: "Acknowledged", consequences: "The notice is acknowledged but no automated action is taken.", effect: "frees_task" }],
           recommended: { optionId: "acknowledged", reasoning: "This is an informational notice." },
           source: { module: DECISION_MODULE, ref: finding.key },
           key: finding.key,
+          class: "infra_monitor.notice",
+          evidence: {
+            code: finding.type,
+            facts: {
+              machine: finding.vars.machine || null,
+              lane: finding.vars.from_lane || finding.vars.lane || null,
+              gate: finding.vars.gate || null,
+            },
+            cause_cleared: false,
+            linked_issue: null,
+          },
         });
         notice.decisionId = result.decision.id;
         this.store.addNotice(this.project, notice);
