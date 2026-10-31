@@ -10,7 +10,8 @@
  *   are covered, not only src/. Skipped: the lockfile, the baseline, symbolic
  *   links (never followed) and binary files (a NUL byte in the first 8 KB).
  * - Commit messages, with `--commits <range>` (CI passes the pull request's or
- *   the push's range).
+ *   the push's range). The few pushed before this check existed are listed by
+ *   id in PUSHED_BEFORE_THE_CHECK, skipped and counted.
  * - The denylist: names that must never appear (private projects, people,
  *   machines, companies). It is private, so it is never committed:
  *     CI:    the GENERIC_DENYLIST repository secret, passed as an env variable
@@ -56,6 +57,16 @@ const MAX_PARTS = 4;
 /** Shortest name matched inside a longer word ("acmecorpapi"); shorter ones only as whole parts */
 const SUBSTRING_MIN = 5;
 const GIT_TIMEOUT_MS = 30_000;
+/**
+ * Commits pushed before commit messages were checked, whose messages break the
+ * rule. History is never rewritten (no force-push), so they are skipped by
+ * their full id, which no other commit can have; the summary counts them.
+ * Nothing is ever added here for a commit made after the check existed.
+ */
+const PUSHED_BEFORE_THE_CHECK = new Set([
+  "caf9fb3a258da60aec7d31395971b568c8f8953e", // a home path, quoted as what it replaced
+  "476a13bc2fe637cf8c58e0949a13829ef372edf5", // a test fixture's home path
+]);
 
 export type Kind = "home-path" | "email" | "denylisted-name";
 
@@ -402,8 +413,13 @@ export function run(options: Options): number {
   if (filesChecked === 0) throw new GuardError(`no files to check in ${root}: wrong folder, or nothing is tracked`);
 
   let commitsChecked = 0;
+  let commitsSkipped = 0;
   if (options.commits) {
     for (const commit of commitMessages(root, options.commits)) {
+      if (PUSHED_BEFORE_THE_CHECK.has(commit.sha)) {
+        commitsSkipped++;
+        continue;
+      }
       commitsChecked++;
       const result = checkText(`commit ${commit.sha.slice(0, 12)}`, commit.message, denylist?.list ?? null, hashOf);
       violations.push(...result.violations);
@@ -411,7 +427,8 @@ export function run(options: Options): number {
     }
   }
 
-  log(`Checked ${filesChecked} files${options.commits ? ` and ${commitsChecked} commit messages (${options.commits})` : ""}`);
+  const skipped = commitsSkipped > 0 ? `; ${commitsSkipped} pushed before the check skipped` : "";
+  log(`Checked ${filesChecked} files${options.commits ? ` and ${commitsChecked} commit messages (${options.commits}${skipped})` : ""}`);
   log(
     denylist
       ? `denylist: ${denylist.list.size} entries, from ${denylist.source}`
