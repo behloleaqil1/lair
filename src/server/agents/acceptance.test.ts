@@ -5497,7 +5497,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     });
 
     it("an unassigned task is done by anyone's DONE line that names it; with a pattern that names only the agent it stays ready until assigned or taken out", async () => {
-      const h = setup(fill({ agents: ["worker-a"], done_pattern: "^-\\s+DONE\\s+{task}(?=\\s|$).*by\\s+{agent}" }));
+      const h = setup(fill({ agents: ["worker-a"], done_pattern: "^-\\s+DONE\\s+{task}(?=\\s|$).*\\bby\\s+{agent}" }));
       prompts(h);
       tasks(h, "|Pool|free-1|", "|Pool|free-2|");
       appendFileSync(h.queueFile, "- DONE free-1 by outside-agent 11:00Z: shipped\n");
@@ -5506,7 +5506,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
       expect(lineOf(status, "free-2")).toMatchObject({ state: "unassigned", ready: true });
       expect(idleOf(status, "worker-a")).toMatchObject({ reason: "ready_work", readyTasks: ["free-2"] });
 
-      const byAgent = setup(fill({ agents: ["worker-a"], done_pattern: "^-\\s+DONE\\b.*by\\s+{agent}" }));
+      const byAgent = setup(fill({ agents: ["worker-a"], done_pattern: "^-\\s+DONE\\b.*\\bby\\s+{agent}" }));
       prompts(byAgent);
       tasks(byAgent, "|Pool|free-1|");
       appendFileSync(byAgent.queueFile, "- DONE free-1 by outside-agent 11:00Z: shipped\n");

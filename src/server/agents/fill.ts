@@ -1252,6 +1252,7 @@ export class AgentsFill {
             id: IDLE_NOTICE_NOTED,
             label: "Noted",
             consequences: `The notice closes. Fill raises none again until ${agent} stops idling and then idles while ready work exists again.`,
+            effect: "reversible",
           },
         ],
         recommended: IDLE_NOTICE_NOTED,
@@ -1259,6 +1260,15 @@ export class AgentsFill {
         reversible: true,
         key,
         ref: `fill-idle:${agent}`,
+        structure: {
+          class: "agents.fill_idle",
+          evidence: {
+            code: "idle_with_ready_work",
+            facts: { agent, idle_minutes: minutes, ready_count: readyCount, cause: state.cause ?? null },
+            cause_cleared: false,
+            linked_issue: null,
+          },
+        },
       },
       null,
     );

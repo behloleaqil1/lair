@@ -521,7 +521,7 @@ describe("agents config", () => {
   });
 
   it("anyAgentPatternFor: a done line for an unassigned task counts by any agent, and never without the task", () => {
-    const both = anyAgentPatternFor("^-\\s+DONE\\s+{task}\\b.*by\\s+{agent}", "feat-x");
+    const both = anyAgentPatternFor("^-\\s+DONE\\s+{task}\\b.*\\bby\\s+{agent}", "feat-x");
     expect(both).not.toBeNull();
     expect(doneLineMatches(both!, "- DONE feat-x shipped by worker-b 12:00Z")).toBe(true);
     expect(doneLineMatches(both!, "- DONE feat-x shipped by someone-else (Name): ok")).toBe(true);
@@ -531,7 +531,7 @@ describe("agents config", () => {
     expect(doneLineMatches(taskOnly!, "- DONE feat-x by worker-b 12:00Z: done")).toBe(true);
     expect(doneLineMatches(taskOnly!, "- DONE feat-xy by worker-b")).toBe(false);
     // A pattern that names only the agent can't say which task a line is about
-    expect(anyAgentPatternFor("^-\\s+DONE\\b.*by\\s+{agent}", "feat-x")).toBeNull();
+    expect(anyAgentPatternFor("^-\\s+DONE\\b.*\\bby\\s+{agent}", "feat-x")).toBeNull();
   });
 
   it("fill.capacity: native capacity settings with load, memory, heavy_work, and agent_class", () => {
