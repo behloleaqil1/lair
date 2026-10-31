@@ -128,9 +128,15 @@ export interface ProjectConfig {
   /**
    * Infrastructure monitor: watch running jobs' machines
    * (src/server/infra-monitor/). Validated by parseInfraMonitorConfig; see
-   * docs/configuration.md#infra-monitor
+   * docs/configuration.md#infrastructure-monitor
    */
   infra_monitor?: Record<string, unknown>;
+  /**
+   * Agent checks: agents test on a runner before they gate
+   * (src/server/checks/). Validated by parseChecksConfig; see
+   * docs/configuration.md#checks
+   */
+  checks?: Record<string, unknown>;
 }
 
 // Process configuration as it appears in YAML (before defaults applied)

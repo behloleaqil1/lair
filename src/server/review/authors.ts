@@ -112,12 +112,13 @@ const PREFIX_TOPIC = /\(([A-Za-z0-9._-]{1,100}(?:\/[A-Za-z0-9._-]{1,100}){1,8})\
 /**
  * The branches a tasks file names, per task line (as fill parses them; a
  * malformed line names none): `(branch: <name>)` or a `(<prefix>/<topic>)`
- * token in the description.
+ * token in the description. An unassigned line (no agent) names no author,
+ * so it confirms none: its branches count once the line is assigned.
  */
 export function branchesFromTasks(content: string): TaskBranch[] {
   const out: TaskBranch[] = [];
   for (const entry of parseTasksFile(content)) {
-    if (entry.kind !== "task") continue;
+    if (entry.kind !== "task" || entry.agent === null) continue;
     const named = new Set<string>();
     for (const pattern of [BRANCH_TAG, PREFIX_TOPIC]) {
       for (const match of entry.description.matchAll(pattern)) {

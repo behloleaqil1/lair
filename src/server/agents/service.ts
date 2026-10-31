@@ -89,6 +89,7 @@ import {
   DECISION_FILL_KEEP,
   DECISION_FILL_START,
   OWNER_HOLDS,
+  parseIdleNoticeKey,
   QueueLines,
   queueMark,
   queueWindowEnd,
@@ -250,6 +251,9 @@ const BUS_EVENTS: Partial<Record<AgentEventKind, EventType>> = {
   budget_exceeded: "agent.budget.exceeded",
   fill_started: "agents.fill_started",
   fill_held: "agents.fill_held",
+  fill_idle_notice: "agents.fill_idle_notice",
+  fill_idle_resolved: "agents.fill_idle_resolved",
+  fill_unmatched: "agents.fill_unmatched",
 };
 
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -481,6 +485,8 @@ export class AgentsService {
         });
       }) ?? null;
     if (options.settings.fill.enabled) {
+      // Once per start (and config reload): what can make fill close or change the wrong task (also on Home → Health)
+      for (const warning of options.settings.fill.warnings) console.warn(`[agents] ${this.project}: ${warning}`);
       this.fill = new AgentsFill({
         project: this.project,
         config: this.config,
@@ -835,6 +841,27 @@ export class AgentsService {
   }
 
   /**
+   * An open provider-limit decision whose limit has reset (`limit_resets_at` is past) says so: its cause is
+   * cleared. Done at the start of the tick, before the waiting run launches and the decision is withdrawn as
+   * moot. Only its evidence changes, for the policy rules (docs/design/decision-policies.md §4). Only while the
+   * decision policies are on (the inbox has causeCleared: AgentsManager.useEvidenceUpdates). Never throws.
+   */
+  private async refreshCauses(t: Tick): Promise<void> {
+    const inbox = this.decisions();
+    if (!inbox.causeCleared) return;
+    try {
+      for (const decision of inbox.open?.(this.project) ?? []) {
+        const evidence = decision.evidence;
+        if (decision.class !== "agents.provider_limit" || !evidence || evidence.cause_cleared) continue;
+        const resets = evidence.facts.limit_resets_at;
+        if (typeof resets === "string" && Date.parse(resets) <= t.now) await inbox.causeCleared(decision.id);
+      }
+    } catch (e) {
+      console.warn(`[agents] ${this.project}: could not update the evidence of a decision: ${message(e)}`);
+    }
+  }
+
+  /**
    * Where the decision of one of fill's holds stands (fill.ts holdDecision;
    * `key` from fillDecisionKey or escalationDecisionKey): for code that keeps
    * a hold only while its decision is open or was answered "keep".
@@ -932,6 +959,11 @@ export class AgentsService {
       await this.recordFillRelease(task, latest, "decision", t.now);
       return "fill starts the task again on its next check";
     }
+    const idle = parseIdleNoticeKey(key);
+    if (idle) {
+      // An idle notice asks nothing: closing it changes nothing, and this episode raises no other
+      return `noted: fill raises no other idle notice for ${idle.agent} until it stops idling and then idles while ready work exists again`;
+    }
     if (key.startsWith("signin:") && ref.startsWith("signin:")) {
       if (optionId !== DECISION_RETRY_NOW) {
         return "the runs on it keep waiting; Lair keeps checking its sign-in, and asks again only if it changes";
@@ -1023,6 +1055,7 @@ export class AgentsService {
       }
     }
     await this.checkBudgets(t);
+    await this.refreshCauses(t);
     if (!this.readOnly) {
       for (const run of this.store.activeRuns(this.project)) {
         t.touchedTasks.add(run.task);
@@ -3158,6 +3191,8 @@ export class AgentsService {
       lastCheck: null,
       lastError: null,
       lines: [],
+      unmatchedReports: [],
+      warnings: fill.warnings,
     };
   }
 
@@ -3586,6 +3621,8 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
   /** Per project: stop following its answers */
   private stopFollowing = new Map<string, () => void>();
   private producer: DecisionProducer | null = null;
+  /** useEvidenceUpdates(): off by default */
+  private evidenceUpdates = false;
   /** "started" between start() and stop(); a reload never runs once "stopped" */
   private phase: "loaded" | "started" | "stopped" = "loaded";
 
@@ -3616,8 +3653,19 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
     for (const stop of this.stopFollowing.values()) stop();
     this.stopFollowing.clear();
     this.producer = decisions;
-    this.decisions = new ProducerDecisions(decisions, this.fileInbox());
+    this.decisions = new ProducerDecisions(decisions, this.fileInbox(), { evidenceUpdates: this.evidenceUpdates });
     for (const [project, service] of this.services) this.follow(project, service);
+  }
+
+  /**
+   * Re-evaluate the evidence of decisions this module raised (a provider-limit decision's cause cleared once
+   * its reset time passed: AgentsService.refreshCauses). Off until the decision policies turn it on
+   * (src/server/decisions/policies/, data/server.yaml decision_policies.enabled); off, no decision's evidence
+   * changes after it was raised.
+   */
+  useEvidenceUpdates(on: boolean): void {
+    this.evidenceUpdates = on;
+    if (this.producer) this.decisions = new ProducerDecisions(this.producer, this.fileInbox(), { evidenceUpdates: on });
   }
 
   private follow(project: string, service: AgentsService): void {
