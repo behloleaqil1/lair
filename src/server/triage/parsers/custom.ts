@@ -395,7 +395,7 @@ export function validateCustomParserConfig(config: unknown): string[] {
       errors.push("custom parser 'detect' pattern is not a valid regex");
     } else {
       if (hasNestedQuantifiers(c.detect)) {
-        errors.push("custom parser 'detect' pattern contains nested quantifiers or alternation under a quantifier, which can cause catastrophic backtracking");
+        errors.push("custom parser 'detect' pattern contains nested quantifiers, which can cause catastrophic backtracking");
       }
       if (hasBackreferences(c.detect)) {
         errors.push("custom parser 'detect' pattern contains backreferences, which can cause exponential time complexity");
@@ -417,7 +417,7 @@ export function validateCustomParserConfig(config: unknown): string[] {
         errors.push("custom parser 'fail_pattern' must not match the empty string (causes infinite loops)");
       }
       if (hasNestedQuantifiers(c.fail_pattern)) {
-        errors.push("custom parser 'fail_pattern' contains nested quantifiers or alternation under a quantifier, which can cause catastrophic backtracking");
+        errors.push("custom parser 'fail_pattern' contains nested quantifiers, which can cause catastrophic backtracking");
       }
       if (hasBackreferences(c.fail_pattern)) {
         errors.push("custom parser 'fail_pattern' contains backreferences, which can cause exponential time complexity");
@@ -434,7 +434,7 @@ export function validateCustomParserConfig(config: unknown): string[] {
         errors.push("custom parser 'summary_pattern' is not a valid regex");
       } else {
         if (hasNestedQuantifiers(c.summary_pattern)) {
-          errors.push("custom parser 'summary_pattern' contains nested quantifiers or alternation under a quantifier, which can cause catastrophic backtracking");
+          errors.push("custom parser 'summary_pattern' contains nested quantifiers, which can cause catastrophic backtracking");
         }
         if (hasBackreferences(c.summary_pattern)) {
           errors.push("custom parser 'summary_pattern' contains backreferences, which can cause exponential time complexity");

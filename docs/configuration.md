@@ -2002,11 +2002,11 @@ Custom parsers run after the built-ins; a file the built-ins already parsed is n
 - Input is capped to 256 KB (the tail).
 - Lines are capped to 2,000 characters.
 - Patterns that match the empty string are refused (they would loop forever).
-- Patterns with nested quantifiers (e.g., `(a+)+`, `(\w*)*`) or alternation under a quantifier (e.g., `(a|a)*`, `(\w|\d)+`) are refused (catastrophic backtracking).
+- Patterns with nested quantifiers (e.g., `(a+)+`, `(\w*)*`, `(a|a)*`, `(\w|\d)+`) are refused (catastrophic backtracking).
 - Patterns with backreferences (`\1`, `\k<name>`) are refused (exponential time complexity).
 - Regex iteration is bounded: matching stops after a fixed iteration count or time budget to prevent hangs on adversarial input.
 
-Non-capturing groups (`(?:...)`) and named groups (`(?<name>...)`) are allowed and not affected by the quantifier checks.
+Non-capturing groups (`(?:...)`) and named groups (`(?<name>...)`) are allowed. Alternation is allowed in non-quantified groups (e.g., `(?:FAIL|ERROR):` is fine, but `(?:FAIL|ERROR)+:` is refused).
 
 A refused pattern stops triage for the project with a notice naming the field.
 
