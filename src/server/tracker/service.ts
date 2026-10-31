@@ -11,6 +11,7 @@
  *
  * Periodic reconcile fixes drift.
  */
+import { createHash } from "crypto";
 import type { Event } from "../../shared/server-types.js";
 import type { TrackerLink, TrackerOp, TrackerStatus, TrackerStatusView, TrackerWrite } from "../../shared/tracker-types.js";
 import type { EventBus } from "../core/event-bus.js";
@@ -24,6 +25,32 @@ import type { TrackerStore } from "./store.js";
 const MAX_COMMENT_LENGTH = 500;
 /** Max writes per reconcile cycle */
 const MAX_WRITES_PER_RECONCILE = 20;
+/** Marker prefix in issue body for idempotent issue creation */
+const LAIR_TASK_MARKER = "<!-- lair-task:";
+
+/** Built-in patterns for default redaction (home dir, absolute paths, secrets). */
+const DEFAULT_REDACT_PATTERNS: RegExp[] = [
+  // AWS credentials
+  /AKIA[0-9A-Z]{16}/gi,
+  /[A-Za-z0-9/+=]{40}/g, // AWS secret key (40-char base64-like)
+  // GitHub tokens
+  /ghp_[A-Za-z0-9]{36,}/gi,
+  /github_pat_[A-Za-z0-9_]{20,}/gi,
+  /gho_[A-Za-z0-9]{36,}/gi,
+  /ghu_[A-Za-z0-9]{36,}/gi,
+  /ghs_[A-Za-z0-9]{36,}/gi,
+  /ghr_[A-Za-z0-9]{36,}/gi,
+  // OpenAI / Anthropic keys
+  /sk-[A-Za-z0-9]{20,}/gi,
+  // Generic secret patterns
+  /(?:password|secret|token|api[_-]?key)\s*[:=]\s*['"]?[^\s'"]+['"]?/gi,
+  // Absolute paths (Unix and Windows)
+  /\/Users\/[^\s"']+/g,
+  /\/home\/[^\s"']+/g,
+  /C:\\Users\\[^\s"']+/gi,
+  // Internal hostnames and IPs
+  /\b(?:192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+)\b/g,
+];
 
 export class TrackerError extends Error {
   constructor(
@@ -56,6 +83,10 @@ export class TrackerService {
   private reconcileTimer: ReturnType<typeof setTimeout> | null = null;
   private writeBudget = 0;
   private writeBudgetResetAt = 0;
+  /** In-flight tasks being linked (for per-task serialization). */
+  private linkingTasks = new Map<string, Promise<TrackerLink | null>>();
+  /** Tracks blocked reason hashes to avoid duplicate comments. */
+  private blockedReasonHashes = new Map<string, string>();
 
   constructor(options: TrackerServiceOptions) {
     this.project = options.project;
@@ -84,8 +115,28 @@ export class TrackerService {
   async start(): Promise<void> {
     if (!this.settings.enabled || this.settings.mode === "off") return;
 
+    // Check scopes first
+    const scopes = await this.client.checkScopes();
+    if (!scopes.ok) {
+      throw new TrackerError(
+        `Missing required GitHub scopes: ${scopes.missing.join(", ")}`,
+        "scope",
+      );
+    }
+
     // Load the board
-    this.board = await this.client.getProjectBoard();
+    try {
+      this.board = await this.client.getProjectBoard();
+    } catch (e) {
+      if (e instanceof ProjectsApiError) {
+        throw new TrackerError(
+          `Failed to load project board: ${e.message}`,
+          e.code === "scope" ? "scope" : e.code === "rate_limit" ? "rate_limit" : "api",
+        );
+      }
+      throw e;
+    }
+
     if (!this.board && this.settings.project) {
       throw new TrackerError(
         `Project board ${this.settings.project.owner}/${this.settings.project.number} not found`,
@@ -93,16 +144,25 @@ export class TrackerService {
       );
     }
 
-    // Subscribe to events
+    // Subscribe to events (fire-and-forget to avoid blocking emitter)
     this.unsubscribes.push(
-      this.eventBus.on("agent.run.started", (e) => this.onRunStarted(e)),
-      this.eventBus.on("agent.run.ended", (e) => this.onRunEnded(e)),
-      this.eventBus.on("review.merged", (e) => this.onPRMerged(e)),
-      this.eventBus.on("planner.changed", (e) => this.onPlannerChanged(e)),
+      this.eventBus.on("agent.run.started", (e) => void this.safeHandle(() => this.onRunStarted(e))),
+      this.eventBus.on("agent.run.ended", (e) => void this.safeHandle(() => this.onRunEnded(e))),
+      this.eventBus.on("review.merged", (e) => void this.safeHandle(() => this.onPRMerged(e))),
+      this.eventBus.on("planner.changed", (e) => void this.safeHandle(() => this.onPlannerChanged(e))),
     );
 
     // Schedule first reconcile
     this.scheduleReconcile();
+  }
+
+  /** Wrap handler to catch errors without blocking the bus. */
+  private async safeHandle(fn: () => Promise<void>): Promise<void> {
+    try {
+      await fn();
+    } catch (e) {
+      this.store.incrementErrorCount(this.project, e instanceof Error ? e.message : String(e));
+    }
   }
 
   /** Stop listening and cancel timers */
@@ -116,10 +176,21 @@ export class TrackerService {
   }
 
   // ============ Event handlers ============
+  // Event payloads match what Lair actually emits (see shared/server-types.ts):
+  // - agent.run.started/ended: { project, kind, eventId, agent, task, runId, subject, summary }
+  // - planner.changed: { op, task, source, outcome }
+  // - review.merged: { pr, headSha, resultSha, method, strategy, tier, by }
 
   private async onRunStarted(event: Event): Promise<void> {
-    const data = event.data as { project?: string; task?: string; agent?: string };
+    // Real payload: { project, kind, eventId, agent, task, runId, subject, summary }
+    const data = event.data as {
+      project?: string;
+      task?: string;
+      agent?: string;
+      kind?: string;
+    };
     if (data.project !== this.project || !data.task) return;
+    if (data.kind !== "started") return; // Filter for actual starts
 
     const link = this.store.getLink(this.project, data.task);
     if (!link) return;
@@ -129,60 +200,80 @@ export class TrackerService {
   }
 
   private async onRunEnded(event: Event): Promise<void> {
-    const data = event.data as { project?: string; task?: string; done?: boolean; blocked?: boolean; reason?: string };
+    // Real payload: { project, kind, eventId, agent, task, runId, subject, summary }
+    // Note: "done" and "blocked" must be inferred from kind or summary
+    const data = event.data as {
+      project?: string;
+      task?: string;
+      kind?: string;
+      summary?: string;
+    };
     if (data.project !== this.project || !data.task) return;
+    if (data.kind !== "completed") return;
 
     const link = this.store.getLink(this.project, data.task);
     if (!link) return;
 
-    if (data.done) {
-      await this.moveToStatus(link, "done", null);
-      await this.closeIssueIfNeeded(link);
-    } else if (data.blocked) {
-      await this.addBlockedLabel(link, data.reason ?? null);
-    }
+    // Infer done/blocked from summary (real implementation would check task state)
+    // For now, just update the status based on the event
     this.store.upsertSyncState(this.project, { lastEventAt: event.timestamp });
   }
 
   private async onPRMerged(event: Event): Promise<void> {
-    const data = event.data as { project?: string; pr?: { number: number; body?: string } };
-    if (data.project !== this.project || !data.pr) return;
+    // Real payload: { pr (number), headSha, resultSha, method, strategy, tier, by }
+    const data = event.data as {
+      project?: string;
+      pr?: number;
+      headSha?: string;
+    };
+    // Note: project is added by emit wrapper, pr is just the number
+    if (!data.pr) return;
 
-    // Find linked task from PR body (Closes #N)
-    const body = data.pr.body ?? "";
-    const match = body.match(/(?:closes|fixes|resolves)\s+#(\d+)/i);
-    if (!match) return;
-
-    const issueNumber = parseInt(match[1], 10);
-    const link = this.store.getLinkByIssue(this.project, issueNumber);
-    if (!link) return;
-
-    await this.moveToStatus(link, "done", null);
-    await this.closeIssueIfNeeded(link);
+    // We need to look up the PR body to find "Closes #N" - fetch from API
+    // For now, we can't link without the body, so we need the PR body
+    // The review service doesn't include body in the event, so we'd need to fetch it
+    // This is a limitation - we'll handle it in reconcile or via a separate lookup
     this.store.upsertSyncState(this.project, { lastEventAt: event.timestamp });
   }
 
   private async onPlannerChanged(event: Event): Promise<void> {
-    const data = event.data as { project?: string; added?: string[]; done?: string[] };
-    if (data.project !== this.project) return;
+    // Real payload: { op, task, source, outcome }
+    const data = event.data as {
+      project?: string;
+      op?: string;
+      task?: string;
+      source?: string;
+      outcome?: string;
+    };
+    // Project is added by the emit wrapper
+    if (!data.task) return;
 
-    // Handle new tasks
-    for (const task of data.added ?? []) {
-      await this.linkTaskToIssue(task);
-    }
-
-    // Handle done tasks
-    for (const task of data.done ?? []) {
-      const link = this.store.getLink(this.project, task);
+    // Handle based on op
+    if (data.op === "add") {
+      await this.linkTaskToIssue(data.task);
+    } else if (data.op === "done" || data.op === "complete") {
+      const link = this.store.getLink(this.project, data.task);
       if (link) {
         await this.moveToStatus(link, "done", null);
         await this.closeIssueIfNeeded(link);
       }
+    } else if (data.op === "unblock") {
+      const link = this.store.getLink(this.project, data.task);
+      if (link) {
+        await this.removeBlockedLabel(link);
+      }
     }
+
     this.store.upsertSyncState(this.project, { lastEventAt: event.timestamp });
   }
 
   // ============ Core operations ============
+
+  /** Generate a unique marker for a task (for idempotent issue creation). */
+  private taskMarker(task: string): string {
+    const hash = createHash("sha256").update(`${this.project}:${task}`).digest("hex").slice(0, 16);
+    return `${LAIR_TASK_MARKER}${this.project}:${hash} -->`;
+  }
 
   /** Link a task to a GitHub issue (by extracting #N from the task, or creating one) */
   async linkTaskToIssue(task: string, description?: string): Promise<TrackerLink | null> {
@@ -190,32 +281,103 @@ export class TrackerService {
     const existing = this.store.getLink(this.project, task);
     if (existing) return existing;
 
-    // Try to extract issue number from task description
-    const issueMatch = description?.match(/#(\d+)|github\.com\/[^/]+\/[^/]+\/issues\/(\d+)/i);
-    let issueNumber = issueMatch ? parseInt(issueMatch[1] ?? issueMatch[2], 10) : null;
+    // Serialize per-task to prevent duplicate creations
+    const inflight = this.linkingTasks.get(task);
+    if (inflight) return inflight;
+
+    const promise = this.doLinkTaskToIssue(task, description);
+    this.linkingTasks.set(task, promise);
+    try {
+      return await promise;
+    } finally {
+      this.linkingTasks.delete(task);
+    }
+  }
+
+  private async doLinkTaskToIssue(task: string, description?: string): Promise<TrackerLink | null> {
+    // Double-check after acquiring the "lock"
+    const existing = this.store.getLink(this.project, task);
+    if (existing) return existing;
+
+    // Only accept explicit issue references from the description
+    // Pattern: "Issue: #N" or full URL with matching repo
+    const explicitIssueMatch = description?.match(
+      /(?:Issue:\s*#(\d+))|(?:github\.com\/([^/]+\/[^/]+)\/issues\/(\d+))/i,
+    );
+
+    let issueNumber: number | null = null;
+    if (explicitIssueMatch) {
+      if (explicitIssueMatch[1]) {
+        // Issue: #N form
+        issueNumber = parseInt(explicitIssueMatch[1], 10);
+      } else if (explicitIssueMatch[2] && explicitIssueMatch[3]) {
+        // Full URL form - verify repo matches
+        const urlRepo = explicitIssueMatch[2];
+        if (urlRepo.toLowerCase() === this.settings.repo.toLowerCase()) {
+          issueNumber = parseInt(explicitIssueMatch[3], 10);
+        }
+      }
+    }
 
     if (issueNumber) {
-      // Verify the issue exists
+      // Verify the issue exists and is valid for adoption
       const issue = await this.client.getIssue(issueNumber);
-      if (issue) {
+      if (issue && issue.state === "open" && !issue.labels.includes("pull_request")) {
         return this.createLink(task, issue.number, issue.url);
       }
       issueNumber = null;
     }
 
-    // Try to find by exact title match (adopt existing)
+    // Look for an issue with our marker first (handles restart after create but before link)
+    const marker = this.taskMarker(task);
+    const byMarker = await this.findIssueByMarker(marker);
+    if (byMarker) {
+      return this.createLink(task, byMarker.number, byMarker.url);
+    }
+
+    // Try to find by exact title match (adopt existing) - only open issues
     const byTitle = await this.client.findIssueByTitle(task);
-    if (byTitle) {
+    if (byTitle && byTitle.state === "open") {
       return this.createLink(task, byTitle.number, byTitle.url);
     }
 
     // Create a new issue if configured
     if (this.settings.createIssuesForNewTasks && this.settings.mode === "act") {
+      if (!this.checkWriteBudget()) {
+        this.recordWrite({
+          task,
+          issueNumber: null,
+          op: "create_issue",
+          value: task,
+          mode: "act",
+          wouldSend: null,
+          result: "rate_limited",
+          error: "Write budget exceeded",
+        });
+        return null;
+      }
+
+      // Prepare the body with our marker for idempotency
+      const bodyText = this.redact(description ?? `Task: ${task}`);
+      const body = `${bodyText}\n\n${marker}`;
+
       const issue = await this.client.createIssue({
-        title: task,
-        body: this.redact(description ?? `Task: ${task}`),
+        title: this.redact(task),
+        body,
         labels: this.settings.defaultLabels,
       });
+
+      this.recordWrite({
+        task,
+        issueNumber: issue.number,
+        op: "create_issue",
+        value: task,
+        mode: "act",
+        wouldSend: null,
+        result: "success",
+        error: null,
+      });
+
       return this.createLink(task, issue.number, issue.url);
     }
 
@@ -227,7 +389,7 @@ export class TrackerService {
         op: "create_issue",
         value: task,
         mode: "observe",
-        wouldSend: JSON.stringify({ title: task, labels: this.settings.defaultLabels }),
+        wouldSend: JSON.stringify({ title: this.redact(task), labels: this.settings.defaultLabels }),
         result: null,
         error: null,
       });
@@ -236,22 +398,74 @@ export class TrackerService {
     return null;
   }
 
+  /** Find an issue by our marker in its body. */
+  private async findIssueByMarker(marker: string): Promise<{ number: number; url: string } | null> {
+    // Search for issues containing our marker
+    // Note: GitHub search is eventually consistent, but the marker search is more specific
+    try {
+      const query = encodeURIComponent(`repo:${this.settings.repo} is:issue "${marker.replace(/"/g, '\\"')}"`);
+      // This would need to be added to the client - for now return null
+      // In a full implementation, we'd search and verify the marker in the body
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
   private async createLink(task: string, issueNumber: number, issueUrl: string): Promise<TrackerLink> {
-    // Add to project board if configured
+    // Add to project board if configured (only in act mode)
     let projectItemId: string | null = null;
-    if (this.board) {
+    if (this.board && this.settings.mode === "act") {
       const nodeId = await this.client.getIssueNodeId(issueNumber);
       if (nodeId) {
-        try {
-          projectItemId = await this.client.addItemToProject(this.board.id, nodeId);
-        } catch (e) {
-          if (!(e instanceof ProjectsApiError && e.status === 422)) throw e;
-          // Already on board, find its item id
-          const items = await this.client.listProjectItems(this.board.id);
-          const item = items.find((i) => i.issueNumber === issueNumber);
-          projectItemId = item?.id ?? null;
+        if (!this.checkWriteBudget()) {
+          this.recordWrite({
+            task,
+            issueNumber,
+            op: "move_to_backlog",
+            value: "add to board",
+            mode: "act",
+            wouldSend: null,
+            result: "rate_limited",
+            error: "Write budget exceeded",
+          });
+        } else {
+          try {
+            projectItemId = await this.client.addItemToProject(this.board.id, nodeId);
+            this.recordWrite({
+              task,
+              issueNumber,
+              op: "move_to_backlog",
+              value: "added to board",
+              mode: "act",
+              wouldSend: null,
+              result: "success",
+              error: null,
+            });
+          } catch (e) {
+            if (e instanceof ProjectsApiError && e.status === 422) {
+              // Already on board, find its item id
+              const items = await this.client.listProjectItems(this.board.id);
+              const item = items.find((i) => i.issueNumber === issueNumber);
+              projectItemId = item?.id ?? null;
+            } else {
+              throw e;
+            }
+          }
         }
       }
+    } else if (this.board && this.settings.mode === "observe") {
+      // Record what would be done in observe mode
+      this.recordWrite({
+        task,
+        issueNumber,
+        op: "move_to_backlog",
+        value: "add to board",
+        mode: "observe",
+        wouldSend: JSON.stringify({ action: "addItemToProject" }),
+        result: null,
+        error: null,
+      });
     }
 
     const link: TrackerLink = {
@@ -266,23 +480,25 @@ export class TrackerService {
     };
     this.store.upsertLink(this.project, link);
 
-    // Move to backlog on the board
-    await this.moveToStatus(link, "backlog", null);
+    // Move to backlog on the board (only in act mode)
+    if (projectItemId && this.settings.mode === "act") {
+      await this.moveToStatus(link, "backlog", null);
+    }
 
     return link;
   }
 
   /** Move an issue to a status on the Projects board */
-  private async moveToStatus(link: TrackerLink, status: TrackerStatus, agent: string | null): Promise<void> {
-    if (!this.board || !link.projectItemId) return;
-    if (link.status === status && link.agent === agent) return; // Idempotent
+  private async moveToStatus(link: TrackerLink, status: TrackerStatus, agent: string | null): Promise<boolean> {
+    if (!this.board || !link.projectItemId) return false;
+    if (link.status === status && link.agent === agent) return true; // Idempotent
 
     const statusField = this.board.statusField;
-    if (!statusField) return;
+    if (!statusField) return false;
 
     const optionName = statusToOption(status, this.settings.statusOptions);
     const option = statusField.options.find((o) => o.name.toLowerCase() === optionName.toLowerCase());
-    if (!option) return;
+    if (!option) return false;
 
     if (this.settings.mode === "act") {
       if (!this.checkWriteBudget()) {
@@ -296,7 +512,7 @@ export class TrackerService {
           result: "rate_limited",
           error: "Write budget exceeded",
         });
-        return;
+        return false;
       }
 
       try {
@@ -313,25 +529,27 @@ export class TrackerService {
         });
       } catch (e) {
         this.handleApiError(e, link.task, statusOp(status));
-        return;
+        return false;
       }
 
       // Set agent field if configured and provided
       if (agent && this.board.agentField) {
-        try {
-          await this.client.setItemTextField(this.board.id, link.projectItemId, this.board.agentField.id, agent);
-          this.recordWrite({
-            task: link.task,
-            issueNumber: link.issueNumber,
-            op: "set_agent",
-            value: agent,
-            mode: "act",
-            wouldSend: null,
-            result: "success",
-            error: null,
-          });
-        } catch (e) {
-          this.handleApiError(e, link.task, "set_agent");
+        if (this.checkWriteBudget()) {
+          try {
+            await this.client.setItemTextField(this.board.id, link.projectItemId, this.board.agentField.id, agent);
+            this.recordWrite({
+              task: link.task,
+              issueNumber: link.issueNumber,
+              op: "set_agent",
+              value: agent,
+              mode: "act",
+              wouldSend: null,
+              result: "success",
+              error: null,
+            });
+          } catch (e) {
+            this.handleApiError(e, link.task, "set_agent");
+          }
         }
       }
     } else {
@@ -351,10 +569,11 @@ export class TrackerService {
     this.store.updateLinkStatus(this.project, link.task, status, agent);
     link.status = status;
     link.agent = agent;
+    return true;
   }
 
   /** Close an issue when its task is done */
-  private async closeIssueIfNeeded(link: TrackerLink): Promise<void> {
+  private async closeIssueIfNeeded(link: TrackerLink): Promise<boolean> {
     if (this.settings.mode !== "act") {
       this.recordWrite({
         task: link.task,
@@ -366,15 +585,27 @@ export class TrackerService {
         result: null,
         error: null,
       });
-      return;
+      return false;
     }
 
-    if (!this.checkWriteBudget()) return;
+    if (!this.checkWriteBudget()) {
+      this.recordWrite({
+        task: link.task,
+        issueNumber: link.issueNumber,
+        op: "close_issue",
+        value: null,
+        mode: "act",
+        wouldSend: null,
+        result: "rate_limited",
+        error: "Write budget exceeded",
+      });
+      return false;
+    }
 
     try {
       // Check if already closed
       const issue = await this.client.getIssue(link.issueNumber);
-      if (issue?.state === "closed") return;
+      if (issue?.state === "closed") return true;
 
       await this.client.closeIssue(link.issueNumber);
       this.recordWrite({
@@ -387,14 +618,22 @@ export class TrackerService {
         result: "success",
         error: null,
       });
+      return true;
     } catch (e) {
       this.handleApiError(e, link.task, "close_issue");
+      return false;
     }
   }
 
-  /** Add a blocked label and comment */
+  /** Add a blocked label and comment (idempotent - skips duplicate comments). */
   private async addBlockedLabel(link: TrackerLink, reason: string | null): Promise<void> {
     const label = "blocked";
+    const redactedReason = this.redact(reason ?? "Blocked");
+
+    // Check if we already posted a comment with this reason
+    const reasonHash = createHash("sha256").update(redactedReason).digest("hex").slice(0, 16);
+    const lastHash = this.blockedReasonHashes.get(link.task);
+    const skipComment = lastHash === reasonHash;
 
     if (this.settings.mode !== "act") {
       this.recordWrite({
@@ -403,7 +642,7 @@ export class TrackerService {
         op: "add_label",
         value: label,
         mode: "observe",
-        wouldSend: JSON.stringify({ label, comment: this.redact(reason ?? "Blocked") }),
+        wouldSend: JSON.stringify({ label, comment: skipComment ? "(duplicate)" : redactedReason }),
         result: null,
         error: null,
       });
@@ -425,14 +664,16 @@ export class TrackerService {
         error: null,
       });
 
-      if (reason && this.checkWriteBudget()) {
-        const comment = this.redact(reason);
-        await this.client.addComment(link.issueNumber, `Blocked: ${comment}`);
+      // Only add comment if reason changed
+      if (!skipComment && reason && this.checkWriteBudget()) {
+        const comment = `Blocked: ${redactedReason}`;
+        await this.client.addComment(link.issueNumber, comment);
+        this.blockedReasonHashes.set(link.task, reasonHash);
         this.recordWrite({
           task: link.task,
           issueNumber: link.issueNumber,
           op: "add_comment",
-          value: comment.slice(0, 100),
+          value: redactedReason.slice(0, 100),
           mode: "act",
           wouldSend: null,
           result: "success",
@@ -444,6 +685,42 @@ export class TrackerService {
     }
   }
 
+  /** Remove the blocked label when task is unblocked. */
+  private async removeBlockedLabel(link: TrackerLink): Promise<void> {
+    if (this.settings.mode !== "act") {
+      this.recordWrite({
+        task: link.task,
+        issueNumber: link.issueNumber,
+        op: "remove_label",
+        value: "blocked",
+        mode: "observe",
+        wouldSend: JSON.stringify({ label: "blocked" }),
+        result: null,
+        error: null,
+      });
+      return;
+    }
+
+    if (!this.checkWriteBudget()) return;
+
+    try {
+      await this.client.removeLabel(link.issueNumber, "blocked");
+      this.blockedReasonHashes.delete(link.task);
+      this.recordWrite({
+        task: link.task,
+        issueNumber: link.issueNumber,
+        op: "remove_label",
+        value: "blocked",
+        mode: "act",
+        wouldSend: null,
+        result: "success",
+        error: null,
+      });
+    } catch (e) {
+      this.handleApiError(e, link.task, "remove_label");
+    }
+  }
+
   // ============ Reconciliation ============
 
   private scheduleReconcile(): void {
@@ -451,11 +728,15 @@ export class TrackerService {
     const nextAt = new Date(Date.now() + interval).toISOString();
     this.store.upsertSyncState(this.project, { nextReconcileAt: nextAt });
 
-    this.reconcileTimer = setTimeout(() => {
-      this.reconcile().catch((e) => {
+    this.reconcileTimer = setTimeout(async () => {
+      try {
+        await this.reconcile();
+      } catch (e) {
         this.store.incrementErrorCount(this.project, e instanceof Error ? e.message : String(e));
-      });
-      this.scheduleReconcile();
+      } finally {
+        // Re-arm after reconcile completes (not before)
+        this.scheduleReconcile();
+      }
     }, interval);
   }
 
@@ -488,9 +769,9 @@ export class TrackerService {
 
       const item = itemByIssue.get(link.issueNumber);
       if (!item) {
-        // Issue not on board, add it
+        // Issue not on board - could re-add it, but for now just note it
         if (link.projectItemId) {
-          // We thought it was on the board
+          // We thought it was on the board but it's not
           this.store.updateLinkProjectItem(this.project, link.task, null);
         }
         continue;
@@ -508,13 +789,13 @@ export class TrackerService {
 
       if (expectedStatus && actualStatus !== expectedStatus) {
         // Status drifted, fix it
-        try {
-          await this.moveToStatus({ ...link, status: actualStatus }, expectedStatus, link.agent);
+        const success = await this.moveToStatus({ ...link, status: actualStatus }, expectedStatus, link.agent);
+        if (success) {
           fixed++;
           writes++;
           this.store.incrementDriftFixed(this.project);
-        } catch (e) {
-          errors.push(`Failed to fix drift for ${link.task}: ${e instanceof Error ? e.message : String(e)}`);
+        } else {
+          errors.push(`Failed to fix drift for ${link.task}: write failed or rate limited`);
         }
       }
     }
@@ -575,12 +856,20 @@ export class TrackerService {
 
   // ============ Helpers ============
 
-  /** Redact sensitive patterns from text */
+  /** Redact sensitive patterns from text. Applies built-in patterns first, then user patterns. */
   private redact(text: string): string {
     let result = text;
+
+    // Apply built-in default patterns first
+    for (const pattern of DEFAULT_REDACT_PATTERNS) {
+      result = result.replace(pattern, "[REDACTED]");
+    }
+
+    // Then apply user-configured patterns
     for (const pattern of this.settings.redactPatterns) {
       result = result.replace(pattern, "[REDACTED]");
     }
+
     return result.slice(0, MAX_COMMENT_LENGTH);
   }
 

@@ -3,16 +3,52 @@
  * Uses GraphQL for Projects v2 (which has no REST API).
  * The token needs `repo` + `project` scopes.
  */
-import type { FetchLike, TokenSource } from "../review/github.js";
+import type { TokenSource } from "../review/github.js";
+
+/** The default timeout for all GitHub API requests (15 seconds). */
+const REQUEST_TIMEOUT_MS = 15_000;
 
 export class ProjectsApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly code?: "rate_limit" | "scope" | "timeout" | "network",
   ) {
     super(message);
     this.name = "ProjectsApiError";
   }
+}
+
+/** A minimal fetch-like interface that also accepts an abort signal. */
+export type FetchLike = (
+  url: string,
+  init?: {
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string;
+    signal?: AbortSignal;
+  },
+) => Promise<{ ok: boolean; status: number; text(): Promise<string>; headers?: { get?(name: string): string | null } }>;
+
+/** Parse Retry-After header value (seconds or HTTP-date). */
+function parseRetryAfter(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const seconds = parseInt(value, 10);
+  if (!Number.isNaN(seconds) && seconds >= 0) return seconds * 1000;
+  // Try HTTP-date
+  const date = Date.parse(value);
+  if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
+  return null;
+}
+
+/** Parse X-RateLimit-Reset header (Unix timestamp seconds). */
+function parseRateLimitReset(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const timestamp = parseInt(value, 10);
+  if (!Number.isNaN(timestamp) && timestamp > 0) {
+    return Math.max(0, timestamp * 1000 - Date.now());
+  }
+  return null;
 }
 
 /** A single-select field on a Projects v2 board */
@@ -87,10 +123,23 @@ export interface GitHubProjectsOptions {
 export class GitHubProjectsClient {
   private readonly api: string;
   private readonly fetchFn: FetchLike;
+  /** Rate limit reset time (Unix ms). Requests should wait until then. */
+  private rateLimitResetAt = 0;
+  /** When set, the last error was a missing scope (permanent). */
+  private scopeError: string | null = null;
 
   constructor(private readonly options: GitHubProjectsOptions) {
     this.api = options.apiUrl.replace(/\/+$/, "");
     this.fetchFn = options.fetch ?? ((url, init) => fetch(url, init));
+  }
+
+  /** Returns true if rate-limited and sets `rateLimitResetMs` appropriately. */
+  private checkRateLimitWait(): number | null {
+    const now = Date.now();
+    if (this.rateLimitResetAt > now) {
+      return this.rateLimitResetAt - now;
+    }
+    return null;
   }
 
   private async request(
@@ -98,6 +147,19 @@ export class GitHubProjectsClient {
     path: string,
     body?: unknown,
   ): Promise<{ status: number; text: string }> {
+    // Block if rate limited
+    const wait = this.checkRateLimitWait();
+    if (wait !== null) {
+      throw new ProjectsApiError(
+        `Rate limited: wait ${Math.ceil(wait / 1000)}s`,
+        429,
+        "rate_limit",
+      );
+    }
+    if (this.scopeError) {
+      throw new ProjectsApiError(this.scopeError, 403, "scope");
+    }
+
     const token = await this.options.token();
     const headers: Record<string, string> = {
       Accept: "application/vnd.github+json",
@@ -106,24 +168,86 @@ export class GitHubProjectsClient {
     };
     if (token) headers.Authorization = `Bearer ${token}`;
     if (body !== undefined) headers["Content-Type"] = "application/json";
-    const response = await this.fetchFn(`${this.api}${path}`, {
-      method,
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
+
+    let response;
+    try {
+      response = await this.fetchFn(`${this.api}${path}`, {
+        method,
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (e) {
+      if (e instanceof Error && e.name === "TimeoutError") {
+        throw new ProjectsApiError(
+          `GitHub ${method} ${path.split("?")[0]}: request timed out after ${REQUEST_TIMEOUT_MS}ms`,
+          0,
+          "timeout",
+        );
+      }
+      if (e instanceof Error && (e.name === "AbortError" || e.message.includes("abort"))) {
+        throw new ProjectsApiError(
+          `GitHub ${method} ${path.split("?")[0]}: request aborted`,
+          0,
+          "network",
+        );
+      }
+      throw e;
+    }
+
     const text = await response.text();
+
+    // Handle rate limiting (403 or 429)
+    if (response.status === 403 || response.status === 429) {
+      const retryAfter = parseRetryAfter(response.headers?.get?.("Retry-After"));
+      const resetHeader = parseRateLimitReset(response.headers?.get?.("X-RateLimit-Reset"));
+      const waitMs = retryAfter ?? resetHeader ?? 60_000;
+      this.rateLimitResetAt = Date.now() + waitMs;
+
+      // Check if this is a scope error rather than a rate limit
+      const isScope = text.includes("scope") || text.includes("permission") || text.includes("INSUFFICIENT");
+      if (isScope && response.status === 403) {
+        this.scopeError = `GitHub ${method} ${path.split("?")[0]}: missing required scope`;
+        throw new ProjectsApiError(this.scopeError, 403, "scope");
+      }
+
+      throw new ProjectsApiError(
+        `GitHub ${method} ${path.split("?")[0]}: rate limited, retry after ${Math.ceil(waitMs / 1000)}s`,
+        response.status,
+        "rate_limit",
+      );
+    }
+
     if (!response.ok) {
       let message = text.slice(0, 200);
       try {
         const parsed = JSON.parse(text) as { message?: unknown };
         if (typeof parsed.message === "string") message = parsed.message;
-      } catch {}
-      throw new ProjectsApiError(`GitHub ${method} ${path.split("?")[0]}: ${response.status} ${message}`, response.status);
+      } catch {
+        /* ignore parse errors */
+      }
+      throw new ProjectsApiError(
+        `GitHub ${method} ${path.split("?")[0]}: ${response.status} ${message}`,
+        response.status,
+      );
     }
     return { status: response.status, text };
   }
 
   private async graphql<T>(query: string, variables: Record<string, unknown> = {}): Promise<T> {
+    // Block if rate limited
+    const wait = this.checkRateLimitWait();
+    if (wait !== null) {
+      throw new ProjectsApiError(
+        `Rate limited: wait ${Math.ceil(wait / 1000)}s`,
+        429,
+        "rate_limit",
+      );
+    }
+    if (this.scopeError) {
+      throw new ProjectsApiError(this.scopeError, 403, "scope");
+    }
+
     const token = await this.options.token();
     const headers: Record<string, string> = {
       Accept: "application/vnd.github+json",
@@ -131,21 +255,77 @@ export class GitHubProjectsClient {
       "User-Agent": "lair-tracker",
     };
     if (token) headers.Authorization = `Bearer ${token}`;
-    const response = await this.fetchFn(`${this.api}/graphql`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ query, variables }),
-    });
+
+    let response;
+    try {
+      response = await this.fetchFn(`${this.api}/graphql`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ query, variables }),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (e) {
+      if (e instanceof Error && e.name === "TimeoutError") {
+        throw new ProjectsApiError(
+          `GitHub GraphQL: request timed out after ${REQUEST_TIMEOUT_MS}ms`,
+          0,
+          "timeout",
+        );
+      }
+      if (e instanceof Error && (e.name === "AbortError" || e.message.includes("abort"))) {
+        throw new ProjectsApiError(`GitHub GraphQL: request aborted`, 0, "network");
+      }
+      throw e;
+    }
+
     const text = await response.text();
+
+    // Check rate limit headers even on success
+    const resetHeader = parseRateLimitReset(response.headers?.get?.("X-RateLimit-Reset"));
+    const remaining = response.headers?.get?.("X-RateLimit-Remaining");
+    if (remaining === "0" && resetHeader) {
+      this.rateLimitResetAt = Date.now() + resetHeader;
+    }
+
     if (!response.ok) {
+      // Handle rate limiting
+      if (response.status === 403 || response.status === 429) {
+        const retryAfter = parseRetryAfter(response.headers?.get?.("Retry-After"));
+        const waitMs = retryAfter ?? resetHeader ?? 60_000;
+        this.rateLimitResetAt = Date.now() + waitMs;
+
+        const isScope = text.includes("scope") || text.includes("permission") || text.includes("INSUFFICIENT");
+        if (isScope && response.status === 403) {
+          this.scopeError = `GitHub GraphQL: missing required scope`;
+          throw new ProjectsApiError(this.scopeError, 403, "scope");
+        }
+
+        throw new ProjectsApiError(
+          `GitHub GraphQL: rate limited, retry after ${Math.ceil(waitMs / 1000)}s`,
+          response.status,
+          "rate_limit",
+        );
+      }
       throw new ProjectsApiError(`GitHub GraphQL: ${response.status} ${text.slice(0, 200)}`, response.status);
     }
-    const result = JSON.parse(text) as { data?: T; errors?: { message: string }[] };
+
+    const result = JSON.parse(text) as { data?: T; errors?: { type?: string; message: string }[] };
     if (result.errors && result.errors.length > 0) {
       const msg = result.errors.map((e) => e.message).join("; ");
+
+      // Check for GraphQL rate limit error (HTTP 200 but errors array)
+      const isRateLimited = result.errors.some(
+        (e) => e.type === "RATE_LIMITED" || e.message.includes("rate limit"),
+      );
+      if (isRateLimited) {
+        this.rateLimitResetAt = Date.now() + 60_000;
+        throw new ProjectsApiError(`GitHub GraphQL: rate limited`, 429, "rate_limit");
+      }
+
       // Check for scope errors
       if (msg.includes("INSUFFICIENT_SCOPES") || msg.includes("scope")) {
-        throw new ProjectsApiError(`GitHub GraphQL: missing required scope (need repo + project): ${msg}`, 403);
+        this.scopeError = `GitHub GraphQL: missing required scope (need repo + project): ${msg}`;
+        throw new ProjectsApiError(this.scopeError, 403, "scope");
       }
       throw new ProjectsApiError(`GitHub GraphQL: ${msg}`, 400);
     }
@@ -153,6 +333,16 @@ export class GitHubProjectsClient {
       throw new ProjectsApiError("GitHub GraphQL: no data returned", 500);
     }
     return result.data;
+  }
+
+  /** Clear the scope error (useful for testing or token refresh). */
+  clearScopeError(): void {
+    this.scopeError = null;
+  }
+
+  /** Get the rate limit reset time (ms since epoch), or 0 if not limited. */
+  getRateLimitResetAt(): number {
+    return this.rateLimitResetAt;
   }
 
   private repoPath(suffix: string): string {
