@@ -42,6 +42,8 @@ export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/tofu-runner",
   // Cloud machines: the status names the account's instances and spend, and the trip is cleared here (every route the owner's)
   "/api/cloud",
+  // The tracker: its status shows task text and repositories, and a reconcile writes to GitHub (every route the owner's)
+  "/api/tracker",
   // The supervisor: Lair's diagnostics, and the ops tokens and their audit (every route the owner's)
   "/api/health/diagnostics",
   "/api/supervisor",

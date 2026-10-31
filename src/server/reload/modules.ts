@@ -19,6 +19,7 @@ import type { PlannerManager } from "../planner/manager.js";
 import { parseWatchdogConfig } from "../watchdog/config.js";
 import type { WatchdogManager } from "../watchdog/service.js";
 import type { Supervisor } from "../supervisor/service.js";
+import type { TrackerManager } from "../tracker/manager.js";
 
 export interface ProjectEntry {
   name: string;
@@ -55,6 +56,7 @@ export interface ServerModules {
   clouds?: CloudManager;
   planner?: PlannerManager;
   supervisor?: Supervisor;
+  trackers?: TrackerManager;
 }
 
 function errorsOf(result: { ok: true } | { ok: false; errors: string[] }): string[] {
@@ -64,7 +66,7 @@ function errorsOf(result: { ok: true } | { ok: false; errors: string[] }): strin
 /** The server's modules, as src/server/index.ts wires them. */
 export function serverModules(m: ServerModules): ReloadableModule[] {
   const modules: ReloadableModule[] = [];
-  const { delivery, watchdogs, pipelines, reviews, agents, triage, placements, clouds, planner, supervisor } = m;
+  const { delivery, watchdogs, pipelines, reviews, agents, triage, placements, clouds, planner, supervisor, trackers } = m;
   if (delivery) {
     modules.push({
       name: "delivery",
@@ -153,6 +155,17 @@ export function serverModules(m: ServerModules): ReloadableModule[] {
       reads: ["agents", "dragons", "ai", "planner"],
       validate: (config) => supervisor.validate(config),
       reload: (entry) => supervisor.reloadProject(entry),
+    });
+  }
+  if (trackers) {
+    modules.push({
+      name: "tracker",
+      blocks: ["tracker"],
+      // Its token defaults to review's, its PR numbers are review's repository, its tasks are agents.fill's file
+      // and its done marker is the planner's
+      reads: ["review", "agents", "planner"],
+      validate: (config) => trackers.validate(config),
+      reload: (entry) => trackers.reloadProject(entry),
     });
   }
   return modules;

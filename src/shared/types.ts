@@ -120,6 +120,12 @@ export interface ProjectConfig {
    */
   planner?: Record<string, unknown>;
   /**
+   * The tracker: GitHub issues, Projects boards and milestones kept in step
+   * with the tasks (src/server/tracker/). Validated by parseTrackerConfig;
+   * see docs/configuration.md#tracker
+   */
+  tracker?: Record<string, unknown>;
+  /**
    * The supervisor: Lair's self-checks (src/server/supervisor/). Validated
    * by parseSupervisorConfig; see
    * docs/configuration.md#supervisor-self-checks-and-the-ops-api
