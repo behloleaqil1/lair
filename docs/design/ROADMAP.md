@@ -80,7 +80,8 @@ Each step lists what must exist first. One module per pull request, each with it
 | A6 | **AI roles**: any tool, any model, per role (build, review per tier, plan, supervise); sign-in status per machine; a write-only key store for API-key tools; reviewer calibration | [ai-roles.md](ai-roles.md) | — | See ai-roles.md |
 | A7 | **Look and feel, then Settings v2**: design tokens, light/dark, a component kit for every view (T1, built); Settings by task, with plain language, levels, search, templates and test buttons (S2-1 built; S2-2 and S2-3 to do) | [settings-v2.md](settings-v2.md) | T1 first; S2-1 needs A6 | See settings-v2.md |
 | A4 | **Supervisor S3**: acting fixes by evidence (deterministic-first) | [supervisor.md](supervisor.md) | A2 | See supervisor.md. **Built**: evidence detectors, acting ops, config and audit. A4 moved ahead of A3's S1-3 (owner's decision: "Lair answers by evidence") |
-| A5 | **Hands-off day** (end-to-end acceptance) | [autonomy.md §11](autonomy.md) | A2–A4 | A project runs a full day with no human input except Decision Inbox answers |
+| A8 | **Work store**: tasks, events, briefs and messages in Lair's database instead of project files | [work-store.md](work-store.md) | bus (built), planner (built) | Tasks live in the store; fill reads the store; agents report through bus tools; legacy files mirrored read-only; an importer for existing projects. See work-store.md |
+| A5 | **Hands-off day** (end-to-end acceptance) | [autonomy.md §11](autonomy.md) | A2–A4, A8 | A project runs a full day with no human input except Decision Inbox answers |
 
 ### B. A proper open-source project
 
@@ -105,7 +106,8 @@ Each step lists what must exist first. One module per pull request, each with it
 | C4 | **Kickstart and projects** | [phase5-deploy.md §3](phase5-deploy.md), [platform.md §10](platform.md) | C3, B2 | "New project": create or connect a repository, choose or detect the stack, first plan |
 | C5 | **Importer**: take over an existing project | [importer.md](importer.md), [autonomy.md §10](autonomy.md) | C3 (architecture recovery uses the architecture stage) | An existing repository adopted with no downtime: connect read-only, discover and audit (stack, build and test commands, CI, deploys, team rules, health, recovered architecture, risk map), a proposed setup, shadow mode beside the existing CI, then a staged, reversible cutover |
 | C6 | **lair-node**: run work on other machines | [node.md](node.md) | runners | Capacity reporting and remote runs without SSH scripts; unplugging a node loses nothing |
-| C7 | **Kubernetes and PaaS deploy targets** | [platform.md §10](platform.md) | delivery | Rollouts with checks and rollback; strategies; promotion behind policy |
+| C7 | **Cloud deployment (AWS first)** | [deploy-aws.md](deploy-aws.md) | delivery, cloud-accounts | Provider-neutral flow (plan, cost, risk, review, apply, release, budget, drift) with an AWS adapter. Moved up: a first project needs AWS before launch. |
+| C7a | **Kubernetes and PaaS deploy targets** | [platform.md §10](platform.md) | C7 | Rollouts with checks and rollback; strategies; promotion behind policy |
 | C8 | **Knowledge and learning loop** | [autonomy.md §8](autonomy.md) | triage, reviews, A3 | Lessons from incidents and reviews turned into checks, playbooks and brief rules |
 | C9 | **Quality** | [quality.md](quality.md) | reviews, triage | Contracts, migration safety, spec conformance, exploratory and UX testing, performance and cost budgets, AI evaluations, a security pipeline |
 | C10 | **Launch kit** (for the apps Lair builds) | [launch-kit.md](launch-kit.md) | C9, delivery | Billing, analytics, the customer-facing surface, a feedback loop, launch readiness |

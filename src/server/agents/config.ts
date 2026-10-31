@@ -127,6 +127,42 @@ const WakeSchema = z
   })
   .strict();
 
+/** Agent class: local (held by load) or remote (not held by load) */
+export type AgentClass = "local" | "remote";
+
+const CapacityMemorySchema = z
+  .object({
+    /** Maximum memory pressure percentage (0-100) before holding new starts */
+    pressure_max: z.number().min(0).max(100).optional(),
+    /** Minimum available memory as percentage of total (0-100) before holding new starts */
+    available_min_pct: z.number().min(0).max(100).optional(),
+  })
+  .strict();
+
+const CapacityHeavyWorkSchema = z
+  .object({
+    /** Globs or commands that indicate heavy work (container gates, builds) */
+    detect: z.array(z.string().min(1)).default([]),
+    /** Maximum concurrent heavy work items (across all agents) */
+    max_active: z.number().int().min(1).max(100).default(1),
+  })
+  .strict();
+
+const CapacitySchema = z
+  .object({
+    /** Maximum 1-minute load average per CPU before holding local agents; null disables the check */
+    load_per_cpu_max: z.number().positive().optional(),
+    /** Memory pressure checks */
+    memory: CapacityMemorySchema.default({}),
+    /** Heavy work detection and limiting */
+    heavy_work: CapacityHeavyWorkSchema.default({}),
+    /** Per-agent class override: agent id -> "local" or "remote" */
+    agent_class: z.record(z.enum(["local", "remote"])).default({}),
+    /** Default class for agents not in agent_class */
+    default_class: z.enum(["local", "remote"]).default("local"),
+  })
+  .strict();
+
 const FillSchema = z
   .object({
     enabled: z.boolean().default(false),
@@ -144,6 +180,8 @@ const FillSchema = z
      * be in the matched text exactly as written)
      */
     done_pattern: z.string().min(1).max(500).default(DEFAULT_DONE_PATTERN),
+    /** Native capacity checks: load, memory, heavy work detection */
+    capacity: CapacitySchema.default({}),
     /** Exit 0: capacity available; anything else (a timeout too) holds, its first output line the reason */
     capacity_cmd: argv.optional(),
     interval_seconds: z.number().int().min(1).max(3600).default(60),
@@ -182,6 +220,8 @@ export const AgentsSchema = z
     stop_grace_seconds: z.number().min(0).max(3600).default(30),
     /** How far a process's start time may differ from the one recorded for its pid */
     pid_start_tolerance_seconds: z.number().min(0).max(600).default(5),
+    /** On a planned restart: adopt (re-attach to runs the previous server started) or stop (signal them first) */
+    on_restart: z.enum(["adopt", "stop"]).default("adopt"),
     /** The agent's session directory; {agents_dir}, {agent} and {repo} are replaced */
     session_dir: z.string().min(1).optional(),
     /** Prints the branch state for a resume summary; {task}, {agent} and {repo} are replaced */
@@ -259,6 +299,8 @@ export interface FillSettings {
   promptFiles: string[];
   maxActive: number;
   donePattern: string;
+  /** Native capacity checks */
+  capacity: CapacitySettings;
   capacityCmd?: string[];
   intervalSeconds: number;
   maxCompletionsWithoutDone: number;
@@ -275,6 +317,49 @@ export interface FillSettings {
     requeueMarker?: string;
     fallbackSeconds: number;
   };
+}
+
+/** Native capacity settings */
+export interface CapacitySettings {
+  /** Maximum 1-minute load average per CPU before holding local agents */
+  loadPerCpuMax?: number;
+  memory: {
+    /** Maximum memory pressure percentage (0-100) */
+    pressureMax?: number;
+    /** Minimum available memory as percentage of total (0-100) */
+    availableMinPct?: number;
+  };
+  heavyWork: {
+    /** Globs (task-id patterns with * and ? wildcards) that indicate heavy work */
+    detect: string[];
+    /** Pre-compiled patterns from detect globs (validated at config load) */
+    detectPatterns: RegExp[];
+    /** Maximum concurrent heavy work items */
+    maxActive: number;
+  };
+  /** Per-agent class override */
+  agentClass: Record<string, AgentClass>;
+  /** Default class for agents */
+  defaultClass: AgentClass;
+}
+
+/**
+ * Compile a task-id glob pattern to a RegExp.
+ * Escapes regex metacharacters, then translates * and ? to .* and . respectively.
+ * This ensures patterns like "gate(backend" don't cause regex syntax errors.
+ */
+export function compileTaskGlob(pattern: string): RegExp {
+  // Escape all regex metacharacters first, then translate glob wildcards
+  const escaped = pattern
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")  // Escape regex metacharacters (except * and ?)
+    .replace(/\*/g, ".*")                   // * -> match anything
+    .replace(/\?/g, ".");                   // ? -> match single character
+  return new RegExp(`^${escaped}$`);
+}
+
+/** Get the class for an agent */
+export function getAgentClass(settings: CapacitySettings, agent: string): AgentClass {
+  return settings.agentClass[agent] ?? settings.defaultClass;
 }
 
 const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -378,6 +463,7 @@ export interface AgentsSettings {
   hungMinutes?: number;
   stopGraceSeconds: number;
   pidStartToleranceSeconds: number;
+  onRestart: "adopt" | "stop";
   sessionDir?: string;
   branchStateCmd?: string[];
   commandTimeoutSeconds: number;
@@ -534,6 +620,7 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
       hungMinutes: value.hung_minutes,
       stopGraceSeconds: value.stop_grace_seconds,
       pidStartToleranceSeconds: value.pid_start_tolerance_seconds,
+      onRestart: value.on_restart,
       sessionDir: value.session_dir,
       branchStateCmd: value.branch_state_cmd,
       commandTimeoutSeconds: value.command_timeout_seconds,
@@ -580,6 +667,20 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         promptFiles: value.fill.prompt_files,
         maxActive: value.fill.max_active,
         donePattern: value.fill.done_pattern,
+        capacity: {
+          loadPerCpuMax: value.fill.capacity.load_per_cpu_max,
+          memory: {
+            pressureMax: value.fill.capacity.memory.pressure_max,
+            availableMinPct: value.fill.capacity.memory.available_min_pct,
+          },
+          heavyWork: {
+            detect: value.fill.capacity.heavy_work.detect,
+            detectPatterns: value.fill.capacity.heavy_work.detect.map(compileTaskGlob),
+            maxActive: value.fill.capacity.heavy_work.max_active,
+          },
+          agentClass: value.fill.capacity.agent_class,
+          defaultClass: value.fill.capacity.default_class,
+        },
         capacityCmd: value.fill.capacity_cmd,
         intervalSeconds: value.fill.interval_seconds,
         maxCompletionsWithoutDone: value.fill.max_completions_without_done,
@@ -640,6 +741,26 @@ function checkFill(value: RawSettings, errors: string[]): void {
     if (!wake.requeue_marker.includes("{wake}")) errors.push(`${where}: needs {wake} (the gate id the marker is about)`);
     if (wake.requeue_marker.split(/[\\/]/).includes("..")) errors.push(`${where}: a ".." segment is refused`);
   }
+
+  // Validate agent_class entries: must be valid agent ids AND be in fill.agents (F7)
+  for (const agent of Object.keys(fill.capacity.agent_class)) {
+    if (!isValidDragonId(agent)) {
+      errors.push(`agents.fill.capacity.agent_class.${agent}: not a valid agent id`);
+    } else if (!fill.agents.includes(agent)) {
+      errors.push(`agents.fill.capacity.agent_class.${agent}: not in agents.fill.agents`);
+    }
+  }
+
+  // Validate detect patterns (F4): they must compile as task-id globs
+  fill.capacity.heavy_work.detect.forEach((pattern, i) => {
+    try {
+      compileTaskGlob(pattern);
+    } catch (e) {
+      errors.push(
+        `agents.fill.capacity.heavy_work.detect[${i}]: invalid task-id glob "${pattern}" (${e instanceof Error ? e.message : String(e)})`
+      );
+    }
+  });
 }
 
 /**

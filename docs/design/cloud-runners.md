@@ -4,8 +4,9 @@ Goal: when the developer's machines are busy or too small, Lair runs gates on a 
 stops as soon as the work is done, and it never spends past the limit the human set. Everything is generic: a provider
 interface with AWS EC2 first, any project, any gate system. This extends [runners.md](runners.md) (executor order,
 budgets, one result format), the placement module (machines, lanes, slots) and [node.md](node.md) (running work on
-another host). Status: planned. A reference implementation outside Lair (shell scripts beside a project's own gate
-queue) proved the design in October 2026; this document is what Lair builds so no project needs those scripts.
+another host). Status: step 1 built (provider, meter and guard, §11); the rest planned. A reference implementation
+outside Lair (shell scripts beside a project's own gate queue) proved the design in October 2026; this document is what
+Lair builds so no project needs those scripts.
 
 ## 0. Principles
 1. **Off unless working.** The machine starts when a job needs it and stops when no job is queued or running. It also
@@ -57,12 +58,20 @@ Tests fake only this boundary (Lair rule: fake remote APIs, the clock and the pr
 
 ## 4. The money guard
 - **Spend** is the larger of two readings:
-  1. the provider's cost reading (`spend`), cached for hours (each call may cost money; provider data lags);
+  1. the provider's cost reading (`spend`), cached for hours (each call may cost money), plus what the meter counted
+     since the reading's data ends (provider data lags: Cost Explorer up to a day), so the lag never hides a run;
   2. Lair's own meter: every run's launch and stop times from `describe` (so a stop by the backstop or in the console
      still counts, and an unknown stop time counts up to now), times the hourly price, plus storage for each month of
      the period, plus a starting amount for spend before the meter existed.
+- **What Lair did not see.** `describe` dates only the last launch. A newer launch after Lair last saw the machine
+  stopped means it may have run unseen since that sighting: a short gap (two checks) counts at the price, a longer one
+  (Lair down, describes failing) and the time before Lair first saw a machine refuse starts until a cost reading taken
+  a day after the launch covers them (decided in the review of step 1).
 - **Refuse at the limit.** At `limit` or above, Lair does not start the machine; it records the trip, moves the
-  machine's jobs to the next executor and raises a `spend` Decision. Only a human clears a trip.
+  machine's jobs to the next executor and raises a `spend` Decision. Only a human clears a trip, and only by an
+  authenticated owner action: the owner session's `POST /api/cloud/trip/clear` (Clear the trip in the Machines view),
+  recorded with the session and a note. Editing `budget.limit` or `budget.period` never clears it (decided in the
+  review of step 1: the project file can be written by an agent or a bad merge, and live reload applies it at once).
 - **The provider's own guard.** Setup creates a provider budget for the same limit with automatic actions: stop the
   machine and deny starts to the runtime credentials. If Lair is wrong or down, the provider still stops.
 - **Credits.** For promotional credits the budget counts usage before credits over a custom period that covers the
@@ -157,12 +166,59 @@ cloud:
 - Logs and reports that come back are treated as untrusted data, as with every executor.
 
 ## 11. Build order (one PR each, reviewed before the next)
-1. **Provider + guard:** the provider interface, the AWS EC2 provider, the meter and the money guard; read-only state,
-   spend and guard in the API and the Machines view.
+1. **Provider + guard (built):** the provider interface, the AWS EC2 provider, the meter and the money guard; read-only
+   state, spend and guard in the API and the Machines view. Configuration: `cloud.enabled` (off by default),
+   `cloud.machines.<id>` with `provider: aws-ec2`, `region`, `profile`, `instance.id`, `instance.tag`, `price_per_hour`,
+   `storage_per_month`, and `cloud.budget` with `limit`, `period`, `meter_start`, `spend_check_hours`, `warn_percent`.
+   As built:
+   - the provider (`src/server/cloud/provider.ts`) has `describe`, `start`, `stop` and `spend`; `waitRunning` and
+     `quota` come with step 2, `resize` later, and `price` is `price_per_hour` from the configuration;
+   - credentials come only from the named profile in the AWS config files (`fromIni`), never from the YAML, the
+     server's environment or an instance role; a credential-shaped key or value in `cloud:` is a config error;
+   - an instance is found by its id and its tag together, so a wrong id never reaches an untagged instance;
+   - the provider's reading is Cost Explorer's unblended cost with credits and refunds left out, for the whole account,
+     cached for `spend_check_hours` (24 at most) in `data/cloud.db` across restarts; `DataUnavailableException`, or an
+     answer with no cost in it, is "unknown", which leaves the meter to decide only for a new account (two days from
+     its first reading, before any amount, and for an answer with no cost only while nothing is metered), then counts
+     as a failed reading (§12 "no data yet" bounded);
+   - the meter records each launch the provider describes; a stop it does not date ends at the check that saw it
+     stopped, and an open run ends at the next launch at the latest; every run counts a minute at least, and a stop
+     dated after the local clock is kept (a launch or stop over a minute ahead of it refuses: the clock is wrong);
+   - each instance's last sighting is kept: a newer launch after a stopped sighting makes a gap from that sighting
+     (less a minute) to the launch, counted at the price up to `2 × check_seconds` and blind beyond; the first sighting
+     is blind up to the launch; a blind gap refuses starts until an amount whose data (read time less the provider's
+     `costLagMs`, a day for AWS) reaches its end;
+   - spend is the larger of the meter and, per account, the reading plus the meter since its data ends (`meterSince`);
+   - the guard refuses (fails closed) when a machine could not be described in the check, a cost reading failed, or the
+     day is outside the period; a trip stands per project, whatever the limit or period says later, until the owner
+     clears it with `POST /api/cloud/trip/clear` (owner session, naming the trip's time; recorded with the session id
+     and a note, `cloud.trip_cleared`); `cloud.guard_tripped` is emitted once per trip;
+   - `startMachine` runs the check on fresh readings before the provider's start, one at a time with checks and
+     stops; nothing calls it yet (step 2 does); a stopped or replaced instance starts nothing, and the module exports
+     no provider. Every route is the owner's (`/api/cloud` in `OWNER_ONLY_PREFIXES`): `GET /api/cloud/status`, and the
+     trip's clear; none starts or stops a machine. Provider error text is kept with ARNs and account ids hidden.
+
+   See docs/configuration.md Cloud machines.
 2. **Lifecycle:** start on demand, idle stop with retries, the self power-off install, quota and spend Decisions.
 3. **Phase A execution:** the `cloud` executor for pipelines (bare repository push, per-job folders, remote build and
    test steps, results back, infrastructure retry).
-4. **Placement and routing:** cloud machines as placement machines with overflow rules for external gate queues.
+4. **Placement and routing (external phase, built):** cloud machines as placement machines with overflow rules for
+   external gate queues. The external phase uses project commands (`state_cmd`, `guard_cmd`, `touch_cmd`) and the
+   project's runner starts the machine when a job lands in its lane; Lair does not call the provider directly yet.
+   Configuration: `placement.machines.<id>.on_demand` with `state_cmd`, `guard_cmd`, `boot_seconds`, `cost_per_hour`,
+   `check_seconds`, `speed_factor`, `touch_cmd`, `touch_seconds`; `placement.routing.<lane>` with `overflow_to`,
+   `prefer_when_faster`, `min_gain_seconds`. As built:
+   - a stopped machine whose guard says ok is a target only through routing, and only for a real gain (boot time
+     counted once): an overflow moves a job that waits, `prefer_when_faster` also one that would start now;
+   - the guard runs again right before a move that starts the machine (a cached verdict may be `check_seconds` old);
+   - a job queued in the machine's lane while its guard refuses or its state is unknown moves back to the lane that
+     overflows to it;
+   - while a job runs in its lanes, `touch_cmd` keeps the machine's idle timer from stopping it (act mode only: in
+     observe mode or on a read-only project nothing keeps a paid machine on); a machine found stopped under a
+     running job raises `placement.machine_stopped_under_job` once per job (at the next state check, up to
+     `check_seconds` later), and the job moves back once when its runner queues it there again.
+
+   See docs/configuration.md Placement.
 5. **Slots and remote scans:** parallel slots with the memory rules; container scanners and hooks on the machine.
 6. **Setup wizard** in Settings (§8).
 7. **Phase B:** lair-node on cloud machines.

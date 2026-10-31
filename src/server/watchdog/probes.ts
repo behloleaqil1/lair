@@ -32,9 +32,24 @@ export interface ProcessInfo {
   command: string;
 }
 
+/** One reading of the process table, and when `ps` took it. */
+export interface ProcessReading {
+  processes: ProcessInfo[];
+  /** When `ps` was started (ms since the epoch) */
+  startedAt: number;
+  /** When it answered: the elapsed times were read between startedAt and this */
+  takenAt: number;
+}
+
 /** Lists the processes on this machine. */
 export interface ProcessTable {
   list(): Promise<ProcessInfo[]>;
+  /**
+   * The reading with its own time, for a table that may hand out one taken earlier (the shared cache). `fresh`: a
+   * reading started after this call, never one kept from before; it rejects when that one fails. A table without
+   * this method reads the machine on every list().
+   */
+  read?(options?: { fresh?: boolean }): Promise<ProcessReading>;
 }
 
 export interface FileStat {
