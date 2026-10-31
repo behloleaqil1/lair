@@ -109,6 +109,12 @@ export interface ProjectConfig {
    */
   placement?: Record<string, unknown>;
   /**
+   * Host services: per-machine services with probe and start
+   * (src/server/host-services/). Validated by parseHostServicesConfig; see
+   * docs/configuration.md#host-services
+   */
+  host_services?: Record<string, unknown>;
+  /**
    * Cloud machines: the provider, the spend meter and the money guard
    * (src/server/cloud/). Validated by parseCloudConfig; see
    * docs/configuration.md#cloud-machines
@@ -140,6 +146,12 @@ export interface ProjectConfig {
   mail_dir?: string;
   /** File to touch when dragons should wake (bus mirror) */
   wake_file?: string;
+  /**
+   * Infrastructure monitor: watch running jobs' machines
+   * (src/server/infra-monitor/). Validated by parseInfraMonitorConfig; see
+   * docs/configuration.md#infrastructure-monitor
+   */
+  infra_monitor?: Record<string, unknown>;
   /**
    * Agent checks: agents test on a runner before they gate
    * (src/server/checks/). Validated by parseChecksConfig; see

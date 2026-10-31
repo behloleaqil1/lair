@@ -57,7 +57,9 @@ import { getBudgetManager } from "./fleet/budget.js";
 import { ReviewManager, inboxDecisionSink, registerReviewRoutes } from "./review/index.js";
 import { mountTriage } from "./triage/index.js";
 import { PlacementManager, registerPlacementRoutes } from "./placement/index.js";
+import { HostServicesManager, registerHostServicesRoutes } from "./host-services/index.js";
 import { CloudManager, registerCloudRoutes } from "./cloud/index.js";
+import { InfraMonitorManager, registerInfraMonitorRoutes } from "./infra-monitor/index.js";
 import { ChecksManager, agentRunIsActive, registerChecksRoutes } from "./checks/index.js";
 import { registerDashboardRoutes } from "./dashboard/index.js";
 import type { DashboardSources } from "./dashboard/routes.js";
@@ -701,6 +703,17 @@ const reviews = new ReviewManager({
   decisions: inboxDecisionSink(decisionInbox),
 });
 reviews.load(projectEntries);
+
+// Host services: per-machine services with probe and start (duty D13).
+// One per project with `host_services.enabled: true` (off by default).
+// It probes services (a container engine, tunnel daemons) every interval and,
+// in act mode, starts them when down (with a backoff kept in
+// data/host-services/) and holds the pipeline lanes that need them
+const hostServices = new HostServicesManager({ events: getEventBus(), dataDir: join(process.cwd(), "data") });
+hostServices.load(projectEntries);
+// A pipeline job whose lane needs a service that is not up waits (act mode only)
+pipelines.useLaneHolds((project, names) => hostServices.holdFor(project, names));
+
 // The ready guard (agents.fill.ready_guard) reads a project's PRs from its review module's git host
 agents.useReadyFacts((project) => {
   const review = reviews.get(project);
@@ -710,6 +723,8 @@ agents.useReadyFacts((project) => {
 await reviews.useDecisions(decisionInbox);
 // The same for delivery's held services: answering releases the service, as its Release button does
 await delivery.useDecisions(decisionInbox);
+// Host services decisions: a service that keeps failing raises one; recovering withdraws it
+hostServices.useDecisions(decisionInbox);
 // Merges, human reviews, finding resolutions and hold releases need the owner's session
 await registerReviewRoutes(fastify, reviews, () => getDefaultProject(), humanAuth);
 
@@ -760,6 +775,9 @@ const placements = new PlacementManager({
 placements.load(projectEntries);
 await registerPlacementRoutes(fastify, placements, () => getDefaultProject());
 
+// Host services routes
+registerHostServicesRoutes(fastify, hostServices, humanAuth);
+
 // Cloud machines: one per project with `cloud.enabled: true` (off by
 // default). It describes each machine's tagged instance through its
 // provider (AWS EC2, credentials from a named profile only), meters the
@@ -771,6 +789,19 @@ const clouds = new CloudManager({
 });
 clouds.load(projectEntries);
 await registerCloudRoutes(fastify, clouds, () => getDefaultProject(), humanAuth);
+
+// Infrastructure monitor (src/server/infra-monitor/): the machines of the
+// gate lanes and the jobs on them (machine down under work, job process gone,
+// two runners in one slot, no live runner while jobs wait). Off unless a
+// project sets `infra_monitor.enabled: true`; observe mode writes nothing.
+// Act mode's re-queues are kept in data/infra-monitor-requeues.json.
+const infraMonitor = new InfraMonitorManager({
+  events: getEventBus(),
+  ledgerPath: join(process.cwd(), "data", "infra-monitor-requeues.json"),
+});
+infraMonitor.load(projectEntries);
+infraMonitor.useDecisions(decisionInbox);
+await registerInfraMonitorRoutes(fastify, infraMonitor, () => getDefaultProject());
 
 // Agent checks (src/server/checks/): agents test on a runner before they gate.
 // One per project with `checks:` configured (off by default). A request needs
@@ -848,7 +879,7 @@ const { supervisor: selfChecks, chat: supervisorChat } = await mountSupervisor(f
       } catch {
         config = null;
       }
-      return moduleReports({ watchdogs, agents, triage, placements, planner, reviews, delivery, pipelines }, project, config);
+      return moduleReports({ watchdogs, agents, triage, placements, hostServices, planner, reviews, delivery, pipelines }, project, config);
     },
     agentsStore: () => agents.getStore(),
     agentsOn: (project) => agents.get(project) !== undefined,
@@ -887,9 +918,11 @@ const reloader = new ConfigReloader({
     agents,
     triage,
     placements,
+    hostServices,
     clouds,
     planner,
     supervisor: selfChecks,
+    infraMonitor,
     bus: {
       validate: (config) => {
         const parsed = parseBusConfig(config.bus);
@@ -1008,6 +1041,11 @@ const stopServer = async (reason: string) => {
   await clouds.stop();
   // Stop agent checks: running checks are marked interrupted, stores close
   await checks.stop();
+
+  // Stop host services: probes in progress are cut short
+  await hostServices.stop();
+  // Stop infra monitor: any tick in progress is cut short
+  await infraMonitor.stop();
 
   // Stop the shared process cache (all modules have stopped, so no one reads it)
   disposeProcessCache();
@@ -1173,12 +1211,28 @@ const start = async () => {
         : "[placement] Off (no project sets placement.enabled)",
     );
 
+    // Start host services (service probes, starts in act mode, lane holds)
+    const hosting = hostServices.start();
+    console.log(
+      hosting.length > 0
+        ? `[host-services] Watching services for: ${hosting.join(", ")}`
+        : "[host-services] Off (no project sets host_services.enabled)",
+    );
+
     // Start cloud checks (describe, meter, cost reading, money guard)
     const metered = clouds.start();
     console.log(
       metered.length > 0
         ? `[cloud] Watching cloud machines for: ${metered.join(", ")}`
         : "[cloud] Off (no project sets cloud.enabled)",
+    );
+
+    // Start infra monitor (machine probes, job tracking, notice raising)
+    const infraMonitored = infraMonitor.start();
+    console.log(
+      infraMonitored.length > 0
+        ? `[infra-monitor] Watching jobs for: ${infraMonitored.join(", ")}`
+        : "[infra-monitor] Off (no project sets infra_monitor.enabled)",
     );
 
     // Start agent checks (reconcile queued/running from a restart)

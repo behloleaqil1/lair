@@ -13,12 +13,16 @@ import { parseReviewConfig } from "../review/config.js";
 import type { ReviewManager } from "../review/service.js";
 import type { TriageManager } from "../triage/manager.js";
 import type { PlacementManager } from "../placement/service.js";
+import { parseHostServicesConfig } from "../host-services/config.js";
+import type { HostServicesManager } from "../host-services/service.js";
 import type { CloudManager } from "../cloud/service.js";
 import { parsePlannerConfig } from "../planner/config.js";
 import type { PlannerManager } from "../planner/manager.js";
 import { parseWatchdogConfig } from "../watchdog/config.js";
 import type { WatchdogManager } from "../watchdog/service.js";
 import type { Supervisor } from "../supervisor/service.js";
+import { parseInfraMonitorConfig } from "../infra-monitor/config.js";
+import type { InfraMonitorManager } from "../infra-monitor/service.js";
 
 export interface ProjectEntry {
   name: string;
@@ -52,9 +56,11 @@ export interface ServerModules {
   agents?: AgentsManager;
   triage?: TriageManager;
   placements?: PlacementManager;
+  hostServices?: HostServicesManager;
   clouds?: CloudManager;
   planner?: PlannerManager;
   supervisor?: Supervisor;
+  infraMonitor?: InfraMonitorManager;
   /** The fleet bus's switch (bus.consume, src/server/bus/consumers.ts): validated and applied per project */
   bus?: { validate(config: ProjectConfig): string[]; reloadProject(entry: ProjectEntry): Promise<void> };
 }
@@ -66,7 +72,7 @@ function errorsOf(result: { ok: true } | { ok: false; errors: string[] }): strin
 /** The server's modules, as src/server/index.ts wires them. */
 export function serverModules(m: ServerModules): ReloadableModule[] {
   const modules: ReloadableModule[] = [];
-  const { delivery, watchdogs, pipelines, reviews, agents, triage, placements, clouds, planner, supervisor, bus } = m;
+  const { delivery, watchdogs, pipelines, reviews, agents, triage, placements, hostServices, clouds, planner, supervisor, infraMonitor, bus } = m;
   if (delivery) {
     modules.push({
       name: "delivery",
@@ -128,6 +134,14 @@ export function serverModules(m: ServerModules): ReloadableModule[] {
       reload: (entry) => placements.reloadProject(entry),
     });
   }
+  if (hostServices) {
+    modules.push({
+      name: "host-services",
+      blocks: ["host_services"],
+      validate: (config) => errorsOf(parseHostServicesConfig(config.host_services)),
+      reload: (entry) => hostServices.reloadProject(entry),
+    });
+  }
   if (clouds) {
     modules.push({
       name: "cloud",
@@ -155,6 +169,15 @@ export function serverModules(m: ServerModules): ReloadableModule[] {
       reads: ["agents", "dragons", "ai", "planner"],
       validate: (config) => supervisor.validate(config),
       reload: (entry) => supervisor.reloadProject(entry),
+    });
+  }
+  if (infraMonitor) {
+    modules.push({
+      name: "infra_monitor",
+      // Its machines and lanes are in its own block; gates_dir and read_only reload every module
+      blocks: ["infra_monitor"],
+      validate: (config) => errorsOf(parseInfraMonitorConfig(config.infra_monitor)),
+      reload: (entry) => infraMonitor.reloadProject(entry),
     });
   }
   if (bus) {
