@@ -303,7 +303,8 @@ export type EventType =
   // Checks (src/server/checks/)
   | "check.requested"
   | "check.started"
-  | "check.completed";
+  | "check.completed"
+  | "check.reconciled";
 
 /** Event stored in the database */
 export interface Event {

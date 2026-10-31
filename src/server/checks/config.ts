@@ -158,9 +158,9 @@ const SHELL_METACHARS_NO_BRACES = /[;&|`$()[\]<>*?!'"\\]/;
 
 /**
  * Valid placeholder pattern: {word} where word is lowercase letters/underscores.
- * We allow placeholders like {sha}, {tests}, {branch}, {agent}, {check_id}.
+ * We allow placeholders like {sha}, {tests}, {branch}, {agent}, {check_id}, {output_dir}.
  */
-const VALID_PLACEHOLDERS = new Set(["sha", "branch", "tests", "agent", "check_id"]);
+const VALID_PLACEHOLDERS = new Set(["sha", "branch", "tests", "agent", "check_id", "output_dir"]);
 
 /**
  * Check if text contains shell metacharacters in a command template.
@@ -257,6 +257,7 @@ export interface CommandPlaceholders {
   tests: string;
   agent: string;
   check_id: string;
+  output_dir: string;
 }
 
 /**
@@ -278,6 +279,7 @@ export function buildCommand(
     substituted = substituted.replace(/\{tests\}/g, placeholders.tests);
     substituted = substituted.replace(/\{agent\}/g, placeholders.agent);
     substituted = substituted.replace(/\{check_id\}/g, placeholders.check_id);
+    substituted = substituted.replace(/\{output_dir\}/g, placeholders.output_dir);
 
     // Reject if result contains shell metachars (defense in depth)
     if (containsShellMetachars(substituted)) {

@@ -416,6 +416,68 @@ export class ChecksStore {
     return !!row;
   }
 
+  /** Count refused requests by an agent in the last hour (for rate limiting refusals). */
+  countAgentRefusals(agent: string, since: number): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) as n FROM check_requests
+         WHERE project = ? AND agent = ? AND status = 'refused' AND created_at >= ?`,
+      )
+      .get(this.project, agent, since) as { n: number };
+    return row.n;
+  }
+
+  /**
+   * Reconcile running checks from a previous instance: mark them as infrastructure failures.
+   * Called at startup. Returns the count of checks reconciled.
+   */
+  reconcileRunningChecks(reason: string, at: number): number {
+    const running = this.db
+      .prepare(`SELECT id, kind, agent FROM check_requests WHERE project = ? AND status = 'running'`)
+      .all(this.project) as Array<{ id: string; kind: string; agent: string }>;
+
+    for (const row of running) {
+      this.db
+        .prepare(
+          `UPDATE check_requests
+           SET status = 'infrastructure', completed_at = ?, log_tail = ?
+           WHERE id = ?`,
+        )
+        .run(at, reason, row.id);
+      this.audit(row.id, row.kind, row.agent, "completed", `status=infrastructure (reconciled: ${reason})`, at);
+    }
+
+    // Also process any queued checks that are now stale
+    return running.length;
+  }
+
+  /**
+   * Prune old checks to keep the database bounded.
+   * Keeps the most recent `keep` checks and deletes older ones.
+   */
+  pruneOldChecks(keep: number, at: number): number {
+    // Get the cutoff id
+    const cutoff = this.db
+      .prepare(
+        `SELECT id FROM check_requests WHERE project = ? ORDER BY created_at DESC LIMIT 1 OFFSET ?`,
+      )
+      .get(this.project, keep) as { id: string } | undefined;
+
+    if (!cutoff) return 0;
+
+    // Delete checks older than the cutoff
+    const checkResult = this.db
+      .prepare(`DELETE FROM check_requests WHERE project = ? AND created_at < (SELECT created_at FROM check_requests WHERE id = ?)`)
+      .run(this.project, cutoff.id);
+
+    // Delete audit entries for deleted checks
+    this.db
+      .prepare(`DELETE FROM checks_audit WHERE project = ? AND check_id NOT IN (SELECT id FROM check_requests WHERE project = ?)`)
+      .run(this.project, this.project);
+
+    return checkResult.changes;
+  }
+
   // ============ Audit ============
 
   private audit(checkId: string, kind: string, agent: string, action: string, detail: string, at: number): void {

@@ -62,11 +62,11 @@ class FakeSpawner implements CheckSpawner {
 }
 
 class FakeGuardRunner implements GuardRunner {
-  calls: Array<{ argv: string[]; cwd: string }> = [];
+  calls: Array<{ argv: string[]; cwd: string; timeoutMs: number }> = [];
   nextResult = { exitCode: 0, output: "" };
 
-  async run(argv: string[], cwd: string): Promise<{ exitCode: number; output: string }> {
-    this.calls.push({ argv, cwd });
+  async run(argv: string[], cwd: string, timeoutMs: number): Promise<{ exitCode: number; output: string }> {
+    this.calls.push({ argv, cwd, timeoutMs });
     return this.nextResult;
   }
 }
@@ -84,6 +84,24 @@ class FakeFs implements ChecksFs {
 
   readFile(path: string): string | null {
     return this.files.get(path) ?? null;
+  }
+
+  readDir(path: string): string[] | null {
+    if (this.dirs.has(path)) {
+      // Return files that start with this directory path
+      const result: string[] = [];
+      for (const filePath of this.files.keys()) {
+        if (filePath.startsWith(path + "/")) {
+          const rest = filePath.slice(path.length + 1);
+          const fileName = rest.split("/")[0];
+          if (fileName && !result.includes(fileName)) {
+            result.push(fileName);
+          }
+        }
+      }
+      return result;
+    }
+    return null;
   }
 
   exists(path: string): boolean {
@@ -130,6 +148,7 @@ async function createTestContext(config: typeof VALID_CONFIG | undefined = VALID
     clock,
     fs,
     outputDir: TEST_DATA_DIR,
+    repoDir: TEST_DATA_DIR,
     validateSha: async () => true,
   });
 

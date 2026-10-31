@@ -3,17 +3,19 @@
  *
  * Routes:
  * - POST /api/checks           Request a check (requires bus token)
- * - GET  /api/checks/:id       Get check result (long-poll with ?wait=)
- * - GET  /api/checks           List checks (for UI)
- * - GET  /api/checks/stats     Stats for Health view
+ * - GET  /api/checks/:id       Get check result (token-bound or owner)
+ * - GET  /api/checks           List checks (owner only)
+ * - GET  /api/checks/stats     Stats for Health view (owner only)
  */
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { rejectCrossSiteRequests } from "../origin.js";
 import { projectQueryGuard } from "../routes/project-guard.js";
 import { hashBusToken, isBusTokenFormat, redactBusToken } from "../bus/index.js";
 import type { BusStore } from "../bus/store.js";
+import type { BusTokenBinding } from "../bus/tokens.js";
 import type { ChecksService, CheckError } from "./service.js";
+import type { HumanAuth } from "../human-auth/index.js";
 
 function respond<T>(data: T) {
   return { success: true, data, timestamp: new Date().toISOString() };
@@ -67,13 +69,15 @@ export interface ChecksRoutesOptions {
   service: ChecksService;
   busStore: BusStore;
   defaultProject: () => string;
+  /** Owner auth for list/stats routes. When null, those routes are disabled. */
+  ownerAuth?: HumanAuth;
 }
 
 export async function registerChecksRoutes(
   fastify: FastifyInstance,
   options: ChecksRoutesOptions,
 ): Promise<void> {
-  const { service, busStore, defaultProject } = options;
+  const { service, busStore, defaultProject, ownerAuth } = options;
 
   await fastify.register(async (app) => {
     app.addHook("onRequest", rejectCrossSiteRequests);
@@ -83,14 +87,28 @@ export async function registerChecksRoutes(
 
     const projectOf = (query: { project?: string }) => query.project ?? defaultProject();
 
+    /** Extract and validate token, returning binding or null */
+    const getTokenBinding = (request: FastifyRequest): BusTokenBinding | null => {
+      const token = extractToken(request.headers.authorization);
+      if (!token || !isBusTokenFormat(token)) return null;
+      return busStore.validateToken(hashBusToken(token));
+    };
+
+    /** Check if this is an owner session request */
+    const isOwnerSession = (request: FastifyRequest): boolean => {
+      if (!ownerAuth) return false;
+      const check = ownerAuth.verifyRequest(request.headers, { method: request.method });
+      return check.ok;
+    };
+
     // POST /api/checks - Request a check
     app.post<{ Body: unknown; Querystring: { project?: string } }>("/api/checks", async (request, reply) => {
-      const project = projectOf(request.query);
-
       // Check if module is enabled
       if (!service.isEnabled()) {
         return fail(reply, 404, "Checks module is not configured for this project");
       }
+
+      const project = projectOf(request.query);
 
       // Extract and validate token
       const token = extractToken(request.headers.authorization);
@@ -128,15 +146,29 @@ export async function registerChecksRoutes(
       return respond(result.data);
     });
 
-    // GET /api/checks/:id - Get check result
+    // GET /api/checks/:id - Get check result (token-bound or owner)
     app.get<{ Params: { id: string }; Querystring: { project?: string; wait?: string } }>("/api/checks/:id", async (request, reply) => {
+      // Check if module is enabled
+      if (!service.isEnabled()) {
+        return fail(reply, 404, "Checks module is not configured for this project");
+      }
+
       const query = GetQuery.safeParse(request.query ?? {});
       if (!query.success) {
         return fail(reply, 400, `Invalid query: ${query.error.issues[0].message}`);
       }
 
+      // Check auth: either token binding or owner session
+      const tokenBinding = getTokenBinding(request);
+      const ownerSession = isOwnerSession(request);
+
+      // If neither token nor owner session, require token
+      if (!tokenBinding && !ownerSession) {
+        return fail(reply, 401, "Authentication required: bus token or owner session");
+      }
+
       const waitMs = query.data.wait ? query.data.wait * 1000 : undefined;
-      const result = await service.getCheck(request.params.id, waitMs);
+      const result = await service.getCheck(request.params.id, ownerSession ? null : tokenBinding, waitMs);
 
       if (!result.ok) {
         return fail(reply, errorCode(result.error), result.error.message);
@@ -145,8 +177,19 @@ export async function registerChecksRoutes(
       return respond(result.data);
     });
 
-    // GET /api/checks - List checks
+    // GET /api/checks - List checks (owner only)
     app.get<{ Querystring: unknown }>("/api/checks", async (request, reply) => {
+      // Check if module is enabled
+      if (!service.isEnabled()) {
+        return fail(reply, 404, "Checks module is not configured for this project");
+      }
+
+      // Owner only
+      const ownerSession = isOwnerSession(request);
+      if (!ownerSession) {
+        return fail(reply, 401, "Owner session required");
+      }
+
       const query = ListQuery.safeParse(request.query ?? {});
       if (!query.success) {
         return fail(reply, 400, `Invalid query: ${query.error.issues[0].message}`);
@@ -173,8 +216,19 @@ export async function registerChecksRoutes(
       });
     });
 
-    // GET /api/checks/stats - Stats for Health view
-    app.get("/api/checks/stats", async () => {
+    // GET /api/checks/stats - Stats for Health view (owner only)
+    app.get("/api/checks/stats", async (request, reply) => {
+      // Check if module is enabled
+      if (!service.isEnabled()) {
+        return fail(reply, 404, "Checks module is not configured for this project");
+      }
+
+      // Owner only
+      const ownerSession = isOwnerSession(request);
+      if (!ownerSession) {
+        return fail(reply, 401, "Owner session required");
+      }
+
       return respond(service.getStats());
     });
   });
