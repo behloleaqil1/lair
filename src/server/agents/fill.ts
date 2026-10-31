@@ -1080,12 +1080,15 @@ export class AgentsFill {
   }
 
   /**
-   * Emit a config warning once if done_match is task_id but pattern has no {task}.
+   * Emit config warnings once:
+   * - If done_match is task_id but pattern has no {task}: falls back to agent_legacy matching
+   * - If done_match is agent_legacy: deprecation warning
    * This is recorded as a notice event visible on Health.
    */
   private async emitConfigWarningIfNeeded(now: number): Promise<void> {
     if (this.configWarningEmitted) return;
     const { settings } = this.options;
+    
     // Check if done_match is task_id but pattern doesn't have {task}
     if (settings.doneMatch === "task_id" && !settings.donePattern.includes("{task}")) {
       this.configWarningEmitted = true;
@@ -1100,6 +1103,26 @@ export class AgentsFill {
             doneMatch: settings.doneMatch,
           },
           dedupeKey: `fill_config_warning:agent_only_pattern`,
+        },
+        now,
+      );
+      return;
+    }
+    
+    // Emit deprecation warning for explicit agent_legacy mode
+    if (settings.doneMatch === "agent_legacy") {
+      this.configWarningEmitted = true;
+      await this.options.record(
+        "fill_config",
+        {
+          summary: `CONFIG WARNING: done_match "agent_legacy" is deprecated; consider adding {task} to your patterns`,
+          evidence: [`done_pattern: ${settings.donePattern}`, `done_match: ${settings.doneMatch}`],
+          data: {
+            warning: "agent_legacy_deprecated",
+            donePattern: settings.donePattern,
+            doneMatch: settings.doneMatch,
+          },
+          dedupeKey: `fill_config_warning:agent_legacy`,
         },
         now,
       );

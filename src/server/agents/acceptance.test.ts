@@ -5411,6 +5411,40 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(status.unmatchedReports[0].reportedTask).toBe("review-feat-login");
     expect(status.unmatchedReports[0].openTask).toBe("feat-login");
   });
+
+  it("with agent_legacy mode, a startup warning is recorded", async () => {
+    const h = setup(fill({ done_match: "agent_legacy" }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+
+    // First check emits the warning
+    await check(h);
+
+    // A fill_config event was recorded
+    const configEvents = eventsOf(h, "fill_config");
+    expect(configEvents.length).toBeGreaterThanOrEqual(1);
+    expect(configEvents[0]).toMatchObject({
+      summary: expect.stringContaining("agent_legacy"),
+      data: { warning: "agent_legacy_deprecated" },
+    });
+  });
+
+  it("with task_id mode but agent-only pattern, a startup warning is recorded", async () => {
+    const h = setup(fill({ done_pattern: "^-\\s+DONE\\s+.*\\bby\\s+{agent}(?=[\\s(]|$)" }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+
+    // First check emits the warning
+    await check(h);
+
+    // A fill_config event was recorded
+    const configEvents = eventsOf(h, "fill_config");
+    expect(configEvents.length).toBeGreaterThanOrEqual(1);
+    expect(configEvents[0]).toMatchObject({
+      summary: expect.stringContaining("agent_legacy matching"),
+      data: { warning: "agent_only_pattern_with_task_id" },
+    });
+  });
 });
 
 
