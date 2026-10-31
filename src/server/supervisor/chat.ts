@@ -655,7 +655,7 @@ export class SupervisorChat {
         const minutes = Math.round((turn.deadlineAt - turn.askedAt) / 60_000);
         const reason = fromFile.error
           ? `no answer within ${minutes} minutes, and answer.json was invalid: ${fromFile.error}`
-          : `no answer within ${minutes} minutes (supervisor.chat.answer_timeout_minutes)`;
+          : `no answer within ${minutes} minutes (supervisor.chat.answer_timeout_minutes): Lair stopped its run`;
         await this.close(turn, reason);
         this.cleanupTurn(turn.id);
         continue;
