@@ -225,36 +225,41 @@ describe("the deterministic part", () => {
     expect(readFileSync(real, "utf-8")).toBe("worker-a|Alice|feat-login|Login\n");
   });
 
-  it("with done_match task_id (default), a DONE line naming another task does not mark the open task done", async () => {
+  it("the planner marks a task done by fill's rule (the shared checkDone): with a fleet's DONE or READY pattern, only a line that names it, by its agent", async () => {
     const p = makePaths();
-    tasks(p, "worker-a|Alice|feat-login|Login form");
-    // done_match defaults to task_id in fill config
-    const h = await setup(p, plannerBlock(p, { agent: undefined }));
+    tasks(p, "worker-a|Alice|feat-login|Login form", "worker-b|Bob|feat-search|Search page");
+    const fleet = {
+      enabled: true,
+      interval_seconds: 1,
+      fill: {
+        enabled: false,
+        tasks_file: p.tasksFile,
+        agents: ["worker-a", "worker-b"],
+        prompt_files: ["{prompts_dir}/worker.txt"],
+        done_pattern: "^-\\s+(?:DONE|READY)\\s+{task}(?=[\\s:]|$).*\\bby\\s+{agent}(?=[\\s(]|$)",
+        waiting_pattern: "^-\\s+WAITING\\s+.*\\bby\\s+{agent}(?=[\\s(]|$)",
+        blocked_pattern: "^-\\s+BLOCKED\\s+.*\\bby\\s+{agent}(?=[\\s(]|$)",
+      },
+    };
+    const h = await setup(p, plannerBlock(p, { agent: undefined }), { extra: { agents: fleet } as never });
     await h.service.cycle();
 
-    // A DONE line for a DIFFERENT task
-    queue(p, "- DONE old-task by worker-a 12:05Z: merged");
+    queue(
+      p,
+      // A stale prompt's line for an old task, a longer id, another agent's line for the task, and a review task's id
+      "- DONE old-task by worker-a (Alice) 12:00Z: merged",
+      "- DONE feat-login-2 by worker-a (Alice) 12:01Z: merged",
+      "- READY feat-login PR #7 at abc1234 by worker-b (Bob) 12:02Z: reviewed",
+      "- DONE review-feat-search by worker-b (Bob) 12:03Z: approved",
+    );
     await h.service.cycle();
-
-    // The task is NOT marked done: the DONE line named a different task
-    expect(taskIds(h)).toEqual(["feat-login"]);
+    expect(taskIds(h)).toEqual(["feat-login", "feat-search"]);
     expect(history(h)).toEqual([]);
-  });
 
-  it("with done_match task_id, a DONE line naming the correct task marks it done", async () => {
-    const p = makePaths();
-    tasks(p, "worker-a|Alice|feat-login|Login form");
-    const h = await setup(p, plannerBlock(p, { agent: undefined }));
+    queue(p, "- READY feat-login PR #7 at abc1234 by worker-a (Alice) 12:04Z: all findings fixed");
     await h.service.cycle();
-
-    // A DONE line for the correct task
-    queue(p, "- DONE feat-login by worker-a 12:05Z: merged");
-    await h.service.cycle();
-
-    // The task is marked done
-    expect(taskIds(h)).toEqual([]);
-    expect(history(h)).toHaveLength(1);
-    expect(history(h)[0]).toMatchObject({ op: "mark_done", task: "feat-login" });
+    expect(taskIds(h)).toEqual(["feat-search"]);
+    expect(history(h)).toMatchObject([{ source: "deterministic", outcome: "applied", op: "mark_done", task: "feat-login", agent: "worker-a" }]);
   });
 });
 
