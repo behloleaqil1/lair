@@ -39,10 +39,11 @@ export function mountOutcomeTracker(fastify: FastifyInstance, options: MountOutc
   const facts = new FactLog(options.dbPath);
   // Only these two methods of the inbox reach the tracker: it can list waiting answers and record an outcome
   const decisions: OutcomeDecisions = Object.freeze({
-    awaitingOutcome: (limit: number) => options.decisions.awaitingOutcome(limit),
+    awaitingOutcome: (...args: Parameters<OutcomeDecisions["awaitingOutcome"]>) => options.decisions.awaitingOutcome(...args),
     recordOutcome: (...args: Parameters<OutcomeDecisions["recordOutcome"]>) => options.decisions.recordOutcome(...args),
   });
   const tracker = new OutcomeTracker({
+    since: facts.enabledSince((options.clock ?? (() => new Date()))().toISOString()),
     decisions,
     facts,
     events: options.events,

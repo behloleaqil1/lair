@@ -104,6 +104,12 @@ Required for every module:
 | `evidence.facts` | Flat key-values, numbers as numbers, times as ISO-8601; ids not names |
 | `evidence.cause_cleared` | Boolean, set by the module that raised the decision, re-evaluated at every check |
 | `evidence.linked_issue` | Issue number if a known cause is tracked, else null |
+
+Rollout 1 state: a module sets `cause_cleared` from real state only where it knows it at the raise (the planner's tamper decision: true when the tasks file was put back). Everywhere else it is `false` at the raise, and nothing re-evaluates it afterwards, so a rule guarded by `cause_cleared` (C7's `infra` and `cause_cleared`) cannot match yet: the update path at every check belongs to rollout 2. No module tracks an issue yet, so `linked_issue` is `null` everywhere until one does.
+
+A decision whose class, evidence or effects the schema refuses is never lost: a module inside Lair raises it without them, and the refusal is written to its audit trail (`structure_refused`), to the `decision.structure_refused` event and to the log. Over HTTP the 400 stays.
+
+Facts hold codes, ids, times and numbers only; a check's string values are not copied.
 | `options[].effect` | Enum: `reversible`, `frees_task`, `irreversible`, `outward`. `outward` and `irreversible` are Tier 3 by construction |
 | `recommended_reason_code` | Code (not prose) for why Lair recommends its option |
 

@@ -699,6 +699,17 @@ An answer is accepted only with that session in the `X-Lair-Owner-Session` heade
   ```
 
   `attention` (`action`, the default, or `notice`), `blocks`, `links` (`[{label, url}]`, http or https, not to this machine or a private network), `expiresAt` and `defaultOptionId` are optional. A default needs `expiresAt`, and is refused for the kinds above that can't have one. A `credentials` decision also needs `secretName` and an option with `"suppliesSecret": true`.
+  **Class, evidence and effects (optional).** A decision can carry a policy `class` (`module.name`, starting with the raising module), an `evidence` object and an `effect` on each option, for rules to read later (nothing acts on them yet; the Decisions view shows them under the prose):
+
+  ```json
+  {
+    "class": "deploy-script.budget",
+    "evidence": { "code": "budget_exceeded", "facts": { "month": "2026-01", "used": 120 }, "cause_cleared": false, "linked_issue": null },
+    "options": [{ "id": "approve", "label": "Approve", "consequences": "Costs more.", "effect": "outward" }]
+  }
+  ```
+
+  `effect` is `reversible`, `frees_task`, `irreversible` or `outward`. `evidence.facts` is flat (strings, numbers, booleans, null). A `class` needs `evidence` and an `effect` on every option; a class in the policy table (docs/design/decision-policies.md) takes only its own evidence codes; any other class is accepted and flagged in the audit trail. A bad object is refused with 400 naming the field. Decisions raised without them load and show as before.
 - `POST /api/decisions/:id/answer`: `{optionId, note?, confirm?, secret?}`, with an owner session (see "Only you answer"). `confirm: true` is required for `spend` and `go_no_go`; `secret` goes only with an option that supplies it, and `credentials` decisions take no `note`
 
 Errors: 400 for invalid input, 403 for a cross-site request or an answer without an owner session, 404 for an unknown decision, 409 when it is no longer open, 429 when a module, or HTTP callers together, have too many open decisions, 503 when the secret store can't take a value.

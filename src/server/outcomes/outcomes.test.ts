@@ -55,7 +55,7 @@ class FakeClock {
   }
 }
 
-function harness(options: { factsPath?: string; storePath?: string; windows?: WindowHours } = {}) {
+function harness(options: { factsPath?: string; storePath?: string; windows?: WindowHours; since?: string; batch?: number } = {}) {
   const clock = new FakeClock();
   const bus = new EventBus();
   const events: { type: string; data: Record<string, unknown> }[] = [];
@@ -74,6 +74,8 @@ function harness(options: { factsPath?: string; storePath?: string; windows?: Wi
     events: bus,
     windows: options.windows ?? WINDOWS,
     checkMinutes: 10,
+    since: options.since,
+    batch: options.batch,
     clock: () => new Date(nowMs),
     timers: { setInterval: () => 0, clearInterval: () => undefined },
   });
@@ -166,26 +168,39 @@ async function answered(h: H, input: RaiseDecisionInput, optionId: string, at = 
 const now = (h: H, id: string) => h.inbox.get(id)!;
 
 describe("restart answers", () => {
-  it("good: a run of the task completes within the window", async () => {
+  it("good: the task is marked done within the window", async () => {
     const h = harness();
     const d = await answered(h, escalation(), "fresh_session");
-    h.fact(2 * HOUR, { code: "run_completed", task: TASK });
+    h.fact(2 * HOUR, { code: "task_done", task: TASK });
     h.at(3 * HOUR);
     expect(await h.tracker.sweep()).toBe(1);
     expect(now(h, d.id)).toMatchObject({
       outcome: "good",
       outcomeAt: iso(T0), // the inbox's clock
-      outcomeEvidence: { rule: "restart", fact: "run_completed", task: TASK },
+      outcomeEvidence: { rule: "restart", fact: "task_done", task: TASK },
     });
   });
 
-  it("good: the task's line is marked done", async () => {
+  it("a run that exits well is not done: it settles nothing, and a pause after it is bad", async () => {
     const h = harness();
     const d = await answered(h, escalation(), "fresh_session");
-    h.fact(HOUR, { code: "task_done", task: TASK });
+    h.fact(HOUR, { code: "run_completed", task: TASK });
     h.at(2 * HOUR);
+    expect(await h.tracker.sweep()).toBe(0);
+    expect(now(h, d.id).outcome).toBeUndefined();
+    h.fact(3 * HOUR, { code: "task_paused", task: TASK });
+    h.at(4 * HOUR);
     await h.tracker.sweep();
-    expect(now(h, d.id).outcome).toBe("good");
+    expect(now(h, d.id)).toMatchObject({ outcome: "bad", outcomeEvidence: { rule: "restart", fact: "task_paused" } });
+  });
+
+  it("a run that exits well and nothing more by the end of the window is unknown, not good", async () => {
+    const h = harness();
+    const d = await answered(h, escalation(), "fresh_session");
+    h.fact(HOUR, { code: "run_completed", task: TASK });
+    h.at(24 * HOUR);
+    await h.tracker.sweep();
+    expect(now(h, d.id)).toMatchObject({ outcome: "unknown", outcomeEvidence: { reason: "window_ended" } });
   });
 
   it("bad: the task fails again", async () => {
@@ -247,20 +262,33 @@ describe("restart answers", () => {
 });
 
 describe("wait / hold answers", () => {
-  it("good: a run of the held task starts (the cause cleared)", async () => {
+  it("good: a run of the held task completes (the cause cleared)", async () => {
     const h = harness();
     const d = await answered(h, exhausted(), "wait");
-    h.fact(2 * HOUR, { code: "run_started", task: TASK });
+    h.fact(2 * HOUR, { code: "run_completed", task: TASK });
     h.at(3 * HOUR);
     await h.tracker.sweep();
-    expect(now(h, d.id)).toMatchObject({ outcome: "good", outcomeEvidence: { rule: "hold", fact: "run_started" } });
+    expect(now(h, d.id)).toMatchObject({ outcome: "good", outcomeEvidence: { rule: "hold", fact: "run_completed" } });
+  });
+
+  it("a probe start is not a cleared hold: a start alone settles nothing, and a start that then fails is not good", async () => {
+    const h = harness();
+    const d = await answered(h, exhausted(), "wait");
+    h.fact(HOUR, { code: "run_started", task: TASK });
+    h.fact(HOUR + MIN, { code: "task_failed", task: TASK });
+    h.at(2 * HOUR);
+    expect(await h.tracker.sweep()).toBe(0);
+    expect(now(h, d.id).outcome).toBeUndefined();
+    h.at(6 * HOUR);
+    await h.tracker.sweep();
+    expect(now(h, d.id)).toMatchObject({ outcome: "unknown", outcomeEvidence: { reason: "window_ended" } });
   });
 
   it("bad: the same hold is raised again for the same cause; another cause does not count", async () => {
     const h = harness();
     const d = await answered(h, exhausted(), "wait");
-    h.fact(HOUR, { code: "hold_raised", family: "agents/escalation", task: TASK });
-    h.fact(2 * HOUR, { code: "hold_raised", family: "agents/exhausted", task: TASK });
+    h.fact(HOUR, { code: "hold_raised", family: "agents/signin:codex", task: TASK });
+    h.fact(2 * HOUR, { code: "hold_raised", family: "agents/chain:c1", task: TASK });
     h.at(3 * HOUR);
     await h.tracker.sweep();
     expect(now(h, d.id)).toMatchObject({ outcome: "bad", outcomeEvidence: { rule: "hold", fact: "hold_raised", factAt: iso(T0 + 2 * HOUR) } });
@@ -269,7 +297,7 @@ describe("wait / hold answers", () => {
   it("unknown when the window (6 hours) ends quietly", async () => {
     const h = harness();
     const d = await answered(h, exhausted(), "wait");
-    h.fact(7 * HOUR, { code: "run_started", task: TASK });
+    h.fact(7 * HOUR, { code: "run_completed", task: TASK });
     h.at(7 * HOUR);
     await h.tracker.sweep();
     expect(now(h, d.id).outcome).toBe("unknown");
@@ -539,10 +567,14 @@ describe("the bus", () => {
     expect(factsFromEvent(e("planner.changed", { project: "demo", op: "drop", task: "t", outcome: "planned" }))).toEqual([]);
     expect(factsFromEvent(e("review.merged", { project: "demo", pr: 7, resultSha: "abc" }))).toMatchObject([{ code: "merged", pr: 7, sha: "abc" }]);
     expect(factsFromEvent(e("review.merged", { project: "demo", pr: "7", resultSha: "abc" }))).toEqual([]);
-    expect(factsFromEvent(e("triage.revert_requested", { project: "demo", sha: "abc" }))).toMatchObject([{ code: "reverted", sha: "abc" }]);
+    // A revert that was only asked for may be declined or fail: it is no fact. A proven culprit is.
+    expect(factsFromEvent(e("triage.revert_requested", { project: "demo", sha: "abc" }))).toEqual([]);
+    expect(factsFromEvent(e("triage.culprit_found", { project: "demo", sha: "abc" }))).toMatchObject([{ code: "default_red", sha: "abc" }]);
     expect(
-      factsFromEvent(e("decision.raised", { project: "demo", module: "agents", key: "exhausted:c1", blocks: ["agents:demo:task:t"] })),
-    ).toMatchObject([{ code: "hold_raised", family: "agents/exhausted", task: "t" }]);
+      factsFromEvent(e("decision.raised", { project: "demo", module: "agents", key: "exhausted:c1", ref: "chain:c1", blocks: ["agents:demo:task:t"] })),
+    ).toMatchObject([{ code: "hold_raised", family: "agents/chain:c1", task: "t" }]);
+    // No ref, no usable cause
+    expect(factsFromEvent(e("decision.raised", { project: "demo", module: "agents", key: "exhausted:c1" }))).toEqual([]);
   });
 });
 
@@ -616,23 +648,196 @@ describe("the store", () => {
 });
 
 describe("the brain trainer reads the outcome", () => {
-  it("a bad outcome makes the answer a negative example; good and unknown stay positive", async () => {
+  it("a bad outcome makes the answer a negative example; good stays positive; the tracker's unknown is no label", async () => {
     const h = harness();
     const bad = await answered(h, escalation("escalation:c1:1", "t-bad"), "fresh_session", 0);
     const good = await answered(h, escalation("escalation:c1:2", "t-good"), "fresh_session", MIN);
     const unknown = await answered(h, { ...escalation("other:1"), source: { module: "custom", ref: "x" } }, "release", 2 * MIN);
     const untracked = await answered(h, escalation("escalation:c1:5", "t-none"), "fresh_session", 3 * MIN);
     h.fact(HOUR, { code: "task_failed", task: "t-bad" });
-    h.fact(HOUR, { code: "run_completed", task: "t-good" });
+    h.fact(HOUR, { code: "task_done", task: "t-good" });
     h.at(2 * HOUR);
     // The untracked one is judged too late to matter here: take its example before the sweep
     const before = exampleFromDecision(now(h, untracked.id));
     await h.tracker.sweep();
     expect(before?.outcome).toBe("unknown");
     const examples = [bad, good, unknown].map((d) => exampleFromDecision(now(h, d.id))!);
-    expect(examples.map((e) => e.outcome)).toEqual(["bad", "good", "unknown"]);
+    // The tracker's own unknown means it could not tell
+    expect(examples.map((e) => e.outcome)).toEqual(["bad", "good", "inconclusive"]);
     const sets = splitLabels(examples);
     expect(sets.negative.map((e) => e.id)).toEqual([bad.id]);
-    expect(sets.positive.map((e) => e.id).sort()).toEqual([good.id, unknown.id].sort());
+    expect(sets.positive.map((e) => e.id)).toEqual([good.id]);
+    expect(sets.pending.map((e) => e.id)).toEqual([unknown.id]);
+    expect(examples[0].outcomeAt).toBe(now(h, bad.id).outcomeAt);
   });
+});
+
+describe("hold answers judge the same cause", () => {
+  function signIn(tool: string): RaiseDecisionInput {
+    return {
+      project: "demo",
+      kind: "credential",
+      title: `${tool} is not signed in`,
+      context: "Signed out.",
+      options: [
+        { id: "wait", label: "Keep waiting", consequences: "Waits." },
+        { id: "retry_now", label: "Check again", consequences: "Checks." },
+      ],
+      recommended: { optionId: "retry_now", reasoning: "r" },
+      source: { module: "agents", ref: `signin:${tool}` },
+      key: `signin:${tool}:mac-1`,
+      blocks: [`agents:demo:tool:${tool}`],
+    };
+  }
+
+  function outage(provider: string, tasks: string[]): RaiseDecisionInput {
+    return {
+      ...signIn(provider),
+      kind: "escalation",
+      source: { module: "agents", ref: `transient:${provider}` },
+      key: `transient:${provider}:1000`,
+      blocks: tasks.map((t) => `agents:demo:task:${t}`),
+    };
+  }
+
+  it("bad: the same tool's sign-in hold is raised again; another tool's does not count", async () => {
+    const h = harness();
+    const d = await answered(h, signIn("codex"), "wait");
+    h.fact(HOUR, { code: "hold_raised", family: "agents/signin:claude" });
+    h.at(2 * HOUR);
+    expect(await h.tracker.sweep()).toBe(0);
+    h.fact(3 * HOUR, { code: "hold_raised", family: "agents/signin:codex" });
+    h.at(4 * HOUR);
+    await h.tracker.sweep();
+    expect(now(h, d.id)).toMatchObject({ outcome: "bad", outcomeEvidence: { rule: "hold", family: "agents/signin:codex" } });
+  });
+
+  it("an outage hold: another provider's outage is not this one's, and any of its waiting tasks completing is good", async () => {
+    const h = harness();
+    const d = await answered(h, outage("anthropic", ["t1", "t2", "t3"]), "wait");
+    h.fact(HOUR, { code: "hold_raised", family: "agents/transient:openai" });
+    h.fact(2 * HOUR, { code: "run_completed", task: "unrelated" });
+    h.at(3 * HOUR);
+    expect(await h.tracker.sweep()).toBe(0);
+    h.fact(4 * HOUR, { code: "run_completed", task: "t3" });
+    h.at(5 * HOUR);
+    await h.tracker.sweep();
+    expect(now(h, d.id)).toMatchObject({ outcome: "good", outcomeEvidence: { rule: "hold", fact: "run_completed", task: "t3" } });
+  });
+
+  it("through the bus: the fact carries the ref, so a hold of another tool is another family", async () => {
+    const h = harness();
+    h.tracker.subscribe();
+    await h.bus.emit("decision.raised", { project: "demo", module: "agents", key: "signin:claude:mac-1", ref: "signin:claude", blocks: ["agents:demo:tool:claude"] });
+    const facts = h.facts.between("demo", "2000-01-01T00:00:00.000Z", "2999-01-01T00:00:00.000Z");
+    expect(facts).toMatchObject([{ code: "hold_raised", family: "agents/signin:claude" }]);
+    expect(facts[0].task).toBeUndefined();
+  });
+});
+
+describe("merge answers count from the merge", () => {
+  it("a proven culprit inside the window after the merge is bad, even past the window after the answer", async () => {
+    const h = harness();
+    const d = await answered(h, mergeHold(), "release");
+    h.fact(20 * HOUR, { code: "merged", pr: 42, sha: "abc123" });
+    h.fact(40 * HOUR, { code: "default_red", sha: "abc123" });
+    h.at(41 * HOUR);
+    await h.tracker.sweep();
+    expect(now(h, d.id)).toMatchObject({ outcome: "bad", outcomeEvidence: { rule: "merge", fact: "default_red", pr: 42 } });
+  });
+
+  it("a culprit after the window that started at the merge is not counted", async () => {
+    const h = harness();
+    const d = await answered(h, mergeHold(), "release");
+    h.fact(20 * HOUR, { code: "merged", pr: 42, sha: "abc123" });
+    h.fact(45 * HOUR, { code: "default_red", sha: "abc123" });
+    h.at(45 * HOUR);
+    await h.tracker.sweep();
+    expect(now(h, d.id)).toMatchObject({ outcome: "unknown", outcomeEvidence: { reason: "window_ended" } });
+  });
+
+  it("a revert only requested is no revert: the event makes no fact", async () => {
+    const h = harness();
+    h.tracker.subscribe();
+    await h.bus.emit("triage.revert_requested", { project: "demo", incidentId: "i1", sha: "abc123", by: null });
+    expect(h.facts.between("demo", "2000-01-01T00:00:00.000Z", "2999-01-01T00:00:00.000Z")).toEqual([]);
+  });
+});
+
+describe("what waits for an outcome", () => {
+  it("a sweep pages through every waiting answer: undecided ones in front do not hide the rest", async () => {
+    const h = harness({ batch: 2 });
+    const quiet: Decision[] = [];
+    for (let i = 0; i < 4; i++) quiet.push(await answered(h, escalation(`escalation:c1:q${i}`, `quiet-${i}`), "fresh_session", i * MIN));
+    const done = await answered(h, escalation("escalation:c1:d", "done-task"), "fresh_session", 5 * MIN);
+    h.fact(HOUR, { code: "task_done", task: "done-task" });
+    h.at(2 * HOUR);
+    expect(await h.tracker.sweep()).toBe(1);
+    expect(now(h, done.id).outcome).toBe("good");
+    for (const q of quiet) expect(now(h, q.id).outcome).toBeUndefined();
+  });
+
+  it("answers given before the tracker first ran are left alone, never stamped unknown", async () => {
+    const h = harness({ since: iso(T0 + HOUR) });
+    const before = await answered(h, escalation("escalation:c1:old", "old-task"), "fresh_session", 0);
+    const after = await answered(h, escalation("escalation:c1:new", "new-task"), "fresh_session", 2 * HOUR);
+    h.fact(3 * HOUR, { code: "task_done", task: "new-task" });
+    h.at(30 * HOUR);
+    await h.tracker.sweep();
+    expect(now(h, before.id).outcome).toBeUndefined();
+    expect(now(h, after.id).outcome).toBe("good");
+  });
+
+  it("the fact log keeps the first start time across opens", () => {
+    const dir = tempDir();
+    const path = join(dir, "outcomes.db");
+    const first = new FactLog(path);
+    expect(first.enabledSince("2026-03-02T08:00:00.000Z")).toBe("2026-03-02T08:00:00.000Z");
+    first.close();
+    const second = new FactLog(path);
+    closers.push(() => second.close());
+    expect(second.enabledSince("2026-04-01T00:00:00.000Z")).toBe("2026-03-02T08:00:00.000Z");
+  });
+});
+
+describe("the store opens a file from every older version", () => {
+  const COMMON = `
+    id TEXT PRIMARY KEY, project TEXT NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL, context TEXT NOT NULL,
+    options TEXT NOT NULL, recommended_option TEXT NOT NULL, recommended_reasoning TEXT NOT NULL,
+    source_module TEXT NOT NULL, source_ref TEXT NOT NULL, dedupe_key TEXT NOT NULL, links TEXT NOT NULL,
+    secret_name TEXT, default_option TEXT, created_at TEXT NOT NULL, expires_at TEXT, overdue_at TEXT,
+    status TEXT NOT NULL, answer_option TEXT, answer_note TEXT, answer_secret_supplied INTEGER NOT NULL DEFAULT 0,
+    answered_by TEXT, answered_at TEXT, withdrawn_reason TEXT, closed_at TEXT, delivered_at TEXT, delivery_error TEXT`;
+  const COLUMNS: Record<number, string> = {
+    1: COMMON,
+    2: `${COMMON}, raised_via TEXT NOT NULL DEFAULT 'server'`,
+    3: `${COMMON}, raised_via TEXT NOT NULL DEFAULT 'server', attention TEXT NOT NULL DEFAULT 'action'`,
+    // Main's version 4: class and evidence, no outcome
+    4: `${COMMON}, raised_via TEXT NOT NULL DEFAULT 'server', attention TEXT NOT NULL DEFAULT 'action', class TEXT, evidence TEXT`,
+  };
+  const ID = "0b5c2c3e-7a43-4f7e-9d2a-0d4b1f2e3a4b";
+
+  for (const version of [1, 2, 3, 4]) {
+    it(`version ${version}: the outcome columns are added and the tracker works`, () => {
+      const dbPath = join(tempDir(), "decisions.db");
+      const old = new Database(dbPath);
+      old.exec(`
+        CREATE TABLE decisions (${COLUMNS[version]});
+        INSERT INTO decisions (id, project, kind, title, context, options, recommended_option, recommended_reasoning,
+          source_module, source_ref, dedupe_key, links, created_at, status, answer_option, answered_by, answered_at)
+        VALUES ('${ID}', 'demo', 'other', 'Old one', 'c',
+          '[{"id":"ok","label":"OK","consequences":"x"},{"id":"no","label":"No","consequences":"y"}]', 'ok', 'r', 'agents', 'r', 'k', '[]',
+          '2026-03-01T00:00:00.000Z', 'answered', 'ok', 'owner', '2026-03-01T01:00:00.000Z');
+      `);
+      old.pragma(`user_version = ${version}`);
+      old.close();
+      const store = new DecisionStore(dbPath);
+      closers.push(() => store.close());
+      expect(store.awaitingOutcome(10).map((d) => d.id)).toEqual([ID]);
+      expect(store.setOutcome(ID, "2026-03-01T01:00:00.000Z", "bad", "2026-03-02T00:00:00.000Z", { rule: "x" })).toBe(true);
+      expect(store.get(ID)).toMatchObject({ outcome: "bad", outcomeEvidence: { rule: "x" } });
+      // And class/evidence from main's version 4 are still there to write
+      expect(new Database(dbPath, { readonly: true }).prepare("SELECT class, evidence FROM decisions").all()).toEqual([{ class: null, evidence: null }]);
+    });
+  }
 });

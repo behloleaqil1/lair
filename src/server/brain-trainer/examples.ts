@@ -57,8 +57,11 @@ export function exampleFromDecision(d: Decision): Example | null {
   const shape = label === null ? null : shapeOf(d);
   if (shape === null || label === null) return null;
   const answeredAt = d.answeredAt && validTime(d.answeredAt) ? new Date(d.answeredAt).toISOString() : undefined;
-  // The outcome tracker's verdict (off by default: then there is none and the answer is unknown)
-  return { ...shape, label, outcome: d.outcome ?? "unknown", ...(answeredAt ? { answeredAt } : {}) };
+  // The outcome tracker's verdict (off by default: then there is none and the answer is unknown).
+  // Its own "unknown" means it could not tell: not a label. A verdict with no usable time is not known yet.
+  const outcomeAt = d.outcomeAt && validTime(d.outcomeAt) ? new Date(d.outcomeAt).toISOString() : undefined;
+  const outcome: Outcome = d.outcome === undefined ? "unknown" : outcomeAt === undefined ? "pending" : d.outcome === "unknown" ? "inconclusive" : d.outcome;
+  return { ...shape, label, outcome, ...(answeredAt ? { answeredAt } : {}), ...(d.outcome !== undefined && outcomeAt ? { outcomeAt } : {}) };
 }
 
 /** An example from a bench case that carries a time (`at`) and maybe an outcome. */
@@ -83,7 +86,7 @@ export interface LabelSets {
   positive: Example[];
   /** The answer was marked bad: never a positive label; a proposal equal to it is vetoed */
   negative: Example[];
-  /** Outcome not resolved yet: not a label until it is */
+  /** Outcome not resolved yet, or the tracker could not tell: not a label */
   pending: Example[];
 }
 
@@ -92,7 +95,7 @@ export function splitLabels(examples: Example[]): LabelSets {
   for (const e of examples) {
     const outcome: Outcome = e.outcome;
     if (outcome === "bad") sets.negative.push(e);
-    else if (outcome === "pending") sets.pending.push(e);
+    else if (outcome === "pending" || outcome === "inconclusive") sets.pending.push(e);
     else sets.positive.push(e);
   }
   return sets;
@@ -126,4 +129,17 @@ export function queryOf(e: Shape): Omit<BenchCase, "label"> {
 /** An example back as a bench case */
 export function toBenchCase(e: Example): BenchCase {
   return { ...queryOf(e), label: e.label };
+}
+
+/**
+ * The examples as a run with this cutoff could have known them: an outcome the
+ * tracker recorded at or after the cutoff did not exist yet, so the answer was
+ * still unjudged then (a label as before, never a veto).
+ */
+export function knownBefore(examples: Example[], cutoffMs: number): Example[] {
+  return examples.map((e) => {
+    if (e.outcomeAt === undefined || Date.parse(e.outcomeAt) < cutoffMs) return e;
+    const { outcomeAt: _later, ...rest } = e;
+    return { ...rest, outcome: "unknown" };
+  });
 }

@@ -18,18 +18,21 @@ import type {
   DecisionAuditAction,
   DecisionAuditEntry,
   DecisionCounts,
+  DecisionEvidence,
   DecisionKind,
   DecisionLink,
   DecisionOption,
   DecisionOutcome,
   DecisionStatus,
 } from "../../shared/decision-types.js";
+import { isKnownDecisionClass } from "./structure.js";
 import type { ValidRaise } from "./validate.js";
 
 // 2: decisions.raised_via (server | http), for the per-project cap on HTTP callers
 // 3: decisions.attention (action | notice): what needs the owner's answer, and what is for their information
-// 4: decisions.outcome, outcome_at, outcome_evidence: the outcome tracker's verdict on an answered decision
-export const SCHEMA_VERSION = 4;
+// 4: decisions.class and decisions.evidence (JSON), nullable: the policy class and its machine-readable evidence
+// 5: decisions.outcome, outcome_at, outcome_evidence: the outcome tracker's verdict on an answered decision
+export const SCHEMA_VERSION = 5;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS decisions (
@@ -64,11 +67,16 @@ const SCHEMA = `
     attention TEXT NOT NULL DEFAULT 'action',
     outcome TEXT,
     outcome_at TEXT,
+    class TEXT,
+    evidence TEXT,
+    outcome TEXT,
+    outcome_at TEXT,
     outcome_evidence TEXT
   );
   CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_open_key_via
     ON decisions(project, source_module, dedupe_key, raised_via) WHERE status = 'open';
   CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(status, project);
+  CREATE INDEX IF NOT EXISTS idx_decisions_await_outcome ON decisions(answered_at) WHERE status = 'answered' AND outcome IS NULL;
 
   CREATE TABLE IF NOT EXISTS decision_blocks (
     decision_id TEXT NOT NULL REFERENCES decisions(id),
@@ -121,6 +129,8 @@ interface DecisionRow {
   outcome: string | null;
   outcome_at: string | null;
   outcome_evidence: string | null;
+  class: string | null;
+  evidence: string | null;
 }
 
 /** Open first, by urgency (soonest expiry, then oldest); then the rest, newest first. */
@@ -131,6 +141,12 @@ const URGENCY_ORDER = `
     CASE WHEN d.status = 'open' THEN d.created_at END,
     d.closed_at DESC,
     d.rowid DESC`;
+
+/** Where the previous page of answers waiting for an outcome ended */
+export interface OutcomeCursor {
+  answeredAt: string;
+  id: string;
+}
 
 export interface ListOptions {
   project?: string;
@@ -203,8 +219,13 @@ export class DecisionStore {
         if (version >= 1 && version <= 2) {
           this.db.exec(`ALTER TABLE decisions ADD COLUMN attention TEXT NOT NULL DEFAULT 'action'`);
         }
-        // Versions 1 to 3 lack the outcome columns
+        // Versions 1 to 3 lack class and evidence: those decisions were raised without them
         if (version >= 1 && version <= 3) {
+          this.db.exec(`ALTER TABLE decisions ADD COLUMN class TEXT`);
+          this.db.exec(`ALTER TABLE decisions ADD COLUMN evidence TEXT`);
+        }
+        // Versions 1 to 4 lack the outcome columns
+        if (version >= 1 && version <= 4) {
           for (const column of ["outcome", "outcome_at", "outcome_evidence"]) {
             this.db.exec(`ALTER TABLE decisions ADD COLUMN ${column} TEXT`);
           }
@@ -263,8 +284,8 @@ export class DecisionStore {
           `INSERT INTO decisions
              (id, project, kind, title, context, options, recommended_option, recommended_reasoning,
               source_module, source_ref, dedupe_key, links, secret_name, default_option,
-              created_at, expires_at, status, raised_via, attention)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`,
+              created_at, expires_at, status, raised_via, attention, class, evidence)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -285,6 +306,8 @@ export class DecisionStore {
           input.expiresAt ?? null,
           limits.via,
           input.attention,
+          input.class ?? null,
+          input.evidence ? JSON.stringify(input.evidence) : null,
         );
       this.addBlocks(id, input.blocks);
       return { kind: "created", decision: this.get(id)!, addedBlocks: input.blocks };
@@ -447,13 +470,14 @@ export class DecisionStore {
   }
 
   /** Answered decisions (by a person) with no outcome yet, oldest answer first. */
-  awaitingOutcome(limit: number): Decision[] {
+  awaitingOutcome(limit: number, since?: string, after?: OutcomeCursor): Decision[] {
     const rows = this.db
       .prepare(
         `SELECT * FROM decisions d WHERE d.status = 'answered' AND d.outcome IS NULL AND d.answered_by <> 'lair'
-         AND d.answer_option IS NOT NULL ORDER BY d.answered_at, d.rowid LIMIT ?`,
+         AND d.answer_option IS NOT NULL AND d.answered_at >= ? AND (d.answered_at > ? OR (d.answered_at = ? AND d.id > ?))
+         ORDER BY d.answered_at, d.id LIMIT ?`,
       )
-      .all(limit) as DecisionRow[];
+      .all(since ?? "", after?.answeredAt ?? "", after?.answeredAt ?? "", after?.id ?? "", limit) as DecisionRow[];
     return rows.map((row) => this.toDecision(row));
   }
 
@@ -565,6 +589,8 @@ export class DecisionStore {
       ...(row.outcome === "good" || row.outcome === "bad" || row.outcome === "unknown"
         ? { outcome: row.outcome, outcomeAt: row.outcome_at ?? undefined, outcomeEvidence: parseEvidence(row.outcome_evidence) }
         : {}),
+      ...(row.class ? { class: row.class, classKnown: isKnownDecisionClass(row.class) } : {}),
+      ...(row.evidence ? { evidence: JSON.parse(row.evidence) as DecisionEvidence } : {}),
     };
   }
 }

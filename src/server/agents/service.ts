@@ -1601,7 +1601,7 @@ export class AgentsService {
     );
     if (!next) {
       this.store.saveRun(run);
-      await this.escalate(run, `never started in ${run.startRetries + 1} attempt(s): ${reason}`, t);
+      await this.escalate(run, `never started in ${run.startRetries + 1} attempt(s): ${reason}`, t, "dead_on_start");
       return true;
     }
     next.startRetries = run.startRetries + 1;
@@ -2066,7 +2066,12 @@ export class AgentsService {
     return resumeSummary({ run, chain, config: this.config, view: this.view(t), branchState, why });
   }
 
-  private async escalate(run: AgentRun, why: string, t: Tick): Promise<void> {
+  private async escalate(
+    run: AgentRun,
+    why: string,
+    t: Tick,
+    code: "repeated_failure" | "dead_on_start" | "provider_limit" = "repeated_failure",
+  ): Promise<void> {
     this.store.releaseClaim(this.project, run.task, run.id);
     const chain = this.store.chainRuns(run.chainId).map((r) => (r.id === run.id ? run : r));
     const attempts = chain.map(
@@ -2104,16 +2109,27 @@ export class AgentsService {
         options: [
           {
             id: DECISION_FRESH,
+            effect: "reversible",
             label: "Start it again",
             consequences: `Lair starts ${run.task} again for ${run.agent} in a fresh session (the old one moved aside), with a resume summary. If that fails too, Lair asks again.`,
           },
           {
             id: DECISION_RELEASE,
+            effect: "frees_task",
             label: "Leave the task unclaimed",
             consequences: `Lair starts nothing more for ${run.task}; the task is free for another run. A task fill runs stays paused until you release it in Work.`,
           },
         ],
         recommended: DECISION_RELEASE,
+        structure: {
+          class: "agents.gave_up",
+          evidence: {
+            code,
+            facts: { agent: run.agent, task: run.task, attempt_count: chain.length, last_exit: run.exitCode ?? null },
+            cause_cleared: false,
+            linked_issue: null,
+          },
+        },
         why: "Every automatic recovery was used; starting again the same way would repeat the loop.",
         reversible: true,
       },
@@ -2200,7 +2216,7 @@ export class AgentsService {
     t.summary.failovers++;
     this.store.saveRun(run);
     if (!next) {
-      await this.escalate(run, `${done + 1} provider errors or rate limits in a row (failover.max_failovers is ${this.settings.failover.maxFailovers}): ${oneLine(info.line, 200)}`, t);
+      await this.escalate(run, `${done + 1} provider errors or rate limits in a row (failover.max_failovers is ${this.settings.failover.maxFailovers}): ${oneLine(info.line, 200)}`, t, "provider_limit");
       return;
     }
     this.store.insertRun(next);
@@ -2280,16 +2296,27 @@ export class AgentsService {
           options: [
             {
               id: DECISION_RETRY_NOW,
+              effect: "reversible",
               label: "I signed it in: check again now",
               consequences: `Lair checks ${refusal.tool}'s sign-in again now; the runs waiting on it start once it is signed in, and you are asked again if it still isn't.`,
             },
             {
               id: DECISION_WAIT,
+              effect: "reversible",
               label: "Keep waiting",
               consequences: `Lair keeps checking; the runs on ${refusal.tool} start once it is signed in. You are not asked again unless it signs in and out again.`,
             },
           ],
           recommended: DECISION_RETRY_NOW,
+          structure: {
+            class: "agents.cannot_start",
+            evidence: {
+              code: "probe_failed",
+              facts: { tool: refusal.tool, waiting_runs: waiting.length },
+              cause_cleared: false,
+              linked_issue: null,
+            },
+          },
           why: "Only you can sign a tool in, with your own account.",
           reversible: true,
         },
@@ -2313,16 +2340,27 @@ export class AgentsService {
         options: [
           {
             id: DECISION_WAIT,
+            effect: "reversible",
             label: "Wait for the cooldown",
             consequences: `${run.task} starts again when a provider's cooldown ends (add a fallback in agents.fallbacks to widen the choice).`,
           },
           {
             id: DECISION_STOP,
+            effect: "frees_task",
             label: "Stop the task",
             consequences: `Lair stops waiting: the waiting run of ${run.task} ends and the task is free for another run.`,
           },
         ],
         recommended: DECISION_WAIT,
+        structure: {
+          class: "agents.provider_limit",
+          evidence: {
+            code: "provider_rate_limit",
+            facts: { agent: run.agent, task: run.task, profiles_failing: skipped.length, limit_resets_at: iso(run.notBefore) },
+            cause_cleared: false,
+            linked_issue: null,
+          },
+        },
         why: "Rate limits and provider errors usually clear on their own.",
         reversible: true,
       },
@@ -2563,16 +2601,27 @@ export class AgentsService {
           options: [
             {
               id: DECISION_WAIT,
+              effect: "reversible",
               label: "Keep waiting",
               consequences: `Lair keeps trying one start on ${provider} at a time; the waiting runs start once one works. If it is still down after another ${this.settings.transient.maxMinutes} minutes, Lair asks again.`,
             },
             {
               id: DECISION_RETRY_NOW,
+              effect: "reversible",
               label: "Try now",
               consequences: `Every run waiting on ${provider} starts on the next check (choose this once the network or the provider is back). If they fail the same way, they wait again.`,
             },
           ],
           recommended: DECISION_WAIT,
+          structure: {
+            class: "agents.provider_limit",
+            evidence: {
+              code: "provider_unreachable",
+              facts: { provider, runs_waiting: runs.length, since: iso(outage.since), failures: outage.failures },
+              cause_cleared: false,
+              linked_issue: null,
+            },
+          },
           why: `Network and provider outages usually end on their own, and nothing waiting is counted against a task; this one has lasted longer than agents.transient_max_minutes (${this.settings.transient.maxMinutes}).`,
           reversible: true,
         },
@@ -2723,16 +2772,27 @@ export class AgentsService {
             options: [
               {
                 id: DECISION_ALLOW,
+                effect: "outward",
                 label: `Allow runs over the limit until ${until}`,
                 consequences: `New runs and restarts ${scope.scope === "project" ? "in this project" : `for ${scope.agent}`} start again, past the ${line.metric} hard limit, until ${until}. To change the limit itself, edit agents.budgets.`,
               },
               {
                 id: DECISION_WAIT,
+                effect: "reversible",
                 label: `Wait until ${until}`,
                 consequences: `Nothing new starts ${scope.scope === "project" ? "in this project" : `for ${scope.agent}`} until the period ends.`,
               },
             ],
             recommended: DECISION_WAIT,
+            structure: {
+              class: "agents.budget",
+              evidence: {
+                code: "budget_exceeded",
+                facts: { scope: scopeKey, metric: line.metric, period: line.period, used: line.used },
+                cause_cleared: false,
+                linked_issue: null,
+              },
+            },
             why: "A hard budget limit is the owner's call to change.",
             reversible: true,
             onTimeout: "wait",

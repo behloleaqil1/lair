@@ -16,7 +16,7 @@ import type { Evidence, Verdict, WindowHours } from "./types.js";
 
 /** What the tracker may do with the Decision Inbox: list answers waiting for a verdict, and record it. */
 export interface OutcomeDecisions {
-  awaitingOutcome(limit: number): Decision[];
+  awaitingOutcome(limit: number, since?: string, after?: { answeredAt: string; id: string }): Decision[];
   recordOutcome(id: string, answeredAt: string, outcome: DecisionOutcome, evidence: Evidence): boolean;
 }
 
@@ -31,12 +31,16 @@ export interface OutcomeTrackerOptions {
   events: EventBus;
   windows: WindowHours;
   checkMinutes: number;
+  /** Answers read per page of a sweep (default 500) */
+  batch?: number;
+  /** ISO-8601: answers given before it are not judged (no facts were kept then) */
+  since?: string;
   clock?: () => Date;
   timers?: Timers;
   log?: (line: string) => void;
 }
 
-const BATCH = 500;
+const DEFAULT_BATCH = 500;
 const EVENTS = [
   "agent.recovery",
   "agent.run.started",
@@ -44,7 +48,6 @@ const EVENTS = [
   "decision.raised",
   "planner.changed",
   "review.merged",
-  "triage.revert_requested",
   "triage.culprit_found",
 ] as const;
 const HOUR_MS = 3_600_000;
@@ -92,13 +95,31 @@ export class OutcomeTracker {
     if (answeredAt === null || !d.answer) return { outcome: "unknown", evidence: { reason: "no_answer_time" } };
     const rule = ruleFor(d);
     if (!rule) return { outcome: "unknown", evidence: { reason: "no_rule" } };
-    const windowEnd = new Date(Date.parse(answeredAt) + this.o.windows[rule.window] * HOUR_MS);
+    const hours = this.o.windows[rule.window];
+    const windowEnd = rule.windowEnd?.({ decision: d, answeredAt, hours, now, facts: this.o.facts }) ?? new Date(Date.parse(answeredAt) + hours * HOUR_MS);
     const until = windowEnd.getTime() < now.getTime() ? windowEnd : now;
     const verdict = rule.judge({ decision: d, answeredAt, windowEnd: until.toISOString(), facts: this.o.facts });
     if (verdict.outcome !== "pending") return verdict;
     return now.getTime() >= windowEnd.getTime()
       ? { outcome: "unknown", evidence: { rule: rule.name, reason: "window_ended" } }
       : verdict;
+  }
+
+  /** Judge one answer and record the verdict when it is final. Returns 1 when one was recorded. */
+  private async settle(d: Decision, now: Date): Promise<number> {
+    const verdict = this.judge(d, now);
+    if (verdict.outcome === "pending" || !d.answeredAt) return 0;
+    // Once per answer: the store refuses a second verdict, so a restart or a repeat sweep adds nothing
+    if (!this.o.decisions.recordOutcome(d.id, d.answeredAt, verdict.outcome, verdict.evidence)) return 0;
+    await this.o.events.emit("decision.outcome", {
+      decisionId: d.id,
+      project: d.project,
+      module: d.source.module,
+      optionId: d.answer?.optionId ?? null,
+      outcome: verdict.outcome,
+      evidence: verdict.evidence,
+    });
+    return 1;
   }
 
   /** Look at every answer still waiting for a verdict. Returns how many got one. */
@@ -108,20 +129,16 @@ export class OutcomeTracker {
     let recorded = 0;
     try {
       const now = this.clock();
-      for (const d of this.o.decisions.awaitingOutcome(BATCH)) {
-        const verdict = this.judge(d, now);
-        if (verdict.outcome === "pending" || !d.answeredAt) continue;
-        // Once per answer: the store refuses a second verdict, so a restart or a repeat sweep adds nothing
-        if (!this.o.decisions.recordOutcome(d.id, d.answeredAt, verdict.outcome, verdict.evidence)) continue;
-        recorded++;
-        await this.o.events.emit("decision.outcome", {
-          decisionId: d.id,
-          project: d.project,
-          module: d.source.module,
-          optionId: d.answer?.optionId ?? null,
-          outcome: verdict.outcome,
-          evidence: verdict.evidence,
-        });
+      // Page through everything waiting, so a backlog of undecided answers cannot hide the ones behind it
+      const batch = this.o.batch ?? DEFAULT_BATCH;
+      let after: { answeredAt: string; id: string } | undefined;
+      for (;;) {
+        const page = this.o.decisions.awaitingOutcome(batch, this.o.since, after);
+        for (const d of page) {
+          after = { answeredAt: d.answeredAt ?? "", id: d.id };
+          recorded += await this.settle(d, now);
+        }
+        if (page.length < batch) break;
       }
       // Facts only matter for the longest window
       const keep = Math.max(...Object.values(this.o.windows)) * HOUR_MS + DAY_MS;

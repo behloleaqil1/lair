@@ -76,6 +76,8 @@ export interface Rule {
   /** Which of the settings' windows the rule uses */
   window: keyof WindowHours;
   judge(input: RuleInput): Verdict;
+  /** Where the window ends when it is not `hours` after the answer (a merge counts from the merge) */
+  windowEnd?(input: { decision: Decision; answeredAt: string; hours: number; now: Date; facts: FactView }): Date;
 }
 
 export interface WindowHours {

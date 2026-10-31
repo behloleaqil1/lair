@@ -8,7 +8,7 @@
  */
 import type { Decision } from "../../shared/decision-types.js";
 import { DECISION_FRESH, DECISION_RELEASE, DECISION_STOP, DECISION_WAIT } from "../agents/service.js";
-import { taskOfRefs } from "./facts.js";
+import { holdFamily, taskOfRefs, tasksOfRefs } from "./facts.js";
 import type { Fact, FactCode, Rule, RuleInput, Verdict } from "./types.js";
 
 const PENDING: Verdict = { outcome: "pending" };
@@ -18,7 +18,6 @@ const PR_REF = /(?:^|:)pr:(\d{1,9})$/;
 
 const answerOf = (d: Decision) => d.answer?.optionId ?? "";
 const taskOf = (d: Decision) => taskOfRefs(d.blocks);
-const keyFamily = (d: Decision) => `${d.source.module}/${d.key.split(":")[0].slice(0, 60)}`;
 const sameTask = (f: Fact, task: string | null) => task !== null && f.task === task;
 
 function firstOf(facts: Fact[], pick: (f: Fact) => boolean): Fact | undefined {
@@ -33,7 +32,10 @@ function evidenceOf(rule: string, fact: Fact, extra: Record<string, string | num
 /** Facts after the answer, in the rule's window. */
 const window = (i: RuleInput): Fact[] => i.facts.between(i.decision.project, i.answeredAt, i.windowEnd);
 
-/** Agent restart answer: good when the task's run completes or it is marked done; bad when it fails or is paused again. */
+/**
+ * Agent restart answer: good when the task is marked done within the window (a run that exits 0 may leave it open);
+ * bad when it fails or is paused again. The first of these in time settles it.
+ */
 export const restartRule: Rule = {
   name: "restart",
   window: "restart",
@@ -41,25 +43,27 @@ export const restartRule: Rule = {
   judge(i) {
     const task = taskOf(i.decision);
     if (task === null) return { outcome: "unknown", evidence: { rule: "restart", reason: "no_task" } };
-    // The first thing that settles it, in time order
-    const fact = firstOf(window(i), (f) => sameTask(f, task) && has(f, "task_done", "run_completed", "task_failed", "task_paused"));
+    const fact = firstOf(window(i), (f) => sameTask(f, task) && has(f, "task_done", "task_failed", "task_paused"));
     if (!fact) return PENDING;
-    return { outcome: has(fact, "task_done", "run_completed") ? "good" : "bad", evidence: evidenceOf("restart", fact) };
+    return { outcome: has(fact, "task_done") ? "good" : "bad", evidence: evidenceOf("restart", fact) };
   },
 };
 
-/** Wait / hold answer: good when a run of the held task starts (the cause cleared); bad when the same hold is raised again. */
+/**
+ * Wait / hold answer: good when a run of a held task completes (the cause cleared; a start proves nothing, Lair probes
+ * one start at a time during an outage); bad when a hold for the same cause (the module and the ref: one tool or
+ * provider or chain) is raised again. A hold with no cause or no held task is judged only on the bad side.
+ */
 export const holdRule: Rule = {
   name: "hold",
   window: "hold",
   applies: (d) => d.source.module === "agents" && answerOf(d) === DECISION_WAIT,
   judge(i) {
-    const task = taskOf(i.decision);
-    const family = keyFamily(i.decision);
-    const fact = firstOf(window(i), (f) => {
-      if (f.code === "hold_raised") return f.family === family && (f.task ?? null) === task;
-      return task !== null && sameTask(f, task) && has(f, "run_started", "run_completed");
-    });
+    const d = i.decision;
+    if (!d.source.ref) return { outcome: "unknown", evidence: { rule: "hold", reason: "no_cause" } };
+    const family = holdFamily(d.source.module, d.source.ref);
+    const held = tasksOfRefs(d.blocks);
+    const fact = firstOf(window(i), (f) => (f.code === "hold_raised" ? f.family === family : f.task !== undefined && held.includes(f.task) && has(f, "run_completed", "task_done")));
     if (!fact) return PENDING;
     return { outcome: fact.code === "hold_raised" ? "bad" : "good", evidence: evidenceOf("hold", fact, { family }) };
   },
@@ -113,14 +117,22 @@ function prOf(d: Decision): number | null {
 }
 
 /**
- * A merge a person released: bad when the default branch turns red on the
- * merged commit or the commit is reverted within the window after the merge
- * (the approving review of it was then a miss). It never says good.
+
+ * A merge a person released: bad when the default branch is proven red on the
+ * merged commit (a culprit with the same sha) or a revert of it lands, within
+ * the window counted from the merge. A merge on another sha (a squash against
+ * the head) stays unknown. It never says good.
  */
 export const mergeRule: Rule = {
   name: "merge",
   window: "merge",
   applies: (d) => prOf(d) !== null && answerOf(d) === "release",
+  windowEnd(i) {
+    const pr = prOf(i.decision);
+    const merged = i.facts.between(i.decision.project, i.answeredAt, i.now.toISOString()).find((f) => f.code === "merged" && f.pr === pr);
+    // Until it merges, the wait for the merge is bounded by the same number of hours
+    return new Date((merged ? Date.parse(merged.at) : Date.parse(i.answeredAt)) + i.hours * 3_600_000);
+  },
   judge(i) {
     const pr = prOf(i.decision);
     const facts = window(i);

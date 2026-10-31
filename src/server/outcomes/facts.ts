@@ -22,6 +22,8 @@ const SCHEMA = `
     sha TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_facts_project_at ON facts(project, at);
+  CREATE INDEX IF NOT EXISTS idx_facts_at ON facts(at);
+  CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 `;
 
 interface FactRow {
@@ -73,6 +75,15 @@ export class FactLog implements FactView {
     }));
   }
 
+  /**
+   * When the tracker first ran (ISO-8601), written on the first call and kept after. Answers given before it have no
+   * facts and a closed window: they are left alone, never stamped unknown for ever.
+   */
+  enabledSince(now: string): string {
+    this.db.prepare(`INSERT OR IGNORE INTO meta (key, value) VALUES ('enabled_since', ?)`).run(now);
+    return (this.db.prepare(`SELECT value FROM meta WHERE key = 'enabled_since'`).get() as { value: string }).value;
+  }
+
   /** Forget facts older than `before` (ISO-8601). */
   prune(before: string): number {
     return this.db.prepare(`DELETE FROM facts WHERE at < ?`).run(before).changes;
@@ -88,11 +99,22 @@ function text(value: unknown, max = 200): string | null {
 
 /** The task a decision waits on, from the refs it blocks (`<module>:<project>:task:<task>`). */
 export function taskOfRefs(blocks: readonly string[]): string | null {
+  return tasksOfRefs(blocks)[0] ?? null;
+}
+
+/** Every task a decision waits on (a provider outage holds up to 50). */
+export function tasksOfRefs(blocks: readonly string[]): string[] {
+  const tasks: string[] = [];
   for (const ref of blocks) {
     const m = TASK_REF.exec(ref);
-    if (m) return m[1];
+    if (m && !tasks.includes(m[1])) tasks.push(m[1]);
   }
-  return null;
+  return tasks;
+}
+
+/** The cause of a hold: the module and the ref the decision is about (`signin:<tool>`, `transient:<provider>`, `chain:<id>`). */
+export function holdFamily(module: string, ref: string): string {
+  return `${module}/${ref}`;
 }
 
 /** The facts an event stands for (none for events the rules do not use). Fields of the wrong type are ignored. */
@@ -115,11 +137,13 @@ export function factsFromEvent(event: Event): Fact[] {
     case "agent.run.ended":
       return task ? [{ ...base, code: "run_completed" }] : [];
     case "decision.raised": {
-      const key = text(d.key);
-      if (!key) return [];
+      const module = text(d.module, 60);
+      const cause = text(d.ref);
+      // With no usable cause, nothing can say it was the same hold again
+      if (!module || !cause) return [];
       const blocks = Array.isArray(d.blocks) ? d.blocks.filter((b): b is string => typeof b === "string") : [];
       const of = taskOfRefs(blocks);
-      return [{ at, project, code: "hold_raised", family: `${text(d.module, 60) ?? "?"}/${key.split(":")[0].slice(0, 60)}`, ...(of ? { task: of } : {}) }];
+      return [{ at, project, code: "hold_raised", family: holdFamily(module, cause), ...(of ? { task: of } : {}) }];
     }
     case "planner.changed": {
       if (d.outcome !== "applied" || !task) return [];
@@ -132,10 +156,10 @@ export function factsFromEvent(event: Event): Fact[] {
       const sha = text(d.resultSha, 64);
       return pr !== null && sha ? [{ at, project, code: "merged", pr, sha }] : [];
     }
-    case "triage.revert_requested":
+    // A revert that was only requested may be declined or fail: it is not a fact. Only a proven culprit counts.
     case "triage.culprit_found": {
       const sha = text(d.sha, 64);
-      return sha ? [{ at, project, code: event.type === "triage.culprit_found" ? "default_red" : "reverted", sha }] : [];
+      return sha ? [{ at, project, code: "default_red", sha }] : [];
     }
     default:
       return [];
