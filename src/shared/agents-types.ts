@@ -288,7 +288,7 @@ export interface ProviderUnreachableView {
  * - not_allowlisted: its agent is not in agents.fill.agents, so fill never starts it
  * - malformed: the line doesn't parse; `detail` says why
  */
-export type FillLineState = "started" | "done" | "held" | "claimed" | "not_allowlisted" | "malformed";
+export type FillLineState = "started" | "done" | "held" | "claimed" | "not_allowlisted" | "unassigned" | "malformed";
 
 /**
  * Why a line is held:

@@ -121,7 +121,7 @@ export function classifyAgent(
 /**
  * Find ready work from the available sources.
  * Ready work is a task that:
- * - Is not assigned to any agent
+ * - Is not assigned to any agent (unassigned state)
  * - Is not done
  * - Has no unmet dependencies (in the plan)
  */
@@ -134,12 +134,12 @@ export function findReadyWork(
   const ready: ReadyWork[] = [];
 
   if (sources.includes("tasks_file")) {
-    // Tasks in the tasks file that have no agent or whose agent is not allowlisted
+    // Tasks in the tasks file that are unassigned (ready for any agent)
     for (const line of tasksFileLines) {
-      if (line.state === "not_allowlisted" || (line.agent === null && line.task)) {
+      if (line.state === "unassigned" && line.task) {
         ready.push({
           source: "tasks_file",
-          task: line.task ?? "unknown",
+          task: line.task,
           description: line.description ?? undefined,
         });
       }

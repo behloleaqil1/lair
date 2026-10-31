@@ -515,7 +515,7 @@ export class QueueLines {
 // ============ THE TASKS FILE ============
 
 export type TasksFileEntry =
-  | { kind: "task"; line: number; agent: string; name: string; task: string; description: string }
+  | { kind: "task"; line: number; agent: string | null; name: string; task: string; description: string }
   | { kind: "malformed"; line: number; text: string; reason: string };
 
 /**
@@ -547,8 +547,9 @@ export function parseTasksFile(content: string, onePerAgent = false): TasksFileE
     }
     const [agent, name, task] = fields.slice(0, 3).map((field) => field.trim());
     const description = fields.slice(3).join("|").trim();
-    if (!isValidDragonId(agent)) {
-      bad(`${agent || "(empty)"} is not a valid agent id`);
+    // Empty agent means unassigned task (ready work); non-empty must be valid
+    if (agent !== "" && !isValidDragonId(agent)) {
+      bad(`${agent} is not a valid agent id`);
       continue;
     }
     if (!isValidTaskId(task)) {
@@ -570,18 +571,21 @@ export function parseTasksFile(content: string, onePerAgent = false): TasksFileE
       continue;
     }
     taskLines.set(task, line);
-    agentLines.set(agent.toLowerCase(), line);
-    entries.push({ kind: "task", line, agent, name: name || agent, task, description });
+    // Only track agent lines for non-empty agents (unassigned tasks don't conflict)
+    if (agent !== "") {
+      agentLines.set(agent.toLowerCase(), line);
+    }
+    entries.push({ kind: "task", line, agent: agent || null, name: name || (agent || "unassigned"), task, description });
   }
   return entries;
 }
 
 /** A tasks_file line as written (its fields trimmed): a done task stays done while it is unchanged. */
-function lineHash(entry: { agent: string; name: string; task: string; description: string }): string {
-  return sha256(Buffer.from([entry.agent, entry.name, entry.task, entry.description].join("\u0000"), "utf-8")).slice(0, 16);
+function lineHash(entry: { agent: string | null; name: string; task: string; description: string }): string {
+  return sha256(Buffer.from([entry.agent ?? "", entry.name, entry.task, entry.description].join("\u0000"), "utf-8")).slice(0, 16);
 }
 
-/** The fields of a tasks_file line. */
+/** The fields of a tasks_file line with an assigned agent (for done checks, queue windows). */
 export type TaskLineFields = { agent: string; name: string; task: string; description: string };
 
 /** The key of the fill_done event that keeps a task done for its latest run and this line as written. */
@@ -1117,16 +1121,6 @@ export class AgentsFill {
           decisionId: null,
         });
       };
-      const hold = async (kind: FillHold, reason: string, runId: string | null = null, waiting: FillWaitingView | null = null) => {
-        show("held", reason, runId, kind, waiting);
-        if (this.holds.get(key) === kind) return;
-        this.holds.set(key, kind);
-        await this.options.record(
-          "fill_held",
-          { agent, task, summary: `fill holds ${agent} on ${task}: ${reason}`, evidence: [reason], data: { line, hold: kind, reason } },
-          probes.clock.now(),
-        );
-      };
       // This line's hold stands on the decision with this key: keep it, and show it on the line
       const standOn = (decisionKey: string) => {
         wanted.add(decisionKey);
@@ -1134,12 +1128,34 @@ export class AgentsFill {
         const view = views[views.length - 1];
         if (view && view.task === task) view.decisionId = decision?.status === "open" ? decision.id : null;
       };
+
+      // Unassigned task (no agent in tasks file): ready work, but fill can't start it
+      if (agent === null) {
+        show("unassigned", "no agent assigned: ready work for any agent");
+        continue;
+      }
+      // After this point, agent is guaranteed to be a string (non-null)
+      // Create variables with proper non-null types for use in closures and functions
+      const agentId: string = agent;
+      const assignedEntry: TaskLineFields = { agent: agentId, name, task, description };
+      
+      // Define closures that use the narrowed agentId
+      const holdTask = async (kind: FillHold, reason: string, runId: string | null = null, waiting: FillWaitingView | null = null) => {
+        show("held", reason, runId, kind, waiting);
+        if (this.holds.get(key) === kind) return;
+        this.holds.set(key, kind);
+        await this.options.record(
+          "fill_held",
+          { agent: agentId, task, summary: `fill holds ${agentId} on ${task}: ${reason}`, evidence: [reason], data: { line, hold: kind, reason } },
+          probes.clock.now(),
+        );
+      };
       // One decision per hold that needs the owner: raised once, kept while the hold lasts
-      const ask = async (run: AgentRun | null, decisionKey: string, question: HoldQuestion) => {
-        await this.raiseHold(run, agent, task, decisionKey, question);
+      const askOwner = async (run: AgentRun | null, decisionKey: string, question: HoldQuestion) => {
+        await this.raiseHold(run, agentId, task, decisionKey, question);
         standOn(decisionKey);
       };
-
+      
       if (!allowed.has(agent)) {
         show("not_allowlisted", `${agent} is not in agents.fill.agents: fill never starts it`);
         continue;
@@ -1160,7 +1176,7 @@ export class AgentsFill {
       }
 
       // Lines that name only the agent end where its next run on another task began (an owner's run, say)
-      const until = queueWindowEnd(store, project, settings, entry, latest);
+      const until = queueWindowEnd(store, project, settings, assignedEntry, latest);
 
       // The owner's last release of the task, and their pause (the owner's own hold) when it is newer
       const release = store.listEvents(project, { kinds: ["fill_released"], task, limit: 1 })[0];
@@ -1168,11 +1184,11 @@ export class AgentsFill {
       // A refusal needs the owner: one decision per refusal and release ("Start it again" that is refused again asks again)
       const refused = async (reason: string, question: string, context: string[]) => {
         if (paused) {
-          await hold("paused", paused, latest?.id ?? null);
+          await holdTask("paused", paused, latest?.id ?? null);
           return;
         }
-        await hold("refused", reason);
-        await ask(latest, fillRefusedKey(task, release?.id ?? "0", latest?.id ?? null), {
+        await holdTask("refused", reason);
+        await askOwner(latest, fillRefusedKey(task, release?.id ?? "0", latest?.id ?? null), {
           code: "probe_failed",
           question,
           context,
@@ -1187,7 +1203,7 @@ export class AgentsFill {
       // Done: kept once seen (for this latest run and this line as written), else from the queue file
       let check: DoneCheck;
       try {
-        check = checkDone(store, project, queue, settings, entry, latest, until);
+        check = checkDone(store, project, queue, settings, assignedEntry, latest, until);
       } catch (e) {
         await refused(
           `done_pattern: ${message(e)}`,
@@ -1210,8 +1226,8 @@ export class AgentsFill {
             runId: latest?.id,
             summary: `fill: ${task} is done: ${oneLine(done)}`,
             evidence: [done],
-            data: { line: done, runId: latest?.id ?? null, lineHash: lineHash(entry) },
-            dedupeKey: fillDoneKey(task, latest?.id ?? null, entry),
+            data: { line: done, runId: latest?.id ?? null, lineHash: lineHash(assignedEntry) },
+            dedupeKey: fillDoneKey(task, latest?.id ?? null, assignedEntry),
           },
           probes.clock.now(),
         );
@@ -1221,7 +1237,7 @@ export class AgentsFill {
 
       // The owner chose to leave it: nothing waits for them, and nothing starts until they release it
       if (paused) {
-        await hold("paused", paused, latest?.id ?? null);
+        await holdTask("paused", paused, latest?.id ?? null);
         continue;
       }
 
@@ -1234,15 +1250,15 @@ export class AgentsFill {
         const runs = ["Runs:", `- Run ${short(latest.id)}: ${latest.state}: ${oneLine(latest.detail)}`];
         if (latest.state === "lost_claim" && !this.claimReleasedByOwner(latest)) {
           const reason = `its run ${short(latest.id)} lost its claim (${oneLine(latest.detail)}), not released by you: fill leaves the task to you`;
-          await hold("owner", reason, latest.id);
-          await ask(latest, fillDecisionKey(task, latest.id), {
+          await holdTask("owner", reason, latest.id);
+          await askOwner(latest, fillDecisionKey(task, latest.id), {
             code: "repeated_failure",
             question: `${agent} is paused on ${task}: its run lost its claim to the task, and you did not release it`,
             context: runs,
           });
           continue;
         }
-        await hold(
+        await holdTask(
           "owner",
           `its last run ${short(latest.id)} ended ${latest.state} (${oneLine(latest.detail)}): fill leaves the task to you (answer its decision, start a run, or release the hold)`,
           latest.id,
@@ -1256,7 +1272,7 @@ export class AgentsFill {
           standOn(escalationKey);
           continue;
         }
-        await ask(latest, fillDecisionKey(task, latest.id), {
+        await askOwner(latest, fillDecisionKey(task, latest.id), {
           code: "repeated_failure",
           question: `${agent} is paused on ${task}: ${howItEnded(latest)}`,
           context: [
@@ -1274,8 +1290,8 @@ export class AgentsFill {
         latest && latest.state === "completed" && latest.id !== releasedRun ? await this.runStatus(latest, agent, task, queue, until) : null;
       if (latest && status?.kind === "blocked") {
         const reason = `blocked: ${oneLine(status.line)}: fill leaves the task to you (release the hold once it is unblocked)`;
-        await hold("blocked", reason, latest.id);
-        await ask(latest, fillDecisionKey(task, latest.id, "blocked"), {
+        await holdTask("blocked", reason, latest.id);
+        await askOwner(latest, fillDecisionKey(task, latest.id, "blocked"), {
           code: "blocked_reported",
           question: `${agent} is paused on ${task}: it reported the task blocked`,
           context: [`Run ${short(latest.id)} ended ${iso(latest.endedAt ?? latest.requestedAt)} on this line:`, "", ...asData(status.line)],
@@ -1287,12 +1303,12 @@ export class AgentsFill {
       // N runs in a row without progress: held, and one decision with them and the last output
       const holdNoDone = async (run: AgentRun, completions: AgentRun[]) => {
         const count = completions.length;
-        await hold(
+        await holdTask(
           "no_done",
           `its last ${count} run(s) exited 0 without progress (no done line, or waiting on nothing that came; agents.fill.max_completions_without_done is ${settings.maxCompletionsWithoutDone}): fill leaves the task to you`,
           run.id,
         );
-        await ask(run, fillDecisionKey(task, run.id), {
+        await askOwner(run, fillDecisionKey(task, run.id), {
           code: "exit0_no_report",
           question: `${agent} is paused on ${task}: its last ${count} run(s) ended without reporting it done`,
           context: [
@@ -1352,13 +1368,13 @@ export class AgentsFill {
             : wait.kind === "woken"
               ? `waiting: ${on} since ${iso(since)}`
               : wait.detail;
-          await hold(
+          await holdTask(
             "waited_too_long",
             `${what}; its runs have been waiting since ${iso(streakStart)}, over ${over}: fill leaves the task to you`,
             latest.id,
             view,
           );
-          await ask(latest, waitingKey, {
+          await askOwner(latest, waitingKey, {
             code: "fill_waiting",
             question: `${agent} is paused on ${task}: it has waited on ${on} since ${iso(streakStart)}`,
             context: [
@@ -1395,14 +1411,14 @@ export class AgentsFill {
           );
         } else if (wait.kind === "pending") {
           const detail = queued ? `waiting: ${queuedText(queued)}; starts again once ${wait.file} exists` : wait.detail;
-          await hold("waiting", detail, latest.id, { ...wait.view, queued: queuedView });
+          await holdTask("waiting", detail, latest.id, { ...wait.view, queued: queuedView });
           continue;
         } else {
           // Waiting on nothing that came: a run without progress, counted and backed off
           const count = completions.length;
           const at = Math.max(wait.fallbackAt ?? 0, since + backoffMs(Math.max(count, 1), settings.backoffSeconds, settings.maxBackoffSeconds));
           if (now < at) {
-            await hold(
+            await holdTask(
               "waiting",
               `${wait.detail}${queued ? `; ${queuedText(queued)}` : ""}; counted as a run without progress (${count} of ${settings.maxCompletionsWithoutDone}): starting it again at ${iso(at)}`,
               latest.id,
@@ -1421,7 +1437,7 @@ export class AgentsFill {
         if (count >= 1) {
           const at = (latest.endedAt ?? latest.requestedAt) + backoffMs(count, settings.backoffSeconds, settings.maxBackoffSeconds);
           if (now < at) {
-            await hold(
+            await holdTask(
               "backoff",
               `its last run ${short(latest.id)} exited 0 without reporting it done (${count} of ${settings.maxCompletionsWithoutDone}): starting it again at ${iso(at)}`,
               latest.id,
@@ -1433,31 +1449,31 @@ export class AgentsFill {
 
       const busy = store.activeRunForAgent(project, agent);
       if (busy) {
-        await hold("busy", `${agent} is busy: run ${short(busy.id)} on ${busy.task} is ${busy.state}`);
+        await holdTask("busy", `${agent} is busy: run ${short(busy.id)} on ${busy.task} is ${busy.state}`);
         continue;
       }
       if (this.options.readOnly()) {
-        await hold("read_only", "the project is read_only: Lair starts no agents");
+        await holdTask("read_only", "the project is read_only: Lair starts no agents");
         continue;
       }
       if (active >= settings.maxActive) {
-        await hold("max_active", `max_active: ${active} run(s) fill started are active (max_active ${settings.maxActive})`);
+        await holdTask("max_active", `max_active: ${active} run(s) fill started are active (max_active ${settings.maxActive})`);
         continue;
       }
       // Native capacity checks (per-agent and per-task, based on class and heavy work)
       const nativeCapacity = await this.checkNativeCapacity(agent, task, capacityState);
       if (nativeCapacity !== null) {
-        await hold(nativeCapacity.hold, nativeCapacity.reason);
+        await holdTask(nativeCapacity.hold, nativeCapacity.reason);
         continue;
       }
       // Legacy capacity_cmd check (same for all agents)
       if (noCapacity !== null) {
-        await hold("capacity", noCapacity);
+        await holdTask("capacity", noCapacity);
         continue;
       }
       const prompt = buildPrompt(settings.promptFiles, promptsDir, { agent, task });
       if (!prompt.ok) {
-        await hold("prompt", prompt.reason);
+        await holdTask("prompt", prompt.reason);
         continue;
       }
       if (settings.capacityCmd) {
@@ -1465,7 +1481,7 @@ export class AgentsFill {
         if (signal.aborted) break;
         if (reason !== null) {
           noCapacity = reason;
-          await hold("capacity", reason);
+          await holdTask("capacity", reason);
           continue;
         }
       }
@@ -1487,7 +1503,7 @@ export class AgentsFill {
           },
           probes.clock.now(),
         );
-        await hold("conflict", reason);
+        await holdTask("conflict", reason);
         continue;
       }
 
@@ -1498,7 +1514,7 @@ export class AgentsFill {
         const why = message(e);
         if (why.startsWith("Over budget")) {
           // The hard limit's own spend decision asks the owner, and the refusal ends with the budget period
-          await hold("refused", `the run request was refused: ${why}`);
+          await holdTask("refused", `the run request was refused: ${why}`);
           continue;
         }
         await refused(`the run request was refused: ${why}`, `${agent} can't start ${task}: ${oneLine(why, 120)}`, [
