@@ -6,3 +6,6 @@ local/
 *.log
 .agent/
 data/
+
+# The genericity guard's private denylist (CONTRIBUTING.md): never committed
+.generic-denylist
