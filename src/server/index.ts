@@ -15,6 +15,7 @@ import { isValidDragonId } from "./parsers/dragon-config.js";
 import { registerRootGuards, requireValidIdParam } from "./root-guards.js";
 import { mountDecisions } from "./decisions/index.js";
 import { mountBrainTrainer } from "./brain-trainer/index.js";
+import { mountOutcomeTracker } from "./outcomes/index.js";
 import { loadNotificationConfig, mountNotifications } from "./notifications/index.js";
 import { notificationsOn } from "./notifications/config.js";
 import {
@@ -562,6 +563,16 @@ await mountNotifications(fastify, {
   inbox: decisionInbox,
   humanAuth,
   dashboardUrl: dashboardUrlFor(HOST, PORT),
+});
+
+// Outcome tracker (src/server/outcomes/): off unless data/server.yaml sets outcome_tracker.enabled. Records whether each
+// answered decision turned out good, bad or unknown (the labels the brain trainer reads). It listens to events and may
+// only list answers waiting for a verdict and record it: it never answers, retries or reverts anything.
+mountOutcomeTracker(fastify, {
+  configPath: join(process.cwd(), "data", "server.yaml"),
+  dbPath: join(process.cwd(), "data", "outcomes.db"),
+  decisions: decisionInbox,
+  events: getEventBus(),
 });
 
 // Brain trainer (src/server/brain-trainer/): off unless data/server.yaml sets brain_trainer.enabled. A nightly
