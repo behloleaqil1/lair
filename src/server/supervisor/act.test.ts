@@ -49,7 +49,14 @@ function makeDecision(overrides: Partial<Decision> = {}): Decision {
 
 function makeAgentsStore() {
   const runs = new Map<string, { id: string; chainId: string; detail: string; state: string }>();
-  const events: Array<{ kind: string; task: string; summary: string; runId?: string }> = [];
+  const events: Array<{
+    kind: string;
+    task: string;
+    summary: string;
+    runId?: string;
+    evidence?: string[];
+    data?: { hold?: string; line?: string };
+  }> = [];
 
   return {
     latestRunForTask: (project: string, task: string) => runs.get(task) ?? null,
@@ -62,8 +69,15 @@ function makeAgentsStore() {
       runs.set(task, { id, chainId, detail, state });
       return id;
     },
-    addEvent: (kind: string, task: string, summary: string, runId?: string) => {
-      events.push({ kind, task, summary, runId });
+    addEvent: (
+      kind: string,
+      task: string,
+      summary: string,
+      runId?: string,
+      evidence?: string[],
+      data?: { hold?: string; line?: string },
+    ) => {
+      events.push({ kind, task, summary, runId, evidence, data });
     },
   };
 }
@@ -154,11 +168,22 @@ describe("isInfraFailure", () => {
 describe("detectHoldInfra", () => {
   it("detects a hold caused by Docker being down", () => {
     const store = makeAgentsStore();
-    store.addRun("feat-login", "Cannot connect to the Docker daemon", "stopped");
+    const runId = store.addRun("feat-login", "stopped", "stopped");
+    // Add a fill_blocked event with evidence (M2 requirement)
+    store.addEvent(
+      "fill_blocked",
+      "feat-login",
+      "BLOCKED: Cannot connect to the Docker daemon",
+      runId,
+      ["BLOCKED: Cannot connect to the Docker daemon"],
+      { hold: "blocked" },
+    );
 
     const decision = makeDecision({
       source: { module: "agents", ref: "task:feat-login" },
       blocks: ["agents:test:task:feat-login"],
+      // S5 fix: fill-specific key pattern
+      key: "fill:test:feat-login:blocked",
     });
 
     const evidence = detectHoldInfra(decision, store as any, "test");
@@ -179,15 +204,26 @@ describe("detectHoldInfra", () => {
 
   it("returns null when failure includes test failures (c)", () => {
     const store = makeAgentsStore();
-    store.addRun("feat-login", "Tests FAILED: 2 assertions failed", "stopped");
+    const runId = store.addRun("feat-login", "stopped", "stopped");
+    // Add a fill_blocked event with test failure in evidence
+    store.addEvent(
+      "fill_blocked",
+      "feat-login",
+      "Tests FAILED: 2 assertions failed",
+      runId,
+      ["Tests FAILED: 2 assertions failed"],
+      { hold: "blocked" },
+    );
 
     const decision = makeDecision({
       source: { module: "agents", ref: "task:feat-login" },
       blocks: ["agents:test:task:feat-login"],
+      // S5 fix: fill-specific key pattern
+      key: "fill:test:feat-login:blocked",
     });
 
     const evidence = detectHoldInfra(decision, store as any, "test");
-    expect(evidence).toBeNull();
+    expect(evidence).toBeNull(); // Null because of code failure pattern
   });
 });
 
