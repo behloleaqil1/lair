@@ -96,7 +96,8 @@ function isAllowedEmail(email: string): boolean {
     lower.endsWith("@example.org") ||
     lower.endsWith("@example.net") ||
     lower.endsWith("@test.com") ||
-    lower.endsWith("@localhost")
+    lower.endsWith("@localhost") ||
+    lower.endsWith(".example") // RFC 2606 reserved TLD
   ) {
     return true;
   }

@@ -126,6 +126,17 @@ const anotherTest = "user@example.org";`,
     expect(result.code).toBe(0);
   });
 
+  it("allows .example TLD email addresses (RFC 2606)", () => {
+    writeFileSync(
+      join(tempDir, "src", "test-data.ts"),
+      `const sshUser = "builder@laptop.example";
+const anotherExample = "admin@server.example";`,
+    );
+
+    const result = runCheck();
+    expect(result.code).toBe(0);
+  });
+
   it("fails on denylisted words when denylist exists", () => {
     // Create a denylist with hash of "secretproject"
     // SHA-256 of "secretproject" (lowercase)

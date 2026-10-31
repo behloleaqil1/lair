@@ -3,8 +3,6 @@
 # Fix these and remove from baseline to reduce technical debt
 #
 # Format: file:line:column:kind
-src/server/agents/acceptance.test.ts:5128:54:home-path
-src/server/agents/acceptance.test.ts:5129:55:home-path
 src/server/ai/ai.test.ts:478:8:non-noreply-email
 src/server/ai/ai.test.ts:792:59:home-path
 src/server/ai/ai.test.ts:804:53:home-path
@@ -49,13 +47,6 @@ src/server/settings/units.test.ts:362:28:non-noreply-email
 src/server/supervisor/chat.test.ts:693:27:non-noreply-email
 src/server/supervisor/ops.test.ts:514:24:non-noreply-email
 docs/configuration.md:58:15:home-path
-docs/configuration.md:2133:72:non-noreply-email
-docs/configuration.md:2135:75:non-noreply-email
-docs/configuration.md:2418:9:home-path
-docs/configuration.md:2423:13:home-path
-docs/configuration.md:2427:11:home-path
-docs/configuration.md:2428:11:home-path
-docs/configuration.md:2430:13:home-path
 docs/design/cleanup.md:38:9:home-path
 docs/design/cleanup.md:43:13:home-path
 docs/design/cleanup.md:47:11:home-path
