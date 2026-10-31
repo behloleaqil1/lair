@@ -56,6 +56,7 @@ import { getBudgetManager } from "./fleet/budget.js";
 import { ReviewManager, inboxDecisionSink, registerReviewRoutes } from "./review/index.js";
 import { mountTriage } from "./triage/index.js";
 import { PlacementManager, registerPlacementRoutes } from "./placement/index.js";
+import { HostServicesManager, registerHostServicesRoutes } from "./host-services/index.js";
 import { CloudManager, registerCloudRoutes } from "./cloud/index.js";
 import { InfraMonitorManager, registerInfraMonitorRoutes } from "./infra-monitor/index.js";
 import { ChecksManager, agentRunIsActive, registerChecksRoutes } from "./checks/index.js";
@@ -649,6 +650,17 @@ const reviews = new ReviewManager({
   decisions: inboxDecisionSink(decisionInbox),
 });
 reviews.load(projectEntries);
+
+// Host services: per-machine services with probe and start (duty D13).
+// One per project with `host_services.enabled: true` (off by default).
+// It probes services (a container engine, tunnel daemons) every interval and,
+// in act mode, starts them when down (with a backoff kept in
+// data/host-services/) and holds the pipeline lanes that need them
+const hostServices = new HostServicesManager({ events: getEventBus(), dataDir: join(process.cwd(), "data") });
+hostServices.load(projectEntries);
+// A pipeline job whose lane needs a service that is not up waits (act mode only)
+pipelines.useLaneHolds((project, names) => hostServices.holdFor(project, names));
+
 // The ready guard (agents.fill.ready_guard) reads a project's PRs from its review module's git host
 agents.useReadyFacts((project) => {
   const review = reviews.get(project);
@@ -658,6 +670,8 @@ agents.useReadyFacts((project) => {
 await reviews.useDecisions(decisionInbox);
 // The same for delivery's held services: answering releases the service, as its Release button does
 await delivery.useDecisions(decisionInbox);
+// Host services decisions: a service that keeps failing raises one; recovering withdraws it
+hostServices.useDecisions(decisionInbox);
 // Merges, human reviews, finding resolutions and hold releases need the owner's session
 await registerReviewRoutes(fastify, reviews, () => getDefaultProject(), humanAuth);
 
@@ -719,6 +733,9 @@ const placements = new PlacementManager({
 });
 placements.load(projectEntries);
 await registerPlacementRoutes(fastify, placements, () => getDefaultProject());
+
+// Host services routes
+registerHostServicesRoutes(fastify, hostServices, humanAuth);
 
 // Cloud machines: one per project with `cloud.enabled: true` (off by
 // default). It describes each machine's tagged instance through its
@@ -821,7 +838,7 @@ const { supervisor: selfChecks, chat: supervisorChat } = await mountSupervisor(f
       } catch {
         config = null;
       }
-      return moduleReports({ watchdogs, agents, triage, placements, planner, reviews, delivery, pipelines }, project, config);
+      return moduleReports({ watchdogs, agents, triage, placements, hostServices, planner, reviews, delivery, pipelines }, project, config);
     },
     agentsStore: () => agents.getStore(),
     agentsOn: (project) => agents.get(project) !== undefined,
@@ -852,7 +869,7 @@ const { supervisor: selfChecks, chat: supervisorChat } = await mountSupervisor(f
 // the modules whose part of it changed, without a restart; an invalid one
 // keeps the previous config running and shows in the dashboard's banner
 const reloader = new ConfigReloader({
-  modules: serverModules({ delivery, watchdogs, pipelines, reviews, agents, triage, placements, clouds, planner, supervisor: selfChecks, trackers, infraMonitor }),
+  modules: serverModules({ delivery, watchdogs, pipelines, reviews, agents, triage, placements, hostServices, clouds, planner, supervisor: selfChecks, trackers, infraMonitor }),
   initial: projectEntries,
   events: getEventBus(),
   onAccepted: (project, config) => {
@@ -965,6 +982,8 @@ const stopServer = async (reason: string) => {
   // Stop agent checks: running checks are marked interrupted, stores close
   await checks.stop();
 
+  // Stop host services: probes in progress are cut short
+  await hostServices.stop();
   // Stop infra monitor: any tick in progress is cut short
   await infraMonitor.stop();
 
@@ -1131,6 +1150,14 @@ const start = async () => {
       placed.length > 0
         ? `[placement] Placing jobs for: ${placed.join(", ")}`
         : "[placement] Off (no project sets placement.enabled)",
+    );
+
+    // Start host services (service probes, starts in act mode, lane holds)
+    const hosting = hostServices.start();
+    console.log(
+      hosting.length > 0
+        ? `[host-services] Watching services for: ${hosting.join(", ")}`
+        : "[host-services] Off (no project sets host_services.enabled)",
     );
 
     // Start cloud checks (describe, meter, cost reading, money guard)

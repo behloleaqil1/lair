@@ -793,6 +793,7 @@ Every route that changes something only you should change needs the owner's sess
 | `/api/ai` | everything: the tools' installed and sign-in state per machine, their models, refreshing a list ([AI API](#ai-api)) | nothing |
 | `/api/health/diagnostics`, `/api/supervisor` | everything: the self-checks' results, minting, listing and revoking ops tokens, their audit ([Supervisor API](#supervisor-api)) | nothing (`/api/health` itself stays open) |
 | `/api/ops` | nothing: it takes an [ops token](#the-ops-api), never the owner's session, and grants no CORS | — |
+| `/api/host-services/owner` | the tick, which runs start commands in act mode ([Host services API](#host-services-api)) | the status, the holds and the hold check under `/api/host-services` |
 
 The watchdog's routes are all reads; it acts only inside the server. Lair's own work doesn't go through these routes either: delivery's automatic deploys, the scheduler, the healer and the watchdog's playbooks run inside the server, server code starts pipeline runs with `PipelineManager.startRun` and creates tasks with the job manager, and agents use the fleet bus (`npm run bus`), which works on the bus database directly. The `lair-node` daemon connects over `/ws/node`, not these routes.
 
@@ -2492,6 +2493,106 @@ No route starts or stops a machine or changes the budget: the machines and the b
 
 Events on the bus: `cloud.guard_tripped` (`{project, limit, spend, reason}`), `cloud.trip_cleared` (`{project, trippedAt, limit, spend, by, note}`).
 
+## Host services
+
+> Off by default. With `enabled: true`, Lair probes the services that work needs on each machine (a container engine, a tunnel daemon). In `observe` mode (the default) it reports outages and asks you once when one lasts; in `act` mode it also starts a service that is down and holds the pipeline lanes that need it.
+
+Gates and pipelines need host services to be running: a container engine for containerized runs, a tunnel daemon to reach a remote machine. When one is down, jobs fail with unhelpful errors ("Cannot connect to the Docker daemon") or hang. The host-services module notices the outage, starts the service again (act mode), keeps pipeline jobs that need it from starting while it is down (act mode), and asks you once when it cannot fix it.
+
+```yaml
+host_services:
+  enabled: true
+  mode: observe                    # observe | act
+  interval_seconds: 60             # probe every minute
+  probe_timeout_seconds: 15        # a probe that runs longer is killed: the state is unknown, never up
+  start_timeout_seconds: 30
+  start_delay_seconds: 10          # after a start, probe again this soon (in the same tick)
+  start_grace_seconds: 120         # after a start, the service has this long to come up before it counts as down
+  backoff_max_seconds: 1800        # the wait between starts doubles from start_grace_seconds up to this
+  stable_seconds: 300              # up this long ends the outage: counts reset, its decision is withdrawn
+  max_start_attempts: 3            # starts per outage before Lair stops and asks
+  escalate_after_probes: 5         # failed probes with no start path before Lair asks
+
+  machines:
+    build-1:
+      - name: docker
+        probe: ["docker", "info"]
+        start: ["open", "-a", "Docker"]
+        needed_by: [heavy, light]
+
+      - name: tunnel
+        probe: ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "build-2", "true"]
+        start: ["launchctl", "start", "com.example.tunnel"]
+        needed_by: [remote]
+
+    build-2:
+      - name: docker
+        probe: ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "build-2", "docker", "info"]
+        start: ["ssh", "-o", "BatchMode=yes", "build-2", "sudo", "systemctl", "start", "docker"]
+        needed_by: [remote]
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Enable host services monitoring |
+| `mode` | `observe` \| `act` | `observe` | `observe` probes, reports and asks; `act` also starts services and enforces lane holds |
+| `interval_seconds` | number | `60` | Seconds between probe cycles (10–3600) |
+| `probe_timeout_seconds` | number | `15` | Seconds before a probe is killed (1–120); a killed probe is a failure, whatever it printed |
+| `start_timeout_seconds` | number | `30` | Seconds before a start command is killed (1–300) |
+| `start_delay_seconds` | number | `10` | Seconds after a start before the probe in the same tick (1–300, at most `start_grace_seconds`) |
+| `start_grace_seconds` | number | `120` | Seconds a started service may take to come up: no second start and no "down" before then (10–3600) |
+| `backoff_max_seconds` | number | `1800` | The longest wait between two starts (60–86400) |
+| `stable_seconds` | number | `300` | Seconds a service must stay up before its counts reset and its decision is withdrawn (30–86400) |
+| `max_start_attempts` | number | `3` | Starts per outage before Lair stops starting it and raises a decision (1–20) |
+| `escalate_after_probes` | number | `5` | Failed probes with no start path (observe mode, a read_only project, a probe that times out) before a decision (1–1000) |
+| `machines` | map | `{}` | Per-machine service lists (machine id → service array) |
+
+### Service options
+
+Each service is a map with:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `name` | string | required | Display name (letters, digits, `_`, `-`; max 32) |
+| `probe` | array | required | Argv that exits 0 when the service is up |
+| `start` | array | required | Argv to start the service (act mode only) |
+| `needed_by` | array | `[]` | Pipeline lanes, pipelines, or `<pipeline>.<lane>` jobs that need this service |
+
+The probe and start commands run directly from their argv (no shell, no stdin), on the machine Lair runs on: to probe or start a service on another machine, put the remote command in the argv (for example `ssh`). Each command is killed at its timeout (SIGTERM, then SIGKILL two seconds later), and only the process Lair started is signalled. The probe decides: exit 0 within `probe_timeout_seconds` is up; a timeout is **unknown** (Lair cannot tell, so it never starts the service on it); anything else (an exit code, a program that is missing, more than 1 MB of output) is down.
+
+### How host services works
+
+Every `interval_seconds`, for each service of each machine:
+
+1. **Probe** it and record the state, the exit code and whether it timed out. Its output is never kept.
+2. **Start** (act mode, state down): run `start`, wait `start_delay_seconds`, probe again. A service that is not up yet is **starting** for `start_grace_seconds`: it is not started again in that window, so a slow starter gets one start, not three. If the start command itself fails, the service is down at once. The wait before the next start is `start_grace_seconds`, then doubles per start, up to `backoff_max_seconds`.
+3. **Stop and ask** (one decision per outage, in the [Decision Inbox](#decision-inbox)):
+   - after `max_start_attempts` starts without a stable recovery, Lair stops starting it (state **failing**): `start_failed`, or `flapping` when it came up after a start and went down again before `stable_seconds`;
+   - after `escalate_after_probes` failed probes with no start path: `not_started` (observe mode, or a read_only project), or `probe_timeout` (the probe keeps timing out).
+   Answer **Start it again** / **Ask again later** (`retry`) to clear the counts, or **Leave it to me** (`leave`) to keep Lair from starting it or asking again until it has stayed up for `stable_seconds`.
+4. **Recover**: the first passing probe makes it **up** and releases its lanes; once it has stayed up for `stable_seconds`, the counts reset and the open decision is withdrawn. A service that comes up and dies again keeps its counts, so it is not restarted every tick.
+
+The counts, the last start (and its grace window), the backoff and the open decision are kept in `data/host-services/<project>.json`, so a restart or a config reload neither repeats a start early nor raises a second decision. A file written by a newer Lair is left alone (the states stay in memory and the status says so); an unreadable one is replaced.
+
+### Lane holds
+
+While a service is not up (down, unknown, starting or failing), the names in its `needed_by` are held. In act mode the [gate pipelines](#gate-pipelines) manager does not start a new attempt of a job whose lane, pipeline or `<pipeline>.<lane>` is held: the job waits (`waitReason: "held: docker on build-1 is down since ..."`) and goes on by itself once the probe passes. An attempt already running is never stopped. In observe mode, or while the module is stopped, holds are only reported (`enforced: false`).
+
+A project's own gate runner, which claims requests from its queue by itself, is not held by Lair; it can ask `GET /api/host-services/:project/holds/check?lane=` before it claims.
+
+### Host services API
+
+`GET /api/host-services/:project` (public, read-only): enabled, running, mode, actBlocked reason, whether holds are enforced, config errors, the last tick summaries, services per machine (state, last probe's exit code and timeout, last start, starts, failed probes, next start, holds, decision id), and held lanes. No probe output and no command arguments.
+
+`GET /api/host-services/:project/machines/:machine`: services for one machine.
+
+`GET /api/host-services/:project/holds`: the lanes held now, each with its reason, the outage's start time and whether it is enforced.
+
+`GET /api/host-services/:project/holds/check?lane=`: `{lane, held, enforced, reason}`.
+
+`POST /api/host-services/owner/:project/tick` (owner only: it runs start commands in act mode): run a probe cycle now.
+
+Events on the bus, on a change only: `host-service.down` (`{project, machine, service, cause}`, cause `probe_failed` or `probe_timeout`), `host-service.starting` (`{project, machine, service, attempt}`), `host-service.up` (`{project, machine, service}`), `host-service.decision` (`{project, machine, service, decisionId, code}`).
 ## Infrastructure Monitor
 
 > Off by default. With `enabled: true` and the default `mode: observe`, the infrastructure monitor probes the machines of your gate lanes, watches the jobs on them, and shows what it finds in its status; it raises nothing, runs nothing but its probes, and writes nothing. With `mode: act` it raises one [notice](#action-items-and-notices) per finding in the [Decision Inbox](#decision-inbox), withdraws it once the problem is gone and, with `requeue_cmd`, re-queues a job of a down machine once onto a lane whose machine is up.

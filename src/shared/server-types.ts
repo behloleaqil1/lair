@@ -311,6 +311,11 @@ export type EventType =
   // Bus (src/server/bus/)
   | "bus.report"
   | "bus.message"
+  // Host services (src/server/host-services/)
+  | "host-service.up"
+  | "host-service.down"
+  | "host-service.starting"
+  | "host-service.decision"
   // Checks (src/server/checks/)
   | "check.requested"
   | "check.started"

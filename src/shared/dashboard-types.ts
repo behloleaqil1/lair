@@ -21,6 +21,8 @@ export interface ModuleFlags {
   triage: boolean;
   /** placement.enabled */
   placement: boolean;
+  /** host_services.enabled */
+  hostServices: boolean;
   /** cloud.enabled: cloud machines, their spend and the money guard */
   cloud: boolean;
   /** pipelines: names at least one pipeline */
