@@ -16,6 +16,8 @@ export interface PlannerAgents {
   fillLines(project: string): FillLineView[];
   /** Release fill's no_done hold on `task`, as the planner (an owner hold is refused) */
   releaseFillHold(project: string, task: string): Promise<void>;
+  /** Whether the ready guard accepts a done line as `task`'s report (true when the guard is off) */
+  reportAccepted(project: string, agent: string, task: string, line: string, taskText: string): Promise<boolean>;
 }
 
 /** The agents module as the planner uses it (the service is looked up on every call, so a reload is followed). */
@@ -24,6 +26,7 @@ export function plannerAgentsFrom(manager: AgentsManager): PlannerAgents {
     requestRun: (project, input) => manager.requestRun(project, input),
     store: () => manager.getStore(),
     fillLines: (project) => manager.get(project)?.fillStatus().lines ?? [],
+    reportAccepted: async (project, agent, task, line, taskText) => (await manager.get(project)?.reportAccepted(agent, task, line, taskText)) ?? true,
     releaseFillHold: async (project, task) => {
       const service = manager.get(project);
       if (!service) throw new Error(`the agents module is off for ${project}`);
