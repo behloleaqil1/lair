@@ -27,7 +27,6 @@ import {
 } from "./human-auth/index.js";
 import { registerControlRoutes } from "./routes/controls.js";
 import { registerBusRoutes } from "./routes/bus.js";
-import { getBusStore } from "./bus/index.js";
 import { registerProcessRoutes } from "./routes/processes.js";
 import { registerSettingsRoutes } from "./routes/settings.js";
 import { getSupervisor } from "./services/supervisor.js";
@@ -56,7 +55,7 @@ import { ReviewManager, inboxDecisionSink, registerReviewRoutes } from "./review
 import { mountTriage } from "./triage/index.js";
 import { PlacementManager, registerPlacementRoutes } from "./placement/index.js";
 import { CloudManager, registerCloudRoutes } from "./cloud/index.js";
-import { ChecksManager, registerChecksRoutes } from "./checks/index.js";
+import { ChecksManager, agentRunIsActive, registerChecksRoutes } from "./checks/index.js";
 import { registerDashboardRoutes } from "./dashboard/index.js";
 import type { DashboardSources } from "./dashboard/routes.js";
 import { RequestLatency, mountSupervisor, registerLatencyHook } from "./supervisor/index.js";
@@ -670,26 +669,19 @@ clouds.load(projectEntries);
 await registerCloudRoutes(fastify, clouds, () => getDefaultProject(), humanAuth);
 
 // Agent checks (src/server/checks/): agents test on a runner before they gate.
-// One per project with `checks:` configured (off by default). Tokens come from
-// the bus; a check is bound to the requesting run's branch and sha.
+// One per project with `checks:` configured (off by default). A request needs
+// the run's bus token and a run the agents module has running; a run tests the
+// branch its first accepted check named, and the sha must be on that branch as
+// pushed to the remote.
 const checks = new ChecksManager({
   dbPath: join(process.cwd(), "data"),
   outputDir: join(process.cwd(), "data", "checks-output"),
   events: getEventBus(),
-  getBusStore: (project) => getBusStore(project, join(process.cwd(), "data")),
-  isRunActive: (project, runId) => {
-    const run = agents.getStore()?.getRun(runId);
-    return run !== null && run !== undefined && isActive(run.state);
-  },
-  getRunInfo: (project, runId) => {
-    const run = agents.getStore()?.getRun(runId);
-    if (!run) return null;
-    // AgentRun doesn't store branch; branch binding is validated when both sides have one
-    return { task: run.task, branch: undefined };
-  },
+  isRunActive: (project, runId, agent) => agentRunIsActive(agents.getStore(), project, runId, agent),
 });
 checks.load(projectEntries);
-// Register routes with owner auth for list/stats; POST uses bus token
+// POST takes the run's bus token; GET /:id the token of the run that asked or the owner's session;
+// the list and the stats the owner's session only
 await registerChecksRoutes(fastify, {
   manager: checks,
   defaultProject: () => getDefaultProject(),

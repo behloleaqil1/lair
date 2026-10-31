@@ -2,16 +2,20 @@
  * Checks service: the core logic for running pre-gate checks.
  *
  * Agents request checks with their bus token. The service:
- * - Validates the request (token, selector, limits, run active, branch match)
- * - Queues the check
- * - Runs the guard before each run (not at request time)
- * - Runs the check when a slot is free
+ * - Validates the request (active run, kind, branch, the run's branch, selector, limits)
+ * - Refuses a sha that is not on the branch as pushed to the remote
+ * - Queues the check (fair FIFO per kind, max_concurrent per kind)
+ * - Runs the guard before each run (and again before the infrastructure retry)
+ * - Runs the check, without a shell, in the project's repository
  * - Returns results through long-poll
+ * - Prunes old results and their output directories (off the request path)
  */
+import { join, relative, isAbsolute } from "path";
 import type { EventBus } from "../core/event-bus.js";
 import type { BusTokenBinding } from "../bus/tokens.js";
 import {
   buildCommand,
+  validateBranchName,
   validateSelector,
   type CheckKindConfig,
   type ParsedChecksConfig,
@@ -20,8 +24,9 @@ import {
   EXIT_INFRASTRUCTURE,
   EXIT_GUARD_REFUSED,
 } from "./config.js";
-import { ChecksStore, type CheckRequest, type CheckStatus, LOG_TAIL_LINES, MAX_FAILING_TESTS } from "./store.js";
+import { ChecksStore, CHECK_ID_PATTERN, CHECK_STATUSES, MAX_FAILING_TESTS, type CheckRequest, type CheckStatus } from "./store.js";
 import { parseJUnitFailures } from "./junit.js";
+import type { ShaCheck } from "./git.js";
 
 export interface CheckResult {
   id: string;
@@ -30,6 +35,21 @@ export interface CheckResult {
   failingTests: string[];
   logTail: string;
 }
+
+export interface RetentionSettings {
+  /** Finished checks older than this are pruned */
+  maxAgeMs: number;
+  /** At most this many checks are kept (checks younger than a day are never pruned by count) */
+  maxRows: number;
+  /** How often the prune runs (also once at start) */
+  intervalMs: number;
+}
+
+export const DEFAULT_RETENTION: RetentionSettings = {
+  maxAgeMs: 14 * 24 * 60 * 60 * 1000,
+  maxRows: 10_000,
+  intervalMs: 60 * 60 * 1000,
+};
 
 export interface ChecksServiceOptions {
   store: ChecksStore;
@@ -43,12 +63,11 @@ export interface ChecksServiceOptions {
   outputDir: string;
   /** The project's repository directory (commands run here) */
   repoDir: string;
-  /** Validate that a sha is reachable from a branch on the remote */
-  validateSha: (sha: string, branch: string) => Promise<boolean>;
-  /** Check if a run is still active in the agents module */
-  isRunActive?: (runId: string) => boolean;
-  /** Get the task/branch for a run from the agents module */
-  getRunInfo?: (runId: string) => { task: string; branch?: string } | null;
+  /** Whether a sha is on a branch as pushed to a remote (git.ts shaOnPushedBranch in production) */
+  validateSha: (sha: string, branch: string, remote: string) => Promise<ShaCheck>;
+  /** Whether the run is active in the agents module for this agent (required: there is no permissive default) */
+  isRunActive: (runId: string, agent: string) => boolean;
+  retention?: Partial<RetentionSettings>;
 }
 
 export interface CheckSpawner {
@@ -68,18 +87,22 @@ export interface SpawnResult {
 }
 
 export interface GuardRunner {
-  run(argv: string[], cwd: string, timeoutMs: number): Promise<{ exitCode: number; output: string }>;
+  run(argv: string[], cwd: string, timeoutMs: number): Promise<{ exitCode: number; output: string; timedOut?: boolean }>;
 }
 
 export interface Clock {
   now(): number;
 }
 
+/** The filesystem as the service uses it: every call is async and every read is bounded. */
 export interface ChecksFs {
-  readFile(path: string): string | null;
-  readDir(path: string): string[] | null;
-  exists(path: string): boolean;
-  mkdir(path: string): void;
+  /** At most `maxBytes` of the file as UTF-8, or null when it can't be read */
+  readFile(path: string, maxBytes: number): Promise<string | null>;
+  /** The names in a directory, or null when it can't be read */
+  readDir(path: string): Promise<string[] | null>;
+  mkdir(path: string): Promise<void>;
+  /** Remove a directory and everything in it; no error when it is missing */
+  remove(path: string): Promise<void>;
 }
 
 export type CheckError =
@@ -93,16 +116,61 @@ export type CheckError =
 
 export type CheckServiceResult<T> = { ok: true; data: T } | { ok: false; error: CheckError };
 
-type Waiter = { resolve: (result: CheckResult) => void; timeout: NodeJS.Timeout };
+type Waiter = { wake: () => void; timeout: NodeJS.Timeout };
 
 /** Max waiters per check (long-poll limit) */
 const MAX_WAITERS_PER_CHECK = 10;
 /** Guard timeout in milliseconds */
-const GUARD_TIMEOUT_MS = 30_000;
-/** Branch name validation pattern: no .., no leading - */
-const BRANCH_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
-/** Max refusals per agent per hour (prevent spam) */
-const MAX_REFUSALS_PER_AGENT_HOUR = 100;
+export const GUARD_TIMEOUT_MS = 30_000;
+/** Max refusals per agent per hour; past it nothing more is written for that agent */
+export const MAX_REFUSALS_PER_AGENT_HOUR = 100;
+/** JUnit reads: per file, in total, and how many files */
+export const MAX_JUNIT_FILE_BYTES = 2 * 1024 * 1024;
+export const MAX_JUNIT_TOTAL_BYTES = 8 * 1024 * 1024;
+export const MAX_JUNIT_FILES = 100;
+/** How long stop() waits for checks in flight to end before it returns */
+export const STOP_WAIT_MS = 10_000;
+const HOUR_MS = 60 * 60 * 1000;
+/** Rows this recent are never pruned by count: the hourly and daily limits read them */
+const RATE_WINDOW_MS = 25 * HOUR_MS;
+
+function message(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/** A glob for a file name (* and ?), as a whole-name regex: every other character is literal. */
+function globToRegExp(glob: string): RegExp {
+  const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]");
+  return new RegExp(`^${escaped}$`);
+}
+
+function isInside(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function statusOf(result: SpawnResult): CheckStatus {
+  if (result.timedOut) return "timeout";
+  switch (result.exitCode) {
+    case EXIT_PASS:
+      return "pass";
+    case EXIT_FAIL:
+      return "fail";
+    case EXIT_INFRASTRUCTURE:
+      return "infrastructure";
+    case EXIT_GUARD_REFUSED:
+      return "guard";
+    case 2: // Usage/validation error from the project script
+      return "refused";
+    default:
+      // A signal or any other exit: never a pass
+      return "fail";
+  }
+}
+
+function emptyCounts(): { total: number; byStatus: Record<CheckStatus, number>; byKind: Record<string, number> } {
+  return { total: 0, byStatus: Object.fromEntries(CHECK_STATUSES.map((s) => [s, 0])) as Record<CheckStatus, number>, byKind: {} };
+}
 
 export class ChecksService {
   private store: ChecksStore;
@@ -114,12 +182,19 @@ export class ChecksService {
   private fs: ChecksFs;
   private outputDir: string;
   private repoDir: string;
-  private validateSha: (sha: string, branch: string) => Promise<boolean>;
-  private isRunActive: (runId: string) => boolean;
-  private getRunInfo: (runId: string) => { task: string; branch?: string } | null;
+  private validateSha: (sha: string, branch: string, remote: string) => Promise<ShaCheck>;
+  private isRunActive: (runId: string, agent: string) => boolean;
+  private retention: RetentionSettings;
   private pollWaiters = new Map<string, Waiter[]>();
-  /** Running check ids, for concurrency tracking after restart */
+  /** Checks this instance is running (stop() kills and records them) */
   private runningChecks = new Set<string>();
+  /** Work in flight (runs, sha checks, prunes): stop() waits for it before the store closes */
+  private inflight = new Set<Promise<unknown>>();
+  /** Git calls one at a time (a fetch updates a ref) */
+  private gitQueue: Promise<unknown> = Promise.resolve();
+  private pruneTimer: NodeJS.Timeout | null = null;
+  private pruning = false;
+  private stopped = false;
 
   constructor(options: ChecksServiceOptions) {
     this.store = options.store;
@@ -132,8 +207,8 @@ export class ChecksService {
     this.outputDir = options.outputDir;
     this.repoDir = options.repoDir;
     this.validateSha = options.validateSha;
-    this.isRunActive = options.isRunActive ?? (() => true);
-    this.getRunInfo = options.getRunInfo ?? (() => null);
+    this.isRunActive = options.isRunActive;
+    this.retention = { ...DEFAULT_RETENTION, ...(options.retention ?? {}) };
   }
 
   isEnabled(): boolean {
@@ -141,44 +216,72 @@ export class ChecksService {
   }
 
   /**
-   * Start the service: reconcile running checks from a previous instance.
+   * Start the service: reconcile checks a previous instance left running,
+   * run what is queued, and prune old results now and every interval.
    * Called at server startup.
    */
   start(): void {
     const now = this.clock.now();
-    // Mark any checks left running by a crash as infrastructure failures
+    // Mark any checks left running by a crash or restart as infrastructure failures
     const runningCount = this.store.reconcileRunningChecks("server restarted", now);
     if (runningCount > 0 && this.events) {
       this.events.emit("check.reconciled", { project: this.store.project, count: runningCount });
     }
-    // Process any queued checks
-    for (const kind of this.config.kinds.keys()) {
-      void this.processQueue(kind);
-    }
+    for (const kind of this.config.kinds.keys()) this.pump(kind);
+    this.track(this.prune());
+    this.pruneTimer = setInterval(() => this.track(this.prune()), this.retention.intervalMs);
+    this.pruneTimer.unref?.();
   }
 
   /**
-   * Stop the service: mark running checks as interrupted.
+   * Stop the service: running checks are recorded as interrupted and killed,
+   * waiters are answered, and the work in flight is awaited (at most
+   * STOP_WAIT_MS) so the caller can close the store afterwards.
    */
-  stop(): void {
-    const now = this.clock.now();
-    for (const id of this.runningChecks) {
-      this.store.completeCheck(id, "infrastructure", undefined, [], "server stopping", now);
-      this.spawner.kill(id);
-    }
-    this.runningChecks.clear();
-    // Clear all waiters
-    for (const [id, waiters] of this.pollWaiters) {
-      const check = this.store.getCheck(id);
-      if (check) {
-        const result = this.toCheckResult(check);
-        for (const w of waiters) {
-          clearTimeout(w.timeout);
-          w.resolve(result);
-        }
+  async stop(): Promise<void> {
+    if (!this.stopped) {
+      this.stopped = true;
+      if (this.pruneTimer) clearInterval(this.pruneTimer);
+      this.pruneTimer = null;
+      const now = this.clock.now();
+      for (const id of this.runningChecks) {
+        this.store.completeCheck(id, "infrastructure", undefined, [], "server stopping", now);
+        this.spawner.kill(id);
       }
-      this.pollWaiters.delete(id);
+      for (const waiters of this.pollWaiters.values()) {
+        for (const w of [...waiters]) w.wake();
+      }
+      this.pollWaiters.clear();
     }
+    await this.settle();
+  }
+
+  private async settle(): Promise<void> {
+    if (this.inflight.size === 0) return;
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, STOP_WAIT_MS);
+      timer.unref?.();
+    });
+    await Promise.race([Promise.allSettled([...this.inflight]), deadline]);
+    if (timer) clearTimeout(timer);
+  }
+
+  /** Keep `work` in flight until it settles; errors are logged, never unhandled. */
+  private track<T>(work: Promise<T>, after?: () => void): void {
+    const tracked: Promise<unknown> = work
+      .catch((e) => console.error(`[checks] ${this.store.project}: ${message(e)}`))
+      .finally(() => {
+        this.inflight.delete(tracked);
+        after?.();
+      });
+    this.inflight.add(tracked);
+  }
+
+  private serialGit<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.gitQueue.then(fn, fn);
+    this.gitQueue = next.catch(() => undefined);
+    return next;
   }
 
   async requestCheck(
@@ -188,105 +291,101 @@ export class ChecksService {
     branch: string | undefined,
     tests: string[],
   ): Promise<CheckServiceResult<{ id: string }>> {
-    const now = this.clock.now();
-
-    if (!this.isEnabled()) {
+    if (this.stopped || !this.isEnabled()) {
       return { ok: false, error: { code: "disabled", message: "Checks module is not configured" } };
     }
+    const now = this.clock.now();
+
+    // Refused requests are limited first: past the limit nothing more is written for this agent
+    if (this.store.countAgentRefusals(binding.agent, now - HOUR_MS) >= MAX_REFUSALS_PER_AGENT_HOUR) {
+      return { ok: false, error: { code: "rate_limit", message: "Too many refused requests in the last hour" } };
+    }
+
+    const refuse = (code: CheckError["code"], reason: string): CheckServiceResult<{ id: string }> => {
+      this.store.createRefusedCheck(kind, binding.agent, binding.runId, sha, branch, tests, reason, this.clock.now());
+      return { ok: false, error: { code, message: reason } as CheckError };
+    };
 
     const kindConfig = this.config.kinds.get(kind);
-    if (!kindConfig) {
-      this.store.createRefusedCheck(kind, binding.agent, binding.runId, sha, branch, tests, "unknown kind", now);
-      return { ok: false, error: { code: "bad_request", message: `Unknown check kind: ${kind}` } };
-    }
+    if (!kindConfig) return refuse("bad_request", `Unknown check kind: ${kind}`);
 
-    // Rate limit refusals per agent (before any validation that could be spammed)
-    const hourAgo = now - 60 * 60 * 1000;
-    const refusalCount = this.store.countAgentRefusals(binding.agent, hourAgo);
-    if (refusalCount >= MAX_REFUSALS_PER_AGENT_HOUR) {
-      // Don't record this one to prevent unbounded growth
-      return { ok: false, error: { code: "rate_limit", message: "Too many refused requests" } };
-    }
+    // The run must be active in the agents module (a token that was never revoked is not enough)
+    if (!this.isRunActive(binding.runId, binding.agent)) return refuse("forbidden", "run is no longer active");
 
-    // Verify the run is still active (not just "token not revoked")
-    if (!this.isRunActive(binding.runId)) {
-      const reason = "run is no longer active";
-      this.store.createRefusedCheck(kind, binding.agent, binding.runId, sha, branch, tests, reason, now);
-      return { ok: false, error: { code: "forbidden", message: reason } };
+    if (branch === undefined || branch === "") {
+      return refuse("bad_request", "branch is required: the branch the sha is pushed to");
     }
+    const branchCheck = validateBranchName(branch);
+    if (!branchCheck.valid) return refuse("bad_request", `invalid branch: ${branchCheck.reason}`);
 
-    // Validate branch format
-    if (branch !== undefined && !BRANCH_PATTERN.test(branch)) {
-      const reason = "invalid branch name format";
-      this.store.createRefusedCheck(kind, binding.agent, binding.runId, sha, branch, tests, reason, now);
-      return { ok: false, error: { code: "bad_request", message: reason } };
-    }
-
-    // Check branch binding: the check's branch must match the run's task branch
-    const runInfo = this.getRunInfo(binding.runId);
-    if (runInfo?.branch && branch && runInfo.branch !== branch) {
-      const reason = `branch "${branch}" does not match run's branch "${runInfo.branch}"`;
-      this.store.createRefusedCheck(kind, binding.agent, binding.runId, sha, branch, tests, reason, now);
-      return { ok: false, error: { code: "forbidden", message: reason } };
+    // A run tests one branch: the one its first accepted check named
+    const bound = this.store.getRunBranch(binding.runId);
+    if (bound !== null && bound !== branch) {
+      return refuse("forbidden", `this run tests branch "${bound}", not "${branch}"`);
     }
 
     const selectorResult = validateSelector(tests, kindConfig.tests);
-    if (!selectorResult.valid) {
-      this.store.createRefusedCheck(kind, binding.agent, binding.runId, sha, branch, tests, selectorResult.reason, now);
-      return { ok: false, error: { code: "bad_request", message: selectorResult.reason } };
+    if (!selectorResult.valid) return refuse("bad_request", selectorResult.reason);
+
+    // Limits before git: an agent can't buy unlimited git calls
+    const limited = this.limitReason(binding.agent, kind, kindConfig, now);
+    if (limited) return refuse("rate_limit", limited);
+
+    let shaCheck: ShaCheck;
+    const validation = this.serialGit(() => this.validateSha(sha, branch, kindConfig.remote));
+    this.track(validation);
+    try {
+      shaCheck = await validation;
+    } catch (e) {
+      shaCheck = { ok: false, reason: `sha check error: ${message(e)}` };
     }
-
-    // Check rate limits BEFORE validateSha (which runs git)
-    const hourlyCount = this.store.countAgentHourly(binding.agent, kind, hourAgo);
-    if (hourlyCount >= kindConfig.max_per_agent_per_hour) {
-      const reason = `rate limit: ${hourlyCount}/${kindConfig.max_per_agent_per_hour} per hour`;
-      this.store.createRefusedCheck(kind, binding.agent, binding.runId, sha, branch, tests, reason, now);
-      return { ok: false, error: { code: "rate_limit", message: reason } };
+    if (this.stopped) {
+      return { ok: false, error: { code: "disabled", message: "Checks module is stopping" } };
     }
+    if (!shaCheck.ok) return refuse("forbidden", shaCheck.reason);
 
-    if (kindConfig.budget.daily_limit) {
-      const dayStart = new Date(now).setUTCHours(0, 0, 0, 0);
-      const dailyCount = this.store.countDailyChecks(kind, dayStart);
-      if (dailyCount >= kindConfig.budget.daily_limit) {
-        const reason = `daily budget exceeded: ${dailyCount}/${kindConfig.budget.daily_limit}`;
-        this.store.createRefusedCheck(kind, binding.agent, binding.runId, sha, branch, tests, reason, now);
-        return { ok: false, error: { code: "rate_limit", message: reason } };
-      }
-    }
+    // From here on everything is synchronous: the limits, the binding and the insert can't interleave
+    const at = this.clock.now();
+    if (!this.isRunActive(binding.runId, binding.agent)) return refuse("forbidden", "run is no longer active");
+    const limitedNow = this.limitReason(binding.agent, kind, kindConfig, at);
+    if (limitedNow) return refuse("rate_limit", limitedNow);
+    const runBranch = this.store.bindRunBranch(binding.runId, binding.agent, branch, at);
+    if (runBranch !== branch) return refuse("forbidden", `this run tests branch "${runBranch}", not "${branch}"`);
 
-    // Validate sha is on the branch (now that rate limits passed)
-    const effectiveBranch = branch ?? runInfo?.branch ?? "HEAD";
-    const shaValid = await this.validateSha(sha, effectiveBranch);
-    if (!shaValid) {
-      const reason = `sha is not reachable from branch "${effectiveBranch}"`;
-      this.store.createRefusedCheck(kind, binding.agent, binding.runId, sha, branch, tests, reason, now);
-      return { ok: false, error: { code: "forbidden", message: reason } };
-    }
-
-    // Guard runs at run time, not request time (moved to runCheck)
-
-    const id = this.store.createCheck(kind, binding.agent, binding.runId, sha, branch, tests, now);
-
+    const id = this.store.createCheck(kind, binding.agent, binding.runId, sha, branch, tests, at);
     if (this.events) {
       this.events.emit("check.requested", {
         project: binding.project, id, kind, agent: binding.agent, sha, tests: tests.length,
       });
     }
-
-    void this.processQueue(kind);
+    this.pump(kind);
     return { ok: true, data: { id } };
+  }
+
+  private limitReason(agent: string, kind: string, kindConfig: CheckKindConfig, now: number): string | null {
+    const hourly = this.store.countAgentHourly(agent, kind, now - HOUR_MS);
+    if (hourly >= kindConfig.max_per_agent_per_hour) {
+      return `rate limit: ${hourly}/${kindConfig.max_per_agent_per_hour} per hour`;
+    }
+    const daily = kindConfig.budget.daily_limit;
+    if (daily) {
+      const dayStart = new Date(now).setUTCHours(0, 0, 0, 0);
+      const count = this.store.countDailyChecks(kind, dayStart);
+      if (count >= daily) return `daily budget exceeded: ${count}/${daily}`;
+    }
+    return null;
   }
 
   /**
    * Get a check result, optionally with long-poll.
-   * Token-bound: only the requesting agent or the owner can read it.
+   * Token-bound: only the requesting run's agent or the owner (tokenBinding null) can read it.
    */
   async getCheck(
     id: string,
     tokenBinding: BusTokenBinding | null,
     waitMs?: number,
   ): Promise<CheckServiceResult<CheckResult>> {
-    if (!this.isEnabled()) {
+    if (this.stopped || !this.isEnabled()) {
       return { ok: false, error: { code: "disabled", message: "Checks module is not configured" } };
     }
 
@@ -295,7 +394,6 @@ export class ChecksService {
       return { ok: false, error: { code: "not_found", message: `Check ${id} not found` } };
     }
 
-    // If token provided, verify it matches the check's run/agent
     if (tokenBinding && (tokenBinding.runId !== check.runId || tokenBinding.agent !== check.agent)) {
       return { ok: false, error: { code: "forbidden", message: "Cannot read another agent's check" } };
     }
@@ -304,26 +402,33 @@ export class ChecksService {
       return { ok: true, data: this.toCheckResult(check) };
     }
 
-    // Limit waiters per check
-    const existingWaiters = this.pollWaiters.get(id) ?? [];
-    if (existingWaiters.length >= MAX_WAITERS_PER_CHECK) {
+    const waiters = this.pollWaiters.get(id) ?? [];
+    if (waiters.length >= MAX_WAITERS_PER_CHECK) {
       return { ok: true, data: this.toCheckResult(check) };
     }
 
     return new Promise((resolve) => {
-      const timeout = setTimeout(() => {
-        const waiters = this.pollWaiters.get(id);
-        if (waiters) {
-          const idx = waiters.findIndex((w) => w.timeout === timeout);
-          if (idx >= 0) waiters.splice(idx, 1);
-          if (waiters.length === 0) this.pollWaiters.delete(id);
-        }
-        const current = this.store.getCheck(id);
-        resolve({ ok: true, data: this.toCheckResult(current ?? check) });
-      }, waitMs);
-
-      const waiters = this.pollWaiters.get(id) ?? [];
-      waiters.push({ resolve: (r) => { clearTimeout(timeout); resolve({ ok: true, data: r }); }, timeout });
+      const waiter: Waiter = {
+        wake: () => {
+          clearTimeout(waiter.timeout);
+          const list = this.pollWaiters.get(id);
+          if (list) {
+            const idx = list.indexOf(waiter);
+            if (idx >= 0) list.splice(idx, 1);
+            if (list.length === 0) this.pollWaiters.delete(id);
+          }
+          try {
+            const current = this.store.getCheck(id);
+            resolve(current
+              ? { ok: true, data: this.toCheckResult(current) }
+              : { ok: false, error: { code: "not_found", message: `Check ${id} not found` } });
+          } catch (e) {
+            resolve({ ok: false, error: { code: "disabled", message: `Checks module is stopping: ${message(e)}` } });
+          }
+        },
+        timeout: setTimeout(() => waiter.wake(), waitMs),
+      };
+      waiters.push(waiter);
       this.pollWaiters.set(id, waiters);
     });
   }
@@ -332,29 +437,23 @@ export class ChecksService {
    * List checks (owner only in routes).
    */
   listChecks(options: { kind?: string; agent?: string; sha?: string; status?: CheckStatus; limit?: number }): CheckRequest[] {
-    if (!this.isEnabled()) return [];
+    if (this.stopped || !this.isEnabled()) return [];
     return this.store.listChecks(options);
   }
 
   /**
-   * Get stats (owner only in routes).
+   * Counts by status and kind over the stored checks (owner only in routes).
    */
   getStats(): { total: number; byStatus: Record<CheckStatus, number>; byKind: Record<string, number> } {
-    if (!this.isEnabled()) {
-      return { total: 0, byStatus: { queued: 0, running: 0, pass: 0, fail: 0, infrastructure: 0, timeout: 0, guard: 0, refused: 0 }, byKind: {} };
-    }
-    const all = this.store.listChecks({ limit: 1000 });
-    const byStatus: Record<CheckStatus, number> = { queued: 0, running: 0, pass: 0, fail: 0, infrastructure: 0, timeout: 0, guard: 0, refused: 0 };
-    const byKind: Record<string, number> = {};
-    for (const c of all) { byStatus[c.status]++; byKind[c.kind] = (byKind[c.kind] ?? 0) + 1; }
-    return { total: all.length, byStatus, byKind };
+    if (this.stopped || !this.isEnabled()) return emptyCounts();
+    return this.store.counts();
   }
 
   /**
    * Check if a sha has a passing check of a given kind.
    */
   hasPassingCheck(kind: string, sha: string): boolean {
-    if (!this.isEnabled()) return false;
+    if (this.stopped || !this.isEnabled()) return false;
     return this.store.hasPassingCheck(kind, sha);
   }
 
@@ -363,55 +462,86 @@ export class ChecksService {
       id: check.id,
       status: check.status,
       durationMs: check.durationMs,
-      failingTests: check.failingTests,
-      logTail: this.sanitizeLogTail(check.logTail),
+      failingTests: check.failingTests.map((name) => this.clean(name)),
+      logTail: this.clean(check.refusalReason ?? check.logTail),
     };
   }
 
-  private sanitizeLogTail(log: string): string {
-    // Replace code fences and potential prompt injection patterns
-    return log
+  /**
+   * Cosmetic cleaning of command output for an agent: code fences and
+   * tag-like markup are neutralised. This is not a prompt fence: whatever
+   * puts a result into a prompt must wrap it as data (the bus tool will).
+   */
+  private clean(text: string): string {
+    return text
       .replace(/```/g, "'''")
-      .replace(/<\/?[a-z_-]+[^>]*>/gi, (m) => `[${m.slice(1, -1).replace(/[<>]/g, "")}]`)
-      .slice(-LOG_TAIL_LINES * 200);
+      .replace(/<\/?[a-z_-]+[^>]*>/gi, (m) => `[${m.slice(1, -1).replace(/[<>]/g, "")}]`);
   }
 
-  private async processQueue(kind: string): Promise<void> {
+  /** Start queued checks of a kind while it has free slots. */
+  private pump(kind: string): void {
+    if (this.stopped) return;
     const kindConfig = this.config.kinds.get(kind);
     if (!kindConfig) return;
-    // Use in-memory tracking for running count (survives restart reconciliation)
-    const running = this.store.countRunning(kind);
-    if (running >= kindConfig.max_concurrent) return;
-    const next = this.store.getNextQueued(kind);
-    if (!next) return;
-    await this.runCheck(next, kindConfig);
-    void this.processQueue(kind);
+    while (this.store.countRunning(kind) < kindConfig.max_concurrent) {
+      const next = this.store.getNextQueued(kind);
+      if (!next) return;
+      if (!this.store.startCheck(next.id, this.clock.now())) return;
+      this.runningChecks.add(next.id);
+      this.track(this.runCheck(next, kindConfig), () => {
+        this.runningChecks.delete(next.id);
+        this.pump(kind);
+      });
+    }
+  }
+
+  /** The guard's refusal, or null when the run may start. Fail closed: a timeout or an error refuses. */
+  private async guard(kindConfig: CheckKindConfig): Promise<string | null> {
+    const cmd = kindConfig.budget.guard_cmd;
+    if (!cmd || cmd.length === 0) return null;
+    try {
+      const result = await this.guardRunner.run(cmd, this.repoDir, GUARD_TIMEOUT_MS);
+      if (result.timedOut) return `guard refused: timed out after ${GUARD_TIMEOUT_MS / 1000} s`;
+      if (result.exitCode !== 0) return `guard refused (exit ${result.exitCode}): ${result.output.slice(0, 200)}`;
+      return null;
+    } catch (e) {
+      return `guard error: ${message(e)}`;
+    }
+  }
+
+  /** One run of the command; a spawn error is returned as a string. */
+  private async spawnOnce(
+    argv: string[],
+    check: CheckRequest,
+    checkOutputDir: string,
+    kindConfig: CheckKindConfig,
+    retry: boolean,
+  ): Promise<SpawnResult | string> {
+    try {
+      return await this.spawner.spawn(argv, {
+        cwd: this.repoDir, // Run in the repository, not the output dir
+        env: {
+          CHECK_ID: check.id,
+          CHECK_SHA: check.sha,
+          CHECK_BRANCH: check.branch ?? "",
+          CHECK_AGENT: check.agent,
+          CHECK_OUTPUT_DIR: checkOutputDir,
+          ...(retry ? { CHECK_RETRY: "1" } : {}),
+        },
+        timeoutMs: kindConfig.timeout_seconds * 1000,
+      });
+    } catch (e) {
+      return `spawn error: ${message(e)}`;
+    }
   }
 
   private async runCheck(check: CheckRequest, kindConfig: CheckKindConfig): Promise<void> {
-    const now = this.clock.now();
-    if (!this.store.startCheck(check.id, now)) return;
-    this.runningChecks.add(check.id);
-
-    // Create per-check output directory
-    const checkOutputDir = `${this.outputDir}/${check.id}`;
-    try { this.fs.mkdir(checkOutputDir); } catch { /* ignore */ }
-
-    // Run guard BEFORE spawn (brief: "must exit 0 before a run starts")
-    if (kindConfig.budget.guard_cmd && kindConfig.budget.guard_cmd.length > 0) {
-      try {
-        const guardResult = await this.guardRunner.run(kindConfig.budget.guard_cmd, this.repoDir, GUARD_TIMEOUT_MS);
-        if (guardResult.exitCode !== 0) {
-          const reason = `guard refused: ${guardResult.output.slice(0, 200)}`;
-          this.completeCheck(check.id, "guard", undefined, [], reason);
-          return;
-        }
-      } catch (e) {
-        // Guard failed to run (timeout, error): fail closed
-        const reason = `guard error: ${e instanceof Error ? e.message : String(e)}`;
-        this.completeCheck(check.id, "guard", undefined, [], reason);
-        return;
-      }
+    const checkOutputDir = join(this.outputDir, check.id);
+    try {
+      await this.fs.mkdir(checkOutputDir);
+    } catch (e) {
+      this.completeCheck(check.id, "infrastructure", undefined, [], `cannot create the output directory: ${message(e)}`);
+      return;
     }
 
     const argv = buildCommand(kindConfig.command, {
@@ -427,150 +557,125 @@ export class ChecksService {
       return;
     }
 
+    // The guard must exit 0 before a run starts
+    const refusal = await this.guard(kindConfig);
+    if (refusal) {
+      this.completeCheck(check.id, "guard", undefined, [], refusal);
+      return;
+    }
+    if (this.stopped) return;
+
     if (this.events) {
       this.events.emit("check.started", { project: check.project, id: check.id, kind: check.kind, agent: check.agent });
     }
 
-    let result: SpawnResult;
-    try {
-      result = await this.spawner.spawn(argv, {
-        cwd: this.repoDir, // Run in repo dir, not output dir
-        env: {
-          CHECK_ID: check.id,
-          CHECK_SHA: check.sha,
-          CHECK_BRANCH: check.branch ?? "",
-          CHECK_AGENT: check.agent,
-          CHECK_OUTPUT_DIR: checkOutputDir,
-        },
-        timeoutMs: kindConfig.timeout_seconds * 1000,
-      });
-    } catch (e) {
-      this.completeCheck(check.id, "infrastructure", undefined, [], `spawn error: ${e instanceof Error ? e.message : String(e)}`);
+    let result = await this.spawnOnce(argv, check, checkOutputDir, kindConfig, false);
+    if (typeof result !== "string" && !result.timedOut && result.exitCode === EXIT_INFRASTRUCTURE && !this.stopped) {
+      // Infrastructure: one retry, and the guard decides again before the paid command runs again
+      const again = await this.guard(kindConfig);
+      if (again) {
+        this.completeCheck(check.id, "guard", undefined, [], again);
+        return;
+      }
+      if (this.stopped) return;
+      result = await this.spawnOnce(argv, check, checkOutputDir, kindConfig, true);
+    }
+    if (typeof result === "string") {
+      this.completeCheck(check.id, "infrastructure", undefined, [], result);
       return;
     }
 
-    if (result.timedOut) {
-      this.completeCheck(check.id, "timeout", undefined, [], result.stderr.slice(-2000) || result.stdout.slice(-2000));
-      return;
-    }
-
-    let status: CheckStatus;
-    let failingTests: string[] = [];
-    switch (result.exitCode) {
-      case EXIT_PASS:
-        status = "pass";
-        break;
-      case EXIT_FAIL:
-        status = "fail";
-        if (kindConfig.parse.junit_path) {
-          failingTests = this.readJUnitFailures(checkOutputDir, kindConfig.parse.junit_path);
-        }
-        break;
-      case EXIT_INFRASTRUCTURE:
-        status = await this.retryOnce(check, kindConfig, argv, checkOutputDir);
-        break;
-      case EXIT_GUARD_REFUSED:
-        status = "guard";
-        break;
-      case 2: // Usage/validation error from the project script
-        status = "refused";
-        break;
-      default:
-        status = "fail";
-    }
-    this.completeCheck(check.id, status, result.exitCode, failingTests, (result.stderr || result.stdout).slice(-LOG_TAIL_LINES * 200));
+    const status = statusOf(result);
+    const failingTests =
+      status === "fail" && kindConfig.parse.junit_path
+        ? await this.readJUnitFailures(checkOutputDir, kindConfig.parse.junit_path)
+        : [];
+    const output = result.stderr ? `${result.stdout}\n${result.stderr}` : result.stdout;
+    this.completeCheck(check.id, status, result.exitCode, failingTests, output);
   }
 
   /**
-   * Read JUnit failures from the output directory.
-   * Supports glob patterns (e.g., TEST-*.xml) by reading all matching files.
+   * Read JUnit failures from the check's output directory. `junitPath` is
+   * relative to it; its file name may be a glob (* and ?), e.g.
+   * test-results/TEST-*.xml. Reads are bounded per file, in total and in
+   * number of files.
    */
-  private readJUnitFailures(outputDir: string, junitPath: string): string[] {
+  private async readJUnitFailures(outputDir: string, junitPath: string): Promise<string[]> {
     const failures: string[] = [];
+    const lastSlash = junitPath.lastIndexOf("/");
+    const dir = lastSlash >= 0 ? join(outputDir, junitPath.slice(0, lastSlash)) : outputDir;
+    const name = junitPath.slice(lastSlash + 1);
+    if (!name || !isInside(outputDir, dir)) return [];
 
-    // Check if it's a glob pattern
-    if (junitPath.includes("*")) {
-      // Get the directory and pattern
-      const lastSlash = junitPath.lastIndexOf("/");
-      const dir = lastSlash >= 0 ? `${outputDir}/${junitPath.slice(0, lastSlash)}` : outputDir;
-      const pattern = lastSlash >= 0 ? junitPath.slice(lastSlash + 1) : junitPath;
+    let budget = MAX_JUNIT_TOTAL_BYTES;
+    const readOne = async (path: string): Promise<void> => {
+      const content = await this.fs.readFile(path, Math.min(MAX_JUNIT_FILE_BYTES, budget));
+      if (!content) return;
+      budget -= Buffer.byteLength(content);
+      failures.push(...parseJUnitFailures(content));
+    };
 
-      // Convert glob to regex
-      const regex = new RegExp("^" + pattern.replace(/\*/g, ".*").replace(/\?/g, ".") + "$");
-
-      const files = this.fs.readDir(dir);
-      if (files) {
-        // Limit files read to prevent unbounded work
-        let filesRead = 0;
-        for (const file of files) {
-          if (filesRead >= 100) break;
-          if (regex.test(file)) {
-            const content = this.fs.readFile(`${dir}/${file}`);
-            if (content) {
-              failures.push(...parseJUnitFailures(content));
-              filesRead++;
-            }
-          }
-        }
+    if (name.includes("*") || name.includes("?")) {
+      const regex = globToRegExp(name);
+      const files = ((await this.fs.readDir(dir)) ?? []).filter((file) => regex.test(file)).sort();
+      for (const file of files.slice(0, MAX_JUNIT_FILES)) {
+        if (budget <= 0 || failures.length >= MAX_FAILING_TESTS) break;
+        await readOne(join(dir, file));
       }
     } else {
-      // Single file path
-      const content = this.fs.readFile(`${outputDir}/${junitPath}`);
-      if (content) {
-        failures.push(...parseJUnitFailures(content));
-      }
+      await readOne(join(dir, name));
     }
 
-    // Dedupe and limit
     return [...new Set(failures)].slice(0, MAX_FAILING_TESTS);
   }
 
-  private async retryOnce(check: CheckRequest, kindConfig: CheckKindConfig, argv: string[], checkOutputDir: string): Promise<CheckStatus> {
-    let result: SpawnResult;
-    try {
-      result = await this.spawner.spawn(argv, {
-        cwd: this.repoDir,
-        env: {
-          CHECK_ID: check.id,
-          CHECK_SHA: check.sha,
-          CHECK_BRANCH: check.branch ?? "",
-          CHECK_AGENT: check.agent,
-          CHECK_OUTPUT_DIR: checkOutputDir,
-          CHECK_RETRY: "1",
-        },
-        timeoutMs: kindConfig.timeout_seconds * 1000,
-      });
-    } catch {
-      return "infrastructure";
-    }
-    if (result.timedOut) return "timeout";
-    if (result.exitCode === EXIT_PASS) return "pass";
-    if (result.exitCode === EXIT_FAIL) return "fail";
-    if (result.exitCode === EXIT_GUARD_REFUSED) return "guard"; // Guard on retry = guard, not infra
-    return "infrastructure";
-  }
-
   private completeCheck(id: string, status: CheckStatus, exitCode: number | undefined, failingTests: string[], logTail: string): void {
-    this.runningChecks.delete(id);
-    const now = this.clock.now();
-    this.store.completeCheck(id, status, exitCode, failingTests, logTail, now);
+    // After stop() the check is recorded as interrupted and the store may be closing
+    if (this.stopped) return;
+    this.store.completeCheck(id, status, exitCode, failingTests, logTail, this.clock.now());
     const waiters = this.pollWaiters.get(id);
     if (waiters) {
-      const check = this.store.getCheck(id);
-      if (check) {
-        const r = this.toCheckResult(check);
-        for (const w of waiters) {
-          clearTimeout(w.timeout);
-          w.resolve(r);
-        }
-      }
-      this.pollWaiters.delete(id);
+      for (const w of [...waiters]) w.wake();
     }
     if (this.events) {
       const check = this.store.getCheck(id);
       if (check) {
         this.events.emit("check.completed", { project: check.project, id, kind: check.kind, agent: check.agent, status, durationMs: check.durationMs });
       }
+    }
+  }
+
+  /**
+   * Prune old results (age and count, see RetentionSettings), remove their
+   * output directories, and remove output directories whose check is gone.
+   * Runs at start and on a timer, never on the request path. Returns the
+   * number of checks pruned.
+   */
+  async prune(): Promise<number> {
+    if (this.stopped || this.pruning) return 0;
+    this.pruning = true;
+    try {
+      const now = this.clock.now();
+      const ids = this.store.pruneOldChecks({
+        olderThan: now - this.retention.maxAgeMs,
+        maxRows: this.retention.maxRows,
+        keepSince: now - RATE_WINDOW_MS,
+      });
+      for (const id of ids) {
+        if (this.stopped) return ids.length;
+        await this.fs.remove(join(this.outputDir, id));
+      }
+      // Directories left by a prune that stopped half way (only names shaped like a check id)
+      const names = (await this.fs.readDir(this.outputDir)) ?? [];
+      for (const name of names) {
+        if (this.stopped) break;
+        if (CHECK_ID_PATTERN.test(name) && !this.store.getCheck(name)) {
+          await this.fs.remove(join(this.outputDir, name));
+        }
+      }
+      return ids.length;
+    } finally {
+      this.pruning = false;
     }
   }
 }

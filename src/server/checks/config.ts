@@ -2,12 +2,14 @@
  * Checks module configuration: parsing and validation for `checks:` in project config.
  *
  * Each project defines named check kinds, each with:
- * - command: argv template with placeholders ({sha}, {branch}, {tests}, {agent}, {check_id})
+ * - command: argv template with placeholders ({sha}, {branch}, {tests}, {agent}, {check_id}, {output_dir})
  * - tests: selector validation (pattern, max_count, max_length)
  * - timeout_seconds, max_concurrent, max_per_agent_per_hour
  * - parse: exit code semantics and optional JUnit path
  * - budget: daily limit and guard_cmd
+ * - remote: the git remote a check's branch must be pushed to (default origin)
  */
+import { createContext, Script } from "vm";
 import { z } from "zod";
 
 // ============ Constants ============
@@ -52,8 +54,13 @@ const BudgetSchema = z
   })
   .default({});
 
+/** A git remote name: it reaches git's argv, so no leading dash and no shell characters */
+const REMOTE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
 const CheckKindSchema = z.object({
   command: z.array(z.string()).min(1),
+  /** The remote a check's branch must be pushed to: its sha must be reachable from <remote>/<branch> */
+  remote: z.string().regex(REMOTE_NAME, "remote must be a git remote name").default("origin"),
   tests: SelectorSchema.default({}),
   timeout_seconds: z.number().int().positive().default(DEFAULT_TIMEOUT_SECONDS),
   max_concurrent: z.number().int().positive().default(DEFAULT_MAX_CONCURRENT),
@@ -211,12 +218,62 @@ export function validateSelectorItem(
     }
   }
 
-  // Check against allowlist pattern
-  const regex = new RegExp(config.pattern);
-  if (!regex.test(item)) {
+  // Check against allowlist pattern (the project's regex, time-bounded: the item is the agent's)
+  const matched = matchesWithin(config.pattern, item, PATTERN_TIMEOUT_MS);
+  if (matched === "timeout") {
+    return { valid: false, reason: `selector pattern ${config.pattern} took longer than ${PATTERN_TIMEOUT_MS} ms` };
+  }
+  if (!matched) {
     return { valid: false, reason: `selector item "${item.slice(0, 40)}" does not match pattern ${config.pattern}` };
   }
 
+  return { valid: true };
+}
+
+/** How long the project's selector pattern may take on one item before the request is refused */
+export const PATTERN_TIMEOUT_MS = 100;
+
+const matchContext = createContext({ re: /./, value: "" });
+const matchScript = new Script("re.test(value)");
+
+/**
+ * Test `value` against `pattern` in a vm context with a timeout, so a pattern
+ * that backtracks badly is interrupted instead of stalling the event loop.
+ */
+export function matchesWithin(pattern: string, value: string, timeoutMs: number): boolean | "timeout" {
+  matchContext.re = new RegExp(pattern);
+  matchContext.value = value;
+  try {
+    return matchScript.runInContext(matchContext, { timeout: timeoutMs }) === true;
+  } catch (e) {
+    // Any other error (none is expected from test()) refuses the item too
+    return (e as { code?: unknown }).code === "ERR_SCRIPT_EXECUTION_TIMEOUT" ? "timeout" : false;
+  } finally {
+    matchContext.value = "";
+  }
+}
+
+// ============ Branch names ============
+
+/**
+ * Validate a branch name: it reaches git's argv, a refspec and the command's
+ * {branch} placeholder. A subset of git's check-ref-format rules: starts with
+ * a letter or digit (so no leading dash), only letters, digits, ".", "_", "-"
+ * and "/", no "..", no "//", no segment starting with ".", no trailing "/" or
+ * ".", no ".lock" suffix, and not HEAD.
+ */
+export function validateBranchName(branch: string): { valid: true } | { valid: false; reason: string } {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/.test(branch)) {
+    return { valid: false, reason: "branch must start with a letter or digit and use only letters, digits, . _ - /" };
+  }
+  if (branch.includes("..")) return { valid: false, reason: 'branch must not contain ".."' };
+  if (branch.includes("//")) return { valid: false, reason: 'branch must not contain "//"' };
+  if (branch.split("/").some((part) => part.startsWith("."))) {
+    return { valid: false, reason: 'branch segments must not start with "."' };
+  }
+  if (branch.endsWith("/") || branch.endsWith(".")) return { valid: false, reason: 'branch must not end with "/" or "."' };
+  if (branch.endsWith(".lock")) return { valid: false, reason: 'branch must not end with ".lock"' };
+  if (branch === "HEAD") return { valid: false, reason: "branch must name a branch, not HEAD" };
   return { valid: true };
 }
 

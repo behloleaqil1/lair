@@ -1,19 +1,21 @@
 /**
  * Checks manager: the multi-project container for the checks module.
  *
- * One ChecksService per project with `checks:` configured. Started and stopped
- * by src/server/index.ts. Provides the shared spawner and git validation.
+ * One ChecksService per project with `checks:` configured (off by default).
+ * Started and stopped by src/server/index.ts. Provides the production
+ * boundaries: the process spawner (no shell, own process group, timeout,
+ * bounded output), the guard runner, the async filesystem and git.
  */
-import { execFile } from "child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync } from "fs";
+import { open, readdir, mkdir, rm } from "fs/promises";
 import { join } from "path";
 import type { EventBus } from "../core/event-bus.js";
 import type { ProjectConfig } from "../../shared/types.js";
-import type { BusStore } from "../bus/store.js";
+import type { AgentRun } from "../agents/types.js";
+import { ProcessSpawner } from "../gates/executors/local.js";
 import { parseChecksConfig, type ParsedChecksConfig } from "./config.js";
-import { ChecksService, type CheckSpawner, type SpawnResult, type GuardRunner, type ChecksFs } from "./service.js";
+import { ChecksService, type CheckSpawner, type SpawnResult, type GuardRunner, type ChecksFs, type RetentionSettings } from "./service.js";
 import { ChecksStore } from "./store.js";
-import { signalTree, terminateTree } from "../gates/executors/local.js";
+import { shaOnPushedBranch, type GitResult, type GitRunner } from "./git.js";
 
 export interface ProjectEntry {
   name: string;
@@ -24,207 +26,175 @@ export interface ProjectEntry {
 export interface ChecksManagerOptions {
   /** Directory for checks databases (one per project) */
   dbPath: string;
-  /** Directory for check outputs */
+  /** Directory for check outputs (one subdirectory per project) */
   outputDir: string;
   events?: EventBus;
-  /** Get the bus store for a project */
-  getBusStore: (project: string) => BusStore;
-  /** Check if a run is active (from agents module) */
-  isRunActive?: (project: string, runId: string) => boolean;
-  /** Get run info (from agents module) */
-  getRunInfo?: (project: string, runId: string) => { task: string; branch?: string } | null;
+  /** Whether a run of `agent` in `project` is active in the agents module (required: no permissive default) */
+  isRunActive: (project: string, runId: string, agent: string) => boolean;
+  retention?: Partial<RetentionSettings>;
+}
+
+/**
+ * The agents module's answer for a check request: the run exists, belongs
+ * to this project and agent, and is running. Anything else (no agents store,
+ * an unknown run, another agent's run, a run that ended without its token
+ * being revoked) is not active.
+ */
+export function agentRunIsActive(
+  store: { getRun(id: string): AgentRun | null } | null | undefined,
+  project: string,
+  runId: string,
+  agent: string,
+): boolean {
+  const run = store?.getRun(runId);
+  return !!run && run.project === project && run.agent === agent && run.state === "running";
 }
 
 /** Real clock for production */
 const realClock = { now: () => Date.now() };
 
 /**
- * Real filesystem for production.
+ * Lair's own tokens never reach a check command, its guard or git (the
+ * same list the local gate executor strips, plus the per-run tokens).
  */
-class RealFs implements ChecksFs {
-  readFile(path: string): string | null {
+const STRIPPED_ENV = [
+  "LAIR_NODE_TOKEN",
+  "LAIR_GITHUB_TOKEN",
+  "GITHUB_TOKEN",
+  "GH_TOKEN",
+  "LAIR_BUS_TOKEN",
+  "LAIR_OPS_TOKEN",
+  "LAIR_REVIEW_TOKEN",
+];
+
+export function checkEnvironment(base: NodeJS.ProcessEnv, extra: Record<string, string> = {}): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(base)) {
+    if (value !== undefined && !STRIPPED_ENV.includes(key)) env[key] = value;
+  }
+  return { ...env, ...extra };
+}
+
+/**
+ * The real filesystem: fs/promises only (nothing synchronous on the event
+ * loop), and a file read stops at `maxBytes`.
+ */
+export class NodeChecksFs implements ChecksFs {
+  async readFile(path: string, maxBytes: number): Promise<string | null> {
+    if (maxBytes <= 0) return null;
+    let handle;
     try {
-      return readFileSync(path, "utf8");
+      handle = await open(path, "r");
+      const buffer = Buffer.alloc(maxBytes);
+      let total = 0;
+      while (total < maxBytes) {
+        const { bytesRead } = await handle.read(buffer, total, maxBytes - total, total);
+        if (bytesRead === 0) break;
+        total += bytesRead;
+      }
+      return buffer.subarray(0, total).toString("utf8");
+    } catch {
+      return null;
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
+  }
+
+  async readDir(path: string): Promise<string[] | null> {
+    try {
+      return await readdir(path);
     } catch {
       return null;
     }
   }
 
-  readDir(path: string): string[] | null {
-    try {
-      return readdirSync(path);
-    } catch {
-      return null;
-    }
+  async mkdir(path: string): Promise<void> {
+    await mkdir(path, { recursive: true });
   }
 
-  exists(path: string): boolean {
-    return existsSync(path);
-  }
-
-  mkdir(path: string): void {
-    mkdirSync(path, { recursive: true });
+  async remove(path: string): Promise<void> {
+    await rm(path, { recursive: true, force: true });
   }
 }
 
 /**
- * Real spawner: runs commands without a shell, with timeout and process group kill.
- * Reuses the logic from gates/executors/local.ts.
+ * The real spawner: the gate executors' ProcessSpawner (argv, shell: false,
+ * its own process group, a timeout that stops the whole group, stdout and
+ * stderr each kept as a rolling tail of at most 1 MB, completion on "close")
+ * plus a kill switch per check id for stop().
  */
-class RealSpawner implements CheckSpawner {
-  private killGraceMs = 5000;
-  /** Running check processes by check id */
-  private running = new Map<string, number>();
+export class ChecksProcessSpawner implements CheckSpawner {
+  private running = new Map<string, AbortController>();
+
+  constructor(
+    private processes = new ProcessSpawner(),
+    private baseEnv: NodeJS.ProcessEnv = process.env,
+  ) {}
 
   async spawn(
     argv: string[],
     options: { cwd: string; env: Record<string, string>; timeoutMs: number },
   ): Promise<SpawnResult> {
-    const { spawn } = await import("child_process");
-
-    return new Promise((resolve) => {
-      const [file, ...args] = argv;
-      if (!file) {
-        resolve({ exitCode: -1, stdout: "", stderr: "empty command", timedOut: false, killed: false });
-        return;
-      }
-
-      let settled = false;
-      let stdout = "";
-      let stderr = "";
-      let timedOut = false;
-      let exitCode: number | null = null;
-
-      const finish = (code: number) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        // Remove from running map
-        for (const [id, pid] of this.running) {
-          if (pid === child?.pid) {
-            this.running.delete(id);
-            break;
-          }
-        }
-        resolve({ exitCode: code, stdout, stderr, timedOut, killed: false });
+    const checkId = options.env.CHECK_ID;
+    const abort = new AbortController();
+    if (checkId) this.running.set(checkId, abort);
+    try {
+      const result = await this.processes.run(argv, {
+        cwd: options.cwd,
+        env: checkEnvironment(this.baseEnv, options.env),
+        timeoutMs: options.timeoutMs,
+        signal: abort.signal,
+      });
+      return {
+        exitCode: result.exitCode,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        timedOut: result.timedOut,
+        killed: abort.signal.aborted,
       };
-
-      let child: ReturnType<typeof spawn>;
-      try {
-        child = spawn(file, args, {
-          cwd: options.cwd,
-          env: { ...process.env, ...options.env },
-          shell: false,
-          stdio: ["ignore", "pipe", "pipe"],
-          detached: process.platform !== "win32",
-          windowsHide: true,
-        });
-      } catch (e) {
-        stderr = e instanceof Error ? e.message : String(e);
-        resolve({ exitCode: -1, stdout, stderr, timedOut: false, killed: false });
-        return;
-      }
-
-      const pid = child.pid;
-
-      // Store the check id -> pid mapping if we can find it in env
-      const checkId = options.env.CHECK_ID;
-      if (checkId && pid !== undefined) {
-        this.running.set(checkId, pid);
-      }
-
-      const terminate = () => {
-        if (pid !== undefined) terminateTree(pid, this.killGraceMs);
-      };
-
-      const timer = setTimeout(() => {
-        timedOut = true;
-        terminate();
-      }, Math.max(0, options.timeoutMs));
-
-      child.stdout?.on("data", (data) => {
-        stdout += data.toString().slice(-100000);
-      });
-
-      child.stderr?.on("data", (data) => {
-        stderr += data.toString().slice(-100000);
-      });
-
-      child.on("exit", (code) => {
-        exitCode = code ?? -1;
-        // Kill any remaining children
-        if (pid !== undefined) signalTree(pid, "SIGKILL");
-        finish(exitCode);
-      });
-
-      child.on("error", (err) => {
-        stderr += err.message;
-        finish(-1);
-      });
-    });
+    } finally {
+      if (checkId && this.running.get(checkId) === abort) this.running.delete(checkId);
+    }
   }
 
   kill(checkId: string): void {
-    const pid = this.running.get(checkId);
-    if (pid !== undefined) {
-      terminateTree(pid, this.killGraceMs);
-      this.running.delete(checkId);
-    }
+    this.running.get(checkId)?.abort();
   }
 }
 
-/**
- * Real guard runner: runs guard commands with a timeout.
- */
-class RealGuardRunner implements GuardRunner {
-  async run(argv: string[], cwd: string, timeoutMs: number): Promise<{ exitCode: number; output: string }> {
-    return new Promise((resolve) => {
-      const [file, ...args] = argv;
-      if (!file) {
-        resolve({ exitCode: -1, output: "empty command" });
-        return;
-      }
+/** The real guard runner: the same spawner, so a timeout stops the guard's whole process group. */
+export class ChecksGuardRunner implements GuardRunner {
+  constructor(
+    private processes = new ProcessSpawner(),
+    private baseEnv: NodeJS.ProcessEnv = process.env,
+  ) {}
 
-      execFile(file, args, {
-        cwd,
-        timeout: timeoutMs,
-        maxBuffer: 1024 * 1024,
-        shell: false,
-      }, (error, stdout, stderr) => {
-        if (error) {
-          // execFile error.code is a string (like 'ETIMEDOUT'), but exit code is a number
-          const exitCode = typeof error.code === "number" ? error.code : (error.killed ? -1 : 1);
-          resolve({
-            exitCode,
-            output: (stderr || stdout || error.message).slice(0, 2000),
-          });
-        } else {
-          resolve({ exitCode: 0, output: (stdout || stderr).slice(0, 2000) });
-        }
-      });
-    });
+  async run(argv: string[], cwd: string, timeoutMs: number): Promise<{ exitCode: number; output: string; timedOut: boolean }> {
+    const result = await this.processes.run(argv, { cwd, env: checkEnvironment(this.baseEnv), timeoutMs });
+    return {
+      exitCode: result.exitCode,
+      output: (result.stderr || result.stdout).slice(-2000),
+      timedOut: result.timedOut,
+    };
   }
 }
 
-/**
- * Git-based sha validator: checks if a sha is reachable from a branch.
- */
-function createShaValidator(repoDir: string): (sha: string, branch: string) => Promise<boolean> {
-  return (sha: string, branch: string): Promise<boolean> => {
-    return new Promise((resolve) => {
-      // Use git branch -r --contains to check if sha is on any remote branch,
-      // or git merge-base --is-ancestor to check if sha is an ancestor of the branch
-      execFile("git", ["merge-base", "--is-ancestor", sha, branch], {
-        cwd: repoDir,
-        timeout: 30000,
-      }, (error) => {
-        // Exit 0 = sha is ancestor of branch (valid)
-        // Exit 1 = sha is not ancestor
-        // Exit 128 = bad revision
-        resolve(!error);
-      });
+/** git in the project's repository, through the same spawner (no prompts: a credential prompt would only hang). */
+export class RepoGit implements GitRunner {
+  constructor(
+    private repoDir: string,
+    private processes = new ProcessSpawner(),
+    private baseEnv: NodeJS.ProcessEnv = process.env,
+  ) {}
+
+  async run(args: string[], timeoutMs: number): Promise<GitResult> {
+    const result = await this.processes.run(["git", ...args], {
+      cwd: this.repoDir,
+      env: checkEnvironment(this.baseEnv, { GIT_TERMINAL_PROMPT: "0" }),
+      timeoutMs,
     });
-  };
+    return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr, timedOut: result.timedOut };
+  }
 }
 
 export class ChecksManager {
@@ -232,20 +202,21 @@ export class ChecksManager {
   private dbPath: string;
   private outputDir: string;
   private events?: EventBus;
-  private getBusStore: (project: string) => BusStore;
-  private isRunActive: (project: string, runId: string) => boolean;
-  private getRunInfo: (project: string, runId: string) => { task: string; branch?: string } | null;
-  private spawner = new RealSpawner();
-  private guardRunner = new RealGuardRunner();
-  private fs = new RealFs();
+  private isRunActive: (project: string, runId: string, agent: string) => boolean;
+  private retention?: Partial<RetentionSettings>;
+  private processes = new ProcessSpawner();
+  private spawner = new ChecksProcessSpawner(this.processes);
+  private guardRunner = new ChecksGuardRunner(this.processes);
+  private fs = new NodeChecksFs();
+  /** Projects whose `checks:` block is invalid, with the reason (they stay off) */
+  private problems = new Map<string, string>();
 
   constructor(options: ChecksManagerOptions) {
     this.dbPath = options.dbPath;
     this.outputDir = options.outputDir;
     this.events = options.events;
-    this.getBusStore = options.getBusStore;
-    this.isRunActive = options.isRunActive ?? (() => true);
-    this.getRunInfo = options.getRunInfo ?? (() => null);
+    this.isRunActive = options.isRunActive;
+    this.retention = options.retention;
   }
 
   /** Load project configs and create services for those with checks enabled. */
@@ -254,17 +225,18 @@ export class ChecksManager {
       if (entry.error || !entry.config) continue;
       const config = entry.config;
 
-      // Parse checks config
+      // No `checks:` block: the module stays off for this project
       if (!config.checks) continue;
       const parsed = parseChecksConfig(config.checks);
       if (!parsed.ok) {
-        console.warn(`[checks] ${entry.name}: ${parsed.error}`);
+        this.problems.set(entry.name, parsed.error);
+        console.warn(`[checks] ${entry.name}: not started: ${parsed.error}`);
         continue;
       }
       if (parsed.config.kinds.size === 0) continue;
 
-      // Create store and service
       const store = new ChecksStore(entry.name, join(this.dbPath, `${entry.name}-checks.db`));
+      const git = new RepoGit(config.repo, this.processes);
       const service = new ChecksService({
         store,
         config: parsed.config,
@@ -275,9 +247,9 @@ export class ChecksManager {
         fs: this.fs,
         outputDir: join(this.outputDir, entry.name),
         repoDir: config.repo,
-        validateSha: createShaValidator(config.repo),
-        isRunActive: (runId) => this.isRunActive(entry.name, runId),
-        getRunInfo: (runId) => this.getRunInfo(entry.name, runId),
+        validateSha: (sha, branch, remote) => shaOnPushedBranch(git, sha, branch, remote),
+        isRunActive: (runId, agent) => this.isRunActive(entry.name, runId, agent),
+        retention: this.retention,
       });
 
       this.services.set(entry.name, { service, store, config: parsed.config });
@@ -294,13 +266,18 @@ export class ChecksManager {
     return started;
   }
 
-  /** Stop all services. */
+  /**
+   * Stop all services: no route reaches them from now on, each one records
+   * and kills its running checks and waits for its work in flight, then its
+   * store closes.
+   */
   async stop(): Promise<void> {
-    for (const { service, store } of this.services.values()) {
-      service.stop();
+    const entries = [...this.services.values()];
+    this.services.clear();
+    for (const { service, store } of entries) {
+      await service.stop();
       store.close();
     }
-    this.services.clear();
   }
 
   /** Get the service for a project. */
@@ -308,15 +285,14 @@ export class ChecksManager {
     return this.services.get(project)?.service;
   }
 
-  /** Get status for all projects. */
-  status(): Array<{ project: string; kinds: string[]; enabled: boolean }> {
-    const result: Array<{ project: string; kinds: string[]; enabled: boolean }> = [];
+  /** Get status for all projects (an invalid `checks:` block is listed with its problem). */
+  status(): Array<{ project: string; kinds: string[]; enabled: boolean; problem?: string }> {
+    const result: Array<{ project: string; kinds: string[]; enabled: boolean; problem?: string }> = [];
     for (const [project, { config }] of this.services) {
-      result.push({
-        project,
-        kinds: [...config.kinds.keys()],
-        enabled: true,
-      });
+      result.push({ project, kinds: [...config.kinds.keys()], enabled: true });
+    }
+    for (const [project, problem] of this.problems) {
+      result.push({ project, kinds: [], enabled: false, problem });
     }
     return result;
   }

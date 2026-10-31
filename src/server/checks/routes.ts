@@ -47,6 +47,7 @@ function extractToken(header: string | undefined): string | null {
 const RequestBody = z.object({
   kind: z.string().min(1).max(64),
   sha: z.string().regex(/^[a-f0-9]{40}$/, "sha must be a 40-char hex string"),
+  // Required by the service (a refusal there is audited); validated with validateBranchName
   branch: z.string().max(200).optional(),
   tests: z.array(z.string().min(1).max(500)).min(1).max(100),
 });
@@ -225,6 +226,7 @@ export async function registerChecksRoutes(
           kind: c.kind,
           agent: c.agent,
           sha: c.sha,
+          branch: c.branch,
           status: c.status,
           createdAt: new Date(c.createdAt).toISOString(),
           durationMs: c.durationMs,

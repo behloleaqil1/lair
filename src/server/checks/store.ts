@@ -3,20 +3,23 @@
  *
  * One store per project, owned by the Lair server:
  * - better-sqlite3 in WAL mode for concurrent reads
- * - Every write in a transaction
- * - Survives restarts
+ * - Multi-row writes in a transaction
+ * - Survives restarts; pruned by age and count (pruneOldChecks)
  */
 import Database from "better-sqlite3";
 import { existsSync, mkdirSync } from "fs";
-import { dirname, join } from "path";
-import { randomUUID } from "crypto";
+import { dirname } from "path";
+import { randomBytes } from "crypto";
 
 // ============ Constants ============
 
 export const CHECKS_SCHEMA_VERSION = 1;
-export const MAX_OUTPUT_BYTES = 2 * 1024 * 1024; // 2 MB
 export const MAX_FAILING_TESTS = 50;
 export const LOG_TAIL_LINES = 40;
+/** The longest log tail line kept (characters) */
+export const LOG_TAIL_LINE_CHARS = 400;
+/** A check id: 16 hex characters (also the name of its output directory) */
+export const CHECK_ID_PATTERN = /^[0-9a-f]{16}$/;
 
 // ============ Types ============
 
@@ -29,6 +32,17 @@ export type CheckStatus =
   | "timeout"
   | "guard"
   | "refused";
+
+export const CHECK_STATUSES: readonly CheckStatus[] = [
+  "queued",
+  "running",
+  "pass",
+  "fail",
+  "infrastructure",
+  "timeout",
+  "guard",
+  "refused",
+];
 
 export interface CheckRequest {
   id: string;
@@ -59,6 +73,15 @@ export interface CheckAuditEntry {
   action: "requested" | "started" | "completed" | "refused";
   detail: string;
   createdAt: number;
+}
+
+export interface PruneOptions {
+  /** Finished rows created before this are deleted */
+  olderThan: number;
+  /** Keep at most this many rows ... */
+  maxRows: number;
+  /** ... but never delete a row created at or after this (the rate-limit windows read them) */
+  keepSince: number;
 }
 
 // ============ Schema ============
@@ -94,6 +117,16 @@ const CHECKS_SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_checks_project_kind ON check_requests(project, kind, created_at);
   CREATE INDEX IF NOT EXISTS idx_checks_project_agent ON check_requests(project, agent, created_at);
   CREATE INDEX IF NOT EXISTS idx_checks_sha ON check_requests(project, sha);
+  CREATE INDEX IF NOT EXISTS idx_checks_created ON check_requests(project, created_at);
+
+  -- The branch each run tests: fixed by the run's first accepted check
+  CREATE TABLE IF NOT EXISTS check_run_branches (
+    run_id TEXT PRIMARY KEY,
+    project TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    bound_at INTEGER NOT NULL
+  );
 
   -- Audit log
   CREATE TABLE IF NOT EXISTS checks_audit (
@@ -107,6 +140,7 @@ const CHECKS_SCHEMA = `
     created_at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_checks_audit_project ON checks_audit(project, created_at);
+  CREATE INDEX IF NOT EXISTS idx_checks_audit_check ON checks_audit(check_id);
 `;
 
 // ============ Row types ============
@@ -177,6 +211,19 @@ function toAuditEntry(row: AuditRow): CheckAuditEntry {
   };
 }
 
+/** The last LOG_TAIL_LINES lines, each at most LOG_TAIL_LINE_CHARS characters. */
+export function logTailOf(text: string): string {
+  return text
+    .split(/\r?\n/)
+    .slice(-LOG_TAIL_LINES)
+    .map((line) => (line.length > LOG_TAIL_LINE_CHARS ? line.slice(0, LOG_TAIL_LINE_CHARS) : line))
+    .join("\n");
+}
+
+function newCheckId(): string {
+  return randomBytes(8).toString("hex");
+}
+
 // ============ Store ============
 
 export class ChecksStore {
@@ -186,26 +233,19 @@ export class ChecksStore {
   constructor(project: string, dbPath: string) {
     this.project = project;
 
-    const dir = dirname(dbPath);
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
+    if (dbPath !== ":memory:") {
+      const dir = dirname(dbPath);
+      if (!existsSync(dir)) {
+        mkdirSync(dir, { recursive: true });
+      }
     }
 
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("busy_timeout = 5000");
 
-    this.migrate();
-  }
-
-  private migrate(): void {
-    const row = this.db
-      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='checks_schema'")
-      .get();
-    if (!row) {
-      this.db.exec(CHECKS_SCHEMA);
-    }
-    // Future migrations would go here
+    // Every statement is IF NOT EXISTS / OR IGNORE: safe on every open
+    this.db.exec(CHECKS_SCHEMA);
   }
 
   close(): void {
@@ -224,15 +264,16 @@ export class ChecksStore {
     tests: string[],
     at: number,
   ): string {
-    const id = randomUUID().slice(0, 8);
-    this.db
-      .prepare(
-        `INSERT INTO check_requests (id, project, kind, agent, run_id, sha, branch, tests, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)`,
-      )
-      .run(id, this.project, kind, agent, runId, sha, branch ?? null, JSON.stringify(tests), at);
-
-    this.audit(id, kind, agent, "requested", `tests: ${tests.length}`, at);
+    const id = newCheckId();
+    this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO check_requests (id, project, kind, agent, run_id, sha, branch, tests, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)`,
+        )
+        .run(id, this.project, kind, agent, runId, sha, branch ?? null, JSON.stringify(tests), at);
+      this.audit(id, kind, agent, "requested", `tests: ${tests.length}`, at);
+    })();
     return id;
   }
 
@@ -247,33 +288,33 @@ export class ChecksStore {
     reason: string,
     at: number,
   ): string {
-    const id = randomUUID().slice(0, 8);
-    this.db
-      .prepare(
-        `INSERT INTO check_requests (id, project, kind, agent, run_id, sha, branch, tests, status, created_at, refusal_reason)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'refused', ?, ?)`,
-      )
-      .run(id, this.project, kind, agent, runId, sha, branch ?? null, JSON.stringify(tests), at, reason);
-
-    this.audit(id, kind, agent, "refused", reason, at);
+    const id = newCheckId();
+    this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO check_requests (id, project, kind, agent, run_id, sha, branch, tests, status, created_at, completed_at, refusal_reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'refused', ?, ?, ?)`,
+        )
+        .run(id, this.project, kind, agent, runId, sha, branch ?? null, JSON.stringify(tests), at, at, reason);
+      this.audit(id, kind, agent, "refused", reason, at);
+    })();
     return id;
   }
 
   /** Mark a check as running. */
   startCheck(id: string, at: number): boolean {
-    const result = this.db
-      .prepare(`UPDATE check_requests SET status = 'running', started_at = ? WHERE id = ? AND status = 'queued'`)
-      .run(at, id);
-    if (result.changes > 0) {
+    return this.db.transaction(() => {
+      const result = this.db
+        .prepare(`UPDATE check_requests SET status = 'running', started_at = ? WHERE id = ? AND status = 'queued'`)
+        .run(at, id);
+      if (result.changes === 0) return false;
       const check = this.getCheck(id);
-      if (check) {
-        this.audit(id, check.kind, check.agent, "started", "", at);
-      }
-    }
-    return result.changes > 0;
+      if (check) this.audit(id, check.kind, check.agent, "started", "", at);
+      return true;
+    })();
   }
 
-  /** Complete a check with results. */
+  /** Complete a running check with its results. False when it is not running (already completed or reconciled). */
   completeCheck(
     id: string,
     status: CheckStatus,
@@ -282,32 +323,32 @@ export class ChecksStore {
     logTail: string,
     at: number,
   ): boolean {
-    const check = this.getCheck(id);
-    if (!check || check.status !== "running") {
-      return false;
-    }
+    return this.db.transaction(() => {
+      const check = this.getCheck(id);
+      if (!check || check.status !== "running") return false;
 
-    const durationMs = check.startedAt ? at - check.startedAt : 0;
-    const truncatedTests = failingTests.slice(0, MAX_FAILING_TESTS);
-    const truncatedLog = logTail.slice(-LOG_TAIL_LINES * 200); // ~200 chars per line
+      const durationMs = check.startedAt ? at - check.startedAt : 0;
+      const truncatedTests = failingTests.slice(0, MAX_FAILING_TESTS);
+      const truncatedLog = logTailOf(logTail);
 
-    this.db
-      .prepare(
-        `UPDATE check_requests
-         SET status = ?, completed_at = ?, duration_ms = ?, exit_code = ?, failing_tests = ?, log_tail = ?
-         WHERE id = ?`,
-      )
-      .run(status, at, durationMs, exitCode ?? null, JSON.stringify(truncatedTests), truncatedLog, id);
+      this.db
+        .prepare(
+          `UPDATE check_requests
+           SET status = ?, completed_at = ?, duration_ms = ?, exit_code = ?, failing_tests = ?, log_tail = ?
+           WHERE id = ? AND status = 'running'`,
+        )
+        .run(status, at, durationMs, exitCode ?? null, JSON.stringify(truncatedTests), truncatedLog, id);
 
-    this.audit(
-      id,
-      check.kind,
-      check.agent,
-      "completed",
-      `status=${status}, exit=${exitCode ?? "none"}, duration=${durationMs}ms`,
-      at,
-    );
-    return true;
+      this.audit(
+        id,
+        check.kind,
+        check.agent,
+        "completed",
+        `status=${status}, exit=${exitCode ?? "none"}, duration=${durationMs}ms`,
+        at,
+      );
+      return true;
+    })();
   }
 
   /** Get a check by id. */
@@ -347,18 +388,26 @@ export class ChecksStore {
     params.push(options.limit ?? 100);
 
     const rows = this.db
-      .prepare(`SELECT * FROM check_requests WHERE ${where.join(" AND ")} ORDER BY created_at DESC LIMIT ?`)
+      .prepare(`SELECT * FROM check_requests WHERE ${where.join(" AND ")} ORDER BY created_at DESC, rowid DESC LIMIT ?`)
       .all(...params) as CheckRow[];
 
     return rows.map(toCheckRequest);
   }
 
-  /** Count queued checks for a kind. */
-  countQueued(kind: string): number {
-    const row = this.db
-      .prepare(`SELECT COUNT(*) as n FROM check_requests WHERE project = ? AND kind = ? AND status = 'queued'`)
-      .get(this.project, kind) as { n: number };
-    return row.n;
+  /** Counts by status and by kind, over every stored row. */
+  counts(): { total: number; byStatus: Record<CheckStatus, number>; byKind: Record<string, number> } {
+    const byStatus = Object.fromEntries(CHECK_STATUSES.map((s) => [s, 0])) as Record<CheckStatus, number>;
+    const byKind: Record<string, number> = {};
+    let total = 0;
+    const rows = this.db
+      .prepare(`SELECT kind, status, COUNT(*) as n FROM check_requests WHERE project = ? GROUP BY kind, status`)
+      .all(this.project) as { kind: string; status: string; n: number }[];
+    for (const row of rows) {
+      total += row.n;
+      if (row.status in byStatus) byStatus[row.status as CheckStatus] += row.n;
+      byKind[row.kind] = (byKind[row.kind] ?? 0) + row.n;
+    }
+    return { total, byStatus, byKind };
   }
 
   /** Count running checks for a kind. */
@@ -369,35 +418,35 @@ export class ChecksStore {
     return row.n;
   }
 
-  /** Count checks by an agent in the last hour. */
+  /** Accepted checks of a kind by an agent since `since` (refusals are limited separately). */
   countAgentHourly(agent: string, kind: string, since: number): number {
     const row = this.db
       .prepare(
         `SELECT COUNT(*) as n FROM check_requests
-         WHERE project = ? AND agent = ? AND kind = ? AND created_at >= ?`,
+         WHERE project = ? AND agent = ? AND kind = ? AND created_at >= ? AND status != 'refused'`,
       )
       .get(this.project, agent, kind, since) as { n: number };
     return row.n;
   }
 
-  /** Count all checks for a kind today (since midnight UTC). */
+  /** Accepted checks of a kind since `since` (midnight UTC): refusals never use the daily budget. */
   countDailyChecks(kind: string, since: number): number {
     const row = this.db
       .prepare(
         `SELECT COUNT(*) as n FROM check_requests
-         WHERE project = ? AND kind = ? AND created_at >= ?`,
+         WHERE project = ? AND kind = ? AND created_at >= ? AND status != 'refused'`,
       )
       .get(this.project, kind, since) as { n: number };
     return row.n;
   }
 
-  /** Get the next queued check for a kind. */
+  /** Get the next queued check for a kind (oldest first). */
   getNextQueued(kind: string): CheckRequest | null {
     const row = this.db
       .prepare(
         `SELECT * FROM check_requests
          WHERE project = ? AND kind = ? AND status = 'queued'
-         ORDER BY created_at ASC
+         ORDER BY created_at ASC, rowid ASC
          LIMIT 1`,
       )
       .get(this.project, kind) as CheckRow | undefined;
@@ -416,7 +465,7 @@ export class ChecksStore {
     return !!row;
   }
 
-  /** Count refused requests by an agent in the last hour (for rate limiting refusals). */
+  /** Count refused requests by an agent since `since` (for rate limiting refusals). */
   countAgentRefusals(agent: string, since: number): number {
     const row = this.db
       .prepare(
@@ -427,55 +476,90 @@ export class ChecksStore {
     return row.n;
   }
 
+  // ============ Run branches ============
+
+  /** The branch a run is bound to, or null before its first accepted check. */
+  getRunBranch(runId: string): string | null {
+    const row = this.db
+      .prepare(`SELECT branch FROM check_run_branches WHERE project = ? AND run_id = ?`)
+      .get(this.project, runId) as { branch: string } | undefined;
+    return row?.branch ?? null;
+  }
+
+  /** Bind a run to a branch unless it is bound already. Returns the run's branch (an existing binding wins). */
+  bindRunBranch(runId: string, agent: string, branch: string, at: number): string {
+    return this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO check_run_branches (run_id, project, agent, branch, bound_at) VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run(runId, this.project, agent, branch, at);
+      return this.getRunBranch(runId) ?? branch;
+    })();
+  }
+
+  // ============ Restart and retention ============
+
   /**
    * Reconcile running checks from a previous instance: mark them as infrastructure failures.
    * Called at startup. Returns the count of checks reconciled.
    */
   reconcileRunningChecks(reason: string, at: number): number {
-    const running = this.db
-      .prepare(`SELECT id, kind, agent FROM check_requests WHERE project = ? AND status = 'running'`)
-      .all(this.project) as Array<{ id: string; kind: string; agent: string }>;
+    return this.db.transaction(() => {
+      const running = this.db
+        .prepare(`SELECT id, kind, agent, started_at FROM check_requests WHERE project = ? AND status = 'running'`)
+        .all(this.project) as Array<{ id: string; kind: string; agent: string; started_at: number | null }>;
 
-    for (const row of running) {
-      this.db
-        .prepare(
-          `UPDATE check_requests
-           SET status = 'infrastructure', completed_at = ?, log_tail = ?
-           WHERE id = ?`,
-        )
-        .run(at, reason, row.id);
-      this.audit(row.id, row.kind, row.agent, "completed", `status=infrastructure (reconciled: ${reason})`, at);
-    }
-
-    // Also process any queued checks that are now stale
-    return running.length;
+      for (const row of running) {
+        this.db
+          .prepare(
+            `UPDATE check_requests
+             SET status = 'infrastructure', completed_at = ?, duration_ms = ?, log_tail = ?
+             WHERE id = ?`,
+          )
+          .run(at, row.started_at ? at - row.started_at : 0, reason, row.id);
+        this.audit(row.id, row.kind, row.agent, "completed", `status=infrastructure (reconciled: ${reason})`, at);
+      }
+      return running.length;
+    })();
   }
 
   /**
-   * Prune old checks to keep the database bounded.
-   * Keeps the most recent `keep` checks and deletes older ones.
+   * Prune finished checks: those created before `olderThan`, and the oldest
+   * beyond the newest `maxRows` (never one created at or after `keepSince`).
+   * Queued and running checks are never pruned. Their audit entries go with
+   * them, and run branch bindings older than `olderThan`. Returns the ids
+   * deleted (their output directories are the caller's to remove).
    */
-  pruneOldChecks(keep: number, _at: number): number {
-    // Get the cutoff id
-    const cutoff = this.db
-      .prepare(
-        `SELECT id FROM check_requests WHERE project = ? ORDER BY created_at DESC LIMIT 1 OFFSET ?`,
-      )
-      .get(this.project, keep) as { id: string } | undefined;
+  pruneOldChecks(options: PruneOptions): string[] {
+    return this.db.transaction(() => {
+      const expired = this.db
+        .prepare(
+          `SELECT id FROM check_requests
+           WHERE project = ? AND status NOT IN ('queued', 'running') AND created_at < ?`,
+        )
+        .all(this.project, options.olderThan) as { id: string }[];
+      const overflow = this.db
+        .prepare(
+          `SELECT id FROM (
+             SELECT id, status, created_at FROM check_requests WHERE project = ?
+             ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?
+           ) WHERE status NOT IN ('queued', 'running') AND created_at < ?`,
+        )
+        .all(this.project, Math.max(0, options.maxRows), options.keepSince) as { id: string }[];
 
-    if (!cutoff) return 0;
-
-    // Delete checks older than the cutoff
-    const checkResult = this.db
-      .prepare(`DELETE FROM check_requests WHERE project = ? AND created_at < (SELECT created_at FROM check_requests WHERE id = ?)`)
-      .run(this.project, cutoff.id);
-
-    // Delete audit entries for deleted checks
-    this.db
-      .prepare(`DELETE FROM checks_audit WHERE project = ? AND check_id NOT IN (SELECT id FROM check_requests WHERE project = ?)`)
-      .run(this.project, this.project);
-
-    return checkResult.changes;
+      const ids = [...new Set([...expired, ...overflow].map((row) => row.id))];
+      const deleteCheck = this.db.prepare(`DELETE FROM check_requests WHERE id = ?`);
+      const deleteAudit = this.db.prepare(`DELETE FROM checks_audit WHERE check_id = ?`);
+      for (const id of ids) {
+        deleteCheck.run(id);
+        deleteAudit.run(id);
+      }
+      this.db
+        .prepare(`DELETE FROM check_run_branches WHERE project = ? AND bound_at < ?`)
+        .run(this.project, options.olderThan);
+      return ids;
+    })();
   }
 
   // ============ Audit ============
@@ -492,30 +576,8 @@ export class ChecksStore {
   /** List audit entries. */
   listAudit(limit: number): CheckAuditEntry[] {
     const rows = this.db
-      .prepare(`SELECT * FROM checks_audit WHERE project = ? ORDER BY created_at DESC LIMIT ?`)
+      .prepare(`SELECT * FROM checks_audit WHERE project = ? ORDER BY created_at DESC, id DESC LIMIT ?`)
       .all(this.project, limit) as AuditRow[];
     return rows.map(toAuditEntry);
   }
-}
-
-// ============ Store management ============
-
-const stores = new Map<string, ChecksStore>();
-
-export function getChecksStore(project: string, dataDir: string): ChecksStore {
-  const key = `${dataDir}:${project}`;
-  let store = stores.get(key);
-  if (!store) {
-    const dbPath = join(dataDir, "checks", `${project}.db`);
-    store = new ChecksStore(project, dbPath);
-    stores.set(key, store);
-  }
-  return store;
-}
-
-export function closeChecksStores(): void {
-  for (const store of stores.values()) {
-    store.close();
-  }
-  stores.clear();
 }
