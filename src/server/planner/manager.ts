@@ -7,6 +7,7 @@ import type { ProjectConfig } from "../../shared/types.js";
 import type { PlannerStatusView } from "../../shared/planner-types.js";
 import type { DecisionProducer } from "../decisions/types.js";
 import type { PlannerAgents } from "./agents.js";
+import type { BusLineSource } from "../bus/consumers.js";
 import { parsePlannerConfig } from "./config.js";
 import { DECISION_MODULE, PlannerService } from "./service.js";
 import { PlannerStore } from "./store.js";
@@ -24,6 +25,8 @@ export interface PlannerManagerOptions {
   events?: EventBus;
   /** Replace the clock (tests) */
   clock?: { now(): number };
+  /** The project's bus as the planner reads it (bus.consume observe or on; read at each cycle), or null */
+  bus?: (project: string) => BusLineSource | null;
 }
 
 const systemClock = { now: () => Date.now() };
@@ -64,6 +67,7 @@ export class PlannerManager {
         clock: this.options.clock ?? systemClock,
         events: this.options.events,
         decisions: () => this.producer,
+        bus: this.options.bus ? () => this.options.bus?.(entry.name) ?? null : undefined,
       });
       this.services.set(entry.name, service);
       this.follow(entry.name, service);
@@ -142,6 +146,11 @@ export class PlannerManager {
 
   get(project: string): PlannerService | undefined {
     return this.services.get(project);
+  }
+
+  /** bus.consume on: a cycle now (an accepted bus report, or a message to the orchestrator); nothing when it is off. */
+  cycleSoon(project: string): Promise<void> {
+    return this.services.get(project)?.cycleSoon() ?? Promise.resolve();
   }
 
   /** Projects with the planner on. */

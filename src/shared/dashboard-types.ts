@@ -21,6 +21,8 @@ export interface ModuleFlags {
   triage: boolean;
   /** placement.enabled */
   placement: boolean;
+  /** host_services.enabled */
+  hostServices: boolean;
   /** cloud.enabled: cloud machines, their spend and the money guard */
   cloud: boolean;
   /** pipelines: names at least one pipeline */
@@ -37,6 +39,8 @@ export interface ModuleFlags {
   machines: boolean;
   /** lair-node machines are registered with this server */
   nodes: boolean;
+  /** lessons.enabled: the lessons store and Knowledge view */
+  lessons: boolean;
 }
 
 export interface DashboardModules {

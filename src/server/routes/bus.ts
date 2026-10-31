@@ -28,6 +28,8 @@ import {
   hashBusToken,
   isBusTokenFormat,
   redactBusToken,
+  type BusConsumeMode,
+  type BusConsumerHealth,
   type BusMirrorConfig,
   type BusServiceOptions,
 } from "../bus/index.js";
@@ -35,7 +37,6 @@ import type { ApiResponse, BoardOutput, TaskStatus } from "../../shared/types.js
 import type { ProjectConfig } from "../../shared/types.js";
 import type { ReportKind } from "../../bus/types.js";
 import { z } from "zod";
-import { join } from "path";
 
 function respond<T>(data: T): ApiResponse<T> {
   return {
@@ -92,6 +93,12 @@ const toolSchemas = {
 
 type ToolName = keyof typeof toolSchemas;
 
+/** POST /api/bus/call: a tool call with the run's bus token; the project is the token's when not named */
+interface CallRoute {
+  Body: { tool: string; args: Record<string, unknown> };
+  Querystring: { project?: string };
+}
+
 // ============ Service management ============
 
 const busServices = new Map<string, { service: BusService; store: BusStore }>();
@@ -110,6 +117,29 @@ export interface BusRoutesOptions {
     /** File to touch when dragons should wake (optional bus feature) */
     wake_file?: string;
   };
+  /**
+   * The project's bus.consume (src/server/bus/consumers.ts). While it is off
+   * every bus route but /api/bus/consumers answers 404 for the project, as
+   * without the bus, and no run of it has a bus token.
+   */
+  mode: (project: string) => BusConsumeMode;
+  /** The projects whose bus.consume isn't off (a token is looked up in their stores) */
+  enabled: () => string[];
+  /** The bus consumers' state for Home → Health */
+  health: (project: string) => BusConsumerHealth;
+}
+
+/**
+ * A project's bus store (<dataDir>/bus/<project>.db): the routes, the consumers, the token minting and the
+ * checks (src/server/checks/) all read this one.
+ */
+export function busStoreFor(project: string, dataDir: string): BusStore {
+  return getBusStore(project, dataDir);
+}
+
+/** Drop a project's bus service (its config changed): the next request builds it from the new config. */
+export function forgetBusService(project: string): void {
+  busServices.delete(project);
 }
 
 function getBusService(
@@ -118,7 +148,7 @@ function getBusService(
 ): { service: BusService; store: BusStore } {
   let entry = busServices.get(project);
   if (!entry) {
-    const store = getBusStore(project, join(options.dataDir, "bus"));
+    const store = busStoreFor(project, options.dataDir);
     const config = options.getConfig(project);
 
     // Mirror config from project settings
@@ -192,19 +222,36 @@ async function busRoutes(
   // Refuse cross-site browser requests (CSRF, DNS rebinding) before anything else
   fastify.addHook("onRequest", rejectCrossSiteRequests);
   fastify.addHook("onRequest", projectQueryGuard());
+  // A project whose bus.consume is off has no bus: its routes answer as without one (the consumers' status excepted)
+  fastify.addHook("onRequest", async (request, reply) => {
+    if (request.routeOptions?.url === "/api/bus/consumers") return;
+    const project = (request.query as { project?: unknown }).project;
+    if (typeof project !== "string") return; // /api/bus/call without one: the token's project, checked there
+    if (options.mode(project) !== "off") return;
+    const err = respondError(`the bus is off for ${project}: set bus.consume to observe or on (docs/configuration.md#fleet-bus)`, 404);
+    return reply.code(err.statusCode).send(err);
+  });
+
+  // ============ GET /api/bus/consumers - The bus consumers' state (open, read-only) ============
+
+  fastify.get<{ Querystring: { project: string } }>("/api/bus/consumers", async (request) => respond(options.health(request.query.project)));
 
   // ============ POST /api/bus/call - Agent API ============
 
-  fastify.post<{
-    Body: { tool: string; args: Record<string, unknown> };
-    Querystring: { project: string };
-  }>("/api/bus/call", async (request, reply) => {
-    const project = request.query.project;
-
+  fastify.post<CallRoute>("/api/bus/call", { config: { projectOptional: true } }, async (request, reply) => {
     // Extract and validate token
     const token = extractToken(request.headers.authorization);
     if (!token || !isBusTokenFormat(token)) {
       const err = respondError("Missing or invalid bus token", 401);
+      return reply.code(err.statusCode).send(err);
+    }
+    const hash = hashBusToken(token);
+
+    // The token's project: the one named, else the project whose bus store issued it (`lair bus` names none)
+    const project =
+      request.query.project ?? options.enabled().find((name) => busStoreFor(name, options.dataDir).validateToken(hash) !== null);
+    if (project === undefined || options.mode(project) === "off") {
+      const err = respondError("Invalid or expired bus token", 401);
       return reply.code(err.statusCode).send(err);
     }
 
@@ -212,21 +259,18 @@ async function busRoutes(
     const { service, store } = getBusService(project, options);
 
     // Validate token in store
-    const binding = store.validateToken(hashBusToken(token));
+    const binding = store.validateToken(hash);
     if (!binding) {
       const err = respondError("Invalid or expired bus token", 401);
       return reply.code(err.statusCode).send(err);
     }
 
-    // Verify the run is still active
+    // Verify the run is still active (a project whose agents module is off has no active run)
     const agentService = options.agents.get(project);
-    if (agentService) {
-      const runs = agentService.runs(100);
-      const run = runs.find((r) => r.id === binding.runId);
-      if (!run || !["queued", "waiting_lock", "running"].includes(run.state)) {
-        const err = respondError("Run is no longer active", 401);
-        return reply.code(err.statusCode).send(err);
-      }
+    const run = agentService?.runs(100).find((r) => r.id === binding.runId);
+    if (!run || !["queued", "waiting_lock", "running"].includes(run.state)) {
+      const err = respondError("Run is no longer active", 401);
+      return reply.code(err.statusCode).send(err);
     }
 
     // Parse request

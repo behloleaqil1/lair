@@ -21,6 +21,7 @@ import { PlacementSchema } from "../placement/config.js";
 import { CloudSchema } from "../cloud/config.js";
 import { ReviewSchema } from "../review/config.js";
 import { SupervisorSchema } from "../supervisor/config.js";
+import { TrackerSchema } from "../tracker/config.js";
 import { TriageSchema } from "../triage/config.js";
 import { WatchdogSchema } from "../watchdog/config.js";
 import {
@@ -292,6 +293,27 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       "budget.period": { sensitive: true, help: "The days the limit covers (UTC); a new period does not clear a trip: only the owner does, in Machines" },
       "budget.meter_start": { help: "Spend before the meter's first run" },
       "budget.spend_check_hours": { help: "How old the provider's cost reading may be (1 to 24 hours); each reading may cost money" },
+      request_timeout_seconds: timeouts,
+    },
+  },
+  {
+    key: "tracker",
+    title: "Tracker: GitHub issues, boards and milestones",
+    schema: TrackerSchema,
+    docs: "#tracker",
+    hints: {
+      mode: { help: "observe records what it would change on GitHub and sends nothing; act creates and closes issues, moves cards and closes milestones" },
+      repos: { help: "The repositories it tracks; a task goes to the one its line names (repo:owner/name), else the first whose match takes it, else the default" },
+      "repos.*.repo": { sensitive: true, help: "owner/name: the tracker writes to this repository in act mode" },
+      "repos.*.project": { help: "Its Projects board: the user or organization that owns it, and the number in the board's URL" },
+      "repos.*.match.tasks": { help: "Task id globs (* and ?) this repository takes" },
+      "repos.*.milestones.rules": { advanced: true, help: "Issues created for these tasks go in this existing milestone (Lair never sets due dates)" },
+      create_issues_for_new_tasks: { help: "A task with no issue gets one (act mode); otherwise only issues it names or with its exact title are linked" },
+      redact_patterns: { help: "Regular expressions removed from every text sent to GitHub, after the built-in ones (paths, tokens, emails, addresses)" },
+      token_env: { sensitive: true, help: "The env var holding the GitHub token; default: review.token_env, else GITHUB_TOKEN" },
+      api_url: { sensitive: true, advanced: true, help: "https only: the token is sent to it" },
+      reconcile_interval_seconds: { advanced: true },
+      write_budget_per_minute: { advanced: true },
       request_timeout_seconds: timeouts,
     },
   },

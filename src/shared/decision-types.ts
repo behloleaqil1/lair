@@ -122,6 +122,7 @@ export type DecisionAuditAction =
   | "raised"
   | "raised_again"
   | "structure_refused"
+  | "evidence_updated"
   | "answered"
   | "overdue"
   | "expired"
@@ -208,4 +209,46 @@ export interface DecisionCounts {
 export interface DecisionStructure {
   class: string;
   evidence: DecisionEvidence;
+}
+
+/**
+ * Shadow policy agreement (docs/design/decision-policies.md §5): one proposer version's proposals for a class
+ * compared with the answers people gave. Nothing here answers a decision.
+ */
+export interface PolicyAgreementRow {
+  class: string;
+  proposer: string;
+  version: string;
+  /** Rows in the policy trace */
+  traced: number;
+  /** Answered by a person, so comparable */
+  compared: number;
+  /** Proposed an option, and a person chose the same one */
+  agreed: number;
+  /** Proposed an option, and a person chose another */
+  disagreed: number;
+  /** Abstained on a decision a person answered */
+  abstained: number;
+  /** Disagreed where the proposal was an irreversible or outward option: one blocks promotion */
+  unsafeDisagreements: number;
+  /** Still open */
+  pending: number;
+  /** Withdrawn or expired: nobody needed to answer */
+  withdrawn: number;
+  /** agreed / (agreed + disagreed); null before any proposal was compared */
+  agreement: number | null;
+  /** proposed / compared; null before any comparison */
+  coverage: number | null;
+}
+
+/** GET /api/owner/decision-policies */
+export interface DecisionPoliciesStatus {
+  /** data/server.yaml decision_policies.enabled: off, nothing is proposed or traced and `agreement` is empty */
+  enabled: boolean;
+  source: "file" | "built-in";
+  version: string;
+  policies: { id: string; class: string; codes: string[]; answer: string; state: string; maxTier: number }[];
+  /** Entries of data/policies.yaml that were refused, each naming its policy, and a refused decision_policies section */
+  errors: string[];
+  agreement: PolicyAgreementRow[];
 }

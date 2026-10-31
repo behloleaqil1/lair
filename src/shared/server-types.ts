@@ -250,6 +250,10 @@ export type EventType =
   | "agent.budget.exceeded"
   | "agents.fill_started"
   | "agents.fill_held"
+  // fill.idle: an allowlisted agent idle while ready work exists, and the end of that episode
+  | "agents.fill_idle_notice"
+  | "agents.fill_idle_resolved"
+  | "agents.fill_unmatched"
   // Gate results, for triage: {project, result: GateResult, reports?, context?}
   | "gate.completed"
   // Triage (src/server/triage/)
@@ -281,6 +285,11 @@ export type EventType =
   | "placement.machine_down"
   | "placement.job_held"
   | "placement.machine_stopped_under_job"
+  // Infrastructure monitor (src/server/infra-monitor/): {project, key, type, summary, mode} / {project, key, type} /
+  // {project, id, from, to, result, attempts, error}
+  | "infra_monitor.finding"
+  | "infra_monitor.cleared"
+  | "infra_monitor.requeued"
   // Cloud machines (src/server/cloud/): {project, limit, spend, reason}
   | "cloud.guard_tripped"
   // The owner cleared the trip: {project, trippedAt, limit, spend, by (owner session id), note}
@@ -301,7 +310,19 @@ export type EventType =
   | "planner.verifier_finished"
   // Bus (src/server/bus/)
   | "bus.report"
-  | "bus.message";
+  | "bus.message"
+  // Bus consumers (src/server/bus/consumers.ts): an event or report refused or ignored, {project, busId, reason}
+  | "bus.consume_refused"
+  // Host services (src/server/host-services/)
+  | "host-service.up"
+  | "host-service.down"
+  | "host-service.starting"
+  | "host-service.decision"
+  // Checks (src/server/checks/)
+  | "check.requested"
+  | "check.started"
+  | "check.completed"
+  | "check.reconciled";
 
 /** Event stored in the database */
 export interface Event {

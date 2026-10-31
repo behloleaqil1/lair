@@ -37,6 +37,7 @@ export const FIXTURE_MODULES: ModuleFlags = {
   review: false,
   triage: false,
   placement: false,
+  hostServices: false,
   cloud: false,
   pipelines: false,
   delivery: true,
@@ -45,6 +46,7 @@ export const FIXTURE_MODULES: ModuleFlags = {
   github: true,
   machines: true,
   nodes: false,
+  lessons: false,
 };
 
 const decisions: Decision[] = [

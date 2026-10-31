@@ -32,6 +32,10 @@ import {
 import { OWNER_SESSION_HEADER } from "../human-auth/index.js";
 import { sha256 } from "./files.js";
 import { PlannerStore } from "./store.js";
+import { EventBus } from "../core/event-bus.js";
+import { BusConsumers, structuredReport, type BusConsumeMode } from "../bus/consumers.js";
+import { BusService } from "../bus/service.js";
+import { BusStore } from "../bus/store.js";
 
 afterEach(cleanup);
 
@@ -223,6 +227,43 @@ describe("the deterministic part", () => {
     await h.service.cycle();
     expect(h.service.status().lastError).toContain("is a symlink");
     expect(readFileSync(real, "utf-8")).toBe("worker-a|Alice|feat-login|Login\n");
+  });
+
+  it("the planner marks a task done by fill's rule (the shared checkDone): with a fleet's DONE or READY pattern, only a line that names it, by its agent", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form", "worker-b|Bob|feat-search|Search page");
+    const fleet = {
+      enabled: true,
+      interval_seconds: 1,
+      fill: {
+        enabled: false,
+        tasks_file: p.tasksFile,
+        agents: ["worker-a", "worker-b"],
+        prompt_files: ["{prompts_dir}/worker.txt"],
+        done_pattern: "^-\\s+(?:DONE|READY)\\s+{task}(?=[\\s:]|$).*\\bby\\s+{agent}(?=[\\s(]|$)",
+        waiting_pattern: "^-\\s+WAITING\\s+.*\\bby\\s+{agent}(?=[\\s(]|$)",
+        blocked_pattern: "^-\\s+BLOCKED\\s+.*\\bby\\s+{agent}(?=[\\s(]|$)",
+      },
+    };
+    const h = await setup(p, plannerBlock(p, { agent: undefined }), { extra: { agents: fleet } as never });
+    await h.service.cycle();
+
+    queue(
+      p,
+      // A stale prompt's line for an old task, a longer id, another agent's line for the task, and a review task's id
+      "- DONE old-task by worker-a (Alice) 12:00Z: merged",
+      "- DONE feat-login-2 by worker-a (Alice) 12:01Z: merged",
+      "- READY feat-login PR #7 at abc1234 by worker-b (Bob) 12:02Z: reviewed",
+      "- DONE review-feat-search by worker-b (Bob) 12:03Z: approved",
+    );
+    await h.service.cycle();
+    expect(taskIds(h)).toEqual(["feat-login", "feat-search"]);
+    expect(history(h)).toEqual([]);
+
+    queue(p, "- READY feat-login PR #7 at abc1234 by worker-a (Alice) 12:04Z: all findings fixed");
+    await h.service.cycle();
+    expect(taskIds(h)).toEqual(["feat-search"]);
+    expect(history(h)).toMatchObject([{ source: "deterministic", outcome: "applied", op: "mark_done", task: "feat-login", agent: "worker-a" }]);
   });
 });
 
@@ -1013,5 +1054,108 @@ describe("the planner agent's AI role", () => {
     expect(call.argv[call.argv.indexOf("--model") + 1]).toBe("model-plan");
     await h.service.cycle();
     expect(runsOf(h)[0]).toMatchObject({ state: "done", agent: "planner" });
+  });
+});
+
+// ============ BUS REPORTS (bus.consume) ============
+
+describe("bus reports (bus.consume): a line the bus mirrored is read by its report", () => {
+  /** A real bus store and service mirroring to the project's queue file, and the consumers that read it */
+  function busFor(p: Paths, mode: BusConsumeMode) {
+    const store = new BusStore("demo", join(p.dir, "data", "bus", "demo.db"));
+    const events = new EventBus();
+    const consumers = new BusConsumers({
+      events,
+      clock: { now: () => NOW },
+      reports: (_project, ids) => store.getReports(ids).map(structuredReport),
+      onReport: () => {},
+      onMessage: () => {},
+      onRunEnded: () => {},
+    });
+    consumers.setMode("demo", mode);
+    const claims = new Map<string, string>();
+    const service = new BusService({
+      store,
+      getClaimedTask: (runId) => claims.get(runId) ?? null,
+      getAllClaims: () => [],
+      getKnownAgents: () => [],
+      mirrorConfig: { queueFile: p.queueFile },
+      events,
+    });
+    /** A report as POST /api/bus/call files it for a run that holds `task` */
+    const report = (agent: string, kind: "DONE" | "BLOCKED", task: string, summary: string): number => {
+      const runId = `run-${claims.size + 1}`;
+      claims.set(runId, task);
+      const result = service.report({ project: "demo", agent, runId, tokenHash: `h-${runId}`, issuedAt: NOW }, kind, task, summary);
+      if (!result.ok) throw new Error(result.error.message);
+      return result.data.id;
+    };
+    return { consumers, report, store };
+  }
+
+  // The summary names another task of the tasks file: read as text, the line is about the first task it names
+  const SUMMARY = "needs feat-search's API first: the payment provider account needs the owner's approval";
+
+  it("on: a BLOCKED report is about the task it names, with its summary as the reason, and is handled once", async () => {
+    const p = makePaths();
+    tasks(p, "worker-b|Bob|feat-search|Search page", "worker-a|Alice|feat-login|Login form");
+    const bus = busFor(p, "on");
+    const h = await setup(p, plannerBlock(p), { bus: (project) => bus.consumers.lineSource(project) });
+    await h.service.cycle();
+    const id = bus.report("worker-a", "BLOCKED", "feat-login", SUMMARY);
+    const mirrored = readFileSync(p.queueFile, "utf-8").trim().split("\n").at(-1) ?? "";
+    expect(mirrored).toMatch(new RegExp(`\\[bus:${id}\\]$`));
+    await h.service.cycle();
+
+    const blocked = h.service.overview().blocked;
+    expect(blocked.map((b) => [b.task, b.agent, b.reason, b.class])).toEqual([["feat-login", "worker-a", SUMMARY, "owner"]]);
+    expect(open(h).map((d) => d.key)).toEqual(["blocked:feat-login:owner"]);
+    expect(h.bus.filter((e) => e.type === "planner.blocked")).toHaveLength(1);
+
+    // The same mirrored line again (copied by hand): its report was handled, so nothing new; across a restart too
+    appendFileSync(p.queueFile, `${mirrored}\n`);
+    await h.service.cycle();
+    const again = await setup(p, plannerBlock(p), { clock: h.clock, dbs: h.dbs, bus: (project) => bus.consumers.lineSource(project) });
+    appendFileSync(p.queueFile, `${mirrored}\n`);
+    await again.service.cycle();
+    expect([...h.bus, ...again.bus].filter((e) => e.type === "planner.blocked")).toHaveLength(1);
+    expect(again.service.overview().blocked.map((b) => b.task)).toEqual(["feat-login"]);
+    bus.store.close();
+  });
+
+  it("observe: the planner reads the line's text as before (here: the first task it names), and records both readings", async () => {
+    const p = makePaths();
+    tasks(p, "worker-b|Bob|feat-search|Search page", "worker-a|Alice|feat-login|Login form");
+    const bus = busFor(p, "observe");
+    const h = await setup(p, plannerBlock(p), { bus: (project) => bus.consumers.lineSource(project) });
+    await h.service.cycle();
+    const id = bus.report("worker-a", "BLOCKED", "feat-login", SUMMARY);
+    await h.service.cycle();
+
+    expect(h.service.overview().blocked.map((b) => b.task)).toEqual(["feat-search"]);
+    const health = bus.consumers.health("demo");
+    expect(health.mode).toBe("observe");
+    // The text parser reads the task as "feat-login by": a difference Health shows before the owner turns the bus on
+    expect(health.observations).toMatchObject({
+      total: 1,
+      mismatches: 1,
+      recent: [{ consumer: "planner", busId: id, report: "BLOCKED feat-login by worker-a", file: "BLOCKED feat-login by by worker-a" }],
+    });
+    expect(health.refused).toEqual([]);
+    expect(id).toBeGreaterThan(0);
+    bus.store.close();
+  });
+
+  it("on: a DONE report marks its task done in the tasks file (fill's done check reads the report)", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form", "worker-b|Bob|feat-search|Search page");
+    const bus = busFor(p, "on");
+    const h = await setup(p, plannerBlock(p, { agent: undefined }), { bus: (project) => bus.consumers.lineSource(project) });
+    await h.service.cycle();
+    bus.report("worker-a", "DONE", "feat-login", "merged");
+    await h.service.cycle();
+    expect(taskIds(h)).toEqual(["feat-search"]);
+    expect(history(h)[0]).toMatchObject({ source: "deterministic", outcome: "applied", op: "mark_done", task: "feat-login" });
+    bus.store.close();
   });
 });
