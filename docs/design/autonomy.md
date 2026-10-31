@@ -282,6 +282,18 @@ planner (§4) turns documents into work; this module WRITES and maintains those 
   in-process request, so a project needs no launcher loop; a task done since its last start (kept once seen) or left
   to the owner is never started again, and one whose runs keep exiting 0 without the done line backs off, then waits
   on one decision.
+- **A restart never leaves two runs of one task** (built): a run's pid, process group, process start time and a
+  fingerprint of its start command are stored when it starts. The new server's first tick reconciles every run the
+  store says is running before it judges anything, and fill starts nothing until then: a process provably the run's
+  (pid and start time match) is adopted with its claim, a different command line only noted; one under a reused pid
+  (another start time) is never signalled and the run is lost, its task free; a gone process is classified by its
+  queue line. Lost and gone need two readings to agree, the second fresh (never the shared cache's); when it fails
+  the run keeps its state and claim until the next tick. Start times count from when a reading was taken (and how
+  long `ps` took), and the shared cache never keeps a `ps` table its timeout cut short or one without the server's
+  own pid. `agents.on_restart: stop` stops the runs on the server's own shutdown instead (SIGTERM to the group,
+  SIGKILL after a bounded wait judged by exit status or fresh readings, each recorded). Fill also refuses to start a
+  task while a live process no run owns holds one of the task's run prompt files on its command line, with one
+  `fill_conflict` notice.
 - **Budgets are advisory until adapters report usage:** today usage is read from run logs by pattern, text the agent
   itself writes, so it can under-report. Budgets become enforcement once providers or adapters report usage to the
   fleet budget directly; until then keep a spending limit at the provider too.
@@ -303,6 +315,10 @@ planner (§4) turns documents into work; this module WRITES and maintains those 
   incident id and are pruned when unused for 90 days.
 - **Status documents:** the app's status file, plan ticks and changelog are generated from events via docs PRs, never
   hand-maintained.
+- **Brain bench (built):** `lair brain-bench` replays recorded decisions against a model or a rule set and reports
+  accuracy, abstain rate, wrong-but-confident rate and latency per decision kind
+  ([Brain bench](../configuration.md#brain-bench)). A candidate model must keep wrong-but-confident near zero before
+  it may run in shadow mode, which reuses the same scoring.
 - **Daily digest** (§1 notifications, and a Digest view): merges, the throughput trend, SLO state, open decisions, the
   top blocker, and the next 24 h of planned work.
 

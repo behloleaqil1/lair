@@ -22,6 +22,8 @@ const OFF: ModuleFlags = {
   review: false,
   triage: false,
   placement: false,
+  hostServices: false,
+  cloud: false,
   pipelines: false,
   delivery: false,
   watchdog: false,
@@ -61,6 +63,7 @@ describe("nav sections", () => {
     expect(ids({ ...OFF, machines: true })).toContain("machines");
     expect(ids({ ...OFF, nodes: true })).toContain("machines");
     expect(ids({ ...OFF, placement: true })).toContain("machines");
+    expect(ids({ ...OFF, cloud: true })).toContain("machines");
     expect(ids({ ...OFF, delivery: true })).toContain("delivery");
     expect(ids({ ...OFF, processes: true })).toContain("processes");
     expect(ids({ ...OFF, delivery: true })).not.toContain("processes");

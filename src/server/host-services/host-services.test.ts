@@ -445,7 +445,7 @@ describe("host-services", () => {
       const config = makeConfig([{ name: "docker", probe: ["probe-docker"], start: ["start-docker"], neededBy: [] }]);
       const events = new EventBus();
       const emitted: unknown[] = [];
-      events.on("host-service.down", (e) => emitted.push(e));
+      events.on("host-service.down", (e) => { emitted.push(e); });
       const { service } = createService(config, world, clock, events);
 
       await service.tick();
@@ -460,7 +460,7 @@ describe("host-services", () => {
       const config = makeConfig([{ name: "docker", probe: ["probe-docker"], start: ["start-docker"], neededBy: [] }]);
       const events = new EventBus();
       const emitted: unknown[] = [];
-      events.on("host-service.up", (e) => emitted.push(e));
+      events.on("host-service.up", (e) => { emitted.push(e); });
       const { service } = createService(config, world, clock, events);
 
       await service.tick();

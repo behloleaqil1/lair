@@ -55,12 +55,40 @@ export const DECISION_STATUSES = ["open", "answered", "expired", "withdrawn"] as
  */
 export type DecisionStatus = (typeof DECISION_STATUSES)[number];
 
+/**
+ * What choosing an option does (docs/design/decision-policies.md §4):
+ * reversible: it can be undone later; frees_task: it stops waiting and frees
+ * the task; irreversible: it can't be undone; outward: it acts outside Lair
+ * (a merge, a spend). irreversible and outward are never for a rule to
+ * answer.
+ */
+export const DECISION_EFFECTS = ["reversible", "frees_task", "irreversible", "outward"] as const;
+export type DecisionEffect = (typeof DECISION_EFFECTS)[number];
+
+/** A fact on a decision: flat, numbers as numbers, times as ISO-8601, ids rather than names. */
+export type DecisionFactValue = string | number | boolean | null;
+
+/**
+ * The machine-readable evidence of a decision (the prose stays in `context`
+ * for the person). `code` is one value of a fixed set per class.
+ */
+export interface DecisionEvidence {
+  code: string;
+  facts: Record<string, DecisionFactValue>;
+  /** Set by the module that raised the decision; true when the cause is gone */
+  cause_cleared: boolean;
+  /** Issue number when a known cause is tracked */
+  linked_issue: number | null;
+}
+
 export interface DecisionOption {
   /** Stable id the producer acts on, e.g. "approve" */
   id: string;
   label: string;
   /** What happens if this option is chosen */
   consequences: string;
+  /** Absent on decisions raised before options carried it */
+  effect?: DecisionEffect;
   /** credentials decisions: choosing this option means supplying the secret */
   suppliesSecret?: boolean;
 }
@@ -89,6 +117,7 @@ export interface DecisionAnswer {
 export type DecisionAuditAction =
   | "raised"
   | "raised_again"
+  | "structure_refused"
   | "answered"
   | "overdue"
   | "expired"
@@ -143,6 +172,14 @@ export interface Decision {
   deliveredAt?: string;
   /** "http": raised over the API, so `source.module` is only what the caller said; "server": by a module inside Lair */
   raisedVia: "server" | "http";
+  /**
+   * The policy class, "module.name" (docs/design/decision-policies.md §2).
+   * Absent on decisions raised without one: they are never for a rule.
+   */
+  class?: string;
+  /** True when `class` is in the policy table (src/server/decisions/structure.ts) */
+  classKnown?: boolean;
+  evidence?: DecisionEvidence;
   /** Only in GET /api/decisions/:id */
   audit?: DecisionAuditEntry[];
 }
@@ -156,4 +193,10 @@ export interface DecisionCounts {
   action: number;
   /** Open notices (for information only) */
   notices: number;
+}
+
+/** The class and evidence a module attaches to a request for a decision (options carry their own effect). */
+export interface DecisionStructure {
+  class: string;
+  evidence: DecisionEvidence;
 }

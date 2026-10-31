@@ -1082,11 +1082,20 @@ export class TriageService {
       question: `Gate ${first.gateId} at ${short(first.sha)} on ${first.branch} still fails with an infrastructure error after ${attempts} re-check(s).`,
       context: infra.flatMap((c) => [describe(c), ...c.verdict.evidence.slice(0, 2)]).slice(0, 8),
       options: [
-        { id: "fix-environment", label: "Fix the environment", consequences: "Nothing runs; re-run the gate once it is fixed" },
-        { id: "rerun", label: "Re-check now", consequences: "One more re-check of the same tests at the same commit" },
-        { id: "ignore", label: "Ignore", consequences: "The failure stays blocking" },
+        { id: "fix-environment", label: "Fix the environment", consequences: "Nothing runs; re-run the gate once it is fixed", effect: "reversible" },
+        { id: "rerun", label: "Re-check now", consequences: "One more re-check of the same tests at the same commit", effect: "reversible" },
+        { id: "ignore", label: "Ignore", consequences: "The failure stays blocking", effect: "reversible" },
       ],
       recommended: "fix-environment",
+      structure: {
+        class: "triage.gate_failure",
+        evidence: {
+          code: "infra_other",
+          facts: { gate: first.gateId, sha: first.sha, recheck_count: attempts, same_commit: true },
+          cause_cleared: false,
+          linked_issue: null,
+        },
+      },
       why: "Lair re-checks an infrastructure failure only up to triage.recheck.max_retries.",
     });
     return `infra: still failing after ${attempts} re-check(s); asked the human`;
@@ -1848,10 +1857,19 @@ export class TriageService {
         ...incident.bisect.probes.filter((p) => p.recheckId).map((p) => `probe ${short(p.sha)}: ${p.outcome}${p.detail ? ` (${p.detail})` : ""}`),
       ],
       options: [
-        { id: "revert", label: `Revert ${short(culprit)}`, consequences: "Lair opens a revert, which goes through the gate and the merge policy" },
-        { id: "keep", label: "Keep it and fix forward", consequences: "Nothing is reverted; the branch stays red until a fix merges" },
+        { id: "revert", label: `Revert ${short(culprit)}`, consequences: "Lair opens a revert, which goes through the gate and the merge policy", effect: "outward" },
+        { id: "keep", label: "Keep it and fix forward", consequences: "Nothing is reverted; the branch stays red until a fix merges", effect: "reversible" },
       ],
       recommended: protection?.keep ? "keep" : "revert",
+      structure: {
+        class: "triage.revert",
+        evidence: {
+          code: "bisect_proved",
+          facts: { incident: incident.id, culprit, branch: incident.branch, human_protected: protectedBy !== undefined },
+          cause_cleared: false,
+          linked_issue: null,
+        },
+      },
       why: protection?.keep
         ? "A merge a human protected is never reverted automatically."
         : protectedBy
@@ -1889,10 +1907,20 @@ export class TriageService {
           id: `revert-${i + 1}`,
           label: `Revert ${short(sha)} (not proven)`,
           consequences: `Lair opens a revert of ${short(sha)} although bisect did not prove it broke the branch`,
+          effect: "outward" as const,
         })),
-        { id: "investigate", label: "Investigate", consequences: "Nothing is reverted" },
+        { id: "investigate", label: "Investigate", consequences: "Nothing is reverted", effect: "reversible" as const },
       ],
       recommended: "investigate",
+      structure: {
+        class: "triage.revert",
+        evidence: {
+          code: "bisect_unproven",
+          facts: { incident: incident.id, branch: incident.branch, suspects: suspects.length },
+          cause_cleared: false,
+          linked_issue: null,
+        },
+      },
       why: "Only a merge proven to break the branch is reverted without a human; this one is not proven.",
     });
   }

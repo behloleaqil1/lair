@@ -37,6 +37,8 @@ export const FIXTURE_MODULES: ModuleFlags = {
   review: false,
   triage: false,
   placement: false,
+  hostServices: false,
+  cloud: false,
   pipelines: false,
   delivery: true,
   watchdog: false,
