@@ -282,11 +282,13 @@ planner (§4) turns documents into work; this module WRITES and maintains those 
   in-process request, so a project needs no launcher loop; a task done since its last start (kept once seen) or left
   to the owner is never started again, and one whose runs keep exiting 0 without the done line backs off, then waits
   on one decision.
-- **Unmatched reports:** a DONE, WAITING or BLOCKED line that names a task other than the agent's open task is an
-  unmatched report. Fill records it, shows it on Health, raises one notice per agent per hour, and doesn't close the
-  task. The next prompt tells the agent: "Your previous run reported <other>; your task is <open>". A run that ends
-  with only unmatched reports takes the no-done path (bounded retries, then hold). Set `done_match: agent_legacy` to
-  keep the old behaviour (with a startup warning); the default `task_id` is recommended.
+- **A line counts only for the task it names** (built, `fill.done_match: task_id`, the default when `done_pattern` has
+  `{task}`): an agent's DONE, WAITING or BLOCKED line on a run that names no task it can be about (an old task from a
+  stale prompt, say) is an unmatched report. It closes and changes nothing, so a run with only such lines takes the
+  no-done path (backoff, then one hold); it is recorded once (`fill_unmatched`, and once on the bus), shown on the
+  task's line and in fill's status, and the task's next run gets the line as fenced data after its prompt. The
+  planner's done-marking shares fill's done check. A pattern without `{task}` can't name a task: it matches by agent
+  (`agent_legacy`), with a config warning on Home → Health.
 - **A restart never leaves two runs of one task** (built): a run's pid, process group, process start time and a
   fingerprint of its start command are stored when it starts. The new server's first tick reconciles every run the
   store says is running before it judges anything, and fill starts nothing until then: a process provably the run's
