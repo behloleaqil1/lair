@@ -12,10 +12,12 @@ import {
   DECISION_KINDS,
   NEVER_DEFAULT_KINDS,
   type DecisionAttention,
+  type DecisionEvidence,
   type DecisionKind,
   type DecisionLink,
   type DecisionOption,
 } from "../../shared/decision-types.js";
+import { ClassSchema, EffectSchema, EvidenceSchema, structureErrors } from "./structure.js";
 import type { AnswerInput, WithdrawInput } from "./types.js";
 
 /** An error with the HTTP status the routes answer with. */
@@ -73,6 +75,7 @@ const OptionSchema = z
     label: oneLine(120),
     consequences: text(1000),
     suppliesSecret: z.boolean().optional(),
+    effect: EffectSchema.optional(),
   })
   .strict();
 
@@ -204,6 +207,8 @@ const RaiseSchema = z
     secretName: z.string().regex(SECRET_NAME, "use letters, digits, '_', '.' and '-'").optional(),
     expiresAt: z.string().datetime({ offset: true }).optional(),
     defaultOptionId: z.string().min(1).max(40).optional(),
+    class: ClassSchema.optional(),
+    evidence: EvidenceSchema.optional(),
   })
   .strict();
 
@@ -223,6 +228,8 @@ export interface ValidRaise {
   secretName?: string;
   expiresAt?: string;
   defaultOptionId?: string;
+  class?: string;
+  evidence?: DecisionEvidence;
 }
 
 export type Parsed<T> = { ok: true; value: T } | { ok: false; errors: string[] };
@@ -279,6 +286,10 @@ export function parseRaiseInput(raw: unknown, now: number): Parsed<ValidRaise> {
     if (value.defaultOptionId !== undefined) errors.push("attention: a notice has no default (nothing is decided for you)");
   }
 
+  errors.push(
+    ...structureErrors({ class: value.class, evidence: value.evidence, options: value.options, module: value.source.module }),
+  );
+
   if (value.defaultOptionId !== undefined) {
     if (NEVER_DEFAULT_KINDS.includes(value.kind)) {
       errors.push(`defaultOptionId: ${value.kind} decisions can't have a default: they always wait for a human`);
@@ -303,6 +314,7 @@ export function parseRaiseInput(raw: unknown, now: number): Parsed<ValidRaise> {
         label: o.label,
         consequences: o.consequences,
         ...(o.suppliesSecret ? { suppliesSecret: true } : {}),
+        ...(o.effect ? { effect: o.effect } : {}),
       })),
       recommended: value.recommended,
       source: value.source,
@@ -312,6 +324,8 @@ export function parseRaiseInput(raw: unknown, now: number): Parsed<ValidRaise> {
       secretName: value.secretName,
       expiresAt,
       defaultOptionId: value.defaultOptionId,
+      ...(value.class !== undefined ? { class: value.class } : {}),
+      ...(value.evidence !== undefined ? { evidence: value.evidence } : {}),
     },
   };
 }

@@ -88,6 +88,8 @@ export class DecisionInbox implements DecisionProducer {
   private clock: Clock;
   private sweepSeconds: number;
   private handlers = new Map<string, ResolutionHandler>();
+  /** Classes outside the policy table already warned about */
+  private flaggedClasses = new Set<string>();
   private inflight = new Map<string, Promise<boolean>>();
   private sweeping: Promise<void> | null = null;
   private timer: NodeJS.Timeout | null = null;
@@ -142,7 +144,19 @@ export class DecisionInbox implements DecisionProducer {
   }
 
   private async raiseVia(input: RaiseDecisionInput, via: RaisedVia): Promise<RaiseResult> {
-    const parsed = parseRaiseInput(input, this.clock.now());
+    let parsed = parseRaiseInput(input, this.clock.now());
+    let structureRefusal: string | undefined;
+    if (!parsed.ok && via === "server") {
+      // A module inside Lair never loses a real decision to a bad class, evidence or effect: raise it plain and say why
+      const plain = parseRaiseInput(withoutStructure(input), this.clock.now());
+      if (plain.ok) {
+        structureRefusal = parsed.errors.join("; ");
+        console.warn(
+          `[decisions] ${plain.value.source.module} raised ${plain.value.key} with a structure the schema refused, so it is raised without it: ${structureRefusal}`,
+        );
+        parsed = plain;
+      }
+    }
     if (!parsed.ok) {
       throw new DecisionError(400, `Invalid decision: ${parsed.errors.join("; ")}`);
     }
@@ -170,6 +184,10 @@ export class DecisionInbox implements DecisionProducer {
     const created = outcome.kind === "created";
     const { module, ref } = decision.source;
     if (created) {
+      if (decision.class !== undefined && decision.classKnown === false && !this.flaggedClasses.has(decision.class)) {
+        this.flaggedClasses.add(decision.class);
+        console.warn(`[decisions] ${module} raised class ${decision.class}, which is not in the policy table (docs/design/decision-policies.md §2)`);
+      }
       const expiry = decision.expiresAt
         ? `; expires ${decision.expiresAt}${decision.defaultOptionId ? `, then ${decision.defaultOptionId} applies` : ", then it keeps waiting"}`
         : "";
@@ -177,8 +195,24 @@ export class DecisionInbox implements DecisionProducer {
         at,
         action: "raised",
         actor: module,
-        detail: `${decision.attention === "notice" ? "notice" : `${decision.kind} decision`} raised by ${module} (${ref}), recommending ${decision.recommended.optionId}${expiry}`,
+        detail: `${decision.attention === "notice" ? "notice" : `${decision.kind} decision`} raised by ${module} (${ref}), recommending ${decision.recommended.optionId}${expiry}${decision.class !== undefined && decision.classKnown === false ? `; class ${decision.class} is not in the policy table` : ""}`,
       });
+      if (structureRefusal !== undefined) {
+        this.store.addAudit(decision.id, {
+          at,
+          action: "structure_refused",
+          actor: module,
+          detail: `raised without class, evidence and effects: ${structureRefusal}`.slice(0, 1000),
+        });
+        await this.events?.emit("decision.structure_refused", {
+          decisionId: decision.id,
+          project: decision.project,
+          module,
+          ref,
+          key: decision.key,
+          errors: structureRefusal.slice(0, 1000),
+        });
+      }
       await this.events?.emit("decision.raised", {
         decisionId: decision.id,
         project: decision.project,
@@ -530,4 +564,21 @@ export class DecisionInbox implements DecisionProducer {
     await this.sweeping?.catch(() => undefined);
     await Promise.all([...this.inflight.values()]).catch(() => undefined);
   }
+}
+
+/** The same input without class, evidence and the effect of each option. */
+function withoutStructure(input: unknown): unknown {
+  if (typeof input !== "object" || input === null) return input;
+  const rest: Record<string, unknown> = { ...(input as Record<string, unknown>) };
+  delete rest.class;
+  delete rest.evidence;
+  if (Array.isArray(rest.options)) {
+    rest.options = rest.options.map((o) => {
+      if (typeof o !== "object" || o === null) return o;
+      const option: Record<string, unknown> = { ...(o as Record<string, unknown>) };
+      delete option.effect;
+      return option;
+    });
+  }
+  return rest;
 }

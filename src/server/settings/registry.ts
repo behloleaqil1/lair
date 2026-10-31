@@ -18,6 +18,7 @@ import { AiSchema } from "../ai/config.js";
 import { DeliverySchema } from "../delivery/config.js";
 import { ExecutorsSchema, PipelinesSchema } from "../gates/project-pipelines.js";
 import { PlacementSchema } from "../placement/config.js";
+import { CloudSchema } from "../cloud/config.js";
 import { ReviewSchema } from "../review/config.js";
 import { SupervisorSchema } from "../supervisor/config.js";
 import { TriageSchema } from "../triage/config.js";
@@ -269,6 +270,29 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       command_timeout_seconds: timeouts,
       command_line: timeouts,
       history: { advanced: true },
+    },
+  },
+  {
+    key: "cloud",
+    title: "Cloud machines",
+    schema: CloudSchema,
+    docs: "#cloud-machines",
+    hints: {
+      // Which account and instance Lair acts on, and how much it may spend: a change is confirmed like a command
+      "machines.*.profile": {
+        sensitive: true,
+        help: "A named profile in your AWS config files; credentials never go in the project file",
+      },
+      "machines.*.instance": { sensitive: true, help: "Lair acts on this instance only while it carries the tag" },
+      "machines.*.price_per_hour": { help: "Rounded up; the meter counts every run at this price" },
+      "budget.limit": {
+        sensitive: true,
+        help: "No start at or above this spend (US dollars); change it here and in the provider's budget together. A higher limit does not clear a trip: the owner does, in Machines",
+      },
+      "budget.period": { sensitive: true, help: "The days the limit covers (UTC); a new period does not clear a trip: only the owner does, in Machines" },
+      "budget.meter_start": { help: "Spend before the meter's first run" },
+      "budget.spend_check_hours": { help: "How old the provider's cost reading may be (1 to 24 hours); each reading may cost money" },
+      request_timeout_seconds: timeouts,
     },
   },
   {
