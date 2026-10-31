@@ -1282,7 +1282,7 @@ export class AgentsFill {
       }
       if (refusal?.retry && !refusal.expired) {
         // Only time can fix it (CI running): not done, no new run, checked again on the next check
-        await hold("report_refused", `done line not accepted yet: ${refusal.problems.map((p) => oneLine(p, 160)).join("; ")}; checked again on the next check`, latest?.id ?? null);
+        await holdTask("report_refused", `done line not accepted yet: ${refusal.problems.map((p) => oneLine(p, 160)).join("; ")}; checked again on the next check`, latest?.id ?? null);
         continue;
       }
       if (check?.kind === "queue" && !refusal) {
