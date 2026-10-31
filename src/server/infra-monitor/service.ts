@@ -14,7 +14,8 @@
 import type { EventBus } from "../core/event-bus.js";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { DecisionProducer } from "../decisions/types.js";
-import { parseInfraMonitorConfig, actBlockedReason, buildArgv, type InfraMonitorSettings } from "./config.js";
+import { parseInfraMonitorConfig, actBlockedReason, buildArgv } from "./config.js";
+import type { InfraMonitorSettings } from "./types.js";
 import { detectJobMachineDown, detectDuplicateSlot, detectDeadRunner, type DetectorContext } from "./detectors.js";
 import type { InfraFinding, InfraMonitorStatus, InfraMonitorTick, InfraNotice, MachineState, MonitoredJob } from "./types.js";
 import { readGateQueue, findDuplicateSlots, getRunnerPid, type InfraMonitorProbes, systemInfraProbes } from "./probes.js";
@@ -258,7 +259,7 @@ export class InfraMonitor {
       try {
         const result = await this.decisions.raise({
           project: this.project,
-          kind: "infrastructure",
+          kind: "escalation",
           attention: "notice",
           title: finding.summary.slice(0, 200),
           context: [
@@ -266,7 +267,7 @@ export class InfraMonitor {
             "",
             ...finding.evidence.map((e) => `- ${e}`),
           ].join("\n"),
-          options: [{ id: "acknowledged", label: "Acknowledged" }],
+          options: [{ id: "acknowledged", label: "Acknowledged", consequences: "The notice is acknowledged but no automated action is taken." }],
           recommended: { optionId: "acknowledged", reasoning: "This is an informational notice." },
           source: { module: DECISION_MODULE, ref: finding.key },
           key: finding.key,

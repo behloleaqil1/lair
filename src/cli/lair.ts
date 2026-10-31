@@ -10,6 +10,8 @@
  *                      one ops tool, its answer printed as JSON (LAIR_OPS_TOKEN, LAIR_URL)
  *   lair supervisor answer --conversation <id> --file <markdown> [--evidence-file <json>]
  *                      a supervisor run's answer, once (LAIR_OPS_TOKEN, LAIR_URL)
+ *   lair brain-bench --cases <file> --model <spec> ...
+ *                      scores models and rules on recorded decisions (no server needed)
  *
  * From the Lair repository: `npm run --silent lair -- review submit ...`, or
  * `node dist/cli/lair.js review submit ...` after `npm run build`.
@@ -18,6 +20,7 @@ import { EXIT_USAGE, reviewSubmit, USAGE } from "./review-submit.js";
 import { OPS_MCP_USAGE, runOpsMcp } from "./ops-mcp.js";
 import { OPS_CALL_USAGE, opsCall } from "./ops-call.js";
 import { ANSWER_USAGE, supervisorAnswer } from "./supervisor-answer.js";
+import { BRAIN_BENCH_USAGE, brainBench, readBoundedFile } from "./brain-bench.js";
 import { BUS_MCP_USAGE, runBusMcp } from "./bus-mcp.js";
 import { USAGE as BUS_USAGE, busCli } from "./bus.js";
 
@@ -54,6 +57,15 @@ async function main(argv: string[]): Promise<number> {
       err: (line) => process.stderr.write(`${line}\n`),
     });
   }
+  if (command === "brain-bench") {
+    return brainBench(subcommand ? [subcommand, ...rest] : [], {
+      env: process.env,
+      fetch: (url, init) => fetch(url, init),
+      readFile: readBoundedFile,
+      out: (line) => process.stdout.write(`${line}\n`),
+      err: (line) => process.stderr.write(`${line}\n`),
+    });
+  }
   if (command === "bus-mcp" && subcommand === undefined) {
     return runBusMcp({
       env: process.env,
@@ -69,7 +81,7 @@ async function main(argv: string[]): Promise<number> {
       err: (line) => process.stderr.write(`${line}\n`),
     });
   }
-  process.stderr.write(`${USAGE}\n\n${OPS_MCP_USAGE}\n\n${OPS_CALL_USAGE}\n\n${ANSWER_USAGE}\n\n${BUS_MCP_USAGE}\n\n${BUS_USAGE}\n`);
+  process.stderr.write(`${USAGE}\n\n${OPS_MCP_USAGE}\n\n${OPS_CALL_USAGE}\n\n${ANSWER_USAGE}\n\n${BRAIN_BENCH_USAGE}\n\n${BUS_MCP_USAGE}\n\n${BUS_USAGE}\n`);
   return EXIT_USAGE;
 }
 

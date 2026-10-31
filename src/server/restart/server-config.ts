@@ -77,6 +77,8 @@ const ServerSchema = z
     // The notifications module's own section (src/server/notifications/config.ts): parsed there, so a
     // mistake in it never stops a restart
     notifications: z.unknown().optional(),
+    // The brain trainer's own section (src/server/brain-trainer/config.ts), parsed there for the same reason
+    brain_trainer: z.unknown().optional(),
   })
   .strict();
 

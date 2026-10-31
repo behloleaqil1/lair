@@ -65,6 +65,22 @@ export interface ProjectConfig {
    */
   delivery?: Record<string, unknown>;
   /**
+   * Static policy scan of infrastructure code before any plan
+   * (src/server/infra-policy/). Validated by parseInfraPolicyConfig; see
+   * docs/configuration.md#infrastructure-policy-scan
+   */
+  infra_policy?: Record<string, unknown>;
+  /**
+   * Isolated `tofu plan` with the read-only plan role (src/server/plan-sandbox/).
+   * Validated by parsePlanSandboxConfig; see docs/configuration.md#plan-sandbox
+   */
+  plan_sandbox?: Record<string, unknown>;
+  /**
+   * Plan and apply of an approved plan file (src/server/tofu-runner/).
+   * Validated by parseTofuRunnerConfig; see docs/configuration.md#opentofu-runner
+   */
+  tofu_runner?: Record<string, unknown>;
+  /**
    * Gate pipelines and where they run (src/server/gates/). Validated by
    * parsePipelineConfig; see docs/configuration.md#gate-pipelines
    */
@@ -92,6 +108,12 @@ export interface ProjectConfig {
    * docs/configuration.md#placement
    */
   placement?: Record<string, unknown>;
+  /**
+   * Cloud machines: the provider, the spend meter and the money guard
+   * (src/server/cloud/). Validated by parseCloudConfig; see
+   * docs/configuration.md#cloud-machines
+   */
+  cloud?: Record<string, unknown>;
   /**
    * The planner: Lair keeps agents.fill's tasks file (src/server/planner/).
    * Validated by parsePlannerConfig; see docs/configuration.md#planner

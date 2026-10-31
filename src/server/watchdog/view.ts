@@ -10,13 +10,15 @@
  * - gates_dir/results: <gate-id>.rc, <gate-id>.log, optional <gate-id>.json
  * - gates_dir/runner-<lane>.pid: the lane's runner process
  */
-import { join } from "path";
+import { basename, join } from "path";
 import type { Gate, ProjectConfig, QueueLine } from "../../shared/types.js";
 import { parseQueueFile } from "../parsers/queue.js";
 import { parseGateFilename, parseGateRc } from "../parsers/gates.js";
 import { parseDragonsFile } from "../parsers/dragons.js";
 import { isValidDragonId, parseDragonRegistry } from "../parsers/dragon-config.js";
+import { getDragonAdapter, tokenizeTemplate } from "../services/adapters.js";
 import { isSafeGateId } from "../services/data.js";
+import { mergeDragonRegistry } from "../services/dragon-registry.js";
 import { agentMatcher, type WatchdogSettings } from "./config.js";
 import type { ProcessInfo, Probes } from "./probes.js";
 import type { WatchdogStore } from "./store.js";
@@ -85,6 +87,37 @@ export function parsePid(text: string | null): number | null {
   return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
 }
 
+/** How long after its claim's `started=` time a process may start and still be the claim's process */
+export const CLAIM_START_TOLERANCE_MS = 60_000;
+
+/**
+ * Whether the live process at a claim's recorded pid is the claiming agent's,
+ * rather than an unrelated process that got the pid after the agent died:
+ * - its command names the agent id (bounded, as in watchdog.agent_command); or
+ * - the claim records its start (`started=`) and the process started no more
+ *   than CLAIM_START_TOLERANCE_MS after it. A reused pid always starts after
+ *   the claim, so a later process is another one, even when it runs the
+ *   adapter's program (another agent's run of the same tool); or
+ * - the claim is a bare pid (no start time) and the process runs the agent's
+ *   adapter program. Without a start time, any other process at that pid is
+ *   taken for a reused one.
+ */
+export function claimPidBelongsTo(
+  claimPid: ClaimPid,
+  proc: ProcessInfo,
+  agent: string,
+  adapterProgram: string | null,
+  now: number,
+): boolean {
+  if (agentMatcher("{agent}", agent).test(proc.command)) return true;
+  if (claimPid.startedAt !== null) {
+    const processStartedAt = now - proc.elapsedSeconds * 1000;
+    return processStartedAt <= claimPid.startedAt + CLAIM_START_TOLERANCE_MS;
+  }
+  // ps does not keep argv boundaries, and an interpreter runs the program as an argument (node .../tool)
+  return adapterProgram !== null && proc.argv.some((arg) => basename(arg) === adapterProgram);
+}
+
 export function isSafeLane(lane: unknown): lane is string {
   return typeof lane === "string" && LANE.test(lane);
 }
@@ -150,11 +183,36 @@ export class ProjectView {
   agentIds(): string[] {
     return this.once("agentIds", () => {
       const ids = new Set(parseDragonRegistry(this.config).keys());
-      const content = this.fs.read(join(this.config.agents_dir, "dragons.txt"), SMALL_FILE_BYTES);
-      for (const dragon of parseDragonsFile(content ?? "")) {
+      for (const dragon of parseDragonsFile(this.dragonsFile())) {
         if (isValidDragonId(dragon.id)) ids.add(dragon.id);
       }
       return [...ids].sort();
+    });
+  }
+
+  private dragonsFile(): string {
+    return this.once(
+      "dragonsFile",
+      () => this.fs.read(join(this.config.agents_dir, "dragons.txt"), SMALL_FILE_BYTES) ?? "",
+    );
+  }
+
+  /**
+   * The file name of the program the agent's adapter starts (the first word
+   * of its start_cmd, e.g. "tool-cli"), or null when the agent is not a known
+   * dragon or its adapter is not defined.
+   */
+  adapterProgram(agentId: string): string | null {
+    return this.once(`adapterProgram:${agentId}`, () => {
+      const dragon = mergeDragonRegistry(this.config, this.dragonsFile()).get(agentId);
+      const adapter = dragon ? getDragonAdapter(dragon, this.config) : undefined;
+      if (!adapter?.start_cmd) return null;
+      try {
+        const program = tokenizeTemplate(adapter.start_cmd)[0];
+        return program && !program.includes("{") ? basename(program) : null;
+      } catch {
+        return null; // unbalanced quotes: config validation reports the adapter
+      }
     });
   }
 
@@ -286,6 +344,17 @@ export class ProjectView {
     const started = content.match(/^\s*started\s*[=:]\s*(\S+)\s*$/im);
     const startedAt = started ? Date.parse(started[1]) : null;
     return { pid, startedAt: Number.isNaN(startedAt) ? null : startedAt };
+  }
+
+  /**
+   * Whether a claim's recorded pid is running as the claiming agent
+   * (claimPidBelongsTo). The orphan_claim detector and the release_claim
+   * guard both ask this, so they never disagree about a pid.
+   */
+  async claimPidIsAgents(claim: Claim, claimPid: ClaimPid): Promise<boolean> {
+    const proc = await this.getProcess(claimPid.pid);
+    if (proc === null) return false;
+    return claimPidBelongsTo(claimPid, proc, claim.agent, this.adapterProgram(claim.agent), this.now);
   }
 
   // ============ QUEUE FILE ============

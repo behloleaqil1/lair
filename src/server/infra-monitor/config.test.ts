@@ -176,6 +176,7 @@ describe("actBlockedReason", () => {
     queue_file: "/tmp/queue.md",
     agents_dir: "/tmp/agents",
     gates_dir: "/tmp/gates",
+    machines: {},
   };
 
   it("returns null when act is allowed", () => {

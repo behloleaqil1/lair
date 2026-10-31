@@ -10,9 +10,11 @@ import {
   listProjects,
 } from "./config.js";
 import { DataService } from "./services/data.js";
+import { QueueCacheManager } from "./services/queue-cache.js";
 import { isValidDragonId } from "./parsers/dragon-config.js";
 import { registerRootGuards, requireValidIdParam } from "./root-guards.js";
 import { mountDecisions } from "./decisions/index.js";
+import { mountBrainTrainer } from "./brain-trainer/index.js";
 import { loadNotificationConfig, mountNotifications } from "./notifications/index.js";
 import { notificationsOn } from "./notifications/config.js";
 import {
@@ -40,6 +42,9 @@ import { registerClientStatic, resolveClientDir } from "./static.js";
 import { getEventBus } from "./core/event-bus.js";
 import { WatchdogManager, registerWatchdogRoutes } from "./watchdog/index.js";
 import { DeliveryManager, registerDeliveryRoutes } from "./delivery/index.js";
+import { InfraPolicyManager, registerInfraPolicyRoutes } from "./infra-policy/index.js";
+import { registerTofuRunnerRoutes, TofuRunnerManager } from "./tofu-runner/index.js";
+import { AwsCliIssuer, DockerSpawner, PlanSandboxManager, registerPlanSandboxRoutes, sweepLeftovers } from "./plan-sandbox/index.js";
 import { PipelineManager, registerPipelineRoutes } from "./gates/index.js";
 import { AgentsManager, registerAgentsRoutes, systemAgentProbesWithCache } from "./agents/index.js";
 import { isActive } from "./agents/types.js";
@@ -48,6 +53,7 @@ import { getBudgetManager } from "./fleet/budget.js";
 import { ReviewManager, inboxDecisionSink, registerReviewRoutes } from "./review/index.js";
 import { mountTriage } from "./triage/index.js";
 import { PlacementManager, registerPlacementRoutes } from "./placement/index.js";
+import { CloudManager, registerCloudRoutes } from "./cloud/index.js";
 import { InfraMonitorManager, registerInfraMonitorRoutes } from "./infra-monitor/index.js";
 import { registerDashboardRoutes } from "./dashboard/index.js";
 import type { DashboardSources } from "./dashboard/routes.js";
@@ -129,6 +135,11 @@ function respondCached<T>(cached: CachedData<T>): ApiResponse<T> & { cache: { ag
 
 // Get data service for project (cached per request cycle)
 const dataServices = new Map<string, DataService>();
+const queueCaches = new QueueCacheManager();
+const queueReady = new Map<string, () => Promise<boolean>>();
+/** The first read of the queue file is waited for this long; then requests get what the cache has */
+const QUEUE_FIRST_READ_MS = 2_000;
+const queueSlowLogged = new Set<string>();
 
 // The agents module's runs, for the Dragons view: a dragon it runs is
 // running, "managed by Lair". Set once the module is loaded, below.
@@ -139,16 +150,38 @@ function getDataService(project?: string): DataService {
 
   if (!dataServices.has(projectName)) {
     const config = loadProjectConfig(projectName);
+    // The queue file is parsed once per change, never on a request
+    const queue = queueCaches.get(projectName, config.queue_file);
+    queueReady.set(projectName, () => queue.readyWithin(QUEUE_FIRST_READ_MS));
     dataServices.set(
       projectName,
       new DataService(config, {
         managedRuns: () => managedRuns?.managedRuns(projectName) ?? new Map(),
+        queue: () => queue.getLines(),
       }),
     );
   }
 
   return dataServices.get(projectName)!;
 }
+
+// A request waits for the first read of its project's queue file, then every
+// handler reads the parsed lines from memory
+fastify.addHook("preHandler", async (request) => {
+  if (!request.url.startsWith("/api/")) return;
+  const asked = (request.query as { project?: unknown } | undefined)?.project;
+  try {
+    const name = typeof asked === "string" && asked ? asked : getDefaultProject();
+    getDataService(name);
+    const ready = await queueReady.get(name)?.();
+    if (ready === false && !queueSlowLogged.has(name)) {
+      queueSlowLogged.add(name);
+      console.warn(`The queue file of project ${name} is slow to read; serving what is cached`);
+    }
+  } catch {
+    // An unknown project or an unreadable config: the handler reports it
+  }
+});
 
 /** Get the data cache for a project (expensive operations use this). */
 function getDataCache(project?: string) {
@@ -414,6 +447,30 @@ delivery.load(projectEntries);
 // Up, Down, Restart, Deploy and Release need the owner's session
 await registerDeliveryRoutes(fastify, delivery, () => getDefaultProject(), humanAuth);
 
+// Infrastructure policy scan: a static check of infrastructure code, one per
+// project with `infra_policy.enabled: true` (off by default). It reads files
+// and runs nothing; the plan step of a later change goes through its guard.
+const infraPolicy = new InfraPolicyManager();
+infraPolicy.load(projectEntries);
+await registerInfraPolicyRoutes(fastify, infraPolicy, () => getDefaultProject(), humanAuth);
+
+// Plan sandbox: `tofu plan` in an isolated container with the read-only plan
+// role, only after the policy scan passes. One per project with
+// `plan_sandbox.enabled: true` (off by default).
+const planSandbox = new PlanSandboxManager({ spawner: new DockerSpawner(), issuer: new AwsCliIssuer(), infra: infraPolicy, sweep: () => sweepLeftovers() });
+planSandbox.load(projectEntries);
+await planSandbox.startupSweep();
+await registerPlanSandboxRoutes(fastify, planSandbox, () => getDefaultProject(), humanAuth);
+
+// OpenTofu runner: plan with the state in S3 and apply an approved plan file
+// with the separate apply role, always through the policy scan and the plan
+// sandbox. One per project with `tofu_runner.enabled: true` (off by default,
+// and `observe` mode does not apply).
+const tofuRunner = new TofuRunnerManager({ sandbox: planSandbox, events: getEventBus() });
+tofuRunner.load(projectEntries);
+await tofuRunner.reconcile();
+await registerTofuRunnerRoutes(fastify, tofuRunner, () => getDefaultProject(), humanAuth);
+
 // AI tools (src/server/ai/): per machine, whether each tool is installed and
 // signed in, and the models it offers, from the tools' own commands (bounded,
 // timed out, cached). Every route is the owner's, reads included.
@@ -508,6 +565,17 @@ await mountNotifications(fastify, {
   dashboardUrl: dashboardUrlFor(HOST, PORT),
 });
 
+// Brain trainer (src/server/brain-trainer/): off unless data/server.yaml sets brain_trainer.enabled. A nightly
+// classifier trained in a container on the answered decisions, scored on the brain bench, versioned, and run in
+// shadow mode only: it is given a read-only view of the inbox and nothing it produces answers a decision.
+await mountBrainTrainer(fastify, {
+  configPath: join(process.cwd(), "data", "server.yaml"),
+  dataDir: join(process.cwd(), "data", "brain"),
+  decisions: decisionInbox,
+  events: getEventBus(),
+  humanAuth,
+});
+
 // Reviews and policy merge: one per project with `review.enabled: true`;
 // with review.prompt_file, reviews by agents the agents module starts.
 // Its decisions (a human review, a refused merge, no agent review) go to the Decision Inbox
@@ -571,6 +639,18 @@ const placements = new PlacementManager({
 });
 placements.load(projectEntries);
 await registerPlacementRoutes(fastify, placements, () => getDefaultProject());
+
+// Cloud machines: one per project with `cloud.enabled: true` (off by
+// default). It describes each machine's tagged instance through its
+// provider (AWS EC2, credentials from a named profile only), meters the
+// spend, reads the provider's cost, and runs the money guard that every
+// start goes through. Its routes are the owner's, reads included.
+const clouds = new CloudManager({
+  dbPath: join(process.cwd(), "data", "cloud.db"),
+  events: getEventBus(),
+});
+clouds.load(projectEntries);
+await registerCloudRoutes(fastify, clouds, () => getDefaultProject(), humanAuth);
 
 // Infrastructure monitor: watch running jobs' machines for infrastructure
 // problems (machine down, duplicate runners, dead runner with queued jobs).
@@ -668,7 +748,7 @@ const { supervisor: selfChecks, chat: supervisorChat } = await mountSupervisor(f
 // the modules whose part of it changed, without a restart; an invalid one
 // keeps the previous config running and shows in the dashboard's banner
 const reloader = new ConfigReloader({
-  modules: serverModules({ delivery, watchdogs, pipelines, reviews, agents, triage, placements, planner, supervisor: selfChecks, infraMonitor }),
+  modules: serverModules({ delivery, watchdogs, pipelines, reviews, agents, triage, placements, clouds, planner, supervisor: selfChecks, infraMonitor }),
   initial: projectEntries,
   events: getEventBus(),
   onAccepted: (project, config) => {
@@ -764,13 +844,16 @@ const stopServer = async (reason: string) => {
   // Stop the planner first: it requests runs from the agents module
   await planner.stop();
 
-  // Stop agent supervision (the agents themselves keep running)
-  await agents.stop();
+  // Stop agent supervision: the agents keep running for the next server to adopt, unless a project sets
+  // agents.on_restart: stop (then their runs are stopped too, within a bounded wait)
+  await agents.stop({ planned: true });
   // Stop triage: wait for calls in progress, then close its store
   await triage.stop();
 
   // Stop placement: a move in progress is cut short and found again on the next start
   await placements.stop();
+  // Stop cloud checks: a check in progress finishes, then the store closes
+  await clouds.stop();
 
   // Stop infra monitor: any tick in progress is cut short
   await infraMonitor.stop();
@@ -780,6 +863,7 @@ const stopServer = async (reason: string) => {
 
   // Stop the data cache manager
   dataCacheManager.stopAll();
+  queueCaches.stopAll();
 
   // Stop healer
   stopHealer();
@@ -928,6 +1012,14 @@ const start = async () => {
       placed.length > 0
         ? `[placement] Placing jobs for: ${placed.join(", ")}`
         : "[placement] Off (no project sets placement.enabled)",
+    );
+
+    // Start cloud checks (describe, meter, cost reading, money guard)
+    const metered = clouds.start();
+    console.log(
+      metered.length > 0
+        ? `[cloud] Watching cloud machines for: ${metered.join(", ")}`
+        : "[cloud] Off (no project sets cloud.enabled)",
     );
 
     // Start infra monitor (machine probes, job tracking, notice raising)

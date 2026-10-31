@@ -87,6 +87,28 @@ Before any plan runs, a static policy scan checks the change:
 
 A scan failure stops the pipeline before plan runs; the agent sees only "policy violation" with the rule name.
 
+**As built (PR 1, `src/server/infra-policy/`):** a static scanner of its own instead of OPA/Conftest, so Lair needs no
+extra binary; it reads `.tf`, `.tofu` and their `.json` forms, follows local modules inside the root, and refuses
+anything it cannot read. The allowlists and the per-address `allow` list live in the project's `infra_policy:` block
+(see [configuration](../configuration.md#infrastructure-policy-scan)). It is off by default. `guardPlan` of the project's policy is
+what the OpenTofu runner (PR 3) calls: it does not start the plan when the scan fails. Not in this PR: the lock-file
+hash check ("or locked in `.terraform.lock.hcl`"), which belongs to the plan sandbox (PR 2) where providers are
+installed, and scanning remote modules (allowlisted sources are trusted as pinned).
+
+The scan also refuses every provisioner (`local-exec`, `remote-exec`, `file`, any other), reads `check` blocks (a
+scoped `data` source runs on plan) and `removed` blocks (a destroy-time provisioner runs on apply), decodes `\uNNNN`
+escapes in labels before matching, and refuses a block type it does not know. It is asynchronous and bounded: 1 MiB per
+file, 8 MiB in total, 500 files, 8 module levels and a 10 second deadline; a breach is a refusal (`unreadable`, detail
+`scan limit`). An `allow` entry names a root, an address and the hash of the block's content, so editing an allowed
+block (a changed `url` or `command`) ends the allowance; the scan reports it as changed. A project whose
+`infra_policy` block is invalid, and is not explicitly `enabled: false`, holds a blocked policy: `guardPlan` always
+refuses (rule `invalid-config`) and the runner asks `requires(project)` to know a scan is wanted. The scan routes are the
+owner's: only `guardPlan` tells an agent anything, and that is the rule names.
+
+**Time of check, time of use:** the scan reads the live directory and `plan` runs after it, so code could change between
+the two. The plan runner (PR 2 and 3) must plan a copy taken after the scan (or compare a content hash before and
+after), never the live directory.
+
 ### 2.2 Plan (isolated)
 
 `tofu plan` runs in an isolated plan runner:
@@ -106,6 +128,26 @@ The plan shows:
 **Why isolation matters:** `tofu plan` is not read-only execution. It runs every provider and data source in the
 change. An `external` data source runs any program; an `http` data source calls any URL; a provider from an untrusted
 source runs its own code. Without isolation, agent-written code could exfiltrate credentials.
+
+**As built (PR 2, `src/server/plan-sandbox/`):** `PlanSandboxManager.plan(root)` is what the OpenTofu runner (PR 3) calls.
+It copies the root first, plans only through the project's `guardPlan` (so the PR 1 scan decides), re-hashes the root to
+close the time-of-check gap, checks the lock file (`.terraform.lock.hcl` pins every provider with a version and hashes,
+all on `allowed_providers`: the check PR 1 left to this PR), then asks STS for the plan role (900 s) and runs
+`tofu init -lockfile=readonly -plugin-dir` and `tofu plan -lock=false` in a read-only container whose environment is the
+role's credentials and fixed settings only. The two boundaries are interfaces (`PlanCredentialIssuer`, `SandboxSpawner`)
+with an `aws sts assume-role` and a `docker run` implementation. Egress: the container has no network unless an
+`egress_network` is configured, a network the owner builds with a proxy that passes only the configured hosts; Lair does
+not run that proxy and does not filter by hostname, so with an `egress_network` the isolation is only as good as that proxy (hostname enforcement: follow-up #203). `host`, `bridge` and `default` are refused, `external_id` is required, and `/status` reports the hosts as declared, not enforced. Off by default; see [configuration](../configuration.md#plan-sandbox).
+
+**As built (PR 3, `src/server/tofu-runner/`):** `TofuRunnerManager` plans and applies through `PlanSandbox` only (the
+sandbox gained `plan(root, { backend, keepPlanFile })` and `apply(root, job)`; both run the same copy, `guardPlan`,
+re-hash and lock-file steps before any credential). State is the S3 backend, `<project>/<env>/<root name>-<hash>/terraform.tfstate` (the root is in the key, so two roots of one environment never share state), with
+`use_lockfile=true`; the plan role reads it with `-lock=false`, the apply role takes the native lock. A plan with changes is
+stored with the SHA-256 of the plan file and the hash of the code; `apply(planId, hash)` runs only that file, only in
+`act` mode, only when the hash matches the record and the file, only on unchanged code, once. OpenTofu refuses a plan made
+on a changed state. A failed or stale apply is not undone: the plan is spent and the runner re-plans from the new state,
+which needs a new approval. After the plan, `tofu show -json` is read for what the plan deletes or replaces; such a plan needs its own confirmation (`confirmDestroy`, bound to the plan hash and the resource names) on top of the hash. One plan or apply runs per workspace (root and environment) at a time; an apply that raises an error or is cut off by a restart ends `failed`; plans expire (`plan_max_age_seconds`, default a day) and `plan_dir` must be 0700 and the process's own. Every plan, apply request, refusal, start and end is written to an audit log (owner session id, plan hash, outcome) and sent as an event. **Not yet:** apply does not consult the cloud money guard or a cost estimate (PR 4), so `mode: act` creates paid resources with no spend check. Decision Inbox wiring (the approval that carries the hash) is a later PR; until then the owner
+calls the apply route with the hash. Off by default; see [configuration](../configuration.md#opentofu-runner).
 
 ### 2.3 Cost estimate
 

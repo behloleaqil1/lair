@@ -20,6 +20,7 @@
  */
 import { cpus, freemem, loadavg } from "os";
 import type { FastifyReply, FastifyRequest } from "fastify";
+import type { DecisionEffect, DecisionStructure } from "../../shared/decision-types.js";
 import type { Recheck, TriageTask } from "../../shared/triage-types.js";
 import type { DecisionProducer } from "../decisions/types.js";
 import type { Clock, CommandRunner } from "../watchdog/probes.js";
@@ -97,6 +98,8 @@ export interface DecisionChoice {
   id: string;
   label: string;
   consequences: string;
+  /** What choosing it does; every option of a request with a structure needs one */
+  effect?: DecisionEffect;
 }
 
 /** What triage asks the human (the Decision Inbox's shape, docs/design/autonomy.md §1). */
@@ -111,6 +114,8 @@ export interface DecisionRequest {
   /** One of the options' ids */
   recommended: string;
   why: string;
+  /** Policy class and evidence (docs/design/decision-policies.md §4) */
+  structure?: DecisionStructure;
 }
 
 export interface DecisionRaiser {
@@ -127,10 +132,16 @@ export class InboxDecisions implements DecisionRaiser {
       kind: request.kind,
       title: oneLine(request.question, 190),
       context: request.context.join("\n\n").slice(0, 19_000),
-      options: request.options.map((o) => ({ id: o.id, label: oneLine(o.label, 90), consequences: oneLine(o.consequences, 400) })),
+      options: request.options.map((o) => ({
+        id: o.id,
+        label: oneLine(o.label, 90),
+        consequences: oneLine(o.consequences, 400),
+        ...(o.effect ? { effect: o.effect } : {}),
+      })),
       recommended: { optionId: request.recommended, reasoning: oneLine(request.why, 1900) },
       source: { module: DECISION_MODULE, ref: request.subject },
       key: request.subject,
+      ...(request.structure ? { class: request.structure.class, evidence: request.structure.evidence } : {}),
     });
     const id = result.decision.id;
     return { ok: true, detail: result.created ? `decision ${id} raised` : `decision ${id} is already open`, ref: id };
