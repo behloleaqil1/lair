@@ -51,10 +51,7 @@ export function parseTasksDoc(text: string, doneMarker: string, onePerAgent = fa
   const malformed: TasksDoc["malformed"] = [];
   for (const entry of parseTasksFile(text, onePerAgent)) {
     if (entry.kind === "task") {
-      // Only include tasks with an assigned agent (non-null)
-      if (entry.agent !== null) {
-        tasks.push({ line: entry.line, agent: entry.agent, name: entry.name, task: entry.task, description: entry.description });
-      }
+      tasks.push({ line: entry.line, agent: entry.agent, name: entry.name, task: entry.task, description: entry.description });
     } else {
       malformed.push({ line: entry.line, reason: entry.reason, text: entry.text });
     }

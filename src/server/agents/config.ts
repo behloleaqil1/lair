@@ -127,12 +127,16 @@ const WakeSchema = z
   })
   .strict();
 
+/** Where fill looks for ready work (fill.idle.ready_sources). Only the tasks file is wired; the plan's sources come later. */
+export const IDLE_READY_SOURCES = ["tasks_file"] as const;
+export type IdleReadySource = (typeof IDLE_READY_SOURCES)[number];
+
 const IdleSchema = z
   .object({
-    /** Idle past this raises one notice per agent (minutes); 0 = off */
-    notice_minutes: z.number().int().min(0).max(1440).default(15),
-    /** Check for ready work from these sources (tasks_file always included) */
-    ready_sources: z.array(z.enum(["tasks_file", "backlog", "tracker"])).default(["tasks_file"]),
+    /** An allowlisted agent idle this long while ready work exists raises one notice (minutes); 0, the default, is off */
+    notice_minutes: z.number().int().min(0).max(1440).default(0),
+    /** Where ready work comes from: only "tasks_file" (its unassigned lines) is wired so far */
+    ready_sources: z.array(z.enum(IDLE_READY_SOURCES)).min(1).default(["tasks_file"]),
   })
   .strict();
 
@@ -337,8 +341,9 @@ export interface FillSettings {
     fallbackSeconds: number;
   };
   idle: {
+    /** 0: off (the idle states are still shown) */
     noticeMinutes: number;
-    readySources: ("tasks_file" | "backlog" | "tracker")[];
+    readySources: IdleReadySource[];
   };
 }
 
@@ -415,6 +420,21 @@ export function fillPatternFor(template: string, task: string, agent: string): F
     task: template.includes("{task}") ? task : null,
     agent: template.includes("{agent}") ? agent : null,
   };
+}
+
+/**
+ * A fill pattern for a task no agent is assigned to (an unassigned tasks_file
+ * line): `{agent}` matches any agent id, so a line by whoever did the task
+ * counts. null when the template doesn't name the task: then no queue line
+ * can be about this task. Throws when it doesn't compile.
+ */
+export function anyAgentPatternFor(template: string, task: string): FillPattern | null {
+  if (!template.includes("{task}")) return null;
+  const regex = new RegExp(
+    template.replace(/\{(task|agent)\}/g, (_match, name: string) => (name === "task" ? escapeRegExp(task) : "[A-Za-z][A-Za-z0-9_-]*")),
+    "i",
+  );
+  return { regex, task, agent: null };
 }
 
 /** A queue line reports what the pattern looks for (see taskLineMatch). */

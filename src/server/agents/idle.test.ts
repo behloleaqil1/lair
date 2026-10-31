@@ -1,306 +1,164 @@
 /**
- * Tests for the idle detection module (idle.ts).
- * These tests verify that:
- * - An idle agent with ready work gets noticed
- * - The notice is raised once per incident (not spammed)
- * - Capacity explanations are correct
+ * Idle detection (idle.ts), on lines shaped as fill.ts shows them. The
+ * acceptance tests (acceptance.test.ts, "idle detection") drive the same
+ * through fill's real check, tasks file and queue file.
  */
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import type { FillLineView } from "../../shared/agents-types.js";
 import {
   classifyAgent,
   computeIdleStates,
   findReadyWork,
   idleExplanation,
-  shouldNotice,
   idleStateView,
-  type IdleSettings,
+  shouldNotice,
+  type IdleInput,
   type IdleState,
-  DEFAULT_IDLE_SETTINGS,
 } from "./idle.js";
 
-function makeLine(overrides: Partial<FillLineView>): FillLineView {
+const MIN = 60_000;
+const NOW = Date.parse("2026-01-01T12:00:00Z");
+
+function line(overrides: Partial<FillLineView>): FillLineView {
   return {
     line: 1,
-    agent: "kiro-A",
-    name: "Smaug",
+    agent: "worker-a",
+    name: "A",
     task: "task-1",
-    description: "A test task",
+    description: "A task",
     state: "started",
-    detail: "running",
+    detail: "",
     hold: null,
     releasable: false,
     waiting: null,
-    runId: "run-1",
+    runId: null,
     decisionId: null,
     ...overrides,
   };
 }
 
+const unassigned = (task: string, ready = true): FillLineView =>
+  line({ agent: null, name: "", task, state: "unassigned", ready, detail: ready ? "no agent assigned" : "not ready" });
+
+function input(lines: FillLineView[], more: Partial<IdleInput> = {}): IdleInput {
+  return { lines, busy: new Set(), activeCount: 0, maxActive: 5, capacityRefused: false, readOnly: false, ...more };
+}
+
 describe("classifyAgent", () => {
-  it("returns busy when agent has a started task", () => {
-    const lines: FillLineView[] = [makeLine({ agent: "kiro-A", state: "started", task: "task-1" })];
-    const result = classifyAgent("kiro-A", lines, 1, 5, false);
-    expect(result.reason).toBe("busy");
-    expect(result.task).toBe("task-1");
+  it("an active run is busy, whatever its lines say (a run with no line, an owner's run)", () => {
+    expect(classifyAgent("worker-a", input([line({ state: "started" })]))).toEqual({ reason: "busy", task: "task-1" });
+    expect(classifyAgent("worker-a", input([], { busy: new Set(["worker-a"]) }))).toEqual({ reason: "busy" });
+    // A held line before its started one in file order is still busy (the started line wins)
+    const lines = [line({ task: "t-held", state: "held", hold: "backoff" }), line({ task: "t-run", state: "started" })];
+    expect(classifyAgent("worker-a", input(lines)).reason).toBe("busy");
+    // Ids compare case-insensitively, as fill's do
+    expect(classifyAgent("Worker-A", input([], { busy: new Set(["worker-a"]) })).reason).toBe("busy");
   });
 
-  it("returns waiting when agent's task is waiting on a gate", () => {
-    const lines: FillLineView[] = [makeLine({ agent: "kiro-A", state: "held", hold: "waiting", task: "task-1" })];
-    const result = classifyAgent("kiro-A", lines, 0, 5, false);
-    expect(result.reason).toBe("waiting");
-    expect(result.hold).toBe("waiting");
-    expect(result.task).toBe("task-1");
+  it("a wait comes first, then max_active, then capacity, then any other hold", () => {
+    const held = (hold: FillLineView["hold"], task: string) => line({ task, state: "held", hold });
+    expect(classifyAgent("worker-a", input([held("blocked", "a"), held("waiting", "b")]))).toEqual({ reason: "waiting", hold: "waiting", task: "b" });
+    expect(classifyAgent("worker-a", input([held("blocked", "a"), held("max_active", "b")]))).toEqual({ reason: "max_active", hold: "max_active", task: "b" });
+    expect(classifyAgent("worker-a", input([held("capacity_load", "a")]))).toEqual({ reason: "capacity", hold: "capacity_load", task: "a" });
+    expect(classifyAgent("worker-a", input([held("paused", "a")]))).toEqual({ reason: "held", hold: "paused", task: "a" });
+    expect(classifyAgent("worker-a", input([held("read_only", "a")]))).toEqual({ reason: "held", hold: "read_only", task: "a" });
   });
 
-  it("returns held with hold kind when agent's task is held", () => {
-    const lines: FillLineView[] = [makeLine({ agent: "kiro-A", state: "held", hold: "blocked", task: "task-1" })];
-    const result = classifyAgent("kiro-A", lines, 0, 5, false);
-    expect(result.reason).toBe("held");
-    expect(result.hold).toBe("blocked");
-  });
-
-  it("returns no_task when agent has no lines", () => {
-    const lines: FillLineView[] = [makeLine({ agent: "kiro-B", state: "started" })];
-    const result = classifyAgent("kiro-A", lines, 0, 5, false);
-    expect(result.reason).toBe("no_task");
-  });
-
-  it("returns task_done when all tasks are done", () => {
-    const lines: FillLineView[] = [makeLine({ agent: "kiro-A", state: "done", task: "task-1" })];
-    const result = classifyAgent("kiro-A", lines, 0, 5, false);
-    expect(result.reason).toBe("task_done");
-  });
-
-  it("returns max_active when fill.max_active is reached", () => {
-    const lines: FillLineView[] = [makeLine({ agent: "kiro-A", state: "done", task: "task-1" })];
-    const result = classifyAgent("kiro-A", lines, 5, 5, false);
-    expect(result.reason).toBe("max_active");
-  });
-
-  it("returns capacity when capacity_cmd refused", () => {
-    const lines: FillLineView[] = [makeLine({ agent: "kiro-A", state: "done", task: "task-1" })];
-    const result = classifyAgent("kiro-A", lines, 0, 5, true);
-    expect(result.reason).toBe("capacity");
+  it("with nothing of its own: read_only, max_active and capacity_cmd explain it before no_task, task_done, no_ready_work", () => {
+    const done = [line({ state: "done" })];
+    expect(classifyAgent("worker-a", input(done, { readOnly: true }))).toEqual({ reason: "held", hold: "read_only" });
+    expect(classifyAgent("worker-a", input(done, { activeCount: 2, maxActive: 2 }))).toEqual({ reason: "max_active" });
+    expect(classifyAgent("worker-a", input(done, { capacityRefused: true }))).toEqual({ reason: "capacity" });
+    expect(classifyAgent("worker-a", input(done))).toEqual({ reason: "task_done", task: "task-1" });
+    expect(classifyAgent("worker-a", input([line({ agent: "worker-b" })]))).toEqual({ reason: "no_task" });
+    expect(classifyAgent("worker-a", input([line({ state: "claimed" })]))).toEqual({ reason: "no_ready_work" });
+    // A malformed line has no agent: it isn't the agent's line
+    expect(classifyAgent("worker-a", input([line({ agent: null, task: null, state: "malformed" })]))).toEqual({ reason: "no_task" });
   });
 });
 
 describe("findReadyWork", () => {
-  it("finds tasks with no agent assigned", () => {
-    const lines: FillLineView[] = [
-      makeLine({ agent: null, task: "unassigned-task", state: "not_allowlisted", description: "Needs work" }),
+  it("only open unassigned lines are ready work: never not_allowlisted, done, claimed, not-ready or malformed lines", () => {
+    const lines = [
+      unassigned("open-1"),
+      unassigned("waiting-1", false),
+      line({ agent: null, task: "done-1", state: "done" }),
+      line({ agent: null, task: "claimed-1", state: "claimed" }),
+      line({ agent: "outside-agent", task: "theirs-1", state: "not_allowlisted" }),
+      line({ agent: null, task: null, state: "malformed", detail: "longer than 2000 characters: ..." }),
+      unassigned("open-2"),
     ];
-    const ready = findReadyWork(["tasks_file"], lines);
-    expect(ready).toHaveLength(1);
-    expect(ready[0].task).toBe("unassigned-task");
-    expect(ready[0].source).toBe("tasks_file");
-  });
-
-  it("finds tasks marked not_allowlisted (their agent not in fill.agents)", () => {
-    const lines: FillLineView[] = [
-      makeLine({ agent: "kiro-X", task: "orphan-task", state: "not_allowlisted" }),
-    ];
-    const ready = findReadyWork(["tasks_file"], lines);
-    expect(ready).toHaveLength(1);
-    expect(ready[0].task).toBe("orphan-task");
-  });
-
-  it("returns empty when all tasks are assigned and active", () => {
-    const lines: FillLineView[] = [
-      makeLine({ agent: "kiro-A", task: "task-1", state: "started" }),
-    ];
-    const ready = findReadyWork(["tasks_file"], lines);
-    expect(ready).toHaveLength(0);
+    expect(findReadyWork(["tasks_file"], lines)).toEqual([
+      { source: "tasks_file", task: "open-1" },
+      { source: "tasks_file", task: "open-2" },
+    ]);
+    expect(findReadyWork([], lines)).toEqual([]);
   });
 });
 
 describe("computeIdleStates", () => {
-  it("marks agent as ready_work when idle with ready work available", () => {
-    const lines: FillLineView[] = [
-      makeLine({ agent: "kiro-A", state: "done", task: "task-1" }),
-    ];
-    const readyWork = [{ source: "tasks_file" as const, task: "new-task" }];
-    const previous = new Map<string, IdleState>();
-    const now = Date.now();
+  const agents = ["worker-a", "worker-b"];
 
-    const states = computeIdleStates(["kiro-A"], lines, 0, 5, false, readyWork, now, previous);
-
-    expect(states).toHaveLength(1);
-    expect(states[0].agent).toBe("kiro-A");
-    expect(states[0].reason).toBe("ready_work");
-    expect(states[0].since).toBe(now);
+  it("an agent with nothing of its own is ready_work while ready work exists, with its cause and the ready tasks", () => {
+    const lines = [line({ state: "done" }), unassigned("free-1")];
+    const ready = findReadyWork(["tasks_file"], lines);
+    const [a, b] = computeIdleStates(agents, input(lines), ready, NOW, new Map());
+    expect(a).toMatchObject({ agent: "worker-a", reason: "ready_work", cause: "task_done", readyTasks: ["free-1"], since: NOW, duration: 0 });
+    // No line at all is the plainest case
+    expect(b).toMatchObject({ agent: "worker-b", reason: "ready_work", cause: "no_task", readyTasks: ["free-1"] });
+    expect(idleExplanation(b)).toBe("worker-b has no line in the tasks file, while ready work exists: unassigned free-1");
   });
 
-  it("marks agent as no_ready_work when idle with no ready work", () => {
-    const lines: FillLineView[] = [
-      makeLine({ agent: "kiro-A", state: "done", task: "task-1" }),
-    ];
-    const readyWork: { source: "tasks_file"; task: string }[] = [];
-    const previous = new Map<string, IdleState>();
-    const now = Date.now();
-
-    const states = computeIdleStates(["kiro-A"], lines, 0, 5, false, readyWork, now, previous);
-
-    expect(states).toHaveLength(1);
-    expect(states[0].reason).toBe("no_ready_work");
-  });
-
-  it("marks no_task agent as ready_work when ready work exists (F2 fix)", () => {
-    // An allowlisted agent has no line in the tasks file, but unassigned work exists
-    const lines: FillLineView[] = [
-      makeLine({ agent: "kiro-B", state: "started", task: "task-1" }), // another agent, not kiro-A
-    ];
-    const readyWork = [{ source: "tasks_file" as const, task: "unassigned-task" }];
-    const previous = new Map<string, IdleState>();
-    const now = Date.now();
-
-    const states = computeIdleStates(["kiro-A"], lines, 0, 5, false, readyWork, now, previous);
-
-    expect(states).toHaveLength(1);
-    expect(states[0].agent).toBe("kiro-A");
-    // F2: no_task should become ready_work when ready work exists
-    expect(states[0].reason).toBe("ready_work");
-    expect(states[0].since).toBe(now);
-  });
-
-  it("marks no_task agent as no_ready_work when no ready work exists", () => {
-    const lines: FillLineView[] = [
-      makeLine({ agent: "kiro-B", state: "started", task: "task-1" }), // another agent, not kiro-A
-    ];
-    const readyWork: { source: "tasks_file"; task: string }[] = [];
-    const previous = new Map<string, IdleState>();
-    const now = Date.now();
-
-    const states = computeIdleStates(["kiro-A"], lines, 0, 5, false, readyWork, now, previous);
-
-    expect(states).toHaveLength(1);
-    expect(states[0].agent).toBe("kiro-A");
-    expect(states[0].reason).toBe("no_ready_work");
-  });
-
-  it("preserves since timestamp for continuous idle state", () => {
-    const lines: FillLineView[] = [
-      makeLine({ agent: "kiro-A", state: "done", task: "task-1" }),
-    ];
-    const readyWork = [{ source: "tasks_file" as const, task: "new-task" }];
-    const earlierTime = Date.now() - 600_000; // 10 minutes ago
-    const previous = new Map<string, IdleState>([
-      ["kiro-A", { agent: "kiro-A", reason: "ready_work", since: earlierTime, duration: 600_000 }],
+  it("without ready work it keeps its own reason; busy, waiting and held agents never become ready_work", () => {
+    expect(computeIdleStates(agents, input([line({ state: "done" })]), [], NOW, new Map()).map((s) => s.reason)).toEqual(["task_done", "no_task"]);
+    const lines = [line({ state: "held", hold: "waiting" }), line({ agent: "worker-b", task: "t-b", state: "held", hold: "no_done" }), unassigned("free-1")];
+    const ready = findReadyWork(["tasks_file"], lines);
+    expect(computeIdleStates(agents, input(lines), ready, NOW, new Map()).map((s) => s.reason)).toEqual(["waiting", "held"]);
+    expect(computeIdleStates(agents, input([unassigned("free-1")], { activeCount: 5 }), ready, NOW, new Map()).map((s) => s.reason)).toEqual([
+      "max_active",
+      "max_active",
     ]);
-    const now = Date.now();
-
-    const states = computeIdleStates(["kiro-A"], lines, 0, 5, false, readyWork, now, previous);
-
-    expect(states[0].since).toBe(earlierTime);
-    expect(states[0].duration).toBeGreaterThanOrEqual(600_000);
-  });
-
-  it("resets since timestamp when state changes", () => {
-    const lines: FillLineView[] = [
-      makeLine({ agent: "kiro-A", state: "started", task: "task-1" }),
-    ];
-    const readyWork: { source: "tasks_file"; task: string }[] = [];
-    const earlierTime = Date.now() - 600_000;
-    const previous = new Map<string, IdleState>([
-      ["kiro-A", { agent: "kiro-A", reason: "ready_work", since: earlierTime, duration: 600_000 }],
+    expect(computeIdleStates(agents, input([unassigned("free-1")], { readOnly: true }), ready, NOW, new Map()).map((s) => s.reason)).toEqual([
+      "held",
+      "held",
     ]);
-    const now = Date.now();
+  });
 
-    const states = computeIdleStates(["kiro-A"], lines, 0, 5, false, readyWork, now, previous);
-
-    // State changed from ready_work to busy, so since should reset
-    expect(states[0].reason).toBe("busy");
-    expect(states[0].since).toBe(now);
+  it("since carries over while the reason stays, and starts again when it changes", () => {
+    const lines = [unassigned("free-1")];
+    const ready = findReadyWork(["tasks_file"], lines);
+    const first = computeIdleStates(["worker-a"], input(lines), ready, NOW, new Map());
+    const previous = new Map(first.map((s) => [s.agent, s]));
+    const [later] = computeIdleStates(["worker-a"], input(lines), ready, NOW + 7 * MIN, previous);
+    expect(later).toMatchObject({ reason: "ready_work", since: NOW, duration: 7 * MIN });
+    const [busy] = computeIdleStates(["worker-a"], input(lines, { busy: new Set(["worker-a"]) }), ready, NOW + 8 * MIN, previous);
+    expect(busy).toMatchObject({ reason: "busy", since: NOW + 8 * MIN, duration: 0 });
   });
 });
 
-describe("idleExplanation", () => {
-  it("explains no_task", () => {
-    const state: IdleState = { agent: "kiro-A", reason: "no_task", since: 0, duration: 0 };
-    expect(idleExplanation(state)).toBe("kiro-A has no line in the tasks file");
+describe("shouldNotice and the view", () => {
+  const state = (reason: IdleState["reason"], duration: number): IdleState => ({ agent: "worker-a", reason, since: NOW, duration, readyTasks: ["free-1"] });
+
+  it("only ready_work, only past notice_minutes, and never with notices off", () => {
+    expect(shouldNotice(state("ready_work", 15 * MIN), { noticeMinutes: 15 })).toBe(true);
+    expect(shouldNotice(state("ready_work", 15 * MIN - 1), { noticeMinutes: 15 })).toBe(false);
+    expect(shouldNotice(state("ready_work", 600 * MIN), { noticeMinutes: 0 })).toBe(false);
+    for (const reason of ["busy", "waiting", "held", "max_active", "capacity", "no_task", "task_done", "no_ready_work"] as const) {
+      expect(shouldNotice(state(reason, 600 * MIN), { noticeMinutes: 15 })).toBe(false);
+    }
   });
 
-  it("explains ready_work", () => {
-    const state: IdleState = { agent: "kiro-A", reason: "ready_work", since: 0, duration: 0 };
-    expect(idleExplanation(state)).toBe("kiro-A is idle while ready work exists");
-  });
-
-  it("explains held with hold kind", () => {
-    const state: IdleState = { agent: "kiro-A", reason: "held", hold: "blocked", task: "task-1", since: 0, duration: 0 };
-    expect(idleExplanation(state)).toBe("kiro-A is held (blocked) on task-1");
-  });
-
-  it("explains waiting", () => {
-    const state: IdleState = { agent: "kiro-A", reason: "waiting", task: "task-1", since: 0, duration: 0 };
-    expect(idleExplanation(state)).toBe("kiro-A is waiting on a gate for task-1");
-  });
-});
-
-describe("shouldNotice", () => {
-  it("returns true when idle with ready work past notice threshold", () => {
-    const state: IdleState = {
-      agent: "kiro-A",
+  it("the view carries the reason, the ready tasks and a plain explanation", () => {
+    expect(idleStateView({ ...state("ready_work", 90_000), cause: "no_task" })).toEqual({
+      agent: "worker-a",
       reason: "ready_work",
-      since: Date.now() - 20 * 60_000, // 20 minutes ago
-      duration: 20 * 60_000,
-    };
-    const settings: IdleSettings = { ...DEFAULT_IDLE_SETTINGS, noticeMinutes: 15 };
-    expect(shouldNotice(state, settings)).toBe(true);
-  });
-
-  it("returns false when idle with ready work but below threshold", () => {
-    const state: IdleState = {
-      agent: "kiro-A",
-      reason: "ready_work",
-      since: Date.now() - 5 * 60_000, // 5 minutes ago
-      duration: 5 * 60_000,
-    };
-    const settings: IdleSettings = { ...DEFAULT_IDLE_SETTINGS, noticeMinutes: 15 };
-    expect(shouldNotice(state, settings)).toBe(false);
-  });
-
-  it("returns false when not ready_work reason", () => {
-    const state: IdleState = {
-      agent: "kiro-A",
-      reason: "waiting",
-      since: Date.now() - 60 * 60_000, // 60 minutes ago
-      duration: 60 * 60_000,
-    };
-    const settings: IdleSettings = { ...DEFAULT_IDLE_SETTINGS, noticeMinutes: 15 };
-    expect(shouldNotice(state, settings)).toBe(false);
-  });
-
-  it("returns false when notice is disabled (noticeMinutes = 0)", () => {
-    const state: IdleState = {
-      agent: "kiro-A",
-      reason: "ready_work",
-      since: Date.now() - 60 * 60_000,
-      duration: 60 * 60_000,
-    };
-    const settings: IdleSettings = { ...DEFAULT_IDLE_SETTINGS, noticeMinutes: 0 };
-    expect(shouldNotice(state, settings)).toBe(false);
-  });
-});
-
-describe("idleStateView", () => {
-  it("converts internal state to API view", () => {
-    const now = Date.now();
-    const state: IdleState = {
-      agent: "kiro-A",
-      reason: "ready_work",
-      hold: undefined,
-      task: undefined,
-      since: now - 300_000, // 5 minutes ago
-      duration: 300_000,
-    };
-    const view = idleStateView(state);
-    expect(view.agent).toBe("kiro-A");
-    expect(view.reason).toBe("ready_work");
-    expect(view.hold).toBeUndefined();
-    expect(view.task).toBeUndefined();
-    expect(view.durationSeconds).toBe(300);
-    expect(view.explanation).toBe("kiro-A is idle while ready work exists");
-    // since is an ISO string
-    expect(new Date(view.since).getTime()).toBe(now - 300_000);
+      since: new Date(NOW).toISOString(),
+      durationSeconds: 90,
+      readyTasks: ["free-1"],
+      explanation: "worker-a has no line in the tasks file, while ready work exists: unassigned free-1",
+    });
+    expect(idleStateView({ agent: "worker-a", reason: "held", hold: "paused", task: "t-1", since: NOW, duration: 0 }).explanation).toBe(
+      "worker-a is held (paused) on t-1",
+    );
   });
 });

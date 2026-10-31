@@ -118,8 +118,6 @@ export function branchesFromTasks(content: string): TaskBranch[] {
   const out: TaskBranch[] = [];
   for (const entry of parseTasksFile(content)) {
     if (entry.kind !== "task") continue;
-    // Only process tasks with an assigned agent
-    if (entry.agent === null) continue;
     const named = new Set<string>();
     for (const pattern of [BRANCH_TAG, PREFIX_TOPIC]) {
       for (const match of entry.description.matchAll(pattern)) {

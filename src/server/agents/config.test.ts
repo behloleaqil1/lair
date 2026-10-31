@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { parse as parseYaml } from "yaml";
 import type { ProjectConfig } from "../../shared/types.js";
 import {
+  anyAgentPatternFor,
   backoffMs,
   DEFAULT_BLOCKED_PATTERN,
   DEFAULT_DONE_PATTERN,
@@ -166,7 +167,7 @@ describe("agents config", () => {
         fallbackSeconds: 900,
       },
       idle: {
-        noticeMinutes: 15,
+        noticeMinutes: 0,
         readySources: ["tasks_file"],
       },
     });
@@ -424,27 +425,41 @@ describe("agents config", () => {
     expect([1, 2, 3, 4].map((n) => backoffMs(n, 10, 60))).toEqual([10_000, 20_000, 40_000, 60_000]);
   });
 
-  it("fill.idle has documented defaults and validates ready_sources", () => {
+  it("fill.idle: notices are off by default; ready_sources takes only the wired source", () => {
     const parsed = parseAgentsConfig(undefined, project);
-    expect(parsed.ok && parsed.settings.fill.idle).toEqual({
-      noticeMinutes: 15,
-      readySources: ["tasks_file"],
-    });
+    expect(parsed.ok && parsed.settings.fill.idle).toEqual({ noticeMinutes: 0, readySources: ["tasks_file"] });
 
-    // Valid ready_sources
     const fill = {
       enabled: true,
       tasks_file: "work/tasks.txt",
       agents: ["worker-a"],
       prompt_files: ["{prompts_dir}/{agent}.txt"],
     };
-    const withIdle = (idle: Record<string, unknown>) => ({
-      enabled: true,
-      fill: { ...fill, idle },
-    });
-    expect(errorsOf(withIdle({ notice_minutes: 30, ready_sources: ["tasks_file", "backlog"] }))).toEqual([]);
-    expect(errorsOf(withIdle({ notice_minutes: 0 }))).toEqual([]); // 0 = off
-    expect(errorsOf(withIdle({ ready_sources: ["invalid_source"] }))[0]).toContain("agents.fill.idle.ready_sources.0");
+    const withIdle = (idle: Record<string, unknown>) => ({ enabled: true, fill: { ...fill, idle } });
+    const on = parseAgentsConfig(withIdle({ notice_minutes: 30, ready_sources: ["tasks_file"] }), project);
+    expect(on.ok && on.settings.fill.idle).toEqual({ noticeMinutes: 30, readySources: ["tasks_file"] });
+    expect(errorsOf(withIdle({ notice_minutes: 0 }))).toEqual([]);
+    // Sources that aren't wired, an empty list, a fraction, a negative or an unknown key are errors, never silent no-ops
+    expect(errorsOf(withIdle({ ready_sources: ["tasks_file", "backlog"] }))[0]).toContain("agents.fill.idle.ready_sources.1");
+    expect(errorsOf(withIdle({ ready_sources: ["tracker"] }))[0]).toContain("agents.fill.idle.ready_sources.0");
+    expect(errorsOf(withIdle({ ready_sources: [] }))[0]).toContain("agents.fill.idle.ready_sources");
+    expect(errorsOf(withIdle({ notice_minutes: 1.5 }))[0]).toContain("agents.fill.idle.notice_minutes");
+    expect(errorsOf(withIdle({ notice_minutes: -1 }))[0]).toContain("agents.fill.idle.notice_minutes");
+    expect(errorsOf(withIdle({ side_queue: [] }))[0]).toContain("agents.fill.idle");
+  });
+
+  it("anyAgentPatternFor: a done line for an unassigned task counts by any agent, and never without the task", () => {
+    const both = anyAgentPatternFor("^-\\s+DONE\\s+{task}\\b.*by\\s+{agent}", "feat-x");
+    expect(both).not.toBeNull();
+    expect(doneLineMatches(both!, "- DONE feat-x shipped by worker-b 12:00Z")).toBe(true);
+    expect(doneLineMatches(both!, "- DONE feat-x shipped by someone-else (Name): ok")).toBe(true);
+    expect(doneLineMatches(both!, "- DONE feat-xy by worker-b")).toBe(false);
+    expect(doneLineMatches(both!, "- WAITING feat-x by worker-b")).toBe(false);
+    const taskOnly = anyAgentPatternFor(DEFAULT_DONE_PATTERN, "feat-x");
+    expect(doneLineMatches(taskOnly!, "- DONE feat-x by worker-b 12:00Z: done")).toBe(true);
+    expect(doneLineMatches(taskOnly!, "- DONE feat-xy by worker-b")).toBe(false);
+    // A pattern that names only the agent can't say which task a line is about
+    expect(anyAgentPatternFor("^-\\s+DONE\\b.*by\\s+{agent}", "feat-x")).toBeNull();
   });
 
   it("fill.capacity: native capacity settings with load, memory, heavy_work, and agent_class", () => {

@@ -1,240 +1,175 @@
 /**
- * Idle detection and side tasks (docs/design/ROADMAP.md N9, never-idle):
- * no agent idles while ready work exists.
+ * Idle detection (docs/design/orchestration.md D1, observe mode): after each
+ * fill check, why each allowlisted agent is or isn't working, and whether it
+ * idles while ready work exists. Pure: fill.ts passes the check's lines and
+ * the agents with an active run, keeps the states between checks, and raises
+ * and withdraws the notice (fill_idle_notice / fill_idle_resolved).
  *
- * On each fill check, for every allowlisted agent:
- * 1. Is it idle? (no active run, no open task in the tasks file)
- * 2. If idle, is there ready work? (tasks file, backlog, tracker issues)
- * 3. If ready work exists, how long has it been idle?
- * 4. Idle past fill.idle.notice_minutes -> one notice per agent
- *
- * Side tasks:
- * - An agent whose task is waiting on a gate may run ONE side task from
- *   fill.side_queue, bounded to finish before its gate usually ends
- * - The main task resumes first when its gate lands
- *
- * Capacity explanation:
- * - Every agent's idle reason is computed: max_active, capacity, holds,
- *   launcher, or "no ready work"
+ * Ready work is an unassigned tasks_file line (an empty agent field) that
+ * fill found open (FillLineView.ready): not done in the queue, no active run
+ * or claim on its task, its last run not waiting or blocked. A line assigned
+ * to an agent fill doesn't run is that agent's, never ready work: it may be
+ * at work outside Lair, where fill can't see it. A malformed line (too long,
+ * a bad id, a duplicate) is never ready work.
  */
-import type { FillLineView, FillHold, IdleReason, IdleStateView } from "../../shared/agents-types.js";
+import type { FillHold, FillLineView, IdleReason, IdleStateView } from "../../shared/agents-types.js";
+import type { IdleReadySource } from "./config.js";
 
 export type { IdleReason };
 
-/** Internal idle state, kept in memory across checks */
+/** An agent's state, kept in memory between checks. */
 export interface IdleState {
   agent: string;
   reason: IdleReason;
-  /** The hold kind when reason is "held" */
+  /** ready_work: why it has nothing of its own (no_task, task_done or no_ready_work) */
+  cause?: "no_task" | "task_done" | "no_ready_work";
   hold?: FillHold;
-  /** The task it would work on, when held or waiting */
   task?: string;
-  /** When it became idle (ms), for notice timing */
+  /** When it entered this state (ms) */
   since: number;
-  /** How long it has been idle (ms) */
+  /** How long it has been in it (ms) */
   duration: number;
+  /** ready_work: the ready tasks' ids */
+  readyTasks?: string[];
 }
 
 export interface ReadyWork {
-  source: "tasks_file" | "backlog" | "tracker";
+  source: IdleReadySource;
   task: string;
-  description?: string;
-  priority?: number;
 }
 
-/** Settings for the idle detection (fill.idle in config). */
+/** fill.idle, as fill.ts reads it. */
 export interface IdleSettings {
-  /** Idle past this raises one notice per agent (minutes); 0 = off */
+  /** An agent in ready_work this long raises one notice (minutes); 0 = off */
   noticeMinutes: number;
-  /** Check for ready work from these sources */
-  readySources: ("tasks_file" | "backlog" | "tracker")[];
+  readySources: IdleReadySource[];
 }
 
-export const DEFAULT_IDLE_SETTINGS: IdleSettings = {
-  noticeMinutes: 15,
-  readySources: ["tasks_file"],
-};
+/** What one check knows besides the lines. */
+export interface IdleInput {
+  lines: FillLineView[];
+  /** The agents (lowercase) with an active run of any origin */
+  busy: ReadonlySet<string>;
+  /** Active runs fill started, and fill.max_active */
+  activeCount: number;
+  maxActive: number;
+  /** capacity_cmd refused this check: no line could start */
+  capacityRefused: boolean;
+  /** The project is read_only: fill starts nothing */
+  readOnly: boolean;
+}
+
+const MAX_READY_SHOWN = 10;
+
+const isCapacityHold = (hold: FillHold) => hold === "capacity" || hold.startsWith("capacity_");
 
 /**
- * Classify one agent's state from the fill lines.
- * Returns the idle reason and, when appropriate, the task and hold.
+ * One agent's state from the check: an active run first (whatever its lines
+ * say), then its lines' holds (a wait, fill's limits, any other hold), then
+ * what would keep it from new work (read_only, max_active, capacity_cmd).
+ * Left with nothing of its own (no line, its lines done or claimed by other
+ * runs), it is no_task, task_done or no_ready_work; computeIdleStates turns
+ * that into ready_work when ready work exists.
  */
-export function classifyAgent(
-  agent: string,
-  lines: FillLineView[],
-  activeCount: number,
-  maxActive: number,
-  capacityRefused: boolean,
-): { reason: IdleReason; hold?: FillHold; task?: string } {
-  // Find this agent's lines
-  const agentLines = lines.filter((l) => l.agent?.toLowerCase() === agent.toLowerCase());
+export function classifyAgent(agent: string, input: IdleInput): { reason: IdleReason; hold?: FillHold; task?: string } {
+  const lower = agent.toLowerCase();
+  const own = input.lines.filter((l) => l.agent !== null && l.agent.toLowerCase() === lower);
+  const started = own.find((l) => l.state === "started");
+  if (started || input.busy.has(lower)) return { reason: "busy", task: started?.task ?? undefined };
 
-  if (agentLines.length === 0) {
-    return { reason: "no_task" };
-  }
+  const held = own.filter((l): l is FillLineView & { hold: FillHold } => l.state === "held" && l.hold !== null);
+  const first = (match: (hold: FillHold) => boolean) => held.find((l) => match(l.hold));
+  const shown = (l: FillLineView & { hold: FillHold }) => ({ hold: l.hold, task: l.task ?? undefined });
+  const waiting = first((h) => h === "waiting");
+  if (waiting) return { reason: "waiting", ...shown(waiting) };
+  const max = first((h) => h === "max_active");
+  if (max) return { reason: "max_active", ...shown(max) };
+  const capacity = first(isCapacityHold);
+  if (capacity) return { reason: "capacity", ...shown(capacity) };
+  if (held[0]) return { reason: "held", ...shown(held[0]) };
 
-  // Check each line's state
-  for (const line of agentLines) {
-    if (line.state === "started") {
-      // Agent is working, not idle
-      return { reason: "busy", task: line.task ?? undefined };
-    }
-    if (line.state === "held" && line.hold === "waiting") {
-      return { reason: "waiting", task: line.task ?? undefined, hold: "waiting" };
-    }
-    if (line.state === "held" && line.hold === "max_active") {
-      return { reason: "max_active", task: line.task ?? undefined };
-    }
-    if (line.state === "held" && line.hold === "capacity") {
-      return { reason: "capacity", task: line.task ?? undefined };
-    }
-    if (line.state === "held" && line.hold) {
-      return { reason: "held", task: line.task ?? undefined, hold: line.hold };
-    }
-    if (line.state === "done") {
-      continue; // Check other lines
-    }
-    if (line.state === "claimed") {
-      // Another agent has this task
-      continue;
-    }
-    if (line.state === "not_allowlisted") {
-      continue;
-    }
-    if (line.state === "malformed") {
-      continue;
-    }
-  }
-
-  // Agent has no active work - check why it isn't starting
-  if (activeCount >= maxActive) {
-    return { reason: "max_active" };
-  }
-  if (capacityRefused) {
-    return { reason: "capacity" };
-  }
-
-  // All tasks done or not available
-  const allDone = agentLines.every((l) => l.state === "done" || l.state === "malformed" || l.state === "not_allowlisted");
-  if (allDone) {
-    return { reason: "task_done" };
-  }
-
-  // No obvious reason - will check for ready work
+  if (input.readOnly) return { reason: "held", hold: "read_only" };
+  if (input.activeCount >= input.maxActive) return { reason: "max_active" };
+  if (input.capacityRefused) return { reason: "capacity" };
+  if (own.length === 0) return { reason: "no_task" };
+  const done = own.filter((l) => l.state === "done");
+  if (done.length === own.length) return { reason: "task_done", task: done[done.length - 1].task ?? undefined };
   return { reason: "no_ready_work" };
 }
 
-/**
- * Find ready work from the available sources.
- * Ready work is a task that:
- * - Is not assigned to any agent (unassigned state), OR
- * - Has an agent not in fill.agents (not_allowlisted state)
- * - Is not done
- * - Has no unmet dependencies (in the plan)
- */
-export function findReadyWork(
-  sources: IdleSettings["readySources"],
-  tasksFileLines: FillLineView[],
-  _backlogTasks?: { task: string; description?: string; priority?: number }[],
-  _trackerIssues?: { task: string; description?: string; priority?: number }[],
-): ReadyWork[] {
-  const ready: ReadyWork[] = [];
-
-  if (sources.includes("tasks_file")) {
-    // Tasks in the tasks file that are unassigned OR not_allowlisted (ready for any agent)
-    for (const line of tasksFileLines) {
-      if ((line.state === "unassigned" || line.state === "not_allowlisted") && line.task) {
-        ready.push({
-          source: "tasks_file",
-          task: line.task,
-          description: line.description ?? undefined,
-        });
-      }
-    }
-  }
-
-  // TODO: Add backlog and tracker sources in future PRs
-  // These require reading the plan sources (planner module integration)
-
-  return ready;
+/** The ready work in the sources fill.idle names: the open unassigned lines of the tasks file. */
+export function findReadyWork(sources: IdleReadySource[], lines: FillLineView[]): ReadyWork[] {
+  if (!sources.includes("tasks_file")) return [];
+  return lines.flatMap((l) =>
+    l.state === "unassigned" && l.ready === true && l.task !== null ? [{ source: "tasks_file" as const, task: l.task }] : [],
+  );
 }
 
 /**
- * Compute the idle states for all allowlisted agents.
+ * Every allowlisted agent's state. `since` carries over from `previous`
+ * while the reason stays the same (fill seeds it with an open notice's
+ * episode after a restart), else it is `now`.
  */
 export function computeIdleStates(
-  allowedAgents: string[],
-  lines: FillLineView[],
-  activeCount: number,
-  maxActive: number,
-  capacityRefused: boolean,
+  agents: string[],
+  input: IdleInput,
   readyWork: ReadyWork[],
   now: number,
-  previousStates: Map<string, IdleState>,
+  previous: ReadonlyMap<string, Pick<IdleState, "reason" | "since">>,
 ): IdleState[] {
-  const states: IdleState[] = [];
-  const hasReadyWork = readyWork.length > 0;
-
-  for (const agent of allowedAgents) {
-    const { reason, hold, task } = classifyAgent(agent, lines, activeCount, maxActive, capacityRefused);
-
-    // Determine if this is a "ready_work" idle (the problem case) or "no_ready_work"
-    let finalReason = reason;
-    if (reason === "task_done" || reason === "no_task") {
-      // Agent's tasks are done or it has no line - check if ready work exists
-      // F2: no_task agents should be ready_work when unassigned work exists
-      finalReason = hasReadyWork ? "ready_work" : "no_ready_work";
-    } else if (reason === "no_ready_work" && hasReadyWork) {
-      finalReason = "ready_work";
-    }
-
-    // Track since when this agent has been in this state
-    const previous = previousStates.get(agent);
-    const since = previous && previous.reason === finalReason ? previous.since : now;
-
-    states.push({
-      agent,
-      reason: finalReason,
-      hold,
-      task,
-      since,
-      duration: now - since,
-    });
-  }
-
-  return states;
+  const readyTasks = readyWork.slice(0, MAX_READY_SHOWN).map((w) => w.task);
+  return agents.map((agent) => {
+    const { reason, hold, task } = classifyAgent(agent, input);
+    const idle = reason === "no_task" || reason === "task_done" || reason === "no_ready_work";
+    const state: IdleState =
+      idle && readyWork.length > 0
+        ? { agent, reason: "ready_work", cause: reason, task, readyTasks, since: now, duration: 0 }
+        : { agent, reason, hold, task, since: now, duration: 0 };
+    const before = previous.get(agent);
+    if (before && before.reason === state.reason && before.since <= now) state.since = before.since;
+    state.duration = now - state.since;
+    return state;
+  });
 }
 
-/**
- * Human-readable explanation of why an agent is idle.
- */
+const CAUSE: Record<NonNullable<IdleState["cause"]>, (s: IdleState) => string> = {
+  no_task: (s) => `${s.agent} has no line in the tasks file`,
+  task_done: (s) => `${s.agent}'s task${s.task ? ` ${s.task}` : ""} is done`,
+  no_ready_work: (s) => `${s.agent}'s tasks are claimed by other runs`,
+};
+
+/** A plain sentence for the state (fill's words and ids only: never a line's description). */
 export function idleExplanation(state: IdleState): string {
+  const on = state.task ? ` on ${state.task}` : "";
   switch (state.reason) {
-    case "no_task":
-      return `${state.agent} has no line in the tasks file`;
-    case "task_done":
-      return `${state.agent}'s task${state.task ? ` (${state.task})` : ""} is done, with no next task`;
-    case "max_active":
-      return `${state.agent} is held: fill.max_active reached`;
-    case "capacity":
-      return `${state.agent} is held: capacity_cmd refused`;
     case "busy":
-      return `${state.agent} is working on ${state.task ?? "a task"}`;
-    case "held":
-      return `${state.agent} is held (${state.hold ?? "unknown"}) on ${state.task ?? "a task"}`;
+      return `${state.agent} is working${on}`;
     case "waiting":
-      return `${state.agent} is waiting on a gate for ${state.task ?? "a task"}`;
+      return `${state.agent} is waiting on a gate${on}`;
+    case "held":
+      return state.hold === "read_only" && !state.task
+        ? `${state.agent} is held: the project is read_only, so fill starts nothing`
+        : `${state.agent} is held (${state.hold ?? "unknown"})${on}`;
+    case "max_active":
+      return `${state.agent} is held: fill.max_active is reached${on}`;
+    case "capacity":
+      return `${state.agent} is held: no capacity (${state.hold ?? "capacity_cmd"})${on}`;
+    case "no_task":
+      return `${state.agent} has no line in the tasks file; no ready work exists`;
+    case "task_done":
+      return `${CAUSE.task_done(state)}, with no next task; no ready work exists`;
     case "no_ready_work":
-      return `${state.agent} is idle: no ready work exists`;
-    case "ready_work":
-      return `${state.agent} is idle while ready work exists`;
+      return `${CAUSE.no_ready_work(state)}; no ready work exists`;
+    case "ready_work": {
+      const why = state.cause ? CAUSE[state.cause](state) : `${state.agent} is idle`;
+      const tasks = state.readyTasks ?? [];
+      return `${why}, while ready work exists: ${tasks.length > 0 ? `unassigned ${tasks.join(", ")}` : "unassigned tasks"}`;
+    }
   }
 }
 
-/**
- * Check if an idle state should trigger a notice.
- */
-export function shouldNotice(state: IdleState, settings: IdleSettings): boolean {
+/** The state is idle while ready work exists, for fill.idle.notice_minutes or more (and notices are on). */
+export function shouldNotice(state: IdleState, settings: Pick<IdleSettings, "noticeMinutes">): boolean {
   if (settings.noticeMinutes <= 0) return false;
   if (state.reason !== "ready_work") return false;
   return state.duration >= settings.noticeMinutes * 60_000;
@@ -242,17 +177,15 @@ export function shouldNotice(state: IdleState, settings: IdleSettings): boolean 
 
 const iso = (ms: number) => new Date(ms).toISOString();
 
-/**
- * Convert an internal IdleState to the API view.
- */
 export function idleStateView(state: IdleState): IdleStateView {
   return {
     agent: state.agent,
     reason: state.reason,
-    hold: state.hold,
-    task: state.task,
+    ...(state.hold ? { hold: state.hold } : {}),
+    ...(state.task ? { task: state.task } : {}),
     since: iso(state.since),
     durationSeconds: Math.round(state.duration / 1000),
+    ...(state.readyTasks ? { readyTasks: state.readyTasks } : {}),
     explanation: idleExplanation(state),
   };
 }
