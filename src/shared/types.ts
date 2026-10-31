@@ -131,6 +131,12 @@ export interface ProjectConfig {
    * docs/configuration.md#supervisor-self-checks-and-the-ops-api
    */
   supervisor?: Record<string, unknown>;
+  /**
+   * Agent checks: agents test on a runner before they gate
+   * (src/server/checks/). Validated by parseChecksConfig; see
+   * docs/configuration.md#checks
+   */
+  checks?: Record<string, unknown>;
 }
 
 // Process configuration as it appears in YAML (before defaults applied)

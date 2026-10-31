@@ -14,6 +14,7 @@ import { QueueCacheManager } from "./services/queue-cache.js";
 import { isValidDragonId } from "./parsers/dragon-config.js";
 import { registerRootGuards, requireValidIdParam } from "./root-guards.js";
 import { mountDecisions } from "./decisions/index.js";
+import { mountDecisionPolicies } from "./decisions/policies/index.js";
 import { mountBrainTrainer } from "./brain-trainer/index.js";
 import { mountOutcomeTracker } from "./outcomes/index.js";
 import { loadNotificationConfig, mountNotifications } from "./notifications/index.js";
@@ -55,6 +56,7 @@ import { ReviewManager, inboxDecisionSink, registerReviewRoutes } from "./review
 import { mountTriage } from "./triage/index.js";
 import { PlacementManager, registerPlacementRoutes } from "./placement/index.js";
 import { CloudManager, registerCloudRoutes } from "./cloud/index.js";
+import { ChecksManager, agentRunIsActive, registerChecksRoutes } from "./checks/index.js";
 import { registerDashboardRoutes } from "./dashboard/index.js";
 import type { DashboardSources } from "./dashboard/routes.js";
 import { RequestLatency, mountSupervisor, registerLatencyHook } from "./supervisor/index.js";
@@ -554,6 +556,21 @@ const decisionInbox = await mountDecisions(fastify, {
   producers: [watchdogs, agents],
 });
 
+// Decision policies (src/server/decisions/policies/): off unless data/server.yaml sets decision_policies.enabled.
+// The table in data/policies.yaml (a built-in one without the file), rules C1-C4 and C11 in shadow. Each raised
+// decision gets a proposal in the policy trace, compared with the answer a person gives; nothing here answers,
+// withdraws or changes a decision. Only while it is on does the agents module update a raised decision's evidence
+// (cause_cleared) for the rules.
+await mountDecisionPolicies(fastify, {
+  configPath: join(process.cwd(), "data", "server.yaml"),
+  policiesPath: join(process.cwd(), "data", "policies.yaml"),
+  inbox: decisionInbox,
+  events: getEventBus(),
+  humanAuth,
+  evidenceProducers: [agents],
+  log: (line) => console.warn(`[decisions] ${line}`),
+});
+
 // Notifications (src/server/notifications/): opt-in desktop and ntfy pushes when a new action item opens,
 // batched (one a minute at most), with a daily reminder; configured in data/server.yaml. Owner-only routes under
 // /api/owner. Notices are never notified
@@ -680,6 +697,27 @@ const clouds = new CloudManager({
 });
 clouds.load(projectEntries);
 await registerCloudRoutes(fastify, clouds, () => getDefaultProject(), humanAuth);
+
+// Agent checks (src/server/checks/): agents test on a runner before they gate.
+// One per project with `checks:` configured (off by default). A request needs
+// the run's bus token and a run the agents module has running; a run tests the
+// branch its first accepted check named, and the sha must be on that branch as
+// pushed to the remote.
+const checks = new ChecksManager({
+  dbPath: join(process.cwd(), "data"),
+  outputDir: join(process.cwd(), "data", "checks-output"),
+  events: getEventBus(),
+  isRunActive: (project, runId, agent) => agentRunIsActive(agents.getStore(), project, runId, agent),
+});
+checks.load(projectEntries);
+// POST takes the run's bus token; GET /:id the token of the run that asked or the owner's session;
+// the list and the stats the owner's session only
+await registerChecksRoutes(fastify, {
+  manager: checks,
+  defaultProject: () => getDefaultProject(),
+  ownerAuth: humanAuth,
+  dataDir: join(process.cwd(), "data"),
+});
 
 // The dashboard's own reads (src/server/dashboard/): the nav's module flags,
 // a gate's detail from the queue, the pipelines, triage and placement, and
@@ -877,6 +915,8 @@ const stopServer = async (reason: string) => {
   await placements.stop();
   // Stop cloud checks: a check in progress finishes, then the store closes
   await clouds.stop();
+  // Stop agent checks: running checks are marked interrupted, stores close
+  await checks.stop();
 
   // Stop the shared process cache (all modules have stopped, so no one reads it)
   disposeProcessCache();
@@ -1049,6 +1089,14 @@ const start = async () => {
       metered.length > 0
         ? `[cloud] Watching cloud machines for: ${metered.join(", ")}`
         : "[cloud] Off (no project sets cloud.enabled)",
+    );
+
+    // Start agent checks (reconcile queued/running from a restart)
+    const checking = checks.start();
+    console.log(
+      checking.length > 0
+        ? `[checks] Agent checks for: ${checking.join(", ")}`
+        : "[checks] Off (no project sets checks:)",
     );
 
     // Start file watchers for all projects

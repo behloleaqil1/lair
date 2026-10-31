@@ -250,6 +250,7 @@ export type EventType =
   | "agent.budget.exceeded"
   | "agents.fill_started"
   | "agents.fill_held"
+  | "agents.fill_unmatched"
   // Gate results, for triage: {project, result: GateResult, reports?, context?}
   | "gate.completed"
   // Triage (src/server/triage/)
@@ -301,7 +302,12 @@ export type EventType =
   | "planner.verifier_finished"
   // Bus (src/server/bus/)
   | "bus.report"
-  | "bus.message";
+  | "bus.message"
+  // Checks (src/server/checks/)
+  | "check.requested"
+  | "check.started"
+  | "check.completed"
+  | "check.reconciled";
 
 /** Event stored in the database */
 export interface Event {
