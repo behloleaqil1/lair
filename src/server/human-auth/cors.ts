@@ -58,6 +58,8 @@ export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/pipelines",
   // Only the owner's message route of the bus: its board and event stream keep their CORS
   "/api/bus/send",
+  // Host services owner routes: the tick route triggers start commands
+  "/api/host-services/owner",
 ];
 
 export function isUnder(url: string, prefixes: readonly string[]): boolean {

@@ -73,6 +73,16 @@ export interface StoredServiceState {
   decisionId: string | null;
   /** Last probe result */
   lastProbe: ProbeResult | null;
+  /** When the current outage started (first failed probe after up); null if up */
+  outageStartedAt: string | null;
+  /**
+   * Consecutive failures in this outage; resets only after the service has
+   * stayed up for `stableWindowMs`. A flapping service (up briefly then down
+   * again) keeps its failure count so the backoff grows.
+   */
+  consecutiveFailures: number;
+  /** When the service first came up in this recovery; null if currently down */
+  recoveryStartedAt: string | null;
 }
 
 /** Module configuration (parsed from the project's host_services block). */

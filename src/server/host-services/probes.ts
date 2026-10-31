@@ -51,10 +51,9 @@ export class ExecFileRunner implements CommandRunner {
       return Promise.resolve({ code: -1, stdout: "", stderr: "empty command" });
     }
     return new Promise((resolve) => {
-      let timedOut = false;
       const timeoutMs = options.timeoutMs ?? this.defaultTimeoutMs;
 
-      const child = execFile(
+      execFile(
         file,
         args,
         {
@@ -70,12 +69,9 @@ export class ExecFileRunner implements CommandRunner {
             return;
           }
 
-          // If the child exited with output but the timer fired after, treat
-          // it as success: the event loop was blocked, not the command.
-          if (error.killed && timedOut && stdout && stdout.length > 0) {
-            resolve({ code: 0, stdout, stderr: stderr ?? "" });
-            return;
-          }
+          // A killed command (by timeout or signal) is always a failure,
+          // even if it printed output before dying. A hung probe that prints
+          // output and then times out must not read as "up".
 
           const code =
             typeof (error as { code?: unknown }).code === "number"
@@ -92,15 +88,6 @@ export class ExecFileRunner implements CommandRunner {
           });
         },
       );
-
-      // Track if the timeout fired for the callback
-      const timer = setTimeout(() => {
-        timedOut = true;
-      }, timeoutMs);
-
-      child.once("close", () => {
-        clearTimeout(timer);
-      });
     });
   }
 }

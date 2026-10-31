@@ -41,7 +41,7 @@ export const PUBLIC_ROUTE_PREFIXES: Readonly<Record<string, string>> = {
   "/api/nodes": "scheduler node reads; the scheduler's hook asks for the owner on every change",
   "/api/jobs": "scheduler job reads; the scheduler's hook asks for the owner on every change",
   "/api/stats": "scheduler statistics reads; the scheduler's hook asks for the owner on every change",
-  "/api/host-services": "read-only host services status; owner tick is checked in the route handler",
+  "/api/host-services": "read-only host services status; the tick route is under /api/host-services/owner",
 };
 
 /**

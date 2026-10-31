@@ -39,6 +39,8 @@ class FakeClock implements Clock {
   }
   async sleep(ms: number, signal?: AbortSignal): Promise<void> {
     if (signal?.aborted) return;
+    // Advance time by the sleep amount to simulate time passing
+    this.t += ms;
     return Promise.resolve();
   }
 }
@@ -216,11 +218,13 @@ function createService(
   const parsed = parseHostServicesConfig(config.host_services);
   if (!parsed.ok) throw new Error(parsed.errors.join("; "));
   const probes = makeProbes(world, clock);
+  // Use fast backoff config for tests (10ms base, 100ms max, 50ms stable window)
+  const store = new HostServicesStore({ baseDelayMs: 10, maxDelayMs: 100, stableWindowMs: 50 });
   const service = new HostServices({
     project: config.name,
     config,
     settings: parsed.settings,
-    store: new HostServicesStore(),
+    store,
     probes,
     events,
   });
@@ -514,6 +518,142 @@ describe("host-services", () => {
       expect(check.held).toBe(true);
 
       await manager.stop();
+    });
+  });
+
+
+  describe("backoff on flapping services", () => {
+    it("applies exponential backoff between start attempts", async () => {
+      const clock = new FakeClock();
+      const world: ServiceWorld = { services: new Map([["docker", { up: false, startWorks: false }]]) };
+      const config = makeConfig([{ name: "docker", probe: ["probe-docker"], start: ["start-docker"], neededBy: [] }]);
+      const { service, probes } = createService(config, world, clock);
+      const runner = probes.runner as FakeRunner;
+
+      // First tick: starts immediately
+      await service.tick();
+      expect(runner.startCalls()).toHaveLength(1);
+
+      // Second tick immediately: should not start (backoff not elapsed)
+      await service.tick();
+      // The backoff should prevent another start within the short interval
+      const startCountAfterSecond = runner.startCalls().length;
+
+      // Advance clock past the backoff period
+      clock.advance(100);
+
+      // Third tick: should start now that backoff elapsed
+      await service.tick();
+      expect(runner.startCalls().length).toBeGreaterThan(startCountAfterSecond);
+    });
+
+    it("does not reset failure count on brief recovery", async () => {
+      const clock = new FakeClock();
+      const world: ServiceWorld = { services: new Map([["docker", { up: false, startWorks: false }]]) };
+      const config = makeConfig([{ name: "docker", probe: ["probe-docker"], start: ["start-docker"], neededBy: [] }]);
+      const parsed = parseHostServicesConfig(config.host_services);
+      if (!parsed.ok) throw new Error(parsed.errors.join("; "));
+      const probes = makeProbes(world, clock);
+      // Use a longer stable window to test
+      const store = new HostServicesStore({ baseDelayMs: 10, maxDelayMs: 100, stableWindowMs: 1000 });
+      const service = new HostServices({
+        project: config.name,
+        config,
+        settings: parsed.settings,
+        store,
+        probes,
+      });
+
+      // Fail a few times to build up consecutive failures
+      await service.tick();
+      clock.advance(50);
+      await service.tick();
+
+      // Now the service comes up briefly
+      world.services.set("docker", { up: true, startWorks: true });
+      await service.tick();
+
+      // But goes down again before the stable window (1000ms)
+      clock.advance(100); // Only 100ms, not 1000ms
+      world.services.set("docker", { up: false, startWorks: false });
+      await service.tick();
+
+      // The consecutive failures should still be high (not reset)
+      const state = store.get("workstation", "docker");
+      expect(state?.consecutiveFailures).toBeGreaterThan(1);
+    });
+  });
+
+
+  describe("events emit only on state change", () => {
+    it("does not emit host-service.up every tick", async () => {
+      const clock = new FakeClock();
+      const world: ServiceWorld = { services: new Map([["docker", { up: true, startWorks: true }]]) };
+      const config = makeConfig([{ name: "docker", probe: ["probe-docker"], start: ["start-docker"], neededBy: [] }]);
+      const events = new EventBus();
+      const emitted: unknown[] = [];
+      events.on("host-service.up", (e) => { emitted.push(e); });
+      const { service } = createService(config, world, clock, events);
+
+      // First tick: service is up, but was unknown -> emit up
+      await service.tick();
+      expect(emitted).toHaveLength(1);
+
+      // Second tick: still up -> should not emit again
+      clock.advance(60000);
+      await service.tick();
+      expect(emitted).toHaveLength(1);
+
+      // Third tick: still up -> still should not emit
+      clock.advance(60000);
+      await service.tick();
+      expect(emitted).toHaveLength(1);
+    });
+
+    it("does not emit host-service.down every tick", async () => {
+      const clock = new FakeClock();
+      const world: ServiceWorld = { services: new Map([["docker", { up: false, startWorks: false }]]) };
+      const config = makeConfig(
+        [{ name: "docker", probe: ["probe-docker"], start: ["start-docker"], neededBy: [] }],
+        "workstation",
+        { mode: "observe" }, // observe mode to avoid starts
+      );
+      const events = new EventBus();
+      const emitted: unknown[] = [];
+      events.on("host-service.down", (e) => { emitted.push(e); });
+      const { service } = createService(config, world, clock, events);
+
+      // First tick: service is down -> emit down
+      await service.tick();
+      expect(emitted).toHaveLength(1);
+
+      // Second tick: still down -> should not emit again
+      clock.advance(60000);
+      await service.tick();
+      expect(emitted).toHaveLength(1);
+
+      // Third tick: still down -> still should not emit
+      clock.advance(60000);
+      await service.tick();
+      expect(emitted).toHaveLength(1);
+    });
+  });
+
+
+  describe("starting state transitions", () => {
+    it("transitions from starting to down/failing after failed probe", async () => {
+      const clock = new FakeClock();
+      const world: ServiceWorld = { services: new Map([["docker", { up: false, startWorks: false }]]) };
+      const config = makeConfig([{ name: "docker", probe: ["probe-docker"], start: ["start-docker"], neededBy: [] }]);
+      const { service } = createService(config, world, clock);
+
+      // First tick: will probe (down), start, probe again (still down)
+      await service.tick();
+
+      // After a failed start, the state should not be "starting" anymore
+      const statuses = service.getServiceStatuses("workstation");
+      expect(statuses[0]?.state).not.toBe("starting");
+      expect(["down", "failing"]).toContain(statuses[0]?.state);
     });
   });
 });

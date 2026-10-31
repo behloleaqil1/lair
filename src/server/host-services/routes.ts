@@ -1,9 +1,16 @@
 /**
  * Host services API routes.
+ *
+ * Read-only status routes are public (under /api/host-services).
+ * The tick route (POST) is owner-only (under /api/host-services/owner).
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { HostServicesManager, HostServicesProjectStatus } from "./service.js";
 import { assertValidProject } from "../config.js";
+import type { HumanAuth } from "../human-auth/human-auth.js";
+
+/** Prefix for routes that require the owner session (gets no CORS). */
+export const OWNER_PREFIX = "/api/host-services/owner";
 
 interface RouteParams {
   project?: string;
@@ -14,7 +21,7 @@ interface HoldCheckQuery {
   lane?: string;
 }
 
-export function registerHostServicesRoutes(app: FastifyInstance, manager: HostServicesManager): void {
+export function registerHostServicesRoutes(app: FastifyInstance, manager: HostServicesManager, auth: HumanAuth): void {
   /**
    * GET /api/host-services/:project
    * Get host services status for a project.
@@ -109,11 +116,13 @@ export function registerHostServicesRoutes(app: FastifyInstance, manager: HostSe
   );
 
   /**
-   * POST /api/host-services/:project/tick
+   * POST /api/host-services/owner/:project/tick
    * Trigger an immediate tick (owner-only).
    */
+  const ownerOnly = auth.requireOwner("Only the owner can trigger a host services tick");
   app.post<{ Params: RouteParams }>(
-    "/api/host-services/:project/tick",
+    `${OWNER_PREFIX}/:project/tick`,
+    { onRequest: ownerOnly },
     async (request: FastifyRequest<{ Params: RouteParams }>, reply: FastifyReply) => {
       const project = assertValidProject(request.params.project);
       const service = manager.get(project);

@@ -19,12 +19,12 @@ export {
   type ProjectEntry,
 } from "./service.js";
 
-export { registerHostServicesRoutes } from "./routes.js";
+export { registerHostServicesRoutes, OWNER_PREFIX } from "./routes.js";
 
 export { parseHostServicesConfig, actBlockedReason, HostServicesSchema } from "./config.js";
 export type { ParseResult } from "./config.js";
 
-export { HostServicesStore } from "./store.js";
+export { HostServicesStore, type BackoffConfig } from "./store.js";
 
 export { systemHostServicesProbes, ExecFileRunner, systemClock } from "./probes.js";
 export type { HostServicesProbes, CommandRunner, CommandOutput, RunOptions, Clock } from "./probes.js";

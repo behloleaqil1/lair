@@ -5,7 +5,11 @@
  * 1. Probe every service on every configured machine
  * 2. For services that are down and in act mode: run start command (with backoff)
  * 3. For services that keep failing: raise a decision (once per outage)
- * 4. Hold lanes that need down services
+ * 4. Report advisory lane holds (services down block gates on those lanes)
+ *
+ * Note: Lane holds are currently advisory only - they appear in the status
+ * and on decisions, but the gate scheduler does not query them. A follow-up
+ * issue tracks wiring them into lane dispatch.
  */
 import type { EventBus } from "../core/event-bus.js";
 import type { ProjectConfig } from "../../shared/types.js";
@@ -109,6 +113,7 @@ export class HostServices {
     const summaries: TickSummary[] = [];
     const at = this.iso();
     const blocked = this.actBlocked;
+    const nowMs = this.probes.clock.now();
 
     for (const [machine, configs] of this.settings.machines) {
       if (this.abort.signal.aborted) break;
@@ -127,12 +132,12 @@ export class HostServices {
         if (this.abort.signal.aborted) break;
 
         const state = this.store.getOrInit(machine, config.name);
-        const wasStarting = state.state === "starting";
+        const wasUp = state.state === "up";
         const hadDecision = state.decisionId;
 
         // Probe the service
         const probeResult = await this.probe(config.probe);
-        this.store.recordProbe(machine, config.name, probeResult);
+        this.store.recordProbe(machine, config.name, probeResult, nowMs);
 
         if (probeResult.up) {
           summary.up++;
@@ -140,37 +145,45 @@ export class HostServices {
           if (hadDecision) {
             await this.withdrawDecision(machine, config.name, hadDecision);
           }
-          await this.events?.emit("host-service.up", {
-            project: this.project,
-            machine,
-            service: config.name,
-          });
+          // Emit up event only on state change
+          if (!wasUp) {
+            await this.events?.emit("host-service.up", {
+              project: this.project,
+              machine,
+              service: config.name,
+            });
+          }
         } else {
           summary.down++;
 
-          // Log the outage event (once when first detected)
-          if (state.state === "down" && !wasStarting) {
+          // Log the outage event once when first detected (state was up)
+          if (wasUp) {
             await this.events?.emit("host-service.down", {
               project: this.project,
               machine,
               service: config.name,
-              output: probeResult.output,
             });
           }
 
-          // Try to start in act mode
-          if (!blocked && state.startAttempts < this.settings.maxStartAttempts) {
+          // Check if we can start (respects backoff)
+          const canStart = !blocked &&
+            state.startAttempts < this.settings.maxStartAttempts &&
+            this.store.canStart(machine, config.name, nowMs);
+
+          if (canStart) {
             await this.startService(machine, config);
             summary.started++;
             // Probe again after start to check if it worked
             const checkResult = await this.probe(config.probe);
-            this.store.recordProbe(machine, config.name, checkResult);
+            const afterStart = this.probes.clock.now();
+            this.store.recordProbe(machine, config.name, checkResult, afterStart);
             if (checkResult.up) {
               summary.up++;
               summary.down--;
               // Service recovered: withdraw any open decision
-              if (state.decisionId) {
-                await this.withdrawDecision(machine, config.name, state.decisionId);
+              const afterState = this.store.get(machine, config.name);
+              if (afterState?.decisionId) {
+                await this.withdrawDecision(machine, config.name, afterState.decisionId);
               }
               await this.events?.emit("host-service.up", {
                 project: this.project,
@@ -178,7 +191,7 @@ export class HostServices {
                 service: config.name,
               });
             }
-          } else if (state.startAttempts >= this.settings.maxStartAttempts && !state.decisionId) {
+          } else if (!blocked && state.startAttempts >= this.settings.maxStartAttempts && !state.decisionId) {
             // Max attempts reached: raise a decision
             this.store.markFailing(machine, config.name);
             if (await this.raiseDecision(machine, config)) {
@@ -235,8 +248,10 @@ export class HostServices {
         signal: this.abort.signal,
       });
     } catch (e) {
+      // Log only the program name, not the full command line (may contain secrets)
+      const program = config.start[0] ?? "(unknown)";
       console.warn(
-        `[host-services] ${this.project}: failed to start ${config.name} on ${machine}: ${e instanceof Error ? e.message : String(e)}`,
+        `[host-services] ${this.project}: failed to start ${config.name} (${program}) on ${machine}`,
       );
     }
 
@@ -248,6 +263,9 @@ export class HostServices {
     if (!this.decisions) return false;
 
     const key = `${machine}:${config.name}`;
+    // Only show the program names, not the full argv (which may contain secrets)
+    const probeName = config.probe[0] ?? "(none)";
+    const startName = config.start[0] ?? "(none)";
     const input: RaiseDecisionInput = {
       project: this.project,
       kind: "other",
@@ -256,8 +274,7 @@ export class HostServices {
       context: `The service **${config.name}** on machine **${machine}** has been probed and found down.\n\n` +
         `Start command was run ${this.settings.maxStartAttempts} times but the service remains unavailable.\n\n` +
         `**Lanes held:** ${config.neededBy.length > 0 ? config.neededBy.join(", ") : "(none)"}\n\n` +
-        `The probe command: \`${config.probe.join(" ")}\`\n\n` +
-        `The start command: \`${config.start.join(" ")}\``,
+        `Probe: \`${probeName}\`, Start: \`${startName}\``,
       options: [
         {
           id: "fixed",
@@ -319,10 +336,10 @@ export class HostServices {
         module: DECISION_MODULE,
         reason: `${serviceName} on ${machine} is now up.`,
       });
-    } catch (e) {
-      // Decision may have been answered already
+    } catch {
+      // Decision may have been answered already; a log that names the decision id is safe
       console.warn(
-        `[host-services] ${this.project}: could not withdraw decision ${decisionId}: ${e instanceof Error ? e.message : String(e)}`,
+        `[host-services] ${this.project}: could not withdraw decision ${decisionId} for ${serviceName}`,
       );
     }
     this.store.clearDecision(machine, serviceName);
@@ -331,14 +348,15 @@ export class HostServices {
   /** Get all lanes currently held by down services. */
   getHeldLanes(): LaneHold[] {
     const holds: LaneHold[] = [];
-    const at = this.iso();
     for (const [machine, configs] of this.settings.machines) {
       const machineHolds = this.store.heldLanes(machine, configs);
       for (const [lane, info] of machineHolds) {
+        // Get the stored state to find when the outage started
+        const state = this.store.get(machine, info.service);
         holds.push({
           lane,
           reason: info.reason,
-          heldAt: at,
+          heldAt: state?.outageStartedAt ?? this.iso(),
           service: info.service,
           machine,
         });

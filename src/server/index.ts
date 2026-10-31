@@ -651,7 +651,7 @@ placements.load(projectEntries);
 await registerPlacementRoutes(fastify, placements, () => getDefaultProject());
 
 // Host services routes
-registerHostServicesRoutes(fastify, hostServices);
+registerHostServicesRoutes(fastify, hostServices, humanAuth);
 
 // Cloud machines: one per project with `cloud.enabled: true` (off by
 // default). It describes each machine's tagged instance through its
