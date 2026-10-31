@@ -41,7 +41,7 @@ export const SECTION_TABS: Record<SectionId, readonly string[]> = {
   delivery: [],
   processes: [],
   // Settings' own pages after Overview (settings-pages.ts), shown in its page list rather than as tabs
-  settings: ["ai", "team", "classic", "yaml", "history"],
+  settings: ["ai", "team", "work", "gates", "classic", "yaml", "history"],
 };
 
 export interface Route {
