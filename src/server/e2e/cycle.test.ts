@@ -345,8 +345,8 @@ describe("E2E: Full agent cycle on a fake project", () => {
     harness = await setup();
     const { paths, clock, spawner, service } = harness;
 
-    // 1. Add a task to the tasks file
-    writeFileSync(paths.tasks, "feat-search|Fix search results\n");
+    // 1. Add a task to the tasks file (format: agent|name|task|description)
+    writeFileSync(paths.tasks, "worker-a|Search Fix|feat-search|Fix search results\n");
 
     // 2. Set up the spawner to simulate an agent that completes its task
     spawner.onSpawn = (pid, _call) => {
@@ -376,7 +376,7 @@ describe("E2E: Full agent cycle on a fake project", () => {
     harness = await setup();
     const { paths, clock, spawner, service } = harness;
 
-    writeFileSync(paths.tasks, "feat-api|Add new API endpoint\n");
+    writeFileSync(paths.tasks, "worker-a|API Endpoint|feat-api|Add new API endpoint\n");
 
     spawner.onSpawn = (_pid, _call) => {
       clock.advance(2 * MIN);
@@ -410,7 +410,7 @@ describe("E2E: Full agent cycle on a fake project", () => {
     harness = await setup();
     const { paths, clock, spawner, service } = harness;
 
-    writeFileSync(paths.tasks, "feat-blocked|Task that gets blocked\n");
+    writeFileSync(paths.tasks, "worker-a|Blocked Task|feat-blocked|Task that gets blocked\n");
 
     spawner.onSpawn = (pid, _call) => {
       clock.advance(3 * MIN);
@@ -435,7 +435,7 @@ describe("E2E: Full agent cycle on a fake project", () => {
     harness = await setup();
     const { paths, clock, spawner, service } = harness;
 
-    writeFileSync(paths.tasks, "feat-prompt|Test prompt creation\n");
+    writeFileSync(paths.tasks, "worker-a|Prompt Test|feat-prompt|Test prompt creation\n");
 
     spawner.onSpawn = (pid, call) => {
       // The task name appears in env or argv
@@ -461,9 +461,9 @@ describe("E2E: Full agent cycle on a fake project", () => {
 
     writeFileSync(
       paths.tasks,
-      `feat-one|First task
-feat-two|Second task
-feat-three|Third task
+      `worker-a|First|feat-one|First task
+worker-a|Second|feat-two|Second task
+worker-a|Third|feat-three|Third task
 `,
     );
 
