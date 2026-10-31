@@ -128,6 +128,7 @@ export class HostServices {
 
         const state = this.store.getOrInit(machine, config.name);
         const wasStarting = state.state === "starting";
+        const hadDecision = state.decisionId;
 
         // Probe the service
         const probeResult = await this.probe(config.probe);
@@ -136,8 +137,8 @@ export class HostServices {
         if (probeResult.up) {
           summary.up++;
           // Service recovered: withdraw any open decision
-          if (state.decisionId) {
-            await this.withdrawDecision(machine, config.name, state.decisionId);
+          if (hadDecision) {
+            await this.withdrawDecision(machine, config.name, hadDecision);
           }
           await this.events?.emit("host-service.up", {
             project: this.project,

@@ -448,7 +448,9 @@ describe("host-services", () => {
       await service.tick();
 
       expect(emitted).toHaveLength(1);
-      expect(emitted[0]).toMatchObject({ project: "test-project", machine: "workstation", service: "docker" });
+      // EventBus wraps data in { id, type, timestamp, data }
+      const event = emitted[0] as { data: Record<string, unknown> };
+      expect(event.data).toMatchObject({ project: "test-project", machine: "workstation", service: "docker" });
     });
 
     it("emits host-service.up on recovery", async () => {
@@ -463,7 +465,9 @@ describe("host-services", () => {
       await service.tick();
 
       expect(emitted).toHaveLength(1);
-      expect(emitted[0]).toMatchObject({ project: "test-project", machine: "workstation", service: "docker" });
+      // EventBus wraps data in { id, type, timestamp, data }
+      const event = emitted[0] as { data: Record<string, unknown> };
+      expect(event.data).toMatchObject({ project: "test-project", machine: "workstation", service: "docker" });
     });
   });
 
