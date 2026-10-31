@@ -58,6 +58,8 @@ export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/pipelines",
   // Only the owner's message route of the bus: its board and event stream keep their CORS
   "/api/bus/send",
+  // The bus's agent API takes a run's bus token, not the owner session; no browser page may call it either
+  "/api/bus/call",
 ];
 
 export function isUnder(url: string, prefixes: readonly string[]): boolean {

@@ -301,7 +301,9 @@ export type EventType =
   | "planner.verifier_finished"
   // Bus (src/server/bus/)
   | "bus.report"
-  | "bus.message";
+  | "bus.message"
+  // Bus consumers (src/server/bus/consumers.ts): an event or report refused or ignored, {project, busId, reason}
+  | "bus.consume_refused";
 
 /** Event stored in the database */
 export interface Event {

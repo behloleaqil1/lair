@@ -55,6 +55,8 @@ export interface ServerModules {
   clouds?: CloudManager;
   planner?: PlannerManager;
   supervisor?: Supervisor;
+  /** The fleet bus's switch (bus.consume, src/server/bus/consumers.ts): validated and applied per project */
+  bus?: { validate(config: ProjectConfig): string[]; reloadProject(entry: ProjectEntry): Promise<void> };
 }
 
 function errorsOf(result: { ok: true } | { ok: false; errors: string[] }): string[] {
@@ -64,7 +66,7 @@ function errorsOf(result: { ok: true } | { ok: false; errors: string[] }): strin
 /** The server's modules, as src/server/index.ts wires them. */
 export function serverModules(m: ServerModules): ReloadableModule[] {
   const modules: ReloadableModule[] = [];
-  const { delivery, watchdogs, pipelines, reviews, agents, triage, placements, clouds, planner, supervisor } = m;
+  const { delivery, watchdogs, pipelines, reviews, agents, triage, placements, clouds, planner, supervisor, bus } = m;
   if (delivery) {
     modules.push({
       name: "delivery",
@@ -153,6 +155,14 @@ export function serverModules(m: ServerModules): ReloadableModule[] {
       reads: ["agents", "dragons", "ai", "planner"],
       validate: (config) => supervisor.validate(config),
       reload: (entry) => supervisor.reloadProject(entry),
+    });
+  }
+  if (bus) {
+    modules.push({
+      name: "bus",
+      blocks: ["bus"],
+      validate: (config) => bus.validate(config),
+      reload: (entry) => bus.reloadProject(entry),
     });
   }
   return modules;

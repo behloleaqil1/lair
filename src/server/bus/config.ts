@@ -1,53 +1,31 @@
 /**
- * Bus configuration parsing and validation.
+ * The project's `bus:` block (docs/configuration.md#fleet-bus):
+ *
+ *   bus:
+ *     consume: off | observe | on   # default off
  */
-import type { BusConsumeMode } from "./consumers.js";
-
-// ============ Types ============
+import { BUS_CONSUME_MODES, type BusConsumeMode } from "./consumers.js";
 
 export interface BusSettings {
-  /** How fill and the planner react to bus events: off | observe | on */
+  /** How fill and the planner read the bus's reports: off | observe | on */
   consume: BusConsumeMode;
 }
 
-// ============ Defaults ============
+const KEYS = ["consume"];
 
-const DEFAULT_BUS_SETTINGS: BusSettings = {
-  consume: "off",
-};
+const isConsumeMode = (value: unknown): value is BusConsumeMode => BUS_CONSUME_MODES.some((mode) => mode === value);
 
-// ============ Parser ============
-
-/**
- * Parse and validate bus configuration from the project config.
- * Invalid values throw with the reason.
- */
-export function parseBusConfig(raw: Record<string, unknown> | undefined): BusSettings {
-  if (!raw) return { ...DEFAULT_BUS_SETTINGS };
-
-  const settings = { ...DEFAULT_BUS_SETTINGS };
-
-  if ("consume" in raw) {
-    const mode = raw.consume;
-    if (mode !== "off" && mode !== "observe" && mode !== "on") {
-      throw new Error(`bus.consume must be "off", "observe", or "on"; got ${JSON.stringify(mode)}`);
-    }
-    settings.consume = mode;
+/** The settings, or every reason the block is refused. A missing block is the default (off). */
+export function parseBusConfig(raw: unknown): { ok: true; settings: BusSettings } | { ok: false; errors: string[] } {
+  if (raw === undefined || raw === null) return { ok: true, settings: { consume: "off" } };
+  if (typeof raw !== "object" || Array.isArray(raw)) return { ok: false, errors: ["bus must be a mapping"] };
+  const block = raw as Record<string, unknown>;
+  const errors: string[] = [];
+  for (const key of Object.keys(block)) {
+    if (!KEYS.includes(key)) errors.push(`bus.${key} is not a known key (known: ${KEYS.join(", ")})`);
   }
-
-  return settings;
-}
-
-/**
- * Get the consume mode description for documentation.
- */
-export function consumeModeDescription(mode: BusConsumeMode): string {
-  switch (mode) {
-    case "off":
-      return "File reader only: events are not consumed (current behavior)";
-    case "observe":
-      return "Record what events would do, without acting, for comparison";
-    case "on":
-      return "Events drive state changes; mirrored lines are skipped";
-  }
+  const consume = block.consume ?? "off";
+  if (!isConsumeMode(consume)) errors.push(`bus.consume must be one of ${BUS_CONSUME_MODES.join(", ")}; got ${JSON.stringify(consume)}`);
+  if (errors.length > 0 || !isConsumeMode(consume)) return { ok: false, errors };
+  return { ok: true, settings: { consume } };
 }

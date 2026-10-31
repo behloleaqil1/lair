@@ -130,6 +130,7 @@ import {
 import { commandFingerprint, findTaskProcess, reconcileRun, runPromptFileName } from "./reconcile.js";
 import type { ProcessInfo, ProcessReading } from "../watchdog/probes.js";
 import type { ReadyFactsSource } from "../ready-guard/guard.js";
+import type { BusLineSource, StructuredReport } from "../bus/consumers.js";
 
 export { TASK_ID, isValidTaskId } from "./types.js";
 
@@ -396,17 +397,19 @@ export interface AgentsServiceOptions {
   events?: EventBus;
   /** Whether a tool is signed in on this machine (src/server/ai/): a signed-out tool starts nothing here */
   tools?: ToolReadiness;
-  /** Mint a bus token for a run. Returns the plaintext token (to give to the agent) and stores its hash. */
-  mintBusToken?: (runId: string, agent: string) => string;
+  /**
+   * Mint a bus token for a run: the plaintext token (to give to the agent; its hash is stored), or null when the
+   * project's bus is off (bus.consume), and the run gets none
+   */
+  mintBusToken?: (runId: string, agent: string) => string | null;
   /** Revoke a run's bus token when the run ends */
   revokeBusToken?: (runId: string) => void;
   /** What the ready guard reads a PR from (read on each use); undefined: the project has no git host to ask */
   readyFacts?: () => ReadyFactsSource | undefined;
-  /**
-   * Bus consumer integration: check if a bus id was consumed (event processed).
-   * When provided and returns true for a line's bus id, fill's file reader skips it.
-   */
-  wasConsumed?: (busId: number) => boolean;
+  /** The project's bus as fill reads it (bus.consume observe or on; read at each check), or null */
+  bus?: () => BusLineSource | null;
+  /** This server's URL, given as LAIR_URL to a run that gets a bus token (unless a module gave it one) */
+  busServerUrl?: string;
 }
 
 interface EventInput {
@@ -432,9 +435,10 @@ export class AgentsService {
   private budget?: FleetBudget;
   private events?: EventBus;
   private tools?: ToolReadiness;
-  private mintBusToken?: (runId: string, agent: string) => string;
+  private mintBusToken?: (runId: string, agent: string) => string | null;
   private revokeBusToken?: (runId: string) => void;
-  private wasConsumed?: (busId: number) => boolean;
+  private bus?: () => BusLineSource | null;
+  private busServerUrl?: string;
   private watchdogSettings: WatchdogSettings;
   private watchdogStore: WatchdogStore | null = null;
   private unsubscribe: (() => void) | null = null;
@@ -468,7 +472,8 @@ export class AgentsService {
     this.tools = options.tools;
     this.mintBusToken = options.mintBusToken;
     this.revokeBusToken = options.revokeBusToken;
-    this.wasConsumed = options.wasConsumed;
+    this.bus = options.bus;
+    this.busServerUrl = options.busServerUrl;
     this.watchdogSettings = watchdogSettingsFor(options.config, options.settings.hungMinutes);
     // Usage reaches the per-agent and per-project budgets through the fleet budget
     this.unsubscribe =
@@ -510,7 +515,7 @@ export class AgentsService {
         },
         withdraw: (decision, reason) => this.withdrawDecision(decision, reason, this.probes.clock.now()),
         readyFacts: options.readyFacts,
-        wasConsumed: this.wasConsumed,
+        bus: options.bus,
       });
     }
   }
@@ -1404,9 +1409,11 @@ export class AgentsService {
     if (adapter?.session_id_env && !adapter.session_id_env.toUpperCase().startsWith("LAIR_")) {
       own[adapter.session_id_env] = run.sessionId;
     }
-    // Mint a bus token for this run (the token itself is never logged or stored)
-    if (this.mintBusToken) {
-      own.LAIR_BUS_TOKEN = this.mintBusToken(run.id, run.agent);
+    // Mint a bus token for this run while the project's bus is on (the token itself is never logged or stored)
+    const busToken = this.mintBusToken?.(run.id, run.agent) ?? null;
+    if (busToken !== null) {
+      own.LAIR_BUS_TOKEN = busToken;
+      if (this.busServerUrl && own.LAIR_URL === undefined) own.LAIR_URL = this.busServerUrl;
     }
     return agentEnvironment(process.env, this.settings.envPassthrough, own);
   }
@@ -1810,7 +1817,7 @@ export class AgentsService {
     const patterns = this.settings.fill;
     try {
       const until = queueWindowEnd(this.store, this.project, patterns, run, run);
-      return reportedOutcome(new QueueLines(this.config.queue_file), patterns, run, until);
+      return reportedOutcome(new QueueLines(this.config.queue_file, this.bus?.() ?? null), patterns, run, until);
     } catch {
       return null; // a pattern that doesn't compile for this task: no line found
     }
@@ -3176,16 +3183,6 @@ export class AgentsService {
     return this.fill.view();
   }
 
-  /**
-   * Process a bus report (from BusConsumers): drives the same state change
-   * as the matching queue line, immediately (event-driven, no file poll).
-   * Returns true if the report was processed, false if fill is off.
-   */
-  async processBusReport(report: { agent: string; kind: string; task: string; gateId?: string; summary?: string }): Promise<boolean> {
-    if (!this.fill) return false;
-    return this.fill.processBusReport(report);
-  }
-
   /** The owner's "check now" (POST /api/agents/tick): a tick, then a fill check when fill is on. */
   async checkNow(): Promise<AgentsTickSummary> {
     const summary = await this.tick();
@@ -3194,13 +3191,29 @@ export class AgentsService {
   }
 
   /**
+   * bus.consume on: an accepted bus report, or a run that ended. Fill checks
+   * now instead of at its next interval (nothing when fill is off). The
+   * report itself changes nothing here: the check reads it at its mirrored
+   * line, so it can't count twice.
+   */
+  checkFillSoon(): Promise<void> {
+    return this.fill ? this.fill.checkSoon() : Promise.resolve();
+  }
+
+  /** Why fill won't read this bus report (an unknown task or agent), or null (also when fill is off). */
+  busReportProblem(report: Pick<StructuredReport, "task" | "agent" | "kind">): string | null {
+    return this.fill ? this.fill.busReportProblem(report) : null;
+  }
+
+  /**
    * Whether the ready guard accepts `line` as `task`'s done report (true when
    * fill or the guard is off). The planner settles a task through this too, so a
-   * refused report is a done nowhere.
+   * refused report is a done nowhere. `report`: the bus report the line was
+   * read from (bus.consume on): its PR and head are its own fields.
    */
-  async reportAccepted(agent: string, task: string, line: string, taskText: string): Promise<boolean> {
+  async reportAccepted(agent: string, task: string, line: string, taskText: string, report: StructuredReport | null = null): Promise<boolean> {
     if (!this.fill) return true;
-    return (await this.fill.guardReport(agent, task, line, this.store.latestRunForTask(this.project, task), taskText)) === null;
+    return (await this.fill.guardReport(agent, task, line, this.store.latestRunForTask(this.project, task), taskText, report)) === null;
   }
 
   /**
@@ -3582,11 +3595,20 @@ export interface AgentsManagerOptions {
   decisions?: DecisionInbox;
   /** Tool sign-in checks (src/server/ai/): a tool signed out on this machine starts no run here */
   tools?: ToolReadiness;
-  /**
-   * Bus consumer integration: check if a bus id was consumed (event processed).
-   * Passed to each fill; when it returns true for a line's bus id, the file reader skips it.
-   */
-  wasConsumed?: (project: string, busId: number) => boolean;
+  /** The fleet bus (src/server/bus/), per project behind bus.consume; without it no run gets a bus token */
+  bus?: AgentsBus;
+}
+
+/** The fleet bus as the agents module uses it (the server wires it; every call is per project and follows reloads). */
+export interface AgentsBus {
+  /** The project's bus as fill reads it, or null while its bus.consume is off */
+  lineSource(project: string): BusLineSource | null;
+  /** A bus token for a run (its hash is stored) while the project's bus.consume isn't off, else null */
+  mintToken(project: string, runId: string, agent: string): string | null;
+  /** Revoke a run's bus tokens (it ended) */
+  revokeTokens(project: string, runId: string): void;
+  /** This server's URL, given to a run with a bus token as LAIR_URL (where `lair bus` and `lair bus-mcp` post) */
+  serverUrl?: string;
 }
 
 /**
@@ -3690,15 +3712,33 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
           budget: this.options.budget,
           events: this.options.events,
           tools: this.options.tools,
-<<<<<<< HEAD
           readyFacts: () => this.readyFacts?.(entry.name),
-=======
-          // Bus consumer integration: check if a bus id was consumed (bound to this project)
-          wasConsumed: this.options.wasConsumed ? (busId) => this.options.wasConsumed!(entry.name, busId) : undefined,
->>>>>>> 56014f3 (fix(bus): wire consumers, persist consumed, add validators)
+          ...this.busOptions(entry.name),
         }),
       );
     }
+  }
+
+  /** A project's bus hooks for its service (none without the bus): each reads the project's bus.consume when used. */
+  private busOptions(project: string): Pick<AgentsServiceOptions, "bus" | "mintBusToken" | "revokeBusToken" | "busServerUrl"> {
+    const bus = this.options.bus;
+    if (!bus) return {};
+    return {
+      bus: () => bus.lineSource(project),
+      mintBusToken: (runId, agent) => bus.mintToken(project, runId, agent),
+      revokeBusToken: (runId) => bus.revokeTokens(project, runId),
+      busServerUrl: bus.serverUrl,
+    };
+  }
+
+  /** bus.consume on: fill checks now (an accepted bus report, or a run that ended); nothing when it is off. */
+  checkFillSoon(project: string): Promise<void> {
+    return this.services.get(project)?.checkFillSoon() ?? Promise.resolve();
+  }
+
+  /** Why fill won't read this bus report (an unknown task or agent), or null. */
+  busReportProblem(project: string, report: Pick<StructuredReport, "task" | "agent" | "kind">): string | null {
+    return this.services.get(project)?.busReportProblem(report) ?? null;
   }
 
   start(): string[] {
@@ -3786,20 +3826,6 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
     const service = this.services.get(project);
     if (!service) return Promise.reject(new AgentsError(404, `The agents module is off for ${project}`));
     return service.requestRun(input);
-  }
-
-  /**
-   * Process a bus report (from BusConsumers): routes to the right project's
-   * fill, which drives the same state change as the matching queue line.
-   * Returns true if the report was processed, false if the project or fill is off.
-   */
-  async processBusReport(
-    project: string,
-    report: { agent: string; kind: string; task: string; gateId?: string; summary?: string },
-  ): Promise<boolean> {
-    const service = this.services.get(project);
-    if (!service) return false;
-    return service.processBusReport(report);
   }
 
   getStore(): AgentsStore | null {

@@ -93,6 +93,10 @@ beforeAll(async () => {
       const config = loadProjectConfig(project);
       return { ...config, mail_dir: undefined, wake_file: undefined };
     },
+    // The bus is on for every project here: the routes' owner checks are what is tested
+    mode: () => "on",
+    enabled: () => [],
+    health: () => ({ mode: "on", received: 0, refused: [], refusedCount: 0, observations: { total: 0, matches: 0, mismatches: 0, recent: [] } }),
   };
 
   app = Fastify({ logger: false });

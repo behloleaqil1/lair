@@ -19,7 +19,7 @@ import type { BusTokenBinding } from "./tokens.js";
 
 // ============ Schema ============
 
-export const BUS_SCHEMA_VERSION = 2;
+export const BUS_SCHEMA_VERSION = 1;
 
 const BUS_SCHEMA = `
   -- Schema version
@@ -72,27 +72,6 @@ const BUS_SCHEMA = `
   );
   CREATE INDEX IF NOT EXISTS idx_bus_messages_to ON bus_messages(project, to_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_bus_messages_from ON bus_messages(project, from_id, created_at);
-
-  -- Consumed bus events: tracks which bus events have been processed (for restart persistence)
-  CREATE TABLE IF NOT EXISTS bus_consumed (
-    bus_id INTEGER NOT NULL,
-    project TEXT NOT NULL,
-    consumed_at INTEGER NOT NULL,
-    PRIMARY KEY (project, bus_id)
-  );
-  CREATE INDEX IF NOT EXISTS idx_bus_consumed_age ON bus_consumed(consumed_at);
-`;
-
-/** Migration from schema version 1 to 2: add bus_consumed table */
-const MIGRATION_V1_TO_V2 = `
-  CREATE TABLE IF NOT EXISTS bus_consumed (
-    bus_id INTEGER NOT NULL,
-    project TEXT NOT NULL,
-    consumed_at INTEGER NOT NULL,
-    PRIMARY KEY (project, bus_id)
-  );
-  CREATE INDEX IF NOT EXISTS idx_bus_consumed_age ON bus_consumed(consumed_at);
-  UPDATE bus_schema SET version = 2;
 `;
 
 // ============ Types ============
@@ -240,13 +219,7 @@ export class BusStore {
       this.db.exec(BUS_SCHEMA);
       return;
     }
-    // Check current version and apply migrations
-    const versionRow = this.db.prepare("SELECT version FROM bus_schema LIMIT 1").get() as { version: number } | undefined;
-    const currentVersion = versionRow?.version ?? 1;
-
-    if (currentVersion < 2) {
-      this.db.exec(MIGRATION_V1_TO_V2);
-    }
+    // Future migrations would go here based on version
   }
 
   close(): void {
@@ -352,6 +325,20 @@ export class BusStore {
     return map;
   }
 
+  /** The project's reports with these ids (an id it doesn't have is left out), read 500 at a time. */
+  getReports(ids: number[]): BusReport[] {
+    const out: BusReport[] = [];
+    for (let i = 0; i < ids.length; i += 500) {
+      const chunk = ids.slice(i, i + 500).filter((id) => Number.isSafeInteger(id));
+      if (chunk.length === 0) continue;
+      const rows = this.db
+        .prepare(`SELECT * FROM bus_reports WHERE project = ? AND id IN (${chunk.map(() => "?").join(", ")})`)
+        .all(this.project, ...chunk) as ReportRow[];
+      out.push(...rows.map(toReport));
+    }
+    return out;
+  }
+
   /** List recent reports. */
   listReports(options: { task?: string; agent?: string; limit?: number } = {}): BusReport[] {
     const where = ["project = ?"];
@@ -448,33 +435,6 @@ export class BusStore {
       .prepare(`SELECT COUNT(*) as n FROM bus_messages WHERE project = ? AND to_id = ? AND read_at IS NULL`)
       .get(this.project, agentId) as { n: number };
     return row.n;
-  }
-
-  // ============ Consumed events ============
-
-  /** Load consumed bus ids (for restart persistence). Returns a Map of busId -> consumedAt. */
-  loadConsumed(cutoff: number): Map<number, number> {
-    const rows = this.db
-      .prepare(`SELECT bus_id, consumed_at FROM bus_consumed WHERE project = ? AND consumed_at > ?`)
-      .all(this.project, cutoff) as Array<{ bus_id: number; consumed_at: number }>;
-    const map = new Map<number, number>();
-    for (const row of rows) {
-      map.set(row.bus_id, row.consumed_at);
-    }
-    return map;
-  }
-
-  /** Save a consumed bus id. */
-  markConsumed(busId: number, at: number): void {
-    this.db
-      .prepare(`INSERT OR REPLACE INTO bus_consumed (bus_id, project, consumed_at) VALUES (?, ?, ?)`)
-      .run(busId, this.project, at);
-  }
-
-  /** Prune old consumed entries (older than cutoff). */
-  pruneConsumed(cutoff: number): number {
-    const result = this.db.prepare(`DELETE FROM bus_consumed WHERE project = ? AND consumed_at < ?`).run(this.project, cutoff);
-    return result.changes;
   }
 }
 
