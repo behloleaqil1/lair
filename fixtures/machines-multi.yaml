@@ -28,7 +28,7 @@ machines:
     runners:
       - remote
       - heavy
-    work_dir: /home/deploy/my-project
+    work_dir: /home/user/my-project
     gate_script: work/bin/gate.sh
   ci-server:
     name: CI Server
