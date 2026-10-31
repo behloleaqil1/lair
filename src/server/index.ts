@@ -219,6 +219,20 @@ fastify.get("/api/health", async () => {
   });
 });
 
+// Bus consumer health for Home → Health (bus PR 2a: observe mode comparison)
+fastify.get<{ Querystring: { project?: string } }>(
+  "/api/bus/health",
+  async (request) => {
+    try {
+      const project = request.query.project ?? getDefaultProject();
+      const summary = busConsumers.getHealthSummary(project);
+      return respond(summary);
+    } catch (e) {
+      return respondError(e instanceof Error ? e.message : "Unknown error");
+    }
+  },
+);
+
 // List projects
 fastify.get("/api/projects", async () => {
   return respond(listProjects());

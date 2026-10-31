@@ -97,6 +97,7 @@ export function Health({ project, refreshKey }: Props) {
   return (
     <div>
       <SelfChecks project={project} refreshKey={refreshKey} />
+      <BusConsumerHealth project={project} refreshKey={refreshKey} />
       <WatchdogHealth project={project} refreshKey={refreshKey} />
     </div>
   );
@@ -275,6 +276,86 @@ function WatchdogHealth({ project, refreshKey }: Props) {
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============ Bus Consumer Health (bus PR 2a) ============
+
+interface BusConsumerHealthStatus {
+  mode: "off" | "observe" | "on";
+  observations: number;
+  matches: number;
+  mismatches: number;
+  pending: number;
+}
+
+function BusConsumerHealth({ project, refreshKey }: Props) {
+  const status = useApi<BusConsumerHealthStatus>("/bus/health", project, refreshKey);
+
+  if (status.loading && !status.data) return null; // Show nothing while loading
+  if (status.error && !status.data) return null; // Hide on error (bus may not be configured)
+  const s = status.data;
+  if (!s || s.mode === "off") return null; // Nothing to show when off
+
+  return (
+    <div>
+      <div className="section-head">
+        <h2>Bus Consumer</h2>
+        <span className={`badge ${s.mode === "on" ? "badge-success" : "badge-neutral"}`}>
+          {s.mode}
+        </span>
+      </div>
+
+      {s.mode === "observe" && s.observations > 0 && (
+        <div className="card">
+          <h3>Observe mode comparison</h3>
+          <p className="muted small">
+            Comparing what bus events would do vs what the file reader does.
+          </p>
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Observations</th>
+                <th>Matches</th>
+                <th>Mismatches</th>
+                <th>Pending</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>{s.observations}</td>
+                <td>
+                  <span className={`badge ${s.matches > 0 ? "badge-success" : "badge-neutral"}`}>
+                    {s.matches}
+                  </span>
+                </td>
+                <td>
+                  <span className={`badge ${s.mismatches > 0 ? "badge-error" : "badge-neutral"}`}>
+                    {s.mismatches}
+                  </span>
+                </td>
+                <td>
+                  <span className={`badge badge-neutral`}>{s.pending}</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          {s.mismatches > 0 && (
+            <p className="warning spaced-lg">
+              {s.mismatches} mismatch(es) detected. Check the event vs file reader actions before enabling.
+            </p>
+          )}
+        </div>
+      )}
+
+      {s.mode === "on" && (
+        <div className="card">
+          <p className="muted small">
+            Bus events drive state changes. Mirrored lines are skipped.
+          </p>
         </div>
       )}
     </div>
