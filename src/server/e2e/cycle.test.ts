@@ -164,12 +164,13 @@ class FakeSpawner implements ProcessSpawner {
     utimesSync(options.logPath, t, t);
 
     const pid = this.nextPid++;
+    const startedAt = this.clock.now(); // Capture start time before onSpawn may advance clock
     this.started.add(pid);
-    this.procs.add(pid, argv.join(" "), this.clock.now());
+    this.procs.add(pid, argv.join(" "), startedAt);
 
     this.onSpawn?.(pid, call);
 
-    return { pid, startedAt: this.clock.now() };
+    return { pid, startedAt };
   }
 
   exitCode(pid: number): number | null | undefined {
