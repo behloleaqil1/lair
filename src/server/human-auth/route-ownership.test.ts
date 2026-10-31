@@ -46,15 +46,16 @@ export const PUBLIC_ROUTE_PREFIXES: Readonly<Record<string, string>> = {
   "/api/host-services": "read-only service states, exit codes and held lanes (no probe output or argv); the tick, which runs start commands, is owner-only under /api/host-services/owner",
 };
 
-/** Methods that change state; never allowed on public routes without explicit approval. */
-const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+/** Methods that can change state (ALL accepts every method); never on a public route without an entry below. */
+const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE", "ALL"]);
 
 /**
  * Public routes that accept POST/PUT/PATCH/DELETE but guard writes another
  * way (e.g. a cryptographic signature from a trusted node, not a browser).
- * Each entry is a route path (with :params replaced by wildcards) and a
- * reason a reviewer can check. A public allow-list entry that covers
- * mutating methods without an entry here fails the test below.
+ * Each entry is one route path as registered (a :param matches any :param)
+ * and a reason a reviewer can check. A mutating route under a public prefix
+ * without an entry here fails the test below, and so does an entry that
+ * names no such route.
  */
 export const PUBLIC_MUTATING_ALLOWED: Readonly<Record<string, string>> = {
   "/api/triage/results":
@@ -122,9 +123,35 @@ export function unclassified(routes: FoundRoute[]): FoundRoute[] {
   return routes.filter((r) => !isUnder(r.path, OWNER_ONLY_PREFIXES) && !isUnder(r.path, publicPrefixes));
 }
 
+/** A path for matching: every :param segment the same */
+const routeKey = (path: string): string => path.replace(/:[^/]+/g, ":param");
+
+/** The mutating routes under a public prefix (and not under an owner-only one) */
+export function publicMutating(routes: FoundRoute[]): FoundRoute[] {
+  return routes.filter(
+    (r) => MUTATING_METHODS.has(r.method) && isUnder(r.path, publicPrefixes) && !isUnder(r.path, OWNER_ONLY_PREFIXES),
+  );
+}
+
+/** The public mutating routes that no `allowed` entry names */
+export function unapprovedPublicMutating(routes: FoundRoute[], allowed: Readonly<Record<string, string>>): FoundRoute[] {
+  const keys = new Set(Object.keys(allowed).map(routeKey));
+  return publicMutating(routes).filter((r) => !keys.has(routeKey(r.path)));
+}
+
+/** `allowed` entries with no reason, or naming no public mutating route (stale) */
+export function publicMutatingAllowProblems(routes: FoundRoute[], allowed: Readonly<Record<string, string>>): string[] {
+  const live = new Set(publicMutating(routes).map((r) => routeKey(r.path)));
+  const problems: string[] = [];
+  for (const [path, reason] of Object.entries(allowed)) {
+    if (reason.trim().length < 20) problems.push(`${path}: needs a reason`);
+    if (!live.has(routeKey(path))) problems.push(`${path}: names no mutating route under a public prefix: remove the stale entry`);
+  }
+  return problems;
+}
+
 describe("route ownership", () => {
   const routes = registeredRoutes();
-  const publicPrefixList = Object.keys(PUBLIC_ROUTE_PREFIXES);
 
   it("finds the server's routes (guards the scan itself)", () => {
     expect(routes.length).toBeGreaterThan(100);
@@ -184,56 +211,40 @@ describe("route ownership", () => {
     }
   });
 
-  it("never allows a mutating method (POST/PUT/PATCH/DELETE) on a public route without explicit approval", () => {
-    // Find all registered mutating routes that fall under public prefixes
-    const publicMutating = routes.filter(
-      (r) => MUTATING_METHODS.has(r.method) && isUnder(r.path, publicPrefixList) && !isUnder(r.path, OWNER_ONLY_PREFIXES),
-    );
-
-    // Check each is in the explicit allow-list
-    const unapproved: string[] = [];
-    for (const route of publicMutating) {
-      // Normalize :param segments for matching
-      const normalized = route.path.replace(/:[^/]+/g, ":param");
-      const allowKey = Object.keys(PUBLIC_MUTATING_ALLOWED).find((k) => {
-        const kNorm = k.replace(/:[^/]+/g, ":param");
-        return normalized === kNorm || route.path === k;
-      });
-      if (!allowKey) {
-        unapproved.push(`${route.method} ${route.path} (${route.file})`);
-      }
-    }
-
+  it("never allows a mutating method (POST/PUT/PATCH/DELETE/ALL) on a public route without an entry", () => {
     expect(
-      unapproved,
-      "Mutating routes on public prefixes need either: (1) move to OWNER_ONLY_PREFIXES, or (2) add to PUBLIC_MUTATING_ALLOWED with a reason explaining the non-browser guard",
+      unapprovedPublicMutating(routes, PUBLIC_MUTATING_ALLOWED).map((r) => `${r.method} ${r.path} (${r.file})`),
+      "move the route under OWNER_ONLY_PREFIXES, or add it to PUBLIC_MUTATING_ALLOWED with the non-browser guard as the reason",
     ).toEqual([]);
   });
 
-  it("gives every public-mutating entry a reason and a real route", () => {
-    for (const [path, reason] of Object.entries(PUBLIC_MUTATING_ALLOWED)) {
-      expect(reason.trim().length, `${path} needs a reason`).toBeGreaterThan(20);
-      // The path should match at least one registered mutating route
-      const normalized = path.replace(/:[^/]+/g, "");
-      const matches = routes.filter(
-        (r) =>
-          MUTATING_METHODS.has(r.method) &&
-          (r.path === path || r.path.replace(/:[^/]+/g, "") === normalized || r.path.startsWith(path.replace(/:[^/]+$/, ""))),
-      );
-      expect(matches.length, `${path} matches no registered mutating route: remove the stale entry`).toBeGreaterThan(0);
-    }
+  it("gives every public-mutating entry a reason and a live route", () => {
+    expect(publicMutatingAllowProblems(routes, PUBLIC_MUTATING_ALLOWED)).toEqual([]);
   });
 
-  it("fails for a mutating route under a public prefix that is not explicitly allowed", () => {
-    // Synthetic test: a POST under /api/health (public) without allow-list entry
+  it("flags a mutating route under a public prefix with no entry, and passes an allowed or owner-only one", () => {
     const source = [
       `fastify.get("/api/health", handler);`,
       `fastify.post("/api/health/dangerous", handler);`,
+      `fastify.all("/api/health/any", handler);`,
+      `fastify.post("/api/triage/results", handler);`,
+      `fastify.delete("/api/triage/owner/protected", handler);`,
     ].join("\n");
     const found = routesIn("fake.ts", source);
-    const publicMutating = found.filter(
-      (r) => MUTATING_METHODS.has(r.method) && isUnder(r.path, publicPrefixList),
-    );
-    expect(publicMutating.map((r) => `${r.method} ${r.path}`)).toEqual(["POST /api/health/dangerous"]);
+    expect(unapprovedPublicMutating(found, PUBLIC_MUTATING_ALLOWED).map((r) => `${r.method} ${r.path}`)).toEqual([
+      "POST /api/health/dangerous",
+      "ALL /api/health/any",
+    ]);
+    const allowAll = { ...PUBLIC_MUTATING_ALLOWED, "/api/health/dangerous": "x", "/api/health/any": "y" };
+    expect(unapprovedPublicMutating(found, allowAll)).toEqual([]);
+  });
+
+  it("fails a stale or unexplained public-mutating entry", () => {
+    const found = routesIn("fake.ts", `app.post("/api/triage/results/:id", handler);`);
+    expect(publicMutatingAllowProblems(found, { "/api/triage/results/:node": "a signed result from a trusted node" })).toEqual([]);
+    expect(publicMutatingAllowProblems(found, { "/api/triage/gone": "too short" })).toEqual([
+      "/api/triage/gone: needs a reason",
+      "/api/triage/gone: names no mutating route under a public prefix: remove the stale entry",
+    ]);
   });
 });
