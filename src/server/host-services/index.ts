@@ -1,11 +1,12 @@
 /**
  * Host services module: per-machine services with probe and start.
  *
- * Provides:
- * - Service health probing at configurable intervals
- * - Automatic service restart in act mode (with backoff)
- * - Lane holds while services are down
- * - Decision escalation when services fail to recover
+ * - Probes every service each interval (argv, no shell, timed; a timeout is never up)
+ * - Act mode: starts a down service, with a grace window and a doubling backoff
+ *   that survive restarts and reloads
+ * - Act mode: holds the pipeline lanes that need a service while it is not up
+ *   (the pipeline manager asks holdFor before it dispatches a job)
+ * - One decision per outage it cannot fix, withdrawn on a stable recovery
  *
  * See docs/configuration.md#host-services for configuration reference.
  */
@@ -14,6 +15,9 @@ export {
   HostServices,
   HostServicesManager,
   createHostServices,
+  DECISION_CLASS,
+  decisionInput,
+  programName,
   type HostServicesOptions,
   type HostServicesProjectStatus,
   type ProjectEntry,
@@ -24,16 +28,18 @@ export { registerHostServicesRoutes, OWNER_PREFIX } from "./routes.js";
 export { parseHostServicesConfig, actBlockedReason, HostServicesSchema } from "./config.js";
 export type { ParseResult } from "./config.js";
 
-export { HostServicesStore, type BackoffConfig } from "./store.js";
+export { HostServicesStore, STORE_VERSION, freshState } from "./store.js";
 
 export { systemHostServicesProbes, ExecFileRunner, systemClock } from "./probes.js";
 export type { HostServicesProbes, CommandRunner, CommandOutput, RunOptions, Clock } from "./probes.js";
 
 export type {
+  EscalationCode,
   ServiceConfig,
   ServiceState,
   ServiceStatus,
   ProbeResult,
+  StartResult,
   TickSummary,
   StoredServiceState,
   HostServicesSettings,

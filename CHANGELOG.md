@@ -5,6 +5,12 @@ file lists what needs action on your side.
 
 ## Unreleased
 
+- **Host services (off by default).** `host_services:` in a project config probes the services work needs on each
+  machine (a container engine, a tunnel daemon). In `act` mode Lair starts a service that is down (a grace window,
+  then a doubling backoff, at most `max_start_attempts` per outage) and holds the pipeline jobs whose lane needs it;
+  in both modes it raises one decision per outage it cannot fix. Its state is kept in `data/host-services/`. See
+  [Host services](docs/configuration.md#host-services).
+
 - **Outcome tracker (off by default).** `outcome_tracker:` in `data/server.yaml` turns on a read-only tracker that
   records `outcome` (good / bad / unknown) with structured evidence on answered decisions; the brain trainer reads
   `bad` as a negative example. The decisions file gets three nullable columns the first time it is opened (nothing to

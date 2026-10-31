@@ -601,10 +601,13 @@ reviews.load(projectEntries);
 
 // Host services: per-machine services with probe and start (duty D13).
 // One per project with `host_services.enabled: true` (off by default).
-// It probes services (Docker, tunnel daemons) every minute and starts them
-// when down (in act mode, with backoff), holding lanes that need them.
-const hostServices = new HostServicesManager({ events: getEventBus() });
+// It probes services (a container engine, tunnel daemons) every interval and,
+// in act mode, starts them when down (with a backoff kept in
+// data/host-services/) and holds the pipeline lanes that need them
+const hostServices = new HostServicesManager({ events: getEventBus(), dataDir: join(process.cwd(), "data") });
 hostServices.load(projectEntries);
+// A pipeline job whose lane needs a service that is not up waits (act mode only)
+pipelines.useLaneHolds((project, names) => hostServices.holdFor(project, names));
 
 // The ready guard (agents.fill.ready_guard) reads a project's PRs from its review module's git host
 agents.useReadyFacts((project) => {

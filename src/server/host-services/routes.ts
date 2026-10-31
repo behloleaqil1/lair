@@ -1,15 +1,17 @@
 /**
  * Host services API routes.
  *
- * Read-only status routes are public (under /api/host-services).
- * The tick route (POST) is owner-only (under /api/host-services/owner).
+ * Reads are public (under /api/host-services): states, exit codes, times and
+ * lane names only, never a probe's output or a command's arguments. The one
+ * route that changes anything, the tick (it runs start commands in act
+ * mode), is owner-only, under /api/host-services/owner (no CORS there).
  */
-import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type { FastifyInstance, FastifyReply } from "fastify";
 import type { HostServicesManager, HostServicesProjectStatus } from "./service.js";
-import { assertValidProject } from "../config.js";
+import { isSafeProjectName } from "../config.js";
 import type { HumanAuth } from "../human-auth/human-auth.js";
 
-/** Prefix for routes that require the owner session (gets no CORS). */
+/** Prefix for routes that require the owner session (gets no CORS: see human-auth/cors.ts). */
 export const OWNER_PREFIX = "/api/host-services/owner";
 
 interface RouteParams {
@@ -21,126 +23,73 @@ interface HoldCheckQuery {
   lane?: string;
 }
 
+function badRequest(reply: FastifyReply, error: string) {
+  return reply.status(400).send({ success: false, error, timestamp: new Date().toISOString() });
+}
+
+/** A project name of the safe shape, or null. Projects without host services read as not enabled. */
+function projectOf(params: RouteParams): string | null {
+  const project = params.project;
+  return typeof project === "string" && isSafeProjectName(project) ? project : null;
+}
+
 export function registerHostServicesRoutes(app: FastifyInstance, manager: HostServicesManager, auth: HumanAuth): void {
-  /**
-   * GET /api/host-services/:project
-   * Get host services status for a project.
-   */
-  app.get<{ Params: RouteParams }>(
-    "/api/host-services/:project",
-    async (request: FastifyRequest<{ Params: RouteParams }>, reply: FastifyReply) => {
-      const project = assertValidProject(request.params.project);
-      const status = manager.status(project);
-      return reply.send({
-        success: true,
-        data: serializeStatus(status),
-        timestamp: new Date().toISOString(),
-      });
-    },
-  );
+  /** GET /api/host-services/:project: the module's status for a project. */
+  app.get<{ Params: RouteParams }>("/api/host-services/:project", async (request, reply) => {
+    const project = projectOf(request.params);
+    if (!project) return badRequest(reply, "Invalid project name");
+    return reply.send({ success: true, data: serializeStatus(manager.status(project)), timestamp: new Date().toISOString() });
+  });
 
-  /**
-   * GET /api/host-services/:project/machines/:machine
-   * Get service statuses for a specific machine.
-   */
-  app.get<{ Params: RouteParams }>(
-    "/api/host-services/:project/machines/:machine",
-    async (request: FastifyRequest<{ Params: RouteParams }>, reply: FastifyReply) => {
-      const project = assertValidProject(request.params.project);
-      const machine = request.params.machine;
-      if (!machine) {
-        return reply.status(400).send({
-          success: false,
-          error: "Missing machine parameter",
-          timestamp: new Date().toISOString(),
-        });
-      }
-      const service = manager.get(project);
-      if (!service) {
-        return reply.send({
-          success: true,
-          data: { machine, services: [] },
-          timestamp: new Date().toISOString(),
-        });
-      }
-      const statuses = service.getServiceStatuses(machine);
-      return reply.send({
-        success: true,
-        data: { machine, services: statuses },
-        timestamp: new Date().toISOString(),
-      });
-    },
-  );
+  /** GET /api/host-services/:project/machines/:machine: one machine's services. */
+  app.get<{ Params: RouteParams }>("/api/host-services/:project/machines/:machine", async (request, reply) => {
+    const project = projectOf(request.params);
+    if (!project) return badRequest(reply, "Invalid project name");
+    const machine = request.params.machine ?? "";
+    const services = manager.get(project)?.getServiceStatuses(machine) ?? [];
+    return reply.send({ success: true, data: { machine, services }, timestamp: new Date().toISOString() });
+  });
 
-  /**
-   * GET /api/host-services/:project/holds
-   * Get all lanes currently held by down services.
-   */
-  app.get<{ Params: RouteParams }>(
-    "/api/host-services/:project/holds",
-    async (request: FastifyRequest<{ Params: RouteParams }>, reply: FastifyReply) => {
-      const project = assertValidProject(request.params.project);
-      const service = manager.get(project);
-      const holds = service?.getHeldLanes() ?? [];
-      return reply.send({
-        success: true,
-        data: { holds },
-        timestamp: new Date().toISOString(),
-      });
-    },
-  );
+  /** GET /api/host-services/:project/holds: the lanes held now, and whether that is enforced. */
+  app.get<{ Params: RouteParams }>("/api/host-services/:project/holds", async (request, reply) => {
+    const project = projectOf(request.params);
+    if (!project) return badRequest(reply, "Invalid project name");
+    const holds = manager.get(project)?.getHeldLanes() ?? [];
+    return reply.send({ success: true, data: { holds }, timestamp: new Date().toISOString() });
+  });
 
-  /**
-   * GET /api/host-services/:project/holds/check
-   * Check if a specific lane is held.
-   */
+  /** GET /api/host-services/:project/holds/check?lane=: whether one lane is held. */
   app.get<{ Params: RouteParams; Querystring: HoldCheckQuery }>(
     "/api/host-services/:project/holds/check",
-    async (request: FastifyRequest<{ Params: RouteParams; Querystring: HoldCheckQuery }>, reply: FastifyReply) => {
-      const project = assertValidProject(request.params.project);
+    async (request, reply) => {
+      const project = projectOf(request.params);
+      if (!project) return badRequest(reply, "Invalid project name");
       const lane = request.query.lane;
-      if (!lane) {
-        return reply.status(400).send({
-          success: false,
-          error: "Missing lane query parameter",
-          timestamp: new Date().toISOString(),
-        });
-      }
-      const result = manager.isLaneHeld(project, lane);
+      if (!lane) return badRequest(reply, "Missing lane query parameter");
       return reply.send({
         success: true,
-        data: { lane, ...result },
+        data: { lane, ...manager.isLaneHeld(project, lane) },
         timestamp: new Date().toISOString(),
       });
     },
   );
 
-  /**
-   * POST /api/host-services/owner/:project/tick
-   * Trigger an immediate tick (owner-only).
-   */
-  const ownerOnly = auth.requireOwner("Only the owner can trigger a host services tick");
-  app.post<{ Params: RouteParams }>(
-    `${OWNER_PREFIX}/:project/tick`,
-    { onRequest: ownerOnly },
-    async (request: FastifyRequest<{ Params: RouteParams }>, reply: FastifyReply) => {
-      const project = assertValidProject(request.params.project);
-      const service = manager.get(project);
-      if (!service) {
-        return reply.status(404).send({
-          success: false,
-          error: "Host services not enabled for this project",
-          timestamp: new Date().toISOString(),
-        });
-      }
-      const ticks = await service.tick();
-      return reply.send({
-        success: true,
-        data: { ticks },
+  /** POST /api/host-services/owner/:project/tick: probe now (and, in act mode, start what is down). Owner only. */
+  const ownerOnly = auth.requireOwner("Only the owner can run a host services tick");
+  app.post<{ Params: RouteParams }>(`${OWNER_PREFIX}/:project/tick`, { onRequest: ownerOnly }, async (request, reply) => {
+    const project = projectOf(request.params);
+    if (!project) return badRequest(reply, "Invalid project name");
+    const service = manager.get(project);
+    if (!service) {
+      return reply.status(404).send({
+        success: false,
+        error: "Host services are not enabled for this project",
         timestamp: new Date().toISOString(),
       });
-    },
-  );
+    }
+    const ticks = await service.tick();
+    return reply.send({ success: true, data: { ticks }, timestamp: new Date().toISOString() });
+  });
 }
 
 function serializeStatus(status: HostServicesProjectStatus): Record<string, unknown> {
@@ -150,6 +99,7 @@ function serializeStatus(status: HostServicesProjectStatus): Record<string, unkn
     running: status.running,
     mode: status.mode,
     actBlocked: status.actBlocked,
+    holdsEnforced: status.holdsEnforced,
     errors: status.errors,
     intervalSeconds: status.intervalSeconds,
     lastTicks: status.lastTicks,

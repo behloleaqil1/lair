@@ -6,27 +6,26 @@ import { z } from "zod";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { HostServicesSettings, ServiceConfig } from "./types.js";
 
-/** Service name: a letter first, then letters, digits, '_' or '-' (max 32) */
-const SERVICE_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
-/** Machine id follows the same pattern */
-const MACHINE_ID = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
-/** Lane or pipeline name */
-const LANE_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
+/** Service and machine names: a letter first, then letters, digits, '_' or '-' (at most 32) */
+const NAME = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
+/** What a service is needed by: a pipeline lane, a pipeline, or a `<pipeline>.<lane>` job */
+const NEEDED_BY = /^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$/;
 
-const serviceName = z.string().regex(SERVICE_NAME, "service names use a letter, then letters, digits, '_' or '-' (at most 32)");
-const machineId = z.string().regex(MACHINE_ID, "machine ids use a letter, then letters, digits, '_' or '-' (at most 32)");
-const laneName = z.string().regex(LANE_NAME, "lane names use a letter, then letters, digits, '_' or '-' (at most 32)");
+const name = (what: string) => z.string().regex(NAME, `${what} use a letter, then letters, digits, '_' or '-' (at most 32)`);
 const argv = z.array(z.string().min(1).max(4096)).min(1).max(64);
 
 const ServiceSchema = z
   .object({
-    name: serviceName,
+    name: name("service names"),
     /** argv to probe: exit 0 = up */
     probe: argv,
     /** argv to start (act mode only) */
     start: argv,
-    /** Lanes or pipelines that need this service */
-    needed_by: z.array(laneName).max(32).default([]),
+    /** Pipeline lanes, pipelines or `<pipeline>.<lane>` jobs that need this service */
+    needed_by: z
+      .array(z.string().regex(NEEDED_BY, "needed_by names a lane, a pipeline or <pipeline>.<lane> (letters, digits, '.', '_', '-')"))
+      .max(32)
+      .default([]),
   })
   .strict();
 
@@ -40,8 +39,12 @@ export const HostServicesSchema = z
     probe_timeout_seconds: z.number().int().min(1).max(120).default(15),
     start_timeout_seconds: z.number().int().min(1).max(300).default(30),
     start_delay_seconds: z.number().int().min(1).max(300).default(10),
+    start_grace_seconds: z.number().int().min(10).max(3600).default(120),
+    backoff_max_seconds: z.number().int().min(60).max(86_400).default(1800),
+    stable_seconds: z.number().int().min(30).max(86_400).default(300),
     max_start_attempts: z.number().int().min(1).max(20).default(3),
-    machines: z.record(machineId, MachineServicesSchema).default({}),
+    escalate_after_probes: z.number().int().min(1).max(1000).default(5),
+    machines: z.record(name("machine ids"), MachineServicesSchema).default({}),
   })
   .strict();
 
@@ -63,7 +66,6 @@ export function parseHostServicesConfig(raw: unknown): ParseResult {
   const value = parsed.data;
   const errors: string[] = [];
 
-  // Validate: service names must be unique within a machine
   const machines = new Map<string, ServiceConfig[]>();
   for (const [machineId, services] of Object.entries(value.machines)) {
     const names = new Set<string>();
@@ -83,8 +85,11 @@ export function parseHostServicesConfig(raw: unknown): ParseResult {
     machines.set(machineId, machineServices);
   }
 
-  if (value.enabled && machines.size === 0) {
-    errors.push("host_services is enabled but no machines have services configured");
+  if (value.enabled && [...machines.values()].every((services) => services.length === 0)) {
+    errors.push("host_services is enabled but no machine has a service");
+  }
+  if (value.start_delay_seconds > value.start_grace_seconds) {
+    errors.push("host_services.start_delay_seconds: must not be longer than start_grace_seconds");
   }
 
   if (errors.length > 0) return { ok: false, errors };
@@ -97,7 +102,11 @@ export function parseHostServicesConfig(raw: unknown): ParseResult {
       probeTimeoutSeconds: value.probe_timeout_seconds,
       startTimeoutSeconds: value.start_timeout_seconds,
       startDelaySeconds: value.start_delay_seconds,
+      startGraceSeconds: value.start_grace_seconds,
+      backoffMaxSeconds: value.backoff_max_seconds,
+      stableSeconds: value.stable_seconds,
       maxStartAttempts: value.max_start_attempts,
+      escalateAfterProbes: value.escalate_after_probes,
       machines,
     },
   };

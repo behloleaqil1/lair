@@ -58,7 +58,7 @@ export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/pipelines",
   // Only the owner's message route of the bus: its board and event stream keep their CORS
   "/api/bus/send",
-  // Host services owner routes: the tick route triggers start commands
+  // Host services: the owner's tick runs start commands (its reads under /api/host-services stay public)
   "/api/host-services/owner",
 ];
 
