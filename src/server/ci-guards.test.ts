@@ -49,10 +49,10 @@ const FETCH_TIMEOUT_ALLOWED: Array<{ file: string; match: string; reason: string
   { file: "review/github.ts", match: "this.fetchFn", reason: "injectable fetch, caller controls timeout" },
   { file: "notifications/mount.ts", match: "fetch:", reason: "injectable fetch option, not a call" },
   { file: "notifications/senders.ts", match: "this.options.fetch", reason: "injectable fetch, caller controls timeout" },
-  // Wrapped with AbortSignal.timeout already
+  // Wrapped with AbortSignal.timeout or AbortController
   { file: "delivery/probes.ts", match: "AbortSignal.timeout", reason: "has AbortSignal.timeout in the same call" },
   { file: "brain-bench/models.ts", match: "AbortSignal.timeout", reason: "has AbortSignal.timeout in the same call" },
-  { file: "services/managed-process.ts", match: "AbortSignal.timeout", reason: "has AbortSignal.timeout in the same call" },
+  { file: "services/managed-process.ts", match: "signal: controller.signal", reason: "uses AbortController with setTimeout for timeout" },
 ];
 
 /**
@@ -63,7 +63,7 @@ const EXEC_TIMEOUT_ALLOWED: Array<{ file: string; match: string; reason: string 
   // Type definitions and interfaces
   { file: "agents/probes.ts", match: "spawn(argv:", reason: "interface definition, not a call" },
   { file: "gates/executors/local.ts", match: "spawn(file, args,", reason: "the spawn wrapper that enforces timeouts for all callers" },
-  { file: "gates/executors/local.ts", match: "spawn(\"taskkill\"", reason: "taskkill for cleanup, bounded by the caller's abort signal" },
+  { file: "gates/executors/local.ts", match: 'spawn("taskkill"', reason: "taskkill for cleanup, bounded by the caller's abort signal" },
   { file: "gates/pipeline-service.ts", match: "spawner?:", reason: "type definition for injectable spawner" },
   { file: "plan-sandbox/service.ts", match: "spawner:", reason: "type definition, not a call" },
   // Has timeout option
@@ -73,6 +73,37 @@ const EXEC_TIMEOUT_ALLOWED: Array<{ file: string; match: string; reason: string 
   { file: "cleanup/probes.ts", match: "timeout:", reason: "has timeout option" },
   { file: "cleanup/worktree.ts", match: "timeout:", reason: "has timeout option" },
   { file: "cleanup/retention.ts", match: "timeout:", reason: "has timeout option" },
+  // Uses ProcessSpawner.run which enforces timeouts
+  { file: "agents/probes.ts", match: "const child = spawn(file, args,", reason: "detached agent process in its own process group, managed by supervisor not timeouts" },
+  { file: "agents/service.ts", match: "this.probes.spawner.spawn", reason: "uses injected spawner which enforces timeouts" },
+  // AI runner has its own timeout handling
+  { file: "ai/runner.ts", match: "child = spawn(file, args,", reason: "has AbortController-based timeout handling" },
+  // Fleet/machines SSH with bounded waits
+  { file: "fleet/machine-manager.ts", match: 'spawn("ssh"', reason: "SSH probe with manual timeout via setTimeout and destroy" },
+  { file: "machines/health.ts", match: 'spawn("ssh"', reason: "SSH probe with manual timeout via setTimeout and destroy" },
+  // Testing harnesses (not production code)
+  { file: "planner/testing/harness.ts", match: "async spawn(argv", reason: "test harness fake, not production code" },
+  { file: "review/testing/agent-fakes.ts", match: "async spawn(argv", reason: "test harness fake, not production code" },
+  // Restart controller has timeout handling
+  { file: "restart/restart.ts", match: "child = spawn(file, args,", reason: "has AbortController-based timeout via child.kill" },
+  // Review check runner has timeout handling
+  { file: "review/check.ts", match: "child = spawn(file, args,", reason: "has AbortController-based timeout via AbortSignal" },
+  // Git operations with timeout
+  { file: "review/git.ts", match: "execFile(", reason: "has timeout option in execFile call" },
+  // Command service has manual timeout handling
+  { file: "services/command.ts", match: "spawn(cmd, args,", reason: "has manual timeout via setTimeout and proc.kill" },
+  // Data cache git operations
+  { file: "services/data-cache.ts", match: "execFile(", reason: "has timeout option in execFile call" },
+  // Managed process has timeout via destroy
+  { file: "services/managed-process.ts", match: "this.child = spawn(cmd, args,", reason: "has timeout handling via setTimeout and destroy" },
+  { file: "services/managed-process.ts", match: "const child = spawn(cmd, args,", reason: "has timeout handling via AbortController" },
+  // Remote gate with timeout handling
+  { file: "services/remote-gate.ts", match: 'spawn("ssh"', reason: "SSH with manual timeout via setTimeout and proc.kill" },
+  { file: "services/remote-gate.ts", match: "spawn(gateScript", reason: "has manual timeout via setTimeout and proc.kill" },
+  // Settings git operations
+  { file: "settings/service.ts", match: "execFile(", reason: "has timeout option" },
+  // Watchdog probes with timeout
+  { file: "watchdog/probes.ts", match: "execFile(", reason: "has timeout option" },
 ];
 
 interface FetchCall {
@@ -211,6 +242,10 @@ const UNWIRED_ALLOWED: Readonly<Record<string, string>> = {
   machines: "machine status parsing, imported by services",
   nodes: "node manager, initialized directly in index.ts startup",
   scheduler: "scheduler module, initialized directly in index.ts startup",
+  bus: "bus routes registered from routes/bus.js; the bus/ directory holds message types and WebSocket logic",
+  cleanup: "cleanup module not mounted in production; routes only registered by tests (see UNMOUNTED in route-ownership.test.ts)",
+  policy: "merge policy utilities imported by review module, not a standalone server module",
+  "ready-guard": "ready guard utilities imported by agents and review modules, not a standalone server module",
 };
 
 function moduleDirectories(dir: string): string[] {
