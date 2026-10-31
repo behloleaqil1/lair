@@ -155,7 +155,6 @@ export type AgentEventKind =
   | "fill_gate_queued"
   | "fill_gate_gone"
   | "fill_unmatched"
-  | "fill_config"
   | "transient"
   | "transient_cleared"
   | "run_adopted"
@@ -399,25 +398,27 @@ export interface FillStatusView {
   lastCheck: string | null;
   lastError: string | null;
   lines: FillLineView[];
-  /** Unmatched DONE/WAITING/BLOCKED reports: a report naming a different task than the agent's open task */
+  /** done_match task_id: per line, its last run's latest report line that names no task it can be about */
   unmatchedReports: FillUnmatchedReportView[];
+  /** What in the fill block can make fill close or change a task a line wasn't about (also on Home → Health) */
+  warnings: string[];
   /** Current capacity state (native capacity checks) */
   capacity?: FillCapacityView;
 }
 
-/** A report (DONE/WAITING/BLOCKED) that named a different task than the agent's open task. */
+/** A DONE, WAITING or BLOCKED line an agent wrote on a run that names no task it can be about: it counts for no task. */
 export interface FillUnmatchedReportView {
-  /** The agent that wrote the report */
+  /** The agent that wrote the line (by its attribution) */
   agent: string;
-  /** What the agent's open task is */
+  /** The task of the run it wrote it on */
   openTask: string;
-  /** The task id the report named (from the queue line) */
+  runId: string;
+  /** The task id the line names, as the pattern reads it ("" when it names none) */
   reportedTask: string;
-  /** The kind of report: done, waiting or blocked */
   kind: "done" | "waiting" | "blocked";
-  /** The queue line as written */
+  /** The queue line as written (data, cut at 300 characters) */
   line: string;
-  /** When it was recorded */
+  /** When fill first saw it */
   at: string;
 }
 

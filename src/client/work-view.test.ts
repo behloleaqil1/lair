@@ -107,6 +107,7 @@ function status(agents: AgentView[], lines: FillLineView[] = []): AgentsStatusVi
       lastError: null,
       lines,
       unmatchedReports: [],
+      warnings: [],
     },
   };
 }
