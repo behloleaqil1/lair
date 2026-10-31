@@ -117,8 +117,10 @@ const MAX_LISTED = 5;
 export const READY_TIMEOUT_MS = 20_000;
 
 const MENTION = /\b(?:PR|pull request)\s*#(\d{1,9})\b(?:\s*\[([0-9a-f]{7,40})\]|\s+at\s+([0-9a-f]{7,40})\b)?/gi;
-/** The tail the bus mirror writes: `... PR #<n> [<sha7>]` at the very end of the line */
+/** The tail the bus mirror writes: `... PR #<n> [<sha7>]` at the very end of the line (before its bus marker) */
 const BUS_TAIL = /\b(?:PR|pull request)\s*#(\d{1,9})\s*\[([0-9a-f]{7,40})\]\s*$/i;
+/** The marker the mirror ends its lines with, `[bus:<id>]` (src/server/bus/consumers.ts) */
+const BUS_MARKER = /\s*\[bus:[1-9]\d{0,14}\]\s*$/;
 
 function mentions(text: string): { pr: number; sha: string | null }[] {
   return [...text.matchAll(MENTION)].map((m) => ({ pr: Number(m[1]), sha: (m[2] ?? m[3] ?? "").toLowerCase() || null }));
@@ -137,7 +139,7 @@ export function isPrWork(taskText: string): boolean {
  * names wins; if that doesn't settle it the line is ambiguous.
  */
 export function parseReadyReport(line: string, taskText = ""): ParsedReport {
-  const tail = BUS_TAIL.exec(line);
+  const tail = BUS_TAIL.exec(line.replace(BUS_MARKER, ""));
   if (tail) return { kind: "pr", report: { pr: Number(tail[1]), sha: tail[2].toLowerCase() } };
   const found = mentions(line);
   if (found.length === 0) return { kind: "none" };

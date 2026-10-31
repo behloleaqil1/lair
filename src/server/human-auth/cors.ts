@@ -42,6 +42,8 @@ export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/tofu-runner",
   // Cloud machines: the status names the account's instances and spend, and the trip is cleared here (every route the owner's)
   "/api/cloud",
+  // The tracker: its status shows task text and repositories, and a reconcile writes to GitHub (every route the owner's)
+  "/api/tracker",
   // The supervisor: Lair's diagnostics, and the ops tokens and their audit (every route the owner's)
   "/api/health/diagnostics",
   "/api/supervisor",
@@ -58,6 +60,14 @@ export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/pipelines",
   // Only the owner's message route of the bus: its board and event stream keep their CORS
   "/api/bus/send",
+  // The bus's agent API takes a run's bus token, not the owner session; no browser page may call it either
+  "/api/bus/call",
+  // Host services: the owner's tick runs start commands (its reads under /api/host-services stay public)
+  "/api/host-services/owner",
+  // Lessons: every route is owner-only (requireOwner)
+  "/api/lessons",
+  // Checks: POST takes a bus token, GET /:id takes a token or owner, list and stats are owner-only
+  "/api/checks",
 ];
 
 export function isUnder(url: string, prefixes: readonly string[]): boolean {

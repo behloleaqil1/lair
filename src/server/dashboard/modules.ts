@@ -29,6 +29,7 @@ export function moduleFlags(config: ProjectConfig, nodeCount: number): ModuleFla
     review: enabled(config.review),
     triage: enabled(config.triage),
     placement: enabled(config.placement),
+    hostServices: enabled(config.host_services),
     cloud: enabled(config.cloud),
     pipelines: hasEntries(config.pipelines),
     delivery: enabled(config.delivery),
@@ -37,6 +38,7 @@ export function moduleFlags(config: ProjectConfig, nodeCount: number): ModuleFla
     github: typeof config.github === "string" && config.github.trim() !== "",
     machines: hasEntries(config.machines),
     nodes: nodeCount > 0,
+    lessons: enabled(config.lessons),
   };
 }
 
@@ -48,6 +50,7 @@ export const NO_MODULES: ModuleFlags = {
   review: false,
   triage: false,
   placement: false,
+  hostServices: false,
   cloud: false,
   pipelines: false,
   delivery: false,
@@ -56,4 +59,5 @@ export const NO_MODULES: ModuleFlags = {
   github: false,
   machines: false,
   nodes: false,
+  lessons: false,
 };

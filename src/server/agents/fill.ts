@@ -6,6 +6,11 @@
  * (`<agent>|<name>|<task>|<description>`) is looked at in file order. It is:
  * - not_allowlisted when its agent isn't in fill.agents (another launcher may
  *   still run that agent): fill never starts it;
+ * - unassigned when it names no agent (`|<name>|<task>|<description>`):
+ *   fill never starts it. It is ready work for any allowlisted agent while
+ *   it is open (no active run or claim on its task, no done line in the
+ *   queue, its last run not waiting or blocked; see unassignedLine), and an
+ *   agent idle while ready work exists raises one notice (fill.idle, idle.ts);
  * - started when a run of its agent on its task is active;
  * - claimed when another agent's run, or any other claim, holds the task;
  * - done when done_pattern matches a queue line written since the task's
@@ -73,30 +78,36 @@ import type {
   FillLineView,
   FillQueuedGateView,
   FillStatusView,
+  FillUnmatchedReportView,
   FillWaitingView,
 } from "../../shared/agents-types.js";
 import { isValidDragonId } from "../parsers/dragon-config.js";
 import { parseGateFilename } from "../parsers/gates.js";
+import { attributedAgent } from "../parsers/queue.js";
 import { getPromptsDir } from "../routes/controls.js";
 import {
+  anyAgentPatternFor,
   backoffMs,
-  doneLineMatches,
   fillPatternFor,
   getAgentClass,
   matchesByAgent,
+  reportPatternFor,
+  REPORTED_TASK_GROUP,
   taskLineMatch,
   WAKE_VALUE,
   type FillPattern,
   type FillSettings,
 } from "./config.js";
 import { escalationDecisionKey, type DecisionRequest } from "./decisions.js";
+import { computeIdleStates, findReadyWork, idleExplanation, idleStateView, shouldNotice, type IdleInput, type IdleState } from "./idle.js";
 import type { AgentProbes, MemoryReading } from "./probes.js";
 import { MAX_PROMPT_FILE_BYTES } from "./prompts.js";
 import { lastLines, readTail } from "./sessions.js";
 import type { AgentsStore } from "./store.js";
 import { isActive, isValidTaskId, type AgentRun, type QueueMark } from "./types.js";
 import type { ProcessInfo } from "../watchdog/probes.js";
-import { evaluateReady, isPrWork, parseReadyReport, refuseReport, unverifiable, type ReadyFactsSource, type ReadyVerdict } from "../ready-guard/guard.js";
+import { evaluateReady, isPrWork, parseReadyReport, refuseReport, unverifiable, type ParsedReport, type ReadyFactsSource, type ReadyVerdict } from "../ready-guard/guard.js";
+import { extractBusId, mirroredReport, type BusLineSource, type StructuredReport } from "../bus/consumers.js";
 
 export const MAX_TASKS_FILE_BYTES = 256 * 1024;
 export const MAX_TASK_LINES = 200;
@@ -157,6 +168,16 @@ export const fillDecisionKey = (task: string, runId: string, kind?: "blocked" | 
  */
 export const fillRefusedKey = (task: string, since: string, runId: string | null) =>
   `fill:${task}:refused:${since}:${runId ?? "none"}`;
+
+/** The one option of an idle notice (fill.idle): it asks nothing */
+export const IDLE_NOTICE_NOTED = "noted";
+/** The key of an agent's idle notice: one per episode (`since`, when it began idling while ready work existed, in ms). */
+export const idleNoticeKey = (agent: string, since: number) => `fill-idle:${agent}:${since}`;
+/** The agent and episode of an idle notice's key, or null for any other key. */
+export function parseIdleNoticeKey(key: string): { agent: string; since: number } | null {
+  const match = /^fill-idle:([A-Za-z][A-Za-z0-9_-]{0,63}):(\d{1,15})$/.exec(key);
+  return match ? { agent: match[1], since: Number(match[2]) } : null;
+}
 
 /** How a run that ended other than completed ended, in plain words (never its log). */
 function howItEnded(run: AgentRun): string {
@@ -261,6 +282,8 @@ interface RunStatus {
   line: string;
   /** What a waiting line names to wait on ((?<wake>...)), not yet checked */
   wake: string | null;
+  /** bus.consume on: the id of the bus report the line was read from (its gate id is the wake), else null */
+  busId: number | null;
 }
 
 /** What a waiting run waits on (see AgentsFill.classifyWait); `named` is a wake that resolved to a file, else null. */
@@ -364,16 +387,72 @@ function firstLineOf(path: string, maxBytes: number): string | null {
   }
 }
 
+/** What a queue line reports, as fill's patterns look for it. */
+export type LineKind = "done" | "waiting" | "blocked";
+
+/** The bus report kind of each line kind */
+const REPORT_KIND: Record<LineKind, StructuredReport["kind"]> = { done: "DONE", waiting: "WAITING", blocked: "BLOCKED" };
+
+/** One pattern of a query, with the kind of line it looks for. */
+export interface LineQuery<K extends LineKind = LineKind> {
+  kind: K;
+  pattern: FillPattern;
+}
+
+/**
+ * Whom a query is about. A bus report (bus.consume on) is matched by these
+ * ids, never by the patterns: its task must be `task`, and its agent `agent`
+ * when the pattern names the agent or `own` is set.
+ */
+export interface LineSubject {
+  task: string;
+  agent: string;
+  /** Only the agent's own lines count, whatever the pattern names (reportedOutcome) */
+  own?: boolean;
+}
+
+/** A line a query matched: its text, what a waiting line waits on, and the bus report it was read from (on mode). */
+export interface LineMatch<K extends LineKind = LineKind> {
+  kind: K;
+  line: string;
+  wake: string | null;
+  report: StructuredReport | null;
+}
+
+interface QueueLine {
+  start: number;
+  text: string;
+  /** The line's newline is in the file (the last line may still be being written) */
+  ended: boolean;
+  /** The bus report this line mirrors (its marker, verified against the bus store), or null */
+  report: StructuredReport | null;
+  /** A second line with the same report's marker: in on mode it is not read again */
+  repeat: boolean;
+}
+
 /**
  * The queue file's lines at one check (its last 4 MB), trimmed, each with
  * the offset it starts at. Fill and the planner (checkDone) read it.
+ *
+ * With the project's bus (bus.consume observe or on), a line that ends with
+ * a bus marker is looked up in the bus store: when it is that report's
+ * mirrored line, the report is kept with it. In on mode such a line is read
+ * by the report's fields only; a marker that names no report, or a line
+ * that isn't the report's mirror, is read as a hand-written line.
  */
 export class QueueLines {
-  private lines: { start: number; text: string }[] = [];
+  private lines: QueueLine[] = [];
+  /** Line indexes by author (lowercase), built on first use (agentLines) */
+  private byAuthor: Map<string, number[]> | null = null;
   private size = 0;
   private usableMarks = new Map<string, boolean>();
+  private readonly structured: boolean;
 
-  constructor(private path: string) {
+  constructor(
+    private path: string,
+    bus: BusLineSource | null = null,
+  ) {
+    this.structured = bus?.mode === "on";
     const opened = openRegular(path, false);
     if ("error" in opened) return;
     try {
@@ -391,7 +470,7 @@ export class QueueLines {
             .toString("utf-8")
             .slice(0, QUEUE_LINE_CHARS)
             .trim();
-          this.lines.push({ start: begin + pos, text });
+          this.lines.push({ start: begin + pos, text, ended: newline >= 0, report: null, repeat: false });
         }
         pos = end + 1;
       }
@@ -400,6 +479,48 @@ export class QueueLines {
     } finally {
       closeSync(opened.fd);
     }
+    if (bus) this.attachReports(bus);
+  }
+
+  /** Keep each mirrored line's bus report with it (one store read for all of them). */
+  private attachReports(bus: BusLineSource): void {
+    const marked = this.lines.map((line) => ({ line, id: extractBusId(line.text) })).filter((m): m is { line: QueueLine; id: number } => m.id !== null);
+    if (marked.length === 0) return;
+    const reports = bus.reports([...new Set(marked.map((m) => m.id))]);
+    const seen = new Set<number>();
+    for (const { line, id } of marked) {
+      const report = mirroredReport(bus, line.text, id, reports);
+      if (!report) continue;
+      if (seen.has(id)) {
+        line.repeat = true;
+        continue;
+      }
+      seen.add(id);
+      line.report = report;
+    }
+  }
+
+  /** The lines that mirror a bus report, oldest first, with the report. */
+  mirrored(): { line: string; report: StructuredReport }[] {
+    return this.lines.flatMap((l) => (l.report ? [{ line: l.text, report: l.report }] : []));
+  }
+
+  /**
+   * Whether a line matches one query for `subject`. In on mode a mirrored
+   * line matches by its report only (kind, task, agent; a WAITING report's
+   * gate id is its wake), and a repeated one never; every other line by the
+   * pattern (taskLineMatch; a waiting line's (?<wake>...) is its wake).
+   */
+  private match<K extends LineKind>(line: QueueLine, query: LineQuery<K>, subject: LineSubject): LineMatch<K> | null {
+    if (this.structured && (line.report !== null || line.repeat)) {
+      const report = line.report;
+      if (report === null || report.kind !== REPORT_KIND[query.kind] || report.task !== subject.task) return null;
+      if ((subject.own || query.pattern.agent !== null) && report.agent.toLowerCase() !== subject.agent.toLowerCase()) return null;
+      return { kind: query.kind, line: line.text, wake: query.kind === "waiting" ? report.gateId : null, report };
+    }
+    const match = taskLineMatch(query.pattern, line.text);
+    if (match === null) return null;
+    return { kind: query.kind, line: line.text, wake: query.kind === "waiting" ? match.groups?.wake?.trim() || null : null, report: null };
   }
 
   /**
@@ -429,35 +550,32 @@ export class QueueLines {
     return this.usable(until) ? { from, to: until.offset } : null;
   }
 
-  /** The first line in the pattern's window that reports what it looks for (taskLineMatch). */
-  find(pattern: FillPattern, mark: QueueMark | undefined, until?: QueueMark): string | null {
-    const window = this.window(pattern, mark, until);
+  /** The first line in the query's window that reports what it looks for (see match). */
+  find<K extends LineKind>(query: LineQuery<K>, subject: LineSubject, mark: QueueMark | undefined, until?: QueueMark): LineMatch<K> | null {
+    const window = this.window(query.pattern, mark, until);
     if (window === null) return null;
     for (const line of this.lines) {
-      if (line.start >= window.from && line.start < window.to && doneLineMatches(pattern, line.text)) return line.text;
+      if (line.start < window.from || line.start >= window.to) continue;
+      const found = this.match(line, query, subject);
+      if (found) return found;
     }
     return null;
   }
 
   /**
-   * The last line in the patterns' windows that one of them matches
-   * (taskLineMatch; a line takes the first pattern that matches it): the
-   * latest such line wins.
+   * The last line in the queries' windows that one of them matches (a line
+   * takes the first query that matches it): the latest such line wins.
    */
-  lastOf<K extends string>(
-    patterns: { kind: K; pattern: FillPattern }[],
-    mark: QueueMark | undefined,
-    until?: QueueMark,
-  ): { kind: K; line: string; match: RegExpExecArray } | null {
-    const windows = patterns.map(({ pattern }) => this.window(pattern, mark, until));
-    let last: { kind: K; line: string; match: RegExpExecArray } | null = null;
+  lastOf<K extends LineKind>(queries: LineQuery<K>[], subject: LineSubject, mark: QueueMark | undefined, until?: QueueMark): LineMatch<K> | null {
+    const windows = queries.map(({ pattern }) => this.window(pattern, mark, until));
+    let last: LineMatch<K> | null = null;
     for (const line of this.lines) {
-      for (let i = 0; i < patterns.length; i++) {
+      for (let i = 0; i < queries.length; i++) {
         const window = windows[i];
         if (window === null || line.start < window.from || line.start >= window.to) continue;
-        const match = taskLineMatch(patterns[i].pattern, line.text);
-        if (match) {
-          last = { kind: patterns[i].kind, line: line.text, match };
+        const found = this.match(line, queries[i], subject);
+        if (found) {
+          last = found;
           break;
         }
       }
@@ -467,20 +585,21 @@ export class QueueLines {
 
   /**
    * The last line written after `mark` that reports the task waiting or
-   * blocked: the latest such line wins. A waiting line's (?<wake>...) is
-   * what it waits on.
+   * blocked: the latest such line wins. A waiting line's (?<wake>...), or a
+   * WAITING report's gate id, is what it waits on.
    */
-  lastStatus(waiting: FillPattern, blocked: FillPattern, mark: QueueMark | undefined, until?: QueueMark): RunStatus | null {
+  lastStatus(waiting: FillPattern, blocked: FillPattern, subject: LineSubject, mark: QueueMark | undefined, until?: QueueMark): RunStatus | null {
     const last = this.lastOf<"waiting" | "blocked">(
       [
         { kind: "waiting", pattern: waiting },
         { kind: "blocked", pattern: blocked },
       ],
+      subject,
       mark,
       until,
     );
     if (!last) return null;
-    return { kind: last.kind, line: last.line, wake: last.kind === "waiting" ? last.match.groups?.wake?.trim() || null : null };
+    return { kind: last.kind, line: last.line, wake: last.wake, busId: last.report?.id ?? null };
   }
 
   /** A mark still describes this file: it isn't past its end and the bytes before it are unchanged. */
@@ -505,21 +624,57 @@ export class QueueLines {
     this.usableMarks.set(key, ok);
     return ok;
   }
+
+  /**
+   * The whole lines `agent` wrote, by their attribution (attributedAgent, in
+   * any case), after `mark` and before `until` (a run's own lines: `until`
+   * is where its agent's next run on another task began), oldest first.
+   * Nothing without a usable `mark` (a line from before the run can be about
+   * anything the agent did before), or when `until` no longer describes the
+   * file. A last line without its newline is still being written: it is left
+   * for a later check. Lines are indexed by author once per QueueLines (one
+   * pass for the check), so each task costs only its agent's lines.
+   */
+  agentLines(agent: string, mark: QueueMark | undefined, until: QueueMark | undefined): string[] {
+    if (!mark || !this.usable(mark)) return [];
+    if (until && !this.usable(until)) return [];
+    if (this.byAuthor === null) {
+      const byAuthor = new Map<string, number[]>();
+      this.lines.forEach((line, i) => {
+        const author = line.ended ? attributedAgent(line.text)?.toLowerCase() : undefined;
+        if (author === undefined) return;
+        const own = byAuthor.get(author);
+        if (own) own.push(i);
+        else byAuthor.set(author, [i]);
+      });
+      this.byAuthor = byAuthor;
+    }
+    const to = until ? until.offset : Number.POSITIVE_INFINITY;
+    return (this.byAuthor.get(agent.toLowerCase()) ?? [])
+      .map((i) => this.lines[i])
+      // In on mode a mirrored line is its bus report, always about the task its run held: never an unmatched one
+      .filter((line) => line.start >= mark.offset && line.start < to && !(this.structured && (line.report !== null || line.repeat)))
+      .map((line) => line.text);
+  }
 }
 
 // ============ THE TASKS FILE ============
 
 export type TasksFileEntry =
-  | { kind: "task"; line: number; agent: string; name: string; task: string; description: string }
+  /** agent null: an unassigned line (an empty agent field), ready work for any agent while it is open */
+  | { kind: "task"; line: number; agent: string | null; name: string; task: string; description: string }
   | { kind: "malformed"; line: number; text: string; reason: string };
 
 /**
  * tasks_file lines: `<agent>|<name>|<task>|<description>` (the description
  * may be empty and may hold "|"). `#` comments and blank lines are skipped.
- * A line that doesn't parse, names an invalid agent or task id, repeats a
- * task, or comes after the 200th task is malformed: reported, not fatal.
- * With `onePerAgent` (patterns that match by agent), so is a second line
- * for an agent: its queue lines couldn't say which of its tasks they're about.
+ * An empty agent field (`|<name>|<task>|<description>`) makes the line
+ * unassigned (agent null): fill starts nothing for it. A line that doesn't
+ * parse, names an invalid agent or task id, repeats a task (unassigned lines
+ * included), or comes after the 200th task is malformed: reported, not
+ * fatal. With `onePerAgent` (patterns that match by agent), so is a second
+ * line for an agent: its queue lines couldn't say which of its tasks they're
+ * about (unassigned lines have no agent, so they never count as one).
  */
 export function parseTasksFile(content: string, onePerAgent = false): TasksFileEntry[] {
   const entries: TasksFileEntry[] = [];
@@ -542,8 +697,8 @@ export function parseTasksFile(content: string, onePerAgent = false): TasksFileE
     }
     const [agent, name, task] = fields.slice(0, 3).map((field) => field.trim());
     const description = fields.slice(3).join("|").trim();
-    if (!isValidDragonId(agent)) {
-      bad(`${agent || "(empty)"} is not a valid agent id`);
+    if (agent !== "" && !isValidDragonId(agent)) {
+      bad(`${agent} is not a valid agent id`);
       continue;
     }
     if (!isValidTaskId(task)) {
@@ -555,7 +710,7 @@ export function parseTasksFile(content: string, onePerAgent = false): TasksFileE
       bad(`task ${task} is already on line ${first}`);
       continue;
     }
-    const agentLine = agentLines.get(agent.toLowerCase());
+    const agentLine = agent === "" ? undefined : agentLines.get(agent.toLowerCase());
     if (onePerAgent && agentLine !== undefined) {
       bad(`${agent} already has a task on line ${agentLine}: with patterns that match by agent, one line per agent`);
       continue;
@@ -565,6 +720,10 @@ export function parseTasksFile(content: string, onePerAgent = false): TasksFileE
       continue;
     }
     taskLines.set(task, line);
+    if (agent === "") {
+      entries.push({ kind: "task", line, agent: null, name, task, description });
+      continue;
+    }
     agentLines.set(agent.toLowerCase(), line);
     entries.push({ kind: "task", line, agent, name: name || agent, task, description });
   }
@@ -584,8 +743,11 @@ function fillDoneKey(task: string, latestRunId: string | null, entry: TaskLineFi
   return `fill_done:${task}:${latestRunId ?? "none"}:${lineHash(entry)}`;
 }
 
-/** A task fill judges done: from its kept record, or from a queue line. null: not done. */
-export type DoneCheck = { kind: "kept"; line: string; at: number } | { kind: "queue"; line: string } | null;
+/**
+ * A task fill judges done: from its kept record, or from a queue line (with
+ * the bus report it was read from, in on mode). null: not done.
+ */
+export type DoneCheck = { kind: "kept"; line: string; at: number } | { kind: "queue"; line: string; report: StructuredReport | null } | null;
 
 /**
  * Where a line's queue window ends: with patterns that match by agent, the
@@ -624,25 +786,85 @@ export function checkDone(
   const kept = store.getEventByKey(project, fillDoneKey(entry.task, latest?.id ?? null, entry));
   if (kept) return { kind: "kept", line: String(kept.data.line ?? ""), at: kept.at };
   const donePattern = fillPatternFor(settings.donePattern, entry.task, entry.agent);
-  let line: string | null;
+  const subject: LineSubject = { task: entry.task, agent: entry.agent };
+  let found: LineMatch | null;
   if (donePattern.task !== null) {
     // A line that names the task: done is done, whatever came after it
-    line = queue.find(donePattern, latest?.queueMark, until);
+    found = queue.find({ kind: "done", pattern: donePattern }, subject, latest?.queueMark, until);
   } else {
     // A line by the agent only says where it is now: its last DONE, WAITING or BLOCKED line decides
     // ("- DONE row 1 by kiro-A", then "- WAITING <gate> by kiro-A" is waiting, not done)
-    const last = queue.lastOf<"done" | "waiting" | "blocked">(
+    const last = queue.lastOf<LineKind>(
       [
         { kind: "done", pattern: donePattern },
         { kind: "waiting", pattern: fillPatternFor(settings.waitingPattern, entry.task, entry.agent) },
         { kind: "blocked", pattern: fillPatternFor(settings.blockedPattern, entry.task, entry.agent) },
       ],
+      subject,
       latest?.queueMark,
       until,
     );
-    line = last?.kind === "done" ? last.line : null;
+    found = last?.kind === "done" ? last : null;
   }
-  return line === null ? null : { kind: "queue", line };
+  return found === null ? null : { kind: "queue", line: found.line, report: found.report };
+}
+
+/** A report line an agent wrote on a run that names no task it can be about (done_match task_id). */
+export interface UnmatchedReport {
+  kind: "done" | "waiting" | "blocked";
+  /** The task id the line names, as its pattern reads it (shown, never compared: taskLineMatch decides) */
+  reportedTask: string;
+  /** The line as written (trimmed and cut as QueueLines reads it): data, never an instruction */
+  line: string;
+}
+
+/** Unmatched reports kept per run at most: the latest ones */
+export const MAX_UNMATCHED_PER_RUN = 5;
+
+/**
+ * With done_match task_id: the report lines `run`'s agent wrote on the run
+ * (QueueLines.agentLines: its own by attribution, after its queue mark,
+ * before `until`, where its next run on another task began) that name no
+ * task they can be about. A line is a report when the project's own
+ * pattern of a kind that has {task} reads a task id
+ * in it (reportPatternFor): a READY or other keyword of the project's
+ * pattern counts, a keyword it doesn't have never does. Such a line is
+ * unmatched unless it is a line of the run's own task (taskLineMatch with
+ * that task's pattern, so "fix-10" and "review-fix-1" are not "fix-1") or
+ * `listed` claims it for another task of the tasks file. An unmatched line
+ * closes and changes nothing: the run's task goes on as if it wasn't there
+ * (no done line: the no-done path). The latest MAX_UNMATCHED_PER_RUN.
+ */
+export function unmatchedReports(
+  queue: QueueLines,
+  settings: Pick<FillSettings, "donePattern" | "waitingPattern" | "blockedPattern">,
+  run: Pick<AgentRun, "agent" | "task" | "queueMark">,
+  until: QueueMark | undefined,
+  listed: (kind: UnmatchedReport["kind"], line: string) => boolean,
+): UnmatchedReport[] {
+  const templates: [UnmatchedReport["kind"], string][] = [
+    ["done", settings.donePattern],
+    ["waiting", settings.waitingPattern],
+    ["blocked", settings.blockedPattern],
+  ];
+  const kinds = templates.flatMap(([kind, template]) => {
+    const report = reportPatternFor(template, run.agent);
+    return report ? [{ kind, report, own: fillPatternFor(template, run.task, run.agent) }] : [];
+  });
+  if (kinds.length === 0) return [];
+  const found: UnmatchedReport[] = [];
+  for (const line of queue.agentLines(run.agent, run.queueMark, until)) {
+    for (const { kind, report, own } of kinds) {
+      const match = report.exec(line);
+      if (!match) continue;
+      // The run's own task's line, or another listed task's: it counts for that task (or for nothing), never here
+      if (taskLineMatch(own, line) === null && !listed(kind, line)) {
+        found.push({ kind, reportedTask: match.groups?.[REPORTED_TASK_GROUP] ?? "", line });
+      }
+      break;
+    }
+  }
+  return found.slice(-MAX_UNMATCHED_PER_RUN);
 }
 
 /** How a run ended by its own queue line: DONE, WAITING or BLOCKED, and the line as written (data, never a prompt). */
@@ -672,10 +894,11 @@ export function reportedOutcome(
   const done = own(settings.donePattern);
   const waiting = own(settings.waitingPattern);
   const blocked = own(settings.blockedPattern);
+  const subject: LineSubject = { task: run.task, agent: run.agent, own: true };
   if (done.task !== null) {
-    const line = queue.find(done, run.queueMark, until);
-    if (line !== null) return { kind: "done", line };
-    const status = queue.lastStatus(waiting, blocked, run.queueMark, until);
+    const found = queue.find({ kind: "done", pattern: done }, subject, run.queueMark, until);
+    if (found !== null) return { kind: "done", line: found.line };
+    const status = queue.lastStatus(waiting, blocked, subject, run.queueMark, until);
     return status ? { kind: status.kind, line: status.line } : null;
   }
   const last = queue.lastOf<ReportedOutcome["kind"]>(
@@ -684,10 +907,69 @@ export function reportedOutcome(
       { kind: "waiting", pattern: waiting },
       { kind: "blocked", pattern: blocked },
     ],
+    subject,
     run.queueMark,
     until,
   );
   return last ? { kind: last.kind, line: last.line } : null;
+}
+
+/** What fill makes of an unassigned line: its state, why, and whether it is ready work (fill.idle). */
+export interface UnassignedLine {
+  state: Extract<FillLineState, "done" | "claimed" | "unassigned">;
+  detail: string;
+  runId: string | null;
+  ready: boolean;
+}
+
+/**
+ * An unassigned tasks_file line (no agent): fill starts nothing for it, and
+ * it is ready work for any allowlisted agent only while it is open. It is
+ * claimed while a run of its task is active or a claim holds it (someone
+ * took it: a run you requested, say); done when a queue line matching
+ * done_pattern names it, written since its latest run was requested (the
+ * whole window when it never ran; `{agent}` then matches any agent, since the
+ * line names none), or when its latest run's own last line is the DONE one;
+ * and not ready while that run's own last line is WAITING or BLOCKED (its
+ * agent still has it). A done line here only keeps the line from counting as
+ * ready work: nothing is recorded, and nothing goes to review. With a
+ * done_pattern that names only the agent, no queue line can name a task
+ * nobody ran: it stays open until it is assigned or taken out of the file.
+ * Throws when a pattern doesn't compile for this task.
+ */
+export function unassignedLine(
+  store: Pick<AgentsStore, "latestRunForTask" | "getClaim" | "firstRunForAgentAfter">,
+  project: string,
+  queue: QueueLines,
+  settings: Pick<FillSettings, "donePattern" | "waitingPattern" | "blockedPattern">,
+  task: string,
+): UnassignedLine {
+  const latest = store.latestRunForTask(project, task);
+  if (latest && isActive(latest.state)) {
+    return { state: "claimed", detail: `run ${short(latest.id)} of agent ${latest.agent} is ${latest.state}: not ready work`, runId: latest.id, ready: false };
+  }
+  const claim = store.getClaim(project, task);
+  if (claim) {
+    return { state: "claimed", detail: `claimed by run ${short(claim.runId)} (agent ${claim.agent}): not ready work`, runId: claim.runId, ready: false };
+  }
+  const donePattern = anyAgentPatternFor(settings.donePattern, task);
+  // An unassigned line has no agent: a done line (or bus report, in on mode) for the task by any agent
+  const doneLine = donePattern ? queue.find({ kind: "done", pattern: donePattern }, { task, agent: "" }, latest?.queueMark) : null;
+  if (doneLine !== null) return { state: "done", detail: `done: ${oneLine(doneLine.line)}`, runId: latest?.id ?? null, ready: false };
+  if (latest) {
+    const until = queueWindowEnd(store, project, settings, { agent: latest.agent, task }, latest);
+    const outcome = reportedOutcome(queue, settings, latest, until);
+    if (outcome?.kind === "done") return { state: "done", detail: `done: ${oneLine(outcome.line)}`, runId: latest.id, ready: false };
+    if (outcome) {
+      return {
+        state: "unassigned",
+        detail: `no agent assigned, and not ready work: its last run ${short(latest.id)} (agent ${latest.agent}) ended on a ${outcome.kind.toUpperCase()} line: ${oneLine(outcome.line)}`,
+        runId: latest.id,
+        ready: false,
+      };
+    }
+  }
+  return { state: "unassigned", detail: "no agent assigned: ready work for any agent in agents.fill.agents", runId: null, ready: true };
 }
 
 // ============ PROMPTS ============
@@ -795,7 +1077,26 @@ export interface AgentsFillOptions {
   withdraw: (decision: Decision, reason: string) => Promise<void>;
   /** The ready guard's source for this project's PRs (used when settings.readyGuard is on); undefined: none, nothing is refused */
   readyFacts?: () => ReadyFactsSource | undefined;
+  /** The project's bus at this check (bus.consume observe or on), or null: queue lines only, as without the bus */
+  bus?: () => BusLineSource | null;
 }
+
+/** How a report or a line reads, for observe mode's comparison: its kind, and the gate a waiting one waits on */
+function reading(kind: LineKind | "PROGRESS" | "TICK" | null, wake: string | null): string {
+  if (kind === null || kind === "PROGRESS" || kind === "TICK") return "nothing (no done, waiting or blocked line)";
+  return kind === "waiting" ? `waiting on ${wake ?? "(nothing named)"}` : kind;
+}
+
+/** observe: how many of the latest mirrored lines each check compares */
+const MAX_OBSERVED_LINES = 200;
+
+const LINE_KIND: Record<StructuredReport["kind"], LineKind | "PROGRESS" | "TICK"> = {
+  DONE: "done",
+  WAITING: "waiting",
+  BLOCKED: "blocked",
+  PROGRESS: "PROGRESS",
+  TICK: "TICK",
+};
 
 function firstLine(text: string): string | null {
   const line = text
@@ -831,8 +1132,18 @@ export class AgentsFill {
   private lineGone = new Map<string, number>();
   /** When fill last saw a waiting run's gate in the gate queue (task|run -> time); the store keeps the first and last sightings */
   private lastQueued = new Map<string, number>();
+  /** The unmatched reports of the lines' last runs at the last complete check (rebuilt from the queue each check) */
+  private unmatchedReports: FillUnmatchedReportView[] = [];
   /** Last capacity check state for the view */
   private lastCapacity: FillCapacityView | null = null;
+  /** checkSoon's check after the one in progress */
+  private again: Promise<void> | null = null;
+  /** stop() ran: events start no check */
+  private ended = false;
+  /** Every allowlisted agent's idle state at the last whole check (fill.idle) */
+  private idleStates = new Map<string, IdleState>();
+  /** Each agent's open idle notice: its episode's start (ms), null for none; read from the store once per agent */
+  private idleNotices = new Map<string, number | null>();
 
   constructor(private options: AgentsFillOptions) {}
 
@@ -859,6 +1170,9 @@ export class AgentsFill {
       lastCheck: this.lastCheck === null ? null : iso(this.lastCheck),
       lastError: this.lastError,
       lines: this.lines,
+      idle: this.idleStates.size > 0 ? [...this.idleStates.values()].map(idleStateView) : undefined,
+      unmatchedReports: this.unmatchedReports,
+      warnings: settings.warnings,
       capacity: this.lastCapacity ?? undefined,
     };
   }
@@ -866,6 +1180,27 @@ export class AgentsFill {
   /** The task's line at the last check, if there is one. */
   lineFor(task: string): FillLineView | null {
     return this.lines.find((line) => line.task === task) ?? null;
+  }
+
+  /**
+   * Why fill won't read a bus report (bus.consume on or observe), or null
+   * when it will: its task has no line in the tasks file at the last check,
+   * that line's agent isn't allowlisted, or fill's pattern for the report's
+   * kind names the agent and another agent reported it. Null until a check
+   * has read the tasks file.
+   */
+  busReportProblem(report: Pick<StructuredReport, "task" | "agent" | "kind">): string | null {
+    if (this.lastCheck === null || this.lastError !== null) return null;
+    const line = this.lineFor(report.task);
+    if (!line) return `task ${report.task} is not in agents.fill.tasks_file: fill ignores the report`;
+    if (line.state === "not_allowlisted") return `${line.agent ?? "its agent"} is not in agents.fill.agents: fill ignores the report`;
+    const kind = LINE_KIND[report.kind];
+    const { settings } = this.options;
+    const template = kind === "done" ? settings.donePattern : kind === "waiting" ? settings.waitingPattern : kind === "blocked" ? settings.blockedPattern : null;
+    if (template !== null && template.includes("{agent}") && line.agent?.toLowerCase() !== report.agent.toLowerCase()) {
+      return `${report.agent} reported it, but the task's line is ${line.agent ?? "another agent"}'s and fill's pattern names the agent: fill ignores the report`;
+    }
+    return null;
   }
 
   /**
@@ -901,10 +1236,28 @@ export class AgentsFill {
     return this.checking;
   }
 
+  /**
+   * A check now, for an event (bus.consume on: an accepted bus report, or a
+   * run that ended), instead of at the next interval. One in progress may
+   * have read the queue before the event's line was written, so one more
+   * runs right after it (calls meanwhile share that one). Nothing once
+   * stop() has run. It never rejects.
+   */
+  checkSoon(): Promise<void> {
+    if (this.ended) return Promise.resolve();
+    if (!this.checking) return this.check();
+    this.again ??= this.checking.then(() => {
+      this.again = null;
+      return this.ended ? undefined : this.check();
+    });
+    return this.again;
+  }
+
   /** Check soon, then every fill.interval_seconds, until stop(). */
   start(): void {
     if (!this.stopped) return;
     this.stopped = false;
+    this.ended = false;
     const interval = this.options.settings.intervalSeconds * 1000;
     const loop = async () => {
       if (this.stopped) return;
@@ -920,12 +1273,14 @@ export class AgentsFill {
   /** Stop the loop. A check in progress is interrupted (its capacity_cmd killed) and awaited. */
   async stop(): Promise<void> {
     this.stopped = true;
+    this.ended = true;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
     this.abort?.abort();
     await this.checking;
+    await this.again;
   }
 
   private async runCheck(): Promise<void> {
@@ -941,6 +1296,8 @@ export class AgentsFill {
     try {
       this.lines = await this.evaluate(abort.signal, now);
       this.lastError = abort.signal.aborted ? "the check was interrupted: the module stopped" : null;
+      // A check cut short saw only some lines: the idle states and notices wait for a whole one
+      if (!abort.signal.aborted) await this.updateIdle(this.lines, now);
     } catch (e) {
       const error = message(e);
       if (error !== this.lastError) console.warn(`[agents] ${this.options.project}: fill check failed: ${error}`);
@@ -950,6 +1307,158 @@ export class AgentsFill {
       this.lastCheck = now;
       if (this.abort === abort) this.abort = null;
     }
+  }
+
+  /**
+   * After a whole check: every allowlisted agent's idle state (idle.ts), and
+   * its notice (fill.idle). An agent idle while ready work exists for
+   * fill.idle.notice_minutes raises one fill_idle_notice (on the bus too) and,
+   * with the Decision Inbox, one notice there, once per episode. The episode
+   * ends when the agent's state changes (it works, waits or is held, or the
+   * ready work is gone), when notices are turned off, or when it leaves
+   * fill.agents: fill_idle_resolved is recorded and the notice withdrawn. The
+   * store says which notice is open, so a restart neither repeats it nor
+   * leaves it open; how long an agent idles before its notice is counted in
+   * memory, so a restart starts that count again. Reads only the store and
+   * the inbox; never throws (the next check tries again).
+   */
+  private async updateIdle(lines: FillLineView[], now: number): Promise<void> {
+    const { store, project, settings } = this.options;
+    const { idle } = settings;
+    try {
+      const active = store.activeRuns(project);
+      const input: IdleInput = {
+        lines,
+        busy: new Set(active.map((run) => run.agent.toLowerCase())),
+        activeCount: active.filter((run) => run.origin === "fill").length,
+        maxActive: settings.maxActive,
+        capacityRefused: lines.some((l) => l.state === "held" && l.hold === "capacity"),
+        readOnly: this.options.readOnly(),
+      };
+      // After a restart an open notice's episode goes on: its start is kept, so it isn't raised again
+      const previous = new Map<string, Pick<IdleState, "reason" | "since">>(this.idleStates);
+      for (const agent of settings.agents) {
+        const open = this.openIdleNotice(agent);
+        if (open !== null && !previous.has(agent)) previous.set(agent, { reason: "ready_work", since: open });
+      }
+      const ready = findReadyWork(idle.readySources, lines);
+      const states = computeIdleStates(settings.agents, input, ready, now, previous);
+      this.idleStates = new Map(states.map((state) => [state.agent, state]));
+      for (const state of states) {
+        const open = this.openIdleNotice(state.agent);
+        if (open === null) {
+          if (shouldNotice(state, idle)) await this.raiseIdleNotice(state, ready.length, now);
+        } else if (idle.noticeMinutes <= 0) {
+          await this.resolveIdleNotice(state.agent, open, "fill.idle.notice_minutes is 0: idle notices are off", now);
+        } else if (state.reason !== "ready_work") {
+          await this.resolveIdleNotice(state.agent, open, idleExplanation(state), now);
+        }
+      }
+      // Notices that no episode stands on: an agent out of fill.agents, or an episode that ended without its withdrawal
+      for (const decision of this.options.openDecisions()) {
+        const notice = parseIdleNoticeKey(decision.key);
+        if (!notice) continue;
+        if (!settings.agents.includes(notice.agent)) {
+          await this.resolveIdleNotice(notice.agent, notice.since, `${notice.agent} is no longer in agents.fill.agents`, now);
+        } else if (this.openIdleNotice(notice.agent) !== notice.since) {
+          await this.options.withdraw(decision, "The idle episode it was about has ended.");
+        }
+      }
+    } catch (e) {
+      console.warn(`[agents] ${project}: fill's idle check failed: ${message(e)}`);
+    }
+  }
+
+  /** The start (ms) of the agent's open idle notice, or null: the latest of its fill_idle_notice and fill_idle_resolved. */
+  private openIdleNotice(agent: string): number | null {
+    let since = this.idleNotices.get(agent);
+    if (since === undefined) {
+      const last = this.options.store.listEvents(this.options.project, { kinds: ["fill_idle_notice", "fill_idle_resolved"], agent, limit: 1 })[0];
+      since = last?.kind === "fill_idle_notice" && typeof last.data.since === "number" ? last.data.since : null;
+      this.idleNotices.set(agent, since);
+    }
+    return since;
+  }
+
+  /** One notice for an agent idle while ready work exists: the event (and bus), and a notice in the Decision Inbox. */
+  private async raiseIdleNotice(state: IdleState, readyCount: number, now: number): Promise<void> {
+    const { agent, since } = state;
+    const minutes = Math.floor(state.duration / 60_000);
+    const tasks = state.readyTasks ?? [];
+    const explanation = idleExplanation(state);
+    const key = idleNoticeKey(agent, since);
+    await this.options.record(
+      "fill_idle_notice",
+      {
+        agent,
+        summary: `fill: ${agent} has been idle for ${minutes} min while ready work exists (${readyCount} unassigned task(s))`,
+        evidence: [explanation],
+        data: { since, cause: state.cause ?? null, minutes, readyCount, readyTasks: tasks, key },
+        dedupeKey: `fill_idle_notice:${agent}:${since}`,
+      },
+      now,
+    );
+    this.idleNotices.set(agent, since);
+    // Without a Decision Inbox the event is the notice: the inbox file is for questions, and this asks none
+    if (this.options.findDecision(key) === undefined) return;
+    const more = readyCount > tasks.length ? ` (and ${readyCount - tasks.length} more)` : "";
+    await this.options.raise(
+      {
+        kind: "other",
+        attention: "notice",
+        question: `${agent} has been idle for ${minutes} min while ready work exists`,
+        context: [
+          `${explanation}.`,
+          "",
+          `Ready work: ${readyCount} unassigned line(s) in the tasks file: ${tasks.join(", ")}${more}.`,
+          "",
+          `Since ${iso(since)}. Assign one of them to ${agent} (its id in the line's agent field), or let the planner do it. ` +
+            `This notice is withdrawn once ${agent} is no longer idle while ready work exists.`,
+        ].join("\n"),
+        options: [
+          {
+            id: IDLE_NOTICE_NOTED,
+            label: "Noted",
+            consequences: `The notice closes. Fill raises none again until ${agent} stops idling and then idles while ready work exists again.`,
+            effect: "reversible",
+          },
+        ],
+        recommended: IDLE_NOTICE_NOTED,
+        why: "Nothing is decided here: assigning the work is yours (or the planner's), and the notice goes by itself once the agent is no longer idle.",
+        reversible: true,
+        key,
+        ref: `fill-idle:${agent}`,
+        structure: {
+          class: "agents.fill_idle",
+          evidence: {
+            code: "idle_with_ready_work",
+            facts: { agent, idle_minutes: minutes, ready_count: readyCount, cause: state.cause ?? null },
+            cause_cleared: false,
+            linked_issue: null,
+          },
+        },
+      },
+      null,
+    );
+  }
+
+  /** The end of an agent's idle episode: fill_idle_resolved (on the bus too), and its notice withdrawn. */
+  private async resolveIdleNotice(agent: string, since: number, why: string, now: number): Promise<void> {
+    const key = idleNoticeKey(agent, since);
+    await this.options.record(
+      "fill_idle_resolved",
+      {
+        agent,
+        summary: `fill: ${agent}'s idle notice is resolved: ${why}`,
+        evidence: [why],
+        data: { since, key },
+        dedupeKey: `fill_idle_resolved:${agent}:${since}`,
+      },
+      now,
+    );
+    this.idleNotices.set(agent, null);
+    const decision = this.options.findDecision(key);
+    if (decision?.status === "open") await this.options.withdraw(decision, `The idle episode ended: ${why}.`);
   }
 
   /** Whether the owner released the claim of this run (POST /api/agents/claims/release). */
@@ -985,6 +1494,41 @@ export class AgentsFill {
     return counted;
   }
 
+  /**
+   * bus.consume observe: for the latest mirrored lines, what the bus report
+   * would have been read as next to what fill's patterns read the same line
+   * as, for the tasks_file line of the task the report names. Kept in memory
+   * by the bus consumers (Home → Health); nothing is written, nothing acts.
+   */
+  private observe(bus: BusLineSource, queue: QueueLines, entries: TasksFileEntry[]): void {
+    const { settings } = this.options;
+    const byTask = new Map<string, TaskLineFields>();
+    // An unassigned line (no agent) reads no report: fill starts nothing for it
+    for (const entry of entries) if (entry.kind === "task" && entry.agent !== null) byTask.set(entry.task, { ...entry, agent: entry.agent });
+    for (const { line, report } of queue.mirrored().slice(-MAX_OBSERVED_LINES)) {
+      const entry = byTask.get(report.task);
+      if (!entry) continue;
+      const queries: LineQuery[] = [
+        { kind: "done", pattern: fillPatternFor(settings.donePattern, entry.task, entry.agent) },
+        { kind: "waiting", pattern: fillPatternFor(settings.waitingPattern, entry.task, entry.agent) },
+        { kind: "blocked", pattern: fillPatternFor(settings.blockedPattern, entry.task, entry.agent) },
+      ];
+      let file = reading(null, null);
+      for (const { kind, pattern } of queries) {
+        const match = taskLineMatch(pattern, line);
+        if (match === null) continue;
+        file = reading(kind, kind === "waiting" ? match.groups?.wake?.trim() || null : null);
+        break;
+      }
+      // As on mode reads it (QueueLines.match): a pattern that names the agent needs the report to be that agent's
+      const kind = LINE_KIND[report.kind];
+      const query = queries.find((q) => q.kind === kind);
+      const otherAgent = query !== undefined && query.pattern.agent !== null && report.agent.toLowerCase() !== entry.agent.toLowerCase();
+      const wouldRead = otherAgent ? reading(null, null) : reading(kind, report.gateId);
+      bus.observed({ consumer: "fill", busId: report.id, task: report.task, agent: report.agent, report: wouldRead, file });
+    }
+  }
+
   private async evaluate(signal: AbortSignal, now: number): Promise<FillLineView[]> {
     const { project, settings, store, config, probes } = this.options;
     const path = this.tasksPath;
@@ -994,7 +1538,10 @@ export class AgentsFill {
     const byAgent = matchesByAgent(settings);
     const entries = parseTasksFile(read.text, byAgent);
     const allowed = new Set(settings.agents);
-    const queue = new QueueLines(config.queue_file);
+    // bus.consume on: mirrored lines are read by their bus report; observe: compared, nothing else changes
+    const bus = this.options.bus?.() ?? null;
+    const queue = new QueueLines(config.queue_file, bus);
+    if (bus?.mode === "observe") this.observe(bus, queue, entries);
     // The gate queue, read at most once per check, and only when a waiting line names a gate
     let gateRequests: Map<string, QueuedRequest> | null = null;
     const gateQueue = () => (gateRequests ??= readGateQueue(config.gates_dir));
@@ -1004,6 +1551,26 @@ export class AgentsFill {
     const capacityState: CapacityState = {};
     this.waitingSeen.clear();
     const views: FillLineView[] = [];
+    const unmatchedThisCheck: FillUnmatchedReportView[] = [];
+    const listedTasks = entries.flatMap((e) => (e.kind === "task" ? [e] : []));
+    const templates = { done: settings.donePattern, waiting: settings.waitingPattern, blocked: settings.blockedPattern };
+    // A report line another task of the file counts as its own (it names that task, written as that task's pattern
+    // wants) is that task's: it is not unmatched, unless that task is done by another line (a stale report about it)
+    const reportsListedTask = (kind: UnmatchedReport["kind"], line: string): boolean =>
+      listedTasks.some((other) => {
+        if (!line.includes(other.task)) return false;
+        const { agent } = other;
+        try {
+          // An unassigned task's line may be anyone's (it has no agent): it is that task's, never unmatched
+          const pattern = agent === null ? anyAgentPatternFor(templates[kind], other.task) : fillPatternFor(templates[kind], other.task, agent);
+          if (pattern === null || taskLineMatch(pattern, line) === null) return false;
+        } catch {
+          return false;
+        }
+        if (agent === null) return true;
+        const kept = store.getEventByKey(project, fillDoneKey(other.task, store.latestRunForTask(project, other.task)?.id ?? null, { ...other, agent }));
+        return kept === null || kept.data.line === line;
+      });
     const seen = new Set<string>();
     /** The keys of the decisions that the holds of this check stand on (fill's own, or a run's escalation) */
     const wanted = new Set<string>();
@@ -1028,6 +1595,19 @@ export class AgentsFill {
         continue;
       }
       const { line, agent, name, task, description } = entry;
+      if (agent === null) {
+        // Unassigned: fill starts nothing for it; it is ready work for any allowlisted agent while it is open
+        let found: UnassignedLine;
+        try {
+          found = unassignedLine(store, project, queue, settings, task);
+        } catch (e) {
+          found = { state: "unassigned", detail: `no agent assigned, and not ready work: done_pattern can't be checked for it: ${message(e)}`, runId: null, ready: false };
+        }
+        const { state, detail, runId, ready } = found;
+        views.push({ line, agent, name, task, description, state, detail, hold: null, releasable: false, waiting: null, runId, decisionId: null, ready });
+        continue;
+      }
+      const fields: TaskLineFields = { agent, name, task, description };
       const key = `${agent}|${task}`;
       seen.add(key);
       const show = (
@@ -1053,13 +1633,29 @@ export class AgentsFill {
           decisionId: null,
         });
       };
-      const hold = async (kind: FillHold, reason: string, runId: string | null = null, waiting: FillWaitingView | null = null) => {
+      // `busId`: the bus report the hold stands on (bus.consume on). Its fill_held is recorded once for that report
+      // and run, also across restarts (held kinds are in memory only, so a hold from a queue line is recorded again
+      // after a restart, as before)
+      const hold = async (
+        kind: FillHold,
+        reason: string,
+        runId: string | null = null,
+        waiting: FillWaitingView | null = null,
+        busId: number | null = null,
+      ) => {
         show("held", reason, runId, kind, waiting);
         if (this.holds.get(key) === kind) return;
         this.holds.set(key, kind);
         await this.options.record(
           "fill_held",
-          { agent, task, summary: `fill holds ${agent} on ${task}: ${reason}`, evidence: [reason], data: { line, hold: kind, reason } },
+          {
+            agent,
+            task,
+            summary: `fill holds ${agent} on ${task}: ${reason}`,
+            evidence: [reason],
+            data: busId === null ? { line, hold: kind, reason } : { line, hold: kind, reason, busId },
+            dedupeKey: busId === null ? undefined : `fill_held:${task}:${runId ?? "none"}:${kind}:bus:${busId}`,
+          },
           probes.clock.now(),
         );
       };
@@ -1096,7 +1692,7 @@ export class AgentsFill {
       }
 
       // Lines that name only the agent end where its next run on another task began (an owner's run, say)
-      const until = queueWindowEnd(store, project, settings, entry, latest);
+      const until = queueWindowEnd(store, project, settings, fields, latest);
 
       // The owner's last release of the task, and their pause (the owner's own hold) when it is newer
       const release = store.listEvents(project, { kinds: ["fill_released"], task, limit: 1 })[0];
@@ -1123,7 +1719,7 @@ export class AgentsFill {
       // Done: kept once seen (for this latest run and this line as written), else from the queue file
       let check: DoneCheck;
       try {
-        check = checkDone(store, project, queue, settings, entry, latest, until);
+        check = checkDone(store, project, queue, settings, fields, latest, until);
       } catch (e) {
         await refused(
           `done_pattern: ${message(e)}`,
@@ -1137,7 +1733,7 @@ export class AgentsFill {
         continue;
       }
       // A DONE line that names a PR counts only when the PR is ready to review (settings.readyGuard)
-      const refusal = check?.kind === "queue" ? await this.guardReport(agent, task, check.line, latest, description) : null;
+      const refusal = check?.kind === "queue" ? await this.guardReport(agent, task, check.line, latest, description, check.report) : null;
       if (refusal?.retry && refusal.expired && !(release && release.at >= refusal.since)) {
         // Waited long enough: one decision for the owner, the report stays refused
         await refused(
@@ -1149,11 +1745,20 @@ export class AgentsFill {
       }
       if (refusal?.retry && !refusal.expired) {
         // Only time can fix it (CI running): not done, no new run, checked again on the next check
-        await hold("report_refused", `done line not accepted yet: ${refusal.problems.map((p) => oneLine(p, 160)).join("; ")}; checked again on the next check`, latest?.id ?? null);
+        await hold(
+          "report_refused",
+          `done line not accepted yet: ${refusal.problems.map((p) => oneLine(p, 160)).join("; ")}; checked again on the next check`,
+          latest?.id ?? null,
+          null,
+          check?.kind === "queue" ? (check.report?.id ?? null) : null,
+        );
         continue;
       }
       if (check?.kind === "queue" && !refusal) {
         const done = check.line;
+        const data: Record<string, unknown> = { line: done, runId: latest?.id ?? null, lineHash: lineHash(fields) };
+        // Read from a bus report (bus.consume on): which one
+        if (check.report) data.busId = check.report.id;
         await this.options.record(
           "fill_done",
           {
@@ -1162,13 +1767,21 @@ export class AgentsFill {
             runId: latest?.id,
             summary: `fill: ${task} is done: ${oneLine(done)}`,
             evidence: [done],
-            data: { line: done, runId: latest?.id ?? null, lineHash: lineHash(entry) },
-            dedupeKey: fillDoneKey(task, latest?.id ?? null, entry),
+            data,
+            dedupeKey: fillDoneKey(task, latest?.id ?? null, fields),
           },
           probes.clock.now(),
         );
         show("done", `done: ${oneLine(done)}`, latest?.id ?? null);
         continue;
+      }
+
+      // task_id: the last run's own report lines that name no task they can be about. Each is recorded once and
+      // shown; it closes and changes nothing, so a run with only such lines goes on below as one without a done line
+      if (settings.doneMatch === "task_id" && latest) {
+        const after = store.firstRunForAgentAfter(project, latest.agent, task, latest)?.queueMark;
+        const reports = unmatchedReports(queue, settings, latest, after, reportsListedTask);
+        if (reports.length > 0) unmatchedThisCheck.push(await this.recordUnmatched(latest, reports));
       }
 
       // The owner chose to leave it: nothing waits for them, and nothing starts until they release it
@@ -1226,7 +1839,7 @@ export class AgentsFill {
         latest && latest.state === "completed" && latest.id !== releasedRun ? await this.runStatus(latest, agent, task, queue, until) : null;
       if (latest && status?.kind === "blocked") {
         const reason = `blocked: ${oneLine(status.line)}: fill leaves the task to you (release the hold once it is unblocked)`;
-        await hold("blocked", reason, latest.id);
+        await hold("blocked", reason, latest.id, null, status.busId);
         await ask(latest, fillDecisionKey(task, latest.id, "blocked"), {
           code: "blocked_reported",
           question: `${agent} is paused on ${task}: it reported the task blocked`,
@@ -1347,7 +1960,7 @@ export class AgentsFill {
           );
         } else if (wait.kind === "pending") {
           const detail = queued ? `waiting: ${queuedText(queued)}; starts again once ${wait.file} exists` : wait.detail;
-          await hold("waiting", detail, latest.id, { ...wait.view, queued: queuedView });
+          await hold("waiting", detail, latest.id, { ...wait.view, queued: queuedView }, status.busId);
           continue;
         } else {
           // Waiting on nothing that came: a run without progress, counted and backed off
@@ -1445,9 +2058,9 @@ export class AgentsFill {
 
       let run: AgentRunView;
       try {
-        // A refused DONE report of the last run is this run's first instruction
-        const refused = latest ? this.refusalNote(latest) : null;
-        run = await this.options.requestRun({ agent, task, prompt: refused ? `${prompt.text}\n\n${refused}\n` : prompt.text });
+        // What the last run reported that wasn't its task, and a refused DONE report of it, are this run's first notes
+        const notes = latest ? [this.unmatchedNote(latest), this.refusalNote(latest)].filter((n): n is string => n !== null) : [];
+        run = await this.options.requestRun({ agent, task, prompt: notes.length > 0 ? `${prompt.text}\n\n${notes.join("\n\n")}\n` : prompt.text });
       } catch (e) {
         const why = message(e);
         if (why.startsWith("Over budget")) {
@@ -1489,7 +2102,65 @@ export class AgentsFill {
     }
     // A check cut short saw only some lines: what it didn't see may still be held
     if (!signal.aborted) await this.withdrawLifted(views, wanted);
+    // A line whose last run reported another task says so, beside why it is where it is
+    for (const report of unmatchedThisCheck) {
+      const view = views.find((v) => v.task === report.openTask);
+      if (view) {
+        view.detail = `${view.detail}; its run ${short(report.runId)} reported ${report.kind.toUpperCase()} for ${report.reportedTask || "no task id"}, not ${report.openTask}: an unmatched report, counted for no task`;
+      }
+    }
+    // Shown from complete checks only (the queue is read again each check, so a line stays shown while its run is the last)
+    if (!signal.aborted) this.unmatchedReports = unmatchedThisCheck;
     return views;
+  }
+
+  /**
+   * Record a run's unmatched reports: one fill_unmatched event per line, kept
+   * in the store (its dedupeKey is the task, the run and the line's hash), so
+   * a line is reported once however many checks see it and across restarts;
+   * a new event also goes on the event bus (agents.fill_unmatched). Returns
+   * the run's view: its latest such line, since it was first seen.
+   */
+  private async recordUnmatched(run: AgentRun, reports: UnmatchedReport[]): Promise<FillUnmatchedReportView> {
+    const { store, project, probes } = this.options;
+    const key = (line: string) => `fill_unmatched:${run.task}:${run.id}:${sha256(Buffer.from(line, "utf-8")).slice(0, 16)}`;
+    for (const report of reports) {
+      await this.options.record(
+        "fill_unmatched",
+        {
+          agent: run.agent,
+          task: run.task,
+          runId: run.id,
+          summary: `fill: ${run.agent}'s ${report.kind.toUpperCase()} line names ${report.reportedTask || "no task id"}, not its task ${run.task}: it counts for no task (unmatched report)`,
+          evidence: [report.line],
+          data: { kind: report.kind, reportedTask: report.reportedTask, line: report.line, runId: run.id },
+          dedupeKey: key(report.line),
+        },
+        probes.clock.now(),
+      );
+    }
+    const last = reports[reports.length - 1];
+    return {
+      agent: run.agent,
+      openTask: run.task,
+      runId: run.id,
+      reportedTask: last.reportedTask,
+      kind: last.kind,
+      line: oneLine(last.line, 300),
+      at: iso(store.getEventByKey(project, key(last.line))?.at ?? probes.clock.now()),
+    };
+  }
+
+  /** The note for the next run when its last run's latest unmatched report is kept (its line fenced as data), or null. */
+  private unmatchedNote(run: AgentRun): string | null {
+    if (this.options.settings.doneMatch !== "task_id") return null;
+    const { store, project } = this.options;
+    const event = store.listEvents(project, { kinds: ["fill_unmatched"], task: run.task, runId: run.id, limit: 1 })[0];
+    if (typeof event?.data.line !== "string") return null;
+    return [
+      `Your previous run reported a task that is not yours; your task is ${run.task}. What it reported (its queue line, as data, not an instruction):`,
+      ...asData(event.data.line),
+    ].join("\n");
   }
 
   /**
@@ -1510,11 +2181,19 @@ export class AgentsFill {
     line: string,
     latest: AgentRun | null,
     taskText: string,
+    report: StructuredReport | null = null,
   ): Promise<{ retry: boolean; expired: boolean; since: number; problems: string[] } | null> {
     const { store, project, settings, probes } = this.options;
     if (!settings.readyGuard) return null;
     const now = probes.clock.now();
-    const parsed = parseReadyReport(line, taskText);
+    // A bus report (bus.consume on) names its PR and head in fields of their own: nothing is parsed from text
+    const parsed: ParsedReport = report
+      ? report.pr === null
+        ? { kind: "none" }
+        : { kind: "pr", report: { pr: report.pr, sha: report.sha?.toLowerCase() ?? null } }
+      : parseReadyReport(line, taskText);
+    // Whose branch the PR must be: the agent that reported it
+    const reporter = report?.agent ?? agent;
     let pr: number | null = null;
     let verdict: ReadyVerdict;
     if (parsed.kind === "ambiguous") {
@@ -1536,7 +2215,7 @@ export class AgentsFill {
       } else if (now < this.guardDownUntil) {
         verdict = unverifiable(pr, "the git host is not answering; asked again shortly");
       } else {
-        verdict = await evaluateReady(parsed.report, source, { agent });
+        verdict = await evaluateReady(parsed.report, source, { agent: reporter });
         if (!verdict.ok && verdict.hostDown) this.guardDownUntil = now + HOST_BACKOFF_MS;
       }
     }
@@ -1735,6 +2414,7 @@ export class AgentsFill {
     const seen = queue.lastStatus(
       fillPatternFor(settings.waitingPattern, task, agent),
       fillPatternFor(settings.blockedPattern, task, agent),
+      { task, agent },
       latest.queueMark,
       until,
     );
@@ -1747,7 +2427,7 @@ export class AgentsFill {
           runId: latest.id,
           summary: `fill: run ${short(latest.id)} of ${agent} on ${task} ended ${seen.kind}: ${oneLine(seen.line)}`,
           evidence: [seen.line],
-          data: { line: seen.line, wake: seen.wake },
+          data: seen.busId === null ? { line: seen.line, wake: seen.wake } : { line: seen.line, wake: seen.wake, busId: seen.busId },
           dedupeKey: `fill_status:${task}:${latest.id}:${seen.kind}:${sha256(Buffer.from(seen.line, "utf-8")).slice(0, 16)}`,
         },
         probes.clock.now(),
@@ -1760,6 +2440,7 @@ export class AgentsFill {
       kind: kept.kind === "fill_waiting" ? "waiting" : "blocked",
       line: String(kept.data.line ?? ""),
       wake: typeof kept.data.wake === "string" ? kept.data.wake : null,
+      busId: typeof kept.data.busId === "number" ? kept.data.busId : null,
     };
   }
 

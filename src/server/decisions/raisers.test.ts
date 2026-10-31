@@ -37,14 +37,17 @@ const RAISERS: Record<string, string[]> = {
   "agents/fill.ts": ["agents.gave_up", "agents.cannot_start"],
   "decisions/holds.ts": [".hold"],
   "gates/pipeline-service.ts": ["pipelines.budget"],
+  "host-services/service.ts": ["host-services.service_down"],
   "planner/service.ts": ["planner.tamper", "planner.unblock", "planner.attempts", "planner.failing", "planner.proposal"],
   "review/agent-assigner.ts": ["review.config", "review.stuck"],
   "review/service.ts": ["review.merge_failed", "review.human_review", "review.emails"],
   "supervisor/chat.ts": ["supervisor.digest"],
   "supervisor/notices.ts": ["supervisor.check_failing"],
+  "tracker/service.ts": ["tracker.token_scopes"],
   "triage/gate-recheck.ts": ["triage.gate_failure"],
   "triage/service.ts": ["triage.gate_failure", "triage.revert"],
   "watchdog/escalation.ts": ["watchdog."],
+  "infra-monitor/service.ts": ["infra_monitor.notice"],
 };
 
 /** Raise calls: the inbox, a module's own wrapper, or a request handed to a decision hook. */

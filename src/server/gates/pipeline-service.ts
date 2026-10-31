@@ -22,7 +22,7 @@ import type {
   PipelinesStatus,
 } from "../../shared/pipeline-types.js";
 import { ExecFileRunner, systemClock, type Clock, type CommandRunner } from "../watchdog/probes.js";
-import { EXECUTOR_KINDS, parsePipelineConfig, type LaneSettings, type ProjectPipelineSettings } from "./project-pipelines.js";
+import { EXECUTOR_KINDS, jobKey, parsePipelineConfig, type LaneSettings, type ProjectPipelineSettings } from "./project-pipelines.js";
 import { PipelineStore, isTerminalJob, type JobPatch } from "./run-store.js";
 import { EventBusDecisionHook, type DecisionHook, type DecisionRequest } from "./decision-hook.js";
 import {
@@ -48,6 +48,9 @@ const MIN = 60_000;
 const IN_FLIGHT = new Set<PipelineAttempt["status"]>(["dispatching", "queued", "running", "cancelling"]);
 export const NODES_NOT_BUILT = "lair-node cannot run pipeline jobs yet";
 export const RUN_ID = /^run-[0-9a-f]{12}$/;
+
+/** Why a job of `project` named by `names` (its lane, its pipeline, `<pipeline>.<lane>`) must wait, or null */
+export type LaneHoldCheck = (project: string, names: readonly string[]) => string | null;
 
 /** A request the routes map to an HTTP status */
 export class PipelineRequestError extends Error {
@@ -140,6 +143,8 @@ export class PipelineManager {
   private stopped = false;
   /** Set by start(): from then on a reload launches the project's waiting jobs */
   private started = false;
+  /** Lane holds (host services): why a job must wait before its next attempt, or null */
+  private laneHolds?: LaneHoldCheck;
 
   constructor(private options: PipelineManagerOptions) {
     this.clock = options.clock ?? systemClock;
@@ -157,6 +162,16 @@ export class PipelineManager {
   private get store(): PipelineStore {
     this.storeInstance ??= new PipelineStore(this.options.dbPath);
     return this.storeInstance;
+  }
+
+  /**
+   * Hold jobs whose lane needs a service that is not up (the host-services
+   * module, act mode). A held job waits before its next attempt, as when no
+   * executor can take it, and goes on by itself once the hold is gone; an
+   * attempt already running is never stopped.
+   */
+  useLaneHolds(check: LaneHoldCheck): void {
+    this.laneHolds = check;
   }
 
   private iso(ms = this.clock.now()): string {
@@ -446,6 +461,12 @@ export class PipelineManager {
       }
 
       if (!executor) {
+        const hold = this.laneHolds?.(p.name, [lane.name, run.pipeline, jobKey(run.pipeline, lane.name)]) ?? null;
+        if (hold) {
+          store.updateJob(job.id, { status: "waiting", waitReason: `held: ${hold}`, attempts });
+          await this.clock.sleep(retryMs, control.signal);
+          continue;
+        }
         let choice: { executor: Executor } | { wait: string };
         try {
           choice = await this.select(p, spec, attempts);
