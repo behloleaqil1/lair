@@ -129,6 +129,7 @@ import {
 } from "./types.js";
 import { commandFingerprint, findTaskProcess, reconcileRun, runPromptFileName } from "./reconcile.js";
 import type { ProcessInfo, ProcessReading } from "../watchdog/probes.js";
+import type { ReadyFactsSource } from "../ready-guard/guard.js";
 
 export { TASK_ID, isValidTaskId } from "./types.js";
 
@@ -399,6 +400,8 @@ export interface AgentsServiceOptions {
   mintBusToken?: (runId: string, agent: string) => string;
   /** Revoke a run's bus token when the run ends */
   revokeBusToken?: (runId: string) => void;
+  /** What the ready guard reads a PR from (read on each use); undefined: the project has no git host to ask */
+  readyFacts?: () => ReadyFactsSource | undefined;
 }
 
 interface EventInput {
@@ -499,6 +502,7 @@ export class AgentsService {
           return inbox.find ? inbox.find(this.project, key) : undefined;
         },
         withdraw: (decision, reason) => this.withdrawDecision(decision, reason, this.probes.clock.now()),
+        readyFacts: options.readyFacts,
       });
     }
   }
@@ -831,6 +835,27 @@ export class AgentsService {
   }
 
   /**
+   * An open provider-limit decision whose limit has reset (`limit_resets_at` is past) says so: its cause is
+   * cleared. Done at the start of the tick, before the waiting run launches and the decision is withdrawn as
+   * moot. Only its evidence changes, for the policy rules (docs/design/decision-policies.md §4). Only while the
+   * decision policies are on (the inbox has causeCleared: AgentsManager.useEvidenceUpdates). Never throws.
+   */
+  private async refreshCauses(t: Tick): Promise<void> {
+    const inbox = this.decisions();
+    if (!inbox.causeCleared) return;
+    try {
+      for (const decision of inbox.open?.(this.project) ?? []) {
+        const evidence = decision.evidence;
+        if (decision.class !== "agents.provider_limit" || !evidence || evidence.cause_cleared) continue;
+        const resets = evidence.facts.limit_resets_at;
+        if (typeof resets === "string" && Date.parse(resets) <= t.now) await inbox.causeCleared(decision.id);
+      }
+    } catch (e) {
+      console.warn(`[agents] ${this.project}: could not update the evidence of a decision: ${message(e)}`);
+    }
+  }
+
+  /**
    * Where the decision of one of fill's holds stands (fill.ts holdDecision;
    * `key` from fillDecisionKey or escalationDecisionKey): for code that keeps
    * a hold only while its decision is open or was answered "keep".
@@ -1019,6 +1044,7 @@ export class AgentsService {
       }
     }
     await this.checkBudgets(t);
+    await this.refreshCauses(t);
     if (!this.readOnly) {
       for (const run of this.store.activeRuns(this.project)) {
         t.touchedTasks.add(run.task);
@@ -3172,6 +3198,16 @@ export class AgentsService {
   }
 
   /**
+   * Whether the ready guard accepts `line` as `task`'s done report (true when
+   * fill or the guard is off). The planner settles a task through this too, so a
+   * refused report is a done nowhere.
+   */
+  async reportAccepted(agent: string, task: string, line: string, taskText: string): Promise<boolean> {
+    if (!this.fill) return true;
+    return (await this.fill.guardReport(agent, task, line, this.store.latestRunForTask(this.project, task), taskText)) === null;
+  }
+
+  /**
    * The owner releases a task fill holds for them (an owner or no_done hold,
    * at fill's last check): fill starts it again on its next check, and counts
    * its completions without done from zero. Only while the run that hold was
@@ -3572,11 +3608,20 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
   /** Per project: stop following its answers */
   private stopFollowing = new Map<string, () => void>();
   private producer: DecisionProducer | null = null;
+  /** useEvidenceUpdates(): off by default */
+  private evidenceUpdates = false;
   /** "started" between start() and stop(); a reload never runs once "stopped" */
   private phase: "loaded" | "started" | "stopped" = "loaded";
 
   constructor(private options: AgentsManagerOptions) {
     this.decisions = options.decisions ?? null;
+  }
+
+  private readyFacts: ((project: string) => ReadyFactsSource | undefined) | null = null;
+
+  /** Where the ready guard reads a project's PRs from (the review module's host); set before load(). */
+  useReadyFacts(facts: (project: string) => ReadyFactsSource | undefined): void {
+    this.readyFacts = facts;
   }
 
   /** Raise decisions through `inbox` instead (a stand-in for the Decision Inbox, in tests). */
@@ -3595,8 +3640,19 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
     for (const stop of this.stopFollowing.values()) stop();
     this.stopFollowing.clear();
     this.producer = decisions;
-    this.decisions = new ProducerDecisions(decisions, this.fileInbox());
+    this.decisions = new ProducerDecisions(decisions, this.fileInbox(), { evidenceUpdates: this.evidenceUpdates });
     for (const [project, service] of this.services) this.follow(project, service);
+  }
+
+  /**
+   * Re-evaluate the evidence of decisions this module raised (a provider-limit decision's cause cleared once
+   * its reset time passed: AgentsService.refreshCauses). Off until the decision policies turn it on
+   * (src/server/decisions/policies/, data/server.yaml decision_policies.enabled); off, no decision's evidence
+   * changes after it was raised.
+   */
+  useEvidenceUpdates(on: boolean): void {
+    this.evidenceUpdates = on;
+    if (this.producer) this.decisions = new ProducerDecisions(this.producer, this.fileInbox(), { evidenceUpdates: on });
   }
 
   private follow(project: string, service: AgentsService): void {
@@ -3646,6 +3702,7 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
           budget: this.options.budget,
           events: this.options.events,
           tools: this.options.tools,
+          readyFacts: () => this.readyFacts?.(entry.name),
         }),
       );
     }

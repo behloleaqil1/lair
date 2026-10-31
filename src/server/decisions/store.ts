@@ -22,7 +22,9 @@ import type {
   DecisionKind,
   DecisionLink,
   DecisionOption,
+  DecisionOutcome,
   DecisionStatus,
+  PolicyAgreementRow,
 } from "../../shared/decision-types.js";
 import { isKnownDecisionClass } from "./structure.js";
 import type { ValidRaise } from "./validate.js";
@@ -30,7 +32,9 @@ import type { ValidRaise } from "./validate.js";
 // 2: decisions.raised_via (server | http), for the per-project cap on HTTP callers
 // 3: decisions.attention (action | notice): what needs the owner's answer, and what is for their information
 // 4: decisions.class and decisions.evidence (JSON), nullable: the policy class and its machine-readable evidence
-export const SCHEMA_VERSION = 4;
+// 5: decisions.outcome, outcome_at, outcome_evidence: the outcome tracker's verdict on an answered decision
+// 6: policy_trace: one row per decision, proposer and version (docs/design/decision-policies.md §5); shadow proposals only
+export const SCHEMA_VERSION = 6;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS decisions (
@@ -64,11 +68,15 @@ const SCHEMA = `
     raised_via TEXT NOT NULL DEFAULT 'server',
     attention TEXT NOT NULL DEFAULT 'action',
     class TEXT,
-    evidence TEXT
+    evidence TEXT,
+    outcome TEXT,
+    outcome_at TEXT,
+    outcome_evidence TEXT
   );
   CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_open_key_via
     ON decisions(project, source_module, dedupe_key, raised_via) WHERE status = 'open';
   CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(status, project);
+  CREATE INDEX IF NOT EXISTS idx_decisions_await_outcome ON decisions(answered_at) WHERE status = 'answered' AND outcome IS NULL;
 
   CREATE TABLE IF NOT EXISTS decision_blocks (
     decision_id TEXT NOT NULL REFERENCES decisions(id),
@@ -86,6 +94,19 @@ const SCHEMA = `
     detail TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_decision_audit ON decision_audit(decision_id, id);
+
+  CREATE TABLE IF NOT EXISTS policy_trace (
+    decision_id TEXT NOT NULL REFERENCES decisions(id),
+    proposer TEXT NOT NULL,
+    version TEXT NOT NULL,
+    class TEXT NOT NULL,
+    policy TEXT NOT NULL,
+    option TEXT,
+    reason_code TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    at TEXT NOT NULL,
+    PRIMARY KEY (decision_id, proposer, version)
+  );
 `;
 
 interface DecisionRow {
@@ -118,6 +139,9 @@ interface DecisionRow {
   delivery_error: string | null;
   raised_via: string;
   attention: string;
+  outcome: string | null;
+  outcome_at: string | null;
+  outcome_evidence: string | null;
   class: string | null;
   evidence: string | null;
 }
@@ -130,6 +154,12 @@ const URGENCY_ORDER = `
     CASE WHEN d.status = 'open' THEN d.created_at END,
     d.closed_at DESC,
     d.rowid DESC`;
+
+/** Where the previous page of answers waiting for an outcome ended */
+export interface OutcomeCursor {
+  answeredAt: string;
+  id: string;
+}
 
 export interface ListOptions {
   project?: string;
@@ -168,6 +198,45 @@ export interface Closing {
   delivered?: boolean;
 }
 
+/** A proposal as written to the policy trace. `option` is null when the proposer abstained. */
+export interface PolicyTraceRow {
+  decisionId: string;
+  proposer: string;
+  version: string;
+  class: string;
+  policy: string;
+  option: string | null;
+  reasonCode: string;
+  confidence: number;
+  at: string;
+}
+
+export interface PolicyTraceJoined extends PolicyTraceRow {
+  status: DecisionStatus;
+  /** The option a person answered; null while open, withdrawn or expired */
+  answer: string | null;
+  options: DecisionOption[];
+}
+
+/** The agreement view's counts for one class, proposer and version (policies/agreement.ts adds the ratios). */
+export type PolicyAgreementCounts = Omit<PolicyAgreementRow, "agreement" | "coverage">;
+
+/** Where a page of open decisions ends: the next page starts after it (oldest first). */
+export interface OpenDecisionCursor {
+  id: string;
+  createdAt: string;
+}
+
+function parseEvidence(text: string | null): Decision["outcomeEvidence"] {
+  if (text === null) return {};
+  try {
+    const value: unknown = JSON.parse(text);
+    return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Decision["outcomeEvidence"]) : {};
+  } catch {
+    return {};
+  }
+}
+
 export class DecisionStore {
   private db: Database.Database;
 
@@ -196,6 +265,12 @@ export class DecisionStore {
         if (version >= 1 && version <= 3) {
           this.db.exec(`ALTER TABLE decisions ADD COLUMN class TEXT`);
           this.db.exec(`ALTER TABLE decisions ADD COLUMN evidence TEXT`);
+        }
+        // Versions 1 to 4 lack the outcome columns
+        if (version >= 1 && version <= 4) {
+          for (const column of ["outcome", "outcome_at", "outcome_evidence"]) {
+            this.db.exec(`ALTER TABLE decisions ADD COLUMN ${column} TEXT`);
+          }
         }
         // One open decision per key and per way in: an HTTP caller's key never stands for a module's own
         this.db.exec(`DROP INDEX IF EXISTS idx_decisions_open_key`);
@@ -428,10 +503,39 @@ export class DecisionStore {
       this.db
         .prepare(
           `UPDATE decisions SET status = 'open', closed_at = NULL, answer_option = NULL, answer_note = NULL,
-             answer_secret_supplied = 0, answered_by = NULL, answered_at = NULL
+             answer_secret_supplied = 0, answered_by = NULL, answered_at = NULL,
+             outcome = NULL, outcome_at = NULL, outcome_evidence = NULL
            WHERE id = ? AND status = 'answered' AND answered_at = ? AND delivered_at IS NULL`,
         )
         .run(id, answeredAt).changes > 0
+    );
+  }
+
+  /** Answered decisions (by a person) with no outcome yet, oldest answer first. */
+  awaitingOutcome(limit: number, since?: string, after?: OutcomeCursor): Decision[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM decisions d WHERE d.status = 'answered' AND d.outcome IS NULL AND d.answered_by <> 'lair'
+         AND d.answer_option IS NOT NULL AND d.answered_at >= ? AND (d.answered_at > ? OR (d.answered_at = ? AND d.id > ?))
+         ORDER BY d.answered_at, d.id LIMIT ?`,
+      )
+      .all(since ?? "", after?.answeredAt ?? "", after?.answeredAt ?? "", after?.id ?? "", limit) as DecisionRow[];
+    return rows.map((row) => this.toDecision(row));
+  }
+
+  /**
+   * Record the outcome of an answer, once: only while it has none, and only
+   * for the answer made at `answeredAt` (an answer undone and given again is
+   * judged on its own). False when it did not apply.
+   */
+  setOutcome(id: string, answeredAt: string, outcome: DecisionOutcome, at: string, evidence: Record<string, unknown>): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE decisions SET outcome = ?, outcome_at = ?, outcome_evidence = ?
+           WHERE id = ? AND status = 'answered' AND answered_at = ? AND outcome IS NULL`,
+        )
+        .run(outcome, at, JSON.stringify(evidence), id, answeredAt).changes > 0
     );
   }
 
@@ -470,6 +574,127 @@ export class DecisionStore {
       | undefined;
     this.db.prepare(`UPDATE decisions SET delivery_error = ? WHERE id = ?`).run(error, id);
     return row?.delivery_error ?? null;
+  }
+
+  /** Replace an open decision's evidence (the caller changed only cause_cleared / linked_issue). False: not open, or none. */
+  updateEvidence(id: string, evidence: DecisionEvidence): boolean {
+    const r = this.db
+      .prepare(`UPDATE decisions SET evidence = ? WHERE id = ? AND status = 'open' AND evidence IS NOT NULL`)
+      .run(JSON.stringify(evidence), id);
+    return r.changes > 0;
+  }
+
+  /** Record a proposal: one row per decision, proposer and version, so a repeat (a restart) changes nothing. True: a new row. */
+  addTrace(t: PolicyTraceRow): boolean {
+    const r = this.db
+      .prepare(
+        `INSERT OR IGNORE INTO policy_trace (decision_id, proposer, version, class, policy, option, reason_code, confidence, at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(t.decisionId, t.proposer, t.version, t.class, t.policy, t.option, t.reasonCode, t.confidence, t.at);
+    return r.changes > 0;
+  }
+
+  /** Whether this proposer version already has a row for the decision. */
+  hasTrace(decisionId: string, proposer: string, version: string): boolean {
+    return (
+      this.db
+        .prepare(`SELECT 1 FROM policy_trace WHERE decision_id = ? AND proposer = ? AND version = ?`)
+        .get(decisionId, proposer, version) !== undefined
+    );
+  }
+
+  /**
+   * Open decisions that carry a class, oldest first: a page of at most `limit` after `after` (by creation time,
+   * then id), for the policy catch-up at start. Ids and times only: the caller reads each decision itself.
+   */
+  openClassified(after: OpenDecisionCursor | null, limit: number): OpenDecisionCursor[] {
+    const rows = (
+      after
+        ? this.db
+            .prepare(
+              `SELECT id, created_at FROM decisions
+                WHERE status = 'open' AND class IS NOT NULL AND (created_at > ? OR (created_at = ? AND id > ?))
+                ORDER BY created_at, id LIMIT ?`,
+            )
+            .all(after.createdAt, after.createdAt, after.id, limit)
+        : this.db
+            .prepare(`SELECT id, created_at FROM decisions WHERE status = 'open' AND class IS NOT NULL ORDER BY created_at, id LIMIT ?`)
+            .all(limit)
+    ) as { id: string; created_at: string }[];
+    return rows.map((r) => ({ id: r.id, createdAt: r.created_at }));
+  }
+
+  /**
+   * The policy trace counted against the answers people gave, per class, proposer and version, in SQL: the
+   * agreement view reads this, never the rows. A decision answered without an option counts as withdrawn; an
+   * unsafe disagreement is one whose proposed option is `irreversible` or `outward` on that decision.
+   */
+  policyAgreement(): PolicyAgreementCounts[] {
+    // Every count is a SUM of 1/0 cases, so a comparison with a NULL option counts as 0, never as NULL
+    const count = (when: string) => `SUM(CASE WHEN ${when} THEN 1 ELSE 0 END)`;
+    const compared = `d.status = 'answered' AND d.answer_option IS NOT NULL`;
+    const disagreed = `${compared} AND t.option IS NOT NULL AND t.option <> d.answer_option`;
+    return this.db
+      .prepare(
+        `SELECT t.class AS class, t.proposer AS proposer, t.version AS version,
+                COUNT(*) AS traced,
+                ${count(compared)} AS compared,
+                ${count(`${compared} AND t.option IS NOT NULL AND t.option = d.answer_option`)} AS agreed,
+                ${count(disagreed)} AS disagreed,
+                ${count(`${compared} AND t.option IS NULL`)} AS abstained,
+                ${count(`${disagreed} AND EXISTS (
+                  SELECT 1 FROM json_each(d.options) o
+                   WHERE json_extract(o.value, '$.id') = t.option
+                     AND json_extract(o.value, '$.effect') IN ('irreversible', 'outward'))`)} AS unsafeDisagreements,
+                ${count(`d.status = 'open'`)} AS pending,
+                ${count(`d.status <> 'open' AND NOT (${compared})`)} AS withdrawn
+           FROM policy_trace t JOIN decisions d ON d.id = t.decision_id
+          GROUP BY t.class, t.proposer, t.version
+          ORDER BY t.class, t.version, t.proposer`,
+      )
+      .all() as PolicyAgreementCounts[];
+  }
+
+  /**
+   * Trace rows with their decision's status, the answer a person gave and the options offered, oldest first, at
+   * most `limit` (tests and diagnostics; the agreement view reads policyAgreement(), never this).
+   */
+  traces(limit = 1000): PolicyTraceJoined[] {
+    const rows = this.db
+      .prepare(
+        `SELECT t.decision_id, t.proposer, t.version, t.class, t.policy, t.option, t.reason_code, t.confidence, t.at,
+                d.status, d.answer_option, d.options
+           FROM policy_trace t JOIN decisions d ON d.id = t.decision_id ORDER BY t.at, t.decision_id LIMIT ?`,
+      )
+      .all(limit) as {
+      decision_id: string;
+      proposer: string;
+      version: string;
+      class: string;
+      policy: string;
+      option: string | null;
+      reason_code: string;
+      confidence: number;
+      at: string;
+      status: string;
+      answer_option: string | null;
+      options: string;
+    }[];
+    return rows.map((r) => ({
+      decisionId: r.decision_id,
+      proposer: r.proposer,
+      version: r.version,
+      class: r.class,
+      policy: r.policy,
+      option: r.option,
+      reasonCode: r.reason_code,
+      confidence: r.confidence,
+      at: r.at,
+      status: r.status as DecisionStatus,
+      answer: r.status === "answered" ? r.answer_option : null,
+      options: JSON.parse(r.options) as DecisionOption[],
+    }));
   }
 
   addAudit(id: string, entry: { at: string; action: DecisionAuditAction; actor: string; detail: string }): void {
@@ -524,6 +749,9 @@ export class DecisionStore {
       closedAt: row.closed_at ?? undefined,
       deliveredAt: row.delivered_at ?? undefined,
       raisedVia: row.raised_via === "http" ? "http" : "server",
+      ...(row.outcome === "good" || row.outcome === "bad" || row.outcome === "unknown"
+        ? { outcome: row.outcome, outcomeAt: row.outcome_at ?? undefined, outcomeEvidence: parseEvidence(row.outcome_evidence) }
+        : {}),
       ...(row.class ? { class: row.class, classKnown: isKnownDecisionClass(row.class) } : {}),
       ...(row.evidence ? { evidence: JSON.parse(row.evidence) as DecisionEvidence } : {}),
     };

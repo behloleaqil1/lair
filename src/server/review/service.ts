@@ -26,6 +26,7 @@ import type {
   Tier,
   Verdict,
 } from "../../shared/review-types.js";
+import type { DecisionEvidence } from "../../shared/decision-types.js";
 import type { EventBus } from "../core/event-bus.js";
 import { assessRisk } from "../policy/risk-rules.js";
 import { matchSlots } from "../policy/reviewer-slots.js";
@@ -37,7 +38,8 @@ import { hashToken, newAssignmentToken } from "./tokens.js";
 import { ACTIVE_STATES } from "../agents/types.js";
 import { checkTestIntegrity, isTestFile, type IntegrityFile } from "./integrity.js";
 import { GitHubHost, tokenFrom, type FetchLike, type TokenSource } from "./github.js";
-import type { GitHost, HostFile, HostPullRequest, HostRepo } from "./host.js";
+import type { GitHost, HostCheck, HostFile, HostPullRequest, HostRepo } from "./host.js";
+import type { ReadyFacts } from "../ready-guard/guard.js";
 import { systemGit, type GitRunner } from "./git.js";
 import { LocalMerger, mergeOnHost, planMerge, type MergeExecution } from "./executor.js";
 import { ReviewStore, type AssignmentRecord, type AutoMergeState, type StoredReview } from "./store.js";
@@ -147,6 +149,20 @@ export const MAX_AUTO_GATE_READS = 20;
  * /api/review/gate-results takes bodies up to 1 MiB).
  */
 export const MAX_TRIAGE_RESULT_BYTES = 8 * 1024 * 1024;
+
+/**
+ * The evidence of a review.merge_failed decision (policy class C10, always the owner's). `merge_error_code`
+ * is why the merge did not happen: the policy that refused it, "interrupted" for a restart that cut it short,
+ * "exception" when the host call threw.
+ */
+export function mergeFailedEvidence(pr: number, headSha: string, refusedBy: string | null): DecisionEvidence {
+  return {
+    code: "merge_error",
+    facts: { pr, head_sha: headSha, refused_by: refusedBy, merge_error_code: refusedBy ?? "exception" },
+    cause_cleared: false,
+    linked_issue: null,
+  };
+}
 
 /** The Decision Inbox key of an automatic merge's failure (or interruption) at one head: one per PR and head. */
 export function autoMergeDecisionKey(pr: number, headSha: string): string {
@@ -517,6 +533,43 @@ export class ReviewService {
     if (commits.length === 0) return "it has no commits";
     const plain = commits.find((c) => !/This reverts commit [0-9a-f]{40}/.test(c.message));
     return plain ? `commit ${short(plain.sha)} does not say which commit it reverts` : null;
+  }
+
+  /**
+   * What the ready guard (src/server/ready-guard/) checks a DONE report
+   * against, read fresh from the host: the PR, every check at its head (the
+   * newest run of each name), the gate at that head (null when the project
+   * requires none), and the ids of the review findings the PR carries.
+   */
+  async readyFacts(n: number): Promise<ReadyFacts> {
+    const host = this.o.host;
+    const pr = await host.getPullRequest(n);
+    const baseTip = await host.branchHead(pr.baseRef);
+    const behindBy = (await host.compare(baseTip, pr.headSha)).behindBy;
+    const newest = new Map<string, HostCheck>();
+    for (const c of await host.listChecks(pr.headSha)) {
+      const key = `${c.kind}:${c.name}`;
+      const seen = newest.get(key);
+      if (!seen || Date.parse(c.at ?? "") > Date.parse(seen.at ?? "")) newest.set(key, c);
+    }
+    const required = await this.gateSource.checksAt(pr.headSha);
+    const findingIds = this.annotate(this.o.store.listReviews(this.project, n), pr.headSha)
+      .flatMap((r) => r.findings)
+      .filter((f) => f.blocking && !f.superseded)
+      .map((f) => f.id);
+    return {
+      state: pr.state,
+      headSha: pr.headSha,
+      baseRef: pr.baseRef,
+      headRef: pr.headRef,
+      mergeable: pr.mergeable,
+      behindBy,
+      body: pr.body ?? "",
+      checks: [...newest.values()].map((c) => ({ name: c.name, state: c.state })),
+      commitShas: (await host.listCommits(n)).map((c) => c.sha),
+      gate: required.length === 0 ? null : required.map((g) => ({ name: g.name, status: g.status })),
+      findingIds,
+    };
   }
 
   /** Evaluate a PR: everything the merge policy looks at, and its verdict. */
@@ -1182,12 +1235,7 @@ export class ReviewService {
           reversible: true,
           structure: {
             class: "review.merge_failed",
-            evidence: {
-              code: "merge_error",
-              facts: { pr: attempt.pr, head_sha: attempt.headSha, refused_by: "interrupted" },
-              cause_cleared: false,
-              linked_issue: null,
-            },
+            evidence: mergeFailedEvidence(attempt.pr, attempt.headSha, "interrupted"),
             effects: ["reversible", "reversible"],
           },
           requestedBy: "review",
@@ -1242,12 +1290,7 @@ export class ReviewService {
         reversible: true,
         structure: {
           class: "review.merge_failed",
-          evidence: {
-            code: "merge_error",
-            facts: { pr: n, head_sha: status.headSha, refused_by: refusedBy ?? null, merge_error_code: refusedBy ?? "exception" },
-            cause_cleared: false,
-            linked_issue: null,
-          },
+          evidence: mergeFailedEvidence(n, status.headSha, refusedBy ?? null),
           effects: ["outward", "reversible"],
         },
         requestedBy: "review",

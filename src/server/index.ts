@@ -15,7 +15,9 @@ import { isValidDragonId } from "./parsers/dragon-config.js";
 import { registerRootGuards, requireValidIdParam } from "./root-guards.js";
 import { mountDecisions } from "./decisions/index.js";
 import { mountLessonsWhenEnabled, parseLessonsConfig, defaultLessonsSettings } from "./lessons/index.js";
+import { mountDecisionPolicies } from "./decisions/policies/index.js";
 import { mountBrainTrainer } from "./brain-trainer/index.js";
+import { mountOutcomeTracker } from "./outcomes/index.js";
 import { loadNotificationConfig, mountNotifications } from "./notifications/index.js";
 import { notificationsOn } from "./notifications/config.js";
 import {
@@ -585,6 +587,21 @@ const decisionInbox = await mountDecisions(fastify, {
   producers: [watchdogs, agents],
 });
 
+// Decision policies (src/server/decisions/policies/): off unless data/server.yaml sets decision_policies.enabled.
+// The table in data/policies.yaml (a built-in one without the file), rules C1-C4 and C11 in shadow. Each raised
+// decision gets a proposal in the policy trace, compared with the answer a person gives; nothing here answers,
+// withdraws or changes a decision. Only while it is on does the agents module update a raised decision's evidence
+// (cause_cleared) for the rules.
+await mountDecisionPolicies(fastify, {
+  configPath: join(process.cwd(), "data", "server.yaml"),
+  policiesPath: join(process.cwd(), "data", "policies.yaml"),
+  inbox: decisionInbox,
+  events: getEventBus(),
+  humanAuth,
+  evidenceProducers: [agents],
+  log: (line) => console.warn(`[decisions] ${line}`),
+});
+
 // Notifications (src/server/notifications/): opt-in desktop and ntfy pushes when a new action item opens,
 // batched (one a minute at most), with a daily reminder; configured in data/server.yaml. Owner-only routes under
 // /api/owner. Notices are never notified
@@ -595,6 +612,16 @@ await mountNotifications(fastify, {
   inbox: decisionInbox,
   humanAuth,
   dashboardUrl: dashboardUrlFor(HOST, PORT),
+});
+
+// Outcome tracker (src/server/outcomes/): off unless data/server.yaml sets outcome_tracker.enabled. Records whether each
+// answered decision turned out good, bad or unknown (the labels the brain trainer reads). It listens to events and may
+// only list answers waiting for a verdict and record it: it never answers, retries or reverts anything.
+mountOutcomeTracker(fastify, {
+  configPath: join(process.cwd(), "data", "server.yaml"),
+  dbPath: join(process.cwd(), "data", "outcomes.db"),
+  decisions: decisionInbox,
+  events: getEventBus(),
 });
 
 // Brain trainer (src/server/brain-trainer/): off unless data/server.yaml sets brain_trainer.enabled. A nightly
@@ -619,6 +646,11 @@ const reviews = new ReviewManager({
   decisions: inboxDecisionSink(decisionInbox),
 });
 reviews.load(projectEntries);
+// The ready guard (agents.fill.ready_guard) reads a project's PRs from its review module's git host
+agents.useReadyFacts((project) => {
+  const review = reviews.get(project);
+  return review ? { facts: (pr) => review.readyFacts(pr) } : undefined;
+});
 // Every merge hold has one decision (only the owner releases a hold); answering it releases the hold
 await reviews.useDecisions(decisionInbox);
 // The same for delivery's held services: answering releases the service, as its Release button does
