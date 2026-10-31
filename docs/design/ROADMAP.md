@@ -113,6 +113,22 @@ Each step lists what must exist first. One module per pull request, each with it
 | C10 | **Launch kit** (for the apps Lair builds) | [launch-kit.md](launch-kit.md) | C9, delivery | Billing, analytics, the customer-facing surface, a feedback loop, launch readiness |
 | C11 | **Teams and scale** | [platform.md M6](platform.md) | the rest | Postgres, roles and permissions, SSO, high availability, quotas |
 
+### O. Lair is the orchestrator
+
+The orchestrator is the person, or the AI assistant, who keeps a project running overnight: assigning tasks, noticing
+stalls, answering "why is nothing merging?", diagnosing infrastructure failures, adjusting capacity, and deciding what
+to do when a gate fails. This section tracks how Lair absorbs each orchestrator duty into code, with the AI only at
+the edges.
+
+See [orchestration.md](orchestration.md) for the full design. The order:
+
+| Phase | Duties | Acceptance |
+|---|---|---|
+| O1: Correctness | D10 (built: #90), D4/D5 (#179), D6 (#99) | A DONE closes only with evidence; reused pids and duplicates are marked lost, never killed |
+| O2: Keep busy | D1/D3 (#166, #178), D13 (#163), D11 (mostly built: #100, #238), D9 (#181), D29 (#186) | No agent idles while ready work exists; services restart automatically |
+| O3: Visibility | D19 (#182), D20 (#183), D18 (#164) | "What happened last night?" and "when will X ship?" are answered from data |
+| O4: The rest | D2 (#177), D8 (#180), D17 (#108, #109, #239), D26 (#185), D28 (#167), D30 (#187) | The orchestrator's remaining manual duties are absorbed |
+
 ## Rules every new module follows
 
 The reviews of the first modules found the same classes of defect again and again. A new module meets these before

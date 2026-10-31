@@ -128,7 +128,9 @@ def run_with_deadline(tmp_path, payload, deadline):
 def test_the_deadline_ends_a_run_that_has_not_finished(tmp_path):
     big = [{"features": {f"f{j}": float((i * j) % 7) for j in range(40)}, "label": "ab"[i % 2]} for i in range(3000)]
     result = run_with_deadline(tmp_path, {"rows": big, "params": {"nEstimators": 5000, "maxDepth": 6}}, "1")
-    assert result.returncode == -signal.SIGALRM
+    # Exit code 124 follows the shell timeout convention. Before the handler fix, this would be
+    # -signal.SIGALRM (-14) when run as a child process, but SIGALRM is ignored when PID 1.
+    assert result.returncode == 124
     assert not (tmp_path / "m.json").exists()
 
 
@@ -136,3 +138,15 @@ def test_the_deadline_ends_a_run_that_has_not_finished(tmp_path):
 def test_a_bad_deadline_is_refused(tmp_path, bad):
     result = run_with_deadline(tmp_path, {"rows": rows(), "params": {}}, bad)
     assert result.returncode == 2
+
+
+def test_set_deadline_installs_sigalrm_handler():
+    """The handler is required because PID 1 ignores signals with default actions."""
+    old_handler = signal.getsignal(signal.SIGALRM)
+    try:
+        train.set_deadline("60")
+        signal.alarm(0)  # cancel the alarm before it fires
+        handler = signal.getsignal(signal.SIGALRM)
+        assert handler is train._deadline_handler
+    finally:
+        signal.signal(signal.SIGALRM, old_handler)
