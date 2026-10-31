@@ -89,6 +89,7 @@ import {
   DECISION_FILL_KEEP,
   DECISION_FILL_START,
   OWNER_HOLDS,
+  parseIdleNoticeKey,
   QueueLines,
   queueMark,
   queueWindowEnd,
@@ -251,6 +252,8 @@ const BUS_EVENTS: Partial<Record<AgentEventKind, EventType>> = {
   budget_exceeded: "agent.budget.exceeded",
   fill_started: "agents.fill_started",
   fill_held: "agents.fill_held",
+  fill_idle_notice: "agents.fill_idle_notice",
+  fill_idle_resolved: "agents.fill_idle_resolved",
   fill_unmatched: "agents.fill_unmatched",
 };
 
@@ -968,6 +971,11 @@ export class AgentsService {
       if (this.readOnly) return "the project is read_only: Lair starts no agents";
       await this.recordFillRelease(task, latest, "decision", t.now);
       return "fill starts the task again on its next check";
+    }
+    const idle = parseIdleNoticeKey(key);
+    if (idle) {
+      // An idle notice asks nothing: closing it changes nothing, and this episode raises no other
+      return `noted: fill raises no other idle notice for ${idle.agent} until it stops idling and then idles while ready work exists again`;
     }
     if (key.startsWith("signin:") && ref.startsWith("signin:")) {
       if (optionId !== DECISION_RETRY_NOW) {

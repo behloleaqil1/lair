@@ -1756,6 +1756,7 @@ Unknown keys, invalid regular expressions, more than 50 `transient_patterns` or 
 `tasks_file` holds one task per line, `<agent>|<name>|<task>|<description>`: the agent id, a display name, the task id and a description (it may be empty and may contain `|`). Blank lines and lines starting with `#` are skipped. Every `interval_seconds` fill reads the file and looks at each line in order:
 
 - An agent that isn't in `fill.agents` is never started (`not allowlisted`). The allowlist is required, so you can move agents over one at a time while another launcher still runs the rest.
+- A line with an empty agent field, `|<name>|<task>|<description>` (the name may be empty too), is `unassigned`: fill starts nothing for it, and it is ready work for any allowlisted agent while it is open (see [Idle detection](#idle-detection)). It is `claimed` while a run of its task is active or a claim holds it, and `done` once a queue line matching `done_pattern` names its task (any agent's: the `{agent}` part matches whoever wrote it). To give it to an agent, put the agent's id in the first field (the planner's `reassign` does that). Its task id counts like any other: it can't repeat, and it counts toward the 200 tasks. The planner sees it (its agent is `null`); the review module's `authors.from_tasks_file` doesn't, since it names no author.
 - A task with an active run of the line's agent is `started`; one with another agent's run or another claim on it is `claimed`. Neither is started again.
 - A task that is `done` is not started again: `done_pattern` matches a queue line (`queue_file`) written since the task was last started (the whole file for a task Lair never ran). Lines are matched as the module's own DONE check reads them: trimmed, and case-insensitively, but the task id must be in the matched text exactly as written (task ids are case-sensitive). A pattern may match by agent instead (see [Matching by agent](#matching-by-agent)). A line an agent writes for a task it is not on counts for no task ([Unmatched reports](#unmatched-reports)). Once fill has seen a task done it keeps that in the store, so rotating or truncating the queue file, or a done line falling out of the 4 MB fill reads, never restarts a finished task. Editing the task's line in `tasks_file` drops what was kept, but the next check finds the done line again while it is still in the queue file. Agents write the queue file, so a done line only keeps fill from starting a task again; it proves nothing else. To overrule a done line you don't trust, request a run of the task yourself (Work section): that is a new start, so only lines written after it count, and fill carries the task on from there.
 - A run that exits 0 on a WAITING or BLOCKED line for its task waits, or is held: see [Waiting and blocked runs](#waiting-and-blocked-runs) below. So does one that ended on such a line while Lair was restarting, whose exit code is lost (see Restarts and hosts in [Agents](#agents)).
@@ -1779,7 +1780,7 @@ Agents are either `local` (held by load) or `remote` (not held by load). Set `fi
 
 Memory checks and heavy-work limits apply to both classes. `capacity_cmd` is still honoured as an extra check, after native checks pass.
 
-`agents.fill_started` and `agents.fill_held` events go on the event bus (and into the agents store): one when fill starts a task, and one when a line becomes held or is held for another kind of reason, not on every check. `agents.fill_unmatched` goes on the bus once per unmatched report ([Unmatched reports](#unmatched-reports)). `fill_done` (a task seen done) and `fill_released` (you lifted a hold) are kept in the agents store. Bounds: the tasks file is read up to 256 KB, 200 tasks and 2,000 characters a line; the queue file's last 4 MB are searched, each line cut at 1,000 characters. A queue file that was rewritten (not appended to) since a task's start is searched whole. Task ids are not reused: a task that is done stays done.
+`agents.fill_started` and `agents.fill_held` events go on the event bus (and into the agents store): one when fill starts a task, and one when a line becomes held or is held for another kind of reason, not on every check. `agents.fill_unmatched` goes on the bus once per unmatched report ([Unmatched reports](#unmatched-reports)), and `agents.fill_idle_notice` and `agents.fill_idle_resolved` once per idle episode ([Idle detection](#idle-detection)). `fill_done` (a task seen done) and `fill_released` (you lifted a hold) are kept in the agents store. Bounds: the tasks file is read up to 256 KB, 200 tasks and 2,000 characters a line; the queue file's last 4 MB are searched, each line cut at 1,000 characters. A queue file that was rewritten (not appended to) since a task's start is searched whole. Task ids are not reused: a task that is done stays done.
 
 ```yaml
 agents:
@@ -1860,6 +1861,8 @@ worker-b|Bob|feat-search|Search page
 | `fill.wake.max_queue_wait_minutes` | number | `1440` | A task waiting this long in a row is held even while its gate is still in the gate queue (never less than `max_wait_minutes`) |
 | `fill.wake.requeue_marker` | string | — | A marker whose first line is the id the waited-on gate was re-queued or re-checked as, followed for a live wait and its result. `{wake}` (required), `{n}` (1 to 9), `{gates_dir}`, `{agents_dir}`, `{repo}`; inside `wake.root` |
 | `fill.wake.fallback_seconds` | number | `900` | With nothing to wait on (no capture, no `wake.file`, or a refused capture), the task starts again after this long, or after the backoff if that is later: such a run counts toward `max_completions_without_done` |
+| `fill.idle.notice_minutes` | integer | `0` (off) | An allowlisted agent idle this long while ready work exists raises one notice (0 to 1440); see [Idle detection](#idle-detection) |
+| `fill.idle.ready_sources` | array | `["tasks_file"]` | Where ready work comes from. Only `tasks_file` (its unassigned lines) is wired so far; any other value is a config error |
 
 A fill block that is enabled without `agents.enabled`, `tasks_file`, `agents` or `prompt_files`, an invalid agent id in `agents`, a `prompt_files` entry with a `..` segment or an unknown placeholder, a `done_pattern`, `waiting_pattern` or `blocked_pattern` with neither `{task}` nor `{agent}`, with an `{agent}` that doesn't come right after `by\s+`, or that isn't a regular expression, or a `wake.file` or `wake.requeue_marker` without `{wake}` (or a `wake.file`, `wake.root` or `wake.requeue_marker` with a `..` segment or an unknown placeholder) is a config error.
 
@@ -1890,6 +1893,22 @@ agents:
       requeue_marker: "{gates_dir}/results/{wake}.recheck-{n}"   # optional: first line, the id it was re-queued as
       fallback_seconds: 900
 ```
+
+#### Idle detection
+
+After every whole check (one the module's stop cut short doesn't count), fill says why each allowlisted agent is or isn't working: the status's `idle` array gives each agent's `reason`, its line's `hold` and `task` when it has one, `since`, and a plain `explanation`. It only reports: it starts nothing, assigns nothing and writes no file. Reasons (an active run first, then its line's hold, then what keeps it from new work):
+
+- `busy`: the agent has an active run (fill's, or one you or a module requested).
+- `waiting`: its line waits on a gate.
+- `max_active`: its line is held at `fill.max_active`, or the agent has nothing of its own and `max_active` is reached.
+- `capacity`: a capacity check holds its line (`capacity`, `capacity_load`, `capacity_memory`, `capacity_heavy`, `capacity_probe`), or the agent has nothing of its own and `capacity_cmd` refused.
+- `held`: its line is held for another reason (`hold` says which), or the project is `read_only`.
+- `no_task`, `task_done`, `no_ready_work`: it has nothing of its own (no line, its lines are done, or other runs hold them), and no ready work exists.
+- `ready_work`: it has nothing of its own while ready work exists (`readyTasks` lists it). This is what a notice is for.
+
+**Ready work** is an `unassigned` line of the tasks file that is open: no active run or claim on its task, no queue line reports it done, and its last run (if one ran) didn't end on a WAITING or BLOCKED line. With a `done_pattern` that names only the agent, no queue line can name a task nobody ran, so such a line stays ready until you assign it or take it out. A line assigned to an agent that isn't in `fill.agents` is never ready work: that agent may be working on it where Lair can't see. A malformed line (over 2,000 characters, say) is never ready work. `fill.idle.ready_sources` takes only `tasks_file` for now.
+
+**The notice.** With `fill.idle.notice_minutes` above 0 (off by default), an agent in `ready_work` for that many minutes raises one notice: a `fill_idle_notice` event (`agents.fill_idle_notice` on the event bus) and, with the Decision Inbox, one [notice](#action-items-and-notices) there (listed under FYI, never counted or notified; "Noted" closes it). One per episode: it isn't raised again while the agent stays in `ready_work`, nor after a restart (the store keeps which notice is open). The episode ends when the agent's reason changes (it works, waits or is held, or the ready work is gone), when `notice_minutes` is set to 0, or when the agent leaves `fill.agents`: fill records `fill_idle_resolved` (`agents.fill_idle_resolved`) and withdraws the notice if it is still open. A later episode raises a new one. How long an agent has idled before its notice is counted in memory, so a restart starts that count again.
 
 #### Unmatched reports
 
@@ -2740,7 +2759,7 @@ Plan and backlog files are read whole up to `max_bytes` (a larger one is refused
 
 **The rules** run every `interval_seconds`, with no agent:
 
-- **done**: a line whose task the queue reports done, by fill's own done check (`done_pattern`, the lines written since the task's latest run started, the whole file for a task Lair never ran), becomes `<done_marker><line>` (`#done worker-a|...`), which fill reads as a comment. `mark_done: lair_runs` limits this to tasks the agents module ran, for a project where another launcher still runs some tasks and reuses task ids for a whole workstream; `off` turns it off.
+- **done**: a line whose task the queue reports done, by fill's own done check (`done_pattern`, the lines written since the task's latest run started, the whole file for a task Lair never ran), becomes `<done_marker><line>` (`#done worker-a|...`), which fill reads as a comment. `mark_done: lair_runs` limits this to tasks the agents module ran, for a project where another launcher still runs some tasks and reuses task ids for a whole workstream; `off` turns it off. An unassigned line is left alone: it has no agent whose report fill's done check (and its ready guard) can judge; once the queue reports it done, fill no longer counts it as ready work.
 - **plan done**: a line whose task id is a plan or backlog task marked done is removed (`drop_plan_done`).
 - Every edit is checked with fill's parser: one that would add a malformed line, a duplicate task, a task past fill's 200 or a file over 256 KB is refused. Lines Lair writes name only agents in `agents.fill.agents`.
 - In `act` mode the tasks file is written atomically (a new file in its directory, then a rename) and only if it still has the content the change was made from; a tasks file that is a symlink is never written. In `observe` mode nothing is written: each change is recorded once as `planned`.
@@ -2754,7 +2773,7 @@ Its **only output** is the proposal file, `<work_dir>/<run id>/proposals.json`:
 {"proposals": [{"op": "add", "task": "feat-search", "agent": "worker-b", "text": "Search page", "reason": "ready in the plan; worker-b is idle"}]}
 ```
 
-- `op`: `add` (a new task id, an allowlisted `agent`, and `text`, the line's description), `finish` (mark it done), `reassign` (another allowlisted `agent`), `reword` (new `text`), `drop` (remove the line), `unblock` (release fill's `blocked` or `no_done` hold on it, a run that stopped without done and said so, never an `owner`, `waiting` or `waited_too_long` hold, and clear the planner's blocked record); `reason` always. An `unblock` needs a task the planner recorded as blocked by a task problem (not by its environment, nor one needing you), with an attempt left (`attempts_per_task`): applying it spends one. Neither `unblock` nor `reword` may touch a task you chose to leave blocked.
+- `op`: `add` (a new task id, an allowlisted `agent`, and `text`, the line's description), `finish` (mark it done), `reassign` (another allowlisted `agent`; for an [unassigned line](#fill), whose agent is `null` in the context, the first), `reword` (new `text`), `drop` (remove the line), `unblock` (release fill's `blocked` or `no_done` hold on it, a run that stopped without done and said so, never an `owner`, `waiting` or `waited_too_long` hold, and clear the planner's blocked record); `reason` always. An `unblock` needs a task the planner recorded as blocked by a task problem (not by its environment, nor one needing you), with an attempt left (`attempts_per_task`): applying it spends one. Neither `unblock` nor `reword` may touch a task you chose to leave blocked.
 - Each proposal is checked in order: the schema (unknown keys are refused), fill's task-id rules and `task_id_pattern`, the allowlist (never the planner agent), the tasks file as the proposals before it leave it (`add` needs a new id, not a done one; the others an open line; `reassign` and `drop` wait while the task has an active run), one proposal per task, `text` one line of at most 500 characters, and `max_proposals` (the rest are refused). A refused proposal is kept with its reason. A run whose agent didn't complete, wrote no file, a file over 256 KB, a symlink or not `{"proposals": [...]}` fails; its triggers wait for the next run, and after `max_failed_runs` failures in a row planner runs pause and you are asked once.
 - In `act` mode accepted proposals are applied at once, except ops with `approval: always` (default: `finish`, `reassign`, `drop` and `unblock`; only `add` and `reword` apply by themselves); in `observe` mode all of them wait. A task the queue reports done is the rules' to mark, so a `finish` of the planner's own has no done line behind it, and an `unblock` starts again work fill held: you see each one. Waiting proposals are listed in the Planner view, where you approve or reject each one or a whole run, and each run with waiting proposals raises one [Decision Inbox](#decision-inbox) decision ("Apply them all" or "Reject them all"). An approval is checked again against the tasks file as it is then. **Approving writes the tasks file, in observe mode too.**
 
@@ -2851,6 +2870,100 @@ Config errors (an unknown key, an invalid pattern or one without its group, a `t
 - `POST /api/planner/proposals/<id>/approve`, `.../reject`, `POST /api/planner/runs/<id>/approve`, `.../reject`, `POST /api/planner/resume`: each with `{"confirm": true}` (HTTP 400 without; 409 when nothing waits)
 
 Events: `planner.changed`, `planner.run_started`, `planner.run_finished`, `planner.proposals_pending`, `planner.blocked`, `planner.tasks_file_restored`. Decisions are raised as module `planner`. Everything is kept in `data/planner.db`: a restart keeps the pending triggers, the planner run in progress, waiting proposals and the history.
+
+## Lessons
+
+The lessons module (`src/server/lessons/`, `docs/design/autonomy.md` §8) stores what Lair has learned from incidents and operational experience. Each lesson has a signal (how to detect the situation), a cause, a response playbook, and prevention (a check or feature that makes it automatic).
+
+**Built-in lessons** (L1-L28) ship with Lair: generic operational lessons from real incidents (slow gates, idle capacity, Docker down, duplicate runs, etc.). They load on start when the module is enabled and are active by default.
+
+**Project lessons** are proposed by incidents and approved by the owner. They can be specific to this project's patterns and failure modes.
+
+### Configuration
+
+```yaml
+lessons:
+  enabled: false       # Off by default. On: data/lessons.db, built-in lessons, /api/lessons, Knowledge view
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Turns the lessons module on. Off: no `data/lessons.db`, no `/api/lessons` routes (404), no Knowledge view in the nav. Takes effect at server start |
+
+### Lessons API
+
+All routes require the owner's session from the dashboard (HTTP 403 otherwise):
+
+- `GET /api/lessons?project=&status=&scope=&limit=`: List lessons. `status` is `proposed`, `active`, or `retired`. `scope` is `built-in` or `project`. Returns the lessons list with counts.
+- `GET /api/lessons/:id`: Lesson detail with related lessons (same signal).
+- `POST /api/lessons`: Propose a new lesson. If an active or proposed lesson with the same signal exists, increments its match count and returns the existing one (`reused: true`). Body: `{title, signal, cause, response, prevention, feature?}`.
+- `PATCH /api/lessons/:id`: Update a lesson. Built-in lessons can only have their status changed.
+- `POST /api/lessons/:id/approve`: Approve a proposed lesson (changes status to `active`).
+- `POST /api/lessons/:id/retire`: Retire a lesson (changes status to `retired`).
+- `POST /api/lessons/:id/match`: Record a signal match (increments `matchCount`, updates `lastMatchAt`).
+
+### Lesson schema
+
+```typescript
+interface LessonSignal {
+  kind: "check" | "event" | "metric" | "pattern";  // What the signal watches
+  value: string;                                    // Check id, event type, metric name, or regex
+  threshold?: number;                              // For metrics: the trigger threshold
+  direction?: "above" | "below";                   // For metrics: above or below
+}
+
+interface Lesson {
+  id: string;                // L1, L2, ... for built-in; UUID for project
+  title: string;             // Short description
+  signal: LessonSignal;      // How to detect this situation
+  cause: string;             // What causes it
+  response: string;          // What to do (playbook ref or text)
+  prevention: string;        // How to prevent it (check or feature ref)
+  sources: LessonSource[];   // Where this lesson came from
+  status: "proposed" | "active" | "retired";
+  scope: "built-in" | "project";
+  matchCount: number;        // Times the signal has matched
+  lastMatchAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  feature: string | null;    // The feature or duty that makes this automatic
+}
+```
+
+### Built-in lessons (L1-L28)
+
+| ID | Title | Signal | Prevention |
+|----|-------|--------|------------|
+| L1 | A gate runs far longer than it should | metric: `gate_duration_seconds > 2400` | slow-gate check |
+| L2 | An on-demand machine powered off under a running job | event: `machine.stopped` | lease refresh |
+| L3 | Every remote start fails no ssh after a reboot | pattern: `no ssh\|connection refused` | host services |
+| L4 | All gates fail at once in their first step | pattern: `exit 125\|Cannot connect to Docker` | environment class |
+| L5 | Two agents work the same task after a restart | event: `agent.duplicate_task` | adopt runs |
+| L6 | A new task closed with no work done | event: `task.closed_by_wrong_report` | match by task id |
+| L7 | Agents redo old merged work | event: `agent.prompt_stale` | warn on stale prompt |
+| L8 | Agents idle while capacity exists | metric: `idle_agents_with_ready_work > 1` | never-idle rule |
+| L9 | Load average says full but agents barely use CPU | metric: `load_per_agent_cpu_ratio > 10` | capacity class |
+| L10 | The server stops answering | check: `event_loop_lag` | #160: async IO, cache |
+| L11 | A cloud gate takes 35 min while its tests take 4-7 | metric: `gate_local_phase_ratio > 0.5` | remote preflight |
+| L12 | Heavy gates still land on the slow machine | event: `placement.wrong_lane` | routing tests |
+| L13 | Agents report not authenticated | pattern: `not authenticated\|could not read Username` | env health check |
+| L14 | Edits to a shared file silently disappear | event: `file.reverted_silently` | #96, #94: one writer |
+| L15 | Gate time spent on code that will change | event: `gate.obsolete_by_review` | review first |
+| L16 | A narrow passing gate is not enough to merge | event: `gate.scope_too_narrow` | scope from change |
+| L17 | A PR leaves out part of its approved design | event: `review.missing_from_design` | check design scope |
+| L18 | Commits show a machine user instead of the owner | event: `commit.identity_unallowed` | per-run identity |
+| L19 | A monitor has a blind spot | event: `monitor.missed_incident` | test against incidents |
+| L20 | Durations measured wrong | event: `timing.wrong_source` | named timestamps |
+| L21 | A remote machine is mostly idle yet slow | metric: `remote_idle_but_slow > 1` | check fs type |
+| L22 | The planner suggests the same work twice | event: `planner.duplicate_proposal` | #97: dedupe |
+| L23 | Acting on an agent claim that was wrong | event: `agent.claim_contradicted` | verify claims |
+| L24 | A kill takes down more than the job | event: `process.kill_too_broad` | per-job pgroup |
+| L25 | Full test suites time out on the developer machine | metric: `suite_timeout_on_local > 1` | prefer cloud |
+| L26 | The server stays slow with no clients connected | check: `event_loop_lag` | #160: async ticks |
+| L27 | The watchdog reports a live process as gone | event: `watchdog.false_absence` | #162: timed-out probe |
+| L28 | A task runs twice: once by hand, once by scheduler | event: `task.duplicate_run_manual` | adopt runs |
+
+Data is kept in `data/lessons.db`. The dashboard's Knowledge view shows the lessons list with counts and status badges.
 
 ## Brain bench
 

@@ -566,7 +566,11 @@ export class PlannerService {
     if (this.settings.markDone !== "off" && agentsStore) {
       // bus.consume on: a line that mirrors a bus report is read by the report (fill's checkDone, the same way)
       const queue = new QueueLines(this.config.queue_file, bus?.mode === "on" ? bus : null);
-      for (const line of doc.tasks) {
+      for (const open of doc.tasks) {
+        // An unassigned line has no agent whose done report fill's checks (and its ready guard) can judge: it is
+        // left to the owner (or a reassign); fill doesn't count it as ready work once a queue line reports it done
+        if (open.agent === null) continue;
+        const line = { ...open, agent: open.agent };
         const latest = agentsStore.latestRunForTask(this.project, line.task);
         if (this.settings.markDone === "lair_runs" && !latest) continue;
         // A task with an active run is not done yet (fill shows it started)
@@ -670,7 +674,7 @@ export class PlannerService {
 
   private lineKey(doc: TasksDoc, task: string): string {
     const line = findTask(doc, task);
-    return line ? sha256(renderLine(line.agent, line.name, line.task, line.description)) : "none";
+    return line ? sha256(renderLine(line.agent ?? "", line.name, line.task, line.description)) : "none";
   }
 
   private async onEvents(doc: TasksDoc, settled: Set<string>, events: QueueEvent[], now: number): Promise<void> {

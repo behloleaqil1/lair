@@ -45,6 +45,7 @@ export const FIXTURE_MODULES: ModuleFlags = {
   github: true,
   machines: true,
   nodes: false,
+  lessons: false,
 };
 
 const decisions: Decision[] = [

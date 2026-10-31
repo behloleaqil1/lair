@@ -5365,6 +5365,332 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(inbox.list({ project: "demo", status: "open" })).toEqual([]);
   });
 
+  // ---- Idle detection (fill.idle): report only, one notice per episode ----
+
+  describe("idle detection: an agent idle while ready work exists gets one notice per episode", () => {
+    const idleOf = (status: FillStatusView | undefined, agent: string) => status?.idle?.find((s) => s.agent === agent);
+    const at$ = (ms: number) => new Date(NOW + ms).toISOString();
+    /** Checks at these minutes (the clock only: no tick), then the notices so far */
+    async function checksAt(h: Harness, minutes: number[]) {
+      for (const m of minutes) {
+        h.clock.t = NOW + m * MIN;
+        await check(h);
+      }
+      return eventsOf(h, "fill_idle_notice");
+    }
+    /** The previous server stops; a new one starts on the same store and the same decisions file */
+    async function restartWith(h: Harness, first: { app: FastifyInstance }, config: ReturnType<typeof fill>, decisionsDb: string) {
+      await h.manager.stop();
+      await first.app.close();
+      apps.splice(apps.indexOf(first.app), 1);
+      const again = setup(config, { paths: h });
+      return { again, inbox: (await withInbox(again, { dbPath: decisionsDb })).inbox };
+    }
+
+    it("one notice past notice_minutes: in the store, on the bus and in the Decision Inbox as a notice; never again that episode; nothing started", async () => {
+      const h = setup(fill({ agents: ["worker-a"], idle: { notice_minutes: 5 } }));
+      const { inbox } = await withInbox(h);
+      prompts(h);
+      tasks(h, "worker-a|Alice|feat-login|Login form", "|Pool|free-1|Anyone can take this", "||free-2|");
+      h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
+
+      let status = await check(h);
+      expect(lineOf(status, "free-1")).toMatchObject({ agent: null, name: "Pool", state: "unassigned", ready: true, runId: null });
+      expect(lineOf(status, "free-1").detail).toBe("no agent assigned: ready work for any agent in agents.fill.agents");
+      expect(lineOf(status, "free-2")).toMatchObject({ agent: null, name: "", state: "unassigned", ready: true });
+      expect(idleOf(status, "worker-a")).toMatchObject({ reason: "busy", task: "feat-login" });
+
+      // Its task done, worker-a has nothing of its own while two unassigned tasks wait
+      await at(h, 0);
+      appendFileSync(h.queueFile, "- DONE feat-login by worker-a 12:01Z: done\n");
+      h.spawner.exit(5001, 0);
+      await at(h, MIN);
+      status = await check(h);
+      expect(idleOf(status, "worker-a")).toEqual({
+        agent: "worker-a",
+        reason: "ready_work",
+        task: "feat-login",
+        since: at$(MIN),
+        durationSeconds: 0,
+        readyTasks: ["free-1", "free-2"],
+        explanation: "worker-a's task feat-login is done, while ready work exists: unassigned free-1, free-2",
+      });
+
+      // Under notice_minutes nothing is raised; at it, one notice
+      expect(await checksAt(h, [5, 5.98])).toEqual([]);
+      const [notice, ...more] = await checksAt(h, [6]);
+      expect(more).toEqual([]);
+      expect(notice).toMatchObject({
+        agent: "worker-a",
+        summary: "fill: worker-a has been idle for 5 min while ready work exists (2 unassigned task(s))",
+        data: { since: NOW + MIN, cause: "task_done", readyTasks: ["free-1", "free-2"], key: `fill-idle:worker-a:${NOW + MIN}` },
+      });
+      expect(h.bus).toContain("agents.fill_idle_notice");
+      const [asked, ...others] = inbox.list({ project: "demo", status: "open" });
+      expect(others).toEqual([]);
+      expect(asked).toMatchObject({
+        key: `fill-idle:worker-a:${NOW + MIN}`,
+        attention: "notice",
+        title: "worker-a has been idle for 5 min while ready work exists",
+        source: { module: "agents", ref: "fill-idle:worker-a" },
+      });
+      expect(asked.context).toContain("Ready work: 2 unassigned line(s) in the tasks file: free-1, free-2.");
+      expect(asked.options.map((o) => o.id)).toEqual(["noted"]);
+
+      // The episode goes on: no second notice, the same one stays open
+      expect(await checksAt(h, [7, 30, 240])).toHaveLength(1);
+      expect(inbox.list({ project: "demo", status: "open" }).map((d) => d.id)).toEqual([asked.id]);
+      expect(idleOf(h.service.status().fill, "worker-a")).toMatchObject({ reason: "ready_work", since: at$(MIN) });
+      // Report only: nothing was started on the unassigned tasks, and the tasks file is as it was
+      expect(runs(h).map((r) => r.task)).toEqual(["feat-login"]);
+      expect(readFileSync(tasksPath(h), "utf-8")).toBe("worker-a|Alice|feat-login|Login form\n|Pool|free-1|Anyone can take this\n||free-2|\n");
+    });
+
+    it("ready work is an open unassigned line only: never another agent's line, nor a done, claimed, waiting or malformed one", async () => {
+      const h = setup(fill({ idle: { notice_minutes: 1 } })); // worker-a and worker-b
+      prompts(h);
+      const lines = [
+        "outside-agent|O|theirs-1|Its own task, maybe in progress where Lair can't see",
+        "|Pool|done-1|Finished elsewhere",
+        "|Pool|waits-1|Gated",
+        "|Pool|taken-1|Someone took it",
+        `|Pool|long-1|${"x".repeat(2100)}`,
+      ];
+      tasks(h, ...lines);
+      appendFileSync(h.queueFile, "- DONE done-1 by outside-agent 11:00Z: shipped\n");
+      h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
+      // waits-1 ran once (a run you requested) and ended on a WAITING line; taken-1 has a run now
+      await request(h, "worker-a", "waits-1", "Take it");
+      await at(h, 0);
+      appendFileSync(h.queueFile, "- WAITING waits-1 gate-1 by worker-a 12:00Z: gate queued\n");
+      h.spawner.exit(5001, 0);
+      await at(h, MIN);
+      expect(runs(h)[0]).toMatchObject({ task: "waits-1", state: "completed" });
+      await request(h, "worker-b", "taken-1", "Take it");
+      await at(h, MIN);
+
+      const status = await check(h);
+      expect(status.lines.map((l) => [l.task, l.state, l.ready])).toEqual([
+        ["theirs-1", "not_allowlisted", undefined],
+        ["done-1", "done", false],
+        ["waits-1", "unassigned", false],
+        ["taken-1", "claimed", false],
+        [null, "malformed", undefined],
+      ]);
+      expect(lineOf(status, "done-1").detail).toBe("done: - DONE done-1 by outside-agent 11:00Z: shipped");
+      expect(lineOf(status, "waits-1").detail).toContain("not ready work: its last run");
+      expect(lineOf(status, "waits-1").detail).toContain("ended on a WAITING line: - WAITING waits-1 gate-1 by worker-a");
+      expect(lineOf(status, "taken-1").detail).toMatch(/^run [\w-]{8} of agent worker-b is \w+: not ready work$/);
+      expect(status.lines[4].detail).toContain("longer than 2000 characters");
+      // worker-a has no line and there is no ready work: explained, never noticed
+      expect(idleOf(status, "worker-a")).toMatchObject({ reason: "no_task", explanation: "worker-a has no line in the tasks file; no ready work exists" });
+      expect(idleOf(status, "worker-b")).toMatchObject({ reason: "busy" });
+      expect(await checksAt(h, [3, 10, 30])).toEqual([]);
+
+      // An open unassigned line appears: worker-a, with no line at all, is idle while ready work exists
+      tasks(h, ...lines, "|Pool|open-1|Ready for anyone");
+      h.clock.t = NOW + 31 * MIN;
+      expect(idleOf(await check(h), "worker-a")).toMatchObject({ reason: "ready_work", readyTasks: ["open-1"], since: at$(31 * MIN) });
+      const notices = await checksAt(h, [32]);
+      expect(notices.map((e) => [e.agent, e.data.cause])).toEqual([["worker-a", "no_task"]]);
+      // Without a Decision Inbox the event is the notice: nothing goes to the inbox file (it is for questions)
+      expect(inboxEntries(h)).toEqual([]);
+      expect(runs(h).map((r) => r.task)).toEqual(["waits-1", "taken-1"]);
+    });
+
+    it("an unassigned task is done by anyone's DONE line that names it; with a pattern that names only the agent it stays ready until assigned or taken out", async () => {
+      const h = setup(fill({ agents: ["worker-a"], done_pattern: "^-\\s+DONE\\s+{task}(?=\\s|$).*\\bby\\s+{agent}" }));
+      prompts(h);
+      tasks(h, "|Pool|free-1|", "|Pool|free-2|");
+      appendFileSync(h.queueFile, "- DONE free-1 by outside-agent 11:00Z: shipped\n");
+      const status = await check(h);
+      expect(lineOf(status, "free-1")).toMatchObject({ state: "done", ready: false });
+      expect(lineOf(status, "free-2")).toMatchObject({ state: "unassigned", ready: true });
+      expect(idleOf(status, "worker-a")).toMatchObject({ reason: "ready_work", readyTasks: ["free-2"] });
+
+      const byAgent = setup(fill({ agents: ["worker-a"], done_pattern: "^-\\s+DONE\\b.*\\bby\\s+{agent}" }));
+      prompts(byAgent);
+      tasks(byAgent, "|Pool|free-1|");
+      appendFileSync(byAgent.queueFile, "- DONE free-1 by outside-agent 11:00Z: shipped\n");
+      expect(lineOf(await check(byAgent), "free-1")).toMatchObject({ state: "unassigned", ready: true });
+    });
+
+    it("an agent that waits, is held, is at max_active, has no capacity or is in a read_only project never gets a notice", async () => {
+      const ready = "|Pool|free-1|Anyone can take this";
+      /** worker-a's run of feat-login (pid 5001) ends on this queue line */
+      async function endsOn(h: Harness, queueLine: string) {
+        prompts(h);
+        tasks(h, "worker-a|Alice|feat-login|Login form", ready);
+        await check(h);
+        await at(h, 0);
+        appendFileSync(h.queueFile, `${queueLine}\n`);
+        h.spawner.exit(5001, 0);
+        await at(h, MIN);
+        return check(h);
+      }
+
+      // Waiting on a gate (for 15 minutes: fill.wake.fallback_seconds), then blocked
+      const waits = setup(fill({ agents: ["worker-a"], idle: { notice_minutes: 1 } }));
+      expect(idleOf(await endsOn(waits, "- WAITING feat-login gate-1 by worker-a 12:01Z: gate queued"), "worker-a")).toMatchObject({
+        reason: "waiting",
+        hold: "waiting",
+        task: "feat-login",
+      });
+      expect(await checksAt(waits, [3, 10, 15])).toEqual([]);
+      const blocked = setup(fill({ agents: ["worker-a"], idle: { notice_minutes: 1 } }));
+      expect(idleOf(await endsOn(blocked, "- BLOCKED feat-login by worker-a 12:01Z: needs the API key"), "worker-a")).toMatchObject({
+        reason: "held",
+        hold: "blocked",
+      });
+      expect(await checksAt(blocked, [3, 30, 120])).toEqual([]);
+
+      // max_active 1: worker-a runs, worker-b's line is held at max_active
+      const max = setup(fill({ max_active: 1, idle: { notice_minutes: 1 } }));
+      prompts(max);
+      tasks(max, "worker-a|Alice|feat-login|Login form", "worker-b|Bob|feat-search|Search", ready);
+      let status = await check(max);
+      expect(idleOf(status, "worker-b")).toMatchObject({ reason: "max_active", hold: "max_active", task: "feat-search" });
+      expect(await checksAt(max, [3, 30])).toEqual([]);
+      // ... and worker-b with no line of its own is max_active too while fill can start nothing more
+      tasks(max, "worker-a|Alice|feat-login|Login form", ready);
+      expect(idleOf(await check(max), "worker-b")).toMatchObject({ reason: "max_active", explanation: "worker-b is held: fill.max_active is reached" });
+      expect(await checksAt(max, [40, 90])).toEqual([]);
+
+      // capacity_cmd says no: worker-a's line is held, worker-b (no line) could start nothing either
+      const full = setup(fill({ idle: { notice_minutes: 1 }, capacity_cmd: ["capacity-check"] }));
+      full.runner.answer = (argv) => (argv[0] === "capacity-check" ? { code: 1, stdout: "load 41 is above 40\n", stderr: "" } : undefined);
+      prompts(full);
+      tasks(full, "worker-a|Alice|feat-login|Login form", ready);
+      status = await check(full);
+      expect([idleOf(status, "worker-a")?.reason, idleOf(status, "worker-b")?.reason]).toEqual(["capacity", "capacity"]);
+      expect(await checksAt(full, [3, 30])).toEqual([]);
+
+      // read_only: fill starts nothing, so nobody is idle "while ready work exists"
+      const readOnly = setup(fill({ idle: { notice_minutes: 1 } }), { readOnly: true });
+      prompts(readOnly);
+      tasks(readOnly, ready);
+      status = await check(readOnly);
+      expect(idleOf(status, "worker-a")).toMatchObject({ reason: "held", hold: "read_only" });
+      expect(await checksAt(readOnly, [3, 30])).toEqual([]);
+      for (const h of [waits, blocked, max, full, readOnly]) expect(runs(h).filter((r) => r.task === "free-1")).toEqual([]);
+    });
+
+    it("the episode ends when the agent works again: resolved, the notice withdrawn; a new episode raises a new one; 'Noted' closes one for its episode", async () => {
+      const h = setup(fill({ agents: ["worker-a"], idle: { notice_minutes: 5 } }));
+      const { inbox, answer } = await withInbox(h);
+      prompts(h);
+      tasks(h, "|Pool|free-1|Anyone", "|Pool|free-2|Anyone");
+      h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
+      expect(idleOf(await check(h), "worker-a")).toMatchObject({ reason: "ready_work", since: at$(0) });
+      await checksAt(h, [5]);
+      const [first] = inbox.list({ project: "demo", status: "open" });
+      expect(first).toMatchObject({ key: `fill-idle:worker-a:${NOW}`, attention: "notice" });
+
+      // You give free-1 to worker-a: fill starts it, and the episode ends
+      tasks(h, "worker-a|Alice|free-1|Anyone", "|Pool|free-2|Anyone");
+      h.clock.t = NOW + 6 * MIN;
+      let status = await check(h);
+      expect(lineOf(status, "free-1")).toMatchObject({ state: "started" });
+      expect(idleOf(status, "worker-a")).toMatchObject({ reason: "busy", task: "free-1" });
+      expect(inbox.get(first.id)).toMatchObject({ status: "withdrawn" });
+      expect(inbox.get(first.id)?.withdrawnReason).toBe("The idle episode ended: worker-a is working on free-1.");
+      expect(eventsOf(h, "fill_idle_resolved").map((e) => [e.agent, e.data.since, e.summary])).toEqual([
+        ["worker-a", NOW, "fill: worker-a's idle notice is resolved: worker-a is working on free-1"],
+      ]);
+      expect(h.bus).toContain("agents.fill_idle_resolved");
+      expect(await checksAt(h, [6.2])).toHaveLength(1); // resolved once, nothing new
+      expect(eventsOf(h, "fill_idle_resolved")).toHaveLength(1);
+
+      // free-1 is done; worker-a idles again while free-2 waits: a new episode, a new notice
+      await at(h, 6.5 * MIN);
+      appendFileSync(h.queueFile, "- DONE free-1 by worker-a 12:07Z: done\n");
+      h.spawner.exit(5001, 0);
+      await at(h, 7 * MIN);
+      status = await check(h);
+      expect(idleOf(status, "worker-a")).toMatchObject({ reason: "ready_work", task: "free-1", readyTasks: ["free-2"], since: at$(7 * MIN) });
+      expect(await checksAt(h, [12])).toHaveLength(2);
+      const open = inbox.list({ project: "demo", status: "open" });
+      expect(open.map((d) => d.key)).toEqual([`fill-idle:worker-a:${NOW + 7 * MIN}`]);
+
+      // "Noted" closes it; nothing more is raised while this episode lasts
+      expect((await answer(open[0].id, { optionId: "noted" })).statusCode).toBe(200);
+      expect(eventsOf(h, "decision").at(-1)?.summary).toContain(
+        "noted: fill raises no other idle notice for worker-a until it stops idling and then idles while ready work exists again",
+      );
+      expect(await checksAt(h, [13, 30, 90])).toHaveLength(2);
+      expect(inbox.list({ project: "demo", status: "open" })).toEqual([]);
+      expect(eventsOf(h, "fill_idle_resolved")).toHaveLength(1);
+    });
+
+    it("a restart neither repeats an open notice nor leaves it open: the store keeps the episode", async () => {
+      const paths = makePaths();
+      const decisionsDb = join(paths.dir, "data", "decisions.db");
+      const config = fill({ agents: ["worker-a"], idle: { notice_minutes: 5 } });
+      const h = setup(config, { paths });
+      const first = await withInbox(h, { dbPath: decisionsDb });
+      prompts(h);
+      tasks(h, "|Pool|free-1|Anyone");
+      await checksAt(h, [0, 5]);
+      const [asked] = first.inbox.list({ project: "demo", status: "open" });
+      expect(asked.key).toBe(`fill-idle:worker-a:${NOW}`);
+
+      // Lair restarts: an hour later and on, the episode goes on from its start, and nothing is raised again
+      const { again, inbox } = await restartWith(h, first, config, decisionsDb);
+      expect(await checksAt(again, [60, 66, 120])).toHaveLength(1);
+      expect(inbox.list({ project: "demo", status: "open" }).map((d) => d.id)).toEqual([asked.id]);
+      expect(idleOf(again.service.status().fill, "worker-a")).toMatchObject({ reason: "ready_work", since: at$(0), durationSeconds: 120 * 60 });
+
+      // The ready work goes (its line is taken out): resolved and withdrawn by the new server
+      tasks(again, "# nothing left");
+      again.clock.t = NOW + 121 * MIN;
+      expect(idleOf(await check(again), "worker-a")).toMatchObject({ reason: "no_task" });
+      expect(inbox.get(asked.id)).toMatchObject({ status: "withdrawn" });
+      expect(eventsOf(again, "fill_idle_resolved").map((e) => e.data.since)).toEqual([NOW]);
+      // A later episode after the restart raises its own notice
+      tasks(again, "|Pool|free-9|Anyone");
+      expect(await checksAt(again, [122, 127])).toHaveLength(2);
+      expect(inbox.list({ project: "demo", status: "open" }).map((d) => d.key)).toEqual([`fill-idle:worker-a:${NOW + 122 * MIN}`]);
+    });
+
+    it("an open notice is withdrawn when notices are turned off, or when its agent leaves fill.agents", async () => {
+      const cases = [
+        { idle: { notice_minutes: 0 }, agents: ["worker-a"], why: "fill.idle.notice_minutes is 0: idle notices are off" },
+        { idle: { notice_minutes: 5 }, agents: ["worker-b"], why: "worker-a is no longer in agents.fill.agents" },
+      ];
+      for (const { idle, agents, why } of cases) {
+        const paths = makePaths();
+        const decisionsDb = join(paths.dir, "data", "decisions.db");
+        const h = setup(fill({ agents: ["worker-a"], idle: { notice_minutes: 5 } }), { paths });
+        const first = await withInbox(h, { dbPath: decisionsDb });
+        prompts(h);
+        tasks(h, "|Pool|free-1|Anyone");
+        await checksAt(h, [0, 5]);
+        const [asked] = first.inbox.list({ project: "demo", status: "open" });
+        expect(asked.key).toBe(`fill-idle:worker-a:${NOW}`);
+
+        const { again, inbox } = await restartWith(h, first, fill({ agents, idle }), decisionsDb);
+        await checksAt(again, [6]);
+        expect(inbox.get(asked.id)).toMatchObject({ status: "withdrawn", withdrawnReason: `The idle episode ended: ${why}.` });
+        expect(eventsOf(again, "fill_idle_resolved").map((e) => [e.agent, e.summary])).toEqual([
+          ["worker-a", `fill: worker-a's idle notice is resolved: ${why}`],
+        ]);
+        expect(await checksAt(again, [7, 8])).toHaveLength(1);
+        expect(inbox.list({ project: "demo", status: "open" })).toEqual([]);
+      }
+    });
+
+    it("notices are off by default: the idle states are shown, nothing is raised", async () => {
+      const h = setup(fill({ agents: ["worker-a"] }));
+      const { inbox } = await withInbox(h);
+      prompts(h);
+      tasks(h, "|Pool|free-1|Anyone");
+      expect(await checksAt(h, [0, 600])).toEqual([]);
+      expect(idleOf(h.service.status().fill, "worker-a")).toMatchObject({ reason: "ready_work", durationSeconds: 600 * 60 });
+      expect(inbox.list({ project: "demo" })).toEqual([]);
+      expect(eventsOf(h, "fill_idle_resolved")).toEqual([]);
+    });
+  });
+
   describe("reports by task id: a line counts only for the task it names; an agent's line that names no task it can be about is reported once and counts for none", () => {
     /** A fleet's patterns: DONE or READY name the task and the agent; WAITING and BLOCKED only the agent */
     const FLEET = {

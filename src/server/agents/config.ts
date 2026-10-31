@@ -127,6 +127,19 @@ const WakeSchema = z
   })
   .strict();
 
+/** Where fill looks for ready work (fill.idle.ready_sources). Only the tasks file is wired; the plan's sources come later. */
+export const IDLE_READY_SOURCES = ["tasks_file"] as const;
+export type IdleReadySource = (typeof IDLE_READY_SOURCES)[number];
+
+const IdleSchema = z
+  .object({
+    /** An allowlisted agent idle this long while ready work exists raises one notice (minutes); 0, the default, is off */
+    notice_minutes: z.number().int().min(0).max(1440).default(0),
+    /** Where ready work comes from: only "tasks_file" (its unassigned lines) is wired so far */
+    ready_sources: z.array(z.enum(IDLE_READY_SOURCES)).min(1).default(["tasks_file"]),
+  })
+  .strict();
+
 /** Agent class: local (held by load) or remote (not held by load) */
 export type AgentClass = "local" | "remote";
 
@@ -203,6 +216,8 @@ const FillSchema = z
     /** A run that ended on such a line is held for the owner at once */
     blocked_pattern: z.string().min(1).max(500).default(DEFAULT_BLOCKED_PATTERN),
     wake: WakeSchema.default({}),
+    /** Idle detection: notice when an agent is idle while ready work exists */
+    idle: IdleSchema.default({}),
     /** Refuse a DONE line that names a PR unless the PR is ready to review (CI, branch, gate, finding map) */
     ready_guard: z.boolean().default(false),
     /** A done line whose PR can't be verified yet (CI running, host not answering) is held this long, then the owner is asked */
@@ -350,6 +365,11 @@ export interface FillSettings {
     requeueMarker?: string;
     fallbackSeconds: number;
   };
+  idle: {
+    /** 0: off (the idle states are still shown) */
+    noticeMinutes: number;
+    readySources: IdleReadySource[];
+  };
 }
 
 /** Native capacity settings */
@@ -425,6 +445,21 @@ export function fillPatternFor(template: string, task: string, agent: string): F
     task: template.includes("{task}") ? task : null,
     agent: template.includes("{agent}") ? agent : null,
   };
+}
+
+/**
+ * A fill pattern for a task no agent is assigned to (an unassigned tasks_file
+ * line): `{agent}` matches any agent id, so a line by whoever did the task
+ * counts. null when the template doesn't name the task: then no queue line
+ * can be about this task. Throws when it doesn't compile.
+ */
+export function anyAgentPatternFor(template: string, task: string): FillPattern | null {
+  if (!template.includes("{task}")) return null;
+  const regex = new RegExp(
+    template.replace(/\{(task|agent)\}/g, (_match, name: string) => (name === "task" ? escapeRegExp(task) : "[A-Za-z][A-Za-z0-9_-]*")),
+    "i",
+  );
+  return { regex, task, agent: null };
 }
 
 /** The named group reportPatternFor captures the task id in */
@@ -765,6 +800,10 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
           maxQueueWaitMinutes: value.fill.wake.max_queue_wait_minutes,
           requeueMarker: value.fill.wake.requeue_marker,
           fallbackSeconds: value.fill.wake.fallback_seconds,
+        },
+        idle: {
+          noticeMinutes: value.fill.idle.notice_minutes,
+          readySources: value.fill.idle.ready_sources,
         },
       },
     },
