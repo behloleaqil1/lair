@@ -45,33 +45,54 @@ Unit tests for every tool; a concurrency test (20 parallel claims of one task: e
 input refused with a clear error); a mirror test (bus writes produce exactly the expected text lines); an end-to-end
 test with two fake agents and a fake orchestrator over stdio; the SSE feed test. `npm test`, lint and typecheck pass.
 
-## 5. Bus consumers (PR 2a)
+## 5. Bus consumers (PR 2a), as built
 
-Fill and the planner subscribe to `bus.report` and `bus.message` events: a DONE or BLOCKED reaches fill's state in under
-2 seconds (event-driven, no file poll in the path). Configuration (per project, `bus.consume`):
+Per project, `bus.consume: off | observe | on` (default `off`; [configuration.md](../configuration.md#fleet-bus)). The
+server wires the bus at startup (`src/server/index.ts`): the consumers (`src/server/bus/consumers.ts`), a bus token per
+run (`src/server/bus/wiring.ts`), and the bus routes with their options.
 
-| Mode | Behavior |
-|------|----------|
-| `off` | File reader only; events are not consumed (default, matches main) |
-| `observe` | Record what events would do, without acting, for comparison on Home → Health |
-| `on` | Events drive state changes; mirrored lines are skipped |
+| Mode | What changes |
+|------|--------------|
+| `off` | Nothing: no run gets a bus token, every bus route answers 404 for the project, fill and the planner read the queue file's lines with their patterns |
+| `observe` | Runs get a bus token and `LAIR_URL` and post reports; fill and the planner still read the lines with their patterns, and keep in memory, for Home → Health, what each mirrored line's report says next to what the patterns read. Nothing is written |
+| `on` | A mirrored line is read by its report's fields, never by the patterns; reports and run ends wake fill and the planner at once |
 
-### 5.1 No double counting
+### 5.1 One read path, no double counting
 
-The mirror appends a marker (`[bus:<id>]`) to mirrored lines. When a consumer processes an event, it records the bus id;
-when the file reader sees a line with a marker whose id was already consumed, it skips it. Hand-written lines (agents
-without the bus) still work exactly as before.
+- `BusService.report` stores the report, appends the mirrored line (ending `[bus:<id>]`) to the queue file, then emits
+  `bus.report`. The line is where the report sits in the queue's order: a run's window, an agent's latest line.
+- `QueueLines` (fill's reader, shared with the planner's done check) looks up the reports of the marked lines in the bus
+  store (one read, then kept in memory: a report never changes). A line that is the report's mirrored line
+  (`- <KIND> <task> by <agent> `) carries the report; in `on` mode it matches a query only by the report's kind, its
+  task (exactly the line's task) and, when the pattern names the agent, its agent. A WAITING report's gate id is what the
+  run waits on; a DONE report's PR and sha go to the ready guard as they are (nothing is parsed from text). A second
+  copy of the line is not read again. A marker that names no report, or a line that isn't the report's, is read as a
+  hand-written line and audited.
+- The planner's queue events take the report's kind, agent and task (its summary is a BLOCKED report's reason); the
+  task is the one the report names, or none.
+- The event changes no state: `bus.report` (DONE, WAITING, BLOCKED) and `agent.run.ended` make fill check
+  (`checkSoon`) and the planner run a cycle (`cycleSoon`) now; one in progress is followed by one more. So the event and
+  the line can't count twice.
 
-Tests:
-- The event first, then the line: one transition.
-- The line only: one transition.
-- A restart between the two: one transition.
+### 5.2 Exactly once across restarts
 
-### 5.2 Observe mode
-
-In `observe` mode, consumers record what each event would have done next to what the file reader did, exposed on
-Home → Health. This lets Claude compare the two before switching a project to `on`.
+What each module did is kept in its own store, with the change: fill's `fill_done` keeps its key per task, run and
+tasks-file line; a hold that stands on a report records `fill_held` once per report, run and hold (its key names the
+report), where a hold from a hand-written line is recorded again after a restart, as before; decisions keep their keys.
+The planner keeps the ids of the reports it handled (with its cursor). Tests: the report, then the line read again and
+again, a copied line, and a new server on the same files: one `fill_done`, one `fill_held`, one decision, one
+`planner.blocked`.
 
 ### 5.3 Latency
 
-A DONE or BLOCKED over the bus reaches fill's state in under 2 seconds. Measured with a fake clock in tests.
+A DONE over the bus counts once its run has ended (as a DONE line does): the run's end (`agent.run.ended`) makes fill
+check at once, so the task is done one tick after the agent exits, not at fill's next interval. The acceptance test
+reports, exits one second later on the fake clock, and sees the task done with fill's interval at an hour.
+
+### 5.4 Refused and ignored
+
+A `bus.report` or `bus.message` event is checked field by field (no casts); an invalid one, or one that doesn't match
+the report the bus stored under its id, is refused with the reason. A report for a task that isn't in fill's tasks
+file, or by an agent fill doesn't run, is ignored. Each is logged, emitted as `bus.consume_refused` and listed on Home
+→ Health (`GET /api/bus/consumers`, read-only). The bus itself refuses a report for a task the run doesn't hold, a run
+that is no longer active, and arguments that fail its schema, with the reason.

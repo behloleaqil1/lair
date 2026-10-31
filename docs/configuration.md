@@ -178,29 +178,26 @@ bus:
 |-----|------|---------|-------------|
 | `mail_dir` | string | — | Directory for per-agent mailbox files |
 | `wake_file` | string | — | File to touch to wake the orchestrator |
-| `bus.consume` | `off` \| `observe` \| `on` | `off` | How fill and the planner react to bus events |
+| `bus.consume` | `off` \| `observe` \| `on` | `off` | Whether the project's runs post structured reports to Lair's bus, and whether fill and the planner read them |
+
+An unknown key under `bus:` or another value is a config error (the live reload keeps the previous config).
 
 ### Bus consume modes
 
-| Mode | Behavior |
-|------|----------|
-| `off` | File reader only: events are not consumed (current behavior) |
-| `observe` | Record what events would do, without acting, for comparison on Home → Health |
-| `on` | Events drive state changes; mirrored lines are skipped |
+| Mode | Runs | Fill and the planner |
+|------|------|----------------------|
+| `off` | No bus token and no `LAIR_URL` (a project with `checks:` still gives its runs both: the checks routes take the token); every bus route but `/api/bus/consumers` answers 404 for the project | Read the queue file's lines with their patterns, as without the bus |
+| `observe` | Each run gets a bus token and `LAIR_URL`, revoked when the run ends; `lair bus` and `lair bus-mcp` work | Still read the lines with their patterns: nothing they do changes. For each line the bus mirrored, Home → Health shows what the report says next to what the patterns read (kept in memory only) |
+| `on` | As `observe` | A line the bus mirrored (it ends with `[bus:<id>]`, and is that report's line) is read by the report's fields: its kind, task, agent, gate id (what a WAITING run waits on), PR and sha (for the ready guard). An accepted report, and a run that ends, make fill check and the planner run a cycle at once, instead of at their next interval |
 
-In `observe` mode, every bus event records what the consumer would have done. When the file reader processes the mirrored
-line, it records what it did. Home → Health shows the comparison: matches, mismatches, and pending observations. Use this
-to verify the bus consumers match the file reader before switching a project to `on`.
+Hand-written lines (an agent without the bus) are read as before in every mode. In `on` mode a line that ends with a
+marker but isn't that report's mirrored line, or names no report, is read as a hand-written line, and shown on Home →
+Health. A report is applied once: fill keeps it in its events (a hold from a report is recorded once per report, also
+across restarts), the planner keeps the ids of the reports it handled. A report for a task that isn't in
+`agents.fill.tasks_file`, or by an agent fill doesn't run, is ignored and shown on Home → Health
+(`GET /api/bus/consumers?project=<name>`), as is an event that fails validation.
 
-In `on` mode, mirrored lines carry a marker (`[bus:<id>]`). When a consumer processes an event, it records the bus id;
-when the file reader sees a line with that marker, it skips it. Hand-written lines (agents without the bus) still work
-exactly as before.
-
-### Note: agent node path
-
-On a host that blocks node for agents (macOS privacy controls, corporate policy), the MCP server is started by the
-agent tool from the owner's MCP config with an absolute node path. It runs Lair's own code, not agent-chosen code; the
-owner installs it.
+Turn `observe` on first, compare on Home → Health, then switch to `on`.
 
 ## Dragons (agents)
 
@@ -555,6 +552,63 @@ Unknown keys and invalid values are config errors; a project with an invalid blo
 - `GET /api/pipelines/runs?limit=50`, `GET /api/pipelines/runs/<id>`: runs with their steps (and where each ran), jobs, attempts, logs and minutes
 - `POST /api/pipelines/runs` with `{"pipeline": "gate", "sha": "<40 hex>"}` or `{"pipeline": "gate", "branch": "main"}` (default: the repository's `HEAD`): starts a run, HTTP 202
 - `POST /api/pipelines/runs/<id>/cancel`: cancels a run; CI runs in flight are asked to cancel
+
+## Checks
+
+Agents can run targeted tests before submitting a gate. Off by default: a project without a `checks:` block has no
+checks (every checks route answers 404). With the block, the server runs the kind's command for a running agent run
+that asks with its bus token. Define check kinds per project (design: [design/checks.md](design/checks.md)):
+
+```yaml
+checks:
+  backend-targeted:
+    command: ["./run-tests.sh", "{sha}", "{tests}"]
+    remote: origin
+    tests:
+      pattern: "^[A-Za-z0-9_.*#]+$"
+      max_count: 50
+      max_length: 5000
+    timeout_seconds: 300
+    max_concurrent: 2
+    max_per_agent_per_hour: 10
+    parse:
+      junit_path: test-results/TEST-*.xml
+    budget:
+      daily_limit: 100
+      guard_cmd: ["./check-spend.sh"]
+```
+
+### Check kind options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `command` | array | required | The argv, run without a shell in the project's repository. Placeholders: `{sha}`, `{branch}`, `{tests}`, `{agent}`, `{check_id}`, `{output_dir}` (also `CHECK_SHA`, `CHECK_BRANCH`, `CHECK_AGENT`, `CHECK_ID`, `CHECK_OUTPUT_DIR` in its environment) |
+| `remote` | string | `origin` | The remote the branch must be pushed to: the sha must be on `<remote>/<branch>` |
+| `tests.pattern` | string | `^[A-Za-z0-9_.*#]+$` | Regex allowlist for each test selector item (100 ms limit per item) |
+| `tests.max_count` | number | `50` | Maximum number of test items |
+| `tests.max_length` | number | `5000` | Maximum total length of tests joined |
+| `timeout_seconds` | number | `300` | Time limit for the check; its whole process group is stopped |
+| `max_concurrent` | number | `2` | Checks of this kind running at once (the rest wait, oldest first) |
+| `max_per_agent_per_hour` | number | `10` | Accepted checks per agent per hour (refusals don't count) |
+| `parse.junit_path` | string | — | JUnit XML path for failing test names, relative to the check's output directory; the file name may be a glob |
+| `budget.daily_limit` | number | — | Accepted checks of this kind per UTC day (refusals don't count) |
+| `budget.guard_cmd` | array | — | Command that must exit 0 before each run and before the infrastructure retry (30 s limit, fail closed) |
+
+Exit codes: 0 pass, 1 test failures, 2 refused (the command refused its input), 3 infrastructure (guard again, retried
+once), 4 refused by the guard. A timeout reports `timeout`; any other exit `fail`.
+
+Lair's own tokens (`GH_TOKEN`, `GITHUB_TOKEN`, `LAIR_*_TOKEN`) are removed from the command's and the guard's
+environment. Finished checks are kept 14 days (at most 10,000), with their output directories in
+`data/checks-output/<project>/`. Changes to `checks:` take effect at the next restart.
+
+### Checks API
+
+Agents request checks with their bus token. See [docs/agents.md](agents.md) for the curl example.
+
+- `POST /api/checks` with `{"kind": "...", "sha": "<40 hex>", "branch": "...", "tests": ["..."]}` and `Authorization: Bearer <bus token>`: request a check, returns `{"id": "..."}` (HTTP 201). The run must be running; a run tests one branch (its first accepted check's); the sha must be on that branch as pushed
+- `GET /api/checks/:id?wait=600` with the same token (or the owner's session): the result, optionally long-polling up to N seconds
+- `GET /api/checks?kind=&agent=&sha=&status=&limit=`: list checks (owner only)
+- `GET /api/checks/stats`: counts by status and kind (owner only)
 
 ## Process manager
 

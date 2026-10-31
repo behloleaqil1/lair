@@ -68,7 +68,7 @@ import type { AgentProbes, ProcessOwner, ProcessSpawner, SpawnOptions, SystemInf
 import type { DecisionInbox, DecisionRequest } from "./decisions.js";
 import { AgentsStore, SCHEMA_VERSION } from "./store.js";
 import type { AgentEvent, AgentRun } from "./types.js";
-import { BusConsumers, agentsBusFor, closeBusStores, structuredReport, type BusConsumeMode } from "../bus/index.js";
+import { BusConsumers, agentsBusFor, closeBusStores, hashBusToken, structuredReport, type BusConsumeMode } from "../bus/index.js";
 import { busStoreFor, forgetBusService, registerBusRoutes } from "../routes/bus.js";
 
 // ============ BOUNDARY FAKES ============
@@ -5935,6 +5935,7 @@ describe("12. the bus (bus.consume): fill reads an agent's structured report in 
     mode: BusConsumeMode,
     fill: Record<string, unknown> = {},
     restartOf?: BusHarness,
+    tokenUsers?: (project: string) => boolean,
   ): Promise<BusHarness> {
     const paths = restartOf?.paths ?? makePaths();
     const config = {
@@ -5969,7 +5970,7 @@ describe("12. the bus (bus.consume): fill reads an agent's structured report in 
       dbPath: paths.dbPath,
       probes: { processes: procs, fs: new NodeFileSystem(), runner: new FakeCommandRunner(), clock, spawner, self: SELF, systemInfo: new FakeSystemInfo() },
       events,
-      bus: agentsBusFor({ consumers, store: (project) => busStoreFor(project, dataDir), clock, serverUrl: SERVER_URL }),
+      bus: agentsBusFor({ consumers, store: (project) => busStoreFor(project, dataDir), clock, serverUrl: SERVER_URL, tokenUsers }),
     });
     managers.push(manager);
     manager.load([{ name: "demo", config }]);
@@ -5998,6 +5999,7 @@ describe("12. the bus (bus.consume): fill reads an agent's structured report in 
   const tasks = (h: BusHarness, ...lines: string[]) => writeFileSync(tasksPath(h.paths), `${lines.join("\n")}\n`);
   const lineOf = (h: BusHarness, task: string) => h.service.fillStatus().lines.find((l) => l.task === task);
   const kinds = (h: BusHarness, kind: AgentEventKind) => h.store.listEvents("demo", { kinds: [kind], limit: 500 }).reverse();
+  const runsOf = (h: BusHarness) => h.store.listRuns("demo", { limit: 500 }).reverse();
   /** What `lair bus report` sends: POST /api/bus/call with the run's token, no project */
   const report = (h: BusHarness, token: string, args: Record<string, unknown>) =>
     h.app.inject({ method: "POST", url: "/api/bus/call", headers: { authorization: `Bearer ${token}` }, payload: { tool: "report", args } });
@@ -6160,6 +6162,19 @@ describe("12. the bus (bus.consume): fill reads an agent's structured report in 
     expect(h.consumers.health("demo").refused.map((r) => r.reason)).toContain(
       "a queue line ends with this report's marker but is not its mirrored line (PROGRESS feat-login by worker-a): read as a hand-written line",
     );
+  });
+
+  it("off, with a module that takes the run's token (the checks): the run gets one, the bus API still refuses it, and it is revoked when the run ends", async () => {
+    const h = await busSetup("off", {}, undefined, () => true);
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    const token = await started(h);
+    expect(token).toMatch(/^lairbus_/);
+    const store = busStoreFor("demo", join(h.paths.dir, "data"));
+    expect(store.validateToken(hashBusToken(token))).toMatchObject({ project: "demo", agent: "worker-a", runId: runsOf(h)[0].id });
+    expect((await report(h, token, { kind: "DONE", task: "feat-login", summary: "x" })).statusCode).toBe(401);
+    h.spawner.exit(5001, 0);
+    await h.service.tick();
+    expect(store.validateToken(hashBusToken(token))).toBeNull();
   });
 
   it("the run's bus token is refused once the run has ended (revoked)", async () => {

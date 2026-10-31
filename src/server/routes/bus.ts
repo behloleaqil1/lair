@@ -37,7 +37,6 @@ import type { ApiResponse, BoardOutput, TaskStatus } from "../../shared/types.js
 import type { ProjectConfig } from "../../shared/types.js";
 import type { ReportKind } from "../../bus/types.js";
 import { z } from "zod";
-import { join } from "path";
 
 function respond<T>(data: T): ApiResponse<T> {
   return {
@@ -130,9 +129,12 @@ export interface BusRoutesOptions {
   health: (project: string) => BusConsumerHealth;
 }
 
-/** A project's bus store, where the routes, the consumers and the token minting all read it. */
+/**
+ * A project's bus store (<dataDir>/bus/<project>.db): the routes, the consumers, the token minting and the
+ * checks (src/server/checks/) all read this one.
+ */
 export function busStoreFor(project: string, dataDir: string): BusStore {
-  return getBusStore(project, join(dataDir, "bus"));
+  return getBusStore(project, dataDir);
 }
 
 /** Drop a project's bus service (its config changed): the next request builds it from the new config. */

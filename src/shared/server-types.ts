@@ -304,7 +304,12 @@ export type EventType =
   | "bus.report"
   | "bus.message"
   // Bus consumers (src/server/bus/consumers.ts): an event or report refused or ignored, {project, busId, reason}
-  | "bus.consume_refused";
+  | "bus.consume_refused"
+  // Checks (src/server/checks/)
+  | "check.requested"
+  | "check.started"
+  | "check.completed"
+  | "check.reconciled";
 
 /** Event stored in the database */
 export interface Event {

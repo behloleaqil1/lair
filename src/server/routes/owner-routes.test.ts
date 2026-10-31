@@ -215,7 +215,7 @@ describe("controls: commands and dragon start/stop", () => {
 describe("bus: messages sent as the owner", () => {
   function unread(agent: string) {
     // Read from the server-owned bus store
-    const store = getBusStore(PROJECT, join(TMP, "bus"));
+    const store = getBusStore(PROJECT, TMP);
     const now = Date.now();
     return store.getUnreadMessages(agent, now).map((m) => ({
       from_id: m.fromId,

@@ -135,6 +135,12 @@ export interface ProjectConfig {
   mail_dir?: string;
   /** File to touch when dragons should wake (bus mirror) */
   wake_file?: string;
+  /**
+   * Agent checks: agents test on a runner before they gate
+   * (src/server/checks/). Validated by parseChecksConfig; see
+   * docs/configuration.md#checks
+   */
+  checks?: Record<string, unknown>;
 }
 
 // Process configuration as it appears in YAML (before defaults applied)
