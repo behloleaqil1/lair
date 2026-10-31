@@ -152,7 +152,7 @@ export function findDuplicateSlots(fs: FileSystem, gatesDir: string, lanes: stri
 /**
  * Node filesystem implementation.
  */
-import { existsSync, readdirSync, readFileSync, statSync } from "fs";
+import { existsSync, readdirSync, statSync, openSync, readSync, closeSync } from "fs";
 
 export class NodeFileSystem implements FileSystem {
   stat(path: string): { isFile: boolean; isDirectory: boolean; mtimeMs: number; ctimeMs: number } | null {
@@ -190,12 +190,12 @@ export class NodeFileSystem implements FileSystem {
     try {
       if (!existsSync(path)) return null;
       const buffer = Buffer.alloc(maxBytes);
-      const fd = require("fs").openSync(path, "r");
+      const fd = openSync(path, "r");
       try {
-        const bytesRead = require("fs").readSync(fd, buffer, 0, maxBytes, 0);
+        const bytesRead = readSync(fd, buffer, 0, maxBytes, 0);
         return buffer.slice(0, bytesRead).toString("utf-8");
       } finally {
-        require("fs").closeSync(fd);
+        closeSync(fd);
       }
     } catch {
       return null;
@@ -206,7 +206,7 @@ export class NodeFileSystem implements FileSystem {
 /**
  * System probes with real implementations.
  */
-export function systemInfraProbes(timeoutMs: number): InfraMonitorProbes {
+export function systemInfraProbes(_timeoutMs: number): InfraMonitorProbes {
   return {
     runner: {
       async run(argv, options) {

@@ -2,7 +2,7 @@
  * In-memory store for the infra monitor.
  * Tracks monitored jobs, machine states, and notices.
  */
-import type { InfraFinding, InfraNotice, MachineState, MonitoredJob } from "./types.js";
+import type { InfraNotice, MachineState, MonitoredJob } from "./types.js";
 
 export class InfraMonitorStore {
   private jobs = new Map<string, Map<string, MonitoredJob>>(); // project -> gateId -> job

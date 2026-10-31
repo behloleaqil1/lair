@@ -10,13 +10,12 @@
  * does not exist there.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { mkdirSync, mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
 import { EventBus } from "../core/event-bus.js";
 import { InfraMonitorManager, type ProjectEntry } from "./service.js";
-import { InfraMonitorStore } from "./store.js";
 import type { CommandOutput, InfraMonitorProbes, FileEntry, FileSystem } from "./probes.js";
 
 // ============ BOUNDARY FAKES ============

@@ -284,7 +284,7 @@ export class InfraMonitor {
 
   // ============ ACT MODE: RE-QUEUE ============
 
-  private async requeue(finding: InfraFinding, now: number): Promise<"moved" | "failed" | "skipped"> {
+  private async requeue(finding: InfraFinding, _now: number): Promise<"moved" | "failed" | "skipped"> {
     if (this.actBlocked !== null) return "skipped";
     if (!this.settings.requeueCmd) return "skipped";
     if (finding.type !== "job_machine_down") return "skipped";

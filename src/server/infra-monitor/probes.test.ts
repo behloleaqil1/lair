@@ -107,7 +107,7 @@ describe("findDuplicateSlots", () => {
 
     readdir(dir: string): FileEntry[] {
       const entries: FileEntry[] = [];
-      for (const [path, _content] of this.files) {
+      for (const [path] of this.files) {
         if (path.startsWith(dir + "/")) {
           const name = path.substring(dir.length + 1);
           if (!name.includes("/")) {
