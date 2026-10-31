@@ -197,33 +197,17 @@ export class StepExecutors {
         if (live.length > 0) {
           return { refused: true, reason: `agent ${vars.agent} has a live process (pid ${live[0].pid})` };
         }
-        // Also check the claim file's recorded pid: if it is alive AND matches the agent,
-        // the agent is running (even if it doesn't match watchdog.agent_command).
-        // We verify the process matches to avoid false positives from pid reuse.
+        // The claim's recorded pid running as the agent (the detector's rule, claimPidBelongsTo)
+        // means the agent is alive though it doesn't match watchdog.agent_command; a reused pid
+        // doesn't stop the release
         const claim = view.claims().find((c) => c.agent === vars.agent);
-        if (claim) {
-          const claimPid = view.claimPid(claim);
-          if (claimPid !== null) {
-            const proc = await view.getProcess(claimPid.pid);
-            if (proc !== null) {
-              // Check if the process belongs to this agent by start time or command
-              const expectedUptimeMs = claimPid.startedAt !== null ? view.now - claimPid.startedAt : null;
-              const actualUptimeMs = proc.elapsedSeconds * 1000;
-              const toleranceMs = expectedUptimeMs !== null ? Math.max(60000, expectedUptimeMs * 0.1) : 0;
-              const startMatch =
-                expectedUptimeMs !== null &&
-                Math.abs(actualUptimeMs - expectedUptimeMs) <= toleranceMs;
-              const commandMatch = proc.command.includes(vars.agent ?? "");
-              if (startMatch || commandMatch) {
-                return {
-                  refused: true,
-                  reason: `agent ${vars.agent} is running (claim's recorded pid ${claimPid.pid} is alive, though it doesn't match the pattern)`,
-                  falsePositive: true,
-                };
-              }
-              // The pid is alive but doesn't match - it's reused, don't block the release
-            }
-          }
+        const claimPid = claim ? view.claimPid(claim) : null;
+        if (claim && claimPid !== null && (await view.claimPidIsAgents(claim, claimPid))) {
+          return {
+            refused: true,
+            reason: `agent ${vars.agent} is running (claim's recorded pid ${claimPid.pid} is alive, though it doesn't match the pattern)`,
+            falsePositive: true,
+          };
         }
         return { refused: false };
       }

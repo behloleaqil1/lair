@@ -540,7 +540,7 @@ export class AgentReviewAssigner implements ReviewAssigner {
       const ended = last ? `run ${short(last.id)} ended ${last.state} (${oneLine(last.detail)})` : "run is gone";
       const agent = record.agent ?? "the reviewer";
       if (record.agent) record.spec.tried.push(record.agent);
-      if (record.attempts >= settings.maxAttempts) return this.giveUp(record, `${agent}'s ${ended}`);
+      if (record.attempts >= settings.maxAttempts) return this.giveUp(record, `${agent}'s ${ended}`, last?.state ?? null);
       record.state = "requested";
       record.notBefore = now + backoffMs(record.attempts, settings.backoffSeconds, settings.maxBackoffSeconds);
       record.detail = `${agent}'s ${ended} without a review: attempt ${record.attempts + 1} of ${settings.maxAttempts} at ${iso(record.notBefore)}`;
@@ -589,6 +589,16 @@ export class AgentReviewAssigner implements ReviewAssigner {
         why: "The configuration can't satisfy the slot, so every PR that needs it waits.",
         kind: "other",
         reversible: true,
+        structure: {
+          class: "review.config",
+          evidence: {
+            code: "config_unsatisfiable",
+            facts: { pr: record.pr, head_sha: record.headSha, slot: record.slot },
+            cause_cleared: false,
+            linked_issue: null,
+          },
+          effects: ["reversible", "outward"],
+        },
         requestedBy: "review",
         links: record.spec.url ? [{ label: `PR #${record.pr}`, url: record.spec.url }] : [],
         key,
@@ -599,8 +609,12 @@ export class AgentReviewAssigner implements ReviewAssigner {
   }
 
   /** The last attempt ended without a review: the slot fails and the owner is asked. */
-  private async giveUp(record: AgentAssignmentRecord, last: string): Promise<void> {
+  private async giveUp(record: AgentAssignmentRecord, last: string, lastRunState: string | null = null): Promise<void> {
     const spec = record.spec;
+    // C9 matches on the code: a run record that is gone (its variables lost), a run that failed or never started
+    // (a provider or start error), anything else ended without a review
+    const code =
+      lastRunState === null ? "run_variables_lost" : lastRunState === "failed" || lastRunState === "never_started" ? "provider_error" : "no_reviewer";
     record.state = "failed";
     record.agent = null;
     record.runId = null;
@@ -623,6 +637,23 @@ export class AgentReviewAssigner implements ReviewAssigner {
         why: `Every reviewer run ended without a review, and the ${spec.tier} tier needs one before it can merge.`,
         kind: "escalation",
         reversible: true,
+        structure: {
+          class: "review.stuck",
+          evidence: {
+            code,
+            facts: {
+              pr: record.pr,
+              head_sha: record.headSha,
+              tier: spec.tier,
+              reviewers_tried: spec.tried.length,
+              attempts: record.attempts,
+              last_run_failure_code: lastRunState ?? "run_gone",
+            },
+            cause_cleared: false,
+            linked_issue: null,
+          },
+          effects: ["outward", "reversible"],
+        },
         requestedBy: "review",
         links: spec.url ? [{ label: `PR #${record.pr}`, url: spec.url }] : [],
         key: `review:agents:${record.pr}:${record.headSha}:${record.slot}:${record.round}`,

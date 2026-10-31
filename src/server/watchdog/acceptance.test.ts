@@ -192,7 +192,14 @@ function makePaths(): Paths {
 
 function setup(
   watchdog: (p: Paths) => Record<string, unknown>,
-  options: { readOnly?: boolean; paths?: Paths; store?: WatchdogStore; remote?: boolean } = {},
+  options: {
+    readOnly?: boolean;
+    paths?: Paths;
+    store?: WatchdogStore;
+    remote?: boolean;
+    /** More project config (e.g. agent_adapters) */
+    config?: Record<string, unknown>;
+  } = {},
 ): Harness {
   const paths = options.paths ?? makePaths();
   const config: ProjectConfig = {
@@ -229,6 +236,7 @@ function setup(
     },
     watchdog: { enabled: true, agent_command: AGENT_COMMAND, ...watchdog(paths) },
   };
+  Object.assign(config, options.config);
   const procs = new FakeProcessTable();
   const runner = new FakeCommandRunner();
   const clock = new FakeClock();
@@ -1590,5 +1598,173 @@ describe("12. orphan claim: live pid that doesn't match the pattern", () => {
     expect(breaches(h)).toHaveLength(1);
     expect(breaches(h)[0]).toMatchObject({ detector: "orphan_claim" });
     expect(h.runner.calls).toEqual([["./bin/release-claim", "worker-b", claimDir]]);
+  });
+
+  it("a claim with a live pid that matches start time but not command is not an orphan (same process, different invocation)", async () => {
+    const h = setup(act("orphan_claim"));
+    // Create claim with pid=4999 for worker-b
+    const claimDir = join(h.agentsDir, "worker-b.running");
+    mkdirSync(claimDir, { recursive: true });
+    // The claim says pid 4999, started at 11:00:00 (60 minutes ago from NOW=12:00:00)
+    writeFileSync(join(claimDir, "pid"), "pid=4999\nstarted=2026-03-02T11:00:00.000Z\n");
+    const t = new Date(NOW - 20 * 60 * 1000);
+    utimesSync(claimDir, t, t);
+
+    // Pid 4999 IS alive, has the RIGHT uptime (60 minutes = since 11:00:00), but the command doesn't contain worker-b
+    // This simulates an agent started via a different path/wrapper
+    h.procs.add(4999, "/usr/bin/some-wrapper-script", { upMinutes: 60 });
+
+    await h.wd.tick();
+
+    // The start time matches (process started at 11:00:00, claim says 11:00:00), so we trust it's the original
+    // process even though the command pattern doesn't match. The agent could have been started with a different
+    // command than watchdog.agent_command.
+    expect(breaches(h)).toHaveLength(0);
+    expect(h.runner.calls).toEqual([]);
+  });
+
+  /** worker-b's claim: a directory 20 minutes old whose pid file holds `pidFile` */
+  function claimWithPid(h: Paths, pidFile: string): string {
+    const claimDir = join(h.agentsDir, "worker-b.running");
+    mkdirSync(claimDir, { recursive: true });
+    writeFileSync(join(claimDir, "pid"), pidFile);
+    return aged(claimDir, 20, null);
+  }
+
+  /** The claim's own start, an hour before NOW */
+  const STARTED = "pid=4999\nstarted=2026-03-02T11:00:00.000Z\n";
+
+  /** worker-b names no adapter: dragon_defaults gives it tool-x, which starts /opt/tool-x/bin/tool-cli */
+  const TOOL_X = {
+    dragon_defaults: { adapter: "tool-x" },
+    agent_adapters: {
+      "tool-x": {
+        id: "tool-x",
+        name: "Tool X",
+        start_cmd: "/opt/tool-x/bin/tool-cli run --model {model} {prompt_file}",
+        stop_cmd: "kill -TERM {pid}",
+        status_method: "file",
+      },
+    },
+  };
+
+  const releaseRemovesClaim = (h: Harness) =>
+    h.runner.when((a) => a[0] === "./bin/release-claim", {
+      effect: (a) => rmSync(a[2], { recursive: true, force: true }),
+    });
+
+  it("a bare-pid claim (no started=) whose live pid runs another command is an orphan: there is no start time to trust", async () => {
+    const h = setup(act("orphan_claim"), { config: TOOL_X });
+    const claim = claimWithPid(h, "4999\n");
+    // Older than the claim: with a started= line it would be the claim's own process
+    h.procs.add(4999, "/usr/bin/some-unrelated-process", { upMinutes: 120 });
+    releaseRemovesClaim(h);
+
+    await h.wd.tick();
+
+    expectActRun(h, {
+      playbook: "orphan_claim",
+      detector: "orphan_claim",
+      argv: ["./bin/release-claim", "worker-b", claim],
+      outcome: "recovered",
+    });
+    expect(breaches(h)[0].evidence).toContain("claim's recorded pid 4999 is not running or doesn't match the agent");
+  });
+
+  it("a bare-pid claim whose live pid runs the agent's adapter program is not an orphan", async () => {
+    const h = setup(act("orphan_claim"), { config: TOOL_X });
+    const claim = claimWithPid(h, "4999\n");
+    h.procs.add(4999, "/opt/tool-x/bin/tool-cli run --model test-model /tmp/prompts/task.md", { upMinutes: 20 });
+
+    await h.wd.tick();
+
+    expect(breaches(h)).toEqual([]);
+    expect(h.runner.calls).toEqual([]);
+    expect(existsSync(claim)).toBe(true);
+    const slo = h.store.sloStatus("demo").find((s) => s.detector === "orphan_claim");
+    expect(slo).toMatchObject({ state: "ok", detail: "live by recorded pid (pattern mismatch): worker-b (pid 4999)" });
+  });
+
+  it("a claim with started= whose pid runs the adapter program but started after the claim is an orphan (another run of the tool)", async () => {
+    const h = setup(act("orphan_claim"), { config: TOOL_X });
+    const claim = claimWithPid(h, STARTED);
+    h.procs.add(4999, "/opt/tool-x/bin/tool-cli run --model test-model /tmp/prompts/other.md", { upMinutes: 5 });
+    releaseRemovesClaim(h);
+
+    await h.wd.tick();
+
+    expect(h.runner.calls).toEqual([["./bin/release-claim", "worker-b", claim]]);
+    expect(breaches(h)[0]).toMatchObject({ detector: "orphan_claim", status: "resolved", resolution: "recovered" });
+  });
+
+  it("a process that started 59 s after the claim's started= time is the claim's own (within the 60 s tolerance)", async () => {
+    const h = setup(act("orphan_claim"));
+    const claim = claimWithPid(h, STARTED);
+    h.procs.add(4999, "/usr/bin/some-wrapper-script", { upMinutes: (3600 - 59) / 60 }); // started 11:00:59
+
+    await h.wd.tick();
+
+    expect(breaches(h)).toEqual([]);
+    expect(h.runner.calls).toEqual([]);
+    expect(existsSync(claim)).toBe(true);
+  });
+
+  it("a process that started 61 s after the claim's started= time is a reused pid: detected, and the act guard lets the release run", async () => {
+    const h = setup(act("orphan_claim"));
+    const claim = claimWithPid(h, STARTED);
+    h.procs.add(4999, "/usr/bin/some-wrapper-script", { upMinutes: (3600 - 61) / 60 }); // started 11:01:01
+    releaseRemovesClaim(h);
+
+    await h.wd.tick();
+
+    expectActRun(h, {
+      playbook: "orphan_claim",
+      detector: "orphan_claim",
+      argv: ["./bin/release-claim", "worker-b", claim],
+      outcome: "recovered",
+    });
+  });
+
+  it("the act guard uses the detector's rule: a pid that turns out to be the agent's by start time is a false positive", async () => {
+    const h = setup(act("orphan_claim"));
+    const claim = claimWithPid(h, STARTED);
+    // ps call 1: the tick's detection, 2: the diagnose re-check, 3: the act guard
+    h.procs.onList = (call) => {
+      if (call === 3) h.procs.add(4999, "/usr/bin/some-wrapper-script", { upMinutes: 60 });
+    };
+    releaseRemovesClaim(h);
+
+    await h.wd.tick();
+
+    expect(h.runner.calls).toEqual([]);
+    const [run] = runs(h);
+    expect(steps(run)).toEqual(["diagnose:succeeded", "act:succeeded", "verify:skipped"]);
+    expect(run.outcome).toBe("cleared");
+    expect(run.steps[1].output).toBe(
+      "false positive: agent worker-b is running (claim's recorded pid 4999 is alive, though it doesn't match the pattern)",
+    );
+    expect(breaches(h)[0]).toMatchObject({ status: "resolved", resolution: "cleared" });
+    expect(existsSync(claim)).toBe(true);
+  });
+
+  it("the act guard uses the detector's rule: a bare pid that turns out to run the adapter program is a false positive", async () => {
+    const h = setup(act("orphan_claim"), { config: TOOL_X });
+    const claim = claimWithPid(h, "4999\n");
+    // ps call 1: the tick's detection, 2: the diagnose re-check, 3: the act guard
+    h.procs.onList = (call) => {
+      if (call === 3) {
+        h.procs.add(4999, "node /opt/tool-x/bin/tool-cli run --model test-model /tmp/prompts/task.md", { upMinutes: 1 });
+      }
+    };
+    releaseRemovesClaim(h);
+
+    await h.wd.tick();
+
+    expect(h.runner.calls).toEqual([]);
+    const [run] = runs(h);
+    expect(steps(run)).toEqual(["diagnose:succeeded", "act:succeeded", "verify:skipped"]);
+    expect(run.outcome).toBe("cleared");
+    expect(breaches(h)[0]).toMatchObject({ status: "resolved", resolution: "cleared" });
+    expect(existsSync(claim)).toBe(true);
   });
 });

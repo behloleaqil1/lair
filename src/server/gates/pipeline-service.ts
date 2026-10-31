@@ -690,6 +690,16 @@ export class PipelineManager {
         why: "GitHub bills hosted minutes of private repositories; spending more needs your approval.",
         reversible: true,
         onTimeout: "wait",
+        structure: {
+          class: "pipelines.budget",
+          evidence: {
+            code: "budget_exceeded",
+            facts: { month, budget_minutes: budget, billed_minutes: billed, estimated_minutes: estimate },
+            cause_cleared: false,
+            linked_issue: null,
+          },
+          effects: ["reversible", "outward"],
+        },
       });
       return `GitHub-hosted minutes would go over the monthly budget (${billed} of ${budget} used, the next job needs about ${estimate}); a spend decision was raised`;
     }
