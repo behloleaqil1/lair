@@ -70,6 +70,7 @@ export class DirWatch {
   private watcher: FSWatcher | null = null;
   private dirIno: number | null = null;
   private poller: NodeJS.Timeout | null = null;
+  private healthChecker: NodeJS.Timeout | null = null;
   /** The last failure reported, so a watch that keeps failing is said once */
   private failure: string | null = null;
   private started = false;
@@ -77,6 +78,8 @@ export class DirWatch {
   private readonly debounceMs: number;
   private readonly pollMs: number;
   private readonly pollLimit: number;
+  /** Interval between health checks when watching (default: pollMs, capped at 5000ms) */
+  private readonly healthCheckMs: number;
 
   constructor(
     readonly dir: string,
@@ -85,6 +88,9 @@ export class DirWatch {
     this.debounceMs = options.debounceMs ?? 100;
     this.pollMs = options.pollMs ?? 5000;
     this.pollLimit = options.pollLimit ?? 200;
+    // Health check: verify the folder still exists even while watching, since
+    // FSEvents on macOS may not reliably deliver directory removal events.
+    this.healthCheckMs = Math.min(this.pollMs, 5000);
   }
 
   /** "watching" (fs.watch on the folder), "polling", "stopped", or "idle" before start() */
@@ -113,6 +119,7 @@ export class DirWatch {
     this.disarm();
     if (this.poller) clearInterval(this.poller);
     this.poller = null;
+    this.stopHealthCheck();
   }
 
   private arm(): boolean {
@@ -132,16 +139,33 @@ export class DirWatch {
     }
     watcher.on("error", (e) => this.lost(`the watch on ${this.dir} failed (${message(e)})`));
     this.watcher = watcher;
+    // Start periodic health checks: macOS FSEvents may not deliver directory
+    // removal events reliably, so we verify the folder still exists.
+    this.startHealthCheck();
     return true;
   }
 
   private disarm(): void {
     const watcher = this.watcher;
     this.watcher = null;
+    this.stopHealthCheck();
     try {
       watcher?.close();
     } catch {
       // Already closed
+    }
+  }
+
+  private startHealthCheck(): void {
+    if (this.healthChecker) return;
+    this.healthChecker = setInterval(() => this.checkFolder(), this.healthCheckMs);
+    this.healthChecker.unref?.();
+  }
+
+  private stopHealthCheck(): void {
+    if (this.healthChecker) {
+      clearInterval(this.healthChecker);
+      this.healthChecker = null;
     }
   }
 
