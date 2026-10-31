@@ -1,10 +1,10 @@
 # PR health
 
 - **Status:** Draft (revised 2026-11-01 against main `d75b43a`)
-- **Plan lines / issues:** #247 (PR health), #251 (ready guard: per-repo CI signal and repo-aware PR references). Section 9 maps every review finding (PH-01 to PH-22) to the section that resolves it.
-- **Owner questions:**
-  1. Should an agent's unfixed problem also reach the Decision Inbox after a while? This spec adds `pr_health.escalate_after_minutes`. Its default is off: the inbox hears only about problems with no owner and notes that could not be delivered (section 4.5).
-  2. Notes go out through an argv command (`notify_cmd`) in this version. Should a later PR add a built-in fleet-bus channel? Section 3 explains why it is not built now.
+- **Plan lines / issues:** #247 (PR health), #251 (ready guard: per-repo CI signal and repo-aware PR references). Section 9 maps every review finding (PH-01 to PH-27) to the section that resolves it.
+- **Owner questions:** none. Two product questions are settled with these defaults:
+  1. `pr_health.escalate_after_minutes` defaults to `null` (off). The inbox hears only about problems with no owner and notes that could not be delivered (section 4.5). A project can set it, for example to 240, after a week in act mode.
+  2. A fleet-bus channel for notes is deferred to a follow-up. It needs an asynchronous bus mirror and delivery outside a run first (section 3). This version uses the argv command `notify_cmd`.
 
 ## 1. Problem
 
@@ -27,14 +27,14 @@ Lair already reads PRs (the review module and the ready guard) and the agents' t
 
 **In:**
 - PR 1: a shared, project-level `repos:` list with a module `src/server/repos/` that holds the list, the PR-reference parser and one git host per repository. The ready guard reuses it (#251): per-repository `ci_counts`, repository-aware `<ref>#n` references and a per-task `repo:owner/name`.
-- PR 2: a new module `src/server/pr-health/`, observe only. It reads each repository's open PRs on its own timer and finds four kinds of problem: `conflicts`, `behind`, `no_ci` and `ci_red`. It decides the owner, emits events and serves a read-only status route.
+- PR 2a and 2b: a new module `src/server/pr-health/`, observe only. 2a is the detector; 2b adds the owner rule, the route and the wiring. It reads each repository's open PRs on its own timer and finds four kinds of problem: `conflicts`, `behind`, `no_ci` and `ci_red`. It decides the owner, emits events and serves a read-only status route.
 - PR 3: act mode. A note to the owning agent through `notify_cmd`, its withdrawal through `withdraw_cmd`, delivery recorded in a ledger, and Decision Inbox notices with withdrawal when there is no owner, delivery gave up, or the optional timer ran out.
 
 **Out (non-goals):**
 - PR health is not a watchdog detector. The watchdog escalates every new breach once even in observe mode (`watchdog/service.ts:357-365`), and its playbook verify step sleeps inside the engine (`watchdog/playbook-engine.ts:82-83`). Both contradict "observe writes nothing" and a non-blocking timer. The infrastructure monitor's pattern fits instead (section 4.2). `DETECTOR_IDS` and its tests stay untouched.
 - Hosts other than GitHub. The `GitHost` interface allows them later.
 - Fixing PRs: merging, rebasing or closing them. PR health only tells someone.
-- A fleet-bus delivery channel. The bus store can take a message (`routes/bus.ts:136` `busStoreFor`, `bus/store.ts:364` `sendMessage`), but an agent sees it only while its run holds a bus token. The bus mirror also writes files with synchronous fs (`bus/mirror.ts:8`). A command channel works for every project today (see owner question 2).
+- A fleet-bus delivery channel. The bus store can take a message (`routes/bus.ts:136` `busStoreFor`, `bus/store.ts:364` `sendMessage`), but an agent sees it only while its run holds a bus token. The bus mirror also writes files with synchronous fs (`bus/mirror.ts:8`). A command channel works for every project today. The bus channel is a follow-up, and it needs an asynchronous mirror and delivery outside a run first.
 - Moving `tracker.repos[]` onto the shared list. The tracker keeps its own block. The shared list aligns with it (same entry fields and rules) and falls back to it (section 4.3); a follow-up can make the tracker read it.
 - Repositories with more than 100 open PRs. The list read is one page of 100, and the status shows `truncated`.
 
@@ -45,10 +45,11 @@ Lair already reads PRs (the review module and the ready guard) and the agents' t
 | PR | Files (new unless marked) |
 |---|---|
 | 1 | `src/server/repos/{config,refs,hosts,checks,index}.ts`. Changed: `ready-guard/guard.ts`, `agents/fill.ts` (the guard call), `review/service.ts` (`readyFacts` uses `newestChecks`), `index.ts` (the ready-facts source), `docs/configuration.md` |
-| 2 | `src/server/pr-health/{config,types,detect,owner,service,routes,index}.ts`. Changed: `review/host.ts` and `review/github.ts` (`HostCommit.committedAt`), `shared/server-types.ts` (event names), `index.ts`, `reload/modules.ts`, `docs/configuration.md` |
+| 2a | `src/server/pr-health/{config,types,detect,service,index}.ts`: config, types, detector, cache, isolation, the status view and events. Changed: `shared/server-types.ts` (event names), `docs/configuration.md` |
+| 2b | `src/server/pr-health/{owner,routes}.ts`: the owner rule and the status route. Changed: `review/host.ts` and `review/github.ts` (`HostCommit.committedAt`), `index.ts` (wiring), `reload/modules.ts` (reload) |
 | 3 | `src/server/core/act-ledger.ts` (the generic ledger, moved out of `infra-monitor/ledger.ts`) and `src/server/pr-health/{act,notices}.ts`. Changed: `infra-monitor/ledger.ts` (becomes a subclass), `infra-monitor/config.ts` (`buildArgv`), `decisions/raisers.test.ts` (`RAISERS`), `docs/configuration.md` |
 
-PR health is wired like the infrastructure monitor (`index.ts:812-818` construct, load, `useDecisions`, routes; `index.ts:1258` start; `reload/modules.ts:187` reload). Construction is `new PrHealthManager({events, agents, ledgerPath})`. It is off unless a project sets `pr_health.enabled: true`.
+PR health is wired in PR 2b, like the infrastructure monitor (`index.ts:812-818` construct, load, `useDecisions`, routes; `index.ts:1258` start; `reload/modules.ts:187` reload). Construction is `new PrHealthManager({events, agents, ledgerPath})`. It is off unless a project sets `pr_health.enabled: true`.
 
 ### 4.2 What it reuses on main
 
@@ -89,12 +90,12 @@ repos:
 |---|---|---|---|
 | `repos` | list | see below | at most 20 entries; a repository listed twice is an error |
 | `repos[].repo` | string | required | `^[A-Za-z0-9-]{1,39}/[A-Za-z0-9_.-]{1,100}$` (GitHub's limits, so a key stays ≤ 200 chars) |
-| `repos[].default` | bool | `true` when there is one entry, else `false` | exactly one `true` when there are 2 or more entries |
+| `repos[].default` | bool | `true` when there is one entry, else `false` | in `repos:` with 2 or more entries, exactly one `true` (see the fallback below) |
 | `repos[].base` | string \| null | `null` (the host's default branch) | 1-255 chars, `isSafeBranchName` (`authors.ts:44`) |
 | `repos[].ci_counts` | bool | `true` | |
 | `repos[].refs` | string[] | `[<name part>]` when it matches the pattern, else `[]` | ≤ 8 per entry, each `^[A-Za-z][A-Za-z0-9_.-]{0,39}$`, not `pr` or `pull`, unique across entries (case-insensitive) |
 
-**When `repos:` is absent,** Lair falls back in this order. First, if `tracker.repos[]` is set, it takes those entries' `repo` and `default`. Otherwise it uses the review repository, `review.repo ?? github` (`review/config.ts:451`), as the one default entry, with `base = review.default_branch`. If neither gives an owner/name, the list is empty: consumers that need it are inactive and give that reason. Errors are reported as `repos[1].refs[0]: …` and turn off the modules that read `repos:` (PR health and the ready guard's repository-aware parsing). The project still loads.
+**When `repos:` is absent,** Lair falls back in this order. First, if `tracker.repos[]` is set, it takes those entries' `repo` and `default`. The tracker allows 2 or more entries with no default (with a warning, `tracker/config.ts:198-199`); that list is taken as "no default", not as an error. Then `PR #n` and a bare `#n` mean only the task's `repo:` repository, and a line without one names no PR. Otherwise it uses the review repository, `review.repo ?? github` (`review/config.ts:451`), as the one default entry, with `base = review.default_branch`. If neither gives an owner/name, the list is empty: consumers that need it are inactive and give that reason. Errors are reported as `repos[1].refs[0]: …` and turn off the modules that read `repos:` (PR health and the ready guard's repository-aware parsing). The project still loads.
 
 **References (`repos/refs.ts`, new):** `parsePrRefs(text, repos, {mode, taskRepo}) → {repo, number, sha | null}[]`, case-insensitive. A reference must start at a word boundary and the number must not be followed by `[0-9A-Za-z_]`.
 
@@ -124,7 +125,9 @@ repos:
 - `fill.guardDownUntil` (`fill.ts:1126,2219`) becomes a map per repository, so one host that is down does not hold reports about another.
 - `agents.fill.ready_guard` still needs `review.enabled` (`agents/config.ts:700`), unchanged.
 
-### 4.4 Detector, observe only (PR 2)
+### 4.4 Detector, observe only (PR 2a; the owner rule, route and wiring are PR 2b)
+
+PR 2a is reached only by its tests until PR 2b wires it. Both are off by default. Until 2b, a finding's owner is `unknown`, with the reason that the owner rule arrives in PR 2b.
 
 **Config: `pr_health:`** (project block, new). All keys are listed in section 4.7.
 
@@ -147,7 +150,7 @@ repos:
    - `ci_red`: requires `ci_counts`. At least one newest check is `failure`. Pending is neither red nor missing CI, and skipped is ignored. Drafts do get `ci_red`, `conflicts` and `behind`, as the script reported them.
    - Each kind can be turned off under `kinds:`.
 4. **Findings and clearing.**
-   - Key: `pr_health:<repo>#<n>@<head8>:<kind>`, where `head8` is the first 8 hex characters of the head. The key is at most 169 characters.
+   - Key: `pr_health:<repo>#<n>@<head8>:<kind>`, where `head8` is the first 8 hex characters of the head. The key is at most 179 characters (a 39-character owner, a 100-character name, a 9-digit PR and `conflicts`), under the 200-character limit for decision keys.
    - An open finding found again keeps its `since`.
    - A kind that was not found while its PR was read successfully gets `clearingSince` and is cleared after `clear_minutes` (default 10) of such reads.
    - When the head moves, every finding of the old head is cleared at once (`why: "head_moved"`).
@@ -157,7 +160,7 @@ repos:
 5. **Owner,** once per tick for each (repo, PR, head) with an open finding (section 4.4.1). It is shown in the status and recomputed every tick.
 6. **Observe output.** `planned[]` in the status lists what act mode would do now: each note and withdrawal with its argv, and each inbox notice with its key and code. Observe raises no decision, runs no command, does not read or create the ledger and writes no file. It emits only the events in section 4.7, as the infrastructure monitor does in observe.
 
-#### 4.4.1 Owner rule (`pr-health/owner.ts`)
+#### 4.4.1 Owner rule (`pr-health/owner.ts`, PR 2b)
 
 The inputs are the fill snapshot, the repository list, the PR's (repo, number, headRef), the review authors settings and a lazy push time. The result is `{agent | null, source: "task_line" | "branch" | null, line | null, reason}`, or `unknown`.
 
@@ -182,7 +185,12 @@ The owner is recomputed every tick. A note goes to the owner at the time it is s
 
 Act mode runs only when `mode: act` and the project is not `read_only` (`actBlocked`, as in `infra-monitor/config.ts:177`). `mode: act` without `notify_cmd` is a config error. Each tick does at most `MAX_COMMANDS_PER_TICK = 4` command runs, counting notes and withdrawals together.
 
-**Ledger** (`data/pr-health-deliveries.json`, new). The format is 1. It is written by `ActLedger<R>` (`core/act-ledger.ts`), the generalised `infra-monitor/ledger.ts`, and `RequeueLedger` becomes `class RequeueLedger extends ActLedger<RequeueRecord>` in the same file with the same export. The ledger keeps records for 14 days, at most 2000. A record:
+**Ledger** (`data/pr-health-deliveries.json`, new). The format is 1. It is written by `ActLedger<R>` (`core/act-ledger.ts`), the generalised `infra-monitor/ledger.ts`, and `RequeueLedger` becomes `class RequeueLedger extends ActLedger<RequeueRecord>` in the same file with the same export. Records older than 14 days are pruned, and so are the oldest once there are more than 2000. PR health gives the ledger a `keep(record)` hook, and pruning never drops a record that the hook keeps:
+- a record whose (repo, PR, head) still has an open finding;
+- a record whose withdrawal is pending (`sent` with `withdraw` null, `running` or `failed`);
+- any record of a repository that has not been read successfully since this process started.
+
+If the 2000 cap is reached only by kept records, it gives way and the status shows a warning. A sent note is therefore never forgotten while its problem is still open, so it is never sent again. A record:
 
 ```ts
 interface NoteRecord {
@@ -212,7 +220,12 @@ On load, a `running` note or withdrawal becomes `failed` with "interrupted by a 
 - Kinds that appear later at the same head get a note of their own, which names only the new kinds.
 - A kind that clears and comes back at the same head is not noted again, as the script's seen-file rule did. Its status still shows it.
 
-**Withdrawals.** A `sent` record is withdrawn once every kind in it is cleared, which includes the head moving or the PR closing.
+**Withdrawals.** A `sent` record is withdrawn once it is cleared. A record is cleared when one of these holds, judged from the ledger and this process's reads, not from findings that existed before a restart:
+- a successful list of its repository no longer has the PR (closed or merged);
+- a successful read shows the PR's head is no longer the record's `head` (the head moved);
+- successful reads of the PR at the record's head have found none of the record's kinds open for `clear_minutes`, counted from the first such read.
+
+After a restart the findings start empty, but the ledger still holds the `sent` records. So a note whose problem was fixed while Lair was down is cleared by the first successful reads after the restart (closed or moved: at once; fixed: after `clear_minutes`) and gets its withdrawal.
 - With `withdraw_cmd` set, the withdrawal runs in the same steps as a note (written `running` first, bounded attempts, backoff) and ends `done` or `gave_up`.
 - With `withdraw_cmd: null`, the record is marked `skipped` and no command runs.
 - A record that was never `sent` gets no withdrawal, and its retries stop once its kinds clear.
@@ -360,11 +373,11 @@ The tests drive the real entry points: `RepoHosts` and `GitHubHost`, fill's `gua
 - **AT-8 `readyGuard_host_down_per_repo`.** lib's fetch never answers (`timeoutMs` 50). The lib report is `unverifiable` with `hostDown`. An app report in the same fill check is still evaluated, and lib's backoff does not hold app.
 - **AT-9 `readyGuard_ambiguous_across_repos`.** `app#5 and lib#5` with a task naming neither is ambiguous. With a task naming `lib#5`, the report is lib#5.
 
-**PR 2: observe detector**
+**PR 2a: detector (AT-10 to AT-20, AT-26, AT-28 to AT-30, AT-32) · PR 2b: owner rule, route and wiring (AT-21 to AT-25, AT-27, AT-31)**
 - **AT-10 `prHealth_off_by_default`.**
   - No `pr_health:`: no instance and no timer, and the status has `enabled: false`.
   - `enabled: true` with an empty `repos`: inactive with a reason.
-  - With PR health off, its tick makes no request.
+  - With PR health off, the fake fetch sees no request for the project.
 - **AT-11 `prHealth_conflicts_from_single_pr_read`.** The list item for PR 42 has no `mergeable` and `GET /pulls/42` returns `mergeable: false`. The result is the finding `pr_health:example/app#42@<head8>:conflicts`, and the request log contains `GET /repos/example/app/pulls/42`.
 - **AT-12 `prHealth_mergeable_null_unknown`.**
   - `mergeable: null`: no new `conflicts` finding.
@@ -419,7 +432,12 @@ The tests drive the real entry points: `RepoHosts` and `GitHubHost`, fill's `gua
   - `listCommits` is not called when a task line names the PR.
 - **AT-24 `prHealth_owner_ignores_malformed_long_line`.** The snapshot has the malformed view fill emits for a 2001-character line naming PR #42 (`agent: null`, `state: "malformed"`). The owner is null with the reason that no open task line names the PR, and nothing throws.
 - **AT-25 `prHealth_owner_unknown_until_fill_checks`.** Fill on with `lastCheck: null` gives `unknown`. Fill off gives null.
-- **AT-26 `prHealth_tick_no_sync_io`.** Every `*Sync` function of `fs` and `child_process` is spied during ticks over two repositories with findings and owners, in observe mode and in act mode with a ledger write. There are zero calls.
+- **AT-26 `prHealth_sources_no_sync_io`.** This is a source scan, as main does it (`infra-monitor/probes.test.ts:191-204`): vitest cannot spy on named ESM exports of `fs` or `child_process`, so a spy would see zero calls whatever the code did. The scan covers every non-test `.ts` file in `src/server/repos/` and `src/server/pr-health/`, plus `src/server/core/act-ledger.ts` from PR 3 on. With comment lines removed, it asserts:
+  - no `\b\w+Sync\s*\(` call;
+  - no import from `"fs"` or `"node:fs"` (only `fs/promises`);
+  - no import from `"child_process"` (commands go through `CommandRunner`).
+
+  It also asserts that the expected files (`service.ts`, `refs.ts`) are in the list, so an empty scan fails.
 - **AT-27 `prHealth_observe_writes_nothing`.** Observe mode with `notify_cmd` and `withdraw_cmd` set and findings both with and without owners:
   - the fake runner records no command;
   - the inbox has no decision;
@@ -453,7 +471,12 @@ The tests drive the real entry points: `RepoHosts` and `GitHubHost`, fill's `gua
   - Exit 1 makes the record `failed`, and nothing runs before `nextAttemptAt`.
   - The retry exits 0, so the record is `sent` after 2 runs in total with the same `{id}`.
   - A timed-out run is `failed`, never `sent`.
-- **AT-35 `prHealthAct_restart_after_send`.** A new manager on the same ledger file, with the same findings, runs nothing.
+- **AT-35 `prHealthAct_restart_after_send`.** Each case uses a new manager on the same ledger file with `withdraw_cmd` set:
+  - Same state after the restart: nothing runs.
+  - The problem was fixed while Lair was down: the first successful read finds none of the record's kinds, and exactly one withdrawal runs after `clear_minutes`.
+  - The PR was closed while Lair was down: exactly one withdrawal runs at the first successful list.
+  - The head moved while Lair was down: exactly one withdrawal runs for the old head.
+  - The repository's first read fails: no withdrawal runs.
 - **AT-36 `prHealthAct_restart_mid_command`.** A `running` record loads as `failed` ("interrupted by a restart") and is retried after its `nextAttemptAt` with the same `{id}`.
 - **AT-37 `prHealthAct_gave_up_escalates`.** With `max_attempts: 2` and both runs failing, the record is `gave_up` and one `delivery_failed` notice is raised. Later ticks raise no more.
 - **AT-38 `prHealthAct_withdraw`.**
@@ -484,11 +507,12 @@ The tests drive the real entry points: `RepoHosts` and `GitHubHost`, fill's `gua
 - **AT-44 `prHealthAct_read_only_project`.** A `read_only` project has `actBlocked` set and behaves like observe.
 - **AT-45 `prHealthAct_switch_to_observe`.** A reload from act to observe withdraws the open notices and runs no command.
 - **AT-46 `infraMonitor_ledger_regression`.** The existing infra-monitor tests pass on `ActLedger`, and `raisers.test.ts` passes with the new `pr-health/notices.ts` entry.
+- **AT-47 `prHealthAct_prune_keeps_open`.** A `sent` record is 15 days old and its head still has an open finding: it is kept, and the next tick sends nothing. A record 15 days old with no open finding and its withdrawal done is pruned.
 
 ## 6. Rollout
 
 1. Merge PR 1. Nothing changes until `repos:` lists a second repository or sets `ci_counts: false`. Then the ready guard can be turned on for a project with several repositories (#251).
-2. Merge PR 2. Set `pr_health: {enabled: true}` (observe is the default) and `repos:`. Run it alongside the existing script for a day: `GET /api/pr-health/status` should show the same problems and owners as the script's output, and `planned` shows what act would send.
+2. Merge PR 2a, then PR 2b. Nothing runs until 2b wires the module. Then set `pr_health: {enabled: true}` (observe is the default) and `repos:`. Run it alongside the existing script for a day: `GET /api/pr-health/status` should show the same problems and owners as the script's output, and `planned` shows what act would send.
 3. Merge PR 3. Set `notify_cmd` (and `withdraw_cmd` if wanted), then `mode: act`. Example of a command that is idempotent on `{id}`:
    `notify_cmd: ["/opt/lair-hooks/agent-note", "{agent}", "{id}", "{message}"]`, where the script appends `- NOTE for <agent> (<id>): <message>` to the team's task list unless a line containing `<id>` is already there.
 4. Check that a deliberately conflicting test PR gets one note, and one withdrawal after the fix. Watch `pr_health.noted` and `pr_health.withdrawn` in Activity. Then retire the script.
@@ -499,10 +523,13 @@ The tests drive the real entry points: `RepoHosts` and `GitHubHost`, fill's `gua
 | PR | Content | Non-test lines (estimate) | ATs |
 |---|---|---|---|
 | 1 | `repos/` (config with the tracker and review fallbacks, refs, hosts, `newestChecks`, `readyFactsFromHost`), ready guard changes (`facts(repo, pr)`, `ci_counts`, repository-aware parsing, per-repository host backoff), `index.ts` source, docs | ~480 | AT-1 to AT-9 |
-| 2 | `pr-health/` config, detector, cache, isolation, owner rule, `HostCommit.committedAt`, events, status route, wiring and reload, docs | ~590 | AT-10 to AT-32 |
-| 3 | `core/act-ledger.ts` (moved from infra-monitor), `buildArgv`, notes, withdrawals, inbox notices, timer, `RAISERS` entry, docs | ~520 | AT-33 to AT-46 |
+| 2a | `pr-health/` config and validation, types, detector (kinds, per-head cache, request budget and deadline), per-repository isolation, findings and clearing, status view, events, docs | ~600 | AT-10 to AT-20, AT-26, AT-28 to AT-30, AT-32 |
+| 2b | Owner rule, `HostCommit.committedAt`, status route, `index.ts` wiring and start, `reload/modules.ts` | ~400 | AT-21 to AT-25, AT-27, AT-31 |
+| 3 | `core/act-ledger.ts` (moved from infra-monitor, with the `keep` hook), `buildArgv`, notes, withdrawals (including after a restart), inbox notices, timer, `RAISERS` entry, docs | ~560 | AT-33 to AT-47 |
 
-Each PR builds and is wired on its own. PR 2 and PR 3 sit behind `pr_health.enabled: false`, and PR 3 also needs `mode: act`.
+The estimates are measured against the infrastructure monitor, whose non-act code is about 1,200 lines; PR 2a and 2b together are the same order of size.
+
+Each PR builds and merges on its own. PR 2a's module is not reachable from startup until PR 2b wires it, so 2a changes no behaviour. PR 2a, 2b and 3 sit behind `pr_health.enabled: false`, and PR 3 also needs `mode: act`.
 
 ## 8. Open risks
 
@@ -522,7 +549,7 @@ Each PR builds and is wired on its own. PR 2 and PR 3 sit behind `pr_health.enab
 | PH-02 | No host factory; token, apiUrl, `timeoutMs` | 4.2 (PR data, timeout and token rows), 4.3 Hosts (`RepoHosts`), 4.7 `request_timeout_seconds`; AT-6, AT-10, AT-19 |
 | PH-03 | `view.taskRegistry()` invented; sync fs | 4.2 (task lines row), 4.4 step 1, 4.4.1 (fill snapshot, read once per tick, no file); AT-24, AT-25, AT-26 |
 | PH-04 | Owner not repository-aware, "first" not latest, no 6 h window, hard-coded branch pattern | 4.3 References, 4.4.1 steps 3-4 (latest line, `branch_window_minutes`, `review.authors` patterns); AT-21, AT-22, AT-23 |
-| PH-05 | No design for notice withdrawal | 4.5 Withdrawals, 4.7 `withdraw_cmd` and the `pr_health.withdrawn` event; AT-38, AT-39 |
+| PH-05 | No design for notice withdrawal, including after a restart | 4.5 Withdrawals ("cleared" judged from the ledger and this process's reads, also after a restart), 4.7 `withdraw_cmd` and the `pr_health.withdrawn` event; AT-35, AT-38, AT-39 |
 | PH-06 | No exactly-once delivery | 4.5 Ledger and Notes (written first, `sent` is final, `{id}`, one message per (PR, head) for its new kinds); AT-33 to AT-36 |
 | PH-07 | Observe mode contradicts the watchdog's escalation | 3 Out (not a watchdog detector), 4.4 step 6; AT-27 |
 | PH-08 | Blocking verify wait | 4.5 Inbox notices (evaluated each tick from `sentAt`); AT-40, AT-41 |
@@ -538,5 +565,11 @@ Each PR builds and is wired on its own. PR 2 and PR 3 sit behind `pr_health.enab
 | PH-18 | Repository list not shared; ready guard reuse | 4.3 (project `repos:` aligned with `tracker.repos[]`, `parsePrRefs`, `RepoHosts`, guard `facts(repo, pr)` and `ci_counts`), 7 PR 1; AT-1 to AT-9 |
 | PH-19 | Owner rule: push-time source, open definition, escalate only | 4.4.1 steps 2, 4 and 5 (`HostCommit.committedAt` from the committer date; open = fill's states; no owner gives the notice only); AT-21, AT-23, AT-40 |
 | PH-20 | Async bounded read, no sync AT, long lines | 4.4 step 1 and 4.9 Event loop (no file read in the tick; fill's limits already apply), 4.4.1 step 2 (malformed lines); AT-24, AT-26 |
-| PH-21 | PR split | 7 (three PRs, each ≤ ~600 non-test lines, with their ATs) |
+| PH-21 | PR split | 7 (PRs 1, 2a, 2b and 3, each ≤ ~600 non-test lines, with their ATs) |
 | PH-22 | Reuse `notices.ts` and `ledger.ts` | 4.2 (notices and act-once rows), 4.5 (`ActLedger` moved out of infra-monitor, notice shape and `syncNotices` rules); AT-46 |
+| PH-23 | The no-sync AT cannot work as a spy | AT-26 is a source scan following `infra-monitor/probes.test.ts:191-204` over `repos/`, `pr-health/` and `core/act-ledger.ts` |
+| PH-24 | Pruning can re-send a note | 4.5 Ledger (the `keep` hook never prunes a record whose head has an open finding or whose withdrawal is pending); AT-47 |
+| PH-25 | The PR 2 estimate is too low | 4.1, 4.4 and 7 (split into 2a and 2b) |
+| PH-26 | A tracker fallback with no default | 4.3 (2 or more tracker entries with no default are taken as "no default", not an error) |
+| PH-27 | AT-10 contradiction; key length | AT-10 bullet 3 reworded; 4.4 step 4 (at most 179 characters) |
+| Owner questions | Settled defaults | Header: `escalate_after_minutes` is `null`; the bus channel is a follow-up that needs an asynchronous mirror and delivery outside a run |
