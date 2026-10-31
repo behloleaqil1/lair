@@ -3690,12 +3690,9 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
           budget: this.options.budget,
           events: this.options.events,
           tools: this.options.tools,
-<<<<<<< HEAD
           readyFacts: () => this.readyFacts?.(entry.name),
-=======
           // Bus consumer integration: check if a bus id was consumed (bound to this project)
           wasConsumed: this.options.wasConsumed ? (busId) => this.options.wasConsumed!(entry.name, busId) : undefined,
->>>>>>> 56014f3 (fix(bus): wire consumers, persist consumed, add validators)
         }),
       );
     }
