@@ -7,7 +7,12 @@
  * file, the convention the Decision Inbox importers read.
  */
 import { randomUUID } from "crypto";
-import type { Decision, DecisionKind as InboxKind } from "../../shared/decision-types.js";
+import type {
+  Decision,
+  DecisionEffect,
+  DecisionKind as InboxKind,
+  DecisionStructure,
+} from "../../shared/decision-types.js";
 import type { DecisionProducer, RaiseDecisionInput } from "../decisions/types.js";
 import type { Clock, FileSystem } from "../watchdog/probes.js";
 
@@ -33,6 +38,8 @@ export interface DecisionOption {
   label: string;
   /** What happens if this option is chosen */
   consequences?: string;
+  /** What choosing it does; every option of a request with a structure needs one */
+  effect?: DecisionEffect;
 }
 
 export interface DecisionRequest {
@@ -57,6 +64,8 @@ export interface DecisionRequest {
   ref?: string;
   /** References of the work that waits, e.g. "agents:demo:task:feat-login" */
   blocks?: string[];
+  /** Policy class and evidence (docs/design/decision-policies.md §4) */
+  structure?: DecisionStructure;
 }
 
 export interface DecisionInbox {
@@ -123,6 +132,7 @@ export function toRaiseInput(decision: DecisionRequest): RaiseDecisionInput {
     id: o.id,
     label: clip(oneLine(printable(o.label, false), 200), 120),
     consequences: clip(printable(o.consequences ?? o.label, true).trim(), 1000),
+    ...(o.effect ? { effect: o.effect } : {}),
   }));
   const recommended = options.some((o) => o.id === decision.recommended) ? decision.recommended! : options[0].id;
   return {
@@ -135,6 +145,7 @@ export function toRaiseInput(decision: DecisionRequest): RaiseDecisionInput {
     source: { module: DECISION_MODULE, ref: clip(printable(decision.ref ?? decision.key, false), 200) },
     key: clip(printable(decision.key, false), 200),
     blocks: (decision.blocks ?? []).map((b) => clip(printable(b, false), 200)),
+    ...(decision.structure ? { class: decision.structure.class, evidence: decision.structure.evidence } : {}),
   };
 }
 

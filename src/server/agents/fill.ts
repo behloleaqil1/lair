@@ -67,6 +67,7 @@ import type { Decision } from "../../shared/decision-types.js";
 import type {
   AgentEventKind,
   AgentRunView,
+  FillCapacityView,
   FillHold,
   FillLineState,
   FillLineView,
@@ -82,6 +83,7 @@ import {
   backoffMs,
   doneLineMatches,
   fillPatternFor,
+  getAgentClass,
   matchesByAgent,
   taskLineMatch,
   WAKE_VALUE,
@@ -89,15 +91,23 @@ import {
   type FillSettings,
 } from "./config.js";
 import { escalationDecisionKey, type DecisionRequest } from "./decisions.js";
-import type { AgentProbes } from "./probes.js";
+import type { AgentProbes, MemoryReading } from "./probes.js";
 import { MAX_PROMPT_FILE_BYTES } from "./prompts.js";
 import { lastLines, readTail } from "./sessions.js";
 import type { AgentsStore } from "./store.js";
 import { isActive, isValidTaskId, type AgentRun, type QueueMark } from "./types.js";
+import type { ProcessInfo } from "../watchdog/probes.js";
 
 export const MAX_TASKS_FILE_BYTES = 256 * 1024;
 export const MAX_TASK_LINES = 200;
 export const MAX_TASK_LINE_CHARS = 2000;
+const CAPACITY_PROBE_TIMEOUT_MS = 5_000;
+
+/** What one fill check reads of the machine and of the heavy work, once */
+interface CapacityState {
+  machine?: Promise<{ cpus: number; load: number; total: number; memory?: MemoryReading }>;
+  heavy?: number;
+}
 const QUEUE_MAX_BYTES = 4 * 1024 * 1024;
 const QUEUE_LINE_CHARS = 1000;
 const MARK_TAIL_BYTES = 256;
@@ -817,6 +827,8 @@ interface HoldQuestion {
   keepConsequences?: string;
   why?: string;
   withOutput?: boolean;
+  /** The evidence code: why the task is held (agents.gave_up, or agents.cannot_start for probe_failed and fill_waiting) */
+  code: "probe_failed" | "fill_waiting" | "repeated_failure" | "exit0_no_report" | "blocked_reported";
 }
 
 export interface AgentsFillOptions {
@@ -828,6 +840,10 @@ export interface AgentsFillOptions {
   store: AgentsStore;
   probes: AgentProbes;
   readOnly: () => boolean;
+  /** False until AgentsService has reconciled the runs the store says are active (after start()): no check runs */
+  ready: () => boolean;
+  /** A live process running a run of the task that no active run owns (AgentsService's), or null */
+  taskProcess: (task: string) => Promise<ProcessInfo | null>;
   /** AgentsService.requestRun as fill: the module's in-process path */
   requestRun: (input: { agent: string; task: string; prompt: string }) => Promise<AgentRunView>;
   /** Record an event in the store, and on the bus */
@@ -878,6 +894,8 @@ export class AgentsFill {
   private unmatchedReports: FillUnmatchedReportView[] = [];
   /** When a notice was last raised for an agent's unmatched report (agent -> time); one per agent per hour */
   private unmatchedNoticeAt = new Map<string, number>();
+  /** Last capacity check state for the view */
+  private lastCapacity: FillCapacityView | null = null;
 
   constructor(private options: AgentsFillOptions) {}
 
@@ -905,6 +923,7 @@ export class AgentsFill {
       lastError: this.lastError,
       lines: this.lines,
       unmatchedReports: this.unmatchedReports,
+      capacity: this.lastCapacity ?? undefined,
     };
   }
 
@@ -974,9 +993,15 @@ export class AgentsFill {
   }
 
   private async runCheck(): Promise<void> {
+    const now = this.options.probes.clock.now();
+    if (!this.options.ready()) {
+      // A restart: a task whose run the previous server started must not look free before that run is adopted
+      this.lastError = "waiting for the agents module to reconcile the runs it found active: fill starts nothing until then";
+      this.lastCheck = now;
+      return;
+    }
     const abort = new AbortController();
     this.abort = abort;
-    const now = this.options.probes.clock.now();
     try {
       this.lines = await this.evaluate(abort.signal, now);
       this.lastError = abort.signal.aborted ? "the check was interrupted: the module stopped" : null;
@@ -1040,6 +1065,7 @@ export class AgentsFill {
     const promptsDir = getPromptsDir(config);
     let active = this.activeCount();
     let noCapacity: string | null = null;
+    const capacityState: CapacityState = {};
     this.waitingSeen.clear();
     const views: FillLineView[] = [];
     const unmatchedThisCheck: FillUnmatchedReportView[] = [];
@@ -1148,6 +1174,7 @@ export class AgentsFill {
         }
         await hold("refused", reason);
         await ask(latest, fillRefusedKey(task, release?.id ?? "0", latest?.id ?? null), {
+          code: "probe_failed",
           question,
           context,
           startLabel: "Start it again",
@@ -1226,6 +1253,7 @@ export class AgentsFill {
           const reason = `its run ${short(latest.id)} lost its claim (${oneLine(latest.detail)}), not released by you: fill leaves the task to you`;
           await hold("owner", reason, latest.id);
           await ask(latest, fillDecisionKey(task, latest.id), {
+            code: "repeated_failure",
             question: `${agent} is paused on ${task}: its run lost its claim to the task, and you did not release it`,
             context: runs,
           });
@@ -1246,6 +1274,7 @@ export class AgentsFill {
           continue;
         }
         await ask(latest, fillDecisionKey(task, latest.id), {
+          code: "repeated_failure",
           question: `${agent} is paused on ${task}: ${howItEnded(latest)}`,
           context: [
             ...runs,
@@ -1264,6 +1293,7 @@ export class AgentsFill {
         const reason = `blocked: ${oneLine(status.line)}: fill leaves the task to you (release the hold once it is unblocked)`;
         await hold("blocked", reason, latest.id);
         await ask(latest, fillDecisionKey(task, latest.id, "blocked"), {
+          code: "blocked_reported",
           question: `${agent} is paused on ${task}: it reported the task blocked`,
           context: [`Run ${short(latest.id)} ended ${iso(latest.endedAt ?? latest.requestedAt)} on this line:`, "", ...asData(status.line)],
           startConsequences: `Fill starts ${task} for ${agent} again on its next check: choose this once what blocked it is cleared.`,
@@ -1280,6 +1310,7 @@ export class AgentsFill {
           run.id,
         );
         await ask(run, fillDecisionKey(task, run.id), {
+          code: "exit0_no_report",
           question: `${agent} is paused on ${task}: its last ${count} run(s) ended without reporting it done`,
           context: [
             "Runs:",
@@ -1345,6 +1376,7 @@ export class AgentsFill {
             view,
           );
           await ask(latest, waitingKey, {
+            code: "fill_waiting",
             question: `${agent} is paused on ${task}: it has waited on ${on} since ${iso(streakStart)}`,
             context: [
               `Run ${short(latest.id)} ended ${iso(since)} on this line:`,
@@ -1429,6 +1461,13 @@ export class AgentsFill {
         await hold("max_active", `max_active: ${active} run(s) fill started are active (max_active ${settings.maxActive})`);
         continue;
       }
+      // Native capacity checks (per-agent and per-task, based on class and heavy work)
+      const nativeCapacity = await this.checkNativeCapacity(agent, task, capacityState);
+      if (nativeCapacity !== null) {
+        await hold(nativeCapacity.hold, nativeCapacity.reason);
+        continue;
+      }
+      // Legacy capacity_cmd check (same for all agents)
       if (noCapacity !== null) {
         await hold("capacity", noCapacity);
         continue;
@@ -1459,6 +1498,27 @@ export class AgentsFill {
         }
       }
 
+      // A run of the task the store doesn't know (one reconciliation couldn't adopt) still runs: never a second
+      const other = await this.options.taskProcess(task);
+      if (other) {
+        const reason = `pid ${other.pid} runs ${task} already (a run prompt file of the task is on its command line), though no run here owns it`;
+        await this.options.record(
+          "fill_conflict",
+          {
+            agent,
+            task,
+            summary: `fill: ${agent} doesn't start ${task}: ${reason}`,
+            // Not its command line: another program's arguments are not Lair's to store
+            evidence: [reason],
+            data: { pid: other.pid },
+            dedupeKey: `fill_conflict:${task}:${other.pid}`,
+          },
+          probes.clock.now(),
+        );
+        await hold("conflict", reason);
+        continue;
+      }
+
       let run: AgentRunView;
       try {
         run = await this.options.requestRun({ agent, task, prompt: promptText });
@@ -1477,6 +1537,7 @@ export class AgentsFill {
         continue;
       }
       active++;
+      if (capacityState.heavy !== undefined && this.isHeavyTask(task)) capacityState.heavy++;
       show("started", `started run ${short(run.id)}`, run.id);
       await this.options.record(
         "fill_started",
@@ -1665,11 +1726,13 @@ export class AgentsFill {
           {
             id: DECISION_FILL_START,
             label: ask.startLabel ?? "Start it again",
+            effect: "reversible",
             consequences: ask.startConsequences ?? `Fill starts ${task} for ${agent} again on its next check, counting from zero.`,
           },
           {
             id: DECISION_FILL_KEEP,
             label: "Keep it paused",
+            effect: "reversible",
             consequences:
               ask.keepConsequences ??
               `Fill leaves ${task} paused until you start a run of it, or release it in Work. Nothing more is asked about it.`,
@@ -1680,6 +1743,15 @@ export class AgentsFill {
           ask.why ??
           "A run that stops the same way again and again usually needs a change a restart won't make (a usage limit, a missing done line, a prompt).",
         reversible: true,
+        structure: {
+          class: ask.code === "probe_failed" || ask.code === "fill_waiting" ? "agents.cannot_start" : "agents.gave_up",
+          evidence: {
+            code: ask.code,
+            facts: { agent, task, attempt_count: latest?.attempt ?? null, last_exit: latest?.exitCode ?? null },
+            cause_cleared: false,
+            linked_issue: null,
+          },
+        },
       },
       latest,
     );
@@ -2028,6 +2100,118 @@ export class AgentsFill {
       this.polled.set(key, now);
       return { state: "absent" };
     }
+  }
+
+  /**
+   * Native capacity check for one agent starting one task: null when there is capacity, otherwise the hold and
+   * why. Nothing is probed when no capacity limit is configured. The machine is read once per check (`state`),
+   * and the heavy-work count once, kept current as this check starts heavy runs. A probe that fails or returns
+   * nonsense holds ("capacity_probe"): fill never starts agents on a machine it could not measure.
+   */
+  private async checkNativeCapacity(
+    agent: string,
+    task: string,
+    state: CapacityState,
+  ): Promise<{ hold: FillHold; reason: string } | null> {
+    const cap = this.options.settings.capacity;
+    const wantsLoad = cap.loadPerCpuMax !== undefined;
+    const wantsMemory = cap.memory.availableMinPct !== undefined;
+    const wantsPressure = cap.memory.pressureMax !== undefined;
+    const wantsHeavy = cap.heavyWork.detect.length > 0;
+    if (!wantsLoad && !wantsMemory && !wantsPressure && !wantsHeavy) return null;
+
+    const sysInfo = this.options.probes.systemInfo;
+    state.machine ??= (async () => {
+      const memory =
+        wantsMemory || wantsPressure
+          ? await sysInfo.memory({ pressure: wantsPressure, timeoutMs: CAPACITY_PROBE_TIMEOUT_MS })
+          : undefined;
+      return { cpus: sysInfo.cpuCount(), load: sysInfo.loadAvg1(), total: sysInfo.totalMemory(), memory };
+    })();
+    const machine = await state.machine;
+    const numCpus = machine.cpus;
+    const load1 = machine.load;
+    const totalMem = machine.total;
+    const available = machine.memory?.available;
+    const pressure = machine.memory?.pressurePct;
+
+    const availablePct =
+      available !== undefined && Number.isFinite(available) && totalMem > 0 ? (available / totalMem) * 100 : undefined;
+    const probeFailed = (what: string) => ({ hold: "capacity_probe" as const, reason: `no capacity: ${what} could not be read` });
+    if (wantsLoad && !(Number.isFinite(numCpus) && numCpus > 0 && Number.isFinite(load1))) return probeFailed("CPU count or load");
+    if (wantsMemory && availablePct === undefined) {
+      return probeFailed("available memory");
+    }
+    if (wantsPressure && !(pressure !== undefined && Number.isFinite(pressure))) return probeFailed("memory pressure");
+
+    const loadPerCpu = wantsLoad ? load1 / numCpus : undefined;
+    state.heavy ??= wantsHeavy ? this.countHeavyWork() : 0;
+    const heavyAtLimit = wantsHeavy && state.heavy >= cap.heavyWork.maxActive;
+    const agentClass = getAgentClass(cap, agent);
+
+    this.lastCapacity = {
+      load: wantsLoad ? load1 : undefined,
+      cpus: wantsLoad ? numCpus : undefined,
+      loadPerCpu,
+      loadPerCpuMax: cap.loadPerCpuMax,
+      loadOverLimit: loadPerCpu !== undefined && cap.loadPerCpuMax !== undefined && loadPerCpu > cap.loadPerCpuMax,
+      memory:
+        availablePct !== undefined
+          ? {
+              total: totalMem,
+              available: available as number,
+              availablePct,
+              underMin: cap.memory.availableMinPct !== undefined && availablePct < cap.memory.availableMinPct,
+              availableMinPct: cap.memory.availableMinPct,
+              pressurePct: pressure,
+              pressureMax: cap.memory.pressureMax,
+            }
+          : undefined,
+      heavyWork: wantsHeavy ? { active: state.heavy, maxActive: cap.heavyWork.maxActive, atLimit: heavyAtLimit } : undefined,
+    };
+
+    // Memory checks hold local and remote agents alike
+    if (availablePct !== undefined && cap.memory.availableMinPct !== undefined && availablePct < cap.memory.availableMinPct) {
+      return {
+        hold: "capacity_memory",
+        reason: `no capacity: available memory ${availablePct.toFixed(1)}% is below capacity.memory.available_min_pct (${cap.memory.availableMinPct}%)`,
+      };
+    }
+    if (pressure !== undefined && cap.memory.pressureMax !== undefined && pressure > cap.memory.pressureMax) {
+      return {
+        hold: "capacity_memory",
+        reason: `no capacity: memory pressure ${pressure.toFixed(1)}% exceeds capacity.memory.pressure_max (${cap.memory.pressureMax}%)`,
+      };
+    }
+
+    // Load holds local agents only
+    if (agentClass === "local" && loadPerCpu !== undefined && cap.loadPerCpuMax !== undefined && loadPerCpu > cap.loadPerCpuMax) {
+      return {
+        hold: "capacity_load",
+        reason: `no capacity: load per CPU ${loadPerCpu.toFixed(2)} exceeds capacity.load_per_cpu_max (${cap.loadPerCpuMax})`,
+      };
+    }
+
+    // Heavy work holds only a task that is itself heavy, whatever agent runs it
+    if (heavyAtLimit && this.isHeavyTask(task)) {
+      return {
+        hold: "capacity_heavy",
+        reason: `no capacity: ${state.heavy} heavy work item(s) active (capacity.heavy_work.max_active is ${cap.heavyWork.maxActive})`,
+      };
+    }
+
+    return null;
+  }
+
+  /** True when the task id matches one of the heavy_work.detect globs. */
+  private isHeavyTask(task: string): boolean {
+    return this.options.settings.capacity.heavyWork.detectPatterns.some((pattern) => pattern.test(task));
+  }
+
+  /** Active runs whose task matches a heavy_work.detect glob. */
+  private countHeavyWork(): number {
+    const { store, project } = this.options;
+    return store.activeRuns(project).filter((run) => this.isHeavyTask(run.task)).length;
   }
 
   /** null when capacity_cmd exits 0; otherwise why fill holds (a timeout holds too). */
