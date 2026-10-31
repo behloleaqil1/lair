@@ -618,6 +618,80 @@ export class GateRechecks {
     return { text: `re-check ${n} (${kind}) in the gate system`, holdRoute };
   }
 
+  /**
+   * Queue an environment recovery re-check through the gate system (M2).
+   * These don't count against max_per_result (M4: separate from normal infra re-checks).
+   */
+  queueEnvironmentRecovery(record: TriageRecord, steps: string[], tests: TestRef[], patternId: string, s: Section): void {
+    const { host } = this;
+    const cfg = this.cfg;
+    const now = host.now();
+    const blocked = this.blocked();
+
+    const kind: GateRecheckKind = tests.length > 0 ? "failed_tests" : "same";
+    const testIds = tests.map(recheckTestId);
+    const reason = `environment:${patternId}`;
+
+    const base: NewGateRecheck = {
+      project: host.project,
+      recordId: record.id,
+      rootId: record.id,
+      gateId: record.gateId,
+      sha: record.sha,
+      pipelineId: record.pipelineId,
+      branch: record.branch,
+      causes: ["infra"],
+      kind,
+      reason,
+      tests: testIds,
+      keys: tests.map((t) => t.key),
+      signatures: record.causes.map((c) => c.cause.signature),
+      attempt: 1, // First attempt after environment recovery
+      status: "refused",
+      detail: "",
+      holdRoute: false,
+    };
+
+    // Build the command
+    const built = buildRecheckArgv(
+      cfg.command,
+      {
+        project: host.project,
+        sha: record.sha,
+        pipeline: record.pipelineId,
+        branch: record.branch,
+        result_id: record.gateId,
+        reason,
+        kind,
+        tests: testIds,
+      },
+      cfg.maxTests,
+    );
+
+    if ("error" in built) {
+      host.action({ recordId: record.id }, "recheck", "skipped", `environment recovery re-check refused: ${built.error}`);
+      return;
+    }
+
+    const what = kind === "same"
+      ? `${record.pipelineId || "its pipeline"} at ${short(record.sha)}`
+      : `${testIds.length} test(s) at ${short(record.sha)}`;
+    const detail = `environment recovery (${patternId}): ${what}`;
+
+    const row = this.rows.create(
+      { ...base, status: blocked ? "would" : "waiting", detail, argv: built.argv, holdRoute: false },
+      now,
+      now, // No cool-down for environment recovery
+    );
+
+    if (blocked) {
+      host.action({ recordId: record.id }, "recheck", "planned", `would re-check after environment recovery: ${detail} (not run: ${blocked})`, built.argv);
+      s.events.push({ type: "triage.recheck_would", data: { recheck: row } });
+    } else {
+      host.action({ recordId: record.id }, "recheck", "waiting", `re-check after environment recovery: ${detail}`, built.argv);
+    }
+  }
+
   /** Why the failed tests can't be the re-check's selection, or null. */
   private testsProblem(used: { c: ClassifiedCause }[], tests: TestRef[]): string | null {
     if (used.some((x) => x.c.cause.tests.length === 0)) return "a cause names no failed test";

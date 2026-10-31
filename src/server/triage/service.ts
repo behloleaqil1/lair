@@ -800,7 +800,15 @@ export class TriageService {
 
       const record = store.getRecord(id)!;
       if (failed && purpose !== "bisect") {
-        this.act(record, classified, origin, this.gateRechecks.plan(record, classified, linked, context.loadPerCore, s, plainNote), s);
+        // Check for environment outage BEFORE planning gate re-checks
+        // (M1: environment classification must happen before gateRechecks.plan)
+        const envResult = this.checkEnvironmentOutage(record, classified);
+        const isEnvActMode = envResult.isEnvironment && settings.environment.mode === "act";
+
+        // Plan gate re-check only if NOT an environment outage in act mode
+        const gate = isEnvActMode ? null : this.gateRechecks.plan(record, classified, linked, context.loadPerCore, s, plainNote);
+
+        this.act(record, classified, origin, gate, envResult, s);
       } else if (failed) {
         store.updateRecord(id, { verdict: overallClass(classified) ?? null, blocking: false, resolution: "bisect probe" });
       }
@@ -955,8 +963,18 @@ export class TriageService {
 
   // ============ ACTIONS PER CLASS ============
 
-  /** `gate`: the gate system's re-check (gate-recheck.ts), null when triage.recheck.mode is off */
-  private act(record: TriageRecord, classified: ClassifiedCause[], origin: TriageRecord | null, gate: GatePlan | null, s: Section): void {
+  /**
+   * `gate`: the gate system's re-check (gate-recheck.ts), null when triage.recheck.mode is off
+   * `envResult`: environment classification result (already computed before gate planning)
+   */
+  private act(
+    record: TriageRecord,
+    classified: ClassifiedCause[],
+    origin: TriageRecord | null,
+    gate: GatePlan | null,
+    envResult: { isEnvironment: boolean; patternId?: string; probe?: string[] },
+    s: Section,
+  ): void {
     const { store, settings } = this.o;
     const of = (cls: Verdict["class"]) => classified.filter((c) => c.verdict.class === cls);
     const infra = of("infra");
@@ -967,8 +985,7 @@ export class TriageService {
     if (infra.length > 0) {
       blocking = true;
 
-      // Check if this is an environment outage (all infra, no code, all steps match env patterns)
-      const envResult = this.checkEnvironmentOutage(record, infra, code);
+      // Environment classification already done before this (M1: must happen before gateRechecks.plan)
       const isEnvActMode = envResult.isEnvironment && settings.environment.mode === "act";
 
       if (envResult.isEnvironment && settings.environment.mode === "observe") {
@@ -1034,14 +1051,21 @@ export class TriageService {
   /**
    * Check if a result represents an environment outage.
    * Returns the matched pattern and probe if it's an environment outage.
+   * Note: code failures are checked by the caller before calling this.
    */
   private checkEnvironmentOutage(
     record: TriageRecord,
-    infra: ClassifiedCause[],
-    code: ClassifiedCause[],
+    classified: ClassifiedCause[],
   ): { isEnvironment: boolean; patternId?: string; probe?: string[] } {
+    const of = (cls: Verdict["class"]) => classified.filter((c) => c.verdict.class === cls);
+    const infra = of("infra");
+    const code = of("code");
+
     // Not an environment outage if there are code failures
     if (code.length > 0) return { isEnvironment: false };
+
+    // Not an environment outage if there are no infra failures
+    if (infra.length === 0) return { isEnvironment: false };
 
     const { settings } = this.o;
     if (settings.environment.patterns.length === 0) return { isEnvironment: false };
@@ -1132,32 +1156,65 @@ export class TriageService {
 
   /**
    * Run the probe for an environment wait. Called from the outbox.
+   * M3: Probe runs OUTSIDE the serial queue with a timeout, so a hanging probe
+   * doesn't block other triage decisions.
    */
   private async runEnvironmentProbe(waitId: string): Promise<void> {
-    await this.serial(async () => {
-      const { store, settings } = this.o;
+    // First, get the wait info (inside serial to ensure consistency)
+    const waitInfo = await this.serial(async () => {
+      const { store } = this.o;
       const wait = store.getEnvironmentWait(waitId);
-      if (!wait || wait.status !== "waiting") return;
+      if (!wait || wait.status !== "waiting") return null;
+      return {
+        id: wait.id,
+        probe: JSON.parse(wait.probe) as string[],
+        probeTimeoutSeconds: wait.probe_timeout_seconds,
+        patternId: wait.pattern_id,
+        probePassCount: wait.probe_pass_count,
+        currentBackoffSeconds: wait.current_backoff_seconds,
+      };
+    });
 
-      const probe = JSON.parse(wait.probe) as string[];
-      const nowMs = this.now();
-      const nowIso = this.iso(nowMs);
+    if (!waitInfo) return;
 
-      let result: { ok: boolean; output: string };
-      try {
-        const output = await this.o.probes.runner.run(probe);
-        result = { ok: output.code === 0, output: (output.stdout + output.stderr).slice(0, 500) };
-      } catch (e) {
-        result = { ok: false, output: message(e).slice(0, 500) };
+    // Run the probe OUTSIDE the serial queue with proper timeout (M3)
+    const timeoutMs = waitInfo.probeTimeoutSeconds * 1000;
+    let result: { ok: boolean; output: string };
+    try {
+      const output = await withTimeout(
+        (async () => {
+          const out = await this.o.probes.runner.run(waitInfo.probe, { timeoutMs });
+          return { ok: true as const, detail: "success", output: out };
+        })(),
+        timeoutMs + 5000, // Grace period for the runner's own timeout
+      );
+      if (output.ok && output.output) {
+        result = { ok: output.output.code === 0, output: (output.output.stdout + output.output.stderr).slice(0, 500) };
+      } else {
+        result = { ok: false, output: output.detail.slice(0, 500) };
       }
+    } catch (e) {
+      result = { ok: false, output: message(e).slice(0, 500) };
+    }
 
-      const probePassCount = result.ok ? wait.probe_pass_count + 1 : 0;
-      const newBackoff = result.ok ? wait.current_backoff_seconds : nextBackoff(wait.current_backoff_seconds, settings.environment.maxBackoffSeconds);
-      const nextProbeAt = this.iso(nowMs + newBackoff * 1000);
-
-      store.updateEnvironmentWaitProbe(waitId, nowIso, result, probePassCount, nextProbeAt, newBackoff);
-
+    // Update the store and take action (inside serial + commit)
+    await this.serial(async () =>
       this.commit((s) => {
+        const { store, settings } = this.o;
+        const wait = store.getEnvironmentWait(waitId);
+        if (!wait || wait.status !== "waiting") return;
+
+        const nowMs = this.now();
+        const nowIso = this.iso(nowMs);
+
+        const probePassCount = result.ok ? wait.probe_pass_count + 1 : 0;
+        const newBackoff = result.ok
+          ? wait.current_backoff_seconds
+          : nextBackoff(wait.current_backoff_seconds, settings.environment.maxBackoffSeconds);
+        const nextProbeAt = this.iso(nowMs + newBackoff * 1000);
+
+        store.updateEnvironmentWaitProbe(waitId, nowIso, result, probePassCount, nextProbeAt, newBackoff);
+
         if (result.ok) {
           // Probe passed! Resolve the wait and trigger re-checks
           this.resolveEnvironmentWait(wait, s);
@@ -1170,15 +1227,17 @@ export class TriageService {
             `environment probe failed for ${wait.pattern_id} (wait ${wait.id.slice(0, 8)}): ${result.output.slice(0, 200)}`,
           );
         }
-      });
-    });
+      }),
+    );
   }
 
   /**
    * Resolve an environment wait after its probe passes. Triggers re-checks for all waiting gates.
+   * M2: Recovery re-checks go through the gate system when available.
+   * M4: Use purpose "environment" so they don't count against max_retries.
    */
   private resolveEnvironmentWait(wait: EnvironmentWaitRow, s: Section): void {
-    const { store, project } = this.o;
+    const { store, project, settings } = this.o;
     const nowIso = this.iso();
 
     store.resolveEnvironmentWait(wait.id, "resolved", nowIso);
@@ -1193,22 +1252,30 @@ export class TriageService {
       `environment recovered: ${wait.pattern_id} (wait ${wait.id.slice(0, 8)}), triggering re-checks for ${gates.length} gate(s)`,
     );
 
+    // Check if the gate system is available (M2: recovery re-checks should go through it)
+    const gateSystemAvailable = settings.gateRecheck.mode === "act" && settings.gateRecheck.command;
+
     // Trigger re-checks for each waiting gate
-    // These re-checks don't count against max_per_result (they're environment-triggered)
+    // M4: These use purpose "environment" so they don't count against max_retries
     for (const gate of gates) {
       const record = store.getRecord(gate.recordId);
       if (!record) continue;
 
-      // Create re-check with special purpose to indicate it's from environment recovery
       const tests = uniqueTests(record.causes.flatMap((c) => c.cause.tests));
       let steps = unique(record.causes.flatMap((c) => (c.cause.step ? [c.cause.step] : [])));
       if (tests.length === 0 && steps.length === 0) steps = record.failedSteps;
 
-      if (tests.length > 0 || steps.length > 0) {
+      if (tests.length === 0 && steps.length === 0) continue;
+
+      if (gateSystemAvailable) {
+        // M2: Use the gate system for recovery re-checks
+        this.gateRechecks.queueEnvironmentRecovery(record, steps, tests, wait.pattern_id, s);
+      } else {
+        // Fall back to Lair's re-check system (with environment purpose, M4)
         store.createRecheck(
           {
             project,
-            purpose: "infra",
+            purpose: "environment",
             recordId: record.id,
             sha: record.sha,
             branch: record.branch,
@@ -2304,6 +2371,69 @@ export class TriageService {
         }
         // An escalated re-check in the gate system (gate-recheck.ts)
         if (subject.startsWith("recheck:")) this.gateRechecks.followDecision(subject.slice("recheck:".length), resolution.optionId, by, s);
+
+        // S2: Handle environment wait expiry decisions
+        if (subject.startsWith("env-wait:")) {
+          const waitId = subject.slice("env-wait:".length);
+          const wait = store.getEnvironmentWait(waitId);
+          if (!wait) return;
+
+          if (resolution.optionId === "rerun-anyway") {
+            // Trigger re-checks for all gates immediately
+            this.action({}, "decision", "done", `answered "rerun-anyway": triggering re-checks for all waiting gates`, undefined, undefined, by);
+            // Mark as resolved and trigger re-checks (in the same transaction via s)
+            if (wait.status === "expired") {
+              store.resolveEnvironmentWait(waitId, "resolved", this.iso());
+              const gates = store.getEnvironmentWaitGates(waitId);
+              for (const gate of gates) {
+                const record = store.getRecord(gate.recordId);
+                if (!record) continue;
+                const tests = uniqueTests(record.causes.flatMap((c) => c.cause.tests));
+                let steps = unique(record.causes.flatMap((c) => (c.cause.step ? [c.cause.step] : [])));
+                if (tests.length === 0 && steps.length === 0) steps = record.failedSteps;
+                if (tests.length === 0 && steps.length === 0) continue;
+                const gateSystemAvailable = this.settings.gateRecheck.mode === "act" && this.settings.gateRecheck.command;
+                if (gateSystemAvailable) {
+                  this.gateRechecks.queueEnvironmentRecovery(record, steps, tests, wait.pattern_id, s);
+                } else {
+                  store.createRecheck(
+                    {
+                      project: this.project,
+                      purpose: "environment",
+                      recordId: record.id,
+                      sha: record.sha,
+                      branch: record.branch,
+                      gateId: record.gateId,
+                      steps,
+                      tests: tests.map((t) => t.id),
+                      classes: unique(tests.map(testClass)),
+                      attempt: 0,
+                      status: "waiting_capacity",
+                      reason: "rerun-anyway decision",
+                      createdAt: this.iso(),
+                    },
+                    this.now(),
+                  );
+                  this.action({ recordId: record.id }, "recheck", "waiting", `re-check queued (rerun-anyway decision)`);
+                }
+              }
+              s.dispatch = true;
+            }
+          } else if (resolution.optionId === "fix-environment") {
+            // Reopen the wait for probing (mark as waiting again)
+            this.action({}, "decision", "done", `answered "fix-environment": resuming probe polling`, undefined, undefined, by);
+            if (wait.status === "expired") {
+              const nowMs = this.now();
+              const nextProbeAt = this.iso(nowMs + this.settings.environment.initialBackoffSeconds * 1000);
+              const expiresAt = this.iso(nowMs + this.settings.environment.maxWaitMinutes * 60 * 1000);
+              store.reopenEnvironmentWait(waitId, nextProbeAt, expiresAt, this.settings.environment.initialBackoffSeconds);
+              s.dispatch = true;
+            }
+          } else {
+            // ignore or other
+            this.action({}, "decision", "done", `answered "${resolution.optionId}": no action taken`, undefined, undefined, by);
+          }
+        }
       }),
     );
     await this.drain();

@@ -162,7 +162,7 @@ export interface TriageAction {
   at: string;
 }
 
-export type RecheckPurpose = "infra" | "bisect";
+export type RecheckPurpose = "infra" | "bisect" | "environment";
 
 /**
  * waiting_capacity: queued until there is capacity; dispatching: the

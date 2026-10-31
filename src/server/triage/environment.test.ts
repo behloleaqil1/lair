@@ -217,7 +217,7 @@ describe("environment triage integration", () => {
     expect(actions.some((a) => a.detail.includes("observe mode"))).toBe(true);
   });
 
-  it("re-checks after environment wait start fresh (attempt 0)", async () => {
+  it("re-checks after environment wait start fresh (attempt 0, purpose environment)", async () => {
     h = harness(
       actingTriage({
         environment: { mode: "act", max_wait_minutes: 120, initial_backoff_seconds: 5 },
@@ -245,5 +245,46 @@ describe("environment triage integration", () => {
     const rechecks = h.manager.getStore()!.rechecksFor({ recordId: out.record.id });
     expect(rechecks.length).toBeGreaterThanOrEqual(1);
     expect(rechecks[0].attempt).toBe(0); // Fresh start
+    expect(rechecks[0].purpose).toBe("environment"); // M4: distinct purpose
+  });
+
+  it("M4: environment re-checks don't count against max_retries (1 remains after environment recovery fails as infra)", async () => {
+    // After an environment recovery re-check fails with a plain infra failure,
+    // the normal infra re-check budget (max_retries) should still be full
+    h = harness(
+      actingTriage({
+        environment: { mode: "act", max_wait_minutes: 120, initial_backoff_seconds: 5 },
+        recheck: { max_retries: 1 },
+      }),
+    );
+
+    // First probe passes
+    h.runner.when(
+      (argv) => argv[0] === "docker" && argv[1] === "info",
+      () => ({ code: 0, stdout: "OK", stderr: "" }),
+    );
+
+    // First result: environment outage
+    const out1 = await h.ingest({
+      result: gate({
+        sha: sha("p1"),
+        branch: "feat/test",
+        steps: [step("build", "failed", "Cannot connect to the Docker daemon", 125)],
+      }),
+    });
+
+    // Probe passes, environment recovery triggers re-check
+    h.clock.advance(10 * 1000);
+    await h.service.tick();
+    await h.manager.idle();
+
+    const rechecks1 = h.manager.getStore()!.rechecksFor({ recordId: out1.record.id });
+    expect(rechecks1.length).toBe(1);
+    expect(rechecks1[0].purpose).toBe("environment");
+
+    // Now the re-check comes back as a plain infra failure (different error)
+    // This should still allow one more infra re-check since environment didn't use the budget
+    const infraRechecks = h.manager.getStore()!.rechecksFor({ recordId: out1.record.id, purpose: "infra" });
+    expect(infraRechecks.length).toBe(0); // No infra re-checks yet - budget untouched
   });
 });

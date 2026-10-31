@@ -1267,6 +1267,15 @@ export class TriageStore {
     this.db.prepare(`UPDATE triage_env_waits SET status = ?, resolved_at = ? WHERE id = ?`).run(status, resolvedAt, id);
   }
 
+  /** Reopen an expired wait for continued probing (S2: fix-environment decision). */
+  reopenEnvironmentWait(id: string, nextProbeAt: string, expiresAt: string, currentBackoffSeconds: number): void {
+    this.db
+      .prepare(
+        `UPDATE triage_env_waits SET status = 'waiting', resolved_at = NULL, next_probe_at = ?, expires_at = ?, current_backoff_seconds = ? WHERE id = ?`,
+      )
+      .run(nextProbeAt, expiresAt, currentBackoffSeconds, id);
+  }
+
   /** Get environment waits that are ready for their next probe attempt. */
   environmentWaitsReadyForProbe(project: string, now: string): EnvironmentWaitRow[] {
     return this.db
