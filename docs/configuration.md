@@ -2762,119 +2762,106 @@ Events: `planner.changed`, `planner.run_started`, `planner.run_finished`, `plann
 
 ## Tracker
 
-The tracker module keeps GitHub issues, Projects v2 boards and milestones in sync with Lair's tasks, runs and PRs. It is off unless a project sets `tracker.enabled: true`. Design: [docs/design/tracker.md](design/tracker.md).
+The tracker keeps a project's GitHub issues, Projects (v2) boards and milestones in step with its tasks, runs and pull requests: a new task gets its issue, a run moves the card to In progress with the agent, a PR closing the issue moves it to In review, the merge or the planner's done line moves it to Done and closes the issue, a blocked task gets a label and one comment. It is off unless a project sets `tracker.enabled: true`, and then it starts in **observe** mode: it records what it would change and sends nothing. Design: [docs/design/tracker.md](design/tracker.md).
 
 ```yaml
 tracker:
   enabled: true
-  mode: observe  # off | observe | act
-  repo: owner/repo  # or inherited from project.github
-  project:
-    owner: my-org
-    number: 1
-  status_field: Status
-  status_options:
-    backlog: Backlog
-    ready: Ready
-    in_progress: In progress
-    in_review: In review
-    done: Done
-  agent_field: Agent
-  create_issues_for_new_tasks: false
-  labels: [enhancement]
-  tier_labels:
-    red: "tier: red"
-    amber: "tier: amber"
-    green: "tier: green"
-  milestones:
-    from: label
-    close_when_complete: true
-  redact_patterns:
-    - "/private/"
-  reconcile_interval_seconds: 900
-  write_budget_per_minute: 30
-  token_env: GITHUB_TOKEN
-  api_url: https://api.github.com
+  mode: observe                 # observe (records only) | act (changes GitHub)
+  create_issues_for_new_tasks: true
+  repos:
+    - repo: example-org/web
+      default: true             # tasks no rule takes go here
+      project: { owner: example-org, number: 3 }   # the board: its owner and the number in its URL
+      agent_field: Agent        # a text field on the board (optional)
+      labels: [lair]            # on every issue Lair creates here
+      milestones:
+        close_when_complete: true
+        rules:
+          - { tasks: ["web-*"], milestone: "M2: Launch" }
+    - repo: example-org/api
+      project: { owner: example-org, number: 4 }
+      match:
+        tasks: ["api-*"]        # task id globs
+        agents: [worker-b]      # or the agent of the task's line
+  redact_patterns: ["codename-\\w+"]
 ```
 
-### Mode
+**Which repository a task goes to.** One project may track several repositories, each with its own board and milestone rules. A task goes to the repository its line names (`repo:owner/name` in the description, or an issue URL or `owner/name#N` of a tracked repository), else to the first repository whose `match` takes it (a task id glob, or the line's agent), else to the `default` one. With one repository it is the default. A task no repository takes is not tracked (the status shows why).
 
-- `off`: Module is loaded but does nothing.
-- `observe`: Records what would be written but sends nothing to GitHub. Useful for dry-run verification before enabling.
-- `act`: Writes to GitHub (moves cards, closes issues, adds labels).
+**Which issue a task is linked to.** In this order: the issue its line names on purpose (`Issue: #N`, `Closes #N`, `Fixes #N`, an issue URL or `owner/name#N` of a tracked repository; a bare `#N` elsewhere in the text is never taken), if it is open and not a pull request; the issue an earlier create made for it (found by its marker, see below); an open issue (not a pull request) whose title is exactly the task id or the title Lair would give it (`<task>: <description>`); else, with `create_issues_for_new_tasks`, a new issue with that title, the redacted description, the repository's `labels` and the milestone its rules give.
 
-### Linking tasks to issues
+**Observe and act.**
 
-A task is linked to an issue by:
+| | observe (the default) | act |
+|---|---|---|
+| Reads GitHub (scopes, boards, issues, PRs, milestones) | yes | yes |
+| Links tasks to existing issues (in Lair's own store) | yes | yes |
+| Creates issues, adds cards, moves cards, sets the Agent field, labels, comments, closes issues, closes or reopens milestones | no: each is recorded as `would_send` in the audit, once (a repeat counts up the same row) | yes, within `write_budget_per_minute`, each one audited |
 
-1. The task description naming `Closes #N`, `#N` or an issue URL.
-2. An exact title match (adopt an existing issue, so no duplicate is created).
-3. Creating a new issue when `create_issues_for_new_tasks: true` and `mode: act`.
+The client itself is read-only in observe mode: a write is refused before anything is sent. Switching to act (Settings or the project file) reloads the tracker live; what observe recorded is not replayed, the next reconcile makes GitHub match.
 
-Links persist across restarts in `data/tracker.db`.
+**What moves the cards.**
 
-### Event-driven updates
+| Lair event (as its module emits it) | On GitHub |
+|---|---|
+| `planner.changed` `{op: "add", outcome: "applied"}` | the task is linked (or its issue created); the card goes to Ready if agents.fill can start it (its agent is in `agents.fill.agents` and fill is on), else Backlog |
+| `agent.run.started` `{kind: "started", task, agent}` | In progress, the Agent field set; a blocked label goes |
+| `review.submitted` `{pr}` | the PR is read: the tasks it closes (or whose id ends its branch name) go to In review |
+| `review.merged` `{pr}` | the PR is read: those tasks go to Done and their issues are closed as completed |
+| `planner.changed` `{op: "mark_done"}` | Done, the issue closed as completed (after the card moved) |
+| `planner.changed` `{op: "drop"}` | the issue closed as not planned |
+| `planner.blocked` `{task, class, rule}` | the `blocked_label` and one comment per reason (kept, so a repeat or a restart posts nothing) |
+| `planner.changed` `{op: "unblock"}` | the blocked label goes |
 
-| Event | Board action |
-|-------|-------------|
-| `agent.run.started` | Move to In progress, set Agent field |
-| `agent.run.ended` (done) | Move to Done, close issue |
-| `agent.run.ended` (blocked) | Add `blocked` label, comment with reason |
-| `review.merged` | Move to Done, close linked issue |
-| `planner.changed` (added) | Link task, move to Backlog or Ready |
-| `planner.changed` (done) | Move to Done, close issue |
+Only `outcome: "applied"` changes count (`planned` is the planner's own observe mode). An `agent.run.ended` changes nothing: an exit is not a done task. Events never wait on GitHub: a handler queues a job and returns, the jobs of a project run one at a time on a bounded queue (500), and a job dropped when it is full is caught up by the next reconcile.
 
-All updates are idempotent: a second event for the same state is a no-op.
+**Reconcile** (at start, then every `reconcile_interval_seconds`, and on the owner's request): links the tasks of the tasks file that have none yet (at most 10 a cycle), finishes the ones marked done there, moves the cards of open PRs to In review, adds missing cards, puts back cards moved by hand (counted as drift fixed only when the fix was sent), retries closes that failed, and closes or reopens milestones. The next one is scheduled when it ends, so two never overlap.
 
-### Reconciliation
+**Milestones.** With `close_when_complete` (the default), an open milestone with closed issues and no open one is closed, and a closed one with an open issue is reopened. Only its state is sent: its title, description and due date are the owner's. Lair never creates a milestone; a rule naming one that does not exist is reported and the issue is created without it.
 
-A periodic full reconcile (default every 15 minutes) fixes drift: if someone moves a card by hand to the wrong column, reconcile moves it back to the expected status. Every drift fix is counted and auditable.
+**Idempotent creates.** The create is recorded (pending) before it is sent, and the issue's body ends with a hidden marker (`<!-- lair-task:<hash> -->`). If the answer is lost (a timeout, a restart), the next attempt lists the repository's issues changed since then (the issues list, which does not lag behind as search does) and links the one with the marker instead of creating another. Creates count against the write budget.
 
-### Milestones
+**Redaction.** Every text sent (titles, bodies, comments, the Agent field) is redacted first by built-in rules, then by `redact_patterns` (case-insensitive regular expressions): the values of this process's secret-looking environment variables (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*KEY*`...), GitHub, OpenAI-style, Slack and AWS key shapes, private keys, `Bearer` tokens, credentials in URLs, `password=`/`token:` pairs, absolute paths (`/Users/...`, `/home/...`, `/tmp/...`, `C:\...`, `~/...`) and the home directory, email addresses and private network addresses. Titles are one line of at most 200 characters, bodies 3000, comments 600. A blocked comment carries only the planner's class and rule, never the agent's text.
 
-- Milestones with zero open issues are closed when `close_when_complete: true`.
-- A milestone is reopened if an issue under it reopens.
-- Due dates are the owner's: Lair never sets or changes them.
-
-### Security
-
-- The token never reaches agents.
-- Text from agents (descriptions, blocked reasons) is bounded (500 characters) and redacted before it goes to GitHub.
-- `redact_patterns` is applied to every outgoing text. Patterns are case-insensitive regular expressions.
+**The token.** `token_env` / `token_cmd`, else the project's `review.token_env` / `review.token_cmd`, else `GITHUB_TOKEN`; the tracker's variable is also kept from the update command, as review's is. A classic token needs `repo` (or `public_repo` for public repositories only) and `project` (observe mode reads boards with `read:project`); a fine-grained token needs Issues: read and write, Pull requests: read, and Projects: read and write on the board's owner (GitHub reports no scopes for it, so it is not checked up front). At start the tracker reads the token's scopes; a missing one stops its writes and raises **one** decision in the Decision Inbox (class `tracker.token_scopes`) listing them, with the option "I updated the token: check again". A 401, or a 403 that is not a rate limit, stops the writes too until the scopes are checked again. Every request has a timeout (`request_timeout_seconds`) and is cut short when the tracker stops. Rate limits (a 429, a 403 with `Retry-After` or `X-RateLimit-Remaining: 0`, a GraphQL `RATE_LIMITED`) stop every request until `Retry-After` or `X-RateLimit-Reset`; the time is kept across a restart.
 
 ### Tracker options
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `enabled` | boolean | `false` | Enable the tracker module |
-| `mode` | `off` \| `observe` \| `act` | `off` | How the tracker operates |
-| `repo` | string | (project.github) | GitHub owner/repo |
-| `project.owner` | string | — | Owner (user or org) of the Projects v2 board |
-| `project.number` | number | — | Project number (from its URL) |
-| `status_field` | string | `Status` | Name of the single-select Status field on the board |
-| `status_options` | object | see above | Maps internal status names to the board's option names |
-| `agent_field` | string | — | Name of the text field to show which agent is working |
-| `create_issues_for_new_tasks` | boolean | `false` | Create issues for tasks that have none |
-| `labels` | array | `[]` | Default labels for created issues |
-| `tier_labels` | object | — | Maps risk tiers (red, amber, green) to GitHub labels |
-| `milestones.from` | `label` \| `section` | `label` | Where milestone names come from |
-| `milestones.close_when_complete` | boolean | `true` | Close milestones with zero open issues |
-| `redact_patterns` | array | `[]` | Regular expressions for text to redact |
-| `reconcile_interval_seconds` | number | `900` | How often to run a full reconcile (60–86400) |
-| `write_budget_per_minute` | number | `30` | Max writes per minute to respect rate limits (1–100) |
-| `token_env` | string | — | Environment variable holding the GitHub token |
-| `token_cmd` | array | — | Command to get the GitHub token (alternative to token_env) |
-| `api_url` | string | `https://api.github.com` | GitHub API URL (for GitHub Enterprise) |
+| Key | Default | |
+|-----|---------|---|
+| `enabled` | `false` | Turn the tracker on for this project |
+| `mode` | `observe` | `observe` (records only) or `act` |
+| `repos` | the project's `github`, no board | The repositories it tracks (at most 20), each: |
+| `repos[].repo` | | `owner/name` |
+| `repos[].default` | `false` (`true` for a single one) | Tasks no rule takes go here; at most one |
+| `repos[].project.owner`, `.number` | | The board: its user or organization, and the number in its URL. Without it, issues are linked and closed but no card moves |
+| `repos[].status_field` | `Status` | The board's single-select status field |
+| `repos[].status_options` | `Backlog`, `Ready`, `In progress`, `In review`, `Done` | The option names of `backlog`, `ready`, `in_progress`, `in_review`, `done` |
+| `repos[].agent_field` | none | A text field set to the agent of the task's run |
+| `repos[].labels` | `[]` | Labels of the issues Lair creates here |
+| `repos[].match.tasks`, `.agents` | `[]` | Task id globs and agent ids this repository takes |
+| `repos[].milestones.close_when_complete` | `true` | Close a complete milestone, reopen one with an open issue |
+| `repos[].milestones.rules` | `[]` | `{tasks: [globs], milestone: "title"}`: the existing milestone of the issues created for those tasks |
+| `create_issues_for_new_tasks` | `false` | Create an issue for a task none is linked to (act mode) |
+| `blocked_label` | `blocked` | The label of a blocked task's issue |
+| `redact_patterns` | `[]` | Redacted from every text sent, after the built-in rules |
+| `reconcile_interval_seconds` | `900` | 60 to 86400 |
+| `write_budget_per_minute` | `30` | Writes a minute (1 to 100), creates included |
+| `request_timeout_seconds` | `15` | Each request to GitHub (1 to 120) |
+| `token_env`, `token_cmd` | review's, else `GITHUB_TOKEN` | Where the token is read |
+| `api_url` | `https://api.github.com` | GitHub Enterprise: `https://host/api/v3`; https only |
 
-The token needs `repo` and `project` scopes. A missing scope is detected and reported clearly. Config errors turn the tracker off for that project.
+The tasks it follows are `agents.fill.tasks_file` (the planner's done marker marks the done ones); without one it follows events only. Its store is `data/tracker.db` (its own file, created only when a project enables the tracker). A config error keeps the tracker off for that project and shows in its status; it never stops Lair's start.
 
 ### Tracker API
 
-`?project=` defaults to the default project. Every route needs the owner's session:
+`?project=` defaults to the default project. Every route is the owner's (`/api/tracker` is owner-only, reads included: they show task text and repositories):
 
-- `GET /api/tracker/status`: enabled, mode, repo, project URL, sync state (last reconcile, drift count, errors), links (task-to-issue mappings), recent writes, warnings and errors
+- `GET /api/tracker/status`: the mode, each repository and its board (loaded, or why not), the token's scopes (granted, missing), the sync state (last reconcile, next one, drift fixed, errors, the rate-limit wait, what needs the owner), the links, the pending creates, the latest 50 writes (each with its result, or `would_send` in observe mode), the queue (waiting, dropped), warnings and config errors
+- `POST /api/tracker/reconcile`: a reconcile now, queued after the jobs waiting (202); recorded in the audit with the owner session. 404 when the tracker is off for the project
 
-Events: `tracker.status_changed`, `tracker.drift_fixed`, `tracker.error`. Everything is kept in `data/tracker.db`.
+The tracker emits no events of its own. The dashboard tab is not built yet.
 
 ## Brain bench
 

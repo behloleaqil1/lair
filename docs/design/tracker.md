@@ -1,136 +1,63 @@
-# Tracker Module Design
+# Tracker: GitHub issues, boards and milestones managed by Lair
 
-Lair keeps GitHub issues, Projects v2 boards and milestones in sync with its
-tasks, runs and PRs. The module is off unless a project sets `tracker.enabled:
-true`.
+Status: built (module `src/server/tracker/`). Configuration: [configuration.md#tracker](../configuration.md#tracker).
 
-## Purpose
+## Why
 
-The owner had every task, bug and feature on GitHub (issues, Projects boards
-with Status columns, milestones with due dates). Instead of manually moving
-cards or closing issues, Lair keeps GitHub true to what is actually happening.
+A project's work is on GitHub: an issue per task, Projects (v2) boards with a Status column and an Agent field, milestones with the owner's due dates. Nobody should move cards by hand: Lair knows when a task is added, started, blocked, reviewed, merged or done, so it keeps GitHub true to that. The provider is GitHub; another tracker (GitLab, Jira, Linear) would be another client behind the same service.
 
-Generic: any project with a GitHub repo and a user or org Project. Other
-trackers (GitLab, Jira, Linear) come later through the same provider interface.
-
-## Architecture
+## Shape
 
 ```
-Events (bus)              Tracker Service              GitHub API
-─────────────────────────────────────────────────────────────────
-agent.run.started    →   moveToStatus(in_progress)  →  GraphQL: update field
-agent.run.ended      →   moveToStatus(done)         →  REST: close issue
-review.merged        →   closeIssue                 →  REST: PATCH /issues/:n
-planner.changed      →   linkTaskToIssue            →  GraphQL: add to project
-                         reconcile()                →  fix drift periodically
+planner.changed / planner.blocked ─┐
+agent.run.started                  ├─> TrackerService (one per project)
+review.submitted / review.merged ──┘     │  handler: queue a job, return
+                                         │  bounded queue, one job at a time
+periodic reconcile ──────────────────────┤
+POST /api/tracker/reconcile (owner) ─────┘
+                                         ▼
+                    store (data/tracker.db): links, pending creates,
+                    sync state, audit of every write
+                                         ▼
+                    write(): observe records │ act: budget, audit, send
+                                         ▼
+                    GitHubTrackerClient: REST + GraphQL, timeouts,
+                    rate limits, read-only in observe mode
 ```
 
-### Components
+- `manager.ts`: one service per project with `tracker.enabled`, wired in `src/server/index.ts` (load, start after the planner and the agents, live reload through `reload/modules.ts`, stop before the store closes). The store is opened only when a project enables the tracker. Start never waits on GitHub and never throws.
+- `service.ts`: the event handlers, the queue, the write gate, linking, the board, blocked labels, PRs, the reconcile, the scope check and its decision.
+- `github-projects.ts`: the client. One per project (one token) for all its repositories.
+- `store.ts`: its own file; its schema version in its own table (`PRAGMA user_version` belongs to other stores: a file with one set is refused, and so is a newer schema).
+- `tasks.ts`: the tasks it follows, agents.fill's tasks file, read asynchronously and parsed as the planner parses it. The work store, once tasks live there, is another source.
+- `redact.ts`: what every outgoing text goes through.
+- `routes.ts`: `GET /api/tracker/status` and `POST /api/tracker/reconcile`, both the owner's.
 
-- **TrackerService** (`service.ts`): Event handlers, reconciliation, write
-  budget, observe/act mode.
-- **TrackerStore** (`store.ts`): SQLite tables for links, sync state, write
-  history.
-- **GitHubProjectsClient** (`github-projects.ts`): GraphQL for Projects v2,
-  REST for issues and milestones.
-- **Config** (`config.ts`): The `tracker:` block validation with defaults.
+## Decisions
 
-## Mode
+**Events never wait on GitHub.** `EventBus.emit` awaits each handler in turn, so a handler that awaited GitHub would hold up the planner, the agents module or the review module behind a slow or hung connection. A tracker handler only parses the payload and queues a job. Jobs run one at a time per project, which also means two events for one task never interleave. The queue is bounded (500); a dropped job is counted and the next reconcile catches up. Every request has a timeout and is aborted when the tracker stops.
 
-- `off`: Module is loaded but does nothing.
-- `observe`: Records what would be written but sends nothing to GitHub. Useful
-  for dry-run verification.
-- `act`: Writes to GitHub (moves cards, closes issues, adds labels).
+**Desired state in the store, writes as attempts.** A link holds the column, agent and closed state Lair wants. An event updates it and tries to send; a write that fails (rate limit, budget, network) leaves the desired state, and the reconcile sends it again. Drift fixed counts only fixes that were sent.
 
-## Link between tasks and issues
+**Observe mode never writes.** Two layers: `write()` records the change as `would_send` (one row per distinct change, counted up on repeats) and sends nothing; and the client is built read-only, so any write that bypassed the gate is refused before a request leaves. Links to existing issues are made in observe mode too: they live in Lair's store only.
 
-A task is linked to an issue by:
+**At most one issue per task.** The link is checked first; a create is recorded as pending before it is sent and its body carries a hidden marker; a later attempt (an event, the reconcile, a restart) looks for the marker in the issues list (strongly consistent, unlike search) before creating; the link is stored as soon as the issue exists, before the board is touched, so a board failure never leads to a second issue. Title adoption uses search and is never the guard against duplicates.
 
-1. The task description naming `Closes #N`, `#N` or an issue URL.
-2. An exact title match (adopt existing issue).
-3. Creating a new issue when `create_issues_for_new_tasks: true` and `mode:
-   act`.
+**Only issues named on purpose are adopted.** An explicit keyword (`Issue:`, `Closes`, `Fixes`, `Resolves`, `Tracks`) with `#N`, an issue URL or `owner/name#N` of a tracked repository; never a bare `#N`, never another repository, never a closed issue or a pull request. A PR's closing keywords are resolved the same way: `#N` is the PR's own repository.
 
-Links are stored in `tracker_links` and persist across restarts.
+**Real payloads.** The handlers read what the modules emit: `planner.changed {op, task, source, outcome}` (only `applied`), `planner.blocked {task, agent, class, rule}`, `agent.run.started {kind, agent, task, ...}`, `review.submitted` and `review.merged {pr, ...}` (a number only: the tracker reads the PR's body and branch from GitHub, in the repository of the project's review module). `contract.test.ts` drives the real planner, agents module and review module.
 
-## Events → board updates
+**Several repositories.** `repos` lists them, each with its own board, status mapping, labels and milestone rules. A task goes to the repository its line names, else the first `match` rule, else the default. Board items are keyed by repository and number, so the same issue number in two repositories never mixes.
 
-| Event | Board action |
-|-------|-------------|
-| `agent.run.started` | Move to In progress, set Agent field |
-| `agent.run.ended` (done) | Move to Done, close issue |
-| `agent.run.ended` (blocked) | Add `blocked` label, comment with reason |
-| `review.merged` | Move to Done, close linked issue |
-| `planner.changed` (added) | Link task, move to Backlog or Ready |
-| `planner.changed` (done) | Move to Done, close issue |
+**The token is the owner's problem, raised once.** The tracker reads the token's scopes at start; missing ones stop its writes and raise one decision listing them (deduplicated by key while open), answered by "check again". A 401 or a non-rate-limit 403 also stops writes. Fine-grained tokens report no scopes and are not refused up front.
 
-All updates are idempotent: a second event for the same state is a no-op.
+**Rate limits.** A 429, a 403 marked as a rate limit (`Retry-After`, `X-RateLimit-Remaining: 0`, the message) and a GraphQL `RATE_LIMITED` set a wait; no request is sent before it ends, and it is kept across a restart. Any other 403 is a permission problem, never retried as a rate limit. Writes also have a per-minute budget, creates included.
 
-## Reconciliation
+**Redaction by default.** Built-in rules (secret environment values, token and key shapes, credentials, absolute paths and the home directory, emails, private addresses) run before the owner's `redact_patterns`, on titles as well as bodies and comments. A blocked comment carries Lair's own words and the planner's class and rule, never the agent's text.
 
-A periodic full reconcile (every 15 minutes by default) fixes drift: if someone
-moves a card by hand to the wrong column, reconcile moves it back to the
-expected status. Every drift fix is counted and auditable.
+**No synchronous I/O on the event loop.** The tasks file is read with `fs/promises`; the token command runs with the asynchronous `execFile`; a test fails if a tracker source uses a `*Sync(` call or `child_process` directly. Only the SQLite store is synchronous, as every Lair store is.
 
-## Rate limiting
+## Not built yet
 
-GitHub's rate limits are respected:
-
-- A write budget per minute (default 30) prevents bursts.
-- 403/429 responses trigger a backoff.
-- Rate-limited writes are recorded as `rate_limited` in the write history.
-
-## Milestones
-
-- Milestones with zero open issues are closed when `close_when_complete: true`.
-- A milestone is reopened if an issue under it reopens.
-- Due dates are the owner's: Lair never sets or changes them.
-
-## Security
-
-- The token never reaches agents (rule 2 from lair-shared-rules.md).
-- Text from agents (descriptions, blocked reasons) is bounded and redacted
-  before it goes to GitHub.
-- `redact_patterns` is applied to every outgoing text.
-
-## Configuration
-
-See [configuration.md#tracker](../configuration.md#tracker) for the full
-reference. Key settings:
-
-```yaml
-tracker:
-  enabled: true
-  mode: observe  # off | observe | act
-  repo: owner/repo  # or from project.github
-  project:
-    owner: my-org
-    number: 1
-  status_field: Status
-  status_options:
-    backlog: Backlog
-    ready: Ready
-    in_progress: In progress
-    in_review: In review
-    done: Done
-  agent_field: Agent
-  create_issues_for_new_tasks: false
-  redact_patterns:
-    - "/private/"
-```
-
-## Status view
-
-`GET /api/tracker/status?project=<name>` returns:
-
-- `enabled`, `mode`, `repo`, `projectNumber`, `projectUrl`
-- `syncState`: last reconcile, drift count, errors
-- `links`: task-to-issue mappings
-- `recentWrites`: audit log of operations
-- `warnings`, `errors`
-
-## Future work (PR 2)
-
-- Routes for the Tracker tab in the dashboard
-- Full wiring into server index.ts
-- Live reload integration
+- The Tracker tab in Work, and a supervisor health check for a sync that keeps failing (the status route has what both need).
+- Labels per risk tier and milestones from plan sections (the original brief); milestone rules by task glob cover the first use.
