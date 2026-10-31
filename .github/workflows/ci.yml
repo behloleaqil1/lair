@@ -45,6 +45,24 @@ jobs:
       - name: Build
         run: npm run build
 
+  brain-trainer-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: brain-trainer/requirements-dev.txt
+
+      - name: Install dependencies pinned by hash
+        run: "pip install --require-hashes --no-deps --only-binary=:all: -r brain-trainer/requirements-dev.txt"
+
+      - name: Test the trainer
+        run: python -m pytest brain-trainer -q
+
   gitleaks:
     runs-on: ubuntu-latest
     permissions:

@@ -347,6 +347,9 @@ describe("requireOwnerForChanges", () => {
       "/api/fleet/machines",
       "/api/pipelines/runs",
       "/api/bus/send",
+      "/api/tofu-runner/status",
+      "/api/tofu-runner/plan",
+      "/api/tofu-runner/apply",
     ]) {
       expect(isUnder(path, OWNER_ONLY_PREFIXES)).toBe(true);
     }
