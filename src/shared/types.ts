@@ -137,6 +137,12 @@ export interface ProjectConfig {
    */
   supervisor?: Record<string, unknown>;
   /**
+   * Infrastructure monitor: watch running jobs' machines
+   * (src/server/infra-monitor/). Validated by parseInfraMonitorConfig; see
+   * docs/configuration.md#infrastructure-monitor
+   */
+  infra_monitor?: Record<string, unknown>;
+  /**
    * Agent checks: agents test on a runner before they gate
    * (src/server/checks/). Validated by parseChecksConfig; see
    * docs/configuration.md#checks

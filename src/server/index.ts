@@ -57,6 +57,7 @@ import { ReviewManager, inboxDecisionSink, registerReviewRoutes } from "./review
 import { mountTriage } from "./triage/index.js";
 import { PlacementManager, registerPlacementRoutes } from "./placement/index.js";
 import { CloudManager, registerCloudRoutes } from "./cloud/index.js";
+import { InfraMonitorManager, registerInfraMonitorRoutes } from "./infra-monitor/index.js";
 import { ChecksManager, agentRunIsActive, registerChecksRoutes } from "./checks/index.js";
 import { registerDashboardRoutes } from "./dashboard/index.js";
 import type { DashboardSources } from "./dashboard/routes.js";
@@ -731,6 +732,19 @@ const clouds = new CloudManager({
 clouds.load(projectEntries);
 await registerCloudRoutes(fastify, clouds, () => getDefaultProject(), humanAuth);
 
+// Infrastructure monitor (src/server/infra-monitor/): the machines of the
+// gate lanes and the jobs on them (machine down under work, job process gone,
+// two runners in one slot, no live runner while jobs wait). Off unless a
+// project sets `infra_monitor.enabled: true`; observe mode writes nothing.
+// Act mode's re-queues are kept in data/infra-monitor-requeues.json.
+const infraMonitor = new InfraMonitorManager({
+  events: getEventBus(),
+  ledgerPath: join(process.cwd(), "data", "infra-monitor-requeues.json"),
+});
+infraMonitor.load(projectEntries);
+infraMonitor.useDecisions(decisionInbox);
+await registerInfraMonitorRoutes(fastify, infraMonitor, () => getDefaultProject());
+
 // Agent checks (src/server/checks/): agents test on a runner before they gate.
 // One per project with `checks:` configured (off by default). A request needs
 // the run's bus token and a run the agents module has running; a run tests the
@@ -838,7 +852,7 @@ const { supervisor: selfChecks, chat: supervisorChat } = await mountSupervisor(f
 // the modules whose part of it changed, without a restart; an invalid one
 // keeps the previous config running and shows in the dashboard's banner
 const reloader = new ConfigReloader({
-  modules: serverModules({ delivery, watchdogs, pipelines, reviews, agents, triage, placements, clouds, planner, supervisor: selfChecks, trackers }),
+  modules: serverModules({ delivery, watchdogs, pipelines, reviews, agents, triage, placements, clouds, planner, supervisor: selfChecks, trackers, infraMonitor }),
   initial: projectEntries,
   events: getEventBus(),
   onAccepted: (project, config) => {
@@ -950,6 +964,9 @@ const stopServer = async (reason: string) => {
   await clouds.stop();
   // Stop agent checks: running checks are marked interrupted, stores close
   await checks.stop();
+
+  // Stop infra monitor: any tick in progress is cut short
+  await infraMonitor.stop();
 
   // Stop the shared process cache (all modules have stopped, so no one reads it)
   disposeProcessCache();
@@ -1122,6 +1139,14 @@ const start = async () => {
       metered.length > 0
         ? `[cloud] Watching cloud machines for: ${metered.join(", ")}`
         : "[cloud] Off (no project sets cloud.enabled)",
+    );
+
+    // Start infra monitor (machine probes, job tracking, notice raising)
+    const infraMonitored = infraMonitor.start();
+    console.log(
+      infraMonitored.length > 0
+        ? `[infra-monitor] Watching jobs for: ${infraMonitored.join(", ")}`
+        : "[infra-monitor] Off (no project sets infra_monitor.enabled)",
     );
 
     // Start agent checks (reconcile queued/running from a restart)

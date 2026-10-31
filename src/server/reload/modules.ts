@@ -20,6 +20,8 @@ import { parseWatchdogConfig } from "../watchdog/config.js";
 import type { WatchdogManager } from "../watchdog/service.js";
 import type { Supervisor } from "../supervisor/service.js";
 import type { TrackerManager } from "../tracker/manager.js";
+import { parseInfraMonitorConfig } from "../infra-monitor/config.js";
+import type { InfraMonitorManager } from "../infra-monitor/service.js";
 
 export interface ProjectEntry {
   name: string;
@@ -57,6 +59,7 @@ export interface ServerModules {
   planner?: PlannerManager;
   supervisor?: Supervisor;
   trackers?: TrackerManager;
+  infraMonitor?: InfraMonitorManager;
 }
 
 function errorsOf(result: { ok: true } | { ok: false; errors: string[] }): string[] {
@@ -66,7 +69,7 @@ function errorsOf(result: { ok: true } | { ok: false; errors: string[] }): strin
 /** The server's modules, as src/server/index.ts wires them. */
 export function serverModules(m: ServerModules): ReloadableModule[] {
   const modules: ReloadableModule[] = [];
-  const { delivery, watchdogs, pipelines, reviews, agents, triage, placements, clouds, planner, supervisor, trackers } = m;
+  const { delivery, watchdogs, pipelines, reviews, agents, triage, placements, clouds, planner, supervisor, trackers, infraMonitor } = m;
   if (delivery) {
     modules.push({
       name: "delivery",
@@ -166,6 +169,15 @@ export function serverModules(m: ServerModules): ReloadableModule[] {
       reads: ["review", "agents", "planner"],
       validate: (config) => trackers.validate(config),
       reload: (entry) => trackers.reloadProject(entry),
+    });
+  }
+  if (infraMonitor) {
+    modules.push({
+      name: "infra_monitor",
+      // Its machines and lanes are in its own block; gates_dir and read_only reload every module
+      blocks: ["infra_monitor"],
+      validate: (config) => errorsOf(parseInfraMonitorConfig(config.infra_monitor)),
+      reload: (entry) => infraMonitor.reloadProject(entry),
     });
   }
   return modules;

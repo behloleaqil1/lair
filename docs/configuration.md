@@ -2492,6 +2492,94 @@ No route starts or stops a machine or changes the budget: the machines and the b
 
 Events on the bus: `cloud.guard_tripped` (`{project, limit, spend, reason}`), `cloud.trip_cleared` (`{project, trippedAt, limit, spend, by, note}`).
 
+## Infrastructure Monitor
+
+> Off by default. With `enabled: true` and the default `mode: observe`, the infrastructure monitor probes the machines of your gate lanes, watches the jobs on them, and shows what it finds in its status; it raises nothing, runs nothing but its probes, and writes nothing. With `mode: act` it raises one [notice](#action-items-and-notices) per finding in the [Decision Inbox](#decision-inbox), withdraws it once the problem is gone and, with `requeue_cmd`, re-queues a job of a down machine once onto a lane whose machine is up.
+
+It finds four problems, each only once it has lasted `down_threshold_seconds` without a break (a single failed probe, or a machine that flaps up and down, is not an outage):
+
+1. **`machine_down`**: a machine has failed its probes while a job runs in one of its lanes, or while jobs wait there. A machine that is down with nothing on it is not a finding (an on-demand server stopped while idle). A job counts as "under" a down machine once the machine answered at least once while the job ran (it went down under the job), or once the job has run `start_grace_seconds` (a job claimed while its on-demand server is still starting is not a finding). One notice per machine, listing its jobs.
+2. **`job_lost`**: a running request (`.req.run`) whose process group, from the `<request>.pgid` file the runner writes next to it, no longer exists: nobody runs the job any more, and its request still says running.
+3. **`slot_overflow`**: a lane has more running requests than `slots`: more than one runner claims a slot.
+4. **`dead_runner`**: jobs wait in a lane and none of its `runner_pid_files` names a live process.
+
+```yaml
+infra_monitor:
+  enabled: true
+  mode: observe                  # observe (default): show only | act: notices and re-queues
+  interval_seconds: 60
+  down_threshold_seconds: 120    # how long a problem must last before it is a finding
+  probe_timeout_seconds: 15      # every probe; one that does not finish in time is a failure
+  machines:
+    local:
+      probes:
+        - ["/usr/local/bin/docker", "info", "--format", "{{.ServerVersion}}"]
+    laptop:
+      probes:
+        - argv: ["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "dev@laptop.lan", "echo", "ok"]
+          expect: "ok"
+    cloud:
+      probes:
+        - argv: ["/usr/local/bin/aws", "ec2", "describe-instances", "--instance-ids", "i-0123456789abcdef0",
+                 "--query", "Reservations[0].Instances[0].State.Name", "--output", "text"]
+          expect: "running"
+      start_grace_seconds: 900    # a job claimed while the server starts is not under a down machine yet
+  lanes:
+    heavy:  { machine: local, slots: 1, runner_pid_files: ["runner-heavy.pid"] }
+    remote: { machine: laptop, slots: 2, runner_pid_files: ["runner-remote.pid", "runner-remote2.pid"], requeue_to: [heavy] }
+    cloud:  { machine: cloud, slots: 2, requeue_to: [remote, heavy] }
+  requeue_cmd: ["/opt/gates/requeue-running.sh", "{id}", "{from}", "{to}"]
+  requeue_timeout_seconds: 120
+  requeue_max_attempts: 2
+  requeue_backoff_seconds: 300
+```
+
+### Options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Run the monitor for this project. Enabled with no `lanes` is refused: it would watch nothing and look healthy |
+| `mode` | `observe` \| `act` | `observe` | `observe` shows findings and the re-queues it would run, and writes nothing. `act` raises and withdraws notices and runs `requeue_cmd`, unless the project is `read_only: true` |
+| `interval_seconds` | integer | `60` | Seconds between ticks (10–3600) |
+| `down_threshold_seconds` | integer | `120` | How long a problem must last, without a break, before it is a finding (30–3600) |
+| `probe_timeout_seconds` | integer | `15` | Deadline of every probe (1–120). At the deadline the probe and every process it started are killed, and the probe failed, whatever it printed |
+| `machines.<id>.probes` | list | — | 1 to 5 probes, run in order; the machine is up when every one exits 0 in time and, with `expect`, prints that text. A probe is an argv (`["prog", "arg"]`) or `{ argv, expect }`. A machine with no probe is refused (it would count as up) |
+| `machines.<id>.start_grace_seconds` | integer | `down_threshold_seconds` | A job counts as under this machine once the machine was seen up during it, or once it has run this long (0–7200) |
+| `lanes.<lane>.machine` | machine id | — | The machine that runs the lane |
+| `lanes.<lane>.slots` | integer | `1` | How many jobs the lane runs at once (1–16) |
+| `lanes.<lane>.runner_pid_files` | list | `[]` | The lane's runner pid files in `gates_dir` (`runner-remote.pid`, `runner-remote2.pid` for a second slot); without them `dead_runner` is not checked for the lane |
+| `lanes.<lane>.requeue_to` | list | `[]` | Lanes a running job of this lane may be re-queued to, in order of preference; the first whose machine is up now is used |
+| `requeue_cmd` | argv | none | Act mode: re-queues a running job. Placeholders `{id}`, `{from}`, `{to}`; it must pass `{id}` and `{to}`, and the program can't be a placeholder. Exit 0 is moved; anything else, or the timeout, is a failure. Your command must stop the run on the old machine and put the request into the new lane |
+| `requeue_timeout_seconds` | integer | `120` | Deadline of `requeue_cmd` (1–900) |
+| `requeue_max_attempts` | integer | `2` | Attempts of one job's re-queue before it gives up (1–5) |
+| `requeue_backoff_seconds` | integer | `300` | Wait after a failed attempt, doubled each time, at most 6 h (30–3600) |
+
+### How it works
+
+Every `interval_seconds`, one tick:
+
+1. **Read the queue.** `<gates_dir>/queue` is listed (asynchronously, at most 5000 entries) for the requests of the configured lanes: queued (`.req`) and running (`.req.run`, with the process group in its `.pgid` file). Files are read without following a symbolic link and without blocking on a FIFO. A queue that can't be read is an error in the status, and nothing is added, cleared or withdrawn on that tick.
+2. **Probe the machines**, all at once, each probe an argv run without a shell in its own process group.
+3. **Read the runner pid files** and check each pid (a signal-0 check: nothing is sent).
+4. **Detect** the four findings above.
+5. **Act mode only.** Each finding raises one notice (class `infra_monitor.notice`, evidence code = the finding's type, with the machine, lane, jobs and the probe's error as facts), deduped by its key (`machine_down:<machine>`, `job_lost:<id>`, `slot_overflow:<lane>`, `dead_runner:<lane>`). A notice stays open until its cause has been gone for `down_threshold_seconds` plus one interval, then it is withdrawn, so a flap neither withdraws nor raises it again. A notice you answered ("Noted") is not raised again while that occurrence lasts; it is when the problem clears and comes back. After a restart an open notice is kept (not raised twice) and withdrawn once its cause stays gone. Switching a project to observe, `read_only` or off withdraws the notices it raised.
+6. **Re-queue (act mode, with `requeue_cmd`).** Each running job of a `machine_down` finding is re-queued at most once: onto the first lane of its `requeue_to` whose machine is up now, never the down one; with none up it waits. At most 4 re-queues run per tick. Every attempt is kept in `data/infra-monitor-requeues.json` before its command runs, so a restart neither repeats a re-queue that worked nor retries one that failed before its backoff; an attempt the restart interrupted counts as failed. A ledger file that can't be read is never overwritten: re-queues stop until it is fixed or removed, and the status says so.
+
+**Observe mode writes nothing.** No notice, no command but the probes, no ledger file. `GET /api/infra-monitor/status` shows the findings and, under `plannedRequeues`, each re-queue act mode would run with its exact argv, or why it would not.
+
+**No false green.** A probe that times out, exits non-zero or misses `expect` is a failure; the status shows `stale: true` when no tick has finished for three intervals, and `lastError` when the queue or the ledger can't be read or a notice can't be raised.
+
+### Infrastructure Monitor API
+
+All read-only; no route starts, stops or changes anything.
+
+- `GET /api/infra-monitor/status?project=`: enabled, running, mode, `actBlocked` (why act mode does nothing), the last tick, `lastError`, `stale`, machines, jobs, findings, `plannedRequeues` and the ledger's `requeues`.
+- `GET /api/infra-monitor/machines?project=`: each machine's `up`, `downSince`, `upSince`, `lastProbeAt`, `lastError` and lanes.
+- `GET /api/infra-monitor/jobs?project=`: the running jobs watched, with their claim time, process group and whether it is alive.
+- `GET /api/infra-monitor/findings?project=`: the current findings with their notice id.
+
+Events on the bus: `infra_monitor.finding` (`{project, key, type, summary, mode}`), `infra_monitor.cleared` (`{project, key, type}`), `infra_monitor.requeued` (`{project, id, from, to, result, attempts, error}`).
+
 ## Cleanup
 
 > Off by default. With `enabled: true`, Lair removes stale worktrees and old entries from watched folders. In `observe` mode (the default) it logs what it would remove; in `act` mode it removes.
@@ -3299,7 +3387,7 @@ Project names (the file name without `.yaml` or `.yml`) must start with a letter
 
 The server watches `projects/` and `projects/local/`. When a project file changes (or a new one appears), it waits until the file has been quiet for a second, then reads it and checks it with every module's own parser, the same checks as at startup:
 
-- **Valid:** only the modules whose part of the file changed are reloaded, each for that project only. A module's part is its own block (`watchdog:`, `delivery:`, `pipelines:` and `executors:`, `review:`, `agents:`, `triage:`, `placement:`, `planner:`, `supervisor:`), the blocks it also reads (the agents module reads `watchdog:`, the planner `agents:`), and every other top-level key a module may read (`repo`, `read_only`, `dragons`, `machines`, `agents_dir`, `outbox_file`...), so a change to one of those reloads every module of the project. Keys no module reads reload nothing: the dashboard's commands (`*_cmd`, `allow_direct_assign`, `backlog_file`), `merge_bar`, `processes`, `orchestrator`, `available_models` and `gate_runner`. Editing only a comment reloads nothing. The dashboard's reads use the new file from the next request.
+- **Valid:** only the modules whose part of the file changed are reloaded, each for that project only. A module's part is its own block (`watchdog:`, `delivery:`, `pipelines:` and `executors:`, `review:`, `agents:`, `triage:`, `placement:`, `planner:`, `supervisor:`, `infra_monitor:`), the blocks it also reads (the agents module reads `watchdog:`, the planner `agents:`), and every other top-level key a module may read (`repo`, `read_only`, `dragons`, `machines`, `agents_dir`, `outbox_file`...), so a change to one of those reloads every module of the project. Keys no module reads reload nothing: the dashboard's commands (`*_cmd`, `allow_direct_assign`, `backlog_file`), `merge_bar`, `processes`, `orchestrator`, `available_models` and `gate_runner`. Editing only a comment reloads nothing. The dashboard's reads use the new file from the next request.
 - **Invalid** (YAML errors, missing required fields, any module's parser refusing its block, a file that is not a regular file or is over 1 MiB): nothing changes, and the modules keep running the previous config. The error is logged, emitted as a `config.invalid` event, and shown in a banner on the dashboard: "projects/x.yaml has an error; the previous config is still running: ..." until the file is fixed.
 - **Another file:** the modules keep running the file they started with. When it is deleted (deleting `projects/local/x.yaml` would otherwise fall back to the public `projects/x.yaml`), or a new file takes its place (a new `projects/local/x.yaml`), nothing changes and the banner says so; restart Lair to switch files. Deleting a project's only file also keeps its previous config running until a restart.
 
@@ -3317,6 +3405,7 @@ A module is reloaded by stopping its instance for the project cleanly and starti
 | triage | The tick, ingests and outbox in progress finish first |
 | placement | As on shutdown: a probe or `move_cmd` in progress is cut short, and a move it cut short is found again by the new instance's first tick. Learned durations, moves and cool-downs are kept (they are in the store); probe history starts again, so a machine is up again only after `min_up_seconds` |
 | supervisor | A round of checks in progress finishes; the next one, a few seconds later, runs with the new settings. A check turned off withdraws its open notice |
+| infra_monitor | A probe or `requeue_cmd` in progress is killed and the tick ends at once (a re-queue it cut short counts as a failed attempt). Machine states and findings start again (a problem must last `down_threshold_seconds` again); open notices are kept and the re-queue ledger is on disk. Switching to observe, `read_only` or off withdraws the notices act mode raised |
 
 Reloads of one module for one project never overlap: a change made while one runs is applied after it, with the latest file (also when the latest file is the one that ran before). A module that fails to start with the new config (for example, its store can't be opened) is started again with the previous one, and the banner says so; it is never left half-started.
 
