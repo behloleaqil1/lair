@@ -951,7 +951,7 @@ export class AgentsFill {
   private lastQueued = new Map<string, number>();
   /** Unmatched reports at the last check: reports naming a different task than the agent's open task */
   private unmatchedReports: FillUnmatchedReportView[] = [];
-  /** When a notice was last raised for an agent's unmatched report (agent -> time); one per agent per hour */
+  /** Lines we've already raised a notice for (agent:lineHash -> time); once per unique line */
   private unmatchedNoticeAt = new Map<string, number>();
   /** Last capacity check state for the view */
   private lastCapacity: FillCapacityView | null = null;
@@ -1714,10 +1714,12 @@ export class AgentsFill {
       probes.clock.now(),
     );
 
-    // One notice per agent per hour
-    const lastNotice = this.unmatchedNoticeAt.get(agent) ?? 0;
-    if (now - lastNotice >= 3600_000) {
-      this.unmatchedNoticeAt.set(agent, now);
+    // One notice per agent per line (not per hour): key on line content
+    // This prevents re-raising the same notice on restart or every hour
+    const lineHash = createHash("sha256").update(unmatched.line).digest("hex").slice(0, 16);
+    const noticeKey = `${agent}:${lineHash}`;
+    if (!this.unmatchedNoticeAt.has(noticeKey)) {
+      this.unmatchedNoticeAt.set(noticeKey, now);
       // The notice is a recorded event with a distinctive summary (the Health view reads it)
       await this.options.record(
         "fill_unmatched",
@@ -1734,7 +1736,7 @@ export class AgentsFill {
             line: unmatched.line,
             notice: true,
           },
-          dedupeKey: `fill_unmatched_notice:${agent}:${Math.floor(now / 3600_000)}`,
+          dedupeKey: `fill_unmatched_notice:${noticeKey}`,
         },
         probes.clock.now(),
       );
