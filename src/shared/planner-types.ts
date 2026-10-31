@@ -57,7 +57,8 @@ export interface PlanTaskView {
 
 export interface TasksLineView {
   line: number;
-  agent: string;
+  /** null: an unassigned line, ready work for any agent */
+  agent: string | null;
   name: string;
   task: string;
   description: string;

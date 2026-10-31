@@ -60,6 +60,12 @@ export const SECTIONS: readonly SectionDef[] = [
     needs: (m) => m.processes,
     enable: "Add the helper processes Lair should supervise under processes: in the project's YAML.",
   },
+  {
+    id: "knowledge",
+    label: "Knowledge",
+    needs: (m) => m.lessons,
+    enable: "Set lessons.enabled: true in the project's YAML to enable the lessons store and Knowledge view.",
+  },
   { id: "settings", label: "Settings", needs: null, enable: "" },
 ];
 
@@ -150,6 +156,7 @@ const TABS: Record<SectionId, readonly TabDef[]> = {
   ],
   delivery: [],
   processes: [],
+  knowledge: [],
   settings: [],
 };
 
