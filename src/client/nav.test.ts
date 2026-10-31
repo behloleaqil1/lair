@@ -30,6 +30,7 @@ const OFF: ModuleFlags = {
   github: false,
   machines: false,
   nodes: false,
+  lessons: false,
 };
 const ALL: ModuleFlags = Object.fromEntries(Object.keys(OFF).map((k) => [k, true])) as unknown as ModuleFlags;
 const ids = (modules: ModuleFlags | null) => visibleSections(modules).map((s) => s.id);

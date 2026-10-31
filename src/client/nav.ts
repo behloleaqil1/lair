@@ -156,6 +156,7 @@ const TABS: Record<SectionId, readonly TabDef[]> = {
   ],
   delivery: [],
   processes: [],
+  knowledge: [],
   settings: [],
 };
 
