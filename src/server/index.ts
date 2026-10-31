@@ -26,6 +26,7 @@ import {
 } from "./human-auth/index.js";
 import { registerControlRoutes } from "./routes/controls.js";
 import { registerBusRoutes } from "./routes/bus.js";
+import { getBusStore } from "./bus/index.js";
 import { registerProcessRoutes } from "./routes/processes.js";
 import { registerSettingsRoutes } from "./routes/settings.js";
 import { getSupervisor } from "./services/supervisor.js";
@@ -667,7 +668,8 @@ const checks = new ChecksManager({
   getRunInfo: (project, runId) => {
     const run = agents.getStore()?.getRun(runId);
     if (!run) return null;
-    return { task: run.task, branch: run.branch };
+    // AgentRun doesn't store branch; branch binding is validated when both sides have one
+    return { task: run.task, branch: undefined };
   },
 });
 checks.load(projectEntries);
