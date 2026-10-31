@@ -349,12 +349,10 @@ describe("E2E: Full agent cycle on a fake project", () => {
     // 1. Add a task to the tasks file (format: agent|name|task|description)
     writeFileSync(paths.tasks, "worker-a|Search Fix|feat-search|Fix search results\n");
 
-    // 2. Set up the spawner to simulate an agent that completes its task
+    // 2. Set up the spawner to simulate an agent that completes
+    let spawnerPid = 0;
     spawner.onSpawn = (pid, _call) => {
-      clock.advance(5 * MIN);
-      const queueLine = `- DONE feat-search by worker-a 10:05Z: implemented search fix\n`;
-      appendFileSync(paths.queue, queueLine);
-      spawner.exit(pid, 0);
+      spawnerPid = pid;
     };
 
     // 3. First checkNow: fill queues the run
@@ -367,11 +365,16 @@ describe("E2E: Full agent cycle on a fake project", () => {
     expect(spawner.calls.length).toBe(1);
     expect(spawner.calls[0].argv).toContain("worker-a");
 
-    // 6. Tick again to process the completion
-    clock.advance(MIN);
+    // 6. Simulate agent work: advance time and write done line
+    clock.advance(5 * MIN);
+    const queueLine = `- DONE feat-search by worker-a 10:05Z: implemented search fix\n`;
+    appendFileSync(paths.queue, queueLine);
+    spawner.exit(spawnerPid, 0);
+
+    // 7. Tick again to process the completion
     await service.checkNow();
 
-    // 7. Verify the queue was read and task marked done
+    // 8. Verify the queue was read and task marked done
     const queueContent = readFileSync(paths.queue, "utf-8");
     expect(queueContent).toContain("DONE feat-search");
   });
@@ -382,12 +385,9 @@ describe("E2E: Full agent cycle on a fake project", () => {
 
     writeFileSync(paths.tasks, "worker-a|API Endpoint|feat-api|Add new API endpoint\n");
 
-    spawner.onSpawn = (_pid, _call) => {
-      clock.advance(2 * MIN);
-      appendFileSync(
-        paths.queue,
-        `- PROGRESS feat-api by worker-a 10:02Z: started implementation\n`,
-      );
+    let spawnerPid = 0;
+    spawner.onSpawn = (pid, _call) => {
+      spawnerPid = pid;
     };
 
     // Queue the run via fill
@@ -397,13 +397,20 @@ describe("E2E: Full agent cycle on a fake project", () => {
 
     expect(spawner.calls.length).toBe(1);
 
+    // Simulate progress update
+    clock.advance(2 * MIN);
+    appendFileSync(
+      paths.queue,
+      `- PROGRESS feat-api by worker-a 10:02Z: started implementation\n`,
+    );
+
     // Simulate continued work and completion
     clock.advance(5 * MIN);
     appendFileSync(
       paths.queue,
       `- DONE feat-api by worker-a 10:07Z: completed API endpoint\n`,
     );
-    spawner.exit(spawner.nextPid - 1, 0);
+    spawner.exit(spawnerPid, 0);
 
     // Tick to process completion
     await service.checkNow();
@@ -419,13 +426,9 @@ describe("E2E: Full agent cycle on a fake project", () => {
 
     writeFileSync(paths.tasks, "worker-a|Blocked Task|feat-blocked|Task that gets blocked\n");
 
+    let spawnerPid = 0;
     spawner.onSpawn = (pid, _call) => {
-      clock.advance(3 * MIN);
-      appendFileSync(
-        paths.queue,
-        `- BLOCKED feat-blocked by worker-a 10:03Z: missing dependency\n`,
-      );
-      spawner.exit(pid, 1);
+      spawnerPid = pid;
     };
 
     // Queue the run via fill
@@ -435,7 +438,15 @@ describe("E2E: Full agent cycle on a fake project", () => {
 
     expect(spawner.calls.length).toBe(1);
 
-    clock.advance(MIN);
+    // Simulate agent getting blocked
+    clock.advance(3 * MIN);
+    appendFileSync(
+      paths.queue,
+      `- BLOCKED feat-blocked by worker-a 10:03Z: missing dependency\n`,
+    );
+    spawner.exit(spawnerPid, 1);
+
+    // Tick to process the blocked state
     await service.checkNow();
 
     const queueContent = readFileSync(paths.queue, "utf-8");
@@ -448,18 +459,11 @@ describe("E2E: Full agent cycle on a fake project", () => {
 
     writeFileSync(paths.tasks, "worker-a|Prompt Test|feat-prompt|Test prompt creation\n");
 
+    let spawnerPid = 0;
+    let taskEnvValue: string | undefined;
     spawner.onSpawn = (pid, call) => {
-      // The task name appears in env or argv
-      const promptArg = call.argv.find((a) => a.includes("feat-prompt"));
-      const taskEnv = call.env.LAIR_TASK;
-      expect(promptArg || taskEnv === "feat-prompt").toBe(true);
-
-      clock.advance(MIN);
-      appendFileSync(
-        paths.queue,
-        `- DONE feat-prompt by worker-a 10:01Z: done\n`,
-      );
-      spawner.exit(pid, 0);
+      spawnerPid = pid;
+      taskEnvValue = call.env.LAIR_TASK;
     };
 
     // Queue the run via fill
@@ -468,6 +472,16 @@ describe("E2E: Full agent cycle on a fake project", () => {
     await service.checkNow();
 
     expect(spawner.calls.length).toBe(1);
+    // The task name should appear in env
+    expect(taskEnvValue).toBe("feat-prompt");
+
+    // Complete the task
+    clock.advance(MIN);
+    appendFileSync(
+      paths.queue,
+      `- DONE feat-prompt by worker-a 10:01Z: done\n`,
+    );
+    spawner.exit(spawnerPid, 0);
   });
 
   it("runs on a multi-task queue", async () => {
@@ -483,22 +497,27 @@ worker-a|Third|feat-three|Third task
     );
 
     let tasksDone = 0;
-    spawner.onSpawn = (_pid, call) => {
-      tasksDone++;
-      const task = call.env.LAIR_TASK;
-      clock.advance(2 * MIN);
-      appendFileSync(
-        paths.queue,
-        `- DONE ${task} by worker-a 10:0${tasksDone * 2}Z: completed\n`,
-      );
-      spawner.exit(spawner.nextPid - 1, 0);
+    let currentPid = 0;
+    spawner.onSpawn = (pid, _call) => {
+      currentPid = pid;
     };
 
     // Run through the tasks: each needs queue (checkFill) + launch (tick)
     for (let i = 0; i < 3; i++) {
       await service.checkNow(); // Queue
       await service.checkNow(); // Launch
-      clock.advance(5 * MIN);
+
+      // Simulate agent work and completion
+      tasksDone++;
+      const task = spawner.calls[i].env.LAIR_TASK;
+      clock.advance(2 * MIN);
+      appendFileSync(
+        paths.queue,
+        `- DONE ${task} by worker-a 10:0${tasksDone * 2}Z: completed\n`,
+      );
+      spawner.exit(currentPid, 0);
+
+      clock.advance(3 * MIN);
     }
 
     expect(tasksDone).toBe(3);
