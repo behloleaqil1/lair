@@ -533,12 +533,15 @@ Unknown keys and invalid values are config errors; a project with an invalid blo
 
 ## Checks
 
-Agents can run targeted tests before submitting a gate. Define check kinds per project:
+Agents can run targeted tests before submitting a gate. Off by default: a project without a `checks:` block has no
+checks (every checks route answers 404). With the block, the server runs the kind's command for a running agent run
+that asks with its bus token. Define check kinds per project (design: [design/checks.md](design/checks.md)):
 
 ```yaml
 checks:
   backend-targeted:
     command: ["./run-tests.sh", "{sha}", "{tests}"]
+    remote: origin
     tests:
       pattern: "^[A-Za-z0-9_.*#]+$"
       max_count: 50
@@ -547,37 +550,43 @@ checks:
     max_concurrent: 2
     max_per_agent_per_hour: 10
     parse:
-      junit_path: build/test-results/test/TEST-*.xml
+      junit_path: test-results/TEST-*.xml
     budget:
       daily_limit: 100
-      guard_cmd: ["./check-aws-spend.sh"]
+      guard_cmd: ["./check-spend.sh"]
 ```
 
 ### Check kind options
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `command` | array | required | The argv with placeholders: `{sha}`, `{branch}`, `{tests}`, `{agent}`, `{check_id}` |
-| `tests.pattern` | string | `^[A-Za-z0-9_.*#]+$` | Regex allowlist for each test selector item |
+| `command` | array | required | The argv, run without a shell in the project's repository. Placeholders: `{sha}`, `{branch}`, `{tests}`, `{agent}`, `{check_id}`, `{output_dir}` (also `CHECK_SHA`, `CHECK_BRANCH`, `CHECK_AGENT`, `CHECK_ID`, `CHECK_OUTPUT_DIR` in its environment) |
+| `remote` | string | `origin` | The remote the branch must be pushed to: the sha must be on `<remote>/<branch>` |
+| `tests.pattern` | string | `^[A-Za-z0-9_.*#]+$` | Regex allowlist for each test selector item (100 ms limit per item) |
 | `tests.max_count` | number | `50` | Maximum number of test items |
 | `tests.max_length` | number | `5000` | Maximum total length of tests joined |
-| `timeout_seconds` | number | `300` | Time limit for the check |
-| `max_concurrent` | number | `2` | Checks of this kind running at once |
-| `max_per_agent_per_hour` | number | `10` | Per-agent hourly rate limit |
-| `parse.junit_path` | string | — | JUnit XML path for failing test names |
-| `budget.daily_limit` | number | — | Daily check limit |
-| `budget.guard_cmd` | array | — | Command that must exit 0 before a check starts |
+| `timeout_seconds` | number | `300` | Time limit for the check; its whole process group is stopped |
+| `max_concurrent` | number | `2` | Checks of this kind running at once (the rest wait, oldest first) |
+| `max_per_agent_per_hour` | number | `10` | Accepted checks per agent per hour (refusals don't count) |
+| `parse.junit_path` | string | — | JUnit XML path for failing test names, relative to the check's output directory; the file name may be a glob |
+| `budget.daily_limit` | number | — | Accepted checks of this kind per UTC day (refusals don't count) |
+| `budget.guard_cmd` | array | — | Command that must exit 0 before each run and before the infrastructure retry (30 s limit, fail closed) |
 
-Exit codes: 0 pass, 1 test failures, 3 infrastructure (retried once), 4 refused by guard.
+Exit codes: 0 pass, 1 test failures, 2 refused (the command refused its input), 3 infrastructure (guard again, retried
+once), 4 refused by the guard. A timeout reports `timeout`; any other exit `fail`.
+
+Lair's own tokens (`GH_TOKEN`, `GITHUB_TOKEN`, `LAIR_*_TOKEN`) are removed from the command's and the guard's
+environment. Finished checks are kept 14 days (at most 10,000), with their output directories in
+`data/checks-output/<project>/`. Changes to `checks:` take effect at the next restart.
 
 ### Checks API
 
 Agents request checks with their bus token. See [docs/agents.md](agents.md) for the curl example.
 
-- `POST /api/checks` with `{"kind": "...", "sha": "...", "tests": ["..."]}` and `Authorization: Bearer <bus token>`: request a check, returns `{"id": "..."}`
-- `GET /api/checks/:id?wait=600`: get result, optionally long-polling up to N seconds
-- `GET /api/checks?kind=&agent=&status=&limit=`: list checks (for the Work view)
-- `GET /api/checks/stats`: counts by status and kind (for the Health view)
+- `POST /api/checks` with `{"kind": "...", "sha": "<40 hex>", "branch": "...", "tests": ["..."]}` and `Authorization: Bearer <bus token>`: request a check, returns `{"id": "..."}` (HTTP 201). The run must be running; a run tests one branch (its first accepted check's); the sha must be on that branch as pushed
+- `GET /api/checks/:id?wait=600` with the same token (or the owner's session): the result, optionally long-polling up to N seconds
+- `GET /api/checks?kind=&agent=&sha=&status=&limit=`: list checks (owner only)
+- `GET /api/checks/stats`: counts by status and kind (owner only)
 
 ## Process manager
 
