@@ -57,3 +57,5 @@ export type {
 
 export { parseBusConfig } from "./config.js";
 export type { BusSettings } from "./config.js";
+export { agentsBusFor } from "./wiring.js";
+export type { AgentsBusOptions } from "./wiring.js";

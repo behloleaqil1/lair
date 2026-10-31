@@ -82,7 +82,6 @@ import { attributedAgent } from "../parsers/queue.js";
 import { getPromptsDir } from "../routes/controls.js";
 import {
   backoffMs,
-  doneLineMatches,
   fillPatternFor,
   getAgentClass,
   matchesByAgent,
@@ -636,7 +635,8 @@ export class QueueLines {
     const to = until ? until.offset : Number.POSITIVE_INFINITY;
     return (this.byAuthor.get(agent.toLowerCase()) ?? [])
       .map((i) => this.lines[i])
-      .filter((line) => line.start >= mark.offset && line.start < to)
+      // In on mode a mirrored line is its bus report, always about the task its run held: never an unmatched one
+      .filter((line) => line.start >= mark.offset && line.start < to && !(this.structured && (line.report !== null || line.repeat)))
       .map((line) => line.text);
   }
 }

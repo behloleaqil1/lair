@@ -8,7 +8,7 @@
  * HTTP tests through registerAgentsRoutes), then asserts what was spawned or
  * signalled, the files on disk, and what the store recorded.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
 import {
   appendFileSync,
@@ -68,6 +68,8 @@ import type { AgentProbes, ProcessOwner, ProcessSpawner, SpawnOptions, SystemInf
 import type { DecisionInbox, DecisionRequest } from "./decisions.js";
 import { AgentsStore, SCHEMA_VERSION } from "./store.js";
 import type { AgentEvent, AgentRun } from "./types.js";
+import { BusConsumers, agentsBusFor, closeBusStores, structuredReport, type BusConsumeMode } from "../bus/index.js";
+import { busStoreFor, forgetBusService, registerBusRoutes } from "../routes/bus.js";
 
 // ============ BOUNDARY FAKES ============
 
@@ -5902,5 +5904,272 @@ describe("10. hung run info: the next run knows what the previous hung on", () =
     expect(beforeJson).not.toContain("</hung_run_warning>");
     // After JSON has the real closing tag, but no OTHER occurrence of injection content
     expect(afterJson.match(/ignore previous instructions/g)).toBeNull();
+  });
+});
+
+// ============ 12. THE BUS: FILL READS THE AGENTS' STRUCTURED REPORTS ============
+
+describe("12. the bus (bus.consume): fill reads an agent's structured report in place of the line the bus mirrors", () => {
+  const tasksPath = (p: Paths) => join(p.dir, "tasks.txt");
+  const SERVER_URL = "http://127.0.0.1:4777";
+
+  interface BusHarness {
+    paths: Paths;
+    config: ProjectConfig;
+    clock: FakeClock;
+    spawner: FakeSpawner;
+    manager: AgentsManager;
+    service: AgentsService;
+    store: AgentsStore;
+    consumers: BusConsumers;
+    app: FastifyInstance;
+    warnings: string[];
+  }
+
+  /**
+   * The server's wiring (src/server/index.ts) for project "demo": the bus consumers, the agents module with
+   * agentsBusFor (a bus token per run while the bus is on), and the bus routes, over one event bus. Only the
+   * process table, the spawner and the clock are fake. `restartOf`: a new server on the same files.
+   */
+  async function busSetup(
+    mode: BusConsumeMode,
+    fill: Record<string, unknown> = {},
+    restartOf?: BusHarness,
+  ): Promise<BusHarness> {
+    const paths = restartOf?.paths ?? makePaths();
+    const config = {
+      ...projectConfig(paths, {
+        ...BASE,
+        fill: { enabled: true, tasks_file: tasksPath(paths), agents: ["worker-a"], prompt_files: ["{prompts_dir}/{agent}.txt"], max_active: 2, interval_seconds: 3600, ...fill },
+      }),
+      bus: { consume: mode },
+    } as ProjectConfig;
+    mkdirSync(paths.promptsDir, { recursive: true });
+    writeFileSync(join(paths.promptsDir, "worker-a.txt"), "You are worker A.\n");
+    writeFileSync(join(paths.promptsDir, "worker-b.txt"), "You are worker B.\n");
+    const clock = restartOf?.clock ?? new FakeClock();
+    const procs = new FakeProcessTable(clock);
+    const spawner = new FakeSpawner(procs, clock);
+    const events = new EventBus();
+    const warnings: string[] = [];
+    const dataDir = join(paths.dir, "data");
+    let manager: AgentsManager | null = null;
+    const consumers = new BusConsumers({
+      events,
+      clock,
+      reports: (project, ids) => busStoreFor(project, dataDir).getReports(ids).map(structuredReport),
+      problem: (project, report) => manager?.busReportProblem(project, report) ?? null,
+      onReport: (project) => void manager?.checkFillSoon(project),
+      onMessage: () => {},
+      onRunEnded: (project) => void manager?.checkFillSoon(project),
+      warn: (text) => warnings.push(text),
+    });
+    consumers.setMode("demo", mode);
+    manager = new AgentsManager({
+      dbPath: paths.dbPath,
+      probes: { processes: procs, fs: new NodeFileSystem(), runner: new FakeCommandRunner(), clock, spawner, self: SELF, systemInfo: new FakeSystemInfo() },
+      events,
+      bus: agentsBusFor({ consumers, store: (project) => busStoreFor(project, dataDir), clock, serverUrl: SERVER_URL }),
+    });
+    managers.push(manager);
+    manager.load([{ name: "demo", config }]);
+    consumers.start();
+    const app = Fastify({ logger: false });
+    apps.push(app);
+    forgetBusService("demo");
+    await registerBusRoutes(app, HumanAuth.open({ tokenPath: join(paths.dir, "owner.token"), dbPath: ":memory:" }), {
+      agents: manager,
+      events,
+      dataDir,
+      getConfig: () => config,
+      mode: (project) => consumers.mode(project),
+      enabled: () => consumers.enabled(),
+      health: (project) => consumers.health(project),
+    });
+    await app.ready();
+    const service = manager.get("demo");
+    const store = manager.getStore();
+    if (!service || !store) throw new Error("agents not enabled");
+    return { paths, config, clock, spawner, manager, service, store, consumers, app, warnings };
+  }
+
+  afterEach(() => closeBusStores());
+
+  const tasks = (h: BusHarness, ...lines: string[]) => writeFileSync(tasksPath(h.paths), `${lines.join("\n")}\n`);
+  const lineOf = (h: BusHarness, task: string) => h.service.fillStatus().lines.find((l) => l.task === task);
+  const kinds = (h: BusHarness, kind: AgentEventKind) => h.store.listEvents("demo", { kinds: [kind], limit: 500 }).reverse();
+  /** What `lair bus report` sends: POST /api/bus/call with the run's token, no project */
+  const report = (h: BusHarness, token: string, args: Record<string, unknown>) =>
+    h.app.inject({ method: "POST", url: "/api/bus/call", headers: { authorization: `Bearer ${token}` }, payload: { tool: "report", args } });
+
+  /** Fill starts feat-login for worker-a, the tick spawns it: its bus token */
+  async function started(h: BusHarness): Promise<string> {
+    await h.service.checkFill();
+    await h.service.tick();
+    return h.spawner.calls.at(-1)?.env.LAIR_BUS_TOKEN ?? "";
+  }
+
+  it("on: a DONE over the bus reaches fill's state as soon as the run ends, read from the report; never twice, also after a restart", async () => {
+    // A done_pattern whose words the mirror doesn't write: only the report's own kind can say DONE
+    const h = await busSetup("on", { done_pattern: "^-\\s+FINISHED\\s+{task}(?=\\s|$)" });
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    const token = await started(h);
+    expect(token).toMatch(/^lairbus_/);
+    expect(h.spawner.calls[0].env.LAIR_URL).toBe(SERVER_URL);
+
+    const posted = await report(h, token, { kind: "DONE", task: "feat-login", summary: "merged", pr: 12, sha: "abc1234def" });
+    expect(posted.statusCode).toBe(200);
+    const id = posted.json().data.id as number;
+    const mirrored = readFileSync(h.paths.queueFile, "utf-8").trim().split("\n").at(-1) ?? "";
+    expect(mirrored).toMatch(new RegExp(`^- DONE feat-login by worker-a \\d\\d:\\d\\dZ: merged PR #12 \\[abc1234\\] \\[bus:${id}\\]$`));
+    // While the run is active the task is not done yet (as on main): the report's check sees it started
+    await vi.waitFor(() => expect(lineOf(h, "feat-login")?.state).toBe("started"));
+
+    // The agent exits 0 one second later; the tick sees it end, and fill checks at once (its interval is an hour)
+    const reportedAt = h.clock.now();
+    h.clock.advance(1 * SEC);
+    h.spawner.exit(5001, 0);
+    await h.service.tick();
+    await vi.waitFor(() => expect(lineOf(h, "feat-login")?.state).toBe("done"));
+    expect(h.clock.now() - reportedAt).toBeLessThan(2 * SEC);
+    const [done] = kinds(h, "fill_done");
+    expect(done.data).toMatchObject({ busId: id, line: expect.stringContaining(`[bus:${id}]`) });
+
+    // Read again and again, with a hand-copied duplicate of the line, then by a new server on the same files
+    appendFileSync(h.paths.queueFile, `${mirrored}\n`);
+    await h.service.checkFill();
+    await h.service.checkFill();
+    const again = await busSetup("on", { done_pattern: "^-\\s+FINISHED\\s+{task}(?=\\s|$)" }, h);
+    await again.service.checkFill();
+    expect(lineOf(again, "feat-login")?.state).toBe("done");
+    expect(kinds(again, "fill_done")).toHaveLength(1);
+    expect(again.spawner.calls).toHaveLength(0);
+  });
+
+  it("on: a BLOCKED over the bus raises exactly one hold and one decision, also after a restart", async () => {
+    const h = await busSetup("on");
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    const token = await started(h);
+    const posted = await report(h, token, { kind: "BLOCKED", task: "feat-login", summary: "needs the staging password" });
+    const id = posted.json().data.id as number;
+    h.spawner.exit(5001, 0);
+    await h.service.tick();
+    await vi.waitFor(() => expect(lineOf(h, "feat-login")).toMatchObject({ state: "held", hold: "blocked" }));
+    await h.service.checkFill();
+    await h.service.checkFill();
+    expect(kinds(h, "fill_held").map((e) => e.data)).toEqual([expect.objectContaining({ hold: "blocked", busId: id })]);
+    expect(inboxEntries(h.paths)).toHaveLength(1);
+
+    const again = await busSetup("on", {}, h);
+    await again.service.checkFill();
+    expect(lineOf(again, "feat-login")).toMatchObject({ state: "held", hold: "blocked" });
+    expect(kinds(again, "fill_held")).toHaveLength(1);
+    expect(inboxEntries(h.paths)).toHaveLength(1);
+  });
+
+  it("on: a WAITING over the bus waits on its gate id, from the report's field (its summary names no gate)", async () => {
+    const h = await busSetup("on");
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    const token = await started(h);
+    const posted = await report(h, token, { kind: "WAITING", task: "feat-login", summary: "the gate runs", gate_id: "gate-42" });
+    const id = posted.json().data.id as number;
+    h.spawner.exit(5001, 0);
+    await h.service.tick();
+    await vi.waitFor(() => expect(kinds(h, "fill_waiting")).toHaveLength(1));
+    expect(kinds(h, "fill_waiting")[0].data).toMatchObject({ wake: "gate-42", busId: id });
+  });
+
+  it("observe: fill reads the lines as before (nothing it records changes) and records what the report says next to it", async () => {
+    const h = await busSetup("observe", { done_pattern: "^-\\s+FINISHED\\s+{task}(?=\\s|$)" });
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    const token = await started(h);
+    expect(token).toMatch(/^lairbus_/);
+    const id = (await report(h, token, { kind: "DONE", task: "feat-login", summary: "merged" })).json().data.id as number;
+    h.spawner.exit(5001, 0);
+    await h.service.tick();
+    await h.service.checkFill();
+    // The pattern doesn't read the mirror's DONE: not done, as without the bus
+    expect(lineOf(h, "feat-login")?.state).not.toBe("done");
+    expect(kinds(h, "fill_done")).toEqual([]);
+    expect(h.store.listEvents("demo", { limit: 500 }).filter((e) => "busId" in e.data)).toEqual([]);
+    expect(h.consumers.health("demo").observations).toMatchObject({
+      total: 1,
+      mismatches: 1,
+      recent: [{ consumer: "fill", busId: id, task: "feat-login", report: "done", file: "nothing (no done, waiting or blocked line)" }],
+    });
+    expect(h.consumers.health("demo")).toMatchObject({ mode: "observe", received: 1 });
+  });
+
+  it("off: as without the bus: no token, the bus routes answer 404, and a line with a marker is read as text", async () => {
+    const h = await busSetup("off");
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    await started(h);
+    expect(h.spawner.calls[0].env.LAIR_BUS_TOKEN).toBeUndefined();
+    expect(h.spawner.calls[0].env.LAIR_URL).toBeUndefined();
+    expect((await report(h, "lairbus_" + "a".repeat(43), { kind: "DONE", task: "feat-login", summary: "x" })).statusCode).toBe(401);
+    appendFileSync(h.paths.queueFile, "- DONE feat-login by worker-a 12:05Z: merged [bus:1]\n");
+    h.spawner.exit(5001, 0);
+    await h.service.tick();
+    await h.service.checkFill();
+    expect(lineOf(h, "feat-login")?.state).toBe("done");
+    expect(kinds(h, "fill_done")[0].data.busId).toBeUndefined();
+    expect(existsSync(join(h.paths.dir, "data", "bus"))).toBe(false);
+  });
+
+  it("refuses an invalid report with its reason, and ignores (and audits) one for a task or agent fill doesn't know", async () => {
+    const h = await busSetup("on");
+    // Fill starts nothing here: its only line is an agent it may not run
+    tasks(h, "worker-b|Bob|feat-search|Search page");
+    await h.service.checkFill();
+    expect(lineOf(h, "feat-search")?.state).toBe("not_allowlisted");
+    // The owner starts runs fill doesn't know about: a task not in the tasks file, and an agent not allowlisted
+    await h.service.requestRun({ agent: "worker-a", task: "chore-docs", prompt: "Fix the docs" });
+    await h.service.requestRun({ agent: "worker-b", task: "feat-search", prompt: "Search page" });
+    await h.service.tick();
+    const tokenOf = (task: string) => h.spawner.calls.find((c) => c.env.LAIR_TASK === task)?.env.LAIR_BUS_TOKEN ?? "";
+
+    // Refused by the bus with the reason: a kind it doesn't know, a task the run doesn't hold
+    const bad = await report(h, tokenOf("chore-docs"), { kind: "FINISHED", task: "chore-docs", summary: "x" });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json().error).toContain("kind");
+    const notHeld = await report(h, tokenOf("chore-docs"), { kind: "DONE", task: "feat-search", summary: "x" });
+    expect(notHeld.statusCode).toBe(403);
+    expect(notHeld.json().error).toBe('Your run holds task "chore-docs", not "feat-search"');
+
+    const chore = (await report(h, tokenOf("chore-docs"), { kind: "DONE", task: "chore-docs", summary: "done" })).json().data.id as number;
+    const search = (await report(h, tokenOf("feat-search"), { kind: "DONE", task: "feat-search", summary: "done" })).json().data.id as number;
+    await vi.waitFor(() => expect(h.consumers.health("demo").refusedCount).toBe(2));
+    expect(h.consumers.health("demo").refused.map((r) => [r.busId, r.reason])).toEqual([
+      [search, "bus.report ignored: worker-b is not in agents.fill.agents: fill ignores the report"],
+      [chore, "bus.report ignored: task chore-docs is not in agents.fill.tasks_file: fill ignores the report"],
+    ]);
+    expect(kinds(h, "fill_done")).toEqual([]);
+    expect(lineOf(h, "feat-search")?.state).toBe("not_allowlisted");
+  });
+
+  it("on: a hand-written line is read as text; one that ends with another report's marker too (and is audited)", async () => {
+    const h = await busSetup("on");
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    const token = await started(h);
+    const progress = (await report(h, token, { kind: "PROGRESS", task: "feat-login", summary: "half way" })).json().data.id as number;
+    appendFileSync(h.paths.queueFile, `- DONE feat-login by worker-a 12:05Z: merged [bus:${progress}]\n`);
+    h.spawner.exit(5001, 0);
+    await h.service.tick();
+    await vi.waitFor(() => expect(lineOf(h, "feat-login")?.state).toBe("done"));
+    expect(kinds(h, "fill_done")[0].data.busId).toBeUndefined();
+    expect(h.consumers.health("demo").refused.map((r) => r.reason)).toContain(
+      "a queue line ends with this report's marker but is not its mirrored line (PROGRESS feat-login by worker-a): read as a hand-written line",
+    );
+  });
+
+  it("the run's bus token is refused once the run has ended (revoked)", async () => {
+    const h = await busSetup("on");
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    const token = await started(h);
+    h.spawner.exit(5001, 0);
+    await h.service.tick();
+    const late = await report(h, token, { kind: "DONE", task: "feat-login", summary: "late" });
+    expect(late.statusCode).toBe(401);
+    expect(readFileSync(h.paths.queueFile, "utf-8")).not.toContain("late");
   });
 });

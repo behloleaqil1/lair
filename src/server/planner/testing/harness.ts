@@ -26,6 +26,7 @@ import {
   type ProcessTable,
 } from "../../watchdog/probes.js";
 import { mountPlanner, plannerAgentsFrom, type PlannerManager, type PlannerService } from "../index.js";
+import type { BusLineSource } from "../../bus/consumers.js";
 
 export const NOW = Date.parse("2026-03-02T12:00:00.000Z");
 export const SEC = 1000;
@@ -254,7 +255,13 @@ export function plannerBlock(p: Paths, over: Record<string, unknown> = {}): Reco
 export async function setup(
   p: Paths,
   planner: Record<string, unknown>,
-  options: { clock?: FakeClock; dbs?: Harness["dbs"]; extra?: Partial<ProjectConfig> } = {},
+  options: {
+    clock?: FakeClock;
+    dbs?: Harness["dbs"];
+    extra?: Partial<ProjectConfig>;
+    /** The project's bus as fill and the planner read it (bus.consume observe or on); no bus without it */
+    bus?: (project: string) => BusLineSource | null;
+  } = {},
 ): Promise<Harness> {
   const config = projectConfig(p, planner, options.extra);
   const clock = options.clock ?? new FakeClock();
@@ -272,7 +279,13 @@ export async function setup(
     decisions: join(p.dir, "data", "decisions.db"),
     owner: join(p.dir, "data", "owner.token"),
   };
-  const agents = new AgentsManager({ dbPath: dbs.agents, probes, events });
+  const busSource = options.bus;
+  const agents = new AgentsManager({
+    dbPath: dbs.agents,
+    probes,
+    events,
+    bus: busSource ? { lineSource: busSource, mintToken: () => null, revokeTokens: () => {} } : undefined,
+  });
   agents.load([{ name: "demo", config }]);
   const app = Fastify();
   const auth = HumanAuth.open({ tokenPath: dbs.owner, dbPath: ":memory:" });
@@ -294,6 +307,7 @@ export async function setup(
     projects: [{ name: "demo", config }],
     defaultProject: () => "demo",
     humanAuth: auth,
+    bus: busSource,
   });
   plannerManager.useDecisions(inbox);
   await app.ready();

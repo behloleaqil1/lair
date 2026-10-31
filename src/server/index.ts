@@ -28,7 +28,7 @@ import {
 } from "./human-auth/index.js";
 import { registerControlRoutes } from "./routes/controls.js";
 import { busStoreFor, forgetBusService, registerBusRoutes } from "./routes/bus.js";
-import { BusConsumers, closeBusStores, hashBusToken, newBusToken, parseBusConfig, structuredReport } from "./bus/index.js";
+import { BusConsumers, agentsBusFor, closeBusStores, parseBusConfig, structuredReport } from "./bus/index.js";
 import { registerProcessRoutes } from "./routes/processes.js";
 import { registerSettingsRoutes } from "./routes/settings.js";
 import { getSupervisor } from "./services/supervisor.js";
@@ -542,30 +542,14 @@ const agents: AgentsManager = new AgentsManager({
   budget: getBudgetManager(),
   tools: aiTools,
   probes: systemAgentProbesWithCache(processCache),
-  bus: {
-    lineSource: (project) => busConsumers.lineSource(project),
-    mintToken: (project, runId, agent) => {
-      if (busConsumers.mode(project) === "off") return null;
-      try {
-        const token = newBusToken();
-        busStoreFor(project, busDataDir).issueToken(agent, runId, hashBusToken(token), Date.now());
-        return token;
-      } catch (e) {
-        console.warn(`[bus] ${project}: no bus token for run ${runId.slice(0, 8)}: ${e instanceof Error ? e.message : String(e)}`);
-        return null;
-      }
-    },
-    revokeTokens: (project, runId) => {
-      // Off: no token is accepted for the project anyway (the routes answer 404)
-      if (busConsumers.mode(project) === "off") return;
-      try {
-        busStoreFor(project, busDataDir).revokeTokensForRun(runId, Date.now());
-      } catch (e) {
-        console.warn(`[bus] ${project}: revoking run ${runId.slice(0, 8)}'s bus token failed: ${e instanceof Error ? e.message : String(e)}`);
-      }
-    },
+  // A bus token per run (and its revocation when the run ends) while the project's bus is on
+  bus: agentsBusFor({
+    consumers: busConsumers,
+    store: (project) => busStoreFor(project, busDataDir),
+    clock: { now: () => Date.now() },
     serverUrl: dashboardUrlFor(HOST, PORT),
-  },
+    warn: (text) => console.warn(text),
+  }),
 });
 agents.load(projectEntries);
 managedRuns = agents;

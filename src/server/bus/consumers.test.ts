@@ -375,9 +375,10 @@ describe("BusConsumers.lineSource: the bus as fill and the planner read it", () 
   });
 
   it("reads each report from the store once, in one read for many ids", () => {
-    const { bus, calls } = consumers("on");
+    // Filed before the consumers start: no event of theirs has read them yet
     const a = report("DONE");
     const b = report("BLOCKED");
+    const { bus, calls } = consumers("on");
     const source = bus.lineSource(PROJECT)!;
     expect([...source.reports([a, b, 999]).keys()]).toEqual([a, b]);
     expect([...source.reports([a, b]).keys()]).toEqual([a, b]);
