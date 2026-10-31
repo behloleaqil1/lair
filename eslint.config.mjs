@@ -17,7 +17,7 @@ export default tseslint.config(
     rules: {
       '@typescript-eslint/no-unused-vars': ['error', { 
         argsIgnorePattern: '^_',
-        caughtErrorsIgnorePattern: '^_',
+        caughtErrors: 'none',  // Preserve ESLint 8 behavior - caught errors weren't flagged
       }],
       'no-empty': ['error', { allowEmptyCatch: true }],
       // Disable new ESLint 10 rules to preserve existing codebase behavior
