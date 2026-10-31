@@ -121,7 +121,8 @@ export function classifyAgent(
 /**
  * Find ready work from the available sources.
  * Ready work is a task that:
- * - Is not assigned to any agent (unassigned state)
+ * - Is not assigned to any agent (unassigned state), OR
+ * - Has an agent not in fill.agents (not_allowlisted state)
  * - Is not done
  * - Has no unmet dependencies (in the plan)
  */
@@ -134,9 +135,9 @@ export function findReadyWork(
   const ready: ReadyWork[] = [];
 
   if (sources.includes("tasks_file")) {
-    // Tasks in the tasks file that are unassigned (ready for any agent)
+    // Tasks in the tasks file that are unassigned OR not_allowlisted (ready for any agent)
     for (const line of tasksFileLines) {
-      if (line.state === "unassigned" && line.task) {
+      if ((line.state === "unassigned" || line.state === "not_allowlisted") && line.task) {
         ready.push({
           source: "tasks_file",
           task: line.task,
@@ -171,12 +172,12 @@ export function computeIdleStates(
   for (const agent of allowedAgents) {
     const { reason, hold, task } = classifyAgent(agent, lines, activeCount, maxActive, capacityRefused);
 
-    // Determine if this is a "ready_work" idle (the problem case)
+    // Determine if this is a "ready_work" idle (the problem case) or "no_ready_work"
     let finalReason = reason;
-    if (reason === "no_ready_work" && hasReadyWork) {
-      finalReason = "ready_work";
-    }
-    if (reason === "task_done" && hasReadyWork) {
+    if (reason === "task_done") {
+      // Agent's tasks are done - check if ready work exists
+      finalReason = hasReadyWork ? "ready_work" : "no_ready_work";
+    } else if (reason === "no_ready_work" && hasReadyWork) {
       finalReason = "ready_work";
     }
 
