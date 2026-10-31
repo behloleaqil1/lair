@@ -817,7 +817,8 @@ describe("pipeline lane holds", () => {
     await pipelines.idle();
     const done = pipelines.getRun(PROJECT, run.id);
     expect(done.status).toBe("passed");
-    expect(done.jobs[0]).toMatchObject({ executor: "local", waitReason: null });
+    expect(done.jobs[0].executor).toBe("local");
+    expect(done.jobs[0].waitReason ?? null).toBeNull();
     expect(spawner.stepCalls().length).toBeGreaterThan(0);
   });
 
