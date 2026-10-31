@@ -155,7 +155,7 @@ describe("readAnswerFile", () => {
     const dir = tempDir();
     const result = readAnswerFile(join(dir, "nope.json"), dir);
     expect(result.ok).toBe(false);
-    expect((result as { error: string }).error).toContain("cannot read file");
+    expect((result as { error: string }).error).toContain("cannot be read or does not exist");
   });
 
   it("rejects file exceeding max size", () => {
@@ -271,7 +271,7 @@ describe("takeAnswerFile", () => {
     const runFolder = tempDir();
     const result = takeAnswerFile(runFolder);
     expect(result.ok).toBe(false);
-    expect((result as { error: string }).error).toContain("cannot read file");
+    expect((result as { error: string }).error).toContain("cannot be read or does not exist");
   });
 });
 
