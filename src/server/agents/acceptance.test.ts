@@ -5280,6 +5280,137 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     // No unmatched reports in agent_legacy mode
     expect(status.unmatchedReports).toHaveLength(0);
   });
+
+  it("prefix collision: DONE fix-1 does not close fix-10", async () => {
+    const h = setup(fill());
+    prompts(h);
+    tasks(h, "worker-a|Alice|fix-10|Fix the tenth issue");
+
+    await check(h);
+    const [run] = runs(h);
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 1 * MIN);
+    expect(run.state).toBe("completed");
+
+    // Report DONE for fix-1, not fix-10
+    appendFileSync(h.queueFile, "- DONE fix-1 by worker-a 12:05Z: closed\n");
+    const status = await check(h);
+
+    // fix-10 stays open - fix-1 is a different task
+    expect(lineOf(status, "fix-10").state).not.toBe("done");
+    expect(status.unmatchedReports).toHaveLength(1);
+    expect(status.unmatchedReports[0].reportedTask).toBe("fix-1");
+    expect(status.unmatchedReports[0].openTask).toBe("fix-10");
+  });
+
+  it("prefix collision: DONE fix-1-2 does not close fix-1", async () => {
+    const h = setup(fill());
+    prompts(h);
+    tasks(h, "worker-a|Alice|fix-1|Fix the first issue");
+
+    await check(h);
+    const [run] = runs(h);
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 1 * MIN);
+    expect(run.state).toBe("completed");
+
+    // Report DONE for fix-1-2, not fix-1
+    appendFileSync(h.queueFile, "- DONE fix-1-2 by worker-a 12:05Z: closed\n");
+    const status = await check(h);
+
+    // fix-1 stays open - fix-1-2 is a different task
+    expect(lineOf(status, "fix-1").state).not.toBe("done");
+    expect(status.unmatchedReports).toHaveLength(1);
+    expect(status.unmatchedReports[0].reportedTask).toBe("fix-1-2");
+    expect(status.unmatchedReports[0].openTask).toBe("fix-1");
+  });
+
+  it("another agent's line for the same task is not counted", async () => {
+    const h = setup(fill());
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+
+    await check(h);
+    const [run] = runs(h);
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 1 * MIN);
+    expect(run.state).toBe("completed");
+
+    // Another agent (worker-b) reports DONE for feat-login
+    appendFileSync(h.queueFile, "- DONE feat-login by worker-b 12:05Z: merged\n");
+    const status = await check(h);
+
+    // The task is NOT done (worker-a's task, not worker-b's)
+    expect(lineOf(status, "feat-login").state).not.toBe("done");
+    // No unmatched report because worker-b is not the task's agent
+    expect(status.unmatchedReports).toHaveLength(0);
+  });
+
+  it("task ids with special characters: dot, colon, underscore", async () => {
+    const h = setup(fill());
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat.login_v2:main|Build the login form");
+
+    await check(h);
+    const [run] = runs(h);
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 1 * MIN);
+    expect(run.state).toBe("completed");
+
+    // Report DONE for the correct task with special characters
+    appendFileSync(h.queueFile, "- DONE feat.login_v2:main by worker-a 12:05Z: merged\n");
+    const status = await check(h);
+
+    // The task is done
+    expect(lineOf(status, "feat.login_v2:main")).toMatchObject({ state: "done" });
+    expect(status.unmatchedReports).toHaveLength(0);
+  });
+
+  it("READY line with the correct task is treated like DONE", async () => {
+    // READY is detected via extractReportedTask which handles DONE/WAITING/BLOCKED
+    // but READY is not one of those, so it won't be detected as unmatched
+    // (This is a verification that READY doesn't break anything)
+    const h = setup(fill());
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+
+    await check(h);
+    const [run] = runs(h);
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 1 * MIN);
+    expect(run.state).toBe("completed");
+
+    // Report READY (not DONE) - this isn't detected as a standard report
+    appendFileSync(h.queueFile, "- READY feat-login by worker-a 12:05Z: PR #12\n");
+    const status = await check(h);
+
+    // READY doesn't close the task (only DONE does)
+    expect(lineOf(status, "feat-login").state).not.toBe("done");
+    // READY is not an unmatched report (it's not DONE/WAITING/BLOCKED)
+    expect(status.unmatchedReports).toHaveLength(0);
+  });
+
+  it("DONE review-task does not close task when the open task is different", async () => {
+    const h = setup(fill());
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+
+    await check(h);
+    const [run] = runs(h);
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
+    await at(h, 1 * MIN);
+    expect(run.state).toBe("completed");
+
+    // Report DONE for review-feat-login, not feat-login
+    appendFileSync(h.queueFile, "- DONE review-feat-login by worker-a 12:05Z: reviewed\n");
+    const status = await check(h);
+
+    // feat-login stays open
+    expect(lineOf(status, "feat-login").state).not.toBe("done");
+    expect(status.unmatchedReports).toHaveLength(1);
+    expect(status.unmatchedReports[0].reportedTask).toBe("review-feat-login");
+    expect(status.unmatchedReports[0].openTask).toBe("feat-login");
+  });
 });
 
 
