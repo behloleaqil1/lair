@@ -144,19 +144,19 @@ export class TrackerService {
       );
     }
 
-    // Subscribe to events (fire-and-forget to avoid blocking emitter)
+    // Subscribe to events (handlers are awaited by EventBus.emit)
     this.unsubscribes.push(
-      this.eventBus.on("agent.run.started", (e) => void this.safeHandle(() => this.onRunStarted(e))),
-      this.eventBus.on("agent.run.ended", (e) => void this.safeHandle(() => this.onRunEnded(e))),
-      this.eventBus.on("review.merged", (e) => void this.safeHandle(() => this.onPRMerged(e))),
-      this.eventBus.on("planner.changed", (e) => void this.safeHandle(() => this.onPlannerChanged(e))),
+      this.eventBus.on("agent.run.started", (e) => this.safeHandle(() => this.onRunStarted(e))),
+      this.eventBus.on("agent.run.ended", (e) => this.safeHandle(() => this.onRunEnded(e))),
+      this.eventBus.on("review.merged", (e) => this.safeHandle(() => this.onPRMerged(e))),
+      this.eventBus.on("planner.changed", (e) => this.safeHandle(() => this.onPlannerChanged(e))),
     );
 
     // Schedule first reconcile
     this.scheduleReconcile();
   }
 
-  /** Wrap handler to catch errors without blocking the bus. */
+  /** Wrap handler to catch errors without crashing the bus. */
   private async safeHandle(fn: () => Promise<void>): Promise<void> {
     try {
       await fn();
