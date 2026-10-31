@@ -375,3 +375,89 @@ describe('self-validation', () => {
     expect(stats.mode & 0o100).toBeTruthy();
   });
 });
+
+describe('CRLF handling', () => {
+  let repo: TestRepo;
+
+  beforeEach(() => {
+    repo = createTestRepo();
+  });
+
+  afterEach(() => {
+    repo.cleanup();
+  });
+
+  it('handles Windows-style CRLF line endings', () => {
+    // Create PR body with CRLF line endings
+    const prBody = 'Some description\r\nrevert-check: test.js guards src/feature.ts\r\n## More stuff\r\n';
+    const result = runRevertChecksWithCode(repo.dir, prBody, 'base-branch');
+    // Should parse correctly and find the check
+    expect(result.stdout).toContain('Found 1 revert-check');
+    expect(result.exitCode).toBe(0);
+  });
+
+  it('handles mixed LF and CRLF line endings', () => {
+    const prBody = 'Line one\nLine two\r\nrevert-check: test.js guards src/feature.ts\r\nLine four\n';
+    const result = runRevertChecksWithCode(repo.dir, prBody, 'base-branch');
+    expect(result.stdout).toContain('Found 1 revert-check');
+    expect(result.exitCode).toBe(0);
+  });
+});
+
+describe('self-revert protection', () => {
+  let repo: TestRepo;
+
+  beforeEach(() => {
+    repo = createTestRepo();
+  });
+
+  afterEach(() => {
+    repo.cleanup();
+  });
+
+  it('rejects revert-check that targets the script itself', () => {
+    // Create scripts directory and a copy of the revert-checks script
+    mkdirSync(join(repo.dir, 'scripts'), { recursive: true });
+    writeFileSync(
+      join(repo.dir, 'scripts/revert-checks.sh'),
+      '#!/bin/bash\necho "the script"\n'
+    );
+    execSync('git add scripts/', { cwd: repo.dir, stdio: 'pipe' });
+    execSync('git commit -m "Add scripts"', { cwd: repo.dir, stdio: 'pipe' });
+
+    const prBody = `
+revert-check: test.js guards scripts/revert-checks.sh
+`;
+    const result = runRevertChecksWithCode(repo.dir, prBody, 'base-branch');
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain('Cannot revert the revert-checks script itself');
+  });
+});
+
+describe('test spec validation', () => {
+  let repo: TestRepo;
+
+  beforeEach(() => {
+    repo = createTestRepo();
+  });
+
+  afterEach(() => {
+    repo.cleanup();
+  });
+
+  it('rejects test specs with shell metacharacters', () => {
+    const prBody = `
+revert-check: test.js; rm -rf / guards src/feature.ts
+`;
+    const result = runRevertChecksWithCode(repo.dir, prBody, 'base-branch');
+    // Should be caught as malformed (the ; breaks the pattern)
+    expect(result.exitCode).toBe(2);
+  });
+
+  it('rejects test specs with backticks', () => {
+    // Even if it parsed, the test spec itself would be rejected
+    const prBody = 'revert-check: `whoami`.test.ts guards src/feature.ts\n';
+    const result = runRevertChecksWithCode(repo.dir, prBody, 'base-branch');
+    expect(result.exitCode).toBe(2);
+  });
+});

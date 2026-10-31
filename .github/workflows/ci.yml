@@ -116,17 +116,21 @@ jobs:
 
       - name: Extract PR body
         if: steps.docs-check.outputs.docs_only != 'true'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          cat << 'PR_BODY_EOF' > pr-body.md
-          ${{ github.event.pull_request.body }}
-          PR_BODY_EOF
+          # Write PR body from env var (avoids heredoc injection)
+          # Uses printf to handle embedded newlines safely
+          printf '%s' "$PR_BODY" > pr-body.md
 
       - name: Check revert-check requirement
         if: steps.docs-check.outputs.docs_only != 'true'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          PR_TITLE="${{ github.event.pull_request.title }}"
           CHANGES_SERVER=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..${{ github.sha }} | grep -c '^src/server/' || true)
           if [[ "$CHANGES_SERVER" -gt 0 ]]; then
+            # Check if title starts with fix( or feat( using pattern matching
             if [[ "$PR_TITLE" =~ ^(fix|feat)\( ]]; then
               if ! grep -q '^revert-check:' pr-body.md; then
                 if ! grep -qi 'no revert-check:' pr-body.md && ! grep -qi 'revert-check-exempt:' pr-body.md; then

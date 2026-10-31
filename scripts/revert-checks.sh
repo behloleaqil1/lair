@@ -20,6 +20,10 @@
 # Don't use set -e as we need to handle errors explicitly
 set -uo pipefail
 
+# Script path (used to detect self-revert)
+SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+SCRIPT_RELATIVE="scripts/revert-checks.sh"
+
 # Color output (disabled if not a terminal)
 if [[ -t 1 ]]; then
   RED='\033[0;31m'
@@ -55,6 +59,11 @@ PR_BODY_FILE="$1"
 BASE_REF="$2"
 
 [[ -f "$PR_BODY_FILE" ]] || { log_error "PR body file not found: $PR_BODY_FILE"; exit 2; }
+
+# Normalize CRLF to LF in PR body (Windows line endings cause parsing issues)
+NORMALIZED_BODY=$(mktemp)
+tr -d '\r' < "$PR_BODY_FILE" > "$NORMALIZED_BODY"
+PR_BODY_FILE="$NORMALIZED_BODY"
 
 # Verify we're in a git repository
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { log_error "Not in a git repository"; exit 3; }
@@ -112,6 +121,8 @@ ORIGINAL_HEAD=$(git rev-parse HEAD)
 
 # Cleanup function
 cleanup() {
+  # Remove normalized body temp file
+  rm -f "$NORMALIZED_BODY"
   # Restore original state
   git checkout --quiet "$ORIGINAL_HEAD" -- . 2>/dev/null || true
   git clean -fd --quiet 2>/dev/null || true
@@ -136,6 +147,16 @@ for check in "${CHECKS[@]}"; do
   # Validate source file exists in current tree
   if [[ ! -f "$source_file" ]]; then
     log_error "Source file not found: $source_file"
+    ERRORS=$((ERRORS + 1))
+    continue
+  fi
+
+  # Block self-revert: do not allow reverting the script itself
+  # Resolving symlinks to catch aliased paths
+  source_real=$(cd "$(dirname "$source_file")" 2>/dev/null && pwd)/$(basename "$source_file")
+  if [[ "$source_real" == "$SCRIPT_PATH" ]] || [[ "$source_file" == "$SCRIPT_RELATIVE" ]]; then
+    log_error "Cannot revert the revert-checks script itself: $source_file"
+    log_error "This would cause unpredictable behavior. Use a separate test PR."
     ERRORS=$((ERRORS + 1))
     continue
   fi
@@ -218,22 +239,31 @@ for check in "${CHECKS[@]}"; do
   # Run the test (expecting it to FAIL)
   log_info "  Running test: $test_spec (expecting FAIL)"
 
-  # Build the npm test command
-  # For vitest, we can pass a filter pattern
+  # Build the npm test command as an array to avoid shell injection
+  # Validate test spec characters first (only alphanumeric, dots, underscores, hyphens, slashes)
+  if [[ ! "$test_spec" =~ ^[A-Za-z0-9_./-]+$ ]]; then
+    log_error "Invalid test spec - contains disallowed characters: $test_spec"
+    ERRORS=$((ERRORS + 1))
+    # Restore the source file for next check
+    git checkout --quiet "$ORIGINAL_HEAD" -- "$source_file" 2>/dev/null || true
+    continue
+  fi
+
+  # For vitest, we pass the test spec as a filter pattern or file path
   if [[ -n "$test_file" ]]; then
-    test_cmd="npm test -- --reporter=basic $test_file"
+    test_args=("npm" "test" "--" "--reporter=basic" "$test_file")
   else
-    # Use as a pattern/filter
-    test_cmd="npm test -- --reporter=basic -t '$test_spec'"
+    # Use as a pattern/filter - note: vitest -t takes a regex pattern
+    test_args=("npm" "test" "--" "--reporter=basic" "-t" "$test_spec")
   fi
 
   # Run with timeout (use 'timeout' command if available, else just run)
   test_rc=0
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$TIMEOUT_PER_CHECK" bash -c "$test_cmd" >/dev/null 2>&1
+    timeout "$TIMEOUT_PER_CHECK" "${test_args[@]}" >/dev/null 2>&1
     test_rc=$?
   else
-    bash -c "$test_cmd" >/dev/null 2>&1
+    "${test_args[@]}" >/dev/null 2>&1
     test_rc=$?
   fi
 
