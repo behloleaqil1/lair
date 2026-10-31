@@ -10,6 +10,7 @@ No network and no state: the same input gives the same model.
 """
 import json
 import math
+import os
 import signal
 import sys
 
@@ -106,11 +107,17 @@ def build(rows, params):
     return model, fit_info
 
 
+def _deadline_handler(signum, frame):
+    """Exit immediately on SIGALRM. PID 1 ignores signals with default actions, so an explicit handler is required."""
+    os._exit(124)
+
+
 def set_deadline(text):
-    """The container's own time limit: SIGALRM has no handler, so it ends the process whatever the fit is doing."""
+    """The container's own time limit. The handler exits with 124 (shell timeout convention) when the alarm fires."""
     seconds = int(text)
     if not 1 <= seconds <= 86_400:
         raise ValueError("deadline_seconds must be 1-86400")
+    signal.signal(signal.SIGALRM, _deadline_handler)
     signal.alarm(seconds)
 
 
