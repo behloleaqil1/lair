@@ -98,11 +98,14 @@ import { lastLines, readTail } from "./sessions.js";
 import type { AgentsStore } from "./store.js";
 import { isActive, isValidTaskId, type AgentRun, type QueueMark } from "./types.js";
 import type { ProcessInfo } from "../watchdog/probes.js";
+import { evaluateReady, isPrWork, parseReadyReport, refuseReport, unverifiable, type ReadyFactsSource, type ReadyVerdict } from "../ready-guard/guard.js";
 
 export const MAX_TASKS_FILE_BYTES = 256 * 1024;
 export const MAX_TASK_LINES = 200;
 export const MAX_TASK_LINE_CHARS = 2000;
 const CAPACITY_PROBE_TIMEOUT_MS = 5_000;
+/** After the git host failed or timed out, the ready guard leaves it alone this long */
+const HOST_BACKOFF_MS = 60_000;
 
 /** What one fill check reads of the machine and of the heavy work, once */
 interface CapacityState {
@@ -915,6 +918,8 @@ export interface AgentsFillOptions {
   findDecision: (key: string) => Decision | null | undefined;
   /** Withdraw a decision whose hold lifted (never throws) */
   withdraw: (decision: Decision, reason: string) => Promise<void>;
+  /** The ready guard's source for this project's PRs (used when settings.readyGuard is on); undefined: none, nothing is refused */
+  readyFacts?: () => ReadyFactsSource | undefined;
 }
 
 function firstLine(text: string): string | null {
@@ -941,6 +946,8 @@ export class AgentsFill {
   private lastError: string | null = null;
   /** The hold each held line is in (agent|task -> hold): fill_held is recorded when it changes */
   private holds = new Map<string, FillHold>();
+  /** The git host failed or timed out: the ready guard asks it nothing until then (clock ms) */
+  private guardDownUntil = 0;
   /** When fill last looked for a waiting run's wake file and didn't find it (task|run -> time) */
   private polled = new Map<string, number>();
   /** The waiting runs seen in the check in progress (to forget the others' polls) */
@@ -1314,7 +1321,23 @@ export class AgentsFill {
         show("done", `done: ${oneLine(check.line)} (seen ${iso(check.at)})`, latest?.id ?? null);
         continue;
       }
-      if (check?.kind === "queue") {
+      // A DONE line that names a PR counts only when the PR is ready to review (settings.readyGuard)
+      const refusal = check?.kind === "queue" ? await this.guardReport(agent, task, check.line, latest, description) : null;
+      if (refusal?.retry && refusal.expired && !(release && release.at >= refusal.since)) {
+        // Waited long enough: one decision for the owner, the report stays refused
+        await refused(
+          `done line still not verifiable after ${Math.round((probes.clock.now() - refusal.since) / 60000)} min: ${refusal.problems.map((p) => oneLine(p, 160)).join("; ")}`,
+          `${agent}'s done report for ${task} could not be verified`,
+          ["Fill held the report and checked it again, and it still could not be accepted:", "", ...asData(refusal.problems.join("; "))],
+        );
+        continue;
+      }
+      if (refusal?.retry && !refusal.expired) {
+        // Only time can fix it (CI running): not done, no new run, checked again on the next check
+        await hold("report_refused", `done line not accepted yet: ${refusal.problems.map((p) => oneLine(p, 160)).join("; ")}; checked again on the next check`, latest?.id ?? null);
+        continue;
+      }
+      if (check?.kind === "queue" && !refusal) {
         const done = check.line;
         await this.options.record(
           "fill_done",
@@ -1634,7 +1657,10 @@ export class AgentsFill {
 
       let run: AgentRunView;
       try {
-        run = await this.options.requestRun({ agent, task, prompt: promptText });
+        // A refused DONE report of the last run is this run's first instruction
+        const refused = latest ? this.refusalNote(latest) : null;
+        const finalPrompt = refused ? `${promptText}\n\n${refused}\n` : promptText;
+        run = await this.options.requestRun({ agent, task, prompt: finalPrompt });
       } catch (e) {
         const why = message(e);
         if (why.startsWith("Over budget")) {
@@ -1741,6 +1767,103 @@ export class AgentsFill {
         probes.clock.now(),
       );
     }
+  }
+
+  /**
+   * The ready guard's verdict on a DONE line: null when it is accepted (the
+   * guard is off, the task is not PR work, or the PR is ready). Fill and the
+   * planner both settle a task through this, so a refused report is never a
+   * done anywhere. A refusal that needs a change is recorded once
+   * (fill_report_refused) with the instruction the agent gets next. One that
+   * only time can fix (`retry`: CI running, the host not answering) is held
+   * and checked again, for at most settings.readyWaitMinutes from its first
+   * check (stored as fill_report_waiting, so a restart keeps it); then it is
+   * `expired` and the caller asks the owner. Nothing here marks the task done
+   * or sends anything to review.
+   */
+  async guardReport(
+    agent: string,
+    task: string,
+    line: string,
+    latest: AgentRun | null,
+    taskText: string,
+  ): Promise<{ retry: boolean; expired: boolean; since: number; problems: string[] } | null> {
+    const { store, project, settings, probes } = this.options;
+    if (!settings.readyGuard) return null;
+    const now = probes.clock.now();
+    const parsed = parseReadyReport(line, taskText);
+    let pr: number | null = null;
+    let verdict: ReadyVerdict;
+    if (parsed.kind === "ambiguous") {
+      verdict = refuseReport(
+        "ambiguous",
+        `the line names several PRs (${parsed.prs.map((n) => `#${n}`).join(", ")}) and the task names none of them`,
+        "Report one PR: end the line with `PR #<n> at <sha>`.",
+      );
+    } else if (parsed.kind === "none") {
+      if (!isPrWork(taskText)) return null;
+      verdict = refuseReport("no_pr", "the task is about a pull request but the line names none", "Report again with `PR #<n> at <sha>` for the PR you opened.");
+    } else {
+      pr = parsed.report.pr;
+      const source = this.options.readyFacts?.();
+      if (parsed.report.sha === null) {
+        verdict = refuseReport("no_head", `the line names PR #${pr} but not the head it reports on`, "Report again with `PR #<n> at <sha>`, the sha of the PR's head.", pr);
+      } else if (!source) {
+        verdict = unverifiable(pr, "no git host is set up to read this project's PRs");
+      } else if (now < this.guardDownUntil) {
+        verdict = unverifiable(pr, "the git host is not answering; asked again shortly");
+      } else {
+        verdict = await evaluateReady(parsed.report, source, { agent });
+        if (!verdict.ok && verdict.hostDown) this.guardDownUntil = now + HOST_BACKOFF_MS;
+      }
+    }
+    if (verdict.ok) return null;
+    const hash = createHash("sha256").update(line).digest("hex").slice(0, 16);
+    if (!verdict.retry) {
+      await this.options.record(
+        "fill_report_refused",
+        {
+          agent,
+          task,
+          runId: latest?.id,
+          summary: `fill: ${agent}'s done report for ${task}${pr === null ? "" : ` (PR #${pr})`} was refused: ${verdict.reason}`,
+          evidence: verdict.problems,
+          data: { pr, reason: verdict.reason, instruction: verdict.instruction },
+          dedupeKey: `fill_report_refused:${task}:${latest?.id ?? "none"}:${createHash("sha256").update(verdict.instruction).digest("hex").slice(0, 16)}`,
+        },
+        now,
+      );
+      return { retry: false, expired: false, since: now, problems: verdict.problems };
+    }
+    // Only time can fix it: held, but only for settings.readyWaitMinutes since it was first held
+    const runId = latest?.id ?? null;
+    const first = store
+      .listEvents(project, { kinds: ["fill_report_waiting"], task, limit: 20 })
+      .find((e) => e.data.lineHash === hash && (e.data.runId ?? null) === runId);
+    const since = first?.at ?? now;
+    if (!first) {
+      await this.options.record(
+        "fill_report_waiting",
+        {
+          agent,
+          task,
+          runId: latest?.id,
+          summary: `fill: ${agent}'s done report for ${task}${pr === null ? "" : ` (PR #${pr})`} can't be verified yet: ${verdict.reason}`,
+          evidence: verdict.problems,
+          data: { pr, reason: verdict.reason, lineHash: hash, runId },
+          dedupeKey: `fill_report_waiting:${task}:${runId ?? "none"}:${hash}`,
+        },
+        now,
+      );
+    }
+    return { retry: true, expired: now - since >= settings.readyWaitMinutes * 60_000, since, problems: verdict.problems };
+  }
+
+  /** The instruction of the run's last refused DONE report, or null. */
+  private refusalNote(run: AgentRun): string | null {
+    const { store, project } = this.options;
+    const event = store.listEvents(project, { kinds: ["fill_report_refused"], task: run.task, runId: run.id, limit: 1 })[0];
+    return typeof event?.data.instruction === "string" ? event.data.instruction : null;
   }
 
   /**

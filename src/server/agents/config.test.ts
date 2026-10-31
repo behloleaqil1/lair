@@ -155,6 +155,8 @@ describe("agents config", () => {
       maxBackoffSeconds: 1800,
       waitingPattern: DEFAULT_WAITING_PATTERN,
       blockedPattern: DEFAULT_BLOCKED_PATTERN,
+      readyGuard: false,
+      readyWaitMinutes: 120,
       wake: {
         file: undefined,
         root: "{gates_dir}",
@@ -516,5 +518,29 @@ describe("agents config", () => {
     const remoteDefault = { ...capacity, defaultClass: "remote" as const };
     expect(getAgentClass(remoteDefault, "worker-a")).toBe("remote");
     expect(getAgentClass(remoteDefault, "worker-b")).toBe("remote");
+  });
+});
+
+describe("agents.fill.ready_guard", () => {
+  const guarded = { enabled: true, fill: { ready_guard: true } };
+
+  it("is a config error without review.enabled: the PRs could not be read, so every report would pass", () => {
+    expect(errorsOf(guarded)).toEqual([
+      "agents.fill.ready_guard: needs review.enabled (the PRs are read through the review module's git host)",
+    ]);
+    const parsed = parseAgentsConfig(guarded, { ...project, review: { enabled: false } } as ProjectConfig);
+    expect(parsed.ok).toBe(false);
+  });
+
+  it("loads with review.enabled, and the wait for an unverifiable report is bounded", () => {
+    const reviewed = { ...project, review: { enabled: true } } as ProjectConfig;
+    const parsed = parseAgentsConfig({ ...guarded, fill: { ready_guard: true, ready_wait_minutes: 30 } }, reviewed);
+    expect(parsed.ok && parsed.settings.fill.readyGuard).toBe(true);
+    expect(parsed.ok && parsed.settings.fill.readyWaitMinutes).toBe(30);
+    expect(errorsOf({ enabled: true, fill: { ready_wait_minutes: 0 } })[0]).toContain("agents.fill.ready_wait_minutes");
+  });
+
+  it("is not checked when the guard is off", () => {
+    expect(errorsOf({ enabled: true, fill: { ready_guard: false } })).toEqual([]);
   });
 });

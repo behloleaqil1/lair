@@ -81,6 +81,39 @@ describe("the deterministic part", () => {
     expect(history(h)).toHaveLength(1);
   });
 
+  it("a DONE line the ready guard refuses marks nothing; once the PR is green the same line marks the task done", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    const h = await setup(p, plannerBlock(p, { agent: undefined }), {
+      extra: { ...(fillOn(p, { ready_guard: true }) as object), review: { enabled: true } } as never,
+    });
+    let state: "failure" | "success" = "failure";
+    h.agents.useReadyFacts(() => ({
+      facts: async () => ({
+        state: "open",
+        headSha: "abc1234def5678",
+        baseRef: "main",
+        mergeable: true,
+        behindBy: 0,
+        body: "",
+        checks: [{ name: "build", state }],
+        commitShas: ["abc1234def5678"],
+        gate: null,
+        findingIds: [],
+      }),
+    }));
+    await h.service.cycle();
+    queue(p, "- DONE feat-login by worker-a 12:05Z: PR #7 at abc1234");
+    await h.service.cycle();
+    expect(taskIds(h)).toEqual(["feat-login"]);
+    expect(history(h)).toEqual([]);
+
+    state = "success";
+    await h.service.cycle();
+    expect(taskIds(h)).toEqual([]);
+    expect(history(h)[0]).toMatchObject({ outcome: "applied", op: "mark_done", task: "feat-login" });
+  });
+
   it("a write that fails is reported, and the rest of the cycle still runs: its BLOCKED line is routed", async () => {
     const p = makePaths();
     tasks(p, "worker-a|Alice|feat-login|Login form", "worker-b|Bob|feat-search|Search page");
