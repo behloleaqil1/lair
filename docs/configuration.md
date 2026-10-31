@@ -2063,8 +2063,45 @@ The built-in root-cause signatures (case-insensitive; each line is cut to 1,000 
 | `bisect.protected_trailer` | string | `Lair-Protected` | A merge whose message has `<trailer>: yes` is proposed for revert, never reverted automatically |
 | `commands` | map | `{}` | See below |
 | `decision_file` | string | `inbox_file` | Where decisions are appended when there is no Decision Inbox or `raise_decision` |
+| `parsers.custom` | array | `[]` | Custom regex parsers for test frameworks not covered by built-ins; see below |
 
 Unknown keys, an invalid regular expression or an unknown placeholder are config errors; a project with an invalid `triage:` block is not triaged, and `GET /api/triage/status` shows why.
+
+### Custom parsers
+
+When a project's tests produce output the built-in parsers (JUnit XML, Gradle, vitest, jest, pytest, go test -json, cargo test, .NET TRX) don't recognise, define a custom regex parser:
+
+```yaml
+triage:
+  parsers:
+    custom:
+      - name: mytest
+        detect: "MyTest Framework"
+        fail_pattern: 'FAIL:\s+(?<suite>[^:]+)::(?<name>\S+)\s+-\s+(?<message>.+)'
+        summary_pattern: '(?<failed>\d+) failed, (?<passed>\d+) passed'
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `name` | string | Parser id, shown in `cause.parser`; lowercase letters, digits, hyphens and underscores (max 32 chars) |
+| `detect` | string | Regex to detect this format (matched against the first 2000 characters of the output) |
+| `fail_pattern` | string | Regex with named groups: `(?<name>...)` (required), `(?<suite>...)`, `(?<message>...)`, `(?<type>...)` |
+| `summary_pattern` | string | Optional regex to extract counts: `(?<failed>\d+)`, `(?<passed>\d+)` |
+
+Custom parsers run after the built-ins; a file the built-ins already parsed is not tried again.
+
+**Security limits.** Patterns run over untrusted test output on the server's event loop, so:
+
+- Input is capped to 256 KB (the tail).
+- Lines are capped to 2,000 characters.
+- Patterns that match the empty string are refused (they would loop forever).
+- Patterns with nested quantifiers (e.g., `(a+)+`, `(\w*)*`, `(a|a)*`, `(\w|\d)+`) are refused (catastrophic backtracking).
+- Patterns with backreferences (`\1`, `\k<name>`) are refused (exponential time complexity).
+- Regex iteration is bounded: matching stops after a fixed iteration count or time budget to prevent hangs on adversarial input.
+
+Non-capturing groups (`(?:...)`) and named groups (`(?<name>...)`) are allowed. Alternation is allowed in non-quantified groups (e.g., `(?:FAIL|ERROR):` is fine, but `(?:FAIL|ERROR)+:` is refused).
+
+A refused pattern stops triage for the project with a notice naming the field.
 
 ### Triage commands
 

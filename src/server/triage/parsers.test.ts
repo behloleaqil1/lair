@@ -5,7 +5,20 @@
  */
 import { describe, expect, it } from "vitest";
 import { DEFAULT_CONTEXT_PATTERNS } from "./config.js";
-import { parseGateEvidence, parseGradle, parseJUnit, parseJest, parsePytest, parseVitest, parseXml } from "./parsers/index.js";
+import {
+  parseGateEvidence,
+  parseGradle,
+  parseJUnit,
+  parseJest,
+  parsePytest,
+  parseVitest,
+  parseXml,
+  parseGoTest,
+  parseCargoTest,
+  parseTrx,
+  createCustomParser,
+  validateCustomParserConfig,
+} from "./parsers/index.js";
 import { fixture, gate, sha, step } from "./testing/harness.js";
 
 const options = { contextPatterns: DEFAULT_CONTEXT_PATTERNS.map((p) => new RegExp(p, "i")) };
@@ -157,6 +170,69 @@ describe("console summaries", () => {
     expect(assertion.evidence).toContain("assert 100 == 108");
     expect(assertion.locations).toContainEqual({ file: "tests/test_orders.py", line: 9 });
   });
+
+  it("go test -json: parses JSON events and extracts failures", () => {
+    const out = parseGoTest(fixture("go-test-json.txt"), options);
+    expect(out.failedCount).toBe(2);
+    expect(out.causes).toHaveLength(2);
+    const [total, connect] = out.causes;
+    expect(total.tests[0]).toMatchObject({
+      suite: "example.com/shop/orders",
+      name: "TestCalculateTotal",
+    });
+    expect(total.message).toContain("expected 108, got 100");
+    expect(connect.tests[0]).toMatchObject({
+      suite: "example.com/shop/orders",
+      name: "TestConnectDB",
+    });
+    expect(connect.type).toBe("panic");
+    expect(connect.message).toContain("connection refused");
+  });
+
+  it("cargo test: parses Rust test output with failures section", () => {
+    const out = parseCargoTest(fixture("cargo-test.txt"), options);
+    expect(out.failedCount).toBe(2);
+    expect(out.causes).toHaveLength(2);
+    const [total, connect] = out.causes;
+    expect(total.tests[0]).toMatchObject({
+      suite: "orders::tests",
+      name: "test_calculate_total",
+    });
+    expect(total.type).toBe("panic");
+    expect(total.message).toContain("assertion failed");
+    expect(connect.tests[0]).toMatchObject({
+      suite: "db::tests",
+      name: "test_connect",
+    });
+    expect(connect.message).toContain("connection failed");
+  });
+
+  it("cargo test: parses Rust 1.73+ panic format (F3)", () => {
+    // Rust 1.73+ changed the panic format from:
+    //   thread 'x' panicked at 'message', src/lib.rs:45:9
+    // to:
+    //   thread 'x' panicked at src/lib.rs:45:9:
+    //   message
+    const out = parseCargoTest(fixture("cargo-test-173.txt"), options);
+    expect(out.failedCount).toBe(2);
+    expect(out.causes).toHaveLength(2);
+    const [total, connect] = out.causes;
+    expect(total.tests[0]).toMatchObject({
+      suite: "orders::tests",
+      name: "test_calculate_total",
+    });
+    expect(total.type).toBe("panic");
+    // The new format has the message on the next line
+    expect(total.message).toContain("assertion");
+    // Location should be extracted from the new format
+    expect(total.tests[0].file).toBe("src/orders.rs");
+    expect(connect.tests[0]).toMatchObject({
+      suite: "db::tests",
+      name: "test_connect",
+    });
+    expect(connect.type).toBe("panic");
+    expect(connect.message).toContain("connection failed");
+  });
 });
 
 describe("parseGateEvidence", () => {
@@ -240,4 +316,282 @@ describe("output written by the code under test", () => {
     expect(junit?.tests[0].suite.length).toBeLessThanOrEqual(500);
     expect(junit?.message).toBe("m");
   }, 30_000);
+});
+
+describe(".NET TRX reports", () => {
+  it("parses failed and passed tests from trx XML", () => {
+    const out = parseTrx(fixture("dotnet-trx.xml"), options);
+    expect(out.failedCount).toBe(2);
+    expect(out.causes).toHaveLength(2);
+    const [assertion, connection] = out.causes;
+    expect(assertion.tests[0]).toMatchObject({
+      suite: "Shop.Orders.Tests.OrderServiceTests",
+      name: "CalculateTotal_WithTax_ReturnsCorrectAmount",
+    });
+    expect(assertion.message).toContain("Assert.Equal() Failure");
+    expect(connection.tests[0]).toMatchObject({
+      suite: "Shop.Data.Tests.ConnectionTests",
+      name: "ConnectToDatabase_WhenDown_ThrowsException",
+    });
+    expect(connection.type).toBe("System.Data.SqlClient.SqlException");
+    expect(out.passed.map((t) => t.name)).toEqual([
+      "ApplyDiscount_ValidCode_ReducesTotal",
+      "ValidateOrder_EmptyCart_ReturnsFalse",
+    ]);
+  });
+});
+
+describe("custom regex parser", () => {
+  it("validates config and rejects invalid patterns", () => {
+    expect(validateCustomParserConfig(null)).toContain("custom parser config must be an object");
+    expect(validateCustomParserConfig({})).toContain("custom parser requires a non-empty 'name' field");
+    expect(validateCustomParserConfig({ name: "test", detect: "x" })).toContain(
+      "custom parser requires a non-empty 'fail_pattern'",
+    );
+    expect(
+      validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "(?<other>x)" }),
+    ).toContain("custom parser 'fail_pattern' must include a (?<name>...) capture group");
+    expect(
+      validateCustomParserConfig({ name: "test", detect: "[", fail_pattern: "(?<name>x)" }),
+    ).toContain("custom parser 'detect' pattern is not a valid regex");
+    expect(
+      validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "(?<name>x)" }),
+    ).toEqual([]);
+  });
+
+  it("parses test output with custom patterns", () => {
+    const parser = createCustomParser({
+      name: "mytest",
+      detect: "MyTest Framework",
+      fail_pattern: "FAIL:\\s+(?<suite>[^:]+)::(?<name>\\S+)\\s+-\\s+(?<message>.+)",
+      summary_pattern: "(?<failed>\\d+) failed, (?<passed>\\d+) passed",
+    });
+    expect(parser).not.toBeNull();
+
+    const output = `
+MyTest Framework v1.0
+Running tests...
+PASS: orders::test_create
+FAIL: orders::test_total - expected 108 but got 100
+PASS: orders::test_delete
+FAIL: db::test_connect - connection refused
+Summary: 2 failed, 2 passed
+`;
+    const out = parser!.parse(output, options);
+    expect(out.failedCount).toBe(2);
+    expect(out.causes).toHaveLength(2);
+    expect(out.causes[0].tests[0]).toMatchObject({ suite: "orders", name: "test_total" });
+    expect(out.causes[0].message).toBe("expected 108 but got 100");
+    expect(out.causes[1].tests[0]).toMatchObject({ suite: "db", name: "test_connect" });
+  });
+
+  it("bounds input to prevent regex attacks", () => {
+    const parser = createCustomParser({
+      name: "bounded",
+      detect: "test",
+      fail_pattern: "FAIL:\\s+(?<name>\\S+)",
+    });
+    expect(parser).not.toBeNull();
+
+    // A huge input should not cause timeout or memory issues
+    const started = Date.now();
+    const hugeOutput = "test\n" + "FAIL: test_" + "a".repeat(100_000) + "\n".repeat(1000);
+    const out = parser!.parse(hugeOutput, options);
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(out.causes.length).toBeLessThanOrEqual(5000);
+  });
+
+  it("rejects patterns that match the empty string (M1: infinite loop prevention)", () => {
+    // A pattern like (?<name>\w*) matches "" and would loop forever with exec()
+    const result1 = validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "(?<name>\\w*)" });
+    expect(result1).toEqual(
+      expect.arrayContaining([expect.stringContaining("must not match the empty string")])
+    );
+
+    // A pattern with optional prefix and (?<name>.*) also matches ""
+    const result2 = validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "(?:FAIL)?\\s*(?<name>.*)" });
+    expect(result2).toEqual(
+      expect.arrayContaining([expect.stringContaining("must not match the empty string")])
+    );
+
+    // A pattern that requires at least one character is accepted
+    expect(
+      validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "FAIL:\\s+(?<name>\\S+)" }),
+    ).toEqual([]);
+  });
+
+  it("handles zero-length matches safely without infinite loops (M1 fix)", () => {
+    // Even if validation is bypassed, the parser should not hang
+    // This test uses a pattern that could match empty strings repeatedly
+    const parser = createCustomParser({
+      name: "test",
+      detect: "test",
+      fail_pattern: "(?<name>x*)", // Matches empty string
+    });
+    expect(parser).not.toBeNull();
+
+    // The parse should complete quickly even with input that has many positions
+    const started = Date.now();
+    const input = "test\n" + "y".repeat(1000);
+    const out = parser!.parse(input, options);
+    expect(Date.now() - started).toBeLessThan(100);
+    // matchAll with a pattern that matches empty strings at every position
+    // should not hang; it may find matches at x positions or none
+    expect(out.causes.length).toBeLessThanOrEqual(5000);
+  });
+
+  it("rejects nested quantifiers (M3: catastrophic backtracking)", () => {
+    // Pattern (a+)+$ causes exponential backtracking
+    const result1 = validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "(a+)+(?<name>x)" });
+    expect(result1).toEqual(
+      expect.arrayContaining([expect.stringContaining("nested quantifiers")])
+    );
+
+    // Pattern (\w+\s?)* also causes catastrophic backtracking
+    const result2 = validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "(\\w+\\s?)*(?<name>x)" });
+    expect(result2).toEqual(
+      expect.arrayContaining([expect.stringContaining("nested quantifiers")])
+    );
+
+    // Pattern (\d*)* has nested quantifiers
+    const result3 = validateCustomParserConfig({ name: "test", detect: "(\\d*)*", fail_pattern: "(?<name>x)" });
+    expect(result3).toEqual(
+      expect.arrayContaining([expect.stringContaining("nested quantifiers")])
+    );
+  });
+
+  it("rejects alternation under quantifiers (F1: overlapping alternatives cause exponential backtracking)", () => {
+    // Pattern (a|a)* has overlapping alternation under a quantifier
+    const result1 = validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "(a|a)*(?<name>x)" });
+    expect(result1).toEqual(
+      expect.arrayContaining([expect.stringContaining("nested quantifiers")])
+    );
+
+    // Pattern (a|aa)+ has overlapping alternation
+    const result2 = validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "(a|aa)+(?<name>x)" });
+    expect(result2).toEqual(
+      expect.arrayContaining([expect.stringContaining("nested quantifiers")])
+    );
+
+    // Pattern (\w|\d)+ has overlapping character classes
+    const result3 = validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "(\\w|\\d)+:(?<name>x)" });
+    expect(result3).toEqual(
+      expect.arrayContaining([expect.stringContaining("nested quantifiers")])
+    );
+
+    // Pattern ((a+))+ has nested quantifier through groups
+    const result4 = validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "((a+))+(?<name>x)" });
+    expect(result4).toEqual(
+      expect.arrayContaining([expect.stringContaining("nested quantifiers")])
+    );
+  });
+
+  it("accepts legitimate patterns with non-capturing groups and named groups (F2 fix)", () => {
+    // Non-capturing group (?:...) without nested quantifiers should be accepted
+    // The ? after ( in (?:...) is part of the group syntax, not a quantifier
+    const result1 = validateCustomParserConfig({
+      name: "test",
+      detect: "x",
+      fail_pattern: "(?:FAIL|ERROR):\\s+(?<suite>\\S+)::(?<name>\\S+)",
+    });
+    expect(result1).toEqual([]);
+
+    // Named group (?<name>...) should not be flagged
+    const result2 = validateCustomParserConfig({
+      name: "test",
+      detect: "x",
+      fail_pattern: "FAIL:\\s+(?<suite>\\S+)::(?<name>\\S+)",
+    });
+    expect(result2).toEqual([]);
+
+    // Alternation inside a NON-quantified group is fine
+    const result3 = validateCustomParserConfig({
+      name: "test",
+      detect: "x",
+      fail_pattern: "(?:FAIL|ERROR):\\s+(?<name>\\S+)",
+    });
+    expect(result3).toEqual([]);
+
+    // Alternation inside a quantified group IS dangerous
+    const result4 = validateCustomParserConfig({
+      name: "test",
+      detect: "x",
+      fail_pattern: "(?:FAIL|ERROR)+:\\s+(?<name>\\S+)",
+    });
+    expect(result4).toEqual(
+      expect.arrayContaining([expect.stringContaining("nested quantifiers")])
+    );
+
+    // Nested quantifiers ARE dangerous and should be rejected
+    // This pattern has .+ inside a group that's followed by ?
+    const result5 = validateCustomParserConfig({
+      name: "test",
+      detect: "x",
+      fail_pattern: "(?:\\s+-\\s+(?<message>.+))?(?<name>\\S+)",
+    });
+    expect(result5).toEqual(
+      expect.arrayContaining([expect.stringContaining("nested quantifiers")])
+    );
+  });
+
+  it("rejects backreferences (M3: exponential time complexity)", () => {
+    // Backreferences like \1 can cause exponential time
+    const result1 = validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "(a)\\1(?<name>x)" });
+    expect(result1).toEqual(
+      expect.arrayContaining([expect.stringContaining("backreferences")])
+    );
+
+    // Named backreferences \k<name>
+    const result2 = validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "(?<dup>a)\\k<dup>(?<name>x)" });
+    expect(result2).toEqual(
+      expect.arrayContaining([expect.stringContaining("backreferences")])
+    );
+
+    const result3 = validateCustomParserConfig({ name: "test", detect: "(a)\\1", fail_pattern: "(?<name>x)" });
+    expect(result3).toEqual(
+      expect.arrayContaining([expect.stringContaining("backreferences")])
+    );
+  });
+
+  it("caps input to 256 KB to bound regex execution (M3)", () => {
+    const parser = createCustomParser({
+      name: "test",
+      detect: "test",
+      fail_pattern: "FAIL:\\s+(?<name>\\S+)",
+    });
+    expect(parser).not.toBeNull();
+
+    // Create 512 KB of input - the parser should only process the tail 256 KB
+    const started = Date.now();
+    const prefix = "a".repeat(256 * 1024);
+    const suffix = "test\nFAIL: test_found\n" + "b".repeat(200 * 1024);
+    const input = prefix + suffix;
+    expect(input.length).toBeGreaterThan(256 * 1024);
+
+    const out = parser!.parse(input, options);
+    expect(Date.now() - started).toBeLessThan(5000);
+    // The failure in the suffix (within last 256 KB) should be found
+    expect(out.causes).toHaveLength(1);
+    expect(out.causes[0].tests[0].name).toBe("test_found");
+  });
+
+  it("bounded iteration prevents regex hangs on crafted input (F1 timeout safeguard)", () => {
+    // Even if a pattern somehow passes structural checks, bounded iteration
+    // ensures the parser doesn't hang on adversarial input
+    const parser = createCustomParser({
+      name: "test",
+      detect: "test",
+      fail_pattern: "FAIL:\\s+(?<name>\\w+)",
+    });
+    expect(parser).not.toBeNull();
+
+    // Input designed to have many potential match positions
+    const started = Date.now();
+    const input = "test\n" + "FAIL: a ".repeat(10000) + "xxx";
+    const out = parser!.parse(input, options);
+    // Should complete within the timeout
+    expect(Date.now() - started).toBeLessThan(3000);
+    // Should find the matches (up to MAX_ENTRIES)
+    expect(out.causes.length).toBeLessThanOrEqual(5000);
+  });
 });

@@ -160,7 +160,8 @@ export class TriageManager {
           adapters: { ...fromCommands, ...injected },
           decisionsViaCommand: injected.decisions === undefined && fromCommands.decisions !== undefined,
           nodeKeys: nodes.keys,
-          parsers: this.options.parsers ?? BUILTIN_PARSERS,
+          // Built-in parsers first, then custom parsers from config (custom parsers are tried last)
+          parsers: [...(this.options.parsers ?? BUILTIN_PARSERS), ...settings.customParsers],
           events: this.options.events,
         }),
       );
