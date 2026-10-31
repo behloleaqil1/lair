@@ -311,7 +311,15 @@ describe("releaseHold", () => {
       op: "release_hold" as const,
       target: "task:feat-login",
       evidence: ["matched infra pattern 'docker' in: Cannot connect to Docker"],
-      clearedCheck: async () => ({ cleared: true, reason: "check deferred" }),
+      // M3: clearedCheck uses runCommand to verify Docker is back
+      clearedCheck: async (runCommand?: (cmd: string, args: string[]) => Promise<{ exitCode: number; output: string }>) => {
+        if (!runCommand) return { cleared: false, reason: "runCommand not available" };
+        const result = await runCommand("docker", ["info"]);
+        if (result.exitCode !== 0) {
+          return { cleared: false, reason: `Docker still unavailable: ${result.output}` };
+        }
+        return { cleared: true, reason: "Docker is back" };
+      },
     };
 
     const result = await releaseHold(evidence, settings, modules);
@@ -382,11 +390,12 @@ describe("releaseHold", () => {
 
 describe("rejectDuplicateProposal", () => {
   it("rejects older duplicate in act mode", async () => {
-    let withdrawn = false;
+    let rejected = false;
     const modules = {
-      withdrawDecision: async (id: string, reason: string) => {
-        withdrawn = true;
-        expect(id).toBe("old-dec");
+      rejectPlannerProposal: async (decisionId: string, runId: string, reason: string) => {
+        rejected = true;
+        expect(decisionId).toBe("old-dec");
+        expect(runId).toBe("test");
         expect(reason).toContain("reject_duplicate_proposal");
       },
       findDecision: (id: string) =>
@@ -409,7 +418,7 @@ describe("rejectDuplicateProposal", () => {
 
     const result = await rejectDuplicateProposal(evidence, settings, modules);
     expect(result.success).toBe(true);
-    expect(withdrawn).toBe(true);
+    expect(rejected).toBe(true);
   });
 });
 
