@@ -80,7 +80,8 @@ Each step lists what must exist first. One module per pull request, each with it
 | A6 | **AI roles**: any tool, any model, per role (build, review per tier, plan, supervise); sign-in status per machine; a write-only key store for API-key tools; reviewer calibration | [ai-roles.md](ai-roles.md) | — | See ai-roles.md |
 | A7 | **Look and feel, then Settings v2**: design tokens, light/dark, a component kit for every view (T1, built); Settings by task, with plain language, levels, search, templates and test buttons (S2-1 built; S2-2 and S2-3 to do) | [settings-v2.md](settings-v2.md) | T1 first; S2-1 needs A6 | See settings-v2.md |
 | A4 | **Supervisor S3**: an allowlist of acting fixes | [supervisor.md](supervisor.md) | A3 | See supervisor.md |
-| A5 | **Hands-off day** (end-to-end acceptance) | [autonomy.md §11](autonomy.md) | A2–A4 | A project runs a full day with no human input except Decision Inbox answers |
+| A8 | **Work store**: tasks, events, briefs and messages in Lair's database instead of project files | [work-store.md](work-store.md) | bus (built), planner (built) | Tasks live in the store; fill reads the store; agents report through bus tools; legacy files mirrored read-only; an importer for existing projects. See work-store.md |
+| A5 | **Hands-off day** (end-to-end acceptance) | [autonomy.md §11](autonomy.md) | A2–A4, A8 | A project runs a full day with no human input except Decision Inbox answers |
 
 ### B. A proper open-source project
 
