@@ -356,18 +356,21 @@ describe("E2E: Full agent cycle on a fake project", () => {
       spawner.exit(pid, 0);
     };
 
-    // 3. Tick + fill check to start the agent
+    // 3. First checkNow: fill queues the run
     await service.checkNow();
 
-    // 4. Verify the agent was started
+    // 4. Second checkNow: tick launches the queued run (spawns the agent)
+    await service.checkNow();
+
+    // 5. Verify the agent was started
     expect(spawner.calls.length).toBe(1);
     expect(spawner.calls[0].argv).toContain("worker-a");
 
-    // 5. Tick again to process the completion
+    // 6. Tick again to process the completion
     clock.advance(MIN);
     await service.checkNow();
 
-    // 6. Verify the queue was read and task marked done
+    // 7. Verify the queue was read and task marked done
     const queueContent = readFileSync(paths.queue, "utf-8");
     expect(queueContent).toContain("DONE feat-search");
   });
@@ -386,8 +389,11 @@ describe("E2E: Full agent cycle on a fake project", () => {
       );
     };
 
-    // Start the agent
+    // Queue the run via fill
     await service.checkNow();
+    // Launch the queued run
+    await service.checkNow();
+
     expect(spawner.calls.length).toBe(1);
 
     // Simulate continued work and completion
@@ -421,7 +427,11 @@ describe("E2E: Full agent cycle on a fake project", () => {
       spawner.exit(pid, 1);
     };
 
+    // Queue the run via fill
     await service.checkNow();
+    // Launch the queued run
+    await service.checkNow();
+
     expect(spawner.calls.length).toBe(1);
 
     clock.advance(MIN);
@@ -451,7 +461,11 @@ describe("E2E: Full agent cycle on a fake project", () => {
       spawner.exit(pid, 0);
     };
 
+    // Queue the run via fill
     await service.checkNow();
+    // Launch the queued run
+    await service.checkNow();
+
     expect(spawner.calls.length).toBe(1);
   });
 
@@ -479,9 +493,10 @@ worker-a|Third|feat-three|Third task
       spawner.exit(spawner.nextPid - 1, 0);
     };
 
-    // Run through the tasks
+    // Run through the tasks: each needs queue (checkFill) + launch (tick)
     for (let i = 0; i < 3; i++) {
-      await service.checkNow();
+      await service.checkNow(); // Queue
+      await service.checkNow(); // Launch
       clock.advance(5 * MIN);
     }
 
