@@ -203,6 +203,12 @@ export interface DataServiceOptions {
    * for this project): such a dragon is running, "managed by Lair"
    */
   managedRuns?: () => Map<string, ManagedRunInfo>;
+  /**
+   * The project's parsed queue file, kept in memory (QueueCache). Without it
+   * the file is read and parsed on each call, which only tests and one-off
+   * tools do: the server always passes it.
+   */
+  queue?: () => QueueLine[];
 }
 
 export class DataService {
@@ -214,6 +220,7 @@ export class DataService {
   // ============ QUEUE ============
 
   getQueueLines(): QueueLine[] {
+    if (this.options.queue) return this.options.queue();
     const content = safeReadFile(this.config.queue_file);
     if (!content) return [];
     return parseQueueFile(content);

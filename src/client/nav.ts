@@ -43,9 +43,9 @@ export const SECTIONS: readonly SectionDef[] = [
   {
     id: "machines",
     label: "Machines",
-    needs: (m) => m.machines || m.nodes || m.placement,
+    needs: (m) => m.machines || m.nodes || m.placement || m.cloud,
     enable:
-      "Add machines: to the project's YAML, or run lair-node on a machine to register it with this server; placement.enabled: true probes them.",
+      "Add machines: to the project's YAML, or run lair-node on a machine to register it with this server; placement.enabled: true probes them; cloud.enabled: true shows cloud machines and their spend.",
   },
   { id: "decisions", label: "Decisions", needs: null, enable: "" },
   {

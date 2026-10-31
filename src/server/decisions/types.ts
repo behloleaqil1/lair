@@ -5,6 +5,7 @@
 import type {
   Decision,
   DecisionAttention,
+  DecisionEvidence,
   DecisionKind,
   DecisionLink,
   DecisionOption,
@@ -42,6 +43,13 @@ export interface RaiseDecisionInput {
    * kinds that always wait (NEVER_DEFAULT_KINDS); needs expiresAt.
    */
   defaultOptionId?: string;
+  /**
+   * The policy class ("module.name", see structure.ts), with its evidence and
+   * an effect on every option. Neither is needed yet; one without the other,
+   * or a class without effects, is refused.
+   */
+  class?: string;
+  evidence?: DecisionEvidence;
 }
 
 export interface RaiseResult {

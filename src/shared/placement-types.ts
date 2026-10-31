@@ -7,6 +7,32 @@
 /** A machine's probe state: up only after `min_up_seconds` of passing probes. */
 export type PlacementMachineState = "up" | "starting" | "down" | "unknown";
 
+/** An on-demand machine's power state, from its state_cmd. */
+export type OnDemandPowerState = "running" | "stopped" | "pending" | "stopping" | "unknown";
+
+/** An on-demand machine's availability for placement. */
+export type OnDemandAvailability = "available" | "unavailable";
+
+export interface OnDemandStatus {
+  /** The power state from state_cmd */
+  powerState: OnDemandPowerState;
+  /** Whether the machine is available for placement */
+  availability: OnDemandAvailability;
+  /** Why unavailable (guard refused, unknown state, command failed) */
+  unavailableReason: string | null;
+  /** Whether the guard allows starting the machine */
+  guardOk: boolean;
+  /** When state and guard were last checked (ISO) */
+  lastCheckAt: string | null;
+  /** Boot time added to estimates (seconds) */
+  bootSeconds: number;
+  /** Cost per hour (shown; breaks a tie between two equally good moves) */
+  costPerHour: number | null;
+  /** When touch_cmd last ran (a job was running there), and why it failed */
+  lastTouchAt: string | null;
+  touchError: string | null;
+}
+
 export interface PlacementMachine {
   id: string;
   state: PlacementMachineState;
@@ -26,6 +52,8 @@ export interface PlacementMachine {
   utilization: number | null;
   /** max(1, utilization): how much slower a loaded machine runs jobs (1 when unknown) */
   factor: number;
+  /** On-demand status, when this machine has on_demand configured */
+  onDemand: OnDemandStatus | null;
 }
 
 export interface PlacementLane {
@@ -51,6 +79,8 @@ export interface PlacementAdvice {
   quiet: boolean;
   /** Its own lane never runs its class (a limit of 0 there): gainSeconds is 0, any lane that can is better */
   stuck: boolean;
+  /** It goes back out of an on-demand lane that can't run it, and why (gainSeconds is 0) */
+  back?: string;
 }
 
 export interface PlacementJob {
