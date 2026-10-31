@@ -75,6 +75,7 @@ import {
 } from "./restart/index.js";
 import { SettingsService, registerSettingsUiRoutes } from "./settings/index.js";
 import { mountPlanner, plannerAgentsFrom } from "./planner/index.js";
+import { TrackerManager, registerTrackerRoutes } from "./tracker/index.js";
 import { join } from "path";
 import type { ApiResponse, ProjectConfig } from "../shared/types.js";
 import { initProcessCache, disposeProcessCache, CachedProcessTable } from "./core/process-cache.js";
@@ -763,6 +764,19 @@ const planner = await mountPlanner(fastify, {
 });
 planner.useDecisions(decisionInbox);
 
+// The tracker (src/server/tracker/): one per project with `tracker.enabled: true` (off by default). It keeps the
+// project's GitHub issues, Projects boards and milestones in step with its tasks, runs and PRs, from the planner's,
+// the agents' and the reviews' events and a periodic reconcile; observe mode (the default) records what it would
+// change and sends nothing. Its store (data/tracker.db) is opened only when a project enables it. A token missing a
+// scope is asked about in the Decision Inbox; every route is the owner's.
+const trackers = new TrackerManager({
+  dbPath: join(process.cwd(), "data", "tracker.db"),
+  events: getEventBus(),
+});
+trackers.load(projectEntries);
+trackers.useDecisions(decisionInbox);
+await registerTrackerRoutes(fastify, trackers, () => getDefaultProject(), humanAuth);
+
 // Placement: one per project with `placement.enabled: true` (off by
 // default). It probes the project's machines, estimates when each queued
 // job of the project's own gate queue finishes on each lane, and moves jobs
@@ -922,6 +936,7 @@ const reloader = new ConfigReloader({
     clouds,
     planner,
     supervisor: selfChecks,
+    trackers,
     infraMonitor,
     bus: {
       validate: (config) => {
@@ -1028,6 +1043,10 @@ const stopServer = async (reason: string) => {
 
   // Stop the planner first: it requests runs from the agents module
   await planner.stop();
+
+  // Stop the tracker: its requests to GitHub in flight are cut short (a create cut short is found again by its
+  // marker on the next start), then its store closes
+  await trackers.stop();
 
   // Stop agent supervision: the agents keep running for the next server to adopt, unless a project sets
   // agents.on_restart: stop (then their runs are stopped too, within a bounded wait)
@@ -1194,6 +1213,14 @@ const start = async () => {
     busConsumers.start();
     const onBus = busConsumers.enabled();
     console.log(onBus.length > 0 ? `[bus] On or observing for: ${onBus.join(", ")}` : "[bus] Off (no project sets bus.consume)");
+    // Start the tracker (after the planner and the agents, whose events it follows): each syncs in the background,
+    // so a slow or unreachable GitHub never holds up the start
+    const tracked = trackers.start();
+    console.log(
+      tracked.length > 0
+        ? `[tracker] Tracking GitHub for: ${tracked.join(", ")}`
+        : "[tracker] Off (no project sets tracker.enabled)",
+    );
 
     // Start triage (re-checks waiting for capacity, bisect probes)
     const triaged = triage.start();

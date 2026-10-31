@@ -126,6 +126,12 @@ export interface ProjectConfig {
    */
   planner?: Record<string, unknown>;
   /**
+   * The tracker: GitHub issues, Projects boards and milestones kept in step
+   * with the tasks (src/server/tracker/). Validated by parseTrackerConfig;
+   * see docs/configuration.md#tracker
+   */
+  tracker?: Record<string, unknown>;
+  /**
    * Lessons: what Lair has learned from incidents (src/server/lessons/).
    * Validated by parseLessonsConfig; see docs/configuration.md#lessons
    */

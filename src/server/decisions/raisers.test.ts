@@ -43,6 +43,7 @@ const RAISERS: Record<string, string[]> = {
   "review/service.ts": ["review.merge_failed", "review.human_review", "review.emails"],
   "supervisor/chat.ts": ["supervisor.digest"],
   "supervisor/notices.ts": ["supervisor.check_failing"],
+  "tracker/service.ts": ["tracker.token_scopes"],
   "triage/gate-recheck.ts": ["triage.gate_failure"],
   "triage/service.ts": ["triage.gate_failure", "triage.revert"],
   "watchdog/escalation.ts": ["watchdog."],

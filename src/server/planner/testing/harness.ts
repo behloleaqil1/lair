@@ -160,6 +160,8 @@ export interface Harness extends Paths {
   app: FastifyInstance;
   owner: Record<string, string>;
   bus: { type: string; data: Record<string, unknown> }[];
+  /** The event bus the agents module and the planner emit on (other modules' tests subscribe to it) */
+  events: EventBus;
   /** Answer a decision as the owner, over HTTP */
   answer(id: string, optionId: string): Promise<number>;
   /** Restart: a new agents manager, planner and inbox on the same data */
@@ -344,6 +346,7 @@ export async function setup(
     app,
     owner,
     bus,
+    events,
     answer,
     dbs,
   };
