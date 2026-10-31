@@ -38,6 +38,7 @@ export const KNOWN_DECISION_CLASSES: Readonly<Record<string, { policy: string; c
   "review.stuck": { policy: "C9", codes: ["run_variables_lost", "provider_error", "no_reviewer"] },
   "review.merge_failed": { policy: "C10", codes: ["merge_error"] },
   "agents.cannot_start": { policy: "C11", codes: ["probe_failed", "fill_waiting"] },
+  "host-services.start_failed": { policy: "C12", codes: ["service_down"] },
 };
 
 export function isKnownDecisionClass(id: string): boolean {

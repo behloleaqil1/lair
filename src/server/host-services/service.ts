@@ -161,6 +161,22 @@ export class HostServices {
           if (!blocked && state.startAttempts < this.settings.maxStartAttempts) {
             await this.startService(machine, config);
             summary.started++;
+            // Probe again after start to check if it worked
+            const checkResult = await this.probe(config.probe);
+            this.store.recordProbe(machine, config.name, checkResult);
+            if (checkResult.up) {
+              summary.up++;
+              summary.down--;
+              // Service recovered: withdraw any open decision
+              if (state.decisionId) {
+                await this.withdrawDecision(machine, config.name, state.decisionId);
+              }
+              await this.events?.emit("host-service.up", {
+                project: this.project,
+                machine,
+                service: config.name,
+              });
+            }
           } else if (state.startAttempts >= this.settings.maxStartAttempts && !state.decisionId) {
             // Max attempts reached: raise a decision
             this.store.markFailing(machine, config.name);
@@ -246,11 +262,13 @@ export class HostServices {
           id: "fixed",
           label: "I fixed it",
           consequences: "Lair will probe again and resume normal operation if the service is up.",
+          effect: "reversible",
         },
         {
           id: "acknowledged",
           label: "Acknowledged",
           consequences: "Lair will keep the lanes held until the service recovers on its own.",
+          effect: "reversible",
         },
       ],
       recommended: { optionId: "fixed", reasoning: "The human should fix the underlying issue." },
@@ -258,6 +276,18 @@ export class HostServices {
       key,
       blocks: config.neededBy.map((lane) => `lane:${lane}`),
       links: [],
+      class: "host-services.start_failed",
+      evidence: {
+        code: "service_down",
+        facts: {
+          machine,
+          service: config.name,
+          start_attempts: this.settings.maxStartAttempts,
+          lanes_held: config.neededBy.length,
+        },
+        cause_cleared: false,
+        linked_issue: null,
+      },
     };
 
     try {

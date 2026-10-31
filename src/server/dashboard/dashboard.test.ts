@@ -263,6 +263,7 @@ describe("GET /api/dashboard/modules", () => {
         review: true,
         triage: false,
         placement: false,
+        hostServices: false,
         cloud: false,
         pipelines: true,
         delivery: false,
