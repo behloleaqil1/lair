@@ -18,10 +18,12 @@ const SECTION_HEADER = /^----\s+(\S+)\s+stdout\s+----$/;
 const SUMMARY = /^test result:\s+(ok|FAILED)\.\s+(\d+)\s+passed;\s+(\d+)\s+failed/;
 // Rust compiler error: "error[E0425]: cannot find value `x` in this scope"
 const COMPILER_ERROR = /^error\[E\d+\]:\s+(.+)$/;
-// "thread 'test_name' panicked at 'assertion failed: ...'" or "thread 'test_name' panicked at 'message', loc"
-// Note: the message may continue on the next line, so we capture everything after "panicked at '"
-const PANIC = /^thread\s+'[^']+'\s+panicked\s+at\s+'(.+)$/;
-// Location in panic: "src/lib.rs:42:5"
+// Old panic format (pre-1.73): "thread 'test_name' panicked at 'message', location"
+const PANIC_OLD = /^thread\s+'[^']+'\s+panicked\s+at\s+'(.+)$/;
+// New panic format (Rust 1.73+): "thread 'test_name' panicked at src/lib.rs:45:9:"
+// followed by the message on the next line(s)
+const PANIC_NEW = /^thread\s+'[^']+'\s+panicked\s+at\s+(\S+\.rs):(\d+):\d+:?\s*$/;
+// Location in old panic: "src/lib.rs:42:5"
 const PANIC_LOCATION = /^(\S+\.rs):(\d+):\d+$/;
 
 interface Section {
@@ -30,18 +32,37 @@ interface Section {
 }
 
 function extractError(lines: string[]): { type?: string; message: string; file?: string; line?: number } {
-  for (const line of lines) {
-    const panic = line.match(PANIC);
-    if (panic) {
-      // Look for location in next lines
-      const locIdx = lines.indexOf(line);
-      for (let i = locIdx + 1; i < Math.min(locIdx + 5, lines.length); i++) {
-        const loc = lines[i].trim().match(PANIC_LOCATION);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // Try new Rust 1.73+ panic format first: "thread 'x' panicked at src/lib.rs:45:9:"
+    const panicNew = line.match(PANIC_NEW);
+    if (panicNew) {
+      // The message is on the following lines
+      const messageParts: string[] = [];
+      for (let j = i + 1; j < Math.min(i + 10, lines.length); j++) {
+        const nextLine = lines[j].trim();
+        // Stop at stack trace or other panic info
+        if (nextLine.startsWith("note:") || nextLine.startsWith("stack backtrace:") || nextLine === "") {
+          break;
+        }
+        messageParts.push(nextLine);
+      }
+      const message = messageParts.join(" ").trim() || "panicked";
+      return { type: "panic", message, file: panicNew[1], line: Number(panicNew[2]) };
+    }
+
+    // Old panic format: "thread 'x' panicked at 'message', location"
+    const panicOld = line.match(PANIC_OLD);
+    if (panicOld) {
+      // Look for location in subsequent lines
+      for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
+        const loc = lines[j].trim().match(PANIC_LOCATION);
         if (loc) {
-          return { type: "panic", message: panic[1], file: loc[1], line: Number(loc[2]) };
+          return { type: "panic", message: panicOld[1], file: loc[1], line: Number(loc[2]) };
         }
       }
-      return { type: "panic", message: panic[1] };
+      return { type: "panic", message: panicOld[1] };
     }
 
     // assertion failures
