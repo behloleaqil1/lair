@@ -157,10 +157,12 @@ export interface BusConsumersOptions {
   onMessage: (project: string, event: BusMessageEvent, mode: BusConsumeMode) => void;
   /** Audit invalid events (for acceptance test 5) */
   onInvalidEvent?: (project: string, reason: string, data: Record<string, unknown>) => void;
-  /** Load persisted consumed ids for a project (for restart persistence, M2) */
+  /** Load persisted consumed ids for a project (for restart persistence, M2). Called once on setMode. */
   loadConsumed?: (project: string) => Map<number, number>;
-  /** Save consumed ids for a project (for restart persistence, M2) */
-  saveConsumed?: (project: string, consumed: Map<number, number>) => void;
+  /** Persist a consumed bus id (for restart persistence, M2). Called on each markConsumed. */
+  persistConsumed?: (project: string, busId: number, at: number) => void;
+  /** Prune old consumed entries (for restart persistence, M2). Called periodically. */
+  pruneConsumed?: (project: string, cutoff: number) => void;
 }
 
 /**
@@ -244,13 +246,14 @@ export class BusConsumers {
 
     const now = this.options.clock.now();
 
-    // Prune old entries
+    // Prune old entries (in memory and optionally in store)
     const cutoff = now - CONSUMED_EVENT_TTL_MS;
     for (const [id, consumedAt] of state.consumed) {
       if (consumedAt <= cutoff) {
         state.consumed.delete(id);
       }
     }
+    this.options.pruneConsumed?.(project, cutoff);
 
     // Add new entry
     state.consumed.set(busId, now);
@@ -264,8 +267,8 @@ export class BusConsumers {
       }
     }
 
-    // Persist
-    this.options.saveConsumed?.(project, state.consumed);
+    // Persist immediately
+    this.options.persistConsumed?.(project, busId, now);
   }
 
   /** Record an observation (for observe mode) */

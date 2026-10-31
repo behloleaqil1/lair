@@ -921,6 +921,86 @@ export class AgentsFill {
     return this.checking;
   }
 
+  /**
+   * Process a bus report immediately (event-driven, no file poll in the path).
+   * Records the appropriate event and updates state; the mirrored queue line
+   * (if any) will be skipped because its bus id is already consumed.
+   */
+  async processBusReport(report: { agent: string; kind: string; task: string; gateId?: string; summary?: string }): Promise<boolean> {
+    const { project, store } = this.options;
+    const probes = this.options.probes;
+    const now = probes.clock.now();
+    const latest = store.latestRunForTask(project, report.task);
+
+    // Build a summary line (like a queue line would say)
+    const summaryLine = report.summary ?? `bus: ${report.agent} ${report.kind} ${report.task}${report.gateId ? ` ${report.gateId}` : ""}`;
+
+    switch (report.kind) {
+      case "DONE": {
+        // Record fill_done (same as when finding a done line in the queue)
+        await this.options.record(
+          "fill_done",
+          {
+            agent: report.agent,
+            task: report.task,
+            runId: latest?.id,
+            summary: `fill: ${report.task} is done (via bus): ${summaryLine}`,
+            evidence: [summaryLine],
+            data: { line: summaryLine, runId: latest?.id ?? null, lineHash: `bus:${now}`, viabus: true },
+            dedupeKey: `fill_done:bus:${report.task}:${latest?.id ?? "none"}:${now}`,
+          },
+          now,
+        );
+        // Clear any hold on this task
+        this.holds.delete(`${report.agent}|${report.task}`);
+        break;
+      }
+      case "BLOCKED": {
+        // Record fill_blocked
+        await this.options.record(
+          "fill_blocked",
+          {
+            agent: report.agent,
+            task: report.task,
+            runId: latest?.id,
+            summary: `fill: ${report.task} is blocked (via bus): ${summaryLine}`,
+            evidence: [summaryLine],
+            data: { line: summaryLine, runId: latest?.id ?? null, viabus: true },
+          },
+          now,
+        );
+        break;
+      }
+      case "WAITING": {
+        // Record fill_waiting
+        await this.options.record(
+          "fill_waiting",
+          {
+            agent: report.agent,
+            task: report.task,
+            runId: latest?.id,
+            summary: `fill: ${report.task} is waiting (via bus)${report.gateId ? ` on ${report.gateId}` : ""}: ${summaryLine}`,
+            evidence: [summaryLine],
+            data: { line: summaryLine, runId: latest?.id ?? null, gateId: report.gateId ?? null, viabus: true },
+          },
+          now,
+        );
+        break;
+      }
+      case "PROGRESS": {
+        // PROGRESS doesn't change fill's state - it's informational only
+        // The check will pick up any actual state changes
+        break;
+      }
+      default:
+        return false;
+    }
+
+    // Trigger a check to update state immediately
+    void this.check();
+    return true;
+  }
+
   /** Check soon, then every fill.interval_seconds, until stop(). */
   start(): void {
     if (!this.stopped) return;

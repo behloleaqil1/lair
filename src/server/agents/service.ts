@@ -402,6 +402,11 @@ export interface AgentsServiceOptions {
   revokeBusToken?: (runId: string) => void;
   /** What the ready guard reads a PR from (read on each use); undefined: the project has no git host to ask */
   readyFacts?: () => ReadyFactsSource | undefined;
+  /**
+   * Bus consumer integration: check if a bus id was consumed (event processed).
+   * When provided and returns true for a line's bus id, fill's file reader skips it.
+   */
+  wasConsumed?: (busId: number) => boolean;
 }
 
 interface EventInput {
@@ -429,6 +434,7 @@ export class AgentsService {
   private tools?: ToolReadiness;
   private mintBusToken?: (runId: string, agent: string) => string;
   private revokeBusToken?: (runId: string) => void;
+  private wasConsumed?: (busId: number) => boolean;
   private watchdogSettings: WatchdogSettings;
   private watchdogStore: WatchdogStore | null = null;
   private unsubscribe: (() => void) | null = null;
@@ -462,6 +468,7 @@ export class AgentsService {
     this.tools = options.tools;
     this.mintBusToken = options.mintBusToken;
     this.revokeBusToken = options.revokeBusToken;
+    this.wasConsumed = options.wasConsumed;
     this.watchdogSettings = watchdogSettingsFor(options.config, options.settings.hungMinutes);
     // Usage reaches the per-agent and per-project budgets through the fleet budget
     this.unsubscribe =
@@ -503,6 +510,7 @@ export class AgentsService {
         },
         withdraw: (decision, reason) => this.withdrawDecision(decision, reason, this.probes.clock.now()),
         readyFacts: options.readyFacts,
+        wasConsumed: this.wasConsumed,
       });
     }
   }
@@ -3168,6 +3176,16 @@ export class AgentsService {
     return this.fill.view();
   }
 
+  /**
+   * Process a bus report (from BusConsumers): drives the same state change
+   * as the matching queue line, immediately (event-driven, no file poll).
+   * Returns true if the report was processed, false if fill is off.
+   */
+  async processBusReport(report: { agent: string; kind: string; task: string; gateId?: string; summary?: string }): Promise<boolean> {
+    if (!this.fill) return false;
+    return this.fill.processBusReport(report);
+  }
+
   /** The owner's "check now" (POST /api/agents/tick): a tick, then a fill check when fill is on. */
   async checkNow(): Promise<AgentsTickSummary> {
     const summary = await this.tick();
@@ -3564,6 +3582,11 @@ export interface AgentsManagerOptions {
   decisions?: DecisionInbox;
   /** Tool sign-in checks (src/server/ai/): a tool signed out on this machine starts no run here */
   tools?: ToolReadiness;
+  /**
+   * Bus consumer integration: check if a bus id was consumed (event processed).
+   * Passed to each fill; when it returns true for a line's bus id, the file reader skips it.
+   */
+  wasConsumed?: (project: string, busId: number) => boolean;
 }
 
 /**
@@ -3667,7 +3690,12 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
           budget: this.options.budget,
           events: this.options.events,
           tools: this.options.tools,
+<<<<<<< HEAD
           readyFacts: () => this.readyFacts?.(entry.name),
+=======
+          // Bus consumer integration: check if a bus id was consumed (bound to this project)
+          wasConsumed: this.options.wasConsumed ? (busId) => this.options.wasConsumed!(entry.name, busId) : undefined,
+>>>>>>> 56014f3 (fix(bus): wire consumers, persist consumed, add validators)
         }),
       );
     }
@@ -3758,6 +3786,20 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
     const service = this.services.get(project);
     if (!service) return Promise.reject(new AgentsError(404, `The agents module is off for ${project}`));
     return service.requestRun(input);
+  }
+
+  /**
+   * Process a bus report (from BusConsumers): routes to the right project's
+   * fill, which drives the same state change as the matching queue line.
+   * Returns true if the report was processed, false if the project or fill is off.
+   */
+  async processBusReport(
+    project: string,
+    report: { agent: string; kind: string; task: string; gateId?: string; summary?: string },
+  ): Promise<boolean> {
+    const service = this.services.get(project);
+    if (!service) return false;
+    return service.processBusReport(report);
   }
 
   getStore(): AgentsStore | null {

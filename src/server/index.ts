@@ -26,6 +26,7 @@ import {
 } from "./human-auth/index.js";
 import { registerControlRoutes } from "./routes/controls.js";
 import { registerBusRoutes } from "./routes/bus.js";
+import { BusConsumers, getBusStore, closeBusStores, parseBusConfig } from "./bus/index.js";
 import { registerProcessRoutes } from "./routes/processes.js";
 import { registerSettingsRoutes } from "./routes/settings.js";
 import { getSupervisor } from "./services/supervisor.js";
@@ -505,15 +506,74 @@ const cachedProcessTable = new CachedProcessTable(processCache);
 // Routes read from the cache immediately; refreshes happen in the background.
 const dataCacheManager = new DataCacheManager();
 
-const agents = new AgentsManager({
+// Bus consumers (bus PR 2a): fill and the planner consume structured bus reports.
+// Created before agents so wasConsumed can be passed to AgentsManager.
+// The onReport handler references agents, which is defined below (late binding).
+const dataDir = join(process.cwd(), "data");
+const CONSUMED_EVENT_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// Forward-declare agents so busConsumers can reference it
+let agents: AgentsManager | null = null;
+
+const busConsumers = new BusConsumers({
+  events: getEventBus(),
+  clock: { now: () => Date.now() },
+  onReport: async (project, event, mode) => {
+    if (mode !== "on") return; // In observe mode, we only record (handled by BusConsumers)
+    if (!agents) return; // Should never happen after startup
+    // Route the report to the agents module, which routes to the right project's fill
+    await agents.processBusReport(project, {
+      agent: event.agent,
+      kind: event.kind,
+      task: event.task,
+      gateId: event.gateId,
+      summary: event.sha ? `${event.agent} ${event.kind} ${event.task}${event.gateId ? ` ${event.gateId}` : ""}${event.pr ? ` PR #${event.pr}` : ""} at ${event.sha}` : undefined,
+    });
+  },
+  onMessage: (_project, _event, _mode) => {
+    // Message handling for owner messages (planner integration) - future PR
+  },
+  onInvalidEvent: (project, reason, data) => {
+    console.warn(`[bus-consumers] ${project}: invalid event: ${reason}`, data);
+  },
+  // Persistence: load and save consumed ids through the bus store (M2: restart persistence)
+  loadConsumed: (project) => {
+    const store = getBusStore(project, dataDir);
+    const cutoff = Date.now() - CONSUMED_EVENT_TTL_MS;
+    return store.loadConsumed(cutoff);
+  },
+  persistConsumed: (project, busId, at) => {
+    const store = getBusStore(project, dataDir);
+    store.markConsumed(busId, at);
+  },
+  pruneConsumed: (project, cutoff) => {
+    const store = getBusStore(project, dataDir);
+    store.pruneConsumed(cutoff);
+  },
+});
+
+agents = new AgentsManager({
   dbPath: join(process.cwd(), "data", "agents.db"),
   events: getEventBus(),
   budget: getBudgetManager(),
   tools: aiTools,
   probes: systemAgentProbesWithCache(processCache),
+  // Bus consumer integration: check if a bus id was consumed (event processed)
+  wasConsumed: (project, busId) => busConsumers.wasConsumed(project, busId),
 });
 agents.load(projectEntries);
 managedRuns = agents;
+
+// Set the consume mode for each project based on its config
+for (const entry of projectEntries) {
+  if (!entry.config) continue;
+  try {
+    const busSettings = parseBusConfig(entry.config.bus as Record<string, unknown> | undefined);
+    busConsumers.setMode(entry.name, busSettings.consume);
+  } catch (e) {
+    console.warn(`[bus-consumers] ${entry.name}: invalid bus config: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
 
 // Progress watchdog: one per project with `watchdog.enabled: true` (off by
 // default). Its routes are read-only and answer for every project. It reads
@@ -748,6 +808,13 @@ const reloader = new ConfigReloader({
   onAccepted: (project, config) => {
     dataServices.delete(project);
     refreshFileWatcher(project, config);
+    // Update bus consumer mode when config changes (bus PR 2a)
+    try {
+      const busSettings = parseBusConfig(config.bus as Record<string, unknown> | undefined);
+      busConsumers.setMode(project, busSettings.consume);
+    } catch (e) {
+      console.warn(`[bus-consumers] ${project}: invalid bus config on reload: ${e instanceof Error ? e.message : String(e)}`);
+    }
   },
 });
 await registerReloadRoutes(fastify, reloader);
@@ -838,6 +905,9 @@ const stopServer = async (reason: string) => {
   // Stop the planner first: it requests runs from the agents module
   await planner.stop();
 
+  // Stop bus consumers before agents: no new events will be processed
+  busConsumers.stop();
+
   // Stop agent supervision: the agents keep running for the next server to adopt, unless a project sets
   // agents.on_restart: stop (then their runs are stopped too, within a bounded wait)
   await agents.stop({ planned: true });
@@ -870,6 +940,9 @@ const stopServer = async (reason: string) => {
 
   // Close store
   closeStore();
+
+  // Close bus stores (bus PR 2a persistence)
+  closeBusStores();
 
   // Stop file watchers
   for (const watcher of fileWatchers.values()) {

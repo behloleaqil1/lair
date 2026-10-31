@@ -534,7 +534,8 @@ describe("BusConsumers", () => {
   describe("persistence", () => {
     it("loads consumed ids on setMode", () => {
       const loadConsumed = vi.fn().mockReturnValue(new Map([[42, 1700000000000]]));
-      const saveConsumed = vi.fn();
+      const persistConsumed = vi.fn();
+      const pruneConsumed = vi.fn();
       
       const persistentConsumers = new BusConsumers({
         events: eventBus,
@@ -542,7 +543,8 @@ describe("BusConsumers", () => {
         onReport: reportHandler,
         onMessage: messageHandler,
         loadConsumed,
-        saveConsumed,
+        persistConsumed,
+        pruneConsumed,
       });
 
       persistentConsumers.setMode("test-project", "on");
@@ -551,9 +553,10 @@ describe("BusConsumers", () => {
       expect(persistentConsumers.wasConsumed("test-project", 42)).toBe(true);
     });
 
-    it("saves consumed ids when marking", () => {
+    it("persists consumed ids when marking", () => {
       const loadConsumed = vi.fn().mockReturnValue(new Map());
-      const saveConsumed = vi.fn();
+      const persistConsumed = vi.fn();
+      const pruneConsumed = vi.fn();
       
       const persistentConsumers = new BusConsumers({
         events: eventBus,
@@ -561,15 +564,37 @@ describe("BusConsumers", () => {
         onReport: reportHandler,
         onMessage: messageHandler,
         loadConsumed,
-        saveConsumed,
+        persistConsumed,
+        pruneConsumed,
       });
 
       persistentConsumers.setMode("test-project", "on");
       persistentConsumers.markConsumed("test-project", 42);
 
-      expect(saveConsumed).toHaveBeenCalledWith("test-project", expect.any(Map));
-      const savedMap = saveConsumed.mock.calls[0][1];
-      expect(savedMap.has(42)).toBe(true);
+      // persistConsumed is called with project, busId, and timestamp
+      expect(persistConsumed).toHaveBeenCalledWith("test-project", 42, expect.any(Number));
+    });
+
+    it("prunes old entries when marking consumed", () => {
+      const loadConsumed = vi.fn().mockReturnValue(new Map());
+      const persistConsumed = vi.fn();
+      const pruneConsumed = vi.fn();
+
+      const persistentConsumers = new BusConsumers({
+        events: eventBus,
+        clock,
+        onReport: reportHandler,
+        onMessage: messageHandler,
+        loadConsumed,
+        persistConsumed,
+        pruneConsumed,
+      });
+
+      persistentConsumers.setMode("test-project", "on");
+      persistentConsumers.markConsumed("test-project", 42);
+
+      // pruneConsumed is called with the cutoff timestamp
+      expect(pruneConsumed).toHaveBeenCalledWith("test-project", expect.any(Number));
     });
   });
 });
