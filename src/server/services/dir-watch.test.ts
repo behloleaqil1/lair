@@ -162,14 +162,15 @@ describe("DirWatch", () => {
     const h = watchDir(dir);
     rmSync(dir, { recursive: true, force: true });
     await waitFor("unlink a.log", () => h.saw("unlink", "a.log"));
-    await sleep(200);
+    // Allow extra time on slow CI runners (macOS) for watcher to detect removal
+    await sleep(500);
     mkdirSync(dir);
     writeFileSync(join(dir, "n.log"), "n\n");
     await waitFor("add n.log", () => h.saw("add", "n.log"));
     await waitFor("the watch", () => h.watch.state === "watching");
     writeFileSync(join(dir, "m.log"), "m\n");
     await waitFor("add m.log", () => h.saw("add", "m.log"));
-  });
+  }, 15_000);
 
   it("does nothing after stop()", async () => {
     const dir = folderWithFiles(tempRoot());

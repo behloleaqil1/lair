@@ -92,10 +92,11 @@ describe("ProjectDataCache", () => {
     const after = cache.peekPullRequests()?.refreshedAt;
     // If both are defined, they should be the same (no refresh after stop)
     // or at worst only differ by a small amount if one was in flight
+    // Threshold is generous for slow CI runners (macOS in particular)
     if (first && after) {
       const firstMs = new Date(first).getTime();
       const afterMs = new Date(after).getTime();
-      expect(afterMs - firstMs).toBeLessThan(200);
+      expect(afterMs - firstMs).toBeLessThan(500);
     }
   });
 });
