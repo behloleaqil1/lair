@@ -46,9 +46,10 @@ describe("nav sections", () => {
       "Decisions",
       "Delivery",
       "Processes",
+      "Knowledge",
       "Settings",
     ]);
-    expect(ids(ALL)).toHaveLength(9);
+    expect(ids(ALL)).toHaveLength(10);
   });
 
   it("shows only the sections every project has when no module is on, and Settings always", () => {
