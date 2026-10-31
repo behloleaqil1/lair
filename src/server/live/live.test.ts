@@ -22,6 +22,9 @@ describe("LivePublisher", () => {
 
   afterEach(() => {
     publisher.close();
+    eventBus.clear();
+    vi.clearAllTimers();
+    vi.restoreAllMocks();
     vi.useRealTimers();
   });
 
@@ -76,7 +79,7 @@ describe("LivePublisher", () => {
     });
 
     it("drops data larger than 8KB", () => {
-      const largeData = { content: "x".repeat(10000) };
+      const largeData = { content: "x".repeat(8500) }; // Just over 8KB threshold
       publisher.publish("dragons", "kiro-A", "update", largeData);
 
       vi.advanceTimersByTime(250);
