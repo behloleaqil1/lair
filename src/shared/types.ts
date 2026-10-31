@@ -120,11 +120,22 @@ export interface ProjectConfig {
    */
   planner?: Record<string, unknown>;
   /**
+   * Lessons: what Lair has learned from incidents (src/server/lessons/).
+   * Validated by parseLessonsConfig; see docs/configuration.md#lessons
+   */
+  lessons?: Record<string, unknown>;
+  /**
    * The supervisor: Lair's self-checks (src/server/supervisor/). Validated
    * by parseSupervisorConfig; see
    * docs/configuration.md#supervisor-self-checks-and-the-ops-api
    */
   supervisor?: Record<string, unknown>;
+  /**
+   * Agent checks: agents test on a runner before they gate
+   * (src/server/checks/). Validated by parseChecksConfig; see
+   * docs/configuration.md#checks
+   */
+  checks?: Record<string, unknown>;
 }
 
 // Process configuration as it appears in YAML (before defaults applied)

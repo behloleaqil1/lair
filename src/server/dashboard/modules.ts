@@ -37,6 +37,7 @@ export function moduleFlags(config: ProjectConfig, nodeCount: number): ModuleFla
     github: typeof config.github === "string" && config.github.trim() !== "",
     machines: hasEntries(config.machines),
     nodes: nodeCount > 0,
+    lessons: enabled(config.lessons),
   };
 }
 
@@ -56,4 +57,5 @@ export const NO_MODULES: ModuleFlags = {
   github: false,
   machines: false,
   nodes: false,
+  lessons: false,
 };

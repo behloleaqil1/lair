@@ -250,6 +250,10 @@ export type EventType =
   | "agent.budget.exceeded"
   | "agents.fill_started"
   | "agents.fill_held"
+  // fill.idle: an allowlisted agent idle while ready work exists, and the end of that episode
+  | "agents.fill_idle_notice"
+  | "agents.fill_idle_resolved"
+  | "agents.fill_unmatched"
   // Gate results, for triage: {project, result: GateResult, reports?, context?}
   | "gate.completed"
   // Triage (src/server/triage/)
@@ -301,7 +305,12 @@ export type EventType =
   | "planner.verifier_finished"
   // Bus (src/server/bus/)
   | "bus.report"
-  | "bus.message";
+  | "bus.message"
+  // Checks (src/server/checks/)
+  | "check.requested"
+  | "check.started"
+  | "check.completed"
+  | "check.reconciled";
 
 /** Event stored in the database */
 export interface Event {

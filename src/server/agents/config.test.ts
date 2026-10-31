@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { parse as parseYaml } from "yaml";
 import type { ProjectConfig } from "../../shared/types.js";
 import {
+  anyAgentPatternFor,
   backoffMs,
   DEFAULT_BLOCKED_PATTERN,
   DEFAULT_DONE_PATTERN,
@@ -15,6 +16,8 @@ import {
   fillPatternFor,
   getAgentClass,
   parseAgentsConfig,
+  REPORTED_TASK_GROUP,
+  reportPatternFor,
   taskLineMatch,
 } from "./config.js";
 import { matchTransient } from "./failover.js";
@@ -140,6 +143,8 @@ describe("agents config", () => {
       promptFiles: [],
       maxActive: 1,
       donePattern: DEFAULT_DONE_PATTERN,
+      doneMatch: "task_id",
+      warnings: [],
       capacity: {
         loadPerCpuMax: undefined,
         memory: { pressureMax: undefined, availableMinPct: undefined },
@@ -164,6 +169,10 @@ describe("agents config", () => {
         maxQueueWaitMinutes: 1440,
         requeueMarker: undefined,
         fallbackSeconds: 900,
+      },
+      idle: {
+        noticeMinutes: 0,
+        readySources: ["tasks_file"],
       },
     });
     expect(errorsOf({ fill: { enabled: true } })).toEqual([
@@ -355,6 +364,74 @@ describe("agents config", () => {
     expect(done("- DONE feat:login by worker-a", "feat")).toBe(false);
   });
 
+  /** A fleet's patterns: done names the task and the agent (DONE or READY); waiting and blocked only the agent */
+  const FLEET = {
+    done_pattern: "^-\\s+(?:DONE|READY)\\s+{task}(?=[\\s:]|$).*\\bby\\s+{agent}(?=[\\s(]|$)",
+    waiting_pattern: "^-\\s+WAITING\\s+(?:(?:.*?\\s)?(?<wake>\\d{8}T\\d{6}Z-[A-Za-z0-9._-]+)\\b)?.*\\bby\\s+{agent}(?=[\\s(]|$)",
+    blocked_pattern: "^-\\s+BLOCKED\\s+.*\\bby\\s+{agent}(?=[\\s(]|$)",
+  };
+
+  it("done_match: task_id when done_pattern names the task; agent_legacy, with a warning, when it names only the agent; task_id asked for without {task} is an error", () => {
+    const fill = { enabled: true, tasks_file: "work/tasks.txt", agents: ["worker-a"], prompt_files: ["{prompts_dir}/{agent}.txt"] };
+    const settingsOf = (extra: Record<string, unknown>, enabled = true) => {
+      const parsed = parseAgentsConfig({ enabled: true, fill: { ...fill, enabled, ...extra } }, project);
+      if (!parsed.ok) throw new Error(parsed.errors.join("; "));
+      return parsed.settings.fill;
+    };
+    const byAgent = "^-\\s+DONE\\s+.*\\bby\\s+{agent}(?=[\\s(]|$)";
+
+    // The default patterns name the task: task_id, nothing to warn about
+    expect(settingsOf({})).toMatchObject({ doneMatch: "task_id", warnings: [] });
+    // A done_pattern that names only the agent keeps matching by agent (such configs worked before done_match), warned
+    const legacy = settingsOf({ done_pattern: byAgent });
+    expect(legacy.doneMatch).toBe("agent_legacy");
+    expect(legacy.warnings).toEqual([
+      "agents.fill.done_pattern has no {task}: fill matches DONE lines by agent (done_match agent_legacy), so a DONE line the agent writes about any other task closes its open task. Put {task} in done_pattern so a line closes only the task it names",
+    ]);
+    // The fleet's: task_id for its done lines, a warning for each pattern that can't name a task
+    const fleet = settingsOf(FLEET);
+    expect(fleet.doneMatch).toBe("task_id");
+    expect(fleet.warnings.map((w) => w.slice(0, w.indexOf(":")))).toEqual([
+      "agents.fill.waiting_pattern has no {task}",
+      "agents.fill.blocked_pattern has no {task}",
+    ]);
+    // agent_legacy asked for with patterns that name the task: allowed, and it says what it turns off
+    expect(settingsOf({ done_match: "agent_legacy" })).toMatchObject({
+      doneMatch: "agent_legacy",
+      warnings: [expect.stringContaining("agents.fill.done_match is agent_legacy: a line an agent writes about a task it isn't on is not reported")],
+    });
+    expect(settingsOf({ done_match: "task_id" })).toMatchObject({ doneMatch: "task_id", warnings: [] });
+    // Fill off: nothing to warn about
+    expect(settingsOf({ done_pattern: byAgent }, false).warnings).toEqual([]);
+
+    // task_id asked for with a done_pattern that can't name the task: an error, never a silent fallback
+    expect(errorsOf({ enabled: true, fill: { ...fill, done_pattern: byAgent, done_match: "task_id" } })).toEqual([
+      'agents.fill.done_match: "task_id" needs {task} in done_pattern (a line that names only the agent can\'t say which task it closes); add {task}, or set done_match: agent_legacy',
+    ]);
+    expect(errorsOf({ enabled: true, fill: { ...fill, done_match: "by_title" } })[0]).toContain("agents.fill.done_match");
+  });
+
+  it("reportPatternFor reads the task id an agent's report line names, with the project's own pattern", () => {
+    const read = (template: string, line: string, agent = "worker-a") =>
+      reportPatternFor(template, agent)?.exec(line)?.groups?.[REPORTED_TASK_GROUP] ?? null;
+    expect(read(DEFAULT_DONE_PATTERN, "- DONE old-task by worker-a 12:05Z: merged")).toBe("old-task");
+    expect(read(DEFAULT_WAITING_PATTERN, "- WAITING old-task 20260302T120100Z-g-1 by worker-a 12:05Z: queued")).toBe("old-task");
+    // Every character a task id may have
+    expect(read(DEFAULT_DONE_PATTERN, "- DONE web/fix#12.v2:b_1 by worker-a")).toBe("web/fix#12.v2:b_1");
+    // The pattern's own keywords and its own end of the id: READY is a report here, the id ends at ':'
+    expect(read(FLEET.done_pattern, "- READY lair-x PR #194 at 4395a03 by worker-a (Mushu) 20:58Z: fixed")).toBe("lair-x");
+    // Its {agent}: another agent's line is no report of this one
+    expect(read(FLEET.done_pattern, "- READY lair-x PR #194 at 4395a03 by worker-b (Mushu) 20:58Z: fixed")).toBeNull();
+    // A keyword the pattern doesn't have is no report, nor is a quoted line
+    expect(read(FLEET.done_pattern, "- MERGED lair-x by worker-a 21:00Z")).toBeNull();
+    expect(read(DEFAULT_DONE_PATTERN, '> "- DONE old-task by worker-a"')).toBeNull();
+    // A second {task} must be the same id
+    expect(read("^-\\s+DONE\\s+{task}\\s+closes\\s+{task}(?=\\s|$)", "- DONE a-1 closes a-1")).toBe("a-1");
+    expect(read("^-\\s+DONE\\s+{task}\\s+closes\\s+{task}(?=\\s|$)", "- DONE a-1 closes a-2")).toBeNull();
+    // A pattern without {task}: its lines name no task
+    expect(reportPatternFor(FLEET.blocked_pattern, "worker-a")).toBeNull();
+  });
+
   it("transient_patterns: defaults that look for an error, bounded in number and length, matched on a dead run's last 3 lines cut to 500 characters", () => {
     const parsed = parseAgentsConfig({}, project);
     expect(parsed.ok).toBe(true);
@@ -418,6 +495,43 @@ describe("agents config", () => {
 
   it("backs off exponentially, capped", () => {
     expect([1, 2, 3, 4].map((n) => backoffMs(n, 10, 60))).toEqual([10_000, 20_000, 40_000, 60_000]);
+  });
+
+  it("fill.idle: notices are off by default; ready_sources takes only the wired source", () => {
+    const parsed = parseAgentsConfig(undefined, project);
+    expect(parsed.ok && parsed.settings.fill.idle).toEqual({ noticeMinutes: 0, readySources: ["tasks_file"] });
+
+    const fill = {
+      enabled: true,
+      tasks_file: "work/tasks.txt",
+      agents: ["worker-a"],
+      prompt_files: ["{prompts_dir}/{agent}.txt"],
+    };
+    const withIdle = (idle: Record<string, unknown>) => ({ enabled: true, fill: { ...fill, idle } });
+    const on = parseAgentsConfig(withIdle({ notice_minutes: 30, ready_sources: ["tasks_file"] }), project);
+    expect(on.ok && on.settings.fill.idle).toEqual({ noticeMinutes: 30, readySources: ["tasks_file"] });
+    expect(errorsOf(withIdle({ notice_minutes: 0 }))).toEqual([]);
+    // Sources that aren't wired, an empty list, a fraction, a negative or an unknown key are errors, never silent no-ops
+    expect(errorsOf(withIdle({ ready_sources: ["tasks_file", "backlog"] }))[0]).toContain("agents.fill.idle.ready_sources.1");
+    expect(errorsOf(withIdle({ ready_sources: ["tracker"] }))[0]).toContain("agents.fill.idle.ready_sources.0");
+    expect(errorsOf(withIdle({ ready_sources: [] }))[0]).toContain("agents.fill.idle.ready_sources");
+    expect(errorsOf(withIdle({ notice_minutes: 1.5 }))[0]).toContain("agents.fill.idle.notice_minutes");
+    expect(errorsOf(withIdle({ notice_minutes: -1 }))[0]).toContain("agents.fill.idle.notice_minutes");
+    expect(errorsOf(withIdle({ side_queue: [] }))[0]).toContain("agents.fill.idle");
+  });
+
+  it("anyAgentPatternFor: a done line for an unassigned task counts by any agent, and never without the task", () => {
+    const both = anyAgentPatternFor("^-\\s+DONE\\s+{task}\\b.*\\bby\\s+{agent}", "feat-x");
+    expect(both).not.toBeNull();
+    expect(doneLineMatches(both!, "- DONE feat-x shipped by worker-b 12:00Z")).toBe(true);
+    expect(doneLineMatches(both!, "- DONE feat-x shipped by someone-else (Name): ok")).toBe(true);
+    expect(doneLineMatches(both!, "- DONE feat-xy by worker-b")).toBe(false);
+    expect(doneLineMatches(both!, "- WAITING feat-x by worker-b")).toBe(false);
+    const taskOnly = anyAgentPatternFor(DEFAULT_DONE_PATTERN, "feat-x");
+    expect(doneLineMatches(taskOnly!, "- DONE feat-x by worker-b 12:00Z: done")).toBe(true);
+    expect(doneLineMatches(taskOnly!, "- DONE feat-xy by worker-b")).toBe(false);
+    // A pattern that names only the agent can't say which task a line is about
+    expect(anyAgentPatternFor("^-\\s+DONE\\b.*\\bby\\s+{agent}", "feat-x")).toBeNull();
   });
 
   it("fill.capacity: native capacity settings with load, memory, heavy_work, and agent_class", () => {

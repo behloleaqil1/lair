@@ -66,6 +66,16 @@ const oneLine = (text: string, max = 200) => {
   return flat.length > max ? `${flat.slice(0, max)}...` : flat;
 };
 
+/**
+ * The evidence code of a review.stuck decision (policy class C9) from how the last reviewer run ended: null is
+ * a run record that is gone (its variables lost), a run that failed or never started is a provider or start
+ * error, anything else ended without a review.
+ */
+export function reviewStuckCode(lastRunState: string | null): "run_variables_lost" | "provider_error" | "no_reviewer" {
+  if (lastRunState === null) return "run_variables_lost";
+  return lastRunState === "failed" || lastRunState === "never_started" ? "provider_error" : "no_reviewer";
+}
+
 /** The agents module task of a slot's review: review-<pr>-<head8>, and -<n> for the n-th slot (n > 1). */
 export function reviewTaskId(pr: number, headSha: string, slot: number): string {
   return `review-${pr}-${headSha.slice(0, 8)}${slot > 0 ? `-${slot + 1}` : ""}`;
@@ -613,8 +623,7 @@ export class AgentReviewAssigner implements ReviewAssigner {
     const spec = record.spec;
     // C9 matches on the code: a run record that is gone (its variables lost), a run that failed or never started
     // (a provider or start error), anything else ended without a review
-    const code =
-      lastRunState === null ? "run_variables_lost" : lastRunState === "failed" || lastRunState === "never_started" ? "provider_error" : "no_reviewer";
+    const code = reviewStuckCode(lastRunState);
     record.state = "failed";
     record.agent = null;
     record.runId = null;
