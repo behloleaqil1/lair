@@ -5515,9 +5515,29 @@ describe("bus consumers: events drive fill's state (bus PR 2a)", () => {
     const consumed = new Set<number>();
     const invalidEvents: { reason: string; data: Record<string, unknown> }[] = [];
 
-    // Create config with bus at project level (not inside agents)
+    // Create fill config (needed for processBusReport)
+    const tasksPath = join(paths.dir, "tasks.txt");
+    mkdirSync(paths.promptsDir, { recursive: true });
+    writeFileSync(join(paths.promptsDir, "worker-a.txt"), "You are worker A.\n");
+    writeFileSync(join(paths.promptsDir, "worker-b.txt"), "You are worker B.\n");
+    writeFileSync(tasksPath, "worker-a|Alice|feat-login|Build the login form\n");
+
+    // Base fill config merged with any additional agents config
     const agentsConfig = agents(paths);
-    const config = projectConfig(paths, { ...BASE, ...agentsConfig });
+    const fillConfig = {
+      fill: {
+        enabled: true,
+        tasks_file: tasksPath,
+        agents: ["worker-a", "worker-b"],
+        prompt_files: ["{prompts_dir}/{agent}.txt"],
+        max_active: 2,
+        interval_seconds: 1,
+        ...(agentsConfig.fill as Record<string, unknown> | undefined),
+      },
+    };
+    // Merge fill into the agents config (don't duplicate fill)
+    const { fill: _, ...restAgentsConfig } = agentsConfig as { fill?: unknown };
+    const config = projectConfig(paths, { ...BASE, ...restAgentsConfig, ...fillConfig });
     // Add bus config at the project level
     (config as unknown as { bus: { consume: string } }).bus = { consume: consumeMode };
 
@@ -5745,7 +5765,24 @@ describe("bus consumers: events drive fill's state (bus PR 2a)", () => {
     const persistedConsumed = new Set<number>();
 
     function createManagerWithPersistence(): Harness {
-      const config = projectConfig(paths, { ...BASE });
+      // Create fill config (needed for processBusReport)
+      const tasksPath = join(paths.dir, "tasks.txt");
+      mkdirSync(paths.promptsDir, { recursive: true });
+      writeFileSync(join(paths.promptsDir, "worker-a.txt"), "You are worker A.\n");
+      writeFileSync(join(paths.promptsDir, "worker-b.txt"), "You are worker B.\n");
+      writeFileSync(tasksPath, "worker-a|Alice|feat-login|Build the login form\n");
+
+      const config = projectConfig(paths, {
+        ...BASE,
+        fill: {
+          enabled: true,
+          tasks_file: tasksPath,
+          agents: ["worker-a", "worker-b"],
+          prompt_files: ["{prompts_dir}/{agent}.txt"],
+          max_active: 2,
+          interval_seconds: 1,
+        },
+      });
       // Add bus config at the project level
       (config as unknown as { bus: { consume: string } }).bus = { consume: "on" };
       const clock = new FakeClock();
@@ -5821,9 +5858,12 @@ describe("bus consumers: events drive fill's state (bus PR 2a)", () => {
 
   // S3: done_pattern test with marked line
   it("a marked line matches the project's done_pattern (the marker doesn't break matching)", async () => {
-    // Custom done_pattern that the line should still match
+    // Custom done_pattern that the line should still match (inside fill config)
     const h = setupWithBusConsumer("off", (_p) => ({
-      done_pattern: "^-\\s+DONE\\s+(?<task>\\S+)",
+      fill: {
+        enabled: true,
+        done_pattern: "^-\\s+DONE\\s+(?<task>\\S+)",
+      },
     }));
 
     await h.service.requestRun({ agent: "worker-a", task: "feat-search", prompt: "Search" });
