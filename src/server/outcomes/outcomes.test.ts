@@ -415,14 +415,14 @@ describe("merges and reviews", () => {
     h.fact(HOUR, { code: "default_red", sha: "other" });
     h.fact(2 * HOUR, { code: "merged", pr: 43, sha: "def456" });
     h.fact(3 * HOUR, { code: "reverted", sha: "def456" });
-    h.at(24 * HOUR);
+    h.at(25 * HOUR);
     await h.tracker.sweep();
     expect(now(h, d.id).outcome).toBe("unknown");
 
     const none = harness();
     const n = await answered(none, mergeHold(), "release");
     none.fact(HOUR, { code: "reverted", sha: "abc123" });
-    none.at(24 * HOUR);
+    none.at(25 * HOUR);
     await none.tracker.sweep();
     expect(now(none, n.id).outcome).toBe("unknown");
   });
@@ -453,7 +453,7 @@ describe("one outcome per answer", () => {
     const first = await answered(h, escalation("escalation:c1:3"), "fresh_session", 0);
     h.fact(HOUR, { code: "task_failed", task: TASK }); // after the first answer, before the second
     const second = await answered(h, escalation("escalation:c1:4"), "fresh_session", 2 * HOUR);
-    h.fact(3 * HOUR, { code: "run_completed", task: TASK });
+    h.fact(3 * HOUR, { code: "task_done", task: TASK });
     h.at(4 * HOUR);
     await h.tracker.sweep();
     expect(now(h, first.id).outcome).toBe("bad"); // the first restart failed again at +1h
@@ -532,6 +532,10 @@ describe("the bus", () => {
     const configPath = join(dir, "server.yaml");
     writeFileSync(configPath, "outcome_tracker:\n  enabled: true\n  check_minutes: 5\n");
     chmodSync(configPath, 0o600);
+    // The tracker has been on for a while: answers given since then are judged
+    const earlier = new FactLog(join(dir, "outcomes.db"));
+    earlier.enabledSince("2000-01-01T00:00:00.000Z");
+    earlier.close();
     const bus = new EventBus();
     const store = new DecisionStore(":memory:");
     closers.push(() => store.close());
