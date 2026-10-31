@@ -1818,6 +1818,8 @@ worker-b|Bob|feat-search|Search page
 | `fill.backoff_seconds` | number | `60` | Wait after such a run before fill starts the task again, doubling |
 | `fill.max_backoff_seconds` | number | `1800` | Longest such wait |
 | `fill.waiting_pattern` | string | `^-\s+WAITING\s+{task}(?=\s\|$)` | A run that ended on such a line waits; same rules as `done_pattern`. An optional `(?<wake>...)` names what it waits on |
+| `fill.ready_guard` | boolean | `false` | Refuse a done line that names a PR (`PR #<n>`, and `at <sha>` for its head) unless the PR is ready to review; see the Ready guard note below. Needs `review.enabled` (the PR is read through the review module's git host) |
+| `fill.ready_wait_minutes` | integer | `120` | How long a done line that only time can settle (CI still running, the git host not answering) is held and checked again; after that the owner gets one decision and the report stays refused. Counted from the first check, kept across restarts. `ready_guard: true` without `review.enabled` is a config error |
 | `fill.blocked_pattern` | string | `^-\s+BLOCKED\s+{task}(?=\s\|$)` | A run that ended on such a line is held for you at once; same rules as `done_pattern` |
 | `fill.wake.file` | string | — | The file whose existence ends a wait. `{wake}` (required), `{gates_dir}`, `{agents_dir}`, `{repo}`; relative to `repo` |
 | `fill.wake.root` | string | `{gates_dir}` | The directory `wake.file` must stay inside. `{gates_dir}`, `{agents_dir}`, `{repo}` |
@@ -1839,6 +1841,7 @@ Agents often end a run on purpose before the task is done: on a WAITING line (`-
 - **A gate still in the queue is a live wait.** When the WAITING line names a gate id (a plain name) and the gate queue (`gates_dir/queue`, read with the gates parser) still has a request for it, `<lane>.<pri>.<id>.req` (queued) or `.req.run` (running), the agent is waiting on work in progress, not on nothing. A machine that is offline for hours, a long queue, or a request moved to another lane is not the agent's doing. Such a wait doesn't count toward `max_wait_minutes`: the line shows `waiting: <gate> still queued in <lane> since <time>` (or `still running`), and the status's `waiting.queued` gives the gate, lane, status and since. When the request is gone and no result came, the budget counts again, from the last time fill saw the request in the queue (that sighting is kept in the store, so a restart doesn't lose it), or from the streak's start when it never saw one. A wait that never had a request in the queue is held at `max_wait_minutes` exactly as before. A live wait is held anyway once the streak has waited `wake.max_queue_wait_minutes` (24 hours by default, never less than `max_wait_minutes`): a gate that sits in the queue that long usually means a runner or a machine is down. The decision then says so. An agent that can write to the gate queue can keep its own wait alive, but never past `max_queue_wait_minutes`.
 - **Re-queued under a new id.** Some gate systems re-check or re-queue a gate under a new id and leave a marker naming it. Set `wake.requeue_marker` to that marker's path (`{wake}` is the id the waiting line names, `{n}` tries 1 to 9, and it must stay inside `wake.root`): the marker's first line, when it is a plain name, is the new id, and its markers are followed in turn (at most 10 ids). A wait whose new id is still in the queue is alive in the same way, and the new id's result (`wake.file` for it, newer than the run's chain) wakes the task as its own would. A marker that is a symlink, not a regular file, or whose first line isn't a plain name is passed over. Without `requeue_marker` only the waiting line's own id is looked up.
 - **Blocked.** A run that ends on a line matching `blocked_pattern` holds the task at once (`held: blocked`), with no restart, and raises one decision carrying the BLOCKED line. The line is cut to 300 characters and shown as data in a code block. It never goes into a prompt: the next run gets fill's `prompt_files` prompt as always. Release the hold ("Release hold", or the decision's "Start it again") once whatever blocked it is cleared.
+- **Ready guard.** With `fill.ready_guard: true`, a done line that names a PR counts only when, at the head it names (the PR's current head), every CI check passes (a skipped one is not a failure), the branch is not behind its base and does not conflict, the project's gate (`review.merge.gate`, when it requires one) passed at that head, and, when the PR carries review findings, its description has one line per finding with the finding's id and the sha of a commit of the PR. Otherwise the line is not a done: the task stays open, nothing goes to review, no `fill_done` is recorded. A refusal that needs a change (red CI, behind, conflicts, gate, finding map, a moved head) is recorded once as `fill_report_refused` (reason and instruction), and the next run's prompt ends with the instruction. A refusal that only time fixes (CI or the gate still running, the host not answering, mergeable not computed yet) holds the line (`held: report_refused`), starts no run, and is checked again on every fill check until it passes or turns into a refusal. Lines that name no PR are not checked. Off by default.
 - **The latest line wins.** Of a run's WAITING and BLOCKED lines, the last one applies. With a `done_pattern` that names the task, a done line always does: a BLOCKED task whose done line is written later (by whoever unblocked it, say) is `done`. With one that names only the agent, the agent's last DONE, WAITING or BLOCKED line decides (see [Matching by agent](#matching-by-agent)). Once fill has seen how a run ended, it keeps that in the store (`fill_waiting`, `fill_blocked`, and for a wake file `fill_wake_absent`, `fill_woken` or `fill_weak`), so rotating the queue file or restarting Lair doesn't turn a waiting run into one without progress.
 
 ```yaml
@@ -2880,7 +2883,7 @@ brain_trainer:
 
 The file is read again at every use, through the checks of the rest of `server.yaml`; a refused file turns the trainer off and the status says why.
 
-**Labels.** An answered decision is a label when a person chose its option; a default applied at expiry, a withdrawn decision and an open one are not. A decision with a single option is an acknowledgement, not a choice: it is never a label and the report counts it as `notices`. A decision raised before the cutoff but answered after it is not a training row (`lateAnswers`). An inbox decision has no outcome yet, so negative labels (`outcome: bad`) come only from the cases file. `outcome: bad` on a case marks an answer that turned out wrong: it is never a positive label, and a proposal equal to it for the same evidence (the same class and features, older than the test window) is refused as an abstain. `outcome: pending` is not a label until it is resolved. Only structured fields become features: the class (`module/kind/option ids`), the module, the offered and the recommended option ids, the evidence fields of a case (numbers, flags, and short identifier-like strings), and the hour of the day. A title, a context or a note never reaches a feature.
+**Labels.** An answered decision is a label when a person chose its option; a default applied at expiry, a withdrawn decision and an open one are not. A decision with a single option is an acknowledgement, not a choice: it is never a label and the report counts it as `notices`. A decision raised before the cutoff but answered after it is not a training row (`lateAnswers`). An inbox decision carries an `outcome` when the [outcome tracker](#outcome-tracker) is on (otherwise it is `unknown`), and a case in the cases file can carry one too; `outcome: bad` from either is a negative label. `outcome: bad` on a case marks an answer that turned out wrong: it is never a positive label, and a proposal equal to it for the same evidence (the same class and features, older than the test window) is refused as an abstain. `outcome: pending` is not a label until it is resolved. Only structured fields become features: the class (`module/kind/option ids`), the module, the offered and the recommended option ids, the evidence fields of a case (numbers, flags, and short identifier-like strings), and the hour of the day. A title, a context or a note never reaches a feature.
 
 **The time split.** Decisions are sorted by the time they were raised, and cut at a time, not at a position: everything strictly before the cutoff trains, everything at or after it tests. Decisions of the same instant therefore never fall on both sides, and no newer decision can reach the training set. The run keeps the cutoff in its report.
 
@@ -2893,6 +2896,47 @@ The file is read again at every use, through the checks of the rest of `server.y
 **Routes (owner only).** `GET /api/owner/brain-trainer` returns the status: whether it is on, the runs over time with their reports (the curve), the model that shadows, the shadow agreement per class, and `skipped`, the number of lines in the run history and the trace that could not be read and were left out. A run's `reason` is a fixed sentence with a `reasonCode`; paths and the container's own output stay out of it (the detail goes to Lair's log). `POST /api/owner/brain-trainer/run` starts a run now in the background (`202`; `409` while it is off or a run is going).
 
 **Not built yet:** the weekly LoRA run for a local language model (stage D), and the Decisions view's chart of the curve; both are tracked as follow-ups.
+
+## Outcome tracker
+
+The outcome tracker watches what happens after each answered decision and records whether the answer turned out `good`, `bad` or `unknown`, with structured evidence, on the decision itself (`outcome`, `outcomeAt`, `outcomeEvidence`, shown by `GET /api/decisions` and `/api/decisions/:id`). The [brain trainer](#brain-trainer) reads `outcome: bad` as a negative example. It is read-only towards the rest of Lair: it never answers, retries, reverts or changes a decision, and the only things it writes are the outcome fields and one `decision.outcome` event. It is off until `data/server.yaml` says otherwise, and it adds no route.
+
+```yaml
+outcome_tracker:
+  enabled: true
+  check_minutes: 10     # how often answers waiting for a verdict are looked at
+  restart_hours: 24
+  hold_hours: 6
+  release_hours: 24
+  planner_hours: 72
+  merge_hours: 24
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Nothing is opened, subscribed to or written while this is off (`data/outcomes.db` is not created) |
+| `check_minutes` | number 1-1440 | `10` | How often answered decisions without an outcome are judged. A server restart judges them at once |
+| `restart_hours` | number 0.1-720 | `24` | Window after an agent restart answer |
+| `hold_hours` | number 0.1-720 | `6` | Window after a wait / hold answer |
+| `release_hours` | number 0.1-720 | `24` | Window after a release / stand-down answer |
+| `planner_hours` | number 0.1-720 | `72` | Window after a planner proposal answer |
+| `merge_hours` | number 0.1-720 | `24` | Window after a released merge hold |
+
+The section is read when the server starts; a refused file or section leaves the tracker off and logs why.
+
+**Rules.** Each rule is a small function over one answer and the facts that followed it, in the window after the answer (the answer's own instant is not in it; the window's last instant is). The first fact that settles it, in time order, decides. A fact is a code and an id taken from a bus event, kept in `data/outcomes.db` (so a restart in the middle of a window loses nothing) for the longest window plus a day. Anything a rule cannot judge is `unknown`: at once when no rule applies, otherwise when the window ends with nothing settled. An answer that Lair applied by itself at expiry is no label and gets no outcome.
+
+| Answer | Good | Bad |
+|---|---|---|
+| Agent restart (`fresh_session` on an escalation) | a run of the task completes, or its line is marked done | the task fails again, or is escalated again |
+| Wait / hold (`wait` by the agents module) | a run of the held task starts (the cause cleared) | the same hold (same module, key family and task) is raised again |
+| Release / stand-down (`release`, `stop` by the agents module) | never recorded | the same task is escalated again |
+| Planner proposals applied (`approve_all`, `follow_verifier`) | every task the planner added right after the answer is done | one of them is dropped or reworded after it was applied |
+| A released merge hold on a pull request (a ref ending `:pr:<number>`) | never recorded | the merged commit turns the default branch red (`triage.culprit_found`) or is reverted (`triage.revert_requested`); the evidence says `review_miss` |
+
+Facts come from `agent.recovery`, `agent.run.started`, `agent.run.ended`, `decision.raised`, `planner.changed`, `review.merged`, `triage.culprit_found` and `triage.revert_requested`. A "good" for a release or a merge would be a guess, so those end `unknown` when nothing went wrong. Evidence holds codes and ids only (`rule`, `fact`, `factAt`, `task`, `pr`, counts); no title, context, note or agent output.
+
+**One outcome per answer.** The store records an outcome only while the decision has none, and only for the answer made at that time, so a repeat check, a restart or a decision undone and answered again never produces a second or a stale outcome. Each answered decision is judged on its own: a failure before a later answer does not count for it.
 
 ## Example complete configuration
 
