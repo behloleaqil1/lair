@@ -37,14 +37,14 @@ caps below the number of agents, and agents waiting on their own gate with nothi
   the backlog, or tracker issues labelled ready.
 - **Act mode:** the agent takes the next ready task, highest priority first. The task is matched to the agent's past
   workstream or area when possible.
-- **Side tasks while waiting:** an agent whose task is waiting on a gate may run ONE side task from `agents.fill.side_queue`
+- **Side tasks while waiting:** an agent whose task is waiting on a gate may run ONE side task from `fill.side_queue`
   (reviews, revert checks, docs), bounded to finish before its gate usually ends (learned durations). A side task is
   a separate run with its own claim under a side agent id, bounded by learned duration and a hard cap, never while
   the main run's process is alive in the same worktree. The main task resumes first when its gate lands.
 - A capacity explanation per idle agent: `max_active`, capacity, holds, launcher. One idle agent must never go
   unexplained.
 
-**Config:** `agents.fill.idle_notice_minutes`, `agents.fill.side_queue`, `agents.fill.priority_order`.
+**Config:** `fill.idle.notice_minutes`, `fill.side_queue`, `fill.idle.ready_sources`.
 
 **Observe → Act:**
 - Observe: raises the notice; logs the ready work and the reason each agent is held.
@@ -239,20 +239,27 @@ lose in-flight work.
 
 **Feature:** Uses the built restart module (#112, `src/server/restart/`). A merge to Lair's own main triggers an
 update at a quiet moment. The trigger is a merge record Lair's own review executor wrote (sha, PR, policy result) or
-a release tag Lair verifies, never a sha alone. Quiet means no merge in flight, no run in `queued`/`waiting_lock`, no
+a release tag Lair verifies against the host's release API (the release must be published, not draft or prerelease,
+and the tag must match the release's tag_name). Quiet means no merge in flight, no run in `queued`/`waiting_lock`, no
 gate started in the last `server.update_quiet_minutes` (default 5).
 
 Steps:
 1. Runs adopt on restart (#90).
 2. Runs `server.update_cmd` from `data/server.yaml` (already built: a list of argvs, at most 20, each bounded by
-   `server.update_timeout_seconds`).
-3. Restarts through `server.service_manager` (launchd/systemd, already built).
+   `server.update_timeout_seconds`). The `update_cmd` is responsible for keeping the previous build: typically it
+   copies the current build to a versioned directory before pulling and rebuilding.
+3. Restarts through `server.service_manager` (launchd/systemd, already built). The service manager's unit points at
+   the new build directory; a rollback edits the unit to point at the kept previous build.
 4. A health check after restart confirms the new version works (`supervisor.checks` green within
    `server.update_health_minutes`, default 5).
-5. Rollback: the previous build is kept beside the new one; if health fails, restart the kept build, then stop and
-   raise one decision when that fails too.
+5. Rollback: if health fails, restart the kept build (edit the service manager's unit to point at it, then restart
+   the unit—never a process found by name), then stop and raise one decision when that fails too. Store migrations
+   are forward-only (rule 6): a rollback to an older build that can't read the newer schema is an unrecoverable
+   failure that stops the update loop and raises a decision; the schema version is checked before the rollback
+   restart.
 
-Bounds: at most one update per day (`server.update_max_per_day`, default 1), audited.
+Bounds: at most one update per day (`server.update_max_per_day`, default 1), audited. Requires `on_restart: adopt`
+(D9 stops runs before updating when `on_restart: stop`, but the rollback path needs adopt to preserve them).
 
 **Config:** `server.auto_update` (off | observe | act, default off), `server.update_cmd`, `server.update_timeout_seconds`,
 `server.update_quiet_minutes`, `server.update_health_minutes`, `server.update_max_per_day`, `server.service_manager`.
@@ -265,6 +272,8 @@ Bounds: at most one update per day (`server.update_max_per_day`, default 1), aud
 - A merge record from Lair's review executor triggers the quiet wait (fails on main: no trigger).
 - In-flight runs are adopted after restart: built (#90).
 - A failed health check rolls back to the previous build (fails on main: no rollback).
+- A release tag is verified against the host's release API (fails on main: no verification).
+- A rollback to a build incompatible with the store's schema raises a decision (fails on main: no check).
 - At most one update per day.
 
 Related issues: #181, #90, #112.
@@ -276,8 +285,8 @@ Related issues: #181, #90, #112.
 
 **Problem:** A restart leaves orphaned runs or lock files. The orchestrator has to find which runs are still alive.
 
-**Feature:** #90. On restart, Lair finds runs that were active before the restart and adopts them (reconnects their
-output, resumes their state). The config key is `agents.on_restart` (adopt | stop, default adopt).
+**Feature:** Built (#90). On restart, Lair finds runs that were active before the restart and adopts them (reconnects
+their output, resumes their state). The config key is `agents.on_restart` (adopt | stop, default adopt).
 
 Adoption means: take the process table now, compare each running process's start time against the claimed run's start
 time (with a tolerance), and treat an uncertain reading (ps timed out, partial output) as alive/unknown and retry.
@@ -291,9 +300,9 @@ marked lost, not killed. No kill by name or pattern.
 - Act: adopts runs; marks reused pids lost.
 
 **Acceptance:**
-- A restart with an orphaned run adopts it if its pid and start time match (fails on main without #90).
-- A process with the same name but another start time is not signalled.
-- No kill; duplicates are never killed, only marked lost.
+- A restart with an orphaned run adopts it if its pid and start time match: built.
+- A process with the same name but another start time is not signalled: built.
+- No kill; duplicates are never killed, only marked lost: built.
 
 Related issues: #90.
 
@@ -304,26 +313,29 @@ Related issues: #90.
 **Problem:** Fill only knows one project script (`capacity_cmd`), which can't tell agents apart. Agents that only push
 to GitHub CI (about 5% CPU each) are held for an hour by load from container gates on the same machine.
 
-**Feature:** Fill decides capacity natively, with per-agent or per-task classes:
-- `agents.fill.capacity.load_per_cpu_max`;
-- `agents.fill.capacity.memory.pressure_max`, `memory.available_min_pct`;
-- `agents.fill.capacity.heavy_work.detect` (globs or commands), `heavy_work.max_active`;
-- per-agent or per-task `class: local | remote` (default `local`).
+**Feature:** Mostly built (#100). Fill decides capacity natively:
+- `fill.capacity.load_per_cpu_max`: built;
+- `fill.capacity.memory.pressure_max`, `memory.available_min_pct`: built;
+- `fill.capacity.heavy_work.detect` (globs), `heavy_work.max_active`: built;
+- per-agent `fill.capacity.agent_class` and `fill.capacity.default_class` (`local` | `remote`): built.
 
 `remote` agents are held only by memory and `max_active`, never by load. `capacity_cmd` stays as an optional extra
 check.
 
-**Config:** `agents.fill.capacity.*`, `agents.defaults.class`, `tasks.class_labels`.
+**New work:** A per-task class label (configuration.md: "There is no per-task class label yet").
+
+**Config:** `fill.capacity.*`, `fill.capacity.default_class`, `fill.capacity.agent_class`.
 
 **Observe → Act:**
 - Observe: logs capacity decisions; uses defaults.
 - Act: same (native capacity has no act-specific behaviour).
 
 **Acceptance:**
-- A `remote` agent starts under high load (fails on main: held like local).
-- A `local` agent is held under high load.
-- Memory pressure holds both.
-- `capacity_cmd` is still honoured.
+- A `remote` agent starts under high load: built.
+- A `local` agent is held under high load: built.
+- Memory pressure holds both: built.
+- `capacity_cmd` is still honoured: built.
+- A per-task class label holds heavy tasks (fails on main: no per-task class).
 
 Related issues: #100.
 
@@ -653,7 +665,7 @@ exceeded" and pauses work.
 cooldowns and the fleet budget's rate-limit pause). The new part: parse the reset time from the rate-limit response,
 hold the agent until then, show it in the UI.
 
-**Config:** `ai.roles.*`, `ai.failover.*`, `ai.limits.show_reset_time` (on/off).
+**Config:** `ai.roles.*`, `failover.*`, `ai.limits.show_reset_time` (on/off).
 
 **Observe → Act:**
 - Observe: logs limit hits; does not hold.

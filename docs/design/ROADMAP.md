@@ -123,10 +123,10 @@ See [orchestration.md](orchestration.md) for the full design. The order:
 
 | Phase | Duties | Acceptance |
 |---|---|---|
-| O1: Correctness | D10 (#90), D4/D5 (#179), D6 (#99) | A DONE closes only with evidence; duplicates are killed on restart |
-| O2: Keep busy | D1/D3 (#166, #178), D13 (#163), D11 (#100), D9 (#181), D29 (#186) | No agent idles while ready work exists; services restart automatically |
+| O1: Correctness | D10 (built: #90), D4/D5 (#179), D6 (#99) | A DONE closes only with evidence; reused pids and duplicates are marked lost, never killed |
+| O2: Keep busy | D1/D3 (#166, #178), D13 (#163), D11 (mostly built: #100, #238), D9 (#181), D29 (#186) | No agent idles while ready work exists; services restart automatically |
 | O3: Visibility | D19 (#182), D20 (#183), D18 (#164) | "What happened last night?" and "when will X ship?" are answered from data |
-| O4: The rest | D2 (#177), D8 (#180), D17 (#108, #109), D26 (#185), D28 (#167), D30 (#187) | The orchestrator's remaining manual duties are absorbed |
+| O4: The rest | D2 (#177), D8 (#180), D17 (#108, #109, #239), D26 (#185), D28 (#167), D30 (#187) | The orchestrator's remaining manual duties are absorbed |
 
 ## Rules every new module follows
 
