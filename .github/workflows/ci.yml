@@ -26,8 +26,17 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: 'npm'
 
+      # .npmrc sets ignore-scripts=true; this fails when a dependency with an install script is not on the
+      # package.json "allowedInstallScripts" list (it reads only .npmrc, package.json and package-lock.json)
+      - name: Install-script policy
+        run: npm run check:install-scripts
+
       - name: Install dependencies
         run: npm ci
+
+      # Runs the install scripts of exactly the allowed packages (better-sqlite3, esbuild; fsevents on macOS)
+      - name: Build allowed native dependencies
+        run: npm run rebuild:native
 
       - name: Type check
         run: npm run typecheck
