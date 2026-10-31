@@ -5121,13 +5121,16 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
   it("returns idle states in the status view: an agent with done task while ready work exists is ready_work", async () => {
     const h = setup(fill({ idle: { notice_minutes: 5 } }));
     prompts(h);
-    // worker-a has a task, worker-b has none (ready work)
+    // worker-a has a task, an unassigned task exists (ready work)
     tasks(h, "worker-a|Alice|feat-login|Build the login form", "|Bob|feat-other|Unassigned task");
-    // Complete worker-a's task
-    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "- DONE feat-login by worker-a 00:01Z: done\n");
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
     await check(h);
+    await h.service.tick(); // pid 5001 starts
+    // Complete worker-a's task via queue file (fill reads done from queue, not log)
+    appendFileSync(h.queueFile, "- DONE feat-login by worker-a 12:01Z: done\n");
+    h.spawner.exit(5001, 0);
     await at(h, 1 * MIN);
-    // Run completes
+    // Run completes, check idle states
     const status = await check(h);
     expect(status.idle).toBeDefined();
     // worker-a's task is done, but ready work exists (the unassigned task)
@@ -5140,8 +5143,12 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     const h = setup(fill({ idle: { notice_minutes: 5 } }));
     prompts(h);
     tasks(h, "worker-a|Alice|feat-login|Build the login form", "|Bob|feat-other|Unassigned task");
-    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "- DONE feat-login by worker-a 00:01Z: done\n");
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
     await check(h);
+    await h.service.tick(); // pid 5001 starts
+    // Complete via queue file
+    appendFileSync(h.queueFile, "- DONE feat-login by worker-a 12:01Z: done\n");
+    h.spawner.exit(5001, 0);
     await at(h, 1 * MIN);
     await check(h);
 
@@ -5167,8 +5174,12 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     const h = setup(fill({ idle: { notice_minutes: 1 } }));
     prompts(h);
     tasks(h, "worker-a|Alice|feat-login|Build the login form", "|Bob|feat-other|Unassigned task");
-    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "- DONE feat-login by worker-a 00:01Z: done\n");
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
     await check(h);
+    await h.service.tick(); // pid 5001 starts
+    // Complete via queue file
+    appendFileSync(h.queueFile, "- DONE feat-login by worker-a 12:01Z: done\n");
+    h.spawner.exit(5001, 0);
     await at(h, 1 * MIN);
     await check(h);
 
@@ -5181,10 +5192,12 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     tasks(h, "worker-a|Alice|feat-new|New task", "|Bob|feat-other|Unassigned task");
     h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
     await check(h);
+    await h.service.tick(); // pid 5002 starts
     expect(h.service.fillStatus()?.idle?.find((s) => s.agent === "worker-a")?.reason).toBe("busy");
 
-    // Complete the new task, ready work still exists
-    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "- DONE feat-new by worker-a 00:05Z: done\n");
+    // Complete the new task via queue file, ready work still exists
+    appendFileSync(h.queueFile, "- DONE feat-new by worker-a 12:05Z: done\n");
+    h.spawner.exit(5002, 0);
     await at(h, 5 * MIN);
     await check(h);
 
