@@ -1,90 +1,51 @@
 /**
- * End-to-end acceptance test: a full agent cycle on a fake project.
+ * End-to-end: tasks through Lair's whole agent cycle on a fake project,
+ * driven through the owner's HTTP API as the dashboard drives it.
  *
- * This test creates:
- * - A fake project in a temp directory
- * - A fake agent CLI (writes to the queue file like a real agent)
- * - A fake gate system (writes gate result files)
+ *   task in the tasks file -> fill starts a run -> the agent reports WAITING on
+ *   a gate -> Lair restarts -> the gate system writes its result -> fill wakes
+ *   the task -> a second run reports DONE -> the task is done, never started again
  *
- * Then runs Lair through the cycle:
- * task -> run -> report -> done
+ *   a BLOCKED report -> held, with one decision in the Decision Inbox -> the
+ *   owner releases it over HTTP -> the decision is withdrawn, the task runs again
  *
- * Fakes only the process spawner, the clock, and the process table.
- * Files are real in a temp directory.
+ * Real: the agents module as the server wires it (AgentsManager, its SQLite
+ * store, the event bus), the owner routes with a signed-in owner session, the
+ * Decision Inbox, files on disk. Fake: only the machine boundary, i.e. the
+ * process spawner (the agent CLI: a started process writes its log, reports a
+ * line in the queue file and exits), the process table and the clock. The gate
+ * system is a result file where the project's wake config looks.
+ *
+ * Every step asserts Lair's own state: the runs and their states, the claim,
+ * the events in the store and on the bus, the fill status the API serves, what
+ * was spawned and the decisions raised; never a file the test wrote itself.
  */
-import { describe, it, expect, afterEach } from "vitest";
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-  appendFileSync,
-  utimesSync,
-} from "fs";
+import { afterEach, describe, expect, it } from "vitest";
+import Fastify, { type FastifyInstance } from "fastify";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import type { AgentAdapter, ProjectConfig } from "../../shared/types.js";
+import type { AgentEventKind, AgentsStatusView, FillLineView } from "../../shared/agents-types.js";
 import { EventBus } from "../core/event-bus.js";
-import type { ProjectConfig } from "../../shared/types.js";
-import type {
-  Clock,
-  ProcessInfo,
-  ProcessTable,
-  RunOptions,
-  CommandOutput,
-  CommandRunner,
-} from "../watchdog/probes.js";
-import { NodeFileSystem } from "../watchdog/probes.js";
-import type {
-  ProcessOwner,
-  ProcessSpawner,
-  SpawnOptions,
-  AgentProbes,
-  SystemInfo,
-  MemoryReading,
-} from "../agents/probes.js";
+import { NodeFileSystem, type Clock, type CommandOutput, type CommandRunner, type ProcessInfo, type ProcessTable } from "../watchdog/probes.js";
 import { AgentsManager, type AgentsService } from "../agents/service.js";
+import { registerAgentsRoutes } from "../agents/routes.js";
+import type { AgentProbes, MemoryReading, ProcessOwner, ProcessSpawner, SpawnOptions, SystemInfo } from "../agents/probes.js";
+import type { AgentsStore } from "../agents/store.js";
+import type { AgentEvent, AgentRun } from "../agents/types.js";
+import type { DecisionInbox } from "../decisions/service.js";
+import { HumanAuth, OWNER_SESSION_HEADER, registerOwnerRoutes } from "../human-auth/index.js";
+import { mountDecisions } from "../decisions/index.js";
+import { ownerRequest, releaseFillHoldAction } from "../../client/agents-actions";
 
 const NOW = Date.parse("2026-06-15T10:00:00.000Z");
 const MIN = 60_000;
-const SELF: ProcessOwner = { pid: 100, startedAt: NOW - 60 * MIN };
+const PROJECT = "e2e";
+const GATE = "20260615T100100Z-feat-search-abcdef12-1";
+const PROMPT = "You are worker A: build what the task says.\n";
 
-interface Paths {
-  root: string;
-  repo: string;
-  queue: string;
-  agents: string;
-  gates: string;
-  tasks: string;
-  data: string;
-  prompts: string;
-}
-
-function makePaths(): Paths {
-  const root = mkdtempSync(join(tmpdir(), "e2e-cycle-"));
-  const repo = join(root, "repo");
-  const queue = join(root, "queue.md");
-  const agents = join(root, "agents");
-  const gates = join(root, "gates");
-  const tasks = join(root, "tasks.txt");
-  const data = join(root, "data");
-  const prompts = join(root, "prompts");
-
-  mkdirSync(repo);
-  mkdirSync(agents);
-  mkdirSync(gates);
-  mkdirSync(join(gates, "results"));
-  mkdirSync(data);
-  mkdirSync(prompts);
-
-  writeFileSync(queue, "# Agent queue\n");
-  writeFileSync(tasks, "");
-  // Prompt file for worker-a (required by fill config)
-  writeFileSync(join(prompts, "worker-a.txt"), "You are worker-a.\n");
-
-  return { root, repo, queue, agents, gates, tasks, data, prompts };
-}
+// ============ THE MACHINE BOUNDARY ============
 
 class FakeClock implements Clock {
   t = NOW;
@@ -94,35 +55,23 @@ class FakeClock implements Clock {
   async sleep(ms: number): Promise<void> {
     this.t += ms;
   }
-  advance(ms: number): void {
-    this.t += ms;
-  }
 }
 
+/** The machine's processes, with start times: `ps` elapsed times grow with the clock */
 class FakeProcessTable implements ProcessTable {
   private procs = new Map<number, { startedAt: number; command: string }>();
   constructor(private clock: FakeClock) {}
-
-  add(
-    pid: number,
-    command: string,
-    startedAt: number = this.clock.now(),
-  ): void {
+  add(pid: number, command: string, startedAt: number): void {
     this.procs.set(pid, { startedAt, command });
   }
-
   remove(pid: number): void {
     this.procs.delete(pid);
   }
-
   async list(): Promise<ProcessInfo[]> {
     return [...this.procs.entries()].map(([pid, p]) => ({
       pid,
       ppid: 1,
-      elapsedSeconds: Math.max(
-        0,
-        Math.floor((this.clock.now() - p.startedAt) / 1000),
-      ),
+      elapsedSeconds: Math.max(0, Math.floor((this.clock.now() - p.startedAt) / 1000)),
       argv: p.command.split(" "),
       command: p.command,
     }));
@@ -130,95 +79,67 @@ class FakeProcessTable implements ProcessTable {
 }
 
 interface SpawnCall {
+  pid: number;
   argv: string[];
   env: Record<string, string>;
-  cwd?: string;
-  logPath: string;
 }
 
-class FakeSpawner implements ProcessSpawner {
+/** The agent CLI: a started process writes its log; `report` is it writing a queue line and exiting. */
+class FakeAgentCli implements ProcessSpawner {
   calls: SpawnCall[] = [];
-  kills: { pid: number; signal: string }[] = [];
   private exits = new Map<number, number | null>();
   private started = new Set<number>();
-  nextPid = 5001;
-
-  onSpawn?: (pid: number, call: SpawnCall) => void;
-
+  private nextPid = 5001;
   constructor(
     private procs: FakeProcessTable,
     private clock: FakeClock,
   ) {}
 
   async spawn(argv: string[], options: SpawnOptions): Promise<ProcessOwner> {
-    const call: SpawnCall = {
-      argv: [...argv],
-      env: { ...options.env },
-      cwd: options.cwd,
-      logPath: options.logPath,
-    };
-    this.calls.push(call);
-
-    writeFileSync(options.logPath, "");
+    const pid = this.nextPid++;
+    this.calls.push({ pid, argv: [...argv], env: { ...options.env } });
+    writeFileSync(options.logPath, "working\n");
     const t = new Date(this.clock.now());
     utimesSync(options.logPath, t, t);
-
-    const pid = this.nextPid++;
-    const startedAt = this.clock.now(); // Capture start time before onSpawn may advance clock
     this.started.add(pid);
-    this.procs.add(pid, argv.join(" "), startedAt);
+    this.procs.add(pid, argv.join(" "), this.clock.now());
+    return { pid, startedAt: this.clock.now() };
+  }
 
-    this.onSpawn?.(pid, call);
-
-    return { pid, startedAt };
+  /** The agent writes its report to the project's queue file, then exits with `code` */
+  report(queueFile: string, pid: number, line: string, code = 0): void {
+    appendFileSync(queueFile, `${line}\n`);
+    this.procs.remove(pid);
+    this.exits.set(pid, code);
   }
 
   exitCode(pid: number): number | null | undefined {
     return this.exits.has(pid) ? this.exits.get(pid) : undefined;
   }
-
   knows(pid: number): boolean {
     return this.started.has(pid);
   }
-
-  kill(pid: number, signal: "SIGTERM" | "SIGKILL"): boolean {
-    this.kills.push({ pid, signal });
-    this.exit(pid, null);
+  kill(pid: number): boolean {
+    this.procs.remove(pid);
+    this.exits.set(pid, null);
     return true;
   }
-
   forget(pid: number): void {
     this.exits.delete(pid);
     this.started.delete(pid);
   }
-
-  exit(pid: number, code: number | null): void {
-    this.procs.remove(pid);
-    this.exits.set(pid, code);
-  }
 }
 
-class FakeCommandRunner implements CommandRunner {
+/** No capacity command is configured: a command run would be a fault, and the test asserts none */
+class NoCommands implements CommandRunner {
   calls: string[][] = [];
-  options: RunOptions[] = [];
-
-  answer?: (
-    argv: string[],
-    options: RunOptions,
-  ) => Promise<CommandOutput | undefined> | CommandOutput | undefined;
-
-  async run(argv: string[], options: RunOptions = {}): Promise<CommandOutput> {
+  async run(argv: string[]): Promise<CommandOutput> {
     this.calls.push([...argv]);
-    this.options.push(options);
-
-    const answered = await this.answer?.(argv, options);
-    if (answered) return answered;
-
-    return { stdout: "", stderr: "", code: 0 };
+    return { code: 127, stdout: "", stderr: "no commands in this test" };
   }
 }
 
-class FakeSystemInfo implements SystemInfo {
+class IdleMachine implements SystemInfo {
   cpuCount(): number {
     return 4;
   }
@@ -226,336 +147,345 @@ class FakeSystemInfo implements SystemInfo {
     return 0.5;
   }
   totalMemory(): number {
-    return 16 * 1024 * 1024 * 1024; // 16GB
+    return 16 * 1024 ** 3;
   }
-  async memory(_options: { pressure: boolean; timeoutMs: number }): Promise<MemoryReading> {
-    return { available: 8 * 1024 * 1024 * 1024, pressurePct: 25 }; // 8GB available
+  async memory(): Promise<MemoryReading> {
+    return { available: 8 * 1024 ** 3 };
   }
 }
 
-function projectConfig(paths: Paths): ProjectConfig {
+// ============ THE FAKE PROJECT ============
+
+interface Project {
+  dir: string;
+  queueFile: string;
+  tasksFile: string;
+  gatesDir: string;
+  promptsDir: string;
+  dbPath: string;
+}
+
+const ADAPTERS: Record<string, AgentAdapter> = {
+  "test-cli": {
+    id: "test-cli",
+    name: "Test CLI",
+    start_cmd: "agent-cli run --agent {agent_id} --model {model} --prompt {prompt_file}",
+    stop_cmd: "kill -TERM {pid}",
+    status_method: "file",
+    log_dir: "logs",
+    session_id_env: "AGENT_SESSION_ID",
+    resume_flag: "--resume {session_id}",
+  },
+};
+
+const dirs: string[] = [];
+
+function fakeProject(): Project {
+  const dir = mkdtempSync(join(tmpdir(), "lair-e2e-"));
+  dirs.push(dir);
+  const project: Project = {
+    dir,
+    queueFile: join(dir, "queue.md"),
+    tasksFile: join(dir, "tasks.txt"),
+    gatesDir: join(dir, "gates"),
+    promptsDir: join(dir, "prompts"),
+    dbPath: join(dir, "data", "agents.db"),
+  };
+  mkdirSync(join(dir, "agents"), { recursive: true });
+  mkdirSync(join(project.gatesDir, "results"), { recursive: true });
+  mkdirSync(project.promptsDir, { recursive: true });
+  writeFileSync(join(project.promptsDir, "worker-a.txt"), PROMPT);
+  writeFileSync(project.queueFile, "# Queue\n");
+  // worker-b is not on fill's list: fill must leave its task alone
+  writeFileSync(project.tasksFile, "worker-a|Alice|feat-search|Fix the search results\nworker-b|Bob|feat-other|Not fill's to start\n");
+  return project;
+}
+
+function projectConfig(p: Project): ProjectConfig {
   return {
-    name: "E2E Test",
-    repo: paths.repo,
-    github: "example/e2e-test",
-    queue_file: paths.queue,
-    agents_dir: paths.agents,
-    gates_dir: paths.gates,
-    read_only: false,
-    prompts_dir: paths.prompts,
-    dragons: {
-      "worker-a": {
-        name: "TestAgent",
-        machine: "local",
-        model: "test-model",
-        instructions: "",
-      },
-    },
-    dragon_start_cmd: ["/bin/echo", "start", "{dragon}", "{task}"],
-    dragon_stop_cmd: ["/bin/echo", "stop", "{dragon}"],
+    name: "E2E",
+    repo: p.dir,
+    github: "example/e2e",
+    queue_file: p.queueFile,
+    agents_dir: join(p.dir, "agents"),
+    gates_dir: p.gatesDir,
+    prompts_dir: p.promptsDir,
     machines: {},
+    read_only: false,
+    inbox_file: join(p.dir, "inbox.md"),
+    dragons: {
+      "worker-a": { name: "A", model: "model-a", machine: "local", instructions: "", adapter: "test-cli" },
+      "worker-b": { name: "B", model: "model-a", machine: "local", instructions: "", adapter: "test-cli" },
+    },
+    agent_adapters: ADAPTERS,
     agents: {
       enabled: true,
+      interval_seconds: 1,
+      start_timeout_minutes: 10,
+      dead_on_start_seconds: 60,
+      hung_minutes: 45,
+      stop_grace_seconds: 30,
+      session_dir: "{agents_dir}/sessions/{agent}",
+      recovery: { same_session_restarts: 2, fresh_sessions: 1, backoff_seconds: 10, max_backoff_seconds: 600 },
+      retries: { max_retries: 2, backoff_seconds: 60, max_backoff_seconds: 3600 },
       fill: {
         enabled: true,
-        tasks_file: paths.tasks,
+        tasks_file: p.tasksFile,
         agents: ["worker-a"],
         prompt_files: ["{prompts_dir}/{agent}.txt"],
+        max_active: 2,
         interval_seconds: 60,
+        // The project's queue format: WAITING <task> <gate id>, and the gate system's result file
+        waiting_pattern: "^-\\s+WAITING\\s+{task}(?:\\s+(?<wake>\\d{8}T\\d{6}Z-\\S+))?(?=\\s|$)",
+        wake: { file: "{gates_dir}/results/{wake}.rc" },
       },
     },
-  } as ProjectConfig;
+  } as unknown as ProjectConfig;
 }
 
-interface TestHarness {
-  paths: Paths;
+// ============ LAIR, AS THE SERVER WIRES IT ============
+
+const DASHBOARD = { origin: "http://localhost:4777", "sec-fetch-site": "same-origin" };
+
+interface Lair {
   clock: FakeClock;
-  procs: FakeProcessTable;
-  spawner: FakeSpawner;
-  runner: FakeCommandRunner;
-  events: EventBus;
+  agentCli: FakeAgentCli;
+  commands: NoCommands;
   manager: AgentsManager;
   service: AgentsService;
-  cleanup: () => Promise<void>;
+  store: AgentsStore;
+  inbox: DecisionInbox;
+  app: FastifyInstance;
+  /** Event types published on the bus, in order */
+  bus: string[];
+  owner: Record<string, string>;
 }
 
-async function setup(): Promise<TestHarness> {
-  const paths = makePaths();
-  const config = projectConfig(paths);
+const running: Lair[] = [];
 
+afterEach(async () => {
+  for (const lair of [...running]) await stopLair(lair);
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+async function stopLair(lair: Lair): Promise<void> {
+  const i = running.indexOf(lair);
+  if (i >= 0) running.splice(i, 1);
+  await lair.app.close();
+  await lair.manager.stop();
+}
+
+/** The machine Lair runs on: it outlives a restart of Lair */
+interface Machine {
+  clock: FakeClock;
+  procs: FakeProcessTable;
+  agentCli: FakeAgentCli;
+}
+
+function machine(): Machine {
   const clock = new FakeClock();
   const procs = new FakeProcessTable(clock);
-  const spawner = new FakeSpawner(procs, clock);
-  const runner = new FakeCommandRunner();
-  const events = new EventBus();
+  return { clock, procs, agentCli: new FakeAgentCli(procs, clock) };
+}
 
+/** A Lair server on the project and machine: `self` is its own process (a restart is a new one on the same data). */
+async function startLair(p: Project, m: Machine, self: ProcessOwner = { pid: 100, startedAt: NOW - 60 * MIN }): Promise<Lair> {
+  const { clock, procs, agentCli } = m;
+  const commands = new NoCommands();
+  const events = new EventBus();
+  const bus: string[] = [];
+  events.on("*", (event) => {
+    bus.push(event.type);
+  });
   const probes: AgentProbes = {
     processes: procs,
     fs: new NodeFileSystem(),
-    runner,
+    runner: commands,
     clock,
-    spawner,
-    self: SELF,
-    systemInfo: new FakeSystemInfo(),
+    spawner: agentCli,
+    self,
+    systemInfo: new IdleMachine(),
   };
+  const manager = new AgentsManager({ dbPath: p.dbPath, probes, events });
+  manager.load([{ name: PROJECT, config: projectConfig(p) }]);
+  const service = manager.get(PROJECT);
+  const store = manager.getStore();
+  if (!service || !store) throw new Error(`agents not enabled: ${manager.status(PROJECT).errors.join("; ")}`);
 
-  const dbPath = join(paths.data, "agents.db");
-
-  const manager = new AgentsManager({
-    dbPath,
-    probes,
-    events,
+  const app = Fastify();
+  const tokenPath = join(p.dir, "data", "owner.token");
+  const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
+  await registerOwnerRoutes(app, auth);
+  const inbox = await mountDecisions(app, { dbPath: ":memory:", humanAuth: auth, defaultProject: () => PROJECT, clock, producers: [manager] });
+  await registerAgentsRoutes(app, manager, () => PROJECT, auth);
+  await app.ready();
+  const signIn = await app.inject({
+    method: "POST",
+    url: "/api/owner/sessions",
+    headers: DASHBOARD,
+    payload: { token: readFileSync(tokenPath, "utf-8").trim() },
   });
-  manager.load([{ name: "e2e", config }]);
-
-  const service = manager.get("e2e");
-  if (!service) {
-    throw new Error(
-      `agents not enabled: ${manager.status("e2e").errors.join("; ")}`,
-    );
-  }
-
-  const cleanup = async () => {
-    await manager.stop();
-    rmSync(paths.root, { recursive: true, force: true });
-  };
-
-  return {
-    paths,
-    clock,
-    procs,
-    spawner,
-    runner,
-    events,
-    manager,
-    service,
-    cleanup,
-  };
+  expect(signIn.statusCode).toBe(201);
+  const owner = { ...DASHBOARD, [OWNER_SESSION_HEADER]: signIn.json().data.session as string };
+  const lair: Lair = { clock, agentCli, commands, manager, service, store, inbox, app, bus, owner };
+  running.push(lair);
+  return lair;
 }
 
-describe("E2E: Full agent cycle on a fake project", () => {
-  let harness: TestHarness;
+/** The owner's "check now" from the dashboard, at NOW + ms: a tick, then a fill check */
+async function checkNow(lair: Lair, ms: number): Promise<void> {
+  lair.clock.t = NOW + ms;
+  const res = await lair.app.inject({ method: "POST", url: `/api/agents/tick?project=${PROJECT}`, headers: lair.owner });
+  expect(res.statusCode, res.body).toBe(200);
+}
 
-  afterEach(async () => {
-    if (harness) {
-      await harness.cleanup();
-    }
+/** The fill status the dashboard reads */
+async function fillLine(lair: Lair, task: string): Promise<FillLineView> {
+  const res = await lair.app.inject({ url: `/api/agents/status?project=${PROJECT}` });
+  expect(res.statusCode).toBe(200);
+  const line = (res.json().data as AgentsStatusView).fill?.lines.find((l) => l.task === task);
+  if (!line) throw new Error(`no fill line for ${task}`);
+  return line;
+}
+
+const runs = (lair: Lair): AgentRun[] => lair.store.listRuns(PROJECT, { limit: 100 }).reverse();
+const eventsOf = (lair: Lair, kind: AgentEventKind): AgentEvent[] => lair.store.listEvents(PROJECT, { kinds: [kind], limit: 100 }).reverse();
+const openDecisions = (lair: Lair) => lair.inbox.list({ project: PROJECT, status: "open" });
+
+/** The run's prompt, as the agent CLI was given it */
+const promptOf = (call: SpawnCall) => readFileSync(call.argv[call.argv.indexOf("--prompt") + 1], "utf-8");
+
+// ============ THE CYCLE ============
+
+describe("e2e: a task through Lair's agent cycle on a fake project", () => {
+  it("task -> run -> WAITING on a gate -> restart -> gate result -> run -> DONE -> done, never started again", async () => {
+    const p = fakeProject();
+    const m = machine();
+    let lair = await startLair(p, m);
+
+    // The owner's check now: fill takes the allowlisted task and queues a run, claimed for it
+    await checkNow(lair, 0);
+    let line = await fillLine(lair, "feat-search");
+    expect(line).toMatchObject({ state: "started", agent: "worker-a", description: "Fix the search results" });
+    const [first] = runs(lair);
+    expect(first).toMatchObject({ agent: "worker-a", task: "feat-search", origin: "fill", state: "queued" });
+    expect(line.runId).toBe(first.id);
+    expect(lair.store.getClaim(PROJECT, "feat-search")).toMatchObject({ runId: first.id });
+    expect(eventsOf(lair, "fill_started").map((e) => e.runId)).toEqual([first.id]);
+    expect(lair.bus).toContain("agents.fill_started");
+    // worker-b's task is not fill's to start: no run, no claim
+    expect(await fillLine(lair, "feat-other")).toMatchObject({ state: "not_allowlisted", runId: null });
+    expect(lair.store.getClaim(PROJECT, "feat-other")).toBeNull();
+
+    // The next check starts the agent CLI with the task and fill's prompt
+    await checkNow(lair, 0);
+    expect(lair.agentCli.calls).toHaveLength(1);
+    const [call1] = lair.agentCli.calls;
+    expect(call1.env).toMatchObject({ LAIR_TASK: "feat-search", LAIR_AGENT: "worker-a" });
+    expect(promptOf(call1)).toBe(PROMPT);
+    expect(runs(lair)[0]).toMatchObject({ id: first.id, state: "running", pid: call1.pid });
+    expect(lair.bus).toContain("agent.run.started");
+
+    // The agent queues a gate, reports WAITING on it and exits: the run ends, the task waits on the gate
+    lair.agentCli.report(p.queueFile, call1.pid, `- WAITING feat-search ${GATE} by worker-a 10:01Z: gate queued`);
+    await checkNow(lair, MIN);
+    expect(runs(lair)[0].state).toBe("completed");
+    expect(lair.bus).toContain("agent.run.ended");
+    line = await fillLine(lair, "feat-search");
+    expect(line).toMatchObject({ state: "held", hold: "waiting", waiting: { wake: GATE, fallbackAt: null, refused: null } });
+    for (const minute of [10, 20]) await checkNow(lair, minute * MIN);
+    expect(lair.agentCli.calls).toHaveLength(1);
+    expect(runs(lair)).toHaveLength(1);
+    // Waiting on a gate needs no owner: nothing asked
+    expect(openDecisions(lair)).toEqual([]);
+
+    // Lair restarts while the task waits: a new server process on the same data keeps waiting
+    const { agentCli } = m;
+    await stopLair(lair);
+    m.clock.t = NOW + 25 * MIN;
+    lair = await startLair(p, m, { pid: 200, startedAt: NOW + 25 * MIN });
+    await checkNow(lair, 26 * MIN);
+    expect(await fillLine(lair, "feat-search")).toMatchObject({ state: "held", hold: "waiting", waiting: { wake: GATE } });
+    expect(runs(lair)).toHaveLength(1);
+
+    // The gate system writes its result: fill wakes the task once, and the next check starts it again
+    const result = join(p.gatesDir, "results", `${GATE}.rc`);
+    writeFileSync(result, "0\n");
+    utimesSync(result, new Date(NOW + 30 * MIN), new Date(NOW + 30 * MIN));
+    await checkNow(lair, 31 * MIN);
+    expect(eventsOf(lair, "fill_woken")).toHaveLength(1);
+    expect(await fillLine(lair, "feat-search")).toMatchObject({ state: "started" });
+    await checkNow(lair, 31 * MIN);
+    expect(agentCli.calls).toHaveLength(2);
+    const call2 = agentCli.calls[1];
+    expect(call2.env).toMatchObject({ LAIR_TASK: "feat-search", LAIR_AGENT: "worker-a" });
+    const second = runs(lair)[1];
+    expect(second).toMatchObject({ task: "feat-search", origin: "fill", state: "running", pid: call2.pid });
+
+    // The agent reports DONE and exits: the run completes, the task is done
+    agentCli.report(p.queueFile, call2.pid, "- DONE feat-search by worker-a 10:40Z: merged");
+    await checkNow(lair, 40 * MIN);
+    expect(runs(lair)[1].state).toBe("completed");
+    line = await fillLine(lair, "feat-search");
+    expect(line).toMatchObject({ state: "done", detail: "done: - DONE feat-search by worker-a 10:40Z: merged" });
+    expect(eventsOf(lair, "fill_done")).toHaveLength(1);
+
+    // Done stays done: later checks start nothing, ask nothing, and run no command
+    for (const minute of [50, 120, 600]) await checkNow(lair, minute * MIN);
+    expect(agentCli.calls).toHaveLength(2);
+    expect(runs(lair)).toHaveLength(2);
+    expect((await fillLine(lair, "feat-search")).state).toBe("done");
+    expect(eventsOf(lair, "fill_done")).toHaveLength(1);
+    expect(openDecisions(lair)).toEqual([]);
+    expect(lair.commands.calls).toEqual([]);
   });
 
-  it("runs a task through the full cycle: task -> run -> report -> done", async () => {
-    harness = await setup();
-    const { paths, clock, spawner, service } = harness;
+  it("a BLOCKED report is held with one decision; the owner's release over HTTP withdraws it and the task runs again", async () => {
+    const p = fakeProject();
+    const lair = await startLair(p, machine());
+    await checkNow(lair, 0);
+    await checkNow(lair, 0);
+    const [call1] = lair.agentCli.calls;
+    const [run] = runs(lair);
+    expect(run).toMatchObject({ state: "running", pid: call1.pid });
 
-    // 1. Add a task to the tasks file (format: agent|name|task|description)
-    writeFileSync(paths.tasks, "worker-a|Search Fix|feat-search|Fix search results\n");
+    // The agent can't go on without the owner: it says so and exits
+    lair.agentCli.report(p.queueFile, call1.pid, "- BLOCKED feat-search by worker-a: needs the search service's API key from the owner");
+    await checkNow(lair, MIN);
+    expect(runs(lair)[0].state).toBe("completed");
+    let line = await fillLine(lair, "feat-search");
+    expect(line).toMatchObject({ state: "held", hold: "blocked", releasable: true, runId: run.id });
+    const [asked, ...more] = openDecisions(lair);
+    expect(more).toEqual([]);
+    expect(asked).toMatchObject({ key: `fill:feat-search:blocked:${run.id}` });
+    expect(asked.context).toContain("needs the search service's API key from the owner");
+    expect(line.decisionId).toBe(asked.id);
+    expect(eventsOf(lair, "fill_held").map((e) => e.data.hold)).toEqual(["blocked"]);
+    expect(lair.bus).toContain("agents.fill_held");
 
-    // 2. Set up the spawner to simulate an agent that completes
-    let spawnerPid = 0;
-    spawner.onSpawn = (pid, _call) => {
-      spawnerPid = pid;
-    };
+    // Held is held: hours of checks start nothing and ask nothing more
+    for (const minute of [10, 60, 600]) await checkNow(lair, minute * MIN);
+    expect(lair.agentCli.calls).toHaveLength(1);
+    expect(openDecisions(lair)).toHaveLength(1);
 
-    // 3. First checkNow: fill queues the run
-    await service.checkNow();
+    // Releasing is the owner's: refused without the owner session
+    const release = releaseFillHoldAction(PROJECT, "feat-search", "worker-a");
+    const anonymous = await lair.app.inject({ method: "POST", url: release.url, headers: DASHBOARD, payload: release.body });
+    expect(anonymous.statusCode).toBe(403);
+    expect(openDecisions(lair)).toHaveLength(1);
 
-    // 4. Second checkNow: tick launches the queued run (spawns the agent)
-    await service.checkNow();
-
-    // 5. Verify the agent was started
-    expect(spawner.calls.length).toBe(1);
-    expect(spawner.calls[0].argv).toContain("worker-a");
-
-    // 6. Simulate agent work: advance time and write done line
-    clock.advance(5 * MIN);
-    const queueLine = `- DONE feat-search by worker-a 10:05Z: implemented search fix\n`;
-    appendFileSync(paths.queue, queueLine);
-    spawner.exit(spawnerPid, 0);
-
-    // 7. Tick again to process the completion
-    await service.checkNow();
-
-    // 8. Verify the queue was read and task marked done
-    const queueContent = readFileSync(paths.queue, "utf-8");
-    expect(queueContent).toContain("DONE feat-search");
-  });
-
-  it("handles an agent that writes progress updates", async () => {
-    harness = await setup();
-    const { paths, clock, spawner, service } = harness;
-
-    writeFileSync(paths.tasks, "worker-a|API Endpoint|feat-api|Add new API endpoint\n");
-
-    let spawnerPid = 0;
-    spawner.onSpawn = (pid, _call) => {
-      spawnerPid = pid;
-    };
-
-    // Queue the run via fill
-    await service.checkNow();
-    // Launch the queued run
-    await service.checkNow();
-
-    expect(spawner.calls.length).toBe(1);
-
-    // Simulate progress update
-    clock.advance(2 * MIN);
-    appendFileSync(
-      paths.queue,
-      `- PROGRESS feat-api by worker-a 10:02Z: started implementation\n`,
-    );
-
-    // Simulate continued work and completion
-    clock.advance(5 * MIN);
-    appendFileSync(
-      paths.queue,
-      `- DONE feat-api by worker-a 10:07Z: completed API endpoint\n`,
-    );
-    spawner.exit(spawnerPid, 0);
-
-    // Tick to process completion
-    await service.checkNow();
-
-    const queueContent = readFileSync(paths.queue, "utf-8");
-    expect(queueContent).toContain("PROGRESS feat-api");
-    expect(queueContent).toContain("DONE feat-api");
-  });
-
-  it("detects a blocked agent and records it", async () => {
-    harness = await setup();
-    const { paths, clock, spawner, service } = harness;
-
-    writeFileSync(paths.tasks, "worker-a|Blocked Task|feat-blocked|Task that gets blocked\n");
-
-    let spawnerPid = 0;
-    spawner.onSpawn = (pid, _call) => {
-      spawnerPid = pid;
-    };
-
-    // Queue the run via fill
-    await service.checkNow();
-    // Launch the queued run
-    await service.checkNow();
-
-    expect(spawner.calls.length).toBe(1);
-
-    // Simulate agent getting blocked
-    clock.advance(3 * MIN);
-    appendFileSync(
-      paths.queue,
-      `- BLOCKED feat-blocked by worker-a 10:03Z: missing dependency\n`,
-    );
-    spawner.exit(spawnerPid, 1);
-
-    // Tick to process the blocked state
-    await service.checkNow();
-
-    const queueContent = readFileSync(paths.queue, "utf-8");
-    expect(queueContent).toContain("BLOCKED feat-blocked");
-  });
-
-  it("creates prompts directory and prompt files", async () => {
-    harness = await setup();
-    const { paths, clock, spawner, service } = harness;
-
-    writeFileSync(paths.tasks, "worker-a|Prompt Test|feat-prompt|Test prompt creation\n");
-
-    let spawnerPid = 0;
-    let taskEnvValue: string | undefined;
-    spawner.onSpawn = (pid, call) => {
-      spawnerPid = pid;
-      taskEnvValue = call.env.LAIR_TASK;
-    };
-
-    // Queue the run via fill
-    await service.checkNow();
-    // Launch the queued run
-    await service.checkNow();
-
-    expect(spawner.calls.length).toBe(1);
-    // The task name should appear in env
-    expect(taskEnvValue).toBe("feat-prompt");
-
-    // Complete the task
-    clock.advance(MIN);
-    appendFileSync(
-      paths.queue,
-      `- DONE feat-prompt by worker-a 10:01Z: done\n`,
-    );
-    spawner.exit(spawnerPid, 0);
-  });
-
-  it("runs on a multi-task queue", async () => {
-    harness = await setup();
-    const { paths, clock, spawner, service } = harness;
-
-    writeFileSync(
-      paths.tasks,
-      `worker-a|First|feat-one|First task
-worker-a|Second|feat-two|Second task
-worker-a|Third|feat-three|Third task
-`,
-    );
-
-    let tasksDone = 0;
-    let currentPid = 0;
-    spawner.onSpawn = (pid, _call) => {
-      currentPid = pid;
-    };
-
-    // Run through the tasks: each needs queue (checkFill) + launch (tick)
-    for (let i = 0; i < 3; i++) {
-      await service.checkNow(); // Queue
-      await service.checkNow(); // Launch
-
-      // Simulate agent work and completion
-      tasksDone++;
-      const task = spawner.calls[i].env.LAIR_TASK;
-      clock.advance(2 * MIN);
-      appendFileSync(
-        paths.queue,
-        `- DONE ${task} by worker-a 10:0${tasksDone * 2}Z: completed\n`,
-      );
-      spawner.exit(currentPid, 0);
-
-      clock.advance(3 * MIN);
-    }
-
-    expect(tasksDone).toBe(3);
-    const queueContent = readFileSync(paths.queue, "utf-8");
-    expect(queueContent).toContain("DONE feat-one");
-    expect(queueContent).toContain("DONE feat-two");
-    expect(queueContent).toContain("DONE feat-three");
-  });
-});
-
-describe("E2E: Fake project structure validation", () => {
-  it("creates all required directories and files", async () => {
-    const harness = await setup();
-    const { paths } = harness;
-
-    try {
-      expect(existsSync(paths.root)).toBe(true);
-      expect(existsSync(paths.repo)).toBe(true);
-      expect(existsSync(paths.queue)).toBe(true);
-      expect(existsSync(paths.agents)).toBe(true);
-      expect(existsSync(paths.gates)).toBe(true);
-      expect(existsSync(join(paths.gates, "results"))).toBe(true);
-      expect(existsSync(paths.data)).toBe(true);
-      expect(existsSync(paths.prompts)).toBe(true);
-
-      const queueContent = readFileSync(paths.queue, "utf-8");
-      expect(queueContent).toContain("# Agent queue");
-    } finally {
-      await harness.cleanup();
-    }
-  });
-
-  it("cleans up temporary files after test", async () => {
-    const harness = await setup();
-    const rootPath = harness.paths.root;
-
-    expect(existsSync(rootPath)).toBe(true);
-    await harness.cleanup();
-    expect(existsSync(rootPath)).toBe(false);
+    // The owner releases it from the dashboard: the decision is withdrawn, fill starts the task again
+    const sent = ownerRequest(release.body, { [OWNER_SESSION_HEADER]: lair.owner[OWNER_SESSION_HEADER] });
+    const released = await lair.app.inject({ url: release.url, ...sent, headers: { ...DASHBOARD, ...sent.headers } });
+    expect(released.statusCode, released.body).toBe(200);
+    expect(released.json().data).toEqual({ task: "feat-search", runId: run.id });
+    await checkNow(lair, 601 * MIN);
+    expect(openDecisions(lair)).toEqual([]);
+    line = await fillLine(lair, "feat-search");
+    expect(line.state).toBe("started");
+    await checkNow(lair, 601 * MIN);
+    expect(lair.agentCli.calls).toHaveLength(2);
+    expect(promptOf(lair.agentCli.calls[1])).toBe(PROMPT);
+    expect(runs(lair).map((r) => r.state)).toEqual(["completed", "running"]);
   });
 });
