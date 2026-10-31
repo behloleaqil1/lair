@@ -20,8 +20,18 @@ import {
   type Decision,
   type DecisionAnswer,
   type DecisionCounts,
+  type DecisionOutcome,
 } from "../../shared/decision-types.js";
-import type { DecisionStore, ListOptions, RaisedVia } from "./store.js";
+import type {
+  DecisionStore,
+  ListOptions,
+  OpenDecisionCursor,
+  OutcomeCursor,
+  PolicyAgreementCounts,
+  PolicyTraceJoined,
+  PolicyTraceRow,
+  RaisedVia,
+} from "./store.js";
 import { SecretStoreUnavailableError, type SecretStore } from "./secrets.js";
 import { DecisionError, parseAnswerInput, parseRaiseInput, parseWithdrawInput } from "./validate.js";
 import type {
@@ -29,6 +39,7 @@ import type {
   AnswerInput,
   Clock,
   DecisionProducer,
+  EvidenceUpdateInput,
   RaiseDecisionInput,
   RaiseResult,
   ResolutionHandler,
@@ -263,6 +274,73 @@ export class DecisionInbox implements DecisionProducer {
     return this.get(id)!;
   }
 
+  /**
+   * The module that raised an open decision says its cause cleared, or that
+   * an issue tracks it. Only these two facts move, only for an open decision
+   * of a module inside the server, only by that module; a change is audited,
+   * and the same value again changes nothing.
+   */
+  async updateEvidence(id: string, input: EvidenceUpdateInput): Promise<Decision> {
+    const { module } = input;
+    const issue = input.linked_issue;
+    if (input.cause_cleared === undefined && issue === undefined) {
+      throw new DecisionError(400, "Invalid update: give cause_cleared or linked_issue");
+    }
+    if (input.cause_cleared !== undefined && typeof input.cause_cleared !== "boolean") {
+      throw new DecisionError(400, "Invalid update: cause_cleared must be true or false");
+    }
+    if (issue !== undefined && issue !== null && !(Number.isSafeInteger(issue) && issue > 0)) {
+      throw new DecisionError(400, "Invalid update: linked_issue must be a positive whole number or null");
+    }
+    const decision = this.store.get(id);
+    if (!decision) throw new DecisionError(404, "Decision not found");
+    if (decision.source.module !== module || decision.raisedVia !== "server") {
+      throw new DecisionError(403, `Only the module that raised this decision (${decision.source.module}) can update its evidence`);
+    }
+    if (decision.status !== "open") throw new DecisionError(409, `Decision is ${decision.status}, not open`);
+    const before = decision.evidence;
+    if (!before) throw new DecisionError(409, "Decision has no evidence to update");
+    const next = {
+      ...before,
+      ...(input.cause_cleared !== undefined ? { cause_cleared: input.cause_cleared } : {}),
+      ...(issue !== undefined ? { linked_issue: issue } : {}),
+    };
+    const changes: string[] = [];
+    if (next.cause_cleared !== before.cause_cleared) changes.push(`cause_cleared ${before.cause_cleared} -> ${next.cause_cleared}`);
+    if (next.linked_issue !== before.linked_issue) changes.push(`linked_issue ${before.linked_issue ?? "none"} -> ${next.linked_issue ?? "none"}`);
+    if (changes.length === 0) return decision;
+    const at = this.iso();
+    if (!this.store.updateEvidence(id, next)) {
+      throw new DecisionError(409, `Decision is ${this.store.get(id)?.status ?? decision.status}, not open`);
+    }
+    this.store.addAudit(id, { at, action: "evidence_updated", actor: module, detail: `${module} updated the evidence: ${changes.join("; ")}` });
+    return this.get(id)!;
+  }
+
+  /** Record a policy proposal (src/server/decisions/policies/). Changes nothing on the decision. True: new row. */
+  recordPolicyTrace(row: PolicyTraceRow): boolean {
+    return this.store.addTrace(row);
+  }
+
+  hasPolicyTrace(decisionId: string, proposer: string, version: string): boolean {
+    return this.store.hasTrace(decisionId, proposer, version);
+  }
+
+  /** Trace rows joined to their decisions, at most `limit` (tests and diagnostics). */
+  policyTraces(limit?: number): PolicyTraceJoined[] {
+    return this.store.traces(limit);
+  }
+
+  /** The agreement counts per class, proposer and version, aggregated in SQL. */
+  policyAgreement(): PolicyAgreementCounts[] {
+    return this.store.policyAgreement();
+  }
+
+  /** A page of open decisions with a class, oldest first, after `after`: the policy catch-up walks these. */
+  openClassified(after: OpenDecisionCursor | null, limit: number): OpenDecisionCursor[] {
+    return this.store.openClassified(after, limit);
+  }
+
   /** The most urgent open decision that blocks `ref`, or null when the work may go on. */
   blockedOn(ref: string): Decision | null {
     return this.store.blocking(ref, this.iso())[0] ?? null;
@@ -303,6 +381,22 @@ export class DecisionInbox implements DecisionProducer {
 
   counts(project?: string): DecisionCounts {
     return this.store.counts(this.iso(), project);
+  }
+
+  // ============ OUTCOMES (the outcome tracker) ============
+
+  /** Answered decisions with no outcome yet, oldest answer first: a page of `limit` after `after`, answered at or after `since`. */
+  awaitingOutcome(limit: number, since?: string, after?: OutcomeCursor): Decision[] {
+    return this.store.awaitingOutcome(limit, since, after);
+  }
+
+  /**
+   * Record how the answer made at `answeredAt` turned out. Once per answer:
+   * false when it has an outcome already, or the decision was reopened and
+   * answered again since. It changes nothing else about the decision.
+   */
+  recordOutcome(id: string, answeredAt: string, outcome: DecisionOutcome, evidence: Record<string, unknown>): boolean {
+    return this.store.setOutcome(id, answeredAt, outcome, this.iso(), evidence);
   }
 
   // ============ ANSWERS ============

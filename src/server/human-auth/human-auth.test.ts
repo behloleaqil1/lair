@@ -347,6 +347,8 @@ describe("requireOwnerForChanges", () => {
       "/api/fleet/machines",
       "/api/pipelines/runs",
       "/api/bus/send",
+      "/api/lessons",
+      "/api/lessons/L1",
       "/api/tofu-runner/status",
       "/api/tofu-runner/plan",
       "/api/tofu-runner/apply",

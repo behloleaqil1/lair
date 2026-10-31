@@ -44,7 +44,7 @@ describe("BusMirror", () => {
       expect(content).toContain("Task completed");
     });
 
-    it("includes gate_id, pr, and sha when provided", () => {
+    it("includes gate_id, pr, sha, and bus id when provided", () => {
       const queueFile = join(tempDir, "queue.md");
       const mirror = new BusMirror({ queueFile });
 
@@ -56,13 +56,31 @@ describe("BusMirror", () => {
         "2026-10-28T15:00:00.000Z",
         "gate-abc123",
         42,
-        "deadbeef"
+        "deadbeef",
+        123
       );
 
       const content = readFileSync(queueFile, "utf-8");
       expect(content).toContain("[gate-abc123]");
       expect(content).toContain("PR #42");
       expect(content).toContain("[deadbee]"); // truncated to 7 chars
+      expect(content).toContain("[bus:123]");
+    });
+
+    it("omits bus id marker when not provided", () => {
+      const queueFile = join(tempDir, "queue.md");
+      const mirror = new BusMirror({ queueFile });
+
+      mirror.mirrorReport(
+        "worker-a",
+        "DONE",
+        "feat-search",
+        "Task completed",
+        "2026-10-28T14:31:00.000Z"
+      );
+
+      const content = readFileSync(queueFile, "utf-8");
+      expect(content).not.toContain("[bus:");
     });
 
     it("creates parent directories", () => {

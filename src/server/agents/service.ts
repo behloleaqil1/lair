@@ -89,6 +89,7 @@ import {
   DECISION_FILL_KEEP,
   DECISION_FILL_START,
   OWNER_HOLDS,
+  parseIdleNoticeKey,
   QueueLines,
   queueMark,
   queueWindowEnd,
@@ -129,6 +130,8 @@ import {
 } from "./types.js";
 import { commandFingerprint, findTaskProcess, reconcileRun, runPromptFileName } from "./reconcile.js";
 import type { ProcessInfo, ProcessReading } from "../watchdog/probes.js";
+import type { ReadyFactsSource } from "../ready-guard/guard.js";
+import type { BusLineSource, StructuredReport } from "../bus/consumers.js";
 
 export { TASK_ID, isValidTaskId } from "./types.js";
 
@@ -249,6 +252,9 @@ const BUS_EVENTS: Partial<Record<AgentEventKind, EventType>> = {
   budget_exceeded: "agent.budget.exceeded",
   fill_started: "agents.fill_started",
   fill_held: "agents.fill_held",
+  fill_idle_notice: "agents.fill_idle_notice",
+  fill_idle_resolved: "agents.fill_idle_resolved",
+  fill_unmatched: "agents.fill_unmatched",
 };
 
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -396,10 +402,19 @@ export interface AgentsServiceOptions {
   events?: EventBus;
   /** Whether a tool is signed in on this machine (src/server/ai/): a signed-out tool starts nothing here */
   tools?: ToolReadiness;
-  /** Mint a bus token for a run. Returns the plaintext token (to give to the agent) and stores its hash. */
-  mintBusToken?: (runId: string, agent: string) => string;
+  /**
+   * Mint a bus token for a run: the plaintext token (to give to the agent; its hash is stored), or null when the
+   * project's bus is off (bus.consume), and the run gets none
+   */
+  mintBusToken?: (runId: string, agent: string) => string | null;
   /** Revoke a run's bus token when the run ends */
   revokeBusToken?: (runId: string) => void;
+  /** What the ready guard reads a PR from (read on each use); undefined: the project has no git host to ask */
+  readyFacts?: () => ReadyFactsSource | undefined;
+  /** The project's bus as fill reads it (bus.consume observe or on; read at each check), or null */
+  bus?: () => BusLineSource | null;
+  /** This server's URL, given as LAIR_URL to a run that gets a bus token (unless a module gave it one) */
+  busServerUrl?: string;
 }
 
 interface EventInput {
@@ -425,8 +440,10 @@ export class AgentsService {
   private budget?: FleetBudget;
   private events?: EventBus;
   private tools?: ToolReadiness;
-  private mintBusToken?: (runId: string, agent: string) => string;
+  private mintBusToken?: (runId: string, agent: string) => string | null;
   private revokeBusToken?: (runId: string) => void;
+  private bus?: () => BusLineSource | null;
+  private busServerUrl?: string;
   private watchdogSettings: WatchdogSettings;
   private watchdogStore: WatchdogStore | null = null;
   private unsubscribe: (() => void) | null = null;
@@ -460,6 +477,8 @@ export class AgentsService {
     this.tools = options.tools;
     this.mintBusToken = options.mintBusToken;
     this.revokeBusToken = options.revokeBusToken;
+    this.bus = options.bus;
+    this.busServerUrl = options.busServerUrl;
     this.watchdogSettings = watchdogSettingsFor(options.config, options.settings.hungMinutes);
     // Usage reaches the per-agent and per-project budgets through the fleet budget
     this.unsubscribe =
@@ -479,6 +498,8 @@ export class AgentsService {
         });
       }) ?? null;
     if (options.settings.fill.enabled) {
+      // Once per start (and config reload): what can make fill close or change the wrong task (also on Home → Health)
+      for (const warning of options.settings.fill.warnings) console.warn(`[agents] ${this.project}: ${warning}`);
       this.fill = new AgentsFill({
         project: this.project,
         config: this.config,
@@ -500,6 +521,8 @@ export class AgentsService {
           return inbox.find ? inbox.find(this.project, key) : undefined;
         },
         withdraw: (decision, reason) => this.withdrawDecision(decision, reason, this.probes.clock.now()),
+        readyFacts: options.readyFacts,
+        bus: options.bus,
       });
     }
   }
@@ -832,6 +855,27 @@ export class AgentsService {
   }
 
   /**
+   * An open provider-limit decision whose limit has reset (`limit_resets_at` is past) says so: its cause is
+   * cleared. Done at the start of the tick, before the waiting run launches and the decision is withdrawn as
+   * moot. Only its evidence changes, for the policy rules (docs/design/decision-policies.md §4). Only while the
+   * decision policies are on (the inbox has causeCleared: AgentsManager.useEvidenceUpdates). Never throws.
+   */
+  private async refreshCauses(t: Tick): Promise<void> {
+    const inbox = this.decisions();
+    if (!inbox.causeCleared) return;
+    try {
+      for (const decision of inbox.open?.(this.project) ?? []) {
+        const evidence = decision.evidence;
+        if (decision.class !== "agents.provider_limit" || !evidence || evidence.cause_cleared) continue;
+        const resets = evidence.facts.limit_resets_at;
+        if (typeof resets === "string" && Date.parse(resets) <= t.now) await inbox.causeCleared(decision.id);
+      }
+    } catch (e) {
+      console.warn(`[agents] ${this.project}: could not update the evidence of a decision: ${message(e)}`);
+    }
+  }
+
+  /**
    * Where the decision of one of fill's holds stands (fill.ts holdDecision;
    * `key` from fillDecisionKey or escalationDecisionKey): for code that keeps
    * a hold only while its decision is open or was answered "keep".
@@ -929,6 +973,11 @@ export class AgentsService {
       await this.recordFillRelease(task, latest, "decision", t.now);
       return "fill starts the task again on its next check";
     }
+    const idle = parseIdleNoticeKey(key);
+    if (idle) {
+      // An idle notice asks nothing: closing it changes nothing, and this episode raises no other
+      return `noted: fill raises no other idle notice for ${idle.agent} until it stops idling and then idles while ready work exists again`;
+    }
     if (key.startsWith("signin:") && ref.startsWith("signin:")) {
       if (optionId !== DECISION_RETRY_NOW) {
         return "the runs on it keep waiting; Lair keeps checking its sign-in, and asks again only if it changes";
@@ -1020,6 +1069,7 @@ export class AgentsService {
       }
     }
     await this.checkBudgets(t);
+    await this.refreshCauses(t);
     if (!this.readOnly) {
       for (const run of this.store.activeRuns(this.project)) {
         t.touchedTasks.add(run.task);
@@ -1393,9 +1443,11 @@ export class AgentsService {
     if (adapter?.session_id_env && !adapter.session_id_env.toUpperCase().startsWith("LAIR_")) {
       own[adapter.session_id_env] = run.sessionId;
     }
-    // Mint a bus token for this run (the token itself is never logged or stored)
-    if (this.mintBusToken) {
-      own.LAIR_BUS_TOKEN = this.mintBusToken(run.id, run.agent);
+    // Mint a bus token for this run while the project's bus is on (the token itself is never logged or stored)
+    const busToken = this.mintBusToken?.(run.id, run.agent) ?? null;
+    if (busToken !== null) {
+      own.LAIR_BUS_TOKEN = busToken;
+      if (this.busServerUrl && own.LAIR_URL === undefined) own.LAIR_URL = this.busServerUrl;
     }
     return agentEnvironment(process.env, this.settings.envPassthrough, own);
   }
@@ -1799,7 +1851,7 @@ export class AgentsService {
     const patterns = this.settings.fill;
     try {
       const until = queueWindowEnd(this.store, this.project, patterns, run, run);
-      return reportedOutcome(new QueueLines(this.config.queue_file), patterns, run, until);
+      return reportedOutcome(new QueueLines(this.config.queue_file, this.bus?.() ?? null), patterns, run, until);
     } catch {
       return null; // a pattern that doesn't compile for this task: no line found
     }
@@ -3155,6 +3207,8 @@ export class AgentsService {
       lastCheck: null,
       lastError: null,
       lines: [],
+      unmatchedReports: [],
+      warnings: fill.warnings,
     };
   }
 
@@ -3170,6 +3224,32 @@ export class AgentsService {
     const summary = await this.tick();
     if (this.fill) await this.checkFill();
     return summary;
+  }
+
+  /**
+   * bus.consume on: an accepted bus report, or a run that ended. Fill checks
+   * now instead of at its next interval (nothing when fill is off). The
+   * report itself changes nothing here: the check reads it at its mirrored
+   * line, so it can't count twice.
+   */
+  checkFillSoon(): Promise<void> {
+    return this.fill ? this.fill.checkSoon() : Promise.resolve();
+  }
+
+  /** Why fill won't read this bus report (an unknown task or agent), or null (also when fill is off). */
+  busReportProblem(report: Pick<StructuredReport, "task" | "agent" | "kind">): string | null {
+    return this.fill ? this.fill.busReportProblem(report) : null;
+  }
+
+  /**
+   * Whether the ready guard accepts `line` as `task`'s done report (true when
+   * fill or the guard is off). The planner settles a task through this too, so a
+   * refused report is a done nowhere. `report`: the bus report the line was
+   * read from (bus.consume on): its PR and head are its own fields.
+   */
+  async reportAccepted(agent: string, task: string, line: string, taskText: string, report: StructuredReport | null = null): Promise<boolean> {
+    if (!this.fill) return true;
+    return (await this.fill.guardReport(agent, task, line, this.store.latestRunForTask(this.project, task), taskText, report)) === null;
   }
 
   /**
@@ -3551,6 +3631,20 @@ export interface AgentsManagerOptions {
   decisions?: DecisionInbox;
   /** Tool sign-in checks (src/server/ai/): a tool signed out on this machine starts no run here */
   tools?: ToolReadiness;
+  /** The fleet bus (src/server/bus/), per project behind bus.consume; without it no run gets a bus token */
+  bus?: AgentsBus;
+}
+
+/** The fleet bus as the agents module uses it (the server wires it; every call is per project and follows reloads). */
+export interface AgentsBus {
+  /** The project's bus as fill reads it, or null while its bus.consume is off */
+  lineSource(project: string): BusLineSource | null;
+  /** A bus token for a run (its hash is stored) while the project's bus.consume isn't off, else null */
+  mintToken(project: string, runId: string, agent: string): string | null;
+  /** Revoke a run's bus tokens (it ended) */
+  revokeTokens(project: string, runId: string): void;
+  /** This server's URL, given to a run with a bus token as LAIR_URL (where `lair bus` and `lair bus-mcp` post) */
+  serverUrl?: string;
 }
 
 /**
@@ -3573,11 +3667,20 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
   /** Per project: stop following its answers */
   private stopFollowing = new Map<string, () => void>();
   private producer: DecisionProducer | null = null;
+  /** useEvidenceUpdates(): off by default */
+  private evidenceUpdates = false;
   /** "started" between start() and stop(); a reload never runs once "stopped" */
   private phase: "loaded" | "started" | "stopped" = "loaded";
 
   constructor(private options: AgentsManagerOptions) {
     this.decisions = options.decisions ?? null;
+  }
+
+  private readyFacts: ((project: string) => ReadyFactsSource | undefined) | null = null;
+
+  /** Where the ready guard reads a project's PRs from (the review module's host); set before load(). */
+  useReadyFacts(facts: (project: string) => ReadyFactsSource | undefined): void {
+    this.readyFacts = facts;
   }
 
   /** Raise decisions through `inbox` instead (a stand-in for the Decision Inbox, in tests). */
@@ -3596,8 +3699,19 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
     for (const stop of this.stopFollowing.values()) stop();
     this.stopFollowing.clear();
     this.producer = decisions;
-    this.decisions = new ProducerDecisions(decisions, this.fileInbox());
+    this.decisions = new ProducerDecisions(decisions, this.fileInbox(), { evidenceUpdates: this.evidenceUpdates });
     for (const [project, service] of this.services) this.follow(project, service);
+  }
+
+  /**
+   * Re-evaluate the evidence of decisions this module raised (a provider-limit decision's cause cleared once
+   * its reset time passed: AgentsService.refreshCauses). Off until the decision policies turn it on
+   * (src/server/decisions/policies/, data/server.yaml decision_policies.enabled); off, no decision's evidence
+   * changes after it was raised.
+   */
+  useEvidenceUpdates(on: boolean): void {
+    this.evidenceUpdates = on;
+    if (this.producer) this.decisions = new ProducerDecisions(this.producer, this.fileInbox(), { evidenceUpdates: on });
   }
 
   private follow(project: string, service: AgentsService): void {
@@ -3647,9 +3761,33 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
           budget: this.options.budget,
           events: this.options.events,
           tools: this.options.tools,
+          readyFacts: () => this.readyFacts?.(entry.name),
+          ...this.busOptions(entry.name),
         }),
       );
     }
+  }
+
+  /** A project's bus hooks for its service (none without the bus): each reads the project's bus.consume when used. */
+  private busOptions(project: string): Pick<AgentsServiceOptions, "bus" | "mintBusToken" | "revokeBusToken" | "busServerUrl"> {
+    const bus = this.options.bus;
+    if (!bus) return {};
+    return {
+      bus: () => bus.lineSource(project),
+      mintBusToken: (runId, agent) => bus.mintToken(project, runId, agent),
+      revokeBusToken: (runId) => bus.revokeTokens(project, runId),
+      busServerUrl: bus.serverUrl,
+    };
+  }
+
+  /** bus.consume on: fill checks now (an accepted bus report, or a run that ended); nothing when it is off. */
+  checkFillSoon(project: string): Promise<void> {
+    return this.services.get(project)?.checkFillSoon() ?? Promise.resolve();
+  }
+
+  /** Why fill won't read this bus report (an unknown task or agent), or null. */
+  busReportProblem(project: string, report: Pick<StructuredReport, "task" | "agent" | "kind">): string | null {
+    return this.services.get(project)?.busReportProblem(report) ?? null;
   }
 
   start(): string[] {

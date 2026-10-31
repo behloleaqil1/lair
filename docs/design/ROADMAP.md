@@ -33,6 +33,8 @@ any machines.
 | Look and feel (T1) | [settings-v2.md](settings-v2.md) | `src/client/ui/` | Design tokens with light, dark and system themes and two densities (AA contrast checked from the values), a component kit, the app shell (left nav, breadcrumbs and page headers) and every view on them; axe runs on every view in CI |
 | Settings v2, part 1 (S2-1) | [settings-v2.md](settings-v2.md) | `src/client/components/Settings*.tsx` | Settings by task: Overview (a setup checklist), AI (tools signed in per machine, profiles with each tool's own models, roles as ordered lists) and Team (agents, bulk moves), the classic form for the rest; a search over every field; one save bar through the phase-1 review |
 | Cleanup | [cleanup.md](cleanup.md) | `src/server/cleanup/` | Retention and removal for worktrees (after merge) and watched folders (results, logs, gate snapshots); configurable keep_days and skip_if_referenced; observe and act modes; bounded per cycle; every removal audited |
+| Bus consumers (PR 2a) | [phase3-bus.md](phase3-bus.md) | `src/server/bus/consumers.ts`, `src/server/bus/wiring.ts` | `bus.consume` (off, observe, on; off by default): runs get a bus token and post structured reports; in on mode fill and the planner read a mirrored line by its report (kind, task, agent, gate id, PR, sha), at once when it arrives or its run ends; each report applied once, also across restarts; observe compares on Home → Health; invalid or unknown reports refused or ignored with the reason |
+| Tracker | [tracker.md](tracker.md) | `src/server/tracker/` | Keeps GitHub issues, Projects (v2) boards and milestones in step with the planner's, the agents' and the reviews' events and a periodic reconcile, for one or several repositories per project (each with its board); off unless enabled, observe mode (records only) unless `mode: act`; events never wait on GitHub; at most one issue per task (pending create and body marker); writes budgeted and audited; rate limits and timeouts on every request; redaction by default; a missing token scope is one owner decision; owner-only routes |
 
 ## Next, in order
 
@@ -74,12 +76,14 @@ Each step lists what must exist first. One module per pull request, each with it
 
 | # | Step | Spec | Needs first | Acceptance (summary) |
 |---|---|---|---|---|
+| A1 | **Checks**: agents test on a runner before they gate | [checks.md](checks.md) | bus, agents | A request with a valid selector runs the configured argv (no shell); only a running run, on its own branch, for a pushed sha; refusals for bad selectors, branches, shas, rate limits and guards are audited; results pruned after 14 days. Follow-ups: bus tool and CLI, dashboard views, `require_before_gate` |
 | A2 | **Reliability**: dashboard probes off the request path (async, cached); retention for results and logs in watched folders (cleanup module, built: [cleanup.md](cleanup.md)) | [#38](https://github.com/behloleaqil1/lair/issues/38), PR #70 | — | No synchronous command on a request; a 30-minute provider outage escalates nothing; a watched folder past its retention limit is archived. **Built (PR #70)**: shared process cache, data cache for expensive routes, transient outage handling. **Cleanup module built.**
 | A3 | **Supervisor S1–S2**: self-checks, the ops API, answers, the daily digest, proposals as decisions (S1-1, the self-checks and the read-only ops API, and S1-2, the supervisor's runs, answers and digest, are built; S1-3, the hourly review and diagnoses, is next) | [supervisor.md](supervisor.md) | A2 | See supervisor.md |
 | A6 | **AI roles**: any tool, any model, per role (build, review per tier, plan, supervise); sign-in status per machine; a write-only key store for API-key tools; reviewer calibration | [ai-roles.md](ai-roles.md) | — | See ai-roles.md |
 | A7 | **Look and feel, then Settings v2**: design tokens, light/dark, a component kit for every view (T1, built); Settings by task, with plain language, levels, search, templates and test buttons (S2-1 built; S2-2 and S2-3 to do) | [settings-v2.md](settings-v2.md) | T1 first; S2-1 needs A6 | See settings-v2.md |
 | A4 | **Supervisor S3**: an allowlist of acting fixes | [supervisor.md](supervisor.md) | A3 | See supervisor.md |
-| A5 | **Hands-off day** (end-to-end acceptance) | [autonomy.md §11](autonomy.md) | A2–A4 | A project runs a full day with no human input except Decision Inbox answers |
+| A8 | **Work store**: tasks, events, briefs and messages in Lair's database instead of project files | [work-store.md](work-store.md) | bus (built), planner (built) | Tasks live in the store; fill reads the store; agents report through bus tools; legacy files mirrored read-only; an importer for existing projects. See work-store.md |
+| A5 | **Hands-off day** (end-to-end acceptance) | [autonomy.md §11](autonomy.md) | A2–A4, A8 | A project runs a full day with no human input except Decision Inbox answers |
 
 ### B. A proper open-source project
 
@@ -110,6 +114,22 @@ Each step lists what must exist first. One module per pull request, each with it
 | C9 | **Quality** | [quality.md](quality.md) | reviews, triage | Contracts, migration safety, spec conformance, exploratory and UX testing, performance and cost budgets, AI evaluations, a security pipeline |
 | C10 | **Launch kit** (for the apps Lair builds) | [launch-kit.md](launch-kit.md) | C9, delivery | Billing, analytics, the customer-facing surface, a feedback loop, launch readiness |
 | C11 | **Teams and scale** | [platform.md M6](platform.md) | the rest | Postgres, roles and permissions, SSO, high availability, quotas |
+
+### O. Lair is the orchestrator
+
+The orchestrator is the person, or the AI assistant, who keeps a project running overnight: assigning tasks, noticing
+stalls, answering "why is nothing merging?", diagnosing infrastructure failures, adjusting capacity, and deciding what
+to do when a gate fails. This section tracks how Lair absorbs each orchestrator duty into code, with the AI only at
+the edges.
+
+See [orchestration.md](orchestration.md) for the full design. The order:
+
+| Phase | Duties | Acceptance |
+|---|---|---|
+| O1: Correctness | D10 (built: #90), D4/D5 (#179), D6 (#99) | A DONE closes only with evidence; reused pids and duplicates are marked lost, never killed |
+| O2: Keep busy | D1/D3 (#166, #178), D13 (#163), D11 (mostly built: #100, #238), D9 (#181), D29 (#186) | No agent idles while ready work exists; services restart automatically |
+| O3: Visibility | D19 (#182), D20 (#183), D18 (#164) | "What happened last night?" and "when will X ship?" are answered from data |
+| O4: The rest | D2 (#177), D8 (#180), D17 (#108, #109, #239), D26 (#185), D28 (#167), D30 (#187) | The orchestrator's remaining manual duties are absorbed |
 
 ## Rules every new module follows
 

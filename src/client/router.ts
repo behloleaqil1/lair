@@ -16,7 +16,7 @@
  * (the owner setup link's #owner-token=...) is left alone.
  */
 
-export type SectionId = "home" | "work" | "gates" | "prs" | "machines" | "decisions" | "delivery" | "processes" | "settings";
+export type SectionId = "home" | "work" | "gates" | "prs" | "machines" | "decisions" | "delivery" | "processes" | "knowledge" | "settings";
 
 export const SECTION_IDS: readonly SectionId[] = [
   "home",
@@ -27,6 +27,7 @@ export const SECTION_IDS: readonly SectionId[] = [
   "decisions",
   "delivery",
   "processes",
+  "knowledge",
   "settings",
 ];
 
@@ -40,6 +41,7 @@ export const SECTION_TABS: Record<SectionId, readonly string[]> = {
   decisions: ["messages"],
   delivery: [],
   processes: [],
+  knowledge: [],
   // Settings' own pages after Overview (settings-pages.ts), shown in its page list rather than as tabs
   settings: ["ai", "team", "classic", "yaml", "history"],
 };
