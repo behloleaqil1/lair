@@ -5536,7 +5536,8 @@ describe("bus consumers: events drive fill's state (bus PR 2a)", () => {
       },
     };
     // Merge fill into the agents config (don't duplicate fill)
-    const { fill: _, ...restAgentsConfig } = agentsConfig as { fill?: unknown };
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { fill: _fill, ...restAgentsConfig } = agentsConfig as { fill?: unknown };
     const config = projectConfig(paths, { ...BASE, ...restAgentsConfig, ...fillConfig });
     // Add bus config at the project level
     (config as unknown as { bus: { consume: string } }).bus = { consume: consumeMode };
