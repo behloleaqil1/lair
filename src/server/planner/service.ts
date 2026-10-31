@@ -498,6 +498,8 @@ export class PlannerService {
           continue;
         }
         if (!check) continue;
+        // Fill's ready guard decides what a done report is: a refused one marks nothing
+        if (check.kind === "queue" && !(await this.agents.reportAccepted(this.project, line.agent, line.task, check.line, line.description))) continue;
         settled.add(line.task);
         changes.push({
           edit: { op: "mark_done", task: line.task },

@@ -79,7 +79,8 @@ Each step lists what must exist first. One module per pull request, each with it
 | A6 | **AI roles**: any tool, any model, per role (build, review per tier, plan, supervise); sign-in status per machine; a write-only key store for API-key tools; reviewer calibration | [ai-roles.md](ai-roles.md) | — | See ai-roles.md |
 | A7 | **Look and feel, then Settings v2**: design tokens, light/dark, a component kit for every view (T1, built); Settings by task, with plain language, levels, search, templates and test buttons (S2-1 built; S2-2 and S2-3 to do) | [settings-v2.md](settings-v2.md) | T1 first; S2-1 needs A6 | See settings-v2.md |
 | A4 | **Supervisor S3**: an allowlist of acting fixes | [supervisor.md](supervisor.md) | A3 | See supervisor.md |
-| A5 | **Hands-off day** (end-to-end acceptance) | [autonomy.md §11](autonomy.md) | A2–A4 | A project runs a full day with no human input except Decision Inbox answers |
+| A8 | **Work store**: tasks, events, briefs and messages in Lair's database instead of project files | [work-store.md](work-store.md) | bus (built), planner (built) | Tasks live in the store; fill reads the store; agents report through bus tools; legacy files mirrored read-only; an importer for existing projects. See work-store.md |
+| A5 | **Hands-off day** (end-to-end acceptance) | [autonomy.md §11](autonomy.md) | A2–A4, A8 | A project runs a full day with no human input except Decision Inbox answers |
 
 ### B. A proper open-source project
 
@@ -110,6 +111,22 @@ Each step lists what must exist first. One module per pull request, each with it
 | C9 | **Quality** | [quality.md](quality.md) | reviews, triage | Contracts, migration safety, spec conformance, exploratory and UX testing, performance and cost budgets, AI evaluations, a security pipeline |
 | C10 | **Launch kit** (for the apps Lair builds) | [launch-kit.md](launch-kit.md) | C9, delivery | Billing, analytics, the customer-facing surface, a feedback loop, launch readiness |
 | C11 | **Teams and scale** | [platform.md M6](platform.md) | the rest | Postgres, roles and permissions, SSO, high availability, quotas |
+
+### O. Lair is the orchestrator
+
+The orchestrator is the person, or the AI assistant, who keeps a project running overnight: assigning tasks, noticing
+stalls, answering "why is nothing merging?", diagnosing infrastructure failures, adjusting capacity, and deciding what
+to do when a gate fails. This section tracks how Lair absorbs each orchestrator duty into code, with the AI only at
+the edges.
+
+See [orchestration.md](orchestration.md) for the full design. The order:
+
+| Phase | Duties | Acceptance |
+|---|---|---|
+| O1: Correctness | D10 (built: #90), D4/D5 (#179), D6 (#99) | A DONE closes only with evidence; reused pids and duplicates are marked lost, never killed |
+| O2: Keep busy | D1/D3 (#166, #178), D13 (#163), D11 (mostly built: #100, #238), D9 (#181), D29 (#186) | No agent idles while ready work exists; services restart automatically |
+| O3: Visibility | D19 (#182), D20 (#183), D18 (#164) | "What happened last night?" and "when will X ship?" are answered from data |
+| O4: The rest | D2 (#177), D8 (#180), D17 (#108, #109, #239), D26 (#185), D28 (#167), D30 (#187) | The orchestrator's remaining manual duties are absorbed |
 
 ## Rules every new module follows
 
