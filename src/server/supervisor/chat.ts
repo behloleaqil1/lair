@@ -505,9 +505,16 @@ export class SupervisorChat {
         attention: "notice",
         title: `Today's digest is ready (${conversation.digestDate})`,
         context: `Lair's supervisor wrote the digest of ${conversation.project} for ${conversation.digestDate}. Home shows it, with the evidence it cites.`,
-        options: [{ id: "noted", label: "Noted", consequences: "The notice closes; Home keeps showing the digest." }],
+        options: [{ id: "noted", label: "Noted", consequences: "The notice closes; Home keeps showing the digest.", effect: "reversible" }],
         recommended: { optionId: "noted", reasoning: "Nothing is decided here: the digest is for reading." },
         source: { module: NOTICE_MODULE, ref: key },
+        class: "supervisor.digest",
+        evidence: {
+          code: "digest_ready",
+          facts: { digest_date: conversation.digestDate },
+          cause_cleared: false,
+          linked_issue: null,
+        },
         key,
       });
     } catch (e) {
