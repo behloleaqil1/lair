@@ -139,7 +139,8 @@ export function toBenchCase(e: Example): BenchCase {
 export function knownBefore(examples: Example[], cutoffMs: number): Example[] {
   return examples.map((e) => {
     if (e.outcomeAt === undefined || Date.parse(e.outcomeAt) < cutoffMs) return e;
-    const { outcomeAt: _later, ...rest } = e;
-    return { ...rest, outcome: "unknown" };
+    const rest = { ...e, outcome: "unknown" as const };
+    delete rest.outcomeAt;
+    return rest;
   });
 }
