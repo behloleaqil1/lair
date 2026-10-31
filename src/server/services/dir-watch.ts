@@ -16,14 +16,26 @@
  * polled instead every `pollMs`, with a bounded scan: one readdir, then an
  * lstat of the new names and of the `pollLimit` most recently changed
  * files. When the folder can be watched again, polling stops.
+ *
+ * The watched folder itself being removed or replaced shows as a rename on
+ * Linux (inotify) and Windows; FSEvents on macOS may report nothing, so there
+ * a health check stats the folder every `healthCheckMs` (async, one at a
+ * time) and polls it once it is gone or another folder.
  */
 import { lstatSync, readdirSync, statSync, watch as fsWatch, type FSWatcher, type Stats, type WatchListener } from "fs";
+import { stat } from "fs/promises";
 import { join } from "path";
 
 export type DirEntryEvent = "add" | "change" | "unlink" | "addDir" | "unlinkDir";
 
 /** fs.watch on one folder (injectable, so tests can count the watches) */
 export type WatchFn = (dir: string, listener: WatchListener<string>) => FSWatcher;
+
+/** The watched folder's inode, async (injectable, so tests can hold a stat) */
+export type StatDirFn = (dir: string) => Promise<{ ino: number }>;
+
+/** The health check's shortest interval: a smaller pollMs never turns it into a busy loop */
+export const MIN_HEALTH_CHECK_MS = 1000;
 
 export interface DirWatchOptions {
   /** Whether an entry (its name in the folder) is worth an event */
@@ -40,7 +52,19 @@ export interface DirWatchOptions {
   watch?: WatchFn;
   /** A watch that failed or was lost (the folder is polled from then on) */
   onError?: (message: string) => void;
+  /**
+   * While watching, check that the folder is still the one watched (default:
+   * on macOS only, where FSEvents may not report its removal). A file system
+   * whose folder inode changes by itself (some network mounts) would make the
+   * watch fall back to polling: turn it off there.
+   */
+  healthCheck?: boolean;
+  /** Interval of that check (default min(pollMs, 5000); never under MIN_HEALTH_CHECK_MS) */
+  healthCheckMs?: number;
+  statDir?: StatDirFn;
 }
+
+const defaultStatDir: StatDirFn = (dir) => stat(dir);
 
 export const defaultWatch: WatchFn = (dir, listener) =>
   // persistent: false, so a watch never keeps the process alive by itself
@@ -71,6 +95,9 @@ export class DirWatch {
   private dirIno: number | null = null;
   private poller: NodeJS.Timeout | null = null;
   private healthChecker: NodeJS.Timeout | null = null;
+  /** A folder check (stat) is in flight; `recheck`: another was asked for meanwhile */
+  private checking = false;
+  private recheck = false;
   /** The last failure reported, so a watch that keeps failing is said once */
   private failure: string | null = null;
   private started = false;
@@ -78,8 +105,9 @@ export class DirWatch {
   private readonly debounceMs: number;
   private readonly pollMs: number;
   private readonly pollLimit: number;
-  /** Interval between health checks when watching (default: pollMs, capped at 5000ms) */
-  private readonly healthCheckMs: number;
+  /** Whether the folder is checked on a timer while watched (see DirWatchOptions.healthCheck) */
+  readonly healthCheck: boolean;
+  readonly healthCheckMs: number;
 
   constructor(
     readonly dir: string,
@@ -88,9 +116,8 @@ export class DirWatch {
     this.debounceMs = options.debounceMs ?? 100;
     this.pollMs = options.pollMs ?? 5000;
     this.pollLimit = options.pollLimit ?? 200;
-    // Health check: verify the folder still exists even while watching, since
-    // FSEvents on macOS may not reliably deliver directory removal events.
-    this.healthCheckMs = Math.min(this.pollMs, 5000);
+    this.healthCheck = options.healthCheck ?? process.platform === "darwin";
+    this.healthCheckMs = Math.max(MIN_HEALTH_CHECK_MS, options.healthCheckMs ?? Math.min(this.pollMs, 5000));
   }
 
   /** "watching" (fs.watch on the folder), "polling", "stopped", or "idle" before start() */
@@ -139,8 +166,6 @@ export class DirWatch {
     }
     watcher.on("error", (e) => this.lost(`the watch on ${this.dir} failed (${message(e)})`));
     this.watcher = watcher;
-    // Start periodic health checks: macOS FSEvents may not deliver directory
-    // removal events reliably, so we verify the folder still exists.
     this.startHealthCheck();
     return true;
   }
@@ -157,7 +182,7 @@ export class DirWatch {
   }
 
   private startHealthCheck(): void {
-    if (this.healthChecker) return;
+    if (!this.healthCheck || this.healthChecker) return;
     this.healthChecker = setInterval(() => this.checkFolder(), this.healthCheckMs);
     this.healthChecker.unref?.();
   }
@@ -208,15 +233,35 @@ export class DirWatch {
     if (this.options.accept(name)) this.schedule(name);
   }
 
-  /** Still the folder that is watched? If not, poll it until it can be watched again. */
+  /**
+   * Still the folder that is watched? If not, poll it until it can be watched
+   * again. One async stat at a time (never on the event loop, never two in
+   * flight: a slow disk can't pile them up); a check asked for meanwhile runs
+   * once after it, so a removal seen during a slow stat is not missed.
+   */
   private checkFolder(): void {
-    let ino: number | null = null;
-    try {
-      ino = statSync(this.dir).ino;
-    } catch {
-      // Gone
+    if (this.stopped || !this.watcher) return;
+    if (this.checking) {
+      this.recheck = true;
+      return;
     }
-    if (ino === null || ino !== this.dirIno) this.lost(`${this.dir} was removed or replaced`);
+    this.checking = true;
+    const watcher = this.watcher;
+    const ino = this.dirIno;
+    void (this.options.statDir ?? defaultStatDir)(this.dir)
+      .then(
+        (st) => st.ino,
+        () => null, // Gone, or can't be looked at: either way not the folder watched
+      )
+      .then((now) => {
+        this.checking = false;
+        // An answer about a watch that ended meanwhile (stopped, lost, armed again) changes nothing
+        if (!this.stopped && this.watcher === watcher && now !== ino) this.lost(`${this.dir} was removed or replaced`);
+        if (this.recheck) {
+          this.recheck = false;
+          this.checkFolder();
+        }
+      });
   }
 
   private schedule(name: string): void {
