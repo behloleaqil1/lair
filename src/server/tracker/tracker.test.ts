@@ -656,6 +656,30 @@ describe("several repositories, each with its own board (multi-repo)", () => {
     ]);
   });
 
+  it("an unassigned line (no agent) is linked by its task id: no agent rule takes it, no Agent field, Backlog until a run starts", async () => {
+    const gh = new FakeGitHub();
+    const webBoard = gh.addBoard("acme", 1);
+    const apiBoard = gh.addBoard("acme", 2);
+    const adopted = gh.addIssue("acme/web", { title: "feat-free" });
+    const dir = mkdtempSync(join(tmpdir(), "lair-tracker-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const h = await rig({
+      gh,
+      dir,
+      tracker: { create_issues_for_new_tasks: true },
+      agents: { enabled: true, fill: { enabled: true, tasks_file: join(dir, "tasks.txt"), agents: ["worker-b"], prompt_files: ["{prompts_dir}/worker.txt"] } },
+      repos: [WEB, { repo: "acme/api", project: { owner: "acme", number: 2 }, agent_field: "Agent", match: { agents: ["worker-b"] } }],
+      // Unassigned lines, as fill and the planner read them: an empty agent field
+      tasks: ["|Anyone|feat-free|Pick me up", "|Anyone|feat-open|Open work"],
+    });
+    expect((await h.status()).errors).toEqual([]);
+    expect(gh.issues("acme/web").map((i) => i.title)).toEqual(["feat-free", "feat-open: Open work"]);
+    expect(apiBoard.items).toEqual([]);
+    expect(gh.card(webBoard, "acme/web", adopted.number)).toMatchObject({ status: "Backlog", agent: null });
+    await h.emit("agent.run.started", runStarted("feat-free", "worker-b"));
+    expect(gh.card(webBoard, "acme/web", adopted.number)).toMatchObject({ status: "In progress", agent: "worker-b" });
+  });
+
   it("with several repositories and no default, a task no rule takes is not tracked", async () => {
     const gh = new FakeGitHub();
     const h = await rig({

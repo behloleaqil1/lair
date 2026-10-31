@@ -564,7 +564,7 @@ export class TrackerService {
     if (explicit) return this.repoState(explicit.repo) ?? null;
     for (const state of this.repos.values()) {
       const m = state.settings.match;
-      if (m.tasks.some((re) => re.test(task)) || (info && m.agents.includes(info.agent))) return state;
+      if (m.tasks.some((re) => re.test(task)) || (info?.agent != null && m.agents.includes(info.agent))) return state;
     }
     for (const state of this.repos.values()) if (state.settings.default) return state;
     return null;
@@ -591,7 +591,7 @@ export class TrackerService {
   }
 
   private initialStatus(info: TaskInfo | null): TrackerStatus {
-    return info && this.settings.fillAgents.includes(info.agent) ? "ready" : "backlog";
+    return info?.agent != null && this.settings.fillAgents.includes(info.agent) ? "ready" : "backlog";
   }
 
   /**

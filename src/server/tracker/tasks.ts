@@ -11,7 +11,8 @@ import { parseTasksDoc } from "../planner/tasks-file.js";
 
 export interface TaskInfo {
   task: string;
-  agent: string;
+  /** null: an unassigned line (any agent may take it): no agent rule matches it, and it is linked by its task id alone */
+  agent: string | null;
   name: string;
   description: string;
 }
