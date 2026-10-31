@@ -2639,7 +2639,7 @@ infra_monitor:
         - ["/usr/local/bin/docker", "info", "--format", "{{.ServerVersion}}"]
     laptop:
       probes:
-        - argv: ["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "dev@laptop.lan", "echo", "ok"]
+        - argv: ["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "user@laptop.example", "echo", "ok"]
           expect: "ok"
     cloud:
       probes:

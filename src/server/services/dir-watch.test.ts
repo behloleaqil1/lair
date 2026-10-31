@@ -21,6 +21,14 @@ import {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * A test that waits on several real file events in turn. Each wait is bounded
+ * by waitFor (10 s, failing with the event it waited for); FSEvents on a macOS
+ * runner can take a second or more per event, so five in a row outlast
+ * vitest's 5 s default, which would fail the test without naming the event.
+ */
+const EVENTS_TIMEOUT_MS = 60_000;
+
 async function waitFor(what: string, done: () => boolean, timeoutMs = 10_000): Promise<void> {
   const until = Date.now() + timeoutMs;
   while (!done()) {
@@ -110,7 +118,7 @@ describe("DirWatch", () => {
     expect(h.saw("add", "a.log")).toBe(false);
     expect(watched).toEqual([dir]);
     expect(h.errors).toEqual([]);
-  });
+  }, EVENTS_TIMEOUT_MS);
 
   it("reports a burst of writes to one file once", async () => {
     const dir = folderWithFiles(tempRoot());
@@ -119,7 +127,7 @@ describe("DirWatch", () => {
     await waitFor("change a.log", () => h.saw("change", "a.log"));
     await sleep(300);
     expect(h.seen.filter((s) => s.name === "a.log")).toHaveLength(1);
-  });
+  }, EVENTS_TIMEOUT_MS);
 
   it("polls instead when asked to, with the same events", async () => {
     const dir = folderWithFiles(tempRoot());
@@ -134,7 +142,7 @@ describe("DirWatch", () => {
     expect(h.watch.state).toBe("polling");
     await exercise(dir, h);
     expect(watched).toEqual([]);
-  });
+  }, EVENTS_TIMEOUT_MS);
 
   it("polls a folder that doesn't exist yet, and watches it once it does", async () => {
     const dir = join(tempRoot(), "later");
@@ -148,7 +156,7 @@ describe("DirWatch", () => {
     await waitFor("add y.log", () => h.saw("add", "y.log"));
     // A missing folder is not an error
     expect(h.errors).toEqual([]);
-  });
+  }, EVENTS_TIMEOUT_MS);
 
   it("polls a folder whose watch can't be made, and says so once", async () => {
     const dir = folderWithFiles(tempRoot());
@@ -164,7 +172,7 @@ describe("DirWatch", () => {
     await sleep(400);
     expect(h.errors).toHaveLength(1);
     expect(h.errors[0]).toContain("ENOSPC");
-  });
+  }, EVENTS_TIMEOUT_MS);
 
   it("watches a folder again after it was removed and made again", async () => {
     const dir = folderWithFiles(tempRoot());
