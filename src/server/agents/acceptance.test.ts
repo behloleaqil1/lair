@@ -5125,10 +5125,9 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
 
     // The agent starts and runs
     await check(h);
-    const [run] = runs(h);
     h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
     await at(h, 1 * MIN);
-    expect(run.state).toBe("completed");
+    expect(runs(h)[0].state).toBe("completed");
 
     // The agent reports DONE for a DIFFERENT task than its open one
     appendFileSync(h.queueFile, "- DONE old-task by worker-a 12:05Z: merged #12\n");
@@ -5160,10 +5159,9 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     tasks(h, "worker-a|Alice|feat-login|Build the login form");
 
     await check(h);
-    const [run] = runs(h);
     h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
     await at(h, 1 * MIN);
-    expect(run.state).toBe("completed");
+    expect(runs(h)[0].state).toBe("completed");
 
     // The agent reports DONE for its correct task
     appendFileSync(h.queueFile, "- DONE feat-login by worker-a 12:05Z: merged #12\n");
@@ -5181,10 +5179,9 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     tasks(h, "worker-a|Alice|feat-login|Build the login form");
 
     await check(h);
-    const [run] = runs(h);
     h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
     await at(h, 1 * MIN);
-    expect(run.state).toBe("completed");
+    expect(runs(h)[0].state).toBe("completed");
 
     // The agent reports WAITING for a DIFFERENT task
     appendFileSync(h.queueFile, "- WAITING old-task gate-123 by worker-a 12:05Z: queued\n");
@@ -5266,10 +5263,9 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     tasks(h, "worker-a|Alice|feat-login|Build the login form");
 
     await check(h);
-    const [run] = runs(h);
     h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
     await at(h, 1 * MIN);
-    expect(run.state).toBe("completed");
+    expect(runs(h)[0].state).toBe("completed");
 
     // The agent reports DONE for a different task, but with agent_legacy it matches by agent
     appendFileSync(h.queueFile, "- DONE old-task by worker-a 12:05Z: merged #12\n");
@@ -5287,10 +5283,9 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     tasks(h, "worker-a|Alice|fix-10|Fix the tenth issue");
 
     await check(h);
-    const [run] = runs(h);
     h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
     await at(h, 1 * MIN);
-    expect(run.state).toBe("completed");
+    expect(runs(h)[0].state).toBe("completed");
 
     // Report DONE for fix-1, not fix-10
     appendFileSync(h.queueFile, "- DONE fix-1 by worker-a 12:05Z: closed\n");
@@ -5309,10 +5304,9 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     tasks(h, "worker-a|Alice|fix-1|Fix the first issue");
 
     await check(h);
-    const [run] = runs(h);
     h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
     await at(h, 1 * MIN);
-    expect(run.state).toBe("completed");
+    expect(runs(h)[0].state).toBe("completed");
 
     // Report DONE for fix-1-2, not fix-1
     appendFileSync(h.queueFile, "- DONE fix-1-2 by worker-a 12:05Z: closed\n");
@@ -5331,10 +5325,9 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     tasks(h, "worker-a|Alice|feat-login|Build the login form");
 
     await check(h);
-    const [run] = runs(h);
     h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
     await at(h, 1 * MIN);
-    expect(run.state).toBe("completed");
+    expect(runs(h)[0].state).toBe("completed");
 
     // Another agent (worker-b) reports DONE for feat-login
     appendFileSync(h.queueFile, "- DONE feat-login by worker-b 12:05Z: merged\n");
@@ -5352,10 +5345,9 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     tasks(h, "worker-a|Alice|feat.login_v2:main|Build the login form");
 
     await check(h);
-    const [run] = runs(h);
     h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
     await at(h, 1 * MIN);
-    expect(run.state).toBe("completed");
+    expect(runs(h)[0].state).toBe("completed");
 
     // Report DONE for the correct task with special characters
     appendFileSync(h.queueFile, "- DONE feat.login_v2:main by worker-a 12:05Z: merged\n");
@@ -5375,10 +5367,9 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     tasks(h, "worker-a|Alice|feat-login|Build the login form");
 
     await check(h);
-    const [run] = runs(h);
     h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
     await at(h, 1 * MIN);
-    expect(run.state).toBe("completed");
+    expect(runs(h)[0].state).toBe("completed");
 
     // Report READY (not DONE) - this isn't detected as a standard report
     appendFileSync(h.queueFile, "- READY feat-login by worker-a 12:05Z: PR #12\n");
@@ -5396,10 +5387,9 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     tasks(h, "worker-a|Alice|feat-login|Build the login form");
 
     await check(h);
-    const [run] = runs(h);
     h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "done\n");
     await at(h, 1 * MIN);
-    expect(run.state).toBe("completed");
+    expect(runs(h)[0].state).toBe("completed");
 
     // Report DONE for review-feat-login, not feat-login
     appendFileSync(h.queueFile, "- DONE review-feat-login by worker-a 12:05Z: reviewed\n");
