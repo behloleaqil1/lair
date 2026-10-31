@@ -676,7 +676,7 @@ describe("hold answers judge the same cause", () => {
   function signIn(tool: string): RaiseDecisionInput {
     return {
       project: "demo",
-      kind: "credential",
+      kind: "credentials",
       title: `${tool} is not signed in`,
       context: "Signed out.",
       options: [
