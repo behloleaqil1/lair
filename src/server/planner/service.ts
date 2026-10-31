@@ -25,6 +25,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import type { EventBus } from "../core/event-bus.js";
 import type { EventType } from "../../shared/server-types.js";
+import type { DecisionEffect } from "../../shared/decision-types.js";
 import type { ProjectConfig } from "../../shared/types.js";
 import type {
   BlockedClass,
@@ -441,10 +442,18 @@ export class PlannerService {
           "Only Lair writes the tasks file in act mode. If you made this change, make it again once the run ends.",
         ].join("\n"),
         options: [
-          { id: "continue", label: "Keep planning", consequences: "Planner runs go on as before." },
-          { id: "pause", label: "Pause planner runs", consequences: "No planner run starts until you resume it in the Planner view. The rules (done, plan done) keep running." },
+          { id: "continue", label: "Keep planning", consequences: "Planner runs go on as before.", effect: "reversible" },
+          { id: "pause", label: "Pause planner runs", consequences: "No planner run starts until you resume it in the Planner view. The rules (done, plan done) keep running.", effect: "reversible" },
         ],
         recommended: { optionId: "pause", reasoning: "A change during a planner run may be the planner agent's: pause until you know who made it." },
+        class: "planner.tamper",
+        evidence: {
+          code: "tasks_file_changed",
+          facts: { run: active.id, restored: restored.ok },
+          // The change was undone when the file was put back
+          cause_cleared: restored.ok,
+          linked_issue: null,
+        },
       });
       return restored.ok ? parseTasksDoc(known.text, this.settings.doneMarker, this.settings.onePerAgent) : doc;
     }
@@ -638,12 +647,20 @@ export class PlannerService {
         options: [
           {
             id: "unblock",
+            effect: "reversible",
             label: "It's sorted: let the task go on",
             consequences: `The planner records ${task} as unblocked, and releases fill's blocked or no_done hold on it if there is one, so fill starts it again.`,
           },
-          { id: "keep", label: "Leave it blocked", consequences: `The planner leaves ${task} alone until its line in the tasks file changes.` },
+          { id: "keep", label: "Leave it blocked", consequences: `The planner leaves ${task} alone until its line in the tasks file changes.`, effect: "reversible" },
         ],
         recommended: { optionId: "keep", reasoning: "Only you know whether the blocker is gone." },
+        class: "planner.unblock",
+        evidence: {
+          code: c.class === "owner" ? "needs_owner" : "infra",
+          facts: { task, agent: event.agent ?? null, block_class: c.class, rule: c.rule },
+          cause_cleared: false,
+          linked_issue: null,
+        },
         blocks: [`planner:${this.project}:task:${task}`],
       });
       const why = fillRunsIt ? ": fill's blocked_pattern doesn't match this line, so fill won't hold it and ask you" : "";
@@ -662,10 +679,17 @@ export class PlannerService {
             `The planner had ${attempts} run(s) for it (planner.attempts_per_task is ${this.settings.attemptsPerTask}).`,
           ].join("\n"),
           options: [
-            { id: "retry", label: "Let the planner try again", consequences: `The planner's attempts on ${task} count from zero, and a planner run starts.` },
-            { id: "keep", label: "Leave it to me", consequences: `The planner leaves ${task} alone until its line in the tasks file changes.` },
+            { id: "retry", label: "Let the planner try again", consequences: `The planner's attempts on ${task} count from zero, and a planner run starts.`, effect: "reversible" },
+            { id: "keep", label: "Leave it to me", consequences: `The planner leaves ${task} alone until its line in the tasks file changes.`, effect: "reversible" },
           ],
           recommended: { optionId: "keep", reasoning: "A task that stays blocked after the planner reworded it usually needs a person." },
+          class: "planner.attempts",
+          evidence: {
+            code: "attempts_exhausted",
+            facts: { task, attempts },
+            cause_cleared: false,
+            linked_issue: null,
+          },
           blocks: [`planner:${this.project}:task:${task}`],
         });
         record.route = id ? "a decision: the planner's attempts are spent" : "attempts spent; the decision was not delivered (no Decision Inbox)";
@@ -890,10 +914,17 @@ export class PlannerService {
         title: `${failures} planner runs in a row failed: planner runs are paused`,
         context: [`The last one: ${run.detail}`, "", "The rules (done, plan done) keep running; only planner runs are paused."].join("\n"),
         options: [
-          { id: "retry", label: "Resume planner runs", consequences: "The failure count starts from zero and the next trigger starts a run." },
-          { id: "pause", label: "Keep them paused", consequences: "No planner run starts until you resume it in the Planner view." },
+          { id: "retry", label: "Resume planner runs", consequences: "The failure count starts from zero and the next trigger starts a run.", effect: "reversible" },
+          { id: "pause", label: "Keep them paused", consequences: "No planner run starts until you resume it in the Planner view.", effect: "reversible" },
         ],
         recommended: { optionId: "pause", reasoning: "Check the planner agent's last run (Agents view) and its prompt first." },
+        class: "planner.failing",
+        evidence: {
+          code: "runs_failed",
+          facts: { run: run.id, failures },
+          cause_cleared: false,
+          linked_issue: null,
+        },
       });
     }
   }
@@ -1356,14 +1387,22 @@ export class PlannerService {
     });
 
     // Build options (M1: add follow_verifier when there are mixed verdicts)
-    const options: { id: string; label: string; consequences: string }[] = [
-      { id: "approve_all", label: "Apply them all", consequences: "Lair checks each against the tasks file as it is now and applies those that still pass." },
-      { id: "reject_all", label: "Reject them all", consequences: "Nothing changes; the next planner run sees the same state." },
+    // A drop or a reword is not undone by the owner (rewording a done task reopens it), so applying one is irreversible
+    const rewrites = (p: StoredProposal): boolean => p.op === "drop" || p.op === "reword";
+    const options: { id: string; label: string; consequences: string; effect: DecisionEffect }[] = [
+      {
+        id: "approve_all",
+        label: "Apply them all",
+        consequences: "Lair checks each against the tasks file as it is now and applies those that still pass.",
+        effect: pending.some(rewrites) ? "irreversible" : "reversible",
+      },
+      { id: "reject_all", label: "Reject them all", consequences: "Nothing changes; the next planner run sees the same state.", effect: "reversible" },
     ];
 
     if (hasVerifier && hasMixedVerdicts) {
       options.push({
         id: "follow_verifier",
+        effect: pending.some((p) => p.verifierVerdict === "approve" && rewrites(p)) ? "irreversible" : "reversible",
         label: "Follow the verifier",
         consequences: "Apply the ones the verifier approved; reject the rest (rejected and unsure).",
       });
@@ -1415,6 +1454,20 @@ export class PlannerService {
       ].join("\n"),
       options,
       recommended,
+      class: "planner.proposal",
+      evidence: {
+        code: !hasVerifier || isNotVerified ? "verifier_missing" : anyReject ? "verifier_rejected" : "verifier_passed",
+        facts: {
+          run: run.id,
+          proposals: pending.length,
+          has_drop: hasDrop,
+          verifier_state: run.verifierState ?? null,
+          rejected: pending.filter((p) => p.verifierVerdict === "reject").length,
+          approved: pending.filter((p) => p.verifierVerdict === "approve").length,
+        },
+        cause_cleared: false,
+        linked_issue: null,
+      },
     });
   }
 

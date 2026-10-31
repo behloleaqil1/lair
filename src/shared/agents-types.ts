@@ -47,7 +47,7 @@ export type AgentState =
 /** new: the first session; resume: the same session again; fresh: a new session, the old one moved aside */
 export type SessionMode = "new" | "resume" | "fresh";
 
-export type StopReason = "hung" | "failover" | "lost_claim" | "fresh_session";
+export type StopReason = "hung" | "failover" | "lost_claim" | "fresh_session" | "server_shutdown";
 
 /** What started a run's chain, when not the owner or another module: "fill" (agents.fill) */
 export type RunOrigin = "fill";
@@ -142,6 +142,7 @@ export type AgentEventKind =
   | "fill_started"
   | "fill_held"
   | "fill_done"
+  | "fill_conflict"
   | "fill_released"
   | "fill_paused"
   | "fill_waiting"
@@ -153,7 +154,10 @@ export type AgentEventKind =
   | "fill_gate_gone"
   | "fill_idle_notice"
   | "transient"
-  | "transient_cleared";
+  | "transient_cleared"
+  | "run_adopted"
+  | "run_lost"
+  | "stopped_for_shutdown";
 
 /** Recovery and audit record: what happened, why, and the evidence. */
 export interface AgentEventView {
@@ -299,8 +303,11 @@ export type FillLineState = "started" | "done" | "held" | "claimed" | "not_allow
  *   while the gate it waits on was still in the gate queue doesn't count), or longer than
  *   fill.wake.max_queue_wait_minutes in all
  * - blocked: its last run ended on a BLOCKED line: it needs someone else first
- * - busy, read_only, max_active, capacity, prompt (a refused prompt file), refused (the run request,
- *   or done_pattern)
+ * - busy, read_only, max_active, capacity, capacity_load (load too high for local agent),
+ *   capacity_memory (memory pressure/low), capacity_heavy (heavy work limit), prompt (a refused
+ *   prompt file), refused (the run request, or done_pattern)
+ * - conflict: a live process this server has no run for holds one of the task's run prompt files on its
+ *   command line (a run of the task it doesn't know): fill starts the task once that process has ended
  * - paused: you chose to leave it ("Keep it paused" on its decision, or "Leave the task unclaimed" on
  *   its run's escalation): nothing waits for you, and fill starts it again once you release it
  * owner, no_done, blocked, waiting, waited_too_long and paused are the owner's to release (POST
@@ -320,6 +327,11 @@ export type FillHold =
   | "read_only"
   | "max_active"
   | "capacity"
+  | "capacity_load"
+  | "capacity_memory"
+  | "capacity_heavy"
+  | "capacity_probe"
+  | "conflict"
   | "prompt"
   | "refused";
 
@@ -385,6 +397,8 @@ export interface FillStatusView {
   lines: FillLineView[];
   /** Idle states for agents in the allowlist (fill.agents) */
   idle?: IdleStateView[];
+  /** Current capacity state (native capacity checks) */
+  capacity?: FillCapacityView;
 }
 
 /** Why an agent is idle: one of these, never unexplained. */
@@ -413,6 +427,46 @@ export interface IdleStateView {
   durationSeconds: number;
   /** Human-readable explanation */
   explanation: string;
+}
+
+/** Current capacity state from native checks */
+export interface FillCapacityView {
+  /** Current system load (1-minute average) */
+  load?: number;
+  /** Number of CPUs */
+  cpus?: number;
+  /** Load per CPU */
+  loadPerCpu?: number;
+  /** Configured load_per_cpu_max */
+  loadPerCpuMax?: number;
+  /** Whether load is over the limit */
+  loadOverLimit: boolean;
+  /** Current memory state */
+  memory?: {
+    /** Total memory in bytes */
+    total: number;
+    /** Available memory in bytes */
+    available: number;
+    /** Available as percentage of total */
+    availablePct: number;
+    /** Whether memory is under the minimum */
+    underMin: boolean;
+    /** Configured available_min_pct */
+    availableMinPct?: number;
+    /** Memory pressure in percent, when pressure_max is set */
+    pressurePct?: number;
+    /** Configured pressure_max */
+    pressureMax?: number;
+  };
+  /** Heavy work state */
+  heavyWork?: {
+    /** Number of currently active heavy work items */
+    active: number;
+    /** Configured max_active */
+    maxActive: number;
+    /** Whether heavy work is at the limit */
+    atLimit: boolean;
+  };
 }
 
 /**

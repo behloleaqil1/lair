@@ -6,7 +6,8 @@ import { describe, expect, it } from "vitest";
 import type { MachineStatus } from "../shared/types";
 import type { PlacementStatus } from "../shared/placement-types";
 import type { Node } from "../shared/server-types";
-import { machineCounts, machineDetail, machineRows, nodeRows } from "./machines-view";
+import type { CloudMachineStatus, CloudStatus } from "../shared/cloud-types";
+import { cloudBudget, machineCounts, machineDetail, machineRows, nodeRows } from "./machines-view";
 
 const statuses: MachineStatus[] = [
   { name: "mac", type: "local", up: true, lastCheck: "2026-10-27T11:59:00Z", runners: [{ lane: "heavy", running: true }, { lane: "light", running: false }] },
@@ -72,5 +73,68 @@ describe("machines", () => {
       jobs: 1,
       runtime: "docker",
     });
+  });
+
+  it("lists cloud machines with their power state, once, and the money guard in a line", () => {
+    const machine = (id: string, state: CloudMachineStatus["state"], lastError: string | null = null): CloudMachineStatus => ({
+      id,
+      provider: "aws-ec2",
+      region: "us-east-1",
+      instanceId: "i-0123456789abcdef0",
+      tag: "role=gate-server",
+      state,
+      launchedAt: null,
+      stoppedAt: null,
+      lastCheckAt: "2026-10-27T12:00:00Z",
+      lastError,
+      pricePerHour: 0.5,
+      storagePerMonth: 6,
+    });
+    const cloud = {
+      project: "shop",
+      enabled: true,
+      errors: [],
+      checkSeconds: 300,
+      lastCheck: "2026-10-27T12:00:00Z",
+      lastError: null,
+      // "remote" is placement's machine too: one row
+      machines: [machine("remote", "running"), machine("cloud-2", "stopped"), machine("cloud-3", "unknown", "describe: timeout")],
+      budget: {
+        limit: 100,
+        currency: "USD",
+        period: { start: "2026-01-01", end: "2026-12-31" },
+        warnPercent: 80,
+        spend: 84.5,
+        percent: 84.5,
+        meter: null,
+        meterError: null,
+        provider: [],
+        guard: { state: "warning", allowed: true, reason: "spend $84.50 of $100.00 (provider $80.00, meter $84.50)", trip: null, checkedAt: null },
+      },
+    } satisfies CloudStatus;
+    const before = machineRows(statuses, placement);
+    const rows = machineRows(statuses, placement, cloud);
+    expect(rows.map((r) => [r.id, r.type, r.badge])).toEqual([
+      ["mac", "local", "badge-success"],
+      ["dell", "ssh", "badge-error"],
+      ["remote", "probed, aws-ec2", "badge-error"],
+      ["cloud-2", "aws-ec2", "badge-neutral"],
+      ["cloud-3", "aws-ec2", "badge-error"],
+    ]);
+    // A machine placement probes keeps its probe state; the provider's is in its detail
+    expect(rows.slice(0, 3).map((r) => r.state)).toEqual(before.map((r) => r.state));
+    expect(rows[2].cloud?.state).toBe("running");
+    expect(rows.slice(3).map((r) => r.state)).toEqual(["stopped", "unknown: describe: timeout"]);
+    expect(cloudBudget(cloud)).toEqual({
+      text: "Cloud spend $84.50 of $100.00 (84.5%) · guard warning",
+      badge: "badge-warning",
+      reason: "spend $84.50 of $100.00 (provider $80.00, meter $84.50)",
+    });
+    const tripped = { ...cloud, budget: { ...cloud.budget, spend: null, percent: null, guard: { ...cloud.budget.guard, state: "refused" as const } } };
+    expect(cloudBudget(tripped)?.text).toBe("Cloud spend unknown of $100.00 · guard refused");
+    expect(cloudBudget(tripped)?.badge).toBe("badge-error");
+    // Off: no rows, no line
+    expect(machineRows(statuses, null, { ...cloud, enabled: false }).map((r) => r.id)).toEqual(["mac", "dell"]);
+    expect(cloudBudget({ ...cloud, enabled: false })).toBeNull();
   });
 });

@@ -14,6 +14,7 @@
 import { createHash } from "crypto";
 import type { EventBus } from "../core/event-bus.js";
 import type { Tier } from "../../shared/review-types.js";
+import type { DecisionEffect, DecisionStructure } from "../../shared/decision-types.js";
 import type { AgentRunState, AgentRunView, AgentsStatusView } from "../../shared/agents-types.js";
 import type { DecisionProducer } from "../decisions/types.js";
 import { toDecisionInput } from "../decisions/request-bridge.js";
@@ -42,6 +43,8 @@ export interface DecisionRequest {
   links: { label: string; url: string }[];
   /** Stable key: while a decision with it is open, the same request is not raised again */
   key?: string;
+  /** Policy class and evidence (docs/design/decision-policies.md §4), with the effect of each option in order */
+  structure?: DecisionStructure & { effects: DecisionEffect[] };
 }
 
 export interface DecisionSink {
@@ -152,6 +155,7 @@ export function inboxDecisionSink(inbox: Pick<DecisionProducer, "raise" | "find"
         reversible: request.reversible,
         onTimeout: "wait",
         requestedBy: request.requestedBy,
+        ...(request.structure ? { structure: request.structure } : {}),
       });
       const { decision } = await inbox.raise({ ...input, links: request.links.slice(0, 20) });
       return { id: decision.id, channel: `decision inbox (${decision.id})` };

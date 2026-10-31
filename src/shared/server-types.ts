@@ -208,6 +208,7 @@ export type EventType =
   | "decision.answered"
   | "decision.expired"
   | "decision.withdrawn"
+  | "decision.structure_refused"
   // Watchdog (src/server/watchdog/)
   | "slo.breached"
   | "slo.recovered"
@@ -277,6 +278,16 @@ export type EventType =
   | "placement.machine_up"
   | "placement.machine_down"
   | "placement.job_held"
+  | "placement.machine_stopped_under_job"
+  // Cloud machines (src/server/cloud/): {project, limit, spend, reason}
+  | "cloud.guard_tripped"
+  // The owner cleared the trip: {project, trippedAt, limit, spend, by (owner session id), note}
+  | "cloud.trip_cleared"
+  // OpenTofu runner (src/server/tofu-runner/): {project, env, root, planId, outcome, reason, by (owner session id)}
+  | "tofu.plan"
+  | "tofu.apply.refused"
+  | "tofu.apply.started"
+  | "tofu.apply.finished"
   // Planner (src/server/planner/)
   | "planner.changed"
   | "planner.run_started"
