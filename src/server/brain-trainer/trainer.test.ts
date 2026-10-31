@@ -188,6 +188,53 @@ describe("a training run", () => {
     expect(vetoed.classifier?.overall).toMatchObject({ correct: 0, abstain: 6, errors: 6 });
   });
 
+  it("an outcome recorded at or after the cutoff is future knowledge: no veto, and the answer stays a label", async () => {
+    const h = setup();
+    const same = (i: number) => ({ evidence: { title_class: "planner_change", marker: i === 0 ? 0 : 1 }, ...(i === 0 ? { outcome: "bad" } : {}) });
+    const run = async (outcomeAtDay: number) => {
+      const { examples, unusable } = fromCases(caseLines(30, same));
+      // Case 0 was answered long ago and judged bad on `outcomeAtDay`; the cutoff of this run is day 24
+      return runTraining({
+        settings: settings(),
+        loadExamples: () => ({
+          examples: examples.map((e) => (e.id === "case-0" ? { ...e, outcomeAt: new Date(START + outcomeAtDay * DAY).toISOString() } : e)),
+          unusable,
+        }),
+        store: new ModelStore(join(tempDir(), "b")),
+        container: h.container,
+        workRoot: h.work,
+        now: h.now,
+      });
+    };
+    const known = await run(10);
+    expect(known.labels).toMatchObject({ used: 29, negative: 1 });
+    expect(h.container.inputs.at(-1)?.rows.map((r) => r.features["ev.marker"])).not.toContain(0);
+    const late = await run(25);
+    expect(late.labels).toMatchObject({ used: 30, negative: 0 });
+    expect(h.container.inputs.at(-1)?.rows.map((r) => r.features["ev.marker"])).toContain(0);
+    // The control: the same decisions with no bad outcome at all score the same as the late one
+    const control = await runTraining({
+      settings: settings(),
+      loadExamples: () => fromCases(caseLines(30, (i) => ({ evidence: same(i).evidence }))),
+      store: new ModelStore(join(tempDir(), "b")),
+      container: h.container,
+      workRoot: h.work,
+      now: h.now,
+    });
+    expect(late.classifier?.overall).toEqual(control.classifier?.overall);
+  });
+
+  it("an answer the tracker could not judge is not a label; one with no verdict still is", () => {
+    const base = { id: "i", at: new Date(START).toISOString(), classKey: "c", kind: "other", module: "m", evidence: {}, options: [], label: "a" };
+    const sets = splitLabels([
+      { ...base, id: "none", outcome: "unknown" },
+      { ...base, id: "tried", outcome: "inconclusive" },
+      { ...base, id: "ok", outcome: "good" },
+    ]);
+    expect(sets.positive.map((e) => e.id)).toEqual(["none", "ok"]);
+    expect(sets.pending.map((e) => e.id)).toEqual(["tried"]);
+  });
+
   it("with too few labels only reports: no container, no model, a run on record", async () => {
     const h = setup();
     const report = await runTraining({
