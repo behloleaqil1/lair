@@ -399,17 +399,12 @@ export class TrackerService {
   }
 
   /** Find an issue by our marker in its body. */
-  private async findIssueByMarker(marker: string): Promise<{ number: number; url: string } | null> {
+  private async findIssueByMarker(_marker: string): Promise<{ number: number; url: string } | null> {
     // Search for issues containing our marker
     // Note: GitHub search is eventually consistent, but the marker search is more specific
-    try {
-      const query = encodeURIComponent(`repo:${this.settings.repo} is:issue "${marker.replace(/"/g, '\\"')}"`);
-      // This would need to be added to the client - for now return null
-      // In a full implementation, we'd search and verify the marker in the body
-      return null;
-    } catch {
-      return null;
-    }
+    // In a full implementation, we'd search for issues containing the marker and verify
+    // For now, we rely on title-based adoption; the marker is for restart recovery only
+    return null;
   }
 
   private async createLink(task: string, issueNumber: number, issueUrl: string): Promise<TrackerLink> {
