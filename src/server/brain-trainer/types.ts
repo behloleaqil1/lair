@@ -5,7 +5,11 @@
  */
 import type { BenchOption } from "../brain-bench/types.js";
 
-export type Outcome = "good" | "bad" | "pending" | "unknown";
+/**
+ * unknown: no verdict is recorded (the tracker is off, or has not judged it): a label as before.
+ * inconclusive: the outcome tracker judged it and could not tell: not a label.
+ */
+export type Outcome = "good" | "bad" | "pending" | "unknown" | "inconclusive";
 
 /** One answered decision, reduced to structured fields. No title, context or note. */
 export interface Example {
@@ -25,6 +29,8 @@ export interface Example {
   /** ISO-8601: when it was answered, if known (a case file has no such time) */
   answeredAt?: string;
   outcome: Outcome;
+  /** ISO-8601: when the outcome tracker recorded the outcome. A run whose cutoff is not after it did not know it. */
+  outcomeAt?: string;
 }
 
 /** A numeric feature vector as sparse name -> value. Absent means 0. */
