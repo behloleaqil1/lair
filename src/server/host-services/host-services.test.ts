@@ -20,17 +20,14 @@ import { parseHostServicesConfig } from "./config.js";
 import {
   HostServices,
   HostServicesManager,
-  type HostServicesOptions,
   type ProjectEntry,
 } from "./service.js";
 import { HostServicesStore } from "./store.js";
 import type { CommandOutput, CommandRunner, Clock, HostServicesProbes, RunOptions } from "./probes.js";
-import type { HostServicesSettings, LaneHold, ServiceStatus } from "./types.js";
 
 // ============ BOUNDARY FAKES ============
 
 const NOW = Date.parse("2026-03-02T12:00:00.000Z");
-const SEC = 1_000;
 
 class FakeClock implements Clock {
   t = NOW;

@@ -3,7 +3,6 @@
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { HostServicesManager, HostServicesProjectStatus } from "./service.js";
-import type { LaneHold, ServiceStatus } from "./types.js";
 import { assertValidProject } from "../config.js";
 
 interface RouteParams {

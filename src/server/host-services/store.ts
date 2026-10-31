@@ -4,7 +4,7 @@
  * The store tracks each service's state, probe results, start attempts, and
  * decisions raised. State is keyed by "machine:service".
  */
-import type { ProbeResult, ServiceState, StoredServiceState, ServiceStatus, ServiceConfig } from "./types.js";
+import type { ProbeResult, StoredServiceState, ServiceStatus, ServiceConfig } from "./types.js";
 
 function key(machine: string, name: string): string {
   return `${machine}:${name}`;

@@ -90,7 +90,7 @@ export class HostServices {
    * An answer to one of this module's decisions. For host-services, answers
    * are mostly informational (the human acknowledged or fixed the problem).
    */
-  async followAnswer(resolution: DecisionResolution): Promise<void> {
+  async followAnswer(_resolution: DecisionResolution): Promise<void> {
     // The service recovers on its own via probes; answers just acknowledge
     // For now, we don't need to do anything special with the answer
   }
