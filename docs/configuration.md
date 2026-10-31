@@ -2815,6 +2815,46 @@ The model is asked for `{"option", "reason_code", "confidence"}` with `option` l
 
 `--json` prints the report as JSON. Exit code 0 means the bench ran; 2 means bad input and nothing ran. Cases are asked one at a time per model.
 
+## Decision policies
+
+[decision-policies.md](design/decision-policies.md) §3 and §5, rollout step 2: a **policy table** says which option a rule would choose for a class of decision, and Lair writes that proposal into a **policy trace** when the decision is raised. **Nothing answers a decision**: every policy is `shadow` (or `off`), a proposal is never shown with the decision, and the table's only effect is the agreement view for you. `suggest` and `act` do not exist yet; a file that asks for them is refused.
+
+It is off until `data/server.yaml` says otherwise (read once at start, so a change needs a restart):
+
+```yaml
+decision_policies:
+  enabled: true
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Off: nothing is proposed or written to the trace (not at start either), no module updates a raised decision's evidence (`cause_cleared`), and `GET /api/owner/decision-policies` shows the table and `enabled: false` with no agreement. A section with any other key or a value of another type is refused: the policies stay off and the reason is logged and shown in the view |
+
+Without `data/policies.yaml` Lair uses a built-in table with rules C1 (`agents.provider_limit` → `wait` while its cause stands), C2 (`supervisor.check_failing` → `noted` when an issue tracks the check), C3 (`watchdog.idle_capacity` → `stand_down` after two playbook attempts, never with nothing running), C4 (`watchdog.orphan_claim` → `stand_down` while a runner is alive) and C11 (`agents.cannot_start` → `keep_held` while the task's run is below its third attempt; from the third on, or without an attempt count, it abstains). To change it, write the file and restart (it is read once at start):
+
+```yaml
+version: 1
+policies:
+  - id: c1-wait                  # unique; lowercase letters, digits, '_' and '-'
+    class: agents.provider_limit # a class of the policy table (src/server/decisions/structure.ts)
+    codes: [provider_rate_limit] # evidence codes it covers; empty: every code of the class
+    answer: wait                 # the option it proposes: must be offered, and not irreversible or outward
+    reason_code: provider_limit_clears
+    state: shadow                # off | shadow
+    max_tier: 1                  # 1 rules, 2 may also be a model's, 3 stays with you (never proposed)
+    when:                        # every condition must hold
+      - { fact: attempts, op: gte, value: 2 }
+    unless:                      # any guard that holds, or cannot be evaluated, makes the rule abstain
+      - { fact: cause_cleared, op: eq, value: true }
+    expires: 2027-01-01T00:00:00Z   # optional; past it the rule abstains
+```
+
+A condition tests a key of the decision's `evidence.facts`, or `cause_cleared` / `linked_issue`. Operators: `eq`, `ne`, `gt`, `gte`, `lt`, `lte` (numbers), `in` (a list), `present` (not null). A fact that is missing, null or of another type than the value never satisfies a condition. Validation fails closed: an entry with any problem (unknown class, a code the class does not take, a bad operator, a repeated id) is refused and listed in the view, the others load; a file that is not valid YAML, is larger than 256 KB or has the wrong shape gives no policies. Whatever the table says, a rule abstains for a decision of a kind that always waits for you (spend, pricing, legal, account, credentials, go/no-go, security), for an option that is `irreversible`, `outward` or has no effect, and for a decision without a class and evidence.
+
+**The trace** is the `policy_trace` table in `data/decisions.db`: one row per decision, proposer and table version (the version is a hash of the table, so any change starts a new comparison): class, policy, proposed option (empty when it abstained), reason code, confidence, time. A repeated event or a restart writes no second row; open decisions raised while Lair was down (or while the policies were off) get theirs at the next start, all of them, a page at a time in the background. A proposal is written once, when the decision is raised (or at that catch-up): a later `cause_cleared` update does not make a new one. **Agreement** joins the trace to the answers people gave (counted in the database, so the view never reads the whole trace): per class and version, `compared` (answered), `agreed`, `disagreed`, `abstained`, `agreement` (agreed of agreed + disagreed), `coverage` (proposed of compared), `unsafeDisagreements` (a disagreement where the proposal was an `irreversible` or `outward` option), and the decisions still open or withdrawn. It is `GET /api/owner/decision-policies` (owner only) and the **Policy agreement** card on the Decisions page when you are signed in as the owner.
+
+**`cause_cleared` and `linked_issue`** are set when a module raises a decision. A module that learns more later calls `updateEvidence` on the Decision Inbox (`DecisionProducer.updateEvidence`): only the module that raised an open decision, only those two facts, audited as `evidence_updated`, and the same value again changes nothing. While `decision_policies.enabled` is on, the agents module does it for a provider-limit decision when the reset time it named has passed; while it is off, no decision's evidence changes after it was raised. No module tracks an issue yet, so `linked_issue` stays empty and C2 abstains; the planner's C7 stays out of the table until its module re-evaluates `cause_cleared`.
+
 ## Brain trainer
 
 The brain trainer starts the training that [decision-policies.md](design/decision-policies.md) §6 calls stage C, and keeps it going: every night it rebuilds the labelled set from the answered decisions, trains a small classifier, scores it on the [brain bench](#brain-bench) against the newest decisions, and keeps the result as a new version. The model that scores best then writes a **proposal into a trace** for each decision raised afterwards. **No model ever answers a decision**: the trainer is handed a read-only view of the Decision Inbox, nothing it produces is shown with a decision, and promoting a model past `shadow` is the owner's decision under the bars in §5 (30 comparisons, 90% agreement for a model, no unsafe disagreement, coverage 60%). It is off until `data/server.yaml` says otherwise.
