@@ -17,7 +17,8 @@
 #   2 - Malformed input or missing files
 #   3 - Internal error
 
-set -euo pipefail
+# Don't use set -e as we need to handle errors explicitly
+set -uo pipefail
 
 # Color output (disabled if not a terminal)
 if [[ -t 1 ]]; then
@@ -68,11 +69,11 @@ MALFORMED=()
 while IFS= read -r line; do
   # Skip empty lines and lines that don't match
   [[ "$line" =~ ^revert-check:[[:space:]]* ]] || continue
-  
+
   # Extract the content after "revert-check:"
   content="${line#revert-check:}"
   content="${content#"${content%%[![:space:]]*}"}"  # trim leading whitespace
-  
+
   # Parse: <test> guards <source>[:range]
   if [[ "$content" =~ ^([^[:space:]]+)[[:space:]]+guards[[:space:]]+([^[:space:]]+)$ ]]; then
     test_spec="${BASH_REMATCH[1]}"
@@ -120,9 +121,9 @@ trap cleanup EXIT
 # Process each check
 for check in "${CHECKS[@]}"; do
   IFS='|' read -r test_spec source_spec <<< "$check"
-  
+
   log_info "=== Checking: $test_spec guards $source_spec ==="
-  
+
   # Parse source spec (file:range or just file)
   if [[ "$source_spec" =~ ^([^:]+):(.+)$ ]]; then
     source_file="${BASH_REMATCH[1]}"
@@ -131,14 +132,14 @@ for check in "${CHECKS[@]}"; do
     source_file="$source_spec"
     line_range=""
   fi
-  
+
   # Validate source file exists in current tree
   if [[ ! -f "$source_file" ]]; then
     log_error "Source file not found: $source_file"
-    ((ERRORS++))
+    ERRORS=$((ERRORS + 1))
     continue
   fi
-  
+
   # Validate test spec (file path or test name pattern)
   # For vitest, test spec can be a file path or a pattern
   test_file=""
@@ -146,57 +147,52 @@ for check in "${CHECKS[@]}"; do
     test_file="$test_spec"
     if [[ ! -f "$test_file" ]]; then
       log_error "Test file not found: $test_file"
-      ((ERRORS++))
+      ERRORS=$((ERRORS + 1))
       continue
     fi
   fi
-  
+
   # Revert the source file (or specific lines) to base version
   if [[ -z "$line_range" ]]; then
     # Revert entire file to base
-    if ! git show "$BASE_REF:$source_file" > "$source_file" 2>/dev/null; then
+    if git show "$BASE_REF:$source_file" > "$source_file" 2>/dev/null; then
+      log_info "  Reverted entire file to base"
+    else
       # File may not exist in base - that's OK for new files
       # Treat as: remove the file entirely
       rm -f "$source_file"
       log_info "  (file did not exist in base, removed)"
-    else
-      log_info "  Reverted entire file to base"
     fi
   else
     # Revert specific line range
-    # Parse range: N, N-M, or N,M,O
     log_info "  Reverting lines $line_range to base"
-    
+
     # Get the base version of the file
-    base_content=$(git show "$BASE_REF:$source_file" 2>/dev/null || echo "")
+    base_content=""
+    if git show "$BASE_REF:$source_file" > /dev/null 2>&1; then
+      base_content=$(git show "$BASE_REF:$source_file" 2>/dev/null)
+    fi
     current_content=$(cat "$source_file")
-    
+
     if [[ -z "$base_content" ]]; then
       # File didn't exist in base, can't do line-level revert
       log_error "Cannot revert lines - file did not exist in base: $source_file"
-      ((ERRORS++))
-      # Restore the file
-      echo "$current_content" > "$source_file"
+      ERRORS=$((ERRORS + 1))
       continue
     fi
-    
-    # For line-level revert, we use a simple approach:
-    # Replace the specified lines with those from base
-    # This handles single line (N), range (N-M), or comma-separated (N,M,O)
-    
+
     # Save base and current to temp files for processing
     tmp_base=$(mktemp)
     tmp_current=$(mktemp)
     echo "$base_content" > "$tmp_base"
     echo "$current_content" > "$tmp_current"
-    
+
     # Process the line range
-    result_content=""
     if [[ "$line_range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
       # Range: N-M
       start_line="${BASH_REMATCH[1]}"
       end_line="${BASH_REMATCH[2]}"
-      
+
       # Extract lines before, the base lines, and lines after
       head -n "$((start_line - 1))" "$tmp_current" > "${tmp_current}.new"
       sed -n "${start_line},${end_line}p" "$tmp_base" >> "${tmp_current}.new"
@@ -212,16 +208,16 @@ for check in "${CHECKS[@]}"; do
     else
       log_error "Unsupported line range format: $line_range (use N, N-M)"
       rm -f "$tmp_base" "$tmp_current"
-      ((ERRORS++))
+      ERRORS=$((ERRORS + 1))
       continue
     fi
-    
+
     rm -f "$tmp_base" "$tmp_current"
   fi
-  
+
   # Run the test (expecting it to FAIL)
   log_info "  Running test: $test_spec (expecting FAIL)"
-  
+
   # Build the npm test command
   # For vitest, we can pass a filter pattern
   if [[ -n "$test_file" ]]; then
@@ -230,29 +226,33 @@ for check in "${CHECKS[@]}"; do
     # Use as a pattern/filter
     test_cmd="npm test -- --reporter=basic -t '$test_spec'"
   fi
-  
-  # Run with timeout
+
+  # Run with timeout (use 'timeout' command if available, else just run)
   test_rc=0
-  if ! timeout "$TIMEOUT_PER_CHECK" bash -c "$test_cmd" >/dev/null 2>&1; then
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$TIMEOUT_PER_CHECK" bash -c "$test_cmd" >/dev/null 2>&1
+    test_rc=$?
+  else
+    bash -c "$test_cmd" >/dev/null 2>&1
     test_rc=$?
   fi
-  
+
   # Check result: we WANT the test to fail (rc != 0)
   if [[ $test_rc -eq 0 ]]; then
     log_error "  REVERT-CHECK FAILED: Test still passes when guarded code is reverted!"
     log_error "  This test does not actually guard the change it claims to guard."
-    ((FAILED++))
+    FAILED=$((FAILED + 1))
   elif [[ $test_rc -eq 124 ]]; then
     log_error "  Test timed out after ${TIMEOUT_PER_CHECK}s"
-    ((ERRORS++))
+    ERRORS=$((ERRORS + 1))
   else
     log_ok "  PASSED: Test fails when guarded code is reverted (exit code: $test_rc)"
-    ((PASSED++))
+    PASSED=$((PASSED + 1))
   fi
-  
+
   # Restore the source file for next check
   git checkout --quiet "$ORIGINAL_HEAD" -- "$source_file" 2>/dev/null || true
-  
+
   log_info ""
 done
 
