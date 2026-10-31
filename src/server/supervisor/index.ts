@@ -32,6 +32,10 @@ import { Supervisor, type Clock, type ProjectEntry } from "./service.js";
 import { SupervisorStore } from "./store.js";
 import { OpsTokens } from "./tokens.js";
 import type { CommandTimeoutLog } from "../core/command-timeouts.js";
+import { SupervisorAct } from "./act.js";
+import type { ActSettings } from "./act-config.js";
+import type { AgentsStore } from "../agents/store.js";
+import type { ActModules } from "./act-ops.js";
 
 export { Supervisor, SERVER_SCOPE } from "./service.js";
 export { RequestLatency, registerLatencyHook } from "./latency.js";
@@ -80,6 +84,24 @@ export interface MountSupervisorOptions {
   cli?: string;
   /** Lair's own supervisor prompt (default: prompts/supervisor.md) */
   defaultPromptPath?: string;
+
+  // M1: SupervisorAct wiring options
+  /** Act settings getter (from project config) */
+  actSettings?: (project: string) => ActSettings;
+  /** Agents store for act detection */
+  agentsStore?: () => AgentsStore | null;
+  /** Modules for act operations */
+  actModules?: (project: string) => ActModules;
+  /** Planner decisions for duplicate detection */
+  plannerDecisions?: (project: string) => Decision[];
+  /** Planner proposals getter */
+  plannerProposals?: (project: string, decisionId: string) => Array<{ op: string; agent: string; task: string; text?: string }>;
+  /** Gate status checker */
+  checkGate?: (gateId: string) => { exists: boolean; running: boolean } | null;
+  /** Raise a supervisor notice */
+  raiseNotice?: (project: string, title: string, context: string) => Promise<void>;
+  /** Act tick interval in ms (default: 60000 = 1 minute) */
+  actTickIntervalMs?: number;
 }
 
 /** The agents module's events after which a run is over: its tokens end at once (runActive is the backstop) */
@@ -90,6 +112,8 @@ export interface SupervisorModule {
   tokens: OpsTokens;
   store: SupervisorStore;
   chat: SupervisorChat;
+  /** M1: SupervisorAct wired into the server, with tick() called on schedule */
+  act?: SupervisorAct;
 }
 
 export async function mountSupervisor(fastify: FastifyInstance, options: MountSupervisorOptions): Promise<SupervisorModule> {
@@ -125,6 +149,40 @@ export async function mountSupervisor(fastify: FastifyInstance, options: MountSu
   // A question still waiting from before a restart can't be answered: its token was in the old process's memory
   await chat.recover();
 
+  // M1: Wire SupervisorAct for each project when act options are provided
+  let supervisorAct: SupervisorAct | undefined;
+  let actTickInterval: ReturnType<typeof setInterval> | undefined;
+
+  if (options.actSettings && options.actModules) {
+    const defaultProject = options.defaultProject();
+    supervisorAct = new SupervisorAct({
+      project: defaultProject,
+      store,
+      settings: () => options.actSettings!(defaultProject),
+      modules: () => options.actModules!(defaultProject),
+      decisions: () => options.decisions ?? null,
+      agentsStore: options.agentsStore ?? (() => null),
+      plannerDecisions: options.plannerDecisions ? () => options.plannerDecisions!(defaultProject) : undefined,
+      plannerProposals: options.plannerProposals ? (id) => options.plannerProposals!(defaultProject, id) : undefined,
+      checkGate: options.checkGate,
+      raiseNotice: options.raiseNotice
+        ? (title, context) => options.raiseNotice!(defaultProject, title, context)
+        : undefined,
+      clock: () => clock.now(),
+    });
+
+    // M1: Schedule tick() to run periodically (off the request path)
+    const tickIntervalMs = options.actTickIntervalMs ?? 60_000; // Default: 1 minute
+    actTickInterval = setInterval(async () => {
+      try {
+        await supervisorAct!.tick();
+      } catch (e) {
+        // Log error but don't crash
+        console.error("[supervisor.act] tick error:", e);
+      }
+    }, tickIntervalMs);
+  }
+
   await registerSupervisorRoutes(fastify, {
     supervisor,
     tokens,
@@ -143,6 +201,8 @@ export async function mountSupervisor(fastify: FastifyInstance, options: MountSu
         return supervisor.diagnostics(project);
       },
     },
+    // M1: Pass act service to routes for Health display
+    act: supervisorAct,
   });
 
   // A run's tokens end with the run: when the agents module says it ended, ended in a recovery, or failed over. A
@@ -160,10 +220,12 @@ export async function mountSupervisor(fastify: FastifyInstance, options: MountSu
 
   fastify.addHook("onClose", async () => {
     for (const off of unsubscribe) off?.();
+    // M1: Clear act tick interval on close
+    if (actTickInterval) clearInterval(actTickInterval);
     await chat.stop();
     await supervisor.stop();
     if (measures instanceof SystemMeasures) measures.dispose();
     store.close();
   });
-  return { supervisor, tokens, store, chat };
+  return { supervisor, tokens, store, chat, act: supervisorAct };
 }

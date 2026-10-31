@@ -22,8 +22,8 @@ import type {
   TurnState,
 } from "../../shared/supervisor-types.js";
 
-// 1: ops_audit; 2: conversations and turns (S1-2); 3: act_audit (S3)
-const SCHEMA_VERSION = 3;
+// 1: ops_audit; 2: conversations and turns (S1-2); 3: act_audit (S3); 4: act_cooldowns (M7)
+const SCHEMA_VERSION = 4;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS ops_audit (
@@ -52,6 +52,13 @@ const SCHEMA = `
   );
   CREATE INDEX IF NOT EXISTS idx_act_audit_at ON act_audit(at);
   CREATE INDEX IF NOT EXISTS idx_act_audit_project ON act_audit(project, at);
+  CREATE TABLE IF NOT EXISTS act_cooldowns (
+    project TEXT NOT NULL,
+    key TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (project, key)
+  );
+  CREATE INDEX IF NOT EXISTS idx_act_cooldowns_expires ON act_cooldowns(expires_at);
   CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     project TEXT NOT NULL,
@@ -505,6 +512,8 @@ export class SupervisorStore {
         entry.result,
         entry.detail?.slice(0, 1000) ?? null,
       );
+    // S3 fix: increment inserts so pruneActAudit runs correctly
+    this.inserts++;
     this.pruneActAudit(new Date(entry.at).getTime());
   }
 
@@ -516,9 +525,9 @@ export class SupervisorStore {
     return rows.map(toActEntry);
   }
 
-  /** Get counts of act audit entries for the UI */
-  getActCounts(project: string): { wouldAct: number; acted: number; failed: number } {
-    const hourAgo = Date.now() - 3600_000;
+  /** Get counts of act audit entries for the UI. S3 fix: takes a clock parameter for testability. */
+  getActCounts(project: string, now?: number): { wouldAct: number; acted: number; failed: number } {
+    const hourAgo = (now ?? Date.now()) - 3600_000;
     const rows = this.db
       .prepare(
         `SELECT mode, result, COUNT(*) as count FROM act_audit
@@ -544,6 +553,33 @@ export class SupervisorStore {
     this.db
       .prepare(`DELETE FROM act_audit WHERE rowid NOT IN (SELECT rowid FROM act_audit ORDER BY at DESC, rowid DESC LIMIT ?)`)
       .run(MAX_ROWS);
+    // M7: Also prune expired cooldowns
+    this.db.prepare(`DELETE FROM act_cooldowns WHERE expires_at < ?`).run(now);
+  }
+
+  // ============ ACT COOLDOWNS (M7) ============
+
+  /** Get all non-expired cooldowns for a project (M7: persist cooldowns across restart) */
+  getActCooldowns(project: string): Array<{ key: string; expiresAt: number }> {
+    const now = Date.now();
+    const rows = this.db
+      .prepare(`SELECT key, expires_at FROM act_cooldowns WHERE project = ? AND expires_at > ?`)
+      .all(project, now) as Array<{ key: string; expires_at: number }>;
+    return rows.map((r) => ({ key: r.key, expiresAt: r.expires_at }));
+  }
+
+  /** Set a cooldown for a key (M7: persist cooldowns) */
+  setActCooldown(project: string, key: string, expiresAt: number): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO act_cooldowns (project, key, expires_at) VALUES (?, ?, ?)`,
+      )
+      .run(project, key.slice(0, 500), expiresAt);
+  }
+
+  /** Clear a specific cooldown (for testing) */
+  clearActCooldown(project: string, key: string): void {
+    this.db.prepare(`DELETE FROM act_cooldowns WHERE project = ? AND key = ?`).run(project, key);
   }
 }
 

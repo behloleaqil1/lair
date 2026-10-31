@@ -1146,7 +1146,7 @@ supervisor:
     cooldown_minutes: 30     # never the same op on the same target twice inside this window
 ```
 
-The default is `mode: off` with an empty `allow`. In `observe` mode, Lair records what it would do without changing anything (Home → Health shows the counts). In `act` mode, ops in `allow` run by themselves; ops not in `allow` are recorded as would-act.
+The default is `mode: off` with an empty `allow`. In `observe` mode, Lair records what it would do without changing anything (Home → Health shows the counts). In `act` mode, ops in `allow` run by themselves; ops not in `allow` are refused and recorded as failed.
 
 Every would-act and act is audited in `data/supervisor.db`. A decision withdrawn by acting records the evidence: `resolved by supervisor (release_hold): matched infra pattern "docker" in: Cannot connect to Docker`.
 

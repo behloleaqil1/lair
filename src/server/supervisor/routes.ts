@@ -37,6 +37,7 @@ import { bounded, redactText } from "./redact.js";
 import type { Supervisor } from "./service.js";
 import type { SupervisorStore } from "./store.js";
 import { MAX_TTL_MS, type OpsToken, type OpsTokens } from "./tokens.js";
+import type { SupervisorAct } from "./act.js";
 
 export interface SupervisorRoutesOptions {
   supervisor: Supervisor;
@@ -52,6 +53,8 @@ export interface SupervisorRoutesOptions {
   clock?: () => number;
   /** A tool still running after this long answers 504 (default 20 s) */
   callTimeoutMs?: number;
+  /** M1: SupervisorAct for Health display */
+  act?: SupervisorAct;
 }
 
 /** What one call may return, as JSON */
@@ -107,7 +110,17 @@ export async function registerSupervisorRoutes(fastify: FastifyInstance, options
         const problem = projectNameError(project, options.projectsDir);
         if (problem) return refuse(reply, 400, problem);
       }
-      return reply.send(ok(supervisor.diagnostics(project || undefined)));
+      const diagnostics = supervisor.diagnostics(project || undefined);
+      // M1: Add act data to diagnostics if available
+      const act = options.act;
+      const actData = act
+        ? {
+            enabled: true,
+            counts: act.getCounts(),
+            recentActions: act.getAuditHistory(20),
+          }
+        : { enabled: false, counts: { wouldAct: 0, acted: 0, failed: 0 }, recentActions: [] };
+      return reply.send(ok({ ...diagnostics, act: actData }));
     });
 
     app.post("/api/supervisor/tokens", { bodyLimit: 4096 }, async (request, reply) => {

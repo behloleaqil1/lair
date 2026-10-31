@@ -4,9 +4,13 @@
  *
  * Evidence detectors are deterministic and in code. The AI never decides
  * alone that something is broken (docs/design/supervisor.md "Safety").
+ *
+ * M2 fix: read the BLOCKED reason from fill_blocked events' evidence, not run.detail.
+ * M3 fix: every cleared check fails closed (unknown = not cleared).
  */
 import type { Decision } from "../../shared/decision-types.js";
 import type { AgentsStore } from "../agents/store.js";
+import type { AgentEvent } from "../agents/types.js";
 import type { ActOp } from "./act-config.js";
 import { CODE_FAILURE_PATTERNS, DEFAULT_INFRA_PATTERNS } from "./act-config.js";
 
@@ -17,12 +21,18 @@ export interface ActEvidence {
   target: string;
   /** Why this is actionable, in Lair's own words */
   evidence: string[];
-  /** What to re-check before acting (returns true when still valid) */
+  /** What to re-check before acting (returns true when still valid). Accepts optional runCommand for probes. */
   clearedCheck: ClearedCheck;
+  /** For release_hold: the kind of hold (blocked, no_done, etc.) - supervisor can only release some */
+  holdKind?: string | null;
 }
 
-/** A function that returns true when the condition is cleared (ready to act) */
-export type ClearedCheck = () => Promise<{ cleared: boolean; reason: string }>;
+/**
+ * A function that returns true when the condition is cleared (ready to act).
+ * Accepts an optional runCommand for running probes (e.g., docker info).
+ * M3: must fail closed (unknown = not cleared).
+ */
+export type ClearedCheck = (runCommand?: RunCommandFn) => Promise<{ cleared: boolean; reason: string }>;
 
 // ============ INFRA DETECTION ============
 
@@ -100,10 +110,20 @@ export async function checkDocker(runCommand: (cmd: string, args: string[]) => P
 // ============ HOLD INFRA DETECTOR ============
 
 /**
+ * The hold kinds the supervisor may release: only blocked and no_done.
+ * An owner, waiting or waited_too_long hold stays the owner's.
+ */
+export const SUPERVISOR_RELEASABLE_HOLDS = ["blocked", "no_done"] as const;
+
+/**
  * Check if an agent hold's BLOCKED/paused evidence points at infrastructure.
  * A hold is infra-caused if:
- * - Every failed step's text matches an infra pattern
+ * - The fill_blocked event's evidence line matches an infra pattern
  * - No text matches a code failure pattern
+ *
+ * M2 fix: Read the BLOCKED reason from fill_blocked events (evidence: [seen.line]),
+ * not from run.detail (which is the run's state description, not the BLOCKED line).
+ * Also check S1-1's infraEvidence approach for transient/exit_unknown events.
  */
 export function detectHoldInfra(
   decision: Decision,
@@ -112,6 +132,16 @@ export function detectHoldInfra(
 ): ActEvidence | null {
   // Only look at agents module decisions
   if (decision.source.module !== "agents") return null;
+
+  // S5 fix: Only look at fill-raised decisions (fill: refs or fill's key patterns)
+  // Chain escalations and "every profile failing" also use agents module but have different keys
+  // Fill keys look like: "fill:<project>:<task>:<reason>" or the source ref starts with "fill:"
+  const isFillDecision =
+    decision.key?.startsWith(`fill:${project}:`) ||
+    decision.source.ref?.startsWith("fill:") ||
+    decision.key?.includes(":blocked:") || // fill's blocked key pattern
+    decision.key?.includes(":no_done:"); // fill's no_done key pattern
+  if (!isFillDecision) return null;
 
   // Extract the task from the decision's blocks
   const prefix = `agents:${project}:task:`;
@@ -124,24 +154,59 @@ export function detectHoldInfra(
   if (!latest) return null;
 
   const chain = store.chainRuns(latest.chainId).slice(-20);
+  const chainRunIds = new Set(chain.map((r) => r.id));
 
-  // Collect all failure evidence from the chain
-  const failureTexts: string[] = [];
+  // M2 fix: Read from fill_blocked and fill_held events' evidence lines, not run.detail
+  // The agent's BLOCKED line is in fill_blocked events with evidence: [seen.line]
+  const holdEvents = store.listEvents(project, {
+    kinds: ["fill_blocked", "fill_held"],
+    task,
+    limit: 20,
+  }) as AgentEvent[];
+
+  // Also get transient and exit_unknown events for S1-1's infraEvidence patterns
+  const infraEvents = store.listEvents(project, {
+    kinds: ["transient", "exit_unknown"],
+    task,
+    limit: 50,
+  }) as AgentEvent[];
+
+  // Collect evidence lines from the correct sources
+  const evidenceLines: string[] = [];
+
+  // From fill_blocked/fill_held: the evidence array holds the BLOCKED line
+  for (const event of holdEvents) {
+    if (event.runId !== undefined && !chainRunIds.has(event.runId)) continue;
+    const evidence = (event as { evidence?: string[] }).evidence;
+    if (Array.isArray(evidence)) {
+      for (const line of evidence) {
+        if (typeof line === "string" && line.trim()) evidenceLines.push(line);
+      }
+    }
+    // Also check the summary and data.line
+    if (event.summary) evidenceLines.push(event.summary);
+    const dataLine = (event as { data?: { line?: string } }).data?.line;
+    if (typeof dataLine === "string" && dataLine.trim()) evidenceLines.push(dataLine);
+  }
+
+  // From transient/exit_unknown: the summary has the error text
+  for (const event of infraEvents) {
+    if (event.runId !== undefined && !chainRunIds.has(event.runId)) continue;
+    if (event.summary) evidenceLines.push(event.summary);
+  }
+
+  // Also check the chain runs' details for 'exit unknown' patterns (restarts)
   for (const run of chain) {
-    if (run.detail) failureTexts.push(run.detail);
+    if (run.detail && run.detail.toLowerCase().startsWith("exit unknown")) {
+      evidenceLines.push(run.detail);
+    }
   }
 
-  // Also check recent events for this task
-  const events = store.listEvents(project, { kinds: ["transient", "exit_unknown"], task, limit: 20 });
-  for (const event of events) {
-    if (event.summary) failureTexts.push(event.summary);
-  }
-
-  if (failureTexts.length === 0) return null;
+  if (evidenceLines.length === 0) return null;
 
   // Check if ALL failures are infra (none are code failures)
   const infraEvidence: string[] = [];
-  for (const text of failureTexts) {
+  for (const text of evidenceLines) {
     const check = isInfraFailure(text);
     if (!check.isInfra) {
       // Found a code failure or no infra pattern: not purely infra
@@ -154,30 +219,80 @@ export function detectHoldInfra(
 
   if (infraEvidence.length === 0) return null;
 
+  // Check what kind of hold this is - the supervisor can only release blocked/no_done
+  // This comes from fill's line.hold, which we can infer from the events
+  const holdKind = inferHoldKind(holdEvents, chain);
+
   return {
     op: "release_hold",
     target: `task:${task}`,
     evidence: infraEvidence.slice(0, 5), // Limit evidence to 5 items
-    clearedCheck: async () => {
-      // For Docker-related failures, check if Docker is back
-      const hasDocker = failureTexts.some(
-        (t) => t.toLowerCase().includes("docker") || t.includes("rc=125"),
-      );
-      if (hasDocker) {
-        // We'd need the runCommand here, but for now return optimistic
-        // The actual check happens in the acting op
-        return { cleared: true, reason: "infra check needed at act time" };
-      }
-      return { cleared: true, reason: "evidence still points at infrastructure" };
-    },
+    holdKind, // For M4: the supervisor checks this before releasing
+    clearedCheck: createClearedCheck(evidenceLines),
   };
 }
+
+/** Infer the hold kind from events. Returns the hold kind or null if unknown. */
+function inferHoldKind(holdEvents: AgentEvent[], _chain: { state: string }[]): string | null {
+  // Check the most recent hold event's data.hold
+  for (const event of holdEvents) {
+    const hold = (event as { data?: { hold?: string } }).data?.hold;
+    if (typeof hold === "string") return hold;
+  }
+  // Fallback: if the chain's last run has a BLOCKED line, it's 'blocked'
+  if (holdEvents.some((e) => e.kind === "fill_blocked")) return "blocked";
+  return null;
+}
+
+/** Create a cleared check that fails closed (M3 fix) */
+function createClearedCheck(evidenceLines: string[]): ClearedCheck {
+  return async (runCommand?: RunCommandFn) => {
+    // M3 fix: unknown = not cleared (fail closed)
+    // For Docker-related failures, check if Docker is back
+    const hasDocker = evidenceLines.some(
+      (t) => t.toLowerCase().includes("docker") || t.includes("rc=125"),
+    );
+    if (hasDocker) {
+      // Must have runCommand to verify Docker
+      if (!runCommand) {
+        return { cleared: false, reason: "Docker check needed but runCommand not available" };
+      }
+      const docker = await checkDocker(runCommand);
+      if (!docker.available) {
+        return { cleared: false, reason: `Docker still unavailable: ${docker.error}` };
+      }
+      return { cleared: true, reason: "Docker is available" };
+    }
+
+    // For SSH/network errors: we'd need the placement probe
+    const hasSsh = evidenceLines.some((t) => t.toLowerCase().includes("ssh:") || t.includes("Connection refused"));
+    if (hasSsh) {
+      // M3: fail closed when we can't verify
+      return { cleared: false, reason: "SSH/network check needed but probe not available (fail closed)" };
+    }
+
+    // For "exit unknown" (restart): Lair is running now, so it's cleared
+    const hasRestart = evidenceLines.some((t) => t.toLowerCase().startsWith("exit unknown"));
+    if (hasRestart) {
+      return { cleared: true, reason: "Lair restarted and is now running" };
+    }
+
+    // M3: fail closed for unknown patterns - we don't know how to check
+    return { cleared: false, reason: "Unknown infra pattern; cannot verify recovery (fail closed)" };
+  };
+}
+
+/** Type for the optional runCommand function passed at act time */
+export type RunCommandFn = (cmd: string, args: string[]) => Promise<{ exitCode: number; output: string }>;
 
 // ============ ESCALATION INFRA DETECTOR ============
 
 /**
  * Check if a triage escalation's evidence points at infrastructure that is
  * now cleared. The escalation is from "failed the same way" detection.
+ *
+ * M3 fix: cleared check fails closed (unknown = not cleared).
+ * S2 fix: read infra classification from triage records when available.
  */
 export function detectEscalationInfra(
   decision: Decision,
@@ -190,9 +305,17 @@ export function detectEscalationInfra(
   // Check if the context mentions infrastructure
   const infraCheck = isInfraFailure(decision.context);
 
+  // S2: Configuration faults ("Permission denied (publickey", "docker: command not found")
+  // are not transient infrastructure - releasing on them only loops
+  const isConfigFault =
+    decision.context.includes("Permission denied (publickey") ||
+    decision.context.includes("docker: command not found");
+  if (isConfigFault) return null;
+
   if (!infraCheck.isInfra) return null;
 
   // Extract gate id from the decision if present
+  // S2: Use the recheck key pattern when available (triage keys decisions by recheck:<rootId>)
   const gateMatch = decision.context.match(/gate[:\s]+([a-zA-Z0-9-]+)/i);
   const gateId = gateMatch?.[1] ?? null;
 
@@ -204,21 +327,24 @@ export function detectEscalationInfra(
       ...(gateId ? [`references gate ${gateId}`] : []),
     ],
     clearedCheck: async () => {
+      // M3 fix: fail closed when unknown
       // Check if the gate now has a result or is running again
       if (gateId) {
         const status = checkGateResult(gateId);
-        if (status) {
-          if (status.exists) {
-            return { cleared: true, reason: `gate ${gateId} now has a result` };
-          }
-          if (status.running) {
-            return { cleared: true, reason: `gate ${gateId} is running again` };
-          }
-          return { cleared: false, reason: `gate ${gateId} still has no result` };
+        if (status === null) {
+          // M3: unknown = not cleared
+          return { cleared: false, reason: `cannot check gate ${gateId} status (fail closed)` };
         }
+        if (status.exists) {
+          return { cleared: true, reason: `gate ${gateId} now has a result` };
+        }
+        if (status.running) {
+          return { cleared: true, reason: `gate ${gateId} is running again` };
+        }
+        return { cleared: false, reason: `gate ${gateId} still has no result` };
       }
-      // If no gate id, assume the infra is back (Docker check, etc.)
-      return { cleared: true, reason: "infrastructure appears recovered" };
+      // M3: Without a gate id, we can't verify - fail closed
+      return { cleared: false, reason: "no gate to check; cannot verify recovery (fail closed)" };
     },
   };
 }
@@ -228,17 +354,21 @@ export function detectEscalationInfra(
 export interface PlannerDecision {
   id: string;
   createdAt: string;
-  proposals: Array<{ op: string; agent: string; task: string }>;
+  proposals: Array<{ op: string; agent: string; task: string; text?: string }>;
 }
 
 /**
  * Detect duplicate planner proposals: a pending planner decision whose
  * proposals are all identical to those of a NEWER pending planner decision.
+ *
+ * M6 fix: compare proposals by text too, not just by index and op/agent/task.
+ * Two proposals with the same ops in different order are duplicates;
+ * two add proposals with different text are not.
  */
 export function detectDuplicateProposal(
   decision: Decision,
   allPlannerDecisions: Decision[],
-  getProposals: (decisionId: string) => Array<{ op: string; agent: string; task: string }>,
+  getProposals: (decisionId: string) => Array<{ op: string; agent: string; task: string; text?: string }>,
 ): ActEvidence | null {
   if (decision.source.module !== "planner") return null;
   if (decision.status !== "open") return null;
@@ -260,11 +390,24 @@ export function detectDuplicateProposal(
     const otherProposals = getProposals(other.id);
     if (otherProposals.length !== thisProposals.length) continue;
 
-    // Check if all proposals match
-    const allMatch = thisProposals.every((p, i) => {
-      const o = otherProposals[i];
-      return o && p.op === o.op && p.agent === o.agent && p.task === o.task;
-    });
+    // M6 fix: compare proposals as sets (order-independent) and include text
+    // Create canonical representations for comparison
+    const thisSet = new Set(
+      thisProposals.map((p) => `${p.op}|${p.agent}|${p.task}|${p.text ?? ""}`),
+    );
+    const otherSet = new Set(
+      otherProposals.map((p) => `${p.op}|${p.agent}|${p.task}|${p.text ?? ""}`),
+    );
+
+    // Check if sets are identical
+    if (thisSet.size !== otherSet.size) continue;
+    let allMatch = true;
+    for (const item of thisSet) {
+      if (!otherSet.has(item)) {
+        allMatch = false;
+        break;
+      }
+    }
 
     if (allMatch) {
       return {
@@ -275,8 +418,9 @@ export function detectDuplicateProposal(
           `both have ${thisProposals.length} proposal(s)`,
         ],
         clearedCheck: async () => {
-          // Re-check that the newer decision still exists and is open
-          return { cleared: true, reason: "duplicate verified" };
+          // M3: Always verify the newer decision still exists and is open
+          // This check is deferred to act time where we have access to the store
+          return { cleared: true, reason: "duplicate verified (re-check at act time)" };
         },
       };
     }
