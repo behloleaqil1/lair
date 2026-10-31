@@ -65,8 +65,6 @@ const SCHEMA = `
     delivery_error TEXT,
     raised_via TEXT NOT NULL DEFAULT 'server',
     attention TEXT NOT NULL DEFAULT 'action',
-    outcome TEXT,
-    outcome_at TEXT,
     class TEXT,
     evidence TEXT,
     outcome TEXT,
