@@ -114,14 +114,21 @@ export class HoldDecisions {
         title: hold.title,
         context: hold.context,
         options: [
-          { id: HOLD_RELEASE, label: hold.releaseLabel, consequences: hold.releaseConsequences },
-          { id: HOLD_KEEP, label: hold.keepLabel, consequences: hold.keepConsequences },
+          { id: HOLD_RELEASE, label: hold.releaseLabel, consequences: hold.releaseConsequences, effect: "outward" },
+          { id: HOLD_KEEP, label: hold.keepLabel, consequences: hold.keepConsequences, effect: "reversible" },
         ],
         recommended: {
           optionId: HOLD_KEEP,
           reasoning: "Whoever held it had a reason: release it once that reason is gone.",
         },
         source: { module: this.module, ref: hold.ref },
+        class: `${this.module}.hold`,
+        evidence: {
+          code: "hold_open",
+          facts: { ref: hold.ref },
+          cause_cleared: false,
+          linked_issue: null,
+        },
         key: hold.key,
         blocks: hold.blocks ?? [],
         links: hold.links ?? [],
