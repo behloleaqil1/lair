@@ -148,8 +148,8 @@ describe("built-in lessons load on start", () => {
 
     // Simulate a version upgrade by manually lowering the version
     // and changing the content, then restarting
-    const { Database } = await import("better-sqlite3");
-    const db = new Database(dbPath);
+    const BetterSqlite3 = await import("better-sqlite3");
+    const db = new BetterSqlite3.default(dbPath);
     db.prepare("UPDATE lessons SET version = 1, signal = ? WHERE id = 'L18'").run(
       JSON.stringify({ kind: "pattern", value: "old_pattern" }),
     );

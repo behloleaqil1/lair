@@ -1,17 +1,22 @@
 /**
- * Tests for the Knowledge view: lessons list grouped by signal kind,
- * status and scope badges, detail view with related lessons.
+ * Tests for the Knowledge view logic: grouping, filters, display helpers.
  */
 import { describe, expect, it } from "vitest";
 import {
+  groupBySignalKind,
+  STATUS_LABELS,
+  STATUS_TONES,
+  SCOPE_LABELS,
+  SIGNAL_KIND_LABELS,
+  DEFAULT_FILTER,
+  formatDate,
+  summaryText,
+  canApprove,
+  canRetire,
+  canEditContent,
   initialKnowledgeState,
-  renderLessonRow,
-  renderLessonDetail,
-  type KnowledgeViewState,
 } from "./knowledge-view";
-import { groupBySignalKind, STATUS_LABELS, STATUS_COLORS, SIGNAL_KIND_LABELS } from "./lessons-api";
-import type { LessonSummary, LessonDetailView, Lesson } from "../shared/lessons-types";
-import { render } from "lit-html";
+import type { LessonSummary, LessonsListView } from "../shared/lessons-types";
 
 function makeSummary(overrides: Partial<LessonSummary> = {}): LessonSummary {
   return {
@@ -27,27 +32,6 @@ function makeSummary(overrides: Partial<LessonSummary> = {}): LessonSummary {
   };
 }
 
-function makeLesson(overrides: Partial<Lesson> = {}): Lesson {
-  return {
-    id: "L1",
-    title: "Test lesson",
-    signal: { kind: "check", value: "test_check" },
-    cause: "Test cause",
-    response: "Test response",
-    prevention: "Test prevention",
-    sources: [{ kind: "manual", ref: "builtin-seed", at: "2026-10-30T00:00:00.000Z" }],
-    status: "active",
-    scope: "built-in",
-    matchCount: 5,
-    lastMatchAt: "2026-10-30T12:00:00.000Z",
-    createdAt: "2026-10-01T00:00:00.000Z",
-    updatedAt: "2026-10-30T12:00:00.000Z",
-    feature: "D28",
-    version: 1,
-    ...overrides,
-  };
-}
-
 describe("initialKnowledgeState", () => {
   it("returns a loading state with no data", () => {
     const state = initialKnowledgeState();
@@ -56,6 +40,13 @@ describe("initialKnowledgeState", () => {
     expect(state.detail).toBeNull();
     expect(state.filter.status).toBe("all");
     expect(state.filter.scope).toBe("all");
+  });
+});
+
+describe("DEFAULT_FILTER", () => {
+  it("has all filters set to 'all'", () => {
+    expect(DEFAULT_FILTER.status).toBe("all");
+    expect(DEFAULT_FILTER.scope).toBe("all");
   });
 });
 
@@ -78,6 +69,19 @@ describe("groupBySignalKind", () => {
     const grouped = groupBySignalKind([]);
     expect(grouped.size).toBe(0);
   });
+
+  it("preserves order within groups", () => {
+    const lessons = [
+      makeSummary({ id: "L1", signal: { kind: "check", value: "a" } }),
+      makeSummary({ id: "L2", signal: { kind: "check", value: "b" } }),
+      makeSummary({ id: "L3", signal: { kind: "check", value: "c" } }),
+    ];
+    const grouped = groupBySignalKind(lessons);
+    const checks = grouped.get("check")!;
+    expect(checks[0].id).toBe("L1");
+    expect(checks[1].id).toBe("L2");
+    expect(checks[2].id).toBe("L3");
+  });
 });
 
 describe("STATUS_LABELS", () => {
@@ -88,11 +92,18 @@ describe("STATUS_LABELS", () => {
   });
 });
 
-describe("STATUS_COLORS", () => {
-  it("has colors for all statuses", () => {
-    expect(STATUS_COLORS.proposed).toBe("yellow");
-    expect(STATUS_COLORS.active).toBe("green");
-    expect(STATUS_COLORS.retired).toBe("gray");
+describe("STATUS_TONES", () => {
+  it("has tones for all statuses", () => {
+    expect(STATUS_TONES.proposed).toBe("warning");
+    expect(STATUS_TONES.active).toBe("success");
+    expect(STATUS_TONES.retired).toBe("neutral");
+  });
+});
+
+describe("SCOPE_LABELS", () => {
+  it("has labels for all scopes", () => {
+    expect(SCOPE_LABELS["built-in"]).toBe("Built-in");
+    expect(SCOPE_LABELS.project).toBe("Project");
   });
 });
 
@@ -105,115 +116,73 @@ describe("SIGNAL_KIND_LABELS", () => {
   });
 });
 
-describe("renderLessonRow", () => {
-  it("renders a lesson row with all fields", () => {
-    const lesson = makeSummary();
-    const container = document.createElement("tbody");
-    const calls: string[] = [];
-    render(renderLessonRow(lesson, (id) => calls.push(id)), container);
-
-    const row = container.querySelector("tr");
-    expect(row).not.toBeNull();
-    expect(row?.textContent).toContain("L1");
-    expect(row?.textContent).toContain("Test lesson");
-    expect(row?.textContent).toContain("test_check");
-    expect(row?.textContent).toContain("Active");
-    expect(row?.textContent).toContain("Built-in");
-    expect(row?.textContent).toContain("5");
+describe("formatDate", () => {
+  it("formats a date string", () => {
+    const result = formatDate("2026-10-30T12:00:00.000Z");
+    // Date formatting is locale-dependent; just check it produces something
+    expect(result).not.toBe("—");
+    expect(result.length).toBeGreaterThan(0);
   });
 
-  it("calls onSelect when clicked", () => {
-    const lesson = makeSummary({ id: "L42" });
-    const container = document.createElement("tbody");
-    const calls: string[] = [];
-    render(renderLessonRow(lesson, (id) => calls.push(id)), container);
-
-    const row = container.querySelector("tr");
-    row?.click();
-    expect(calls).toEqual(["L42"]);
+  it("returns dash for null", () => {
+    expect(formatDate(null)).toBe("—");
   });
 });
 
-describe("renderLessonDetail", () => {
-  it("renders the lesson detail with all fields", () => {
-    const lesson = makeLesson();
-    const detail: LessonDetailView = { lesson, related: [] };
-    const container = document.createElement("div");
-    const calls: { action: string; id: string }[] = [];
+describe("summaryText", () => {
+  it("returns a summary string", () => {
+    const counts: LessonsListView["counts"] = {
+      total: 28,
+      active: 25,
+      proposed: 2,
+      retired: 1,
+      builtIn: 26,
+      project: 2,
+    };
+    const text = summaryText(counts);
+    expect(text).toContain("28 lessons");
+    expect(text).toContain("25 active");
+    expect(text).toContain("2 proposed");
+    expect(text).toContain("1 retired");
+    expect(text).toContain("26 built-in");
+    expect(text).toContain("2 project");
+  });
+});
 
-    render(
-      renderLessonDetail(
-        detail,
-        (id) => calls.push({ action: "approve", id }),
-        (id) => calls.push({ action: "retire", id }),
-        () => calls.push({ action: "close", id: "" }),
-        (id) => calls.push({ action: "related", id }),
-      ),
-      container,
-    );
-
-    expect(container.textContent).toContain("L1: Test lesson");
-    expect(container.textContent).toContain("Test cause");
-    expect(container.textContent).toContain("Test response");
-    expect(container.textContent).toContain("Test prevention");
-    expect(container.textContent).toContain("D28");
-    expect(container.textContent).toContain("test_check");
+describe("canApprove", () => {
+  it("returns true for proposed lessons", () => {
+    expect(canApprove({ status: "proposed" })).toBe(true);
   });
 
-  it("shows approve button for proposed lessons", () => {
-    const lesson = makeLesson({ status: "proposed" });
-    const detail: LessonDetailView = { lesson, related: [] };
-    const container = document.createElement("div");
-
-    render(
-      renderLessonDetail(detail, () => {}, () => {}, () => {}, () => {}),
-      container,
-    );
-
-    const approveBtn = container.querySelector("button.btn-primary");
-    expect(approveBtn?.textContent).toContain("Approve");
+  it("returns false for active lessons", () => {
+    expect(canApprove({ status: "active" })).toBe(false);
   });
 
-  it("does not show approve button for active lessons", () => {
-    const lesson = makeLesson({ status: "active" });
-    const detail: LessonDetailView = { lesson, related: [] };
-    const container = document.createElement("div");
+  it("returns false for retired lessons", () => {
+    expect(canApprove({ status: "retired" })).toBe(false);
+  });
+});
 
-    render(
-      renderLessonDetail(detail, () => {}, () => {}, () => {}, () => {}),
-      container,
-    );
-
-    const approveBtn = container.querySelector("button.btn-primary");
-    expect(approveBtn).toBeNull();
+describe("canRetire", () => {
+  it("returns true for active lessons", () => {
+    expect(canRetire({ status: "active" })).toBe(true);
   });
 
-  it("shows related lessons", () => {
-    const lesson = makeLesson({ id: "L10", signal: { kind: "check", value: "event_loop_lag" } });
-    const related: LessonSummary[] = [
-      makeSummary({ id: "L26", title: "Related lesson", signal: { kind: "check", value: "event_loop_lag" } }),
-    ];
-    const detail: LessonDetailView = { lesson, related };
-    const container = document.createElement("div");
-    const calls: string[] = [];
+  it("returns true for proposed lessons", () => {
+    expect(canRetire({ status: "proposed" })).toBe(true);
+  });
 
-    render(
-      renderLessonDetail(
-        detail,
-        () => {},
-        () => {},
-        () => {},
-        (id) => calls.push(id),
-      ),
-      container,
-    );
+  it("returns false for retired lessons", () => {
+    expect(canRetire({ status: "retired" })).toBe(false);
+  });
+});
 
-    expect(container.textContent).toContain("Related lessons");
-    expect(container.textContent).toContain("L26: Related lesson");
+describe("canEditContent", () => {
+  it("returns true for project lessons", () => {
+    expect(canEditContent({ scope: "project" })).toBe(true);
+  });
 
-    // Click the related lesson
-    const relatedBtn = container.querySelector(".related-lessons button");
-    (relatedBtn as HTMLButtonElement)?.click();
-    expect(calls).toEqual(["L26"]);
+  it("returns false for built-in lessons", () => {
+    expect(canEditContent({ scope: "built-in" })).toBe(false);
   });
 });

@@ -18,11 +18,14 @@ export const STATUS_LABELS: Record<LessonStatus, string> = {
   retired: "Retired",
 };
 
-export const STATUS_COLORS: Record<LessonStatus, string> = {
-  proposed: "yellow",
-  active: "green",
-  retired: "gray",
+export const STATUS_TONES: Record<LessonStatus, "warning" | "success" | "neutral"> = {
+  proposed: "warning",
+  active: "success",
+  retired: "neutral",
 };
+
+/** @deprecated Use STATUS_TONES */
+export const STATUS_COLORS = STATUS_TONES;
 
 export interface LessonFilter {
   status?: LessonStatus;
