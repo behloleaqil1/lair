@@ -129,6 +129,7 @@ import {
 } from "./types.js";
 import { commandFingerprint, findTaskProcess, reconcileRun, runPromptFileName } from "./reconcile.js";
 import type { ProcessInfo, ProcessReading } from "../watchdog/probes.js";
+import type { ReadyFactsSource } from "../ready-guard/guard.js";
 
 export { TASK_ID, isValidTaskId } from "./types.js";
 
@@ -399,6 +400,8 @@ export interface AgentsServiceOptions {
   mintBusToken?: (runId: string, agent: string) => string;
   /** Revoke a run's bus token when the run ends */
   revokeBusToken?: (runId: string) => void;
+  /** What the ready guard reads a PR from (read on each use); undefined: the project has no git host to ask */
+  readyFacts?: () => ReadyFactsSource | undefined;
 }
 
 interface EventInput {
@@ -499,6 +502,7 @@ export class AgentsService {
           return inbox.find ? inbox.find(this.project, key) : undefined;
         },
         withdraw: (decision, reason) => this.withdrawDecision(decision, reason, this.probes.clock.now()),
+        readyFacts: options.readyFacts,
       });
     }
   }
@@ -3193,6 +3197,16 @@ export class AgentsService {
   }
 
   /**
+   * Whether the ready guard accepts `line` as `task`'s done report (true when
+   * fill or the guard is off). The planner settles a task through this too, so a
+   * refused report is a done nowhere.
+   */
+  async reportAccepted(agent: string, task: string, line: string, taskText: string): Promise<boolean> {
+    if (!this.fill) return true;
+    return (await this.fill.guardReport(agent, task, line, this.store.latestRunForTask(this.project, task), taskText)) === null;
+  }
+
+  /**
    * The owner releases a task fill holds for them (an owner or no_done hold,
    * at fill's last check): fill starts it again on its next check, and counts
    * its completions without done from zero. Only while the run that hold was
@@ -3600,6 +3614,13 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
     this.decisions = options.decisions ?? null;
   }
 
+  private readyFacts: ((project: string) => ReadyFactsSource | undefined) | null = null;
+
+  /** Where the ready guard reads a project's PRs from (the review module's host); set before load(). */
+  useReadyFacts(facts: (project: string) => ReadyFactsSource | undefined): void {
+    this.readyFacts = facts;
+  }
+
   /** Raise decisions through `inbox` instead (a stand-in for the Decision Inbox, in tests). */
   setDecisionInbox(inbox: DecisionInbox): void {
     this.decisions = inbox;
@@ -3667,6 +3688,7 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
           budget: this.options.budget,
           events: this.options.events,
           tools: this.options.tools,
+          readyFacts: () => this.readyFacts?.(entry.name),
         }),
       );
     }

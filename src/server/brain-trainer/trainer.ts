@@ -9,7 +9,7 @@ import { join } from "path";
 import { runBench } from "../brain-bench/run.js";
 import type { ModelReport } from "../brain-bench/types.js";
 import type { TrainerContainer } from "./container.js";
-import { splitLabels, toBenchCase } from "./examples.js";
+import { knownBefore, splitLabels, toBenchCase } from "./examples.js";
 import { featuresOf } from "./features.js";
 import { avoidSet, classifierBenchModel, MAX_MODEL_BYTES, parseModel, recommendedBenchModel } from "./model.js";
 import { timeSplit } from "./split.js";
@@ -58,8 +58,19 @@ function readFileBounded(path: string, max: number): string {
 export async function runTraining(deps: TrainerDeps): Promise<RunReport> {
   const { settings, store } = deps;
   const at = deps.now().toISOString();
-  const { examples, unusable, notices = 0 } = deps.loadExamples();
-  const sets = splitLabels(examples);
+  const { examples: loaded, unusable, notices = 0 } = deps.loadExamples();
+  let examples = loaded;
+  let sets = splitLabels(examples);
+  // An outcome recorded at or after the cutoff was not known when the test window began: for this run the answer was
+  // still unjudged. The cutoff depends on the labels, so settle it by looking again (a few passes at most).
+  for (let pass = 0; pass < 3; pass++) {
+    const probe = timeSplit(sets.positive, { testFraction: settings.testFraction, minTest: settings.minTest });
+    if (!probe.ok) break;
+    const masked = knownBefore(loaded, Date.parse(probe.cutoffAt));
+    if (masked.every((e, i) => e.outcome === examples[i].outcome)) break;
+    examples = masked;
+    sets = splitLabels(examples);
+  }
   const labels = {
     total: examples.length + unusable + notices,
     used: sets.positive.length,
@@ -115,8 +126,10 @@ export async function runTraining(deps: TrainerDeps): Promise<RunReport> {
       return finish({ ...base, status: "failed", reasonCode: "model_refused", reason: "the trainer's model was refused" });
     }
 
-    // Answers marked bad before the cutoff veto a repeat; later ones are not looked at
-    const older = sets.negative.filter((e) => Date.parse(e.at) < Date.parse(split.cutoffAt));
+    // Answers raised and judged bad before the cutoff veto a repeat; a decision judged bad later is future knowledge
+    const older = sets.negative.filter(
+      (e) => Date.parse(e.at) < Date.parse(split.cutoffAt) && (e.outcomeAt === undefined || Date.parse(e.outcomeAt) < Date.parse(split.cutoffAt)),
+    );
     const avoid = avoidSet(older, (e) => featuresOf(toBenchCase(e)));
     const version = store.newVersion(deps.now());
     const bench = await runBench(

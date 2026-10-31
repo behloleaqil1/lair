@@ -104,6 +104,10 @@ export interface DecisionLink {
   url: string;
 }
 
+/** How an answered decision turned out (the outcome tracker, src/server/outcomes/). */
+export const DECISION_OUTCOMES = ["good", "bad", "unknown"] as const;
+export type DecisionOutcome = (typeof DECISION_OUTCOMES)[number];
+
 export interface DecisionAnswer {
   optionId: string;
   note?: string;
@@ -173,6 +177,11 @@ export interface Decision {
   deliveredAt?: string;
   /** "http": raised over the API, so `source.module` is only what the caller said; "server": by a module inside Lair */
   raisedVia: "server" | "http";
+  /** Set once by the outcome tracker, when it is on; absent until then */
+  outcome?: DecisionOutcome;
+  outcomeAt?: string;
+  /** Codes and ids only, no prose: `{ rule, ... }` */
+  outcomeEvidence?: Record<string, string | number | boolean | null>;
   /**
    * The policy class, "module.name" (docs/design/decision-policies.md §2).
    * Absent on decisions raised without one: they are never for a rule.

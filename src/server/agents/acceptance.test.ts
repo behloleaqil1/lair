@@ -412,6 +412,8 @@ function projectConfig(
     },
     agent_adapters: ADAPTERS,
     agents,
+    // The ready guard reads PRs through the review module's host
+    review: (agents?.fill as { ready_guard?: boolean } | undefined)?.ready_guard ? { enabled: true } : undefined,
   };
   return config as ProjectConfig;
 }
@@ -3606,6 +3608,179 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(eventsOf(h, "fill_released").map((e) => e.data.by)).toEqual(["decision"]);
     expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "started" });
     expect(runs(h)).toHaveLength(4);
+  });
+
+  describe("ready guard: a DONE line that names a PR counts only when the PR is ready to review", () => {
+    const green = {
+      state: "open" as const,
+      headSha: "abc1234def5678",
+      baseRef: "main",
+      mergeable: true,
+      behindBy: 0,
+      body: "",
+      checks: [{ name: "build", state: "success" as "success" | "failure" | "pending" }],
+      commitShas: ["abc1234def5678"],
+      gate: null,
+      findingIds: [] as string[],
+    };
+    const DONE = "- DONE feat-login by worker-a 12:05Z: PR #7 at abc1234 ready";
+
+    /** worker-a starts feat-login, writes the DONE line, and exits 0; facts() is what the host says. */
+    async function finished(facts: () => typeof green, guard = true, line = DONE, description = "Login form") {
+      const h = setup(fill({ agents: ["worker-a"], ready_guard: guard }));
+      prompts(h);
+      h.manager.useReadyFacts(() => ({ facts: async () => facts() }));
+      tasks(h, `worker-a|Alice|feat-login|${description}`);
+      await check(h);
+      await at(h, 0); // pid 5001
+      appendFileSync(h.queueFile, `${line}\n`);
+      h.spawner.exit(5001, 0);
+      await at(h, MIN);
+      return h;
+    }
+
+    it("a refused report (red CI) never marks the task done, sends nothing to review, and is the next run's first instruction", async () => {
+      const facts = { ...green, checks: [{ name: "build-22", state: "failure" as const }] };
+      const h = await finished(() => facts);
+
+      expect(lineOf(await check(h), "feat-login").state).not.toBe("done");
+      expect(eventsOf(h, "fill_done")).toEqual([]);
+      const [refused] = eventsOf(h, "fill_report_refused");
+      expect(refused).toMatchObject({ task: "feat-login", agent: "worker-a" });
+      expect(refused.data).toMatchObject({ pr: 7, reason: "ci_failed" });
+      expect(String(refused.data.instruction)).toContain("failing checks: build-22");
+
+      // Checked again every time; the same refusal is recorded once
+      await check(h);
+      expect(eventsOf(h, "fill_report_refused")).toHaveLength(1);
+
+      // The next run starts with the reason
+      h.clock.t = NOW + 10 * MIN;
+      await check(h);
+      await h.service.tick();
+      expect(runs(h)).toHaveLength(2);
+      expect(promptOf(h.spawner.calls[1])).toContain("Your report for PR #7 was refused");
+      expect(promptOf(h.spawner.calls[1])).toContain("build-22");
+    });
+
+    it("pending CI is refused for now and checked again: not done, no new run, then done once CI is green", async () => {
+      let facts: typeof green = { ...green, checks: [{ name: "build-22", state: "pending" }] };
+      const h = await finished(() => facts);
+
+      for (let i = 0; i < 3; i++) {
+        const held = lineOf(await check(h), "feat-login");
+        expect(held).toMatchObject({ state: "held", hold: "report_refused" });
+        expect(held.detail).toContain("CI is still running at the head: build-22");
+      }
+      expect(eventsOf(h, "fill_done")).toEqual([]);
+      expect(eventsOf(h, "fill_report_refused")).toEqual([]);
+      expect(runs(h)).toHaveLength(1);
+
+      facts = { ...green };
+      expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "done" });
+      expect(eventsOf(h, "fill_done")).toHaveLength(1);
+      expect(runs(h)).toHaveLength(1);
+    });
+
+    it("a ready PR is accepted as done", async () => {
+      const h = await finished(() => green);
+      expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "done" });
+      expect(eventsOf(h, "fill_done")).toHaveLength(1);
+      expect(eventsOf(h, "fill_report_refused")).toEqual([]);
+    });
+
+    it("a branch behind its base is refused with the reason", async () => {
+      const h = await finished(() => ({ ...green, behindBy: 3 }));
+      await check(h);
+      expect(eventsOf(h, "fill_done")).toEqual([]);
+      expect(eventsOf(h, "fill_report_refused")[0].data).toMatchObject({ reason: "behind_base" });
+    });
+
+    const refusal = async (h: Awaited<ReturnType<typeof finished>>) => {
+      await check(h);
+      expect(eventsOf(h, "fill_done")).toEqual([]);
+      return eventsOf(h, "fill_report_refused")[0]?.data;
+    };
+
+    it("a head the PR has moved past, a conflicting branch, a gate that did not pass and unmapped findings are each refused", async () => {
+      expect(await refusal(await finished(() => ({ ...green, headSha: "9999999def5678" })))).toMatchObject({ reason: "head_moved" });
+      expect(await refusal(await finished(() => ({ ...green, mergeable: false as never })))).toMatchObject({ reason: "conflicting" });
+      expect(await refusal(await finished(() => ({ ...green, gate: [{ name: "backend", status: "failed" }] as never })))).toMatchObject({
+        reason: "gate_unverified",
+      });
+      expect(await refusal(await finished(() => ({ ...green, findingIds: ["f-1"], body: "nothing" })))).toMatchObject({ reason: "findings_unmapped" });
+    });
+
+    it("a DONE line without a head, or naming several PRs, or no PR for PR work, is refused", async () => {
+      const noHead = await finished(() => green, true, "- DONE feat-login by worker-a 12:05Z: PR #7 ready");
+      expect(await refusal(noHead)).toMatchObject({ reason: "no_head" });
+      const several = await finished(() => green, true, "- DONE feat-login by worker-a 12:05Z: PR #3 and PR #7 at abc1234");
+      expect(await refusal(several)).toMatchObject({ reason: "ambiguous" });
+      const noPr = await finished(() => green, true, "- DONE feat-login by worker-a 12:05Z: merged", "Open a PR for the login form");
+      expect(await refusal(noPr)).toMatchObject({ reason: "no_pr" });
+      // Not PR work: a line without a PR is accepted
+      const plain = await finished(() => green, true, "- DONE feat-login by worker-a 12:05Z: merged");
+      expect(lineOf(await check(plain), "feat-login")).toMatchObject({ state: "done" });
+    });
+
+    it("the bus mirror's tail decides: a PR number in the summary does not, and an old head is head_moved", async () => {
+      const seen: number[] = [];
+      const h = setup(fill({ agents: ["worker-a"], ready_guard: true }));
+      prompts(h);
+      h.manager.useReadyFacts(() => ({ facts: async (pr: number) => (seen.push(pr), { ...green, headSha: "def9999abc" }) }));
+      tasks(h, "worker-a|Alice|feat-login|Login form");
+      await check(h);
+      await at(h, 0);
+      appendFileSync(h.queueFile, "- DONE feat-login by worker-a (Alice) 12:05Z: follow-up to PR #3 [gate-1] PR #7 [abc1234]\n");
+      h.spawner.exit(5001, 0);
+      await at(h, MIN);
+      await check(h);
+      expect(seen).toEqual([7]);
+      expect(eventsOf(h, "fill_report_refused")[0].data).toMatchObject({ pr: 7, reason: "head_moved" });
+    });
+
+    it("a repeated DONE line after a refusal is one refusal", async () => {
+      const h = await finished(() => ({ ...green, checks: [{ name: "build", state: "failure" as const }] }));
+      await check(h);
+      appendFileSync(h.queueFile, `${DONE}\n`);
+      await check(h);
+      expect(eventsOf(h, "fill_report_refused")).toHaveLength(1);
+    });
+
+    it("a host that fails is held, then after the wait the owner is asked once and the task is never done", async () => {
+      let calls = 0;
+      const h = await finished((): typeof green => {
+        calls++;
+        throw new Error("host is down");
+      });
+      expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "held", hold: "report_refused" });
+      expect(eventsOf(h, "fill_report_waiting")).toHaveLength(1);
+      // Backed off: a second check does not ask the host again
+      const asked = calls;
+      await check(h);
+      expect(calls).toBe(asked);
+      // Past the wait (default 120 min) from the first check
+      h.clock.t += 121 * MIN;
+      const line = lineOf(await check(h), "feat-login");
+      expect(line).toMatchObject({ state: "held", hold: "refused" });
+      expect(line.detail).toContain("still not verifiable");
+      expect(eventsOf(h, "fill_done")).toEqual([]);
+      expect(eventsOf(h, "fill_report_waiting")).toHaveLength(1);
+    });
+
+    it("pending CI that never finishes ends in the same decision", async () => {
+      const h = await finished(() => ({ ...green, checks: [{ name: "build", state: "pending" as const }] }));
+      expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "held", hold: "report_refused" });
+      h.clock.t += 121 * MIN;
+      expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "held", hold: "refused" });
+      expect(eventsOf(h, "fill_done")).toEqual([]);
+    });
+
+    it("with the guard off nothing is checked", async () => {
+      const h = await finished(() => ({ ...green, checks: [{ name: "build", state: "failure" as const }] }), false);
+      expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "done" });
+      expect(eventsOf(h, "fill_report_refused")).toEqual([]);
+    });
   });
 
   it("done is kept once seen: a rotated or truncated queue file doesn't restart the task; an edited line clears it", async () => {
