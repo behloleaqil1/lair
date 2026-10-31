@@ -2952,6 +2952,100 @@ The tasks it follows are `agents.fill.tasks_file` (the planner's done marker mar
 
 The tracker emits no events of its own. The dashboard tab is not built yet.
 
+## Lessons
+
+The lessons module (`src/server/lessons/`, `docs/design/autonomy.md` §8) stores what Lair has learned from incidents and operational experience. Each lesson has a signal (how to detect the situation), a cause, a response playbook, and prevention (a check or feature that makes it automatic).
+
+**Built-in lessons** (L1-L28) ship with Lair: generic operational lessons from real incidents (slow gates, idle capacity, Docker down, duplicate runs, etc.). They load on start when the module is enabled and are active by default.
+
+**Project lessons** are proposed by incidents and approved by the owner. They can be specific to this project's patterns and failure modes.
+
+### Configuration
+
+```yaml
+lessons:
+  enabled: false       # Off by default. On: data/lessons.db, built-in lessons, /api/lessons, Knowledge view
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Turns the lessons module on. Off: no `data/lessons.db`, no `/api/lessons` routes (404), no Knowledge view in the nav. Takes effect at server start |
+
+### Lessons API
+
+All routes require the owner's session from the dashboard (HTTP 403 otherwise):
+
+- `GET /api/lessons?project=&status=&scope=&limit=`: List lessons. `status` is `proposed`, `active`, or `retired`. `scope` is `built-in` or `project`. Returns the lessons list with counts.
+- `GET /api/lessons/:id`: Lesson detail with related lessons (same signal).
+- `POST /api/lessons`: Propose a new lesson. If an active or proposed lesson with the same signal exists, increments its match count and returns the existing one (`reused: true`). Body: `{title, signal, cause, response, prevention, feature?}`.
+- `PATCH /api/lessons/:id`: Update a lesson. Built-in lessons can only have their status changed.
+- `POST /api/lessons/:id/approve`: Approve a proposed lesson (changes status to `active`).
+- `POST /api/lessons/:id/retire`: Retire a lesson (changes status to `retired`).
+- `POST /api/lessons/:id/match`: Record a signal match (increments `matchCount`, updates `lastMatchAt`).
+
+### Lesson schema
+
+```typescript
+interface LessonSignal {
+  kind: "check" | "event" | "metric" | "pattern";  // What the signal watches
+  value: string;                                    // Check id, event type, metric name, or regex
+  threshold?: number;                              // For metrics: the trigger threshold
+  direction?: "above" | "below";                   // For metrics: above or below
+}
+
+interface Lesson {
+  id: string;                // L1, L2, ... for built-in; UUID for project
+  title: string;             // Short description
+  signal: LessonSignal;      // How to detect this situation
+  cause: string;             // What causes it
+  response: string;          // What to do (playbook ref or text)
+  prevention: string;        // How to prevent it (check or feature ref)
+  sources: LessonSource[];   // Where this lesson came from
+  status: "proposed" | "active" | "retired";
+  scope: "built-in" | "project";
+  matchCount: number;        // Times the signal has matched
+  lastMatchAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  feature: string | null;    // The feature or duty that makes this automatic
+}
+```
+
+### Built-in lessons (L1-L28)
+
+| ID | Title | Signal | Prevention |
+|----|-------|--------|------------|
+| L1 | A gate runs far longer than it should | metric: `gate_duration_seconds > 2400` | slow-gate check |
+| L2 | An on-demand machine powered off under a running job | event: `machine.stopped` | lease refresh |
+| L3 | Every remote start fails no ssh after a reboot | pattern: `no ssh\|connection refused` | host services |
+| L4 | All gates fail at once in their first step | pattern: `exit 125\|Cannot connect to Docker` | environment class |
+| L5 | Two agents work the same task after a restart | event: `agent.duplicate_task` | adopt runs |
+| L6 | A new task closed with no work done | event: `task.closed_by_wrong_report` | match by task id |
+| L7 | Agents redo old merged work | event: `agent.prompt_stale` | warn on stale prompt |
+| L8 | Agents idle while capacity exists | metric: `idle_agents_with_ready_work > 1` | never-idle rule |
+| L9 | Load average says full but agents barely use CPU | metric: `load_per_agent_cpu_ratio > 10` | capacity class |
+| L10 | The server stops answering | check: `event_loop_lag` | #160: async IO, cache |
+| L11 | A cloud gate takes 35 min while its tests take 4-7 | metric: `gate_local_phase_ratio > 0.5` | remote preflight |
+| L12 | Heavy gates still land on the slow machine | event: `placement.wrong_lane` | routing tests |
+| L13 | Agents report not authenticated | pattern: `not authenticated\|could not read Username` | env health check |
+| L14 | Edits to a shared file silently disappear | event: `file.reverted_silently` | #96, #94: one writer |
+| L15 | Gate time spent on code that will change | event: `gate.obsolete_by_review` | review first |
+| L16 | A narrow passing gate is not enough to merge | event: `gate.scope_too_narrow` | scope from change |
+| L17 | A PR leaves out part of its approved design | event: `review.missing_from_design` | check design scope |
+| L18 | Commits show a machine user instead of the owner | event: `commit.identity_unallowed` | per-run identity |
+| L19 | A monitor has a blind spot | event: `monitor.missed_incident` | test against incidents |
+| L20 | Durations measured wrong | event: `timing.wrong_source` | named timestamps |
+| L21 | A remote machine is mostly idle yet slow | metric: `remote_idle_but_slow > 1` | check fs type |
+| L22 | The planner suggests the same work twice | event: `planner.duplicate_proposal` | #97: dedupe |
+| L23 | Acting on an agent claim that was wrong | event: `agent.claim_contradicted` | verify claims |
+| L24 | A kill takes down more than the job | event: `process.kill_too_broad` | per-job pgroup |
+| L25 | Full test suites time out on the developer machine | metric: `suite_timeout_on_local > 1` | prefer cloud |
+| L26 | The server stays slow with no clients connected | check: `event_loop_lag` | #160: async ticks |
+| L27 | The watchdog reports a live process as gone | event: `watchdog.false_absence` | #162: timed-out probe |
+| L28 | A task runs twice: once by hand, once by scheduler | event: `task.duplicate_run_manual` | adopt runs |
+
+Data is kept in `data/lessons.db`. The dashboard's Knowledge view shows the lessons list with counts and status badges.
+
 ## Brain bench
 
 `lair brain-bench` scores candidate "brains" on recorded decisions: a small local model, a hosted model, or a set of deterministic rules. It is a command, not a server feature: there is no configuration key, it is off unless you run it, it never talks to the Lair server and changes nothing. A shadow mode that compares a model with the real answers later reuses the same scoring.

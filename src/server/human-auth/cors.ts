@@ -60,6 +60,8 @@ export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/pipelines",
   // Only the owner's message route of the bus: its board and event stream keep their CORS
   "/api/bus/send",
+  // Lessons: every route is owner-only (requireOwner)
+  "/api/lessons",
   // Checks: POST takes a bus token, GET /:id takes a token or owner, list and stats are owner-only
   "/api/checks",
 ];

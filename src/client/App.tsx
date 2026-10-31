@@ -15,6 +15,7 @@ import { PullRequests } from "./components/PullRequests";
 import { MachinesSection } from "./components/MachinesSection";
 import { DecisionsSection } from "./components/DecisionsSection";
 import { Delivery } from "./components/Delivery";
+import { Knowledge } from "./components/Knowledge";
 import { Processes } from "./components/Processes";
 import { Settings } from "./components/Settings";
 import { CommandBar } from "./components/CommandBar";
@@ -200,6 +201,8 @@ export function App() {
         return <Delivery project={currentProject} refreshKey={refreshKey} />;
       case "processes":
         return <Processes project={currentProject} refreshKey={refreshKey} />;
+      case "knowledge":
+        return <Knowledge {...props} />;
       case "settings":
         // Settings (src/client/components/Settings.tsx) is keyed by project: a switch starts it afresh. Its pages are
         // the URL's tab, so moving between them keeps the draft
