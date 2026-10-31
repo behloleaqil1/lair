@@ -66,6 +66,8 @@ export interface DecisionRequest {
   blocks?: string[];
   /** Policy class and evidence (docs/design/decision-policies.md §4) */
   structure?: DecisionStructure;
+  /** "notice": for the owner's information only (FYI in the Decision Inbox: nothing waits for an answer) */
+  attention?: "notice";
 }
 
 export interface DecisionInbox {
@@ -148,6 +150,7 @@ export function toRaiseInput(decision: DecisionRequest): RaiseDecisionInput {
     key: clip(printable(decision.key, false), 200),
     blocks: (decision.blocks ?? []).map((b) => clip(printable(b, false), 200)),
     ...(decision.structure ? { class: decision.structure.class, evidence: decision.structure.evidence } : {}),
+    ...(decision.attention ? { attention: decision.attention } : {}),
   };
 }
 

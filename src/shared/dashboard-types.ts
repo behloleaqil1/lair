@@ -39,6 +39,8 @@ export interface ModuleFlags {
   machines: boolean;
   /** lair-node machines are registered with this server */
   nodes: boolean;
+  /** lessons.enabled: the lessons store and Knowledge view */
+  lessons: boolean;
 }
 
 export interface DashboardModules {

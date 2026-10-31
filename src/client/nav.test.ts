@@ -31,6 +31,7 @@ const OFF: ModuleFlags = {
   github: false,
   machines: false,
   nodes: false,
+  lessons: false,
 };
 const ALL: ModuleFlags = Object.fromEntries(Object.keys(OFF).map((k) => [k, true])) as unknown as ModuleFlags;
 const ids = (modules: ModuleFlags | null) => visibleSections(modules).map((s) => s.id);
@@ -46,9 +47,10 @@ describe("nav sections", () => {
       "Decisions",
       "Delivery",
       "Processes",
+      "Knowledge",
       "Settings",
     ]);
-    expect(ids(ALL)).toHaveLength(9);
+    expect(ids(ALL)).toHaveLength(10);
   });
 
   it("shows only the sections every project has when no module is on, and Settings always", () => {

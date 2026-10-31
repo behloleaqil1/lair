@@ -272,6 +272,7 @@ describe("GET /api/dashboard/modules", () => {
         github: true,
         machines: true,
         nodes: true,
+        lessons: false,
       },
     });
   });

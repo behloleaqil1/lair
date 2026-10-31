@@ -60,6 +60,8 @@ export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/bus/send",
   // Host services: the owner's tick runs start commands (its reads under /api/host-services stay public)
   "/api/host-services/owner",
+  // Lessons: every route is owner-only (requireOwner)
+  "/api/lessons",
   // Checks: POST takes a bus token, GET /:id takes a token or owner, list and stats are owner-only
   "/api/checks",
 ];
