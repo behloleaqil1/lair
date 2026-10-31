@@ -77,20 +77,39 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   revert-checks:
-    # Validates that PR tests actually guard the changes they claim to guard.
+    # Proves that a PR's tests guard the code they claim to guard (CONTRIBUTING.md, "Revert checks").
     # Runs only on pull requests, after the build job passes.
     if: github.event_name == 'pull_request'
     needs: build
     runs-on: ubuntu-latest
+    # Bounded: at most 10 checks (--max-checks), each test run killed after 120 s (--timeout)
+    timeout-minutes: 45
     permissions:
       contents: read
+      issues: read
       pull-requests: read
 
     steps:
       - uses: actions/checkout@v4
         with:
-          # Full history needed to access base branch
+          # Full history for the base commit; the token is not left in .git/config for the PR's code
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Read the exemption label history
+        # Before any PR code runs; the token is used only in this step. Read live (not from the event), so
+        # re-running the job after the owner labels the PR sees the label. A failed read exempts nothing.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if ! timeout 60 gh api --paginate "repos/$REPO/issues/$PR_NUMBER/events" \
+            --jq '.[] | select(.event == "labeled" or .event == "unlabeled") | {event, label: (.label.name // ""), actor: (.actor.login // "")} | tojson' \
+            > "$RUNNER_TEMP/label-events.ndjson"; then
+            echo "::warning::Could not read the label history; no exemption applies"
+            : > "$RUNNER_TEMP/label-events.ndjson"
+          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -101,67 +120,27 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Check for docs-only PR
-        id: docs-check
-        run: |
-          CHANGED_FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..${{ github.sha }})
-          DOCS_ONLY=true
-          for file in $CHANGED_FILES; do
-            if [[ ! "$file" =~ \.(md|txt)$ ]] && [[ ! "$file" =~ ^docs/ ]]; then
-              DOCS_ONLY=false
-              break
-            fi
-          done
-          echo "docs_only=$DOCS_ONLY" >> $GITHUB_OUTPUT
-
-      - name: Extract PR body
-        if: steps.docs-check.outputs.docs_only != 'true'
+      - name: Revert checks
+        # The script decides whether lines are required (title, changed paths, owner label) from its own
+        # parse of the body, so fenced examples never count; a docs-only PR needs none
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
-        run: |
-          # Write PR body from env var (avoids heredoc injection)
-          # Uses printf to handle embedded newlines safely
-          printf '%s' "$PR_BODY" > pr-body.md
-
-      - name: Check revert-check requirement
-        if: steps.docs-check.outputs.docs_only != 'true'
-        env:
           PR_TITLE: ${{ github.event.pull_request.title }}
-        run: |
-          CHANGES_SERVER=$(git diff --name-only ${{ github.event.pull_request.base.sha }}..${{ github.sha }} | grep -c '^src/server/' || true)
-          if [[ "$CHANGES_SERVER" -gt 0 ]]; then
-            # Check if title starts with fix( or feat( using pattern matching
-            if [[ "$PR_TITLE" =~ ^(fix|feat)\( ]]; then
-              if ! grep -q '^revert-check:' pr-body.md; then
-                if ! grep -qi 'no revert-check:' pr-body.md && ! grep -qi 'revert-check-exempt:' pr-body.md; then
-                  echo "::error::This PR changes src/server and is a fix/feat. It must include at least one 'revert-check:' line or explain why with 'no revert-check:' or 'revert-check-exempt:'."
-                  exit 1
-                fi
-              fi
-            fi
-          fi
-
-      - name: Run revert checks
-        if: steps.docs-check.outputs.docs_only != 'true'
-        env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          OWNER: ${{ github.repository_owner }}
+          # Repository variables (owner-set): REVERT_CHECKS_REQUIRE=auto|always|never, REVERT_CHECKS_CODE_PATHS=src/,scripts/
+          REQUIRE_MODE: ${{ vars.REVERT_CHECKS_REQUIRE }}
+          CODE_PATHS: ${{ vars.REVERT_CHECKS_CODE_PATHS }}
         run: |
-          # Run the BASE version of the script to prevent a PR from grading itself
-          # If the script doesn't exist in base, run the current version
-          if git show "$BASE_SHA:scripts/revert-checks.sh" >/dev/null 2>&1; then
-            SCRIPT_TMP=$(mktemp)
-            git show "$BASE_SHA:scripts/revert-checks.sh" > "$SCRIPT_TMP"
-            chmod +x "$SCRIPT_TMP"
-            "$SCRIPT_TMP" pr-body.md "$BASE_SHA"
-            RC=$?
-            rm -f "$SCRIPT_TMP"
-            exit $RC
-          else
-            # Script is new in this PR - run current version
-            chmod +x scripts/revert-checks.sh
-            scripts/revert-checks.sh pr-body.md "$BASE_SHA"
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
+          # The base commit's copy grades the PR when it has one, so a PR is not graded by its own copy
+          # (a PR that changes the script must keep these options working)
+          script=src/cli/revert-checks.ts
+          if git cat-file -e "$BASE_SHA:$script" 2>/dev/null; then
+            git show "$BASE_SHA:$script" > "$RUNNER_TEMP/revert-checks.mts"
+            script="$RUNNER_TEMP/revert-checks.mts"
           fi
-
-      - name: Skip (docs-only)
-        if: steps.docs-check.outputs.docs_only == 'true'
-        run: echo "Skipping revert checks for docs-only PR"
+          npx --no-install tsx "$script" "--title=$PR_TITLE" --exempt-label=revert-check-exempt \
+            "--exempt-actors=$OWNER" "--label-events=$RUNNER_TEMP/label-events.ndjson" \
+            "--require=${REQUIRE_MODE:-auto}" "--code-paths=${CODE_PATHS:-src/,scripts/}" \
+            --max-checks=10 --timeout=120 "$RUNNER_TEMP/pr-body.md" "$BASE_SHA"
