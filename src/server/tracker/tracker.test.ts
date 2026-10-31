@@ -10,19 +10,17 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import Database from "better-sqlite3";
-import { TrackerService, type TrackerServiceOptions } from "./service.js";
+import { TrackerService } from "./service.js";
 import { TrackerStore } from "./store.js";
 import {
   GitHubProjectsClient,
   ProjectsApiError,
   type ProjectBoard,
-  type ProjectItem,
   type TrackerIssue,
   type TrackerMilestone,
 } from "./github-projects.js";
 import { type TrackerSettings } from "./config.js";
 import { EventBus } from "../core/event-bus.js";
-import type { TrackerStatus } from "../../shared/tracker-types.js";
 
 // ============ FAKE GITHUB CLIENT ============
 
@@ -208,7 +206,7 @@ function createFakeClient(state: FakeGitHubState): GitHubProjectsClient {
       const m = state.milestones.get(number);
       if (m) m.state = "open";
     },
-  } as GitHubProjectsClient;
+  } as unknown as GitHubProjectsClient;
 }
 
 
@@ -538,7 +536,7 @@ describe("Tracker Module Acceptance Tests", () => {
     it("refuses with a clear message when project scope is missing", async () => {
       ctx = createTestContext();
       // Override checkScopes to report missing scope
-      (ctx.client as Record<string, unknown>).checkScopes = async () => ({
+      (ctx.client as unknown as Record<string, unknown>).checkScopes = async () => ({
         ok: false,
         missing: ["project"],
       });

@@ -102,7 +102,7 @@ export class TrackerStore {
 
   upsertLink(
     project: string,
-    link: Omit<TrackerLink, "linkedAt" | "syncedAt"> & { linkedAt?: string; syncedAt?: string }
+    link: Omit<TrackerLink, "linkedAt" | "syncedAt"> & { linkedAt?: string; syncedAt?: string | null }
   ): void {
     const now = new Date().toISOString();
     this.db

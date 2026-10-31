@@ -15,7 +15,7 @@ import type { Event } from "../../shared/server-types.js";
 import type { TrackerLink, TrackerOp, TrackerStatus, TrackerStatusView, TrackerWrite } from "../../shared/tracker-types.js";
 import type { EventBus } from "../core/event-bus.js";
 import { tokenFrom } from "../review/github.js";
-import type { TrackerSettings, StatusMapping } from "./config.js";
+import type { TrackerSettings } from "./config.js";
 import { statusToOption, optionToStatus } from "./config.js";
 import { GitHubProjectsClient, ProjectsApiError, type ProjectBoard, type ProjectItem } from "./github-projects.js";
 import type { TrackerStore } from "./store.js";

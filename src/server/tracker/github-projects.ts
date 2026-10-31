@@ -3,9 +3,7 @@
  * Uses GraphQL for Projects v2 (which has no REST API).
  * The token needs `repo` + `project` scopes.
  */
-import type { FetchLike, FetchResponseLike, TokenSource } from "../review/github.js";
-import type { TrackerStatus } from "../../shared/tracker-types.js";
-import type { StatusMapping } from "./config.js";
+import type { FetchLike, TokenSource } from "../review/github.js";
 
 export class ProjectsApiError extends Error {
   constructor(
@@ -258,8 +256,8 @@ export class GitHubProjectsClient {
     let agentField: ProjectTextField | null = null;
 
     for (const field of project.fields.nodes) {
-      if ("options" in field && field.name.toLowerCase() === this.options.statusFieldName.toLowerCase()) {
-        statusField = { id: field.id, name: field.name, options: field.options };
+      if ("options" in field && field.options && field.name.toLowerCase() === this.options.statusFieldName.toLowerCase()) {
+        statusField = { id: field.id, name: field.name, options: field.options ?? [] };
       } else if (
         this.options.agentFieldName &&
         field.name.toLowerCase() === this.options.agentFieldName.toLowerCase() &&
@@ -280,6 +278,15 @@ export class GitHubProjectsClient {
 
   /** Get all items on the board */
   async listProjectItems(boardId: string): Promise<ProjectItem[]> {
+    interface ProjectItemsResponse {
+      node?: {
+        items: {
+          pageInfo: { hasNextPage: boolean; endCursor: string | null };
+          nodes: ProjectItemRaw[];
+        };
+      };
+    }
+
     const items: ProjectItem[] = [];
     let cursor: string | null = null;
 
@@ -323,14 +330,7 @@ export class GitHubProjectsClient {
           }
         }
       `;
-      const data = await this.graphql<{
-        node?: {
-          items: {
-            pageInfo: { hasNextPage: boolean; endCursor: string | null };
-            nodes: ProjectItemRaw[];
-          };
-        };
-      }>(query, { boardId, cursor });
+      const data: ProjectItemsResponse = await this.graphql<ProjectItemsResponse>(query, { boardId, cursor });
 
       const itemsData = data.node?.items;
       if (!itemsData) break;
