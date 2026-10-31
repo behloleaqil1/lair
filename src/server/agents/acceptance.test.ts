@@ -5206,6 +5206,152 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     await check(h);
     expect(eventsOf(h, "fill_idle_notice")).toHaveLength(2);
   });
+
+  it("F1: does not count a DONE unassigned task as ready work (no false positive notices)", async () => {
+    const h = setup(fill({ idle: { notice_minutes: 1 } }));
+    prompts(h);
+    // worker-a has a task, an unassigned task exists but is done in the queue
+    tasks(h, "worker-a|Alice|feat-login|Build the login form", "|Bob|feat-other|Unassigned task");
+    // Pre-populate the queue with a DONE line for the unassigned task
+    appendFileSync(h.queueFile, "- DONE feat-other by worker-b 10:00Z: done by someone else\n");
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
+    await check(h);
+    await h.service.tick(); // pid 5001 starts
+    // Complete worker-a's task
+    appendFileSync(h.queueFile, "- DONE feat-login by worker-a 12:01Z: done\n");
+    h.spawner.exit(5001, 0);
+    await at(h, 1 * MIN);
+    await check(h);
+
+    // Wait past the notice threshold
+    await at(h, 5 * MIN);
+    await check(h);
+
+    // F1: The unassigned task should show as done, not as ready work
+    const status = h.service.fillStatus();
+    const unassignedLine = status?.lines.find((l) => l.task === "feat-other");
+    expect(unassignedLine?.state).toBe("done");
+
+    // No notice should be raised because the only "unassigned" task is actually done
+    expect(eventsOf(h, "fill_idle_notice")).toHaveLength(0);
+
+    // worker-a should be no_ready_work, not ready_work
+    const workerAIdle = status?.idle?.find((s) => s.agent === "worker-a");
+    expect(workerAIdle?.reason).toBe("no_ready_work");
+  });
+
+  it("F1: does not count a DONE not_allowlisted task as ready work (no false positive notices)", async () => {
+    const h = setup(fill({ agents: ["worker-a"], idle: { notice_minutes: 1 } }));
+    prompts(h);
+    // worker-a has a task, worker-x (not in fill.agents) also has a task but it's done
+    tasks(h, "worker-a|Alice|feat-login|Build the login form", "worker-x|Xavier|feat-other|Task for non-fill agent");
+    // Pre-populate the queue with a DONE line for the not_allowlisted task
+    appendFileSync(h.queueFile, "- DONE feat-other by worker-x 10:00Z: done\n");
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
+    await check(h);
+    await h.service.tick(); // pid 5001 starts
+    // Complete worker-a's task
+    appendFileSync(h.queueFile, "- DONE feat-login by worker-a 12:01Z: done\n");
+    h.spawner.exit(5001, 0);
+    await at(h, 1 * MIN);
+    await check(h);
+
+    // Wait past the notice threshold
+    await at(h, 5 * MIN);
+    await check(h);
+
+    // F1: The not_allowlisted task should show as done, not as not_allowlisted ready work
+    const status = h.service.fillStatus();
+    const otherLine = status?.lines.find((l) => l.task === "feat-other");
+    expect(otherLine?.state).toBe("done");
+
+    // No notice should be raised because the only "not_allowlisted" task is actually done
+    expect(eventsOf(h, "fill_idle_notice")).toHaveLength(0);
+
+    // worker-a should be no_ready_work, not ready_work
+    const workerAIdle = status?.idle?.find((s) => s.agent === "worker-a");
+    expect(workerAIdle?.reason).toBe("no_ready_work");
+  });
+
+  it("F2: an agent with no tasks-file line becomes ready_work when unassigned work exists", async () => {
+    const h = setup(fill({ agents: ["worker-a", "worker-b"], idle: { notice_minutes: 1 } }));
+    prompts(h);
+    // Only worker-a has a task, worker-b has no line; an unassigned task exists
+    tasks(h, "worker-a|Alice|feat-login|Build the login form", "|Bob|feat-other|Unassigned task");
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
+    await check(h);
+
+    // worker-b should immediately be in ready_work state (it has no line, but unassigned work exists)
+    const status = h.service.fillStatus();
+    const workerBIdle = status?.idle?.find((s) => s.agent === "worker-b");
+    expect(workerBIdle).toBeDefined();
+    expect(workerBIdle?.reason).toBe("ready_work");
+    expect(workerBIdle?.explanation).toContain("idle while ready work exists");
+  });
+
+  it("F2: an agent with no tasks-file line becomes no_ready_work when no unassigned work exists", async () => {
+    const h = setup(fill({ agents: ["worker-a", "worker-b"], idle: { notice_minutes: 1 } }));
+    prompts(h);
+    // Only worker-a has a task, worker-b has no line; no unassigned tasks
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
+    await check(h);
+
+    // worker-b should be no_ready_work (no line, no ready work)
+    const status = h.service.fillStatus();
+    const workerBIdle = status?.idle?.find((s) => s.agent === "worker-b");
+    expect(workerBIdle).toBeDefined();
+    expect(workerBIdle?.reason).toBe("no_ready_work");
+  });
+
+  it("F5: a waiting agent with ready work does not raise a notice (correct: waiting is not idle)", async () => {
+    const h = setup(fill({ agents: ["worker-a"], idle: { notice_minutes: 1 } }));
+    prompts(h);
+    // worker-a has a task, an unassigned task exists (ready work)
+    tasks(h, "worker-a|Alice|feat-login|Build the login form", "|Bob|feat-other|Unassigned task");
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
+    await check(h);
+    await h.service.tick(); // pid 5001 starts
+    // Worker writes WAITING line (gate pending)
+    appendFileSync(h.queueFile, "- WAITING feat-login gate-123 by worker-a 12:01Z: waiting for gate\n");
+    h.spawner.exit(5001, 0);
+    await at(h, 1 * MIN);
+    await check(h);
+
+    // Wait past the notice threshold
+    await at(h, 5 * MIN);
+    await check(h);
+
+    // worker-a should be in waiting state, not raising idle notices
+    const status = h.service.fillStatus();
+    const workerAIdle = status?.idle?.find((s) => s.agent === "worker-a");
+    expect(workerAIdle?.reason).toBe("waiting");
+
+    // No notice because waiting is not "idle with ready work"
+    expect(eventsOf(h, "fill_idle_notice")).toHaveLength(0);
+  });
+
+  it("F5: max_active with ready work does not raise a notice (correct: held at max_active)", async () => {
+    const h = setup(fill({ agents: ["worker-a", "worker-b"], max_active: 1, idle: { notice_minutes: 1 } }));
+    prompts(h);
+    // Both agents have tasks, plus an unassigned task exists
+    tasks(h, "worker-a|Alice|feat-login|Build the login form", "worker-b|Bob|feat-signup|Build signup", "|Charlie|feat-other|Unassigned task");
+    h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
+    await check(h);
+    await h.service.tick(); // pid 5001 starts for worker-a
+
+    // worker-b should be held at max_active (1 agent running, max is 1)
+    const status = h.service.fillStatus();
+    const workerBIdle = status?.idle?.find((s) => s.agent === "worker-b");
+    expect(workerBIdle?.reason).toBe("max_active");
+
+    // Wait past the notice threshold
+    await at(h, 5 * MIN);
+    await check(h);
+
+    // No notice because max_active is not "idle with ready work"
+    expect(eventsOf(h, "fill_idle_notice")).toHaveLength(0);
+  });
 });
 
 

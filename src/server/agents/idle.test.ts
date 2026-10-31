@@ -145,6 +145,39 @@ describe("computeIdleStates", () => {
     expect(states[0].reason).toBe("no_ready_work");
   });
 
+  it("marks no_task agent as ready_work when ready work exists (F2 fix)", () => {
+    // An allowlisted agent has no line in the tasks file, but unassigned work exists
+    const lines: FillLineView[] = [
+      makeLine({ agent: "kiro-B", state: "started", task: "task-1" }), // another agent, not kiro-A
+    ];
+    const readyWork = [{ source: "tasks_file" as const, task: "unassigned-task" }];
+    const previous = new Map<string, IdleState>();
+    const now = Date.now();
+
+    const states = computeIdleStates(["kiro-A"], lines, 0, 5, false, readyWork, now, previous);
+
+    expect(states).toHaveLength(1);
+    expect(states[0].agent).toBe("kiro-A");
+    // F2: no_task should become ready_work when ready work exists
+    expect(states[0].reason).toBe("ready_work");
+    expect(states[0].since).toBe(now);
+  });
+
+  it("marks no_task agent as no_ready_work when no ready work exists", () => {
+    const lines: FillLineView[] = [
+      makeLine({ agent: "kiro-B", state: "started", task: "task-1" }), // another agent, not kiro-A
+    ];
+    const readyWork: { source: "tasks_file"; task: string }[] = [];
+    const previous = new Map<string, IdleState>();
+    const now = Date.now();
+
+    const states = computeIdleStates(["kiro-A"], lines, 0, 5, false, readyWork, now, previous);
+
+    expect(states).toHaveLength(1);
+    expect(states[0].agent).toBe("kiro-A");
+    expect(states[0].reason).toBe("no_ready_work");
+  });
+
   it("preserves since timestamp for continuous idle state", () => {
     const lines: FillLineView[] = [
       makeLine({ agent: "kiro-A", state: "done", task: "task-1" }),

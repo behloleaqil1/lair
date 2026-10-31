@@ -661,6 +661,40 @@ export interface ReportedOutcome {
 }
 
 /**
+ * Check if a task has a done line in the queue file.
+ * Used for unassigned and not_allowlisted tasks where the standard checkDone
+ * may not apply (no agent to check, or agent not in fill.agents).
+ * Returns the done line if found, null otherwise.
+ */
+export function checkTaskDone(
+  store: Pick<AgentsStore, "getEventByKey" | "latestRunForTask">,
+  project: string,
+  queue: QueueLines,
+  settings: Pick<FillSettings, "donePattern">,
+  task: string,
+  agent: string | null,
+): string | null {
+  // For tasks with an agent, check if we have a kept done record
+  if (agent !== null) {
+    const latest = store.latestRunForTask(project, task);
+    const kept = store.getEventByKey(project, `fill_done:${task}:${latest?.id ?? "none"}:${lineHash({ agent, name: "", task, description: "" })}`);
+    if (kept) return String(kept.data.line ?? "");
+  }
+
+  // Create a pattern that matches done lines for this task
+  // Use a placeholder agent if none provided - the pattern will match by task if {task} is in the pattern
+  const donePattern = fillPatternFor(settings.donePattern, task, agent ?? "any-agent");
+
+  // If the pattern includes {task}, find any done line that mentions the task
+  if (donePattern.task !== null) {
+    return queue.find(donePattern, undefined, undefined);
+  }
+
+  // Pattern only matches by agent - can't check without a valid agent
+  return null;
+}
+
+/**
  * How a run ended, by its agent's own queue lines for its task written since
  * its chain was requested (its queue mark): read with fill's patterns as
  * checkDone and runStatus read them (a done line that names the task wins,
@@ -1129,9 +1163,15 @@ export class AgentsFill {
         if (view && view.task === task) view.decisionId = decision?.status === "open" ? decision.id : null;
       };
 
-      // Unassigned task (no agent in tasks file): ready work, but fill can't start it
+      // Unassigned task (no agent in tasks file): check if done, else ready work for any agent
       if (agent === null) {
-        show("unassigned", "no agent assigned: ready work for any agent");
+        // F1: Check if this task has a done line in the queue before marking it as ready work
+        const doneLine = checkTaskDone(store, project, queue, settings, task, null);
+        if (doneLine !== null) {
+          show("done", `done: ${oneLine(doneLine)}`, null);
+        } else {
+          show("unassigned", "no agent assigned: ready work for any agent");
+        }
         continue;
       }
       // After this point, agent is guaranteed to be a string (non-null)
@@ -1157,7 +1197,13 @@ export class AgentsFill {
       };
       
       if (!allowed.has(agent)) {
-        show("not_allowlisted", `${agent} is not in agents.fill.agents: fill never starts it`);
+        // F1: Check if this task has a done line in the queue before marking it as ready work
+        const doneLine = checkTaskDone(store, project, queue, settings, task, agent);
+        if (doneLine !== null) {
+          show("done", `done: ${oneLine(doneLine)}`, null);
+        } else {
+          show("not_allowlisted", `${agent} is not in agents.fill.agents: fill never starts it`);
+        }
         continue;
       }
       const latest = store.latestRunForTask(project, task);

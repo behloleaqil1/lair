@@ -174,8 +174,9 @@ export function computeIdleStates(
 
     // Determine if this is a "ready_work" idle (the problem case) or "no_ready_work"
     let finalReason = reason;
-    if (reason === "task_done") {
-      // Agent's tasks are done - check if ready work exists
+    if (reason === "task_done" || reason === "no_task") {
+      // Agent's tasks are done or it has no line - check if ready work exists
+      // F2: no_task agents should be ready_work when unassigned work exists
       finalReason = hasReadyWork ? "ready_work" : "no_ready_work";
     } else if (reason === "no_ready_work" && hasReadyWork) {
       finalReason = "ready_work";
