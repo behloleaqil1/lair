@@ -14,10 +14,12 @@ import Fastify from "fastify";
 import type { FastifyInstance } from "fastify";
 import { ChecksService, type CheckSpawner, type SpawnResult, type GuardRunner, type Clock, type ChecksFs } from "./service.js";
 import { ChecksStore } from "./store.js";
+import { getBusStore } from "../bus/index.js";
 import { BusStore } from "../bus/store.js";
 import { hashBusToken, newBusToken } from "../bus/tokens.js";
 import { parseChecksConfig, EXIT_PASS, EXIT_FAIL, EXIT_INFRASTRUCTURE } from "./config.js";
 import { registerChecksRoutes } from "./routes.js";
+import type { ChecksManager } from "./manager.js";
 import { existsSync, mkdirSync, rmSync } from "fs";
 import { join } from "path";
 
@@ -113,6 +115,21 @@ class FakeFs implements ChecksFs {
   }
 }
 
+/**
+ * FakeManager wraps a single service for tests.
+ * The routes expect a ChecksManager, so this adapter provides the interface.
+ */
+class FakeManager implements Pick<ChecksManager, "get" | "start" | "stop"> {
+  constructor(private service: ChecksService, private project: string) {}
+
+  get(project: string): ChecksService | undefined {
+    return project === this.project ? this.service : undefined;
+  }
+
+  start(): string[] { return [this.project]; }
+  async stop(): Promise<void> { this.service.stop(); }
+}
+
 // ============ Test helpers ============
 
 interface TestContext {
@@ -124,13 +141,16 @@ interface TestContext {
   clock: FakeClock;
   fs: FakeFs;
   service: ChecksService;
+  manager: FakeManager;
 }
 
 async function createTestContext(config: typeof VALID_CONFIG | undefined = VALID_CONFIG): Promise<TestContext> {
   mkdirSync(TEST_DATA_DIR, { recursive: true });
+  // Create bus subdirectory for getBusStore
+  mkdirSync(join(TEST_DATA_DIR, "bus"), { recursive: true });
 
   const checksStore = new ChecksStore(TEST_PROJECT, join(TEST_DATA_DIR, "checks.db"));
-  const busStore = new BusStore(TEST_PROJECT, join(TEST_DATA_DIR, "bus.db"));
+  const busStore = new BusStore(TEST_PROJECT, join(TEST_DATA_DIR, "bus", `${TEST_PROJECT}.db`));
 
   const spawner = new FakeSpawner();
   const guard = new FakeGuardRunner();
@@ -152,11 +172,17 @@ async function createTestContext(config: typeof VALID_CONFIG | undefined = VALID
     validateSha: async () => true,
   });
 
+  const manager = new FakeManager(service, TEST_PROJECT);
+
   const app = Fastify();
-  await registerChecksRoutes(app, { service, busStore, defaultProject: () => TEST_PROJECT });
+  await registerChecksRoutes(app, {
+    manager: manager as unknown as ChecksManager,
+    defaultProject: () => TEST_PROJECT,
+    dataDir: TEST_DATA_DIR,
+  });
   await app.ready();
 
-  return { app, checksStore, busStore, spawner, guard, clock, fs, service };
+  return { app, checksStore, busStore, spawner, guard, clock, fs, service, manager };
 }
 
 function createToken(ctx: TestContext, agent: string): string {
@@ -407,7 +433,8 @@ describe("Checks module acceptance tests", () => {
   });
 
   // Test 5: guard_cmd exits 1 - refused as guard, no spawn
-  it("guard_cmd exits 1: refused as guard, no spawn", async () => {
+  // The guard runs at run time (before spawn), not at request time
+  it("guard_cmd exits 1: check ends as guard status, no spawn", async () => {
     const guardConfig = {
       "backend-targeted": {
         ...VALID_CONFIG["backend-targeted"],
@@ -430,10 +457,21 @@ describe("Checks module acceptance tests", () => {
       payload: { kind: "backend-targeted", sha: "a".repeat(40), tests: ["TestA"] },
     });
 
-    expect(res.statusCode).toBe(403);
-    expect(JSON.parse(res.body).error).toContain("guard refused");
-    expect(ctx.spawner.calls.length).toBe(0);
+    // Request succeeds (check is queued)
+    expect(res.statusCode).toBe(201);
+    const id = JSON.parse(res.body).data.id;
+
+    // Wait for processing
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Guard ran but command did not
     expect(ctx.guard.calls.length).toBe(1);
+    expect(ctx.spawner.calls.length).toBe(0);
+
+    // Check status is guard
+    const check = ctx.checksStore.getCheck(id);
+    expect(check?.status).toBe("guard");
+    expect(check?.logTail).toContain("guard refused");
   });
 
   // Test 6: Exit 3 retries once, then reports infrastructure

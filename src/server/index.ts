@@ -54,6 +54,7 @@ import { ReviewManager, inboxDecisionSink, registerReviewRoutes } from "./review
 import { mountTriage } from "./triage/index.js";
 import { PlacementManager, registerPlacementRoutes } from "./placement/index.js";
 import { CloudManager, registerCloudRoutes } from "./cloud/index.js";
+import { ChecksManager, registerChecksRoutes, parseChecksConfig } from "./checks/index.js";
 import { registerDashboardRoutes } from "./dashboard/index.js";
 import type { DashboardSources } from "./dashboard/routes.js";
 import { RequestLatency, mountSupervisor, registerLatencyHook } from "./supervisor/index.js";
@@ -651,6 +652,33 @@ const clouds = new CloudManager({
 clouds.load(projectEntries);
 await registerCloudRoutes(fastify, clouds, () => getDefaultProject(), humanAuth);
 
+// Agent checks (src/server/checks/): agents test on a runner before they gate.
+// One per project with `checks:` configured (off by default). Tokens come from
+// the bus; a check is bound to the requesting run's branch and sha.
+const checks = new ChecksManager({
+  dbPath: join(process.cwd(), "data"),
+  outputDir: join(process.cwd(), "data", "checks-output"),
+  events: getEventBus(),
+  getBusStore: (project) => getBusStore(project, join(process.cwd(), "data")),
+  isRunActive: (project, runId) => {
+    const run = agents.getStore()?.getRun(runId);
+    return run !== null && run !== undefined && isActive(run.state);
+  },
+  getRunInfo: (project, runId) => {
+    const run = agents.getStore()?.getRun(runId);
+    if (!run) return null;
+    return { task: run.task, branch: run.branch };
+  },
+});
+checks.load(projectEntries);
+// Register routes with owner auth for list/stats; POST uses bus token
+await registerChecksRoutes(fastify, {
+  manager: checks,
+  defaultProject: () => getDefaultProject(),
+  ownerAuth: humanAuth,
+  dataDir: join(process.cwd(), "data"),
+});
+
 // The dashboard's own reads (src/server/dashboard/): the nav's module flags,
 // a gate's detail from the queue, the pipelines, triage and placement, and
 // the owner-only log tails and failing tests
@@ -843,6 +871,8 @@ const stopServer = async (reason: string) => {
   await placements.stop();
   // Stop cloud checks: a check in progress finishes, then the store closes
   await clouds.stop();
+  // Stop agent checks: running checks are marked interrupted, stores close
+  await checks.stop();
 
   // Stop the shared process cache (all modules have stopped, so no one reads it)
   disposeProcessCache();
@@ -1006,6 +1036,14 @@ const start = async () => {
       metered.length > 0
         ? `[cloud] Watching cloud machines for: ${metered.join(", ")}`
         : "[cloud] Off (no project sets cloud.enabled)",
+    );
+
+    // Start agent checks (reconcile queued/running from a restart)
+    const checking = checks.start();
+    console.log(
+      checking.length > 0
+        ? `[checks] Agent checks for: ${checking.join(", ")}`
+        : "[checks] Off (no project sets checks:)",
     );
 
     // Start file watchers for all projects

@@ -2,20 +2,21 @@
  * Checks routes: the HTTP API for the checks module.
  *
  * Routes:
- * - POST /api/checks           Request a check (requires bus token)
- * - GET  /api/checks/:id       Get check result (token-bound or owner)
- * - GET  /api/checks           List checks (owner only)
- * - GET  /api/checks/stats     Stats for Health view (owner only)
+ * - POST /api/checks?project=         Request a check (requires bus token)
+ * - GET  /api/checks/:id?project=     Get check result (token-bound or owner)
+ * - GET  /api/checks?project=         List checks (owner only)
+ * - GET  /api/checks/stats?project=   Stats for Health view (owner only)
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { rejectCrossSiteRequests } from "../origin.js";
 import { projectQueryGuard } from "../routes/project-guard.js";
-import { hashBusToken, isBusTokenFormat, redactBusToken } from "../bus/index.js";
-import type { BusStore } from "../bus/store.js";
+import { hashBusToken, isBusTokenFormat, redactBusToken, getBusStore } from "../bus/index.js";
 import type { BusTokenBinding } from "../bus/tokens.js";
-import type { ChecksService, CheckError } from "./service.js";
+import type { ChecksManager } from "./manager.js";
+import type { CheckError } from "./service.js";
 import type { HumanAuth } from "../human-auth/index.js";
+import { join } from "path";
 
 function respond<T>(data: T) {
   return { success: true, data, timestamp: new Date().toISOString() };
@@ -51,8 +52,11 @@ const RequestBody = z.object({
   tests: z.array(z.string().min(1).max(500)).min(1).max(100),
 });
 
-const ListQuery = z.object({
+const ProjectQuery = z.object({
   project: z.string().optional(),
+});
+
+const ListQuery = ProjectQuery.extend({
   kind: z.string().optional(),
   agent: z.string().optional(),
   sha: z.string().optional(),
@@ -60,24 +64,24 @@ const ListQuery = z.object({
   limit: z.coerce.number().int().min(1).max(500).default(100),
 });
 
-const GetQuery = z.object({
-  project: z.string().optional(),
+const GetQuery = ProjectQuery.extend({
   wait: z.coerce.number().int().min(0).max(600).optional(),
 });
 
 export interface ChecksRoutesOptions {
-  service: ChecksService;
-  busStore: BusStore;
+  manager: ChecksManager;
   defaultProject: () => string;
   /** Owner auth for list/stats routes. When null, those routes are disabled. */
   ownerAuth?: HumanAuth;
+  /** Data directory for bus stores */
+  dataDir: string;
 }
 
 export async function registerChecksRoutes(
   fastify: FastifyInstance,
   options: ChecksRoutesOptions,
 ): Promise<void> {
-  const { service, busStore, defaultProject, ownerAuth } = options;
+  const { manager, defaultProject, ownerAuth, dataDir } = options;
 
   await fastify.register(async (app) => {
     app.addHook("onRequest", rejectCrossSiteRequests);
@@ -88,9 +92,10 @@ export async function registerChecksRoutes(
     const projectOf = (query: { project?: string }) => query.project ?? defaultProject();
 
     /** Extract and validate token, returning binding or null */
-    const getTokenBinding = (request: FastifyRequest): BusTokenBinding | null => {
+    const getTokenBinding = (request: FastifyRequest, project: string): BusTokenBinding | null => {
       const token = extractToken(request.headers.authorization);
       if (!token || !isBusTokenFormat(token)) return null;
+      const busStore = getBusStore(project, dataDir);
       return busStore.validateToken(hashBusToken(token));
     };
 
@@ -103,21 +108,21 @@ export async function registerChecksRoutes(
 
     // POST /api/checks - Request a check
     app.post<{ Body: unknown; Querystring: { project?: string } }>("/api/checks", async (request, reply) => {
-      // Check if module is enabled
-      if (!service.isEnabled()) {
-        return fail(reply, 404, "Checks module is not configured for this project");
+      const projectQuery = ProjectQuery.safeParse(request.query ?? {});
+      if (!projectQuery.success) {
+        return fail(reply, 400, `Invalid query: ${projectQuery.error.issues[0].message}`);
       }
 
-      const project = projectOf(request.query);
-
-      // Extract and validate token
-      const token = extractToken(request.headers.authorization);
-      if (!token || !isBusTokenFormat(token)) {
+      // Extract and validate token first (to get project from binding)
+      const rawToken = extractToken(request.headers.authorization);
+      if (!rawToken || !isBusTokenFormat(rawToken)) {
         return fail(reply, 401, "Missing or invalid bus token");
       }
 
-      // Validate token
-      const binding = busStore.validateToken(hashBusToken(token));
+      // Try to validate against the queried project or default
+      const project = projectOf(projectQuery.data);
+      const busStore = getBusStore(project, dataDir);
+      const binding = busStore.validateToken(hashBusToken(rawToken));
       if (!binding) {
         return fail(reply, 401, "Invalid or expired bus token");
       }
@@ -125,6 +130,12 @@ export async function registerChecksRoutes(
       // Verify project matches
       if (binding.project !== project) {
         return fail(reply, 403, "Token is for a different project");
+      }
+
+      // Get the service for this project
+      const service = manager.get(project);
+      if (!service || !service.isEnabled()) {
+        return fail(reply, 404, "Checks module is not configured for this project");
       }
 
       // Parse body
@@ -138,7 +149,7 @@ export async function registerChecksRoutes(
       const result = await service.requestCheck(binding, body.data.kind, body.data.sha, body.data.branch, body.data.tests);
 
       if (!result.ok) {
-        const safeMessage = redactBusToken(result.error.message, token);
+        const safeMessage = redactBusToken(result.error.message, rawToken);
         return fail(reply, errorCode(result.error), safeMessage);
       }
 
@@ -148,18 +159,21 @@ export async function registerChecksRoutes(
 
     // GET /api/checks/:id - Get check result (token-bound or owner)
     app.get<{ Params: { id: string }; Querystring: { project?: string; wait?: string } }>("/api/checks/:id", async (request, reply) => {
-      // Check if module is enabled
-      if (!service.isEnabled()) {
-        return fail(reply, 404, "Checks module is not configured for this project");
-      }
-
       const query = GetQuery.safeParse(request.query ?? {});
       if (!query.success) {
         return fail(reply, 400, `Invalid query: ${query.error.issues[0].message}`);
       }
 
+      const project = projectOf(query.data);
+      const service = manager.get(project);
+
+      // Check if module is enabled
+      if (!service || !service.isEnabled()) {
+        return fail(reply, 404, "Checks module is not configured for this project");
+      }
+
       // Check auth: either token binding or owner session
-      const tokenBinding = getTokenBinding(request);
+      const tokenBinding = getTokenBinding(request, project);
       const ownerSession = isOwnerSession(request);
 
       // If neither token nor owner session, require token
@@ -179,8 +193,16 @@ export async function registerChecksRoutes(
 
     // GET /api/checks - List checks (owner only)
     app.get<{ Querystring: unknown }>("/api/checks", async (request, reply) => {
+      const query = ListQuery.safeParse(request.query ?? {});
+      if (!query.success) {
+        return fail(reply, 400, `Invalid query: ${query.error.issues[0].message}`);
+      }
+
+      const project = projectOf(query.data);
+      const service = manager.get(project);
+
       // Check if module is enabled
-      if (!service.isEnabled()) {
+      if (!service || !service.isEnabled()) {
         return fail(reply, 404, "Checks module is not configured for this project");
       }
 
@@ -188,11 +210,6 @@ export async function registerChecksRoutes(
       const ownerSession = isOwnerSession(request);
       if (!ownerSession) {
         return fail(reply, 401, "Owner session required");
-      }
-
-      const query = ListQuery.safeParse(request.query ?? {});
-      if (!query.success) {
-        return fail(reply, 400, `Invalid query: ${query.error.issues[0].message}`);
       }
 
       const checks = service.listChecks({
@@ -217,9 +234,17 @@ export async function registerChecksRoutes(
     });
 
     // GET /api/checks/stats - Stats for Health view (owner only)
-    app.get("/api/checks/stats", async (request, reply) => {
+    app.get<{ Querystring: { project?: string } }>("/api/checks/stats", async (request, reply) => {
+      const query = ProjectQuery.safeParse(request.query ?? {});
+      if (!query.success) {
+        return fail(reply, 400, `Invalid query: ${query.error.issues[0].message}`);
+      }
+
+      const project = projectOf(query.data);
+      const service = manager.get(project);
+
       // Check if module is enabled
-      if (!service.isEnabled()) {
+      if (!service || !service.isEnabled()) {
         return fail(reply, 404, "Checks module is not configured for this project");
       }
 
