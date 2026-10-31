@@ -356,8 +356,8 @@ describe("E2E: Full agent cycle on a fake project", () => {
       spawner.exit(pid, 0);
     };
 
-    // 3. Tick fill to start the agent
-    await service.tick();
+    // 3. Tick + fill check to start the agent
+    await service.checkNow();
 
     // 4. Verify the agent was started
     expect(spawner.calls.length).toBe(1);
@@ -365,7 +365,7 @@ describe("E2E: Full agent cycle on a fake project", () => {
 
     // 5. Tick again to process the completion
     clock.advance(MIN);
-    await service.tick();
+    await service.checkNow();
 
     // 6. Verify the queue was read and task marked done
     const queueContent = readFileSync(paths.queue, "utf-8");
@@ -387,7 +387,7 @@ describe("E2E: Full agent cycle on a fake project", () => {
     };
 
     // Start the agent
-    await service.tick();
+    await service.checkNow();
     expect(spawner.calls.length).toBe(1);
 
     // Simulate continued work and completion
@@ -399,7 +399,7 @@ describe("E2E: Full agent cycle on a fake project", () => {
     spawner.exit(spawner.nextPid - 1, 0);
 
     // Tick to process completion
-    await service.tick();
+    await service.checkNow();
 
     const queueContent = readFileSync(paths.queue, "utf-8");
     expect(queueContent).toContain("PROGRESS feat-api");
@@ -421,11 +421,11 @@ describe("E2E: Full agent cycle on a fake project", () => {
       spawner.exit(pid, 1);
     };
 
-    await service.tick();
+    await service.checkNow();
     expect(spawner.calls.length).toBe(1);
 
     clock.advance(MIN);
-    await service.tick();
+    await service.checkNow();
 
     const queueContent = readFileSync(paths.queue, "utf-8");
     expect(queueContent).toContain("BLOCKED feat-blocked");
@@ -451,7 +451,7 @@ describe("E2E: Full agent cycle on a fake project", () => {
       spawner.exit(pid, 0);
     };
 
-    await service.tick();
+    await service.checkNow();
     expect(spawner.calls.length).toBe(1);
   });
 
@@ -481,7 +481,7 @@ feat-three|Third task
 
     // Run through the tasks
     for (let i = 0; i < 3; i++) {
-      await service.tick();
+      await service.checkNow();
       clock.advance(5 * MIN);
     }
 
