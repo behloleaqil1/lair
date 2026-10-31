@@ -1327,11 +1327,20 @@ export class TriageService {
         `Gates affected: ${gateIds.join(", ")}`,
       ],
       options: [
-        { id: "fix-environment", label: "Fix the environment", consequences: "Re-checks will be triggered after the next successful probe" },
-        { id: "rerun-anyway", label: "Re-check now anyway", consequences: "Re-check all gates immediately" },
-        { id: "ignore", label: "Ignore", consequences: "The failures stay blocking" },
+        { id: "fix-environment", label: "Fix the environment", consequences: "Re-checks will be triggered after the next successful probe", effect: "reversible" },
+        { id: "rerun-anyway", label: "Re-check now anyway", consequences: "Re-check all gates immediately", effect: "reversible" },
+        { id: "ignore", label: "Ignore", consequences: "The failures stay blocking", effect: "reversible" },
       ],
       recommended: "fix-environment",
+      structure: {
+        class: "triage.environment_outage",
+        evidence: {
+          code: "environment_probe_timeout",
+          facts: { pattern: wait.pattern_id, wait_minutes: this.o.settings.environment.maxWaitMinutes, gates_affected: gates.length },
+          cause_cleared: false,
+          linked_issue: null,
+        },
+      },
       why: `The probe command (${wait.probe}) hasn't passed in ${this.o.settings.environment.maxWaitMinutes} minutes.`,
     });
   }
