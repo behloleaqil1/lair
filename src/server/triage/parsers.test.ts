@@ -373,4 +373,104 @@ Summary: 2 failed, 2 passed
     expect(Date.now() - started).toBeLessThan(5000);
     expect(out.causes.length).toBeLessThanOrEqual(5000);
   });
+
+  it("rejects patterns that match the empty string (M1: infinite loop prevention)", () => {
+    // A pattern like (?<name>\w*) matches "" and would loop forever with exec()
+    const result1 = validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "(?<name>\\w*)" });
+    expect(result1).toEqual(
+      expect.arrayContaining([expect.stringContaining("must not match the empty string")])
+    );
+
+    // A pattern with optional prefix and (?<name>.*) also matches ""
+    const result2 = validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "(?:FAIL)?\\s*(?<name>.*)" });
+    expect(result2).toEqual(
+      expect.arrayContaining([expect.stringContaining("must not match the empty string")])
+    );
+
+    // A pattern that requires at least one character is accepted
+    expect(
+      validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "FAIL:\\s+(?<name>\\S+)" }),
+    ).toEqual([]);
+  });
+
+  it("handles zero-length matches safely without infinite loops (M1 fix)", () => {
+    // Even if validation is bypassed, the parser should not hang
+    // This test uses a pattern that could match empty strings repeatedly
+    const parser = createCustomParser({
+      name: "test",
+      detect: "test",
+      fail_pattern: "(?<name>x*)", // Matches empty string
+    });
+    expect(parser).not.toBeNull();
+
+    // The parse should complete quickly even with input that has many positions
+    const started = Date.now();
+    const input = "test\n" + "y".repeat(1000);
+    const out = parser!.parse(input, options);
+    expect(Date.now() - started).toBeLessThan(100);
+    // matchAll with a pattern that matches empty strings at every position
+    // should not hang; it may find matches at x positions or none
+    expect(out.causes.length).toBeLessThanOrEqual(5000);
+  });
+
+  it("rejects nested quantifiers (M3: catastrophic backtracking)", () => {
+    // Pattern (a+)+$ causes exponential backtracking
+    const result1 = validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "(a+)+(?<name>x)" });
+    expect(result1).toEqual(
+      expect.arrayContaining([expect.stringContaining("nested quantifiers")])
+    );
+
+    // Pattern (\w+\s?)* also causes catastrophic backtracking
+    const result2 = validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "(\\w+\\s?)*(?<name>x)" });
+    expect(result2).toEqual(
+      expect.arrayContaining([expect.stringContaining("nested quantifiers")])
+    );
+
+    // Pattern (\d*)* has nested quantifiers
+    const result3 = validateCustomParserConfig({ name: "test", detect: "(\\d*)*", fail_pattern: "(?<name>x)" });
+    expect(result3).toEqual(
+      expect.arrayContaining([expect.stringContaining("nested quantifiers")])
+    );
+  });
+
+  it("rejects backreferences (M3: exponential time complexity)", () => {
+    // Backreferences like \1 can cause exponential time
+    const result1 = validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "(a)\\1(?<name>x)" });
+    expect(result1).toEqual(
+      expect.arrayContaining([expect.stringContaining("backreferences")])
+    );
+
+    // Named backreferences \k<name>
+    const result2 = validateCustomParserConfig({ name: "test", detect: "x", fail_pattern: "(?<dup>a)\\k<dup>(?<name>x)" });
+    expect(result2).toEqual(
+      expect.arrayContaining([expect.stringContaining("backreferences")])
+    );
+
+    const result3 = validateCustomParserConfig({ name: "test", detect: "(a)\\1", fail_pattern: "(?<name>x)" });
+    expect(result3).toEqual(
+      expect.arrayContaining([expect.stringContaining("backreferences")])
+    );
+  });
+
+  it("caps input to 256 KB to bound regex execution (M3)", () => {
+    const parser = createCustomParser({
+      name: "test",
+      detect: "test",
+      fail_pattern: "FAIL:\\s+(?<name>\\S+)",
+    });
+    expect(parser).not.toBeNull();
+
+    // Create 512 KB of input - the parser should only process the tail 256 KB
+    const started = Date.now();
+    const prefix = "a".repeat(256 * 1024);
+    const suffix = "test\nFAIL: test_found\n" + "b".repeat(200 * 1024);
+    const input = prefix + suffix;
+    expect(input.length).toBeGreaterThan(256 * 1024);
+
+    const out = parser!.parse(input, options);
+    expect(Date.now() - started).toBeLessThan(5000);
+    // The failure in the suffix (within last 256 KB) should be found
+    expect(out.causes).toHaveLength(1);
+    expect(out.causes[0].tests[0].name).toBe("test_found");
+  });
 });
