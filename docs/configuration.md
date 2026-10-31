@@ -531,6 +531,63 @@ Unknown keys and invalid values are config errors; a project with an invalid blo
 - `POST /api/pipelines/runs` with `{"pipeline": "gate", "sha": "<40 hex>"}` or `{"pipeline": "gate", "branch": "main"}` (default: the repository's `HEAD`): starts a run, HTTP 202
 - `POST /api/pipelines/runs/<id>/cancel`: cancels a run; CI runs in flight are asked to cancel
 
+## Checks
+
+Agents can run targeted tests before submitting a gate. Off by default: a project without a `checks:` block has no
+checks (every checks route answers 404). With the block, the server runs the kind's command for a running agent run
+that asks with its bus token. Define check kinds per project (design: [design/checks.md](design/checks.md)):
+
+```yaml
+checks:
+  backend-targeted:
+    command: ["./run-tests.sh", "{sha}", "{tests}"]
+    remote: origin
+    tests:
+      pattern: "^[A-Za-z0-9_.*#]+$"
+      max_count: 50
+      max_length: 5000
+    timeout_seconds: 300
+    max_concurrent: 2
+    max_per_agent_per_hour: 10
+    parse:
+      junit_path: test-results/TEST-*.xml
+    budget:
+      daily_limit: 100
+      guard_cmd: ["./check-spend.sh"]
+```
+
+### Check kind options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `command` | array | required | The argv, run without a shell in the project's repository. Placeholders: `{sha}`, `{branch}`, `{tests}`, `{agent}`, `{check_id}`, `{output_dir}` (also `CHECK_SHA`, `CHECK_BRANCH`, `CHECK_AGENT`, `CHECK_ID`, `CHECK_OUTPUT_DIR` in its environment) |
+| `remote` | string | `origin` | The remote the branch must be pushed to: the sha must be on `<remote>/<branch>` |
+| `tests.pattern` | string | `^[A-Za-z0-9_.*#]+$` | Regex allowlist for each test selector item (100 ms limit per item) |
+| `tests.max_count` | number | `50` | Maximum number of test items |
+| `tests.max_length` | number | `5000` | Maximum total length of tests joined |
+| `timeout_seconds` | number | `300` | Time limit for the check; its whole process group is stopped |
+| `max_concurrent` | number | `2` | Checks of this kind running at once (the rest wait, oldest first) |
+| `max_per_agent_per_hour` | number | `10` | Accepted checks per agent per hour (refusals don't count) |
+| `parse.junit_path` | string | — | JUnit XML path for failing test names, relative to the check's output directory; the file name may be a glob |
+| `budget.daily_limit` | number | — | Accepted checks of this kind per UTC day (refusals don't count) |
+| `budget.guard_cmd` | array | — | Command that must exit 0 before each run and before the infrastructure retry (30 s limit, fail closed) |
+
+Exit codes: 0 pass, 1 test failures, 2 refused (the command refused its input), 3 infrastructure (guard again, retried
+once), 4 refused by the guard. A timeout reports `timeout`; any other exit `fail`.
+
+Lair's own tokens (`GH_TOKEN`, `GITHUB_TOKEN`, `LAIR_*_TOKEN`) are removed from the command's and the guard's
+environment. Finished checks are kept 14 days (at most 10,000), with their output directories in
+`data/checks-output/<project>/`. Changes to `checks:` take effect at the next restart.
+
+### Checks API
+
+Agents request checks with their bus token. See [docs/agents.md](agents.md) for the curl example.
+
+- `POST /api/checks` with `{"kind": "...", "sha": "<40 hex>", "branch": "...", "tests": ["..."]}` and `Authorization: Bearer <bus token>`: request a check, returns `{"id": "..."}` (HTTP 201). The run must be running; a run tests one branch (its first accepted check's); the sha must be on that branch as pushed
+- `GET /api/checks/:id?wait=600` with the same token (or the owner's session): the result, optionally long-polling up to N seconds
+- `GET /api/checks?kind=&agent=&sha=&status=&limit=`: list checks (owner only)
+- `GET /api/checks/stats`: counts by status and kind (owner only)
+
 ## Process manager
 
 Define processes for Lair to manage (starting, stopping and restarting them from the dashboard needs the owner's session, see [Owner-only routes](#owner-only-routes)):
@@ -1678,7 +1735,7 @@ Unknown keys, invalid regular expressions, more than 50 `transient_patterns` or 
 
 - An agent that isn't in `fill.agents` is never started (`not allowlisted`). The allowlist is required, so you can move agents over one at a time while another launcher still runs the rest.
 - A task with an active run of the line's agent is `started`; one with another agent's run or another claim on it is `claimed`. Neither is started again.
-- A task that is `done` is not started again: `done_pattern` matches a queue line (`queue_file`) written since the task was last started (the whole file for a task Lair never ran). Lines are matched as the module's own DONE check reads them: trimmed, and case-insensitively, but the task id must be in the matched text exactly as written (task ids are case-sensitive). A pattern may match by agent instead (see [Matching by agent](#matching-by-agent)). Once fill has seen a task done it keeps that in the store, so rotating or truncating the queue file, or a done line falling out of the 4 MB fill reads, never restarts a finished task. Editing the task's line in `tasks_file` drops what was kept, but the next check finds the done line again while it is still in the queue file. Agents write the queue file, so a done line only keeps fill from starting a task again; it proves nothing else. To overrule a done line you don't trust, request a run of the task yourself (Work section): that is a new start, so only lines written after it count, and fill carries the task on from there.
+- A task that is `done` is not started again: `done_pattern` matches a queue line (`queue_file`) written since the task was last started (the whole file for a task Lair never ran). Lines are matched as the module's own DONE check reads them: trimmed, and case-insensitively, but the task id must be in the matched text exactly as written (task ids are case-sensitive). A pattern may match by agent instead (see [Matching by agent](#matching-by-agent)). A line an agent writes for a task it is not on counts for no task ([Unmatched reports](#unmatched-reports)). Once fill has seen a task done it keeps that in the store, so rotating or truncating the queue file, or a done line falling out of the 4 MB fill reads, never restarts a finished task. Editing the task's line in `tasks_file` drops what was kept, but the next check finds the done line again while it is still in the queue file. Agents write the queue file, so a done line only keeps fill from starting a task again; it proves nothing else. To overrule a done line you don't trust, request a run of the task yourself (Work section): that is a new start, so only lines written after it count, and fill carries the task on from there.
 - A run that exits 0 on a WAITING or BLOCKED line for its task waits, or is held: see [Waiting and blocked runs](#waiting-and-blocked-runs) below. So does one that ended on such a line while Lair was restarting, whose exit code is lost (see Restarts and hosts in [Agents](#agents)).
 - A run that exits 0 without writing the done line, or a WAITING or BLOCKED one (an adapter that stops on a usage limit with exit code 0, say), is started again with fill's prompt (built from `prompt_files` again, not the prompt of a run you requested), after `backoff_seconds`, doubling up to `max_backoff_seconds` (`held: backoff`, with the time). After `max_completions_without_done` such runs in a row, fill holds the task (`held: no_done`) and raises one decision in the [Decision Inbox](#decision-inbox) with those runs and the last run's last output lines: "Start it again" (it counts from zero) or "Keep it paused" (recommended).
 - A task whose last run ended in any other way than completing is `held: owner`: it is yours to resume, and fill never restarts it by itself. It has one decision, as every hold that needs you ([One decision per hold](#one-decision-per-hold)): a run that was escalated has its escalation, and any other (one you stopped, one whose claim was lost, released by you or not, one that failed while Lair was restarting) gets one from fill. A run that dies is restarted by the module's recovery, not by fill, so there is never a second run of one task.
@@ -1700,7 +1757,7 @@ Agents are either `local` (held by load) or `remote` (not held by load). Set `fi
 
 Memory checks and heavy-work limits apply to both classes. `capacity_cmd` is still honoured as an extra check, after native checks pass.
 
-`agents.fill_started` and `agents.fill_held` events go on the event bus (and into the agents store): one when fill starts a task, and one when a line becomes held or is held for another kind of reason, not on every check. `fill_done` (a task seen done) and `fill_released` (you lifted a hold) are kept in the agents store. Bounds: the tasks file is read up to 256 KB, 200 tasks and 2,000 characters a line; the queue file's last 4 MB are searched, each line cut at 1,000 characters. A queue file that was rewritten (not appended to) since a task's start is searched whole. Task ids are not reused: a task that is done stays done.
+`agents.fill_started` and `agents.fill_held` events go on the event bus (and into the agents store): one when fill starts a task, and one when a line becomes held or is held for another kind of reason, not on every check. `agents.fill_unmatched` goes on the bus once per unmatched report ([Unmatched reports](#unmatched-reports)). `fill_done` (a task seen done) and `fill_released` (you lifted a hold) are kept in the agents store. Bounds: the tasks file is read up to 256 KB, 200 tasks and 2,000 characters a line; the queue file's last 4 MB are searched, each line cut at 1,000 characters. A queue file that was rewritten (not appended to) since a task's start is searched whole. Task ids are not reused: a task that is done stays done.
 
 ```yaml
 agents:
@@ -1757,6 +1814,7 @@ worker-b|Bob|feat-search|Search page
 | `fill.prompt_files` | array | `[]` | Required when enabled. Files whose contents, in order, make the prompt. `{prompts_dir}`, `{agent}`, `{task}` |
 | `fill.max_active` | number | `1` | Runs fill started that may be active at once (restarts and retries count) |
 | `fill.done_pattern` | string | `^-\s+DONE\s+{task}(?=\s\|$)` | Regular expression for a queue line that reports the task done, matched case-insensitively against each trimmed line; the task id must be in the matched text exactly. Must contain `{task}`, `{agent}` or both ([Matching by agent](#matching-by-agent)), inserted as literal text. End the task id at whitespace, not `\b`, `:` or `-`: task ids can contain `-` and `:` |
+| `fill.done_match` | string | `task_id` when `done_pattern` has `{task}`, else `agent_legacy` | `task_id`: a DONE, WAITING or BLOCKED line closes or changes only the task its pattern's `{task}` names, and an agent's line that names no task it can be about is an [unmatched report](#unmatched-reports). `agent_legacy`: no unmatched reports, and a `done_pattern` without `{task}` matches the agent's last line ([Matching by agent](#matching-by-agent)). `task_id` with a `done_pattern` without `{task}` is a config error. A pattern without `{task}`, or `agent_legacy`, is a config warning (on Home → Health and in the Work section) |
 | `fill.capacity_cmd` | array | — | Exit 0: capacity available; anything else holds, with its first output line as the reason |
 | `fill.capacity.load_per_cpu_max` | number | — | Maximum 1-minute load average per CPU before holding local agents. Remote agents are not held by load |
 | `fill.capacity.memory.pressure_max` | number | — | Hold new starts (local and remote) while memory pressure is above this percentage (0-100). Linux: `some avg10` of `/proc/pressure/memory`. macOS: 100 minus `kern.memorystatus_level`. A read that fails or times out holds with `capacity_probe` |
@@ -1810,6 +1868,18 @@ agents:
       requeue_marker: "{gates_dir}/results/{wake}.recheck-{n}"   # optional: first line, the id it was re-queued as
       fallback_seconds: 900
 ```
+
+#### Unmatched reports
+
+A line counts only for the task it names: with a pattern that has `{task}`, `- DONE fix-10`, `- DONE fix-1-2`, `- DONE review-fix-1` and `- DONE FIX-1` never close `fix-1` (task ids are exact and case-sensitive, and their characters `.`, `#`, `/` and `:` are literal). Agents sometimes report a task they are not on, from a stale prompt, say. With `done_match: task_id` (the default when `done_pattern` has `{task}`), fill looks at the lines a task's last run wrote (after its start, and before its agent's next run on another task) and reports each one that:
+
+- is the agent's own (`by <agent>`, as [Matching by agent](#matching-by-agent) reads attributions: not another agent's, not an unattributed or quoted line);
+- matches one of the project's own `done_pattern`, `waiting_pattern` or `blocked_pattern` that has `{task}`, read with any task id in place of `{task}` (so a `READY` that `done_pattern` allows counts; a keyword the patterns don't have never does);
+- is not a line of the run's own task, nor of another task in `tasks_file` that it counts for (a line for another open task is that task's; once that task is done by another line, a new line for it is a stale report).
+
+Such an unmatched report closes and changes nothing: the task is not done, a WAITING line attaches no wait, a BLOCKED line holds nothing. A run that ends with only unmatched reports is a run without a done line: it backs off, and after `max_completions_without_done` of them the task is `held: no_done`, with one decision. Each such line is recorded once, as a `fill_unmatched` event (with the line as written, its kind and the task id it names), and goes once on the event bus as `agents.fill_unmatched`, whatever the number of checks or restarts. The task's line in the Work section says so, and the status (`fill.unmatchedReports`) lists, per task, its last run's latest such line while that run is the task's last. The task's next run gets a note after its prompt: "Your previous run reported a task that is not yours; your task is `<task>`", then the line, fenced as data. A last line without its newline is still being written, and is read on a later check.
+
+A pattern without `{task}` can't name a task, so its lines are neither checked nor reported: a `waiting_pattern` or `blocked_pattern` without `{task}` changes the agent's open task whatever its line says, and a `done_pattern` without `{task}` makes `done_match` `agent_legacy`, where a DONE line about any other task closes the agent's open task. Each is a config warning, shown on Home → Health (the "Module start failures and errors" self-check turns to a warning) and in the Work section. `done_match: agent_legacy` with patterns that name the task keeps today's matching without unmatched reports (also a warning). `done_match: task_id` with a `done_pattern` without `{task}` is a config error.
 
 #### Matching by agent
 

@@ -33,6 +33,8 @@ export interface ModuleReport {
   on: boolean;
   errors: string[];
   lastError: string | null;
+  /** What it runs with but warns about, in Lair's own words (agents: fill patterns that can count a line for the wrong task) */
+  warnings?: string[];
 }
 
 /** What the checks read, from the modules the server runs. Every source but the config is optional. */
@@ -339,23 +341,34 @@ const moduleErrors: CheckDefinition = {
     const on = reports.filter((r) => r.on);
     const failed = on.filter((r) => r.errors.length > 0).map((r) => r.module);
     const erroring = on.filter((r) => r.errors.length === 0 && r.lastError !== null).map((r) => r.module);
-    const status: CheckStatus = failed.length > 0 ? "failing" : erroring.length > 0 ? "warning" : "ok";
+    const warned = on.filter((r) => r.errors.length === 0 && (r.warnings?.length ?? 0) > 0);
+    const warnings = warned.flatMap((r) => r.warnings ?? []);
+    const status: CheckStatus = failed.length > 0 ? "failing" : erroring.length > 0 || warned.length > 0 ? "warning" : "ok";
     return {
       status,
-      values: { modules_on: on.length, failed: failed.length > 0 ? list(failed) : null, erroring: erroring.length > 0 ? list(erroring) : null },
+      values: {
+        modules_on: on.length,
+        failed: failed.length > 0 ? list(failed) : null,
+        erroring: erroring.length > 0 ? list(erroring) : null,
+        warned: warned.length > 0 ? list(warned.map((r) => r.module)) : null,
+      },
       thresholds: {},
       explanation:
         failed.length > 0
           ? `${list(failed)} did not start: ${failed.length === 1 ? "its" : "their"} config has errors.`
           : erroring.length > 0
             ? `${list(erroring)} reported an error on ${erroring.length === 1 ? "its" : "their"} last round.`
-            : `The ${on.length} module(s) the project turns on run without errors.`,
+            : warned.length > 0
+              ? `${list(warned.map((r) => r.module))} run${warned.length === 1 ? "s" : ""} with a config warning: ${warnings.join("; ")}.`
+              : `The ${on.length} module(s) the project turns on run without errors.`,
       fix:
         failed.length > 0
           ? `Open Settings for ${list(failed)}: each module's errors are shown in its section (and in its status route). Saving a valid config reloads it.`
           : erroring.length > 0
             ? `See ${list(erroring)}'s section for the error it reports; it is tried again on its next round.`
-            : null,
+            : warned.length > 0
+              ? `Change what each warning names in ${list(warned.map((r) => r.module))}'s settings (Settings, or the project's YAML); saving a valid config reloads it.`
+              : null,
     };
   },
 };

@@ -180,6 +180,14 @@ const FillSchema = z
      * be in the matched text exactly as written)
      */
     done_pattern: z.string().min(1).max(500).default(DEFAULT_DONE_PATTERN),
+    /**
+     * How fill reads a report line: "task_id" (the default when done_pattern
+     * has {task}) closes or changes only the task the line names, and reports
+     * an agent's line that names no task it can be about as unmatched;
+     * "agent_legacy" (the default when done_pattern has no {task}) keeps
+     * matching such a pattern by agent, with a warning on Health
+     */
+    done_match: z.enum(["task_id", "agent_legacy"]).optional(),
     /** Native capacity checks: load, memory, heavy work detection */
     capacity: CapacitySchema.default({}),
     /** Exit 0: capacity available; anything else (a timeout too) holds, its first output line the reason */
@@ -295,6 +303,16 @@ export const AgentsSchema = z
 
 type RawSettings = z.infer<typeof AgentsSchema>;
 
+/**
+ * How fill reads report lines (agents.fill.done_match):
+ * - "task_id": a DONE, WAITING or BLOCKED line closes or changes only the task
+ *   its pattern's {task} names, and an agent's line that names no task of the
+ *   tasks file it could be about is an unmatched report (fill.ts);
+ * - "agent_legacy": no unmatched reports; a done_pattern without {task}
+ *   matches the agent's last line, as before done_match existed.
+ */
+export type DoneMatch = "task_id" | "agent_legacy";
+
 /** The parsed `agents.fill:` block. */
 export interface FillSettings {
   enabled: boolean;
@@ -303,6 +321,13 @@ export interface FillSettings {
   promptFiles: string[];
   maxActive: number;
   donePattern: string;
+  /**
+   * How fill reads report lines (DoneMatch): done_match as written, else
+   * "task_id" when done_pattern has {task} and "agent_legacy" when it has not.
+   */
+  doneMatch: DoneMatch;
+  /** What may make fill close or change the wrong task (fillConfigWarnings); shown on Home → Health */
+  warnings: string[];
   /** Native capacity checks */
   capacity: CapacitySettings;
   capacityCmd?: string[];
@@ -400,6 +425,34 @@ export function fillPatternFor(template: string, task: string, agent: string): F
     task: template.includes("{task}") ? task : null,
     agent: template.includes("{agent}") ? agent : null,
   };
+}
+
+/** The named group reportPatternFor captures the task id in */
+export const REPORTED_TASK_GROUP = "lairReportedTask";
+
+/**
+ * A fill pattern for any task, to read which task an agent's report line
+ * names: the first {task} becomes a capture of a task id (TASK_ID's
+ * characters), a later one a back-reference to it, and {agent} the agent's
+ * id as literal text; case-insensitive like donePatternFor. null when the
+ * template has no {task} (its lines name no task) or doesn't compile so.
+ * The capture is what the line says, for showing it: whether a line is
+ * about a given task stays taskLineMatch's call with that task's pattern.
+ */
+export function reportPatternFor(template: string, agent: string): RegExp | null {
+  if (!template.includes("{task}")) return null;
+  let captured = false;
+  const source = template.replace(/\{(task|agent)\}/g, (_match, name: string) => {
+    if (name === "agent") return escapeRegExp(agent);
+    if (captured) return `\\k<${REPORTED_TASK_GROUP}>`;
+    captured = true;
+    return `(?<${REPORTED_TASK_GROUP}>[A-Za-z0-9][A-Za-z0-9._/#:-]{0,127})`;
+  });
+  try {
+    return new RegExp(source, "i");
+  } catch {
+    return null;
+  }
 }
 
 /** A queue line reports what the pattern looks for (see taskLineMatch). */
@@ -700,6 +753,8 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         maxBackoffSeconds: value.fill.max_backoff_seconds,
         waitingPattern: value.fill.waiting_pattern,
         blockedPattern: value.fill.blocked_pattern,
+        doneMatch: doneMatchOf(value.fill),
+        warnings: value.fill.enabled ? fillConfigWarnings(value.fill) : [],
         readyGuard: value.fill.ready_guard,
         readyWaitMinutes: value.fill.ready_wait_minutes,
         wake: {
@@ -727,6 +782,12 @@ function checkFill(value: RawSettings, errors: string[]): void {
     if (fill.prompt_files.length === 0) {
       errors.push("agents.fill.prompt_files: at least one prompt file is required when fill is enabled");
     }
+  }
+  // Asked for in so many words, task_id needs a done line that can name the task
+  if (fill.done_match === "task_id" && !fill.done_pattern.includes("{task}")) {
+    errors.push(
+      'agents.fill.done_match: "task_id" needs {task} in done_pattern (a line that names only the agent can\'t say which task it closes); add {task}, or set done_match: agent_legacy',
+    );
   }
   fill.agents.forEach((agent, i) => {
     if (!isValidDragonId(agent)) errors.push(`agents.fill.agents[${i}]: ${agent} is not a valid agent id`);
@@ -807,6 +868,42 @@ function checkTaskPattern(pattern: string, key: string, what: string, errors: st
   } catch (e) {
     errors.push(`agents.fill.${key}: not a valid regular expression (${e instanceof Error ? e.message : String(e)})`);
   }
+}
+
+/** done_match as written, else "task_id" when done_pattern names the task and "agent_legacy" when it names only the agent. */
+function doneMatchOf(fill: Pick<RawSettings["fill"], "done_match" | "done_pattern">): DoneMatch {
+  return fill.done_match ?? (fill.done_pattern.includes("{task}") ? "task_id" : "agent_legacy");
+}
+
+/**
+ * What in a fill block can make fill close or change a task the line wasn't
+ * about (stale DONE lines for old tasks once closed new ones): a pattern
+ * without {task} matches by agent, and agent_legacy turns unmatched reports
+ * off. Warnings, not errors: such blocks worked before done_match.
+ */
+export function fillConfigWarnings(
+  fill: Pick<RawSettings["fill"], "done_match" | "done_pattern" | "waiting_pattern" | "blocked_pattern">,
+): string[] {
+  const warnings: string[] = [];
+  if (!fill.done_pattern.includes("{task}")) {
+    warnings.push(
+      "agents.fill.done_pattern has no {task}: fill matches DONE lines by agent (done_match agent_legacy), so a DONE line the agent writes about any other task closes its open task. Put {task} in done_pattern so a line closes only the task it names",
+    );
+  } else if (fill.done_match === "agent_legacy") {
+    warnings.push(
+      "agents.fill.done_match is agent_legacy: a line an agent writes about a task it isn't on is not reported (no unmatched reports). Remove done_match to use task_id",
+    );
+  }
+  for (const [key, what] of [
+    ["waiting_pattern", "WAITING"],
+    ["blocked_pattern", "BLOCKED"],
+  ] as const) {
+    if (fill[key].includes("{task}")) continue;
+    warnings.push(
+      `agents.fill.${key} has no {task}: a ${what} line the agent writes about another task changes its open task, and is not reported as unmatched. Put {task} in ${key} so a line changes only the task it names`,
+    );
+  }
+  return warnings;
 }
 
 /** Backoff for attempt n (1-based): base * 2^(n-1), capped. In milliseconds. */
