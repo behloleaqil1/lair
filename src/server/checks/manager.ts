@@ -10,11 +10,10 @@ import { join } from "path";
 import type { EventBus } from "../core/event-bus.js";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { BusStore } from "../bus/store.js";
-import type { HumanAuth } from "../human-auth/index.js";
 import { parseChecksConfig, type ParsedChecksConfig } from "./config.js";
 import { ChecksService, type CheckSpawner, type SpawnResult, type GuardRunner, type ChecksFs } from "./service.js";
 import { ChecksStore } from "./store.js";
-import { signalTree, terminateTree, ProcessSpawner as GatesProcessSpawner } from "../gates/executors/local.js";
+import { signalTree, terminateTree } from "../gates/executors/local.js";
 
 export interface ProjectEntry {
   name: string;
@@ -82,7 +81,6 @@ class RealSpawner implements CheckSpawner {
     options: { cwd: string; env: Record<string, string>; timeoutMs: number },
   ): Promise<SpawnResult> {
     const { spawn } = await import("child_process");
-    const started = Date.now();
 
     return new Promise((resolve) => {
       const [file, ...args] = argv;
@@ -187,7 +185,7 @@ class RealGuardRunner implements GuardRunner {
         return;
       }
 
-      const child = execFile(file, args, {
+      const _child = execFile(file, args, {
         cwd,
         timeout: timeoutMs,
         maxBuffer: 1024 * 1024,
@@ -216,7 +214,7 @@ function createShaValidator(repoDir: string): (sha: string, branch: string) => P
     return new Promise((resolve) => {
       // Use git branch -r --contains to check if sha is on any remote branch,
       // or git merge-base --is-ancestor to check if sha is an ancestor of the branch
-      const child = execFile("git", ["merge-base", "--is-ancestor", sha, branch], {
+      const _child = execFile("git", ["merge-base", "--is-ancestor", sha, branch], {
         cwd: repoDir,
         timeout: 30000,
       }, (error) => {

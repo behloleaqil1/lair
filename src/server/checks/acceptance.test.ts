@@ -14,7 +14,6 @@ import Fastify from "fastify";
 import type { FastifyInstance } from "fastify";
 import { ChecksService, type CheckSpawner, type SpawnResult, type GuardRunner, type Clock, type ChecksFs } from "./service.js";
 import { ChecksStore } from "./store.js";
-import { getBusStore } from "../bus/index.js";
 import { BusStore } from "../bus/store.js";
 import { hashBusToken, newBusToken } from "../bus/tokens.js";
 import { parseChecksConfig, EXIT_PASS, EXIT_FAIL, EXIT_INFRASTRUCTURE } from "./config.js";

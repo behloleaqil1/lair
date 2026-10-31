@@ -55,7 +55,7 @@ import { ReviewManager, inboxDecisionSink, registerReviewRoutes } from "./review
 import { mountTriage } from "./triage/index.js";
 import { PlacementManager, registerPlacementRoutes } from "./placement/index.js";
 import { CloudManager, registerCloudRoutes } from "./cloud/index.js";
-import { ChecksManager, registerChecksRoutes, parseChecksConfig } from "./checks/index.js";
+import { ChecksManager, registerChecksRoutes } from "./checks/index.js";
 import { registerDashboardRoutes } from "./dashboard/index.js";
 import type { DashboardSources } from "./dashboard/routes.js";
 import { RequestLatency, mountSupervisor, registerLatencyHook } from "./supervisor/index.js";

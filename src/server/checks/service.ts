@@ -100,7 +100,7 @@ const MAX_WAITERS_PER_CHECK = 10;
 /** Guard timeout in milliseconds */
 const GUARD_TIMEOUT_MS = 30_000;
 /** Branch name validation pattern: no .., no leading - */
-const BRANCH_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._\/-]{0,199}$/;
+const BRANCH_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 /** Max refusals per agent per hour (prevent spam) */
 const MAX_REFUSALS_PER_AGENT_HOUR = 100;
 

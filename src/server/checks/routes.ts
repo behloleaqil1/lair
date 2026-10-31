@@ -16,7 +16,6 @@ import type { BusTokenBinding } from "../bus/tokens.js";
 import type { ChecksManager } from "./manager.js";
 import type { CheckError } from "./service.js";
 import type { HumanAuth } from "../human-auth/index.js";
-import { join } from "path";
 
 function respond<T>(data: T) {
   return { success: true, data, timestamp: new Date().toISOString() };

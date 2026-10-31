@@ -455,7 +455,7 @@ export class ChecksStore {
    * Prune old checks to keep the database bounded.
    * Keeps the most recent `keep` checks and deletes older ones.
    */
-  pruneOldChecks(keep: number, at: number): number {
+  pruneOldChecks(keep: number, _at: number): number {
     // Get the cutoff id
     const cutoff = this.db
       .prepare(
