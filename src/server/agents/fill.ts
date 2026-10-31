@@ -88,7 +88,6 @@ import { getPromptsDir } from "../routes/controls.js";
 import {
   anyAgentPatternFor,
   backoffMs,
-  doneLineMatches,
   fillPatternFor,
   getAgentClass,
   matchesByAgent,
@@ -107,7 +106,8 @@ import { lastLines, readTail } from "./sessions.js";
 import type { AgentsStore } from "./store.js";
 import { isActive, isValidTaskId, type AgentRun, type QueueMark } from "./types.js";
 import type { ProcessInfo } from "../watchdog/probes.js";
-import { evaluateReady, isPrWork, parseReadyReport, refuseReport, unverifiable, type ReadyFactsSource, type ReadyVerdict } from "../ready-guard/guard.js";
+import { evaluateReady, isPrWork, parseReadyReport, refuseReport, unverifiable, type ParsedReport, type ReadyFactsSource, type ReadyVerdict } from "../ready-guard/guard.js";
+import { extractBusId, mirroredReport, type BusLineSource, type StructuredReport } from "../bus/consumers.js";
 
 export const MAX_TASKS_FILE_BYTES = 256 * 1024;
 export const MAX_TASK_LINES = 200;
@@ -282,6 +282,8 @@ interface RunStatus {
   line: string;
   /** What a waiting line names to wait on ((?<wake>...)), not yet checked */
   wake: string | null;
+  /** bus.consume on: the id of the bus report the line was read from (its gate id is the wake), else null */
+  busId: number | null;
 }
 
 /** What a waiting run waits on (see AgentsFill.classifyWait); `named` is a wake that resolved to a file, else null. */
@@ -385,19 +387,72 @@ function firstLineOf(path: string, maxBytes: number): string | null {
   }
 }
 
+/** What a queue line reports, as fill's patterns look for it. */
+export type LineKind = "done" | "waiting" | "blocked";
+
+/** The bus report kind of each line kind */
+const REPORT_KIND: Record<LineKind, StructuredReport["kind"]> = { done: "DONE", waiting: "WAITING", blocked: "BLOCKED" };
+
+/** One pattern of a query, with the kind of line it looks for. */
+export interface LineQuery<K extends LineKind = LineKind> {
+  kind: K;
+  pattern: FillPattern;
+}
+
+/**
+ * Whom a query is about. A bus report (bus.consume on) is matched by these
+ * ids, never by the patterns: its task must be `task`, and its agent `agent`
+ * when the pattern names the agent or `own` is set.
+ */
+export interface LineSubject {
+  task: string;
+  agent: string;
+  /** Only the agent's own lines count, whatever the pattern names (reportedOutcome) */
+  own?: boolean;
+}
+
+/** A line a query matched: its text, what a waiting line waits on, and the bus report it was read from (on mode). */
+export interface LineMatch<K extends LineKind = LineKind> {
+  kind: K;
+  line: string;
+  wake: string | null;
+  report: StructuredReport | null;
+}
+
+interface QueueLine {
+  start: number;
+  text: string;
+  /** The line's newline is in the file (the last line may still be being written) */
+  ended: boolean;
+  /** The bus report this line mirrors (its marker, verified against the bus store), or null */
+  report: StructuredReport | null;
+  /** A second line with the same report's marker: in on mode it is not read again */
+  repeat: boolean;
+}
+
 /**
  * The queue file's lines at one check (its last 4 MB), trimmed, each with
  * the offset it starts at. Fill and the planner (checkDone) read it.
+ *
+ * With the project's bus (bus.consume observe or on), a line that ends with
+ * a bus marker is looked up in the bus store: when it is that report's
+ * mirrored line, the report is kept with it. In on mode such a line is read
+ * by the report's fields only; a marker that names no report, or a line
+ * that isn't the report's mirror, is read as a hand-written line.
  */
 export class QueueLines {
-  /** `ended`: the line's newline is in the file (the last line may still be being written) */
-  private lines: { start: number; text: string; ended: boolean }[] = [];
+  private lines: QueueLine[] = [];
   /** Line indexes by author (lowercase), built on first use (agentLines) */
   private byAuthor: Map<string, number[]> | null = null;
   private size = 0;
   private usableMarks = new Map<string, boolean>();
+  private readonly structured: boolean;
 
-  constructor(private path: string) {
+  constructor(
+    private path: string,
+    bus: BusLineSource | null = null,
+  ) {
+    this.structured = bus?.mode === "on";
     const opened = openRegular(path, false);
     if ("error" in opened) return;
     try {
@@ -415,7 +470,7 @@ export class QueueLines {
             .toString("utf-8")
             .slice(0, QUEUE_LINE_CHARS)
             .trim();
-          this.lines.push({ start: begin + pos, text, ended: newline >= 0 });
+          this.lines.push({ start: begin + pos, text, ended: newline >= 0, report: null, repeat: false });
         }
         pos = end + 1;
       }
@@ -424,6 +479,48 @@ export class QueueLines {
     } finally {
       closeSync(opened.fd);
     }
+    if (bus) this.attachReports(bus);
+  }
+
+  /** Keep each mirrored line's bus report with it (one store read for all of them). */
+  private attachReports(bus: BusLineSource): void {
+    const marked = this.lines.map((line) => ({ line, id: extractBusId(line.text) })).filter((m): m is { line: QueueLine; id: number } => m.id !== null);
+    if (marked.length === 0) return;
+    const reports = bus.reports([...new Set(marked.map((m) => m.id))]);
+    const seen = new Set<number>();
+    for (const { line, id } of marked) {
+      const report = mirroredReport(bus, line.text, id, reports);
+      if (!report) continue;
+      if (seen.has(id)) {
+        line.repeat = true;
+        continue;
+      }
+      seen.add(id);
+      line.report = report;
+    }
+  }
+
+  /** The lines that mirror a bus report, oldest first, with the report. */
+  mirrored(): { line: string; report: StructuredReport }[] {
+    return this.lines.flatMap((l) => (l.report ? [{ line: l.text, report: l.report }] : []));
+  }
+
+  /**
+   * Whether a line matches one query for `subject`. In on mode a mirrored
+   * line matches by its report only (kind, task, agent; a WAITING report's
+   * gate id is its wake), and a repeated one never; every other line by the
+   * pattern (taskLineMatch; a waiting line's (?<wake>...) is its wake).
+   */
+  private match<K extends LineKind>(line: QueueLine, query: LineQuery<K>, subject: LineSubject): LineMatch<K> | null {
+    if (this.structured && (line.report !== null || line.repeat)) {
+      const report = line.report;
+      if (report === null || report.kind !== REPORT_KIND[query.kind] || report.task !== subject.task) return null;
+      if ((subject.own || query.pattern.agent !== null) && report.agent.toLowerCase() !== subject.agent.toLowerCase()) return null;
+      return { kind: query.kind, line: line.text, wake: query.kind === "waiting" ? report.gateId : null, report };
+    }
+    const match = taskLineMatch(query.pattern, line.text);
+    if (match === null) return null;
+    return { kind: query.kind, line: line.text, wake: query.kind === "waiting" ? match.groups?.wake?.trim() || null : null, report: null };
   }
 
   /**
@@ -453,35 +550,32 @@ export class QueueLines {
     return this.usable(until) ? { from, to: until.offset } : null;
   }
 
-  /** The first line in the pattern's window that reports what it looks for (taskLineMatch). */
-  find(pattern: FillPattern, mark: QueueMark | undefined, until?: QueueMark): string | null {
-    const window = this.window(pattern, mark, until);
+  /** The first line in the query's window that reports what it looks for (see match). */
+  find<K extends LineKind>(query: LineQuery<K>, subject: LineSubject, mark: QueueMark | undefined, until?: QueueMark): LineMatch<K> | null {
+    const window = this.window(query.pattern, mark, until);
     if (window === null) return null;
     for (const line of this.lines) {
-      if (line.start >= window.from && line.start < window.to && doneLineMatches(pattern, line.text)) return line.text;
+      if (line.start < window.from || line.start >= window.to) continue;
+      const found = this.match(line, query, subject);
+      if (found) return found;
     }
     return null;
   }
 
   /**
-   * The last line in the patterns' windows that one of them matches
-   * (taskLineMatch; a line takes the first pattern that matches it): the
-   * latest such line wins.
+   * The last line in the queries' windows that one of them matches (a line
+   * takes the first query that matches it): the latest such line wins.
    */
-  lastOf<K extends string>(
-    patterns: { kind: K; pattern: FillPattern }[],
-    mark: QueueMark | undefined,
-    until?: QueueMark,
-  ): { kind: K; line: string; match: RegExpExecArray } | null {
-    const windows = patterns.map(({ pattern }) => this.window(pattern, mark, until));
-    let last: { kind: K; line: string; match: RegExpExecArray } | null = null;
+  lastOf<K extends LineKind>(queries: LineQuery<K>[], subject: LineSubject, mark: QueueMark | undefined, until?: QueueMark): LineMatch<K> | null {
+    const windows = queries.map(({ pattern }) => this.window(pattern, mark, until));
+    let last: LineMatch<K> | null = null;
     for (const line of this.lines) {
-      for (let i = 0; i < patterns.length; i++) {
+      for (let i = 0; i < queries.length; i++) {
         const window = windows[i];
         if (window === null || line.start < window.from || line.start >= window.to) continue;
-        const match = taskLineMatch(patterns[i].pattern, line.text);
-        if (match) {
-          last = { kind: patterns[i].kind, line: line.text, match };
+        const found = this.match(line, queries[i], subject);
+        if (found) {
+          last = found;
           break;
         }
       }
@@ -491,20 +585,21 @@ export class QueueLines {
 
   /**
    * The last line written after `mark` that reports the task waiting or
-   * blocked: the latest such line wins. A waiting line's (?<wake>...) is
-   * what it waits on.
+   * blocked: the latest such line wins. A waiting line's (?<wake>...), or a
+   * WAITING report's gate id, is what it waits on.
    */
-  lastStatus(waiting: FillPattern, blocked: FillPattern, mark: QueueMark | undefined, until?: QueueMark): RunStatus | null {
+  lastStatus(waiting: FillPattern, blocked: FillPattern, subject: LineSubject, mark: QueueMark | undefined, until?: QueueMark): RunStatus | null {
     const last = this.lastOf<"waiting" | "blocked">(
       [
         { kind: "waiting", pattern: waiting },
         { kind: "blocked", pattern: blocked },
       ],
+      subject,
       mark,
       until,
     );
     if (!last) return null;
-    return { kind: last.kind, line: last.line, wake: last.kind === "waiting" ? last.match.groups?.wake?.trim() || null : null };
+    return { kind: last.kind, line: last.line, wake: last.wake, busId: last.report?.id ?? null };
   }
 
   /** A mark still describes this file: it isn't past its end and the bytes before it are unchanged. */
@@ -557,7 +652,8 @@ export class QueueLines {
     const to = until ? until.offset : Number.POSITIVE_INFINITY;
     return (this.byAuthor.get(agent.toLowerCase()) ?? [])
       .map((i) => this.lines[i])
-      .filter((line) => line.start >= mark.offset && line.start < to)
+      // In on mode a mirrored line is its bus report, always about the task its run held: never an unmatched one
+      .filter((line) => line.start >= mark.offset && line.start < to && !(this.structured && (line.report !== null || line.repeat)))
       .map((line) => line.text);
   }
 }
@@ -647,8 +743,11 @@ function fillDoneKey(task: string, latestRunId: string | null, entry: TaskLineFi
   return `fill_done:${task}:${latestRunId ?? "none"}:${lineHash(entry)}`;
 }
 
-/** A task fill judges done: from its kept record, or from a queue line. null: not done. */
-export type DoneCheck = { kind: "kept"; line: string; at: number } | { kind: "queue"; line: string } | null;
+/**
+ * A task fill judges done: from its kept record, or from a queue line (with
+ * the bus report it was read from, in on mode). null: not done.
+ */
+export type DoneCheck = { kind: "kept"; line: string; at: number } | { kind: "queue"; line: string; report: StructuredReport | null } | null;
 
 /**
  * Where a line's queue window ends: with patterns that match by agent, the
@@ -687,25 +786,27 @@ export function checkDone(
   const kept = store.getEventByKey(project, fillDoneKey(entry.task, latest?.id ?? null, entry));
   if (kept) return { kind: "kept", line: String(kept.data.line ?? ""), at: kept.at };
   const donePattern = fillPatternFor(settings.donePattern, entry.task, entry.agent);
-  let line: string | null;
+  const subject: LineSubject = { task: entry.task, agent: entry.agent };
+  let found: LineMatch | null;
   if (donePattern.task !== null) {
     // A line that names the task: done is done, whatever came after it
-    line = queue.find(donePattern, latest?.queueMark, until);
+    found = queue.find({ kind: "done", pattern: donePattern }, subject, latest?.queueMark, until);
   } else {
     // A line by the agent only says where it is now: its last DONE, WAITING or BLOCKED line decides
     // ("- DONE row 1 by kiro-A", then "- WAITING <gate> by kiro-A" is waiting, not done)
-    const last = queue.lastOf<"done" | "waiting" | "blocked">(
+    const last = queue.lastOf<LineKind>(
       [
         { kind: "done", pattern: donePattern },
         { kind: "waiting", pattern: fillPatternFor(settings.waitingPattern, entry.task, entry.agent) },
         { kind: "blocked", pattern: fillPatternFor(settings.blockedPattern, entry.task, entry.agent) },
       ],
+      subject,
       latest?.queueMark,
       until,
     );
-    line = last?.kind === "done" ? last.line : null;
+    found = last?.kind === "done" ? last : null;
   }
-  return line === null ? null : { kind: "queue", line };
+  return found === null ? null : { kind: "queue", line: found.line, report: found.report };
 }
 
 /** A report line an agent wrote on a run that names no task it can be about (done_match task_id). */
@@ -793,10 +894,11 @@ export function reportedOutcome(
   const done = own(settings.donePattern);
   const waiting = own(settings.waitingPattern);
   const blocked = own(settings.blockedPattern);
+  const subject: LineSubject = { task: run.task, agent: run.agent, own: true };
   if (done.task !== null) {
-    const line = queue.find(done, run.queueMark, until);
-    if (line !== null) return { kind: "done", line };
-    const status = queue.lastStatus(waiting, blocked, run.queueMark, until);
+    const found = queue.find({ kind: "done", pattern: done }, subject, run.queueMark, until);
+    if (found !== null) return { kind: "done", line: found.line };
+    const status = queue.lastStatus(waiting, blocked, subject, run.queueMark, until);
     return status ? { kind: status.kind, line: status.line } : null;
   }
   const last = queue.lastOf<ReportedOutcome["kind"]>(
@@ -805,6 +907,7 @@ export function reportedOutcome(
       { kind: "waiting", pattern: waiting },
       { kind: "blocked", pattern: blocked },
     ],
+    subject,
     run.queueMark,
     until,
   );
@@ -850,8 +953,9 @@ export function unassignedLine(
     return { state: "claimed", detail: `claimed by run ${short(claim.runId)} (agent ${claim.agent}): not ready work`, runId: claim.runId, ready: false };
   }
   const donePattern = anyAgentPatternFor(settings.donePattern, task);
-  const doneLine = donePattern ? queue.find(donePattern, latest?.queueMark) : null;
-  if (doneLine !== null) return { state: "done", detail: `done: ${oneLine(doneLine)}`, runId: latest?.id ?? null, ready: false };
+  // An unassigned line has no agent: a done line (or bus report, in on mode) for the task by any agent
+  const doneLine = donePattern ? queue.find({ kind: "done", pattern: donePattern }, { task, agent: "" }, latest?.queueMark) : null;
+  if (doneLine !== null) return { state: "done", detail: `done: ${oneLine(doneLine.line)}`, runId: latest?.id ?? null, ready: false };
   if (latest) {
     const until = queueWindowEnd(store, project, settings, { agent: latest.agent, task }, latest);
     const outcome = reportedOutcome(queue, settings, latest, until);
@@ -973,7 +1077,26 @@ export interface AgentsFillOptions {
   withdraw: (decision: Decision, reason: string) => Promise<void>;
   /** The ready guard's source for this project's PRs (used when settings.readyGuard is on); undefined: none, nothing is refused */
   readyFacts?: () => ReadyFactsSource | undefined;
+  /** The project's bus at this check (bus.consume observe or on), or null: queue lines only, as without the bus */
+  bus?: () => BusLineSource | null;
 }
+
+/** How a report or a line reads, for observe mode's comparison: its kind, and the gate a waiting one waits on */
+function reading(kind: LineKind | "PROGRESS" | "TICK" | null, wake: string | null): string {
+  if (kind === null || kind === "PROGRESS" || kind === "TICK") return "nothing (no done, waiting or blocked line)";
+  return kind === "waiting" ? `waiting on ${wake ?? "(nothing named)"}` : kind;
+}
+
+/** observe: how many of the latest mirrored lines each check compares */
+const MAX_OBSERVED_LINES = 200;
+
+const LINE_KIND: Record<StructuredReport["kind"], LineKind | "PROGRESS" | "TICK"> = {
+  DONE: "done",
+  WAITING: "waiting",
+  BLOCKED: "blocked",
+  PROGRESS: "PROGRESS",
+  TICK: "TICK",
+};
 
 function firstLine(text: string): string | null {
   const line = text
@@ -1013,6 +1136,10 @@ export class AgentsFill {
   private unmatchedReports: FillUnmatchedReportView[] = [];
   /** Last capacity check state for the view */
   private lastCapacity: FillCapacityView | null = null;
+  /** checkSoon's check after the one in progress */
+  private again: Promise<void> | null = null;
+  /** stop() ran: events start no check */
+  private ended = false;
   /** Every allowlisted agent's idle state at the last whole check (fill.idle) */
   private idleStates = new Map<string, IdleState>();
   /** Each agent's open idle notice: its episode's start (ms), null for none; read from the store once per agent */
@@ -1056,6 +1183,27 @@ export class AgentsFill {
   }
 
   /**
+   * Why fill won't read a bus report (bus.consume on or observe), or null
+   * when it will: its task has no line in the tasks file at the last check,
+   * that line's agent isn't allowlisted, or fill's pattern for the report's
+   * kind names the agent and another agent reported it. Null until a check
+   * has read the tasks file.
+   */
+  busReportProblem(report: Pick<StructuredReport, "task" | "agent" | "kind">): string | null {
+    if (this.lastCheck === null || this.lastError !== null) return null;
+    const line = this.lineFor(report.task);
+    if (!line) return `task ${report.task} is not in agents.fill.tasks_file: fill ignores the report`;
+    if (line.state === "not_allowlisted") return `${line.agent ?? "its agent"} is not in agents.fill.agents: fill ignores the report`;
+    const kind = LINE_KIND[report.kind];
+    const { settings } = this.options;
+    const template = kind === "done" ? settings.donePattern : kind === "waiting" ? settings.waitingPattern : kind === "blocked" ? settings.blockedPattern : null;
+    if (template !== null && template.includes("{agent}") && line.agent?.toLowerCase() !== report.agent.toLowerCase()) {
+      return `${report.agent} reported it, but the task's line is ${line.agent ?? "another agent"}'s and fill's pattern names the agent: fill ignores the report`;
+    }
+    return null;
+  }
+
+  /**
    * With patterns that match by agent, the agent's open fill task other than
    * `task`, if it has one: its line at the last check, whose task has run for
    * this agent and isn't done (it waits, backs off, is held or runs). A run
@@ -1088,10 +1236,28 @@ export class AgentsFill {
     return this.checking;
   }
 
+  /**
+   * A check now, for an event (bus.consume on: an accepted bus report, or a
+   * run that ended), instead of at the next interval. One in progress may
+   * have read the queue before the event's line was written, so one more
+   * runs right after it (calls meanwhile share that one). Nothing once
+   * stop() has run. It never rejects.
+   */
+  checkSoon(): Promise<void> {
+    if (this.ended) return Promise.resolve();
+    if (!this.checking) return this.check();
+    this.again ??= this.checking.then(() => {
+      this.again = null;
+      return this.ended ? undefined : this.check();
+    });
+    return this.again;
+  }
+
   /** Check soon, then every fill.interval_seconds, until stop(). */
   start(): void {
     if (!this.stopped) return;
     this.stopped = false;
+    this.ended = false;
     const interval = this.options.settings.intervalSeconds * 1000;
     const loop = async () => {
       if (this.stopped) return;
@@ -1107,12 +1273,14 @@ export class AgentsFill {
   /** Stop the loop. A check in progress is interrupted (its capacity_cmd killed) and awaited. */
   async stop(): Promise<void> {
     this.stopped = true;
+    this.ended = true;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
     this.abort?.abort();
     await this.checking;
+    await this.again;
   }
 
   private async runCheck(): Promise<void> {
@@ -1326,6 +1494,41 @@ export class AgentsFill {
     return counted;
   }
 
+  /**
+   * bus.consume observe: for the latest mirrored lines, what the bus report
+   * would have been read as next to what fill's patterns read the same line
+   * as, for the tasks_file line of the task the report names. Kept in memory
+   * by the bus consumers (Home → Health); nothing is written, nothing acts.
+   */
+  private observe(bus: BusLineSource, queue: QueueLines, entries: TasksFileEntry[]): void {
+    const { settings } = this.options;
+    const byTask = new Map<string, TaskLineFields>();
+    // An unassigned line (no agent) reads no report: fill starts nothing for it
+    for (const entry of entries) if (entry.kind === "task" && entry.agent !== null) byTask.set(entry.task, { ...entry, agent: entry.agent });
+    for (const { line, report } of queue.mirrored().slice(-MAX_OBSERVED_LINES)) {
+      const entry = byTask.get(report.task);
+      if (!entry) continue;
+      const queries: LineQuery[] = [
+        { kind: "done", pattern: fillPatternFor(settings.donePattern, entry.task, entry.agent) },
+        { kind: "waiting", pattern: fillPatternFor(settings.waitingPattern, entry.task, entry.agent) },
+        { kind: "blocked", pattern: fillPatternFor(settings.blockedPattern, entry.task, entry.agent) },
+      ];
+      let file = reading(null, null);
+      for (const { kind, pattern } of queries) {
+        const match = taskLineMatch(pattern, line);
+        if (match === null) continue;
+        file = reading(kind, kind === "waiting" ? match.groups?.wake?.trim() || null : null);
+        break;
+      }
+      // As on mode reads it (QueueLines.match): a pattern that names the agent needs the report to be that agent's
+      const kind = LINE_KIND[report.kind];
+      const query = queries.find((q) => q.kind === kind);
+      const otherAgent = query !== undefined && query.pattern.agent !== null && report.agent.toLowerCase() !== entry.agent.toLowerCase();
+      const wouldRead = otherAgent ? reading(null, null) : reading(kind, report.gateId);
+      bus.observed({ consumer: "fill", busId: report.id, task: report.task, agent: report.agent, report: wouldRead, file });
+    }
+  }
+
   private async evaluate(signal: AbortSignal, now: number): Promise<FillLineView[]> {
     const { project, settings, store, config, probes } = this.options;
     const path = this.tasksPath;
@@ -1335,7 +1538,10 @@ export class AgentsFill {
     const byAgent = matchesByAgent(settings);
     const entries = parseTasksFile(read.text, byAgent);
     const allowed = new Set(settings.agents);
-    const queue = new QueueLines(config.queue_file);
+    // bus.consume on: mirrored lines are read by their bus report; observe: compared, nothing else changes
+    const bus = this.options.bus?.() ?? null;
+    const queue = new QueueLines(config.queue_file, bus);
+    if (bus?.mode === "observe") this.observe(bus, queue, entries);
     // The gate queue, read at most once per check, and only when a waiting line names a gate
     let gateRequests: Map<string, QueuedRequest> | null = null;
     const gateQueue = () => (gateRequests ??= readGateQueue(config.gates_dir));
@@ -1427,13 +1633,29 @@ export class AgentsFill {
           decisionId: null,
         });
       };
-      const hold = async (kind: FillHold, reason: string, runId: string | null = null, waiting: FillWaitingView | null = null) => {
+      // `busId`: the bus report the hold stands on (bus.consume on). Its fill_held is recorded once for that report
+      // and run, also across restarts (held kinds are in memory only, so a hold from a queue line is recorded again
+      // after a restart, as before)
+      const hold = async (
+        kind: FillHold,
+        reason: string,
+        runId: string | null = null,
+        waiting: FillWaitingView | null = null,
+        busId: number | null = null,
+      ) => {
         show("held", reason, runId, kind, waiting);
         if (this.holds.get(key) === kind) return;
         this.holds.set(key, kind);
         await this.options.record(
           "fill_held",
-          { agent, task, summary: `fill holds ${agent} on ${task}: ${reason}`, evidence: [reason], data: { line, hold: kind, reason } },
+          {
+            agent,
+            task,
+            summary: `fill holds ${agent} on ${task}: ${reason}`,
+            evidence: [reason],
+            data: busId === null ? { line, hold: kind, reason } : { line, hold: kind, reason, busId },
+            dedupeKey: busId === null ? undefined : `fill_held:${task}:${runId ?? "none"}:${kind}:bus:${busId}`,
+          },
           probes.clock.now(),
         );
       };
@@ -1511,7 +1733,7 @@ export class AgentsFill {
         continue;
       }
       // A DONE line that names a PR counts only when the PR is ready to review (settings.readyGuard)
-      const refusal = check?.kind === "queue" ? await this.guardReport(agent, task, check.line, latest, description) : null;
+      const refusal = check?.kind === "queue" ? await this.guardReport(agent, task, check.line, latest, description, check.report) : null;
       if (refusal?.retry && refusal.expired && !(release && release.at >= refusal.since)) {
         // Waited long enough: one decision for the owner, the report stays refused
         await refused(
@@ -1523,11 +1745,20 @@ export class AgentsFill {
       }
       if (refusal?.retry && !refusal.expired) {
         // Only time can fix it (CI running): not done, no new run, checked again on the next check
-        await hold("report_refused", `done line not accepted yet: ${refusal.problems.map((p) => oneLine(p, 160)).join("; ")}; checked again on the next check`, latest?.id ?? null);
+        await hold(
+          "report_refused",
+          `done line not accepted yet: ${refusal.problems.map((p) => oneLine(p, 160)).join("; ")}; checked again on the next check`,
+          latest?.id ?? null,
+          null,
+          check?.kind === "queue" ? (check.report?.id ?? null) : null,
+        );
         continue;
       }
       if (check?.kind === "queue" && !refusal) {
         const done = check.line;
+        const data: Record<string, unknown> = { line: done, runId: latest?.id ?? null, lineHash: lineHash(fields) };
+        // Read from a bus report (bus.consume on): which one
+        if (check.report) data.busId = check.report.id;
         await this.options.record(
           "fill_done",
           {
@@ -1536,7 +1767,7 @@ export class AgentsFill {
             runId: latest?.id,
             summary: `fill: ${task} is done: ${oneLine(done)}`,
             evidence: [done],
-            data: { line: done, runId: latest?.id ?? null, lineHash: lineHash(fields) },
+            data,
             dedupeKey: fillDoneKey(task, latest?.id ?? null, fields),
           },
           probes.clock.now(),
@@ -1608,7 +1839,7 @@ export class AgentsFill {
         latest && latest.state === "completed" && latest.id !== releasedRun ? await this.runStatus(latest, agent, task, queue, until) : null;
       if (latest && status?.kind === "blocked") {
         const reason = `blocked: ${oneLine(status.line)}: fill leaves the task to you (release the hold once it is unblocked)`;
-        await hold("blocked", reason, latest.id);
+        await hold("blocked", reason, latest.id, null, status.busId);
         await ask(latest, fillDecisionKey(task, latest.id, "blocked"), {
           code: "blocked_reported",
           question: `${agent} is paused on ${task}: it reported the task blocked`,
@@ -1729,7 +1960,7 @@ export class AgentsFill {
           );
         } else if (wait.kind === "pending") {
           const detail = queued ? `waiting: ${queuedText(queued)}; starts again once ${wait.file} exists` : wait.detail;
-          await hold("waiting", detail, latest.id, { ...wait.view, queued: queuedView });
+          await hold("waiting", detail, latest.id, { ...wait.view, queued: queuedView }, status.busId);
           continue;
         } else {
           // Waiting on nothing that came: a run without progress, counted and backed off
@@ -1950,11 +2181,19 @@ export class AgentsFill {
     line: string,
     latest: AgentRun | null,
     taskText: string,
+    report: StructuredReport | null = null,
   ): Promise<{ retry: boolean; expired: boolean; since: number; problems: string[] } | null> {
     const { store, project, settings, probes } = this.options;
     if (!settings.readyGuard) return null;
     const now = probes.clock.now();
-    const parsed = parseReadyReport(line, taskText);
+    // A bus report (bus.consume on) names its PR and head in fields of their own: nothing is parsed from text
+    const parsed: ParsedReport = report
+      ? report.pr === null
+        ? { kind: "none" }
+        : { kind: "pr", report: { pr: report.pr, sha: report.sha?.toLowerCase() ?? null } }
+      : parseReadyReport(line, taskText);
+    // Whose branch the PR must be: the agent that reported it
+    const reporter = report?.agent ?? agent;
     let pr: number | null = null;
     let verdict: ReadyVerdict;
     if (parsed.kind === "ambiguous") {
@@ -1976,7 +2215,7 @@ export class AgentsFill {
       } else if (now < this.guardDownUntil) {
         verdict = unverifiable(pr, "the git host is not answering; asked again shortly");
       } else {
-        verdict = await evaluateReady(parsed.report, source, { agent });
+        verdict = await evaluateReady(parsed.report, source, { agent: reporter });
         if (!verdict.ok && verdict.hostDown) this.guardDownUntil = now + HOST_BACKOFF_MS;
       }
     }
@@ -2175,6 +2414,7 @@ export class AgentsFill {
     const seen = queue.lastStatus(
       fillPatternFor(settings.waitingPattern, task, agent),
       fillPatternFor(settings.blockedPattern, task, agent),
+      { task, agent },
       latest.queueMark,
       until,
     );
@@ -2187,7 +2427,7 @@ export class AgentsFill {
           runId: latest.id,
           summary: `fill: run ${short(latest.id)} of ${agent} on ${task} ended ${seen.kind}: ${oneLine(seen.line)}`,
           evidence: [seen.line],
-          data: { line: seen.line, wake: seen.wake },
+          data: seen.busId === null ? { line: seen.line, wake: seen.wake } : { line: seen.line, wake: seen.wake, busId: seen.busId },
           dedupeKey: `fill_status:${task}:${latest.id}:${seen.kind}:${sha256(Buffer.from(seen.line, "utf-8")).slice(0, 16)}`,
         },
         probes.clock.now(),
@@ -2200,6 +2440,7 @@ export class AgentsFill {
       kind: kept.kind === "fill_waiting" ? "waiting" : "blocked",
       line: String(kept.data.line ?? ""),
       wake: typeof kept.data.wake === "string" ? kept.data.wake : null,
+      busId: typeof kept.data.busId === "number" ? kept.data.busId : null,
     };
   }
 

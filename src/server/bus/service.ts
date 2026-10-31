@@ -190,7 +190,7 @@ export class BusService {
     // Mirror to text files
     const mirrored: string[] = [];
     if (this.mirror) {
-      const files = this.mirror.mirrorReport(binding.agent, kind, task, sanitizedSummary, iso(now), gateId, pr, sha);
+      const files = this.mirror.mirrorReport(binding.agent, kind, task, sanitizedSummary, iso(now), gateId, pr, sha, id);
       mirrored.push(...files);
     }
 

@@ -22,6 +22,7 @@ const OFF: ModuleFlags = {
   review: false,
   triage: false,
   placement: false,
+  hostServices: false,
   cloud: false,
   pipelines: false,
   delivery: false,

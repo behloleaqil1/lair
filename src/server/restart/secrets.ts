@@ -6,11 +6,13 @@ import type { ProjectConfig } from "../../shared/types.js";
 import { parseAgentsConfig } from "../agents/config.js";
 import { parsePipelineConfig } from "../gates/project-pipelines.js";
 import { parseReviewConfig } from "../review/config.js";
+import { parseTrackerConfig } from "../tracker/config.js";
 
 /**
  * review.token_env (reviews on), executors.github.token_env (pipelines
- * configured) and agents.env_passthrough (agents on: the provider keys the
- * agents get), over all `configs`.
+ * configured), agents.env_passthrough (agents on: the provider keys the
+ * agents get) and the tracker's token variable (tracker on), over all
+ * `configs`.
  */
 export function configuredTokenEnvs(configs: ProjectConfig[]): string[] {
   const names = new Set<string>();
@@ -23,6 +25,8 @@ export function configuredTokenEnvs(configs: ProjectConfig[]): string[] {
     }
     const agents = parseAgentsConfig(config.agents, config);
     if (agents.ok && agents.settings.enabled) for (const name of agents.settings.envPassthrough) names.add(name);
+    const tracker = parseTrackerConfig(config.tracker, config);
+    if (tracker.ok && tracker.settings.enabled) names.add(tracker.settings.token.env);
   }
   return [...names].sort();
 }

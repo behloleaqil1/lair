@@ -1,9 +1,11 @@
 /**
  * Home → Health: Lair's own self-checks (the failing and warning ones with
- * their fix; SelfChecks.tsx, the owner's), then the progress watchdog: SLO
- * status per detector, breaches and playbook runs. Read-only; the watchdog
- * is configured in the project YAML (watchdog:, see
- * docs/configuration.md#watchdog), the self-checks in its supervisor: block.
+ * their fix; SelfChecks.tsx, the owner's), then the bus reports (while the
+ * project's bus.consume is observe or on: observe mode's comparison and the
+ * refused reports), then the progress watchdog: SLO status per detector,
+ * breaches and playbook runs. Read-only; the watchdog is configured in the
+ * project YAML (watchdog:, see docs/configuration.md#watchdog), the
+ * self-checks in its supervisor: block, the bus in its bus: block.
  */
 import { useApi } from "../hooks/useApi";
 import { SelfChecks } from "./SelfChecks";
@@ -97,6 +99,7 @@ export function Health({ project, refreshKey }: Props) {
   return (
     <div>
       <SelfChecks project={project} refreshKey={refreshKey} />
+      <BusConsumersHealth project={project} refreshKey={refreshKey} />
       <WatchdogHealth project={project} refreshKey={refreshKey} />
     </div>
   );
@@ -271,6 +274,96 @@ function WatchdogHealth({ project, refreshKey }: Props) {
                   </td>
                   <td>{b.summary}</td>
                   <td className="muted small">{b.resolution}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============ The bus consumers (bus.consume, src/server/bus/consumers.ts) ============
+
+/** GET /api/bus/consumers (BusConsumerHealth) */
+interface BusConsumersStatus {
+  mode: "off" | "observe" | "on";
+  received: number;
+  refused: { at: string; busId: number | null; reason: string }[];
+  refusedCount: number;
+  observations: {
+    total: number;
+    matches: number;
+    mismatches: number;
+    recent: { consumer: "fill" | "planner"; busId: number; task: string; agent: string; report: string; file: string; at: string }[];
+  };
+}
+
+/** How fill and the planner read the agents' bus reports; nothing while the project's bus is off. */
+function BusConsumersHealth({ project, refreshKey }: Props) {
+  const status = useApi<BusConsumersStatus>("/bus/consumers", project, refreshKey);
+  const s = status.data;
+  if (!s || s.mode === "off") return null;
+  const o = s.observations;
+
+  return (
+    <div>
+      <div className="section-head">
+        <h2>Bus reports</h2>
+        <Badge tone={s.mode === "on" ? "badge-success" : "badge-neutral"}>{s.mode === "on" ? "On" : "Observe"}</Badge>
+        <span className="muted small">{s.received} report(s) received since the server started</span>
+      </div>
+      <div className="card">
+        <p className="muted small">
+          {s.mode === "on"
+            ? "Fill and the planner read the agents' bus reports in place of the queue lines the bus mirrors, as soon as each arrives."
+            : "Fill and the planner still read the queue lines. For each line the bus mirrored, this compares what its report says with what their patterns read."}
+        </p>
+        {s.mode === "observe" && (
+          <p>
+            Compared: {o.total}, the same: {o.matches}, different:{" "}
+            <Badge tone={o.mismatches > 0 ? "badge-warning" : "badge-success"}>{o.mismatches}</Badge>
+          </p>
+        )}
+        {o.recent.length > 0 && (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Report</th>
+                <th>Read by</th>
+                <th>The report says</th>
+                <th>The patterns read</th>
+              </tr>
+            </thead>
+            <tbody>
+              {o.recent.map((r) => (
+                <tr key={`${r.consumer}-${r.busId}`}>
+                  <td>
+                    <code>
+                      #{r.busId} {r.task}
+                    </code>{" "}
+                    <span className="muted small">by {r.agent}</span>
+                  </td>
+                  <td>{r.consumer}</td>
+                  <td>{r.report}</td>
+                  <td>{r.file}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+      {s.refused.length > 0 && (
+        <div className="card">
+          <h3>Refused or ignored ({s.refusedCount})</h3>
+          <table className="table">
+            <tbody>
+              {s.refused.map((r, i) => (
+                <tr key={i}>
+                  <td className="muted small">{time(r.at)}</td>
+                  <td>{r.busId === null ? "—" : `#${r.busId}`}</td>
+                  <td>{r.reason}</td>
                 </tr>
               ))}
             </tbody>

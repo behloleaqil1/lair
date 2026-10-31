@@ -325,6 +325,20 @@ export class BusStore {
     return map;
   }
 
+  /** The project's reports with these ids (an id it doesn't have is left out), read 500 at a time. */
+  getReports(ids: number[]): BusReport[] {
+    const out: BusReport[] = [];
+    for (let i = 0; i < ids.length; i += 500) {
+      const chunk = ids.slice(i, i + 500).filter((id) => Number.isSafeInteger(id));
+      if (chunk.length === 0) continue;
+      const rows = this.db
+        .prepare(`SELECT * FROM bus_reports WHERE project = ? AND id IN (${chunk.map(() => "?").join(", ")})`)
+        .all(this.project, ...chunk) as ReportRow[];
+      out.push(...rows.map(toReport));
+    }
+    return out;
+  }
+
   /** List recent reports. */
   listReports(options: { task?: string; agent?: string; limit?: number } = {}): BusReport[] {
     const where = ["project = ?"];

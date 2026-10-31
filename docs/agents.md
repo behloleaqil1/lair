@@ -216,6 +216,38 @@ After `npm run build` you can use `node /path/to/lair/dist/bus/cli.js --project 
 
 The fleet bus ensures atomic task claims (no two agents can claim the same task) and provides instant updates to the UI.
 
+### Reports that fill and the planner read (bus.consume)
+
+The stdio server above keeps its own database: what it writes reaches Lair only as text in the queue file. For fill and
+the planner to read an agent's reports as structured data, set the project's `bus.consume` to `observe` or `on`
+([configuration.md#fleet-bus](configuration.md#fleet-bus)). Lair then gives each run a bus token (`LAIR_BUS_TOKEN`) and
+the server's address (`LAIR_URL`); the token works only while that run is active. The agent reports with
+`lair bus report --kind DONE --task <id> --summary-file <file> [--gate <id>] [--pr <n>] [--sha <sha>]`, or with the
+same tools over MCP from `lair bus-mcp`. Each report is stored by the server, appended to the queue file as a line that
+ends with `[bus:<id>]`, and read by fill and the planner from its fields (task, kind, gate id, PR, sha) instead of from
+the line's text.
+
+### On a host that blocks node for agents
+
+On a host where agents may not run node themselves (privacy controls, a corporate policy, a sandbox), the agent tool
+starts the MCP server from the **owner's** MCP config, with an absolute node path. It runs Lair's own code, never code
+the agent chose, and it gets the run's environment (`LAIR_BUS_TOKEN`, `LAIR_URL`) from the agent tool. The owner
+installs it:
+
+```json
+{
+  "mcpServers": {
+    "lair": {
+      "command": "/usr/local/bin/node",
+      "args": ["/path/to/lair/dist/cli/lair.js", "bus-mcp"]
+    }
+  }
+}
+```
+
+The agent can't change which code runs (the path is in the owner's config), and it reaches the bus only through
+Lair's API, with its run's token.
+
 ## Checks: test before you gate
 
 Agents can run targeted tests before submitting a gate, using the HTTP API with their bus token. This is faster and cheaper than a full gate (the same tests that take 15 min on a loaded machine take ~2.5 min on a dedicated runner).

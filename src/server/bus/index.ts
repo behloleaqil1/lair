@@ -29,3 +29,33 @@ export type { BusTokenBinding } from "./tokens.js";
 
 export { BusMirror } from "./mirror.js";
 export type { BusMirrorConfig } from "./mirror.js";
+
+export {
+  BusConsumers,
+  BUS_CONSUME_MODES,
+  extractBusId,
+  stripBusMarker,
+  isMirrorOf,
+  mirroredReport,
+  structuredReport,
+  validateBusReportEvent,
+  validateBusMessageEvent,
+  eventMismatch,
+} from "./consumers.js";
+export type {
+  BusConsumeMode,
+  BusConsumerHealth,
+  BusConsumersOptions,
+  BusLineSource,
+  BusMessageEvent,
+  BusObservation,
+  BusObservationView,
+  BusRefusal,
+  BusReportEvent,
+  StructuredReport,
+} from "./consumers.js";
+
+export { parseBusConfig } from "./config.js";
+export type { BusSettings } from "./config.js";
+export { agentsBusFor } from "./wiring.js";
+export type { AgentsBusOptions } from "./wiring.js";

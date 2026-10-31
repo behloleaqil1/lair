@@ -145,9 +145,9 @@ describe("decision class, evidence and option effects", () => {
     expect(warn.mock.calls.filter((c) => String(c[0]).includes("agents.new_thing"))).toHaveLength(1);
   });
 
-  it("the classes of the policy table are the eleven of the design, each in module.name", () => {
+  it("the classes of the policy table are the twelve of the design, each in module.name", () => {
     const policies = Object.values(KNOWN_DECISION_CLASSES).map((c) => c.policy);
-    expect(policies.sort()).toEqual(["C1", "C10", "C11", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9"].sort());
+    expect(policies.sort()).toEqual(["C1", "C10", "C11", "C12", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9"].sort());
     for (const id of Object.keys(KNOWN_DECISION_CLASSES)) expect(isKnownDecisionClass(id)).toBe(true);
     expect(isKnownDecisionClass("toString")).toBe(false);
   });

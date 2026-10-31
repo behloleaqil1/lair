@@ -4,7 +4,7 @@
  * `agents.enabled: true`.
  */
 export { AgentsManager, AgentsService, AgentsError } from "./service.js";
-export type { AgentRuns, AgentsManagerOptions, AgentsServiceOptions, RunRequest } from "./service.js";
+export type { AgentRuns, AgentsBus, AgentsManagerOptions, AgentsServiceOptions, RunRequest } from "./service.js";
 export { registerAgentsRoutes } from "./routes.js";
 export { parseAgentsConfig } from "./config.js";
 export type { AgentsSettings } from "./config.js";

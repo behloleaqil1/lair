@@ -355,6 +355,10 @@ export interface QueueEvent {
   /** The task as the line names it (parseQueueLine), not necessarily a task id */
   task: string | null;
   text: string;
+  /** bus.consume on: the bus report the line mirrors; type, agent and task are then the report's own */
+  busId?: number;
+  /** bus.consume on: the report's own summary (what a BLOCKED report gives as its reason) */
+  summary?: string;
 }
 
 export interface QueueEventsRead {
