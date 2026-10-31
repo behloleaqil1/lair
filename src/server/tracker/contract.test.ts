@@ -7,12 +7,12 @@
  * is a stand-in.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { appendFileSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
 import { EventBus } from "../core/event-bus.js";
-import { cleanup as plannerCleanup, makePaths, plannerBlock, queue, setup, tasks } from "../planner/testing/harness.js";
+import { MIN, cleanup as plannerCleanup, makePaths, plannerBlock, queue, setup, tasks } from "../planner/testing/harness.js";
 import { ReviewManager } from "../review/service.js";
 import { FakeClock, FakeGit, FakeRemote, fakeGitHubApi, type FakeFile, type Person } from "../review/testing/fakes.js";
 import { TrackerManager } from "./manager.js";
@@ -83,7 +83,19 @@ describe("the events the agents module and the planner emit", () => {
     expect(gh.issue("example/demo", issue.number)?.labels).toEqual(["blocked"]);
     expect(gh.issue("example/demo", issue.number)?.comments).toHaveLength(1);
 
-    // The planner marks it done from the queue: planner.changed {op: "mark_done"} as it emits it
+    // The run exits 0 (agent.run.ended: an exit is not a done task, nothing moves)
+    const call = h.spawner.calls.at(-1)!;
+    h.clock.t += 2 * MIN;
+    appendFileSync(call.logPath, "worked\n");
+    const t = new Date(h.clock.now());
+    utimesSync(call.logPath, t, t);
+    h.spawner.exit(call.pid, 0);
+    await h.agentsService.tick();
+    await idle();
+    expect(h.bus.some((e) => e.type === "agent.run.ended" && e.data.task === "feat-login")).toBe(true);
+    expect(gh.card(board, "example/demo", issue.number)?.status).toBe("In progress");
+
+    // The planner marks it done from the queue (a task with an active run never is): planner.changed {op: "mark_done"}
     queue(p, "- DONE feat-login by worker-a 12:05Z: merged #12");
     await h.service.cycle();
     await idle();
