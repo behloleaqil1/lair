@@ -1129,6 +1129,7 @@ With `supervisor.chat.enabled`, the Ask tab sends questions to the supervisor (a
 | `chat.min_interval_seconds` | number | `30` | Between the starts of two supervisor runs (0 to 86400) |
 | `chat.max_conversation_turns` | number | `10` | Questions in one conversation; then you start a new one (1 to 50) |
 | `chat.answer_timeout_minutes` | number | `15` | A question with no answer this long after it was asked is closed, and its run stopped (1 to 240) |
+| `chat.answer_file` | boolean | `false` | The run answers by writing `answer.json` at the exact path Lair gives it, instead of with `lair supervisor answer` (for agent tools that can't run commands on the host); see [Submitting the answer](#a-supervisor-run) |
 | `digest.enabled` | boolean | `false` | A supervisor run writes a digest once a day |
 | `digest.time` | `HH:MM` | `"08:00"` | When, in this machine's local time (24 hours) |
 
@@ -1148,33 +1149,36 @@ A question starts a conversation, or continues the one the chat panel has open, 
 - the context, as JSON data under a heading that says it is data: the self-checks that need a look (with their values and fixes) and the ids of those that pass, the project's open decisions (at most 30: id, kind, title, the module that raised it, since when), and the conversation so far (each question cut to 1000 characters and each answer to 3000, at most 12000 in all, the oldest dropped first). Every string is redacted as the ops API's answers are;
 - the question, or for a digest what Lair asks for.
 
-**Its environment** has what the agents module gives every run, and three of its own, kept in the agents module's memory only (never in its store, the prompt file or a log):
+**Its environment** has what the agents module gives every run, and three of its own (four with `chat.answer_file`), kept in the agents module's memory only (never in its store, the prompt file or a log):
 
 - `LAIR_OPS_TOKEN`: a [run token](#the-ops-api) minted for this run: it reads this project only, and stops working when the run ends, however it ends, or at `answer_timeout_minutes`;
 - `LAIR_URL`: this server;
-- `LAIR_SUPERVISOR_CONVERSATION`: the conversation's id.
+- `LAIR_SUPERVISOR_CONVERSATION`: the conversation's id;
+- with `chat.answer_file`, also `LAIR_ANSWER_FILE`: the exact path of the run's `answer.json` (below).
 
-**Submitting the answer.** The run writes `answer.json` in any working directory it can write to. Lair picks it up as soon as the file appears, or when the run ends with the file present. Schema:
+**Submitting the answer.** The run writes its answer as Markdown in a file, and the evidence it cites as a JSON list of `{tool, args, note}` (each `tool` an ops tool, its `args` as called, and a note of what it showed; at most 30), both outside the repository (the prompt says `$TMPDIR`), then runs:
+
+```
+lair supervisor answer --conversation <id> --file "$TMPDIR/answer.md" [--evidence-file "$TMPDIR/evidence.json"]
+```
+
+It is `node <lair>/dist/cli/lair.js supervisor answer ...` after `npm run build` (the prompt gives the exact command), and reads `LAIR_OPS_TOKEN`, `LAIR_URL` (default `http://127.0.0.1:4777`) and, without `--conversation`, `LAIR_SUPERVISOR_CONVERSATION`. It posts to `POST /api/ops/answer`. Lair takes an answer once per question, only under the token of the run that was asked, and only while that run is active; the token is never printed. Exit codes: `0` recorded; `1` refused (an ended, another run's or the owner's token, an answer already given, an invalid answer: Lair says which); `2` a usage or input error, and nothing was sent; `3` Lair could not be reached, or answered with a server error.
+
+**The answer as a file (`chat.answer_file`, off by default).** For an agent tool that can't run commands on the host (a sandbox, a security block), the run can write its answer to a file instead. Before the run starts, Lair makes a private folder for it (mode 0700, an unguessable name) under `<agents_dir>/supervisor-runs/`, puts the exact path of `answer.json` in it in `LAIR_ANSWER_FILE` and in the prompt, and reads only that path. The prompt tells the run to write the file, not to run `node`, `npm` or `lair` commands to submit it, not to work around a block on the host, and to exit once the file is written. The file:
 
 ```json
 {
-  "answer": "Your Markdown answer here (≤ 8 KB)",
+  "answer": "Your Markdown answer (at most 8 KB)",
   "evidence": [
     {"tool": "events.query", "args": {"agent": "worker-a"}, "note": "two transient errors at 09:12 and 09:40"}
-  ],
-  "confidence": "high"
+  ]
 }
 ```
 
-- `answer` (required): your Markdown answer, at most 8 KB.
-- `evidence` (required, may be empty `[]`): the tool calls your answer rests on, each with `tool` (an ops tool), `args` (as called), and `note` (what it showed); at most 20 items.
-- `confidence` (optional): your confidence level.
+- `answer` (required): the Markdown answer, at most 8 KB (UTF-8 bytes).
+- `evidence` (required, `[]` if none): as for the CLI, at most 20 items.
 
-Validation: a regular file inside the run's directory, at most 64 KB, valid JSON with the schema above. A file outside the run directory (via symlink or path traversal) is refused. An invalid file is logged with the reason, and if the run ends or times out with an invalid `answer.json`, the "no answer" reason includes it.
-
-**CLI path (backward compatible).** The run can also call `lair supervisor answer --conversation <id> --file "$TMPDIR/answer.md" [--evidence-file "$TMPDIR/evidence.json"]` (`node <lair>/dist/cli/lair.js supervisor answer ...` after build), which posts to `POST /api/ops/answer`. Both paths work, and **whichever arrives first wins**: the second is ignored and audited. The CLI reads `LAIR_OPS_TOKEN`, `LAIR_URL` (default `http://127.0.0.1:4777`) and, without `--conversation`, `LAIR_SUPERVISOR_CONVERSATION`. Exit codes: `0` recorded; `1` refused (an ended, another run's or the owner's token, an answer already given, an invalid answer: Lair says which); `2` a usage or input error, and nothing was sent; `3` Lair could not be reached, or answered with a server error.
-
-**Why the file path?** An agent tool may not be able to run `node` or CLI commands on the host (a security block, a sandbox). The prompt now tells the run to write `answer.json`, never to run node, npm or CLI commands to submit, and never to try to work around a host restriction.
+No other field is accepted. The file must be a regular file (not a symlink) inside the run's folder, at most 64 KB, valid JSON of that shape. Lair reads it only once the run has ended, or at the question's deadline (then it stops the run): never while the run goes on, so a file still being written is not read. A valid file answers the question once (it is moved aside so it is never read twice); an invalid one is refused, and the "no answer" reason says why. The CLI still works with the switch on, and the first answer counts: a later one is refused (the CLI) or ignored and logged (the file). The run's folder is removed when its question is closed, at the deadline of a question answered with the CLI, and, for folders left by a restart, when Lair starts. Without a folder (it can't be made), the run is told to answer with the CLI.
 
 `lair ops call <tool> [--args <json>]` is the same kind of command for the read tools: it checks the tool and its arguments with the server's own list before sending anything, and prints Lair's answer as JSON (`{tool, project, truncated, result}`), with the same exit codes.
 
@@ -1185,7 +1189,7 @@ Validation: a regular file inside the run's directory, at most 64 KB, valid JSON
 - links go only to the dashboard's own pages (`#/work/<agent>`, `#/decisions/<id>`, ...) and to the repository's host (`https://github.com/<owner>/<name>/...`, or the review module's API host); any other link is its text, not clickable;
 - secrets of known shapes, `Authorization` and `Bearer` values and a URL's credentials are taken out, of the evidence's notes and arguments too.
 
-**No answer.** A question is closed as "no answer", with the reason, when its run ends without answering (it exited, crashed, failed over or was recovered into a new run, whose token no longer works, or you stopped it), when `answer_timeout_minutes` pass, or when Lair restarts before the answer comes (tokens live in memory only). Before closing, Lair checks for `answer.json` in the run's directory: if it exists and is valid, the answer is taken even after the run ends or times out; if it exists but is invalid, the "no answer" reason includes the validation error. An answer's token ends, and whatever still runs of its task is stopped (its claim released). Nothing is retried on its own: ask again. An answered question whose run is still going at its deadline is stopped too.
+**No answer.** A question is closed as "no answer", with the reason, when its run ends without answering (it exited, crashed, failed over or was recovered into a new run, whose token no longer works, or you stopped it), when `answer_timeout_minutes` pass, or when Lair restarts before the answer comes (tokens live in memory only). With `chat.answer_file`, a valid `answer.json` is taken first, when the run ended or at the deadline; an invalid one adds its error to the reason. Its token ends, and whatever still runs of its task is stopped (its claim released). Nothing is retried on its own: ask again. An answered question whose run is still going at its deadline is stopped too.
 
 **Bounds.** A question that would start a run past `max_runs_per_day` (in the 24 hours before), or sooner than `min_interval_seconds` after the last supervisor run started, is refused with why and when to try again (HTTP 429); so is a question past `max_conversation_turns` (409). A refused question leaves nothing behind. The agents module's budgets apply on top: an agent over its budget starts nothing.
 
