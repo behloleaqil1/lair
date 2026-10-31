@@ -43,16 +43,18 @@ const FETCH_TIMEOUT_ALLOWED: Array<{ file: string; match: string; reason: string
   { file: "gates/executors/types.ts", match: "signal: AbortSignal", reason: "type definition, not a call" },
   { file: "gates/gate-executor.ts", match: "signal?: AbortSignal", reason: "type definition, not a call" },
   { file: "agents/fill.ts", match: "signal: AbortSignal", reason: "parameter type, caller provides signal" },
-  // Callers that receive the signal from their caller
+  // Callers that receive the signal from their caller or use injectable fetch
   { file: "gates/executors/github-api.ts", match: "await this.options.fetch", reason: "receives signal from caller via options" },
   { file: "gates/pipeline-service.ts", match: "fetchImpl:", reason: "type definition for injectable fetch" },
   { file: "review/github.ts", match: "this.fetchFn", reason: "injectable fetch, caller controls timeout" },
   { file: "notifications/mount.ts", match: "fetch:", reason: "injectable fetch option, not a call" },
   { file: "notifications/senders.ts", match: "this.options.fetch", reason: "injectable fetch, caller controls timeout" },
-  // Wrapped with AbortSignal.timeout or AbortController
-  { file: "delivery/probes.ts", match: "AbortSignal.timeout", reason: "has AbortSignal.timeout in the same call" },
-  { file: "brain-bench/models.ts", match: "AbortSignal.timeout", reason: "has AbortSignal.timeout in the same call" },
-  { file: "services/managed-process.ts", match: "signal: controller.signal", reason: "uses AbortController with setTimeout for timeout" },
+  // Injectable fetch with timeout on next line or in options
+  { file: "brain-bench/models.ts", match: "o.fetch(url", reason: "has AbortSignal.timeout in the same call object (signal: AbortSignal.timeout)" },
+  // Wrapped with AbortController setTimeout
+  { file: "services/managed-process.ts", match: "await fetch(config.url", reason: "uses AbortController with setTimeout for timeout (see lines above the call)" },
+  // Wrapped with AbortSignal.timeout directly in call
+  { file: "delivery/probes.ts", match: "fetch(url", reason: "has AbortSignal.timeout in the same call" },
 ];
 
 /**
