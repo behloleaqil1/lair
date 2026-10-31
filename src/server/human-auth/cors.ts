@@ -60,6 +60,8 @@ export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/bus/send",
   // Host services: the owner's tick runs start commands (its reads under /api/host-services stay public)
   "/api/host-services/owner",
+  // Checks: POST takes a bus token, GET /:id takes a token or owner, list and stats are owner-only
+  "/api/checks",
 ];
 
 export function isUnder(url: string, prefixes: readonly string[]): boolean {

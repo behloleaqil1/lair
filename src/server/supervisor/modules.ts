@@ -39,7 +39,7 @@ export function moduleReports(m: ReportingModules, project: string, config: Proj
   }
   if (m.agents) {
     const s = m.agents.status(project);
-    reports.push({ module: "agents", on: on.agents, errors: s.errors, lastError: s.lastError });
+    reports.push({ module: "agents", on: on.agents, errors: s.errors, lastError: s.lastError, warnings: s.fill?.warnings ?? [] });
   }
   if (m.triage) {
     reports.push({ module: "triage", on: on.triage, errors: m.triage.status(project).errors, lastError: null });
