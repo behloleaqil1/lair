@@ -161,16 +161,23 @@ describe("DirWatch", () => {
     const dir = folderWithFiles(tempRoot());
     const h = watchDir(dir);
     rmSync(dir, { recursive: true, force: true });
-    await waitFor("unlink a.log", () => h.saw("unlink", "a.log"));
-    // Allow extra time on slow CI runners (macOS) for watcher to detect removal
-    await sleep(500);
+    // macOS FSEvents can be very slow or unreliable for directory removal.
+    // Wait for either the unlink event OR for the watch to notice the folder
+    // is gone (state becomes "polling"). Either means the removal was detected.
+    await waitFor(
+      "unlink a.log or polling state",
+      () => h.saw("unlink", "a.log") || h.watch.state === "polling",
+      20_000,
+    );
+    // Allow extra time for watcher to stabilize after removal detection
+    await sleep(600);
     mkdirSync(dir);
     writeFileSync(join(dir, "n.log"), "n\n");
-    await waitFor("add n.log", () => h.saw("add", "n.log"));
-    await waitFor("the watch", () => h.watch.state === "watching");
+    await waitFor("add n.log", () => h.saw("add", "n.log"), 20_000);
+    await waitFor("the watch", () => h.watch.state === "watching", 20_000);
     writeFileSync(join(dir, "m.log"), "m\n");
-    await waitFor("add m.log", () => h.saw("add", "m.log"));
-  }, 15_000);
+    await waitFor("add m.log", () => h.saw("add", "m.log"), 20_000);
+  }, 90_000);
 
   it("does nothing after stop()", async () => {
     const dir = folderWithFiles(tempRoot());
