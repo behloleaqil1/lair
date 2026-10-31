@@ -1878,6 +1878,7 @@ Agents often end a run on purpose before the task is done: on a WAITING line (`-
 - **Re-queued under a new id.** Some gate systems re-check or re-queue a gate under a new id and leave a marker naming it. Set `wake.requeue_marker` to that marker's path (`{wake}` is the id the waiting line names, `{n}` tries 1 to 9, and it must stay inside `wake.root`): the marker's first line, when it is a plain name, is the new id, and its markers are followed in turn (at most 10 ids). A wait whose new id is still in the queue is alive in the same way, and the new id's result (`wake.file` for it, newer than the run's chain) wakes the task as its own would. A marker that is a symlink, not a regular file, or whose first line isn't a plain name is passed over. Without `requeue_marker` only the waiting line's own id is looked up.
 - **Blocked.** A run that ends on a line matching `blocked_pattern` holds the task at once (`held: blocked`), with no restart, and raises one decision carrying the BLOCKED line. The line is cut to 300 characters and shown as data in a code block. It never goes into a prompt: the next run gets fill's `prompt_files` prompt as always. Release the hold ("Release hold", or the decision's "Start it again") once whatever blocked it is cleared.
 - **Ready guard.** With `fill.ready_guard: true`, a done line that names a PR counts only when, at the head it names (the PR's current head), every CI check passes (a skipped one is not a failure), the branch is not behind its base and does not conflict, the project's gate (`review.merge.gate`, when it requires one) passed at that head, and, when the PR carries review findings, its description has one line per finding with the finding's id and the sha of a commit of the PR. Otherwise the line is not a done: the task stays open, nothing goes to review, no `fill_done` is recorded. A refusal that needs a change (red CI, behind, conflicts, gate, finding map, a moved head) is recorded once as `fill_report_refused` (reason and instruction), and the next run's prompt ends with the instruction. A refusal that only time fixes (CI or the gate still running, the host not answering, mergeable not computed yet) holds the line (`held: report_refused`), starts no run, and is checked again on every fill check until it passes or turns into a refusal. Lines that name no PR are not checked. Off by default.
+- **Ready guard over several repositories.** A project that lists its [repositories](#repositories) (`repos:`) can report PRs of any of them (`lib PR #7 at <sha>`, `lib#7`, `example/lib#7`); the bus tail `PR #<n> [<sha>]` and a bus report's `pr` are the task's repository, else the default. The review repository's PRs are read through the review module (gate and findings); another repository's through its own host, with no gate and no findings. On a repository with `ci_counts: false` the CI items are not checked; the rest are. A host that fails or does not answer holds only the reports about its own repository, for a minute. Refusals name such a PR `<ref>#<n>`.
 - **The latest line wins.** Of a run's WAITING and BLOCKED lines, the last one applies. With a `done_pattern` that names the task, a done line always does: a BLOCKED task whose done line is written later (by whoever unblocked it, say) is `done`. With one that names only the agent, the agent's last DONE, WAITING or BLOCKED line decides (see [Matching by agent](#matching-by-agent)). Once fill has seen how a run ended, it keeps that in the store (`fill_waiting`, `fill_blocked`, and for a wake file `fill_wake_absent`, `fill_woken` or `fill_weak`), so rotating the queue file or restarting Lair doesn't turn a waiting run into one without progress.
 
 ```yaml
@@ -3059,6 +3060,37 @@ Config errors (an unknown key, an invalid pattern or one without its group, a `t
 - `POST /api/planner/proposals/<id>/approve`, `.../reject`, `POST /api/planner/runs/<id>/approve`, `.../reject`, `POST /api/planner/resume`: each with `{"confirm": true}` (HTTP 400 without; 409 when nothing waits)
 
 Events: `planner.changed`, `planner.run_started`, `planner.run_finished`, `planner.proposals_pending`, `planner.blocked`, `planner.tasks_file_restored`. Decisions are raised as module `planner`. Everything is kept in `data/planner.db`: a restart keeps the pending triggers, the planner run in progress, waiting proposals and the history.
+
+## Repositories
+
+`repos:` lists a project's repositories once, for every module that reads pull requests of more than one: the [ready guard](#fill) now, PR health later ([docs/design/pr-health.md](design/pr-health.md)). Each entry says which branch its PRs merge into, whether its hosted CI counts, and the short names task text uses for it.
+
+```yaml
+repos:
+  - repo: example/app       # owner/name
+    default: true            # a bare "PR #12" means this repository
+    base: main               # default: the host's default branch
+    ci_counts: true          # false: hosted CI is not a signal here
+    refs: [app]              # app#12, app PR #12
+  - repo: example/lib
+    ci_counts: false
+    refs: [lib]
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `repos` | list | see below | At most 20 entries; a repository listed twice is an error |
+| `repos[].repo` | string | required | `owner/name` (GitHub's limits: a 39-character owner, a 100-character name) |
+| `repos[].default` | boolean | `true` with one entry, else `false` | With two or more entries, exactly one is `true` |
+| `repos[].base` | string \| null | `null` | The branch its PRs merge into; `null`: the host's default branch |
+| `repos[].ci_counts` | boolean | `true` | `false`: the repository's hosted CI is not a signal (it is disabled, or never runs): red, running or missing CI is never an item |
+| `repos[].refs` | list | the name part, when valid | At most 8 short names, each a letter then up to 39 letters, digits, `_`, `.` or `-`; not `pr` or `pull`; unique across entries (ignoring case). Default names that two entries share are dropped from both |
+
+**PR references.** Task text and done lines name a PR as `owner/name#12` (a listed repository), `<ref>#12`, `<ref> PR #12` or `<ref> pull request #12` (that entry's repository), or `PR #12` (the task's repository when its description has `repo:owner/name`, the tracker's tag, else the default). A bare number never names a repository that is neither the task's nor the default, and `xapp#12`, `app#123` and `app#12a` are not `app#12`.
+
+**Without `repos:`** the list is `tracker.repos[]` (each entry's `repo` and `default`; two or more with no default are read as no default), else the review repository (`review.repo`, else `github:`, with `review.default_branch` as its base), else empty: the modules that need it are inactive and say why. The ready guard reads the list only when `repos:` is set; without it the guard works as before (the review repository, `PR #<n>` forms only). An invalid `repos:` is reported (`repos[1].refs[0]: ...`) and turns off what reads it (the ready guard reads only the review repository, as without `repos:`); the project still loads.
+
+**Hosts.** Each listed repository other than the review repository is read through a GitHub host of its own, built once (a rate-limit answer blocks only that repository), with the review module's token (`review.token_env`, `review.token_cmd`) and `review.api_url`; one request may take 20 s, and a timeout is a failure.
 
 ## Tracker
 

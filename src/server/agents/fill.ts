@@ -106,7 +106,19 @@ import { lastLines, readTail } from "./sessions.js";
 import type { AgentsStore } from "./store.js";
 import { isActive, isValidTaskId, type AgentRun, type QueueMark } from "./types.js";
 import type { ProcessInfo } from "../watchdog/probes.js";
-import { evaluateReady, isPrWork, parseReadyReport, refuseReport, unverifiable, type ParsedReport, type ReadyFactsSource, type ReadyVerdict } from "../ready-guard/guard.js";
+import {
+  evaluateReady,
+  fieldReport,
+  isPrWork,
+  NO_SOURCE_REPOS,
+  parseReadyReport,
+  prName,
+  refuseReport,
+  unverifiable,
+  type ParsedReport,
+  type ReadyFactsSource,
+  type ReadyVerdict,
+} from "../ready-guard/guard.js";
 import { extractBusId, mirroredReport, type BusLineSource, type StructuredReport } from "../bus/consumers.js";
 
 export const MAX_TASKS_FILE_BYTES = 256 * 1024;
@@ -1122,8 +1134,8 @@ export class AgentsFill {
   private lastError: string | null = null;
   /** The hold each held line is in (agent|task -> hold): fill_held is recorded when it changes */
   private holds = new Map<string, FillHold>();
-  /** The git host failed or timed out: the ready guard asks it nothing until then (clock ms) */
-  private guardDownUntil = 0;
+  /** A repository's git host failed or timed out: the ready guard asks it nothing until then (owner/name lowercased -> clock ms) */
+  private guardDownUntil = new Map<string, number>();
   /** When fill last looked for a waiting run's wake file and didn't find it (task|run -> time) */
   private polled = new Map<string, number>();
   /** The waiting runs seen in the check in progress (to forget the others' polls) */
@@ -2186,20 +2198,24 @@ export class AgentsFill {
     const { store, project, settings, probes } = this.options;
     if (!settings.readyGuard) return null;
     const now = probes.clock.now();
+    const source = this.options.readyFacts?.();
+    const repos = source?.repos ?? NO_SOURCE_REPOS;
     // A bus report (bus.consume on) names its PR and head in fields of their own: nothing is parsed from text
     const parsed: ParsedReport = report
       ? report.pr === null
         ? { kind: "none" }
-        : { kind: "pr", report: { pr: report.pr, sha: report.sha?.toLowerCase() ?? null } }
-      : parseReadyReport(line, taskText);
+        : fieldReport(report.pr, report.sha?.toLowerCase() ?? null, taskText, repos)
+      : parseReadyReport(line, taskText, repos, source ? source.legacy === true : true);
     // Whose branch the PR must be: the agent that reported it
     const reporter = report?.agent ?? agent;
     let pr: number | null = null;
+    let repo: string | null = null;
+    let name: string | null = null;
     let verdict: ReadyVerdict;
     if (parsed.kind === "ambiguous") {
       verdict = refuseReport(
         "ambiguous",
-        `the line names several PRs (${parsed.prs.map((n) => `#${n}`).join(", ")}) and the task names none of them`,
+        `the line names several PRs (${parsed.prs.map((p) => prName(p, repos).replace(/^PR /, "")).join(", ")}) and the task names none of them`,
         "Report one PR: end the line with `PR #<n> at <sha>`.",
       );
     } else if (parsed.kind === "none") {
@@ -2207,16 +2223,20 @@ export class AgentsFill {
       verdict = refuseReport("no_pr", "the task is about a pull request but the line names none", "Report again with `PR #<n> at <sha>` for the PR you opened.");
     } else {
       pr = parsed.report.pr;
-      const source = this.options.readyFacts?.();
+      repo = parsed.report.repo;
+      name = prName(parsed.report, repos);
+      // A repository whose host is down holds only the reports about that repository
+      const hostKey = parsed.report.repo.toLowerCase();
       if (parsed.report.sha === null) {
-        verdict = refuseReport("no_head", `the line names PR #${pr} but not the head it reports on`, "Report again with `PR #<n> at <sha>`, the sha of the PR's head.", pr);
+        verdict = refuseReport("no_head", `the line names ${name} but not the head it reports on`, "Report again with `PR #<n> at <sha>`, the sha of the PR's head.", name);
       } else if (!source) {
-        verdict = unverifiable(pr, "no git host is set up to read this project's PRs");
-      } else if (now < this.guardDownUntil) {
-        verdict = unverifiable(pr, "the git host is not answering; asked again shortly");
+        verdict = unverifiable(name, "no git host is set up to read this project's PRs");
+      } else if (now < (this.guardDownUntil.get(hostKey) ?? 0)) {
+        verdict = unverifiable(name, "the git host is not answering; asked again shortly");
       } else {
-        verdict = await evaluateReady(parsed.report, source, { agent: reporter });
-        if (!verdict.ok && verdict.hostDown) this.guardDownUntil = now + HOST_BACKOFF_MS;
+        const ciCounts = repos.find((r) => r.repo.toLowerCase() === hostKey)?.ciCounts !== false;
+        verdict = await evaluateReady(parsed.report, source, { agent: reporter, ciCounts });
+        if (!verdict.ok && verdict.hostDown) this.guardDownUntil.set(hostKey, now + HOST_BACKOFF_MS);
       }
     }
     if (verdict.ok) return null;
@@ -2228,9 +2248,9 @@ export class AgentsFill {
           agent,
           task,
           runId: latest?.id,
-          summary: `fill: ${agent}'s done report for ${task}${pr === null ? "" : ` (PR #${pr})`} was refused: ${verdict.reason}`,
+          summary: `fill: ${agent}'s done report for ${task}${name === null ? "" : ` (${name})`} was refused: ${verdict.reason}`,
           evidence: verdict.problems,
-          data: { pr, reason: verdict.reason, instruction: verdict.instruction },
+          data: { pr, repo, reason: verdict.reason, instruction: verdict.instruction },
           dedupeKey: `fill_report_refused:${task}:${latest?.id ?? "none"}:${createHash("sha256").update(verdict.instruction).digest("hex").slice(0, 16)}`,
         },
         now,
@@ -2250,9 +2270,9 @@ export class AgentsFill {
           agent,
           task,
           runId: latest?.id,
-          summary: `fill: ${agent}'s done report for ${task}${pr === null ? "" : ` (PR #${pr})`} can't be verified yet: ${verdict.reason}`,
+          summary: `fill: ${agent}'s done report for ${task}${name === null ? "" : ` (${name})`} can't be verified yet: ${verdict.reason}`,
           evidence: verdict.problems,
-          data: { pr, reason: verdict.reason, lineHash: hash, runId },
+          data: { pr, repo, reason: verdict.reason, lineHash: hash, runId },
           dedupeKey: `fill_report_waiting:${task}:${runId ?? "none"}:${hash}`,
         },
         now,
