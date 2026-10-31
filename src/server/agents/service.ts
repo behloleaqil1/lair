@@ -250,6 +250,7 @@ const BUS_EVENTS: Partial<Record<AgentEventKind, EventType>> = {
   budget_exceeded: "agent.budget.exceeded",
   fill_started: "agents.fill_started",
   fill_held: "agents.fill_held",
+  fill_unmatched: "agents.fill_unmatched",
 };
 
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -481,6 +482,8 @@ export class AgentsService {
         });
       }) ?? null;
     if (options.settings.fill.enabled) {
+      // Once per start (and config reload): what can make fill close or change the wrong task (also on Home → Health)
+      for (const warning of options.settings.fill.warnings) console.warn(`[agents] ${this.project}: ${warning}`);
       this.fill = new AgentsFill({
         project: this.project,
         config: this.config,
@@ -3180,6 +3183,8 @@ export class AgentsService {
       lastCheck: null,
       lastError: null,
       lines: [],
+      unmatchedReports: [],
+      warnings: fill.warnings,
     };
   }
 
