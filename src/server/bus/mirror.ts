@@ -4,6 +4,10 @@
  *
  * Every field is cleaned and bounded: newlines and control characters become
  * spaces, lengths are capped, so no value can start a second line.
+ *
+ * Mirrored lines carry a marker (`[bus:<id>]`) at the end, so consumers that
+ * already processed the event can skip them. This prevents double counting
+ * when both the event and the mirrored line would trigger the same transition.
  */
 import { appendFileSync, existsSync, mkdirSync, utimesSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
@@ -62,7 +66,8 @@ export class BusMirror {
 
   /**
    * Mirror a report to the queue file.
-   * Format: `- {KIND} {task} by {agent} {time}: {summary} [{gate_id}] [PR #{pr}] [{sha}]`
+   * Format: `- {KIND} {task} by {agent} {time}: {summary} [{gate_id}] [PR #{pr}] [{sha}] [bus:{id}]`
+   * The `[bus:{id}]` marker lets consumers skip lines they already processed via the event.
    */
   mirrorReport(
     agent: string,
@@ -73,6 +78,7 @@ export class BusMirror {
     gateId?: string,
     pr?: number,
     sha?: string,
+    busId?: number,
   ): string[] {
     const mirrored: string[] = [];
 
@@ -91,6 +97,7 @@ export class BusMirror {
     if (gateId) parts.push(`[${sanitize(gateId, MAX_GATE_ID)}]`);
     if (pr !== undefined && pr !== null) parts.push(`PR #${pr}`);
     if (sha) parts.push(`[${sanitize(sha, MAX_SHA).slice(0, 7)}]`);
+    if (busId !== undefined) parts.push(`[bus:${busId}]`);
 
     const line = parts.join(" ") + "\n";
 

@@ -170,12 +170,34 @@ Configure the MCP fleet bus for agent communication:
 ```yaml
 mail_dir: /path/to/mail
 wake_file: /path/to/wake
+bus:
+  consume: off  # off | observe | on
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `mail_dir` | string | — | Directory for per-agent mailbox files |
 | `wake_file` | string | — | File to touch to wake the orchestrator |
+| `bus.consume` | `off` \| `observe` \| `on` | `off` | Whether the project's runs post structured reports to Lair's bus, and whether fill and the planner read them |
+
+An unknown key under `bus:` or another value is a config error (the live reload keeps the previous config).
+
+### Bus consume modes
+
+| Mode | Runs | Fill and the planner |
+|------|------|----------------------|
+| `off` | No bus token and no `LAIR_URL` (a project with `checks:` still gives its runs both: the checks routes take the token); every bus route but `/api/bus/consumers` answers 404 for the project | Read the queue file's lines with their patterns, as without the bus |
+| `observe` | Each run gets a bus token and `LAIR_URL`, revoked when the run ends; `lair bus` and `lair bus-mcp` work | Still read the lines with their patterns: nothing they do changes. For each line the bus mirrored, Home → Health shows what the report says next to what the patterns read (kept in memory only) |
+| `on` | As `observe` | A line the bus mirrored (it ends with `[bus:<id>]`, and is that report's line) is read by the report's fields: its kind, task, agent, gate id (what a WAITING run waits on), PR and sha (for the ready guard). An accepted report, and a run that ends, make fill check and the planner run a cycle at once, instead of at their next interval |
+
+Hand-written lines (an agent without the bus) are read as before in every mode. In `on` mode a line that ends with a
+marker but isn't that report's mirrored line, or names no report, is read as a hand-written line, and shown on Home →
+Health. A report is applied once: fill keeps it in its events (a hold from a report is recorded once per report, also
+across restarts), the planner keeps the ids of the reports it handled. A report for a task that isn't in
+`agents.fill.tasks_file`, or by an agent fill doesn't run, is ignored and shown on Home → Health
+(`GET /api/bus/consumers?project=<name>`), as is an event that fails validation.
+
+Turn `observe` on first, compare on Home → Health, then switch to `on`.
 
 ## Dragons (agents)
 
@@ -3037,6 +3059,109 @@ Config errors (an unknown key, an invalid pattern or one without its group, a `t
 - `POST /api/planner/proposals/<id>/approve`, `.../reject`, `POST /api/planner/runs/<id>/approve`, `.../reject`, `POST /api/planner/resume`: each with `{"confirm": true}` (HTTP 400 without; 409 when nothing waits)
 
 Events: `planner.changed`, `planner.run_started`, `planner.run_finished`, `planner.proposals_pending`, `planner.blocked`, `planner.tasks_file_restored`. Decisions are raised as module `planner`. Everything is kept in `data/planner.db`: a restart keeps the pending triggers, the planner run in progress, waiting proposals and the history.
+
+## Tracker
+
+The tracker keeps a project's GitHub issues, Projects (v2) boards and milestones in step with its tasks, runs and pull requests: a new task gets its issue, a run moves the card to In progress with the agent, a PR closing the issue moves it to In review, the merge or the planner's done line moves it to Done and closes the issue, a blocked task gets a label and one comment. It is off unless a project sets `tracker.enabled: true`, and then it starts in **observe** mode: it records what it would change and sends nothing. Design: [docs/design/tracker.md](design/tracker.md).
+
+```yaml
+tracker:
+  enabled: true
+  mode: observe                 # observe (records only) | act (changes GitHub)
+  create_issues_for_new_tasks: true
+  repos:
+    - repo: example-org/web
+      default: true             # tasks no rule takes go here
+      project: { owner: example-org, number: 3 }   # the board: its owner and the number in its URL
+      agent_field: Agent        # a text field on the board (optional)
+      labels: [lair]            # on every issue Lair creates here
+      milestones:
+        close_when_complete: true
+        rules:
+          - { tasks: ["web-*"], milestone: "M2: Launch" }
+    - repo: example-org/api
+      project: { owner: example-org, number: 4 }
+      match:
+        tasks: ["api-*"]        # task id globs
+        agents: [worker-b]      # or the agent of the task's line
+  redact_patterns: ["codename-\\w+"]
+```
+
+**Which repository a task goes to.** One project may track several repositories, each with its own board and milestone rules. A task goes to the repository its line names (`repo:owner/name` in the description, or an issue URL or `owner/name#N` of a tracked repository), else to the first repository whose `match` takes it (a task id glob, or the line's agent), else to the `default` one. With one repository it is the default. A task no repository takes is not tracked (the status shows why).
+
+**Which issue a task is linked to.** In this order: the issue its line names on purpose (`Issue: #N`, `Closes #N`, `Fixes #N`, an issue URL or `owner/name#N` of a tracked repository; a bare `#N` elsewhere in the text is never taken), if it is open and not a pull request; the issue an earlier create made for it (found by its marker, see below); an open issue (not a pull request) whose title is exactly the task id or the title Lair would give it (`<task>: <description>`); else, with `create_issues_for_new_tasks`, a new issue with that title, the redacted description, the repository's `labels` and the milestone its rules give.
+
+**Observe and act.**
+
+| | observe (the default) | act |
+|---|---|---|
+| Reads GitHub (scopes, boards, issues, PRs, milestones) | yes | yes |
+| Links tasks to existing issues (in Lair's own store) | yes | yes |
+| Creates issues, adds cards, moves cards, sets the Agent field, labels, comments, closes issues, closes or reopens milestones | no: each is recorded as `would_send` in the audit, once (a repeat counts up the same row) | yes, within `write_budget_per_minute`, each one audited |
+
+The client itself is read-only in observe mode: a write is refused before anything is sent. Switching to act (Settings or the project file) reloads the tracker live; what observe recorded is not replayed, the next reconcile makes GitHub match.
+
+**What moves the cards.**
+
+| Lair event (as its module emits it) | On GitHub |
+|---|---|
+| `planner.changed` `{op: "add", outcome: "applied"}` | the task is linked (or its issue created); the card goes to Ready if agents.fill can start it (its agent is in `agents.fill.agents` and fill is on), else Backlog |
+| `agent.run.started` `{kind: "started", task, agent}` | In progress, the Agent field set; a blocked label goes |
+| `review.submitted` `{pr}` | the PR is read: the tasks it closes (or whose id ends its branch name) go to In review |
+| `review.merged` `{pr}` | the PR is read: those tasks go to Done and their issues are closed as completed |
+| `planner.changed` `{op: "mark_done"}` | Done, the issue closed as completed (after the card moved) |
+| `planner.changed` `{op: "drop"}` | the issue closed as not planned |
+| `planner.blocked` `{task, class, rule}` | the `blocked_label` and one comment per reason (kept, so a repeat or a restart posts nothing) |
+| `planner.changed` `{op: "unblock"}` | the blocked label goes |
+
+Only `outcome: "applied"` changes count (`planned` is the planner's own observe mode). An `agent.run.ended` changes nothing: an exit is not a done task. Events never wait on GitHub: a handler queues a job and returns, the jobs of a project run one at a time on a bounded queue (500), and a job dropped when it is full is caught up by the next reconcile.
+
+**Reconcile** (at start, then every `reconcile_interval_seconds`, and on the owner's request): links the tasks of the tasks file that have none yet (at most 10 a cycle), finishes the ones marked done there, moves the cards of open PRs to In review, adds missing cards, puts back cards moved by hand (counted as drift fixed only when the fix was sent), retries closes that failed, and closes or reopens milestones. The next one is scheduled when it ends, so two never overlap.
+
+**Milestones.** With `close_when_complete` (the default), an open milestone with closed issues and no open one is closed, and a closed one with an open issue is reopened. Only its state is sent: its title, description and due date are the owner's. Lair never creates a milestone; a rule naming one that does not exist is reported and the issue is created without it.
+
+**Idempotent creates.** The create is recorded (pending) before it is sent, and the issue's body ends with a hidden marker (`<!-- lair-task:<hash> -->`). If the answer is lost (a timeout, a restart), the next attempt lists the repository's issues changed since then (the issues list, which does not lag behind as search does) and links the one with the marker instead of creating another. Creates count against the write budget.
+
+**Redaction.** Every text sent (titles, bodies, comments, the Agent field) is redacted first by built-in rules, then by `redact_patterns` (case-insensitive regular expressions): the values of this process's secret-looking environment variables (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*KEY*`...), GitHub, OpenAI-style, Slack and AWS key shapes, private keys, `Bearer` tokens, credentials in URLs, `password=`/`token:` pairs, absolute paths (`/Users/...`, `/home/...`, `/tmp/...`, `C:\...`, `~/...`) and the home directory, email addresses and private network addresses. Titles are one line of at most 200 characters, bodies 3000, comments 600. A blocked comment carries only the planner's class and rule, never the agent's text.
+
+**The token.** `token_env` / `token_cmd`, else the project's `review.token_env` / `review.token_cmd`, else `GITHUB_TOKEN`; the tracker's variable is also kept from the update command, as review's is. A classic token needs `repo` (or `public_repo` for public repositories only) and `project` (observe mode reads boards with `read:project`); a fine-grained token needs Issues: read and write, Pull requests: read, and Projects: read and write on the board's owner (GitHub reports no scopes for it, so it is not checked up front). At start the tracker reads the token's scopes; a missing one stops its writes and raises **one** decision in the Decision Inbox (class `tracker.token_scopes`) listing them, with the option "I updated the token: check again". A 401, or a 403 that is not a rate limit, stops the writes too until the scopes are checked again. Every request has a timeout (`request_timeout_seconds`) and is cut short when the tracker stops. Rate limits (a 429, a 403 with `Retry-After` or `X-RateLimit-Remaining: 0`, a GraphQL `RATE_LIMITED`) stop every request until `Retry-After` or `X-RateLimit-Reset`; the time is kept across a restart.
+
+### Tracker options
+
+| Key | Default | |
+|-----|---------|---|
+| `enabled` | `false` | Turn the tracker on for this project |
+| `mode` | `observe` | `observe` (records only) or `act` |
+| `repos` | the project's `github`, no board | The repositories it tracks (at most 20), each: |
+| `repos[].repo` | | `owner/name` |
+| `repos[].default` | `false` (`true` for a single one) | Tasks no rule takes go here; at most one |
+| `repos[].project.owner`, `.number` | | The board: its user or organization, and the number in its URL. Without it, issues are linked and closed but no card moves |
+| `repos[].status_field` | `Status` | The board's single-select status field |
+| `repos[].status_options` | `Backlog`, `Ready`, `In progress`, `In review`, `Done` | The option names of `backlog`, `ready`, `in_progress`, `in_review`, `done` |
+| `repos[].agent_field` | none | A text field set to the agent of the task's run |
+| `repos[].labels` | `[]` | Labels of the issues Lair creates here |
+| `repos[].match.tasks`, `.agents` | `[]` | Task id globs and agent ids this repository takes |
+| `repos[].milestones.close_when_complete` | `true` | Close a complete milestone, reopen one with an open issue |
+| `repos[].milestones.rules` | `[]` | `{tasks: [globs], milestone: "title"}`: the existing milestone of the issues created for those tasks |
+| `create_issues_for_new_tasks` | `false` | Create an issue for a task none is linked to (act mode) |
+| `blocked_label` | `blocked` | The label of a blocked task's issue |
+| `redact_patterns` | `[]` | Redacted from every text sent, after the built-in rules |
+| `reconcile_interval_seconds` | `900` | 60 to 86400 |
+| `write_budget_per_minute` | `30` | Writes a minute (1 to 100), creates included |
+| `request_timeout_seconds` | `15` | Each request to GitHub (1 to 120) |
+| `token_env`, `token_cmd` | review's, else `GITHUB_TOKEN` | Where the token is read |
+| `api_url` | `https://api.github.com` | GitHub Enterprise: `https://host/api/v3`; https only |
+
+The tasks it follows are `agents.fill.tasks_file` (the planner's done marker marks the done ones); without one it follows events only. Its store is `data/tracker.db` (its own file, created only when a project enables the tracker). A config error keeps the tracker off for that project and shows in its status; it never stops Lair's start.
+
+### Tracker API
+
+`?project=` defaults to the default project. Every route is the owner's (`/api/tracker` is owner-only, reads included: they show task text and repositories):
+
+- `GET /api/tracker/status`: the mode, each repository and its board (loaded, or why not), the token's scopes (granted, missing), the sync state (last reconcile, next one, drift fixed, errors, the rate-limit wait, what needs the owner), the links, the pending creates, the latest 50 writes (each with its result, or `would_send` in observe mode), the queue (waiting, dropped), warnings and config errors
+- `POST /api/tracker/reconcile`: a reconcile now, queued after the jobs waiting (202); recorded in the audit with the owner session. 404 when the tracker is off for the project
+
+The tracker emits no events of its own. The dashboard tab is not built yet.
 
 ## Lessons
 

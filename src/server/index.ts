@@ -28,7 +28,8 @@ import {
   registerOwnerRoutes,
 } from "./human-auth/index.js";
 import { registerControlRoutes } from "./routes/controls.js";
-import { registerBusRoutes } from "./routes/bus.js";
+import { busStoreFor, forgetBusService, registerBusRoutes } from "./routes/bus.js";
+import { BusConsumers, agentsBusFor, closeBusStores, parseBusConfig, structuredReport } from "./bus/index.js";
 import { registerProcessRoutes } from "./routes/processes.js";
 import { registerSettingsRoutes } from "./routes/settings.js";
 import { getSupervisor } from "./services/supervisor.js";
@@ -74,6 +75,7 @@ import {
 } from "./restart/index.js";
 import { SettingsService, registerSettingsUiRoutes } from "./settings/index.js";
 import { mountPlanner, plannerAgentsFrom } from "./planner/index.js";
+import { TrackerManager, registerTrackerRoutes } from "./tracker/index.js";
 import { join } from "path";
 import type { ApiResponse, ProjectConfig } from "../shared/types.js";
 import { initProcessCache, disposeProcessCache, CachedProcessTable } from "./core/process-cache.js";
@@ -418,9 +420,6 @@ await registerOwnerRoutes(fastify, humanAuth);
 // Register Phase 2 control routes (commands and dragon start/stop: owner only)
 await registerControlRoutes(fastify, humanAuth);
 
-// Register Phase 3 bus routes (messages sent as the owner: owner only)
-await registerBusRoutes(fastify, humanAuth);
-
 // Register process manager routes (start/stop/restart: owner only)
 await registerProcessRoutes(fastify, humanAuth);
 
@@ -543,15 +542,71 @@ const cachedProcessTable = new CachedProcessTable(processCache);
 // Routes read from the cache immediately; refreshes happen in the background.
 const dataCacheManager = new DataCacheManager();
 
-const agents = new AgentsManager({
+// The fleet bus (src/server/bus/, docs/design/phase3-bus.md): per project behind `bus.consume: off | observe | on`
+// (off by default, and then no bus at all: no route answers for the project and no run gets a bus token). Observe and
+// on: each run gets a bus token and posts structured reports (`lair bus`, `lair bus-mcp`); on: fill and the planner
+// read those reports in place of the queue lines the bus mirrors, at once (bus PR 2a); observe: they only compare.
+const busDataDir = join(process.cwd(), "data");
+/** The projects' configs as last loaded or reloaded (the bus routes' mirror reads its paths) */
+const busProjectConfigs = new Map<string, ProjectConfig>();
+const busConsumers: BusConsumers = new BusConsumers({
+  events: getEventBus(),
+  clock: { now: () => Date.now() },
+  reports: (project, ids) => busStoreFor(project, busDataDir).getReports(ids).map(structuredReport),
+  problem: (project, report) => agents.busReportProblem(project, report),
+  onReport: (project) => {
+    void agents.checkFillSoon(project);
+    void planner.cycleSoon(project);
+  },
+  onMessage: (project) => void planner.cycleSoon(project),
+  onRunEnded: (project) => void agents.checkFillSoon(project),
+  warn: (text) => console.warn(text),
+});
+/** A project's bus.consume, from its config (load and reload); an invalid block keeps the bus off */
+const applyBusConfig = (entry: { name: string; config?: ProjectConfig }) => {
+  if (entry.config) busProjectConfigs.set(entry.name, entry.config);
+  else busProjectConfigs.delete(entry.name);
+  const parsed = parseBusConfig(entry.config?.bus);
+  if (!parsed.ok) console.warn(`[bus] ${entry.name}: the bus stays off: ${parsed.errors.join("; ")}`);
+  busConsumers.setMode(entry.name, parsed.ok ? parsed.settings.consume : "off");
+  forgetBusService(entry.name);
+};
+for (const entry of projectEntries) applyBusConfig(entry);
+
+const agents: AgentsManager = new AgentsManager({
   dbPath: join(process.cwd(), "data", "agents.db"),
   events: getEventBus(),
   budget: getBudgetManager(),
   tools: aiTools,
   probes: systemAgentProbesWithCache(processCache),
+  // A bus token per run (and its revocation when the run ends) while the project's bus is on
+  bus: agentsBusFor({
+    consumers: busConsumers,
+    store: (project) => busStoreFor(project, busDataDir),
+    clock: { now: () => Date.now() },
+    serverUrl: dashboardUrlFor(HOST, PORT),
+    // The checks take the run's bus token too: a project with checks: gives its runs one with the bus off
+    tokenUsers: (project) => checks.enabled().includes(project),
+    warn: (text) => console.warn(text),
+  }),
 });
 agents.load(projectEntries);
 managedRuns = agents;
+
+// The bus routes (the agents' API with their run's token; the owner's messages need the owner's session)
+await registerBusRoutes(fastify, humanAuth, {
+  agents,
+  events: getEventBus(),
+  dataDir: busDataDir,
+  getConfig: (project) => {
+    const config = busProjectConfigs.get(project);
+    if (!config) throw new Error(`no config is loaded for ${project}`);
+    return config;
+  },
+  mode: (project) => busConsumers.mode(project),
+  enabled: () => busConsumers.enabled(),
+  health: (project) => busConsumers.health(project),
+});
 
 // Progress watchdog: one per project with `watchdog.enabled: true` (off by
 // default). Its routes are read-only and answer for every project. It reads
@@ -705,8 +760,22 @@ const planner = await mountPlanner(fastify, {
   projects: projectEntries,
   defaultProject: () => getDefaultProject(),
   humanAuth,
+  bus: (project) => busConsumers.lineSource(project),
 });
 planner.useDecisions(decisionInbox);
+
+// The tracker (src/server/tracker/): one per project with `tracker.enabled: true` (off by default). It keeps the
+// project's GitHub issues, Projects boards and milestones in step with its tasks, runs and PRs, from the planner's,
+// the agents' and the reviews' events and a periodic reconcile; observe mode (the default) records what it would
+// change and sends nothing. Its store (data/tracker.db) is opened only when a project enables it. A token missing a
+// scope is asked about in the Decision Inbox; every route is the owner's.
+const trackers = new TrackerManager({
+  dbPath: join(process.cwd(), "data", "tracker.db"),
+  events: getEventBus(),
+});
+trackers.load(projectEntries);
+trackers.useDecisions(decisionInbox);
+await registerTrackerRoutes(fastify, trackers, () => getDefaultProject(), humanAuth);
 
 // Placement: one per project with `placement.enabled: true` (off by
 // default). It probes the project's machines, estimates when each queued
@@ -855,7 +924,28 @@ const { supervisor: selfChecks, chat: supervisorChat } = await mountSupervisor(f
 // the modules whose part of it changed, without a restart; an invalid one
 // keeps the previous config running and shows in the dashboard's banner
 const reloader = new ConfigReloader({
-  modules: serverModules({ delivery, watchdogs, pipelines, reviews, agents, triage, placements, hostServices, clouds, planner, supervisor: selfChecks, infraMonitor }),
+  modules: serverModules({
+    delivery,
+    watchdogs,
+    pipelines,
+    reviews,
+    agents,
+    triage,
+    placements,
+    hostServices,
+    clouds,
+    planner,
+    supervisor: selfChecks,
+    trackers,
+    infraMonitor,
+    bus: {
+      validate: (config) => {
+        const parsed = parseBusConfig(config.bus);
+        return parsed.ok ? [] : parsed.errors;
+      },
+      reloadProject: async (entry) => applyBusConfig(entry),
+    },
+  }),
   initial: projectEntries,
   events: getEventBus(),
   onAccepted: (project, config) => {
@@ -948,8 +1038,15 @@ const stopServer = async (reason: string) => {
   // Let a merge in progress finish and record itself, then close the review store
   await reviews.stop();
 
+  // The bus consumers first: no report or run end starts a check or a cycle from here on
+  busConsumers.stop();
+
   // Stop the planner first: it requests runs from the agents module
   await planner.stop();
+
+  // Stop the tracker: its requests to GitHub in flight are cut short (a create cut short is found again by its
+  // marker on the next start), then its store closes
+  await trackers.stop();
 
   // Stop agent supervision: the agents keep running for the next server to adopt, unless a project sets
   // agents.on_restart: stop (then their runs are stopped too, within a bounded wait)
@@ -990,6 +1087,9 @@ const stopServer = async (reason: string) => {
 
   // Close store
   closeStore();
+
+  // Close the bus stores (the modules that read them have stopped)
+  closeBusStores();
 
   // Stop file watchers
   for (const watcher of fileWatchers.values()) {
@@ -1107,6 +1207,19 @@ const start = async () => {
       planning.length > 0
         ? `[planner] Planning for: ${planning.join(", ")}`
         : "[planner] Off (no project sets planner.enabled)",
+    );
+
+    // The bus consumers (after fill and the planner, which they wake)
+    busConsumers.start();
+    const onBus = busConsumers.enabled();
+    console.log(onBus.length > 0 ? `[bus] On or observing for: ${onBus.join(", ")}` : "[bus] Off (no project sets bus.consume)");
+    // Start the tracker (after the planner and the agents, whose events it follows): each syncs in the background,
+    // so a slow or unreachable GitHub never holds up the start
+    const tracked = trackers.start();
+    console.log(
+      tracked.length > 0
+        ? `[tracker] Tracking GitHub for: ${tracked.join(", ")}`
+        : "[tracker] Off (no project sets tracker.enabled)",
     );
 
     // Start triage (re-checks waiting for capacity, bisect probes)

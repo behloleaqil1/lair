@@ -311,6 +311,8 @@ export type EventType =
   // Bus (src/server/bus/)
   | "bus.report"
   | "bus.message"
+  // Bus consumers (src/server/bus/consumers.ts): an event or report refused or ignored, {project, busId, reason}
+  | "bus.consume_refused"
   // Host services (src/server/host-services/)
   | "host-service.up"
   | "host-service.down"
