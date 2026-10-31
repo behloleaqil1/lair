@@ -252,12 +252,8 @@ describe("FileWatcherService on large folders", () => {
     await waitFor("the log lines", () => ws.lines.includes("c"));
     await sleep(500);
     const updates = ws.dragons.filter((d) => d.id === "kiro-A" && d.event === "log_line");
-    // On slow CI runners (macOS), rapid writes may trigger two debounced events
-    // instead of one; what matters is that it's bounded (not one per write)
-    expect(updates.length).toBeGreaterThanOrEqual(1);
-    expect(updates.length).toBeLessThanOrEqual(2);
-    // The last update should have the final line
-    expect(updates[updates.length - 1].lastLogLine).toBe("c");
+    expect(updates).toHaveLength(1);
+    expect(updates[0].lastLogLine).toBe("c");
     expect(ws.lines.filter((line) => line === "b")).toHaveLength(1);
   }, 30_000);
 });

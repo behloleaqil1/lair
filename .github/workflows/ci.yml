@@ -11,11 +11,10 @@ permissions:
 
 jobs:
   build:
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
         node-version: ['22', '24']
 
     steps:
@@ -36,14 +35,60 @@ jobs:
       - name: Lint
         run: npm run lint
 
-      - name: Genericity guard
-        run: npm run check:generic
-
       - name: Test
         run: npm test
 
       - name: Build
         run: npm run build
+
+  # The end-to-end agent cycle and the folder watch on macOS (FSEvents), where
+  # Lair also runs. The full suite runs on Linux above.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: End-to-end cycle and folder watch
+        run: npx vitest run src/server/e2e/cycle.test.ts src/server/services/dir-watch.test.ts
+
+  # CONTRIBUTING.md "No private details": every tracked file, the commit
+  # messages of this push or pull request, and the private denylist, which
+  # comes from the GENERIC_DENYLIST repository secret (never committed). The
+  # guard fails when the secret is missing, so a skipped name check can't pass
+  # as green; pull requests from forks get no secrets, so a maintainer runs
+  # the guard for them (docs: CONTRIBUTING.md).
+  generic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The base commit, for the baseline comparison and the commit range
+          fetch-depth: 0
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Genericity guard
+        env:
+          GENERIC_DENYLIST: ${{ secrets.GENERIC_DENYLIST }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: npm run check:generic -- --base-ref "$BASE_SHA" --commits "$BASE_SHA..$HEAD_SHA"
 
   brain-trainer-python:
     runs-on: ubuntu-latest
