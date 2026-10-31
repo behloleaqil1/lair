@@ -461,3 +461,140 @@ revert-check: test.js; rm -rf / guards src/feature.ts
     expect(result.exitCode).toBe(2);
   });
 });
+
+describe('code fence handling', () => {
+  let repo: TestRepo;
+
+  beforeEach(() => {
+    repo = createTestRepo();
+  });
+
+  afterEach(() => {
+    repo.cleanup();
+  });
+
+  it('ignores revert-check lines inside fenced code blocks', () => {
+    const prBody = `
+## Examples
+\`\`\`
+revert-check: example.test.ts guards src/example.ts
+\`\`\`
+
+## Real checks
+revert-check: test.js guards src/feature.ts
+`;
+    const result = runRevertChecksWithCode(repo.dir, prBody, 'base-branch');
+    // Should find only 1 check (the one outside the code fence)
+    expect(result.stdout).toContain('Found 1 revert-check');
+    expect(result.exitCode).toBe(0);
+  });
+
+  it('ignores revert-check lines inside fenced blocks with language tag', () => {
+    const prBody = `
+\`\`\`markdown
+revert-check: example.test.ts guards src/example.ts
+\`\`\`
+
+revert-check: test.js guards src/feature.ts
+`;
+    const result = runRevertChecksWithCode(repo.dir, prBody, 'base-branch');
+    expect(result.stdout).toContain('Found 1 revert-check');
+    expect(result.exitCode).toBe(0);
+  });
+
+  it('handles multiple fenced code blocks', () => {
+    const prBody = `
+\`\`\`
+revert-check: a.test.ts guards src/a.ts
+\`\`\`
+
+revert-check: test.js guards src/feature.ts
+
+\`\`\`
+revert-check: b.test.ts guards src/b.ts
+\`\`\`
+`;
+    const result = runRevertChecksWithCode(repo.dir, prBody, 'base-branch');
+    // Only the middle one should be found
+    expect(result.stdout).toContain('Found 1 revert-check');
+    expect(result.exitCode).toBe(0);
+  });
+});
+
+describe('error handling', () => {
+  let repo: TestRepo;
+
+  beforeEach(() => {
+    repo = createTestRepo();
+  });
+
+  afterEach(() => {
+    repo.cleanup();
+  });
+
+  it('exits 2 when checks have mix of passes and errors', () => {
+    // Set up an additional source file that exists
+    const srcPath = join(repo.dir, 'src', 'exists.ts');
+    writeFileSync(srcPath, 'export const x = 1;\n');
+    execSync('git add .', { cwd: repo.dir, stdio: 'pipe' });
+    execSync('git commit -m "Add exists.ts"', { cwd: repo.dir, stdio: 'pipe' });
+
+    // Create base version
+    execSync('git checkout base-branch', { cwd: repo.dir, stdio: 'pipe' });
+    writeFileSync(srcPath, 'export const x = 0;\n');
+    execSync('git add .', { cwd: repo.dir, stdio: 'pipe' });
+    execSync('git commit -m "Base exists.ts"', { cwd: repo.dir, stdio: 'pipe' });
+    execSync('git checkout pr-branch', { cwd: repo.dir, stdio: 'pipe' });
+
+    const prBody = `
+revert-check: test.js guards src/feature.ts
+revert-check: test.js guards src/nonexistent.ts
+`;
+    // One will pass (src/feature.ts exists), one will error (src/nonexistent.ts doesn't exist)
+    const result = runRevertChecksWithCode(repo.dir, prBody, 'base-branch');
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain('Source file not found');
+    expect(result.stdout).toContain('Errors: 1');
+  });
+
+  it('errors count propagate to non-zero exit even with passes', () => {
+    // Create multiple source files
+    const src1 = join(repo.dir, 'src', 'good.ts');
+    writeFileSync(src1, 'export const good = "changed";\n');
+    execSync('git add .', { cwd: repo.dir, stdio: 'pipe' });
+    execSync('git commit -m "Add good.ts on PR"', { cwd: repo.dir, stdio: 'pipe' });
+
+    // Base version
+    execSync('git checkout base-branch', { cwd: repo.dir, stdio: 'pipe' });
+    writeFileSync(src1, 'export const good = "original";\n');
+    execSync('git add .', { cwd: repo.dir, stdio: 'pipe' });
+    execSync('git commit -m "Base good.ts"', { cwd: repo.dir, stdio: 'pipe' });
+    execSync('git checkout pr-branch', { cwd: repo.dir, stdio: 'pipe' });
+
+    // Update test to check for the good.ts change specifically
+    writeFileSync(
+      join(repo.dir, 'test.js'),
+      `const fs = require('fs');
+const feature = fs.readFileSync('src/feature.ts', 'utf-8');
+const good = fs.readFileSync('src/good.ts', 'utf-8');
+// Pass if feature has "a * b" and good has "changed"
+if (feature.includes('a * b') && good.includes('changed')) {
+  process.exit(0);
+}
+process.exit(1);
+`
+    );
+    execSync('git add .', { cwd: repo.dir, stdio: 'pipe' });
+    execSync('git commit -m "Update test"', { cwd: repo.dir, stdio: 'pipe' });
+
+    const prBody = `
+revert-check: test.js guards src/feature.ts
+revert-check: test.js guards src/missing.ts
+`;
+    const result = runRevertChecksWithCode(repo.dir, prBody, 'base-branch');
+    // Should exit 2 due to the error, even though one passed
+    expect(result.exitCode).toBe(2);
+    expect(result.stdout).toContain('Passed: 1');
+    expect(result.stdout).toContain('Errors: 1');
+  });
+});

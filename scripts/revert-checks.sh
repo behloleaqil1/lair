@@ -73,10 +73,25 @@ git rev-parse --verify "$BASE_REF" >/dev/null 2>&1 || { log_error "Base ref not 
 
 # Extract revert-check lines from PR body
 # Format: revert-check: <test> guards <source>[:range]
+# Lines inside fenced code blocks (```) are ignored (examples in docs)
 CHECKS=()
 MALFORMED=()
+IN_CODE_FENCE=false
 while IFS= read -r line; do
-  # Skip empty lines and lines that don't match
+  # Track fenced code blocks (``` with optional language tag)
+  if [[ "$line" =~ ^\`\`\` ]]; then
+    if [[ "$IN_CODE_FENCE" == "true" ]]; then
+      IN_CODE_FENCE=false
+    else
+      IN_CODE_FENCE=true
+    fi
+    continue
+  fi
+
+  # Skip lines inside code fences
+  [[ "$IN_CODE_FENCE" == "true" ]] && continue
+
+  # Skip lines that don't match revert-check pattern
   [[ "$line" =~ ^revert-check:[[:space:]]* ]] || continue
 
   # Extract the content after "revert-check:"

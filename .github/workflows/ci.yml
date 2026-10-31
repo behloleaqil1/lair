@@ -143,9 +143,24 @@ jobs:
 
       - name: Run revert checks
         if: steps.docs-check.outputs.docs_only != 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          chmod +x scripts/revert-checks.sh
-          scripts/revert-checks.sh pr-body.md ${{ github.event.pull_request.base.sha }}
+          # Run the BASE version of the script to prevent a PR from grading itself
+          # If the script doesn't exist in base, run the current version
+          if git show "$BASE_SHA:scripts/revert-checks.sh" >/dev/null 2>&1; then
+            SCRIPT_TMP=$(mktemp)
+            git show "$BASE_SHA:scripts/revert-checks.sh" > "$SCRIPT_TMP"
+            chmod +x "$SCRIPT_TMP"
+            "$SCRIPT_TMP" pr-body.md "$BASE_SHA"
+            RC=$?
+            rm -f "$SCRIPT_TMP"
+            exit $RC
+          else
+            # Script is new in this PR - run current version
+            chmod +x scripts/revert-checks.sh
+            scripts/revert-checks.sh pr-body.md "$BASE_SHA"
+          fi
 
       - name: Skip (docs-only)
         if: steps.docs-check.outputs.docs_only == 'true'
