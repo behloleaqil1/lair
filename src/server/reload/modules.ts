@@ -161,9 +161,8 @@ export function serverModules(m: ServerModules): ReloadableModule[] {
   if (infraMonitor) {
     modules.push({
       name: "infra_monitor",
+      // Its machines and lanes are in its own block; gates_dir and read_only reload every module
       blocks: ["infra_monitor"],
-      // Reads the machines config for lane-to-machine mapping
-      reads: ["machines"],
       validate: (config) => errorsOf(parseInfraMonitorConfig(config.infra_monitor)),
       reload: (entry) => infraMonitor.reloadProject(entry),
     });

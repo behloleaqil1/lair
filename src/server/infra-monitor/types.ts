@@ -1,110 +1,132 @@
 /**
- * Types for the infrastructure monitor module.
+ * Types of the infrastructure monitor (docs/configuration.md#infrastructure-monitor).
  *
- * The monitor watches running jobs' machines and detects:
- * - A machine that goes down while a job runs on it
- * - Duplicate runner slots (two runners claiming one slot)
- * - A dead runner while its lane has queued jobs
+ * The monitor watches the machines that run a project's gate lanes and the
+ * jobs on them, and finds:
+ * - machine_down: a machine has failed its probes for down_threshold_seconds
+ *   while a job runs on it, or while jobs wait in its lanes;
+ * - job_lost: a running request whose process group is gone;
+ * - slot_overflow: more running requests in a lane than it has slots (two
+ *   runners claiming one slot);
+ * - dead_runner: jobs wait in a lane and none of its runner pid files names a
+ *   live process.
  */
 
-/** A job being monitored */
-export interface MonitoredJob {
-  /** Gate id (e.g. "20260302T113000Z-login-fix-abc1234-101") */
-  id: string;
-  /** Lane the job runs on */
-  lane: string;
-  /** Machine the lane is assigned to */
-  machine: string;
-  /** When the job was first seen running (ISO string) */
-  startedAt: string;
-  /** When the job was last seen running (epoch ms) */
-  lastSeenAt: number;
-  /** Runner pid if known */
-  runnerPid: number | null;
-}
+export type FindingType = "machine_down" | "job_lost" | "slot_overflow" | "dead_runner";
 
-/** Machine state for monitoring */
-export interface MachineState {
-  /** Machine id from config */
+/** What the monitor knows about one machine, from its probes. */
+export interface MachineView {
   id: string;
-  /** Whether the machine is reachable */
-  reachable: boolean;
-  /** Last time the machine was probed (epoch ms) */
-  lastProbeAt: number | null;
-  /** Error message if probe failed */
-  lastError: string | null;
-  /** When the machine became unreachable (epoch ms), null if up */
+  /** null: not probed yet */
+  up: boolean | null;
+  /** Since when every probe round has failed (epoch ms), while it does */
   downSince: number | null;
+  /** Since when every probe round has passed (epoch ms), while it does */
+  upSince: number | null;
+  lastProbeAt: number | null;
+  /** The failing probe's error, one line (a timeout says so) */
+  lastError: string | null;
+  lanes: string[];
 }
 
-/** A finding from the monitor */
-export interface InfraFinding {
-  /** Unique key for deduplication */
-  key: string;
-  /** Category of finding */
-  type: "job_machine_down" | "duplicate_slot" | "dead_runner";
-  /** Human-readable summary */
-  summary: string;
-  /** Detailed evidence lines */
-  evidence: string[];
-  /** Variables for act-mode commands */
-  vars: Record<string, string>;
-}
-
-/** A notice raised to the decision inbox */
-export interface InfraNotice {
+/** A running request the monitor watches. */
+export interface JobView {
   id: string;
-  finding: InfraFinding;
-  /** When the notice was raised (ISO string) */
-  raisedAt: string;
-  /** Decision id if linked to the inbox */
-  decisionId: string | null;
-  /** Whether re-queue was attempted */
-  requeued: boolean;
-  /** Result of re-queue attempt */
-  requeueResult: "moved" | "failed" | "skipped" | null;
+  lane: string;
+  machine: string;
+  /** The request's claim time (its ctime, epoch ms) */
+  claimedAt: number;
+  /** The machine answered its probes at least once while this job ran */
+  machineSeenUp: boolean;
+  /** The process group in the request's .pgid file, if there is one */
+  pgid: number | null;
+  /** null: no .pgid file (yet) */
+  groupAlive: boolean | null;
 }
 
-/** Configuration for the infra monitor */
-export interface InfraMonitorSettings {
-  /** Whether the monitor is enabled */
-  enabled: boolean;
-  /** Mode: observe or act */
-  mode: "observe" | "act";
-  /** Interval between checks in seconds */
-  intervalSeconds: number;
-  /** How long a machine must be down before noticing (seconds) */
-  downThresholdSeconds: number;
-  /** Command to probe a machine: argv with {machine} placeholder */
-  probeCmd: string[] | null;
-  /** Timeout for probe commands in seconds */
-  probeTimeoutSeconds: number;
-  /** Command to re-queue a job: argv with {gate}, {from_lane}, {to_lane} placeholders */
-  requeueCmd: string[] | null;
-  /** Timeout for re-queue commands in seconds */
-  requeueTimeoutSeconds: number;
+/** A problem the monitor found. */
+export interface InfraFinding {
+  /** Dedupe key, also the notice's key: `<type>:<subject>` */
+  key: string;
+  type: FindingType;
+  /** One line */
+  summary: string;
+  /** Evidence lines, one line each */
+  evidence: string[];
+  /** Flat facts for the notice's evidence */
+  facts: Record<string, string | number | boolean | null>;
+  machine: string | null;
+  lane: string | null;
+  /** Running jobs a machine_down finding is about (their re-queue candidates) */
+  jobs: { id: string; lane: string }[];
 }
 
-/** Tick summary */
+export interface FindingView extends InfraFinding {
+  /** When the monitor first reported it (epoch ms) */
+  since: number;
+  /** When its cause was last seen gone (epoch ms); the notice is withdrawn once it stays gone */
+  clearingSince: number | null;
+  /** The open notice in the Decision Inbox (act mode), or null */
+  noticeId: string | null;
+}
+
+/** One job's re-queue, as the ledger keeps it across restarts. */
+export interface RequeueRecord {
+  project: string;
+  id: string;
+  from: string;
+  to: string;
+  attempts: number;
+  /** running: started and not finished (a restart counts it as a failed attempt) */
+  status: "running" | "moved" | "failed" | "gave_up";
+  lastAttemptAt: number;
+  /** When a failed re-queue may run again (epoch ms), or null */
+  nextAttemptAt: number | null;
+  lastError: string | null;
+  /** The argv that ran */
+  argv: string[];
+}
+
+/** A re-queue act mode would run now for a job of a down machine (observe mode shows it; nothing runs). */
+export interface PlannedRequeue {
+  id: string;
+  from: string;
+  to: string | null;
+  argv: string[] | null;
+  /** Why it can't run now, or null */
+  reason: string | null;
+}
+
 export interface InfraMonitorTick {
   at: string;
-  jobsMonitored: number;
+  durationMs: number;
   machinesProbed: number;
-  findingsDetected: number;
+  machinesDown: number;
+  runningJobs: number;
+  queuedJobs: number;
+  findings: number;
   noticesRaised: number;
-  requeuesAttempted: number;
+  noticesWithdrawn: number;
+  requeues: number;
 }
 
-/** Status for API */
 export interface InfraMonitorStatus {
   project: string;
   enabled: boolean;
   running: boolean;
   mode: "observe" | "act" | null;
+  /** Why act mode does nothing (observe mode, read_only project...), or null */
+  actBlocked: string | null;
   intervalSeconds: number | null;
   lastTick: InfraMonitorTick | null;
   lastError: string | null;
-  monitoredJobs: MonitoredJob[];
-  machineStates: MachineState[];
-  activeNotices: InfraNotice[];
+  /** No tick finished for three intervals: the monitor is not watching */
+  stale: boolean;
+  machines: MachineView[];
+  jobs: JobView[];
+  findings: FindingView[];
+  /** The re-queues act mode would run (or runs) for the current findings */
+  plannedRequeues: PlannedRequeue[];
+  /** The re-queues act mode ran, from the ledger */
+  requeues: RequeueRecord[];
 }

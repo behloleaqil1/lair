@@ -1,240 +1,109 @@
 /**
- * Tests for infra monitor configuration parsing.
+ * The `infra_monitor:` block: defaults, refusals and the re-queue argv.
  */
 import { describe, expect, it } from "vitest";
-import { parseInfraMonitorConfig, buildArgv, actBlockedReason } from "./config.js";
 import type { ProjectConfig } from "../../shared/types.js";
+import { actBlockedReason, buildRequeueArgv, parseInfraMonitorConfig, type InfraMonitorSettings } from "./config.js";
+
+const valid = {
+  enabled: true,
+  mode: "act",
+  machines: {
+    local: { probes: [["/usr/local/bin/docker", "info", "--format", "{{.ServerVersion}}"]] },
+    laptop: { probes: [{ argv: ["/usr/bin/ssh", "-o", "ConnectTimeout=5", "dev@host", "echo", "ok"], expect: "ok" }] },
+  },
+  lanes: {
+    heavy: { machine: "local" },
+    remote: { machine: "laptop", slots: 2, runner_pid_files: ["runner-remote.pid", "runner-remote2.pid"], requeue_to: ["heavy"] },
+  },
+  requeue_cmd: ["/opt/gates/requeue.sh", "{id}", "{from}", "{to}"],
+};
+
+function settings(raw: unknown): InfraMonitorSettings {
+  const parsed = parseInfraMonitorConfig(raw);
+  if (!parsed.ok) throw new Error(parsed.errors.join("; "));
+  return parsed.settings;
+}
+
+function errors(raw: unknown): string[] {
+  const parsed = parseInfraMonitorConfig(raw);
+  return parsed.ok ? [] : parsed.errors;
+}
 
 describe("parseInfraMonitorConfig", () => {
-  it("returns defaults when config is undefined", () => {
-    const result = parseInfraMonitorConfig(undefined);
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.settings).toMatchObject({
-        enabled: false,
-        mode: "observe",
-        intervalSeconds: 60,
-        downThresholdSeconds: 120,
-        probeCmd: null,
-        probeTimeoutSeconds: 10,
-        requeueCmd: null,
-        requeueTimeoutSeconds: 30,
-      });
-    }
+  it("is off and in observe mode by default", () => {
+    expect(settings(undefined)).toMatchObject({ enabled: false, mode: "observe", intervalSeconds: 60, downThresholdSeconds: 120, requeueCmd: null });
+    expect(settings({})).toMatchObject({ enabled: false, mode: "observe" });
   });
 
-  it("returns defaults when config is null", () => {
-    const result = parseInfraMonitorConfig(null);
-    expect(result.ok).toBe(true);
+  it("parses machines (probe argv, or argv with expect) and lanes", () => {
+    const s = settings(valid);
+    expect(s.machines).toEqual([
+      { id: "local", probes: [{ argv: ["/usr/local/bin/docker", "info", "--format", "{{.ServerVersion}}"], expect: null }], startGraceSeconds: 120 },
+      { id: "laptop", probes: [{ argv: ["/usr/bin/ssh", "-o", "ConnectTimeout=5", "dev@host", "echo", "ok"], expect: "ok" }], startGraceSeconds: 120 },
+    ]);
+    expect(s.lanes).toEqual([
+      { name: "heavy", machine: "local", slots: 1, runnerPidFiles: [], requeueTo: [] },
+      { name: "remote", machine: "laptop", slots: 2, runnerPidFiles: ["runner-remote.pid", "runner-remote2.pid"], requeueTo: ["heavy"] },
+    ]);
   });
 
-  it("parses enabled: true", () => {
-    const result = parseInfraMonitorConfig({ enabled: true });
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.settings.enabled).toBe(true);
-    }
+  it("refuses an enabled block that watches nothing", () => {
+    expect(errors({ enabled: true })).toEqual(["infra_monitor.lanes: name at least one lane and its machine, or the monitor watches nothing"]);
   });
 
-  it("parses mode: act", () => {
-    const result = parseInfraMonitorConfig({ mode: "act" });
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.settings.mode).toBe("act");
-    }
+  it("refuses a machine with no probe: it would count as up", () => {
+    expect(errors({ ...valid, machines: { ...valid.machines, local: { probes: [] } } })[0]).toContain("infra_monitor.machines.local.probes");
   });
 
-  it("rejects invalid mode", () => {
-    const result = parseInfraMonitorConfig({ mode: "invalid" });
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.errors).toContain("infra_monitor.mode must be 'observe' or 'act'");
-    }
-  });
-
-  it("parses interval_seconds", () => {
-    const result = parseInfraMonitorConfig({ interval_seconds: 120 });
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.settings.intervalSeconds).toBe(120);
-    }
-  });
-
-  it("rejects interval_seconds out of range", () => {
-    const tooLow = parseInfraMonitorConfig({ interval_seconds: 5 });
-    expect(tooLow.ok).toBe(false);
-
-    const tooHigh = parseInfraMonitorConfig({ interval_seconds: 5000 });
-    expect(tooHigh.ok).toBe(false);
-  });
-
-  it("parses probe_cmd", () => {
-    const result = parseInfraMonitorConfig({
-      probe_cmd: ["ssh", "-o", "ConnectTimeout=5", "{machine}", "echo", "ok"],
+  it("refuses a lane on an unknown machine and a requeue_to that is unknown or itself", () => {
+    const out = errors({
+      ...valid,
+      lanes: { heavy: { machine: "cloud" }, remote: { machine: "laptop", requeue_to: ["remote", "quick"] } },
     });
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.settings.probeCmd).toEqual(["ssh", "-o", "ConnectTimeout=5", "{machine}", "echo", "ok"]);
-    }
+    expect(out).toEqual([
+      'infra_monitor.lanes.heavy.machine: no machine "cloud" under infra_monitor.machines',
+      "infra_monitor.lanes.remote.requeue_to: a lane can't re-queue to itself",
+      'infra_monitor.lanes.remote.requeue_to: no lane "quick" under infra_monitor.lanes',
+    ]);
   });
 
-  it("rejects probe_cmd with dangerous characters", () => {
-    const result = parseInfraMonitorConfig({
-      probe_cmd: ["sh", "-c", "echo $HOME"],
-    });
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.errors[0]).toContain("forbidden shell metacharacters");
-    }
+  it("refuses unknown keys, out-of-range numbers and a program starting with '-'", () => {
+    expect(errors({ ...valid, probe_cmd: ["ssh"] })[0]).toContain("Unrecognized key");
+    expect(errors({ ...valid, interval_seconds: 5 })[0]).toContain("infra_monitor.interval_seconds");
+    expect(errors({ ...valid, probe_timeout_seconds: 0 })[0]).toContain("infra_monitor.probe_timeout_seconds");
+    expect(errors({ ...valid, machines: { local: { probes: [["-rf"]] } }, lanes: { heavy: { machine: "local" } } })[0]).toContain("must not start with '-'");
+    expect(errors({ ...valid, lanes: { heavy: { machine: "local", runner_pid_files: ["../x.pid"] } } })[0]).toContain("runner_pid_files");
   });
 
-  it("rejects non-array probe_cmd", () => {
-    const result = parseInfraMonitorConfig({ probe_cmd: "ping {machine}" });
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.errors).toContain("infra_monitor.probe_cmd must be an array");
-    }
-  });
-
-  it("rejects empty probe_cmd array", () => {
-    const result = parseInfraMonitorConfig({ probe_cmd: [] });
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.errors).toContain("infra_monitor.probe_cmd must have at least one element");
-    }
-  });
-
-  it("parses requeue_cmd", () => {
-    const result = parseInfraMonitorConfig({
-      requeue_cmd: ["./bin/requeue", "{gate}", "{from_lane}", "{to_lane}"],
-    });
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.settings.requeueCmd).toEqual(["./bin/requeue", "{gate}", "{from_lane}", "{to_lane}"]);
-    }
-  });
-
-  it("rejects non-object config", () => {
-    const result = parseInfraMonitorConfig("invalid");
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.errors).toContain("infra_monitor must be an object");
-    }
-  });
-
-  it("collects multiple errors", () => {
-    const result = parseInfraMonitorConfig({
-      enabled: "yes",
-      mode: "maybe",
-      interval_seconds: "fast",
-    });
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.errors.length).toBeGreaterThan(1);
-    }
+  it("checks requeue_cmd's placeholders", () => {
+    expect(errors({ ...valid, requeue_cmd: ["/x", "{id}", "{to}", "{host}"] })).toEqual([
+      "infra_monitor.requeue_cmd: unknown placeholder {host} (allowed: {id}, {from}, {to})",
+    ]);
+    expect(errors({ ...valid, requeue_cmd: ["{to}", "{id}"] })).toContain("infra_monitor.requeue_cmd: the program can't be a placeholder");
+    expect(errors({ ...valid, requeue_cmd: ["/x", "{id}"] })).toEqual(["infra_monitor.requeue_cmd: must pass {id} and {to}"]);
   });
 });
 
-describe("buildArgv", () => {
-  it("replaces placeholders", () => {
-    const result = buildArgv(["ssh", "{machine}", "echo", "ok"], { machine: "build-server" });
-    expect(result).toEqual({ argv: ["ssh", "build-server", "echo", "ok"] });
-  });
-
-  it("replaces multiple placeholders", () => {
-    const result = buildArgv(
-      ["./bin/requeue", "{gate}", "{from_lane}", "{to_lane}"],
-      { gate: "20260302T110000Z-fix-abc-101", from_lane: "heavy", to_lane: "light" }
-    );
-    expect(result).toEqual({
-      argv: ["./bin/requeue", "20260302T110000Z-fix-abc-101", "heavy", "light"],
+describe("buildRequeueArgv", () => {
+  it("fills each placeholder once, as one argument, never interpreting the value", () => {
+    expect(buildRequeueArgv(["/x", "--id={id}", "{from}", "{to}"], { id: "g$&{to}", from: "remote", to: "heavy" })).toEqual({
+      argv: ["/x", "--id=g$&{to}", "remote", "heavy"],
     });
   });
 
-  it("fails on unreplaced placeholder", () => {
-    const result = buildArgv(["ssh", "{machine}", "{unknown}"], { machine: "host" });
-    expect("error" in result).toBe(true);
-    if ("error" in result) {
-      expect(result.error).toContain("{unknown}");
-    }
-  });
-
-  it("fails when command starts with option", () => {
-    const result = buildArgv(["-option", "value"], {});
-    expect("error" in result).toBe(true);
-    if ("error" in result) {
-      expect(result.error).toContain("must not start with an option");
-    }
+  it("refuses a value that would become an option", () => {
+    expect(buildRequeueArgv(["/x", "{id}", "{to}"], { id: "-rf", from: "a", to: "b" })).toEqual({
+      error: 'requeue_cmd: the value in "{id}" starts with "-" and would be read as an option',
+    });
   });
 });
 
 describe("actBlockedReason", () => {
-  const baseConfig: ProjectConfig = {
-    name: "Test",
-    repo: "/tmp/test",
-    github: "example/test",
-    queue_file: "/tmp/queue.md",
-    agents_dir: "/tmp/agents",
-    gates_dir: "/tmp/gates",
-    machines: {},
-  };
-
-  it("returns null when act is allowed", () => {
-    const result = actBlockedReason(baseConfig, {
-      enabled: true,
-      mode: "act",
-      intervalSeconds: 60,
-      downThresholdSeconds: 120,
-      probeCmd: null,
-      probeTimeoutSeconds: 10,
-      requeueCmd: ["./bin/requeue"],
-      requeueTimeoutSeconds: 30,
-    });
-    expect(result).toBeNull();
-  });
-
-  it("blocks when project is read_only", () => {
-    const result = actBlockedReason(
-      { ...baseConfig, read_only: true },
-      {
-        enabled: true,
-        mode: "act",
-        intervalSeconds: 60,
-        downThresholdSeconds: 120,
-        probeCmd: null,
-        probeTimeoutSeconds: 10,
-        requeueCmd: ["./bin/requeue"],
-        requeueTimeoutSeconds: 30,
-      }
-    );
-    expect(result).toContain("read_only");
-  });
-
-  it("blocks when mode is observe", () => {
-    const result = actBlockedReason(baseConfig, {
-      enabled: true,
-      mode: "observe",
-      intervalSeconds: 60,
-      downThresholdSeconds: 120,
-      probeCmd: null,
-      probeTimeoutSeconds: 10,
-      requeueCmd: ["./bin/requeue"],
-      requeueTimeoutSeconds: 30,
-    });
-    expect(result).toContain("observe");
-  });
-
-  it("blocks when requeue_cmd is not configured", () => {
-    const result = actBlockedReason(baseConfig, {
-      enabled: true,
-      mode: "act",
-      intervalSeconds: 60,
-      downThresholdSeconds: 120,
-      probeCmd: null,
-      probeTimeoutSeconds: 10,
-      requeueCmd: null,
-      requeueTimeoutSeconds: 30,
-    });
-    expect(result).toContain("requeue_cmd");
+  const config = { read_only: false } as ProjectConfig;
+  it("acts only in act mode on a project that is not read_only", () => {
+    expect(actBlockedReason(config, settings(valid))).toBeNull();
+    expect(actBlockedReason(config, settings({ ...valid, mode: "observe" }))).toContain("observe");
+    expect(actBlockedReason({ read_only: true } as ProjectConfig, settings(valid))).toBe("the project is read_only");
   });
 });

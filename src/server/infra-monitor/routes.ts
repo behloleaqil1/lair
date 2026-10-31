@@ -1,19 +1,21 @@
 /**
- * Infrastructure monitor routes: read-only. The infra monitor is configured
- * in the project YAML (infra_monitor:), so there are no mutation routes.
+ * Infrastructure monitor routes: read-only. The monitor is configured in the
+ * project YAML (infra_monitor:), act mode included, so no route starts,
+ * stops or changes anything.
  *
- *   GET /api/infra-monitor/status?project=    Status, machines, jobs, notices
- *   GET /api/infra-monitor/jobs?project=      Running jobs being monitored
- *   GET /api/infra-monitor/machines?project=  Machine states and reachability
- *   GET /api/infra-monitor/notices?project=   Active infrastructure notices
+ *   GET /api/infra-monitor/status?project=    machines, jobs, findings, planned and past re-queues
+ *   GET /api/infra-monitor/machines?project=  machine states from the probes
+ *   GET /api/infra-monitor/jobs?project=      running jobs being watched
+ *   GET /api/infra-monitor/findings?project=  current findings
  *
  * `?project=` is validated by the root guards (src/server/root-guards.ts);
  * without it the default project is used.
  */
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { rejectCrossSiteRequests } from "../origin.js";
 import type { InfraMonitorManager } from "./service.js";
+import type { InfraMonitorStatus } from "./types.js";
 
 function respond<T>(data: T) {
   return { success: true, data, timestamp: new Date().toISOString() };
@@ -30,57 +32,23 @@ export async function registerInfraMonitorRoutes(
   manager: InfraMonitorManager,
   defaultProject: () => string,
 ): Promise<void> {
-  // Encapsulated so the cross-site guard applies to these routes too
   await fastify.register(async (app) => {
     app.addHook("onRequest", rejectCrossSiteRequests);
 
-    const projectOf = (query: { project?: string }) => query.project ?? defaultProject();
-
-    // GET /api/infra-monitor/status - Full status including machines, jobs, notices
-    app.get("/api/infra-monitor/status", async (request, reply) => {
+    // Each route is written out (app.get("/api/...")) so the route-ownership scan sees it
+    const read = (pick: (status: InfraMonitorStatus) => unknown) => async (request: FastifyRequest, reply: FastifyReply) => {
       const query = ProjectQuery.safeParse(request.query ?? {});
       if (!query.success) return fail(reply, 400, `Invalid query: ${query.error.issues[0].path.join(".")}`);
       try {
-        return respond(manager.status(projectOf(query.data)));
+        return respond(pick(manager.status(query.data.project ?? defaultProject())));
       } catch (e) {
         return fail(reply, 500, e instanceof Error ? e.message : "Unknown error");
       }
-    });
+    };
 
-    // GET /api/infra-monitor/jobs - Running jobs being monitored
-    app.get("/api/infra-monitor/jobs", async (request, reply) => {
-      const query = ProjectQuery.safeParse(request.query ?? {});
-      if (!query.success) return fail(reply, 400, `Invalid query: ${query.error.issues[0].path.join(".")}`);
-      try {
-        const status = manager.status(projectOf(query.data));
-        return respond(status.monitoredJobs);
-      } catch (e) {
-        return fail(reply, 500, e instanceof Error ? e.message : "Unknown error");
-      }
-    });
-
-    // GET /api/infra-monitor/machines - Machine states
-    app.get("/api/infra-monitor/machines", async (request, reply) => {
-      const query = ProjectQuery.safeParse(request.query ?? {});
-      if (!query.success) return fail(reply, 400, `Invalid query: ${query.error.issues[0].path.join(".")}`);
-      try {
-        const status = manager.status(projectOf(query.data));
-        return respond(status.machineStates);
-      } catch (e) {
-        return fail(reply, 500, e instanceof Error ? e.message : "Unknown error");
-      }
-    });
-
-    // GET /api/infra-monitor/notices - Active infrastructure notices
-    app.get("/api/infra-monitor/notices", async (request, reply) => {
-      const query = ProjectQuery.safeParse(request.query ?? {});
-      if (!query.success) return fail(reply, 400, `Invalid query: ${query.error.issues[0].path.join(".")}`);
-      try {
-        const status = manager.status(projectOf(query.data));
-        return respond(status.activeNotices);
-      } catch (e) {
-        return fail(reply, 500, e instanceof Error ? e.message : "Unknown error");
-      }
-    });
+    app.get("/api/infra-monitor/status", read((s) => s));
+    app.get("/api/infra-monitor/machines", read((s) => s.machines));
+    app.get("/api/infra-monitor/jobs", read((s) => s.jobs));
+    app.get("/api/infra-monitor/findings", read((s) => s.findings));
   });
 }

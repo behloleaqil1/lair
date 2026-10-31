@@ -1,447 +1,442 @@
 /**
- * The infrastructure monitor service: one InfraMonitor per project with
- * `infra_monitor.enabled`.
+ * The infrastructure monitor: one InfraMonitor per project with
+ * `infra_monitor.enabled: true` (docs/configuration.md#infrastructure-monitor).
  *
- * Each tick:
- * 1. Probe every machine the project's lanes use
- * 2. Read the gate queue to find running and queued jobs
- * 3. Detect infrastructure problems:
- *    - Jobs running on machines that went down
- *    - Duplicate runner slots
- *    - Dead runners while jobs are queued
- * 4. For each finding, raise one notice and, in act mode, re-queue the job
+ * Every interval_seconds, one tick:
+ * 1. read the gate queue of the configured lanes (async, bounded) and each
+ *    running request's process group;
+ * 2. probe every configured machine (argv, with a timeout; a timeout or a
+ *    missing `expect` is a failure);
+ * 3. read the lanes' runner pid files;
+ * 4. detect (detectors.ts) and keep the findings, each until its cause has
+ *    been gone for down_threshold_seconds plus one interval;
+ * 5. act mode only: raise one Decision Inbox notice per finding, withdraw it
+ *    once the finding is gone, and, with requeue_cmd, re-queue each running
+ *    job of a down machine once onto a lane whose machine is up, through the
+ *    ledger (bounded attempts with backoff, kept across restarts).
+ *
+ * Observe mode writes nothing: no notice, no command but the probes, no
+ * ledger. Its findings and the re-queues it would run are in the status.
  */
+import { join } from "path";
 import type { EventBus } from "../core/event-bus.js";
-import type { ProjectConfig } from "../../shared/types.js";
 import type { DecisionProducer } from "../decisions/types.js";
-import { parseInfraMonitorConfig, actBlockedReason, buildArgv } from "./config.js";
-import type { InfraMonitorSettings } from "./types.js";
-import { detectJobMachineDown, detectDuplicateSlot, detectDeadRunner, type DetectorContext } from "./detectors.js";
-import type { InfraFinding, InfraMonitorStatus, InfraMonitorTick, InfraNotice, MachineState, MonitoredJob } from "./types.js";
-import { readGateQueue, findDuplicateSlots, getRunnerPid, type InfraMonitorProbes, systemInfraProbes } from "./probes.js";
-import { InfraMonitorStore } from "./store.js";
+import type { ProjectConfig } from "../../shared/types.js";
+import { actBlockedReason, buildRequeueArgv, parseInfraMonitorConfig, type InfraMonitorSettings, type LaneSettings, type MachineSettings } from "./config.js";
+import { detect, oneLine, type RunnerState } from "./detectors.js";
+import { RequeueLedger } from "./ledger.js";
+import { NOTICE_MODULE, noticeFor } from "./notices.js";
+import { groupAlive, pidAlive, readQueue, readRunnerPids, systemInfraProbes, type InfraProbes, type QueueEntry } from "./probes.js";
+import type { FindingView, InfraFinding, InfraMonitorStatus, InfraMonitorTick, JobView, MachineView, PlannedRequeue, RequeueRecord } from "./types.js";
 
-const DECISION_MODULE = "infra_monitor";
-const MAX_EVIDENCE_LINES = 20;
+/** At most this many re-queues run in one tick */
+export const MAX_REQUEUES_PER_TICK = 4;
+/** The longest wait between two attempts of one re-queue */
+const MAX_BACKOFF_MS = 6 * 3_600_000;
+
+type Log = Pick<Console, "warn" | "log">;
 
 export interface InfraMonitorOptions {
   project: string;
   config: ProjectConfig;
   settings: InfraMonitorSettings;
-  store: InfraMonitorStore;
-  probes: InfraMonitorProbes;
+  probes: InfraProbes;
+  ledger: RequeueLedger;
   events?: EventBus;
+  log?: Log;
+  /** Delay of the first tick after start() (default 1 s) */
+  firstTickMs?: number;
 }
 
-function iso(ms: number): string {
-  return new Date(ms).toISOString();
-}
+const iso = (ms: number) => new Date(ms).toISOString();
 
 export class InfraMonitor {
   readonly project: string;
-  private config: ProjectConfig;
-  private settings: InfraMonitorSettings;
-  private store: InfraMonitorStore;
-  private probes: InfraMonitorProbes;
-  private events?: EventBus;
+  readonly settings: InfraMonitorSettings;
+  private readonly config: ProjectConfig;
+  private readonly probes: InfraProbes;
+  private readonly ledger: RequeueLedger;
+  private readonly events?: EventBus;
+  private readonly log: Log;
+  private readonly firstTickMs: number;
   private decisions?: DecisionProducer;
+
+  private machines = new Map<string, MachineView>();
+  private jobs = new Map<string, JobView>();
+  private held = new Map<string, number>();
+  private findings = new Map<string, FindingView>();
+  /** key -> when an open notice with no finding behind it was first seen (after a restart or reload) */
+  private orphans = new Map<string, number>();
+  private planned: PlannedRequeue[] = [];
+
   private timer: NodeJS.Timeout | null = null;
-  private ticking: Promise<InfraMonitorTick> | null = null;
+  private ticking: Promise<InfraMonitorTick | null> | null = null;
   private stopped = true;
   private abort = new AbortController();
-  lastTick?: InfraMonitorTick;
-  lastError?: string;
+  private startedAt: number | null = null;
+  private lastFinishedAt: number | null = null;
+  lastTick: InfraMonitorTick | null = null;
+  lastError: string | null = null;
 
   constructor(options: InfraMonitorOptions) {
     this.project = options.project;
     this.config = options.config;
     this.settings = options.settings;
-    this.store = options.store;
     this.probes = options.probes;
+    this.ledger = options.ledger;
     this.events = options.events;
+    this.log = options.log ?? console;
+    this.firstTickMs = options.firstTickMs ?? 1000;
+    // In the order of the config; "not probed yet" until the first tick
+    for (const m of this.settings.machines) {
+      const lanes = this.settings.lanes.filter((l) => l.machine === m.id).map((l) => l.name);
+      this.machines.set(m.id, { id: m.id, up: null, downSince: null, upSince: null, lastProbeAt: null, lastError: null, lanes });
+    }
+  }
+
+  private backoffMs(attempts: number): number {
+    return Math.min(this.settings.requeueBackoffSeconds * 1000 * 2 ** (attempts - 1), MAX_BACKOFF_MS);
   }
 
   get running(): boolean {
     return !this.stopped;
   }
 
-  /** Why act mode is off for this project, or null when it is on. */
+  /** Why act mode does nothing, or null when it acts. */
   get actBlocked(): string | null {
     return actBlockedReason(this.config, this.settings);
   }
-
-  private get gatesDir(): string {
-    return this.config.gates_dir;
-  }
-
-  /** The machines used by the project's lanes. */
-  private get machines(): Map<string, string> {
-    const result = new Map<string, string>();
-    const machines = this.config.machines ?? {};
-    for (const [id, machine] of Object.entries(machines)) {
-      if (machine && typeof machine === "object" && "runners" in machine) {
-        const runners = machine.runners as string[] | undefined;
-        if (runners) {
-          for (const lane of runners) {
-            result.set(lane, id);
-          }
-        }
-      }
-    }
-    // Local machine handles lanes not assigned elsewhere
-    return result;
-  }
-
-  /** Unique machine ids from the project. */
-  private get machineIds(): string[] {
-    return [...new Set(this.machines.values())];
-  }
-
-  /** Lanes from the config. */
-  private get lanes(): string[] {
-    return [...this.machines.keys()];
-  }
-
-  // ============ DECISION INBOX ============
 
   useDecisions(decisions: DecisionProducer): void {
     this.decisions = decisions;
   }
 
-  // ============ MACHINE PROBING ============
+  private get thresholdMs(): number {
+    return this.settings.downThresholdSeconds * 1000;
+  }
 
-  private async probeMachine(machineId: string, now: number): Promise<MachineState> {
-    const existing = this.store.getMachine(this.project, machineId);
-    const state: MachineState = {
-      id: machineId,
-      reachable: existing?.reachable ?? true,
-      lastProbeAt: now,
-      lastError: existing?.lastError ?? null,
-      downSince: existing?.downSince ?? null,
-    };
+  /** A finding's notice stays until its cause has been gone this long: no withdraw-and-raise on a flap. */
+  private get clearMs(): number {
+    return this.thresholdMs + this.settings.intervalSeconds * 1000;
+  }
 
-    if (!this.settings.probeCmd) {
-      // No probe command: assume reachable
-      state.reachable = true;
-      state.downSince = null;
-      this.store.putMachine(this.project, state);
-      return state;
-    }
+  private lane(name: string): LaneSettings | undefined {
+    return this.settings.lanes.find((l) => l.name === name);
+  }
 
-    const built = buildArgv(this.settings.probeCmd, { machine: machineId });
-    if ("error" in built) {
-      state.lastError = `probe_cmd error: ${built.error}`;
-      // Don't change reachability on config error
-      this.store.putMachine(this.project, state);
-      return state;
-    }
+  // ============ PROBES ============
 
-    try {
-      const result = await this.probes.runner.run(built.argv, {
+  private async probeMachine(machine: MachineSettings, now: number): Promise<void> {
+    let error: string | null = null;
+    for (const probe of machine.probes) {
+      const out = await this.probes.runner.run(probe.argv, {
         timeoutMs: this.settings.probeTimeoutSeconds * 1000,
         signal: this.abort.signal,
       });
-
-      if (this.abort.signal.aborted) {
-        // Aborted: don't update state
-        return state;
-      }
-
-      if (result.code === 0) {
-        state.reachable = true;
-        state.lastError = null;
-        state.downSince = null;
-      } else {
-        const wasUp = state.reachable;
-        state.reachable = false;
-        state.lastError = result.stderr.trim().slice(0, 500) || `exit code ${result.code}`;
-        if (wasUp || state.downSince === null) {
-          state.downSince = now;
-        }
-      }
-    } catch (e) {
-      const wasUp = state.reachable;
-      state.reachable = false;
-      state.lastError = e instanceof Error ? e.message : String(e);
-      if (wasUp || state.downSince === null) {
-        state.downSince = now;
-      }
+      if (this.abort.signal.aborted) return;
+      if (out.timedOut) error = `probe ${probe.argv[0]} timed out after ${this.settings.probeTimeoutSeconds} s`;
+      else if (out.code !== 0) error = `probe ${probe.argv[0]} exited ${out.code}: ${oneLine(out.stderr || out.stdout, 300) || "no output"}`;
+      else if (probe.expect !== null && !out.stdout.includes(probe.expect)) error = `probe ${probe.argv[0]} did not print "${probe.expect}"`;
+      if (error) break;
     }
-
-    this.store.putMachine(this.project, state);
-    return state;
-  }
-
-  private async probeMachines(now: number): Promise<Map<string, MachineState>> {
-    const states = new Map<string, MachineState>();
-    await Promise.all(
-      this.machineIds.map(async (id) => {
-        const state = await this.probeMachine(id, now);
-        states.set(id, state);
-      })
-    );
-    return states;
-  }
-
-  // ============ JOB TRACKING ============
-
-  private updateRunningJobs(now: number): MonitoredJob[] {
-    const queue = readGateQueue(this.probes.fs, this.gatesDir);
-    const running = queue.filter((g) => g.status === "running");
-    const runningIds = new Set(running.map((g) => g.gateId));
-
-    // Remove jobs that are no longer running
-    for (const job of this.store.listJobs(this.project)) {
-      if (!runningIds.has(job.id)) {
-        this.store.deleteJob(this.project, job.id);
-        // Clear any notifications for this job
-        this.store.clearNotified(this.project, `job_machine_down:${job.id}`);
-      }
-    }
-
-    // Add or update running jobs
-    for (const gate of running) {
-      const machine = this.machines.get(gate.lane);
-      if (!machine) continue; // Lane not assigned to a machine
-
-      const existing = this.store.getJob(this.project, gate.gateId);
-      const runnerPid = gate.pid ?? getRunnerPid(this.probes.fs, this.gatesDir, gate.lane);
-
-      if (existing) {
-        existing.lastSeenAt = now;
-        existing.runnerPid = runnerPid;
-        this.store.putJob(this.project, existing);
-      } else {
-        this.store.putJob(this.project, {
-          id: gate.gateId,
-          lane: gate.lane,
-          machine,
-          startedAt: iso(gate.ctimeMs ?? now),
-          lastSeenAt: now,
-          runnerPid,
-        });
-      }
-    }
-
-    return this.store.listJobs(this.project);
-  }
-
-  // ============ NOTICE HANDLING ============
-
-  private async raiseNotice(finding: InfraFinding, now: number): Promise<boolean> {
-    if (this.store.hasNotified(this.project, finding.key)) {
-      return false; // Already notified this session
-    }
-
-    const notice: InfraNotice = {
-      id: crypto.randomUUID(),
-      finding,
-      raisedAt: iso(now),
-      decisionId: null,
-      requeued: false,
-      requeueResult: null,
-    };
-
-    this.store.addNotice(this.project, notice);
-    this.store.markNotified(this.project, finding.key);
-
-    // Emit event
-    await this.events?.emit("decision.needed", {
-      project: this.project,
-      module: DECISION_MODULE,
-      kind: "notice",
-      summary: finding.summary,
-      evidence: finding.evidence.slice(0, MAX_EVIDENCE_LINES),
-    });
-
-    // Raise to Decision Inbox if available (as a notice, not blocking)
-    if (this.decisions) {
-      try {
-        const result = await this.decisions.raise({
-          project: this.project,
-          kind: "escalation",
-          attention: "notice",
-          title: finding.summary.slice(0, 200),
-          context: [
-            `**${finding.type}**`,
-            "",
-            ...finding.evidence.map((e) => `- ${e}`),
-          ].join("\n"),
-          options: [{ id: "acknowledged", label: "Acknowledged", consequences: "The notice is acknowledged but no automated action is taken.", effect: "frees_task" }],
-          recommended: { optionId: "acknowledged", reasoning: "This is an informational notice." },
-          source: { module: DECISION_MODULE, ref: finding.key },
-          key: finding.key,
-          class: "infra_monitor.notice",
-          evidence: {
-            code: finding.type,
-            facts: {
-              machine: finding.vars.machine || null,
-              lane: finding.vars.from_lane || finding.vars.lane || null,
-              gate: finding.vars.gate || null,
-            },
-            cause_cleared: false,
-            linked_issue: null,
+    const prev = this.machines.get(machine.id);
+    const lanes = this.settings.lanes.filter((l) => l.machine === machine.id).map((l) => l.name);
+    this.machines.set(
+      machine.id,
+      error === null
+        ? { id: machine.id, up: true, downSince: null, upSince: prev?.up === true ? prev.upSince : now, lastProbeAt: now, lastError: null, lanes }
+        : {
+            id: machine.id,
+            up: false,
+            downSince: prev?.up === false && prev.downSince !== null ? prev.downSince : now,
+            upSince: null,
+            lastProbeAt: now,
+            lastError: error,
+            lanes,
           },
-        });
-        notice.decisionId = result.decision.id;
-        this.store.addNotice(this.project, notice);
-      } catch (e) {
-        console.warn(`[infra-monitor] ${this.project}: failed to raise notice: ${e instanceof Error ? e.message : String(e)}`);
-      }
-    }
-
-    return true;
+    );
   }
 
-  // ============ ACT MODE: RE-QUEUE ============
-
-  private async requeue(finding: InfraFinding, _now: number): Promise<"moved" | "failed" | "skipped"> {
-    if (this.actBlocked !== null) return "skipped";
-    if (!this.settings.requeueCmd) return "skipped";
-    if (finding.type !== "job_machine_down") return "skipped";
-
-    // Find an alternative lane (same track, different machine if possible)
-    const fromLane = finding.vars.from_lane;
-    const fromMachine = finding.vars.machine;
-    const gate = finding.vars.gate;
-
-    // For now, we don't auto-select a target lane; the requeue_cmd handles that
-    // Just pass the from_lane and let the command figure out the best target
-    const toLane = fromLane; // Placeholder - the command may override
-
-    const built = buildArgv(this.settings.requeueCmd, {
-      gate,
-      from_lane: fromLane,
-      to_lane: toLane,
-    });
-
-    if ("error" in built) {
-      console.warn(`[infra-monitor] ${this.project}: requeue_cmd error: ${built.error}`);
-      return "failed";
+  private updateJobs(running: QueueEntry[]): void {
+    const next = new Map<string, JobView>();
+    for (const entry of running) {
+      const lane = this.lane(entry.lane);
+      if (!lane) continue;
+      // The same run while it stays in its lane (a runner may touch its request, which moves the ctime on)
+      const prev = this.jobs.get(entry.id);
+      const same = prev !== undefined && prev.lane === entry.lane ? prev : null;
+      next.set(entry.id, {
+        id: entry.id,
+        lane: entry.lane,
+        machine: lane.machine,
+        claimedAt: same ? Math.min(same.claimedAt, entry.ctimeMs) : entry.ctimeMs,
+        machineSeenUp: (same?.machineSeenUp ?? false) || this.machines.get(lane.machine)?.up === true,
+        pgid: entry.pgid,
+        groupAlive: entry.pgid === null ? null : groupAlive(entry.pgid),
+      });
     }
+    this.jobs = next;
+  }
 
-    try {
-      const result = await this.probes.runner.run(built.argv, {
+  private async readRunners(): Promise<Map<string, RunnerState[]>> {
+    const out = new Map<string, RunnerState[]>();
+    for (const lane of this.settings.lanes) {
+      if (lane.runnerPidFiles.length === 0) continue;
+      const pids = await readRunnerPids(this.config.gates_dir, lane.runnerPidFiles);
+      out.set(lane.name, pids.map((p) => ({ ...p, alive: p.pid !== null && pidAlive(p.pid) })));
+    }
+    return out;
+  }
+
+  // ============ FINDINGS ============
+
+  /** Keep this tick's findings; a finding gone for clearMs is dropped. Returns the dropped ones. */
+  private reconcile(current: InfraFinding[], now: number): FindingView[] {
+    const seen = new Set<string>();
+    for (const finding of current) {
+      seen.add(finding.key);
+      const prev = this.findings.get(finding.key);
+      this.findings.set(finding.key, { ...finding, since: prev?.since ?? now, clearingSince: null, noticeId: prev?.noticeId ?? null });
+      if (!prev) {
+        this.log.warn(`[infra-monitor] ${this.project}: ${finding.summary}`);
+        void this.events?.emit("infra_monitor.finding", { project: this.project, key: finding.key, type: finding.type, summary: finding.summary, mode: this.settings.mode });
+      }
+    }
+    const dropped: FindingView[] = [];
+    for (const [key, view] of this.findings) {
+      if (seen.has(key)) continue;
+      const clearingSince = view.clearingSince ?? now;
+      if (now - clearingSince >= this.clearMs) {
+        this.findings.delete(key);
+        dropped.push(view);
+        void this.events?.emit("infra_monitor.cleared", { project: this.project, key, type: view.type });
+      } else {
+        this.findings.set(key, { ...view, clearingSince });
+      }
+    }
+    return dropped;
+  }
+
+  // ============ ACT: NOTICES ============
+
+  private async syncNotices(dropped: FindingView[], now: number, tick: InfraMonitorTick): Promise<void> {
+    const inbox = this.decisions;
+    if (!inbox) {
+      if (this.findings.size > 0) this.lastError = "no Decision Inbox: notices can't be raised";
+      return;
+    }
+    for (const view of this.findings.values()) {
+      try {
+        const latest = inbox.find(this.project, NOTICE_MODULE, view.key);
+        if (latest?.status === "open") {
+          view.noticeId = latest.id;
+          continue;
+        }
+        view.noticeId = null;
+        if (view.clearingSince !== null) continue;
+        // The owner noted this occurrence: not again until it clears and comes back
+        if (latest?.status === "answered") {
+          const answered = Date.parse(latest.answeredAt ?? latest.closedAt ?? latest.createdAt);
+          if (answered >= view.since) continue;
+        }
+        const { decision, created } = await inbox.raise(noticeFor(this.project, view, Math.ceil(this.clearMs / 60_000)));
+        view.noticeId = decision.id;
+        if (created) tick.noticesRaised++;
+      } catch (e) {
+        this.lastError = `notice ${view.key} could not be raised: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    }
+    const withdraw = async (id: string, key: string, reason: string) => {
+      try {
+        await inbox.withdraw(id, { module: NOTICE_MODULE, reason });
+        tick.noticesWithdrawn++;
+      } catch (e) {
+        this.lastError = `notice ${key} could not be withdrawn: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    };
+    for (const view of dropped) {
+      const latest = inbox.find(this.project, NOTICE_MODULE, view.key);
+      if (latest?.status === "open") await withdraw(latest.id, view.key, `The problem has been gone for ${Math.ceil(this.clearMs / 60_000)} min.`);
+    }
+    // Open notices with no finding behind them (raised before a restart or a reload): withdrawn once they stay so
+    const open = inbox.openOf(this.project, NOTICE_MODULE);
+    const openKeys = new Set(open.map((d) => d.key));
+    for (const key of this.orphans.keys()) if (!openKeys.has(key) || this.findings.has(key)) this.orphans.delete(key);
+    for (const decision of open) {
+      if (this.findings.has(decision.key)) continue;
+      const since = this.orphans.get(decision.key) ?? now;
+      this.orphans.set(decision.key, since);
+      if (now - since >= this.clearMs) {
+        this.orphans.delete(decision.key);
+        await withdraw(decision.id, decision.key, `The problem has not been seen for ${Math.ceil(this.clearMs / 60_000)} min.`);
+      }
+    }
+  }
+
+  // ============ ACT: RE-QUEUE ============
+
+  /** The re-queue of a job of a down machine: where to and the argv, or why not. */
+  private plan(job: { id: string; lane: string }, downMachine: string): PlannedRequeue {
+    const base = { id: job.id, from: job.lane };
+    if (!this.settings.requeueCmd) return { ...base, to: null, argv: null, reason: "infra_monitor.requeue_cmd is not set" };
+    const targets = this.lane(job.lane)?.requeueTo ?? [];
+    if (targets.length === 0) return { ...base, to: null, argv: null, reason: `lane ${job.lane} has no requeue_to` };
+    const to = targets.find((name) => {
+      const machine = this.lane(name)?.machine;
+      return machine !== undefined && machine !== downMachine && this.machines.get(machine)?.up === true;
+    });
+    if (!to) return { ...base, to: null, argv: null, reason: `no lane of ${targets.join(", ")} has a machine that is up` };
+    const built = buildRequeueArgv(this.settings.requeueCmd, { id: job.id, from: job.lane, to });
+    if ("error" in built) return { ...base, to, argv: null, reason: built.error };
+    return { ...base, to, argv: built.argv, reason: null };
+  }
+
+  private async requeues(now: number, tick: InfraMonitorTick): Promise<void> {
+    if (!this.settings.requeueCmd) return;
+    await this.ledger.load();
+    if (this.ledger.error) {
+      this.lastError = this.ledger.error;
+      return;
+    }
+    for (const plan of this.planned) {
+      if (tick.requeues >= MAX_REQUEUES_PER_TICK || this.abort.signal.aborted) return;
+      if (!plan.to || !plan.argv) continue;
+      const prev = this.ledger.get(this.project, plan.id);
+      if (prev && (prev.status === "moved" || prev.status === "gave_up" || prev.attempts >= this.settings.requeueMaxAttempts)) continue;
+      if (prev && prev.nextAttemptAt !== null && now < prev.nextAttemptAt) continue;
+      const attempts = (prev?.attempts ?? 0) + 1;
+      const record: RequeueRecord = {
+        project: this.project,
+        id: plan.id,
+        from: plan.from,
+        to: plan.to,
+        attempts,
+        status: "running",
+        lastAttemptAt: now,
+        // If this attempt never finishes (a restart), the next waits as after a failure
+        nextAttemptAt: now + this.backoffMs(attempts),
+        lastError: null,
+        argv: plan.argv,
+      };
+      try {
+        // Kept before the command runs: a restart in the middle counts this attempt
+        await this.ledger.put(record, now);
+      } catch (e) {
+        this.lastError = `re-queue of ${plan.id} not run: the ledger can't be written: ${e instanceof Error ? e.message : String(e)}`;
+        return;
+      }
+      tick.requeues++;
+      const out = await this.probes.runner.run(plan.argv, {
         timeoutMs: this.settings.requeueTimeoutSeconds * 1000,
         signal: this.abort.signal,
       });
-
-      if (this.abort.signal.aborted) return "skipped";
-
-      if (result.code === 0) {
-        await this.events?.emit("placement.moved", {
-          project: this.project,
-          gateId: gate,
-          from: fromLane,
-          to: toLane,
-          reason: `machine ${fromMachine} down`,
-        });
-        return "moved";
-      } else {
-        console.warn(`[infra-monitor] ${this.project}: requeue failed: ${result.stderr.trim().slice(0, 200) || `exit ${result.code}`}`);
-        return "failed";
+      // Stopped mid-command: the record stays "running", read as a failed attempt after the restart
+      if (this.abort.signal.aborted) return;
+      const ok = out.code === 0 && !out.timedOut;
+      const done = this.probes.clock.now();
+      record.status = ok ? "moved" : record.attempts >= this.settings.requeueMaxAttempts ? "gave_up" : "failed";
+      record.nextAttemptAt = record.status === "failed" ? done + this.backoffMs(record.attempts) : null;
+      record.lastError = ok
+        ? null
+        : out.timedOut
+          ? `timed out after ${this.settings.requeueTimeoutSeconds} s`
+          : `exited ${out.code}: ${oneLine(out.stderr || out.stdout, 300) || "no output"}`;
+      try {
+        await this.ledger.put(record, done);
+      } catch (e) {
+        this.lastError = `the re-queue of ${plan.id} finished (${record.status}) but the ledger can't be written: ${e instanceof Error ? e.message : String(e)}`;
       }
-    } catch (e) {
-      console.warn(`[infra-monitor] ${this.project}: requeue error: ${e instanceof Error ? e.message : String(e)}`);
-      return "failed";
+      this.log.warn(`[infra-monitor] ${this.project}: re-queue of ${plan.id} from ${plan.from} to ${plan.to}: ${record.status}${record.lastError ? ` (${record.lastError})` : ""}`);
+      void this.events?.emit("infra_monitor.requeued", {
+        project: this.project,
+        id: plan.id,
+        from: plan.from,
+        to: plan.to,
+        result: record.status,
+        attempts: record.attempts,
+        error: record.lastError,
+      });
     }
   }
 
   // ============ THE TICK ============
 
-  tick(): Promise<InfraMonitorTick> {
-    if (!this.ticking) {
-      this.ticking = this.runTick().finally(() => {
-        this.ticking = null;
-      });
-    }
+  /** One tick; ticks never overlap (a call during one returns it). */
+  tick(): Promise<InfraMonitorTick | null> {
+    this.ticking ??= this.runTick().finally(() => {
+      this.ticking = null;
+    });
     return this.ticking;
   }
 
-  private async runTick(): Promise<InfraMonitorTick> {
+  private async runTick(): Promise<InfraMonitorTick | null> {
     const now = this.probes.clock.now();
-    const summary: InfraMonitorTick = {
+    const tick: InfraMonitorTick = {
       at: iso(now),
-      jobsMonitored: 0,
+      durationMs: 0,
       machinesProbed: 0,
-      findingsDetected: 0,
+      machinesDown: 0,
+      runningJobs: 0,
+      queuedJobs: 0,
+      findings: 0,
       noticesRaised: 0,
-      requeuesAttempted: 0,
+      noticesWithdrawn: 0,
+      requeues: 0,
     };
-
     try {
-      // 1. Probe machines
-      const machineStates = await this.probeMachines(now);
-      if (this.abort.signal.aborted) return summary;
-      summary.machinesProbed = machineStates.size;
+      let queue: QueueEntry[];
+      try {
+        queue = await readQueue(this.config.gates_dir, new Set(this.settings.lanes.map((l) => l.name)));
+      } catch (e) {
+        // Nothing is known: no finding is added or dropped, no notice withdrawn
+        this.lastError = `the gate queue can't be read: ${e instanceof Error ? e.message : String(e)}`;
+        return null;
+      }
+      await Promise.all(this.settings.machines.map((m) => this.probeMachine(m, now)));
+      if (this.abort.signal.aborted) return null;
+      const running = queue.filter((q) => q.status === "running");
+      const queued = queue.filter((q) => q.status === "queued");
+      this.updateJobs(running);
+      const runners = await this.readRunners();
+      const { findings, held } = detect(
+        {
+          now,
+          thresholdMs: this.thresholdMs,
+          machines: this.machines,
+          machineSettings: new Map(this.settings.machines.map((m) => [m.id, m])),
+          lanes: this.settings.lanes,
+          running: [...this.jobs.values()],
+          queued,
+          runners,
+        },
+        this.held,
+      );
+      this.held = held;
+      const dropped = this.reconcile(findings, now);
+      this.planned = [...this.findings.values()]
+        .filter((f) => f.type === "machine_down" && f.clearingSince === null && f.machine !== null)
+        .flatMap((f) => f.jobs.map((job) => this.plan(job, f.machine as string)));
 
-      // 2. Update running jobs
-      const runningJobs = this.updateRunningJobs(now);
-      summary.jobsMonitored = runningJobs.length;
-
-      // 3. Read queue for additional context
-      const queuedGates = readGateQueue(this.probes.fs, this.gatesDir);
-
-      // 4. Detect problems
-      const ctx: DetectorContext = {
-        project: this.project,
-        now,
-        runningJobs,
-        queuedGates,
-        machineStates,
-        lanes: this.machines,
-        downThresholdSeconds: this.settings.downThresholdSeconds,
-      };
-
-      const duplicates = findDuplicateSlots(this.probes.fs, this.gatesDir, this.lanes);
-      const findings: InfraFinding[] = [
-        ...detectJobMachineDown(ctx),
-        ...detectDuplicateSlot(ctx, duplicates),
-        ...detectDeadRunner(ctx),
-      ];
-      summary.findingsDetected = findings.length;
-
-      // 5. Handle findings
-      for (const finding of findings) {
-        if (this.abort.signal.aborted) break;
-
-        const raised = await this.raiseNotice(finding, now);
-        if (raised) summary.noticesRaised++;
-
-        // In act mode, try to re-queue jobs on down machines
-        if (finding.type === "job_machine_down" && this.actBlocked === null) {
-          summary.requeuesAttempted++;
-          const result = await this.requeue(finding, now);
-          const notice = this.store.getNotice(this.project, finding.key);
-          if (notice) {
-            notice.requeued = true;
-            notice.requeueResult = result;
-            this.store.addNotice(this.project, notice);
-          }
-          // If successfully moved, clear the notification so it can be raised again if needed
-          if (result === "moved") {
-            this.store.clearNotified(this.project, finding.key);
-          }
-        }
+      this.lastError = null;
+      if (this.actBlocked === null) {
+        await this.syncNotices(dropped, now, tick);
+        await this.requeues(now, tick);
       }
 
-      // Clear notifications for findings that are no longer present
-      const currentKeys = new Set(findings.map((f) => f.key));
-      for (const notice of this.store.listNotices(this.project)) {
-        if (!currentKeys.has(notice.finding.key)) {
-          this.store.deleteNotice(this.project, notice.finding.key);
-          this.store.clearNotified(this.project, notice.finding.key);
-        }
-      }
-
-      this.lastTick = summary;
-      this.lastError = undefined;
+      tick.machinesProbed = this.settings.machines.length;
+      tick.machinesDown = [...this.machines.values()].filter((m) => m.up === false).length;
+      tick.runningJobs = running.length;
+      tick.queuedJobs = queued.length;
+      tick.findings = this.findings.size;
+      tick.durationMs = this.probes.clock.now() - now;
+      this.lastTick = tick;
+      this.lastFinishedAt = this.probes.clock.now();
+      return tick;
     } catch (e) {
-      this.lastError = e instanceof Error ? e.message : String(e);
-      console.error(`[infra-monitor] ${this.project}: tick failed:`, e);
+      this.lastError = `tick failed: ${e instanceof Error ? e.message : String(e)}`;
+      this.log.warn(`[infra-monitor] ${this.project}: ${this.lastError}`);
+      return null;
     }
-
-    return summary;
   }
 
   // ============ LIFECYCLE ============
@@ -449,22 +444,20 @@ export class InfraMonitor {
   start(): void {
     if (!this.stopped) return;
     this.stopped = false;
-    if (this.abort.signal.aborted) {
-      this.abort = new AbortController();
-    }
-
+    if (this.abort.signal.aborted) this.abort = new AbortController();
+    this.startedAt = this.probes.clock.now();
     const loop = async () => {
       if (this.stopped) return;
       await this.tick();
       if (this.stopped) return;
-      this.timer = setTimeout(loop, this.settings.intervalSeconds * 1000);
+      this.timer = setTimeout(() => void loop(), this.settings.intervalSeconds * 1000);
       this.timer.unref();
     };
-
-    this.timer = setTimeout(loop, 1000);
+    this.timer = setTimeout(() => void loop(), this.firstTickMs);
     this.timer.unref();
   }
 
+  /** Stop: a probe or re-queue in progress is killed; the tick ends at once. */
   async stop(): Promise<void> {
     this.stopped = true;
     this.abort.abort();
@@ -475,18 +468,38 @@ export class InfraMonitor {
     await this.ticking?.catch(() => undefined);
   }
 
+  /** Withdraw this project's open notices (the monitor stops raising them: turned off or observe). */
+  async withdrawAll(reason: string): Promise<void> {
+    const inbox = this.decisions;
+    if (!inbox) return;
+    for (const decision of inbox.openOf(this.project, NOTICE_MODULE)) {
+      try {
+        await inbox.withdraw(decision.id, { module: NOTICE_MODULE, reason });
+      } catch (e) {
+        this.log.warn(`[infra-monitor] ${this.project}: notice ${decision.key} could not be withdrawn: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  }
+
   status(): InfraMonitorStatus {
+    const now = this.probes.clock.now();
+    // The last tick that finished, or when the first one was due
+    const since = this.lastFinishedAt ?? (this.startedAt === null ? null : this.startedAt + this.firstTickMs);
     return {
       project: this.project,
       enabled: true,
       running: this.running,
       mode: this.settings.mode,
+      actBlocked: this.actBlocked,
       intervalSeconds: this.settings.intervalSeconds,
-      lastTick: this.lastTick ?? null,
-      lastError: this.lastError ?? null,
-      monitoredJobs: this.store.listJobs(this.project),
-      machineStates: this.store.listMachines(this.project),
-      activeNotices: this.store.listNotices(this.project),
+      lastTick: this.lastTick,
+      lastError: this.lastError,
+      stale: this.running && since !== null && now - since > 3 * this.settings.intervalSeconds * 1000,
+      machines: [...this.machines.values()].map((m) => ({ ...m, lanes: [...m.lanes] })),
+      jobs: [...this.jobs.values()].map((j) => ({ ...j })),
+      findings: [...this.findings.values()].map((f) => ({ ...f, evidence: [...f.evidence], facts: { ...f.facts }, jobs: f.jobs.map((j) => ({ ...j })) })),
+      plannedRequeues: this.planned.map((p) => ({ ...p, argv: p.argv ? [...p.argv] : null })),
+      requeues: this.ledger.list(this.project),
     };
   }
 }
@@ -499,18 +512,25 @@ export interface ProjectEntry {
   error?: string;
 }
 
-/**
- * All projects' infra monitors.
- */
+export interface InfraMonitorManagerOptions {
+  probes?: InfraProbes;
+  events?: EventBus;
+  /** The re-queue ledger file; null keeps it in memory (tests) */
+  ledgerPath?: string | null;
+  log?: Log;
+  firstTickMs?: number;
+}
+
+/** Every project's infra monitor. */
 export class InfraMonitorManager {
   private monitors = new Map<string, InfraMonitor>();
   private problems = new Map<string, string[]>();
-  private store: InfraMonitorStore;
   private decisions?: DecisionProducer;
   private phase: "loaded" | "started" | "stopped" = "loaded";
+  readonly ledger: RequeueLedger;
 
-  constructor(private options: { probes?: InfraMonitorProbes; events?: EventBus }) {
-    this.store = new InfraMonitorStore();
+  constructor(private readonly options: InfraMonitorManagerOptions = {}) {
+    this.ledger = new RequeueLedger(options.ledgerPath === undefined ? join(process.cwd(), "data", "infra-monitor-requeues.json") : options.ledgerPath);
   }
 
   load(projects: ProjectEntry[]): void {
@@ -519,55 +539,47 @@ export class InfraMonitorManager {
         if (entry.error) this.problems.set(entry.name, [entry.error]);
         continue;
       }
-
       const parsed = parseInfraMonitorConfig(entry.config.infra_monitor);
       if (!parsed.ok) {
         this.problems.set(entry.name, parsed.errors);
-        console.warn(`[infra-monitor] ${entry.name}: not started: ${parsed.errors.join("; ")}`);
+        (this.options.log ?? console).warn(`[infra-monitor] ${entry.name}: not started: ${parsed.errors.join("; ")}`);
         continue;
       }
-
       if (!parsed.settings.enabled) continue;
-
-      this.monitors.set(
-        entry.name,
-        new InfraMonitor({
-          project: entry.name,
-          config: entry.config,
-          settings: parsed.settings,
-          store: this.store,
-          probes: this.options.probes ?? systemInfraProbes(parsed.settings.probeTimeoutSeconds * 1000),
-          events: this.options.events,
-        })
-      );
+      const monitor = new InfraMonitor({
+        project: entry.name,
+        config: entry.config,
+        settings: parsed.settings,
+        probes: this.options.probes ?? systemInfraProbes(),
+        ledger: this.ledger,
+        events: this.options.events,
+        log: this.options.log,
+        firstTickMs: this.options.firstTickMs,
+      });
+      if (this.decisions) monitor.useDecisions(this.decisions);
+      this.monitors.set(entry.name, monitor);
     }
   }
 
   start(): string[] {
     this.phase = "started";
-    for (const monitor of this.monitors.values()) {
-      if (this.decisions) monitor.useDecisions(this.decisions);
-      monitor.start();
-    }
+    for (const monitor of this.monitors.values()) monitor.start();
     return [...this.monitors.keys()];
   }
 
   async reloadProject(entry: ProjectEntry): Promise<void> {
     if (this.phase === "stopped") return;
-
     const old = this.monitors.get(entry.name);
     if (old) await old.stop();
-
     this.monitors.delete(entry.name);
     this.problems.delete(entry.name);
-    this.store.clearProject(entry.name);
     this.load([entry]);
-
     const next = this.monitors.get(entry.name);
-    if (next && this.phase === "started") {
-      if (this.decisions) next.useDecisions(this.decisions);
-      next.start();
+    // The old instance raised notices and the new one won't: its notices are withdrawn, not left open
+    if (old && old.actBlocked === null && (!next || next.actBlocked !== null)) {
+      await old.withdrawAll("The infrastructure monitor no longer raises notices for this project (turned off, observe mode or read_only).");
     }
+    if (next && this.phase === "started") next.start();
   }
 
   async stop(): Promise<void> {
@@ -582,9 +594,7 @@ export class InfraMonitorManager {
 
   useDecisions(decisions: DecisionProducer): void {
     this.decisions = decisions;
-    for (const monitor of this.monitors.values()) {
-      monitor.useDecisions(decisions);
-    }
+    for (const monitor of this.monitors.values()) monitor.useDecisions(decisions);
   }
 
   status(project: string): InfraMonitorStatus {
@@ -595,16 +605,16 @@ export class InfraMonitorManager {
       enabled: false,
       running: false,
       mode: null,
+      actBlocked: null,
       intervalSeconds: null,
       lastTick: null,
       lastError: this.problems.get(project)?.join("; ") ?? null,
-      monitoredJobs: [],
-      machineStates: [],
-      activeNotices: [],
+      stale: false,
+      machines: [],
+      jobs: [],
+      findings: [],
+      plannedRequeues: [],
+      requeues: [],
     };
-  }
-
-  allStatus(): InfraMonitorStatus[] {
-    return [...this.monitors.keys()].map((p) => this.status(p));
   }
 }

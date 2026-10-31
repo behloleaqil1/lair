@@ -1,41 +1,28 @@
 /**
- * Infrastructure monitor module (docs/configuration.md#infra-monitor).
+ * Infrastructure monitor module (docs/configuration.md#infrastructure-monitor).
  *
- * Watches running jobs' machines and raises notices when:
- * - A machine goes down while a job runs on it
- * - Two runners claim the same slot
- * - A runner is down while its lane has queued jobs
+ * Watches the machines of a project's gate lanes and the jobs on them, and
+ * finds a machine down under work, a job whose process is gone, a lane with
+ * more running jobs than slots, and a lane whose runners are all dead while
+ * jobs wait.
  *
  * Started and stopped by src/server/index.ts; off unless a project sets
- * `infra_monitor.enabled: true`, and observe-only unless it sets `mode: act`.
+ * `infra_monitor.enabled: true`, and observe-only (writes nothing) unless it
+ * sets `mode: act`.
  */
-export { InfraMonitor, InfraMonitorManager, type InfraMonitorOptions, type ProjectEntry } from "./service.js";
-export { parseInfraMonitorConfig, actBlockedReason, buildArgv } from "./config.js";
-export { InfraMonitorStore } from "./store.js";
+export { InfraMonitor, InfraMonitorManager, MAX_REQUEUES_PER_TICK, type InfraMonitorOptions, type InfraMonitorManagerOptions, type ProjectEntry } from "./service.js";
+export { parseInfraMonitorConfig, actBlockedReason, buildRequeueArgv, type InfraMonitorSettings } from "./config.js";
+export { RequeueLedger } from "./ledger.js";
 export { registerInfraMonitorRoutes } from "./routes.js";
+export { SpawnRunner, systemInfraProbes, type CommandOutput, type CommandRunner, type Clock, type InfraProbes } from "./probes.js";
 export type {
+  FindingType,
+  FindingView,
   InfraFinding,
-  InfraMonitorSettings,
   InfraMonitorStatus,
   InfraMonitorTick,
-  InfraNotice,
-  MachineState,
-  MonitoredJob,
+  JobView,
+  MachineView,
+  PlannedRequeue,
+  RequeueRecord,
 } from "./types.js";
-export {
-  readGateQueue,
-  findDuplicateSlots,
-  getRunnerPid,
-  parseGateRequest,
-  parsePid,
-  NodeFileSystem,
-  systemInfraProbes,
-  type CommandOutput,
-  type CommandRunner,
-  type Clock,
-  type FileEntry,
-  type FileSystem,
-  type InfraMonitorProbes,
-  type QueuedGate,
-} from "./probes.js";
-export { detectJobMachineDown, detectDuplicateSlot, detectDeadRunner, type DetectorContext } from "./detectors.js";

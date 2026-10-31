@@ -13,7 +13,7 @@ import { DecisionInbox } from "../service.js";
 import { EvidenceSchema, structureErrors } from "../structure.js";
 import type { RaiseDecisionInput } from "../types.js";
 
-const REAL_MODULE_TESTS = /[\\/]src[\\/]server[\\/](?:agents|planner|review|triage|watchdog|gates)[\\/][^\\/]*\.test\.ts$/;
+const REAL_MODULE_TESTS = /[\\/]src[\\/]server[\\/](?:agents|planner|review|triage|watchdog|gates|infra-monitor)[\\/][^\\/]*\.test\.ts$/;
 
 let problems: string[] = [];
 

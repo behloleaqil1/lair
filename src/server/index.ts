@@ -668,11 +668,14 @@ const clouds = new CloudManager({
 clouds.load(projectEntries);
 await registerCloudRoutes(fastify, clouds, () => getDefaultProject(), humanAuth);
 
-// Infrastructure monitor: watch running jobs' machines for infrastructure
-// problems (machine down, duplicate runners, dead runner with queued jobs).
-// Off unless a project sets `infra_monitor.enabled: true`.
+// Infrastructure monitor (src/server/infra-monitor/): the machines of the
+// gate lanes and the jobs on them (machine down under work, job process gone,
+// two runners in one slot, no live runner while jobs wait). Off unless a
+// project sets `infra_monitor.enabled: true`; observe mode writes nothing.
+// Act mode's re-queues are kept in data/infra-monitor-requeues.json.
 const infraMonitor = new InfraMonitorManager({
   events: getEventBus(),
+  ledgerPath: join(process.cwd(), "data", "infra-monitor-requeues.json"),
 });
 infraMonitor.load(projectEntries);
 infraMonitor.useDecisions(decisionInbox);

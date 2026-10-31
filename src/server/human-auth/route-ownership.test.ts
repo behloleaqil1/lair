@@ -37,7 +37,7 @@ export const PUBLIC_ROUTE_PREFIXES: Readonly<Record<string, string>> = {
   "/api/bus/events": "read-only event stream; the owner's message route /api/bus/send is owner-only",
   "/api/triage": "failure triage reads; a posted result must be signed by a trusted node; owner changes are under /api/triage/owner",
   "/api/placement": "read-only placement status",
-  "/api/infra-monitor": "read-only infrastructure monitor status, jobs, machines and notices",
+  "/api/infra-monitor": "read-only infrastructure monitor status, machines, jobs and findings; it has no mutation route",
   "/api/bus/messages": "read-only message lists for the dashboard; the owner's message route /api/bus/send is owner-only",
   "/api/nodes": "scheduler node reads; the scheduler's hook asks for the owner on every change",
   "/api/jobs": "scheduler job reads; the scheduler's hook asks for the owner on every change",

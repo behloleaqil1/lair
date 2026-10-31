@@ -1,156 +1,190 @@
 /**
- * Detectors for the infra monitor.
+ * The infra monitor's detectors: pure functions of one tick's snapshot.
+ * They never act; the service raises, withdraws and re-queues.
  *
- * Each detector checks for one class of infrastructure problem and returns
- * findings. Detectors never act; the service handles that.
+ * A condition counts only once it has lasted down_threshold_seconds without
+ * a break: a machine's probes failing round after round (its downSince), or
+ * the other conditions seen on every tick since `held` says. A condition
+ * that breaks starts again from zero, so a blip or a flapping machine is not
+ * an outage.
  */
-import type { InfraFinding, MachineState, MonitoredJob } from "./types.js";
-import type { QueuedGate } from "./probes.js";
+import type { LaneSettings, MachineSettings } from "./config.js";
+import type { QueueEntry } from "./probes.js";
+import type { InfraFinding, JobView, MachineView } from "./types.js";
 
-export interface DetectorContext {
-  project: string;
+export interface RunnerState {
+  file: string;
+  pid: number | null;
+  alive: boolean;
+}
+
+export interface Snapshot {
   now: number;
-  runningJobs: MonitoredJob[];
-  queuedGates: QueuedGate[];
-  machineStates: Map<string, MachineState>;
-  lanes: Map<string, string>; // lane -> machine
-  downThresholdSeconds: number;
+  thresholdMs: number;
+  machines: ReadonlyMap<string, MachineView>;
+  machineSettings: ReadonlyMap<string, MachineSettings>;
+  lanes: readonly LaneSettings[];
+  running: readonly JobView[];
+  queued: readonly QueueEntry[];
+  /** Lanes with runner_pid_files: what each file says */
+  runners: ReadonlyMap<string, RunnerState[]>;
 }
 
-function iso(ms: number): string {
-  return new Date(ms).toISOString();
+/** Printable, one line, at most `max` characters (text from probes and files is untrusted). */
+export function oneLine(text: string, max: number): string {
+  const flat = [...text].map((ch) => (ch < " " || ch === "\u007f" ? " " : ch)).join("").replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 3)}...` : flat;
 }
 
-function minutes(seconds: number): string {
-  const m = Math.round(seconds / 60);
+const iso = (ms: number) => new Date(ms).toISOString();
+
+function minutes(ms: number): string {
+  const m = Math.max(1, Math.round(ms / 60_000));
   return m === 1 ? "1 min" : `${m} min`;
 }
 
-/**
- * Detect jobs whose machine has gone down.
- *
- * A finding is raised when:
- * - A job is running on a machine
- * - The machine is unreachable
- * - The machine has been down longer than the threshold
- */
-export function detectJobMachineDown(ctx: DetectorContext): InfraFinding[] {
-  const findings: InfraFinding[] = [];
+function listFact(items: string[]): string {
+  return oneLine(items.join(", "), 200);
+}
 
-  for (const job of ctx.runningJobs) {
-    const machineState = ctx.machineStates.get(job.machine);
-    if (!machineState) continue;
-    if (machineState.reachable) continue;
-    if (machineState.downSince === null) continue;
+/** A running job is on a down machine once the machine was seen up during it, or once it ran longer than the start grace. */
+function jobCounts(job: JobView, machine: MachineSettings | undefined, now: number): boolean {
+  if (job.machineSeenUp) return true;
+  const grace = (machine?.startGraceSeconds ?? 0) * 1000;
+  return now - job.claimedAt >= grace;
+}
 
-    const downSeconds = (ctx.now - machineState.downSince) / 1000;
-    if (downSeconds < ctx.downThresholdSeconds) continue;
-
-    findings.push({
-      key: `job_machine_down:${job.id}`,
-      type: "job_machine_down",
-      summary: `Job ${job.id} is running on ${job.machine}, which has been down for ${minutes(downSeconds)}`,
+function machineDown(s: Snapshot): InfraFinding[] {
+  const out: InfraFinding[] = [];
+  for (const [id, m] of s.machines) {
+    if (m.up !== false || m.downSince === null) continue;
+    const downMs = s.now - m.downSince;
+    if (downMs < s.thresholdMs) continue;
+    const lanes = new Set(s.lanes.filter((l) => l.machine === id).map((l) => l.name));
+    const running = s.running.filter((j) => lanes.has(j.lane) && jobCounts(j, s.machineSettings.get(id), s.now));
+    const queued = s.queued.filter((q) => lanes.has(q.lane) && s.now - q.ctimeMs >= s.thresholdMs);
+    // A machine that is down with nothing on it is not a problem (an on-demand server stopped when idle)
+    if (running.length === 0 && queued.length === 0) continue;
+    const error = m.lastError ? oneLine(m.lastError, 200) : null;
+    const summary =
+      running.length > 0
+        ? `Machine ${id} has been down for ${minutes(downMs)} under ${running.length} running gate job(s)`
+        : `Machine ${id} has been down for ${minutes(downMs)} while ${queued.length} gate job(s) wait in its lanes`;
+    const oldestQueued = queued.reduce<number | null>((min, q) => (min === null || q.ctimeMs < min ? q.ctimeMs : min), null);
+    out.push({
+      key: `machine_down:${id}`,
+      type: "machine_down",
+      summary,
       evidence: [
-        `job ${job.id} on lane ${job.lane}`,
-        `machine ${job.machine} unreachable since ${iso(machineState.downSince)}`,
-        machineState.lastError ? `last probe error: ${machineState.lastError}` : "no probe error recorded",
-        `job started at ${job.startedAt}`,
+        `machine ${id} has failed its probes since ${iso(m.downSince)}${error ? `: ${error}` : ""}`,
+        ...running.slice(0, 5).map((j) => `running: ${j.id} (lane ${j.lane}, claimed ${iso(j.claimedAt)})`),
+        ...(running.length > 5 ? [`... and ${running.length - 5} more running`] : []),
+        ...(queued.length > 0 ? [`queued: ${queued.length} job(s) in lane(s) ${[...new Set(queued.map((q) => q.lane))].join(", ")}, waiting since ${iso(oldestQueued ?? s.now)}`] : []),
       ],
-      vars: {
-        gate: job.id,
-        from_lane: job.lane,
-        machine: job.machine,
-        down_seconds: String(Math.round(downSeconds)),
+      facts: {
+        machine: id,
+        down_since: iso(m.downSince),
+        down_seconds: Math.round(downMs / 1000),
+        last_error: error,
+        running_jobs: running.length,
+        queued_jobs: queued.length,
+        jobs: running.length > 0 ? listFact(running.map((j) => j.id)) : null,
       },
+      machine: id,
+      lane: null,
+      jobs: running.map((j) => ({ id: j.id, lane: j.lane })),
+    });
+  }
+  return out;
+}
+
+/** Conditions that must hold tick after tick: key -> the finding they make. */
+function conditions(s: Snapshot): Map<string, InfraFinding> {
+  const out = new Map<string, InfraFinding>();
+  const laneOf = new Map(s.lanes.map((l) => [l.name, l]));
+
+  // A running request whose process group is gone: nobody runs it any more
+  for (const job of s.running) {
+    if (job.pgid === null || job.groupAlive !== false) continue;
+    const key = `job_lost:${job.id}`.slice(0, 200);
+    out.set(key, {
+      key,
+      type: "job_lost",
+      summary: oneLine(`Gate job ${job.id} in lane ${job.lane} has no process left (group ${job.pgid} is gone) but its request still says running`, 200),
+      evidence: [
+        `request ${job.id} is running in lane ${job.lane} (machine ${job.machine}), claimed ${iso(job.claimedAt)}`,
+        `its process group ${job.pgid} (from its .pgid file) no longer exists`,
+        "the runner that held it ended without finishing the request",
+      ],
+      facts: { gate: oneLine(job.id, 200), lane: job.lane, machine: job.machine, pgid: job.pgid, claimed_at: iso(job.claimedAt) },
+      machine: job.machine,
+      lane: job.lane,
+      jobs: [],
     });
   }
 
-  return findings;
-}
-
-/**
- * Detect duplicate runner slots.
- *
- * A finding is raised when two or more runners claim the same slot
- * (multiple runner-<lane>.pid files with different pids).
- */
-export function detectDuplicateSlot(ctx: DetectorContext, duplicates: { lane: string; count: number; pids: number[] }[]): InfraFinding[] {
-  const findings: InfraFinding[] = [];
-
-  for (const dup of duplicates) {
-    findings.push({
-      key: `duplicate_slot:${dup.lane}`,
-      type: "duplicate_slot",
-      summary: `Lane ${dup.lane} has ${dup.count} runners claiming the slot (pids: ${dup.pids.join(", ")})`,
+  // More running requests than slots: two runners claim one slot
+  const runningByLane = new Map<string, JobView[]>();
+  for (const job of s.running) runningByLane.set(job.lane, [...(runningByLane.get(job.lane) ?? []), job]);
+  for (const [lane, jobs] of runningByLane) {
+    const settings = laneOf.get(lane);
+    if (!settings || jobs.length <= settings.slots) continue;
+    const key = `slot_overflow:${lane}`;
+    out.set(key, {
+      key,
+      type: "slot_overflow",
+      summary: `Lane ${lane} runs ${jobs.length} gate jobs in ${settings.slots} slot(s): more than one runner claims a slot`,
       evidence: [
-        `lane ${dup.lane}: ${dup.count} runner pid files found`,
-        `pids: ${dup.pids.join(", ")}`,
-        "only one runner should hold each lane's slot at a time",
+        `lane ${lane} has ${settings.slots} slot(s) and ${jobs.length} running requests`,
+        ...jobs.slice(0, 5).map((j) => `running: ${j.id} (claimed ${iso(j.claimedAt)}${j.pgid !== null ? `, group ${j.pgid}` : ""})`),
       ],
-      vars: {
-        lane: dup.lane,
-        count: String(dup.count),
-        pids: dup.pids.join(","),
-      },
+      facts: { lane, machine: settings.machine, slots: settings.slots, running_jobs: jobs.length, jobs: listFact(jobs.map((j) => j.id)) },
+      machine: settings.machine,
+      lane,
+      jobs: [],
     });
   }
 
-  return findings;
-}
-
-/**
- * Detect dead runners while jobs are queued.
- *
- * A finding is raised when:
- * - A lane has queued jobs (not just running ones)
- * - The lane's machine is unreachable
- * - The machine has been down longer than the threshold
- */
-export function detectDeadRunner(ctx: DetectorContext): InfraFinding[] {
-  const findings: InfraFinding[] = [];
-
-  // Group queued gates by lane
-  const queuedByLane = new Map<string, QueuedGate[]>();
-  for (const gate of ctx.queuedGates) {
-    if (gate.status !== "queued") continue;
-    const list = queuedByLane.get(gate.lane) ?? [];
-    list.push(gate);
-    queuedByLane.set(gate.lane, list);
-  }
-
-  for (const [lane, queued] of queuedByLane) {
-    if (queued.length === 0) continue;
-
-    const machine = ctx.lanes.get(lane);
-    if (!machine) continue;
-
-    const machineState = ctx.machineStates.get(machine);
-    if (!machineState) continue;
-    if (machineState.reachable) continue;
-    if (machineState.downSince === null) continue;
-
-    const downSeconds = (ctx.now - machineState.downSince) / 1000;
-    if (downSeconds < ctx.downThresholdSeconds) continue;
-
-    findings.push({
-      key: `dead_runner:${lane}`,
+  // Jobs wait and no runner of the lane is alive
+  for (const [lane, runners] of s.runners) {
+    const queued = s.queued.filter((q) => q.lane === lane);
+    if (queued.length === 0 || runners.some((r) => r.alive)) continue;
+    const settings = laneOf.get(lane);
+    const key = `dead_runner:${lane}`;
+    out.set(key, {
+      key,
       type: "dead_runner",
-      summary: `Lane ${lane} has ${queued.length} queued job(s) but its machine ${machine} has been down for ${minutes(downSeconds)}`,
+      summary: `No runner is alive for lane ${lane} while ${queued.length} gate job(s) wait in it`,
       evidence: [
-        `lane ${lane}: ${queued.length} queued job(s)`,
-        `machine ${machine} unreachable since ${iso(machineState.downSince)}`,
-        machineState.lastError ? `last probe error: ${machineState.lastError}` : "no probe error recorded",
-        ...queued.slice(0, 5).map((g) => `queued: ${g.gateId} (priority ${g.priority})`),
-        ...(queued.length > 5 ? [`... and ${queued.length - 5} more`] : []),
+        `lane ${lane}: ${queued.length} queued request(s)`,
+        ...runners.map((r) => `${r.file}: ${r.pid === null ? "missing or no pid" : `pid ${r.pid} is not running`}`),
       ],
-      vars: {
+      facts: {
         lane,
-        machine,
-        queued_count: String(queued.length),
-        down_seconds: String(Math.round(downSeconds)),
+        machine: settings?.machine ?? null,
+        queued_jobs: queued.length,
+        pid_files: listFact(runners.map((r) => r.file)),
+        pids: listFact(runners.map((r) => (r.pid === null ? "-" : String(r.pid)))),
       },
+      machine: settings?.machine ?? null,
+      lane,
+      jobs: [],
     });
   }
+  return out;
+}
 
-  return findings;
+/**
+ * This tick's findings. `held` is since when each condition has held
+ * without a break (from the last tick); the result's `held` replaces it.
+ */
+export function detect(s: Snapshot, held: ReadonlyMap<string, number>): { findings: InfraFinding[]; held: Map<string, number> } {
+  const findings = machineDown(s);
+  const nextHeld = new Map<string, number>();
+  for (const [key, finding] of conditions(s)) {
+    const since = held.get(key) ?? s.now;
+    nextHeld.set(key, since);
+    if (s.now - since >= s.thresholdMs) findings.push(finding);
+  }
+  return { findings, held: nextHeld };
 }
