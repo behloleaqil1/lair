@@ -628,6 +628,12 @@ export class GateRechecks {
     const now = host.now();
     const blocked = this.blocked();
 
+    // Must have a command configured
+    if (!cfg.command) {
+      host.action({ recordId: record.id }, "recheck", "skipped", `environment recovery re-check: no command configured`);
+      return;
+    }
+
     const kind: GateRecheckKind = tests.length > 0 ? "failed_tests" : "same";
     const testIds = tests.map(recheckTestId);
     const reason = `environment:${patternId}`;

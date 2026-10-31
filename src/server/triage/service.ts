@@ -1181,18 +1181,9 @@ export class TriageService {
     const timeoutMs = waitInfo.probeTimeoutSeconds * 1000;
     let result: { ok: boolean; output: string };
     try {
-      const output = await withTimeout(
-        (async () => {
-          const out = await this.o.probes.runner.run(waitInfo.probe, { timeoutMs });
-          return { ok: true as const, detail: "success", output: out };
-        })(),
-        timeoutMs + 5000, // Grace period for the runner's own timeout
-      );
-      if (output.ok && output.output) {
-        result = { ok: output.output.code === 0, output: (output.output.stdout + output.output.stderr).slice(0, 500) };
-      } else {
-        result = { ok: false, output: output.detail.slice(0, 500) };
-      }
+      // Use the runner's built-in timeout support
+      const out = await this.o.probes.runner.run(waitInfo.probe, { timeoutMs });
+      result = { ok: out.code === 0, output: (out.stdout + out.stderr).slice(0, 500) };
     } catch (e) {
       result = { ok: false, output: message(e).slice(0, 500) };
     }
