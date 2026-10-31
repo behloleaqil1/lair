@@ -36,7 +36,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     cause: "An overloaded machine, a hung test, or a stuck transfer",
     response: "Cancel the job's own processes (by its working dir, never a shared process group) and re-place it on the fastest free machine",
     prevention: "A slow-gate check every minute, measured from the job's real start",
-    feature: "D28",
+    feature: "time and process limits",
     version: 1,
   },
   {
@@ -46,7 +46,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     cause: "Its idle timer saw no activity during the job's long local phase; the activity mark was refreshed only at job start and end",
     response: "Restart the machine and retry the job once",
     prevention: "A lease refreshed every minute while a job holds the machine; idle timeout >= the longest local phase",
-    feature: "D12",
+    feature: "machine placement",
     version: 1,
   },
   {
@@ -56,7 +56,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     cause: "The user-level tunnel daemon was not restarted after the host rebooted",
     response: "Start the daemon; hold the lanes that need it",
     prevention: "Host services with probe and start commands, checked after boot",
-    feature: "D13",
+    feature: "remote start checks",
     version: 1,
   },
   {
@@ -66,7 +66,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     cause: "The container engine is not running",
     response: "Hold the gates; probe the engine; re-check after it answers; ONE notice per outage",
     prevention: "An environment failure class in triage",
-    feature: "D14",
+    feature: "gate first-step checks",
     version: 1,
   },
   {
@@ -76,7 +76,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     cause: "The old server's runs were orphaned, not stopped; fill started new ones",
     response: "Stop the orphans by process group",
     prevention: "Adopt or stop previous runs before fill's first tick",
-    feature: "D10",
+    feature: "task duplicate guard",
     version: 1,
   },
   {
@@ -86,7 +86,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     cause: "Reports matched by agent instead of by task; a DONE line naming another task id closed the agent's open task",
     response: "Reopen under a new task id",
     prevention: "Close only on the exact task id; record unmatched reports",
-    feature: "D4",
+    feature: "task closing checks",
     version: 1,
   },
   {
@@ -96,7 +96,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     cause: "A per-agent prompt file went stale; it described a different task than the agent's open line",
     response: "Replace it with 'your open line is your task'",
     prevention: "Warn when a built prompt names another task id",
-    feature: "D6",
+    feature: "merged work memory",
     version: 1,
   },
   {
@@ -106,7 +106,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     cause: "Two launchers with different limits; caps below the agent count",
     response: "Move all agents to one launcher; raise caps",
     prevention: "Every idle agent gets an explanation; never idle without one",
-    feature: "D1",
+    feature: "idle capacity scheduling",
     version: 1,
   },
   {
@@ -116,7 +116,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     cause: "Container VM threads and gates inflate load; LLM-bound agents are light",
     response: "Hold only local-heavy work on load",
     prevention: "A per-agent capacity class (local or remote)",
-    feature: "D11",
+    feature: "load measurement",
     version: 1,
   },
   {
@@ -136,7 +136,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     cause: "The preflight ran on the overloaded local machine beside the remote gate",
     response: "Measure each gate's phases",
     prevention: "Run the whole gate remotely; report the phase breakdown per gate",
-    feature: "D20",
+    feature: "gate duration tuning",
     version: 1,
   },
   {
@@ -146,7 +146,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     cause: "The routing pattern did not recognise that command kind",
     response: "Fix the pattern",
     prevention: "Routing tests per command kind",
-    feature: "D23",
+    feature: "heavy gate placement",
     version: 1,
   },
   {
@@ -156,7 +156,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     cause: "Keychain or credential-store reads time out under extreme load",
     response: "Retry with backoff; a credential cache; report 'pr-needed', not BLOCKED",
     prevention: "Check each agent's environment health (gh, git) before runs",
-    feature: "D29",
+    feature: "agent auth checks",
     version: 1,
   },
   {
@@ -176,7 +176,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     cause: "The gate ran before the review; a merge gate runs, then review requests changes",
     response: "Cancel the obsolete gate",
     prevention: "Review first; merge gates only after approval at the head",
-    feature: "D30",
+    feature: "gate scope trimming",
     version: 1,
   },
   {
@@ -196,7 +196,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     cause: "Scope drift; a required file or test from the design's PR scope is absent",
     response: "Request changes naming the missing item",
     prevention: "The reviewer checks the design's PR scope list (files + required tests) mechanically",
-    feature: "D7",
+    feature: "design completeness check",
     version: 1,
   },
   {
@@ -206,7 +206,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     cause: "No identity configured for agent runs; author name or email from the machine's default config",
     response: "Set the identity; squash-merge with the owner identity",
     prevention: "A per-run identity and a Health warning on an unallowed identity",
-    feature: "D8",
+    feature: "commit identity check",
     version: 2,
   },
   {
@@ -226,7 +226,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     cause: "The wrong timestamp source; a job's 'age' counted from queue time, not start",
     response: "Use the job's start marker",
     prevention: "Time fields carry their meaning (queued, started, ended)",
-    feature: "D28",
+    feature: "time and process limits",
     version: 1,
   },
   {
@@ -256,7 +256,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     cause: "Agents report what they see in their context only; an agent's diagnosis contradicted by evidence",
     response: "Verify from another context before acting",
     prevention: "Report verification against evidence",
-    feature: "D5",
+    feature: "claim verification",
     version: 1,
   },
   {
@@ -266,7 +266,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     cause: "Jobs share the runner's process group",
     response: "Kill by the job's working dir or pattern",
     prevention: "Each job in its own process group",
-    feature: "D28",
+    feature: "time and process limits",
     version: 1,
   },
   {
@@ -276,7 +276,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     cause: "The developer machine is overloaded by agents and containers",
     response: "Run heavy suites on cloud machines",
     prevention: "Routing prefers cloud for heavy suites",
-    feature: "D12",
+    feature: "machine placement",
     version: 1,
   },
   {
@@ -306,7 +306,7 @@ export const BUILTIN_LESSONS: BuiltInLesson[] = [
     cause: "The scheduler cannot see runs it did not start; the task line was still open when it ticked",
     response: "Stop the later run by its process group",
     prevention: "Register manual runs with the orchestrator (claim the task) before starting them; adopt external runs",
-    feature: "D10",
+    feature: "task duplicate guard",
     version: 1,
   },
 ];

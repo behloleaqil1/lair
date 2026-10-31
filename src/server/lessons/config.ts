@@ -3,13 +3,14 @@
  * See docs/configuration.md (once this module is documented).
  *
  * lessons:
- *   enabled: true      # Whether lessons are loaded and matched
+ *   enabled: false     # Off by default. On: data/lessons.db, the built-in
+ *                      # lessons, /api/lessons and the Knowledge view
  */
 import { z } from "zod";
 
 export const LessonsSchema = z
   .object({
-    enabled: z.boolean().default(true),
+    enabled: z.boolean().default(false),
   })
   .strict();
 

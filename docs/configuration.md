@@ -2761,7 +2761,7 @@ Events: `planner.changed`, `planner.run_started`, `planner.run_finished`, `plann
 
 The lessons module (`src/server/lessons/`, `docs/design/autonomy.md` §8) stores what Lair has learned from incidents and operational experience. Each lesson has a signal (how to detect the situation), a cause, a response playbook, and prevention (a check or feature that makes it automatic).
 
-**Built-in lessons** (L1-L28) ship with Lair: generic operational lessons from real incidents (slow gates, idle capacity, Docker down, duplicate runs, etc.). They load on first start and are active by default.
+**Built-in lessons** (L1-L28) ship with Lair: generic operational lessons from real incidents (slow gates, idle capacity, Docker down, duplicate runs, etc.). They load on start when the module is enabled and are active by default.
 
 **Project lessons** are proposed by incidents and approved by the owner. They can be specific to this project's patterns and failure modes.
 
@@ -2769,12 +2769,12 @@ The lessons module (`src/server/lessons/`, `docs/design/autonomy.md` §8) stores
 
 ```yaml
 lessons:
-  enabled: true        # Whether lessons are loaded and matched (default: true)
+  enabled: false       # Off by default. On: data/lessons.db, built-in lessons, /api/lessons, Knowledge view
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | boolean | `true` | Whether the lessons module is active for this project |
+| `enabled` | boolean | `false` | Turns the lessons module on. Off: no `data/lessons.db`, no `/api/lessons` routes (404), no Knowledge view in the nav. Takes effect at server start |
 
 ### Lessons API
 

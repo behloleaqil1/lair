@@ -15,12 +15,13 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
-import { mkdtempSync, readFileSync, rmSync } from "fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { HumanAuth, OWNER_SESSION_HEADER, registerOwnerRoutes } from "../human-auth/index.js";
 import { registerRootGuards } from "../root-guards.js";
-import { mountLessons, BUILTIN_LESSONS, type LessonsModule } from "./index.js";
+import { mountLessons, mountLessonsWhenEnabled, BUILTIN_LESSONS, type LessonsModule } from "./index.js";
+import { parseLessonsConfig } from "./config.js";
 import type { LessonsListView, LessonDetailView, Lesson } from "../../shared/lessons-types.js";
 
 const NOW = Date.parse("2026-10-30T12:00:00.000Z");
@@ -215,14 +216,14 @@ describe("owner-only writes", () => {
   });
 
   it("returns the created lesson directly, not by list order", async () => {
-    // Use a clock that is EARLIER than the built-ins' creation time
-    // to ensure the propose route returns the right lesson
+    // Built-ins are seeded at a LATER time than the proposal, so a newest-first
+    // list({limit:1}) would return a built-in; only the created id is right.
+    const LATE_TIME = Date.parse("2026-10-31T00:00:00.000Z");
     const EARLY_TIME = Date.parse("2026-10-29T00:00:00.000Z");
-    const { app, answerToken } = await build(EARLY_TIME);
+    const { app, answerToken, clock } = await build(LATE_TIME);
     const browser = await unlock(app, answerToken);
+    clock.t = EARLY_TIME;
 
-    // The clock is earlier than built-ins (which use Date.now() in loadBuiltinLessons)
-    // So if we did list({limit:1}), we'd get a built-in, not our proposal
     const lesson = {
       title: "Early proposal",
       signal: { kind: "event", value: "early.proposal" },
@@ -314,7 +315,7 @@ describe("list and filter lessons", () => {
     expect(res.statusCode).toBe(200);
     const view = res.json().data as LessonsListView;
     expect(view.lessons.length).toBeGreaterThanOrEqual(BUILTIN_LESSONS.length);
-    expect(view.enabled).toBe(true);
+    expect(view.enabled).toBe(false);
     expect(view.project).toBe("example");
   });
 
@@ -590,5 +591,51 @@ describe("all routes require owner session", () => {
     const { app } = await build();
     const res = await post(app, "/api/lessons/L1/match", {}, DASHBOARD);
     expect(res.statusCode).toBe(403);
+  });
+});
+
+describe("lessons switch (off by default)", () => {
+  async function buildSwitched(enabled: boolean) {
+    dir = mkdtempSync(join(tmpdir(), "lair-lessons-switch-"));
+    const tokenPath = join(dir, "owner.token");
+    const dbPath = join(dir, "lessons.db");
+    const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
+    app = Fastify();
+    registerRootGuards(app);
+    await registerOwnerRoutes(app, auth);
+    const mounted = await mountLessonsWhenEnabled(app, {
+      enabled,
+      dbPath,
+      humanAuth: auth,
+      defaultProject: () => "example",
+      clock: () => NOW,
+    });
+    module = mounted;
+    await app.ready();
+    const answerToken = readFileSync(tokenPath, "utf-8").trim();
+    return { app, mounted, dbPath, answerToken };
+  }
+
+  it("defaults to off when the block is absent", () => {
+    const parsed = parseLessonsConfig(undefined);
+    expect(parsed.ok && parsed.settings.enabled).toBe(false);
+  });
+
+  it("off: no lessons.db is created and /api/lessons is not mounted", async () => {
+    const { app, mounted, dbPath, answerToken } = await buildSwitched(false);
+    const browser = await unlock(app, answerToken);
+    expect(mounted).toBeNull();
+    expect(existsSync(dbPath)).toBe(false);
+    expect((await get(app, "/api/lessons", browser)).statusCode).toBe(404);
+    expect((await post(app, "/api/lessons", {}, browser)).statusCode).toBe(404);
+  });
+
+  it("on: mounted, seeded, and owner-only", async () => {
+    const { app, mounted, dbPath, answerToken } = await buildSwitched(true);
+    expect(mounted?.builtInLoaded).toBe(BUILTIN_LESSONS.length);
+    expect(existsSync(dbPath)).toBe(true);
+    expect((await get(app, "/api/lessons", DASHBOARD)).statusCode).toBe(403);
+    const browser = await unlock(app, answerToken);
+    expect((await get(app, "/api/lessons", browser)).statusCode).toBe(200);
   });
 });

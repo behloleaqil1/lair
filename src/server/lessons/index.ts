@@ -53,9 +53,6 @@ export async function mountLessons(fastify: FastifyInstance, options: MountLesso
 
   // Load built-in lessons (insert missing, update outdated content)
   const builtInLoaded = loadBuiltinLessons(store, clock);
-  if (builtInLoaded > 0) {
-    console.log(`[Lessons] Loaded or updated ${builtInLoaded} built-in lessons`);
-  }
 
   const settings = options.settings ?? (() => defaultLessonsSettings());
 
@@ -73,4 +70,17 @@ export async function mountLessons(fastify: FastifyInstance, options: MountLesso
   });
 
   return { store, builtInLoaded };
+}
+
+/**
+ * Mount the lessons module only when a project turned it on (`lessons.enabled:
+ * true`). Off (the default): no database file is created, nothing is seeded
+ * and no /api/lessons route exists.
+ */
+export async function mountLessonsWhenEnabled(
+  fastify: FastifyInstance,
+  options: MountLessonsOptions & { enabled: boolean },
+): Promise<LessonsModule | null> {
+  if (!options.enabled) return null;
+  return mountLessons(fastify, options);
 }
