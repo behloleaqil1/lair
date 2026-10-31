@@ -2817,7 +2817,7 @@ decision_policies:
 |-----|------|---------|-------------|
 | `enabled` | boolean | `false` | Off: nothing is proposed or written to the trace (not at start either), no module updates a raised decision's evidence (`cause_cleared`), and `GET /api/owner/decision-policies` shows the table and `enabled: false` with no agreement. A section with any other key or a value of another type is refused: the policies stay off and the reason is logged and shown in the view |
 
-Without `data/policies.yaml` Lair uses a built-in table with rules C1 (`agents.provider_limit` → `wait` while its cause stands), C2 (`supervisor.check_failing` → `noted` when an issue tracks the check), C3 (`watchdog.idle_capacity` → `stand_down` after two playbook attempts, never with nothing running), C4 (`watchdog.orphan_claim` → `stand_down` while a runner is alive) and C11 (`agents.cannot_start` → `keep_held`). To change it, write the file and restart (it is read once at start):
+Without `data/policies.yaml` Lair uses a built-in table with rules C1 (`agents.provider_limit` → `wait` while its cause stands), C2 (`supervisor.check_failing` → `noted` when an issue tracks the check), C3 (`watchdog.idle_capacity` → `stand_down` after two playbook attempts, never with nothing running), C4 (`watchdog.orphan_claim` → `stand_down` while a runner is alive) and C11 (`agents.cannot_start` → `keep_held` while the task's run is below its third attempt; from the third on, or without an attempt count, it abstains). To change it, write the file and restart (it is read once at start):
 
 ```yaml
 version: 1

@@ -158,7 +158,8 @@ policies:
     max_tier: 1
     when:
       - { fact: process_found, op: eq, value: true }
-  # C11: an agent cannot start (probe failed) or a fill waits too long. The cause is transient.
+  # C11: an agent cannot start (probe failed) or a fill waits too long. The cause is transient: only while the
+  # task's run is below its third attempt; from the third on (or with no attempt count) it is left to you.
   - id: c11-keep-held
     class: agents.cannot_start
     codes: [probe_failed, fill_waiting]
@@ -166,6 +167,8 @@ policies:
     reason_code: probe_error_transient
     state: shadow
     max_tier: 1
+    unless:
+      - { fact: attempt_count, op: gte, value: 3 }
 `;
 
 /** data/policies.yaml when it exists, else the built-in table. A file that is too large or unreadable gives no policies. */

@@ -164,9 +164,18 @@ describe("rule proposer", () => {
     expect(propose(claim({ process_found: false }))?.option).toBeNull();
     expect(propose(claim({ process_found: "true" }))?.option).toBeNull();
   });
-  it("C11: keep held for a probe error", () => {
-    const d = decision({ class: "agents.cannot_start", code: "probe_failed", options: [{ id: "keep_held", label: "Keep", consequences: "c", effect: "reversible" }, { id: "retry_now", label: "Retry", consequences: "c", effect: "reversible" }] });
-    expect(propose(d)).toMatchObject({ option: "keep_held", policy: "c11-keep-held" });
+  it("C11: keep held for a probe error while the run is below its third attempt; a persistent one is left to you", () => {
+    const held = (code: string, facts: DecisionEvidence["facts"]) =>
+      decision({ class: "agents.cannot_start", code, facts, options: [{ id: "keep_held", label: "Keep", consequences: "c", effect: "reversible" }, { id: "retry_now", label: "Retry", consequences: "c", effect: "reversible" }] });
+    expect(propose(held("probe_failed", { attempt_count: 1 }))).toMatchObject({ option: "keep_held", policy: "c11-keep-held" });
+    expect(propose(held("fill_waiting", { attempt_count: 2 }))).toMatchObject({ option: "keep_held", policy: "c11-keep-held" });
+    // the third attempt on: the cause did not clear by itself
+    expect(propose(held("probe_failed", { attempt_count: 3 }))).toMatchObject({ option: null, policy: "c11-keep-held", reasonCode: "guard" });
+    expect(propose(held("fill_waiting", { attempt_count: 7 }))).toMatchObject({ option: null, reasonCode: "guard" });
+    // no attempt count (no run yet), or not a number: the guard cannot be evaluated, so it abstains
+    expect(propose(held("probe_failed", { attempt_count: null }))).toMatchObject({ option: null, reasonCode: "guard" });
+    expect(propose(held("probe_failed", {}))).toMatchObject({ option: null, reasonCode: "guard" });
+    expect(propose(held("probe_failed", { attempt_count: "1" }))).toMatchObject({ option: null, reasonCode: "guard" });
   });
 
   it("abstains when the option is not offered, has no effect, or is irreversible or outward", () => {
