@@ -5315,7 +5315,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
   });
 
   it("raises one fill_idle_notice event when an agent is idle with ready work past the threshold", async () => {
-    const h = setup(fill({ idle: { notice_minutes: 5 } }));
+    const h = setup(fill({ agents: ["worker-a"], idle: { notice_minutes: 5 } }));
     prompts(h);
     tasks(h, "worker-a|Alice|feat-login|Build the login form", "|Bob|feat-other|Unassigned task");
     h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
@@ -5346,7 +5346,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
   });
 
   it("clears idle notice flag when agent becomes busy again, then raises a new notice on next idle incident", async () => {
-    const h = setup(fill({ idle: { notice_minutes: 1 } }));
+    const h = setup(fill({ agents: ["worker-a"], idle: { notice_minutes: 1 } }));
     prompts(h);
     tasks(h, "worker-a|Alice|feat-login|Build the login form", "|Bob|feat-other|Unassigned task");
     h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");

@@ -82,6 +82,12 @@ export function classifyAgent(
     if (line.state === "held" && line.hold === "waiting") {
       return { reason: "waiting", task: line.task ?? undefined, hold: "waiting" };
     }
+    if (line.state === "held" && line.hold === "max_active") {
+      return { reason: "max_active", task: line.task ?? undefined };
+    }
+    if (line.state === "held" && line.hold === "capacity") {
+      return { reason: "capacity", task: line.task ?? undefined };
+    }
     if (line.state === "held" && line.hold) {
       return { reason: "held", task: line.task ?? undefined, hold: line.hold };
     }
