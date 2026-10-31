@@ -153,6 +153,7 @@ export type AgentEventKind =
   | "fill_gate_queued"
   | "fill_gate_gone"
   | "fill_unmatched"
+  | "fill_config"
   | "transient"
   | "transient_cleared"
   | "run_adopted"

@@ -728,13 +728,8 @@ function checkFill(value: RawSettings, errors: string[]): void {
     if (fill.prompt_files.length === 0) {
       errors.push("agents.fill.prompt_files: at least one prompt file is required when fill is enabled");
     }
-    // Warn when done_match is task_id but done_pattern doesn't have {task}
-    if (fill.done_match === "task_id" && !fill.done_pattern.includes("{task}")) {
-      errors.push(
-        `agents.fill.done_pattern: with done_match "task_id" (the default), done_pattern needs {task}; ` +
-        `use done_match "agent_legacy" to match by agent only (with a startup warning)`
-      );
-    }
+    // Note: done_match "task_id" with a pattern that doesn't have {task} falls back to agent_legacy
+    // behavior at runtime (with a startup warning); it's not a config error.
   }
   fill.agents.forEach((agent, i) => {
     if (!isValidDragonId(agent)) errors.push(`agents.fill.agents[${i}]: ${agent} is not a valid agent id`);

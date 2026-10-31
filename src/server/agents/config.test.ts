@@ -309,12 +309,10 @@ describe("agents config", () => {
     );
     expect(errorsOf(withFill({ agents: ["not an id"] }))).toEqual(["agents.fill.agents[0]: not an id is not a valid agent id"]);
     expect(errorsOf(withFill({ done_pattern: "^- DONE " }))).toEqual([
-      'agents.fill.done_pattern: with done_match "task_id" (the default), done_pattern needs {task}; use done_match "agent_legacy" to match by agent only (with a startup warning)',
       "agents.fill.done_pattern: needs {task} or {agent} (without either one done line would match every task)",
     ]);
-    expect(errorsOf(withFill({ done_pattern: "^- DONE .*\\bby\\s+{agent}(?=[\\s(]|$)" }))).toEqual([
-      'agents.fill.done_pattern: with done_match "task_id" (the default), done_pattern needs {task}; use done_match "agent_legacy" to match by agent only (with a startup warning)',
-    ]);
+    // A pattern with {agent} only is valid; the config comment explains that task_id mode falls back to agent_legacy
+    expect(errorsOf(withFill({ done_pattern: "^- DONE .*\\bby\\s+{agent}(?=[\\s(]|$)" }))).toEqual([]);
     expect(errorsOf(withFill({ done_pattern: "^- DONE ({task}" }))[0]).toContain(
       "agents.fill.done_pattern: not a valid regular expression",
     );

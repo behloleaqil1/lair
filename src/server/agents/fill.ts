@@ -78,6 +78,7 @@ import type {
 } from "../../shared/agents-types.js";
 import { isValidDragonId } from "../parsers/dragon-config.js";
 import { parseGateFilename } from "../parsers/gates.js";
+import { attributedAgent } from "../parsers/queue.js";
 import { getPromptsDir } from "../routes/controls.js";
 import {
   backoffMs,
@@ -503,6 +504,18 @@ export class QueueLines {
     this.usableMarks.set(key, ok);
     return ok;
   }
+
+  /**
+   * All lines in the window from `mark` to `until`, newest last.
+   * For direct iteration when pattern-based search is not suitable.
+   */
+  linesInWindow(mark: QueueMark | undefined, until: QueueMark | undefined): string[] {
+    const from = mark && this.usable(mark) ? mark.offset : 0;
+    const to = until && this.usable(until) ? until.offset : Number.POSITIVE_INFINITY;
+    return this.lines
+      .filter((line) => line.start >= from && line.start < to)
+      .map((line) => line.text);
+  }
 }
 
 // ============ THE TASKS FILE ============
@@ -635,9 +648,10 @@ export function checkDone(
   if (kept) return { kind: "kept", line: String(kept.data.line ?? ""), at: kept.at };
   const donePattern = fillPatternFor(settings.donePattern, entry.task, entry.agent);
   let line: string | null;
-  // In task_id mode, only lines naming THIS task count (the pattern must have {task}, enforced by config)
-  // In agent_legacy mode, keep today's behaviour
-  const useTaskIdMatching = settings.doneMatch === "task_id" || donePattern.task !== null;
+  // In task_id mode with a pattern that has {task}, only lines naming THIS task count
+  // In agent_legacy mode, or task_id mode with a pattern that has no {task}, keep today's behaviour
+  // (the pattern must have {task} for task_id matching to work; when it doesn't, fall back to agent_legacy)
+  const useTaskIdMatching = donePattern.task !== null;
   if (useTaskIdMatching) {
     // A line that names the task: done is done, whatever came after it
     line = queue.find(donePattern, latest?.queueMark, until);
@@ -683,29 +697,74 @@ export function findUnmatchedReport(
   mark: QueueMark | undefined,
   until: QueueMark | undefined,
 ): UnmatchedReport | null {
-  // Look for any DONE/WAITING/BLOCKED line by this agent
-  // We use a generic pattern that matches by agent only
-  const agentDone: FillPattern = { ...fillPatternFor(settings.donePattern, openTask, agent), agent, task: null };
-  const agentWaiting: FillPattern = { ...fillPatternFor(settings.waitingPattern, openTask, agent), agent, task: null };
-  const agentBlocked: FillPattern = { ...fillPatternFor(settings.blockedPattern, openTask, agent), agent, task: null };
-
-  // Find the agent's latest DONE/WAITING/BLOCKED line
-  const last = queue.lastOf<"done" | "waiting" | "blocked">(
-    [
-      { kind: "done", pattern: agentDone },
-      { kind: "waiting", pattern: agentWaiting },
-      { kind: "blocked", pattern: agentBlocked },
-    ],
-    mark,
-    until,
-  );
-  if (!last) return null;
-
-  // Extract what task it names
-  const reportedTask = extractReportedTask(last.line);
-  if (!reportedTask || reportedTask === openTask) return null;
-
-  return { kind: last.kind, reportedTask, line: last.line };
+  // Look for any DONE/WAITING/BLOCKED line by this agent that names a different task
+  // We need a pattern that matches any report by this agent, regardless of what task it names
+  // Then we extract the task id and compare to the open task
+  
+  // Build patterns that match by agent only (set task: null so taskLineMatch doesn't require a specific task)
+  // But we need to change the regex to not have the open task hardcoded in it
+  // Solution: use agent-only patterns if the pattern has {agent}, otherwise use the raw extractReportedTask approach
+  
+  const { donePattern, waitingPattern, blockedPattern } = settings;
+  
+  // If patterns have {agent}, use agent-only matching with a dummy task
+  // The key insight: for unmatched detection, we only care about lines THIS agent wrote
+  // We use attributedAgent to check the agent, and extractReportedTask to get the task
+  const hasAgentPlaceholder = donePattern.includes("{agent}");
+  
+  if (hasAgentPlaceholder) {
+    // Create agent-only patterns: regex still needs a task for substitution, but we set task: null
+    // The regex will have "dummy" substituted, but taskLineMatch only checks agent attribution when task is null
+    const dummyTask = "___UNMATCHED_DETECTION_DUMMY___";
+    const agentDone: FillPattern = { ...fillPatternFor(donePattern, dummyTask, agent), task: null };
+    const agentWaiting: FillPattern = { ...fillPatternFor(waitingPattern, dummyTask, agent), task: null };
+    const agentBlocked: FillPattern = { ...fillPatternFor(blockedPattern, dummyTask, agent), task: null };
+    
+    const last = queue.lastOf<"done" | "waiting" | "blocked">(
+      [
+        { kind: "done", pattern: agentDone },
+        { kind: "waiting", pattern: agentWaiting },
+        { kind: "blocked", pattern: agentBlocked },
+      ],
+      mark,
+      until,
+    );
+    if (!last) return null;
+    
+    const reportedTask = extractReportedTask(last.line);
+    if (!reportedTask || reportedTask === openTask) return null;
+    
+    return { kind: last.kind, reportedTask, line: last.line };
+  }
+  
+  // For patterns with {task} only: we need to search the queue lines directly
+  // since the regex would have the specific task baked in
+  // Use the raw queue to find lines matching "- DONE|WAITING|BLOCKED <task>" by this agent
+  const lines = queue.linesInWindow(mark, until);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    
+    // Check if it's a report line by extracting the task
+    const reportedTask = extractReportedTask(trimmed);
+    if (!reportedTask) continue;
+    
+    // Check if it's by this agent
+    const lineAgent = attributedAgent(trimmed);
+    if (!lineAgent || lineAgent.toLowerCase() !== agent.toLowerCase()) continue;
+    
+    // It's a report by this agent - check if it's for a different task
+    if (reportedTask === openTask) continue;
+    
+    // Determine the kind
+    const kindMatch = /^-\s+(DONE|WAITING|BLOCKED)\s+/i.exec(trimmed);
+    if (!kindMatch) continue;
+    const kind = kindMatch[1].toLowerCase() as "done" | "waiting" | "blocked";
+    
+    return { kind, reportedTask, line: trimmed };
+  }
+  
+  return null;
 }
 
 /** How a run ended by its own queue line: DONE, WAITING or BLOCKED, and the line as written (data, never a prompt). */
@@ -896,6 +955,8 @@ export class AgentsFill {
   private unmatchedNoticeAt = new Map<string, number>();
   /** Last capacity check state for the view */
   private lastCapacity: FillCapacityView | null = null;
+  /** Whether the config warning for agent-only patterns with done_match task_id has been emitted */
+  private configWarningEmitted = false;
 
   constructor(private options: AgentsFillOptions) {}
 
@@ -1000,6 +1061,8 @@ export class AgentsFill {
       this.lastCheck = now;
       return;
     }
+    // Emit a startup warning once if done_match is task_id but pattern has no {task}
+    await this.emitConfigWarningIfNeeded(now);
     const abort = new AbortController();
     this.abort = abort;
     try {
@@ -1013,6 +1076,33 @@ export class AgentsFill {
     } finally {
       this.lastCheck = now;
       if (this.abort === abort) this.abort = null;
+    }
+  }
+
+  /**
+   * Emit a config warning once if done_match is task_id but pattern has no {task}.
+   * This is recorded as a notice event visible on Health.
+   */
+  private async emitConfigWarningIfNeeded(now: number): Promise<void> {
+    if (this.configWarningEmitted) return;
+    const { settings } = this.options;
+    // Check if done_match is task_id but pattern doesn't have {task}
+    if (settings.doneMatch === "task_id" && !settings.donePattern.includes("{task}")) {
+      this.configWarningEmitted = true;
+      await this.options.record(
+        "fill_config",
+        {
+          summary: `CONFIG WARNING: done_match is "task_id" but done_pattern has no {task}; falling back to agent_legacy matching`,
+          evidence: [`done_pattern: ${settings.donePattern}`, `done_match: ${settings.doneMatch}`],
+          data: {
+            warning: "agent_only_pattern_with_task_id",
+            donePattern: settings.donePattern,
+            doneMatch: settings.doneMatch,
+          },
+          dedupeKey: `fill_config_warning:agent_only_pattern`,
+        },
+        now,
+      );
     }
   }
 
