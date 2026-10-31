@@ -14,7 +14,7 @@ import Fastify from "fastify";
 import type { FastifyInstance } from "fastify";
 import { ChecksService, type CheckSpawner, type SpawnResult, type GuardRunner, type Clock, type ChecksFs } from "./service.js";
 import { ChecksStore } from "./store.js";
-import { BusStore } from "../bus/store.js";
+import { BusStore, getBusStore, closeBusStores } from "../bus/store.js";
 import { hashBusToken, newBusToken } from "../bus/tokens.js";
 import { parseChecksConfig, EXIT_PASS, EXIT_FAIL, EXIT_INFRASTRUCTURE } from "./config.js";
 import { registerChecksRoutes } from "./routes.js";
@@ -144,12 +144,16 @@ interface TestContext {
 }
 
 async function createTestContext(config: typeof VALID_CONFIG | undefined = VALID_CONFIG): Promise<TestContext> {
+  // Clear any cached bus stores from previous tests
+  closeBusStores();
+
   mkdirSync(TEST_DATA_DIR, { recursive: true });
   // Create bus subdirectory for getBusStore
   mkdirSync(join(TEST_DATA_DIR, "bus"), { recursive: true });
 
   const checksStore = new ChecksStore(TEST_PROJECT, join(TEST_DATA_DIR, "checks.db"));
-  const busStore = new BusStore(TEST_PROJECT, join(TEST_DATA_DIR, "bus", `${TEST_PROJECT}.db`));
+  // Use getBusStore to ensure the same instance is used by routes
+  const busStore = getBusStore(TEST_PROJECT, TEST_DATA_DIR);
 
   const spawner = new FakeSpawner();
   const guard = new FakeGuardRunner();
@@ -203,7 +207,8 @@ describe("Checks module acceptance tests", () => {
   afterEach(async () => {
     await ctx.app.close();
     ctx.checksStore.close();
-    ctx.busStore.close();
+    // Use closeBusStores to properly close cached stores
+    closeBusStores();
     if (existsSync(TEST_DATA_DIR)) {
       rmSync(TEST_DATA_DIR, { recursive: true });
     }
@@ -235,10 +240,11 @@ describe("Checks module acceptance tests", () => {
     expect(call.argv).toEqual(["./run-tests.sh", "a".repeat(40), "TestClassA TestClassB"]);
     expect(call.options.env.CHECK_ID).toBe(createData.id);
 
-    // Get result
+    // Get result - use token auth
     const getRes = await ctx.app.inject({
       method: "GET",
       url: `/api/checks/${createData.id}`,
+      headers: { authorization: `Bearer ${token}` },
     });
 
     expect(getRes.statusCode).toBe(200);
@@ -401,7 +407,7 @@ describe("Checks module acceptance tests", () => {
     };
 
     ctx.checksStore.close();
-    ctx.busStore.close();
+    closeBusStores();
     await ctx.app.close();
     ctx = await createTestContext(lowLimitConfig);
 
@@ -442,7 +448,7 @@ describe("Checks module acceptance tests", () => {
     };
 
     ctx.checksStore.close();
-    ctx.busStore.close();
+    closeBusStores();
     await ctx.app.close();
     ctx = await createTestContext(guardConfig);
 
@@ -527,7 +533,7 @@ describe("Checks module acceptance tests", () => {
     };
 
     ctx.checksStore.close();
-    ctx.busStore.close();
+    closeBusStores();
     await ctx.app.close();
     ctx = await createTestContext(junitConfig);
 
@@ -597,6 +603,7 @@ describe("Checks module acceptance tests", () => {
     const getRes = await ctx.app.inject({
       method: "GET",
       url: `/api/checks/${id}`,
+      headers: { authorization: `Bearer ${token}` },
     });
 
     const { data } = JSON.parse(getRes.body);
@@ -610,7 +617,7 @@ describe("Checks module acceptance tests", () => {
   // Test 8: With checks off, routes return 404/disabled
   it("with checks off, routes return 404", async () => {
     ctx.checksStore.close();
-    ctx.busStore.close();
+    closeBusStores();
     await ctx.app.close();
     // Pass empty object to get empty config (no check kinds defined)
     ctx = await createTestContext({} as typeof VALID_CONFIG);
