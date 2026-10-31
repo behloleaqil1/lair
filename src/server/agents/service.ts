@@ -3176,6 +3176,16 @@ export class AgentsService {
   }
 
   /**
+   * Whether the ready guard accepts `line` as `task`'s done report (true when
+   * fill or the guard is off). The planner settles a task through this too, so a
+   * refused report is a done nowhere.
+   */
+  async reportAccepted(agent: string, task: string, line: string, taskText: string): Promise<boolean> {
+    if (!this.fill) return true;
+    return (await this.fill.guardReport(agent, task, line, this.store.latestRunForTask(this.project, task), taskText)) === null;
+  }
+
+  /**
    * The owner releases a task fill holds for them (an owner or no_done hold,
    * at fill's last check): fill starts it again on its next check, and counts
    * its completions without done from zero. Only while the run that hold was

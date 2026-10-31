@@ -151,6 +151,7 @@ export type AgentEventKind =
   | "fill_weak"
   | "fill_wake_absent"
   | "fill_report_refused"
+  | "fill_report_waiting"
   | "fill_gate_queued"
   | "fill_gate_gone"
   | "transient"

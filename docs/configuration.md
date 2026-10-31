@@ -1771,6 +1771,7 @@ worker-b|Bob|feat-search|Search page
 | `fill.max_backoff_seconds` | number | `1800` | Longest such wait |
 | `fill.waiting_pattern` | string | `^-\s+WAITING\s+{task}(?=\s\|$)` | A run that ended on such a line waits; same rules as `done_pattern`. An optional `(?<wake>...)` names what it waits on |
 | `fill.ready_guard` | boolean | `false` | Refuse a done line that names a PR (`PR #<n>`, and `at <sha>` for its head) unless the PR is ready to review; see the Ready guard note below. Needs `review.enabled` (the PR is read through the review module's git host) |
+| `fill.ready_wait_minutes` | integer | `120` | How long a done line that only time can settle (CI still running, the git host not answering) is held and checked again; after that the owner gets one decision and the report stays refused. Counted from the first check, kept across restarts. `ready_guard: true` without `review.enabled` is a config error |
 | `fill.blocked_pattern` | string | `^-\s+BLOCKED\s+{task}(?=\s\|$)` | A run that ended on such a line is held for you at once; same rules as `done_pattern` |
 | `fill.wake.file` | string | — | The file whose existence ends a wait. `{wake}` (required), `{gates_dir}`, `{agents_dir}`, `{repo}`; relative to `repo` |
 | `fill.wake.root` | string | `{gates_dir}` | The directory `wake.file` must stay inside. `{gates_dir}`, `{agents_dir}`, `{repo}` |

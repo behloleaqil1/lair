@@ -197,6 +197,8 @@ const FillSchema = z
     wake: WakeSchema.default({}),
     /** Refuse a DONE line that names a PR unless the PR is ready to review (CI, branch, gate, finding map) */
     ready_guard: z.boolean().default(false),
+    /** A done line whose PR can't be verified yet (CI running, host not answering) is held this long, then the owner is asked */
+    ready_wait_minutes: z.number().int().min(1).max(10080).default(120),
   })
   .strict();
 
@@ -312,6 +314,8 @@ export interface FillSettings {
   blockedPattern: string;
   /** Refuse a DONE line that names a PR unless the PR is ready to review (src/server/ready-guard/) */
   readyGuard: boolean;
+  /** How long a report that only time can settle is held before the owner is asked */
+  readyWaitMinutes: number;
   wake: {
     file?: string;
     root: string;
@@ -604,6 +608,10 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
     if (!isValidDragonId(agent)) errors.push(`agents.budgets.per_agent.${agent}: not a valid agent id`);
   }
   checkLimits(value.budgets.project, "agents.budgets.project", errors);
+  // The guard reads PRs through the review module's git host: without it every report would pass unchecked
+  if (project && value.fill.ready_guard && project.review?.enabled !== true) {
+    errors.push("agents.fill.ready_guard: needs review.enabled (the PRs are read through the review module's git host)");
+  }
   checkLimits(value.budgets.agent, "agents.budgets.agent", errors);
   for (const [agent, limits] of Object.entries(value.budgets.per_agent)) {
     checkLimits(limits, `agents.budgets.per_agent.${agent}`, errors);
@@ -693,6 +701,7 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         waitingPattern: value.fill.waiting_pattern,
         blockedPattern: value.fill.blocked_pattern,
         readyGuard: value.fill.ready_guard,
+        readyWaitMinutes: value.fill.ready_wait_minutes,
         wake: {
           file: value.fill.wake.file,
           root: value.fill.wake.root,

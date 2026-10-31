@@ -546,6 +546,7 @@ export class ReviewService {
       state: pr.state,
       headSha: pr.headSha,
       baseRef: pr.baseRef,
+      headRef: pr.headRef,
       mergeable: pr.mergeable,
       behindBy,
       body: pr.body ?? "",

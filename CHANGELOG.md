@@ -5,6 +5,7 @@ file lists what needs action on your side.
 
 ## Unreleased
 
+- **Ready guard fixes.** The planner settles a done line through the same guard as fill; the PR and head are read from the bus line's tail (or the PR the task names), a line with no PR or head for PR work is refused, a PR on another agent's branch is refused, pending CI or an unreachable host is held for at most `fill.ready_wait_minutes` and then asked once, GitHub calls time out and back off on rate limits, and host text in the next prompt is fenced as data.
 - **Ready guard (off by default).** `agents.fill.ready_guard: true` refuses a done line that names a PR whose CI is
   red or pending, whose branch is behind or conflicting, whose gate did not pass at the head, or that lacks a
   finding-to-commit map; the agent gets the reason as its next instruction. See
