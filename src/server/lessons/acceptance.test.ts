@@ -218,7 +218,7 @@ describe("owner-only writes", () => {
     // Use a clock that is EARLIER than the built-ins' creation time
     // to ensure the propose route returns the right lesson
     const EARLY_TIME = Date.parse("2026-10-29T00:00:00.000Z");
-    const { app, answerToken, clock } = await build(EARLY_TIME);
+    const { app, answerToken } = await build(EARLY_TIME);
     const browser = await unlock(app, answerToken);
 
     // The clock is earlier than built-ins (which use Date.now() in loadBuiltinLessons)
