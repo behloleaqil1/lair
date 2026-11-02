@@ -423,6 +423,58 @@ export class PlannerStore {
     return (this.db.prepare(`SELECT COUNT(*) AS n FROM planner_runs WHERE project = ?`).get(project) as { n: number }).n;
   }
 
+  /**
+   * For AI spend's classes: the planner run whose planner agent run (`role` planner) or verifier run (`role`
+   * verifier) is in chain `chainId` or is `runId`, requested from `since` on (bounded by the index), or null.
+   */
+  runForAgentRun(project: string, role: "planner" | "verifier", runId: string, chainId: string, since: number): StoredRun | null {
+    const where = role === "planner" ? "(chain_id = ? OR agent_run_id = ?)" : "(verifier_chain_id = ? OR verifier_run_id = ?)";
+    const row = this.db
+      .prepare(`SELECT * FROM planner_runs WHERE project = ? AND requested_at >= ? AND ${where} ORDER BY requested_at DESC LIMIT 1`)
+      .get(project, since, chainId, runId) as RunRow | undefined;
+    return row ? toRun(row) : null;
+  }
+
+  /** How many of a run's proposals carry a verdict the verifier gave (not the stand-in for a missing one). */
+  verifierVerdicts(runId: string, missing: string): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM planner_proposals WHERE run_id = ? AND verifier_verdict IN ('approve', 'reject', 'unsure')
+           AND (verifier_reason IS NULL OR verifier_reason != ?)`,
+      )
+      .get(runId, missing) as { n: number };
+    return row.n;
+  }
+
+  /**
+   * For the AI spend API: planner runs requested in [from, to), those with an applied proposal, and their proposals
+   * by status and by the verifier's verdict.
+   */
+  acceptance(
+    project: string,
+    from: number,
+    to: number,
+  ): { runs: number; runsWithApplied: number; status: Record<string, number>; verdicts: Record<string, number> } {
+    const runs = this.db
+      .prepare(
+        `SELECT COUNT(*) AS runs, SUM(EXISTS (SELECT 1 FROM planner_proposals p WHERE p.run_id = r.id AND p.status = 'applied')) AS applied
+         FROM planner_runs r WHERE project = ? AND requested_at >= ? AND requested_at < ?`,
+      )
+      .get(project, from, to) as { runs: number; applied: number | null };
+    const tally = (column: "status" | "verifier_verdict") =>
+      Object.fromEntries(
+        (
+          this.db
+            .prepare(
+              `SELECT p.${column} AS k, COUNT(*) AS n FROM planner_proposals p JOIN planner_runs r ON r.id = p.run_id
+               WHERE r.project = ? AND r.requested_at >= ? AND r.requested_at < ? AND p.${column} IS NOT NULL GROUP BY p.${column}`,
+            )
+            .all(project, from, to) as { k: string; n: number }[]
+        ).map((row) => [row.k, row.n]),
+      );
+    return { runs: runs.runs, runsWithApplied: runs.applied ?? 0, status: tally("status"), verdicts: tally("verifier_verdict") };
+  }
+
   /** When the project's runs requested after `since` started, oldest first (max_runs_per_day). */
   runStartsSince(project: string, since: number): number[] {
     const rows = this.db

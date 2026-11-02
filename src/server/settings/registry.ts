@@ -243,6 +243,9 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       "fill.capacity_cmd": { help: "Exit 0: capacity available; anything else holds (its first output line is the reason)" },
       "budgets.guard_mode": { help: "The mode of the request and minute limits AI spend adds; token and cost hard limits always block" },
       "spend.enabled": { help: "Record each ended run's runtime, prompt size and the usage its adapter reports" },
+      "spend.daily_summary_utc": { advanced: true, help: "When the UTC day that just ended is summed up, HH:MM in UTC" },
+      "spend.notice.waste_share": { help: "A notice when today's waste share reaches this (0 to 1); unset: no notice" },
+      "spend.notice.task_attempts": { help: "A notice when a task's runs without a completion within 24 h reach this; unset: no notice" },
     },
   },
   {

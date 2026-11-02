@@ -9,7 +9,7 @@ import { isValidDragonId } from "../parsers/dragon-config.js";
 import { attributedAgent } from "../parsers/queue.js";
 import { getAdapter } from "../services/adapters.js";
 import { placeholdersIn } from "../watchdog/config.js";
-import { guardsNeedSpendErrors, resolveUsageParsers, type SpendSettings } from "./spend.js";
+import { guardsNeedSpendErrors, resolveUsageParsers, spendConfigErrors, type SpendSettings } from "./spend.js";
 
 /** A guard's mode (docs/design/ai-spend.md §4.5): off computes nothing; observe records what it would do; act does it */
 export const GUARD_MODES = ["off", "observe", "act"] as const;
@@ -326,6 +326,26 @@ export const AgentsSchema = z
     spend: z
       .object({
         enabled: z.boolean().default(false),
+        /** Per-run rows are kept this long (D4) */
+        retention_days: z.number().int().min(1).max(3650).default(90),
+        /** Daily aggregates are kept this long (D4); at least retention_days */
+        aggregate_days: z.number().int().min(1).max(3650).default(365),
+        /** On first enable, the runs that ended this many days back are classified from what Lair holds (usage none) */
+        backfill_days: z.number().int().min(0).max(90).default(7),
+        /** When the UTC day that just ended is summed up (spend_daily, agents.spend.daily): "HH:MM", UTC */
+        daily_summary_utc: z.string().max(5).default("00:05"),
+        /** Decision Inbox notices (attention: notice), each off until its threshold is set */
+        notice: z
+          .object({
+            /** The day's waste share, in the panel's unit, at or past this: in (0, 1] */
+            waste_share: z.number().optional(),
+            /** ... with at least this many runs that day */
+            min_runs: z.number().int().min(1).max(100_000).default(20),
+            /** One task's attempts without a completion within 24 h at or past this */
+            task_attempts: z.number().int().min(1).max(10_000).optional(),
+          })
+          .strict()
+          .default({}),
       })
       .strict()
       .default({}),
@@ -691,6 +711,7 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
   });
   // Every adapter's usage parser (agent_adapters.<id>.usage_parser and request_pattern), checked whether spend is on or not
   const usageParsers = resolveUsageParsers(project, value.usage_patterns.length > 0, errors);
+  const summaryMinute = spendConfigErrors(value.spend, errors);
 
   if (value.session_dir) {
     checkPlaceholders(value.session_dir, ["agents_dir", "agent", "repo"], "agents.session_dir", errors);
@@ -794,7 +815,21 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         perAgent: value.budgets.per_agent,
         guardMode: value.budgets.guard_mode,
       },
-      spend: { enabled: value.spend.enabled, parsers: usageParsers },
+      spend: {
+        enabled: value.spend.enabled,
+        parsers: usageParsers,
+        retentionDays: value.spend.retention_days,
+        aggregateDays: value.spend.aggregate_days,
+        backfillDays: value.spend.backfill_days,
+        dailySummaryMinute: summaryMinute,
+        notice: {
+          wasteShare: value.spend.notice.waste_share ?? null,
+          minRuns: value.spend.notice.min_runs,
+          taskAttempts: value.spend.notice.task_attempts ?? null,
+        },
+        // A WAITING line's wake is something Lair watches only when fill follows it to a file
+        wakeWatched: value.fill.enabled && value.fill.wake.file !== undefined,
+      },
       fill: {
         enabled: value.fill.enabled,
         tasksFile: value.fill.tasks_file,

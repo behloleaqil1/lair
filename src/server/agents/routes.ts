@@ -11,6 +11,9 @@
  *   POST /api/agents/fill/release?project=       {task, confirm: true}: fill starts a task it holds for the owner again
  *   GET  /api/agents/prompts?project=            owner: the files in prompts_dir (basenames, sizes, times)
  *   GET  /api/agents/prompts/file?name=&project= owner: one of them, by basename: {name, size, text}
+ *   GET  /api/agents/spend?project=&window=today|7d|30d|1y&by=project|agent|task|reason|origin|provider
+ *                                                owner: AI spend by class and unit, waste share, top tasks, guards
+ *   GET  /api/agents/spend/runs?project=&task=&limit=  owner: spend rows, a task's with task= (numbers, ids, enums)
  *
  * Every POST is the owner's (starting a run, releasing a claim, a fresh
  * session, an early check, releasing a fill hold): it needs an owner session (src/server/human-auth/,
@@ -28,6 +31,7 @@
  */
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
+import { SPEND_GROUPS, SPEND_WINDOWS } from "../../shared/agents-types.js";
 import { rejectCrossSiteRequests } from "../origin.js";
 import type { HumanAuth } from "../human-auth/index.js";
 import { AgentsError, isValidTaskId, type AgentsManager, type AgentsService } from "./service.js";
@@ -45,6 +49,8 @@ const limit = z.coerce.number().int().min(1).max(500).default(100);
 const ProjectQuery = z.object({ project: z.string().optional() });
 const ListQuery = ProjectQuery.extend({ limit });
 const PromptQuery = ProjectQuery.extend({ name: z.string().max(255) });
+const SpendQuery = ProjectQuery.extend({ window: z.enum(SPEND_WINDOWS).default("today"), by: z.enum(SPEND_GROUPS).default("project") });
+const SpendRunsQuery = ProjectQuery.extend({ task: z.string().max(200).optional(), limit });
 const RUN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 const RunBody = z
@@ -207,6 +213,37 @@ export async function registerAgentsRoutes(
       if (!service) return reply;
       try {
         return respond(readPromptFile(service.promptsDir(), query.data.name));
+      } catch (e) {
+        return handleError(reply, e);
+      }
+    });
+
+    // AI spend (docs/design/ai-spend.md §4.4): the owner's data (cost, usage), so owner only, like the prompt reads.
+    // Numbers, ids and enums only: never a prompt, a log line or a blocker's text. 404 while agents.spend is off
+    app.get("/api/agents/spend", ownerOnly, async (request, reply) => {
+      const query = SpendQuery.safeParse(request.query ?? {});
+      if (!query.success) {
+        const key = String(query.error.issues[0].path[0] ?? "query");
+        const allowed = key === "window" ? SPEND_WINDOWS.join(", ") : key === "by" ? SPEND_GROUPS.join(", ") : query.error.issues[0].message;
+        return fail(reply, 400, `Invalid query: ${key}: ${allowed}`);
+      }
+      const service = serviceOf(reply, projectOf(query.data));
+      if (!service) return reply;
+      try {
+        return respond(service.spendReport(query.data.window, query.data.by));
+      } catch (e) {
+        return handleError(reply, e);
+      }
+    });
+
+    app.get("/api/agents/spend/runs", ownerOnly, async (request, reply) => {
+      const query = SpendRunsQuery.safeParse(request.query ?? {});
+      if (!query.success) return fail(reply, 400, `Invalid query: ${String(query.error.issues[0].path[0] ?? "query")}`);
+      if (query.data.task !== undefined && !isValidTaskId(query.data.task)) return fail(reply, 400, "Invalid query: task");
+      const service = serviceOf(reply, projectOf(query.data));
+      if (!service) return reply;
+      try {
+        return respond(service.spendRuns(query.data.task, query.data.limit));
       } catch (e) {
         return handleError(reply, e);
       }

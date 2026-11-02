@@ -35,7 +35,9 @@ import { parseAgentsConfig } from "./config.js";
 import type { DecisionInbox, DecisionRequest } from "./decisions.js";
 import type { AgentProbes, ProcessOwner, ProcessSpawner, SpawnOptions, SystemInfo, MemoryReading } from "./probes.js";
 import { AgentsManager, type AgentsService } from "./service.js";
-import { KIRO_REQUEST_PATTERN, MAX_REQUEST_PATTERN_CHARS, SCAN_BYTES_PER_TICK, classifyEnd, originOf } from "./spend.js";
+import { KIRO_REQUEST_PATTERN, MAX_REQUEST_PATTERN_CHARS, SCAN_BYTES_PER_TICK, originOf } from "./spend.js";
+import { blockerKey, CLASSIFY_WAIT_MS, SpendClassifier, type ModuleVerdict, type SpendFacts } from "./spend-classify.js";
+import type { Decision } from "../../shared/decision-types.js";
 import { AgentsStore, SCHEMA_VERSION } from "./store.js";
 import type { AgentEvent, AgentRun, SpendRow } from "./types.js";
 
@@ -195,6 +197,7 @@ interface Harness extends Paths {
   store: AgentsStore;
   asked: DecisionRequest[];
   probes: AgentProbes;
+  events: EventBus;
 }
 
 const dirs: string[] = [];
@@ -246,27 +249,32 @@ function projectConfig(p: Paths, agents: Record<string, unknown>, adapters: Reco
   } as unknown as ProjectConfig;
 }
 
-function setup(agents: Record<string, unknown> = {}, options: { paths?: Paths; budget?: BudgetManager; adapters?: Record<string, AgentAdapter>; clock?: FakeClock } = {}): Harness {
+function setup(
+  agents: Record<string, unknown> = {},
+  options: { paths?: Paths; budget?: BudgetManager; adapters?: Record<string, AgentAdapter>; clock?: FakeClock; inbox?: DecisionInbox; events?: EventBus; facts?: SpendFacts } = {},
+): Harness {
   const paths = options.paths ?? makePaths();
   const config = projectConfig(paths, agents, options.adapters);
   const clock = options.clock ?? new FakeClock();
   const procs = new FakeProcessTable(clock);
   const spawner = new FakeSpawner(procs, clock);
   const asked: DecisionRequest[] = [];
-  const decisions: DecisionInbox = {
+  const decisions: DecisionInbox = options.inbox ?? {
     request: async (decision) => {
       asked.push(decision);
       return { id: `decision-${asked.length}`, via: "the decisions module" };
     },
   };
   const probes: AgentProbes = { processes: procs, fs: new NodeFileSystem(), runner: new NoCommands(), clock, spawner, self: SELF, systemInfo: SYSTEM };
-  const manager = new AgentsManager({ dbPath: paths.dbPath, probes, events: new EventBus(), budget: options.budget, decisions });
+  const events = options.events ?? new EventBus();
+  const manager = new AgentsManager({ dbPath: paths.dbPath, probes, events, budget: options.budget, decisions });
   managers.push(manager);
+  if (options.facts) manager.useSpendFacts(options.facts);
   manager.load([{ name: "demo", config }]);
   const service = manager.get("demo");
   const store = manager.getStore();
   if (!service || !store) throw new Error(`agents not enabled: ${manager.status("demo").errors.join("; ")}`);
-  return { ...paths, config, clock, procs, spawner, manager, service, store, asked, probes };
+  return { ...paths, config, clock, procs, spawner, manager, service, store, asked, probes, events };
 }
 
 const SPEND_ON = { spend: { enabled: true } };
@@ -824,8 +832,19 @@ describe("AT-23: a bad usage config is refused at load, naming each key", () => 
       const errors = errorsOf({ enabled: true }, project(adapter));
       expect(errors, JSON.stringify(adapter)).toEqual([expect.stringContaining(error)]);
     }
+    // agents.spend's own keys (the classification part): each refused naming it
+    expect(errorsOf({ enabled: true, spend: { enabled: true, notice: { waste_share: 2 } } }, project({}))).toEqual([
+      expect.stringContaining("agents.spend.notice.waste_share: a share in (0, 1]"),
+    ]);
+    expect(errorsOf({ enabled: true, spend: { enabled: true, notice: { waste_share: 0 } } }, project({}))).toEqual([
+      expect.stringContaining("agents.spend.notice.waste_share"),
+    ]);
+    expect(errorsOf({ enabled: true, spend: { retention_days: 90, aggregate_days: 30 } }, project({}))).toEqual([
+      expect.stringContaining("agents.spend.aggregate_days: at least agents.spend.retention_days"),
+    ]);
+    expect(errorsOf({ enabled: true, spend: { daily_summary_utc: "24:05" } }, project({}))).toEqual([expect.stringContaining("agents.spend.daily_summary_utc")]);
     // Keys of later parts are unknown here: refused too, naming them
-    expect(errorsOf({ enabled: true, spend: { enabled: true, notice: { waste_share: 2 } } }, project({}))).toEqual([expect.stringMatching(/^agents\.spend: .*notice/)]);
+    expect(errorsOf({ enabled: true, spend: { enabled: true, guards: {} } }, project({}))).toEqual([expect.stringMatching(/^agents\.spend: .*guards/)]);
     expect(errorsOf({ enabled: true, budgets: { guard_mode: "block" } }, project({}))).toEqual([expect.stringContaining("agents.budgets.guard_mode")]);
   });
 
@@ -952,21 +971,23 @@ describe("run origins and the classes this part can tell", () => {
     expect(originOf(run("review-42-abcdef12", "fill"))).toBe("fill");
   });
 
-  it("failed ends are no_result by their kind; what needs the classification part is unclassified", async () => {
+  it("failed ends are no_result by their kind; a module run with nothing wired to tell is unclassified", async () => {
     const h = setup(SPEND_ON);
     await oneRun(h, { task: "feat-crash", log: "working\nsegmentation fault\n", exit: 2 });
     expect(spendRows(h).find((r) => r.task === "feat-crash")).toMatchObject({ class: "no_result", reason: "crashed" });
+    // A WAITING line that names nothing Lair watches (no wake capture, no fill.wake.file)
     await oneRun(h, { agent: "worker-b", task: "feat-wait", log: CLAUDE_RUN, line: "- WAITING feat-wait by worker-b: gate queued" });
-    expect(spendRows(h).find((r) => r.task === "feat-wait")).toMatchObject({ class: "unclassified", reason: "pending" });
+    expect(spendRows(h).find((r) => r.task === "feat-wait")).toMatchObject({ class: "idle", reason: "waiting_unnamed" });
     await oneRun(h, { agent: "worker-p", task: "feat-blocked", log: "x\n", line: "- BLOCKED feat-blocked by worker-p: needs a key" });
     expect(spendRows(h).find((r) => r.task === "feat-blocked")).toMatchObject({ class: "productive", reason: "blocked" });
 
-    const ended = { state: "completed", endKind: "completed", task: "review-1-abc" } as AgentRun;
-    expect(classifyEnd(ended, "review", null)).toEqual({ class: "unclassified", reason: "pending" });
-    expect(classifyEnd(ended, "owner", null)).toEqual({ class: "idle", reason: "no_line" });
-    expect(classifyEnd(ended, "fill", { kind: "done", line: "- READY feat by worker-a: PR #4" })).toEqual({ class: "productive", reason: "ready" });
+    const classifier = new SpendClassifier({ project: "demo", store: h.store, wakeWatched: () => false, facts: () => undefined });
+    const ended = { id: "r-1", state: "completed", endKind: "completed", task: "review-1-abcdef12", agent: "worker-a", chainId: "c-1", requestedAt: NOW } as AgentRun;
+    expect(classifier.atEnd(ended, "completed", "review", null, NOW, true)).toMatchObject({ class: "unclassified", reason: "pending", pr: 1, headSha: "abcdef12" });
+    expect(classifier.atEnd(ended, "completed", "owner", null, NOW, true)).toMatchObject({ class: "idle", reason: "no_line" });
+    expect(classifier.atEnd(ended, "completed", "fill", { kind: "done", line: "- READY feat by worker-a: PR #4" }, NOW, true)).toMatchObject({ class: "productive", reason: "ready" });
     for (const end of ["hung", "rate_limit", "provider_error", "unreachable", "exit_unknown", "lost", "vars_lost", "lost_claim", "stopped", "never_started", "dead_on_start"] as const) {
-      expect(classifyEnd({ ...ended, state: "failed", endKind: end }, "fill", null)).toEqual({ class: "no_result", reason: end });
+      expect(classifier.atEnd({ ...ended, state: "failed", endKind: end }, end, "fill", null, NOW, true)).toMatchObject({ class: "no_result", reason: end });
     }
   });
 
@@ -1011,5 +1032,552 @@ describe("spend.recordCall: a module's model call without an agent run", () => {
     }
     expect(h.manager.recordCall("other-project", { module: "brain", provider: "local" })).toBe(false);
     expect(ledger(h.dbPath)).toHaveLength(2);
+  });
+});
+
+// ============ PART 2: CLASSIFY, API, DAILY SUMMARY, NOTICES (§7 PR 2) ============
+
+const DAY = 24 * 60 * MIN;
+const byTask = (h: Harness, task: string): SpendRow[] => spendRows(h).filter((r) => r.task === task);
+
+/** A Decision Inbox stand-in that keeps what it is asked, and answers find, open and withdraw as the real one does */
+function memoryInbox() {
+  const kept: { id: string; status: string; key: string; kind: string; title: string; source: { module: string; project: string; ref: string }; request: DecisionRequest }[] = [];
+  const inbox: DecisionInbox = {
+    request: async (request) => {
+      const decision = {
+        id: `decision-${kept.length + 1}`,
+        status: "open",
+        key: request.key,
+        kind: request.kind,
+        title: request.question,
+        source: { module: "agents", project: request.project, ref: request.ref ?? "" },
+        request,
+      };
+      kept.push(decision);
+      return { id: decision.id, via: "the decisions module" };
+    },
+    find: (_project, key) => ([...kept].reverse().find((d) => d.key === key) ?? null) as unknown as Decision | null,
+    open: () => kept.filter((d) => d.status === "open") as unknown as Decision[],
+    withdraw: async (id) => {
+      const decision = kept.find((d) => d.id === id);
+      if (decision) decision.status = "withdrawn";
+    },
+  };
+  return { inbox, kept };
+}
+
+/** A module's run (review, planner, verifier, supervisor): requested in-process, its CLI works and exits 0 */
+async function moduleRun(h: Harness, origin: "review" | "planner" | "verifier" | "supervisor", task: string): Promise<AgentRun> {
+  h.spawner.behaviour = (pid, logPath) => {
+    writeLog(h.clock, logPath, "worked\n");
+    h.spawner.exit(pid, 0);
+  };
+  const view = await h.manager.requestRun("demo", { agent: "worker-b", task, prompt: `Do it ${PROMPT_MARKER}` }, { origin });
+  await h.service.tick();
+  h.spawner.behaviour = undefined;
+  h.clock.t += 90 * SEC;
+  await h.service.tick();
+  return h.store.getRun(view.id)!;
+}
+
+async function ownerApp(h: Harness) {
+  const app = Fastify();
+  cleanups.push(() => app.close());
+  const tokenPath = join(h.dir, "data", "owner.token");
+  const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
+  await registerOwnerRoutes(app, auth);
+  await registerAgentsRoutes(app, h.manager, () => "demo", auth);
+  await app.ready();
+  const browser = { origin: "http://localhost:4777", "sec-fetch-site": "same-origin" };
+  const signIn = await app.inject({ method: "POST", url: "/api/owner/sessions", headers: browser, payload: { token: readFileSync(tokenPath, "utf-8").trim() } });
+  const owner = { ...browser, [OWNER_SESSION_HEADER]: signIn.json().data.session as string };
+  return { app, browser, owner };
+}
+
+describe("AT-8: a builder's runs get one class and reason each", () => {
+  it("DONE, no line, a crash, a rate limit and a transient death: productive/done, idle/no_line, no_result by the end", async () => {
+    const h = setup(SPEND_ON);
+    await oneRun(h, { task: "t-done", log: "x\n", line: "- DONE t-done by worker-a 12:01Z: merged" });
+    await oneRun(h, { task: "t-quiet", log: "x\n" });
+    await oneRun(h, { task: "t-crash", log: "working\nsegmentation fault\n", exit: 2 });
+    await oneRun(h, { agent: "worker-p", task: "t-limit", log: "Error: 429 Too Many Requests: rate limit exceeded, retry later\n", exit: 1 });
+    await oneRun(h, { agent: "builder-k", task: "t-net", log: "error: connect ECONNRESET 10.0.0.1:443\n", exit: 1 });
+    const first = (task: string) => byTask(h, task)[0];
+    expect(first("t-done")).toMatchObject({ class: "productive", reason: "done", origin: "other" });
+    expect(first("t-quiet")).toMatchObject({ class: "idle", reason: "no_line" });
+    expect(first("t-crash")).toMatchObject({ class: "no_result", reason: "crashed", lairRestart: false });
+    expect(first("t-limit")).toMatchObject({ class: "no_result", reason: "rate_limit" });
+    expect(first("t-net")).toMatchObject({ class: "no_result", reason: "unreachable" });
+  });
+
+  it("a hung run is no_result/hung; its resume in the same session is a reload", async () => {
+    const h = setup({ ...SPEND_ON, recovery: { same_session_restarts: 1, fresh_sessions: 0, backoff_seconds: 0, max_backoff_seconds: 0 } });
+    let spawned = 0;
+    h.spawner.behaviour = (pid, logPath) => {
+      spawned++;
+      if (spawned === 1) return writeLog(h.clock, logPath, "working\n"); // then silent
+      writeLog(h.clock, logPath, "resumed\n");
+      appendFileSync(h.queueFile, "- DONE t-hang by worker-a 13:00Z: merged\n");
+      h.spawner.exit(pid, 0);
+    };
+    await h.service.requestRun({ agent: "worker-a", task: "t-hang", prompt: "Build it" });
+    await h.service.tick();
+    h.clock.t += 46 * MIN;
+    for (let i = 0; i < 8 && byTask(h, "t-hang").length < 2; i++) {
+      await h.service.tick();
+      h.clock.t += 30 * SEC;
+    }
+    expect(byTask(h, "t-hang").map((r) => [r.sessionMode, r.class, r.reason, r.reload])).toEqual([
+      ["new", "no_result", "hung", false],
+      ["resume", "productive", "done", true],
+    ]);
+  });
+
+  it("a run that ended while Lair was down with no line, and a module run whose variables a restart lost: no_result, lair_restart", async () => {
+    const h = setup(SPEND_ON);
+    h.spawner.behaviour = (_pid, logPath) => writeLog(h.clock, logPath, "working\n"); // runs on past the restart
+    await h.service.requestRun({ agent: "worker-a", task: "t-gone", prompt: "Build it" });
+    await h.service.tick();
+    await h.manager.requestRun("demo", { agent: "worker-b", task: "review-7-abcdef12", prompt: "Review it", variables: { LAIR_REVIEW_TOKEN: "t" } }, { origin: "review" });
+    // Lair restarts (on_restart: adopt): the run's process ends meanwhile, and the queued run's variables are gone
+    await h.manager.stop();
+    h.clock.t += 5 * MIN;
+    const again = setup(SPEND_ON, { paths: { dir: h.dir, queueFile: h.queueFile, dbPath: h.dbPath }, clock: h.clock });
+    for (let i = 0; i < 3; i++) {
+      await again.service.tick();
+      again.clock.t += 30 * SEC;
+    }
+    expect(byTask(again, "t-gone")[0]).toMatchObject({ class: "no_result", reason: "exit_unknown", lairRestart: true });
+    expect(byTask(again, "review-7-abcdef12")[0]).toMatchObject({ class: "no_result", reason: "vars_lost", lairRestart: true, origin: "review", pr: 7, headSha: "abcdef12" });
+  });
+
+  it("WAITING on a gate it queued is productive (gate_queued); the next run waiting on the same gate is idle (waiting_same)", async () => {
+    const paths = makePaths();
+    const WAITS_ON_GATE = "^-\\s+WAITING\\s+{task}(?:\\s+(?<wake>\\d{8}T\\d{6}Z-\\S+))?(?=\\s|$)";
+    const GATE = "20260302T120100Z-t-wait-abcdef12-4242";
+    mkdirSync(join(paths.dir, "prompts"), { recursive: true });
+    writeFileSync(join(paths.dir, "prompts", "worker.txt"), "Build what the task says.\n");
+    writeFileSync(join(paths.dir, "tasks.txt"), "worker-a|A|t-wait|Wait task\n");
+    const h = setup(
+      {
+        ...SPEND_ON,
+        fill: {
+          enabled: true,
+          tasks_file: join(paths.dir, "tasks.txt"),
+          agents: ["worker-a"],
+          prompt_files: ["{prompts_dir}/worker.txt"],
+          max_active: 1,
+          interval_seconds: 1,
+          waiting_pattern: WAITS_ON_GATE,
+          wake: { file: "{gates_dir}/results/{wake}.rc" },
+        },
+      },
+      { paths },
+    );
+    const waitRun = async (stamp: string) => {
+      h.spawner.behaviour = (pid, logPath) => {
+        writeLog(h.clock, logPath, "queued the gate\n");
+        appendFileSync(h.queueFile, `- WAITING t-wait ${GATE} by worker-a ${stamp}: gate queued\n`);
+        h.spawner.exit(pid, 0);
+      };
+      await h.service.tick();
+      h.spawner.behaviour = undefined;
+      h.clock.t += MIN;
+      await h.service.tick();
+    };
+    await h.service.checkFill();
+    await waitRun("12:01Z");
+    // Written before fill looked at the wait: its class waits for fill's record
+    expect(byTask(h, "t-wait")[0]).toMatchObject({ class: "unclassified", reason: "pending" });
+    await h.service.checkFill(); // fill: waiting on the gate, whose result isn't there
+    expect(eventsOf(h, "fill_wake_absent")).toHaveLength(1);
+    await h.service.tick();
+    expect(byTask(h, "t-wait")[0]).toMatchObject({ class: "productive", reason: "gate_queued" });
+
+    // The gate's result comes: fill starts the task again, and that run waits on the same gate
+    writeFileSync(join(paths.dir, "gates", "results", `${GATE}.rc`), "0\n");
+    h.clock.t += MIN;
+    await h.service.checkFill();
+    await waitRun("12:10Z");
+    const rows = byTask(h, "t-wait");
+    expect(rows.map((r) => [r.class, r.reason, r.origin])).toEqual([
+      ["productive", "gate_queued", "fill"],
+      ["idle", "waiting_same", "fill"],
+    ]);
+  });
+});
+
+describe("AT-9: a module's run is classified by what its module recorded", () => {
+  it("review, planner, verifier and supervisor runs: productive with a record, idle without; pending until the module has read it", async () => {
+    const verdicts = new Map<string, ModuleVerdict | null>([
+      ["review-41-abcdef12", "productive"],
+      ["review-42-bcdef123", "idle"],
+      ["planner-1", "productive"],
+      ["planner-2", "idle"],
+      ["planner-3", "pending"],
+      ["verifier-1", "productive"],
+      ["verifier-2", "idle"],
+      ["supervisor-ask-1", "productive"],
+      ["supervisor-ask-2", "pending"],
+    ]);
+    const look = (_project: string, run: { task: string }) => verdicts.get(run.task) ?? null;
+    const facts: SpendFacts = {
+      review: (_project, run, _pr, head) => ({ verdict: (verdicts.get(run.task) ?? "idle") as ModuleVerdict, headSha: `${head}00000000000000000000000000000000` }),
+      planner: look,
+      verifier: look,
+      supervisor: look,
+    };
+    const h = setup(SPEND_ON, { facts });
+    const origins: [string, "review" | "planner" | "verifier" | "supervisor"][] = [
+      ["review-41-abcdef12", "review"],
+      ["review-42-bcdef123", "review"],
+      ["planner-1", "planner"],
+      ["planner-2", "planner"],
+      ["planner-3", "planner"],
+      ["verifier-1", "verifier"],
+      ["verifier-2", "verifier"],
+      ["supervisor-ask-1", "supervisor"],
+      ["supervisor-ask-2", "supervisor"],
+    ];
+    for (const [task, origin] of origins) await moduleRun(h, origin, task);
+    const of = (task: string) => byTask(h, task)[0];
+    expect(of("review-41-abcdef12")).toMatchObject({ class: "productive", reason: "review_recorded", origin: "review", pr: 41, headSha: `abcdef12${"0".repeat(32)}` });
+    expect(of("review-42-bcdef123")).toMatchObject({ class: "idle", reason: "no_review", origin: "review", pr: 42 });
+    expect(of("planner-1")).toMatchObject({ class: "productive", reason: "proposals", origin: "planner" });
+    expect(of("planner-2")).toMatchObject({ class: "idle", reason: "no_proposals", origin: "planner" });
+    expect(of("verifier-1")).toMatchObject({ class: "productive", reason: "verdicts", origin: "verifier" });
+    expect(of("verifier-2")).toMatchObject({ class: "idle", reason: "no_verdicts", origin: "verifier" });
+    expect(of("supervisor-ask-1")).toMatchObject({ class: "productive", reason: "answered", origin: "supervisor" });
+    // Not read by their modules yet
+    expect(of("planner-3")).toMatchObject({ class: "unclassified", reason: "pending" });
+    expect(of("supervisor-ask-2")).toMatchObject({ class: "unclassified", reason: "pending" });
+
+    // The planner reads its run's output: the next tick classifies it; the question never gets its answer
+    verdicts.set("planner-3", "productive");
+    await h.service.tick();
+    expect(of("planner-3")).toMatchObject({ class: "productive", reason: "proposals" });
+    expect(of("supervisor-ask-2")).toMatchObject({ class: "unclassified", reason: "pending" });
+    h.clock.t += CLASSIFY_WAIT_MS;
+    await h.service.tick();
+    expect(of("supervisor-ask-2")).toMatchObject({ class: "idle", reason: "no_answer" });
+    // A classified row is never changed again
+    verdicts.set("supervisor-ask-2", "productive");
+    await h.service.tick();
+    expect(of("supervisor-ask-2")).toMatchObject({ class: "idle", reason: "no_answer" });
+  });
+
+  it("without the module wired, its runs stay unclassified (nothing is guessed)", async () => {
+    const h = setup(SPEND_ON);
+    await moduleRun(h, "planner", "planner-9");
+    h.clock.t += CLASSIFY_WAIT_MS;
+    await h.service.tick();
+    expect(byTask(h, "planner-9")[0]).toMatchObject({ class: "unclassified", reason: "pending" });
+  });
+});
+
+describe("AT-31: a repeat BLOCKED with nothing pushed since is idle; only a key of the blocker is kept", () => {
+  it("first productive, the same blocker at the same head idle, after the PR moved productive again", async () => {
+    let head = "a".repeat(40);
+    const h = setup(SPEND_ON, { facts: { prHead: (_project, pr) => (pr === 42 ? head : null) } });
+    const BLOCKER = "waiting for PR #42 to be reviewed by the owner";
+    await oneRun(h, { task: "t-block", log: "x\n", line: `- BLOCKED t-block by worker-a 12:01Z: ${BLOCKER}` });
+    await oneRun(h, { agent: "worker-b", task: "t-block", log: "x\n", line: `- BLOCKED t-block by worker-b (2026-03-02 13:15Z): ${BLOCKER.replace("reviewed", "reviewed ")}` });
+    head = "b".repeat(40);
+    await oneRun(h, { task: "t-block", log: "x\n", line: `- BLOCKED t-block by worker-a 14:30Z: ${BLOCKER}` });
+    const rows = byTask(h, "t-block");
+    expect(rows.map((r) => [r.class, r.reason, r.pr, r.headSha])).toEqual([
+      ["productive", "blocked", 42, "a".repeat(40)],
+      ["idle", "blocked_repeat", 42, "a".repeat(40)],
+      ["productive", "blocked", 42, "b".repeat(40)],
+    ]);
+    expect(new Set(rows.map((r) => r.blockerKey)).size).toBe(1);
+    expect(rows[0].blockerKey).toMatch(/^[0-9a-f]{64}$/);
+    // A DONE in between is a push: the same blocker after it is new information again
+    await oneRun(h, { task: "t-block", log: "x\n", line: "- DONE t-block by worker-a 15:00Z: part one merged" });
+    await oneRun(h, { task: "t-block", log: "x\n", line: `- BLOCKED t-block by worker-a 15:30Z: ${BLOCKER}` });
+    expect(byTask(h, "t-block").at(-1)).toMatchObject({ class: "productive", reason: "blocked" });
+    // Another blocker is another key
+    expect(blockerKey(`- BLOCKED t-block by worker-a 16:00Z: needs the signing key`, null, null)).not.toBe(rows[0].blockerKey);
+
+    const { app, owner } = await ownerApp(h);
+    const response = await app.inject({ method: "GET", url: "/api/agents/spend/runs?project=demo&task=t-block", headers: owner });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().data).toHaveLength(5);
+    expect(response.body).not.toContain("waiting for PR");
+    expect(response.body).not.toContain(PROMPT_MARKER);
+    const db = new Database(h.dbPath, { readonly: true });
+    try {
+      expect(JSON.stringify(db.prepare("SELECT * FROM agents_spend").all())).not.toContain("waiting for PR");
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("AT-10: GET /api/agents/spend is the owner's, numbers only", () => {
+  it("totals, waste share, top tasks and each guard's mode for 7 days; refused without the owner, for a bad window and for a long window by task", async () => {
+    const h = setup(SPEND_ON);
+    h.clock.t = NOW - 2 * DAY;
+    await oneRun(h, { task: "t-a", log: "x\n", line: "- DONE t-a by worker-a 12:01Z: merged" });
+    h.clock.t = NOW - DAY;
+    await oneRun(h, { task: "t-b", log: "x\n" });
+    await oneRun(h, { task: "t-b", log: "segfault\n", exit: 2 });
+    h.clock.t = NOW;
+    await oneRun(h, { agent: "builder-k", task: "t-c", log: KIRO_30 });
+    const { app, browser, owner } = await ownerApp(h);
+
+    const ok = await app.inject({ method: "GET", url: "/api/agents/spend?project=demo&window=7d&by=task", headers: owner });
+    expect(ok.statusCode).toBe(200);
+    const report = ok.json().data;
+    expect(report).toMatchObject({ window: "7d", by: "task", source: "runs", unit: "requests" });
+    expect(report.totals.runs).toBeGreaterThanOrEqual(4);
+    expect(report.productive.runs).toBe(1);
+    expect(report.idle.runs).toBeGreaterThanOrEqual(1);
+    expect(report.waste.runs).toBeGreaterThan(0);
+    expect(report.groups.map((g: { key: string }) => g.key)).toEqual(expect.arrayContaining(["t-a", "t-b", "t-c"]));
+    // The request-lines adapter reports no tokens: not reported, never estimated
+    const kiro = report.groups.find((g: { key: string }) => g.key === "t-c");
+    expect(kiro.totals).toMatchObject({ requests: 30, tokens: null, cost: null, reported: false });
+    expect(report.topTasks[0]).toMatchObject({ task: "t-b" });
+    expect(report.guards.map((g: { guard: string }) => g.guard)).toContain("task_no_result_cap");
+    expect(report.guards.find((g: { guard: string }) => g.guard === "budget")).toMatchObject({ key: "agents.budgets.guard_mode", mode: "observe", would: 0, did: 0 });
+    expect(ok.body).not.toContain(PROMPT_MARKER);
+
+    for (const url of ["/api/agents/spend?project=demo&window=7d", "/api/agents/spend/runs?project=demo"]) {
+      expect([401, 403]).toContain((await app.inject({ method: "GET", url, headers: browser })).statusCode);
+    }
+    const year = await app.inject({ method: "GET", url: "/api/agents/spend?project=demo&window=year", headers: owner });
+    expect(year.statusCode).toBe(400);
+    expect(year.json().error).toContain("window");
+    const long = await app.inject({ method: "GET", url: "/api/agents/spend?project=demo&window=1y&by=task", headers: owner });
+    expect(long.statusCode).toBe(400);
+    expect(long.json().error).toContain("no per-task detail");
+    const longByAgent = await app.inject({ method: "GET", url: "/api/agents/spend?project=demo&window=1y&by=agent", headers: owner });
+    expect(longByAgent.statusCode).toBe(200);
+    expect(longByAgent.json().data).toMatchObject({ source: "aggregates", topTasks: null });
+  });
+
+  it("with agents.spend off the routes say so (404)", async () => {
+    const h = setup();
+    const { app, owner } = await ownerApp(h);
+    for (const url of ["/api/agents/spend?project=demo", "/api/agents/spend/runs?project=demo"]) {
+      const response = await app.inject({ method: "GET", url, headers: owner });
+      expect(response.statusCode).toBe(404);
+      expect(response.json().error).toContain("agents.spend.enabled is off");
+    }
+  });
+});
+
+describe("AT-11: one daily summary per day, also across a restart", () => {
+  it("past 00:05 UTC the day before is summed up once: one spend_daily event and one agents.spend.daily", async () => {
+    const events = new EventBus();
+    const daily: Record<string, unknown>[] = [];
+    events.on("agents.spend.daily", (event) => {
+      daily.push(event.data);
+    });
+    const h = setup(SPEND_ON, { events });
+    await oneRun(h, { task: "t-a", log: "x\n", line: "- DONE t-a by worker-a 12:01Z: merged" });
+    await oneRun(h, { task: "t-b", log: "x\n" });
+    const ofDay = () => eventsOf(h, "spend_daily").filter((e) => e.data.day === "2026-03-02");
+    h.clock.t = Date.parse("2026-03-03T00:04:00Z");
+    await h.service.tick();
+    expect(ofDay()).toEqual([]);
+    h.clock.t = Date.parse("2026-03-03T00:05:30Z");
+    await h.service.tick();
+    await h.service.tick();
+    expect(ofDay()).toHaveLength(1);
+    expect(ofDay()[0].data).toMatchObject({ day: "2026-03-02", totals: { runs: 2 }, productive: { runs: 1 }, idle: { runs: 1 } });
+    // Lair restarts at 00:06
+    await h.manager.stop();
+    h.clock.t = Date.parse("2026-03-03T00:06:00Z");
+    const again = setup(SPEND_ON, { paths: { dir: h.dir, queueFile: h.queueFile, dbPath: h.dbPath }, clock: h.clock, events });
+    await again.service.tick();
+    expect(eventsOf(again, "spend_daily").filter((e) => e.data.day === "2026-03-02")).toHaveLength(1);
+    expect(daily.filter((d) => d.day === "2026-03-02")).toHaveLength(1);
+    expect(daily.find((d) => d.day === "2026-03-02")).toMatchObject({ project: "demo", totals: { runs: 2 } });
+    expect(JSON.stringify(daily)).not.toContain(PROMPT_MARKER);
+    // Its aggregates are written
+    const db = new Database(h.dbPath, { readonly: true });
+    try {
+      expect(db.prepare("SELECT SUM(runs) AS n FROM agents_spend_daily WHERE day = '2026-03-02'").get()).toEqual({ n: 2 });
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("AT-12: the notices", () => {
+  it("spend_waste: a notice once today's waste share passes the threshold with enough runs; withdrawn the next day", async () => {
+    const { inbox, kept } = memoryInbox();
+    const h = setup({ spend: { enabled: true, notice: { waste_share: 0.5, min_runs: 20 } } }, { inbox });
+    const runs = async (productive: number, idle: number) => {
+      for (let i = 0; i < productive; i++) {
+        const task = `t-p${kept.length}-${spendRows(h).length}`;
+        await oneRun(h, { task, log: "x\n", line: `- DONE ${task} by worker-a 12:01Z: merged` });
+      }
+      for (let i = 0; i < idle; i++) await oneRun(h, { agent: "worker-b", task: `t-i-${spendRows(h).length}`, log: "x\n" });
+    };
+    // 19 runs, more than half of them idle: too few runs for a notice
+    await runs(9, 10);
+    await h.service.tick();
+    expect(kept.filter((d) => d.key.startsWith("spend_waste:"))).toEqual([]);
+    // 25 runs, 14 idle
+    await runs(2, 4);
+    await h.service.tick();
+    await h.service.tick();
+    const notices = kept.filter((d) => d.key.startsWith("spend_waste:"));
+    expect(notices).toHaveLength(1);
+    expect(notices[0].request).toMatchObject({ attention: "notice", kind: "other", key: "spend_waste:2026-03-02", ref: "spend:waste:2026-03-02" });
+    // Raised at the first check that found at least 20 runs and half or more of the minutes idle
+    expect(notices[0].request.question).toMatch(/^AI spend: (5\d|60) % of today's minutes went to idle or no-result runs$/);
+    expect(notices[0].request.context).not.toContain(PROMPT_MARKER);
+    // The next day's first tick withdraws it
+    h.clock.t = Date.parse("2026-03-03T00:10:00Z");
+    await h.service.tick();
+    expect(notices[0].status).toBe("withdrawn");
+  });
+
+  it("spend_task_attempts: a notice once a task's attempts without a completion reach the threshold; withdrawn when it completes", async () => {
+    const { inbox, kept } = memoryInbox();
+    const h = setup({ spend: { enabled: true, notice: { task_attempts: 3 } } }, { inbox });
+    await oneRun(h, { task: "t-hard", log: "x\n" });
+    await oneRun(h, { agent: "worker-b", task: "t-hard", log: "x\n" });
+    await h.service.tick();
+    expect(kept).toEqual([]);
+    await oneRun(h, { task: "t-hard", log: "x\n" });
+    await h.service.tick();
+    const notice = kept.find((d) => d.key.startsWith("spend_task_attempts:t-hard:"));
+    expect(notice?.request).toMatchObject({ attention: "notice", ref: expect.stringMatching(/^spend:attempts:0:t-hard$/) });
+    expect(notice?.request.question).toContain("t-hard took 3 runs");
+    await h.service.tick();
+    expect(kept.filter((d) => d.key.startsWith("spend_task_attempts:"))).toHaveLength(1);
+    await oneRun(h, { task: "t-hard", log: "x\n", line: "- DONE t-hard by worker-a 13:00Z: merged" });
+    await h.service.tick();
+    expect(notice?.status).toBe("withdrawn");
+  });
+});
+
+/** A spend row as a run of `task` that ended at `endedAt` would have it (for the retention fixtures) */
+function fixtureRow(runId: string, endedAt: number, cost: number, cls: SpendRow["class"] = "productive", reason = "done"): SpendRow {
+  return {
+    runId,
+    project: "demo",
+    agent: "worker-a",
+    task: `t-${runId}`,
+    chainId: runId,
+    origin: "fill",
+    adapter: "claude-cli",
+    provider: "provider-c",
+    model: "model-a",
+    startedAt: endedAt - 60_000,
+    endedAt,
+    runtimeS: 60,
+    class: cls,
+    reason,
+    sessionMode: "new",
+    reload: false,
+    lairRestart: false,
+    usageSource: "reported",
+    inputTokens: 10,
+    cacheWriteTokens: 0,
+    cacheReadTokens: 100,
+    outputTokens: 5,
+    tokens: 15,
+    requests: null,
+    turns: 1,
+    cost,
+    contextBytes: 100,
+    pr: null,
+    headSha: null,
+    blockerKey: null,
+    backfilled: false,
+    usageRecorded: true,
+  };
+}
+
+describe("AT-29: retention aggregates each day again before its runs go", () => {
+  it("rows past 90 days go after their day is aggregated (late rows too); aggregates past 365 days go; a second run changes nothing", async () => {
+    const paths = makePaths();
+    const store = new AgentsStore(paths.dbPath);
+    const at = (days: number) => NOW - days * DAY;
+    store.recordSpend(fixtureRow("old-1", at(400), 1), null);
+    store.recordSpend(fixtureRow("old-2", at(400) + MIN, 2), null);
+    store.recordSpend(fixtureRow("d100", at(100), 3), null);
+    store.recordSpend(fixtureRow("d101", at(101), 4), null);
+    // d101's aggregate was written before a late row of that day arrived
+    const d101 = new Date(at(101)).toISOString().slice(0, 10);
+    store.aggregateSpendDay("demo", d101, Date.parse(`${d101}T00:00:00Z`), false);
+    store.recordSpend(fixtureRow("d101-late", at(101) + 2 * MIN, 5, "no_result", "exit_unknown"), null);
+    store.recordSpend(fixtureRow("d1", at(1), 6), null);
+    store.recordSpend(fixtureRow("d0", NOW - MIN, 7), null);
+    store.close();
+
+    const h = setup(SPEND_ON, { paths });
+    await h.service.tick();
+    const look = () => {
+      const db = new Database(h.dbPath, { readonly: true });
+      try {
+        return {
+          runs: (db.prepare("SELECT run_id FROM agents_spend ORDER BY run_id").all() as { run_id: string }[]).map((r) => r.run_id),
+          daily: db.prepare("SELECT day, class, reason, runs, cost FROM agents_spend_daily ORDER BY day, class").all(),
+        };
+      } finally {
+        db.close();
+      }
+    };
+    const first = look();
+    expect(first.runs).toEqual(["d0", "d1"]);
+    const d100 = new Date(at(100)).toISOString().slice(0, 10);
+    const d1 = new Date(at(1)).toISOString().slice(0, 10);
+    expect(first.daily).toEqual([
+      { day: d101, class: "no_result", reason: "exit_unknown", runs: 1, cost: 5 },
+      { day: d101, class: "productive", reason: "done", runs: 1, cost: 4 },
+      { day: d100, class: "productive", reason: "done", runs: 1, cost: 3 },
+      { day: d1, class: "productive", reason: "done", runs: 1, cost: 6 },
+    ]);
+    // The 1-year window: the aggregates, plus today's runs (not aggregated yet): the sum of the rows within a year
+    const year = h.service.spendReport("1y", "project");
+    expect(year).toMatchObject({ source: "aggregates", totals: { runs: 5, cost: 25 } });
+    expect(year.noResult).toMatchObject({ runs: 1, cost: 5 });
+
+    // Run twice (a restart, the same day): nothing more is written or deleted
+    await h.service.tick();
+    await h.manager.stop();
+    const again = setup(SPEND_ON, { paths, clock: h.clock });
+    await again.service.tick();
+    expect(look()).toEqual(first);
+  });
+});
+
+describe("AT-34: the first enable classifies the runs of the last backfill_days", () => {
+  it("runs of the last 7 days get backfilled rows (usage none), older ones none; a second start adds nothing", async () => {
+    const paths = makePaths();
+    const NO_RESTARTS = { recovery: { same_session_restarts: 0, fresh_sessions: 0, backoff_seconds: 0, max_backoff_seconds: 0 } };
+    const off = setup(NO_RESTARTS, { paths });
+    for (let i = 0; i < 10; i++) {
+      off.clock.t = NOW - (10 - i) * DAY;
+      await oneRun(off, { task: `t-day${i}`, log: CLAUDE_RUN, exit: i === 9 ? 0 : 2, line: i === 9 ? "- DONE t-day9 by worker-a 12:01Z: merged" : undefined });
+    }
+    expect(spendRows(off)).toEqual([]);
+    await off.manager.stop();
+
+    const clock = new FakeClock();
+    const on = setup({ ...SPEND_ON, ...NO_RESTARTS }, { paths, clock });
+    await on.service.tick();
+    await on.service.tick();
+    const rows = spendRows(on);
+    expect(rows.map((r) => r.task)).toEqual(["t-day3", "t-day4", "t-day5", "t-day6", "t-day7", "t-day8", "t-day9"]);
+    for (const row of rows) expect(row).toMatchObject({ backfilled: true, usageSource: "none", tokens: null, cost: null, usageRecorded: true });
+    expect(rows[0]).toMatchObject({ class: "no_result", reason: "crashed" });
+    // Its DONE line was never recorded by Lair (no fill): not guessed, and the queue file isn't read again for it
+    expect(rows.at(-1)).toMatchObject({ class: "unclassified", reason: "not_recorded" });
+    expect(ledger(on.dbPath)).toEqual([]);
+    expect(eventsOf(on, "spend_backfill").map((e) => e.dedupeKey)).toEqual(["spend_backfill:start", "spend_backfill:done"]);
+
+    await on.manager.stop();
+    const again = setup({ ...SPEND_ON, ...NO_RESTARTS }, { paths, clock });
+    await again.service.tick();
+    expect(spendRows(again)).toEqual(rows);
   });
 });

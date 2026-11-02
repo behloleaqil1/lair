@@ -254,6 +254,8 @@ export type EventType =
   | "agents.fill_idle_notice"
   | "agents.fill_idle_resolved"
   | "agents.fill_unmatched"
+  // AI spend of the UTC day that just ended: {project, day, ...totals} (numbers, enums and task ids only)
+  | "agents.spend.daily"
   // Gate results, for triage: {project, result: GateResult, reports?, context?}
   | "gate.completed"
   // Triage (src/server/triage/)
