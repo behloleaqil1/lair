@@ -68,12 +68,13 @@ export function extractPrNumbers(reason: string): ExtractedPr[] {
 
 /** Check if a branch names the task id (case-insensitive, separator-normalized). */
 export function branchContainsTask(branch: string, taskId: string): boolean {
-  const norm = (s: string) => s.toLowerCase().replace(/[-_]/g, "/");
-  const branchParts = norm(branch).split("/");
-  const taskParts = norm(taskId).split("/");
-  // Check as consecutive path segments (exact segment match)
+  // Normalize: lowercase and treat - and _ as equivalent within a segment
+  const normSeg = (s: string) => s.toLowerCase().replace(/[_]/g, "-");
+  const branchParts = branch.toLowerCase().split("/");
+  const taskParts = taskId.toLowerCase().split("/");
+  // Match task parts as consecutive segments in the branch
   for (let i = 0; i <= branchParts.length - taskParts.length; i++) {
-    if (taskParts.every((t, j) => branchParts[i + j] === t)) return true;
+    if (taskParts.every((t, j) => normSeg(branchParts[i + j]) === normSeg(t))) return true;
   }
   return false;
 }
