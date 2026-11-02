@@ -101,7 +101,11 @@ export interface AgentRun {
   failover?: FailoverInfo;
   waitingLock?: StoredLockWait;
   pid?: number;
+  /** Process group id (for signalling the agent and its children) */
+  pgid?: number;
   pidStartedAt?: number;
+  /** A fingerprint of the start command as `ps` shows it (reconcile.ts: noted when a live pid shows another one) */
+  commandFingerprint?: string;
   requestedAt: number;
   notBefore: number;
   /** When the current attempt to start began (budget and profile waits don't count) */

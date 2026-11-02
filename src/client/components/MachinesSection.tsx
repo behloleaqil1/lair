@@ -1,25 +1,30 @@
 /**
  * Machines (the old Machines and Nodes views): the project's machines with
  * their gate runners and, with placement on, its probe of each (up since,
- * load, lanes and the jobs on them); and on the Nodes tab the lair-node
- * machines registered with this server and the scheduler. A row opens its
- * detail (#/machines/<name>, #/machines/<node id>?tab=nodes).
+ * load, lanes and the jobs on them); with cloud on, its cloud machines'
+ * power state, the spend and the money guard (read-only); and on the Nodes
+ * tab the lair-node machines registered with this server and the
+ * scheduler. A row opens its detail (#/machines/<name>,
+ * #/machines/<node id>?tab=nodes).
  */
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useApi } from "../hooks/useApi";
 import { useMachinesWebSocket } from "../hooks/useWebSocket";
-import { machineDetail, machineRows, nodeRows, type MachineRow, type NodeRow } from "../machines-view";
+import { cloudBudget, cloudState, machineDetail, machineRows, nodeRows, type MachineRow, type NodeRow } from "../machines-view";
+import { clearCloudTrip } from "../owner-actions";
 import { adviceText, eta } from "../placement-view";
 import { linkTo } from "../router";
 import type { MachineStatus } from "../../shared/types";
 import type { ListNodesResponse } from "../../shared/server-types";
 import type { PlacementStatus } from "../../shared/placement-types";
+import type { CloudBudgetStatus, CloudMachineStatus, CloudProviderSpend, CloudStatus } from "../../shared/cloud-types";
 import { DataTable, type Column } from "./DataTable";
 import { DetailPanel, DetailSection } from "./DetailPanel";
 import { SectionHeader, type SectionProps } from "./Section";
 import { usePlacement } from "./Placement";
-import { EmptyState, ErrorState, KeyValues, Loading, Time } from "./ui";
+import { EmptyState, ErrorState, KeyValues, Loading, OwnerOnlyNotice, Time, useOwnerSignedIn } from "./ui";
 import { Badge } from "../ui/Badge";
+import { Button } from "../ui/Button";
 
 const MACHINE_COLUMNS: Column<MachineRow>[] = [
   { key: "id", label: "Machine", sort: (r) => r.id, render: (r) => <strong>{r.id}</strong> },
@@ -50,10 +55,19 @@ export function MachinesSection({ project, refreshKey, route, modules, open }: S
   const restMachines = useMemo(() => machinesApi.data ?? [], [machinesApi.data]);
   const { machines: wsMachines, connected } = useMachinesWebSocket(project, restMachines);
   const placement = usePlacement(project, refreshKey, modules?.placement !== true);
+  // The cloud status is the owner's (it names the account's instances and spend)
+  const signedIn = useOwnerSignedIn(refreshKey);
+  // Bumped after the owner clears a trip, so the status is read again at once
+  const [cloudTick, setCloudTick] = useState(0);
+  const cloud = useApi<CloudStatus>("/cloud/status", project, refreshKey + cloudTick, {
+    owner: true,
+    skip: modules?.cloud !== true || signedIn !== true,
+  });
   const nodesApi = useApi<ListNodesResponse>("/nodes", "", refreshKey, { skip: route.tab !== "nodes" });
   // The WebSocket sends what GET /api/machines does; its hook types the runner lanes loosely
   const statuses = connected ? (wsMachines as MachineStatus[]) : restMachines;
-  const rows = useMemo(() => machineRows(statuses, placement.data), [statuses, placement.data]);
+  const rows = useMemo(() => machineRows(statuses, placement.data, cloud.data), [statuses, placement.data, cloud.data]);
+  const budget = cloudBudget(cloud.data);
   const nodes = nodeRows(nodesApi.data?.nodes ?? []);
 
   const body = () => {
@@ -94,6 +108,9 @@ export function MachinesSection({ project, refreshKey, route, modules, open }: S
     if (machinesApi.error && !machinesApi.data) return <ErrorState what="machines" error={machinesApi.error} />;
     return (
       <div className="card">
+        {modules?.cloud === true && signedIn === false && <OwnerOnlyNotice text="Cloud machines and their spend are shown to the owner only." />}
+        {budget && <p className="muted small">Money guard: {budget.reason}</p>}
+        {cloud.data && cloud.data.errors.length > 0 && <p className="muted small">Cloud config: {cloud.data.errors.join("; ")}</p>}
         <DataTable
           label="Machines"
           columns={MACHINE_COLUMNS}
@@ -111,10 +128,23 @@ export function MachinesSection({ project, refreshKey, route, modules, open }: S
     <div>
       <SectionHeader title="Machines" section="machines" route={route} modules={modules}>
         {placement.data?.enabled && <span className="muted small">Placement: {placement.data.mode ?? "off"}</span>}
+        {budget && (
+          <Badge tone={budget.badge} title={budget.reason}>
+            {budget.text}
+          </Badge>
+        )}
       </SectionHeader>
       {body()}
       {route.detail && route.tab !== "nodes" && (
-        <MachineDetailPanel id={route.detail} rows={rows} placement={placement.data} onClose={() => open(null)} />
+        <MachineDetailPanel
+          id={route.detail}
+          rows={rows}
+          placement={placement.data}
+          budget={cloud.data?.enabled ? cloud.data.budget : null}
+          project={project}
+          onTripCleared={() => setCloudTick((t) => t + 1)}
+          onClose={() => open(null)}
+        />
       )}
       {route.detail && route.tab === "nodes" && (
         <NodeDetailPanel id={route.detail} rows={nodes} loading={nodesApi.loading} onClose={() => open(null)} />
@@ -127,11 +157,17 @@ function MachineDetailPanel({
   id,
   rows,
   placement,
+  budget,
+  project,
+  onTripCleared,
   onClose,
 }: {
   id: string;
   rows: MachineRow[];
   placement: PlacementStatus | null;
+  budget: CloudBudgetStatus | null;
+  project: string;
+  onTripCleared: () => void;
   onClose: () => void;
 }) {
   const model = machineDetail(id, rows, placement);
@@ -169,6 +205,7 @@ function MachineDetailPanel({
           />
         </DetailSection>
       )}
+      {row.cloud && <CloudMachineDetail machine={row.cloud} budget={budget} project={project} onTripCleared={onTripCleared} />}
       {lanes.length > 0 && (
         <DetailSection title="Lanes">
           <ul className="plain-list">
@@ -210,6 +247,106 @@ function MachineDetailPanel({
         </DetailSection>
       )}
     </DetailPanel>
+  );
+}
+
+function money(amount: number | null): string | null {
+  return amount === null ? null : `$${amount.toFixed(2)}`;
+}
+
+function providerReading(r: CloudProviderSpend): string {
+  if (r.state === "amount") {
+    const lag = r.dataUntil && r.meterSince !== null ? ` (its data ends ${r.dataUntil}; + ${money(r.meterSince)} metered since)` : "";
+    return `${money(r.amount) ?? "-"}${lag}`;
+  }
+  if (r.state === "unknown") return `no data yet (${r.detail ?? "the provider has none"})`;
+  if (r.state === "error") return `failed: ${r.detail ?? "no detail"}`;
+  return r.detail ?? "not read yet";
+}
+
+/** A cloud machine's provider state, and the project's spend and money guard; the owner clears a trip here */
+function CloudMachineDetail({
+  machine,
+  budget,
+  project,
+  onTripCleared,
+}: {
+  machine: CloudMachineStatus;
+  budget: CloudBudgetStatus | null;
+  project: string;
+  onTripCleared: () => void;
+}) {
+  const meter = budget?.meter ?? null;
+  const trip = budget?.guard.trip ?? null;
+  const [clearing, setClearing] = useState(false);
+  const [clearError, setClearError] = useState<string | null>(null);
+  const clear = async () => {
+    if (!trip || !budget) return;
+    const question =
+      `Clear the money guard's trip of ${trip.at}? Starts are allowed again only while the spend stays under the limit ` +
+      `(${money(budget.limit)} now): if it is still reached, raise cloud.budget.limit and the provider's budget first, or the guard trips again.`;
+    if (!window.confirm(question)) return;
+    setClearing(true);
+    setClearError(null);
+    try {
+      const answer = await clearCloudTrip(project, trip.at);
+      if (answer.success) onTripCleared();
+      else setClearError(answer.error ?? "Not cleared");
+    } catch (e) {
+      setClearError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setClearing(false);
+    }
+  };
+  return (
+    <>
+      <DetailSection title="Cloud machine">
+        <KeyValues
+          rows={[
+            ["Provider", `${machine.provider}, ${machine.region}`],
+            ["Instance", `${machine.instanceId} (tag ${machine.tag})`],
+            ["Power state", cloudState(machine)],
+            ["Launched", machine.launchedAt ? <Time iso={machine.launchedAt} /> : null],
+            ["Stopped", machine.stoppedAt ? <Time iso={machine.stoppedAt} /> : null],
+            ["Price", `${money(machine.pricePerHour)}/hour, storage ${money(machine.storagePerMonth)}/month`],
+            ["Last check", machine.lastCheckAt ? <Time iso={machine.lastCheckAt} /> : null],
+            ["Last error", machine.lastError],
+          ]}
+        />
+      </DetailSection>
+      {budget && (
+        <DetailSection title="Spend and money guard">
+          <KeyValues
+            rows={[
+              ["Guard", `${budget.guard.state}: ${budget.guard.reason}`],
+              ["Spend", budget.spend === null ? "unknown" : `${money(budget.spend)} of ${money(budget.limit)}`],
+              ["Period", `${budget.period.start} to ${budget.period.end}`],
+              [
+                "Meter",
+                meter
+                  ? `${money(meter.total)} (compute ${money(meter.compute)}, storage ${money(meter.storage)}, start ${money(meter.start)}); today ${money(meter.today)}`
+                  : budget.meterError,
+              ],
+              ...budget.provider.map((r): [string, string] => [`Provider (${r.profile})`, providerReading(r)]),
+              [
+                "Tripped",
+                trip ? `${money(trip.spend)} on ${trip.at} (limit ${money(trip.limit)}, ${trip.period.start} to ${trip.period.end})` : null,
+              ],
+              ["Checked", budget.guard.checkedAt ? <Time iso={budget.guard.checkedAt} /> : null],
+            ]}
+          />
+          {trip && (
+            <p>
+              <Button size="sm" variant="danger" disabled={clearing} onClick={() => void clear()}>
+                Clear the trip
+              </Button>{" "}
+              <span className="muted small">Only you clear it; a higher limit or a new period alone does not.</span>
+            </p>
+          )}
+          {clearError && <p className="error">{clearError}</p>}
+        </DetailSection>
+      )}
+    </>
   );
 }
 

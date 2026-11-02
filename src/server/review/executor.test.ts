@@ -145,7 +145,7 @@ describe("email allow-list", () => {
   it("matches globs case-insensitively and masks what it reports", () => {
     expect(emailAllowed("12345+Name@Users.Noreply.GitHub.com", ALLOWED)).toBe(true);
     expect(emailAllowed("agents@example.com", ALLOWED)).toBe(true);
-    expect(emailAllowed("agents@example.com.evil", ALLOWED)).toBe(false);
+    expect(emailAllowed("agents@example.com.invalid", ALLOWED)).toBe(false);
     expect(emailAllowed("", ALLOWED)).toBe(false);
     expect(maskEmail("someone@private.example")).toBe("s***@private.example");
   });

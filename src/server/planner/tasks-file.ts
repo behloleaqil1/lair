@@ -15,7 +15,8 @@ const MAX_NAME_CHARS = 64;
 
 export interface TaskLine {
   line: number;
-  agent: string;
+  /** null: an unassigned line (`|<name>|<task>|<description>`), ready work for any agent; `reassign` gives it one */
+  agent: string | null;
   name: string;
   task: string;
   description: string;
@@ -25,7 +26,7 @@ export interface TasksDoc {
   text: string;
   hash: string;
   rows: string[];
-  /** Open tasks: fill's task lines */
+  /** Open tasks: fill's task lines, unassigned ones included (so ids aren't reused, and they count toward fill's cap) */
   tasks: TaskLine[];
   /** Done tasks: lines marked with done_marker (task -> line) */
   done: Map<string, number>;
@@ -70,7 +71,7 @@ export function parseTasksDoc(text: string, doneMarker: string, onePerAgent = fa
   return { text, hash: sha256(text), rows, tasks, done, malformed, onePerAgent };
 }
 
-/** A line's fields as fill reads them: no "|" in the first three, the description one line. */
+/** A line's fields as fill reads them: no "|" in the first three, the description one line. An empty agent is unassigned. */
 export function renderLine(agent: string, name: string, task: string, description: string): string {
   const safeName = clean(name, MAX_NAME_CHARS).replace(/\|/g, "/") || agent;
   return `${agent}|${safeName}|${task}|${clean(description, MAX_DESCRIPTION_CHARS)}`;
@@ -122,7 +123,8 @@ export function applyEdit(doc: TasksDoc, edit: TaskEdit, doneMarker: string): Ed
         rows[found.line - 1] = after;
         break;
       case "reword":
-        after = renderLine(found.agent, found.name, found.task, edit.description);
+        // An unassigned line stays unassigned (an empty agent field)
+        after = renderLine(found.agent ?? "", found.name, found.task, edit.description);
         rows[found.line - 1] = after;
         break;
     }

@@ -1,22 +1,16 @@
 /**
  * Data service - reads files from the configured project paths
  * All operations are READ-ONLY
+ *
+ * Every read is asynchronous and bounded (issue #245): the routes that call
+ * these run on the event loop, and a synchronous listing of a folder of
+ * thousands of logs or results, or a status command waited for in-line,
+ * stalled every request and timer for seconds on a busy machine.
  */
-import {
-  readFileSync,
-  existsSync,
-  readdirSync,
-  statSync,
-  lstatSync,
-  openSync,
-  fstatSync,
-  readSync,
-  closeSync,
-  constants,
-} from "fs";
+import { exec, execFile } from "child_process";
 import { join } from "path";
-import { execSync, execFileSync } from "child_process";
 import { noteCommandTimeout } from "../core/command-timeouts.js";
+import { listDir, lstatOrNull, mapLimit, readSmallFile, readTail as readTailFile, SingleFlight, statOrNull } from "./async-fs.js";
 import type {
   ProjectConfig,
   Dragon,
@@ -61,51 +55,36 @@ import { mergeDragonRegistry } from "./dragon-registry.js";
 import { DEFAULT_TAIL_LINES, readLogTail } from "./log-tail.js";
 import type { LogTailView } from "../../shared/dashboard-types.js";
 
-/**
- * Safe file read - returns null if file doesn't exist
- */
-function safeReadFile(path: string): string | null {
-  try {
-    if (!existsSync(path)) return null;
-    return readFileSync(path, "utf-8");
-  } catch {
-    return null;
-  }
+/** The most a small file (dragons.txt, a pid file) may hold to be read */
+const SMALL_FILE_BYTES = 1024 * 1024;
+/** The end of the queue file read when no queue cache is given (tests and one-off tools) */
+const QUEUE_TAIL_BYTES = 4 * 1024 * 1024;
+/** Result codes read at once */
+const READ_CONCURRENCY = 16;
+
+/** A small file's text, or null when it is missing, unreadable or larger than SMALL_FILE_BYTES. */
+function safeReadFile(path: string): Promise<string | null> {
+  return readSmallFile(path, SMALL_FILE_BYTES);
 }
 
 /**
- * Safe directory list - returns empty array if dir doesn't exist
+ * Run a read-only command WITHOUT a shell, asynchronously. Arguments are
+ * passed as argv, so values from config, files or requests can never be
+ * parsed as shell syntax. Returns stdout, or null if the command fails, is
+ * missing, or runs past `timeoutMs` (it is then killed).
  */
-function safeListDir(path: string): string[] {
-  try {
-    if (!existsSync(path)) return [];
-    return readdirSync(path);
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Run a read-only command WITHOUT a shell. Arguments are passed as argv, so
- * values from config, files or requests can never be parsed as shell syntax.
- * Returns stdout, or null if the command fails or is missing.
- */
-function safeExecFile(
-  file: string,
-  args: string[],
-  timeoutMs = 5000,
-): string | null {
-  try {
-    return execFileSync(file, args, {
-      timeout: timeoutMs,
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "ignore"],
+function safeExecFile(file: string, args: string[], timeoutMs = 5000): Promise<string | null> {
+  return new Promise((resolve) => {
+    const child = execFile(file, args, { timeout: timeoutMs, killSignal: "SIGKILL", encoding: "utf-8" }, (error, stdout) => {
+      if (!error) return resolve(stdout);
+      // The supervisor's command_timeouts check counts the status commands that time out
+      const e = error as NodeJS.ErrnoException & { killed?: boolean };
+      if (e.killed && e.code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") noteCommandTimeout("status", file);
+      resolve(null);
     });
-  } catch (e) {
-    // The supervisor's command_timeouts check counts the status commands that time out
-    if ((e as NodeJS.ErrnoException).code === "ETIMEDOUT") noteCommandTimeout("status", file);
-    return null;
-  }
+    // Nothing is written to it (stdin was "ignore")
+    child.stdin?.end();
+  });
 }
 
 /**
@@ -113,16 +92,13 @@ function safeExecFile(
  * whose value IS a shell command written by the user in their own project
  * config. Never pass file- or request-derived values here.
  */
-function safeExecShell(cmd: string, timeoutMs = 5000): string | null {
-  try {
-    return execSync(cmd, {
-      timeout: timeoutMs,
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-  } catch {
-    return null;
-  }
+function safeExecShell(cmd: string, timeoutMs = 5000): Promise<string | null> {
+  return new Promise((resolve) => {
+    const child = exec(cmd, { timeout: timeoutMs, killSignal: "SIGKILL", encoding: "utf-8" }, (error, stdout) =>
+      resolve(error ? null : stdout),
+    );
+    child.stdin?.end();
+  });
 }
 
 /** Gate ids are file-name stems: no path separators, no leading dot. */
@@ -143,8 +119,8 @@ export function parsePidFile(content: string | null): string | null {
 }
 
 /** True if a process with this (validated) PID exists. */
-function isPidRunning(pid: string): boolean {
-  return safeExecFile("ps", ["-p", pid, "-o", "pid="]) !== null;
+async function isPidRunning(pid: string): Promise<boolean> {
+  return (await safeExecFile("ps", ["-p", pid, "-o", "pid="])) !== null;
 }
 
 /** How many of a dragon's newest logs (by name) are checked for the newest by mtime */
@@ -164,30 +140,13 @@ const CLOCK_SKEW_MS = 5 * 60 * 1000;
  * The last `maxBytes` of a regular file as UTF-8, or null. Opened without
  * blocking, so a FIFO planted where a log should be can't hang the server.
  */
-function readTail(path: string, maxBytes: number): string | null {
-  let fd: number | null = null;
-  try {
-    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
-    const stat = fstatSync(fd);
-    if (!stat.isFile()) return null;
-    const length = Math.min(stat.size, maxBytes);
-    const buffer = Buffer.alloc(length);
-    const read = readSync(fd, buffer, 0, length, stat.size - length);
-    return buffer.subarray(0, read).toString("utf-8");
-  } catch {
-    return null;
-  } finally {
-    if (fd !== null) closeSync(fd);
-  }
+async function readTail(path: string, maxBytes: number): Promise<string | null> {
+  return (await readTailFile(path, maxBytes))?.text ?? null;
 }
 
 /** True for a regular file at `path` itself (a symlink is not one). */
-function isRegularFile(path: string): boolean {
-  try {
-    return lstatSync(path).isFile();
-  } catch {
-    return false;
-  }
+async function isRegularFile(path: string): Promise<boolean> {
+  return (await lstatOrNull(path))?.isFile() === true;
 }
 
 /** A dragon's log: `<id>.log`, or `<id>-<UTC stamp>...log` (as the agents module and launchers name them). */
@@ -203,29 +162,45 @@ export interface DataServiceOptions {
    * for this project): such a dragon is running, "managed by Lair"
    */
   managedRuns?: () => Map<string, ManagedRunInfo>;
+  /**
+   * The project's parsed queue file, kept in memory (QueueCache). Without it
+   * the file is read and parsed on each call, which only tests and one-off
+   * tools do: the server always passes it.
+   */
+  queue?: () => QueueLine[];
 }
 
 export class DataService {
+  /** Concurrent requests share one listing of a folder (and one read of the result codes) */
+  private readonly flight = new SingleFlight<unknown>();
+
   constructor(
     private config: ProjectConfig,
     private options: DataServiceOptions = {},
   ) {}
 
-  // ============ QUEUE ============
-
-  getQueueLines(): QueueLine[] {
-    const content = safeReadFile(this.config.queue_file);
-    if (!content) return [];
-    return parseQueueFile(content);
+  /** A folder's names ([] when it is missing), one listing at a time per folder. */
+  private listDir(path: string): Promise<string[]> {
+    return this.flight.run(`list:${path}`, () => listDir(path)) as Promise<string[]>;
   }
 
-  getQueueLinesByType(types: string[]): QueueLine[] {
-    const lines = this.getQueueLines();
+  // ============ QUEUE ============
+
+  async getQueueLines(): Promise<QueueLine[]> {
+    if (this.options.queue) return this.options.queue();
+    const read = await readTailFile(this.config.queue_file, QUEUE_TAIL_BYTES);
+    if (!read?.text) return [];
+    // A window that starts inside the file starts inside a line: that one is dropped
+    return parseQueueFile(read.partial ? read.text.slice(read.text.indexOf("\n") + 1) : read.text);
+  }
+
+  async getQueueLinesByType(types: string[]): Promise<QueueLine[]> {
+    const lines = await this.getQueueLines();
     return filterByType(lines, types as QueueLineType[]);
   }
 
-  getQueueLinesByAgent(agentId: string): QueueLine[] {
-    const lines = this.getQueueLines();
+  async getQueueLinesByAgent(agentId: string): Promise<QueueLine[]> {
+    const lines = await this.getQueueLines();
     return filterByAgent(lines, agentId);
   }
 
@@ -241,8 +216,8 @@ export class DataService {
    * - model and adapter: its own (YAML dragons:), else dragon_defaults';
    *   modelFromDefault says which.
    */
-  getDragons(): Dragon[] {
-    const content = safeReadFile(join(this.config.agents_dir, "dragons.txt")) ?? "";
+  async getDragons(): Promise<Dragon[]> {
+    const content = (await safeReadFile(join(this.config.agents_dir, "dragons.txt"))) ?? "";
     const listed = parseDragonsFile(content);
     // The YAML dragons: with dragons.txt, dragon_defaults applied (as start/stop and the agents module see them)
     const registry = mergeDragonRegistry(this.config, content);
@@ -259,7 +234,7 @@ export class DataService {
     }
     if (listed.length === 0) return [];
 
-    const entries = safeListDir(this.config.agents_dir);
+    const entries = await this.listDir(this.config.agents_dir);
     const runningDirs = entries.filter((d) => d.endsWith(".running"));
     const logFiles = entries.filter((f) => f.endsWith(".log"));
     const logsByDragon = matchLogsToDragons(
@@ -267,14 +242,14 @@ export class DataService {
       listed.map((d) => d.id),
     );
 
-    const queueLines = this.getQueueLines();
-    const gateResults = this.getGateResultsMap();
+    const queueLines = await this.getQueueLines();
+    const gateResults = await this.getGateResultsMap();
 
-    return listed.map((d) => {
+    return mapLimit(listed, 4, async (d) => {
       const run = managed.get(d.id);
-      const newest = this.newestLog(logsByDragon.get(d.id) || []);
+      const newest = await this.newestLog(logsByDragon.get(d.id) || []);
       const parsed = newest
-        ? parseLogLastLine(readTail(newest.path, DRAGON_LOG_TAIL_BYTES) ?? "")
+        ? parseLogLastLine((await readTail(newest.path, DRAGON_LOG_TAIL_BYTES)) ?? "")
         : null;
 
       const queueStats = calculateAgentStats(queueLines, d.id);
@@ -318,24 +293,22 @@ export class DataService {
    * looked at (their names carry a UTC stamp), so a directory of old logs
    * costs no more than a handful of stats.
    */
-  private newestLog(files: string[]): { path: string; mtimeMs: number; mtime: Date } | null {
+  private async newestLog(files: string[]): Promise<{ path: string; mtimeMs: number; mtime: Date } | null> {
+    const paths = [...files].sort().reverse().slice(0, LOG_CANDIDATES).map((file) => join(this.config.agents_dir, file));
+    // Gone since the listing: null
+    const stats = await mapLimit(paths, 4, statOrNull);
     let newest: { path: string; mtimeMs: number; mtime: Date } | null = null;
-    for (const file of [...files].sort().reverse().slice(0, LOG_CANDIDATES)) {
-      const path = join(this.config.agents_dir, file);
-      try {
-        const stat = statSync(path);
-        if (stat.isFile() && (newest === null || stat.mtimeMs > newest.mtimeMs)) {
-          newest = { path, mtimeMs: stat.mtimeMs, mtime: stat.mtime };
-        }
-      } catch {
-        // Gone since the listing
+    for (let i = 0; i < paths.length; i++) {
+      const stat = stats[i];
+      if (stat?.isFile() && (newest === null || stat.mtimeMs > newest.mtimeMs)) {
+        newest = { path: paths[i], mtimeMs: stat.mtimeMs, mtime: stat.mtime };
       }
     }
     return newest;
   }
 
-  getDragonById(id: string): Dragon | null {
-    const dragons = this.getDragons();
+  async getDragonById(id: string): Promise<Dragon | null> {
+    const dragons = await this.getDragons();
     return dragons.find((d) => d.id === id) || null;
   }
 
@@ -343,67 +316,67 @@ export class DataService {
    * The path of a dragon's newest log by mtime (`<id>.log` or
    * `<id>-<UTC>.log` in agents_dir), or null without one.
    */
-  getDragonLogPath(id: string): string | null {
-    const logs = safeListDir(this.config.agents_dir).filter((f) => isLogOf(f, id));
-    return this.newestLog(logs)?.path ?? null;
+  async getDragonLogPath(id: string): Promise<string | null> {
+    const logs = (await this.listDir(this.config.agents_dir)).filter((f) => isLogOf(f, id));
+    return (await this.newestLog(logs))?.path ?? null;
   }
 
   /** The bounded tail of a dragon's newest log (services/log-tail.ts), or null without one. */
-  getDragonLogTail(id: string, lines = DEFAULT_TAIL_LINES): LogTailView | null {
-    const path = this.getDragonLogPath(id);
+  async getDragonLogTail(id: string, lines = DEFAULT_TAIL_LINES): Promise<LogTailView | null> {
+    const path = await this.getDragonLogPath(id);
     return path ? readLogTail(path, lines) : null;
   }
 
   // ============ GATES ============
 
-  getGateQueue(): Gate[] {
+  async getGateQueue(): Promise<Gate[]> {
     const queueDir = join(this.config.gates_dir, "queue");
-    const files = safeListDir(queueDir).filter(
+    const files = (await this.listDir(queueDir)).filter(
       (f) => f.endsWith(".req") || f.includes(".req."),
     );
     return parseGateFiles(files);
   }
 
-  getGatesByStatus(status: string): Gate[] {
-    const gates = this.getGateQueue();
+  async getGatesByStatus(status: string): Promise<Gate[]> {
+    const gates = await this.getGateQueue();
     return gates.filter((g) => g.status === status);
   }
 
-  getRunningGates(): Gate[] {
-    const gates = this.getGateQueue();
-    return gates
-      .filter((g) => g.status === "running")
-      .map((gate) => {
-        // Try to read current step from log: <lane>.<priority>.<gate-id>.log
-        const logPath = join(
-          this.config.gates_dir,
-          "queue",
-          `${gate.lane}.${gate.priority}.${gate.id}.log`,
-        );
-        const content = readTail(logPath, RESULT_LOG_TAIL_BYTES);
-        if (content) {
-          const { currentStep } = parseGateLog(content);
-          return { ...gate, currentStep };
-        }
-        return gate;
-      });
+  async getRunningGates(): Promise<Gate[]> {
+    const gates = await this.getGateQueue();
+    return mapLimit(gates.filter((g) => g.status === "running"), 4, async (gate) => {
+      // Try to read current step from log: <lane>.<priority>.<gate-id>.log
+      const logPath = join(this.config.gates_dir, "queue", `${gate.lane}.${gate.priority}.${gate.id}.log`);
+      const content = await readTail(logPath, RESULT_LOG_TAIL_BYTES);
+      if (content) {
+        const { currentStep } = parseGateLog(content);
+        return { ...gate, currentStep };
+      }
+      return gate;
+    });
   }
 
-  getGateResultsMap(): Map<string, number> {
+  /** Every result code in gates_dir/results by gate id; concurrent callers share one read. */
+  getGateResultsMap(): Promise<Map<string, number>> {
+    return this.flight.run("results-map", () => this.readGateResultsMap()) as Promise<Map<string, number>>;
+  }
+
+  private async readGateResultsMap(): Promise<Map<string, number>> {
     const resultsDir = join(this.config.gates_dir, "results");
-    const files = safeListDir(resultsDir).filter((f) => f.endsWith(".rc"));
+    const files = (await this.listDir(resultsDir)).filter((f) => f.endsWith(".rc"));
+    const contents = await mapLimit(files, READ_CONCURRENCY, (file) => safeReadFile(join(resultsDir, file)));
 
     const results = new Map<string, number>();
-    for (const file of files) {
+    files.forEach((file, i) => {
       const id = file.replace(".rc", "");
-      const content = safeReadFile(join(resultsDir, file));
+      const content = contents[i];
       if (content) {
         const rc = parseGateRc(content);
         if (rc !== null) {
           results.set(id, rc);
         }
       }
-    }
+    });
     return results;
   }
 
@@ -413,31 +386,29 @@ export class DataService {
    * returned as finishedAt; one more than a few minutes in the future (a
    * clock ahead, a copied file) is not counted as recent.
    */
-  getRecentGateResults(
+  async getRecentGateResults(
     hours = 24,
     limit = RECENT_RESULTS_LIMIT,
     now = Date.now(),
-  ): GateResult[] {
+  ): Promise<GateResult[]> {
     const resultsDir = join(this.config.gates_dir, "results");
     const span =
       Number.isFinite(hours) && hours > 0 ? Math.min(hours, MAX_RESULT_HOURS) : 24;
     const cutoff = now - span * 60 * 60 * 1000;
     const latest = now + CLOCK_SKEW_MS;
 
-    const recent: { id: string; rcPath: string; mtimeMs: number; mtime: Date }[] = [];
-    for (const file of safeListDir(resultsDir)) {
-      if (!file.endsWith(".rc")) continue;
+    const candidates = (await this.listDir(resultsDir)).flatMap((file) => {
+      if (!file.endsWith(".rc")) return [];
       const id = file.slice(0, -".rc".length);
-      if (!isSafeGateId(id)) continue;
-      const rcPath = join(resultsDir, file);
-      try {
-        const stat = statSync(rcPath);
-        if (!stat.isFile() || stat.mtimeMs < cutoff || stat.mtimeMs > latest) continue;
-        recent.push({ id, rcPath, mtimeMs: stat.mtimeMs, mtime: stat.mtime });
-      } catch {
-        continue;
-      }
-    }
+      return isSafeGateId(id) ? [{ id, rcPath: join(resultsDir, file) }] : [];
+    });
+    const stats = await mapLimit(candidates, READ_CONCURRENCY, ({ rcPath }) => statOrNull(rcPath));
+    const recent: { id: string; rcPath: string; mtimeMs: number; mtime: Date }[] = [];
+    candidates.forEach(({ id, rcPath }, i) => {
+      const stat = stats[i];
+      if (!stat || !stat.isFile() || stat.mtimeMs < cutoff || stat.mtimeMs > latest) return;
+      recent.push({ id, rcPath, mtimeMs: stat.mtimeMs, mtime: stat.mtime });
+    });
     // Newest first; for the same time, the later id first
     recent.sort(
       (a, b) => b.mtimeMs - a.mtimeMs || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0),
@@ -446,10 +417,10 @@ export class DataService {
     const results: GateResult[] = [];
     for (const { id, rcPath, mtime } of recent) {
       if (results.length >= limit) break;
-      const rc = parseGateRc(readTail(rcPath, 1024) ?? "");
+      const rc = parseGateRc((await readTail(rcPath, 1024)) ?? "");
       if (rc === null) continue;
 
-      const logContent = readTail(join(resultsDir, `${id}.log`), RESULT_LOG_TAIL_BYTES);
+      const logContent = await readTail(join(resultsDir, `${id}.log`), RESULT_LOG_TAIL_BYTES);
       const { failedSteps } = logContent
         ? parseGateLog(logContent)
         : { failedSteps: [] };
@@ -472,51 +443,58 @@ export class DataService {
    * without one). The id comes from a URL (Fastify decodes %2F), so it must
    * be a safe file-name stem that can't name a path outside gates_dir.
    */
-  getGateRecord(id: string): {
+  async getGateRecord(id: string): Promise<{
     gate: Gate | null;
     result: { rc: number; finishedAt: string } | null;
     logPath: string | null;
-  } {
+  }> {
     if (!isSafeGateId(id)) {
       throw new Error("Invalid gate id");
     }
-    const gate = this.getGateQueue().find((g) => g.id === id) ?? null;
+    const gate = (await this.getGateQueue()).find((g) => g.id === id) ?? null;
     const resultsDir = join(this.config.gates_dir, "results");
     let result: { rc: number; finishedAt: string } | null = null;
     const rcPath = join(resultsDir, `${id}.rc`);
-    if (isRegularFile(rcPath)) {
-      const rc = parseGateRc(readTail(rcPath, 1024) ?? "");
-      if (rc !== null) result = { rc, finishedAt: statSync(rcPath).mtime.toISOString() };
+    const rcStat = await lstatOrNull(rcPath);
+    if (rcStat?.isFile()) {
+      const rc = parseGateRc((await readTail(rcPath, 1024)) ?? "");
+      if (rc !== null) result = { rc, finishedAt: rcStat.mtime.toISOString() };
     }
 
     const queueDir = join(this.config.gates_dir, "queue");
     const candidates = [join(resultsDir, `${id}.log`)];
     if (gate) candidates.push(join(queueDir, `${gate.lane}.${gate.priority}.${id}.log`));
-    for (const file of safeListDir(queueDir)) {
+    for (const file of await this.listDir(queueDir)) {
       if (file.endsWith(`.${id}.log`)) candidates.push(join(queueDir, file));
     }
-    const logPath = candidates.find((path) => isRegularFile(path)) ?? null;
+    let logPath: string | null = null;
+    for (const path of candidates) {
+      if (await isRegularFile(path)) {
+        logPath = path;
+        break;
+      }
+    }
     return { gate, result, logPath };
   }
 
   /** The bounded tail of a gate's log (services/log-tail.ts), or null without one. */
-  getGateLogTail(id: string, lines = DEFAULT_TAIL_LINES): LogTailView | null {
-    const { logPath } = this.getGateRecord(id);
+  async getGateLogTail(id: string, lines = DEFAULT_TAIL_LINES): Promise<LogTailView | null> {
+    const { logPath } = await this.getGateRecord(id);
     return logPath ? readLogTail(logPath, lines) : null;
   }
 
   /** The end of a gate's log as text (at most RESULT_LOG_TAIL_BYTES), to read its steps; null without one. */
-  getGateLogText(id: string): string | null {
-    const { logPath } = this.getGateRecord(id);
+  async getGateLogText(id: string): Promise<string | null> {
+    const { logPath } = await this.getGateRecord(id);
     return logPath ? readTail(logPath, RESULT_LOG_TAIL_BYTES) : null;
   }
 
   // ============ PRs ============
 
-  getPullRequests(): PullRequest[] {
+  async getPullRequests(): Promise<PullRequest[]> {
     if (!this.config.github) return [];
 
-    const output = safeExecFile(
+    const output = await safeExecFile(
       "gh",
       [
         "pr",
@@ -541,7 +519,7 @@ export class DataService {
         updatedAt: string;
       }
       const prs = JSON.parse(output) as GhPr[];
-      const gateResults = this.getGateResultsMap();
+      const gateResults = await this.getGateResultsMap();
 
       return prs.map((pr) => {
         // Find latest gate for this head sha
@@ -582,7 +560,7 @@ export class DataService {
 
   // ============ MACHINES ============
 
-  getMachineStatuses(): MachineStatus[] {
+  async getMachineStatuses(): Promise<MachineStatus[]> {
     const statuses: MachineStatus[] = [];
 
     for (const [, machine] of Object.entries(this.config.machines || {})) {
@@ -592,7 +570,7 @@ export class DataService {
         up = true; // Local is always up if we're running
       } else if (machine.type === "ssh" && machine.ssh_cmd) {
         // Legacy key: ssh_cmd is a shell command the user wrote in their config
-        const result = safeExecShell(machine.ssh_cmd, 10000);
+        const result = await safeExecShell(machine.ssh_cmd, 10000);
         up = result?.trim() === "up";
       }
 
@@ -603,12 +581,12 @@ export class DataService {
         for (const lane of ["heavy", "light", "remote"] as const) {
           // Pid files are written by gate runners (and anything else that can
           // write gates_dir), so treat their content as untrusted
-          const content = safeReadFile(
+          const content = await safeReadFile(
             join(this.config.gates_dir, `runner-${lane}.pid`),
           );
           if (!content) continue;
           const pid = parsePidFile(content);
-          runners.push({ lane, running: pid !== null && isPidRunning(pid) });
+          runners.push({ lane, running: pid !== null && (await isPidRunning(pid)) });
         }
       }
 
@@ -626,18 +604,18 @@ export class DataService {
 
   // ============ ORCHESTRATOR ============
 
-  getOrchestratorStatus(): OrchestratorStatus {
-    const queueLines = this.getQueueLines();
+  async getOrchestratorStatus(): Promise<OrchestratorStatus> {
+    const queueLines = await this.getQueueLines();
     const tickLines = getTickLines(queueLines, 30);
 
     const stopPath = join(this.config.agents_dir, "STOP");
-    const stopFileExists = existsSync(stopPath);
+    const stopFileExists = (await statOrNull(stopPath)) !== null;
 
     let launchdLoaded = false;
     if (this.config.orchestrator?.launchd_label) {
       const uid = process.getuid?.();
       if (uid !== undefined) {
-        const result = safeExecFile("launchctl", [
+        const result = await safeExecFile("launchctl", [
           "print",
           `gui/${uid}/${this.config.orchestrator.launchd_label}`,
         ]);
@@ -654,14 +632,14 @@ export class DataService {
 
   // ============ OVERVIEW ============
 
-  getOverview(): OverviewData {
+  async getOverview(): Promise<OverviewData> {
     const problems: Problem[] = [];
 
     // Get main head
     let mainHead = "unknown";
     let mainDate = "unknown";
 
-    const gitLog = safeExecFile("git", [
+    const gitLogRead = safeExecFile("git", [
       "-C",
       this.config.repo,
       "log",
@@ -669,14 +647,9 @@ export class DataService {
       "--format=%H %ci",
       "origin/main",
     ]);
-    if (gitLog) {
-      const parts = gitLog.trim().split(" ");
-      mainHead = parts[0]?.slice(0, 8) || "unknown";
-      mainDate = parts.slice(1).join(" ") || "unknown";
-    }
 
-    // Get recent merges
-    const mergesOutput = this.config.github
+    // Get recent merges (both commands run at once)
+    const mergesRead = this.config.github
       ? safeExecFile(
           "gh",
           [
@@ -694,6 +667,12 @@ export class DataService {
           15000,
         )
       : null;
+    const [gitLog, mergesOutput] = await Promise.all([gitLogRead, mergesRead]);
+    if (gitLog) {
+      const parts = gitLog.trim().split(" ");
+      mainHead = parts[0]?.slice(0, 8) || "unknown";
+      mainDate = parts.slice(1).join(" ") || "unknown";
+    }
 
     let recentMerges: MergedPR[] = [];
     if (mergesOutput) {
@@ -714,8 +693,8 @@ export class DataService {
     }
 
     // Check for problems
-    const gates = this.getGateQueue();
-    const dragons = this.getDragons();
+    const gates = await this.getGateQueue();
+    const dragons = await this.getDragons();
 
     // Stale runs (> 2 hours)
     for (const gate of gates) {
@@ -762,7 +741,7 @@ export class DataService {
 
     // No runner for lane with queued gates: the lanes a machine's runners can serve
     const byLane = groupByLane(gates);
-    const machines = this.getMachineStatuses();
+    const machines = await this.getMachineStatuses();
     const localMachine = machines.find((m) => m.type === "local");
 
     for (const lane of ["heavy", "light", "remote"] as const) {

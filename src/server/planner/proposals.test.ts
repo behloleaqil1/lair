@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 import type { BlockedClass } from "../../shared/planner-types.js";
 import { checkProposals, type CheckContext } from "./proposals.js";
-import { parseTasksDoc } from "./tasks-file.js";
+import { applyEdit, findTask, parseTasksDoc } from "./tasks-file.js";
 
 const DOC = parseTasksDoc(
   ["# agent|name|task|description", "worker-a|Alice|feat-cart|Cart", "worker-b|Bob|feat-search|Search page", ""].join("\n"),
@@ -68,5 +68,50 @@ describe("unblock and reword of blocked tasks", () => {
     expect(refusalOf({ op: "drop", task: "feat-search", reason: "superseded" }, busy)).toContain("drop it once that run ends");
     expect(refusalOf({ op: "finish", task: "feat-search", reason: "merged" }, busy)).toBeNull();
     expect(refusalOf({ op: "reassign", task: "feat-cart", agent: "worker-a", reason: "x" }, busy)).toBe("task feat-cart is already worker-a's");
+  });
+});
+
+describe("unassigned lines (an empty agent field): open lines the planner sees, never dropped", () => {
+  const text = ["worker-a|Alice|feat-cart|Cart", "|Pool|free-1|Anyone can take this", "||free-2|", ""].join("\n");
+  const doc = parseTasksDoc(text, "#done ");
+  const withDoc = (c: CheckContext): CheckContext => ({ ...c, doc });
+
+  it("are parsed as open lines with no agent, so an id is never reused and they count toward fill's cap", () => {
+    expect(doc.tasks.map((t) => [t.line, t.agent, t.task])).toEqual([
+      [1, "worker-a", "feat-cart"],
+      [2, null, "free-1"],
+      [3, null, "free-2"],
+    ]);
+    expect(doc.malformed).toEqual([]);
+    expect(refusalOf({ op: "add", task: "free-1", agent: "worker-b", text: "Again", reason: "x" }, withDoc(ctx({})))).toBe(
+      "task free-1 is already in the tasks file (line 2)",
+    );
+    expect(applyEdit(doc, { op: "add", agent: "worker-b", name: "Bob", task: "free-2", description: "Again" }, "#done ")).toEqual({
+      ok: false,
+      reason: "task free-2 is already in the tasks file",
+    });
+    const full = parseTasksDoc([...Array.from({ length: 199 }, (_, i) => `worker-a|A|t-${i}|`), "|Pool|free-1|", ""].join("\n"), "#done ");
+    expect(full.tasks).toHaveLength(200);
+    expect(applyEdit(full, { op: "add", agent: "worker-b", name: "Bob", task: "one-more", description: "" }, "#done ")).toEqual({
+      ok: false,
+      reason: "the tasks file has 200 tasks, fill's limit",
+    });
+  });
+
+  it("reassign gives one an agent; reword keeps it unassigned; finish and drop work as for any line", () => {
+    const { checked } = checkProposals([{ op: "reassign", task: "free-1", agent: "worker-b", reason: "worker-b is idle" }], withDoc(ctx({})));
+    expect(checked[0]).toMatchObject({ refusal: null, edit: { op: "reassign", task: "free-1", agent: "worker-b" } });
+    const assigned = applyEdit(doc, { op: "reassign", task: "free-1", agent: "worker-b", name: "Bob" }, "#done ");
+    expect(assigned).toMatchObject({ ok: true, before: "|Pool|free-1|Anyone can take this", after: "worker-b|Bob|free-1|Anyone can take this" });
+    expect(assigned.ok && findTask(assigned.doc, "free-1")).toMatchObject({ agent: "worker-b", name: "Bob" });
+
+    const reworded = applyEdit(doc, { op: "reword", task: "free-2", description: "Now with words" }, "#done ");
+    expect(reworded).toMatchObject({ ok: true, after: "||free-2|Now with words" });
+    expect(reworded.ok && findTask(reworded.doc, "free-2")).toMatchObject({ agent: null, description: "Now with words" });
+
+    const finished = applyEdit(doc, { op: "mark_done", task: "free-1" }, "#done ");
+    expect(finished.ok && [findTask(finished.doc, "free-1"), finished.doc.done.get("free-1")]).toEqual([null, 2]);
+    const dropped = applyEdit(doc, { op: "drop", task: "free-2" }, "#done ");
+    expect(dropped.ok && dropped.doc.tasks.map((t) => t.task)).toEqual(["feat-cart", "free-1"]);
   });
 });

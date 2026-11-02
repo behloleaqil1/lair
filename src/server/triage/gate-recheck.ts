@@ -647,11 +647,17 @@ export class GateRechecks {
     const real = {
       id: "real",
       label: "Treat it as a real failure",
+      effect: "reversible" as const,
       consequences: network
         ? "It stays blocking, and the author checks the change (a host, a port, a connection setting)"
         : "It stays blocking, and the author fixes it",
     };
-    const environment = { id: "fix-environment", label: "Fix the environment", consequences: "Nothing more runs; run the gate again once it is fixed" };
+    const environment = {
+      id: "fix-environment",
+      label: "Fix the environment",
+      consequences: "Nothing more runs; run the gate again once it is fixed",
+      effect: "reversible" as const,
+    };
     const first = network ? [real, environment] : infra ? [environment] : [real];
     host.raiseDecision({ recordId: failure.id }, s, {
       project: host.project,
@@ -668,11 +674,20 @@ export class GateRechecks {
       options: [
         ...first,
         ...(left > 0
-          ? [{ id: "rerun", label: "Re-check once more", consequences: `One more re-check (${left} left of max_per_result ${cfg.maxPerResult})` }]
+          ? [{ id: "rerun", label: "Re-check once more", consequences: `One more re-check (${left} left of max_per_result ${cfg.maxPerResult})`, effect: "reversible" as const }]
           : []),
-        { id: "ignore", label: "Ignore", consequences: "Nothing more runs" },
+        { id: "ignore", label: "Ignore", consequences: "Nothing more runs", effect: "reversible" as const },
       ],
       recommended: first[0].id,
+      structure: {
+        class: "triage.gate_failure",
+        evidence: {
+          code: network ? "infra_download" : infra ? "infra_other" : "same_failure_again",
+          facts: { gate: root.gateId, sha: root.sha, recheck_count: chain.length, same_commit: true, network },
+          cause_cleared: false,
+          linked_issue: null,
+        },
+      },
       why: network
         ? "The same network failure twice at the same commit is as likely the change (a host, a port, a setting) as the machine."
         : "Lair re-checks a failure that looks like infrastructure or load; one that fails the same way again, or keeps failing, is not that.",

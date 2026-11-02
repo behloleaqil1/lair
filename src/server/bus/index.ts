@@ -15,7 +15,7 @@ export type {
   BusServiceOptions,
 } from "./service.js";
 
-export { BusStore, getBusStore, closeBusStores, messageState } from "./store.js";
+export { BusStore, getBusStore, openedBusStore, existingBusStore, closeBusStores, messageState } from "./store.js";
 export type { BusReport, BusMessage, MessageState } from "./store.js";
 
 export {
@@ -29,3 +29,35 @@ export type { BusTokenBinding } from "./tokens.js";
 
 export { BusMirror } from "./mirror.js";
 export type { BusMirrorConfig } from "./mirror.js";
+
+export {
+  BusConsumers,
+  BUS_CONSUME_MODES,
+  extractBusId,
+  stripBusMarker,
+  isMirrorOf,
+  mirroredReport,
+  structuredReport,
+  validateBusReportEvent,
+  validateBusMessageEvent,
+  eventMismatch,
+} from "./consumers.js";
+export type {
+  BusConsumeMode,
+  BusConsumerHealth,
+  BusConsumersOptions,
+  BusLineSource,
+  BusMessageEvent,
+  BusObservation,
+  BusObservationView,
+  BusRefusal,
+  BusReportEvent,
+  StructuredReport,
+} from "./consumers.js";
+
+export { parseBusConfig } from "./config.js";
+export type { BusSettings } from "./config.js";
+export { BusLive, liveEvents } from "./live.js";
+export type { BusLiveOptions } from "./live.js";
+export { agentsBusFor } from "./wiring.js";
+export type { AgentsBusOptions } from "./wiring.js";

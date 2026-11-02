@@ -303,6 +303,11 @@ function FillTab({
         {fill.running ? "" : " (not running)"}
       </p>
       {fill.lastError && <div className="error">Fill's last check failed: {fill.lastError}</div>}
+      {(fill.warnings ?? []).map((warning) => (
+        <p key={warning} className="warning-rail small">
+          Config warning: {warning}
+        </p>
+      ))}
       <DataTable
         label="Tasks file lines"
         columns={columns}

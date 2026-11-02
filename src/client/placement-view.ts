@@ -42,6 +42,7 @@ export function adviceText(job: PlacementJob | undefined, mode: PlacementStatus[
   if (!job) return "-";
   if (job.advice) {
     const verb = mode === "act" ? "moving to" : "would move to";
+    if (job.advice.back) return `${verb} ${job.advice.to}: ${job.advice.back}`;
     if (job.advice.stuck) return `${verb} ${job.advice.to}: ${job.lane} never runs it`;
     const quiet = job.advice.quiet ? " (quiet re-check)" : "";
     // A quiet re-check may finish later on the quieter machine: "+12 min"
@@ -55,8 +56,30 @@ function clock(iso: string | null): string {
   return iso ? new Date(iso).toLocaleTimeString() : "?";
 }
 
-/** "up since 10:02", "down since 09:58", "starting (passing since 10:01)", "not probed yet" */
+/**
+ * An on-demand machine's power state: "on demand: stopped, guard ok, 150 s
+ * boot", "on demand: starting", "on demand: refused (guard refused: ...)",
+ * or null for a machine that is not on demand.
+ */
+export function onDemandText(m: PlacementMachine): string | null {
+  const od = m.onDemand;
+  if (!od) return null;
+  if (od.availability === "available") return `on demand: stopped, guard ok, ${od.bootSeconds} s boot`;
+  if (od.powerState === "running") return "on demand: running";
+  if (od.powerState === "pending") return "on demand: starting";
+  if (od.powerState === "stopping") return "on demand: stopping";
+  const why = od.unavailableReason ? ` (${od.unavailableReason})` : "";
+  return od.powerState === "stopped" ? `on demand: refused${why}` : `on demand: unknown${why}`;
+}
+
+/** "up since 10:02", "down since 09:58", "starting (passing since 10:01)", "not probed yet", then the on-demand state */
 export function machineState(m: PlacementMachine): string {
+  const onDemand = onDemandText(m);
+  const state = probeState(m);
+  return onDemand ? `${state} · ${onDemand}` : state;
+}
+
+function probeState(m: PlacementMachine): string {
   switch (m.state) {
     case "up":
       return `up since ${clock(m.upSince)}`;
@@ -71,6 +94,8 @@ export function machineState(m: PlacementMachine): string {
 
 export function machineBadge(m: PlacementMachine): string {
   if (m.state === "up") return "badge-success";
+  // A stopped on-demand machine that may be started is not a fault
+  if (m.onDemand?.availability === "available") return "badge-neutral";
   if (m.state === "down") return "badge-error";
   return "badge-warning";
 }

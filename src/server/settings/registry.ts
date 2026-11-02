@@ -18,8 +18,10 @@ import { AiSchema } from "../ai/config.js";
 import { DeliverySchema } from "../delivery/config.js";
 import { ExecutorsSchema, PipelinesSchema } from "../gates/project-pipelines.js";
 import { PlacementSchema } from "../placement/config.js";
+import { CloudSchema } from "../cloud/config.js";
 import { ReviewSchema } from "../review/config.js";
 import { SupervisorSchema } from "../supervisor/config.js";
+import { TrackerSchema } from "../tracker/config.js";
 import { TriageSchema } from "../triage/config.js";
 import { WatchdogSchema } from "../watchdog/config.js";
 import {
@@ -427,6 +429,53 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
     },
   },
   {
+    key: "cloud",
+    title: "Cloud machines",
+    schema: CloudSchema,
+    docs: "#cloud-machines",
+    hints: {
+      // Which account and instance Lair acts on, and how much it may spend: a change is confirmed like a command
+      "machines.*.profile": {
+        sensitive: true,
+        help: "A named profile in your AWS config files; credentials never go in the project file",
+      },
+      "machines.*.instance": { sensitive: true, help: "Lair acts on this instance only while it carries the tag" },
+      "machines.*.price_per_hour": { help: "Rounded up; the meter counts every run at this price" },
+      "budget.limit": {
+        sensitive: true,
+        help: "No start at or above this spend (US dollars); change it here and in the provider's budget together. A higher limit does not clear a trip: the owner does, in Machines",
+      },
+      "budget.period": { sensitive: true, help: "The days the limit covers (UTC); a new period does not clear a trip: only the owner does, in Machines" },
+      "budget.meter_start": { help: "Spend before the meter's first run" },
+      "budget.spend_check_hours": { help: "How old the provider's cost reading may be (1 to 24 hours); each reading may cost money" },
+      request_timeout_seconds: timeouts,
+    },
+  },
+  {
+    key: "tracker",
+    title: "Tracker: GitHub issues, boards and milestones",
+    schema: TrackerSchema,
+    docs: "#tracker",
+    hints: {
+      mode: { help: "observe records what it would change on GitHub and sends nothing; act creates and closes issues, moves cards and closes milestones" },
+      repos: { help: "The repositories it tracks; a task goes to the one its line names (repo:owner/name), else the first whose match takes it, else the default" },
+      "repos.*.repo": { sensitive: true, help: "owner/name: the tracker writes to this repository in act mode" },
+      "repos.*.project": { help: "Its Projects board: the user or organization that owns it, and the number in the board's URL" },
+      "repos.*.match.tasks": { help: "Task id globs (* and ?) this repository takes" },
+      "repos.*.milestones.rules": { advanced: true, help: "Issues created for these tasks go in this existing milestone (Lair never sets due dates)" },
+      "repos.*.redact_patterns": { help: "Regular expressions removed from this repository's texts only (e.g. a private name a public repository must never see), after the project-wide ones" },
+      "repos.*.create_issues": { help: "Create issues in this repository for tasks with none (default: create_issues_for_new_tasks): on for a private repository, off for a public one" },
+      create_issues_for_new_tasks: { help: "A task with no issue gets one (act mode); otherwise only issues it names or with its exact title are linked" },
+      auto_link: { help: "Link the issue a reconcile proposes for a task (one candidate, named by the task id or closed by the task's PR; a close title alone never) without asking, in act mode; off: proposals wait in the status for the owner" },
+      redact_patterns: { help: "Regular expressions removed from every text sent to GitHub, after the built-in ones (paths, tokens, emails, addresses)" },
+      token_env: { sensitive: true, help: "The env var holding the GitHub token; default: review.token_env, else GITHUB_TOKEN" },
+      api_url: { sensitive: true, advanced: true, help: "https only: the token is sent to it" },
+      reconcile_interval_seconds: { advanced: true },
+      write_budget_per_minute: { advanced: true },
+      request_timeout_seconds: timeouts,
+    },
+  },
+  {
     key: "supervisor",
     title: "Supervisor: self-checks, questions and the digest",
     schema: SupervisorSchema,
@@ -444,6 +493,7 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       "chat.answer_timeout_minutes": { help: "A question with no answer by then is closed and its run stopped" },
       "chat.min_interval_seconds": { advanced: true },
       "chat.max_conversation_turns": { advanced: true },
+      "chat.answer_file": { help: "The run answers by writing answer.json where Lair says, not with the lair CLI", advanced: true },
       "digest.enabled": { help: "A supervisor run writes a digest once a day; Home shows the latest" },
       "digest.time": { help: "When, in this machine's local time (HH:MM)" },
     },

@@ -155,7 +155,7 @@ machines:
     runners: [remote]
     connect_timeout: 4
     # Optional: paths on the remote machine
-    work_dir: /home/deploy/my-project
+    work_dir: /home/user/my-project
     gate_script: work/bin/gate.sh
 ```
 
@@ -360,7 +360,7 @@ machines:
     type: ssh
     host: 198.51.100.10
     # ...
-    kiro_cli: /home/deploy/.local/bin/kiro-cli  # Path to agent CLI on remote
+    kiro_cli: /home/user/.local/bin/kiro-cli  # Path to agent CLI on remote
 ```
 
 ### Commands for dragon management

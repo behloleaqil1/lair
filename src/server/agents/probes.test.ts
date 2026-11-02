@@ -7,7 +7,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "os";
 import { join } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
-import { agentEnvironment, ChildProcessSpawner, ProcessSnapshot } from "./probes.js";
+import { agentEnvironment, ChildProcessSpawner, NodeSystemInfo, ProcessSnapshot, type SystemInfoDeps } from "./probes.js";
+import type { CommandOutput, CommandRunner, RunOptions } from "../watchdog/probes.js";
 import { AgentsManager } from "./service.js";
 
 const dirs: string[] = [];
@@ -86,6 +87,19 @@ describe("ProcessSnapshot", () => {
     expect(snap.isAlive(self.pid, self.startedAt)).toBe(true); // this server, also when ps doesn't list it
     snap.addSpawned({ pid: 5001, startedAt: now });
     expect(snap.isAlive(5001, now)).toBe(true);
+  });
+
+  it("counts start times back from when the reading was taken, and allows for the time ps took", () => {
+    // Taken 20 s ago, when 4242 had run 600 s: it started 620 s ago
+    const old = new ProcessSnapshot([proc(4242, 600)], now - 20_000, self, 5);
+    expect(old.startedAt(4242)).toBe(now - 620_000);
+    expect(old.isAlive(4242, now - 620_000)).toBe(true);
+    expect(old.isAlive(4242, now - 600_000)).toBe(false); // 20 s later: not that process
+    // ps took 10 s: the elapsed times were read up to 10 s before it answered, so the start may be that much earlier
+    const slow = new ProcessSnapshot([proc(4242, 600)], now, self, 5, 10_000);
+    expect(slow.isAlive(4242, now - 610_000)).toBe(true);
+    expect(slow.isAlive(4242, now - 618_000)).toBe(false);
+    expect(slow.isAlive(4242, now - 590_000)).toBe(false); // never later than the reading allows
   });
 });
 
@@ -167,5 +181,88 @@ describe("an agent's environment", () => {
         else process.env[name] = value;
       }
     }
+  });
+});
+
+const VM_STAT = `Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                               1000.
+Pages active:                             5000.
+Pages inactive:                           3000.
+Pages speculative:                         200.
+Pages purgeable:                           800.
+`;
+
+/** Answers argv[0] from a table; counts calls and keeps the options. */
+class TableRunner implements CommandRunner {
+  calls: Array<{ argv: string[]; options?: RunOptions }> = [];
+  constructor(private answers: Record<string, CommandOutput | Error>) {}
+  async run(argv: string[], options?: RunOptions): Promise<CommandOutput> {
+    this.calls.push({ argv, options });
+    const answer = this.answers[argv[0]] ?? { code: 127, stdout: "", stderr: "" };
+    if (answer instanceof Error) throw answer;
+    return answer;
+  }
+}
+
+function machine(platform: NodeJS.Platform, runner: CommandRunner, files: Record<string, string> = {}): NodeSystemInfo {
+  const deps: SystemInfoDeps = {
+    platform,
+    runner,
+    readText: async (path) => {
+      if (path in files) return files[path];
+      throw new Error(`ENOENT ${path}`);
+    },
+    freemem: () => 123,
+  };
+  return new NodeSystemInfo(deps);
+}
+
+describe("NodeSystemInfo available memory and pressure", () => {
+  it("on macOS counts free, inactive, speculative and purgeable pages from vm_stat, not os.freemem()", async () => {
+    const runner = new TableRunner({ vm_stat: { code: 0, stdout: VM_STAT, stderr: "" } });
+    const reading = await machine("darwin", runner).memory({ pressure: false, timeoutMs: 1234 });
+    expect(reading.available).toBe((1000 + 3000 + 200 + 800) * 16384);
+    expect(reading.pressurePct).toBeUndefined();
+    // No shell, bounded by the timeout, and sysctl is not run when pressure is not wanted
+    expect(runner.calls).toEqual([{ argv: ["vm_stat"], options: { timeoutMs: 1234 } }]);
+  });
+
+  it("on macOS reads pressure as 100 minus kern.memorystatus_level", async () => {
+    const runner = new TableRunner({
+      vm_stat: { code: 0, stdout: VM_STAT, stderr: "" },
+      sysctl: { code: 0, stdout: "72\n", stderr: "" },
+    });
+    const reading = await machine("darwin", runner).memory({ pressure: true, timeoutMs: 1000 });
+    expect(reading.pressurePct).toBe(28);
+    expect(runner.calls.map((c) => c.argv)).toEqual([["vm_stat"], ["sysctl", "-n", "kern.memorystatus_level"]]);
+  });
+
+  it("on macOS a failed, throwing or unparsable read is NaN, never a number", async () => {
+    const failed = await machine("darwin", new TableRunner({ vm_stat: { code: 1, stdout: VM_STAT, stderr: "" } })).memory({ pressure: false, timeoutMs: 10 });
+    expect(failed.available).toBeNaN();
+    const threw = await machine("darwin", new TableRunner({ vm_stat: new Error("timed out") })).memory({ pressure: false, timeoutMs: 10 });
+    expect(threw.available).toBeNaN();
+    const junk = await machine(
+      "darwin",
+      new TableRunner({ vm_stat: { code: 0, stdout: "nonsense", stderr: "" }, sysctl: { code: 0, stdout: "lots", stderr: "" } }),
+    ).memory({ pressure: true, timeoutMs: 10 });
+    expect(junk.available).toBeNaN();
+    expect(junk.pressurePct).toBeNaN();
+  });
+
+  it("on Linux uses os.freemem() (MemAvailable) and reads pressure from /proc/pressure/memory without a command", async () => {
+    const runner = new TableRunner({});
+    const info = machine("linux", runner, {
+      "/proc/pressure/memory": "some avg10=12.50 avg60=3.00 avg300=1.00 total=99\nfull avg10=1.00 avg60=0.00 avg300=0.00 total=9\n",
+    });
+    expect(await info.memory({ pressure: true, timeoutMs: 10 })).toEqual({ available: 123, pressurePct: 12.5 });
+    expect(await info.memory({ pressure: false, timeoutMs: 10 })).toEqual({ available: 123 });
+    expect(runner.calls).toEqual([]);
+  });
+
+  it("on Linux an unreadable pressure file is NaN", async () => {
+    const reading = await machine("linux", new TableRunner({})).memory({ pressure: true, timeoutMs: 10 });
+    expect(reading.available).toBe(123);
+    expect(reading.pressurePct).toBeNaN();
   });
 });

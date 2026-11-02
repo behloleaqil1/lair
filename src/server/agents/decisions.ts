@@ -7,7 +7,12 @@
  * file, the convention the Decision Inbox importers read.
  */
 import { randomUUID } from "crypto";
-import type { Decision, DecisionKind as InboxKind } from "../../shared/decision-types.js";
+import type {
+  Decision,
+  DecisionEffect,
+  DecisionKind as InboxKind,
+  DecisionStructure,
+} from "../../shared/decision-types.js";
 import type { DecisionProducer, RaiseDecisionInput } from "../decisions/types.js";
 import type { Clock, FileSystem } from "../watchdog/probes.js";
 
@@ -33,6 +38,8 @@ export interface DecisionOption {
   label: string;
   /** What happens if this option is chosen */
   consequences?: string;
+  /** What choosing it does; every option of a request with a structure needs one */
+  effect?: DecisionEffect;
 }
 
 export interface DecisionRequest {
@@ -57,6 +64,10 @@ export interface DecisionRequest {
   ref?: string;
   /** References of the work that waits, e.g. "agents:demo:task:feat-login" */
   blocks?: string[];
+  /** Policy class and evidence (docs/design/decision-policies.md §4) */
+  structure?: DecisionStructure;
+  /** "notice": for the owner's information only (FYI in the Decision Inbox: nothing waits for an answer) */
+  attention?: "notice";
 }
 
 export interface DecisionInbox {
@@ -71,6 +82,8 @@ export interface DecisionInbox {
   open?(project: string): Decision[];
   /** Withdraw an open decision whose condition is gone. Absent: this inbox can't. */
   withdraw?(id: string, reason: string): Promise<void>;
+  /** Tell the inbox an open decision's cause cleared (docs/design/decision-policies.md §4). Absent: this inbox can't. */
+  causeCleared?(id: string): Promise<void>;
 }
 
 function oneLine(text: string, max = 500): string {
@@ -123,6 +136,7 @@ export function toRaiseInput(decision: DecisionRequest): RaiseDecisionInput {
     id: o.id,
     label: clip(oneLine(printable(o.label, false), 200), 120),
     consequences: clip(printable(o.consequences ?? o.label, true).trim(), 1000),
+    ...(o.effect ? { effect: o.effect } : {}),
   }));
   const recommended = options.some((o) => o.id === decision.recommended) ? decision.recommended! : options[0].id;
   return {
@@ -135,6 +149,8 @@ export function toRaiseInput(decision: DecisionRequest): RaiseDecisionInput {
     source: { module: DECISION_MODULE, ref: clip(printable(decision.ref ?? decision.key, false), 200) },
     key: clip(printable(decision.key, false), 200),
     blocks: (decision.blocks ?? []).map((b) => clip(printable(b, false), 200)),
+    ...(decision.structure ? { class: decision.structure.class, evidence: decision.structure.evidence } : {}),
+    ...(decision.attention ? { attention: decision.attention } : {}),
   };
 }
 
@@ -144,10 +160,23 @@ export function toRaiseInput(decision: DecisionRequest): RaiseDecisionInput {
  * inbox file) takes it, so the owner still hears.
  */
 export class ProducerDecisions implements DecisionInbox {
+  /**
+   * Present only with `evidenceUpdates` (the decision policies are on, data/server.yaml
+   * decision_policies.enabled): without it the agents module never changes a raised decision's evidence.
+   */
+  readonly causeCleared?: (id: string) => Promise<void>;
+
   constructor(
     private producer: DecisionProducer,
     private fallback: DecisionInbox,
-  ) {}
+    options: { evidenceUpdates?: boolean } = {},
+  ) {
+    if (options.evidenceUpdates) {
+      this.causeCleared = async (id: string) => {
+        await this.producer.updateEvidence(id, { module: DECISION_MODULE, cause_cleared: true });
+      };
+    }
+  }
 
   find(project: string, key: string): Decision | null {
     return this.producer.find(project, DECISION_MODULE, key);
@@ -188,7 +217,7 @@ export class InboxFileDecisions implements DecisionInbox {
     const file = this.target(decision.project);
     if (!file) return { id, via: "store only (no inbox_file)" };
     try {
-      this.fs.append(file, formatDecision(decision, id, new Date(this.clock.now()).toISOString()));
+      await this.fs.append(file, formatDecision(decision, id, new Date(this.clock.now()).toISOString()));
       return { id, via: `inbox file ${file}` };
     } catch (e) {
       return { id, via: `store only (could not write ${file}: ${e instanceof Error ? e.message : String(e)})` };

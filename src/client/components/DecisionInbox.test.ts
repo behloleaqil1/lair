@@ -257,3 +257,41 @@ describe("DecisionCountBadge", () => {
     ).toContain("badge-error");
   });
 });
+
+describe("a decision's class, evidence and option effects", () => {
+  const structured = decision({
+    class: "agents.provider_limit",
+    classKnown: true,
+    evidence: {
+      code: "provider_rate_limit",
+      facts: { profiles_failing: 2, agent: "agent-a" },
+      cause_cleared: false,
+      linked_issue: 12,
+    },
+    options: [
+      { id: "approve", label: "Approve the larger plan", consequences: "Costs more each month.", effect: "outward" },
+      { id: "decline", label: "Keep the current plan", consequences: "The deploy stays blocked.", effect: "frees_task" },
+    ],
+  });
+
+  it("are shown under the prose, with each option's effect", () => {
+    const html = card({ decision: structured });
+    expect(html).toContain('data-decision-class="agents.provider_limit"');
+    expect(html).toContain("provider_rate_limit");
+    expect(html).toContain("profiles_failing=2, agent=agent-a");
+    expect(html).toContain("cause not cleared");
+    expect(html).toContain("issue #12");
+    expect(html).toContain("(outward)");
+    expect(html).toContain("(frees task)");
+  });
+
+  it("say when the class is not in the policy table", () => {
+    expect(card({ decision: { ...structured, classKnown: false } })).toContain("(not in the policy table)");
+  });
+
+  it("are not shown for a decision raised without them", () => {
+    const html = card({});
+    expect(html).not.toContain("data-decision-class");
+    expect(html).not.toContain("(outward)");
+  });
+});

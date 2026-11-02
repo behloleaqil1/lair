@@ -9,6 +9,7 @@ import {
   type DecisionCounts,
   type DecisionKind,
   type DecisionOption,
+  type DecisionPoliciesStatus,
 } from "../shared/decision-types";
 import { fetchApi, ownerHeaders } from "./owner-session";
 
@@ -147,4 +148,14 @@ export function postAnswer(id: string, body: Record<string, unknown>): Promise<D
     headers: { "Content-Type": "application/json", ...ownerHeaders() },
     body: JSON.stringify(body),
   });
+}
+
+/** The policy table and its shadow agreement with the answers given (owner only). */
+export function decisionPolicies(): Promise<DecisionPoliciesStatus> {
+  return fetchApi<DecisionPoliciesStatus>("/api/owner/decision-policies", { headers: ownerHeaders() });
+}
+
+/** "93%" for a ratio, "-" while there is nothing to compare. */
+export function percent(ratio: number | null): string {
+  return ratio === null ? "-" : `${Math.round(ratio * 100)}%`;
 }

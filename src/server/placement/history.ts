@@ -210,6 +210,16 @@ export class SampleIndex {
     );
   }
 
+  /**
+   * What the class takes on other machines (passed runs, else all), while
+   * this machine has no run of it; null when it has one or nothing is learned.
+   */
+  elsewhere(cls: string, machine: string): number | null {
+    const key = SampleIndex.key(cls, machine);
+    if ((this.all.get(key) ?? []).length > 0) return null;
+    return median(this.passedClass.get(cls) ?? []) ?? median(this.allClass.get(cls) ?? []);
+  }
+
   /** The machine's usual load factor while running gates (at least 1). */
   usualFactor(machine: string): number {
     return Math.max(1, median(this.factors.get(machine) ?? []) ?? 1);

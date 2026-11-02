@@ -208,6 +208,9 @@ export type EventType =
   | "decision.answered"
   | "decision.expired"
   | "decision.withdrawn"
+  // The outcome tracker recorded how an answer turned out (src/server/outcomes/): {decisionId, project, module, optionId, outcome, evidence}
+  | "decision.outcome"
+  | "decision.structure_refused"
   // Watchdog (src/server/watchdog/)
   | "slo.breached"
   | "slo.recovered"
@@ -247,6 +250,10 @@ export type EventType =
   | "agent.budget.exceeded"
   | "agents.fill_started"
   | "agents.fill_held"
+  // fill.idle: an allowlisted agent idle while ready work exists, and the end of that episode
+  | "agents.fill_idle_notice"
+  | "agents.fill_idle_resolved"
+  | "agents.fill_unmatched"
   // Gate results, for triage: {project, result: GateResult, reports?, context?}
   | "gate.completed"
   // Triage (src/server/triage/)
@@ -277,6 +284,31 @@ export type EventType =
   | "placement.machine_up"
   | "placement.machine_down"
   | "placement.job_held"
+  | "placement.machine_stopped_under_job"
+  // Infrastructure monitor (src/server/infra-monitor/): {project, key, type, summary, mode} / {project, key, type} /
+  // {project, id, from, to, result, attempts, error}
+  | "infra_monitor.finding"
+  | "infra_monitor.cleared"
+  | "infra_monitor.requeued"
+  // PR health (src/server/pr-health/): {project, key, repo, pr, head, kind, owner, ownerSource, mode} /
+  // {project, key, repo, pr, head, kind, why} / {project, repo, error}
+  | "pr_health.finding"
+  | "pr_health.cleared"
+  | "pr_health.repo_error"
+  // PR health act mode: {project, id, repo, pr, head, kinds, agent, result, attempts, error} /
+  // {project, id, agent, result, attempts, error} / {project, key, code, decisionId}
+  | "pr_health.noted"
+  | "pr_health.withdrawn"
+  | "pr_health.escalated"
+  // Cloud machines (src/server/cloud/): {project, limit, spend, reason}
+  | "cloud.guard_tripped"
+  // The owner cleared the trip: {project, trippedAt, limit, spend, by (owner session id), note}
+  | "cloud.trip_cleared"
+  // OpenTofu runner (src/server/tofu-runner/): {project, env, root, planId, outcome, reason, by (owner session id)}
+  | "tofu.plan"
+  | "tofu.apply.refused"
+  | "tofu.apply.started"
+  | "tofu.apply.finished"
   // Planner (src/server/planner/)
   | "planner.changed"
   | "planner.run_started"
@@ -288,7 +320,22 @@ export type EventType =
   | "planner.verifier_finished"
   // Bus (src/server/bus/)
   | "bus.report"
-  | "bus.message";
+  | "bus.message"
+  // A message read (its recipient fetched its inbox: {project, agent, ids}) or acknowledged ({project, agent, id})
+  | "bus.message_read"
+  | "bus.message_acked"
+  // Bus consumers (src/server/bus/consumers.ts): an event or report refused or ignored, {project, busId, reason}
+  | "bus.consume_refused"
+  // Host services (src/server/host-services/)
+  | "host-service.up"
+  | "host-service.down"
+  | "host-service.starting"
+  | "host-service.decision"
+  // Checks (src/server/checks/)
+  | "check.requested"
+  | "check.started"
+  | "check.completed"
+  | "check.reconciled";
 
 /** Event stored in the database */
 export interface Event {

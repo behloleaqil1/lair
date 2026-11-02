@@ -93,6 +93,10 @@ beforeAll(async () => {
       const config = loadProjectConfig(project);
       return { ...config, mail_dir: undefined, wake_file: undefined };
     },
+    // The bus is on (busMode) for every project here: the routes' owner checks are what is tested
+    mode: () => busMode,
+    enabled: () => [],
+    health: () => ({ mode: "on", received: 0, refused: [], refusedCount: 0, observations: { total: 0, matches: 0, mismatches: 0, recent: [] } }),
   };
 
   app = Fastify({ logger: false });
@@ -162,6 +166,8 @@ function expectRefused(res: { statusCode: number; json: () => { error?: string }
 }
 
 const p = `?project=${PROJECT}`;
+/** The project's bus.consume as the bus routes see it */
+let busMode: "off" | "observe" | "on" = "on";
 
 describe("controls: commands and dragon start/stop", () => {
   it("refuses every command without the owner's session, and changes nothing", async () => {
@@ -209,7 +215,7 @@ describe("controls: commands and dragon start/stop", () => {
 describe("bus: messages sent as the owner", () => {
   function unread(agent: string) {
     // Read from the server-owned bus store
-    const store = getBusStore(PROJECT, join(TMP, "bus"));
+    const store = getBusStore(PROJECT, TMP);
     const now = Date.now();
     return store.getUnreadMessages(agent, now).map((m) => ({
       from_id: m.fromId,
@@ -230,6 +236,83 @@ describe("bus: messages sent as the owner", () => {
     const sent = await sendBusMessage(PROJECT, "worker-a", "rebase on main");
     expect(sent).toMatchObject({ success: true, data: { to: "worker-a" } });
     expect(unread("worker-a")).toMatchObject([{ from_id: "owner", to_id: "worker-a", text: "rebase on main" }]);
+  });
+
+  it("answers 404 for a project whose bus.consume is off, as without the bus, the consumers' status excepted", async () => {
+    busMode = "off";
+    try {
+      for (const url of [`/api/bus/board${p}`, `/api/bus/messages/worker-a${p}`]) {
+        const res = await app.inject({ url });
+        expect(res.statusCode).toBe(404);
+        expect(res.json().error).toBe(`the bus is off for ${PROJECT}: set bus.consume to observe or on (docs/configuration.md#fleet-bus)`);
+      }
+      expect((await post(`/api/bus/send${p}`, { to: "worker-a", text: "not sent" }, owner())).statusCode).toBe(404);
+      expect(unread("worker-a").map((m) => m.text)).not.toContain("not sent");
+      expect((await app.inject({ url: `/api/bus/consumers${p}` })).statusCode).toBe(200);
+    } finally {
+      busMode = "on";
+    }
+  });
+});
+
+describe("bus: GET /api/bus/activity (Home → Bus's first page)", () => {
+  const SECRET = "only the owner reads this text";
+  const NOTE = "acknowledged with a private note";
+  beforeAll(() => {
+    const store = getBusStore(PROJECT, TMP);
+    const at = Date.parse("2026-03-02T12:00:00.000Z");
+    for (let i = 0; i < 205; i++) store.createReport("worker-z", "run-z", "PROGRESS", "task-z", `step ${i} ${"x".repeat(900)}`, at + i);
+    const id = store.sendMessage("owner", "worker-z", SECRET, 5, at);
+    store.getUnreadMessages("worker-z", at + 1);
+    store.ackMessage(id, "worker-z", NOTE, at + 2);
+  });
+
+  const activity = async (query: string, headers: Record<string, string> = BROWSER) => {
+    const res = await app.inject({ url: `/api/bus/activity${p}${query}`, headers });
+    return { status: res.statusCode, body: res.json() };
+  };
+
+  it("answers at most 200 of each kind, 50 by default, and refuses a limit that is not a whole number from 1", async () => {
+    expect((await activity("&limit=500")).body.data.reports).toHaveLength(200);
+    expect((await activity("&limit=200")).body.data.reports).toHaveLength(200);
+    expect((await activity("&limit=3")).body.data.reports).toHaveLength(3);
+    expect((await activity("")).body.data.reports).toHaveLength(50);
+    for (const bad of ["0", "-1", "abc", "2.5", ""]) {
+      const res = await activity(`&limit=${bad}`);
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe("limit must be a whole number from 1 to 200");
+    }
+  });
+
+  it("cuts a report's summary to 500 characters and gives the newest first", async () => {
+    const [newest] = (await activity("&limit=1")).body.data.reports;
+    expect(newest).toMatchObject({ type: "report", agent: "worker-z", task: "task-z", kind: "PROGRESS" });
+    expect(newest.summary.startsWith("step 204 ")).toBe(true);
+    expect(newest.summary).toHaveLength(500);
+  });
+
+  it("gives message texts and ack notes to the owner's session only; anyone else gets the metadata and state", async () => {
+    const open = await activity("&limit=5");
+    expect(open.body.data.owner).toBe(false);
+    // (the earlier tests' messages are in the same store)
+    expect(open.body.data.messages.filter((m: { to: string }) => m.to === "worker-z")).toEqual([
+      { id: expect.any(String), at: "2026-03-02T12:00:00.000Z", from: "owner", to: "worker-z", state: "acknowledged" },
+    ]);
+    expect(JSON.stringify(open.body)).not.toContain(SECRET);
+    expect(JSON.stringify(open.body)).not.toContain(NOTE);
+
+    const owned = await activity("&limit=5", owner());
+    expect(owned.body.data.owner).toBe(true);
+    expect(owned.body.data.messages.find((m: { to: string }) => m.to === "worker-z")).toMatchObject({ text: SECRET, ackNote: NOTE, state: "acknowledged" });
+  });
+
+  it("answers 404 while the project's bus.consume is off", async () => {
+    busMode = "off";
+    try {
+      expect((await activity("")).status).toBe(404);
+    } finally {
+      busMode = "on";
+    }
   });
 });
 

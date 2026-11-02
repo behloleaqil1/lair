@@ -26,8 +26,17 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: 'npm'
 
+      # .npmrc sets ignore-scripts=true; this fails when a dependency with an install script is not on the
+      # package.json "allowedInstallScripts" list (it reads only .npmrc, package.json and package-lock.json)
+      - name: Install-script policy
+        run: npm run check:install-scripts
+
       - name: Install dependencies
         run: npm ci
+
+      # Runs the install scripts of exactly the allowed packages (better-sqlite3, esbuild; fsevents on macOS)
+      - name: Build allowed native dependencies
+        run: npm run rebuild:native
 
       - name: Type check
         run: npm run typecheck
@@ -40,6 +49,77 @@ jobs:
 
       - name: Build
         run: npm run build
+
+  # The end-to-end agent cycle and the folder watch on macOS (FSEvents), where
+  # Lair also runs. The full suite runs on Linux above.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # On macOS the allowed list includes fsevents (npm installs it only there)
+      - name: Build allowed native dependencies
+        run: npm run rebuild:native
+
+      - name: End-to-end cycle and folder watch
+        run: npx vitest run src/server/e2e/cycle.test.ts src/server/services/dir-watch.test.ts
+
+  # CONTRIBUTING.md "No private details": every tracked file, the commit
+  # messages of this push or pull request, and the private denylist, which
+  # comes from the GENERIC_DENYLIST repository secret (never committed). The
+  # guard fails when the secret is missing, so a skipped name check can't pass
+  # as green; pull requests from forks get no secrets, so a maintainer runs
+  # the guard for them (docs: CONTRIBUTING.md).
+  generic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The base commit, for the baseline comparison and the commit range
+          fetch-depth: 0
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Genericity guard
+        env:
+          GENERIC_DENYLIST: ${{ secrets.GENERIC_DENYLIST }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: npm run check:generic -- --base-ref "$BASE_SHA" --commits "$BASE_SHA..$HEAD_SHA"
+
+  brain-trainer-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: brain-trainer/requirements-dev.txt
+
+      - name: Install dependencies pinned by hash
+        run: "pip install --require-hashes --no-deps --only-binary=:all: -r brain-trainer/requirements-dev.txt"
+
+      - name: Test the trainer
+        run: python -m pytest brain-trainer -q
 
   gitleaks:
     runs-on: ubuntu-latest
@@ -57,3 +137,72 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  revert-checks:
+    # Proves that a PR's tests guard the code they claim to guard (CONTRIBUTING.md, "Revert checks").
+    # Runs only on pull requests, after the build job passes.
+    if: github.event_name == 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    # Bounded: at most 10 checks (--max-checks), each test run killed after 120 s (--timeout)
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history for the base commit; the token is not left in .git/config for the PR's code
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Read the exemption label history
+        # Before any PR code runs; the token is used only in this step. Read live (not from the event), so
+        # re-running the job after the owner labels the PR sees the label. A failed read exempts nothing.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if ! timeout 60 gh api --paginate "repos/$REPO/issues/$PR_NUMBER/events" \
+            --jq '.[] | select(.event == "labeled" or .event == "unlabeled") | {event, label: (.label.name // ""), actor: (.actor.login // "")} | tojson' \
+            > "$RUNNER_TEMP/label-events.ndjson"; then
+            echo "::warning::Could not read the label history; no exemption applies"
+            : > "$RUNNER_TEMP/label-events.ndjson"
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Revert checks
+        # The script decides whether lines are required (title, changed paths, owner label) from its own
+        # parse of the body, so fenced examples never count; a docs-only PR needs none
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          OWNER: ${{ github.repository_owner }}
+          # Repository variables (owner-set): REVERT_CHECKS_REQUIRE=auto|always|never, REVERT_CHECKS_CODE_PATHS=src/,scripts/
+          REQUIRE_MODE: ${{ vars.REVERT_CHECKS_REQUIRE }}
+          CODE_PATHS: ${{ vars.REVERT_CHECKS_CODE_PATHS }}
+        run: |
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
+          # The base commit's copy grades the PR when it has one, so a PR is not graded by its own copy
+          # (a PR that changes the script must keep these options working)
+          script=src/cli/revert-checks.ts
+          if git cat-file -e "$BASE_SHA:$script" 2>/dev/null; then
+            git show "$BASE_SHA:$script" > "$RUNNER_TEMP/revert-checks.mts"
+            script="$RUNNER_TEMP/revert-checks.mts"
+          fi
+          npx --no-install tsx "$script" "--title=$PR_TITLE" --exempt-label=revert-check-exempt \
+            "--exempt-actors=$OWNER" "--label-events=$RUNNER_TEMP/label-events.ndjson" \
+            "--require=${REQUIRE_MODE:-auto}" "--code-paths=${CODE_PATHS:-src/,scripts/}" \
+            --max-checks=10 --timeout=120 "$RUNNER_TEMP/pr-body.md" "$BASE_SHA"

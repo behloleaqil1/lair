@@ -43,9 +43,9 @@ export const SECTIONS: readonly SectionDef[] = [
   {
     id: "machines",
     label: "Machines",
-    needs: (m) => m.machines || m.nodes || m.placement,
+    needs: (m) => m.machines || m.nodes || m.placement || m.cloud,
     enable:
-      "Add machines: to the project's YAML, or run lair-node on a machine to register it with this server; placement.enabled: true probes them.",
+      "Add machines: to the project's YAML, or run lair-node on a machine to register it with this server; placement.enabled: true probes them; cloud.enabled: true shows cloud machines and their spend.",
   },
   { id: "decisions", label: "Decisions", needs: null, enable: "" },
   {
@@ -59,6 +59,12 @@ export const SECTIONS: readonly SectionDef[] = [
     label: "Processes",
     needs: (m) => m.processes,
     enable: "Add the helper processes Lair should supervise under processes: in the project's YAML.",
+  },
+  {
+    id: "knowledge",
+    label: "Knowledge",
+    needs: (m) => m.lessons,
+    enable: "Set lessons.enabled: true in the project's YAML to enable the lessons store and Knowledge view.",
   },
   { id: "settings", label: "Settings", needs: null, enable: "" },
 ];
@@ -92,6 +98,8 @@ const TABS: Record<SectionId, readonly TabDef[]> = {
   home: [
     { id: null, label: "Overview", needs: null, enable: "" },
     { id: "activity", label: "Activity", needs: null, enable: "" },
+    // The fleet bus (bus.consume): while it is off the tab says how to turn it on
+    { id: "bus", label: "Bus", needs: null, enable: "" },
     // Lair's self-checks are always there; the watchdog's part says how to turn it on
     { id: "health", label: "Health", needs: null, enable: "" },
   ],
@@ -150,6 +158,7 @@ const TABS: Record<SectionId, readonly TabDef[]> = {
   ],
   delivery: [],
   processes: [],
+  knowledge: [],
   settings: [],
 };
 

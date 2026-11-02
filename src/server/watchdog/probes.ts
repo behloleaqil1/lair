@@ -8,15 +8,8 @@
  */
 import { execFile } from "child_process";
 import { kindOfProgram, noteCommandTimeout } from "../core/command-timeouts.js";
-import {
-  appendFileSync,
-  closeSync,
-  fstatSync,
-  openSync,
-  readSync,
-  readdirSync,
-  statSync,
-} from "fs";
+import { appendFile } from "fs/promises";
+import { listDir, readTailText, statOrNull } from "../services/async-fs.js";
 
 // ============ INTERFACES ============
 
@@ -32,9 +25,24 @@ export interface ProcessInfo {
   command: string;
 }
 
+/** One reading of the process table, and when `ps` took it. */
+export interface ProcessReading {
+  processes: ProcessInfo[];
+  /** When `ps` was started (ms since the epoch) */
+  startedAt: number;
+  /** When it answered: the elapsed times were read between startedAt and this */
+  takenAt: number;
+}
+
 /** Lists the processes on this machine. */
 export interface ProcessTable {
   list(): Promise<ProcessInfo[]>;
+  /**
+   * The reading with its own time, for a table that may hand out one taken earlier (the shared cache). `fresh`: a
+   * reading started after this call, never one kept from before; it rejects when that one fails. A table without
+   * this method reads the machine on every list().
+   */
+  read?(options?: { fresh?: boolean }): Promise<ProcessReading>;
 }
 
 export interface FileStat {
@@ -42,15 +50,18 @@ export interface FileStat {
   isDirectory: boolean;
 }
 
-/** File reads (and the one append the escalation writer needs). */
+/** A value, or a promise of it: the node file system answers asynchronously; a fake may answer at once. */
+export type Awaitable<T> = T | Promise<T>;
+
+/** File reads (and the one append the escalation writer needs). Callers always await them. */
 export interface FileSystem {
   /** null when the path does not exist or cannot be read */
-  stat(path: string): FileStat | null;
+  stat(path: string): Awaitable<FileStat | null>;
   /** Entry names in a directory; [] when it does not exist */
-  list(dir: string): string[];
-  /** File content (the last `maxBytes` bytes when given); null when missing */
-  read(path: string, maxBytes?: number): string | null;
-  append(path: string, text: string): void;
+  list(dir: string): Awaitable<string[]>;
+  /** File content (the last `maxBytes` bytes when given); null when missing or not a regular file */
+  read(path: string, maxBytes?: number): Awaitable<string | null>;
+  append(path: string, text: string): Awaitable<void>;
 }
 
 export interface CommandOutput {
@@ -216,42 +227,26 @@ export function parseElapsed(value: string): number | null {
   );
 }
 
+/** The most a read with no maxBytes returns: the end of the file */
+export const DEFAULT_READ_MAX_BYTES = 16 * 1024 * 1024;
+
+/** The files, through fs/promises: never a synchronous call on the tick (issue #245). */
 export class NodeFileSystem implements FileSystem {
-  stat(path: string): FileStat | null {
-    try {
-      const st = statSync(path);
-      return { mtimeMs: st.mtimeMs, isDirectory: st.isDirectory() };
-    } catch {
-      return null;
-    }
+  async stat(path: string): Promise<FileStat | null> {
+    const st = await statOrNull(path);
+    return st ? { mtimeMs: st.mtimeMs, isDirectory: st.isDirectory() } : null;
   }
 
-  list(dir: string): string[] {
-    try {
-      return readdirSync(dir);
-    } catch {
-      return [];
-    }
+  list(dir: string): Promise<string[]> {
+    return listDir(dir);
   }
 
-  read(path: string, maxBytes?: number): string | null {
-    let fd: number | null = null;
-    try {
-      fd = openSync(path, "r");
-      const size = fstatSync(fd).size;
-      const length = maxBytes !== undefined ? Math.min(size, maxBytes) : size;
-      const buffer = Buffer.alloc(length);
-      readSync(fd, buffer, 0, length, size - length);
-      return buffer.toString("utf-8");
-    } catch {
-      return null;
-    } finally {
-      if (fd !== null) closeSync(fd);
-    }
+  read(path: string, maxBytes?: number): Promise<string | null> {
+    return readTailText(path, maxBytes ?? DEFAULT_READ_MAX_BYTES);
   }
 
-  append(path: string, text: string): void {
-    appendFileSync(path, text);
+  append(path: string, text: string): Promise<void> {
+    return appendFile(path, text);
   }
 }
 

@@ -55,7 +55,7 @@ machines:
     connect_timeout: 4
     runners:
       - remote
-    work_dir: /home/deploy/project
+    work_dir: /home/user/project
     sync: rsync
 ```
 
@@ -170,12 +170,41 @@ Configure the MCP fleet bus for agent communication:
 ```yaml
 mail_dir: /path/to/mail
 wake_file: /path/to/wake
+bus:
+  consume: off  # off | observe | on
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `mail_dir` | string | — | Directory for per-agent mailbox files |
 | `wake_file` | string | — | File to touch to wake the orchestrator |
+| `bus.consume` | `off` \| `observe` \| `on` | `off` | Whether the project's runs post structured reports to Lair's bus, and whether fill and the planner read them |
+
+An unknown key under `bus:` or another value is a config error (the live reload keeps the previous config).
+
+### Bus consume modes
+
+| Mode | Runs | Fill and the planner |
+|------|------|----------------------|
+| `off` | No bus token and no `LAIR_URL` (a project with `checks:` still gives its runs both: the checks routes take the token); every bus route but `/api/bus/consumers` answers 404 for the project | Read the queue file's lines with their patterns, as without the bus |
+| `observe` | Each run gets a bus token and `LAIR_URL`, revoked when the run ends; `lair bus` and `lair bus-mcp` work | Still read the lines with their patterns: nothing they do changes. For each line the bus mirrored, Home → Health shows what the report says next to what the patterns read (kept in memory only) |
+| `on` | As `observe` | A line the bus mirrored (it ends with `[bus:<id>]`, and is that report's line) is read by the report's fields: its kind, task, agent, gate id (what a WAITING run waits on), PR and sha (for the ready guard). An accepted report, and a run that ends, make fill check and the planner run a cycle at once, instead of at their next interval |
+
+Hand-written lines (an agent without the bus) are read as before in every mode. In `on` mode a line that ends with a
+marker but isn't that report's mirrored line, or names no report, is read as a hand-written line, and shown on Home →
+Health. A report is applied once: fill keeps it in its events (a hold from a report is recorded once per report, also
+across restarts), the planner keeps the ids of the reports it handled. A report for a task that isn't in
+`agents.fill.tasks_file`, or by an agent fill doesn't run, is ignored and shown on Home → Health
+(`GET /api/bus/consumers?project=<name>`), as is an event that fails validation.
+
+A run's bus token is revoked on every way the run ends (exit, crash, failover, transient retry, never started, stopped,
+claim released), whatever `bus.consume` is by then, and at start Lair revokes the tokens of runs that ended while it
+was down. `lair bus report` is refused with 400, and nothing is stored or mirrored, when its `sha` isn't 7 to 64 hex
+digits or its `gate_id` isn't a plain name (letters, digits, `.`, `_` and `-`, starting with a letter or digit, no
+`..`). The mirror appends to `queue_file`, `inbox_file` and `mail_dir` without blocking the server, one line at a time
+per file; an owner message to a recipient that isn't a plain name gets no mailbox file.
+
+Turn `observe` on first, compare on Home → Health, then switch to `on`.
 
 ## Dragons (agents)
 
@@ -531,6 +560,63 @@ Unknown keys and invalid values are config errors; a project with an invalid blo
 - `POST /api/pipelines/runs` with `{"pipeline": "gate", "sha": "<40 hex>"}` or `{"pipeline": "gate", "branch": "main"}` (default: the repository's `HEAD`): starts a run, HTTP 202
 - `POST /api/pipelines/runs/<id>/cancel`: cancels a run; CI runs in flight are asked to cancel
 
+## Checks
+
+Agents can run targeted tests before submitting a gate. Off by default: a project without a `checks:` block has no
+checks (every checks route answers 404). With the block, the server runs the kind's command for a running agent run
+that asks with its bus token. Define check kinds per project (design: [design/checks.md](design/checks.md)):
+
+```yaml
+checks:
+  backend-targeted:
+    command: ["./run-tests.sh", "{sha}", "{tests}"]
+    remote: origin
+    tests:
+      pattern: "^[A-Za-z0-9_.*#]+$"
+      max_count: 50
+      max_length: 5000
+    timeout_seconds: 300
+    max_concurrent: 2
+    max_per_agent_per_hour: 10
+    parse:
+      junit_path: test-results/TEST-*.xml
+    budget:
+      daily_limit: 100
+      guard_cmd: ["./check-spend.sh"]
+```
+
+### Check kind options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `command` | array | required | The argv, run without a shell in the project's repository. Placeholders: `{sha}`, `{branch}`, `{tests}`, `{agent}`, `{check_id}`, `{output_dir}` (also `CHECK_SHA`, `CHECK_BRANCH`, `CHECK_AGENT`, `CHECK_ID`, `CHECK_OUTPUT_DIR` in its environment) |
+| `remote` | string | `origin` | The remote the branch must be pushed to: the sha must be on `<remote>/<branch>` |
+| `tests.pattern` | string | `^[A-Za-z0-9_.*#]+$` | Regex allowlist for each test selector item (100 ms limit per item) |
+| `tests.max_count` | number | `50` | Maximum number of test items |
+| `tests.max_length` | number | `5000` | Maximum total length of tests joined |
+| `timeout_seconds` | number | `300` | Time limit for the check; its whole process group is stopped |
+| `max_concurrent` | number | `2` | Checks of this kind running at once (the rest wait, oldest first) |
+| `max_per_agent_per_hour` | number | `10` | Accepted checks per agent per hour (refusals don't count) |
+| `parse.junit_path` | string | — | JUnit XML path for failing test names, relative to the check's output directory; the file name may be a glob |
+| `budget.daily_limit` | number | — | Accepted checks of this kind per UTC day (refusals don't count) |
+| `budget.guard_cmd` | array | — | Command that must exit 0 before each run and before the infrastructure retry (30 s limit, fail closed) |
+
+Exit codes: 0 pass, 1 test failures, 2 refused (the command refused its input), 3 infrastructure (guard again, retried
+once), 4 refused by the guard. A timeout reports `timeout`; any other exit `fail`.
+
+Lair's own tokens (`GH_TOKEN`, `GITHUB_TOKEN`, `LAIR_*_TOKEN`) are removed from the command's and the guard's
+environment. Finished checks are kept 14 days (at most 10,000), with their output directories in
+`data/checks-output/<project>/`. Changes to `checks:` take effect at the next restart.
+
+### Checks API
+
+Agents request checks with their bus token. See [docs/agents.md](agents.md) for the curl example.
+
+- `POST /api/checks` with `{"kind": "...", "sha": "<40 hex>", "branch": "...", "tests": ["..."]}` and `Authorization: Bearer <bus token>`: request a check, returns `{"id": "..."}` (HTTP 201). The run must be running; a run tests one branch (its first accepted check's); the sha must be on that branch as pushed
+- `GET /api/checks/:id?wait=600` with the same token (or the owner's session): the result, optionally long-polling up to N seconds
+- `GET /api/checks?kind=&agent=&sha=&status=&limit=`: list checks (owner only)
+- `GET /api/checks/stats`: counts by status and kind (owner only)
+
 ## Process manager
 
 Define processes for Lair to manage (starting, stopping and restarting them from the dashboard needs the owner's session, see [Owner-only routes](#owner-only-routes)):
@@ -699,13 +785,24 @@ An answer is accepted only with that session in the `X-Lair-Owner-Session` heade
   ```
 
   `attention` (`action`, the default, or `notice`), `blocks`, `links` (`[{label, url}]`, http or https, not to this machine or a private network), `expiresAt` and `defaultOptionId` are optional. A default needs `expiresAt`, and is refused for the kinds above that can't have one. A `credentials` decision also needs `secretName` and an option with `"suppliesSecret": true`.
+  **Class, evidence and effects (optional).** A decision can carry a policy `class` (`module.name`, starting with the raising module), an `evidence` object and an `effect` on each option, for rules to read later (nothing acts on them yet; the Decisions view shows them under the prose):
+
+  ```json
+  {
+    "class": "deploy-script.budget",
+    "evidence": { "code": "budget_exceeded", "facts": { "month": "2026-01", "used": 120 }, "cause_cleared": false, "linked_issue": null },
+    "options": [{ "id": "approve", "label": "Approve", "consequences": "Costs more.", "effect": "outward" }]
+  }
+  ```
+
+  `effect` is `reversible`, `frees_task`, `irreversible` or `outward`. `evidence.facts` is flat (strings, numbers, booleans, null). A `class` needs `evidence` and an `effect` on every option; a class in the policy table (docs/design/decision-policies.md) takes only its own evidence codes; any other class is accepted and flagged in the audit trail. A bad object is refused with 400 naming the field. Decisions raised without them load and show as before.
 - `POST /api/decisions/:id/answer`: `{optionId, note?, confirm?, secret?}`, with an owner session (see "Only you answer"). `confirm: true` is required for `spend` and `go_no_go`; `secret` goes only with an option that supplies it, and `credentials` decisions take no `note`
 
 Errors: 400 for invalid input, 403 for a cross-site request or an answer without an owner session, 404 for an unknown decision, 409 when it is no longer open, 429 when a module, or HTTP callers together, have too many open decisions, 503 when the secret store can't take a value.
 
 ## Owner-only routes
 
-Every route that changes something only you should change needs the owner's session, the same one the Decision Inbox uses (see "Only you answer"): the `X-Lair-Owner-Session` header, from the dashboard's own origin, in a same-origin browser request. Without it the answer is HTTP 403, before the request's body is read, and nothing changes. `curl`, scripts, agents and other local programs can still read: every `GET` stays open, except the two that read prompt files from disk (`/api/agents/prompts`), the Settings API (`/api/settings`), whose reads reveal paths and commands, the AI tools API (`/api/ai`), whose reads run the tools' own commands, Lair's diagnostics and the ops tokens and their audit (`/api/health/diagnostics`, `/api/supervisor`), and logs and test output (`/api/dashboard/.../output` and `.../log`, and the logs in pipeline runs), which can hold anything a test or an agent printed. No CORS is granted under these prefixes (`OWNER_ONLY_PREFIXES` in `src/server/human-auth/cors.ts`). The dashboard's views send the session once this browser is signed in, and show "sign in from Decisions" until it is.
+Every route that changes something only you should change needs the owner's session, the same one the Decision Inbox uses (see "Only you answer"): the `X-Lair-Owner-Session` header, from the dashboard's own origin, in a same-origin browser request. Without it the answer is HTTP 403, before the request's body is read, and nothing changes. `curl`, scripts, agents and other local programs can still read: every `GET` stays open, except the two that read prompt files from disk (`/api/agents/prompts`), the Settings API (`/api/settings`), whose reads reveal paths and commands, the AI tools API (`/api/ai`), whose reads run the tools' own commands, the cloud machines' status (`/api/cloud`), which names the account's instances and spend, Lair's diagnostics and the ops tokens and their audit (`/api/health/diagnostics`, `/api/supervisor`), and logs and test output (`/api/dashboard/.../output` and `.../log`, and the logs in pipeline runs), which can hold anything a test or an agent printed. No CORS is granted under these prefixes (`OWNER_ONLY_PREFIXES` in `src/server/human-auth/cors.ts`). The dashboard's views send the session once this browser is signed in, and show "sign in from Decisions" until it is.
 
 | Prefix | Owner only | Open |
 |--------|------------|------|
@@ -725,6 +822,7 @@ Every route that changes something only you should change needs the owner's sess
 | `/api/ai` | everything: the tools' installed and sign-in state per machine, their models, refreshing a list ([AI API](#ai-api)) | nothing |
 | `/api/health/diagnostics`, `/api/supervisor` | everything: the self-checks' results, minting, listing and revoking ops tokens, their audit ([Supervisor API](#supervisor-api)) | nothing (`/api/health` itself stays open) |
 | `/api/ops` | nothing: it takes an [ops token](#the-ops-api), never the owner's session, and grants no CORS | — |
+| `/api/host-services/owner` | the tick, which runs start commands in act mode ([Host services API](#host-services-api)) | the status, the holds and the hold check under `/api/host-services` |
 
 The watchdog's routes are all reads; it acts only inside the server. Lair's own work doesn't go through these routes either: delivery's automatic deploys, the scheduler, the healer and the watchdog's playbooks run inside the server, server code starts pipeline runs with `PipelineManager.startRun` and creates tasks with the job manager, and agents use the fleet bus (`npm run bus`), which works on the bus database directly. The `lair-node` daemon connects over `/ws/node`, not these routes.
 
@@ -775,7 +873,7 @@ watchdog:
 | `lock_holder_dead` | A configured lock's recorded holder pid is not running, or the lock has no pid and is older than `lease_minutes`, while an agent is WAITING or a gate request is queued | `stale_lock` | `break_lock` | the lock is gone or held by a live process |
 | `duplicate_agent` | More than one process matches `agent_command` for one agent id (a wrapper and its child count once). One breach for each process except the oldest | `duplicate_agent` | `stop_duplicate` | one process left |
 | `agent_hung` | The agent's process is alive, but neither its newest log nor the process itself has changed for `hung_minutes`, **and** the agent is not WAITING. WAITING means its latest queue line is a `WAITING` line naming a gate id that has no `<gate-id>.rc` result yet; such an agent is never hung | `agent_stuck` | `restart_agent` | the old pid is gone and the agent has a live process |
-| `orphan_claim` | A claim `agents_dir/<id>.running` older than `claim_grace_minutes` whose agent has no live process. A live agent's claim is never touched | `orphan_claim` | `release_claim` | the claim is gone |
+| `orphan_claim` | A claim `agents_dir/<id>.running` older than `claim_grace_minutes` whose agent has no live process. A live agent's claim is never touched. A pid recorded in the claim (the file, or its `pid` file: `pid=<pid>` with an optional `started=<ISO time>`, or a bare pid) keeps it only while that pid runs as the agent, since the OS may give a dead agent's pid to another process: its command names the agent id; or, with `started=`, it started no more than 60 s after that time; or, for a bare pid, it runs the agent's adapter program (the first word of the adapter's `start_cmd`). The `release_claim` guard re-checks with the same rule | `orphan_claim` | `release_claim` | the claim is gone |
 | `infra_signature` | The same normalised failure text (timestamps, hashes, numbers and the gate's own ids removed) in at least `infra_min_tracks` finished, failed gates of different tracks on one lane within `infra_window_minutes` | `lane_broken` | `mark_lane_broken` | later ticks |
 | `gate_owner_gone` | A running gate request (`.req.run`) whose runner pid (in the `.req.run` file, else `gates_dir/runner-<lane>.pid`) is not running, or that has no runner pid at all, and whose log has been silent for `gate_lease_minutes` | `gate_owner_gone` | `requeue_gate` | the request is no longer running |
 | `idle_capacity` | Ready work (queued gate requests plus `ready_tasks_cmd` tasks) and free capacity (no agent running, or fewer than `max_agents`), with nothing started (no claim, running gate or agent process) for `idle_minutes` | `idle_capacity` | `fill_capacity` | later ticks |
@@ -971,7 +1069,9 @@ Lair uses a single, shared process cache for all modules that need the process t
 
 **Behavior:**
 - A failed `ps` keeps the last good snapshot, marked stale. Routes answer from the stale cache, not with an error.
-- A `ps` timeout that fires after the child has already exited (the event loop was blocked, not `ps` itself) counts as success if the output is valid.
+- A `ps` that its timeout (or the output cap) stopped has failed, whatever it printed: its table may stop part-way, and a process missing from it is no proof that it ended. A `ps` that exited by itself counts as success even when its timer fired late (the event loop was blocked, not `ps`).
+- A table without the Lair server's own pid is not complete and fails the same way; so does one without pid 1, once a snapshot has shown pid 1 (a host that hides other users' processes never shows it).
+- Each snapshot keeps when its `ps` started and when it answered. The agents module counts process start times back from that, never from the time it reads the cache, so a snapshot seconds old doesn't make a live process look like another one. When it is about to end a run on a snapshot, it reads `ps` again first, bypassing the cache (see [Restarts and hosts](#agents)).
 - A cache older than 10 seconds shows as stale; the dashboard shows the cache age.
 
 **Configuration** (environment variables; these are server-wide, not per project):
@@ -1036,6 +1136,7 @@ With `supervisor.chat.enabled`, the Ask tab sends questions to the supervisor (a
 | `chat.min_interval_seconds` | number | `30` | Between the starts of two supervisor runs (0 to 86400) |
 | `chat.max_conversation_turns` | number | `10` | Questions in one conversation; then you start a new one (1 to 50) |
 | `chat.answer_timeout_minutes` | number | `15` | A question with no answer this long after it was asked is closed, and its run stopped (1 to 240) |
+| `chat.answer_file` | boolean | `false` | The run answers by writing `answer.json` at the exact path Lair gives it, instead of with `lair supervisor answer` (for agent tools that can't run commands on the host); see [Submitting the answer](#a-supervisor-run) |
 | `digest.enabled` | boolean | `false` | A supervisor run writes a digest once a day |
 | `digest.time` | `HH:MM` | `"08:00"` | When, in this machine's local time (24 hours) |
 
@@ -1055,11 +1156,12 @@ A question starts a conversation, or continues the one the chat panel has open, 
 - the context, as JSON data under a heading that says it is data: the self-checks that need a look (with their values and fixes) and the ids of those that pass, the project's open decisions (at most 30: id, kind, title, the module that raised it, since when), and the conversation so far (each question cut to 1000 characters and each answer to 3000, at most 12000 in all, the oldest dropped first). Every string is redacted as the ops API's answers are;
 - the question, or for a digest what Lair asks for.
 
-**Its environment** has what the agents module gives every run, and three of its own, kept in the agents module's memory only (never in its store, the prompt file or a log):
+**Its environment** has what the agents module gives every run, and three of its own (four with `chat.answer_file`), kept in the agents module's memory only (never in its store, the prompt file or a log):
 
 - `LAIR_OPS_TOKEN`: a [run token](#the-ops-api) minted for this run: it reads this project only, and stops working when the run ends, however it ends, or at `answer_timeout_minutes`;
 - `LAIR_URL`: this server;
-- `LAIR_SUPERVISOR_CONVERSATION`: the conversation's id.
+- `LAIR_SUPERVISOR_CONVERSATION`: the conversation's id;
+- with `chat.answer_file`, also `LAIR_ANSWER_FILE`: the exact path of the run's `answer.json` (below).
 
 **Submitting the answer.** The run writes its answer as Markdown in a file, and the evidence it cites as a JSON list of `{tool, args, note}` (each `tool` an ops tool, its `args` as called, and a note of what it showed; at most 30), both outside the repository (the prompt says `$TMPDIR`), then runs:
 
@@ -1068,6 +1170,22 @@ lair supervisor answer --conversation <id> --file "$TMPDIR/answer.md" [--evidenc
 ```
 
 It is `node <lair>/dist/cli/lair.js supervisor answer ...` after `npm run build` (the prompt gives the exact command), and reads `LAIR_OPS_TOKEN`, `LAIR_URL` (default `http://127.0.0.1:4777`) and, without `--conversation`, `LAIR_SUPERVISOR_CONVERSATION`. It posts to `POST /api/ops/answer`. Lair takes an answer once per question, only under the token of the run that was asked, and only while that run is active; the token is never printed. Exit codes: `0` recorded; `1` refused (an ended, another run's or the owner's token, an answer already given, an invalid answer: Lair says which); `2` a usage or input error, and nothing was sent; `3` Lair could not be reached, or answered with a server error.
+
+**The answer as a file (`chat.answer_file`, off by default).** For an agent tool that can't run commands on the host (a sandbox, a security block), the run can write its answer to a file instead. Before the run starts, Lair makes a private folder for it (mode 0700, an unguessable name) under `<agents_dir>/supervisor-runs/`, puts the exact path of `answer.json` in it in `LAIR_ANSWER_FILE` and in the prompt, and reads only that path. The prompt tells the run to write the file, not to run `node`, `npm` or `lair` commands to submit it, not to work around a block on the host, and to exit once the file is written. The file:
+
+```json
+{
+  "answer": "Your Markdown answer (at most 8 KB)",
+  "evidence": [
+    {"tool": "events.query", "args": {"agent": "worker-a"}, "note": "two transient errors at 09:12 and 09:40"}
+  ]
+}
+```
+
+- `answer` (required): the Markdown answer, at most 8 KB (UTF-8 bytes).
+- `evidence` (required, `[]` if none): as for the CLI, at most 20 items.
+
+No other field is accepted. The file must be a regular file (not a symlink) inside the run's folder, at most 64 KB, valid JSON of that shape. Lair reads it only once the run has ended, or at the question's deadline (then it stops the run): never while the run goes on, so a file still being written is not read. A valid file answers the question once (it is moved aside so it is never read twice); an invalid one is refused, and the "no answer" reason says why. The CLI still works with the switch on, and the first answer counts: a later one is refused (the CLI) or ignored and logged (the file). The run's folder is removed when its question is closed, at the deadline of a question answered with the CLI, and, for folders left by a restart, when Lair starts. Without a folder (it can't be made), the run is told to answer with the CLI.
 
 `lair ops call <tool> [--args <json>]` is the same kind of command for the read tools: it checks the tool and its arguments with the server's own list before sending anything, and prints Lair's answer as JSON (`{tool, project, truncated, result}`), with the same exit codes.
 
@@ -1078,7 +1196,7 @@ It is `node <lair>/dist/cli/lair.js supervisor answer ...` after `npm run build`
 - links go only to the dashboard's own pages (`#/work/<agent>`, `#/decisions/<id>`, ...) and to the repository's host (`https://github.com/<owner>/<name>/...`, or the review module's API host); any other link is its text, not clickable;
 - secrets of known shapes, `Authorization` and `Bearer` values and a URL's credentials are taken out, of the evidence's notes and arguments too.
 
-**No answer.** A question is closed as "no answer", with the reason, when its run ends without answering (it exited, crashed, failed over or was recovered into a new run, whose token no longer works, or you stopped it), when `answer_timeout_minutes` pass, or when Lair restarts before the answer comes (tokens live in memory only). Its token ends, and whatever still runs of its task is stopped (its claim released). Nothing is retried on its own: ask again. An answered question whose run is still going at its deadline is stopped too.
+**No answer.** A question is closed as "no answer", with the reason, when its run ends without answering (it exited, crashed, failed over or was recovered into a new run, whose token no longer works, or you stopped it), when `answer_timeout_minutes` pass, or when Lair restarts before the answer comes (tokens live in memory only). With `chat.answer_file`, a valid `answer.json` is taken first, when the run ended or at the deadline; an invalid one adds its error to the reason. Its token ends, and whatever still runs of its task is stopped (its claim released). Nothing is retried on its own: ask again. An answered question whose run is still going at its deadline is stopped too.
 
 **Bounds.** A question that would start a run past `max_runs_per_day` (in the 24 hours before), or sooner than `min_interval_seconds` after the last supervisor run started, is refused with why and when to try again (HTTP 429); so is a question past `max_conversation_turns` (409). A refused question leaves nothing behind. The agents module's budgets apply on top: an agent over its budget starts nothing.
 
@@ -1570,7 +1688,20 @@ A run is requested for an agent (a `dragons:` entry or a `dragons.txt` line) and
   - a provider unreachable for the fleet for `transient_max_minutes` (`escalation`, one open per provider and outage; once answered "wait", asked again after each further `transient_max_minutes`; withdrawn once the outage is over): `wait` keeps trying one start at a time, `retry_now` lets every run waiting on it start on the next check.
   When the inbox refuses a decision (its open-decision cap, say), it is written to `inbox_file` as an `- OWNER? ...` entry with the evidence instead.
 - **The watchdog.** The watchdog's `agent_hung` and `orphan_claim` detectors leave an agent with an active run here to this module (their SLO detail says so), so one failure is never handled twice.
-- **Restarts and hosts.** When the Lair server stops (Restart, Update, a stop and start), the agents keep running. When it starts again it finds each running run's process by pid and start time and carries on supervising it: a process that is still alive is supervised to its end as before (hung, failover, a lost claim), and nothing is started a second time. What the new server can't learn is a re-adopted process's exit code (only the server process that started an agent sees it exit; a config reload keeps it), so when one ends, or ended while Lair was down, the agent's queue line decides:
+- **Restarts and hosts.** When the Lair server stops (Restart, Update, a stop and start), the agents keep running (`on_restart: adopt`, the default). Each run's pid, process group, the start time of its process and a fingerprint of its start command are kept in the store when it starts. Before the new server's first tick judges anything, it reconciles every run the store says is running or stopping against the process table:
+  - **adopted**: a process runs under the run's pid and started when the run's process did (within `pid_start_tolerance_seconds`). Lair supervises it to its end as before (hung, failover, a lost claim), its claim stays, and fill counts it as active (a `run_adopted` event). Its command line is checked too (the whole `ps` command line, or the part after an interpreter for a script), but a difference is only noted in the event (`data.commandDiffers`): a start script that `exec`s the agent, or a program that rewrites its title, shows another command line, and pid and start time already identify the process. A run recorded before process groups and commands were kept is adopted on its pid and start time alone, as before;
+  - **lost**: a process runs under the run's pid but started at another time: the pid was reused. That process is never signalled, the run ends `failed` (`lost in a restart: ...`, a `run_lost` recovery event), and its task is free;
+  - **gone**: nothing runs under the pid. Its exit is classified by its queue line, as below.
+
+  One reading of the process table never ends a run: before a run is lost or gone (here, and whenever a later tick finds a run it didn't start missing), a second, fresh reading taken after the tick's own (never the [shared cache](#process-cache-a2)'s) must say so too. When that reading fails, the run keeps its state, claim and locks, and the next tick reads again. Start times count back from when a reading was taken, allowing for how long `ps` took, so a cached reading seconds old or a `ps` slowed by load doesn't make a live process look like another one; a tick's time is taken after its reading.
+
+  Fill starts nothing until every run has its verdict: a fill check that comes first finds `lastError` saying so and does nothing. A failed `ps` fails the reconciliation as it fails a tick, and the next tick tries again. A `read_only` project reconciles nothing (it starts and stops nothing either).
+
+  With `on_restart: stop`, the server's own shutdown (Restart, Update, SIGTERM or SIGINT) stops the runs too: SIGTERM to each running run's process group (only a process provably the run's), up to `stop_grace_seconds` for them to end, never more than 20 s so the shutdown stays within its 60 s limit, then SIGKILL; every signal is a `stopped_for_shutdown` event. A run this server started is followed by its exit status; a run it adopted, by a fresh reading of the process table every second (never the cache's): one that ends on SIGTERM isn't sent SIGKILL. When the table can't be read, an adopted run isn't signalled, and it gets SIGKILL only when the wait's last reading showed it still running (otherwise it can't be proven the run's). The runs stay `stopping` until the next server's first tick ends them by their queue line: a DONE, WAITING or BLOCKED line completes the run as below; with none it ends `failed` (not counted as a failed attempt) and its task is free, so fill starts a fill task again and any other run is the owner's to start again. With `adopt`, the shutdown never waits on agent runs.
+
+  As a last guard against two runs of one task, fill checks the process table before it starts a task: a live process that no active run owns, whose command line holds one of the task's run prompt files (`<prompts_dir>/<task>-<agent>-<run>.txt`, the file Lair writes for each run and passes as `{prompt_file}`), is a run of the task Lair doesn't know. Fill doesn't start the task (`held: conflict`), records one `fill_conflict` event for that process, and starts it once the process has ended. An adapter whose `start_cmd` doesn't take `{prompt_file}` isn't covered by this check.
+
+  What the new server can't learn is a re-adopted process's exit code (only the server process that started an agent sees it exit; a config reload keeps it), so when one ends, or ended while Lair was down, the agent's queue line decides:
   - a DONE, WAITING or BLOCKED line for the task, written by that agent (by its attribution, `by <agent>`) since the run's chain was requested, completes the run. Its detail says `exit unknown (it ended while Lair was restarting); classified from its queue line: WAITING` (or DONE, BLOCKED), and its `completed` event keeps the line. The line is read with fill's `done_pattern`, `waiting_pattern` and `blocked_pattern` (their defaults when fill is off), so a [fill](#fill) task goes on exactly as after exit 0 on that line: `done`, `held: waiting` until its wake comes, or `held: blocked` with fill's one decision. Nothing is escalated;
   - with no such line, the end counts as one failed attempt (an `exit_unknown` recovery event): the task is restarted with the same session, then in a fresh one, as `recovery` allows, and is escalated only once those restarts are used up, as for a crash.
   Have agents write their DONE, WAITING or BLOCKED line before they exit: across a restart it is the only way Lair can tell a finished run from a crash. Liveness is read from this machine's process table, so one data directory (`data/agents.db`) and its lock files belong to one host: don't share them between machines, or one host would judge the other's processes dead.
@@ -1611,6 +1742,7 @@ agents:
 | `hung_minutes` | number | `watchdog.hung_minutes` (`45`) | Silence limit for a running agent |
 | `stop_grace_seconds` | number | `30` | SIGTERM, then SIGKILL after this long |
 | `pid_start_tolerance_seconds` | number | `5` | How far a process's start time may be from its owner's recorded one |
+| `on_restart` | `adopt` \| `stop` | `adopt` | The server's own shutdown: `adopt` leaves the runs working for the next server to adopt; `stop` stops them (SIGTERM to each run's process group, SIGKILL after `stop_grace_seconds`, 20 s at most). See Restarts and hosts |
 | `session_dir` | string | — | The agent's session directory, moved aside for a fresh session. `{agents_dir}`, `{agent}` and `{repo}` are replaced; relative to `repo` |
 | `branch_state_cmd` | array | — | Prints the branch state for a resume summary. `{task}`, `{agent}`, `{repo}` |
 | `command_timeout_seconds` | number | `30` | Timeout for `branch_state_cmd` |
@@ -1650,15 +1782,16 @@ Unknown keys, invalid regular expressions, more than 50 `transient_patterns` or 
 `tasks_file` holds one task per line, `<agent>|<name>|<task>|<description>`: the agent id, a display name, the task id and a description (it may be empty and may contain `|`). Blank lines and lines starting with `#` are skipped. Every `interval_seconds` fill reads the file and looks at each line in order:
 
 - An agent that isn't in `fill.agents` is never started (`not allowlisted`). The allowlist is required, so you can move agents over one at a time while another launcher still runs the rest.
+- A line with an empty agent field, `|<name>|<task>|<description>` (the name may be empty too), is `unassigned`: fill starts nothing for it, and it is ready work for any allowlisted agent while it is open (see [Idle detection](#idle-detection)). It is `claimed` while a run of its task is active or a claim holds it, and `done` once a queue line matching `done_pattern` names its task (any agent's: the `{agent}` part matches whoever wrote it). To give it to an agent, put the agent's id in the first field (the planner's `reassign` does that). Its task id counts like any other: it can't repeat, and it counts toward the 200 tasks. The planner sees it (its agent is `null`); the review module's `authors.from_tasks_file` doesn't, since it names no author.
 - A task with an active run of the line's agent is `started`; one with another agent's run or another claim on it is `claimed`. Neither is started again.
-- A task that is `done` is not started again: `done_pattern` matches a queue line (`queue_file`) written since the task was last started (the whole file for a task Lair never ran). Lines are matched as the module's own DONE check reads them: trimmed, and case-insensitively, but the task id must be in the matched text exactly as written (task ids are case-sensitive). A pattern may match by agent instead (see [Matching by agent](#matching-by-agent)). Once fill has seen a task done it keeps that in the store, so rotating or truncating the queue file, or a done line falling out of the 4 MB fill reads, never restarts a finished task. Editing the task's line in `tasks_file` drops what was kept, but the next check finds the done line again while it is still in the queue file. Agents write the queue file, so a done line only keeps fill from starting a task again; it proves nothing else. To overrule a done line you don't trust, request a run of the task yourself (Work section): that is a new start, so only lines written after it count, and fill carries the task on from there.
+- A task that is `done` is not started again: `done_pattern` matches a queue line (`queue_file`) written since the task was last started (the whole file for a task Lair never ran). Lines are matched as the module's own DONE check reads them: trimmed, and case-insensitively, but the task id must be in the matched text exactly as written (task ids are case-sensitive). A pattern may match by agent instead (see [Matching by agent](#matching-by-agent)). A line an agent writes for a task it is not on counts for no task ([Unmatched reports](#unmatched-reports)). Once fill has seen a task done it keeps that in the store, so rotating or truncating the queue file, or a done line falling out of the 4 MB fill reads, never restarts a finished task. Editing the task's line in `tasks_file` drops what was kept, but the next check finds the done line again while it is still in the queue file. Agents write the queue file, so a done line only keeps fill from starting a task again; it proves nothing else. To overrule a done line you don't trust, request a run of the task yourself (Work section): that is a new start, so only lines written after it count, and fill carries the task on from there.
 - A run that exits 0 on a WAITING or BLOCKED line for its task waits, or is held: see [Waiting and blocked runs](#waiting-and-blocked-runs) below. So does one that ended on such a line while Lair was restarting, whose exit code is lost (see Restarts and hosts in [Agents](#agents)).
 - A run that exits 0 without writing the done line, or a WAITING or BLOCKED one (an adapter that stops on a usage limit with exit code 0, say), is started again with fill's prompt (built from `prompt_files` again, not the prompt of a run you requested), after `backoff_seconds`, doubling up to `max_backoff_seconds` (`held: backoff`, with the time). After `max_completions_without_done` such runs in a row, fill holds the task (`held: no_done`) and raises one decision in the [Decision Inbox](#decision-inbox) with those runs and the last run's last output lines: "Start it again" (it counts from zero) or "Keep it paused" (recommended).
 - A task whose last run ended in any other way than completing is `held: owner`: it is yours to resume, and fill never restarts it by itself. It has one decision, as every hold that needs you ([One decision per hold](#one-decision-per-hold)): a run that was escalated has its escalation, and any other (one you stopped, one whose claim was lost, released by you or not, one that failed while Lair was restarting) gets one from fill. A run that dies is restarted by the module's recovery, not by fill, so there is never a second run of one task.
 - A refused start (`held: refused`: the run request was refused, or `done_pattern` couldn't be checked) has one decision too, except when the refusal is a hard budget limit, which has its own `spend` decision. The line shows the decision of its hold (`decisionId`).
 - `held: paused` is your own pause: you answered "Keep it paused", or "Leave the task unclaimed" on the escalation of a task fill runs. Nothing waits for you and nothing more is asked; fill starts it again once you release it.
 - You lift an `owner`, `no_done`, `blocked`, `waiting`, `waited_too_long` or `paused` hold with the decision's answer, or with "Release hold" in the Work section (`POST /api/agents/fill/release`, owner only); requesting a run of the task yourself works too. Either lifts the hold only while the run it is about is still the task's latest: once the task has moved on (you answered its escalation with a fresh session, say), the release is refused and the next check shows where the task is now. The planner may release only a `no_done` or `blocked` hold.
-- Otherwise the task is started when its agent has no active run, fewer than `max_active` runs fill started are active, and `capacity_cmd` (when set) exits 0. Its prompt is the contents of `prompt_files`, in order, separated by a blank line (`default_instructions` and the agent's `instructions` come first, as for every run). It is requested through the module's in-process request, never over HTTP. A line that waits for any of these is `held`, with the reason: `busy`, `max_active`, `capacity` (the capacity command's first output line), `prompt` (a refused prompt file), `read_only`, or `refused` (the refused request: over budget, say).
+- Otherwise the task is started when its agent has no active run, fewer than `max_active` runs fill started are active, native capacity checks pass (when configured), and `capacity_cmd` (when set) exits 0. Its prompt is the contents of `prompt_files`, in order, separated by a blank line (`default_instructions` and the agent's `instructions` come first, as for every run). It is requested through the module's in-process request, never over HTTP. A line that waits for any of these is `held`, with the reason: `busy`, `max_active`, `capacity` (the capacity command's first output line), `capacity_load` (load per CPU over limit), `capacity_memory` (available memory below minimum, or pressure above the maximum), `capacity_heavy` (this heavy task, with heavy work at limit), `capacity_probe` (the machine could not be measured: fill fails closed), `prompt` (a refused prompt file), `read_only`, or `refused` (the refused request: over budget, say).
 - A line that doesn't parse, names an invalid agent or task id, or repeats a task is `malformed`: it is reported, and the other lines are still filled.
 
 The Work section shows fill's lines, with each line's state, why it is held (for a waiting one, `waiting: <wake> since <time>`, or `waiting: <gate> still queued in <lane> since <time>` while its gate is in the gate queue), and a "Release hold" button for the holds that are yours to lift.
@@ -1667,7 +1800,13 @@ The Work section shows fill's lines, with each line's state, why it is held (for
 
 **The capacity command** is an argv, run without a shell before each start, with `command_timeout_seconds` as its timeout. Exit 0 means there is capacity; any other exit code, or a timeout, holds every line that would start in that check, with its first output line as the reason.
 
-`agents.fill_started` and `agents.fill_held` events go on the event bus (and into the agents store): one when fill starts a task, and one when a line becomes held or is held for another kind of reason, not on every check. `fill_done` (a task seen done) and `fill_released` (you lifted a hold) are kept in the agents store. Bounds: the tasks file is read up to 256 KB, 200 tasks and 2,000 characters a line; the queue file's last 4 MB are searched, each line cut at 1,000 characters. A queue file that was rewritten (not appended to) since a task's start is searched whole. Task ids are not reused: a task that is done stays done.
+**Native capacity checks** let fill decide capacity itself without an external command. Set `fill.capacity.load_per_cpu_max` to hold local agents when the 1-minute load average per CPU exceeds it. Set `fill.capacity.memory.available_min_pct` to hold all agents when available memory drops below that percentage of total. Set `fill.capacity.heavy_work.detect` to a list of task globs that count as heavy work, and `fill.capacity.heavy_work.max_active` to limit how many may run at once.
+
+Agents are either `local` (held by load) or `remote` (not held by load). Set `fill.capacity.default_class` to the default (`"local"`), and `fill.capacity.agent_class` to override it per agent. A remote agent (one that only pushes to GitHub CI, say) starts even under high load, since it doesn't add to the machine's workload.
+
+Memory checks and heavy-work limits apply to both classes. `capacity_cmd` is still honoured as an extra check, after native checks pass.
+
+`agents.fill_started` and `agents.fill_held` events go on the event bus (and into the agents store): one when fill starts a task, and one when a line becomes held or is held for another kind of reason, not on every check. `agents.fill_unmatched` goes on the bus once per unmatched report ([Unmatched reports](#unmatched-reports)), and `agents.fill_idle_notice` and `agents.fill_idle_resolved` once per idle episode ([Idle detection](#idle-detection)). `fill_done` (a task seen done) and `fill_released` (you lifted a hold) are kept in the agents store. Bounds: the tasks file is read up to 256 KB, 200 tasks and 2,000 characters a line; the queue file's last 4 MB are searched, each line cut at 1,000 characters. A queue file that was rewritten (not appended to) since a task's start is searched whole. Task ids are not reused: a task that is done stays done.
 
 ```yaml
 agents:
@@ -1687,6 +1826,29 @@ agents:
     interval_seconds: 60
 ```
 
+With native capacity checks:
+
+```yaml
+agents:
+  fill:
+    enabled: true
+    tasks_file: work/tasks.txt
+    agents: [worker-a, worker-b, worker-c]
+    prompt_files: ["{prompts_dir}/{agent}.txt"]
+    max_active: 4
+    capacity:
+      load_per_cpu_max: 1.5              # hold local agents when load/cpu > 1.5
+      memory:
+        available_min_pct: 15            # hold all agents when memory < 15%
+        pressure_max: 60                 # ...or when memory pressure > 60%
+      heavy_work:
+        detect: ["*-backend-gate", "*-e2e-*"]   # these tasks count as heavy work
+        max_active: 2                    # at most 2 heavy tasks at once
+      agent_class:
+        worker-c: remote                 # worker-c only pushes to CI; not held by load
+      default_class: local               # the default
+```
+
 ```text
 # agent|name|task|description
 worker-a|Alice|feat-login|Build the login form
@@ -1701,12 +1863,22 @@ worker-b|Bob|feat-search|Search page
 | `fill.prompt_files` | array | `[]` | Required when enabled. Files whose contents, in order, make the prompt. `{prompts_dir}`, `{agent}`, `{task}` |
 | `fill.max_active` | number | `1` | Runs fill started that may be active at once (restarts and retries count) |
 | `fill.done_pattern` | string | `^-\s+DONE\s+{task}(?=\s\|$)` | Regular expression for a queue line that reports the task done, matched case-insensitively against each trimmed line; the task id must be in the matched text exactly. Must contain `{task}`, `{agent}` or both ([Matching by agent](#matching-by-agent)), inserted as literal text. End the task id at whitespace, not `\b`, `:` or `-`: task ids can contain `-` and `:` |
+| `fill.done_match` | string | `task_id` when `done_pattern` has `{task}`, else `agent_legacy` | `task_id`: a DONE, WAITING or BLOCKED line closes or changes only the task its pattern's `{task}` names, and an agent's line that names no task it can be about is an [unmatched report](#unmatched-reports). `agent_legacy`: no unmatched reports, and a `done_pattern` without `{task}` matches the agent's last line ([Matching by agent](#matching-by-agent)). `task_id` with a `done_pattern` without `{task}` is a config error. A pattern without `{task}`, or `agent_legacy`, is a config warning (on Home → Health and in the Work section) |
 | `fill.capacity_cmd` | array | — | Exit 0: capacity available; anything else holds, with its first output line as the reason |
+| `fill.capacity.load_per_cpu_max` | number | — | Maximum 1-minute load average per CPU before holding local agents. Remote agents are not held by load |
+| `fill.capacity.memory.pressure_max` | number | — | Hold new starts (local and remote) while memory pressure is above this percentage (0-100). Linux: `some avg10` of `/proc/pressure/memory`. macOS: 100 minus `kern.memorystatus_level`. A read that fails or times out holds with `capacity_probe` |
+| `fill.capacity.memory.available_min_pct` | number | — | Hold new starts (local and remote) below this available memory as a percentage of total (0-100). Linux: `MemAvailable`. macOS: free + inactive + speculative + purgeable pages from `vm_stat` (not just free pages). A read that fails or times out holds with `capacity_probe` |
+| `fill.capacity.heavy_work.detect` | array | `[]` | Task-id globs (`*` any text, `?` one character; every other character is literal) that mark heavy work, e.g. container gates. Only a task that matches is held when `max_active` is reached; other tasks, local or remote, are not |
+| `fill.capacity.heavy_work.max_active` | number | `1` | Maximum concurrent heavy runs across all agents (counted once per check; a heavy run started in the check counts at once) |
+| `fill.capacity.agent_class` | map | `{}` | Per-agent class override: agent id (it must be in `fill.agents`) → `"local"` or `"remote"`. There is no per-task class label yet |
+| `fill.capacity.default_class` | string | `"local"` | Default class for agents not in `agent_class`. `"local"` agents are held by load; `"remote"` agents are not |
 | `fill.interval_seconds` | number | `60` | Seconds between fill checks |
 | `fill.max_completions_without_done` | number | `3` | Runs in a row that exit 0 without the done line; then fill holds the task and asks you |
 | `fill.backoff_seconds` | number | `60` | Wait after such a run before fill starts the task again, doubling |
 | `fill.max_backoff_seconds` | number | `1800` | Longest such wait |
 | `fill.waiting_pattern` | string | `^-\s+WAITING\s+{task}(?=\s\|$)` | A run that ended on such a line waits; same rules as `done_pattern`. An optional `(?<wake>...)` names what it waits on |
+| `fill.ready_guard` | boolean | `false` | Refuse a done line that names a PR (`PR #<n>`, and `at <sha>` for its head) unless the PR is ready to review; see the Ready guard note below. Needs `review.enabled` (the PR is read through the review module's git host) |
+| `fill.ready_wait_minutes` | integer | `120` | How long a done line that only time can settle (CI still running, the git host not answering) is held and checked again; after that the owner gets one decision and the report stays refused. Counted from the first check, kept across restarts. `ready_guard: true` without `review.enabled` is a config error |
 | `fill.blocked_pattern` | string | `^-\s+BLOCKED\s+{task}(?=\s\|$)` | A run that ended on such a line is held for you at once; same rules as `done_pattern` |
 | `fill.wake.file` | string | — | The file whose existence ends a wait. `{wake}` (required), `{gates_dir}`, `{agents_dir}`, `{repo}`; relative to `repo` |
 | `fill.wake.root` | string | `{gates_dir}` | The directory `wake.file` must stay inside. `{gates_dir}`, `{agents_dir}`, `{repo}` |
@@ -1715,6 +1887,8 @@ worker-b|Bob|feat-search|Search page
 | `fill.wake.max_queue_wait_minutes` | number | `1440` | A task waiting this long in a row is held even while its gate is still in the gate queue (never less than `max_wait_minutes`) |
 | `fill.wake.requeue_marker` | string | — | A marker whose first line is the id the waited-on gate was re-queued or re-checked as, followed for a live wait and its result. `{wake}` (required), `{n}` (1 to 9), `{gates_dir}`, `{agents_dir}`, `{repo}`; inside `wake.root` |
 | `fill.wake.fallback_seconds` | number | `900` | With nothing to wait on (no capture, no `wake.file`, or a refused capture), the task starts again after this long, or after the backoff if that is later: such a run counts toward `max_completions_without_done` |
+| `fill.idle.notice_minutes` | integer | `0` (off) | An allowlisted agent idle this long while ready work exists raises one notice (0 to 1440); see [Idle detection](#idle-detection) |
+| `fill.idle.ready_sources` | array | `["tasks_file"]` | Where ready work comes from. Only `tasks_file` (its unassigned lines) is wired so far; any other value is a config error |
 
 A fill block that is enabled without `agents.enabled`, `tasks_file`, `agents` or `prompt_files`, an invalid agent id in `agents`, a `prompt_files` entry with a `..` segment or an unknown placeholder, a `done_pattern`, `waiting_pattern` or `blocked_pattern` with neither `{task}` nor `{agent}`, with an `{agent}` that doesn't come right after `by\s+`, or that isn't a regular expression, or a `wake.file` or `wake.requeue_marker` without `{wake}` (or a `wake.file`, `wake.root` or `wake.requeue_marker` with a `..` segment or an unknown placeholder) is a config error.
 
@@ -1728,6 +1902,8 @@ Agents often end a run on purpose before the task is done: on a WAITING line (`-
 - **A gate still in the queue is a live wait.** When the WAITING line names a gate id (a plain name) and the gate queue (`gates_dir/queue`, read with the gates parser) still has a request for it, `<lane>.<pri>.<id>.req` (queued) or `.req.run` (running), the agent is waiting on work in progress, not on nothing. A machine that is offline for hours, a long queue, or a request moved to another lane is not the agent's doing. Such a wait doesn't count toward `max_wait_minutes`: the line shows `waiting: <gate> still queued in <lane> since <time>` (or `still running`), and the status's `waiting.queued` gives the gate, lane, status and since. When the request is gone and no result came, the budget counts again, from the last time fill saw the request in the queue (that sighting is kept in the store, so a restart doesn't lose it), or from the streak's start when it never saw one. A wait that never had a request in the queue is held at `max_wait_minutes` exactly as before. A live wait is held anyway once the streak has waited `wake.max_queue_wait_minutes` (24 hours by default, never less than `max_wait_minutes`): a gate that sits in the queue that long usually means a runner or a machine is down. The decision then says so. An agent that can write to the gate queue can keep its own wait alive, but never past `max_queue_wait_minutes`.
 - **Re-queued under a new id.** Some gate systems re-check or re-queue a gate under a new id and leave a marker naming it. Set `wake.requeue_marker` to that marker's path (`{wake}` is the id the waiting line names, `{n}` tries 1 to 9, and it must stay inside `wake.root`): the marker's first line, when it is a plain name, is the new id, and its markers are followed in turn (at most 10 ids). A wait whose new id is still in the queue is alive in the same way, and the new id's result (`wake.file` for it, newer than the run's chain) wakes the task as its own would. A marker that is a symlink, not a regular file, or whose first line isn't a plain name is passed over. Without `requeue_marker` only the waiting line's own id is looked up.
 - **Blocked.** A run that ends on a line matching `blocked_pattern` holds the task at once (`held: blocked`), with no restart, and raises one decision carrying the BLOCKED line. The line is cut to 300 characters and shown as data in a code block. It never goes into a prompt: the next run gets fill's `prompt_files` prompt as always. Release the hold ("Release hold", or the decision's "Start it again") once whatever blocked it is cleared.
+- **Ready guard.** With `fill.ready_guard: true`, a done line that names a PR counts only when, at the head it names (the PR's current head), every CI check passes (a skipped one is not a failure), the branch is not behind its base and does not conflict, the project's gate (`review.merge.gate`, when it requires one) passed at that head, and, when the PR carries review findings, its description has one line per finding with the finding's id and the sha of a commit of the PR. Otherwise the line is not a done: the task stays open, nothing goes to review, no `fill_done` is recorded. A refusal that needs a change (red CI, behind, conflicts, gate, finding map, a moved head) is recorded once as `fill_report_refused` (reason and instruction), and the next run's prompt ends with the instruction. A refusal that only time fixes (CI or the gate still running, the host not answering, mergeable not computed yet) holds the line (`held: report_refused`), starts no run, and is checked again on every fill check until it passes or turns into a refusal. Lines that name no PR are not checked. Off by default.
+- **Ready guard over several repositories.** A project that lists its [repositories](#repositories) (`repos:`) can report PRs of any of them (`lib PR #7 at <sha>`, `lib#7`, `example/lib#7`); the bus tail `PR #<n> [<sha>]` and a bus report's `pr` are the task's repository, else the default. The review repository's PRs are read through the review module (gate and findings); another repository's through its own host, with no gate and no findings. On a repository with `ci_counts: false` the CI items are not checked; the rest are. A host that fails or does not answer holds only the reports about its own repository, for a minute. Refusals name such a PR `<ref>#<n>`.
 - **The latest line wins.** Of a run's WAITING and BLOCKED lines, the last one applies. With a `done_pattern` that names the task, a done line always does: a BLOCKED task whose done line is written later (by whoever unblocked it, say) is `done`. With one that names only the agent, the agent's last DONE, WAITING or BLOCKED line decides (see [Matching by agent](#matching-by-agent)). Once fill has seen how a run ended, it keeps that in the store (`fill_waiting`, `fill_blocked`, and for a wake file `fill_wake_absent`, `fill_woken` or `fill_weak`), so rotating the queue file or restarting Lair doesn't turn a waiting run into one without progress.
 
 ```yaml
@@ -1744,6 +1920,34 @@ agents:
       requeue_marker: "{gates_dir}/results/{wake}.recheck-{n}"   # optional: first line, the id it was re-queued as
       fallback_seconds: 900
 ```
+
+#### Idle detection
+
+After every whole check (one the module's stop cut short doesn't count), fill says why each allowlisted agent is or isn't working: the status's `idle` array gives each agent's `reason`, its line's `hold` and `task` when it has one, `since`, and a plain `explanation`. It only reports: it starts nothing, assigns nothing and writes no file. Reasons (an active run first, then its line's hold, then what keeps it from new work):
+
+- `busy`: the agent has an active run (fill's, or one you or a module requested).
+- `waiting`: its line waits on a gate.
+- `max_active`: its line is held at `fill.max_active`, or the agent has nothing of its own and `max_active` is reached.
+- `capacity`: a capacity check holds its line (`capacity`, `capacity_load`, `capacity_memory`, `capacity_heavy`, `capacity_probe`), or the agent has nothing of its own and `capacity_cmd` refused.
+- `held`: its line is held for another reason (`hold` says which), or the project is `read_only`.
+- `no_task`, `task_done`, `no_ready_work`: it has nothing of its own (no line, its lines are done, or other runs hold them), and no ready work exists.
+- `ready_work`: it has nothing of its own while ready work exists (`readyTasks` lists it). This is what a notice is for.
+
+**Ready work** is an `unassigned` line of the tasks file that is open: no active run or claim on its task, no queue line reports it done, and its last run (if one ran) didn't end on a WAITING or BLOCKED line. With a `done_pattern` that names only the agent, no queue line can name a task nobody ran, so such a line stays ready until you assign it or take it out. A line assigned to an agent that isn't in `fill.agents` is never ready work: that agent may be working on it where Lair can't see. A malformed line (over 2,000 characters, say) is never ready work. `fill.idle.ready_sources` takes only `tasks_file` for now.
+
+**The notice.** With `fill.idle.notice_minutes` above 0 (off by default), an agent in `ready_work` for that many minutes raises one notice: a `fill_idle_notice` event (`agents.fill_idle_notice` on the event bus) and, with the Decision Inbox, one [notice](#action-items-and-notices) there (listed under FYI, never counted or notified; "Noted" closes it). One per episode: it isn't raised again while the agent stays in `ready_work`, nor after a restart (the store keeps which notice is open). The episode ends when the agent's reason changes (it works, waits or is held, or the ready work is gone), when `notice_minutes` is set to 0, or when the agent leaves `fill.agents`: fill records `fill_idle_resolved` (`agents.fill_idle_resolved`) and withdraws the notice if it is still open. A later episode raises a new one. How long an agent has idled before its notice is counted in memory, so a restart starts that count again.
+
+#### Unmatched reports
+
+A line counts only for the task it names: with a pattern that has `{task}`, `- DONE fix-10`, `- DONE fix-1-2`, `- DONE review-fix-1` and `- DONE FIX-1` never close `fix-1` (task ids are exact and case-sensitive, and their characters `.`, `#`, `/` and `:` are literal). Agents sometimes report a task they are not on, from a stale prompt, say. With `done_match: task_id` (the default when `done_pattern` has `{task}`), fill looks at the lines a task's last run wrote (after its start, and before its agent's next run on another task) and reports each one that:
+
+- is the agent's own (`by <agent>`, as [Matching by agent](#matching-by-agent) reads attributions: not another agent's, not an unattributed or quoted line);
+- matches one of the project's own `done_pattern`, `waiting_pattern` or `blocked_pattern` that has `{task}`, read with any task id in place of `{task}` (so a `READY` that `done_pattern` allows counts; a keyword the patterns don't have never does);
+- is not a line of the run's own task, nor of another task in `tasks_file` that it counts for (a line for another open task is that task's; once that task is done by another line, a new line for it is a stale report).
+
+Such an unmatched report closes and changes nothing: the task is not done, a WAITING line attaches no wait, a BLOCKED line holds nothing. A run that ends with only unmatched reports is a run without a done line: it backs off, and after `max_completions_without_done` of them the task is `held: no_done`, with one decision. Each such line is recorded once, as a `fill_unmatched` event (with the line as written, its kind and the task id it names), and goes once on the event bus as `agents.fill_unmatched`, whatever the number of checks or restarts. The task's line in the Work section says so, and the status (`fill.unmatchedReports`) lists, per task, its last run's latest such line while that run is the task's last. The task's next run gets a note after its prompt: "Your previous run reported a task that is not yours; your task is `<task>`", then the line, fenced as data. A last line without its newline is still being written, and is read on a later check.
+
+A pattern without `{task}` can't name a task, so its lines are neither checked nor reported: a `waiting_pattern` or `blocked_pattern` without `{task}` changes the agent's open task whatever its line says, and a `done_pattern` without `{task}` makes `done_match` `agent_legacy`, where a DONE line about any other task closes the agent's open task. Each is a config warning, shown on Home → Health (the "Module start failures and errors" self-check turns to a warning) and in the Work section. `done_match: agent_legacy` with patterns that name the task keeps today's matching without unmatched reports (also a warning). `done_match: task_id` with a `done_pattern` without `{task}` is a config error.
 
 #### Matching by agent
 
@@ -1907,8 +2111,47 @@ The built-in root-cause signatures (case-insensitive; each line is cut to 1,000 
 | `bisect.protected_trailer` | string | `Lair-Protected` | A merge whose message has `<trailer>: yes` is proposed for revert, never reverted automatically |
 | `commands` | map | `{}` | See below |
 | `decision_file` | string | `inbox_file` | Where decisions are appended when there is no Decision Inbox or `raise_decision` |
+| `parsers.custom` | array | `[]` | Custom regex parsers for test frameworks not covered by built-ins; see below |
 
 Unknown keys, an invalid regular expression or an unknown placeholder are config errors; a project with an invalid `triage:` block is not triaged, and `GET /api/triage/status` shows why.
+
+### Custom parsers
+
+When a project's tests produce output the built-in parsers (JUnit XML, Gradle, vitest, jest, pytest, `go test -json`, cargo test, .NET TRX) don't recognise, define a custom regex parser.
+
+> **Note:** The Go parser reads only JSON output from `go test -json`. Plain `go test` output (non-JSON `--- FAIL:` lines without `-json`) is not parsed; use `-json` or write a custom parser for your output format.
+
+```yaml
+triage:
+  parsers:
+    custom:
+      - name: mytest
+        detect: "MyTest Framework"
+        fail_pattern: 'FAIL:\s+(?<suite>[^:]+)::(?<name>\S+)\s+-\s+(?<message>.+)'
+        summary_pattern: '(?<failed>\d+) failed, (?<passed>\d+) passed'
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `name` | string | Parser id, shown in `cause.parser`; must start with a letter, then lowercase alphanumeric, hyphens and underscores (max 32 chars); must not conflict with built-in parser ids |
+| `detect` | string | Regex to detect this format (matched against the first 2000 characters of the output) |
+| `fail_pattern` | string | Regex with named groups: `(?<name>...)` (required), `(?<suite>...)`, `(?<message>...)`, `(?<type>...)` |
+| `summary_pattern` | string | Optional regex to extract counts: `(?<failed>\d+)`, `(?<passed>\d+)` |
+
+Custom parsers run after the built-ins; a file the built-ins already parsed is not tried again.
+
+**Security limits.** Patterns run over untrusted test output, so:
+
+- Input is capped to 256 KB (the tail).
+- Lines are capped to 2,000 characters.
+- Patterns that match the empty string are refused (they would loop forever).
+- Patterns with nested quantifiers (e.g., `(a+)+`, `(\w*)*`, `(a|a)*`, `(\w|\d)+`) are refused (catastrophic backtracking).
+- Patterns with backreferences (`\1`, `\k<name>`) are refused (exponential time complexity).
+- Each regex operation runs in a worker thread with a 2-second timeout; if the operation exceeds this, the worker is terminated (`Worker.terminate()`), the match fails closed (no results), and a triage notice is recorded. This is a hard bound: the main event loop is never blocked, even by catastrophic patterns that bypass static checks.
+
+Non-capturing groups (`(?:...)`) and named groups (`(?<name>...)`) are allowed. Alternation is allowed in non-quantified groups (e.g., `(?:FAIL|ERROR):` is fine, but `(?:FAIL|ERROR)+:` is refused).
+
+A refused pattern stops triage for the project with a notice naming the field.
 
 ### Triage commands
 
@@ -2051,7 +2294,7 @@ The owner only (the owner's session from [the owner credential](#decision-inbox)
 
 ## Placement
 
-> Off by default. With `enabled: true` and the default `mode: observe`, placement probes your machines, estimates when every queued job finishes, and shows where it would move each one. It runs none of your commands except the probes.
+> Off by default. With `enabled: true` and the default `mode: observe`, placement probes your machines, estimates when every queued job finishes, and shows where it would move each one. It runs none of your commands except the probes and, for an [on-demand machine](#on-demand-machines), its `state_cmd` and `guard_cmd` checks.
 
 Placement is for projects that keep their own gate queue and runners: the request files under `gates_dir/queue/` that the Gates section reads, one lane per runner. It decides which machine runs each queued job, for any number of machines, and moves a job to another lane when it is expected to finish sooner there. Lair never renames a request itself. In act mode it runs your `move_cmd`, which validates and moves the request, and then checks that the request landed.
 
@@ -2102,7 +2345,7 @@ Every `interval_seconds`:
    One sample is kept per gate id, with its exit code. A run that failed (exit code not 0) in less than half the time its class usually takes (the median of passed runs on that machine, else on any machine) is a fragment, such as a preflight that failed or a run killed when its machine went away, and is not learned. A later passed run of the same id (a job re-queued under its id) replaces a failed one, never the other way round. A job's expected duration is the median of the newest `history.samples` passed runs of its class on that machine, else on any machine; else of all its runs on that machine, else on any machine; else of any class on that machine; else `default_seconds`.
 4. **Load.** `load_cmd` prints the 1-minute load average first and the cpu count last (`sysctl -n vm.loadavg hw.ncpu` and `cat /proc/loadavg; nproc` both do; `cpus:` overrides the count). A machine's load factor is `max(1, load ÷ cpus)`. A machine runs jobs slower when its load factor is above the one it usually has while running gates: the expected duration is multiplied by `max(1, factor now ÷ usual factor)`, where the usual factor is the median of the factors Lair measured during the runs it learned from (1 until it has some). Without `load_cmd` the factor is 1.
 5. **Estimates.** Each lane runs its jobs in its own order (lower priority digit first, then the id, which usually starts with a UTC time) on `slots` runners, with at most `limits.<class>` jobs of a class at a time, and no job starts before the one ahead of it (a runner takes the head of its queue). A running job ends its expected duration after it started, but always has at least a tenth of that left (so one past its duration is expected to need a tenth of it more). A job its lane never runs (a class limit of `0` there) has no expected finish on it. A **pseudo-lane** (`serves:`) is a second runner that takes jobs from other lanes' queues: a queued job of a lane it serves, at or below its `max_priority`, whose class is in `eligible.<pseudo-lane>`, is estimated on the pseudo-lane and is **never moved** (its runner takes it beside the main one). The Gates section shows every queued job's expected start and finish.
-6. **Moves.** A queued job moves to another lane when it is expected to finish at least `min_gain_seconds` sooner there, and the move saves at least that much in all: what it costs the jobs of the same or a more urgent priority on both lanes is counted against it. The target lane must be up, list the job's class in `eligible`, and not be a pseudo-lane. The job that gains most moves first, then the next one on the state that leaves, up to `max_moves_per_tick`. A job its lane never runs goes, before any of those, to the lane that can run it soonest (its gain shows as 0 and its estimate as `never → ...`); this holds for a quiet re-check too, whatever the loads.
+6. **Moves.** A queued job moves to another lane when it is expected to finish at least `min_gain_seconds` sooner there, and the move saves at least that much in all: what it costs the jobs of the same or a more urgent priority on both lanes is counted against it. The target lane must be up (or be on an available [on-demand machine](#on-demand-machines), through `routing` only), list the job's class in `eligible`, and not be a pseudo-lane. The job that gains most moves first, then the next one on the state that leaves, up to `max_moves_per_tick`; of two moves that are equally good, the one to the lane with the lower `cost_per_hour` wins. A job its lane never runs goes, before any of those, to the lane that can run it soonest (its gain shows as 0 and its estimate as `never → ...`); this holds for a quiet re-check too, whatever the loads.
 
    **Cool-downs.** A job moved (or tried) is not moved again for `cooldown_seconds`, whatever the estimates say, and the cool-down doubles with every earlier move of that job in the last 24 hours (30 min, then 60, then 120 by default). After `max_moves_per_job` moves or tries in 24 hours the job is **held**: placement stops moving it, says why in the Gates section, and emits `placement.job_held` once for that hold (the store remembers it, so a restart doesn't report it again; a job held again after it left the queue is reported again). So a job a flapping link keeps sending back (your fallback moves it home, placement moves it out again) settles instead of bouncing forever.
 7. **Quiet re-checks.** A job whose id or command matches a `prefer_quiet` pattern (for example a re-check of tests that failed by timeout) goes to the eligible up machine with the lowest load per cpu, when that is at least `quiet_margin` lower than its current machine's, even if it finishes later there: `min_gain_seconds` and the in-all rule don't apply to that move. When no machine is that much quieter, it is placed by time like any other job, but only on machines no busier than its own (a machine whose load is unknown counts as busier). When no target's load is known at all, it is placed by time on any eligible machine.
@@ -2122,12 +2365,13 @@ Each decision is explained in one line, for example `moved 20260101T000000Z-fix-
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | boolean | `false` | Run placement for this project |
-| `mode` | `observe` \| `act` | `observe` | `observe` records and shows advice (`would_move`); `act` runs `move_cmd`, unless the project is `read_only: true` |
+| `mode` | `observe` \| `act` | `observe` | `observe` records and shows advice (`would_move`); `act` runs `move_cmd` and an on-demand machine's `touch_cmd`, unless the project is `read_only: true` |
 | `interval_seconds` | number | `60` | Seconds between ticks (10 to 3600) |
 | `probe_timeout_seconds` | number | `15` | Timeout of each probe and load command |
-| `command_timeout_seconds` | number | `60` | Timeout of `move_cmd` |
+| `command_timeout_seconds` | number | `60` | Timeout of `move_cmd` and of an on-demand machine's `state_cmd`, `guard_cmd` and `touch_cmd` |
 | `machines` | map | `{}` | Machine id → machine options (below) |
 | `lanes` | map | `{}` | Lane name (as in the request file names) → lane options (below). At least one when enabled. Lanes not listed are never read or moved |
+| `routing` | map | `{}` | Lane name → routing options (below): where its jobs may go on an on-demand machine |
 | `classes` | map | `{}` | Class name → patterns matched against a request's command. The first class, in the order written, wins |
 | `eligible` | map | `{}` | Lane → the classes it can run. A job moves only to a lane that lists its class |
 | `prefer_quiet` | array | `[]` | Patterns matched against a job's id and command: such a job goes to the least-loaded machine |
@@ -2153,6 +2397,20 @@ Machine options:
 | `load_cmd` | array | — | Argv that prints the 1-minute load first and the cpu count last. Over SSH, the remote command is one string the remote shell parses |
 | `cpus` | number | — | The cpu count, instead of the one `load_cmd` prints |
 | `min_up_seconds` | number | `240` | Passing probes needed in a row before the machine counts as up (`0` for the machine Lair runs on) |
+| `on_demand` | object | — | On-demand machine settings (see below) |
+
+On-demand machine options (the `on_demand` block; see [On-demand machines](#on-demand-machines)):
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `state_cmd` | array | — | Argv that prints the machine's power state: `running`, `stopped`, `pending`, or `stopping` |
+| `guard_cmd` | array | — | Argv that exits 0 with output starting `guard: ok` when starting the machine is allowed |
+| `boot_seconds` | number | `150` | Seconds added to estimates while the machine is not up |
+| `cost_per_hour` | number | — | Shown in the status; of two moves that are equally good, the one to the cheaper lane wins |
+| `check_seconds` | number | `300` | Minimum seconds between state and guard checks (the guard may call paid APIs) |
+| `speed_factor` | number | `1.0` | While the machine has no run of a class yet, its expected duration is this times what the class takes on the other machines (`0.5`: twice as fast) |
+| `touch_cmd` | array | — | Argv that refreshes the machine's activity mark (or lease), run while a job runs in one of its lanes, in act mode only |
+| `touch_seconds` | number | `60` | How often `touch_cmd` runs while a job runs there. A touch runs at most once per tick, so this may not be shorter than `interval_seconds` |
 
 Lane options:
 
@@ -2164,13 +2422,351 @@ Lane options:
 | `serves` | array | `[]` | A pseudo-lane: the lanes whose queues its runner takes jobs from |
 | `max_priority` | number | — | A pseudo-lane takes only jobs at this priority digit or lower |
 
-Unknown keys, a lane on an unknown machine, an unknown class in `limits` or `eligible`, an invalid pattern, an unknown placeholder in `move_cmd`, or `mode: act` without `move_cmd` are config errors: the project's placement does not start, and `GET /api/placement/status` shows the errors.
+Routing options (the `routing` block, per lane):
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `overflow_to` | array | `[]` | On-demand lanes this lane's waiting jobs may go to while their machine is stopped |
+| `prefer_when_faster` | boolean | `false` | A job of this lane also goes to an on-demand lane (listed or not) when it would finish sooner there, boot time included, even if it would start now where it is |
+| `min_gain_seconds` | number | — | How much sooner a job must finish to start an on-demand machine for it (defaults to the global `min_gain_seconds`) |
+
+Unknown keys, a lane on an unknown machine, an unknown class in `limits` or `eligible`, an invalid pattern, an unknown placeholder in `move_cmd`, `mode: act` without `move_cmd`, a `routing` or `overflow_to` lane that is not in `lanes`, or a `touch_seconds` shorter than `interval_seconds` are config errors: the project's placement does not start, and `GET /api/placement/status` shows the errors.
+
+### On-demand machines
+
+A machine with an `on_demand` block is one your project starts when a job lands in its lane (a cloud machine that powers itself off when idle, say). Placement never starts or stops it: it moves a job into its lane, and your project's runner starts it. Lair reads the machine's power state with `state_cmd` and asks `guard_cmd` (your spend and quota check) whether a start is allowed, at most every `check_seconds` (both may call paid APIs).
+
+- **Available.** A machine whose state is `stopped` and whose guard says ok is **available**: its lanes are planned as if it were up, with `boot_seconds` added to every estimate there (once). Running, it counts like any machine, through its probes and `min_up_seconds`. A refusing guard, an unknown state, or a command that fails or times out makes it **unavailable**, with the reason shown; so do `pending` and `stopping`.
+- **Starting it.** A lane on an available machine is a target only through `routing`: a lane's `overflow_to` lists it, or the lane has `prefer_when_faster`. A move there needs a free slot and a gain above 0 of at least the routing's `min_gain_seconds`, in all too; with `overflow_to` alone the job must also be waiting (it would not start now where it is). These moves go before moves by time. In act mode, right before such a move the guard runs again (unless it ran in this tick): a refusal cancels the move (`placement.move_failed`, the job waits its cool-down) and the machine stays unavailable until its next check.
+- **Moving back.** A job queued in its lane while the guard refuses or the state is unknown goes back, before any other move, to a lane whose `overflow_to` lists that lane (else to any up lane that runs its class): `moved back q1 aws→heavy: est. never → 60 min; aws guard refused: spend 181 >= limit 180; heavy idle`. Its cool-down and `max_moves_per_job` still apply, so a job moved in and refused straight after waits out the cool-down of that move (30 min by default) before it goes back, and one that reached `max_moves_per_job` is held where it is. A machine that is `pending` or `stopping` keeps its jobs.
+- **Keeping it alive.** While a job runs in one of its lanes, `touch_cmd` runs every `touch_seconds`, so the machine's idle timer does not stop it during a long phase of the job that does not use it. A touch keeps a paid machine on, so it runs in act mode only: in observe mode or on a `read_only` project it never runs, and the status shows why (`touchError: not touched: placement.mode is observe`). A check that finds the machine `stopped` (or `stopping`) after it had answered, while jobs run in its lanes, emits `placement.machine_stopped_under_job` once per job; when the runner puts such a job back in that lane while the machine is not up, it moves back once (`aws stopped under it`). The state is checked at most every `check_seconds`, so the notice can come up to `check_seconds` (5 min by default) after the machine stopped, not within a minute; a job its runner already put back in the queue by then gets no notice and is planned like any job queued for that machine.
+- **Shown.** The Machines section shows the on-demand state next to the probe state: `on demand: stopped, guard ok, 150 s boot`, `on demand: starting`, `on demand: running`, `on demand: refused (guard refused: ...)`. The status (`onDemand`) has the power state, availability and reason, the last check and the last touch with its error. A move explains itself: `moved q1 heavy→aws: est. 2 h 0 min → 63 min; aws stopped, guard ok, 150 s boot; overflow: heavy had 1 waiting; aws idle`.
+
+```yaml
+placement:
+  machines:
+    workstation:
+      probe: ["true"]
+      min_up_seconds: 0
+    aws:
+      probe: ["ssh", "aws-gate", "echo", "ok"]
+      expect: "ok"
+      on_demand:
+        state_cmd: ["/path/to/aws-gate.sh", "state"]   # prints running|stopped|pending|stopping
+        guard_cmd: ["/path/to/aws-gate.sh", "guard"]   # exit 0 + "guard: ok" = start allowed
+        touch_cmd: ["/path/to/aws-gate.sh", "touch"]   # refreshes the machine's idle timer
+        boot_seconds: 150
+        cost_per_hour: 0.35
+        check_seconds: 300
+  lanes:
+    heavy: { machine: workstation, slots: 1 }
+    aws: { machine: aws, slots: 2, limits: { big: 1 } }
+  routing:
+    heavy:
+      overflow_to: [aws]
+      prefer_when_faster: true
+      min_gain_seconds: 300
+  eligible:
+    heavy: [small, big]
+    aws: [small, big]
+```
+
+With this configuration a job waiting in `heavy` goes to `aws` when it would finish at least 5 minutes sooner there, the 150-second boot included (with `prefer_when_faster`, so does one that would start now on `heavy` but finishes 5 minutes sooner on `aws`). While the guard refuses, nothing goes to `aws` and what is queued there comes back to `heavy`.
 
 ### Placement API
 
-`GET /api/placement/status?project=` (read-only): the mode and why act mode is off, config errors, the last tick, every machine's probe state (up, starting, down; since when; load and cpus), every lane's slots in use and per-class limits, every job's class, expected start and finish, advice and why it stays where it is, the latest moves (moved, failed, interrupted, gone, would_move, each with its argv and explanation), and the learned durations.
+`GET /api/placement/status?project=` (read-only): the mode and why act mode is off, config errors, the last tick, every machine's probe state (up, starting, down; since when; load and cpus) and, for an on-demand machine, its power state, availability and reason, last check and last touch, every lane's slots in use and per-class limits, every job's class, expected start and finish, advice and why it stays where it is, the latest moves (moved, failed, interrupted, gone, would_move, each with its argv and explanation), and the learned durations.
 
-Events on the bus: `placement.moved`, `placement.would_move`, `placement.move_failed`, `placement.machine_up`, `placement.machine_down`, `placement.job_held`.
+Events on the bus: `placement.moved`, `placement.would_move`, `placement.move_failed`, `placement.machine_up`, `placement.machine_down`, `placement.job_held`, `placement.machine_stopped_under_job` (`{project, machine, gateId, lane, state}`).
+
+## Cloud machines
+
+> Off by default. With `enabled: true`, Lair describes each cloud machine's instance through its provider, meters what it costs, reads the account's cost, and keeps a money guard that every start goes through. It does not start or stop a machine by itself yet: starting on demand and stopping when idle come next ([cloud runners](design/cloud-runners.md) §11 step 2), through this guard.
+
+```yaml
+cloud:
+  enabled: true
+  check_seconds: 300
+  machines:
+    cloud-1:
+      provider: aws-ec2
+      region: us-east-1
+      profile: lair-gates            # a named profile in your AWS config files; never keys here
+      instance:
+        id: i-0123456789abcdef0
+        tag: { key: role, value: gate-server }
+      price_per_hour: 0.35           # rounded up: the meter counts every run at this price
+      storage_per_month: 6
+  budget:
+    limit: 100                       # US dollars; give the provider's own budget the same limit
+    period: { start: 2027-01-01, end: 2027-12-31 }
+    meter_start: 1
+```
+
+### Cloud options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Watch this project's cloud machines and run the guard. On, it needs at least one machine and a `budget` |
+| `check_seconds` | number | `300` | Seconds between checks (60 to 3600): each machine is described, and the guard runs |
+| `request_timeout_seconds` | number | `30` | Every provider call is cut off after this (5 to 120) |
+| `machines` | map | `{}` | Machine id → machine options (below). An id that is also a machine under `machines:` or `placement.machines` is shown as one machine |
+| `budget` | object | — | The money guard's limit (below) |
+
+Machine options:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `provider` | `aws-ec2` | — | The provider (AWS EC2 for now) |
+| `region` | string | — | The instance's region, such as `us-east-1` |
+| `profile` | string | — | A named profile in your AWS config files: the only source of credentials (see below) |
+| `instance.id` | string | — | The EC2 instance id |
+| `instance.tag` | `{key, value}` | — | A tag the instance must carry. Lair describes, starts and stops only an instance with this id and this tag: one without it is "not found" |
+| `price_per_hour` | number | — | The hourly price, rounded up. The meter counts each run at the higher of the price when Lair recorded it and the current one |
+| `storage_per_month` | number | `0` | The machine's disk per month, counted for every month of the period begun so far |
+
+Budget options:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `limit` | number | — | No start at or above this spend, in US dollars |
+| `period.start`, `period.end` | `YYYY-MM-DD` | — | The days the limit covers, both included (UTC). Outside them no start happens. For promotional credits, cover the credits' validity |
+| `meter_start` | number | `0` | Spend before the meter's first run |
+| `spend_check_hours` | number | `6` | How old the provider's cost reading may get before it is read again (1 to 24): each reading may cost money, and provider data lags anyway. A start never rests on a reading older than a day |
+| `warn_percent` | number | `80` | From this share of the limit on, the guard says `warning` (a start is still allowed) |
+
+### Credentials
+
+Credentials never go in the project's YAML. A machine names a `profile`, and Lair reads that profile alone from the AWS shared config and credentials files (`~/.aws/config` and `~/.aws/credentials`, or the files `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE` name), SSO, role and `credential_process` profiles included. Keys in the server's environment or an instance role are not used in its place. A key named like a credential anywhere under `cloud:` (`access_key`, `secret`, `session_token`, `password`, `credential`), or a value shaped like an AWS access key id, makes the block invalid; the error names the place, never the value.
+
+The profile needs `ec2:DescribeInstances`, `ec2:StartInstances` and `ec2:StopInstances` (the last two limited to instances with the tag), and `ce:GetCostAndUsage`. For example:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "ec2:DescribeInstances", "Resource": "*" },
+    {
+      "Effect": "Allow",
+      "Action": ["ec2:StartInstances", "ec2:StopInstances"],
+      "Resource": "arn:aws:ec2:*:*:instance/*",
+      "Condition": { "StringEquals": { "aws:ResourceTag/role": "gate-server" } }
+    },
+    { "Effect": "Allow", "Action": "ce:GetCostAndUsage", "Resource": "*" }
+  ]
+}
+```
+
+### The meter and the money guard
+
+- **Spend** is the larger of two. Lair's meter: every run of every machine (the launch and stop times the provider reports) at `price_per_hour`, rounded up to whole minutes, plus `storage_per_month` for every month of the period begun so far, plus `meter_start`. A run whose stop the provider does not date counts up to the check that saw it stopped; a run still open when the machine launches again ends at that launch at the latest. And the provider's reading with what the meter counted since that reading's data ends: the reading is the account's unblended cost with credits and refunds left out, from `period.start` to today, read at most every `spend_check_hours` and kept in `data/cloud.db` (a restart does not read it again). Cost Explorer's data can be a day late, so a reading taken at T holds the spend up to T less a day; the meter's runs since then, and storage by the hour (at a 28-day month's rate), are added to it, so the provider's lag never hides a run.
+- **What Lair did not see.** The provider dates only an instance's last launch, so runs that started and stopped while Lair was down, or between two checks, leave nothing but a newer launch. When Lair sees a launch newer than the last one it saw, after it last saw the machine stopped, the time from that sighting (less a minute) to the launch is a gap. A gap up to two checks long (`2 × check_seconds`) counts at `price_per_hour` as if the machine ran throughout (a start Lair makes itself adds about a minute this way). A longer one (Lair was down, or describes failed) is blind: no start happens until a cost reading taken a day after that launch is in, as its data then holds whatever ran. The first time Lair sees a machine is blind up to its last launch: a machine last launched before `period.start` has nothing to wait for, one launched in the period waits up to a day. A machine seen running before and after a gap keeps one run across it, so that whole time counts. Gaps are kept in `data/cloud.db`: a restart forgets none.
+- **At the limit** (spend at or above `limit`) the guard trips: no start, the trip is recorded once with its spend, limit, period and reason, and `cloud.guard_tripped` is emitted. Later readings do not clear it, nor does a restart, nor does any edit of the config: a higher `budget.limit` or a new `period` alone leaves it standing (anything that can write the project file could make that edit). Only the owner clears it: **Clear the trip** in a cloud machine's detail (the Machines section), which sends `POST /api/cloud/trip/clear` with the owner's session and the trip's time. The clear is recorded with the owner session's public id and an optional note, logged, and emitted as `cloud.trip_cleared`; the guard then judges the spend again at the next check or start, and trips again if it is still at the limit. So raise `budget.limit` (and the provider's budget) first, then clear the trip.
+- **The clock.** A clock behind the provider's never makes the meter count short: every run counts a minute at least (as EC2 bills one at least per start), and a stop the provider dates after this machine's clock is kept as dated, not cut back to now. A launch or stop dated more than a minute after this machine's clock means the clock is wrong: that machine's description is not recorded and starts are refused until the clock is fixed.
+- **It fails closed.** A machine Lair could not describe in this check, a cost reading that failed, a blind gap no reading covers yet, or a day outside the period refuses a start too (`refused`, not a trip: starts are allowed again once the readings come back). A new account has no cost data for up to a day: that reading is "no data yet" (`unknown`), and the meter decides alone, but only for a new account: within two days of the account's first reading, while no amount was ever read for it, and, when the answer simply held no cost, while the meter has counted nothing (no storage, no run in the period). Past that, "no data" is a failed reading and refuses starts, so a wrong filter, a changed answer or another payer account never quietly removes the provider's reading.
+- **Every start** runs the guard first on fresh readings: each machine is described again, and the cost is read if its reading is due. Checks and starts run one at a time. A stop is never refused. A config reload replaces the project's cloud instance: the old one calls no provider again (a start queued on it is refused), and the module exports no provider, so nothing in Lair reaches a provider's start but through the guard.
+- **Shown to the owner only.** The Machines section lists each cloud machine with its power state (`running`, `stopped`, `pending`, `stopping`, or `unknown` with the reason), shows the spend and the guard in its header (`Cloud spend $12.40 of $100.00 (12.4%) · guard ok`), and in a machine's detail its instance and tag, last launch and stop, price, the meter's parts (compute, storage, starting amount, today), each account's reading and any trip. A browser not signed in as the owner sees none of it.
+- **The account stays hidden.** A provider's error text names the account and the role (`User: arn:aws:sts::<account>:assumed-role/... is not authorized`). Lair hides every ARN, 12-digit account id and access key id in it (`arn:(hidden)`, `(account id hidden)`) before it keeps, logs or shows it, and keeps at most 300 characters.
+
+### Cloud API
+
+Every route is the owner's, reads included (the status names the account's instances and spend): `/api/cloud` is in `OWNER_ONLY_PREFIXES`, so no CORS is granted under it, and a request without the owner's session gets HTTP 403.
+
+`GET /api/cloud/status?project=` (read-only): config errors, the last check, each machine's provider, region, instance and tag, power state, last launch and stop, last check and error, and the budget: limit, period, spend and its share of the limit, the meter's parts, each account's cost reading (`amount`, `unknown`, `error`, `not_read`), and the guard (`ok`, `warning`, `tripped`, `refused`) with its reason and the trip that stands (`{limit, period, spend, at, reason}`).
+
+`POST /api/cloud/trip/clear?project=` with `{"trippedAt": "<the trip's at>", "note": "..."}` (owner): clears the trip that stands. `trippedAt` must be the standing trip's time, so a page showing an older trip clears nothing (HTTP 409, as when no trip stands). Answers `{cleared, by}` (the trip and the owner session's public id).
+
+No route starts or stops a machine or changes the budget: the machines and the budget are changed in the project's YAML or in Settings.
+
+Events on the bus: `cloud.guard_tripped` (`{project, limit, spend, reason}`), `cloud.trip_cleared` (`{project, trippedAt, limit, spend, by, note}`).
+
+## Host services
+
+> Off by default. With `enabled: true`, Lair probes the services that work needs on each machine (a container engine, a tunnel daemon). In `observe` mode (the default) it reports outages and asks you once when one lasts; in `act` mode it also starts a service that is down and holds the pipeline lanes that need it.
+
+Gates and pipelines need host services to be running: a container engine for containerized runs, a tunnel daemon to reach a remote machine. When one is down, jobs fail with unhelpful errors ("Cannot connect to the Docker daemon") or hang. The host-services module notices the outage, starts the service again (act mode), keeps pipeline jobs that need it from starting while it is down (act mode), and asks you once when it cannot fix it.
+
+```yaml
+host_services:
+  enabled: true
+  mode: observe                    # observe | act
+  interval_seconds: 60             # probe every minute
+  probe_timeout_seconds: 15        # a probe that runs longer is killed: the state is unknown, never up
+  start_timeout_seconds: 30
+  start_delay_seconds: 10          # after a start, probe again this soon (in the same tick)
+  start_grace_seconds: 120         # after a start, the service has this long to come up before it counts as down
+  backoff_max_seconds: 1800        # the wait between starts doubles from start_grace_seconds up to this
+  stable_seconds: 300              # up this long ends the outage: counts reset, its decision is withdrawn
+  max_start_attempts: 3            # starts per outage before Lair stops and asks
+  escalate_after_probes: 5         # failed probes with no start path before Lair asks
+
+  machines:
+    build-1:
+      - name: docker
+        probe: ["docker", "info"]
+        start: ["open", "-a", "Docker"]
+        needed_by: [heavy, light]
+
+      - name: tunnel
+        probe: ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "build-2", "true"]
+        start: ["launchctl", "start", "com.example.tunnel"]
+        needed_by: [remote]
+
+    build-2:
+      - name: docker
+        probe: ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "build-2", "docker", "info"]
+        start: ["ssh", "-o", "BatchMode=yes", "build-2", "sudo", "systemctl", "start", "docker"]
+        needed_by: [remote]
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Enable host services monitoring |
+| `mode` | `observe` \| `act` | `observe` | `observe` probes, reports and asks; `act` also starts services and enforces lane holds |
+| `interval_seconds` | number | `60` | Seconds between probe cycles (10–3600) |
+| `probe_timeout_seconds` | number | `15` | Seconds before a probe is killed (1–120); a killed probe is a failure, whatever it printed |
+| `start_timeout_seconds` | number | `30` | Seconds before a start command is killed (1–300) |
+| `start_delay_seconds` | number | `10` | Seconds after a start before the probe in the same tick (1–300, at most `start_grace_seconds`) |
+| `start_grace_seconds` | number | `120` | Seconds a started service may take to come up: no second start and no "down" before then (10–3600) |
+| `backoff_max_seconds` | number | `1800` | The longest wait between two starts (60–86400) |
+| `stable_seconds` | number | `300` | Seconds a service must stay up before its counts reset and its decision is withdrawn (30–86400) |
+| `max_start_attempts` | number | `3` | Starts per outage before Lair stops starting it and raises a decision (1–20) |
+| `escalate_after_probes` | number | `5` | Failed probes with no start path (observe mode, a read_only project, a probe that times out) before a decision (1–1000) |
+| `machines` | map | `{}` | Per-machine service lists (machine id → service array) |
+
+### Service options
+
+Each service is a map with:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `name` | string | required | Display name (letters, digits, `_`, `-`; max 32) |
+| `probe` | array | required | Argv that exits 0 when the service is up |
+| `start` | array | required | Argv to start the service (act mode only) |
+| `needed_by` | array | `[]` | Pipeline lanes, pipelines, or `<pipeline>.<lane>` jobs that need this service |
+
+The probe and start commands run directly from their argv (no shell, no stdin), on the machine Lair runs on: to probe or start a service on another machine, put the remote command in the argv (for example `ssh`). Each command is killed at its timeout (SIGTERM, then SIGKILL two seconds later), and only the process Lair started is signalled. The probe decides: exit 0 within `probe_timeout_seconds` is up; a timeout is **unknown** (Lair cannot tell, so it never starts the service on it); anything else (an exit code, a program that is missing, more than 1 MB of output) is down.
+
+### How host services works
+
+Every `interval_seconds`, for each service of each machine:
+
+1. **Probe** it and record the state, the exit code and whether it timed out. Its output is never kept.
+2. **Start** (act mode, state down): run `start`, wait `start_delay_seconds`, probe again. A service that is not up yet is **starting** for `start_grace_seconds`: it is not started again in that window, so a slow starter gets one start, not three. If the start command itself fails, the service is down at once. The wait before the next start is `start_grace_seconds`, then doubles per start, up to `backoff_max_seconds`.
+3. **Stop and ask** (one decision per outage, in the [Decision Inbox](#decision-inbox)):
+   - after `max_start_attempts` starts without a stable recovery, Lair stops starting it (state **failing**): `start_failed`, or `flapping` when it came up after a start and went down again before `stable_seconds`;
+   - after `escalate_after_probes` failed probes with no start path: `not_started` (observe mode, or a read_only project), or `probe_timeout` (the probe keeps timing out).
+   Answer **Start it again** / **Ask again later** (`retry`) to clear the counts, or **Leave it to me** (`leave`) to keep Lair from starting it or asking again until it has stayed up for `stable_seconds`.
+4. **Recover**: the first passing probe makes it **up** and releases its lanes; once it has stayed up for `stable_seconds`, the counts reset and the open decision is withdrawn. A service that comes up and dies again keeps its counts, so it is not restarted every tick.
+
+The counts, the last start (and its grace window), the backoff and the open decision are kept in `data/host-services/<project>.json`, so a restart or a config reload neither repeats a start early nor raises a second decision. A file written by a newer Lair is left alone (the states stay in memory and the status says so); an unreadable one is replaced.
+
+### Lane holds
+
+While a service is not up (down, unknown, starting or failing), the names in its `needed_by` are held. In act mode the [gate pipelines](#gate-pipelines) manager does not start a new attempt of a job whose lane, pipeline or `<pipeline>.<lane>` is held: the job waits (`waitReason: "held: docker on build-1 is down since ..."`) and goes on by itself once the probe passes. An attempt already running is never stopped. In observe mode, or while the module is stopped, holds are only reported (`enforced: false`).
+
+A project's own gate runner, which claims requests from its queue by itself, is not held by Lair; it can ask `GET /api/host-services/:project/holds/check?lane=` before it claims.
+
+### Host services API
+
+`GET /api/host-services/:project` (public, read-only): enabled, running, mode, actBlocked reason, whether holds are enforced, config errors, the last tick summaries, services per machine (state, last probe's exit code and timeout, last start, starts, failed probes, next start, holds, decision id), and held lanes. No probe output and no command arguments.
+
+`GET /api/host-services/:project/machines/:machine`: services for one machine.
+
+`GET /api/host-services/:project/holds`: the lanes held now, each with its reason, the outage's start time and whether it is enforced.
+
+`GET /api/host-services/:project/holds/check?lane=`: `{lane, held, enforced, reason}`.
+
+`POST /api/host-services/owner/:project/tick` (owner only: it runs start commands in act mode): run a probe cycle now.
+
+Events on the bus, on a change only: `host-service.down` (`{project, machine, service, cause}`, cause `probe_failed` or `probe_timeout`), `host-service.starting` (`{project, machine, service, attempt}`), `host-service.up` (`{project, machine, service}`), `host-service.decision` (`{project, machine, service, decisionId, code}`).
+## Infrastructure Monitor
+
+> Off by default. With `enabled: true` and the default `mode: observe`, the infrastructure monitor probes the machines of your gate lanes, watches the jobs on them, and shows what it finds in its status; it raises nothing, runs nothing but its probes, and writes nothing. With `mode: act` it raises one [notice](#action-items-and-notices) per finding in the [Decision Inbox](#decision-inbox), withdraws it once the problem is gone and, with `requeue_cmd`, re-queues a job of a down machine once onto a lane whose machine is up.
+
+It finds four problems, each only once it has lasted `down_threshold_seconds` without a break (a single failed probe, or a machine that flaps up and down, is not an outage):
+
+1. **`machine_down`**: a machine has failed its probes while a job runs in one of its lanes, or while jobs wait there. A machine that is down with nothing on it is not a finding (an on-demand server stopped while idle). A job counts as "under" a down machine once the machine answered at least once while the job ran (it went down under the job), or once the job has run `start_grace_seconds` (a job claimed while its on-demand server is still starting is not a finding). One notice per machine, listing its jobs.
+2. **`job_lost`**: a running request (`.req.run`) whose process group, from the `<request>.pgid` file the runner writes next to it, no longer exists: nobody runs the job any more, and its request still says running.
+3. **`slot_overflow`**: a lane has more running requests than `slots`: more than one runner claims a slot.
+4. **`dead_runner`**: jobs wait in a lane and none of its `runner_pid_files` names a live process.
+
+```yaml
+infra_monitor:
+  enabled: true
+  mode: observe                  # observe (default): show only | act: notices and re-queues
+  interval_seconds: 60
+  down_threshold_seconds: 120    # how long a problem must last before it is a finding
+  probe_timeout_seconds: 15      # every probe; one that does not finish in time is a failure
+  machines:
+    local:
+      probes:
+        - ["/usr/local/bin/docker", "info", "--format", "{{.ServerVersion}}"]
+    laptop:
+      probes:
+        - argv: ["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "user@laptop.example", "echo", "ok"]
+          expect: "ok"
+    cloud:
+      probes:
+        - argv: ["/usr/local/bin/aws", "ec2", "describe-instances", "--instance-ids", "i-0123456789abcdef0",
+                 "--query", "Reservations[0].Instances[0].State.Name", "--output", "text"]
+          expect: "running"
+      start_grace_seconds: 900    # a job claimed while the server starts is not under a down machine yet
+  lanes:
+    heavy:  { machine: local, slots: 1, runner_pid_files: ["runner-heavy.pid"] }
+    remote: { machine: laptop, slots: 2, runner_pid_files: ["runner-remote.pid", "runner-remote2.pid"], requeue_to: [heavy] }
+    cloud:  { machine: cloud, slots: 2, requeue_to: [remote, heavy] }
+  requeue_cmd: ["/opt/gates/requeue-running.sh", "{id}", "{from}", "{to}"]
+  requeue_timeout_seconds: 120
+  requeue_max_attempts: 2
+  requeue_backoff_seconds: 300
+```
+
+### Options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Run the monitor for this project. Enabled with no `lanes` is refused: it would watch nothing and look healthy |
+| `mode` | `observe` \| `act` | `observe` | `observe` shows findings and the re-queues it would run, and writes nothing. `act` raises and withdraws notices and runs `requeue_cmd`, unless the project is `read_only: true` |
+| `interval_seconds` | integer | `60` | Seconds between ticks (10–3600) |
+| `down_threshold_seconds` | integer | `120` | How long a problem must last, without a break, before it is a finding (30–3600) |
+| `probe_timeout_seconds` | integer | `15` | Deadline of every probe (1–120). At the deadline the probe and every process it started are killed, and the probe failed, whatever it printed |
+| `machines.<id>.probes` | list | — | 1 to 5 probes, run in order; the machine is up when every one exits 0 in time and, with `expect`, prints that text. A probe is an argv (`["prog", "arg"]`) or `{ argv, expect }`. A machine with no probe is refused (it would count as up) |
+| `machines.<id>.start_grace_seconds` | integer | `down_threshold_seconds` | A job counts as under this machine once the machine was seen up during it, or once it has run this long (0–7200) |
+| `lanes.<lane>.machine` | machine id | — | The machine that runs the lane |
+| `lanes.<lane>.slots` | integer | `1` | How many jobs the lane runs at once (1–16) |
+| `lanes.<lane>.runner_pid_files` | list | `[]` | The lane's runner pid files in `gates_dir` (`runner-remote.pid`, `runner-remote2.pid` for a second slot); without them `dead_runner` is not checked for the lane |
+| `lanes.<lane>.requeue_to` | list | `[]` | Lanes a running job of this lane may be re-queued to, in order of preference; the first whose machine is up now is used |
+| `requeue_cmd` | argv | none | Act mode: re-queues a running job. Placeholders `{id}`, `{from}`, `{to}`; it must pass `{id}` and `{to}`, and the program can't be a placeholder. Exit 0 is moved; anything else, or the timeout, is a failure. Your command must stop the run on the old machine and put the request into the new lane |
+| `requeue_timeout_seconds` | integer | `120` | Deadline of `requeue_cmd` (1–900) |
+| `requeue_max_attempts` | integer | `2` | Attempts of one job's re-queue before it gives up (1–5) |
+| `requeue_backoff_seconds` | integer | `300` | Wait after a failed attempt, doubled each time, at most 6 h (30–3600) |
+
+### How it works
+
+Every `interval_seconds`, one tick:
+
+1. **Read the queue.** `<gates_dir>/queue` is listed (asynchronously, at most 5000 entries) for the requests of the configured lanes: queued (`.req`) and running (`.req.run`, with the process group in its `.pgid` file). Files are read without following a symbolic link and without blocking on a FIFO. A queue that can't be read is an error in the status, and nothing is added, cleared or withdrawn on that tick.
+2. **Probe the machines**, all at once, each probe an argv run without a shell in its own process group.
+3. **Read the runner pid files** and check each pid (a signal-0 check: nothing is sent).
+4. **Detect** the four findings above.
+5. **Act mode only.** Each finding raises one notice (class `infra_monitor.notice`, evidence code = the finding's type, with the machine, lane, jobs and the probe's error as facts), deduped by its key (`machine_down:<machine>`, `job_lost:<id>`, `slot_overflow:<lane>`, `dead_runner:<lane>`). A notice stays open until its cause has been gone for `down_threshold_seconds` plus one interval, then it is withdrawn, so a flap neither withdraws nor raises it again. A notice you answered ("Noted") is not raised again while that occurrence lasts; it is when the problem clears and comes back. After a restart an open notice is kept (not raised twice) and withdrawn once its cause stays gone. Switching a project to observe, `read_only` or off withdraws the notices it raised.
+6. **Re-queue (act mode, with `requeue_cmd`).** Each running job of a `machine_down` finding is re-queued at most once: onto the first lane of its `requeue_to` whose machine is up now, never the down one; with none up it waits. At most 4 re-queues run per tick. Every attempt is kept in `data/infra-monitor-requeues.json` before its command runs, so a restart neither repeats a re-queue that worked nor retries one that failed before its backoff; an attempt the restart interrupted counts as failed. A ledger file that can't be read is never overwritten: re-queues stop until it is fixed or removed, and the status says so.
+
+**Observe mode writes nothing.** No notice, no command but the probes, no ledger file. `GET /api/infra-monitor/status` shows the findings and, under `plannedRequeues`, each re-queue act mode would run with its exact argv, or why it would not.
+
+**No false green.** A probe that times out, exits non-zero or misses `expect` is a failure; the status shows `stale: true` when no tick has finished for three intervals, and `lastError` when the queue or the ledger can't be read or a notice can't be raised.
+
+### Infrastructure Monitor API
+
+All read-only; no route starts, stops or changes anything.
+
+- `GET /api/infra-monitor/status?project=`: enabled, running, mode, `actBlocked` (why act mode does nothing), the last tick, `lastError`, `stale`, machines, jobs, findings, `plannedRequeues` and the ledger's `requeues`.
+- `GET /api/infra-monitor/machines?project=`: each machine's `up`, `downSince`, `upSince`, `lastProbeAt`, `lastError` and lanes.
+- `GET /api/infra-monitor/jobs?project=`: the running jobs watched, with their claim time, process group and whether it is alive.
+- `GET /api/infra-monitor/findings?project=`: the current findings with their notice id.
+
+Events on the bus: `infra_monitor.finding` (`{project, key, type, summary, mode}`), `infra_monitor.cleared` (`{project, key, type}`), `infra_monitor.requeued` (`{project, id, from, to, result, attempts, error}`).
 
 ## Cleanup
 
@@ -2187,19 +2783,19 @@ cleanup:
 
   worktrees:
     repos:
-      - /Users/dev/my-project
+      - /home/user/my-project
     after_merge: true
     min_idle_hours: 24
 
   retention:
-    - path: /Users/dev/my-project/work/gates/snapshots
+    - path: /home/user/my-project/work/gates/snapshots
       keep_days: 2
       kind: worktree
       skip_if_referenced:
-        - /Users/dev/my-project/work/gates/queue/*.req
-        - /Users/dev/my-project/work/gates/queue/*.req.run
+        - /home/user/my-project/work/gates/queue/*.req
+        - /home/user/my-project/work/gates/queue/*.req.run
 
-    - path: /Users/dev/my-project/work/gates/results
+    - path: /home/user/my-project/work/gates/results
       keep_days: 30
       kind: file
 ```
@@ -2261,6 +2857,147 @@ Events on the bus: `cleanup.removed`, `cleanup.cycle`, `cleanup.safety_violation
 
 The Health tab shows "Would free N GB (M entries)" in observe mode, and "Last cleanup: freed N GB (M entries)" in act mode, with links to the removals list.
 
+## Infrastructure policy scan
+
+Before any `plan` runs on infrastructure code, a static scan reads the code and refuses what it must not run ([design](design/deploy-aws.md#21-policy-scan-before-plan)). The scan reads files only: it never runs OpenTofu, a provider or a program. It is off unless you turn it on.
+
+```yaml
+infra_policy:
+  enabled: true                       # default false
+  roots:                              # absolute paths of the directories the scan reads
+    - /srv/infra/staging
+  allowed_providers:                  # provider sources that may be used
+    - hashicorp/aws
+  allowed_modules:                    # remote module sources: an exact source, or a prefix ending in /
+    - terraform-aws-modules/vpc/aws
+    - git::https://example.com/org/
+  allow:                              # denied blocks you accept: root, address and the block's content hash
+    - root: /srv/infra/staging
+      address: data.http.health
+      hash: 3b1c0f5a9d2e4c7b8a6f1e0d9c8b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b
+```
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `enabled` | boolean | `false` | Turn the scan on for this project |
+| `roots` | list of absolute paths | `[]` | Directories of infrastructure code; required when enabled |
+| `allowed_providers` | list | `[]` | Provider sources, `namespace/type` or `host/namespace/type`; `hashicorp/aws` and `registry.opentofu.org/hashicorp/aws` are the same provider. Every provider the code declares or implies (from a resource, data or provider block, or a `provider` meta-argument) must be listed |
+| `allowed_modules` | list | `[]` | Remote module sources. An exact source, or a prefix ending in `/` that names a host and at least one path segment (`git::https://example.com/org/`). A bare scheme, a host (`https://github.com/`) or `/` is a config error, and a source with a `..` segment never matches. Local modules (`./` or `../`) need no entry: they are scanned like the root, and must stay inside it |
+| `allow` | list | `[]` | Denied blocks to accept. Each entry has `root` (one of `roots`), `address` (`data.http.health`; a block in a local module is `module.<name>.` plus its address) and `hash`, the content hash the scan reports for that block. Editing the block (a changed `url` or `command`) changes its hash and ends the allowance: the scan then refuses it and marks it `changedSinceAllowed`. The same address in another root is not allowed |
+
+Refused, unless allowed: `external` and `http` data sources (also inside a `check` block), any provisioner (`local-exec`, `remote-exec`, `file`, others) on any resource or in a `removed` block, a provider not in `allowed_providers`, a remote module not in `allowed_modules`, a local module outside its root, a `source` that is not a plain string, a block of a type the scan does not know or with the wrong number of labels (`unknown-block`), and code the scan cannot read: `.tf`, `.tofu`, `.tf.json` and `.tofu.json` files, at most 1 MiB each, 8 MiB and 500 files in total, 8 module levels, and a 10 second deadline; a string escape it does not decode (it decodes `\n`, `\r`, `\t`, `\"`, `\\`, `\uNNNN`, `\UNNNNNNNN`) is unreadable too. An allowed use is not refused but is listed as `allowed`.
+
+An invalid block (unknown keys, relative roots, `enabled` without roots, a bad `allowed_*` entry or `allow` entry) never turns the scan off: unless the block says `enabled: false`, the project is **blocked**, every `guardPlan` refuses with `invalid-config`, and `GET /api/infra-policy/status` shows the errors. Lair reads this block at startup.
+
+The rule names are what an agent sees of a refusal (`policy violation: denied-external-data`); the file, line, address and hash are for you. Rules: `denied-external-data`, `denied-http-data`, `denied-local-exec`, `denied-remote-exec`, `denied-file-provisioner`, `denied-provisioner`, `provider-not-allowed`, `module-not-allowed`, `module-outside-root`, `source-not-literal`, `unknown-block`, `invalid-config`, `unreadable`. The scan does not read remote modules: allow only sources you have pinned and reviewed. Checking the lock file's hashes belongs to the plan sandbox, not this scan.
+
+### Infrastructure policy API
+
+Both routes are the owner's (signed in on the dashboard), reads included, and get no CORS.
+
+| Route | Meaning |
+|-------|---------|
+| `GET /api/infra-policy/status?project=` | Whether the scan is on or blocked (with the errors), the roots, and the last scan of each |
+| `GET /api/infra-policy/scan?project=&root=` | Scan a configured root (all roots without `root=`); 404 when the scan is off, 409 when the project is blocked, 400 for a root that is not configured |
+
+The routes read files and run nothing. Server code that plans asks `InfraPolicyManager.requires(project)` and, when true, plans only through `get(project).guardPlan`, which does not start the plan when the scan fails (or when the config is blocked).
+
+## Plan sandbox
+
+`tofu plan` is not read-only: it runs every provider and data source in the code ([design](design/deploy-aws.md#22-plan-isolated)). The plan sandbox runs it in an isolated container with the read-only plan role and nothing else. It is off unless you turn it on, and it needs the [policy scan](#infrastructure-policy-scan) on for the project: a plan never starts on code the scan did not pass.
+
+```yaml
+plan_sandbox:
+  enabled: true                       # default false
+  plan_role_arn: arn:aws:iam::123456789012:role/lair-plan
+  external_id: lair-plan-1            # required; what the role's trust policy asks for
+  image: plan-runner:1                # container image with the tofu binary
+  plugin_dir: /srv/infra/provider-mirror
+  provider_api_hosts: ["*.amazonaws.com"]
+  registry_hosts: [registry.opentofu.org]
+  egress_network: plan-egress         # optional; without it the plan has no network
+```
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `enabled` | boolean | `false` | Turn the sandbox on for this project |
+| `plan_role_arn` | IAM role ARN | none | The read-only role every plan assumes; required when enabled. Lair asks STS for 15 minutes (900 s, the shortest STS issues) and never stores the credentials |
+| `external_id` | string | none | Required when enabled: the external id for the assume-role call, so the role is never assumed without one. Not a secret |
+| `region` | string | `us-east-1` | Region of the credentials |
+| `image` | string | none | Image the plan runs in; required when enabled (a plain image reference) |
+| `plugin_dir` | absolute path | none | The provider mirror, mounted read-only. Providers come from here with `init -lockfile=readonly`; nothing is downloaded at plan time. Required when enabled; a plain path, no `:` or `,` |
+| `provider_api_hosts` | list of hosts | `[]` | Hosts the plan may reach: the provider APIs. A host, or `*.` plus a domain |
+| `registry_hosts` | list of hosts | `[registry.opentofu.org]` | Hosts the plan may reach: the module and provider registries |
+| `egress_network` | container network | none | A network whose only exit is a proxy or firewall that lets exactly the two host lists through. **Lair does not run that proxy and does not filter by hostname**: with this key set the isolation is only as good as your proxy (hostname enforcement is follow-up #203). `host`, `bridge`, `default` and `container:` are refused; `none` or no key gives the container no network at all (`--network none`, enforced by docker) and a plan that needs the cloud fails |
+| `timeout_seconds` | integer | `600` | 10 to 900; a step that runs longer is killed, and never longer than the credentials' life |
+| `max_output_bytes` | integer | `262144` | Output kept for the owner; the rest is cut |
+
+**What a run does,** in this order, each step ending the run before the next: Lair copies the root (leaving out `.git`, `.terraform`, `*.tfstate*` and `.env*`; a symlink or special file refuses the copy), the policy scan reads the root, the root is hashed again and must still match the copy, `.terraform.lock.hcl` must pin every provider with a version and verified hashes, each on `infra_policy.allowed_providers`, and only then are the plan role's credentials issued. `tofu init -lockfile=readonly -plugin-dir=/plugins` and `tofu plan -lock=false -detailed-exitcode` then run in the copy. The container is read-only, drops every capability, has a memory and process limit, and its whole environment is the plan role's credentials plus fixed settings: no variable of Lair's own reaches it. The credentials are removed from the output before it is shown. Fixed settings (`PATH`, `HOME`, the tofu switches, the region) go to the container with explicit values; the credentials go by name only, so they are not in the process list; the docker client gets only its own settings (`PATH`, `HOME`, `DOCKER_*`), and `aws sts` gets only `AWS_*`, `PATH` and `HOME`.
+
+**Image requirement and crash cleanup.** The command runs under `timeout -s KILL`, a few seconds after Lair's own limit, so a container cannot outlive a dead Lair by more than that: the image needs a `timeout` command (coreutils or busybox). At startup, when a project has the sandbox on, Lair removes leftover `lair-plan-*` temp copies and containers (it assumes one Lair per machine). Output past 8 MiB stops the run and is reported as `output`, not as a timeout.
+
+An invalid block (unknown keys, no role, no mirror, a relative path, a bad host or a timeout over 900) never turns the sandbox off: unless the block says `enabled: false`, every plan is refused with `invalid-config` and `GET /api/plan-sandbox/status` shows the errors. Lair reads this block at startup.
+
+### Plan sandbox API
+
+Both routes are the owner's (signed in on the dashboard) and get no CORS.
+
+| Route | Meaning |
+|-------|---------|
+| `GET /api/plan-sandbox/status?project=` | Whether the sandbox is on or blocked (with the errors), the role, the declared egress hosts (`declaredEgressHosts`, with `egressHostsEnforcedByLair: false`) and the limits; no credential |
+| `POST /api/plan-sandbox/plan?project=&root=` | Plan one of the project's `infra_policy.roots` through the scan and the sandbox; 404 when the sandbox is off, 400 for a root that is not configured. The answer is `refused` (with the reason), `failed` (init, plan, timeout, output or credentials) or `planned` (`changes`, the output, when the credentials expire) |
+
+## OpenTofu runner
+
+Plans and applies infrastructure from the control plane ([design](design/deploy-aws.md#26-apply)). It adds no execution path of its own: every plan and every apply goes through the [policy scan](#infrastructure-policy-scan) and the [plan sandbox](#plan-sandbox) (copy, scan, lock-file check, then credentials), so the project needs both on. Off unless you turn it on; `observe` mode, the default, plans and never applies.
+
+```yaml
+tofu_runner:
+  enabled: true                       # default false
+  mode: observe                       # observe (plan only) or act (apply an approved plan)
+  apply_role_arn: arn:aws:iam::123456789012:role/lair-apply
+  external_id: lair-apply-1
+  state_bucket: lair-state-123456789012
+  environments: [staging, production]
+  plan_dir: /var/lib/lair/tofu-plans
+```
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `enabled` | boolean | `false` | Turn the runner on for this project |
+| `mode` | `observe` or `act` | `observe` | `observe` refuses every apply; `act` applies a plan the owner approved |
+| `apply_role_arn` | IAM role ARN | none | The role `tofu apply` assumes (1 hour); required when enabled and never the plan role (the block is then invalid). Not used for a plan |
+| `external_id` | string | none | Required when enabled: the apply role's external id. Not a secret |
+| `state_bucket` | S3 bucket name | none | Required when enabled. Each workspace (an environment of one root) has its own state, `<project>/<env>/<root name>-<8 hex of the root path hash>/terraform.tfstate`, with `use_lockfile=true` (OpenTofu 1.8+ native locking, no lock table) and `encrypt=true`; the code declares an empty `backend "s3" {}` and Lair passes these as `-backend-config` |
+| `environments` | list of names | `[]` | The environments that can be planned and applied; at least one when enabled |
+| `plan_dir` | absolute path | none | Where plan files, their records and the audit log are kept (files 0600). Required when enabled; keep it outside any repository. Lair creates it 0700 and refuses to plan or apply (`plan-dir-unsafe`) when it is not a directory of its own user or is open to group or others |
+| `apply_timeout_seconds` | integer | `1800` | 60 to 3600; never longer than the apply role's hour |
+| `plan_max_age_seconds` | integer | `86400` | 60 to 604800 (a week). A plan older than this is refused (`plan-expired`) and can no longer be applied; plan again |
+
+**Plan.** The sandbox runs `tofu init` with the S3 backend, then `tofu plan -lock=false -out=lair.tfplan` with the plan role (which reads state, never writes). It then reads the plan back with `tofu show -json` and records which resources it deletes (`destroys`) and which it replaces (`replaces`); a plan whose changes cannot be read is refused (`plan-unreadable`). A plan with changes is kept as `<id>.tfplan` with a record (project, root, environment, the plan file's SHA-256, the hash of the code it was made on). A newer plan of the same root and environment supersedes the older, which can then no longer be applied. A plan with no changes keeps nothing.
+
+**Apply.** Only `act` mode, only a plan that is still `planned`, and only when the hash sent with the approval equals the recorded hash and the file on disk still hashes to it. Then the sandbox repeats copy, scan and lock-file check, refuses when the code is not the code that was planned, and runs `tofu apply lair.tfplan` with the apply role. OpenTofu itself refuses a plan made on a state that has since changed. A plan is applied once. Only one plan or apply runs per workspace (root and environment) at a time; another is refused at once with `workspace-busy`, while a different root or environment is not held up. A plan that deletes or replaces anything also needs its own confirmation: the plan answer carries `destroys`, `replaces` and `destroyConfirmation` (a hash bound to the plan and those resource names), and the apply is refused (`destroy-not-confirmed`, naming the resources) unless `confirmDestroy` carries it. An apply that raises an error or is cut off by a restart ends `failed` (never left `applying`), its file is dropped, and the owner plans again; Lair marks such leftovers failed when it starts.
+
+**A failed apply is not rolled back.** Resources the apply created or changed stay, and the state records them. The plan is spent (`failed`, or `stale` when the state or code changed), its file removed, and the runner re-plans from the state as it now is; the answer carries that new plan, which needs a new approval. Nothing runs `destroy` on its own. Each outcome is logged with the plan hash and the time.
+
+**Audit.** Every plan, every apply request (refused ones too, with the reason), every apply start and every apply end is appended to `audit.jsonl` in `plan_dir` and sent as a `tofu.plan`, `tofu.apply.refused`, `tofu.apply.started` or `tofu.apply.finished` event. An entry holds the time, the owner session id, project, environment, root, the full plan hash, the outcome and reason, and the destroyed or replaced resources; no tool output and no credential. An apply does not start when its start entry cannot be written.
+
+**No spend check yet.** An apply does not consult the [cloud money guard](#cloud-machines) or any cost estimate (cost estimation is a later change of the design). With `mode: act` an approved plan creates paid resources with no spend limit in front of it, so turn `act` on knowingly. The default, `observe`, and the default of being off keep this safe.
+
+An invalid block (or an `apply_role_arn` equal to the plan role) never turns the runner off: unless the block says `enabled: false`, every call is refused with `invalid-config` and `status` shows the errors. Lair reads this block at startup.
+
+### OpenTofu runner API
+
+All routes are the owner's (signed in on the dashboard) and get no CORS. A project without `tofu_runner.enabled` answers 404 (400 for a missing or unknown `root`, `env`, `plan` or `hash`).
+
+| Route | Meaning |
+|-------|---------|
+| `GET /api/tofu-runner/status?project=` | On or blocked (with the errors), mode, apply role, bucket, environments; no credential or external id |
+| `GET /api/tofu-runner/plans?project=` | The plan records: id, root, environment, plan hash, status (`planned`, `applying`, `applied`, `failed`, `stale`, `superseded`, `expired`) and times. Never the plan file |
+| `GET /api/tofu-runner/audit?project=&limit=` | The newest audit entries (default 100, at most 500), oldest first |
+| `POST /api/tofu-runner/plan?project=&root=&env=` | Plan one environment of a configured root. `refused`, `failed`, or `planned` (`changes`; with changes also `planId` and `planHash` to approve) |
+| `POST /api/tofu-runner/apply?project=&plan=&hash=&confirmDestroy=` | Apply the plan `plan` whose approved hash is `hash`; `confirmDestroy` is needed when the plan destroys or replaces. `applied`, `refused` (`observe-mode`, `unknown-plan`, `not-approvable`, `hash-mismatch`, `plan-file-changed`, `plan-expired`, `destroy-not-confirmed`, `workspace-busy`, `plan-dir-unsafe`, `audit-unavailable`, `policy`, ...) or `not-applied` (with `replan`) |
+
 ## Planner
 
 > Off by default. With `enabled: true`, Lair keeps [fill](#fill)'s tasks file itself: it marks tasks done, drops the ones the plan marks done, and runs a supervised planner agent when something happens, whose proposals it checks before anything changes ([design](design/planner.md)). A project then needs no free-running orchestrator agent that edits the tasks file.
@@ -2276,7 +3013,7 @@ Plan and backlog files are read whole up to `max_bytes` (a larger one is refused
 
 **The rules** run every `interval_seconds`, with no agent:
 
-- **done**: a line whose task the queue reports done, by fill's own done check (`done_pattern`, the lines written since the task's latest run started, the whole file for a task Lair never ran), becomes `<done_marker><line>` (`#done worker-a|...`), which fill reads as a comment. `mark_done: lair_runs` limits this to tasks the agents module ran, for a project where another launcher still runs some tasks and reuses task ids for a whole workstream; `off` turns it off.
+- **done**: a line whose task the queue reports done, by fill's own done check (`done_pattern`, the lines written since the task's latest run started, the whole file for a task Lair never ran), becomes `<done_marker><line>` (`#done worker-a|...`), which fill reads as a comment. `mark_done: lair_runs` limits this to tasks the agents module ran, for a project where another launcher still runs some tasks and reuses task ids for a whole workstream; `off` turns it off. An unassigned line is left alone: it has no agent whose report fill's done check (and its ready guard) can judge; once the queue reports it done, fill no longer counts it as ready work.
 - **plan done**: a line whose task id is a plan or backlog task marked done is removed (`drop_plan_done`).
 - Every edit is checked with fill's parser: one that would add a malformed line, a duplicate task, a task past fill's 200 or a file over 256 KB is refused. Lines Lair writes name only agents in `agents.fill.agents`.
 - In `act` mode the tasks file is written atomically (a new file in its directory, then a rename) and only if it still has the content the change was made from; a tasks file that is a symlink is never written. In `observe` mode nothing is written: each change is recorded once as `planned`.
@@ -2290,7 +3027,7 @@ Its **only output** is the proposal file, `<work_dir>/<run id>/proposals.json`:
 {"proposals": [{"op": "add", "task": "feat-search", "agent": "worker-b", "text": "Search page", "reason": "ready in the plan; worker-b is idle"}]}
 ```
 
-- `op`: `add` (a new task id, an allowlisted `agent`, and `text`, the line's description), `finish` (mark it done), `reassign` (another allowlisted `agent`), `reword` (new `text`), `drop` (remove the line), `unblock` (release fill's `blocked` or `no_done` hold on it, a run that stopped without done and said so, never an `owner`, `waiting` or `waited_too_long` hold, and clear the planner's blocked record); `reason` always. An `unblock` needs a task the planner recorded as blocked by a task problem (not by its environment, nor one needing you), with an attempt left (`attempts_per_task`): applying it spends one. Neither `unblock` nor `reword` may touch a task you chose to leave blocked.
+- `op`: `add` (a new task id, an allowlisted `agent`, and `text`, the line's description), `finish` (mark it done), `reassign` (another allowlisted `agent`; for an [unassigned line](#fill), whose agent is `null` in the context, the first), `reword` (new `text`), `drop` (remove the line), `unblock` (release fill's `blocked` or `no_done` hold on it, a run that stopped without done and said so, never an `owner`, `waiting` or `waited_too_long` hold, and clear the planner's blocked record); `reason` always. An `unblock` needs a task the planner recorded as blocked by a task problem (not by its environment, nor one needing you), with an attempt left (`attempts_per_task`): applying it spends one. Neither `unblock` nor `reword` may touch a task you chose to leave blocked.
 - Each proposal is checked in order: the schema (unknown keys are refused), fill's task-id rules and `task_id_pattern`, the allowlist (never the planner agent), the tasks file as the proposals before it leave it (`add` needs a new id, not a done one; the others an open line; `reassign` and `drop` wait while the task has an active run), one proposal per task, `text` one line of at most 500 characters, and `max_proposals` (the rest are refused). A refused proposal is kept with its reason. A run whose agent didn't complete, wrote no file, a file over 256 KB, a symlink or not `{"proposals": [...]}` fails; its triggers wait for the next run, and after `max_failed_runs` failures in a row planner runs pause and you are asked once.
 - In `act` mode accepted proposals are applied at once, except ops with `approval: always` (default: `finish`, `reassign`, `drop` and `unblock`; only `add` and `reword` apply by themselves); in `observe` mode all of them wait. A task the queue reports done is the rules' to mark, so a `finish` of the planner's own has no done line behind it, and an `unblock` starts again work fill held: you see each one. Waiting proposals are listed in the Planner view, where you approve or reject each one or a whole run, and each run with waiting proposals raises one [Decision Inbox](#decision-inbox) decision ("Apply them all" or "Reject them all"). An approval is checked again against the tasks file as it is then. **Approving writes the tasks file, in observe mode too.**
 
@@ -2388,6 +3125,488 @@ Config errors (an unknown key, an invalid pattern or one without its group, a `t
 
 Events: `planner.changed`, `planner.run_started`, `planner.run_finished`, `planner.proposals_pending`, `planner.blocked`, `planner.tasks_file_restored`. Decisions are raised as module `planner`. Everything is kept in `data/planner.db`: a restart keeps the pending triggers, the planner run in progress, waiting proposals and the history.
 
+## Repositories
+
+`repos:` lists a project's repositories once, for every module that reads pull requests of more than one: the [ready guard](#fill) and [PR health](#pr-health). Each entry says which branch its PRs merge into, whether its hosted CI counts, and the short names task text uses for it.
+
+```yaml
+repos:
+  - repo: example/app       # owner/name
+    default: true            # a bare "PR #12" means this repository
+    base: main               # default: the host's default branch
+    ci_counts: true          # false: hosted CI is not a signal here
+    refs: [app]              # app#12, app PR #12
+  - repo: example/lib
+    ci_counts: false
+    refs: [lib]
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `repos` | list | see below | At most 20 entries; a repository listed twice is an error |
+| `repos[].repo` | string | required | `owner/name` (GitHub's limits: a 39-character owner, a 100-character name) |
+| `repos[].default` | boolean | `true` with one entry, else `false` | With two or more entries, exactly one is `true` |
+| `repos[].base` | string \| null | `null` | The branch its PRs merge into; `null`: the host's default branch |
+| `repos[].ci_counts` | boolean | `true` | `false`: the repository's hosted CI is not a signal (it is disabled, or never runs): red, running or missing CI is never an item |
+| `repos[].refs` | list | the name part, when valid | At most 8 short names, each a letter then up to 39 letters, digits, `_`, `.` or `-`; not `pr` or `pull`; unique across entries (ignoring case). Default names that two entries share are dropped from both |
+
+**PR references.** Task text and done lines name a PR as `owner/name#12` (a listed repository), `<ref>#12`, `<ref> PR #12` or `<ref> pull request #12` (that entry's repository), or `PR #12` (the task's repository when its description has `repo:owner/name`, the tracker's tag, else the default). A bare number never names a repository that is neither the task's nor the default, and `xapp#12`, `app#123` and `app#12a` are not `app#12`.
+
+**Without `repos:`** the list is `tracker.repos[]` (each entry's `repo` and `default`; two or more with no default are read as no default), else the review repository (`review.repo`, else `github:`, with `review.default_branch` as its base), else empty: the modules that need it are inactive and say why. The ready guard reads the list only when `repos:` is set; without it the guard works as before (the review repository, `PR #<n>` forms only). An invalid `repos:` is reported (`repos[1].refs[0]: ...`) and turns off what reads it (the ready guard reads only the review repository, as without `repos:`, and PR health does not start); the project still loads. The error shows on the dashboard's config banner from startup on, and a live reload to an invalid `repos:` is refused (the previous config keeps running). An explicit ref that is another entry's name (`refs: [lib]` beside `example/lib` without `refs`) is an error too: set that entry's `refs` to tell them apart.
+
+No one module owns `repos:`, so an edit to it reloads every module of the project.
+
+**Hosts.** Each listed repository other than the review repository is read through a GitHub host of its own, built once (a rate-limit answer blocks only that repository), with the review module's token (`review.token_env`, `review.token_cmd`) and `review.api_url`; one request may take 20 s, and a timeout is a failure.
+
+## PR health
+
+PR health reads the open pull requests of each repository in [`repos:`](#repositories) and finds the ones that went bad: `conflicts` (the host says the PR can't merge into its base), `behind` (more than `behind_threshold` commits behind the base), `no_ci` (no check has run at the head of a non-draft PR for `no_ci_minutes`) and `ci_red` (the newest run of a check at the head failed). `no_ci` and `ci_red` need the repository's `ci_counts`. Design: [docs/design/pr-health.md](design/pr-health.md).
+
+It is off unless a project sets `pr_health.enabled: true`, and it starts in **observe** mode: it emits events and serves a read-only status (`GET /api/pr-health/status?project=`), and writes nothing. In **act** mode it also sends the owning agent one note per problem and withdraws it once the problem clears, and raises a Decision Inbox notice only when nobody owns the PR or a note could not be delivered (see Act mode below). Startup logs `[pr-health] Watching PRs for: …` or `[pr-health] Off (no project sets pr_health.enabled)`, and a changed `pr_health:`, `review:` or `repos:` reloads it without a restart.
+
+```yaml
+pr_health:
+  enabled: true
+  mode: act                      # default observe; act needs notify_cmd
+  interval_seconds: 300
+  ignored_prs: [example/app#7]
+  ignored_branches: ["dependabot/**"]
+  notify_cmd: ["/opt/lair-hooks/agent-note", "{agent}", "{id}", "{message}"]
+  withdraw_cmd: ["/opt/lair-hooks/agent-unnote", "{agent}", "{id}", "{message}"]
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | |
+| `mode` | `observe` \| `act` | `observe` | `act` needs `notify_cmd`; a `read_only` project only observes |
+| `interval_seconds` | integer | `300` | 60-3600; the first tick runs 1 s after start, and the next is scheduled when one ends |
+| `request_timeout_seconds` | integer | `20` | 1-120; a timeout is a failure of that repository for the tick |
+| `max_prs_per_repo` | integer | `30` | 1-100 PRs read per repository and tick (newest first, PRs left unread last tick before them) |
+| `max_requests_per_tick` | integer | `120` | 10-1000 requests per tick, shared by the project's repositories; a tick also ends at half the interval |
+| `behind_threshold` | integer | `30` | 1-10000 |
+| `no_ci_minutes` | integer | `20` | 1-1440, since the PR was last updated |
+| `clear_minutes` | integer | `10` | 0-1440: a kind that successful reads no longer find is cleared after this long |
+| `kinds.{conflicts,behind,no_ci,ci_red}` | boolean | `true` | Turn a kind off |
+| `ignored_prs` | list | `[]` | `owner/name#N` of a listed repository, at most 200 |
+| `ignored_branches` | list | `["dependabot/**"]` | Head branch globs (`*` within one segment, `**` across, `?`), at most 50 |
+| `owner.branch_window_minutes` | integer | `360` | 0-10080: how recent a head commit must be for the owner rule's branch step (0: no branch step) |
+| `notify_cmd`, `withdraw_cmd` | argv \| null | `null` | The commands that send a note and withdraw one (act mode); placeholders `{agent}`, `{repo}`, `{pr}`, `{head}` (8 hex), `{kinds}` (comma-separated), `{id}` (the delivery id) and `{message}` (one line, at most 500 characters) only. `withdraw_cmd: null` marks a withdrawal `skipped` |
+| `command_timeout_seconds` | integer | `30` | 1-300; a command that does not exit in time is killed with its process group and counts as failed |
+| `max_attempts` | integer | `3` | 1-5 attempts per note or withdrawal |
+| `backoff_seconds` | integer | `300` | 30-3600: the wait after a failed attempt, doubled each time (at most 6 h) |
+| `escalate_after_minutes` | integer \| null | `null` | 10-10080: an `unfixed` notice when a problem is still found this long after its note was sent; `null`: never |
+
+**What is read.** Each tick reads each repository in order: its open PRs (one page of 100; `truncated` in the status says more exist, and a PR missing from a full page is not taken as closed) and its base tip. A PR named in `ignored_prs`, from a branch in `ignored_branches` or into another branch than the base (a stacked PR) is skipped and listed with why. For the others the PR itself is read for its mergeability and compared with the base when its head or the base tip moved or mergeability was not known yet, and its checks are read unless they all passed at this head. An unchanged PR whose checks passed costs no request. The host's token and URL are the review module's (`review.token_env`, `review.token_cmd`, `review.api_url`), else `GITHUB_TOKEN` and `https://api.github.com`.
+
+**Findings.** One per (repository, PR, head, kind), keyed `pr_health:<owner/name>#<n>@<head8>:<kind>`. A moved head, a closed PR and a PR that becomes skipped clear at once; a kind that is no longer found clears after `clear_minutes`. Mergeability the host has not worked out yet (`null`) neither opens nor clears `conflicts`. Findings are kept in memory and found again after a restart.
+
+**Failures.** Each repository is read on its own: a timeout, a rate-limit answer or any host error stops that repository for the tick and keeps its findings exactly as they were (nothing is cleared, and nothing is found again when it recovers); its state is `error`, and `pr_health.repo_error` is emitted once when an error streak starts. The request budget and the deadline stop a repository the same way, with `partial` in the status and the unread PRs first next tick.
+
+**Owner.** After each tick, every (repository, PR, head) with a finding gets an owner from fill's last check (in memory; no file is read). The owner is the agent of the latest open task line (`started`, `claimed` or `held`) whose name or description names the PR: `app#42`, `app PR #42`, `example/app#42`, or a bare `PR #42` / `#42`, which means the line's `repo:owner/name` repository, else the default. Done, malformed, not-allowlisted and unassigned lines never name one. If no line does, and `owner.branch_window_minutes` is above 0, the owner is the one agent the head branch maps to through `review.authors.branch_pattern` and `review.authors.branches`, if that agent has an open line and the head commit's committer date is inside the window (read once per head). Otherwise nobody owns it, with the reason. With no agents module or fill off nobody owns any PR; before fill's first check the owner is unknown.
+
+**Status.** `GET /api/pr-health/status?project=` shows each repository (`state`, `partial`, `truncated`, skipped PRs with why), each finding with its owner, and `planned`: what act mode would do now, a note per owned (repository, PR, head) with the argv `notify_cmd` would run, and a `no_owner` notice per unowned one (an unknown owner plans nothing). The note's text uses Lair's words and counts only, never a branch name, check name or PR title.
+
+**Act mode.** With `mode: act` (and a project that is not `read_only`), each tick runs at most 4 commands, notes and withdrawals together, as argv arrays with no shell, in the project's repository, with `command_timeout_seconds`:
+- **Notes.** For each (repository, PR, head) whose owner is an agent, the kinds the last read found that no earlier note of that head named go into one `notify_cmd` run. Its delivery id `{id}` is `pr_health:<owner/name>#<n>@<head8>:<kinds joined "+">`. The note is written to the ledger before the command runs; exit 0 makes it `sent`, which is final (also across restarts); anything else is retried with the same `{id}` after the backoff while its kinds are still found, and gives up after `max_attempts`. `notify_cmd` should be idempotent on `{id}`: a command that delivered and then failed or was cut off by a restart runs once more with the same `{id}`. A kind that clears and comes back at the same head is not noted again; a new head starts over.
+- **Withdrawals.** A sent note is withdrawn once its problem cleared, judged from the reads after a restart too: its PR is gone from a full list (or now skipped), its head moved, or reads at its head found none of its kinds for `clear_minutes`. A note never sent gets none.
+- **Ledger.** `data/pr-health-deliveries.json` (format 1, written atomically). Records older than 14 days, then the oldest over 2000, are pruned, but never one whose head still has a finding, whose withdrawal is pending, or of a repository not read since the start. A file that can't be read or parsed is never overwritten: notes and withdrawals stop and `lastError` says why.
+- **Inbox notices** (class `pr_health.notice`, one per (repository, PR, head), for information with one "Noted" option): `no_owner` (nobody owns the PR; an unknown owner raises nothing), `delivery_failed` (a note gave up) and, with `escalate_after_minutes`, `unfixed`. One noted is not raised again for that head. A notice is withdrawn when its head has no open finding, and one left from before a restart once its repository has been read and nothing was seen for `clear_minutes`. A reload to observe, `enabled: false` or `read_only` withdraws the open notices and runs no command; the ledger stays.
+
+The status adds `deliveries` (the ledger's records of the project) and `warning` (the ledger's cap gave way to records it still needs).
+
+**Events.** `pr_health.finding` `{project, key, repo, pr, head, kind, owner, ownerSource, mode}` (emitted at the end of the tick that opens it, with its owner: `null` when nobody owns it or the owner is unknown), `pr_health.cleared` `{project, key, repo, pr, head, kind, why}` (`fixed`, `head_moved`, `closed` or `ignored`) and `pr_health.repo_error` `{project, repo, error}`. Act mode: `pr_health.noted` `{project, id, repo, pr, head, kinds, agent, result, attempts, error}` (`sent`, `failed` or `gave_up`), `pr_health.withdrawn` `{project, id, agent, result, attempts, error}` (`done`, `skipped`, `failed` or `gave_up`) and `pr_health.escalated` `{project, key, code, decisionId}`.
+
+## Tracker
+
+The tracker keeps a project's GitHub issues, Projects (v2) boards and milestones in step with its tasks, runs and pull requests: a new task gets its issue, a run moves the card to In progress with the agent, a PR closing the issue moves it to In review, the merge or the planner's done line moves it to Done and closes the issue, a blocked task gets a label and one comment. It is off unless a project sets `tracker.enabled: true`, and then it starts in **observe** mode: it records what it would change and sends nothing. Design: [docs/design/tracker.md](design/tracker.md).
+
+```yaml
+tracker:
+  enabled: true
+  mode: observe                 # observe (records only) | act (changes GitHub)
+  create_issues_for_new_tasks: true
+  repos:
+    - repo: example-org/web
+      default: true             # tasks no rule takes go here
+      project: { owner: example-org, number: 3 }   # the board: its owner and the number in its URL
+      agent_field: Agent        # a text field on the board (optional)
+      labels: [lair]            # on every issue Lair creates here
+      milestones:
+        close_when_complete: true
+        rules:
+          - { tasks: ["web-*"], milestone: "M2: Launch" }
+    - repo: example-org/api
+      project: { owner: example-org, number: 4 }
+      match:
+        tasks: ["api-*"]        # task id globs
+        agents: [worker-b]      # or the agent of the task's line
+      create_issues: false      # a public repository: link only, never create
+      redact_patterns: ["internal-\\w+"]   # this repository's texts only
+  redact_patterns: ["codename-\\w+"]
+  auto_link: false              # proposed links wait for the owner
+```
+
+**Which repository a task goes to.** One project may track several repositories, each with its own board and milestone rules. A task goes to the repository its line names (`repo:owner/name` in the description, or an issue URL or `owner/name#N` of a tracked repository), else to the first repository whose `match` takes it (a task id glob, or the line's agent), else to the `default` one. With one repository it is the default. A task no repository takes is not tracked (the status shows why).
+
+**Which issue a task is linked to.** In this order: the issue its line names on purpose (`Issue: #N`, `Closes #N`, `Fixes #N`, an issue URL or `owner/name#N` of a tracked repository; a bare `#N` elsewhere in the text is never taken), if it is open and not a pull request; the issue an earlier create made for it (found by its marker, see below); an open issue (not a pull request) whose title is exactly the task id or the title Lair would give it (`<task>: <description>`); else, when the repository creates issues (`repos[].create_issues`, default `create_issues_for_new_tasks`), a new issue with that title, the redacted description, the repository's `labels` and the milestone its rules give. A reconcile tries at most 10 unlinked tasks this way, each one starting after the last task the one before tried, so every task is tried in turn. A task id the repository's redaction changes is never searched for there.
+
+**Link proposals.** For the open tasks still unlinked (none named on their line, no create pending, a tracked repository takes them), each reconcile reads one page of every tracked repository's open issues (the newest 100 by update; no request when no task needs one) and proposes:
+
+| Reason | When |
+|---|---|
+| `mentions_task` | the issue's title or body names the task id as a word of its own (a task id of 4 or more characters with a letter and a digit or one of `. _ / # : -`; a plain word like `login` or a number like `1234` is too common) |
+| `pull_closes` | an open PR of the task (its branch ends with the task id, or its body names it) closes the issue (`Closes #N`), open and unlinked (at most 5 issues read one by one a reconcile when the page did not have them) |
+| `similar_title` | the issue's title is close to the task's description, alone or after the task id (character bigrams, 0.85 or more; titles of fewer than 10 letters and digits are never compared) |
+
+Only issues of the repository the task goes to are candidates, and an issue linked to a task already is never proposed. A task with one candidate issue, proposed for no other task, is `would_link`; two candidates, or one issue proposed for two tasks, is `ambiguous` and never linked automatically. The status lists the proposals (`proposals`), and each one is recorded once in the audit as `would_link` (op `link_issue`, counted up on each reconcile). With `auto_link: true` in act mode, a `would_link` proposal whose reasons include `mentions_task` or `pull_closes` is linked by the reconcile (at most 10 a reconcile; audited as `link_issue` with `auto: <reasons>` once the link is made). A `similar_title` match alone is never linked automatically (sibling titles such as "fix login bug 1" and "fix login bug 2" score high): it waits for the owner; in observe mode it is recorded only, whatever `auto_link` says. The owner accepts a proposal (an ambiguous one too, by naming the issue) with `POST /api/tracker/links`. A link lives in Lair's store; its card then moves as any link's does. A failed read (the page, an issue) links nothing and leaves the last proposals as they were.
+
+**Observe and act.**
+
+| | observe (the default) | act |
+|---|---|---|
+| Reads GitHub (scopes, boards, issues, PRs, milestones) | yes | yes |
+| Links tasks to existing issues (in Lair's own store) | yes | yes |
+| Links proposed issues (`auto_link`) | no: recorded as `would_link` | with `auto_link: true`; else recorded as `would_link` |
+| Links an issue the owner accepts (`POST /api/tracker/links`) | yes | yes |
+| Creates issues, adds cards, moves cards, sets the Agent field, labels, comments, closes issues, closes or reopens milestones | no: each is recorded as `would_send` in the audit, once (a repeat counts up the same row) | yes, within `write_budget_per_minute`, each one audited |
+
+The client itself is read-only in observe mode: a write is refused before anything is sent. Switching to act (Settings or the project file) reloads the tracker live; what observe recorded is not replayed, the next reconcile makes GitHub match.
+
+**What moves the cards.**
+
+| Lair event (as its module emits it) | On GitHub |
+|---|---|
+| `planner.changed` `{op: "add", outcome: "applied"}` | the task is linked (or its issue created); the card goes to Ready if agents.fill can start it (its agent is in `agents.fill.agents` and fill is on), else Backlog |
+| `agent.run.started` `{kind: "started", task, agent}` | In progress, the Agent field set; a blocked label goes |
+| `review.submitted` `{pr}` | the PR is read: the tasks it closes (or whose id ends its branch name) go to In review |
+| `review.merged` `{pr}` | the PR is read: those tasks go to Done and their issues are closed as completed |
+| `planner.changed` `{op: "mark_done"}` | Done, the issue closed as completed (after the card moved) |
+| `planner.changed` `{op: "drop"}` | the issue closed as not planned |
+| `planner.blocked` `{task, class, rule}` | the `blocked_label` and one comment per reason (kept, so a repeat or a restart posts nothing) |
+| `planner.changed` `{op: "unblock"}` | the blocked label goes |
+
+Only `outcome: "applied"` changes count (`planned` is the planner's own observe mode). An `agent.run.ended` changes nothing: an exit is not a done task. Events never wait on GitHub: a handler queues a job and returns, the jobs of a project run one at a time on a bounded queue (500), and a job dropped when it is full is caught up by the next reconcile.
+
+**Reconcile** (at start, then every `reconcile_interval_seconds`, and on the owner's request): links the tasks of the tasks file that have none yet (at most 10 tried a cycle, in turn), proposes issues for the ones still unlinked (see Link proposals), finishes the ones marked done there, finishes the ones whose PR was merged outside the review module, drops the ones whose line was removed by hand, moves the cards of open PRs to In review, adds missing cards, puts back cards moved by hand (counted as drift fixed only when the fix was sent), retries closes that failed, and closes or reopens milestones. The next one is scheduled when it ends, so two never overlap.
+
+**Merges made outside the review module.** `review.merged` comes only from a merge the review module makes; a PR merged by a script's push, `gh pr merge` or the GitHub web UI emits nothing. So while a linked task is In progress or In review, each reconcile reads one page of the closed PRs of every tracked repository (the newest 100 by update: one request per repository, with the usual timeout; none when no task is In progress or In review) and matches them as `review.submitted` does (the issues a PR closes, a task id ending its branch name). A merged PR finishes its tasks as `review.merged` does: Done, the issue closed as completed, through the write budget, at most 10 tasks a reconcile (the rest wait for the next one). A PR closed without merging changes nothing: the status lists it under `closedUnmerged`. A finished task is never read again, so a merge is applied once, also across a restart. A PR merged long ago that has left the newest 100 is not seen.
+
+**Task lines removed by hand.** The planner's own drop arrives as an event. A linked task whose line is not in the tasks file and not marked done (deleted, or commented out with `#`) for 2 reconciles in a row counts as dropped: with `close_removed_tasks: true` its issue is closed as not planned (at most 10 a reconcile); with the key off (the default) nothing is sent, a `would_close` row is recorded in the audit (once, counted up on each reconcile) and the status lists the task under `removedTasks`. A line fill refuses (malformed, longer than 2000 characters, past its 200 tasks) is still in the file: the task ids on it are never dropped. A tasks file with no task line at all is taken for a broken write and counts nothing. Only a task whose line this process has seen in the file can count as removed: links from before a restart whose lines are gone, or a config reload that points `agents.fill.tasks_file` at another file, count nothing. The count is kept in memory, so a restart or a config reload starts it again; a line that comes back resets it.
+
+**Milestones.** With `close_when_complete` (the default), an open milestone with closed issues and no open one is closed, and a closed one with an open issue is reopened. Only its state is sent: its title, description and due date are the owner's. Lair never creates a milestone; a rule naming one that does not exist is reported and the issue is created without it.
+
+**Idempotent creates.** The create is recorded (pending) before it is sent, and the issue's body ends with a hidden marker (`<!-- lair-task:<hash> -->`). If the answer is lost (a timeout, a restart), the next attempt lists the repository's issues changed since then (the issues list, which does not lag behind as search does) and links the one with the marker instead of creating another. Creates count against the write budget.
+
+**Redaction.** Every text sent (titles, bodies, comments, the Agent field) is redacted first by built-in rules, then by `redact_patterns` (case-insensitive regular expressions): the values of this process's secret-looking environment variables (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*KEY*`...), GitHub, OpenAI-style, Slack and AWS key shapes, private keys, `Bearer` tokens, credentials in URLs, `password=`/`token:` pairs, absolute paths (`/Users/...`, `/home/...`, `/tmp/...`, `C:\...`, `~/...`) and the home directory, email addresses and private network addresses. Then a repository's own `repos[].redact_patterns`, on that repository's texts only: a name a public repository must never see is listed there, and the private repository still gets it. Every text bound for a repository goes through them: the issue title and body, comments, the Agent field of its board; a task id they change is never sent to it in a search either. Texts are bounded after every pattern ran. Titles are one line of at most 200 characters, bodies 3000, comments 600. A blocked comment carries only the planner's class and rule, never the agent's text. Keep a public repository's `create_issues: false` when its task text is not meant to be public: linking reads only.
+
+**The token.** `token_env` / `token_cmd`, else the project's `review.token_env` / `review.token_cmd`, else `GITHUB_TOKEN`; the tracker's variable is also kept from the update command, as review's is. A classic token needs `repo` (or `public_repo` for public repositories only) and `project` (observe mode reads boards with `read:project`); a fine-grained token needs Issues: read and write, Pull requests: read, and Projects: read and write on the board's owner (GitHub reports no scopes for it, so it is not checked up front). At start the tracker reads the token's scopes; a missing one stops its writes and raises **one** decision in the Decision Inbox (class `tracker.token_scopes`) listing them, with the option "I updated the token: check again". A 401, or a 403 that is not a rate limit, stops the writes too until the scopes are checked again. Every request has a timeout (`request_timeout_seconds`) and is cut short when the tracker stops. Rate limits (a 429, a 403 with `Retry-After` or `X-RateLimit-Remaining: 0`, a GraphQL `RATE_LIMITED`) stop every request until `Retry-After` or `X-RateLimit-Reset`; the time is kept across a restart.
+
+### Tracker options
+
+| Key | Default | |
+|-----|---------|---|
+| `enabled` | `false` | Turn the tracker on for this project |
+| `mode` | `observe` | `observe` (records only) or `act` |
+| `repos` | the project's `github`, no board | The repositories it tracks (at most 20), each: |
+| `repos[].repo` | | `owner/name` |
+| `repos[].default` | `false` (`true` for a single one) | Tasks no rule takes go here; at most one |
+| `repos[].project.owner`, `.number` | | The board: its user or organization, and the number in its URL. Without it, issues are linked and closed but no card moves |
+| `repos[].status_field` | `Status` | The board's single-select status field |
+| `repos[].status_options` | `Backlog`, `Ready`, `In progress`, `In review`, `Done` | The option names of `backlog`, `ready`, `in_progress`, `in_review`, `done` |
+| `repos[].agent_field` | none | A text field set to the agent of the task's run |
+| `repos[].labels` | `[]` | Labels of the issues Lair creates here |
+| `repos[].create_issues` | `create_issues_for_new_tasks` | Create issues here for tasks none is linked to (on for a private repository, off for a public one) |
+| `repos[].redact_patterns` | `[]` | Redacted from this repository's texts only, after the built-in rules and `redact_patterns` |
+| `repos[].match.tasks`, `.agents` | `[]` | Task id globs and agent ids this repository takes |
+| `repos[].milestones.close_when_complete` | `true` | Close a complete milestone, reopen one with an open issue |
+| `repos[].milestones.rules` | `[]` | `{tasks: [globs], milestone: "title"}`: the existing milestone of the issues created for those tasks |
+| `create_issues_for_new_tasks` | `false` | Create an issue for a task none is linked to (act mode); the default of each `repos[].create_issues` |
+| `auto_link` | `false` | Link a proposed issue (one candidate, proposed for no other task, and named by the task id or closed by the task's PR: a close title alone never) without the owner, in act mode; off: recorded as `would_link`, listed in the status for the owner to accept |
+| `close_removed_tasks` | `false` | Close as not planned the issue of a linked task whose line was removed or commented out by hand (missing 2 reconciles in a row); off: recorded as `would_close` and listed in the status |
+| `blocked_label` | `blocked` | The label of a blocked task's issue |
+| `redact_patterns` | `[]` | Redacted from every text sent, after the built-in rules |
+| `reconcile_interval_seconds` | `900` | 60 to 86400 |
+| `write_budget_per_minute` | `30` | Writes a minute (1 to 100), creates included |
+| `request_timeout_seconds` | `15` | Each request to GitHub (1 to 120) |
+| `token_env`, `token_cmd` | review's, else `GITHUB_TOKEN` | Where the token is read |
+| `api_url` | `https://api.github.com` | GitHub Enterprise: `https://host/api/v3`; https only |
+
+The tasks it follows are `agents.fill.tasks_file` (the planner's done marker marks the done ones); without one it follows events only. Its store is `data/tracker.db` (its own file, created only when a project enables the tracker). A config error keeps the tracker off for that project and shows in its status; it never stops Lair's start.
+
+### Tracker API
+
+`?project=` defaults to the default project. Every route is the owner's (`/api/tracker` is owner-only, reads included: they show task text and repositories):
+
+- `GET /api/tracker/status`: the mode, each repository and its board (loaded, or why not), the token's scopes (granted, missing), the sync state (last reconcile, next one, drift fixed, errors, the rate-limit wait, what needs the owner), the links, the pending creates, the latest 50 writes (each with its result, or `would_send` in observe mode, or `would_close` for a removed task line while `close_removed_tasks` is off), the queue (waiting, dropped), `closedUnmerged` (linked tasks' PRs the last reconcile saw closed without merging), `removedTasks` (linked tasks whose line is missing: reconciles missed, and `waiting`, `would_close` or `closing`), `proposals` (unlinked tasks, their candidate issues with reasons, score and PR, and `would_link` or `ambiguous`), warnings and config errors
+- `POST /api/tracker/reconcile`: a reconcile now, queued after the jobs waiting (202); recorded in the audit with the owner session. 404 when the tracker is off for the project
+- `POST /api/tracker/links` `{task, repo, issue}`: accept a proposed link (one of the candidates of the last reconcile's proposal for that task, an ambiguous one included). Checked now (409 when it is not proposed or the task is linked already), made by a queued job (202) that reads the issue again (still open, not a PR, linked to no other task) and records `link_issue` in the audit with the owner session (`success`, or `skipped`/`error` and why). 403 without an owner session, 404 when the tracker is off
+
+The tracker emits no events of its own. The dashboard tab is not built yet.
+
+## Lessons
+
+The lessons module (`src/server/lessons/`, `docs/design/autonomy.md` §8) stores what Lair has learned from incidents and operational experience. Each lesson has a signal (how to detect the situation), a cause, a response playbook, and prevention (a check or feature that makes it automatic).
+
+**Built-in lessons** (L1-L28) ship with Lair: generic operational lessons from real incidents (slow gates, idle capacity, Docker down, duplicate runs, etc.). They load on start when the module is enabled and are active by default.
+
+**Project lessons** are proposed by incidents and approved by the owner. They can be specific to this project's patterns and failure modes.
+
+### Configuration
+
+```yaml
+lessons:
+  enabled: false       # Off by default. On: data/lessons.db, built-in lessons, /api/lessons, Knowledge view
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Turns the lessons module on. Off: no `data/lessons.db`, no `/api/lessons` routes (404), no Knowledge view in the nav. Takes effect at server start |
+
+### Lessons API
+
+All routes require the owner's session from the dashboard (HTTP 403 otherwise):
+
+- `GET /api/lessons?project=&status=&scope=&limit=`: List lessons. `status` is `proposed`, `active`, or `retired`. `scope` is `built-in` or `project`. Returns the lessons list with counts.
+- `GET /api/lessons/:id`: Lesson detail with related lessons (same signal).
+- `POST /api/lessons`: Propose a new lesson. If an active or proposed lesson with the same signal exists, increments its match count and returns the existing one (`reused: true`). Body: `{title, signal, cause, response, prevention, feature?}`.
+- `PATCH /api/lessons/:id`: Update a lesson. Built-in lessons can only have their status changed.
+- `POST /api/lessons/:id/approve`: Approve a proposed lesson (changes status to `active`).
+- `POST /api/lessons/:id/retire`: Retire a lesson (changes status to `retired`).
+- `POST /api/lessons/:id/match`: Record a signal match (increments `matchCount`, updates `lastMatchAt`).
+
+### Lesson schema
+
+```typescript
+interface LessonSignal {
+  kind: "check" | "event" | "metric" | "pattern";  // What the signal watches
+  value: string;                                    // Check id, event type, metric name, or regex
+  threshold?: number;                              // For metrics: the trigger threshold
+  direction?: "above" | "below";                   // For metrics: above or below
+}
+
+interface Lesson {
+  id: string;                // L1, L2, ... for built-in; UUID for project
+  title: string;             // Short description
+  signal: LessonSignal;      // How to detect this situation
+  cause: string;             // What causes it
+  response: string;          // What to do (playbook ref or text)
+  prevention: string;        // How to prevent it (check or feature ref)
+  sources: LessonSource[];   // Where this lesson came from
+  status: "proposed" | "active" | "retired";
+  scope: "built-in" | "project";
+  matchCount: number;        // Times the signal has matched
+  lastMatchAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  feature: string | null;    // The feature or duty that makes this automatic
+}
+```
+
+### Built-in lessons (L1-L28)
+
+| ID | Title | Signal | Prevention |
+|----|-------|--------|------------|
+| L1 | A gate runs far longer than it should | metric: `gate_duration_seconds > 2400` | slow-gate check |
+| L2 | An on-demand machine powered off under a running job | event: `machine.stopped` | lease refresh |
+| L3 | Every remote start fails no ssh after a reboot | pattern: `no ssh\|connection refused` | host services |
+| L4 | All gates fail at once in their first step | pattern: `exit 125\|Cannot connect to Docker` | environment class |
+| L5 | Two agents work the same task after a restart | event: `agent.duplicate_task` | adopt runs |
+| L6 | A new task closed with no work done | event: `task.closed_by_wrong_report` | match by task id |
+| L7 | Agents redo old merged work | event: `agent.prompt_stale` | warn on stale prompt |
+| L8 | Agents idle while capacity exists | metric: `idle_agents_with_ready_work > 1` | never-idle rule |
+| L9 | Load average says full but agents barely use CPU | metric: `load_per_agent_cpu_ratio > 10` | capacity class |
+| L10 | The server stops answering | check: `event_loop_lag` | #160: async IO, cache |
+| L11 | A cloud gate takes 35 min while its tests take 4-7 | metric: `gate_local_phase_ratio > 0.5` | remote preflight |
+| L12 | Heavy gates still land on the slow machine | event: `placement.wrong_lane` | routing tests |
+| L13 | Agents report not authenticated | pattern: `not authenticated\|could not read Username` | env health check |
+| L14 | Edits to a shared file silently disappear | event: `file.reverted_silently` | #96, #94: one writer |
+| L15 | Gate time spent on code that will change | event: `gate.obsolete_by_review` | review first |
+| L16 | A narrow passing gate is not enough to merge | event: `gate.scope_too_narrow` | scope from change |
+| L17 | A PR leaves out part of its approved design | event: `review.missing_from_design` | check design scope |
+| L18 | Commits show a machine user instead of the owner | event: `commit.identity_unallowed` | per-run identity |
+| L19 | A monitor has a blind spot | event: `monitor.missed_incident` | test against incidents |
+| L20 | Durations measured wrong | event: `timing.wrong_source` | named timestamps |
+| L21 | A remote machine is mostly idle yet slow | metric: `remote_idle_but_slow > 1` | check fs type |
+| L22 | The planner suggests the same work twice | event: `planner.duplicate_proposal` | #97: dedupe |
+| L23 | Acting on an agent claim that was wrong | event: `agent.claim_contradicted` | verify claims |
+| L24 | A kill takes down more than the job | event: `process.kill_too_broad` | per-job pgroup |
+| L25 | Full test suites time out on the developer machine | metric: `suite_timeout_on_local > 1` | prefer cloud |
+| L26 | The server stays slow with no clients connected | check: `event_loop_lag` | #160: async ticks |
+| L27 | The watchdog reports a live process as gone | event: `watchdog.false_absence` | #162: timed-out probe |
+| L28 | A task runs twice: once by hand, once by scheduler | event: `task.duplicate_run_manual` | adopt runs |
+
+Data is kept in `data/lessons.db`. The dashboard's Knowledge view shows the lessons list with counts and status badges.
+
+## Brain bench
+
+`lair brain-bench` scores candidate "brains" on recorded decisions: a small local model, a hosted model, or a set of deterministic rules. It is a command, not a server feature: there is no configuration key, it is off unless you run it, it never talks to the Lair server and changes nothing. A shadow mode that compares a model with the real answers later reuses the same scoring.
+
+```
+lair brain-bench --cases cases.jsonl --model ollama:qwen3:4b --model rules:rules.json [--endpoint <url>]
+                 [--api-key-env <NAME>] [--threshold 0.5] [--limit <n>] [--json]
+```
+
+**Cases** are JSON Lines, one decision per line (at most 50,000 lines, 32 KB each, 16 MB in all):
+
+```json
+{"id": "d1", "kind": "escalation", "module": "agents", "evidence": {"class": "rate_limited", "attempts": 3},
+ "options": [{"id": "wait", "label": "Wait for the cooldown"}, {"id": "switch", "label": "Switch profile"}],
+ "label": "wait", "reason": "the cooldown ends soon"}
+```
+
+`evidence` holds structured fields (codes, counts, flags), not prose. `label` is the option id that was answered. `reason` is kept for people and never sent to a model. Three optional fields serve the [brain trainer](#brain-trainer) and are never sent to a model either: `at` (the decision's ISO-8601 time, for the time split), `recommended` (the option id Lair recommended) and `outcome` (`good`, `bad` or `pending`). An invalid value of one of these three is ignored (the field is left out, and the trainer counts a case without a usable `at` as unusable), so a file that scored before still scores. Other fields are ignored. A bad line stops the run with its line number.
+
+**Models** (`--model`, repeat it to compare):
+
+| Spec | What it is |
+|---|---|
+| `ollama:<name>` | An Ollama server (`/api/chat`), the answer constrained with a JSON schema. `--endpoint` defaults to `http://127.0.0.1:11434`. |
+| `openai:<name>` | Any OpenAI-compatible server (`/chat/completions` with a strict `json_schema`): vLLM, LM Studio, llama.cpp, a hosted API. `--endpoint` defaults to `http://127.0.0.1:1234/v1`. `--api-key-env NAME` reads the bearer token from that environment variable; the token is never printed and an endpoint URL with embedded credentials is refused. |
+| `rules:<file.json>` | Deterministic rules scored like a model: `{"rules": [{"when": {"module": "agents", "class": "rate_limited"}, "option": "wait", "reasonCode": "cooldown"}]}`. The first rule whose `when` fields all equal the case's `kind`, `module` or evidence fields answers with confidence 1. No match is an abstain. |
+
+The model is asked for `{"option", "reason_code", "confidence"}` with `option` limited to the case's option ids. The case reaches the prompt as fenced data and is never treated as instructions. A reply that is not valid JSON, names an option the case does not offer, or has no confidence from 0 to 1 counts as an abstain and as an error; so does an endpoint that cannot be reached.
+
+**The report**, overall and for each decision kind, for each model:
+
+| Measure | Meaning |
+|---|---|
+| `accuracy` | correct / all cases (an abstain is not a hit) |
+| `answeredAccuracy` | correct / (correct + wrong) |
+| `abstainRate` | answers below `--threshold` confidence (default 0.5), plus errors |
+| `wrongConfidentRate` | wrong answers at or above the threshold, over all cases: the number to keep near zero before a model may act |
+| `errors` | replies that were unusable (a subset of the abstains) |
+| latency | mean, p50 and p95 per case, in milliseconds |
+
+`--json` prints the report as JSON. Exit code 0 means the bench ran; 2 means bad input and nothing ran. Cases are asked one at a time per model.
+
+## Decision policies
+
+[decision-policies.md](design/decision-policies.md) §3 and §5, rollout step 2: a **policy table** says which option a rule would choose for a class of decision, and Lair writes that proposal into a **policy trace** when the decision is raised. **Nothing answers a decision**: every policy is `shadow` (or `off`), a proposal is never shown with the decision, and the table's only effect is the agreement view for you. `suggest` and `act` do not exist yet; a file that asks for them is refused.
+
+It is off until `data/server.yaml` says otherwise (read once at start, so a change needs a restart):
+
+```yaml
+decision_policies:
+  enabled: true
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Off: nothing is proposed or written to the trace (not at start either), no module updates a raised decision's evidence (`cause_cleared`), and `GET /api/owner/decision-policies` shows the table and `enabled: false` with no agreement. A section with any other key or a value of another type is refused: the policies stay off and the reason is logged and shown in the view |
+
+Without `data/policies.yaml` Lair uses a built-in table with rules C1 (`agents.provider_limit` → `wait` while its cause stands), C2 (`supervisor.check_failing` → `noted` when an issue tracks the check), C3 (`watchdog.idle_capacity` → `stand_down` after two playbook attempts, never with nothing running), C4 (`watchdog.orphan_claim` → `stand_down` while a runner is alive) and C11 (`agents.cannot_start` → `keep_held` while the task's run is below its third attempt; from the third on, or without an attempt count, it abstains). To change it, write the file and restart (it is read once at start):
+
+```yaml
+version: 1
+policies:
+  - id: c1-wait                  # unique; lowercase letters, digits, '_' and '-'
+    class: agents.provider_limit # a class of the policy table (src/server/decisions/structure.ts)
+    codes: [provider_rate_limit] # evidence codes it covers; empty: every code of the class
+    answer: wait                 # the option it proposes: must be offered, and not irreversible or outward
+    reason_code: provider_limit_clears
+    state: shadow                # off | shadow
+    max_tier: 1                  # 1 rules, 2 may also be a model's, 3 stays with you (never proposed)
+    when:                        # every condition must hold
+      - { fact: attempts, op: gte, value: 2 }
+    unless:                      # any guard that holds, or cannot be evaluated, makes the rule abstain
+      - { fact: cause_cleared, op: eq, value: true }
+    expires: 2027-01-01T00:00:00Z   # optional; past it the rule abstains
+```
+
+A condition tests a key of the decision's `evidence.facts`, or `cause_cleared` / `linked_issue`. Operators: `eq`, `ne`, `gt`, `gte`, `lt`, `lte` (numbers), `in` (a list), `present` (not null). A fact that is missing, null or of another type than the value never satisfies a condition. Validation fails closed: an entry with any problem (unknown class, a code the class does not take, a bad operator, a repeated id) is refused and listed in the view, the others load; a file that is not valid YAML, is larger than 256 KB or has the wrong shape gives no policies. Whatever the table says, a rule abstains for a decision of a kind that always waits for you (spend, pricing, legal, account, credentials, go/no-go, security), for an option that is `irreversible`, `outward` or has no effect, and for a decision without a class and evidence.
+
+**The trace** is the `policy_trace` table in `data/decisions.db`: one row per decision, proposer and table version (the version is a hash of the table, so any change starts a new comparison): class, policy, proposed option (empty when it abstained), reason code, confidence, time. A repeated event or a restart writes no second row; open decisions raised while Lair was down (or while the policies were off) get theirs at the next start, all of them, a page at a time in the background. A proposal is written once, when the decision is raised (or at that catch-up): a later `cause_cleared` update does not make a new one. **Agreement** joins the trace to the answers people gave (counted in the database, so the view never reads the whole trace): per class and version, `compared` (answered), `agreed`, `disagreed`, `abstained`, `agreement` (agreed of agreed + disagreed), `coverage` (proposed of compared), `unsafeDisagreements` (a disagreement where the proposal was an `irreversible` or `outward` option), and the decisions still open or withdrawn. It is `GET /api/owner/decision-policies` (owner only) and the **Policy agreement** card on the Decisions page when you are signed in as the owner.
+
+**`cause_cleared` and `linked_issue`** are set when a module raises a decision. A module that learns more later calls `updateEvidence` on the Decision Inbox (`DecisionProducer.updateEvidence`): only the module that raised an open decision, only those two facts, audited as `evidence_updated`, and the same value again changes nothing. While `decision_policies.enabled` is on, the agents module does it for a provider-limit decision when the reset time it named has passed; while it is off, no decision's evidence changes after it was raised. No module tracks an issue yet, so `linked_issue` stays empty and C2 abstains; the planner's C7 stays out of the table until its module re-evaluates `cause_cleared`.
+
+## Brain trainer
+
+The brain trainer starts the training that [decision-policies.md](design/decision-policies.md) §6 calls stage C, and keeps it going: every night it rebuilds the labelled set from the answered decisions, trains a small classifier, scores it on the [brain bench](#brain-bench) against the newest decisions, and keeps the result as a new version. The model that scores best then writes a **proposal into a trace** for each decision raised afterwards. **No model ever answers a decision**: the trainer is handed a read-only view of the Decision Inbox, nothing it produces is shown with a decision, and promoting a model past `shadow` is the owner's decision under the bars in §5 (30 comparisons, 90% agreement for a model, no unsafe disagreement, coverage 60%). It is off until `data/server.yaml` says otherwise.
+
+```yaml
+brain_trainer:
+  enabled: true
+  image: sha256:<64 hex>             # required: the id `docker build -q brain-trainer/` prints; Lair never pulls it
+  run_hour: 3                        # local hour of the nightly run
+  min_labels: 100                    # fewer usable labels: the run only writes its report
+  test_fraction: 0.2                 # the newest share is held out for the bench
+  min_test: 10                       # a newest window smaller than this is not scored
+  confidence_floor: 0.7              # a proposal below it is an abstain
+  timeout_minutes: 15
+  shadow: true                       # the best model writes proposals into the trace
+  cases_file: /abs/path/cases.jsonl  # optional: more labelled cases, in the brain bench format with "at"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Nothing runs, is written or is subscribed to while this is off |
+| `image` | `sha256:<64 hex>` or `name@sha256:<digest>` | none; required when `enabled` | The trainer image, named by content: a tag is refused, because a tag can be moved. Build it once with `docker build -q brain-trainer/` and put the id it prints here; a rebuilt image has a new id, so the config changes with it |
+| `run_hour` | integer 0-23 | `3` | The nightly run starts at this local hour, once a day |
+| `min_labels` | integer 20-100000 | `100` | Below this many usable labels a run only writes its report: no container starts, no model is made |
+| `test_fraction` | number 0.05-0.5 | `0.2` | The newest share of the decisions, by time, held out as the test window |
+| `min_test` | integer | `10` | A test window under this is not scored (the run reports `split_too_small`) |
+| `confidence_floor` | number 0-1 | `0.7` | A proposal below it is an abstain, in the bench and in the trace |
+| `timeout_minutes` | integer 1-240 | `15` | The container ends itself ten seconds sooner (an alarm inside it); one still running after this is killed by its exact name (then `docker rm -f`), and the run fails. A container that cannot be stopped is a failed run that says so |
+| `shadow` | boolean | `true` | Whether the best model writes proposals into the trace |
+| `cases_file` | absolute path | none | Extra labelled cases (the bench's JSON Lines, each with `at`, and `outcome` where known), read through the same file checks as `server.yaml` |
+
+The file is read again at every use, through the checks of the rest of `server.yaml`; a refused file turns the trainer off and the status says why.
+
+**Labels.** An answered decision is a label when a person chose its option; a default applied at expiry, a withdrawn decision and an open one are not. A decision with a single option is an acknowledgement, not a choice: it is never a label and the report counts it as `notices`. A decision raised before the cutoff but answered after it is not a training row (`lateAnswers`). An inbox decision carries an `outcome` when the [outcome tracker](#outcome-tracker) is on (otherwise it is `unknown`), and a case in the cases file can carry one too; `outcome: bad` from either is a negative label. `outcome: bad` on a case marks an answer that turned out wrong: it is never a positive label, and a proposal equal to it for the same evidence (the same class and features, older than the test window) is refused as an abstain. `outcome: pending` is not a label until it is resolved. Only structured fields become features: the class (`module/kind/option ids`), the module, the offered and the recommended option ids, the evidence fields of a case (numbers, flags, and short identifier-like strings), and the hour of the day. A title, a context or a note never reaches a feature.
+
+**The time split.** Decisions are sorted by the time they were raised, and cut at a time, not at a position: everything strictly before the cutoff trains, everything at or after it tests. Decisions of the same instant therefore never fall on both sides, and no newer decision can reach the training set. The run keeps the cutoff in its report.
+
+**The container.** The fit runs in `lair-brain-trainer` (`brain-trainer/`: Python with scikit-learn's gradient boosting, every dependency pinned in `requirements.txt`). The image is built from a base pinned by digest, and its dependencies are installed with `--require-hashes` (every wheel's sha256 is in `requirements.txt`). Lair starts it with `--network none`, `--pull never`, a read-only root, all capabilities dropped, 2 GB of memory with no swap, 2 CPUs and 256 processes, no environment from the host, and two mounts: the input rows read-only at `/in`, and a separate directory at `/out` that receives `model.json`. It never runs as root: it runs as Lair's own user, and Lair refuses to start it when that is uid 0 (run Lair as a regular user). A file the container writes must be a plain file under the size limit, never a link. The model comes back as trees in a JSON file, which Lair validates as untrusted input (bounded size, node counts, child indexes that always point forward) and evaluates itself: no Python is needed to make a proposal, and each proposal takes microseconds.
+
+**Versions.** Each trained run keeps `data/brain/models/m-<UTC time>/model.json` and `report.json`; a version is never overwritten (a second run in the same second becomes `...-2`), and `data/brain/runs.jsonl` lists every run, including the ones that only reported. `data/brain/best.json` names the model that shadows: it moves to a new model only when that model is strictly better on its own test window (accuracy, then fewer wrong-but-confident answers). That is not a promotion: it changes only which model writes proposals.
+
+**The report** is the brain bench's, per class (`module/kind/option ids`, or the `class`/`title_class` a case carries): accuracy, abstain rate and wrong-but-confident rate for the classifier and, beside it, for Lair's own recommended option on the same window, which is the bar to beat. **The shadow trace** (`data/brain/shadow-trace.jsonl`) holds `{decisionId, class, proposer, version, option, reasonCode, confidence, at}` per decision raised (`option` is `null` for an abstain); once a decision is answered, the status compares them: per class and version, proposals compared, agreed, abstained and wrong-but-confident.
+
+**Routes (owner only).** `GET /api/owner/brain-trainer` returns the status: whether it is on, the runs over time with their reports (the curve), the model that shadows, the shadow agreement per class, and `skipped`, the number of lines in the run history and the trace that could not be read and were left out. A run's `reason` is a fixed sentence with a `reasonCode`; paths and the container's own output stay out of it (the detail goes to Lair's log). `POST /api/owner/brain-trainer/run` starts a run now in the background (`202`; `409` while it is off or a run is going).
+
+**Not built yet:** the weekly LoRA run for a local language model (stage D), and the Decisions view's chart of the curve; both are tracked as follow-ups.
+
+## Outcome tracker
+
+The outcome tracker watches what happens after each answered decision and records whether the answer turned out `good`, `bad` or `unknown`, with structured evidence, on the decision itself (`outcome`, `outcomeAt`, `outcomeEvidence`, shown by `GET /api/decisions` and `/api/decisions/:id`). The [brain trainer](#brain-trainer) reads `outcome: bad` as a negative example. It is read-only towards the rest of Lair: it never answers, retries, reverts or changes a decision, and the only things it writes are the outcome fields and one `decision.outcome` event. It is off until `data/server.yaml` says otherwise, and it adds no route.
+
+```yaml
+outcome_tracker:
+  enabled: true
+  check_minutes: 10     # how often answers waiting for a verdict are looked at
+  restart_hours: 24
+  hold_hours: 6
+  release_hours: 24
+  planner_hours: 72
+  merge_hours: 24
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Nothing is opened, subscribed to or written while this is off (`data/outcomes.db` is not created) |
+| `check_minutes` | number 1-1440 | `10` | How often answered decisions without an outcome are judged. A server restart judges them at once |
+| `restart_hours` | number 0.1-720 | `24` | Window after an agent restart answer |
+| `hold_hours` | number 0.1-720 | `6` | Window after a wait / hold answer |
+| `release_hours` | number 0.1-720 | `24` | Window after a release / stand-down answer |
+| `planner_hours` | number 0.1-720 | `72` | Window after a planner proposal answer |
+| `merge_hours` | number 0.1-720 | `24` | Window after a released merge hold |
+
+The section is read when the server starts; a refused file or section leaves the tracker off and logs why.
+
+**Rules.** Each rule is a small function over one answer and the facts that followed it, in the window after the answer (the answer's own instant is not in it; the window's last instant is). The first fact that settles it, in time order, decides. A fact is a code and an id taken from a bus event, kept in `data/outcomes.db` (so a restart in the middle of a window loses nothing) for the longest window plus a day. Anything a rule cannot judge is `unknown`: at once when no rule applies, otherwise when the window ends with nothing settled. An answer that Lair applied by itself at expiry is no label and gets no outcome.
+
+| Answer | Good | Bad |
+|---|---|---|
+| Agent restart (`fresh_session` on an escalation) | a run of the task completes, or its line is marked done | the task fails again, or is escalated again |
+| Wait / hold (`wait` by the agents module) | a run of the held task starts (the cause cleared) | the same hold (same module, key family and task) is raised again |
+| Release / stand-down (`release`, `stop` by the agents module) | never recorded | the same task is escalated again |
+| Planner proposals applied (`approve_all`, `follow_verifier`) | every task the planner added right after the answer is done | one of them is dropped or reworded after it was applied |
+| A released merge hold on a pull request (a ref ending `:pr:<number>`) | never recorded | the merged commit turns the default branch red (`triage.culprit_found`) or is reverted (`triage.revert_requested`); the evidence says `review_miss` |
+
+Facts come from `agent.recovery`, `agent.run.started`, `agent.run.ended`, `decision.raised`, `planner.changed`, `review.merged`, `triage.culprit_found` and `triage.revert_requested`. A "good" for a release or a merge would be a guess, so those end `unknown` when nothing went wrong. Evidence holds codes and ids only (`rule`, `fact`, `factAt`, `task`, `pr`, counts); no title, context, note or agent output.
+
+**One outcome per answer.** The store records an outcome only while the decision has none, and only for the answer made at that time, so a repeat check, a restart or a decision undone and answered again never produces a second or a stale outcome. Each answered decision is judged on its own: a failure before a later answer does not count for it.
+
 ## Example complete configuration
 
 ```yaml
@@ -2440,7 +3659,7 @@ The **Settings** view edits every key on this page, for the owner only (reads in
 - **Nothing invalid is written.** A change is checked first by the same parsers startup and [live reload](#live-config-reload) use; a refused change leaves the file untouched. A saved change is applied by live reload at once.
 - **Only the changed lines change.** A form save edits the file's own text where it can: a changed value, a key removed from or added to a map (a new entry among one-line `{ ... }` entries is written like them). Every other line stays byte for byte: padded flow maps, comments aligned with several spaces, multi-line flow maps, list indentation. A change that can't be made that way (a list that grows or shrinks, a new nested block) writes the file from its parsed form instead: comments and key order still stay, and flow maps keep their padding when the file pads them. YAML anchors are kept too: changing an anchored value (`&name`) from the form changes every alias of it (`*name`), and changing an alias replaces only that alias with the new value (a key inside an alias is edited in the YAML tab).
 - **No silent overwrite.** A save names the version of the file it started from. If the file changed since (a hand edit, another browser), it is refused (HTTP 409) with what saving would now change, and the review drawer offers to review the same changes again on top of the current file.
-- **Commands are confirmed.** A change that adds or changes something Lair runs (any `*_cmd` key, adapters' `start_cmd` and `stop_cmd`, watchdog `actions`, triage `commands`, placement's `probe`, `load_cmd` and `move_cmd`, a step's `run`, a process's `command`, `gate_script`...) shows the exact argv lists and needs your confirmation; the server refuses it without (HTTP 428). So does a change to a field that decides what Lair runs or where it sends code and tokens: a machine's `host`, `user` and `key`, an environment's `compose_files`, `project_directory` and `deploy.repo`, `executors.github.checkout_action`, `review.api_url` and `review.merge.clone_url`.
+- **Commands are confirmed.** A change that adds or changes something Lair runs (any `*_cmd` key, adapters' `start_cmd` and `stop_cmd`, watchdog `actions`, triage `commands`, placement's `probe`, `load_cmd` and `move_cmd`, a step's `run`, a process's `command`, `gate_script`...) shows the exact argv lists and needs your confirmation; the server refuses it without (HTTP 428). So does a change to a field that decides what Lair runs or where it sends code and tokens: a machine's `host`, `user` and `key`, an environment's `compose_files`, `project_directory` and `deploy.repo`, `executors.github.checkout_action`, `review.api_url` and `review.merge.clone_url`, and a cloud machine's `profile` and `instance` and the cloud budget's `limit` and `period` (which account and instance Lair acts on, and how much it may spend).
 - **No secrets.** A value whose key names a secret (`token`, `password`, `api_key`, `private_key`...) or that looks like one (a private key, a known token format, a URL with a password) is refused. Keep secrets in a file under `data/` (mode 0600) or an environment variable and name it in the config (`token_env`, `*_file`); the view shows whether the ones Lair knows are set, never their values. Comments are scanned too, for values shaped like a secret (a comment has no key to go by), and no error message ever quotes a secret.
 - **History.** Every accepted version is kept in `data/config-history/<project>/` (the newest 50) with when and which owner session (its public id) made it; a version Settings finds on disk that it didn't write, such as a hand edit, is kept too before it is replaced. If that version holds something that is or looks like a secret, only a note of it (when, its hash) is kept, never its text, so it can't be restored. Each shows its diff, and **Restore** saves it again through the same checks.
 - **Files.** Writes are atomic (a temporary file, `fsync`, `rename`). A project file that is a symlink, a `projects/local/` that is one, or anything but a regular file is refused. A save is at most 1 MiB, like the file.
@@ -2471,7 +3690,7 @@ Project names (the file name without `.yaml` or `.yml`) must start with a letter
 
 The server watches `projects/` and `projects/local/`. When a project file changes (or a new one appears), it waits until the file has been quiet for a second, then reads it and checks it with every module's own parser, the same checks as at startup:
 
-- **Valid:** only the modules whose part of the file changed are reloaded, each for that project only. A module's part is its own block (`watchdog:`, `delivery:`, `pipelines:` and `executors:`, `review:`, `agents:`, `triage:`, `placement:`, `planner:`, `supervisor:`), the blocks it also reads (the agents module reads `watchdog:`, the planner `agents:`), and every other top-level key a module may read (`repo`, `read_only`, `dragons`, `machines`, `agents_dir`, `outbox_file`...), so a change to one of those reloads every module of the project. Keys no module reads reload nothing: the dashboard's commands (`*_cmd`, `allow_direct_assign`, `backlog_file`), `merge_bar`, `processes`, `orchestrator`, `available_models` and `gate_runner`. Editing only a comment reloads nothing. The dashboard's reads use the new file from the next request.
+- **Valid:** only the modules whose part of the file changed are reloaded, each for that project only. A module's part is its own block (`watchdog:`, `delivery:`, `pipelines:` and `executors:`, `review:`, `agents:`, `triage:`, `placement:`, `planner:`, `supervisor:`, `infra_monitor:`), the blocks it also reads (the agents module reads `watchdog:`, the planner `agents:`), and every other top-level key a module may read (`repo`, `read_only`, `dragons`, `machines`, `agents_dir`, `outbox_file`...), so a change to one of those reloads every module of the project. Keys no module reads reload nothing: the dashboard's commands (`*_cmd`, `allow_direct_assign`, `backlog_file`), `merge_bar`, `processes`, `orchestrator`, `available_models` and `gate_runner`. Editing only a comment reloads nothing. The dashboard's reads use the new file from the next request.
 - **Invalid** (YAML errors, missing required fields, any module's parser refusing its block, a file that is not a regular file or is over 1 MiB): nothing changes, and the modules keep running the previous config. The error is logged, emitted as a `config.invalid` event, and shown in a banner on the dashboard: "projects/x.yaml has an error; the previous config is still running: ..." until the file is fixed.
 - **Another file:** the modules keep running the file they started with. When it is deleted (deleting `projects/local/x.yaml` would otherwise fall back to the public `projects/x.yaml`), or a new file takes its place (a new `projects/local/x.yaml`), nothing changes and the banner says so; restart Lair to switch files. Deleting a project's only file also keeps its previous config running until a restart.
 
@@ -2489,6 +3708,7 @@ A module is reloaded by stopping its instance for the project cleanly and starti
 | triage | The tick, ingests and outbox in progress finish first |
 | placement | As on shutdown: a probe or `move_cmd` in progress is cut short, and a move it cut short is found again by the new instance's first tick. Learned durations, moves and cool-downs are kept (they are in the store); probe history starts again, so a machine is up again only after `min_up_seconds` |
 | supervisor | A round of checks in progress finishes; the next one, a few seconds later, runs with the new settings. A check turned off withdraws its open notice |
+| infra_monitor | A probe or `requeue_cmd` in progress is killed and the tick ends at once (a re-queue it cut short counts as a failed attempt). Machine states and findings start again (a problem must last `down_threshold_seconds` again); open notices are kept and the re-queue ledger is on disk. Switching to observe, `read_only` or off withdraws the notices act mode raised |
 
 Reloads of one module for one project never overlap: a change made while one runs is applied after it, with the latest file (also when the latest file is the one that ran before). A module that fails to start with the new config (for example, its store can't be opened) is started again with the previous one, and the banner says so; it is never left half-started.
 

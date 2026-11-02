@@ -68,6 +68,20 @@ describe("placement config", () => {
     expect(errors({ ...valid, machines: { a: { probe: "true" } } })[0]).toMatch(/^placement\.machines\.a\.probe/);
   });
 
+  it("refuses a touch_seconds shorter than interval_seconds: a touch runs at most once per tick", () => {
+    const onDemand = (touch: Record<string, unknown>) => ({
+      ...valid,
+      interval_seconds: 120,
+      machines: { ...valid.machines, b: { ...valid.machines.b, on_demand: { state_cmd: ["s"], guard_cmd: ["g"], ...touch } } },
+    });
+    expect(errors(onDemand({ touch_cmd: ["t"], touch_seconds: 60 }))).toEqual([
+      "placement.machines.b.on_demand.touch_seconds: 60 is shorter than interval_seconds (120); a touch runs at most once per tick",
+    ]);
+    expect(errors(onDemand({ touch_cmd: ["t"], touch_seconds: 120 }))).toEqual([]);
+    // Without touch_cmd nothing is touched, so the default does not matter
+    expect(errors(onDemand({}))).toEqual([]);
+  });
+
   it("reads globs and /regex/ patterns, first class in the order written", () => {
     expect(compilePattern("*gate.sh*backend*").test("x scripts/gate.sh full-backend {WT}")).toBe(true);
     expect(compilePattern("*gate.sh*backend*").test("gate.sh docs")).toBe(false);

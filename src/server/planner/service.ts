@@ -25,6 +25,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import type { EventBus } from "../core/event-bus.js";
 import type { EventType } from "../../shared/server-types.js";
+import type { DecisionEffect } from "../../shared/decision-types.js";
 import type { ProjectConfig } from "../../shared/types.js";
 import type {
   BlockedClass,
@@ -44,6 +45,7 @@ import type {
 } from "../../shared/planner-types.js";
 import type { DecisionProducer, DecisionResolution, RaiseDecisionInput } from "../decisions/types.js";
 import { buildPrompt, checkDone, MAX_TASKS_FILE_BYTES, QueueLines, queueWindowEnd, type DoneCheck } from "../agents/fill.js";
+import { extractBusId, mirroredReport, type BusLineSource } from "../bus/consumers.js";
 import { doneLineMatches, fillPatternFor } from "../agents/config.js";
 import { utcStamp } from "../agents/sessions.js";
 import { isActive, type QueueMark } from "../agents/types.js";
@@ -110,6 +112,9 @@ const IDLE = "idle_fingerprint";
 const BLOCKED = "blocked";
 const RECENT = "recent_events";
 const BASELINE = "baseline";
+/** bus.consume on: the ids of the bus reports the planner has handled (newest last) */
+const BUS_APPLIED = "bus_applied";
+const MAX_BUS_APPLIED = 2000;
 
 interface Known {
   hash: string;
@@ -155,6 +160,8 @@ export interface PlannerServiceOptions {
   events?: EventBus;
   /** The Decision Inbox, when the server has connected it (read on each use) */
   decisions: () => DecisionProducer | null;
+  /** The project's bus (bus.consume observe or on; read at each cycle), or null: queue lines only */
+  bus?: () => BusLineSource | null;
 }
 
 function withReadiness(tasks: PlanTask[]): PlanTaskView[] {
@@ -188,6 +195,11 @@ export class PlannerService {
   private doc: TasksDoc | null = null;
   private idle: string[] = [];
   private messages: OwnerMessage[] = [];
+  private bus?: () => BusLineSource | null;
+  /** cycleSoon's cycle after the one in progress */
+  private again: Promise<void> | null = null;
+  /** stop() ran: events start no cycle */
+  private ended = false;
 
   constructor(options: PlannerServiceOptions) {
     this.project = options.project;
@@ -195,6 +207,7 @@ export class PlannerService {
     this.settings = options.settings;
     this.store = options.store;
     this.agents = options.agents;
+    this.bus = options.bus;
     this.clock = options.clock;
     this.events = options.events;
     this.decisions = options.decisions;
@@ -240,6 +253,23 @@ export class PlannerService {
     return this.cycling;
   }
 
+  /**
+   * bus.consume on: an accepted bus report, or a message to the
+   * orchestrator. A cycle now instead of at the next interval; one in
+   * progress may have read the queue before the report's line was written,
+   * so one more runs right after it. Nothing once stop() has run. It never
+   * rejects.
+   */
+  cycleSoon(): Promise<void> {
+    if (this.ended) return Promise.resolve();
+    if (!this.cycling) return this.cycle();
+    this.again ??= this.cycling.then(() => {
+      this.again = null;
+      return this.ended ? undefined : this.cycle();
+    });
+    return this.again;
+  }
+
   private async runCycle(): Promise<void> {
     const now = this.clock.now();
     this.cycleError = null;
@@ -265,16 +295,19 @@ export class PlannerService {
       this.sourceViews = [...plan.views, ...(owner ? [owner.view] : [])];
       throw new Error(`the tasks file: ${read.reason}`);
     }
-    const queue = this.readQueue();
+    // bus.consume on: lines that mirror a bus report are read by the report; observe: compared only
+    const bus = this.bus?.() ?? null;
+    const queue = this.readQueue(bus);
     this.sourceViews = [...plan.views, ...(owner ? [owner.view] : []), ...(queue ? [queue.view] : [])];
     this.messages = owner?.messages ?? [];
 
     let doc = parseTasksDoc(read.text, this.settings.doneMarker, this.settings.onePerAgent);
     doc = await this.watchTasksFile(doc, this.store.activeRun(this.project), now);
-    const { doc: afterRules, settled } = await this.deterministic(doc, plan.tasks, now);
+    const { doc: afterRules, settled } = await this.deterministic(doc, plan.tasks, now, bus);
     doc = afterRules;
     const baseline = this.state<boolean>(BASELINE) !== true;
     await this.onEvents(doc, settled, queue?.events ?? [], now);
+    this.markApplied(queue?.events ?? []);
     this.collect(doc, settled, plan.hashes, this.messages, baseline, now);
     this.doc = doc;
     this.setState(BASELINE, true);
@@ -305,16 +338,65 @@ export class PlannerService {
     return { view: read.status, messages: read.messages };
   }
 
-  private readQueue(): { view: SourceStatusView; events: QueueEvent[] } | null {
+  private readQueue(bus: BusLineSource | null): { view: SourceStatusView; events: QueueEvent[] } | null {
     const source = this.settings.sources.find((s): s is QueueSourceSettings => s.kind === "queue_events");
     if (!source) return null;
     const read = readQueueEvents(source, this.settings.roots, this.state<QueueMark>(CURSOR));
     this.setState(CURSOR, read.cursor);
-    if (read.events.length > 0) {
-      const recent = [...(this.state<QueueEvent[]>(RECENT) ?? []), ...read.events].slice(-MAX_RECENT_EVENTS);
+    const events = bus ? this.busEvents(bus, read.events) : read.events;
+    if (events.length > 0) {
+      const recent = [...(this.state<QueueEvent[]>(RECENT) ?? []), ...events].slice(-MAX_RECENT_EVENTS);
       this.setState(RECENT, recent);
     }
-    return { view: read.status, events: read.events };
+    return { view: read.status, events };
+  }
+
+  /**
+   * The project's bus: a line that mirrors a bus report is the report. On:
+   * it takes the report's kind, agent and task (and its summary as the
+   * reason), and a report the planner handled before (its id is kept with
+   * the planner's state, so also across restarts) is dropped. Observe: the
+   * line stays as parsed, and what each reading made of it is recorded for
+   * Home → Health. Hand-written lines are as parsed.
+   */
+  private busEvents(bus: BusLineSource, events: QueueEvent[]): QueueEvent[] {
+    const marked = events.map((event) => ({ event, id: extractBusId(event.text) }));
+    const ids = [...new Set(marked.flatMap((m) => (m.id === null ? [] : [m.id])))];
+    if (ids.length === 0) return events;
+    const reports = bus.reports(ids);
+    const applied = new Set(this.state<number[]>(BUS_APPLIED) ?? []);
+    const out: QueueEvent[] = [];
+    for (const { event, id } of marked) {
+      const report = id === null ? null : mirroredReport(bus, event.text, id, reports);
+      if (id === null || report === null) {
+        out.push(event);
+        continue;
+      }
+      if (bus.mode === "observe") {
+        bus.observed({
+          consumer: "planner",
+          busId: id,
+          task: report.task,
+          agent: report.agent,
+          report: `${report.kind} ${report.task} by ${report.agent}`,
+          file: `${event.type} ${event.task ?? "(no task)"} by ${event.agent ?? "(no agent)"}`,
+        });
+        out.push(event);
+        continue;
+      }
+      if (applied.has(id)) continue;
+      applied.add(id);
+      out.push({ ...event, type: report.kind, agent: report.agent, task: report.task, busId: id, summary: clean(report.summary, 500) });
+    }
+    return out;
+  }
+
+  /** Keep the ids of the bus reports this cycle handled (bus.consume on), so none is handled again. */
+  private markApplied(events: QueueEvent[]): void {
+    const ids = events.flatMap((event) => (event.busId === undefined ? [] : [event.busId]));
+    if (ids.length === 0) return;
+    const kept = [...(this.state<number[]>(BUS_APPLIED) ?? []), ...ids];
+    this.setState(BUS_APPLIED, [...new Set(kept)].slice(-MAX_BUS_APPLIED));
   }
 
   // ============ THE TASKS FILE ============
@@ -441,10 +523,18 @@ export class PlannerService {
           "Only Lair writes the tasks file in act mode. If you made this change, make it again once the run ends.",
         ].join("\n"),
         options: [
-          { id: "continue", label: "Keep planning", consequences: "Planner runs go on as before." },
-          { id: "pause", label: "Pause planner runs", consequences: "No planner run starts until you resume it in the Planner view. The rules (done, plan done) keep running." },
+          { id: "continue", label: "Keep planning", consequences: "Planner runs go on as before.", effect: "reversible" },
+          { id: "pause", label: "Pause planner runs", consequences: "No planner run starts until you resume it in the Planner view. The rules (done, plan done) keep running.", effect: "reversible" },
         ],
         recommended: { optionId: "pause", reasoning: "A change during a planner run may be the planner agent's: pause until you know who made it." },
+        class: "planner.tamper",
+        evidence: {
+          code: "tasks_file_changed",
+          facts: { run: active.id, restored: restored.ok },
+          // The change was undone when the file was put back
+          cause_cleared: restored.ok,
+          linked_issue: null,
+        },
       });
       return restored.ok ? parseTasksDoc(known.text, this.settings.doneMarker, this.settings.onePerAgent) : doc;
     }
@@ -469,13 +559,18 @@ export class PlannerService {
    * mode writes them; observe mode records each as planned, once. Returns the
    * tasks these settle (done or dropped, written or planned).
    */
-  private async deterministic(doc: TasksDoc, tasks: PlanTask[], now: number): Promise<{ doc: TasksDoc; settled: Set<string> }> {
+  private async deterministic(doc: TasksDoc, tasks: PlanTask[], now: number, bus: BusLineSource | null): Promise<{ doc: TasksDoc; settled: Set<string> }> {
     const changes: PlannedChange[] = [];
     const settled = new Set<string>();
     const agentsStore = this.agents.store();
     if (this.settings.markDone !== "off" && agentsStore) {
-      const queue = new QueueLines(this.config.queue_file);
-      for (const line of doc.tasks) {
+      // bus.consume on: a line that mirrors a bus report is read by the report (fill's checkDone, the same way)
+      const queue = await QueueLines.read(this.config.queue_file, bus?.mode === "on" ? bus : null);
+      for (const open of doc.tasks) {
+        // An unassigned line has no agent whose done report fill's checks (and its ready guard) can judge: it is
+        // left to the owner (or a reassign); fill doesn't count it as ready work once a queue line reports it done
+        if (open.agent === null) continue;
+        const line = { ...open, agent: open.agent };
         const latest = agentsStore.latestRunForTask(this.project, line.task);
         if (this.settings.markDone === "lair_runs" && !latest) continue;
         // A task with an active run is not done yet (fill shows it started)
@@ -484,11 +579,13 @@ export class PlannerService {
         try {
           const patterns = this.settings.fillPatterns;
           const until = queueWindowEnd(agentsStore, this.project, patterns, line, latest);
-          check = checkDone(agentsStore, this.project, queue, patterns, line, latest, until);
+          check = await checkDone(agentsStore, this.project, queue, patterns, line, latest, until);
         } catch {
           continue;
         }
         if (!check) continue;
+        // Fill's ready guard decides what a done report is: a refused one marks nothing
+        if (check.kind === "queue" && !(await this.agents.reportAccepted(this.project, line.agent, line.task, check.line, line.description, check.report))) continue;
         settled.add(line.task);
         changes.push({
           edit: { op: "mark_done", task: line.task },
@@ -559,8 +656,13 @@ export class PlannerService {
     this.setState(LAST_TRIGGER, now);
   }
 
-  /** The task a queue line is about: a task id it names, else the reporting agent's only open line. */
+  /**
+   * The task a queue line is about: a task id it names, else the reporting
+   * agent's only open line. A bus report (bus.consume on) names its task
+   * exactly: that task when the tasks file has it, else none.
+   */
   private taskOf(event: QueueEvent, doc: TasksDoc): string | null {
+    if (event.busId !== undefined) return event.task !== null && (findTask(doc, event.task) || doc.done.has(event.task)) ? event.task : null;
     for (const line of doc.tasks) if (namesTask(event.text, line.task)) return line.task;
     for (const task of doc.done.keys()) if (namesTask(event.text, task)) return task;
     if (event.agent) {
@@ -572,7 +674,7 @@ export class PlannerService {
 
   private lineKey(doc: TasksDoc, task: string): string {
     const line = findTask(doc, task);
-    return line ? sha256(renderLine(line.agent, line.name, line.task, line.description)) : "none";
+    return line ? sha256(renderLine(line.agent ?? "", line.name, line.task, line.description)) : "none";
   }
 
   private async onEvents(doc: TasksDoc, settled: Set<string>, events: QueueEvent[], now: number): Promise<void> {
@@ -591,7 +693,8 @@ export class PlannerService {
   private async onBlocked(event: QueueEvent, doc: TasksDoc, now: number): Promise<void> {
     const blocked = this.state<Record<string, BlockedRecord>>(BLOCKED) ?? {};
     const task = this.taskOf(event, doc);
-    const reason = reasonOf(event.text);
+    // A bus report gives its reason as its summary; a hand-written line after its first ": "
+    const reason = event.summary !== undefined ? clean(event.summary, 500) : reasonOf(event.text);
     const c = classifyBlocked(reason, this.settings.blocked);
     if (!task) {
       // Not a task Lair knows: shown, nothing else
@@ -616,7 +719,13 @@ export class PlannerService {
     // Fill holds the run, and asks the owner itself, only when its blocked_pattern matches this line for this task.
     // The planner maps more lines to a task (by the agent's only open line), and those fill takes for runs without
     // a done line: it would start them again before it asks
-    const fillHoldsIt = fillRunsIt && lineAgent !== null && this.fillBlockedPatternMatches(event.text, task, lineAgent);
+    // A bus report is fill's when it reads it (QueueLines in on mode): the task's, by its agent when the pattern names it
+    const fillHoldsIt =
+      fillRunsIt &&
+      lineAgent !== null &&
+      (event.busId !== undefined
+        ? !this.settings.fillPatterns.blockedPattern.includes("{agent}") || event.agent?.toLowerCase() === lineAgent.toLowerCase()
+        : this.fillBlockedPatternMatches(event.text, task, lineAgent));
     if ((c.class === "owner" || c.class === "environment") && fillHoldsIt) {
       // One decision for one line: fill's
       record.route = `${c.class === "owner" ? "needs you" : "its environment"}: fill holds the task and asks you (its decision, in the Agents view)`;
@@ -638,12 +747,20 @@ export class PlannerService {
         options: [
           {
             id: "unblock",
+            effect: "reversible",
             label: "It's sorted: let the task go on",
             consequences: `The planner records ${task} as unblocked, and releases fill's blocked or no_done hold on it if there is one, so fill starts it again.`,
           },
-          { id: "keep", label: "Leave it blocked", consequences: `The planner leaves ${task} alone until its line in the tasks file changes.` },
+          { id: "keep", label: "Leave it blocked", consequences: `The planner leaves ${task} alone until its line in the tasks file changes.`, effect: "reversible" },
         ],
         recommended: { optionId: "keep", reasoning: "Only you know whether the blocker is gone." },
+        class: "planner.unblock",
+        evidence: {
+          code: c.class === "owner" ? "needs_owner" : "infra",
+          facts: { task, agent: event.agent ?? null, block_class: c.class, rule: c.rule },
+          cause_cleared: false,
+          linked_issue: null,
+        },
         blocks: [`planner:${this.project}:task:${task}`],
       });
       const why = fillRunsIt ? ": fill's blocked_pattern doesn't match this line, so fill won't hold it and ask you" : "";
@@ -662,10 +779,17 @@ export class PlannerService {
             `The planner had ${attempts} run(s) for it (planner.attempts_per_task is ${this.settings.attemptsPerTask}).`,
           ].join("\n"),
           options: [
-            { id: "retry", label: "Let the planner try again", consequences: `The planner's attempts on ${task} count from zero, and a planner run starts.` },
-            { id: "keep", label: "Leave it to me", consequences: `The planner leaves ${task} alone until its line in the tasks file changes.` },
+            { id: "retry", label: "Let the planner try again", consequences: `The planner's attempts on ${task} count from zero, and a planner run starts.`, effect: "reversible" },
+            { id: "keep", label: "Leave it to me", consequences: `The planner leaves ${task} alone until its line in the tasks file changes.`, effect: "reversible" },
           ],
           recommended: { optionId: "keep", reasoning: "A task that stays blocked after the planner reworded it usually needs a person." },
+          class: "planner.attempts",
+          evidence: {
+            code: "attempts_exhausted",
+            facts: { task, attempts },
+            cause_cleared: false,
+            linked_issue: null,
+          },
           blocks: [`planner:${this.project}:task:${task}`],
         });
         record.route = id ? "a decision: the planner's attempts are spent" : "attempts spent; the decision was not delivered (no Decision Inbox)";
@@ -812,7 +936,7 @@ export class PlannerService {
       else this.store.insertRun(run);
       await this.failed(run, now, false);
     };
-    const template = buildPrompt([agent.promptFile], getPromptsDir(this.config), { agent: agent.id, task });
+    const template = await buildPrompt([agent.promptFile], getPromptsDir(this.config), { agent: agent.id, task });
     if (!template.ok) return fail(`the planner agent's prompt: ${template.reason}`);
     try {
       mkdirSync(this.settings.workDir, { recursive: true, mode: 0o700 });
@@ -890,10 +1014,17 @@ export class PlannerService {
         title: `${failures} planner runs in a row failed: planner runs are paused`,
         context: [`The last one: ${run.detail}`, "", "The rules (done, plan done) keep running; only planner runs are paused."].join("\n"),
         options: [
-          { id: "retry", label: "Resume planner runs", consequences: "The failure count starts from zero and the next trigger starts a run." },
-          { id: "pause", label: "Keep them paused", consequences: "No planner run starts until you resume it in the Planner view." },
+          { id: "retry", label: "Resume planner runs", consequences: "The failure count starts from zero and the next trigger starts a run.", effect: "reversible" },
+          { id: "pause", label: "Keep them paused", consequences: "No planner run starts until you resume it in the Planner view.", effect: "reversible" },
         ],
         recommended: { optionId: "pause", reasoning: "Check the planner agent's last run (Agents view) and its prompt first." },
+        class: "planner.failing",
+        evidence: {
+          code: "runs_failed",
+          facts: { run: run.id, failures },
+          cause_cleared: false,
+          linked_issue: null,
+        },
       });
     }
   }
@@ -1061,7 +1192,7 @@ export class PlannerService {
     const id = randomUUID();
     const task = `verifier-${utcStamp(now)}-${id.slice(0, 6)}`;
 
-    const template = buildPrompt([verifier.promptFile], getPromptsDir(this.config), { agent: verifier.id, task });
+    const template = await buildPrompt([verifier.promptFile], getPromptsDir(this.config), { agent: verifier.id, task });
     if (!template.ok) {
       console.warn(`[planner] ${this.project}: verifier prompt template: ${template.reason}`);
       return false;
@@ -1356,14 +1487,22 @@ export class PlannerService {
     });
 
     // Build options (M1: add follow_verifier when there are mixed verdicts)
-    const options: { id: string; label: string; consequences: string }[] = [
-      { id: "approve_all", label: "Apply them all", consequences: "Lair checks each against the tasks file as it is now and applies those that still pass." },
-      { id: "reject_all", label: "Reject them all", consequences: "Nothing changes; the next planner run sees the same state." },
+    // A drop or a reword is not undone by the owner (rewording a done task reopens it), so applying one is irreversible
+    const rewrites = (p: StoredProposal): boolean => p.op === "drop" || p.op === "reword";
+    const options: { id: string; label: string; consequences: string; effect: DecisionEffect }[] = [
+      {
+        id: "approve_all",
+        label: "Apply them all",
+        consequences: "Lair checks each against the tasks file as it is now and applies those that still pass.",
+        effect: pending.some(rewrites) ? "irreversible" : "reversible",
+      },
+      { id: "reject_all", label: "Reject them all", consequences: "Nothing changes; the next planner run sees the same state.", effect: "reversible" },
     ];
 
     if (hasVerifier && hasMixedVerdicts) {
       options.push({
         id: "follow_verifier",
+        effect: pending.some((p) => p.verifierVerdict === "approve" && rewrites(p)) ? "irreversible" : "reversible",
         label: "Follow the verifier",
         consequences: "Apply the ones the verifier approved; reject the rest (rejected and unsure).",
       });
@@ -1415,6 +1554,20 @@ export class PlannerService {
       ].join("\n"),
       options,
       recommended,
+      class: "planner.proposal",
+      evidence: {
+        code: !hasVerifier || isNotVerified ? "verifier_missing" : anyReject ? "verifier_rejected" : "verifier_passed",
+        facts: {
+          run: run.id,
+          proposals: pending.length,
+          has_drop: hasDrop,
+          verifier_state: run.verifierState ?? null,
+          rejected: pending.filter((p) => p.verifierVerdict === "reject").length,
+          approved: pending.filter((p) => p.verifierVerdict === "approve").length,
+        },
+        cause_cleared: false,
+        linked_issue: null,
+      },
     });
   }
 
@@ -1786,6 +1939,7 @@ export class PlannerService {
   start(): void {
     if (!this.stopped) return;
     this.stopped = false;
+    this.ended = false;
     const interval = this.settings.intervalSeconds * 1000;
     const loop = async () => {
       if (this.stopped) return;
@@ -1801,10 +1955,12 @@ export class PlannerService {
   /** Stop the loop; resolves once the cycle or action in progress has finished. */
   async stop(): Promise<void> {
     this.stopped = true;
+    this.ended = true;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    await this.again;
     await this.queue;
   }
 }

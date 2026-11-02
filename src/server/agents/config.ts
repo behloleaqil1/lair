@@ -127,6 +127,55 @@ const WakeSchema = z
   })
   .strict();
 
+/** Where fill looks for ready work (fill.idle.ready_sources). Only the tasks file is wired; the plan's sources come later. */
+export const IDLE_READY_SOURCES = ["tasks_file"] as const;
+export type IdleReadySource = (typeof IDLE_READY_SOURCES)[number];
+
+const IdleSchema = z
+  .object({
+    /** An allowlisted agent idle this long while ready work exists raises one notice (minutes); 0, the default, is off */
+    notice_minutes: z.number().int().min(0).max(1440).default(0),
+    /** Where ready work comes from: only "tasks_file" (its unassigned lines) is wired so far */
+    ready_sources: z.array(z.enum(IDLE_READY_SOURCES)).min(1).default(["tasks_file"]),
+  })
+  .strict();
+
+/** Agent class: local (held by load) or remote (not held by load) */
+export type AgentClass = "local" | "remote";
+
+const CapacityMemorySchema = z
+  .object({
+    /** Maximum memory pressure percentage (0-100) before holding new starts */
+    pressure_max: z.number().min(0).max(100).optional(),
+    /** Minimum available memory as percentage of total (0-100) before holding new starts */
+    available_min_pct: z.number().min(0).max(100).optional(),
+  })
+  .strict();
+
+const CapacityHeavyWorkSchema = z
+  .object({
+    /** Globs or commands that indicate heavy work (container gates, builds) */
+    detect: z.array(z.string().min(1)).default([]),
+    /** Maximum concurrent heavy work items (across all agents) */
+    max_active: z.number().int().min(1).max(100).default(1),
+  })
+  .strict();
+
+const CapacitySchema = z
+  .object({
+    /** Maximum 1-minute load average per CPU before holding local agents; null disables the check */
+    load_per_cpu_max: z.number().positive().optional(),
+    /** Memory pressure checks */
+    memory: CapacityMemorySchema.default({}),
+    /** Heavy work detection and limiting */
+    heavy_work: CapacityHeavyWorkSchema.default({}),
+    /** Per-agent class override: agent id -> "local" or "remote" */
+    agent_class: z.record(z.enum(["local", "remote"])).default({}),
+    /** Default class for agents not in agent_class */
+    default_class: z.enum(["local", "remote"]).default("local"),
+  })
+  .strict();
+
 const FillSchema = z
   .object({
     enabled: z.boolean().default(false),
@@ -144,6 +193,16 @@ const FillSchema = z
      * be in the matched text exactly as written)
      */
     done_pattern: z.string().min(1).max(500).default(DEFAULT_DONE_PATTERN),
+    /**
+     * How fill reads a report line: "task_id" (the default when done_pattern
+     * has {task}) closes or changes only the task the line names, and reports
+     * an agent's line that names no task it can be about as unmatched;
+     * "agent_legacy" (the default when done_pattern has no {task}) keeps
+     * matching such a pattern by agent, with a warning on Health
+     */
+    done_match: z.enum(["task_id", "agent_legacy"]).optional(),
+    /** Native capacity checks: load, memory, heavy work detection */
+    capacity: CapacitySchema.default({}),
     /** Exit 0: capacity available; anything else (a timeout too) holds, its first output line the reason */
     capacity_cmd: argv.optional(),
     interval_seconds: z.number().int().min(1).max(3600).default(60),
@@ -157,6 +216,12 @@ const FillSchema = z
     /** A run that ended on such a line is held for the owner at once */
     blocked_pattern: z.string().min(1).max(500).default(DEFAULT_BLOCKED_PATTERN),
     wake: WakeSchema.default({}),
+    /** Idle detection: notice when an agent is idle while ready work exists */
+    idle: IdleSchema.default({}),
+    /** Refuse a DONE line that names a PR unless the PR is ready to review (CI, branch, gate, finding map) */
+    ready_guard: z.boolean().default(false),
+    /** A done line whose PR can't be verified yet (CI running, host not answering) is held this long, then the owner is asked */
+    ready_wait_minutes: z.number().int().min(1).max(10080).default(120),
   })
   .strict();
 
@@ -182,6 +247,8 @@ export const AgentsSchema = z
     stop_grace_seconds: z.number().min(0).max(3600).default(30),
     /** How far a process's start time may differ from the one recorded for its pid */
     pid_start_tolerance_seconds: z.number().min(0).max(600).default(5),
+    /** On a planned restart: adopt (re-attach to runs the previous server started) or stop (signal them first) */
+    on_restart: z.enum(["adopt", "stop"]).default("adopt"),
     /** The agent's session directory; {agents_dir}, {agent} and {repo} are replaced */
     session_dir: z.string().min(1).optional(),
     /** Prints the branch state for a resume summary; {task}, {agent} and {repo} are replaced */
@@ -251,6 +318,16 @@ export const AgentsSchema = z
 
 type RawSettings = z.infer<typeof AgentsSchema>;
 
+/**
+ * How fill reads report lines (agents.fill.done_match):
+ * - "task_id": a DONE, WAITING or BLOCKED line closes or changes only the task
+ *   its pattern's {task} names, and an agent's line that names no task of the
+ *   tasks file it could be about is an unmatched report (fill.ts);
+ * - "agent_legacy": no unmatched reports; a done_pattern without {task}
+ *   matches the agent's last line, as before done_match existed.
+ */
+export type DoneMatch = "task_id" | "agent_legacy";
+
 /** The parsed `agents.fill:` block. */
 export interface FillSettings {
   enabled: boolean;
@@ -259,6 +336,15 @@ export interface FillSettings {
   promptFiles: string[];
   maxActive: number;
   donePattern: string;
+  /**
+   * How fill reads report lines (DoneMatch): done_match as written, else
+   * "task_id" when done_pattern has {task} and "agent_legacy" when it has not.
+   */
+  doneMatch: DoneMatch;
+  /** What may make fill close or change the wrong task (fillConfigWarnings); shown on Home → Health */
+  warnings: string[];
+  /** Native capacity checks */
+  capacity: CapacitySettings;
   capacityCmd?: string[];
   intervalSeconds: number;
   maxCompletionsWithoutDone: number;
@@ -266,6 +352,10 @@ export interface FillSettings {
   maxBackoffSeconds: number;
   waitingPattern: string;
   blockedPattern: string;
+  /** Refuse a DONE line that names a PR unless the PR is ready to review (src/server/ready-guard/) */
+  readyGuard: boolean;
+  /** How long a report that only time can settle is held before the owner is asked */
+  readyWaitMinutes: number;
   wake: {
     file?: string;
     root: string;
@@ -275,6 +365,54 @@ export interface FillSettings {
     requeueMarker?: string;
     fallbackSeconds: number;
   };
+  idle: {
+    /** 0: off (the idle states are still shown) */
+    noticeMinutes: number;
+    readySources: IdleReadySource[];
+  };
+}
+
+/** Native capacity settings */
+export interface CapacitySettings {
+  /** Maximum 1-minute load average per CPU before holding local agents */
+  loadPerCpuMax?: number;
+  memory: {
+    /** Maximum memory pressure percentage (0-100) */
+    pressureMax?: number;
+    /** Minimum available memory as percentage of total (0-100) */
+    availableMinPct?: number;
+  };
+  heavyWork: {
+    /** Globs (task-id patterns with * and ? wildcards) that indicate heavy work */
+    detect: string[];
+    /** Pre-compiled patterns from detect globs (validated at config load) */
+    detectPatterns: RegExp[];
+    /** Maximum concurrent heavy work items */
+    maxActive: number;
+  };
+  /** Per-agent class override */
+  agentClass: Record<string, AgentClass>;
+  /** Default class for agents */
+  defaultClass: AgentClass;
+}
+
+/**
+ * Compile a task-id glob pattern to a RegExp.
+ * Escapes regex metacharacters, then translates * and ? to .* and . respectively.
+ * This ensures patterns like "gate(backend" don't cause regex syntax errors.
+ */
+export function compileTaskGlob(pattern: string): RegExp {
+  // Escape all regex metacharacters first, then translate glob wildcards
+  const escaped = pattern
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")  // Escape regex metacharacters (except * and ?)
+    .replace(/\*/g, ".*")                   // * -> match anything
+    .replace(/\?/g, ".");                   // ? -> match single character
+  return new RegExp(`^${escaped}$`);
+}
+
+/** Get the class for an agent */
+export function getAgentClass(settings: CapacitySettings, agent: string): AgentClass {
+  return settings.agentClass[agent] ?? settings.defaultClass;
 }
 
 const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -307,6 +445,49 @@ export function fillPatternFor(template: string, task: string, agent: string): F
     task: template.includes("{task}") ? task : null,
     agent: template.includes("{agent}") ? agent : null,
   };
+}
+
+/**
+ * A fill pattern for a task no agent is assigned to (an unassigned tasks_file
+ * line): `{agent}` matches any agent id, so a line by whoever did the task
+ * counts. null when the template doesn't name the task: then no queue line
+ * can be about this task. Throws when it doesn't compile.
+ */
+export function anyAgentPatternFor(template: string, task: string): FillPattern | null {
+  if (!template.includes("{task}")) return null;
+  const regex = new RegExp(
+    template.replace(/\{(task|agent)\}/g, (_match, name: string) => (name === "task" ? escapeRegExp(task) : "[A-Za-z][A-Za-z0-9_-]*")),
+    "i",
+  );
+  return { regex, task, agent: null };
+}
+
+/** The named group reportPatternFor captures the task id in */
+export const REPORTED_TASK_GROUP = "lairReportedTask";
+
+/**
+ * A fill pattern for any task, to read which task an agent's report line
+ * names: the first {task} becomes a capture of a task id (TASK_ID's
+ * characters), a later one a back-reference to it, and {agent} the agent's
+ * id as literal text; case-insensitive like donePatternFor. null when the
+ * template has no {task} (its lines name no task) or doesn't compile so.
+ * The capture is what the line says, for showing it: whether a line is
+ * about a given task stays taskLineMatch's call with that task's pattern.
+ */
+export function reportPatternFor(template: string, agent: string): RegExp | null {
+  if (!template.includes("{task}")) return null;
+  let captured = false;
+  const source = template.replace(/\{(task|agent)\}/g, (_match, name: string) => {
+    if (name === "agent") return escapeRegExp(agent);
+    if (captured) return `\\k<${REPORTED_TASK_GROUP}>`;
+    captured = true;
+    return `(?<${REPORTED_TASK_GROUP}>[A-Za-z0-9][A-Za-z0-9._/#:-]{0,127})`;
+  });
+  try {
+    return new RegExp(source, "i");
+  } catch {
+    return null;
+  }
 }
 
 /** A queue line reports what the pattern looks for (see taskLineMatch). */
@@ -347,6 +528,13 @@ export function matchesByAgent(fill: Pick<FillSettings, "donePattern" | "waiting
 /** What a waiting line may name to wait on: one plain name (a gate id, say), never a path or an option */
 export const WAKE_VALUE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 
+/**
+ * One plain name (WAKE_VALUE) with no "..": never a path, an option or a parent directory. What a waiting line may
+ * name and fill may look up (a gate id), what the bus accepts as a report's gate id, and what the bus mirror joins
+ * into a directory as a file name.
+ */
+export const isPlainName = (value: string): boolean => WAKE_VALUE.test(value) && !value.includes("..");
+
 export interface BudgetLimit {
   soft?: number;
   hard?: number;
@@ -378,6 +566,7 @@ export interface AgentsSettings {
   hungMinutes?: number;
   stopGraceSeconds: number;
   pidStartToleranceSeconds: number;
+  onRestart: "adopt" | "stop";
   sessionDir?: string;
   branchStateCmd?: string[];
   commandTimeoutSeconds: number;
@@ -514,6 +703,10 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
     if (!isValidDragonId(agent)) errors.push(`agents.budgets.per_agent.${agent}: not a valid agent id`);
   }
   checkLimits(value.budgets.project, "agents.budgets.project", errors);
+  // The guard reads PRs through the review module's git host: without it every report would pass unchecked
+  if (project && value.fill.ready_guard && project.review?.enabled !== true) {
+    errors.push("agents.fill.ready_guard: needs review.enabled (the PRs are read through the review module's git host)");
+  }
   checkLimits(value.budgets.agent, "agents.budgets.agent", errors);
   for (const [agent, limits] of Object.entries(value.budgets.per_agent)) {
     checkLimits(limits, `agents.budgets.per_agent.${agent}`, errors);
@@ -534,6 +727,7 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
       hungMinutes: value.hung_minutes,
       stopGraceSeconds: value.stop_grace_seconds,
       pidStartToleranceSeconds: value.pid_start_tolerance_seconds,
+      onRestart: value.on_restart,
       sessionDir: value.session_dir,
       branchStateCmd: value.branch_state_cmd,
       commandTimeoutSeconds: value.command_timeout_seconds,
@@ -580,6 +774,20 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         promptFiles: value.fill.prompt_files,
         maxActive: value.fill.max_active,
         donePattern: value.fill.done_pattern,
+        capacity: {
+          loadPerCpuMax: value.fill.capacity.load_per_cpu_max,
+          memory: {
+            pressureMax: value.fill.capacity.memory.pressure_max,
+            availableMinPct: value.fill.capacity.memory.available_min_pct,
+          },
+          heavyWork: {
+            detect: value.fill.capacity.heavy_work.detect,
+            detectPatterns: value.fill.capacity.heavy_work.detect.map(compileTaskGlob),
+            maxActive: value.fill.capacity.heavy_work.max_active,
+          },
+          agentClass: value.fill.capacity.agent_class,
+          defaultClass: value.fill.capacity.default_class,
+        },
         capacityCmd: value.fill.capacity_cmd,
         intervalSeconds: value.fill.interval_seconds,
         maxCompletionsWithoutDone: value.fill.max_completions_without_done,
@@ -587,6 +795,10 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         maxBackoffSeconds: value.fill.max_backoff_seconds,
         waitingPattern: value.fill.waiting_pattern,
         blockedPattern: value.fill.blocked_pattern,
+        doneMatch: doneMatchOf(value.fill),
+        warnings: value.fill.enabled ? fillConfigWarnings(value.fill) : [],
+        readyGuard: value.fill.ready_guard,
+        readyWaitMinutes: value.fill.ready_wait_minutes,
         wake: {
           file: value.fill.wake.file,
           root: value.fill.wake.root,
@@ -595,6 +807,10 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
           maxQueueWaitMinutes: value.fill.wake.max_queue_wait_minutes,
           requeueMarker: value.fill.wake.requeue_marker,
           fallbackSeconds: value.fill.wake.fallback_seconds,
+        },
+        idle: {
+          noticeMinutes: value.fill.idle.notice_minutes,
+          readySources: value.fill.idle.ready_sources,
         },
       },
     },
@@ -612,6 +828,12 @@ function checkFill(value: RawSettings, errors: string[]): void {
     if (fill.prompt_files.length === 0) {
       errors.push("agents.fill.prompt_files: at least one prompt file is required when fill is enabled");
     }
+  }
+  // Asked for in so many words, task_id needs a done line that can name the task
+  if (fill.done_match === "task_id" && !fill.done_pattern.includes("{task}")) {
+    errors.push(
+      'agents.fill.done_match: "task_id" needs {task} in done_pattern (a line that names only the agent can\'t say which task it closes); add {task}, or set done_match: agent_legacy',
+    );
   }
   fill.agents.forEach((agent, i) => {
     if (!isValidDragonId(agent)) errors.push(`agents.fill.agents[${i}]: ${agent} is not a valid agent id`);
@@ -640,6 +862,26 @@ function checkFill(value: RawSettings, errors: string[]): void {
     if (!wake.requeue_marker.includes("{wake}")) errors.push(`${where}: needs {wake} (the gate id the marker is about)`);
     if (wake.requeue_marker.split(/[\\/]/).includes("..")) errors.push(`${where}: a ".." segment is refused`);
   }
+
+  // Validate agent_class entries: must be valid agent ids AND be in fill.agents (F7)
+  for (const agent of Object.keys(fill.capacity.agent_class)) {
+    if (!isValidDragonId(agent)) {
+      errors.push(`agents.fill.capacity.agent_class.${agent}: not a valid agent id`);
+    } else if (!fill.agents.includes(agent)) {
+      errors.push(`agents.fill.capacity.agent_class.${agent}: not in agents.fill.agents`);
+    }
+  }
+
+  // Validate detect patterns (F4): they must compile as task-id globs
+  fill.capacity.heavy_work.detect.forEach((pattern, i) => {
+    try {
+      compileTaskGlob(pattern);
+    } catch (e) {
+      errors.push(
+        `agents.fill.capacity.heavy_work.detect[${i}]: invalid task-id glob "${pattern}" (${e instanceof Error ? e.message : String(e)})`
+      );
+    }
+  });
 }
 
 /**
@@ -672,6 +914,42 @@ function checkTaskPattern(pattern: string, key: string, what: string, errors: st
   } catch (e) {
     errors.push(`agents.fill.${key}: not a valid regular expression (${e instanceof Error ? e.message : String(e)})`);
   }
+}
+
+/** done_match as written, else "task_id" when done_pattern names the task and "agent_legacy" when it names only the agent. */
+function doneMatchOf(fill: Pick<RawSettings["fill"], "done_match" | "done_pattern">): DoneMatch {
+  return fill.done_match ?? (fill.done_pattern.includes("{task}") ? "task_id" : "agent_legacy");
+}
+
+/**
+ * What in a fill block can make fill close or change a task the line wasn't
+ * about (stale DONE lines for old tasks once closed new ones): a pattern
+ * without {task} matches by agent, and agent_legacy turns unmatched reports
+ * off. Warnings, not errors: such blocks worked before done_match.
+ */
+export function fillConfigWarnings(
+  fill: Pick<RawSettings["fill"], "done_match" | "done_pattern" | "waiting_pattern" | "blocked_pattern">,
+): string[] {
+  const warnings: string[] = [];
+  if (!fill.done_pattern.includes("{task}")) {
+    warnings.push(
+      "agents.fill.done_pattern has no {task}: fill matches DONE lines by agent (done_match agent_legacy), so a DONE line the agent writes about any other task closes its open task. Put {task} in done_pattern so a line closes only the task it names",
+    );
+  } else if (fill.done_match === "agent_legacy") {
+    warnings.push(
+      "agents.fill.done_match is agent_legacy: a line an agent writes about a task it isn't on is not reported (no unmatched reports). Remove done_match to use task_id",
+    );
+  }
+  for (const [key, what] of [
+    ["waiting_pattern", "WAITING"],
+    ["blocked_pattern", "BLOCKED"],
+  ] as const) {
+    if (fill[key].includes("{task}")) continue;
+    warnings.push(
+      `agents.fill.${key} has no {task}: a ${what} line the agent writes about another task changes its open task, and is not reported as unmatched. Put {task} in ${key} so a line changes only the task it names`,
+    );
+  }
+  return warnings;
 }
 
 /** Backoff for attempt n (1-based): base * 2^(n-1), capped. In milliseconds. */

@@ -34,6 +34,7 @@ import { SectionHeader, type SectionProps } from "./Section";
 import { LiveFeed } from "./LiveFeed";
 import { Activity } from "./Activity";
 import { Health } from "./Health";
+import { BusPanel } from "./BusPanel";
 import { ErrorState, Loading, ModuleOff, Time, useOwnerSignedIn } from "./ui";
 import { Button, ButtonLink } from "../ui/Button";
 import { Card } from "../ui/Card";
@@ -229,6 +230,7 @@ export function Home(props: SectionProps) {
   let body: ReactNode;
   if (!tabAvailable("home", route.tab, modules)) body = <ModuleOff what={tab?.label ?? "This tab"} enable={tab?.enable ?? ""} />;
   else if (route.tab === "activity") body = <Activity project={props.project} refreshKey={props.refreshKey} />;
+  else if (route.tab === "bus") body = <BusPanel project={props.project} refreshKey={props.refreshKey} />;
   else if (route.tab === "health") body = <Health project={props.project} refreshKey={props.refreshKey} />;
   else body = <HomeOverview {...props} />;
   return (

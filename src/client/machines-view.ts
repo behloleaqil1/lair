@@ -1,17 +1,19 @@
 /**
  * The Machines section (the old Machines and Nodes views): the project's
- * machines with their runners and placement's probes, and the lair-node
- * machines registered with this server. Kept apart from the components so
- * tests check the same rules.
+ * machines with their runners and placement's probes, its cloud machines
+ * with their power state and the money guard, and the lair-node machines
+ * registered with this server. Kept apart from the components so tests
+ * check the same rules.
  */
 import type { MachineStatus } from "../shared/types";
 import type { PlacementJob, PlacementLane, PlacementMachine, PlacementStatus } from "../shared/placement-types";
+import type { CloudMachineStatus, CloudStatus } from "../shared/cloud-types";
 import type { Node } from "../shared/server-types";
 import { laneSlots, machineBadge, machineLoad, machineState } from "./placement-view";
 
 export interface MachineRow {
   id: string;
-  /** local, ssh, or probed only (a placement machine the project's machines: doesn't name) */
+  /** local, ssh, probed only (a placement machine the project's machines: doesn't name), or a cloud provider */
   type: string;
   state: string;
   badge: string;
@@ -21,10 +23,29 @@ export interface MachineRow {
   lastCheck: string | null;
   status: MachineStatus | null;
   probe: PlacementMachine | null;
+  /** The machine under cloud: (provider state), when it is one */
+  cloud: CloudMachineStatus | null;
 }
 
-/** Each machine once: the project's machines, and placement's probes of them (or of others it names). */
-export function machineRows(statuses: readonly MachineStatus[], placement: PlacementStatus | null): MachineRow[] {
+/** "running", "stopped", "unknown: <why>" */
+export function cloudState(m: CloudMachineStatus): string {
+  return m.state === "unknown" && m.lastError ? `unknown: ${m.lastError}` : m.state;
+}
+
+/** A stopped cloud machine is not a fault: it runs only while there is work */
+export function cloudBadge(m: CloudMachineStatus): string {
+  if (m.state === "running") return "badge-success";
+  if (m.state === "stopped") return "badge-neutral";
+  if (m.state === "pending" || m.state === "stopping") return "badge-warning";
+  return "badge-error";
+}
+
+/** Each machine once: the project's machines, placement's probes of them (or of others it names), and its cloud machines. */
+export function machineRows(
+  statuses: readonly MachineStatus[],
+  placement: PlacementStatus | null,
+  cloud: CloudStatus | null = null,
+): MachineRow[] {
   const probes = placement?.enabled ? placement.machines : [];
   const rows: MachineRow[] = statuses.map((status) => {
     const probe = probes.find((p) => p.id === status.name) ?? null;
@@ -39,6 +60,7 @@ export function machineRows(statuses: readonly MachineStatus[], placement: Place
       lastCheck: probe?.lastProbeAt ?? status.lastCheck ?? null,
       status,
       probe,
+      cloud: null,
     };
   });
   for (const probe of probes) {
@@ -53,9 +75,52 @@ export function machineRows(statuses: readonly MachineStatus[], placement: Place
       lastCheck: probe.lastProbeAt,
       status: null,
       probe,
+      cloud: null,
+    });
+  }
+  for (const m of cloud?.enabled ? cloud.machines : []) {
+    const row = rows.find((r) => r.id === m.id);
+    if (row) {
+      // The same machine probed or named under machines: too: one row, its provider shown beside its type
+      row.cloud = m;
+      row.type = `${row.type}, ${m.provider}`;
+      continue;
+    }
+    rows.push({
+      id: m.id,
+      type: m.provider,
+      state: cloudState(m),
+      badge: cloudBadge(m),
+      runners: "—",
+      load: "-",
+      lastCheck: m.lastCheckAt,
+      status: null,
+      probe: null,
+      cloud: m,
     });
   }
   return rows;
+}
+
+function dollars(amount: number): string {
+  return `$${amount.toFixed(2)}`;
+}
+
+/**
+ * The cloud budget in a line: "Cloud spend $12.40 of $100.00 (12.4%) · guard
+ * ok", with the badge for the guard. Null when the module is off.
+ */
+export function cloudBudget(cloud: CloudStatus | null): { text: string; badge: string; reason: string } | null {
+  const budget = cloud?.enabled ? cloud.budget : null;
+  if (!budget) return null;
+  const spend =
+    budget.spend === null
+      ? `unknown of ${dollars(budget.limit)}`
+      : `${dollars(budget.spend)} of ${dollars(budget.limit)}${budget.percent === null ? "" : ` (${budget.percent}%)`}`;
+  const { guard } = budget;
+  const badge =
+    guard.state === "ok" ? "badge-success" : guard.state === "warning" ? "badge-warning" : "badge-error";
+  return { text: `Cloud spend ${spend} · guard ${guard.state}`, badge, reason: guard.reason };
 }
 
 export interface MachineDetailModel {

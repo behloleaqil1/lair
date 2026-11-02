@@ -298,7 +298,7 @@ describe("merge.check_cmd", () => {
 
   it("runs after the policy allows the merge: an argv with its placeholders, Lair's minimal environment, then the merge", async () => {
     const rig = boot(repo(), { check_cmd: CHECK }, {
-      env: { PATH: "/usr/bin:/bin", HOME: "/home/lair", GITHUB_TOKEN: "ghp_not_for_the_check", LAIR_OWNER_TOKEN: "x", AWS_SECRET_ACCESS_KEY: "y" },
+      env: { PATH: "/usr/bin:/bin", HOME: "/home/user", GITHUB_TOKEN: "ghp_not_for_the_check", LAIR_OWNER_TOKEN: "x", AWS_SECRET_ACCESS_KEY: "y" },
     });
     const { service, spawner, remote, head } = rig;
 
@@ -313,7 +313,7 @@ describe("merge.check_cmd", () => {
     expect(spawner.calls).toEqual([
       {
         argv: ["/opt/checks/migration-order", "--pr", "3", `--head=${head}`, "main", "example-org/demo"],
-        options: { cwd: dir, env: { PATH: "/usr/bin:/bin", HOME: "/home/lair" }, timeoutMs: 300_000, maxOutputBytes: CHECK_OUTPUT_BYTES },
+        options: { cwd: dir, env: { PATH: "/usr/bin:/bin", HOME: "/home/user" }, timeoutMs: 300_000, maxOutputBytes: CHECK_OUTPUT_BYTES },
       },
     ]);
     expect(remote.branches.get("main")).toBe(head);

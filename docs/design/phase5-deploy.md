@@ -26,7 +26,7 @@ machines:
     # Deployment config
     deploy:
       enabled: true
-      deploy_dir: /home/deploy/apps/{project}
+      deploy_dir: /home/user/apps/{project}
       services:
         - name: backend
           type: systemd

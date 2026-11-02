@@ -435,7 +435,7 @@ describe("buildStartCommand", () => {
     const { command, warnings } = buildStartCommand(BUILTIN_ADAPTERS.aider, {
       agentId: "worker-1",
       task: "fix-bug",
-      promptFile: "/home/me/My Prompts/task one.md",
+      promptFile: "/home/user/My Prompts/task one.md",
     });
 
     expect(warnings).toHaveLength(0);
@@ -443,7 +443,7 @@ describe("buildStartCommand", () => {
       "aider",
       "--yes",
       "--message-file",
-      "/home/me/My Prompts/task one.md",
+      "/home/user/My Prompts/task one.md",
     ]);
   });
 

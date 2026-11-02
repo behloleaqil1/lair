@@ -11,6 +11,8 @@
  * - GET  /api/bus/events: SSE feed for the UI (open)
  * - POST /api/bus/send: Owner sends a message (requires owner session)
  * - GET  /api/bus/messages/:agentId: Message list for the UI (open)
+ * - GET  /api/bus/activity: The Bus tab's first load, bounded by ?limit (at most 200); message texts and ack notes
+ *   only with the owner's session (the live updates are on the `bus` WebSocket channel: src/server/bus/live.ts)
  *
  * Claims have ONE source of truth: the agents module's claims. The bus does
  * not keep its own claim table.
@@ -27,15 +29,25 @@ import {
   getBusStore,
   hashBusToken,
   isBusTokenFormat,
+  messageState,
   redactBusToken,
+  type BusConsumeMode,
+  type BusConsumerHealth,
   type BusMirrorConfig,
   type BusServiceOptions,
 } from "../bus/index.js";
 import type { ApiResponse, BoardOutput, TaskStatus } from "../../shared/types.js";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { ReportKind } from "../../bus/types.js";
+import {
+  BUS_ACTIVITY_DEFAULT_LIMIT,
+  BUS_ACTIVITY_MAX_LIMIT,
+  BUS_SUMMARY_MAX,
+  type BusActivity,
+} from "../../shared/bus-live.js";
+import type { AgentRun } from "../agents/types.js";
+import { isPlainName } from "../agents/config.js";
 import { z } from "zod";
-import { join } from "path";
 
 function respond<T>(data: T): ApiResponse<T> {
   return {
@@ -67,15 +79,24 @@ function extractToken(header: string | undefined): string | null {
 
 const ReportKindSchema = z.enum(["WAITING", "DONE", "BLOCKED", "PROGRESS", "TICK"]);
 
+/** A commit id: 7 to 64 hex digits (the consumers refuse a report whose sha isn't hex) */
+const SHA = /^[0-9a-f]{7,64}$/i;
+
 const toolSchemas = {
   whoami: z.object({}),
+  // A report the consumers would refuse is refused here (400), never stored or mirrored: its wake-up would be lost
   report: z.object({
     kind: ReportKindSchema,
     task: z.string().min(1).max(200),
     summary: z.string().min(1).max(10000),
-    gate_id: z.string().max(200).optional(),
+    // What a WAITING run waits on, as fill looks it up: one plain name (no '/', no '..', no leading '-')
+    gate_id: z
+      .string()
+      .max(200)
+      .refine(isPlainName, "a plain name: letters, digits, '.', '_' and '-', starting with a letter or digit, no '..'")
+      .optional(),
     pr: z.number().int().positive().optional(),
-    sha: z.string().max(64).optional(),
+    sha: z.string().regex(SHA, "a commit id: 7 to 64 hex digits").optional(),
   }),
   inbox: z.object({}),
   ack: z.object({
@@ -91,6 +112,12 @@ const toolSchemas = {
 } as const;
 
 type ToolName = keyof typeof toolSchemas;
+
+/** POST /api/bus/call: a tool call with the run's bus token; the project is the token's when not named */
+interface CallRoute {
+  Body: { tool: string; args: Record<string, unknown> };
+  Querystring: { project?: string };
+}
 
 // ============ Service management ============
 
@@ -110,6 +137,39 @@ export interface BusRoutesOptions {
     /** File to touch when dragons should wake (optional bus feature) */
     wake_file?: string;
   };
+  /**
+   * The project's bus.consume (src/server/bus/consumers.ts). While it is off
+   * every bus route but /api/bus/consumers answers 404 for the project, as
+   * without the bus, and no run of it has a bus token.
+   */
+  mode: (project: string) => BusConsumeMode;
+  /** The projects whose bus.consume isn't off (a token is looked up in their stores) */
+  enabled: () => string[];
+  /** The bus consumers' state for Home → Health */
+  health: (project: string) => BusConsumerHealth;
+}
+
+/**
+ * A project's bus store (<dataDir>/bus/<project>.db): the routes, the consumers, the token minting and the
+ * checks (src/server/checks/) all read this one.
+ */
+export function busStoreFor(project: string, dataDir: string): BusStore {
+  return getBusStore(project, dataDir);
+}
+
+/** Drop a project's bus service (its config changed): the next request builds it from the new config. */
+export function forgetBusService(project: string): void {
+  busServices.delete(project);
+}
+
+/**
+ * A run of the project by its id, looked up in the agents store (however many runs came after it), or null: none
+ * with that id, another project's, or the project's agents module is off (it has no runs).
+ */
+function projectRun(options: BusRoutesOptions, project: string, runId: string): AgentRun | null {
+  if (!options.agents.get(project)) return null;
+  const run = options.agents.getStore()?.getRun(runId) ?? null;
+  return run !== null && run.project === project ? run : null;
 }
 
 function getBusService(
@@ -118,7 +178,7 @@ function getBusService(
 ): { service: BusService; store: BusStore } {
   let entry = busServices.get(project);
   if (!entry) {
-    const store = getBusStore(project, join(options.dataDir, "bus"));
+    const store = busStoreFor(project, options.dataDir);
     const config = options.getConfig(project);
 
     // Mirror config from project settings
@@ -130,14 +190,8 @@ function getBusService(
 
     const serviceOptions: BusServiceOptions = {
       store,
-      getClaimedTask: (runId: string) => {
-        const agentService = options.agents.get(project);
-        if (!agentService) return null;
-        // Find the run and get its claimed task
-        const runs = agentService.runs(100);
-        const run = runs.find((r) => r.id === runId);
-        return run?.task ?? null;
-      },
+      // The run's task (whichever run it is: never only among the latest runs)
+      getClaimedTask: (runId: string) => projectRun(options, project, runId)?.task ?? null,
       getAllClaims: () => {
         const agentService = options.agents.get(project);
         if (!agentService) return [];
@@ -192,19 +246,36 @@ async function busRoutes(
   // Refuse cross-site browser requests (CSRF, DNS rebinding) before anything else
   fastify.addHook("onRequest", rejectCrossSiteRequests);
   fastify.addHook("onRequest", projectQueryGuard());
+  // A project whose bus.consume is off has no bus: its routes answer as without one (the consumers' status excepted)
+  fastify.addHook("onRequest", async (request, reply) => {
+    if (request.routeOptions?.url === "/api/bus/consumers") return;
+    const project = (request.query as { project?: unknown }).project;
+    if (typeof project !== "string") return; // /api/bus/call without one: the token's project, checked there
+    if (options.mode(project) !== "off") return;
+    const err = respondError(`the bus is off for ${project}: set bus.consume to observe or on (docs/configuration.md#fleet-bus)`, 404);
+    return reply.code(err.statusCode).send(err);
+  });
+
+  // ============ GET /api/bus/consumers - The bus consumers' state (open, read-only) ============
+
+  fastify.get<{ Querystring: { project: string } }>("/api/bus/consumers", async (request) => respond(options.health(request.query.project)));
 
   // ============ POST /api/bus/call - Agent API ============
 
-  fastify.post<{
-    Body: { tool: string; args: Record<string, unknown> };
-    Querystring: { project: string };
-  }>("/api/bus/call", async (request, reply) => {
-    const project = request.query.project;
-
+  fastify.post<CallRoute>("/api/bus/call", { config: { projectOptional: true } }, async (request, reply) => {
     // Extract and validate token
     const token = extractToken(request.headers.authorization);
     if (!token || !isBusTokenFormat(token)) {
       const err = respondError("Missing or invalid bus token", 401);
+      return reply.code(err.statusCode).send(err);
+    }
+    const hash = hashBusToken(token);
+
+    // The token's project: the one named, else the project whose bus store issued it (`lair bus` names none)
+    const project =
+      request.query.project ?? options.enabled().find((name) => busStoreFor(name, options.dataDir).validateToken(hash) !== null);
+    if (project === undefined || options.mode(project) === "off") {
+      const err = respondError("Invalid or expired bus token", 401);
       return reply.code(err.statusCode).send(err);
     }
 
@@ -212,21 +283,17 @@ async function busRoutes(
     const { service, store } = getBusService(project, options);
 
     // Validate token in store
-    const binding = store.validateToken(hashBusToken(token));
+    const binding = store.validateToken(hash);
     if (!binding) {
       const err = respondError("Invalid or expired bus token", 401);
       return reply.code(err.statusCode).send(err);
     }
 
-    // Verify the run is still active
-    const agentService = options.agents.get(project);
-    if (agentService) {
-      const runs = agentService.runs(100);
-      const run = runs.find((r) => r.id === binding.runId);
-      if (!run || !["queued", "waiting_lock", "running"].includes(run.state)) {
-        const err = respondError("Run is no longer active", 401);
-        return reply.code(err.statusCode).send(err);
-      }
+    // Verify the run is still active (a project whose agents module is off has no active run)
+    const run = projectRun(options, project, binding.runId);
+    if (!run || !["queued", "waiting_lock", "running"].includes(run.state)) {
+      const err = respondError("Run is no longer active", 401);
+      return reply.code(err.statusCode).send(err);
     }
 
     // Parse request
@@ -255,7 +322,7 @@ async function busRoutes(
 
       case "report": {
         const reportArgs = parsed.data as z.infer<typeof toolSchemas.report>;
-        result = service.report(
+        result = await service.report(
           binding,
           reportArgs.kind as ReportKind,
           reportArgs.task,
@@ -279,7 +346,7 @@ async function busRoutes(
 
       case "send": {
         const sendArgs = parsed.data as z.infer<typeof toolSchemas.send>;
-        result = service.send(binding, sendArgs.to, sendArgs.text, sendArgs.priority);
+        result = await service.send(binding, sendArgs.to, sendArgs.text, sendArgs.priority);
         break;
       }
 
@@ -466,7 +533,7 @@ async function busRoutes(
       }
 
       const { service } = getBusService(project, options);
-      const result = service.sendFromOwner(to, text, priority);
+      const result = await service.sendFromOwner(to, text, priority);
       if (!result.ok) {
         const err = respondError(result.error.message);
         return reply.code(err.statusCode).send(err);
@@ -508,5 +575,48 @@ async function busRoutes(
       })),
       unread: service.countUnread(agentId),
     });
+  });
+
+  // ============ GET /api/bus/activity - The Bus tab's first load (open; message texts for the owner only) ============
+
+  fastify.get<{ Querystring: { project: string; limit?: string } }>("/api/bus/activity", async (request, reply) => {
+    const raw = request.query.limit;
+    const asked = raw === undefined ? BUS_ACTIVITY_DEFAULT_LIMIT : Number(raw);
+    if (!Number.isSafeInteger(asked) || asked < 1) {
+      const err = respondError(`limit must be a whole number from 1 to ${BUS_ACTIVITY_MAX_LIMIT}`);
+      return reply.code(err.statusCode).send(err);
+    }
+    const limit = Math.min(asked, BUS_ACTIVITY_MAX_LIMIT);
+    const project = request.query.project;
+    const store = busStoreFor(project, options.dataDir);
+    // The socket carries no owner session: texts and ack notes come only from here, with it
+    const owner = auth.verifyRequest(request.headers, { method: request.method }).ok;
+    const activity: BusActivity = {
+      reports: store.listReports({ limit }).map((r) => ({
+        type: "report",
+        id: r.id,
+        at: new Date(r.createdAt).toISOString(),
+        agent: r.agent,
+        task: r.task,
+        kind: r.kind,
+        summary: r.summary.slice(0, BUS_SUMMARY_MAX),
+        gateId: r.gateId,
+        pr: r.pr,
+        sha: r.sha,
+      })),
+      messages: store.listRecentMessages(limit).map((m) => ({
+        id: m.id,
+        at: new Date(m.createdAt).toISOString(),
+        from: m.fromId,
+        to: m.toId,
+        state: messageState(m),
+        ...(owner ? { text: m.text, ackNote: m.ackNote } : {}),
+      })),
+      claims: (options.agents.getStore()?.listClaims(project) ?? [])
+        .slice(-limit)
+        .map((c) => ({ agent: c.agent, task: c.task, at: new Date(c.claimedAt).toISOString() })),
+      owner,
+    };
+    return respond(activity);
   });
 }

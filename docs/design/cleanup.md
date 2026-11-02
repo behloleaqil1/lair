@@ -35,19 +35,19 @@ cleanup:
 
   worktrees:
     repos:
-      - /Users/dev/my-project
+      - /home/user/my-project
     after_merge: true
     min_idle_hours: 24
 
   retention:
-    - path: /Users/dev/my-project/work/gates/snapshots
+    - path: /home/user/my-project/work/gates/snapshots
       keep_days: 2
       kind: worktree
       skip_if_referenced:
-        - /Users/dev/my-project/work/gates/queue/*.req
-        - /Users/dev/my-project/work/gates/queue/*.req.run
+        - /home/user/my-project/work/gates/queue/*.req
+        - /home/user/my-project/work/gates/queue/*.req.run
 
-    - path: /Users/dev/my-project/work/gates/results
+    - path: /home/user/my-project/work/gates/results
       keep_days: 30
       kind: file
 ```

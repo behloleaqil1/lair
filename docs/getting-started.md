@@ -32,6 +32,25 @@ Open `http://localhost:4777`. The server serves both the API and the built web U
 
 Lair reads project configs from `projects/` and writes its state to `data/`, both relative to the directory you start it from, so always start it from the repository root.
 
+### Install scripts
+
+The repository's `.npmrc` sets `ignore-scripts=true`, so `npm install` and `npm ci` run no preinstall, install or
+postinstall script of any dependency. Three packages need theirs, and only they are listed in `allowedInstallScripts` in
+`package.json`:
+
+- `better-sqlite3`: downloads a prebuilt SQLite binding for your Node.js version, or compiles one
+- `esbuild`: checks and installs its platform binary
+- `fsevents` (macOS only, optional): file watching; npm does not install it on Linux
+
+`npm run rebuild:native` runs exactly those scripts (`npm rebuild --ignore-scripts=false <name>`). `npm run build`,
+`npm run dev` and the test runner (`npm test` or `npx vitest`) run it once after each install, and again when the
+lockfile or the Node.js version changes, so the steps above work as they are. `npm run setup` does both in one step:
+`npm ci`, then `npm run rebuild:native`.
+
+CI runs `npm run check:install-scripts`, which fails when a dependency in `package-lock.json` has an install script and
+is not on the list. If you add such a dependency, read its script first, then add it to `allowedInstallScripts` and to
+this section.
+
 ### Development mode
 
 For development with hot reload:
@@ -89,7 +108,7 @@ See [Configuration](configuration.md) for all available options.
 
 - Check that port 4777 is not in use: `lsof -i :4777`
 - Verify Node.js version: `node --version` (should be 22 or 24)
-- If `npm install` failed on `better-sqlite3`, install the C/C++ toolchain listed under Prerequisites and run `npm install` again
+- If `npm run rebuild:native` (or the first `npm run build`) failed on `better-sqlite3`, install the C/C++ toolchain listed under Prerequisites and run `npm run rebuild:native` again; after a Node.js upgrade, run it once too
 - Read the server's output in the terminal where you ran `npm start` (a service manager writes it to its log file instead); each module logs its start and any config error with a `[module]` prefix
 
 ### Project not showing

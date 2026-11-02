@@ -92,11 +92,13 @@ Pure functions that parse project files into typed structures:
 
 - **`data.ts`**: main data service, aggregates parsers for each view (read-only); a gate's record and log path, and a dragon's newest log, for the dashboard's details
 - **`log-tail.ts`**: the bounded tail of a log the owner reads (lines, bytes, line length, no symlinks, credentials masked)
+- **`async-fs.ts`**: bounded `fs/promises` reads for request handlers and timer ticks (a tail, a small file, a capped listing, a few reads at a time, one listing shared while in flight): no synchronous fs call on those paths (issue #245; `ci-guards.test.ts` lists the modules held to it)
 - **`command.ts`**: runs configured commands as argument arrays (no shell) and appends each action to `data/audit.log`
 - **`dragon-registry.ts`**: the dragons a project has (YAML `dragons:` plus `dragons.txt`); start/stop requests are checked against it and the start dialog lists it
 - **`adapters.ts`**: built-in agent adapter definitions and command builders (adapters are listed in the UI; dragons are started with `dragon_start_cmd`)
 - **`supervisor.ts`**, **`managed-process.ts`**, **`ring-buffer.ts`**: process manager for long-running services and their logs
 - **`file-watcher.ts`**: watches a project's folders (agents_dir, the gate queue and results, the queue file's folder) and broadcasts changes over the WebSocket
+- **`queue-cache.ts`**: the queue file, read once per change with async IO (at most its last 4 MB) and parsed into memory; the dashboard's queue, dragon and overview views read the parsed lines, never the file. A failed read keeps the last good lines; a change is seen by a folder watch and a 5 s size/mtime check
 - **`dir-watch.ts`**: one folder's watch (fs.watch on the folder, never on its files), with polling where the folder can't be watched; the file watcher and the config reloader use it
 - **`gate-runner.ts`**, **`gate-distribution.ts`**, **`remote-gate.ts`**: optional gate runner, lane-to-machine distribution and remote gate execution over SSH (library code with tests; not started by the server yet)
 
@@ -222,6 +224,16 @@ Which machine runs each queued job of a project's own gate queue ([configuration
 - **`estimate.ts`**: per-lane simulation (order, slots, class limits, pseudo-lanes) and the greedy move decisions, quiet re-checks included
 - **`store.ts`**: moves, the runs Lair saw start, and learned durations in SQLite (`data/placement.db`)
 - **`service.ts`**, **`routes.ts`**: the per-project tick (probes, learning, estimates, act or observe, recovery of a move cut short) started and stopped by `index.ts`, and the read-only `GET /api/placement/status`
+
+#### Cloud machines (`cloud/`)
+
+Cloud machines, their spend and the money guard ([configuration](configuration.md#cloud-machines), [design](design/cloud-runners.md)). Off unless a project sets `cloud.enabled`.
+
+- **`config.ts`**: the validated `cloud:` block (machines with provider, region, profile, instance and tag, prices; the budget), refusing anything that looks like a credential
+- **`provider.ts`**: the provider interface and the AWS EC2 provider (describe, start and stop a tagged instance; the account's cost before credits and refunds), built on `AwsClients`, the AWS SDK clients for one named profile: the boundary tests fake
+- **`meter.ts`**, **`guard.ts`**: Lair's meter (runs and counted gaps times price, storage per month, the starting amount; `meterSince`, what it counted after a reading's data ends) and the guard's verdict (the larger of the meter and the provider's reading plus the meter since its data, against the limit; fail closed, blind gaps included)
+- **`store.ts`**: runs, each instance's last sighting and the gaps since, the last cost reading per account, and the trips (cleared only by the owner) in SQLite (`data/cloud.db`)
+- **`service.ts`**, **`routes.ts`**: the per-project check and the guarded start (`startMachine`), started and stopped by `index.ts`, and `GET /api/cloud/status`, the owner's only (`/api/cloud` is in `OWNER_ONLY_PREFIXES`); provider error text is kept with the account hidden (`providerText`)
 
 #### Settings (`settings/`)
 

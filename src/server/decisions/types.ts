@@ -5,6 +5,7 @@
 import type {
   Decision,
   DecisionAttention,
+  DecisionEvidence,
   DecisionKind,
   DecisionLink,
   DecisionOption,
@@ -42,6 +43,13 @@ export interface RaiseDecisionInput {
    * kinds that always wait (NEVER_DEFAULT_KINDS); needs expiresAt.
    */
   defaultOptionId?: string;
+  /**
+   * The policy class ("module.name", see structure.ts), with its evidence and
+   * an effect on every option. Neither is needed yet; one without the other,
+   * or a class without effects, is refused.
+   */
+  class?: string;
+  evidence?: DecisionEvidence;
 }
 
 export interface RaiseResult {
@@ -70,6 +78,14 @@ export interface AnswerInput {
 export interface AnswerContext {
   remoteAddress?: string;
   userAgent?: string;
+}
+
+/** What a producer may change on an open decision's evidence after it raised it: the two facts that move. */
+export interface EvidenceUpdateInput {
+  /** Must be the module that raised the decision */
+  module: string;
+  cause_cleared?: boolean;
+  linked_issue?: number | null;
 }
 
 export interface WithdrawInput {
@@ -105,12 +121,20 @@ export type ResolutionHandler = (resolution: DecisionResolution) => void | Promi
  *   first), whatever its status, or null: a producer that keeps one
  *   decision per condition reads it to tell "asked and answered" from
  *   "never asked" or "withdrawn", across restarts.
+ * - updateEvidence(): the cause cleared, or an issue now tracks it.
  * - openOf(): the module's open decisions in a project, to withdraw those
  *   whose condition is gone.
  */
 export interface DecisionProducer {
   raise(input: RaiseDecisionInput): Promise<RaiseResult>;
   withdraw(id: string, input: WithdrawInput): Promise<Decision>;
+  /**
+   * Re-evaluate `cause_cleared` / `linked_issue` of an open decision this
+   * module raised: both are set at the raise, and only the module knows when
+   * they change. Nothing else on the decision moves; a decision without
+   * evidence, or one already closed, is refused.
+   */
+  updateEvidence(id: string, input: EvidenceUpdateInput): Promise<Decision>;
   blockedOn(ref: string): Decision | null;
   onResolved(module: string, handler: ResolutionHandler, options?: { project?: string }): () => void;
   find(project: string, module: string, key: string): Decision | null;

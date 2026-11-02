@@ -29,19 +29,19 @@ describe("parseCleanupConfig", () => {
       max_entries_per_cycle: 100,
       max_seconds_per_cycle: 300,
       worktrees: {
-        repos: ["/Users/dev/project"],
+        repos: ["/home/user/project"],
         after_merge: true,
         min_idle_hours: 48,
       },
       retention: [
         {
-          path: "/Users/dev/project/work/gates/snapshots",
+          path: "/home/user/project/work/gates/snapshots",
           keep_days: 2,
           kind: "worktree",
-          skip_if_referenced: ["/Users/dev/project/work/gates/queue/*.req"],
+          skip_if_referenced: ["/home/user/project/work/gates/queue/*.req"],
         },
         {
-          path: "/Users/dev/project/work/gates/results",
+          path: "/home/user/project/work/gates/results",
           keep_days: 30,
           kind: "file",
         },
@@ -57,19 +57,19 @@ describe("parseCleanupConfig", () => {
       maxEntriesPerCycle: 100,
       maxSecondsPerCycle: 300,
       worktrees: {
-        repos: ["/Users/dev/project"],
+        repos: ["/home/user/project"],
         afterMerge: true,
         minIdleHours: 48,
       },
       retention: [
         {
-          path: "/Users/dev/project/work/gates/snapshots",
+          path: "/home/user/project/work/gates/snapshots",
           keepDays: 2,
           kind: "worktree",
-          skipIfReferenced: ["/Users/dev/project/work/gates/queue/*.req"],
+          skipIfReferenced: ["/home/user/project/work/gates/queue/*.req"],
         },
         {
-          path: "/Users/dev/project/work/gates/results",
+          path: "/home/user/project/work/gates/results",
           keepDays: 30,
           kind: "file",
           skipIfReferenced: [],

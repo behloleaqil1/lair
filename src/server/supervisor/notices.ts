@@ -39,6 +39,17 @@ function describe(values: Record<string, unknown>): string {
     .join(", ");
 }
 
+/** The numbers and booleans of a check's values as flat facts: `value_latency_ms`. Strings are names, not facts. */
+function flatFacts(prefix: string, values: Record<string, unknown>): Record<string, number | boolean> {
+  const out: Record<string, number | boolean> = {};
+  for (const [name, v] of Object.entries(values)) {
+    const key = `${prefix}_${name.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`.slice(0, 60);
+    if (typeof v === "number" && Number.isFinite(v)) out[key] = v;
+    else if (typeof v === "boolean") out[key] = v;
+  }
+  return out;
+}
+
 /** The notice for a failing check. Every word of it is Lair's own (the check's). */
 export function noticeFor(project: string, result: CheckResult, failingSince: number): RaiseDecisionInput {
   const where = result.scope === "server" ? "Lair" : `project ${result.scope}`;
@@ -61,6 +72,7 @@ export function noticeFor(project: string, result: CheckResult, failingSince: nu
       {
         id: NOTICE_NOTED,
         label: "Noted",
+        effect: "reversible",
         consequences:
           "The notice closes. Lair doesn't raise it again until the check recovers and then fails again; Home → Health keeps showing the check.",
       },
@@ -70,6 +82,19 @@ export function noticeFor(project: string, result: CheckResult, failingSince: nu
       reasoning: "Nothing is decided here: the fix is yours to make, and the notice goes by itself once the check recovers.",
     },
     source: { module: NOTICE_MODULE, ref: `${result.scope}:${result.id}` },
+    class: "supervisor.check_failing",
+    evidence: {
+      code: "check_failing",
+      facts: {
+        check_id: result.id,
+        scope: result.scope,
+        failing_since: iso(failingSince),
+        ...flatFacts("value", result.values),
+        ...flatFacts("threshold", result.thresholds),
+      },
+      cause_cleared: false,
+      linked_issue: null,
+    },
     key: noticeKey(result.scope, result.id),
   };
 }

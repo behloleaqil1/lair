@@ -20,12 +20,13 @@ export interface FetchResponseLike {
   status: number;
   ok: boolean;
   text(): Promise<string>;
+  headers?: { get(name: string): string | null };
 }
 
 /** The part of fetch() the provider uses, so tests can stand in for the API. */
 export type FetchLike = (
   url: string,
-  init?: { method?: string; headers?: Record<string, string>; body?: string },
+  init?: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal },
 ) => Promise<FetchResponseLike>;
 
 export type TokenSource = () => Promise<string | null>;
@@ -66,6 +67,7 @@ interface GhPull {
   user?: { login?: string } | null;
   labels?: { name?: string }[];
   mergeable?: boolean | null;
+  body?: string | null;
   updated_at?: string;
 }
 
@@ -81,6 +83,7 @@ interface GhFile {
 interface GhPerson {
   name?: string;
   email?: string;
+  date?: string;
 }
 
 interface GhCommit {
@@ -134,6 +137,7 @@ function mapPull(p: GhPull): HostPullRequest {
     labels: (p.labels ?? []).map((l) => l.name ?? "").filter(Boolean),
     mergeable: typeof p.mergeable === "boolean" ? p.mergeable : null,
     updatedAt: p.updated_at ?? null,
+    body: typeof p.body === "string" ? p.body : null,
   };
 }
 
@@ -148,12 +152,18 @@ export interface GitHubHostOptions {
   apiUrl: string;
   token: TokenSource;
   fetch?: FetchLike;
+  /** One request may take this long (default 30 s); then it fails and the caller retries later */
+  timeoutMs?: number;
+  /** The time, in ms (a test's clock) */
+  now?: () => number;
 }
 
 export class GitHubHost implements GitHost {
   readonly repo: string;
   private readonly api: string;
   private readonly fetchFn: FetchLike;
+  /** After a rate-limit answer no request goes out until then (ms) */
+  private blockedUntil = 0;
 
   constructor(private readonly options: GitHubHostOptions) {
     this.repo = options.repo;
@@ -166,6 +176,10 @@ export class GitHubHost implements GitHost {
     path: string,
     options: { body?: unknown; accept?: string; allow404?: boolean } = {},
   ): Promise<{ status: number; text: string }> {
+    const now = (this.options.now ?? Date.now)();
+    if (now < this.blockedUntil) {
+      throw new HostError(`GitHub ${method} ${path.split("?")[0]}: rate limited, not asking again for ${Math.ceil((this.blockedUntil - now) / 1000)} s`, 429);
+    }
     const token = await this.options.token();
     const headers: Record<string, string> = {
       Accept: options.accept ?? "application/vnd.github+json",
@@ -178,15 +192,18 @@ export class GitHubHost implements GitHost {
       method,
       headers,
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      signal: AbortSignal.timeout(this.options.timeoutMs ?? 30_000),
     });
     const text = await response.text();
+    if (response.status === 429 || (response.status === 403 && (response.headers?.get("retry-after") || response.headers?.get("x-ratelimit-remaining") === "0"))) {
+      const asked = Number(response.headers?.get("retry-after"));
+      const reset = Number(response.headers?.get("x-ratelimit-reset"));
+      const waitMs = Number.isFinite(asked) && asked > 0 ? asked * 1000 : Number.isFinite(reset) && reset > 0 ? reset * 1000 - now : 60_000;
+      this.blockedUntil = now + Math.min(Math.max(waitMs, 1000), 15 * 60_000);
+    }
     if (!response.ok && !(options.allow404 && response.status === 404)) {
-      let message = text.slice(0, 200);
-      try {
-        const parsed = JSON.parse(text) as { message?: unknown };
-        if (typeof parsed.message === "string") message = parsed.message;
-      } catch {}
-      throw new HostError(`GitHub ${method} ${path.split("?")[0]}: ${response.status} ${message}`, response.status);
+      // The status only: a response body is host text, kept out of errors, logs and statuses
+      throw new HostError(`GitHub ${method} ${path.split("?")[0]}: ${response.status}`, response.status);
     }
     return { status: response.status, text };
   }
@@ -242,6 +259,7 @@ export class GitHubHost implements GitHost {
           sha: c.sha,
           author: person(c.commit.author),
           committer: person(c.commit.committer),
+          committedAt: typeof c.commit.committer?.date === "string" ? c.commit.committer.date : null,
           message: c.commit.message ?? "",
         });
       }

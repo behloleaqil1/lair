@@ -10,6 +10,7 @@
  */
 import { ownerHeaders } from "./owner-session";
 import type { CommandResult, DragonStartRequest, DragonStopRequest } from "../shared/types";
+import type { CloudTripCleared } from "../shared/cloud-types";
 
 export interface ApiEnvelope<T = unknown> {
   success: boolean;
@@ -80,4 +81,11 @@ export function startPipelineRun<T>(project: string, body: { pipeline: string; s
 
 export function cancelPipelineRun<T>(project: string, id: string): Promise<ApiEnvelope<T>> {
   return ownerPost<T>(`/api/pipelines/runs/${encodeURIComponent(id)}/cancel${query(project)}`);
+}
+
+// ============ CLOUD ============
+
+/** The owner clears the money guard's trip that stands, named by when it tripped (as the status shows it). */
+export function clearCloudTrip(project: string, trippedAt: string): Promise<ApiEnvelope<CloudTripCleared>> {
+  return ownerPost<CloudTripCleared>(`/api/cloud/trip/clear${query(project)}`, { trippedAt });
 }

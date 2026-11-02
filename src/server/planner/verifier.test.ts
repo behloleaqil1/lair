@@ -928,3 +928,49 @@ describe("verifier acceptance tests", () => {
     store.close();
   });
 });
+
+// ============ OPTION EFFECTS ============
+
+describe("the run's decision tells the owner which options cannot be undone", () => {
+  const ADD = { op: "add", task: "feat-search", agent: "worker-b", text: "Search page", reason: "ready" };
+  const REWORD = { op: "reword", task: "feat-login", text: "Login form, with the reset link", reason: "the plan says so" };
+  const DROP = { op: "drop", task: "feat-login", reason: "superseded" };
+
+  /** One observe-mode run whose proposals get these verdicts; the effect of each option of its decision. */
+  async function effectsOf(proposals: unknown[], verdicts: ("approve" | "reject")[]): Promise<Record<string, string | undefined>> {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    const h = await setupWithVerifier(p, { mode: "observe" });
+    await h.service.cycle();
+    await startPlannerRun(h, 31 * SEC);
+    await runPlannerAgent(h, (c) => writeProposals(c, { proposals }));
+    await h.service.cycle();
+    await runVerifierAgent(h, (c) =>
+      writeVerdicts(c, { verdicts: verdicts.map((verdict, proposal) => ({ proposal, verdict, reason: "checked" })) }),
+    );
+    await h.service.cycle();
+    const [decision] = open(h);
+    expect(decision).toBeDefined();
+    return Object.fromEntries(decision.options.map((o) => [o.id, o.effect]));
+  }
+
+  it("effects-1. only adds: approve_all and follow_verifier are reversible", async () => {
+    const other = { ...ADD, task: "feat-cart", text: "Cart page" };
+    expect(await effectsOf([ADD, other], ["approve", "reject"])).toEqual({
+      approve_all: "reversible",
+      reject_all: "reversible",
+      follow_verifier: "reversible",
+    });
+  });
+
+  it("effects-2. a pending reword or drop makes approve_all irreversible; follow_verifier only when the verifier approved it", async () => {
+    // Rejected by the verifier: applying all would apply it, following the verifier would not
+    expect(await effectsOf([ADD, REWORD], ["approve", "reject"])).toMatchObject({ approve_all: "irreversible", follow_verifier: "reversible" });
+    expect(await effectsOf([ADD, DROP], ["approve", "reject"])).toMatchObject({ approve_all: "irreversible", follow_verifier: "reversible" });
+    // Approved by the verifier: both apply it
+    expect(await effectsOf([REWORD, ADD], ["approve", "reject"])).toMatchObject({ approve_all: "irreversible", follow_verifier: "irreversible" });
+    expect(await effectsOf([DROP, ADD], ["approve", "reject"])).toMatchObject({ approve_all: "irreversible", follow_verifier: "irreversible" });
+    // Declining never changes anything
+    expect(await effectsOf([REWORD, ADD], ["approve", "reject"])).toMatchObject({ reject_all: "reversible" });
+  });
+});

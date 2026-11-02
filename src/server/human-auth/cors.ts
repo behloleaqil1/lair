@@ -18,6 +18,9 @@ import type { FastifyCorsOptions } from "@fastify/cors";
  * added at runtime would not take effect; there is deliberately no helper
  * to add one. Prefer a module's whole prefix (e.g. /api/review) over single
  * routes, so a new owner-only route under it can't be forgotten here.
+ *
+ * route-ownership.test.ts fails for any registered route that is neither
+ * under a prefix here nor on its short public list (with a reason each).
  */
 export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/owner",
@@ -31,6 +34,16 @@ export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/dashboard",
   // AI tools: every route, reads included, runs the tools' own commands and shows who is signed in
   "/api/ai",
+  // The infrastructure policy scan: every route is the owner's (a scan answer names files, lines and addresses)
+  "/api/infra-policy",
+  // The plan sandbox: a plan shows resource names and the cloud's answers (every route the owner's)
+  "/api/plan-sandbox",
+  // The OpenTofu runner: plan answers name resources, and apply changes the cloud (every route the owner's)
+  "/api/tofu-runner",
+  // Cloud machines: the status names the account's instances and spend, and the trip is cleared here (every route the owner's)
+  "/api/cloud",
+  // The tracker: its status shows task text and repositories, and a reconcile writes to GitHub (every route the owner's)
+  "/api/tracker",
   // The supervisor: Lair's diagnostics, and the ops tokens and their audit (every route the owner's)
   "/api/health/diagnostics",
   "/api/supervisor",
@@ -47,6 +60,14 @@ export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/pipelines",
   // Only the owner's message route of the bus: its board and event stream keep their CORS
   "/api/bus/send",
+  // The bus's agent API takes a run's bus token, not the owner session; no browser page may call it either
+  "/api/bus/call",
+  // Host services: the owner's tick runs start commands (its reads under /api/host-services stay public)
+  "/api/host-services/owner",
+  // Lessons: every route is owner-only (requireOwner)
+  "/api/lessons",
+  // Checks: POST takes a bus token, GET /:id takes a token or owner, list and stats are owner-only
+  "/api/checks",
 ];
 
 export function isUnder(url: string, prefixes: readonly string[]): boolean {

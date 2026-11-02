@@ -10,15 +10,18 @@
  * - gates_dir/results: <gate-id>.rc, <gate-id>.log, optional <gate-id>.json
  * - gates_dir/runner-<lane>.pid: the lane's runner process
  */
-import { join } from "path";
+import { basename, join } from "path";
 import type { Gate, ProjectConfig, QueueLine } from "../../shared/types.js";
 import { parseQueueFile } from "../parsers/queue.js";
 import { parseGateFilename, parseGateRc } from "../parsers/gates.js";
 import { parseDragonsFile } from "../parsers/dragons.js";
 import { isValidDragonId, parseDragonRegistry } from "../parsers/dragon-config.js";
+import { getDragonAdapter, tokenizeTemplate } from "../services/adapters.js";
 import { isSafeGateId } from "../services/data.js";
+import { mergeDragonRegistry } from "../services/dragon-registry.js";
 import { agentMatcher, type WatchdogSettings } from "./config.js";
-import type { ProcessInfo, Probes } from "./probes.js";
+import { mapLimit } from "../services/async-fs.js";
+import type { FileStat, ProcessInfo, Probes } from "./probes.js";
 import type { WatchdogStore } from "./store.js";
 import type { ContainerServices, SupervisedAgents } from "./types.js";
 
@@ -74,7 +77,18 @@ export interface GateResultFile {
 
 const QUEUE_MAX_BYTES = 4 * 1024 * 1024;
 const SMALL_FILE_BYTES = 64 * 1024;
+/** Files looked at (stat, a small read) at once */
+const STAT_CONCURRENCY = 8;
 const LANE = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
+
+/** An agent's latest line in the queue file (the file is appended in time order). */
+function latestOf(lines: QueueLine[], agentId: string): QueueLine | undefined {
+  const lower = agentId.toLowerCase();
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].agent?.toLowerCase() === lower) return lines[i];
+  }
+  return undefined;
+}
 
 /** A pid from a pid file or lock: "1234", or "pid=1234" / "pid: 1234" on any line. */
 export function parsePid(text: string | null): number | null {
@@ -83,6 +97,37 @@ export function parsePid(text: string | null): number | null {
   if (!match) return null;
   const pid = Number(match[1]);
   return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+}
+
+/** How long after its claim's `started=` time a process may start and still be the claim's process */
+export const CLAIM_START_TOLERANCE_MS = 60_000;
+
+/**
+ * Whether the live process at a claim's recorded pid is the claiming agent's,
+ * rather than an unrelated process that got the pid after the agent died:
+ * - its command names the agent id (bounded, as in watchdog.agent_command); or
+ * - the claim records its start (`started=`) and the process started no more
+ *   than CLAIM_START_TOLERANCE_MS after it. A reused pid always starts after
+ *   the claim, so a later process is another one, even when it runs the
+ *   adapter's program (another agent's run of the same tool); or
+ * - the claim is a bare pid (no start time) and the process runs the agent's
+ *   adapter program. Without a start time, any other process at that pid is
+ *   taken for a reused one.
+ */
+export function claimPidBelongsTo(
+  claimPid: ClaimPid,
+  proc: ProcessInfo,
+  agent: string,
+  adapterProgram: string | null,
+  now: number,
+): boolean {
+  if (agentMatcher("{agent}", agent).test(proc.command)) return true;
+  if (claimPid.startedAt !== null) {
+    const processStartedAt = now - proc.elapsedSeconds * 1000;
+    return processStartedAt <= claimPid.startedAt + CLAIM_START_TOLERANCE_MS;
+  }
+  // ps does not keep argv boundaries, and an interpreter runs the program as an argument (node .../tool)
+  return adapterProgram !== null && proc.argv.some((arg) => basename(arg) === adapterProgram);
 }
 
 export function isSafeLane(lane: unknown): lane is string {
@@ -147,14 +192,39 @@ export class ProjectView {
   // ============ AGENTS ============
 
   /** Agent ids from the YAML dragons: map and agents_dir/dragons.txt. */
-  agentIds(): string[] {
-    return this.once("agentIds", () => {
+  agentIds(): Promise<string[]> {
+    return this.once("agentIds", async () => {
       const ids = new Set(parseDragonRegistry(this.config).keys());
-      const content = this.fs.read(join(this.config.agents_dir, "dragons.txt"), SMALL_FILE_BYTES);
-      for (const dragon of parseDragonsFile(content ?? "")) {
+      for (const dragon of parseDragonsFile(await this.dragonsFile())) {
         if (isValidDragonId(dragon.id)) ids.add(dragon.id);
       }
       return [...ids].sort();
+    });
+  }
+
+  private dragonsFile(): Promise<string> {
+    return this.once(
+      "dragonsFile",
+      async () => (await this.fs.read(join(this.config.agents_dir, "dragons.txt"), SMALL_FILE_BYTES)) ?? "",
+    );
+  }
+
+  /**
+   * The file name of the program the agent's adapter starts (the first word
+   * of its start_cmd, e.g. "tool-cli"), or null when the agent is not a known
+   * dragon or its adapter is not defined.
+   */
+  adapterProgram(agentId: string): Promise<string | null> {
+    return this.once(`adapterProgram:${agentId}`, async () => {
+      const dragon = mergeDragonRegistry(this.config, await this.dragonsFile()).get(agentId);
+      const adapter = dragon ? getDragonAdapter(dragon, this.config) : undefined;
+      if (!adapter?.start_cmd) return null;
+      try {
+        const program = tokenizeTemplate(adapter.start_cmd)[0];
+        return program && !program.includes("{") ? basename(program) : null;
+      } catch {
+        return null; // unbalanced quotes: config validation reports the adapter
+      }
     });
   }
 
@@ -183,8 +253,8 @@ export class ProjectView {
   }
 
   /** Known agents that run on this machine. */
-  localAgentIds(): string[] {
-    return this.agentIds().filter((id) => this.isLocalAgent(id));
+  async localAgentIds(): Promise<string[]> {
+    return (await this.agentIds()).filter((id) => this.isLocalAgent(id));
   }
 
   /**
@@ -221,8 +291,8 @@ export class ProjectView {
    * seen from here, so its claim is the signal).
    */
   async runningAgents(): Promise<string[]> {
-    const claimed = new Set(this.claims().map((c) => c.agent));
-    const ids = new Set([...this.agentIds(), ...claimed]);
+    const claimed = new Set((await this.claims()).map((c) => c.agent));
+    const ids = new Set([...(await this.agentIds()), ...claimed]);
     const running: string[] = [];
     for (const id of ids) {
       if (this.isLocalAgent(id)) {
@@ -235,33 +305,38 @@ export class ProjectView {
   }
 
   /** The newest <id>.log / <id>-<UTC>.log in agents_dir, by mtime. */
-  newestLog(agentId: string): AgentLog | null {
-    return this.once(`newestLog:${agentId}`, () => {
+  newestLog(agentId: string): Promise<AgentLog | null> {
+    return this.once(`newestLog:${agentId}`, async () => {
       const escaped = agentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const name = new RegExp(`^${escaped}(?:-\\d{8}T\\d{6}Z)?\\.log$`);
+      const entries = (await this.agentsDirEntries()).filter((entry) => name.test(entry));
+      const stats = await mapLimit(entries, STAT_CONCURRENCY, async (entry) => this.fs.stat(join(this.config.agents_dir, entry)));
       let newest: AgentLog | null = null;
-      for (const entry of this.fs.list(this.config.agents_dir)) {
-        if (!name.test(entry)) continue;
-        const path = join(this.config.agents_dir, entry);
-        const st = this.fs.stat(path);
+      for (let i = 0; i < entries.length; i++) {
+        const st = stats[i];
         if (st && !st.isDirectory && (!newest || st.mtimeMs > newest.mtimeMs)) {
-          newest = { name: entry, path, mtimeMs: st.mtimeMs };
+          newest = { name: entries[i], path: join(this.config.agents_dir, entries[i]), mtimeMs: st.mtimeMs };
         }
       }
       return newest;
     });
   }
 
+  /** agents_dir's entries, listed once per view (every agent's newest log and the claims read them). */
+  private agentsDirEntries(): Promise<string[]> {
+    return this.once("agentsDirEntries", async () => this.fs.list(this.config.agents_dir));
+  }
+
   /** Claims: agents_dir/<id>.running (a directory or a file). */
-  claims(): Claim[] {
-    return this.once("claims", () => {
+  claims(): Promise<Claim[]> {
+    return this.once("claims", async () => {
       const claims: Claim[] = [];
-      for (const entry of this.fs.list(this.config.agents_dir)) {
+      for (const entry of await this.agentsDirEntries()) {
         if (!entry.endsWith(".running")) continue;
         const agent = entry.slice(0, -".running".length);
         if (!isValidDragonId(agent)) continue;
         const path = join(this.config.agents_dir, entry);
-        const st = this.fs.stat(path);
+        const st = await this.fs.stat(path);
         if (st) claims.push({ agent, name: entry, path, mtimeMs: st.mtimeMs });
       }
       return claims.sort((a, b) => a.name.localeCompare(b.name));
@@ -273,12 +348,12 @@ export class ProjectView {
    * Returns null when no pid is recorded. The claim format matches the lock
    * format: either `pid=1234\nstarted=...\n` or just a bare pid.
    */
-  claimPid(claim: Claim): ClaimPid | null {
-    const st = this.fs.stat(claim.path);
+  async claimPid(claim: Claim): Promise<ClaimPid | null> {
+    const st = await this.fs.stat(claim.path);
     if (!st) return null;
     const isDirectory = st.isDirectory;
     const pidFile = isDirectory ? join(claim.path, "pid") : claim.path;
-    const content = this.fs.read(pidFile, SMALL_FILE_BYTES);
+    const content = await this.fs.read(pidFile, SMALL_FILE_BYTES);
     if (!content) return null;
     const pid = parsePid(content);
     if (pid === null) return null;
@@ -288,42 +363,49 @@ export class ProjectView {
     return { pid, startedAt: Number.isNaN(startedAt) ? null : startedAt };
   }
 
+  /**
+   * Whether a claim's recorded pid is running as the claiming agent
+   * (claimPidBelongsTo). The orphan_claim detector and the release_claim
+   * guard both ask this, so they never disagree about a pid.
+   */
+  async claimPidIsAgents(claim: Claim, claimPid: ClaimPid): Promise<boolean> {
+    const proc = await this.getProcess(claimPid.pid);
+    if (proc === null) return false;
+    return claimPidBelongsTo(claimPid, proc, claim.agent, await this.adapterProgram(claim.agent), this.now);
+  }
+
   // ============ QUEUE FILE ============
 
-  queueLines(): QueueLine[] {
-    return this.once("queueLines", () => {
-      const content = this.fs.read(this.config.queue_file, QUEUE_MAX_BYTES);
+  queueLines(): Promise<QueueLine[]> {
+    return this.once("queueLines", async () => {
+      const content = await this.fs.read(this.config.queue_file, QUEUE_MAX_BYTES);
       return content ? parseQueueFile(content) : [];
     });
   }
 
   /** The agent's latest line in the queue file (the file is appended in time order). */
-  latestLineFor(agentId: string): QueueLine | undefined {
-    const lower = agentId.toLowerCase();
-    const lines = this.queueLines();
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (lines[i].agent?.toLowerCase() === lower) return lines[i];
-    }
-    return undefined;
+  async latestLineFor(agentId: string): Promise<QueueLine | undefined> {
+    return latestOf(await this.queueLines(), agentId);
   }
 
   /**
    * The gate an agent is WAITING on: its latest queue line is a WAITING line
    * naming a gate id, and that gate has no result (.rc) yet. Null otherwise.
    */
-  waitingOn(agentId: string): string | null {
-    const line = this.latestLineFor(agentId);
+  async waitingOn(agentId: string): Promise<string | null> {
+    const line = await this.latestLineFor(agentId);
     if (!line || line.type !== "WAITING" || !line.gateId) return null;
-    return this.gateResultExists(line.gateId) ? null : line.gateId;
+    return (await this.gateResultExists(line.gateId)) ? null : line.gateId;
   }
 
   /** Agents whose latest queue line is a WAITING line (on anything). */
-  waitingAgents(): string[] {
+  async waitingAgents(): Promise<string[]> {
+    const lines = await this.queueLines();
     const agents = new Set<string>();
-    for (const line of this.queueLines()) {
+    for (const line of lines) {
       if (line.agent) agents.add(line.agent);
     }
-    return [...agents].filter((a) => this.latestLineFor(a)?.type === "WAITING").sort();
+    return [...agents].filter((a) => latestOf(lines, a)?.type === "WAITING").sort();
   }
 
   // ============ GATES ============
@@ -336,19 +418,19 @@ export class ProjectView {
     return join(this.config.gates_dir, "results");
   }
 
-  gateResultExists(gateId: string): boolean {
-    return isSafeGateId(gateId) && this.fs.stat(join(this.gatesResultsDir, `${gateId}.rc`)) !== null;
+  async gateResultExists(gateId: string): Promise<boolean> {
+    return isSafeGateId(gateId) && (await this.fs.stat(join(this.gatesResultsDir, `${gateId}.rc`))) !== null;
   }
 
   /** Queued (.req) and running (.req.run) gate requests. */
-  gateRequests(): GateRequest[] {
-    return this.once("gateRequests", () => {
+  gateRequests(): Promise<GateRequest[]> {
+    return this.once("gateRequests", async () => {
       const requests: GateRequest[] = [];
-      for (const name of this.fs.list(this.gatesQueueDir)) {
+      for (const name of await this.fs.list(this.gatesQueueDir)) {
         const gate = parseGateFilename(name);
         if (!gate || (gate.status !== "queued" && gate.status !== "running")) continue;
         const path = join(this.gatesQueueDir, name);
-        const st = this.fs.stat(path);
+        const st = await this.fs.stat(path);
         if (!st) continue;
         requests.push({
           name,
@@ -363,58 +445,60 @@ export class ProjectView {
   }
 
   /** The log of a running or finished gate request, newest of the queue and results copies. */
-  gateLogMtime(request: GateRequest): number | null {
+  async gateLogMtime(request: GateRequest): Promise<number | null> {
     const candidates = [
       join(this.gatesQueueDir, `${request.base}.log`),
       join(this.gatesResultsDir, `${request.gate.id}.log`),
     ];
     let newest: number | null = null;
     for (const path of candidates) {
-      const st = this.fs.stat(path);
+      const st = await this.fs.stat(path);
       if (st && (newest === null || st.mtimeMs > newest)) newest = st.mtimeMs;
     }
     return newest;
   }
 
   /** The pid recorded for a lane's runner: gates_dir/runner-<lane>.pid. */
-  runnerPid(lane: string): number | null {
+  async runnerPid(lane: string): Promise<number | null> {
     if (!isSafeLane(lane)) return null;
-    return parsePid(this.fs.read(join(this.config.gates_dir, `runner-${lane}.pid`), SMALL_FILE_BYTES));
+    return parsePid(await this.fs.read(join(this.config.gates_dir, `runner-${lane}.pid`), SMALL_FILE_BYTES));
   }
 
-  /** Finished gates: gates_dir/results/<gate-id>.rc. */
-  gateResults(): GateResultFile[] {
-    return this.once("gateResults", () => {
-      const results: GateResultFile[] = [];
-      for (const name of this.fs.list(this.gatesResultsDir)) {
-        if (!name.endsWith(".rc")) continue;
-        const id = name.slice(0, -3);
-        if (!isSafeGateId(id)) continue;
-        const path = join(this.gatesResultsDir, name);
-        const st = this.fs.stat(path);
-        const rc = parseGateRc(this.fs.read(path, 64) ?? "");
-        if (!st || rc === null) continue;
-        results.push({
+  /** Finished gates: gates_dir/results/<gate-id>.rc (a few read at a time). */
+  gateResults(): Promise<GateResultFile[]> {
+    return this.once("gateResults", async () => {
+      const ids = (await this.fs.list(this.gatesResultsDir)).flatMap((name) => {
+        const id = name.endsWith(".rc") ? name.slice(0, -3) : "";
+        return isSafeGateId(id) ? [id] : [];
+      });
+      const read = await mapLimit(ids, STAT_CONCURRENCY, async (id) => {
+        const path = join(this.gatesResultsDir, `${id}.rc`);
+        const [st, text] = [await this.fs.stat(path), await this.fs.read(path, 64)];
+        const rc = parseGateRc(text ?? "");
+        if (!st || rc === null) return null;
+        const result: GateResultFile = {
           id,
           rc,
           mtimeMs: st.mtimeMs,
           logPath: join(this.gatesResultsDir, `${id}.log`),
           jsonPath: join(this.gatesResultsDir, `${id}.json`),
-        });
-      }
+        };
+        return result;
+      });
+      const results = read.filter((r): r is GateResultFile => r !== null);
       return results.sort((a, b) => a.mtimeMs - b.mtimeMs || a.id.localeCompare(b.id));
     });
   }
 
-  readSmall(path: string): string | null {
+  async readSmall(path: string): Promise<string | null> {
     return this.fs.read(path, SMALL_FILE_BYTES);
   }
 
-  readTail(path: string, maxBytes: number): string | null {
+  async readTail(path: string, maxBytes: number): Promise<string | null> {
     return this.fs.read(path, maxBytes);
   }
 
-  stat(path: string) {
+  async stat(path: string): Promise<FileStat | null> {
     return this.fs.stat(path);
   }
 

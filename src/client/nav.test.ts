@@ -22,6 +22,8 @@ const OFF: ModuleFlags = {
   review: false,
   triage: false,
   placement: false,
+  hostServices: false,
+  cloud: false,
   pipelines: false,
   delivery: false,
   watchdog: false,
@@ -29,6 +31,7 @@ const OFF: ModuleFlags = {
   github: false,
   machines: false,
   nodes: false,
+  lessons: false,
 };
 const ALL: ModuleFlags = Object.fromEntries(Object.keys(OFF).map((k) => [k, true])) as unknown as ModuleFlags;
 const ids = (modules: ModuleFlags | null) => visibleSections(modules).map((s) => s.id);
@@ -44,9 +47,10 @@ describe("nav sections", () => {
       "Decisions",
       "Delivery",
       "Processes",
+      "Knowledge",
       "Settings",
     ]);
-    expect(ids(ALL)).toHaveLength(9);
+    expect(ids(ALL)).toHaveLength(10);
   });
 
   it("shows only the sections every project has when no module is on, and Settings always", () => {
@@ -61,6 +65,7 @@ describe("nav sections", () => {
     expect(ids({ ...OFF, machines: true })).toContain("machines");
     expect(ids({ ...OFF, nodes: true })).toContain("machines");
     expect(ids({ ...OFF, placement: true })).toContain("machines");
+    expect(ids({ ...OFF, cloud: true })).toContain("machines");
     expect(ids({ ...OFF, delivery: true })).toContain("delivery");
     expect(ids({ ...OFF, processes: true })).toContain("processes");
     expect(ids({ ...OFF, delivery: true })).not.toContain("processes");
@@ -94,9 +99,9 @@ describe("section tabs", () => {
       "Locks and budget",
     ]);
     expect(tabAvailable("work", "planner", OFF)).toBe(false);
-    // Health always: Lair's self-checks, with the watchdog's part when it is on
-    expect(visibleTabs("home", OFF).map((t) => t.id)).toEqual([null, "activity", "health"]);
-    expect(visibleTabs("home", { ...OFF, watchdog: true }).map((t) => t.id)).toEqual([null, "activity", "health"]);
+    // Health always: Lair's self-checks, with the watchdog's part when it is on; Bus always: it says when the bus is off
+    expect(visibleTabs("home", OFF).map((t) => t.id)).toEqual([null, "activity", "bus", "health"]);
+    expect(visibleTabs("home", { ...OFF, watchdog: true }).map((t) => t.id)).toEqual([null, "activity", "bus", "health"]);
     expect(tabAvailable("gates", "triage", OFF)).toBe(false);
     expect(tabAvailable("gates", "results", OFF)).toBe(true);
   });

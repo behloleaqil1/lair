@@ -5,6 +5,7 @@
  * default hook emits on the event bus.
  */
 import type { EventBus } from "../core/event-bus.js";
+import type { DecisionEffect, DecisionStructure } from "../../shared/decision-types.js";
 
 export type DecisionKind = "product" | "spend" | "legal" | "security" | "credential" | "release" | "escalation" | "other";
 
@@ -24,6 +25,8 @@ export interface DecisionRequest {
   /** `spend` decisions always wait */
   onTimeout: "wait" | "recommended" | "cancel";
   requestedBy: string;
+  /** Policy class and evidence (docs/design/decision-policies.md §4), with the effect of each option in order */
+  structure?: DecisionStructure & { effects: DecisionEffect[] };
 }
 
 export interface DecisionHook {

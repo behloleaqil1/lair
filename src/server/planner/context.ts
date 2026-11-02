@@ -128,6 +128,7 @@ export function plannerSection(input: { runId: string; proposalFile: string; max
     `- At most ${input.maxProposals} proposals. Lair checks each one and refuses what breaks a rule, with the reason.`,
     "- add: a new task id, an agent from rules.allowlist, and text (the line's description). finish: the task is done.",
     "  reassign: another allowlisted agent. reword: new text. drop: remove the line. unblock: the blocker is gone.",
+    "- A tasks file line whose agent is null is unassigned: ready work for any agent. reassign gives it to one.",
     "- agent only for add and reassign; text only for add and reword; reason always.",
     "- Do not edit the tasks file or any other file: Lair applies the proposals it accepts.",
     "- Write an empty list when nothing should change: {\"proposals\": []}",

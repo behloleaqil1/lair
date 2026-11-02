@@ -19,6 +19,8 @@ export interface HostPullRequest {
   /** null: not computed yet */
   mergeable: boolean | null;
   updatedAt: string | null;
+  /** The PR description (absent from hosts that don't return it) */
+  body?: string | null;
 }
 
 export interface HostFile {
@@ -40,6 +42,8 @@ export interface HostCommit {
   sha: string;
   author: PersonIdentity;
   committer: PersonIdentity;
+  /** The committer date (ISO 8601), or null when the host gives none */
+  committedAt: string | null;
   /** The full message: trailers such as Co-authored-by publish emails too */
   message: string;
 }

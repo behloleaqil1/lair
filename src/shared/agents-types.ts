@@ -47,7 +47,7 @@ export type AgentState =
 /** new: the first session; resume: the same session again; fresh: a new session, the old one moved aside */
 export type SessionMode = "new" | "resume" | "fresh";
 
-export type StopReason = "hung" | "failover" | "lost_claim" | "fresh_session";
+export type StopReason = "hung" | "failover" | "lost_claim" | "fresh_session" | "server_shutdown";
 
 /** What started a run's chain, when not the owner or another module: "fill" (agents.fill) */
 export type RunOrigin = "fill";
@@ -142,6 +142,7 @@ export type AgentEventKind =
   | "fill_started"
   | "fill_held"
   | "fill_done"
+  | "fill_conflict"
   | "fill_released"
   | "fill_paused"
   | "fill_waiting"
@@ -149,10 +150,18 @@ export type AgentEventKind =
   | "fill_woken"
   | "fill_weak"
   | "fill_wake_absent"
+  | "fill_report_refused"
+  | "fill_report_waiting"
   | "fill_gate_queued"
   | "fill_gate_gone"
+  | "fill_idle_notice"
+  | "fill_idle_resolved"
+  | "fill_unmatched"
   | "transient"
-  | "transient_cleared";
+  | "transient_cleared"
+  | "run_adopted"
+  | "run_lost"
+  | "stopped_for_shutdown";
 
 /** Recovery and audit record: what happened, why, and the evidence. */
 export interface AgentEventView {
@@ -281,9 +290,12 @@ export interface ProviderUnreachableView {
  * - held: it would start but doesn't, for the reason in `detail`
  * - claimed: another agent's run, or another claim, holds the task
  * - not_allowlisted: its agent is not in agents.fill.agents, so fill never starts it
+ * - unassigned: the line names no agent (`|<name>|<task>|<description>`), so fill never starts it; `ready`
+ *   says whether it is ready work for any agent (fill.idle). An unassigned task that is done, or has an
+ *   active run or a claim, is `done` or `claimed` instead
  * - malformed: the line doesn't parse; `detail` says why
  */
-export type FillLineState = "started" | "done" | "held" | "claimed" | "not_allowlisted" | "malformed";
+export type FillLineState = "started" | "done" | "held" | "claimed" | "not_allowlisted" | "unassigned" | "malformed";
 
 /**
  * Why a line is held:
@@ -298,8 +310,11 @@ export type FillLineState = "started" | "done" | "held" | "claimed" | "not_allow
  *   while the gate it waits on was still in the gate queue doesn't count), or longer than
  *   fill.wake.max_queue_wait_minutes in all
  * - blocked: its last run ended on a BLOCKED line: it needs someone else first
- * - busy, read_only, max_active, capacity, prompt (a refused prompt file), refused (the run request,
- *   or done_pattern)
+ * - busy, read_only, max_active, capacity, capacity_load (load too high for local agent),
+ *   capacity_memory (memory pressure/low), capacity_heavy (heavy work limit), prompt (a refused
+ *   prompt file), refused (the run request, or done_pattern)
+ * - conflict: a live process this server has no run for holds one of the task's run prompt files on its
+ *   command line (a run of the task it doesn't know): fill starts the task once that process has ended
  * - paused: you chose to leave it ("Keep it paused" on its decision, or "Leave the task unclaimed" on
  *   its run's escalation): nothing waits for you, and fill starts it again once you release it
  * owner, no_done, blocked, waiting, waited_too_long and paused are the owner's to release (POST
@@ -319,8 +334,14 @@ export type FillHold =
   | "read_only"
   | "max_active"
   | "capacity"
+  | "capacity_load"
+  | "capacity_memory"
+  | "capacity_heavy"
+  | "capacity_probe"
+  | "conflict"
   | "prompt"
-  | "refused";
+  | "refused"
+  | "report_refused";
 
 export interface FillLineView {
   /** 1-based line number in tasks_file */
@@ -340,6 +361,11 @@ export interface FillLineView {
   runId: string | null;
   /** The open Decision Inbox item of a hold that needs the owner (FILL_OWNER_HOLDS), when it has one */
   decisionId: string | null;
+  /**
+   * Unassigned lines only: true when it is ready work for any agent (open: not done in the queue, no
+   * active run or claim on its task, its last run not waiting or blocked); `detail` says why not
+   */
+  ready?: boolean;
 }
 
 /** The holds that need the owner: each has exactly one open decision while it lasts. */
@@ -382,6 +408,111 @@ export interface FillStatusView {
   lastCheck: string | null;
   lastError: string | null;
   lines: FillLineView[];
+  /** Idle states for agents in the allowlist (fill.agents) */
+  idle?: IdleStateView[];
+  /** done_match task_id: per line, its last run's latest report line that names no task it can be about */
+  unmatchedReports: FillUnmatchedReportView[];
+  /** What in the fill block can make fill close or change a task a line wasn't about (also on Home → Health) */
+  warnings: string[];
+  /** Current capacity state (native capacity checks) */
+  capacity?: FillCapacityView;
+}
+
+/**
+ * Why an allowlisted agent is or isn't working, at fill's last check (fill.idle): never unexplained.
+ * - busy: it has an active run (fill's or anyone's)
+ * - waiting: its line waits on a gate
+ * - held: its line is held for another reason (`hold`), or the project is read_only
+ * - max_active: fill.max_active is reached (its line is held so, or nothing more could start)
+ * - capacity: a capacity check holds its line, or capacity_cmd refused every start
+ * - no_task: it has no line in the tasks file, and no ready work exists
+ * - task_done: its lines are done, and no ready work exists
+ * - no_ready_work: its lines are claimed by other runs, and no ready work exists
+ * - ready_work: idle (no line, its lines done or claimed) while ready work exists: the case a notice is for
+ */
+export type IdleReason =
+  | "busy"
+  | "waiting"
+  | "held"
+  | "max_active"
+  | "capacity"
+  | "no_task"
+  | "task_done"
+  | "no_ready_work"
+  | "ready_work";
+
+/** The idle state of one allowlisted agent. */
+export interface IdleStateView {
+  agent: string;
+  reason: IdleReason;
+  /** The hold of its line when it is held, waiting, at max_active or capacity */
+  hold?: FillHold;
+  /** Its line's task, when it has one in this state */
+  task?: string;
+  /** When it entered this state (kept across a restart only while its notice is open) */
+  since: string;
+  /** How long it has been in this state (seconds) */
+  durationSeconds: number;
+  /** ready_work: the ready tasks (unassigned lines' ids, at most 10) */
+  readyTasks?: string[];
+  /** Plain sentence: why */
+  explanation: string;
+}
+
+/** A DONE, WAITING or BLOCKED line an agent wrote on a run that names no task it can be about: it counts for no task. */
+export interface FillUnmatchedReportView {
+  /** The agent that wrote the line (by its attribution) */
+  agent: string;
+  /** The task of the run it wrote it on */
+  openTask: string;
+  runId: string;
+  /** The task id the line names, as the pattern reads it ("" when it names none) */
+  reportedTask: string;
+  kind: "done" | "waiting" | "blocked";
+  /** The queue line as written (data, cut at 300 characters) */
+  line: string;
+  /** When fill first saw it */
+  at: string;
+}
+
+/** Current capacity state from native checks */
+export interface FillCapacityView {
+  /** Current system load (1-minute average) */
+  load?: number;
+  /** Number of CPUs */
+  cpus?: number;
+  /** Load per CPU */
+  loadPerCpu?: number;
+  /** Configured load_per_cpu_max */
+  loadPerCpuMax?: number;
+  /** Whether load is over the limit */
+  loadOverLimit: boolean;
+  /** Current memory state */
+  memory?: {
+    /** Total memory in bytes */
+    total: number;
+    /** Available memory in bytes */
+    available: number;
+    /** Available as percentage of total */
+    availablePct: number;
+    /** Whether memory is under the minimum */
+    underMin: boolean;
+    /** Configured available_min_pct */
+    availableMinPct?: number;
+    /** Memory pressure in percent, when pressure_max is set */
+    pressurePct?: number;
+    /** Configured pressure_max */
+    pressureMax?: number;
+  };
+  /** Heavy work state */
+  heavyWork?: {
+    /** Number of currently active heavy work items */
+    active: number;
+    /** Configured max_active */
+    maxActive: number;
+    /** Whether heavy work is at the limit */
+    atLimit: boolean;
+  };
 }
 
 /**

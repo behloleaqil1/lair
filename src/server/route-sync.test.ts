@@ -58,6 +58,8 @@ const ROUTE_FILES = [
   "delivery/routes.ts",
   "gates/routes.ts",
   "placement/routes.ts",
+  "infra-monitor/routes.ts",
+  "cloud/routes.ts",
   "review/routes.ts",
   "triage/routes.ts",
   "watchdog/routes.ts",
@@ -74,8 +76,8 @@ const ROUTE_FILES = [
 /**
  * Service files that are called from routes and must not use sync process calls.
  *
- * These are checked separately because the fix requires migrating the routes
- * to use the async data-cache.ts instead.
+ * Checked separately: they held the last such calls on the request path,
+ * until issue #245 made them asynchronous.
  */
 const SERVICE_FILES = [
   "services/data.ts",
@@ -157,15 +159,9 @@ describe("route handlers must not use synchronous child-process APIs", () => {
     }
   });
   
-  it.fails("service files called from routes do not call execSync, execFileSync or spawnSync", () => {
-    // This test is EXPECTED TO FAIL on the base commit (7e90e73) because
-    // services/data.ts uses execSync and execFileSync for gh and git commands.
-    //
-    // The fix requires migrating routes to use the async data-cache.ts.
-    // The async cache is added in this PR; the route migration is tracked
-    // as follow-up work.
-    //
-    // When the migration is complete, change this back to `it(...)`.
+  it("service files called from routes do not call execSync, execFileSync or spawnSync", () => {
+    // services/data.ts ran gh, git, ps and launchctl with execFileSync and the
+    // legacy ssh_cmd with execSync; they run asynchronously now (issue #245).
     //
     // Files scanned: services/data.ts, services/log-tail.ts
     const issues: string[] = [];

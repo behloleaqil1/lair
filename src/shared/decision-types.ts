@@ -55,12 +55,40 @@ export const DECISION_STATUSES = ["open", "answered", "expired", "withdrawn"] as
  */
 export type DecisionStatus = (typeof DECISION_STATUSES)[number];
 
+/**
+ * What choosing an option does (docs/design/decision-policies.md §4):
+ * reversible: it can be undone later; frees_task: it stops waiting and frees
+ * the task; irreversible: it can't be undone; outward: it acts outside Lair
+ * (a merge, a spend). irreversible and outward are never for a rule to
+ * answer.
+ */
+export const DECISION_EFFECTS = ["reversible", "frees_task", "irreversible", "outward"] as const;
+export type DecisionEffect = (typeof DECISION_EFFECTS)[number];
+
+/** A fact on a decision: flat, numbers as numbers, times as ISO-8601, ids rather than names. */
+export type DecisionFactValue = string | number | boolean | null;
+
+/**
+ * The machine-readable evidence of a decision (the prose stays in `context`
+ * for the person). `code` is one value of a fixed set per class.
+ */
+export interface DecisionEvidence {
+  code: string;
+  facts: Record<string, DecisionFactValue>;
+  /** Set by the module that raised the decision; true when the cause is gone */
+  cause_cleared: boolean;
+  /** Issue number when a known cause is tracked */
+  linked_issue: number | null;
+}
+
 export interface DecisionOption {
   /** Stable id the producer acts on, e.g. "approve" */
   id: string;
   label: string;
   /** What happens if this option is chosen */
   consequences: string;
+  /** Absent on decisions raised before options carried it */
+  effect?: DecisionEffect;
   /** credentials decisions: choosing this option means supplying the secret */
   suppliesSecret?: boolean;
 }
@@ -76,6 +104,10 @@ export interface DecisionLink {
   url: string;
 }
 
+/** How an answered decision turned out (the outcome tracker, src/server/outcomes/). */
+export const DECISION_OUTCOMES = ["good", "bad", "unknown"] as const;
+export type DecisionOutcome = (typeof DECISION_OUTCOMES)[number];
+
 export interface DecisionAnswer {
   optionId: string;
   note?: string;
@@ -89,6 +121,8 @@ export interface DecisionAnswer {
 export type DecisionAuditAction =
   | "raised"
   | "raised_again"
+  | "structure_refused"
+  | "evidence_updated"
   | "answered"
   | "overdue"
   | "expired"
@@ -143,6 +177,19 @@ export interface Decision {
   deliveredAt?: string;
   /** "http": raised over the API, so `source.module` is only what the caller said; "server": by a module inside Lair */
   raisedVia: "server" | "http";
+  /** Set once by the outcome tracker, when it is on; absent until then */
+  outcome?: DecisionOutcome;
+  outcomeAt?: string;
+  /** Codes and ids only, no prose: `{ rule, ... }` */
+  outcomeEvidence?: Record<string, string | number | boolean | null>;
+  /**
+   * The policy class, "module.name" (docs/design/decision-policies.md §2).
+   * Absent on decisions raised without one: they are never for a rule.
+   */
+  class?: string;
+  /** True when `class` is in the policy table (src/server/decisions/structure.ts) */
+  classKnown?: boolean;
+  evidence?: DecisionEvidence;
   /** Only in GET /api/decisions/:id */
   audit?: DecisionAuditEntry[];
 }
@@ -156,4 +203,52 @@ export interface DecisionCounts {
   action: number;
   /** Open notices (for information only) */
   notices: number;
+}
+
+/** The class and evidence a module attaches to a request for a decision (options carry their own effect). */
+export interface DecisionStructure {
+  class: string;
+  evidence: DecisionEvidence;
+}
+
+/**
+ * Shadow policy agreement (docs/design/decision-policies.md §5): one proposer version's proposals for a class
+ * compared with the answers people gave. Nothing here answers a decision.
+ */
+export interface PolicyAgreementRow {
+  class: string;
+  proposer: string;
+  version: string;
+  /** Rows in the policy trace */
+  traced: number;
+  /** Answered by a person, so comparable */
+  compared: number;
+  /** Proposed an option, and a person chose the same one */
+  agreed: number;
+  /** Proposed an option, and a person chose another */
+  disagreed: number;
+  /** Abstained on a decision a person answered */
+  abstained: number;
+  /** Disagreed where the proposal was an irreversible or outward option: one blocks promotion */
+  unsafeDisagreements: number;
+  /** Still open */
+  pending: number;
+  /** Withdrawn or expired: nobody needed to answer */
+  withdrawn: number;
+  /** agreed / (agreed + disagreed); null before any proposal was compared */
+  agreement: number | null;
+  /** proposed / compared; null before any comparison */
+  coverage: number | null;
+}
+
+/** GET /api/owner/decision-policies */
+export interface DecisionPoliciesStatus {
+  /** data/server.yaml decision_policies.enabled: off, nothing is proposed or traced and `agreement` is empty */
+  enabled: boolean;
+  source: "file" | "built-in";
+  version: string;
+  policies: { id: string; class: string; codes: string[]; answer: string; state: string; maxTier: number }[];
+  /** Entries of data/policies.yaml that were refused, each naming its policy, and a refused decision_policies section */
+  errors: string[];
+  agreement: PolicyAgreementRow[];
 }

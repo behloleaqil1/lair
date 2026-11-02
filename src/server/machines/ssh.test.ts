@@ -232,7 +232,7 @@ describe("buildGateCommand", () => {
     const args = buildGateCommand(
       machine,
       "gate.sh",
-      "/home/work",
+      "/srv/work",
       "conf",
       "tree",
       { BACKEND_TESTS: "com.example.Test", DEBUG: "true" }

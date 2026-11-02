@@ -215,7 +215,8 @@ export type LockVerdict =
 /** Whether a lock is free, held by a live process, or stale (its holder is gone). */
 export function judgeLock(lock: LockFile | null, snapshot: ProcessSnapshot, staleMinutes: number): LockVerdict {
   if (!lock) return { state: "free" };
-  const now = snapshot.now;
+  // The age as of the reading (a cached one may be seconds old: the lock then looks that much younger)
+  const now = snapshot.takenAt;
   if (lock.pid !== null) {
     if (lock.format === "lair") {
       if (snapshot.isAlive(lock.pid, lock.startedAt)) {

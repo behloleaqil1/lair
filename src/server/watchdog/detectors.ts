@@ -45,18 +45,18 @@ const lockHolderDead: Detector = {
   title: "Locks held by a live process",
   inactiveReason: (ctx) => (ctx.settings.locks.length === 0 ? "no watchdog.locks configured" : null),
   async detect(view) {
-    const queued = view.gateRequests().filter((r) => r.gate.status === "queued");
-    const waiting = view.waitingAgents();
+    const queued = (await view.gateRequests()).filter((r) => r.gate.status === "queued");
+    const waiting = await view.waitingAgents();
     const waiters = [
       ...waiting.map((a) => `agent ${a} is WAITING`),
       ...queued.map((r) => `gate request ${r.name} is queued`),
     ];
     const findings: Finding[] = [];
     for (const lock of view.settings.locks) {
-      const st = view.stat(lock.path);
+      const st = await view.stat(lock.path);
       if (!st) continue;
       const pidSource = st.isDirectory ? join(lock.path, lock.pidFile) : lock.path;
-      const pid = parsePid(view.readSmall(pidSource));
+      const pid = parsePid(await view.readSmall(pidSource));
       if (pid !== null && (await view.isAlive(pid))) continue; // a live holder: never broken
       if (waiters.length === 0) continue; // nobody needs it
       const age = view.minutesSince(st.mtimeMs);
@@ -85,7 +85,7 @@ const duplicateAgent: Detector = {
   inactiveReason: (ctx) => (ctx.settings.agentCommand ? null : NO_AGENT_PATTERN),
   async detect(view) {
     const findings: Finding[] = [];
-    for (const agent of view.localAgentIds()) {
+    for (const agent of await view.localAgentIds()) {
       const procs = await view.agentProcesses(agent);
       if (procs.length < 2) continue;
       const [keep, ...extra] = procs;
@@ -114,19 +114,19 @@ const duplicateAgent: Detector = {
  * minutes. Null when it isn't hung. The agents module
  * (src/server/agents/) applies the same rule to the runs it starts.
  */
-export function hungFinding(
+export async function hungFinding(
   view: ProjectView,
   agent: string,
   proc: ProcessInfo,
   limit: number = view.settings.hungMinutes,
-): Finding | null {
-  if (view.waitingOn(agent)) return null; // WAITING on a gate with no result yet: never hung
+): Promise<Finding | null> {
+  if (await view.waitingOn(agent)) return null; // WAITING on a gate with no result yet: never hung
   const startedAt = view.now - proc.elapsedSeconds * 1000;
-  const log = view.newestLog(agent);
+  const log = await view.newestLog(agent);
   const lastActivity = Math.max(startedAt, log?.mtimeMs ?? startedAt);
   const silent = view.minutesSince(lastActivity);
   if (silent < limit) return null;
-  const latest = view.latestLineFor(agent);
+  const latest = await view.latestLineFor(agent);
   return {
     detector: "agent_hung",
     key: `agent_hung:${agent}`,
@@ -151,7 +151,7 @@ const agentHung: Detector = {
   async detect(view) {
     const findings: Finding[] = [];
     const supervised: string[] = [];
-    for (const agent of view.localAgentIds()) {
+    for (const agent of await view.localAgentIds()) {
       // The agents module recovers the agents it runs; one failure is handled once
       const reason = view.ctx.agents?.supervisedReason(view.ctx.project, agent);
       if (reason) {
@@ -160,7 +160,7 @@ const agentHung: Detector = {
       }
       const procs = await view.agentProcesses(agent);
       if (procs.length === 0) continue;
-      const finding = hungFinding(view, agent, procs[0]);
+      const finding = await hungFinding(view, agent, procs[0]);
       if (finding) findings.push(finding);
     }
     return { findings, detail: supervisedDetail(supervised) };
@@ -182,7 +182,7 @@ const orphanClaim: Detector = {
     const remote: string[] = [];
     const supervised: string[] = [];
     const livePid: string[] = [];
-    for (const claim of view.claims()) {
+    for (const claim of await view.claims()) {
       // A remote agent's process is not in the local process table: unknown, never "dead"
       if (!view.isLocalAgent(claim.agent)) {
         remote.push(`${claim.agent} (${view.agentMachine(claim.agent).machine})`);
@@ -195,31 +195,12 @@ const orphanClaim: Detector = {
       }
       if ((await view.agentProcesses(claim.agent)).length > 0) continue; // live agent: never touched
 
-      // Check the claim file's recorded pid: if it is alive AND belongs to this agent, skip it.
-      // A live pid alone is not enough: after the agent dies, the OS can reuse that pid for
-      // an unrelated process, so we verify the process matches the agent.
-      const claimPid = view.claimPid(claim);
-      if (claimPid !== null) {
-        const proc = await view.getProcess(claimPid.pid);
-        if (proc !== null) {
-          // The pid is alive. Check if it belongs to this agent:
-          // 1. If the claim has a start time, the process uptime should roughly match
-          //    (the process should have been running since approximately that time)
-          // 2. Or, the process command contains the agent id
-          const expectedUptimeMs = claimPid.startedAt !== null ? view.now - claimPid.startedAt : null;
-          const actualUptimeMs = proc.elapsedSeconds * 1000;
-          // Allow 10% tolerance plus 60 seconds for timing differences
-          const toleranceMs = expectedUptimeMs !== null ? Math.max(60000, expectedUptimeMs * 0.1) : 0;
-          const startMatch =
-            expectedUptimeMs !== null &&
-            Math.abs(actualUptimeMs - expectedUptimeMs) <= toleranceMs;
-          const commandMatch = proc.command.includes(claim.agent);
-          if (startMatch || commandMatch) {
-            livePid.push(`${claim.agent} (pid ${claimPid.pid})`);
-            continue;
-          }
-          // The pid is alive but doesn't match the agent: it's a reused pid, treat as orphan
-        }
+      // The claim's recorded pid, when it is alive AND the agent's: a live pid alone is not
+      // enough, since the OS can give a dead agent's pid to an unrelated process (claimPidBelongsTo)
+      const claimPid = await view.claimPid(claim);
+      if (claimPid !== null && (await view.claimPidIsAgents(claim, claimPid))) {
+        livePid.push(`${claim.agent} (pid ${claimPid.pid})`);
+        continue;
       }
 
       const age = view.minutesSince(claim.mtimeMs);
@@ -233,7 +214,8 @@ const orphanClaim: Detector = {
           `no process matches watchdog.agent_command for ${claim.agent}`,
           ...(claimPid !== null ? [`claim's recorded pid ${claimPid.pid} is not running or doesn't match the agent`] : []),
         ],
-        vars: { agent: claim.agent, claim: claim.path },
+        // process_found: only a claim whose agent has no live process (nor a live recorded pid) is reported
+        vars: { agent: claim.agent, claim: claim.path, claim_age_min: String(Math.round(age)), process_found: "false" },
       });
     }
     const details = [
@@ -322,14 +304,14 @@ const infraSignature: Detector = {
     const s = view.settings;
     const since = view.now - s.infraWindowMinutes * 60000;
     const groups = new Map<string, { lane: string; signature: string; tracks: Map<string, string> }>();
-    for (const result of view.gateResults()) {
+    for (const result of await view.gateResults()) {
       if (result.rc === 0 || result.mtimeMs < since) continue;
       const idParts = result.id.match(GATE_ID);
       if (!idParts) continue;
       const [, , track, sha] = idParts;
-      const log = view.readTail(result.logPath, LOG_TAIL_BYTES) ?? "";
+      const log = await view.readTail(result.logPath, LOG_TAIL_BYTES) ?? "";
       let json: Record<string, unknown> | null = null;
-      const jsonText = view.readSmall(result.jsonPath);
+      const jsonText = await view.readSmall(result.jsonPath);
       if (jsonText) {
         try {
           const parsed = JSON.parse(jsonText) as unknown;
@@ -374,12 +356,12 @@ const gateOwnerGone: Detector = {
   async detect(view) {
     const findings: Finding[] = [];
     const lease = view.settings.gateLeaseMinutes;
-    for (const request of view.gateRequests()) {
+    for (const request of await view.gateRequests()) {
       if (request.gate.status !== "running") continue;
-      const ownPid = parsePid(view.readSmall(request.path));
-      const pid = ownPid ?? view.runnerPid(request.gate.lane);
+      const ownPid = parsePid(await view.readSmall(request.path));
+      const pid = ownPid ?? await view.runnerPid(request.gate.lane);
       if (pid !== null && (await view.isAlive(pid))) continue;
-      const lastActivity = Math.max(request.mtimeMs, view.gateLogMtime(request) ?? 0);
+      const lastActivity = Math.max(request.mtimeMs, await view.gateLogMtime(request) ?? 0);
       const silent = view.minutesSince(lastActivity);
       if (silent < lease) continue;
       const owner =
@@ -411,11 +393,11 @@ const idleCapacity: Detector = {
   inactiveReason: () => null,
   async detect(view) {
     const s = view.settings;
-    const requests = view.gateRequests();
+    const requests = await view.gateRequests();
     const queued = requests.filter((r) => r.gate.status === "queued");
     const ready = await view.readyTasks();
     const work = queued.length + ready.length;
-    const claims = view.claims();
+    const claims = await view.claims();
     // Local agents count by their live process, remote ones by their claim
     const running = view.hasAgentPattern()
       ? (await view.runningAgents()).length
@@ -430,7 +412,7 @@ const idleCapacity: Detector = {
       ...claims.map((c) => c.mtimeMs),
       ...requests.filter((r) => r.gate.status === "running").map((r) => r.mtimeMs),
     ];
-    for (const agent of view.localAgentIds()) {
+    for (const agent of await view.localAgentIds()) {
       for (const proc of await view.agentProcesses(agent)) {
         starts.push(view.now - proc.elapsedSeconds * 1000);
       }
@@ -442,7 +424,7 @@ const idleCapacity: Detector = {
     if (idle < s.idleMinutes) return { findings: [], detail };
 
     const freeSlots =
-      s.maxAgents !== undefined ? s.maxAgents - running : Math.max(1, view.agentIds().length - running);
+      s.maxAgents !== undefined ? s.maxAgents - running : Math.max(1, (await view.agentIds()).length - running);
     return {
       detail,
       findings: [
@@ -461,6 +443,7 @@ const idleCapacity: Detector = {
             ready: String(ready.length),
             queued: String(queued.length),
             running: String(running),
+            last_start: lastStart === -Infinity ? "" : iso(lastStart),
           },
         },
       ],
@@ -485,7 +468,7 @@ const progressStall: Detector = {
     // appended in time order), and it counts only with a full ISO time: an
     // HH:MMZ time has no date, so an old line could pass for today's.
     let lastMerged: { message: string } | undefined;
-    for (const line of view.queueLines()) {
+    for (const line of await view.queueLines()) {
       if (/^MERGED\b/i.test(line.message)) lastMerged = line;
     }
     let undated: string | null = null;
@@ -512,9 +495,9 @@ const progressStall: Detector = {
         if (!Number.isNaN(at)) merges.push(at);
       }
     }
-    const requests = view.gateRequests();
+    const requests = await view.gateRequests();
     const ready = await view.readyTasks();
-    const claims = view.claims();
+    const claims = await view.claims();
     const pending = requests.length + ready.length + claims.length;
     if (merges.length === 0) {
       return { findings: [], detail: "no merge on record (no MERGED line, no merged_cmd result)" };

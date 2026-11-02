@@ -31,6 +31,7 @@ import { ReviewManager } from "./service.js";
 import { registerReviewRoutes } from "./routes.js";
 import { parseReviewConfig } from "./config.js";
 import { reviewTaskId } from "./agent-assigner.js";
+import { branchesFromTasks } from "./authors.js";
 import { inboxDecisionSink, type ReviewerRuns } from "./ports.js";
 import { FINDINGS_FORMAT, fillTemplate, invalidValue } from "./prompt.js";
 import { FakeRemote, fakeGitHubApi, type FakeFile, type Person } from "./testing/fakes.js";
@@ -249,7 +250,7 @@ async function boot(options: BootOptions = {}): Promise<Harness> {
     await registerOwnerRoutes(app, auth);
     const agents = new AgentsManager({
       dbPath: join(dir, "data", "agents.db"),
-      probes: { processes: procs, fs: new NodeFileSystem(), runner: new NoCommands(), clock, spawner, self: SELF },
+      probes: { processes: procs, fs: new NodeFileSystem(), runner: new NoCommands(), clock, spawner, self: SELF, systemInfo: { cpuCount: () => 4, loadAvg1: () => 0.5, totalMemory: () => 16e9, memory: async () => ({ available: 8e9 }) } },
       events,
     });
     agents.load([{ name: "demo", config }]);
@@ -894,7 +895,18 @@ describe("author mapping", () => {
     "rev-b|B|fix-cache|Fix the cache TTL (fix/cache-ttl)",
     "worker-a|A|shared-1|Part one (team/shared)",
     "rev-c|C|shared-2|Part two (team/shared)",
+    // Unassigned: it names no author, so it confirms none and makes no match ambiguous (every test below holds with it)
+    "|Pool|free-1|Up for grabs (fix/cache-ttl) (branch: team/login)",
   ].join("\n");
+
+  it("reads the branches of assigned lines only: an unassigned line names no author", () => {
+    expect(branchesFromTasks(tasks)).toEqual([
+      { line: 2, agent: "worker-a", branch: "team/login" },
+      { line: 3, agent: "rev-b", branch: "fix/cache-ttl" },
+      { line: 4, agent: "worker-a", branch: "team/shared" },
+      { line: 5, agent: "rev-c", branch: "team/shared" },
+    ]);
+  });
 
   async function authorFor(headRef: string, authors: Record<string, unknown>) {
     // agents.fill.tasks_file is relative to the repo (fill itself stays off)

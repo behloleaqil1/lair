@@ -222,7 +222,7 @@ export function Planner({ project, refreshKey }: Props) {
             {o.lines.map((l) => (
               <tr key={l.task}>
                 <td>{l.line}</td>
-                <td>{l.agent}</td>
+                <td>{l.agent ?? <span className="muted">unassigned</span>}</td>
                 <td><code>{l.task}</code></td>
                 <td className="muted small">{l.description}</td>
               </tr>

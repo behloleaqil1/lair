@@ -11,7 +11,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, existsSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { BusStore, getBusStore, closeBusStores } from "./store.js";
+import { BusStore, getBusStore, closeBusStores, existingBusStore, openedBusStore } from "./store.js";
 import { hashBusToken, newBusToken } from "./tokens.js";
 
 describe("BusStore", () => {
@@ -325,5 +325,51 @@ describe("getBusStore", () => {
     const store1 = getBusStore("project-a", tempDir);
     const store2 = getBusStore("project-b", tempDir);
     expect(store1).not.toBe(store2);
+  });
+
+  it("openedBusStore and existingBusStore never create a store: null for a project without one, the store once it exists", async () => {
+    expect(openedBusStore("project-a", tempDir)).toBeNull();
+    expect(await existingBusStore("project-a", tempDir)).toBeNull();
+    expect(existsSync(join(tempDir, "bus"))).toBe(false);
+
+    const created = getBusStore("project-a", tempDir);
+    expect(openedBusStore("project-a", tempDir)).toBe(created);
+    // A new process: nothing open, the file is there
+    closeBusStores();
+    expect(openedBusStore("project-a", tempDir)).toBeNull();
+    const existing = await existingBusStore("project-a", tempDir);
+    expect(existing).not.toBeNull();
+    expect(openedBusStore("project-a", tempDir)).toBe(existing);
+  });
+});
+
+describe("revokeTokensExcept (the sweep at start)", () => {
+  let tempDir: string;
+  let store: BusStore;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "bus-store-sweep-"));
+    store = new BusStore("test-project", join(tempDir, "bus.db"));
+  });
+
+  afterEach(() => {
+    store.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("revokes every token of a run not in the active list and keeps the active runs' tokens", () => {
+    store.issueToken("worker-a", "run-ended", "h-ended-1", 1);
+    store.issueToken("worker-a", "run-ended", "h-ended-2", 2);
+    store.issueToken("worker-b", "run-active", "h-active", 3);
+    store.issueToken("worker-c", "run-gone", "h-gone", 4);
+    expect(store.revokeTokensExcept(["run-active"], 10)).toBe(3);
+    expect(store.validateToken("h-ended-1")).toBeNull();
+    expect(store.validateToken("h-ended-2")).toBeNull();
+    expect(store.validateToken("h-gone")).toBeNull();
+    expect(store.validateToken("h-active")).toMatchObject({ runId: "run-active" });
+    // Idempotent: nothing more to revoke
+    expect(store.revokeTokensExcept(["run-active"], 11)).toBe(0);
+    expect(store.revokeTokensExcept([], 12)).toBe(1);
+    expect(store.validateToken("h-active")).toBeNull();
   });
 });
