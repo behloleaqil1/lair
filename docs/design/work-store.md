@@ -4,7 +4,8 @@
 > line, and the owner approves it, before code begins. Roadmap: [ROADMAP.md](ROADMAP.md) A (follows the bus). Relates to:
 > [phase3-bus.md](phase3-bus.md) (agents report through the bus), [planner.md](planner.md) (proposals become tasks),
 > [autonomy.md §4](autonomy.md) (the planner module), [autonomy.md §6](autonomy.md) (agents),
-> [configuration.md](../configuration.md#fill) (fill's tasks file).
+> [configuration.md](../configuration.md#fill) (fill's tasks file). Checked against main at e8147ef (2 Nov, "Main today");
+> work store 1 builds 3.3, 3.4, 6.4 and the read routes of 4.2.
 
 ## The problem
 
@@ -23,6 +24,23 @@ can offer to others.
 Lair already keeps its own state in stores (`src/server/*/store.ts`: agents, decisions, review, triage, planner,
 placement, supervisor, bus). The work itself should live there too.
 
+## Main today (checked against main at e8147ef)
+
+What this design builds on, as it is on main now:
+
+| Module | What it does now | What the work store takes from it |
+|---|---|---|
+| bus (`src/server/bus/`) | One store per project (`data/bus/<project>.db`); a token per run (`tokens.ts`), minted and revoked by the agents module (`wiring.ts`); `BusService.report` binds a report to the run's claimed task and stores it, the mirror appends the queue line with its `[bus:<id>]` marker, then `bus.report` is emitted; the consumers (`bus.consume: off \| observe \| on`) let fill and the planner read the report in place of the line; `BusLive` puts reports, messages and claim events on the dashboard's `bus` WebSocket channel | How agents report (4.1): the work store becomes one more consumer of `bus.report` and of the claim events, and reads each report from the bus store by id |
+| fill (`agents/fill.ts`) | Reads the tasks file (`readBounded`, 256 KB) and the last 4 MB of the queue file (`QueueLines.read`) asynchronously on every check (#287); `checkDone`, `reportedOutcome` and `unassignedLine` decide done, waiting and blocked | The importer reuses these unchanged (6.4). Fill keeps reading the files until `work_store.mode: on` (work store 3) |
+| planner (`planner/`) | Writes the tasks file (`tasks-file.ts`, done lines behind the done marker, `#done ` by default) and marks tasks done from `checkDone` | The importer reads done lines with the planner's own parser (`parseTasksDoc`). The planner writes the store from work store 4 |
+| tracker (`tracker/`) | Its own store (`data/tracker.db`) holds the task-to-issue links; it reads tasks through a `TaskSource` (`tracker/tasks.ts`) | Links stay in the tracker's store (no copy here); a store-backed `TaskSource` replaces the file one later (12.6) |
+| decisions, review, PR health, revert checks, CI guards | Unchanged by the store | The CI guards cover the new module: it is wired from `index.ts`, its routes are owner-only (route-ownership test), it uses no synchronous fs |
+
+The problem the store fixes first is cost: fill, the planner and the tracker each re-read the growing tasks and queue
+files on their own timers, and the gate result folders on top. On 2 Nov that made checks slow and, together with the
+synchronous reads #287 removed, froze the server for up to 28 s. With the store a check reads indexed rows, and the
+files are read only when they change (the follower, work store 2).
+
 ## Goals
 
 1. **Single source of truth**: one database for tasks, events, briefs and messages.
@@ -39,48 +57,43 @@ placement, supervisor, bus). The work itself should live there too.
 A task is a unit of work an agent can claim and complete.
 
 ```typescript
-interface Task {
+interface WorkTask {            // schema v1 (work store 1)
   id: string;                   // Valid per isValidTaskId (agents module), see the id rule below
   project: string;              // Project this task belongs to
-  title: string;                // Short description, max 200 chars
-  state: TaskState;             // See 2.1; `assigned` and `running` are derived, see 1.5
-  agent: string | null;         // Intended assignee (today's agent column). NEVER the holder, see 1.5
-  priority: number;             // 1-999, lower = higher priority
-  tier: RiskTier;               // red, amber, green
+  title: string;                // Max 200 chars; from the tasks file: the description's first 200 characters, else the id
+  description: string;          // The tasks file's description as written (max 2000 chars, fill's line limit)
+  state: StoredTaskState;       // See 2.1; `assigned` and `running` are derived at read time, see 1.5
+  agent: string | null;         // Intended assignee (today's agent column), null for an unassigned line. NEVER the holder
+  agentName: string | null;     // The tasks file's name column, kept so a mirror can write the line back unchanged
+  priority: number;             // 1-999, lower first; from the tasks file: the line's position among the tasks
   source: TaskSource;           // Where this task came from
-  labels: string[];             // User-defined labels
-  briefId: string | null;       // Reference to versioned brief
-  dependencies: string[];       // Task ids this waits on
   blockedReason: string | null; // Why blocked, if state is blocked
-  externalRef: ExternalRef | null; // Link to GitHub issue, etc.
   createdAt: number;
   updatedAt: number;
-  version: number;              // Optimistic locking
+  version: number;              // Bumped on every stored change; optimistic locking for the writers of work store 4+
 }
 
-type TaskState = 'open' | 'ready' | 'assigned' | 'running' | 'waiting' | 'blocked' | 'in_review' | 'done' | 'dropped';
+type StoredTaskState = 'open' | 'ready' | 'waiting' | 'blocked' | 'in_review' | 'done' | 'dropped';
+type TaskState = StoredTaskState | 'assigned' | 'running';   // the last two derived from the claim (1.5)
 
 type RiskTier = 'red' | 'amber' | 'green';
 
 interface TaskSource {
-  kind: 'plan' | 'backlog' | 'intake' | 'planner' | 'owner' | 'import';
-  ref: string;    // Document path, section id, or import source
-}
-
-interface ExternalRef {
-  provider: 'github' | 'gitlab' | 'jira';
-  owner: string;
-  repo: string;
-  number: number;
-  url: string;
+  kind: 'import' | 'plan' | 'backlog' | 'intake' | 'planner' | 'owner';
+  ref: string;    // Document path, section id, or for an import "tasks_file:<line>"
 }
 ```
+
+Columns that arrive with the PR that first writes them, each as a schema migration: `tier` and `labels` (the board,
+work store 6), `brief_id` (briefs, work store 7), dependencies (`work_task_deps`, the planner, work store 4). There is
+**no `externalRef` column**: the tracker's `tracker_links` is the one source of truth for task-to-issue links, as
+`agents_claims` is for holders (1.5). An `ExternalRef` below means the tracker's link.
 
 **One id rule.** There is one task-id rule in Lair: `isValidTaskId` from the agents module, which wraps
 `TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._/#:-]{0,127}$/` (`agents/types.ts`). Fill, the planner's proposals and the
 queue matching already enforce it, so ids such as `Feat-1.2` or `area/topic#3` exist in real task files. The store,
-the routes and the importer call that function; none defines its own pattern. (Ids contain `/`: route handlers
-URL-decode `:id` and the store treats it as an opaque string.)
+the routes and the importer call that function; none defines its own pattern. (Ids contain `/` and `#`: the
+routes take the id as a query parameter, and the store treats it as an opaque string.)
 
 ### 1.2 Task events
 
@@ -88,7 +101,7 @@ An append-only timeline of everything that happened to a task.
 
 ```typescript
 interface TaskEvent {
-  id: string;                   // UUID
+  id: number;                   // INTEGER, increasing: a reader keeps a cursor
   project: string;
   taskId: string;
   kind: TaskEventKind;
@@ -224,7 +237,7 @@ stays `ready` until the claim exists, and the read model shows the derived state
 | State | Required |
 |---|---|
 | `open` | `title`, `source` |
-| `ready` | `open` requirements, every dependency `done`, `briefId` (a brief, even a one-line one, exists) |
+| `ready` | `open` requirements and every dependency `done` (a brief is optional until briefs, work store 7) |
 | `waiting` | `gateId` (the gate the run waits on) |
 | `blocked` | `blockedReason` (non-empty, 1-500 chars) |
 | `in_review` | `pr` (number) and `sha` |
@@ -297,13 +310,13 @@ Recommendation: A. The `project` column stays in every table anyway (it keeps ro
 
 ```
 src/server/work/
-├── store.ts          # WorkStore class
-├── store.test.ts     # Unit tests
-├── types.ts          # Task, Brief, TaskEvent interfaces
-├── manager.ts        # WorkManager: project lifecycle, event subscriptions
-├── routes.ts         # REST API
-├── adapters.ts       # File adapter interfaces
-└── index.ts
+├── config.ts         # The work_store: block (mode)
+├── store.ts          # WorkStore interface, SqliteWorkStore, schema and migrations, the task and event model
+├── importer.ts       # Reads the configured files with fill's and the planner's parsers and checks
+├── manager.ts        # WorkStoreManager: per-project mode, stores, imports, live reload
+├── routes.ts         # Owner-only REST API
+├── index.ts
+└── work.test.ts      # Through the routes and the manager
 ```
 
 ### 3.2 SQLite now, Postgres later
@@ -317,7 +330,7 @@ src/server/work/
 | C. SQLite calls directly in the store, no interface | Least code | Postgres later means a rewrite of every caller |
 
 Recommendation: A. The boundary is an **async `WorkStore` repository interface** (`createTask`, `transition`,
-`appendEvent`, `listByState`, `readyByPriority`, `timeline`, `dependents`, `byExternalRef`, ...). The first
+`appendEvent`, `listByState`, `readyByPriority`, `timeline`, `dependents`, ...). The first
 implementation is `SqliteWorkStore` (its methods return resolved promises; transactions are internal to one
 method). A `PostgresWorkStore` is a second implementation of the same interface. Cost: every caller `await`s, which
 the HTTP routes and the planner already do. A transition that spans repository calls (4.4, 7.4) is expressed as one
@@ -326,92 +339,69 @@ repository method, never as a caller holding a transaction.
 ### 3.3 Schema
 
 ```sql
--- Schema version 1
+-- Schema version 1 (work store 1)
+CREATE TABLE work_schema (version INTEGER NOT NULL);
 CREATE TABLE work_tasks (
-  id TEXT NOT NULL,
   project TEXT NOT NULL,
+  id TEXT NOT NULL,
   title TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
   state TEXT NOT NULL,
   agent TEXT,
+  agent_name TEXT,
   priority INTEGER NOT NULL DEFAULT 500,
-  tier TEXT NOT NULL DEFAULT 'green',
   source_kind TEXT NOT NULL,
   source_ref TEXT NOT NULL,
-  labels TEXT NOT NULL DEFAULT '[]',  -- JSON array
-  brief_id TEXT,
-  dependencies TEXT NOT NULL DEFAULT '[]',  -- JSON array, display copy; work_task_deps is queried
   blocked_reason TEXT,
-  external_provider TEXT,
-  external_owner TEXT,
-  external_repo TEXT,
-  external_number INTEGER,
-  external_url TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   version INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY (project, id)
 );
-CREATE INDEX idx_work_tasks_state ON work_tasks(project, state);
-CREATE INDEX idx_work_tasks_agent ON work_tasks(project, agent) WHERE agent IS NOT NULL;
-CREATE INDEX idx_work_tasks_priority ON work_tasks(project, state, priority) WHERE state IN ('open', 'ready');
-CREATE UNIQUE INDEX idx_work_tasks_external
-  ON work_tasks(project, external_provider, external_owner, external_repo, external_number)
-  WHERE external_number IS NOT NULL;
-
-CREATE TABLE work_task_deps (
-  project TEXT NOT NULL,
-  task_id TEXT NOT NULL,
-  depends_on TEXT NOT NULL,
-  PRIMARY KEY (project, task_id, depends_on)
-);
-CREATE INDEX idx_work_task_deps_reverse ON work_task_deps(project, depends_on);
+CREATE INDEX work_tasks_state ON work_tasks(project, state, priority);
+CREATE INDEX work_tasks_agent ON work_tasks(project, agent) WHERE agent IS NOT NULL;
 
 CREATE TABLE work_events (
-  id TEXT PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,   -- increasing: a reader keeps a cursor
   project TEXT NOT NULL,
   task_id TEXT NOT NULL,
   kind TEXT NOT NULL,
   actor_kind TEXT NOT NULL,
   actor_id TEXT NOT NULL,
   actor_run_id TEXT,
-  payload TEXT NOT NULL,  -- JSON, max 64 KB
+  payload TEXT NOT NULL,  -- JSON, bounded
   at INTEGER NOT NULL
 );
-CREATE INDEX idx_work_events_task ON work_events(project, task_id, at);
-CREATE INDEX idx_work_events_kind ON work_events(project, kind, at);
+CREATE INDEX work_events_task ON work_events(project, task_id, id);
 
-CREATE TABLE work_briefs (
-  id TEXT PRIMARY KEY,
+-- One row per applied import: who, when, what it changed
+CREATE TABLE work_imports (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   project TEXT NOT NULL,
-  task_id TEXT NOT NULL,
-  version INTEGER NOT NULL,
-  content TEXT NOT NULL,  -- max 200 KB
-  created_by_kind TEXT NOT NULL,
-  created_by_id TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  at INTEGER NOT NULL,
+  actor_kind TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  tasks_file_hash TEXT NOT NULL,
+  created INTEGER NOT NULL,
+  updated INTEGER NOT NULL,
+  dropped INTEGER NOT NULL,
+  warnings INTEGER NOT NULL
 );
-CREATE UNIQUE INDEX idx_work_briefs_task_version ON work_briefs(project, task_id, version);
 ```
+
+Later migrations, each with its PR: v2 `work_cursors` (the bus consumer's last applied report id, work store 2), then
+`work_task_deps` (with its reverse index on `depends_on`), `tier` and `labels`, and `work_briefs` (unique on
+`project, task_id, version`), as in the first draft of this section.
 
 ### 3.4 Schema versioning and migrations
 
-Like other stores, use `user_version` pragma:
-
-```typescript
-export const SCHEMA_VERSION = 1;
-
-constructor(dbPath: string) {
-  this.db = new Database(dbPath);
-  this.db.pragma('journal_mode = WAL');
-  this.db.pragma('busy_timeout = 5000');
-
-  const version = this.db.pragma('user_version', { simple: true }) as number;
-  if (version < SCHEMA_VERSION) {
-    this.migrate(version);
-    this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
-  }
-}
-```
+The work store has its own file, so its version lives in its own table (`work_schema`), as the tracker's does, never
+in `PRAGMA user_version`: a file whose `user_version` is set belongs to another store and is refused, and so is a
+file written by a newer Lair (a schema version above the one this build knows). Migrations are an ordered list, one
+per version, each applied in one transaction with the version update, so an older file is brought up step by step;
+each later PR adds its migration and a test that opens a file written at the previous version. The directory is
+created with `fs/promises` before the database is opened (no synchronous fs on a request path); the `better-sqlite3`
+calls themselves are synchronous, as in every Lair store, and each is a few indexed statements in one transaction.
 
 ### 3.5 Backups and export
 
@@ -451,7 +441,7 @@ task's terminal year. Bounded per cycle, every removal audited, a backup first (
 | A task's timeline | task page | `idx_work_events_task` |
 | Latest event per task | board cards | `idx_work_events_task` (last row per task, `LIMIT 1`) |
 | Dependents of a finished task | `open` to `ready` on completion | `idx_work_task_deps_reverse` (`depends_on`), no JSON scan |
-| Task by external ref | tracker sync | `idx_work_tasks_external` (unique) |
+| Task by external ref | tracker sync | In the tracker's own store (`tracker_links_issue`), not here (1.1) |
 | Tasks of an agent | owner page | `idx_work_tasks_agent` |
 
 `dependencies` JSON on the task row is a display copy written in the same transaction as `work_task_deps`; the
@@ -460,6 +450,16 @@ table is what queries read. The "< 10 ms" target in section 8 holds for these se
 ## 4. Access
 
 ### 4.1 Agent access: bus tools and HTTP
+
+**How agents report (no change for agents).** Agents keep reporting with the bus tools and their run's token (`lair
+bus report`, the MCP tool, `POST /api/bus/call`), or with a `DONE`/`WAITING`/`BLOCKED` line written by hand.
+`BusService.report` binds the report to the task the run holds (`getClaimedTask`), stores it, the mirror appends the
+queue line, and `bus.report` is emitted. The work store is one more consumer (work store 2): on `bus.report`, and at
+start, it reads the bus store's reports above its cursor (`work_cursors`) and applies each, with the cursor update,
+in one transaction. A report therefore applies once across restarts, and a missed event is caught up by the next
+one. Claim facts arrive the same way from `agent.run.started`, `agent.run.ended` and `agent.claim.released`. A
+hand-written line (an agent without a token) reaches the store through the follower (6.4), read with fill's own
+checks. The tools below are for later PRs (work store 7); `report` is unchanged.
 
 Agents access tasks through the bus tools, extended:
 
@@ -485,15 +485,11 @@ check(what: 'gate' | 'review' | 'merge'): CheckResult;
 `report` keeps the `task` argument so no agent or consumer changes. The server refuses a mismatch exactly as
 `BusService.report` does now, with the same message.
 
-HTTP routes for curl access (no node needed):
+HTTP for curl access (no node needed): the bus's existing token route, `POST /api/bus/call`, gains the `task` and
+`check` tools (work store 7); `report` is already one of its tools. No `/api/work/agent/*` route is added, so the
+whole `/api/work` prefix stays owner-only.
 
-```
-GET  /api/work/task                   # Same as task() tool
-POST /api/work/report                 # Same as report() tool
-GET  /api/work/check?what=gate
-```
-
-These routes require the run's bus token, issued by the agents module at run start. **Agent, run and task are derived
+These calls require the run's bus token, issued by the agents module at run start. **Agent, run and task are derived
 from the token binding only.** There is no `run_id` parameter, and a `run_id` or `actor` in a query or body is
 ignored (and logged once as a notice-worthy mismatch if it differs from the binding). Every event the route writes
 records that derived actor, which is the audit trail.
@@ -504,22 +500,22 @@ Owner routes require an owner session (`src/server/human-auth/`). Owner-only is 
 check: `/api/work` is added to `OWNER_ONLY_PREFIXES`, reads that expose paths or other projects' data use
 `requireOwner()`, and writes use `requireOwnerForChanges()`. Both run before the body is parsed. The route layer
 builds the actor from the authenticated session (`{ kind: 'owner', id: session.subject }`) and passes it to the
-store as a trusted argument; the store has no way to read an actor from a request body. The agent routes in 4.1
-are the single exception to the prefix: they authenticate by bus token and are mounted under `/api/work/agent/`
-(`/api/work/agent/task`, `/report`, `/check`), outside the owner-only prefix by design.
+store as a trusted argument; the store has no way to read an actor from a request body. Agents never call
+`/api/work`: they use the bus's token routes (4.1). In work store 1 every `/api/work` route, reads included, needs the
+owner (`requireOwner()` on the whole prefix): task text and file paths are the owner's.
 
 ```
-GET    /api/work/tasks?project=<p>&state=<s>&limit=<n>
-GET    /api/work/tasks/:id
-POST   /api/work/tasks                # Create task
-PATCH  /api/work/tasks/:id            # Edit task
-DELETE /api/work/tasks/:id            # Drop task
-POST   /api/work/tasks/:id/reopen
-GET    /api/work/tasks/:id/events
-GET    /api/work/tasks/:id/brief
-POST   /api/work/tasks/:id/brief      # New brief version
-GET    /api/work/export?project=<p>&format=json|md
-POST   /api/work/import               # Import from the configured files (6.4); body: { dry_run }
+GET    /api/work/status?project=<p>                  # WS1: mode, schema version, counts by state, last import
+GET    /api/work/tasks?project=<p>&state=<s>&agent=<a>&limit=<n>   # WS1: with the derived state and holder (1.5)
+GET    /api/work/task?project=<p>&id=<id>            # WS1: one task and its newest events
+POST   /api/work/import?project=<p>                  # WS1: import from the configured files (6.4); body { dry_run }, default true
+POST   /api/work/tasks                               # Create task (WS4)
+PATCH  /api/work/task?id=<id>                        # Edit task (WS4)
+POST   /api/work/task/drop?id=<id>                   # Drop task (WS4)
+POST   /api/work/task/reopen?id=<id>                 # (WS4)
+GET    /api/work/task/brief?id=<id>                  # (WS7)
+POST   /api/work/task/brief?id=<id>                  # New brief version (WS7)
+GET    /api/work/export?project=<p>&format=json|md   # (WS9)
 ```
 
 ### 4.3 Planner access
@@ -611,9 +607,10 @@ A detail view with everything about a task:
 
 ### 5.3 Live updates
 
-The `live` module (live UI, PR 2b) is the transport: it replaces main's SSE feed (`/api/bus/events`) with topics,
-coalescing (one update per row per 250 ms) and an 8 KB cap. The work store publishes on a `work` topic keyed by
-project; the board and detail view subscribe to it. No SSE route is added for the work store.
+There is no `live` module on main. `BusLive` (`bus/live.ts`) coalesces bus events (100 ms quiet, at most 1 s, 50 per
+update) onto the dashboard's `bus` WebSocket channel (`wsServer.broadcast`), and carries only what any viewer may see.
+The work store publishes on a `work` channel the same way, per project: ids, states, agents and titles, never a
+description or a brief (those need the owner's session through the routes). No SSE route is added.
 
 ## 6. Files as adapters
 
@@ -625,20 +622,30 @@ project; the board and detail view subscribe to it. No SSE route is added for th
 | B. Big-bang switch with a one-off import | One code path | A project with a legacy writer breaks the day it switches |
 | C. Permanent two-way sync | No retirement needed | Two truths, the conflict class this design exists to remove |
 
-Recommendation: A, with `mirror` as one-way (store to files) and never two-way.
+Recommendation: A, as two switches so each step changes one thing, with `mirror` one-way (store to files), never
+two-way:
 
 ```yaml
 work_store:
-  mode: db | mirror | files
+  mode: off | observe | on        # who reads the store; default off
+  files: follow | mirror | none   # how the legacy files relate to it; default follow (work store 2 and 5)
 ```
 
-### 6.1 `files` mode (default for existing projects)
+| `mode` | Who reads the store | The files |
+|---|---|---|
+| `off` (default) | Nothing: no store file is created and every work route answers 404 for the project | Fill, the planner and the tracker read them, exactly as today |
+| `observe` | The owner (read API, import dry runs, and from work store 2 a comparison with fill's view). Fill, the planner and the tracker still read the files | `follow`: the store follows the files one way: on the owner's import (work store 1), automatically when they change (work store 2) |
+| `on` | Fill (work store 3), then the planner (4) and the tracker (8) | `follow` while legacy writers still edit the files; `mirror` once the store is written directly (Lair writes the files for old scripts, 6.2); `none` when nothing reads them (the first draft's `db` mode) |
 
-`files` is **today's path, with no work store**: fill reads the tasks file, queue matching and bus 2a work as they
-do now, and nothing is written to the database. A project adopts the store by running the importer (6.4) and then
-moving to `mirror`. No new parser of the queue file is added in this mode.
+Work store 1 accepts `mode: off | observe` only; `on` and `files` arrive with the PRs that build them.
 
-### 6.2 `mirror` mode (transition)
+### 6.1 `off` (default for every project)
+
+`off` is **today's path, with no work store**: fill reads the tasks file, queue matching and bus 2a work as they
+do now, and nothing is written to a database. A project adopts the store by switching to `observe`, running the
+importer (6.4) with a dry run, then applying it. No new parser of the queue file is added in any mode.
+
+### 6.2 `files: mirror` (transition)
 
 The database is truth; Lair writes the legacy files for old scripts. Mirror mode is **detect, refuse, one notice**.
 
@@ -669,37 +676,52 @@ bus 2a's consumers as before; it is not lost.
 
 Mirror mode lets a project observe the new system before retiring file-based tools.
 
-### 6.3 `db` mode (target)
+### 6.3 `files: none` (target)
 
 Database only. No file reads or writes. This is the target for new projects and for projects that have
 retired their legacy scripts.
 
-### 6.4 Importer
+### 6.4 Importer and follower
 
-A one-off with a dry run, not a parser that lives on. It reads only the project's **configured** files
-(`agents.fill.tasks_file`, `queue_file`, `prompts_dir`), never paths from the request. If a path must be given at
-all, `root-guards.ts` confines it to the project's roots.
+**One way, idempotent, re-runnable, observe first.** It reads only the project's **configured** files
+(`agents.fill.tasks_file`, resolved against the repository as fill resolves it, and `queue_file`), never paths from
+the request, asynchronously and with fill's bounds (`readBounded`, 256 KB; `QueueLines.read`, the last 4 MB).
 
 ```
-POST /api/work/import            # owner session, requireOwnerForChanges
-{ "project": "my-project", "dry_run": true }
+POST /api/work/import?project=<p>     # owner session (the /api/work prefix is owner-only)
+{ "dry_run": true }                   # the default: report, write nothing
 ```
 
-It **reuses fill's code**, so there is no third parser: `parseTasksFile` (with its 256 KB and 200-task bounds) for
-tasks, and fill's done detection (`checkDone`, `reportedOutcome`) with the project's existing `done_pattern` for
-queue lines. Each task id is checked with `isValidTaskId` (1.1); a line that fails is a warning in the report, not a
-silent drop. It returns the tasks and briefs it would create (the tasks-file description becomes brief version 1),
-the queue lines it would turn into `report` events, warnings (malformed lines, duplicate ids), and the diff against
-the store. With `dry_run: false` it applies in one transaction after a backup (3.5).
+It **reuses fill's and the planner's code**, so there is no third parser and no new pattern setting:
 
-New configuration keys only cover what fill has no setting for, a format for `WAITING` or `BLOCKED` lines:
+- the tasks file through the planner's `parseTasksDoc` (fill's `parseTasksFile` with its bounds and `isValidTaskId`,
+  plus done lines behind the planner's `done_marker`); a line fill refuses is a warning, and the task ids on it are
+  kept, never dropped because their line is malformed (as the tracker does);
+- each open line's state through fill's own checks with the project's patterns: `checkDone` (with `queueWindowEnd`
+  and fill's kept `fill_done` record), then `reportedOutcome` for the task's latest run (`WAITING`, `BLOCKED`), and
+  `unassignedLine` for a line with no agent; with `bus.consume: on` a mirrored line is read by its bus report, as
+  fill reads it; a `DONE` that fill's ready guard refuses (`reportAccepted`) does not make the task done;
+- a task with an active run or a claim is stored `ready` (the read model shows it `assigned` or `running`, 1.5).
 
-```yaml
-work_store:
-  import:
-    waiting_pattern: '^- WAITING (?<task>[^ ]+) (?<gate>[^ ]+)'
-    blocked_pattern: '^- BLOCKED (?<task>[^ ]+)'
-```
+| In the files | Stored state |
+|---|---|
+| An open line, no report | `ready` |
+| An open line, a `DONE` fill accepts (or fill's kept record) | `done` |
+| An open line whose latest run last wrote `WAITING` / `BLOCKED` | `waiting` / `blocked` (the line is the reason) |
+| A done line (`#done ...`) | `done` |
+| Gone from a readable file, imported before | `dropped` ("no longer in the tasks file") |
+
+The import diffs the files against the store and changes only what differs, in **one transaction** (no `await`
+between the diff and the writes): a new task is `created`; a changed agent, name or description is `edited` (before
+and after); a new state is `state_changed`, and a done or dropped task back in the file is `reopened`. A position
+change only updates `priority`. Running it twice changes nothing the second time. It never drops anything when the
+tasks file cannot be read, and two imports of one project never run at once (the second is refused). Each applied
+import adds one `work_imports` row; it and every event carry the owner's session as actor. In `observe` the store
+can always be rebuilt from the files, so the pre-import backup of 3.5 arrives before `on` (work store 9).
+
+**The follower (work store 2)** runs the same import when a configured file changed (its size, mtime and content
+hash), never on a timer alone, so a check that finds nothing changed costs two `stat`s instead of 256 KB and 4 MB of
+reads. It is the only file reader in `observe` and in `on` with `files: follow`.
 
 ## 7. Security
 
@@ -762,33 +784,41 @@ The SQLite store handles this easily. Postgres (M6) handles more.
 
 ### 9.1 Lair's own project first
 
-Lair's own project starts on `db` mode, as it has no legacy scripts. This validates the design before other
-projects adopt it.
+Lair's own project goes to `on` with `files: none` first, as it has no legacy scripts. This validates the design
+before other projects adopt it.
 
 ### 9.2 Existing projects
 
 ```
-files mode ──▶ mirror mode (observe 7 days) ──▶ retire writers ──▶ db mode
+off ──▶ observe (dry run, apply, compare) ──▶ observe + follow (kept current, compared with fill's view)
+    ──▶ on + follow (fill reads the store) ──▶ the planner and the owner write the store, files: mirror ──▶ files: none
 ```
 
-Each step is a config change; no data migration needed (the importer runs once at adoption).
+Each step is a config change, and each is undone by the previous value: until `files: mirror` the files stay the
+input every writer edits, so `mode: off` is always today's behaviour. No data migration is needed beyond the import.
+
+**Agents during the switch.** Agents never change. They report through the bus with their run's token, or by a line
+in the queue file. In `observe` both reach fill as today, and the store through the bus consumer and the follower.
+In `on`, fill reads the state those two keep current: a bus report at once (the event, then the cursor), a
+hand-written line when the follower sees the queue file change. The planner keeps writing the tasks file, which is
+followed, until it writes the store itself (work store 4).
 
 ## 10. PR plan
 
-Seven PRs, each under about 400 lines with its tests, each with two or three **acceptance tests** that drive the
-real entry point and fail on main:
+Each PR stays under about 450 non-test lines (work store 1: 600), drives the real entry point in its tests, and says
+in its body how each acceptance test was checked to fail on main, with revert-check lines.
 
-| PR | Module | What | Acceptance tests (fail on main) |
+| PR | What | Size | Acceptance tests (fail on main) |
 |---|---|---|---|
-| W1a | store | Schema, `SqliteWorkStore`, importer dry run (reusing fill's parser) | The importer accepts `Feat-1.2` and `area/topic#3` (`isValidTaskId`) and warns on a malformed line; a dry run writes nothing; a transition missing its required field is refused |
-| W1b | api, UI | Read API (owner-only prefix), board read-only on the `work` live topic | `GET /api/work/tasks` without an owner session is 403 before any handler work; a derived `running` shows for a task with a claim and no write to the row |
-| W2 | agents | `task()` and `report()` through token binding, derived holder | A report after the claim was released is refused; a claim replaced by failover shows the new holder with no write to the task row; a report with another run's id in the body is bound to the token's run |
-| W3a | planner | `WorkStoreProducer`; proposals write to the store in `db` mode | A proposal creates a task through the producer; the planner agent has no route to the store; external edits become owner events |
-| W3b | board | Owner transitions from the board | `PATCH /api/work/tasks/:id` without the owner session is 403 before the body is read; reopen is owner-only |
-| W4 | mirror | Mirror mode, hash detection, intent rows | A foreign line in the queue file survives the next mirror write; exactly one notice for ten repeated edits; the server killed between the run insert and the event write leaves one state and one run after restart |
-| W5 | briefs | Brief versioning, export | An agent sees the brief version current at run start; JSON export round-trips |
-
-Each PR adds its own tests. The PR body says how each acceptance test was checked to fail on main.
+| WS1 | Schema v1, `SqliteWorkStore`, the task and event model, the importer (dry run and apply), the read API, `work_store.mode: off \| observe` | ~600 | Every route is 403 without the owner session; a dry run reports `Feat-1.2`, `area/topic#3`, a done line and a malformed-line warning and writes nothing; an apply stores the DONE, WAITING and BLOCKED states fill's checks read, a second apply changes nothing, a removed line is dropped and an unreadable file drops nothing; a claimed task reads `running` with no write to its row; a newer or foreign store file is refused |
+| WS2 | The follower (import on file change) and the bus consumer (reports and claim facts by cursor, v2 `work_cursors`, replay at start); `files: follow`; the status compares the store with fill's view | ~450 | A report applies once across a restart between the bus write and the store write; an unchanged file is not re-read; the comparison names a task fill and the store disagree on |
+| WS3 | `mode: on`: fill takes its lines and their done, waiting and blocked state from the store; no tasks-file parse or queue window per check | ~450 | Fill starts the store's ready task with the tasks file unreadable; a DONE bus report closes the task without a queue read; `mode: off` again is today's behaviour |
+| WS4 | `WorkStoreProducer` for the planner, owner writes (create, edit, drop, reopen), `work_task_deps` | ~450 | A proposal creates a task through the producer; the planner agent has no route to the store; a write without the owner session is 403 before the body is read |
+| WS5 | `files: mirror`: hash detection, intent rows, one notice per file | ~400 | A foreign line in the queue file survives the next mirror write; one notice for ten edits; a kill between intent and write is reconciled at start |
+| WS6 | Board (read-only, `work` WebSocket channel), then owner transitions; `tier`, `labels` | ~400 | The board shows a derived `running`; a drag without the session changes nothing |
+| WS7 | Briefs (versioned, `work_briefs`), the `task()` and `check()` bus tools | ~400 | An agent sees the brief version current at run start; another run's task is refused |
+| WS8 | The tracker reads tasks from the store (`TaskSource`) | ~150 | The tracker's reconcile in `on` makes the same writes as from the files |
+| WS9 | Backups, export, retention (3.5, 3.6) | ~350 | A JSON export round-trips; retention never touches an open task's events |
 
 ## 11. Open questions for the owner
 
@@ -868,11 +898,8 @@ not an automatic override. This preserves the principle that Lair is the source 
 
 ### 12.6 Tracker module compatibility
 
-The tracker module (its own design doc, when it lands) builds the sync against today's task model. This design
-ensures the tracker can move onto the work store with no behaviour change:
-
-- The tracker reads tasks from the work store instead of files.
-- It updates `externalRef` when it syncs.
-- The event types it listens to (`work.task.*`) carry the same information.
-
-The tracker module's interface stays the same; only its data source changes.
+The tracker module is on main (`src/server/tracker/`). It reads tasks through `TaskSource` (`tracker/tasks.ts`),
+whose comment already names the work store as another source, and keeps its links, sync state and audit in its own
+store. Work store 8 adds a store-backed `TaskSource` (open: tasks not `done` or `dropped`; done: `done`), chosen when
+`work_store.mode` is `on`. The links stay in `tracker_links` (1.1: no `externalRef` copy); the tracker's interface
+stays the same and only its data source changes.
