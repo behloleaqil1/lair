@@ -7,7 +7,7 @@
  */
 import { routeHash } from "./router";
 
-export type SettingsPage = "overview" | "ai" | "team" | "classic" | "yaml" | "history";
+export type SettingsPage = "overview" | "repos" | "ai" | "team" | "classic" | "yaml" | "history";
 
 export interface PageDef {
   id: SettingsPage;
@@ -21,6 +21,11 @@ export const SETTINGS_PAGES: readonly PageDef[] = [
     id: "overview",
     label: "Overview",
     about: "What this project has set up, what needs you, and a link to where each part is fixed. Nothing here changes a setting.",
+  },
+  {
+    id: "repos",
+    label: "Repositories",
+    about: "The project's repositories: add, edit or remove them, and see the token's scopes. A bare PR #12 means the default repository.",
   },
   {
     id: "ai",
@@ -65,9 +70,10 @@ export function pageHref(page: SettingsPage, detail: string | null = null, proje
   return routeHash({ section: "settings", tab: tabOf(page), detail, project });
 }
 
-/** The page that edits a YAML key (dotted, from the top level): AI for the profiles and roles, Team for the agents. */
+/** The page that edits a YAML key (dotted, from the top level): AI for the profiles and roles, Team for the agents, Repos for repos. */
 export function pageForKey(key: string): SettingsPage {
   if (key === "") return "overview";
+  if (key === "repos" || key.startsWith("repos.")) return "repos";
   if (key === "ai" || key.startsWith("ai.profiles") || key.startsWith("ai.roles")) return "ai";
   if (key === "dragons" || key.startsWith("dragons.")) return "team";
   return "classic";

@@ -40,6 +40,7 @@ import { SettingsForm, type FormFocus } from "./SettingsForm";
 import { SettingsHistory } from "./SettingsHistory";
 import { SettingsAi } from "./SettingsAi";
 import { SettingsOverview } from "./SettingsOverview";
+import { SettingsRepos } from "./SettingsRepos";
 import { SettingsReview } from "./SettingsReview";
 import { SettingsSearch } from "./SettingsSearch";
 import { SettingsTeam } from "./SettingsTeam";
@@ -252,7 +253,7 @@ export function Settings({ project, refreshKey, route, go }: Props) {
     setDraft(next);
     clearReview();
   };
-  const pageFocus = route.detail && (page === "ai" || page === "team") ? { key: route.detail, nonce } : null;
+  const pageFocus = route.detail && (page === "ai" || page === "team" || page === "repos") ? { key: route.detail, nonce } : null;
 
   const onPick = (entry: SearchEntry) => {
     setNonce((n) => n + 1);
@@ -268,6 +269,16 @@ export function Settings({ project, refreshKey, route, go }: Props) {
     switch (page) {
       case "overview":
         return <SettingsOverview view={view} project={route.project} />;
+      case "repos":
+        return (
+          <SettingsRepos
+            project={view.id}
+            draft={draft}
+            errors={errors}
+            disabled={busy || yamlDirty || view.values === null}
+            onDraft={onDraft}
+          />
+        );
       case "ai":
         return (
           <SettingsAi
