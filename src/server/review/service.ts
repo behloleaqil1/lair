@@ -375,9 +375,12 @@ export class ReviewService {
   /**
    * Record the head; a new one makes every review at an older head stale,
    * and withdraws the human reviews asked for at the old head from the
-   * Decision Inbox (a review there would bind to a head that is gone).
+   * Decision Inbox (a review there would bind to a head that is gone). The
+   * PR's branch and state are kept too (the planner reads which task's own
+   * PR merged from them, without asking the host).
    */
   private async noteHead(pr: HostPullRequest): Promise<void> {
+    this.o.store.observePull(this.project, pr.number, pr.headRef ?? null, pr.state ?? null, this.now());
     const previous = this.o.store.observeHead(this.project, pr.number, pr.headSha, this.now());
     if (!previous) return;
     const stale = this.o.store
@@ -1997,6 +2000,14 @@ export class ReviewManager {
   /** AI spend: a PR's head as the review store last read it (null: unknown). */
   spendPrHead(project: string, pr: number): string | null {
     return this.store?.currentHead(project, pr) ?? null;
+  }
+
+  /**
+   * The planner's closed-work guard (planner.guards.prefilter_closed): PRs the store records as merged, with the
+   * branch the review module last read, the newest first. Local only (review.db); [] with no store.
+   */
+  mergedPrs(project: string, limit: number): { pr: number; branch: string | null; at: string | null }[] {
+    return this.store?.mergedPrs(project, limit) ?? [];
   }
 
   /** Names of the projects with reviews on. */
