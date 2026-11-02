@@ -3088,7 +3088,7 @@ Events: `planner.changed`, `planner.run_started`, `planner.run_finished`, `plann
 
 ## Repositories
 
-`repos:` lists a project's repositories once, for every module that reads pull requests of more than one: the [ready guard](#fill) now, PR health later ([docs/design/pr-health.md](design/pr-health.md)). Each entry says which branch its PRs merge into, whether its hosted CI counts, and the short names task text uses for it.
+`repos:` lists a project's repositories once, for every module that reads pull requests of more than one: the [ready guard](#fill) and [PR health](#pr-health). Each entry says which branch its PRs merge into, whether its hosted CI counts, and the short names task text uses for it.
 
 ```yaml
 repos:
@@ -3123,7 +3123,7 @@ No one module owns `repos:`, so an edit to it reloads every module of the projec
 
 PR health reads the open pull requests of each repository in [`repos:`](#repositories) and finds the ones that went bad: `conflicts` (the host says the PR can't merge into its base), `behind` (more than `behind_threshold` commits behind the base), `no_ci` (no check has run at the head of a non-draft PR for `no_ci_minutes`) and `ci_red` (the newest run of a check at the head failed). `no_ci` and `ci_red` need the repository's `ci_counts`. Design: [docs/design/pr-health.md](design/pr-health.md).
 
-It is off unless a project sets `pr_health.enabled: true`, and it only observes: it emits events and keeps a status, and writes nothing. This version is the detector alone; the owner rule, the status route and the server wiring come next, then act mode (a note to the owning agent, Decision Inbox notices).
+It is off unless a project sets `pr_health.enabled: true`, and it only observes: it emits events and serves a read-only status (`GET /api/pr-health/status?project=`), and writes nothing. Startup logs `[pr-health] Watching PRs for: …` or `[pr-health] Off (no project sets pr_health.enabled)`, and a changed `pr_health:`, `review:` or `repos:` reloads it without a restart. Act mode (a note to the owning agent, Decision Inbox notices) comes in a later version.
 
 ```yaml
 pr_health:
@@ -3148,7 +3148,7 @@ pr_health:
 | `kinds.{conflicts,behind,no_ci,ci_red}` | boolean | `true` | Turn a kind off |
 | `ignored_prs` | list | `[]` | `owner/name#N` of a listed repository, at most 200 |
 | `ignored_branches` | list | `["dependabot/**"]` | Head branch globs (`*` within one segment, `**` across, `?`), at most 50 |
-| `owner.branch_window_minutes` | integer | `360` | 0-10080, for the owner rule (a later version) |
+| `owner.branch_window_minutes` | integer | `360` | 0-10080: how recent a head commit must be for the owner rule's branch step (0: no branch step) |
 | `notify_cmd`, `withdraw_cmd` | argv \| null | `null` | For act mode (a later version); placeholders `{agent}`, `{repo}`, `{pr}`, `{head}`, `{kinds}`, `{id}`, `{message}` only |
 | `command_timeout_seconds`, `max_attempts`, `backoff_seconds`, `escalate_after_minutes` | | `30`, `3`, `300`, `null` | For act mode (a later version) |
 
@@ -3158,7 +3158,11 @@ pr_health:
 
 **Failures.** Each repository is read on its own: a timeout, a rate-limit answer or any host error stops that repository for the tick and keeps its findings exactly as they were (nothing is cleared, and nothing is found again when it recovers); its state is `error`, and `pr_health.repo_error` is emitted once when an error streak starts. The request budget and the deadline stop a repository the same way, with `partial` in the status and the unread PRs first next tick.
 
-**Events.** `pr_health.finding` `{project, key, repo, pr, head, kind, owner, ownerSource, mode}` (the owner is `null` until the owner rule arrives), `pr_health.cleared` `{project, key, repo, pr, head, kind, why}` (`fixed`, `head_moved`, `closed` or `ignored`) and `pr_health.repo_error` `{project, repo, error}`.
+**Owner.** After each tick, every (repository, PR, head) with a finding gets an owner from fill's last check (in memory; no file is read). The owner is the agent of the latest open task line (`started`, `claimed` or `held`) whose name or description names the PR: `app#42`, `app PR #42`, `example/app#42`, or a bare `PR #42` / `#42`, which means the line's `repo:owner/name` repository, else the default. Done, malformed, not-allowlisted and unassigned lines never name one. If no line does, and `owner.branch_window_minutes` is above 0, the owner is the one agent the head branch maps to through `review.authors.branch_pattern` and `review.authors.branches`, if that agent has an open line and the head commit's committer date is inside the window (read once per head). Otherwise nobody owns it, with the reason. With no agents module or fill off nobody owns any PR; before fill's first check the owner is unknown.
+
+**Status.** `GET /api/pr-health/status?project=` shows each repository (`state`, `partial`, `truncated`, skipped PRs with why), each finding with its owner, and `planned`: what act mode would do now, a note per owned (repository, PR, head) with the argv `notify_cmd` would run, and a `no_owner` notice per unowned one (an unknown owner plans nothing). The note's text uses Lair's words and counts only, never a branch name, check name or PR title.
+
+**Events.** `pr_health.finding` `{project, key, repo, pr, head, kind, owner, ownerSource, mode}` (emitted at the end of the tick that opens it, with its owner: `null` when nobody owns it or the owner is unknown), `pr_health.cleared` `{project, key, repo, pr, head, kind, why}` (`fixed`, `head_moved`, `closed` or `ignored`) and `pr_health.repo_error` `{project, repo, error}`.
 
 ## Tracker
 

@@ -13,6 +13,8 @@ import type { Clock } from "../service.js";
 export interface Person {
   name: string;
   email: string;
+  /** The commit's date for this person (GitHub's commit.author.date / commit.committer.date), when a test sets one */
+  date?: string;
 }
 
 export interface FakeCommit {
