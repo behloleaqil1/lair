@@ -1,6 +1,7 @@
 /**
- * Registry tests: every field in the Work and Gates pages has a label
- * (settings-v2.md requirement "every field has a label, help and a default").
+ * Registry tests: every field in the Work and Gates pages has its own hint
+ * with a label and help (settings-v2.md requirement "every field has a label,
+ * help and a default"), list and record entry fields included.
  */
 import { describe, expect, it } from "vitest";
 import { settingsSections, SETTINGS_SECTIONS } from "./registry.js";
@@ -35,35 +36,54 @@ describe("registry hints for Work and Gates pages", () => {
     expect(keys).toContain("placement");
   });
 
-  it("every Work page field has a non-empty label", () => {
-    for (const field of workFields) {
-      // Fields with "*" in the path are record/list entries; they may have generic labels
-      if (field.key.includes("*")) continue;
-      expect(field.label.length, `${field.key} should have a label`).toBeGreaterThan(0);
+  /** The section's own hint for an index entry (its key without the section prefix), list and record entries ("*") too */
+  const hintFor = (entry: (typeof index)[number]) => {
+    const section = sections.find((s) => s.key === entry.section)!;
+    const pattern = entry.key.slice(entry.section.length + 1);
+    return Object.prototype.hasOwnProperty.call(section.hints, pattern) ? section.hints[pattern] : undefined;
+  };
+  /** Every field under a section root, "*" keys (list items, record entries) included */
+  const nonRoot = (fields: typeof index) => fields.filter((f) => f.key !== f.section);
+
+  it("covers list and record entry fields (* keys) on both pages", () => {
+    const keys = index.map((f) => f.key);
+    for (const key of [
+      "agents.locks.*.name",
+      "agents.locks.*.stale_minutes",
+      "placement.machines.*.on_demand.state_cmd",
+      "placement.machines.*.on_demand.touch_seconds",
+      "pipelines.*.steps.*.name",
+      "triage.trusted_nodes.*.id",
+    ]) {
+      expect(keys, key).toContain(key);
     }
   });
 
-  it("every Gates page field has a non-empty label", () => {
-    for (const field of gatesFields) {
-      if (field.key.includes("*")) continue;
-      expect(field.label.length, `${field.key} should have a label`).toBeGreaterThan(0);
-    }
+  it("every Work page field has its own hint label and help", () => {
+    const missing = nonRoot(workFields)
+      .filter((f) => !hintFor(f)?.label || !hintFor(f)?.help)
+      .map((f) => f.key);
+    expect(missing.join(" ")).toBe("");
   });
 
-  it("basic agents fields have help text", () => {
-    // Filter out section roots (like "agents" itself) which may not have help
-    const basicAgents = workFields.filter((f) => f.level === "basic" && !f.key.includes("*") && f.key !== "agents");
-    for (const field of basicAgents) {
-      expect(field.help.length, `${field.key} should have help`).toBeGreaterThan(0);
-    }
+  it("every Gates page field has its own hint label and help", () => {
+    const missing = nonRoot(gatesFields)
+      .filter((f) => !hintFor(f)?.label || !hintFor(f)?.help)
+      .map((f) => f.key);
+    expect(missing.join(" ")).toBe("");
   });
 
-  it("basic gates fields have help text", () => {
-    // Filter out section roots which may not have help
-    const basicGates = gatesFields.filter((f) => f.level === "basic" && !f.key.includes("*") && !["pipelines", "executors", "triage", "placement"].includes(f.key));
-    for (const field of basicGates) {
-      expect(field.help.length, `${field.key} should have help`).toBeGreaterThan(0);
+  it("no two Gates fields in one group share a label", () => {
+    const seen = new Map<string, string>();
+    const dupes: string[] = [];
+    for (const f of nonRoot(gatesFields)) {
+      const hint = hintFor(f);
+      if (!hint?.label || !hint.group) continue;
+      const id = `${f.section}/${hint.group}/${hint.label}`;
+      if (seen.has(id)) dupes.push(`${seen.get(id)} and ${f.key}: ${hint.label}`);
+      else seen.set(id, f.key);
     }
+    expect(dupes.join("; ")).toBe("");
   });
 });
 

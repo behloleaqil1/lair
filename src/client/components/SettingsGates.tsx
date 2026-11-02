@@ -6,11 +6,16 @@
  * Edits the `pipelines:`, `executors:`, `triage:`, and `placement:` blocks.
  * Every edit goes into the shell's draft, saved through its review.
  */
-import { useEffect, useRef } from "react";
+import { useEffect, useState } from "react";
 import type { FieldError, KnownValues, PathSegment, SettingsSection } from "../../shared/settings-types";
 import { Card } from "../ui/Card";
 import { Callout } from "../ui/Card";
-import { revealIn, type PageFocus } from "./SettingsAi";
+import { Badge, StatusBadge } from "../ui/Badge";
+import { Button } from "../ui/Button";
+import { EmptyState } from "../ui/EmptyState";
+import { getIn, setIn } from "../settings-form";
+import { isPlainObject } from "../../shared/settings-rules";
+import type { PageFocus } from "./SettingsAi";
 import { SettingsForm, type FormFocus } from "./SettingsForm";
 
 interface Props {
@@ -27,63 +32,36 @@ interface Props {
 /** The section keys (from the registry) this page edits */
 const GATES_SECTIONS = ["pipelines", "executors", "triage", "placement"];
 
-/** Get the draft value at a path */
-function getIn(draft: Record<string, unknown>, path: string[]): unknown {
-  let current: unknown = draft;
-  for (const key of path) {
-    if (current === undefined || current === null || typeof current !== "object") return undefined;
-    current = (current as Record<string, unknown>)[key];
-  }
-  return current;
-}
+/** A pipeline name the schema takes (PIPELINE_NAME in server/gates/project-pipelines.ts) */
+const PIPELINE_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$/;
 
-/** Set a value at a path in the draft, returning a new draft */
-function setIn(draft: Record<string, unknown>, path: PathSegment[], value: unknown): Record<string, unknown> {
-  if (path.length === 0) return draft;
-  const [head, ...rest] = path;
-  const key = String(head);
-  if (rest.length === 0) {
-    if (value === undefined) {
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      const { [key]: _, ...remaining } = draft;
-      return remaining;
-    }
-    return { ...draft, [key]: value };
-  }
-  const child = draft[key];
-  const nextChild = typeof child === "object" && child !== null ? (child as Record<string, unknown>) : {};
-  return { ...draft, [key]: setIn(nextChild, rest, value) };
-}
-
-export function SettingsGates({ project: _project, draft, sections, known, errors, disabled, onDraft, focus }: Props) {
-  const root = useRef<HTMLDivElement>(null);
-
-  // Handle focus from search picks
+export function SettingsGates({ draft, sections, known, errors, disabled, onDraft, focus }: Props) {
+  // A search pick: SettingsForm unfolds, scrolls to and focuses the field itself
   const key = focus?.key;
-  const nonce = focus?.nonce;
-  useEffect(() => {
-    if (!key) return;
-    if (key === "pipelines" || key.startsWith("pipelines.")) {
-      revealIn(root.current, "[data-gates-pipelines]");
-    } else if (key === "executors" || key.startsWith("executors.")) {
-      revealIn(root.current, "[data-gates-executors]");
-    } else if (key === "triage" || key.startsWith("triage.")) {
-      revealIn(root.current, "[data-gates-triage]");
-    } else if (key === "placement" || key.startsWith("placement.")) {
-      revealIn(root.current, "[data-gates-placement]");
-    }
-  }, [key, nonce]);
+  const [newPipeline, setNewPipeline] = useState("");
+  // After "Add pipeline": the form opens the new pipeline's steps
+  const [added, setAdded] = useState<FormFocus | null>(null);
+  // A new search pick takes over from it
+  const pickNonce = focus?.nonce;
+  useEffect(() => setAdded(null), [key, pickNonce]);
 
   const gatesSections = sections.filter((s) => GATES_SECTIONS.includes(s.key));
   const gatesErrors = errors.filter((e) => GATES_SECTIONS.some((k) => e.path === k || e.path.startsWith(`${k}.`)));
 
   const onChange = (path: PathSegment[], value: unknown) => {
-    onDraft(setIn(draft, path, value));
+    onDraft(setIn(draft, path, value) as Record<string, unknown>);
   };
 
   // Get block statuses for summary cards
-  const pipelines = getIn(draft, ["pipelines"]) as Record<string, unknown> | undefined;
-  const pipelineCount = pipelines ? Object.keys(pipelines).length : 0;
+  const pipelines = getIn(draft, ["pipelines"]);
+  const pipelineCount = isPlainObject(pipelines) ? Object.keys(pipelines).length : 0;
+
+  const addPipeline = () => {
+    const name = newPipeline;
+    onDraft(setIn(draft, ["pipelines", name], { steps: [] }) as Record<string, unknown>);
+    setNewPipeline("");
+    setAdded({ section: "pipelines", path: `pipelines.${name}.steps`, nonce: Date.now() });
+  };
 
   const triage = getIn(draft, ["triage"]) as Record<string, unknown> | undefined;
   const triageEnabled = triage?.enabled === true;
@@ -95,16 +73,17 @@ export function SettingsGates({ project: _project, draft, sections, known, error
 
   // Build form focus for the classic form sections
   const formFocus: FormFocus | null =
-    focus && key
+    added ??
+    (focus && key
       ? {
           section: key.split(".")[0],
           path: key,
           nonce: focus.nonce,
         }
-      : null;
+      : null);
 
   return (
-    <div ref={root} data-settings-gates="">
+    <div data-settings-gates="">
       {gatesErrors.length > 0 && (
         <Callout tone="danger" className="section-intro" title="The check refused these">
           {gatesErrors.map((e, i) => (
@@ -123,12 +102,31 @@ export function SettingsGates({ project: _project, draft, sections, known, error
         <div className="stack-sm">
           <div className="row">
             <strong>Pipelines defined</strong>
-            <span className="badge badge-neutral">{pipelineCount}</span>
+            <Badge plain>{pipelineCount}</Badge>
           </div>
           {pipelineCount === 0 && (
-            <Callout tone="info">
-              No pipelines are defined. Add one to run checks through Lair's gate system.
-            </Callout>
+            <EmptyState
+              framed={false}
+              title="No pipelines yet"
+              action={
+                <div className="row">
+                  <input
+                    aria-label="New pipeline name"
+                    className="input"
+                    style={{ maxWidth: "14rem" }}
+                    value={newPipeline}
+                    disabled={disabled}
+                    placeholder="e.g. ci"
+                    onChange={(e) => setNewPipeline(e.target.value.trim())}
+                  />
+                  <Button size="sm" disabled={disabled || !PIPELINE_NAME.test(newPipeline)} onClick={addPipeline}>
+                    Add pipeline
+                  </Button>
+                </div>
+              }
+            >
+              A pipeline runs checks through Lair's gate system. Name it, then add its steps below.
+            </EmptyState>
           )}
         </div>
       </Card>
@@ -150,11 +148,11 @@ export function SettingsGates({ project: _project, draft, sections, known, error
             <strong>Triage</strong>
             {triageEnabled ? (
               <>
-                <span className="badge badge-success">enabled</span>
-                <span className="badge badge-neutral">{String(triageMode)}</span>
+                <StatusBadge status="ok">enabled</StatusBadge>
+                <Badge plain>{String(triageMode)}</Badge>
               </>
             ) : (
-              <span className="badge badge-neutral">disabled</span>
+              <StatusBadge status="off">disabled</StatusBadge>
             )}
           </div>
           {triageEnabled && triageMode === "observe" && (
@@ -176,11 +174,11 @@ export function SettingsGates({ project: _project, draft, sections, known, error
             <strong>Placement</strong>
             {placementEnabled ? (
               <>
-                <span className="badge badge-success">enabled</span>
-                <span className="badge badge-neutral">{String(placementMode)}</span>
+                <StatusBadge status="ok">enabled</StatusBadge>
+                <Badge plain>{String(placementMode)}</Badge>
               </>
             ) : (
-              <span className="badge badge-neutral">disabled</span>
+              <StatusBadge status="off">disabled</StatusBadge>
             )}
           </div>
           {placementEnabled && placementMode === "observe" && (

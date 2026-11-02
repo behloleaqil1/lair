@@ -6,11 +6,12 @@
  *
  * Every edit goes into the shell's draft, saved through its review.
  */
-import { useEffect, useRef } from "react";
 import type { FieldError, KnownValues, PathSegment, SettingsSection } from "../../shared/settings-types";
 import { Card } from "../ui/Card";
 import { Callout } from "../ui/Card";
-import { revealIn, type PageFocus } from "./SettingsAi";
+import { StatusBadge } from "../ui/Badge";
+import { getIn, setIn } from "../settings-form";
+import type { PageFocus } from "./SettingsAi";
 import { SettingsForm, type FormFocus } from "./SettingsForm";
 
 interface Props {
@@ -27,59 +28,15 @@ interface Props {
 /** The section keys (from the registry) this page edits */
 const WORK_SECTIONS = ["agents"];
 
-/** Get the draft value at a path, e.g. draft.agents.fill */
-function getIn(draft: Record<string, unknown>, path: string[]): unknown {
-  let current: unknown = draft;
-  for (const key of path) {
-    if (current === undefined || current === null || typeof current !== "object") return undefined;
-    current = (current as Record<string, unknown>)[key];
-  }
-  return current;
-}
-
-/** Set a value at a path in the draft, returning a new draft */
-function setIn(draft: Record<string, unknown>, path: PathSegment[], value: unknown): Record<string, unknown> {
-  if (path.length === 0) return draft;
-  const [head, ...rest] = path;
-  const key = String(head);
-  if (rest.length === 0) {
-    if (value === undefined) {
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      const { [key]: _, ...remaining } = draft;
-      return remaining;
-    }
-    return { ...draft, [key]: value };
-  }
-  const child = draft[key];
-  const nextChild = typeof child === "object" && child !== null ? (child as Record<string, unknown>) : {};
-  return { ...draft, [key]: setIn(nextChild, rest, value) };
-}
-
-export function SettingsWork({ project: _project, draft, sections, known, errors, disabled, onDraft, focus }: Props) {
-  const root = useRef<HTMLDivElement>(null);
-
-  // Handle focus from search picks
+export function SettingsWork({ draft, sections, known, errors, disabled, onDraft, focus }: Props) {
+  // A search pick: SettingsForm unfolds, scrolls to and focuses the field itself
   const key = focus?.key;
-  const nonce = focus?.nonce;
-  useEffect(() => {
-    if (!key) return;
-    // Find the card that holds this key
-    if (key.startsWith("agents.fill")) {
-      revealIn(root.current, "[data-work-fill]");
-    } else if (key.startsWith("agents.recovery") || key.startsWith("agents.retries")) {
-      revealIn(root.current, "[data-work-recovery]");
-    } else if (key.startsWith("agents.budgets")) {
-      revealIn(root.current, "[data-work-budgets]");
-    } else if (key.startsWith("agents.")) {
-      revealIn(root.current, "[data-work-agents]");
-    }
-  }, [key, nonce]);
 
   const workSections = sections.filter((s) => WORK_SECTIONS.includes(s.key));
   const workErrors = errors.filter((e) => WORK_SECTIONS.some((k) => e.path === k || e.path.startsWith(`${k}.`)));
 
   const onChange = (path: PathSegment[], value: unknown) => {
-    onDraft(setIn(draft, path, value));
+    onDraft(setIn(draft, path, value) as Record<string, unknown>);
   };
 
   // Get the agents block for display
@@ -98,7 +55,7 @@ export function SettingsWork({ project: _project, draft, sections, known, errors
       : null;
 
   return (
-    <div ref={root} data-settings-work="">
+    <div data-settings-work="">
       {workErrors.length > 0 && (
         <Callout tone="danger" className="section-intro" title="The check refused these">
           {workErrors.map((e, i) => (
@@ -118,9 +75,9 @@ export function SettingsWork({ project: _project, draft, sections, known, errors
           <div className="row">
             <strong>Fill</strong>
             {fillEnabled ? (
-              <span className="badge badge-success">enabled</span>
+              <StatusBadge status="ok">enabled</StatusBadge>
             ) : (
-              <span className="badge badge-neutral">disabled</span>
+              <StatusBadge status="off">disabled</StatusBadge>
             )}
           </div>
           {agentsEnabled === false && fillEnabled && (
