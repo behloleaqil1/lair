@@ -12,10 +12,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
 import Database from "better-sqlite3";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, symlinkSync } from "fs";
 import { createServer } from "net";
 import { tmpdir } from "os";
-import { join } from "path";
+import { join, dirname } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { ChatStatusView, ConversationView, DigestView } from "../../shared/supervisor-types.js";
 import { parseMarkdown } from "../../shared/safe-markdown.js";
@@ -609,7 +609,300 @@ describe("a question with no answer", () => {
   });
 });
 
-// ============ 5. THE DIGEST ============
+// ============ 5. ANSWER FROM FILE (answer.json) ============
+
+describe("answer.json: answers from a file in the run's per-turn folder", () => {
+  /** supervisor.chat.answer_file on (it is off by default) */
+  const fileOn = (chat: Record<string, unknown> = {}) => ({ supervisor: { agent: "sup", chat: { enabled: true, answer_file: true, ...chat } } });
+  const runFolders = (h: Harness) => join(h.dir, "agents", "supervisor-runs");
+
+  /**
+   * Write answer.json to the path specified in LAIR_ANSWER_FILE env var.
+   * This simulates what a supervisor run writes.
+   */
+  function writeAnswerFile(call: SpawnCall, content: { answer: string; evidence?: unknown[] }): string {
+    const answerPath = call.env.LAIR_ANSWER_FILE;
+    if (!answerPath) throw new Error("LAIR_ANSWER_FILE not in run environment");
+    writeFileSync(answerPath, JSON.stringify(content));
+    return answerPath;
+  }
+
+  it("is off by default: no run folder, no LAIR_ANSWER_FILE, the prompt gives the CLI command", async () => {
+    const h = await boot();
+    const { view, call } = await asked(h);
+    expect(call.env.LAIR_ANSWER_FILE).toBeUndefined();
+    expect(existsSync(runFolders(h))).toBe(false);
+    const prompt = promptOf(call);
+    expect(prompt).toContain(`lair supervisor answer --conversation ${view.id}`);
+    expect(prompt).not.toContain("LAIR_ANSWER_FILE");
+    expect(prompt).not.toContain("answer.json");
+  });
+
+  it("accepts a valid answer.json when the run exits (before closing as no_answer), never while it runs", async () => {
+    const h = await boot(fileOn());
+    const { view, call } = await asked(h);
+
+    // The exact path is in the run's environment, in a private folder Lair made for this run
+    expect(call.env.LAIR_ANSWER_FILE).toMatch(/\/agents\/supervisor-runs\/run-[0-9a-f]{8}-[0-9a-f]{16}\/answer\.json$/);
+    expect(existsSync(dirname(call.env.LAIR_ANSWER_FILE!))).toBe(true);
+
+    writeAnswerFile(call, {
+      answer: "worker-a is held because of an infrastructure failure.",
+      evidence: [{ tool: "events.query", args: { agent: "worker-a" }, note: "saw a restart event at 08:30" }],
+    });
+    // The run still goes: a file it may still be writing is not read yet
+    await check(h);
+    expect((await conversation(h, view.id)).turns[0].state).toBe("pending");
+    expect(existsSync(call.env.LAIR_ANSWER_FILE!)).toBe(true);
+
+    // Run exits without calling the CLI
+    h.spawner.exit(call.pid, 0);
+    await tick(h);
+    await check(h);
+
+    // The answer was taken from the file
+    const turn = (await conversation(h, view.id)).turns[0];
+    expect(turn.state).toBe("answered");
+    expect(turn.answer).toContain("worker-a is held because of an infrastructure failure");
+    expect(turn.evidence).toEqual([{ tool: "events.query", args: { agent: "worker-a" }, note: "saw a restart event at 08:30" }]);
+  });
+
+  it("accepts answer.json at timeout (before closing as no_answer)", async () => {
+    const h = await boot(fileOn({ answer_timeout_minutes: 5 }));
+    const { view, call } = await asked(h);
+
+    // Write the answer file
+    writeAnswerFile(call, {
+      answer: "Found the issue: gate queue stuck for 2 hours.",
+      evidence: [],
+    });
+
+    // Advance past timeout
+    h.clock.t = NOW + 5 * MIN;
+    await check(h);
+
+    // The answer was taken from the file despite timeout
+    const turn = (await conversation(h, view.id)).turns[0];
+    expect(turn.state).toBe("answered");
+    expect(turn.answer).toContain("gate queue stuck for 2 hours");
+  });
+
+  it("refuses answer.json outside the run directory (symlink escape)", async () => {
+    const h = await boot(fileOn());
+    const { view, call } = await asked(h);
+
+    // The run folder is a private directory; try to put a symlink there pointing outside
+    const outsideDir = join(h.dir, "outside");
+    mkdirSync(outsideDir, { recursive: true });
+    writeFileSync(join(outsideDir, "secret.json"), JSON.stringify({ answer: "malicious", evidence: [] }));
+
+    // Create a symlink in the run folder pointing to the outside file
+    const answerPath = call.env.LAIR_ANSWER_FILE!;
+    try {
+      symlinkSync(join(outsideDir, "secret.json"), answerPath);
+    } catch {
+      // Symlinks may not be supported on all platforms; skip this test
+      h.spawner.exit(call.pid, 0);
+      await tick(h);
+      await check(h);
+      return;
+    }
+
+    // Run exits without answering via CLI
+    h.spawner.exit(call.pid, 0);
+    await tick(h);
+    await check(h);
+
+    // The symlink should be detected and refused
+    const turn = (await conversation(h, view.id)).turns[0];
+    expect(turn.state).toBe("no_answer");
+    expect(turn.reason).toMatch(/symlink|outside/i);
+  });
+
+  it("refuses malformed answer.json and includes the error in no_answer reason", async () => {
+    const h = await boot(fileOn());
+    const { view, call } = await asked(h);
+
+    // Write malformed JSON to the answer file path
+    const answerPath = call.env.LAIR_ANSWER_FILE!;
+    writeFileSync(answerPath, "{ not valid json");
+
+    h.spawner.exit(call.pid, 0);
+    await tick(h);
+    await check(h);
+
+    const turn = (await conversation(h, view.id)).turns[0];
+    expect(turn.state).toBe("no_answer");
+    expect(turn.reason).toContain("answer.json was invalid");
+    expect(turn.reason).toContain("not valid JSON");
+  });
+
+  it("refuses answer.json missing required fields", async () => {
+    const h = await boot(fileOn());
+    const { view, call } = await asked(h);
+
+    const answerPath = call.env.LAIR_ANSWER_FILE!;
+    writeFileSync(answerPath, JSON.stringify({ answer: "missing evidence field" }));
+
+    h.spawner.exit(call.pid, 0);
+    await tick(h);
+    await check(h);
+
+    const turn = (await conversation(h, view.id)).turns[0];
+    expect(turn.state).toBe("no_answer");
+    expect(turn.reason).toContain("evidence: required");
+  });
+
+  it("CLI answer first, then file: file is ignored (CLI wins)", async () => {
+    const h = await boot(fileOn());
+    const { view, call } = await asked(h);
+
+    // CLI answer first
+    const cliResult = await answer(h, call.env, {
+      text: "Answer from CLI",
+      evidence: [],
+    });
+    expect(cliResult.code).toBe(EXIT_OK);
+
+    // Now write the file
+    writeAnswerFile(call, {
+      answer: "Answer from file (should be ignored)",
+      evidence: [],
+    });
+
+    // Run exits
+    h.spawner.exit(call.pid, 0);
+    await tick(h);
+    await check(h);
+
+    // CLI answer was kept
+    const turn = (await conversation(h, view.id)).turns[0];
+    expect(turn.state).toBe("answered");
+    expect(turn.answer).toBe("Answer from CLI");
+  });
+
+  it("file answer after run ends: file wins over no_answer", async () => {
+    const h = await boot(fileOn());
+    const { view, call } = await asked(h);
+
+    // Write the file after run ends (but before check)
+    h.spawner.exit(call.pid, 0);
+    await tick(h);
+
+    writeAnswerFile(call, {
+      answer: "Answer from file after exit",
+      evidence: [],
+    });
+
+    await check(h);
+
+    const turn = (await conversation(h, view.id)).turns[0];
+    expect(turn.state).toBe("answered");
+    expect(turn.answer).toBe("Answer from file after exit");
+  });
+
+  it("timeout without answer.json: no_answer with timeout reason", async () => {
+    const h = await boot(fileOn({ answer_timeout_minutes: 5 }));
+    const { view } = await asked(h);
+
+    h.clock.t = NOW + 5 * MIN;
+    await check(h);
+
+    const turn = (await conversation(h, view.id)).turns[0];
+    expect(turn.state).toBe("no_answer");
+    expect(turn.reason).toContain("no answer within 5 minutes");
+    expect(turn.reason).not.toContain("answer.json");
+  });
+
+  it("answer file is renamed to answer.taken.json after being read", async () => {
+    const h = await boot(fileOn());
+    const { view, call } = await asked(h);
+
+    const answerPath = call.env.LAIR_ANSWER_FILE!;
+    writeAnswerFile(call, { answer: "Test answer", evidence: [] });
+
+    // Run exits
+    h.spawner.exit(call.pid, 0);
+    await tick(h);
+    await check(h);
+
+    // The answer should have been taken - turn is answered, not no_answer
+    const turn = (await conversation(h, view.id)).turns[0];
+    expect(turn.state).toBe("answered");
+    expect(turn.answer).toBe("Test answer");
+
+    // The run folder is cleaned up after the turn closes, so files are removed
+    // The rename happens internally to prevent re-reads, but cleanup removes the folder
+    expect(existsSync(answerPath)).toBe(false);
+    expect(existsSync(dirname(answerPath))).toBe(false);
+  });
+
+  it("removes the run folder when the question is closed at its deadline", async () => {
+    const h = await boot(fileOn({ answer_timeout_minutes: 5 }));
+    const { call } = await asked(h);
+    const folder = dirname(call.env.LAIR_ANSWER_FILE!);
+    expect(existsSync(folder)).toBe(true);
+    h.clock.t = NOW + 5 * MIN;
+    await check(h);
+    expect(existsSync(folder)).toBe(false);
+  });
+
+  it("after a real restart of Lair, removes every run folder left: a pending question's and an answered one's", async () => {
+    const h = await boot(fileOn({ min_interval_seconds: 0 }));
+    // One question answered with the CLI: its folder stays until the deadline (then the run is stopped and it goes)
+    const answered = await asked(h, "First?");
+    expect((await answer(h, answered.call.env, { text: "From the CLI", evidence: [] })).code).toBe(EXIT_OK);
+    h.spawner.exit(answered.call.pid, 0);
+    await tick(h);
+    await check(h);
+    expect((await conversation(h, answered.view.id)).turns[0].state).toBe("answered");
+    const answeredFolder = dirname(answered.call.env.LAIR_ANSWER_FILE!);
+    expect(existsSync(answeredFolder)).toBe(true);
+    // One question still waiting, whose run left a file of its own in its folder
+    const waiting = await asked(h, "Second?");
+    const waitingFolder = dirname(waiting.call.env.LAIR_ANSWER_FILE!);
+    writeFileSync(join(waitingFolder, "notes.txt"), "scratch");
+    // Something else in the folder that is not a run folder is left alone
+    mkdirSync(join(runFolders(h), "not-a-run-folder"));
+
+    await h.restart();
+
+    expect((await conversation(h, waiting.view.id)).turns[0]).toMatchObject({
+      state: "no_answer",
+      reason: "no answer: Lair restarted before it came, and the run's token ended with the restart",
+    });
+    expect(existsSync(waitingFolder)).toBe(false);
+    expect(existsSync(answeredFolder)).toBe(false);
+    expect(existsSync(join(runFolders(h), "not-a-run-folder"))).toBe(true);
+  });
+});
+
+// ============ 6. THE PROMPT ============
+
+describe("the prompt, with supervisor.chat.answer_file", () => {
+  it("gives the exact answer.json path, says to write it and then exit, and gives no CLI command", async () => {
+    const h = await boot({ supervisor: { agent: "sup", chat: { enabled: true, answer_file: true } } });
+    const { call } = await asked(h);
+    const prompt = promptOf(call);
+
+    expect(prompt).toContain(`exact path in \`LAIR_ANSWER_FILE\`: \`${call.env.LAIR_ANSWER_FILE}\``);
+    expect(prompt).toContain('"answer":');
+    expect(prompt).toContain('"evidence":');
+    expect(prompt).toContain("Do not run `node`, `npm` or `lair` commands");
+    expect(prompt).toContain("do not try to work around a block on the host");
+    // Lair reads the file only once the run has ended (or at the deadline): the run must exit once it wrote it
+    expect(prompt).toContain("Lair reads the file only once your run has ended, or at the deadline above");
+    expect(prompt).toContain("So write it, then exit");
+    expect(prompt).not.toMatch(/as soon as it appears/);
+    // Only the fields Lair keeps
+    expect(prompt).not.toContain("confidence");
+    expect(prompt).not.toMatch(/lair supervisor answer/);
+    // The template's closing line holds for either way of answering
+    expect(prompt).toContain('Submit your answer once, as "Submitting your answer" below says. After that, stop.');
+  });
+});
+
+// ============ 7. THE DIGEST ============
 
 describe("the daily digest", () => {
   const at = (day: number, h: number, m: number) => new Date(2026, 9, day, h, m, 0).getTime();
