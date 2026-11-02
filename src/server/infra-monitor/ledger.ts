@@ -4,23 +4,13 @@
  * re-queue is retried a bounded number of times with backoff, across
  * restarts. Only act mode writes it; observe mode never creates it.
  *
- * A JSON file of its own (format version 1), written atomically (a new file
- * in the same directory, then a rename) with async fs; writes are queued one
- * after the other. An attempt is written BEFORE its command runs, so a
- * restart in the middle counts it: the record then reads as a failed attempt.
- * A file that can't be read or parsed is not overwritten: re-queues stop
- * (the status says why) until it is fixed or removed.
+ * The generic act-once ledger (core/act-ledger.ts): format version 1, async
+ * fs, an attempt written BEFORE its command runs, a `running` record read
+ * back as a failed attempt after a restart, and a file that can't be read
+ * or parsed never overwritten (re-queues stop until it is fixed or removed).
  */
-import { mkdir, readFile, rename, writeFile } from "fs/promises";
-import { dirname } from "path";
+import { ActLedger } from "../core/act-ledger.js";
 import type { RequeueRecord } from "./types.js";
-
-const FORMAT = 1;
-/** Records kept: 14 days, at most this many (the newest) */
-const RETENTION_MS = 14 * 86_400_000;
-const MAX_RECORDS = 2000;
-
-const keyOf = (project: string, id: string) => `${project}\u0000${id}`;
 
 function isRecord(v: unknown): v is RequeueRecord {
   if (typeof v !== "object" || v === null) return false;
@@ -39,79 +29,22 @@ function isRecord(v: unknown): v is RequeueRecord {
   );
 }
 
-export class RequeueLedger {
-  private records = new Map<string, RequeueRecord>();
-  private loading: Promise<void> | null = null;
-  private writes: Promise<void> = Promise.resolve();
-  /** Why the ledger can't be used, or null */
-  error: string | null = null;
-
+export class RequeueLedger extends ActLedger<RequeueRecord> {
   /** `path` null: kept in memory only (nothing survives a restart) */
-  constructor(private readonly path: string | null) {}
-
-  /** Read the file once. A missing file is an empty ledger. */
-  load(): Promise<void> {
-    this.loading ??= this.read();
-    return this.loading;
-  }
-
-  private async read(): Promise<void> {
-    if (!this.path) return;
-    let text: string;
-    try {
-      text = await readFile(this.path, "utf-8");
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === "ENOENT") return;
-      this.error = `the re-queue ledger can't be read: ${(e as Error).message}`;
-      return;
-    }
-    try {
-      const data = JSON.parse(text) as { format?: unknown; records?: unknown };
-      if (data.format !== FORMAT || !Array.isArray(data.records)) throw new Error(`not format ${FORMAT}`);
-      for (const r of data.records) {
-        if (!isRecord(r)) throw new Error("a record has the wrong shape");
+  constructor(path: string | null) {
+    super({
+      path,
+      name: "re-queue ledger",
+      stops: "re-queues stop",
+      isRecord,
+      interrupted: (r) => {
         // Started and never finished: the server stopped during the command
         if (r.status === "running") {
           r.status = "failed";
           r.lastError = "interrupted by a restart";
         }
-        this.records.set(keyOf(r.project, r.id), r);
-      }
-    } catch (e) {
-      this.records.clear();
-      this.error = `the re-queue ledger ${this.path} is not valid (${(e as Error).message}); re-queues stop until it is fixed or removed`;
-    }
-  }
-
-  get(project: string, id: string): RequeueRecord | null {
-    const r = this.records.get(keyOf(project, id));
-    return r ? { ...r, argv: [...r.argv] } : null;
-  }
-
-  list(project: string): RequeueRecord[] {
-    return [...this.records.values()].filter((r) => r.project === project).map((r) => ({ ...r, argv: [...r.argv] }));
-  }
-
-  /** Keep a record and write the file; rejects when the write fails (the caller then runs nothing). */
-  put(record: RequeueRecord, now: number): Promise<void> {
-    if (this.error) return Promise.reject(new Error(this.error));
-    this.records.set(keyOf(record.project, record.id), { ...record, argv: [...record.argv] });
-    const write = this.writes.then(() => this.write(now));
-    // The queue goes on after a failed write; this caller sees the failure
-    this.writes = write.catch(() => undefined);
-    return write;
-  }
-
-  private async write(now: number): Promise<void> {
-    const kept = [...this.records.values()]
-      .filter((r) => r.status === "running" || now - r.lastAttemptAt < RETENTION_MS)
-      .sort((a, b) => b.lastAttemptAt - a.lastAttemptAt)
-      .slice(0, MAX_RECORDS);
-    this.records = new Map(kept.map((r) => [keyOf(r.project, r.id), r]));
-    if (!this.path) return;
-    await mkdir(dirname(this.path), { recursive: true });
-    const tmp = `${this.path}.${process.pid}.tmp`;
-    await writeFile(tmp, `${JSON.stringify({ format: FORMAT, records: kept }, null, 1)}\n`, { mode: 0o600 });
-    await rename(tmp, this.path);
+      },
+      keep: (r) => r.status === "running",
+    });
   }
 }

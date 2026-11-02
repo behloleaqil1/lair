@@ -147,6 +147,8 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       "agent_adapters.*.models_cmd": { help: "Lists the tool's models (no placeholders); read by models_parser" },
       "agent_adapters.*.auth_check_cmd": { help: "Exits 0 when the tool is signed in (no placeholders)" },
       "agent_adapters.*.login_hint": { help: "The command you run in a terminal to sign in (Lair never runs it)" },
+      "agent_adapters.*.usage_parser": { help: "How an ended run's usage is read from its log (agents.spend); unset: the built-in default" },
+      "agent_adapters.*.request_pattern": { advanced: true, help: "request-lines: a regular expression for one model request (case-sensitive)" },
     },
   },
   {
@@ -239,6 +241,8 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       "fill.prompt_files": { widget: "list", help: "Their contents, in order, make a run's prompt; {prompts_dir}, {agent}, {task}" },
       "fill.done_pattern": { advanced: true, help: "Matched against new queue lines; {task} and {agent} are replaced" },
       "fill.capacity_cmd": { help: "Exit 0: capacity available; anything else holds (its first output line is the reason)" },
+      "budgets.guard_mode": { help: "The mode of the request and minute limits AI spend adds; token and cost hard limits always block" },
+      "spend.enabled": { help: "Record each ended run's runtime, prompt size and the usage its adapter reports" },
     },
   },
   {
@@ -308,7 +312,10 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       "repos.*.project": { help: "Its Projects board: the user or organization that owns it, and the number in the board's URL" },
       "repos.*.match.tasks": { help: "Task id globs (* and ?) this repository takes" },
       "repos.*.milestones.rules": { advanced: true, help: "Issues created for these tasks go in this existing milestone (Lair never sets due dates)" },
+      "repos.*.redact_patterns": { help: "Regular expressions removed from this repository's texts only (e.g. a private name a public repository must never see), after the project-wide ones" },
+      "repos.*.create_issues": { help: "Create issues in this repository for tasks with none (default: create_issues_for_new_tasks): on for a private repository, off for a public one" },
       create_issues_for_new_tasks: { help: "A task with no issue gets one (act mode); otherwise only issues it names or with its exact title are linked" },
+      auto_link: { help: "Link the issue a reconcile proposes for a task (one candidate, named by the task id or closed by the task's PR; a close title alone never) without asking, in act mode; off: proposals wait in the status for the owner" },
       redact_patterns: { help: "Regular expressions removed from every text sent to GitHub, after the built-in ones (paths, tokens, emails, addresses)" },
       token_env: { sensitive: true, help: "The env var holding the GitHub token; default: review.token_env, else GITHUB_TOKEN" },
       api_url: { sensitive: true, advanced: true, help: "https only: the token is sent to it" },

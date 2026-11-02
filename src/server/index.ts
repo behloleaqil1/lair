@@ -29,7 +29,7 @@ import {
 } from "./human-auth/index.js";
 import { registerControlRoutes } from "./routes/controls.js";
 import { busStoreFor, forgetBusService, registerBusRoutes } from "./routes/bus.js";
-import { BusConsumers, agentsBusFor, closeBusStores, existingBusStore, openedBusStore, parseBusConfig, structuredReport } from "./bus/index.js";
+import { BusConsumers, BusLive, agentsBusFor, closeBusStores, existingBusStore, openedBusStore, parseBusConfig, structuredReport } from "./bus/index.js";
 import { registerProcessRoutes } from "./routes/processes.js";
 import { registerSettingsRoutes } from "./routes/settings.js";
 import { getSupervisor } from "./services/supervisor.js";
@@ -61,6 +61,7 @@ import { PlacementManager, registerPlacementRoutes } from "./placement/index.js"
 import { HostServicesManager, registerHostServicesRoutes } from "./host-services/index.js";
 import { CloudManager, registerCloudRoutes } from "./cloud/index.js";
 import { InfraMonitorManager, registerInfraMonitorRoutes } from "./infra-monitor/index.js";
+import { PrHealthManager, registerPrHealthRoutes, startedLine as prHealthStartedLine } from "./pr-health/index.js";
 import { ChecksManager, agentRunIsActive, registerChecksRoutes } from "./checks/index.js";
 import { registerDashboardRoutes } from "./dashboard/index.js";
 import type { DashboardSources } from "./dashboard/routes.js";
@@ -77,6 +78,7 @@ import {
 import { SettingsService, registerSettingsUiRoutes } from "./settings/index.js";
 import { mountPlanner, plannerAgentsFrom } from "./planner/index.js";
 import { TrackerManager, registerTrackerRoutes } from "./tracker/index.js";
+import { WorkStoreManager, registerWorkRoutes } from "./work/index.js";
 import { join } from "path";
 import type { ApiResponse, ProjectConfig } from "../shared/types.js";
 import { initProcessCache, disposeProcessCache, CachedProcessTable } from "./core/process-cache.js";
@@ -247,7 +249,7 @@ fastify.get<{ Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      return respond(service.getOverview());
+      return respond(await service.getOverview());
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -260,7 +262,7 @@ fastify.get<{ Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      return respond(service.getDragons());
+      return respond(await service.getDragons());
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -273,7 +275,7 @@ fastify.get<{ Params: { id: string }; Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      const dragon = service.getDragonById(request.params.id);
+      const dragon = await service.getDragonById(request.params.id);
       if (!dragon) {
         return respondError(`Dragon not found: ${request.params.id}`);
       }
@@ -292,7 +294,7 @@ fastify.get<{ Params: { id: string }; Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      const lines = service.getQueueLinesByAgent(request.params.id);
+      const lines = await service.getQueueLinesByAgent(request.params.id);
       return respond(lines);
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
@@ -306,8 +308,8 @@ fastify.get<{ Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      const queue = service.getGateQueue();
-      const results = service.getRecentGateResults(24);
+      const queue = await service.getGateQueue();
+      const results = await service.getRecentGateResults(24);
       return respond({ queue, results });
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
@@ -321,9 +323,9 @@ fastify.get<{ Querystring: { project?: string; status?: string } }>(
     try {
       const service = getDataService(request.query.project);
       if (request.query.status) {
-        return respond(service.getGatesByStatus(request.query.status));
+        return respond(await service.getGatesByStatus(request.query.status));
       }
-      return respond(service.getGateQueue());
+      return respond(await service.getGateQueue());
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -338,7 +340,7 @@ fastify.get<{ Querystring: { project?: string; hours?: string } }>(
       const hours = request.query.hours
         ? parseInt(request.query.hours, 10)
         : 24;
-      return respond(service.getRecentGateResults(hours));
+      return respond(await service.getRecentGateResults(hours));
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -356,9 +358,9 @@ fastify.get<{ Querystring: { project?: string; types?: string } }>(
       const service = getDataService(request.query.project);
       if (request.query.types) {
         const types = request.query.types.split(",");
-        return respond(service.getQueueLinesByType(types));
+        return respond(await service.getQueueLinesByType(types));
       }
-      return respond(service.getQueueLines());
+      return respond(await service.getQueueLines());
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -385,7 +387,7 @@ fastify.get<{ Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      return respond(service.getMachineStatuses());
+      return respond(await service.getMachineStatuses());
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -398,7 +400,7 @@ fastify.get<{ Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      return respond(service.getOrchestratorStatus());
+      return respond(await service.getOrchestratorStatus());
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -573,6 +575,12 @@ const applyBusConfig = (entry: { name: string; config?: ProjectConfig }) => {
   forgetBusService(entry.name);
 };
 for (const entry of projectEntries) applyBusConfig(entry);
+// The bus live on the dashboard's `bus` WebSocket channel (Home → Bus), for projects whose bus.consume isn't off
+const busLive = new BusLive({
+  events: getEventBus(),
+  mode: (project) => busConsumers.mode(project),
+  publish: (project, update) => wsServer?.broadcast("bus", update, { project }),
+});
 
 const agents: AgentsManager = new AgentsManager({
   dbPath: join(process.cwd(), "data", "agents.db"),
@@ -694,6 +702,8 @@ await mountBrainTrainer(fastify, {
   decisions: decisionInbox,
   events: getEventBus(),
   humanAuth,
+  // Each shadow proposal counts as one model call of its project (0 tokens) while that project's agents.spend is on
+  recordCall: (project, call) => agents.recordCall(project, call),
 });
 
 // Reviews and policy merge: one per project with `review.enabled: true`;
@@ -779,6 +789,27 @@ trackers.load(projectEntries);
 trackers.useDecisions(decisionInbox);
 await registerTrackerRoutes(fastify, trackers, () => getDefaultProject(), humanAuth);
 
+// The work store (src/server/work/, docs/design/work-store.md): one SQLite file per project with
+// `work_store.mode: observe` (off by default: no store file, today's files exactly). In observe it follows the files
+// one way when the owner imports (a dry run first); once the owner applied an import it follows by itself
+// (`work_store.files: follow`, started below): bus reports and run and claim facts by cursor, the files when they
+// change. Fill, the planner and the tracker still read the files. Every route is the owner's.
+const works = new WorkStoreManager({
+  dataDir: join(process.cwd(), "data"),
+  runs: () => agents.getStore(),
+  bus: (project) => busConsumers.lineSource(project),
+  reports: (project) => existingBusStore(project, busDataDir),
+  // The ready guard's verdict only (record: false): fill's refusal and waiting events stay fill's own
+  accepted: (project) => {
+    const service = agents.get(project);
+    return service ? (agent, task, line, description, report, options) => service.reportAccepted(agent, task, line, description, report, options) : undefined;
+  },
+  fill: (project) => agents.get(project)?.fillStatus() ?? null,
+  events: getEventBus(),
+});
+works.load(projectEntries);
+await registerWorkRoutes(fastify, works, () => getDefaultProject(), humanAuth);
+
 // Placement: one per project with `placement.enabled: true` (off by
 // default). It probes the project's machines, estimates when each queued
 // job of the project's own gate queue finishes on each lane, and moves jobs
@@ -818,6 +849,16 @@ const infraMonitor = new InfraMonitorManager({
 infraMonitor.load(projectEntries);
 infraMonitor.useDecisions(decisionInbox);
 await registerInfraMonitorRoutes(fastify, infraMonitor, () => getDefaultProject());
+
+// PR health (src/server/pr-health/): the open PRs of each repository in repos:
+// that conflict, fall behind, get no CI or go red, and the agent whose task
+// line or branch owns each (fill's last check). Off unless a project sets
+// `pr_health.enabled: true`; observe by default (events and a read-only
+// status). Act mode's notes are kept in data/pr-health-deliveries.json.
+const prHealth = new PrHealthManager({ events: getEventBus(), agents, ledgerPath: join(process.cwd(), "data", "pr-health-deliveries.json") });
+prHealth.load(projectEntries);
+prHealth.useDecisions(decisionInbox);
+await registerPrHealthRoutes(fastify, prHealth, () => getDefaultProject());
 
 // Agent checks (src/server/checks/): agents test on a runner before they gate.
 // One per project with `checks:` configured (off by default). A request needs
@@ -872,7 +913,7 @@ const { supervisor: selfChecks, chat: supervisorChat } = await mountSupervisor(f
   events: getEventBus(),
   decisions: decisionInbox,
   agents: {
-    requestRun: (project, input) => agents.requestRun(project, input),
+    requestRun: (project, input, options) => agents.requestRun(project, input, options),
     getStore: () => agents.getStore(),
     releaseClaim: async (project, task, why) => agents.get(project)?.releaseClaim(task, why),
   },
@@ -940,6 +981,7 @@ const reloader = new ConfigReloader({
     supervisor: selfChecks,
     trackers,
     infraMonitor,
+    prHealth,
     bus: {
       validate: (config) => {
         const parsed = parseBusConfig(config.bus);
@@ -947,6 +989,7 @@ const reloader = new ConfigReloader({
       },
       reloadProject: async (entry) => applyBusConfig(entry),
     },
+    work: works,
   }),
   initial: projectEntries,
   events: getEventBus(),
@@ -1042,6 +1085,7 @@ const stopServer = async (reason: string) => {
 
   // The bus consumers first: no report or run end starts a check or a cycle from here on
   busConsumers.stop();
+  busLive.stop();
 
   // Stop the planner first: it requests runs from the agents module
   await planner.stop();
@@ -1049,6 +1093,9 @@ const stopServer = async (reason: string) => {
   // Stop the tracker: its requests to GitHub in flight are cut short (a create cut short is found again by its
   // marker on the next start), then its store closes
   await trackers.stop();
+
+  // Close the work stores (an import in flight finishes its one transaction first: it never awaits inside it)
+  await works.stop();
 
   // Stop agent supervision: the agents keep running for the next server to adopt, unless a project sets
   // agents.on_restart: stop (then their runs are stopped too, within a bounded wait)
@@ -1067,6 +1114,8 @@ const stopServer = async (reason: string) => {
   await hostServices.stop();
   // Stop infra monitor: any tick in progress is cut short
   await infraMonitor.stop();
+  // Stop PR health: a tick in progress ends at its next request
+  await prHealth.stop();
 
   // Stop the shared process cache (all modules have stopped, so no one reads it)
   disposeProcessCache();
@@ -1213,8 +1262,12 @@ const start = async () => {
 
     // The bus consumers (after fill and the planner, which they wake)
     busConsumers.start();
+    busLive.start();
     const onBus = busConsumers.enabled();
     console.log(onBus.length > 0 ? `[bus] On or observing for: ${onBus.join(", ")}` : "[bus] Off (no project sets bus.consume)");
+    // The work store's follower and consumer (after the agents and the bus, whose facts it reads): it replays what came
+    // since its cursors first, then follows; a project follows only once the owner applied an import
+    works.start();
     // Start the tracker (after the planner and the agents, whose events it follows): each syncs in the background,
     // so a slow or unreachable GitHub never holds up the start
     const tracked = trackers.start();
@@ -1263,6 +1316,9 @@ const start = async () => {
         ? `[infra-monitor] Watching jobs for: ${infraMonitored.join(", ")}`
         : "[infra-monitor] Off (no project sets infra_monitor.enabled)",
     );
+
+    // Start PR health (each project's open PRs and their owners; observe only)
+    console.log(prHealthStartedLine(prHealth.start()));
 
     // Start agent checks (reconcile queued/running from a restart)
     const checking = checks.start();

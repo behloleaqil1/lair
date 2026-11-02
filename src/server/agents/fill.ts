@@ -59,13 +59,15 @@
  *   requested through AgentsService.requestRun, the module's in-process path,
  *   so claims, locks, never-started retries, recovery, failover and budgets
  *   apply to it as to any run.
- * Input is bounded: the tasks file (256 KB, 200 tasks, 2000 characters a
+ * Input is bounded, and read asynchronously (a check never blocks the event
+ * loop on a slow disk, #245): the tasks file (256 KB, 200 tasks, 2000 characters a
  * line), each prompt file (200 KB, a regular file inside prompts_dir with no
  * symlink out of it) and the queue file (its last 4 MB, lines cut at 1000
  * characters and trimmed before done_pattern sees them).
  */
 import { createHash } from "crypto";
-import { closeSync, constants, fstatSync, lstatSync, opendirSync, openSync, readSync, realpathSync, type Dir } from "fs";
+import { constants, type Dir } from "fs";
+import { lstat, open, opendir, realpath, type FileHandle } from "fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { Decision } from "../../shared/decision-types.js";
@@ -212,19 +214,20 @@ function asData(text: string, max = 300): string[] {
 
 // ============ FILES ============
 
-export type Opened = { fd: number; size: number } | { error: string };
+// Every read here is asynchronous (fs/promises) and bounded: fill runs on a
+// timer, and a synchronous read on a saturated disk stalls the server (#245).
+
+type Opened = { handle: FileHandle; size: number } | { error: string };
 
 /**
  * Open a regular file for reading. O_NONBLOCK, so a FIFO put in its place
- * doesn't block the server (it is refused as not a regular file);
- * `noFollow` refuses a symlink as the last component. Shared with the
- * planner's source reads (src/server/planner/files.ts).
+ * doesn't block anything (it is refused as not a regular file); `noFollow`
+ * refuses a symlink as the last component. The caller closes the handle.
  */
-export function openRegular(path: string, noFollow: boolean): Opened {
-  let fd: number;
+async function openRegular(path: string, noFollow: boolean): Promise<Opened> {
+  let handle: FileHandle;
   try {
-    const flags = constants.O_RDONLY | (constants.O_NONBLOCK ?? 0) | (noFollow ? (constants.O_NOFOLLOW ?? 0) : 0);
-    fd = openSync(path, flags);
+    handle = await open(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0) | (noFollow ? (constants.O_NOFOLLOW ?? 0) : 0));
   } catch (e) {
     const code = (e as NodeJS.ErrnoException).code;
     return {
@@ -232,41 +235,48 @@ export function openRegular(path: string, noFollow: boolean): Opened {
     };
   }
   try {
-    const st = fstatSync(fd);
-    if (!st.isFile()) {
-      closeSync(fd);
-      return { error: "is not a regular file" };
-    }
-    return { fd, size: st.size };
+    const st = await handle.stat();
+    if (st.isFile()) return { handle, size: st.size };
+    await handle.close().catch(() => {});
+    return { error: "is not a regular file" };
   } catch (e) {
-    closeSync(fd);
+    await handle.close().catch(() => {});
     return { error: `cannot be read (${message(e)})` };
   }
 }
 
-export function readAt(fd: number, position: number, length: number): Buffer {
+async function readAt(handle: FileHandle, position: number, length: number): Promise<Buffer> {
   const buffer = Buffer.alloc(length);
   let done = 0;
   while (done < length) {
-    const n = readSync(fd, buffer, done, length - done, position + done);
-    if (n === 0) break;
-    done += n;
+    const { bytesRead } = await handle.read(buffer, done, length - done, position + done);
+    if (bytesRead === 0) break;
+    done += bytesRead;
   }
   return done === length ? buffer : buffer.subarray(0, done);
 }
 
-/** A whole regular file of at most `maxBytes`, as text. */
-export function readBounded(path: string, maxBytes: number, noFollow: boolean): { ok: true; text: string } | { ok: false; reason: string } {
-  const opened = openRegular(path, noFollow);
-  if ("error" in opened) return { ok: false, reason: opened.error };
+/** Read from a regular file, then close it; `fallback` when it can't be opened or read. */
+async function withRegular<T>(path: string, noFollow: boolean, fallback: (reason: string) => T, read: (handle: FileHandle, size: number) => Promise<T>): Promise<T> {
+  const opened = await openRegular(path, noFollow);
+  if ("error" in opened) return fallback(opened.error);
   try {
-    if (opened.size > maxBytes) return { ok: false, reason: `is larger than ${maxBytes} bytes (${opened.size})` };
-    return { ok: true, text: readAt(opened.fd, 0, opened.size).toString("utf-8") };
+    return await read(opened.handle, opened.size);
   } catch (e) {
-    return { ok: false, reason: `cannot be read (${message(e)})` };
+    return fallback(`cannot be read (${message(e)})`);
   } finally {
-    closeSync(opened.fd);
+    await opened.handle.close().catch(() => {});
   }
+}
+
+type BoundedRead = { ok: true; text: string } | { ok: false; reason: string };
+
+/** A whole regular file of at most `maxBytes`, as text. */
+export function readBounded(path: string, maxBytes: number, noFollow: boolean): Promise<BoundedRead> {
+  return withRegular<BoundedRead>(path, noFollow, (reason) => ({ ok: false, reason }), async (handle, size) => {
+    if (size > maxBytes) return { ok: false, reason: `is larger than ${maxBytes} bytes (${size})` };
+    return { ok: true, text: (await readAt(handle, 0, size)).toString("utf-8") };
+  });
 }
 
 // ============ THE QUEUE FILE ============
@@ -274,17 +284,12 @@ export function readBounded(path: string, maxBytes: number, noFollow: boolean): 
 const EMPTY_TAIL = sha256(Buffer.alloc(0));
 
 /** Where the queue file stands now (see QueueMark); offset 0 when it can't be read. */
-export function queueMark(path: string): QueueMark {
-  const opened = openRegular(path, false);
-  if ("error" in opened) return { offset: 0, tail: EMPTY_TAIL };
-  try {
-    const length = Math.min(opened.size, MARK_TAIL_BYTES);
-    return { offset: opened.size, tail: sha256(readAt(opened.fd, opened.size - length, length)) };
-  } catch {
-    return { offset: 0, tail: EMPTY_TAIL };
-  } finally {
-    closeSync(opened.fd);
-  }
+export function queueMark(path: string): Promise<QueueMark> {
+  const none = (): QueueMark => ({ offset: 0, tail: EMPTY_TAIL });
+  return withRegular(path, false, none, async (handle, size) => {
+    const length = Math.min(size, MARK_TAIL_BYTES);
+    return { offset: size, tail: sha256(await readAt(handle, size - length, length)) };
+  });
 }
 
 /** How a run that exited 0 without the done line ended: on a WAITING or a BLOCKED line for its task. */
@@ -331,19 +336,19 @@ export interface QueuedRequest {
  * Bounded: the first GATE_QUEUE_MAX_ENTRIES entries; a directory or a
  * symlink is never a request. A running request wins over a queued one.
  */
-export function readGateQueue(gatesDir: string): Map<string, QueuedRequest> {
+export async function readGateQueue(gatesDir: string): Promise<Map<string, QueuedRequest>> {
   const requests = new Map<string, QueuedRequest>();
   const dir = join(gatesDir, "queue");
   let handle: Dir;
   try {
-    handle = opendirSync(dir);
+    handle = await opendir(dir, { bufferSize: 128 });
   } catch {
     return requests;
   }
   try {
-    for (let i = 0; i < GATE_QUEUE_MAX_ENTRIES; i++) {
-      const entry = handle.readSync();
-      if (entry === null) break;
+    let i = 0;
+    for await (const entry of handle) {
+      if (++i > GATE_QUEUE_MAX_ENTRIES) break;
       if (entry.isDirectory() || entry.isSymbolicLink()) continue;
       const gate = parseGateFilename(entry.name);
       if (!gate || (gate.status !== "queued" && gate.status !== "running")) continue;
@@ -353,7 +358,11 @@ export function readGateQueue(gatesDir: string): Map<string, QueuedRequest> {
   } catch {
     // What was read before the error stands
   } finally {
-    handle.closeSync();
+    try {
+      await handle.close();
+    } catch {
+      // The loop closed it when it ran to the end or broke off
+    }
   }
   return requests;
 }
@@ -386,17 +395,11 @@ const queuedText = (q: QueuedGate) =>
 const isPlainWake = isPlainName;
 
 /** The first line of a small regular file (no symlink as its last part), trimmed; null when it can't be read. */
-function firstLineOf(path: string, maxBytes: number): string | null {
-  const opened = openRegular(path, true);
-  if ("error" in opened) return null;
-  try {
-    const text = readAt(opened.fd, 0, Math.min(opened.size, maxBytes)).toString("utf-8");
+function firstLineOf(path: string, maxBytes: number): Promise<string | null> {
+  return withRegular(path, true, () => null, async (handle, size) => {
+    const text = (await readAt(handle, 0, Math.min(size, maxBytes))).toString("utf-8");
     return text.split("\n")[0].replace(/\r$/, "").trim();
-  } catch {
-    return null;
-  } finally {
-    closeSync(opened.fd);
-  }
+  });
 }
 
 /** What a queue line reports, as fill's patterns look for it. */
@@ -431,6 +434,13 @@ export interface LineMatch<K extends LineKind = LineKind> {
   report: StructuredReport | null;
 }
 
+/** One read of the queue file: its last QUEUE_MAX_BYTES from `begin`, and its size then */
+interface QueueWindow {
+  bytes: Buffer;
+  begin: number;
+  size: number;
+}
+
 interface QueueLine {
   start: number;
   text: string;
@@ -460,17 +470,25 @@ export class QueueLines {
   private usableMarks = new Map<string, boolean>();
   private readonly structured: boolean;
 
-  constructor(
+  /** Read the queue file's last QUEUE_MAX_BYTES (one async read) and parse its lines. */
+  static async read(path: string, bus: BusLineSource | null = null): Promise<QueueLines> {
+    const snapshot = await withRegular(path, false, () => null, async (handle, size): Promise<QueueWindow> => {
+      const begin = Math.max(0, size - QUEUE_MAX_BYTES);
+      return { bytes: await readAt(handle, begin, size - begin), begin, size };
+    });
+    return new QueueLines(path, bus, snapshot);
+  }
+
+  private constructor(
     private path: string,
-    bus: BusLineSource | null = null,
+    bus: BusLineSource | null,
+    /** The bytes read (null when the file can't be read): marks inside them are checked from memory */
+    private readonly snapshot: QueueWindow | null,
   ) {
     this.structured = bus?.mode === "on";
-    const opened = openRegular(path, false);
-    if ("error" in opened) return;
-    try {
-      this.size = opened.size;
-      const begin = Math.max(0, opened.size - QUEUE_MAX_BYTES);
-      const bytes = readAt(opened.fd, begin, opened.size - begin);
+    if (snapshot) {
+      this.size = snapshot.size;
+      const { begin, bytes } = snapshot;
       let pos = 0;
       while (pos < bytes.length) {
         const newline = bytes.indexOf(0x0a, pos);
@@ -486,10 +504,6 @@ export class QueueLines {
         }
         pos = end + 1;
       }
-    } catch {
-      this.lines = [];
-    } finally {
-      closeSync(opened.fd);
     }
     if (bus) this.attachReports(bus);
   }
@@ -542,8 +556,8 @@ export class QueueLines {
    * looks at nothing, since a line by the agent from before the task's start
    * can be about anything it did before.
    */
-  private from(pattern: FillPattern, mark: QueueMark | undefined): number | null {
-    if (mark && this.usable(mark)) return mark.offset;
+  private async from(pattern: FillPattern, mark: QueueMark | undefined): Promise<number | null> {
+    if (mark && (await this.usable(mark))) return mark.offset;
     return pattern.task !== null ? 0 : null;
   }
 
@@ -555,16 +569,16 @@ export class QueueLines {
    * where that run's lines begin is unknown, so such a pattern reads
    * nothing: what fill saw before is kept in the store.
    */
-  private window(pattern: FillPattern, mark: QueueMark | undefined, until: QueueMark | undefined): { from: number; to: number } | null {
-    const from = this.from(pattern, mark);
+  private async window(pattern: FillPattern, mark: QueueMark | undefined, until: QueueMark | undefined): Promise<{ from: number; to: number } | null> {
+    const from = await this.from(pattern, mark);
     if (from === null) return null;
     if (pattern.task !== null || !until) return { from, to: Number.POSITIVE_INFINITY };
-    return this.usable(until) ? { from, to: until.offset } : null;
+    return (await this.usable(until)) ? { from, to: until.offset } : null;
   }
 
   /** The first line in the query's window that reports what it looks for (see match). */
-  find<K extends LineKind>(query: LineQuery<K>, subject: LineSubject, mark: QueueMark | undefined, until?: QueueMark): LineMatch<K> | null {
-    const window = this.window(query.pattern, mark, until);
+  async find<K extends LineKind>(query: LineQuery<K>, subject: LineSubject, mark: QueueMark | undefined, until?: QueueMark): Promise<LineMatch<K> | null> {
+    const window = await this.window(query.pattern, mark, until);
     if (window === null) return null;
     for (const line of this.lines) {
       if (line.start < window.from || line.start >= window.to) continue;
@@ -578,8 +592,9 @@ export class QueueLines {
    * The last line in the queries' windows that one of them matches (a line
    * takes the first query that matches it): the latest such line wins.
    */
-  lastOf<K extends LineKind>(queries: LineQuery<K>[], subject: LineSubject, mark: QueueMark | undefined, until?: QueueMark): LineMatch<K> | null {
-    const windows = queries.map(({ pattern }) => this.window(pattern, mark, until));
+  async lastOf<K extends LineKind>(queries: LineQuery<K>[], subject: LineSubject, mark: QueueMark | undefined, until?: QueueMark): Promise<LineMatch<K> | null> {
+    const windows: ({ from: number; to: number } | null)[] = [];
+    for (const { pattern } of queries) windows.push(await this.window(pattern, mark, until));
     let last: LineMatch<K> | null = null;
     for (const line of this.lines) {
       for (let i = 0; i < queries.length; i++) {
@@ -600,8 +615,8 @@ export class QueueLines {
    * blocked: the latest such line wins. A waiting line's (?<wake>...), or a
    * WAITING report's gate id, is what it waits on.
    */
-  lastStatus(waiting: FillPattern, blocked: FillPattern, subject: LineSubject, mark: QueueMark | undefined, until?: QueueMark): RunStatus | null {
-    const last = this.lastOf<"waiting" | "blocked">(
+  async lastStatus(waiting: FillPattern, blocked: FillPattern, subject: LineSubject, mark: QueueMark | undefined, until?: QueueMark): Promise<RunStatus | null> {
+    const last = await this.lastOf<"waiting" | "blocked">(
       [
         { kind: "waiting", pattern: waiting },
         { kind: "blocked", pattern: blocked },
@@ -615,22 +630,20 @@ export class QueueLines {
   }
 
   /** A mark still describes this file: it isn't past its end and the bytes before it are unchanged. */
-  private usable(mark: QueueMark): boolean {
+  private async usable(mark: QueueMark): Promise<boolean> {
     const key = `${mark.offset}:${mark.tail}`;
     const known = this.usableMarks.get(key);
     if (known !== undefined) return known;
     let ok = false;
     if (mark.offset <= this.size) {
-      const opened = openRegular(this.path, false);
-      if (!("error" in opened)) {
-        try {
-          const length = Math.min(mark.offset, MARK_TAIL_BYTES);
-          ok = sha256(readAt(opened.fd, mark.offset - length, length)) === mark.tail;
-        } catch {
-          ok = false;
-        } finally {
-          closeSync(opened.fd);
-        }
+      const length = Math.min(mark.offset, MARK_TAIL_BYTES);
+      const start = mark.offset - length;
+      const window = this.snapshot;
+      if (window && start >= window.begin && mark.offset - window.begin <= window.bytes.length) {
+        // Inside the bytes this check read: no second read
+        ok = sha256(window.bytes.subarray(start - window.begin, mark.offset - window.begin)) === mark.tail;
+      } else {
+        ok = await withRegular(this.path, false, () => false, async (handle) => sha256(await readAt(handle, start, length)) === mark.tail);
       }
     }
     this.usableMarks.set(key, ok);
@@ -647,9 +660,9 @@ export class QueueLines {
    * for a later check. Lines are indexed by author once per QueueLines (one
    * pass for the check), so each task costs only its agent's lines.
    */
-  agentLines(agent: string, mark: QueueMark | undefined, until: QueueMark | undefined): string[] {
-    if (!mark || !this.usable(mark)) return [];
-    if (until && !this.usable(until)) return [];
+  async agentLines(agent: string, mark: QueueMark | undefined, until: QueueMark | undefined): Promise<string[]> {
+    if (!mark || !(await this.usable(mark))) return [];
+    if (until && !(await this.usable(until))) return [];
     if (this.byAuthor === null) {
       const byAuthor = new Map<string, number[]>();
       this.lines.forEach((line, i) => {
@@ -786,7 +799,7 @@ export function queueWindowEnd(
  * DONE, WAITING or BLOCKED line (up to `until`, queueWindowEnd) is the DONE
  * one. Throws when a pattern doesn't compile for this task.
  */
-export function checkDone(
+export async function checkDone(
   store: Pick<AgentsStore, "getEventByKey">,
   project: string,
   queue: QueueLines,
@@ -794,7 +807,7 @@ export function checkDone(
   entry: TaskLineFields,
   latest: AgentRun | null,
   until: QueueMark | undefined,
-): DoneCheck {
+): Promise<DoneCheck> {
   const kept = store.getEventByKey(project, fillDoneKey(entry.task, latest?.id ?? null, entry));
   if (kept) return { kind: "kept", line: String(kept.data.line ?? ""), at: kept.at };
   const donePattern = fillPatternFor(settings.donePattern, entry.task, entry.agent);
@@ -802,11 +815,11 @@ export function checkDone(
   let found: LineMatch | null;
   if (donePattern.task !== null) {
     // A line that names the task: done is done, whatever came after it
-    found = queue.find({ kind: "done", pattern: donePattern }, subject, latest?.queueMark, until);
+    found = await queue.find({ kind: "done", pattern: donePattern }, subject, latest?.queueMark, until);
   } else {
     // A line by the agent only says where it is now: its last DONE, WAITING or BLOCKED line decides
     // ("- DONE row 1 by kiro-A", then "- WAITING <gate> by kiro-A" is waiting, not done)
-    const last = queue.lastOf<LineKind>(
+    const last = await queue.lastOf<LineKind>(
       [
         { kind: "done", pattern: donePattern },
         { kind: "waiting", pattern: fillPatternFor(settings.waitingPattern, entry.task, entry.agent) },
@@ -847,13 +860,13 @@ export const MAX_UNMATCHED_PER_RUN = 5;
  * closes and changes nothing: the run's task goes on as if it wasn't there
  * (no done line: the no-done path). The latest MAX_UNMATCHED_PER_RUN.
  */
-export function unmatchedReports(
+export async function unmatchedReports(
   queue: QueueLines,
   settings: Pick<FillSettings, "donePattern" | "waitingPattern" | "blockedPattern">,
   run: Pick<AgentRun, "agent" | "task" | "queueMark">,
   until: QueueMark | undefined,
   listed: (kind: UnmatchedReport["kind"], line: string) => boolean,
-): UnmatchedReport[] {
+): Promise<UnmatchedReport[]> {
   const templates: [UnmatchedReport["kind"], string][] = [
     ["done", settings.donePattern],
     ["waiting", settings.waitingPattern],
@@ -865,7 +878,7 @@ export function unmatchedReports(
   });
   if (kinds.length === 0) return [];
   const found: UnmatchedReport[] = [];
-  for (const line of queue.agentLines(run.agent, run.queueMark, until)) {
+  for (const line of await queue.agentLines(run.agent, run.queueMark, until)) {
     for (const { kind, report, own } of kinds) {
       const match = report.exec(line);
       if (!match) continue;
@@ -895,12 +908,12 @@ export interface ReportedOutcome {
  * count, whatever the patterns name. For a run whose exit status is lost
  * (it ended while Lair was restarting). null: it wrote no such line.
  */
-export function reportedOutcome(
+export async function reportedOutcome(
   queue: QueueLines,
   settings: Pick<FillSettings, "donePattern" | "waitingPattern" | "blockedPattern">,
   run: Pick<AgentRun, "agent" | "task" | "queueMark">,
   until: QueueMark | undefined,
-): ReportedOutcome | null {
+): Promise<ReportedOutcome | null> {
   // Its agent's lines only: a pattern that names the task alone would count another agent's line about it
   const own = (template: string): FillPattern => ({ ...fillPatternFor(template, run.task, run.agent), agent: run.agent });
   const done = own(settings.donePattern);
@@ -908,12 +921,12 @@ export function reportedOutcome(
   const blocked = own(settings.blockedPattern);
   const subject: LineSubject = { task: run.task, agent: run.agent, own: true };
   if (done.task !== null) {
-    const found = queue.find({ kind: "done", pattern: done }, subject, run.queueMark, until);
+    const found = await queue.find({ kind: "done", pattern: done }, subject, run.queueMark, until);
     if (found !== null) return { kind: "done", line: found.line };
-    const status = queue.lastStatus(waiting, blocked, subject, run.queueMark, until);
+    const status = await queue.lastStatus(waiting, blocked, subject, run.queueMark, until);
     return status ? { kind: status.kind, line: status.line } : null;
   }
-  const last = queue.lastOf<ReportedOutcome["kind"]>(
+  const last = await queue.lastOf<ReportedOutcome["kind"]>(
     [
       { kind: "done", pattern: done },
       { kind: "waiting", pattern: waiting },
@@ -949,13 +962,13 @@ export interface UnassignedLine {
  * nobody ran: it stays open until it is assigned or taken out of the file.
  * Throws when a pattern doesn't compile for this task.
  */
-export function unassignedLine(
+export async function unassignedLine(
   store: Pick<AgentsStore, "latestRunForTask" | "getClaim" | "firstRunForAgentAfter">,
   project: string,
   queue: QueueLines,
   settings: Pick<FillSettings, "donePattern" | "waitingPattern" | "blockedPattern">,
   task: string,
-): UnassignedLine {
+): Promise<UnassignedLine> {
   const latest = store.latestRunForTask(project, task);
   if (latest && isActive(latest.state)) {
     return { state: "claimed", detail: `run ${short(latest.id)} of agent ${latest.agent} is ${latest.state}: not ready work`, runId: latest.id, ready: false };
@@ -966,11 +979,11 @@ export function unassignedLine(
   }
   const donePattern = anyAgentPatternFor(settings.donePattern, task);
   // An unassigned line has no agent: a done line (or bus report, in on mode) for the task by any agent
-  const doneLine = donePattern ? queue.find({ kind: "done", pattern: donePattern }, { task, agent: "" }, latest?.queueMark) : null;
+  const doneLine = donePattern ? await queue.find({ kind: "done", pattern: donePattern }, { task, agent: "" }, latest?.queueMark) : null;
   if (doneLine !== null) return { state: "done", detail: `done: ${oneLine(doneLine.line)}`, runId: latest?.id ?? null, ready: false };
   if (latest) {
     const until = queueWindowEnd(store, project, settings, { agent: latest.agent, task }, latest);
-    const outcome = reportedOutcome(queue, settings, latest, until);
+    const outcome = await reportedOutcome(queue, settings, latest, until);
     if (outcome?.kind === "done") return { state: "done", detail: `done: ${oneLine(outcome.line)}`, runId: latest.id, ready: false };
     if (outcome) {
       return {
@@ -1000,11 +1013,11 @@ function within(root: string, path: string): boolean {
  * prompts_dir: a ".." segment, a path outside it, a symlink that leads out
  * of it, anything but a regular file, or a file over 200 KB is refused.
  */
-export function buildPrompt(templates: string[], promptsDir: string, vars: { agent: string; task: string }): PromptResult {
+export async function buildPrompt(templates: string[], promptsDir: string, vars: { agent: string; task: string }): Promise<PromptResult> {
   const root = resolve(promptsDir);
   let realRoot: string;
   try {
-    realRoot = realpathSync(root);
+    realRoot = await realpath(root);
   } catch {
     return { ok: false, reason: `prompts_dir ${root} does not exist` };
   }
@@ -1020,12 +1033,12 @@ export function buildPrompt(templates: string[], promptsDir: string, vars: { age
     if (!within(root, path)) return refuse(path, `it is outside prompts_dir (${root})`);
     let real: string;
     try {
-      real = realpathSync(path);
+      real = await realpath(path);
     } catch {
       return { ok: false, reason: `prompt file ${path} does not exist` };
     }
     if (!within(realRoot, real)) return refuse(path, `a symlink out of prompts_dir (to ${real})`);
-    const read = readBounded(real, MAX_PROMPT_FILE_BYTES, true);
+    const read = await readBounded(real, MAX_PROMPT_FILE_BYTES, true);
     if (!read.ok) return refuse(path, `it ${read.reason}`);
     files.push(path);
     const text = read.text.trim();
@@ -1545,17 +1558,17 @@ export class AgentsFill {
     const { project, settings, store, config, probes } = this.options;
     const path = this.tasksPath;
     if (!path) throw new Error("agents.fill.tasks_file is not set");
-    const read = readBounded(path, MAX_TASKS_FILE_BYTES, false);
+    const read = await readBounded(path, MAX_TASKS_FILE_BYTES, false);
     if (!read.ok) throw new Error(`tasks_file ${path} ${read.reason}`);
     const byAgent = matchesByAgent(settings);
     const entries = parseTasksFile(read.text, byAgent);
     const allowed = new Set(settings.agents);
     // bus.consume on: mirrored lines are read by their bus report; observe: compared, nothing else changes
     const bus = this.options.bus?.() ?? null;
-    const queue = new QueueLines(config.queue_file, bus);
+    const queue = await QueueLines.read(config.queue_file, bus);
     if (bus?.mode === "observe") this.observe(bus, queue, entries);
     // The gate queue, read at most once per check, and only when a waiting line names a gate
-    let gateRequests: Map<string, QueuedRequest> | null = null;
+    let gateRequests: Promise<Map<string, QueuedRequest>> | null = null;
     const gateQueue = () => (gateRequests ??= readGateQueue(config.gates_dir));
     const promptsDir = getPromptsDir(config);
     let active = this.activeCount();
@@ -1611,7 +1624,7 @@ export class AgentsFill {
         // Unassigned: fill starts nothing for it; it is ready work for any allowlisted agent while it is open
         let found: UnassignedLine;
         try {
-          found = unassignedLine(store, project, queue, settings, task);
+          found = await unassignedLine(store, project, queue, settings, task);
         } catch (e) {
           found = { state: "unassigned", detail: `no agent assigned, and not ready work: done_pattern can't be checked for it: ${message(e)}`, runId: null, ready: false };
         }
@@ -1731,7 +1744,7 @@ export class AgentsFill {
       // Done: kept once seen (for this latest run and this line as written), else from the queue file
       let check: DoneCheck;
       try {
-        check = checkDone(store, project, queue, settings, fields, latest, until);
+        check = await checkDone(store, project, queue, settings, fields, latest, until);
       } catch (e) {
         await refused(
           `done_pattern: ${message(e)}`,
@@ -1792,7 +1805,7 @@ export class AgentsFill {
       // shown; it closes and changes nothing, so a run with only such lines goes on below as one without a done line
       if (settings.doneMatch === "task_id" && latest) {
         const after = store.firstRunForAgentAfter(project, latest.agent, task, latest)?.queueMark;
-        const reports = unmatchedReports(queue, settings, latest, after, reportsListedTask);
+        const reports = await unmatchedReports(queue, settings, latest, after, reportsListedTask);
         if (reports.length > 0) unmatchedThisCheck.push(await this.recordUnmatched(latest, reports));
       }
 
@@ -1892,7 +1905,7 @@ export class AgentsFill {
         // The gate it waits on is still in the gate queue (under its id, or one it was re-queued as): a live wait
         const pollKey = `${task}|${latest.id}`;
         this.waitingSeen.add(pollKey);
-        const queued = wait.kind === "woken" ? null : this.queuedGate(status.wake, gateQueue);
+        const queued = wait.kind === "woken" ? null : await this.queuedGate(status.wake, gateQueue);
         await this.noteQueued(latest, agent, task, pollKey, queued, now);
         const queuedView = queued ? queuedGateView(queued) : null;
         // A wait budget across restarts: from the first run of this streak of waiting runs
@@ -2032,7 +2045,7 @@ export class AgentsFill {
         await hold("capacity", noCapacity);
         continue;
       }
-      const prompt = buildPrompt(settings.promptFiles, promptsDir, { agent, task });
+      const prompt = await buildPrompt(settings.promptFiles, promptsDir, { agent, task });
       if (!prompt.ok) {
         await hold("prompt", prompt.reason);
         continue;
@@ -2185,7 +2198,8 @@ export class AgentsFill {
    * and checked again, for at most settings.readyWaitMinutes from its first
    * check (stored as fill_report_waiting, so a restart keeps it); then it is
    * `expired` and the caller asks the owner. Nothing here marks the task done
-   * or sends anything to review.
+   * or sends anything to review. `record: false` (the work store, which only
+   * observes) gives the verdict and records nothing: those events are fill's.
    */
   async guardReport(
     agent: string,
@@ -2194,6 +2208,7 @@ export class AgentsFill {
     latest: AgentRun | null,
     taskText: string,
     report: StructuredReport | null = null,
+    options: { record?: boolean } = {},
   ): Promise<{ retry: boolean; expired: boolean; since: number; problems: string[] } | null> {
     const { store, project, settings, probes } = this.options;
     if (!settings.readyGuard) return null;
@@ -2223,7 +2238,8 @@ export class AgentsFill {
       verdict = refuseReport("no_pr", "the task is about a pull request but the line names none", "Report again with `PR #<n> at <sha>` for the PR you opened.");
     } else {
       pr = parsed.report.pr;
-      repo = parsed.report.repo;
+      // Without a source the repository is a placeholder (NO_SOURCE_REPOS): events say none
+      repo = source ? parsed.report.repo : null;
       name = prName(parsed.report, repos);
       // A repository whose host is down holds only the reports about that repository
       const hostKey = parsed.report.repo.toLowerCase();
@@ -2241,8 +2257,9 @@ export class AgentsFill {
     }
     if (verdict.ok) return null;
     const hash = createHash("sha256").update(line).digest("hex").slice(0, 16);
+    const record = options.record !== false;
     if (!verdict.retry) {
-      await this.options.record(
+      if (record) await this.options.record(
         "fill_report_refused",
         {
           agent,
@@ -2263,7 +2280,7 @@ export class AgentsFill {
       .listEvents(project, { kinds: ["fill_report_waiting"], task, limit: 20 })
       .find((e) => e.data.lineHash === hash && (e.data.runId ?? null) === runId);
     const since = first?.at ?? now;
-    if (!first) {
+    if (!first && record) {
       await this.options.record(
         "fill_report_waiting",
         {
@@ -2431,7 +2448,7 @@ export class AgentsFill {
     until: QueueMark | undefined,
   ): Promise<RunStatus | null> {
     const { settings, store, project, probes } = this.options;
-    const seen = queue.lastStatus(
+    const seen = await queue.lastStatus(
       fillPatternFor(settings.waitingPattern, task, agent),
       fillPatternFor(settings.blockedPattern, task, agent),
       { task, agent },
@@ -2518,7 +2535,7 @@ export class AgentsFill {
       if (seen.has("fill_weak")) return stale;
       const pollKey = `${task}|${latest.id}`;
       this.waitingSeen.add(pollKey);
-      const found = this.wakeFile(pollKey, file, now);
+      const found = await this.wakeFile(pollKey, file, now);
       const path = file;
       const note = (kind: "fill_wake_absent" | "fill_weak", summary: string) =>
         this.options.record(
@@ -2529,7 +2546,7 @@ export class AgentsFill {
       if (found.state === "absent") {
         await note("fill_wake_absent", `fill: ${file} isn't there yet: ${agent} waits on it for ${task}`);
         // Its gate re-queued under a new id (wake.requeue_marker): that run's result, newer than the chain, wakes it too
-        const requeued = status.wake !== null ? this.requeuedResult(status.wake, this.chainStart(latest)) : null;
+        const requeued = status.wake !== null ? await this.requeuedResult(status.wake, this.chainStart(latest)) : null;
         if (requeued !== null) return { kind: "woken", file: requeued, named };
       }
       if (found.state !== "present") {
@@ -2590,13 +2607,13 @@ export class AgentsFill {
    * re-queue marker says it became (the newest first). null for a wake that
    * isn't a plain name, or a gate the queue no longer has.
    */
-  private queuedGate(wake: string | null, gateQueue: () => Map<string, QueuedRequest>): QueuedGate | null {
+  private async queuedGate(wake: string | null, gateQueue: () => Promise<Map<string, QueuedRequest>>): Promise<QueuedGate | null> {
     if (wake === null || !isPlainWake(wake)) return null;
-    const queue = gateQueue();
+    const queue = await gateQueue();
     let gate = wake;
     let request = queue.get(wake);
     if (!request) {
-      for (const id of this.requeuedIds(wake).slice(1).reverse()) {
+      for (const id of (await this.requeuedIds(wake)).slice(1).reverse()) {
         request = queue.get(id);
         if (request) {
           gate = id;
@@ -2607,7 +2624,7 @@ export class AgentsFill {
     if (!request) return null;
     let since: number;
     try {
-      since = lstatSync(request.path).mtimeMs;
+      since = (await lstat(request.path)).mtimeMs;
     } catch {
       return null; // it left the queue since the listing
     }
@@ -2681,7 +2698,7 @@ export class AgentsFill {
    * regular file inside wake.root (not a symlink) whose first line is a
    * plain name; any other is passed over. Without the setting: its own only.
    */
-  private requeuedIds(wake: string): string[] {
+  private async requeuedIds(wake: string): Promise<string[]> {
     const template = this.options.settings.wake.requeueMarker;
     const ids = [wake];
     if (!template) return ids;
@@ -2692,7 +2709,7 @@ export class AgentsFill {
       for (const n of ns) {
         const marker = this.templatePath(template, ids[i], n);
         if (!marker.ok) continue;
-        const next = firstLineOf(marker.path, MARKER_MAX_BYTES);
+        const next = await firstLineOf(marker.path, MARKER_MAX_BYTES);
         if (next === null || !isPlainWake(next) || ids.includes(next)) continue;
         ids.push(next);
         if (ids.length >= MAX_REQUEUE_IDS) break;
@@ -2702,13 +2719,13 @@ export class AgentsFill {
   }
 
   /** The wake file of an id the waiting line's gate was re-queued as, when it exists and is newer than `after`. */
-  private requeuedResult(wake: string, after: number): string | null {
+  private async requeuedResult(wake: string, after: number): Promise<string | null> {
     if (!isPlainWake(wake) || !this.options.settings.wake.file) return null;
-    for (const id of this.requeuedIds(wake).slice(1)) {
+    for (const id of (await this.requeuedIds(wake)).slice(1)) {
       const resolved = this.wakePath(id);
       if (!resolved.ok) continue;
       try {
-        if (lstatSync(resolved.path).mtimeMs > after) return resolved.path;
+        if ((await lstat(resolved.path)).mtimeMs > after) return resolved.path;
       } catch {
         // Not there yet
       }
@@ -2747,15 +2764,15 @@ export class AgentsFill {
   }
 
   /** The wake file, looked for at most every wake.poll_seconds per waiting run ("unchecked" in between). */
-  private wakeFile(
+  private async wakeFile(
     key: string,
     path: string,
     now: number,
-  ): { state: "present"; mtimeMs: number } | { state: "absent" } | { state: "unchecked" } {
+  ): Promise<{ state: "present"; mtimeMs: number } | { state: "absent" } | { state: "unchecked" }> {
     const last = this.polled.get(key);
     if (last !== undefined && now - last < this.options.settings.wake.pollSeconds * 1000) return { state: "unchecked" };
     try {
-      const mtimeMs = lstatSync(path).mtimeMs;
+      const mtimeMs = (await lstat(path)).mtimeMs;
       this.polled.delete(key);
       return { state: "present", mtimeMs };
     } catch {

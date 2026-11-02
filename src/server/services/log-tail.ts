@@ -9,8 +9,8 @@
  * symlink and without blocking (a FIFO where a log should be can't hang
  * the server), and only a regular file is read.
  */
-import { closeSync, constants, fstatSync, openSync, readSync } from "fs";
 import { basename } from "path";
+import { readTail, type TailRead } from "./async-fs.js";
 import { redact } from "../delivery/redact.js";
 import type { LogTailView } from "../../shared/dashboard-types.js";
 
@@ -28,31 +28,9 @@ export function clampLines(value: unknown): number {
   return Math.min(MAX_TAIL_LINES, Math.max(1, Math.floor(n)));
 }
 
-/** The last `maxBytes` of a regular file, with its size and time; null when it is not one. */
-export function readTailBytes(
-  path: string,
-  maxBytes: number = MAX_TAIL_BYTES,
-): { text: string; size: number; mtime: Date; partial: boolean } | null {
-  let fd: number | null = null;
-  try {
-    const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
-    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | noFollow);
-    const stat = fstatSync(fd);
-    if (!stat.isFile()) return null;
-    const length = Math.min(stat.size, Math.max(0, maxBytes));
-    const buffer = Buffer.alloc(length);
-    const read = readSync(fd, buffer, 0, length, stat.size - length);
-    return {
-      text: buffer.subarray(0, read).toString("utf-8"),
-      size: stat.size,
-      mtime: stat.mtime,
-      partial: stat.size > length,
-    };
-  } catch {
-    return null;
-  } finally {
-    if (fd !== null) closeSync(fd);
-  }
+/** The last `maxBytes` of a regular file (no symlink), with its size and time; null when it is not one. */
+export function readTailBytes(path: string, maxBytes: number = MAX_TAIL_BYTES): Promise<TailRead | null> {
+  return readTail(path, maxBytes, true);
 }
 
 /**
@@ -69,8 +47,8 @@ export function tailLines(text: string, count: number, partial = false): { lines
 }
 
 /** A log file's tail as the dashboard shows it, or null when there is no such regular file. */
-export function readLogTail(path: string, count: number = DEFAULT_TAIL_LINES): LogTailView | null {
-  const read = readTailBytes(path);
+export async function readLogTail(path: string, count: number = DEFAULT_TAIL_LINES): Promise<LogTailView | null> {
+  const read = await readTailBytes(path);
   if (!read) return null;
   const { lines, truncated } = tailLines(read.text, count, read.partial);
   return {

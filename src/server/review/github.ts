@@ -83,6 +83,7 @@ interface GhFile {
 interface GhPerson {
   name?: string;
   email?: string;
+  date?: string;
 }
 
 interface GhCommit {
@@ -201,12 +202,8 @@ export class GitHubHost implements GitHost {
       this.blockedUntil = now + Math.min(Math.max(waitMs, 1000), 15 * 60_000);
     }
     if (!response.ok && !(options.allow404 && response.status === 404)) {
-      let message = text.slice(0, 200);
-      try {
-        const parsed = JSON.parse(text) as { message?: unknown };
-        if (typeof parsed.message === "string") message = parsed.message;
-      } catch {}
-      throw new HostError(`GitHub ${method} ${path.split("?")[0]}: ${response.status} ${message}`, response.status);
+      // The status only: a response body is host text, kept out of errors, logs and statuses
+      throw new HostError(`GitHub ${method} ${path.split("?")[0]}: ${response.status}`, response.status);
     }
     return { status: response.status, text };
   }
@@ -262,6 +259,7 @@ export class GitHubHost implements GitHost {
           sha: c.sha,
           author: person(c.commit.author),
           committer: person(c.commit.committer),
+          committedAt: typeof c.commit.committer?.date === "string" ? c.commit.committer.date : null,
           message: c.commit.message ?? "",
         });
       }

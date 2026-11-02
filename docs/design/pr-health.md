@@ -21,7 +21,7 @@ Lair already reads PRs (the review module and the ready guard) and the agents' t
 5. As the owner, I get a Decision Inbox notice only when no agent owns the PR, or when its note could not be delivered. The notice goes away by itself once the problem clears.
 6. As the owner, a repository whose hosted CI does not work (it is disabled, or every run fails for billing reasons) produces no CI noise. Its conflicts and behind problems are still reported.
 7. If the git host times out, rate-limits Lair or fails for one repository, the other repositories are still watched. Nothing about the failing one is cleared or re-sent when it recovers.
-8. As the owner, I exclude PRs (`ignored_prs`) and bot branches (`ignored_branches`, `dependabot/*` by default) from PR health.
+8. As the owner, I exclude PRs (`ignored_prs`) and bot branches (`ignored_branches`, `dependabot/**` by default) from PR health.
 
 ## 3. Scope
 
@@ -203,7 +203,7 @@ interface NoteRecord {
   attempts: number; lastAttemptAt: number; nextAttemptAt: number | null; lastError: string | null;
   argv: string[];
   sentAt: number | null;
-  withdraw: null | { status: "running" | "done" | "skipped" | "failed" | "gave_up"; attempts: number;
+  withdraw: null | { status: "running" | "done" | "skipped" | "failed" | "gave_up"; why: "fixed" | "head_moved" | "closed" | "ignored"; attempts: number;
                      lastAttemptAt: number; nextAttemptAt: number | null; lastError: string | null };
 }
 ```
@@ -221,7 +221,7 @@ On load, a `running` note or withdrawal becomes `failed` with "interrupted by a 
 - A kind that clears and comes back at the same head is not noted again, as the script's seen-file rule did. Its status still shows it.
 
 **Withdrawals.** A `sent` record is withdrawn once it is cleared. A record is cleared when one of these holds, judged from the ledger and this process's reads, not from findings that existed before a restart:
-- a successful list of its repository no longer has the PR (closed or merged);
+- a successful list of its repository no longer has the PR (closed or merged), or now skips it (`ignored`: it became ignored or targets another base);
 - a successful read shows the PR's head is no longer the record's `head` (the head moved);
 - successful reads of the PR at the record's head have found none of the record's kinds open for `clear_minutes`, counted from the first such read.
 
@@ -275,7 +275,7 @@ Deduplication follows `syncNotices` (`infra-monitor/service.ts:222-275`):
 | `clear_minutes` | int | 10 | 0-1440 |
 | `kinds.{conflicts,behind,no_ci,ci_red}` | bool | `true` | |
 | `ignored_prs` | string[] | `[]` | `owner/name#N` with a repository listed in `repos`, ≤ 200 entries |
-| `ignored_branches` | string[] | `["dependabot/*"]` | `compileBranchGlob` syntax, ≤ 50 |
+| `ignored_branches` | string[] | `["dependabot/**"]` | `compileBranchGlob` syntax, ≤ 50. The default is `**`, not `*`: `*` stays within one path segment, and bot branches have several (`dependabot/npm_and_yarn/x`) |
 | `owner.branch_window_minutes` | int | 360 | 0-10080 (0: no branch rule) |
 | `notify_cmd` | argv \| null | `null` | `Argv` as in `infra-monitor/config.ts:19-23`; only the placeholders below |
 | `withdraw_cmd` | argv \| null | `null` | same |

@@ -414,6 +414,12 @@ export class GitHubTrackerClient {
       .sort((a, b) => a.number - b.number);
   }
 
+  /** The open issues (not pull requests), the most recently updated first: one page of `perPage` */
+  async listOpenIssues(repo: string, perPage: number): Promise<Issue[]> {
+    const list = await this.rest<GhIssue[]>("GET", `/repos/${repo}/issues?state=open&sort=updated&direction=desc&per_page=${perPage}`);
+    return (list ?? []).map(issueOf).filter((issue) => !issue.isPullRequest && issue.state === "open");
+  }
+
   /**
    * The issue whose body carries `marker`, among the issues created or
    * changed since `since` (the issues list, which never lags behind a

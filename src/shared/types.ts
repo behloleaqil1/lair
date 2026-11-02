@@ -166,6 +166,18 @@ export interface ProjectConfig {
    */
   infra_monitor?: Record<string, unknown>;
   /**
+   * PR health: open pull requests that conflict, fall behind, get no CI or
+   * go red (src/server/pr-health/). Validated by parsePrHealthConfig; see
+   * docs/configuration.md#pr-health
+   */
+  pr_health?: Record<string, unknown>;
+  /**
+   * The work store: tasks and their events in Lair's database
+   * (src/server/work/). Validated by parseWorkStoreConfig; see
+   * docs/configuration.md#work-store
+   */
+  work_store?: Record<string, unknown>;
+  /**
    * Agent checks: agents test on a runner before they gate
    * (src/server/checks/). Validated by parseChecksConfig; see
    * docs/configuration.md#checks
@@ -645,6 +657,11 @@ export interface AgentAdapter {
   version_cmd?: string[];
   /** Not verified end to end: its flags and conventions may need adapting */
   experimental?: boolean;
+  // AI spend (agents.spend, docs/configuration.md "AI spend"):
+  /** How an ended run's usage is read from its log; default: patterns with agents.usage_patterns, else the built-in default */
+  usage_parser?: "claude-stream-json" | "claude-json" | "request-lines" | "patterns" | "none";
+  /** usage_parser request-lines: a regular expression (case-sensitive, at most 500 characters) for one model request */
+  request_pattern?: string;
 }
 
 /** How a tool's models_cmd output is read (src/server/ai/parsers.ts). */

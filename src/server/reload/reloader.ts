@@ -26,6 +26,7 @@ import type { ProjectConfig } from "../../shared/types.js";
 import type { ConfigProblem, ConfigReload, ConfigStatusView } from "../../shared/lifecycle-types.js";
 import { PROJECTS_DIR, getConfigPath, isSafeProjectName, listProjects, loadProjectConfig } from "../config.js";
 import { DirWatch, type WatchFn } from "../services/dir-watch.js";
+import { parseReposConfig } from "../repos/config.js";
 import { fingerprint, type ProjectEntry, type ReloadableModule } from "./modules.js";
 
 export interface ConfigReloaderOptions {
@@ -241,10 +242,13 @@ export class ConfigReloader {
    * What keeps `config` from being taken ([] when nothing does): every
    * module's own parser, and that its part of the config can be compared.
    * apply() checks a changed file with it, and Settings checks a change
-   * before writing it.
+   * before writing it. The shared repository list (repos:) belongs to no
+   * one module, so it is checked here: an invalid one is the project's
+   * problem, shown on the banner.
    */
   validate(config: ProjectConfig): string[] {
-    const errors: string[] = [];
+    const repos = config.repos === undefined ? null : parseReposConfig(config);
+    const errors: string[] = repos && !repos.ok ? [...repos.errors] : [];
     for (const module of this.options.modules) {
       try {
         errors.push(...module.validate(config));

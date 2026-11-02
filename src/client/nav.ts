@@ -98,6 +98,8 @@ const TABS: Record<SectionId, readonly TabDef[]> = {
   home: [
     { id: null, label: "Overview", needs: null, enable: "" },
     { id: "activity", label: "Activity", needs: null, enable: "" },
+    // The fleet bus (bus.consume): while it is off the tab says how to turn it on
+    { id: "bus", label: "Bus", needs: null, enable: "" },
     // Lair's self-checks are always there; the watchdog's part says how to turn it on
     { id: "health", label: "Health", needs: null, enable: "" },
   ],

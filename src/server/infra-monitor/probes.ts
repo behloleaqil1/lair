@@ -29,6 +29,8 @@ export interface CommandOutput {
 export interface RunOptions {
   timeoutMs: number;
   signal?: AbortSignal;
+  /** Working directory (default: the server's) */
+  cwd?: string;
 }
 
 /** Runs a command from an argv array. Never through a shell. */
@@ -79,7 +81,7 @@ export class SpawnRunner implements CommandRunner {
       let settled = false;
       let child: ReturnType<typeof spawn>;
       try {
-        child = spawn(file, args, { shell: false, detached: true, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+        child = spawn(file, args, { cwd: options.cwd, shell: false, detached: true, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
       } catch (e) {
         resolve({ code: -1, stdout: "", stderr: e instanceof Error ? e.message : String(e), timedOut: false });
         return;

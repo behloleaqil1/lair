@@ -17,8 +17,10 @@
 import type { EventBus } from "../core/event-bus.js";
 import type { BusStore, BusReport, BusMessage } from "./store.js";
 import type { BusTokenBinding } from "./tokens.js";
+import { redactBusTokens } from "./tokens.js";
 import type { ReportKind } from "../../bus/types.js";
 import { BusMirror, type BusMirrorConfig } from "./mirror.js";
+import { BUS_SUMMARY_MAX } from "../../shared/bus-live.js";
 
 // ============ Special IDs ============
 
@@ -177,7 +179,8 @@ export class BusService {
     }
 
     const now = Date.now();
-    const sanitizedSummary = sanitizeText(summary, MAX_SUMMARY_CHARS);
+    // No bus token in a summary: the board, the mirror files and the live channel show it to every reader
+    const sanitizedSummary = redactBusTokens(sanitizeText(summary, MAX_SUMMARY_CHARS));
 
     const id = this.store.createReport(
       binding.agent,
@@ -200,7 +203,9 @@ export class BusService {
 
     // Emit event
     if (this.events) {
-      this.events.emit("bus.report", { project: binding.project, id, agent: binding.agent, kind, task, gateId, pr, sha });
+      // The summary only as far as the dashboard shows it (src/server/bus/live.ts): the event bus keeps recent events
+      const summary = sanitizedSummary.slice(0, BUS_SUMMARY_MAX);
+      this.events.emit("bus.report", { project: binding.project, id, agent: binding.agent, kind, task, gateId, pr, sha, summary });
     }
 
     // Wake on DONE or BLOCKED
@@ -216,6 +221,9 @@ export class BusService {
   inbox(binding: BusTokenBinding): BusResult<InboxMessage[]> {
     const now = Date.now();
     const messages = this.store.getUnreadMessages(binding.agent, now);
+    if (this.events && messages.length > 0) {
+      void this.events.emit("bus.message_read", { project: binding.project, agent: binding.agent, ids: messages.map((m) => m.id) });
+    }
 
     return {
       ok: true,
@@ -235,6 +243,9 @@ export class BusService {
     const now = Date.now();
     const sanitizedNote = note ? sanitizeText(note, 1000) : undefined;
     const acked = this.store.ackMessage(messageId, binding.agent, sanitizedNote, now);
+    if (acked && this.events) {
+      void this.events.emit("bus.message_acked", { project: binding.project, agent: binding.agent, id: messageId });
+    }
 
     if (!acked) {
       // Check if the message exists

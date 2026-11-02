@@ -99,9 +99,9 @@ describe("section tabs", () => {
       "Locks and budget",
     ]);
     expect(tabAvailable("work", "planner", OFF)).toBe(false);
-    // Health always: Lair's self-checks, with the watchdog's part when it is on
-    expect(visibleTabs("home", OFF).map((t) => t.id)).toEqual([null, "activity", "health"]);
-    expect(visibleTabs("home", { ...OFF, watchdog: true }).map((t) => t.id)).toEqual([null, "activity", "health"]);
+    // Health always: Lair's self-checks, with the watchdog's part when it is on; Bus always: it says when the bus is off
+    expect(visibleTabs("home", OFF).map((t) => t.id)).toEqual([null, "activity", "bus", "health"]);
+    expect(visibleTabs("home", { ...OFF, watchdog: true }).map((t) => t.id)).toEqual([null, "activity", "bus", "health"]);
     expect(tabAvailable("gates", "triage", OFF)).toBe(false);
     expect(tabAvailable("gates", "results", OFF)).toBe(true);
   });

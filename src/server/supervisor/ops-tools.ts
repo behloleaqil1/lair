@@ -165,7 +165,7 @@ function runsGet(project: string, args: Args, s: OpsSources) {
   return { project, agent, runs };
 }
 
-function logsTail(project: string, args: Args, s: OpsSources) {
+async function logsTail(project: string, args: Args, s: OpsSources) {
   const agent = str(args.agent);
   const gate = str(args.gate);
   if ((agent === undefined) === (gate === undefined)) throw new OpsError(400, "give one of agent or gate");
@@ -177,24 +177,24 @@ function logsTail(project: string, args: Args, s: OpsSources) {
       : null;
   if (agent !== undefined) {
     if (!isValidDragonId(agent)) throw new OpsError(400, "agent is not an agent id");
-    const view = agentLogTail(s.dashboard, project, agent, lines);
+    const view = await agentLogTail(s.dashboard, project, agent, lines);
     return { project, agent, source: view.source, runId: view.runId, log: clean(view.log) };
   }
   if (!isSafeGateId(gate)) throw new OpsError(400, "gate is not a gate id");
-  const found = lookUpGate(s.dashboard, project, gate);
+  const found = await lookUpGate(s.dashboard, project, gate);
   if (!found) throw new OpsError(404, `no gate ${gate} in ${project}`);
-  return { project, gate, log: clean(gateLogTail(s.dashboard, project, gate, found, lines)) };
+  return { project, gate, log: clean(await gateLogTail(s.dashboard, project, gate, found, lines)) };
 }
 
-function gatesResult(project: string, args: Args, s: OpsSources) {
+async function gatesResult(project: string, args: Args, s: OpsSources) {
   if (!s.dashboard) throw new OpsError(503, "the dashboard's readers aren't available");
   const id = str(args.id);
   if (id === undefined) {
-    const results = s.dashboard.data(project).getRecentGateResults(num(args.hours, 24), num(args.limit, 20));
+    const results = await s.dashboard.data(project).getRecentGateResults(num(args.hours, 24), num(args.limit, 20));
     return { project, results };
   }
   if (!isSafeGateId(id)) throw new OpsError(400, "id is not a gate id");
-  const found = lookUpGate(s.dashboard, project, id);
+  const found = await lookUpGate(s.dashboard, project, id);
   if (!found) throw new OpsError(404, `no gate ${id} in ${project}: not in the queue, the results, the pipeline runs or triage`);
   return {
     project,

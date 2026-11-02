@@ -144,7 +144,8 @@ export async function registerAgentsRoutes(
       const service = serviceOf(reply, projectOf(query.data));
       if (!service) return reply;
       try {
-        const run = await service.requestRun(body.data);
+        // The owner's own run: its AI spend record says so
+        const run = await service.requestRun(body.data, { origin: "owner" });
         reply.code(201);
         return respond(run);
       } catch (e) {

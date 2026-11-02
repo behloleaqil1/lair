@@ -49,8 +49,19 @@ export type SessionMode = "new" | "resume" | "fresh";
 
 export type StopReason = "hung" | "failover" | "lost_claim" | "fresh_session" | "server_shutdown";
 
-/** What started a run's chain, when not the owner or another module: "fill" (agents.fill) */
-export type RunOrigin = "fill";
+/**
+ * What started a run's chain: "fill" (agents.fill), "review" (the review module's agent assigner), "planner" and
+ * "verifier" (the planner), "supervisor" (the supervisor's chat and digest), "owner" (POST /api/agents/runs). A run
+ * recorded before its module set one has none: the AI spend record then goes by the task id's prefix.
+ */
+export type RunOrigin = "fill" | "review" | "planner" | "verifier" | "supervisor" | "owner";
+
+/**
+ * How an ended run's usage is read from its log (agent_adapters.<id>.usage_parser, docs/design/ai-spend.md §4.1):
+ * claude-stream-json / claude-json: the CLI's own `result` events (tokens, cost, turns); request-lines: lines matching
+ * the adapter's request_pattern (requests only); patterns: agents.usage_patterns, read while the run works; none.
+ */
+export type UsageParserKind = "claude-stream-json" | "claude-json" | "request-lines" | "patterns" | "none";
 
 /** One way to run an agent: an adapter (CLI), a model, and the provider it bills. */
 export interface AgentProfile {
@@ -161,7 +172,13 @@ export type AgentEventKind =
   | "transient_cleared"
   | "run_adopted"
   | "run_lost"
-  | "stopped_for_shutdown";
+  | "stopped_for_shutdown"
+  /** A guard in observe mode reached a verdict and changed nothing (docs/design/ai-spend.md §4.5) */
+  | "guard_would"
+  /** A guard in act mode did what it describes */
+  | "guard_did"
+  /** An ended run's usage was read but refused (over a cap, unreadable): the run's spend row says not reported */
+  | "usage_refused";
 
 /** Recovery and audit record: what happened, why, and the evidence. */
 export interface AgentEventView {

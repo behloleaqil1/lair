@@ -396,6 +396,8 @@ An adapter (a preset, or one of your `agent_adapters`) may set these keys:
 | `login_hint` | string | What you run in a terminal to sign in, shown as the fix. Lair never runs it |
 | `version_cmd` | array | Prints the tool's version: an argv |
 | `experimental` | boolean | Shown as experimental |
+| `usage_parser` | `claude-stream-json` \| `claude-json` \| `request-lines` \| `patterns` \| `none` | How an ended run's usage is read from its log, with [AI spend](#ai-spend) on. Unset: `patterns` when `agents.usage_patterns` is set, else the built-in default (`request-lines` for an adapter with the id `kiro`, built in or your own), else `none`. An adapter of another id that wraps a CLI (a start script, say) sets `usage_parser` and, for `request-lines`, `request_pattern` itself. Use `claude-stream-json` with a Claude Code start command that has `--output-format stream-json --verbose` |
+| `request_pattern` | string | With `request-lines`: a regular expression (case-sensitive, at most 500 characters, tested line by line) for one model request; one that takes over 100 ms on a short line (nested quantifiers) is refused at load. The `kiro` default is `GenerateAssistantResponseCommand done totalEvents=\d+`, the CLI's line for each finished request |
 
 These commands are run as written: argv arrays, never through a shell, with no `{placeholder}` and a program that doesn't start with `-` (a config error otherwise). Each runs with at most 256 KiB of output and a timeout (5 seconds for a sign-in check, 15 for the others), in the environment an agent of the project gets (`PATH`, `HOME` and the like, plus `agents.env_passthrough`), never the rest of Lair's. Lair never reads a tool's token files: the tool's own check answers. A check's answer is:
 
@@ -823,6 +825,7 @@ Every route that changes something only you should change needs the owner's sess
 | `/api/health/diagnostics`, `/api/supervisor` | everything: the self-checks' results, minting, listing and revoking ops tokens, their audit ([Supervisor API](#supervisor-api)) | nothing (`/api/health` itself stays open) |
 | `/api/ops` | nothing: it takes an [ops token](#the-ops-api), never the owner's session, and grants no CORS | — |
 | `/api/host-services/owner` | the tick, which runs start commands in act mode ([Host services API](#host-services-api)) | the status, the holds and the hold check under `/api/host-services` |
+| `/api/work` | everything: the work store's status, tasks and events, and imports ([Work store](#work-store)) | nothing |
 
 The watchdog's routes are all reads; it acts only inside the server. Lair's own work doesn't go through these routes either: delivery's automatic deploys, the scheduler, the healer and the watchdog's playbooks run inside the server, server code starts pipeline runs with `PipelineManager.startRun` and creates tasks with the job manager, and agents use the fleet bus (`npm run bus`), which works on the bus database directly. The `lair-node` daemon connects over `/ws/node`, not these routes.
 
@@ -1393,7 +1396,7 @@ Globs use `**` (any directories), `*`, `?` and `{a,b}`; a glob without `/` match
 | `agent:<id>` | That reviewer agent, never the author; the author must be known (an unknown author may be that very agent) |
 | `peer` | Any reviewer, agent or human, other than the author |
 | `self` | The author's own review (its self-check) |
-| `{any_of: [...], different_model: true}` | Any of the listed ones; with `different_model`, an agent on a model other than the author's (a human always qualifies). `pool: [ids]` names the reviewer agents for this slot ([Reviews by agents](#reviews-by-agents)) |
+| `{any_of: [...], different_model: true}` | Any of the listed ones; with `different_model`, an agent on a model other than the author's (a human always qualifies). `pool: [ids]` names the reviewer agents for this slot ([Reviews by agents](#reviews-by-agents)). `ask_after: [gate, earlier_slots]` (either or both) asks for the slot only once the gate passed at the head and/or every earlier slot of the tier is approved there ([Staged slots](#staged-slots)) |
 
 Defaults: `red: [human]`, `amber: [peer]`, `green: [self]`. Only an `approve` given at the PR's current head sha counts; a push makes every older review stale, and a reviewer's later review replaces its earlier one. The author is the agent Lair's own modules registered for the PR (the agent assigner or intake; never settable over HTTP), else the agent the branch mappings name (`authors.branch_pattern`, `authors.branches` and `authors.from_tasks_file`, see [Reviews by agents](#reviews-by-agents)); its model comes from `dragons:` or `authors.models`. `branch_pattern` is a template, not a regular expression: `{agent}` (exactly once) is an agent id, `*` matches within one path segment and `**` (at most once) across segments, and everything else is literal, so `agent/{agent}/**` reads `worker-a` from `agent/worker-a/fix-login`. Branch names longer than 255 characters never match. With no author, no agent slot (`agent:<id>`, `peer`, `self`) and no `different_model` can be satisfied, no agent is asked to review, and the status says why (`authorNote`).
 
@@ -1551,11 +1554,28 @@ The runner sends `--pipeline <id>` and `--pipeline-version <version>` with each 
 
 ### Reviewers and the Decision Inbox
 
-`POST /api/review/prs/:number/request-reviews` (owner only: asking can start reviewer runs) asks for every missing review at the head, once per head: a named or peer reviewer agent, or the author's self-check, through the agent assigner, and a human through the Decision Inbox. A slot is asked for again at the same head only after its assignee reviewed without filling it (for example on the author's model when `different_model` is set), as a new round: the earlier rounds' records stay. A round is written, with its token's hash, before the assigner is called; one that Lair never finished handing on (it stopped in between, or the assigner failed) doesn't count after 10 minutes, so the slot can be asked for again. When the PR gets a new head, the human reviews asked for at the old one are withdrawn from the Decision Inbox, so only the current head's request stays open.
+`POST /api/review/prs/:number/request-reviews` (owner only: asking can start reviewer runs) asks for every missing review at the head, once per head: a named or peer reviewer agent, or the author's self-check, through the agent assigner, and a human through the Decision Inbox. A slot still waiting on its `ask_after` is skipped, and the response says so ([Staged slots](#staged-slots)). A slot is asked for again at the same head only after its assignee reviewed without filling it (for example on the author's model when `different_model` is set), as a new round: the earlier rounds' records stay. A round is written, with its token's hash, before the assigner is called; one that Lair never finished handing on (it stopped in between, or the assigner failed) doesn't count after 10 minutes, so the slot can be asked for again. When the PR gets a new head, the human reviews asked for at the old one are withdrawn from the Decision Inbox, so only the current head's request stays open.
 
 Each agent assignment carries a random token, which the assigner must hand only to the agent doing the review; Lair stores only its hash, recorded before the assigner is called. A token counts for **one** review: a second review with it is refused (403), and so is a review under an assignment that a later request replaced. An assignment for a named agent (or the author's self-check) is that agent's, and a review under it must name that agent; one for any peer binds to the first agent, other than the author, that reviews with it.
 
 A project with [reviews by agents](#reviews-by-agents) has its named and peer reviews done by agents Lair starts; otherwise, and for self-checks, agent requests are published on the event bus as `review.assignment_requested`. The assignment event carries the token, and the event bus is internal to the server: it is not served over HTTP. The review module's decisions (a human review, a refused merge, no agent review) are raised in the [Decision Inbox](#decision-inbox) as module `review`. Other events: `review.submitted`, `review.invalidated` (a push made reviews stale), `review.merged`, `review.merge_refused`.
+
+### Staged slots
+
+An expensive reviewer (a strong model, a busy human) should review only work that is a real candidate. A slot in object form can set `ask_after`, a list with either or both of:
+
+- `gate`: ask for the slot only once the merge gate passed at the PR's current head (the merge policy's rule: every required check passed, for the head; signed results where `merge.gate.source: signed`);
+- `earlier_slots`: ask only once every earlier slot in the same tier list is filled by an approval at the head.
+
+```yaml
+review:
+  reviewers:
+    red:
+      - { any_of: [peer], pool: [reviewer-a, reviewer-b] }
+      - { any_of: [peer], different_model: true, pool: [strong-reviewer], ask_after: [gate, earlier_slots] }
+```
+
+Until its condition holds at the head, a missing slot is `waiting`: it is not asked for (no round, no token, no attempt, no run, no Decision Inbox item). The PR's status shows the reason on the slot (`slots[i].waiting`, also in its `detail`) and in `assignments` as state `waiting`, and the dashboard's "Required reviews" table shows it. Lair looks again at a waiting slot on the scan every minute (at most 10 PRs per scan, the ones looked at longest ago first; a project with [reviews by agents](#reviews-by-agents)), and at once when a gate result is stored for the head or an approval arrives for it; then only the waiting slots are asked, so the other slots are still asked once per head. A new head starts over, and the condition is checked at the new head. The owner's "Request missing reviews" skips waiting slots too: their outcome's channel is `waiting`, with the reason. Merge rules don't change: a waiting slot is a missing one, and a `request_changes` from any reviewer blocks the merge. Without `ask_after` a slot is asked as soon as it is missing. An unknown value, a value listed twice, an empty list and `earlier_slots` on a tier's first slot are config errors.
 
 ### Reviews by agents
 
@@ -1621,7 +1641,7 @@ The model recorded with the review is the one of the profile the run actually ru
 
 **Retries and decisions.** A run can end without a review: it exited without submitting, crashed past the agents module's own recovery, or was escalated. Then the slot is retried with a new token (the old one stops working) after `retries.backoff_seconds`, doubling up to `retries.max_backoff_seconds`, by an agent that hasn't tried yet when there is one. After `retries.max_attempts` runs the slot fails and Lair raises an `escalation` decision in the Decision Inbox ("No agent reviewed PR #n at <sha>"); only the owner's "Request missing reviews" starts a new round. A push or a closed PR makes the open assignments `stale`: nothing more starts for that head, and a review run still going is stopped (its claim is released, and the agents module stops it on its next check). The state is in `data/review.db` (schema version 2), so a restart carries on where it stopped.
 
-**Status.** A PR's "Required reviews" table (PRs section) shows each slot's request, read-only: `requested` (with the retry time), `assigned to <agent>` (the run and the attempt), `reviewed by <agent>`, `failed` or `stale`, with the detail. `GET /api/review/prs/:number` returns the same as `assignments`.
+**Status.** A PR's "Required reviews" table (PRs section) shows each slot's request, read-only: `requested` (with the retry time), `assigned to <agent>` (the run and the attempt), `reviewed by <agent>`, `failed`, `stale` or `waiting` ([staged slots](#staged-slots)), with the detail. `GET /api/review/prs/:number` returns the same as `assignments`.
 
 **Authors.** A peer review needs to know who wrote the PR. Besides `authors.branch_pattern`, which reads an agent id carried in the branch name:
 
@@ -1679,7 +1699,20 @@ A run is requested for an agent (a `dragons:` entry or a `dragons.txt` line) and
   - when a fleet outage has lasted `transient_max_minutes` with runs waiting on it, Lair raises **one** decision for the project, per provider and outage, never one per agent or task: "Keep waiting" (recommended) or "Try now", which lets every waiting run start on the next check. While it is open nothing more is raised. After "Keep waiting", Lair asks again once the outage has lasted another `transient_max_minutes`.
 
   The defaults look for an error, not a word alone, because an agent's own output (its tests, say) is in the same log: `expected 503 to equal 200` or a word like `TRANSIENT` in prose is not an outage. Tune them to your agent CLIs' output.
-- **Budgets.** Token and cost limits per UTC day and month, for the project (`budgets.project`) and for each agent (`budgets.agent`, overridden per metric by `budgets.per_agent.<id>`). Usage comes from the fleet budget: every cost recorded there with a project (and agent) is counted, including the usage Lair reads from run logs with `usage_patterns` (named groups `tokens` and `cost`, each match adds), which it records through the fleet budget. A soft limit is a `budget_warning`, once per period. A hard limit stops new runs and restarts for that scope (running agents continue) and raises a `spend` decision, once per period. **These budgets are advisory** while usage comes from run logs: the agent writes that text, so it can under-report (amounts are never counted below zero). They become reliable once providers or adapters report usage to the fleet budget themselves; keep a spending limit at the provider too.
+- **Budgets.** Token and cost limits per UTC day and month, for the project (`budgets.project`) and for each agent (`budgets.agent`, overridden per metric by `budgets.per_agent.<id>`). Usage comes from the agents ledger: every cost the fleet budget records with a project (and agent), the usage Lair reads from run logs with `usage_patterns` (named groups `tokens` and `cost`, each match adds), and, with [AI spend](#ai-spend) on, the usage each ended run's adapter reports. A soft limit is a `budget_warning`, once per period. A hard limit stops new runs and restarts for that scope (running agents continue) and raises a `spend` decision, once per period. `budgets.guard_mode` doesn't change that: it is the mode of the request and minute limits AI spend adds (a later part).
+
+  **With AI spend on, more usage counts.** Before it, a hard limit counted only `usage_patterns` and what the fleet budget recorded with a project; with `agents.spend.enabled` and an adapter that reports usage (`usage_parser`), every such run's tokens and cost count too, so a limit that was never reached may now be, and block. Check your limits before you turn spend on. **These budgets are advisory** while usage comes from run logs: the agent writes that text, so it can under-report (amounts are never counted below zero, and a run's reported usage over 10,000,000,000 tokens or 100,000 in cost is refused). Keep a spending limit at the provider too.
+- <a id="ai-spend"></a>**AI spend (measure).** Off by default (`spend.enabled: false`); off, nothing below is read, written or shown. With it on, every run that ends gets one record in `data/agents.db` (`agents_spend`): its agent, task, chain, origin, adapter, provider and model, its start, end and runtime, how it ended, whether it restarted a failed run (`reload`) or was ended by a Lair restart (`lair_restart`), the size of its prompt file (`context_bytes`, never the text), and the usage its adapter reports. The usage is read from the run's log once its process is gone, by its adapter's `usage_parser` ([Agent adapters](#agent-adapters)):
+  - `claude-stream-json` (or `claude-json`): the CLI's `result` events. One process can write several (each `usage` counts only since the previous one), so tokens and cost are the last event's totals (`modelUsage`, `total_cost_usd`) and turns are summed. An `assistant` event's own `usage` is never counted;
+  - `request-lines`: the lines matching the adapter's `request_pattern`, one per model request. Tokens and cost show as not reported: **Lair never estimates them** from requests or runtime;
+  - `patterns`: `usage_patterns`, read while the run works (the record takes the run's total from the ledger);
+  - `none`: tokens and cost not reported; runtime and prompt size are still recorded.
+
+  The tokens a run adds to the ledger (what `daily_tokens` and `monthly_tokens` count) are its input, cache-write and output tokens: cache reads are kept in the record only, as they are billed at a fraction of the input price and would swamp a token budget. The cost is all the CLI reports. Each run's record and its ledger usage are written in one transaction keyed by the run, once, also across a restart. The log is read with asynchronous reads only, at most 4 MB per check (a bigger log over several checks, up to 256 MB), lines over 1 MB are never parsed, and a `request_pattern` that takes over 250 ms on part of a log is stopped (at most 300 ms of pattern time per check). A run's usage that can't be read or is refused (over the cap, its result line unreadable, its log gone) is recorded as not reported, with a `usage_refused` event that says why; measuring never fails or delays a run.
+
+  The run's class (`productive`, `idle`, `no_result`, with a reason) is recorded for what the end and the run's own queue line tell (a failed end, a DONE, READY or BLOCKED line, a builder run with no line); the rest is `unclassified` for now. Runs requested by the review module, the planner and its verifier, the supervisor, and the owner (`POST /api/agents/runs`) carry that origin. A model call a module makes without an agent run is one ledger row too (reason `call:<module>`): the brain's shadow proposals count as such calls, with 0 tokens. The API and the dashboard panel for these records, the daily summary and the guards come later ([design](design/ai-spend.md)).
+
+  A guard's mode other than `off` (`failover.quota.mode`, `recovery.hung_repeat.mode`, `fill.wake.events.mode`, `spend.guards.*.mode`) and a `daily_requests`, `daily_minutes`, `monthly_requests` or `monthly_minutes` limit need `spend.enabled: true`: their verdicts and counts come from the spend records, so without it the config is refused, naming both keys. `budgets.guard_mode` is accepted without it.
 - **Decisions.** They go to the [Decision Inbox](#decision-inbox) as module `agents`, and the owner's answer is carried out:
   - an escalated task (`escalation`, one per escalation of a task): `fresh_session` starts it again in a fresh session (if that fails too, Lair asks again), `release` leaves it unclaimed;
   - every profile failing (`escalation`, once per task): `wait` keeps it waiting for the cooldown, `stop` ends the waiting run and frees the task;
@@ -1729,6 +1762,8 @@ agents:
     agent: { daily_cost: { soft: 15, hard: 20 } }
     per_agent:
       worker-a: { daily_tokens: { hard: 2000000 } }
+  spend:
+    enabled: true                 # one record per ended run, with the usage its adapter reports
 ```
 
 ### Agents options
@@ -1767,13 +1802,15 @@ agents:
 | `providers` | map | `{}` | Adapter id -> provider name, for cooldowns and the fleet budget |
 | `usage_patterns` | array | `[]` | Regular expressions with `(?<tokens>...)` and/or `(?<cost>...)`, read from run logs |
 | `budgets.project`, `budgets.agent`, `budgets.per_agent.<id>` | map | — | `daily_tokens`, `daily_cost`, `monthly_tokens`, `monthly_cost`, each `{soft, hard}` |
+| `budgets.guard_mode` | `off` \| `observe` \| `act` | `observe` | The mode of the request and minute limits AI spend adds (a later part). Token and cost hard limits block whatever it says |
+| `spend.enabled` | boolean | `false` | [AI spend](#ai-spend): one record per ended run, with the usage its adapter reports (`agent_adapters.<id>.usage_parser`) |
 | `fill` | map | off | Start runs from a task list: see [Fill](#fill) |
 
 The default patterns look for an error, not the words alone, so an agent writing about rate limiting in its own work doesn't trigger a failover: a rate limit is `rate limit ... exceeded|reached|error|retry`, `exceeded|reached|hit ... rate limit`, `error|status|http 429`, `429 too many requests`, `quota exceeded|exhausted` or `usage limit reached|exceeded`; a provider error is `overloaded_error`, `model is overloaded|unavailable`, `api error ... 5xx` or `status|http 500|502|503|504|529`. Tune them to your adapters' output.
 
 The default `transient_patterns` look for an error too: `"retryErrorType":"TRANSIENT"`, `ClientNetworkError`, `network error occurred`, `error ... ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN`, `getaddrinfo EAI_AGAIN|ENOTFOUND`, `error ... connection refused|reset`, `status|http 502|503`, `502 bad gateway` and `503 service unavailable`. They are checked before failover's patterns, so a 502 or 503 doesn't count as a failover: the provider is passed over, and a fallback on another provider takes the task when there is one. Setting `transient_patterns` replaces them all; `[]` turns the rule off.
 
-Unknown keys, invalid regular expressions, more than 50 `transient_patterns` or one longer than 300 characters, a `transient_max_retries` outside 0 to 50, a usage pattern without a named group, a fallback naming an unknown adapter, a `LAIR_*` name in `env_passthrough`, a soft limit above its hard limit, or a `fill` block that is enabled but incomplete (see below) are config errors: the project's agents module doesn't start, and `GET /api/agents/status` shows the errors. Lair reads the config at startup.
+Unknown keys, invalid regular expressions, more than 50 `transient_patterns` or one longer than 300 characters, a `transient_max_retries` outside 0 to 50, a usage pattern without a named group, a fallback naming an unknown adapter, a `LAIR_*` name in `env_passthrough`, a soft limit above its hard limit, an adapter's bad `usage_parser` or `request_pattern` (or an `estimate` key), a guard or a request or minute limit without `spend.enabled`, or a `fill` block that is enabled but incomplete (see below) are config errors: the project's agents module doesn't start, and `GET /api/agents/status` shows the errors. Lair reads the config at startup.
 
 ### Fill
 
@@ -2111,8 +2148,47 @@ The built-in root-cause signatures (case-insensitive; each line is cut to 1,000 
 | `bisect.protected_trailer` | string | `Lair-Protected` | A merge whose message has `<trailer>: yes` is proposed for revert, never reverted automatically |
 | `commands` | map | `{}` | See below |
 | `decision_file` | string | `inbox_file` | Where decisions are appended when there is no Decision Inbox or `raise_decision` |
+| `parsers.custom` | array | `[]` | Custom regex parsers for test frameworks not covered by built-ins; see below |
 
 Unknown keys, an invalid regular expression or an unknown placeholder are config errors; a project with an invalid `triage:` block is not triaged, and `GET /api/triage/status` shows why.
+
+### Custom parsers
+
+When a project's tests produce output the built-in parsers (JUnit XML, Gradle, vitest, jest, pytest, `go test -json`, cargo test, .NET TRX) don't recognise, define a custom regex parser.
+
+> **Note:** The Go parser reads only JSON output from `go test -json`. Plain `go test` output (non-JSON `--- FAIL:` lines without `-json`) is not parsed; use `-json` or write a custom parser for your output format.
+
+```yaml
+triage:
+  parsers:
+    custom:
+      - name: mytest
+        detect: "MyTest Framework"
+        fail_pattern: 'FAIL:\s+(?<suite>[^:]+)::(?<name>\S+)\s+-\s+(?<message>.+)'
+        summary_pattern: '(?<failed>\d+) failed, (?<passed>\d+) passed'
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `name` | string | Parser id, shown in `cause.parser`; must start with a letter, then lowercase alphanumeric, hyphens and underscores (max 32 chars); must not conflict with built-in parser ids |
+| `detect` | string | Regex to detect this format (matched against the first 2000 characters of the output) |
+| `fail_pattern` | string | Regex with named groups: `(?<name>...)` (required), `(?<suite>...)`, `(?<message>...)`, `(?<type>...)` |
+| `summary_pattern` | string | Optional regex to extract counts: `(?<failed>\d+)`, `(?<passed>\d+)` |
+
+Custom parsers run after the built-ins; a file the built-ins already parsed is not tried again.
+
+**Security limits.** Patterns run over untrusted test output, so:
+
+- Input is capped to 256 KB (the tail).
+- Lines are capped to 2,000 characters.
+- Patterns that match the empty string are refused (they would loop forever).
+- Patterns with nested quantifiers (e.g., `(a+)+`, `(\w*)*`, `(a|a)*`, `(\w|\d)+`) are refused (catastrophic backtracking).
+- Patterns with backreferences (`\1`, `\k<name>`) are refused (exponential time complexity).
+- Each regex operation runs in a worker thread with a 2-second timeout; if the operation exceeds this, the worker is terminated (`Worker.terminate()`), the match fails closed (no results), and a triage notice is recorded. This is a hard bound: the main event loop is never blocked, even by catastrophic patterns that bypass static checks.
+
+Non-capturing groups (`(?:...)`) and named groups (`(?<name>...)`) are allowed. Alternation is allowed in non-quantified groups (e.g., `(?:FAIL|ERROR):` is fine, but `(?:FAIL|ERROR)+:` is refused).
+
+A refused pattern stops triage for the project with a notice naming the field.
 
 ### Triage commands
 
@@ -3088,7 +3164,7 @@ Events: `planner.changed`, `planner.run_started`, `planner.run_finished`, `plann
 
 ## Repositories
 
-`repos:` lists a project's repositories once, for every module that reads pull requests of more than one: the [ready guard](#fill) now, PR health later ([docs/design/pr-health.md](design/pr-health.md)). Each entry says which branch its PRs merge into, whether its hosted CI counts, and the short names task text uses for it.
+`repos:` lists a project's repositories once, for every module that reads pull requests of more than one: the [ready guard](#fill) and [PR health](#pr-health). Each entry says which branch its PRs merge into, whether its hosted CI counts, and the short names task text uses for it.
 
 ```yaml
 repos:
@@ -3113,9 +3189,69 @@ repos:
 
 **PR references.** Task text and done lines name a PR as `owner/name#12` (a listed repository), `<ref>#12`, `<ref> PR #12` or `<ref> pull request #12` (that entry's repository), or `PR #12` (the task's repository when its description has `repo:owner/name`, the tracker's tag, else the default). A bare number never names a repository that is neither the task's nor the default, and `xapp#12`, `app#123` and `app#12a` are not `app#12`.
 
-**Without `repos:`** the list is `tracker.repos[]` (each entry's `repo` and `default`; two or more with no default are read as no default), else the review repository (`review.repo`, else `github:`, with `review.default_branch` as its base), else empty: the modules that need it are inactive and say why. The ready guard reads the list only when `repos:` is set; without it the guard works as before (the review repository, `PR #<n>` forms only). An invalid `repos:` is reported (`repos[1].refs[0]: ...`) and turns off what reads it (the ready guard reads only the review repository, as without `repos:`); the project still loads.
+**Without `repos:`** the list is `tracker.repos[]` (each entry's `repo` and `default`; two or more with no default are read as no default), else the review repository (`review.repo`, else `github:`, with `review.default_branch` as its base), else empty: the modules that need it are inactive and say why. The ready guard reads the list only when `repos:` is set; without it the guard works as before (the review repository, `PR #<n>` forms only). An invalid `repos:` is reported (`repos[1].refs[0]: ...`) and turns off what reads it (the ready guard reads only the review repository, as without `repos:`, and PR health does not start); the project still loads. The error shows on the dashboard's config banner from startup on, and a live reload to an invalid `repos:` is refused (the previous config keeps running). An explicit ref that is another entry's name (`refs: [lib]` beside `example/lib` without `refs`) is an error too: set that entry's `refs` to tell them apart.
+
+No one module owns `repos:`, so an edit to it reloads every module of the project.
 
 **Hosts.** Each listed repository other than the review repository is read through a GitHub host of its own, built once (a rate-limit answer blocks only that repository), with the review module's token (`review.token_env`, `review.token_cmd`) and `review.api_url`; one request may take 20 s, and a timeout is a failure.
+
+## PR health
+
+PR health reads the open pull requests of each repository in [`repos:`](#repositories) and finds the ones that went bad: `conflicts` (the host says the PR can't merge into its base), `behind` (more than `behind_threshold` commits behind the base), `no_ci` (no check has run at the head of a non-draft PR for `no_ci_minutes`) and `ci_red` (the newest run of a check at the head failed). `no_ci` and `ci_red` need the repository's `ci_counts`. Design: [docs/design/pr-health.md](design/pr-health.md).
+
+It is off unless a project sets `pr_health.enabled: true`, and it starts in **observe** mode: it emits events and serves a read-only status (`GET /api/pr-health/status?project=`), and writes nothing. In **act** mode it also sends the owning agent one note per problem and withdraws it once the problem clears, and raises a Decision Inbox notice only when nobody owns the PR or a note could not be delivered (see Act mode below). Startup logs `[pr-health] Watching PRs for: …` or `[pr-health] Off (no project sets pr_health.enabled)`, and a changed `pr_health:`, `review:` or `repos:` reloads it without a restart.
+
+```yaml
+pr_health:
+  enabled: true
+  mode: act                      # default observe; act needs notify_cmd
+  interval_seconds: 300
+  ignored_prs: [example/app#7]
+  ignored_branches: ["dependabot/**"]
+  notify_cmd: ["/opt/lair-hooks/agent-note", "{agent}", "{id}", "{message}"]
+  withdraw_cmd: ["/opt/lair-hooks/agent-unnote", "{agent}", "{id}", "{message}"]
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | |
+| `mode` | `observe` \| `act` | `observe` | `act` needs `notify_cmd`; a `read_only` project only observes |
+| `interval_seconds` | integer | `300` | 60-3600; the first tick runs 1 s after start, and the next is scheduled when one ends |
+| `request_timeout_seconds` | integer | `20` | 1-120; a timeout is a failure of that repository for the tick |
+| `max_prs_per_repo` | integer | `30` | 1-100 PRs read per repository and tick (newest first, PRs left unread last tick before them) |
+| `max_requests_per_tick` | integer | `120` | 10-1000 requests per tick, shared by the project's repositories; a tick also ends at half the interval |
+| `behind_threshold` | integer | `30` | 1-10000 |
+| `no_ci_minutes` | integer | `20` | 1-1440, since the PR was last updated |
+| `clear_minutes` | integer | `10` | 0-1440: a kind that successful reads no longer find is cleared after this long |
+| `kinds.{conflicts,behind,no_ci,ci_red}` | boolean | `true` | Turn a kind off |
+| `ignored_prs` | list | `[]` | `owner/name#N` of a listed repository, at most 200 |
+| `ignored_branches` | list | `["dependabot/**"]` | Head branch globs (`*` within one segment, `**` across, `?`), at most 50 |
+| `owner.branch_window_minutes` | integer | `360` | 0-10080: how recent a head commit must be for the owner rule's branch step (0: no branch step) |
+| `notify_cmd`, `withdraw_cmd` | argv \| null | `null` | The commands that send a note and withdraw one (act mode); placeholders `{agent}`, `{repo}`, `{pr}`, `{head}` (8 hex), `{kinds}` (comma-separated), `{id}` (the delivery id) and `{message}` (one line, at most 500 characters) only. `withdraw_cmd: null` marks a withdrawal `skipped` |
+| `command_timeout_seconds` | integer | `30` | 1-300; a command that does not exit in time is killed with its process group and counts as failed |
+| `max_attempts` | integer | `3` | 1-5 attempts per note or withdrawal |
+| `backoff_seconds` | integer | `300` | 30-3600: the wait after a failed attempt, doubled each time (at most 6 h) |
+| `escalate_after_minutes` | integer \| null | `null` | 10-10080: an `unfixed` notice when a problem is still found this long after its note was sent; `null`: never |
+
+**What is read.** Each tick reads each repository in order: its open PRs (one page of 100; `truncated` in the status says more exist, and a PR missing from a full page is not taken as closed) and its base tip. A PR named in `ignored_prs`, from a branch in `ignored_branches` or into another branch than the base (a stacked PR) is skipped and listed with why. For the others the PR itself is read for its mergeability and compared with the base when its head or the base tip moved or mergeability was not known yet, and its checks are read unless they all passed at this head. An unchanged PR whose checks passed costs no request. The host's token and URL are the review module's (`review.token_env`, `review.token_cmd`, `review.api_url`), else `GITHUB_TOKEN` and `https://api.github.com`.
+
+**Findings.** One per (repository, PR, head, kind), keyed `pr_health:<owner/name>#<n>@<head8>:<kind>`. A moved head, a closed PR and a PR that becomes skipped clear at once; a kind that is no longer found clears after `clear_minutes`. Mergeability the host has not worked out yet (`null`) neither opens nor clears `conflicts`. Findings are kept in memory and found again after a restart.
+
+**Failures.** Each repository is read on its own: a timeout, a rate-limit answer or any host error stops that repository for the tick and keeps its findings exactly as they were (nothing is cleared, and nothing is found again when it recovers); its state is `error`, and `pr_health.repo_error` is emitted once when an error streak starts. The request budget and the deadline stop a repository the same way, with `partial` in the status and the unread PRs first next tick.
+
+**Owner.** After each tick, every (repository, PR, head) with a finding gets an owner from fill's last check (in memory; no file is read). The owner is the agent of the latest open task line (`started`, `claimed` or `held`) whose name or description names the PR: `app#42`, `app PR #42`, `example/app#42`, or a bare `PR #42` / `#42`, which means the line's `repo:owner/name` repository, else the default. Done, malformed, not-allowlisted and unassigned lines never name one. If no line does, and `owner.branch_window_minutes` is above 0, the owner is the one agent the head branch maps to through `review.authors.branch_pattern` and `review.authors.branches`, if that agent has an open line and the head commit's committer date is inside the window (read once per head). Otherwise nobody owns it, with the reason. With no agents module or fill off nobody owns any PR; before fill's first check the owner is unknown.
+
+**Status.** `GET /api/pr-health/status?project=` shows each repository (`state`, `partial`, `truncated`, skipped PRs with why), each finding with its owner, and `planned`: what act mode would do now, a note per owned (repository, PR, head) with the argv `notify_cmd` would run, and a `no_owner` notice per unowned one (an unknown owner plans nothing). The note's text uses Lair's words and counts only, never a branch name, check name or PR title.
+
+**Act mode.** With `mode: act` (and a project that is not `read_only`), each tick runs at most 4 commands, notes and withdrawals together, as argv arrays with no shell, in the project's repository, with `command_timeout_seconds`:
+- **Notes.** For each (repository, PR, head) whose owner is an agent, the kinds the last read found that no earlier note of that head named go into one `notify_cmd` run. Its delivery id `{id}` is `pr_health:<owner/name>#<n>@<head8>:<kinds joined "+">`. The note is written to the ledger before the command runs; exit 0 makes it `sent`, which is final (also across restarts); anything else is retried with the same `{id}` after the backoff while its kinds are still found, and gives up after `max_attempts`. `notify_cmd` should be idempotent on `{id}`: a command that delivered and then failed or was cut off by a restart runs once more with the same `{id}`. A kind that clears and comes back at the same head is not noted again; a new head starts over.
+- **Withdrawals.** A sent note is withdrawn once its problem cleared, judged from the reads after a restart too: its PR is gone from a full list (or now skipped), its head moved, or reads at its head found none of its kinds for `clear_minutes`. A note never sent gets none.
+- **Ledger.** `data/pr-health-deliveries.json` (format 1, written atomically). Records older than 14 days, then the oldest over 2000, are pruned, but never one whose head still has a finding, whose withdrawal is pending, or of a repository not read since the start. A file that can't be read or parsed is never overwritten: notes and withdrawals stop and `lastError` says why.
+- **Inbox notices** (class `pr_health.notice`, one per (repository, PR, head), for information with one "Noted" option): `no_owner` (nobody owns the PR; an unknown owner raises nothing), `delivery_failed` (a note gave up) and, with `escalate_after_minutes`, `unfixed`. One noted is not raised again for that head. A notice is withdrawn when its head has no open finding, and one left from before a restart once its repository has been read and nothing was seen for `clear_minutes`. A reload to observe, `enabled: false` or `read_only` withdraws the open notices and runs no command; the ledger stays.
+
+The status adds `deliveries` (the ledger's records of the project) and `warning` (the ledger's cap gave way to records it still needs).
+
+**Events.** `pr_health.finding` `{project, key, repo, pr, head, kind, owner, ownerSource, mode}` (emitted at the end of the tick that opens it, with its owner: `null` when nobody owns it or the owner is unknown), `pr_health.cleared` `{project, key, repo, pr, head, kind, why}` (`fixed`, `head_moved`, `closed` or `ignored`) and `pr_health.repo_error` `{project, repo, error}`. Act mode: `pr_health.noted` `{project, id, repo, pr, head, kinds, agent, result, attempts, error}` (`sent`, `failed` or `gave_up`), `pr_health.withdrawn` `{project, id, agent, result, attempts, error}` (`done`, `skipped`, `failed` or `gave_up`) and `pr_health.escalated` `{project, key, code, decisionId}`.
 
 ## Tracker
 
@@ -3141,12 +3277,25 @@ tracker:
       match:
         tasks: ["api-*"]        # task id globs
         agents: [worker-b]      # or the agent of the task's line
+      create_issues: false      # a public repository: link only, never create
+      redact_patterns: ["internal-\\w+"]   # this repository's texts only
   redact_patterns: ["codename-\\w+"]
+  auto_link: false              # proposed links wait for the owner
 ```
 
 **Which repository a task goes to.** One project may track several repositories, each with its own board and milestone rules. A task goes to the repository its line names (`repo:owner/name` in the description, or an issue URL or `owner/name#N` of a tracked repository), else to the first repository whose `match` takes it (a task id glob, or the line's agent), else to the `default` one. With one repository it is the default. A task no repository takes is not tracked (the status shows why).
 
-**Which issue a task is linked to.** In this order: the issue its line names on purpose (`Issue: #N`, `Closes #N`, `Fixes #N`, an issue URL or `owner/name#N` of a tracked repository; a bare `#N` elsewhere in the text is never taken), if it is open and not a pull request; the issue an earlier create made for it (found by its marker, see below); an open issue (not a pull request) whose title is exactly the task id or the title Lair would give it (`<task>: <description>`); else, with `create_issues_for_new_tasks`, a new issue with that title, the redacted description, the repository's `labels` and the milestone its rules give.
+**Which issue a task is linked to.** In this order: the issue its line names on purpose (`Issue: #N`, `Closes #N`, `Fixes #N`, an issue URL or `owner/name#N` of a tracked repository; a bare `#N` elsewhere in the text is never taken), if it is open and not a pull request; the issue an earlier create made for it (found by its marker, see below); an open issue (not a pull request) whose title is exactly the task id or the title Lair would give it (`<task>: <description>`); else, when the repository creates issues (`repos[].create_issues`, default `create_issues_for_new_tasks`), a new issue with that title, the redacted description, the repository's `labels` and the milestone its rules give. A reconcile tries at most 10 unlinked tasks this way, each one starting after the last task the one before tried, so every task is tried in turn. A task id the repository's redaction changes is never searched for there.
+
+**Link proposals.** For the open tasks still unlinked (none named on their line, no create pending, a tracked repository takes them), each reconcile reads one page of every tracked repository's open issues (the newest 100 by update; no request when no task needs one) and proposes:
+
+| Reason | When |
+|---|---|
+| `mentions_task` | the issue's title or body names the task id as a word of its own (a task id of 4 or more characters with a letter and a digit or one of `. _ / # : -`; a plain word like `login` or a number like `1234` is too common) |
+| `pull_closes` | an open PR of the task (its branch ends with the task id, or its body names it) closes the issue (`Closes #N`), open and unlinked (at most 5 issues read one by one a reconcile when the page did not have them) |
+| `similar_title` | the issue's title is close to the task's description, alone or after the task id (character bigrams, 0.85 or more; titles of fewer than 10 letters and digits are never compared) |
+
+Only issues of the repository the task goes to are candidates, and an issue linked to a task already is never proposed. A task with one candidate issue, proposed for no other task, is `would_link`; two candidates, or one issue proposed for two tasks, is `ambiguous` and never linked automatically. The status lists the proposals (`proposals`), and each one is recorded once in the audit as `would_link` (op `link_issue`, counted up on each reconcile). With `auto_link: true` in act mode, a `would_link` proposal whose reasons include `mentions_task` or `pull_closes` is linked by the reconcile (at most 10 a reconcile; audited as `link_issue` with `auto: <reasons>` once the link is made). A `similar_title` match alone is never linked automatically (sibling titles such as "fix login bug 1" and "fix login bug 2" score high): it waits for the owner; in observe mode it is recorded only, whatever `auto_link` says. The owner accepts a proposal (an ambiguous one too, by naming the issue) with `POST /api/tracker/links`. A link lives in Lair's store; its card then moves as any link's does. A failed read (the page, an issue) links nothing and leaves the last proposals as they were.
 
 **Observe and act.**
 
@@ -3154,6 +3303,8 @@ tracker:
 |---|---|---|
 | Reads GitHub (scopes, boards, issues, PRs, milestones) | yes | yes |
 | Links tasks to existing issues (in Lair's own store) | yes | yes |
+| Links proposed issues (`auto_link`) | no: recorded as `would_link` | with `auto_link: true`; else recorded as `would_link` |
+| Links an issue the owner accepts (`POST /api/tracker/links`) | yes | yes |
 | Creates issues, adds cards, moves cards, sets the Agent field, labels, comments, closes issues, closes or reopens milestones | no: each is recorded as `would_send` in the audit, once (a repeat counts up the same row) | yes, within `write_budget_per_minute`, each one audited |
 
 The client itself is read-only in observe mode: a write is refused before anything is sent. Switching to act (Settings or the project file) reloads the tracker live; what observe recorded is not replayed, the next reconcile makes GitHub match.
@@ -3173,17 +3324,17 @@ The client itself is read-only in observe mode: a write is refused before anythi
 
 Only `outcome: "applied"` changes count (`planned` is the planner's own observe mode). An `agent.run.ended` changes nothing: an exit is not a done task. Events never wait on GitHub: a handler queues a job and returns, the jobs of a project run one at a time on a bounded queue (500), and a job dropped when it is full is caught up by the next reconcile.
 
-**Reconcile** (at start, then every `reconcile_interval_seconds`, and on the owner's request): links the tasks of the tasks file that have none yet (at most 10 a cycle), finishes the ones marked done there, finishes the ones whose PR was merged outside the review module, drops the ones whose line was removed by hand, moves the cards of open PRs to In review, adds missing cards, puts back cards moved by hand (counted as drift fixed only when the fix was sent), retries closes that failed, and closes or reopens milestones. The next one is scheduled when it ends, so two never overlap.
+**Reconcile** (at start, then every `reconcile_interval_seconds`, and on the owner's request): links the tasks of the tasks file that have none yet (at most 10 tried a cycle, in turn), proposes issues for the ones still unlinked (see Link proposals), finishes the ones marked done there, finishes the ones whose PR was merged outside the review module, drops the ones whose line was removed by hand, moves the cards of open PRs to In review, adds missing cards, puts back cards moved by hand (counted as drift fixed only when the fix was sent), retries closes that failed, and closes or reopens milestones. The next one is scheduled when it ends, so two never overlap.
 
 **Merges made outside the review module.** `review.merged` comes only from a merge the review module makes; a PR merged by a script's push, `gh pr merge` or the GitHub web UI emits nothing. So while a linked task is In progress or In review, each reconcile reads one page of the closed PRs of every tracked repository (the newest 100 by update: one request per repository, with the usual timeout; none when no task is In progress or In review) and matches them as `review.submitted` does (the issues a PR closes, a task id ending its branch name). A merged PR finishes its tasks as `review.merged` does: Done, the issue closed as completed, through the write budget, at most 10 tasks a reconcile (the rest wait for the next one). A PR closed without merging changes nothing: the status lists it under `closedUnmerged`. A finished task is never read again, so a merge is applied once, also across a restart. A PR merged long ago that has left the newest 100 is not seen.
 
-**Task lines removed by hand.** The planner's own drop arrives as an event. A linked task whose line is not in the tasks file and not marked done (deleted, or commented out with `#`) for 2 reconciles in a row counts as dropped: with `close_removed_tasks: true` its issue is closed as not planned (at most 10 a reconcile); with the key off (the default) nothing is sent, a `would_close` row is recorded in the audit (once, counted up on each reconcile) and the status lists the task under `removedTasks`. A line fill refuses (malformed, longer than 2000 characters, past its 200 tasks) is still in the file: the task ids on it are never dropped. A tasks file with no task line at all is taken for a broken write and counts nothing. The count is kept in memory, so a restart or a config reload starts it again; a line that comes back resets it.
+**Task lines removed by hand.** The planner's own drop arrives as an event. A linked task whose line is not in the tasks file and not marked done (deleted, or commented out with `#`) for 2 reconciles in a row counts as dropped: with `close_removed_tasks: true` its issue is closed as not planned (at most 10 a reconcile); with the key off (the default) nothing is sent, a `would_close` row is recorded in the audit (once, counted up on each reconcile) and the status lists the task under `removedTasks`. A line fill refuses (malformed, longer than 2000 characters, past its 200 tasks) is still in the file: the task ids on it are never dropped. A tasks file with no task line at all is taken for a broken write and counts nothing. Only a task whose line this process has seen in the file can count as removed: links from before a restart whose lines are gone, or a config reload that points `agents.fill.tasks_file` at another file, count nothing. The count is kept in memory, so a restart or a config reload starts it again; a line that comes back resets it.
 
 **Milestones.** With `close_when_complete` (the default), an open milestone with closed issues and no open one is closed, and a closed one with an open issue is reopened. Only its state is sent: its title, description and due date are the owner's. Lair never creates a milestone; a rule naming one that does not exist is reported and the issue is created without it.
 
 **Idempotent creates.** The create is recorded (pending) before it is sent, and the issue's body ends with a hidden marker (`<!-- lair-task:<hash> -->`). If the answer is lost (a timeout, a restart), the next attempt lists the repository's issues changed since then (the issues list, which does not lag behind as search does) and links the one with the marker instead of creating another. Creates count against the write budget.
 
-**Redaction.** Every text sent (titles, bodies, comments, the Agent field) is redacted first by built-in rules, then by `redact_patterns` (case-insensitive regular expressions): the values of this process's secret-looking environment variables (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*KEY*`...), GitHub, OpenAI-style, Slack and AWS key shapes, private keys, `Bearer` tokens, credentials in URLs, `password=`/`token:` pairs, absolute paths (`/Users/...`, `/home/...`, `/tmp/...`, `C:\...`, `~/...`) and the home directory, email addresses and private network addresses. Titles are one line of at most 200 characters, bodies 3000, comments 600. A blocked comment carries only the planner's class and rule, never the agent's text.
+**Redaction.** Every text sent (titles, bodies, comments, the Agent field) is redacted first by built-in rules, then by `redact_patterns` (case-insensitive regular expressions): the values of this process's secret-looking environment variables (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*KEY*`...), GitHub, OpenAI-style, Slack and AWS key shapes, private keys, `Bearer` tokens, credentials in URLs, `password=`/`token:` pairs, absolute paths (`/Users/...`, `/home/...`, `/tmp/...`, `C:\...`, `~/...`) and the home directory, email addresses and private network addresses. Then a repository's own `repos[].redact_patterns`, on that repository's texts only: a name a public repository must never see is listed there, and the private repository still gets it. Every text bound for a repository goes through them: the issue title and body, comments, the Agent field of its board; a task id they change is never sent to it in a search either. Texts are bounded after every pattern ran. Titles are one line of at most 200 characters, bodies 3000, comments 600. A blocked comment carries only the planner's class and rule, never the agent's text. Keep a public repository's `create_issues: false` when its task text is not meant to be public: linking reads only.
 
 **The token.** `token_env` / `token_cmd`, else the project's `review.token_env` / `review.token_cmd`, else `GITHUB_TOKEN`; the tracker's variable is also kept from the update command, as review's is. A classic token needs `repo` (or `public_repo` for public repositories only) and `project` (observe mode reads boards with `read:project`); a fine-grained token needs Issues: read and write, Pull requests: read, and Projects: read and write on the board's owner (GitHub reports no scopes for it, so it is not checked up front). At start the tracker reads the token's scopes; a missing one stops its writes and raises **one** decision in the Decision Inbox (class `tracker.token_scopes`) listing them, with the option "I updated the token: check again". A 401, or a 403 that is not a rate limit, stops the writes too until the scopes are checked again. Every request has a timeout (`request_timeout_seconds`) and is cut short when the tracker stops. Rate limits (a 429, a 403 with `Retry-After` or `X-RateLimit-Remaining: 0`, a GraphQL `RATE_LIMITED`) stop every request until `Retry-After` or `X-RateLimit-Reset`; the time is kept across a restart.
 
@@ -3201,10 +3352,13 @@ Only `outcome: "applied"` changes count (`planned` is the planner's own observe 
 | `repos[].status_options` | `Backlog`, `Ready`, `In progress`, `In review`, `Done` | The option names of `backlog`, `ready`, `in_progress`, `in_review`, `done` |
 | `repos[].agent_field` | none | A text field set to the agent of the task's run |
 | `repos[].labels` | `[]` | Labels of the issues Lair creates here |
+| `repos[].create_issues` | `create_issues_for_new_tasks` | Create issues here for tasks none is linked to (on for a private repository, off for a public one) |
+| `repos[].redact_patterns` | `[]` | Redacted from this repository's texts only, after the built-in rules and `redact_patterns` |
 | `repos[].match.tasks`, `.agents` | `[]` | Task id globs and agent ids this repository takes |
 | `repos[].milestones.close_when_complete` | `true` | Close a complete milestone, reopen one with an open issue |
 | `repos[].milestones.rules` | `[]` | `{tasks: [globs], milestone: "title"}`: the existing milestone of the issues created for those tasks |
-| `create_issues_for_new_tasks` | `false` | Create an issue for a task none is linked to (act mode) |
+| `create_issues_for_new_tasks` | `false` | Create an issue for a task none is linked to (act mode); the default of each `repos[].create_issues` |
+| `auto_link` | `false` | Link a proposed issue (one candidate, proposed for no other task, and named by the task id or closed by the task's PR: a close title alone never) without the owner, in act mode; off: recorded as `would_link`, listed in the status for the owner to accept |
 | `close_removed_tasks` | `false` | Close as not planned the issue of a linked task whose line was removed or commented out by hand (missing 2 reconciles in a row); off: recorded as `would_close` and listed in the status |
 | `blocked_label` | `blocked` | The label of a blocked task's issue |
 | `redact_patterns` | `[]` | Redacted from every text sent, after the built-in rules |
@@ -3220,10 +3374,61 @@ The tasks it follows are `agents.fill.tasks_file` (the planner's done marker mar
 
 `?project=` defaults to the default project. Every route is the owner's (`/api/tracker` is owner-only, reads included: they show task text and repositories):
 
-- `GET /api/tracker/status`: the mode, each repository and its board (loaded, or why not), the token's scopes (granted, missing), the sync state (last reconcile, next one, drift fixed, errors, the rate-limit wait, what needs the owner), the links, the pending creates, the latest 50 writes (each with its result, or `would_send` in observe mode, or `would_close` for a removed task line while `close_removed_tasks` is off), the queue (waiting, dropped), `closedUnmerged` (linked tasks' PRs the last reconcile saw closed without merging), `removedTasks` (linked tasks whose line is missing: reconciles missed, and `waiting`, `would_close` or `closing`), warnings and config errors
+- `GET /api/tracker/status`: the mode, each repository and its board (loaded, or why not), the token's scopes (granted, missing), the sync state (last reconcile, next one, drift fixed, errors, the rate-limit wait, what needs the owner), the links, the pending creates, the latest 50 writes (each with its result, or `would_send` in observe mode, or `would_close` for a removed task line while `close_removed_tasks` is off), the queue (waiting, dropped), `closedUnmerged` (linked tasks' PRs the last reconcile saw closed without merging), `removedTasks` (linked tasks whose line is missing: reconciles missed, and `waiting`, `would_close` or `closing`), `proposals` (unlinked tasks, their candidate issues with reasons, score and PR, and `would_link` or `ambiguous`), warnings and config errors
 - `POST /api/tracker/reconcile`: a reconcile now, queued after the jobs waiting (202); recorded in the audit with the owner session. 404 when the tracker is off for the project
+- `POST /api/tracker/links` `{task, repo, issue}`: accept a proposed link (one of the candidates of the last reconcile's proposal for that task, an ambiguous one included). Checked now (409 when it is not proposed or the task is linked already), made by a queued job (202) that reads the issue again (still open, not a PR, linked to no other task) and records `link_issue` in the audit with the owner session (`success`, or `skipped`/`error` and why). 403 without an owner session, 404 when the tracker is off
 
 The tracker emits no events of its own. The dashboard tab is not built yet.
+
+## Work store
+
+Tasks and their events in Lair's own database instead of project files ([design](design/work-store.md)). Off by
+default; a project opts in, and moves one step at a time.
+
+```yaml
+work_store:
+  mode: off      # off | observe
+  files: follow  # follow
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `work_store.mode` | `off` \| `observe` | `off` | `off`: today's files exactly; no store file is created; `GET /api/work/status` reports `off`, and every other `/api/work` read and the import answer 404 for the project. `observe`: the project's store (`data/work/<project>.db`) follows the files one way (below); fill, the planner and the tracker still read the files, and nothing else reads the store |
+| `work_store.files` | `follow` | `follow` | How the files relate to the store: `follow` keeps the store in step with them, one way (the store never writes a project file). `mirror` and `none` come in a later version |
+
+An unknown key under `work_store:` or another value is a config error (the live reload keeps the previous config, and
+the store stays off). `on`, where fill reads the store, comes in a later version. In `observe` the store is opened, and
+`data/work/<project>.db` created, by the follower's first step (at start, or within 15 s of switching to `observe`), a status
+read or an import, whichever comes first.
+
+**Import.** `POST /api/work/import?project=<name>` with `{"dry_run": true}` (the default) reports what it would change
+and writes nothing; `{"dry_run": false}` applies it in one transaction, with your session as the actor on every event.
+It reads only the configured files, `agents.fill.tasks_file` and `queue_file`, with fill's own parser and checks: an
+open line is `ready`; a `DONE` line fill accepts makes it `done` (a `DONE` the ready guard refuses does not); its
+latest run's last `WAITING` or `BLOCKED` line makes it `waiting` or `blocked`; a done line (the planner's
+`done_marker`) is `done`; a task imported before and gone from the file is `dropped`. A task a run or claim holds keeps
+its state (a new one is `ready`) and is shown `assigned` or `running`. Fill's holds (a decision, a pause, a refusal)
+are not a state of the store. Running the import again changes only what differs; an unreadable tasks file imports and
+drops nothing; a line fill refuses is a warning, and the task ids on it are never dropped. Only tasks an import made
+follow the files: one the planner or you made is never changed by them (the import lists it under `skipped`).
+
+**Following (`files: follow`).** Your first applied import adopts the store; from then on it follows by itself, and a
+dry run before that adopts nothing. Every 15 s, and at once on a bus report or a run's start, end or released claim:
+the store applies the bus reports and run facts that came since its last ones, each once, also across a restart
+(`WAITING`, `BLOCKED` and an accepted `DONE` set the state; `PROGRESS`, `TICK`, a refused `DONE`, a run's end and a
+released claim are recorded on the task only; a live run's start shows a waiting or blocked task running again); then it
+looks at the two files' size and time, and imports again only when one changed (the follower is the actor). A step that
+fails or takes longer than 60 s is shown as a failure in the status and backs off (doubling, up to 10 minutes); a ready
+guard that fails on a `DONE` is such a failure (the report is read again, never taken as refused). The store asks fill's
+ready guard for its verdict only: it writes no event in the agents store. The status's `applied` counts the facts
+recorded on a task (a `PROGRESS` too), `skipped` those for tasks the store does not have or already recorded. Do not `VACUUM`
+`data/agents.db` while a project follows (the store reads its events by row).
+
+**Reads.** `GET /api/work/status?project=<name>` (the mode, the schema version, tasks by state, the last import, whether
+the store is adopted and its cursors, the follower's checks, reads and failures, and a comparison with fill's view at
+its last check: the tasks the two disagree on, fill's holds left out), `GET /api/work/tasks?project=<name>&state=&agent=&limit=`
+and `GET /api/work/task?project=<name>&id=<task>` (one task and its newest events). Every `/api/work` route needs the
+owner's session, reads included.
 
 ## Lessons
 

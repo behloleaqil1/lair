@@ -112,13 +112,20 @@ export interface ReviewSlot {
   differentModel: boolean;
   /** Reviewer agents the agent assigner picks from for this slot (else review.reviewers_pool.<tier>) */
   pool?: string[];
+  /** Ask for this slot only once these hold at the head (absent: as soon as it is missing) */
+  askAfter?: ReviewAskAfter[];
 }
+
+/** A slot's condition for being asked: the gate passed at the head, or every earlier slot of its tier approved there. */
+export type ReviewAskAfter = "gate" | "earlier_slots";
 
 export interface SlotStatus {
   slot: ReviewSlot;
   label: string;
   satisfiedBy: { reviewId: string; reviewer: ReviewerRef } | null;
   detail: string;
+  /** Why this missing slot is not asked for yet (its `askAfter` doesn't hold at the head); absent when it may be asked */
+  waiting?: string;
 }
 
 /**
@@ -127,9 +134,10 @@ export interface SlotStatus {
  * - assigned: an agent's run is reviewing it;
  * - reviewed: the assignee reviewed (whether or not that filled the slot);
  * - failed: no review came (runs ended without one, or no agent can take it), `detail` says why;
- * - stale: the PR moved on (a new head, or closed) before a review came.
+ * - stale: the PR moved on (a new head, or closed) before a review came;
+ * - waiting: not asked for: the slot's `askAfter` doesn't hold at the head yet (`detail` says why).
  */
-export type SlotAssignmentState = "requested" | "assigned" | "reviewed" | "failed" | "stale";
+export type SlotAssignmentState = "requested" | "assigned" | "reviewed" | "failed" | "stale" | "waiting";
 
 export interface SlotAssignmentView {
   /** Index into PrReviewStatus.slots */

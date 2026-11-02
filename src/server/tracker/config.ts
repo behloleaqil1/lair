@@ -38,6 +38,10 @@ export interface RepoSettings {
   /** Tasks this repository takes when their line names no repository */
   match: { tasks: RegExp[]; agents: string[] };
   milestones: { closeWhenComplete: boolean; rules: MilestoneRule[] };
+  /** The owner's patterns for this repository's texts only, applied after the built-in rules and the project-wide ones */
+  redactPatterns: RegExp[];
+  /** Create an issue here for a task none is linked to (default: create_issues_for_new_tasks) */
+  createIssues: boolean;
 }
 
 export interface TrackerSettings {
@@ -45,6 +49,8 @@ export interface TrackerSettings {
   mode: TrackerMode;
   repos: RepoSettings[];
   createIssuesForNewTasks: boolean;
+  /** Link the issues the reconcile proposes (one candidate only) without the owner, in act mode; off: recorded as would_link */
+  autoLink: boolean;
   /** A linked task whose line left the tasks file (two reconciles in a row) has its issue closed as not planned; off: recorded as would_close */
   closeRemovedTasks: boolean;
   blockedLabel: string;
@@ -71,6 +77,7 @@ export type TrackerParseResult = { ok: true; settings: TrackerSettings } | { ok:
 
 const OWNER_REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const Label = z.string().min(1).max(50);
+const RedactPatterns = z.array(z.string().min(1).max(500)).max(50);
 const Glob = z.string().min(1).max(200);
 
 const StatusMappingSchema = z
@@ -100,6 +107,10 @@ const RepoSchema = z
     status_options: StatusMappingSchema.default({}),
     agent_field: z.string().min(1).max(100).optional(),
     labels: z.array(Label).max(20).default([]),
+    /** Redacted from this repository's texts only, after the built-in rules and the project-wide redact_patterns */
+    redact_patterns: RedactPatterns.default([]),
+    /** Default: create_issues_for_new_tasks */
+    create_issues: z.boolean().optional(),
     match: z
       .object({
         /** Task id globs (* and ?) */
@@ -131,11 +142,13 @@ export const TrackerSchema = z
     /** Default: the project's `github:` repository, without a board */
     repos: z.array(RepoSchema).max(20).default([]),
     create_issues_for_new_tasks: z.boolean().default(false),
+    /** Link the issue a reconcile proposes for a task (one candidate only) without the owner; off: recorded as would_link */
+    auto_link: z.boolean().default(false),
     /** Close the issue of a linked task whose line was removed or commented out by hand (absent two reconciles in a row) */
     close_removed_tasks: z.boolean().default(false),
     blocked_label: Label.default("blocked"),
     /** Regular expressions (case-insensitive) redacted from every text sent to GitHub, after the built-in ones */
-    redact_patterns: z.array(z.string().min(1).max(500)).max(50).default([]),
+    redact_patterns: RedactPatterns.default([]),
     reconcile_interval_seconds: z.number().int().min(60).max(86_400).default(900),
     write_budget_per_minute: z.number().int().min(1).max(100).default(30),
     request_timeout_seconds: z.number().int().min(1).max(120).default(15),
@@ -173,14 +186,18 @@ export function parseTrackerConfig(raw: unknown, project: ProjectConfig): Tracke
   const errors: string[] = [];
   const warnings: string[] = [];
 
-  const redactPatterns: RegExp[] = [];
-  value.redact_patterns.forEach((pattern, i) => {
-    try {
-      redactPatterns.push(new RegExp(pattern, "gi"));
-    } catch (e) {
-      errors.push(`tracker.redact_patterns[${i}]: not a valid regular expression (${e instanceof Error ? e.message : String(e)})`);
-    }
-  });
+  const compile = (patterns: string[], where: string): RegExp[] => {
+    const out: RegExp[] = [];
+    patterns.forEach((pattern, i) => {
+      try {
+        out.push(new RegExp(pattern, "gi"));
+      } catch (e) {
+        errors.push(`${where}[${i}]: not a valid regular expression (${e instanceof Error ? e.message : String(e)})`);
+      }
+    });
+    return out;
+  };
+  const redactPatterns = compile(value.redact_patterns, "tracker.redact_patterns");
 
   let rawRepos = value.repos;
   if (rawRepos.length === 0 && value.enabled) {
@@ -206,7 +223,7 @@ export function parseTrackerConfig(raw: unknown, project: ProjectConfig): Tracke
     if (!r.project && value.enabled) warnings.push(`tracker.repos ${r.repo}: no project (board): its issues are linked and closed, no card moves`);
   }
 
-  const repos: RepoSettings[] = rawRepos.map((r) => ({
+  const repos: RepoSettings[] = rawRepos.map((r, i) => ({
     repo: r.repo,
     default: r.default || rawRepos.length === 1,
     board: r.project ? { owner: r.project.owner, number: r.project.number } : null,
@@ -219,6 +236,8 @@ export function parseTrackerConfig(raw: unknown, project: ProjectConfig): Tracke
       closeWhenComplete: r.milestones.close_when_complete,
       rules: r.milestones.rules.map((rule) => ({ tasks: rule.tasks.map(compileTaskGlob), milestone: rule.milestone })),
     },
+    redactPatterns: compile(r.redact_patterns, `tracker.repos[${i}].redact_patterns`),
+    createIssues: r.create_issues ?? value.create_issues_for_new_tasks,
   }));
 
   // The token: the tracker's own source, else the review module's (the same repositories, the same account)
@@ -249,6 +268,7 @@ export function parseTrackerConfig(raw: unknown, project: ProjectConfig): Tracke
       mode: value.mode,
       repos,
       createIssuesForNewTasks: value.create_issues_for_new_tasks,
+      autoLink: value.auto_link,
       closeRemovedTasks: value.close_removed_tasks,
       blockedLabel: value.blocked_label,
       redactPatterns,

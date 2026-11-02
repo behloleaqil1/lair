@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { PrReviewStatus, SlotAssignmentView } from "../shared/review-types";
-import { assignmentLabel, findingLocation, mergeButtonState, parseFindingLines } from "./review-view";
+import { assignmentLabel, findingLocation, mergeButtonState, parseFindingLines, requestReviewsMessage } from "./review-view";
 
 describe("assignmentLabel", () => {
   const base: SlotAssignmentView = {
@@ -32,6 +32,31 @@ describe("assignmentLabel", () => {
       text: "failed",
       detail: "no review after 3 run(s)",
     });
+  });
+
+  it("shows a staged slot as waiting, with why", () => {
+    const why = "waiting for the gate to pass at abc1234";
+    expect(assignmentLabel({ ...base, state: "waiting", channel: "waiting", notBefore: null, detail: why })).toEqual({
+      badge: "badge-neutral",
+      text: "waiting",
+      detail: why,
+    });
+  });
+});
+
+describe("requestReviewsMessage", () => {
+  it("names the slots the owner's request skipped as waiting", () => {
+    expect(requestReviewsMessage([{ slot: "a peer other than the author", channel: "assigner", detail: "queued" }])).toBe(
+      "Request reviews: done",
+    );
+    expect(
+      requestReviewsMessage([
+        { slot: "a peer other than the author", channel: "already requested", detail: "at abc1234" },
+        { slot: "agent strong-reviewer", channel: "waiting", detail: "not asked for yet: waiting for the gate to pass at abc1234" },
+      ]),
+    ).toBe(
+      "Request reviews: done; skipped 1 waiting: agent strong-reviewer (not asked for yet: waiting for the gate to pass at abc1234)",
+    );
   });
 });
 
