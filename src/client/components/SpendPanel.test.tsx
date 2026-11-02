@@ -112,14 +112,24 @@ describe("AT-35: Home's AI spend panel", () => {
     expect(spendAsks()).toEqual(["GET /api/agents/spend?window=today&by=agent&project=demo"]);
 
     // Today: worker-c finished t-docs and ended t-notes with nothing (each run's cost reported), builder-k hit its quota
-    expect(part("waste")).toBe("50% of the cost went to idle runs or runs with no result");
-    expect(bar("cost")).toContain("$1.04: productive $0.52 · idle $0.52 · no result $0.00");
+    // on the kiro CLI (requests only). The waste share is of the cost the two Claude Code runs reported, and says so
+    const partly = "Tokens and cost cover only the 2 of 3 runs whose adapter reported them; the others' are not reported, never estimated.";
+    const waste = "50% of the reported cost (2 of 3 runs) went to idle runs or runs with no result";
+    expect(part("waste")).toBe(waste);
+    // The kiro run's cost and tokens are unknown, not 0: "not reported" in its class's place, never "$0.00"
+    expect(bar("cost")).toContain("$1.04: productive $0.52 · idle $0.52 · no result not reported");
+    expect(bar("cost")).not.toContain("$0.00");
     expect(bar("tokens")).toContain("138k tokens");
-    expect(bar("requests")).toContain("30 requests: productive 0 requests · idle 0 requests · no result 30 requests");
+    expect(bar("tokens")).toContain("no result not reported");
+    expect(bar("tokens")).not.toContain(" 0 tokens");
+    // and the Claude Code runs count no request lines: theirs are not reported either, never "0 requests"
+    expect(bar("requests")).toContain("30 requests: productive not reported · idle not reported · no result 30 requests");
     expect(bar("runs")).toContain("3 runs: productive 1 run · idle 1 run · no result 1 run");
-    expect(panel()!.querySelectorAll('[data-spend-bar="cost"] .spend-segment')).toHaveLength(2); // productive and idle: no-result cost is 0
-    expect(part("reasons")).toContain("hit a rate limit or quota: 1 run, $0.00");
+    expect(panel()!.querySelectorAll('[data-spend-bar="cost"] .spend-segment')).toHaveLength(2); // productive and idle: no-result cost is unknown
+    expect(part("reasons")).toContain("hit a rate limit or quota: 1 run, not reported");
+    expect(part("reasons")).not.toContain("$0.00");
     expect(part("reasons")).toContain("wrote no queue line: 1 run, $0.52");
+    expect(part("partly-reported")).toBe(partly);
     expect(part("tasks")).toContain("t-api");
     expect(part("tasks")).toContain("t-notes");
     expect(part("tasks")).not.toContain("t-docs");
@@ -127,7 +137,6 @@ describe("AT-35: Home's AI spend panel", () => {
     // The kiro CLI reports requests, not tokens or cost: "not reported", never an estimate
     expect(row("builder-k")).toEqual(["builder-k", "1", "0", "0", "1", "100% of requests", "30", "1.5 min", "not reported", "not reported"]);
     expect(row("worker-c")).toEqual(["worker-c", "2", "1", "1", "0", "50%", "—", "3 min", "138k", "$1.04"]);
-    expect(part("partly-reported")).toContain("not reported");
     expect(part("losses")).toBe("0 context reloads (a restart that re-sent a failed run's context) · 0 runs ended by a Lair restart");
 
     // One line per guard: G1 watched the quota line once; the others in observe had nothing; the rest are off
@@ -143,6 +152,19 @@ describe("AT-35: Home's AI spend panel", () => {
     // Axe on the panel: no serious or critical violations (colour contrast is tokens.test.ts's)
     const result = await axe.run(panel()!, { resultTypes: ["violations"], rules: { "color-contrast": { enabled: false } } });
     expect(result.violations.filter((v) => v.impact === "serious" || v.impact === "critical").map((v) => v.id)).toEqual([]);
+
+    // The caveat comes from the report's totals, not the table: by project (one row, whose cost 2 of its 3 runs
+    // reported) the caveat and the waste sentence stay as they were
+    const select = panel()!.querySelector<HTMLSelectElement>('select[aria-label="Group the AI spend table by"]')!;
+    act(() => {
+      select.value = "project";
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await until("the table by project", () => row("demo").length > 0);
+    expect(spendAsks().at(-1)).toBe("GET /api/agents/spend?window=today&by=project&project=demo");
+    expect(row("demo").slice(0, 5)).toEqual(["demo", "3", "1", "1", "1"]);
+    expect(part("partly-reported")).toBe(partly);
+    expect(part("waste")).toBe(waste);
   });
 
   it("the 7 days switch refetches with window=7d (the crash two days ago counts then); the table's grouping refetches with by=", async () => {

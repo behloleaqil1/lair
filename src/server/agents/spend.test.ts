@@ -1366,7 +1366,7 @@ describe("AT-10: GET /api/agents/spend is the owner's, numbers only", () => {
     expect(report.groups.map((g: { key: string }) => g.key)).toEqual(expect.arrayContaining(["t-a", "t-b", "t-c"]));
     // The request-lines adapter reports no tokens: not reported, never estimated
     const kiro = report.groups.find((g: { key: string }) => g.key === "t-c");
-    expect(kiro.totals).toMatchObject({ requests: 30, tokens: null, cost: null, reported: false });
+    expect(kiro.totals).toMatchObject({ requests: 30, tokens: null, cost: null, reported: false, reportedRuns: 0 });
     expect(report.topTasks[0]).toMatchObject({ task: "t-b" });
     expect(report.guards.map((g: { guard: string }) => g.guard)).toContain("task_no_result_cap");
     expect(report.guards.find((g: { guard: string }) => g.guard === "budget")).toMatchObject({ key: "agents.budgets.guard_mode", mode: "observe", would: 0, did: 0 });

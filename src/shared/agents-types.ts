@@ -76,7 +76,8 @@ export type SpendUnit = "cost" | "requests" | "minutes" | "runs";
 
 /**
  * Spend summed over runs. `reported: false` when no run of them reported tokens and cost: both are null then ("not
- * reported"), never estimated. requests and turns are null when no run had them.
+ * reported"), never estimated. requests and turns are null when no run had them. `reportedRuns`: how many of the runs
+ * reported tokens and cost; fewer than `runs` (and more than 0) means tokens and cost cover only those runs.
  */
 export interface SpendTotalsView {
   runs: number;
@@ -86,6 +87,7 @@ export interface SpendTotalsView {
   tokens: number | null;
   cost: number | null;
   reported: boolean;
+  reportedRuns: number;
 }
 
 /** (idle + no_result) / (productive + idle + no_result), per unit; null where the unit has nothing */

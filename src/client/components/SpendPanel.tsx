@@ -20,6 +20,7 @@ import {
   groupRows,
   guardLines,
   lossesSentence,
+  partlyReportedNote,
   spendBars,
   spendEndpoint,
   topTaskRows,
@@ -102,7 +103,8 @@ function SpendReportBody({ report, range, by, onBy }: { report: SpendReportView;
   const reasons = topWasteReasons(report);
   const tasks = topTaskRows(report);
   const rows = groupRows(report);
-  const partly = report.totals.reported && rows.some((r) => !r.reported);
+  // From the report's totals, not the table's rows: it holds whatever the table is grouped by
+  const partly = partlyReportedNote(report);
   return (
     <>
       <p className="spend-waste" data-spend="waste">
@@ -113,12 +115,12 @@ function SpendReportBody({ report, range, by, onBy }: { report: SpendReportView;
           <SpendBarRow key={bar.unit} bar={bar} />
         ))}
       </div>
-      <SpendLegend />
       {partly && (
         <p className="muted small" data-spend="partly-reported">
-          Tokens and cost count only the runs whose adapter reports them; the rows of the others say &quot;{NOT_REPORTED}&quot;.
+          {partly}
         </p>
       )}
+      <SpendLegend />
 
       <div className="grid grid-2 spend-lists">
         <div>

@@ -266,7 +266,7 @@ CREATE INDEX IF NOT EXISTS idx_agents_spend_pending ON agents_spend_pending(proj
   - reviews per head (heads reviewed more than once);
   - planner acceptance;
   - each guard's mode and its `would` and `did` counts;
-  - `reported: false`, with `null` tokens and cost, for any group whose adapters report no tokens.
+  - `reported: false`, with `null` tokens and cost, for any group whose adapters report no tokens, and `reportedRuns` (how many runs reported them) on every totals.
   "today" is the UTC day.
 - `GET /api/agents/spend/runs?project=<p>&task=<id>&limit=` returns that task's run rows. These hold numbers, ids and enums only, never a prompt or a log line.
 
@@ -287,6 +287,7 @@ AgentDetail gets a "Spend" line (today's runs per class and cost or requests) ne
 
 - The agents status (`GET /api/agents/status`, not owner-only) says only whether spend is on (`spendEnabled`), so the panel and the Spend line show while it is on and a signed-out browser sees "shown to the owner only" in their place. Their numbers come from the owner-only spend route alone, read once a minute and on each switch.
 - The bars cover each unit with data: cost and tokens where an adapter reported them (else "not reported" in their place), requests, model turns, agent time and runs. Runs not classified yet are a fourth, grey segment when there are some. Each bar has its numbers beside it in text.
+- A class or a waste reason with runs none of which reported (or counted) the unit says "not reported" in its place, never "$0.00" or "0 tokens"; a class with no runs is a true 0. Each totals object of the API carries `reportedRuns` (how many of its `runs` reported tokens and cost), so a mixed fleet is told from the data, whatever the table is grouped by: a caveat beside the bars ("cover only the 2 of 3 runs whose adapter reported them"), the waste share in cost says "of the reported cost (2 of 3 runs)", a reason says "reported for 1 of them", and the agent's Spend line says "cost $0.30 for 1 of 5 runs (partly reported ...)".
 - The table is by agent first (task, origin and project on its select). A row whose runs have none of the panel's unit shows its waste share in the next unit it has ("100% of requests").
 - The guard lines read the API's `mode`, `would` and `did` per guard, in plain words ("watching: would have cooled a provider once today").
 

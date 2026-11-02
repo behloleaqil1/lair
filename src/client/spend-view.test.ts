@@ -1,25 +1,33 @@
 /**
  * The AI spend panel's rules (spend-view.ts) on the edges the DOM test (components/SpendPanel.test.tsx, against the
- * real server) doesn't reach: no reported cost at all, runs not classified yet, each guard mode with and without
- * counts, a group with no cost of its own, an agent with no runs, and ids a newer server may send.
+ * real server) doesn't reach: no reported cost at all, cost reported by only some runs, runs not classified yet, each
+ * guard mode with and without counts, a group with no cost of its own, an agent with no runs, and ids a newer server
+ * may send.
  */
 import { describe, expect, it } from "vitest";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { SpendGroupView, SpendGuardView, SpendReportView, SpendTotalsView } from "../shared/agents-types";
-import { agentSpendLine, formatCost, formatCount, formatMinutes, groupRow, guardLines, reasonLabel, spendBars, topWasteReasons, wasteSentence } from "./spend-view";
+import {
+  agentSpendLine,
+  formatCost,
+  formatCount,
+  formatMinutes,
+  groupRow,
+  guardLines,
+  partlyReportedNote,
+  reasonLabel,
+  spendBars,
+  topWasteReasons,
+  wasteSentence,
+} from "./spend-view";
 import { SpendPanelView } from "./components/SpendPanel";
 
-const totals = (over: Partial<SpendTotalsView> = {}): SpendTotalsView => ({
-  runs: 0,
-  minutes: 0,
-  requests: null,
-  turns: null,
-  tokens: null,
-  cost: null,
-  reported: false,
-  ...over,
-});
+/** Totals as the server sums them; reportedRuns defaults to every run when reported, else none */
+const totals = (over: Partial<SpendTotalsView> = {}): SpendTotalsView => {
+  const t: SpendTotalsView = { runs: 0, minutes: 0, requests: null, turns: null, tokens: null, cost: null, reported: false, reportedRuns: 0, ...over };
+  return { ...t, reportedRuns: over.reportedRuns ?? (t.reported ? t.runs : 0) };
+};
 
 const share = (over: Partial<SpendGroupView["waste"]> = {}): SpendGroupView["waste"] => ({ cost: null, tokens: null, requests: null, turns: null, minutes: null, runs: null, ...over });
 
@@ -61,6 +69,39 @@ function requestsOnly(): SpendReportView {
   };
 }
 
+/**
+ * A day of a mixed fleet: a Claude Code run that finished (cost reported, no request lines), two idle runs of which
+ * only one reported its cost (the other on the kiro CLI: request lines only), and a kiro CLI run that ended on its
+ * provider's quota line (no result, requests only)
+ */
+function mixed(): SpendReportView {
+  const productive = totals({ runs: 1, minutes: 2, turns: 10, tokens: 60_000, cost: 0.5, reported: true });
+  const idle = totals({ runs: 2, minutes: 3, requests: 12, turns: 8, tokens: 40_000, cost: 0.25, reported: true, reportedRuns: 1 });
+  const noResult = totals({ runs: 1, minutes: 1.5, requests: 30 });
+  const unclassified = totals();
+  const all = totals({ runs: 4, minutes: 6.5, requests: 42, turns: 18, tokens: 100_000, cost: 0.75, reported: true, reportedRuns: 2 });
+  const waste = share({ cost: 0.3333, tokens: 0.4, requests: 1, turns: 0.4444, minutes: 0.6923, runs: 0.75 });
+  return {
+    ...requestsOnly(),
+    by: "project",
+    unit: "cost",
+    totals: all,
+    productive,
+    idle,
+    noResult,
+    unclassified,
+    waste,
+    wasteShare: 0.3333,
+    groups: [{ key: "demo", totals: all, productive, idle, noResult, unclassified, waste, reloads: 0, lairRestarts: 0 }],
+    reasons: [
+      { class: "no_result", reason: "rate_limit", totals: noResult },
+      { class: "idle", reason: "no_line", totals: idle },
+      { class: "productive", reason: "done", totals: productive },
+    ],
+    reloads: 0,
+  };
+}
+
 describe("AI spend panel rules", () => {
   it("no adapter reported cost: cost and tokens say 'not reported', the waste share is in requests, and not-classified runs are their own segment", () => {
     const report = requestsOnly();
@@ -95,6 +136,51 @@ describe("AI spend panel rules", () => {
     expect(html).toContain("not reported: the adapters of these runs don&#x27;t report it");
     expect(html).toContain("1 context reload (a restart that re-sent a failed run&#x27;s context)");
     expect(html).toContain('aria-pressed="true" data-spend-window="today"');
+    // Nothing was reported, so nothing is partly reported
+    expect(partlyReportedNote(requestsOnly())).toBeNull();
+    expect(html).not.toContain('data-spend="partly-reported"');
+  });
+
+  it("cost reported by some runs only: a class or reason whose runs reported none says 'not reported' (never $0.00 or 0 tokens), a class with no runs is a true 0, and the waste share says it is of the reported cost", () => {
+    const report = mixed();
+    const bars = spendBars(report);
+    const segments = (unit: string) => bars.find((b) => b.unit === unit)!.segments.map((s) => [s.class, s.value, s.text]);
+    expect(segments("cost")).toEqual([
+      ["productive", 0.5, "$0.50"],
+      ["idle", 0.25, "$0.25"],
+      ["noResult", null, "not reported"],
+    ]);
+    expect(segments("tokens")).toEqual([
+      ["productive", 60_000, "60k tokens"],
+      ["idle", 40_000, "40k tokens"],
+      ["noResult", null, "not reported"],
+    ]);
+    // The productive Claude Code run counted no request lines: unknown, not 0
+    expect(segments("requests")).toEqual([
+      ["productive", null, "not reported"],
+      ["idle", 12, "12 requests"],
+      ["noResult", 30, "30 requests"],
+    ]);
+    expect(bars.find((b) => b.unit === "cost")!.segments.find((s) => s.class === "noResult")!.share).toBe(0);
+    // A class with no runs at all is a true 0
+    expect(spendBars({ ...report, noResult: totals() }).find((b) => b.unit === "cost")!.segments.at(-1)).toMatchObject({ class: "noResult", value: 0, text: "$0.00" });
+
+    expect(topWasteReasons(report).map((r) => [r.label, r.runs, r.amount])).toEqual([
+      ["wrote no queue line", 2, "$0.25 (reported for 1 of them)"],
+      ["hit a rate limit or quota", 1, "not reported"],
+    ]);
+    expect(wasteSentence(report)).toBe("33% of the reported cost (2 of 4 runs) went to idle runs or runs with no result");
+    expect(partlyReportedNote(report)).toBe("Tokens and cost cover only the 2 of 4 runs whose adapter reported them; the others' are not reported, never estimated.");
+    // Every run reported: the plain sentence, no caveat
+    const all = { ...report, totals: { ...report.totals, reportedRuns: 4 } };
+    expect(wasteSentence(all)).toBe("33% of the cost went to idle runs or runs with no result");
+    expect(partlyReportedNote(all)).toBeNull();
+
+    const html = renderToStaticMarkup(
+      createElement(SpendPanelView, { report: { data: report, loading: false, error: null }, signedIn: true, range: "today", by: "project", onRange: () => undefined, onBy: () => undefined }),
+    );
+    expect(html).toContain('data-spend="partly-reported"');
+    expect(html).not.toContain("$0.00");
   });
 
   it("a group without the report's unit shows its waste in the next unit it has; one with nothing classified shows a dash", () => {
@@ -155,6 +241,15 @@ describe("AI spend panel rules", () => {
     );
     const timed = { ...report, groups: [{ ...report.groups[0], totals: totals({ runs: 1, minutes: 3 }) }] };
     expect(agentSpendLine(timed, "builder-k")).toContain("· 3 min (tokens and cost not reported)");
+    // Its adapter changed during the day: 4 runs on the kiro CLI, 1 on Claude Code at $0.30. The cost is partly reported
+    const changed = { ...report, groups: [{ ...report.groups[0], totals: totals({ runs: 5, minutes: 62, requests: 40, cost: 0.3, tokens: 9_000, reported: true, reportedRuns: 1 }) }] };
+    expect(agentSpendLine(changed, "builder-k")).toBe(
+      "Today (UTC): 5 runs: 2 productive, 1 idle, 1 with no result, 1 not classified yet · cost $0.30 for 1 of 5 runs (partly reported; the others' not reported), 40 requests",
+    );
+    // Every run reported: the cost alone
+    const reported = { ...report, groups: [{ ...report.groups[0], totals: totals({ runs: 5, minutes: 62, cost: 1.2, tokens: 9_000, reported: true }) }] };
+    expect(agentSpendLine(reported, "builder-k")).toContain("· cost $1.20");
+    expect(agentSpendLine(reported, "builder-k")).not.toContain("partly");
   });
 
   it("numbers in words, and a reason a newer server sends", () => {

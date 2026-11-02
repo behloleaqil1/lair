@@ -138,7 +138,8 @@ export const CLASS_HINT: Record<SpendSegmentClass, string> = {
 
 export interface SpendSegment {
   class: SpendSegmentClass;
-  value: number;
+  /** null: the class has runs but none of them reported or counted this unit ("not reported", never a 0) */
+  value: number | null;
   /** Of the bar's total, 0 to 1 */
   share: number;
   text: string;
@@ -158,7 +159,9 @@ const SEGMENTS: readonly SpendSegmentClass[] = ["productive", "idle", "noResult"
 
 /**
  * One bar per unit with data. Cost and tokens with no reported run say "not reported" instead; a unit nothing
- * counted (no request lines, no turns) is left out. Not-classified-yet runs are a segment only when there are some.
+ * counted (no request lines, no turns) is left out. A class with runs none of which reported or counted the unit
+ * says "not reported" in its segment (its amount is unknown, not 0); a class with no runs is a true 0.
+ * Not-classified-yet runs are a segment only when there are some.
  */
 export function spendBars(report: SpendReportView): SpendBar[] {
   const bars: SpendBar[] = [];
@@ -170,18 +173,40 @@ export function spendBars(report: SpendReportView): SpendBar[] {
         continue;
       }
     } else if (total === null || (total === 0 && unit !== "runs")) continue;
-    const segments = SEGMENTS.map((cls) => {
-      const value = valueIn(report[cls], unit) ?? 0;
-      return { class: cls, value, share: total && total > 0 ? value / total : 0, text: formatIn(unit, value) };
-    }).filter((s) => s.class !== "unclassified" || s.value > 0);
-    bars.push({ unit, label: UNIT_LABEL[unit], notReported: false, total: total ?? 0, totalText: formatIn(unit, total ?? 0), segments });
+    const segments = SEGMENTS.filter((cls) => cls !== "unclassified" || report.unclassified.runs > 0).map((cls): SpendSegment => {
+      const t = report[cls];
+      const value = t.runs === 0 ? 0 : valueIn(t, unit);
+      if (value === null) return { class: cls, value: null, share: 0, text: NOT_REPORTED };
+      return { class: cls, value, share: total > 0 ? value / total : 0, text: formatIn(unit, value) };
+    });
+    bars.push({ unit, label: UNIT_LABEL[unit], notReported: false, total, totalText: formatIn(unit, total), segments });
   }
   return bars;
 }
 
-/** "42% of the model requests went to idle runs or runs with no result", or null when nothing was classified */
+/** Some runs reported tokens and cost and some didn't: tokens and cost cover only the ones that did */
+export const partlyReported = (t: SpendTotalsView): boolean => t.reportedRuns > 0 && t.reportedRuns < t.runs;
+
+/**
+ * The caveat beside the bars when tokens and cost cover only some of the window's runs (from the report's totals, so
+ * it holds whatever the table is grouped by), or null
+ */
+export function partlyReportedNote(report: SpendReportView): string | null {
+  const t = report.totals;
+  if (!partlyReported(t)) return null;
+  return `Tokens and cost cover only the ${t.reportedRuns} of ${plural(t.runs, "run")} whose adapter reported them; the others' are ${NOT_REPORTED}, never estimated.`;
+}
+
+/**
+ * "42% of the model requests went to idle runs or runs with no result", or null when nothing was classified. In cost,
+ * when only some runs reported it, the sentence says it is the reported cost and of how many runs.
+ */
 export function wasteSentence(report: SpendReportView): string | null {
   if (report.wasteShare === null) return null;
+  const t = report.totals;
+  if (report.unit === "cost" && partlyReported(t)) {
+    return `${formatShare(report.wasteShare)} of the reported cost (${t.reportedRuns} of ${plural(t.runs, "run")}) went to idle runs or runs with no result`;
+  }
   return `${formatShare(report.wasteShare)} of ${UNIT_PHRASE[report.unit]} went to idle runs or runs with no result`;
 }
 
@@ -234,20 +259,23 @@ export interface WasteReasonRow {
   amount: string;
 }
 
-/** The idle and no-result reasons that cost the most in the report's unit, then by runs; at most `n` */
+/**
+ * The idle and no-result reasons that cost the most in the report's unit, then by runs; at most `n`. A reason whose
+ * runs didn't report the unit says "not reported" (and ranks after the known amounts), never a 0.
+ */
 export function topWasteReasons(report: SpendReportView, n = 5): WasteReasonRow[] {
   const unit = report.unit;
   return report.reasons
     .filter((r) => r.class === "idle" || r.class === "no_result")
-    .map((r) => ({ r, value: valueIn(r.totals, unit) ?? 0 }))
-    .sort((a, b) => b.value - a.value || b.r.totals.runs - a.r.totals.runs || a.r.reason.localeCompare(b.r.reason))
+    .map((r) => ({ r, value: valueIn(r.totals, unit) }))
+    .sort((a, b) => (b.value ?? -1) - (a.value ?? -1) || b.r.totals.runs - a.r.totals.runs || a.r.reason.localeCompare(b.r.reason))
     .slice(0, n)
     .map(({ r, value }) => ({
       key: `${r.class}/${r.reason}`,
       class: CLASS_OF[r.class],
       label: reasonLabel(r.reason),
       runs: r.totals.runs,
-      amount: unit === "runs" ? "" : formatIn(unit, value),
+      amount: unit === "runs" ? "" : value === null ? NOT_REPORTED : `${formatIn(unit, value)}${unit === "cost" && partlyReported(r.totals) ? ` (reported for ${r.totals.reportedRuns} of them)` : ""}`,
     }));
 }
 
@@ -391,7 +419,8 @@ export function guardLines(guards: readonly SpendGuardView[], range: SpendPanelW
 
 /**
  * An agent's line in its detail (today's report, by agent): its runs per class, then its cost, else its requests,
- * else its time, saying when tokens and cost are not reported.
+ * else its time, saying when tokens and cost are not reported, and when the cost covers only some of its runs
+ * (partly reported: an adapter changed during the day).
  */
 export function agentSpendLine(report: SpendReportView, agent: string): string {
   const group = report.groups.find((g) => g.key === agent);
@@ -399,11 +428,12 @@ export function agentSpendLine(report: SpendReportView, agent: string): string {
   const parts = [`${group.productive.runs} productive`, `${group.idle.runs} idle`, `${group.noResult.runs} with no result`];
   if (group.unclassified.runs > 0) parts.push(`${group.unclassified.runs} not classified yet`);
   const t = group.totals;
-  const amount =
-    t.reported && t.cost !== null
-      ? `cost ${formatCost(t.cost)}`
-      : t.requests !== null
-        ? `${formatIn("requests", t.requests)}, ${formatMinutes(t.minutes)} (tokens and cost ${NOT_REPORTED})`
-        : `${formatMinutes(t.minutes)} (tokens and cost ${NOT_REPORTED})`;
+  let amount: string;
+  if (t.reported && t.cost !== null && partlyReported(t)) {
+    amount = `cost ${formatCost(t.cost)} for ${t.reportedRuns} of ${plural(t.runs, "run")} (partly reported; the others' ${NOT_REPORTED})`;
+    if (t.requests !== null) amount += `, ${formatIn("requests", t.requests)}`;
+  } else if (t.reported && t.cost !== null) amount = `cost ${formatCost(t.cost)}`;
+  else if (t.requests !== null) amount = `${formatIn("requests", t.requests)}, ${formatMinutes(t.minutes)} (tokens and cost ${NOT_REPORTED})`;
+  else amount = `${formatMinutes(t.minutes)} (tokens and cost ${NOT_REPORTED})`;
   return `Today (UTC): ${plural(t.runs, "run")}: ${parts.join(", ")} · ${amount}`;
 }

@@ -100,6 +100,7 @@ function totalsOf(acc: Acc): SpendTotalsView {
     tokens: reported ? acc.tokens : null,
     cost: reported && acc.cost !== null ? round(acc.cost, 6) : null,
     reported,
+    reportedRuns: acc.reportedRuns,
   };
 }
 
