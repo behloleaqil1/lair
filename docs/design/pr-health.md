@@ -203,7 +203,7 @@ interface NoteRecord {
   attempts: number; lastAttemptAt: number; nextAttemptAt: number | null; lastError: string | null;
   argv: string[];
   sentAt: number | null;
-  withdraw: null | { status: "running" | "done" | "skipped" | "failed" | "gave_up"; attempts: number;
+  withdraw: null | { status: "running" | "done" | "skipped" | "failed" | "gave_up"; why: "fixed" | "head_moved" | "closed" | "ignored"; attempts: number;
                      lastAttemptAt: number; nextAttemptAt: number | null; lastError: string | null };
 }
 ```
@@ -221,7 +221,7 @@ On load, a `running` note or withdrawal becomes `failed` with "interrupted by a 
 - A kind that clears and comes back at the same head is not noted again, as the script's seen-file rule did. Its status still shows it.
 
 **Withdrawals.** A `sent` record is withdrawn once it is cleared. A record is cleared when one of these holds, judged from the ledger and this process's reads, not from findings that existed before a restart:
-- a successful list of its repository no longer has the PR (closed or merged);
+- a successful list of its repository no longer has the PR (closed or merged), or now skips it (`ignored`: it became ignored or targets another base);
 - a successful read shows the PR's head is no longer the record's `head` (the head moved);
 - successful reads of the PR at the record's head have found none of the record's kinds open for `clear_minutes`, counted from the first such read.
 

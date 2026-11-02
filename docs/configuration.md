@@ -3162,21 +3162,23 @@ No one module owns `repos:`, so an edit to it reloads every module of the projec
 
 PR health reads the open pull requests of each repository in [`repos:`](#repositories) and finds the ones that went bad: `conflicts` (the host says the PR can't merge into its base), `behind` (more than `behind_threshold` commits behind the base), `no_ci` (no check has run at the head of a non-draft PR for `no_ci_minutes`) and `ci_red` (the newest run of a check at the head failed). `no_ci` and `ci_red` need the repository's `ci_counts`. Design: [docs/design/pr-health.md](design/pr-health.md).
 
-It is off unless a project sets `pr_health.enabled: true`, and it only observes: it emits events and serves a read-only status (`GET /api/pr-health/status?project=`), and writes nothing. Startup logs `[pr-health] Watching PRs for: …` or `[pr-health] Off (no project sets pr_health.enabled)`, and a changed `pr_health:`, `review:` or `repos:` reloads it without a restart. Act mode (a note to the owning agent, Decision Inbox notices) comes in a later version.
+It is off unless a project sets `pr_health.enabled: true`, and it starts in **observe** mode: it emits events and serves a read-only status (`GET /api/pr-health/status?project=`), and writes nothing. In **act** mode it also sends the owning agent one note per problem and withdraws it once the problem clears, and raises a Decision Inbox notice only when nobody owns the PR or a note could not be delivered (see Act mode below). Startup logs `[pr-health] Watching PRs for: …` or `[pr-health] Off (no project sets pr_health.enabled)`, and a changed `pr_health:`, `review:` or `repos:` reloads it without a restart.
 
 ```yaml
 pr_health:
   enabled: true
-  mode: observe                  # act arrives in a later version (it needs notify_cmd)
+  mode: act                      # default observe; act needs notify_cmd
   interval_seconds: 300
   ignored_prs: [example/app#7]
   ignored_branches: ["dependabot/**"]
+  notify_cmd: ["/opt/lair-hooks/agent-note", "{agent}", "{id}", "{message}"]
+  withdraw_cmd: ["/opt/lair-hooks/agent-unnote", "{agent}", "{id}", "{message}"]
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | boolean | `false` | |
-| `mode` | `observe` \| `act` | `observe` | `act` needs `notify_cmd`; this version does not act |
+| `mode` | `observe` \| `act` | `observe` | `act` needs `notify_cmd`; a `read_only` project only observes |
 | `interval_seconds` | integer | `300` | 60-3600; the first tick runs 1 s after start, and the next is scheduled when one ends |
 | `request_timeout_seconds` | integer | `20` | 1-120; a timeout is a failure of that repository for the tick |
 | `max_prs_per_repo` | integer | `30` | 1-100 PRs read per repository and tick (newest first, PRs left unread last tick before them) |
@@ -3188,8 +3190,11 @@ pr_health:
 | `ignored_prs` | list | `[]` | `owner/name#N` of a listed repository, at most 200 |
 | `ignored_branches` | list | `["dependabot/**"]` | Head branch globs (`*` within one segment, `**` across, `?`), at most 50 |
 | `owner.branch_window_minutes` | integer | `360` | 0-10080: how recent a head commit must be for the owner rule's branch step (0: no branch step) |
-| `notify_cmd`, `withdraw_cmd` | argv \| null | `null` | For act mode (a later version); placeholders `{agent}`, `{repo}`, `{pr}`, `{head}`, `{kinds}`, `{id}`, `{message}` only |
-| `command_timeout_seconds`, `max_attempts`, `backoff_seconds`, `escalate_after_minutes` | | `30`, `3`, `300`, `null` | For act mode (a later version) |
+| `notify_cmd`, `withdraw_cmd` | argv \| null | `null` | The commands that send a note and withdraw one (act mode); placeholders `{agent}`, `{repo}`, `{pr}`, `{head}` (8 hex), `{kinds}` (comma-separated), `{id}` (the delivery id) and `{message}` (one line, at most 500 characters) only. `withdraw_cmd: null` marks a withdrawal `skipped` |
+| `command_timeout_seconds` | integer | `30` | 1-300; a command that does not exit in time is killed with its process group and counts as failed |
+| `max_attempts` | integer | `3` | 1-5 attempts per note or withdrawal |
+| `backoff_seconds` | integer | `300` | 30-3600: the wait after a failed attempt, doubled each time (at most 6 h) |
+| `escalate_after_minutes` | integer \| null | `null` | 10-10080: an `unfixed` notice when a problem is still found this long after its note was sent; `null`: never |
 
 **What is read.** Each tick reads each repository in order: its open PRs (one page of 100; `truncated` in the status says more exist, and a PR missing from a full page is not taken as closed) and its base tip. A PR named in `ignored_prs`, from a branch in `ignored_branches` or into another branch than the base (a stacked PR) is skipped and listed with why. For the others the PR itself is read for its mergeability and compared with the base when its head or the base tip moved or mergeability was not known yet, and its checks are read unless they all passed at this head. An unchanged PR whose checks passed costs no request. The host's token and URL are the review module's (`review.token_env`, `review.token_cmd`, `review.api_url`), else `GITHUB_TOKEN` and `https://api.github.com`.
 
@@ -3201,7 +3206,15 @@ pr_health:
 
 **Status.** `GET /api/pr-health/status?project=` shows each repository (`state`, `partial`, `truncated`, skipped PRs with why), each finding with its owner, and `planned`: what act mode would do now, a note per owned (repository, PR, head) with the argv `notify_cmd` would run, and a `no_owner` notice per unowned one (an unknown owner plans nothing). The note's text uses Lair's words and counts only, never a branch name, check name or PR title.
 
-**Events.** `pr_health.finding` `{project, key, repo, pr, head, kind, owner, ownerSource, mode}` (emitted at the end of the tick that opens it, with its owner: `null` when nobody owns it or the owner is unknown), `pr_health.cleared` `{project, key, repo, pr, head, kind, why}` (`fixed`, `head_moved`, `closed` or `ignored`) and `pr_health.repo_error` `{project, repo, error}`.
+**Act mode.** With `mode: act` (and a project that is not `read_only`), each tick runs at most 4 commands, notes and withdrawals together, as argv arrays with no shell, in the project's repository, with `command_timeout_seconds`:
+- **Notes.** For each (repository, PR, head) whose owner is an agent, the kinds the last read found that no earlier note of that head named go into one `notify_cmd` run. Its delivery id `{id}` is `pr_health:<owner/name>#<n>@<head8>:<kinds joined "+">`. The note is written to the ledger before the command runs; exit 0 makes it `sent`, which is final (also across restarts); anything else is retried with the same `{id}` after the backoff while its kinds are still found, and gives up after `max_attempts`. `notify_cmd` should be idempotent on `{id}`: a command that delivered and then failed or was cut off by a restart runs once more with the same `{id}`. A kind that clears and comes back at the same head is not noted again; a new head starts over.
+- **Withdrawals.** A sent note is withdrawn once its problem cleared, judged from the reads after a restart too: its PR is gone from a full list (or now skipped), its head moved, or reads at its head found none of its kinds for `clear_minutes`. A note never sent gets none.
+- **Ledger.** `data/pr-health-deliveries.json` (format 1, written atomically). Records older than 14 days, then the oldest over 2000, are pruned, but never one whose head still has a finding, whose withdrawal is pending, or of a repository not read since the start. A file that can't be read or parsed is never overwritten: notes and withdrawals stop and `lastError` says why.
+- **Inbox notices** (class `pr_health.notice`, one per (repository, PR, head), for information with one "Noted" option): `no_owner` (nobody owns the PR; an unknown owner raises nothing), `delivery_failed` (a note gave up) and, with `escalate_after_minutes`, `unfixed`. One noted is not raised again for that head. A notice is withdrawn when its head has no open finding, and one left from before a restart once its repository has been read and nothing was seen for `clear_minutes`. A reload to observe, `enabled: false` or `read_only` withdraws the open notices and runs no command; the ledger stays.
+
+The status adds `deliveries` (the ledger's records of the project) and `warning` (the ledger's cap gave way to records it still needs).
+
+**Events.** `pr_health.finding` `{project, key, repo, pr, head, kind, owner, ownerSource, mode}` (emitted at the end of the tick that opens it, with its owner: `null` when nobody owns it or the owner is unknown), `pr_health.cleared` `{project, key, repo, pr, head, kind, why}` (`fixed`, `head_moved`, `closed` or `ignored`) and `pr_health.repo_error` `{project, repo, error}`. Act mode: `pr_health.noted` `{project, id, repo, pr, head, kinds, agent, result, attempts, error}` (`sent`, `failed` or `gave_up`), `pr_health.withdrawn` `{project, id, agent, result, attempts, error}` (`done`, `skipped`, `failed` or `gave_up`) and `pr_health.escalated` `{project, key, code, decisionId}`.
 
 ## Tracker
 
