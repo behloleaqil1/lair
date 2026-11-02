@@ -823,6 +823,7 @@ Every route that changes something only you should change needs the owner's sess
 | `/api/health/diagnostics`, `/api/supervisor` | everything: the self-checks' results, minting, listing and revoking ops tokens, their audit ([Supervisor API](#supervisor-api)) | nothing (`/api/health` itself stays open) |
 | `/api/ops` | nothing: it takes an [ops token](#the-ops-api), never the owner's session, and grants no CORS | — |
 | `/api/host-services/owner` | the tick, which runs start commands in act mode ([Host services API](#host-services-api)) | the status, the holds and the hold check under `/api/host-services` |
+| `/api/work` | everything: the work store's status, tasks and events, and imports ([Work store](#work-store)) | nothing |
 
 The watchdog's routes are all reads; it acts only inside the server. Lair's own work doesn't go through these routes either: delivery's automatic deploys, the scheduler, the healer and the watchdog's playbooks run inside the server, server code starts pipeline runs with `PipelineManager.startRun` and creates tasks with the job manager, and agents use the fleet bus (`npm run bus`), which works on the bus database directly. The `lair-node` daemon connects over `/ws/node`, not these routes.
 
@@ -3359,6 +3360,36 @@ The tasks it follows are `agents.fill.tasks_file` (the planner's done marker mar
 - `POST /api/tracker/links` `{task, repo, issue}`: accept a proposed link (one of the candidates of the last reconcile's proposal for that task, an ambiguous one included). Checked now (409 when it is not proposed or the task is linked already), made by a queued job (202) that reads the issue again (still open, not a PR, linked to no other task) and records `link_issue` in the audit with the owner session (`success`, or `skipped`/`error` and why). 403 without an owner session, 404 when the tracker is off
 
 The tracker emits no events of its own. The dashboard tab is not built yet.
+
+## Work store
+
+Tasks and their events in Lair's own database instead of project files ([design](design/work-store.md)). Off by
+default; a project opts in, and moves one step at a time.
+
+```yaml
+work_store:
+  mode: off  # off | observe
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `work_store.mode` | `off` \| `observe` | `off` | `off`: today's files exactly; no store file is created and every `/api/work` route answers 404 for the project. `observe`: the project's store (`data/work/<project>.db`) follows the files one way when you import; fill, the planner and the tracker still read the files |
+
+An unknown key under `work_store:` or another value is a config error (the live reload keeps the previous config, and
+the store stays off). `on`, where fill reads the store, comes in a later version.
+
+**Import.** `POST /api/work/import?project=<name>` with `{"dry_run": true}` (the default) reports what it would change
+and writes nothing; `{"dry_run": false}` applies it in one transaction, with your session as the actor on every event.
+It reads only the configured files, `agents.fill.tasks_file` and `queue_file`, with fill's own parser and checks: an
+open line is `ready`; a `DONE` line fill accepts makes it `done` (a `DONE` the ready guard refuses does not); its
+latest run's last `WAITING` or `BLOCKED` line makes it `waiting` or `blocked`; a done line (the planner's
+`done_marker`) is `done`; a task imported before and gone from the file is `dropped`. A task a run or claim holds stays
+`ready` and is shown `assigned` or `running`. Running the import again changes only what differs; an unreadable tasks
+file imports and drops nothing; a line fill refuses is a warning, and the task ids on it are never dropped.
+
+**Reads.** `GET /api/work/status?project=<name>` (the mode, the schema version, tasks by state, the last import),
+`GET /api/work/tasks?project=<name>&state=&agent=&limit=` and `GET /api/work/task?project=<name>&id=<task>` (one task
+and its newest events). Every `/api/work` route needs the owner's session, reads included.
 
 ## Lessons
 

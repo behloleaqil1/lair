@@ -44,6 +44,8 @@ export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/cloud",
   // The tracker: its status shows task text and repositories, and a reconcile writes to GitHub (every route the owner's)
   "/api/tracker",
+  // The work store: its reads show task text and file paths, and an import writes the store (every route the owner's)
+  "/api/work",
   // The supervisor: Lair's diagnostics, and the ops tokens and their audit (every route the owner's)
   "/api/health/diagnostics",
   "/api/supervisor",

@@ -68,6 +68,8 @@ export interface ServerModules {
   prHealth?: PrHealthManager;
   /** The fleet bus's switch (bus.consume, src/server/bus/consumers.ts): validated and applied per project */
   bus?: { validate(config: ProjectConfig): string[]; reloadProject(entry: ProjectEntry): Promise<void> };
+  /** The work store's switch (work_store.mode, src/server/work/): validated and applied per project */
+  work?: { validate(config: ProjectConfig): string[]; reloadProject(entry: ProjectEntry): Promise<void> };
 }
 
 function errorsOf(result: { ok: true } | { ok: false; errors: string[] }): string[] {
@@ -77,7 +79,7 @@ function errorsOf(result: { ok: true } | { ok: false; errors: string[] }): strin
 /** The server's modules, as src/server/index.ts wires them. */
 export function serverModules(m: ServerModules): ReloadableModule[] {
   const modules: ReloadableModule[] = [];
-  const { delivery, watchdogs, pipelines, reviews, agents, triage, placements, hostServices, clouds, planner, supervisor, trackers, infraMonitor, prHealth, bus } =
+  const { delivery, watchdogs, pipelines, reviews, agents, triage, placements, hostServices, clouds, planner, supervisor, trackers, infraMonitor, prHealth, bus, work } =
     m;
   if (delivery) {
     modules.push({
@@ -214,6 +216,16 @@ export function serverModules(m: ServerModules): ReloadableModule[] {
       blocks: ["bus"],
       validate: (config) => bus.validate(config),
       reload: (entry) => bus.reloadProject(entry),
+    });
+  }
+  if (work) {
+    modules.push({
+      name: "work_store",
+      blocks: ["work_store"],
+      // An import reads agents.fill's tasks file and patterns and the planner's done marker from the config it was given
+      reads: ["agents", "planner"],
+      validate: (config) => work.validate(config),
+      reload: (entry) => work.reloadProject(entry),
     });
   }
   return modules;
