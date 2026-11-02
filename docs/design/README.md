@@ -46,6 +46,7 @@
 - [ai-roles.md](ai-roles.md): any AI tool and model, per role; how Lair checks sign-in and keeps API keys
 - [ai-spend.md](ai-spend.md): AI spend and waste: usage per run, productive/idle/no-result classes, a spend panel, and guards against retry, wake and planner waste
 - [decision-brain.md](decision-brain.md): decision brain v3: rules for today's repeating decision classes, a per-class bench on all answered decisions, abstain rules, and a shadow trial for a small local model
+- [provider-limits.md](provider-limits.md): provider quotas and outages: structured error matching, daily and monthly caps with probes toward the reset, a burst of dead-on-start runs as an outage, fallback order per role, and switch-back
 - [settings-v2.md](settings-v2.md): Settings organised by task, and the look and feel of the whole dashboard
 - [app-architecture.md](app-architecture.md): the architecture stage for the apps Lair builds: quality attributes, trade-offs, ADRs, the stack, reference architectures and fitness functions
 - [importer.md](importer.md): taking over an existing project: discovery and audit, a proposed setup, shadow mode, a staged reversible cutover
