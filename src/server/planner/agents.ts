@@ -2,10 +2,11 @@
  * What the planner needs from the agents module, in-process (the rule:
  * modules start runs through AgentsManager.requestRun, never over HTTP):
  * starting the planner agent's run, its runs and fill's done records in the
- * agents store, fill's lines, and releasing a no_done hold for an unblock.
+ * agents store, fill's lines, releasing a no_done hold for an unblock, and
+ * recording its guards' verdicts where the spend API counts them.
  */
 import type { AgentRunView, FillLineView, RunOrigin } from "../../shared/agents-types.js";
-import type { AgentsManager } from "../agents/service.js";
+import type { AgentsManager, ModuleGuard } from "../agents/service.js";
 import type { AgentsStore } from "../agents/store.js";
 import type { StructuredReport } from "../bus/consumers.js";
 
@@ -23,6 +24,11 @@ export interface PlannerAgents {
    * report the line was read from (bus.consume on), whose PR and head are its own fields
    */
   reportAccepted(project: string, agent: string, task: string, line: string, taskText: string, report?: StructuredReport | null): Promise<boolean>;
+  /**
+   * A G6 guard's verdict (docs/design/ai-spend.md §4.5): a guard_would (observe) or guard_did (act) event of the
+   * agents module, once per dedupe key; nothing while agents.spend is off. True when this call recorded it.
+   */
+  recordGuard(project: string, kind: "guard_would" | "guard_did", guard: ModuleGuard): Promise<boolean>;
 }
 
 /** The agents module as the planner uses it (the service is looked up on every call, so a reload is followed). */
@@ -38,5 +44,6 @@ export function plannerAgentsFrom(manager: AgentsManager): PlannerAgents {
       if (!service) throw new Error(`the agents module is off for ${project}`);
       await service.releaseFillHold(task, "planner");
     },
+    recordGuard: (project, kind, guard) => manager.recordModuleGuard(project, kind, guard),
   };
 }

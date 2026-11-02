@@ -215,4 +215,21 @@ export interface PlannerOverviewView extends PlannerStatusView {
     nextRunAt: string | null;
   } | null;
   pausedReason: string | null;
+  /** Owner messages recorded as handled (planner.guards.handled_messages), the newest first */
+  handledMessages: HandledMessageView[];
+}
+
+/** An owner message recorded as handled: left out of the planner's later contexts and triggers. */
+export interface HandledMessageView {
+  id: string;
+  /** The task whose closing handled it; null when the owner marked it */
+  task: string | null;
+  at: string;
+  by: "lair" | "owner";
+}
+
+/** POST /api/planner/messages/:id/handled and .../reopen: the message's state after the call. */
+export interface OwnerMessageStateView {
+  id: string;
+  handled: HandledMessageView | null;
 }
