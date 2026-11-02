@@ -27,7 +27,7 @@ export interface PrFacts {
   checksSettled: boolean;
 }
 
-/** Who should hear about a PR's problems (the owner rule, a later version). */
+/** Who hears about a PR's problems (owner.ts): agent null means nobody owns it, with the reason */
 export interface OwnerView {
   agent: string | null;
   source: "task_line" | "branch" | null;
@@ -74,7 +74,7 @@ export interface RepoView {
   skipped: { pr: number; why: "ignored_prs" | "ignored_branches" | "other_base" | "max_prs_per_repo" }[];
 }
 
-/** What act mode would do now (it arrives with the owner rule and act mode; empty until then). */
+/** What act mode would do now (plan.ts): a note per owned (repo, PR, head), a no_owner notice per unowned one */
 export type Planned =
   | { type: "note" | "withdraw"; id: string; agent: string | null; argv: string[] | null; reason: string | null }
   | { type: "notice"; key: string; code: "no_owner" | "delivery_failed" | "unfixed" };

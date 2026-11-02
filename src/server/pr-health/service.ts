@@ -18,21 +18,24 @@
  * repository for the tick and keeps its findings exactly as they were, so
  * nothing is cleared or found again when it recovers. The budget and the
  * deadline stop it the same way and mark it partial.
+ * 4. Then, for each (repo, PR, head) with open findings: its owner (owner.ts)
+ *    and what act mode would do (plan.ts). A new finding's event carries it.
  *
  * Observe only: it emits events and serves a status, and writes nothing.
  */
 import type { EventBus } from "../core/event-bus.js";
 import type { ProjectConfig } from "../../shared/types.js";
 import { tokenFrom, type FetchLike } from "../review/github.js";
-import type { GitHost, HostPullRequest } from "../review/host.js";
+import type { GitHost, HostCommit, HostPullRequest } from "../review/host.js";
 import { newestChecks, RepoHosts, type RepoEntry } from "../repos/index.js";
 import { actBlockedReason, KINDS, parsePrHealthConfig, type PrHealthSettings } from "./config.js";
 import { findingKey, kindsOf, readOrder, skipReason } from "./detect.js";
-import type { ClearedWhy, FindingView, PrFacts, PrHealthStatus, PrHealthTick, RepoView } from "./types.js";
+import { ownerOf, type FillSource, type OwnerInputs } from "./owner.js";
+import { plan, type PlanGroup } from "./plan.js";
+import type { ClearedWhy, FindingView, Planned, PrFacts, PrHealthStatus, PrHealthTick, RepoView } from "./types.js";
 
 type Log = Pick<Console, "warn" | "log">;
 
-const OWNER_PENDING = "this version works out no owner (the owner rule comes next)";
 /** A full page of the open-PR list: more PRs may exist */
 const LIST_PAGE = 100;
 
@@ -48,6 +51,8 @@ export interface PrHealthOptions {
   config: ProjectConfig;
   settings: PrHealthSettings;
   events?: EventBus;
+  /** The agents module: fill's last check names the owners (none: nobody owns a PR) */
+  agents?: FillSource;
   /** Tests stand in for the git host's API here (the only stand-in) */
   fetch?: FetchLike;
   env?: NodeJS.ProcessEnv;
@@ -62,6 +67,8 @@ interface RepoState {
   cache: Map<number, PrFacts>;
   /** PRs that were due last tick and not read (the cap, the budget or an error): read first */
   unread: Set<number>;
+  /** The open PRs of the last successful list */
+  prs: Map<number, HostPullRequest>;
 }
 
 export class PrHealth {
@@ -69,12 +76,18 @@ export class PrHealth {
   readonly settings: PrHealthSettings;
   private readonly config: ProjectConfig;
   private readonly events?: EventBus;
+  private readonly agents?: FillSource;
   private readonly log: Log;
   private readonly now: () => number;
   private readonly firstTickMs: number;
   private readonly hosts: RepoHosts;
   private readonly repos = new Map<string, RepoState>();
   private readonly findings = new Map<string, FindingView>();
+  /** Findings opened this tick: their event goes out once their owner is known */
+  private opened: FindingView[] = [];
+  /** The head commit's committer date per <repo>#<pr>@<head> (null: not known), read once */
+  private readonly pushTimes = new Map<string, number | null>();
+  private planned: Planned[] = [];
   private budget = { used: 0, deadline: 0 };
 
   private timer: NodeJS.Timeout | null = null;
@@ -92,6 +105,7 @@ export class PrHealth {
     this.config = options.config;
     this.settings = options.settings;
     this.events = options.events;
+    this.agents = options.agents;
     this.log = options.log ?? console;
     this.now = options.now ?? (() => Date.now());
     this.firstTickMs = options.firstTickMs ?? 1000;
@@ -122,7 +136,7 @@ export class PrHealth {
         prsRead: 0,
         skipped: [],
       };
-      this.repos.set(entry.repo, { view, cache: new Map(), unread: new Set() });
+      this.repos.set(entry.repo, { view, cache: new Map(), unread: new Set(), prs: new Map() });
     }
   }
 
@@ -140,9 +154,15 @@ export class PrHealth {
 
   // ============ FINDINGS ============
 
+  /** Its event goes out at the end of the tick, with its owner. */
   private open(view: FindingView): void {
     this.findings.set(view.key, view);
-    this.log.warn(`[pr-health] ${this.project}: ${view.repo}#${view.pr} ${view.kind} (owner unknown)`);
+    this.opened.push(view);
+  }
+
+  private announce(view: FindingView): void {
+    const owner = view.owner === "unknown" ? null : view.owner;
+    this.log.warn(`[pr-health] ${this.project}: ${view.repo}#${view.pr} ${view.kind} (owner ${owner ? (owner.agent ?? "none") : "unknown"})`);
     void this.events?.emit("pr_health.finding", {
       project: this.project,
       key: view.key,
@@ -150,8 +170,8 @@ export class PrHealth {
       pr: view.pr,
       head: view.head,
       kind: view.kind,
-      owner: null,
-      ownerSource: null,
+      owner: owner?.agent ?? null,
+      ownerSource: owner?.source ?? null,
       mode: this.settings.mode,
     });
   }
@@ -175,7 +195,8 @@ export class PrHealth {
         if (!state.view.truncated) this.clear(f, "closed");
       } else if (skippedNow.has(f.pr)) this.clear(f, "ignored");
     }
-    for (const n of state.cache.keys()) if (!openNow.has(n)) state.cache.delete(n);
+    // A PR missing from a full page may still be open: its cached facts stay
+    if (!state.view.truncated) for (const n of state.cache.keys()) if (!openNow.has(n)) state.cache.delete(n);
   }
 
   /** One read PR's kinds against its open findings. */
@@ -189,13 +210,76 @@ export class PrHealth {
         if (open) open.clearingSince = null;
         else {
           const head = facts.headSha;
-          this.open({ key, repo: entry.repo, pr: pr.number, head, kind, since: now, clearingSince: null, owner: "unknown", ownerReason: OWNER_PENDING, noticeId: null });
+          const pending = "the owner is worked out at the end of the tick";
+          this.open({ key, repo: entry.repo, pr: pr.number, head, kind, since: now, clearingSince: null, owner: "unknown", ownerReason: pending, noticeId: null });
         }
       } else if (open && !unknown.has(kind)) {
         open.clearingSince ??= now;
         if (now - open.clearingSince >= this.settings.clearMinutes * 60_000) this.clear(open, "fixed");
       }
     }
+  }
+
+  // ============ OWNERS ============
+
+  /** The head commit's committer date (epoch ms, or null: not known), read once per (repo, PR, head). */
+  private async pushedAt(state: RepoState, pr: number, head: string): Promise<number | null> {
+    const key = `${state.view.repo}#${pr}@${head}`;
+    if (this.pushTimes.has(key)) return this.pushTimes.get(key) ?? null;
+    if (state.view.state === "error") throw new Error("the repository could not be read this tick");
+    let commits: HostCommit[];
+    try {
+      commits = await this.hosts.host(state.view.repo).listCommits(pr);
+    } catch (e) {
+      throw new Error(errorText(e));
+    }
+    const ms = Date.parse(commits.find((c) => c.sha === head)?.committedAt ?? "");
+    const at = Number.isFinite(ms) ? ms : null;
+    this.pushTimes.set(key, at);
+    return at;
+  }
+
+  /** Each (repo, PR, head) with open findings gets its owner; returns them with the facts a note needs. */
+  private async assignOwners(now: number): Promise<PlanGroup[]> {
+    const inputs: OwnerInputs = {
+      fill: this.agents?.get(this.project)?.fillStatus() ?? null,
+      repos: this.settings.repos,
+      authors: this.settings.authors,
+      branchWindowMinutes: this.settings.branchWindowMinutes,
+      config: this.config,
+      now,
+    };
+    const heads = new Map<string, FindingView[]>();
+    for (const f of this.findings.values()) {
+      const key = `${f.repo}#${f.pr}@${f.head}`;
+      heads.set(key, [...(heads.get(key) ?? []), f]);
+    }
+    for (const key of this.pushTimes.keys()) if (!heads.has(key)) this.pushTimes.delete(key);
+    const groups: PlanGroup[] = [];
+    for (const list of heads.values()) {
+      const { repo, pr, head } = list[0];
+      const state = this.repos.get(repo) as RepoState;
+      const listed = state.prs.get(pr);
+      const result = await ownerOf({ repo, number: pr, headRef: listed?.headRef ?? "" }, inputs, () => this.pushedAt(state, pr, head));
+      for (const f of list) {
+        f.owner = "owner" in result ? result.owner : "unknown";
+        f.ownerReason = "unknown" in result ? result.unknown : null;
+      }
+      const facts = state.cache.get(pr);
+      const updated = Date.parse(listed?.updatedAt ?? "");
+      groups.push({
+        repo,
+        pr,
+        head,
+        kinds: list.map((f) => f.kind),
+        owner: result,
+        base: state.view.base,
+        behindBy: facts?.behindBy ?? 0,
+        failing: facts?.checks?.filter((c) => c.state === "failure").length ?? 0,
+        quietMinutes: Number.isFinite(updated) ? Math.max(0, Math.floor((now - updated) / 60_000)) : 0,
+      });
+    }
+    return groups;
   }
 
   // ============ READING ============
@@ -236,12 +320,15 @@ export class PrHealth {
     const wasError = view.state === "error";
     const host = this.hosts.host(entry.repo);
     let read = 0;
+    let listed = false;
     view.partial = false;
     try {
       const base = await this.hosts.base(entry.repo);
       view.base = base;
       const open = await host.listOpenPullRequests();
+      listed = true;
       Object.assign(view, { state: "ok", error: null, truncated: open.length >= LIST_PAGE, lastReadAt: now });
+      state.prs = new Map(open.map((p) => [p.number, p]));
       const skipped: RepoView["skipped"] = [];
       const due: HostPullRequest[] = [];
       for (const pr of open) {
@@ -262,7 +349,8 @@ export class PrHealth {
         read++;
       }
     } catch (e) {
-      if (e instanceof Spent) view.partial = true;
+      // Partial only means some PRs of a list went unread: a tick that never listed reads nothing new
+      if (e instanceof Spent) view.partial = listed;
       else {
         view.state = "error";
         view.error = errorText(e);
@@ -292,6 +380,8 @@ export class PrHealth {
     try {
       let prsRead = 0;
       for (const entry of this.settings.repos) prsRead += await this.readRepo(entry, now);
+      this.planned = plan(await this.assignOwners(now), this.settings);
+      for (const view of this.opened.splice(0)) if (this.findings.has(view.key)) this.announce(view);
       this.lastError = null;
       const done = this.now();
       this.lastTick = { at: iso(now), durationMs: done - now, requests: this.budget.used, prsRead, findings: this.findings.size };
@@ -350,8 +440,8 @@ export class PrHealth {
       lastError: this.lastError,
       stale: this.running && since !== null && now - since > 3 * this.settings.intervalSeconds * 1000,
       repos: [...this.repos.values()].map(({ view }) => ({ ...view, skipped: view.skipped.map((s) => ({ ...s })) })),
-      findings: [...this.findings.values()].map((f) => ({ ...f })),
-      planned: [],
+      findings: [...this.findings.values()].map((f) => ({ ...f, owner: f.owner === "unknown" ? f.owner : { ...f.owner } })),
+      planned: this.planned.map((p) => ("argv" in p && p.argv ? { ...p, argv: [...p.argv] } : { ...p })),
     };
   }
 }
@@ -366,10 +456,16 @@ export interface ProjectEntry {
 
 export type PrHealthManagerOptions = Omit<PrHealthOptions, "project" | "config" | "settings">;
 
+/** The startup log line for the projects PR health watches. */
+export function startedLine(projects: string[]): string {
+  return projects.length > 0 ? `[pr-health] Watching PRs for: ${projects.join(", ")}` : "[pr-health] Off (no project sets pr_health.enabled)";
+}
+
 /** Every project's PR health. */
 export class PrHealthManager {
   private readonly monitors = new Map<string, PrHealth>();
   private readonly problems = new Map<string, string[]>();
+  private phase: "loaded" | "started" | "stopped" = "loaded";
 
   constructor(private readonly options: PrHealthManagerOptions = {}) {}
 
@@ -382,7 +478,9 @@ export class PrHealthManager {
       const parsed = parsePrHealthConfig(entry.config);
       if (!parsed.ok) {
         this.problems.set(entry.name, parsed.errors);
-        (this.options.log ?? console).warn(`[pr-health] ${entry.name}: not started: ${parsed.errors.join("; ")}`);
+        // A project that does not turn PR health on is not warned about (its errors are in the status)
+        const on = (entry.config.pr_health as { enabled?: unknown } | undefined)?.enabled === true;
+        if (on) (this.options.log ?? console).warn(`[pr-health] ${entry.name}: not started: ${parsed.errors.join("; ")}`);
         continue;
       }
       if (!parsed.settings.enabled) continue;
@@ -392,11 +490,23 @@ export class PrHealthManager {
 
   /** Start every project's timer; returns the projects that watch something. */
   start(): string[] {
+    this.phase = "started";
     for (const monitor of this.monitors.values()) monitor.start();
     return [...this.monitors.values()].filter((m) => m.running).map((m) => m.project);
   }
 
+  /** A changed project file: stop the project's instance, then start it from the new config (none: off). */
+  async reloadProject(entry: ProjectEntry): Promise<void> {
+    if (this.phase === "stopped") return;
+    await this.monitors.get(entry.name)?.stop();
+    this.monitors.delete(entry.name);
+    this.problems.delete(entry.name);
+    this.load([entry]);
+    if (this.phase === "started") this.monitors.get(entry.name)?.start();
+  }
+
   async stop(): Promise<void> {
+    this.phase = "stopped";
     await Promise.all([...this.monitors.values()].map((m) => m.stop()));
     this.monitors.clear();
   }

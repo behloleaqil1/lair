@@ -83,6 +83,8 @@ export interface PrHealthSettings {
   apiUrl: string;
   tokenEnv: string;
   tokenCmd: string[] | null;
+  /** review.authors' branch mappings, for the owner rule's branch step (none when review: does not parse) */
+  authors: { branchPattern: RegExp | null; branches: BranchGlob[] };
 }
 
 export type ParseResult = { ok: true; settings: PrHealthSettings } | { ok: false; errors: string[] };
@@ -158,6 +160,7 @@ export function parsePrHealthConfig(project: ProjectConfig): ParseResult {
       apiUrl: review.ok ? review.settings.apiUrl : "https://api.github.com",
       tokenEnv: review.ok ? review.settings.tokenEnv : "GITHUB_TOKEN",
       tokenCmd: review.ok ? review.settings.tokenCmd : null,
+      authors: review.ok ? { branchPattern: review.settings.authors.branchPattern, branches: review.settings.authors.branches } : { branchPattern: null, branches: [] },
     },
   };
 }

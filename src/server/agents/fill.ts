@@ -2223,7 +2223,8 @@ export class AgentsFill {
       verdict = refuseReport("no_pr", "the task is about a pull request but the line names none", "Report again with `PR #<n> at <sha>` for the PR you opened.");
     } else {
       pr = parsed.report.pr;
-      repo = parsed.report.repo;
+      // Without a source the repository is a placeholder (NO_SOURCE_REPOS): events say none
+      repo = source ? parsed.report.repo : null;
       name = prName(parsed.report, repos);
       // A repository whose host is down holds only the reports about that repository
       const hostKey = parsed.report.repo.toLowerCase();
