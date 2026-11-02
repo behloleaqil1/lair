@@ -4,7 +4,7 @@
  */
 import { z } from "zod";
 import type { ProjectConfig } from "../../shared/types.js";
-import type { ReviewerOption, ReviewSlot, Tier } from "../../shared/review-types.js";
+import type { ReviewAskAfter, ReviewerOption, ReviewSlot, Tier } from "../../shared/review-types.js";
 import { DEFAULT_FILE_KINDS, DEFAULT_RISK_RULES, type RiskRule } from "../policy/risk-rules.js";
 import { isValidPromptName, PROMPT_NAME_RULE } from "../agents/prompts.js";
 import { ROLE_REF, roleIsSet, type RolePath } from "../ai/profiles.js";
@@ -38,6 +38,9 @@ const RuleSchema = z
   })
   .strict();
 
+/** A slot's `ask_after` values (staged review slots: docs/design/review-stages.md) */
+const ASK_AFTER: readonly ReviewAskAfter[] = ["gate", "earlier_slots"];
+
 const OptionString = z
   .string()
   .regex(new RegExp(`^(human|peer|self|agent:${AGENT_ID})$`), "use human, peer, self or agent:<id>");
@@ -51,13 +54,18 @@ const SlotSchema = z.union(
         different_model: z.boolean().default(false),
         /** Reviewer agents for this slot (reviews by agents), instead of reviewers_pool.<tier> */
         pool: Pool.optional(),
+        /** Ask for the slot only once these hold at the head (values checked in parseReviewConfig, which names them) */
+        ask_after: z.array(z.string()).max(10).optional(),
       })
       .strict(),
   ],
   {
     errorMap: (issue, ctx) =>
       issue.code === "invalid_union"
-        ? { message: "use human, peer, self or agent:<id>, or {any_of: [...], different_model: true, pool?: [...]}" }
+        ? {
+            message:
+              "use human, peer, self or agent:<id>, or {any_of: [...], different_model: true, pool?: [...], ask_after?: [gate, earlier_slots]}",
+          }
         : { message: ctx.defaultError },
   },
 );
@@ -342,7 +350,19 @@ function parseSlot(value: z.infer<typeof SlotSchema>): ReviewSlot {
   if (typeof value === "string") return { anyOf: [parseOption(value)], differentModel: false };
   const slot: ReviewSlot = { anyOf: value.any_of.map(parseOption), differentModel: value.different_model };
   if (value.pool) slot.pool = value.pool;
+  if (value.ask_after) slot.askAfter = value.ask_after as ReviewAskAfter[];
   return slot;
+}
+
+/** Why a slot's `ask_after` can't be used (`index`: the slot's place in its tier list), or null. */
+function askAfterError(askAfter: string[] | undefined, index: number): string | null {
+  if (askAfter === undefined) return null;
+  if (askAfter.length === 0) return "an empty list: leave ask_after out to ask as soon as the slot is missing";
+  const unknown = askAfter.find((v) => !(ASK_AFTER as readonly string[]).includes(v));
+  if (unknown !== undefined) return `unknown value ${JSON.stringify(unknown).slice(0, 80)} (use gate or earlier_slots)`;
+  if (new Set(askAfter).size !== askAfter.length) return "a value is listed twice";
+  if (index === 0 && askAfter.includes("earlier_slots")) return "earlier_slots on the tier's first slot: it has no earlier slot";
+  return null;
 }
 
 /** Branch names longer than this never match `authors.branch_pattern`. */
@@ -496,7 +516,10 @@ export function parseReviewConfig(
   for (const tier of ["red", "amber", "green"] as const) {
     unsetRoles(value.reviewers_pool[tier], `review.reviewers_pool.${tier}`);
     value.reviewers[tier]?.forEach((slot, i) => {
-      if (typeof slot !== "string") unsetRoles(slot.pool, `review.reviewers.${tier}[${i}].pool`);
+      if (typeof slot === "string") return;
+      unsetRoles(slot.pool, `review.reviewers.${tier}[${i}].pool`);
+      const askAfter = askAfterError(slot.ask_after, i);
+      if (askAfter) errors.push(`review.reviewers.${tier}[${i}].ask_after: ${askAfter}`);
     });
   }
 
