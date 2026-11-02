@@ -70,8 +70,8 @@ and while another writer was active.
   no open line (`service.ts:844-855`). A planner run then needs `debounce_seconds`, the run itself, the verifier and
   the approval before the agent gets a line. In observe mode that took tens of minutes.
 - **Unassigned lines go unused.** Fill already treats these lines as ready work for any agent
-  (`src/server/agents/fill.ts:944-1000`) and raises a notice when an agent is idle while ready work exists
-  (`fill.idle`, `src/server/agents/config.ts:150-161`). But nothing hands such a line to the idle agent.
+  (`src/server/agents/fill.ts:979-1035`) and raises a notice when an agent is idle while ready work exists
+  (`fill.idle`, `src/server/agents/config.ts:158-169`). But nothing hands such a line to the idle agent.
 - **It ignores phases and owner markers.** Nothing reads the plan's phase order or a plan line that is marked for the
   owner only. `orderTasks` (`src/server/planner/context.ts:41-45`) ranks tasks only by trigger and by `ready`.
 
@@ -91,10 +91,10 @@ keywords: idle, ready, restore, tamper, auto_apply, approval, unassigned, phase,
 | Plan tasks, ready flag | `service.ts:175` (`ready = !done && waitingOn.length === 0`), `src/server/planner/sources.ts:89-152` (phase from `phase_pattern`) | Reads each plan task's dependencies and phase | Phase order isn't used, and there is no marker to skip a task |
 | Context ordering | `src/server/planner/context.ts:41-45` `orderTasks` | Tasks named by triggers come first, then ready tasks | No phase order, and no count of how many lines are wanted |
 | Add rules | `src/server/planner/proposals.ts:98` (`add` needs an agent), `:112-113` (an existing line or a done id is refused) | Refuses a duplicate line or a reused id | An `add` can't make an unassigned line. Nothing compares a proposal with pending ones (#97) |
-| Unassigned lines | `src/server/agents/fill.ts:688-689`, `:944-1000` `unassignedLine` | `\|<name>\|<task>\|<desc>` is ready work for any agent. Fill never starts it | No rule assigns one to an idle agent |
-| Idle notice | `src/server/agents/config.ts:150-161` `fill.idle.notice_minutes` (0 = off), `ready_sources: ["tasks_file"]` | Raises one notice per idle episode while ready work exists | Ready work comes only from the tasks file. The plan is not a source |
-| Fill holds | `src/server/agents/fill.ts:160` `OWNER_HOLDS` | Shows the reason fill won't start a line | The planner doesn't count held lines as "not ready" |
-| Prompt files | `src/server/agents/config.ts:206` `prompt_files` with `{prompts_dir}`, `{agent}`, `{task}` | Builds the prompt for a run | No placeholder for the kind of task, so a spec task gets the same prompt as a build task |
+| Unassigned lines | `src/server/agents/fill.ts:721-722`, `:979-1035` `unassignedLine` | `\|<name>\|<task>\|<desc>` is ready work for any agent. Fill never starts it | No rule assigns one to an idle agent |
+| Idle notice | `src/server/agents/config.ts:158-169` `fill.idle.notice_minutes` (0 = off), `ready_sources: ["tasks_file"]` | Raises one notice per idle episode while ready work exists | Ready work comes only from the tasks file. The plan is not a source |
+| Fill holds | `src/server/agents/fill.ts:176` `OWNER_HOLDS` | Shows the reason fill won't start a line | The planner doesn't count held lines as "not ready" |
+| Prompt files | `src/server/agents/config.ts:214` `prompt_files` with `{prompts_dir}`, `{agent}`, `{task}` | Builds the prompt for a run | No placeholder for the kind of task, so a spec task gets the same prompt as a build task |
 | Task types | `src/shared/server-types.ts:55` `TaskType` | This is the scheduler's job type (build, review, gate…), not a planner task kind | No planner task kind exists |
 | G6 guards | [ai-spend.md §4.5](ai-spend.md), PR #322 (open) | `prefilter_closed`, `handled_messages`, `skip_unchanged`, `recheck_on_change`, each `off`/`observe`/`act` | Specified and being built. This spec depends on them and does not specify them again |
 | Verifier PR ownership | PR #308 (open), #290 | Checks that the PR a DONE line names belongs to the task | Being built. A prerequisite for `finish` in act mode |
