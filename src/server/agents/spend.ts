@@ -574,8 +574,8 @@ export interface SpendNotice {
   ref: string;
   question: string;
   context: string;
-  /** Its evidence code and facts (numbers and ids), for the decision's structure (class agents.spend_notice) */
-  code?: string;
+  /** Its evidence code (one of class agents.spend_notice's, decisions/structure.ts) and facts (numbers and ids) */
+  code: "waste_share" | "task_attempts" | "would_park";
   facts?: Record<string, string | number | boolean | null>;
 }
 

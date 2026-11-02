@@ -325,7 +325,8 @@ One deployment runs an interim `agents.failover.cooldown_minutes: 120` as a stop
 - **What doesn't count**, by D2's reasoning (the failure isn't the task's):
   - runs that died while their provider was in a **fleet** outage or a fleet quota cooldown (decision D2), since G1 and the transient rule handle those. G1's observe-mode `would_cool` windows count as cooldowns here too;
   - runs with `lair_restart = 1` (`exit_unknown`, `lost`, `vars_lost`): Lair's own restart ended them;
-  - runs that ended `stopped`: an owner stop or a shutdown.
+  - runs that ended `stopped`: an owner stop or a shutdown;
+  - runs that ended `lost_claim` because their claim was released on request: by the owner (the Agents view or the API) or by a module stopping its own run (a review whose PR moved on, a supervisor turn). A claim another run took still counts.
 - **As built (PR 5).** The count is read from the run records of the task's chains, at the moment a failed run's chain would go on (a restart, a failover, a transient or never-started retry), so the run that just failed counts at once. A fleet outage is the provider's latest `transient` event by the run's end saying every agent waits; until G1 exists, the fleet cooldown is today's rate-limit and provider-error cooldown once two agents' failovers made it fleet-wide, and G1's quota cooldown (and its `would_cool` windows) joins it with PR 4. The count starts over when the task's fill hold is released: `start_again` releases it, and so does a release in Work. A superseded run never ran, so it isn't counted.
 - On the data above, with `max: 6`, the 13 tasks that took 10 or more attempts would each have stopped at their sixth no-result run and asked once.
 

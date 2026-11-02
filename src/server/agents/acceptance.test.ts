@@ -7041,6 +7041,8 @@ describe("AI spend guards on failed runs: G2 no-result cap, G4 hung-repeat (docs
         expect(eventsOf(h, "guard_would")[0]).toMatchObject({ subject: "t-cap", task: "t-cap", runId: all[3].id, data: { ...counted, verdict: "would_park" } });
         const notices = inbox.list({ project: "demo", status: "open" });
         expect(notices.map((d) => [d.key, d.attention])).toEqual([[`guard_would:task_no_result_cap:${all[3].id}`, "notice"]]);
+        // A known class of the policy table (C14), with its own evidence code
+        expect(notices[0]).toMatchObject({ class: "agents.spend_notice", classKnown: true, evidence: { code: "would_park" } });
         expect(h.store.getClaim("demo", "t-cap")).toMatchObject({ runId: all[4].id });
         // The next failure of the same streak records nothing more
         t += 20 * SEC;
@@ -7202,4 +7204,215 @@ describe("AI spend guards on failed runs: G2 no-result cap, G4 hung-repeat (docs
     expect(eventsOf(h, "guard_did")).toEqual([]);
     expect(eventsOf(h, "guard_would")).toEqual([]);
   });
+
+  /** The spawn pids by call, each run writing a line and then running on (until the test ends it) */
+  const runningOn = (h: Harness): number[] => {
+    const pids: number[] = [];
+    h.spawner.behaviour = (pid, log, call) => {
+      pids[call] = pid;
+      writeLog(h.clock, log, "working\n");
+    };
+    return pids;
+  };
+
+  it("G2 act, max 3: a run whose variables a Lair restart lost, and runs stopped by a claim released on request (the owner's, a module's), don't count", async () => {
+    const config = guarded({ cap: { mode: "act", max: 3 } }, { same_session_restarts: 5, fresh_sessions: 0 });
+    const task = "review-7-abcdef12";
+    // As the review module asks for a review run (src/server/review/agent-assigner.ts): its token in the run variables
+    const review = (h: Harness) =>
+      h.manager.requestRun("demo", { agent: "worker-b", task, prompt: "Review it", variables: { LAIR_REVIEW_TOKEN: "t" } }, { origin: "review" });
+    const h1 = setup(config);
+    const p1 = runningOn(h1);
+    await review(h1);
+    await at(h1, 0); // spawn
+    h1.spawner.exit(p1[1], 2);
+    await at(h1, 2 * MIN); // crashed, the first that counts: resumed after 10 s, with the chain's variables
+    expect(runs(h1).at(-1)).toMatchObject({ state: "queued", variableNames: ["LAIR_REVIEW_TOKEN"] });
+    // Lair restarts before the resume starts: the variables lived only in memory
+    await h1.manager.stop();
+    const h2 = setup(config, { paths: h1, self: { pid: 200, startedAt: NOW + 3 * MIN } });
+    const p2 = runningOn(h2);
+    const app = await http(h2);
+    await at(h2, 3 * MIN); // vars_lost
+    // The review module asks again, and the owner releases the claim (the Agents view) while it runs
+    await review(h2);
+    await at(h2, 4 * MIN); // spawn 1
+    expect((await post(app, "/api/agents/claims/release?project=demo", { task, confirm: true })).statusCode).toBe(200);
+    await at(h2, 5 * MIN); // stopping
+    await at(h2, 5 * MIN); // lost_claim
+    // Again, and this time the review module stops it: the PR moved on
+    await review(h2);
+    await at(h2, 6 * MIN); // spawn 2
+    await h2.service.releaseClaim(task, "the review module: round 1 was replaced by round 2");
+    await at(h2, 7 * MIN);
+    await at(h2, 7 * MIN); // lost_claim
+    // Again: its crash is the second that counts, so it is resumed as before
+    await review(h2);
+    await at(h2, 8 * MIN); // spawn 3
+    h2.spawner.exit(p2[3], 2);
+    await at(h2, 11 * MIN);
+    expect(runs(h2).map((r) => r.endKind ?? null)).toEqual(["crashed", "vars_lost", "lost_claim", "lost_claim", "crashed", null]);
+    expect(eventsOf(h2, "claim_released").map((e) => e.data.by)).toEqual(["request", "module"]);
+    expect(eventsOf(h2, "guard_did")).toEqual([]);
+    await at(h2, 12 * MIN); // spawn 4: the resume
+    h2.spawner.exit(p2[4], 2);
+    await at(h2, 15 * MIN); // the third that counts: parked
+    const all = runs(h2);
+    expect(all).toHaveLength(6);
+    expect(eventsOf(h2, "guard_did")).toHaveLength(1);
+    expect(eventsOf(h2, "guard_did")[0].data).toMatchObject({ guard: "task_no_result_cap", verdict: "park", count: 3, ends: ["crashed", "crashed", "crashed"], runs: [all[0].id, all[4].id, all[5].id] });
+    expect(eventsOf(h2, "escalated")).toHaveLength(1);
+  });
+
+  it("G2 act, max 2: rate limits of two agents on one provider within the cooldown are the fleet's and don't count; one agent's own count and park", async () => {
+    const RATE_LIMIT = "Error: 429 Too Many Requests: rate limit exceeded, retry later";
+    const limited = (h: Harness) => {
+      h.spawner.behaviour = (pid, log) => {
+        writeLog(h.clock, log, `${RATE_LIMIT}\n`);
+        h.spawner.exit(pid, 1);
+      };
+    };
+    // Two agents: worker-a's first is its own (counted, one of 2); worker-b's, and every later one, are the fleet's
+    const fleet = setup(guarded({ cap: { mode: "act", max: 2 } }));
+    limited(fleet);
+    await request(fleet, "worker-a", "t-a");
+    await request(fleet, "worker-b", "t-b");
+    for (const minute of [0, 0, 30, 30, 60, 60]) await at(fleet, minute * MIN);
+    const failovers = eventsOf(fleet, "failover");
+    expect(failovers.map((e) => [e.agent, e.data.kind, e.data.parked ?? false])).toEqual([
+      ["worker-a", "rate_limit", false],
+      ["worker-b", "rate_limit", false],
+      ["worker-a", "rate_limit", false],
+      ["worker-b", "rate_limit", false],
+      ["worker-a", "rate_limit", false],
+      ["worker-b", "rate_limit", false],
+    ]);
+    expect(eventsOf(fleet, "guard_did")).toEqual([]);
+    expect(runs(fleet).filter((r) => r.state === "queued").map((r) => r.task).sort()).toEqual(["t-a", "t-b"]);
+
+    // One agent alone: its provider cools for it only, so each rate limit counts, and the second parks the task
+    const own = setup(guarded({ cap: { mode: "act", max: 2 } }));
+    limited(own);
+    await request(own, "worker-a", "t-a");
+    for (const minute of [0, 0, 30, 30, 60, 60]) await at(own, minute * MIN);
+    const all = runs(own);
+    expect(all.map((r) => r.endKind)).toEqual(["rate_limit", "rate_limit"]);
+    expect(eventsOf(own, "failover").map((e) => e.data.parked ?? false)).toEqual([false, true]);
+    expect(eventsOf(own, "guard_did")[0].data).toMatchObject({ verdict: "park", count: 2, ends: ["rate_limit", "rate_limit"], runs: [all[0].id, all[1].id] });
+    expect(eventsOf(own, "escalated")).toHaveLength(1);
+    expect(own.store.getClaim("demo", "t-a")).toBeNull();
+  });
+
+  it("G2 act, max 2: a run that never started counts; at the cap it is parked instead of retried", async () => {
+    const h = setup(guarded({ cap: { mode: "act", max: 2 } }));
+    h.spawner.failAll = "spawn agent-cli ENOENT";
+    await request(h, "worker-a", "t-never");
+    for (const minute of [0, 10, 11, 21, 23, 33, 60]) await at(h, minute * MIN);
+    const all = runs(h);
+    expect(all.map((r) => r.state)).toEqual(["never_started", "never_started"]); // retries.max_retries (2) would allow a third
+    expect(eventsOf(h, "guard_did")[0].data).toMatchObject({ verdict: "park", count: 2, ends: ["never_started", "never_started"], runs: [all[0].id, all[1].id] });
+    expect(eventsOf(h, "never_started").map((e) => e.data.nextRunId === null)).toEqual([false, true]);
+    expect(eventsOf(h, "escalated")).toHaveLength(1);
+  });
+
+  /** A fill task whose runs die at once (dead on start): under G2 act with max 2, the second death parks it. */
+  const parkByCap = async (h: Harness) => {
+    fillTasks(h, "worker-a|A|t-park|Dies at once");
+    h.spawner.behaviour = (pid, log) => {
+      writeLog(h.clock, log, "starting\n");
+      h.spawner.exit(pid, 2);
+    };
+    await h.service.checkFill();
+    for (let s = 0; s <= 60; s += 10) await at(h, s * SEC);
+    expect(eventsOf(h, "guard_did").map((e) => e.data.ends)).toEqual([["dead_on_start", "dead_on_start"]]);
+    return runs(h).at(-1)!;
+  };
+
+  it("G2 act: a Lair restart while the task is parked keeps fill's hold on the same decision; a release in Work starts it again and the count over", async () => {
+    const config = guarded({ cap: { mode: "act", max: 2 } });
+    const paths = makePaths();
+    const decisionsDb = join(paths.dir, "data", "decisions.db");
+    const h = setup(config, { paths });
+    const first = await withInbox(h, { dbPath: decisionsDb });
+    const parked = await parkByCap(h);
+    const [asked] = first.inbox.list({ project: "demo", status: "open" });
+    expect(asked.key).toBe(`guard:task_no_result_cap:${parked.id}`);
+
+    // Lair restarts: a new agents module on the same store, the inbox on the same file
+    await h.manager.stop();
+    await first.app.close();
+    apps.splice(apps.indexOf(first.app), 1);
+    const again = setup(config, { paths });
+    const second = await withInbox(again, { dbPath: decisionsDb });
+    again.spawner.behaviour = (pid, log) => {
+      writeLog(again.clock, log, "starting\n");
+      again.spawner.exit(pid, 2);
+    };
+    expect(lineOf(await again.service.checkFill(), "t-park")).toMatchObject({ state: "held", hold: "no_result_cap", runId: parked.id, decisionId: asked.id, releasable: true });
+    await at(again, 5 * MIN);
+    await again.service.checkFill();
+    expect(runs(again)).toHaveLength(2);
+
+    // Released in Work (POST /api/agents/fill/release): fill starts it again, and the count starts over
+    const release = await second.app.inject({ method: "POST", url: "/api/agents/fill/release?project=demo", headers: second.owner, payload: { task: "t-park", confirm: true } });
+    expect(release.statusCode).toBe(200);
+    expect(eventsOf(again, "fill_released").map((e) => e.data.by)).toEqual(["owner"]);
+    await again.service.checkFill();
+    await at(again, 6 * MIN); // spawn: it dies at once
+    await at(again, 7 * MIN); // dead on start: one since the release, so resumed
+    expect(runs(again).at(-1)).toMatchObject({ state: "queued", sessionMode: "resume" });
+    expect(eventsOf(again, "guard_did")).toHaveLength(1);
+  });
+
+  it("G2 act: the park answered with fresh_session starts the task in a fresh session; the count goes on, so its next death parks it again", async () => {
+    const h = setup(guarded({ cap: { mode: "act", max: 2 } }));
+    const { inbox, answer } = await withInbox(h);
+    const parked = await parkByCap(h);
+    const [asked] = inbox.list({ project: "demo", status: "open" });
+    expect((await answer(asked.id, { optionId: "fresh_session" })).statusCode).toBe(200);
+    expect(runs(h).at(-1)).toMatchObject({ state: "queued", sessionMode: "fresh", chainId: parked.chainId });
+    await at(h, 2 * MIN); // spawn: it dies at once
+    await at(h, 3 * MIN); // the third within the window: parked again, with its own decision
+    expect(eventsOf(h, "guard_did")).toHaveLength(2);
+    expect(openKeys(inbox)).toEqual([`guard:task_no_result_cap:${runs(h).at(-1)!.id}`]);
+  });
+
+  for (const option of ["fresh_session", "release"] as const) {
+    it(`G4 act: the park answered with ${option} ${option === "fresh_session" ? "starts a fresh session with the hung info and a resume summary" : "lets fill start the task again in a new chain"}`, async () => {
+      const h = setup(guarded({ hung: { mode: "act", max_per_task: 2 } }));
+      const { inbox, answer } = await withInbox(h);
+      fillTasks(h, "worker-a|A|t-hang|Hangs");
+      h.spawner.behaviour = (_pid, log, call) => writeLog(h.clock, log, `working ${call}\n`); // then silent
+      let t = 0;
+      await h.service.checkFill();
+      await at(h, t);
+      for (const wait of [0, 10 * SEC]) {
+        t += wait;
+        await at(h, t);
+        t += 46 * MIN;
+        await at(h, t); // hung: SIGTERM
+        await at(h, t); // gone
+      }
+      const parked = runs(h).at(-1)!;
+      expect(eventsOf(h, "guard_did").map((e) => e.data.ends)).toEqual([["hung", "hung"]]);
+      const [asked] = inbox.list({ project: "demo", status: "open" });
+      expect(asked.key).toBe(`guard:hung_repeat:${parked.id}`);
+      expect((await answer(asked.id, { optionId: option })).statusCode).toBe(200);
+      if (option === "fresh_session") {
+        expect(runs(h).at(-1)).toMatchObject({ state: "queued", sessionMode: "fresh", chainId: parked.chainId });
+        await at(h, t + 10 * SEC);
+        const prompt = promptOf(h.spawner.calls[2]);
+        expect(prompt).toContain("<hung_run_warning>");
+        expect(prompt).toContain("# Resume summary (written by Lair)");
+      } else {
+        expect(eventsOf(h, "fill_released").map((e) => e.data.by)).toEqual(["decision"]);
+        await h.service.checkFill();
+        await at(h, t + 10 * SEC);
+        expect(runs(h)).toHaveLength(3);
+        expect(runs(h).at(-1)).toMatchObject({ state: "running" });
+        expect(runs(h).at(-1)!.chainId).not.toBe(parked.chainId);
+      }
+      expect(openKeys(inbox)).toEqual([]);
+    });
+  }
 });

@@ -901,7 +901,7 @@ export class AgentsService {
         ref: notice.ref,
         structure: {
           class: "agents.spend_notice",
-          evidence: { code: notice.code ?? "spend_notice", facts: notice.facts ?? {}, cause_cleared: false, linked_issue: null },
+          evidence: { code: notice.code, facts: notice.facts ?? {}, cause_cleared: false, linked_issue: null },
         },
       },
       this.probes.clock.now(),
@@ -2428,14 +2428,32 @@ export class AgentsService {
   /**
    * G2: the task's no-result runs within the window, across its chains, since its hold was last released (start
    * again resets the count). Not counted (decision D2): a run that ended while its provider was in a fleet outage or
-   * cooldown, a Lair restart's (exit_unknown, lost, vars_lost), a stop, and a superseded run (it never ran).
+   * cooldown, a Lair restart's (exit_unknown, lost, vars_lost), a stop (the owner's, or a claim released on request),
+   * and a superseded run (it never ran).
    */
   private noResultCap(run: AgentRun, now: number): FailedRunVerdict | null {
     const g = this.settings.spend.guards.taskNoResultCap;
-    if (g.mode === "off" || !countsTowardCap(run) || this.fleetFailure(run)) return null;
+    if (g.mode === "off" || !this.countsForCap(run)) return null;
     const released = this.store.listEvents(this.project, { kinds: ["fill_released"], task: run.task, limit: 1 })[0]?.at ?? 0;
-    const counted = this.endedSince(run, Math.max(now - g.windowMs, released + 1)).filter((r) => countsTowardCap(r) && !this.fleetFailure(r));
+    const counted = this.endedSince(run, Math.max(now - g.windowMs, released + 1)).filter((r) => this.countsForCap(r));
     return counted.length >= g.max ? { guard: "task_no_result_cap", mode: g.mode, counted, max: g.max, windowMs: g.windowMs } : null;
+  }
+
+  /** Whether an ended run counts toward G2: a no-result end that was neither the fleet's problem nor a stop on request. */
+  private countsForCap(run: AgentRun): boolean {
+    return countsTowardCap(run) && !this.fleetFailure(run) && !this.releasedOnRequest(run);
+  }
+
+  /**
+   * A run stopped because its claim was released through releaseClaim: by the owner (the Agents view, the API) or by
+   * a module on its own account (a review whose PR moved on, a supervisor turn). That is a stop, not the task failing.
+   * A claim another run took (a double start) is no release on request, so that end still counts.
+   */
+  private releasedOnRequest(run: AgentRun): boolean {
+    if (endKindOf(run) !== "lost_claim") return false;
+    return this.store
+      .listEvents(this.project, { kinds: ["claim_released"], runId: run.id, limit: 20 })
+      .some((e) => e.data.by === "request" || e.data.by === "module");
   }
 
   /**
