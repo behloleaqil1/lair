@@ -95,6 +95,14 @@ function fromRepos(raw: unknown): ReposResult {
       refOwner.set(ref.toLowerCase(), i);
     });
   });
+  // An explicit ref that is another entry's name (its default ref) would take that name from it silently
+  list.forEach((r, i) => {
+    if (r.refs !== undefined) return;
+    for (const ref of nameRef(r.repo)) {
+      const owner = refOwner.get(ref.toLowerCase());
+      if (owner !== undefined) errors.push(`repos[${owner}].refs: ${ref} is the name of repos[${i}] (${r.repo}); set repos[${i}].refs to tell them apart`);
+    }
+  });
   const defaults = list.filter((r) => r.default === true).length;
   if (list.length > 1 && defaults !== 1) {
     errors.push(`repos: exactly one entry must be default: true (${defaults} are), so a bare PR #<n> names one repository`);

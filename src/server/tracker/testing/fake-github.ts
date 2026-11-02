@@ -360,10 +360,13 @@ export class FakeGitHub {
     if (kind === "issues") {
       if (number === null) {
         if (method === "GET") {
+          // As GitHub lists them: open ones by default, PRs included; sorted by creation or by the latest update
           const since = Date.parse(req.query.get("since") ?? "1970-01-01T00:00:00Z");
+          const state = req.query.get("state") ?? "open";
+          const key = req.query.get("sort") === "updated" ? "updatedAt" : "createdAt";
           const list = [...repo.issues.values()]
-            .filter((i) => i.updatedAt >= since)
-            .sort((a, b) => b.createdAt - a.createdAt)
+            .filter((i) => i.updatedAt >= since && (state === "all" || i.state === state))
+            .sort((a, b) => b[key] - a[key])
             .slice(0, Number(req.query.get("per_page") ?? 30))
             .map((i) => this.issueJson(i));
           return reply(200, list);

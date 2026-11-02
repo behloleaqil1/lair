@@ -3152,9 +3152,52 @@ repos:
 
 **PR references.** Task text and done lines name a PR as `owner/name#12` (a listed repository), `<ref>#12`, `<ref> PR #12` or `<ref> pull request #12` (that entry's repository), or `PR #12` (the task's repository when its description has `repo:owner/name`, the tracker's tag, else the default). A bare number never names a repository that is neither the task's nor the default, and `xapp#12`, `app#123` and `app#12a` are not `app#12`.
 
-**Without `repos:`** the list is `tracker.repos[]` (each entry's `repo` and `default`; two or more with no default are read as no default), else the review repository (`review.repo`, else `github:`, with `review.default_branch` as its base), else empty: the modules that need it are inactive and say why. The ready guard reads the list only when `repos:` is set; without it the guard works as before (the review repository, `PR #<n>` forms only). An invalid `repos:` is reported (`repos[1].refs[0]: ...`) and turns off what reads it (the ready guard reads only the review repository, as without `repos:`); the project still loads.
+**Without `repos:`** the list is `tracker.repos[]` (each entry's `repo` and `default`; two or more with no default are read as no default), else the review repository (`review.repo`, else `github:`, with `review.default_branch` as its base), else empty: the modules that need it are inactive and say why. The ready guard reads the list only when `repos:` is set; without it the guard works as before (the review repository, `PR #<n>` forms only). An invalid `repos:` is reported (`repos[1].refs[0]: ...`) and turns off what reads it (the ready guard reads only the review repository, as without `repos:`, and PR health does not start); the project still loads. The error shows on the dashboard's config banner from startup on, and a live reload to an invalid `repos:` is refused (the previous config keeps running). An explicit ref that is another entry's name (`refs: [lib]` beside `example/lib` without `refs`) is an error too: set that entry's `refs` to tell them apart.
+
+No one module owns `repos:`, so an edit to it reloads every module of the project.
 
 **Hosts.** Each listed repository other than the review repository is read through a GitHub host of its own, built once (a rate-limit answer blocks only that repository), with the review module's token (`review.token_env`, `review.token_cmd`) and `review.api_url`; one request may take 20 s, and a timeout is a failure.
+
+## PR health
+
+PR health reads the open pull requests of each repository in [`repos:`](#repositories) and finds the ones that went bad: `conflicts` (the host says the PR can't merge into its base), `behind` (more than `behind_threshold` commits behind the base), `no_ci` (no check has run at the head of a non-draft PR for `no_ci_minutes`) and `ci_red` (the newest run of a check at the head failed). `no_ci` and `ci_red` need the repository's `ci_counts`. Design: [docs/design/pr-health.md](design/pr-health.md).
+
+It is off unless a project sets `pr_health.enabled: true`, and it only observes: it emits events and keeps a status, and writes nothing. This version is the detector alone; the owner rule, the status route and the server wiring come next, then act mode (a note to the owning agent, Decision Inbox notices).
+
+```yaml
+pr_health:
+  enabled: true
+  mode: observe                  # act arrives in a later version (it needs notify_cmd)
+  interval_seconds: 300
+  ignored_prs: [example/app#7]
+  ignored_branches: ["dependabot/**"]
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | |
+| `mode` | `observe` \| `act` | `observe` | `act` needs `notify_cmd`; this version does not act |
+| `interval_seconds` | integer | `300` | 60-3600; the first tick runs 1 s after start, and the next is scheduled when one ends |
+| `request_timeout_seconds` | integer | `20` | 1-120; a timeout is a failure of that repository for the tick |
+| `max_prs_per_repo` | integer | `30` | 1-100 PRs read per repository and tick (newest first, PRs left unread last tick before them) |
+| `max_requests_per_tick` | integer | `120` | 10-1000 requests per tick, shared by the project's repositories; a tick also ends at half the interval |
+| `behind_threshold` | integer | `30` | 1-10000 |
+| `no_ci_minutes` | integer | `20` | 1-1440, since the PR was last updated |
+| `clear_minutes` | integer | `10` | 0-1440: a kind that successful reads no longer find is cleared after this long |
+| `kinds.{conflicts,behind,no_ci,ci_red}` | boolean | `true` | Turn a kind off |
+| `ignored_prs` | list | `[]` | `owner/name#N` of a listed repository, at most 200 |
+| `ignored_branches` | list | `["dependabot/**"]` | Head branch globs (`*` within one segment, `**` across, `?`), at most 50 |
+| `owner.branch_window_minutes` | integer | `360` | 0-10080, for the owner rule (a later version) |
+| `notify_cmd`, `withdraw_cmd` | argv \| null | `null` | For act mode (a later version); placeholders `{agent}`, `{repo}`, `{pr}`, `{head}`, `{kinds}`, `{id}`, `{message}` only |
+| `command_timeout_seconds`, `max_attempts`, `backoff_seconds`, `escalate_after_minutes` | | `30`, `3`, `300`, `null` | For act mode (a later version) |
+
+**What is read.** Each tick reads each repository in order: its open PRs (one page of 100; `truncated` in the status says more exist, and a PR missing from a full page is not taken as closed) and its base tip. A PR named in `ignored_prs`, from a branch in `ignored_branches` or into another branch than the base (a stacked PR) is skipped and listed with why. For the others the PR itself is read for its mergeability and compared with the base when its head or the base tip moved or mergeability was not known yet, and its checks are read unless they all passed at this head. An unchanged PR whose checks passed costs no request. The host's token and URL are the review module's (`review.token_env`, `review.token_cmd`, `review.api_url`), else `GITHUB_TOKEN` and `https://api.github.com`.
+
+**Findings.** One per (repository, PR, head, kind), keyed `pr_health:<owner/name>#<n>@<head8>:<kind>`. A moved head, a closed PR and a PR that becomes skipped clear at once; a kind that is no longer found clears after `clear_minutes`. Mergeability the host has not worked out yet (`null`) neither opens nor clears `conflicts`. Findings are kept in memory and found again after a restart.
+
+**Failures.** Each repository is read on its own: a timeout, a rate-limit answer or any host error stops that repository for the tick and keeps its findings exactly as they were (nothing is cleared, and nothing is found again when it recovers); its state is `error`, and `pr_health.repo_error` is emitted once when an error streak starts. The request budget and the deadline stop a repository the same way, with `partial` in the status and the unread PRs first next tick.
+
+**Events.** `pr_health.finding` `{project, key, repo, pr, head, kind, owner, ownerSource, mode}` (the owner is `null` until the owner rule arrives), `pr_health.cleared` `{project, key, repo, pr, head, kind, why}` (`fixed`, `head_moved`, `closed` or `ignored`) and `pr_health.repo_error` `{project, repo, error}`.
 
 ## Tracker
 
@@ -3180,12 +3223,25 @@ tracker:
       match:
         tasks: ["api-*"]        # task id globs
         agents: [worker-b]      # or the agent of the task's line
+      create_issues: false      # a public repository: link only, never create
+      redact_patterns: ["internal-\\w+"]   # this repository's texts only
   redact_patterns: ["codename-\\w+"]
+  auto_link: false              # proposed links wait for the owner
 ```
 
 **Which repository a task goes to.** One project may track several repositories, each with its own board and milestone rules. A task goes to the repository its line names (`repo:owner/name` in the description, or an issue URL or `owner/name#N` of a tracked repository), else to the first repository whose `match` takes it (a task id glob, or the line's agent), else to the `default` one. With one repository it is the default. A task no repository takes is not tracked (the status shows why).
 
-**Which issue a task is linked to.** In this order: the issue its line names on purpose (`Issue: #N`, `Closes #N`, `Fixes #N`, an issue URL or `owner/name#N` of a tracked repository; a bare `#N` elsewhere in the text is never taken), if it is open and not a pull request; the issue an earlier create made for it (found by its marker, see below); an open issue (not a pull request) whose title is exactly the task id or the title Lair would give it (`<task>: <description>`); else, with `create_issues_for_new_tasks`, a new issue with that title, the redacted description, the repository's `labels` and the milestone its rules give.
+**Which issue a task is linked to.** In this order: the issue its line names on purpose (`Issue: #N`, `Closes #N`, `Fixes #N`, an issue URL or `owner/name#N` of a tracked repository; a bare `#N` elsewhere in the text is never taken), if it is open and not a pull request; the issue an earlier create made for it (found by its marker, see below); an open issue (not a pull request) whose title is exactly the task id or the title Lair would give it (`<task>: <description>`); else, when the repository creates issues (`repos[].create_issues`, default `create_issues_for_new_tasks`), a new issue with that title, the redacted description, the repository's `labels` and the milestone its rules give. A reconcile tries at most 10 unlinked tasks this way, each one starting after the last task the one before tried, so every task is tried in turn. A task id the repository's redaction changes is never searched for there.
+
+**Link proposals.** For the open tasks still unlinked (none named on their line, no create pending, a tracked repository takes them), each reconcile reads one page of every tracked repository's open issues (the newest 100 by update; no request when no task needs one) and proposes:
+
+| Reason | When |
+|---|---|
+| `mentions_task` | the issue's title or body names the task id as a word of its own (a task id of 4 or more characters with a letter and a digit or one of `. _ / # : -`; a plain word like `login` or a number like `1234` is too common) |
+| `pull_closes` | an open PR of the task (its branch ends with the task id, or its body names it) closes the issue (`Closes #N`), open and unlinked (at most 5 issues read one by one a reconcile when the page did not have them) |
+| `similar_title` | the issue's title is close to the task's description, alone or after the task id (character bigrams, 0.85 or more; titles of fewer than 10 letters and digits are never compared) |
+
+Only issues of the repository the task goes to are candidates, and an issue linked to a task already is never proposed. A task with one candidate issue, proposed for no other task, is `would_link`; two candidates, or one issue proposed for two tasks, is `ambiguous` and never linked automatically. The status lists the proposals (`proposals`), and each one is recorded once in the audit as `would_link` (op `link_issue`, counted up on each reconcile). With `auto_link: true` in act mode, a `would_link` proposal whose reasons include `mentions_task` or `pull_closes` is linked by the reconcile (at most 10 a reconcile; audited as `link_issue` with `auto: <reasons>` once the link is made). A `similar_title` match alone is never linked automatically (sibling titles such as "fix login bug 1" and "fix login bug 2" score high): it waits for the owner; in observe mode it is recorded only, whatever `auto_link` says. The owner accepts a proposal (an ambiguous one too, by naming the issue) with `POST /api/tracker/links`. A link lives in Lair's store; its card then moves as any link's does. A failed read (the page, an issue) links nothing and leaves the last proposals as they were.
 
 **Observe and act.**
 
@@ -3193,6 +3249,8 @@ tracker:
 |---|---|---|
 | Reads GitHub (scopes, boards, issues, PRs, milestones) | yes | yes |
 | Links tasks to existing issues (in Lair's own store) | yes | yes |
+| Links proposed issues (`auto_link`) | no: recorded as `would_link` | with `auto_link: true`; else recorded as `would_link` |
+| Links an issue the owner accepts (`POST /api/tracker/links`) | yes | yes |
 | Creates issues, adds cards, moves cards, sets the Agent field, labels, comments, closes issues, closes or reopens milestones | no: each is recorded as `would_send` in the audit, once (a repeat counts up the same row) | yes, within `write_budget_per_minute`, each one audited |
 
 The client itself is read-only in observe mode: a write is refused before anything is sent. Switching to act (Settings or the project file) reloads the tracker live; what observe recorded is not replayed, the next reconcile makes GitHub match.
@@ -3212,17 +3270,17 @@ The client itself is read-only in observe mode: a write is refused before anythi
 
 Only `outcome: "applied"` changes count (`planned` is the planner's own observe mode). An `agent.run.ended` changes nothing: an exit is not a done task. Events never wait on GitHub: a handler queues a job and returns, the jobs of a project run one at a time on a bounded queue (500), and a job dropped when it is full is caught up by the next reconcile.
 
-**Reconcile** (at start, then every `reconcile_interval_seconds`, and on the owner's request): links the tasks of the tasks file that have none yet (at most 10 a cycle), finishes the ones marked done there, finishes the ones whose PR was merged outside the review module, drops the ones whose line was removed by hand, moves the cards of open PRs to In review, adds missing cards, puts back cards moved by hand (counted as drift fixed only when the fix was sent), retries closes that failed, and closes or reopens milestones. The next one is scheduled when it ends, so two never overlap.
+**Reconcile** (at start, then every `reconcile_interval_seconds`, and on the owner's request): links the tasks of the tasks file that have none yet (at most 10 tried a cycle, in turn), proposes issues for the ones still unlinked (see Link proposals), finishes the ones marked done there, finishes the ones whose PR was merged outside the review module, drops the ones whose line was removed by hand, moves the cards of open PRs to In review, adds missing cards, puts back cards moved by hand (counted as drift fixed only when the fix was sent), retries closes that failed, and closes or reopens milestones. The next one is scheduled when it ends, so two never overlap.
 
 **Merges made outside the review module.** `review.merged` comes only from a merge the review module makes; a PR merged by a script's push, `gh pr merge` or the GitHub web UI emits nothing. So while a linked task is In progress or In review, each reconcile reads one page of the closed PRs of every tracked repository (the newest 100 by update: one request per repository, with the usual timeout; none when no task is In progress or In review) and matches them as `review.submitted` does (the issues a PR closes, a task id ending its branch name). A merged PR finishes its tasks as `review.merged` does: Done, the issue closed as completed, through the write budget, at most 10 tasks a reconcile (the rest wait for the next one). A PR closed without merging changes nothing: the status lists it under `closedUnmerged`. A finished task is never read again, so a merge is applied once, also across a restart. A PR merged long ago that has left the newest 100 is not seen.
 
-**Task lines removed by hand.** The planner's own drop arrives as an event. A linked task whose line is not in the tasks file and not marked done (deleted, or commented out with `#`) for 2 reconciles in a row counts as dropped: with `close_removed_tasks: true` its issue is closed as not planned (at most 10 a reconcile); with the key off (the default) nothing is sent, a `would_close` row is recorded in the audit (once, counted up on each reconcile) and the status lists the task under `removedTasks`. A line fill refuses (malformed, longer than 2000 characters, past its 200 tasks) is still in the file: the task ids on it are never dropped. A tasks file with no task line at all is taken for a broken write and counts nothing. The count is kept in memory, so a restart or a config reload starts it again; a line that comes back resets it.
+**Task lines removed by hand.** The planner's own drop arrives as an event. A linked task whose line is not in the tasks file and not marked done (deleted, or commented out with `#`) for 2 reconciles in a row counts as dropped: with `close_removed_tasks: true` its issue is closed as not planned (at most 10 a reconcile); with the key off (the default) nothing is sent, a `would_close` row is recorded in the audit (once, counted up on each reconcile) and the status lists the task under `removedTasks`. A line fill refuses (malformed, longer than 2000 characters, past its 200 tasks) is still in the file: the task ids on it are never dropped. A tasks file with no task line at all is taken for a broken write and counts nothing. Only a task whose line this process has seen in the file can count as removed: links from before a restart whose lines are gone, or a config reload that points `agents.fill.tasks_file` at another file, count nothing. The count is kept in memory, so a restart or a config reload starts it again; a line that comes back resets it.
 
 **Milestones.** With `close_when_complete` (the default), an open milestone with closed issues and no open one is closed, and a closed one with an open issue is reopened. Only its state is sent: its title, description and due date are the owner's. Lair never creates a milestone; a rule naming one that does not exist is reported and the issue is created without it.
 
 **Idempotent creates.** The create is recorded (pending) before it is sent, and the issue's body ends with a hidden marker (`<!-- lair-task:<hash> -->`). If the answer is lost (a timeout, a restart), the next attempt lists the repository's issues changed since then (the issues list, which does not lag behind as search does) and links the one with the marker instead of creating another. Creates count against the write budget.
 
-**Redaction.** Every text sent (titles, bodies, comments, the Agent field) is redacted first by built-in rules, then by `redact_patterns` (case-insensitive regular expressions): the values of this process's secret-looking environment variables (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*KEY*`...), GitHub, OpenAI-style, Slack and AWS key shapes, private keys, `Bearer` tokens, credentials in URLs, `password=`/`token:` pairs, absolute paths (`/Users/...`, `/home/...`, `/tmp/...`, `C:\...`, `~/...`) and the home directory, email addresses and private network addresses. Titles are one line of at most 200 characters, bodies 3000, comments 600. A blocked comment carries only the planner's class and rule, never the agent's text.
+**Redaction.** Every text sent (titles, bodies, comments, the Agent field) is redacted first by built-in rules, then by `redact_patterns` (case-insensitive regular expressions): the values of this process's secret-looking environment variables (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*KEY*`...), GitHub, OpenAI-style, Slack and AWS key shapes, private keys, `Bearer` tokens, credentials in URLs, `password=`/`token:` pairs, absolute paths (`/Users/...`, `/home/...`, `/tmp/...`, `C:\...`, `~/...`) and the home directory, email addresses and private network addresses. Then a repository's own `repos[].redact_patterns`, on that repository's texts only: a name a public repository must never see is listed there, and the private repository still gets it. Every text bound for a repository goes through them: the issue title and body, comments, the Agent field of its board; a task id they change is never sent to it in a search either. Texts are bounded after every pattern ran. Titles are one line of at most 200 characters, bodies 3000, comments 600. A blocked comment carries only the planner's class and rule, never the agent's text. Keep a public repository's `create_issues: false` when its task text is not meant to be public: linking reads only.
 
 **The token.** `token_env` / `token_cmd`, else the project's `review.token_env` / `review.token_cmd`, else `GITHUB_TOKEN`; the tracker's variable is also kept from the update command, as review's is. A classic token needs `repo` (or `public_repo` for public repositories only) and `project` (observe mode reads boards with `read:project`); a fine-grained token needs Issues: read and write, Pull requests: read, and Projects: read and write on the board's owner (GitHub reports no scopes for it, so it is not checked up front). At start the tracker reads the token's scopes; a missing one stops its writes and raises **one** decision in the Decision Inbox (class `tracker.token_scopes`) listing them, with the option "I updated the token: check again". A 401, or a 403 that is not a rate limit, stops the writes too until the scopes are checked again. Every request has a timeout (`request_timeout_seconds`) and is cut short when the tracker stops. Rate limits (a 429, a 403 with `Retry-After` or `X-RateLimit-Remaining: 0`, a GraphQL `RATE_LIMITED`) stop every request until `Retry-After` or `X-RateLimit-Reset`; the time is kept across a restart.
 
@@ -3240,10 +3298,13 @@ Only `outcome: "applied"` changes count (`planned` is the planner's own observe 
 | `repos[].status_options` | `Backlog`, `Ready`, `In progress`, `In review`, `Done` | The option names of `backlog`, `ready`, `in_progress`, `in_review`, `done` |
 | `repos[].agent_field` | none | A text field set to the agent of the task's run |
 | `repos[].labels` | `[]` | Labels of the issues Lair creates here |
+| `repos[].create_issues` | `create_issues_for_new_tasks` | Create issues here for tasks none is linked to (on for a private repository, off for a public one) |
+| `repos[].redact_patterns` | `[]` | Redacted from this repository's texts only, after the built-in rules and `redact_patterns` |
 | `repos[].match.tasks`, `.agents` | `[]` | Task id globs and agent ids this repository takes |
 | `repos[].milestones.close_when_complete` | `true` | Close a complete milestone, reopen one with an open issue |
 | `repos[].milestones.rules` | `[]` | `{tasks: [globs], milestone: "title"}`: the existing milestone of the issues created for those tasks |
-| `create_issues_for_new_tasks` | `false` | Create an issue for a task none is linked to (act mode) |
+| `create_issues_for_new_tasks` | `false` | Create an issue for a task none is linked to (act mode); the default of each `repos[].create_issues` |
+| `auto_link` | `false` | Link a proposed issue (one candidate, proposed for no other task, and named by the task id or closed by the task's PR: a close title alone never) without the owner, in act mode; off: recorded as `would_link`, listed in the status for the owner to accept |
 | `close_removed_tasks` | `false` | Close as not planned the issue of a linked task whose line was removed or commented out by hand (missing 2 reconciles in a row); off: recorded as `would_close` and listed in the status |
 | `blocked_label` | `blocked` | The label of a blocked task's issue |
 | `redact_patterns` | `[]` | Redacted from every text sent, after the built-in rules |
@@ -3259,8 +3320,9 @@ The tasks it follows are `agents.fill.tasks_file` (the planner's done marker mar
 
 `?project=` defaults to the default project. Every route is the owner's (`/api/tracker` is owner-only, reads included: they show task text and repositories):
 
-- `GET /api/tracker/status`: the mode, each repository and its board (loaded, or why not), the token's scopes (granted, missing), the sync state (last reconcile, next one, drift fixed, errors, the rate-limit wait, what needs the owner), the links, the pending creates, the latest 50 writes (each with its result, or `would_send` in observe mode, or `would_close` for a removed task line while `close_removed_tasks` is off), the queue (waiting, dropped), `closedUnmerged` (linked tasks' PRs the last reconcile saw closed without merging), `removedTasks` (linked tasks whose line is missing: reconciles missed, and `waiting`, `would_close` or `closing`), warnings and config errors
+- `GET /api/tracker/status`: the mode, each repository and its board (loaded, or why not), the token's scopes (granted, missing), the sync state (last reconcile, next one, drift fixed, errors, the rate-limit wait, what needs the owner), the links, the pending creates, the latest 50 writes (each with its result, or `would_send` in observe mode, or `would_close` for a removed task line while `close_removed_tasks` is off), the queue (waiting, dropped), `closedUnmerged` (linked tasks' PRs the last reconcile saw closed without merging), `removedTasks` (linked tasks whose line is missing: reconciles missed, and `waiting`, `would_close` or `closing`), `proposals` (unlinked tasks, their candidate issues with reasons, score and PR, and `would_link` or `ambiguous`), warnings and config errors
 - `POST /api/tracker/reconcile`: a reconcile now, queued after the jobs waiting (202); recorded in the audit with the owner session. 404 when the tracker is off for the project
+- `POST /api/tracker/links` `{task, repo, issue}`: accept a proposed link (one of the candidates of the last reconcile's proposal for that task, an ambiguous one included). Checked now (409 when it is not proposed or the task is linked already), made by a queued job (202) that reads the issue again (still open, not a PR, linked to no other task) and records `link_issue` in the audit with the owner session (`success`, or `skipped`/`error` and why). 403 without an owner session, 404 when the tracker is off
 
 The tracker emits no events of its own. The dashboard tab is not built yet.
 
