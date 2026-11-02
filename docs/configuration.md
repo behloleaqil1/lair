@@ -197,6 +197,13 @@ across restarts), the planner keeps the ids of the reports it handled. A report 
 `agents.fill.tasks_file`, or by an agent fill doesn't run, is ignored and shown on Home → Health
 (`GET /api/bus/consumers?project=<name>`), as is an event that fails validation.
 
+A run's bus token is revoked on every way the run ends (exit, crash, failover, transient retry, never started, stopped,
+claim released), whatever `bus.consume` is by then, and at start Lair revokes the tokens of runs that ended while it
+was down. `lair bus report` is refused with 400, and nothing is stored or mirrored, when its `sha` isn't 7 to 64 hex
+digits or its `gate_id` isn't a plain name (letters, digits, `.`, `_` and `-`, starting with a letter or digit, no
+`..`). The mirror appends to `queue_file`, `inbox_file` and `mail_dir` without blocking the server, one line at a time
+per file; an owner message to a recipient that isn't a plain name gets no mailbox file.
+
 Turn `observe` on first, compare on Home → Health, then switch to `on`.
 
 ## Dragons (agents)
