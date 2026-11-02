@@ -456,6 +456,14 @@ export class BusStore {
       .get(this.project, agentId) as { n: number };
     return row.n;
   }
+
+  /** The project's latest messages, newest first (the dashboard's Bus tab). */
+  listRecentMessages(limit: number): BusMessage[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM bus_messages WHERE project = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`)
+      .all(this.project, limit) as MessageRow[];
+    return rows.map(toMessage);
+  }
 }
 
 // ============ Store management ============

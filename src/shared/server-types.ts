@@ -311,6 +311,9 @@ export type EventType =
   // Bus (src/server/bus/)
   | "bus.report"
   | "bus.message"
+  // A message read (its recipient fetched its inbox: {project, agent, ids}) or acknowledged ({project, agent, id})
+  | "bus.message_read"
+  | "bus.message_acked"
   // Bus consumers (src/server/bus/consumers.ts): an event or report refused or ignored, {project, busId, reason}
   | "bus.consume_refused"
   // Host services (src/server/host-services/)

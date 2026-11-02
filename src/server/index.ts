@@ -29,7 +29,7 @@ import {
 } from "./human-auth/index.js";
 import { registerControlRoutes } from "./routes/controls.js";
 import { busStoreFor, forgetBusService, registerBusRoutes } from "./routes/bus.js";
-import { BusConsumers, agentsBusFor, closeBusStores, existingBusStore, openedBusStore, parseBusConfig, structuredReport } from "./bus/index.js";
+import { BusConsumers, BusLive, agentsBusFor, closeBusStores, existingBusStore, openedBusStore, parseBusConfig, structuredReport } from "./bus/index.js";
 import { registerProcessRoutes } from "./routes/processes.js";
 import { registerSettingsRoutes } from "./routes/settings.js";
 import { getSupervisor } from "./services/supervisor.js";
@@ -573,6 +573,12 @@ const applyBusConfig = (entry: { name: string; config?: ProjectConfig }) => {
   forgetBusService(entry.name);
 };
 for (const entry of projectEntries) applyBusConfig(entry);
+// The bus live on the dashboard's `bus` WebSocket channel (Home → Bus), for projects whose bus.consume isn't off
+const busLive = new BusLive({
+  events: getEventBus(),
+  mode: (project) => busConsumers.mode(project),
+  publish: (project, update) => wsServer?.broadcast("bus", update, { project }),
+});
 
 const agents: AgentsManager = new AgentsManager({
   dbPath: join(process.cwd(), "data", "agents.db"),
@@ -1042,6 +1048,7 @@ const stopServer = async (reason: string) => {
 
   // The bus consumers first: no report or run end starts a check or a cycle from here on
   busConsumers.stop();
+  busLive.stop();
 
   // Stop the planner first: it requests runs from the agents module
   await planner.stop();
@@ -1213,6 +1220,7 @@ const start = async () => {
 
     // The bus consumers (after fill and the planner, which they wake)
     busConsumers.start();
+    busLive.start();
     const onBus = busConsumers.enabled();
     console.log(onBus.length > 0 ? `[bus] On or observing for: ${onBus.join(", ")}` : "[bus] Off (no project sets bus.consume)");
     // Start the tracker (after the planner and the agents, whose events it follows): each syncs in the background,
