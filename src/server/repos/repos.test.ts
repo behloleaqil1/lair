@@ -57,6 +57,9 @@ describe("repos: config", () => {
     expect(errorsOf(two({}, { repo: "Example/App" }))[0]).toMatch(/^repos\[1\]\.repo: Example\/App is listed twice/);
     expect(errorsOf([{ repo: "example/app", refs: ["pr"] }])[0]).toMatch(/^repos\[0\]\.refs\[0\]: pr and pull/);
     expect(errorsOf(two({ refs: ["web"] }, { refs: ["WEB"] }))[0]).toMatch(/^repos\[1\]\.refs\[0\]: WEB is also a ref of repos\[0\]/);
+    // An explicit ref equal to another entry's default name is the same collision, not a silent takeover
+    expect(errorsOf(two({ refs: ["Lib"] }, {}))[0]).toMatch(/^repos\[0\]\.refs: lib is the name of repos\[1\] \(example\/lib\)/);
+    expect(errorsOf(two({ refs: ["core"] }, {}))).toEqual([]);
     expect(errorsOf(two({}, { default: true }))[0]).toMatch(/^repos: exactly one entry must be default: true \(2 are\)/);
     expect(errorsOf(two({ default: false }, {}))[0]).toMatch(/^repos: exactly one entry must be default: true \(0 are\)/);
     const many = Array.from({ length: 21 }, (_, i) => ({ repo: `example/r${i}`, default: i === 0 }));
