@@ -519,6 +519,25 @@ export class AgentsStore {
     return rows.map(toEvent);
   }
 
+  /**
+   * The project's run and claim facts (started, completed, claim_released events that name a task) in the rows
+   * (after, upTo], oldest first, at most `limit`, with their row as `seq`: the work store's consumer reads by row.
+   */
+  claimFactsAfter(project: string, after: number, upTo: number, limit: number): (AgentEvent & { seq: number })[] {
+    const rows = this.db
+      .prepare(
+        `SELECT rowid AS seq, * FROM agents_events WHERE rowid > ? AND rowid <= ? AND project = ?
+           AND kind IN ('started', 'completed', 'claim_released') AND task IS NOT NULL ORDER BY rowid LIMIT ?`,
+      )
+      .all(after, upTo, project, limit) as (EventRow & { seq: number })[];
+    return rows.map((row) => ({ ...toEvent(row), seq: row.seq }));
+  }
+
+  /** The newest event's row, 0 when there is none (events are never deleted, so rows only grow). */
+  lastEventSeq(): number {
+    return (this.db.prepare(`SELECT MAX(rowid) AS seq FROM agents_events`).get() as { seq: number | null }).seq ?? 0;
+  }
+
   countEvents(project: string, kind: AgentEventKind, subject?: string): number {
     const row = (
       subject === undefined

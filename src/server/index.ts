@@ -789,16 +789,20 @@ await registerTrackerRoutes(fastify, trackers, () => getDefaultProject(), humanA
 
 // The work store (src/server/work/, docs/design/work-store.md): one SQLite file per project with
 // `work_store.mode: observe` (off by default: no store file, today's files exactly). In observe it follows the files
-// one way when the owner imports (a dry run first); fill, the planner and the tracker still read the files. Every
-// route is the owner's.
+// one way when the owner imports (a dry run first); once the owner applied an import it follows by itself
+// (`work_store.files: follow`, started below): bus reports and run and claim facts by cursor, the files when they
+// change. Fill, the planner and the tracker still read the files. Every route is the owner's.
 const works = new WorkStoreManager({
   dataDir: join(process.cwd(), "data"),
   runs: () => agents.getStore(),
   bus: (project) => busConsumers.lineSource(project),
+  reports: (project) => existingBusStore(project, busDataDir),
   accepted: (project) => {
     const service = agents.get(project);
     return service ? (agent, task, line, description, report) => service.reportAccepted(agent, task, line, description, report) : undefined;
   },
+  fill: (project) => agents.get(project)?.fillStatus() ?? null,
+  events: getEventBus(),
 });
 works.load(projectEntries);
 await registerWorkRoutes(fastify, works, () => getDefaultProject(), humanAuth);
@@ -1258,6 +1262,9 @@ const start = async () => {
     busLive.start();
     const onBus = busConsumers.enabled();
     console.log(onBus.length > 0 ? `[bus] On or observing for: ${onBus.join(", ")}` : "[bus] Off (no project sets bus.consume)");
+    // The work store's follower and consumer (after the agents and the bus, whose facts it reads): it replays what came
+    // since its cursors first, then follows; a project follows only once the owner applied an import
+    works.start();
     // Start the tracker (after the planner and the agents, whose events it follows): each syncs in the background,
     // so a slow or unreachable GitHub never holds up the start
     const tracked = trackers.start();
