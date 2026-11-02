@@ -53,6 +53,8 @@ export interface WorkStoreManagerOptions {
   followIntervalMs?: number;
   /** A follow step that takes longer fails (ms, default 60 s); the step in flight still ends before another starts */
   followTimeoutMs?: number;
+  /** Facts read per source per round (default 500) */
+  factBatch?: number;
   now?: () => number;
   log?: Pick<Console, "warn">;
 }
@@ -266,6 +268,11 @@ export class WorkStoreManager {
       state.nextAt = 0;
       state.lastError = null;
     } catch (e) {
+      // Switched off or stopping under the step (its store was closed): not a failure of the follower
+      if (this.stopped || this.follows.get(project) !== state) {
+        await work.catch(() => {});
+        return;
+      }
       state.failures++;
       state.lastError = message(e);
       state.nextAt = this.now() + Math.min((this.options.followIntervalMs ?? 15_000) * 2 ** (state.failures - 1), MAX_BACKOFF_MS);
@@ -281,7 +288,7 @@ export class WorkStoreManager {
     if (!opened.ok) throw new Error(opened.error);
     // Not adopted: the owner's first applied import (after a dry run) starts the following
     if (!(await opened.data.adopted())) return;
-    const facts = await drainFacts(project, opened.data, await this.factSources(project), () => this.now());
+    const facts = await drainFacts(project, opened.data, await this.factSources(project), () => this.now(), this.options.factBatch);
     state.applied += facts.applied;
     state.skipped += facts.skipped;
     const entry = this.projects.get(project);
@@ -424,8 +431,9 @@ export class WorkStoreManager {
     this.importing.add(project);
     try {
       // The consumer's starting points, read before the files: a fact after them is the consumer's, one before the files'
-      const cursors = options.dryRun ? undefined : factMarks(await this.factSources(project));
-      const files = await readFiles({ project, config: entry.config, runs: this.options.runs(), bus: this.options.bus(project), accepted: this.options.accepted?.(project) });
+      const sources = await this.factSources(project);
+      const cursors = options.dryRun ? undefined : factMarks(sources);
+      const files = await readFiles({ project, config: entry.config, runs: this.options.runs(), bus: this.options.bus(project), reports: sources.reports, accepted: sources.accepted });
       if (!files.ok) return { ok: false, code: 422, error: files.error };
       // Opened after the reads: a reload that switched the project off meanwhile refuses the import
       const opened = await this.opened(project);

@@ -797,9 +797,10 @@ const works = new WorkStoreManager({
   runs: () => agents.getStore(),
   bus: (project) => busConsumers.lineSource(project),
   reports: (project) => existingBusStore(project, busDataDir),
+  // The ready guard's verdict only (record: false): fill's refusal and waiting events stay fill's own
   accepted: (project) => {
     const service = agents.get(project);
-    return service ? (agent, task, line, description, report) => service.reportAccepted(agent, task, line, description, report) : undefined;
+    return service ? (agent, task, line, description, report, options) => service.reportAccepted(agent, task, line, description, report, options) : undefined;
   },
   fill: (project) => agents.get(project)?.fillStatus() ?? null,
   events: getEventBus(),

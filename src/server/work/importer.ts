@@ -24,7 +24,8 @@ import { matchesByAgent, parseAgentsConfig, type FillSettings } from "../agents/
 import { checkDone, MAX_TASKS_FILE_BYTES, parseTasksFile, QueueLines, queueWindowEnd, readBounded, reportedOutcome, unassignedLine } from "../agents/fill.js";
 import type { AgentsStore } from "../agents/store.js";
 import { isActive } from "../agents/types.js";
-import { extractBusId, type BusLineSource, type StructuredReport } from "../bus/consumers.js";
+import { extractBusId, isMirrorOf, type BusLineSource, type StructuredReport } from "../bus/consumers.js";
+import type { BusStore } from "../bus/store.js";
 import { parsePlannerConfig } from "../planner/config.js";
 import { parseTasksDoc, type TaskLine } from "../planner/tasks-file.js";
 import { taskIdsIn } from "../tracker/tasks.js";
@@ -38,8 +39,11 @@ const NO_RUNS: RunsSource = { getEventByKey: () => null, latestRunForTask: () =>
 
 const DEFAULT_DONE_MARKER = "#done ";
 
-/** Fill's ready guard on a DONE line (AgentsService.reportAccepted): false refuses it */
-export type ReportAccepted = (agent: string, task: string, line: string, description: string, report: StructuredReport | null) => Promise<boolean>;
+/**
+ * Fill's ready guard on a DONE line (AgentsService.reportAccepted): false refuses it. The work store only observes, so
+ * it always asks for the verdict alone (`record: false`): fill's refusal and waiting events stay fill's to write.
+ */
+export type ReportAccepted = (agent: string, task: string, line: string, description: string, report: StructuredReport | null, options: { record: false }) => Promise<boolean>;
 
 export interface ImportSources {
   project: string;
@@ -47,6 +51,8 @@ export interface ImportSources {
   runs: RunsSource | null;
   /** The project's bus (bus.consume observe or on), or null: a mirrored line is read by its report only in on mode */
   bus: BusLineSource | null;
+  /** The project's bus store when its file exists: a mirrored BLOCKED line's reason is its report's summary in every mode */
+  reports?: Pick<BusStore, "getReports"> | null;
   accepted?: ReportAccepted;
 }
 
@@ -83,10 +89,14 @@ export async function readFiles(src: ImportSources): Promise<FilesRead> {
   };
   const claimed = new Set(doc.tasks.filter((line) => held(line.task)).map((line) => line.task));
   const queue = await QueueLines.read(src.config.queue_file, src.bus?.mode === "on" ? src.bus : null);
-  /** A BLOCKED line's reason: a mirrored report's own summary (as the bus consumer stores it), else the line */
+  /**
+   * A BLOCKED line's reason: the mirrored report's own summary (as the bus consumer stores it, whatever bus.consume
+   * says), else the line. A line that ends with another report's marker is not that report's mirror: the line.
+   */
   const reasonOf = (line: string) => {
     const id = extractBusId(line);
-    return reportReason((id === null ? undefined : src.bus?.reports([id]).get(id))?.summary ?? line);
+    const report = id === null ? undefined : (src.bus?.reports([id]).get(id) ?? src.reports?.getReports([id])[0]);
+    return reportReason(report && isMirrorOf(line, report) ? report.summary : line);
   };
 
   /** What fill's checks read for one open line */
@@ -105,7 +115,7 @@ export async function readFiles(src: ImportSources): Promise<FilesRead> {
         const fields = { agent: line.agent, name: line.name, task: line.task, description: line.description };
         until = queueWindowEnd(runs, src.project, fill, fields, latest);
         const done = await checkDone(runs, src.project, queue, fill, fields, latest, until);
-        if (done && (done.kind === "kept" || !src.accepted || (await src.accepted(line.agent, line.task, done.line, line.description, done.report)))) {
+        if (done && (done.kind === "kept" || !src.accepted || (await src.accepted(line.agent, line.task, done.line, line.description, done.report, { record: false })))) {
           return { state: "done", reason: done.line };
         }
         if (done) warnings.push(`${line.task}: fill's ready guard refuses its DONE line: imported as not done`);

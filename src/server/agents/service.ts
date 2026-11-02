@@ -3261,10 +3261,19 @@ export class AgentsService {
    * fill or the guard is off). The planner settles a task through this too, so a
    * refused report is a done nowhere. `report`: the bus report the line was
    * read from (bus.consume on): its PR and head are its own fields.
+   * `record: false` (the work store, which only observes): the verdict only,
+   * with no fill_report_refused or fill_report_waiting event written.
    */
-  async reportAccepted(agent: string, task: string, line: string, taskText: string, report: StructuredReport | null = null): Promise<boolean> {
+  async reportAccepted(
+    agent: string,
+    task: string,
+    line: string,
+    taskText: string,
+    report: StructuredReport | null = null,
+    options: { record?: boolean } = {},
+  ): Promise<boolean> {
     if (!this.fill) return true;
-    return (await this.fill.guardReport(agent, task, line, this.store.latestRunForTask(this.project, task), taskText, report)) === null;
+    return (await this.fill.guardReport(agent, task, line, this.store.latestRunForTask(this.project, task), taskText, report, options)) === null;
   }
 
   /**

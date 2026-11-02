@@ -3816,6 +3816,23 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
       expect(eventsOf(h, "fill_report_refused")).toEqual([]);
     });
 
+    it("the verdict alone (record: false, as the work store asks) writes no refusal; fill's own check still records it once", async () => {
+      const h = await finished(() => ({ ...green, checks: [{ name: "build-22", state: "failure" as const }] }));
+      expect(eventsOf(h, "fill_report_refused")).toEqual([]);
+      expect(await h.service.reportAccepted("worker-a", "feat-login", DONE, "Login form", null, { record: false })).toBe(false);
+      expect(eventsOf(h, "fill_report_refused")).toEqual([]);
+      await check(h);
+      expect(eventsOf(h, "fill_report_refused")).toHaveLength(1);
+    });
+
+    it("the verdict alone on pending CI writes no waiting event; the planner's and fill's calls still do", async () => {
+      const h = await finished(() => ({ ...green, checks: [{ name: "build-22", state: "pending" as const }] }));
+      expect(await h.service.reportAccepted("worker-a", "feat-login", DONE, "Login form", null, { record: false })).toBe(false);
+      expect(eventsOf(h, "fill_report_waiting")).toEqual([]);
+      expect(await h.service.reportAccepted("worker-a", "feat-login", DONE, "Login form")).toBe(false);
+      expect(eventsOf(h, "fill_report_waiting")).toHaveLength(1);
+    });
+
     it("a branch behind its base is refused with the reason", async () => {
       const h = await finished(() => ({ ...green, behindBy: 3 }));
       await check(h);

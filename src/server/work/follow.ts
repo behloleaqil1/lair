@@ -17,8 +17,8 @@ import { statOrNull } from "../services/async-fs.js";
 import type { ReportAccepted } from "./importer.js";
 import type { ClaimFact, CursorMove, Cursors, ReportFact, WorkFact, WorkStore } from "./store.js";
 
-/** The bus store's reads the consumer uses (the project's store when its file exists; never created here) */
-export type ReportReader = Pick<BusStore, "reportsAfter" | "lastReportId">;
+/** The bus store's reads the consumer and the importer use (the project's store when its file exists; never created here) */
+export type ReportReader = Pick<BusStore, "reportsAfter" | "lastReportId" | "getReports">;
 /** The agents store's reads the consumer uses */
 export type ClaimFactReader = Pick<AgentsStore, "claimFactsAfter" | "lastEventSeq" | "latestRunForTask">;
 
@@ -44,7 +44,7 @@ export function factMarks(src: FactSources): Cursors {
 }
 
 /** Apply every fact above the store's cursors, in time order, a batch per transaction. */
-export async function drainFacts(project: string, store: WorkStore, src: FactSources, now: () => number): Promise<{ applied: number; skipped: number }> {
+export async function drainFacts(project: string, store: WorkStore, src: FactSources, now: () => number, batch = FACT_BATCH): Promise<{ applied: number; skipped: number }> {
   let cursors = await store.cursors();
   // A source with no cursor (a store adopted before the consumer existed, or the agents module was off) starts at its end
   const start: Cursors = {};
@@ -64,10 +64,10 @@ export async function drainFacts(project: string, store: WorkStore, src: FactSou
     // A source whose end is behind its cursor had its file replaced: it starts again at its end
     if (src.reports && busAt !== undefined && busEnd < busAt) moves.push({ source: "bus.report", from: busAt, to: busEnd });
     if (src.runs && runsAt !== undefined && runsEnd < runsAt) moves.push({ source: "agents.event", from: runsAt, to: runsEnd });
-    const reports = src.reports && busAt !== undefined && busEnd > busAt ? src.reports.reportsAfter(busAt, FACT_BATCH) : [];
-    const claims = src.runs && runsAt !== undefined && runsEnd > runsAt ? src.runs.claimFactsAfter(project, runsAt, runsEnd, FACT_BATCH) : [];
+    const reports = src.reports && busAt !== undefined && busEnd > busAt ? src.reports.reportsAfter(busAt, batch) : [];
+    const claims = src.runs && runsAt !== undefined && runsEnd > runsAt ? src.runs.claimFactsAfter(project, runsAt, runsEnd, batch) : [];
     // A full batch may stop mid-time: the other source applies only up to its latest time, so the two stay in order
-    const latest = (times: number[]) => (times.length === FACT_BATCH ? Math.max(...times) : Infinity);
+    const latest = (times: number[]) => (times.length === batch ? Math.max(...times) : Infinity);
     const horizon = Math.min(latest(reports.map((r) => r.createdAt)), latest(claims.map((c) => c.at)));
     const prefix = <T>(items: T[], at: (item: T) => number) => {
       const end = items.findIndex((item) => at(item) > horizon);
@@ -78,7 +78,7 @@ export async function drainFacts(project: string, store: WorkStore, src: FactSou
     if (takenReports.length > 0 && busAt !== undefined) moves.push({ source: "bus.report", from: busAt, to: takenReports[takenReports.length - 1].id });
     if (runsAt !== undefined && runsEnd > runsAt) {
       // Every fact up to the end was read: rows of other projects and kinds are passed over for good
-      const to = takenClaims.length === claims.length && claims.length < FACT_BATCH ? runsEnd : takenClaims[takenClaims.length - 1]?.seq;
+      const to = takenClaims.length === claims.length && claims.length < batch ? runsEnd : takenClaims[takenClaims.length - 1]?.seq;
       if (to !== undefined) moves.push({ source: "agents.event", from: runsAt, to });
     }
     if (moves.length === 0) break;
@@ -89,7 +89,7 @@ export async function drainFacts(project: string, store: WorkStore, src: FactSou
       if (claim.kind !== "started" && claim.kind !== "completed" && claim.kind !== "claim_released") continue;
       const run = src.runs?.latestRunForTask(project, claim.task ?? "") ?? null;
       const live = claim.kind === "started" && run !== null && run.id === claim.runId && isActive(run.state);
-      facts.push({ source: "agents.event", id: claim.seq, at: claim.at, task: claim.task ?? "", agent: claim.agent ?? null, runId: claim.runId ?? null, kind: claim.kind, live } satisfies ClaimFact);
+      facts.push({ source: "agents.event", id: claim.seq, at: claim.at, task: claim.task ?? "", eventId: claim.id, agent: claim.agent ?? null, runId: claim.runId ?? null, kind: claim.kind, live } satisfies ClaimFact);
     }
     facts.sort((a, b) => a.at - b.at || rank(a) - rank(b));
     const result = await store.applyFacts(facts, moves, now());
@@ -121,11 +121,12 @@ async function reportFact(store: WorkStore, report: Parameters<typeof structured
   const task = await store.getTask(report.task);
   if (!task) return fact;
   try {
-    // The line as the bus mirror starts it; the guard reads the report's own PR and sha fields
-    fact.accepted = !accepted || (await accepted(report.agent, report.task, `- DONE ${report.task} by ${report.agent} ${report.summary}`, task.description, structuredReport(report)));
-  } catch {
-    // A guard that fails accepts nothing: the follower reads the line again on the next change
-    fact.accepted = false;
+    // The line as the bus mirror starts it; the guard reads the report's own PR and sha fields. The verdict only:
+    // fill writes its own refusal and waiting events, never the work store (it observes)
+    fact.accepted = !accepted || (await accepted(report.agent, report.task, `- DONE ${report.task} by ${report.agent} ${report.summary}`, task.description, structuredReport(report), { record: false }));
+  } catch (e) {
+    // No verdict is no refusal: the step fails (shown, backed off) and no cursor moves, so the report is read again
+    throw new Error(`the ready guard failed on bus report ${report.id} (${report.task}): ${e instanceof Error ? e.message : String(e)}`);
   }
   return fact;
 }

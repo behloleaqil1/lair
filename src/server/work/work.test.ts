@@ -43,6 +43,7 @@ interface RigOptions {
   fill?: () => FillStatusView | null;
   followTimeoutMs?: number;
   followIntervalMs?: number;
+  factBatch?: number;
 }
 
 async function rig(o: RigOptions = {}) {
@@ -69,18 +70,30 @@ async function rig(o: RigOptions = {}) {
   const events = new EventBus();
   const warnings: string[] = [];
   let now = 1_000;
+  // Fill's ready guard (a stand-in for AgentsService.reportAccepted): like fill's guardReport, a refusal is recorded in
+  // the agents store unless the caller asks for the verdict alone (record: false), as the work store must
+  const guard = o.accepted
+    ? () =>
+        async (agent: string, task: string, _line: string, _description: string, _report: unknown, options?: { record?: boolean }) => {
+          const ok = await o.accepted!(task);
+          if (!ok && options?.record !== false) agents.addEvent({ project: PROJECT, kind: "fill_report_refused", agent, task, summary: "refused", evidence: [], data: {}, at: now });
+          return ok;
+        }
+    : undefined;
   // As index.ts builds it, with the server's events; the follower's timer is not what these tests wait on (one does)
   const managerFor = () =>
     new WorkStoreManager({
       dataDir,
       runs: () => agents,
+      // bus.consume off (the default): the importer has no bus line source
       bus: () => null,
       reports: (project) => existingBusStore(project, dataDir),
-      accepted: o.accepted ? () => async (_agent, task) => o.accepted!(task) : undefined,
+      accepted: guard,
       fill: o.fill ? () => o.fill!() : undefined,
       events,
       followIntervalMs: o.followIntervalMs ?? 3_600_000,
       followTimeoutMs: o.followTimeoutMs,
+      factBatch: o.factBatch,
       now: () => now,
       log: { warn: (text: string) => warnings.push(text) },
     });
@@ -494,6 +507,20 @@ describe("work store: its own file, versioned", () => {
     expect((await store.timeline("feat-1", 10)).map((e) => e.kind)).toEqual(["state_changed", "report", "created"]);
   });
 
+  it("applies a run or claim fact once by its event id, even when its row number changed under the cursor", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lair-work-store-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const store = await SqliteWorkStore.open(PROJECT, join(dir, "shop.db"));
+    cleanups.push(() => store.close());
+    await store.syncFromFiles({ ...snapshot, tasks: [{ ...snapshot.tasks[0], state: "waiting" as const }] }, { dryRun: false, actor: { kind: "owner", id: "s1" }, at: 5, cursors: { "agents.event": 0 } });
+    const started = { source: "agents.event" as const, id: 1, eventId: "e-1", at: 6, task: "feat-1", agent: "worker-a", runId: "r1", kind: "started" as const, live: true };
+    expect(await store.applyFacts([started], [{ source: "agents.event", from: 0, to: 1 }], 7)).toEqual({ moved: true, applied: 1, skipped: 0 });
+    // The same event under another row (the agents store's rows were renumbered): skipped, nothing moves twice
+    expect(await store.applyFacts([{ ...started, id: 2 }], [{ source: "agents.event", from: 1, to: 2 }], 8)).toEqual({ moved: true, applied: 0, skipped: 1 });
+    expect(await store.getTask("feat-1")).toMatchObject({ state: "ready", version: 2 });
+    expect((await store.timeline("feat-1", 10)).map((e) => e.kind)).toEqual(["state_changed", "started", "created"]);
+  });
+
   it("shows a store that can't be opened in the status and refuses the import, for that project only", async () => {
     const h = await rig({ tasks: ["worker-a|A|feat-1|Ship it"] });
     const path = join(h.dataDir, "work", `${PROJECT}.db`);
@@ -603,14 +630,15 @@ describe("work store 2: it follows by itself once the owner applied an import", 
     expect(h.warnings).toEqual([]);
   });
 
-  it("a DONE report the ready guard refuses is recorded and changes nothing; one it accepts closes the task", async () => {
+  it("a DONE report the ready guard refuses is recorded and changes nothing; one it accepts closes the task; fill's records stay fill's", async () => {
     const h = await rig({
       tasks: ["worker-a|A|feat-guard|Its PR is not ready", "worker-b|B|feat-ok|Ships"],
-      // Fill's ready guard (a stand-in): it refuses feat-guard's DONE
+      // Fill's ready guard (a stand-in): it refuses feat-guard's DONE, and records the refusal unless asked not to
       accepted: (task) => task !== "feat-guard",
     });
-    h.run({ id: "run-g", task: "feat-guard", agent: "worker-a", state: "running" });
-    h.run({ id: "run-o", task: "feat-ok", agent: "worker-b", state: "running" });
+    // Runs that ended (no claim): the follower reads their mirrored DONE lines and asks the guard too
+    h.run({ id: "run-g", task: "feat-guard", agent: "worker-a", state: "completed" });
+    h.run({ id: "run-o", task: "feat-ok", agent: "worker-b", state: "completed" });
     await h.importFiles(false);
     h.manager.start();
     await h.manager.settled();
@@ -623,6 +651,103 @@ describe("work store 2: it follows by itself once the owner applied an import", 
     const ok = (await h.task("feat-ok")).body.data;
     expect(ok.task).toMatchObject({ state: "done", version: 2 });
     expect(kinds(ok.events)).toEqual(["state_changed", "report", "created"]);
+    // The follower reads the mirrored lines and asks the guard again: still the verdict alone
+    await h.manager.followNow();
+    expect((await h.status()).follow).toMatchObject({ reads: 2, failures: 0 });
+    expect((await h.task("feat-guard")).body.data.task).toMatchObject({ state: "ready", version: 1 });
+    // Observe writes nothing outside the store: no refusal or waiting event of fill's in the agents store
+    expect(h.agents.listEvents(PROJECT, { kinds: ["fill_report_refused", "fill_report_waiting"] })).toEqual([]);
+  });
+
+  it("a ready guard that fails gives no verdict: the step fails, the cursor stays, and the report applies once it answers", async () => {
+    let broken = true;
+    const h = await rig({
+      tasks: ["worker-a|A|feat-1|Ships"],
+      accepted: () => {
+        if (broken) throw new Error("the git host token was refused");
+        return true;
+      },
+    });
+    h.run({ id: "run-1", task: "feat-1", agent: "worker-a", state: "running" });
+    await h.importFiles(false);
+    h.manager.start();
+    await h.manager.settled();
+    const id = await h.report("run-1", "DONE", "shipped", { pr: 3, sha: "abc123" });
+    await h.manager.settled();
+    const failed = await h.status();
+    expect(failed.follow).toMatchObject({ failures: 1, lastError: `the ready guard failed on bus report ${id} (feat-1): the git host token was refused` });
+    expect(failed.store?.cursors).toMatchObject({ "bus.report": id - 1 });
+    expect(kinds((await h.task("feat-1")).body.data.events)).toEqual(["created"]);
+    // It answers again: the report applies, once
+    broken = false;
+    h.setNow(10 * 3_600_000);
+    await h.manager.followNow();
+    expect((await h.status()).follow).toMatchObject({ failures: 0, lastError: null });
+    expect((await h.status()).store?.cursors).toMatchObject({ "bus.report": id });
+    const t = (await h.task("feat-1")).body.data;
+    expect(t.task).toMatchObject({ state: "done", version: 2 });
+    expect(kinds(t.events)).toEqual(["state_changed", "report", "created"]);
+  });
+
+  it("a mirrored BLOCKED line reads as its report's summary with bus.consume off: the follower does not edit the consumer's reason", async () => {
+    const h = await rig({ tasks: ["worker-a|A|feat-1|Needs a key"] });
+    h.run({ id: "run-1", task: "feat-1", agent: "worker-a", state: "completed" });
+    await h.importFiles(false);
+    h.manager.start();
+    await h.manager.settled();
+    await h.report("run-1", "BLOCKED", "needs the key");
+    await h.manager.settled();
+    expect((await h.task("feat-1")).body.data.task).toMatchObject({ state: "blocked", blockedReason: "needs the key", version: 2 });
+    // The mirror appended its line: the follower reads it (the run has ended) and finds the same state and reason
+    expect(readFileSync(h.queueFile, "utf-8")).toContain("- BLOCKED feat-1 by worker-a");
+    await h.manager.followNow();
+    expect((await h.status()).follow).toMatchObject({ reads: 2, failures: 0 });
+    const t = (await h.task("feat-1")).body.data;
+    expect(t.task).toMatchObject({ state: "blocked", blockedReason: "needs the key", version: 2 });
+    expect(kinds(t.events)).toEqual(["state_changed", "report", "created"]);
+  });
+
+  it("applies the two sources in time order: a run's start before its report, whichever source is read first", async () => {
+    const h = await rig({ tasks: ["worker-b|B|feat-wait|Waits on a gate"], queue: ["- WAITING feat-wait gate-12 by worker-b"] });
+    h.run({ id: "run-1", task: "feat-wait", agent: "worker-b", state: "completed" });
+    await h.importFiles(false);
+    expect((await h.task("feat-wait")).body.data.task.state).toBe("waiting");
+    // While the server is down: run-2 starts (an agents event), then reports WAITING again (a bus report)
+    h.setNow(2_000);
+    h.run({ id: "run-2", task: "feat-wait", agent: "worker-b", state: "running" });
+    expect(h.agents.claim(PROJECT, "feat-wait", "run-2", "worker-b", { pid: 4242, startedAt: 1 }, 2_000, () => true).ok).toBe(true);
+    h.agents.addEvent({ project: PROJECT, kind: "started", agent: "worker-b", task: "feat-wait", runId: "run-2", subject: "feat-wait", summary: "started", evidence: [], data: {}, at: Date.now() });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await h.report("run-2", "WAITING", "waits on the next gate", { gateId: "gate-13" });
+    // The start replays first (ready, shown running), then the report (waiting again)
+    h.manager.start();
+    await h.manager.settled();
+    const t = (await h.task("feat-wait")).body.data;
+    expect(t.task).toMatchObject({ state: "waiting", version: 3 });
+    expect(kinds(t.events).reverse()).toEqual(["created", "started", "state_changed", "report", "state_changed"]);
+  });
+
+  it("a full batch of one source holds the other back to its latest time, so facts apply in time order across batches", async () => {
+    const h = await rig({ tasks: ["worker-a|A|feat-1|Ships"], factBatch: 2 });
+    h.run({ id: "run-1", task: "feat-1", agent: "worker-a", state: "running" });
+    await h.importFiles(false);
+    // While the server is down: three reports, and three run facts whose times fall between and after them
+    const at: number[] = [];
+    for (const summary of ["one", "two", "three"]) {
+      at.push(getBusStore(PROJECT, h.dataDir).getReport(await h.report("run-1", "PROGRESS", summary))!.createdAt);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const fact = (kind: "started" | "completed" | "claim_released", when: number) =>
+      h.agents.addEvent({ project: PROJECT, kind, agent: "worker-a", task: "feat-1", runId: "run-1", subject: "feat-1", summary: kind, evidence: [], data: {}, at: when });
+    fact("started", at[0] + 1);
+    fact("completed", at[2] + 1);
+    fact("claim_released", at[2] + 2);
+    // Batches of 2: the first round's claims stop at the reports' latest time, the late `completed` waits for the third report
+    h.manager.start();
+    await h.manager.settled();
+    const t = (await h.task("feat-1")).body.data;
+    expect(kinds(t.events).reverse()).toEqual(["created", "report", "started", "report", "report", "ended", "claim_released"]);
+    expect(t.events.filter((e: { kind: string }) => e.kind === "report").map((e: { payload: { summary: string } }) => e.payload.summary).reverse()).toEqual(["one", "two", "three"]);
   });
 
   it("a run that starts on a waiting task shows it running again; a replayed start of a run that ended moves nothing", async () => {
@@ -728,6 +853,24 @@ describe("work store 2: it follows by itself once the owner applied an import", 
     // Nothing was left to read again
     await h.manager.followNow();
     expect((await h.status()).follow).toMatchObject({ checks: 2, reads: 1 });
+  });
+
+  it("reads a file again that changed while its import ran: the file's size and time are taken before the read", async () => {
+    let release!: (ok: boolean) => void;
+    const guard = new Promise<boolean>((resolve) => (release = resolve));
+    const h = await rig({ tasks: ["worker-a|A|feat-1|Ship it"], accepted: () => guard });
+    await h.importFiles(false);
+    appendFileSync(h.queueFile, "- DONE feat-1 PR #12 by worker-a\n");
+    h.manager.start();
+    await waitFor(async () => (await h.status()).follow?.reads === 1);
+    // The tasks file changes while the follower's import (which read it already) waits on the guard
+    appendFileSync(h.tasksFile, "worker-b|B|feat-2|Added meanwhile\n");
+    release(true);
+    await h.manager.settled();
+    expect((await h.task("feat-2")).status).toBe(404);
+    await h.manager.followNow();
+    expect((await h.status()).follow).toMatchObject({ checks: 2, reads: 2, failures: 0 });
+    expect((await h.task("feat-2")).body.data.task).toMatchObject({ state: "ready", agent: "worker-b" });
   });
 
   it("compares the store with fill's view at its last check, names the tasks they disagree on, and leaves fill's holds out", async () => {

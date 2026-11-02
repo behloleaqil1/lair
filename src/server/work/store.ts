@@ -151,7 +151,10 @@ export interface ReportFact {
 /** A claim fact from the agents store's events: a run started, a run ended, a claim was released */
 export interface ClaimFact {
   source: "agents.event";
+  /** The event's row in the agents store: the cursor's position */
   id: number;
+  /** The event's own id: a fact already on the task's timeline is not applied again, whatever its row */
+  eventId: string;
   at: number;
   task: string;
   agent: string | null;
@@ -350,6 +353,8 @@ export class SqliteWorkStore implements WorkStore {
     const setState = this.db.prepare(`UPDATE work_tasks SET state = ?, blocked_reason = ?, updated_at = ?, version = version + 1 WHERE project = ? AND id = ?`);
     const position = this.db.prepare(`SELECT position FROM work_cursors WHERE project = ? AND source = ?`);
     const move = this.db.prepare(`UPDATE work_cursors SET position = ?, updated_at = ? WHERE project = ? AND source = ?`);
+    // A run or claim fact already on the task's timeline (its row was renumbered under the cursor): not applied again
+    const seenFact = this.db.prepare(`SELECT 1 FROM work_events WHERE project = ? AND task_id = ? AND kind = ? AND json_extract(payload, '$.eventId') = ? LIMIT 1`);
     return this.db.transaction(() => {
       // Every cursor where this drain read it, or nothing: a fact is applied once, with the cursor that covers it
       if (moves.some((m) => (position.get(this.project, m.source) as { position: number } | undefined)?.position !== m.from)) return { moved: false, applied: 0, skipped: 0 };
@@ -358,8 +363,9 @@ export class SqliteWorkStore implements WorkStore {
       let skipped = 0;
       for (const fact of facts) {
         const row = getRow.get(this.project, fact.task) as TaskRow | undefined;
-        if (!row) {
-          // Not a task of the store (yet): the follower imports it from the files
+        // Not a task of the store (yet): the follower imports it from the files
+        const again = row !== undefined && fact.source === "agents.event" && seenFact.get(this.project, fact.task, CLAIM_EVENTS[fact.kind], fact.eventId) !== undefined;
+        if (!row || again) {
           skipped++;
           continue;
         }
@@ -368,7 +374,7 @@ export class SqliteWorkStore implements WorkStore {
         // The agent that reported, or the agents module for its runs and claims (never a field of the fact's text)
         const actor: WorkActor =
           fact.source === "bus.report" ? { kind: "agent", id: fact.agent, runId: fact.runId } : { kind: "module", id: "agents", ...(fact.runId ? { runId: fact.runId } : {}) };
-        const cause = fact.source === "bus.report" ? { busId: fact.id } : { eventSeq: fact.id };
+        const cause = fact.source === "bus.report" ? { busId: fact.id } : { eventSeq: fact.id, eventId: fact.eventId };
         if (fact.source === "bus.report") {
           const refused = fact.kind === "DONE" && !fact.accepted ? { refused: "fill's ready guard does not accept it now" } : {};
           event(task.id, "report", { ...cause, kind: fact.kind, summary: fact.summary.slice(0, 300), gateId: fact.gateId, pr: fact.pr, sha: fact.sha, ...refused }, actor, fact.at);
