@@ -55,6 +55,7 @@ import { isActive } from "./agents/types.js";
 import { AiToolsService, registerAiRoutes } from "./ai/index.js";
 import { getBudgetManager } from "./fleet/budget.js";
 import { ReviewManager, inboxDecisionSink, registerReviewRoutes } from "./review/index.js";
+import { RepoSources } from "./repos/index.js";
 import { mountTriage } from "./triage/index.js";
 import { PlacementManager, registerPlacementRoutes } from "./placement/index.js";
 import { HostServicesManager, registerHostServicesRoutes } from "./host-services/index.js";
@@ -717,11 +718,10 @@ hostServices.load(projectEntries);
 // A pipeline job whose lane needs a service that is not up waits (act mode only)
 pipelines.useLaneHolds((project, names) => hostServices.holdFor(project, names));
 
-// The ready guard (agents.fill.ready_guard) reads a project's PRs from its review module's git host
-agents.useReadyFacts((project) => {
-  const review = reviews.get(project);
-  return review ? { facts: (pr) => review.readyFacts(pr) } : undefined;
-});
+// The ready guard (agents.fill.ready_guard) reads a project's PRs: the review repository's through the review
+// module, any other repository the project lists (repos:) through a git host of its own (src/server/repos/)
+const repoSources = new RepoSources({ review: (project) => reviews.get(project) });
+agents.useReadyFacts((project, config) => repoSources.readyFacts(project, config));
 // Every merge hold has one decision (only the owner releases a hold); answering it releases the hold
 await reviews.useDecisions(decisionInbox);
 // The same for delivery's held services: answering releases the service, as its Release button does
