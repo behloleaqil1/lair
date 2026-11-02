@@ -681,6 +681,8 @@ export const ASYNC_ONLY_MODULES: readonly string[] = [
   "watchdog/view.ts",
   "watchdog/detectors.ts",
   "watchdog/executors.ts",
+  "agents/fill.ts",
+  "agents/service.ts",
 ];
 
 /**

@@ -98,6 +98,8 @@ import { WatchdogStore } from "../watchdog/store.js";
 import { NodeFileSystem, type CommandOutput, type ProcessInfo } from "../watchdog/probes.js";
 import { listDir, mapLimit, readSmallFile, readTail, SingleFlight } from "./async-fs.js";
 import { DataService } from "./data.js";
+import { AgentsManager } from "../agents/service.js";
+import { EventBus } from "../core/event-bus.js";
 
 const FILES = 5000;
 /** The longest the event loop may go without running a due timer */
@@ -219,7 +221,82 @@ describe("the event loop on a slow disk (issue #245)", () => {
     expect(result.recent.every((r) => r.rc === 0)).toBe(true);
     expect(result.overview.agentCounts).toEqual({ running: 0, idle: 1 });
   }, 120_000);
+
+  it("keeps a timer firing through a fill check over a 4 MB queue file and 5,000 prompt files, and starts the one open task", async () => {
+    const config = fillProject();
+    const manager = new AgentsManager({
+      dbPath: join(dir, "agents.db"),
+      probes: {
+        processes: { list: async () => [] },
+        fs: new NodeFileSystem(),
+        runner: { run: async (): Promise<CommandOutput> => ({ code: 0, stdout: "", stderr: "" }) },
+        clock: { now: () => Date.now(), sleep: async () => {} },
+        spawner: {
+          spawn: async () => {
+            throw new Error("a fill check requests runs; it never spawns one");
+          },
+          exitCode: () => undefined,
+          knows: () => false,
+          kill: () => false,
+          forget: () => {},
+        },
+        self: { pid: process.pid, startedAt: Date.now() - 60_000 },
+        systemInfo: { cpuCount: () => 4, loadAvg1: () => 0.5, totalMemory: () => 16e9, memory: async () => ({ available: 8e9 }) },
+      },
+      events: new EventBus(),
+    });
+    try {
+      manager.load([{ name: "demo", config }]);
+      const service = manager.get("demo");
+      if (!service) throw new Error(`agents not enabled: ${manager.status("demo").errors.join("; ")}`);
+      const { result, maxGapMs } = await withSlowDisk(() => service.checkFill());
+      expect(slow.syncCalls, "a synchronous fs or child_process call ran on the fill check").toBe(0);
+      expect(slow.asyncCalls).toBeGreaterThan(0);
+      expect(maxGapMs).toBeLessThan(LAG_BUDGET_MS);
+      const states = Object.fromEntries(result.lines.map((l) => [l.task, l.state]));
+      expect(states["task-19"]).toBe("started");
+      expect(Object.values(states).filter((s) => s === "done")).toHaveLength(19);
+      expect(manager.getStore()?.listRuns("demo", { limit: 10 }).map((r) => [r.task, r.origin])).toEqual([["task-19", "fill"]]);
+    } finally {
+      await manager.stop();
+    }
+  }, 120_000);
 });
+
+/** A fill project: 20 tasks for worker-a, 19 of them reported done in a 4 MB queue file; 5,000 old prompt files */
+function fillProject(): ProjectConfig {
+  const agents = join(dir, "agents");
+  const prompts = join(dir, "prompts");
+  mkdirSync(agents, { recursive: true });
+  mkdirSync(prompts, { recursive: true });
+  writeFileSync(join(prompts, "worker.txt"), "Build what the task says.\n");
+  for (let i = 0; i < FILES; i++) writeFileSync(join(prompts, `task-${i}-worker-a-old.txt`), "an old run's prompt\n");
+  const tasks = Array.from({ length: 20 }, (_, i) => `worker-a|Alice|task-${i}|Build part ${i}`);
+  writeFileSync(join(dir, "tasks.txt"), `${tasks.join("\n")}\n`);
+  const filler = `- PROGRESS other by worker-b 12:00Z: ${"x".repeat(950)}`;
+  const lines: string[] = [];
+  for (let i = 0; i < 4000; i++) lines.push(i % 200 === 0 && i / 200 < 19 ? `- DONE task-${i / 200} by worker-a 12:00Z: merged` : filler);
+  writeFileSync(join(dir, "queue.md"), `${lines.join("\n")}\n`);
+  return {
+    name: "demo",
+    repo: dir,
+    github: "",
+    queue_file: join(dir, "queue.md"),
+    agents_dir: agents,
+    gates_dir: join(dir, "gates"),
+    prompts_dir: prompts,
+    machines: {},
+    dragons: { "worker-a": { id: "worker-a", name: "Alice", model: "model-a", machine: "local", instructions: "", adapter: "test-cli" } },
+    agent_adapters: {
+      "test-cli": { id: "test-cli", name: "Test CLI", start_cmd: "agent-cli run --agent {agent_id} --prompt {prompt_file}", stop_cmd: "kill -TERM {pid}", status_method: "file", log_dir: "logs" },
+    },
+    agents: {
+      enabled: true,
+      interval_seconds: 1,
+      fill: { enabled: true, tasks_file: join(dir, "tasks.txt"), agents: ["worker-a"], prompt_files: ["{prompts_dir}/worker.txt"], interval_seconds: 1 },
+    },
+  } as unknown as ProjectConfig;
+}
 
 describe("bounded async reads", () => {
   it("readTail reads only the last bytes of a regular file, and nothing of a folder or a missing path", async () => {

@@ -31,7 +31,8 @@
  * task list, through requestRun like any other in-process caller.
  */
 import { randomUUID } from "crypto";
-import { closeSync, fstatSync, mkdirSync, openSync, readSync, statSync, writeFileSync } from "fs";
+import { mkdir, open, writeFile } from "fs/promises";
+import { readTailText, statOrNull } from "../services/async-fs.js";
 import { basename, join } from "path";
 import type { EventBus } from "../core/event-bus.js";
 import type { EventType } from "../../shared/server-types.js";
@@ -116,7 +117,7 @@ import {
   type AgentProbes,
   type ProcessOwner,
 } from "./probes.js";
-import { extractHungLogLines, extractLastTool, lastLines, moveSessionAside, readTail, resumeSummary, sessionDirFor, utcStamp } from "./sessions.js";
+import { extractHungLogLines, extractLastTool, lastLines, moveSessionAside, resumeSummary, sessionDirFor, utcStamp } from "./sessions.js";
 import { AgentsStore, type ClaimResult, type HungInfo } from "./store.js";
 import {
   claimView,
@@ -272,29 +273,36 @@ const failoverLabel = (kind: FailoverInfo["kind"]) => (kind === "rate_limit" ? "
 const openTaskRefusal = (agent: string, open: FillLineView) =>
   `Agent ${agent} has an open fill task, ${open.task} (${open.state}${open.hold ? `: ${open.hold}` : ""}): with fill's patterns matching by agent, its lines on another task would count for that one. Let ${open.task} finish, or take its line out of tasks_file first`;
 
-function fileSize(path: string): number {
-  try {
-    return statSync(path).size;
-  } catch {
-    return 0;
-  }
+// A run's log is read on every tick: asynchronously and bounded, never on the event loop (#245)
+
+async function fileSize(path: string): Promise<number> {
+  return (await statOrNull(path))?.size ?? 0;
+}
+
+/** The last `maxBytes` of a run's log (a regular file), or "" when it can't be read. */
+async function logTail(path: string, maxBytes: number): Promise<string> {
+  return (await readTailText(path, maxBytes)) ?? "";
 }
 
 /** Bytes of a file from `offset`, at most `max`. */
-function readFrom(path: string, offset: number, max: number): Buffer {
-  let fd: number | null = null;
+async function readFrom(path: string, offset: number, max: number): Promise<Buffer> {
+  let handle;
   try {
-    fd = openSync(path, "r");
-    const size = fstatSync(fd).size;
+    handle = await open(path, "r");
+  } catch {
+    return Buffer.alloc(0);
+  }
+  try {
+    const { size } = await handle.stat();
     if (size <= offset) return Buffer.alloc(0);
     const length = Math.min(size - offset, max);
     const buffer = Buffer.alloc(length);
-    readSync(fd, buffer, 0, length, offset);
-    return buffer;
+    const { bytesRead } = await handle.read(buffer, 0, length, offset);
+    return buffer.subarray(0, bytesRead);
   } catch {
     return Buffer.alloc(0);
   } finally {
-    if (fd !== null) closeSync(fd);
+    await handle.close().catch(() => {});
   }
 }
 
@@ -1074,7 +1082,7 @@ export class AgentsService {
     if (this.reconcilePending && !this.readOnly) this.reconcilePending = !(await this.reconcile(t));
     if (!this.readOnly) {
       for (const run of this.store.activeRuns(this.project)) {
-        if (run.state === "running" || run.state === "stopping") this.readUsage(run);
+        if (run.state === "running" || run.state === "stopping") await this.readUsage(run);
       }
     }
     await this.checkBudgets(t);
@@ -1317,11 +1325,11 @@ export class AgentsService {
     let spawned: ProcessOwner;
     let argv: string[];
     try {
-      run.promptFile = this.writePrompt(run);
+      run.promptFile = await this.writePrompt(run);
       argv = this.startCommand(run);
       const logPath = join(this.config.agents_dir, `${run.agent}-${utcStamp(t.now)}.log`);
       run.logPath = logPath;
-      run.logOffset = fileSize(logPath);
+      run.logOffset = await fileSize(logPath);
       spawned = await this.probes.spawner.spawn(argv, { cwd: this.config.repo, env: this.env(run), logPath });
     } catch (e) {
       this.releaseHeld(locks.held);
@@ -1367,9 +1375,9 @@ export class AgentsService {
     );
   }
 
-  private writePrompt(run: AgentRun): string {
+  private async writePrompt(run: AgentRun): Promise<string> {
     const dir = getPromptsDir(this.config);
-    mkdirSync(dir, { recursive: true });
+    await mkdir(dir, { recursive: true });
     const dragon = loadKnownDragons(this.config).get(run.agent);
     // A module's own prompt (ownPrompt) gets no default_instructions: those are the builders' standing orders
     const parts = [run.ownPrompt ? undefined : this.config.default_instructions, dragon?.instructions, run.resumeSummary, run.prompt]
@@ -1381,7 +1389,7 @@ export class AgentsService {
       parts.push(this.formatHungInfo(hungInfo));
     }
     const file = join(dir, runPromptFileName(run.task, run.agent, run.id));
-    writeFileSync(file, parts.join("\n\n") + "\n", "utf-8");
+    await writeFile(file, parts.join("\n\n") + "\n", "utf-8");
     return file;
   }
 
@@ -1727,7 +1735,7 @@ export class AgentsService {
     await this.noteReachable(run, t, false);
 
     // A rate limit or provider error at the end of a silent log
-    const failover = this.failoverWhileAlive(run, t.now);
+    const failover = await this.failoverWhileAlive(run, t.now);
     if (failover) {
       run.failover = failover;
       return this.stopRun(run, "failover", `${failoverLabel(failover.kind)}: ${failover.line}`, [`log line: ${failover.line}`], t);
@@ -1745,16 +1753,12 @@ export class AgentsService {
     }
   }
 
-  private failoverWhileAlive(run: AgentRun, now: number): FailoverInfo | null {
+  private async failoverWhileAlive(run: AgentRun, now: number): Promise<FailoverInfo | null> {
     if (!run.logPath) return null;
-    let mtime: number;
-    try {
-      mtime = statSync(run.logPath).mtimeMs;
-    } catch {
-      return null;
-    }
-    if (now - mtime < this.settings.failover.silenceSeconds * 1000) return null;
-    const last = lastLines(readTail(run.logPath, 8192), 1);
+    const st = await statOrNull(run.logPath);
+    if (!st) return null;
+    if (now - st.mtimeMs < this.settings.failover.silenceSeconds * 1000) return null;
+    const last = lastLines(await logTail(run.logPath, 8192), 1);
     // A transient error is handled as at an exit (finishStop): its provider counts as unreachable, nothing is counted
     const transient = matchTransient(last, this.settings);
     if (transient !== null) return { kind: "provider_error", line: transient, transient: true };
@@ -1853,11 +1857,11 @@ export class AgentsService {
    * run's queue mark (DONE, WAITING or BLOCKED), read with fill's patterns
    * as fill reads them, so fill classifies the completed run the same way.
    */
-  private reportedOutcome(run: AgentRun): ReportedOutcome | null {
+  private async reportedOutcome(run: AgentRun): Promise<ReportedOutcome | null> {
     const patterns = this.settings.fill;
     try {
       const until = queueWindowEnd(this.store, this.project, patterns, run, run);
-      return reportedOutcome(new QueueLines(this.config.queue_file, this.bus?.() ?? null), patterns, run, until);
+      return await reportedOutcome(await QueueLines.read(this.config.queue_file, this.bus?.() ?? null), patterns, run, until);
     } catch {
       return null; // a pattern that doesn't compile for this task: no line found
     }
@@ -1879,7 +1883,7 @@ export class AgentsService {
       return this.endRun(run, "completed", "exited 0", t, true);
     }
     if (code === undefined) return this.unsupervisedExit(run, t);
-    const tail = run.logPath ? readTail(run.logPath, 64 * 1024) : "";
+    const tail = run.logPath ? await logTail(run.logPath, 64 * 1024) : "";
     const exit = code === null ? "ended by a signal" : `exit code ${code}`;
     // A transient network or provider error is waited out, never a recovery attempt, while the chain has transient
     // retries left (its provider counts as unreachable, so the next attempt moves to a fallback when there is one)
@@ -1890,7 +1894,7 @@ export class AgentsService {
     if (failover) return this.failover(run, failover, t);
 
     const lived = t.now - (run.spawnedAt ?? t.now);
-    const empty = run.logPath ? fileSize(run.logPath) === 0 : true;
+    const empty = run.logPath ? (await fileSize(run.logPath)) === 0 : true;
     const evidence = [
       `pid ${run.pid} ${exit}`,
       ...this.transientCapNote(transient, used),
@@ -1918,7 +1922,7 @@ export class AgentsService {
    * agents.recovery), and escalates only once that budget is spent.
    */
   private async unsupervisedExit(run: AgentRun, t: Tick): Promise<void> {
-    const outcome = this.reportedOutcome(run);
+    const outcome = await this.reportedOutcome(run);
     if (outcome) {
       // The line is the agent's text: kept as evidence, never in the run's detail (resume summaries carry details)
       const detail = `exit unknown (it ended while Lair was restarting); classified from its queue line: ${outcome.kind.toUpperCase()}`;
@@ -1927,7 +1931,7 @@ export class AgentsService {
         data: { exit: "unknown", classifiedAs: outcome.kind, line: outcome.line },
       });
     }
-    const tail = run.logPath ? readTail(run.logPath, 64 * 1024) : "";
+    const tail = run.logPath ? await logTail(run.logPath, 64 * 1024) : "";
     const transient = matchTransient(lastLines(tail, TRANSIENT_TAIL_LINES), this.settings);
     const used = this.transientRetriesUsed(run, t.now);
     if (transient !== null && used < this.settings.transient.maxRetries) {
@@ -1954,7 +1958,7 @@ export class AgentsService {
    * a fill task again; any other run is the owner's to start again.
    */
   private async stoppedForShutdown(run: AgentRun, t: Tick): Promise<void> {
-    const outcome = this.reportedOutcome(run);
+    const outcome = await this.reportedOutcome(run);
     if (outcome) {
       const detail = `stopped for the server's shutdown (agents.on_restart: stop); classified from its queue line: ${outcome.kind.toUpperCase()}`;
       return this.endRun(run, "completed", detail, t, true, {
@@ -2160,7 +2164,7 @@ export class AgentsService {
       },
       t.now,
     );
-    const output = run.logPath ? lastLines(readTail(run.logPath, 8192), 10) : [];
+    const output = run.logPath ? lastLines(await logTail(run.logPath, 8192), 10) : [];
     await this.raise(
       {
         kind: "escalation",
@@ -2488,14 +2492,11 @@ export class AgentsService {
   }
 
   /** The run's log was written after `after`, and its newest lines are not a transient error (a CLI retrying on its own). */
-  private wroteSince(run: AgentRun, after: number): boolean {
+  private async wroteSince(run: AgentRun, after: number): Promise<boolean> {
     if (!run.logPath) return false;
-    try {
-      if (statSync(run.logPath).mtimeMs <= after) return false;
-    } catch {
-      return false;
-    }
-    return matchTransient(lastLines(readTail(run.logPath, 8192), TRANSIENT_TAIL_LINES), this.settings) === null;
+    const st = await statOrNull(run.logPath);
+    if (!st || st.mtimeMs <= after) return false;
+    return matchTransient(lastLines(await logTail(run.logPath, 8192), TRANSIENT_TAIL_LINES), this.settings) === null;
   }
 
   /**
@@ -2516,7 +2517,7 @@ export class AgentsService {
         ? exitedZero
           ? "exited 0"
           : `has run ${seconds(lived)}`
-        : !startedSince && this.wroteSince(run, outage.lastAt)
+        : !startedSince && (await this.wroteSince(run, outage.lastAt))
           ? "is still writing its log"
           : null;
     if (how === null) return;
@@ -2731,9 +2732,9 @@ export class AgentsService {
   // ============ USAGE AND BUDGETS ============
 
   /** Usage lines (agents.usage_patterns) written to the run's log since the last read. */
-  private readUsage(run: AgentRun): void {
+  private async readUsage(run: AgentRun): Promise<void> {
     if (!run.logPath || this.settings.usagePatterns.length === 0) return;
-    const bytes = readFrom(run.logPath, run.logOffset, 1024 * 1024);
+    const bytes = await readFrom(run.logPath, run.logOffset, 1024 * 1024);
     const end = bytes.lastIndexOf(0x0a);
     if (end < 0) return;
     const text = bytes.subarray(0, end + 1).toString("utf-8");
@@ -3000,7 +3001,7 @@ export class AgentsService {
         logOffset: 0,
         origin: options.origin,
         // Fill's done_pattern looks at the queue lines written after this
-        queueMark: queueMark(this.config.queue_file),
+        queueMark: await queueMark(this.config.queue_file),
       };
       const claimed = await this.claimFor(t, task, id, agent);
       if (!claimed.ok) {
