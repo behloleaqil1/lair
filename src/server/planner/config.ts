@@ -11,6 +11,7 @@ import {
   DEFAULT_BLOCKED_PATTERN,
   DEFAULT_DONE_PATTERN,
   DEFAULT_WAITING_PATTERN,
+  GUARD_MODES,
   matchesByAgent,
   parseAgentsConfig,
 } from "../agents/config.js";
@@ -18,6 +19,7 @@ import { isValidDragonId } from "../parsers/dragon-config.js";
 import { getPromptsDir } from "../routes/controls.js";
 import { knownDragonIds } from "../services/dragon-registry.js";
 import { placeholdersIn } from "../watchdog/config.js";
+import type { PlannerGuards } from "./guards.js";
 
 /** The most bytes and lines a plan or backlog file may be read with */
 export const MAX_SOURCE_BYTES = 4 * 1024 * 1024;
@@ -161,6 +163,33 @@ const VerifierSchema = z
   })
   .strict();
 
+const GuardMode = z.enum(GUARD_MODES);
+
+/**
+ * G6, the planner guards (docs/design/ai-spend.md §4.5): each part off (the default), observe (records what it would
+ * do and changes nothing) or act. Cheap and deterministic: no model call and no network.
+ */
+const GuardsSchema = z
+  .object({
+    /** Drop closed work (a done id, or a task whose own PR merged) from a run's context */
+    prefilter_closed: GuardMode.default("off"),
+    /** A proposal may name the owner message it carries out (from_message): handled once its task closes */
+    handled_messages: GuardMode.default("off"),
+    /** Skip a run whose inputs are those of the last finished run that gave nothing applicable */
+    skip_unchanged: z
+      .object({
+        mode: GuardMode.default("off"),
+        /** This long after the last run, a run starts even with the same inputs */
+        max_skip_hours: z.number().int().min(1).max(720).default(24),
+      })
+      .strict()
+      .default({}),
+    /** The tasks file changed during a run (act mode): keep the edit and check each proposal against it (D7) */
+    recheck_on_change: GuardMode.default("off"),
+  })
+  .strict()
+  .default({});
+
 const PlannerSchema = z
   .object({
     enabled: z.boolean().default(false),
@@ -210,6 +239,7 @@ const PlannerSchema = z
     context_max_bytes: z.number().int().min(4096).max(150_000).default(64_000),
     /** An extra rule for the task ids proposals may name (fill's rules always apply) */
     task_id_pattern: Pattern.optional(),
+    guards: GuardsSchema,
   })
   .strict();
 
@@ -305,6 +335,8 @@ export interface PlannerSettings {
   onePerAgent: boolean;
   /** agents.fill.enabled: fill runs the allowlisted agents' lines (and holds their BLOCKED runs for the owner) */
   fillEnabled: boolean;
+  /** G6, the planner guards (docs/design/ai-spend.md §4.5) */
+  guards: PlannerGuards;
   /** Not errors: the planner runs, but the owner should know */
   warnings: string[];
 }
@@ -554,6 +586,21 @@ export function parsePlannerConfig(raw: unknown, project: ProjectConfig): Planne
     .filter((r): r is RegExp => r !== null);
   const taskIdPattern = value.task_id_pattern ? compile(value.task_id_pattern, "", "planner.task_id_pattern", errors) : null;
 
+  // A guard's verdicts and counts are written by AI spend (the agents module's events, the spend API): named with
+  // both keys, as the agents block's guards are
+  const spendOn = (project.agents as { spend?: { enabled?: unknown } } | undefined)?.spend?.enabled === true;
+  const guardModes: [string, string][] = [
+    ["prefilter_closed", value.guards.prefilter_closed],
+    ["handled_messages", value.guards.handled_messages],
+    ["skip_unchanged.mode", value.guards.skip_unchanged.mode],
+    ["recheck_on_change", value.guards.recheck_on_change],
+  ];
+  for (const [key, mode] of guardModes) {
+    if (mode !== "off" && !spendOn) {
+      errors.push(`planner.guards.${key}: ${mode} needs agents.spend.enabled: true (a guard's verdicts and counts are written by spend)`);
+    }
+  }
+
   // Files whoever can write chooses what the agents work on: keep them out of the repo the agents work in
   if (value.enabled) {
     const repo = realish(project.repo);
@@ -611,6 +658,12 @@ export function parsePlannerConfig(raw: unknown, project: ProjectConfig): Planne
       fillPatterns,
       onePerAgent: matchesByAgent(fillPatterns),
       fillEnabled: fill?.enabled === true,
+      guards: {
+        prefilterClosed: value.guards.prefilter_closed,
+        handledMessages: value.guards.handled_messages,
+        skipUnchanged: { mode: value.guards.skip_unchanged.mode, maxSkipMs: value.guards.skip_unchanged.max_skip_hours * 3_600_000 },
+        recheckOnChange: value.guards.recheck_on_change,
+      },
       warnings,
     },
   };

@@ -320,6 +320,8 @@ export type EventType =
   | "planner.tasks_file_restored"
   | "planner.verifier_started"
   | "planner.verifier_finished"
+  // planner.guards.skip_unchanged act: no run, its inputs were the last run's {project, hash (a prefix), earlierRunId, triggers}
+  | "planner.skipped"
   // Bus (src/server/bus/)
   | "bus.report"
   | "bus.message"
