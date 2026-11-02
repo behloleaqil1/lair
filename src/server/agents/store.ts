@@ -797,6 +797,11 @@ export class AgentsStore {
       .run(error.slice(0, 500), retryAt, runId);
   }
 
+  /** Whether a run's spend row is owed (marked when it ended while spend was on, not written yet). */
+  isSpendPending(runId: string): boolean {
+    return this.db.prepare(`SELECT 1 FROM agents_spend_pending WHERE run_id = ?`).get(runId) !== undefined;
+  }
+
   dropSpendPending(runId: string): void {
     this.db.prepare(`DELETE FROM agents_spend_pending WHERE run_id = ?`).run(runId);
   }
@@ -888,14 +893,17 @@ export class AgentsStore {
     return rows.map(toSpendRow);
   }
 
-  /** Rows still `unclassified/pending` that ended since `since`, the latest first (their class waits on a record). */
-  unclassifiedSpend(project: string, since: number, limit: number): SpendRow[] {
+  /**
+   * Rows still `unclassified/pending` that ended in [since, before) (`before` null: up to now), the latest first
+   * (their class waits on a record).
+   */
+  unclassifiedSpend(project: string, since: number, before: number | null, limit: number): SpendRow[] {
     const rows = this.db
       .prepare(
-        `SELECT * FROM agents_spend WHERE project = ? AND ended_at >= ? AND class = 'unclassified' AND reason = 'pending'
+        `SELECT * FROM agents_spend WHERE project = ? AND ended_at >= ? AND ended_at < ? AND class = 'unclassified' AND reason = 'pending'
          ORDER BY ended_at DESC LIMIT ?`,
       )
-      .all(project, since, limit) as SpendRowDb[];
+      .all(project, since, before ?? Number.MAX_SAFE_INTEGER, limit) as SpendRowDb[];
     return rows.map(toSpendRow);
   }
 
@@ -914,15 +922,17 @@ export class AgentsStore {
 
   /**
    * Spend summed per group (`groupBy` a column of agents_spend), class and reason, over runs that ended in
-   * [from, to); `skipAggregatedDays`: only the runs of days with no daily aggregate (a long window adds them to the
-   * aggregates). Numbers only.
+   * [from, to). `aggregatedBefore` (a long window, which adds the daily aggregates of the days before it): a run that
+   * ended before it is left out when its day has an aggregate; the runs from it on are all counted. Numbers only.
    */
-  spendCells(project: string, from: number, to: number, groupBy: SpendGroupColumn, skipAggregatedDays = false): SpendCell[] {
+  spendCells(project: string, from: number, to: number, groupBy: SpendGroupColumn, aggregatedBefore: number | null = null): SpendCell[] {
     const column = SPEND_GROUP_COLUMNS[groupBy];
-    const skip = skipAggregatedDays
-      ? `AND NOT EXISTS (SELECT 1 FROM agents_spend_daily d WHERE d.project = s.project
-           AND d.day = strftime('%Y-%m-%d', s.ended_at / 1000, 'unixepoch'))`
-      : "";
+    const skip =
+      aggregatedBefore === null
+        ? ""
+        : `AND (s.ended_at >= ? OR NOT EXISTS (SELECT 1 FROM agents_spend_daily d WHERE d.project = s.project
+             AND d.day = strftime('%Y-%m-%d', s.ended_at / 1000, 'unixepoch')))`;
+    const params: number[] = aggregatedBefore === null ? [] : [aggregatedBefore];
     return this.db
       .prepare(
         `SELECT ${column} AS g, class, reason, COUNT(*) AS runs, SUM(reload) AS reloads, SUM(lair_restart) AS lairRestarts,
@@ -931,7 +941,7 @@ export class AgentsStore {
          FROM agents_spend s WHERE project = ? AND ended_at >= ? AND ended_at < ? ${skip}
          GROUP BY g, class, reason`,
       )
-      .all(project, from, to) as SpendCell[];
+      .all(project, from, to, ...params) as SpendCell[];
   }
 
   /** The daily aggregates summed the same way, for days in [fromDay, toDay) ("YYYY-MM-DD"); no per-task detail. */

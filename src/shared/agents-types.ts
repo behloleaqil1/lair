@@ -104,6 +104,8 @@ export interface SpendGroupView {
   productive: SpendTotalsView;
   idle: SpendTotalsView;
   noResult: SpendTotalsView;
+  /** Runs with no class yet: in the totals, in no waste share */
+  unclassified: SpendTotalsView;
   waste: SpendWasteShare;
   reloads: number;
   lairRestarts: number;
