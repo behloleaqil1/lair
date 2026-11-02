@@ -1,6 +1,6 @@
 # Project setup and configuration
 
-- **Status:** Draft (revised 2026-11-02 against main `fce21c4`, after review request-changes)
+- **Status:** Draft (revised 2026-11-02 against main `fce21c4`, after re-review)
 - **Plan lines / issues:** C4 (#122), B2 (#113), GitHub issue #263
 - **Owner questions:** none remaining.
   - ~~Task id namespace on multi-project cutover~~ — Cut: multi-project PRs 8-10 are out of scope (see section 9).
@@ -27,15 +27,16 @@ to environments — using the Settings UI, building on the wizard that already e
 |------|------------------------------|-------------|
 | **Token** | `review.token_env` / `token_cmd`, else `LAIR_GITHUB_TOKEN`; Settings refuses secret values | `review/config.ts:451`, `configuration.md:3505` |
 | **Repository list** | `repos:` (new in PR #266, pr-health.md §4.3), falls back to `tracker.repos[]` then `review.repo ?? github`; each entry has `repo`, `default`, `base`, `ci_counts`, `refs` | `configuration.md:3108-3116`, `tracker/config.ts:84-87` |
-| **Tracker binding** | `tracker.enabled`, `tracker.mode`, `tracker.repos[].{repo, default, project.{owner,number}, status_field, status_options, agent_field, labels, match, milestones}`, `tracker.create_issues_for_new_tasks`, `tracker.close_removed_tasks`, `tracker.redact_patterns` | `configuration.md:3122-3217`, `tracker/config.ts:37-145` |
+| **Tracker binding** | `tracker.enabled`, `tracker.mode`, `tracker.repos[].{repo, default, project.{owner,number}, status_field, status_options, agent_field, labels, match, milestones}`, `tracker.create_issues_for_new_tasks`, `tracker.close_removed_tasks`, `tracker.redact_patterns`; entries keyed by `repo` value | `configuration.md:3122-3217`, `tracker/config.ts:37-145` |
 | **Agents** | `agents.enabled`, `agents.fill.{enabled, agents, max_active, tasks_file, prompt_files, ...}`, `agents.locks`, `agents.env_passthrough`, `agents.fallbacks` | `configuration.md:1663-1948`, `agents/config.ts` |
 | **Roles** | `ai.roles.{build, review.{red, amber, green}, plan, supervise}` — ordered profile lists, failover along the role | `configuration.md:355-410` |
 | **Gates** | `pipelines.<name>`, `executors.{order, github.*, local.*}`; GitHub and local executors | `configuration.md:500-700`, `pipelines/config.ts` |
 | **Environments** | `delivery.environments.<name>` (local stack only), `compose:` services | `configuration.md:1243` |
-| **Wizard** | `ProjectWizard.tsx`, `POST /api/settings/projects` (creates `projects/<name>.yaml`), `POST /api/settings/repo` | `src/client/settings/ProjectWizard.tsx`, `src/server/routes/settings.ts` |
+| **Wizard** | `ProjectWizard.tsx` with id, name, repo, github, paths, modules; `POST /api/settings/projects` (creates `projects/<name>.yaml`), `POST /api/settings/repo` | `src/client/components/ProjectWizard.tsx`, `src/server/settings/routes.ts` |
 | **Store** | `data/lair.db` has `nodes`, `tasks`, `jobs`, `events`, `agent_runs`; `data/agents.db` has `agents_runs`, `agents_claims`, `agents_events` | `store/migrations.ts:17-95`, `agents/store.ts:27-86` |
 | **History** | Config edits are versioned in `data/config-history/<project>/` | Settings routes, `configuration.md:3402` |
-| **Owner routes** | OWNER_ONLY_PREFIXES pattern | `cors.ts` (needs `{POST /api/vcs/test, POST /api/settings/wizard/steps/*}` added in this spec) |
+| **Owner routes** | OWNER_ONLY_PREFIXES pattern; needs `POST /api/settings/wizard/steps/*` added in this spec | `cors.ts:25-50` |
+| **Tracker status** | `GET /api/tracker/status` returns repos with board status and token scopes | `shared/tracker-types.ts:151-171`, `tracker/routes.ts:55` |
 
 ## 3. Scope
 
@@ -67,18 +68,19 @@ to environments — using the Settings UI, building on the wizard that already e
 
 **Purpose:** Before a repository can be added, verify that the configured token has the required scopes.
 
-**What exists:** `GET /api/tracker/status` returns the token's scopes (`tracker/service.ts:234`). The tracker reads
-scopes at start and raises a decision when one is missing.
+**What exists:** `GET /api/tracker/status` returns the token's scopes in `scopes: {checked, granted[], missing[]}`
+(`tracker/service.ts:234`, `shared/tracker-types.ts:159`). The tracker reads scopes at start and raises a decision
+when one is missing. Required scopes: `repo` (or `public_repo` for public repositories), `read:project`, `project`
+for act mode.
 
 **What this spec adds (new):**
-- `GET /api/vcs/token-status` (owner-only): returns `{ok, scopes[], missing[], error?}`. Reads the token from
-  `review.token_env`/`token_cmd` else `LAIR_GITHUB_TOKEN`. Required scopes: `repo` (or `public_repo` for public
-  repositories), `read:project`, `project` for act mode.
-- Settings → Repositories shows the scopes status at the top. A red badge appears when a scope is missing.
-- The wizard's repository step checks the token first; it refuses to continue until the scopes are correct, with an
-  error message naming each missing scope.
+- Settings → Repositories shows the scopes status at the top (read from `GET /api/tracker/status`). A red badge
+  appears when a scope is missing.
+- The wizard's repository step calls `GET /api/tracker/status` first; it refuses to continue until the scopes are
+  correct, with an error message naming each missing scope and the env var name (`LAIR_GITHUB_TOKEN` or the value
+  of `review.token_env`).
 
-**Security:** `/api/vcs/token-status` is added to OWNER_ONLY_PREFIXES (`cors.ts:25-50`). No secret value is returned.
+**No new routes.** The existing tracker status endpoint already provides scope information.
 
 ### 4.2 Repositories page (extends the shared `repos:` from PR #266)
 
@@ -111,7 +113,8 @@ Fallback: `tracker.repos[]` → `review.repo ?? github`. Config keys are in `con
 
 **What exists:** `tracker.repos[].{project.{owner,number}, status_field, status_options, labels, match, milestones}`
 (`configuration.md:3197-3206`). `tracker.create_issues_for_new_tasks` (`configuration.md:3176`). The tracker is off
-unless `tracker.enabled: true`, and starts in observe mode.
+unless `tracker.enabled: true`, and starts in observe mode. `GET /api/tracker/status` returns `repos: TrackerRepoView[]`
+where each entry has `board: {owner, number, loaded, title, url, error}` (`shared/tracker-types.ts:131-140`).
 
 **What this spec adds (new):**
 - Settings → Repositories → each row has a "Board" section that edits:
@@ -119,7 +122,8 @@ unless `tracker.enabled: true`, and starts in observe mode.
   - `tracker.repos[i].project.number` (number)
   - `tracker.repos[i].labels` (chip input)
   - `tracker.repos[i].milestones.rules` (table: task globs → milestone title)
-- The form validates that the board exists: `GET /api/tracker/test-board` (existing) with `{owner, number}`.
+- The form validates that the board exists: call `GET /api/tracker/status` and check `repos[].board.loaded` for the
+  matching repository (by `repo` value). If `board.error` is set, show it.
 - `tracker.enabled` and `tracker.mode` are in Settings → Modules → Tracker.
 
 **No new config keys.** The tracker already has everything; this spec wires the Settings UI to them.
@@ -161,16 +165,23 @@ unless `tracker.enabled: true`, and starts in observe mode.
 
 ### 4.6 Environments Settings (existing key `delivery.environments`, new routes)
 
-**What exists:** `delivery.environments.<name>` with `compose:` services, Down/Up in Delivery view, `data/delivery.db`
-for held services (`configuration.md:1243`).
+**What exists:** `delivery.environments.<name>` (`delivery/config.ts:70-107`) with:
+- `type: "compose"` (only compose for now)
+- `compose_files[]` (array of paths)
+- `project_name` (compose project name)
+- `project_directory` (optional working directory)
+- `services` (record of service settings with health checks)
+- `deploy.auto` (boolean, whether a merge triggers deploy)
+- `deploy.health_timeout_minutes` (roll back if not healthy within this time, default 5)
+
+Down/Up in Delivery view, `data/delivery.db` for held services (`configuration.md:1243`).
 
 **What this spec adds (new):**
 - Settings → Environments page:
   - **Environments table:** list `delivery.environments` keys (e.g. `local`).
-  - **Add environment:** name (text), `target: compose` (only compose for now), `config.file` (path to
-    `docker-compose.yml`).
-  - **Edit:** the compose file path, `auto_deploy` (boolean, whether a merge triggers deploy).
-  - **Health check:** `health_check.{endpoint, timeout, interval}` for the environment.
+  - **Add environment:** name (text), `type: compose` (only compose for now), `compose_files[]` (array of paths).
+  - **Edit:** `compose_files[]`, `project_name`, `project_directory`, `deploy.auto` (checkbox), `deploy.health_timeout_minutes`.
+  - **Services:** table of `services.<name>` with health check type, build flag, paths.
 - Future targets (`ecs`, `kubernetes`, `ssh`) are out of scope; the UI shows "compose" as the only option.
 
 **Routes (new):**
@@ -200,48 +211,54 @@ for held services (`configuration.md:1243`).
 
 ### 4.8 Extended wizard (extends existing `ProjectWizard.tsx`)
 
-**What exists:** `ProjectWizard.tsx` with steps for project name, `POST /api/settings/projects` creates the file,
-`POST /api/settings/repo` sets the repository.
+**What exists:** `src/client/components/ProjectWizard.tsx` with fields for project id, name, repository path, GitHub
+repo (detected from remotes), paths (`queue_file`, `agents_dir`, `gates_dir`), and modules (toggles). Routes in
+`src/server/settings/routes.ts`: `POST /api/settings/projects` (creates the file), `POST /api/settings/repo` (checks
+a repository path).
 
 **What this spec adds (new):**
-- **Step 1 (new): Token check.** Calls `GET /api/vcs/token-status`. If scopes are missing, shows an error with the
-  env var name (`LAIR_GITHUB_TOKEN` or `review.token_env`) and the missing scopes. The user must fix the token
-  externally and click "Check again".
+- **Step 1 (new): Token check.** Calls `GET /api/tracker/status` to read `scopes`. If scopes are missing, shows an
+  error with the env var name (`LAIR_GITHUB_TOKEN` or `review.token_env`) and the missing scopes. The user must fix
+  the token externally and click "Check again".
 - **Step 2 (existing): Project name.** No change.
-- **Step 3 (new): Repository.** Text input for `owner/name`, validated. On submit, calls
-  `POST /api/settings/repos` to add `repos: [{repo, default: true}]`.
+- **Step 3 (extends existing): Repository.** The existing `repo` and `github` fields, plus a call to
+  `POST /api/settings/repos` to add `repos: [{repo, default: true}]` when the project is created.
 - **Step 4 (new): Board (optional).** Text inputs for `tracker.repos[0].project.{owner, number}`. On submit, updates
   the tracker block. Skip button if no board.
 - **Step 5 (new): Agents.** Checkbox list of `dragons:` entries to add to `agents.fill.agents`. Number input for
   `agents.fill.max_active`. Skip if no dragons.
-- **Step 6 (new): Modules.** Checkboxes for `tracker.enabled`, `review.enabled`, `agents.fill.enabled` (each starts
-  observe or off). Brief explanation of each.
+- **Step 6 (extends existing): Modules.** The existing toggles for `tracker.enabled`, `review.enabled`,
+  `agents.fill.enabled` (each starts observe or off), with brief explanations. No new UI.
 - **Completion:** shows the created project file path and links to Settings.
+
+**File paths:**
+- Wizard: `src/client/components/ProjectWizard.tsx`
+- Routes: `src/server/settings/routes.ts`
+- Review integrity: `src/server/review/integrity.ts`
+- Gates pipelines: `src/server/gates/project-pipelines.ts`
 
 **Routes (new):**
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `POST` | `/api/settings/wizard/steps/token` | owner | Validate token scopes, return `{ok, missing[]}` |
-| `POST` | `/api/settings/wizard/steps/repo` | owner | Add repository to `repos:` |
 | `POST` | `/api/settings/wizard/steps/board` | owner | Set tracker board for the repository |
 | `POST` | `/api/settings/wizard/steps/agents` | owner | Set `agents.fill.agents` and `max_active` |
-| `POST` | `/api/settings/wizard/steps/modules` | owner | Set `tracker.enabled`, `review.enabled`, `agents.fill.enabled` |
 
-All wizard routes are added to OWNER_ONLY_PREFIXES.
+All wizard routes are added to OWNER_ONLY_PREFIXES. (Note: token check uses existing `GET /api/tracker/status`; repo
+uses existing `POST /api/settings/repos`.)
 
 ## 5. Security and privacy
 
-- **Owner-only routes:** All routes in §4.1-4.8 are in OWNER_ONLY_PREFIXES (`cors.ts:25-50`). A signed-out viewer or
+- **Owner-only routes:** All routes in §4.2-4.8 are in OWNER_ONLY_PREFIXES (`cors.ts:25-50`). A signed-out viewer or
   a non-owner gets 403.
 - **Audit:** Every Settings edit is recorded in `data/config-history/<project>/`, as today. The wizard's steps use the
   same path.
 - **Redaction:** The tracker's `redact_patterns` apply to any text written to issues or boards. No new redaction
   config.
-- **No secrets in responses:** `/api/vcs/token-status` returns scope names, not the token value. Settings refuses to
-  store or return secret values (`configuration.md:3505`).
-- **Test route bounds:** The wizard's token-check step is the only `/api/vcs/*` route; it is bounded (one call per
-  wizard flow, no polling). The existing `/api/tracker/test-board` is already bounded.
+- **No secrets in responses:** Token scope information comes from `GET /api/tracker/status`, which returns scope names,
+  not the token value. Settings refuses to store or return secret values (`configuration.md:3505`).
+- **Route bounds:** The wizard's token-check uses the existing `GET /api/tracker/status` (bounded by tracker tick
+  interval). Board validation uses the same endpoint's `repos[].board` data.
 
 ## 6. Acceptance tests
 
@@ -253,10 +270,11 @@ board, select one agent, enable tracker in observe mode.
 **Expected:** A file `projects/test-repo.yaml` exists with `repos: [{repo: "test-owner/test-repo", default: true}]`,
 `tracker.enabled: true`, `tracker.mode: observe`, `agents.fill.agents: [<selected>]`.
 
-### AT-2 `addSecondRepository`
-**Setup:** A project with `repos: [{repo: "test-owner/app", default: true}]`.
-**Action:** Settings → Repositories → Add → enter `test-owner/lib`, uncheck default, set refs: `[lib]`.
-**Expected:** `repos:` now has two entries. `parsePrRefs("lib#42", repos, {mode:"report"})` returns
+### AT-2 `addSecondRepositoryWithDifferentBase`
+**Setup:** A project with `repos: [{repo: "test-owner/app", default: true, base: "main"}]`.
+**Action:** Settings → Repositories → Add → enter `test-owner/lib`, uncheck default, set base: `develop`, set refs: `[lib]`.
+**Expected:** `repos:` now has two entries: the first with `base: "main"`, the second with `repo: "test-owner/lib"`,
+`base: "develop"`, `refs: ["lib"]`. `parsePrRefs("lib#42", repos, {mode:"report"})` returns
 `{repo: "test-owner/lib", number: 42}`.
 
 ### AT-3 `duplicateRepositoryRefused`
@@ -264,19 +282,21 @@ board, select one agent, enable tracker in observe mode.
 **Action:** Settings → Repositories → Add → enter `test-owner/app`.
 **Expected:** HTTP 409 with error `"repository already listed"`. The `repos:` list is unchanged.
 
-### AT-4 `agentCapEnforced`
-**Setup:** A project with `agents.fill.agents: [agent-a, agent-b, agent-c]`, `agents.fill.max_active: 2`. Three tasks
-are ready.
-**Action:** Fill runs a tick.
-**Expected:** At most 2 agents have running runs. The third task's line shows `held: capacity`.
+### AT-4 `agentCapEnforcedViaSettings`
+**Setup:** A project with `agents.fill.agents: [agent-a, agent-b]`, `agents.fill.max_active: 3`. Three tasks are ready.
+**Action:** Settings → Agents → change `max_active` to 2, save. Fill runs a tick.
+**Expected:** The config file now has `agents.fill.max_active: 2`. At most 2 agents have running runs. The third
+task's line shows `held: capacity`.
 
-### AT-5 `trackerIssueCreated`
-**Setup:** A project with `tracker.enabled: true`, `tracker.mode: act`,
-`tracker.repos: [{repo: "test-owner/app", labels: ["lair"]}]`, `tracker.create_issues_for_new_tasks: true`.
-A task line `agent-a|Agent A|task-1|Build feature X` exists.
-**Action:** Tracker reconciles.
-**Expected:** The mocked GitHub API received `POST /repos/test-owner/app/issues` with `labels: ["lair"]`. The task has
-`issueNumber` in the tracker store.
+### AT-5 `trackerIssueCreatedViaSettings`
+**Setup:** A project with `tracker.enabled: false`. A task line `agent-a|Agent A|task-1|Build feature X` exists.
+**Action:** Settings → Repositories → select `test-owner/app` → Board section → set `project.owner: "test-owner"`,
+`project.number: 1`, `labels: ["lair"]`. Then Settings → Modules → enable tracker in `act` mode, enable
+`create_issues_for_new_tasks`. Tracker reconciles.
+**Expected:** The config file has `tracker.enabled: true`, `tracker.mode: act`,
+`tracker.repos: [{repo: "test-owner/app", project: {owner: "test-owner", number: 1}, labels: ["lair"]}]`,
+`tracker.create_issues_for_new_tasks: true`. The mocked GitHub API received `POST /repos/test-owner/app/issues` with
+`labels: ["lair"]`. The task has `issueNumber` in the tracker store.
 
 ### AT-6 `specFirstBlocks`
 **Setup:** A project with `specs.required_for: ["feature-*"]`, `specs.path: "docs/design/"`. A task line with id
@@ -291,8 +311,7 @@ body or filename).
 **Expected:** The ready guard does not include `spec_not_approved`. (Other items like CI may still apply.)
 
 ### AT-8 `tokenScopesMissing`
-**Setup:** `LAIR_GITHUB_TOKEN` is set but the mocked token endpoint returns scopes `["public_repo"]` (missing
-`project`).
+**Setup:** `LAIR_GITHUB_TOKEN` is set but `GET /api/tracker/status` returns `scopes: {checked: true, granted: ["public_repo"], missing: ["project"]}`.
 **Action:** Open the wizard, reach the token-check step.
 **Expected:** The step shows an error: "Missing scopes: project". The Continue button is disabled.
 
@@ -304,15 +323,15 @@ body or filename).
 
 ### AT-10 `environmentAddedAndDeployed`
 **Setup:** A project with no `delivery.environments`.
-**Action:** Settings → Environments → Add → name `local`, target `compose`, file `docker-compose.yml`.
+**Action:** Settings → Environments → Add → name `local`, type `compose`, compose_files: `["docker-compose.yml"]`.
 Then Delivery → `local` → Up.
-**Expected:** `delivery.environments.local` exists in config. The environment starts (mocked compose).
+**Expected:** `delivery.environments.local` exists in config with `type: "compose"`, `compose_files: ["docker-compose.yml"]`. The environment starts (mocked compose).
 
 ## 7. Rollout
 
-1. **PR 1 (after #266 merges): Repositories page.** Settings form over `repos:`, the `github:` migration, the token
-   check route. ATs: AT-1, AT-2, AT-3, AT-8, AT-9.
-2. **PR 2: Wizard steps.** Extend `ProjectWizard.tsx` with the new steps. ATs: AT-1, AT-8.
+1. **PR 1 (after #266 merges): Repositories page.** Settings form over `repos:`, the `github:` migration. Token
+   check reads `GET /api/tracker/status` scopes. ATs: AT-1, AT-2, AT-3, AT-8, AT-9.
+2. **PR 2: Wizard steps.** Extend `ProjectWizard.tsx` with the new steps (token check, board, agents). ATs: AT-1, AT-8.
 3. **PR 3: Agents Settings.** Form over `agents.fill.*` and `ai.roles`. AT: AT-4.
 4. **PR 4: Tracker Settings.** Form over `tracker.repos[].project.*`. AT: AT-5.
 5. **PR 5: Gates Settings.** Form over `pipelines` and `executors`. No new AT (existing gates tests cover).
@@ -320,8 +339,8 @@ Then Delivery → `local` → Up.
 7. **PR 7: Spec-first rule.** Config keys `specs.required_for` and `specs.path`, ready guard extension. ATs: AT-6,
    AT-7.
 
-Total: ~2,400 lines across 7 PRs (reduced from original 11 by cutting multi-project PRs 8-10 and merging VCS provider
-into PR 1).
+Total: ~2,200 lines across 7 PRs (reduced from original by cutting multi-project PRs 8-10, merging VCS into PR 1,
+and reusing existing routes for token check and board validation).
 
 ## 8. Open risks
 
@@ -345,6 +364,14 @@ into PR 1).
 | Should: existing wizard | §4.8: extends `ProjectWizard.tsx` | (this revision) |
 | Should: owner question 3 | §header: answered on main (`tracker.enabled: false`) | (this revision) |
 | Low: acceptance_link | §4.7: test-integrity check cites spec-first tasks | (this revision) |
+| N1: test-board route | §4.3: validate board from `GET /api/tracker/status` repos | (this revision) |
+| N2: delivery keys | §4.6: use main's `compose_files[]`, `deploy.auto`, `deploy.health_timeout_minutes` | (this revision) |
+| D5: token check route | §4.1: use existing `GET /api/tracker/status` scopes, no new route | (this revision) |
+| AT-2: second repo base | §6 AT-2: added `base: "develop"` to second repo | (this revision) |
+| AT-4/AT-5: Settings forms | §6 AT-4/AT-5: rewritten to exercise Settings UI changes | (this revision) |
+| SHOULD: wizard paths | §4.8: wizard already has repo/github/paths/modules, Steps 3/6 extend them | (this revision) |
+| SHOULD: tracker.repos mapping | §2: noted `tracker.repos[]` entries keyed by `repo` value | (this revision) |
+| SHOULD: file paths | §4.8: added File paths section with ProjectWizard, routes, integrity, pipelines | (this revision) |
 
 ## References
 
