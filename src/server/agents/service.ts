@@ -370,6 +370,7 @@ export const MODULE_RUN_VARIABLES: readonly string[] = [
   "LAIR_OPS_TOKEN",
   "LAIR_SUPERVISOR_CONVERSATION",
   "LAIR_BUS_TOKEN",
+  "LAIR_ANSWER_FILE",
 ];
 const MAX_RUN_VARIABLE_CHARS = 1000;
 
@@ -3675,10 +3676,10 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
     this.decisions = options.decisions ?? null;
   }
 
-  private readyFacts: ((project: string) => ReadyFactsSource | undefined) | null = null;
+  private readyFacts: ((project: string, config: ProjectConfig) => ReadyFactsSource | undefined) | null = null;
 
-  /** Where the ready guard reads a project's PRs from (the review module's host); set before load(). */
-  useReadyFacts(facts: (project: string) => ReadyFactsSource | undefined): void {
+  /** Where the ready guard reads a project's PRs from (with the project's config: its repos:); set before load(). */
+  useReadyFacts(facts: (project: string, config: ProjectConfig) => ReadyFactsSource | undefined): void {
     this.readyFacts = facts;
   }
 
@@ -3748,11 +3749,12 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
       }
       if (!parsed.settings.enabled) continue;
       this.store ??= new AgentsStore(this.options.dbPath);
+      const config = entry.config;
       this.services.set(
         entry.name,
         new AgentsService({
           project: entry.name,
-          config: entry.config,
+          config,
           settings: parsed.settings,
           store: this.store,
           probes: this.getProbes(),
@@ -3760,7 +3762,7 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
           budget: this.options.budget,
           events: this.options.events,
           tools: this.options.tools,
-          readyFacts: () => this.readyFacts?.(entry.name),
+          readyFacts: () => this.readyFacts?.(entry.name, config),
           ...this.busOptions(entry.name),
         }),
       );

@@ -16,11 +16,18 @@
  *   `lair supervisor answer`. It is taken once per question, only while the
  *   run is active (the token checks that), and only from the run that was
  *   asked. The answer and its evidence are cleaned (answers.ts).
+ * - With supervisor.chat.answer_file (off by default), the run may instead
+ *   write answer.json at the exact path in LAIR_ANSWER_FILE, in a private
+ *   folder Lair made for the run (answer-file.ts). check() reads it once the
+ *   run has ended, or at the deadline; never while the run still writes. The
+ *   first answer counts: a later one from the CLI or the file is refused or
+ *   ignored (logged).
  * - check(): a question whose run ended without an answer (exited, failed
  *   over, recovered into a new run, stopped) or that reached
  *   answer_timeout_minutes is closed as "no answer" with the reason, its
  *   token ends, and a run still going on its task is stopped (its claim
- *   released). Nothing is retried: the owner asks again.
+ *   released). Before closing, check() takes a valid answer.json if there is
+ *   one. Nothing is retried: the owner asks again.
  * - digestTick(): with supervisor.digest.enabled, once a day at
  *   supervisor.digest.time (local), a digest run; its answer is kept as the
  *   day's digest, and with notifications on, one notice says it is ready.
@@ -31,7 +38,8 @@
  *
  * Restarts: tokens live in memory only, so a question still pending when
  * Lair starts can't be answered any more. recover() closes it as "no
- * answer" and stops its run.
+ * answer" and stops its run, and removes every run folder left under the
+ * projects' agents_dir (the folder map was in memory only).
  */
 import { existsSync, readFileSync } from "fs";
 import { randomUUID } from "crypto";
@@ -54,6 +62,7 @@ import { getPromptsDir } from "../routes/controls.js";
 import { supervisorAgent, type ChatSettings, type SupervisorSettings } from "./config.js";
 import { buildSupervisorPrompt } from "./chat-prompt.js";
 import { sanitizeAnswer, sanitizeEvidence } from "./answers.js";
+import { answerFilePath, cleanupRunFolder, createRunFolder, sweepRunFolders, takeAnswerFile } from "./answer-file.js";
 import { NOTICE_MODULE } from "./notices.js";
 import { redactText } from "./redact.js";
 import type { Supervisor } from "./service.js";
@@ -171,7 +180,7 @@ export interface SupervisorChatOptions {
   cli?: string;
   /** Lair's own prompt template (default: prompts/supervisor.md) */
   defaultPromptPath?: string;
-  log?: Pick<Console, "warn">;
+  log?: Pick<Console, "info" | "warn">;
 }
 
 export class SupervisorChat {
@@ -186,8 +195,10 @@ export class SupervisorChat {
   private stoppedAfterAnswer = new Set<string>();
   /** project -> the supervisor agent as the status last read it */
   private agentCache = new Map<string, { generation: number; at: number; value: { agent: string } | { problem: string } }>();
+  /** turnId -> per-run folder path for answer files */
+  private runFolders = new Map<string, string>();
   private readonly cli: string;
-  private readonly log: Pick<Console, "warn">;
+  private readonly log: Pick<Console, "info" | "warn">;
 
   constructor(private readonly o: SupervisorChatOptions) {
     this.cli = o.cli ?? defaultCli();
@@ -311,12 +322,22 @@ export class SupervisorChat {
 
     const conversationId = p.conversation?.id ?? randomUUID();
     const seq = p.turns.length + 1;
+    const turnId = randomUUID();
     const task =
       p.kind === "digest" && p.digestDate
         ? `supervisor-digest-${p.digestDate.replace(/-/g, "")}`
         : `supervisor-ask-${conversationId.slice(0, 8)}-${seq}`;
     const timeoutMs = p.settings.chat.answer_timeout_minutes * 60_000;
     const repoUrl = repoWebUrl(config);
+
+    // With supervisor.chat.answer_file, a private folder for the run's answer.json; without one, the run answers with the CLI
+    let runFolder: string | null = null;
+    if (p.settings.chat.answer_file) {
+      runFolder = await createRunFolder(config.agents_dir, turnId);
+      if (!runFolder) this.log.warn(`[supervisor] no answer folder could be made under ${p.project}'s agents_dir: the run answers with the CLI`);
+    }
+    const answerFilePathValue = runFolder ? answerFilePath(runFolder) : null;
+
     const prompt = buildSupervisorPrompt({
       template,
       project: p.project,
@@ -330,6 +351,7 @@ export class SupervisorChat {
       cli: this.cli,
       timeoutMinutes: p.settings.chat.answer_timeout_minutes,
       repoUrl,
+      answerFilePath: answerFilePathValue,
       now,
     });
 
@@ -345,18 +367,21 @@ export class SupervisorChat {
           LAIR_OPS_TOKEN: minted.token,
           LAIR_SUPERVISOR_CONVERSATION: conversationId,
           ...(this.o.serverUrl ? { LAIR_URL: this.o.serverUrl } : {}),
+          ...(answerFilePathValue ? { LAIR_ANSWER_FILE: answerFilePathValue } : {}),
         },
         // The supervisor's prompt is the whole task: not the builders' default_instructions before it
         ownPrompt: true,
       });
     } catch (e) {
       this.o.tokens.revoke(minted.info.id);
+      if (runFolder) await cleanupRunFolder(runFolder);
       const status = typeof (e as { statusCode?: unknown }).statusCode === "number" ? (e as { statusCode: number }).statusCode : 500;
       // Only the agent becoming busy meanwhile passes by itself; a claimed task, a held agent, the budget don't
       const nowBusy = status === 409 && (agents.getStore()?.activeRunForAgent(p.project, found.agent) ?? null) !== null;
       throw new ChatError(status, `The supervisor run could not start: ${message(e)}`, nowBusy);
     }
     this.o.tokens.bindRun(minted.info.id, run.id);
+    if (runFolder) this.runFolders.set(turnId, runFolder);
 
     const conversation: StoredConversation = p.conversation ?? {
       id: conversationId,
@@ -367,7 +392,7 @@ export class SupervisorChat {
       updatedAt: now,
     };
     const turn: StoredTurn = {
-      id: randomUUID(),
+      id: turnId,
       conversationId,
       seq,
       question: p.question,
@@ -387,6 +412,7 @@ export class SupervisorChat {
     } catch (e) {
       // Not kept, so never answered: the run goes too
       this.o.tokens.endRun(run.id);
+      await this.cleanupTurn(turnId);
       await agents.releaseClaim(p.project, task, "the supervisor: its question could not be stored").catch(() => undefined);
       throw e;
     }
@@ -481,6 +507,38 @@ export class SupervisorChat {
     });
   }
 
+  /**
+   * A pending turn's answer.json (supervisor.chat.answer_file), taken once its run has ended, or at the deadline
+   * while it still runs: never earlier, so a file the run is still writing is not read. Called inside exclusive().
+   * taken: the turn is answered; else error says why a file there was refused (none: there was no file).
+   */
+  private async tryAnswerFromFile(turn: StoredTurn & { project: string }): Promise<{ taken: boolean; error?: string }> {
+    const runFolder = this.runFolders.get(turn.id);
+    if (!runFolder) return { taken: false };
+    const result = await takeAnswerFile(runFolder);
+    if (!result.ok) return result.missing ? { taken: false } : { taken: false, error: result.error };
+
+    const conversation = this.o.store.getConversation(turn.conversationId);
+    if (!conversation) return { taken: false, error: "its conversation is gone" };
+    const clean = sanitizeAnswer(result.content.answer, this.policy(conversation.project));
+    if (clean.length === 0) return { taken: false, error: "answer: nothing is left of it once cleaned (no HTML is kept)" };
+    if (!this.o.store.answerTurn(turn.id, clean, result.content.evidence, this.o.clock())) {
+      this.log.info(`[supervisor] answer.json of turn ${turn.id.slice(0, 8)} ignored: the question was already answered or closed`);
+      return { taken: false };
+    }
+    this.log.info(`[supervisor] answer.json taken for turn ${turn.id.slice(0, 8)}`);
+    if (conversation.kind === "digest") await this.noticeDigest(conversation);
+    return { taken: true };
+  }
+
+  /** The turn's run folder, if it has one: forgotten and removed. */
+  private async cleanupTurn(turnId: string): Promise<void> {
+    const runFolder = this.runFolders.get(turnId);
+    if (!runFolder) return;
+    this.runFolders.delete(turnId);
+    await cleanupRunFolder(runFolder);
+  }
+
   /** One notice, with notifications on: "Today's digest is ready". Yesterday's, if still open, is withdrawn. */
   private async noticeDigest(conversation: StoredConversation): Promise<void> {
     const inbox = this.o.inbox;
@@ -541,16 +599,30 @@ export class SupervisorChat {
     const now = this.o.clock();
     const store = this.o.agents?.getStore() ?? null;
     for (const turn of this.o.store.pendingTurns()) {
+      // At the deadline, an answer.json is the last chance, even while the run still goes (it is stopped)
       if (now >= turn.deadlineAt) {
+        const fromFile = await this.tryAnswerFromFile(turn);
+        if (fromFile.taken) {
+          if (turn.runId) this.o.tokens.endRun(turn.runId);
+          await this.stopRun(turn, "answered with answer.json at its deadline");
+          await this.cleanupTurn(turn.id);
+          continue;
+        }
         const minutes = Math.round((turn.deadlineAt - turn.askedAt) / 60_000);
-        await this.close(turn, `no answer within ${minutes} minutes (supervisor.chat.answer_timeout_minutes): Lair stopped its run`);
+        const reason = fromFile.error
+          ? `no answer within ${minutes} minutes, and answer.json was invalid: ${fromFile.error}`
+          : `no answer within ${minutes} minutes (supervisor.chat.answer_timeout_minutes): Lair stopped its run`;
+        await this.close(turn, reason);
+        await this.cleanupTurn(turn.id);
         continue;
       }
       if (turn.runId === null) {
         await this.close(turn, "its run never started");
+        await this.cleanupTurn(turn.id);
         continue;
       }
       const run = store?.getRun(turn.runId) ?? null;
+      // Still running: an answer.json it may still be writing is not read before it ends or the deadline
       if (run && isActive(run.state)) continue;
 
       // Check if the run is being retried by the agents module (a new run in the same chain is active)
@@ -564,15 +636,26 @@ export class SupervisorChat {
         }
       }
 
+      // The run ended: an answer.json it left is taken before the question is closed as "no answer"
+      const fromFile = await this.tryAnswerFromFile(turn);
+      if (fromFile.taken) {
+        this.o.tokens.endRun(turn.runId);
+        await this.cleanupTurn(turn.id);
+        continue;
+      }
+
       const how = run ? `its run ended ${run.state} (${oneLine(run.detail)})` : "its run is gone";
+      const reason = fromFile.error ? `no answer: ${how}, and answer.json was invalid: ${fromFile.error}` : `no answer: ${how}`;
       // A failover or a recovery goes on in a new run, without a token that works: it is stopped
-      await this.close(turn, `no answer: ${how}`);
+      await this.close(turn, reason);
+      await this.cleanupTurn(turn.id);
     }
-    // An answered question whose run still goes past its deadline: the run is stopped
+    // An answered question whose run still goes past its deadline: the run is stopped (and its run folder removed)
     for (const turn of this.o.store.answeredPastDeadline(now, now - DAY)) {
       if (this.stoppedAfterAnswer.has(turn.id)) continue;
       this.stoppedAfterAnswer.add(turn.id);
       await this.stopRun(turn, "answered, and still running past its deadline");
+      await this.cleanupTurn(turn.id);
     }
   }
 
@@ -596,11 +679,27 @@ export class SupervisorChat {
     }
   }
 
-  /** After a restart: a pending question's token is gone with the old process, so it is closed and its run stopped. */
+  /**
+   * After a restart: a pending question's token is gone with the old process, so it is closed and its run stopped.
+   * Then no run folder can be answered through any more (the map of them was in memory): every one left under the
+   * projects' agents_dir is removed, the folders of questions answered before the restart too.
+   */
   recover(): Promise<void> {
     return this.exclusive(async () => {
       for (const turn of this.o.store.pendingTurns()) {
         await this.close(turn, "no answer: Lair restarted before it came, and the run's token ended with the restart");
+      }
+      const dirs = new Set<string>();
+      for (const project of this.o.supervisor.projects()) {
+        try {
+          dirs.add(this.o.config(project).agents_dir);
+        } catch {
+          // A project whose config can't be read: its folders wait for the next start
+        }
+      }
+      for (const dir of dirs) {
+        const removed = await sweepRunFolders(dir);
+        if (removed > 0) this.log.info(`[supervisor] removed ${removed} run folder(s) left from before the restart`);
       }
     });
   }

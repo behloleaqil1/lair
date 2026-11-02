@@ -159,6 +159,9 @@ Everything in this repository is public. In code, docs, examples, fixtures and c
 
 - No real home-directory paths, IP addresses (use `localhost` or the RFC 5737 ranges above), hostnames, SSH key paths, email addresses, account names, private repository names, or customer or business data
 - No keys, tokens or passwords, not even expired ones. CI runs [gitleaks](https://github.com/gitleaks/gitleaks) on every push and pull request
+- CI also runs the genericity guard (`npm run check:generic`, [scripts/check-generic.ts](scripts/check-generic.ts)) on every tracked file and on the commit messages of the push or pull request. It flags home-directory paths (use `/home/user/...`), email addresses other than placeholders (`example.com`, the `.example` or `.test` domains) and GitHub noreply addresses, and names on a private denylist (projects, people, machines, companies)
+- The denylist is never committed. CI reads it from the `GENERIC_DENYLIST` repository secret, one name per line (maintainers change it with `gh secret set GENERIC_DENYLIST`); locally the guard reads `GENERIC_DENYLIST`, else the gitignored `.generic-denylist` file, and without either it says that names went unchecked. In CI a missing denylist fails the job. Pull requests from forks get no secrets, so there the job fails and a maintainer runs the guard before merging
+- A line that must keep such text (a test whose input is a URL with credentials, say) takes a `generic-ignore: <reason>` comment, counted in the guard's summary. `.generic-baseline` lists known violations still to fix; CI fails when it grows, and when an entry matches nothing any more
 - Keep your own project configs in `projects/local/`, which is gitignored. The repository ships only `projects/example.yaml`, with made-up paths
 - Keep the code project-agnostic: details specific to one product or agent vendor (CLI commands, file formats) belong in the project config, not in the code
 

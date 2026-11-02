@@ -101,7 +101,7 @@ describe("checkPathSafety", () => {
   });
 
   it("rejects home directory", async () => {
-    const home = process.env.HOME || "/Users/test";
+    const home = process.env.HOME || "/home/user";
     fsys.files.set(home, { isDir: true, isSymlink: false, mtimeMs: 0 });
     const result = await checkPathSafety(fsys, home, [home]);
     expect(result.safe).toBe(false);
