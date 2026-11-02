@@ -581,6 +581,8 @@ export interface SpendNotice {
 
 /** Runs a first enable's backfill classifies per tick */
 const BACKFILL_PER_TICK = 200;
+/** Unclassified rows from before the classify lookback looked at, once per start */
+const CLASSIFY_OLDER_ONCE = 200;
 /** Days retention aggregates and deletes per tick (each day in one transaction) */
 const PRUNE_DAYS_PER_TICK = 31;
 /** Tasks over the attempts threshold looked at per tick */
@@ -610,6 +612,8 @@ export class SpendRecorder {
   private backfillAfter: { requestedAt: number; id: string } | null = null;
   /** The UTC day retention last finished (it runs at most once a day) */
   private prunedDay: string | null = null;
+  /** Whether this start looked at the rows still unclassified from before the classify lookback */
+  private olderClassified = false;
 
   constructor(private readonly o: SpendRecorderOptions) {
     this.classifier = new SpendClassifier({
@@ -924,7 +928,14 @@ export class SpendRecorder {
   /** Rows written unclassified (their module hadn't recorded its result): classified once it has, or once it's late. */
   private classifyPending(): void {
     const now = this.o.now();
-    for (const row of this.o.store.unclassifiedSpend(this.o.project, now - CLASSIFY_LOOKBACK_MS, CLASSIFY_PER_TICK)) {
+    const since = now - CLASSIFY_LOOKBACK_MS;
+    const rows = this.o.store.unclassifiedSpend(this.o.project, since, null, CLASSIFY_PER_TICK);
+    // Once per start, the older ones too (Lair was down longer than the lookback, or their module is wired now)
+    if (!this.olderClassified) {
+      this.olderClassified = true;
+      rows.push(...this.o.store.unclassifiedSpend(this.o.project, 0, since, CLASSIFY_OLDER_ONCE));
+    }
+    for (const row of rows) {
       const run = this.o.store.getRun(row.runId);
       if (!run) continue;
       const classified = this.classifier.later(row, run, now - row.endedAt >= CLASSIFY_WAIT_MS);
@@ -939,7 +950,7 @@ export class SpendRecorder {
    */
   private async backfill(): Promise<void> {
     const { store, project } = this.o;
-    if (store.hasEvent(project, BACKFILL_DONE)) return;
+    if (this.backfilled()) return;
     const now = this.o.now();
     let start = store.getEventByKey(project, BACKFILL_START);
     if (!start) {
@@ -960,6 +971,8 @@ export class SpendRecorder {
     for (const run of runs) {
       this.backfillAfter = { requestedAt: run.requestedAt, id: run.id };
       if (isActive(run.state) || run.endedAt === undefined || run.endedAt < from || run.endedAt >= to || store.getSpend(run.id)) continue;
+      // A run that ended while spend was on is drain's (its mark): its row comes with the usage its log reports
+      if (store.isSpendPending(run.id)) continue;
       const outcome = this.recordedOutcome(run);
       const row = await this.rowOf(run, { source: "none" }, outcome, true);
       // A completed builder run whose line fill never recorded (not a fill task): its line is unknown here, and the
@@ -998,6 +1011,11 @@ export class SpendRecorder {
     return { kind: kindOf(seen)!, line, wake: typeof seen.data.wake === "string" ? seen.data.wake : null };
   }
 
+  /** Whether the first enable's backfill is done (its event) */
+  private backfilled(): boolean {
+    return this.o.store.hasEvent(this.o.project, BACKFILL_DONE);
+  }
+
   /** The day's summary key (and the event bus's dedupe) */
   private dailyKey(day: string): string {
     return `spend_daily:${this.o.project}:${day}`;
@@ -1006,9 +1024,11 @@ export class SpendRecorder {
   /**
    * At daily_summary_utc, for the UTC day that just ended: its aggregates (written again from its rows), one
    * spend_daily event with the same totals the API gives for that day, and agents.spend.daily on the event bus.
-   * Once per day, also across restarts (the event's dedupe key).
+   * Once per day, also across restarts (the event's dedupe key). Not before a first enable's backfill is done: the
+   * day's runs are the last it reaches, and a summary from part of them would never be sent again.
    */
   private async dailySummary(): Promise<void> {
+    if (!this.backfilled()) return;
     const now = this.o.now();
     const start = dayStart(now - this.o.settings.dailySummaryMinute * 60_000) - DAY_MS;
     const day = utcDay(start);
@@ -1053,8 +1073,10 @@ export class SpendRecorder {
    * Retention (D4), at most once a UTC day: each whole day whose per-run rows are past retention_days is
    * aggregated again from its rows and its rows deleted, in one transaction per day (a late row is counted, and no
    * day is left half deleted); then the aggregates past aggregate_days go. Bounded per tick: the rest goes on next.
+   * Not before a first enable's backfill is done.
    */
   private prune(): void {
+    if (!this.backfilled()) return;
     const now = this.o.now();
     const today = utcDay(now);
     if (this.prunedDay === today) return;

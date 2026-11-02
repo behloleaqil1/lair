@@ -195,12 +195,14 @@ export function spendReportBetween(input: ReportInput & { from: number; to: numb
   if (long && by === "task") {
     throw new SpendReportError(`a window past ${input.retentionDays} days comes from the daily aggregates, which have no per-task detail: use by=project, agent, reason, origin or provider`);
   }
-  // A long window: the daily aggregates, and the runs of the days not aggregated yet (today's, say)
+  // A long window: the daily aggregates of the days before retention's cutoff, and every run from the cutoff on (a
+  // row that came after its day's summary counts at once), plus a run before it whose day has no aggregate yet
+  const cutoff = Math.min(Math.max(dayStart(input.now - input.retentionDays * DAY_MS), dayStart(from)), to);
   const cellsBy = (group: SpendGroupBy): SpendCell[] =>
     long
       ? [
-          ...store.spendDailyCells(project, utcDay(from), utcDay(dayStart(to - 1) + DAY_MS), group as Exclude<SpendGroupBy, "task">),
-          ...store.spendCells(project, from, to, group, true),
+          ...store.spendDailyCells(project, utcDay(from), utcDay(cutoff), group as Exclude<SpendGroupBy, "task">),
+          ...store.spendCells(project, from, to, group, cutoff),
         ]
       : store.spendCells(project, from, to, group);
   const cells = cellsBy(by);
@@ -230,6 +232,7 @@ export function spendReportBetween(input: ReportInput & { from: number; to: numb
       productive: totalsOf(accs.productive),
       idle: totalsOf(accs.idle),
       noResult: totalsOf(accs.noResult),
+      unclassified: totalsOf(accs.unclassified),
       waste: wasteOf(accs),
       reloads: accs.reloads,
       lairRestarts: accs.lairRestarts,
