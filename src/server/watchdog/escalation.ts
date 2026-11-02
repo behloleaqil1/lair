@@ -286,7 +286,7 @@ export class Escalator {
     let writeError: string | undefined;
     if (file) {
       try {
-        probes.fs.append(file, text);
+        await probes.fs.append(file, text);
       } catch (e) {
         writeError = e instanceof Error ? e.message : String(e);
       }

@@ -3008,27 +3008,27 @@ describe("10. the Dragons view: a dragon this module runs is running, managed by
     // As src/server/index.ts gives the data service the agents module's runs
     const data = new DataService(h.config, { managedRuns: () => h.manager.managedRuns("demo") });
     writeFileSync(join(h.agentsDir, "dragons.txt"), "worker-b\tB\tunassigned\n");
-    const dragon = (id: string) => data.getDragons().find((d) => d.id === id);
+    const dragon = async (id: string) => (await data.getDragons()).find((d) => d.id === id);
 
-    expect(dragon("worker-a")).toBeUndefined(); // in dragons: only, and not running: not listed
+    expect(await dragon("worker-a")).toBeUndefined(); // in dragons: only, and not running: not listed
     const run = await request(h);
     // Requested: shown (though dragons.txt doesn't list it), running, starting
-    expect(dragon("worker-a")).toMatchObject({
+    expect(await dragon("worker-a")).toMatchObject({
       running: true,
       managedRun: { runId: run.id, task: "feat-login", state: "starting" },
     });
 
     await h.service.tick();
     expect(h.store.getRun(run.id)).toMatchObject({ state: "running", pid: 5001 });
-    expect(dragon("worker-a")).toMatchObject({ running: true, managedRun: { runId: run.id, state: "working" } });
-    expect(dragon("worker-b")).toMatchObject({ running: false });
-    expect(dragon("worker-b")?.managedRun).toBeUndefined();
+    expect(await dragon("worker-a")).toMatchObject({ running: true, managedRun: { runId: run.id, state: "working" } });
+    expect(await dragon("worker-b")).toMatchObject({ running: false });
+    expect((await dragon("worker-b"))?.managedRun).toBeUndefined();
 
     h.spawner.exit(5001, 0);
     await h.service.tick();
     expect(h.store.getRun(run.id)?.state).toBe("completed");
     expect(h.manager.managedRuns("demo").size).toBe(0);
-    expect(dragon("worker-a")).toBeUndefined();
+    expect(await dragon("worker-a")).toBeUndefined();
     // A project without the module has no managed runs
     expect(h.manager.managedRuns("off").size).toBe(0);
   });

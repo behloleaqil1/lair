@@ -660,3 +660,132 @@ describe("wiring guard", () => {
     });
   });
 });
+
+// ============================================================================
+// SYNC I/O GUARD: no synchronous fs or child process on tick and request paths
+// ============================================================================
+
+/**
+ * The modules converted to asynchronous, bounded reads (issue #245): they
+ * run on request handlers and timer ticks, where one synchronous readdir,
+ * read or child process stalls the whole server on a busy disk. No *Sync(
+ * call (fs, child_process, or a Dir/handle method) may come back in them.
+ * Add a module here once it is converted; an entry for a missing file fails.
+ */
+export const ASYNC_ONLY_MODULES: readonly string[] = [
+  "services/async-fs.ts",
+  "services/data.ts",
+  "services/log-tail.ts",
+  "dashboard/routes.ts",
+  "watchdog/probes.ts",
+  "watchdog/view.ts",
+  "watchdog/detectors.ts",
+  "watchdog/executors.ts",
+];
+
+/**
+ * Synchronous calls allowed in those modules: one-time startup code only,
+ * one call site per entry, with the reason. None today.
+ */
+export const SYNC_CALL_ALLOWED: readonly AllowEntry[] = [];
+
+/** A call of a name ending in Sync: readdirSync(, execFileSync(, handle.readSync( */
+const SYNC_CALL = /(?<![\w$])([A-Za-z_$][\w$]*Sync)\s*\(/g;
+/** A named import from fs or child_process (also with node:) */
+const FS_IMPORT = /\bimport\s+(?:type\s+)?\{([^}]*)\}\s*from\s*["'](?:node:)?(?:fs|child_process)["']/g;
+
+export interface SyncCall {
+  file: string;
+  line: number;
+  code: string;
+  callee: string;
+}
+
+/** Every *Sync( call in one source file (comments and literals masked), and each *Sync name imported from fs or child_process */
+export function findSyncCalls(file: string, source: string): SyncCall[] {
+  const masked = maskSource(source);
+  const lines = source.split("\n");
+  const found: SyncCall[] = [];
+  const at = (index: number, callee: string) => {
+    const line = masked.slice(0, index).split("\n").length;
+    found.push({ file, line, code: (lines[line - 1] ?? "").trim(), callee });
+  };
+  for (const m of masked.matchAll(SYNC_CALL)) at(m.index ?? 0, m[1]);
+  // Import specifiers are string literals (masked), so the import is read from the source at the masked match
+  for (const m of source.matchAll(FS_IMPORT)) {
+    if (masked.slice(m.index ?? 0, (m.index ?? 0) + 6) !== "import") continue;
+    for (const name of m[1].split(",").map((s) => s.trim().split(/\s+as\s+/)[0].replace(/^type\s+/, ""))) {
+      if (/Sync$/.test(name)) at(m.index ?? 0, `import ${name}`);
+    }
+  }
+  return found;
+}
+
+/** Calls in the converted modules that no SYNC_CALL_ALLOWED entry names, and allow-list entries that are wrong */
+export function syncCallProblems(calls: readonly SyncCall[], allowed: readonly AllowEntry[]): string[] {
+  const problems: string[] = [];
+  for (const call of calls) {
+    const entries = allowed.filter((e) => e.file === call.file && call.code.includes(e.site));
+    if (entries.length === 0) problems.push(`${call.file}:${call.line} ${call.callee}: ${call.code.slice(0, 100)}`);
+  }
+  for (const entry of allowed) {
+    const sites = calls.filter((c) => c.file === entry.file && c.code.includes(entry.site));
+    if (entry.reason.trim().length < 20) problems.push(`${entry.file} "${entry.site}": needs a reason`);
+    if (sites.length !== 1) problems.push(`${entry.file} "${entry.site}": matches ${sites.length} calls: name one call site`);
+  }
+  return problems;
+}
+
+describe("sync I/O guard (issue #245)", () => {
+  it("lists only modules that exist, and none of them calls a synchronous fs or child_process function", () => {
+    const missing = ASYNC_ONLY_MODULES.filter((file) => !sourceFiles(SERVER_DIR).includes(join(SERVER_DIR, file)));
+    expect(missing, "remove the stale ASYNC_ONLY_MODULES entry").toEqual([]);
+    const calls = ASYNC_ONLY_MODULES.flatMap((file) => findSyncCalls(file, readFileSync(join(SERVER_DIR, file), "utf8")));
+    expect(
+      syncCallProblems(calls, SYNC_CALL_ALLOWED),
+      "use fs/promises with a bounded read (services/async-fs.ts) or an async child process with a timeout; one-time startup code may go on SYNC_CALL_ALLOWED with a reason",
+    ).toEqual([]);
+  });
+
+  describe("on source strings", () => {
+    it("flags fs, Dir and child_process sync calls, and Sync names imported under another name", () => {
+      const source = [
+        'import { readFileSync as read, statSync } from "node:fs";',
+        'import { execFileSync } from "child_process";',
+        "const a = readdirSync(dir);",
+        "const b = handle.readSync();",
+        "const c = fs.existsSync(path) && execSync(cmd);",
+      ].join("\n");
+      expect(findSyncCalls("example.ts", source).map((c) => [c.line, c.callee])).toEqual([
+        [3, "readdirSync"],
+        [4, "readSync"],
+        [5, "existsSync"],
+        [5, "execSync"],
+        [1, "import readFileSync"],
+        [1, "import statSync"],
+        [2, "import execFileSync"],
+      ]);
+    });
+
+    it("ignores Sync names in comments, strings, async calls and other imports", () => {
+      const source = [
+        "// readdirSync(dir) was here",
+        'const s = "statSync(path)";',
+        'import { readdir, stat } from "fs/promises";',
+        'import { syncState } from "./state.js";',
+        "await readdir(dir);",
+      ].join("\n");
+      expect(findSyncCalls("example.ts", source)).toEqual([]);
+    });
+
+    it("passes an allowed call site and fails a stale or vague entry", () => {
+      const calls = findSyncCalls("boot.ts", "const config = readFileSync(CONFIG_PATH);\n");
+      const reason = "read once at startup, before the server listens";
+      expect(syncCallProblems(calls, [{ file: "boot.ts", site: "readFileSync(CONFIG_PATH)", reason }])).toEqual([]);
+      expect(syncCallProblems(calls, [])).toEqual(["boot.ts:1 readFileSync: const config = readFileSync(CONFIG_PATH);"]);
+      expect(syncCallProblems([], [{ file: "boot.ts", site: "readFileSync(CONFIG_PATH)", reason }])).toEqual([
+        'boot.ts "readFileSync(CONFIG_PATH)": matches 0 calls: name one call site',
+      ]);
+    });
+  });
+});
