@@ -12,6 +12,7 @@ import { parsePlannerConfig } from "./config.js";
 import type { PlannerPrs } from "./guards.js";
 import { DECISION_MODULE, NO_VERDICT_REASON, PlannerService } from "./service.js";
 import { PlannerStore } from "./store.js";
+import { prSourceFromConfig, type PrSource } from "./pr-ownership.js";
 
 const DAY_MS = 86_400_000;
 
@@ -32,6 +33,8 @@ export interface PlannerManagerOptions {
   bus?: (project: string) => BusLineSource | null;
   /** The review store's merged PRs (planner.guards.prefilter_closed); without it no PR counts as merged */
   prs?: PlannerPrs;
+  /** How a project's PRs are read for finish proposals' ownership (default: its review block's host) */
+  prOwnership?: (project: string, config: ProjectConfig) => PrSource;
 }
 
 const systemClock = { now: () => Date.now() };
@@ -74,6 +77,7 @@ export class PlannerManager {
         decisions: () => this.producer,
         bus: this.options.bus ? () => this.options.bus?.(entry.name) ?? null : undefined,
         prs: this.options.prs,
+        prOwnership: (this.options.prOwnership ?? ((_project, config) => prSourceFromConfig(config)))(entry.name, entry.config),
       });
       this.services.set(entry.name, service);
       this.follow(entry.name, service);
