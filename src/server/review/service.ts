@@ -1754,6 +1754,9 @@ export interface ReviewManagerOptions {
 /** How often open PRs are scanned for missing reviews by agents and automatic merges, by default */
 export const AUTO_REQUEST_INTERVAL_MS = 60_000;
 
+/** AI spend: a review run's review counts when it is recorded up to this long after the run's end */
+export const SPEND_REVIEW_MARGIN_MS = 5 * 60_000;
+
 export class ReviewManager {
   private services = new Map<string, ReviewService>();
   private problems = new Map<string, string[]>();
@@ -1972,19 +1975,23 @@ export class ReviewManager {
 
   /**
    * AI spend (src/server/agents/spend-classify.ts): whether a review run recorded its review. The run's span is
-   * from its request to 5 minutes after its end (a review is posted while the run runs). null with no store.
+   * from its request to 5 minutes after its end (a review is posted while the run runs, or just after it ends): with
+   * none recorded yet, pending until those 5 minutes are over, then idle. null with no store.
    */
   spendReview(
     project: string,
     run: { agent: string; requestedAt: number; endedAt: number },
     pr: number,
     headPrefix: string,
-  ): { verdict: "productive" | "idle"; headSha: string | null } | null {
+  ): { verdict: "productive" | "idle" | "pending"; headSha: string | null } | null {
     if (!this.store) return null;
+    const until = run.endedAt + SPEND_REVIEW_MARGIN_MS;
     const from = new Date(run.requestedAt).toISOString();
-    const to = new Date(run.endedAt + 5 * 60_000).toISOString();
+    const to = new Date(until).toISOString();
     const found = this.store.reviewDuring(project, pr, headPrefix, run.agent, from, to);
-    return { verdict: found.recorded ? "productive" : "idle", headSha: found.headSha };
+    if (found.recorded) return { verdict: "productive", headSha: found.headSha };
+    const now = (this.options.clock ?? systemClock).now();
+    return { verdict: now < until ? "pending" : "idle", headSha: found.headSha };
   }
 
   /** AI spend: a PR's head as the review store last read it (null: unknown). */

@@ -4,7 +4,8 @@
  * buttons inline and a link to its full context, and config errors; below
  * it a collapsed FYI list of notices, agents in trouble, failed gates and
  * PRs ready to merge), the fleet at a glance (one tile per section, each a
- * link), the problems Lair sees, and the recent activity. Its Activity tab
+ * link), the AI spend panel (while agents.spend is on: SpendPanel.tsx), the
+ * problems Lair sees, and the recent activity. Its Activity tab
  * is the bus's reports and the control audit log; its Health tab (with the
  * watchdog on) the SLOs, breaches and playbook runs.
  *
@@ -40,6 +41,7 @@ import { Button, ButtonLink } from "../ui/Button";
 import { Card } from "../ui/Card";
 import { Icon, type IconName } from "../ui/Icon";
 import { AskLairCard, DigestCard } from "./SupervisorChat";
+import { SpendPanel } from "./SpendPanel";
 
 interface WatchdogSummary {
   enabled: boolean;
@@ -331,6 +333,9 @@ function HomeOverview({ project, refreshKey, modules }: SectionProps) {
           />
         )}
       </div>
+
+      {/* AI spend: only while agents.spend is on; its numbers are the owner's (asked for once a minute, or on a switch) */}
+      <SpendPanel project={project} refreshKey={slowKey} enabled={agentsView?.spendEnabled === true} signedIn={signedIn} />
 
       <div className="grid grid-2">
         <Card title="Problems">

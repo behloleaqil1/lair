@@ -10,6 +10,7 @@ import {
   backoffMs,
   DEFAULT_BLOCKED_PATTERN,
   DEFAULT_DONE_PATTERN,
+  DEFAULT_QUOTA_PATTERNS,
   DEFAULT_TRANSIENT_PATTERNS,
   DEFAULT_WAITING_PATTERN,
   doneLineMatches,
@@ -20,7 +21,7 @@ import {
   reportPatternFor,
   taskLineMatch,
 } from "./config.js";
-import { matchTransient } from "./failover.js";
+import { matchFailover, matchTransient } from "./failover.js";
 
 const project = {
   name: "Demo",
@@ -491,6 +492,38 @@ describe("agents config", () => {
     expect(errorsOf({ transient_patterns: ["", "ok"] })[0]).toMatch(/^agents\.transient_patterns\.0: /);
     expect(errorsOf({ transient_patterns: ["(unclosed"] })[0]).toContain("agents.transient_patterns[0]: not a valid regular expression");
     expect(errorsOf({ transient_max_minutes: 0 })[0]).toMatch(/^agents\.transient_max_minutes: /);
+  });
+
+  it("failover.quota (G1): off by default with the generic patterns; refused empty, slow, not a pattern, or a max below the backoff; checked before the rate-limit patterns", () => {
+    const parsed = parseAgentsConfig({}, project);
+    if (!parsed.ok) throw new Error(parsed.errors.join("; "));
+    expect(parsed.settings.failover.quota).toMatchObject({ mode: "off", backoffMs: 30 * 60_000, maxBackoffMs: 240 * 60_000 });
+    expect(parsed.settings.failover.quota.patterns.map((p) => [p.source, p.flags])).toEqual(DEFAULT_QUOTA_PATTERNS.map((p) => [p, "i"]));
+    expect(errorsOf({ failover: { quota: { patterns: [] } } })[0]).toMatch(/^agents\.failover\.quota\.patterns: must not be empty/);
+    expect(errorsOf({ failover: { quota: { patterns: ["(unclosed"] } } })[0]).toContain("agents.failover.quota.patterns[0]: not a valid regular expression");
+    expect(errorsOf({ failover: { quota: { patterns: ["ok", "(a+)+$"] } } })[0]).toContain("agents.failover.quota.patterns[1]: it takes too long on a short line");
+    expect(errorsOf({ failover: { quota: { patterns: ["x*"] } } })[0]).toContain("agents.failover.quota.patterns[0]: it matches an empty line");
+    expect(errorsOf({ failover: { quota: { patterns: ["x".repeat(301)] } } })[0]).toMatch(/^agents\.failover\.quota\.patterns\.0: /);
+    expect(errorsOf({ failover: { quota: { backoff_minutes: 60, max_backoff_minutes: 30 } } })[0]).toBe(
+      "agents.failover.quota.max_backoff_minutes: must be at least backoff_minutes (60)",
+    );
+    expect(errorsOf({ failover: { quota: { mode: "sometimes" } }, spend: { enabled: true } })[0]).toMatch(/^agents\.failover\.quota\.mode: /);
+    expect(errorsOf({ failover: { quota: { reset: "5am" } } })[0]).toMatch(/^agents\.failover\.quota: /);
+    // A mode other than off needs spend (AT-33), and loads with it
+    expect(errorsOf({ failover: { quota: { mode: "act" } } })[0]).toContain("agents.failover.quota.mode: act needs agents.spend.enabled: true");
+    expect(errorsOf({ failover: { quota: { mode: "act" } }, spend: { enabled: true } })).toEqual([]);
+
+    // The provider's real quota line matches both: in act it is a quota, in observe today's rate limit marked as one
+    const line = '[ERROR] [KRS] HTTP 429 requestId=00000000-0000-4000-8000-000000000009 body={"reason":"DAILY_REQUEST_COUNT"}';
+    const mode = (m: string) => {
+      const p = parseAgentsConfig({ failover: { quota: { mode: m } }, spend: { enabled: true } }, project);
+      if (!p.ok) throw new Error(p.errors.join("; "));
+      return p.settings;
+    };
+    expect(matchFailover(["working", line], mode("act"))).toEqual({ kind: "quota", line, quota: { reset: null } });
+    expect(matchFailover(["working", line], mode("observe"))).toEqual({ kind: "rate_limit", line, quota: { reset: null } });
+    expect(matchFailover(["working", line], mode("off"))).toEqual({ kind: "rate_limit", line });
+    expect(matchFailover(["Error: 429 Too Many Requests"], mode("act"))).toEqual({ kind: "rate_limit", line: "Error: 429 Too Many Requests" });
   });
 
   it("backs off exponentially, capped", () => {

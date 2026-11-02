@@ -171,17 +171,22 @@ export class SpendClassifier {
       return this.module(run, origin as keyof typeof MODULE_REASONS, endedAt, final) ?? verdict("unclassified", "pending", reviewPr);
     }
     if (outcome?.kind === "done") return verdict("productive", /^\s*-\s+READY\b/.test(outcome.line) ? "ready" : "done");
-    if (outcome?.kind === "blocked") return this.blocked(run, outcome, endedAt, final) ?? verdict("unclassified", "pending");
+    if (outcome?.kind === "blocked") return this.blocked(run, outcome, endedAt, final);
     if (outcome?.kind === "waiting") return this.waiting(run, outcome.wake ?? null, endedAt, final) ?? verdict("unclassified", "pending");
     return verdict("idle", "no_line");
   }
 
   /**
-   * A row written unclassified, again. Its queue line isn't read again: a builder's row is unclassified only for a
-   * WAITING line, whose wake fill recorded (fill_waiting) when it looked at it.
+   * A row written unclassified, again. Its queue line isn't read again: a builder's row is unclassified for a
+   * BLOCKED line (the row keeps the line's key, PR and head, and the same rule runs again on them) or for a WAITING
+   * line, whose wake fill recorded (fill_waiting) when it looked at it.
    */
   later(row: SpendRow, run: AgentRun, final: boolean): Classified | null {
     if (!BUILDER_ORIGINS.includes(row.origin)) return this.module(run, row.origin as keyof typeof MODULE_REASONS, row.endedAt, final);
+    if (row.blockerKey !== null) {
+      const again = this.blockedRule(run, row.blockerKey, row.pr, row.headSha, row.endedAt, final);
+      return again.class === "unclassified" ? null : again;
+    }
     const seen = this.o.store.listEvents(this.o.project, { kinds: ["fill_waiting"], task: run.task, runId: run.id, limit: 1 })[0];
     if (!seen) return final ? verdict("idle", "waiting_unnamed") : null;
     return this.waiting(run, typeof seen.data.wake === "string" ? seen.data.wake : null, row.endedAt, final);
@@ -239,20 +244,27 @@ export class SpendClassifier {
   /**
    * BLOCKED (decision D1): the first report of a blocker is productive (blocked); a repeat with the same key is idle
    * (blocked_repeat) when nothing was pushed since the earlier one: the PR it names is still at the same head, and
-   * the task had no DONE, READY or queued gate in between. null while a row in between waits for its class.
+   * the task had no DONE, READY or queued gate in between. `unclassified/pending` while a row in between still
+   * waits for its class; it keeps the key, PR and head, so later() runs the same rule again.
    */
-  private blocked(run: AgentRun, outcome: QueueOutcome, endedAt: number, final: boolean): Classified | null {
+  private blocked(run: AgentRun, outcome: QueueOutcome, endedAt: number, final: boolean): Classified {
     const pr = prNamed(outcome.line);
     const key = blockerKey(outcome.line, outcome.wake ?? null, pr);
     const headSha = pr === null ? null : (this.o.facts()?.prHead?.(this.o.project, pr) ?? null);
-    const first = verdict("productive", "blocked", { pr, headSha, blockerKey: key });
+    return this.blockedRule(run, key, pr, headSha, endedAt, final);
+  }
+
+  /** The rule of blocked() over a blocker key, the PR the line named and that PR's head when the run ended. */
+  private blockedRule(run: AgentRun, key: string, pr: number | null, headSha: string | null, endedAt: number, final: boolean): Classified {
+    const extra = { pr, headSha, blockerKey: key };
     const earlier = this.o.store.taskSpendBefore(this.o.project, run.task, endedAt, run.id, 200);
     const same = earlier.findIndex((r) => r.blockerKey === key);
-    if (same < 0) return first;
+    if (same < 0) return verdict("productive", "blocked", extra);
     const between = earlier.slice(0, same);
-    if (!final && between.some((r) => r.class === "unclassified")) return null;
+    // Only a row whose class is still to come is waited on: a backfilled `not_recorded` row never gets one
+    if (!final && between.some((r) => r.class === "unclassified" && r.reason === "pending")) return verdict("unclassified", "pending", extra);
     const pushed = between.some((r) => r.class === "productive" && (r.reason === "done" || r.reason === "ready" || r.reason === "gate_queued"));
     const moved = pr !== null && (earlier[same].headSha ?? null) !== headSha;
-    return pushed || moved ? first : verdict("idle", "blocked_repeat", { pr, headSha, blockerKey: key });
+    return pushed || moved ? verdict("productive", "blocked", extra) : verdict("idle", "blocked_repeat", extra);
   }
 }
