@@ -63,6 +63,145 @@ export type RunOrigin = "fill" | "review" | "planner" | "verifier" | "supervisor
  */
 export type UsageParserKind = "claude-stream-json" | "claude-json" | "request-lines" | "patterns" | "none";
 
+/** A run's class (docs/design/ai-spend.md §4.2); `unclassified` while its module hasn't recorded its result yet */
+export type SpendClass = "productive" | "idle" | "no_result" | "unclassified";
+
+/** GET /api/agents/spend: the window ("today" is the UTC day) and the grouping */
+export const SPEND_WINDOWS = ["today", "7d", "30d", "1y"] as const;
+export type SpendWindow = (typeof SPEND_WINDOWS)[number];
+export const SPEND_GROUPS = ["project", "agent", "task", "reason", "origin", "provider"] as const;
+export type SpendGroupBy = (typeof SPEND_GROUPS)[number];
+/** The unit a waste share is shown in first: cost when any was reported, then requests, then minutes, then runs */
+export type SpendUnit = "cost" | "requests" | "minutes" | "runs";
+
+/**
+ * Spend summed over runs. `reported: false` when no run of them reported tokens and cost: both are null then ("not
+ * reported"), never estimated. requests and turns are null when no run had them.
+ */
+export interface SpendTotalsView {
+  runs: number;
+  minutes: number;
+  requests: number | null;
+  turns: number | null;
+  tokens: number | null;
+  cost: number | null;
+  reported: boolean;
+}
+
+/** (idle + no_result) / (productive + idle + no_result), per unit; null where the unit has nothing */
+export interface SpendWasteShare {
+  cost: number | null;
+  tokens: number | null;
+  requests: number | null;
+  turns: number | null;
+  minutes: number | null;
+  runs: number | null;
+}
+
+export interface SpendGroupView {
+  key: string;
+  totals: SpendTotalsView;
+  productive: SpendTotalsView;
+  idle: SpendTotalsView;
+  noResult: SpendTotalsView;
+  /** Runs with no class yet: in the totals, in no waste share */
+  unclassified: SpendTotalsView;
+  waste: SpendWasteShare;
+  reloads: number;
+  lairRestarts: number;
+}
+
+export interface SpendReasonView {
+  class: SpendClass;
+  reason: string;
+  totals: SpendTotalsView;
+}
+
+export interface SpendTaskView {
+  task: string;
+  /** Runs since its last completion (a DONE or READY run, or any productive run of a module's task) */
+  attempts: number;
+  noResult: number;
+  chains: number;
+  lastEndedAt: string;
+}
+
+export interface SpendReviewHeadView {
+  pr: number;
+  /** The head's first 8 characters */
+  head: string;
+  runs: number;
+  reviews: number;
+  failed: number;
+}
+
+export interface SpendPlannerView {
+  /** Planner runs requested in the window, and those with an applied proposal */
+  runs: number;
+  runsWithApplied: number;
+  proposals: { applied: number; declined: number; rejected: number; pending: number };
+  verdicts: { approve: number; reject: number; unsure: number; unverified: number };
+  /** The planner's and its verifier's reported cost per applied proposal: null when none applied or no cost was reported */
+  costPerApplied: number | null;
+  /** Planner runs with no applied proposal, of all */
+  wasteShare: number | null;
+}
+
+/** Guard ids, as each guard's guard_would and guard_did events carry them in data.guard (docs/design/ai-spend.md §4.5) */
+export const SPEND_GUARDS = [
+  "quota",
+  "task_no_result_cap",
+  "wake_events",
+  "hung_repeat",
+  "budget",
+  "planner_prefilter_closed",
+  "planner_handled_messages",
+  "planner_skip_unchanged",
+  "planner_recheck_on_change",
+] as const;
+export type SpendGuardId = (typeof SPEND_GUARDS)[number];
+
+export interface SpendGuardView {
+  guard: SpendGuardId;
+  /** The config key of its mode */
+  key: string;
+  mode: "off" | "observe" | "act";
+  would: number;
+  did: number;
+}
+
+/** GET /api/agents/spend: numbers, ids and enums only (never a prompt, a log line or a blocker's text) */
+export interface SpendReportView {
+  project: string;
+  window: SpendWindow;
+  by: SpendGroupBy;
+  from: string;
+  to: string;
+  /** runs: the per-run rows; aggregates: the daily aggregates (and the runs of days not aggregated yet), no per-task detail */
+  source: "runs" | "aggregates";
+  unit: SpendUnit;
+  totals: SpendTotalsView;
+  productive: SpendTotalsView;
+  idle: SpendTotalsView;
+  noResult: SpendTotalsView;
+  /** Runs whose class waits on their module's record: in no share */
+  unclassified: SpendTotalsView;
+  waste: SpendWasteShare;
+  /** The waste share in `unit` */
+  wasteShare: number | null;
+  /** By `by`, the most waste in `unit` first (at most 200) */
+  groups: SpendGroupView[];
+  reasons: SpendReasonView[];
+  reloads: number;
+  lairRestarts: number;
+  /** The 10 tasks with the most attempts without a completion (null for a window past the per-run rows) */
+  topTasks: SpendTaskView[] | null;
+  /** Heads reviewed more than once (null for a window past the per-run rows) */
+  reviewsPerHead: SpendReviewHeadView[] | null;
+  planner: SpendPlannerView | null;
+  guards: SpendGuardView[];
+}
+
 /** One way to run an agent: an adapter (CLI), a model, and the provider it bills. */
 export interface AgentProfile {
   adapter: string;
@@ -178,7 +317,11 @@ export type AgentEventKind =
   /** A guard in act mode did what it describes */
   | "guard_did"
   /** An ended run's usage was read but refused (over a cap, unreadable): the run's spend row says not reported */
-  | "usage_refused";
+  | "usage_refused"
+  /** The spend of the UTC day that just ended (also agents.spend.daily on the event bus): numbers, enums, task ids */
+  | "spend_daily"
+  /** agents.spend's first enable classified the runs of the days before (its start and its end) */
+  | "spend_backfill";
 
 /** Recovery and audit record: what happened, why, and the evidence. */
 export interface AgentEventView {
@@ -332,9 +475,11 @@ export type FillLineState = "started" | "done" | "held" | "claimed" | "not_allow
  *   prompt file), refused (the run request, or done_pattern)
  * - conflict: a live process this server has no run for holds one of the task's run prompt files on its
  *   command line (a run of the task it doesn't know): fill starts the task once that process has ended
+ * - no_result_cap, hung_repeat: an AI spend guard in act mode parked it (docs/design/ai-spend.md G2, G4): its no-result
+ *   runs, or its hangs, reached the guard's limit within its window, in any chain; one decision asks what next
  * - paused: you chose to leave it ("Keep it paused" on its decision, or "Leave the task unclaimed" on
  *   its run's escalation): nothing waits for you, and fill starts it again once you release it
- * owner, no_done, blocked, waiting, waited_too_long and paused are the owner's to release (POST
+ * owner, no_done, blocked, waiting, waited_too_long, no_result_cap, hung_repeat and paused are the owner's to release (POST
  * /api/agents/fill/release, or the decision); a waiting one also ends by itself.
  * owner, no_done, blocked, waited_too_long and refused need the owner (FILL_OWNER_HOLDS): each has
  * exactly one open Decision Inbox item while it lasts (`decisionId`).
@@ -358,7 +503,9 @@ export type FillHold =
   | "conflict"
   | "prompt"
   | "refused"
-  | "report_refused";
+  | "report_refused"
+  | "no_result_cap"
+  | "hung_repeat";
 
 export interface FillLineView {
   /** 1-based line number in tasks_file */
@@ -386,7 +533,7 @@ export interface FillLineView {
 }
 
 /** The holds that need the owner: each has exactly one open decision while it lasts. */
-export const FILL_OWNER_HOLDS: readonly FillHold[] = ["owner", "no_done", "blocked", "waited_too_long", "refused"];
+export const FILL_OWNER_HOLDS: readonly FillHold[] = ["owner", "no_done", "blocked", "waited_too_long", "refused", "no_result_cap", "hung_repeat"];
 
 export interface FillWaitingView {
   /** What the WAITING line named (a gate id, say), when the pattern captures it */

@@ -6938,3 +6938,268 @@ describe("12. the bus (bus.consume): fill reads an agent's structured report in 
     expect(code.match(/\b\w+\.state\s*=\s*[a-z]\w*\s*;/g)).toEqual(["run.state = state;"]);
   });
 });
+
+describe("AI spend guards on failed runs: G2 no-result cap, G4 hung-repeat (docs/design/ai-spend.md §4.5; AT-16, AT-19, AT-28)", () => {
+  const tasksFile = (p: Paths) => join(p.dir, "tasks.txt");
+  /** spend on, the guards as given, and fill over tasks.txt with no backoff after a run without done */
+  const guarded =
+    (guards: { cap?: Record<string, unknown>; hung?: Record<string, unknown> }, recovery: Record<string, unknown> = {}) =>
+    (p: Paths) => ({
+      spend: { enabled: true, guards: { task_no_result_cap: guards.cap ?? {} } },
+      recovery: { ...BASE.recovery, ...recovery, hung_repeat: guards.hung ?? {} },
+      fill: {
+        enabled: true,
+        tasks_file: tasksFile(p),
+        agents: ["worker-a", "worker-b"],
+        prompt_files: ["{prompts_dir}/{agent}.txt"],
+        max_active: 2,
+        interval_seconds: 1,
+        backoff_seconds: 0,
+        max_backoff_seconds: 0,
+      },
+    });
+  const fillTasks = (p: Paths, ...lines: string[]) => {
+    mkdirSync(p.promptsDir, { recursive: true });
+    writeFileSync(join(p.promptsDir, "worker-a.txt"), "You are worker A: build what the task says.\n");
+    writeFileSync(join(p.promptsDir, "worker-b.txt"), "You are worker B.\n");
+    writeFileSync(tasksFile(p), `${lines.join("\n")}\n`);
+  };
+  const lineOf = (status: FillStatusView, task: string) => status.lines.find((l) => l.task === task);
+  const guardOf = (h: Harness, guard: string) => h.service.spendReport("today", "project").guards.find((g) => g.guard === guard);
+  const openKeys = (inbox: Awaited<ReturnType<typeof withInbox>>["inbox"]) => inbox.list({ project: "demo", status: "open" }).map((d) => d.key);
+
+  for (const mode of ["act", "observe"] as const) {
+    it(`G2 ${mode}, max 3: crashed, hung, crashed across two chains ${mode === "act" ? "parks the fill task with one decision; start_again resets the count" : "goes on as before, with one guard_would and one notice"}`, async () => {
+      const h = setup(guarded({ cap: { mode, max: 3 } }, { same_session_restarts: 2, fresh_sessions: 0 }));
+      const { inbox, answer } = await withInbox(h);
+      fillTasks(h, "worker-a|A|t-cap|Keeps failing");
+      const pids: number[] = [];
+      h.spawner.behaviour = (pid, log, call) => {
+        pids[call] = pid;
+        writeLog(h.clock, log, `working ${call}\n`);
+        if (call === 3) h.spawner.exit(pid, 0); // a completion with no DONE line: its chain ends, fill starts a new one
+      };
+      let t = 0;
+      const crash = async (call: number) => {
+        t += 2 * MIN;
+        h.spawner.exit(pids[call], 2);
+        await at(h, t);
+      };
+      await h.service.checkFill(); // chain 1
+      await at(h, t); // spawn 1
+      await crash(1); // crashed: resumed after 10 s
+      t += 10 * SEC;
+      await at(h, t); // spawn 2: it hangs
+      t += 46 * MIN;
+      await at(h, t); // hung: SIGTERM
+      await at(h, t); // gone: resumed after 20 s
+      t += 20 * SEC;
+      await at(h, t); // spawn 3: exits 0 at once
+      t += MIN;
+      await at(h, t); // completed with no DONE line
+      await h.service.checkFill(); // chain 2
+      await at(h, t); // spawn 4
+      await crash(4); // the third run with no result within the window
+      const all = runs(h);
+      expect(all.map((r) => r.endKind ?? null).slice(0, 4)).toEqual(["crashed", "hung", "completed", "crashed"]);
+      expect(all[3].chainId).not.toBe(all[0].chainId);
+      const counted = { guard: "task_no_result_cap", task: "t-cap", count: 3, max: 3, ends: ["crashed", "hung", "crashed"], runs: [all[0].id, all[1].id, all[3].id] };
+
+      if (mode === "act") {
+        expect(all).toHaveLength(4); // nothing more is started
+        expect(eventsOf(h, "guard_did")).toHaveLength(1);
+        expect(eventsOf(h, "guard_did")[0]).toMatchObject({ subject: "t-cap", task: "t-cap", runId: all[3].id, data: { ...counted, verdict: "park" } });
+        expect(eventsOf(h, "guard_would")).toEqual([]);
+        expect(eventsOf(h, "escalated")).toEqual([]); // a fill task: the guard's own decision
+        expect(h.store.getClaim("demo", "t-cap")).toBeNull();
+        expect(openKeys(inbox)).toEqual([`guard:task_no_result_cap:${all[3].id}`]);
+        const [asked] = inbox.list({ project: "demo", status: "open" });
+        expect(asked.options.map((o) => o.id)).toEqual(["start_again", "fresh_session", "keep_parked"]);
+        expect(lineOf(await h.service.checkFill(), "t-cap")).toMatchObject({ state: "held", hold: "no_result_cap", runId: all[3].id, decisionId: asked.id, releasable: true });
+        await h.service.checkFill();
+        expect(runs(h)).toHaveLength(4);
+        expect(openKeys(inbox)).toHaveLength(1);
+        expect(guardOf(h, "task_no_result_cap")).toMatchObject({ mode: "act", would: 0, did: 1 });
+
+        // "Start it again": fill starts it in a new chain, and the count starts over (its next crash is resumed)
+        expect((await answer(asked.id, { optionId: "start_again" })).statusCode).toBe(200);
+        expect(eventsOf(h, "fill_released")).toHaveLength(1);
+        await h.service.checkFill();
+        await at(h, t); // spawn 5
+        await crash(5);
+        expect(runs(h)).toHaveLength(6);
+        expect(runs(h).at(-1)).toMatchObject({ state: "queued", sessionMode: "resume", chainId: runs(h)[4].chainId });
+        expect(eventsOf(h, "guard_did")).toHaveLength(1);
+        // Answering it twice is refused: it is answered
+        expect((await answer(asked.id, { optionId: "start_again" })).statusCode).toBe(409);
+      } else {
+        // Nothing changes: resumed as before
+        expect(all).toHaveLength(5);
+        expect(all[4]).toMatchObject({ state: "queued", sessionMode: "resume", chainId: all[3].chainId });
+        expect(eventsOf(h, "guard_did")).toEqual([]);
+        expect(eventsOf(h, "guard_would")).toHaveLength(1);
+        expect(eventsOf(h, "guard_would")[0]).toMatchObject({ subject: "t-cap", task: "t-cap", runId: all[3].id, data: { ...counted, verdict: "would_park" } });
+        const notices = inbox.list({ project: "demo", status: "open" });
+        expect(notices.map((d) => [d.key, d.attention])).toEqual([[`guard_would:task_no_result_cap:${all[3].id}`, "notice"]]);
+        expect(h.store.getClaim("demo", "t-cap")).toMatchObject({ runId: all[4].id });
+        // The next failure of the same streak records nothing more
+        t += 20 * SEC;
+        await at(h, t); // spawn 5
+        await crash(5);
+        expect(eventsOf(h, "guard_would")).toHaveLength(1);
+        expect(openKeys(inbox)).toHaveLength(1);
+        expect(lineOf(await h.service.checkFill(), "t-cap")?.hold ?? null).not.toBe("no_result_cap");
+        expect(guardOf(h, "task_no_result_cap")).toMatchObject({ mode: "observe", would: 1, did: 0 });
+      }
+    });
+  }
+
+  it("G2 act: a task whose runs died while the outage was the fleet's is not parked", async () => {
+    const NETWORK_ERROR =
+      'Error: A network error occurred. Please check your connection and try again. (code -32000): {"errorType":"ClientNetworkError","retryErrorType":"TRANSIENT"}';
+    const h = setup(guarded({ cap: { mode: "act", max: 3 } }));
+    fillTasks(h, "worker-a|A|t-other|Another task");
+    h.spawner.behaviour = (pid, log) => {
+      writeLog(h.clock, log, `${NETWORK_ERROR}\n`);
+      h.spawner.exit(pid, 1);
+    };
+    // worker-a's run dies first: the outage is worker-a's own. Then worker-b's task starts and dies: now the fleet's
+    await h.service.checkFill();
+    await at(h, 0);
+    await at(h, 0);
+    fillTasks(h, "worker-a|A|t-other|Another task", "worker-b|B|t-fleet|Dies in the outage");
+    await h.service.checkFill();
+    const ended = () => runs(h).filter((r) => r.task === "t-fleet" && r.endedAt !== undefined);
+    for (let s = 10; s <= 7200 && ended().length < 3; s += 10) await at(h, s * SEC);
+    expect(ended().length).toBeGreaterThanOrEqual(3);
+    const transient = eventsOf(h, "transient");
+    expect(transient.find((e) => e.task === "t-other")?.data.fleet).toBe(false);
+    expect(transient.filter((e) => e.task === "t-fleet").every((e) => e.data.fleet === true)).toBe(true);
+    expect(eventsOf(h, "guard_did")).toEqual([]);
+    expect(eventsOf(h, "guard_would")).toEqual([]);
+    expect(lineOf(await h.service.checkFill(), "t-fleet")?.hold ?? null).not.toBe("no_result_cap");
+  });
+
+  it("G2 act, max 2: Lair restarts' ends (exit_unknown) and the owner's stop don't count; the second crash parks a run fill doesn't own through its escalation", async () => {
+    const config = guarded({ cap: { mode: "act", max: 2 } }, { same_session_restarts: 5, fresh_sessions: 0 });
+    const h1 = setup(config);
+    h1.spawner.behaviour = (_pid, log) => writeLog(h1.clock, log, "working\n"); // it runs on
+    await request(h1, "worker-a", "t-third");
+    await at(h1, 0);
+    // Lair restarts twice while it runs: each time its run ended unseen (exit_unknown) and is resumed
+    const h2 = setup(config, { paths: h1, self: { pid: 200, startedAt: NOW } });
+    h2.spawner.behaviour = (_pid, log) => writeLog(h2.clock, log, "working\n");
+    await at(h2, MIN);
+    await at(h2, MIN);
+    await at(h2, 2 * MIN);
+    const h3 = setup(config, { paths: h1, self: { pid: 300, startedAt: NOW + 3 * MIN } });
+    const pids: number[] = [];
+    h3.spawner.behaviour = (pid, log, call) => {
+      pids[call] = pid;
+      writeLog(h3.clock, log, "working\n");
+    };
+    await at(h3, 4 * MIN);
+    await at(h3, 4 * MIN);
+    await at(h3, 5 * MIN); // spawn (call 1)
+    // The owner asks for a fresh session: the run is stopped and a fresh one queued
+    await h3.service.freshSession(runs(h3).at(-1)!.id);
+    await at(h3, 6 * MIN);
+    await at(h3, 6 * MIN);
+    await at(h3, 7 * MIN); // spawn (call 2)
+    h3.spawner.exit(pids[2], 2);
+    await at(h3, 10 * MIN); // crashed: the first that counts, resumed
+    await at(h3, 12 * MIN); // spawn (call 3), after its backoff
+    h3.spawner.exit(pids[3], 2);
+    await at(h3, 15 * MIN); // crashed again: the cap
+    const all = runs(h3);
+    expect(all.map((r) => r.endKind ?? null)).toEqual(["exit_unknown", "exit_unknown", "stopped", "crashed", "crashed"]);
+    expect(eventsOf(h3, "guard_did")).toHaveLength(1);
+    expect(eventsOf(h3, "guard_did")[0].data).toMatchObject({ guard: "task_no_result_cap", verdict: "park", count: 2, ends: ["crashed", "crashed"], runs: [all[3].id, all[4].id] });
+    // Not a fill task: the usual escalation, once, and nothing more starts
+    expect(eventsOf(h3, "escalated")).toHaveLength(1);
+    expect(h3.store.getClaim("demo", "t-third")).toBeNull();
+    await at(h3, 20 * MIN);
+    expect(runs(h3)).toHaveLength(5);
+  });
+
+  for (const mode of ["act", "observe"] as const) {
+    it(`G4 ${mode}, max_per_task 2, first unset: the first hang resumes as before; the second ${mode === "act" ? "parks the task with one decision, and nothing resumes it" : "resumes as before, with one guard_would and one notice"}`, async () => {
+      const h = setup(guarded({ hung: { mode, max_per_task: 2 } }));
+      const { inbox, answer } = await withInbox(h);
+      fillTasks(h, "worker-a|A|t-hang|Hangs");
+      h.spawner.behaviour = (_pid, log, call) => writeLog(h.clock, log, `working ${call}\n`); // then silent
+      let t = 0;
+      const hang = async () => {
+        t += 46 * MIN;
+        await at(h, t); // hung: SIGTERM
+        await at(h, t); // gone
+      };
+      await h.service.checkFill();
+      await at(h, t);
+      await hang();
+      expect(runs(h).at(-1)).toMatchObject({ state: "queued", sessionMode: "resume" });
+      t += 10 * SEC;
+      await at(h, t);
+      await hang();
+      const all = runs(h);
+      const counted = { guard: "hung_repeat", task: "t-hang", count: 2, max: 2, ends: ["hung", "hung"], runs: [all[0].id, all[1].id] };
+      if (mode === "act") {
+        expect(all).toHaveLength(2); // no resume run
+        expect(eventsOf(h, "guard_did")).toHaveLength(1);
+        expect(eventsOf(h, "guard_did")[0]).toMatchObject({ subject: "t-hang", runId: all[1].id, data: { ...counted, verdict: "park" } });
+        expect(eventsOf(h, "guard_would")).toEqual([]);
+        expect(h.store.getClaim("demo", "t-hang")).toBeNull();
+        const [asked] = inbox.list({ project: "demo", status: "open" });
+        expect(asked.key).toBe(`guard:hung_repeat:${all[1].id}`);
+        expect(asked.options.map((o) => o.id)).toEqual(["fresh_session", "keep_parked", "release"]);
+        expect(lineOf(await h.service.checkFill(), "t-hang")).toMatchObject({ state: "held", hold: "hung_repeat", decisionId: asked.id });
+        await at(h, t + 60 * MIN);
+        expect(runs(h)).toHaveLength(2);
+        expect(guardOf(h, "hung_repeat")).toMatchObject({ mode: "act", would: 0, did: 1 });
+        // "Keep it parked": the owner's pause, and the decision is answered
+        expect((await answer(asked.id, { optionId: "keep_parked" })).statusCode).toBe(200);
+        expect(lineOf(await h.service.checkFill(), "t-hang")).toMatchObject({ state: "held", hold: "paused" });
+        expect(openKeys(inbox)).toEqual([]);
+      } else {
+        expect(all).toHaveLength(3);
+        expect(all[2]).toMatchObject({ state: "queued", sessionMode: "resume", chainId: all[0].chainId });
+        expect(eventsOf(h, "guard_did")).toEqual([]);
+        expect(eventsOf(h, "guard_would")).toHaveLength(1);
+        expect(eventsOf(h, "guard_would")[0]).toMatchObject({ subject: "t-hang", runId: all[1].id, data: { ...counted, verdict: "would_park" } });
+        expect(inbox.list({ project: "demo", status: "open" }).map((d) => [d.key, d.attention])).toEqual([[`guard_would:hung_repeat:${all[1].id}`, "notice"]]);
+        // A third hang in the same streak records nothing more
+        t += 20 * SEC;
+        await at(h, t);
+        await hang();
+        expect(eventsOf(h, "guard_would")).toHaveLength(1);
+        expect(guardOf(h, "hung_repeat")).toMatchObject({ mode: "observe", would: 1, did: 0 });
+      }
+    });
+  }
+
+  it("G4 first: fresh with mode off: the first hang restarts in a fresh session with the hung info; nothing is parked", async () => {
+    const h = setup(guarded({ hung: { mode: "off", first: "fresh" } }));
+    fillTasks(h, "worker-a|A|t-hang|Hangs");
+    h.spawner.behaviour = (_pid, log, call) => writeLog(h.clock, log, `working ${call}\n`);
+    let t = 0;
+    const hang = async () => {
+      t += 46 * MIN;
+      await at(h, t);
+      await at(h, t);
+    };
+    await h.service.checkFill();
+    await at(h, t);
+    await hang();
+    expect(runs(h).at(-1)).toMatchObject({ state: "queued", sessionMode: "fresh", freshSessions: 1 });
+    t += 10 * SEC;
+    await at(h, t);
+    const prompt = promptOf(h.spawner.calls[1]);
+    expect(prompt).toContain("<hung_run_warning>");
+    expect(prompt).toContain("# Resume summary (written by Lair)");
+    // Its second hang within the window: today's rule (mode off parks nothing)
+    await hang();
+    expect(runs(h).at(-1)).toMatchObject({ state: "queued", sessionMode: "resume" });
+    expect(eventsOf(h, "guard_did")).toEqual([]);
+    expect(eventsOf(h, "guard_would")).toEqual([]);
+  });
+});

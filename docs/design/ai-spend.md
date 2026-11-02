@@ -1,6 +1,6 @@
 # AI spend and waste
 
-- **Status:** design. PR 1 (measure, §7) is built; the rest is not. The feature decisions are made (§8, 2026-11-02).
+- **Status:** design. PR 1 (measure) and PR 2 (classify, API, daily summary, notices) of §7 are built; the rest is not. The feature decisions are made (§8, 2026-11-02).
 - **Base:** main `9bce85a`.
 - **Related:** [autonomy.md §6](autonomy.md#6-agents-budgets-failover-and-session-recovery-module-agents) (the agents module), [review-stages.md](review-stages.md) (staged review slots, `ask_after`, built separately), [planner.md](planner.md), [decision-policies.md](decision-policies.md) (the brain), issue #185 (usage limit detector).
 
@@ -193,7 +193,9 @@ Only the hash is stored (`blocker_key`), never the text. "No push since" means t
 - **Per PR head:** review runs, reviews recorded and review runs that failed (from `review_agent_assignments` and `review_reviews`).
 - **Planner:** proposals by status (`applied`, `declined`, `rejected`, `pending`) and the verifier verdict, from `planner_proposals`.
 
-**The waste share** of a window is `(idle + no_result) / total`, in each unit there is data for: cost (reported), tokens (reported), requests, turns, agent-minutes and runs. The panel shows the unit with the best data first: cost if any reported cost exists, then requests, then minutes.
+**When a run's facts come later.** A module reads its run's result after the run ends (the planner its proposals, fill a WAITING line's wake), so a row is written `unclassified/pending` when they aren't there yet and is classified on a later tick, from what the module recorded (`SpendFacts`, read-only from its store: review, planner, verifier and supervisor). 30 minutes after the run's end it gets the class the facts give by then, so what never came counts as none (`no_proposals`, `waiting_unnamed`, ...). A module that isn't wired leaves its runs `unclassified`: nothing is guessed. A classified row never changes.
+
+**The waste share** of a window is `(idle + no_result) / (productive + idle + no_result)`, `unclassified` rows being in neither, in each unit there is data for: cost (reported), tokens (reported), requests, turns, agent-minutes and runs. The panel shows the unit with the best data first: cost if any reported cost exists, then requests, then minutes.
 
 ### 4.3 Storage
 
@@ -245,10 +247,11 @@ CREATE INDEX IF NOT EXISTS idx_agents_spend_pending ON agents_spend_pending(proj
 
 - The aggregate for a UTC day is written when that day's daily summary runs, as an upsert on the primary key. Writing it again (after a restart, say) gives the same rows.
 - Rows for a day can arrive after its summary ran: an exit-unknown or adopted run ends late. So right before a day's per-run rows are deleted, the pruning step always upserts that day's aggregate again from the rows still there. A late row is never lost, and an aggregate is never left stale.
-- Deletes run at most once a day, in the tick, asynchronously and in batches of 1,000.
-- Windows longer than 90 days read the aggregates only, so they have no per-run or per-task detail.
+- Deletes run at most once a day, in the tick, one whole UTC day at a time: the day's aggregate is written again and its per-run rows deleted in one transaction, so a crash can't leave a day half deleted (whose aggregate a later pass would then write again from what is left). At most 31 days per tick; the rest go on the next tick.
+- `agents_spend_daily` has no `tokens` column: a long window's tokens are input + cache write + output, so a `patterns` row (a total with no split) adds none there.
+- Windows longer than 90 days have no per-task detail. They read the aggregates of the days before the retention cutoff and the per-run rows from the cutoff on, so a row that lands after its day's summary counts at once. A day before the cutoff whose rows retention hasn't deleted yet is read from its aggregate, or from its rows when it has none.
 
-**Backfill (PR 2, because it needs the classification).** On first enable, the runs from the last `backfill_days` (7) are classified from the run records and events Lair already holds. Their usage is `none`, because their logs may have moved, and they get `backfilled = 1`. The first panel isn't empty, and every view can tell these rows apart. The backfill is idempotent: a row whose `run_id` exists is skipped.
+**Backfill (PR 2, because it needs the classification).** On first enable, the runs from the last `backfill_days` (7) are classified from the run records and events Lair already holds. Their usage is `none`, because their logs may have moved, and they get `backfilled = 1`. The first panel isn't empty, and every view can tell these rows apart. The backfill is idempotent: a row whose `run_id` exists is skipped, and so is a run that ended while spend was on (its pending mark), whose row drain writes with the usage its log reports. The queue file isn't read for it: a completed builder run whose line fill never recorded (not a fill task) is `unclassified` with reason `not_recorded`, not guessed idle. The daily summary and retention wait until the backfill is done (its `spend_backfill:done` event): it goes oldest first, so a summary before then would miss the last day's runs, and it is never sent again.
 
 ### 4.4 Show it
 
@@ -294,7 +297,7 @@ Each is off until its threshold is set. The recommended thresholds (decision D6)
 Every guard has a `mode` (decision D6):
 
 - `off`: the default. Nothing is computed.
-- `observe`: the guard reaches the same verdict it would act on and changes nothing. It records one `guard_would` event, carrying the guard, the subject (a task, a provider or a planner run), the verdict (`would_park`, `would_skip`, `would_cool`, `would_wake`, `would_block`, `would_apply`) and the evidence as numbers and ids. It raises one inbox item with `attention: "notice"` per subject and streak, and counts the verdict in the panel and the API.
+- `observe`: the guard reaches the same verdict it would act on and changes nothing. It records one `guard_would` event, carrying the guard (`data.guard`, one of `quota`, `task_no_result_cap`, `wake_events`, `hung_repeat`, `budget`, `planner_prefilter_closed`, `planner_handled_messages`, `planner_skip_unchanged`, `planner_recheck_on_change`: the spend API counts by it), the subject (a task, a provider or a planner run), the verdict (`would_park`, `would_skip`, `would_cool`, `would_wake`, `would_block`, `would_apply`) and the evidence as numbers and ids. It raises one inbox item with `attention: "notice"` per subject and streak, and counts the verdict in the panel and the API.
 - `act`: the guard does what it describes, records a `guard_did` event and counts it.
 
 **Rollout.** Every guard ships in `observe`. Each one moves to `act` on its own, after a week of observe evidence shows its would-verdicts would have been right: the parked tasks didn't later complete unattended, the skipped planner runs had nothing applicable, and the cooled-down provider stayed limited. An observe verdict and an act verdict for the same input are the same verdict. The tests check that.
@@ -323,6 +326,7 @@ One deployment runs an interim `agents.failover.cooldown_minutes: 120` as a stop
   - runs that died while their provider was in a **fleet** outage or a fleet quota cooldown (decision D2), since G1 and the transient rule handle those. G1's observe-mode `would_cool` windows count as cooldowns here too;
   - runs with `lair_restart = 1` (`exit_unknown`, `lost`, `vars_lost`): Lair's own restart ended them;
   - runs that ended `stopped`: an owner stop or a shutdown.
+- **As built (PR 5).** The count is read from the run records of the task's chains, at the moment a failed run's chain would go on (a restart, a failover, a transient or never-started retry), so the run that just failed counts at once. A fleet outage is the provider's latest `transient` event by the run's end saying every agent waits; until G1 exists, the fleet cooldown is today's rate-limit and provider-error cooldown once two agents' failovers made it fleet-wide, and G1's quota cooldown (and its `would_cool` windows) joins it with PR 4. The count starts over when the task's fill hold is released: `start_again` releases it, and so does a release in Work. A superseded run never ran, so it isn't counted.
 - On the data above, with `max: 6`, the 13 tasks that took 10 or more attempts would each have stopped at their sixth no-result run and asked once.
 
 **G3. Waiting agents woken only by the awaited event.** This extends `agents.fill.wake`.
@@ -343,7 +347,7 @@ One deployment runs an interim `agents.failover.cooldown_minutes: 120` as a stop
   - `resume`, the default, is today's behaviour.
   - `fresh` starts a fresh session with the hung-info block and a resume summary, so the stuck context isn't re-sent. It applies whenever it is set, in any mode, and is a change the owner makes on its own evidence.
 - `mode` governs only the park below.
-- The `max_per_task`-th hang of a task within the window, in any chain, **parks** it with the fill hold `hung_repeat` (or escalation for a module run) and one decision. Options: `fresh_session` (with the hung info), `keep_parked`, `release`. The task is not resumed again.
+- The `max_per_task`-th hang of a task within the window, in any chain, **parks** it with the fill hold `hung_repeat` (or escalation for a module run) and one decision. Options: `fresh_session` (with the hung info), `keep_parked`, `release`. The task is not resumed again. A hang after `fresh_session` or `release`, within the window, parks it again (the count doesn't start over). `first: fresh` turns a first hang's resume into a fresh session; when the chain's restarts are used up, it is escalated as today.
 - On the data above, with `max_per_task: 2`, the 59 repeat hangs (3,011 agent-minutes) would have been 26 parked tasks, each asked about once.
 
 **G5. Daily budget per project with an owner notice.** This reuses `agents.budgets` and adds no second budget system (`budgets.guard_mode`).

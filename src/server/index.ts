@@ -904,7 +904,7 @@ await registerDashboardRoutes(fastify, dashboardSources, humanAuth);
 // call audited in data/supervisor.db; and (off by default) the owner's
 // questions and the daily digest, answered by supervisor runs the agents
 // module starts in-process, each with a run token in its environment
-const { supervisor: selfChecks, chat: supervisorChat } = await mountSupervisor(fastify, {
+const { supervisor: selfChecks, chat: supervisorChat, store: supervisorStore } = await mountSupervisor(fastify, {
   dbPath: join(process.cwd(), "data", "supervisor.db"),
   humanAuth,
   defaultProject: () => getDefaultProject(),
@@ -961,6 +961,17 @@ const { supervisor: selfChecks, chat: supervisorChat } = await mountSupervisor(f
     triageRecords: (project, limit) => triage.getStore()?.listRecords(project, { limit }) ?? [],
     placement: (project) => placements.status(project),
   },
+});
+
+// AI spend's classes (agents.spend, docs/design/ai-spend.md §4.2): what the review, planner and supervisor modules
+// recorded about the runs they asked for, read from their stores (read-only, no log or network read)
+agents.useSpendFacts({
+  review: (project, run, pr, headPrefix) => reviews.spendReview(project, run, pr, headPrefix),
+  prHead: (project, pr) => reviews.spendPrHead(project, pr),
+  planner: (project, run) => planner.spendRun(project, "planner", run),
+  verifier: (project, run) => planner.spendRun(project, "verifier", run),
+  supervisor: (project, run) => supervisorStore.spendVerdict(project, run.id),
+  plannerAcceptance: (project, from, to) => planner.spendAcceptance(project, from, to),
 });
 
 // Live config reload (src/server/reload/): a changed project file reaches

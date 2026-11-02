@@ -74,6 +74,9 @@ import { parseVerdicts, readVerdictsFile, verifierSection, VERDICTS_FILE } from 
 /** The module name the planner raises decisions as. */
 export const DECISION_MODULE = "planner";
 
+/** The reason a proposal gets when the verifier's file has no verdict for it (not a verdict the verifier gave) */
+export const NO_VERDICT_REASON = "no verdict from verifier";
+
 /** A run's prompt is at most this long (the agents module's limit is 200,000) */
 const PROMPT_LIMIT = 190_000;
 const MAX_TRIGGERS = 50;
@@ -1358,7 +1361,7 @@ export class PlannerService {
         this.store.setVerifierVerdict(p.id, v.verdict, v.reason, v.evidence);
       } else {
         // No verdict: treat as unsure
-        this.store.setVerifierVerdict(p.id, "unsure", "no verdict from verifier", null);
+        this.store.setVerifierVerdict(p.id, "unsure", NO_VERDICT_REASON, null);
       }
     }
 

@@ -937,6 +937,26 @@ export class ReviewStore {
     return row?.head_sha ?? null;
   }
 
+  /**
+   * For AI spend's classes: whether `reviewer` recorded a review of the PR head that starts with `headPrefix`
+   * between two ISO times (a review run's span), and that head in full (from the review or its assignment; null
+   * when neither is known).
+   */
+  reviewDuring(project: string, pr: number, headPrefix: string, reviewer: string, fromIso: string, toIso: string): { recorded: boolean; headSha: string | null } {
+    const n = headPrefix.length;
+    const review = this.db
+      .prepare(
+        `SELECT head_sha FROM review_reviews WHERE project = ? AND pr = ? AND reviewer_id = ? AND substr(head_sha, 1, ?) = ?
+           AND created_at >= ? AND created_at <= ? LIMIT 1`,
+      )
+      .get(project, pr, reviewer, n, headPrefix, fromIso, toIso) as { head_sha: string } | undefined;
+    if (review) return { recorded: true, headSha: review.head_sha };
+    const assigned = this.db
+      .prepare(`SELECT head_sha FROM review_agent_assignments WHERE project = ? AND pr = ? AND substr(head_sha, 1, ?) = ? LIMIT 1`)
+      .get(project, pr, n, headPrefix) as { head_sha: string } | undefined;
+    return { recorded: false, headSha: assigned?.head_sha ?? null };
+  }
+
   // ============ REVIEWS BY AGENTS ============
 
   /**

@@ -54,6 +54,9 @@ import type {
   LockView,
   ProviderUnreachableView,
   RunOrigin,
+  SpendGroupBy,
+  SpendReportView,
+  SpendWindow,
   StopReason,
 } from "../../shared/agents-types.js";
 import type { Decision } from "../../shared/decision-types.js";
@@ -69,7 +72,7 @@ import { WatchdogStore } from "../watchdog/store.js";
 import { ProjectView } from "../watchdog/view.js";
 import type { ProjectEntry } from "../watchdog/service.js";
 import type { SupervisedAgents } from "../watchdog/types.js";
-import { backoffMs, MODEL_ID, parseAgentsConfig, type AgentLockSettings, type AgentsSettings } from "./config.js";
+import { backoffMs, fillPatternFor, MODEL_ID, parseAgentsConfig, type AgentLockSettings, type AgentsSettings } from "./config.js";
 import {
   agentLimits,
   describeUsage,
@@ -82,6 +85,7 @@ import {
   InboxFileDecisions,
   ProducerDecisions,
   escalationDecisionKey,
+  guardDecisionKey,
   type DecisionInbox,
   type DecisionRequest,
 } from "./decisions.js";
@@ -118,7 +122,9 @@ import {
   type ProcessOwner,
 } from "./probes.js";
 import { extractHungLogLines, extractLastTool, lastLines, moveSessionAside, resumeSummary, sessionDirFor, utcStamp } from "./sessions.js";
-import { SpendRecorder, type ModelCall } from "./spend.js";
+import { countsTowardCap, endKindOf, originOf, SpendRecorder, type ModelCall, type SpendNotice } from "./spend.js";
+import type { SpendFacts } from "./spend-classify.js";
+import { guardModes, spendReport, SpendReportError } from "./spend-report.js";
 import { AgentsStore, type ClaimResult, type HungInfo } from "./store.js";
 import {
   claimView,
@@ -130,8 +136,12 @@ import {
   type Claim,
   type FailoverInfo,
   type RunEndKind,
+  type SpendRow,
   type StoredLockWait,
 } from "./types.js";
+
+/** The one option of an AI spend notice */
+const SPEND_NOTICE_NOTED = "noted";
 import { commandFingerprint, findTaskProcess, reconcileRun, runPromptFileName } from "./reconcile.js";
 import type { ProcessInfo, ProcessReading } from "../watchdog/probes.js";
 import type { ReadyFactsSource } from "../ready-guard/guard.js";
@@ -164,6 +174,20 @@ export const DECISION_WAIT = "wait";
 export const DECISION_STOP = "stop";
 export const DECISION_ALLOW = "allow";
 export const DECISION_RETRY_NOW = "retry_now";
+/** A task a guard parked (G2, G4): it stays parked, the owner's pause */
+export const DECISION_GUARD_KEEP = "keep_parked";
+/** Runs of a task a guard reads (G2, G4) */
+const GUARD_RUNS = 500;
+
+/** A guard's verdict on a task's failed runs (G2, G4: docs/design/ai-spend.md §4.5) */
+interface FailedRunVerdict {
+  guard: "task_no_result_cap" | "hung_repeat";
+  mode: "observe" | "act";
+  /** The runs it counted, oldest first, the one that ended now last */
+  counted: AgentRun[];
+  max: number;
+  windowMs: number;
+}
 
 /** In the detail of a run that waits for its tool's sign-in */
 const SIGNED_OUT_DETAIL = "not signed in on this machine";
@@ -427,6 +451,8 @@ export interface AgentsServiceOptions {
   sweepBusTokens?: (activeRunIds: () => string[]) => Promise<void>;
   /** What the ready guard reads a PR from (read on each use); undefined: the project has no git host to ask */
   readyFacts?: () => ReadyFactsSource | undefined;
+  /** What the review, planner and supervisor modules recorded about their runs (AI spend's classes; read on each use) */
+  spendFacts?: () => SpendFacts | undefined;
   /** The project's bus as fill reads it (bus.consume observe or on; read at each check), or null */
   bus?: () => BusLineSource | null;
   /** This server's URL, given as LAIR_URL to a run that gets a bus token (unless a module gave it one) */
@@ -484,6 +510,8 @@ export class AgentsService {
   private reconciled = new Set<string>();
   /** AI spend (agents.spend): a record per ended run, written after its end, and module model calls */
   private spend: SpendRecorder;
+  /** What other modules recorded about their runs, for AI spend's classes */
+  private spendFacts?: () => SpendFacts | undefined;
   lastTick?: AgentsTickSummary;
   lastError?: string;
 
@@ -502,6 +530,7 @@ export class AgentsService {
     this.sweepBusTokens = options.sweepBusTokens;
     this.bus = options.bus;
     this.busServerUrl = options.busServerUrl;
+    this.spendFacts = options.spendFacts;
     this.watchdogSettings = watchdogSettingsFor(options.config, options.settings.hungMinutes);
     // Usage reaches the per-agent and per-project budgets through the fleet budget
     this.unsubscribe =
@@ -528,6 +557,12 @@ export class AgentsService {
       budget: this.budget,
       outcome: (run) => this.reportedOutcome(run),
       record: (kind, input, at) => this.record(kind, input, at),
+      facts: () => options.spendFacts?.(),
+      guardModes: () => guardModes(this.config as { agents?: unknown; planner?: unknown }),
+      notice: (notice) => this.spendNotice(notice),
+      emit: async (type, data) => {
+        await this.events?.emit(type, data);
+      },
       warn: (line) => console.warn(line),
     });
     if (options.settings.fill.enabled) {
@@ -834,7 +869,70 @@ export class AgentsService {
     ["chain", (decision: Decision, chainId: string) => this.chainMoot(decision, chainId)],
     ["transient", (decision: Decision, provider: string) => this.outageMoot(decision, provider)],
     ["signin", (_decision: Decision, tool: string) => this.signInMoot(tool)],
+    // AI spend's notices: a day's waste once the day is over, a task's attempts once it completed or was released
+    ["spend", (_decision: Decision, rest: string) => this.spend.moot(rest)],
   ]);
+
+  /**
+   * One AI spend notice (attention: notice: nothing waits on an answer, and the notifier never sends it outside
+   * Lair). Only through the Decision Inbox: the inbox file is for questions, and this asks none.
+   */
+  private async spendNotice(notice: SpendNotice): Promise<boolean> {
+    const inbox = this.decisions();
+    if (!inbox.find) return false;
+    return this.raiseAt(
+      {
+        kind: "other",
+        attention: "notice",
+        question: notice.question,
+        context: notice.context,
+        options: [
+          {
+            id: SPEND_NOTICE_NOTED,
+            label: "Noted",
+            consequences: "The notice closes. Nothing else changes.",
+            effect: "reversible",
+          },
+        ],
+        recommended: SPEND_NOTICE_NOTED,
+        why: "Nothing is decided here: it is for your information, and it goes by itself once its condition clears.",
+        reversible: true,
+        key: notice.key,
+        ref: notice.ref,
+        structure: {
+          class: "agents.spend_notice",
+          evidence: { code: notice.code ?? "spend_notice", facts: notice.facts ?? {}, cause_cleared: false, linked_issue: null },
+        },
+      },
+      this.probes.clock.now(),
+    );
+  }
+
+  /** GET /api/agents/spend: 404 while agents.spend is off; 400 for a long window by task. */
+  spendReport(window: SpendWindow, by: SpendGroupBy): SpendReportView {
+    if (!this.spend.enabled) throw new AgentsError(404, "agents.spend.enabled is off: set it to true to record AI spend");
+    try {
+      return spendReport({
+        store: this.store,
+        project: this.project,
+        window,
+        by,
+        now: this.probes.clock.now(),
+        retentionDays: this.settings.spend.retentionDays,
+        facts: this.spendFacts?.(),
+        modes: guardModes(this.config as { agents?: unknown; planner?: unknown }),
+      });
+    } catch (e) {
+      if (e instanceof SpendReportError) throw new AgentsError(400, e.message);
+      throw e;
+    }
+  }
+
+  /** GET /api/agents/spend/runs: a task's run rows (all of the project's without one), the latest first. */
+  spendRuns(task: string | undefined, limit: number): SpendRow[] {
+    if (!this.spend.enabled) throw new AgentsError(404, "agents.spend.enabled is off: set it to true to record AI spend");
+    return this.store.listSpend(this.project, { task, limit });
+  }
 
   /** A tool's sign-in decision (ref `signin:<tool>`) is moot once its check says it is signed in here. */
   private signInMoot(tool: string): string | null {
@@ -864,6 +962,11 @@ export class AgentsService {
     const chain = this.store.chainRuns(chainId);
     const last = chain[chain.length - 1];
     if (!last) return "its runs are gone";
+    if (decision.key.startsWith("guard:")) {
+      // A park (G2, G4) stands until the task runs again some other way
+      const latest = this.store.latestRunForTask(this.project, last.task);
+      return latest && latest.id !== decision.key.slice(decision.key.lastIndexOf(":") + 1) ? `${last.task} started again as run ${short(latest.id)}` : null;
+    }
     if (decision.key.startsWith("escalation:")) {
       const attempts = Number(decision.key.slice(decision.key.lastIndexOf(":") + 1));
       const latest = this.store.latestRunForTask(this.project, last.task);
@@ -1044,6 +1147,7 @@ export class AgentsService {
       return "the runs waiting on the provider start on the next check";
     }
     const chain = ref.startsWith("chain:") ? this.store.chainRuns(ref.slice("chain:".length)) : [];
+    if (key.startsWith("guard:")) return this.answerPark(key, chain, optionId, t);
     const latest = chain[chain.length - 1];
     if (!latest) return "its task is gone";
     if (key.startsWith("escalation:")) {
@@ -1069,6 +1173,32 @@ export class AgentsService {
       return `run ${short(waiting.id)} stopped; the task is free`;
     }
     return "nothing to do";
+  }
+
+  /**
+   * The answer to a guard's park (key `guard:<guard>:<run>`, G2 and G4): "start_again" releases fill's hold (G2's
+   * no-result count starts over: it counts from the task's last release), "release" releases it too (G4), a fresh
+   * session starts the task again in one (the hung info and a resume summary in its prompt), "keep_parked" makes it
+   * the owner's pause. Nothing changes once the task moved on.
+   */
+  private async answerPark(key: string, chain: AgentRun[], optionId: string, t: Tick): Promise<string> {
+    const parked = chain.find((r) => r.id === key.slice(key.lastIndexOf(":") + 1));
+    if (!parked) return "its task is gone";
+    if (this.store.latestRunForTask(this.project, parked.task)?.id !== parked.id) return "the task has moved on since: nothing to change";
+    if (optionId === DECISION_GUARD_KEEP) {
+      await this.recordFillPause(parked.task, parked, 'you chose "Keep it parked"', t.now);
+      return "the task stays parked until you release it";
+    }
+    if (this.readOnly) return "the project is read_only: Lair starts no agents";
+    if (optionId === DECISION_FRESH) {
+      const next = await this.restartFresh(parked, t, "the owner chose a fresh session");
+      return `started again as run ${short(next.id)} in a fresh session`;
+    }
+    if (optionId !== DECISION_FILL_START && optionId !== DECISION_RELEASE) return "nothing to do";
+    await this.recordFillRelease(parked.task, parked, "decision", t.now);
+    return optionId === DECISION_FILL_START
+      ? "fill starts the task again on its next check, and its count of runs with no result starts over"
+      : "fill starts the task again on its next check, in a new session";
   }
 
   /** A budget line the owner allowed runs past, for its period. */
@@ -1111,8 +1241,10 @@ export class AgentsService {
       await this.reapLocks(t);
       const activeChains = new Set(this.store.activeRuns(this.project).map((run) => run.chainId));
       for (const chain of this.moduleVars.keys()) if (!activeChains.has(chain)) this.moduleVars.delete(chain);
-      // agents.spend: the spend rows of runs that ended (bounded per tick; it never throws)
+      // agents.spend: the spend rows of runs that ended, then their classes, the daily summary, retention and the
+      // notices (each bounded per tick; neither throws)
       await this.spend.drain();
+      await this.spend.maintain();
     }
     // A question whose chain moved on is moot: withdrawn, so nothing is left waiting for the owner by mistake
     await this.withdrawMoot(t);
@@ -1665,9 +1797,10 @@ export class AgentsService {
     t.summary.ended++;
     const r = this.settings.retries;
     const retry = run.startRetries < r.maxRetries;
-    const next = retry
-      ? this.followUp(run, t.now, t.now + backoffMs(run.startRetries + 1, r.backoffSeconds, r.maxBackoffSeconds))
-      : null;
+    // G2 (§4.5): a task at its no-result cap is parked (act), not retried
+    const parked = retry && (await this.guardFailed(run, t));
+    const next =
+      retry && !parked ? this.followUp(run, t.now, t.now + backoffMs(run.startRetries + 1, r.backoffSeconds, r.maxBackoffSeconds)) : null;
     await this.record(
       "never_started",
       {
@@ -1686,6 +1819,7 @@ export class AgentsService {
       },
       t.now,
     );
+    if (parked) return true;
     if (!next) {
       this.store.saveRun(run);
       await this.escalate(run, `never started in ${run.startRetries + 1} attempt(s): ${reason}`, t, "dead_on_start");
@@ -1881,7 +2015,11 @@ export class AgentsService {
     const patterns = this.settings.fill;
     try {
       const until = queueWindowEnd(this.store, this.project, patterns, run, run);
-      return await reportedOutcome(await QueueLines.read(this.config.queue_file, this.bus?.() ?? null), patterns, run, until);
+      const outcome = await reportedOutcome(await QueueLines.read(this.config.queue_file, this.bus?.() ?? null), patterns, run, until);
+      if (outcome?.kind !== "blocked") return outcome;
+      // The gate a BLOCKED line names (its pattern's (?<wake>...)), for AI spend's blocker key
+      const gate = fillPatternFor(patterns.blockedPattern, run.task, run.agent).regex.exec(outcome.line)?.groups?.wake?.trim() || null;
+      return { ...outcome, wake: gate };
     } catch {
       return null; // a pattern that doesn't compile for this task: no line found
     }
@@ -2077,8 +2215,11 @@ export class AgentsService {
       );
     }
 
+    // G4 and G2 (docs/design/ai-spend.md §4.5): a guard in act mode parks the task here, and nothing restarts it
+    if (kind !== "fresh_session" && (await this.guardFailed(run, t))) return;
+
     const r = this.settings.recovery;
-    const mode =
+    let mode: "resume" | "fresh" | null =
       kind === "fresh_session"
         ? "fresh"
         : run.sameSessionRestarts < r.sameSessionRestarts
@@ -2086,6 +2227,9 @@ export class AgentsService {
           : run.freshSessions < r.freshSessions
             ? "fresh"
             : null;
+    // G4's `first` (its own switch, in any mode): the task's first hang within the window restarts in a fresh
+    // session, with the hung info and a resume summary, instead of resuming the stuck context
+    if (mode === "resume" && kind === "hung" && r.hungRepeat.first === "fresh" && this.hangsOf(run, t.now).length === 1) mode = "fresh";
     if (mode === null) {
       this.store.saveRun(run);
       await this.escalate(run, `${kind.replace(/_/g, " ")}: ${detail}`, t);
@@ -2242,6 +2386,230 @@ export class AgentsService {
     );
   }
 
+  // ============ GUARDS ON FAILED RUNS (G2, G4) ============
+
+  /**
+   * G4 (hung_repeat), then G2 (task_no_result_cap), right before a failed run's chain would go on (a restart, a
+   * failover, a retry; docs/design/ai-spend.md §4.5). `run` has ended and isn't saved yet. Observe records what a
+   * guard would do, once per task and streak, and the chain goes on as before. True: a guard in act mode parked
+   * the task, and the caller starts nothing more for it.
+   */
+  private async guardFailed(run: AgentRun, t: Tick): Promise<boolean> {
+    for (const verdict of [this.hungRepeat(run, t.now), this.noResultCap(run, t.now)]) {
+      if (!verdict) continue;
+      if (verdict.mode === "act") {
+        await this.park(run, verdict, t);
+        return true;
+      }
+      await this.wouldPark(run, verdict, t);
+    }
+    return false;
+  }
+
+  /** The task's ended runs (every chain) that ended at or after `since`, `run` included as it is now. */
+  private endedSince(run: AgentRun, since: number): AgentRun[] {
+    // A run requested up to a day before may have ended in the window (a hung one runs for its hung_minutes)
+    const runs = this.store.taskRunsSince(this.project, run.task, since - 86_400_000, GUARD_RUNS).filter((r) => r.id !== run.id);
+    return [...runs, run].filter((r) => !isActive(r.state) && r.endedAt !== undefined && r.endedAt >= since);
+  }
+
+  /** G4: the task's hangs within hung_repeat.window_hours, `run` included. */
+  private hangsOf(run: AgentRun, now: number): AgentRun[] {
+    return this.endedSince(run, now - this.settings.recovery.hungRepeat.windowMs).filter((r) => endKindOf(r) === "hung");
+  }
+
+  private hungRepeat(run: AgentRun, now: number): FailedRunVerdict | null {
+    const g = this.settings.recovery.hungRepeat;
+    if (g.mode === "off" || endKindOf(run) !== "hung") return null;
+    const counted = this.hangsOf(run, now);
+    return counted.length >= g.maxPerTask ? { guard: "hung_repeat", mode: g.mode, counted, max: g.maxPerTask, windowMs: g.windowMs } : null;
+  }
+
+  /**
+   * G2: the task's no-result runs within the window, across its chains, since its hold was last released (start
+   * again resets the count). Not counted (decision D2): a run that ended while its provider was in a fleet outage or
+   * cooldown, a Lair restart's (exit_unknown, lost, vars_lost), a stop, and a superseded run (it never ran).
+   */
+  private noResultCap(run: AgentRun, now: number): FailedRunVerdict | null {
+    const g = this.settings.spend.guards.taskNoResultCap;
+    if (g.mode === "off" || !countsTowardCap(run) || this.fleetFailure(run)) return null;
+    const released = this.store.listEvents(this.project, { kinds: ["fill_released"], task: run.task, limit: 1 })[0]?.at ?? 0;
+    const counted = this.endedSince(run, Math.max(now - g.windowMs, released + 1)).filter((r) => countsTowardCap(r) && !this.fleetFailure(r));
+    return counted.length >= g.max ? { guard: "task_no_result_cap", mode: g.mode, counted, max: g.max, windowMs: g.windowMs } : null;
+  }
+
+  /**
+   * Whether a run ended while its provider was the fleet's problem (D2): in a fleet outage (the latest `transient`
+   * event of its provider by its end says fleet, with no `transient_cleared` after it), or, for a rate limit or a
+   * provider error, in a cooldown two or more agents' failovers made fleet-wide (as coolingUntil reads it).
+   */
+  private fleetFailure(run: AgentRun): boolean {
+    const at = run.endedAt ?? 0;
+    const provider = run.profile.provider;
+    const [outage] = this.store.listEvents(this.project, { kinds: ["transient", "transient_cleared"], subject: provider, until: at, limit: 1 });
+    if (outage?.kind === "transient" && outage.data.fleet === true) return true;
+    const end = endKindOf(run);
+    const cooldown = this.settings.failover.cooldownMinutes * 60000;
+    if ((end !== "rate_limit" && end !== "provider_error") || cooldown <= 0) return false;
+    const agents = new Set(
+      this.store
+        .listEvents(this.project, { kinds: ["failover"], subject: provider, since: at - cooldown, until: at, limit: 100 })
+        .filter((e) => e.data.kind === "rate_limit" || e.data.kind === "provider_error")
+        .map((e) => e.agent ?? ""),
+    );
+    agents.add(run.agent);
+    return agents.size >= 2;
+  }
+
+  /** What a verdict says, for its event, notice and decision: numbers, ids and end kinds only. */
+  private verdictText(run: AgentRun, v: FailedRunVerdict): { what: string; key: string; evidence: string[]; data: Record<string, unknown> } {
+    const hours = Math.round((v.windowMs / 3_600_000) * 100) / 100;
+    const key = v.guard === "hung_repeat" ? "agents.recovery.hung_repeat.max_per_task" : "agents.spend.guards.task_no_result_cap.max";
+    const what = `${v.counted.length} ${v.guard === "hung_repeat" ? "hang(s)" : "run(s) with no result"} of ${run.task} within ${hours} h (${key} ${v.max})`;
+    const evidence = v.counted.map((r) => `run ${short(r.id)} (chain ${short(r.chainId)}): ${endKindOf(r)} at ${iso(r.endedAt ?? 0)}`);
+    const data = {
+      guard: v.guard,
+      task: run.task,
+      count: v.counted.length,
+      max: v.max,
+      windowHours: hours,
+      runs: v.counted.map((r) => r.id),
+      ends: v.counted.map((r) => endKindOf(r)),
+    };
+    return { what, key, evidence, data };
+  }
+
+  /**
+   * Observe: one guard_would event and one notice per task and streak (none of this guard's for the task since the
+   * first run it counts now), and nothing else changes.
+   */
+  private async wouldPark(run: AgentRun, v: FailedRunVerdict, t: Tick): Promise<void> {
+    const since = v.counted[0]?.endedAt ?? t.now;
+    const earlier = this.store.listEvents(this.project, { kinds: ["guard_would"], task: run.task, since, limit: 50 });
+    if (earlier.some((e) => e.data.guard === v.guard)) return;
+    const { what, evidence, data } = this.verdictText(run, v);
+    const recorded = await this.record(
+      "guard_would",
+      {
+        agent: run.agent,
+        task: run.task,
+        runId: run.id,
+        subject: run.task,
+        summary: `${v.guard} (observe): ${what}: would park ${run.task}; it goes on as before`,
+        evidence,
+        data: { ...data, verdict: "would_park" },
+        dedupeKey: `guard_would:${v.guard}:${run.id}`,
+      },
+      t.now,
+    );
+    if (!recorded) return;
+    await this.spendNotice({
+      key: `guard_would:${v.guard}:${run.id}`,
+      ref: `spend:guard:${t.now}:${run.task}`,
+      question: `${v.guard} would park ${run.task}: ${what}`,
+      code: "would_park",
+      facts: { guard: v.guard, task: run.task, count: v.counted.length, max: v.max, window_hours: Math.round((v.windowMs / 3_600_000) * 100) / 100 },
+      context: [
+        `In act mode Lair would park ${run.task} here, with one decision, instead of starting it again. It is in observe mode, so it goes on as before.`,
+        "",
+        ...evidence.map((line) => `- ${line}`),
+      ].join("\n"),
+    });
+  }
+
+  /**
+   * Act: the task is parked. Its chain ends here, a guard_did event says why, and one decision asks the owner: a
+   * fill task's claim is released and fill holds it (`no_result_cap` or `hung_repeat`) on the guard's decision;
+   * any other run is escalated through the existing path (its module's own caps still apply).
+   */
+  private async park(run: AgentRun, v: FailedRunVerdict, t: Tick): Promise<void> {
+    const { what, evidence, data } = this.verdictText(run, v);
+    run.detail = `${run.detail}; parked by ${v.guard}: ${what}`;
+    this.store.saveRun(run);
+    await this.record(
+      "guard_did",
+      {
+        agent: run.agent,
+        task: run.task,
+        runId: run.id,
+        subject: run.task,
+        summary: `${v.guard}: ${what}: ${run.task} is parked, not started again`,
+        evidence,
+        data: { ...data, verdict: "park" },
+        dedupeKey: `guard_did:${v.guard}:${run.id}`,
+      },
+      t.now,
+    );
+    if (originOf(run) !== "fill") {
+      await this.escalate(run, `${v.guard}: ${what}`, t);
+      return;
+    }
+    this.store.releaseClaim(this.project, run.task, run.id);
+    const hung = v.guard === "hung_repeat";
+    const options: DecisionRequest["options"] = hung
+      ? [
+          {
+            id: DECISION_FRESH,
+            effect: "reversible",
+            label: "Start a fresh session",
+            consequences: `Lair starts ${run.task} again for ${run.agent} in a fresh session (the old one moved aside), with what it was doing when it hung and a resume summary. Another hang within the window parks it again.`,
+          },
+          { id: DECISION_GUARD_KEEP, effect: "reversible", label: "Keep it parked", consequences: `Fill leaves ${run.task} paused until you release it in Work.` },
+          {
+            id: DECISION_RELEASE,
+            effect: "reversible",
+            label: "Release the hold",
+            consequences: `Fill starts ${run.task} again on its next check, in a new session. Another hang within the window parks it again.`,
+          },
+        ]
+      : [
+          {
+            id: DECISION_FILL_START,
+            effect: "reversible",
+            label: "Start it again",
+            consequences: `Fill starts ${run.task} again on its next check, and its count of runs with no result starts over.`,
+          },
+          {
+            id: DECISION_FRESH,
+            effect: "reversible",
+            label: "Start a fresh session",
+            consequences: `Lair starts ${run.task} again for ${run.agent} in a fresh session (the old one moved aside), with a resume summary. The count goes on: one more run with no result parks it again.`,
+          },
+          { id: DECISION_GUARD_KEEP, effect: "reversible", label: "Keep it parked", consequences: `Fill leaves ${run.task} paused until you release it in Work.` },
+        ];
+    await this.raise(
+      {
+        kind: "escalation",
+        key: guardDecisionKey(v.guard, run.id),
+        ref: `chain:${run.chainId}`,
+        blocks: [`agents:${this.project}:task:${run.task}`],
+        question: `${run.agent} is parked on ${run.task}: ${what}`,
+        context: [
+          `${v.guard}: Lair stopped starting ${run.task} again. The runs it counted:`,
+          "",
+          ...evidence.map((line) => `- ${line}`),
+        ].join("\n"),
+        options,
+        recommended: DECISION_GUARD_KEEP,
+        structure: {
+          class: "agents.gave_up",
+          evidence: {
+            code: "repeated_failure",
+            facts: { agent: run.agent, task: run.task, attempt_count: v.counted.length, last_exit: run.exitCode ?? null },
+            cause_cleared: false,
+            linked_issue: null,
+          },
+        },
+        why: hung
+          ? "The task hung again: resuming the same context would most likely hang the same way."
+          : "The task keeps failing: starting it again the same way would repeat the failures.",
+        reversible: true,
+      },
+      t,
+      run,
+    );
+  }
+
   // ============ FAILOVER ============
 
   /**
@@ -2267,7 +2635,9 @@ export class AgentsService {
       : chooseProfile(profiles, run.profileIndex + 1, true, (p) =>
           p.provider === run.profile.provider ? `provider ${p.provider} just failed` : this.unusable(p, run.agent, t.now),
         );
-    const next = capped ? null : this.followUp(run, t.now, t.now);
+    // G2 (§4.5): a task at its no-result cap is parked (act), not failed over
+    const parked = !capped && (await this.guardFailed(run, t));
+    const next = capped || parked ? null : this.followUp(run, t.now, t.now);
     if (next) {
       next.sessionMode = "new";
       next.sessionId = randomUUID();
@@ -2297,7 +2667,9 @@ export class AgentsService {
         subject: run.profile.provider,
         summary: capped
           ? `${run.agent} on ${run.task}: ${failoverLabel(info.kind)} on ${profileLabel(run.profile)}; ${done} failovers already: escalating`
-          : chosen
+          : parked
+            ? `${run.agent} on ${run.task}: ${failoverLabel(info.kind)} on ${profileLabel(run.profile)}; the task is parked at its no-result cap`
+            : chosen
             ? `${run.agent} on ${run.task}: ${failoverLabel(info.kind)} on ${profileLabel(run.profile)}; switched to ${profileLabel(chosen.profile)}`
             : `${run.agent} on ${run.task}: ${failoverLabel(info.kind)} on ${profileLabel(run.profile)}; no fallback left`,
         evidence: [`log line: ${oneLine(info.line)}`, ...skipped],
@@ -2305,12 +2677,13 @@ export class AgentsService {
           kind: info.kind,
           line: info.line,
           from: run.profile,
-          to: chosen?.profile ?? null,
+          to: next ? (chosen?.profile ?? null) : null,
           fromIndex: run.profileIndex,
-          toIndex: chosen?.index ?? null,
+          toIndex: next ? (chosen?.index ?? null) : null,
           nextRunId: next?.id ?? null,
           failovers: done + 1,
           capped,
+          ...(parked ? { parked: true } : {}),
           coolingUntil: cooldown > 0 ? iso(t.now + cooldown) : null,
         },
       },
@@ -2318,6 +2691,7 @@ export class AgentsService {
     );
     t.summary.failovers++;
     this.store.saveRun(run);
+    if (parked) return;
     if (!next) {
       await this.escalate(run, `${done + 1} provider errors or rate limits in a row (failover.max_failovers is ${this.settings.failover.maxFailovers}): ${oneLine(info.line, 200)}`, t, "provider_limit");
       return;
@@ -2638,6 +3012,8 @@ export class AgentsService {
       t.now,
     );
 
+    // G2 (§4.5): a death the fleet's outage explains isn't counted; one that is, at the cap, parks the task (act)
+    if (await this.guardFailed(run, t)) return;
     const next = this.followUp(run, t.now, t.now);
     next.transientRetries = used + 1;
     if (run.spawnedAt !== undefined && lived >= this.settings.deadOnStartSeconds * 1000) {
@@ -3754,6 +4130,17 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
     this.readyFacts = facts;
   }
 
+  private spendFacts: SpendFacts | null = null;
+
+  /**
+   * What the review, planner and supervisor modules recorded about the runs they asked for, read by AI spend to
+   * classify those runs (a review recorded, proposals, verdicts, an answer). Read on each use, so it may be set after
+   * load(); without it their runs stay unclassified.
+   */
+  useSpendFacts(facts: SpendFacts): void {
+    this.spendFacts = facts;
+  }
+
   /** Raise decisions through `inbox` instead (a stand-in for the Decision Inbox, in tests). */
   setDecisionInbox(inbox: DecisionInbox): void {
     this.decisions = inbox;
@@ -3834,6 +4221,7 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
           events: this.options.events,
           tools: this.options.tools,
           readyFacts: () => this.readyFacts?.(entry.name, config),
+          spendFacts: () => this.spendFacts ?? undefined,
           ...this.busOptions(entry.name),
         }),
       );

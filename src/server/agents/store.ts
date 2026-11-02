@@ -149,6 +149,50 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_agents_spend_pending ON agents_spend_pending(project, ended_at);
 `;
 
+/** What spend sums can be grouped by, and the column each is (a fixed map: never a column name from a request) */
+const SPEND_GROUP_COLUMNS = {
+  project: "project",
+  agent: "agent",
+  task: "task",
+  reason: "reason",
+  origin: "origin",
+  provider: "provider",
+} as const;
+export type SpendGroupColumn = keyof typeof SPEND_GROUP_COLUMNS;
+
+/** Spend summed for one group, class and reason (numbers only; null where no run reported the unit) */
+export interface SpendCell {
+  g: string;
+  class: string;
+  reason: string;
+  runs: number;
+  reloads: number;
+  lairRestarts: number;
+  requests: number | null;
+  turns: number | null;
+  minutes: number;
+  tokens: number | null;
+  cost: number | null;
+  reportedRuns: number;
+}
+
+export interface SpendTaskStreak {
+  task: string;
+  attempts: number;
+  noResult: number;
+  chains: number;
+  firstEndedAt: number;
+  lastEndedAt: number;
+}
+
+export interface SpendReviewHead {
+  pr: number;
+  head: string;
+  runs: number;
+  reviews: number;
+  failed: number;
+}
+
 interface SpendRowDb {
   run_id: string;
   project: string;
@@ -413,6 +457,17 @@ export class AgentsStore {
     );
   }
 
+  /** A task's runs requested since `since`, in every chain, the latest `limit` of them, oldest first. */
+  taskRunsSince(project: string, task: string, since: number, limit: number): AgentRun[] {
+    return this.runs(
+      `SELECT data FROM agents_runs WHERE project = ? AND task = ? AND requested_at >= ? ORDER BY requested_at DESC, rowid DESC LIMIT ?`,
+      project,
+      task,
+      since,
+      limit,
+    ).reverse();
+  }
+
   /** The first run of `agent` on another task than `task` requested after the run `after`, or null. */
   firstRunForAgentAfter(project: string, agent: string, task: string, after: AgentRun): AgentRun | null {
     return (
@@ -609,6 +664,8 @@ export class AgentsStore {
       runId?: string;
       subject?: string;
       since?: number;
+      /** At or before this time */
+      until?: number;
       limit?: number;
     } = {},
   ): AgentEvent[] {
@@ -637,6 +694,10 @@ export class AgentsStore {
     if (options.since !== undefined) {
       where.push("at >= ?");
       params.push(options.since);
+    }
+    if (options.until !== undefined) {
+      where.push("at <= ?");
+      params.push(options.until);
     }
     params.push(options.limit ?? 100);
     const rows = this.db
@@ -753,6 +814,11 @@ export class AgentsStore {
       .run(error.slice(0, 500), retryAt, runId);
   }
 
+  /** Whether a run's spend row is owed (marked when it ended while spend was on, not written yet). */
+  isSpendPending(runId: string): boolean {
+    return this.db.prepare(`SELECT 1 FROM agents_spend_pending WHERE run_id = ?`).get(runId) !== undefined;
+  }
+
   dropSpendPending(runId: string): void {
     this.db.prepare(`DELETE FROM agents_spend_pending WHERE run_id = ?`).run(runId);
   }
@@ -819,12 +885,206 @@ export class AgentsStore {
     return row ? toSpendRow(row) : null;
   }
 
-  /** A project's spend rows, the latest end first. */
-  listSpend(project: string, options: { since?: number; limit?: number } = {}): SpendRow[] {
-    const rows = this.db
-      .prepare(`SELECT * FROM agents_spend WHERE project = ? AND ended_at >= ? ORDER BY ended_at DESC, rowid DESC LIMIT ?`)
-      .all(project, options.since ?? 0, options.limit ?? 100) as SpendRowDb[];
+  /** A project's spend rows (one task's, with `task`), the latest end first. */
+  listSpend(project: string, options: { since?: number; limit?: number; task?: string } = {}): SpendRow[] {
+    const rows = (
+      options.task === undefined
+        ? this.db
+            .prepare(`SELECT * FROM agents_spend WHERE project = ? AND ended_at >= ? ORDER BY ended_at DESC, rowid DESC LIMIT ?`)
+            .all(project, options.since ?? 0, options.limit ?? 100)
+        : this.db
+            .prepare(`SELECT * FROM agents_spend WHERE project = ? AND task = ? AND ended_at >= ? ORDER BY ended_at DESC, rowid DESC LIMIT ?`)
+            .all(project, options.task, options.since ?? 0, options.limit ?? 100)
+    ) as SpendRowDb[];
     return rows.map(toSpendRow);
+  }
+
+  /** A task's spend rows that ended before `before` (not `runId`'s), the latest first. */
+  taskSpendBefore(project: string, task: string, before: number, runId: string, limit: number): SpendRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM agents_spend WHERE project = ? AND task = ? AND ended_at <= ? AND run_id != ?
+         ORDER BY ended_at DESC, rowid DESC LIMIT ?`,
+      )
+      .all(project, task, before, runId, limit) as SpendRowDb[];
+    return rows.map(toSpendRow);
+  }
+
+  /**
+   * Rows still `unclassified/pending` that ended in [since, before) (`before` null: up to now), the latest first
+   * (their class waits on a record).
+   */
+  unclassifiedSpend(project: string, since: number, before: number | null, limit: number): SpendRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM agents_spend WHERE project = ? AND ended_at >= ? AND ended_at < ? AND class = 'unclassified' AND reason = 'pending'
+         ORDER BY ended_at DESC LIMIT ?`,
+      )
+      .all(project, since, before ?? Number.MAX_SAFE_INTEGER, limit) as SpendRowDb[];
+    return rows.map(toSpendRow);
+  }
+
+  /** Give an `unclassified` row its class (once: a classified row is never changed). True when it changed. */
+  classifySpend(runId: string, v: { class: SpendRow["class"]; reason: string; pr: number | null; headSha: string | null; blockerKey: string | null }): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE agents_spend SET class = ?, reason = ?, pr = COALESCE(?, pr), head_sha = COALESCE(?, head_sha),
+             blocker_key = COALESCE(?, blocker_key)
+           WHERE run_id = ? AND class = 'unclassified'`,
+        )
+        .run(v.class, v.reason, v.pr, v.headSha, v.blockerKey, runId).changes === 1
+    );
+  }
+
+  /**
+   * Spend summed per group (`groupBy` a column of agents_spend), class and reason, over runs that ended in
+   * [from, to). `aggregatedBefore` (a long window, which adds the daily aggregates of the days before it): a run that
+   * ended before it is left out when its day has an aggregate; the runs from it on are all counted. Numbers only.
+   */
+  spendCells(project: string, from: number, to: number, groupBy: SpendGroupColumn, aggregatedBefore: number | null = null): SpendCell[] {
+    const column = SPEND_GROUP_COLUMNS[groupBy];
+    const skip =
+      aggregatedBefore === null
+        ? ""
+        : `AND (s.ended_at >= ? OR NOT EXISTS (SELECT 1 FROM agents_spend_daily d WHERE d.project = s.project
+             AND d.day = strftime('%Y-%m-%d', s.ended_at / 1000, 'unixepoch')))`;
+    const params: number[] = aggregatedBefore === null ? [] : [aggregatedBefore];
+    return this.db
+      .prepare(
+        `SELECT ${column} AS g, class, reason, COUNT(*) AS runs, SUM(reload) AS reloads, SUM(lair_restart) AS lairRestarts,
+           SUM(requests) AS requests, SUM(turns) AS turns, SUM(runtime_s) / 60.0 AS minutes, SUM(tokens) AS tokens,
+           SUM(cost) AS cost, SUM(usage_source = 'reported') AS reportedRuns
+         FROM agents_spend s WHERE project = ? AND ended_at >= ? AND ended_at < ? ${skip}
+         GROUP BY g, class, reason`,
+      )
+      .all(project, from, to, ...params) as SpendCell[];
+  }
+
+  /** The daily aggregates summed the same way, for days in [fromDay, toDay) ("YYYY-MM-DD"); no per-task detail. */
+  spendDailyCells(project: string, fromDay: string, toDay: string, groupBy: Exclude<SpendGroupColumn, "task">): SpendCell[] {
+    const column = SPEND_GROUP_COLUMNS[groupBy];
+    return this.db
+      .prepare(
+        `SELECT ${column} AS g, class, reason, SUM(runs) AS runs, SUM(reloads) AS reloads, SUM(lair_restarts) AS lairRestarts,
+           SUM(requests) AS requests, SUM(turns) AS turns, SUM(minutes) AS minutes,
+           SUM(COALESCE(input_tokens, 0) + COALESCE(cache_write_tokens, 0) + COALESCE(output_tokens, 0))
+             * (CASE WHEN COUNT(input_tokens) + COUNT(cache_write_tokens) + COUNT(output_tokens) > 0 THEN 1 ELSE NULL END) AS tokens,
+           SUM(cost) AS cost, SUM(CASE WHEN cost IS NOT NULL OR input_tokens IS NOT NULL THEN runs ELSE 0 END) AS reportedRuns
+         FROM agents_spend_daily WHERE project = ? AND day >= ? AND day < ?
+         GROUP BY g, class, reason`,
+      )
+      .all(project, fromDay, toDay) as SpendCell[];
+  }
+
+  /**
+   * The tasks with the most attempts since their last completion (a DONE or READY run, or any productive run of a
+   * module's task), over runs that ended in [from, to), at least `min` of them.
+   */
+  spendTaskStreaks(project: string, from: number, to: number, min: number, limit: number): SpendTaskStreak[] {
+    return this.db
+      .prepare(
+        `SELECT task, COUNT(*) AS attempts, SUM(class = 'no_result') AS noResult, COUNT(DISTINCT chain_id) AS chains,
+           MIN(ended_at) AS firstEndedAt, MAX(ended_at) AS lastEndedAt
+         FROM agents_spend s WHERE project = ? AND ended_at >= ? AND ended_at < ?
+           AND NOT EXISTS (SELECT 1 FROM agents_spend c WHERE c.project = s.project AND c.task = s.task
+             AND c.ended_at >= s.ended_at AND c.class = 'productive'
+             AND (c.reason IN ('done', 'ready') OR c.origin IN ('review', 'planner', 'verifier', 'supervisor')))
+         GROUP BY task HAVING COUNT(*) >= ? ORDER BY attempts DESC, lastEndedAt DESC LIMIT ?`,
+      )
+      .all(project, from, to, min, limit) as SpendTaskStreak[];
+  }
+
+  /** When the task's last completion (as spendTaskStreaks counts one) ended, or null. */
+  lastSpendCompletion(project: string, task: string): number | null {
+    const row = this.db
+      .prepare(
+        `SELECT MAX(ended_at) AS at FROM agents_spend WHERE project = ? AND task = ? AND class = 'productive'
+           AND (reason IN ('done', 'ready') OR origin IN ('review', 'planner', 'verifier', 'supervisor'))`,
+      )
+      .get(project, task) as { at: number | null };
+    return row.at;
+  }
+
+  /** Review runs per PR head ([from, to)) for heads with more than one: runs, reviews recorded, failed runs. */
+  spendReviewHeads(project: string, from: number, to: number, limit: number): SpendReviewHead[] {
+    return this.db
+      .prepare(
+        `SELECT pr, substr(head_sha, 1, 8) AS head, COUNT(*) AS runs, SUM(reason = 'review_recorded') AS reviews,
+           SUM(class = 'no_result') AS failed
+         FROM agents_spend WHERE project = ? AND origin = 'review' AND pr IS NOT NULL AND head_sha IS NOT NULL
+           AND ended_at >= ? AND ended_at < ?
+         GROUP BY pr, head HAVING COUNT(*) > 1 ORDER BY runs DESC, pr DESC LIMIT ?`,
+      )
+      .all(project, from, to, limit) as SpendReviewHead[];
+  }
+
+  /** guard_would and guard_did events in [from, to), per guard (data.guard). */
+  guardCounts(project: string, from: number, to: number): { kind: "guard_would" | "guard_did"; guard: string | null; n: number }[] {
+    return this.db
+      .prepare(
+        `SELECT kind, json_extract(data, '$.guard') AS guard, COUNT(*) AS n FROM agents_events
+         WHERE project = ? AND at >= ? AND at < ? AND kind IN ('guard_would', 'guard_did') GROUP BY kind, guard`,
+      )
+      .all(project, from, to) as { kind: "guard_would" | "guard_did"; guard: string | null; n: number }[];
+  }
+
+  /**
+   * Write one UTC day's aggregates again from its per-run rows (`day` "YYYY-MM-DD", from `start` ms for 24 h): the
+   * day's old aggregate rows go first, so a group whose rows were classified since doesn't stay. Idempotent.
+   * `deleteRuns`: the day's per-run rows go in the same transaction (retention), so a day is never half deleted.
+   * The runs it summed (and deleted).
+   */
+  aggregateSpendDay(project: string, day: string, start: number, deleteRuns: boolean): number {
+    const tx = this.db.transaction((): number => {
+      const end = start + 86_400_000;
+      const runs = (
+        this.db.prepare(`SELECT COUNT(*) AS n FROM agents_spend WHERE project = ? AND ended_at >= ? AND ended_at < ?`).get(project, start, end) as {
+          n: number;
+        }
+      ).n;
+      if (runs === 0 && deleteRuns) return 0;
+      this.db.prepare(`DELETE FROM agents_spend_daily WHERE project = ? AND day = ?`).run(project, day);
+      this.db
+        .prepare(
+          `INSERT INTO agents_spend_daily (project, day, agent, origin, provider, class, reason, runs, reloads, lair_restarts,
+             requests, turns, minutes, input_tokens, cache_write_tokens, cache_read_tokens, output_tokens, cost)
+           SELECT project, ?, agent, origin, provider, class, reason, COUNT(*), SUM(reload), SUM(lair_restart),
+             SUM(requests), SUM(turns), SUM(runtime_s) / 60.0, SUM(input_tokens), SUM(cache_write_tokens),
+             SUM(cache_read_tokens), SUM(output_tokens), SUM(cost)
+           FROM agents_spend WHERE project = ? AND ended_at >= ? AND ended_at < ?
+           GROUP BY agent, origin, provider, class, reason`,
+        )
+        .run(day, project, start, end);
+      if (deleteRuns) this.db.prepare(`DELETE FROM agents_spend WHERE project = ? AND ended_at >= ? AND ended_at < ?`).run(project, start, end);
+      return runs;
+    });
+    return tx.immediate();
+  }
+
+  /** The earliest end of a per-run row before `before`, or null (the next day retention prunes). */
+  oldestSpendBefore(project: string, before: number): number | null {
+    const row = this.db.prepare(`SELECT MIN(ended_at) AS at FROM agents_spend WHERE project = ? AND ended_at < ?`).get(project, before) as {
+      at: number | null;
+    };
+    return row.at;
+  }
+
+  /** Delete the daily aggregates of days before `day`. The rows deleted. */
+  pruneSpendDaily(project: string, day: string): number {
+    return this.db.prepare(`DELETE FROM agents_spend_daily WHERE project = ? AND day < ?`).run(project, day).changes;
+  }
+
+  /** Ended runs requested in [from, to), after (requestedAt, id) for paging, oldest first: the backfill's input. */
+  runsRequestedBetween(project: string, from: number, to: number, after: { requestedAt: number; id: string } | null, limit: number): AgentRun[] {
+    const rows = this.db
+      .prepare(
+        `SELECT data FROM agents_runs WHERE project = ? AND requested_at >= ? AND requested_at < ?
+           AND (requested_at > ? OR (requested_at = ? AND id > ?))
+         ORDER BY requested_at, id LIMIT ?`,
+      )
+      .all(project, from, to, after?.requestedAt ?? -1, after?.requestedAt ?? -1, after?.id ?? "", limit) as { data: string }[];
+    return rows.map((row) => JSON.parse(row.data) as AgentRun);
   }
 
   // ============ HUNG INFO ============
