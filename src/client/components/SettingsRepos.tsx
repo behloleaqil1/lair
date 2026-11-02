@@ -205,7 +205,13 @@ export function SettingsRepos({ project, draft, errors, disabled, onDraft }: Pro
 }
 
 function TokenScopesCard({ status }: { status: TrackerStatusView | null }) {
-  if (!status) return null;
+  if (!status) {
+    return (
+      <Card title="Token scopes" className="mb-4">
+        <p className="muted">Loading token scopes...</p>
+      </Card>
+    );
+  }
   const { scopes } = status;
   if (!scopes.checked) {
     return (

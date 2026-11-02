@@ -86,7 +86,7 @@ export function reposOf(draft: Draft): RepoRow[] {
       isDefault: entry.default === true,
       base: typeof entry.base === "string" ? entry.base : null,
       ciCounts: entry.ci_counts !== false,
-      refs: Array.isArray(entry.refs) ? entry.refs.filter((r): r is string => typeof r === "string" && REF_PATTERN.test(r)) : [],
+      refs: Array.isArray(entry.refs) ? entry.refs.filter((r): r is string => typeof r === "string" && REF_PATTERN.test(r) && !RESERVED_REFS.has(r.toLowerCase())) : [],
     });
   }
   return rows;
