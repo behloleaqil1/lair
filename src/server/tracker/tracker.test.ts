@@ -841,6 +841,199 @@ describe("the GitHub client's answers (F7)", () => {
   });
 });
 
+const closedPullLists = (gh: FakeGitHub) => gh.requests.filter((r) => r.method === "GET" && r.path.endsWith("/pulls") && r.query.get("state") === "closed");
+const statusSets = (gh: FakeGitHub, from: number) => gh.requests.slice(from).filter((r) => r.graphql === "updateProjectV2ItemFieldValue");
+const issuePatches = (gh: FakeGitHub, from: number) => gh.requests.slice(from).filter((r) => r.method === "PATCH" && /\/issues\/\d+$/.test(r.path));
+
+describe("merges made outside the review module (#262 item 2)", () => {
+  it("a merged PR no review.merged announced (closing ref or branch name) moves its card to Done and closes the issue, once, also across a restart", async () => {
+    const gh = new FakeGitHub();
+    const board = gh.addBoard("acme", 1);
+    const login = gh.addIssue("acme/web", { title: "feat-login" });
+    const search = gh.addIssue("acme/web", { title: "feat-search" });
+    const options = { gh, tasks: ["worker-a|Alice|feat-login|Login form", "worker-b|Bob|feat-search|Search page"] };
+    const h = await rig(options);
+    await h.emit("agent.run.started", runStarted("feat-login"));
+    gh.addPull("acme/web", { number: 21, body: "No keywords here", headRef: "agent/worker-b/feat-search" });
+    await h.reconcile();
+    expect(gh.card(board, "acme/web", login.number)?.status).toBe("In progress");
+    expect(gh.card(board, "acme/web", search.number)?.status).toBe("In review");
+
+    // Merged by a script's push or the web UI: PR 20 was never seen open, PR 21 was; no review.merged for either
+    gh.addPull("acme/web", { number: 20, state: "closed", merged: true, body: `Fixes the form.\n\nCloses #${login.number}`, headRef: "fix/form" });
+    gh.closePull("acme/web", 21, true);
+    const before = gh.requests.length;
+    await h.reconcile();
+    expect(gh.card(board, "acme/web", login.number)?.status).toBe("Done");
+    expect(gh.card(board, "acme/web", search.number)?.status).toBe("Done");
+    expect(gh.issue("acme/web", login.number)).toMatchObject({ state: "closed", stateReason: "completed" });
+    expect(gh.issue("acme/web", search.number)).toMatchObject({ state: "closed", stateReason: "completed" });
+    expect(statusSets(gh, before)).toHaveLength(2);
+    expect(issuePatches(gh, before)).toHaveLength(2);
+    expect((await h.status()).links.every((l) => l.closedAs === "completed" && l.closedSynced && l.status === "done")).toBe(true);
+
+    // Seen again, and after a restart (the store on disk): nothing more is sent, and no closed PRs are read for finished tasks
+    const writes = gh.writes().length;
+    const lists = closedPullLists(gh).length;
+    await h.reconcile();
+    await h.manager.stop();
+    const again = await rig({ ...options, dir: h.dir });
+    await again.reconcile();
+    await again.emit("review.merged", reviewMerged(21));
+    expect(gh.writes()).toHaveLength(writes);
+    expect(closedPullLists(gh)).toHaveLength(lists);
+  });
+
+  it("a PR closed without merging leaves the card and the issue alone and is listed in the status; a later merge still finishes the task", async () => {
+    const gh = new FakeGitHub();
+    const board = gh.addBoard("acme", 1);
+    const issue = gh.addIssue("acme/web", { title: "feat-login" });
+    const h = await rig({ gh, tasks: ["worker-a|Alice|feat-login|Login form"] });
+    gh.addPull("acme/web", { number: 30, body: `Closes #${issue.number}`, headRef: "fix/one" });
+    await h.reconcile();
+    expect(gh.card(board, "acme/web", issue.number)?.status).toBe("In review");
+
+    gh.closePull("acme/web", 30, false);
+    const writes = gh.writes().length;
+    await h.reconcile();
+    await h.reconcile();
+    expect(gh.writes()).toHaveLength(writes);
+    expect(gh.card(board, "acme/web", issue.number)?.status).toBe("In review");
+    expect(gh.issue("acme/web", issue.number)?.state).toBe("open");
+    const status = await h.status();
+    expect(status.closedUnmerged).toEqual([{ task: "feat-login", prRepo: "acme/web", pr: 30 }]);
+    expect(status.links[0]).toMatchObject({ status: "in_review", closedAs: null });
+
+    gh.addPull("acme/web", { number: 31, state: "closed", merged: true, body: `Closes #${issue.number}`, headRef: "fix/two" });
+    await h.reconcile();
+    expect(gh.card(board, "acme/web", issue.number)?.status).toBe("Done");
+    expect(gh.issue("acme/web", issue.number)).toMatchObject({ state: "closed", stateReason: "completed" });
+    expect((await h.status()).closedUnmerged).toEqual([]);
+  });
+
+  it("reads one page of closed PRs per tracked repository, only while a linked task is In progress or In review; a failed read is an error, never a move", async () => {
+    const gh = new FakeGitHub();
+    gh.addBoard("acme", 1);
+    gh.addBoard("acme", 2);
+    const issue = gh.addIssue("acme/web", { title: "feat-login" });
+    const h = await rig({
+      gh,
+      repos: [WEB, { repo: "acme/api", project: { owner: "acme", number: 2 }, match: { tasks: ["api-*"] } }],
+      tasks: ["worker-a|Alice|feat-login|Login form"],
+    });
+    await h.reconcile();
+    expect(closedPullLists(gh)).toHaveLength(0);
+
+    await h.emit("agent.run.started", runStarted("feat-login"));
+    await h.reconcile();
+    expect(closedPullLists(gh).map((r) => [r.path, r.query.get("per_page"), r.query.get("sort"), r.query.get("direction")])).toEqual([
+      ["/repos/acme/web/pulls", "100", "updated", "desc"],
+      ["/repos/acme/api/pulls", "100", "updated", "desc"],
+    ]);
+    expect(closedPullLists(gh).every((r) => r.hadSignal)).toBe(true);
+
+    gh.addPull("acme/web", { number: 40, state: "closed", merged: true, body: `Closes #${issue.number}`, headRef: "fix/x" });
+    gh.intercept = (req) => (req.path.endsWith("/pulls") && req.query.get("state") === "closed" ? { status: 502, body: { message: "Bad gateway" } } : undefined);
+    await h.reconcile();
+    expect(gh.issue("acme/web", issue.number)?.state).toBe("open");
+    expect((await h.status()).syncState?.lastError).toMatch(/closed pull requests.*502/);
+    gh.intercept = null;
+    await h.reconcile();
+    expect(gh.issue("acme/web", issue.number)).toMatchObject({ state: "closed", stateReason: "completed" });
+  });
+});
+
+describe("task lines removed by hand (#262 item 4)", () => {
+  const LINES = {
+    a: "worker-a|Alice|feat-a|Removed",
+    b: "worker-a|Alice|feat-b|Commented out",
+    c: "worker-a|Alice|feat-c|Grows too long",
+    d: "worker-b|Bob|feat-d|Loses its description",
+    e: "worker-b|Bob|feat-e|Comes and goes",
+  };
+
+  it("close_removed_tasks: a removed or commented-out line closes its issue as not planned after 2 reconciles in a row; a malformed or too-long line never", async () => {
+    const gh = new FakeGitHub();
+    gh.addBoard("acme", 1);
+    const issues = Object.fromEntries(Object.keys(LINES).map((k) => [k, gh.addIssue("acme/web", { title: `feat-${k}` })]));
+    const h = await rig({ gh, tracker: { close_removed_tasks: true }, tasks: Object.values(LINES) });
+    expect((await h.status()).links).toHaveLength(5);
+    // c grows past fill's 2000 characters, d loses its description field: both malformed, neither removed
+    const kept = [`worker-a|Alice|feat-c|${"x".repeat(2100)}`, "worker-b|Bob|feat-d", LINES.e];
+    const before = gh.requests.length;
+
+    h.writeTasks([`#${LINES.b}`, ...kept]);
+    await h.reconcile();
+    expect(issuePatches(gh, before)).toHaveLength(0);
+    expect((await h.status()).removedTasks.map((r) => [r.task, r.missedReconciles, r.action]).sort()).toEqual([
+      ["feat-a", 1, "waiting"],
+      ["feat-b", 1, "waiting"],
+    ]);
+
+    // The second reconcile in a row closes a and b; e leaves for one reconcile only, then once more after it came back
+    h.writeTasks([`#${LINES.b}`, ...kept.slice(0, 2)]);
+    await h.reconcile();
+    expect(issuePatches(gh, before).map((r) => r.path).sort()).toEqual([`/repos/acme/web/issues/${issues.a.number}`, `/repos/acme/web/issues/${issues.b.number}`].sort());
+    for (const k of ["a", "b"]) expect(gh.issue("acme/web", issues[k].number)).toMatchObject({ state: "closed", stateReason: "not_planned" });
+    h.writeTasks([`#${LINES.b}`, ...kept]);
+    await h.reconcile();
+    h.writeTasks([`#${LINES.b}`, ...kept.slice(0, 2)]);
+    await h.reconcile();
+    // A file with no task line at all is taken for a broken write: it counts nothing
+    h.writeTasks([]);
+    await h.reconcile();
+    await h.reconcile();
+
+    expect(issuePatches(gh, before)).toHaveLength(2);
+    for (const k of ["c", "d", "e"]) expect(gh.issue("acme/web", issues[k].number)?.state, k).toBe("open");
+    const status = await h.status();
+    expect(status.links.filter((l) => l.closedAs === "not_planned").map((l) => l.task).sort()).toEqual(["feat-a", "feat-b"]);
+    expect(status.removedTasks).toEqual([{ task: "feat-e", repo: "acme/web", issueNumber: issues.e.number, missedReconciles: 1, action: "waiting" }]);
+  });
+
+  it("without close_removed_tasks (the default) a removed line is recorded as would_close, once, and shown in the status; nothing is sent", async () => {
+    const gh = new FakeGitHub();
+    gh.addBoard("acme", 1);
+    const a = gh.addIssue("acme/web", { title: "feat-a" });
+    gh.addIssue("acme/web", { title: "feat-e" });
+    const h = await rig({ gh, tasks: [LINES.a, LINES.e] });
+    h.writeTasks([LINES.e]);
+    const writes = gh.writes().length;
+    await h.reconcile();
+    await h.reconcile();
+    await h.reconcile();
+    expect(gh.writes()).toHaveLength(writes);
+    expect(gh.issue("acme/web", a.number)?.state).toBe("open");
+    const status = await h.status();
+    expect(status.removedTasks).toEqual([{ task: "feat-a", repo: "acme/web", issueNumber: a.number, missedReconciles: 3, action: "would_close" }]);
+    const rows = status.recentWrites.filter((w) => w.result === "would_close");
+    expect(rows).toEqual([
+      expect.objectContaining({ op: "close_issue", task: "feat-a", issueNumber: a.number, value: "not_planned", mode: "act", count: 2 }),
+    ]);
+    expect(JSON.parse(rows[0].wouldSend!)).toEqual({ state: "closed", state_reason: "not_planned" });
+    expect(status.links.find((l) => l.task === "feat-a")?.closedAs).toBeNull();
+  });
+
+  it("observe: a merge outside the review module and a removed line (close_removed_tasks on) are recorded as would_send; nothing is sent", async () => {
+    const gh = new FakeGitHub();
+    gh.addBoard("acme", 1);
+    const login = gh.addIssue("acme/web", { title: "feat-login" });
+    const a = gh.addIssue("acme/web", { title: "feat-a" });
+    const h = await rig({ gh, tracker: { mode: "observe", close_removed_tasks: true }, tasks: ["worker-a|Alice|feat-login|Login form", LINES.a] });
+    await h.emit("agent.run.started", runStarted("feat-login"));
+    gh.addPull("acme/web", { number: 50, state: "closed", merged: true, body: `Closes #${login.number}`, headRef: "fix/form" });
+    h.writeTasks(["worker-a|Alice|feat-login|Login form"]);
+    await h.reconcile();
+    await h.reconcile();
+    await h.reconcile();
+    expect(gh.writes()).toEqual([]);
+    const closes = (await h.status()).recentWrites.filter((w) => w.op === "close_issue");
+    expect(closes.map((w) => `${w.issueNumber} ${w.value} ${w.mode} ${w.result}`).sort()).toEqual(
+      [`${login.number} completed observe would_send`, `${a.number} not_planned observe would_send`].sort(),
+    );
+  });
+});
+
 describe("wiring: off by default, live reload, owner-only routes, its own store (F6, F12)", () => {
   it("a project without a tracker block starts nothing and creates no store file", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lair-tracker-"));
