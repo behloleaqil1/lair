@@ -24,6 +24,16 @@ export type { PlannerSettings, VerifierAgentSettings } from "./config.js";
 export { PlannerStore } from "./store.js";
 export { registerPlannerRoutes } from "./routes.js";
 export { parseVerdicts, readVerdictsFile, verifierSection, VERDICTS_FILE } from "./verifier.js";
+export {
+  extractPrNumbers,
+  branchContainsTask,
+  branchMatchesAgent,
+  titleBodyNamesTask,
+  checkPrOwnership,
+  type ExtractedPr,
+  type PrMetadata,
+  type OwnershipResult,
+} from "./pr-ownership.js";
 
 export interface MountPlannerOptions extends PlannerManagerOptions {
   projects: ProjectEntry[];
