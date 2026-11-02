@@ -1134,14 +1134,19 @@ describe("bus reports (bus.consume): a line the bus mirrored is read by its repo
     const id = await bus.report("worker-a", "BLOCKED", "feat-login", SUMMARY);
     await h.service.cycle();
 
+    // In observe mode the text parser reads the same line the bus mirrored.
+    // The planner takes the first task that line names ("feat-search" from the
+    // summary's text), not the report's task; that's what observe shows.
     expect(h.service.overview().blocked.map((b) => b.task)).toEqual(["feat-search"]);
     const health = bus.consumers.health("demo");
     expect(health.mode).toBe("observe");
-    // The text parser reads the task as "feat-login by": a difference Health shows before the owner turns the bus on
+    // The text parser now correctly reads the task as "feat-login" (matching the
+    // report), so for BLOCKED lines the readings match (#269).
     expect(health.observations).toMatchObject({
       total: 1,
-      mismatches: 1,
-      recent: [{ consumer: "planner", busId: id, report: "BLOCKED feat-login by worker-a", file: "BLOCKED feat-login by by worker-a" }],
+      matches: 1,
+      mismatches: 0,
+      recent: [],
     });
     expect(health.refused).toEqual([]);
     expect(id).toBeGreaterThan(0);
