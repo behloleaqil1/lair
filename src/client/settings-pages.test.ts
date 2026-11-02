@@ -7,7 +7,7 @@ import { SETTINGS_PAGES, pageForKey, pageOf, tabOf, unsavedText } from "./settin
 describe("SETTINGS_PAGES", () => {
   it("has all expected pages in order", () => {
     const ids = SETTINGS_PAGES.map((p) => p.id);
-    expect(ids).toEqual(["overview", "ai", "team", "work", "gates", "classic", "yaml", "history"]);
+    expect(ids).toEqual(["overview", "repos", "ai", "team", "work", "gates", "classic", "yaml", "history"]);
   });
 
   it("every page has an about text", () => {
@@ -25,6 +25,13 @@ describe("pageForKey", () => {
     expect(pageForKey("ai.roles")).toBe("ai");
     expect(pageForKey("ai.roles.build")).toBe("ai");
     expect(pageForKey("ai.roles.review.red")).toBe("ai");
+  });
+
+  it("routes repos keys to the repos page", () => {
+    expect(pageForKey("repos")).toBe("repos");
+    expect(pageForKey("repos.0")).toBe("repos");
+    expect(pageForKey("repos.0.refs")).toBe("repos");
+    expect(pageForKey("reposition")).toBe("classic");
   });
 
   it("routes dragons keys to the team page", () => {

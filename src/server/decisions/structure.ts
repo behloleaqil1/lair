@@ -16,7 +16,7 @@ const CODE = /^[a-z][a-z0-9_]{0,59}$/;
 const FACT_KEY = /^[a-z][a-z0-9_]{0,59}$/;
 
 /**
- * The classes of the policy table (C1-C14) with the evidence codes each
+ * The classes of the policy table (C1-C15) with the evidence codes each
  * allows. A class outside this table is allowed but flagged; a known class
  * takes only its own codes.
  */
@@ -31,6 +31,8 @@ export const KNOWN_DECISION_CLASSES: Readonly<Record<string, { policy: string; c
   },
   "planner.proposal": { policy: "C6", codes: ["verifier_rejected", "verifier_passed", "verifier_missing", "writer_conflict"] },
   "planner.unblock": { policy: "C7", codes: ["infra", "waiting_on_gate", "needs_owner"] },
+  // The planner guards' notices (G6, docs/design/ai-spend.md §4.5): what observe mode would do, or a kept change
+  "planner.guard_notice": { policy: "C15", codes: ["would_skip", "would_apply", "tasks_file_kept"] },
   "triage.gate_failure": {
     policy: "C8",
     codes: ["infra_download", "docker_down", "test_assertion", "unknown_failure", "infra_other", "same_failure_again"],
@@ -40,7 +42,7 @@ export const KNOWN_DECISION_CLASSES: Readonly<Record<string, { policy: string; c
   "agents.cannot_start": { policy: "C11", codes: ["probe_failed", "fill_waiting"] },
   "host-services.service_down": { policy: "C12", codes: ["start_failed", "flapping", "not_started", "probe_timeout"] },
   "pr_health.notice": { policy: "C13", codes: ["no_owner", "delivery_failed", "unfixed"] },
-  "agents.spend_notice": { policy: "C14", codes: ["waste_share", "task_attempts", "would_park", "would_cool", "budget_soft", "would_block"] },
+  "agents.spend_notice": { policy: "C14", codes: ["waste_share", "task_attempts", "would_park", "would_cool", "budget_soft", "would_block", "would_wake"] },
 };
 
 export function isKnownDecisionClass(id: string): boolean {
