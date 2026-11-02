@@ -60,7 +60,8 @@ export interface TrackerWrite {
   mode: TrackerMode;
   /** observe: what would have been sent (JSON, redacted) */
   wouldSend: string | null;
-  result: "success" | "error" | "rate_limited" | "skipped" | "would_send";
+  /** would_close: a removed task line whose issue close_removed_tasks (off) would close */
+  result: "success" | "error" | "rate_limited" | "skipped" | "would_send" | "would_close";
   error: string | null;
   /** How many times the same observe row was seen (observe rows are kept once) */
   count: number;
@@ -97,6 +98,25 @@ export interface TrackerPendingCreate {
   since: string;
 }
 
+/** A linked task's PR that was closed without merging (seen by the last reconcile): the task's card is left where it is */
+export interface TrackerUnmergedPull {
+  task: string;
+  /** The PR: its repository and number */
+  prRepo: string;
+  pr: number;
+}
+
+/** A linked task whose line is not in the tasks file (removed or commented out by hand) */
+export interface TrackerRemovedTask {
+  task: string;
+  repo: string;
+  issueNumber: number;
+  /** Reconciles in a row that did not find its line (counted since the tracker started) */
+  missedReconciles: number;
+  /** waiting: missed fewer than 2 reconciles; would_close: close_removed_tasks is off, so its issue stays open; closing: a later reconcile closes it (one closes at most 10) */
+  action: "waiting" | "would_close" | "closing";
+}
+
 /** GET /api/tracker/status */
 export interface TrackerStatusView {
   project: string;
@@ -112,6 +132,10 @@ export interface TrackerStatusView {
   recentWrites: TrackerWrite[];
   /** Jobs waiting in the tracker's queue, and jobs dropped because it was full (a reconcile catches up) */
   queue: { waiting: number; dropped: number };
+  /** PRs of linked tasks closed without merging (the last reconcile) */
+  closedUnmerged: TrackerUnmergedPull[];
+  /** Linked tasks whose line left the tasks file and whose issue is still open */
+  removedTasks: TrackerRemovedTask[];
   warnings: string[];
   /** Config errors (the tracker did not start) */
   errors: string[];

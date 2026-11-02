@@ -60,7 +60,9 @@ run (`src/server/bus/wiring.ts`), and the bus routes with their options.
 ### 5.1 One read path, no double counting
 
 - `BusService.report` stores the report, appends the mirrored line (ending `[bus:<id>]`) to the queue file, then emits
-  `bus.report`. The line is where the report sits in the queue's order: a run's window, an agent's latest line.
+  `bus.report`. The line is where the report sits in the queue's order: a run's window, an agent's latest line. The
+  mirror's writes are asynchronous (`fs/promises`, never blocking the event loop) and awaited before the event, and a
+  file's appends are serialised in call order, so lines never interleave and the queue keeps the store's order.
 - `QueueLines` (fill's reader, shared with the planner's done check) looks up the reports of the marked lines in the bus
   store (one read, then kept in memory: a report never changes). A line that is the report's mirrored line
   (`- <KIND> <task> by <agent> `) carries the report; in `on` mode it matches a query only by the report's kind, its
@@ -95,4 +97,17 @@ A `bus.report` or `bus.message` event is checked field by field (no casts); an i
 the report the bus stored under its id, is refused with the reason. A report for a task that isn't in fill's tasks
 file, or by an agent fill doesn't run, is ignored. Each is logged, emitted as `bus.consume_refused` and listed on Home
 → Health (`GET /api/bus/consumers`, read-only). The bus itself refuses a report for a task the run doesn't hold, a run
-that is no longer active, and arguments that fail its schema, with the reason.
+that is no longer active, and arguments that fail its schema, with the reason. The schema refuses (400) what the
+consumers would refuse, so such a report is never stored or mirrored and its wake-up never lost: a `sha` that isn't 7
+to 64 hex digits, a `gate_id` that isn't a plain name (letters, digits, `.`, `_` and `-`, starting with a letter or
+digit, no `..`: the rule fill applies to what a run waits on). A run is looked up by its id in the agents store,
+however many runs came after it. An owner message to a recipient that isn't a plain name gets no mailbox file.
+
+### 5.5 Bus tokens end with their run
+
+Every way a run ends goes through one helper in the agents service (`runEnded`): an exit, a crash, a failover, a
+transient retry, never started, the owner's stop or fresh session, a released claim. It revokes the run's bus token
+whatever `bus.consume` is by then (a reload may have switched it off since the token was minted), without creating a
+bus store for a project that has none. At start the agents service revokes the token of every run that isn't active:
+runs that ended while no server was there to revoke them. Tests drive each end path, a mode switch mid-run and a
+restart through the real agents service and bus routes.

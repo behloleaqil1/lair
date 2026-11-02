@@ -22,14 +22,21 @@
  */
 import { createHash } from "crypto";
 import type { Event } from "../../shared/server-types.js";
-import type { TrackerLink, TrackerOp, TrackerStatus, TrackerStatusView } from "../../shared/tracker-types.js";
+import type {
+  TrackerLink,
+  TrackerOp,
+  TrackerRemovedTask,
+  TrackerStatus,
+  TrackerStatusView,
+  TrackerUnmergedPull,
+} from "../../shared/tracker-types.js";
 import type { EventBus } from "../core/event-bus.js";
 import type { DecisionProducer, DecisionResolution } from "../decisions/types.js";
 import { optionToStatus, statusToOption, type RepoSettings, type TrackerSettings } from "./config.js";
-import { GitHubError, type Board, type BoardItem, type GitHubTrackerClient, type Issue, type Milestone } from "./github-projects.js";
+import { GitHubError, type Board, type BoardItem, type GitHubTrackerClient, type Issue, type Milestone, type Pull } from "./github-projects.js";
 import { makeRedactor, oneLine, type Redact } from "./redact.js";
 import type { TrackerStore } from "./store.js";
-import type { TaskInfo, TaskSource } from "./tasks.js";
+import type { TaskInfo, TaskSource, TasksSnapshot } from "./tasks.js";
 
 /** The module name on its decisions */
 export const DECISION_MODULE = "tracker";
@@ -40,6 +47,12 @@ export const RECHECK = "recheck";
 export const MAX_QUEUE = 500;
 /** New links a reconcile makes (the rest wait for the next one) */
 const MAX_NEW_LINKS_PER_RECONCILE = 10;
+/** Closed PRs a reconcile reads per tracked repository (one page, the newest update first) */
+const CLOSED_PULLS_PER_REPO = 100;
+/** Tasks a reconcile finishes because their PR merged elsewhere, and tasks it closes because their line was removed (each; the rest wait) */
+const MAX_FINISHES_PER_RECONCILE = 10;
+/** Reconciles in a row that must miss a linked task's line before it counts as removed */
+export const REMOVED_AFTER_RECONCILES = 2;
 /** While writes wait on the owner, a reconcile checks the token again at most this often */
 const SCOPE_RECHECK_MS = 5 * 60_000;
 const TITLE_MAX = 200;
@@ -151,6 +164,10 @@ export class TrackerService {
   private needsOwner: string | null = null;
   private readonly milestones = new Map<string, { at: number; open: Milestone[] }>();
   private readonly notes = new Set<string>();
+  /** Open linked tasks whose line the last reconciles did not find: task -> reconciles in a row */
+  private readonly missing = new Map<string, number>();
+  /** Linked tasks' PRs the last reconcile saw closed without merging */
+  private closedUnmerged: TrackerUnmergedPull[] = [];
 
   constructor(options: TrackerServiceOptions) {
     this.project = options.project;
@@ -874,9 +891,11 @@ export class TrackerService {
 
   /**
    * Make GitHub match: link the tasks that have no issue yet (the ones an
-   * event missed, a create cut short), close the done ones, move the cards
-   * of open PRs to In review, put back cards moved by hand, add missing
-   * cards, retry failed closes, and close or reopen milestones.
+   * event missed, a create cut short), close the done ones, finish the
+   * tasks whose PR was merged outside the review module, drop the ones
+   * whose line was removed by hand, move the cards of open PRs to In
+   * review, put back cards moved by hand, add missing cards, retry failed
+   * closes, and close or reopen milestones.
    */
   async reconcile(): Promise<{ fixed: number; errors: string[] }> {
     const errors: string[] = [];
@@ -904,6 +923,10 @@ export class TrackerService {
           if (link && (link.closedAs !== "completed" || !link.closedSynced)) await this.finish(task, "completed").catch((e) => errors.push(`${task}: ${message(e)}`));
         }
       }
+
+      // Merges first: a task whose PR merged is done, even if its line also went
+      await this.reconcileMerges(errors);
+      if (snapshot && !this.stopped) await this.reconcileRemoved(snapshot, errors);
 
       for (const state of this.repos.values()) {
         if (this.stopped) break;
@@ -944,6 +967,105 @@ export class TrackerService {
       this.scheduleReconcile();
     }
     return { fixed, errors };
+  }
+
+  /**
+   * A PR merged by another path than the review module (a script's push,
+   * `gh pr merge`, the web UI) emits no review.merged. For the linked tasks
+   * In progress or In review, the closed PRs of each tracked repository are
+   * read (one page, the newest update first: one request per repository)
+   * and matched as review.submitted matches (the issues a PR closes, a task
+   * id ending its branch name). A merged one finishes its tasks as
+   * review.merged does (Done, the issue closed as completed), through the
+   * write budget; one closed without merging changes nothing and is listed
+   * in the status.
+   */
+  private async reconcileMerges(errors: string[]): Promise<void> {
+    const waiting = (link: TrackerLink) => !link.closedAs && (link.status === "in_progress" || link.status === "in_review");
+    if (!this.store.listLinks(this.project).some(waiting)) {
+      this.closedUnmerged = [];
+      return;
+    }
+    const merged = new Set<string>();
+    const unmerged = new Map<string, TrackerUnmergedPull>();
+    for (const state of this.repos.values()) {
+      if (this.stopped) return;
+      const repo = state.settings.repo;
+      let pulls: Pull[];
+      try {
+        pulls = await this.client.listClosedPulls(repo, CLOSED_PULLS_PER_REPO);
+      } catch (e) {
+        errors.push(`${repo} closed pull requests: ${message(e)}`);
+        continue;
+      }
+      for (const pull of pulls) {
+        for (const link of this.linksOfPull(repo, pull.body, pull.headRef)) {
+          if (!waiting(link)) continue;
+          if (pull.merged) merged.add(link.task);
+          else if (!unmerged.has(link.task)) unmerged.set(link.task, { task: link.task, prRepo: repo, pr: pull.number });
+        }
+      }
+    }
+    for (const task of merged) unmerged.delete(task);
+    this.closedUnmerged = [...unmerged.values()];
+    let finished = 0;
+    for (const task of merged) {
+      if (this.stopped || finished >= MAX_FINISHES_PER_RECONCILE) break;
+      finished++;
+      await this.finish(task, "completed").catch((e) => errors.push(`${task}: ${message(e)}`));
+    }
+  }
+
+  /**
+   * A linked task whose line left the tasks file and is not done was
+   * removed or commented out by hand (the planner's own drop comes as an
+   * event). Missed by REMOVED_AFTER_RECONCILES reconciles in a row, it
+   * counts as dropped: with close_removed_tasks its issue is closed as not
+   * planned (at most MAX_FINISHES_PER_RECONCILE a reconcile); without, a
+   * would_close row is recorded and the status lists it. A task on a line
+   * fill refuses (malformed, too long) is still in the file; a file with
+   * no task line at all is taken for a broken write and counts nothing.
+   * The count is kept in memory: a restart starts it again.
+   */
+  private async reconcileRemoved(snapshot: TasksSnapshot, errors: string[]): Promise<void> {
+    const present = new Set<string>([...snapshot.open.map((t) => t.task), ...snapshot.done, ...snapshot.mentioned]);
+    if (present.size === 0) return;
+    const open = this.store.listLinks(this.project).filter((l) => !l.closedAs);
+    const openTasks = new Set(open.map((l) => l.task));
+    for (const task of [...this.missing.keys()]) if (!openTasks.has(task)) this.missing.delete(task);
+    let closed = 0;
+    for (const link of open) {
+      if (present.has(link.task)) {
+        this.missing.delete(link.task);
+        continue;
+      }
+      const misses = (this.missing.get(link.task) ?? 0) + 1;
+      this.missing.set(link.task, misses);
+      if (misses < REMOVED_AFTER_RECONCILES) continue;
+      if (!this.settings.closeRemovedTasks) {
+        this.store.recordWrite(
+          this.project,
+          {
+            task: link.task,
+            repo: link.repo,
+            issueNumber: link.issueNumber,
+            op: "close_issue",
+            value: "not_planned",
+            mode: this.settings.mode,
+            wouldSend: JSON.stringify({ state: "closed", state_reason: "not_planned" }),
+            result: "would_close",
+            error: null,
+            dedupeKey: sha(`would_close\0${link.repo}\0${link.issueNumber}\0${link.task}`),
+          },
+          this.iso(),
+        );
+        continue;
+      }
+      if (this.stopped || closed >= MAX_FINISHES_PER_RECONCILE) continue;
+      closed++;
+      this.missing.delete(link.task);
+      await this.finish(link.task, "not_planned").catch((e) => errors.push(`${link.task}: ${message(e)}`));
+    }
   }
 
   /** Cards moved by hand go back; missing cards are added. Returns the cards put back. */
@@ -1030,7 +1152,20 @@ export class TrackerService {
       pending: this.store.listPending(this.project),
       recentWrites: this.store.listWrites(this.project, 50),
       queue: { waiting: this.waiting, dropped: this.dropped },
+      closedUnmerged: this.closedUnmerged,
+      removedTasks: this.removedTasks(),
       warnings: [...this.settings.warnings, ...this.notes],
     };
+  }
+
+  private removedTasks(): TrackerRemovedTask[] {
+    const out: TrackerRemovedTask[] = [];
+    for (const [task, misses] of this.missing) {
+      const link = this.store.getLink(this.project, task);
+      if (!link || link.closedAs) continue;
+      const action = misses < REMOVED_AFTER_RECONCILES ? "waiting" : this.settings.closeRemovedTasks ? "closing" : "would_close";
+      out.push({ task, repo: link.repo, issueNumber: link.issueNumber, missedReconciles: misses, action });
+    }
+    return out;
   }
 }
