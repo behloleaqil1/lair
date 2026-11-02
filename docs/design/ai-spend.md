@@ -1,6 +1,6 @@
 # AI spend and waste
 
-- **Status:** design, docs only. Nothing here is built. The feature decisions are made (§8, 2026-11-02).
+- **Status:** design. PR 1 (measure, §7) is built; the rest is not. The feature decisions are made (§8, 2026-11-02).
 - **Base:** main `9bce85a`.
 - **Related:** [autonomy.md §6](autonomy.md#6-agents-budgets-failover-and-session-recovery-module-agents) (the agents module), [review-stages.md](review-stages.md) (staged review slots, `ask_after`, built separately), [planner.md](planner.md), [decision-policies.md](decision-policies.md) (the brain), issue #185 (usage limit detector).
 
@@ -121,9 +121,9 @@ There is one new part of the agents module, `src/server/agents/spend.ts`, under 
 
 | Value | What it reads at run end |
 |---|---|
-| `claude-stream-json` | The last line whose JSON has `"type":"result"`, from the log's last 256 KB. It takes `usage.input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `output_tokens`, `total_cost_usd`, `num_turns` (stored as `turns`, not as requests: compaction and side calls aren't turns), `is_error`, and the first key of `modelUsage` (which fills `model` when the profile has none) |
+| `claude-stream-json` | Every line whose JSON has `"type":"result"`, over the whole log, read in 1 MB chunks across ticks. One process can write several result events (14 of 180 recorded runs wrote 2 to 19): each one's `usage` and `num_turns` count only since the previous one, while the last one's `modelUsage` and `total_cost_usd` are the process's totals. So the tokens are the last event's `modelUsage` summed over its models (`inputTokens`, `cacheCreationInputTokens`, `cacheReadInputTokens`, `outputTokens`; the events' `usage` summed when it has none), the cost is its `total_cost_usd`, `turns` is the sum of `num_turns` (stored as `turns`, not as requests: compaction and side calls aren't turns), and `model` is the first key of `modelUsage` (when the profile has none). A line over 1 MB after the last result read refuses the usage (it may hold the totals) |
 | `claude-json` | The same fields from the one JSON object the run wrote |
-| `request-lines` | Counts lines matching `request_pattern` (an adapter field, at most 500 characters, case-sensitive, compiled once) over the whole log, read in 1 MB chunks across ticks like `readUsage` does today. That gives requests, no tokens |
+| `request-lines` | Counts lines matching `request_pattern` (an adapter field, at most 500 characters, case-sensitive, compiled once, refused when it matches an empty line) over the whole log, read in 1 MB chunks across ticks like `readUsage` does today, each chunk's lines in a vm with a 250 ms timeout. That gives requests, no tokens |
 | `patterns` | Today's `usage_patterns` |
 | `none` | Nothing is reported. Tokens and cost show as "not reported", and runtime and context size are still recorded |
 
@@ -141,7 +141,7 @@ The built-ins get defaults:
   - Both get tests against a recorded stream-json log.
   - **Session id for resume.** The first `{"type":"system","subtype":"init",...}` event carries the CLI's `session_id`. Lair reads it in the same incremental log read that `readUsage` already does, and stores it as the run's session id, so `resume_flag: "--resume {session_id}"` resumes the CLI's real session. Without that event, a resume falls back to a fresh session.
   - The adapter option `output: text` keeps the old plain-text start command and status pattern. With that option, `usage_parser` is `none`.
-- `kiro`: `request-lines`, with `request_pattern: "GenerateAssistantResponseCommand done"`.
+- `kiro`: `request-lines`, with `request_pattern: "GenerateAssistantResponseCommand done totalEvents=\\d+"` (every request line in the recorded logs has this form; `totalEvents=` keeps an agent's own prose that names the command from counting).
 - The others: `none`.
 
 When `usage_parser` is set to anything but `patterns`, `readUsage` skips that run, so nothing is counted twice.
@@ -163,7 +163,7 @@ A run whose adapter uses `request-lines` also records `requests`. For an adapter
 - `owner`: set by `POST /api/agents/runs`.
 - `fill`: unchanged.
 
-A run with no origin falls back to its task prefix. Model calls a module makes without an agent run go through a single in-process function, `spend.recordCall({ project, module, provider, model, requests, tokens, cost, source })`, which writes `agents_usage` with `run_id` null and `reason: "call:<module>"`. Today no server module makes such calls. The brain is a local classifier with no tokens: its evaluations are counted as `brain` calls with 0 tokens, so the panel shows it costs nothing. If a future brain uses a remote model, it must call `recordCall`. The bench CLI stays outside the server and prints its own usage.
+A run with no origin falls back to its task prefix. Model calls a module makes without an agent run go through a single in-process function, `spend.recordCall(project, { module, provider, tokens, cost })` (`AgentsManager.recordCall`), which writes `agents_usage` with `run_id` null and `reason: "call:<module>"`. One call is one row, so the rows count the calls; `agents_usage` has no model or request column, and PR 1 adds none. Today no server module makes such calls. The brain is a local classifier with no tokens: its evaluations are counted as `brain` calls with 0 tokens, so the panel shows it costs nothing. If a future brain uses a remote model, it must call `recordCall`. The bench CLI stays outside the server and prints its own usage.
 
 **Planner and verifier model calls.** Every planner run and every verifier run is an agent run, so its usage is recorded like any other run's. `planner_runs` already holds `agent_run_id` and `verifier_run_id`. The spend rollup joins on them to give, per planner run, its own requests, tokens and cost plus its verifier's, and the proposals by status. The panel then shows the **cost per applied proposal** and the planner's waste share (runs with no applied proposal).
 
@@ -206,10 +206,11 @@ CREATE TABLE IF NOT EXISTS agents_spend (
   origin TEXT NOT NULL,              -- fill | review | planner | verifier | supervisor | owner | other
   adapter TEXT NOT NULL, provider TEXT NOT NULL, model TEXT,
   started_at INTEGER, ended_at INTEGER NOT NULL, runtime_s INTEGER NOT NULL,
-  class TEXT NOT NULL, reason TEXT NOT NULL,
+  class TEXT NOT NULL, reason TEXT NOT NULL,   -- PR 1 writes `unclassified`/`pending` for what needs PR 2's rules
   session_mode TEXT NOT NULL, reload INTEGER NOT NULL, lair_restart INTEGER NOT NULL,
   usage_source TEXT NOT NULL,        -- reported | requests | none  (never estimated)
   input_tokens INTEGER, cache_write_tokens INTEGER, cache_read_tokens INTEGER, output_tokens INTEGER,
+  tokens INTEGER,                    -- as the budgets count them (input + cache write + output; usage_patterns' total)
   requests INTEGER, turns INTEGER,   -- requests: request-lines only; turns: num_turns of a result event
   cost REAL, context_bytes INTEGER NOT NULL,
   pr INTEGER, head_sha TEXT,         -- review runs, and BLOCKED lines naming a PR
@@ -230,6 +231,14 @@ CREATE TABLE IF NOT EXISTS agents_spend_daily (
   cost REAL,                                         -- null when no run of the group reported it
   PRIMARY KEY (project, day, agent, origin, provider, class, reason)
 );
+
+-- Runs that ended while spend was on and whose row isn't written yet: marked in the same synchronous step that
+-- ends the run, so a restart between the end and the next tick loses nothing (PR 1)
+CREATE TABLE IF NOT EXISTS agents_spend_pending (
+  run_id TEXT PRIMARY KEY, project TEXT NOT NULL, ended_at INTEGER NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0, last_error TEXT   -- a failed write backs off
+);
+CREATE INDEX IF NOT EXISTS idx_agents_spend_pending ON agents_spend_pending(project, ended_at);
 ```
 
 **Retention (decision D4).** Per-run rows are kept for `agents.spend.retention_days` (90), and daily aggregates for `agents.spend.aggregate_days` (365).
@@ -400,7 +409,7 @@ agent_adapters:
     # output: text                           # the old plain-text start command; usage_parser becomes none
   my-other-cli:
     usage_parser: request-lines              # requests and minutes; tokens and cost "not reported" (D3)
-    request_pattern: "GenerateAssistantResponseCommand done"
+    request_pattern: "GenerateAssistantResponseCommand done totalEvents=\\d+"
 
 agents:
   failover:

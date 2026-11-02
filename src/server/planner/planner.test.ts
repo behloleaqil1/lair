@@ -296,7 +296,7 @@ describe("triggers start the planner agent through the agents module", () => {
     expect(run.triggers.map((t) => t.kind).sort()).toEqual(["idle", "owner_message"]);
     // It is an ordinary agents run: claimed, requested in-process
     const agentRun = h.agentsStore.getRun(run.agentRunId ?? "");
-    expect(agentRun).toMatchObject({ agent: "planner", task: run.task, state: "queued" });
+    expect(agentRun).toMatchObject({ agent: "planner", task: run.task, state: "queued", origin: "planner" });
     expect(h.agentsStore.getClaim("demo", run.task)).toMatchObject({ runId: run.agentRunId });
 
     const call = await runPlannerAgent(h, (c) => writeProposals(c, { proposals: [] }));

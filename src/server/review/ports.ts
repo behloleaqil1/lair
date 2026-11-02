@@ -15,7 +15,7 @@ import { createHash } from "crypto";
 import type { EventBus } from "../core/event-bus.js";
 import type { Tier } from "../../shared/review-types.js";
 import type { DecisionEffect, DecisionStructure } from "../../shared/decision-types.js";
-import type { AgentRunState, AgentRunView, AgentsStatusView } from "../../shared/agents-types.js";
+import type { AgentRunState, AgentRunView, AgentsStatusView, RunOrigin } from "../../shared/agents-types.js";
 import type { DecisionProducer } from "../decisions/types.js";
 import { toDecisionInput } from "../decisions/request-bridge.js";
 
@@ -107,9 +107,11 @@ export interface ReviewAssigner {
  * project's service, to stop a review run that is no longer needed.
  */
 export interface ReviewerRuns {
+  /** `origin` review, kept on the run for its AI spend record */
   requestRun(
     project: string,
     input: { agent: string; task: string; prompt: string; variables: Record<string, string>; ownPrompt?: boolean },
+    options?: { origin?: RunOrigin },
   ): Promise<AgentRunView>;
   status(project: string): AgentsStatusView;
   managedRuns(project: string): ReadonlyMap<string, unknown>;

@@ -12,16 +12,28 @@ import { existsSync, mkdirSync } from "fs";
 import { dirname } from "path";
 import { randomUUID } from "crypto";
 import type { AgentEventKind, AgentRunState } from "../../shared/agents-types.js";
-import { ACTIVE_STATES, type AgentEvent, type AgentRun, type Claim, type UsageRecord } from "./types.js";
+import {
+  ACTIVE_STATES,
+  type AgentEvent,
+  type AgentRun,
+  type Claim,
+  type SpendPending,
+  type SpendRow,
+  type UsageRecord,
+} from "./types.js";
 import type { ProcessOwner } from "./probes.js";
 
 /**
  * 1: runs, claims, events, usage. 2: idx_agents_runs_task,
  * idx_agents_events_task and idx_agents_events_run (fill looks up a task's
- * runs, releases and claim releases on every check). Every statement is IF
+ * runs, releases and claim releases on every check). 3: agents_hung_info.
+ * 4: AI spend (docs/design/ai-spend.md §4.3): agents_spend (one row per
+ * ended run), agents_spend_daily (the daily aggregates, written from the
+ * spend API's PR on) and agents_spend_pending (runs that ended while
+ * agents.spend was on whose row isn't written yet). Every statement is IF
  * NOT EXISTS, so running SCHEMA migrates any older version.
  */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS agents_runs (
@@ -93,7 +105,121 @@ const SCHEMA = `
     recorded_at INTEGER NOT NULL,
     PRIMARY KEY (project, agent, task)
   );
+
+  CREATE TABLE IF NOT EXISTS agents_spend (
+    run_id TEXT PRIMARY KEY,
+    project TEXT NOT NULL, agent TEXT NOT NULL, task TEXT NOT NULL, chain_id TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    adapter TEXT NOT NULL, provider TEXT NOT NULL, model TEXT,
+    started_at INTEGER, ended_at INTEGER NOT NULL, runtime_s INTEGER NOT NULL,
+    class TEXT NOT NULL, reason TEXT NOT NULL,
+    session_mode TEXT NOT NULL, reload INTEGER NOT NULL, lair_restart INTEGER NOT NULL,
+    usage_source TEXT NOT NULL,
+    input_tokens INTEGER, cache_write_tokens INTEGER, cache_read_tokens INTEGER, output_tokens INTEGER,
+    tokens INTEGER,
+    requests INTEGER, turns INTEGER,
+    cost REAL, context_bytes INTEGER NOT NULL,
+    pr INTEGER, head_sha TEXT,
+    blocker_key TEXT,
+    backfilled INTEGER NOT NULL DEFAULT 0,
+    usage_recorded INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE INDEX IF NOT EXISTS idx_agents_spend_time ON agents_spend(project, ended_at);
+  CREATE INDEX IF NOT EXISTS idx_agents_spend_task ON agents_spend(project, task, ended_at);
+
+  CREATE TABLE IF NOT EXISTS agents_spend_daily (
+    project TEXT NOT NULL, day TEXT NOT NULL,
+    agent TEXT NOT NULL, origin TEXT NOT NULL, provider TEXT NOT NULL,
+    class TEXT NOT NULL, reason TEXT NOT NULL,
+    runs INTEGER NOT NULL, reloads INTEGER NOT NULL, lair_restarts INTEGER NOT NULL,
+    requests INTEGER, turns INTEGER, minutes REAL NOT NULL,
+    input_tokens INTEGER, cache_write_tokens INTEGER, cache_read_tokens INTEGER, output_tokens INTEGER,
+    cost REAL,
+    PRIMARY KEY (project, day, agent, origin, provider, class, reason)
+  );
+
+  CREATE TABLE IF NOT EXISTS agents_spend_pending (
+    run_id TEXT PRIMARY KEY,
+    project TEXT NOT NULL,
+    ended_at INTEGER NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    retry_at INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_agents_spend_pending ON agents_spend_pending(project, ended_at);
 `;
+
+interface SpendRowDb {
+  run_id: string;
+  project: string;
+  agent: string;
+  task: string;
+  chain_id: string;
+  origin: string;
+  adapter: string;
+  provider: string;
+  model: string | null;
+  started_at: number | null;
+  ended_at: number;
+  runtime_s: number;
+  class: string;
+  reason: string;
+  session_mode: string;
+  reload: number;
+  lair_restart: number;
+  usage_source: string;
+  input_tokens: number | null;
+  cache_write_tokens: number | null;
+  cache_read_tokens: number | null;
+  output_tokens: number | null;
+  tokens: number | null;
+  requests: number | null;
+  turns: number | null;
+  cost: number | null;
+  context_bytes: number;
+  pr: number | null;
+  head_sha: string | null;
+  blocker_key: string | null;
+  backfilled: number;
+  usage_recorded: number;
+}
+
+function toSpendRow(row: SpendRowDb): SpendRow {
+  return {
+    runId: row.run_id,
+    project: row.project,
+    agent: row.agent,
+    task: row.task,
+    chainId: row.chain_id,
+    origin: row.origin as SpendRow["origin"],
+    adapter: row.adapter,
+    provider: row.provider,
+    model: row.model,
+    startedAt: row.started_at,
+    endedAt: row.ended_at,
+    runtimeS: row.runtime_s,
+    class: row.class as SpendRow["class"],
+    reason: row.reason,
+    sessionMode: row.session_mode as SpendRow["sessionMode"],
+    reload: row.reload === 1,
+    lairRestart: row.lair_restart === 1,
+    usageSource: row.usage_source as SpendRow["usageSource"],
+    inputTokens: row.input_tokens,
+    cacheWriteTokens: row.cache_write_tokens,
+    cacheReadTokens: row.cache_read_tokens,
+    outputTokens: row.output_tokens,
+    tokens: row.tokens,
+    requests: row.requests,
+    turns: row.turns,
+    cost: row.cost,
+    contextBytes: row.context_bytes,
+    pr: row.pr,
+    headSha: row.head_sha,
+    blockerKey: row.blocker_key,
+    backfilled: row.backfilled === 1,
+    usageRecorded: row.usage_recorded === 1,
+  };
+}
 
 interface ClaimRow {
   project: string;
@@ -568,6 +694,118 @@ export class AgentsStore {
             .get(project, agent, since)
     ) as { tokens: number; cost: number };
     return { tokens: row.tokens, cost: row.cost };
+  }
+
+  /** Usage the ledger holds for one run (agents.usage_patterns rows): null when it holds none. */
+  usageForRun(runId: string): { tokens: number; cost: number } | null {
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS n, COALESCE(SUM(tokens), 0) AS tokens, COALESCE(SUM(cost), 0) AS cost FROM agents_usage WHERE run_id = ?`)
+      .get(runId) as { n: number; tokens: number; cost: number };
+    return row.n === 0 ? null : { tokens: row.tokens, cost: row.cost };
+  }
+
+  // ============ AI SPEND ============
+
+  /**
+   * A run ended while agents.spend was on: its spend row is owed. Kept until the row is written, so a restart
+   * between the end and the next tick loses nothing. Idempotent per run.
+   */
+  markSpendPending(project: string, runId: string, endedAt: number): void {
+    this.db
+      .prepare(`INSERT OR IGNORE INTO agents_spend_pending (run_id, project, ended_at) VALUES (?, ?, ?)`)
+      .run(runId, project, endedAt);
+  }
+
+  /** Runs whose spend row is owed and may be tried at `now` (a failed one waits its backoff), the earliest end first. */
+  pendingSpend(project: string, now: number, limit: number): SpendPending[] {
+    const rows = this.db
+      .prepare(
+        `SELECT run_id, ended_at, attempts FROM agents_spend_pending WHERE project = ? AND retry_at <= ?
+         ORDER BY ended_at, run_id LIMIT ?`,
+      )
+      .all(project, now, limit) as { run_id: string; ended_at: number; attempts: number }[];
+    return rows.map((row) => ({ runId: row.run_id, endedAt: row.ended_at, attempts: row.attempts }));
+  }
+
+  /** Writing a run's spend row failed: counted, with why (bounded), and not tried again before `retryAt`. */
+  spendAttemptFailed(runId: string, error: string, retryAt: number): void {
+    this.db
+      .prepare(`UPDATE agents_spend_pending SET attempts = attempts + 1, last_error = ?, retry_at = ? WHERE run_id = ?`)
+      .run(error.slice(0, 500), retryAt, runId);
+  }
+
+  dropSpendPending(runId: string): void {
+    this.db.prepare(`DELETE FROM agents_spend_pending WHERE run_id = ?`).run(runId);
+  }
+
+  /**
+   * One transaction: the run's spend row (usage_recorded = 1), its usage in the ledger (when `usage` is given and
+   * the row is new) and the end of its pending mark. A row that exists already is left alone and nothing is added
+   * to the ledger, so a retry or a restart never counts a run's usage twice. True when the row was written.
+   */
+  recordSpend(row: SpendRow, usage: UsageRecord | null): boolean {
+    const tx = this.db.transaction((): boolean => {
+      const result = this.db
+        .prepare(
+          `INSERT OR IGNORE INTO agents_spend (
+             run_id, project, agent, task, chain_id, origin, adapter, provider, model,
+             started_at, ended_at, runtime_s, class, reason, session_mode, reload, lair_restart,
+             usage_source, input_tokens, cache_write_tokens, cache_read_tokens, output_tokens, tokens,
+             requests, turns, cost, context_bytes, pr, head_sha, blocker_key, backfilled, usage_recorded)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+        )
+        .run(
+          row.runId,
+          row.project,
+          row.agent,
+          row.task,
+          row.chainId,
+          row.origin,
+          row.adapter,
+          row.provider,
+          row.model,
+          row.startedAt,
+          row.endedAt,
+          row.runtimeS,
+          row.class,
+          row.reason,
+          row.sessionMode,
+          row.reload ? 1 : 0,
+          row.lairRestart ? 1 : 0,
+          row.usageSource,
+          row.inputTokens,
+          row.cacheWriteTokens,
+          row.cacheReadTokens,
+          row.outputTokens,
+          row.tokens,
+          row.requests,
+          row.turns,
+          row.cost,
+          row.contextBytes,
+          row.pr,
+          row.headSha,
+          row.blockerKey,
+          row.backfilled ? 1 : 0,
+        );
+      const written = result.changes === 1;
+      if (written && usage) this.addUsage(usage);
+      this.dropSpendPending(row.runId);
+      return written;
+    });
+    return tx.immediate();
+  }
+
+  getSpend(runId: string): SpendRow | null {
+    const row = this.db.prepare(`SELECT * FROM agents_spend WHERE run_id = ?`).get(runId) as SpendRowDb | undefined;
+    return row ? toSpendRow(row) : null;
+  }
+
+  /** A project's spend rows, the latest end first. */
+  listSpend(project: string, options: { since?: number; limit?: number } = {}): SpendRow[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM agents_spend WHERE project = ? AND ended_at >= ? ORDER BY ended_at DESC, rowid DESC LIMIT ?`)
+      .all(project, options.since ?? 0, options.limit ?? 100) as SpendRowDb[];
+    return rows.map(toSpendRow);
   }
 
   // ============ HUNG INFO ============

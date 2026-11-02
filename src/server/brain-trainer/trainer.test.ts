@@ -23,6 +23,7 @@ import { exampleFromDecision, examplesFromCases, isNotice, splitLabels } from ".
 import { mountBrainTrainer } from "./index.js";
 import { parseModel, propose, probabilities } from "./model.js";
 import { timeSplit } from "./split.js";
+import type { BrainCallRecorder } from "./service.js";
 import { readOnlyDecisions, type DecisionReader } from "./shadow.js";
 import { ModelStore } from "./store.js";
 import { DEFAULT_PARAMS, runTraining, type TrainerSettings } from "./trainer.js";
@@ -528,7 +529,11 @@ function pick(i: number, small: boolean): RaiseDecisionInput {
   };
 }
 
-async function server(yaml: string | null = "brain_trainer:\n  enabled: true\n" + IMAGE_LINE + "  min_labels: 20\n  min_test: 3\n", wrap?: (inbox: DecisionInbox) => DecisionReader) {
+async function server(
+  yaml: string | null = "brain_trainer:\n  enabled: true\n" + IMAGE_LINE + "  min_labels: 20\n  min_test: 3\n",
+  wrap?: (inbox: DecisionInbox) => DecisionReader,
+  recordCall?: BrainCallRecorder,
+) {
   const dir = tempDir();
   const configPath = join(dir, "server.yaml");
   if (yaml !== null) {
@@ -555,6 +560,7 @@ async function server(yaml: string | null = "brain_trainer:\n  enabled: true\n" 
     container,
     clock: () => new Date(runAt),
     timers: { set: () => () => undefined },
+    recordCall,
   });
   await app.ready();
   const owner = { ...BROWSER, [OWNER_SESSION_HEADER]: auth.createSession(readFileSync(tokenPath, "utf-8").trim())!.session };
@@ -671,13 +677,17 @@ function clockAdvance(h: { clock: FakeClock }): void {
 
 describe("shadow mode never answers", () => {
   it("writes a proposal into the trace when a decision is raised, leaves the decision open, and compares after the answer", async () => {
-    const h = await server();
+    const calls: unknown[] = [];
+    const h = await server(undefined, undefined, (project, call) => calls.push({ project, ...call }));
     await h.answered(40);
     const model = await trained(h);
+    expect(calls).toEqual([]); // no model, no proposal: nothing was evaluated
     clockAdvance(h);
     const { decision } = await h.inbox.raise(pick(100, true));
     const proposals = h.trainer["shadow"].proposals();
     expect(proposals).toHaveLength(1);
+    // Each proposal is one model call of the decision's project for its AI spend: a local classifier, no tokens
+    expect(calls).toEqual([{ project: "demo", module: "brain", provider: "local", tokens: 0, cost: 0 }]);
     expect(proposals[0]).toMatchObject({
       decisionId: decision.id, class: "planner/other/large+small", proposer: "classifier", version: model.version, option: "small", reasonCode: "classifier_gbt",
     });

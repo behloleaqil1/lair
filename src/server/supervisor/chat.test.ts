@@ -199,7 +199,7 @@ async function boot(options: BootOptions = {}): Promise<Harness> {
         return run !== null && run !== undefined && isActive(run.state);
       },
       agents: {
-        requestRun: (project, input) => agents.requestRun(project, input),
+        requestRun: (project, input, options) => agents.requestRun(project, input, options),
         getStore: () => agents.getStore(),
         releaseClaim: async (project, task, why) => agents.get(project)?.releaseClaim(task, why),
       },
@@ -329,7 +329,7 @@ describe("asking: one supervisor run, with a run token in its environment", () =
     ]);
     const runId = view.turns[0].runId!;
     const run = h.agents.getStore()!.getRun(runId)!;
-    expect(run).toMatchObject({ agent: "sup", task: `supervisor-ask-${view.id.slice(0, 8)}-1`, state: "queued" });
+    expect(run).toMatchObject({ agent: "sup", task: `supervisor-ask-${view.id.slice(0, 8)}-1`, state: "queued", origin: "supervisor" });
 
     await tick(h);
     expect(h.spawner.calls).toHaveLength(1);

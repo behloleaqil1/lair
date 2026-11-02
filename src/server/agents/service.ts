@@ -72,9 +72,11 @@ import type { SupervisedAgents } from "../watchdog/types.js";
 import { backoffMs, MODEL_ID, parseAgentsConfig, type AgentLockSettings, type AgentsSettings } from "./config.js";
 import {
   agentLimits,
+  BUDGET_METRICS,
   describeUsage,
   evaluateBudget,
   periodEnd,
+  periodKey,
   type FleetBudget,
 } from "./budgets.js";
 import {
@@ -118,6 +120,7 @@ import {
   type ProcessOwner,
 } from "./probes.js";
 import { extractHungLogLines, extractLastTool, lastLines, moveSessionAside, resumeSummary, sessionDirFor, utcStamp } from "./sessions.js";
+import { SpendRecorder, type ModelCall } from "./spend.js";
 import { AgentsStore, type ClaimResult, type HungInfo } from "./store.js";
 import {
   claimView,
@@ -128,6 +131,7 @@ import {
   type AgentRun,
   type Claim,
   type FailoverInfo,
+  type RunEndKind,
   type StoredLockWait,
 } from "./types.js";
 import { commandFingerprint, findTaskProcess, reconcileRun, runPromptFileName } from "./reconcile.js";
@@ -162,6 +166,8 @@ export const DECISION_WAIT = "wait";
 export const DECISION_STOP = "stop";
 export const DECISION_ALLOW = "allow";
 export const DECISION_RETRY_NOW = "retry_now";
+/** The one option of a budget guard's notice (budgets.guard_mode observe) */
+export const BUDGET_NOTICE_NOTED = "noted";
 
 /** In the detail of a run that waits for its tool's sign-in */
 const SIGNED_OUT_DETAIL = "not signed in on this machine";
@@ -480,6 +486,8 @@ export class AgentsService {
   private reconcilePending = false;
   /** The runs reconciliation has given a verdict since start() */
   private reconciled = new Set<string>();
+  /** AI spend (agents.spend): a record per ended run, written after its end, and module model calls */
+  private spend: SpendRecorder;
   lastTick?: AgentsTickSummary;
   lastError?: string;
 
@@ -516,6 +524,16 @@ export class AgentsService {
           reason: event.reason,
         });
       }) ?? null;
+    this.spend = new SpendRecorder({
+      project: this.project,
+      store: this.store,
+      settings: options.settings.spend,
+      now: () => this.probes.clock.now(),
+      budget: this.budget,
+      outcome: (run) => this.reportedOutcome(run),
+      record: (kind, input, at) => this.record(kind, input, at),
+      warn: (line) => console.warn(line),
+    });
     if (options.settings.fill.enabled) {
       // Once per start (and config reload): what can make fill close or change the wrong task (also on Home → Health)
       for (const warning of options.settings.fill.warnings) console.warn(`[agents] ${this.project}: ${warning}`);
@@ -820,6 +838,7 @@ export class AgentsService {
     ["chain", (decision: Decision, chainId: string) => this.chainMoot(decision, chainId)],
     ["transient", (decision: Decision, provider: string) => this.outageMoot(decision, provider)],
     ["signin", (_decision: Decision, tool: string) => this.signInMoot(tool)],
+    ["guard", (_decision: Decision, rest: string) => this.guardMoot(rest)],
   ]);
 
   /** A tool's sign-in decision (ref `signin:<tool>`) is moot once its check says it is signed in here. */
@@ -1048,7 +1067,7 @@ export class AgentsService {
       if (optionId !== DECISION_STOP) return "the run keeps waiting for the cooldown";
       const waiting = chain.find((r) => r.state === "queued" || r.state === "waiting_lock");
       if (!waiting) return "nothing was waiting any more";
-      this.runEnded(waiting, "failed", t.now);
+      this.runEnded(waiting, "failed", t.now, "stopped");
       waiting.detail = "stopped by the owner while every profile was failing";
       this.store.saveRun(waiting);
       this.store.releaseClaim(this.project, waiting.task, waiting.id);
@@ -1097,6 +1116,8 @@ export class AgentsService {
       await this.reapLocks(t);
       const activeChains = new Set(this.store.activeRuns(this.project).map((run) => run.chainId));
       for (const chain of this.moduleVars.keys()) if (!activeChains.has(chain)) this.moduleVars.delete(chain);
+      // agents.spend: the spend rows of runs that ended (bounded per tick; it never throws)
+      await this.spend.drain();
     }
     // A question whose chain moved on is moot: withdrawn, so nothing is left waiting for the owner by mistake
     await this.withdrawMoot(t);
@@ -1165,8 +1186,12 @@ export class AgentsService {
     return null;
   }
 
-  /** The hard budget limit an agent's new runs are blocked by, or null. */
+  /**
+   * The hard budget limit an agent's new runs are blocked by, or null. Only with budgets.guard_mode act: in observe
+   * (the default) a hard limit records would_block and a notice (checkBudgets) and blocks nothing; off ignores it.
+   */
   private budgetBlock(agent: string, now: number): string | null {
+    if (this.settings.budgets.guardMode !== "act") return null;
     const scopes = [
       evaluateBudget(this.store, this.project, null, this.settings.budgets.project, now),
       evaluateBudget(this.store, this.project, agent, agentLimits(this.settings, agent), now),
@@ -1186,7 +1211,7 @@ export class AgentsService {
     // Module run variables live only in memory: without them (after a restart) the run ends, and its module asks again
     const lost = (run.variableNames ?? []).filter((name) => this.moduleVars.get(run.chainId)?.[name] === undefined);
     if (lost.length > 0) {
-      return this.endRun(run, "failed", `not started: its run variables (${lost.join(", ")}) were lost in a restart`, t, true);
+      return this.endRun(run, "failed", "vars_lost", `not started: its run variables (${lost.join(", ")}) were lost in a restart`, t, true);
     }
 
     // No new runs past a hard budget limit (the wait doesn't count as a start attempt)
@@ -1203,7 +1228,7 @@ export class AgentsService {
     // A usable profile: the run's own, else the next one (failover at start)
     const profiles = this.profiles(run.agent, run.requestModel);
     if (profiles.length === 0) {
-      this.runEnded(run, "failed", t.now);
+      this.runEnded(run, "failed", t.now, "never_started");
       run.detail = `agent ${run.agent} has no adapter to start it with (not in dragons: or dragons.txt, or an unknown adapter)`;
       this.store.saveRun(run);
       t.summary.ended++;
@@ -1303,6 +1328,7 @@ export class AgentsService {
       return this.endRun(
         run,
         "superseded",
+        "lost_claim",
         `task ${run.task} is claimed by run ${short(holder.runId)} (agent ${holder.agent}, ${t.snap.describe(holder.ownerPid, holder.ownerStartedAt)})`,
         t,
         false,
@@ -1389,7 +1415,10 @@ export class AgentsService {
       parts.push(this.formatHungInfo(hungInfo));
     }
     const file = join(dir, runPromptFileName(run.task, run.agent, run.id));
-    await writeFile(file, parts.join("\n\n") + "\n", "utf-8");
+    const text = parts.join("\n\n") + "\n";
+    await writeFile(file, text, "utf-8");
+    // The context the run starts from (its AI spend record keeps the size only, never the text)
+    run.contextBytes = Buffer.byteLength(text, "utf-8");
     return file;
   }
 
@@ -1639,7 +1668,7 @@ export class AgentsService {
   private async startTimedOut(run: AgentRun, t: Tick, reason: string): Promise<boolean> {
     const since = run.launchingSince ?? t.now;
     if (t.now - since < this.settings.startTimeoutMinutes * 60000) return false;
-    this.runEnded(run, "never_started", t.now);
+    this.runEnded(run, "never_started", t.now, "never_started");
     run.detail = `never started: no live agent process ${Math.round((t.now - since) / 60000)} min after starting began: ${reason}`;
     t.summary.neverStarted++;
     t.summary.ended++;
@@ -1824,7 +1853,7 @@ export class AgentsService {
     const evidence = run.stopEvidence ?? [];
     switch (run.stopReason) {
       case "lost_claim":
-        return this.endRun(run, "lost_claim", `stopped: ${detail}`, t, false);
+        return this.endRun(run, "lost_claim", "lost_claim", `stopped: ${detail}`, t, false);
       case "failover": {
         const info: FailoverInfo = run.failover ?? { kind: "provider_error", line: detail };
         // Its silent log ended on a transient error: waited out as at an exit, while the chain has transient retries left
@@ -1876,11 +1905,11 @@ export class AgentsService {
     const claim = this.store.getClaim(this.project, run.task);
     if (!claim || claim.runId !== run.id) {
       // Its claim went first: the task isn't this run's to restart
-      return this.endRun(run, "lost_claim", "the process ended after its claim was released", t, false);
+      return this.endRun(run, "lost_claim", "lost_claim", "the process ended after its claim was released", t, false);
     }
     if (code === 0) {
       await this.noteReachable(run, t, true);
-      return this.endRun(run, "completed", "exited 0", t, true);
+      return this.endRun(run, "completed", "completed", "exited 0", t, true);
     }
     if (code === undefined) return this.unsupervisedExit(run, t);
     const tail = run.logPath ? await logTail(run.logPath, 64 * 1024) : "";
@@ -1922,11 +1951,13 @@ export class AgentsService {
    * agents.recovery), and escalates only once that budget is spent.
    */
   private async unsupervisedExit(run: AgentRun, t: Tick): Promise<void> {
+    // Its end is its log's last write, not when this server noticed (the AI spend record's runtime)
+    run.exitUnseen = true;
     const outcome = await this.reportedOutcome(run);
     if (outcome) {
       // The line is the agent's text: kept as evidence, never in the run's detail (resume summaries carry details)
       const detail = `exit unknown (it ended while Lair was restarting); classified from its queue line: ${outcome.kind.toUpperCase()}`;
-      return this.endRun(run, "completed", detail, t, true, {
+      return this.endRun(run, "completed", "completed", detail, t, true, {
         evidence: [`queue line: ${oneLine(outcome.line)}`],
         data: { exit: "unknown", classifiedAs: outcome.kind, line: outcome.line },
       });
@@ -1959,43 +1990,49 @@ export class AgentsService {
    */
   private async stoppedForShutdown(run: AgentRun, t: Tick): Promise<void> {
     const outcome = await this.reportedOutcome(run);
+    // The previous server stopped it on its way out: this one didn't see it end
+    run.exitUnseen = true;
     if (outcome) {
       const detail = `stopped for the server's shutdown (agents.on_restart: stop); classified from its queue line: ${outcome.kind.toUpperCase()}`;
-      return this.endRun(run, "completed", detail, t, true, {
+      return this.endRun(run, "completed", "completed", detail, t, true, {
         evidence: [`queue line: ${oneLine(outcome.line)}`],
         data: { exit: "stopped_for_shutdown", classifiedAs: outcome.kind, line: outcome.line },
       });
     }
     const detail = "stopped for the server's shutdown (agents.on_restart: stop), with no queue line for the task: the task is free";
-    return this.endRun(run, "failed", detail, t, true);
+    return this.endRun(run, "failed", "stopped", detail, t, true);
   }
 
   /**
    * Every way a run ends comes through here (endRun, recover, failover, a transient retry, never started, no adapter,
    * the owner's stop, a released claim): its end state and time, no lock wait, and its bus token revoked, whatever
-   * the project's bus.consume is now (a reload may have switched it off since the token was minted). The caller
-   * sets the detail and saves the run.
+   * the project's bus.consume is now (a reload may have switched it off since the token was minted). `end` is how it
+   * ended, which its AI spend row is owed by (agents.spend; marked here, in the same step, so a restart loses
+   * nothing). The caller sets the detail and saves the run.
    */
-  private runEnded(run: AgentRun, state: EndedRunState, now: number): void {
+  private runEnded(run: AgentRun, state: EndedRunState, now: number, end: RunEndKind): void {
     run.state = state;
     run.endedAt = now;
+    run.endKind = end;
     run.waitingLock = undefined;
     try {
       this.revokeBusToken?.(run.id);
     } catch (e) {
       console.warn(`[agents] ${this.project}: revoking run ${short(run.id)}'s bus token failed: ${message(e)}`);
     }
+    this.spend.ended(run, now);
   }
 
   private async endRun(
     run: AgentRun,
     state: Exclude<EndedRunState, "never_started">,
+    end: RunEndKind,
     detail: string,
     t: Tick,
     releaseClaim: boolean,
     event: { evidence?: string[]; data?: Record<string, unknown> } = {},
   ): Promise<void> {
-    this.runEnded(run, state, t.now);
+    this.runEnded(run, state, t.now, end);
     run.detail = detail;
     this.releaseRunLocks(run);
     if (releaseClaim) this.store.releaseClaim(this.project, run.task, run.id);
@@ -2027,7 +2064,8 @@ export class AgentsService {
     evidence: string[],
     t: Tick,
   ): Promise<void> {
-    this.runEnded(run, "failed", t.now);
+    // A fresh session the owner asked for stops the run: it didn't fail
+    this.runEnded(run, "failed", t.now, kind === "fresh_session" ? "stopped" : kind);
     run.detail = `${kind.replace(/_/g, " ")}: ${detail}`;
     this.releaseRunLocks(run);
     // The server keeps the task between attempts
@@ -2222,7 +2260,7 @@ export class AgentsService {
    * recovery counters carry over: failing over never buys more restarts.
    */
   private async failover(run: AgentRun, info: FailoverInfo, t: Tick): Promise<void> {
-    this.runEnded(run, "failed", t.now);
+    this.runEnded(run, "failed", t.now, info.transient ? "unreachable" : info.kind);
     run.failover = info;
     run.detail = `${failoverLabel(info.kind)} on ${profileLabel(run.profile)}: ${oneLine(info.line)}`;
     this.releaseRunLocks(run);
@@ -2574,7 +2612,7 @@ export class AgentsService {
   private async transientRetry(run: AgentRun, line: string, exit: string, used: number, t: Tick): Promise<void> {
     const provider = run.profile.provider;
     const lived = run.spawnedAt === undefined ? 0 : t.now - run.spawnedAt;
-    this.runEnded(run, "failed", t.now);
+    this.runEnded(run, "failed", t.now, "unreachable");
     run.detail = `transient: provider ${provider} unreachable (${exit}): ${oneLine(line)}`;
     this.releaseRunLocks(run);
     // The server keeps the task between attempts
@@ -2731,9 +2769,12 @@ export class AgentsService {
 
   // ============ USAGE AND BUDGETS ============
 
-  /** Usage lines (agents.usage_patterns) written to the run's log since the last read. */
+  /**
+   * Usage lines (agents.usage_patterns) written to the run's log since the last read. With agents.spend on, only for
+   * a run whose adapter's usage_parser is `patterns`: another parser reads the run once it ends, so nothing counts twice.
+   */
   private async readUsage(run: AgentRun): Promise<void> {
-    if (!run.logPath || this.settings.usagePatterns.length === 0) return;
+    if (!run.logPath || this.settings.usagePatterns.length === 0 || !this.spend.readsPatterns(run)) return;
     const bytes = await readFrom(run.logPath, run.logOffset, 1024 * 1024);
     const end = bytes.lastIndexOf(0x0a);
     if (end < 0) return;
@@ -2789,8 +2830,13 @@ export class AgentsService {
     return scopes;
   }
 
-  /** Soft limits warn once per period; hard limits stop new runs and raise a `spend` decision once. */
+  /**
+   * Soft limits warn once per period. A hard limit, by budgets.guard_mode: act stops new runs and raises a `spend`
+   * decision once (and records guard_did); observe, the default, records guard_would (would_block) and raises one
+   * notice per scope, metric and period, and blocks nothing; off ignores it.
+   */
   private async checkBudgets(t: Tick): Promise<void> {
+    const mode = this.settings.budgets.guardMode;
     for (const scope of this.scopes(t.now)) {
       const scopeKey = scope.scope === "project" ? "project" : `agent:${scope.agent}`;
       for (const line of scope.lines) {
@@ -2811,9 +2857,26 @@ export class AgentsService {
           );
           if (warned) t.summary.warnings++;
         }
-        if (line.level !== "hard") continue;
+        if (line.level !== "hard" || mode === "off") continue;
         const text = describeUsage(scope, line, "hard");
         const until = iso(periodEnd(line.metric, t.now));
+        if (mode === "observe") {
+          await this.budgetWouldBlock(scope, scopeKey, key, line, text, until, t);
+          continue;
+        }
+        const guardFacts = { guard: "budget", subject: scopeKey, metric: line.metric, period: line.period, used: line.used, hard: line.hard ?? null };
+        await this.record(
+          "guard_did",
+          {
+            agent: scope.agent,
+            subject: scopeKey,
+            summary: `budget guard (act): blocks new runs ${scope.scope === "project" ? "in the project" : `for ${scope.agent}`} until ${until}: ${text}`,
+            evidence: [text],
+            data: { ...guardFacts, verdict: "block" },
+            dedupeKey: `guard_did:budget:${key}`,
+          },
+          t.now,
+        );
         await this.record(
           "budget_exceeded",
           {
@@ -2871,6 +2934,96 @@ export class AgentsService {
         );
       }
     }
+  }
+
+  /**
+   * budgets.guard_mode observe: a hard limit reached blocks nothing. It records one guard_would event (would_block)
+   * and raises one notice per scope, metric and period (withdrawn once the period is over or the limit no longer
+   * reached: mootBy "guard"); the notice never leaves Lair.
+   */
+  private async budgetWouldBlock(
+    scope: BudgetScopeView,
+    scopeKey: string,
+    key: string,
+    line: BudgetLine,
+    text: string,
+    until: string,
+    t: Tick,
+  ): Promise<void> {
+    const who = scope.scope === "project" ? "in the project" : `for ${scope.agent}`;
+    const facts = { guard: "budget", subject: scopeKey, metric: line.metric, period: line.period, used: line.used, hard: line.hard ?? null };
+    await this.record(
+      "guard_would",
+      {
+        agent: scope.agent,
+        subject: scopeKey,
+        summary: `budget guard (observe): would block new runs ${who} until ${until}: ${text}; nothing was blocked`,
+        evidence: [text],
+        data: { ...facts, verdict: "would_block" },
+        dedupeKey: `guard_would:budget:${key}`,
+      },
+      t.now,
+    );
+    await this.raiseAt(
+      {
+        kind: "other",
+        attention: "notice",
+        question: `${text.charAt(0).toUpperCase()}${text.slice(1)}: in observe mode nothing was blocked`,
+        context: [
+          `Scope: ${scopeKey}. Metric: ${line.metric} for ${line.period}. Used: ${line.used} (hard limit ${line.hard ?? "none"}).`,
+          "",
+          `agents.budgets.guard_mode is observe, so new runs ${who} still start. With guard_mode act, they would wait until ${until} and a spend decision would ask you.`,
+        ].join("\n"),
+        options: [
+          {
+            id: BUDGET_NOTICE_NOTED,
+            label: "Noted",
+            consequences: "The notice closes. Nothing else changes: runs go on starting while guard_mode is observe.",
+            effect: "reversible",
+          },
+        ],
+        recommended: BUDGET_NOTICE_NOTED,
+        why: "Nothing is decided here: the limit is observed only. Raise the limit, or set guard_mode act to have it block.",
+        reversible: true,
+        key: `guard:budget:${key}`,
+        ref: `guard:budget:${key}`,
+        structure: {
+          class: "agents.budget_guard",
+          evidence: {
+            code: "would_block",
+            facts: { scope: scopeKey, metric: line.metric, period: line.period, used: line.used, hard: line.hard ?? null },
+            cause_cleared: false,
+            linked_issue: null,
+          },
+        },
+      },
+      t.now,
+    );
+  }
+
+  /** A budget guard's notice (ref `guard:budget:<scope>:<metric>:<period>`) is moot once its period ended or its limit isn't reached. */
+  private guardMoot(rest: string): string | null {
+    if (!rest.startsWith("budget:")) return null;
+    const parts = rest.slice("budget:".length).split(":");
+    const period = parts.pop() ?? "";
+    const metric = parts.pop() ?? "";
+    const scopeKey = parts.join(":");
+    const now = this.probes.clock.now();
+    const known = BUDGET_METRICS.find((m) => m === metric);
+    if (!known) return null;
+    if (periodKey(known, now) !== period) return `the ${known} period ${period} is over`;
+    if (this.settings.budgets.guardMode !== "observe") return "budgets.guard_mode is no longer observe";
+    const scope = this.scopes(now).find((s) => (s.scope === "project" ? "project" : `agent:${s.agent}`) === scopeKey);
+    const line = scope?.lines.find((l) => l.metric === known);
+    return line?.level === "hard" ? null : `${scopeKey} is under its ${known} hard limit`;
+  }
+
+  /**
+   * A model call a module made without an agent run (the brain's evaluations, say): its tokens and cost go to the
+   * ledger with run_id null and reason `call:<module>`, while agents.spend is on. False when nothing was written.
+   */
+  recordCall(call: ModelCall): boolean {
+    return this.spend.recordCall(call);
   }
 
   // ============ REAPERS ============
@@ -3062,7 +3215,7 @@ export class AgentsService {
       );
       const run = this.store.getRun(claim.runId);
       if (run && (run.state === "queued" || run.state === "waiting_lock")) {
-        this.runEnded(run, "lost_claim", now);
+        this.runEnded(run, "lost_claim", now, "stopped");
         run.detail = "its claim was released on request before it started";
         this.store.saveRun(run);
       }
@@ -3170,7 +3323,7 @@ export class AgentsService {
     const snap = this.snapshot;
     const alive = (pid: number, started: number): boolean | null => (snap ? snap.isAlive(pid, started) : null);
     const claims = this.store.listClaims(this.project);
-    const projectBudget = evaluateBudget(this.store, this.project, null, this.settings.budgets.project, now);
+    const projectBudget = evaluateBudget(this.store, this.project, null, this.settings.budgets.project, now, this.settings.budgets.guardMode === "act");
     const agents = this.agentIds().map((id) => this.agentView(id, claims, now, alive));
     return {
       project: this.project,
@@ -3335,7 +3488,7 @@ export class AgentsService {
   ): AgentView {
     const active = this.store.activeRunForAgent(this.project, id);
     const latest = active ?? this.store.latestRunForAgent(this.project, id);
-    const budget = evaluateBudget(this.store, this.project, id, agentLimits(this.settings, id), now);
+    const budget = evaluateBudget(this.store, this.project, id, agentLimits(this.settings, id), now, this.settings.budgets.guardMode === "act");
     // Over budget is what blocks new runs: a hard limit the owner didn't allow runs past
     const overBudget = this.budgetBlock(id, now);
     const previous = active?.previousRunId ? this.store.getRun(active.previousRunId) : null;
@@ -3457,7 +3610,7 @@ export class AgentsService {
         );
       } else if (verdict.kind === "lost") {
         const detail = `lost in a restart: ${verdict.reason}; that process isn't the run's, so Lair leaves it alone`;
-        await this.endRun(run, "failed", detail, t, true);
+        await this.endRun(run, "failed", "lost", detail, t, true);
         await this.record(
           "run_lost",
           {
@@ -3674,7 +3827,8 @@ export interface AgentsBus {
  */
 /** How other modules start agent runs, in-process (AgentsManager has it). */
 export interface AgentRuns {
-  requestRun(project: string, input: RunRequest): Promise<AgentRunView>;
+  /** `origin`: the module asking (review, planner, verifier, supervisor), kept on the run for its AI spend record */
+  requestRun(project: string, input: RunRequest, options?: { origin?: RunOrigin }): Promise<AgentRunView>;
 }
 
 export class AgentsManager implements SupervisedAgents, AgentRuns {
@@ -3894,10 +4048,27 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
    * Start a run from another module (the scheduler, the planner): the
    * in-process way, AgentRuns. Over HTTP only the owner may start runs.
    */
-  requestRun(project: string, input: RunRequest): Promise<AgentRunView> {
+  requestRun(project: string, input: RunRequest, options: { origin?: RunOrigin } = {}): Promise<AgentRunView> {
     const service = this.services.get(project);
     if (!service) return Promise.reject(new AgentsError(404, `The agents module is off for ${project}`));
-    return service.requestRun(input);
+    // fill's runs (its max_active, its open-task rule) and the owner's come their own ways, never through here
+    if (options.origin === "fill" || options.origin === "owner") {
+      return Promise.reject(new AgentsError(400, `A module's run can't have origin ${options.origin}`));
+    }
+    return service.requestRun(input, options);
+  }
+
+  /**
+   * A model call a module made without an agent run (AgentsService.recordCall): written while the project's
+   * agents module runs with agents.spend on, else nothing. Never throws.
+   */
+  recordCall(project: string, call: ModelCall): boolean {
+    try {
+      return this.services.get(project)?.recordCall(call) ?? false;
+    } catch (e) {
+      console.warn(`[agents] ${project}: a model call was not recorded: ${e instanceof Error ? e.message : String(e)}`);
+      return false;
+    }
   }
 
   getStore(): AgentsStore | null {

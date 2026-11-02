@@ -978,7 +978,7 @@ export class PlannerService {
     // Recorded before the request: after a restart its agent run is found by task id
     this.store.insertRun(run);
     try {
-      const view = await this.agents.requestRun(this.project, { agent: agent.id, task, prompt });
+      const view = await this.agents.requestRun(this.project, { agent: agent.id, task, prompt }, { origin: "planner" });
       run.agentRunId = view.id;
       run.chainId = view.chainId;
       run.detail = `agent run ${short(view.id)} requested`;
@@ -1269,7 +1269,7 @@ export class PlannerService {
     }
 
     try {
-      const view = await this.agents.requestRun(this.project, { agent: verifier.id, task, prompt });
+      const view = await this.agents.requestRun(this.project, { agent: verifier.id, task, prompt }, { origin: "verifier" });
       run.verifierRunId = view.id;
       run.verifierChainId = view.chainId;
       run.verifierTask = task;
