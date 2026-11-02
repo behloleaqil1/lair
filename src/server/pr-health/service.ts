@@ -37,9 +37,9 @@ import type { GitHost, HostCommit, HostPullRequest } from "../review/host.js";
 import { newestChecks, RepoHosts, type RepoEntry } from "../repos/index.js";
 import { Deliveries, DeliveryLedger, type TickReads } from "./act.js";
 import { actBlockedReason, KINDS, parsePrHealthConfig, type PrHealthSettings } from "./config.js";
-import { findingKey, kindsOf, readOrder, skipReason } from "./detect.js";
+import { ciIsSignal, findingKey, kindsOf, readOrder, skipReason } from "./detect.js";
 import { noticeCode, Notices } from "./notices.js";
-import { ownerOf, type FillSource, type OwnerInputs } from "./owner.js";
+import { ownerOf, type FillSource, type OwnerInputs, type ReviewAuthorSource } from "./owner.js";
 import { plan, type PlanGroup } from "./plan.js";
 import type { ClearedWhy, FindingView, NoteRecord, Planned, PrFacts, PrHealthStatus, PrHealthTick, RepoView } from "./types.js";
 
@@ -62,6 +62,8 @@ export interface PrHealthOptions {
   events?: EventBus;
   /** The agents module: fill's last check names the owners (none: nobody owns a PR) */
   agents?: FillSource;
+  /** The review module: the PR authors it registered (owner.rule branch_first) */
+  reviews?: ReviewAuthorSource;
   /** Tests stand in for the git host's API here (the only stand-in) */
   fetch?: FetchLike;
   env?: NodeJS.ProcessEnv;
@@ -92,6 +94,7 @@ export class PrHealth {
   private readonly config: ProjectConfig;
   private readonly events?: EventBus;
   private readonly agents?: FillSource;
+  private readonly reviews?: ReviewAuthorSource;
   private readonly log: Log;
   private readonly now: () => number;
   private readonly firstTickMs: number;
@@ -131,6 +134,7 @@ export class PrHealth {
     this.settings = options.settings;
     this.events = options.events;
     this.agents = options.agents;
+    this.reviews = options.reviews;
     this.log = options.log ?? console;
     this.now = options.now ?? (() => Date.now());
     this.firstTickMs = options.firstTickMs ?? 1000;
@@ -153,6 +157,7 @@ export class PrHealth {
         repo: entry.repo,
         base: entry.base,
         ciCounts: entry.ciCounts,
+        ciSignal: ciIsSignal(entry, this.settings),
         state: "inactive",
         error: null,
         partial: false,
@@ -306,6 +311,14 @@ export class PrHealth {
       repos: this.settings.repos,
       authors: this.settings.authors,
       branchWindowMinutes: this.settings.branchWindowMinutes,
+      rule: this.settings.ownerRule,
+      reviewRepo: this.settings.reviewRepo,
+      registeredAuthor: (pr) => {
+        const review = this.reviews?.get(this.project);
+        // Only the review module of the same repository: its PR numbers are that repository's
+        if (!review || review.settings.repo.toLowerCase() !== (this.settings.reviewRepo ?? "").toLowerCase()) return null;
+        return review.registeredAuthor(pr);
+      },
       config: this.config,
       now,
     };
@@ -320,7 +333,7 @@ export class PrHealth {
       const { repo, pr, head } = list[0];
       const state = this.repos.get(repo) as RepoState;
       const listed = state.prs.get(pr);
-      const result = await ownerOf({ repo, number: pr, headRef: listed?.headRef ?? "" }, inputs, () => this.pushedAt(state, pr, head));
+      const result = await ownerOf({ repo, number: pr, headRef: listed?.headRef ?? "", user: listed?.user ?? null }, inputs, () => this.pushedAt(state, pr, head));
       for (const f of list) {
         f.owner = "owner" in result ? result.owner : "unknown";
         f.ownerReason = "unknown" in result ? result.unknown : null;
@@ -366,7 +379,7 @@ export class PrHealth {
       };
     } else facts = { ...prev };
     // Pending, missing or red checks are read again every tick (a re-run or a late run is seen)
-    if (entry.ciCounts && !(facts.checksSettled && facts.checksHead === facts.headSha)) {
+    if (ciIsSignal(entry, this.settings) && !(facts.checksSettled && facts.checksHead === facts.headSha)) {
       const checks = newestChecks(await host.listChecks(facts.headSha));
       const settled = checks.length > 0 && checks.every((c) => c.state === "success" || c.state === "skipped");
       facts = { ...facts, checks, checksHead: facts.headSha, checksSettled: settled };

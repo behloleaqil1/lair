@@ -19,7 +19,7 @@ import { EventBus } from "../core/event-bus.js";
 import { serverModules } from "../reload/modules.js";
 import type { FetchLike } from "../review/github.js";
 import { ACTIONS_APP, FakeClock, FakeRemote, fakeGitHubApi, type FakePull } from "../review/testing/fakes.js";
-import { PrHealthManager, parsePrHealthConfig, registerPrHealthRoutes, startedLine } from "./index.js";
+import { PrHealthManager, parsePrHealthConfig, registerPrHealthRoutes, startedLine, type ReviewAuthorSource } from "./index.js";
 
 const W = { name: "W", email: "w@example.com" };
 const MIN = 60_000;
@@ -72,7 +72,7 @@ function fillView(lines: string[], states: Record<number, FillLineState> = {}, o
   return { ...loop, lastCheck: ago(1), lastError: null, lines: views, unmatchedReports: [], warnings: [], ...over };
 }
 
-function setup(prHealth: Record<string, unknown> = {}, repos: unknown = [APP], extra: Record<string, unknown> = {}) {
+function setup(prHealth: Record<string, unknown> = {}, repos: unknown = [APP], extra: Record<string, unknown> = {}, reviews?: ReviewAuthorSource) {
   const app = remote("example/app");
   const lib = remote("example/lib");
   const apis = { app: fakeGitHubApi(app), lib: fakeGitHubApi(lib) };
@@ -109,7 +109,7 @@ function setup(prHealth: Record<string, unknown> = {}, repos: unknown = [APP], e
   });
   // The agents module as index.ts passes it: get(project)?.fillStatus()
   const agents = { get: (project: string) => (project === "demo" && fill.view ? { fillStatus: () => fill.view as FillStatusView } : undefined) };
-  const manager = new PrHealthManager({ events: bus, agents, fetch, env: {}, now: () => clock.now(), log: quiet });
+  const manager = new PrHealthManager({ events: bus, agents, reviews, fetch, env: {}, now: () => clock.now(), log: quiet });
   manager.load([{ name: "demo", config: config({ repos, ...extra, pr_health: { enabled: true, ...prHealth } }) }]);
   cleanups.push(() => manager.stop());
   const monitor = manager.get("demo");
@@ -695,5 +695,115 @@ describe("PR health 2b: the owner rule, the plan, the route and the wiring", () 
     expect(manager.get("demo")).toBeUndefined();
     expect(vi.getTimerCount()).toBe(0);
     expect(manager.status("demo")).toMatchObject({ enabled: false, running: false });
+  });
+});
+
+describe("PR health: a repository whose CI is not the signal, and the branch_first owner rule (#292)", () => {
+  const AUTHORS = { review: { authors: { branch_pattern: "agent/{agent}/**" } } };
+  const ownerOf = (h: ReturnType<typeof setup>, pr: number) => h.status().findings.find((f) => f.pr === pr)?.owner;
+  /** The review module as index.ts passes it, with these registered authors of example/app */
+  const registered = (authors: Record<number, string>): ReviewAuthorSource => ({
+    get: (project) => (project === "demo" ? { settings: { repo: "example/app" }, registeredAuthor: (n) => authors[n] ?? null } : undefined),
+  });
+
+  it("prHealth_ci_signal_false: red and missing CI give no finding and no check request; conflicts and behind still found; another repository's CI still counts", async () => {
+    const h = setup({ repos: { "example/app": { ci_signal: false } } }, [APP, LIB]);
+    pr(h.app, 1, {}, [["build", "failure"]]);
+    pr(h.app, 2, { mergeable: false }, [["build", "failure"]]);
+    pr(h.app, 3, { updatedAt: ago(60) }, null);
+    pr(h.lib, 5, {}, [["build", "failure"]]);
+    advanceMain(h.app, 31);
+    await h.tick();
+    expect(h.kinds()).toEqual(["example/app#1:behind", "example/app#2:behind", "example/app#2:conflicts", "example/app#3:behind", "example/lib#5:ci_red"]);
+    expect(h.requests.filter((r) => r.startsWith("GET /repos/example/app/") && /check-runs|statuses/.test(r))).toEqual([]);
+    expect(h.status().repos).toMatchObject([
+      { repo: "example/app", ciCounts: true, ciSignal: false },
+      { repo: "example/lib", ciCounts: true, ciSignal: true },
+    ]);
+  });
+
+  it("prHealth_ci_signal_default_true: without the setting, or with ci_signal true, a red run is ci_red", async () => {
+    for (const block of [{}, { repos: { "example/app": { ci_signal: true } } }]) {
+      const h = setup(block);
+      pr(h.app, 1, {}, [["build", "failure"]]);
+      await h.tick();
+      expect(h.kinds()).toEqual(["example/app#1:ci_red"]);
+      expect(h.status().repos[0]).toMatchObject({ ciSignal: true });
+    }
+  });
+
+  it("prHealth_ci_signal_config: an unlisted or malformed repository and an unknown key are refused (PR health stays off)", () => {
+    const parse = (repos: unknown) => parsePrHealthConfig(config({ repos: [APP], pr_health: { enabled: true, repos } }));
+    expect(parse({ "example/other": { ci_signal: false } })).toEqual({ ok: false, errors: ["pr_health.repos.example/other: example/other is not listed in repos:"] });
+    expect(parse({ "not a repo": { ci_signal: false } })).toEqual({ ok: false, errors: ["pr_health.repos.not a repo: use owner/name"] });
+    expect(parse({ "example/app": { ci_signal: "no" } }).ok).toBe(false);
+    expect(parse({ "example/app": { ci: false } }).ok).toBe(false);
+    const ok = parse({ "Example/App": { ci_signal: false } });
+    expect(ok.ok && ok.settings.noCiSignal).toEqual(["example/app"]);
+    const off = parsePrHealthConfig(config({ repos: [APP], pr_health: { enabled: true } }));
+    expect(off.ok && [off.settings.noCiSignal, off.settings.ownerRule]).toEqual([[], "task_line"]);
+    expect(parsePrHealthConfig(config({ repos: [APP], pr_health: { enabled: true, owner: { rule: "anyone" } } })).ok).toBe(false);
+  });
+
+  it("prHealth_owner_branch_first_branch: the branch's agent with no open line and an old head, over a task line that only mentions the PR; no commit read", async () => {
+    const h = setup({ owner: { rule: "branch_first" } }, [APP], AUTHORS);
+    pr(h.app, 42, { mergeable: false, headRef: "agent/agent-c/x" });
+    h.fill.view = fillView(["agent-a|n|t|seen on app#42 while fixing the build"]);
+    await h.tick();
+    expect(ownerOf(h, 42)).toEqual({ agent: "agent-c", source: "branch", line: null, reason: "its branch maps to agent-c (review.authors)" });
+    expect(h.of("pr_health.finding")).toMatchObject([{ owner: "agent-c", ownerSource: "branch" }]);
+    expect(h.requests.filter((r) => r.endsWith("/commits"))).toEqual([]);
+    // Before fill's first check the branch still names the owner
+    h.fill.view = fillView([], {}, { lastCheck: null });
+    await h.tick();
+    expect(ownerOf(h, 42)).toMatchObject({ agent: "agent-c", source: "branch" });
+  });
+
+  it("prHealth_owner_branch_first_registered: the review module's registered author when the branch maps to nobody; only for its own repository", async () => {
+    const h = setup({ owner: { rule: "branch_first" } }, [APP, LIB], AUTHORS, registered({ 42: "agent-r" }));
+    pr(h.app, 42, { mergeable: false, headRef: "team/topic" });
+    pr(h.lib, 42, { mergeable: false, headRef: "team/topic" });
+    await h.tick();
+    const owners = h.status().findings.map((f) => [f.repo, f.owner === "unknown" ? f.owner : f.owner.source, f.owner === "unknown" ? null : f.owner.agent]);
+    expect(owners.sort()).toEqual([
+      ["example/app", "review", "agent-r"],
+      ["example/lib", "pr_author", "example-bot"],
+    ]);
+  });
+
+  it("prHealth_owner_branch_first_fallbacks: a task line naming the PR, then the PR author; every finding has an owner", async () => {
+    const h = setup({ owner: { rule: "branch_first" }, notify_cmd: ["/opt/hooks/agent-note", "{agent}", "{id}"] }, [APP], AUTHORS, registered({}));
+    const h42 = pr(h.app, 42, { mergeable: false, headRef: "team/a" });
+    pr(h.app, 43, { headRef: "team/b" }, [["build", "failure"]]);
+    pr(h.app, 44, { mergeable: false, headRef: "agent/agent-c/y" });
+    h.fill.view = fillView(["agent-a|n|t|app PR #42 conflicts"]);
+    await h.tick();
+    expect(ownerOf(h, 42)).toMatchObject({ agent: "agent-a", source: "task_line", line: 1 });
+    expect(ownerOf(h, 43)).toEqual({ agent: "example-bot", source: "pr_author", line: null, reason: expect.stringMatching(/example-bot opened the PR$/) });
+    expect(ownerOf(h, 44)).toMatchObject({ agent: "agent-c", source: "branch" });
+    expect(h.status().findings.every((f) => f.owner !== "unknown" && f.owner.agent !== null)).toBe(true);
+    const agents = () => h.status().planned.map((p) => (p.type === "note" ? p.agent : p.type)).sort();
+    expect(agents()).toEqual(["agent-a", "agent-c", "example-bot"]);
+    expect(h.status().planned.find((p) => p.type === "note" && p.agent === "agent-a")).toMatchObject({ argv: ["/opt/hooks/agent-note", "agent-a", `pr_health:example/app#42@${h42.slice(0, 8)}:conflicts`] });
+    // Fill on but not checked yet, with no branch or registered author: unknown, nothing planned for it
+    h.fill.view = fillView([], {}, { lastCheck: null });
+    await h.tick();
+    expect(ownerOf(h, 43)).toBe("unknown");
+    expect(agents()).toEqual(["agent-c"]);
+  });
+
+  it("prHealth_owner_branch_first_bad_login: a PR author that is not a host account name owns nothing (a no_owner notice is planned)", async () => {
+    const h = setup({ owner: { rule: "branch_first" } }, [APP], AUTHORS);
+    const head = pr(h.app, 42, { mergeable: false, headRef: "team/a", user: "-not a login" });
+    await h.tick();
+    expect(ownerOf(h, 42)).toMatchObject({ agent: null, source: null, reason: expect.stringMatching(/no usable PR author/) });
+    expect(h.status().planned).toEqual([{ type: "notice", key: `pr_health:example/app#42@${head.slice(0, 8)}`, code: "no_owner" }]);
+  });
+
+  it("prHealth_owner_task_line_default: without owner.rule the PR author never owns a PR", async () => {
+    const h = setup({}, [APP], AUTHORS);
+    pr(h.app, 42, { mergeable: false, headRef: "team/a" });
+    await h.tick();
+    expect(ownerOf(h, 42)).toMatchObject({ agent: null, source: null });
   });
 });

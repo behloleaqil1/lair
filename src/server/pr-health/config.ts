@@ -17,6 +17,11 @@ export type Kind = (typeof KINDS)[number];
 export const NOTE_PLACEHOLDERS = ["agent", "repo", "pr", "head", "kinds", "id", "message"] as const;
 const PLACEHOLDER = /\{([A-Za-z_]+)\}/g;
 const IGNORED_PR = /^([A-Za-z0-9-]{1,39}\/[A-Za-z0-9_.-]{1,100})#([1-9][0-9]{0,8})$/;
+const REPO_NAME = /^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9_.-]{1,100}$/;
+
+/** The owner rule: task_line (a task line, then the branch inside a window) or branch_first (#292) */
+export const OWNER_RULES = ["task_line", "branch_first"] as const;
+export type OwnerRule = (typeof OWNER_RULES)[number];
 
 const Argv = z
   .array(z.string().min(1).max(4096))
@@ -44,7 +49,12 @@ const Block = z
     ignored_prs: z.array(z.string().regex(IGNORED_PR, "use owner/name#N")).max(200).default([]),
     // `*` stays within one path segment, and bot branches have several (dependabot/npm_and_yarn/x)
     ignored_branches: z.array(z.string()).max(50).default(["dependabot/**"]),
-    owner: z.object({ branch_window_minutes: int(0, 10080, 360) }).strict().default({}),
+    // Per listed repository: ci_signal false means its hosted CI is not the merge signal here
+    repos: z
+      .record(z.string(), z.object({ ci_signal: z.boolean().default(true) }).strict())
+      .refine((r) => Object.keys(r).length <= 100, "at most 100 repositories")
+      .default({}),
+    owner: z.object({ branch_window_minutes: int(0, 10080, 360), rule: z.enum(OWNER_RULES).default("task_line") }).strict().default({}),
     notify_cmd: Argv.nullable().default(null),
     withdraw_cmd: Argv.nullable().default(null),
     command_timeout_seconds: int(1, 300, 30),
@@ -69,6 +79,9 @@ export interface PrHealthSettings {
   ignoredPrs: { repo: string; pr: number }[];
   ignoredBranches: BranchGlob[];
   branchWindowMinutes: number;
+  ownerRule: OwnerRule;
+  /** Listed repositories (as in repos:) whose hosted CI is not a signal for PR health (pr_health.repos.<repo>.ci_signal: false) */
+  noCiSignal: string[];
   notifyCmd: string[] | null;
   withdrawCmd: string[] | null;
   commandTimeoutSeconds: number;
@@ -85,6 +98,8 @@ export interface PrHealthSettings {
   tokenCmd: string[] | null;
   /** review.authors' branch mappings, for the owner rule's branch step (none when review: does not parse) */
   authors: { branchPattern: RegExp | null; branches: BranchGlob[] };
+  /** The review module's repository (its registered PR authors are of this repository), or null */
+  reviewRepo: string | null;
 }
 
 export type ParseResult = { ok: true; settings: PrHealthSettings } | { ok: false; errors: string[] };
@@ -114,6 +129,19 @@ export function parsePrHealthConfig(project: ProjectConfig): ParseResult {
     if (entry) ignoredPrs.push({ repo: entry.repo, pr: Number(pr) });
     else if (list.ok) errors.push(`pr_health.ignored_prs.${i}: ${repo} is not listed in repos:`);
   });
+  const noCiSignal: string[] = [];
+  for (const [repo, over] of Object.entries(b.repos)) {
+    if (!REPO_NAME.test(repo)) {
+      errors.push(`pr_health.repos.${repo}: use owner/name`);
+      continue;
+    }
+    const entry = repos.find((r) => r.repo.toLowerCase() === repo.toLowerCase());
+    if (!entry) {
+      if (list.ok) errors.push(`pr_health.repos.${repo}: ${repo} is not listed in repos:`);
+      continue;
+    }
+    if (!over.ci_signal && !noCiSignal.includes(entry.repo)) noCiSignal.push(entry.repo);
+  }
   const ignoredBranches: BranchGlob[] = [];
   b.ignored_branches.forEach((glob, i) => {
     const compiled = compileBranchGlob(glob, "ignored");
@@ -149,6 +177,8 @@ export function parsePrHealthConfig(project: ProjectConfig): ParseResult {
       ignoredPrs,
       ignoredBranches,
       branchWindowMinutes: b.owner.branch_window_minutes,
+      ownerRule: b.owner.rule,
+      noCiSignal,
       notifyCmd: b.notify_cmd,
       withdrawCmd: b.withdraw_cmd,
       commandTimeoutSeconds: b.command_timeout_seconds,
@@ -160,6 +190,7 @@ export function parsePrHealthConfig(project: ProjectConfig): ParseResult {
       apiUrl: review.ok ? review.settings.apiUrl : "https://api.github.com",
       tokenEnv: review.ok ? review.settings.tokenEnv : "GITHUB_TOKEN",
       tokenCmd: review.ok ? review.settings.tokenCmd : null,
+      reviewRepo: review.ok && review.settings.repo ? review.settings.repo : null,
       authors: review.ok ? { branchPattern: review.settings.authors.branchPattern, branches: review.settings.authors.branches } : { branchPattern: null, branches: [] },
     },
   };

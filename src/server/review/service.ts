@@ -306,6 +306,11 @@ export class ReviewService {
     return { author: null, source: null, note: mapped.note, others: [] };
   }
 
+  /** The author Lair's modules registered for PR n (its id), or null: PR health's owner rule reads it */
+  registeredAuthor(n: number): string | null {
+    return this.o.store.getAuthor(this.project, n)?.id ?? null;
+  }
+
   /** The PR's state and head now, from the git host (recorded as the head seen), or null when it can't say. */
   async currentPullRequest(n: number): Promise<{ state: string; headSha: string } | null> {
     try {
