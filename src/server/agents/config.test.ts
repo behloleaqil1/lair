@@ -170,6 +170,7 @@ describe("agents config", () => {
         maxQueueWaitMinutes: 1440,
         requeueMarker: undefined,
         fallbackSeconds: 900,
+        events: { mode: "off" },
       },
       idle: {
         noticeMinutes: 0,

@@ -187,6 +187,19 @@ describe("BusStore", () => {
   // ============ Message tests ============
 
   describe("messages", () => {
+    it("unreadSince: the first message to the agent after the time that it hasn't read (a waiting agent's wake, G3)", () => {
+      const t = Date.parse("2026-03-02T12:00:00.000Z");
+      store.sendMessage("worker-b", "worker-a", "before the wait", 5, t - 1000);
+      store.sendMessage("worker-a", "worker-b", "to another agent", 5, t + 1000);
+      expect(store.unreadSince("worker-a", t)).toBeNull();
+      const first = store.sendMessage("worker-b", "worker-a", "have a look", 5, t + 2000);
+      store.sendMessage("owner", "worker-a", "and this", 5, t + 3000);
+      expect(store.unreadSince("worker-a", t)).toEqual({ id: first, at: t + 2000 });
+      // Read (the agent fetched its inbox): no longer a wake
+      store.getUnreadMessages("worker-a", t + 4000);
+      expect(store.unreadSince("worker-a", t)).toBeNull();
+    });
+
     it("sends and receives a message", () => {
       const now = Date.now();
       const id = store.sendMessage("owner", "worker-a", "Hello worker", 5, now);
