@@ -52,6 +52,7 @@ import { AwsCliIssuer, DockerSpawner, PlanSandboxManager, registerPlanSandboxRou
 import { PipelineManager, registerPipelineRoutes } from "./gates/index.js";
 import { AgentsManager, registerAgentsRoutes, systemAgentProbesWithCache } from "./agents/index.js";
 import { isActive } from "./agents/types.js";
+import { decisionWake } from "./agents/wake-events.js";
 import { AiToolsService, registerAiRoutes } from "./ai/index.js";
 import { getBudgetManager } from "./fleet/budget.js";
 import { ReviewManager, inboxDecisionSink, registerReviewRoutes } from "./review/index.js";
@@ -972,6 +973,15 @@ agents.useSpendFacts({
   verifier: (project, run) => planner.spendRun(project, "verifier", run),
   supervisor: (project, run) => supervisorStore.spendVerdict(project, run.id),
   plannerAcceptance: (project, from, to) => planner.spendAcceptance(project, from, to),
+});
+
+// G3, waiting agents woken by the awaited event (agents.fill.wake.events, docs/design/ai-spend.md §4.5): the state a
+// wait's event is read from when fill checks it (on its first look after a start, then every wake.poll_seconds), so
+// a missed server event can't strand a wait. Read-only; the bus store is opened only when its file exists
+agents.useWakeFacts({
+  pr: (project, pr, since) => reviews.wakeFacts(project, pr, since),
+  decision: (project, id) => decisionWake(decisionInbox.get(id), project),
+  message: async (project, agent, since) => (await existingBusStore(project, busDataDir))?.unreadSince(agent, since) ?? null,
 });
 
 // Live config reload (src/server/reload/): a changed project file reaches
