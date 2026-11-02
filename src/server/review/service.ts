@@ -2010,6 +2010,17 @@ export class ReviewManager {
     return this.store?.mergedPrs(project, limit) ?? [];
   }
 
+  /**
+   * A waiting agent's PR (agents.fill.wake.events): its first review or its merge recorded after `since` (ms), from
+   * the review store (read-only), or null.
+   */
+  wakeFacts(project: string, pr: number, since: number): { event: "review.submitted" | "review.merged"; at: number } | null {
+    const found = this.store?.reviewedOrMergedAfter(project, pr, new Date(since).toISOString());
+    if (!found) return null;
+    const at = Date.parse(found.at);
+    return Number.isFinite(at) ? { event: found.event, at } : null;
+  }
+
   /** Names of the projects with reviews on. */
   enabled(): string[] {
     return [...this.services.keys()];

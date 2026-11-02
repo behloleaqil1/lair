@@ -943,6 +943,30 @@ describe("AT-33: a guard (or a request or minute budget) needs agents.spend; bud
     }
   });
 
+  it("G3 (fill.wake.events): off by default; observe and act load with spend on; a bad mode is refused; on with no event capture in waiting_pattern is a warning", () => {
+    const fill = (wake: Record<string, unknown>, waiting_pattern?: string) => ({
+      enabled: true,
+      spend: { enabled: true },
+      fill: { enabled: true, tasks_file: "work/tasks.txt", agents: ["worker-a"], prompt_files: ["{prompts_dir}/{agent}.txt"], wake, ...(waiting_pattern ? { waiting_pattern } : {}) },
+    });
+    const off = parseAgentsConfig(fill({}), config);
+    expect(off.ok && off.settings.fill.wake.events).toEqual({ mode: "off" });
+    expect(off.ok && off.settings.fill.warnings.some((w) => w.includes("wake.events"))).toBe(false);
+    const withPr = "^-\\s+WAITING\\s+{task}(?:\\s+PR\\s+(?<pr>\\d{1,7}))?(?=\\s|$)";
+    for (const mode of ["observe", "act"] as const) {
+      const on = parseAgentsConfig(fill({ events: { mode } }, withPr), config);
+      expect(on.ok && on.settings.fill.wake.events).toEqual({ mode });
+      expect(on.ok && on.settings.fill.warnings).toEqual([]);
+      // The default waiting_pattern names no event: a warning, not an error
+      const bare = parseAgentsConfig(fill({ events: { mode } }), config);
+      expect(bare.ok && bare.settings.fill.warnings).toEqual([
+        `agents.fill.wake.events.mode is ${mode}, but waiting_pattern captures no (?<pr>...), (?<decision>...) or (?<message>bus): no wait names an event, so the guard has nothing to wake`,
+      ]);
+    }
+    expect(errorsOf(fill({ events: { mode: "wake" } })).some((e) => e.startsWith("agents.fill.wake.events.mode:"))).toBe(true);
+    expect(errorsOf(fill({ events: { mode: "act", poll: 5 } })).some((e) => e.startsWith("agents.fill.wake.events:"))).toBe(true);
+  });
+
   it("a daily_requests or daily_minutes limit with spend off is refused, naming both keys", () => {
     expect(errorsOf({ enabled: true, budgets: { project: { daily_requests: { soft: 800 } } } })).toContain(
       "agents.budgets.project.daily_requests: needs agents.spend.enabled: true (counted from the spend records)",
@@ -1235,6 +1259,114 @@ describe("AT-8: a builder's runs get one class and reason each", () => {
       ["idle", "waiting_same", "fill"],
     ]);
   });
+
+  /** fill over t-wait with G3 (fill.wake.events) in `mode`; its WAITING line names PR 42 and no gate */
+  function g3Wait(mode: "off" | "observe" | "act") {
+    const paths = makePaths();
+    mkdirSync(join(paths.dir, "prompts"), { recursive: true });
+    writeFileSync(join(paths.dir, "prompts", "worker.txt"), "Build what the task says.\n");
+    writeFileSync(join(paths.dir, "tasks.txt"), "worker-a|A|t-wait|Wait task\n");
+    const h = setup(
+      {
+        ...SPEND_ON,
+        fill: {
+          enabled: true,
+          tasks_file: join(paths.dir, "tasks.txt"),
+          agents: ["worker-a"],
+          prompt_files: ["{prompts_dir}/worker.txt"],
+          max_active: 1,
+          interval_seconds: 1,
+          backoff_seconds: 0,
+          waiting_pattern: "^-\\s+WAITING\\s+{task}(?:\\s+PR\\s+(?<pr>\\S+))?(?=\\s|$)",
+          wake: { fallback_seconds: 900, max_wait_minutes: 240, events: { mode } },
+        },
+      },
+      { paths },
+    );
+    /** The started run writes its WAITING line on PR 42 and exits 0; a minute later the tick ends it and writes its row */
+    const waitRun = async () => {
+      h.spawner.behaviour = (pid, logPath) => {
+        writeLog(h.clock, logPath, "asked for a review\n");
+        appendFileSync(h.queueFile, "- WAITING t-wait PR 42 by worker-a: review requested\n");
+        h.spawner.exit(pid, 0);
+      };
+      await h.service.tick();
+      h.spawner.behaviour = undefined;
+      h.clock.t += MIN;
+      await h.service.tick();
+    };
+    /** ReviewService.emit's review.submitted for PR 42 (it adds the project) */
+    const reviewOf42 = () =>
+      h.events.emit("review.submitted", {
+        project: "demo",
+        pr: 42,
+        headSha: "0123456789abcdef0123456789abcdef01234567",
+        reviewer: "worker-b",
+        verdict: "approve",
+        blockingFindings: 0,
+        stale: false,
+      });
+    const lineOf = async () => (await h.service.checkFill()).lines.find((l) => l.task === "t-wait");
+    return { h, waitRun, reviewOf42, lineOf };
+  }
+
+  it("G3 act: a WAITING on PR 42 is productive (woken_by_event) once its review woke it, however long it waited, never waiting_unnamed; the next run waiting on the same PR, started again without a newer one, is waiting_same", async () => {
+    const { h, waitRun, reviewOf42, lineOf } = g3Wait("act");
+    await h.service.checkFill();
+    await waitRun(); // ends at +1 min
+    // Written before fill looked: its class waits for its event
+    expect(byTask(h, "t-wait")[0]).toMatchObject({ class: "unclassified", reason: "pending" });
+    expect(await lineOf()).toMatchObject({ state: "held", hold: "waiting" });
+    // Past CLASSIFY_WAIT_MS and still waiting on it (act has no fallback timer): not final while the wait goes on
+    h.clock.t = NOW + 41 * MIN;
+    expect((await lineOf())?.hold).toBe("waiting");
+    await h.service.tick();
+    expect(byTask(h, "t-wait")[0]).toMatchObject({ class: "unclassified", reason: "pending" });
+
+    await reviewOf42();
+    expect((await lineOf())?.state).toBe("started");
+    h.clock.t += MIN;
+    await waitRun(); // the woken run starts at +42 min and ends on the same line
+    const [first, second] = byTask(h, "t-wait");
+    expect([first.class, first.reason]).toEqual(["productive", "woken_by_event"]);
+    expect(second).toMatchObject({ class: "unclassified", reason: "pending" });
+
+    // No newer review: fill keeps it waiting; the owner starts it again, and once that row is final it was the same wait
+    expect((await lineOf())?.hold).toBe("waiting");
+    await h.service.requestRun({ agent: "worker-a", task: "t-wait", prompt: "Look at it again" });
+    await h.service.tick();
+    h.clock.t += 31 * MIN;
+    await h.service.tick();
+    expect(byTask(h, "t-wait").slice(0, 2).map((r) => [r.class, r.reason])).toEqual([
+      ["productive", "woken_by_event"],
+      ["idle", "waiting_same"],
+    ]);
+  });
+
+  for (const [mode, came, cls, reason] of [
+    ["observe", true, "productive", "woken_by_event"],
+    ["observe", false, "idle", "waiting_event"],
+    ["off", true, "idle", "waiting_unnamed"],
+  ] as const) {
+    it(`G3 ${mode}: a WAITING on PR 42 whose review ${came ? "came" : "never came"} is ${cls}/${reason} once the fallback timer started the task again`, async () => {
+      const { h, waitRun, reviewOf42, lineOf } = g3Wait(mode);
+      await h.service.checkFill();
+      await waitRun(); // ends at +1 min
+      expect((await lineOf())?.hold).toBe("waiting");
+      if (came) {
+        h.clock.t = NOW + 5 * MIN;
+        await reviewOf42();
+        expect((await lineOf())?.hold).toBe("waiting"); // observe and off: the timer still starts it
+      }
+      h.clock.t = NOW + 16 * MIN;
+      expect((await lineOf())?.state).toBe("started");
+      await h.service.tick(); // the timer's run starts, and runs on
+      h.clock.t = NOW + 32 * MIN;
+      await h.service.tick();
+      expect(byTask(h, "t-wait")[0]).toMatchObject({ class: cls, reason });
+      expect(eventsOf(h, "guard_would")).toHaveLength(mode === "observe" && came ? 1 : 0);
+    });
+  }
 });
 
 describe("AT-9: a module's run is classified by what its module recorded", () => {

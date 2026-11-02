@@ -1000,6 +1000,21 @@ export class ReviewStore {
     return { recorded: false, headSha: assigned?.head_sha ?? null };
   }
 
+  /**
+   * For a waiting agent (agents.fill.wake.events): the first review of the PR, or its merge, recorded after an ISO
+   * time (the earlier of the two), or null when neither came.
+   */
+  reviewedOrMergedAfter(project: string, pr: number, sinceIso: string): { event: "review.submitted" | "review.merged"; at: string } | null {
+    const review = this.db
+      .prepare(`SELECT created_at AS at FROM review_reviews WHERE project = ? AND pr = ? AND created_at > ? ORDER BY created_at LIMIT 1`)
+      .get(project, pr, sinceIso) as { at: string } | undefined;
+    const merge = this.db
+      .prepare(`SELECT merged_at AS at FROM review_merges WHERE project = ? AND pr = ? AND merged_at > ? ORDER BY merged_at LIMIT 1`)
+      .get(project, pr, sinceIso) as { at: string } | undefined;
+    if (review && (!merge || review.at <= merge.at)) return { event: "review.submitted", at: review.at };
+    return merge ? { event: "review.merged", at: merge.at } : null;
+  }
+
   // ============ REVIEWS BY AGENTS ============
 
   /**
