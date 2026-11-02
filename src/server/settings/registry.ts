@@ -335,6 +335,7 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       "chat.answer_timeout_minutes": { help: "A question with no answer by then is closed and its run stopped" },
       "chat.min_interval_seconds": { advanced: true },
       "chat.max_conversation_turns": { advanced: true },
+      "chat.answer_file": { help: "The run answers by writing answer.json where Lair says, not with the lair CLI", advanced: true },
       "digest.enabled": { help: "A supervisor run writes a digest once a day; Home shows the latest" },
       "digest.time": { help: "When, in this machine's local time (HH:MM)" },
     },

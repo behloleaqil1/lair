@@ -789,7 +789,7 @@ describe("sign-in status: the tool's own check, never its token files", () => {
     const runner = new FakeRunner((argv) => {
       if (argv[0] !== "ssh") return undefined;
       const remote = argv[argv.length - 1];
-      if (remote === "command -v 'kiro-cli'") return out("/home/dev/.local/bin/kiro-cli\n");
+      if (remote === "command -v 'kiro-cli'") return out("/home/user/.local/bin/kiro-cli\n");
       if (remote === "'kiro-cli' '--version'") return out("kiro-cli 1.20.0\n");
       if (remote === "'kiro-cli' 'whoami'") return out("Logged in with Builder ID\n");
       return out("", 127, "command not found");
@@ -801,7 +801,7 @@ describe("sign-in status: the tool's own check, never its token files", () => {
       ["local", false, "unknown"],
       ["build", true, "signed_in"],
     ]);
-    expect(kiro.machines[1]).toMatchObject({ path: "/home/dev/.local/bin/kiro-cli", version: "kiro-cli 1.20.0" });
+    expect(kiro.machines[1]).toMatchObject({ path: "/home/user/.local/bin/kiro-cli", version: "kiro-cli 1.20.0" });
     // No other tool is asked about on the build machine, and the idle machine is not asked at all
     expect(view.tools.filter((t) => t.id !== "kiro").every((t) => t.machines.map((m) => m.machine).join() === "local")).toBe(true);
     expect(view.notes).toEqual(["idle: no dragon runs there, so its tools were not checked"]);

@@ -104,6 +104,8 @@ export const ChatSchema = z
     max_conversation_turns: z.number().int().min(1).max(50).default(10),
     /** A question with no answer this long after it was asked is closed, and its run stopped */
     answer_timeout_minutes: z.number().int().min(1).max(240).default(15),
+    /** The run answers by writing answer.json at the exact path Lair gives it, instead of with `lair supervisor answer` */
+    answer_file: z.boolean().default(false),
   })
   .strict();
 
