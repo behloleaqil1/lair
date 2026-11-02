@@ -302,6 +302,8 @@ export type AgentEventKind =
   | "fill_woken"
   | "fill_weak"
   | "fill_wake_absent"
+  /** G3 observe: the fallback timer started a wait whose event (a PR, a decision, a bus message) hadn't come */
+  | "fill_wake_timer"
   | "fill_report_refused"
   | "fill_report_waiting"
   | "fill_gate_queued"

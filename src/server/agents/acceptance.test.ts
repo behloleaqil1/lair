@@ -75,6 +75,7 @@ import { AgentsStore, SCHEMA_VERSION } from "./store.js";
 import type { AgentEvent, AgentRun } from "./types.js";
 import {
   BusConsumers,
+  BusStore,
   agentsBusFor,
   closeBusStores,
   existingBusStore,
@@ -83,6 +84,8 @@ import {
   structuredReport,
   type BusConsumeMode,
 } from "../bus/index.js";
+import { ReviewStore } from "../review/store.js";
+import { decisionWake } from "./wake-events.js";
 import { busStoreFor, forgetBusService, registerBusRoutes } from "../routes/bus.js";
 
 // ============ BOUNDARY FAKES ============
@@ -374,6 +377,8 @@ interface Harness extends Paths {
   service: AgentsService;
   store: AgentsStore;
   bus: string[];
+  /** The server's event bus the module listens on (G3's wake events) */
+  events: EventBus;
   /** `ps` (read through the real shared cache with the `cachedPs` option) */
   ps: FakePs;
   psCache?: ProcessCache;
@@ -553,7 +558,7 @@ function setup(
   const service = manager.get("demo");
   const store = manager.getStore();
   if (!service || !store) throw new Error(`agents not enabled: ${manager.status("demo").errors.join("; ")}`);
-  return { ...paths, config, clock, procs, spawner, runner, systemInfo, manager, service, store, bus, ps, psCache };
+  return { ...paths, config, clock, procs, spawner, runner, systemInfo, manager, service, store, bus, events, ps, psCache };
 }
 
 const request = (h: Harness, agent = "worker-a", task = "feat-login", prompt = "Build the login form") =>
@@ -2794,7 +2799,7 @@ describe("8. wiring: the router and the service's own tick", () => {
  * The agents routes and the real Decision Inbox, mounted as src/server/index.ts does. `serverYaml`: also mount
  * the decision policies with that data/server.yaml (null: no file), with the agents module, as index.ts does.
  */
-async function withInbox(h: Harness, options: { maxOpenPerSource?: number; dbPath?: string; serverYaml?: string | null } = {}) {
+async function withInbox(h: Harness, options: { maxOpenPerSource?: number; dbPath?: string; serverYaml?: string | null; events?: EventBus } = {}) {
   const { serverYaml, ...inboxOptions } = options;
   const app = Fastify();
   const tokenPath = join(h.dir, "data", "owner.token");
@@ -7847,4 +7852,519 @@ describe("AI spend G1: the fleet quota cooldown (docs/design/ai-spend.md §4.5; 
     expect(did?.data).toMatchObject({ guard: "task_no_result_cap", verdict: "park", count: 2, ends: ["crashed", "crashed"], runs: [all[4].id, all[5].id] });
     expect(h.spawner.calls).toHaveLength(6);
   });
+});
+
+// ============ AI SPEND G3: EVENT WAKE ============
+
+describe("AI spend G3: waiting agents woken by the awaited event (docs/design/ai-spend.md §4.5; AT-17, AT-18, AT-28)", () => {
+  const tasksFile = (p: Paths) => join(p.dir, "tasks.txt");
+  /** A WAITING line that may name a PR, a decision or the bus: "- WAITING <task> PR <n> by ...", "... decision <id> ...", "... on bus ..." */
+  const WAITS_ON = "^-\\s+WAITING\\s+{task}(?:\\s+PR\\s+(?<pr>\\S+)|\\s+decision\\s+(?<decision>\\S+)|\\s+on\\s+(?<message>\\S+))?(?=\\s|$)";
+  const HEAD = "0123456789abcdef0123456789abcdef01234567";
+  const at12 = (minutes: number) => new Date(NOW + minutes * MIN).toISOString();
+  /** spend on, G3 in `mode`, and fill over tasks.txt (fallback 15 minutes, no backoff after a run without done) */
+  const g3 =
+    (mode: "off" | "observe" | "act", fill: Record<string, unknown> = {}, wake: Record<string, unknown> = {}) =>
+    (p: Paths) => ({
+      spend: { enabled: true },
+      fill: {
+        enabled: true,
+        tasks_file: tasksFile(p),
+        agents: ["worker-a"],
+        prompt_files: ["{prompts_dir}/{agent}.txt"],
+        interval_seconds: 1,
+        backoff_seconds: 0,
+        waiting_pattern: WAITS_ON,
+        ...fill,
+        wake: { fallback_seconds: 900, max_wait_minutes: 240, events: { mode }, ...wake },
+      },
+    });
+  const fillTask = (p: Paths) => {
+    mkdirSync(p.promptsDir, { recursive: true });
+    writeFileSync(join(p.promptsDir, "worker-a.txt"), "You are worker A: build what the task says.\n");
+    writeFileSync(tasksFile(p), "worker-a|A|feat-login|Login form\n");
+  };
+  const lineOf = (status: FillStatusView) => {
+    const line = status.lines.find((l) => l.task === "feat-login");
+    if (!line) throw new Error("no fill line for feat-login");
+    return line;
+  };
+  const check = async (h: Harness) => lineOf(await h.service.checkFill());
+  const guardOf = (h: Harness) => h.service.spendReport("today", "project").guards.find((g) => g.guard === "wake_events");
+
+  /** Fill starts feat-login at NOW (pid 5001), which (after `during`) writes `queueLine` and exits 0; the tick at +1 min sees it end. */
+  async function runEndingWith(h: Harness, queueLine: string, during?: () => Promise<void>): Promise<AgentRun> {
+    await check(h);
+    await at(h, 0);
+    if (during) await during();
+    appendFileSync(h.queueFile, `${queueLine}\n`);
+    h.spawner.exit(5001, 0);
+    await at(h, MIN);
+    const [run] = runs(h);
+    expect(run.state).toBe("completed");
+    return run;
+  }
+
+  /** The server events as their emitters send them (ReviewService.emit adds the project; DecisionInbox; BusService) */
+  const reviewEvent = (type: "review.submitted" | "review.invalidated" | "review.merged" | "review.merge_refused", pr: number, project = "demo") =>
+    ({
+      "review.submitted": { project, pr, headSha: HEAD, reviewer: "worker-b", verdict: "approve", blockingFindings: 0, stale: false },
+      "review.invalidated": { project, pr, previousHead: HEAD, headSha: "fedcba9876543210fedcba9876543210fedcba98", staleReviews: 1 },
+      "review.merged": { project, pr, headSha: HEAD, resultSha: HEAD, method: "local", strategy: "ff-only", tier: "green", by: "owner" },
+      "review.merge_refused": { project, pr, headSha: HEAD, reasons: ["a blocking finding is open"], refusedBy: "policy", by: "owner" },
+    })[type];
+  const busMessage = (to: string) => ({ project: "demo", id: "a1b2c3d4", from: "worker-b", to, priority: 5 });
+  async function emitAt(h: Harness, minutes: number, type: Parameters<EventBus["emit"]>[0], data: Record<string, unknown>) {
+    h.clock.t = NOW + minutes * MIN;
+    await h.events.emit(type, data);
+  }
+
+  /** The review module on its own database, as the server runs it: the state check reads it through ReviewManager.wakeFacts */
+  function reviewModule(dir: string) {
+    const dbPath = join(dir, "review.db");
+    const reviews = new ReviewManager({ dbPath, env: {}, cwd: dir, agentCheckMs: 0, autoRequestMs: 0, fetch: async () => {
+      throw new Error("no network in this test");
+    } });
+    reviewManagers.push(reviews);
+    const config = {
+      name: "demo",
+      repo: dir,
+      github: "example/demo",
+      queue_file: join(dir, "queue.md"),
+      agents_dir: join(dir, "agents"),
+      gates_dir: join(dir, "gates"),
+      machines: {},
+      read_only: false,
+      review: { enabled: true, merge: { gate: { source: "checks", required: ["build"] }, work_dir: join(dir, "work") } },
+    } as unknown as ProjectConfig;
+    reviews.load([{ name: "demo", config }]);
+    const review = (pr: number, minutes: number) => {
+      const store = new ReviewStore(dbPath);
+      store.addReview({
+        project: "demo",
+        pr,
+        headSha: HEAD,
+        reviewer: { id: "worker-b", kind: "agent" },
+        verdict: "approve",
+        summary: "looks right",
+        context: {},
+        findings: [],
+        client: null,
+        at: at12(minutes),
+      });
+      store.close();
+    };
+    return { reviews, review };
+  }
+
+  it("AT-17 act: a wait on PR 42 has no fallback timer; a review of PR 41 changes nothing, one of PR 42 starts the task once", async () => {
+    const h = setup(g3("act", { backoff_seconds: 60 }));
+    fillTask(h);
+    const run = await runEndingWith(h, "- WAITING feat-login PR 42 by worker-a 12:01Z: review requested");
+    const label = "PR 42 (a review, a merge or a merge refusal)";
+
+    let line = await check(h);
+    expect(line).toMatchObject({ state: "held", hold: "waiting", waiting: { wake: label, since: at12(1), fallbackAt: null, refused: null } });
+    expect(line.detail).toBe(`waiting: ${label} since ${at12(1)}; no fallback timer: it starts again when that comes`);
+    // Long past fallback_seconds: still waiting, nothing counted
+    for (const minute of [16, 30, 90]) {
+      h.clock.t = NOW + minute * MIN;
+      expect((await check(h)).hold).toBe("waiting");
+    }
+    expect(runs(h)).toHaveLength(1);
+
+    await emitAt(h, 91, "review.submitted", reviewEvent("review.submitted", 41));
+    expect((await check(h)).hold).toBe("waiting");
+    expect(eventsOf(h, "guard_did")).toEqual([]);
+
+    await emitAt(h, 92, "review.submitted", reviewEvent("review.submitted", 42));
+    line = await check(h);
+    expect(line.state).toBe("started");
+    const [did] = eventsOf(h, "guard_did");
+    expect(eventsOf(h, "guard_did")).toHaveLength(1);
+    expect(did).toMatchObject({
+      task: "feat-login",
+      subject: "feat-login",
+      runId: run.id,
+      data: { guard: "wake_events", verdict: "wake", target: "pr", pr: 42, event: "review.submitted", eventAt: at12(92), source: "event" },
+    });
+    expect(eventsOf(h, "fill_woken")).toHaveLength(1);
+    expect(eventsOf(h, "guard_would")).toEqual([]);
+    // Once: more checks and the same event again start nothing more
+    await emitAt(h, 93, "review.submitted", reviewEvent("review.submitted", 42));
+    await check(h);
+    await check(h);
+    expect(runs(h)).toHaveLength(2);
+    await at(h, 93 * MIN);
+    expect(h.spawner.calls).toHaveLength(2);
+    expect(guardOf(h)).toMatchObject({ key: "agents.fill.wake.events.mode", mode: "act", would: 0, did: 1 });
+    // The woken run isn't a run without progress: the next one that ends without a line is the first
+    h.spawner.exit(5002, 0);
+    await at(h, 94 * MIN);
+    line = await check(h);
+    expect(line).toMatchObject({ state: "held", hold: "backoff" });
+    expect(line.detail).toContain("(1 of 3)");
+  });
+
+  it("wired: with the module started, an event makes fill check at once (its interval is an hour)", async () => {
+    const h = setup(g3("act", { interval_seconds: 3600 }));
+    fillTask(h);
+    await runEndingWith(h, "- WAITING feat-login PR 42 by worker-a: review requested");
+    expect((await check(h)).hold).toBe("waiting");
+    h.clock.t = NOW + 2 * MIN;
+    expect(h.manager.start()).toEqual(["demo"]);
+    // The loop's first check (a second after the start, once the first tick reconciled the runs); the next is an hour away
+    for (let i = 0; i < 300 && h.service.fillStatus().lastCheck !== at12(2); i++) await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(h.service.fillStatus().lastCheck).toBe(at12(2));
+    expect(runs(h)).toHaveLength(1);
+    h.clock.t = NOW + 3 * MIN;
+    await h.events.emit("review.merged", reviewEvent("review.merged", 42));
+    for (let i = 0; i < 300 && runs(h).length < 2; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(runs(h)).toHaveLength(2);
+    expect(eventsOf(h, "guard_did").map((e) => e.data.event)).toEqual(["review.merged"]);
+    await h.manager.stop();
+  }, 10_000);
+
+  for (const type of ["review.invalidated", "review.merged", "review.merge_refused"] as const) {
+    it(`AT-17 act: ${type} for the PR wakes it too; the same event of another project or PR doesn't`, async () => {
+      const h = setup(g3("act"));
+      fillTask(h);
+      await runEndingWith(h, "- WAITING feat-login PR 42 by worker-a: review requested");
+      await emitAt(h, 5, type, reviewEvent(type, 42, "other"));
+      await emitAt(h, 6, type, reviewEvent(type, 43));
+      expect((await check(h)).hold).toBe("waiting");
+      await emitAt(h, 7, type, reviewEvent(type, 42));
+      expect((await check(h)).state).toBe("started");
+      expect(eventsOf(h, "guard_did").map((e) => e.data.event)).toEqual([type]);
+    });
+  }
+
+  it("AT-17 act: an event while the run was still running counts (it may have come before the agent wrote its line)", async () => {
+    const h = setup(g3("act"));
+    fillTask(h);
+    await runEndingWith(h, "- WAITING feat-login PR 42 by worker-a: review requested", () => emitAt(h, 0.5, "review.submitted", reviewEvent("review.submitted", 42)));
+    expect((await check(h)).state).toBe("started");
+    expect(eventsOf(h, "guard_did")[0].data).toMatchObject({ event: "review.submitted", eventAt: at12(0.5) });
+  });
+
+  it("AT-17 act: a restart between the event and the check still starts the task once: the state check reads the review store", async () => {
+    const h1 = setup(g3("act"));
+    const { reviews, review } = reviewModule(h1.dir);
+    h1.manager.useWakeFacts({ pr: (project, pr, since) => reviews.wakeFacts(project, pr, since) });
+    fillTask(h1);
+    const run = await runEndingWith(h1, "- WAITING feat-login PR 42 by worker-a: review requested");
+    h1.clock.t = NOW + 2 * MIN;
+    expect((await check(h1)).hold).toBe("waiting"); // the state check found no review yet
+    // Lair goes down; meanwhile the review module records a review of PR 42 (its event reaches no agents module)
+    await h1.manager.stop();
+    review(41, 5);
+    review(42, 6);
+
+    const h2 = setup(g3("act"), { paths: h1 });
+    h2.manager.useWakeFacts({ pr: (project, pr, since) => reviews.wakeFacts(project, pr, since) });
+    h2.clock.t = NOW + 10 * MIN;
+    await h2.service.tick();
+    expect((await check(h2)).state).toBe("started");
+    expect(eventsOf(h2, "guard_did").map((e) => e.data)).toEqual([
+      { guard: "wake_events", task: "feat-login", target: "pr", pr: 42, event: "review.submitted", eventAt: at12(6), source: "state", verdict: "wake" },
+    ]);
+    expect(eventsOf(h2, "fill_woken").map((e) => e.runId)).toEqual([run.id]);
+    // Once: later checks (another state check after poll_seconds) start nothing more
+    for (const minute of [11, 12, 20]) {
+      h2.clock.t = NOW + minute * MIN;
+      await check(h2);
+    }
+    expect(runs(h2)).toHaveLength(2);
+  });
+
+  it("AT-17 act: after max_wait_minutes with no event, one decision", async () => {
+    const h = setup(g3("act"));
+    fillTask(h);
+    await runEndingWith(h, "- WAITING feat-login PR 42 by worker-a: review requested");
+    h.clock.t = NOW + 240 * MIN;
+    expect((await check(h)).hold).toBe("waiting");
+    h.clock.t = NOW + 241 * MIN;
+    const line = await check(h);
+    expect(line).toMatchObject({ state: "held", hold: "waited_too_long" });
+    for (const minute of [300, 600]) {
+      h.clock.t = NOW + minute * MIN;
+      await check(h);
+    }
+    const entries = inboxEntries(h);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toContain(`worker-a is paused on feat-login: it has waited on PR 42 (a review, a merge or a merge refusal) since ${at12(1)}`);
+    expect(runs(h)).toHaveLength(1);
+    expect(eventsOf(h, "guard_did")).toEqual([]);
+  });
+
+  /**
+   * The Decision Inbox (its real answer route and events) with the decision fact wired, and a question an agent or a
+   * tool asked over the API (POST /api/decisions), as an agent's WAITING line names one
+   */
+  async function withDecision(h: Harness) {
+    const { inbox, answer } = await withInbox(h, { events: h.events });
+    h.manager.useWakeFacts({ decision: (project, id) => decisionWake(inbox.get(id), project) });
+    const { decision } = await inbox.raiseFromHttp({
+      project: "demo",
+      kind: "other",
+      title: "Pick the default page size",
+      context: "The list view needs a page size.",
+      options: [
+        { id: "small", label: "20 rows", consequences: "Faster pages, more paging." },
+        { id: "large", label: "100 rows", consequences: "Slower pages, less paging." },
+      ],
+      recommended: { optionId: "small", reasoning: "Most lists are short." },
+      source: { module: "planner", ref: "card-12" },
+      key: "page-size",
+    });
+    return { inbox, answer, decision };
+  }
+
+  it("AT-17 act: a wait on a decision starts again when the owner answers it in the Decision Inbox (its real decision.answered)", async () => {
+    const h = setup(g3("act"));
+    const { answer, decision } = await withDecision(h);
+    fillTask(h);
+    await runEndingWith(h, `- WAITING feat-login decision ${decision.id} by worker-a: asked the owner`);
+    let line = await check(h);
+    expect(line).toMatchObject({ hold: "waiting", waiting: { wake: `decision ${decision.id} (its answer)`, fallbackAt: null } });
+    h.clock.t = NOW + 30 * MIN;
+    expect((await check(h)).hold).toBe("waiting");
+    expect((await answer(decision.id, { optionId: "small" })).statusCode).toBe(200);
+    line = await check(h);
+    expect(line.state).toBe("started");
+    expect(eventsOf(h, "guard_did").map((e) => [e.data.event, e.data.target, e.data.decision])).toEqual([["decision.answered", "decision", decision.id]]);
+  });
+
+  it("AT-17 act: a wait on the bus starts again on a message to its agent, not on one to another agent; a message sent while Lair was down is found in the bus store", async () => {
+    const h = setup(g3("act"));
+    const busA = new BusStore("demo", join(h.dir, "bus.db"));
+    h.manager.useWakeFacts({ message: (_project, agent, since) => busA.unreadSince(agent, since) });
+    fillTask(h);
+    await runEndingWith(h, "- WAITING feat-login on bus by worker-a: asked worker-b");
+    expect((await check(h)).waiting).toMatchObject({ wake: "a bus message to it", fallbackAt: null });
+    // As BusService sends one: the message is stored, then its event goes out
+    busA.sendMessage("owner", "worker-b", "for worker-b", 5, NOW + 5 * MIN);
+    await emitAt(h, 5, "bus.message", busMessage("worker-b"));
+    expect((await check(h)).hold).toBe("waiting");
+    busA.sendMessage("owner", "worker-a", "for worker-a", 5, NOW + 6 * MIN);
+    await emitAt(h, 6, "bus.message", busMessage("worker-a"));
+    expect((await check(h)).state).toBe("started");
+    expect(eventsOf(h, "guard_did").map((e) => [e.data.event, e.data.target, e.data.source, e.data.eventAt])).toEqual([["bus.message", "message", "event", at12(6)]]);
+    busA.close();
+
+    // The state check: a message to another agent wakes nothing; an unread one to it does
+    const h2 = setup(g3("act"));
+    const bus = new BusStore("demo", join(h2.dir, "bus.db"));
+    h2.manager.useWakeFacts({ message: (_project, agent, since) => bus.unreadSince(agent, since) });
+    fillTask(h2);
+    await runEndingWith(h2, "- WAITING feat-login on bus by worker-a: asked worker-b");
+    bus.sendMessage("worker-a", "worker-b", "please look", 5, NOW + 2 * MIN);
+    h2.clock.t = NOW + 2 * MIN;
+    expect((await check(h2)).hold).toBe("waiting");
+    bus.sendMessage("worker-b", "worker-a", "done, have a look", 5, NOW + 2.25 * MIN);
+    h2.clock.t = NOW + 2.5 * MIN; // inside poll_seconds (60) of the last state check: not read yet
+    expect((await check(h2)).hold).toBe("waiting");
+    h2.clock.t = NOW + 3 * MIN;
+    expect((await check(h2)).state).toBe("started");
+    expect(eventsOf(h2, "guard_did")[0].data).toMatchObject({ event: "bus.message", source: "state", eventAt: at12(2.25) });
+    bus.close();
+  });
+
+  for (const then of ["a newer answer starts it", "it is held at max_wait_minutes"] as const) {
+    it(`AT-17 act: a run woken by a decision's answer that ends on the same decision line is not started again on that answer (no restart loop); ${then}`, async () => {
+      const h = setup(g3("act"));
+      const { answer, decision } = await withDecision(h);
+      fillTask(h);
+      const waits = `- WAITING feat-login decision ${decision.id} by worker-a: asked the owner`;
+      const first = await runEndingWith(h, waits); // starts at +0, ends at +1 min
+      h.clock.t = NOW + 30 * MIN;
+      expect((await answer(decision.id, { optionId: "small" })).statusCode).toBe(200);
+      expect((await check(h)).state).toBe("started");
+      // The woken run starts a minute later and ends on the same line: it didn't act on the answer
+      await at(h, 31 * MIN);
+      appendFileSync(h.queueFile, `${waits}\n`);
+      h.spawner.exit(5002, 0);
+      await at(h, 32 * MIN);
+      const second = runs(h)[1];
+      expect(second).toMatchObject({ state: "completed", spawnedAt: NOW + 31 * MIN });
+      // Its first look reads the decision at once (the state check): answered at +30, before this run started
+      expect(await check(h)).toMatchObject({ state: "held", hold: "waiting", waiting: { wake: `decision ${decision.id} (its answer)`, fallbackAt: null } });
+      for (const minute of [33, 40, 100]) {
+        h.clock.t = NOW + minute * MIN; // past poll_seconds each time: read again, still that answer
+        expect((await check(h)).hold).toBe("waiting");
+      }
+      expect(runs(h)).toHaveLength(2);
+      expect(eventsOf(h, "fill_woken").map((e) => e.runId)).toEqual([first.id]);
+      expect(eventsOf(h, "guard_did").map((e) => [e.runId, e.data.eventAt])).toEqual([[first.id, at12(30)]]);
+
+      if (then === "a newer answer starts it") {
+        // decision.answered again for that id, as DecisionInbox.answer sends it, after the run started
+        await emitAt(h, 120, "decision.answered", { decisionId: decision.id, project: "demo", kind: "other", module: "planner", optionId: "large", by: "owner", secretSupplied: false });
+        expect((await check(h)).state).toBe("started");
+        expect(eventsOf(h, "guard_did").map((e) => [e.runId, e.data.eventAt, e.data.source])).toEqual([
+          [first.id, at12(30), "event"],
+          [second.id, at12(120), "event"],
+        ]);
+      } else {
+        // Its streak of waiting runs began when the first ended (+1 min): held at max_wait_minutes (240), not started
+        h.clock.t = NOW + 240 * MIN;
+        expect((await check(h)).hold).toBe("waiting");
+        h.clock.t = NOW + 241 * MIN;
+        expect(await check(h)).toMatchObject({ state: "held", hold: "waited_too_long" });
+        expect(runs(h)).toHaveLength(2);
+      }
+    });
+  }
+
+  it("AT-17 act: a bus message the agent read during its run wakes nothing through its event; an unread one after it does", async () => {
+    const h = setup(g3("act"));
+    const bus = new BusStore("demo", join(h.dir, "bus.db"));
+    h.manager.useWakeFacts({ message: (_project, agent, since) => bus.unreadSince(agent, since) });
+    fillTask(h);
+    await runEndingWith(h, "- WAITING feat-login on bus by worker-a: answered the owner", async () => {
+      // The owner's message comes during the run (stored, then its event, as BusService sends it), and the agent reads it
+      bus.sendMessage("owner", "worker-a", "use the small page size", 5, NOW + 0.5 * MIN);
+      await emitAt(h, 0.5, "bus.message", busMessage("worker-a"));
+      expect(bus.getUnreadMessages("worker-a", NOW + 0.75 * MIN)).toHaveLength(1);
+    });
+    expect((await check(h)).hold).toBe("waiting");
+    h.clock.t = NOW + 5 * MIN;
+    expect((await check(h)).hold).toBe("waiting");
+    expect(runs(h)).toHaveLength(1);
+    expect(eventsOf(h, "guard_did")).toEqual([]);
+    // A message after it, unread: it wakes it, as the event
+    bus.sendMessage("owner", "worker-a", "one more thing", 5, NOW + 6 * MIN);
+    await emitAt(h, 6, "bus.message", busMessage("worker-a"));
+    expect((await check(h)).state).toBe("started");
+    expect(eventsOf(h, "guard_did").map((e) => [e.data.event, e.data.source, e.data.eventAt])).toEqual([["bus.message", "event", at12(6)]]);
+    bus.close();
+  });
+
+  it("a capture that isn't a PR number is refused and shown: the wait names nothing (fallback, counted)", async () => {
+    const h = setup(g3("act"));
+    fillTask(h);
+    await runEndingWith(h, "- WAITING feat-login PR ../x by worker-a");
+    const line = await check(h);
+    expect(line).toMatchObject({ hold: "waiting", waiting: { wake: null, fallbackAt: at12(16), refused: 'PR "../x" is not a PR number (1 to 7 digits)' } });
+    expect(line.detail).toBe(
+      `waiting: (nothing named) since ${at12(1)}; event refused: PR "../x" is not a PR number (1 to 7 digits); counted as a run without progress (1 of 3): starting it again at ${at12(16)}`,
+    );
+    await emitAt(h, 5, "review.submitted", reviewEvent("review.submitted", 42));
+    expect((await check(h)).hold).toBe("waiting");
+    h.clock.t = NOW + 16 * MIN;
+    expect((await check(h)).state).toBe("started");
+    expect(eventsOf(h, "guard_did")).toEqual([]);
+  });
+
+  /** Each run fill starts writes `line`, then exits 0 */
+  const endsWith = (h: Harness, line: string) => {
+    h.spawner.behaviour = (pid) => {
+      appendFileSync(h.queueFile, `${line}\n`);
+      h.spawner.exit(pid, 0);
+    };
+  };
+  /** Start feat-login at NOW + `startMin` (the check requests it, the tick spawns it), and let it end a minute later */
+  async function runAt(h: Harness, startMin: number): Promise<void> {
+    h.clock.t = NOW + startMin * MIN;
+    expect((await check(h)).state).toBe("started");
+    await at(h, startMin * MIN);
+    await at(h, (startMin + 1) * MIN);
+  }
+
+  for (const mode of ["act", "off"] as const) {
+    it(`AT-18 ${mode}: a wait that names nothing starts again after fallback_seconds${mode === "act" ? ", doubling after each run without progress" : " (no doubling: today's rule)"}; held after max_completions_without_done`, async () => {
+      const h = setup(g3(mode, { max_completions_without_done: 3, max_backoff_seconds: 1800 }, { fallback_seconds: 60 }));
+      fillTask(h);
+      endsWith(h, "- WAITING feat-login by worker-a: waiting on a review");
+      await runAt(h, 0); // ends at +1 min
+      expect((await check(h)).detail).toContain(`(1 of 3): starting it again at ${at12(2)}`);
+      await runAt(h, 2); // ends at +3 min
+      const second = mode === "act" ? 5 : 4; // act: 120 s after the second; off: 60 s again
+      expect((await check(h)).detail).toContain(`(2 of 3): starting it again at ${at12(second)}`);
+      h.clock.t = NOW + (second - 0.5) * MIN;
+      expect((await check(h)).hold).toBe("waiting");
+      await runAt(h, second); // the third in a row
+      expect(await check(h)).toMatchObject({ state: "held", hold: "no_done" });
+      for (const minute of [60, 600]) {
+        h.clock.t = NOW + minute * MIN;
+        await check(h);
+        await h.service.tick();
+      }
+      expect(runs(h)).toHaveLength(3);
+      expect(inboxEntries(h)).toHaveLength(1);
+      expect(eventsOf(h, "guard_did")).toEqual([]);
+    });
+  }
+
+  it("AT-28 observe, with AT-17's inputs: nothing changes (the fallback timer starts it as before); one guard_would and one notice for the waiting run, the API's would count, no guard_did", async () => {
+    const h = setup(g3("observe"));
+    const { inbox } = await withInbox(h);
+    fillTask(h);
+    const run = await runEndingWith(h, "- WAITING feat-login PR 42 by worker-a 12:01Z: review requested");
+    // Today's line: a wait on nothing Lair watches, counted, with the fallback timer
+    const today = {
+      state: "held",
+      hold: "waiting",
+      waiting: { wake: null, since: at12(1), fallbackAt: at12(16), refused: null },
+      detail: `waiting: (nothing named) since ${at12(1)}; counted as a run without progress (1 of 3): starting it again at ${at12(16)}`,
+    };
+    expect(await check(h)).toMatchObject(today);
+
+    await emitAt(h, 5, "review.submitted", reviewEvent("review.submitted", 41));
+    expect(await check(h)).toMatchObject(today);
+    expect(eventsOf(h, "guard_would")).toEqual([]);
+    await emitAt(h, 6, "review.submitted", reviewEvent("review.submitted", 42));
+    expect(await check(h)).toMatchObject(today);
+    const [would] = eventsOf(h, "guard_would");
+    expect(eventsOf(h, "guard_would")).toHaveLength(1);
+    expect(would).toMatchObject({
+      task: "feat-login",
+      subject: "feat-login",
+      runId: run.id,
+      data: { guard: "wake_events", verdict: "would_wake", target: "pr", pr: 42, event: "review.submitted", eventAt: at12(6), source: "event" },
+    });
+    const notices = inbox.list({ project: "demo", status: "open" });
+    expect(notices.map((d) => [d.key, d.attention])).toEqual([[`guard_would:wake_events:${run.id}`, "notice"]]);
+    expect(notices[0]).toMatchObject({ class: "agents.spend_notice", classKnown: true, evidence: { code: "would_wake" } });
+    // The same streak: nothing more
+    await emitAt(h, 7, "review.submitted", reviewEvent("review.submitted", 42));
+    expect(await check(h)).toMatchObject(today);
+    expect(eventsOf(h, "guard_would")).toHaveLength(1);
+    expect(inbox.list({ project: "demo", status: "open" })).toHaveLength(1);
+    expect(guardOf(h)).toMatchObject({ mode: "observe", would: 1, did: 0 });
+
+    // The timer starts it as before; the event was due, so no fill_wake_timer
+    h.clock.t = NOW + 15 * MIN;
+    expect((await check(h)).hold).toBe("waiting");
+    h.clock.t = NOW + 16 * MIN;
+    expect((await check(h)).state).toBe("started");
+    expect(runs(h)).toHaveLength(2);
+    expect(eventsOf(h, "guard_did")).toEqual([]);
+    expect(eventsOf(h, "fill_woken")).toEqual([]);
+    expect(eventsOf(h, "fill_wake_timer")).toEqual([]);
+  });
+
+  for (const mode of ["observe", "off"] as const) {
+    it(`AT-28 ${mode}: the fallback timer starts a wait whose event hadn't come${mode === "observe" ? ", recorded once (fill_wake_timer: act would have kept it waiting)" : "; off records nothing and hears no event"}`, async () => {
+      const h = setup(g3(mode));
+      fillTask(h);
+      const run = await runEndingWith(h, "- WAITING feat-login PR 42 by worker-a: review requested");
+      h.clock.t = NOW + 16 * MIN;
+      expect((await check(h)).state).toBe("started");
+      await check(h);
+      expect(eventsOf(h, "fill_wake_timer").map((e) => [e.runId, e.data])).toEqual(
+        mode === "observe" ? [[run.id, { guard: "wake_events", task: "feat-login", target: "pr", pr: 42, eventDue: false }]] : [],
+      );
+      // The new run ends on the same line; an event for it now is heard in observe only
+      await at(h, 16 * MIN);
+      appendFileSync(h.queueFile, "- WAITING feat-login PR 42 by worker-a: review requested\n");
+      h.spawner.exit(5002, 0);
+      await at(h, 17 * MIN);
+      await emitAt(h, 18, "review.submitted", reviewEvent("review.submitted", 42));
+      await check(h);
+      expect(eventsOf(h, "guard_would")).toHaveLength(mode === "observe" ? 1 : 0);
+      expect(eventsOf(h, "guard_did")).toEqual([]);
+      expect(guardOf(h)).toMatchObject({ mode, would: mode === "observe" ? 1 : 0, did: 0 });
+    });
+  }
 });
