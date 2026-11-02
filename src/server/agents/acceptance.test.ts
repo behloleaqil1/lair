@@ -7508,6 +7508,62 @@ describe("AI spend G1: the fleet quota cooldown (docs/design/ai-spend.md §4.5; 
     expect(h.spawner.calls).toHaveLength(4);
   });
 
+  it("AT-13 act: a Lair restart during the cooldown keeps it: the probe at its time and only one, the same decision, and the next probe at +60", async () => {
+    const h1 = setup(quotaOn({ mode: "act" }), { dragons: WORKER_C });
+    const decisionsDb = join(h1.dir, "decisions.db");
+    await withInbox(h1, { dbPath: decisionsDb });
+    ending(h1, QUOTA_LINE);
+    await threeWaiting(h1);
+    expect(h1.spawner.calls).toHaveLength(1);
+
+    // The new server on the same data, five minutes on: the cooldown's state is read back from its events
+    const restarted: ProcessOwner = { pid: 200, startedAt: NOW + 5 * MIN };
+    const h2 = setup(quotaOn({ mode: "act" }), { paths: h1, dragons: WORKER_C, self: restarted });
+    const { inbox } = await withInbox(h2, { dbPath: decisionsDb });
+    ending(h2, QUOTA_LINE);
+    h2.clock.t = restarted.startedAt;
+    h2.spawner.nextPid = 6001;
+    h2.service.start();
+    await h2.service.tick();
+    await at(h2, 29 * MIN);
+    expect(h2.spawner.calls).toEqual([]);
+    expect(inbox.list({ project: "demo", status: "open" }).map((d) => d.key)).toEqual([`quota:provider-a:${NOW}`]);
+    await at(h2, 30 * MIN); // one probe, not three
+    expect(h2.spawner.calls).toHaveLength(1);
+    await at(h2, 30 * MIN + 30 * SEC); // it hits the quota again
+    expect(eventsOf(h2, "quota").at(-1)?.data).toMatchObject({ since: NOW, nextTryAt: NOW + 90 * MIN + 30 * SEC, steps: 2, hits: 2 });
+    await at(h2, 90 * MIN);
+    expect(h2.spawner.calls).toHaveLength(1);
+    expect(runs(h2).filter((r) => r.state === "queued")).toHaveLength(3);
+    expect(inbox.list({ project: "demo", status: "open" }).map((d) => d.key)).toEqual([`quota:provider-a:${NOW}`]);
+    expect(eventsOf(h2, "guard_did")).toHaveLength(1);
+  });
+
+  it("act: a run that started before the probe time and ends on a quota line after it is no failed probe: the step stays, and the probe still starts", async () => {
+    const h = setup(quotaOn({ mode: "act" }));
+    h.spawner.behaviour = (pid, log, call) => {
+      if (call !== 2) return writeLog(h.clock, log, "working\n"); // worker-b's long run (call 1), and the probe (call 3)
+      writeLog(h.clock, log, `${QUOTA_LINE}\n`);
+      h.spawner.exit(pid, 1);
+    };
+    await request(h, "worker-b", "t-b");
+    await request(h, "worker-a", "t-a");
+    await at(h, 0); // both start
+    await at(h, 0); // worker-a's run ends on the quota line: the cooldown starts, the probe is due at 30 min
+    expect(eventsOf(h, "quota").map((e) => e.data)).toEqual([expect.objectContaining({ since: NOW, nextTryAt: NOW + 30 * MIN, steps: 1, hits: 1 })]);
+
+    // worker-b's run, started before the cooldown, hits the quota at 35 min, before any probe ran
+    h.clock.t = NOW + 35 * MIN;
+    const [long] = runs(h).filter((r) => r.state === "running" && r.agent === "worker-b");
+    writeLog(h.clock, long.logPath!, `${QUOTA_LINE}\n`);
+    h.spawner.exit(long.pid!, 1);
+    await h.service.tick();
+    expect(eventsOf(h, "quota").at(-1)?.data).toMatchObject({ since: NOW, nextTryAt: NOW + 30 * MIN, steps: 1, hits: 2 });
+    // so the probe is still due, and worker-a's waiting run starts as the one probe
+    expect(h.spawner.calls).toHaveLength(3);
+    expect(runs(h).filter((r) => r.state === "running").map((r) => r.agent)).toEqual(["worker-a"]);
+  });
+
   it("AT-14 act: a reset time with no zone is the server's local time; one that isn't a time falls back to the backoff; a reset is capped at 24 h", async () => {
     const pattern = "hit your .* limit . resets (?<reset>.+)$";
     const cases: [string, number, (start: number) => number][] = [
@@ -7577,4 +7633,55 @@ describe("AI spend G1: the fleet quota cooldown (docs/design/ai-spend.md §4.5; 
       expect(eventsOf(h, "guard_would").map((e) => e.runId)).toEqual([failovers[0].runId, live.id]);
     });
   }
+
+  it("AT-28 observe with G2 act: one agent's quota retries count toward G2 in no window of the streak; once a start works, the task's failures count again", async () => {
+    // One agent on a 120-minute cooldown: each retry ends after the streak's first would_cool window, as act's
+    // cooldown would not (each failed probe doubles it, until a start works)
+    const h = setup(() => ({
+      spend: { enabled: true, guards: { task_no_result_cap: { mode: "act", max: 2 } } },
+      failover: { quota: { mode: "observe" }, cooldown_minutes: 120, max_failovers: 10 },
+    }));
+    const pids: number[] = [];
+    h.spawner.behaviour = (pid, log, call) => {
+      pids[call] = pid;
+      if (call >= 5) return writeLog(h.clock, log, `working ${call}\n`);
+      writeLog(h.clock, log, `${QUOTA_LINE}\n`);
+      h.spawner.exit(pid, 1);
+    };
+    await request(h, "worker-a", "t-a");
+    let t = 0;
+    for (let i = 0; i < 4; i++) {
+      await at(h, t); // the task starts again, and its run ends on the quota line
+      t += 30 * SEC;
+      await at(h, t); // today's rate-limit path: the next start after the 120-minute cooldown
+      t += 120 * MIN;
+    }
+    expect(h.spawner.calls).toHaveLength(4);
+    const failovers = eventsOf(h, "failover");
+    expect(failovers.map((e) => [e.data.kind, e.data.parked ?? false])).toEqual(Array(4).fill(["rate_limit", false]));
+    const [would] = eventsOf(h, "guard_would");
+    expect(eventsOf(h, "guard_would")).toHaveLength(1); // one streak
+    expect(failovers.slice(1).every((e) => e.at > (would.data.untilMs as number))).toBe(true); // every retry after its first window
+    expect(eventsOf(h, "guard_did")).toEqual([]);
+    expect(eventsOf(h, "escalated")).toEqual([]);
+    expect(runs(h).filter((r) => r.state === "queued")).toHaveLength(1);
+
+    // A start that runs past dead_on_start_seconds ends the streak; that run's crash and its resume's count, and park it
+    await at(h, t); // run 5 starts and runs on
+    t += 2 * MIN;
+    await at(h, t);
+    h.spawner.exit(pids[5], 2);
+    t += 30 * SEC;
+    await at(h, t); // crashed: one counted run, so it is resumed after recovery.backoff_seconds
+    expect(eventsOf(h, "guard_did")).toEqual([]);
+    t += 10 * SEC;
+    await at(h, t); // run 6 starts
+    t += 2 * MIN;
+    h.spawner.exit(pids[6], 2);
+    await at(h, t); // crashed: the second counted run
+    const all = runs(h);
+    const [did] = eventsOf(h, "guard_did");
+    expect(did?.data).toMatchObject({ guard: "task_no_result_cap", verdict: "park", count: 2, ends: ["crashed", "crashed"], runs: [all[4].id, all[5].id] });
+    expect(h.spawner.calls).toHaveLength(6);
+  });
 });

@@ -197,6 +197,8 @@ const SETTINGS_PAGES: { name: string; hash: string; shows: string }[] = [
   { name: "Overview", hash: "#/settings", shows: "build-2 doesn't answer" },
   { name: "AI: tools, profiles and roles", hash: "#/settings?tab=ai", shows: "Reviewer for AMBER" },
   { name: "Team: the agents", hash: "#/settings?tab=team", shows: "kiro-opus (kiro + claude-opus-4.5)" },
+  { name: "Work: task source, recovery, budgets", hash: "#/settings?tab=work", shows: "Task source" },
+  { name: "Gates: pipelines, executors, triage, placement", hash: "#/settings?tab=gates", shows: "Pipelines defined" },
   { name: "All settings (classic), a field shown by the search", hash: "#/settings/watchdog.interval_seconds?tab=classic", shows: "Secrets" },
   { name: "YAML", hash: "#/settings?tab=yaml", shows: "The project's file" },
   { name: "History", hash: "#/settings?tab=history", shows: "saved from Settings" },

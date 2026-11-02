@@ -2557,7 +2557,12 @@ export class AgentsService {
     return agents.size >= 2;
   }
 
-  /** G1: the provider was in a fleet quota cooldown at `at` (act), or in a would_cool window (observe). */
+  /**
+   * G1: the provider was in a fleet quota cooldown at `at` (act), or in an observe streak then. Act's cooldown doesn't
+   * end with its first backoff window (a failed probe doubles it, until a start works), so observe's streak is the one
+   * wouldCool keeps: its newest would_cool by `at` (within QUOTA_STATE_MS), with no start on the provider between it
+   * and `at` that had worked by `at`. A start after `at` doesn't end it, so a run's verdict doesn't change later.
+   */
   private quotaCooledAt(provider: string, at: number): boolean {
     const since = at - QUOTA_STATE_MS;
     const [state] = this.store.listEvents(this.project, { kinds: ["quota", "quota_cleared"], subject: provider, since, until: at, limit: 1 });
@@ -2565,7 +2570,7 @@ export class AgentsService {
     const would = this.store
       .listEvents(this.project, { kinds: ["guard_would"], subject: provider, since, until: at, limit: 20 })
       .find((e) => e.data.guard === "quota");
-    return would !== undefined && typeof would.data.untilMs === "number" && at <= would.data.untilMs;
+    return would !== undefined && !this.providerWorkedSince(provider, would.at, at);
   }
 
   /** What a verdict says, for its event, notice and decision: numbers, ids and end kinds only. */
@@ -2849,9 +2854,9 @@ export class AgentsService {
 
   /**
    * G1 act: a run's quota line. The provider cools for every agent at once until the line's reset time (capped at
-   * 24 h), else for quota.backoff_minutes, doubling per failed probe up to quota.max_backoff_minutes: a line at or
-   * after the next try is a probe that hit it again. A line before it (a run that started earlier) keeps the step and
-   * only moves the next try to a later reset time. A new cooldown records one guard_did.
+   * 24 h), else for quota.backoff_minutes, doubling per failed probe up to quota.max_backoff_minutes: a line from a
+   * run started at or after the next try is a probe that hit it again. Any other line (a run that started earlier)
+   * keeps the step and only moves the next try to a later reset time. A new cooldown records one guard_did.
    */
   private async quotaHit(run: AgentRun, info: FailoverInfo, t: Tick): Promise<QuotaCooldown> {
     const q = this.settings.failover.quota;
@@ -2859,7 +2864,8 @@ export class AgentsService {
     const previous = this.quotaCooldown(provider, t.now);
     const reset = info.quota?.reset ?? null;
     const resetAt = reset === null ? null : quotaResetAt(reset, t.now);
-    const probed = previous !== null && t.now >= previous.nextTryAt;
+    // A probe started at or after the next try; a run that started before it hitting the quota tells nothing of it
+    const probed = previous !== null && t.now >= previous.nextTryAt && (run.spawnedAt ?? t.now) >= previous.nextTryAt;
     const steps = previous === null ? 1 : probed ? previous.steps + 1 : previous.steps;
     const backoff = Math.min(q.maxBackoffMs, q.backoffMs * 2 ** Math.min(steps - 1, 30));
     const nextTryAt = previous !== null && !probed ? Math.max(previous.nextTryAt, resetAt ?? 0) : (resetAt ?? t.now + backoff);
@@ -2944,19 +2950,20 @@ export class AgentsService {
   }
 
   /**
-   * Whether a start on the provider at or after `since` worked (the newest 50 starts): it completed, or it lived
-   * dead_on_start_seconds without ending on a quota line. G1 observe's streak and notice end there.
+   * Whether a start on the provider between `since` and `until` had worked by `until` (the newest 50 starts): it
+   * completed by then, or it lived dead_on_start_seconds by then without ending on a quota line. G1 observe's streak
+   * and notice end there.
    */
-  private providerWorkedSince(provider: string, since: number, now: number): boolean {
+  private providerWorkedSince(provider: string, since: number, until: number): boolean {
     const deadOnStart = this.settings.deadOnStartSeconds * 1000;
-    for (const started of this.store.listEvents(this.project, { kinds: ["started"], since, limit: 50 })) {
+    for (const started of this.store.listEvents(this.project, { kinds: ["started"], since, until, limit: 50 })) {
       const profile = started.data.profile;
       if (!started.runId || typeof profile !== "object" || profile === null || (profile as { provider?: unknown }).provider !== provider) continue;
       const run = this.store.getRun(started.runId);
       if (!run || run.spawnedAt === undefined) continue;
-      if (run.state === "completed") return true;
+      if (run.state === "completed" && run.endedAt !== undefined && run.endedAt <= until) return true;
       if (run.failover?.quota) continue;
-      if ((run.endedAt ?? now) - run.spawnedAt >= deadOnStart) return true;
+      if (Math.min(run.endedAt ?? until, until) - run.spawnedAt >= deadOnStart) return true;
     }
     return false;
   }
