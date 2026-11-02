@@ -26,6 +26,7 @@
 | [phase4-fleet.md](phase4-fleet.md) | Phase 4: SSH machines, distributed gates, agent management | Partly built: SSH machines, gate distribution, agent adapters (only `kiro` is tested), budgets and self-healing; the manager chat view is not built |
 | [phase5-deploy.md](phase5-deploy.md) | Phase 5: Deployment, GitHub integration, kickstart | Planned, not built |
 | [sandbox.md](sandbox.md) | Agent sandboxing: threat model, isolation options, per-agent OS users, scoped credentials, migration | Planned; design for ROADMAP.md B4 |
+| [agent-launch.md](agent-launch.md) | Agent launch contract: what every adapter launch gives a run (bus, task header, push and history rules, identity, checks), observe first, with a contract test for each adapter | Planned, not built |
 
 ## Principles
 
