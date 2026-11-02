@@ -61,6 +61,7 @@ import { PlacementManager, registerPlacementRoutes } from "./placement/index.js"
 import { HostServicesManager, registerHostServicesRoutes } from "./host-services/index.js";
 import { CloudManager, registerCloudRoutes } from "./cloud/index.js";
 import { InfraMonitorManager, registerInfraMonitorRoutes } from "./infra-monitor/index.js";
+import { PrHealthManager, registerPrHealthRoutes, startedLine as prHealthStartedLine } from "./pr-health/index.js";
 import { ChecksManager, agentRunIsActive, registerChecksRoutes } from "./checks/index.js";
 import { registerDashboardRoutes } from "./dashboard/index.js";
 import type { DashboardSources } from "./dashboard/routes.js";
@@ -825,6 +826,14 @@ infraMonitor.load(projectEntries);
 infraMonitor.useDecisions(decisionInbox);
 await registerInfraMonitorRoutes(fastify, infraMonitor, () => getDefaultProject());
 
+// PR health (src/server/pr-health/): the open PRs of each repository in repos:
+// that conflict, fall behind, get no CI or go red, and the agent whose task
+// line or branch owns each (fill's last check). Off unless a project sets
+// `pr_health.enabled: true`; observe only: events and a read-only status.
+const prHealth = new PrHealthManager({ events: getEventBus(), agents });
+prHealth.load(projectEntries);
+await registerPrHealthRoutes(fastify, prHealth, () => getDefaultProject());
+
 // Agent checks (src/server/checks/): agents test on a runner before they gate.
 // One per project with `checks:` configured (off by default). A request needs
 // the run's bus token and a run the agents module has running; a run tests the
@@ -946,6 +955,7 @@ const reloader = new ConfigReloader({
     supervisor: selfChecks,
     trackers,
     infraMonitor,
+    prHealth,
     bus: {
       validate: (config) => {
         const parsed = parseBusConfig(config.bus);
@@ -1074,6 +1084,8 @@ const stopServer = async (reason: string) => {
   await hostServices.stop();
   // Stop infra monitor: any tick in progress is cut short
   await infraMonitor.stop();
+  // Stop PR health: a tick in progress ends at its next request
+  await prHealth.stop();
 
   // Stop the shared process cache (all modules have stopped, so no one reads it)
   disposeProcessCache();
@@ -1271,6 +1283,9 @@ const start = async () => {
         ? `[infra-monitor] Watching jobs for: ${infraMonitored.join(", ")}`
         : "[infra-monitor] Off (no project sets infra_monitor.enabled)",
     );
+
+    // Start PR health (each project's open PRs and their owners; observe only)
+    console.log(prHealthStartedLine(prHealth.start()));
 
     // Start agent checks (reconcile queued/running from a restart)
     const checking = checks.start();

@@ -21,7 +21,7 @@ Lair already reads PRs (the review module and the ready guard) and the agents' t
 5. As the owner, I get a Decision Inbox notice only when no agent owns the PR, or when its note could not be delivered. The notice goes away by itself once the problem clears.
 6. As the owner, a repository whose hosted CI does not work (it is disabled, or every run fails for billing reasons) produces no CI noise. Its conflicts and behind problems are still reported.
 7. If the git host times out, rate-limits Lair or fails for one repository, the other repositories are still watched. Nothing about the failing one is cleared or re-sent when it recovers.
-8. As the owner, I exclude PRs (`ignored_prs`) and bot branches (`ignored_branches`, `dependabot/*` by default) from PR health.
+8. As the owner, I exclude PRs (`ignored_prs`) and bot branches (`ignored_branches`, `dependabot/**` by default) from PR health.
 
 ## 3. Scope
 
@@ -275,7 +275,7 @@ Deduplication follows `syncNotices` (`infra-monitor/service.ts:222-275`):
 | `clear_minutes` | int | 10 | 0-1440 |
 | `kinds.{conflicts,behind,no_ci,ci_red}` | bool | `true` | |
 | `ignored_prs` | string[] | `[]` | `owner/name#N` with a repository listed in `repos`, ≤ 200 entries |
-| `ignored_branches` | string[] | `["dependabot/*"]` | `compileBranchGlob` syntax, ≤ 50 |
+| `ignored_branches` | string[] | `["dependabot/**"]` | `compileBranchGlob` syntax, ≤ 50. The default is `**`, not `*`: `*` stays within one path segment, and bot branches have several (`dependabot/npm_and_yarn/x`) |
 | `owner.branch_window_minutes` | int | 360 | 0-10080 (0: no branch rule) |
 | `notify_cmd` | argv \| null | `null` | `Argv` as in `infra-monitor/config.ts:19-23`; only the placeholders below |
 | `withdraw_cmd` | argv \| null | `null` | same |

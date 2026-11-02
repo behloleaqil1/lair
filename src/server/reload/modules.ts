@@ -24,6 +24,8 @@ import type { Supervisor } from "../supervisor/service.js";
 import type { TrackerManager } from "../tracker/manager.js";
 import { parseInfraMonitorConfig } from "../infra-monitor/config.js";
 import type { InfraMonitorManager } from "../infra-monitor/service.js";
+import { parsePrHealthConfig } from "../pr-health/config.js";
+import type { PrHealthManager } from "../pr-health/service.js";
 
 export interface ProjectEntry {
   name: string;
@@ -63,6 +65,7 @@ export interface ServerModules {
   supervisor?: Supervisor;
   trackers?: TrackerManager;
   infraMonitor?: InfraMonitorManager;
+  prHealth?: PrHealthManager;
   /** The fleet bus's switch (bus.consume, src/server/bus/consumers.ts): validated and applied per project */
   bus?: { validate(config: ProjectConfig): string[]; reloadProject(entry: ProjectEntry): Promise<void> };
 }
@@ -74,7 +77,8 @@ function errorsOf(result: { ok: true } | { ok: false; errors: string[] }): strin
 /** The server's modules, as src/server/index.ts wires them. */
 export function serverModules(m: ServerModules): ReloadableModule[] {
   const modules: ReloadableModule[] = [];
-  const { delivery, watchdogs, pipelines, reviews, agents, triage, placements, hostServices, clouds, planner, supervisor, trackers, infraMonitor, bus } = m;
+  const { delivery, watchdogs, pipelines, reviews, agents, triage, placements, hostServices, clouds, planner, supervisor, trackers, infraMonitor, prHealth, bus } =
+    m;
   if (delivery) {
     modules.push({
       name: "delivery",
@@ -191,6 +195,17 @@ export function serverModules(m: ServerModules): ReloadableModule[] {
       blocks: ["infra_monitor"],
       validate: (config) => errorsOf(parseInfraMonitorConfig(config.infra_monitor)),
       reload: (entry) => infraMonitor.reloadProject(entry),
+    });
+  }
+  if (prHealth) {
+    modules.push({
+      name: "pr_health",
+      // Its repositories are repos: (no module owns it, so a change there reloads every module); its token,
+      // host and branch authors are review's
+      blocks: ["pr_health"],
+      reads: ["review"],
+      validate: (config) => errorsOf(parsePrHealthConfig(config)),
+      reload: (entry) => prHealth.reloadProject(entry),
     });
   }
   if (bus) {
