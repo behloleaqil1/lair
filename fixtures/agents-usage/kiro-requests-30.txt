@@ -1,0 +1,222 @@
+[INFO] kas.server.starting {"product":"KAS (Kiro Agent Server)","version":"0.66.70"}
+[INFO] Auth: --auth=acp-callback (host-mediated refresh via _kiro/auth/getAccessToken)
+[INFO] acp.content_collection.resolved {"enabled":true}
+[INFO] acp.remote_sessions.enabled {"endpoint":"https://app.kiro.dev"}
+[INFO] [KiroAgent] MCP subsystem initialized
+[INFO] memory.sync.organizationDecision {"decision":"unknown"}
+[ERROR] (node:47379) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+[INFO] fs.workflow.recipes.readDir.ok {"system":"fs","tier":"user","durationMs":208}
+[INFO] fs.workflow.recipes.readDir.ok {"system":"fs","tier":"cloud","durationMs":39}
+[INFO] fs.workflow.recipes.readDir.ok {"system":"fs","tier":"cloud","durationMs":3}
+[INFO] fs.workflow.recipeCatalog.refreshShared.ok {"system":"fs","trigger":"startup","durationMs":279}
+[tool] Read File
+[tool] status: InProgress
+[tool] status: Completed
+[tool] Read File
+[tool] status: InProgress
+[tool] Run a command
+[tool] status: InProgress
+[tool] status: InProgress
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=59
+[tool] status: Completed
+[tool] status: Completed
+Agent text.
+[tool] Run a command
+[tool] status: InProgress
+[tool] status: InProgress
+[tool] Read File
+[tool] status: InProgress
+[tool] Read File
+[tool] status: InProgress
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=63
+[tool] status: Completed
+[tool] status: Completed
+[tool] status: Completed
+Agent text.
+[tool] Run a command
+[tool] status: InProgress
+[tool] status: InProgress
+[tool] Run a command
+[tool] status: InProgress
+[tool] status: InProgress
+[tool] Run a command
+[tool] status: InProgress
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=82
+[tool] status: InProgress
+[tool] status: Completed
+[tool] status: Failed: Run a command
+[tool] status: Completed
+Agent text.
+[tool] Run a command
+[tool] status: InProgress
+[tool] status: InProgress
+[tool] Run a command
+[tool] status: InProgress
+[tool] status: InProgress
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=57
+[tool] status: Completed
+[tool] status: Completed
+Agent text.
+[tool] Run a command
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=48
+[tool] status: InProgress
+[tool] status: InProgress
+[tool] status: Completed
+Agent text.
+[tool] Run a command
+[tool] status: InProgress
+[tool] status: InProgress
+[tool] Read File
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=50
+[tool] status: Completed
+[tool] status: InProgress
+[tool] status: Failed: Run a command
+[tool] List Directory
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=23
+[tool] status: InProgress
+[tool] status: Completed
+[tool] List Directory
+[tool] List Directory
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=46
+[tool] status: InProgress
+[tool] status: Completed
+[tool] status: InProgress
+[tool] status: Completed
+[tool] Read File
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=18
+[tool] status: InProgress
+[tool] status: Completed
+Agent text.[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=24
+
+[tool] Read File
+[tool] status: InProgress
+[tool] status: Completed
+Agent text.
+[tool] List Directory
+[tool] Read File
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=54
+[tool] status: InProgress
+[tool] status: Completed
+[tool] status: InProgress
+[tool] status: Completed
+[tool] Read File
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=18
+[tool] status: InProgress
+[tool] status: Completed
+Agent text.
+[tool] Read File
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=24
+[tool] status: InProgress
+[tool] status: Completed
+Agent text.
+[tool] Read File
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=31
+[tool] status: InProgress
+[tool] status: Completed
+Agent text.
+[tool] Read File
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=23
+[tool] status: InProgress
+[tool] status: Failed: Run a command
+[tool] Run a command
+[tool] status: InProgress
+[tool] status: InProgress
+[tool] List Directory
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=43
+[tool] status: Completed
+[tool] status: InProgress
+[tool] status: Completed
+[tool] Read File
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=21
+[tool] status: InProgress
+[tool] status: Completed
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=23
+[tool] List Directory
+[tool] status: InProgress
+[tool] status: Completed
+Agent text.
+[tool] Read File
+[tool] Read File
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=39
+[tool] status: InProgress
+[tool] status: Completed
+[tool] status: InProgress
+[tool] status: Completed
+Agent text.
+[tool] Run a command
+[tool] status: InProgress
+[tool] status: InProgress
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=47
+[tool] status: Completed
+[tool] Read File
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=23
+[tool] status: InProgress
+[tool] status: Completed
+Agent text.
+[tool] Read File
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=28
+[tool] status: InProgress
+[tool] status: Completed
+[tool] Read File
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=20
+[tool] status: InProgress
+[tool] status: Completed
+Agent text.
+[tool] Read File
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=27
+[tool] status: InProgress
+[tool] status: Completed
+Agent text.
+
+Agent text.
+Agent text.
+Agent text.
+Agent text.
+Agent text.
+
+Agent text.
+Agent text.
+Agent text.
+Agent text.
+Agent text.
+
+Agent text.
+Agent text.
+Agent text.
+Agent text.
+[tool] Read File
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=97
+[tool] status: InProgress
+[tool] status: Failed: Run a command
+[tool] List Directory
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=22
+[tool] status: InProgress
+[tool] status: Completed
+[tool] Read File
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=18
+[tool] status: InProgress
+[tool] status: Completed
+Agent text.
+[tool] Read File
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=28
+[tool] status: InProgress
+[tool] status: Completed
+[tool] Read File
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=20
+[tool] status: InProgress
+[tool] status: Completed
+Agent text.
+
+Agent text.
+Agent text.
+Agent text.
+Agent text.
+[tool] status: Failed: Run a command
+[tool] Write File
+[INFO] [KRS] <-- GenerateAssistantResponseCommand done totalEvents=1007
+[tool] status: Pending
+[tool] status: Completed
+[ERROR] [KRS] HTTP 429 requestId=00000000-0000-4000-8000-000000000009 body={"__type":"com.amazon.kiro.runtimeservice#ThrottlingException","message":"You have exceeded the maximum number of chat requests for today.","reason":"DAILY_REQUEST_COUNT"}
+
+Error: You've reached your daily usage limit. Please return tomorrow to continue building. (Request ID: 00000000-0000-4000-8000-000000000009) (code -32000): {"errorType":"UsageLimitReachedError","retryErrorType":"CLIENT_ERROR","requestId":"00000000-0000-4000-8000-000000000009","actions":["viewUsage"]}

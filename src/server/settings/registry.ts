@@ -147,6 +147,8 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       "agent_adapters.*.models_cmd": { help: "Lists the tool's models (no placeholders); read by models_parser" },
       "agent_adapters.*.auth_check_cmd": { help: "Exits 0 when the tool is signed in (no placeholders)" },
       "agent_adapters.*.login_hint": { help: "The command you run in a terminal to sign in (Lair never runs it)" },
+      "agent_adapters.*.usage_parser": { help: "How an ended run's usage is read from its log (agents.spend); unset: the built-in default" },
+      "agent_adapters.*.request_pattern": { advanced: true, help: "request-lines: a regular expression for one model request (case-sensitive)" },
     },
   },
   {
@@ -239,6 +241,8 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       "fill.prompt_files": { widget: "list", help: "Their contents, in order, make a run's prompt; {prompts_dir}, {agent}, {task}" },
       "fill.done_pattern": { advanced: true, help: "Matched against new queue lines; {task} and {agent} are replaced" },
       "fill.capacity_cmd": { help: "Exit 0: capacity available; anything else holds (its first output line is the reason)" },
+      "budgets.guard_mode": { help: "The mode of the request and minute limits AI spend adds; token and cost hard limits always block" },
+      "spend.enabled": { help: "Record each ended run's runtime, prompt size and the usage its adapter reports" },
     },
   },
   {

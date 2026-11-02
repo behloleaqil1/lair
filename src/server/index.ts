@@ -702,6 +702,8 @@ await mountBrainTrainer(fastify, {
   decisions: decisionInbox,
   events: getEventBus(),
   humanAuth,
+  // Each shadow proposal counts as one model call of its project (0 tokens) while that project's agents.spend is on
+  recordCall: (project, call) => agents.recordCall(project, call),
 });
 
 // Reviews and policy merge: one per project with `review.enabled: true`;
@@ -911,7 +913,7 @@ const { supervisor: selfChecks, chat: supervisorChat } = await mountSupervisor(f
   events: getEventBus(),
   decisions: decisionInbox,
   agents: {
-    requestRun: (project, input) => agents.requestRun(project, input),
+    requestRun: (project, input, options) => agents.requestRun(project, input, options),
     getStore: () => agents.getStore(),
     releaseClaim: async (project, task, why) => agents.get(project)?.releaseClaim(task, why),
   },

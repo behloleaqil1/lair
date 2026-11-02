@@ -5307,7 +5307,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     const reopened = new Database(paths.dbPath);
     try {
       expect(reopened.pragma("user_version", { simple: true })).toBe(SCHEMA_VERSION);
-      expect(SCHEMA_VERSION).toBe(3);
+      expect(SCHEMA_VERSION).toBe(4);
       expect(reopened.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_agents_runs_task'").get()).toEqual({
         name: "idx_agents_runs_task",
       });

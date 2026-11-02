@@ -4,13 +4,14 @@
  * starting the planner agent's run, its runs and fill's done records in the
  * agents store, fill's lines, and releasing a no_done hold for an unblock.
  */
-import type { AgentRunView, FillLineView } from "../../shared/agents-types.js";
+import type { AgentRunView, FillLineView, RunOrigin } from "../../shared/agents-types.js";
 import type { AgentsManager } from "../agents/service.js";
 import type { AgentsStore } from "../agents/store.js";
 import type { StructuredReport } from "../bus/consumers.js";
 
 export interface PlannerAgents {
-  requestRun(project: string, input: { agent: string; task: string; prompt: string }): Promise<AgentRunView>;
+  /** `origin`: planner or verifier, kept on the run for its AI spend record */
+  requestRun(project: string, input: { agent: string; task: string; prompt: string }, options?: { origin?: RunOrigin }): Promise<AgentRunView>;
   /** The agents store, or null while no project runs the agents module */
   store(): AgentsStore | null;
   /** Fill's lines at its last check ([] when fill is off) */
@@ -27,7 +28,7 @@ export interface PlannerAgents {
 /** The agents module as the planner uses it (the service is looked up on every call, so a reload is followed). */
 export function plannerAgentsFrom(manager: AgentsManager): PlannerAgents {
   return {
-    requestRun: (project, input) => manager.requestRun(project, input),
+    requestRun: (project, input, options) => manager.requestRun(project, input, options),
     store: () => manager.getStore(),
     fillLines: (project) => manager.get(project)?.fillStatus().lines ?? [],
     reportAccepted: async (project, agent, task, line, taskText, report) =>

@@ -95,6 +95,9 @@ const AdapterSchema = z
     login_hint: text.optional(),
     version_cmd: argv.optional(),
     experimental: z.boolean().optional(),
+    // AI spend: how an ended run's usage is read (checked when the agents module loads the project)
+    usage_parser: z.enum(["claude-stream-json", "claude-json", "request-lines", "patterns", "none"]).optional(),
+    request_pattern: text.optional(),
   })
   .passthrough();
 

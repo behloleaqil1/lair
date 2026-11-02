@@ -127,6 +127,76 @@ export interface AgentRun {
    * kept by every attempt, so an agent's own output can't buy endless ones
    */
   transientRetries?: number;
+  /** How the run ended (set with its end state): what the AI spend record classifies it by */
+  endKind?: RunEndKind;
+  /** It ended while no Lair server watched its process (its exit status is lost): its end is its log's last write */
+  exitUnseen?: boolean;
+  /** Bytes of the prompt file Lair wrote for it (the resume summary included) */
+  contextBytes?: number;
+}
+
+/**
+ * How a run ended: "completed" (exit 0, or its own queue line once its exit status was lost), else why it failed.
+ * The failed kinds are the AI spend record's no_result reasons (docs/design/ai-spend.md §4.2).
+ */
+export type RunEndKind =
+  | "completed"
+  | "hung"
+  | "crashed"
+  | "dead_on_start"
+  | "never_started"
+  | "rate_limit"
+  | "provider_error"
+  | "unreachable"
+  | "exit_unknown"
+  | "lost"
+  | "vars_lost"
+  | "lost_claim"
+  | "stopped";
+
+/** A run whose AI spend row is owed (it ended while agents.spend was on). */
+export interface SpendPending {
+  runId: string;
+  endedAt: number;
+  attempts: number;
+}
+
+/** One ended run's AI spend record (agents_spend, docs/design/ai-spend.md §4.3): numbers, ids and enums only. */
+export interface SpendRow {
+  runId: string;
+  project: string;
+  agent: string;
+  task: string;
+  chainId: string;
+  origin: RunOrigin | "other";
+  adapter: string;
+  provider: string;
+  model: string | null;
+  startedAt: number | null;
+  endedAt: number;
+  runtimeS: number;
+  class: "productive" | "idle" | "no_result" | "unclassified";
+  reason: string;
+  sessionMode: SessionMode;
+  reload: boolean;
+  lairRestart: boolean;
+  /** reported: the adapter reported tokens and cost; requests: request lines only; none: nothing (never estimated) */
+  usageSource: "reported" | "requests" | "none";
+  inputTokens: number | null;
+  cacheWriteTokens: number | null;
+  cacheReadTokens: number | null;
+  outputTokens: number | null;
+  /** Tokens as the budgets count them (input + cache write + output; usage_patterns' total), null when not reported */
+  tokens: number | null;
+  requests: number | null;
+  turns: number | null;
+  cost: number | null;
+  contextBytes: number;
+  pr: number | null;
+  headSha: string | null;
+  blockerKey: string | null;
+  backfilled: boolean;
+  usageRecorded: boolean;
 }
 
 export interface Claim {

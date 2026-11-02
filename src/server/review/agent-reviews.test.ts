@@ -257,10 +257,10 @@ async function boot(options: BootOptions = {}): Promise<Harness> {
     const inbox = await mountDecisions(app, { dbPath: ":memory:", humanAuth: auth, defaultProject: () => "demo", events, clock });
     // The real agents module, with a look at review.db as each run is requested (the token's hash must be there first)
     const port_: ReviewerRuns = {
-      requestRun: async (project, input) => {
+      requestRun: async (project, input, options) => {
         const hash = sha256(input.variables.LAIR_REVIEW_TOKEN ?? "");
         hashKnownAtStart.push(query(reviewDb, `SELECT 1 FROM review_requests WHERE token_hash = ?`, hash).length === 1);
-        return agents.requestRun(project, input);
+        return agents.requestRun(project, input, options);
       },
       status: (project) => agents.status(project),
       managedRuns: (project) => agents.managedRuns(project),
@@ -411,6 +411,8 @@ describe("reviews by agents: a slot goes to an agent Lair starts", () => {
     expect(call.env.LAIR_AGENT).toBe("rev-b");
     expect(call.env.LAIR_TASK).toBe(reviewTaskId(7, h.head, 0));
     expect(call.env.LAIR_TASK).toBe(`review-7-${h.head.slice(0, 8)}`);
+    // The run carries the module that asked for it (its AI spend record's origin)
+    expect(h.agents.getStore()!.getRun(call.env.LAIR_RUN_ID)!.origin).toBe("review");
     expect(call.env.LAIR_REVIEW_PROJECT).toBe("demo");
     expect(call.env.LAIR_URL).toBe(h.url);
     const token = call.env.LAIR_REVIEW_TOKEN;

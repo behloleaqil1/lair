@@ -124,6 +124,9 @@ describe("verifier acceptance tests", () => {
 
     // Verifier agent should have been requested
     expect(h.spawner.calls.some((c) => c.env.LAIR_AGENT === "verifier")).toBe(true);
+    // Each run carries the module that asked for it (its AI spend record's origin)
+    expect(h.agentsStore.getRun(runsOf(h)[0].verifierRunId ?? "")?.origin).toBe("verifier");
+    expect(h.agentsStore.getRun(runsOf(h)[0].agentRunId ?? "")?.origin).toBe("planner");
   });
 
   it("2. verifier approve verdict with auto_apply applies without owner", async () => {
