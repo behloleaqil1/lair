@@ -37,6 +37,7 @@ export interface FakePull {
   merged: boolean;
   body: string;
   headRef: string;
+  updatedAt: number;
 }
 
 export interface FakeMilestone {
@@ -178,11 +179,11 @@ export class FakeGitHub {
     return [...this.repo(repo).issues.values()].filter((i) => !i.isPull);
   }
 
-  addPull(repo: string, pull: Partial<FakePull> & { body: string; headRef: string }): FakePull {
+  addPull(repo: string, pull: Partial<Omit<FakePull, "updatedAt">> & { body: string; headRef: string }): FakePull {
     const r = this.repo(repo);
     const number = pull.number ?? r.next++;
     if (number >= r.next) r.next = number + 1;
-    const full: FakePull = { number, state: pull.state ?? "open", merged: pull.merged ?? false, body: pull.body, headRef: pull.headRef };
+    const full: FakePull = { number, state: pull.state ?? "open", merged: pull.merged ?? false, body: pull.body, headRef: pull.headRef, updatedAt: this.tick() };
     r.pulls.set(number, full);
     // A PR is an issue too, as GitHub's issues API lists it
     this.repo(repo).issues.set(number, {
@@ -202,6 +203,21 @@ export class FakeGitHub {
       updatedAt: this.clock,
     });
     return full;
+  }
+
+  /** A PR merged (or closed unmerged) on GitHub by any path: a push, `gh pr merge`, the web UI */
+  closePull(repo: string, number: number, merged: boolean): FakePull {
+    const pull = this.repo(repo).pulls.get(number);
+    if (!pull) throw new Error(`no PR ${repo}#${number}`);
+    pull.state = "closed";
+    pull.merged = merged;
+    pull.updatedAt = this.tick();
+    const asIssue = this.repo(repo).issues.get(number);
+    if (asIssue) {
+      asIssue.state = "closed";
+      asIssue.updatedAt = pull.updatedAt;
+    }
+    return pull;
   }
 
   addMilestone(repo: string, fields: Partial<FakeMilestone> & { title: string }): FakeMilestone {
@@ -390,8 +406,18 @@ export class FakeGitHub {
       }
     }
     if (kind === "pulls" && method === "GET") {
-      const pullJson = (p: FakePull) => ({ number: p.number, state: p.state, merged: p.merged, body: p.body, head: { ref: p.headRef } });
-      if (number === null) return reply(200, [...repo.pulls.values()].filter((p) => p.state === "open").map(pullJson));
+      const mergedAt = (p: FakePull) => (p.merged ? new Date(p.updatedAt).toISOString() : null);
+      const pullJson = (p: FakePull) => ({ number: p.number, state: p.state, merged: p.merged, merged_at: mergedAt(p), body: p.body, head: { ref: p.headRef } });
+      if (number === null) {
+        // As GitHub lists them: by state, the newest update first, one page; a listed PR has merged_at but no merged
+        const state = req.query.get("state") ?? "open";
+        const list = [...repo.pulls.values()]
+          .filter((p) => state === "all" || p.state === state)
+          .sort((a, b) => b.updatedAt - a.updatedAt)
+          .slice(0, Number(req.query.get("per_page") ?? 30))
+          .map((p) => ({ number: p.number, state: p.state, merged_at: mergedAt(p), body: p.body, head: { ref: p.headRef } }));
+        return reply(200, list);
+      }
       const pull = repo.pulls.get(number);
       return pull ? reply(200, pullJson(pull)) : reply(404, { message: "Not Found" });
     }

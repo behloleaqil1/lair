@@ -286,7 +286,7 @@ export async function setup(
     dbPath: dbs.agents,
     probes,
     events,
-    bus: busSource ? { lineSource: busSource, mintToken: () => null, revokeTokens: () => {} } : undefined,
+    bus: busSource ? { lineSource: busSource, mintToken: () => null, revokeTokens: () => {}, sweepTokens: async () => {} } : undefined,
   });
   agents.load([{ name: "demo", config }]);
   const app = Fastify();

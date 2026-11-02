@@ -8,10 +8,18 @@
  * Mirrored lines carry a marker (`[bus:<id>]`) at the end, so consumers that
  * already processed the event can skip them. This prevents double counting
  * when both the event and the mirrored line would trigger the same transition.
+ *
+ * The writes are asynchronous (they run inside POST /api/bus/call and
+ * /api/bus/send, never blocking the event loop) and serialised per file: a
+ * file's lines are appended one at a time, in the order they were asked for,
+ * so two lines never interleave and the queue file keeps the bus store's
+ * order. Each method resolves once its own lines are written (or failed), so
+ * the bus emits its event only after the mirrored line is in the file.
  */
-import { appendFileSync, existsSync, mkdirSync, utimesSync, writeFileSync } from "fs";
-import { dirname, join } from "path";
+import { appendFile, mkdir, utimes, writeFile } from "fs/promises";
+import { dirname, join, resolve } from "path";
 import type { ReportKind } from "../../bus/types.js";
+import { isPlainName } from "../agents/config.js";
 
 // ============ Config ============
 
@@ -47,12 +55,33 @@ function sanitize(value: string, max: number): string {
   /* eslint-enable no-control-regex */
 }
 
-/** Ensure a file's parent directory exists */
-function ensureDir(path: string): void {
-  const dir = dirname(path);
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
-  }
+// ============ Serialised appends ============
+
+/** Per file (resolved path), the end of its chain of appends: the next append starts once this one has settled */
+const tails = new Map<string, Promise<void>>();
+
+/**
+ * Append one line to a file after every append already asked for on it (by any mirror: a project's bus service is
+ * rebuilt when its config changes), creating its directory when missing. Queued synchronously, so lines land in the
+ * order of the calls. True once written, false when the write failed (the bus write already succeeded).
+ */
+function appendLine(path: string, line: string): Promise<boolean> {
+  const key = resolve(path);
+  const previous = tails.get(key) ?? Promise.resolve();
+  const written = previous.then(async () => {
+    await mkdir(dirname(key), { recursive: true });
+    await appendFile(key, line);
+  });
+  const settled = written.then(
+    () => true,
+    () => false,
+  );
+  const tail = settled.then(() => undefined);
+  tails.set(key, tail);
+  void tail.then(() => {
+    if (tails.get(key) === tail) tails.delete(key);
+  });
+  return settled;
 }
 
 // ============ Mirror ============
@@ -68,8 +97,9 @@ export class BusMirror {
    * Mirror a report to the queue file.
    * Format: `- {KIND} {task} by {agent} {time}: {summary} [{gate_id}] [PR #{pr}] [{sha}] [bus:{id}]`
    * The `[bus:{id}]` marker lets consumers skip lines they already processed via the event.
+   * Resolves with the files written once the line is in the file.
    */
-  mirrorReport(
+  async mirrorReport(
     agent: string,
     kind: ReportKind,
     task: string,
@@ -79,10 +109,9 @@ export class BusMirror {
     pr?: number,
     sha?: string,
     busId?: number,
-  ): string[] {
-    const mirrored: string[] = [];
-
-    if (!this.config.queueFile) return mirrored;
+  ): Promise<string[]> {
+    const queueFile = this.config.queueFile;
+    if (!queueFile) return [];
 
     const parts = [
       `-`,
@@ -99,70 +128,47 @@ export class BusMirror {
     if (sha) parts.push(`[${sanitize(sha, MAX_SHA).slice(0, 7)}]`);
     if (busId !== undefined) parts.push(`[bus:${busId}]`);
 
-    const line = parts.join(" ") + "\n";
-
-    try {
-      ensureDir(this.config.queueFile);
-      appendFileSync(this.config.queueFile, line);
-      mirrored.push(this.config.queueFile);
-    } catch {
-      // Ignore mirror failures - the bus write succeeded
-    }
-
-    return mirrored;
+    return (await appendLine(queueFile, parts.join(" ") + "\n")) ? [queueFile] : [];
   }
 
   /**
    * Mirror a message to the recipient's mailbox file.
    * Format: `- MSG {time} from {from}: {text}`
+   * An agent's mailbox is `<mail_dir>/<to>.md` only when `to` is a plain name (no '/', no '..'): any other
+   * recipient has no mailbox file. Resolves with the files written once the lines are in them.
    */
-  mirrorMessage(
-    messageId: string,
-    from: string,
-    to: string,
-    text: string,
-    time: string,
-  ): string[] {
-    const mirrored: string[] = [];
+  async mirrorMessage(messageId: string, from: string, to: string, text: string, time: string): Promise<string[]> {
+    const line = `- MSG ${time.slice(11, 16)}Z [${messageId}] from ${sanitize(from, MAX_AGENT)}: ${sanitize(text, MAX_TEXT)}\n`;
+    const writes: Array<Promise<string | null>> = [];
 
     // Write to the inbox file if to=orchestrator and inbox_file is set
-    if (to === "orchestrator" && this.config.inboxFile) {
-      const line = `- MSG ${time.slice(11, 16)}Z [${messageId}] from ${sanitize(from, MAX_AGENT)}: ${sanitize(text, MAX_TEXT)}\n`;
-      try {
-        ensureDir(this.config.inboxFile);
-        appendFileSync(this.config.inboxFile, line);
-        mirrored.push(this.config.inboxFile);
-      } catch {
-        // Ignore
-      }
+    const inboxFile = this.config.inboxFile;
+    if (to === "orchestrator" && inboxFile) {
+      writes.push(appendLine(inboxFile, line).then((ok) => (ok ? inboxFile : null)));
     }
 
     // Write to the agent's mailbox if mail_dir is set
-    if (this.config.mailDir && to !== "orchestrator" && to !== "owner") {
-      const mailFile = join(this.config.mailDir, `${sanitize(to, MAX_AGENT)}.md`);
-      const line = `- MSG ${time.slice(11, 16)}Z [${messageId}] from ${sanitize(from, MAX_AGENT)}: ${sanitize(text, MAX_TEXT)}\n`;
-      try {
-        ensureDir(mailFile);
-        appendFileSync(mailFile, line);
-        mirrored.push(mailFile);
-      } catch {
-        // Ignore
-      }
+    if (this.config.mailDir && to !== "orchestrator" && to !== "owner" && isPlainName(to)) {
+      const mailFile = join(this.config.mailDir, `${to}.md`);
+      writes.push(appendLine(mailFile, line).then((ok) => (ok ? mailFile : null)));
     }
 
-    return mirrored;
+    return (await Promise.all(writes)).filter((file): file is string => file !== null);
   }
 
-  /** Touch the wake file to signal the orchestrator */
-  touchWake(wakeFile: string): void {
+  /** Touch the wake file to signal the orchestrator (created when missing); failures are ignored */
+  async touchWake(wakeFile: string): Promise<void> {
+    const now = new Date();
     try {
-      const now = new Date();
-      if (existsSync(wakeFile)) {
-        utimesSync(wakeFile, now, now);
-      } else {
-        ensureDir(wakeFile);
-        writeFileSync(wakeFile, "");
-      }
+      await utimes(wakeFile, now, now);
+      return;
+    } catch {
+      // Missing (or unreadable): create it below
+    }
+    try {
+      await mkdir(dirname(wakeFile), { recursive: true });
+      // "a": never truncates a file created in the meantime
+      await writeFile(wakeFile, "", { flag: "a" });
     } catch {
       // Ignore
     }
