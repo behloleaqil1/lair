@@ -118,6 +118,48 @@ describe("parseReviewConfig", () => {
   });
 });
 
+describe("staged review slots (ask_after)", () => {
+  const errorsOf = (red: unknown[]) => {
+    const parsed = parseReviewConfig({ enabled: true, merge: gate, reviewers: { red } }, project);
+    return parsed.ok ? [] : parsed.errors;
+  };
+
+  it("parses the documented example; a slot without ask_after carries none", () => {
+    const doc = readFileSync(new URL("../../../docs/configuration.md", import.meta.url), "utf-8");
+    const section = doc.slice(doc.indexOf("### Staged slots"));
+    const start = section.indexOf("```yaml") + "```yaml".length;
+    const example = parseYaml(section.slice(start, section.indexOf("```", start))) as { review: Record<string, unknown> };
+    const parsed = parseReviewConfig({ enabled: true, merge: gate, ...example.review }, project);
+    expect(parsed.ok ? [] : parsed.errors).toEqual([]);
+    if (!parsed.ok) return;
+    expect(parsed.settings.reviewers.red).toEqual([
+      { anyOf: [{ kind: "peer" }], differentModel: false, pool: ["reviewer-a", "reviewer-b"] },
+      {
+        anyOf: [{ kind: "peer" }],
+        differentModel: true,
+        pool: ["strong-reviewer"],
+        askAfter: ["gate", "earlier_slots"],
+      },
+    ]);
+  });
+
+  it("refuses an unknown value, a repeated value, an empty list and earlier_slots on the first slot", () => {
+    expect(errorsOf(["human", { any_of: ["peer"], ask_after: ["ci"] }])).toEqual([
+      'review.reviewers.red[1].ask_after: unknown value "ci" (use gate or earlier_slots)',
+    ]);
+    expect(errorsOf(["human", { any_of: ["peer"], ask_after: ["gate", "gate"] }])).toEqual([
+      "review.reviewers.red[1].ask_after: a value is listed twice",
+    ]);
+    expect(errorsOf([{ any_of: ["peer"], ask_after: [] }])).toEqual([
+      "review.reviewers.red[0].ask_after: an empty list: leave ask_after out to ask as soon as the slot is missing",
+    ]);
+    expect(errorsOf([{ any_of: ["peer"], ask_after: ["earlier_slots"] }, "human"])).toEqual([
+      "review.reviewers.red[0].ask_after: earlier_slots on the tier's first slot: it has no earlier slot",
+    ]);
+    expect(errorsOf([{ any_of: ["peer"], ask_after: ["gate"] }, { any_of: ["human"], ask_after: ["earlier_slots"] }])).toEqual([]);
+  });
+});
+
 describe("required checks", () => {
   it("names the app that must have made each check run, GitHub Actions by default", () => {
     const parsed = parseReviewConfig(

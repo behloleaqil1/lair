@@ -11,7 +11,7 @@ import { useEffect, useState } from "react";
 import type { PullRequest } from "../../shared/types";
 import type { MergeHold, PrReviewStatus, ReviewFinding } from "../../shared/review-types";
 import { mergePr, prStatus, releaseHold, requestReviews, resolveFinding, submitOwnerReview } from "../review-api";
-import { GATE_BADGE, TIER_BADGE, findingLocation, parseFindingLines, shortSha } from "../review-view";
+import { GATE_BADGE, TIER_BADGE, findingLocation, parseFindingLines, requestReviewsMessage, shortSha } from "../review-view";
 import { prDetail } from "../pr-view";
 import { linkTo } from "../router";
 import { DetailPanel, DetailSection } from "./DetailPanel";
@@ -211,7 +211,7 @@ export function PrDetail({ number, raw, project, refreshKey, reviewOn, readOnly,
         title="Required reviews"
         actions={
           owner && !model.reviewsComplete ? (
-            <Button size="sm" disabled={busy} onClick={() => void act("Request reviews", () => requestReviews(project, status.number))}>
+            <Button size="sm" disabled={busy} onClick={() => void act("Request reviews", () => requestReviews(project, status.number), requestReviewsMessage)}>
               Request missing reviews
             </Button>
           ) : undefined

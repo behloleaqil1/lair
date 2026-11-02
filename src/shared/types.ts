@@ -172,6 +172,12 @@ export interface ProjectConfig {
    */
   pr_health?: Record<string, unknown>;
   /**
+   * The work store: tasks and their events in Lair's database
+   * (src/server/work/). Validated by parseWorkStoreConfig; see
+   * docs/configuration.md#work-store
+   */
+  work_store?: Record<string, unknown>;
+  /**
    * Agent checks: agents test on a runner before they gate
    * (src/server/checks/). Validated by parseChecksConfig; see
    * docs/configuration.md#checks

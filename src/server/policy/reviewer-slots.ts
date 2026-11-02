@@ -169,3 +169,27 @@ export function matchSlots(
     return { slot, label, satisfiedBy: null, detail: parts.join(". ") };
   });
 }
+
+/**
+ * Staged review slots: mark each missing slot whose `askAfter` doesn't hold
+ * at the head as waiting, with the reason (also appended to its detail). It
+ * waits on `gate` while the gate hasn't passed at the head, and on
+ * `earlier_slots` while an earlier slot of the tier isn't filled by an
+ * approval there. Filled slots, and slots without `askAfter`, never wait.
+ */
+export function withSlotWaits(slots: SlotStatus[], gatePassed: boolean, headSha: string): SlotStatus[] {
+  const head = headSha.slice(0, 7);
+  return slots.map((status, index) => {
+    const askAfter = status.slot.askAfter;
+    if (status.satisfiedBy || !askAfter) return status;
+    const why: string[] = [];
+    if (askAfter.includes("gate") && !gatePassed) why.push(`the gate to pass at ${head}`);
+    if (askAfter.includes("earlier_slots")) {
+      const open = slots.slice(0, index).flatMap((s, i) => (s.satisfiedBy ? [] : [`${i + 1} (${s.label})`]));
+      if (open.length > 0) why.push(`an approval at ${head} of earlier slot${open.length === 1 ? "" : "s"} ${open.join(", ")}`);
+    }
+    if (why.length === 0) return status;
+    const waiting = `waiting for ${why.join(" and for ")}`;
+    return { ...status, waiting, detail: `${status.detail}. Not asked for yet: ${waiting}` };
+  });
+}
