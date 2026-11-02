@@ -75,7 +75,7 @@ The inventory below was found with `git grep` on `github/main` (`0debc32`) over 
 | Lair's own pushes | `docs/design/importer.md:67` | Lair never force-pushes | Agents' pushes aren't covered |
 | Sandbox | `docs/design/sandbox.md` | Planned isolation of runs (B4) | Not built. Every guard below is a guard rail for an agent that makes a mistake, not a defence against one that tries to get around it |
 
-Two more checks found nothing on `0debc32`: `git grep -n -E "launch_contract|launch_gap|history_rewrite|mcp_config|on_argv|prompt_via|exec_commands"` and `git grep -n "hooksPath"` over `src/`. Everything in §4 marked *new* is absent today.
+Two more checks found nothing on `0debc32`: `git grep -n -E "launch_contract|launch_gap|history_rewrite|mcp_config|on_argv|prompt_via|exec_commands|submit_command|reviewSubmitCommand|branch_template|owner_mcp_file|bus_via"` and `git grep -n "hooksPath"` over `src/`. Everything in §4 marked *new* is absent today.
 
 ## 3. Gaps
 
