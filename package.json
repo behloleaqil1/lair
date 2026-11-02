@@ -75,7 +75,7 @@
     "@types/ws": "^8.5.12",
     "@vitejs/plugin-react": "^4.3.1",
     "axe-core": "^4.14.0",
-    "concurrently": "^8.2.2",
+    "concurrently": "^10.0.6",
     "eslint": "^10.14.0",
     "jsdom": "^26.1.0",
     "react": "^18.3.1",
