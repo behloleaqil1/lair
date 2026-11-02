@@ -8,12 +8,12 @@
  * names no agent.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import type { FillLineView, FillStatusView } from "../../shared/agents-types.js";
 import { findExternalAuthor, matchAuthorLines } from "./external-author.js";
-import { actingTriage, fixture, gate, harness, sha, type Harness } from "./testing/harness.js";
+import { actingTriage, fixture, gate, harness, NOW, sha, type Harness } from "./testing/harness.js";
 
 let h: Harness | null = null;
 const dirs: string[] = [];
@@ -91,13 +91,13 @@ describe("triage.external_author: tasks_file", () => {
   it("an external gate failure for a task with one open line routes to that line's agent", async () => {
     const file = tasksFileOutside();
     h = withFill(actingTriage({ external_author: "tasks_file" }), () => fillView(file, OPEN_LINES()));
-    const out = await externalFailure(h, "feature/fix-login");
+    const out = await externalFailure(h, "kiro/worker-a/fix-login");
     expect(out.record).toMatchObject({ trust: "signed", agent: "worker-a", verdict: "code" });
     const notes = h.runner.callsTo("./bin/notify");
     expect(notes).toHaveLength(1);
     expect(notes[0][1]).toBe("worker-a");
     expect(out.actions.find((a) => a.kind === "note" && a.detail.startsWith("author worker-a"))?.detail).toBe(
-      "author worker-a: the one open tasks file line that names this result (line 1, task fix-login, by its branch)",
+      "author worker-a: the one open tasks file line that names this result (line 1, task fix-login, by its agent and task in the branch)",
     );
     expect(out.actions.find((a) => a.kind === "route")).toMatchObject({ status: "done", argv: notes[0] });
   });
@@ -111,7 +111,7 @@ describe("triage.external_author: tasks_file", () => {
     expect(h.runner.callsTo("./bin/notify")).toEqual([]);
     expect(out.actions.find((a) => a.kind === "note")?.detail).toContain("2 open tasks file lines name branch feature/fix-login");
     expect(out.actions.find((a) => a.kind === "decision")).toMatchObject({ status: "done" });
-    expect(h.inbox()).toContain("no single open task line names its author");
+    expect(h.inbox()).toContain("no author agent is known for it");
   });
 
   it("no open line that names the result routes to the owner", async () => {
@@ -122,13 +122,13 @@ describe("triage.external_author: tasks_file", () => {
     expect(out.actions.find((a) => a.kind === "note")?.detail).toBe(
       "no author from the tasks file: no open tasks file line names branch feature/unknown-work or pipeline backend",
     );
-    expect(h.inbox()).toContain("no single open task line names its author");
+    expect(h.inbox()).toContain("no author agent is known for it");
   });
 
   it("observe records the would-route with the matched agent and sends nothing", async () => {
     const file = tasksFileOutside();
     h = withFill({ ...actingTriage({ external_author: "tasks_file" }), mode: "observe" }, () => fillView(file, OPEN_LINES()));
-    const out = await externalFailure(h, "feature/fix-login");
+    const out = await externalFailure(h, "worker-a/fix-login");
     expect(out.record.agent).toBe("worker-a");
     expect(out.actions.find((a) => a.kind === "route")).toMatchObject({
       status: "planned",
@@ -158,7 +158,7 @@ describe("triage.external_author: tasks_file", () => {
       reads++;
       return fillView(file, OPEN_LINES());
     });
-    const out = await externalFailure(h, "feature/fix-login");
+    const out = await externalFailure(h, "kiro/worker-a/fix-login");
     expect(reads).toBe(0);
     expect(out.record.agent).toBeUndefined();
     expect(out.actions.find((a) => a.kind === "route")).toMatchObject({ status: "skipped" });
@@ -173,11 +173,11 @@ describe("triage.external_author: tasks_file", () => {
       writeFileSync(file, "");
       return fillView(file, OPEN_LINES());
     });
-    const out = await externalFailure(h, "feature/fix-login");
+    const out = await externalFailure(h, "kiro/worker-a/fix-login");
     expect(out.record.agent).toBeUndefined();
     expect(h.runner.callsTo("./bin/notify")).toEqual([]);
     expect(out.actions.find((a) => a.kind === "note")?.detail).toContain("inside the project's repository");
-    expect(h.inbox()).toContain("no single open task line names its author");
+    expect(h.inbox()).toContain("no author agent is known for it");
   });
 
   it("an unreadable fill status, or no fill at all, finds no author and asks the owner", async () => {
@@ -192,7 +192,7 @@ describe("triage.external_author: tasks_file", () => {
     h = harness(actingTriage({ external_author: "tasks_file" }));
     const none = await externalFailure(h, "feature/fix-login", sha("x2"));
     expect(none.actions.find((a) => a.kind === "note")?.detail).toContain("no tasks file source is connected");
-    expect(h.inbox()).toContain("no single open task line names its author");
+    expect(h.inbox()).toContain("no author agent is known for it");
   });
 
   it("a trusted result that names its agent keeps it: the tasks file is not read", async () => {
@@ -217,7 +217,85 @@ describe("triage.external_author: tasks_file", () => {
     await externalFailure(h, "feature/unknown-work", sha("x4"), "backend");
     const again = await externalFailure(h, "feature/unknown-work", sha("x4"), "frontend");
     expect(again.actions.find((a) => a.kind === "decision")).toMatchObject({ status: "skipped" });
-    expect(h.inbox().match(/no single open task line names its author/g)).toHaveLength(1);
+    expect(h.inbox().match(/no author agent is known for it/g)).toHaveLength(1);
+  });
+
+  it("one line that names the result only by pipeline routes to the owner, not to its agent", async () => {
+    const file = tasksFileOutside();
+    // Task id e2e is the pipeline; the failing branch is one no line names
+    h = withFill(actingTriage({ external_author: "tasks_file" }), () => fillView(file, [line(1, "worker-b", "e2e", "started", "stabilise the e2e suite")]));
+    const out = await externalFailure(h, "claude/billing-fix", sha("p1"), "e2e");
+    expect(out.record.agent).toBeUndefined();
+    expect(h.runner.callsTo("./bin/notify")).toEqual([]);
+    expect(out.actions.find((a) => a.kind === "note")?.detail).toBe(
+      "no author from the tasks file: only line 1 (worker-b, e2e) names branch claude/billing-fix or pipeline e2e, by its pipeline only, which does not show who wrote the branch",
+    );
+    expect(h.inbox()).toContain("no author agent is known for it");
+  });
+
+  it("one held line that names the result only by its last segment (a takeover's branch) routes to the owner", async () => {
+    const file = tasksFileOutside();
+    h = withFill(actingTriage({ external_author: "tasks_file" }), () => fillView(file, [line(1, "worker-a", "fix-login", "held")]));
+    const out = await externalFailure(h, "claude/fix-login", sha("p2"));
+    expect(out.record.agent).toBeUndefined();
+    expect(h.runner.callsTo("./bin/notify")).toEqual([]);
+    expect(out.actions.find((a) => a.kind === "note")?.detail).toContain("by its branch's last segment only");
+    expect(h.inbox()).toContain("no author agent is known for it");
+  });
+
+  it("a trusted in-process result without context.agent gets its author from the tasks file", async () => {
+    const file = tasksFileOutside();
+    h = withFill(actingTriage({ external_author: "tasks_file" }), () => fillView(file, OPEN_LINES()));
+    const out = await h.ingest({
+      result: gate({ sha: sha("t1"), branch: "kiro/worker-b/add-export" }),
+      reports: [{ content: fixture("junit-assertion.xml") }],
+    });
+    expect(out.record).toMatchObject({ trust: "trusted", agent: "worker-b" });
+    expect(h.runner.callsTo("./bin/notify").map((c) => c[1])).toEqual(["worker-b"]);
+  });
+
+  it("a symlinked tasks file whose target is inside the repository is not trusted", async () => {
+    const link = join(mkdtempSync(join(tmpdir(), "lair-link-")), "tasks.txt");
+    dirs.push(join(link, ".."));
+    h = withFill(actingTriage({ external_author: "tasks_file" }), () => {
+      const target = join(h!.dir, "tasks.txt");
+      writeFileSync(target, "");
+      try {
+        symlinkSync(target, link);
+      } catch {
+        // already linked by an earlier read
+      }
+      return fillView(link, OPEN_LINES());
+    });
+    const out = await externalFailure(h, "kiro/worker-a/fix-login", sha("s1"));
+    expect(out.record.agent).toBeUndefined();
+    expect(h.runner.callsTo("./bin/notify")).toEqual([]);
+    expect(out.actions.find((a) => a.kind === "note")?.detail).toContain("inside the project's repository");
+  });
+
+  it("a stopped fill or a stale last check finds no author: the owner is asked", async () => {
+    const file = tasksFileOutside();
+    h = withFill(actingTriage({ external_author: "tasks_file" }), () => fillView(file, OPEN_LINES(), { running: false }));
+    const stopped = await externalFailure(h, "kiro/worker-a/fix-login", sha("f1"));
+    expect(stopped.record.agent).toBeUndefined();
+    expect(stopped.actions.find((a) => a.kind === "note")?.detail).toContain("agents.fill is stopped");
+    await h.cleanup();
+
+    // 121 s before NOW with a 60 s interval: older than two intervals
+    const stale = new Date(NOW - 121_000).toISOString();
+    h = withFill(actingTriage({ external_author: "tasks_file" }), () => fillView(file, OPEN_LINES(), { lastCheck: stale }));
+    const old = await externalFailure(h, "kiro/worker-a/fix-login", sha("f2"));
+    expect(old.record.agent).toBeUndefined();
+    expect(old.actions.find((a) => a.kind === "note")?.detail).toContain("older than two intervals");
+    expect(h.runner.callsTo("./bin/notify")).toEqual([]);
+  });
+
+  it("the owner's question says no author is known, not that the tasks file was read", async () => {
+    const file = tasksFileOutside();
+    h = withFill(actingTriage({ external_author: "tasks_file" }), () => fillView(file, OPEN_LINES()));
+    await externalFailure(h, "feature/unknown-work", sha("w1"));
+    expect(h.inbox()).not.toContain("no single open task line");
+    expect(h.inbox()).toContain("no author agent is known for it");
   });
 });
 
@@ -233,11 +311,15 @@ describe("matchAuthorLines and findExternalAuthor", () => {
       line(5, "worker-d", "fix-login", "malformed"),
       line(6, "worker-e", "fix-login", "held"),
     ];
-    expect(matchAuthorLines(lines, subject)).toEqual([{ line: 6, agent: "worker-e", task: "fix-login", by: "branch" }]);
+    expect(matchAuthorLines(lines, subject)).toEqual([{ line: 6, agent: "worker-e", task: "fix-login", by: "segment" }]);
   });
 
   it("names a result by the whole branch, its last segment, the pipeline, or the branch as a word in the description", () => {
     expect(matchAuthorLines([line(1, "worker-a", "team/fix-login", "held")], subject)[0]?.by).toBe("branch");
+    expect(matchAuthorLines([line(1, "worker-a", "fix-login", "held")], subject)[0]?.by).toBe("segment");
+    expect(matchAuthorLines([line(1, "worker-a", "fix-login", "held")], { branch: "kiro/worker-a/fix-login", pipelineId: "p" })[0]?.by).toBe("agent_branch");
+    // Another agent's id in the branch is not the line's agent
+    expect(matchAuthorLines([line(1, "worker-a", "fix-login", "held")], { branch: "kiro/worker-b/fix-login", pipelineId: "p" })[0]?.by).toBe("segment");
     expect(matchAuthorLines([line(1, "worker-a", "backend", "held")], subject)[0]?.by).toBe("pipeline");
     expect(matchAuthorLines([line(1, "worker-a", "t1", "held", "on team/fix-login, then review")], subject)[0]?.by).toBe("description");
     // Part of a longer name is not the branch
@@ -251,12 +333,22 @@ describe("matchAuthorLines and findExternalAuthor", () => {
     const file = tasksFileOutside();
     const repo = mkdtempSync(join(tmpdir(), "lair-repo-"));
     dirs.push(repo);
-    expect(findExternalAuthor(null, repo, subject).kind).toBe("unavailable");
-    expect(findExternalAuthor(fillView(file, OPEN_LINES(), { enabled: false }), repo, subject).kind).toBe("unavailable");
-    expect(findExternalAuthor(fillView(file, OPEN_LINES(), { lastCheck: null }), repo, subject).kind).toBe("unavailable");
-    expect(findExternalAuthor(fillView(file, OPEN_LINES(), { lastError: "too long" }), repo, subject).kind).toBe("unavailable");
-    expect(findExternalAuthor(fillView(null, OPEN_LINES()), repo, subject).kind).toBe("unavailable");
-    expect(findExternalAuthor(fillView(join(repo, "missing.txt"), OPEN_LINES()), repo, subject).kind).toBe("unavailable");
-    expect(findExternalAuthor(fillView(file, OPEN_LINES()), repo, subject)).toMatchObject({ kind: "one", author: { agent: "worker-a" } });
+    expect(findExternalAuthor(null, repo, subject, NOW).kind).toBe("unavailable");
+    expect(findExternalAuthor(fillView(file, OPEN_LINES(), { enabled: false }), repo, subject, NOW).kind).toBe("unavailable");
+    expect(findExternalAuthor(fillView(file, OPEN_LINES(), { lastCheck: null }), repo, subject, NOW).kind).toBe("unavailable");
+    expect(findExternalAuthor(fillView(file, OPEN_LINES(), { lastError: "too long" }), repo, subject, NOW).kind).toBe("unavailable");
+    expect(findExternalAuthor(fillView(null, OPEN_LINES()), repo, subject, NOW).kind).toBe("unavailable");
+    expect(findExternalAuthor(fillView(join(repo, "missing.txt"), OPEN_LINES()), repo, subject, NOW).kind).toBe("unavailable");
+    expect(findExternalAuthor(fillView(file, OPEN_LINES(), { running: false }), repo, subject, NOW).kind).toBe("unavailable");
+    expect(findExternalAuthor(fillView(file, OPEN_LINES(), { lastCheck: "not a time" }), repo, subject, NOW).kind).toBe("unavailable");
+    // A last segment alone names the result but does not pick its author
+    expect(findExternalAuthor(fillView(file, OPEN_LINES()), repo, subject, NOW).kind).toBe("none");
+    expect(findExternalAuthor(fillView(file, OPEN_LINES()), repo, { branch: "team/worker-a/fix-login", pipelineId: "backend" }, NOW)).toMatchObject({
+      kind: "one",
+      author: { agent: "worker-a", by: "agent_branch" },
+    });
+    // A strong match plus a pipeline-only one is ambiguous
+    const both = [line(1, "worker-a", "fix-login", "held"), line(2, "worker-b", "backend", "started")];
+    expect(findExternalAuthor(fillView(file, both), repo, { branch: "worker-a/fix-login", pipelineId: "backend" }, NOW).kind).toBe("ambiguous");
   });
 });
