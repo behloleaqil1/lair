@@ -22,8 +22,8 @@ machines:
     connect_timeout: 4
     runners:
       - remote
-    work_dir: /home/deploy/my-project
-    kiro_cli: /home/deploy/.local/bin/kiro-cli
+    work_dir: /home/user/my-project
+    kiro_cli: /home/user/.local/bin/kiro-cli
 
 available_models:
   - id: claude-opus-4.5

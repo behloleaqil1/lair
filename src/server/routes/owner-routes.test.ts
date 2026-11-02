@@ -93,6 +93,10 @@ beforeAll(async () => {
       const config = loadProjectConfig(project);
       return { ...config, mail_dir: undefined, wake_file: undefined };
     },
+    // The bus is on (busMode) for every project here: the routes' owner checks are what is tested
+    mode: () => busMode,
+    enabled: () => [],
+    health: () => ({ mode: "on", received: 0, refused: [], refusedCount: 0, observations: { total: 0, matches: 0, mismatches: 0, recent: [] } }),
   };
 
   app = Fastify({ logger: false });
@@ -162,6 +166,8 @@ function expectRefused(res: { statusCode: number; json: () => { error?: string }
 }
 
 const p = `?project=${PROJECT}`;
+/** The project's bus.consume as the bus routes see it */
+let busMode: "off" | "observe" | "on" = "on";
 
 describe("controls: commands and dragon start/stop", () => {
   it("refuses every command without the owner's session, and changes nothing", async () => {
@@ -209,7 +215,7 @@ describe("controls: commands and dragon start/stop", () => {
 describe("bus: messages sent as the owner", () => {
   function unread(agent: string) {
     // Read from the server-owned bus store
-    const store = getBusStore(PROJECT, join(TMP, "bus"));
+    const store = getBusStore(PROJECT, TMP);
     const now = Date.now();
     return store.getUnreadMessages(agent, now).map((m) => ({
       from_id: m.fromId,
@@ -230,6 +236,22 @@ describe("bus: messages sent as the owner", () => {
     const sent = await sendBusMessage(PROJECT, "worker-a", "rebase on main");
     expect(sent).toMatchObject({ success: true, data: { to: "worker-a" } });
     expect(unread("worker-a")).toMatchObject([{ from_id: "owner", to_id: "worker-a", text: "rebase on main" }]);
+  });
+
+  it("answers 404 for a project whose bus.consume is off, as without the bus, the consumers' status excepted", async () => {
+    busMode = "off";
+    try {
+      for (const url of [`/api/bus/board${p}`, `/api/bus/messages/worker-a${p}`]) {
+        const res = await app.inject({ url });
+        expect(res.statusCode).toBe(404);
+        expect(res.json().error).toBe(`the bus is off for ${PROJECT}: set bus.consume to observe or on (docs/configuration.md#fleet-bus)`);
+      }
+      expect((await post(`/api/bus/send${p}`, { to: "worker-a", text: "not sent" }, owner())).statusCode).toBe(404);
+      expect(unread("worker-a").map((m) => m.text)).not.toContain("not sent");
+      expect((await app.inject({ url: `/api/bus/consumers${p}` })).statusCode).toBe(200);
+    } finally {
+      busMode = "on";
+    }
   });
 });
 

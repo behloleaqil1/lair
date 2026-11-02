@@ -109,6 +109,12 @@ export interface ProjectConfig {
    */
   placement?: Record<string, unknown>;
   /**
+   * Host services: per-machine services with probe and start
+   * (src/server/host-services/). Validated by parseHostServicesConfig; see
+   * docs/configuration.md#host-services
+   */
+  host_services?: Record<string, unknown>;
+  /**
    * Cloud machines: the provider, the spend meter and the money guard
    * (src/server/cloud/). Validated by parseCloudConfig; see
    * docs/configuration.md#cloud-machines
@@ -120,11 +126,44 @@ export interface ProjectConfig {
    */
   planner?: Record<string, unknown>;
   /**
+   * The tracker: GitHub issues, Projects boards and milestones kept in step
+   * with the tasks (src/server/tracker/). Validated by parseTrackerConfig;
+   * see docs/configuration.md#tracker
+   */
+  tracker?: Record<string, unknown>;
+  /**
+   * Lessons: what Lair has learned from incidents (src/server/lessons/).
+   * Validated by parseLessonsConfig; see docs/configuration.md#lessons
+   */
+  lessons?: Record<string, unknown>;
+  /**
    * The supervisor: Lair's self-checks (src/server/supervisor/). Validated
    * by parseSupervisorConfig; see
    * docs/configuration.md#supervisor-self-checks-and-the-ops-api
    */
   supervisor?: Record<string, unknown>;
+  /**
+   * Fleet bus consumers (src/server/bus/consumers.ts): how fill and the
+   * planner react to bus events. Validated by parseBusConfig; see
+   * docs/configuration.md#fleet-bus
+   */
+  bus?: Record<string, unknown>;
+  /** Directory for per-agent mailbox files (bus mirror) */
+  mail_dir?: string;
+  /** File to touch when dragons should wake (bus mirror) */
+  wake_file?: string;
+  /**
+   * Infrastructure monitor: watch running jobs' machines
+   * (src/server/infra-monitor/). Validated by parseInfraMonitorConfig; see
+   * docs/configuration.md#infrastructure-monitor
+   */
+  infra_monitor?: Record<string, unknown>;
+  /**
+   * Agent checks: agents test on a runner before they gate
+   * (src/server/checks/). Validated by parseChecksConfig; see
+   * docs/configuration.md#checks
+   */
+  checks?: Record<string, unknown>;
 }
 
 // Process configuration as it appears in YAML (before defaults applied)

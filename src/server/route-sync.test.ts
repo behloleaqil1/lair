@@ -58,6 +58,7 @@ const ROUTE_FILES = [
   "delivery/routes.ts",
   "gates/routes.ts",
   "placement/routes.ts",
+  "infra-monitor/routes.ts",
   "cloud/routes.ts",
   "review/routes.ts",
   "triage/routes.ts",

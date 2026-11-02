@@ -21,6 +21,7 @@ import { PlacementSchema } from "../placement/config.js";
 import { CloudSchema } from "../cloud/config.js";
 import { ReviewSchema } from "../review/config.js";
 import { SupervisorSchema } from "../supervisor/config.js";
+import { TrackerSchema } from "../tracker/config.js";
 import { TriageSchema } from "../triage/config.js";
 import { WatchdogSchema } from "../watchdog/config.js";
 import {
@@ -296,6 +297,27 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
     },
   },
   {
+    key: "tracker",
+    title: "Tracker: GitHub issues, boards and milestones",
+    schema: TrackerSchema,
+    docs: "#tracker",
+    hints: {
+      mode: { help: "observe records what it would change on GitHub and sends nothing; act creates and closes issues, moves cards and closes milestones" },
+      repos: { help: "The repositories it tracks; a task goes to the one its line names (repo:owner/name), else the first whose match takes it, else the default" },
+      "repos.*.repo": { sensitive: true, help: "owner/name: the tracker writes to this repository in act mode" },
+      "repos.*.project": { help: "Its Projects board: the user or organization that owns it, and the number in the board's URL" },
+      "repos.*.match.tasks": { help: "Task id globs (* and ?) this repository takes" },
+      "repos.*.milestones.rules": { advanced: true, help: "Issues created for these tasks go in this existing milestone (Lair never sets due dates)" },
+      create_issues_for_new_tasks: { help: "A task with no issue gets one (act mode); otherwise only issues it names or with its exact title are linked" },
+      redact_patterns: { help: "Regular expressions removed from every text sent to GitHub, after the built-in ones (paths, tokens, emails, addresses)" },
+      token_env: { sensitive: true, help: "The env var holding the GitHub token; default: review.token_env, else GITHUB_TOKEN" },
+      api_url: { sensitive: true, advanced: true, help: "https only: the token is sent to it" },
+      reconcile_interval_seconds: { advanced: true },
+      write_budget_per_minute: { advanced: true },
+      request_timeout_seconds: timeouts,
+    },
+  },
+  {
     key: "supervisor",
     title: "Supervisor: self-checks, questions and the digest",
     schema: SupervisorSchema,
@@ -313,6 +335,7 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       "chat.answer_timeout_minutes": { help: "A question with no answer by then is closed and its run stopped" },
       "chat.min_interval_seconds": { advanced: true },
       "chat.max_conversation_turns": { advanced: true },
+      "chat.answer_file": { help: "The run answers by writing answer.json where Lair says, not with the lair CLI", advanced: true },
       "digest.enabled": { help: "A supervisor run writes a digest once a day; Home shows the latest" },
       "digest.time": { help: "When, in this machine's local time (HH:MM)" },
     },

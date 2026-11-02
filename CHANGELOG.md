@@ -5,6 +5,22 @@ file lists what needs action on your side.
 
 ## Unreleased
 
+- **Host services (off by default).** `host_services:` in a project config probes the services work needs on each
+  machine (a container engine, a tunnel daemon). In `act` mode Lair starts a service that is down (a grace window,
+  then a doubling backoff, at most `max_start_attempts` per outage) and holds the pipeline jobs whose lane needs it;
+  in both modes it raises one decision per outage it cannot fix. Its state is kept in `data/host-services/`. See
+  [Host services](docs/configuration.md#host-services).
+- **Decision policies, shadow only (off by default).** `decision_policies:` in `data/server.yaml` turns on proposals,
+  in a trace, of what Lair's rules C1-C4 and C11 would answer for each decision, compared with your answers (Decisions
+  page → Policy agreement, owner only). Nothing answers a decision. An optional `data/policies.yaml` replaces the
+  built-in table; it is validated at start and an invalid entry is refused, never half-applied. `data/decisions.db`
+  gets a `policy_trace` table (schema 6, migrated on start whether the policies are on or off). See
+  [Decision policies](docs/configuration.md#decision-policies).
+- **Outcome tracker (off by default).** `outcome_tracker:` in `data/server.yaml` turns on a read-only tracker that
+  records `outcome` (good / bad / unknown) with structured evidence on answered decisions; the brain trainer reads
+  `bad` as a negative example. The decisions file gets three nullable columns the first time it is opened (nothing to
+  do). See [Outcome tracker](docs/configuration.md#outcome-tracker).
+
 - **Ready guard fixes.** The planner settles a done line through the same guard as fill; the PR and head are read from the bus line's tail (or the PR the task names), a line with no PR or head for PR work is refused, a PR on another agent's branch is refused, pending CI or an unreachable host is held for at most `fill.ready_wait_minutes` and then asked once, GitHub calls time out and back off on rate limits, and host text in the next prompt is fenced as data.
 - **Ready guard (off by default).** `agents.fill.ready_guard: true` refuses a done line that names a PR whose CI is
   red or pending, whose branch is behind or conflicting, whose gate did not pass at the head, or that lacks a
