@@ -361,13 +361,13 @@ export function formatDecision(request: DecisionRequest, at: string): string {
 export class InboxDecisionRaiser implements DecisionRaiser {
   constructor(
     private file: string,
-    private fs: { append(path: string, text: string): void },
+    private fs: { append(path: string, text: string): void | Promise<void> },
     private clock: Clock,
   ) {}
 
   async raise(request: DecisionRequest): Promise<AdapterResult> {
     try {
-      this.fs.append(this.file, formatDecision(request, new Date(this.clock.now()).toISOString()));
+      await this.fs.append(this.file, formatDecision(request, new Date(this.clock.now()).toISOString()));
       return { ok: true, detail: `appended to ${this.file}`, ref: this.file };
     } catch (e) {
       return { ok: false, detail: `could not write ${this.file}: ${e instanceof Error ? e.message : String(e)}` };

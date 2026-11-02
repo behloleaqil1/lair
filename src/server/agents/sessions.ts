@@ -136,7 +136,7 @@ export interface SummaryInput {
 }
 
 /** The resume summary for the run after `run` (a fresh session, or a fallback agent). */
-export function resumeSummary(input: SummaryInput): string {
+export async function resumeSummary(input: SummaryInput): Promise<string> {
   const { run, chain, config, view } = input;
   const parts: string[] = [
     "# Resume summary (written by Lair)",
@@ -153,11 +153,11 @@ export function resumeSummary(input: SummaryInput): string {
   if (input.branchState && input.branchState.trim()) {
     parts.push("", "## Branch state", "```", input.branchState.trim().slice(0, 4000), "```");
   }
-  const lines = view.queueLines().filter((line) => line.agent?.toLowerCase() === run.agent.toLowerCase());
+  const lines = (await view.queueLines()).filter((line) => line.agent?.toLowerCase() === run.agent.toLowerCase());
   if (lines.length > 0) {
     parts.push("", "## Your latest status lines", ...lines.slice(-5).map((line) => `- ${line.message}`));
     const gateId = [...lines].reverse().find((line) => line.gateId)?.gateId;
-    if (gateId && isSafeGateId(gateId) && view.gateResultExists(gateId)) {
+    if (gateId && isSafeGateId(gateId) && (await view.gateResultExists(gateId))) {
       const log = readTail(join(config.gates_dir, "results", `${gateId}.log`), 16 * 1024);
       const tail = lastLines(log, 30);
       if (tail.length > 0) {

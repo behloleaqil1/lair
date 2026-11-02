@@ -92,27 +92,27 @@ describe("a large queue file under dashboard polling", () => {
     // The same rounds without the cache read and parse the file each time:
     // the control, so the cached rounds are judged against it, not a fixed time
     const control = new DataService(makeConfig());
-    const round = (s: DataService, i: number) => {
+    const round = async (s: DataService, i: number) => {
       const t = performance.now();
-      const dragons = s.getDragons();
-      s.getQueueLinesByAgent(`worker-${i % AGENTS}`);
-      s.getQueueLines();
+      const dragons = await s.getDragons();
+      await s.getQueueLinesByAgent(`worker-${i % AGENTS}`);
+      await s.getQueueLines();
       expect(dragons).toHaveLength(AGENTS);
       return performance.now() - t;
     };
     const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
     const uncached: number[] = [];
-    for (let i = 0; i < 9; i++) uncached.push(round(control, i));
+    for (let i = 0; i < 9; i++) uncached.push(await round(control, i));
     const cached: number[] = [];
     for (let i = 0; i < 9; i++) {
-      cached.push(round(service, i));
+      cached.push(await round(service, i));
       await new Promise((r) => setImmediate(r)); // let the loop run, as between requests
     }
     expect(reader.reads).toBe(1);
     expect(median(cached)).toBeLessThan(median(uncached));
     // The per-agent slice comes from the same memory
-    expect(service.getQueueLinesByAgent("worker-3").every((l) => l.agent === "worker-3")).toBe(true);
-    expect(service.getQueueLinesByAgent("worker-3").length).toBeGreaterThan(10);
+    expect((await service.getQueueLinesByAgent("worker-3")).every((l) => l.agent === "worker-3")).toBe(true);
+    expect((await service.getQueueLinesByAgent("worker-3")).length).toBeGreaterThan(10);
   });
 
   it("serves the cached lines, not the file: a rewrite on disk is not seen until the cache reads it", async () => {
@@ -121,24 +121,24 @@ describe("a large queue file under dashboard polling", () => {
     const cache = await started({ watch: false, checkMs: 3_600_000 });
     const service = new DataService(makeConfig(), { queue: () => cache.getLines() });
     const control = new DataService(makeConfig());
-    expect(service.getQueueLines()).toHaveLength(2);
+    expect(await service.getQueueLines()).toHaveLength(2);
 
     writeFileSync(QUEUE, line("worker-1", 7) + line("worker-1", 8) + line("worker-2", 9));
-    expect(service.getQueueLines()).toHaveLength(2);
-    expect(service.getQueueLinesByAgent("worker-1").map((l) => l.task)).toEqual([
+    expect(await service.getQueueLines()).toHaveLength(2);
+    expect((await service.getQueueLinesByAgent("worker-1")).map((l) => l.task)).toEqual([
       expect.stringContaining("task-1"),
       expect.stringContaining("task-2"),
     ]);
-    expect(service.getQueueLinesByAgent("worker-2")).toEqual([]);
-    expect(service.getDragons().find((d) => d.id === "worker-2")?.stats?.doneCount ?? 0).toBe(0);
-    expect(control.getDragons().find((d) => d.id === "worker-2")?.stats?.doneCount).toBe(1);
+    expect(await service.getQueueLinesByAgent("worker-2")).toEqual([]);
+    expect((await service.getDragons()).find((d) => d.id === "worker-2")?.stats?.doneCount ?? 0).toBe(0);
+    expect((await control.getDragons()).find((d) => d.id === "worker-2")?.stats?.doneCount).toBe(1);
     // The control reads the file itself and sees the rewrite: it would fail this test if the service did too
-    expect(control.getQueueLines()).toHaveLength(3);
+    expect(await control.getQueueLines()).toHaveLength(3);
 
     rmSync(QUEUE);
-    expect(service.getQueueLines()).toHaveLength(2);
+    expect(await service.getQueueLines()).toHaveLength(2);
     await cache.refresh();
-    expect(service.getQueueLines()).toEqual([]);
+    expect(await service.getQueueLines()).toEqual([]);
   });
 
   it("keeps the newest lines when the file is larger than the cap, and says so", async () => {

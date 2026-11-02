@@ -248,7 +248,7 @@ fastify.get<{ Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      return respond(service.getOverview());
+      return respond(await service.getOverview());
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -261,7 +261,7 @@ fastify.get<{ Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      return respond(service.getDragons());
+      return respond(await service.getDragons());
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -274,7 +274,7 @@ fastify.get<{ Params: { id: string }; Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      const dragon = service.getDragonById(request.params.id);
+      const dragon = await service.getDragonById(request.params.id);
       if (!dragon) {
         return respondError(`Dragon not found: ${request.params.id}`);
       }
@@ -293,7 +293,7 @@ fastify.get<{ Params: { id: string }; Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      const lines = service.getQueueLinesByAgent(request.params.id);
+      const lines = await service.getQueueLinesByAgent(request.params.id);
       return respond(lines);
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
@@ -307,8 +307,8 @@ fastify.get<{ Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      const queue = service.getGateQueue();
-      const results = service.getRecentGateResults(24);
+      const queue = await service.getGateQueue();
+      const results = await service.getRecentGateResults(24);
       return respond({ queue, results });
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
@@ -322,9 +322,9 @@ fastify.get<{ Querystring: { project?: string; status?: string } }>(
     try {
       const service = getDataService(request.query.project);
       if (request.query.status) {
-        return respond(service.getGatesByStatus(request.query.status));
+        return respond(await service.getGatesByStatus(request.query.status));
       }
-      return respond(service.getGateQueue());
+      return respond(await service.getGateQueue());
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -339,7 +339,7 @@ fastify.get<{ Querystring: { project?: string; hours?: string } }>(
       const hours = request.query.hours
         ? parseInt(request.query.hours, 10)
         : 24;
-      return respond(service.getRecentGateResults(hours));
+      return respond(await service.getRecentGateResults(hours));
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -357,9 +357,9 @@ fastify.get<{ Querystring: { project?: string; types?: string } }>(
       const service = getDataService(request.query.project);
       if (request.query.types) {
         const types = request.query.types.split(",");
-        return respond(service.getQueueLinesByType(types));
+        return respond(await service.getQueueLinesByType(types));
       }
-      return respond(service.getQueueLines());
+      return respond(await service.getQueueLines());
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -386,7 +386,7 @@ fastify.get<{ Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      return respond(service.getMachineStatuses());
+      return respond(await service.getMachineStatuses());
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -399,7 +399,7 @@ fastify.get<{ Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      return respond(service.getOrchestratorStatus());
+      return respond(await service.getOrchestratorStatus());
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
