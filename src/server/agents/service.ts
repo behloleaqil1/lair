@@ -54,6 +54,9 @@ import type {
   LockView,
   ProviderUnreachableView,
   RunOrigin,
+  SpendGroupBy,
+  SpendReportView,
+  SpendWindow,
   StopReason,
 } from "../../shared/agents-types.js";
 import type { Decision } from "../../shared/decision-types.js";
@@ -69,7 +72,7 @@ import { WatchdogStore } from "../watchdog/store.js";
 import { ProjectView } from "../watchdog/view.js";
 import type { ProjectEntry } from "../watchdog/service.js";
 import type { SupervisedAgents } from "../watchdog/types.js";
-import { backoffMs, MODEL_ID, parseAgentsConfig, type AgentLockSettings, type AgentsSettings } from "./config.js";
+import { backoffMs, fillPatternFor, MODEL_ID, parseAgentsConfig, type AgentLockSettings, type AgentsSettings } from "./config.js";
 import {
   agentLimits,
   describeUsage,
@@ -118,7 +121,9 @@ import {
   type ProcessOwner,
 } from "./probes.js";
 import { extractHungLogLines, extractLastTool, lastLines, moveSessionAside, resumeSummary, sessionDirFor, utcStamp } from "./sessions.js";
-import { SpendRecorder, type ModelCall } from "./spend.js";
+import { SpendRecorder, type ModelCall, type SpendNotice } from "./spend.js";
+import type { SpendFacts } from "./spend-classify.js";
+import { guardModes, spendReport, SpendReportError } from "./spend-report.js";
 import { AgentsStore, type ClaimResult, type HungInfo } from "./store.js";
 import {
   claimView,
@@ -130,8 +135,12 @@ import {
   type Claim,
   type FailoverInfo,
   type RunEndKind,
+  type SpendRow,
   type StoredLockWait,
 } from "./types.js";
+
+/** The one option of an AI spend notice */
+const SPEND_NOTICE_NOTED = "noted";
 import { commandFingerprint, findTaskProcess, reconcileRun, runPromptFileName } from "./reconcile.js";
 import type { ProcessInfo, ProcessReading } from "../watchdog/probes.js";
 import type { ReadyFactsSource } from "../ready-guard/guard.js";
@@ -427,6 +436,8 @@ export interface AgentsServiceOptions {
   sweepBusTokens?: (activeRunIds: () => string[]) => Promise<void>;
   /** What the ready guard reads a PR from (read on each use); undefined: the project has no git host to ask */
   readyFacts?: () => ReadyFactsSource | undefined;
+  /** What the review, planner and supervisor modules recorded about their runs (AI spend's classes; read on each use) */
+  spendFacts?: () => SpendFacts | undefined;
   /** The project's bus as fill reads it (bus.consume observe or on; read at each check), or null */
   bus?: () => BusLineSource | null;
   /** This server's URL, given as LAIR_URL to a run that gets a bus token (unless a module gave it one) */
@@ -484,6 +495,8 @@ export class AgentsService {
   private reconciled = new Set<string>();
   /** AI spend (agents.spend): a record per ended run, written after its end, and module model calls */
   private spend: SpendRecorder;
+  /** What other modules recorded about their runs, for AI spend's classes */
+  private spendFacts?: () => SpendFacts | undefined;
   lastTick?: AgentsTickSummary;
   lastError?: string;
 
@@ -502,6 +515,7 @@ export class AgentsService {
     this.sweepBusTokens = options.sweepBusTokens;
     this.bus = options.bus;
     this.busServerUrl = options.busServerUrl;
+    this.spendFacts = options.spendFacts;
     this.watchdogSettings = watchdogSettingsFor(options.config, options.settings.hungMinutes);
     // Usage reaches the per-agent and per-project budgets through the fleet budget
     this.unsubscribe =
@@ -528,6 +542,12 @@ export class AgentsService {
       budget: this.budget,
       outcome: (run) => this.reportedOutcome(run),
       record: (kind, input, at) => this.record(kind, input, at),
+      facts: () => options.spendFacts?.(),
+      guardModes: () => guardModes(this.config as { agents?: unknown; planner?: unknown }),
+      notice: (notice) => this.spendNotice(notice),
+      emit: async (type, data) => {
+        await this.events?.emit(type, data);
+      },
       warn: (line) => console.warn(line),
     });
     if (options.settings.fill.enabled) {
@@ -834,7 +854,66 @@ export class AgentsService {
     ["chain", (decision: Decision, chainId: string) => this.chainMoot(decision, chainId)],
     ["transient", (decision: Decision, provider: string) => this.outageMoot(decision, provider)],
     ["signin", (_decision: Decision, tool: string) => this.signInMoot(tool)],
+    // AI spend's notices: a day's waste once the day is over, a task's attempts once it completed or was released
+    ["spend", (_decision: Decision, rest: string) => this.spend.moot(rest)],
   ]);
+
+  /**
+   * One AI spend notice (attention: notice: nothing waits on an answer, and the notifier never sends it outside
+   * Lair). Only through the Decision Inbox: the inbox file is for questions, and this asks none.
+   */
+  private async spendNotice(notice: SpendNotice): Promise<boolean> {
+    const inbox = this.decisions();
+    if (!inbox.find) return false;
+    return this.raiseAt(
+      {
+        kind: "other",
+        attention: "notice",
+        question: notice.question,
+        context: notice.context,
+        options: [
+          {
+            id: SPEND_NOTICE_NOTED,
+            label: "Noted",
+            consequences: "The notice closes. Nothing else changes.",
+            effect: "reversible",
+          },
+        ],
+        recommended: SPEND_NOTICE_NOTED,
+        why: "Nothing is decided here: it is for your information, and it goes by itself once its condition clears.",
+        reversible: true,
+        key: notice.key,
+        ref: notice.ref,
+      },
+      this.probes.clock.now(),
+    );
+  }
+
+  /** GET /api/agents/spend: 404 while agents.spend is off; 400 for a long window by task. */
+  spendReport(window: SpendWindow, by: SpendGroupBy): SpendReportView {
+    if (!this.spend.enabled) throw new AgentsError(404, "agents.spend.enabled is off: set it to true to record AI spend");
+    try {
+      return spendReport({
+        store: this.store,
+        project: this.project,
+        window,
+        by,
+        now: this.probes.clock.now(),
+        retentionDays: this.settings.spend.retentionDays,
+        facts: this.spendFacts?.(),
+        modes: guardModes(this.config as { agents?: unknown; planner?: unknown }),
+      });
+    } catch (e) {
+      if (e instanceof SpendReportError) throw new AgentsError(400, e.message);
+      throw e;
+    }
+  }
+
+  /** GET /api/agents/spend/runs: a task's run rows (all of the project's without one), the latest first. */
+  spendRuns(task: string | undefined, limit: number): SpendRow[] {
+    if (!this.spend.enabled) throw new AgentsError(404, "agents.spend.enabled is off: set it to true to record AI spend");
+    return this.store.listSpend(this.project, { task, limit });
+  }
 
   /** A tool's sign-in decision (ref `signin:<tool>`) is moot once its check says it is signed in here. */
   private signInMoot(tool: string): string | null {
@@ -1111,8 +1190,10 @@ export class AgentsService {
       await this.reapLocks(t);
       const activeChains = new Set(this.store.activeRuns(this.project).map((run) => run.chainId));
       for (const chain of this.moduleVars.keys()) if (!activeChains.has(chain)) this.moduleVars.delete(chain);
-      // agents.spend: the spend rows of runs that ended (bounded per tick; it never throws)
+      // agents.spend: the spend rows of runs that ended, then their classes, the daily summary, retention and the
+      // notices (each bounded per tick; neither throws)
       await this.spend.drain();
+      await this.spend.maintain();
     }
     // A question whose chain moved on is moot: withdrawn, so nothing is left waiting for the owner by mistake
     await this.withdrawMoot(t);
@@ -1881,7 +1962,11 @@ export class AgentsService {
     const patterns = this.settings.fill;
     try {
       const until = queueWindowEnd(this.store, this.project, patterns, run, run);
-      return await reportedOutcome(await QueueLines.read(this.config.queue_file, this.bus?.() ?? null), patterns, run, until);
+      const outcome = await reportedOutcome(await QueueLines.read(this.config.queue_file, this.bus?.() ?? null), patterns, run, until);
+      if (outcome?.kind !== "blocked") return outcome;
+      // The gate a BLOCKED line names (its pattern's (?<wake>...)), for AI spend's blocker key
+      const gate = fillPatternFor(patterns.blockedPattern, run.task, run.agent).regex.exec(outcome.line)?.groups?.wake?.trim() || null;
+      return { ...outcome, wake: gate };
     } catch {
       return null; // a pattern that doesn't compile for this task: no line found
     }
@@ -3754,6 +3839,17 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
     this.readyFacts = facts;
   }
 
+  private spendFacts: SpendFacts | null = null;
+
+  /**
+   * What the review, planner and supervisor modules recorded about the runs they asked for, read by AI spend to
+   * classify those runs (a review recorded, proposals, verdicts, an answer). Read on each use, so it may be set after
+   * load(); without it their runs stay unclassified.
+   */
+  useSpendFacts(facts: SpendFacts): void {
+    this.spendFacts = facts;
+  }
+
   /** Raise decisions through `inbox` instead (a stand-in for the Decision Inbox, in tests). */
   setDecisionInbox(inbox: DecisionInbox): void {
     this.decisions = inbox;
@@ -3834,6 +3930,7 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
           events: this.options.events,
           tools: this.options.tools,
           readyFacts: () => this.readyFacts?.(entry.name, config),
+          spendFacts: () => this.spendFacts ?? undefined,
           ...this.busOptions(entry.name),
         }),
       );

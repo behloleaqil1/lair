@@ -39,7 +39,7 @@ export const PUBLIC_ROUTE_PREFIXES: Readonly<Record<string, string>> = {
   "/api/placement": "read-only placement status",
   "/api/infra-monitor": "read-only infrastructure monitor status, machines, jobs and findings; it has no mutation route",
   "/api/pr-health": "read-only PR health status (repositories, findings, owners, planned actions; no token, PR titles or bodies); it has no mutation route",
-  "/api/bus/messages": "read-only message lists for the dashboard; the owner's message route /api/bus/send is owner-only",
+  "/api/bus/messages": "read-only message lists for the dashboard; message texts and ack notes only with the owner session",
   "/api/bus/consumers": "read-only status of the bus consumers (bus.consume): the mode, refusals and observe mode's comparison",
   "/api/bus/activity": "read-only, bounded recent bus activity; message texts and ack notes only with the owner session",
   "/api/nodes": "scheduler node reads; the scheduler's hook asks for the owner on every change",

@@ -1,6 +1,6 @@
 # AI spend and waste
 
-- **Status:** design. PR 1 (measure, §7) is built; the rest is not. The feature decisions are made (§8, 2026-11-02).
+- **Status:** design. PR 1 (measure) and PR 2 (classify, API, daily summary, notices) of §7 are built; the rest is not. The feature decisions are made (§8, 2026-11-02).
 - **Base:** main `9bce85a`.
 - **Related:** [autonomy.md §6](autonomy.md#6-agents-budgets-failover-and-session-recovery-module-agents) (the agents module), [review-stages.md](review-stages.md) (staged review slots, `ask_after`, built separately), [planner.md](planner.md), [decision-policies.md](decision-policies.md) (the brain), issue #185 (usage limit detector).
 
@@ -193,7 +193,9 @@ Only the hash is stored (`blocker_key`), never the text. "No push since" means t
 - **Per PR head:** review runs, reviews recorded and review runs that failed (from `review_agent_assignments` and `review_reviews`).
 - **Planner:** proposals by status (`applied`, `declined`, `rejected`, `pending`) and the verifier verdict, from `planner_proposals`.
 
-**The waste share** of a window is `(idle + no_result) / total`, in each unit there is data for: cost (reported), tokens (reported), requests, turns, agent-minutes and runs. The panel shows the unit with the best data first: cost if any reported cost exists, then requests, then minutes.
+**When a run's facts come later.** A module reads its run's result after the run ends (the planner its proposals, fill a WAITING line's wake), so a row is written `unclassified/pending` when they aren't there yet and is classified on a later tick, from what the module recorded (`SpendFacts`, read-only from its store: review, planner, verifier and supervisor). 30 minutes after the run's end it gets the class the facts give by then, so what never came counts as none (`no_proposals`, `waiting_unnamed`, ...). A module that isn't wired leaves its runs `unclassified`: nothing is guessed. A classified row never changes.
+
+**The waste share** of a window is `(idle + no_result) / (productive + idle + no_result)`, `unclassified` rows being in neither, in each unit there is data for: cost (reported), tokens (reported), requests, turns, agent-minutes and runs. The panel shows the unit with the best data first: cost if any reported cost exists, then requests, then minutes.
 
 ### 4.3 Storage
 
@@ -245,10 +247,11 @@ CREATE INDEX IF NOT EXISTS idx_agents_spend_pending ON agents_spend_pending(proj
 
 - The aggregate for a UTC day is written when that day's daily summary runs, as an upsert on the primary key. Writing it again (after a restart, say) gives the same rows.
 - Rows for a day can arrive after its summary ran: an exit-unknown or adopted run ends late. So right before a day's per-run rows are deleted, the pruning step always upserts that day's aggregate again from the rows still there. A late row is never lost, and an aggregate is never left stale.
-- Deletes run at most once a day, in the tick, asynchronously and in batches of 1,000.
+- Deletes run at most once a day, in the tick, one whole UTC day at a time: the day's aggregate is written again and its per-run rows deleted in one transaction, so a crash can't leave a day half deleted (whose aggregate a later pass would then write again from what is left). At most 31 days per tick; the rest go on the next tick.
+- `agents_spend_daily` has no `tokens` column: a long window's tokens are input + cache write + output, so a `patterns` row (a total with no split) adds none there.
 - Windows longer than 90 days read the aggregates only, so they have no per-run or per-task detail.
 
-**Backfill (PR 2, because it needs the classification).** On first enable, the runs from the last `backfill_days` (7) are classified from the run records and events Lair already holds. Their usage is `none`, because their logs may have moved, and they get `backfilled = 1`. The first panel isn't empty, and every view can tell these rows apart. The backfill is idempotent: a row whose `run_id` exists is skipped.
+**Backfill (PR 2, because it needs the classification).** On first enable, the runs from the last `backfill_days` (7) are classified from the run records and events Lair already holds. Their usage is `none`, because their logs may have moved, and they get `backfilled = 1`. The first panel isn't empty, and every view can tell these rows apart. The backfill is idempotent: a row whose `run_id` exists is skipped. The queue file isn't read for it: a completed builder run whose line fill never recorded (not a fill task) is `unclassified` with reason `not_recorded`, not guessed idle.
 
 ### 4.4 Show it
 
@@ -294,7 +297,7 @@ Each is off until its threshold is set. The recommended thresholds (decision D6)
 Every guard has a `mode` (decision D6):
 
 - `off`: the default. Nothing is computed.
-- `observe`: the guard reaches the same verdict it would act on and changes nothing. It records one `guard_would` event, carrying the guard, the subject (a task, a provider or a planner run), the verdict (`would_park`, `would_skip`, `would_cool`, `would_wake`, `would_block`, `would_apply`) and the evidence as numbers and ids. It raises one inbox item with `attention: "notice"` per subject and streak, and counts the verdict in the panel and the API.
+- `observe`: the guard reaches the same verdict it would act on and changes nothing. It records one `guard_would` event, carrying the guard (`data.guard`, one of `quota`, `task_no_result_cap`, `wake_events`, `hung_repeat`, `budget`, `planner_prefilter_closed`, `planner_handled_messages`, `planner_skip_unchanged`, `planner_recheck_on_change`: the spend API counts by it), the subject (a task, a provider or a planner run), the verdict (`would_park`, `would_skip`, `would_cool`, `would_wake`, `would_block`, `would_apply`) and the evidence as numbers and ids. It raises one inbox item with `attention: "notice"` per subject and streak, and counts the verdict in the panel and the API.
 - `act`: the guard does what it describes, records a `guard_did` event and counts it.
 
 **Rollout.** Every guard ships in `observe`. Each one moves to `act` on its own, after a week of observe evidence shows its would-verdicts would have been right: the parked tasks didn't later complete unattended, the skipped planner runs had nothing applicable, and the cooled-down provider stayed limited. An observe verdict and an act verdict for the same input are the same verdict. The tests check that.

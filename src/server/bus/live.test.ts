@@ -114,6 +114,25 @@ describe("bus live: what each bus action publishes", () => {
     ]);
   });
 
+  it("a report's summary loses every bus token, the run's own and any other, whole or cut, before it is stored and emitted", async () => {
+    const other = newBusToken();
+    const cut = other.slice(0, 20);
+    const emitted: unknown[] = [];
+    events.on("bus.report", (event) => void emitted.push(event.data));
+    const summary = `blocked: LAIR_BUS_TOKEN=${token} failed; an old run's ${other} and a cut one ${cut}`;
+    const { id } = await call("report", { kind: "BLOCKED", task: TASK, summary });
+    await settle();
+    const redacted = "blocked: LAIR_BUS_TOKEN=[bus-token] failed; an old run's [bus-token] and a cut one [bus-token]";
+    // Stored as /api/bus/board and /api/bus/activity read it, emitted on the event bus, published on the live channel
+    const stored = busStoreFor(PROJECT, dir).listReports({ limit: 10 });
+    expect(stored.map((r) => r.summary)).toEqual([redacted]);
+    expect(emitted).toMatchObject([{ project: PROJECT, id, summary: redacted }]);
+    expect(published.flatMap((p) => p.update.events)).toMatchObject([{ type: "report", id, summary: redacted }]);
+    for (const seen of [JSON.stringify(stored), JSON.stringify(emitted), allPublished()]) {
+      for (const secret of [token, other, cut]) expect(seen).not.toContain(secret);
+    }
+  });
+
   it("messages: sent, read and acknowledged as metadata only, never a text, an ack note or the token", async () => {
     await call("send", { to: "owner", text: AGENT_TEXT });
     const owner = new BusService({ store: busStoreFor(PROJECT, dir), getClaimedTask: () => null, getAllClaims: () => [], getKnownAgents: () => [], events });

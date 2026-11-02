@@ -896,6 +896,8 @@ export async function unmatchedReports(
 export interface ReportedOutcome {
   kind: "done" | "waiting" | "blocked";
   line: string;
+  /** A WAITING line's (?<wake>...) capture, as fill reads it (null: none, or another kind) */
+  wake?: string | null;
 }
 
 /**
@@ -924,7 +926,7 @@ export async function reportedOutcome(
     const found = await queue.find({ kind: "done", pattern: done }, subject, run.queueMark, until);
     if (found !== null) return { kind: "done", line: found.line };
     const status = await queue.lastStatus(waiting, blocked, subject, run.queueMark, until);
-    return status ? { kind: status.kind, line: status.line } : null;
+    return status ? { kind: status.kind, line: status.line, wake: status.wake } : null;
   }
   const last = await queue.lastOf<ReportedOutcome["kind"]>(
     [
@@ -936,7 +938,7 @@ export async function reportedOutcome(
     run.queueMark,
     until,
   );
-  return last ? { kind: last.kind, line: last.line } : null;
+  return last ? { kind: last.kind, line: last.line, wake: last.wake } : null;
 }
 
 /** What fill makes of an unassigned line: its state, why, and whether it is ready work (fill.idle). */

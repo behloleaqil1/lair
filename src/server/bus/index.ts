@@ -23,6 +23,7 @@ export {
   hashBusToken,
   isBusTokenFormat,
   redactBusToken,
+  redactBusTokens,
   BUS_TOKEN_PREFIX,
 } from "./tokens.js";
 export type { BusTokenBinding } from "./tokens.js";

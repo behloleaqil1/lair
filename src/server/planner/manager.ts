@@ -9,8 +9,10 @@ import type { DecisionProducer } from "../decisions/types.js";
 import type { PlannerAgents } from "./agents.js";
 import type { BusLineSource } from "../bus/consumers.js";
 import { parsePlannerConfig } from "./config.js";
-import { DECISION_MODULE, PlannerService } from "./service.js";
+import { DECISION_MODULE, NO_VERDICT_REASON, PlannerService } from "./service.js";
 import { PlannerStore } from "./store.js";
+
+const DAY_MS = 86_400_000;
 
 export interface ProjectEntry {
   name: string;
@@ -146,6 +148,41 @@ export class PlannerManager {
 
   get(project: string): PlannerService | undefined {
     return this.services.get(project);
+  }
+
+  /**
+   * AI spend (src/server/agents/spend-classify.ts): what the planner recorded about one of its agent runs. A
+   * planner run is productive once it wrote proposals, pending while the planner hasn't read its output; a verifier
+   * run is productive once it gave verdicts, pending while it runs. null: no planner run has it (or no store).
+   */
+  spendRun(project: string, role: "planner" | "verifier", run: { id: string; chainId: string; requestedAt: number }): "pending" | "productive" | "idle" | null {
+    if (!this.store) return null;
+    // A planner run is requested before its agent runs, and its verifier within a day of it
+    const found = this.store.runForAgentRun(project, role, run.id, run.chainId, run.requestedAt - 2 * DAY_MS);
+    if (!found) return null;
+    if (role === "planner") {
+      if (this.store.runProposals(found.id).length > 0) return "productive";
+      return found.state === "running" && found.verifierState === null ? "pending" : "idle";
+    }
+    if (found.verifierState === "running") return "pending";
+    return found.verifierState === "done" && this.store.verifierVerdicts(found.id, NO_VERDICT_REASON) > 0 ? "productive" : "idle";
+  }
+
+  /** AI spend: the planner's runs and proposals in [from, to). null with no store. */
+  spendAcceptance(project: string, from: number, to: number): {
+    runs: number;
+    runsWithApplied: number;
+    proposals: { applied: number; declined: number; rejected: number; pending: number };
+    verdicts: { approve: number; reject: number; unsure: number; unverified: number };
+  } | null {
+    if (!this.store) return null;
+    const { runs, runsWithApplied, status, verdicts } = this.store.acceptance(project, from, to);
+    return {
+      runs,
+      runsWithApplied,
+      proposals: { applied: status.applied ?? 0, declined: status.declined ?? 0, rejected: status.rejected ?? 0, pending: status.pending ?? 0 },
+      verdicts: { approve: verdicts.approve ?? 0, reject: verdicts.reject ?? 0, unsure: verdicts.unsure ?? 0, unverified: verdicts.unverified ?? 0 },
+    };
   }
 
   /** bus.consume on: a cycle now (an accepted bus report, or a message to the orchestrator); nothing when it is off. */

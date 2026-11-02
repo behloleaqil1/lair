@@ -1970,6 +1970,28 @@ export class ReviewManager {
     return this.services.get(project);
   }
 
+  /**
+   * AI spend (src/server/agents/spend-classify.ts): whether a review run recorded its review. The run's span is
+   * from its request to 5 minutes after its end (a review is posted while the run runs). null with no store.
+   */
+  spendReview(
+    project: string,
+    run: { agent: string; requestedAt: number; endedAt: number },
+    pr: number,
+    headPrefix: string,
+  ): { verdict: "productive" | "idle"; headSha: string | null } | null {
+    if (!this.store) return null;
+    const from = new Date(run.requestedAt).toISOString();
+    const to = new Date(run.endedAt + 5 * 60_000).toISOString();
+    const found = this.store.reviewDuring(project, pr, headPrefix, run.agent, from, to);
+    return { verdict: found.recorded ? "productive" : "idle", headSha: found.headSha };
+  }
+
+  /** AI spend: a PR's head as the review store last read it (null: unknown). */
+  spendPrHead(project: string, pr: number): string | null {
+    return this.store?.currentHead(project, pr) ?? null;
+  }
+
   /** Names of the projects with reviews on. */
   enabled(): string[] {
     return [...this.services.keys()];
