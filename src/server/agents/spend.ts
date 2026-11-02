@@ -122,6 +122,8 @@ export interface SpendSettings {
   notice: { wasteShare: number | null; minRuns: number; taskAttempts: number | null };
   /** fill follows a WAITING line's wake to a file (fill on, wake.file set) */
   wakeWatched: boolean;
+  /** The guards spend counts for: G2 (agents.spend.guards.task_no_result_cap) */
+  guards: { taskNoResultCap: { mode: "off" | "observe" | "act"; max: number; windowMs: number } };
 }
 
 /**
@@ -525,6 +527,23 @@ export function endKindOf(run: AgentRun): RunEndKind {
   return "crashed";
 }
 
+/** The no-result ends G2 counts (§4.2, decision D2): not a Lair restart's (exit_unknown, lost, vars_lost) or a stop */
+const CAP_COUNTED: ReadonlySet<RunEndKind> = new Set<RunEndKind>([
+  "hung",
+  "crashed",
+  "dead_on_start",
+  "never_started",
+  "rate_limit",
+  "provider_error",
+  "unreachable",
+  "lost_claim",
+]);
+
+/** Whether an ended run counts toward a task's no-result cap (G2); a superseded run never ran, so it doesn't. */
+export function countsTowardCap(run: AgentRun): boolean {
+  return run.state !== "superseded" && CAP_COUNTED.has(endKindOf(run));
+}
+
 // ============ THE RECORDER ============
 
 export interface SpendRecorderOptions {
@@ -555,6 +574,9 @@ export interface SpendNotice {
   ref: string;
   question: string;
   context: string;
+  /** Its evidence code and facts (numbers and ids), for the decision's structure (class agents.spend_notice) */
+  code?: string;
+  facts?: Record<string, string | number | boolean | null>;
 }
 
 /** Runs a first enable's backfill classifies per tick */
@@ -1079,6 +1101,8 @@ export class SpendRecorder {
         await raise({
           key: `spend_waste:${day}`,
           ref: `spend:waste:${day}`,
+          code: "waste_share",
+          facts: { day, runs: report.totals.runs, waste_share: Math.round(share * 10_000) / 10_000, unit: report.unit },
           question: `AI spend: ${Math.round(share * 100)} % of today's ${report.unit} went to idle or no-result runs`,
           context: [
             `Today (${day}, UTC): ${report.totals.runs} runs; ${report.productive.runs} productive, ${report.idle.runs} idle, ${report.noResult.runs} with no result.`,
@@ -1101,6 +1125,8 @@ export class SpendRecorder {
         await raise({
           key: `spend_task_attempts:${streak.task}:${marker}`,
           ref: `spend:attempts:${marker}:${streak.task}`,
+          code: "task_attempts",
+          facts: { task: streak.task, attempts, no_result: streak.noResult, chains: streak.chains },
           question: `AI spend: ${streak.task} took ${attempts} runs within 24 h without a completion`,
           context: [
             `${streak.task}: ${attempts} runs since its last completion within 24 h (${streak.noResult} with no result, over ${streak.chains} chain(s)); the notice is at ${taskAttempts}.`,
@@ -1119,15 +1145,17 @@ export class SpendRecorder {
 
   /**
    * Why a spend notice is moot (its ref after `spend:`), or null while it stands: a day's waste notice once the day
-   * is over; a task's attempts notice once it completed or was released after the streak it was raised for.
+   * is over; a task's attempts notice, or a guard's would-park notice (`guard:<at>:<task>`), once the task completed
+   * or was released after the streak it was raised for.
    */
   moot(rest: string): string | null {
     if (rest.startsWith("waste:")) {
       const day = rest.slice("waste:".length);
       return day !== utcDay(this.o.now()) ? `the day ${day} is over` : null;
     }
-    if (rest.startsWith("attempts:")) {
-      const tail = rest.slice("attempts:".length);
+    const streak = rest.startsWith("attempts:") ? "attempts:" : rest.startsWith("guard:") ? "guard:" : null;
+    if (streak) {
+      const tail = rest.slice(streak.length);
       const at = tail.indexOf(":");
       const marker = Number(tail.slice(0, at));
       const task = tail.slice(at + 1);

@@ -21,6 +21,8 @@ export const DECISION_MODULE = "agents";
 
 /** The key of a run chain's escalation, per escalation (`attempts`: the chain's runs when it was escalated). */
 export const escalationDecisionKey = (chainId: string, attempts: number) => `escalation:${chainId}:${attempts}`;
+/** A task a guard parked (G2, G4): one decision per parking run */
+export const guardDecisionKey = (guard: string, runId: string) => `guard:${guard}:${runId}`;
 
 export type DecisionKind =
   | "product"

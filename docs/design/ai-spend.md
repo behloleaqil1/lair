@@ -326,6 +326,7 @@ One deployment runs an interim `agents.failover.cooldown_minutes: 120` as a stop
   - runs that died while their provider was in a **fleet** outage or a fleet quota cooldown (decision D2), since G1 and the transient rule handle those. G1's observe-mode `would_cool` windows count as cooldowns here too;
   - runs with `lair_restart = 1` (`exit_unknown`, `lost`, `vars_lost`): Lair's own restart ended them;
   - runs that ended `stopped`: an owner stop or a shutdown.
+- **As built (PR 5).** The count is read from the run records of the task's chains, at the moment a failed run's chain would go on (a restart, a failover, a transient or never-started retry), so the run that just failed counts at once. A fleet outage is the provider's latest `transient` event by the run's end saying every agent waits; until G1 exists, the fleet cooldown is today's rate-limit and provider-error cooldown once two agents' failovers made it fleet-wide, and G1's quota cooldown (and its `would_cool` windows) joins it with PR 4. The count starts over when the task's fill hold is released: `start_again` releases it, and so does a release in Work. A superseded run never ran, so it isn't counted.
 - On the data above, with `max: 6`, the 13 tasks that took 10 or more attempts would each have stopped at their sixth no-result run and asked once.
 
 **G3. Waiting agents woken only by the awaited event.** This extends `agents.fill.wake`.
@@ -346,7 +347,7 @@ One deployment runs an interim `agents.failover.cooldown_minutes: 120` as a stop
   - `resume`, the default, is today's behaviour.
   - `fresh` starts a fresh session with the hung-info block and a resume summary, so the stuck context isn't re-sent. It applies whenever it is set, in any mode, and is a change the owner makes on its own evidence.
 - `mode` governs only the park below.
-- The `max_per_task`-th hang of a task within the window, in any chain, **parks** it with the fill hold `hung_repeat` (or escalation for a module run) and one decision. Options: `fresh_session` (with the hung info), `keep_parked`, `release`. The task is not resumed again.
+- The `max_per_task`-th hang of a task within the window, in any chain, **parks** it with the fill hold `hung_repeat` (or escalation for a module run) and one decision. Options: `fresh_session` (with the hung info), `keep_parked`, `release`. The task is not resumed again. A hang after `fresh_session` or `release`, within the window, parks it again (the count doesn't start over). `first: fresh` turns a first hang's resume into a fresh session; when the chain's restarts are used up, it is escalated as today.
 - On the data above, with `max_per_task: 2`, the 59 repeat hangs (3,011 agent-minutes) would have been 26 parked tasks, each asked about once.
 
 **G5. Daily budget per project with an owner notice.** This reuses `agents.budgets` and adds no second budget system (`budgets.guard_mode`).

@@ -457,6 +457,17 @@ export class AgentsStore {
     );
   }
 
+  /** A task's runs requested since `since`, in every chain, the latest `limit` of them, oldest first. */
+  taskRunsSince(project: string, task: string, since: number, limit: number): AgentRun[] {
+    return this.runs(
+      `SELECT data FROM agents_runs WHERE project = ? AND task = ? AND requested_at >= ? ORDER BY requested_at DESC, rowid DESC LIMIT ?`,
+      project,
+      task,
+      since,
+      limit,
+    ).reverse();
+  }
+
   /** The first run of `agent` on another task than `task` requested after the run `after`, or null. */
   firstRunForAgentAfter(project: string, agent: string, task: string, after: AgentRun): AgentRun | null {
     return (
@@ -653,6 +664,8 @@ export class AgentsStore {
       runId?: string;
       subject?: string;
       since?: number;
+      /** At or before this time */
+      until?: number;
       limit?: number;
     } = {},
   ): AgentEvent[] {
@@ -681,6 +694,10 @@ export class AgentsStore {
     if (options.since !== undefined) {
       where.push("at >= ?");
       params.push(options.since);
+    }
+    if (options.until !== undefined) {
+      where.push("at <= ?");
+      params.push(options.until);
     }
     params.push(options.limit ?? 100);
     const rows = this.db

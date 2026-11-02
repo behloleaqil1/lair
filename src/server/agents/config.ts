@@ -267,6 +267,20 @@ export const AgentsSchema = z
         fresh_sessions: z.number().int().min(0).max(10).default(1),
         backoff_seconds: z.number().min(0).default(30),
         max_backoff_seconds: z.number().min(0).default(1800),
+        /**
+         * G4, the hung-repeat rule (docs/design/ai-spend.md §4.5): a task's max_per_task-th hang within window_hours,
+         * in any chain, parks it (mode act) or records what it would do (observe). `first` is how the first hang
+         * restarts, a switch of its own: resume (as before) or fresh (a fresh session with the hung info)
+         */
+        hung_repeat: z
+          .object({
+            mode: z.enum(GUARD_MODES).default("off"),
+            max_per_task: z.number().int().min(1).max(100).default(2),
+            window_hours: z.number().positive().max(720).default(24),
+            first: z.enum(["resume", "fresh"]).default("resume"),
+          })
+          .strict()
+          .default({}),
       })
       .strict()
       .default({}),
@@ -343,6 +357,24 @@ export const AgentsSchema = z
             min_runs: z.number().int().min(1).max(100_000).default(20),
             /** One task's attempts without a completion within 24 h at or past this */
             task_attempts: z.number().int().min(1).max(10_000).optional(),
+          })
+          .strict()
+          .default({}),
+        /** The guards spend counts for (docs/design/ai-spend.md §4.5), each off until its mode is set */
+        guards: z
+          .object({
+            /**
+             * G2: a task's max no-result runs within window_hours, across its chains, park it (act) or record what it
+             * would do (observe). Runs a fleet outage or cooldown, a Lair restart or a stop ended don't count
+             */
+            task_no_result_cap: z
+              .object({
+                mode: z.enum(GUARD_MODES).default("off"),
+                max: z.number().int().min(1).max(1000).default(6),
+                window_hours: z.number().positive().max(720).default(24),
+              })
+              .strict()
+              .default({}),
           })
           .strict()
           .default({}),
@@ -614,6 +646,8 @@ export interface AgentsSettings {
     freshSessions: number;
     backoffSeconds: number;
     maxBackoffSeconds: number;
+    /** G4 (agents.recovery.hung_repeat) */
+    hungRepeat: { mode: GuardMode; maxPerTask: number; windowMs: number; first: "resume" | "fresh" };
   };
   retries: { maxRetries: number; backoffSeconds: number; maxBackoffSeconds: number };
   locks: AgentLockSettings[];
@@ -784,6 +818,12 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         freshSessions: value.recovery.fresh_sessions,
         backoffSeconds: value.recovery.backoff_seconds,
         maxBackoffSeconds: value.recovery.max_backoff_seconds,
+        hungRepeat: {
+          mode: value.recovery.hung_repeat.mode,
+          maxPerTask: value.recovery.hung_repeat.max_per_task,
+          windowMs: value.recovery.hung_repeat.window_hours * 3_600_000,
+          first: value.recovery.hung_repeat.first,
+        },
       },
       retries: {
         maxRetries: value.retries.max_retries,
@@ -829,6 +869,13 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         },
         // A WAITING line's wake is something Lair watches only when fill follows it to a file
         wakeWatched: value.fill.enabled && value.fill.wake.file !== undefined,
+        guards: {
+          taskNoResultCap: {
+            mode: value.spend.guards.task_no_result_cap.mode,
+            max: value.spend.guards.task_no_result_cap.max,
+            windowMs: value.spend.guards.task_no_result_cap.window_hours * 3_600_000,
+          },
+        },
       },
       fill: {
         enabled: value.fill.enabled,

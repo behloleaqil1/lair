@@ -914,6 +914,32 @@ describe("AT-33: a guard (or a request or minute budget) needs agents.spend; bud
     expect(errorsOf({ enabled: true, failover: { quota: { mode: "off" } } }).some((e) => e.includes("needs agents.spend"))).toBe(false);
   });
 
+  it("G2 and G4: off by default; their keys are checked, naming each; G4's first is no mode and needs nothing", () => {
+    const parsed = parseAgentsConfig({ enabled: true }, config);
+    expect(parsed.ok && parsed.settings.recovery.hungRepeat).toEqual({ mode: "off", maxPerTask: 2, windowMs: 24 * 3_600_000, first: "resume" });
+    expect(parsed.ok && parsed.settings.spend.guards.taskNoResultCap).toEqual({ mode: "off", max: 6, windowMs: 24 * 3_600_000 });
+    const on = parseAgentsConfig(
+      { enabled: true, spend: { enabled: true, guards: { task_no_result_cap: { mode: "act", max: 3, window_hours: 6 } } }, recovery: { hung_repeat: { mode: "observe", first: "fresh" } } },
+      config,
+    );
+    expect(on.ok && on.settings.spend.guards.taskNoResultCap).toEqual({ mode: "act", max: 3, windowMs: 6 * 3_600_000 });
+    expect(on.ok && on.settings.recovery.hungRepeat).toMatchObject({ mode: "observe", first: "fresh" });
+    expect(errorsOf({ enabled: true, recovery: { hung_repeat: { first: "fresh" } } })).toEqual([]);
+    const bad = errorsOf({
+      enabled: true,
+      spend: { enabled: true, guards: { task_no_result_cap: { mode: "park", max: 0 } } },
+      recovery: { hung_repeat: { first: "restart", window_hours: 0 } },
+    });
+    for (const key of [
+      "agents.spend.guards.task_no_result_cap.mode",
+      "agents.spend.guards.task_no_result_cap.max",
+      "agents.recovery.hung_repeat.first",
+      "agents.recovery.hung_repeat.window_hours",
+    ]) {
+      expect(bad.some((e) => e.startsWith(`${key}:`)), key).toBe(true);
+    }
+  });
+
   it("a daily_requests or daily_minutes limit with spend off is refused, naming both keys", () => {
     expect(errorsOf({ enabled: true, budgets: { project: { daily_requests: { soft: 800 } } } })).toContain(
       "agents.budgets.project.daily_requests: needs agents.spend.enabled: true (counted from the spend records)",
