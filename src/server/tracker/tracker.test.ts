@@ -28,6 +28,7 @@ import { TrackerStore } from "./store.js";
 import { parseTrackerConfig } from "./config.js";
 import { GitHubError, GitHubTrackerClient } from "./github-projects.js";
 import { FakeGitHub } from "./testing/fake-github.js";
+import { distinctiveTaskId, mentionTokens, titleSimilarity } from "./proposals.js";
 
 const PROJECT = "shop";
 const TOKEN = `ghp_${"a".repeat(36)}`;
@@ -1116,5 +1117,289 @@ describe("no synchronous fs or child process on the event loop", () => {
       expect(text, file).not.toMatch(/\b\w+Sync\(/);
       expect(text, file).not.toMatch(/from "(?:node:)?child_process"/);
     }
+  });
+});
+
+describe("link proposals (#262 item 1)", () => {
+  const accept = (h: Awaited<ReturnType<typeof rig>>, body: Record<string, unknown>, headers: Record<string, string> = h.owner) =>
+    h.app.inject({ method: "POST", url: `/api/tracker/links?project=${PROJECT}`, headers, payload: body });
+
+  it("an issue naming the task, a PR of the task closing an issue, a close title: proposed as would_link, not linked (auto_link off); the owner accepts one, audited", async () => {
+    const gh = new FakeGitHub();
+    const board = gh.addBoard("acme", 1);
+    const alpha = gh.addIssue("acme/web", { title: "Build the checkout (feat-alpha)" });
+    const payments = gh.addIssue("acme/web", { title: "Payments" });
+    const gamma = gh.addIssue("acme/web", { title: "Order history page for customer" });
+    gh.addPull("acme/web", { number: 40, body: `Adds the provider.\n\nCloses #${payments.number}`, headRef: "agent/worker-a/feat-beta" });
+    const h = await rig({
+      gh,
+      tasks: ["worker-a|Alice|feat-alpha|Checkout page", "worker-a|Alice|feat-beta|Payment provider", "worker-a|Alice|feat-gamma|Order history page for customers", "worker-a|Alice|feat-delta|Nothing like it"],
+    });
+    const status = await h.status();
+    expect(status.links).toEqual([]);
+    expect(board.items).toEqual([]);
+    expect(status.proposals.map((p) => [p.task, p.action, p.candidates.map((c) => [c.issueNumber, c.reasons.join("+"), c.pr])])).toEqual([
+      ["feat-alpha", "would_link", [[alpha.number, "mentions_task", null]]],
+      ["feat-beta", "would_link", [[payments.number, "pull_closes", 40]]],
+      ["feat-gamma", "would_link", [[gamma.number, "similar_title", null]]],
+    ]);
+    expect(status.proposals[2].candidates[0].score).toBeGreaterThanOrEqual(0.85);
+    const rows = status.recentWrites.filter((w) => w.result === "would_link");
+    expect(rows.map((w) => `${w.task} ${w.op} ${w.issueNumber} ${w.value} ${w.mode}`).sort()).toEqual([
+      `feat-alpha link_issue ${alpha.number} mentions_task act`,
+      `feat-beta link_issue ${payments.number} pull_closes act`,
+      `feat-gamma link_issue ${gamma.number} similar_title act`,
+    ]);
+    // Recorded once: a second reconcile counts the same rows up
+    await h.reconcile();
+    expect((await h.status()).recentWrites.filter((w) => w.result === "would_link").map((w) => w.count)).toEqual([2, 2, 2]);
+    expect((await h.status()).links).toEqual([]);
+
+    // Not proposed for that task: refused; without an owner session: refused, nothing linked
+    expect((await accept(h, { task: "feat-alpha", repo: "acme/web", issue: gamma.number })).statusCode).toBe(409);
+    expect((await accept(h, { task: "feat-delta", repo: "acme/web", issue: alpha.number })).statusCode).toBe(409);
+    for (const headers of [{}, BROWSER, { ...BROWSER, [OWNER_SESSION_HEADER]: "x".repeat(43) }]) {
+      expect((await accept(h, { task: "feat-alpha", repo: "acme/web", issue: alpha.number }, headers)).statusCode).toBe(403);
+    }
+    expect((await accept(h, { task: "feat-alpha", repo: "acme/web", issue: "1" })).statusCode).toBe(400);
+    await h.idle();
+    expect((await h.status()).links).toEqual([]);
+
+    const res = await accept(h, { task: "feat-alpha", repo: "acme/web", issue: alpha.number });
+    expect(res.statusCode, res.body).toBe(202);
+    await h.idle();
+    const after = await h.status();
+    expect(after.links.map((l) => [l.task, l.issueNumber])).toEqual([["feat-alpha", alpha.number]]);
+    expect(gh.card(board, "acme/web", alpha.number)?.status).toBe("Backlog");
+    expect(after.recentWrites.find((w) => w.op === "link_issue" && w.result === "success")).toMatchObject({ task: "feat-alpha", value: `owner ${h.sessionId}` });
+    expect(after.proposals.map((p) => p.task)).toEqual(["feat-beta", "feat-gamma"]);
+    // Linked already: refused
+    expect((await accept(h, { task: "feat-alpha", repo: "acme/web", issue: alpha.number })).statusCode).toBe(409);
+  });
+
+  it("ambiguous (two candidates, or one issue for two tasks) is never linked, even with auto_link; a single candidate is, once; the owner may pick one", async () => {
+    const gh = new FakeGitHub();
+    const board = gh.addBoard("acme", 1);
+    const first = gh.addIssue("acme/web", { title: "feat-login follow-up" });
+    const second = gh.addIssue("acme/web", { title: "Session cookies", body: "Depends on feat-login." });
+    const shared = gh.addIssue("acme/web", { title: "Settings page layout" });
+    const cart = gh.addIssue("acme/web", { title: "Shopping cart drawer" });
+    const h = await rig({
+      gh,
+      tracker: { auto_link: true },
+      tasks: [
+        "worker-a|Alice|feat-login|Sign in",
+        "worker-a|Alice|feat-set1|Settings page layout",
+        "worker-a|Alice|feat-set2|Settings page layouts",
+        "worker-a|Alice|feat-cart|Shopping cart drawer",
+      ],
+    });
+    let status = await h.status();
+    expect(status.links.map((l) => [l.task, l.issueNumber])).toEqual([["feat-cart", cart.number]]);
+    expect(gh.card(board, "acme/web", cart.number)?.status).toBe("Backlog");
+    expect(status.recentWrites.filter((w) => w.op === "link_issue" && w.result === "success").map((w) => w.value)).toEqual(["auto: similar_title"]);
+    expect(status.proposals.map((p) => [p.task, p.action, p.candidates.map((c) => c.issueNumber).sort()])).toEqual([
+      ["feat-login", "ambiguous", [first.number, second.number].sort()],
+      ["feat-set1", "ambiguous", [shared.number]],
+      ["feat-set2", "ambiguous", [shared.number]],
+    ]);
+    const ambiguousRows = status.recentWrites.filter((w) => w.result === "would_link");
+    expect(ambiguousRows).toHaveLength(3);
+    for (const row of ambiguousRows) expect(row).toMatchObject({ op: "link_issue", repo: null, issueNumber: null, value: expect.stringMatching(/^ambiguous: /) });
+
+    // Later reconciles link nothing more
+    const writes = gh.writes().length;
+    await h.reconcile();
+    await h.reconcile();
+    expect(gh.writes()).toHaveLength(writes);
+    status = await h.status();
+    expect(status.links).toHaveLength(1);
+    expect(status.recentWrites.filter((w) => w.op === "link_issue" && w.result === "success")).toHaveLength(1);
+
+    // The owner picks one of the candidates
+    const res = await accept(h, { task: "feat-login", repo: "acme/web", issue: second.number });
+    expect(res.statusCode, res.body).toBe(202);
+    await h.idle();
+    expect((await h.status()).links.find((l) => l.task === "feat-login")?.issueNumber).toBe(second.number);
+  });
+
+  it("observe: proposals are recorded as would_link and never linked, even with auto_link; an accepted link is Lair's only, its card would_send", async () => {
+    const gh = new FakeGitHub();
+    gh.addBoard("acme", 1);
+    const cart = gh.addIssue("acme/web", { title: "Shopping cart drawer" });
+    const h = await rig({ gh, tracker: { mode: "observe", auto_link: true }, tasks: ["worker-a|Alice|feat-cart|Shopping cart drawer"] });
+    let status = await h.status();
+    expect(status.links).toEqual([]);
+    expect(status.recentWrites.filter((w) => w.result === "would_link")).toEqual([
+      expect.objectContaining({ task: "feat-cart", issueNumber: cart.number, op: "link_issue", mode: "observe", value: "similar_title" }),
+    ]);
+    const res = await accept(h, { task: "feat-cart", repo: "acme/web", issue: cart.number });
+    expect(res.statusCode, res.body).toBe(202);
+    await h.idle();
+    status = await h.status();
+    expect(status.links.map((l) => l.task)).toEqual(["feat-cart"]);
+    expect(status.recentWrites.find((w) => w.op === "add_to_board")).toMatchObject({ result: "would_send", mode: "observe" });
+    expect(gh.writes()).toEqual([]);
+  });
+
+  it("a failed read links nothing: the open-issues page failing keeps the proposals as they were; an accept whose issue read fails is audited as an error", async () => {
+    const gh = new FakeGitHub();
+    gh.addBoard("acme", 1);
+    const cart = gh.addIssue("acme/web", { title: "Shopping cart drawer" });
+    const openIssuesPage = (req: { method: string; path: string; query: URLSearchParams }) =>
+      req.method === "GET" && req.path === "/repos/acme/web/issues" && req.query.get("sort") === "updated";
+    gh.intercept = (req) => (openIssuesPage(req) ? { status: 502, body: { message: "Bad gateway" } } : undefined);
+    const h = await rig({ gh, tasks: ["worker-a|Alice|feat-cart|Shopping cart drawer"] });
+    let status = await h.status();
+    expect(status.proposals).toEqual([]);
+    expect(status.recentWrites.filter((w) => w.op === "link_issue")).toEqual([]);
+    expect(status.syncState?.lastError).toMatch(/open issues/);
+    expect(gh.requests.filter(openIssuesPage)).toHaveLength(1);
+
+    gh.intercept = null;
+    await h.reconcile();
+    expect((await h.status()).proposals.map((p) => p.task)).toEqual(["feat-cart"]);
+    // The page fails again: the last proposals stay, still nothing linked
+    gh.intercept = (req) => (openIssuesPage(req) ? { status: 502, body: { message: "Bad gateway" } } : undefined);
+    await h.reconcile();
+    expect((await h.status()).proposals.map((p) => p.task)).toEqual(["feat-cart"]);
+
+    gh.intercept = (req) => (req.method === "GET" && req.path === `/repos/acme/web/issues/${cart.number}` ? { status: 500, body: { message: "boom" } } : undefined);
+    expect((await accept(h, { task: "feat-cart", repo: "acme/web", issue: cart.number })).statusCode).toBe(202);
+    await h.idle();
+    status = await h.status();
+    expect(status.links).toEqual([]);
+    expect(status.recentWrites.find((w) => w.op === "link_issue" && w.result !== "would_link")).toMatchObject({ result: "error", value: `owner ${h.sessionId}` });
+
+    gh.intercept = null;
+    gh.issue("acme/web", cart.number)!.state = "closed";
+    expect((await accept(h, { task: "feat-cart", repo: "acme/web", issue: cart.number })).statusCode).toBe(202);
+    await h.idle();
+    status = await h.status();
+    expect(status.links).toEqual([]);
+    expect(status.recentWrites.find((w) => w.op === "link_issue" && w.result === "skipped")).toMatchObject({ error: "the issue is closed" });
+  });
+
+  it("each reconcile tries the next unlinked tasks (at most 10 searches), so a task past the 10th is linked too", async () => {
+    const gh = new FakeGitHub();
+    const lines = Array.from({ length: 12 }, (_, i) => `worker-a|Alice|feat-${i + 1}|Plain task number ${i + 1}`);
+    gh.addIssue("acme/web", { title: "feat-12" });
+    const h = await rig({ gh, repos: [{ repo: "acme/web", default: true }], tasks: lines });
+    const searches = () => gh.requests.filter((r) => r.path === "/search/issues").length;
+    expect(searches()).toBe(10);
+    expect((await h.status()).links).toEqual([]);
+    await h.reconcile();
+    expect(searches()).toBeLessThanOrEqual(20);
+    expect((await h.status()).links.map((l) => l.task)).toEqual(["feat-12"]);
+  });
+
+  it("matching: a task id is a word of its own; a plain-word id is never matched by mention; titles compare by bigrams", () => {
+    expect([...mentionTokens("Fixes (feat-a). See `feat-b`: x, feat-c.v2 and #feat-d")].filter((w) => w.startsWith("feat"))).toEqual(["feat-a", "feat-b", "feat-c.v2", "feat-d"]);
+    expect(distinctiveTaskId("login")).toBe(false);
+    expect(distinctiveTaskId("api")).toBe(false);
+    expect(distinctiveTaskId("feat-a")).toBe(true);
+    expect(titleSimilarity("Order history page for customers", "order history page, for customer")).toBeGreaterThan(0.9);
+    expect(titleSimilarity("Login form (web)", "Login form")).toBeLessThan(0.85);
+    expect(titleSimilarity("short", "short")).toBe(0);
+  });
+});
+
+describe("per-repository redaction and creates (#262 item 3)", () => {
+  const CORE = { repo: "acme/core", default: true, project: { owner: "acme", number: 2 }, agent_field: "Agent" };
+
+  it("create_issues per repository: on for the private one, off for the public one", async () => {
+    const gh = new FakeGitHub();
+    gh.addBoard("acme", 2);
+    gh.addBoard("acme", 3);
+    const h = await rig({
+      gh,
+      tracker: { create_issues_for_new_tasks: true },
+      repos: [CORE, { repo: "acme/site", project: { owner: "acme", number: 3 }, match: { tasks: ["site-*"] }, create_issues: false }],
+      tasks: ["worker-a|Alice|core-api|API server", "worker-a|Alice|site-home|Home page"],
+    });
+    expect(gh.issues("acme/core").map((i) => i.title)).toEqual(["core-api: API server"]);
+    expect(gh.issues("acme/site")).toEqual([]);
+    expect(gh.writes().filter((r) => r.path.startsWith("/repos/acme/site"))).toEqual([]);
+    expect((await h.status()).links.map((l) => `${l.task} ${l.repo}`)).toEqual(["core-api acme/core"]);
+    expect(parseTrackerConfig({ enabled: true, create_issues_for_new_tasks: true, repos: [{ repo: "a/b" }, { repo: "a/c", create_issues: false }] }, h.config))
+      .toMatchObject({ ok: true, settings: { repos: [{ createIssues: true }, { createIssues: false }] } });
+    expect(parseTrackerConfig({ enabled: true, repos: [{ repo: "a/b", redact_patterns: ["(unclosed"] }] }, h.config)).toMatchObject({
+      ok: false,
+      errors: [expect.stringMatching(/^tracker\.repos\[0\]\.redact_patterns\[0\]: not a valid regular expression/)],
+    });
+  });
+
+  it("a private name configured for the public repository never reaches it (title, body, comment, Agent field, search); the private one still gets it", async () => {
+    const gh = new FakeGitHub();
+    const coreBoard = gh.addBoard("acme", 2);
+    const siteBoard = gh.addBoard("acme", 3);
+    const h = await rig({
+      gh,
+      tracker: { create_issues_for_new_tasks: true },
+      repos: [CORE, { repo: "acme/site", project: { owner: "acme", number: 3 }, agent_field: "Agent", match: { tasks: ["*-site"] }, redact_patterns: ["zephyr"] }],
+      tasks: ["zephyr-bot|Zed|zephyr-site|Zephyr landing page", "zephyr-bot|Zed|zephyr-core|Zephyr engine"],
+    });
+    for (const task of ["zephyr-site", "zephyr-core"]) {
+      await h.emit("agent.run.started", runStarted(task, "zephyr-bot", `ev-${task}`));
+      await h.emit("planner.blocked", plannerBlocked(task, "owner", "zephyr_gate", "zephyr-bot"));
+    }
+
+    const [site] = gh.issues("acme/site");
+    const [core] = gh.issues("acme/core");
+    expect(site.title).toBe("[redacted]-site: [redacted] landing page");
+    expect(site.comments).toHaveLength(1);
+    expect(gh.card(siteBoard, "acme/site", site.number)?.agent).toBe("[redacted]-bot");
+    const toSite = gh.requests.filter(
+      (r) => r.path.startsWith("/repos/acme/site") || (r.query.get("q") ?? "").includes("repo:acme/site") || r.body?.variables?.board === siteBoard.id,
+    );
+    expect(toSite.filter((r) => r.write).length).toBeGreaterThanOrEqual(5);
+    for (const r of toSite) expect(JSON.stringify({ path: r.path, query: r.query.toString(), body: r.body ?? null }), r.path).not.toMatch(/zephyr/i);
+
+    expect(core.title).toBe("zephyr-core: Zephyr engine");
+    expect(core.body).toContain("Zephyr engine");
+    expect(core.comments[0]).toContain("zephyr_gate");
+    expect(gh.card(coreBoard, "acme/core", core.number)?.agent).toBe("zephyr-bot");
+  });
+
+  it("observe: what would be sent to the public repository is recorded redacted", async () => {
+    const gh = new FakeGitHub();
+    const h = await rig({
+      gh,
+      tracker: { mode: "observe", create_issues_for_new_tasks: true },
+      repos: [{ repo: "acme/core", default: true }, { repo: "acme/site", match: { tasks: ["*-site"] }, redact_patterns: ["zephyr"] }],
+      tasks: ["worker-a|Alice|zephyr-site|Zephyr landing page", "worker-a|Alice|zephyr-core|Zephyr engine"],
+    });
+    const creates = (await h.status()).recentWrites.filter((w) => w.op === "create_issue");
+    expect(creates.map((w) => `${w.repo} ${w.result}`).sort()).toEqual(["acme/core would_send", "acme/site would_send"]);
+    expect(creates.find((w) => w.repo === "acme/site")!.wouldSend).not.toMatch(/zephyr/i);
+    expect(creates.find((w) => w.repo === "acme/core")!.wouldSend).toMatch(/Zephyr engine/);
+    expect(gh.writes()).toEqual([]);
+  });
+});
+
+describe("a removed-line miss counts only for tasks this process has seen (#271)", () => {
+  it("links from before a restart whose lines are gone count nothing; a line seen and then removed still does", async () => {
+    const gh = new FakeGitHub();
+    gh.addBoard("acme", 1);
+    const a = gh.addIssue("acme/web", { title: "feat-a" });
+    const e = gh.addIssue("acme/web", { title: "feat-e" });
+    const lineA = "worker-a|Alice|feat-a|Removed while stopped";
+    const lineE = "worker-b|Bob|feat-e|Removed while running";
+    const first = await rig({ gh, tracker: { close_removed_tasks: true }, tasks: [lineA, lineE] });
+    expect((await first.status()).links).toHaveLength(2);
+    await first.manager.stop();
+
+    // Restarted with a's line gone (or a reload pointing at another file): a was never seen by this process
+    const h = await rig({ gh, dir: first.dir, tracker: { close_removed_tasks: true }, tasks: [lineE] });
+    await h.reconcile();
+    await h.reconcile();
+    expect(gh.issue("acme/web", a.number)?.state).toBe("open");
+    expect((await h.status()).removedTasks).toEqual([]);
+
+    h.writeTasks(["worker-a|Alice|feat-x|Another line"]);
+    await h.reconcile();
+    await h.reconcile();
+    expect(gh.issue("acme/web", e.number)).toMatchObject({ state: "closed", stateReason: "not_planned" });
+    expect(gh.issue("acme/web", a.number)?.state).toBe("open");
   });
 });

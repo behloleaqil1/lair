@@ -18,12 +18,18 @@
  *   pending before it is sent, its body carries a marker, and a later
  *   attempt finds the issue by that marker in the issues list before it
  *   would create another one.
- * - Every text sent is redacted (redact.ts) and bounded.
+ * - An issue found by a guess (proposals.ts) is only proposed: linked by
+ *   auto_link in act mode when it is the one candidate, or by the owner.
+ * - Every text sent is redacted (redact.ts, then the repository's own
+ *   patterns) and bounded.
  */
 import { createHash } from "crypto";
 import type { Event } from "../../shared/server-types.js";
 import type {
   TrackerLink,
+  TrackerLinkCandidate,
+  TrackerLinkProposal,
+  TrackerLinkReason,
   TrackerOp,
   TrackerRemovedTask,
   TrackerStatus,
@@ -34,7 +40,8 @@ import type { EventBus } from "../core/event-bus.js";
 import type { DecisionProducer, DecisionResolution } from "../decisions/types.js";
 import { optionToStatus, statusToOption, type RepoSettings, type TrackerSettings } from "./config.js";
 import { GitHubError, type Board, type BoardItem, type GitHubTrackerClient, type Issue, type Milestone, type Pull } from "./github-projects.js";
-import { makeRedactor, oneLine, type Redact } from "./redact.js";
+import { distinctiveTaskId, IssueIndex, mentionTokens } from "./proposals.js";
+import { makeRedactor, oneLine, withPatterns, type Redact } from "./redact.js";
 import type { TrackerStore } from "./store.js";
 import type { TaskInfo, TaskSource, TasksSnapshot } from "./tasks.js";
 
@@ -49,6 +56,12 @@ export const MAX_QUEUE = 500;
 const MAX_NEW_LINKS_PER_RECONCILE = 10;
 /** Closed PRs a reconcile reads per tracked repository (one page, the newest update first) */
 const CLOSED_PULLS_PER_REPO = 100;
+/** Open issues a reconcile reads per tracked repository to propose links (one page, the newest update first; none when no task needs one) */
+const OPEN_ISSUES_PER_REPO = 100;
+/** Issues a reconcile reads one by one to propose links (a PR's closing issue the page did not have) */
+const MAX_PROPOSAL_LOOKUPS = 5;
+/** Candidates kept per proposal */
+const MAX_CANDIDATES = 5;
 /** Tasks a reconcile finishes because their PR merged elsewhere, and tasks it closes because their line was removed (each; the rest wait) */
 const MAX_FINISHES_PER_RECONCILE = 10;
 /** Reconciles in a row that must miss a linked task's line before it counts as removed */
@@ -86,6 +99,8 @@ interface RepoState {
   settings: RepoSettings;
   board: Board | null;
   error: string | null;
+  /** Every text sent to this repository goes through it */
+  redact: Redact;
 }
 
 type WriteResult<T> = { sent: true; value: T } | { sent: false; why: "observe" | "budget" | "needs_owner" | "rate_limited" | "failed" };
@@ -168,6 +183,13 @@ export class TrackerService {
   private readonly missing = new Map<string, number>();
   /** Linked tasks' PRs the last reconcile saw closed without merging */
   private closedUnmerged: TrackerUnmergedPull[] = [];
+  /** Linked tasks whose line this process has seen in the tasks file: only those can count as removed */
+  private readonly seenPresent = new Set<string>();
+  /** The issues the last reconcile proposes for unlinked tasks, and those tasks' lines */
+  private proposals: TrackerLinkProposal[] = [];
+  private readonly proposalInfo = new Map<string, TaskInfo>();
+  /** Where the next reconcile starts among the unlinked tasks (each reconcile tries the next ones) */
+  private linkCursor = 0;
 
   constructor(options: TrackerServiceOptions) {
     this.project = options.project;
@@ -181,7 +203,10 @@ export class TrackerService {
     this.now = options.now ?? Date.now;
     this.redact = options.redact ?? makeRedactor({ patterns: options.settings.redactPatterns });
     this.log = options.log ?? console;
-    for (const repo of options.settings.repos) this.repos.set(repo.repo.toLowerCase(), { settings: repo, board: null, error: null });
+    for (const repo of options.settings.repos) {
+      // A repository's own patterns run after the built-in rules and the project's, on its texts only
+      this.repos.set(repo.repo.toLowerCase(), { settings: repo, board: null, error: null, redact: withPatterns(this.redact, repo.redactPatterns) });
+    }
     const sync = this.store.getState(this.project);
     const reset = sync?.rateLimitResetAt ? Date.parse(sync.rateLimitResetAt) : 0;
     if (reset > this.now()) this.client.restoreRateLimit(reset);
@@ -293,6 +318,45 @@ export class TrackerService {
       await this.loadBoards();
       await this.reconcile();
     });
+  }
+
+  /**
+   * The owner accepts a proposed link (POST /api/tracker/links): checked
+   * against the last reconcile's proposals now, made by a queued job (the
+   * issue is read again there: still open, not a PR, linked to no task).
+   */
+  acceptLink(task: string, repo: string, issueNumber: number, by: string): { ok: true } | { ok: false; code: 409 | 503; error: string } {
+    if (this.store.getLink(this.project, task)) return { ok: false, code: 409, error: `${task} is linked already` };
+    const candidate = this.proposals
+      .find((p) => p.task === task)
+      ?.candidates.find((c) => c.repo.toLowerCase() === repo.toLowerCase() && c.issueNumber === issueNumber);
+    if (!candidate) return { ok: false, code: 409, error: `${repo}#${issueNumber} is not proposed for ${task} (the status lists the last reconcile's proposals)` };
+    if (!this.enqueue(`link ${task}`, () => this.linkAccepted(task, candidate, by))) {
+      return { ok: false, code: 503, error: "The tracker's queue is full or it is stopping: try again shortly" };
+    }
+    return { ok: true };
+  }
+
+  private async linkAccepted(task: string, candidate: TrackerLinkCandidate, by: string): Promise<void> {
+    const audit = (result: "success" | "skipped" | "error", error: string | null) =>
+      this.store.recordWrite(
+        this.project,
+        { task, repo: candidate.repo, issueNumber: candidate.issueNumber, op: "link_issue", value: `owner ${by}`, mode: this.settings.mode, wouldSend: null, result, error },
+        this.iso(),
+      );
+    if (this.store.getLink(this.project, task)) return audit("skipped", "the task is linked already");
+    if (this.store.getLinkByIssue(this.project, candidate.repo, candidate.issueNumber)) return audit("skipped", "the issue is linked to another task");
+    let issue: Issue | null;
+    try {
+      issue = await this.client.getIssue(candidate.repo, candidate.issueNumber);
+    } catch (e) {
+      audit("error", `the issue could not be read: ${message(e)}`.slice(0, 300));
+      throw e;
+    }
+    if (!issue || issue.state !== "open" || issue.isPullRequest) return audit("skipped", `the issue is ${issue ? (issue.isPullRequest ? "a pull request" : "closed") : "not found"}`);
+    audit("success", null);
+    this.proposals = this.proposals.filter((p) => p.task !== task);
+    await this.link(task, candidate.repo, issue, this.initialStatus(this.proposalInfo.get(task) ?? null));
   }
 
   /** An answer to one of the tracker's decisions: "check again" checks the token's scopes again. */
@@ -591,17 +655,28 @@ export class TrackerService {
     return `${MARKER_PREFIX}${sha(`${this.project}\0${task}`)} -->`;
   }
 
-  private titleOf(task: string, info: TaskInfo | null): string {
-    const description = oneLine(info?.description ?? "").replace(/\brepo:[\w.-]+\/[\w.-]+/gi, "").trim();
-    return this.redact(oneLine(description ? `${task}: ${description}` : task), TITLE_MAX);
+  /** The redactor of a repository's texts (its own patterns after the project's) */
+  private redactFor(repo: string): Redact {
+    return this.repoState(repo)?.redact ?? this.redact;
   }
 
-  private bodyOf(task: string, info: TaskInfo | null): string {
-    const description = this.redact(info?.description ?? "", BODY_MAX);
+  /** A task line's description without the tracker's repo: tag, on one line */
+  private descriptionOf(info: TaskInfo | null): string {
+    return oneLine(info?.description ?? "").replace(/\brepo:[\w.-]+\/[\w.-]+/gi, "").trim();
+  }
+
+  private titleOf(task: string, info: TaskInfo | null, repo: string): string {
+    const description = this.descriptionOf(info);
+    return this.redactFor(repo)(oneLine(description ? `${task}: ${description}` : task), TITLE_MAX);
+  }
+
+  private bodyOf(task: string, info: TaskInfo | null, repo: string): string {
+    const redact = this.redactFor(repo);
+    const description = redact(info?.description ?? "", BODY_MAX);
     return [
-      description || `Task ${this.redact(task, 128)}.`,
+      description || `Task ${redact(task, 128)}.`,
       "",
-      `_Tracked by Lair: this issue follows task \`${this.redact(task, 128)}\` of the project's plan (its column, its agent, closed when the task is done)._`,
+      `_Tracked by Lair: this issue follows task \`${redact(task, 128)}\` of the project's plan (its column, its agent, closed when the task is done)._`,
       "",
       this.marker(task),
     ].join("\n");
@@ -614,7 +689,7 @@ export class TrackerService {
   /**
    * The task's issue: the one linked already, else one its line names, else
    * the one an earlier create made (found by its marker), else an open issue
-   * with its exact title, else (create_issues_for_new_tasks) a new one.
+   * with its exact title, else (its repository's create_issues) a new one.
    */
   private async ensureLink(task: string, info: TaskInfo | null): Promise<TrackerLink | null> {
     const existing = this.store.getLink(this.project, task);
@@ -642,14 +717,17 @@ export class TrackerService {
       if (made) return this.link(task, pending.repo, made, status);
     }
 
-    // One search: the title Lair would give it starts with the task id
-    const title = this.titleOf(task, info);
-    const [same] = await this.client.findOpenIssuesByTitle(repo, task, [title, task]);
-    if (same) return this.link(task, repo, same, status);
+    // One search: the title Lair would give it starts with the task id. A task id this repository's
+    // redaction changes is never sent to it, not even in a search
+    const title = this.titleOf(task, info, repo);
+    if (this.redactFor(repo)(task, 128) === task) {
+      const [same] = await this.client.findOpenIssuesByTitle(repo, task, [title, task]);
+      if (same) return this.link(task, repo, same, status);
+    }
 
-    if (!this.settings.createIssuesForNewTasks) return null;
+    if (!state.settings.createIssues) return null;
     const milestone = await this.milestoneFor(state, task);
-    const body = this.bodyOf(task, info);
+    const body = this.bodyOf(task, info, repo);
     const marker = this.marker(task);
     const created = await this.write(
       {
@@ -757,7 +835,7 @@ export class TrackerService {
       }
     }
     if (which.agent && link.agent && board.agentField) {
-      const agent = this.redact(oneLine(link.agent), AGENT_MAX);
+      const agent = state.redact(oneLine(link.agent), AGENT_MAX);
       const set = await this.write(
         { op: "set_agent", task: link.task, repo: link.repo, issueNumber: link.issueNumber, value: agent, wouldSend: { agent } },
         () => this.client.setText(board.id, link.projectItemId!, board.agentField!.id, agent),
@@ -831,7 +909,7 @@ export class TrackerService {
       () => this.client.addLabels(link.repo, link.issueNumber, [label]),
     );
     if (!labelled.sent) return;
-    const comment = this.redact(
+    const comment = this.redactFor(link.repo)(
       `Lair: this task is blocked (${cls}${rule ? `, ${rule}` : ""}). It waits for its cause to clear or for the owner; the ${label} label goes when it is released.`,
       COMMENT_MAX,
     );
@@ -911,18 +989,33 @@ export class TrackerService {
         return null;
       });
       if (snapshot) {
-        let linked = 0;
-        for (const info of snapshot.open) {
-          if (this.stopped || linked >= MAX_NEW_LINKS_PER_RECONCILE) break;
-          if (this.store.getLink(this.project, info.task)) continue;
-          linked++;
+        // At most MAX_NEW_LINKS_PER_RECONCILE tried, each reconcile starting where the last one stopped
+        const unlinked = snapshot.open.filter((info) => !this.store.getLink(this.project, info.task));
+        const start = unlinked.length > 0 ? this.linkCursor % unlinked.length : 0;
+        let tried = 0;
+        for (; tried < Math.min(unlinked.length, MAX_NEW_LINKS_PER_RECONCILE) && !this.stopped; tried++) {
+          const info = unlinked[(start + tried) % unlinked.length];
           await this.ensureLink(info.task, info).catch((e) => errors.push(`${info.task}: ${message(e)}`));
         }
+        this.linkCursor = start + tried;
         for (const task of snapshot.done) {
           const link = this.store.getLink(this.project, task);
           if (link && (link.closedAs !== "completed" || !link.closedSynced)) await this.finish(task, "completed").catch((e) => errors.push(`${task}: ${message(e)}`));
         }
       }
+
+      // Open PRs, read once: they propose links, and their tasks are in review
+      const openPulls = new Map<string, Pull[]>();
+      for (const state of this.repos.values()) {
+        if (this.stopped) break;
+        const repo = state.settings.repo;
+        try {
+          openPulls.set(repo.toLowerCase(), await this.client.listOpenPulls(repo));
+        } catch (e) {
+          errors.push(`${repo} pull requests: ${message(e)}`);
+        }
+      }
+      if (snapshot && !this.stopped) await this.reconcileProposals(snapshot, openPulls, errors);
 
       // Merges first: a task whose PR merged is done, even if its line also went
       await this.reconcileMerges(errors);
@@ -931,15 +1024,12 @@ export class TrackerService {
       for (const state of this.repos.values()) {
         if (this.stopped) break;
         const repo = state.settings.repo;
-        // Open PRs: their tasks are in review
-        try {
-          for (const pull of await this.client.listOpenPulls(repo)) {
-            for (const link of this.linksOfPull(repo, pull.body, pull.headRef)) {
-              if (!link.closedAs && link.status !== "done" && link.status !== "in_review") await this.setStatus(link, "in_review");
+        for (const pull of openPulls.get(repo.toLowerCase()) ?? []) {
+          for (const link of this.linksOfPull(repo, pull.body, pull.headRef)) {
+            if (!link.closedAs && link.status !== "done" && link.status !== "in_review") {
+              await this.setStatus(link, "in_review").catch((e) => errors.push(`${link.task}: ${message(e)}`));
             }
           }
-        } catch (e) {
-          errors.push(`${repo} pull requests: ${message(e)}`);
         }
         try {
           fixed += await this.reconcileBoard(state);
@@ -967,6 +1057,145 @@ export class TrackerService {
       this.scheduleReconcile();
     }
     return { fixed, errors };
+  }
+
+  /**
+   * Link proposals for the open tasks no issue is linked to (none named on
+   * their line, no create pending, a tracked repository takes them). One
+   * page of each tracked repository's open issues is read (no request when
+   * no task needs one) and matched (proposals.ts: the task id named, a close
+   * title); an open PR of the task (its branch ends with the task id, or its
+   * body names it) proposes the open, unlinked issue it closes (at most
+   * MAX_PROPOSAL_LOOKUPS read one by one). One candidate proposed for no
+   * other task: would_link; anything else is ambiguous and never linked
+   * without the owner. With auto_link in act mode a would_link one is linked
+   * (at most MAX_NEW_LINKS_PER_RECONCILE); otherwise it is recorded once as
+   * would_link. A failed read keeps the last proposals and links nothing.
+   */
+  private async reconcileProposals(snapshot: TasksSnapshot, openPulls: Map<string, Pull[]>, errors: string[]): Promise<void> {
+    const tracked = this.settings.repos.map((r) => r.repo);
+    const wanted: TaskInfo[] = [];
+    for (const info of snapshot.open) {
+      if (this.store.getLink(this.project, info.task) || this.store.getPending(this.project, info.task)) continue;
+      const state = this.repoFor(info.task, info);
+      if (state && !explicitIssue(info.description, state.settings.repo, tracked)) wanted.push(info);
+    }
+    if (wanted.length === 0) {
+      this.proposals = [];
+      this.proposalInfo.clear();
+      return;
+    }
+    const index = new IssueIndex();
+    for (const state of this.repos.values()) {
+      if (this.stopped) return;
+      try {
+        for (const issue of await this.client.listOpenIssues(state.settings.repo, OPEN_ISSUES_PER_REPO)) index.add(state.settings.repo, issue);
+      } catch (e) {
+        errors.push(`${state.settings.repo} open issues: ${message(e)}`);
+        return;
+      }
+    }
+    const linked = new Set(this.store.listLinks(this.project).map((l) => IssueIndex.key(l.repo, l.issueNumber)));
+    const issues = new Map<string, Issue>();
+    const found = new Map<string, Map<string, TrackerLinkCandidate>>();
+    const add = (task: string, repo: string, issue: Issue, reason: TrackerLinkReason, score: number | null, pr: number | null) => {
+      const key = IssueIndex.key(repo, issue.number);
+      if (linked.has(key) || issue.isPullRequest || issue.state !== "open") return;
+      issues.set(key, issue);
+      const byIssue = found.get(task) ?? new Map<string, TrackerLinkCandidate>();
+      found.set(task, byIssue);
+      const c = byIssue.get(key) ?? { repo, issueNumber: issue.number, issueUrl: issue.url, title: issue.title.slice(0, 200), reasons: [], score: null, pr: null };
+      if (!c.reasons.includes(reason)) c.reasons.push(reason);
+      c.score = score ?? c.score;
+      c.pr = pr ?? c.pr;
+      byIssue.set(key, c);
+    };
+    for (const info of wanted) {
+      if (this.stopped) return;
+      for (const m of index.match(info.task, this.descriptionOf(info))) add(info.task, m.repo, m.issue, m.reason, m.score, null);
+      // Matching is synchronous: the event loop gets a turn between tasks
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    let lookups = 0;
+    for (const state of this.repos.values()) {
+      const prRepo = state.settings.repo;
+      for (const pull of openPulls.get(prRepo.toLowerCase()) ?? []) {
+        const words = mentionTokens(pull.body);
+        for (const { task } of wanted) {
+          if (pull.headRef !== task && !pull.headRef.endsWith(`/${task}`) && !(distinctiveTaskId(task) && words.has(task))) continue;
+          for (const ref of closingRefs(pull.body, prRepo)) {
+            const refRepo = this.repoState(ref.repo)?.settings.repo;
+            const key = IssueIndex.key(ref.repo, ref.number);
+            if (!refRepo || linked.has(key)) continue;
+            let issue = index.get(refRepo, ref.number) ?? issues.get(key) ?? null;
+            if (!issue) {
+              if (this.stopped || lookups >= MAX_PROPOSAL_LOOKUPS) continue;
+              lookups++;
+              try {
+                issue = await this.client.getIssue(refRepo, ref.number);
+              } catch (e) {
+                errors.push(`${refRepo}#${ref.number}: ${message(e)}`);
+                return;
+              }
+            }
+            if (issue) add(task, refRepo, issue, "pull_closes", null, pull.number);
+          }
+        }
+      }
+    }
+
+    const tasksOfIssue = new Map<string, number>();
+    for (const byIssue of found.values()) for (const key of byIssue.keys()) tasksOfIssue.set(key, (tasksOfIssue.get(key) ?? 0) + 1);
+    this.proposalInfo.clear();
+    this.proposals = [];
+    for (const info of wanted) {
+      const byIssue = found.get(info.task);
+      if (!byIssue || byIssue.size === 0) continue;
+      const [first] = byIssue.keys();
+      const ambiguous = byIssue.size > 1 || (tasksOfIssue.get(first) ?? 0) > 1;
+      this.proposals.push({ task: info.task, candidates: [...byIssue.values()].slice(0, MAX_CANDIDATES), action: ambiguous ? "ambiguous" : "would_link" });
+      this.proposalInfo.set(info.task, info);
+    }
+
+    let autoLinked = 0;
+    for (const p of [...this.proposals]) {
+      if (this.stopped) return;
+      const c = p.candidates[0];
+      const issue = issues.get(IssueIndex.key(c.repo, c.issueNumber));
+      if (p.action === "would_link" && issue && this.settings.autoLink && this.settings.mode === "act" && autoLinked < MAX_NEW_LINKS_PER_RECONCILE) {
+        autoLinked++;
+        this.store.recordWrite(
+          this.project,
+          { task: p.task, repo: c.repo, issueNumber: c.issueNumber, op: "link_issue", value: `auto: ${c.reasons.join(", ")}`, mode: "act", wouldSend: null, result: "success", error: null },
+          this.iso(),
+        );
+        this.proposals = this.proposals.filter((x) => x !== p);
+        await this.link(p.task, c.repo, issue, this.initialStatus(this.proposalInfo.get(p.task) ?? null)).catch((e) => errors.push(`${p.task}: ${message(e)}`));
+        continue;
+      }
+      const named = p.candidates.map((x) => `${x.repo}#${x.issueNumber}`);
+      const value = p.action === "would_link" ? c.reasons.join(", ") : `ambiguous: ${named.join(", ")}`;
+      const wouldSend = JSON.stringify({
+        action: p.action,
+        candidates: p.candidates.map((x) => ({ issue: `${x.repo}#${x.issueNumber}`, reasons: x.reasons, score: x.score, pr: x.pr })),
+      }).slice(0, 4000);
+      this.store.recordWrite(
+        this.project,
+        {
+          task: p.task,
+          repo: p.action === "would_link" ? c.repo : null,
+          issueNumber: p.action === "would_link" ? c.issueNumber : null,
+          op: "link_issue",
+          value,
+          mode: this.settings.mode,
+          wouldSend,
+          result: "would_link",
+          error: null,
+          dedupeKey: sha(`would_link\0${p.task}\0${value}`),
+        },
+        this.iso(),
+      );
+    }
   }
 
   /**
@@ -1025,7 +1254,10 @@ export class TrackerService {
    * would_close row is recorded and the status lists it. A task on a line
    * fill refuses (malformed, too long) is still in the file; a file with
    * no task line at all is taken for a broken write and counts nothing.
-   * The count is kept in memory: a restart starts it again.
+   * Only a task this process has seen in the file can miss: a config
+   * reload that points at another tasks file, or links made before a
+   * restart for lines gone since, count nothing. The count is kept in
+   * memory: a restart starts it again.
    */
   private async reconcileRemoved(snapshot: TasksSnapshot, errors: string[]): Promise<void> {
     const present = new Set<string>([...snapshot.open.map((t) => t.task), ...snapshot.done, ...snapshot.mentioned]);
@@ -1033,12 +1265,15 @@ export class TrackerService {
     const open = this.store.listLinks(this.project).filter((l) => !l.closedAs);
     const openTasks = new Set(open.map((l) => l.task));
     for (const task of [...this.missing.keys()]) if (!openTasks.has(task)) this.missing.delete(task);
+    for (const task of [...this.seenPresent]) if (!openTasks.has(task)) this.seenPresent.delete(task);
     let closed = 0;
     for (const link of open) {
       if (present.has(link.task)) {
+        this.seenPresent.add(link.task);
         this.missing.delete(link.task);
         continue;
       }
+      if (!this.seenPresent.has(link.task)) continue;
       const misses = (this.missing.get(link.task) ?? 0) + 1;
       this.missing.set(link.task, misses);
       if (misses < REMOVED_AFTER_RECONCILES) continue;
@@ -1097,7 +1332,7 @@ export class TrackerService {
       }
       const actual = item.status ? optionToStatus(item.status, state.settings.statusOptions) : null;
       const statusDrift = link.status !== null && actual !== link.status;
-      const agentDrift = link.agent !== null && board.agentField !== null && (item.agent ?? "") !== this.redact(oneLine(link.agent), AGENT_MAX);
+      const agentDrift = link.agent !== null && board.agentField !== null && (item.agent ?? "") !== state.redact(oneLine(link.agent), AGENT_MAX);
       if (!statusDrift && !agentDrift) continue;
       const outcome = await this.pushBoard(link, { status: statusDrift, agent: agentDrift });
       if (statusDrift && outcome === "sent") {
@@ -1153,6 +1388,8 @@ export class TrackerService {
       recentWrites: this.store.listWrites(this.project, 50),
       queue: { waiting: this.waiting, dropped: this.dropped },
       closedUnmerged: this.closedUnmerged,
+      // A task linked since (an event, the owner) is no longer proposed
+      proposals: this.proposals.filter((p) => !this.store.getLink(this.project, p.task)),
       removedTasks: this.removedTasks(),
       warnings: [...this.settings.warnings, ...this.notes],
     };
