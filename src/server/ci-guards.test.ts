@@ -561,6 +561,7 @@ export const UNWIRED_ALLOWED: Readonly<Record<string, string>> = {
   jobs: "scheduler job definitions; imported by routes/scheduler.ts, which index.ts registers",
   machines: "machine config and SSH helpers; imported by fleet/, services/ and ai/",
   policy: "merge policy helpers; imported by review/",
+  "pr-health": "PR health 2a: the detector alone, reached only by its tests until PR 2b wires it from index.ts (remove this entry then)",
   "ready-guard": "ready guard helpers; imported by agents/ and review/",
 };
 
