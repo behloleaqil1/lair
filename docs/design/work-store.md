@@ -181,11 +181,12 @@ truth: the agents module's claims"). The work store never copies holder state:
   or replaced after its owner died (failover, restart adoption) produces a task event written by the agents module
   through the producer interface, and the task goes back to `ready` (or `blocked` when the reason is a block) with
   that reason in the event. A claim replaced by failover changes the derived holder with no write to the task row.
-- Work store 2 (observe): the consumer records each run and claim fact (`started`, `ended`, `claim_released`) on the
-  task's timeline. Only a *live* run's start moves the stored state (a `waiting` or `blocked` task back to `ready`,
-  shown `running`); a run's end or a released claim moves nothing, because the agents module releases a claim at
-  every run's end, also right after a `WAITING` or `BLOCKED` report, and fill keeps that state then. A start replayed
-  after its run ended moves nothing either: the files decide that task's state (6.4).
+- Work store 2 (observe): the consumer records each run and claim fact (`started`, `ended` for a completed run,
+  `claim_released`) on the task's timeline; a run that crashed, hung or was stopped records an `agent.recovery` kind,
+  which work store 2 does not read. Only a *live* run's start moves the stored state (a `waiting` or `blocked` task back
+  to `ready`, shown `running`); a run's end or a released claim moves nothing, because the agents module releases a
+  claim at every run's end, also right after a `WAITING` or `BLOCKED` report, and fill keeps that state then. A start
+  replayed after its run ended moves nothing either: the files decide that task's state (6.4).
 
 | Store | What it holds | How work store relates |
 |---|---|---|
@@ -416,11 +417,16 @@ CREATE TABLE work_cursors (
 ```
 
 One cursor per source, because the facts come from two stores with their own ids: reports from the project's bus
-store, run and claim facts from the agents store's events (by row: that table's id is a text id, and its rows only
-grow). The owner's first applied import starts both cursors where the sources ended before the files were read (a
-fact before that is in the files the import read; one after it is the consumer's). A store adopted under work store 1
-has no cursor: each source starts at its end when the consumer first reads it. A source whose end is behind its cursor
-(its file was replaced) starts again at its end.
+store (an `AUTOINCREMENT` id), run and claim facts from the agents store's events. `agents_events` has a text primary
+key, so its cursor is the table's implicit row number, which only grows while rows are only added (no Lair code
+deletes or vacuums that table). Two guards keep a renumbering (a manual `VACUUM`, a future retention) from applying a
+fact twice or hiding it: each run or claim event on the timeline carries the agents event's own id, and a fact whose id
+is already on the task's timeline is skipped; a source whose end is behind its cursor starts again at its end. Do not
+`VACUUM` or prune `agents_events` while a project follows; an integer sequence column on `agents_events` (an agents
+store migration) is the clean fix and is left to the PR that first prunes it. The owner's first applied import starts
+both cursors where the sources ended before the files were read (a fact before that is in the files the import read;
+one after it is the consumer's). A store adopted under work store 1 has no cursor: each source starts at its end when
+the consumer first reads it.
 
 ### 3.4 Schema versioning and migrations
 
@@ -493,7 +499,10 @@ checks. The tools below are for later PRs (work store 7); `report` is unchanged.
 What a report does to its task (work store 2): every report is a `report` event on the task, with the agent and run
 from the bus store as the actor; `WAITING` makes it `waiting`, `BLOCKED` makes it `blocked` (its summary is the
 reason), a `DONE` that fill's ready guard accepts makes it `done` (a refused one is recorded as refused and moves
-nothing: the follower reads its line again when the files next change); `PROGRESS` and `TICK` move nothing, nor does
+nothing: the follower reads its line again when the files next change). The work store asks the guard for its verdict
+alone (`reportAccepted(..., { record: false })`): fill's `fill_report_refused` and `fill_report_waiting` events stay
+fill's to write, so observing writes nothing in the agents store. A guard that fails gives no verdict: the step fails
+(shown, backed off) and the cursor stays, so the report is read again. `PROGRESS` and `TICK` move nothing, nor does
 any report on a `done` or `dropped` task. A report for a task the store does not have is skipped (counted in the
 status) and the cursor moves past it: the follower imports the task from the files. The two sources are applied in
 time order (a full batch of one source holds the other back to its last time), so a replay after a restart applies a

@@ -3399,7 +3399,11 @@ the store applies the bus reports and run facts that came since its last ones, e
 (`WAITING`, `BLOCKED` and an accepted `DONE` set the state; `PROGRESS`, `TICK`, a refused `DONE`, a run's end and a
 released claim are recorded on the task only; a live run's start shows a waiting or blocked task running again); then it
 looks at the two files' size and time, and imports again only when one changed (the follower is the actor). A step that
-fails or takes longer than 60 s is shown as a failure in the status and backs off (doubling, up to 10 minutes).
+fails or takes longer than 60 s is shown as a failure in the status and backs off (doubling, up to 10 minutes); a ready
+guard that fails on a `DONE` is such a failure (the report is read again, never taken as refused). The store asks fill's
+ready guard for its verdict only: it writes no event in the agents store. The status's `applied` counts the facts
+recorded on a task (a `PROGRESS` too), `skipped` those for tasks the store does not have or already recorded. Do not `VACUUM`
+`data/agents.db` while a project follows (the store reads its events by row).
 
 **Reads.** `GET /api/work/status?project=<name>` (the mode, the schema version, tasks by state, the last import, whether
 the store is adopted and its cursors, the follower's checks, reads and failures, and a comparison with fill's view at
