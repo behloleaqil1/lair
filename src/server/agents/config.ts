@@ -315,8 +315,8 @@ export const AgentsSchema = z
         agent: LimitsSchema.optional(),
         per_agent: z.record(LimitsSchema).default({}),
         /**
-         * What a hard limit does (docs/design/ai-spend.md G5): act blocks new runs with a spend decision; observe
-         * (the default) records would_block and a notice and blocks nothing; off ignores hard limits
+         * The mode of the budget guard AI spend adds (docs/design/ai-spend.md G5: the request and minute limits, a later
+         * part). Token and cost hard limits block new runs as before, whatever it says
          */
         guard_mode: z.enum(GUARD_MODES).default("observe"),
       })
@@ -614,7 +614,7 @@ export interface AgentsSettings {
     project?: BudgetLimits;
     agent?: BudgetLimits;
     perAgent: Record<string, BudgetLimits>;
-    /** What a hard limit does: act blocks, observe only records would_block and a notice, off ignores it */
+    /** The budget guard's mode, for the limits AI spend adds (G5); token and cost hard limits always block */
     guardMode: GuardMode;
   };
   /** agents.spend, with every adapter's usage parser resolved */

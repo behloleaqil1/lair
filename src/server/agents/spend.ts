@@ -73,11 +73,21 @@ export const MAX_RUN_TOKENS = 1e10;
 export const MAX_RUN_COST = 1e5;
 /** How long request_pattern may take on one chunk of a log */
 export const REQUEST_PATTERN_TIMEOUT_MS = 250;
+/** request_pattern time per tick, over all owed rows: past it the rest waits for the next tick */
+export const VM_MS_PER_TICK = 300;
+/**
+ * Lines a request_pattern must get through in PROBE_TIMEOUT_MS when the config loads: runs of one character and a
+ * mismatch at the end, where a pattern with nested quantifiers backtracks for seconds
+ */
+const PROBE_LINES = ["a", "0", " ", "x", "-", "=", ".", "\t", "ab"].map((s) => `${s.repeat(32)}!`);
+const PROBE_TIMEOUT_MS = 100;
 /** Failed attempts to write a run's row before its mark is dropped (recorded); the first retry waits RETRY_BASE_MS, doubling */
 export const MAX_SPEND_ATTEMPTS = 5;
 const RETRY_BASE_MS = 30_000;
 /** A mark whose run is still active this long after it was made was left by a crash: the run's real end marks it again */
 const STALE_MARK_MS = 24 * 3600_000;
+/** Failed marks kept for another try at most (a database that stays broken doesn't grow memory) */
+const MAX_UNMARKED = 1000;
 
 /** An adapter's usage parser, resolved: its request pattern compiled once, at config load. */
 export interface ResolvedUsageParser {
@@ -154,6 +164,9 @@ function requestPatternProblem(source: unknown): string | null {
     return `not a valid regular expression (${e instanceof Error ? e.message : String(e)})`;
   }
   if (re.test("")) return "it matches an empty line, so it would count every line";
+  if (countMatchingLines(re, PROBE_LINES, PROBE_TIMEOUT_MS) === null) {
+    return `it takes over ${PROBE_TIMEOUT_MS} ms on a short line (nested quantifiers backtrack): simplify it`;
+  }
   return null;
 }
 
@@ -249,18 +262,25 @@ interface LogScan {
   requests: number;
   totals: ResultTotals;
   refused?: string;
+  /** The drain's request_pattern time so far (shared by the scans of one drain) */
+  vm: VmTime;
+}
+
+/** Time the request_pattern ran in one drain, in ms: past VM_MS_PER_TICK the drain stops for that tick */
+interface VmTime {
+  spent: number;
 }
 
 const requestContext = createContext({ re: /./, lines: [] as string[], n: 0 });
 const requestScript = new Script("n = 0; for (const line of lines) if (re.test(line)) n++;");
 
-/** The lines `re` matches, interrupted after REQUEST_PATTERN_TIMEOUT_MS (a pattern that backtracks badly): null then. */
-function countMatchingLines(re: RegExp, lines: string[]): number | null {
+/** The lines `re` matches, interrupted after `timeoutMs` (a pattern that backtracks badly): null then. */
+function countMatchingLines(re: RegExp, lines: string[], timeoutMs = REQUEST_PATTERN_TIMEOUT_MS): number | null {
   requestContext.re = re;
   requestContext.lines = lines;
   requestContext.n = 0;
   try {
-    requestScript.runInContext(requestContext, { timeout: REQUEST_PATTERN_TIMEOUT_MS });
+    requestScript.runInContext(requestContext, { timeout: timeoutMs });
     return typeof requestContext.n === "number" ? requestContext.n : null;
   } catch {
     return null;
@@ -308,7 +328,9 @@ function processLines(scan: LogScan, lines: string[]): void {
   if (lines.length === 0 || scan.refused) return;
   if (scan.kind === "requests") {
     // One run of the pattern over a chunk's lines, in a vm that interrupts it: a pattern that backtracks badly fails
+    const started = performance.now();
     const n = countMatchingLines(scan.pattern!, lines);
+    scan.vm.spent += performance.now() - started;
     if (n === null) scan.refused = `its request_pattern took over ${REQUEST_PATTERN_TIMEOUT_MS} ms on a part of the log`;
     else scan.requests += n;
     return;
@@ -376,7 +398,7 @@ async function stepScan(scan: LogScan, path: string, budget: number): Promise<{ 
       scan.refused = "its log was rewritten while it was read";
       return { used, done: true };
     }
-    while (scan.offset < scan.end && used < budget && !scan.refused) {
+    while (scan.offset < scan.end && used < budget && !scan.refused && scan.vm.spent < VM_MS_PER_TICK) {
       const length = Math.min(SCAN_CHUNK_BYTES, scan.end - scan.offset);
       const buffer = Buffer.alloc(length);
       const { bytesRead } = await handle.read(buffer, 0, length, scan.offset);
@@ -511,6 +533,8 @@ const PROVIDER_NAME = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/;
 export class SpendRecorder {
   /** Reads in progress, by run id (a restart starts a log over: its row isn't written until a read finishes) */
   private scans = new Map<string, LogScan>();
+  /** Ends whose mark failed to write, by run id (written again by markAgain) */
+  private unmarked = new Map<string, { at: number; attempts: number; why: string; agent: string; task: string }>();
 
   constructor(private readonly o: SpendRecorderOptions) {}
 
@@ -528,13 +552,53 @@ export class SpendRecorder {
     return !this.enabled || this.parserFor(run).kind === "patterns";
   }
 
-  /** A run ended (synchronously, as it ends): its row is owed. Never throws. */
+  /**
+   * A run ended (synchronously, as it ends): its row is owed. Never throws. A mark that can't be written (a busy or
+   * full database) is kept here and written again by the next drains; after MAX_SPEND_ATTEMPTS in all, the run is
+   * given up with a usage_refused event, so no row is lost without a word.
+   */
   ended(run: AgentRun, at: number): void {
     if (!this.enabled) return;
     try {
       this.o.store.markSpendPending(this.o.project, run.id, at);
     } catch (e) {
-      this.o.warn?.(`[agents] ${this.o.project}: run ${run.id.slice(0, 8)}'s spend row is not owed: ${message(e)}`);
+      this.o.warn?.(`[agents] ${this.o.project}: run ${run.id.slice(0, 8)}'s spend row could not be marked owed (tried again next tick): ${message(e)}`);
+      if (this.unmarked.size < MAX_UNMARKED) {
+        this.unmarked.set(run.id, { at, attempts: 1, why: message(e), agent: run.agent, task: run.task });
+      }
+    }
+  }
+
+  /** The marks that failed in ended(), written again (each drain, MAX_SPEND_ATTEMPTS in all). Never throws. */
+  private async markAgain(): Promise<void> {
+    for (const [runId, mark] of [...this.unmarked]) {
+      try {
+        this.o.store.markSpendPending(this.o.project, runId, mark.at);
+        this.unmarked.delete(runId);
+        continue;
+      } catch (e) {
+        mark.attempts++;
+        mark.why = message(e);
+      }
+      if (mark.attempts < MAX_SPEND_ATTEMPTS) continue;
+      this.unmarked.delete(runId);
+      try {
+        await this.o.record(
+          "usage_refused",
+          {
+            agent: mark.agent,
+            task: mark.task,
+            runId,
+            summary: `run ${runId.slice(0, 8)} (${mark.agent} on ${mark.task}) gets no spend row: its end could not be recorded after ${mark.attempts} attempts: ${mark.why}`,
+            evidence: [mark.why],
+            data: { why: mark.why, stage: "mark", attempts: mark.attempts },
+            dedupeKey: `usage_refused:${runId}`,
+          },
+          this.o.now(),
+        );
+      } catch (e) {
+        this.o.warn?.(`[agents] ${this.o.project}: run ${runId.slice(0, 8)} gets no spend row (${mark.why}), and that could not be recorded: ${message(e)}`);
+      }
     }
   }
 
@@ -545,7 +609,9 @@ export class SpendRecorder {
    */
   async drain(): Promise<void> {
     if (!this.enabled) return;
+    await this.markAgain();
     let budget = SCAN_BYTES_PER_TICK;
+    const vm: VmTime = { spent: 0 };
     let pending;
     try {
       pending = this.o.store.pendingSpend(this.o.project, this.o.now(), MAX_RUNS_PER_TICK);
@@ -554,7 +620,7 @@ export class SpendRecorder {
       return;
     }
     for (const owed of pending) {
-      if (budget <= 0) break;
+      if (budget <= 0 || vm.spent >= VM_MS_PER_TICK) break;
       try {
         const run = this.o.store.getRun(owed.runId);
         if (!run || this.o.store.getSpend(owed.runId)) {
@@ -567,7 +633,7 @@ export class SpendRecorder {
           if (this.o.now() - owed.endedAt > STALE_MARK_MS) this.o.store.dropSpendPending(owed.runId);
           continue;
         }
-        const read = await this.usageOf(run, budget);
+        const read = await this.usageOf(run, budget, vm);
         budget -= read.used;
         if (read.usage === null) continue; // more of its log next time
         await this.write(run, read.usage);
@@ -579,7 +645,7 @@ export class SpendRecorder {
   }
 
   /** The usage of an ended run: null while its log is still being read. */
-  private async usageOf(run: AgentRun, budget: number): Promise<{ usage: LogUsage | null; used: number }> {
+  private async usageOf(run: AgentRun, budget: number, vm: VmTime): Promise<{ usage: LogUsage | null; used: number }> {
     const parser = this.parserFor(run);
     if (parser.kind === "none") return { usage: { source: "none" }, used: 0 };
     if (parser.kind === "patterns") {
@@ -603,9 +669,11 @@ export class SpendRecorder {
         skipping: false,
         requests: 0,
         totals: emptyTotals(),
+        vm,
       };
       this.scans.set(run.id, scan);
     }
+    scan.vm = vm;
     const step = await stepScan(scan, run.logPath, budget);
     if (!step.done) return { usage: null, used: step.used };
     this.scans.delete(run.id);

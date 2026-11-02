@@ -2202,10 +2202,8 @@ describe("5a. transient provider and network errors are waited out, within bound
 // ============ 6. BUDGETS ============
 
 describe("6. budgets per agent and per project, per day and month, fed by the fleet budget", () => {
-  // guard_mode act: hard limits block (the default, observe, only records would_block: spend.test.ts AT-1)
   const limits = () => ({
     budgets: {
-      guard_mode: "act",
       agent: { daily_cost: { soft: 5, hard: 8 } },
       project: { monthly_tokens: { soft: 10000, hard: 20000 } },
     },
@@ -2732,7 +2730,7 @@ describe("9. the Decision Inbox: decisions are raised there, and the owner's ans
 
   it("a hard budget limit is a spend decision; 'allow' (confirmed) lets the waiting run start for the rest of the period", async () => {
     const budget = new BudgetManager({ enabled: true, maxDailyCost: 1000, providers: [] });
-    const h = setup(() => ({ budgets: { guard_mode: "act", agent: { daily_cost: { hard: 8 } } } }), { budget });
+    const h = setup(() => ({ budgets: { agent: { daily_cost: { hard: 8 } } } }), { budget });
     const { inbox, answer } = await withInbox(h);
     await request(h); // waits: worker-a is over budget once the usage comes in
     budget.recordCost("provider-a", 9, "usage", { project: "demo", agent: "worker-a", tokens: 100 });
@@ -2767,7 +2765,7 @@ describe("9. the Decision Inbox: decisions are raised there, and the owner's ans
 
   it("when the inbox refuses a decision (its cap per module is reached), the inbox file gets it instead", async () => {
     const budget = new BudgetManager({ enabled: true, maxDailyCost: 1000, providers: [] });
-    const h = setup(() => ({ budgets: { guard_mode: "act", agent: { daily_cost: { hard: 8 } } } }), { budget });
+    const h = setup(() => ({ budgets: { agent: { daily_cost: { hard: 8 } } } }), { budget });
     const { inbox } = await withInbox(h, { maxOpenPerSource: 1 });
     budget.recordCost("provider-a", 9, "usage", { project: "demo", agent: "worker-a", tokens: 100 });
     budget.recordCost("provider-a", 9, "usage", { project: "demo", agent: "worker-b", tokens: 100 });

@@ -72,11 +72,9 @@ import type { SupervisedAgents } from "../watchdog/types.js";
 import { backoffMs, MODEL_ID, parseAgentsConfig, type AgentLockSettings, type AgentsSettings } from "./config.js";
 import {
   agentLimits,
-  BUDGET_METRICS,
   describeUsage,
   evaluateBudget,
   periodEnd,
-  periodKey,
   type FleetBudget,
 } from "./budgets.js";
 import {
@@ -166,8 +164,6 @@ export const DECISION_WAIT = "wait";
 export const DECISION_STOP = "stop";
 export const DECISION_ALLOW = "allow";
 export const DECISION_RETRY_NOW = "retry_now";
-/** The one option of a budget guard's notice (budgets.guard_mode observe) */
-export const BUDGET_NOTICE_NOTED = "noted";
 
 /** In the detail of a run that waits for its tool's sign-in */
 const SIGNED_OUT_DETAIL = "not signed in on this machine";
@@ -838,7 +834,6 @@ export class AgentsService {
     ["chain", (decision: Decision, chainId: string) => this.chainMoot(decision, chainId)],
     ["transient", (decision: Decision, provider: string) => this.outageMoot(decision, provider)],
     ["signin", (_decision: Decision, tool: string) => this.signInMoot(tool)],
-    ["guard", (_decision: Decision, rest: string) => this.guardMoot(rest)],
   ]);
 
   /** A tool's sign-in decision (ref `signin:<tool>`) is moot once its check says it is signed in here. */
@@ -1186,12 +1181,8 @@ export class AgentsService {
     return null;
   }
 
-  /**
-   * The hard budget limit an agent's new runs are blocked by, or null. Only with budgets.guard_mode act: in observe
-   * (the default) a hard limit records would_block and a notice (checkBudgets) and blocks nothing; off ignores it.
-   */
+  /** The hard budget limit an agent's new runs are blocked by, or null. */
   private budgetBlock(agent: string, now: number): string | null {
-    if (this.settings.budgets.guardMode !== "act") return null;
     const scopes = [
       evaluateBudget(this.store, this.project, null, this.settings.budgets.project, now),
       evaluateBudget(this.store, this.project, agent, agentLimits(this.settings, agent), now),
@@ -2830,13 +2821,8 @@ export class AgentsService {
     return scopes;
   }
 
-  /**
-   * Soft limits warn once per period. A hard limit, by budgets.guard_mode: act stops new runs and raises a `spend`
-   * decision once (and records guard_did); observe, the default, records guard_would (would_block) and raises one
-   * notice per scope, metric and period, and blocks nothing; off ignores it.
-   */
+  /** Soft limits warn once per period; hard limits stop new runs and raise a `spend` decision once. */
   private async checkBudgets(t: Tick): Promise<void> {
-    const mode = this.settings.budgets.guardMode;
     for (const scope of this.scopes(t.now)) {
       const scopeKey = scope.scope === "project" ? "project" : `agent:${scope.agent}`;
       for (const line of scope.lines) {
@@ -2857,26 +2843,9 @@ export class AgentsService {
           );
           if (warned) t.summary.warnings++;
         }
-        if (line.level !== "hard" || mode === "off") continue;
+        if (line.level !== "hard") continue;
         const text = describeUsage(scope, line, "hard");
         const until = iso(periodEnd(line.metric, t.now));
-        if (mode === "observe") {
-          await this.budgetWouldBlock(scope, scopeKey, key, line, text, until, t);
-          continue;
-        }
-        const guardFacts = { guard: "budget", subject: scopeKey, metric: line.metric, period: line.period, used: line.used, hard: line.hard ?? null };
-        await this.record(
-          "guard_did",
-          {
-            agent: scope.agent,
-            subject: scopeKey,
-            summary: `budget guard (act): blocks new runs ${scope.scope === "project" ? "in the project" : `for ${scope.agent}`} until ${until}: ${text}`,
-            evidence: [text],
-            data: { ...guardFacts, verdict: "block" },
-            dedupeKey: `guard_did:budget:${key}`,
-          },
-          t.now,
-        );
         await this.record(
           "budget_exceeded",
           {
@@ -2934,88 +2903,6 @@ export class AgentsService {
         );
       }
     }
-  }
-
-  /**
-   * budgets.guard_mode observe: a hard limit reached blocks nothing. It records one guard_would event (would_block)
-   * and raises one notice per scope, metric and period (withdrawn once the period is over or the limit no longer
-   * reached: mootBy "guard"); the notice never leaves Lair.
-   */
-  private async budgetWouldBlock(
-    scope: BudgetScopeView,
-    scopeKey: string,
-    key: string,
-    line: BudgetLine,
-    text: string,
-    until: string,
-    t: Tick,
-  ): Promise<void> {
-    const who = scope.scope === "project" ? "in the project" : `for ${scope.agent}`;
-    const facts = { guard: "budget", subject: scopeKey, metric: line.metric, period: line.period, used: line.used, hard: line.hard ?? null };
-    await this.record(
-      "guard_would",
-      {
-        agent: scope.agent,
-        subject: scopeKey,
-        summary: `budget guard (observe): would block new runs ${who} until ${until}: ${text}; nothing was blocked`,
-        evidence: [text],
-        data: { ...facts, verdict: "would_block" },
-        dedupeKey: `guard_would:budget:${key}`,
-      },
-      t.now,
-    );
-    await this.raiseAt(
-      {
-        kind: "other",
-        attention: "notice",
-        question: `${text.charAt(0).toUpperCase()}${text.slice(1)}: in observe mode nothing was blocked`,
-        context: [
-          `Scope: ${scopeKey}. Metric: ${line.metric} for ${line.period}. Used: ${line.used} (hard limit ${line.hard ?? "none"}).`,
-          "",
-          `agents.budgets.guard_mode is observe, so new runs ${who} still start. With guard_mode act, they would wait until ${until} and a spend decision would ask you.`,
-        ].join("\n"),
-        options: [
-          {
-            id: BUDGET_NOTICE_NOTED,
-            label: "Noted",
-            consequences: "The notice closes. Nothing else changes: runs go on starting while guard_mode is observe.",
-            effect: "reversible",
-          },
-        ],
-        recommended: BUDGET_NOTICE_NOTED,
-        why: "Nothing is decided here: the limit is observed only. Raise the limit, or set guard_mode act to have it block.",
-        reversible: true,
-        key: `guard:budget:${key}`,
-        ref: `guard:budget:${key}`,
-        structure: {
-          class: "agents.budget_guard",
-          evidence: {
-            code: "would_block",
-            facts: { scope: scopeKey, metric: line.metric, period: line.period, used: line.used, hard: line.hard ?? null },
-            cause_cleared: false,
-            linked_issue: null,
-          },
-        },
-      },
-      t.now,
-    );
-  }
-
-  /** A budget guard's notice (ref `guard:budget:<scope>:<metric>:<period>`) is moot once its period ended or its limit isn't reached. */
-  private guardMoot(rest: string): string | null {
-    if (!rest.startsWith("budget:")) return null;
-    const parts = rest.slice("budget:".length).split(":");
-    const period = parts.pop() ?? "";
-    const metric = parts.pop() ?? "";
-    const scopeKey = parts.join(":");
-    const now = this.probes.clock.now();
-    const known = BUDGET_METRICS.find((m) => m === metric);
-    if (!known) return null;
-    if (periodKey(known, now) !== period) return `the ${known} period ${period} is over`;
-    if (this.settings.budgets.guardMode !== "observe") return "budgets.guard_mode is no longer observe";
-    const scope = this.scopes(now).find((s) => (s.scope === "project" ? "project" : `agent:${s.agent}`) === scopeKey);
-    const line = scope?.lines.find((l) => l.metric === known);
-    return line?.level === "hard" ? null : `${scopeKey} is under its ${known} hard limit`;
   }
 
   /**
@@ -3323,7 +3210,7 @@ export class AgentsService {
     const snap = this.snapshot;
     const alive = (pid: number, started: number): boolean | null => (snap ? snap.isAlive(pid, started) : null);
     const claims = this.store.listClaims(this.project);
-    const projectBudget = evaluateBudget(this.store, this.project, null, this.settings.budgets.project, now, this.settings.budgets.guardMode === "act");
+    const projectBudget = evaluateBudget(this.store, this.project, null, this.settings.budgets.project, now);
     const agents = this.agentIds().map((id) => this.agentView(id, claims, now, alive));
     return {
       project: this.project,
@@ -3488,7 +3375,7 @@ export class AgentsService {
   ): AgentView {
     const active = this.store.activeRunForAgent(this.project, id);
     const latest = active ?? this.store.latestRunForAgent(this.project, id);
-    const budget = evaluateBudget(this.store, this.project, id, agentLimits(this.settings, id), now, this.settings.budgets.guardMode === "act");
+    const budget = evaluateBudget(this.store, this.project, id, agentLimits(this.settings, id), now);
     // Over budget is what blocks new runs: a hard limit the owner didn't allow runs past
     const overBudget = this.budgetBlock(id, now);
     const previous = active?.previousRunId ? this.store.getRun(active.previousRunId) : null;

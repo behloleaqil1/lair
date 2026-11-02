@@ -366,59 +366,38 @@ describe("AT-1: an adapter's stream-json result event is the run's usage", () =>
     expect(pendingCount(h.dbPath)).toBe(0);
   });
 
-  it("with budgets.guard_mode unset (observe), a hard token limit it passes records would_block and a notice, and the next run starts", async () => {
-    const h = setup({ ...SPEND_ON, budgets: { project: { daily_tokens: { hard: 50_000 } } } });
-    await oneRun(h, { log: CLAUDE_RUN, line: "- DONE feat-login by worker-a 12:05Z: merged" });
-    await h.service.tick();
-    await h.service.tick();
+  for (const guardMode of [undefined, "observe", "act", "off"] as const) {
+    it(`a hard token limit the reported usage passes blocks new runs as before, with budgets.guard_mode ${guardMode ?? "unset"}`, async () => {
+      const budgets = { ...(guardMode ? { guard_mode: guardMode } : {}), project: { daily_tokens: { hard: 50_000 } } };
+      const h = setup({ ...SPEND_ON, budgets });
+      await oneRun(h, { log: CLAUDE_RUN, line: "- DONE feat-login by worker-a 12:05Z: merged" });
+      await h.service.tick();
+      await h.service.tick();
 
-    const would = eventsOf(h, "guard_would");
-    expect(would).toHaveLength(1);
-    expect(would[0]).toMatchObject({
-      subject: "project",
-      data: { guard: "budget", subject: "project", verdict: "would_block", metric: "daily_tokens", period: "2026-03-02", used: 69_007, hard: 50_000 },
+      // Today's blocking: one spend decision, one budget_exceeded, new runs refused; guard_mode doesn't change it
+      const spend = h.asked.filter((d) => d.kind === "spend");
+      expect(spend).toHaveLength(1);
+      expect(spend[0]).toMatchObject({ key: "budget:project:daily_tokens:2026-03-02", recommended: "wait" });
+      expect(eventsOf(h, "budget_exceeded")).toHaveLength(1);
+      expect(h.manager.status("demo").projectBudget).toMatchObject({ blocked: true, lines: [{ metric: "daily_tokens", used: 69_007, level: "hard" }] });
+      await expect(h.service.requestRun({ agent: "worker-b", task: "task-2", prompt: "Next" })).rejects.toMatchObject({
+        statusCode: 403,
+        message: "Over budget: the project used 69007 tokens in day 2026-03-02 (hard limit 50000)",
+      });
+      expect(eventsOf(h, "guard_would")).toEqual([]);
+      expect(eventsOf(h, "guard_did")).toEqual([]);
+      expect(h.asked.filter((d) => d.attention === "notice")).toEqual([]);
     });
-    const notices = h.asked.filter((d) => d.attention === "notice");
-    expect(notices).toHaveLength(1);
-    expect(notices[0]).toMatchObject({ kind: "other", key: "guard:budget:project:daily_tokens:2026-03-02", options: [{ id: "noted" }] });
-    expect(notices[0].question).toContain("in observe mode nothing was blocked");
-    // Nothing blocks: no spend decision, no budget_exceeded, and the next run starts
-    expect(h.asked.filter((d) => d.kind === "spend")).toEqual([]);
-    expect(eventsOf(h, "budget_exceeded")).toEqual([]);
-    expect(eventsOf(h, "guard_did")).toEqual([]);
-    expect(h.manager.status("demo").projectBudget).toMatchObject({ blocked: false, lines: [{ metric: "daily_tokens", level: "hard" }] });
-    const next = await h.service.requestRun({ agent: "worker-b", task: "task-2", prompt: "Next" });
-    await h.service.tick();
-    expect(h.store.getRun(next.id)?.state).toBe("running");
-  });
+  }
 
-  it("with guard_mode act, the existing spend decision is raised and new runs wait (today's blocking)", async () => {
-    const h = setup({ ...SPEND_ON, budgets: { guard_mode: "act", project: { daily_tokens: { hard: 50_000 } } } });
-    await oneRun(h, { log: CLAUDE_RUN, line: "- DONE feat-login by worker-a 12:05Z: merged" });
+  it("a hard limit configured the way it was before AI spend (usage_patterns, no guard_mode, spend off) still blocks", async () => {
+    const h = setup({ usage_patterns: ["cost: \\$(?<cost>[0-9.]+)"], budgets: { agent: { daily_cost: { hard: 1 } } } });
+    await oneRun(h, { agent: "worker-p", task: "feat-p", log: "working\ncost: $2.50\n", line: "- DONE feat-p by worker-p" });
     await h.service.tick();
-    await h.service.tick();
-
-    const spend = h.asked.filter((d) => d.kind === "spend");
-    expect(spend).toHaveLength(1);
-    expect(spend[0]).toMatchObject({ key: "budget:project:daily_tokens:2026-03-02", recommended: "wait" });
-    expect(eventsOf(h, "budget_exceeded")).toHaveLength(1);
-    expect(eventsOf(h, "guard_did")).toHaveLength(1);
-    expect(eventsOf(h, "guard_would")).toEqual([]);
-    expect(h.asked.filter((d) => d.attention === "notice")).toEqual([]);
-    await expect(h.service.requestRun({ agent: "worker-b", task: "task-2", prompt: "Next" })).rejects.toMatchObject({
-      statusCode: 403,
-      message: "Over budget: the project used 69007 tokens in day 2026-03-02 (hard limit 50000)",
-    });
-  });
-
-  it("with guard_mode off, a hard limit does nothing at all", async () => {
-    const h = setup({ ...SPEND_ON, budgets: { guard_mode: "off", project: { daily_tokens: { hard: 50_000 } } } });
-    await oneRun(h, { log: CLAUDE_RUN, line: "- DONE feat-login by worker-a 12:05Z: merged" });
-    await h.service.tick();
-    expect(eventsOf(h, "guard_would")).toEqual([]);
-    expect(eventsOf(h, "budget_exceeded")).toEqual([]);
-    expect(h.asked).toEqual([]);
-    await expect(h.service.requestRun({ agent: "worker-b", task: "task-2", prompt: "Next" })).resolves.toMatchObject({ state: "queued" });
+    expect(h.store.usageSince("demo", "worker-p", 0)).toEqual({ tokens: 0, cost: 2.5 });
+    expect(h.asked.filter((d) => d.kind === "spend")).toHaveLength(1);
+    await expect(h.service.requestRun({ agent: "worker-p", task: "feat-q", prompt: "Next" })).rejects.toMatchObject({ statusCode: 403 });
+    expect(spendRows(h)).toEqual([]);
   });
 });
 
@@ -464,6 +443,34 @@ describe("AT-2: a run's spend row and usage are written once, also across a rest
     // And the store itself refuses a second row for the run: its usage isn't added twice
     expect(again.store.recordSpend(rows[0], { project: "demo", provider: "provider-c", runId: run.id, tokens: 5, cost: 5, at: NOW })).toBe(false);
     expect(ledger(again.dbPath)).toHaveLength(1);
+  });
+});
+
+describe("an end whose mark can't be written is marked again, then given up with an event", () => {
+  it("a mark that fails once is written again by the next drain: the row is not lost", async () => {
+    const h = setup(SPEND_ON);
+    const mark = h.store.markSpendPending.bind(h.store);
+    let failures = 1;
+    h.store.markSpendPending = (project, runId, endedAt) => {
+      if (failures-- > 0) throw new Error("database is locked");
+      mark(project, runId, endedAt);
+    };
+    const run = await oneRun(h, { log: CLAUDE_RUN, line: "- DONE feat-login by worker-a 12:05Z: merged" });
+    expect(spendRows(h)).toEqual([expect.objectContaining({ runId: run.id, class: "productive", tokens: 69_007 })]);
+    expect(eventsOf(h, "usage_refused")).toEqual([]);
+  });
+
+  it("a mark that keeps failing is given up after five attempts with a usage_refused event saying why", async () => {
+    const h = setup(SPEND_ON);
+    h.store.markSpendPending = () => {
+      throw new Error("database or disk is full");
+    };
+    const run = await oneRun(h, { log: CLAUDE_RUN, line: "- DONE feat-login by worker-a 12:05Z: merged" });
+    for (let i = 0; i < 4; i++) await h.service.tick();
+    expect(spendRows(h)).toEqual([]);
+    const refused = eventsOf(h, "usage_refused");
+    expect(refused).toHaveLength(1);
+    expect(refused[0]).toMatchObject({ runId: run.id, agent: "worker-a", task: "feat-login", data: { stage: "mark", attempts: 5, why: "database or disk is full" } });
   });
 });
 
@@ -629,14 +636,37 @@ describe("AT-5: an adapter that reports no tokens: its requests, never an estima
     expect(spendRows(h)[0].requests).toBe(23);
   });
 
-  it("a request_pattern that backtracks badly is stopped after its time: the usage is refused, the tick goes on", async () => {
-    const adapters = { ...ADAPTERS, "plain-cli": { ...ADAPTERS["plain-cli"], usage_parser: "request-lines", request_pattern: "^(a+)+$" } } as Record<string, AgentAdapter>;
+  it("a request_pattern that backtracks badly on a log line (not on the load-time probe) is stopped after its time: the usage is refused, the tick goes on", async () => {
+    const adapters = { ...ADAPTERS, "plain-cli": { ...ADAPTERS["plain-cli"], usage_parser: "request-lines", request_pattern: "^(q+)+$" } } as Record<string, AgentAdapter>;
     const h = setup(SPEND_ON, { adapters });
     const started = Date.now();
-    const run = await oneRun(h, { agent: "worker-p", task: "feat-slow", log: `${"a".repeat(40)}!\nrequest\n` });
+    const run = await oneRun(h, { agent: "worker-p", task: "feat-slow", log: `${"q".repeat(40)}!\nrequest\n` });
     expect(Date.now() - started).toBeLessThan(5000);
     expect(spendRows(h)[0]).toMatchObject({ runId: run.id, usageSource: "none", requests: null });
     expect(String(eventsOf(h, "usage_refused")[0].data.why)).toContain("took over 250 ms");
+  });
+
+  it("a pattern's time is bounded per tick over all owed rows: past it the rest waits for the next tick", async () => {
+    const slow = { usage_parser: "request-lines", request_pattern: "^(q+)+$" };
+    const adapters = { ...ADAPTERS, "claude-cli": { ...ADAPTERS["claude-cli"], ...slow }, "plain-cli": { ...ADAPTERS["plain-cli"], ...slow } } as Record<string, AgentAdapter>;
+    const h = setup(SPEND_ON, { adapters });
+    h.spawner.behaviour = (pid, logPath) => {
+      writeLog(h.clock, logPath, `${"q".repeat(40)}!\n`);
+      h.spawner.exit(pid, 0);
+    };
+    for (const [agent, task] of [["worker-a", "t-1"], ["worker-b", "t-2"], ["worker-p", "t-3"]]) {
+      await h.service.requestRun({ agent, task, prompt: "x" });
+    }
+    await h.service.tick();
+    h.clock.t += 90 * SEC;
+    await h.service.tick(); // all three end: each read would take the whole 250 ms timeout
+    // Two timeouts reach the 300 ms bound: the third run's row waits
+    expect(spendRows(h)).toHaveLength(2);
+    expect(pendingCount(h.dbPath)).toBe(1);
+    await h.service.tick();
+    expect(spendRows(h)).toHaveLength(3);
+    expect(spendRows(h).every((r) => r.usageSource === "none")).toBe(true);
+    expect(eventsOf(h, "usage_refused")).toHaveLength(3);
   });
 
   it("the built-in pattern is the kiro CLI's request line, found mid-line too", () => {
@@ -784,6 +814,7 @@ describe("AT-23: a bad usage config is refused at load, naming each key", () => 
       [{ usage_parser: "request-lines", request_pattern: "([a-z" }, "agent_adapters.plain-cli.request_pattern: not a valid regular expression"],
       [{ usage_parser: "request-lines", request_pattern: "x".repeat(MAX_REQUEST_PATTERN_CHARS + 1) }, "agent_adapters.plain-cli.request_pattern: at most 500 characters"],
       [{ usage_parser: "request-lines", request_pattern: "a*" }, "agent_adapters.plain-cli.request_pattern: it matches an empty line"],
+      [{ usage_parser: "request-lines", request_pattern: "^(a+)+$" }, "agent_adapters.plain-cli.request_pattern: it takes over 100 ms on a short line"],
       [{ usage_parser: "request-lines" }, "agent_adapters.plain-cli.request_pattern: usage_parser request-lines needs a request_pattern"],
       [{ usage_parser: "claude-stream-json", request_pattern: "x" }, "agent_adapters.plain-cli.request_pattern: only read with usage_parser: request-lines"],
       [{ usage_parser: "tokens-guess" }, "agent_adapters.plain-cli.usage_parser: one of claude-stream-json, claude-json, request-lines, patterns, none"],
@@ -873,14 +904,15 @@ describe("AT-33: a guard (or a request or minute budget) needs agents.spend; bud
     );
   });
 
-  it("budgets.guard_mode observe with a daily_cost hard limit loads with spend off: its verdicts are events and notices", async () => {
+  it("budgets.guard_mode observe with a daily_cost hard limit loads with spend off, and the cost limit blocks as before", async () => {
     expect(errorsOf({ enabled: true, budgets: { guard_mode: "observe", project: { daily_cost: { hard: 50 } } } })).toEqual([]);
     const budget = new BudgetManager({ enabled: true, maxDailyCost: 1000, providers: [] });
     const h = setup({ budgets: { guard_mode: "observe", project: { daily_cost: { hard: 5 } } } }, { budget });
     budget.recordCost("provider-c", 6, "usage", { project: "demo", agent: "worker-a", tokens: 10 });
     await h.service.tick();
-    expect(eventsOf(h, "guard_would")).toHaveLength(1);
-    expect(h.asked.filter((d) => d.attention === "notice")).toHaveLength(1);
+    expect(h.asked.filter((d) => d.kind === "spend")).toHaveLength(1);
+    await expect(h.service.requestRun({ agent: "worker-b", task: "task-2", prompt: "Next" })).rejects.toMatchObject({ statusCode: 403 });
+    expect(eventsOf(h, "guard_would")).toEqual([]);
     expect(spendRows(h)).toEqual([]);
   });
 });

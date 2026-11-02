@@ -47,17 +47,13 @@ export function agentLimits(settings: AgentsSettings, agent: string): BudgetLimi
   return { ...base, ...own };
 }
 
-/**
- * Evaluate one scope (the project when `agent` is null). `blocks`: hard limits block new runs (budgets.guard_mode
- * act); otherwise a scope at its hard limit is shown at that level but not as blocked.
- */
+/** Evaluate one scope (the project when `agent` is null). */
 export function evaluateBudget(
   store: AgentsStore,
   project: string,
   agent: string | null,
   limits: BudgetLimits | undefined,
   now: number,
-  blocks = true,
 ): BudgetScopeView | null {
   if (!limits) return null;
   const lines: BudgetLine[] = [];
@@ -78,7 +74,7 @@ export function evaluateBudget(
     scope: agent === null ? "project" : "agent",
     agent: agent ?? undefined,
     lines,
-    blocked: blocks && lines.some((line) => line.level === "hard"),
+    blocked: lines.some((line) => line.level === "hard"),
   };
 }
 

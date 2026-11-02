@@ -241,7 +241,7 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       "fill.prompt_files": { widget: "list", help: "Their contents, in order, make a run's prompt; {prompts_dir}, {agent}, {task}" },
       "fill.done_pattern": { advanced: true, help: "Matched against new queue lines; {task} and {agent} are replaced" },
       "fill.capacity_cmd": { help: "Exit 0: capacity available; anything else holds (its first output line is the reason)" },
-      "budgets.guard_mode": { help: "What a hard limit does: act blocks new runs; observe (the default) only notes it; off ignores it" },
+      "budgets.guard_mode": { help: "The mode of the request and minute limits AI spend adds; token and cost hard limits always block" },
       "spend.enabled": { help: "Record each ended run's runtime, prompt size and the usage its adapter reports" },
     },
   },
