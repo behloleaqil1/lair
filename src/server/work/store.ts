@@ -407,14 +407,15 @@ export class SqliteWorkStore implements WorkStore {
       const skipped = new Map<string, string>();
       files.tasks.forEach((t, i) => {
         seen.add(t.id);
+        // `files: follow` follows what an import made: a task the planner or the owner made is theirs (§6.4)
+        const source = current.get(t.id)?.source.kind ?? "import";
+        if (source !== "import") {
+          skipped.set(t.id, `${t.id}: made by the ${source}, so the files do not change it`);
+          return;
+        }
         const priority = Math.min(i + 1, 999);
         const ref = `tasks_file:${t.line}`;
         const old = current.get(t.id);
-        // `files: follow` follows what an import made: a task the planner or the owner made is theirs (§6.4)
-        if (old && old.source.kind !== "import") {
-          skipped.set(t.id, `${t.id}: made by the ${old.source.kind}, so the files do not change it`);
-          return;
-        }
         // A claimed task keeps its stored state (the run reports it); dropped and back in the file, it is ready again
         const state: StoredTaskState = t.state !== "claimed" ? t.state : old && old.state !== "dropped" ? old.state : "ready";
         const blocked = state !== "blocked" ? null : t.state === "claimed" ? (old?.blockedReason ?? null) : t.reason;
