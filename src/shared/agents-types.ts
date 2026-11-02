@@ -344,7 +344,19 @@ export interface AgentEventView {
   at: string;
 }
 
-export type BudgetMetric = "daily_tokens" | "daily_cost" | "monthly_tokens" | "monthly_cost";
+/**
+ * Token and cost limits count the agents ledger. Request and minute limits (AI spend G5, docs/design/ai-spend.md
+ * §4.5) count the spend records of ended runs, for adapters that report no tokens
+ */
+export type BudgetMetric =
+  | "daily_tokens"
+  | "daily_cost"
+  | "monthly_tokens"
+  | "monthly_cost"
+  | "daily_requests"
+  | "daily_minutes"
+  | "monthly_requests"
+  | "monthly_minutes";
 
 export interface BudgetLine {
   metric: BudgetMetric;
@@ -354,13 +366,18 @@ export interface BudgetLine {
   soft?: number;
   hard?: number;
   level: "ok" | "soft" | "hard";
+  /**
+   * A request or minute line's budgets.guard_mode (G5): its hard limit holds new runs only in `act`; `observe` records
+   * what it would hold, `off` nothing. Unset on token and cost lines, whose hard limits always hold new runs
+   */
+  guard?: "off" | "observe" | "act";
 }
 
 export interface BudgetScopeView {
   scope: "project" | "agent";
   agent?: string;
   lines: BudgetLine[];
-  /** A hard limit is reached: no new runs */
+  /** A hard limit that holds new runs is reached: no new runs */
   blocked: boolean;
 }
 

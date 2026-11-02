@@ -776,6 +776,40 @@ export class AgentsStore {
     return { tokens: row.tokens, cost: row.cost };
   }
 
+  /**
+   * Model requests and agent-minutes of the runs that ended from `since` on, a project's or one agent's, from the
+   * spend records (the request and minute budgets, G5). `aggregated`: retention's cutoff is past `since`, so the days
+   * [fromDay, toDay) come from the daily aggregates, and a run that ended before `before` is left out when its day
+   * has one (as a long spend window reads them).
+   */
+  spendUsageSince(
+    project: string,
+    agent: string | null,
+    since: number,
+    aggregated?: { before: number; fromDay: string; toDay: string },
+  ): { requests: number; minutes: number } {
+    const byAgent = agent === null ? "" : " AND agent = ?";
+    const agentParam = agent === null ? [] : [agent];
+    const skip = aggregated
+      ? ` AND (s.ended_at >= ? OR NOT EXISTS (SELECT 1 FROM agents_spend_daily d WHERE d.project = s.project
+           AND d.day = strftime('%Y-%m-%d', s.ended_at / 1000, 'unixepoch')))`
+      : "";
+    const runs = this.db
+      .prepare(
+        `SELECT COALESCE(SUM(requests), 0) AS requests, COALESCE(SUM(runtime_s), 0) / 60.0 AS minutes
+         FROM agents_spend s WHERE project = ? AND ended_at >= ?${byAgent}${skip}`,
+      )
+      .get(project, since, ...agentParam, ...(aggregated ? [aggregated.before] : [])) as { requests: number; minutes: number };
+    if (!aggregated) return { requests: runs.requests, minutes: runs.minutes };
+    const days = this.db
+      .prepare(
+        `SELECT COALESCE(SUM(requests), 0) AS requests, COALESCE(SUM(minutes), 0) AS minutes
+         FROM agents_spend_daily WHERE project = ? AND day >= ? AND day < ?${byAgent}`,
+      )
+      .get(project, aggregated.fromDay, aggregated.toDay, ...agentParam) as { requests: number; minutes: number };
+    return { requests: runs.requests + days.requests, minutes: runs.minutes + days.minutes };
+  }
+
   /** Usage the ledger holds for one run (agents.usage_patterns rows): null when it holds none. */
   usageForRun(runId: string): { tokens: number; cost: number } | null {
     const row = this.db

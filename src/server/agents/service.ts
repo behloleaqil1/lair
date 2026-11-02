@@ -76,9 +76,15 @@ import type { SupervisedAgents } from "../watchdog/types.js";
 import { backoffMs, fillPatternFor, MODEL_ID, parseAgentsConfig, type AgentLockSettings, type AgentsSettings } from "./config.js";
 import {
   agentLimits,
+  budgetNoticeMoot,
   describeUsage,
   evaluateBudget,
+  holdsRuns,
   periodEnd,
+  scopeKeyOf,
+  softNotice,
+  wouldBlockNotice,
+  type BudgetNotice,
   type FleetBudget,
 } from "./budgets.js";
 import {
@@ -915,13 +921,15 @@ export class AgentsService {
     ["signin", (_decision: Decision, tool: string) => this.signInMoot(tool)],
     // AI spend's notices: a day's waste once the day is over, a task's attempts once it completed or was released
     ["spend", (_decision: Decision, rest: string) => this.spend.moot(rest)],
+    // G5's budget notices (a soft limit reached, a hard limit observe would hold at): once their period is over
+    ["budget_notice", (_decision: Decision, rest: string) => budgetNoticeMoot(rest, this.probes.clock.now())],
   ]);
 
   /**
    * One AI spend notice (attention: notice: nothing waits on an answer, and the notifier never sends it outside
    * Lair). Only through the Decision Inbox: the inbox file is for questions, and this asks none.
    */
-  private async spendNotice(notice: SpendNotice): Promise<boolean> {
+  private async spendNotice(notice: SpendNotice | BudgetNotice): Promise<boolean> {
     const inbox = this.decisions();
     if (!inbox.find) return false;
     return this.raiseAt(
@@ -1398,16 +1406,26 @@ export class AgentsService {
     return null;
   }
 
+  /**
+   * One budget scope: the project's when `agent` is null, else the agent's. Its request and minute lines (G5) carry
+   * budgets.guard_mode and are counted from the spend records.
+   */
+  private budgetOf(agent: string | null, now: number): BudgetScopeView | null {
+    const limits = agent === null ? this.settings.budgets.project : agentLimits(this.settings, agent);
+    return evaluateBudget(this.store, this.project, agent, limits, now, {
+      guardMode: this.settings.budgets.guardMode,
+      retentionDays: this.settings.spend.retentionDays,
+    });
+  }
+
   /** The hard budget limit an agent's new runs are blocked by, or null. */
   private budgetBlock(agent: string, now: number): string | null {
-    const scopes = [
-      evaluateBudget(this.store, this.project, null, this.settings.budgets.project, now),
-      evaluateBudget(this.store, this.project, agent, agentLimits(this.settings, agent), now),
-    ];
+    const scopes = [this.budgetOf(null, now), this.budgetOf(agent, now)];
     for (const scope of scopes) {
       if (!scope) continue;
-      // A limit the owner allowed runs past (a spend decision) doesn't block, for its period
-      const line = scope.lines.find((l) => l.level === "hard" && !this.overridden(scope, l));
+      // A limit the owner allowed runs past (a spend decision) doesn't block, for its period; nor does a request or
+      // minute limit whose guard isn't in act (G5)
+      const line = scope.lines.find((l) => l.level === "hard" && holdsRuns(l) && !this.overridden(scope, l));
       if (line) return describeUsage(scope, line, "hard");
     }
     return null;
@@ -3564,19 +3582,23 @@ export class AgentsService {
 
   private scopes(now: number): BudgetScopeView[] {
     const scopes: BudgetScopeView[] = [];
-    const project = evaluateBudget(this.store, this.project, null, this.settings.budgets.project, now);
+    const project = this.budgetOf(null, now);
     if (project) scopes.push(project);
     for (const agent of this.agentIds()) {
-      const scope = evaluateBudget(this.store, this.project, agent, agentLimits(this.settings, agent), now);
+      const scope = this.budgetOf(agent, now);
       if (scope) scopes.push(scope);
     }
     return scopes;
   }
 
-  /** Soft limits warn once per period; hard limits stop new runs and raise a `spend` decision once. */
+  /**
+   * Soft limits warn once per period (with AI spend on, also as one inbox notice); hard limits stop new runs and
+   * raise a `spend` decision once. A request or minute hard limit (G5) does that only with budgets.guard_mode act
+   * (and records one guard_did); observe records one guard_would and one notice instead, and off nothing.
+   */
   private async checkBudgets(t: Tick): Promise<void> {
     for (const scope of this.scopes(t.now)) {
-      const scopeKey = scope.scope === "project" ? "project" : `agent:${scope.agent}`;
+      const scopeKey = scopeKeyOf(scope);
       for (const line of scope.lines) {
         if (line.level === "ok") continue;
         const key = `${scopeKey}:${line.metric}:${line.period}`;
@@ -3594,10 +3616,16 @@ export class AgentsService {
             t.now,
           );
           if (warned) t.summary.warnings++;
+          if (this.spend.enabled) await this.spendNotice(softNotice(scope, line));
         }
         if (line.level !== "hard") continue;
         const text = describeUsage(scope, line, "hard");
         const until = iso(periodEnd(line.metric, t.now));
+        if (!holdsRuns(line)) {
+          if (line.guard === "observe") await this.wouldBlock(scope, line, until, t);
+          continue;
+        }
+        if (line.guard === "act") await this.budgetGuardEvent("guard_did", scope, line, until, t);
         await this.record(
           "budget_exceeded",
           {
@@ -3655,6 +3683,50 @@ export class AgentsService {
         );
       }
     }
+  }
+
+  /**
+   * G5's verdict on a request or minute hard limit, once per scope, metric and period (subject: the scope): `block`
+   * in act (`guard_did`), `would_block` in observe (`guard_would`), with the same data. True when it was recorded now.
+   */
+  private budgetGuardEvent(kind: "guard_did" | "guard_would", scope: BudgetScopeView, line: BudgetLine, until: string, t: Tick): Promise<boolean> {
+    const scopeKey = scopeKeyOf(scope);
+    const text = describeUsage(scope, line, "hard");
+    const act = kind === "guard_did";
+    const who = scope.scope === "project" ? "in the project" : `for ${scope.agent}`;
+    return this.record(
+      kind,
+      {
+        agent: scope.agent,
+        subject: scopeKey,
+        summary: act
+          ? `budget (act): ${text}; no new runs ${who} until ${until}`
+          : `budget (observe): ${text}; would hold new runs ${who} until ${until}; they go on as before`,
+        evidence: [text],
+        data: {
+          guard: "budget",
+          verdict: act ? "block" : "would_block",
+          scope: scopeKey,
+          metric: line.metric,
+          period: line.period,
+          used: line.used,
+          soft: line.soft ?? null,
+          hard: line.hard ?? null,
+          until,
+        },
+        dedupeKey: `${kind}:budget:${scopeKey}:${line.metric}:${line.period}`,
+      },
+      t.now,
+    );
+  }
+
+  /**
+   * G5 observe: a request or minute hard limit act would hold new runs at. Nothing is held; one guard_would and one
+   * notice per scope, metric and period (both keyed, so asking again on every check adds nothing).
+   */
+  private async wouldBlock(scope: BudgetScopeView, line: BudgetLine, until: string, t: Tick): Promise<void> {
+    await this.budgetGuardEvent("guard_would", scope, line, until, t);
+    await this.spendNotice(wouldBlockNotice(scope, line, until));
   }
 
   /**
@@ -3983,7 +4055,7 @@ export class AgentsService {
     const snap = this.snapshot;
     const alive = (pid: number, started: number): boolean | null => (snap ? snap.isAlive(pid, started) : null);
     const claims = this.store.listClaims(this.project);
-    const projectBudget = evaluateBudget(this.store, this.project, null, this.settings.budgets.project, now);
+    const projectBudget = this.budgetOf(null, now);
     const agents = this.agentIds().map((id) => this.agentView(id, claims, now, alive));
     return {
       project: this.project,
@@ -4158,7 +4230,7 @@ export class AgentsService {
   ): AgentView {
     const active = this.store.activeRunForAgent(this.project, id);
     const latest = active ?? this.store.latestRunForAgent(this.project, id);
-    const budget = evaluateBudget(this.store, this.project, id, agentLimits(this.settings, id), now);
+    const budget = this.budgetOf(id, now);
     // Over budget is what blocks new runs: a hard limit the owner didn't allow runs past
     const overBudget = this.budgetBlock(id, now);
     const previous = active?.previousRunId ? this.store.getRun(active.previousRunId) : null;
