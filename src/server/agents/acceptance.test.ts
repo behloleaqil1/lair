@@ -2334,6 +2334,169 @@ describe("6. budgets per agent and per project, per day and month, fed by the fl
   });
 });
 
+describe("6a. AI spend G5: request and minute budgets, the soft-limit notice and budgets.guard_mode (docs/design/ai-spend.md §4.5; AT-20, AT-28)", () => {
+  /** The builder CLI's real request lines (a sanitized run log): one per model request */
+  const REQUEST_LINES = readFileSync(join(process.cwd(), "fixtures", "agents-usage", "kiro-requests-30.txt"), "utf-8")
+    .split("\n")
+    .filter((line) => line.includes("GenerateAssistantResponseCommand done"));
+  /** A run's log with `n` model requests, each after a tool line, as the CLI writes them */
+  const requestLog = (n: number) => Array.from({ length: n }, (_, i) => `[tool] Read File\n${REQUEST_LINES[i % REQUEST_LINES.length]}\n`).join("");
+  /** The built-in kiro adapter id with no usage_parser: its built-in request-lines parser counts the request lines */
+  const KIRO: Record<string, AgentAdapter> = {
+    kiro: { id: "kiro", name: "Kiro CLI", start_cmd: "kiro-cli chat --no-interactive --model {model} {prompt_file}", stop_cmd: "kill -TERM {pid}", status_method: "file", log_dir: "logs" },
+  };
+  const BUILDERS = {
+    "builder-k": { name: "K", model: "model-k", machine: "local", instructions: "", adapter: "kiro" },
+    "builder-l": { name: "L", model: "model-k", machine: "local", instructions: "", adapter: "kiro" },
+  };
+  const g5 = (mode: "act" | "observe" | "off" | undefined) => () => ({
+    spend: { enabled: true },
+    budgets: { ...(mode ? { guard_mode: mode } : {}), project: { daily_requests: { soft: 50, hard: 60 } } },
+  });
+  const options = { dragons: BUILDERS, extra: () => ({ agent_adapters: { ...ADAPTERS, ...KIRO } }) };
+  const DAY = "2026-03-02";
+  const UNTIL = "2026-03-03T00:00:00.000Z";
+  const OVER = `the project used 61 requests in day ${DAY} (hard limit 60)`;
+  /** What act's guard_did and observe's guard_would both say about the limit (only the verdict differs) */
+  const VERDICT = { guard: "budget", scope: "project", metric: "daily_requests", period: DAY, used: 61, soft: 50, hard: 60, until: UNTIL };
+
+  /** A builder's run writes `n` request lines and exits 0; then its end (and spend row), then a check that reads it */
+  const requestsRun = async (h: Harness, agent: string, task: string, n: number, from: number) => {
+    h.spawner.behaviour = (pid, log) => {
+      writeLog(h.clock, log, requestLog(n));
+      h.spawner.exit(pid, 0);
+    };
+    await request(h, agent, task);
+    await at(h, from); // spawned: it writes its requests and exits
+    h.spawner.behaviour = undefined;
+    await at(h, from + 2 * MIN); // its end, and its spend row
+    await at(h, from + 3 * MIN); // the budget check reads it
+  };
+  const guardOf = (h: Harness) => h.service.spendReport("today", "project").guards.find((g) => g.guard === "budget");
+  const requestLine = (h: Harness) => h.service.status().projectBudget?.lines.find((l) => l.metric === "daily_requests");
+
+  for (const mode of ["act", "observe", "off"] as const) {
+    const title =
+      mode === "act"
+        ? "AT-20 act: one notice at 55 requests; at 61 the spend decision fires and new runs and restarts wait; the running one continues"
+        : mode === "observe"
+          ? "AT-28 observe: the same inputs change nothing; one guard_would with act's subject and verdict, and one notice"
+          : "off: the same inputs: the soft notice only; the hard limit records and holds nothing";
+    it(title, async () => {
+      const h = setup(g5(mode), options);
+      const { inbox } = await withInbox(h);
+      const open = () => inbox.list({ project: "demo", status: "open" });
+
+      // A run of worker-b works on through everything below
+      h.spawner.behaviour = (_pid, log) => writeLog(h.clock, log, "working\n");
+      await request(h, "worker-b", "t-long");
+      await at(h, 0);
+      const long = runs(h)[0];
+      expect(long).toMatchObject({ agent: "worker-b", state: "running" });
+
+      // 55 requests: past the soft limit; one notice, whatever the mode
+      await requestsRun(h, "builder-k", "t-1", 55, MIN);
+      expect(h.store.listSpend("demo", { task: "t-1" })).toEqual([expect.objectContaining({ requests: 55, usageSource: "requests", tokens: null, cost: null })]);
+      expect(eventsOf(h, "budget_warning").map((e) => e.summary)).toEqual([`budget warning: the project used 55 requests in day ${DAY} (soft limit 50)`]);
+      expect(open().map((d) => [d.key, d.attention, d.kind])).toEqual([[`budget_soft:project:daily_requests:${DAY}`, "notice", "other"]]);
+      expect(open()[0]).toMatchObject({
+        class: "agents.spend_notice",
+        classKnown: true,
+        evidence: { code: "budget_soft", facts: { scope: "project", metric: "daily_requests", period: DAY, used: 55, soft: 50, hard: 60 } },
+      });
+      expect(open()[0].title).toBe(`Budget: the project used 55 requests in day ${DAY} (soft limit 50)`);
+      await at(h, 4 * MIN);
+      expect(open()).toHaveLength(1);
+
+      // 6 more: 61, past the hard limit
+      await requestsRun(h, "builder-l", "t-2", 6, 5 * MIN);
+      expect(requestLine(h)).toMatchObject({ used: 61, level: "hard", guard: mode });
+      expect(eventsOf(h, "budget_warning")).toHaveLength(1);
+      // The running run continues in every mode
+      expect(h.store.getRun(long.id)).toMatchObject({ state: "running" });
+      expect(h.spawner.kills).toEqual([]);
+      // worker-b's run then crashes: its restart is a new start
+      h.spawner.exit(h.store.getRun(long.id)!.pid!, 2);
+      await at(h, 9 * MIN); // crashed: resumed after 10 s
+      await at(h, 9 * MIN + 20 * SEC);
+      await at(h, 10 * MIN);
+      const restart = runs(h).find((r) => r.previousRunId === long.id);
+      const decisions = () => open().filter((d) => d.kind === "spend");
+      const notices = () => open().filter((d) => d.attention === "notice").map((d) => d.key).sort();
+
+      if (mode === "act") {
+        // The existing spend decision, once
+        expect(decisions().map((d) => d.key)).toEqual([`budget:project:daily_requests:${DAY}`]);
+        expect(decisions()[0].title).toContain(`The project used 61 requests in day ${DAY} (hard limit 60). No new runs in this project until ${UNTIL}`);
+        expect(decisions()[0].options.map((o) => o.id)).toEqual(["allow", "wait"]);
+        expect(eventsOf(h, "budget_exceeded")).toHaveLength(1);
+        expect(eventsOf(h, "guard_did").map((e) => [e.subject, e.data])).toEqual([["project", { ...VERDICT, verdict: "block" }]]);
+        expect(eventsOf(h, "guard_would")).toEqual([]);
+        expect(notices()).toEqual([`budget_soft:project:daily_requests:${DAY}`]);
+        // New runs wait: refused at the request, and the restart stays queued
+        await expect(request(h, "builder-k", "t-3")).rejects.toMatchObject({ statusCode: 403, message: `Over budget: ${OVER}` });
+        expect(restart).toMatchObject({ state: "queued", detail: `not starting: over budget (${OVER})` });
+        expect(h.spawner.calls).toHaveLength(3);
+        expect(agentView(h.service.status(), "builder-k").state).toBe("over_budget");
+        expect(h.service.status().projectBudget?.blocked).toBe(true);
+        expect(guardOf(h)).toMatchObject({ mode: "act", would: 0, did: 1 });
+      } else {
+        // Nothing changes: no decision; the restart and a new run start
+        expect(decisions()).toEqual([]);
+        expect(eventsOf(h, "budget_exceeded")).toEqual([]);
+        expect(eventsOf(h, "guard_did")).toEqual([]);
+        expect(restart).toMatchObject({ state: "running" });
+        await expect(request(h, "builder-k", "t-3")).resolves.toMatchObject({ state: "queued" });
+        await at(h, 11 * MIN);
+        expect(h.spawner.calls).toHaveLength(5);
+        expect(agentView(h.service.status(), "builder-k").state).not.toBe("over_budget");
+        expect(h.service.status().projectBudget?.blocked).toBe(false);
+        if (mode === "observe") {
+          // One guard_would with act's subject and verdict, and one notice; the next checks add nothing
+          expect(eventsOf(h, "guard_would").map((e) => [e.subject, e.data])).toEqual([["project", { ...VERDICT, verdict: "would_block" }]]);
+          expect(notices()).toEqual([`budget_soft:project:daily_requests:${DAY}`, `guard_would:budget:project:daily_requests:${DAY}`]);
+          const would = open().find((d) => d.key.startsWith("guard_would:"))!;
+          expect(would).toMatchObject({ class: "agents.spend_notice", classKnown: true, evidence: { code: "would_block", facts: { guard: "budget", used: 61, hard: 60, until: UNTIL } } });
+          expect(would.title).toBe(`Budget (observe): ${OVER}: would hold new runs until ${UNTIL}`);
+          await at(h, 12 * MIN);
+          expect(eventsOf(h, "guard_would")).toHaveLength(1);
+          expect(notices()).toHaveLength(2);
+          expect(guardOf(h)).toMatchObject({ mode: "observe", would: 1, did: 0 });
+        } else {
+          expect(eventsOf(h, "guard_would")).toEqual([]);
+          expect(notices()).toEqual([`budget_soft:project:daily_requests:${DAY}`]);
+          expect(guardOf(h)).toMatchObject({ mode: "off", would: 0, did: 0 });
+        }
+      }
+
+      // The next UTC day: a new period. The notices are withdrawn and new runs start again
+      await at(h, 12 * 60 * MIN + 10 * MIN);
+      expect(open().filter((d) => d.attention === "notice")).toEqual([]);
+      expect(requestLine(h)).toMatchObject({ period: "2026-03-03", used: 0, level: "ok" });
+      await expect(request(h, "builder-l", "t-4")).resolves.toMatchObject({ state: "queued" });
+    });
+  }
+
+  it("guard_mode unset is observe; a token or cost hard limit beside it holds new runs whatever the mode", async () => {
+    const budget = new BudgetManager({ enabled: true, maxDailyCost: 1000, providers: [] });
+    const h = setup(
+      () => ({ spend: { enabled: true }, budgets: { project: { daily_requests: { hard: 60 }, daily_cost: { hard: 5 } } } }),
+      { ...options, budget },
+    );
+    const { inbox } = await withInbox(h);
+    await requestsRun(h, "builder-k", "t-1", 61, 0);
+    expect(requestLine(h)).toMatchObject({ used: 61, level: "hard", guard: "observe" });
+    expect(eventsOf(h, "guard_would").map((e) => e.data.verdict)).toEqual(["would_block"]);
+    await expect(request(h, "builder-l", "t-2")).resolves.toMatchObject({ state: "queued" });
+    // The cost limit is no guard: it holds new runs as before
+    budget.recordCost("provider-a", 6, "usage", { project: "demo", agent: "worker-a", tokens: 10 });
+    await at(h, 4 * MIN);
+    expect(inbox.list({ project: "demo", status: "open" }).filter((d) => d.kind === "spend").map((d) => d.key)).toEqual([`budget:project:daily_cost:${DAY}`]);
+    await expect(request(h, "builder-k", "t-3")).rejects.toMatchObject({ statusCode: 403, message: `Over budget: the project used 6 cost in day ${DAY} (hard limit 5)` });
+    expect(eventsOf(h, "guard_did")).toEqual([]);
+  });
+});
+
 // ============ 7 AND 8. HTTP ============
 
 /** What a browser on the dashboard sends with a same-origin request */

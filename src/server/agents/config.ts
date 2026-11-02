@@ -89,6 +89,11 @@ const LimitsSchema = z
     daily_cost: LimitSchema.optional(),
     monthly_tokens: LimitSchema.optional(),
     monthly_cost: LimitSchema.optional(),
+    /** G5 (docs/design/ai-spend.md §4.5): model requests and agent-minutes of ended runs, from the spend records */
+    daily_requests: LimitSchema.optional(),
+    daily_minutes: LimitSchema.optional(),
+    monthly_requests: LimitSchema.optional(),
+    monthly_minutes: LimitSchema.optional(),
   })
   .strict();
 
@@ -362,8 +367,9 @@ export const AgentsSchema = z
         agent: LimitsSchema.optional(),
         per_agent: z.record(LimitsSchema).default({}),
         /**
-         * The mode of the budget guard AI spend adds (docs/design/ai-spend.md G5: the request and minute limits, a later
-         * part). Token and cost hard limits block new runs as before, whatever it says
+         * The mode of the budget guard AI spend adds (docs/design/ai-spend.md G5): what a request or minute hard limit
+         * does. act holds new runs; observe records what it would hold; off nothing. Token and cost hard limits hold new
+         * runs as before, whatever it says
          */
         guard_mode: z.enum(GUARD_MODES).default("observe"),
       })
