@@ -122,7 +122,16 @@ export function parseVerdicts(items: unknown[], acceptedIndices: Set<number>): P
 export function verifierSection(input: {
   runId: string;
   verdictsFile: string;
-  proposals: { index: number; op: string; task: string; agent: string | null; text: string | null; reason: string }[];
+  proposals: {
+    index: number;
+    op: string;
+    task: string;
+    agent: string | null;
+    text: string | null;
+    reason: string;
+    /** Lair's PR ownership check of a finish proposal whose reason names a merged PR (null: none named) */
+    prOwnership?: { state: string; note: string | null } | null;
+  }[];
   context: { json: string };
 }): string {
   // Build the proposals data for the JSON block
@@ -133,6 +142,7 @@ export function verifierSection(input: {
     agent: p.agent,
     text: p.text,
     reason: p.reason,
+    ...(p.prOwnership ? { pr_ownership: p.prOwnership } : {}),
   }));
 
   // Guard against corrupt context.json (minor fix from review)
@@ -164,12 +174,12 @@ export function verifierSection(input: {
     "",
     "### PR ownership for finish proposals",
     "",
-    "When a **finish** proposal's reason names a PR (e.g., 'merged as #123'), verify the PR belongs to the task:",
-    "- The PR's head branch contains the task id (e.g., kiro/kiro-A/feat-login for task feat-login)",
-    "- OR the PR's title or body names the task id",
-    "- If neither matches, verdict **unsure** with 'PR #N does not belong to task <id>: branch is <branch>, title does not name the task'",
+    "When a **finish** proposal's reason names a merged PR (e.g., 'merged as #123'), Lair has already checked that the PR belongs to the task and put the result in that proposal's `pr_ownership` field. A PR belongs to the task when its head branch contains the task id (e.g., agent/worker-a/feat-login for task feat-login), OR its branch maps to the task's agent through review.authors, OR its title or body names the task id. A finish whose PR belongs to another task was already refused and is not shown to you.",
+    "- `pr_ownership.state` is `owned`: the note says which route matched; judge the rest of the proposal as usual",
+    "- `pr_ownership.state` is `unsure` (Lair could not read the PR): verdict **unsure**; the owner decides",
+    "- If you read a PR yourself and cannot (no tool, an error, no network), verdict **unsure** with the reason, never approve",
     "",
-    "Use `gh pr view <n> --json headRefName,title,body` to check. A merged PR for another task is not evidence this task is done.",
+    "A merged PR for another task is not evidence this task is done.",
     "",
     `Write your verdicts as JSON to this file, and nothing else: ${input.verdictsFile}`,
     "",

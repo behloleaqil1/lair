@@ -6,8 +6,11 @@ import { describe, expect, it } from "vitest";
 import {
   branchContainsTask,
   branchMatchesAgent,
+  checkFinishOwnership,
   checkPrOwnership,
   extractPrNumbers,
+  prSourceFromConfig,
+  type PrSource,
   titleBodyNamesTask,
   type PrMetadata,
 } from "./pr-ownership.js";
@@ -64,14 +67,14 @@ describe("extractPrNumbers", () => {
 
 describe("branchContainsTask", () => {
   it("matches task id as path segment", () => {
-    expect(branchContainsTask("kiro/kiro-A/feat-login", "feat-login")).toBe(true);
+    expect(branchContainsTask("agent/worker-a/feat-login", "feat-login")).toBe(true);
     expect(branchContainsTask("feature/feat-login", "feat-login")).toBe(true);
     expect(branchContainsTask("feat-login", "feat-login")).toBe(true);
   });
 
   it("matches with separator normalization", () => {
-    expect(branchContainsTask("kiro/kiro-A/feat_login", "feat-login")).toBe(true);
-    expect(branchContainsTask("kiro/kiro-A/feat-login", "feat_login")).toBe(true);
+    expect(branchContainsTask("agent/worker-a/feat_login", "feat-login")).toBe(true);
+    expect(branchContainsTask("agent/worker-a/feat-login", "feat_login")).toBe(true);
   });
 
   it("matches task id as suffix", () => {
@@ -79,18 +82,18 @@ describe("branchContainsTask", () => {
   });
 
   it("does not match partial task id", () => {
-    expect(branchContainsTask("kiro/feat-login-fix", "feat-login")).toBe(false);
-    expect(branchContainsTask("kiro/prefeat-login", "feat-login")).toBe(false);
+    expect(branchContainsTask("agent/feat-login-fix", "feat-login")).toBe(false);
+    expect(branchContainsTask("agent/prefeat-login", "feat-login")).toBe(false);
   });
 
   it("case insensitive matching", () => {
-    expect(branchContainsTask("kiro/FEAT-LOGIN", "feat-login")).toBe(true);
-    expect(branchContainsTask("kiro/feat-login", "FEAT-LOGIN")).toBe(true);
+    expect(branchContainsTask("agent/FEAT-LOGIN", "feat-login")).toBe(true);
+    expect(branchContainsTask("agent/feat-login", "FEAT-LOGIN")).toBe(true);
   });
 
   it("handles multi-part task ids", () => {
-    expect(branchContainsTask("kiro/kiro-A/api/users", "api/users")).toBe(true);
-    expect(branchContainsTask("kiro/kiro-A/api-users", "api-users")).toBe(true);
+    expect(branchContainsTask("agent/worker-a/api/users", "api/users")).toBe(true);
+    expect(branchContainsTask("agent/worker-a/api-users", "api-users")).toBe(true);
   });
 });
 
@@ -102,25 +105,25 @@ describe("branchMatchesAgent", () => {
   });
 
   it("matches via branch_pattern", () => {
-    const mapping = makeMapping(/^kiro\/(?<agent>[^/]+)\//, []);
-    expect(branchMatchesAgent("kiro/kiro-A/feat-login", "kiro-A", mapping)).toBe(true);
-    expect(branchMatchesAgent("kiro/kiro-B/feat-login", "kiro-A", mapping)).toBe(false);
+    const mapping = makeMapping(/^agent\/(?<agent>[^/]+)\//, []);
+    expect(branchMatchesAgent("agent/worker-a/feat-login", "worker-a", mapping)).toBe(true);
+    expect(branchMatchesAgent("agent/worker-b/feat-login", "worker-a", mapping)).toBe(false);
   });
 
   it("matches via branches glob", () => {
-    const glob = compileBranchGlob("team/kiro-A/**", "kiro-A") as BranchGlob;
+    const glob = compileBranchGlob("team/worker-a/**", "worker-a") as BranchGlob;
     const mapping = makeMapping(null, [glob]);
-    expect(branchMatchesAgent("team/kiro-A/feat-login", "kiro-A", mapping)).toBe(true);
-    expect(branchMatchesAgent("team/kiro-B/feat-login", "kiro-A", mapping)).toBe(false);
+    expect(branchMatchesAgent("team/worker-a/feat-login", "worker-a", mapping)).toBe(true);
+    expect(branchMatchesAgent("team/worker-b/feat-login", "worker-a", mapping)).toBe(false);
   });
 
   it("returns false when no mapping", () => {
-    expect(branchMatchesAgent("kiro/kiro-A/feat", "kiro-A", null)).toBe(false);
+    expect(branchMatchesAgent("agent/worker-a/feat", "worker-a", null)).toBe(false);
   });
 
   it("returns false when no expected agent", () => {
-    const mapping = makeMapping(/^kiro\/(?<agent>[^/]+)\//, []);
-    expect(branchMatchesAgent("kiro/kiro-A/feat", null, mapping)).toBe(false);
+    const mapping = makeMapping(/^agent\/(?<agent>[^/]+)\//, []);
+    expect(branchMatchesAgent("agent/worker-a/feat", null, mapping)).toBe(false);
   });
 });
 
@@ -177,17 +180,17 @@ describe("checkPrOwnership", () => {
   });
 
   it("owns when branch contains task", () => {
-    const result = checkPrOwnership(pr("kiro/kiro-A/feat-login", "other", null), "feat-login", "kiro-A", null);
+    const result = checkPrOwnership(pr("agent/worker-a/feat-login", "other", null), "feat-login", "worker-a", null);
     expect(result.owns).toBe(true);
     expect(result.method).toBe("branch_contains_task");
   });
 
   it("owns when branch matches agent", () => {
     const result = checkPrOwnership(
-      pr("kiro/kiro-A/other", "other", null),
+      pr("agent/worker-a/other", "other", null),
       "feat-login",
-      "kiro-A",
-      mapping(/^kiro\/(?<agent>[^/]+)\//),
+      "worker-a",
+      mapping(/^agent\/(?<agent>[^/]+)\//),
     );
     expect(result.owns).toBe(true);
     expect(result.method).toBe("branch_agent_match");
@@ -200,7 +203,7 @@ describe("checkPrOwnership", () => {
   });
 
   it("does not own when nothing matches", () => {
-    const result = checkPrOwnership(pr("main", "other", null), "feat-login", "kiro-A", null);
+    const result = checkPrOwnership(pr("main", "other", null), "feat-login", "worker-a", null);
     expect(result.owns).toBe(false);
     expect(result.method).toBe("none");
     expect(result.reason).toContain("branch 'main' does not contain task id 'feat-login'");
@@ -210,16 +213,15 @@ describe("checkPrOwnership", () => {
   it("prefers branch_contains_task over other methods", () => {
     // All three would match, but branch_contains_task is checked first
     const result = checkPrOwnership(
-      pr("kiro/kiro-A/feat-login", "feat-login: done", null),
+      pr("agent/worker-a/feat-login", "feat-login: done", null),
       "feat-login",
-      "kiro-A",
-      mapping(/^kiro\/(?<agent>[^/]+)\//),
+      "worker-a",
+      mapping(/^agent\/(?<agent>[^/]+)\//),
     );
     expect(result.owns).toBe(true);
     expect(result.method).toBe("branch_contains_task");
   });
 });
-
 
 describe("verifierSection PR ownership instructions", () => {
   // Import verifierSection to test the instructions are included
@@ -237,7 +239,8 @@ describe("verifierSection PR ownership instructions", () => {
     expect(section).toContain("PR ownership for finish proposals");
     expect(section).toContain("branch contains the task id");
     expect(section).toContain("title or body names the task id");
-    expect(section).toContain("gh pr view");
+    expect(section).toContain("maps to the task's agent through review.authors");
+    expect(section).toContain("never approve");
     expect(section).toContain("unsure");
   });
 
@@ -259,5 +262,55 @@ describe("verifierSection PR ownership instructions", () => {
     expect(section).toContain('"reason": "PR #123 merged"');
     expect(section).toContain('"op": "add"');
     expect(section).toContain('"task": "feat-cart"');
+  });
+});
+
+describe("checkFinishOwnership", () => {
+  const reader = (headRef: string, title = "x"): PrSource["reader"] => ({
+    getPullRequest: async (n: number) => ({ number: n, headRef, title, body: null, state: "merged" }),
+  });
+
+  it("a reason naming no merged PR is not checked and reads nothing", async () => {
+    let reads = 0;
+    const source: PrSource = { reader: { getPullRequest: async () => { reads++; throw new Error("no"); } }, mapping: null, missing: null };
+    expect(await checkFinishOwnership({ reason: "fixes #290", task: "t", agent: null, source })).toEqual({ state: "none", note: null });
+    expect(reads).toBe(0);
+  });
+
+  it("no reader: unsure with why, never owned", async () => {
+    const r = await checkFinishOwnership({ reason: "merged as #5", task: "t", agent: null, source: { reader: null, mapping: null, missing: "no host" } });
+    expect(r.state).toBe("unsure");
+    expect(r.note).toContain("PR #5 could not be read (no host)");
+  });
+
+  it("a read that does not answer in time is unsure", async () => {
+    const source: PrSource = { reader: { getPullRequest: () => new Promise(() => {}) }, mapping: null, missing: null };
+    const r = await checkFinishOwnership({ reason: "merged as #6", task: "t", agent: null, source, timeoutMs: 20 });
+    expect(r.state).toBe("unsure");
+    expect(r.note).toContain("no answer in");
+  });
+
+  it("one PR of another task among owned ones: not_owned", async () => {
+    const source: PrSource = {
+      reader: { getPullRequest: async (n: number) => ({ number: n, headRef: n === 7 ? "agent/worker-a/feat-x" : "agent/worker-b/other", title: "y", state: "merged" }) },
+      mapping: null,
+      missing: null,
+    };
+    const r = await checkFinishOwnership({ reason: "#7 merged, #8 merged", task: "feat-x", agent: "worker-a", source });
+    expect(r.state).toBe("not_owned");
+    expect(r.note).toContain("PR #8 does not belong to task feat-x");
+  });
+
+  it("owned names the route that matched", async () => {
+    const r = await checkFinishOwnership({ reason: "merged as #9", task: "feat-x", agent: null, source: { reader: reader("agent/worker-a/feat-x"), mapping: null, missing: null } });
+    expect(r).toEqual({ state: "owned", note: "PR #9 belongs to task feat-x (branch_contains_task)" });
+  });
+});
+
+describe("prSourceFromConfig", () => {
+  it("a project without a review block has no reader", () => {
+    const s = prSourceFromConfig({ github: "example/demo" } as never);
+    expect(s.reader).toBeNull();
+    expect(s.missing).toContain("no review block");
   });
 });

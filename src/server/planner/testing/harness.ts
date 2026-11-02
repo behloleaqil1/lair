@@ -6,6 +6,7 @@
  * (in a temp dir) are the production ones, wired as src/server/index.ts
  * wires them.
  */
+import type { PrSource } from "../pr-ownership.js";
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -263,6 +264,8 @@ export async function setup(
     extra?: Partial<ProjectConfig>;
     /** The project's bus as fill and the planner read it (bus.consume observe or on); no bus without it */
     bus?: (project: string) => BusLineSource | null;
+    /** How finish proposals' PRs are read (the one stand-in for the PR host); default: no reader */
+    prs?: PrSource;
   } = {},
 ): Promise<Harness> {
   const config = projectConfig(p, planner, options.extra);
@@ -310,6 +313,7 @@ export async function setup(
     defaultProject: () => "demo",
     humanAuth: auth,
     bus: busSource,
+    prs: () => options.prs ?? { reader: null, mapping: null, missing: "no PR host in this test" },
   });
   plannerManager.useDecisions(inbox);
   await app.ready();

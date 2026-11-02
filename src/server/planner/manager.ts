@@ -11,6 +11,7 @@ import type { BusLineSource } from "../bus/consumers.js";
 import { parsePlannerConfig } from "./config.js";
 import { DECISION_MODULE, NO_VERDICT_REASON, PlannerService } from "./service.js";
 import { PlannerStore } from "./store.js";
+import { prSourceFromConfig, type PrSource } from "./pr-ownership.js";
 
 const DAY_MS = 86_400_000;
 
@@ -29,6 +30,8 @@ export interface PlannerManagerOptions {
   clock?: { now(): number };
   /** The project's bus as the planner reads it (bus.consume observe or on; read at each cycle), or null */
   bus?: (project: string) => BusLineSource | null;
+  /** How a project's PRs are read for finish proposals' ownership (default: its review block's host) */
+  prs?: (project: string, config: ProjectConfig) => PrSource;
 }
 
 const systemClock = { now: () => Date.now() };
@@ -70,6 +73,7 @@ export class PlannerManager {
         events: this.options.events,
         decisions: () => this.producer,
         bus: this.options.bus ? () => this.options.bus?.(entry.name) ?? null : undefined,
+        prs: (this.options.prs ?? ((_project, config) => prSourceFromConfig(config)))(entry.name, entry.config),
       });
       this.services.set(entry.name, service);
       this.follow(entry.name, service);

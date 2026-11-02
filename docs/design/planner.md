@@ -250,6 +250,29 @@ An accepted proposal without a verdict is treated as **unverified**. A verdict f
 refused is ignored. The verifier's text (reason) and evidence lines become part of the stored verdict and the
 decision context; they never reach any prompt.
 
+### PR ownership of finish proposals
+
+A finish whose reason names a merged PR ("merged as #230", "PR #230 merged") claims that PR as the task's evidence.
+Lair checks the claim itself when the planner run's proposals come in, before the verifier and with or without one
+(`pr-ownership.ts`). A PR belongs to the task when:
+
+1. its head branch contains the task id as a path segment (`agent/worker-a/feat-login` for `feat-login`); or
+2. its head branch maps to the task's agent (the task line's agent) through `review.authors` (`branch_pattern`,
+   `branches`); or
+3. its title or body names the task id (not `feat-login-fix` for `feat-login`).
+
+Lair reads each PR (at most 5 per reason) through the project's `review` block host, one read at most 15 s.
+
+- Any named PR of another task: the proposal is **refused** by Lair, with the PR's branch and why it doesn't match.
+- A PR Lair cannot read (no `review` block, an error, a timeout): the proposal waits for the owner as **unsure**
+  ("Lair could not check PR ownership: ..."). No verifier verdict lifts that hold and it is never auto-applied; it
+  is never treated as owned.
+- All owned: the verifier's bundle carries `pr_ownership` (`state`, and a note naming the route that matched) on the
+  proposal; the verifier judges the rest as usual.
+
+A reason that names no merged PR is not checked. The verifier prompt also says: if it reads a PR itself and cannot,
+its verdict is `unsure`, never `approve`.
+
 ### Applying with verification
 
 After the verifier run ends:
