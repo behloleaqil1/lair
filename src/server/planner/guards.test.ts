@@ -30,7 +30,7 @@ import {
   type SpawnCall,
 } from "./testing/harness.js";
 import { PlannerStore } from "./store.js";
-import { branchNamesTask, inputsHash, ownMergedPr } from "./guards.js";
+import { branchNamesTask, inputsHash, ownMergedPr, readyLineMatches } from "./guards.js";
 import { OWNER_SESSION_HEADER } from "../human-auth/index.js";
 
 const stores: { close(): void }[] = [];
@@ -154,7 +154,7 @@ const T42 = { op: "add", task: "t-42", agent: "worker-b", text: "Search page (pl
 const T43 = { op: "add", task: "t-43", agent: "worker-b", text: "Fix the regression from #42", reason: "a follow-up of #42" };
 
 describe("G6's pure parts", () => {
-  it("a branch names a task id only as whole consecutive parts; a task's own merged PR is by its branch or its DONE line's PR", () => {
+  it("a branch names a task id only as whole consecutive parts; a task's own merged PR is by its branch or its READY or DONE line's PR", () => {
     expect(branchNamesTask("agent/worker-a/t-42", "t-42")).toBe(true);
     expect(branchNamesTask("agent/worker-a/T-42", "t-42")).toBe(true);
     expect(branchNamesTask("t-42", "t-42")).toBe(true);
@@ -170,9 +170,18 @@ describe("G6's pure parts", () => {
       (task) => (task === "t-50" ? 50 : task === "t-51" ? 51 : null),
     );
     expect(own("t-42")).toBe("its own PR #42 (branch agent/worker-a/t-42) merged");
-    expect(own("t-50")).toBe("its own PR #50, which its DONE line names, merged");
+    expect(own("t-50")).toBe("its own PR #50, which its READY or DONE line names, merged");
     expect(own("t-51")).toBeNull();
     expect(own("t-4")).toBeNull();
+  });
+
+  it("a task's own READY line: the READY keyword, then the task id as written, by any agent", () => {
+    expect(readyLineMatches("- READY t-7 by worker-a 12:00Z: search page PR #7 at abcdef7", "t-7")).toBe(true);
+    expect(readyLineMatches("- ready t-7 by worker-b (12:00Z): PR #7", "t-7")).toBe(true);
+    expect(readyLineMatches("- READY t-70 by worker-a 12:00Z: PR #70", "t-7")).toBe(false);
+    expect(readyLineMatches("- READY T-7 by worker-a 12:00Z: PR #7", "t-7")).toBe(false);
+    expect(readyLineMatches("- PROGRESS t-7 by worker-a 12:00Z: READY t-7 soon, PR #7", "t-7")).toBe(false);
+    expect(readyLineMatches("- DONE t-7 by worker-a 12:00Z: PR #7", "t-7")).toBe(false);
   });
 
   it("the inputs' hash leaves out recent events, triggers and times, and changes with any listed input", () => {
@@ -262,8 +271,30 @@ describe("G6 prefilter_closed: closed work leaves the context", () => {
     const call = await runPlannerAgent(h, (c) => writeProposals(c, { proposals: [] }));
     const context = contextOf(call);
     expect(context.openTasks.map((t) => t.id)).toEqual(["t-51", "t-52"]);
-    expect(context.closed?.tasks).toEqual([{ id: "t-50", why: "its own PR #50, which its DONE line names, merged" }]);
+    expect(context.closed?.tasks).toEqual([{ id: "t-50", why: "its own PR #50, which its READY or DONE line names, merged" }]);
     expect(context.closed?.mergedPrs).toEqual([{ pr: 50, branch: null }]);
+  });
+
+  it("act: a task's own READY line names its PR too; merged with no DONE line after it, the task is closed, a line that only mentions it isn't", async () => {
+    const p = makePaths();
+    const reviews = reviewsOf(p);
+    writeFileSync(p.planFile, ["# Plan", "- [ ] t-7: Search page", "- [ ] t-8: Cart page"].join("\n"));
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    // #7's branch names no task; the review module merged it
+    reviews.observePull("demo", 7, "feature/search-page", "open", "2026-03-02T11:00:00.000Z");
+    merge(reviews, 7, "2026-03-02T11:30:00.000Z");
+    const h = await boot(p, { prefilter_closed: "act" }, {}, reviews);
+    await h.service.cycle();
+    queue(p, "- READY t-7 by worker-a 11:58Z: search page PR #7 at abcdef7", "- PROGRESS t-8 by worker-a 11:59Z: starts once PR #7 lands");
+    at(h, 10 * SEC);
+    await h.service.cycle();
+    at(h, 41 * SEC);
+    await h.service.cycle();
+    const call = await runPlannerAgent(h, (c) => writeProposals(c, { proposals: [] }));
+    const context = contextOf(call);
+    expect(context.openTasks.map((t) => t.id)).toEqual(["t-8"]);
+    expect(context.closed?.tasks).toEqual([{ id: "t-7", why: "its own PR #7, which its READY or DONE line names, merged" }]);
+    expect(context.closed?.mergedPrs).toEqual([{ pr: 7, branch: "feature/search-page" }]);
   });
 
   it("AT-28 observe: the context is unchanged and nothing is refused; one guard_would per run, one notice per set of closed tasks", async () => {

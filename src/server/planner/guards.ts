@@ -5,7 +5,7 @@
  * records: the tasks file, the queue lines the planner already reads, and the review store (review.db).
  */
 import type { BlockedView, PlanTaskView, TriggerView } from "../../shared/planner-types.js";
-import type { GuardMode } from "../agents/config.js";
+import { anyAgentPatternFor, doneLineMatches, type GuardMode } from "../agents/config.js";
 import { sha256 } from "./files.js";
 import type { OwnerMessage } from "./sources.js";
 
@@ -83,9 +83,22 @@ export interface ClosedWork {
 }
 
 /**
+ * A task's own READY line, by any agent: `- READY <task> ...`, the READY keyword where the default done_pattern has
+ * DONE (AI spend's run classes read a READY line the same way). A project whose done_pattern also reads READY lines
+ * has them as done lines already.
+ */
+export const READY_LINE_PATTERN = "^-\\s+READY\\s+{task}(?=\\s|$)";
+
+/** Whether a queue line is `task`'s own READY line (READY_LINE_PATTERN, by any agent; the task id as written). */
+export function readyLineMatches(line: string, task: string): boolean {
+  const pattern = anyAgentPatternFor(READY_LINE_PATTERN, task);
+  return pattern !== null && doneLineMatches(pattern, line);
+}
+
+/**
  * Why a task's **own** PR counts as merged, or null. A task's own PR is one whose head branch names the task id
- * (branchNamesTask), or the PR its own DONE line names (`linePr`, read as the ready guard reads it). A task whose
- * text only mentions a merged PR (a follow-up: "fix the regression from #42") is not closed by it.
+ * (branchNamesTask), or the PR its own READY or DONE line names (`linePr`, read as the ready guard reads it). A task
+ * whose text only mentions a merged PR (a follow-up: "fix the regression from #42") is not closed by it.
  */
 export function ownMergedPr(merged: MergedPr[], linePr: (task: string) => number | null): (task: string) => string | null {
   const byBranch = branchIndex(merged);
@@ -94,7 +107,7 @@ export function ownMergedPr(merged: MergedPr[], linePr: (task: string) => number
     const own = byBranch.get(parts(task).join("/"));
     if (own) return `its own PR #${own.pr} (branch ${own.branch}) merged`;
     const named = linePr(task);
-    return named !== null && numbers.has(named) ? `its own PR #${named}, which its DONE line names, merged` : null;
+    return named !== null && numbers.has(named) ? `its own PR #${named}, which its READY or DONE line names, merged` : null;
   };
 }
 

@@ -74,6 +74,7 @@ import {
   MAX_MERGED_PRS,
   openTriggers,
   ownMergedPr,
+  readyLineMatches,
   type ContextClosed,
   type MergedPr,
   type PlannerPrs,
@@ -142,7 +143,7 @@ const BUS_APPLIED = "bus_applied";
 const MAX_BUS_APPLIED = 2000;
 
 // G6, the planner guards (docs/design/ai-spend.md §4.5)
-/** Per task: the PR its own DONE line names (the newest line), read as the ready guard reads it */
+/** Per task: the PR its own READY or DONE line names (the newest line), read as the ready guard reads it */
 const TASK_PRS = "task_prs";
 const MAX_TASK_PRS = 2000;
 /** Per planner run: the owner-message ids of its context (the only ones from_message may name) */
@@ -1180,7 +1181,7 @@ export class PlannerService {
     }
   }
 
-  /** Why a task's own PR counts as merged (by its branch, or the PR its own DONE line names), or null. */
+  /** Why a task's own PR counts as merged (by its branch, or the PR its own READY or DONE line names), or null. */
   private ownMerged(merged: MergedPr[]): (task: string) => string | null {
     const prs = this.state<Record<string, number>>(TASK_PRS) ?? {};
     return ownMergedPr(merged, (task) => (Object.hasOwn(prs, task) ? prs[task] : null));
@@ -1188,8 +1189,9 @@ export class PlannerService {
 
   /**
    * prefilter_closed: the PR a new queue line names as its task's own report, kept per task. A line is a task's own
-   * DONE line as fill reads it (done_pattern, by any agent; a bus report by its kind and task), and its PR is read as
-   * the ready guard reads it. A PR of another repository than the review module's is not one review.db records.
+   * READY line (READY_LINE_PATTERN, by any agent) or its own DONE line as fill reads it (done_pattern, by any agent; a
+   * bus report by its kind and task), and its PR is read as the ready guard reads it. A PR of another repository than
+   * the review module's is not one review.db records.
    */
   private notePrLines(events: QueueEvent[], doc: TasksDoc): void {
     const named = events.filter((e) => /#\d/.test(e.text));
@@ -1202,7 +1204,7 @@ export class PlannerService {
     let prs = this.state<Record<string, number>>(TASK_PRS) ?? {};
     let changed = false;
     for (const event of named) {
-      for (const task of this.doneLineTasks(event, known)) {
+      for (const task of this.reportLineTasks(event, known)) {
         const text = findTask(doc, task)?.description ?? this.planTasks.find((t) => t.id === task)?.text ?? "";
         const parsed = parseReadyReport(event.text, text, listed && repos.ok ? repos.repos : NO_SOURCE_REPOS, !(listed && repos.ok && repos.from === "repos"));
         if (parsed.kind !== "pr" || (own !== null && parsed.report.repo.toLowerCase() !== own)) continue;
@@ -1213,23 +1215,30 @@ export class PlannerService {
     if (changed) this.setState(TASK_PRS, newest(prs, MAX_TASK_PRS));
   }
 
-  /** The tasks a queue line is the own DONE line of (fill's done_pattern for the task, by any agent). */
-  private doneLineTasks(event: QueueEvent, known: Set<string>): string[] {
+  /**
+   * The tasks a queue line is the own READY or DONE line of (READY_LINE_PATTERN, or fill's done_pattern for the task;
+   * by any agent). A bus report has no READY kind: its DONE reports only.
+   */
+  private reportLineTasks(event: QueueEvent, known: Set<string>): string[] {
     if (event.busId !== undefined) return event.type === "DONE" && event.task !== null && isValidTaskId(event.task) ? [event.task] : [];
     const out: string[] = [];
     for (const task of known) {
       if (!namesTask(event.text, task)) continue;
-      let pattern: ReturnType<typeof anyAgentPatternFor> = null;
-      try {
-        pattern = anyAgentPatternFor(this.settings.fillPatterns.donePattern, task);
-      } catch {
-        continue;
-      }
-      // A done_pattern that names no task (it matches by agent): the line's own DONE keyword and task
-      const own = pattern ? doneLineMatches(pattern, event.text) : event.type === "DONE" && event.task === task;
-      if (own) out.push(task);
+      if (readyLineMatches(event.text, task) || this.isDoneLine(event, task)) out.push(task);
     }
     return out;
+  }
+
+  /** Whether a queue line is the task's own DONE line as fill reads it (done_pattern for the task, by any agent). */
+  private isDoneLine(event: QueueEvent, task: string): boolean {
+    let pattern: ReturnType<typeof anyAgentPatternFor> = null;
+    try {
+      pattern = anyAgentPatternFor(this.settings.fillPatterns.donePattern, task);
+    } catch {
+      return false;
+    }
+    // A done_pattern that names no task (it matches by agent): the line's own DONE keyword and task
+    return pattern ? doneLineMatches(pattern, event.text) : event.type === "DONE" && event.task === task;
   }
 
   /** Owner messages for a run's context: the handled ones are left out (handled_messages on). */
