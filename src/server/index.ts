@@ -965,11 +965,7 @@ agents.useSpendFacts({
   prHead: (project, pr) => reviews.spendPrHead(project, pr),
   planner: (project, run) => planner.spendRun(project, "planner", run),
   verifier: (project, run) => planner.spendRun(project, "verifier", run),
-  supervisor: (project, run) => {
-    const turn = supervisorStore.turnByRun(run.id);
-    if (!turn || turn.project !== project) return null;
-    return turn.state === "answered" ? "productive" : turn.state === "no_answer" ? "idle" : "pending";
-  },
+  supervisor: (project, run) => supervisorStore.spendVerdict(project, run.id),
   plannerAcceptance: (project, from, to) => planner.spendAcceptance(project, from, to),
 });
 

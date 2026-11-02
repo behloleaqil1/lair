@@ -345,6 +345,16 @@ export class SupervisorStore {
     return row ? { ...toTurn(row), project: row.project } : null;
   }
 
+  /**
+   * AI spend's class of a supervisor run (src/server/agents/spend-classify.ts): its question answered (productive),
+   * closed without an answer (idle) or still waiting (pending); null when no question of the project has the run.
+   */
+  spendVerdict(project: string, runId: string): "productive" | "idle" | "pending" | null {
+    const turn = this.turnByRun(runId);
+    if (!turn || turn.project !== project) return null;
+    return turn.state === "answered" ? "productive" : turn.state === "no_answer" ? "idle" : "pending";
+  }
+
   /** Every turn still waiting on its run, oldest first. */
   pendingTurns(): (StoredTurn & { project: string })[] {
     const rows = this.db
