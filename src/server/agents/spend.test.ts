@@ -843,8 +843,10 @@ describe("AT-23: a bad usage config is refused at load, naming each key", () => 
       expect.stringContaining("agents.spend.aggregate_days: at least agents.spend.retention_days"),
     ]);
     expect(errorsOf({ enabled: true, spend: { daily_summary_utc: "24:05" } }, project({}))).toEqual([expect.stringContaining("agents.spend.daily_summary_utc")]);
-    // Keys of later parts are unknown here: refused too, naming them
-    expect(errorsOf({ enabled: true, spend: { enabled: true, guards: {} } }, project({}))).toEqual([expect.stringMatching(/^agents\.spend: .*guards/)]);
+    // Keys of later parts are unknown here: refused too, naming them (spend.guards has G2 only so far)
+    expect(errorsOf({ enabled: true, spend: { enabled: true, guards: { wake_events: {} } } }, project({}))).toEqual([
+      expect.stringMatching(/^agents\.spend\.guards: .*wake_events/),
+    ]);
     expect(errorsOf({ enabled: true, budgets: { guard_mode: "block" } }, project({}))).toEqual([expect.stringContaining("agents.budgets.guard_mode")]);
   });
 
