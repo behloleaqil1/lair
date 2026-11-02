@@ -420,6 +420,11 @@ export interface AgentsStatusView {
   fill?: FillStatusView;
   /** Providers Lair holds new starts on: their runs died of transient errors (agents.transient_patterns) */
   unreachable?: ProviderUnreachableView[];
+  /**
+   * agents.spend.enabled (docs/design/ai-spend.md §4.4): Home's AI spend panel and an agent's Spend line show only
+   * while it is on. Their data comes from the owner-only GET /api/agents/spend; this says only whether there is any
+   */
+  spendEnabled?: boolean;
 }
 
 /**

@@ -1410,3 +1410,96 @@ span.error {
   margin: var(--space-1) 0;
   white-space: normal;
 }
+
+/* Home → AI spend (components/SpendPanel.tsx): one stacked bar per unit on the status colours; the numbers are beside
+   each bar in text, so the bar is never the only way to read them */
+.spend-waste {
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  margin-bottom: var(--space-3);
+}
+
+.spend-bars {
+  display: grid;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
+.spend-bar-row {
+  display: grid;
+  grid-template-columns: 9rem minmax(6rem, 1fr);
+  column-gap: var(--space-3);
+  row-gap: var(--space-1);
+  align-items: center;
+}
+
+.spend-bar-label {
+  font-weight: var(--weight-medium);
+}
+
+.spend-bar {
+  display: flex;
+  height: 0.75rem;
+  overflow: hidden;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-sunken);
+}
+
+.spend-bar-numbers {
+  grid-column: 2;
+}
+
+.spend-segment {
+  display: block;
+  height: 100%;
+}
+
+.spend-productive {
+  background: var(--color-success);
+}
+
+.spend-idle {
+  background: var(--color-warning);
+}
+
+.spend-noResult {
+  background: var(--color-danger);
+}
+
+.spend-unclassified {
+  background: var(--color-neutral);
+}
+
+.spend-dot {
+  display: inline-block;
+  width: 0.625rem;
+  height: 0.625rem;
+  border-radius: var(--radius-full);
+}
+
+.spend-legend {
+  display: grid;
+  gap: var(--space-1);
+  margin: 0 0 var(--space-3);
+  padding: 0;
+  list-style: none;
+}
+
+.spend-lists {
+  margin: var(--space-4) 0;
+}
+
+.spend-table-head {
+  margin-bottom: var(--space-2);
+}
+
+@media (max-width: 600px) {
+  .spend-bar-row {
+    grid-template-columns: 1fr;
+  }
+
+  .spend-bar-numbers {
+    grid-column: 1;
+  }
+}
