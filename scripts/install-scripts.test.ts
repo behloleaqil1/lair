@@ -188,3 +188,18 @@ describe("install-scripts rebuild and ensure", () => {
     expect(r.out).toContain("node_modules is missing");
   });
 });
+
+describe("install-scripts wiring", () => {
+  it("vitest runs ensure as its global setup", async () => {
+    const config = (await import("../vite.config")).default as { test?: { globalSetup?: string | string[] } };
+    expect([config.test?.globalSetup ?? []].flat()).toContain("scripts/vitest-global-setup.mjs");
+    expect(readFileSync(join(REPO, "scripts", "vitest-global-setup.mjs"), "utf8")).toMatch(/^\s*ensure\(\);$/m);
+  });
+
+  it("npm run build and npm run dev run ensure first, so npm ci && npm run build gives a working install", () => {
+    const pkg = JSON.parse(readFileSync(join(REPO, "package.json"), "utf8")) as { scripts: Record<string, string> };
+    for (const name of ["build", "dev"]) {
+      expect(pkg.scripts[name], name).toMatch(/^node scripts\/install-scripts\.mjs ensure && /);
+    }
+  });
+});
