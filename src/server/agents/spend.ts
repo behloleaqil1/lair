@@ -50,6 +50,7 @@ import {
 import { DAY_MS, dayStart, guardModes, spendReportBetween, utcDay } from "./spend-report.js";
 import type { AgentsStore } from "./store.js";
 import { isActive, type AgentRun, type RunEndKind, type SpendRow, type UsageRecord } from "./types.js";
+import { storedCaptures } from "./wake-events.js";
 
 export type { QueueOutcome } from "./spend-classify.js";
 
@@ -122,6 +123,8 @@ export interface SpendSettings {
   notice: { wasteShare: number | null; minRuns: number; taskAttempts: number | null };
   /** fill follows a WAITING line's wake to a file (fill on, wake.file set) */
   wakeWatched: boolean;
+  /** fill watches the PR, decision or bus message a WAITING line names (fill on, G3 fill.wake.events.mode not off) */
+  wakeEvents: boolean;
   /** The guards spend counts for: G2 (agents.spend.guards.task_no_result_cap) */
   guards: { taskNoResultCap: { mode: "off" | "observe" | "act"; max: number; windowMs: number } };
 }
@@ -625,6 +628,7 @@ export class SpendRecorder {
       project: o.project,
       store: o.store,
       wakeWatched: () => o.settings.wakeWatched,
+      wakeEvents: () => o.settings.wakeEvents,
       facts: () => o.facts?.(),
     });
   }
@@ -1013,7 +1017,7 @@ export class SpendRecorder {
     const seen = events.find((e) => kindOf(e) === "done") ?? events.find((e) => kindOf(e) !== null);
     if (!seen) return null;
     const line = typeof seen.data.line === "string" ? seen.data.line : "";
-    return { kind: kindOf(seen)!, line, wake: typeof seen.data.wake === "string" ? seen.data.wake : null };
+    return { kind: kindOf(seen)!, line, wake: typeof seen.data.wake === "string" ? seen.data.wake : null, captures: storedCaptures(seen.data.captures) };
   }
 
   /** Whether the first enable's backfill is done (its event) */

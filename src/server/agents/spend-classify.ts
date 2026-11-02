@@ -16,6 +16,7 @@ import type { RunOrigin } from "../../shared/agents-types.js";
 import { attributedAgent } from "../parsers/queue.js";
 import type { AgentsStore } from "./store.js";
 import type { AgentRun, RunEndKind, SpendRow } from "./types.js";
+import { storedCaptures, wakeKey, wakeTargetOf, type WakeCaptures } from "./wake-events.js";
 
 /** After this long, a run its facts can't classify yet gets the class they give by then */
 export const CLASSIFY_WAIT_MS = 30 * 60_000;
@@ -30,6 +31,8 @@ export interface QueueOutcome {
   line: string;
   /** WAITING: the (?<wake>...) capture; BLOCKED: the blocked pattern's (?<wake>...) capture (the gate it names) */
   wake?: string | null;
+  /** WAITING: the G3 captures, the PR, decision or bus message it names (null: none) */
+  captures?: WakeCaptures | null;
 }
 
 /** A module's record of a run it asked for: pending until the module has read the run's result */
@@ -149,6 +152,8 @@ export interface ClassifierOptions {
   store: AgentsStore;
   /** fill follows a WAITING line's wake to a file (fill on, wake.file set): only then is a named wake watched */
   wakeWatched: () => boolean;
+  /** fill watches the PR, decision or bus message a WAITING line names (G3: fill on, fill.wake.events not off) */
+  wakeEvents?: () => boolean;
   facts: () => SpendFacts | undefined;
 }
 
@@ -172,7 +177,7 @@ export class SpendClassifier {
     }
     if (outcome?.kind === "done") return verdict("productive", /^\s*-\s+READY\b/.test(outcome.line) ? "ready" : "done");
     if (outcome?.kind === "blocked") return this.blocked(run, outcome, endedAt, final);
-    if (outcome?.kind === "waiting") return this.waiting(run, outcome.wake ?? null, endedAt, final) ?? verdict("unclassified", "pending");
+    if (outcome?.kind === "waiting") return this.waiting(run, outcome.wake ?? null, outcome.captures ?? null, endedAt, final) ?? verdict("unclassified", "pending");
     return verdict("idle", "no_line");
   }
 
@@ -189,7 +194,7 @@ export class SpendClassifier {
     }
     const seen = this.o.store.listEvents(this.o.project, { kinds: ["fill_waiting"], task: run.task, runId: run.id, limit: 1 })[0];
     if (!seen) return final ? verdict("idle", "waiting_unnamed") : null;
-    return this.waiting(run, typeof seen.data.wake === "string" ? seen.data.wake : null, row.endedAt, final);
+    return this.waiting(run, typeof seen.data.wake === "string" ? seen.data.wake : null, storedCaptures(seen.data.captures), row.endedAt, final);
   }
 
   /** What the module that asked for the run recorded. null: not yet. */
@@ -221,11 +226,15 @@ export class SpendClassifier {
    * WAITING (§4.2): idle when it names nothing Lair watches, or the same wake as the task's previous run; productive
    * (gate_queued) when fill found its wake absent when it looked (or the gate in the gate queue, or the result came
    * after the chain started): the run queued what it waits on. A wake whose result was there before the chain
-   * started was no wait (fill_weak). null while fill hasn't looked.
+   * started was no wait (fill_weak). null while fill hasn't looked. Without a gate fill follows, a wait on a PR, a
+   * decision or a bus message is watched while G3 is on (waitingEvent).
    */
-  private waiting(run: AgentRun, wake: string | null, endedAt: number, final: boolean): Classified | null {
+  private waiting(run: AgentRun, wake: string | null, captures: WakeCaptures | null, endedAt: number, final: boolean): Classified | null {
     const named = wake?.trim() || null;
-    if (named === null || !this.o.wakeWatched()) return verdict("idle", "waiting_unnamed");
+    if (named === null || !this.o.wakeWatched()) {
+      const target = this.o.wakeEvents?.() ? wakeTargetOf(captures).target : null;
+      return target === null ? verdict("idle", "waiting_unnamed") : this.waitingEvent(run, wakeKey(target, run.agent), endedAt, final);
+    }
     const previous = this.o.store.taskSpendBefore(this.o.project, run.task, endedAt, run.id, 10).find((r) => r.class !== "no_result");
     if (previous) {
       const before = this.o.store.listEvents(this.o.project, { kinds: ["fill_waiting"], task: run.task, runId: previous.runId, limit: 1 })[0];
@@ -239,6 +248,27 @@ export class SpendClassifier {
     if (kinds.has("fill_weak")) return verdict("idle", "waiting_unnamed");
     if (kinds.has("fill_wake_absent") || kinds.has("fill_gate_queued") || kinds.has("fill_woken")) return verdict("productive", "gate_queued");
     return final ? verdict("idle", "waiting_unnamed") : null;
+  }
+
+  /**
+   * WAITING on a PR, a decision or a bus message (G3, `key` as wakeKey gives it): productive (woken_by_event) once
+   * that event came after the run started, as fill recorded it (act: its fill_woken; observe: the guard_would of the
+   * wake it would have made). Such a wait may rightly last longer than CLASSIFY_WAIT_MS (act has no fallback timer:
+   * max_wait_minutes bounds it), so it is final only once the task has a later run (the event, the fallback timer or
+   * the owner started it again) and the row is final. Not come by then: idle, waiting_same when the task's previous
+   * run waited on the same one, else waiting_event. null until then.
+   */
+  private waitingEvent(run: AgentRun, key: string, endedAt: number, final: boolean): Classified | null {
+    const { store, project } = this.o;
+    const woken = store
+      .listEvents(project, { kinds: ["fill_woken", "guard_would"], task: run.task, runId: run.id, limit: 10 })
+      .some((e) => e.data.guard === "wake_events");
+    if (woken) return verdict("productive", "woken_by_event");
+    if (!final || store.latestRunForTask(project, run.task)?.id === run.id) return null;
+    const previous = store.taskSpendBefore(project, run.task, endedAt, run.id, 10).find((r) => r.class !== "no_result");
+    const before = previous ? store.listEvents(project, { kinds: ["fill_waiting"], task: run.task, runId: previous.runId, limit: 1 })[0] : undefined;
+    const target = before ? wakeTargetOf(storedCaptures(before.data.captures)).target : null;
+    return verdict("idle", target !== null && wakeKey(target, run.agent) === key ? "waiting_same" : "waiting_event");
   }
 
   /**

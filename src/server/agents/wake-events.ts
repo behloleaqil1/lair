@@ -13,7 +13,12 @@
  *
  * Everything here is data: a capture that isn't a PR number, a decision id or "bus" is refused, and shown.
  */
-import { WAKE_EVENT_GROUPS } from "./config.js";
+
+/**
+ * The waiting_pattern groups G3 (agents.fill.wake.events) reads: what a wait names as its event. Kept here, in a
+ * module with no imports, so the config, fill and the spend classifier all read it without an import cycle.
+ */
+export const WAKE_EVENT_GROUPS = ["pr", "decision", "message"] as const;
 
 /** What a wait names as its event */
 export type WakeTarget = { kind: "pr"; pr: number } | { kind: "decision"; id: string } | { kind: "message" };

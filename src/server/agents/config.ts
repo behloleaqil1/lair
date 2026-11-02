@@ -10,6 +10,7 @@ import { attributedAgent } from "../parsers/queue.js";
 import { getAdapter } from "../services/adapters.js";
 import { placeholdersIn } from "../watchdog/config.js";
 import { guardsNeedSpendErrors, resolveUsageParsers, slowOnShortLines, spendConfigErrors, type SpendSettings } from "./spend.js";
+import { WAKE_EVENT_GROUPS } from "./wake-events.js";
 
 /** A guard's mode (docs/design/ai-spend.md §4.5): off computes nothing; observe records what it would do; act does it */
 export const GUARD_MODES = ["off", "observe", "act"] as const;
@@ -921,6 +922,8 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         },
         // A WAITING line's wake is something Lair watches only when fill follows it to a file
         wakeWatched: value.fill.enabled && value.fill.wake.file !== undefined,
+        // ... and the PR, decision or bus message it names (G3), while fill.wake.events is on
+        wakeEvents: value.fill.enabled && value.fill.wake.events.mode !== "off",
         guards: {
           taskNoResultCap: {
             mode: value.spend.guards.task_no_result_cap.mode,
@@ -1120,9 +1123,6 @@ export function fillConfigWarnings(
   }
   return warnings;
 }
-
-/** The waiting_pattern groups G3 (agents.fill.wake.events) reads: what a wait names as its event */
-export const WAKE_EVENT_GROUPS = ["pr", "decision", "message"] as const;
 
 /** Backoff for attempt n (1-based): base * 2^(n-1), capped. In milliseconds. */
 export function backoffMs(attempt: number, baseSeconds: number, maxSeconds: number): number {
