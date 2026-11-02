@@ -407,6 +407,7 @@ One deployment runs an interim `agents.failover.cooldown_minutes: 120` as a stop
   - `recentEvents` (`src/server/planner/context.ts:83`, which changes every tick), the trigger list and every time field are left out. A hash over the whole context would never repeat, and the guard would be inert.
   - If the last finished run with the same hash ended with no applicable proposal (none applied or pending), the new run is skipped. No agent run starts, the triggers are consumed, and a `planner_skipped` event records the hash prefix and the earlier run's id.
   - Any real change (an owner message, a task line, a done line, a new idle set) gives a new hash, and the planner runs.
+  - A run the owner asked for is never skipped (nor a would-be skip in observe): the owner's "Let the planner try again" on a task's spent attempts (an `owner_retry` trigger) resets the attempts and the owner's keep, which decide what is refused but are not inputs of the hash.
   - Once `max_skip_hours` has passed since the last run, it runs anyway.
   - The hash and the outcome are kept in `planner_state`, so a restart doesn't undo the skip.
   - The spend panel counts skipped runs.

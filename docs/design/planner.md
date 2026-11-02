@@ -302,8 +302,8 @@ them. None calls a model or the network: they read the tasks file, the queue lin
 
 - **`prefilter_closed`.** Before the context is built, closed work leaves `openTasks` and the triggers: a done id of
   the tasks file, or a task whose **own** PR merged. A task's own PR is one whose head branch names the task id (whole
-  `/`-separated parts), or the PR its own DONE line names (fill's `done_pattern` for that task, the PR read as the ready
-  guard reads it; the planner keeps, per task, the PR its newest such line names). A PR merged when `review_merges`
+  `/`-separated parts), or the PR its own READY or DONE line names (`- READY <task> ...`, or fill's `done_pattern` for
+  that task; the PR read as the ready guard reads it; the planner keeps, per task, the PR its newest such line names). A PR merged when `review_merges`
   has it, or when the review module last read it from the host as merged: the review module keeps each PR's branch and
   state as it reads them (`review_prs.head_ref` and `.state`, review.db schema 5). A task whose text only mentions a
   merged PR stays, as does a `done_no_next` trigger (its point is the idle agent). The context gains `closed` (the
@@ -321,6 +321,8 @@ them. None calls a model or the network: they read the tasks file, the queue lin
   when that run ended `done` with nothing applied or waiting, isn't started: its triggers are consumed and a
   `planner.skipped` event names the earlier run. Recent queue events, the triggers and times are left out (a hash over
   them would never repeat). A failed run is no evidence, and `max_skip_hours` after the last run a run starts anyway.
+  A run with an `owner_retry` trigger (the owner's "Let the planner try again") is never skipped, nor a would-be skip:
+  that answer resets the task's attempts and the owner's keep, which decide refusals but are no input of the hash.
 - **`recheck_on_change` (D7).** In act mode a change to the tasks file during a run is kept and recorded with its
   diff, one notice names the run, and at the run's end each proposal is checked against the file as it is then; the
   valid ones go on to the verifier and the approval, the rest are refused one by one. The run keeps `tampered`, and
