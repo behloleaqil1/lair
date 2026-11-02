@@ -7934,12 +7934,13 @@ describe("AI spend G3: waiting agents woken by the awaited event (docs/design/ai
     expect(eventsOf(h, "guard_did")).toEqual([]);
   });
 
-  it("AT-17 act: a wait on a decision starts again when the owner answers it in the Decision Inbox (its real decision.answered)", async () => {
-    const h = setup(g3("act"));
+  /**
+   * The Decision Inbox (its real answer route and events) with the decision fact wired, and a question an agent or a
+   * tool asked over the API (POST /api/decisions), as an agent's WAITING line names one
+   */
+  async function withDecision(h: Harness) {
     const { inbox, answer } = await withInbox(h, { events: h.events });
     h.manager.useWakeFacts({ decision: (project, id) => decisionWake(inbox.get(id), project) });
-    fillTask(h);
-    // A question an agent or a tool asked over the API (POST /api/decisions), as an agent's WAITING line names one
     const { decision } = await inbox.raiseFromHttp({
       project: "demo",
       kind: "other",
@@ -7953,6 +7954,13 @@ describe("AI spend G3: waiting agents woken by the awaited event (docs/design/ai
       source: { module: "planner", ref: "card-12" },
       key: "page-size",
     });
+    return { inbox, answer, decision };
+  }
+
+  it("AT-17 act: a wait on a decision starts again when the owner answers it in the Decision Inbox (its real decision.answered)", async () => {
+    const h = setup(g3("act"));
+    const { answer, decision } = await withDecision(h);
+    fillTask(h);
     await runEndingWith(h, `- WAITING feat-login decision ${decision.id} by worker-a: asked the owner`);
     let line = await check(h);
     expect(line).toMatchObject({ hold: "waiting", waiting: { wake: `decision ${decision.id} (its answer)`, fallbackAt: null } });
@@ -7993,6 +8001,52 @@ describe("AI spend G3: waiting agents woken by the awaited event (docs/design/ai
     expect(eventsOf(h2, "guard_did")[0].data).toMatchObject({ event: "bus.message", source: "state", eventAt: at12(2.25) });
     bus.close();
   });
+
+  for (const then of ["a newer answer starts it", "it is held at max_wait_minutes"] as const) {
+    it(`AT-17 act: a run woken by a decision's answer that ends on the same decision line is not started again on that answer (no restart loop); ${then}`, async () => {
+      const h = setup(g3("act"));
+      const { answer, decision } = await withDecision(h);
+      fillTask(h);
+      const waits = `- WAITING feat-login decision ${decision.id} by worker-a: asked the owner`;
+      const first = await runEndingWith(h, waits); // starts at +0, ends at +1 min
+      h.clock.t = NOW + 30 * MIN;
+      expect((await answer(decision.id, { optionId: "small" })).statusCode).toBe(200);
+      expect((await check(h)).state).toBe("started");
+      // The woken run starts a minute later and ends on the same line: it didn't act on the answer
+      await at(h, 31 * MIN);
+      appendFileSync(h.queueFile, `${waits}\n`);
+      h.spawner.exit(5002, 0);
+      await at(h, 32 * MIN);
+      const second = runs(h)[1];
+      expect(second).toMatchObject({ state: "completed", spawnedAt: NOW + 31 * MIN });
+      // Its first look reads the decision at once (the state check): answered at +30, before this run started
+      expect(await check(h)).toMatchObject({ state: "held", hold: "waiting", waiting: { wake: `decision ${decision.id} (its answer)`, fallbackAt: null } });
+      for (const minute of [33, 40, 100]) {
+        h.clock.t = NOW + minute * MIN; // past poll_seconds each time: read again, still that answer
+        expect((await check(h)).hold).toBe("waiting");
+      }
+      expect(runs(h)).toHaveLength(2);
+      expect(eventsOf(h, "fill_woken").map((e) => e.runId)).toEqual([first.id]);
+      expect(eventsOf(h, "guard_did").map((e) => [e.runId, e.data.eventAt])).toEqual([[first.id, at12(30)]]);
+
+      if (then === "a newer answer starts it") {
+        // decision.answered again for that id, as DecisionInbox.answer sends it, after the run started
+        await emitAt(h, 120, "decision.answered", { decisionId: decision.id, project: "demo", kind: "other", module: "planner", optionId: "large", by: "owner", secretSupplied: false });
+        expect((await check(h)).state).toBe("started");
+        expect(eventsOf(h, "guard_did").map((e) => [e.runId, e.data.eventAt, e.data.source])).toEqual([
+          [first.id, at12(30), "event"],
+          [second.id, at12(120), "event"],
+        ]);
+      } else {
+        // Its streak of waiting runs began when the first ended (+1 min): held at max_wait_minutes (240), not started
+        h.clock.t = NOW + 240 * MIN;
+        expect((await check(h)).hold).toBe("waiting");
+        h.clock.t = NOW + 241 * MIN;
+        expect(await check(h)).toMatchObject({ state: "held", hold: "waited_too_long" });
+        expect(runs(h)).toHaveLength(2);
+      }
+    });
+  }
 
   it("a capture that isn't a PR number is refused and shown: the wait names nothing (fallback, counted)", async () => {
     const h = setup(g3("act"));

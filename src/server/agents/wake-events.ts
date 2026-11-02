@@ -165,25 +165,31 @@ export class WakeArrivals {
 export interface WakeFacts {
   /** The first review of the PR, or its merge, recorded after `since` (ms) */
   pr?(project: string, pr: number, since: number): { event: "review.submitted" | "review.merged"; at: number } | null | Promise<{ event: "review.submitted" | "review.merged"; at: number } | null>;
-  /** The decision, when it is the project's and closed with an answer (answered, or expired with its default) */
+  /**
+   * The decision, when it is the project's and closed with an answer (answered, or expired with its default), at its
+   * answer's time; wakeStateOf counts it only when that is at or after the run's start
+   */
   decision?(project: string, id: string): { event: "decision.answered" | "decision.expired"; at: number } | null | Promise<{ event: "decision.answered" | "decision.expired"; at: number } | null>;
   /** The first bus message to the agent sent after `since` that it hasn't read */
   message?(project: string, agent: string, since: number): { at: number } | null | Promise<{ at: number } | null>;
 }
 
-/** What the state check found for a target since `since`, or null (nothing yet, or no record to read) */
+/**
+ * What the state check found for a target since `since` (the run's start), or null (nothing yet, or no record to
+ * read). A record from before `since` is none, as an arrival from before it is: the run could read it already, so a
+ * run that ends waiting on it again (a decision answered before it started, say) waits for a newer one and is held at
+ * max_wait_minutes, instead of being started again at once, run after run.
+ */
 export async function wakeStateOf(facts: WakeFacts | undefined, project: string, agent: string, target: WakeTarget, since: number): Promise<WakeCame | null> {
   if (!facts) return null;
-  if (target.kind === "pr") {
-    const found = await facts.pr?.(project, target.pr, since);
-    return found ? { event: found.event, at: found.at, source: "state" } : null;
+  let found: { event: WakeEventType; at: number } | null | undefined;
+  if (target.kind === "pr") found = await facts.pr?.(project, target.pr, since);
+  else if (target.kind === "decision") found = await facts.decision?.(project, target.id);
+  else {
+    const message = await facts.message?.(project, agent, since);
+    found = message ? { event: "bus.message", at: message.at } : null;
   }
-  if (target.kind === "decision") {
-    const found = await facts.decision?.(project, target.id);
-    return found ? { event: found.event, at: found.at, source: "state" } : null;
-  }
-  const found = await facts.message?.(project, agent, since);
-  return found ? { event: "bus.message", at: found.at, source: "state" } : null;
+  return found && found.at >= since ? { event: found.event, at: found.at, source: "state" } : null;
 }
 
 /** The fields of a Decision Inbox decision the decision fact reads */

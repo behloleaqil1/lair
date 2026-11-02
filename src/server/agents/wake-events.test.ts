@@ -100,7 +100,7 @@ describe("G3: the state check", () => {
       },
       decision: async (project: string, id: string) => {
         asked.push(`decision ${project} ${id}`);
-        return { event: "decision.answered" as const, at: 9 };
+        return { event: "decision.answered" as const, at: 150 };
       },
       message: (project: string, agent: string, since: number) => {
         asked.push(`message ${project} ${agent} ${since}`);
@@ -109,11 +109,23 @@ describe("G3: the state check", () => {
     };
     expect(await wakeStateOf(facts, "demo", "worker-a", { kind: "pr", pr: 42 }, 100)).toEqual({ event: "review.merged", at: 105, source: "state" });
     expect(await wakeStateOf(facts, "demo", "worker-a", { kind: "pr", pr: 41 }, 100)).toBeNull();
-    expect(await wakeStateOf(facts, "demo", "worker-a", { kind: "decision", id: "d-1" }, 100)).toEqual({ event: "decision.answered", at: 9, source: "state" });
+    expect(await wakeStateOf(facts, "demo", "worker-a", { kind: "decision", id: "d-1" }, 100)).toEqual({ event: "decision.answered", at: 150, source: "state" });
     expect(await wakeStateOf(facts, "demo", "worker-a", { kind: "message" }, 100)).toBeNull();
     expect(asked).toEqual(["pr demo 42 100", "pr demo 41 100", "decision demo d-1", "message demo worker-a 100"]);
     expect(await wakeStateOf(undefined, "demo", "worker-a", { kind: "pr", pr: 42 }, 100)).toBeNull();
     expect(await wakeStateOf({}, "demo", "worker-a", { kind: "message" }, 100)).toBeNull();
+  });
+
+  it("a record from before the run started is none: a decision answered before it (the run could read the answer) wakes nothing; at or after it, it does", async () => {
+    const answeredAt = 150;
+    const facts = { decision: () => ({ event: "decision.answered" as const, at: answeredAt }) };
+    const decision = { kind: "decision", id: "d-1" } as const;
+    expect(await wakeStateOf(facts, "demo", "worker-a", decision, answeredAt + 1)).toBeNull();
+    expect(await wakeStateOf(facts, "demo", "worker-a", decision, answeredAt)).toEqual({ event: "decision.answered", at: answeredAt, source: "state" });
+    expect(await wakeStateOf(facts, "demo", "worker-a", decision, answeredAt - 1)).toMatchObject({ at: answeredAt });
+    // A PR or message fact that returned an older record is held to the same rule
+    expect(await wakeStateOf({ pr: () => ({ event: "review.submitted" as const, at: 10 }) }, "demo", "worker-a", { kind: "pr", pr: 42 }, 100)).toBeNull();
+    expect(await wakeStateOf({ message: () => ({ at: 10 }) }, "demo", "worker-a", { kind: "message" }, 100)).toBeNull();
   });
 
   it("a Decision Inbox decision wakes once it is the project's and closed with an answer (answered, or expired with its default)", () => {
