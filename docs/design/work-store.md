@@ -5,7 +5,8 @@
 > [phase3-bus.md](phase3-bus.md) (agents report through the bus), [planner.md](planner.md) (proposals become tasks),
 > [autonomy.md §4](autonomy.md) (the planner module), [autonomy.md §6](autonomy.md) (agents),
 > [configuration.md](../configuration.md#fill) (fill's tasks file). Checked against main at e8147ef (2 Nov, "Main today");
-> work store 1 builds 3.3, 3.4, 6.4 and the read routes of 4.2.
+> work store 1 builds 3.3, 3.4, 6.4 and the read routes of 4.2; work store 2 builds the bus consumer (4.1), the follower
+> and the comparison with fill (6.4), and schema v2 (3.3).
 
 ## The problem
 
@@ -180,6 +181,11 @@ truth: the agents module's claims"). The work store never copies holder state:
   or replaced after its owner died (failover, restart adoption) produces a task event written by the agents module
   through the producer interface, and the task goes back to `ready` (or `blocked` when the reason is a block) with
   that reason in the event. A claim replaced by failover changes the derived holder with no write to the task row.
+- Work store 2 (observe): the consumer records each run and claim fact (`started`, `ended`, `claim_released`) on the
+  task's timeline. Only a *live* run's start moves the stored state (a `waiting` or `blocked` task back to `ready`,
+  shown `running`); a run's end or a released claim moves nothing, because the agents module releases a claim at
+  every run's end, also right after a `WAITING` or `BLOCKED` report, and fill keeps that state then. A start replayed
+  after its run ended moves nothing either: the files decide that task's state (6.4).
 
 | Store | What it holds | How work store relates |
 |---|---|---|
@@ -225,7 +231,8 @@ Transitions:
 | blocked | ready | owner/planner | Unblocked; fill picks it up again |
 | running | in_review | agent | Reports `DONE` with PR |
 | in_review | done | review/merge | PR merged |
-| assigned/running/waiting | ready | agents (claim released, lost or replaced) | The claim is gone, reason in the event |
+| assigned/running/waiting | ready | agents (claim released, lost or replaced) | The claim is gone, reason in the event (from work store 3; in work store 2 a released claim is recorded and moves nothing, 1.5) |
+| waiting/blocked | ready | agents (work store 2) | A live run started on the task: shown `running` (1.5) |
 | * | dropped | owner | Owner drops the task |
 | dropped/done | open | owner | Owner reopens |
 
@@ -245,7 +252,11 @@ stays `ready` until the claim exists, and the read model shows the derived state
 | `dropped` | a reason (1-500 chars) and an `owner` or `planner` actor |
 
 The required values live on the transition's event payload and are copied to the task row only where the model has
-a column (`blocked_reason`).
+a column (`blocked_reason`). So a task blocked again for another reason is an `edited` event with the reason before and
+after (and a new version); a task still waiting on a new line has no column to change: the new line or report is on
+its event (`report`, with the gate id), and the state stays. A blocked reason is a `BLOCKED` report's summary, or the
+`BLOCKED` line when it was written by hand (the mirrored line of a report reads as the report's summary, so the
+consumer and the follower store the same reason).
 
 ### 2.2 Configurable per project
 
@@ -389,9 +400,27 @@ CREATE TABLE work_imports (
 );
 ```
 
-Later migrations, each with its PR: v2 `work_cursors` (the bus consumer's last applied report id, work store 2), then
-`work_task_deps` (with its reverse index on `depends_on`), `tier` and `labels`, and `work_briefs` (unique on
-`project, task_id, version`), as in the first draft of this section.
+Later migrations, each with its PR: v2 `work_cursors` (work store 2, below), then `work_task_deps` (with its reverse
+index on `depends_on`), `tier` and `labels`, and `work_briefs` (unique on `project, task_id, version`), as in the first
+draft of this section.
+
+```sql
+-- Schema version 2 (work store 2): the consumer's position in each source of facts
+CREATE TABLE work_cursors (
+  project TEXT NOT NULL,
+  source TEXT NOT NULL,       -- 'bus.report' (a bus report id) or 'agents.event' (an agents_events row)
+  position INTEGER NOT NULL,  -- the last fact applied from that source
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (project, source)
+);
+```
+
+One cursor per source, because the facts come from two stores with their own ids: reports from the project's bus
+store, run and claim facts from the agents store's events (by row: that table's id is a text id, and its rows only
+grow). The owner's first applied import starts both cursors where the sources ended before the files were read (a
+fact before that is in the files the import read; one after it is the consumer's). A store adopted under work store 1
+has no cursor: each source starts at its end when the consumer first reads it. A source whose end is behind its cursor
+(its file was replaced) starts again at its end.
 
 ### 3.4 Schema versioning and migrations
 
@@ -461,6 +490,15 @@ one. Claim facts arrive the same way from `agent.run.started`, `agent.run.ended`
 hand-written line (an agent without a token) reaches the store through the follower (6.4), read with fill's own
 checks. The tools below are for later PRs (work store 7); `report` is unchanged.
 
+What a report does to its task (work store 2): every report is a `report` event on the task, with the agent and run
+from the bus store as the actor; `WAITING` makes it `waiting`, `BLOCKED` makes it `blocked` (its summary is the
+reason), a `DONE` that fill's ready guard accepts makes it `done` (a refused one is recorded as refused and moves
+nothing: the follower reads its line again when the files next change); `PROGRESS` and `TICK` move nothing, nor does
+any report on a `done` or `dropped` task. A report for a task the store does not have is skipped (counted in the
+status) and the cursor moves past it: the follower imports the task from the files. The two sources are applied in
+time order (a full batch of one source holds the other back to its last time), so a replay after a restart applies a
+run's start, its reports and its end in the order they happened.
+
 Agents access tasks through the bus tools, extended:
 
 ```typescript
@@ -499,13 +537,15 @@ records that derived actor, which is the audit trail.
 Owner routes require an owner session (`src/server/human-auth/`). Owner-only is a **route property**, not a store
 check: `/api/work` is added to `OWNER_ONLY_PREFIXES`, reads that expose paths or other projects' data use
 `requireOwner()`, and writes use `requireOwnerForChanges()`. Both run before the body is parsed. The route layer
-builds the actor from the authenticated session (`{ kind: 'owner', id: session.subject }`) and passes it to the
-store as a trusted argument; the store has no way to read an actor from a request body. Agents never call
+builds the actor from the authenticated session (`{ kind: 'owner', id: session.id }`: the session's public id, never
+its secret) and passes it to the store as a trusted argument; the store has no way to read an actor from a request
+body. Agents never call
 `/api/work`: they use the bus's token routes (4.1). In work store 1 every `/api/work` route, reads included, needs the
 owner (`requireOwner()` on the whole prefix): task text and file paths are the owner's.
 
 ```
-GET    /api/work/status?project=<p>                  # WS1: mode, schema version, counts by state, last import
+GET    /api/work/status?project=<p>                  # WS1: mode, schema version, counts by state, last import;
+                                                     # WS2: adopted, cursors, the follower, the comparison with fill
 GET    /api/work/tasks?project=<p>&state=<s>&agent=<a>&limit=<n>   # WS1: with the derived state and holder (1.5)
 GET    /api/work/task?project=<p>&id=<id>            # WS1: one task and its newest events
 POST   /api/work/import?project=<p>                  # WS1: import from the configured files (6.4); body { dry_run }, default true
@@ -633,11 +673,12 @@ work_store:
 
 | `mode` | Who reads the store | The files |
 |---|---|---|
-| `off` (default) | Nothing: no store file is created and every work route answers 404 for the project | Fill, the planner and the tracker read them, exactly as today |
+| `off` (default) | Nothing: no store file is created; the status route reports `off`, and every other read and the import answer 404 for the project | Fill, the planner and the tracker read them, exactly as today |
 | `observe` | The owner (read API, import dry runs, and from work store 2 a comparison with fill's view). Fill, the planner and the tracker still read the files | `follow`: the store follows the files one way: on the owner's import (work store 1), automatically when they change (work store 2) |
 | `on` | Fill (work store 3), then the planner (4) and the tracker (8) | `follow` while legacy writers still edit the files; `mirror` once the store is written directly (Lair writes the files for old scripts, 6.2); `none` when nothing reads them (the first draft's `db` mode) |
 
-Work store 1 accepts `mode: off | observe` only; `on` and `files` arrive with the PRs that build them.
+Work store 1 accepts `mode: off | observe` only; work store 2 adds `files: follow` (the default; `mirror` and `none`
+are refused until the PRs that build them), and `on` arrives with work store 3.
 
 ### 6.1 `off` (default for every project)
 
@@ -701,15 +742,28 @@ It **reuses fill's and the planner's code**, so there is no third parser and no 
   and fill's kept `fill_done` record), then `reportedOutcome` for the task's latest run (`WAITING`, `BLOCKED`), and
   `unassignedLine` for a line with no agent; with `bus.consume: on` a mirrored line is read by its bus report, as
   fill reads it; a `DONE` that fill's ready guard refuses (`reportAccepted`) does not make the task done;
-- a task with an active run or a claim is stored `ready` (the read model shows it `assigned` or `running`, 1.5).
+- a task with an active run or a claim says nothing new in the files while the run works (its reports reach the store
+  through the bus consumer, 4.1): the import keeps its stored state, a new task is stored `ready`, and the read model
+  shows it `assigned` or `running` (1.5). Whether a run holds it is read before the queue file, so a run that ends
+  meanwhile has its last lines in the read;
+- **fill's holds are not a stored state.** Fill holds a line for the owner (a decision on
+  `agents:<project>:task:<task>`, a refusal, a pause, a backoff, capacity) before its done check; the import does not
+  copy those: a held line is stored by what its lines say (usually `ready`). Only the holds that are a state the store
+  keeps, `waiting` (and `waited_too_long`) and `blocked`, are compared with it (the comparison below ignores the rest).
 
 | In the files | Stored state |
 |---|---|
 | An open line, no report | `ready` |
 | An open line, a `DONE` fill accepts (or fill's kept record) | `done` |
-| An open line whose latest run last wrote `WAITING` / `BLOCKED` | `waiting` / `blocked` (the line is the reason) |
+| An open line whose latest run last wrote `WAITING` / `BLOCKED` (an unassigned line's too) | `waiting` / `blocked` (the line is the reason, or the report's summary for a mirrored line) |
+| An open line a run or a claim holds | unchanged (a new task: `ready`) |
 | A done line (`#done ...`) | `done` |
 | Gone from a readable file, imported before | `dropped` ("no longer in the tasks file") |
+
+**`files: follow` follows only what an import made.** A task whose `source` is not `import` (the planner's or the
+owner's, from work store 4) is never edited, moved or dropped by the files, even when a line names it: the import
+lists it as skipped. Only an import-sourced task can be dropped for leaving the file. So the planner's and the owner's
+writes (work store 4) and the follower never fight over one row.
 
 The import diffs the files against the store and changes only what differs, in **one transaction** (no `await`
 between the diff and the writes): a new task is `created`; a changed agent, name or description is `edited` (before
@@ -719,9 +773,29 @@ tasks file cannot be read, and two imports of one project never run at once (the
 import adds one `work_imports` row; it and every event carry the owner's session as actor. In `observe` the store
 can always be rebuilt from the files, so the pre-import backup of 3.5 arrives before `on` (work store 9).
 
-**The follower (work store 2)** runs the same import when a configured file changed (its size, mtime and content
-hash), never on a timer alone, so a check that finds nothing changed costs two `stat`s instead of 256 KB and 4 MB of
-reads. It is the only file reader in `observe` and in `on` with `files: follow`.
+**The follower (work store 2)** runs the same import when a configured file changed (its size, mtime and inode; the
+import itself compares content, so a file touched with nothing new changes nothing), never on a timer alone, so a
+check that finds nothing changed costs two `stat`s instead of 256 KB and 4 MB of reads. It is the only file reader in `observe` and in `on` with `files: follow`.
+
+As built in work store 2:
+
+- **Adoption.** Nothing follows until the owner applies a first import (after a dry run): that apply adopts the store
+  and starts the consumer's cursors (3.3). A dry run adopts nothing. Until then the status says the follower waits.
+- **One step per project at a time,** every 15 s and at start: the consumer drains first (bus reports and run and claim
+  facts above the cursors, 4.1), then the two files are `stat`ed (size, mtime, inode, taken before the read so a change
+  during it is read next time); only a change runs the import, with the follower (`module`) as the actor. A bus report
+  or a run or claim event drains at once. A request during a step runs once after it.
+- **Failures.** A step that fails, or takes longer than 60 s, is a failure in the status, with a backoff that doubles
+  from the interval up to 10 minutes; the step in flight still ends before another starts (its writes are each one
+  transaction). An unreadable tasks file fails the step and drops nothing.
+- **Live reload.** A change to the blocks an import reads (`agents`, `planner`) replaces the config the next step
+  reads; a step or import in flight ends with the config it started with and is not restarted. `mode: off` closes
+  the store and forgets the follower.
+- **The comparison.** `GET /api/work/status` puts the store next to fill's view at fill's last complete check: a
+  fill `done` line against a `done` task, `started` or `claimed` against a task a run or claim holds, a `waiting` or
+  `blocked` hold against that state, an unassigned line that is ready work against `ready`; every other hold is
+  ignored (counted). It names the first 50 tasks they disagree on, including a store task fill has no line for and a
+  line the store does not have. A status read in `observe` opens the store, and so creates its file.
 
 ## 7. Security
 
@@ -756,14 +830,16 @@ actor on a process-written event is a role (`agent`, `owner`, `module`, `system`
 
 A transition spans two databases (`data/work/<project>.db` and `data/agents.db`) and side effects (mirror files,
 tracker sync). No single SQLite transaction covers that, so each has a **write order** and a **recovery on start**.
-The reconcile runs **before fill's first tick** (the same gate the restart-adoption design uses).
+The reconcile runs **before fill's first tick** (the same gate the restart-adoption design uses). In `observe` (work
+store 2) nothing reads the store, so its replay starts with the follower, after the agents module and the bus have
+started; work store 3, where fill reads the store, moves it before fill's first tick.
 
 | Transition | Write order | Recovery on start |
 |---|---|---|
 | `ready` to `assigned` to `running` | 1. the run is inserted in the agents store; 2. the claim; 3. the work store writes its event (the task row's stored state stays `ready`, 2.1) | A claim whose task has no row raises one notice. An event naming a run with no active run and no claim is closed with a `claim_lost` event; the task shows `ready` again. After a kill between 1 and 3 there is one derived state and one run |
 | Report to `waiting`, `blocked`, `in_review` | 1. the bus store records the report; 2. the work store applies the state and event in one transaction | A report with no matching work event is replayed from the bus's last applied report id (idempotent by report id) |
 | Mirror write | 1. an intent row with the file's expected hash; 2. the file write; 3. the intent is cleared | An intent found at start: if the file hash equals the expected after-hash the write finished (clear it); if it equals the before-hash it is rolled back (retry); otherwise it is a foreign edit (6.2) |
-| Tracker sync | The tracker records the last synced event id per task | Replayed from that id, idempotent by `externalRef` (an update to an issue already in the target state is a no-op) |
+| Tracker sync | The tracker records the last synced event id per task | Replayed from that id, idempotent by the tracker's link for the task (an update to an issue already in the target state is a no-op) |
 
 Like planner.md's `INTENT` and `afterHash`, but generalised to each side effect above.
 
@@ -838,10 +914,12 @@ The store is the source of truth. GitHub Issues, Projects boards and milestones 
 
 ### 12.1 Task ↔ issue links
 
-A task's `externalRef` links it to a GitHub issue:
+The tracker's link for a task (a `tracker_links` row in the tracker's own store, 1.1) ties it to a GitHub issue; the
+task row holds no copy of it. A link names:
 
 ```typescript
-interface ExternalRef {
+interface ExternalRef {   // the tracker's link, as the tracker reads it
+
   provider: 'github';
   owner: string;      // e.g. 'example-org'
   repo: string;       // e.g. 'example-repo'
@@ -885,7 +963,7 @@ body. Unmatched issues become new tasks in `open` state.
 
 A sync cycle (every 5 minutes, or on webhook):
 
-1. For each task with an `externalRef`: compare state. If different, update the issue.
+1. For each task the tracker has a link for: compare state. If different, update the issue.
 2. For each open issue without a task: create a task (if `tracker.auto_import: true`) or log it.
 3. For each task whose issue was edited on GitHub: the edit becomes a decision ("accept GitHub edit" or
    "revert to store state") unless it's only a label or assignee change, which the tracker handles
