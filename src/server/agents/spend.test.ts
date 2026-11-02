@@ -32,6 +32,7 @@ import { loadProjectConfig } from "../config.js";
 import { ConfigReloader, serverModules } from "../reload/index.js";
 import { NodeFileSystem, type Clock, type CommandOutput, type CommandRunner, type ProcessInfo, type ProcessTable } from "../watchdog/probes.js";
 import { parseAgentsConfig } from "./config.js";
+import { describeUsage, evaluateBudget } from "./budgets.js";
 import type { DecisionInbox, DecisionRequest } from "./decisions.js";
 import type { AgentProbes, ProcessOwner, ProcessSpawner, SpawnOptions, SystemInfo, MemoryReading } from "./probes.js";
 import { AgentsManager, type AgentsService } from "./service.js";
@@ -1575,6 +1576,130 @@ describe("AT-29: retention aggregates each day again before its runs go", () => 
     const again = setup(SPEND_ON, { paths, clock: h.clock });
     await again.service.tick();
     expect(look()).toEqual(first);
+  });
+});
+
+describe("G5: request and minute limits count the spend records (docs/design/ai-spend.md §4.5)", () => {
+  const T = (iso: string) => Date.parse(iso);
+  const NOW_20 = T("2026-03-20T12:00:00Z");
+  /** A run's spend row: its agent, model requests (null: its adapter counts none) and runtime */
+  const row = (runId: string, endedAt: number, agent: string, requests: number | null, runtimeS: number): SpendRow => ({
+    ...fixtureRow(runId, endedAt, 0),
+    agent,
+    requests,
+    runtimeS,
+    usageSource: requests === null ? "none" : "requests",
+    inputTokens: null,
+    cacheWriteTokens: null,
+    cacheReadTokens: null,
+    outputTokens: null,
+    tokens: null,
+    turns: null,
+    cost: null,
+  });
+  const dayOf = (iso: string) => [iso, T(`${iso}T00:00:00Z`)] as const;
+
+  it("a project's and an agent's requests and agent-minutes per day and month; the guard's mode says whether a hard limit holds runs", () => {
+    const store = new AgentsStore(makePaths().dbPath);
+    store.recordSpend(row("a-today", T("2026-03-20T08:00:00Z"), "worker-a", 30, 600), null);
+    store.recordSpend(row("b-today", T("2026-03-20T09:00:00Z"), "worker-b", 20, 1200), null);
+    store.recordSpend(row("p-today", T("2026-03-20T10:00:00Z"), "worker-p", null, 30), null); // no requests, its minutes count
+    store.recordSpend(row("a-yesterday", T("2026-03-19T12:00:00Z"), "worker-a", 100, 3600), null);
+    store.recordSpend(row("a-last-month", T("2026-02-28T12:00:00Z"), "worker-a", 1000, 3600), null);
+    const limits = { daily_requests: { soft: 40, hard: 60 }, daily_minutes: { hard: 30 }, monthly_requests: { soft: 100 }, monthly_minutes: { soft: 500 } };
+    const act = { guardMode: "act" as const, retentionDays: 90 };
+
+    const project = evaluateBudget(store, "demo", null, limits, NOW_20, act)!;
+    expect(project.lines).toEqual([
+      { metric: "daily_requests", period: "2026-03-20", used: 50, soft: 40, hard: 60, level: "soft", guard: "act" },
+      { metric: "daily_minutes", period: "2026-03-20", used: 30.5, soft: undefined, hard: 30, level: "hard", guard: "act" },
+      { metric: "monthly_requests", period: "2026-03", used: 150, soft: 100, hard: undefined, level: "soft", guard: "act" },
+      { metric: "monthly_minutes", period: "2026-03", used: 90.5, soft: 500, hard: undefined, level: "ok", guard: "act" },
+    ]);
+    expect(project.blocked).toBe(true);
+    expect(describeUsage(project, project.lines[1], "hard")).toBe("the project used 30.5 agent-minutes in day 2026-03-20 (hard limit 30)");
+    const agent = evaluateBudget(store, "demo", "worker-a", limits, NOW_20, act)!;
+    expect(agent.lines.map((l) => [l.metric, l.used, l.level])).toEqual([
+      ["daily_requests", 30, "ok"],
+      ["daily_minutes", 10, "ok"],
+      ["monthly_requests", 130, "soft"],
+      ["monthly_minutes", 70, "ok"],
+    ]);
+    expect(describeUsage(agent, agent.lines[0], "soft")).toBe("agent worker-a used 30 requests in day 2026-03-20 (soft limit 40)");
+
+    // observe and off: the same lines, and nothing is held
+    for (const guardMode of ["observe", "off"] as const) {
+      const watched = evaluateBudget(store, "demo", null, limits, NOW_20, { guardMode, retentionDays: 90 })!;
+      expect(watched.lines.map((l) => [l.metric, l.level, l.guard])).toEqual(project.lines.map((l) => [l.metric, l.level, guardMode]));
+      expect(watched.blocked).toBe(false);
+    }
+    // Without the spend options there is nothing to count them from (config load refuses them while spend is off)
+    expect(evaluateBudget(store, "demo", null, limits, NOW_20)?.lines).toEqual([]);
+    // A token or cost line carries no guard and holds runs at its hard limit, as before
+    store.addUsage({ project: "demo", agent: "worker-a", provider: "provider-c", tokens: 10, cost: 9, at: NOW_20 - MIN });
+    const cost = evaluateBudget(store, "demo", null, { daily_cost: { hard: 8 } }, NOW_20, { guardMode: "observe", retentionDays: 90 })!;
+    expect(cost).toMatchObject({ blocked: true, lines: [{ metric: "daily_cost", used: 9, level: "hard" }] });
+    expect(cost.lines[0].guard).toBeUndefined();
+    store.close();
+  });
+
+  it("a month that reaches back past retention_days reads its older days from the daily aggregates, each run counted once", () => {
+    const store = new AgentsStore(makePaths().dbPath);
+    // Retention ran for these days: aggregated, their runs deleted
+    store.recordSpend(row("d05", T("2026-03-05T10:00:00Z"), "worker-a", 10, 60), null);
+    store.recordSpend(row("d10", T("2026-03-10T10:00:00Z"), "worker-b", 20, 60), null);
+    store.recordSpend(row("feb", T("2026-02-27T10:00:00Z"), "worker-a", 1000, 60), null);
+    for (const iso of ["2026-03-05", "2026-03-10", "2026-02-27"]) store.aggregateSpendDay("demo", ...dayOf(iso), true);
+    // Days whose daily summary ran but whose runs are still kept: counted once
+    store.recordSpend(row("d12", T("2026-03-12T10:00:00Z"), "worker-a", 40, 60), null);
+    store.recordSpend(row("d15", T("2026-03-15T10:00:00Z"), "worker-a", 100, 60), null);
+    for (const iso of ["2026-03-12", "2026-03-15"]) store.aggregateSpendDay("demo", ...dayOf(iso), false);
+    // A day with no aggregate yet: its run counts
+    store.recordSpend(row("d11", T("2026-03-11T10:00:00Z"), "worker-a", 5, 60), null);
+    const limits = { monthly_requests: { hard: 1000 }, monthly_minutes: { hard: 1000 } };
+
+    // retention_days 7: the cutoff is 2026-03-13; the days before it come from the aggregates
+    const short = evaluateBudget(store, "demo", null, limits, NOW_20, { guardMode: "act", retentionDays: 7 })!;
+    expect(short.lines.map((l) => [l.metric, l.used])).toEqual([["monthly_requests", 175], ["monthly_minutes", 5]]);
+    const agent = evaluateBudget(store, "demo", "worker-a", limits, NOW_20, { guardMode: "act", retentionDays: 7 })!;
+    expect(agent.lines.map((l) => [l.metric, l.used])).toEqual([["monthly_requests", 155], ["monthly_minutes", 4]]);
+    // retention_days 90 reaches past the month's start: the runs alone (the deleted days are not counted)
+    const long = evaluateBudget(store, "demo", null, limits, NOW_20, { guardMode: "act", retentionDays: 90 })!;
+    expect(long.lines.map((l) => [l.metric, l.used])).toEqual([["monthly_requests", 145], ["monthly_minutes", 3]]);
+    store.close();
+  });
+
+  it("the new limits load with spend on, checked like the others; budgets.guard_mode takes off, observe or act", () => {
+    const config = projectConfig(makePaths(), {});
+    const parsed = parseAgentsConfig(
+      {
+        enabled: true,
+        spend: { enabled: true },
+        budgets: {
+          guard_mode: "act",
+          project: { daily_requests: { soft: 800, hard: 1000 }, monthly_minutes: { hard: 6000 } },
+          agent: { daily_minutes: { soft: 120 } },
+          per_agent: { "worker-a": { monthly_requests: { hard: 20000 } } },
+        },
+      },
+      config,
+    );
+    expect(parsed.ok && parsed.settings.budgets).toEqual({
+      project: { daily_requests: { soft: 800, hard: 1000 }, monthly_minutes: { hard: 6000 } },
+      agent: { daily_minutes: { soft: 120 } },
+      perAgent: { "worker-a": { monthly_requests: { hard: 20000 } } },
+      guardMode: "act",
+    });
+    expect(parseAgentsConfig({ enabled: true }, config)).toMatchObject({ ok: true, settings: { budgets: { guardMode: "observe" } } });
+    const bad = parseAgentsConfig(
+      { enabled: true, spend: { enabled: true }, budgets: { guard_mode: "block", project: { daily_requests: { soft: 90, hard: 60 }, daily_minutes: { hard: -1 } } } },
+      config,
+    );
+    const errors = bad.ok ? [] : bad.errors;
+    expect(errors.some((e) => e.startsWith("agents.budgets.guard_mode:"))).toBe(true);
+    expect(errors.some((e) => e.startsWith("agents.budgets.project.daily_minutes.hard:"))).toBe(true);
+    const soft = parseAgentsConfig({ enabled: true, spend: { enabled: true }, budgets: { project: { daily_requests: { soft: 90, hard: 60 } } } }, config);
+    expect(soft.ok ? [] : soft.errors).toEqual(["agents.budgets.project.daily_requests: soft (90) is above hard (60)"]);
   });
 });
 
