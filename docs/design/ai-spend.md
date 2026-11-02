@@ -8,7 +8,7 @@ Lair starts AI runs by itself: builder agents through fill, reviewer agents thro
 
 1. **Measure:** record usage for every run, reported by the adapter where it can, estimated where it can't.
 2. **Classify and show:** classify every run as productive, idle or no-result, and show it in an API, a dashboard panel, a daily summary and threshold notices.
-3. **Guard:** add five guards, each off by default, against the waste patterns found below.
+3. **Guard:** add six guards, each off by default, against the waste patterns found below.
 
 ## 1. Why: what one real deployment shows
 
@@ -28,7 +28,7 @@ These numbers come from one busy project running 16 to 36 agents on one builder 
 | Rate limits | every one came from the same provider, with reason `DAILY_REQUEST_COUNT`. For 8 hours each waiting agent retried about every 31 minutes, 12 to 13 times, because `failover.cooldown_minutes` is a fixed 30 |
 | Decisions caused by those rate limits | 77 "every profile is failing" questions (one per task), 63 of them later withdrawn |
 | Reviews | 87 reviews on 51 PR heads: 30 heads were reviewed at least twice and 6 heads three times. 55 of 89 review runs failed |
-| Planner | 45 proposals: 8 applied, 19 declined, 17 refused by the rules, 1 pending. 7 of 20 planner runs failed |
+| Planner | 19 planner runs: 12 done, 7 failed. 45 proposals: only 8 applied (18 %), 20 declined by the verifier and 17 refused by Lair's rules. The top reasons: tasks already done were proposed again (three closed task ids, and a cleanup finished days earlier, proposed again from an old owner message), and "the tasks file changed while this planner run was active" (9) |
 | Waits woken by a timer | 9 of 20 waits named no gate (a review, an approval) and were started again after `fill.wake.fallback_seconds` |
 | `agents_usage` rows | **0**: no adapter reports usage, and `usage_patterns` is empty |
 
@@ -41,6 +41,7 @@ One more finding: an adapter **can** report its cost. During an earlier fallback
 3. **Provider unreachable: 59 runs, 565 model requests and 1,245 agent-minutes** in runs that then died. The transient rule already makes these cost no recovery attempts, but the work done before each death is lost.
 4. **Idle completions: 39 of 56 builder completions, using 993 model requests**, ended WAITING or with no queue line. 9 waits named nothing Lair could watch, so a timer woke them.
 5. **Restart losses: 34 runs that "ended while Lair wasn't supervising" and 11 review runs not started** (their run variables were lost) across 8 Lair restarts. Each of the 34 is resumed, which reloads its context.
+6. **Planner proposals that can't apply: 37 of 45 proposals refused or declined**, most of them for work already done. The planner and its verifier spend most of their runs this way.
 
 ## 2. What exists today
 
@@ -66,6 +67,10 @@ The inventory below was found with `git grep` over usage, budget, cost, failover
 | Run origin | `src/shared/agents-types.ts:53` `RunOrigin = "fill"` | Marks fill's runs | Review, planner, verifier and supervisor runs are told apart only by task-id prefix |
 | Module runs | `src/server/planner/service.ts:981` (planner), `:1272` (verifier), `src/server/review/agent-assigner.ts:318`, `src/server/supervisor/chat.ts:362` | Each requests an ordinary agent run, so claims, recovery, failover and budgets apply | Their spend can't be split by role. Their result (a proposal, a verdict, a review) isn't linked to the run's cost |
 | Module run caps | `src/server/planner/config.ts:139,150` `max_runs_per_day`, `src/server/review/config.ts:191` `retries.max_attempts` | Cap runs per day and per review slot | These exist and are kept |
+| Planner run gating | `src/server/planner/service.ts:864-884` `nextRunAt` and `maybeStart` | A run starts on a trigger, after `debounce_seconds`, at least `min_interval_seconds` after the last run, within `max_runs_per_day` | Nothing skips a run whose inputs are the same as those of the last run that produced nothing applicable |
+| Planner context | `src/server/planner/context.ts:68` (`tasksFile.done`, the last 200 done ids), `:70-82` (`openTasks`), `:84` (`ownerMessages`) | The model sees done ids, but also open plan and backlog tasks and owner messages that may describe the same, already finished, work | Open tasks whose id is done, or whose PR is merged, are not filtered out before the model sees them |
+| Planner rules | `src/server/planner/proposals.ts:113` ("task ids are not reused"), `src/server/planner/service.ts:493-515,1134` (tasks file changed during the run) | Refuses a proposal for a done id **after** the model proposed it, and refuses a whole run's proposals when the tasks file changed while it ran | The run is already spent. There is no rule for an `add` whose work maps to a merged PR, so the verifier is asked about it |
+| Owner messages | `src/server/planner/sources.ts:318-343` | A message is "answered" only when the replies file has a reply with its id. Until then it is in every planner context (the newest `max_messages`) | A message that a task carried out stays "unanswered", so it is proposed again |
 | The brain | `src/server/brain-trainer/model.ts` (a local trained classifier), `src/server/brain-trainer/shadow.ts` | Decision proposals in shadow mode, with no model calls | No tokens, so nothing to bill. The bench (`src/cli/brain-bench.ts`, `src/server/brain-bench/models.ts:125,150`) calls model endpoints from the CLI only, outside the server |
 | AI tools checks | `src/server/ai/runner.ts` | Model lists, sign-in and version checks | These are not model calls |
 | Built-in Claude Code adapter | `src/server/services/adapters.ts:77-84` | `claude -p ...` writes plain text | The final usage event is only there with `--output-format stream-json` (or `json`) |
@@ -100,10 +105,11 @@ The inventory below was found with `git grep` over usage, budget, cost, failover
 7. Waits on anything but a gate are woken by a timer.
 8. A task that hung once is resumed into the same hang.
 9. Budgets exist but have nothing to count. Soft limits notify no one, and adapters that report no tokens have no metric.
+10. The planner proposes work that is already done and owner requests that are already carried out. It also runs again on inputs that produced nothing applicable last time. Lair refuses these proposals only after the run has paid for them.
 
 ## 4. Design
 
-There is one new part of the agents module, `src/server/agents/spend.ts`, under `agents.spend`, plus four guards in the sections they belong to. `agents.spend.enabled: false` is the default. With it off, nothing new is read, written or shown.
+There is one new part of the agents module, `src/server/agents/spend.ts`, under `agents.spend`, plus six guards: G2 under `agents.spend`, the others in the sections they belong to (`failover`, `fill.wake`, `recovery`, `budgets`, `planner`). `agents.spend.enabled: false` is the default. With it off, nothing new is read, written or shown.
 
 ### 4.1 Measure
 
@@ -138,6 +144,8 @@ When `usage_parser` is set to anything but `patterns`, `readUsage` skips that ru
 - `fill`: unchanged.
 
 A run with no origin falls back to its task prefix. Model calls a module makes without an agent run go through a single in-process function, `spend.recordCall({ project, module, provider, model, requests, tokens, cost, source })`, which writes `agents_usage` with `run_id` null and `reason: "call:<module>"`. Today no server module makes such calls. The brain is a local classifier with no tokens: its evaluations are counted as `brain` calls with 0 tokens, so the panel shows it costs nothing. If a future brain uses a remote model, it must call `recordCall`. The bench CLI stays outside the server and prints its own usage.
+
+**Planner and verifier model calls.** Every planner run and every verifier run is an agent run, so its usage is recorded like any other run's. `planner_runs` already holds `agent_run_id` and `verifier_run_id`. The spend rollup joins on them to give, per planner run, its own requests, tokens and cost plus its verifier's, and the proposals by status. The panel then shows the **cost per applied proposal** and the planner's waste share (runs with no applied proposal).
 
 ### 4.2 Classify every run
 
@@ -266,6 +274,27 @@ Both are off until their threshold is set.
 - Estimated tokens and cost count toward `*_tokens` and `*_cost` limits only with `budgets.count_estimates: true` (default false), so a guess never blocks runs by itself.
 - Recommended for the deployment above: `project: { daily_requests: { soft: <80 % of the provider's daily quota> } }`, plus `daily_cost` soft and hard limits at amounts the owner chooses for each paid provider.
 
+**G6. Planner guards: propose only what can apply.** These extend `planner:` with `guards`. All three parts are cheap and deterministic: no model is called and no network is used.
+
+- **Filter closed work before proposing** (`guards.prefilter_closed: false`).
+  - Before the context is built, Lair drops from `openTasks`, and from the triggers, every task whose id is a done id of the tasks file, and every task whose text names a PR (`#<n>`, `PR <n>`) that the review store records as merged.
+  - It reads only local stores: the tasks file and `review.db`.
+  - The context gains `closed: { tasks, mergedPrs }` (the newest 200 of each), so the model also sees what is finished.
+  - After the run, one new rule refuses an `add` whose text names a merged PR, with the reason. Like every rule refusal, this happens before the verifier is asked, so the verifier run is saved too.
+- **Mark an owner request handled once a task closes it** (`guards.handled_messages: false`).
+  - A proposal may carry `from_message: <id>`. It must be an owner-message id in that run's context, or the proposal is refused.
+  - When a proposal with `from_message` is applied and its task later closes (its DONE line, or an applied `finish`), Lair records the message as handled in `planner_state` (keyed by message id, so it is idempotent; at most 1,000 kept; with the task and the time). A handled message is left out of later contexts and triggers.
+  - A message whose proposal was declined or refused stays open.
+  - The owner can mark a message handled, or reopen it, from the planner view through an owner-only route.
+- **Skip a run when nothing changed** (`guards.skip_unchanged: { enabled: false, max_skip_hours: 24 }`).
+  - Lair hashes, with sha256, the context it would give the planner run, with volatile fields (times, trigger times) removed.
+  - If the last finished run with the same hash ended with no applicable proposal (none applied or pending), the new run is skipped. No agent run starts, the triggers are consumed, and a `planner_skipped` event records the hash prefix and the earlier run's id.
+  - Any real change (an owner message, a task line, a done line, a new idle set) gives a new hash, and the planner runs.
+  - Once `max_skip_hours` has passed since the last run, it runs anyway.
+  - The hash and the outcome are kept in `planner_state`, so a restart doesn't undo the skip.
+  - The spend panel counts skipped runs.
+- Recommended: all three on. On the 48 hours above, the proposals for closed task ids and for the old, already carried out request would not have been made.
+
 **Not here.** Staged review slots (`ask_after`, [review-stages.md](review-stages.md), PR #291) stop an expensive reviewer slot from running before the gate or the earlier slots. This spec only measures reviews per head and review-run waste, so the effect of `ask_after` shows in the panel.
 
 ### 4.6 Configuration (recommended values shown; every default is off)
@@ -301,6 +330,12 @@ agents:
     notice: { waste_share: 0.5, min_runs: 20, task_attempts: 6 }
     guards:
       task_no_result_cap: { max: 6, window_hours: 24 }   # G2
+
+planner:
+  guards:                                    # G6
+    prefilter_closed: true
+    handled_messages: true
+    skip_unchanged: { enabled: true, max_skip_hours: 24 }
 ```
 
 Config is checked at load, and errors name the key:
@@ -343,6 +378,10 @@ Each test drives the real entry point (the agents tick, `requestRun`, the route)
 | AT-21 | spend off | Every action above | No `agents_spend` rows, no events, no panel, and the route returns 404 with `agents.spend.enabled is off` |
 | AT-22 | v1, v2 and v3 `agents.db` files from fixtures | Open with the new store | Migrates to v4. Existing runs, events and usage are kept, and `agents_spend` exists |
 | AT-23 | Config with a bad `request_pattern`, `waste_share: 2`, or `max_backoff_minutes < backoff_minutes` | Load | Refused, naming each key. The previous config stays live |
+| AT-24 | G6 `prefilter_closed` on. A backlog task whose id is a done id. A plan task naming PR #42, which `review.db` records as merged | A planner trigger | The context holds neither task, and `closed` lists both. A returned `add` naming #42 is refused with its reason, and no verifier run is requested for it |
+| AT-25 | G6 `handled_messages` on. Owner message M | A proposal with `from_message: M` is applied and its task's DONE line arrives. Then a proposal with `from_message` set to an id not in the context. Then the owner reopens M; then a request without an owner session | M is handled, absent from the next context, and raises no `owner_message` trigger. The unknown id is refused. Reopening puts M back. The request without an owner session gets **401/403** |
+| AT-26 | G6 `skip_unchanged` on. Run R1 with context hash H ended with only refused proposals | A trigger with the same inputs; Lair restarts; another trigger; then a new owner message; then the clock passes `max_skip_hours` | Both same-input triggers are skipped (`planner_skipped`, no agent run), the restart included. The new message starts a run. After `max_skip_hours` a run starts even with hash H |
+| AT-27 | G6 off | The inputs of AT-24 to AT-26 | Today's behaviour, unchanged |
 
 ## 6. Security and privacy
 
@@ -365,7 +404,9 @@ Each PR is separate, behind its off-by-default switch, with tests and docs (`doc
 6. **G3 event wake.** ATs 17-18. Docs: Fill → wake.
 7. **G5 budget metrics and soft notice.** ATs 20, 6. Docs: `Budgets.`.
 
-PRs 4 to 7 depend only on PR 1, so they can be built in parallel after it. Once PR 4 merges, #185 can close for its reset-time part.
+8. **G6 planner guards:** filter closed work, handled owner messages, and skipping unchanged runs. ATs 24-27. Docs: the planner section of `docs/configuration.md`, and [planner.md](planner.md).
+
+PRs 4 to 7 depend only on PR 1, so they can be built in parallel after it. PR 8 depends on nothing here and can start at once. Once PR 4 merges, #185 can close for its reset-time part.
 
 ## 8. Open questions for the owner
 
@@ -375,3 +416,4 @@ PRs 4 to 7 depend only on PR 1, so they can be built in parallel after it. Once 
 - **Q4.** Is 90-day retention right?
 - **Q5.** Should the built-in `claude-code` adapter switch to `--output-format stream-json --verbose` by default? That changes its log from text to JSON lines, and its `status_pattern` must be checked against it. A custom adapter can opt in regardless.
 - **Q6.** Are these the right recommended thresholds: waste notice at 50 % with at least 20 runs a day, task notice at 6 attempts without a completion, G2 at 6, G4 at 2?
+- **Q7.** 9 planner runs had all their proposals refused because "the tasks file changed while this planner run was active". That refusal protects the file's integrity. Should the planner instead start only once the tasks file has been quiet for a while, and wait while fill is writing it? Or should Lair re-check each proposal against the new file rather than refuse the whole run? This spec leaves the rule as it is.

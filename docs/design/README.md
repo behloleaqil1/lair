@@ -44,7 +44,7 @@
 5. Read `quality.md` and `launch-kit.md` for quality and launch criteria
 - [supervisor.md](supervisor.md): the supervisor, Lair's operator: self-checks, answers, diagnoses and fixes within the autonomy the owner gives it
 - [ai-roles.md](ai-roles.md): any AI tool and model, per role; how Lair checks sign-in and keeps API keys
-- [ai-spend.md](ai-spend.md): AI spend and waste: usage per run, productive/idle/no-result classes, a spend panel, and guards against retry and wake waste
+- [ai-spend.md](ai-spend.md): AI spend and waste: usage per run, productive/idle/no-result classes, a spend panel, and guards against retry, wake and planner waste
 - [settings-v2.md](settings-v2.md): Settings organised by task, and the look and feel of the whole dashboard
 - [app-architecture.md](app-architecture.md): the architecture stage for the apps Lair builds: quality attributes, trade-offs, ADRs, the stack, reference architectures and fitness functions
 - [importer.md](importer.md): taking over an existing project: discovery and audit, a proposed setup, shadow mode, a staged reversible cutover
