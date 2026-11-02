@@ -16,7 +16,7 @@ const CODE = /^[a-z][a-z0-9_]{0,59}$/;
 const FACT_KEY = /^[a-z][a-z0-9_]{0,59}$/;
 
 /**
- * The classes of the policy table (C1-C13) with the evidence codes each
+ * The classes of the policy table (C1-C14) with the evidence codes each
  * allows. A class outside this table is allowed but flagged; a known class
  * takes only its own codes.
  */
@@ -40,6 +40,7 @@ export const KNOWN_DECISION_CLASSES: Readonly<Record<string, { policy: string; c
   "agents.cannot_start": { policy: "C11", codes: ["probe_failed", "fill_waiting"] },
   "host-services.service_down": { policy: "C12", codes: ["start_failed", "flapping", "not_started", "probe_timeout"] },
   "pr_health.notice": { policy: "C13", codes: ["no_owner", "delivery_failed", "unfixed"] },
+  "agents.spend_notice": { policy: "C14", codes: ["waste_share", "task_attempts", "would_park", "would_cool", "budget_soft", "would_block"] },
 };
 
 export function isKnownDecisionClass(id: string): boolean {

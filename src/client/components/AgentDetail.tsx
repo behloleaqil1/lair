@@ -2,8 +2,9 @@
  * An agent's detail (#/work/<agent>): its task and description, the current
  * run (state, model, started, recoveries, claims), what it waits for, the
  * holds fill keeps for the owner (Release), its tasks_file lines, budget,
- * recent runs and recoveries, its recent reports, and the tail of its log.
- * The log and every action are the owner's.
+ * today's AI spend (while agents.spend is on), recent runs and recoveries,
+ * its recent reports, and the tail of its log. The log, the spend and every
+ * action are the owner's.
  */
 import { useState } from "react";
 import { useApi } from "../hooks/useApi";
@@ -20,12 +21,14 @@ import {
 import { canStartDragon } from "../dragon-start";
 import { startDragon, stopDragon } from "../owner-actions";
 import type { Dragon, DragonManagementConfig, DragonStartRequest, DragonStopRequest, QueueLine } from "../../shared/types";
-import type { AgentRunView, AgentsStatusView } from "../../shared/agents-types";
+import type { AgentRunView, AgentsStatusView, SpendReportView } from "../../shared/agents-types";
 import type { AgentLogView } from "../../shared/dashboard-types";
 import { DetailPanel, DetailSection } from "./DetailPanel";
 import { DragonStartDialog } from "./DragonStartDialog";
 import { DragonStopDialog } from "./DragonStopDialog";
 import { BudgetLines } from "./Budget";
+import { AgentSpendLineView } from "./SpendPanel";
+import { spendEndpoint } from "../spend-view";
 import { EmptyState, ErrorState, KeyValues, Loading, OwnerOnlyNotice, Time, useOwnerSignedIn } from "./ui";
 import { Badge } from "../ui/Badge";
 import { Button, ButtonLink } from "../ui/Button";
@@ -59,6 +62,8 @@ export interface AgentDetailData {
   queue: Fetched<QueueLine[]>;
   /** Fetched only once this browser is signed in as the owner */
   log: Fetched<AgentLogView>;
+  /** Today's AI spend by agent: asked for only while agents.spend is on and this browser is signed in as the owner */
+  spend?: Fetched<SpendReportView>;
 }
 
 export function AgentDetail(props: Props) {
@@ -71,7 +76,12 @@ export function AgentDetail(props: Props) {
     owner: true,
     skip: signedIn !== true,
   });
-  return <AgentDetailView {...props} data={{ signedIn, runs, queue, log }} />;
+  // AI spend is the owner's too; asked for once a minute
+  const spend = useApi<SpendReportView>(spendEndpoint("today", "agent"), project, Math.floor(refreshKey / 60_000), {
+    owner: true,
+    skip: status?.spendEnabled !== true || signedIn !== true,
+  });
+  return <AgentDetailView {...props} data={{ signedIn, runs, queue, log, spend }} />;
 }
 
 export function AgentDetailView({
@@ -85,7 +95,7 @@ export function AgentDetailView({
   onClose,
   data,
 }: Props & { data: AgentDetailData }) {
-  const { signedIn, runs, queue, log } = data;
+  const { signedIn, runs, queue, log, spend } = data;
   const managed = status !== null;
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
   const [starting, setStarting] = useState(false);
@@ -302,6 +312,12 @@ export function AgentDetailView({
       {model.budget && (
         <DetailSection title="Budget">
           <BudgetLines budget={model.budget} />
+        </DetailSection>
+      )}
+
+      {status?.spendEnabled === true && (
+        <DetailSection title="Spend">
+          <AgentSpendLineView report={spend ?? { data: null, loading: false, error: null }} agent={id} signedIn={signedIn} />
         </DetailSection>
       )}
 

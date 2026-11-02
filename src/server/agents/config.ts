@@ -9,7 +9,7 @@ import { isValidDragonId } from "../parsers/dragon-config.js";
 import { attributedAgent } from "../parsers/queue.js";
 import { getAdapter } from "../services/adapters.js";
 import { placeholdersIn } from "../watchdog/config.js";
-import { guardsNeedSpendErrors, resolveUsageParsers, spendConfigErrors, type SpendSettings } from "./spend.js";
+import { guardsNeedSpendErrors, resolveUsageParsers, slowOnShortLines, spendConfigErrors, type SpendSettings } from "./spend.js";
 
 /** A guard's mode (docs/design/ai-spend.md §4.5): off computes nothing; observe records what it would do; act does it */
 export const GUARD_MODES = ["off", "observe", "act"] as const;
@@ -65,6 +65,16 @@ export const DEFAULT_TRANSIENT_PATTERNS = [
 export const MAX_TRANSIENT_PATTERNS = 50;
 export const MAX_TRANSIENT_PATTERN_CHARS = 300;
 
+/**
+ * Lines that mean a quota, not a burst (G1, agents.failover.quota.patterns, matched case-insensitively): a daily
+ * request count, or a usage limit that says when it resets. A pattern may capture (?<reset>...): an ISO time, HH:MM
+ * or H am/pm with an optional zone, or "in <n> minutes|hours".
+ */
+export const DEFAULT_QUOTA_PATTERNS = ["DAILY_REQUEST_COUNT", "hit your .* limit"];
+/** At most this many quota patterns, each at most this many characters */
+export const MAX_QUOTA_PATTERNS = 20;
+export const MAX_QUOTA_PATTERN_CHARS = 300;
+
 const LimitSchema = z
   .object({
     soft: z.number().positive().optional(),
@@ -78,6 +88,11 @@ const LimitsSchema = z
     daily_cost: LimitSchema.optional(),
     monthly_tokens: LimitSchema.optional(),
     monthly_cost: LimitSchema.optional(),
+    /** G5 (docs/design/ai-spend.md §4.5): model requests and agent-minutes of ended runs, from the spend records */
+    daily_requests: LimitSchema.optional(),
+    daily_minutes: LimitSchema.optional(),
+    monthly_requests: LimitSchema.optional(),
+    monthly_minutes: LimitSchema.optional(),
   })
   .strict();
 
@@ -267,6 +282,20 @@ export const AgentsSchema = z
         fresh_sessions: z.number().int().min(0).max(10).default(1),
         backoff_seconds: z.number().min(0).default(30),
         max_backoff_seconds: z.number().min(0).default(1800),
+        /**
+         * G4, the hung-repeat rule (docs/design/ai-spend.md §4.5): a task's max_per_task-th hang within window_hours,
+         * in any chain, parks it (mode act) or records what it would do (observe). `first` is how the first hang
+         * restarts, a switch of its own: resume (as before) or fresh (a fresh session with the hung info)
+         */
+        hung_repeat: z
+          .object({
+            mode: z.enum(GUARD_MODES).default("off"),
+            max_per_task: z.number().int().min(1).max(100).default(2),
+            window_hours: z.number().positive().max(720).default(24),
+            first: z.enum(["resume", "fresh"]).default("resume"),
+          })
+          .strict()
+          .default({}),
       })
       .strict()
       .default({}),
@@ -290,6 +319,21 @@ export const AgentsSchema = z
         cooldown_minutes: z.number().min(0).default(30),
         /** Failovers per task (chain of runs); one more is escalated instead */
         max_failovers: z.number().int().min(0).max(20).default(3),
+        /**
+         * G1, the fleet quota cooldown (docs/design/ai-spend.md §4.5): a line matching `patterns` (checked before the
+         * rate-limit patterns) cools its provider for every agent until its reset time, else for backoff_minutes,
+         * doubling per failed probe up to max_backoff_minutes; then one start probes it. Observe: today's path, and
+         * a would_cool record
+         */
+        quota: z
+          .object({
+            mode: z.enum(GUARD_MODES).default("off"),
+            patterns: z.array(z.string().min(1).max(MAX_QUOTA_PATTERN_CHARS)).max(MAX_QUOTA_PATTERNS).default(DEFAULT_QUOTA_PATTERNS),
+            backoff_minutes: z.number().positive().max(1440).default(30),
+            max_backoff_minutes: z.number().positive().max(1440).default(240),
+          })
+          .strict()
+          .default({}),
       })
       .strict()
       .default({}),
@@ -315,8 +359,9 @@ export const AgentsSchema = z
         agent: LimitsSchema.optional(),
         per_agent: z.record(LimitsSchema).default({}),
         /**
-         * The mode of the budget guard AI spend adds (docs/design/ai-spend.md G5: the request and minute limits, a later
-         * part). Token and cost hard limits block new runs as before, whatever it says
+         * The mode of the budget guard AI spend adds (docs/design/ai-spend.md G5): what a request or minute hard limit
+         * does. act holds new runs; observe records what it would hold; off nothing. Token and cost hard limits hold new
+         * runs as before, whatever it says
          */
         guard_mode: z.enum(GUARD_MODES).default("observe"),
       })
@@ -343,6 +388,24 @@ export const AgentsSchema = z
             min_runs: z.number().int().min(1).max(100_000).default(20),
             /** One task's attempts without a completion within 24 h at or past this */
             task_attempts: z.number().int().min(1).max(10_000).optional(),
+          })
+          .strict()
+          .default({}),
+        /** The guards spend counts for (docs/design/ai-spend.md §4.5), each off until its mode is set */
+        guards: z
+          .object({
+            /**
+             * G2: a task's max no-result runs within window_hours, across its chains, park it (act) or record what it
+             * would do (observe). Runs a fleet outage or cooldown, a Lair restart or a stop ended don't count
+             */
+            task_no_result_cap: z
+              .object({
+                mode: z.enum(GUARD_MODES).default("off"),
+                max: z.number().int().min(1).max(1000).default(6),
+                window_hours: z.number().positive().max(720).default(24),
+              })
+              .strict()
+              .default({}),
           })
           .strict()
           .default({}),
@@ -614,6 +677,8 @@ export interface AgentsSettings {
     freshSessions: number;
     backoffSeconds: number;
     maxBackoffSeconds: number;
+    /** G4 (agents.recovery.hung_repeat) */
+    hungRepeat: { mode: GuardMode; maxPerTask: number; windowMs: number; first: "resume" | "fresh" };
   };
   retries: { maxRetries: number; backoffSeconds: number; maxBackoffSeconds: number };
   locks: AgentLockSettings[];
@@ -623,6 +688,8 @@ export interface AgentsSettings {
     silenceSeconds: number;
     cooldownMinutes: number;
     maxFailovers: number;
+    /** G1 (agents.failover.quota): the patterns compiled case-insensitive, the backoff in ms */
+    quota: { mode: GuardMode; patterns: RegExp[]; backoffMs: number; maxBackoffMs: number };
   };
   /** agents.transient_patterns (compiled case-insensitive), agents.transient_max_minutes and agents.transient_max_retries */
   transient: { patterns: RegExp[]; maxMinutes: number; maxRetries: number };
@@ -702,6 +769,16 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
     "agents.failover.provider_error_patterns",
     errors,
   );
+  const quota = value.failover.quota;
+  const quotaPatterns = compile(quota.patterns, "i", "agents.failover.quota.patterns", errors);
+  if (quota.patterns.length === 0) errors.push("agents.failover.quota.patterns: must not be empty (the lines that mean a quota)");
+  quotaPatterns.forEach((re, i) => {
+    if (re.test("")) errors.push(`agents.failover.quota.patterns[${i}]: it matches an empty line, so every line would be a quota`);
+    else if (slowOnShortLines(re)) errors.push(`agents.failover.quota.patterns[${i}]: it takes too long on a short line (nested quantifiers backtrack): simplify it`);
+  });
+  if (quota.max_backoff_minutes < quota.backoff_minutes) {
+    errors.push(`agents.failover.quota.max_backoff_minutes: must be at least backoff_minutes (${quota.backoff_minutes})`);
+  }
   const transientPatterns = compile(value.transient_patterns, "i", "agents.transient_patterns", errors);
   const usagePatterns = compile(value.usage_patterns, "gi", "agents.usage_patterns", errors);
   value.usage_patterns.forEach((pattern, i) => {
@@ -784,6 +861,12 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         freshSessions: value.recovery.fresh_sessions,
         backoffSeconds: value.recovery.backoff_seconds,
         maxBackoffSeconds: value.recovery.max_backoff_seconds,
+        hungRepeat: {
+          mode: value.recovery.hung_repeat.mode,
+          maxPerTask: value.recovery.hung_repeat.max_per_task,
+          windowMs: value.recovery.hung_repeat.window_hours * 3_600_000,
+          first: value.recovery.hung_repeat.first,
+        },
       },
       retries: {
         maxRetries: value.retries.max_retries,
@@ -804,6 +887,12 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         silenceSeconds: value.failover.silence_seconds,
         cooldownMinutes: value.failover.cooldown_minutes,
         maxFailovers: value.failover.max_failovers,
+        quota: {
+          mode: quota.mode,
+          patterns: quotaPatterns,
+          backoffMs: quota.backoff_minutes * 60000,
+          maxBackoffMs: quota.max_backoff_minutes * 60000,
+        },
       },
       transient: { patterns: transientPatterns, maxMinutes: value.transient_max_minutes, maxRetries: value.transient_max_retries },
       usagePatterns,
@@ -829,6 +918,13 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         },
         // A WAITING line's wake is something Lair watches only when fill follows it to a file
         wakeWatched: value.fill.enabled && value.fill.wake.file !== undefined,
+        guards: {
+          taskNoResultCap: {
+            mode: value.spend.guards.task_no_result_cap.mode,
+            max: value.spend.guards.task_no_result_cap.max,
+            windowMs: value.spend.guards.task_no_result_cap.window_hours * 3_600_000,
+          },
+        },
       },
       fill: {
         enabled: value.fill.enabled,

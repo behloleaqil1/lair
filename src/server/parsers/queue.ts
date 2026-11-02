@@ -109,13 +109,24 @@ export function detectLineType(content: string): QueueLineType {
 }
 
 /**
- * Extract task name from queue line content
+ * Extract task name from queue line content.
+ *
+ * The mirrored line for BLOCKED, PROGRESS is `- <TYPE> <task> by <agent> ...`
+ * and for DONE is `- DONE <task> task by <agent> ...`. The old pattern
+ * allowed two words, matching "feat-login by" for BLOCKED lines; that "by"
+ * is the attribution's preposition, not part of the task.
+ *
+ * We now stop at "by" when it's followed by a valid agent-id pattern (letter
+ * then letters, digits, underscores or hyphens, and then "(Name)", "HH:MMZ",
+ * ":" or end-of-line). The word "task" after a task id in DONE lines is still
+ * included when the second word is NOT "by" followed by an agent.
  */
 function extractTask(content: string, type: QueueLineType): string | undefined {
   // Common patterns:
-  // "DONE example-track-r2 task by kiro-X"
-  // "WAITING #42 example-track-r3 CRITICAL"
-  // "BLOCKED example-runners by kiro-Y"
+  // "DONE example-track-r2 task by kiro-X (Falkor) 14:35Z: ..."
+  // "WAITING #42 example-track-r3 20261024T152000Z-gate-id by kiro-B 15:20Z"
+  // "BLOCKED example-runners by kiro-Y 16:05Z: ..."
+  // "PROGRESS feat-search by kiro-Z 17:00Z: ..."
 
   if (
     type === "DONE" ||
@@ -123,11 +134,25 @@ function extractTask(content: string, type: QueueLineType): string | undefined {
     type === "BLOCKED" ||
     type === "PROGRESS"
   ) {
-    // Remove the type prefix and extract first word(s) as task
+    // Remove the type prefix
     const afterType = content.replace(
       /^(DONE|WAITING|BLOCKED|PROGRESS)\s+/i,
       "",
     );
+
+    // Check if the line is "<task> by <agent> ..." pattern
+    // Agent lookahead: "by" followed by a valid agent id (letter first, then
+    // letters/digits/underscore/hyphen, ending at word boundary or valid suffix)
+    // followed by "(", "HH:MMZ", ":" or end-of-line.
+    const byAgentPattern =
+      /^([#\w-]+)\s+by\s+([A-Za-z](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9])?)\s*(?:\(|\d{1,2}:\d{2}Z|:|$)/;
+    const byAgentMatch = afterType.match(byAgentPattern);
+    if (byAgentMatch) {
+      // The line is "<task> by <agent> ..." - return just the task
+      return byAgentMatch[1];
+    }
+
+    // Otherwise, match first word(s) up to two
     const taskMatch = afterType.match(/^([#\w-]+(?:\s+[#\w-]+)?)/);
     return taskMatch?.[1];
   }

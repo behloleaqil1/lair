@@ -44,6 +44,8 @@ import { SettingsRepos } from "./SettingsRepos";
 import { SettingsReview } from "./SettingsReview";
 import { SettingsSearch } from "./SettingsSearch";
 import { SettingsTeam } from "./SettingsTeam";
+import { SettingsWork } from "./SettingsWork";
+import { SettingsGates } from "./SettingsGates";
 import { ProjectWizard } from "./ProjectWizard";
 import { NotificationSettings } from "./NotificationSettings";
 import { Badge } from "../ui/Badge";
@@ -253,7 +255,7 @@ export function Settings({ project, refreshKey, route, go }: Props) {
     setDraft(next);
     clearReview();
   };
-  const pageFocus = route.detail && (page === "ai" || page === "team" || page === "repos") ? { key: route.detail, nonce } : null;
+  const pageFocus = route.detail && (page === "ai" || page === "team" || page === "repos" || page === "work" || page === "gates") ? { key: route.detail, nonce } : null;
 
   const onPick = (entry: SearchEntry) => {
     setNonce((n) => n + 1);
@@ -297,6 +299,32 @@ export function Settings({ project, refreshKey, route, go }: Props) {
           <SettingsTeam
             project={view.id}
             draft={draft}
+            known={view.known}
+            errors={errors}
+            disabled={busy || yamlDirty || view.values === null}
+            onDraft={onDraft}
+            focus={pageFocus}
+          />
+        );
+      case "work":
+        return (
+          <SettingsWork
+            project={view.id}
+            draft={draft}
+            sections={sections}
+            known={view.known}
+            errors={errors}
+            disabled={busy || yamlDirty || view.values === null}
+            onDraft={onDraft}
+            focus={pageFocus}
+          />
+        );
+      case "gates":
+        return (
+          <SettingsGates
+            project={view.id}
+            draft={draft}
+            sections={sections}
             known={view.known}
             errors={errors}
             disabled={busy || yamlDirty || view.values === null}

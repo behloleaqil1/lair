@@ -7,7 +7,7 @@
  */
 import { routeHash } from "./router";
 
-export type SettingsPage = "overview" | "repos" | "ai" | "team" | "classic" | "yaml" | "history";
+export type SettingsPage = "overview" | "repos" | "ai" | "team" | "work" | "gates" | "classic" | "yaml" | "history";
 
 export interface PageDef {
   id: SettingsPage;
@@ -37,6 +37,18 @@ export const SETTINGS_PAGES: readonly PageDef[] = [
     id: "team",
     label: "Team",
     about: "The agents (dragons): what each runs on and where. Select several to move them to another profile at once.",
+  },
+  {
+    id: "work",
+    label: "Work",
+    about:
+      "Where tasks come from (a tasks file or the planner), limits (max active, waits, recovery budget), and the capacity check that decides whether there is room for another run.",
+  },
+  {
+    id: "gates",
+    label: "Gates",
+    about:
+      "Pipelines and their steps, executors (GitHub Actions, local), triage (infra patterns, re-checks, flaky policy), and placement (which machine runs what).",
   },
   {
     id: "classic",
@@ -70,12 +82,17 @@ export function pageHref(page: SettingsPage, detail: string | null = null, proje
   return routeHash({ section: "settings", tab: tabOf(page), detail, project });
 }
 
-/** The page that edits a YAML key (dotted, from the top level): AI for the profiles and roles, Team for the agents, Repos for repos. */
+/** The page that edits a YAML key (dotted, from the top level): Repos for repos, AI for the profiles and roles, Team for the agents, Work for agents.fill, Gates for pipelines/triage/placement. */
 export function pageForKey(key: string): SettingsPage {
   if (key === "") return "overview";
   if (key === "repos" || key.startsWith("repos.")) return "repos";
   if (key === "ai" || key.startsWith("ai.profiles") || key.startsWith("ai.roles")) return "ai";
   if (key === "dragons" || key.startsWith("dragons.")) return "team";
+  if (key === "agents" || key.startsWith("agents.")) return "work";
+  if (key === "pipelines" || key.startsWith("pipelines.")) return "gates";
+  if (key === "executors" || key.startsWith("executors.")) return "gates";
+  if (key === "triage" || key.startsWith("triage.")) return "gates";
+  if (key === "placement" || key.startsWith("placement.")) return "gates";
   return "classic";
 }
 

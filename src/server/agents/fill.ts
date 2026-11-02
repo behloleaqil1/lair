@@ -100,7 +100,7 @@ import {
   type FillPattern,
   type FillSettings,
 } from "./config.js";
-import { escalationDecisionKey, type DecisionRequest } from "./decisions.js";
+import { escalationDecisionKey, guardDecisionKey, type DecisionRequest } from "./decisions.js";
 import { computeIdleStates, findReadyWork, idleExplanation, idleStateView, shouldNotice, type IdleInput, type IdleState } from "./idle.js";
 import type { AgentProbes, MemoryReading } from "./probes.js";
 import { MAX_PROMPT_FILE_BYTES } from "./prompts.js";
@@ -157,7 +157,7 @@ export type HoldDecisionState =
 export const DECISION_FILL_START = "start_again";
 export const DECISION_FILL_KEEP = "keep_held";
 /** Holds the owner lifts (POST /api/agents/fill/release, or the decision); a waiting one also ends by itself */
-export const OWNER_HOLDS: readonly FillHold[] = ["owner", "no_done", "blocked", "waiting", "waited_too_long", "paused"];
+export const OWNER_HOLDS: readonly FillHold[] = ["owner", "no_done", "blocked", "waiting", "waited_too_long", "paused", "no_result_cap", "hung_repeat"];
 
 const short = (id: string) => id.slice(0, 8);
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -1833,6 +1833,22 @@ export class AgentsFill {
             context: runs,
           });
           continue;
+        }
+        // An AI spend guard parked it (G2 no_result_cap, G4 hung_repeat): held on the guard's decision while it is open
+        const parked = store.listEvents(project, { kinds: ["guard_did"], runId: latest.id, limit: 5 }).find((e) => e.data.verdict === "park");
+        if (parked && (parked.data.guard === "task_no_result_cap" || parked.data.guard === "hung_repeat")) {
+          const parkKey = guardDecisionKey(parked.data.guard, latest.id);
+          const decision = this.options.findDecision(parkKey);
+          // undefined: no Decision Inbox here (the hold still stands); answered without moving the task on: the owner's
+          if (decision === undefined || decision?.status === "open") {
+            await hold(
+              parked.data.guard === "hung_repeat" ? "hung_repeat" : "no_result_cap",
+              `parked by ${parked.data.guard}: ${oneLine(parked.summary)}: fill starts it again once you answer its decision or release it`,
+              latest.id,
+            );
+            if (decision) standOn(parkKey);
+            continue;
+          }
         }
         await hold(
           "owner",

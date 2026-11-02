@@ -57,10 +57,13 @@ export interface StoredLockWait {
 }
 
 export interface FailoverInfo {
-  kind: "rate_limit" | "provider_error";
+  /** quota: a failover.quota pattern matched with the guard in act (G1); in observe the line keeps today's kind */
+  kind: "rate_limit" | "provider_error" | "quota";
   line: string;
   /** The line is a transient error (agents.transient_patterns): waited out, not failed over */
   transient?: boolean;
+  /** The line matched a failover.quota pattern (G1, act or observe), with what its (?<reset>...) group captured */
+  quota?: { reset: string | null };
 }
 
 export interface AgentRun {

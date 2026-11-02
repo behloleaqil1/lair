@@ -268,3 +268,62 @@ describe("parseQueueLine agent IDs", () => {
     expect(parseQueueLine("- (aider-1, 18:15Z) checking status")!.agent).toBe("aider-1");
   });
 });
+
+describe("parseQueueLine bus-mirrored formats", () => {
+  it("extracts task from mirrored DONE line (task word is kept)", () => {
+    // Mirror format: "- DONE ${task} task by ${agentId} ${time}: ..."
+    const line = "- DONE feat-login task by kiro-A 14:35Z: head abc1234d [bus:1]";
+    const result = parseQueueLine(line)!;
+    expect(result.type).toBe("DONE");
+    expect(result.task).toBe("feat-login task");
+    expect(result.agent).toBe("kiro-A");
+  });
+
+  it("extracts task from mirrored BLOCKED line (stops before 'by agent')", () => {
+    // Mirror format: "- BLOCKED ${task} by ${agentId} ${time}: ${summary}"
+    // The parser must NOT include "by" in the task
+    const line = "- BLOCKED feat-login by worker-a 14:35Z: needs API approval [bus:2]";
+    const result = parseQueueLine(line)!;
+    expect(result.type).toBe("BLOCKED");
+    expect(result.task).toBe("feat-login");
+    expect(result.agent).toBe("worker-a");
+  });
+
+  it("extracts task from mirrored WAITING line (stops before 'by agent')", () => {
+    // Mirror format: "- WAITING ${task} [${gateId}] by ${agentId} ${time}: ${summary}"
+    // With gate id between task and "by"
+    const line = "- WAITING search-panel 20261024T152000Z-gate-id by kiro-B 15:20Z: queued [bus:3]";
+    const result = parseQueueLine(line)!;
+    expect(result.type).toBe("WAITING");
+    // The second word is the gate id timestamp, not "by", so both words are kept
+    expect(result.task).toBe("search-panel 20261024T152000Z-gate-id");
+    expect(result.agent).toBe("kiro-B");
+  });
+
+  it("extracts task from mirrored WAITING line without gate id", () => {
+    // Mirror format without gate: "- WAITING ${task} by ${agentId} ${time}: ${summary}"
+    const line = "- WAITING feat-search by worker-c 15:20Z: waiting for review [bus:4]";
+    const result = parseQueueLine(line)!;
+    expect(result.type).toBe("WAITING");
+    expect(result.task).toBe("feat-search");
+    expect(result.agent).toBe("worker-c");
+  });
+
+  it("extracts task from mirrored PROGRESS line (stops before 'by agent')", () => {
+    // Mirror format: "- PROGRESS ${task} by ${agentId} ${time}: ${summary}"
+    const line = "- PROGRESS refactoring by kiro-D 17:00Z: 3 of 8 files complete [bus:5]";
+    const result = parseQueueLine(line)!;
+    expect(result.type).toBe("PROGRESS");
+    expect(result.task).toBe("refactoring");
+    expect(result.agent).toBe("kiro-D");
+  });
+
+  it("handles agents with various valid ID formats", () => {
+    // Agent id: letter first, then letters/digits/underscore/hyphen
+    expect(parseQueueLine("- BLOCKED task-a by a 12:00Z: x")!.task).toBe("task-a");
+    expect(parseQueueLine("- BLOCKED task-b by Agent123 12:00Z: x")!.task).toBe("task-b");
+    expect(parseQueueLine("- BLOCKED task-c by my_agent-1 12:00Z: x")!.task).toBe("task-c");
+    expect(parseQueueLine("- BLOCKED task-d by X (Name) 12:00Z: x")!.task).toBe("task-d");
+    expect(parseQueueLine("- BLOCKED task-e by agent:")!.task).toBe("task-e");
+  });
+});

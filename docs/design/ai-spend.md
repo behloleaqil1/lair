@@ -1,6 +1,6 @@
 # AI spend and waste
 
-- **Status:** design. PR 1 (measure) and PR 2 (classify, API, daily summary, notices) of §7 are built; the rest is not. The feature decisions are made (§8, 2026-11-02).
+- **Status:** design. Of §7, PR 1 (measure; 1b is not built), PR 2 (classify, API, daily summary, notices), PR 3 (dashboard), PR 4 (G1) and PR 5 (G2, G4) are built; the rest is not. The feature decisions are made (§8, 2026-11-02).
 - **Base:** main `9bce85a`.
 - **Related:** [autonomy.md §6](autonomy.md#6-agents-budgets-failover-and-session-recovery-module-agents) (the agents module), [review-stages.md](review-stages.md) (staged review slots, `ask_after`, built separately), [planner.md](planner.md), [decision-policies.md](decision-policies.md) (the brain), issue #185 (usage limit detector).
 
@@ -249,9 +249,9 @@ CREATE INDEX IF NOT EXISTS idx_agents_spend_pending ON agents_spend_pending(proj
 - Rows for a day can arrive after its summary ran: an exit-unknown or adopted run ends late. So right before a day's per-run rows are deleted, the pruning step always upserts that day's aggregate again from the rows still there. A late row is never lost, and an aggregate is never left stale.
 - Deletes run at most once a day, in the tick, one whole UTC day at a time: the day's aggregate is written again and its per-run rows deleted in one transaction, so a crash can't leave a day half deleted (whose aggregate a later pass would then write again from what is left). At most 31 days per tick; the rest go on the next tick.
 - `agents_spend_daily` has no `tokens` column: a long window's tokens are input + cache write + output, so a `patterns` row (a total with no split) adds none there.
-- Windows longer than 90 days read the aggregates only, so they have no per-run or per-task detail.
+- Windows longer than 90 days have no per-task detail. They read the aggregates of the days before the retention cutoff and the per-run rows from the cutoff on, so a row that lands after its day's summary counts at once. A day before the cutoff whose rows retention hasn't deleted yet is read from its aggregate, or from its rows when it has none.
 
-**Backfill (PR 2, because it needs the classification).** On first enable, the runs from the last `backfill_days` (7) are classified from the run records and events Lair already holds. Their usage is `none`, because their logs may have moved, and they get `backfilled = 1`. The first panel isn't empty, and every view can tell these rows apart. The backfill is idempotent: a row whose `run_id` exists is skipped. The queue file isn't read for it: a completed builder run whose line fill never recorded (not a fill task) is `unclassified` with reason `not_recorded`, not guessed idle.
+**Backfill (PR 2, because it needs the classification).** On first enable, the runs from the last `backfill_days` (7) are classified from the run records and events Lair already holds. Their usage is `none`, because their logs may have moved, and they get `backfilled = 1`. The first panel isn't empty, and every view can tell these rows apart. The backfill is idempotent: a row whose `run_id` exists is skipped, and so is a run that ended while spend was on (its pending mark), whose row drain writes with the usage its log reports. The queue file isn't read for it: a completed builder run whose line fill never recorded (not a fill task) is `unclassified` with reason `not_recorded`, not guessed idle. The daily summary and retention wait until the backfill is done (its `spend_backfill:done` event): it goes oldest first, so a summary before then would miss the last day's runs, and it is never sent again.
 
 ### 4.4 Show it
 
@@ -266,7 +266,7 @@ CREATE INDEX IF NOT EXISTS idx_agents_spend_pending ON agents_spend_pending(proj
   - reviews per head (heads reviewed more than once);
   - planner acceptance;
   - each guard's mode and its `would` and `did` counts;
-  - `reported: false`, with `null` tokens and cost, for any group whose adapters report no tokens.
+  - `reported: false`, with `null` tokens and cost, for any group whose adapters report no tokens, and `reportedRuns` (how many runs reported them) on every totals.
   "today" is the UTC day.
 - `GET /api/agents/spend/runs?project=<p>&task=<id>&limit=` returns that task's run rows. These hold numbers, ids and enums only, never a prompt or a log line.
 
@@ -282,6 +282,14 @@ CREATE INDEX IF NOT EXISTS idx_agents_spend_pending ON agents_spend_pending(proj
 - "not reported" in place of tokens and cost for adapters that don't report them.
 
 AgentDetail gets a "Spend" line (today's runs per class and cost or requests) next to its Budget section. Charts follow the dashboard's existing component styles.
+
+**As built (PR 3).**
+
+- The agents status (`GET /api/agents/status`, not owner-only) says only whether spend is on (`spendEnabled`), so the panel and the Spend line show while it is on and a signed-out browser sees "shown to the owner only" in their place. Their numbers come from the owner-only spend route alone, read once a minute and on each switch.
+- The bars cover each unit with data: cost and tokens where an adapter reported them (else "not reported" in their place), requests, model turns, agent time and runs. Runs not classified yet are a fourth, grey segment when there are some. Each bar has its numbers beside it in text.
+- A class or a waste reason with runs none of which reported (or counted) the unit says "not reported" in its place, never "$0.00" or "0 tokens"; a class with no runs is a true 0. Each totals object of the API carries `reportedRuns` (how many of its `runs` reported tokens and cost), so a mixed fleet is told from the data, whatever the table is grouped by: a caveat beside the bars ("cover only the 2 of 3 runs whose adapter reported them"), the waste share in cost says "of the reported cost (2 of 3 runs)", a reason says "reported for 1 of them", and the agent's Spend line says "cost $0.30 for 1 of 5 runs (partly reported ...)".
+- The table is by agent first (task, origin and project on its select). A row whose runs have none of the panel's unit shows its waste share in the next unit it has ("100% of requests").
+- The guard lines read the API's `mode`, `would` and `did` per guard, in plain words ("watching: would have cooled a provider once today").
 
 **Daily summary.** At `agents.spend.daily_summary_utc` ("00:05"), for the UTC day that just ended, each project records one `spend_daily` event (dedupe key `spend_daily:<project>:<date>`, so a restart doesn't repeat it). It is published on the event bus as `agents.spend.daily`. The data is the same totals the API gives for that day: numbers, enums and task ids only. The same step writes that day's `agents_spend_daily` rows. The supervisor digest may read it. No AI run makes it.
 
@@ -316,6 +324,13 @@ One deployment runs an interim `agents.failover.cooldown_minutes: 120` as a stop
 - A run already running isn't stopped by someone else's quota line. It ends on its own, as today.
 - In observe, the provider isn't cooled beyond today's rule. Each start that would have waited records `would_cool` with the reset time Lair would have used.
 - Recommended: patterns for the CLIs in use. On the 48 hours above, this would have replaced 114 failed starts with about 6 probes, and 77 decisions with 1.
+- **As built (PR 4).**
+  - The cooldown's state is kept on events of a new kind, `quota` (provider, since, next probe, backoff step, lines, reset), next to the `failover` event of kind `quota`. A `quota_cleared` event ends it: a start after the latest quota line that lives past `dead_on_start_seconds` or exits 0, or the owner's "Try now". A quota state older than 48 hours is over.
+  - A provider in a quota cooldown is passed over like one in a transient outage, so a fallback on another provider wins; with none, the run waits for the probe the same way (one start at a time, no `start_timeout_minutes`).
+  - The quota's cooldown replaces `cooldown_minutes` for quota lines rather than adding to it: `coolingUntil` still reads only rate-limit and provider-error failovers, so the interim 120-minute cooldown doesn't hold a quota's probe back. The quota failover's run ends `rate_limit` (§4.2's end kinds don't change).
+  - Each cooldown records one `guard_did` (`verdict: "cool"`); its decision is class `agents.provider_limit`, code `provider_quota`.
+  - Observe's streak per provider lasts until a start on it works, read from the run records at the next quota line, so it writes only the `guard_would` and its notice (class `agents.spend_notice`, code `would_cool`). G2 leaves out a run that ends while the streak is open (#315): from its `would_cool` until a start on the provider works by the run's end, as act's cooldown lasts until a probe works (it does not end with the first backoff window).
+  - A reset group is read as an ISO time with a zone, `HH:MM` or `H[:MM]am|pm` with an optional zone (`Z`, `UTC`, `GMT`, an offset, or an IANA name), or `in <n> minutes|hours`. Quota patterns run in a vm that interrupts them after 50 ms (no match then), and a pattern slow on short lines is refused at load.
 
 **G2. Per-task no-result cap.** `agents.spend.guards.task_no_result_cap: { mode: off, max: 6, window_hours: 24 }`.
 
@@ -323,9 +338,11 @@ One deployment runs an interim `agents.failover.cooldown_minutes: 120` as a stop
   - A fill task gets the fill hold `no_result_cap`, its claim is released, and one `escalation` decision is raised per task and streak. The options are `start_again` (resets the count), `fresh_session` and `keep_parked`.
   - A module run (review, planner, verifier) ends its chain and is escalated once through the existing `escalate` path. Its module's own caps still apply.
 - **What doesn't count**, by D2's reasoning (the failure isn't the task's):
-  - runs that died while their provider was in a **fleet** outage or a fleet quota cooldown (decision D2), since G1 and the transient rule handle those. G1's observe-mode `would_cool` windows count as cooldowns here too;
+  - runs that died while their provider was in a **fleet** outage or a fleet quota cooldown (decision D2), since G1 and the transient rule handle those. G1's observe-mode streaks (from a `would_cool` until a start on the provider works) count as cooldowns here too;
   - runs with `lair_restart = 1` (`exit_unknown`, `lost`, `vars_lost`): Lair's own restart ended them;
-  - runs that ended `stopped`: an owner stop or a shutdown.
+  - runs that ended `stopped`: an owner stop or a shutdown;
+  - runs that ended `lost_claim` because their claim was released on request: by the owner (the Agents view or the API) or by a module stopping its own run (a review whose PR moved on, a supervisor turn). A claim another run took still counts.
+- **As built (PR 5).** The count is read from the run records of the task's chains, at the moment a failed run's chain would go on (a restart, a failover, a transient or never-started retry), so the run that just failed counts at once. A fleet outage is the provider's latest `transient` event by the run's end saying every agent waits; until G1 exists, the fleet cooldown is today's rate-limit and provider-error cooldown once two agents' failovers made it fleet-wide, and G1's quota cooldown (and its observe streaks) joins it with PR 4. The count starts over when the task's fill hold is released: `start_again` releases it, and so does a release in Work. A superseded run never ran, so it isn't counted.
 - On the data above, with `max: 6`, the 13 tasks that took 10 or more attempts would each have stopped at their sixth no-result run and asked once.
 
 **G3. Waiting agents woken only by the awaited event.** This extends `agents.fill.wake`.
@@ -346,7 +363,7 @@ One deployment runs an interim `agents.failover.cooldown_minutes: 120` as a stop
   - `resume`, the default, is today's behaviour.
   - `fresh` starts a fresh session with the hung-info block and a resume summary, so the stuck context isn't re-sent. It applies whenever it is set, in any mode, and is a change the owner makes on its own evidence.
 - `mode` governs only the park below.
-- The `max_per_task`-th hang of a task within the window, in any chain, **parks** it with the fill hold `hung_repeat` (or escalation for a module run) and one decision. Options: `fresh_session` (with the hung info), `keep_parked`, `release`. The task is not resumed again.
+- The `max_per_task`-th hang of a task within the window, in any chain, **parks** it with the fill hold `hung_repeat` (or escalation for a module run) and one decision. Options: `fresh_session` (with the hung info), `keep_parked`, `release`. The task is not resumed again. A hang after `fresh_session` or `release`, within the window, parks it again (the count doesn't start over). `first: fresh` turns a first hang's resume into a fresh session; when the chain's restarts are used up, it is escalated as today.
 - On the data above, with `max_per_task: 2`, the 59 repeat hangs (3,011 agent-minutes) would have been 26 parked tasks, each asked about once.
 
 **G5. Daily budget per project with an owner notice.** This reuses `agents.budgets` and adds no second budget system (`budgets.guard_mode`).
@@ -359,6 +376,10 @@ One deployment runs an interim `agents.failover.cooldown_minutes: 120` as a stop
 - **PR 1 makes more usage count toward the existing hard token and cost limits.** Today they count `usage_patterns` and attributed fleet-budget costs; once PR 1 records what adapters report, a limit may be reached that wasn't before, and it blocks as today. PR 1's docs say so, and AT-1 checks that a hard limit blocks whatever `guard_mode` says.
 - Only reported usage counts toward token and cost limits, because nothing is estimated (decision D3).
 - Recommended for the deployment above: `project: { daily_requests: { soft: <80 % of the provider's daily quota> } }`, plus `daily_cost` soft and hard limits at amounts the owner chooses for each paid provider.
+- **As built (PR 7).**
+  - Requests are the sum of `agents_spend.requests` (0 for a run whose adapter counts none) and minutes the sum of `runtime_s` / 60, over the runs that ended in the UTC period, for the project or one agent. A running run counts once it ends. A month that reaches back past `retention_days` reads its days before retention's cutoff from `agents_spend_daily`, with the same rule as the API's long window (a run before the cutoff is left out when its day has an aggregate).
+  - Each request or minute budget line carries its `guard` (the mode). Its hard limit holds runs (`budgetBlock`, the agent's `over_budget` state, the 403 on a request) only in `act`. In `act` the existing `budget_exceeded` event and `spend` decision follow, plus one `guard_did` (`verdict: "block"`). In `observe` there is one `guard_would` (`verdict: "would_block"`, the same subject and data) and one notice (code `would_block`). In `off` nothing is recorded. The subject is the scope (`project` or `agent:<id>`), and the streak is the scope, metric and period.
+  - The soft notice applies to every metric (tokens and cost too) while spend is on. With spend off, a soft limit stays an event only, so nothing new is shown. It is class `agents.spend_notice`, code `budget_soft`, key `budget_soft:<scope>:<metric>:<period>`. Both notices have ref `budget_notice:<metric>:<period>:<scope>` and are withdrawn once the period is over. The hard-limit `spend` decision keeps its behaviour: it is answered, not withdrawn.
 
 **G6. Planner guards: propose only what can apply.** These extend `planner:` with `guards`. Each of the four parts has its own mode. All four are cheap and deterministic: no model is called and no network is used.
 

@@ -4,7 +4,7 @@
  * the same setIn/getIn pattern as other Settings pages.
  */
 import { isPlainObject } from "../shared/settings-rules";
-import { setIn } from "./settings-form";
+import { getIn, setIn } from "./settings-form";
 
 /** A repository entry as the UI shows it. */
 export interface RepoRow {
@@ -53,21 +53,22 @@ export const MAX_REFS = 8;
 
 /** The repos: array from the draft, or [] if absent. */
 export function reposArrayOf(draft: Draft): unknown[] {
-  const repos = draft.repos;
+  const repos = getIn(draft, ["repos"]);
   return Array.isArray(repos) ? repos : [];
 }
 
 /** Whether the draft has an explicit repos: key. */
 export function hasReposKey(draft: Draft): boolean {
-  return "repos" in draft;
+  return getIn(draft, ["repos"]) !== undefined;
 }
 
 /** The legacy github: value, if set and repos: is absent. */
 export function legacyGithub(draft: Draft): string | null {
   if (hasReposKey(draft)) return null;
-  if (typeof draft.github === "string" && GITHUB_REPO.test(draft.github)) return draft.github;
-  const review = draft.review;
-  if (isPlainObject(review) && typeof review.repo === "string" && GITHUB_REPO.test(review.repo)) return review.repo;
+  const github = getIn(draft, ["github"]);
+  if (typeof github === "string" && GITHUB_REPO.test(github)) return github;
+  const reviewRepo = getIn(draft, ["review", "repo"]);
+  if (typeof reviewRepo === "string" && GITHUB_REPO.test(reviewRepo)) return reviewRepo;
   return null;
 }
 
@@ -174,12 +175,7 @@ export function removeRepo(draft: Draft, index: number): Draft {
   const updated = [...current];
   updated.splice(index, 1);
   // If the list is now empty, remove the repos key entirely
-  if (updated.length === 0) {
-    const next = { ...draft };
-    delete next.repos;
-    return next;
-  }
-  return setIn(draft, ["repos"], updated) as Draft;
+  return setIn(draft, ["repos"], updated.length === 0 ? undefined : updated) as Draft;
 }
 
 /** Migrate from legacy github:/review.repo to repos:[{repo, default: true}]. */

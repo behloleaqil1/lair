@@ -76,7 +76,8 @@ export type SpendUnit = "cost" | "requests" | "minutes" | "runs";
 
 /**
  * Spend summed over runs. `reported: false` when no run of them reported tokens and cost: both are null then ("not
- * reported"), never estimated. requests and turns are null when no run had them.
+ * reported"), never estimated. requests and turns are null when no run had them. `reportedRuns`: how many of the runs
+ * reported tokens and cost; fewer than `runs` (and more than 0) means tokens and cost cover only those runs.
  */
 export interface SpendTotalsView {
   runs: number;
@@ -86,6 +87,7 @@ export interface SpendTotalsView {
   tokens: number | null;
   cost: number | null;
   reported: boolean;
+  reportedRuns: number;
 }
 
 /** (idle + no_result) / (productive + idle + no_result), per unit; null where the unit has nothing */
@@ -104,6 +106,8 @@ export interface SpendGroupView {
   productive: SpendTotalsView;
   idle: SpendTotalsView;
   noResult: SpendTotalsView;
+  /** Runs with no class yet: in the totals, in no waste share */
+  unclassified: SpendTotalsView;
   waste: SpendWasteShare;
   reloads: number;
   lairRestarts: number;
@@ -307,6 +311,10 @@ export type AgentEventKind =
   | "fill_unmatched"
   | "transient"
   | "transient_cleared"
+  /** A provider's fleet quota cooldown (G1 act): its state, kept on each event, so the newest one says where it stands */
+  | "quota"
+  /** A start on a provider in a quota cooldown worked, or the owner chose "Try now": the cooldown is over */
+  | "quota_cleared"
   | "run_adopted"
   | "run_lost"
   | "stopped_for_shutdown"
@@ -336,7 +344,19 @@ export interface AgentEventView {
   at: string;
 }
 
-export type BudgetMetric = "daily_tokens" | "daily_cost" | "monthly_tokens" | "monthly_cost";
+/**
+ * Token and cost limits count the agents ledger. Request and minute limits (AI spend G5, docs/design/ai-spend.md
+ * §4.5) count the spend records of ended runs, for adapters that report no tokens
+ */
+export type BudgetMetric =
+  | "daily_tokens"
+  | "daily_cost"
+  | "monthly_tokens"
+  | "monthly_cost"
+  | "daily_requests"
+  | "daily_minutes"
+  | "monthly_requests"
+  | "monthly_minutes";
 
 export interface BudgetLine {
   metric: BudgetMetric;
@@ -346,13 +366,18 @@ export interface BudgetLine {
   soft?: number;
   hard?: number;
   level: "ok" | "soft" | "hard";
+  /**
+   * A request or minute line's budgets.guard_mode (G5): its hard limit holds new runs only in `act`; `observe` records
+   * what it would hold, `off` nothing. Unset on token and cost lines, whose hard limits always hold new runs
+   */
+  guard?: "off" | "observe" | "act";
 }
 
 export interface BudgetScopeView {
   scope: "project" | "agent";
   agent?: string;
   lines: BudgetLine[];
-  /** A hard limit is reached: no new runs */
+  /** A hard limit that holds new runs is reached: no new runs */
   blocked: boolean;
 }
 
@@ -414,6 +439,11 @@ export interface AgentsStatusView {
   fill?: FillStatusView;
   /** Providers Lair holds new starts on: their runs died of transient errors (agents.transient_patterns) */
   unreachable?: ProviderUnreachableView[];
+  /**
+   * agents.spend.enabled (docs/design/ai-spend.md §4.4): Home's AI spend panel and an agent's Spend line show only
+   * while it is on. Their data comes from the owner-only GET /api/agents/spend; this says only whether there is any
+   */
+  spendEnabled?: boolean;
 }
 
 /**
@@ -473,9 +503,11 @@ export type FillLineState = "started" | "done" | "held" | "claimed" | "not_allow
  *   prompt file), refused (the run request, or done_pattern)
  * - conflict: a live process this server has no run for holds one of the task's run prompt files on its
  *   command line (a run of the task it doesn't know): fill starts the task once that process has ended
+ * - no_result_cap, hung_repeat: an AI spend guard in act mode parked it (docs/design/ai-spend.md G2, G4): its no-result
+ *   runs, or its hangs, reached the guard's limit within its window, in any chain; one decision asks what next
  * - paused: you chose to leave it ("Keep it paused" on its decision, or "Leave the task unclaimed" on
  *   its run's escalation): nothing waits for you, and fill starts it again once you release it
- * owner, no_done, blocked, waiting, waited_too_long and paused are the owner's to release (POST
+ * owner, no_done, blocked, waiting, waited_too_long, no_result_cap, hung_repeat and paused are the owner's to release (POST
  * /api/agents/fill/release, or the decision); a waiting one also ends by itself.
  * owner, no_done, blocked, waited_too_long and refused need the owner (FILL_OWNER_HOLDS): each has
  * exactly one open Decision Inbox item while it lasts (`decisionId`).
@@ -499,7 +531,9 @@ export type FillHold =
   | "conflict"
   | "prompt"
   | "refused"
-  | "report_refused";
+  | "report_refused"
+  | "no_result_cap"
+  | "hung_repeat";
 
 export interface FillLineView {
   /** 1-based line number in tasks_file */
@@ -527,7 +561,7 @@ export interface FillLineView {
 }
 
 /** The holds that need the owner: each has exactly one open decision while it lasts. */
-export const FILL_OWNER_HOLDS: readonly FillHold[] = ["owner", "no_done", "blocked", "waited_too_long", "refused"];
+export const FILL_OWNER_HOLDS: readonly FillHold[] = ["owner", "no_done", "blocked", "waited_too_long", "refused", "no_result_cap", "hung_repeat"];
 
 export interface FillWaitingView {
   /** What the WAITING line named (a gate id, say), when the pattern captures it */
