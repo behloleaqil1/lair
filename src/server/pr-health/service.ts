@@ -95,16 +95,18 @@ export class PrHealth {
     this.log = options.log ?? console;
     this.now = options.now ?? (() => Date.now());
     this.firstTickMs = options.firstTickMs ?? 1000;
-    const send = options.fetch ?? ((url, init) => fetch(url, init));
+    const baseFetch: FetchLike = options.fetch ?? ((url, init) => fetch(url, init));
+    const timeoutMs = this.settings.requestTimeoutSeconds * 1000;
     this.hosts = new RepoHosts({
       repos: this.settings.repos,
       apiUrl: this.settings.apiUrl,
       token: tokenFrom(this.settings.tokenEnv, this.settings.tokenCmd, options.env ?? process.env),
       fetch: async (url, init) => {
         this.spend();
-        return send(url, init);
+        // The host passes its own timeout signal; a request without one still ends at the request timeout
+        return baseFetch(url, { ...init, signal: init?.signal ?? AbortSignal.timeout(timeoutMs) });
       },
-      timeoutMs: this.settings.requestTimeoutSeconds * 1000,
+      timeoutMs,
       now: this.now,
     });
     for (const entry of this.settings.repos) {
