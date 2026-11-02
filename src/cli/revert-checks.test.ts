@@ -318,7 +318,7 @@ function write(rel: string, text: string): void {
 
 function commit(message: string): void {
   sh(repo, "git", ["add", "-A"]);
-  sh(repo, "git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-q", "-m", message]);
+  sh(repo, "git", ["-c", "user.name=user", "-c", "user.email=user@example.com", "-c", "commit.gpgsign=false", "commit", "-q", "-m", message]);
 }
 
 function childEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
