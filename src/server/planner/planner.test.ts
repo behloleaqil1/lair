@@ -93,6 +93,8 @@ describe("the deterministic part", () => {
     });
     let state: "failure" | "success" = "failure";
     h.agents.useReadyFacts(() => ({
+      repos: [{ repo: "example/demo", default: true, base: null, ciCounts: true, refs: [] }],
+      legacy: true,
       facts: async () => ({
         state: "open",
         headSha: "abc1234def5678",

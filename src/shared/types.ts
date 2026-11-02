@@ -132,6 +132,13 @@ export interface ProjectConfig {
    */
   tracker?: Record<string, unknown>;
   /**
+   * The project's repositories (src/server/repos/): each one's base branch,
+   * whether its hosted CI counts and its short names in task text. Read by
+   * the ready guard. Validated by parseReposConfig; see
+   * docs/configuration.md#repositories
+   */
+  repos?: unknown;
+  /**
    * Lessons: what Lair has learned from incidents (src/server/lessons/).
    * Validated by parseLessonsConfig; see docs/configuration.md#lessons
    */

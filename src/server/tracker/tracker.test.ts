@@ -491,14 +491,14 @@ describe("text sent to GitHub is redacted by default (F4)", () => {
       gh,
       env: { GITHUB_TOKEN: TOKEN, DEPLOY_SECRET: secret },
       tracker: { create_issues_for_new_tasks: true, redact_patterns: ["project-bluebird"] },
-      tasks: [`worker-a|Alice|feat-login|Fix /Users/someone/src/app.ts for project-bluebird; key ${ghToken} ${secret}, mail dev@example.com at 10.0.0.12`],
+      tasks: [`worker-a|Alice|feat-login|Fix /Users/user/src/app.ts for project-bluebird; key ${ghToken} ${secret}, mail dev@example.com at 10.0.0.12`],
     });
     const [issue] = gh.issues("acme/web");
     expect(issue).toBeDefined();
-    await h.emit("planner.blocked", plannerBlocked("feat-login", "environment", "needs /home/someone/.ssh/id_rsa and sk-ant-abcdefghijklmnopqrstuvwx"));
+    await h.emit("planner.blocked", plannerBlocked("feat-login", "environment", "needs /home/user/.ssh/id_rsa and sk-ant-abcdefghijklmnopqrstuvwx"));
     expect(issue.comments).toHaveLength(1);
     const sent = [issue.title, issue.body, ...issue.comments].join("\n");
-    for (const leak of ["/Users/someone", "/home/someone", ghToken, secret, "dev@example.com", "10.0.0.12", "project-bluebird", "sk-ant-"]) {
+    for (const leak of ["/Users/user", "/home/user", ghToken, secret, "dev@example.com", "10.0.0.12", "project-bluebird", "sk-ant-"]) {
       expect(sent, leak).not.toContain(leak);
     }
     expect(issue.title).toBe("feat-login: Fix [path] for [redacted]; key [redacted token] [redacted], mail [email] at [address]");
