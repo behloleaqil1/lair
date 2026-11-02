@@ -1058,12 +1058,14 @@ export class PlannerService {
     // G6 handled_messages: a handled owner message is left out
     const messages = this.openMessages();
     const blocked = this.blockedViews().filter((b) => !b.task.startsWith("?"));
-    // G6 skip_unchanged: the inputs of the last finished run that gave nothing applicable
+    // G6 skip_unchanged: the inputs of the last finished run that gave nothing applicable. A run the owner asked for
+    // ("Let the planner try again": an owner_retry trigger) is never skipped, in act or observe: that answer resets
+    // the task's attempts and the owner's keep, which decide what is refused but are no input of the hash
     let hash: string | null = null;
     let unchanged: StoredRun | null = null;
     if (guards.skipUnchanged.mode !== "off") {
       hash = inputsHash({ tasksText: doc.text, openTasks, messages, blocked, closed, allowlist: this.settings.allowlist, idle: this.idle });
-      unchanged = this.unchangedRun(hash, now);
+      unchanged = triggers.some((t) => t.kind === "owner_retry") ? null : this.unchangedRun(hash, now);
       if (unchanged && guards.skipUnchanged.mode === "act") return this.skipRun(hash, unchanged, pending, now);
     }
     const id = randomUUID();

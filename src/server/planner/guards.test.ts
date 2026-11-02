@@ -505,6 +505,57 @@ describe("G6 skip_unchanged: a run on the same inputs as one that gave nothing a
     expect(h2.service.runs()[0].triggers.map((t) => t.kind)).toEqual(["owner_message"]);
   });
 
+  /**
+   * R1 for a blocked task's one planner attempt (attempts_per_task 1): its unblock is refused, the attempt being
+   * spent. The task reports BLOCKED again with the same reason, so every input of the hash is R1's, and the owner
+   * answers the attempts decision with "Let the planner try again".
+   */
+  async function ownerRetry(mode: "act" | "observe") {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-cart|Cart");
+    const h = await boot(p, { skip_unchanged: { mode, max_skip_hours: 24 } }, {}, undefined, { attempts_per_task: 1 });
+    await h.service.cycle();
+    queue(p, "- BLOCKED feat-cart by worker-a 12:01Z: the scope is unclear");
+    await h.service.cycle();
+    at(h, 2 * MIN);
+    await h.service.cycle();
+    await runPlannerAgent(h, (c) => writeProposals(c, { proposals: [{ op: "unblock", task: "feat-cart", reason: "the plan settles the scope" }] }));
+    await h.service.cycle();
+    const r1 = h.service.runs()[0];
+    expect(r1).toMatchObject({ state: "done", rejected: 1, applied: 0, pending: 0 });
+    expect(h.service.proposals()[0].refusal).toContain("the planner's attempts on task feat-cart are spent");
+
+    queue(p, "- BLOCKED feat-cart by worker-a 12:20Z: the scope is unclear");
+    at(h, 20 * MIN);
+    await h.service.cycle();
+    const decision = h.inbox.list({ project: "demo", status: "open" }).find((d) => d.key === "attempts:feat-cart");
+    expect(await h.answer(decision?.id ?? "", "retry")).toBe(200);
+    at(h, 20 * MIN + 31 * SEC);
+    await h.service.cycle();
+    return { h, r1 };
+  }
+
+  it("act: the owner's 'Let the planner try again' starts a run on R1's inputs; its unblock then goes on", async () => {
+    const { h, r1 } = await ownerRetry("act");
+    expect(h.bus.filter((e) => e.type === "planner.skipped")).toEqual([]);
+    expect(events(h, "guard_did", "planner_skip_unchanged")).toEqual([]);
+    const runs = h.service.runs();
+    expect(runs).toHaveLength(2);
+    expect(runs[1].id).toBe(r1.id);
+    expect(runs[0].triggers.map((t) => [t.kind, t.task])).toEqual([["owner_retry", "feat-cart"]]);
+    await runPlannerAgent(h, (c) => writeProposals(c, { proposals: [{ op: "unblock", task: "feat-cart", reason: "the plan settles the scope" }] }));
+    await h.service.cycle();
+    // The owner reset the attempts: the unblock is no longer refused (approval.unblock waits for the owner)
+    expect(h.service.proposals().filter((x) => x.status === "pending").map((x) => [x.op, x.task])).toEqual([["unblock", "feat-cart"]]);
+  });
+
+  it("observe: a run the owner asked for is no would-be skip either", async () => {
+    const { h } = await ownerRetry("observe");
+    expect(h.service.runs()).toHaveLength(2);
+    expect(events(h, "guard_would", "planner_skip_unchanged")).toEqual([]);
+    expect(notices(h)).toEqual([]);
+  });
+
   it("AT-28 observe: the run starts as today; one guard_would naming the earlier run, and one notice", async () => {
     const { p, h, r1 } = await firstRun("observe");
     await sameInputsTrigger(h, p, 20 * MIN, "tidied up");
