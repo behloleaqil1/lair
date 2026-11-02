@@ -15,6 +15,7 @@ export type Channel =
   | "gates" // All gate updates (queue + results)
   | "machines" // Machine health changes
   | "orchestrator" // Orchestrator tick events
+  | "bus" // The fleet bus's reports, message states and claims (src/server/bus/live.ts; metadata only)
   | `logs:${string}`; // Live log streaming for a specific dragon (logs:kiro-A)
 
 // Client → Server message types
@@ -257,6 +258,7 @@ export class LairWebSocketServer {
       "gates",
       "machines",
       "orchestrator",
+      "bus",
       "logs:",
     ];
     return validPrefixes.some(
