@@ -45,7 +45,7 @@ import { existsSync, readFileSync } from "fs";
 import { randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 import type { ProjectConfig } from "../../shared/types.js";
-import type { AgentRunView } from "../../shared/agents-types.js";
+import type { AgentRunView, RunOrigin } from "../../shared/agents-types.js";
 import type { Decision } from "../../shared/decision-types.js";
 import type {
   ChatStatusView,
@@ -148,9 +148,11 @@ export class ChatError extends Error {
 
 /** What the chat needs from the agents module (AgentsManager has it). */
 export interface ChatAgents {
+  /** `origin` supervisor, kept on the run for its AI spend record */
   requestRun(
     project: string,
     input: { agent: string; task: string; prompt: string; variables: Record<string, string>; ownPrompt?: boolean },
+    options?: { origin?: RunOrigin },
   ): Promise<AgentRunView>;
   getStore(): {
     getRun(id: string): AgentRun | null;
@@ -371,7 +373,7 @@ export class SupervisorChat {
         },
         // The supervisor's prompt is the whole task: not the builders' default_instructions before it
         ownPrompt: true,
-      });
+      }, { origin: "supervisor" });
     } catch (e) {
       this.o.tokens.revoke(minted.info.id);
       if (runFolder) await cleanupRunFolder(runFolder);

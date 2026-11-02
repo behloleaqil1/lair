@@ -682,6 +682,13 @@ export const ASYNC_ONLY_MODULES: readonly string[] = [
   "watchdog/executors.ts",
   "agents/fill.ts",
   "agents/service.ts",
+  // The work store: its follower runs on a timer and its routes on requests
+  "work/config.ts",
+  "work/follow.ts",
+  "work/importer.ts",
+  "work/manager.ts",
+  "work/routes.ts",
+  "work/store.ts",
 ];
 
 /**

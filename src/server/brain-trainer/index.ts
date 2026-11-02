@@ -10,7 +10,7 @@ import type { HumanAuth } from "../human-auth/index.js";
 import type { ServerConfigFileOptions } from "../restart/server-config.js";
 import { DockerTrainerContainer, type TrainerContainer } from "./container.js";
 import { registerBrainTrainerRoutes } from "./routes.js";
-import { BrainTrainer, type Timers } from "./service.js";
+import { BrainTrainer, type BrainCallRecorder, type Timers } from "./service.js";
 import type { DecisionReader } from "./shadow.js";
 
 export { BrainTrainer } from "./service.js";
@@ -30,6 +30,8 @@ export interface MountBrainTrainerOptions {
   timers?: Timers;
   fileOptions?: ServerConfigFileOptions;
   log?: (line: string) => void;
+  /** Counts each shadow proposal as a model call of its project (the agents module's AI spend) */
+  recordCall?: BrainCallRecorder;
 }
 
 export async function mountBrainTrainer(fastify: FastifyInstance, options: MountBrainTrainerOptions): Promise<BrainTrainer> {

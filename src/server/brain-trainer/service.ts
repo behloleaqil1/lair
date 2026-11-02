@@ -45,7 +45,15 @@ export interface BrainTrainerOptions {
   timers?: Timers;
   fileOptions?: ServerConfigFileOptions;
   log?: (line: string) => void;
+  /**
+   * Counts each shadow proposal as one model call of the project (the agents module's AI spend, while its
+   * agents.spend is on): a local classifier, so 0 tokens and 0 cost. Never throws.
+   */
+  recordCall?: BrainCallRecorder;
 }
+
+/** The agents module's spend.recordCall, as the brain uses it */
+export type BrainCallRecorder = (project: string, call: { module: string; provider: string; tokens: number; cost: number }) => unknown;
 
 export interface BrainTrainerStatus {
   enabled: boolean;
@@ -205,10 +213,20 @@ export class BrainTrainer {
     this.cancelTimer = null;
   }
 
-  /** decision.raised: the best model writes its proposal into the trace (when shadow is on). */
+  /**
+   * decision.raised: the best model writes its proposal into the trace (when shadow is on). Each proposal is one
+   * model call of the decision's project for its AI spend (a local classifier: no tokens, no cost).
+   */
   onRaised(data: Record<string, unknown>): void {
     const s = this.settings().settings;
-    if (s.enabled && s.shadow) this.shadow.onRaised(data);
+    if (!s.enabled || !s.shadow) return;
+    const proposal = this.shadow.onRaised(data);
+    if (!proposal || typeof data.project !== "string" || !this.options.recordCall) return;
+    try {
+      this.options.recordCall(data.project, { module: "brain", provider: "local", tokens: 0, cost: 0 });
+    } catch (e) {
+      this.log(`brain trainer: the call was not counted: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   subscribe(events: EventBus = this.options.events): () => void {

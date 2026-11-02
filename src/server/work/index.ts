@@ -1,6 +1,6 @@
 /**
  * The work store (docs/design/work-store.md): tasks and their events in Lair's database, per project, behind
- * `work_store.mode: off | observe` (off by default).
+ * `work_store.mode: off | observe` (off by default) and `work_store.files: follow`.
  */
 export { parseWorkStoreConfig, WORK_MODES } from "./config.js";
 export type { WorkMode, WorkSettings } from "./config.js";

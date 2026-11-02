@@ -322,7 +322,7 @@ export class AgentReviewAssigner implements ReviewAssigner {
           variables: this.variables(record.project, token),
           // The review prompt is the whole task: the builders' default_instructions don't go before it
           ownPrompt: true,
-        });
+        }, { origin: "review" });
         record.state = "assigned";
         record.agent = candidate.id;
         record.runId = run.id;

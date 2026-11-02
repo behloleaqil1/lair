@@ -345,6 +345,19 @@ export class BusStore {
     return map;
   }
 
+  /** The reports after `afterId`, oldest first, at most `limit` (the work store's consumer reads them by id). */
+  reportsAfter(afterId: number, limit: number): BusReport[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM bus_reports WHERE project = ? AND id > ? ORDER BY id LIMIT ?`)
+      .all(this.project, afterId, limit) as ReportRow[];
+    return rows.map(toReport);
+  }
+
+  /** The newest report's id, 0 when there is none (the file is this project's alone: a lookup, not a scan). */
+  lastReportId(): number {
+    return (this.db.prepare(`SELECT MAX(id) AS id FROM bus_reports`).get() as { id: number | null }).id ?? 0;
+  }
+
   /** The project's reports with these ids (an id it doesn't have is left out), read 500 at a time. */
   getReports(ids: number[]): BusReport[] {
     const out: BusReport[] = [];

@@ -396,6 +396,8 @@ An adapter (a preset, or one of your `agent_adapters`) may set these keys:
 | `login_hint` | string | What you run in a terminal to sign in, shown as the fix. Lair never runs it |
 | `version_cmd` | array | Prints the tool's version: an argv |
 | `experimental` | boolean | Shown as experimental |
+| `usage_parser` | `claude-stream-json` \| `claude-json` \| `request-lines` \| `patterns` \| `none` | How an ended run's usage is read from its log, with [AI spend](#ai-spend) on. Unset: `patterns` when `agents.usage_patterns` is set, else the built-in default (`request-lines` for an adapter with the id `kiro`, built in or your own), else `none`. An adapter of another id that wraps a CLI (a start script, say) sets `usage_parser` and, for `request-lines`, `request_pattern` itself. Use `claude-stream-json` with a Claude Code start command that has `--output-format stream-json --verbose` |
+| `request_pattern` | string | With `request-lines`: a regular expression (case-sensitive, at most 500 characters, tested line by line) for one model request; one that takes over 100 ms on a short line (nested quantifiers) is refused at load. The `kiro` default is `GenerateAssistantResponseCommand done totalEvents=\d+`, the CLI's line for each finished request |
 
 These commands are run as written: argv arrays, never through a shell, with no `{placeholder}` and a program that doesn't start with `-` (a config error otherwise). Each runs with at most 256 KiB of output and a timeout (5 seconds for a sign-in check, 15 for the others), in the environment an agent of the project gets (`PATH`, `HOME` and the like, plus `agents.env_passthrough`), never the rest of Lair's. Lair never reads a tool's token files: the tool's own check answers. A check's answer is:
 
@@ -1697,7 +1699,20 @@ A run is requested for an agent (a `dragons:` entry or a `dragons.txt` line) and
   - when a fleet outage has lasted `transient_max_minutes` with runs waiting on it, Lair raises **one** decision for the project, per provider and outage, never one per agent or task: "Keep waiting" (recommended) or "Try now", which lets every waiting run start on the next check. While it is open nothing more is raised. After "Keep waiting", Lair asks again once the outage has lasted another `transient_max_minutes`.
 
   The defaults look for an error, not a word alone, because an agent's own output (its tests, say) is in the same log: `expected 503 to equal 200` or a word like `TRANSIENT` in prose is not an outage. Tune them to your agent CLIs' output.
-- **Budgets.** Token and cost limits per UTC day and month, for the project (`budgets.project`) and for each agent (`budgets.agent`, overridden per metric by `budgets.per_agent.<id>`). Usage comes from the fleet budget: every cost recorded there with a project (and agent) is counted, including the usage Lair reads from run logs with `usage_patterns` (named groups `tokens` and `cost`, each match adds), which it records through the fleet budget. A soft limit is a `budget_warning`, once per period. A hard limit stops new runs and restarts for that scope (running agents continue) and raises a `spend` decision, once per period. **These budgets are advisory** while usage comes from run logs: the agent writes that text, so it can under-report (amounts are never counted below zero). They become reliable once providers or adapters report usage to the fleet budget themselves; keep a spending limit at the provider too.
+- **Budgets.** Token and cost limits per UTC day and month, for the project (`budgets.project`) and for each agent (`budgets.agent`, overridden per metric by `budgets.per_agent.<id>`). Usage comes from the agents ledger: every cost the fleet budget records with a project (and agent), the usage Lair reads from run logs with `usage_patterns` (named groups `tokens` and `cost`, each match adds), and, with [AI spend](#ai-spend) on, the usage each ended run's adapter reports. A soft limit is a `budget_warning`, once per period. A hard limit stops new runs and restarts for that scope (running agents continue) and raises a `spend` decision, once per period. `budgets.guard_mode` doesn't change that: it is the mode of the request and minute limits AI spend adds (a later part).
+
+  **With AI spend on, more usage counts.** Before it, a hard limit counted only `usage_patterns` and what the fleet budget recorded with a project; with `agents.spend.enabled` and an adapter that reports usage (`usage_parser`), every such run's tokens and cost count too, so a limit that was never reached may now be, and block. Check your limits before you turn spend on. **These budgets are advisory** while usage comes from run logs: the agent writes that text, so it can under-report (amounts are never counted below zero, and a run's reported usage over 10,000,000,000 tokens or 100,000 in cost is refused). Keep a spending limit at the provider too.
+- <a id="ai-spend"></a>**AI spend (measure).** Off by default (`spend.enabled: false`); off, nothing below is read, written or shown. With it on, every run that ends gets one record in `data/agents.db` (`agents_spend`): its agent, task, chain, origin, adapter, provider and model, its start, end and runtime, how it ended, whether it restarted a failed run (`reload`) or was ended by a Lair restart (`lair_restart`), the size of its prompt file (`context_bytes`, never the text), and the usage its adapter reports. The usage is read from the run's log once its process is gone, by its adapter's `usage_parser` ([Agent adapters](#agent-adapters)):
+  - `claude-stream-json` (or `claude-json`): the CLI's `result` events. One process can write several (each `usage` counts only since the previous one), so tokens and cost are the last event's totals (`modelUsage`, `total_cost_usd`) and turns are summed. An `assistant` event's own `usage` is never counted;
+  - `request-lines`: the lines matching the adapter's `request_pattern`, one per model request. Tokens and cost show as not reported: **Lair never estimates them** from requests or runtime;
+  - `patterns`: `usage_patterns`, read while the run works (the record takes the run's total from the ledger);
+  - `none`: tokens and cost not reported; runtime and prompt size are still recorded.
+
+  The tokens a run adds to the ledger (what `daily_tokens` and `monthly_tokens` count) are its input, cache-write and output tokens: cache reads are kept in the record only, as they are billed at a fraction of the input price and would swamp a token budget. The cost is all the CLI reports. Each run's record and its ledger usage are written in one transaction keyed by the run, once, also across a restart. The log is read with asynchronous reads only, at most 4 MB per check (a bigger log over several checks, up to 256 MB), lines over 1 MB are never parsed, and a `request_pattern` that takes over 250 ms on part of a log is stopped (at most 300 ms of pattern time per check). A run's usage that can't be read or is refused (over the cap, its result line unreadable, its log gone) is recorded as not reported, with a `usage_refused` event that says why; measuring never fails or delays a run.
+
+  The run's class (`productive`, `idle`, `no_result`, with a reason) is recorded for what the end and the run's own queue line tell (a failed end, a DONE, READY or BLOCKED line, a builder run with no line); the rest is `unclassified` for now. Runs requested by the review module, the planner and its verifier, the supervisor, and the owner (`POST /api/agents/runs`) carry that origin. A model call a module makes without an agent run is one ledger row too (reason `call:<module>`): the brain's shadow proposals count as such calls, with 0 tokens. The API and the dashboard panel for these records, the daily summary and the guards come later ([design](design/ai-spend.md)).
+
+  A guard's mode other than `off` (`failover.quota.mode`, `recovery.hung_repeat.mode`, `fill.wake.events.mode`, `spend.guards.*.mode`) and a `daily_requests`, `daily_minutes`, `monthly_requests` or `monthly_minutes` limit need `spend.enabled: true`: their verdicts and counts come from the spend records, so without it the config is refused, naming both keys. `budgets.guard_mode` is accepted without it.
 - **Decisions.** They go to the [Decision Inbox](#decision-inbox) as module `agents`, and the owner's answer is carried out:
   - an escalated task (`escalation`, one per escalation of a task): `fresh_session` starts it again in a fresh session (if that fails too, Lair asks again), `release` leaves it unclaimed;
   - every profile failing (`escalation`, once per task): `wait` keeps it waiting for the cooldown, `stop` ends the waiting run and frees the task;
@@ -1747,6 +1762,8 @@ agents:
     agent: { daily_cost: { soft: 15, hard: 20 } }
     per_agent:
       worker-a: { daily_tokens: { hard: 2000000 } }
+  spend:
+    enabled: true                 # one record per ended run, with the usage its adapter reports
 ```
 
 ### Agents options
@@ -1785,13 +1802,15 @@ agents:
 | `providers` | map | `{}` | Adapter id -> provider name, for cooldowns and the fleet budget |
 | `usage_patterns` | array | `[]` | Regular expressions with `(?<tokens>...)` and/or `(?<cost>...)`, read from run logs |
 | `budgets.project`, `budgets.agent`, `budgets.per_agent.<id>` | map | — | `daily_tokens`, `daily_cost`, `monthly_tokens`, `monthly_cost`, each `{soft, hard}` |
+| `budgets.guard_mode` | `off` \| `observe` \| `act` | `observe` | The mode of the request and minute limits AI spend adds (a later part). Token and cost hard limits block whatever it says |
+| `spend.enabled` | boolean | `false` | [AI spend](#ai-spend): one record per ended run, with the usage its adapter reports (`agent_adapters.<id>.usage_parser`) |
 | `fill` | map | off | Start runs from a task list: see [Fill](#fill) |
 
 The default patterns look for an error, not the words alone, so an agent writing about rate limiting in its own work doesn't trigger a failover: a rate limit is `rate limit ... exceeded|reached|error|retry`, `exceeded|reached|hit ... rate limit`, `error|status|http 429`, `429 too many requests`, `quota exceeded|exhausted` or `usage limit reached|exceeded`; a provider error is `overloaded_error`, `model is overloaded|unavailable`, `api error ... 5xx` or `status|http 500|502|503|504|529`. Tune them to your adapters' output.
 
 The default `transient_patterns` look for an error too: `"retryErrorType":"TRANSIENT"`, `ClientNetworkError`, `network error occurred`, `error ... ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN`, `getaddrinfo EAI_AGAIN|ENOTFOUND`, `error ... connection refused|reset`, `status|http 502|503`, `502 bad gateway` and `503 service unavailable`. They are checked before failover's patterns, so a 502 or 503 doesn't count as a failover: the provider is passed over, and a fallback on another provider takes the task when there is one. Setting `transient_patterns` replaces them all; `[]` turns the rule off.
 
-Unknown keys, invalid regular expressions, more than 50 `transient_patterns` or one longer than 300 characters, a `transient_max_retries` outside 0 to 50, a usage pattern without a named group, a fallback naming an unknown adapter, a `LAIR_*` name in `env_passthrough`, a soft limit above its hard limit, or a `fill` block that is enabled but incomplete (see below) are config errors: the project's agents module doesn't start, and `GET /api/agents/status` shows the errors. Lair reads the config at startup.
+Unknown keys, invalid regular expressions, more than 50 `transient_patterns` or one longer than 300 characters, a `transient_max_retries` outside 0 to 50, a usage pattern without a named group, a fallback naming an unknown adapter, a `LAIR_*` name in `env_passthrough`, a soft limit above its hard limit, an adapter's bad `usage_parser` or `request_pattern` (or an `estimate` key), a guard or a request or minute limit without `spend.enabled`, or a `fill` block that is enabled but incomplete (see below) are config errors: the project's agents module doesn't start, and `GET /api/agents/status` shows the errors. Lair reads the config at startup.
 
 ### Fill
 
@@ -3368,28 +3387,48 @@ default; a project opts in, and moves one step at a time.
 
 ```yaml
 work_store:
-  mode: off  # off | observe
+  mode: off      # off | observe
+  files: follow  # follow
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `work_store.mode` | `off` \| `observe` | `off` | `off`: today's files exactly; no store file is created and every `/api/work` route answers 404 for the project. `observe`: the project's store (`data/work/<project>.db`) follows the files one way when you import; fill, the planner and the tracker still read the files |
+| `work_store.mode` | `off` \| `observe` | `off` | `off`: today's files exactly; no store file is created; `GET /api/work/status` reports `off`, and every other `/api/work` read and the import answer 404 for the project. `observe`: the project's store (`data/work/<project>.db`) follows the files one way (below); fill, the planner and the tracker still read the files, and nothing else reads the store |
+| `work_store.files` | `follow` | `follow` | How the files relate to the store: `follow` keeps the store in step with them, one way (the store never writes a project file). `mirror` and `none` come in a later version |
 
 An unknown key under `work_store:` or another value is a config error (the live reload keeps the previous config, and
-the store stays off). `on`, where fill reads the store, comes in a later version.
+the store stays off). `on`, where fill reads the store, comes in a later version. In `observe` the store is opened, and
+`data/work/<project>.db` created, by the follower's first step (at start, or within 15 s of switching to `observe`), a status
+read or an import, whichever comes first.
 
 **Import.** `POST /api/work/import?project=<name>` with `{"dry_run": true}` (the default) reports what it would change
 and writes nothing; `{"dry_run": false}` applies it in one transaction, with your session as the actor on every event.
 It reads only the configured files, `agents.fill.tasks_file` and `queue_file`, with fill's own parser and checks: an
 open line is `ready`; a `DONE` line fill accepts makes it `done` (a `DONE` the ready guard refuses does not); its
 latest run's last `WAITING` or `BLOCKED` line makes it `waiting` or `blocked`; a done line (the planner's
-`done_marker`) is `done`; a task imported before and gone from the file is `dropped`. A task a run or claim holds stays
-`ready` and is shown `assigned` or `running`. Running the import again changes only what differs; an unreadable tasks
-file imports and drops nothing; a line fill refuses is a warning, and the task ids on it are never dropped.
+`done_marker`) is `done`; a task imported before and gone from the file is `dropped`. A task a run or claim holds keeps
+its state (a new one is `ready`) and is shown `assigned` or `running`. Fill's holds (a decision, a pause, a refusal)
+are not a state of the store. Running the import again changes only what differs; an unreadable tasks file imports and
+drops nothing; a line fill refuses is a warning, and the task ids on it are never dropped. Only tasks an import made
+follow the files: one the planner or you made is never changed by them (the import lists it under `skipped`).
 
-**Reads.** `GET /api/work/status?project=<name>` (the mode, the schema version, tasks by state, the last import),
-`GET /api/work/tasks?project=<name>&state=&agent=&limit=` and `GET /api/work/task?project=<name>&id=<task>` (one task
-and its newest events). Every `/api/work` route needs the owner's session, reads included.
+**Following (`files: follow`).** Your first applied import adopts the store; from then on it follows by itself, and a
+dry run before that adopts nothing. Every 15 s, and at once on a bus report or a run's start, end or released claim:
+the store applies the bus reports and run facts that came since its last ones, each once, also across a restart
+(`WAITING`, `BLOCKED` and an accepted `DONE` set the state; `PROGRESS`, `TICK`, a refused `DONE`, a run's end and a
+released claim are recorded on the task only; a live run's start shows a waiting or blocked task running again); then it
+looks at the two files' size and time, and imports again only when one changed (the follower is the actor). A step that
+fails or takes longer than 60 s is shown as a failure in the status and backs off (doubling, up to 10 minutes); a ready
+guard that fails on a `DONE` is such a failure (the report is read again, never taken as refused). The store asks fill's
+ready guard for its verdict only: it writes no event in the agents store. The status's `applied` counts the facts
+recorded on a task (a `PROGRESS` too), `skipped` those for tasks the store does not have or already recorded. Do not `VACUUM`
+`data/agents.db` while a project follows (the store reads its events by row).
+
+**Reads.** `GET /api/work/status?project=<name>` (the mode, the schema version, tasks by state, the last import, whether
+the store is adopted and its cursors, the follower's checks, reads and failures, and a comparison with fill's view at
+its last check: the tasks the two disagree on, fill's holds left out), `GET /api/work/tasks?project=<name>&state=&agent=&limit=`
+and `GET /api/work/task?project=<name>&id=<task>` (one task and its newest events). Every `/api/work` route needs the
+owner's session, reads included.
 
 ## Lessons
 

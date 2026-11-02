@@ -9,6 +9,11 @@ import { isValidDragonId } from "../parsers/dragon-config.js";
 import { attributedAgent } from "../parsers/queue.js";
 import { getAdapter } from "../services/adapters.js";
 import { placeholdersIn } from "../watchdog/config.js";
+import { guardsNeedSpendErrors, resolveUsageParsers, type SpendSettings } from "./spend.js";
+
+/** A guard's mode (docs/design/ai-spend.md §4.5): off computes nothing; observe records what it would do; act does it */
+export const GUARD_MODES = ["off", "observe", "act"] as const;
+export type GuardMode = (typeof GUARD_MODES)[number];
 
 const argv = z.array(z.string().min(1)).min(1);
 const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
@@ -309,6 +314,18 @@ export const AgentsSchema = z
         /** Every agent's budget, unless per_agent sets the metric */
         agent: LimitsSchema.optional(),
         per_agent: z.record(LimitsSchema).default({}),
+        /**
+         * The mode of the budget guard AI spend adds (docs/design/ai-spend.md G5: the request and minute limits, a later
+         * part). Token and cost hard limits block new runs as before, whatever it says
+         */
+        guard_mode: z.enum(GUARD_MODES).default("observe"),
+      })
+      .strict()
+      .default({}),
+    /** AI spend (docs/design/ai-spend.md): one record per ended run, with the usage its adapter reports */
+    spend: z
+      .object({
+        enabled: z.boolean().default(false),
       })
       .strict()
       .default({}),
@@ -597,7 +614,11 @@ export interface AgentsSettings {
     project?: BudgetLimits;
     agent?: BudgetLimits;
     perAgent: Record<string, BudgetLimits>;
+    /** The budget guard's mode, for the limits AI spend adds (G5); token and cost hard limits always block */
+    guardMode: GuardMode;
   };
+  /** agents.spend, with every adapter's usage parser resolved */
+  spend: SpendSettings;
   fill: FillSettings;
 }
 
@@ -640,16 +661,19 @@ function checkLimits(limits: RawSettings["budgets"]["project"], where: string, e
  */
 export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): AgentsParseResult {
   const parsed = AgentsSchema.safeParse(raw ?? {});
+  // A guard's verdicts and counts are written by spend: named with both keys, also beside the schema's own errors
+  const guardErrors = guardsNeedSpendErrors(raw);
   if (!parsed.success) {
     return {
       ok: false,
-      errors: parsed.error.issues.map(
-        (issue) => `agents.${issue.path.join(".") || "(root)"}: ${issue.message}`,
-      ),
+      errors: [
+        ...guardErrors,
+        ...parsed.error.issues.map((issue) => `agents.${issue.path.join(".") || "(root)"}: ${issue.message}`),
+      ],
     };
   }
   const value: RawSettings = parsed.data;
-  const errors: string[] = [];
+  const errors: string[] = [...guardErrors];
 
   const rateLimit = compile(value.failover.rate_limit_patterns, "i", "agents.failover.rate_limit_patterns", errors);
   const providerError = compile(
@@ -665,6 +689,8 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
       errors.push(`agents.usage_patterns[${i}]: needs a named group (?<tokens>...) or (?<cost>...)`);
     }
   });
+  // Every adapter's usage parser (agent_adapters.<id>.usage_parser and request_pattern), checked whether spend is on or not
+  const usageParsers = resolveUsageParsers(project, value.usage_patterns.length > 0, errors);
 
   if (value.session_dir) {
     checkPlaceholders(value.session_dir, ["agents_dir", "agent", "repo"], "agents.session_dir", errors);
@@ -766,7 +792,9 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         project: value.budgets.project,
         agent: value.budgets.agent,
         perAgent: value.budgets.per_agent,
+        guardMode: value.budgets.guard_mode,
       },
+      spend: { enabled: value.spend.enabled, parsers: usageParsers },
       fill: {
         enabled: value.fill.enabled,
         tasksFile: value.fill.tasks_file,
