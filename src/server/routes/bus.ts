@@ -11,6 +11,8 @@
  * - GET  /api/bus/events: SSE feed for the UI (open)
  * - POST /api/bus/send: Owner sends a message (requires owner session)
  * - GET  /api/bus/messages/:agentId: Message list for the UI (open)
+ * - GET  /api/bus/activity: The Bus tab's first load, bounded by ?limit (at most 200); message texts and ack notes
+ *   only with the owner's session (the live updates are on the `bus` WebSocket channel: src/server/bus/live.ts)
  *
  * Claims have ONE source of truth: the agents module's claims. The bus does
  * not keep its own claim table.
@@ -27,6 +29,7 @@ import {
   getBusStore,
   hashBusToken,
   isBusTokenFormat,
+  messageState,
   redactBusToken,
   type BusConsumeMode,
   type BusConsumerHealth,
@@ -36,6 +39,12 @@ import {
 import type { ApiResponse, BoardOutput, TaskStatus } from "../../shared/types.js";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { ReportKind } from "../../bus/types.js";
+import {
+  BUS_ACTIVITY_DEFAULT_LIMIT,
+  BUS_ACTIVITY_MAX_LIMIT,
+  BUS_SUMMARY_MAX,
+  type BusActivity,
+} from "../../shared/bus-live.js";
 import type { AgentRun } from "../agents/types.js";
 import { isPlainName } from "../agents/config.js";
 import { z } from "zod";
@@ -566,5 +575,48 @@ async function busRoutes(
       })),
       unread: service.countUnread(agentId),
     });
+  });
+
+  // ============ GET /api/bus/activity - The Bus tab's first load (open; message texts for the owner only) ============
+
+  fastify.get<{ Querystring: { project: string; limit?: string } }>("/api/bus/activity", async (request, reply) => {
+    const raw = request.query.limit;
+    const asked = raw === undefined ? BUS_ACTIVITY_DEFAULT_LIMIT : Number(raw);
+    if (!Number.isSafeInteger(asked) || asked < 1) {
+      const err = respondError(`limit must be a whole number from 1 to ${BUS_ACTIVITY_MAX_LIMIT}`);
+      return reply.code(err.statusCode).send(err);
+    }
+    const limit = Math.min(asked, BUS_ACTIVITY_MAX_LIMIT);
+    const project = request.query.project;
+    const store = busStoreFor(project, options.dataDir);
+    // The socket carries no owner session: texts and ack notes come only from here, with it
+    const owner = auth.verifyRequest(request.headers, { method: request.method }).ok;
+    const activity: BusActivity = {
+      reports: store.listReports({ limit }).map((r) => ({
+        type: "report",
+        id: r.id,
+        at: new Date(r.createdAt).toISOString(),
+        agent: r.agent,
+        task: r.task,
+        kind: r.kind,
+        summary: r.summary.slice(0, BUS_SUMMARY_MAX),
+        gateId: r.gateId,
+        pr: r.pr,
+        sha: r.sha,
+      })),
+      messages: store.listRecentMessages(limit).map((m) => ({
+        id: m.id,
+        at: new Date(m.createdAt).toISOString(),
+        from: m.fromId,
+        to: m.toId,
+        state: messageState(m),
+        ...(owner ? { text: m.text, ackNote: m.ackNote } : {}),
+      })),
+      claims: (options.agents.getStore()?.listClaims(project) ?? [])
+        .slice(-limit)
+        .map((c) => ({ agent: c.agent, task: c.task, at: new Date(c.claimedAt).toISOString() })),
+      owner,
+    };
+    return respond(activity);
   });
 }

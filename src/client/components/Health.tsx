@@ -287,7 +287,7 @@ function WatchdogHealth({ project, refreshKey }: Props) {
 // ============ The bus consumers (bus.consume, src/server/bus/consumers.ts) ============
 
 /** GET /api/bus/consumers (BusConsumerHealth) */
-interface BusConsumersStatus {
+export interface BusConsumersStatus {
   mode: "off" | "observe" | "on";
   received: number;
   refused: { at: string; busId: number | null; reason: string }[];
@@ -303,8 +303,12 @@ interface BusConsumersStatus {
 /** How fill and the planner read the agents' bus reports; nothing while the project's bus is off. */
 function BusConsumersHealth({ project, refreshKey }: Props) {
   const status = useApi<BusConsumersStatus>("/bus/consumers", project, refreshKey);
-  const s = status.data;
-  if (!s || s.mode === "off") return null;
+  return status.data ? <BusConsumersView status={status.data} /> : null;
+}
+
+/** The consumers' comparison (observe: matches and mismatches) and refusals; also on Home → Bus. */
+export function BusConsumersView({ status: s }: { status: BusConsumersStatus }) {
+  if (s.mode === "off") return null;
   const o = s.observations;
 
   return (
