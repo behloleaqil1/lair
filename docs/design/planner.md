@@ -84,6 +84,9 @@ The first cycle only records a baseline (the queue's end, the messages and file 
 triggers. Triggers are kept in the store. A run starts when the newest trigger is `debounce_seconds` old, at least
 `min_interval_seconds` after the previous run started, fewer than `max_runs_per_day` runs started in the 24 hours
 before, and no planner run is active: many triggers make one run, and no stream of them makes more than the cap.
+Pending triggers held longer than the debounce and `min_interval_seconds` (runs paused, the project `read_only`, or the
+cap reached) are reported once per stall: a `[planner]` log line and `planner.run_held`, with when the cap lets the
+next run start.
 
 ### The run
 
@@ -198,8 +201,8 @@ dedupe key is per task, so a task that reports `BLOCKED` every few minutes asks 
 - **Routes** under `/api/planner` (in `OWNER_ONLY_PREFIXES`, no CORS): every read and every write needs an owner
   session (the status too: its errors and warnings name paths on the machine); writes also need `confirm: true`,
   except marking an owner message handled or reopening it (reversible, idempotent).
-- **Events**: `planner.changed`, `planner.run_started`, `planner.run_finished`, `planner.proposals_pending`,
-  `planner.blocked`, `planner.tasks_file_restored`, `planner.skipped`.
+- **Events**: `planner.changed`, `planner.run_started`, `planner.run_finished`, `planner.run_held`,
+  `planner.proposals_pending`, `planner.blocked`, `planner.tasks_file_restored`, `planner.skipped`.
 - **Decisions** as module `planner`.
 
 ## Restarts and reloads
@@ -250,6 +253,29 @@ Each item names a proposal by its index (0-based, in the order the planner propo
 An accepted proposal without a verdict is treated as **unverified**. A verdict for a proposal the checks already
 refused is ignored. The verifier's text (reason) and evidence lines become part of the stored verdict and the
 decision context; they never reach any prompt.
+
+### PR ownership of finish proposals
+
+A finish whose reason names a merged PR ("merged as #230", "PR #230 merged") claims that PR as the task's evidence.
+Lair checks the claim itself when the planner run's proposals come in, before the verifier and with or without one
+(`pr-ownership.ts`). A PR belongs to the task when:
+
+1. its head branch contains the task id as a path segment (`agent/worker-a/feat-login` for `feat-login`); or
+2. its head branch maps to the task's agent (the task line's agent) through `review.authors` (`branch_pattern`,
+   `branches`); or
+3. its title or body names the task id (not `feat-login-fix` for `feat-login`).
+
+Lair reads each PR (at most 5 per reason) through the project's `review` block host, one read at most 15 s.
+
+- Any named PR of another task: the proposal is **refused** by Lair, with the PR's branch and why it doesn't match.
+- A PR Lair cannot read (no `review` block, an error, a timeout): the proposal waits for the owner as **unsure**
+  ("Lair could not check PR ownership: ..."). No verifier verdict lifts that hold and it is never auto-applied; it
+  is never treated as owned.
+- All owned: the verifier's bundle carries `pr_ownership` (`state`, and a note naming the route that matched) on the
+  proposal; the verifier judges the rest as usual.
+
+A reason that names no merged PR is not checked. The verifier prompt also says: if it reads a PR itself and cannot,
+its verdict is `unsure`, never `approve`.
 
 ### Applying with verification
 

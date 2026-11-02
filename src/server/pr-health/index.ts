@@ -11,10 +11,10 @@
  * notice only when nobody owns the PR or a note could not be delivered.
  */
 export { PrHealth, PrHealthManager, startedLine, type PrHealthOptions, type PrHealthManagerOptions, type ProjectEntry } from "./service.js";
-export { parsePrHealthConfig, actBlockedReason, KINDS, NOTE_PLACEHOLDERS, type Kind, type PrHealthSettings } from "./config.js";
+export { parsePrHealthConfig, actBlockedReason, KINDS, NOTE_PLACEHOLDERS, OWNER_RULES, type Kind, type OwnerRule, type PrHealthSettings } from "./config.js";
 export { findingKey } from "./detect.js";
 export { DeliveryLedger, MAX_COMMANDS_PER_TICK } from "./act.js";
 export { NOTICE_CLASS, NOTICE_MODULE, type NoticeCode } from "./notices.js";
-export { ownerOf, type FillSource, type OwnerInputs, type OwnerResult } from "./owner.js";
+export { ownerOf, type FillSource, type OwnerInputs, type OwnerResult, type ReviewAuthorSource } from "./owner.js";
 export { registerPrHealthRoutes } from "./routes.js";
 export type { ClearedWhy, FindingView, NoteRecord, OwnerView, Planned, PrFacts, PrHealthStatus, PrHealthTick, RepoView, WithdrawState } from "./types.js";

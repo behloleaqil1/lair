@@ -93,6 +93,7 @@ import {
 import { proposalView, type ChangeInput, type PlannerStore, type StoredProposal, type StoredRun } from "./store.js";
 import { applyEdit, diffOf, diffTexts, findTask, parseTasksDoc, renderLine, type TaskEdit, type TasksDoc } from "./tasks-file.js";
 import { parseVerdicts, readVerdictsFile, verifierSection, VERDICTS_FILE } from "./verifier.js";
+import { checkFinishOwnership, type PrSource } from "./pr-ownership.js";
 
 /** The module name the planner raises decisions as. */
 export const DECISION_MODULE = "planner";
@@ -232,6 +233,16 @@ interface BlockedRecord {
   kept?: string;
 }
 
+/** Pending triggers that start no run beyond the usual waits (planner.run_held) */
+interface RunStall {
+  reason: "paused" | "read_only" | "max_runs_per_day";
+  /** When the cap lets one more run start; null: until the owner resumes runs or the project is writable */
+  until: number | null;
+  triggers: number;
+  runsInDay: number;
+  maxRunsPerDay: number;
+}
+
 /** A change to make: an edit of the tasks file, and its record. */
 interface PlannedChange {
   edit: TaskEdit;
@@ -256,7 +267,15 @@ export interface PlannerServiceOptions {
   bus?: () => BusLineSource | null;
   /** The review store's merged PRs (planner.guards.prefilter_closed); without it no PR counts as merged */
   prs?: PlannerPrs;
+  /** How finish proposals' PRs are read for their ownership; none: a PR claim is unsure */
+  prOwnership?: PrSource;
 }
+
+/** The start of the reason Lair gives a finish proposal whose PR it could not check (held for the owner). */
+export const OWNERSHIP_UNSURE = "Lair could not check PR ownership: ";
+
+/** Lair held this proposal (a PR whose ownership it could not check): no verdict lifts the hold, only the owner applies it. */
+const heldByLair = (p: StoredProposal) => p.verifierVerdict === "unsure" && (p.verifierReason ?? "").startsWith(OWNERSHIP_UNSURE);
 
 function withReadiness(tasks: PlanTask[]): PlanTaskView[] {
   const done = new Map<string, boolean>();
@@ -291,10 +310,13 @@ export class PlannerService {
   private messages: OwnerMessage[] = [];
   private bus?: () => BusLineSource | null;
   private prs?: PlannerPrs;
+  private prOwnership: PrSource;
   /** cycleSoon's cycle after the one in progress */
   private again: Promise<void> | null = null;
   /** stop() ran: events start no cycle */
   private ended = false;
+  /** The stall last reported (noteStall), so each is reported once */
+  private stallKey: string | null = null;
 
   constructor(options: PlannerServiceOptions) {
     this.project = options.project;
@@ -307,6 +329,7 @@ export class PlannerService {
     this.clock = options.clock;
     this.events = options.events;
     this.decisions = options.decisions;
+    this.prOwnership = options.prOwnership ?? { reader: null, mapping: null, missing: "no PR host is connected" };
   }
 
   get running(): boolean {
@@ -991,6 +1014,13 @@ export class PlannerService {
     return this.store.runStartsSince(this.project, now - DAY_MS);
   }
 
+  /** The runs started in the 24 hours before `now`, and when max_runs_per_day lets one more start (0: now). */
+  private dayCap(now: number, maxRunsPerDay: number): { runs: number; freeAt: number } {
+    const day = this.runsInDay(now);
+    // At the cap: once the oldest run of the window is 24 hours old (the one that makes room)
+    return { runs: day.length, freeAt: day.length >= maxRunsPerDay ? day[day.length - maxRunsPerDay] + DAY_MS : 0 };
+  }
+
   /**
    * When a run can start, given the pending triggers (null: none pending):
    * the newest trigger debounce_seconds old, min_interval_seconds after the
@@ -1002,15 +1032,56 @@ export class PlannerService {
     if (!agent || triggers.length === 0) return null;
     const lastTrigger = this.state<number>(LAST_TRIGGER) ?? 0;
     const lastRun = this.state<number>(LAST_RUN);
-    const day = this.runsInDay(now);
-    // At the cap: once the oldest run of the window is 24 hours old (the one that makes room)
-    const dayFree = day.length >= agent.maxRunsPerDay ? day[day.length - agent.maxRunsPerDay] + DAY_MS : 0;
+    const dayFree = this.dayCap(now, agent.maxRunsPerDay).freeAt;
     return Math.max(lastTrigger + agent.debounceSeconds * 1000, lastRun === null ? 0 : lastRun + agent.minIntervalSeconds * 1000, dayFree);
+  }
+
+  /**
+   * Why pending triggers start no run beyond the usual waits (the debounce
+   * and min_interval_seconds): planner runs are paused, the project is
+   * read_only, or max_runs_per_day runs started in the 24 hours before
+   * (until: when the cap lets one more start). null: none pending, or only
+   * the usual waits.
+   */
+  private stallOf(now: number): RunStall | null {
+    const agent = this.settings.agent;
+    const triggers = (this.state<TriggerView[]>(TRIGGERS) ?? []).length;
+    if (!agent || triggers === 0) return null;
+    const cap = this.dayCap(now, agent.maxRunsPerDay);
+    const facts = { triggers, runsInDay: cap.runs, maxRunsPerDay: agent.maxRunsPerDay };
+    if (this.state(PAUSED)) return { reason: "paused", until: null, ...facts };
+    if (this.config.read_only === true) return { reason: "read_only", until: null, ...facts };
+    if (cap.freeAt > now) return { reason: "max_runs_per_day", until: cap.freeAt, ...facts };
+    return null;
+  }
+
+  /**
+   * A stall is visible: once per stall (its reason and until), a log line
+   * and planner.run_held; again after a restart or reload. Without it a day
+   * of pending triggers and no run left no trace outside the Planner view.
+   */
+  private async noteStall(now: number): Promise<void> {
+    const stall = this.stallOf(now);
+    const key = stall ? `${stall.reason}:${stall.until ?? ""}` : null;
+    if (key === this.stallKey) return;
+    this.stallKey = key;
+    if (!stall) return;
+    const until = stall.until === null ? null : iso(stall.until);
+    const why =
+      stall.reason === "max_runs_per_day"
+        ? ` until ${until}: max_runs_per_day (${stall.maxRunsPerDay}) runs started in the 24 hours before`
+        : stall.reason === "read_only"
+          ? ": the project is read_only"
+          : ": planner runs are paused (resume them in the Planner view)";
+    console.warn(`[planner] ${this.project}: ${stall.triggers} trigger(s) pending, no planner run${why}`);
+    await this.emit("planner.run_held", { ...stall, until });
   }
 
   private async maybeStart(doc: TasksDoc, now: number): Promise<void> {
     const agent = this.settings.agent;
-    if (!agent || this.state(PAUSED) || this.config.read_only === true) return;
+    if (!agent) return;
+    await this.noteStall(now);
+    if (this.state(PAUSED) || this.config.read_only === true) return;
     const at = this.nextRunAt(now);
     if (at === null || now < at) return;
     await this.startRun(doc, now);
@@ -1682,6 +1753,20 @@ export class PlannerService {
     const { checked } = checkProposals(file.items, ctx);
     // The tasks file changed while the run was active and was put back: every proposal is refused (D7 keeps the edit)
     const whole = this.refusedWhole(run);
+    // PR ownership (#290): a finish whose reason names a merged PR of another task is refused; one Lair cannot read is held
+    const ownership = new Map<number, { state: string; note: string | null }>();
+    for (const c of checked) {
+      if (c.op !== "finish" || c.refusal || whole) continue;
+      const result = await checkFinishOwnership({
+        reason: c.reason,
+        task: c.task,
+        agent: findTask(doc, c.task)?.agent ?? c.agent,
+        source: this.prOwnership,
+      });
+      if (result.state === "none") continue;
+      if (result.state === "not_owned") c.refusal = result.note;
+      ownership.set(c.index, result);
+    }
     const stored = checked.map((c) =>
       this.store.insertProposal({
         project: this.project,
@@ -1697,8 +1782,10 @@ export class PlannerService {
         decidedBy: c.refusal || whole ? "lair" : null,
         decidedAt: c.refusal || whole ? now : null,
         createdAt: now,
-        verifierVerdict: null,
-        verifierReason: null,
+        // Held by Lair until the owner decides; no verifier verdict can turn it into an approve
+        verifierVerdict: !c.refusal && ownership.get(c.index)?.state === "unsure" ? "unsure" : null,
+        verifierReason:
+          !c.refusal && ownership.get(c.index)?.state === "unsure" ? `${OWNERSHIP_UNSURE}${ownership.get(c.index)?.note}` : null,
         verifierEvidence: null,
       }),
     );
@@ -1712,7 +1799,7 @@ export class PlannerService {
       const needsVerification = accepted.filter((p) => !verifier.skipOps.includes(p.op as never));
       if (needsVerification.length > 0) {
         // Start verifier run
-        const started = await this.startVerifier(run, accepted, now);
+        const started = await this.startVerifier(run, accepted, now, ownership);
         if (started) {
           run.verifierState = "running";
           run.detail = `${accepted.length} proposal(s) accepted; verifier run started`;
@@ -1738,7 +1825,12 @@ export class PlannerService {
   }
 
   /** Start the verifier agent run for a planner run's accepted proposals. */
-  private async startVerifier(run: StoredRun, accepted: StoredProposal[], now: number): Promise<boolean> {
+  private async startVerifier(
+    run: StoredRun,
+    accepted: StoredProposal[],
+    now: number,
+    ownership: Map<number, { state: string; note: string | null }>,
+  ): Promise<boolean> {
     const verifier = this.settings.verifier;
     if (!verifier) return false;
 
@@ -1783,6 +1875,7 @@ export class PlannerService {
       agent: p.agent,
       text: p.text,
       reason: p.reason,
+      prOwnership: ownership.get(p.index) ?? null,
     }));
 
     const section = verifierSection({
@@ -1891,7 +1984,7 @@ export class PlannerService {
       this.store.saveRun(run);
       // Mark all pending proposals as unverified
       for (const p of this.store.runProposals(run.id)) {
-        if (p.status === "pending") {
+        if (p.status === "pending" && !heldByLair(p)) {
           this.store.setVerifierVerdict(p.id, "unverified", "verification failed", null);
         }
       }
@@ -1915,6 +2008,8 @@ export class PlannerService {
     for (const p of proposals) {
       if (p.status !== "pending") continue;
 
+      // Lair held it (a PR it could not check): no verdict lifts the hold, only the owner decides
+      if (heldByLair(p)) continue;
       const v = verdictMap.get(p.index);
       if (v) {
         this.store.setVerifierVerdict(p.id, v.verdict, v.reason, v.evidence);
@@ -1944,6 +2039,8 @@ export class PlannerService {
 
     for (const p of accepted) {
       if (!this.writes || !isOp(p.op)) continue;
+      // Lair held it (a PR whose ownership it could not check): only the owner applies it
+      if (heldByLair(p)) continue;
 
       // Check auto-apply (requires verifier with auto_apply config)
       if (verifier && this.settings.approval[p.op] === "never") {
