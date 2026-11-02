@@ -24,9 +24,11 @@ import { jestParser, vitestParser } from "./js.js";
 import { junitParser } from "./junit.js";
 import { pytestParser } from "./pytest.js";
 import { trxParser } from "./trx.js";
-import type { EvidenceParser } from "./types.js";
+import type { AsyncEvidenceParser, EvidenceParser } from "./types.js";
+import { isAsyncParser } from "./types.js";
 
-export type { EvidenceParser, ParseOptions, ParseOutput } from "./types.js";
+export type { EvidenceParser, AsyncEvidenceParser, ParseOptions, ParseOutput } from "./types.js";
+export { isAsyncParser } from "./types.js";
 export { parseJUnit } from "./junit.js";
 export { parseGradle } from "./gradle.js";
 export { parseVitest, parseJest } from "./js.js";
@@ -34,7 +36,7 @@ export { parsePytest } from "./pytest.js";
 export { parseGoTest, goTestParser } from "./go.js";
 export { parseCargoTest, cargoTestParser } from "./cargo.js";
 export { parseTrx, trxParser } from "./trx.js";
-export { createCustomParser, validateCustomParserConfig, type CustomParserConfig } from "./custom.js";
+export { createCustomParser, validateCustomParserConfig, runCatastrophicRegexTest, type CustomParserConfig } from "./custom.js";
 export { parseXml } from "./xml.js";
 
 /**
@@ -243,6 +245,134 @@ export function parseGateEvidence(
 
   const causes = withChains(absorbFollowers(mergeCauses([...reportCauses, ...consoleCauses])), consoleChains, failed);
   // A report that names no step explains the failure on its own
+  const unattributed = causes.some((c) => c.step === undefined);
+  for (const step of failed) {
+    if (causes.some((c) => c.step === step.name)) continue;
+    if (unattributed && step.status !== "timed_out") {
+      notes.push(`step ${step.name}: explained by a report that names no step`);
+      continue;
+    }
+    causes.push(stepCause(step));
+  }
+  if (causes.length === 0) causes.push(runnerCause(result));
+  return { causes, passed, flaky, parsers: [...used], notes };
+}
+
+/**
+ * Async version of parseGateEvidence that properly handles async custom parsers.
+ * Custom parsers run regex in worker threads with hard timeouts, so they must be
+ * awaited. Built-in parsers remain synchronous for performance.
+ *
+ * Use this version when custom parsers are in the parser list.
+ */
+export async function parseGateEvidenceAsync(
+  result: GateResult,
+  reports: ReportInput[],
+  options: { contextPatterns: RegExp[]; parsers?: (EvidenceParser | AsyncEvidenceParser)[] },
+): Promise<GateEvidence> {
+  const parsers = options.parsers ?? BUILTIN_PARSERS;
+  const failed = failedSteps(result);
+  const onlyStep = failed.length === 1 ? failed[0].name : undefined;
+  const reportCauses: FailureCause[] = [];
+  const passed: TestRef[] = [];
+  const flaky: TestRef[] = [];
+  const used = new Set<string>();
+  const notes: string[] = [];
+
+  // Process reports - sync parsers only (custom parsers are console parsers)
+  for (const report of reports) {
+    const name = report.name ?? "(unnamed)";
+    try {
+      const lines = boundedLines(report.content);
+      const syncParsers = parsers.filter((p): p is EvidenceParser => !isAsyncParser(p));
+      const parser = report.format
+        ? syncParsers.find((p) => p.id === report.format)
+        : (syncParsers.find((p) => p.source === "report" && p.detect(report.content, lines)) ??
+          syncParsers.find((p) => p.detect(report.content, lines)));
+      if (!parser) {
+        notes.push(`report ${name}: no parser recognises it`);
+        continue;
+      }
+      const out = parser.parse(report.content, { step: report.step ?? onlyStep, contextPatterns: options.contextPatterns });
+      used.add(parser.id);
+      reportCauses.push(...out.causes);
+      passed.push(...out.passed);
+      flaky.push(...out.flaky);
+    } catch (e) {
+      notes.push(`report ${name}: could not be read (${clip(e instanceof Error ? e.message : String(e), 200)})`);
+    }
+  }
+
+  const covered = new Set(reportCauses.flatMap((c) => c.tests.map((t) => t.key)));
+  const consoleChains = new Map<string, string[]>();
+  const consoleCauses: FailureCause[] = [];
+  const consoleParsers = parsers.filter((p) => p.source === "console");
+
+  // Process failed steps with both sync and async parsers
+  for (const step of failed) {
+    const output = step.output ?? "";
+    if (!output.trim()) continue;
+
+    try {
+      const lines = boundedLines(output);
+
+      // Find matching parser - try sync parsers first, then async
+      let matchedParser: EvidenceParser | AsyncEvidenceParser | undefined;
+      for (const p of consoleParsers) {
+        if (isAsyncParser(p)) {
+          if (await p.detect(output, lines)) {
+            matchedParser = p;
+            break;
+          }
+        } else {
+          if (p.detect(output, lines)) {
+            matchedParser = p;
+            break;
+          }
+        }
+      }
+
+      if (!matchedParser) continue;
+
+      // Parse with the matched parser
+      let out: Awaited<ReturnType<AsyncEvidenceParser["parse"]>>;
+      if (isAsyncParser(matchedParser)) {
+        out = await matchedParser.parse(output, { step: step.name, contextPatterns: options.contextPatterns });
+      } else {
+        out = matchedParser.parse(output, { step: step.name, contextPatterns: options.contextPatterns });
+      }
+
+      used.add(matchedParser.id);
+
+      // Add any notes from the parser (e.g., pattern timeout notices)
+      if (out.notes) {
+        notes.push(...out.notes);
+      }
+
+      for (const cause of out.causes) {
+        if (cause.tests.length > 0 && cause.tests.every((t) => covered.has(t.key))) {
+          if (cause.causedBy.length > 0) {
+            for (const t of cause.tests) {
+              if (!consoleChains.has(t.key)) consoleChains.set(t.key, cause.causedBy);
+            }
+          }
+          continue;
+        }
+        if (cause.kind === "build" && reportCauses.some((c) => c.step === step.name)) continue;
+        consoleCauses.push(cause);
+      }
+      passed.push(...out.passed);
+      flaky.push(...out.flaky);
+    } catch (e) {
+      notes.push(`step ${step.name}: its output could not be read (${clip(e instanceof Error ? e.message : String(e), 200)})`);
+    }
+  }
+
+  if (result.status === "passed") {
+    return { causes: [], passed, flaky, parsers: [...used], notes };
+  }
+
+  const causes = withChains(absorbFollowers(mergeCauses([...reportCauses, ...consoleCauses])), consoleChains, failed);
   const unattributed = causes.some((c) => c.step === undefined);
   for (const step of failed) {
     if (causes.some((c) => c.step === step.name)) continue;

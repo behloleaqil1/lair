@@ -18,13 +18,18 @@ const SECTION_HEADER = /^----\s+(\S+)\s+stdout\s+----$/;
 const SUMMARY = /^test result:\s+(ok|FAILED)\.\s+(\d+)\s+passed;\s+(\d+)\s+failed/;
 // Rust compiler error: "error[E0425]: cannot find value `x` in this scope"
 const COMPILER_ERROR = /^error\[E\d+\]:\s+(.+)$/;
-// Old panic format (pre-1.73): "thread 'test_name' panicked at 'message', location"
-const PANIC_OLD = /^thread\s+'[^']+'\s+panicked\s+at\s+'(.+)$/;
+// Old panic format (pre-1.73):
+// - One-line format: "thread 'test_name' panicked at 'message', src/lib.rs:45:9"
+// - Multi-line format: message ends with "', location" on a later line
+// Try one-line format first (message and location on same line):
+const PANIC_OLD_ONELINE = /^thread\s+'[^']+'\s+panicked\s+at\s+'(.+)',\s+(\S+\.rs):(\d+):\d+$/;
+// Multi-line: first line ends with an opening message quote, location on a later line
+const PANIC_OLD_MULTILINE_START = /^thread\s+'[^']+'\s+panicked\s+at\s+'(.+)$/;
 // New panic format (Rust 1.73+): "thread 'test_name' panicked at src/lib.rs:45:9:"
 // followed by the message on the next line(s)
 const PANIC_NEW = /^thread\s+'[^']+'\s+panicked\s+at\s+(\S+\.rs):(\d+):\d+:?\s*$/;
-// Location in old panic: "src/lib.rs:42:5"
-const PANIC_LOCATION = /^(\S+\.rs):(\d+):\d+$/;
+// Location at end of multi-line old panic: "...',  src/lib.rs:42:5"
+const PANIC_OLD_LOCATION_END = /'\s*,\s*(\S+\.rs):(\d+):\d+\s*$/;
 
 interface Section {
   name: string;
@@ -52,17 +57,38 @@ function extractError(lines: string[]): { type?: string; message: string; file?:
       return { type: "panic", message, file: panicNew[1], line: Number(panicNew[2]) };
     }
 
-    // Old panic format: "thread 'x' panicked at 'message', location"
-    const panicOld = line.match(PANIC_OLD);
-    if (panicOld) {
-      // Look for location in subsequent lines
-      for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
-        const loc = lines[j].trim().match(PANIC_LOCATION);
-        if (loc) {
-          return { type: "panic", message: panicOld[1], file: loc[1], line: Number(loc[2]) };
+    // Old panic format: try one-line first "thread 'x' panicked at 'msg', src/lib.rs:45:9"
+    const panicOneLine = line.match(PANIC_OLD_ONELINE);
+    if (panicOneLine) {
+      return { type: "panic", message: panicOneLine[1], file: panicOneLine[2], line: Number(panicOneLine[3]) };
+    }
+
+    // Old panic format: multi-line (message spans lines, ends with "', location")
+    const panicMultiStart = line.match(PANIC_OLD_MULTILINE_START);
+    if (panicMultiStart) {
+      // Collect the full message by scanning subsequent lines until we find the location
+      const messageParts = [panicMultiStart[1]];
+      for (let j = i + 1; j < Math.min(i + 10, lines.length); j++) {
+        const nextLine = lines[j];
+        const locEnd = nextLine.match(PANIC_OLD_LOCATION_END);
+        if (locEnd) {
+          // This line has the end of the message and the location
+          const beforeLoc = nextLine.slice(0, nextLine.length - nextLine.match(PANIC_OLD_LOCATION_END)![0].length);
+          if (beforeLoc.trim()) {
+            messageParts.push(beforeLoc.trim());
+          }
+          const message = messageParts.join(" ").replace(/`/g, "'").trim();
+          return { type: "panic", message, file: locEnd[1], line: Number(locEnd[2]) };
         }
+        // Continue collecting message parts (stop at note: or empty line)
+        if (nextLine.trim().startsWith("note:") || nextLine.trim() === "") {
+          break;
+        }
+        messageParts.push(nextLine.trim());
       }
-      return { type: "panic", message: panicOld[1] };
+      // No location found, return message without location
+      const message = messageParts.join(" ").replace(/`/g, "'").trim();
+      return { type: "panic", message };
     }
 
     // assertion failures

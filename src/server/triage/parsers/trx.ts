@@ -85,7 +85,9 @@ export function parseTrx(xml: string, options: ParseOptions): ParseOutput {
       continue;
     }
 
-    if (outcome !== "Failed") {
+    // Failed outcomes: Failed, Error, Timeout, Aborted
+    // NotExecuted and Inconclusive are skipped (not run)
+    if (outcome !== "Failed" && outcome !== "Error" && outcome !== "Timeout" && outcome !== "Aborted") {
       // Skip other outcomes (NotExecuted, Inconclusive, etc.)
       continue;
     }
@@ -137,9 +139,13 @@ export const trxParser: EvidenceParser = {
   id: "trx",
   source: "report",
   detect: (text) => {
-    // TRX files have a TestRun root element with xmlns containing vstst
+    // TRX files have a TestRun root element with xmlns containing the Microsoft TeamTest namespace.
+    // The namespace URL is "http://microsoft.com/schemas/VisualStudio/TeamTest/2010" (or similar years).
+    // Detection must work on the first 2000 characters of a real TRX file, where:
+    // - <TestRun may have attributes before the xmlns
+    // - The namespace contains "VisualStudio" and "TeamTest" (not "vstst" which doesn't appear)
     const head = text.slice(0, 2000);
-    return /<TestRun[\s>]/.test(head) && /xmlns.*vstst|microsoft\.com.*testrun/i.test(head);
+    return /<TestRun[\s>]/.test(head) && /VisualStudio\/TeamTest/i.test(head);
   },
   parse: parseTrx,
 };

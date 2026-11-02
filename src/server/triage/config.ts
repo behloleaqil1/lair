@@ -7,7 +7,7 @@ import type { ProjectConfig } from "../../shared/types.js";
 import { GATE_RECHECK_KEYS, parseGateRecheck, type GateRecheckSettings } from "./gate-recheck-config.js";
 import { DEFAULT_INFRA_SIGNATURES, DEFAULT_TIMEOUT_SIGNATURES, type CompiledSignature, type SignatureDef } from "./signatures.js";
 import { createCustomParser, validateCustomParserConfig, type CustomParserConfig } from "./parsers/custom.js";
-import type { EvidenceParser } from "./parsers/types.js";
+import type { AsyncEvidenceParser, EvidenceParser } from "./parsers/types.js";
 
 export const INFRA_KINDS = ["network", "container", "oom", "runner", "disk", "load"] as const;
 export type InfraKind = (typeof INFRA_KINDS)[number];
@@ -278,8 +278,8 @@ export interface TriageSettings {
   };
   commands: Partial<Record<CommandId, string[]>>;
   decisionFile?: string;
-  /** Custom parsers created from config (wired on load and reload) */
-  customParsers: EvidenceParser[];
+  /** Custom parsers created from config (wired on load and reload). Async parsers use worker threads with hard timeouts. */
+  customParsers: (EvidenceParser | AsyncEvidenceParser)[];
 }
 
 export type TriageParseResult = { ok: true; settings: TriageSettings } | { ok: false; errors: string[] };
@@ -382,7 +382,7 @@ export function parseTriageConfig(raw: unknown): TriageParseResult {
   }
 
   // Validate and create custom parsers
-  const customParsers: EvidenceParser[] = [];
+  const customParsers: (EvidenceParser | AsyncEvidenceParser)[] = [];
   const customNames = new Set<string>();
   for (let i = 0; i < value.parsers.custom.length; i++) {
     const cfg = value.parsers.custom[i];

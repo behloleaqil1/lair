@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { actBlockedReason, DEFAULT_CONTEXT_PATTERNS, DEFAULT_INFRA_PATTERNS, parseTriageConfig } from "./config.js";
 import { fillArgv, formatDecision } from "./adapters.js";
 import { projectConfig } from "./testing/harness.js";
+import { isAsyncParser } from "./parsers/types.js";
 
 describe("parseTriageConfig", () => {
   it("is off and in observe mode by default, with the built-in patterns", () => {
@@ -82,7 +83,7 @@ describe("parseTriageConfig", () => {
 });
 
 describe("custom parsers through config", () => {
-  it("creates custom parsers from valid config entries", () => {
+  it("creates custom parsers from valid config entries", async () => {
     const parsed = parseTriageConfig({
       enabled: true,
       parsers: {
@@ -99,14 +100,17 @@ describe("custom parsers through config", () => {
     if (!parsed.ok) throw new Error(parsed.errors.join("; "));
     expect(parsed.settings.customParsers).toHaveLength(1);
     expect(parsed.settings.customParsers[0].id).toBe("mytest");
-    // The parser actually works
+    // The parser actually works - custom parsers are async
     const text = `
 MyTest Framework v1.0
 Running tests...
 FAIL: orders::test_total - expected 108 but got 100
 Summary: 1 failed, 2 passed
 `;
-    const out = parsed.settings.customParsers[0].parse(text, { contextPatterns: [] });
+    const parser = parsed.settings.customParsers[0];
+    expect(isAsyncParser(parser)).toBe(true);
+    if (!isAsyncParser(parser)) throw new Error("Expected async parser");
+    const out = await parser.parse(text, { contextPatterns: [] });
     expect(out.causes).toHaveLength(1);
     expect(out.causes[0].tests[0]).toMatchObject({ suite: "orders", name: "test_total" });
     expect(out.failedCount).toBe(1);

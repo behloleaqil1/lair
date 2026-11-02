@@ -2109,7 +2109,9 @@ Unknown keys, an invalid regular expression or an unknown placeholder are config
 
 ### Custom parsers
 
-When a project's tests produce output the built-in parsers (JUnit XML, Gradle, vitest, jest, pytest, go test -json, cargo test, .NET TRX) don't recognise, define a custom regex parser:
+When a project's tests produce output the built-in parsers (JUnit XML, Gradle, vitest, jest, pytest, `go test -json`, cargo test, .NET TRX) don't recognise, define a custom regex parser.
+
+> **Note:** The Go parser reads only JSON output from `go test -json`. Plain `go test` output (non-JSON `--- FAIL:` lines without `-json`) is not parsed; use `-json` or write a custom parser for your output format.
 
 ```yaml
 triage:
@@ -2123,21 +2125,21 @@ triage:
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `name` | string | Parser id, shown in `cause.parser`; lowercase letters, digits, hyphens and underscores (max 32 chars) |
+| `name` | string | Parser id, shown in `cause.parser`; must start with a letter, then lowercase alphanumeric, hyphens and underscores (max 32 chars); must not conflict with built-in parser ids |
 | `detect` | string | Regex to detect this format (matched against the first 2000 characters of the output) |
 | `fail_pattern` | string | Regex with named groups: `(?<name>...)` (required), `(?<suite>...)`, `(?<message>...)`, `(?<type>...)` |
 | `summary_pattern` | string | Optional regex to extract counts: `(?<failed>\d+)`, `(?<passed>\d+)` |
 
 Custom parsers run after the built-ins; a file the built-ins already parsed is not tried again.
 
-**Security limits.** Patterns run over untrusted test output on the server's event loop, so:
+**Security limits.** Patterns run over untrusted test output, so:
 
 - Input is capped to 256 KB (the tail).
 - Lines are capped to 2,000 characters.
 - Patterns that match the empty string are refused (they would loop forever).
 - Patterns with nested quantifiers (e.g., `(a+)+`, `(\w*)*`, `(a|a)*`, `(\w|\d)+`) are refused (catastrophic backtracking).
 - Patterns with backreferences (`\1`, `\k<name>`) are refused (exponential time complexity).
-- Regex iteration is bounded: matching stops after a fixed iteration count or time budget to prevent hangs on adversarial input.
+- Each regex operation runs in a worker thread with a 2-second timeout; if the operation exceeds this, the worker is terminated (`Worker.terminate()`), the match fails closed (no results), and a triage notice is recorded. This is a hard bound: the main event loop is never blocked, even by catastrophic patterns that bypass static checks.
 
 Non-capturing groups (`(?:...)`) and named groups (`(?<name>...)`) are allowed. Alternation is allowed in non-quantified groups (e.g., `(?:FAIL|ERROR):` is fine, but `(?:FAIL|ERROR)+:` is refused).
 

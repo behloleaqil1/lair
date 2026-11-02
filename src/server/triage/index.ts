@@ -30,8 +30,9 @@ export type { TriageSettings } from "./config.js";
 export { TriageStore } from "./store.js";
 export { GitCli } from "./git.js";
 export type { GitProbe, CommitInfo } from "./git.js";
-export { BUILTIN_PARSERS, parseGateEvidence } from "./parsers/index.js";
-export type { EvidenceParser, ReportInput } from "./parsers/index.js";
+export { BUILTIN_PARSERS, parseGateEvidence, parseGateEvidenceAsync } from "./parsers/index.js";
+export type { EvidenceParser, AsyncEvidenceParser, ReportInput } from "./parsers/index.js";
+export { isAsyncParser } from "./parsers/index.js";
 export { NO_OWNER, InboxDecisions } from "./adapters.js";
 export type {
   AgentRouter,

@@ -19,16 +19,45 @@
  *   - Input is capped to 256 KB to bound regex execution time
  *   - Patterns with nested quantifiers, alternation under quantifiers, or backreferences are refused
  *   - Patterns that match the empty string are refused
- *   - Regex matching runs with a hard time bound (2 seconds per operation)
+ *   - Regex matching runs in a worker thread with a hard time bound (2 seconds per operation);
+ *     the worker is terminated on timeout (Worker.terminate()) and the match fails closed with a
+ *     triage notice "pattern timed out". This is a TRUE hard bound: the worker is killed mid-exec()
+ *     so even a single catastrophic regex.exec() call cannot block Lair's event loop.
  */
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 import { boundedLines, clip, groupFailures, makeTest, type RawFailure } from "../text.js";
-import type { EvidenceParser, ParseOptions, ParseOutput } from "./types.js";
+import type { AsyncEvidenceParser, ParseOptions, ParseOutput } from "./types.js";
+import type { MatchAllResult, RegexRequest, RegexResult, TestResult } from "./regex-worker.js";
 
 const MAX_ENTRIES = 5000;
 /** Maximum input size in bytes: patterns run over untrusted test output */
 const MAX_INPUT_BYTES = 256 * 1024;
-/** Timeout for regex operations in milliseconds */
+/** Timeout for regex operations in milliseconds - a hard bound enforced by Worker.terminate() */
 const REGEX_TIMEOUT_MS = 2000;
+
+/** 
+ * Get the worker path and exec args lazily. This avoids issues with import.meta.url
+ * in client-side tests (where fileURLToPath throws) by deferring the check.
+ */
+function getWorkerConfig(): { path: string; execArgv: string[] } {
+  const jsPath = fileURLToPath(new URL("./regex-worker.js", import.meta.url));
+  const tsPath = fileURLToPath(new URL("./regex-worker.ts", import.meta.url));
+  const useTsx = !existsSync(jsPath) && existsSync(tsPath);
+  return {
+    path: useTsx ? tsPath : jsPath,
+    execArgv: useTsx ? ["--import", "tsx"] : [],
+  };
+}
+
+let workerConfig: { path: string; execArgv: string[] } | null = null;
+function getOrInitWorkerConfig(): { path: string; execArgv: string[] } {
+  if (!workerConfig) {
+    workerConfig = getWorkerConfig();
+  }
+  return workerConfig;
+}
 
 export interface CustomParserConfig {
   /** Parser id, shown in cause.parser */
@@ -213,70 +242,116 @@ function matchesEmptyString(pattern: string): boolean {
   }
 }
 
-/**
- * Execute a regex operation with a timeout. Returns null if the operation times out.
- * This is a safety net for patterns that pass structural checks but still cause slowdowns.
- */
-function withTimeout<T>(fn: () => T, timeoutMs: number): T | null {
-  // For synchronous regex operations in the main thread, we can't truly interrupt them.
-  // However, we use this as a wrapper that measures time and returns null if too slow.
-  // The real protection is the structural checks; this is a last-resort safeguard.
-  const start = Date.now();
-  try {
-    const result = fn();
-    if (Date.now() - start > timeoutMs) {
-      // Operation completed but took too long - log for monitoring
-      return result; // Still return the result since we have it
-    }
-    return result;
-  } catch {
-    return null;
-  }
+/** Result of a worker regex operation */
+interface WorkerResult<T> {
+  value: T;
+  timedOut: boolean;
 }
 
 /**
- * Execute regex matchAll with a bounded iteration count and time check.
- * Returns matches found within the time budget, or an empty array if it times out.
+ * Run a regex test in a worker thread with a hard timeout.
+ * Returns { value: true/false, timedOut: boolean }.
+ * On timeout, the worker is terminated to prevent event loop blocking.
  */
-function boundedMatchAll(regex: RegExp, text: string, maxMatches: number, timeoutMs: number): RegExpExecArray[] {
-  const results: RegExpExecArray[] = [];
-  const start = Date.now();
-  const clonedRegex = new RegExp(regex.source, regex.flags);
+async function workerRegexTest(pattern: string, flags: string, text: string, timeoutMs: number): Promise<WorkerResult<boolean>> {
+  return new Promise((resolve) => {
+    const req: RegexRequest = { kind: "test", pattern, flags, text };
+    const config = getOrInitWorkerConfig();
+    const worker = new Worker(config.path, { 
+      workerData: req,
+      execArgv: config.execArgv,
+    });
 
-  // Iterate with periodic time checks
-  let match: RegExpExecArray | null;
-  let iterations = 0;
-  const maxIterations = maxMatches * 10; // Allow some failed matches
+    const timer = setTimeout(() => {
+      worker.terminate();
+      resolve({ value: false, timedOut: true });
+    }, timeoutMs);
 
-  while ((match = clonedRegex.exec(text)) !== null) {
-    iterations++;
+    worker.on("message", (result: RegexResult | { error: string }) => {
+      clearTimeout(timer);
+      if ("error" in result) {
+        resolve({ value: false, timedOut: false });
+      } else if (result.kind === "test") {
+        resolve({ value: (result as TestResult).matched, timedOut: false });
+      } else {
+        resolve({ value: false, timedOut: false });
+      }
+      worker.terminate();
+    });
 
-    // Periodic time check (every 100 iterations)
-    if (iterations % 100 === 0 && Date.now() - start > timeoutMs) {
-      break;
-    }
+    worker.on("error", () => {
+      clearTimeout(timer);
+      resolve({ value: false, timedOut: false });
+    });
 
-    if (iterations > maxIterations) {
-      break;
-    }
-
-    // Skip zero-length matches to prevent infinite loops
-    if (match[0].length === 0) {
-      clonedRegex.lastIndex++;
-      continue;
-    }
-
-    results.push(match);
-    if (results.length >= maxMatches) {
-      break;
-    }
-  }
-
-  return results;
+    worker.on("exit", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) resolve({ value: false, timedOut: false });
+    });
+  });
 }
 
-/** Create a custom parser from config. Returns null if patterns are invalid. */
-export function createCustomParser(config: CustomParserConfig): EvidenceParser | null {
+/**
+ * Run regex matchAll in a worker thread with a hard timeout.
+ * Returns { value: matches[], timedOut: boolean }.
+ * On timeout, the worker is terminated to prevent event loop blocking.
+ */
+async function workerRegexMatchAll(
+  pattern: string,
+  flags: string,
+  text: string,
+  maxMatches: number,
+  timeoutMs: number,
+): Promise<WorkerResult<MatchAllResult["matches"]>> {
+  return new Promise((resolve) => {
+    const req: RegexRequest = { kind: "matchAll", pattern, flags, text, maxMatches };
+    const config = getOrInitWorkerConfig();
+    const worker = new Worker(config.path, { 
+      workerData: req,
+      execArgv: config.execArgv,
+    });
+
+    const timer = setTimeout(() => {
+      worker.terminate();
+      resolve({ value: [], timedOut: true });
+    }, timeoutMs);
+
+    worker.on("message", (result: RegexResult | { error: string }) => {
+      clearTimeout(timer);
+      if ("error" in result) {
+        resolve({ value: [], timedOut: false });
+      } else if (result.kind === "matchAll") {
+        resolve({ value: (result as MatchAllResult).matches, timedOut: false });
+      } else {
+        resolve({ value: [], timedOut: false });
+      }
+      worker.terminate();
+    });
+
+    worker.on("error", () => {
+      clearTimeout(timer);
+      resolve({ value: [], timedOut: false });
+    });
+
+    worker.on("exit", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) resolve({ value: [], timedOut: false });
+    });
+  });
+}
+
+/**
+ * Create an async custom parser from config. Returns null if patterns are invalid.
+ *
+ * The parser uses worker threads with hard timeouts (Worker.terminate()) to ensure
+ * even catastrophic regex patterns cannot block Lair's event loop. When a pattern
+ * times out, detect() returns false and parse() returns empty results with a note
+ * explaining the timeout ("pattern timed out" triage notice).
+ *
+ * The returned parser has `async: true` set so callers can identify it needs
+ * async handling via isAsyncParser().
+ */
+export function createCustomParser(config: CustomParserConfig): AsyncEvidenceParser & { async: true } | null {
   const detectRegex = compileRegex(config.detect);
   const failRegex = compileRegex(config.fail_pattern);
   const summaryRegex = config.summary_pattern ? compileRegex(config.summary_pattern) : null;
@@ -285,7 +360,15 @@ export function createCustomParser(config: CustomParserConfig): EvidenceParser |
     return null;
   }
 
-  const parse = (text: string, options: ParseOptions): ParseOutput => {
+  const detect = async (text: string, _lines: string[]): Promise<boolean> => {
+    const result = await workerRegexTest(detectRegex.source, detectRegex.flags, text.slice(0, 2000), REGEX_TIMEOUT_MS);
+    // On timeout, return false (fail closed: don't use this parser)
+    return result.value;
+  };
+
+  const parse = async (text: string, options: ParseOptions): Promise<ParseOutput> => {
+    const notes: string[] = [];
+
     // Cap input to 256 KB (the tail) to bound regex execution time
     const bounded = text.length > MAX_INPUT_BYTES ? text.slice(-MAX_INPUT_BYTES) : text;
     const lines = boundedLines(bounded);
@@ -295,21 +378,46 @@ export function createCustomParser(config: CustomParserConfig): EvidenceParser |
 
     // Extract summary if pattern is provided
     if (summaryRegex) {
-      summaryRegex.lastIndex = 0;
-      const summaryMatch = withTimeout(() => summaryRegex.exec(fullText), REGEX_TIMEOUT_MS);
-      if (summaryMatch?.groups?.failed) {
-        failedCount = Number(summaryMatch.groups.failed);
+      const summaryResult = await workerRegexMatchAll(
+        summaryRegex.source,
+        summaryRegex.flags,
+        fullText,
+        1,
+        REGEX_TIMEOUT_MS,
+      );
+      if (summaryResult.timedOut) {
+        notes.push(`custom parser '${config.name}': summary_pattern timed out (>${REGEX_TIMEOUT_MS}ms)`);
+      } else if (summaryResult.value.length > 0 && summaryResult.value[0].groups.failed) {
+        failedCount = Number(summaryResult.value[0].groups.failed);
       }
     }
 
-    // Extract failing tests using bounded iteration with timeout
-    const seen = new Set<string>();
-    const matches = boundedMatchAll(failRegex, fullText, MAX_ENTRIES, REGEX_TIMEOUT_MS);
+    // Extract failing tests using worker thread with hard timeout
+    const matchResult = await workerRegexMatchAll(
+      failRegex.source,
+      failRegex.flags,
+      fullText,
+      MAX_ENTRIES,
+      REGEX_TIMEOUT_MS,
+    );
 
-    for (const match of matches) {
+    if (matchResult.timedOut) {
+      notes.push(`custom parser '${config.name}': fail_pattern timed out (>${REGEX_TIMEOUT_MS}ms), results incomplete`);
+      // Return what we have (empty) with the timeout note - fail closed
+      return {
+        causes: [],
+        passed: [],
+        flaky: [],
+        failedCount,
+        notes,
+      };
+    }
+
+    const seen = new Set<string>();
+    for (const match of matchResult.value) {
       if (raws.length >= MAX_ENTRIES) break;
 
-      const groups = match.groups ?? {};
+      const groups = match.groups;
       const name = groups.name?.trim();
       if (!name) continue;
 
@@ -323,7 +431,7 @@ export function createCustomParser(config: CustomParserConfig): EvidenceParser |
 
       // Find context lines around the match
       const matchStart = match.index;
-      const matchEnd = matchStart + match[0].length;
+      const matchEnd = matchStart + match.match.length;
       const beforeStart = fullText.lastIndexOf("\n", matchStart) + 1;
       const afterEnd = fullText.indexOf("\n", matchEnd);
       const contextLines = fullText
@@ -347,19 +455,35 @@ export function createCustomParser(config: CustomParserConfig): EvidenceParser |
       passed: [],
       flaky: [],
       failedCount,
+      notes: notes.length > 0 ? notes : undefined,
     };
   };
 
   return {
     id: config.name,
     source: "console",
-    detect: (text, _lines) => {
-      detectRegex.lastIndex = 0;
-      const result = withTimeout(() => detectRegex.test(text.slice(0, 2000)), REGEX_TIMEOUT_MS);
-      return result ?? false;
-    },
+    async: true,
+    detect,
     parse,
   };
+}
+
+/**
+ * Run a catastrophic regex test with worker thread protection.
+ * Exported for testing the worker timeout behavior.
+ *
+ * @param pattern - The regex pattern to test
+ * @param text - The text to match against
+ * @param timeoutMs - Timeout in milliseconds
+ * @returns { timedOut: boolean, matched: boolean }
+ */
+export async function runCatastrophicRegexTest(
+  pattern: string,
+  text: string,
+  timeoutMs: number,
+): Promise<{ timedOut: boolean; matched: boolean }> {
+  const result = await workerRegexTest(pattern, "g", text, timeoutMs);
+  return { timedOut: result.timedOut, matched: result.value };
 }
 
 /**
@@ -375,6 +499,9 @@ export function createCustomParser(config: CustomParserConfig): EvidenceParser |
 export function validateCustomParserConfig(config: unknown): string[] {
   const errors: string[] = [];
 
+  // Built-in parser ids that custom parsers cannot use
+  const BUILTIN_IDS = ["junit", "trx", "gradle", "vitest", "jest", "pytest", "go", "cargo"];
+
   if (!config || typeof config !== "object") {
     return ["custom parser config must be an object"];
   }
@@ -384,7 +511,9 @@ export function validateCustomParserConfig(config: unknown): string[] {
   if (typeof c.name !== "string" || c.name.length === 0) {
     errors.push("custom parser requires a non-empty 'name' field");
   } else if (!/^[a-z][a-z0-9_-]{0,31}$/.test(c.name)) {
-    errors.push("custom parser name must be lowercase alphanumeric with hyphens/underscores (max 32 chars)");
+    errors.push("custom parser name must start with a letter and contain only lowercase alphanumeric, hyphens and underscores (max 32 chars)");
+  } else if (BUILTIN_IDS.includes(c.name)) {
+    errors.push(`custom parser name '${c.name}' conflicts with a built-in parser`);
   }
 
   if (typeof c.detect !== "string" || c.detect.length === 0) {

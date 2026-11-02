@@ -9,14 +9,11 @@ test utils::tests::test_format_money ... ok
 failures:
 
 ---- orders::tests::test_calculate_total stdout ----
-thread 'orders::tests::test_calculate_total' panicked at 'assertion failed: `(left == right)`
-  left: `100`,
- right: `108`', src/orders.rs:45:9
+thread 'orders::tests::test_calculate_total' panicked at 'assertion failed: `(left == right)`: left: `100`, right: `108`', src/orders.rs:45:9
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 
 ---- db::tests::test_connect stdout ----
-thread 'db::tests::test_connect' panicked at 'connection failed: Connection refused (os error 111)'
-src/db.rs:23:5
+thread 'db::tests::test_connect' panicked at 'connection failed: Connection refused (os error 111)', src/db.rs:23:5
 
 
 failures:

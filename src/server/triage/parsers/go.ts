@@ -147,8 +147,10 @@ export const goTestParser: EvidenceParser = {
   source: "console",
   detect: (_text, lines) => {
     // Detect go test -json output: lines starting with { that have "Action" field
+    // Scan all bounded lines, not just the first 100 - a cold-cache run may have
+    // many "go: downloading" lines before the first test event.
     let jsonLines = 0;
-    for (const line of lines.slice(0, 100)) {
+    for (const line of lines) {
       if (line.startsWith("{") && line.includes('"Action"')) {
         jsonLines++;
         if (jsonLines >= 3) return true;

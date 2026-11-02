@@ -14,7 +14,7 @@ import { ExecFileRunner, NodeFileSystem, systemClock } from "../watchdog/probes.
 import { parseTriageConfig } from "./config.js";
 import { commandAdapters, type TriageAdapters } from "./adapters.js";
 import { GitCli } from "./git.js";
-import { BUILTIN_PARSERS, type EvidenceParser } from "./parsers/index.js";
+import { BUILTIN_PARSERS, type AsyncEvidenceParser, type EvidenceParser } from "./parsers/index.js";
 import { TriageStore } from "./store.js";
 import {
   TriageConflictError,
@@ -40,7 +40,7 @@ export interface TriageManagerOptions {
   /** In-process adapters from other modules, per project; they replace the command adapters */
   adapters?: (project: string) => Partial<TriageAdapters>;
   /** Evidence parsers (default: the built-in ones) */
-  parsers?: EvidenceParser[];
+  parsers?: (EvidenceParser | AsyncEvidenceParser)[];
   /**
    * The review module (ReviewManager), in-process: every signed result
    * triage accepts is handed to it, which keeps it for the project's merge
