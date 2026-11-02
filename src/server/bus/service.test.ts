@@ -71,7 +71,7 @@ describe("BusService", () => {
   // ============ whoami tests ============
 
   describe("whoami", () => {
-    it("shows agent identity (ACCEPTANCE TEST 4)", () => {
+    it("shows agent identity (ACCEPTANCE TEST 4)", async () => {
       const binding = issueToken("worker-a", "run-1");
 
       const result = service.whoami(binding);
@@ -84,7 +84,7 @@ describe("BusService", () => {
       }
     });
 
-    it("shows claimed task from agents module (ACCEPTANCE TEST 4)", () => {
+    it("shows claimed task from agents module (ACCEPTANCE TEST 4)", async () => {
       const binding = issueToken("worker-a", "run-1");
       runTaskMap.set("run-1", "feat-search");
 
@@ -99,22 +99,22 @@ describe("BusService", () => {
   // ============ report tests ============
 
   describe("report", () => {
-    it("accepts report when run holds the task (ACCEPTANCE TEST 5)", () => {
+    it("accepts report when run holds the task (ACCEPTANCE TEST 5)", async () => {
       const binding = issueToken("worker-a", "run-1");
       runTaskMap.set("run-1", "feat-search");
 
-      const result = service.report(binding, "PROGRESS", "feat-search", "Working on it");
+      const result = await service.report(binding, "PROGRESS", "feat-search", "Working on it");
       expect(result.ok).toBe(true);
       if (result.ok) {
         expect(result.data.id).toBeGreaterThan(0);
       }
     });
 
-    it("refuses report when run does not hold the task (ACCEPTANCE TEST 5)", () => {
+    it("refuses report when run does not hold the task (ACCEPTANCE TEST 5)", async () => {
       const binding = issueToken("worker-a", "run-1");
       runTaskMap.set("run-1", "different-task");
 
-      const result = service.report(binding, "DONE", "feat-search", "Trying to report wrong task");
+      const result = await service.report(binding, "DONE", "feat-search", "Trying to report wrong task");
       expect(result.ok).toBe(false);
       if (!result.ok) {
         expect(result.error.code).toBe("forbidden");
@@ -123,11 +123,11 @@ describe("BusService", () => {
       }
     });
 
-    it("refuses report when run holds no task (ACCEPTANCE TEST 5)", () => {
+    it("refuses report when run holds no task (ACCEPTANCE TEST 5)", async () => {
       const binding = issueToken("worker-a", "run-1");
       // runTaskMap is empty, so run-1 holds no task
 
-      const result = service.report(binding, "DONE", "feat-search", "No task claimed");
+      const result = await service.report(binding, "DONE", "feat-search", "No task claimed");
       expect(result.ok).toBe(false);
       if (!result.ok) {
         expect(result.error.code).toBe("forbidden");
@@ -135,11 +135,11 @@ describe("BusService", () => {
       }
     });
 
-    it("stores report with all fields", () => {
+    it("stores report with all fields", async () => {
       const binding = issueToken("worker-a", "run-1");
       runTaskMap.set("run-1", "feat-search");
 
-      const result = service.report(binding, "WAITING", "feat-search", "Waiting for gate", "gate-abc", 42, "abc123");
+      const result = await service.report(binding, "WAITING", "feat-search", "Waiting for gate", "gate-abc", 42, "abc123");
       expect(result.ok).toBe(true);
       if (result.ok) {
         const report = store.getReport(result.data.id);
@@ -155,10 +155,10 @@ describe("BusService", () => {
   // ============ send tests ============
 
   describe("send", () => {
-    it("allows sending to orchestrator (ACCEPTANCE TEST 6)", () => {
+    it("allows sending to orchestrator (ACCEPTANCE TEST 6)", async () => {
       const binding = issueToken("worker-a", "run-1");
 
-      const result = service.send(binding, "orchestrator", "Need help");
+      const result = await service.send(binding, "orchestrator", "Need help");
       expect(result.ok).toBe(true);
       if (result.ok) {
         expect(result.data.to).toBe("orchestrator");
@@ -166,20 +166,20 @@ describe("BusService", () => {
       }
     });
 
-    it("allows sending to owner (ACCEPTANCE TEST 6)", () => {
+    it("allows sending to owner (ACCEPTANCE TEST 6)", async () => {
       const binding = issueToken("worker-a", "run-1");
 
-      const result = service.send(binding, "owner", "Question for owner");
+      const result = await service.send(binding, "owner", "Question for owner");
       expect(result.ok).toBe(true);
       if (result.ok) {
         expect(result.data.to).toBe("owner");
       }
     });
 
-    it("refuses sending to another agent (ACCEPTANCE TEST 6)", () => {
+    it("refuses sending to another agent (ACCEPTANCE TEST 6)", async () => {
       const binding = issueToken("worker-a", "run-1");
 
-      const result = service.send(binding, "worker-b", "Hello worker-b");
+      const result = await service.send(binding, "worker-b", "Hello worker-b");
       expect(result.ok).toBe(false);
       if (!result.ok) {
         expect(result.error.code).toBe("forbidden");
@@ -187,8 +187,8 @@ describe("BusService", () => {
       }
     });
 
-    it("sendFromOwner can send to any agent", () => {
-      const result = service.sendFromOwner("worker-b", "Hello from owner", 8);
+    it("sendFromOwner can send to any agent", async () => {
+      const result = await service.sendFromOwner("worker-b", "Hello from owner", 8);
       expect(result.ok).toBe(true);
       if (result.ok) {
         expect(result.data.to).toBe("worker-b");
@@ -205,7 +205,7 @@ describe("BusService", () => {
   // ============ inbox tests ============
 
   describe("inbox", () => {
-    it("returns unread messages in priority order (ACCEPTANCE TEST 7)", () => {
+    it("returns unread messages in priority order (ACCEPTANCE TEST 7)", async () => {
       const binding = issueToken("worker-a", "run-1");
       const now = Date.now();
 
@@ -228,7 +228,7 @@ describe("BusService", () => {
       }
     });
 
-    it("only returns messages for this agent", () => {
+    it("only returns messages for this agent", async () => {
       const bindingA = issueToken("worker-a", "run-a");
       const bindingB = issueToken("worker-b", "run-b");
       const now = Date.now();
@@ -255,7 +255,7 @@ describe("BusService", () => {
   // ============ ack tests ============
 
   describe("ack", () => {
-    it("succeeds for own messages (ACCEPTANCE TEST 8)", () => {
+    it("succeeds for own messages (ACCEPTANCE TEST 8)", async () => {
       const binding = issueToken("worker-a", "run-1");
       const now = Date.now();
 
@@ -275,7 +275,7 @@ describe("BusService", () => {
       expect(msg!.ackNote).toBe("Done!");
     });
 
-    it("fails for another agent's message (ACCEPTANCE TEST 8)", () => {
+    it("fails for another agent's message (ACCEPTANCE TEST 8)", async () => {
       const bindingA = issueToken("worker-a", "run-a");
       const now = Date.now();
 
@@ -290,7 +290,7 @@ describe("BusService", () => {
       }
     });
 
-    it("returns not_found for non-existent message", () => {
+    it("returns not_found for non-existent message", async () => {
       const binding = issueToken("worker-a", "run-1");
 
       const result = service.ack(binding, "non-existent-id");
@@ -304,7 +304,7 @@ describe("BusService", () => {
   // ============ board tests ============
 
   describe("board", () => {
-    it("shows tasks and owners from agents module (ACCEPTANCE TEST 9)", () => {
+    it("shows tasks and owners from agents module (ACCEPTANCE TEST 9)", async () => {
       const now = Date.now();
 
       // Set up claims (simulating agents module)
@@ -338,7 +338,7 @@ describe("BusService", () => {
       }
     });
 
-    it("shows tasks with reports but no current owner", () => {
+    it("shows tasks with reports but no current owner", async () => {
       const now = Date.now();
 
       // A task was worked on but is now unclaimed
@@ -358,11 +358,11 @@ describe("BusService", () => {
   // ============ sanitization tests ============
 
   describe("sanitization", () => {
-    it("removes control characters from summary", () => {
+    it("removes control characters from summary", async () => {
       const binding = issueToken("worker-a", "run-1");
       runTaskMap.set("run-1", "feat-test");
 
-      const result = service.report(binding, "PROGRESS", "feat-test", "Line1\x00\x1bLine2\nLine3");
+      const result = await service.report(binding, "PROGRESS", "feat-test", "Line1\x00\x1bLine2\nLine3");
       expect(result.ok).toBe(true);
       if (result.ok) {
         const report = store.getReport(result.data.id);
@@ -372,12 +372,12 @@ describe("BusService", () => {
       }
     });
 
-    it("truncates very long text", () => {
+    it("truncates very long text", async () => {
       const binding = issueToken("worker-a", "run-1");
       runTaskMap.set("run-1", "feat-test");
 
       const longSummary = "x".repeat(15000);
-      const result = service.report(binding, "PROGRESS", "feat-test", longSummary);
+      const result = await service.report(binding, "PROGRESS", "feat-test", longSummary);
       expect(result.ok).toBe(true);
       if (result.ok) {
         const report = store.getReport(result.data.id);

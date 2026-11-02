@@ -38,8 +38,9 @@ import { hashToken, newAssignmentToken } from "./tokens.js";
 import { ACTIVE_STATES } from "../agents/types.js";
 import { checkTestIntegrity, isTestFile, type IntegrityFile } from "./integrity.js";
 import { GitHubHost, tokenFrom, type FetchLike, type TokenSource } from "./github.js";
-import type { GitHost, HostCheck, HostFile, HostPullRequest, HostRepo } from "./host.js";
+import type { GitHost, HostFile, HostPullRequest, HostRepo } from "./host.js";
 import type { ReadyFacts } from "../ready-guard/guard.js";
+import { newestChecks } from "../repos/checks.js";
 import { systemGit, type GitRunner } from "./git.js";
 import { LocalMerger, mergeOnHost, planMerge, type MergeExecution } from "./executor.js";
 import { ReviewStore, type AssignmentRecord, type AutoMergeState, type StoredReview } from "./store.js";
@@ -546,12 +547,7 @@ export class ReviewService {
     const pr = await host.getPullRequest(n);
     const baseTip = await host.branchHead(pr.baseRef);
     const behindBy = (await host.compare(baseTip, pr.headSha)).behindBy;
-    const newest = new Map<string, HostCheck>();
-    for (const c of await host.listChecks(pr.headSha)) {
-      const key = `${c.kind}:${c.name}`;
-      const seen = newest.get(key);
-      if (!seen || Date.parse(c.at ?? "") > Date.parse(seen.at ?? "")) newest.set(key, c);
-    }
+    const newest = newestChecks(await host.listChecks(pr.headSha));
     const required = await this.gateSource.checksAt(pr.headSha);
     const findingIds = this.annotate(this.o.store.listReviews(this.project, n), pr.headSha)
       .flatMap((r) => r.findings)
@@ -565,7 +561,7 @@ export class ReviewService {
       mergeable: pr.mergeable,
       behindBy,
       body: pr.body ?? "",
-      checks: [...newest.values()].map((c) => ({ name: c.name, state: c.state })),
+      checks: newest.map((c) => ({ name: c.name, state: c.state })),
       commitShas: (await host.listCommits(n)).map((c) => c.sha),
       gate: required.length === 0 ? null : required.map((g) => ({ name: g.name, status: g.status })),
       findingIds,

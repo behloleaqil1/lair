@@ -478,6 +478,16 @@ export class GitHubTrackerClient {
     return (list ?? []).map(pullOf);
   }
 
+  /**
+   * The closed pull requests, the most recently updated first (one page of
+   * `perPage`): a merge made outside Lair's review module shows here. A
+   * listed PR carries `merged_at`, not `merged`.
+   */
+  async listClosedPulls(repo: string, perPage: number): Promise<Pull[]> {
+    const list = await this.rest<GhPull[]>("GET", `/repos/${repo}/pulls?state=closed&sort=updated&direction=desc&per_page=${perPage}`);
+    return (list ?? []).map(pullOf);
+  }
+
   // ============ Milestones (REST) ============
 
   async listMilestones(repo: string, state: "open" | "closed"): Promise<Milestone[]> {

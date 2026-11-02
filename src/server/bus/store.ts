@@ -12,6 +12,7 @@
  */
 import Database from "better-sqlite3";
 import { existsSync, mkdirSync } from "fs";
+import { access } from "fs/promises";
 import { dirname, join } from "path";
 import { randomUUID } from "crypto";
 import type { ReportKind } from "../../bus/types.js";
@@ -255,6 +256,25 @@ export class BusStore {
     return result.changes;
   }
 
+  /**
+   * Revoke every token of a run not in `activeRunIds` (the runs that ended while this server wasn't there to revoke
+   * them): one transaction. Returns how many were revoked.
+   */
+  revokeTokensExcept(activeRunIds: readonly string[], at: number): number {
+    const active = new Set(activeRunIds);
+    const revoke = this.db.prepare(`UPDATE bus_tokens SET revoked_at = ? WHERE project = ? AND run_id = ? AND revoked_at IS NULL`);
+    return this.db.transaction(() => {
+      const runs = this.db
+        .prepare(`SELECT DISTINCT run_id FROM bus_tokens WHERE project = ? AND revoked_at IS NULL`)
+        .all(this.project) as Array<{ run_id: string }>;
+      let revoked = 0;
+      for (const { run_id } of runs) {
+        if (!active.has(run_id)) revoked += revoke.run(at, this.project, run_id).changes;
+      }
+      return revoked;
+    })();
+  }
+
   /** Validate a token: returns the binding if valid, null if invalid or revoked. */
   validateToken(tokenHash: string): BusTokenBinding | null {
     const row = this.db
@@ -436,6 +456,14 @@ export class BusStore {
       .get(this.project, agentId) as { n: number };
     return row.n;
   }
+
+  /** The project's latest messages, newest first (the dashboard's Bus tab). */
+  listRecentMessages(limit: number): BusMessage[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM bus_messages WHERE project = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`)
+      .all(this.project, limit) as MessageRow[];
+    return rows.map(toMessage);
+  }
 }
 
 // ============ Store management ============
@@ -452,6 +480,26 @@ export function getBusStore(project: string, dataDir: string): BusStore {
     stores.set(key, store);
   }
   return store;
+}
+
+/** A project's bus store if this process has it open, else null: nothing is opened or created. */
+export function openedBusStore(project: string, dataDir: string): BusStore | null {
+  return stores.get(`${dataDir}:${project}`) ?? null;
+}
+
+/**
+ * A project's bus store if it is open or its database file exists, else null: nothing is created (a project that
+ * never had a bus keeps no bus files). The file is checked without blocking the event loop.
+ */
+export async function existingBusStore(project: string, dataDir: string): Promise<BusStore | null> {
+  const open = openedBusStore(project, dataDir);
+  if (open) return open;
+  try {
+    await access(join(dataDir, "bus", `${project}.db`));
+  } catch {
+    return null;
+  }
+  return getBusStore(project, dataDir);
 }
 
 /** Close all bus stores. */

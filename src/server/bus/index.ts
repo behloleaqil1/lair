@@ -15,7 +15,7 @@ export type {
   BusServiceOptions,
 } from "./service.js";
 
-export { BusStore, getBusStore, closeBusStores, messageState } from "./store.js";
+export { BusStore, getBusStore, openedBusStore, existingBusStore, closeBusStores, messageState } from "./store.js";
 export type { BusReport, BusMessage, MessageState } from "./store.js";
 
 export {
@@ -57,5 +57,7 @@ export type {
 
 export { parseBusConfig } from "./config.js";
 export type { BusSettings } from "./config.js";
+export { BusLive, liveEvents } from "./live.js";
+export type { BusLiveOptions } from "./live.js";
 export { agentsBusFor } from "./wiring.js";
 export type { AgentsBusOptions } from "./wiring.js";

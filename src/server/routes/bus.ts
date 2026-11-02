@@ -11,6 +11,8 @@
  * - GET  /api/bus/events: SSE feed for the UI (open)
  * - POST /api/bus/send: Owner sends a message (requires owner session)
  * - GET  /api/bus/messages/:agentId: Message list for the UI (open)
+ * - GET  /api/bus/activity: The Bus tab's first load, bounded by ?limit (at most 200); message texts and ack notes
+ *   only with the owner's session (the live updates are on the `bus` WebSocket channel: src/server/bus/live.ts)
  *
  * Claims have ONE source of truth: the agents module's claims. The bus does
  * not keep its own claim table.
@@ -27,6 +29,7 @@ import {
   getBusStore,
   hashBusToken,
   isBusTokenFormat,
+  messageState,
   redactBusToken,
   type BusConsumeMode,
   type BusConsumerHealth,
@@ -36,6 +39,14 @@ import {
 import type { ApiResponse, BoardOutput, TaskStatus } from "../../shared/types.js";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { ReportKind } from "../../bus/types.js";
+import {
+  BUS_ACTIVITY_DEFAULT_LIMIT,
+  BUS_ACTIVITY_MAX_LIMIT,
+  BUS_SUMMARY_MAX,
+  type BusActivity,
+} from "../../shared/bus-live.js";
+import type { AgentRun } from "../agents/types.js";
+import { isPlainName } from "../agents/config.js";
 import { z } from "zod";
 
 function respond<T>(data: T): ApiResponse<T> {
@@ -68,15 +79,24 @@ function extractToken(header: string | undefined): string | null {
 
 const ReportKindSchema = z.enum(["WAITING", "DONE", "BLOCKED", "PROGRESS", "TICK"]);
 
+/** A commit id: 7 to 64 hex digits (the consumers refuse a report whose sha isn't hex) */
+const SHA = /^[0-9a-f]{7,64}$/i;
+
 const toolSchemas = {
   whoami: z.object({}),
+  // A report the consumers would refuse is refused here (400), never stored or mirrored: its wake-up would be lost
   report: z.object({
     kind: ReportKindSchema,
     task: z.string().min(1).max(200),
     summary: z.string().min(1).max(10000),
-    gate_id: z.string().max(200).optional(),
+    // What a WAITING run waits on, as fill looks it up: one plain name (no '/', no '..', no leading '-')
+    gate_id: z
+      .string()
+      .max(200)
+      .refine(isPlainName, "a plain name: letters, digits, '.', '_' and '-', starting with a letter or digit, no '..'")
+      .optional(),
     pr: z.number().int().positive().optional(),
-    sha: z.string().max(64).optional(),
+    sha: z.string().regex(SHA, "a commit id: 7 to 64 hex digits").optional(),
   }),
   inbox: z.object({}),
   ack: z.object({
@@ -142,6 +162,16 @@ export function forgetBusService(project: string): void {
   busServices.delete(project);
 }
 
+/**
+ * A run of the project by its id, looked up in the agents store (however many runs came after it), or null: none
+ * with that id, another project's, or the project's agents module is off (it has no runs).
+ */
+function projectRun(options: BusRoutesOptions, project: string, runId: string): AgentRun | null {
+  if (!options.agents.get(project)) return null;
+  const run = options.agents.getStore()?.getRun(runId) ?? null;
+  return run !== null && run.project === project ? run : null;
+}
+
 function getBusService(
   project: string,
   options: BusRoutesOptions,
@@ -160,14 +190,8 @@ function getBusService(
 
     const serviceOptions: BusServiceOptions = {
       store,
-      getClaimedTask: (runId: string) => {
-        const agentService = options.agents.get(project);
-        if (!agentService) return null;
-        // Find the run and get its claimed task
-        const runs = agentService.runs(100);
-        const run = runs.find((r) => r.id === runId);
-        return run?.task ?? null;
-      },
+      // The run's task (whichever run it is: never only among the latest runs)
+      getClaimedTask: (runId: string) => projectRun(options, project, runId)?.task ?? null,
       getAllClaims: () => {
         const agentService = options.agents.get(project);
         if (!agentService) return [];
@@ -266,8 +290,7 @@ async function busRoutes(
     }
 
     // Verify the run is still active (a project whose agents module is off has no active run)
-    const agentService = options.agents.get(project);
-    const run = agentService?.runs(100).find((r) => r.id === binding.runId);
+    const run = projectRun(options, project, binding.runId);
     if (!run || !["queued", "waiting_lock", "running"].includes(run.state)) {
       const err = respondError("Run is no longer active", 401);
       return reply.code(err.statusCode).send(err);
@@ -299,7 +322,7 @@ async function busRoutes(
 
       case "report": {
         const reportArgs = parsed.data as z.infer<typeof toolSchemas.report>;
-        result = service.report(
+        result = await service.report(
           binding,
           reportArgs.kind as ReportKind,
           reportArgs.task,
@@ -323,7 +346,7 @@ async function busRoutes(
 
       case "send": {
         const sendArgs = parsed.data as z.infer<typeof toolSchemas.send>;
-        result = service.send(binding, sendArgs.to, sendArgs.text, sendArgs.priority);
+        result = await service.send(binding, sendArgs.to, sendArgs.text, sendArgs.priority);
         break;
       }
 
@@ -510,7 +533,7 @@ async function busRoutes(
       }
 
       const { service } = getBusService(project, options);
-      const result = service.sendFromOwner(to, text, priority);
+      const result = await service.sendFromOwner(to, text, priority);
       if (!result.ok) {
         const err = respondError(result.error.message);
         return reply.code(err.statusCode).send(err);
@@ -552,5 +575,48 @@ async function busRoutes(
       })),
       unread: service.countUnread(agentId),
     });
+  });
+
+  // ============ GET /api/bus/activity - The Bus tab's first load (open; message texts for the owner only) ============
+
+  fastify.get<{ Querystring: { project: string; limit?: string } }>("/api/bus/activity", async (request, reply) => {
+    const raw = request.query.limit;
+    const asked = raw === undefined ? BUS_ACTIVITY_DEFAULT_LIMIT : Number(raw);
+    if (!Number.isSafeInteger(asked) || asked < 1) {
+      const err = respondError(`limit must be a whole number from 1 to ${BUS_ACTIVITY_MAX_LIMIT}`);
+      return reply.code(err.statusCode).send(err);
+    }
+    const limit = Math.min(asked, BUS_ACTIVITY_MAX_LIMIT);
+    const project = request.query.project;
+    const store = busStoreFor(project, options.dataDir);
+    // The socket carries no owner session: texts and ack notes come only from here, with it
+    const owner = auth.verifyRequest(request.headers, { method: request.method }).ok;
+    const activity: BusActivity = {
+      reports: store.listReports({ limit }).map((r) => ({
+        type: "report",
+        id: r.id,
+        at: new Date(r.createdAt).toISOString(),
+        agent: r.agent,
+        task: r.task,
+        kind: r.kind,
+        summary: r.summary.slice(0, BUS_SUMMARY_MAX),
+        gateId: r.gateId,
+        pr: r.pr,
+        sha: r.sha,
+      })),
+      messages: store.listRecentMessages(limit).map((m) => ({
+        id: m.id,
+        at: new Date(m.createdAt).toISOString(),
+        from: m.fromId,
+        to: m.toId,
+        state: messageState(m),
+        ...(owner ? { text: m.text, ackNote: m.ackNote } : {}),
+      })),
+      claims: (options.agents.getStore()?.listClaims(project) ?? [])
+        .slice(-limit)
+        .map((c) => ({ agent: c.agent, task: c.task, at: new Date(c.claimedAt).toISOString() })),
+      owner,
+    };
+    return respond(activity);
   });
 }

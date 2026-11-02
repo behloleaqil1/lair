@@ -29,7 +29,15 @@
  * Text that comes from the git host (check names, gate names, branch names)
  * is data: the instruction states Lair's own words first and lists such text
  * only inside a fenced data block.
+ *
+ * A project that lists its repositories (`repos:`, src/server/repos/) can
+ * report PRs of any of them (`lib PR #7`, `lib#7`, `owner/name#7`); a bare
+ * `PR #n` is the task's repository (`repo:owner/name`), else the default. On
+ * a repository whose hosted CI does not count (`ci_counts: false`) the CI
+ * items are not checked.
  */
+import { bareRepo, parsePrRefs, taskRepoOf } from "../repos/refs.js";
+import type { RepoEntry } from "../repos/config.js";
 
 export type ReadyRefusal =
   | "unverifiable"
@@ -79,10 +87,19 @@ export interface ReadyFacts {
 }
 
 export interface ReadyFactsSource {
-  facts(pr: number): Promise<ReadyFacts>;
+  /** The repositories a report can name */
+  repos: RepoEntry[];
+  /** The project sets no `repos:`: only `PR #n` forms name a PR (on the one repository), as before */
+  legacy?: boolean;
+  facts(repo: string, pr: number): Promise<ReadyFacts>;
 }
 
+/** No source: a `PR #n` still names a PR (one that can't be verified), as before */
+export const NO_SOURCE_REPOS: RepoEntry[] = [{ repo: "(unknown)", default: true, base: null, ciCounts: true, refs: [] }];
+
 export interface ReadyReport {
+  /** owner/name */
+  repo: string;
   pr: number;
   /** The head the agent reported, when the line names one */
   sha: string | null;
@@ -109,49 +126,59 @@ export type ParsedReport =
   | { kind: "none" }
   | { kind: "pr"; report: ReadyReport }
   /** The line names several PRs and nothing says which one is the report's */
-  | { kind: "ambiguous"; prs: number[] };
+  | { kind: "ambiguous"; prs: { repo: string; pr: number }[] };
 
 const SHA = /^[0-9a-f]{7,40}$/i;
 const MAX_LISTED = 5;
 /** How long one read of a PR may take before the host counts as not answering */
 export const READY_TIMEOUT_MS = 20_000;
 
-const MENTION = /\b(?:PR|pull request)\s*#(\d{1,9})\b(?:\s*\[([0-9a-f]{7,40})\]|\s+at\s+([0-9a-f]{7,40})\b)?/gi;
 /** The tail the bus mirror writes: `... PR #<n> [<sha7>]` at the very end of the line (before its bus marker) */
 const BUS_TAIL = /\b(?:PR|pull request)\s*#(\d{1,9})\s*\[([0-9a-f]{7,40})\]\s*$/i;
 /** The marker the mirror ends its lines with, `[bus:<id>]` (src/server/bus/consumers.ts) */
 const BUS_MARKER = /\s*\[bus:[1-9]\d{0,14}\]\s*$/;
-
-function mentions(text: string): { pr: number; sha: string | null }[] {
-  return [...text.matchAll(MENTION)].map((m) => ({ pr: Number(m[1]), sha: (m[2] ?? m[3] ?? "").toLowerCase() || null }));
-}
 
 /** Whether a task's text is about a pull request (so its DONE line must name one). */
 export function isPrWork(taskText: string): boolean {
   return /\b(?:PR|pull request)\b/i.test(taskText);
 }
 
+/** How a refusal names a PR: `PR #<n>` on the default repository (as before), `<ref>#<n>` on another. */
+export function prName(r: { repo: string; pr: number }, repos: RepoEntry[]): string {
+  const entry = repos.find((e) => e.repo.toLowerCase() === r.repo.toLowerCase());
+  return !entry || entry.default ? `PR #${r.pr}` : `${entry.refs[0] ?? entry.repo}#${r.pr}`;
+}
+
+/** A report that names its PR number in a field (the bus tail, a structured bus report): the task's repository, else the default. */
+export function fieldReport(pr: number, sha: string | null, taskText: string, repos: RepoEntry[]): ParsedReport {
+  const repo = bareRepo(repos, taskRepoOf(taskText));
+  return repo === null ? { kind: "none" } : { kind: "pr", report: { repo, pr, sha } };
+}
+
 /**
  * The PR a DONE queue line reports and the head it names. The bus mirror
  * writes `... <summary> [gate] PR #<n> [<sha7>]`: that tail is read first, so
  * a PR number in the agent's own summary can't win. An agent's own line says
- * `PR #<n> at <sha>`. With several PRs and no bus tail, the PR the task text
- * names wins; if that doesn't settle it the line is ambiguous.
+ * `PR #<n> at <sha>` (or `<ref> PR #<n> at <sha>`). With several PRs and no
+ * bus tail, the PR the task text names wins; if that doesn't settle it the
+ * line is ambiguous. PRs are (repository, number) pairs.
  */
-export function parseReadyReport(line: string, taskText = ""): ParsedReport {
+export function parseReadyReport(line: string, taskText: string, repos: RepoEntry[], legacy = false): ParsedReport {
   const tail = BUS_TAIL.exec(line.replace(BUS_MARKER, ""));
-  if (tail) return { kind: "pr", report: { pr: Number(tail[1]), sha: tail[2].toLowerCase() } };
-  const found = mentions(line);
+  if (tail) return fieldReport(Number(tail[1]), tail[2].toLowerCase(), taskText, repos);
+  const options = { mode: "report", taskRepo: taskRepoOf(taskText), qualified: !legacy } as const;
+  const found = parsePrRefs(line, repos, options);
   if (found.length === 0) return { kind: "none" };
-  let prs = [...new Set(found.map((m) => m.pr))];
+  const key = (r: { repo: string; number: number }) => `${r.repo.toLowerCase()}#${r.number}`;
+  let prs = [...new Map(found.map((m) => [key(m), m])).values()];
   if (prs.length > 1) {
-    const named = new Set(mentions(taskText).map((m) => m.pr));
-    const narrowed = prs.filter((p) => named.has(p));
+    const named = new Set(parsePrRefs(taskText, repos, options).map(key));
+    const narrowed = prs.filter((p) => named.has(key(p)));
     if (narrowed.length > 0) prs = narrowed;
   }
-  if (prs.length > 1) return { kind: "ambiguous", prs };
-  const sha = found.filter((m) => m.pr === prs[0] && m.sha).pop()?.sha ?? null;
-  return { kind: "pr", report: { pr: prs[0], sha } };
+  if (prs.length > 1) return { kind: "ambiguous", prs: prs.map((p) => ({ repo: p.repo, pr: p.number })) };
+  const sha = found.filter((m) => key(m) === key(prs[0]) && m.sha).pop()?.sha ?? null;
+  return { kind: "pr", report: { repo: prs[0].repo, pr: prs[0].number, sha } };
 }
 
 /** One piece of external text, safe on one line of a fenced data block. */
@@ -190,10 +217,10 @@ interface Problem {
 
 const display = (p: Problem): string => (p.data ? `${p.safe}: ${names(p.data.values)}` : p.safe);
 
-function evaluate(report: ReadyReport, f: ReadyFacts, agent: string | undefined): Problem[] {
+function evaluate(report: ReadyReport, f: ReadyFacts, agent: string | undefined, name: string, ciCounts: boolean): Problem[] {
   const out: Problem[] = [];
   if (f.state !== "open") {
-    out.push({ reason: "not_open", retry: false, safe: `PR #${report.pr} is ${f.state}`, todo: "Report on an open PR." });
+    out.push({ reason: "not_open", retry: false, safe: `${name} is ${f.state}`, todo: "Report on an open PR." });
     return out;
   }
   const head = f.headSha.toLowerCase();
@@ -210,7 +237,7 @@ function evaluate(report: ReadyReport, f: ReadyFacts, agent: string | undefined)
     out.push({
       reason: "wrong_agent",
       retry: false,
-      safe: `PR #${report.pr} is another agent's branch, not ${agent}'s`,
+      safe: `${name} is another agent's branch, not ${agent}'s`,
       data: { label: "PR branch", values: [f.headRef ?? ""] },
       todo: `Report the PR you opened yourself (its branch names ${agent}), not another agent's.`,
     });
@@ -241,8 +268,10 @@ function evaluate(report: ReadyReport, f: ReadyFacts, agent: string | undefined)
       todo: "Nothing to change; it is checked again.",
     });
   }
-  const failed = f.checks.filter((c) => c.state === "failure").map((c) => c.name);
-  const running = f.checks.filter((c) => c.state === "pending").map((c) => c.name);
+  // ci_counts: false: the repository's hosted CI is not a signal (neither red, running nor missing CI is an item)
+  const checks = ciCounts ? f.checks : [];
+  const failed = checks.filter((c) => c.state === "failure").map((c) => c.name);
+  const running = checks.filter((c) => c.state === "pending").map((c) => c.name);
   if (failed.length > 0) {
     out.push({
       reason: "ci_failed",
@@ -260,7 +289,7 @@ function evaluate(report: ReadyReport, f: ReadyFacts, agent: string | undefined)
       data: { label: "running checks", values: running },
       todo: "Nothing to change; it is checked again when CI finishes.",
     });
-  } else if (f.checks.length === 0) {
+  } else if (ciCounts && f.checks.length === 0) {
     out.push({
       reason: "ci_pending",
       retry: true,
@@ -311,16 +340,16 @@ function evaluate(report: ReadyReport, f: ReadyFacts, agent: string | undefined)
   return out;
 }
 
-function verdictOf(pr: number | null, problems: Problem[], hostDown = false): ReadyVerdict {
+function verdictOf(name: string | null, problems: Problem[], hostDown = false): ReadyVerdict {
   if (problems.length === 0) return { ok: true };
   const first = problems.find((p) => !p.retry) ?? problems[0];
   const retry = problems.every((p) => p.retry);
   const todo = [...new Set(problems.filter((p) => !p.retry || retry).map((p) => p.todo))];
   const data = problems.flatMap((p) => (p.data ? [`${p.data.label}: ${names(p.data.values)}`] : []));
   const instruction = [
-    pr === null
+    name === null
       ? "Your report was refused. Nothing was sent to review and the task stays open."
-      : `Your report for PR #${pr} was refused. Nothing was sent to review and the task stays open.`,
+      : `Your report for ${name} was refused. Nothing was sent to review and the task stays open.`,
     ...problems.map((p) => `- ${p.safe}`),
     "",
     ...todo,
@@ -333,41 +362,43 @@ function verdictOf(pr: number | null, problems: Problem[], hostDown = false): Re
 }
 
 /** The host can't say (no source, or backing off): a retry, never an accept. */
-export function unverifiable(pr: number, safe: string): ReadyVerdict {
-  return verdictOf(pr, [{ reason: "unverifiable", retry: true, safe, todo: "Nothing to change; it is checked again." }], true);
+export function unverifiable(name: string, safe: string): ReadyVerdict {
+  return verdictOf(name, [{ reason: "unverifiable", retry: true, safe, todo: "Nothing to change; it is checked again." }], true);
 }
 
 /** A refusal that needs no host read (the report is missing a PR or a head, or names several). */
-export function refuseReport(reason: ReadyRefusal, safe: string, todo: string, pr: number | null = null): ReadyVerdict {
-  return verdictOf(pr, [{ reason, retry: false, safe, todo }]);
+export function refuseReport(reason: ReadyRefusal, safe: string, todo: string, name: string | null = null): ReadyVerdict {
+  return verdictOf(name, [{ reason, retry: false, safe, todo }]);
 }
 
 /**
  * Check one report against the host's facts. Never throws and never waits
  * longer than `timeoutMs`: a host that fails or does not answer is a retry
- * (`hostDown`).
+ * (`hostDown`). `ciCounts: false` (the repository's `ci_counts`) skips the CI
+ * items; everything else is checked.
  */
 export async function evaluateReady(
   report: ReadyReport,
   source: ReadyFactsSource,
-  options: { agent?: string; timeoutMs?: number } = {},
+  options: { agent?: string; timeoutMs?: number; ciCounts?: boolean } = {},
 ): Promise<ReadyVerdict> {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const name = prName(report, source.repos);
   try {
-    const read = source.facts(report.pr);
+    const read = source.facts(report.repo, report.pr);
     read.catch(() => {});
     const deadline = new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(new Error("the git host did not answer in time")), options.timeoutMs ?? READY_TIMEOUT_MS);
     });
-    return verdictOf(report.pr, evaluate(report, await Promise.race([read, deadline]), options.agent));
+    return verdictOf(name, evaluate(report, await Promise.race([read, deadline]), options.agent, name, options.ciCounts !== false));
   } catch {
     return verdictOf(
-      report.pr,
+      name,
       [
         {
           reason: "unverifiable",
           retry: true,
-          safe: `PR #${report.pr} could not be read from the git host`,
+          safe: `${name} could not be read from the git host`,
           todo: "Nothing to change; it is checked again.",
         },
       ],

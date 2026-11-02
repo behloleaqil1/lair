@@ -33,7 +33,7 @@ export const SECTION_IDS: readonly SectionId[] = [
 
 /** Each section's tabs besides its first (the default, tab null) */
 export const SECTION_TABS: Record<SectionId, readonly string[]> = {
-  home: ["activity", "health"],
+  home: ["activity", "bus", "health"],
   work: ["tasks", "planner", "locks"],
   gates: ["results", "pipelines", "triage", "placement"],
   prs: [],
