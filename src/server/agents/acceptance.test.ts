@@ -6217,8 +6217,8 @@ describe("10. hung run info: the next run knows what the previous hung on", () =
     const h = setup(() => ({ hung_minutes: 45 }));
     h.spawner.behaviour = (pid, log) => {
       writeLog(h.clock, log, "Starting task...\n");
-      writeLog(h.clock, log, "Searching for files in /Users/dev/workspace...\n");
-      writeLog(h.clock, log, "Running grep -r pattern /Users/dev/workspace...\n");
+      writeLog(h.clock, log, "Searching for files in /home/user/workspace...\n");
+      writeLog(h.clock, log, "Running grep -r pattern /home/user/workspace...\n");
     };
     await request(h);
     let t = 0;
