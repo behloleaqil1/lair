@@ -122,6 +122,8 @@ export interface SpendSettings {
   notice: { wasteShare: number | null; minRuns: number; taskAttempts: number | null };
   /** fill follows a WAITING line's wake to a file (fill on, wake.file set) */
   wakeWatched: boolean;
+  /** The guards spend counts for: G2 (agents.spend.guards.task_no_result_cap) */
+  guards: { taskNoResultCap: { mode: "off" | "observe" | "act"; max: number; windowMs: number } };
 }
 
 /**
@@ -317,6 +319,11 @@ interface VmTime {
 
 const requestContext = createContext({ re: /./, lines: [] as string[], n: 0 });
 const requestScript = new Script("n = 0; for (const line of lines) if (re.test(line)) n++;");
+
+/** A pattern that takes over PROBE_TIMEOUT_MS on PROBE_LINES (nested quantifiers backtracking): refused at config load. */
+export function slowOnShortLines(re: RegExp): boolean {
+  return countMatchingLines(re, PROBE_LINES, PROBE_TIMEOUT_MS) === null;
+}
 
 /** The lines `re` matches, interrupted after `timeoutMs` (a pattern that backtracks badly): null then. */
 function countMatchingLines(re: RegExp, lines: string[], timeoutMs = REQUEST_PATTERN_TIMEOUT_MS): number | null {
@@ -525,6 +532,23 @@ export function endKindOf(run: AgentRun): RunEndKind {
   return "crashed";
 }
 
+/** The no-result ends G2 counts (§4.2, decision D2): not a Lair restart's (exit_unknown, lost, vars_lost) or a stop */
+const CAP_COUNTED: ReadonlySet<RunEndKind> = new Set<RunEndKind>([
+  "hung",
+  "crashed",
+  "dead_on_start",
+  "never_started",
+  "rate_limit",
+  "provider_error",
+  "unreachable",
+  "lost_claim",
+]);
+
+/** Whether an ended run counts toward a task's no-result cap (G2); a superseded run never ran, so it doesn't. */
+export function countsTowardCap(run: AgentRun): boolean {
+  return run.state !== "superseded" && CAP_COUNTED.has(endKindOf(run));
+}
+
 // ============ THE RECORDER ============
 
 export interface SpendRecorderOptions {
@@ -555,10 +579,15 @@ export interface SpendNotice {
   ref: string;
   question: string;
   context: string;
+  /** Its evidence code (one of class agents.spend_notice's, decisions/structure.ts) and facts (numbers and ids) */
+  code: "waste_share" | "task_attempts" | "would_park" | "would_cool";
+  facts?: Record<string, string | number | boolean | null>;
 }
 
 /** Runs a first enable's backfill classifies per tick */
 const BACKFILL_PER_TICK = 200;
+/** Unclassified rows from before the classify lookback looked at, once per start */
+const CLASSIFY_OLDER_ONCE = 200;
 /** Days retention aggregates and deletes per tick (each day in one transaction) */
 const PRUNE_DAYS_PER_TICK = 31;
 /** Tasks over the attempts threshold looked at per tick */
@@ -588,6 +617,8 @@ export class SpendRecorder {
   private backfillAfter: { requestedAt: number; id: string } | null = null;
   /** The UTC day retention last finished (it runs at most once a day) */
   private prunedDay: string | null = null;
+  /** Whether this start looked at the rows still unclassified from before the classify lookback */
+  private olderClassified = false;
 
   constructor(private readonly o: SpendRecorderOptions) {
     this.classifier = new SpendClassifier({
@@ -902,7 +933,14 @@ export class SpendRecorder {
   /** Rows written unclassified (their module hadn't recorded its result): classified once it has, or once it's late. */
   private classifyPending(): void {
     const now = this.o.now();
-    for (const row of this.o.store.unclassifiedSpend(this.o.project, now - CLASSIFY_LOOKBACK_MS, CLASSIFY_PER_TICK)) {
+    const since = now - CLASSIFY_LOOKBACK_MS;
+    const rows = this.o.store.unclassifiedSpend(this.o.project, since, null, CLASSIFY_PER_TICK);
+    // Once per start, the older ones too (Lair was down longer than the lookback, or their module is wired now)
+    if (!this.olderClassified) {
+      this.olderClassified = true;
+      rows.push(...this.o.store.unclassifiedSpend(this.o.project, 0, since, CLASSIFY_OLDER_ONCE));
+    }
+    for (const row of rows) {
       const run = this.o.store.getRun(row.runId);
       if (!run) continue;
       const classified = this.classifier.later(row, run, now - row.endedAt >= CLASSIFY_WAIT_MS);
@@ -917,7 +955,7 @@ export class SpendRecorder {
    */
   private async backfill(): Promise<void> {
     const { store, project } = this.o;
-    if (store.hasEvent(project, BACKFILL_DONE)) return;
+    if (this.backfilled()) return;
     const now = this.o.now();
     let start = store.getEventByKey(project, BACKFILL_START);
     if (!start) {
@@ -938,6 +976,8 @@ export class SpendRecorder {
     for (const run of runs) {
       this.backfillAfter = { requestedAt: run.requestedAt, id: run.id };
       if (isActive(run.state) || run.endedAt === undefined || run.endedAt < from || run.endedAt >= to || store.getSpend(run.id)) continue;
+      // A run that ended while spend was on is drain's (its mark): its row comes with the usage its log reports
+      if (store.isSpendPending(run.id)) continue;
       const outcome = this.recordedOutcome(run);
       const row = await this.rowOf(run, { source: "none" }, outcome, true);
       // A completed builder run whose line fill never recorded (not a fill task): its line is unknown here, and the
@@ -976,6 +1016,11 @@ export class SpendRecorder {
     return { kind: kindOf(seen)!, line, wake: typeof seen.data.wake === "string" ? seen.data.wake : null };
   }
 
+  /** Whether the first enable's backfill is done (its event) */
+  private backfilled(): boolean {
+    return this.o.store.hasEvent(this.o.project, BACKFILL_DONE);
+  }
+
   /** The day's summary key (and the event bus's dedupe) */
   private dailyKey(day: string): string {
     return `spend_daily:${this.o.project}:${day}`;
@@ -984,9 +1029,11 @@ export class SpendRecorder {
   /**
    * At daily_summary_utc, for the UTC day that just ended: its aggregates (written again from its rows), one
    * spend_daily event with the same totals the API gives for that day, and agents.spend.daily on the event bus.
-   * Once per day, also across restarts (the event's dedupe key).
+   * Once per day, also across restarts (the event's dedupe key). Not before a first enable's backfill is done: the
+   * day's runs are the last it reaches, and a summary from part of them would never be sent again.
    */
   private async dailySummary(): Promise<void> {
+    if (!this.backfilled()) return;
     const now = this.o.now();
     const start = dayStart(now - this.o.settings.dailySummaryMinute * 60_000) - DAY_MS;
     const day = utcDay(start);
@@ -1031,8 +1078,10 @@ export class SpendRecorder {
    * Retention (D4), at most once a UTC day: each whole day whose per-run rows are past retention_days is
    * aggregated again from its rows and its rows deleted, in one transaction per day (a late row is counted, and no
    * day is left half deleted); then the aggregates past aggregate_days go. Bounded per tick: the rest goes on next.
+   * Not before a first enable's backfill is done.
    */
   private prune(): void {
+    if (!this.backfilled()) return;
     const now = this.o.now();
     const today = utcDay(now);
     if (this.prunedDay === today) return;
@@ -1079,6 +1128,8 @@ export class SpendRecorder {
         await raise({
           key: `spend_waste:${day}`,
           ref: `spend:waste:${day}`,
+          code: "waste_share",
+          facts: { day, runs: report.totals.runs, waste_share: Math.round(share * 10_000) / 10_000, unit: report.unit },
           question: `AI spend: ${Math.round(share * 100)} % of today's ${report.unit} went to idle or no-result runs`,
           context: [
             `Today (${day}, UTC): ${report.totals.runs} runs; ${report.productive.runs} productive, ${report.idle.runs} idle, ${report.noResult.runs} with no result.`,
@@ -1101,6 +1152,8 @@ export class SpendRecorder {
         await raise({
           key: `spend_task_attempts:${streak.task}:${marker}`,
           ref: `spend:attempts:${marker}:${streak.task}`,
+          code: "task_attempts",
+          facts: { task: streak.task, attempts, no_result: streak.noResult, chains: streak.chains },
           question: `AI spend: ${streak.task} took ${attempts} runs within 24 h without a completion`,
           context: [
             `${streak.task}: ${attempts} runs since its last completion within 24 h (${streak.noResult} with no result, over ${streak.chains} chain(s)); the notice is at ${taskAttempts}.`,
@@ -1119,15 +1172,17 @@ export class SpendRecorder {
 
   /**
    * Why a spend notice is moot (its ref after `spend:`), or null while it stands: a day's waste notice once the day
-   * is over; a task's attempts notice once it completed or was released after the streak it was raised for.
+   * is over; a task's attempts notice, or a guard's would-park notice (`guard:<at>:<task>`), once the task completed
+   * or was released after the streak it was raised for.
    */
   moot(rest: string): string | null {
     if (rest.startsWith("waste:")) {
       const day = rest.slice("waste:".length);
       return day !== utcDay(this.o.now()) ? `the day ${day} is over` : null;
     }
-    if (rest.startsWith("attempts:")) {
-      const tail = rest.slice("attempts:".length);
+    const streak = rest.startsWith("attempts:") ? "attempts:" : rest.startsWith("guard:") ? "guard:" : null;
+    if (streak) {
+      const tail = rest.slice(streak.length);
       const at = tail.indexOf(":");
       const marker = Number(tail.slice(0, at));
       const task = tail.slice(at + 1);

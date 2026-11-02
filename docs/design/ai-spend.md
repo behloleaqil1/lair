@@ -249,9 +249,9 @@ CREATE INDEX IF NOT EXISTS idx_agents_spend_pending ON agents_spend_pending(proj
 - Rows for a day can arrive after its summary ran: an exit-unknown or adopted run ends late. So right before a day's per-run rows are deleted, the pruning step always upserts that day's aggregate again from the rows still there. A late row is never lost, and an aggregate is never left stale.
 - Deletes run at most once a day, in the tick, one whole UTC day at a time: the day's aggregate is written again and its per-run rows deleted in one transaction, so a crash can't leave a day half deleted (whose aggregate a later pass would then write again from what is left). At most 31 days per tick; the rest go on the next tick.
 - `agents_spend_daily` has no `tokens` column: a long window's tokens are input + cache write + output, so a `patterns` row (a total with no split) adds none there.
-- Windows longer than 90 days read the aggregates only, so they have no per-run or per-task detail.
+- Windows longer than 90 days have no per-task detail. They read the aggregates of the days before the retention cutoff and the per-run rows from the cutoff on, so a row that lands after its day's summary counts at once. A day before the cutoff whose rows retention hasn't deleted yet is read from its aggregate, or from its rows when it has none.
 
-**Backfill (PR 2, because it needs the classification).** On first enable, the runs from the last `backfill_days` (7) are classified from the run records and events Lair already holds. Their usage is `none`, because their logs may have moved, and they get `backfilled = 1`. The first panel isn't empty, and every view can tell these rows apart. The backfill is idempotent: a row whose `run_id` exists is skipped. The queue file isn't read for it: a completed builder run whose line fill never recorded (not a fill task) is `unclassified` with reason `not_recorded`, not guessed idle.
+**Backfill (PR 2, because it needs the classification).** On first enable, the runs from the last `backfill_days` (7) are classified from the run records and events Lair already holds. Their usage is `none`, because their logs may have moved, and they get `backfilled = 1`. The first panel isn't empty, and every view can tell these rows apart. The backfill is idempotent: a row whose `run_id` exists is skipped, and so is a run that ended while spend was on (its pending mark), whose row drain writes with the usage its log reports. The queue file isn't read for it: a completed builder run whose line fill never recorded (not a fill task) is `unclassified` with reason `not_recorded`, not guessed idle. The daily summary and retention wait until the backfill is done (its `spend_backfill:done` event): it goes oldest first, so a summary before then would miss the last day's runs, and it is never sent again.
 
 ### 4.4 Show it
 
@@ -316,6 +316,13 @@ One deployment runs an interim `agents.failover.cooldown_minutes: 120` as a stop
 - A run already running isn't stopped by someone else's quota line. It ends on its own, as today.
 - In observe, the provider isn't cooled beyond today's rule. Each start that would have waited records `would_cool` with the reset time Lair would have used.
 - Recommended: patterns for the CLIs in use. On the 48 hours above, this would have replaced 114 failed starts with about 6 probes, and 77 decisions with 1.
+- **As built (PR 4).**
+  - The cooldown's state is kept on events of a new kind, `quota` (provider, since, next probe, backoff step, lines, reset), next to the `failover` event of kind `quota`. A `quota_cleared` event ends it: a start after the latest quota line that lives past `dead_on_start_seconds` or exits 0, or the owner's "Try now". A quota state older than 48 hours is over.
+  - A provider in a quota cooldown is passed over like one in a transient outage, so a fallback on another provider wins; with none, the run waits for the probe the same way (one start at a time, no `start_timeout_minutes`).
+  - The quota's cooldown replaces `cooldown_minutes` for quota lines rather than adding to it: `coolingUntil` still reads only rate-limit and provider-error failovers, so the interim 120-minute cooldown doesn't hold a quota's probe back. The quota failover's run ends `rate_limit` (§4.2's end kinds don't change).
+  - Each cooldown records one `guard_did` (`verdict: "cool"`); its decision is class `agents.provider_limit`, code `provider_quota`.
+  - Observe's streak per provider lasts until a start on it works, read from the run records at the next quota line, so it writes only the `guard_would` and its notice (class `agents.spend_notice`, code `would_cool`). Its `would_cool` window (to the time act would have cooled until) is what G2 leaves out.
+  - A reset group is read as an ISO time with a zone, `HH:MM` or `H[:MM]am|pm` with an optional zone (`Z`, `UTC`, `GMT`, an offset, or an IANA name), or `in <n> minutes|hours`. Quota patterns run in a vm that interrupts them after 50 ms (no match then), and a pattern slow on short lines is refused at load.
 
 **G2. Per-task no-result cap.** `agents.spend.guards.task_no_result_cap: { mode: off, max: 6, window_hours: 24 }`.
 
@@ -325,7 +332,9 @@ One deployment runs an interim `agents.failover.cooldown_minutes: 120` as a stop
 - **What doesn't count**, by D2's reasoning (the failure isn't the task's):
   - runs that died while their provider was in a **fleet** outage or a fleet quota cooldown (decision D2), since G1 and the transient rule handle those. G1's observe-mode `would_cool` windows count as cooldowns here too;
   - runs with `lair_restart = 1` (`exit_unknown`, `lost`, `vars_lost`): Lair's own restart ended them;
-  - runs that ended `stopped`: an owner stop or a shutdown.
+  - runs that ended `stopped`: an owner stop or a shutdown;
+  - runs that ended `lost_claim` because their claim was released on request: by the owner (the Agents view or the API) or by a module stopping its own run (a review whose PR moved on, a supervisor turn). A claim another run took still counts.
+- **As built (PR 5).** The count is read from the run records of the task's chains, at the moment a failed run's chain would go on (a restart, a failover, a transient or never-started retry), so the run that just failed counts at once. A fleet outage is the provider's latest `transient` event by the run's end saying every agent waits; until G1 exists, the fleet cooldown is today's rate-limit and provider-error cooldown once two agents' failovers made it fleet-wide, and G1's quota cooldown (and its `would_cool` windows) joins it with PR 4. The count starts over when the task's fill hold is released: `start_again` releases it, and so does a release in Work. A superseded run never ran, so it isn't counted.
 - On the data above, with `max: 6`, the 13 tasks that took 10 or more attempts would each have stopped at their sixth no-result run and asked once.
 
 **G3. Waiting agents woken only by the awaited event.** This extends `agents.fill.wake`.
@@ -346,7 +355,7 @@ One deployment runs an interim `agents.failover.cooldown_minutes: 120` as a stop
   - `resume`, the default, is today's behaviour.
   - `fresh` starts a fresh session with the hung-info block and a resume summary, so the stuck context isn't re-sent. It applies whenever it is set, in any mode, and is a change the owner makes on its own evidence.
 - `mode` governs only the park below.
-- The `max_per_task`-th hang of a task within the window, in any chain, **parks** it with the fill hold `hung_repeat` (or escalation for a module run) and one decision. Options: `fresh_session` (with the hung info), `keep_parked`, `release`. The task is not resumed again.
+- The `max_per_task`-th hang of a task within the window, in any chain, **parks** it with the fill hold `hung_repeat` (or escalation for a module run) and one decision. Options: `fresh_session` (with the hung info), `keep_parked`, `release`. The task is not resumed again. A hang after `fresh_session` or `release`, within the window, parks it again (the count doesn't start over). `first: fresh` turns a first hang's resume into a fresh session; when the chain's restarts are used up, it is escalated as today.
 - On the data above, with `max_per_task: 2`, the 59 repeat hangs (3,011 agent-minutes) would have been 26 parked tasks, each asked about once.
 
 **G5. Daily budget per project with an owner notice.** This reuses `agents.budgets` and adds no second budget system (`budgets.guard_mode`).

@@ -843,8 +843,10 @@ describe("AT-23: a bad usage config is refused at load, naming each key", () => 
       expect.stringContaining("agents.spend.aggregate_days: at least agents.spend.retention_days"),
     ]);
     expect(errorsOf({ enabled: true, spend: { daily_summary_utc: "24:05" } }, project({}))).toEqual([expect.stringContaining("agents.spend.daily_summary_utc")]);
-    // Keys of later parts are unknown here: refused too, naming them
-    expect(errorsOf({ enabled: true, spend: { enabled: true, guards: {} } }, project({}))).toEqual([expect.stringMatching(/^agents\.spend: .*guards/)]);
+    // Keys of later parts are unknown here: refused too, naming them (spend.guards has G2 only so far)
+    expect(errorsOf({ enabled: true, spend: { enabled: true, guards: { wake_events: {} } } }, project({}))).toEqual([
+      expect.stringMatching(/^agents\.spend\.guards: .*wake_events/),
+    ]);
     expect(errorsOf({ enabled: true, budgets: { guard_mode: "block" } }, project({}))).toEqual([expect.stringContaining("agents.budgets.guard_mode")]);
   });
 
@@ -912,6 +914,32 @@ describe("AT-33: a guard (or a request or minute budget) needs agents.spend; bud
     }
     // off is no guard at all
     expect(errorsOf({ enabled: true, failover: { quota: { mode: "off" } } }).some((e) => e.includes("needs agents.spend"))).toBe(false);
+  });
+
+  it("G2 and G4: off by default; their keys are checked, naming each; G4's first is no mode and needs nothing", () => {
+    const parsed = parseAgentsConfig({ enabled: true }, config);
+    expect(parsed.ok && parsed.settings.recovery.hungRepeat).toEqual({ mode: "off", maxPerTask: 2, windowMs: 24 * 3_600_000, first: "resume" });
+    expect(parsed.ok && parsed.settings.spend.guards.taskNoResultCap).toEqual({ mode: "off", max: 6, windowMs: 24 * 3_600_000 });
+    const on = parseAgentsConfig(
+      { enabled: true, spend: { enabled: true, guards: { task_no_result_cap: { mode: "act", max: 3, window_hours: 6 } } }, recovery: { hung_repeat: { mode: "observe", first: "fresh" } } },
+      config,
+    );
+    expect(on.ok && on.settings.spend.guards.taskNoResultCap).toEqual({ mode: "act", max: 3, windowMs: 6 * 3_600_000 });
+    expect(on.ok && on.settings.recovery.hungRepeat).toMatchObject({ mode: "observe", first: "fresh" });
+    expect(errorsOf({ enabled: true, recovery: { hung_repeat: { first: "fresh" } } })).toEqual([]);
+    const bad = errorsOf({
+      enabled: true,
+      spend: { enabled: true, guards: { task_no_result_cap: { mode: "park", max: 0 } } },
+      recovery: { hung_repeat: { first: "restart", window_hours: 0 } },
+    });
+    for (const key of [
+      "agents.spend.guards.task_no_result_cap.mode",
+      "agents.spend.guards.task_no_result_cap.max",
+      "agents.recovery.hung_repeat.first",
+      "agents.recovery.hung_repeat.window_hours",
+    ]) {
+      expect(bad.some((e) => e.startsWith(`${key}:`)), key).toBe(true);
+    }
   });
 
   it("a daily_requests or daily_minutes limit with spend off is refused, naming both keys", () => {
@@ -1579,5 +1607,146 @@ describe("AT-34: the first enable classifies the runs of the last backfill_days"
     const again = setup({ ...SPEND_ON, ...NO_RESTARTS }, { paths, clock });
     await again.service.tick();
     expect(spendRows(again)).toEqual(rows);
+  });
+});
+
+describe("first enable and late facts (the #306 review's follow-ups)", () => {
+  const NO_RESTARTS = { recovery: { same_session_restarts: 0, fresh_sessions: 0, backoff_seconds: 0, max_backoff_seconds: 0 } };
+
+  it("S1: with more runs than one tick's backfill, the day before is summed up once it is done; 1y counts a row that came after its day's summary", async () => {
+    const paths = makePaths();
+    const off = setup(NO_RESTARTS, { paths });
+    off.clock.t = NOW - 3 * DAY;
+    const base = await oneRun(off, { task: "t-base", log: CLAUDE_RUN, exit: 2 });
+    await off.manager.stop();
+    // More runs as Lair records them: 200 six days ago, then 30 the day before (the backfill, oldest first, reaches them last)
+    const store = new AgentsStore(paths.dbPath);
+    const copy = (i: number, endedAt: number) =>
+      store.insertRun({ ...base, id: `copy-${String(i).padStart(3, "0")}`, chainId: `copy-${i}`, task: `t-copy${i}`, requestedAt: endedAt - 90 * SEC, spawnedAt: endedAt - 89 * SEC, endedAt });
+    for (let i = 0; i < 200; i++) copy(i, NOW - 6 * DAY + i * MIN);
+    for (let i = 0; i < 30; i++) copy(200 + i, Date.parse("2026-03-01T10:00:00Z") + i * MIN);
+    store.close();
+
+    const on = setup({ ...SPEND_ON, ...NO_RESTARTS }, { paths });
+    await on.service.tick();
+    // One tick's backfill: the 200 oldest. The day before isn't summed up from part of its runs
+    expect(spendRows(on)).toHaveLength(200);
+    expect(eventsOf(on, "spend_daily")).toEqual([]);
+    await on.service.tick();
+    expect(spendRows(on)).toHaveLength(231);
+    const daily = eventsOf(on, "spend_daily");
+    expect(daily).toHaveLength(1);
+    expect(daily[0].data).toMatchObject({ day: "2026-03-01", totals: { runs: 30 }, noResult: { runs: 30 } });
+    await on.service.tick();
+    expect(eventsOf(on, "spend_daily")).toHaveLength(1);
+
+    // A row of that day lands after its summary (an exit-unknown run seen late): every window counts it at once
+    on.store.recordSpend(fixtureRow("late-1", Date.parse("2026-03-01T23:00:00Z"), 1, "no_result", "exit_unknown"), null);
+    expect(on.service.spendReport("7d", "project").totals.runs).toBe(232);
+    const year = on.service.spendReport("1y", "project");
+    expect(year).toMatchObject({ source: "aggregates", totals: { runs: 232 } });
+    expect(year.groups[0]).toMatchObject({ key: "demo", totals: { runs: 232 }, unclassified: { runs: 0 } });
+  });
+
+  it("S4: a run that ended while spend was on is drain's: the backfill leaves it, and its row keeps the usage its log reports", async () => {
+    // A clock that moves on every read, as a real one does between the end and the backfill's start in one tick
+    class MovingClock extends FakeClock {
+      now(): number {
+        return ++this.t;
+      }
+    }
+    const paths = makePaths();
+    const clock = new MovingClock();
+    const off = setup(NO_RESTARTS, { paths, clock });
+    const all = lines(CLAUDE_RUN);
+    const assistant = all.find((l) => l.includes('"type":"assistant"'))!;
+    const filler = Array.from({ length: Math.ceil((SCAN_BYTES_PER_TICK * 1.3) / assistant.length) }, () => assistant);
+    const big = [...all.slice(0, -1), ...filler, all.at(-1)!].join("\n") + "\n";
+    off.spawner.behaviour = (_pid, logPath) => writeLog(off.clock, logPath, big); // runs on past the restart
+    const view = await off.service.requestRun({ agent: "worker-a", task: "t-long", prompt: "Build it" });
+    await off.service.tick();
+    // Lair restarts with spend turned on for the first time; the run's process ended meanwhile
+    await off.manager.stop();
+    clock.t += 5 * MIN;
+    const on = setup({ ...SPEND_ON, ...NO_RESTARTS }, { paths, clock });
+    await on.service.tick();
+    const ended = on.store.getRun(view.id)!;
+    expect(ended.endedAt).toBeDefined();
+    const start = eventsOf(on, "spend_backfill").find((e) => e.dedupeKey === "spend_backfill:start")!;
+    expect(ended.endedAt!).toBeLessThan(Number(start.data.to)); // inside the backfill's window
+    // Its log is longer than one tick reads: owed, and the backfill wrote nothing for it
+    expect(on.store.getSpend(view.id)).toBeNull();
+    expect(pendingCount(on.dbPath)).toBe(1);
+    for (let i = 0; i < 3; i++) await on.service.tick();
+    expect(on.store.getSpend(view.id)).toMatchObject({ backfilled: false, usageSource: "reported", tokens: 69_007, outputTokens: 13_052 });
+    expect(ledger(on.dbPath).filter((r) => r.run_id === view.id)).toHaveLength(1);
+  });
+
+  it("S2: a repeat BLOCKED waiting on a run before it keeps its key and is classified blocked_repeat; a not_recorded row isn't waited on", async () => {
+    const paths = makePaths();
+    const GATE = "20260302T120100Z-t-key-abcdef12-4242";
+    writeFileSync(join(paths.dir, "tasks.txt"), "");
+    mkdirSync(join(paths.dir, "prompts"), { recursive: true });
+    writeFileSync(join(paths.dir, "prompts", "worker.txt"), "Build what the task says.\n");
+    const h = setup(
+      {
+        ...SPEND_ON,
+        fill: {
+          enabled: true,
+          tasks_file: join(paths.dir, "tasks.txt"),
+          agents: ["worker-a"],
+          prompt_files: ["{prompts_dir}/worker.txt"],
+          waiting_pattern: "^-\\s+WAITING\\s+{task}(?:\\s+(?<wake>\\d{8}T\\d{6}Z-\\S+))?(?=\\s|$)",
+          wake: { file: "{gates_dir}/results/{wake}.rc" },
+        },
+      },
+      { paths },
+    );
+    const BLOCKER = "needs the signing key from the owner";
+    const first = await oneRun(h, { task: "t-key", log: "x\n", line: `- BLOCKED t-key by worker-a 12:01Z: ${BLOCKER}` });
+    // A WAITING run fill hasn't looked at: its class waits (30 min at most)
+    const wait = await oneRun(h, { task: "t-key", log: "x\n", line: `- WAITING t-key ${GATE} by worker-a 12:05Z: gate queued` });
+    expect(h.store.getSpend(wait.id)).toMatchObject({ class: "unclassified", reason: "pending" });
+    const repeat = await oneRun(h, { task: "t-key", log: "x\n", line: `- BLOCKED t-key by worker-a 12:09Z: ${BLOCKER}` });
+    const key = h.store.getSpend(first.id)!.blockerKey;
+    expect(key).toMatch(/^[0-9a-f]{64}$/);
+    // It waits for the row before it, and keeps its key meanwhile
+    expect(h.store.getSpend(repeat.id)).toMatchObject({ class: "unclassified", reason: "pending", blockerKey: key });
+    h.clock.t += CLASSIFY_WAIT_MS;
+    await h.service.tick();
+    expect(h.store.getSpend(wait.id)).toMatchObject({ class: "idle", reason: "waiting_unnamed" });
+    expect(h.store.getSpend(repeat.id)).toMatchObject({ class: "idle", reason: "blocked_repeat", blockerKey: key });
+
+    // A backfilled row whose line was never recorded (it never gets a class) is not waited on
+    h.store.recordSpend({ ...fixtureRow("old-done", h.clock.t, 0, "unclassified", "not_recorded"), task: "t-key", backfilled: true }, null);
+    h.clock.t += MIN;
+    const third = await oneRun(h, { task: "t-key", log: "x\n", line: `- BLOCKED t-key by worker-a 13:00Z: ${BLOCKER}` });
+    expect(h.store.getSpend(third.id)).toMatchObject({ class: "idle", reason: "blocked_repeat", blockerKey: key });
+  });
+
+  it("L2, L3: a row still pending from before the classify lookback is classified once after a start; groups count unclassified runs", async () => {
+    const verdicts = new Map<string, ModuleVerdict | null>([["planner-7", "pending"]]);
+    const facts: SpendFacts = { planner: (_project, run) => verdicts.get(run.task) ?? null };
+    const h = setup(SPEND_ON, { facts });
+    const run = await moduleRun(h, "planner", "planner-7");
+    expect(h.store.getSpend(run.id)).toMatchObject({ class: "unclassified", reason: "pending" });
+    expect(h.service.spendReport("today", "origin").groups.find((g) => g.key === "planner")).toMatchObject({ totals: { runs: 1 }, unclassified: { runs: 1 } });
+    // Lair is down for three days; the planner's record of the run is there when it is back
+    await h.manager.stop();
+    h.clock.t += 3 * DAY;
+    verdicts.set("planner-7", "productive");
+    const again = setup(SPEND_ON, { paths: { dir: h.dir, queueFile: h.queueFile, dbPath: h.dbPath }, clock: h.clock, facts });
+    await again.service.tick();
+    expect(again.store.getSpend(run.id)).toMatchObject({ class: "productive", reason: "proposals" });
+  });
+
+  it("L5: an empty window and a day with no runs", async () => {
+    const h = setup(SPEND_ON);
+    const today = h.service.spendReport("today", "task");
+    expect(today).toMatchObject({ unit: "runs", wasteShare: null, totals: { runs: 0 }, groups: [], reasons: [], topTasks: [] });
+    await h.service.tick();
+    const daily = eventsOf(h, "spend_daily");
+    expect(daily).toHaveLength(1);
+    expect(daily[0]).toMatchObject({ summary: "AI spend 2026-03-01: 0 run(s), no runs", data: { day: "2026-03-01", totals: { runs: 0 }, wasteShare: null } });
   });
 });

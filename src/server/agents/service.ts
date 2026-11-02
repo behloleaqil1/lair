@@ -85,10 +85,11 @@ import {
   InboxFileDecisions,
   ProducerDecisions,
   escalationDecisionKey,
+  guardDecisionKey,
   type DecisionInbox,
   type DecisionRequest,
 } from "./decisions.js";
-import { chooseProfile, matchFailover, matchTransient, profileLabel, profilesFor, TRANSIENT_TAIL_LINES } from "./failover.js";
+import { chooseProfile, matchFailover, matchTransient, profileLabel, profilesFor, quotaResetAt, TRANSIENT_TAIL_LINES } from "./failover.js";
 import {
   AgentsFill,
   DECISION_FILL_KEEP,
@@ -121,7 +122,7 @@ import {
   type ProcessOwner,
 } from "./probes.js";
 import { extractHungLogLines, extractLastTool, lastLines, moveSessionAside, resumeSummary, sessionDirFor, utcStamp } from "./sessions.js";
-import { SpendRecorder, type ModelCall, type SpendNotice } from "./spend.js";
+import { countsTowardCap, endKindOf, originOf, SpendRecorder, type ModelCall, type SpendNotice } from "./spend.js";
 import type { SpendFacts } from "./spend-classify.js";
 import { guardModes, spendReport, SpendReportError } from "./spend-report.js";
 import { AgentsStore, type ClaimResult, type HungInfo } from "./store.js";
@@ -173,6 +174,20 @@ export const DECISION_WAIT = "wait";
 export const DECISION_STOP = "stop";
 export const DECISION_ALLOW = "allow";
 export const DECISION_RETRY_NOW = "retry_now";
+/** A task a guard parked (G2, G4): it stays parked, the owner's pause */
+export const DECISION_GUARD_KEEP = "keep_parked";
+/** Runs of a task a guard reads (G2, G4) */
+const GUARD_RUNS = 500;
+
+/** A guard's verdict on a task's failed runs (G2, G4: docs/design/ai-spend.md §4.5) */
+interface FailedRunVerdict {
+  guard: "task_no_result_cap" | "hung_repeat";
+  mode: "observe" | "act";
+  /** The runs it counted, oldest first, the one that ended now last */
+  counted: AgentRun[];
+  max: number;
+  windowMs: number;
+}
 
 /** In the detail of a run that waits for its tool's sign-in */
 const SIGNED_OUT_DETAIL = "not signed in on this machine";
@@ -221,6 +236,32 @@ interface Outage {
   lastAgent: string;
 }
 
+/** A quota cooldown's state is read from events at most this old: a quota line older than this has long reset */
+const QUOTA_STATE_MS = 48 * 3_600_000;
+
+/**
+ * A provider's fleet quota cooldown (G1 act, docs/design/ai-spend.md §4.5): a run's line matched
+ * failover.quota.patterns, and no start on the provider has worked since. Kept on each `quota` event (its data), so
+ * the newest one says where it stands; a `quota_cleared` event ends it. Every agent waits at once.
+ */
+interface QuotaCooldown {
+  quota: true;
+  provider: string;
+  /** The first quota line of the cooldown */
+  since: number;
+  /** When one start may probe the provider: the line's reset time, else the backoff */
+  nextTryAt: number;
+  /** Backoff steps: the first line, then each one at or after the next try (a probe that hit the quota again) */
+  steps: number;
+  hits: number;
+  /** The latest line's reset text, when its pattern captured one */
+  reset: string | null;
+  /** The latest quota line: only a start after it that works ends the cooldown */
+  lastAt: number;
+  /** Always: a quota is the account's, so every agent waits (for probeInFlight) */
+  fleet: true;
+}
+
 /** The events shown as an agent's recoveries. */
 export const RECOVERY_KINDS: readonly AgentEventKind[] = [
   "claim_released",
@@ -241,6 +282,8 @@ export const RECOVERY_KINDS: readonly AgentEventKind[] = [
   "decision",
   "transient",
   "transient_cleared",
+  "quota",
+  "quota_cleared",
   "run_lost",
 ];
 
@@ -278,7 +321,7 @@ const oneLine = (text: string, max = 300) => {
   const flat = text.replace(/\s+/g, " ").trim();
   return flat.length > max ? `${flat.slice(0, max)}...` : flat;
 };
-const failoverLabel = (kind: FailoverInfo["kind"]) => (kind === "rate_limit" ? "rate limit" : "provider error");
+const failoverLabel = (kind: FailoverInfo["kind"]) => (kind === "rate_limit" ? "rate limit" : kind === "quota" ? "quota" : "provider error");
 
 /** Why a run of `agent` on another task is refused while its fill task is open (fill matching by agent). */
 const openTaskRefusal = (agent: string, open: FillLineView) =>
@@ -853,6 +896,7 @@ export class AgentsService {
   private readonly mootBy: ReadonlyMap<string, (decision: Decision, rest: string) => string | null> = new Map([
     ["chain", (decision: Decision, chainId: string) => this.chainMoot(decision, chainId)],
     ["transient", (decision: Decision, provider: string) => this.outageMoot(decision, provider)],
+    ["quota", (decision: Decision, provider: string) => this.quotaMoot(decision, provider)],
     ["signin", (_decision: Decision, tool: string) => this.signInMoot(tool)],
     // AI spend's notices: a day's waste once the day is over, a task's attempts once it completed or was released
     ["spend", (_decision: Decision, rest: string) => this.spend.moot(rest)],
@@ -884,6 +928,10 @@ export class AgentsService {
         reversible: true,
         key: notice.key,
         ref: notice.ref,
+        structure: {
+          class: "agents.spend_notice",
+          evidence: { code: notice.code, facts: notice.facts ?? {}, cause_cleared: false, linked_issue: null },
+        },
       },
       this.probes.clock.now(),
     );
@@ -934,6 +982,24 @@ export class AgentsService {
   }
 
   /**
+   * G1: a quota cooldown's decision (key `quota:<provider>:<since>`) is moot once that cooldown is over (a probe
+   * worked, the owner chose "Try now", or the guard is no longer in act) or a newer one began; an observe notice
+   * (key `guard_would:quota:<run>`) once a start on the provider worked after it.
+   */
+  private quotaMoot(decision: Decision, provider: string): string | null {
+    const now = this.probes.clock.now();
+    if (decision.key.startsWith("quota:")) {
+      const since = Number(decision.key.slice(decision.key.lastIndexOf(":") + 1));
+      const cooldown = this.quotaCooldown(provider, now);
+      if (!cooldown) return `the quota cooldown of provider ${provider} is over`;
+      if (cooldown.since !== since) return `that quota cooldown of provider ${provider} ended (another began ${iso(cooldown.since)})`;
+      return null;
+    }
+    const would = this.store.getEventByKey(this.project, decision.key);
+    return would && this.providerWorkedSince(provider, would.at, now) ? `a start on provider ${provider} worked since` : null;
+  }
+
+  /**
    * A run chain's escalation or "every profile is failing" decision is moot
    * once the chain moved on: started again some other way (the owner's run
    * or a fresh session from Work, fill after the owner released its hold),
@@ -943,6 +1009,11 @@ export class AgentsService {
     const chain = this.store.chainRuns(chainId);
     const last = chain[chain.length - 1];
     if (!last) return "its runs are gone";
+    if (decision.key.startsWith("guard:")) {
+      // A park (G2, G4) stands until the task runs again some other way
+      const latest = this.store.latestRunForTask(this.project, last.task);
+      return latest && latest.id !== decision.key.slice(decision.key.lastIndexOf(":") + 1) ? `${last.task} started again as run ${short(latest.id)}` : null;
+    }
     if (decision.key.startsWith("escalation:")) {
       const attempts = Number(decision.key.slice(decision.key.lastIndexOf(":") + 1));
       const latest = this.store.latestRunForTask(this.project, last.task);
@@ -1122,7 +1193,26 @@ export class AgentsService {
       );
       return "the runs waiting on the provider start on the next check";
     }
+    if (ref.startsWith("quota:")) {
+      // G1: the observe notice asks nothing; the act decision's "Try now" ends the cooldown
+      if (!key.startsWith("quota:")) return "noted: nothing changes";
+      if (optionId !== DECISION_RETRY_NOW) return "Lair keeps probing the provider with one start at a time";
+      const provider = ref.slice("quota:".length);
+      const cooldown = this.quotaCooldown(provider, t.now);
+      if (!cooldown) return `the quota cooldown of provider ${provider} is over: nothing to do`;
+      await this.record(
+        "quota_cleared",
+        {
+          subject: provider,
+          summary: `the owner chose to try provider ${provider} now: the runs waiting on its quota start on the next check`,
+          data: { provider, since: cooldown.since, hits: cooldown.hits, steps: cooldown.steps, by: "owner" },
+        },
+        t.now,
+      );
+      return "the runs waiting on the provider start on the next check";
+    }
     const chain = ref.startsWith("chain:") ? this.store.chainRuns(ref.slice("chain:".length)) : [];
+    if (key.startsWith("guard:")) return this.answerPark(key, chain, optionId, t);
     const latest = chain[chain.length - 1];
     if (!latest) return "its task is gone";
     if (key.startsWith("escalation:")) {
@@ -1148,6 +1238,32 @@ export class AgentsService {
       return `run ${short(waiting.id)} stopped; the task is free`;
     }
     return "nothing to do";
+  }
+
+  /**
+   * The answer to a guard's park (key `guard:<guard>:<run>`, G2 and G4): "start_again" releases fill's hold (G2's
+   * no-result count starts over: it counts from the task's last release), "release" releases it too (G4), a fresh
+   * session starts the task again in one (the hung info and a resume summary in its prompt), "keep_parked" makes it
+   * the owner's pause. Nothing changes once the task moved on.
+   */
+  private async answerPark(key: string, chain: AgentRun[], optionId: string, t: Tick): Promise<string> {
+    const parked = chain.find((r) => r.id === key.slice(key.lastIndexOf(":") + 1));
+    if (!parked) return "its task is gone";
+    if (this.store.latestRunForTask(this.project, parked.task)?.id !== parked.id) return "the task has moved on since: nothing to change";
+    if (optionId === DECISION_GUARD_KEEP) {
+      await this.recordFillPause(parked.task, parked, 'you chose "Keep it parked"', t.now);
+      return "the task stays parked until you release it";
+    }
+    if (this.readOnly) return "the project is read_only: Lair starts no agents";
+    if (optionId === DECISION_FRESH) {
+      const next = await this.restartFresh(parked, t, "the owner chose a fresh session");
+      return `started again as run ${short(next.id)} in a fresh session`;
+    }
+    if (optionId !== DECISION_FILL_START && optionId !== DECISION_RELEASE) return "nothing to do";
+    await this.recordFillRelease(parked.task, parked, "decision", t.now);
+    return optionId === DECISION_FILL_START
+      ? "fill starts the task again on its next check, and its count of runs with no result starts over"
+      : "fill starts the task again on its next check, in a new session";
   }
 
   /** A budget line the owner allowed runs past, for its period. */
@@ -1186,6 +1302,7 @@ export class AgentsService {
         await this.advance(run, t);
       }
       await this.checkOutages(t);
+      await this.checkQuotas(t);
       await this.reapClaims(t);
       await this.reapLocks(t);
       const activeChains = new Set(this.store.activeRuns(this.project).map((run) => run.chainId));
@@ -1244,7 +1361,9 @@ export class AgentsService {
    * Why a profile can't be used now by `agent`, or null. A provider
    * unreachable after transient errors (for this agent, or for every agent
    * once the outage is the fleet's) is passed over like one cooling down, so
-   * a fallback on another provider wins; `outages: false` leaves that out.
+   * a fallback on another provider wins, and so is one in a fleet quota
+   * cooldown (G1 act, every agent); `outages: false` leaves both out (they
+   * are waited out with one probe start).
    */
   private unusable(profile: AgentProfile, agent: string, now: number, outages = true): string | null {
     if (!getAdapter(profile.adapter, this.config)) return `adapter ${profile.adapter} is not defined`;
@@ -1258,6 +1377,8 @@ export class AgentsService {
       if (outage && this.downFor(outage, agent)) {
         return `provider ${profile.provider} unreachable since ${iso(outage.since)} (transient errors)`;
       }
+      const quota = this.quotaCooldown(profile.provider, now);
+      if (quota) return `provider ${profile.provider} hit its quota (since ${iso(quota.since)}; every agent waits, next probe at ${iso(quota.nextTryAt)})`;
     }
     return null;
   }
@@ -1335,15 +1456,20 @@ export class AgentsService {
       return;
     }
     if (!chosen) {
-      // With no other profile, the run waits the outage out on the first profile it is the only problem of: one start
-      // per backoff step tries it (the wait doesn't count toward start_timeout_minutes, and nothing is counted)
+      // With no other profile, the run waits the outage (or the fleet quota cooldown, G1) out on the first profile it
+      // is the only problem of: one start per backoff step tries it (the wait doesn't count toward
+      // start_timeout_minutes, and nothing is counted: no failover, no recovery)
+      const waitOn = (p: AgentProfile): Outage | QuotaCooldown | null => unreachable(p) ?? this.quotaCooldown(p.provider, t.now);
       const order = [...profiles.keys()].slice(from).concat([...profiles.keys()].slice(0, from));
-      const index = order.find((i) => usable(profiles[i], false) === null && unreachable(profiles[i]) !== null);
-      const outage = index === undefined ? null : unreachable(profiles[index]);
+      const index = order.find((i) => usable(profiles[i], false) === null && waitOn(profiles[i]) !== null);
+      const outage = index === undefined ? null : waitOn(profiles[index]);
       if (index !== undefined && outage) {
         const due = t.now >= outage.nextTryAt;
         if (!due || this.probeInFlight(run, outage)) {
-          const detail = `not starting: provider ${outage.provider} unreachable since ${iso(outage.since)} (${outage.failures} transient failure(s)); ${due ? "another start is trying it now" : `next try at ${iso(outage.nextTryAt)}`}`;
+          const detail =
+            "quota" in outage
+              ? `not starting: provider ${outage.provider} hit its quota (since ${iso(outage.since)}, ${outage.hits} line(s)); ${due ? "another start is probing it now" : `next probe at ${iso(outage.nextTryAt)}`}`
+              : `not starting: provider ${outage.provider} unreachable since ${iso(outage.since)} (${outage.failures} transient failure(s)); ${due ? "another start is trying it now" : `next try at ${iso(outage.nextTryAt)}`}`;
           if (run.state !== "queued" || run.detail !== detail || run.launchingSince !== undefined || run.waitingLock) {
             run.state = "queued";
             run.launchingSince = undefined;
@@ -1746,9 +1872,10 @@ export class AgentsService {
     t.summary.ended++;
     const r = this.settings.retries;
     const retry = run.startRetries < r.maxRetries;
-    const next = retry
-      ? this.followUp(run, t.now, t.now + backoffMs(run.startRetries + 1, r.backoffSeconds, r.maxBackoffSeconds))
-      : null;
+    // G2 (§4.5): a task at its no-result cap is parked (act), not retried
+    const parked = retry && (await this.guardFailed(run, t));
+    const next =
+      retry && !parked ? this.followUp(run, t.now, t.now + backoffMs(run.startRetries + 1, r.backoffSeconds, r.maxBackoffSeconds)) : null;
     await this.record(
       "never_started",
       {
@@ -1767,6 +1894,7 @@ export class AgentsService {
       },
       t.now,
     );
+    if (parked) return true;
     if (!next) {
       this.store.saveRun(run);
       await this.escalate(run, `never started in ${run.startRetries + 1} attempt(s): ${reason}`, t, "dead_on_start");
@@ -2162,8 +2290,11 @@ export class AgentsService {
       );
     }
 
+    // G4 and G2 (docs/design/ai-spend.md §4.5): a guard in act mode parks the task here, and nothing restarts it
+    if (kind !== "fresh_session" && (await this.guardFailed(run, t))) return;
+
     const r = this.settings.recovery;
-    const mode =
+    let mode: "resume" | "fresh" | null =
       kind === "fresh_session"
         ? "fresh"
         : run.sameSessionRestarts < r.sameSessionRestarts
@@ -2171,6 +2302,9 @@ export class AgentsService {
           : run.freshSessions < r.freshSessions
             ? "fresh"
             : null;
+    // G4's `first` (its own switch, in any mode): the task's first hang within the window restarts in a fresh
+    // session, with the hung info and a resume summary, instead of resuming the stuck context
+    if (mode === "resume" && kind === "hung" && r.hungRepeat.first === "fresh" && this.hangsOf(run, t.now).length === 1) mode = "fresh";
     if (mode === null) {
       this.store.saveRun(run);
       await this.escalate(run, `${kind.replace(/_/g, " ")}: ${detail}`, t);
@@ -2327,6 +2461,262 @@ export class AgentsService {
     );
   }
 
+  // ============ GUARDS ON FAILED RUNS (G2, G4) ============
+
+  /**
+   * G4 (hung_repeat), then G2 (task_no_result_cap), right before a failed run's chain would go on (a restart, a
+   * failover, a retry; docs/design/ai-spend.md §4.5). `run` has ended and isn't saved yet. Observe records what a
+   * guard would do, once per task and streak, and the chain goes on as before. True: a guard in act mode parked
+   * the task, and the caller starts nothing more for it.
+   */
+  private async guardFailed(run: AgentRun, t: Tick): Promise<boolean> {
+    for (const verdict of [this.hungRepeat(run, t.now), this.noResultCap(run, t.now)]) {
+      if (!verdict) continue;
+      if (verdict.mode === "act") {
+        await this.park(run, verdict, t);
+        return true;
+      }
+      await this.wouldPark(run, verdict, t);
+    }
+    return false;
+  }
+
+  /** The task's ended runs (every chain) that ended at or after `since`, `run` included as it is now. */
+  private endedSince(run: AgentRun, since: number): AgentRun[] {
+    // A run requested up to a day before may have ended in the window (a hung one runs for its hung_minutes)
+    const runs = this.store.taskRunsSince(this.project, run.task, since - 86_400_000, GUARD_RUNS).filter((r) => r.id !== run.id);
+    return [...runs, run].filter((r) => !isActive(r.state) && r.endedAt !== undefined && r.endedAt >= since);
+  }
+
+  /** G4: the task's hangs within hung_repeat.window_hours, `run` included. */
+  private hangsOf(run: AgentRun, now: number): AgentRun[] {
+    return this.endedSince(run, now - this.settings.recovery.hungRepeat.windowMs).filter((r) => endKindOf(r) === "hung");
+  }
+
+  private hungRepeat(run: AgentRun, now: number): FailedRunVerdict | null {
+    const g = this.settings.recovery.hungRepeat;
+    if (g.mode === "off" || endKindOf(run) !== "hung") return null;
+    const counted = this.hangsOf(run, now);
+    return counted.length >= g.maxPerTask ? { guard: "hung_repeat", mode: g.mode, counted, max: g.maxPerTask, windowMs: g.windowMs } : null;
+  }
+
+  /**
+   * G2: the task's no-result runs within the window, across its chains, since its hold was last released (start
+   * again resets the count). Not counted (decision D2): a run that ended while its provider was in a fleet outage or
+   * cooldown, a Lair restart's (exit_unknown, lost, vars_lost), a stop (the owner's, or a claim released on request),
+   * and a superseded run (it never ran).
+   */
+  private noResultCap(run: AgentRun, now: number): FailedRunVerdict | null {
+    const g = this.settings.spend.guards.taskNoResultCap;
+    if (g.mode === "off" || !this.countsForCap(run)) return null;
+    const released = this.store.listEvents(this.project, { kinds: ["fill_released"], task: run.task, limit: 1 })[0]?.at ?? 0;
+    const counted = this.endedSince(run, Math.max(now - g.windowMs, released + 1)).filter((r) => this.countsForCap(r));
+    return counted.length >= g.max ? { guard: "task_no_result_cap", mode: g.mode, counted, max: g.max, windowMs: g.windowMs } : null;
+  }
+
+  /** Whether an ended run counts toward G2: a no-result end that was neither the fleet's problem nor a stop on request. */
+  private countsForCap(run: AgentRun): boolean {
+    return countsTowardCap(run) && !this.fleetFailure(run) && !this.releasedOnRequest(run);
+  }
+
+  /**
+   * A run stopped because its claim was released through releaseClaim: by the owner (the Agents view, the API) or by
+   * a module on its own account (a review whose PR moved on, a supervisor turn). That is a stop, not the task failing.
+   * A claim another run took (a double start) is no release on request, so that end still counts.
+   */
+  private releasedOnRequest(run: AgentRun): boolean {
+    if (endKindOf(run) !== "lost_claim") return false;
+    return this.store
+      .listEvents(this.project, { kinds: ["claim_released"], runId: run.id, limit: 20 })
+      .some((e) => e.data.by === "request" || e.data.by === "module");
+  }
+
+  /**
+   * Whether a run ended while its provider was the fleet's problem (D2): in a fleet outage (the latest `transient`
+   * event of its provider by its end says fleet, with no `transient_cleared` after it), or, for a rate limit or a
+   * provider error, in a cooldown two or more agents' failovers made fleet-wide (as coolingUntil reads it), or in
+   * G1's fleet quota cooldown (act: its latest `quota` event by the run's end, with no `quota_cleared` after it;
+   * observe: a `would_cool` window around the run's end).
+   */
+  private fleetFailure(run: AgentRun): boolean {
+    const at = run.endedAt ?? 0;
+    const provider = run.profile.provider;
+    const [outage] = this.store.listEvents(this.project, { kinds: ["transient", "transient_cleared"], subject: provider, until: at, limit: 1 });
+    if (outage?.kind === "transient" && outage.data.fleet === true) return true;
+    if (this.quotaCooledAt(provider, at)) return true;
+    const end = endKindOf(run);
+    const cooldown = this.settings.failover.cooldownMinutes * 60000;
+    if ((end !== "rate_limit" && end !== "provider_error") || cooldown <= 0) return false;
+    const agents = new Set(
+      this.store
+        .listEvents(this.project, { kinds: ["failover"], subject: provider, since: at - cooldown, until: at, limit: 100 })
+        .filter((e) => e.data.kind === "rate_limit" || e.data.kind === "provider_error")
+        .map((e) => e.agent ?? ""),
+    );
+    agents.add(run.agent);
+    return agents.size >= 2;
+  }
+
+  /** G1: the provider was in a fleet quota cooldown at `at` (act), or in a would_cool window (observe). */
+  private quotaCooledAt(provider: string, at: number): boolean {
+    const since = at - QUOTA_STATE_MS;
+    const [state] = this.store.listEvents(this.project, { kinds: ["quota", "quota_cleared"], subject: provider, since, until: at, limit: 1 });
+    if (state?.kind === "quota") return true;
+    const would = this.store
+      .listEvents(this.project, { kinds: ["guard_would"], subject: provider, since, until: at, limit: 20 })
+      .find((e) => e.data.guard === "quota");
+    return would !== undefined && typeof would.data.untilMs === "number" && at <= would.data.untilMs;
+  }
+
+  /** What a verdict says, for its event, notice and decision: numbers, ids and end kinds only. */
+  private verdictText(run: AgentRun, v: FailedRunVerdict): { what: string; key: string; evidence: string[]; data: Record<string, unknown> } {
+    const hours = Math.round((v.windowMs / 3_600_000) * 100) / 100;
+    const key = v.guard === "hung_repeat" ? "agents.recovery.hung_repeat.max_per_task" : "agents.spend.guards.task_no_result_cap.max";
+    const what = `${v.counted.length} ${v.guard === "hung_repeat" ? "hang(s)" : "run(s) with no result"} of ${run.task} within ${hours} h (${key} ${v.max})`;
+    const evidence = v.counted.map((r) => `run ${short(r.id)} (chain ${short(r.chainId)}): ${endKindOf(r)} at ${iso(r.endedAt ?? 0)}`);
+    const data = {
+      guard: v.guard,
+      task: run.task,
+      count: v.counted.length,
+      max: v.max,
+      windowHours: hours,
+      runs: v.counted.map((r) => r.id),
+      ends: v.counted.map((r) => endKindOf(r)),
+    };
+    return { what, key, evidence, data };
+  }
+
+  /**
+   * Observe: one guard_would event and one notice per task and streak (none of this guard's for the task since the
+   * first run it counts now), and nothing else changes.
+   */
+  private async wouldPark(run: AgentRun, v: FailedRunVerdict, t: Tick): Promise<void> {
+    const since = v.counted[0]?.endedAt ?? t.now;
+    const earlier = this.store.listEvents(this.project, { kinds: ["guard_would"], task: run.task, since, limit: 50 });
+    if (earlier.some((e) => e.data.guard === v.guard)) return;
+    const { what, evidence, data } = this.verdictText(run, v);
+    const recorded = await this.record(
+      "guard_would",
+      {
+        agent: run.agent,
+        task: run.task,
+        runId: run.id,
+        subject: run.task,
+        summary: `${v.guard} (observe): ${what}: would park ${run.task}; it goes on as before`,
+        evidence,
+        data: { ...data, verdict: "would_park" },
+        dedupeKey: `guard_would:${v.guard}:${run.id}`,
+      },
+      t.now,
+    );
+    if (!recorded) return;
+    await this.spendNotice({
+      key: `guard_would:${v.guard}:${run.id}`,
+      ref: `spend:guard:${t.now}:${run.task}`,
+      question: `${v.guard} would park ${run.task}: ${what}`,
+      code: "would_park",
+      facts: { guard: v.guard, task: run.task, count: v.counted.length, max: v.max, window_hours: Math.round((v.windowMs / 3_600_000) * 100) / 100 },
+      context: [
+        `In act mode Lair would park ${run.task} here, with one decision, instead of starting it again. It is in observe mode, so it goes on as before.`,
+        "",
+        ...evidence.map((line) => `- ${line}`),
+      ].join("\n"),
+    });
+  }
+
+  /**
+   * Act: the task is parked. Its chain ends here, a guard_did event says why, and one decision asks the owner: a
+   * fill task's claim is released and fill holds it (`no_result_cap` or `hung_repeat`) on the guard's decision;
+   * any other run is escalated through the existing path (its module's own caps still apply).
+   */
+  private async park(run: AgentRun, v: FailedRunVerdict, t: Tick): Promise<void> {
+    const { what, evidence, data } = this.verdictText(run, v);
+    run.detail = `${run.detail}; parked by ${v.guard}: ${what}`;
+    this.store.saveRun(run);
+    await this.record(
+      "guard_did",
+      {
+        agent: run.agent,
+        task: run.task,
+        runId: run.id,
+        subject: run.task,
+        summary: `${v.guard}: ${what}: ${run.task} is parked, not started again`,
+        evidence,
+        data: { ...data, verdict: "park" },
+        dedupeKey: `guard_did:${v.guard}:${run.id}`,
+      },
+      t.now,
+    );
+    if (originOf(run) !== "fill") {
+      await this.escalate(run, `${v.guard}: ${what}`, t);
+      return;
+    }
+    this.store.releaseClaim(this.project, run.task, run.id);
+    const hung = v.guard === "hung_repeat";
+    const options: DecisionRequest["options"] = hung
+      ? [
+          {
+            id: DECISION_FRESH,
+            effect: "reversible",
+            label: "Start a fresh session",
+            consequences: `Lair starts ${run.task} again for ${run.agent} in a fresh session (the old one moved aside), with what it was doing when it hung and a resume summary. Another hang within the window parks it again.`,
+          },
+          { id: DECISION_GUARD_KEEP, effect: "reversible", label: "Keep it parked", consequences: `Fill leaves ${run.task} paused until you release it in Work.` },
+          {
+            id: DECISION_RELEASE,
+            effect: "reversible",
+            label: "Release the hold",
+            consequences: `Fill starts ${run.task} again on its next check, in a new session. Another hang within the window parks it again.`,
+          },
+        ]
+      : [
+          {
+            id: DECISION_FILL_START,
+            effect: "reversible",
+            label: "Start it again",
+            consequences: `Fill starts ${run.task} again on its next check, and its count of runs with no result starts over.`,
+          },
+          {
+            id: DECISION_FRESH,
+            effect: "reversible",
+            label: "Start a fresh session",
+            consequences: `Lair starts ${run.task} again for ${run.agent} in a fresh session (the old one moved aside), with a resume summary. The count goes on: one more run with no result parks it again.`,
+          },
+          { id: DECISION_GUARD_KEEP, effect: "reversible", label: "Keep it parked", consequences: `Fill leaves ${run.task} paused until you release it in Work.` },
+        ];
+    await this.raise(
+      {
+        kind: "escalation",
+        key: guardDecisionKey(v.guard, run.id),
+        ref: `chain:${run.chainId}`,
+        blocks: [`agents:${this.project}:task:${run.task}`],
+        question: `${run.agent} is parked on ${run.task}: ${what}`,
+        context: [
+          `${v.guard}: Lair stopped starting ${run.task} again. The runs it counted:`,
+          "",
+          ...evidence.map((line) => `- ${line}`),
+        ].join("\n"),
+        options,
+        recommended: DECISION_GUARD_KEEP,
+        structure: {
+          class: "agents.gave_up",
+          evidence: {
+            code: "repeated_failure",
+            facts: { agent: run.agent, task: run.task, attempt_count: v.counted.length, last_exit: run.exitCode ?? null },
+            cause_cleared: false,
+            linked_issue: null,
+          },
+        },
+        why: hung
+          ? "The task hung again: resuming the same context would most likely hang the same way."
+          : "The task keeps failing: starting it again the same way would repeat the failures.",
+        reversible: true,
+      },
+      t,
+      run,
+    );
+  }
+
   // ============ FAILOVER ============
 
   /**
@@ -2334,9 +2724,15 @@ export class AgentsService {
    * with a resume summary. The agent's output decides this, so a chain gets
    * at most failover.max_failovers of them (then it is escalated), and the
    * recovery counters carry over: failing over never buys more restarts.
+   * A quota line (G1 act) is the account's, not the task's: it cools the
+   * provider for every agent at once, doesn't count toward max_failovers,
+   * and with no other profile the task waits for the cooldown's probe, with
+   * one decision per provider (not one per task). In observe it takes this
+   * path as a rate limit, and only a would_cool is recorded beside it.
    */
   private async failover(run: AgentRun, info: FailoverInfo, t: Tick): Promise<void> {
-    this.runEnded(run, "failed", t.now, info.transient ? "unreachable" : info.kind);
+    const quota = info.kind === "quota";
+    this.runEnded(run, "failed", t.now, info.transient ? "unreachable" : info.kind === "quota" ? "rate_limit" : info.kind);
     run.failover = info;
     run.detail = `${failoverLabel(info.kind)} on ${profileLabel(run.profile)}: ${oneLine(info.line)}`;
     this.releaseRunLocks(run);
@@ -2345,23 +2741,34 @@ export class AgentsService {
 
     const cooldown = this.settings.failover.cooldownMinutes * 60000;
     const done = run.failovers ?? 0;
-    const capped = done >= this.settings.failover.maxFailovers;
+    const capped = !quota && done >= this.settings.failover.maxFailovers;
+    const failovers = quota ? done : done + 1;
+    // G1: the cooldown starts (or a failed probe doubles it) before anything reads it; observe records would_cool
+    const cooling = quota ? await this.quotaHit(run, info, t) : null;
+    if (info.quota && !quota) await this.wouldCool(run, info, t);
     const profiles = this.profiles(run.agent, run.requestModel);
     const { chosen, skipped } = capped
       ? { chosen: null, skipped: [`failover.max_failovers (${this.settings.failover.maxFailovers}) reached`] }
       : chooseProfile(profiles, run.profileIndex + 1, true, (p) =>
           p.provider === run.profile.provider ? `provider ${p.provider} just failed` : this.unusable(p, run.agent, t.now),
         );
-    const next = capped ? null : this.followUp(run, t.now, t.now);
+    // G2 (§4.5): a task at its no-result cap is parked (act), not failed over
+    const parked = !capped && (await this.guardFailed(run, t));
+    const next = capped || parked ? null : this.followUp(run, t.now, t.now);
     if (next) {
       next.sessionMode = "new";
       next.sessionId = randomUUID();
-      next.failovers = done + 1;
+      next.failovers = failovers;
       next.resumeSummary = await this.summary(run, t, `${failoverLabel(info.kind)}: ${info.line}`);
       if (chosen) {
         next.profileIndex = chosen.index;
         next.profile = chosen.profile;
         next.detail = `failing over to ${profileLabel(chosen.profile)}`;
+      } else if (cooling) {
+        // No fixed timer: launch waits for the cooldown's probe (or its end) and starts it then
+        next.profileIndex = 0;
+        next.profile = profiles[0] ?? run.profile;
+        next.detail = `waiting: provider ${cooling.provider} hit its quota; next probe at ${iso(cooling.nextTryAt)}`;
       } else {
         const ends = [
           t.now + cooldown,
@@ -2382,7 +2789,9 @@ export class AgentsService {
         subject: run.profile.provider,
         summary: capped
           ? `${run.agent} on ${run.task}: ${failoverLabel(info.kind)} on ${profileLabel(run.profile)}; ${done} failovers already: escalating`
-          : chosen
+          : parked
+            ? `${run.agent} on ${run.task}: ${failoverLabel(info.kind)} on ${profileLabel(run.profile)}; the task is parked at its no-result cap`
+            : chosen
             ? `${run.agent} on ${run.task}: ${failoverLabel(info.kind)} on ${profileLabel(run.profile)}; switched to ${profileLabel(chosen.profile)}`
             : `${run.agent} on ${run.task}: ${failoverLabel(info.kind)} on ${profileLabel(run.profile)}; no fallback left`,
         evidence: [`log line: ${oneLine(info.line)}`, ...skipped],
@@ -2390,26 +2799,259 @@ export class AgentsService {
           kind: info.kind,
           line: info.line,
           from: run.profile,
-          to: chosen?.profile ?? null,
+          to: next ? (chosen?.profile ?? null) : null,
           fromIndex: run.profileIndex,
-          toIndex: chosen?.index ?? null,
+          toIndex: next ? (chosen?.index ?? null) : null,
           nextRunId: next?.id ?? null,
-          failovers: done + 1,
+          failovers,
           capped,
-          coolingUntil: cooldown > 0 ? iso(t.now + cooldown) : null,
+          ...(parked ? { parked: true } : {}),
+          ...(info.quota ? { quota: { reset: info.quota.reset } } : {}),
+          coolingUntil: cooling ? iso(cooling.nextTryAt) : cooldown > 0 ? iso(t.now + cooldown) : null,
         },
       },
       t.now,
     );
     t.summary.failovers++;
     this.store.saveRun(run);
+    if (parked) return;
     if (!next) {
       await this.escalate(run, `${done + 1} provider errors or rate limits in a row (failover.max_failovers is ${this.settings.failover.maxFailovers}): ${oneLine(info.line, 200)}`, t, "provider_limit");
       return;
     }
     this.store.insertRun(next);
     this.store.transferClaim(this.project, run.task, run.id, next.id, this.probes.self);
-    if (!chosen) await this.raiseExhausted(next, skipped, t);
+    // A quota's wait is asked once per provider and cooldown (checkQuotas), never once per task
+    if (!chosen && !cooling) await this.raiseExhausted(next, skipped, t);
+  }
+
+  // ============ G1: FLEET QUOTA COOLDOWN ============
+
+  /** The provider's fleet quota cooldown now (G1 act; its newest quota or quota_cleared event decides), or null. */
+  private quotaCooldown(provider: string, now: number): QuotaCooldown | null {
+    if (this.settings.failover.quota.mode !== "act") return null;
+    const [latest] = this.store.listEvents(this.project, { kinds: ["quota", "quota_cleared"], subject: provider, since: now - QUOTA_STATE_MS, limit: 1 });
+    if (!latest || latest.kind !== "quota") return null;
+    const data = latest.data;
+    const num = (value: unknown, fallback: number) => (typeof value === "number" && Number.isFinite(value) ? value : fallback);
+    return {
+      quota: true,
+      provider,
+      since: num(data.since, latest.at),
+      nextTryAt: num(data.nextTryAt, latest.at),
+      steps: num(data.steps, 1),
+      hits: num(data.hits, 1),
+      reset: typeof data.reset === "string" ? data.reset : null,
+      lastAt: latest.at,
+      fleet: true,
+    };
+  }
+
+  /**
+   * G1 act: a run's quota line. The provider cools for every agent at once until the line's reset time (capped at
+   * 24 h), else for quota.backoff_minutes, doubling per failed probe up to quota.max_backoff_minutes: a line at or
+   * after the next try is a probe that hit it again. A line before it (a run that started earlier) keeps the step and
+   * only moves the next try to a later reset time. A new cooldown records one guard_did.
+   */
+  private async quotaHit(run: AgentRun, info: FailoverInfo, t: Tick): Promise<QuotaCooldown> {
+    const q = this.settings.failover.quota;
+    const provider = run.profile.provider;
+    const previous = this.quotaCooldown(provider, t.now);
+    const reset = info.quota?.reset ?? null;
+    const resetAt = reset === null ? null : quotaResetAt(reset, t.now);
+    const probed = previous !== null && t.now >= previous.nextTryAt;
+    const steps = previous === null ? 1 : probed ? previous.steps + 1 : previous.steps;
+    const backoff = Math.min(q.maxBackoffMs, q.backoffMs * 2 ** Math.min(steps - 1, 30));
+    const nextTryAt = previous !== null && !probed ? Math.max(previous.nextTryAt, resetAt ?? 0) : (resetAt ?? t.now + backoff);
+    const since = previous?.since ?? t.now;
+    const hits = (previous?.hits ?? 0) + 1;
+    const how = resetAt !== null ? `its reset time${reset ? ` (${oneLine(reset, 80)})` : ""}` : `backoff step ${steps}, quota.backoff_minutes ${q.backoffMs / 60000}`;
+    const data = { provider, since, nextTryAt, steps, hits, reset, resetAt: resetAt === null ? null : iso(resetAt), line: oneLine(info.line, 500) };
+    await this.record(
+      "quota",
+      {
+        agent: run.agent,
+        task: run.task,
+        runId: run.id,
+        subject: provider,
+        summary: `${run.agent} on ${run.task}: provider ${provider} hit its quota${probed ? " again (the probe)" : ""}; every agent's starts on it wait, one start probes it at ${iso(nextTryAt)} (${how})`,
+        evidence: [`log: ${oneLine(info.line)}`, `cooling since ${iso(since)}, ${hits} quota line(s)`],
+        data,
+      },
+      t.now,
+    );
+    if (previous === null) {
+      await this.record(
+        "guard_did",
+        {
+          agent: run.agent,
+          task: run.task,
+          runId: run.id,
+          subject: provider,
+          summary: `quota: provider ${provider} hit its quota: cooled for every agent until ${iso(nextTryAt)}, then one start probes it`,
+          evidence: [`log: ${oneLine(info.line)}`],
+          data: { guard: "quota", verdict: "cool", provider, until: iso(nextTryAt), reset, resetAt: data.resetAt },
+          dedupeKey: `guard_did:quota:${provider}:${since}`,
+        },
+        t.now,
+      );
+    }
+    return { quota: true, provider, since, nextTryAt, steps, hits, reset, lastAt: t.now, fleet: true };
+  }
+
+  /**
+   * G1 observe: a line act would read as a quota. Nothing changes (it took today's rate-limit path); one guard_would
+   * (would_cool, with the time act would cool until) and one notice per provider and streak. The streak goes on until
+   * a start on the provider works after its first line, as act's cooldown does.
+   */
+  private async wouldCool(run: AgentRun, info: FailoverInfo, t: Tick): Promise<void> {
+    const provider = run.profile.provider;
+    const previous = this.store
+      .listEvents(this.project, { kinds: ["guard_would"], subject: provider, since: t.now - QUOTA_STATE_MS, limit: 20 })
+      .find((e) => e.data.guard === "quota");
+    if (previous && !this.providerWorkedSince(provider, previous.at, t.now)) return;
+    const reset = info.quota?.reset ?? null;
+    const resetAt = reset === null ? null : quotaResetAt(reset, t.now);
+    const until = resetAt ?? t.now + this.settings.failover.quota.backoffMs;
+    const key = `guard_would:quota:${run.id}`;
+    const recorded = await this.record(
+      "guard_would",
+      {
+        agent: run.agent,
+        task: run.task,
+        runId: run.id,
+        subject: provider,
+        summary: `quota (observe): provider ${provider} hit its quota (${run.agent} on ${run.task}): would cool it for every agent until ${iso(until)}, then probe it with one start; it goes on as before`,
+        evidence: [`log: ${oneLine(info.line)}`],
+        data: { guard: "quota", verdict: "would_cool", provider, until: iso(until), untilMs: until, reset, resetAt: resetAt === null ? null : iso(resetAt) },
+        dedupeKey: key,
+      },
+      t.now,
+    );
+    if (!recorded) return;
+    await this.spendNotice({
+      key,
+      ref: `quota:${provider}`,
+      question: `quota would cool provider ${provider} for every agent until ${iso(until)}`,
+      code: "would_cool",
+      facts: { guard: "quota", provider, until: iso(until), reset_given: resetAt !== null },
+      context: [
+        `A run of ${run.agent} on ${run.task} ended on a line agents.failover.quota.patterns reads as a quota. In act mode Lair would hold every agent's starts on ${provider} until ${iso(until)}${resetAt !== null ? " (the line's reset time)" : ""}, then probe it with one start, and ask once for the provider. It is in observe mode, so the line took the rate-limit path as before.`,
+        "",
+        "This notice is withdrawn once a start on the provider works.",
+      ].join("\n"),
+    });
+  }
+
+  /**
+   * Whether a start on the provider at or after `since` worked (the newest 50 starts): it completed, or it lived
+   * dead_on_start_seconds without ending on a quota line. G1 observe's streak and notice end there.
+   */
+  private providerWorkedSince(provider: string, since: number, now: number): boolean {
+    const deadOnStart = this.settings.deadOnStartSeconds * 1000;
+    for (const started of this.store.listEvents(this.project, { kinds: ["started"], since, limit: 50 })) {
+      const profile = started.data.profile;
+      if (!started.runId || typeof profile !== "object" || profile === null || (profile as { provider?: unknown }).provider !== provider) continue;
+      const run = this.store.getRun(started.runId);
+      if (!run || run.spawnedAt === undefined) continue;
+      if (run.state === "completed") return true;
+      if (run.failover?.quota) continue;
+      if ((run.endedAt ?? now) - run.spawnedAt >= deadOnStart) return true;
+    }
+    return false;
+  }
+
+  /**
+   * G1 act: a start on the provider after its latest quota line that is alive past dead_on_start_seconds (or exited
+   * 0) shows the quota is back: the cooldown ends for every agent, and the runs waiting on it start on the next check.
+   */
+  private async noteQuotaBack(run: AgentRun, t: Tick, exitedZero: boolean): Promise<void> {
+    if (run.spawnedAt === undefined) return;
+    const cooldown = this.quotaCooldown(run.profile.provider, t.now);
+    if (!cooldown || run.spawnedAt < cooldown.lastAt) return;
+    const lived = t.now - run.spawnedAt;
+    if (!exitedZero && lived < this.settings.deadOnStartSeconds * 1000) return;
+    await this.record(
+      "quota_cleared",
+      {
+        agent: run.agent,
+        task: run.task,
+        runId: run.id,
+        subject: cooldown.provider,
+        summary: `provider ${cooldown.provider} works again: run ${short(run.id)} of ${run.agent} ${exitedZero ? "exited 0" : `has run ${seconds(lived)}`}; the runs waiting on its quota start`,
+        evidence: [`cooling since ${iso(cooldown.since)}, ${cooldown.hits} quota line(s), ${cooldown.steps} backoff step(s)`],
+        data: { provider: cooldown.provider, since: cooldown.since, hits: cooldown.hits, steps: cooldown.steps, by: "start" },
+      },
+      t.now,
+    );
+  }
+
+  /**
+   * G1 act: a provider in a quota cooldown with runs waiting on it raises one decision per provider and cooldown
+   * (key `quota:<provider>:<since>`), never one per agent or task: keep waiting (the probe goes on), or try now (the
+   * cooldown ends, and every waiting run starts on the next check). Moot once the cooldown is over (quotaMoot).
+   */
+  private async checkQuotas(t: Tick): Promise<void> {
+    if (this.settings.failover.quota.mode !== "act") return;
+    const waiting = new Map<string, AgentRun[]>();
+    for (const run of this.store.activeRuns(this.project)) {
+      if (run.state !== "queued" && run.state !== "waiting_lock") continue;
+      waiting.set(run.profile.provider, [...(waiting.get(run.profile.provider) ?? []), run]);
+    }
+    for (const [provider, runs] of waiting) {
+      const cooldown = this.quotaCooldown(provider, t.now);
+      if (!cooldown) continue;
+      await this.raise(
+        {
+          kind: "escalation",
+          key: `quota:${provider}:${cooldown.since}`,
+          ref: `quota:${provider}`,
+          blocks: runs.slice(0, 50).map((r) => `agents:${this.project}:task:${r.task}`),
+          question: `Provider ${provider} hit its quota: ${runs.length} run(s) wait for it`,
+          context: [
+            `Since ${iso(cooldown.since)}, ${cooldown.hits} run(s) on ${provider} ended on a quota line (agents.failover.quota.patterns). A quota is the account's, so every agent's starts on it wait, and nothing is counted against the tasks.`,
+            `Lair probes it with one start at ${iso(cooldown.nextTryAt)}${cooldown.reset ? ` (the line said it resets: ${oneLine(cooldown.reset, 80)})` : ""}; a probe that hits the quota again doubles the wait, up to agents.failover.quota.max_backoff_minutes. Once a probe works, the waiting runs start.`,
+            "",
+            "Waiting:",
+            ...runs.slice(0, 20).map((r) => `- ${r.agent} on ${r.task} (run ${short(r.id)})`),
+            ...(runs.length > 20 ? [`- and ${runs.length - 20} more`] : []),
+          ].join("\n"),
+          options: [
+            {
+              id: DECISION_WAIT,
+              effect: "reversible",
+              label: "Keep waiting",
+              consequences: `Lair keeps probing ${provider} with one start at a time; the waiting runs start once one works.`,
+            },
+            {
+              id: DECISION_RETRY_NOW,
+              effect: "reversible",
+              label: "Try now",
+              consequences: `The cooldown ends: every run waiting on ${provider} starts on the next check (choose this once the quota was raised or has reset). A run that hits it again starts a new cooldown.`,
+            },
+          ],
+          recommended: DECISION_WAIT,
+          structure: {
+            class: "agents.provider_limit",
+            evidence: {
+              code: "provider_quota",
+              facts: {
+                provider,
+                runs_waiting: runs.length,
+                since: iso(cooldown.since),
+                next_probe_at: iso(cooldown.nextTryAt),
+                failed_probes: cooldown.steps - 1,
+              },
+              cause_cleared: false,
+              linked_issue: null,
+            },
+          },
+          why: "A quota resets by itself, and waiting costs nothing: one start probes it, and no task is counted against while it lasts.",
+          reversible: true,
+        },
+        t,
+      );
+    }
   }
 
   /**
@@ -2591,7 +3233,7 @@ export class AgentsService {
    * is only some agents' so far, only the agent's own runs count. A run that
    * waits on a lock is no try: it holds nothing up.
    */
-  private probeInFlight(run: AgentRun, outage: Outage): boolean {
+  private probeInFlight(run: AgentRun, outage: Pick<Outage, "provider" | "fleet" | "nextTryAt">): boolean {
     return this.store
       .activeRuns(this.project)
       .some(
@@ -2622,6 +3264,7 @@ export class AgentsService {
    */
   private async noteReachable(run: AgentRun, t: Tick, exitedZero: boolean): Promise<void> {
     if (run.spawnedAt === undefined) return;
+    await this.noteQuotaBack(run, t, exitedZero);
     const outage = this.outage(run.profile.provider);
     if (!outage) return;
     const lived = t.now - run.spawnedAt;
@@ -2723,6 +3366,8 @@ export class AgentsService {
       t.now,
     );
 
+    // G2 (§4.5): a death the fleet's outage explains isn't counted; one that is, at the cap, parks the task (act)
+    if (await this.guardFailed(run, t)) return;
     const next = this.followUp(run, t.now, t.now);
     next.transientRetries = used + 1;
     if (run.spawnedAt !== undefined && lived >= this.settings.deadOnStartSeconds * 1000) {

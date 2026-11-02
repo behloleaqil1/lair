@@ -104,6 +104,8 @@ export interface SpendGroupView {
   productive: SpendTotalsView;
   idle: SpendTotalsView;
   noResult: SpendTotalsView;
+  /** Runs with no class yet: in the totals, in no waste share */
+  unclassified: SpendTotalsView;
   waste: SpendWasteShare;
   reloads: number;
   lairRestarts: number;
@@ -307,6 +309,10 @@ export type AgentEventKind =
   | "fill_unmatched"
   | "transient"
   | "transient_cleared"
+  /** A provider's fleet quota cooldown (G1 act): its state, kept on each event, so the newest one says where it stands */
+  | "quota"
+  /** A start on a provider in a quota cooldown worked, or the owner chose "Try now": the cooldown is over */
+  | "quota_cleared"
   | "run_adopted"
   | "run_lost"
   | "stopped_for_shutdown"
@@ -473,9 +479,11 @@ export type FillLineState = "started" | "done" | "held" | "claimed" | "not_allow
  *   prompt file), refused (the run request, or done_pattern)
  * - conflict: a live process this server has no run for holds one of the task's run prompt files on its
  *   command line (a run of the task it doesn't know): fill starts the task once that process has ended
+ * - no_result_cap, hung_repeat: an AI spend guard in act mode parked it (docs/design/ai-spend.md G2, G4): its no-result
+ *   runs, or its hangs, reached the guard's limit within its window, in any chain; one decision asks what next
  * - paused: you chose to leave it ("Keep it paused" on its decision, or "Leave the task unclaimed" on
  *   its run's escalation): nothing waits for you, and fill starts it again once you release it
- * owner, no_done, blocked, waiting, waited_too_long and paused are the owner's to release (POST
+ * owner, no_done, blocked, waiting, waited_too_long, no_result_cap, hung_repeat and paused are the owner's to release (POST
  * /api/agents/fill/release, or the decision); a waiting one also ends by itself.
  * owner, no_done, blocked, waited_too_long and refused need the owner (FILL_OWNER_HOLDS): each has
  * exactly one open Decision Inbox item while it lasts (`decisionId`).
@@ -499,7 +507,9 @@ export type FillHold =
   | "conflict"
   | "prompt"
   | "refused"
-  | "report_refused";
+  | "report_refused"
+  | "no_result_cap"
+  | "hung_repeat";
 
 export interface FillLineView {
   /** 1-based line number in tasks_file */
@@ -527,7 +537,7 @@ export interface FillLineView {
 }
 
 /** The holds that need the owner: each has exactly one open decision while it lasts. */
-export const FILL_OWNER_HOLDS: readonly FillHold[] = ["owner", "no_done", "blocked", "waited_too_long", "refused"];
+export const FILL_OWNER_HOLDS: readonly FillHold[] = ["owner", "no_done", "blocked", "waited_too_long", "refused", "no_result_cap", "hung_repeat"];
 
 export interface FillWaitingView {
   /** What the WAITING line named (a gate id, say), when the pattern captures it */
