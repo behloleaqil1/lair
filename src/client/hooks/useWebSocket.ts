@@ -63,7 +63,7 @@ interface LogLineData {
 }
 
 export type WSChannel =
-  "dragons" | "gates" | "machines" | "orchestrator" | `logs:${string}`;
+  "dragons" | "gates" | "machines" | "orchestrator" | "bus" | `logs:${string}`;
 
 export interface UseWebSocketState {
   connected: boolean;
@@ -91,6 +91,8 @@ export interface UseWebSocketOptions {
   onMachineUpdate?: (data: MachineUpdateData) => void;
   /** Callback for orchestrator updates */
   onOrchestratorUpdate?: (data: unknown) => void;
+  /** Callback for fleet bus updates (BusLiveUpdate, unchecked: bus-feed.ts parseBusUpdate checks it) */
+  onBusUpdate?: (data: unknown) => void;
   /** Callback for log lines (requires logs:<dragonId> subscription) */
   onLogLine?: (data: LogLineData) => void;
   /** Callback when connection state changes */
@@ -204,6 +206,7 @@ export function useWebSocket(
           else if (channel === "gates") handlers.onGateUpdate?.(message.data as GateUpdateData);
           else if (channel === "machines") handlers.onMachineUpdate?.(message.data as MachineUpdateData);
           else if (channel === "orchestrator") handlers.onOrchestratorUpdate?.(message.data);
+          else if (channel === "bus") handlers.onBusUpdate?.(message.data);
           else if (channel.startsWith("logs:")) handlers.onLogLine?.(message.data as LogLineData);
           break;
         }
