@@ -6,7 +6,8 @@
  * - behind: the PR is more than behind_threshold commits behind its base;
  * - no_ci: no check has run at the head of a non-draft PR for no_ci_minutes;
  * - ci_red: the newest run of at least one check at the head failed.
- * no_ci and ci_red need the repository's `ci_counts`.
+ * no_ci and ci_red need the repository's `ci_counts` and its
+ * `pr_health.repos.<repo>.ci_signal` (both default true).
  */
 import type { HostCheck } from "../review/host.js";
 import type { Kind } from "./config.js";
@@ -30,7 +31,8 @@ export interface PrFacts {
 /** Who hears about a PR's problems (owner.ts): agent null means nobody owns it, with the reason */
 export interface OwnerView {
   agent: string | null;
-  source: "task_line" | "branch" | null;
+  /** review: the author the review module registered; pr_author: the host account that opened the PR (owner.rule branch_first) */
+  source: "task_line" | "branch" | "review" | "pr_author" | null;
   line: number | null;
   reason: string;
 }
@@ -61,6 +63,8 @@ export interface RepoView {
   /** null until it is known (the host's default branch is read once) */
   base: string | null;
   ciCounts: boolean;
+  /** Its CI counts for PR health (ci_counts and pr_health.repos.<repo>.ci_signal) */
+  ciSignal: boolean;
   /** inactive: not read yet */
   state: "ok" | "error" | "inactive";
   /** The last read's error, one line, or null */

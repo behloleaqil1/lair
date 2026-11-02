@@ -855,10 +855,12 @@ await registerInfraMonitorRoutes(fastify, infraMonitor, () => getDefaultProject(
 
 // PR health (src/server/pr-health/): the open PRs of each repository in repos:
 // that conflict, fall behind, get no CI or go red, and the agent whose task
-// line or branch owns each (fill's last check). Off unless a project sets
+// line or branch owns each (fill's last check, or with owner.rule branch_first
+// the branch, the review module's registered author, a task line, the PR's
+// author). Off unless a project sets
 // `pr_health.enabled: true`; observe by default (events and a read-only
 // status). Act mode's notes are kept in data/pr-health-deliveries.json.
-const prHealth = new PrHealthManager({ events: getEventBus(), agents, ledgerPath: join(process.cwd(), "data", "pr-health-deliveries.json") });
+const prHealth = new PrHealthManager({ events: getEventBus(), agents, reviews, ledgerPath: join(process.cwd(), "data", "pr-health-deliveries.json") });
 prHealth.load(projectEntries);
 prHealth.useDecisions(decisionInbox);
 await registerPrHealthRoutes(fastify, prHealth, () => getDefaultProject());
