@@ -2,7 +2,7 @@
 
 - **Status:** design (spec only, no code). Owner questions: none (the choices are made in §9 and can be revisited in
   review).
-- **Base:** main `d2b3d8e`.
+- **Base:** main `2d40545`.
 - **Issue:** #323.
 - **Related:** [autonomy.md](autonomy.md) (principles 3 and 4: evidence for every automatic action, reversible by
   default), [decision-policies.md](decision-policies.md) §5 (shadow, suggest, act and the promotion bars for decision
@@ -51,7 +51,7 @@ rollbacks are only proposed (§4.6).
 - **No record links a flip to its evidence.** A flip is a YAML edit (settings history keeps the diff), with nothing
   saying what the evidence was when it was made.
 
-## 2. What exists today (checked against main at `d2b3d8e`)
+## 2. What exists today (checked against main at `2d40545`)
 
 ### 2.1 The switches and what observe records
 
@@ -61,7 +61,7 @@ rollbacks are only proposed (§4.6).
 | PR health | `pr_health.mode: observe \| act`, `observe` (`src/server/pr-health/config.ts:32`); act needs `notify_cmd` (`config.ts:133`) | `pr_health.finding` / `pr_health.cleared` events (`src/server/pr-health/service.ts:225,241`); the plan act would run, live (`src/server/pr-health/plan.ts`, `types.ts:77`) | No (events in memory; plan recomputed) | None |
 | Bus consumers | `bus.consume: off \| observe \| on`, `off` (`src/server/bus/config.ts:20-27`) | Per mirrored line: the report's reading next to the patterns' reading, `match` (`src/server/bus/consumers.ts:478-479`) | No (in memory, capped) | `health().observations` total, matches, mismatches (`consumers.ts:344-361`) |
 | Work store | `work_store.mode: off \| observe`, `off` (`src/server/work/config.ts:14-17`); `on` not built yet (work-store.md §6, "work store 3") | The store next to fill's view at fill's last check (`src/server/work/manager.ts:86-93`) | No (last check only) | `agree`, `ignored`, `disagree[]` in `GET /api/work/status` |
-| Spend guards (9 units) | Each guard's mode, `off` or `observe` by default, the keys listed in `GUARD_KEYS` (`src/server/agents/spend-report.ts:41-51`) | One `guard_would` event per verdict (`src/server/agents/service.ts:2622`, `:2940`; `src/server/agents/budgets.ts:194-200`); act writes `guard_did` (`service.ts:2660`) | Yes (agents store events) | Counts only (`spend-report.ts:243-249`) |
+| Spend guards (9 units) | Each guard's mode, `off` or `observe` by default, the keys listed in `GUARD_KEYS` (`src/server/agents/spend-report.ts:41-51`) | One `guard_would` event per verdict (`src/server/agents/service.ts:2627`, `:2945`; `src/server/agents/budgets.ts:194-200`); act writes `guard_did` (`service.ts:2665`) | Yes (agents store events) | Counts only (`spend-report.ts:243-249`) |
 | Decision rules (per class) | Policy `state: off \| shadow` in the policy table; `decision_policies.enabled` in `data/server.yaml` (`src/server/decisions/policies/config.ts:7,23`) | One `policy_trace` row per decision, proposer and table version | Yes (`data/decisions.db`) | `policyAgreement()` with unsafe disagreements (`src/server/decisions/store.ts:633-656`), `GET /api/owner/decision-policies` (`src/server/decisions/policies/index.ts:144`) |
 
 Other modules with the same switch (watchdog, triage and its re-checks, placement, host services, infrastructure
