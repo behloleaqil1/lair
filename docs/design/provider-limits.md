@@ -1,7 +1,7 @@
 # Provider limits: quotas, outages, fallback order and switch-back
 
 - **Status:** design (spec only; nothing here is built). Refs issue #185 (usage limit detector, D26).
-- **Base:** main `2d40545`.
+- **Base:** main `99ba920`.
 - **Related:** [ai-spend.md §4.5 G1](ai-spend.md#45-guards-off-observe-act) (the fleet quota cooldown, built), [ai-roles.md](ai-roles.md) (profiles and roles, failover along a role), [autonomy.md §6](autonomy.md#6-agents-budgets-failover-and-session-recovery-module-agents) (the agents module), [configuration.md, Agents](../configuration.md#agents).
 
 Lair starts every AI run through an agent CLI. When the account behind that CLI runs out of quota, or the provider is down, every run fails in seconds. Lair already handles part of this: rate-limit and provider-error lines fail over to the next profile, transient network errors are waited out, and G1 cools a provider for the whole fleet on a quota line. This spec closes the gaps that one real monthly cap exposed:
@@ -23,39 +23,39 @@ Error: You've reached your monthly usage limit. Please return next month to cont
 ```
 
 - None of the default `rate_limit_patterns` (`src/server/agents/config.ts:30-37`) match this wording. The closest is `\busage limit (reached|exceeded)\b`, but the line says "reached your monthly usage limit". The default `quota.patterns` (`config.ts:74`, `DAILY_REQUEST_COUNT` and `hit your .* limit`) miss it too.
-- So `matchFailover` (`src/server/agents/failover.ts:77`) returned null. The runs were recorded as `dead_on_start` (`src/server/agents/service.ts:2159-2163`) and resumed in the same session, 4 of 4 times, instead of failing over.
+- So `matchFailover` (`src/server/agents/failover.ts:77`) returned null. The runs were recorded as `dead_on_start` (`src/server/agents/service.ts:2174-2178`) and resumed in the same session, 4 of 4 times, instead of failing over.
 - The deployment fixed it by hand, adding `"errorType"\s*:\s*"UsageLimitReachedError"` and `\breached your monthly usage limit\b` to its project config. After that, failover worked.
 - The structured part of the line was there all along: `errorType` names the error in a stable, machine-readable way. The same CLI's HTTP body for its daily cap carries `"reason":"DAILY_REQUEST_COUNT"` (`fixtures/agents-usage/kiro-requests-30.txt:220`), and the monthly one carries `MONTHLY_REQUEST_COUNT`.
 
-**A daily quota retried on a fixed timer** ([ai-spend.md §1](ai-spend.md#1-why-what-one-real-deployment-shows), 48 h to 2026-11-02). There were 114 rate-limited runs, all `DAILY_REQUEST_COUNT`. For 8 hours each waiting agent retried about every 31 minutes, because `failover.cooldown_minutes` was a fixed 30. G1 (built since) replaces that with one probe per backoff step, doubling from 30 to 240 minutes. For a monthly cap, the same backoff still means one failed probe every 4 hours for up to a month, about 180 dead runs. G1 also caps any reset at 24 hours (`QUOTA_MAX_COOLDOWN_MS`, `failover.ts:127`) and forgets a cooldown after 48 hours (`QUOTA_STATE_MS`, `service.ts:247`).
+**A daily quota retried on a fixed timer** ([ai-spend.md §1](ai-spend.md#1-why-what-one-real-deployment-shows), 48 h to 2026-11-02). There were 114 rate-limited runs, all `DAILY_REQUEST_COUNT`. For 8 hours each waiting agent retried about every 31 minutes, because `failover.cooldown_minutes` was a fixed 30. G1 (built since) replaces that with one probe per backoff step, doubling from 30 to 240 minutes. For a monthly cap, the same backoff still means one failed probe every 4 hours for up to a month, about 180 dead runs. G1 also caps any reset at 24 hours (`QUOTA_MAX_COOLDOWN_MS`, `failover.ts:127`) and forgets a cooldown after 48 hours (`QUOTA_STATE_MS`, `service.ts:248`).
 
 **Another CLI reports its window and its reset.** A Claude Code run with `--output-format stream-json` writes a `rate_limit_event` before it stops (`fixtures/agents-usage/claude-stream-json-usage-limit.jsonl:2`). It has `rate_limit_info.status: "rejected"`, `rateLimitType: "five_hour"`, `resetsAt` as epoch seconds, and a `seven_day` window. Today Lair reads none of these fields. The reset time is in the line, but the only way to read it is a `(?<reset>...)` regex group, and that does not handle epoch seconds.
 
-**With a fallback, the primary is never probed again** (from the code, §2). When the primary provider is in a quota cooldown or an outage, `unusable()` (`service.ts:1381-1397`) passes it over. If the agent has a fallback, every run starts on the fallback. A probe of the primary happens only for a run that has **no** usable profile (`service.ts:1481-1506`). So once every agent has a fallback, nothing ever ends the primary's cooldown:
+**With a fallback, the primary is never probed again** (from the code, §2). When the primary provider is in a quota cooldown or an outage, `unusable()` (`service.ts:1396-1412`) passes it over. If the agent has a fallback, every run starts on the fallback. A probe of the primary happens only for a run that has **no** usable profile (`service.ts:1496-1521`). So once every agent has a fallback, nothing ever ends the primary's cooldown:
 
 - the quota state lasts until it ages out after 48 hours;
-- a transient outage never ages out, because `outage()` (`service.ts:3235-3236`) reads the newest event with no time bound.
+- a transient outage never ages out, because `outage()` (`service.ts:3250-3251`) reads the newest event with no time bound.
 
 Until then, the whole fleet keeps running on the fallback, which is usually the dearer one.
 
 ## 2. What exists today
 
-Found with `git grep` over `failover`, `quota`, `transient`, `outage`, `dead_on_start`, `cooldown`, `probe`, `profileIndex`, `origin`, `errorType`, `MONTHLY` and `monthly` in `src/server/agents/`, `src/server/ai/`, `src/shared/agents-types.ts`, `src/client/components/` and `docs/configuration.md` on main `2d40545`.
+Found with `git grep` over `failover`, `quota`, `transient`, `outage`, `dead_on_start`, `cooldown`, `probe`, `profileIndex`, `origin`, `errorType`, `MONTHLY` and `monthly` in `src/server/agents/`, `src/server/ai/`, `src/shared/agents-types.ts`, `src/client/components/` and `docs/configuration.md` on main `99ba920`.
 
 | What | Where | What it does | What is missing |
 |---|---|---|---|
 | Failover line matching | `src/server/agents/failover.ts:77-92` `matchFailover`; `config.ts:30-45` the default patterns | Matches the last 20 log lines, newest first, each cut to 500 characters: quota patterns (G1) first, then `rate_limit_patterns`, then `provider_error_patterns` | Wording only. No structured field is read. A JSON line longer than 500 characters is cut before any field |
-| G1 quota cooldown | `failover.ts:94-124` `matchQuota` (vm, 50 ms), `:126-171` `quotaResetAt`; `service.ts:254-270` `QuotaCooldown`, `:2859-2876` `quotaCooldown`, `:2884-2930` `quotaHit`, `:2998-3017` `noteQuotaBack`; `config.ts:336-344` `failover.quota` | A quota line cools its provider for every agent until its reset time, or `backoff_minutes` doubling up to `max_backoff_minutes`. Then one start probes it. A start that lives past `dead_on_start_seconds` clears it. One decision per provider and cooldown | No period: daily and monthly are the same. A reset is capped at 24 h, and the state is forgotten after 48 h. A reset comes only from a regex group, as ISO, a clock time or "in N minutes", never epoch seconds. No probe happens while every run has a fallback |
-| Rate-limit cooldown | `service.ts:1361-1371` `coolingUntil`; `config.ts:327` `cooldown_minutes` (30) | Cools for the agent that hit it, and for every agent once two agents hit it within the cooldown | Fixed length. Kept for short bursts |
-| Transient outage | `service.ts:218` `TRANSIENT_FLEET_WINDOW_SECONDS` (900), `:226-244` `Outage`, `:3235-3253` `outage`, `:3256` `downFor`, `:3266-3278` `probeInFlight`, `:3295` `noteReachable`, `:3361` `transientRetry`; `failover.ts:219-225` `matchTransient`; `config.ts:55-64`, `:349-356` | A dead run whose last 3 lines match `transient_patterns` costs no recovery attempt. Its provider is down for that agent, and for every agent once two agents' runs die within 15 min. One start probes it with backoff. One decision per provider | Needs a matching line. A burst of silent `dead_on_start` deaths is not an outage. The newest event has no age bound |
-| Dead on start | `service.ts:2152-2163` (in `onExit`), `:2289-2335` `recover`; `config.ts:271` `dead_on_start_seconds` (60) | A run that dies within 60 s, or with an empty log, is recovered: a same-session resume, then a fresh session, then escalation | Recovered per run. Nothing looks across agents |
-| Profile choice at launch | `service.ts:1424-1542` `launch`; `failover.ts:238-254` `chooseProfile` | Starts from the run's `profileIndex`, wraps once, and takes the first usable profile. It records a `failover` event of kind `unavailable` when it moves | No role priority, and no cap on how many runs may move to a fallback. A provider that is cooling down or in an outage is never chosen as a probe while a fallback is usable |
-| Profile index across a chain | `service.ts:3843` (a new run starts at `profileIndex: 0`), `:1948` (`followUp` keeps `prev.profileIndex`), `:1535-1539` (another CLI cannot resume: new session) | A new chain tries the primary first. A restart in the same chain stays on the fallback | No switch-back inside a chain |
-| Failover on a quota | `service.ts:2761-2855` `failover` | Moves the task on. A quota failover counts no failover, and with no profile left it waits for the probe | Kept as it is |
+| G1 quota cooldown | `failover.ts:94-124` `matchQuota` (vm, 50 ms), `:126-171` `quotaResetAt`; `service.ts:255-271` `QuotaCooldown`, `:2874-2891` `quotaCooldown`, `:2899-2945` `quotaHit`, `:3013-3032` `noteQuotaBack`; `config.ts:336-344` `failover.quota` | A quota line cools its provider for every agent until its reset time, or `backoff_minutes` doubling up to `max_backoff_minutes`. Then one start probes it. A start that lives past `dead_on_start_seconds` clears it. One decision per provider and cooldown | No period: daily and monthly are the same. A reset is capped at 24 h, and the state is forgotten after 48 h. A reset comes only from a regex group, as ISO, a clock time or "in N minutes", never epoch seconds. No probe happens while every run has a fallback |
+| Rate-limit cooldown | `service.ts:1376-1386` `coolingUntil`; `config.ts:327` `cooldown_minutes` (30) | Cools for the agent that hit it, and for every agent once two agents hit it within the cooldown | Fixed length. Kept for short bursts |
+| Transient outage | `service.ts:219` `TRANSIENT_FLEET_WINDOW_SECONDS` (900), `:227-245` `Outage`, `:3250-3268` `outage`, `:3271` `downFor`, `:3281-3293` `probeInFlight`, `:3310` `noteReachable`, `:3376` `transientRetry`; `failover.ts:219-225` `matchTransient`; `config.ts:55-64`, `:349-356` | A dead run whose last 3 lines match `transient_patterns` costs no recovery attempt. Its provider is down for that agent, and for every agent once two agents' runs die within 15 min. One start probes it with backoff. One decision per provider | Needs a matching line. A burst of silent `dead_on_start` deaths is not an outage. The newest event has no age bound |
+| Dead on start | `service.ts:2167-2178` (in `onExit`), `:2304-2350` `recover`; `config.ts:271` `dead_on_start_seconds` (60) | A run that dies within 60 s, or with an empty log, is recovered: a same-session resume, then a fresh session, then escalation | Recovered per run. Nothing looks across agents |
+| Profile choice at launch | `service.ts:1439-1557` `launch`; `failover.ts:238-254` `chooseProfile` | Starts from the run's `profileIndex`, wraps once, and takes the first usable profile. It records a `failover` event of kind `unavailable` when it moves | No role priority, and no cap on how many runs may move to a fallback. A provider that is cooling down or in an outage is never chosen as a probe while a fallback is usable |
+| Profile index across a chain | `service.ts:3879` (a new run starts at `profileIndex: 0`), `:1963` (`followUp` keeps `prev.profileIndex`), `:1550-1554` (another CLI cannot resume: new session) | A new chain tries the primary first. A restart in the same chain stays on the fallback | No switch-back inside a chain |
+| Failover on a quota | `service.ts:2776-2870` `failover` | Moves the task on. A quota failover counts no failover, and with no profile left it waits for the probe | Kept as it is |
 | Roles | `src/server/ai/profiles.ts:21` `ROLE_PATHS`, `:140` `agentRole`, `:196-201` `roleFallbacks`; `src/shared/agents-types.ts:57` `RunOrigin`; `src/server/agents/spend.ts` `originOf` | A run's role is known from its origin: `fill`, `review`, `planner`, `verifier`, `supervisor` or `owner`, else its task prefix. Fallbacks follow the role's order | Nothing ranks roles against each other |
 | Fleet budget provider pause | `src/server/fleet/budget.ts:186` `isProviderAvailable` | A provider the fleet budget paused is passed over | Cost caps only. No slot limit |
 | Status and UI | `src/shared/agents-types.ts` `AgentsStatusView.unreachable`; `src/client/components/Work.tsx:181-183` (the unreachable card), `Home.tsx:277` | Shows providers that are unreachable after transient errors | A quota cooldown, its period and its reset are shown only in a run's detail text and the decision |
-| Decisions | `service.ts:3021-3050` (the quota decision, key `quota:<provider>:<since>`), `:3191` `raiseExhausted` | One quota decision per provider and cooldown: "Keep waiting" or "Try now" | No period or reset date in the text when the line gave none |
+| Decisions | `service.ts:3036-3065` (the quota decision, key `quota:<provider>:<since>`), `:3206` `raiseExhausted` | One quota decision per provider and cooldown: "Keep waiting" or "Try now" | No period or reset date in the text when the line gave none |
 | Docs | `docs/configuration.md:1691` (the `Failover.` bullet), `:364` (role failover) | Describe the above | Nothing on structured errors, periods, bursts, priority or switch-back |
 
 **Searched and not found** on main (these are the NEW items): `errorType` and `MONTHLY` in `src/server/agents/` (the only hit is the transient default pattern string `config.ts:56`); any period field on the quota state; any count of `dead_on_start` across agents; any role rank or fallback slot limit (`max_active` exists only for fill and heavy work, `config.ts:188`); any probe of a passed-over provider while a fallback is usable.
@@ -100,7 +100,7 @@ The first rule that matches a line wins. Lines are read newest first, as `matchF
 | `retryErrorType` | `TRANSIENT` | `transient` | (none) |
 | `errorType` | `ClientNetworkError` | `transient` | (none) |
 
-**Where it runs.** It runs in `onExit` (`service.ts:2142-2150`), before the transient and failover checks, and in `failoverWhileAlive` (`:2008-2017`). A structured class beats a pattern match on the same line. For a newer line, the newer line wins.
+**Where it runs.** It runs in `onExit` (`service.ts:2157-2165`), before the transient and failover checks, and in `failoverWhileAlive` (`:2023-2032`). A structured class beats a pattern match on the same line. For a newer line, the newer line wins.
 
 - A `transient` class takes the transient path (`transientRetry`), within `transient_max_retries`, exactly as a `transient_patterns` match does today.
 - `quota`, `rate_limit` and `provider_error` build the same `FailoverInfo` a pattern would build. `quota` goes through G1's own mode: in G1 `act` it is a quota failover, otherwise it is a `rate_limit`, as G1 observe does today. The `FailoverInfo` gains `source: "structured" | "pattern"`, `period` and `resetAt`.
@@ -115,7 +115,7 @@ The first rule that matches a line wins. Lines are read newest first, as `matchF
 
 ### 4.2 Quota periods and the reset (extends G1)
 
-The `QuotaCooldown` state (`service.ts:254`) and its `quota` event data gain three fields:
+The `QuotaCooldown` state (`service.ts:255`) and its `quota` event data gain three fields:
 
 - `period`: `window` | `daily` | `weekly` | `monthly` | `unknown`;
 - `resetAt`: epoch ms, or null;
@@ -141,13 +141,13 @@ Each period has its own cap, replacing the flat 24 h: `window` 24 h, `daily` 26 
 - **Reset known** (`resetAt` set): the first probe is at `resetAt + quota.reset_grace_minutes` (5). Until then, if the reset is more than `max_backoff_minutes` away, one probe runs every `quota.long_probe_hours` (24; 0 means none before the reset). This catches an owner who raised the cap. A probe that hits the quota **after** the reset means the period or the zone was misread. From then on, the cooldown uses today's doubling backoff from `backoff_minutes`, up to `max_backoff_minutes`, with `resetFrom: none`.
 - **Reset unknown:** today's doubling backoff. For `monthly` it is capped at `quota.monthly_max_backoff_minutes` (1440, one probe a day) instead of `max_backoff_minutes` (240).
 
-**Showing it** (#185's UI part). `AgentsStatusView` gains `quotas?: ProviderQuotaView[]`, with the provider, period, since, hits, resetAt, resetFrom and nextProbeAt. Work shows it next to the unreachable card (`Work.tsx:181`), for example: "provider P: monthly cap since 2 Nov 15:00Z; resets 1 Dec 00:00 UTC (from the period); next probe 3 Nov 15:00Z". The quota decision text (`service.ts:3021-3050`) names the period and the reset date. Its options stay "Keep waiting" and "Try now".
+**Showing it** (#185's UI part). `AgentsStatusView` gains `quotas?: ProviderQuotaView[]`, with the provider, period, since, hits, resetAt, resetFrom and nextProbeAt. Work shows it next to the unreachable card (`Work.tsx:181`), for example: "provider P: monthly cap since 2 Nov 15:00Z; resets 1 Dec 00:00 UTC (from the period); next probe 3 Nov 15:00Z". The quota decision text (`service.ts:3036-3065`) names the period and the reset date. Its options stay "Keep waiting" and "Try now".
 
 G1's mode governs all of §4.2. In observe, `would_cool` carries the period, the reset and its source.
 
 ### 4.3 A burst of dead-on-start runs is an outage (`failover.burst`)
 
-**The rule.** It is checked in `recover` (`service.ts:2289`), when a run ends `dead_on_start` and no structured class, quota, failover or transient pattern matched it. A burst on provider P is:
+**The rule.** It is checked in `recover` (`service.ts:2304`), when a run ends `dead_on_start` and no structured class, quota, failover or transient pattern matched it. A burst on provider P is:
 
 - runs of at least `burst.min_agents` (3) distinct agents, each ending `dead_on_start` on P,
 - within `burst.window_minutes` (10) of each other,
@@ -169,7 +169,7 @@ While that outage is open, a further `dead_on_start` on P is a transient retry (
 
 **In observe**, recovery runs as today, plus one `provider_would` (`guard: "burst"`, `verdict: "would_hold"`, the provider, the run ids) per provider and burst. The streak ends when a start on P works.
 
-`outage()` (`service.ts:3235`) also gains an age bound: an outage whose newest event is older than `transient_max_minutes` × 4 (default 8 h) with no failure since is over. This is a pure read, and the next failure opens a new one.
+`outage()` (`service.ts:3250`) also gains an age bound: an outage whose newest event is older than `transient_max_minutes` × 4 (default 8 h) with no failure since is over. This is a pure read, and the next failure opens a new one.
 
 ### 4.4 Fallback order per role (`failover.fallback`)
 
@@ -191,13 +191,13 @@ The list must name each of the four roles once.
 
 A provider with no entry is unlimited, as today.
 
-**At launch** (`service.ts:1469`), `chooseProfile`'s `unusable` callback also refuses a fallback profile on P when:
+**At launch** (`service.ts:1484`), `chooseProfile`'s `unusable` callback also refuses a fallback profile on P when:
 
 - P's fallback slots are full;
 - the run's role is not in `roles`;
 - a queued run of a higher-priority role in this project wants a fallback slot on P in this tick.
 
-The tick sorts queued runs by role rank, then by queued time, before `advance` (`service.ts:1335`). That makes the third check a pure read of the tick's order. A refused run is handled like a run with no usable profile:
+The tick sorts queued runs by role rank, then by queued time, before `advance` (`service.ts:1350`). That makes the third check a pure read of the tick's order. A refused run is handled like a run with no usable profile:
 
 - it waits for its primary's probe (§4.5) or its cooldown;
 - its detail names the reason: "fallback P full (2/2); build runs first";
@@ -218,11 +218,11 @@ Running runs are never stopped to free a slot.
   - a probe that hits the quota again doubles the wait (G1), and the run moves to its fallback **without** counting a failover (as G1's quota failover does today);
   - a probe that dies of a transient error is a transient retry.
 
-**Move chains back.** Once P is usable again, a chain that runs on a fallback returns to its first usable profile at its next **follow-up that starts a new or fresh session** (`followUp`, `service.ts:1935-1955`: `profileIndex` becomes 0, and `chooseProfile` checks from there). Three limits apply:
+**Move chains back.** Once P is usable again, a chain that runs on a fallback returns to its first usable profile at its next **follow-up that starts a new or fresh session** (`followUp`, `service.ts:1950-1970`: `profileIndex` becomes 0, and `chooseProfile` checks from there). Three limits apply:
 
 - a running run is never stopped to switch back;
-- a planned same-session resume stays on the fallback, because another CLI can't resume the session (`service.ts:1535`);
-- new chains already start at index 0 (`service.ts:3843`).
+- a planned same-session resume stays on the fallback, because another CLI can't resume the session (`service.ts:1550`);
+- new chains already start at index 0 (`service.ts:3879`).
 
 Each switch records a `failover` event of kind `switch_back` (from, to). It counts no failover.
 
