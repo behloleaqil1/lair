@@ -400,6 +400,15 @@ describe("G6 handled_messages: an owner request a task carried out is handled", 
       }
     }
     expect(h.service.overview().handledMessages.map((m) => m.by)).toEqual(["owner"]);
+
+    // A message id is any text: one named like an object's own property is an entry like any other
+    appendFileSync(p.inboxFile, "- OWNER 2026-03-02T12:30:00Z [constructor]: An odd id\n");
+    await h.service.cycle();
+    expect((await post(h, "/api/planner/messages/constructor/reopen?project=demo")).json().data).toEqual({ id: "constructor", handled: null });
+    expect((await post(h, "/api/planner/messages/constructor/handled?project=demo")).json().data).toMatchObject({ handled: { id: "constructor", by: "owner" } });
+    expect(h.service.overview().handledMessages.map((m) => m.id)).toEqual(["constructor", "m1"]);
+    expect((await post(h, "/api/planner/messages/constructor/reopen?project=demo")).json().data).toEqual({ id: "constructor", handled: null });
+    expect(h.service.overview().handledMessages.map((m) => m.id)).toEqual(["m1"]);
   });
 
   it("AT-28 observe: the message is recorded as would-be handled and stays in the context; one guard_would and one notice", async () => {

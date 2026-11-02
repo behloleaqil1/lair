@@ -193,6 +193,14 @@ const handledView = (id: string, record: HandledRecord): HandledMessageView => (
   by: record.by,
 });
 
+/**
+ * The record with `key` set to `value` as its newest entry. Own keys only (Object.fromEntries), so a key such as
+ * "__proto__" or "constructor" (an owner message may be called anything) is an entry like any other.
+ */
+function withEntry<T>(record: Record<string, T>, key: string, value: T): Record<string, T> {
+  return Object.fromEntries([...Object.entries(record).filter(([k]) => k !== key), [key, value]]);
+}
+
 /** Keep the newest `max` entries of a record (insertion order: the newest last). */
 function newest<T>(record: Record<string, T>, max: number): Record<string, T> {
   const entries = Object.entries(record);
@@ -1189,15 +1197,14 @@ export class PlannerService {
     const reviewRepo = ((this.config.review as { repo?: unknown } | undefined)?.repo ?? this.config.github) as unknown;
     const own = listed && typeof reviewRepo === "string" ? reviewRepo.toLowerCase() : null;
     const known = new Set<string>([...doc.tasks.map((t) => t.task), ...doc.done.keys(), ...this.planTasks.flatMap((t) => (t.id === null ? [] : [t.id]))]);
-    const prs = this.state<Record<string, number>>(TASK_PRS) ?? {};
+    let prs = this.state<Record<string, number>>(TASK_PRS) ?? {};
     let changed = false;
     for (const event of named) {
       for (const task of this.doneLineTasks(event, known)) {
         const text = findTask(doc, task)?.description ?? this.planTasks.find((t) => t.id === task)?.text ?? "";
         const parsed = parseReadyReport(event.text, text, listed && repos.ok ? repos.repos : NO_SOURCE_REPOS, !(listed && repos.ok && repos.from === "repos"));
         if (parsed.kind !== "pr" || (own !== null && parsed.report.repo.toLowerCase() !== own)) continue;
-        delete prs[task];
-        prs[task] = parsed.report.pr;
+        prs = withEntry(prs, task, parsed.report.pr);
         changed = true;
       }
     }
@@ -1373,9 +1380,8 @@ export class PlannerService {
     ];
     if (this.settings.guards.handledMessages === "act") {
       const handled = this.state<Record<string, HandledRecord>>(HANDLED) ?? {};
-      if (handled[link.message]) return;
-      handled[link.message] = { task: link.task, at: now, by: "lair", proposal: proposalId };
-      this.setState(HANDLED, newest(handled, MAX_HANDLED));
+      if (Object.hasOwn(handled, link.message)) return;
+      this.setState(HANDLED, newest(withEntry(handled, link.message, { task: link.task, at: now, by: "lair", proposal: proposalId }), MAX_HANDLED));
       this.dropMessageTriggers(link.message);
       await this.guardEvent("guard_did", {
         guard: "planner_handled_messages",
@@ -2404,12 +2410,10 @@ export class PlannerService {
     if (this.lastCycle === null) await this.cycle();
     return this.exclusive(async () => {
       const handled = this.state<Record<string, HandledRecord>>(HANDLED) ?? {};
-      const known = handled[id];
-      if (known) return { id, handled: handledView(id, known) };
+      if (Object.hasOwn(handled, id)) return { id, handled: handledView(id, handled[id]) };
       if (!this.messages.some((m) => m.id === id)) throw new PlannerError(404, `No owner message ${clean(id, 64)}`);
       const record: HandledRecord = { task: null, at: this.clock.now(), by: "owner", proposal: null };
-      handled[id] = record;
-      this.setState(HANDLED, newest(handled, MAX_HANDLED));
+      this.setState(HANDLED, newest(withEntry(handled, id, record), MAX_HANDLED));
       this.dropMessageTriggers(id);
       return { id, handled: handledView(id, record) };
     });
@@ -2426,12 +2430,11 @@ export class PlannerService {
     return this.exclusive(async () => {
       const handled = this.state<Record<string, HandledRecord>>(HANDLED) ?? {};
       const read = this.messages.find((m) => m.id === id);
-      if (!handled[id]) {
+      if (!Object.hasOwn(handled, id)) {
         if (!read) throw new PlannerError(404, `No owner message ${clean(id, 64)}`);
         return { id, handled: null };
       }
-      delete handled[id];
-      this.setState(HANDLED, handled);
+      this.setState(HANDLED, Object.fromEntries(Object.entries(handled).filter(([key]) => key !== id)));
       if (read) this.addTrigger("owner_message", this.clock.now(), { task: null, detail: `owner message [${read.id}] (reopened by the owner): ${read.text}` });
       return { id, handled: null };
     });
