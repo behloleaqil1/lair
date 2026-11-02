@@ -40,6 +40,7 @@ import type {
   AgentEventKind,
   AgentEventView,
   AgentProfile,
+  AgentRunState,
   AgentRunView,
   AgentState,
   AgentsStatusView,
@@ -407,8 +408,13 @@ export interface AgentsServiceOptions {
    * project's bus is off (bus.consume), and the run gets none
    */
   mintBusToken?: (runId: string, agent: string) => string | null;
-  /** Revoke a run's bus token when the run ends */
+  /** Revoke a run's bus token: every way a run ends calls it (runEnded), whatever the project's bus.consume is now */
   revokeBusToken?: (runId: string) => void;
+  /**
+   * At start(): revoke the bus tokens of every run that isn't active (they ended while no server was there to revoke
+   * them). `activeRunIds` is read right before the revocation, so a run started meanwhile keeps its token.
+   */
+  sweepBusTokens?: (activeRunIds: () => string[]) => Promise<void>;
   /** What the ready guard reads a PR from (read on each use); undefined: the project has no git host to ask */
   readyFacts?: () => ReadyFactsSource | undefined;
   /** The project's bus as fill reads it (bus.consume observe or on; read at each check), or null */
@@ -430,6 +436,9 @@ interface EventInput {
 
 type LockAttempt = { ok: true; held: AgentLockSettings[] } | { ok: false; wait: StoredLockWait };
 
+/** The states a run ends in (runEnded): never active again */
+type EndedRunState = Exclude<AgentRunState, "queued" | "waiting_lock" | "running" | "stopping">;
+
 export class AgentsService {
   readonly project: string;
   readonly settings: AgentsSettings;
@@ -442,6 +451,7 @@ export class AgentsService {
   private tools?: ToolReadiness;
   private mintBusToken?: (runId: string, agent: string) => string | null;
   private revokeBusToken?: (runId: string) => void;
+  private sweepBusTokens?: (activeRunIds: () => string[]) => Promise<void>;
   private bus?: () => BusLineSource | null;
   private busServerUrl?: string;
   private watchdogSettings: WatchdogSettings;
@@ -477,6 +487,7 @@ export class AgentsService {
     this.tools = options.tools;
     this.mintBusToken = options.mintBusToken;
     this.revokeBusToken = options.revokeBusToken;
+    this.sweepBusTokens = options.sweepBusTokens;
     this.bus = options.bus;
     this.busServerUrl = options.busServerUrl;
     this.watchdogSettings = watchdogSettingsFor(options.config, options.settings.hungMinutes);
@@ -1029,9 +1040,7 @@ export class AgentsService {
       if (optionId !== DECISION_STOP) return "the run keeps waiting for the cooldown";
       const waiting = chain.find((r) => r.state === "queued" || r.state === "waiting_lock");
       if (!waiting) return "nothing was waiting any more";
-      waiting.state = "failed";
-      waiting.endedAt = t.now;
-      waiting.waitingLock = undefined;
+      this.runEnded(waiting, "failed", t.now);
       waiting.detail = "stopped by the owner while every profile was failing";
       this.store.saveRun(waiting);
       this.store.releaseClaim(this.project, waiting.task, waiting.id);
@@ -1186,8 +1195,7 @@ export class AgentsService {
     // A usable profile: the run's own, else the next one (failover at start)
     const profiles = this.profiles(run.agent, run.requestModel);
     if (profiles.length === 0) {
-      run.state = "failed";
-      run.endedAt = t.now;
+      this.runEnded(run, "failed", t.now);
       run.detail = `agent ${run.agent} has no adapter to start it with (not in dragons: or dragons.txt, or an unknown adapter)`;
       this.store.saveRun(run);
       t.summary.ended++;
@@ -1623,9 +1631,7 @@ export class AgentsService {
   private async startTimedOut(run: AgentRun, t: Tick, reason: string): Promise<boolean> {
     const since = run.launchingSince ?? t.now;
     if (t.now - since < this.settings.startTimeoutMinutes * 60000) return false;
-    run.state = "never_started";
-    run.endedAt = t.now;
-    run.waitingLock = undefined;
+    this.runEnded(run, "never_started", t.now);
     run.detail = `never started: no live agent process ${Math.round((t.now - since) / 60000)} min after starting began: ${reason}`;
     t.summary.neverStarted++;
     t.summary.ended++;
@@ -1960,22 +1966,35 @@ export class AgentsService {
     return this.endRun(run, "failed", detail, t, true);
   }
 
+  /**
+   * Every way a run ends comes through here (endRun, recover, failover, a transient retry, never started, no adapter,
+   * the owner's stop, a released claim): its end state and time, no lock wait, and its bus token revoked, whatever
+   * the project's bus.consume is now (a reload may have switched it off since the token was minted). The caller
+   * sets the detail and saves the run.
+   */
+  private runEnded(run: AgentRun, state: EndedRunState, now: number): void {
+    run.state = state;
+    run.endedAt = now;
+    run.waitingLock = undefined;
+    try {
+      this.revokeBusToken?.(run.id);
+    } catch (e) {
+      console.warn(`[agents] ${this.project}: revoking run ${short(run.id)}'s bus token failed: ${message(e)}`);
+    }
+  }
+
   private async endRun(
     run: AgentRun,
-    state: "completed" | "lost_claim" | "superseded" | "failed",
+    state: Exclude<EndedRunState, "never_started">,
     detail: string,
     t: Tick,
     releaseClaim: boolean,
     event: { evidence?: string[]; data?: Record<string, unknown> } = {},
   ): Promise<void> {
-    run.state = state;
+    this.runEnded(run, state, t.now);
     run.detail = detail;
-    run.endedAt = t.now;
-    run.waitingLock = undefined;
     this.releaseRunLocks(run);
     if (releaseClaim) this.store.releaseClaim(this.project, run.task, run.id);
-    // Revoke the run's bus token so it can't be used after the run ends
-    this.revokeBusToken?.(run.id);
     this.store.saveRun(run);
     t.summary.ended++;
     if (state === "completed") {
@@ -2004,8 +2023,7 @@ export class AgentsService {
     evidence: string[],
     t: Tick,
   ): Promise<void> {
-    run.state = "failed";
-    run.endedAt = t.now;
+    this.runEnded(run, "failed", t.now);
     run.detail = `${kind.replace(/_/g, " ")}: ${detail}`;
     this.releaseRunLocks(run);
     // The server keeps the task between attempts
@@ -2200,8 +2218,7 @@ export class AgentsService {
    * recovery counters carry over: failing over never buys more restarts.
    */
   private async failover(run: AgentRun, info: FailoverInfo, t: Tick): Promise<void> {
-    run.state = "failed";
-    run.endedAt = t.now;
+    this.runEnded(run, "failed", t.now);
     run.failover = info;
     run.detail = `${failoverLabel(info.kind)} on ${profileLabel(run.profile)}: ${oneLine(info.line)}`;
     this.releaseRunLocks(run);
@@ -2556,8 +2573,7 @@ export class AgentsService {
   private async transientRetry(run: AgentRun, line: string, exit: string, used: number, t: Tick): Promise<void> {
     const provider = run.profile.provider;
     const lived = run.spawnedAt === undefined ? 0 : t.now - run.spawnedAt;
-    run.state = "failed";
-    run.endedAt = t.now;
+    this.runEnded(run, "failed", t.now);
     run.detail = `transient: provider ${provider} unreachable (${exit}): ${oneLine(line)}`;
     this.releaseRunLocks(run);
     // The server keeps the task between attempts
@@ -3045,10 +3061,8 @@ export class AgentsService {
       );
       const run = this.store.getRun(claim.runId);
       if (run && (run.state === "queued" || run.state === "waiting_lock")) {
-        run.state = "lost_claim";
+        this.runEnded(run, "lost_claim", now);
         run.detail = "its claim was released on request before it started";
-        run.endedAt = now;
-        run.waitingLock = undefined;
         this.store.saveRun(run);
       }
       return { task, runId: claim.runId, runState: run?.state ?? null };
@@ -3376,6 +3390,10 @@ export class AgentsService {
     this.stopped = false;
     this.reconcilePending = true;
     this.reconciled.clear();
+    // The bus tokens of runs that ended while no server was there to revoke them: revoked now (in the background)
+    this.sweepBusTokens?.(() => this.store.activeRuns(this.project).map((run) => run.id)).catch((e: unknown) => {
+      console.warn(`[agents] ${this.project}: sweeping the bus tokens of ended runs failed: ${message(e)}`);
+    });
     this.fill?.start();
     const loop = async () => {
       if (this.stopped) return;
@@ -3641,8 +3659,10 @@ export interface AgentsBus {
   lineSource(project: string): BusLineSource | null;
   /** A bus token for a run (its hash is stored) while the project's bus.consume isn't off, else null */
   mintToken(project: string, runId: string, agent: string): string | null;
-  /** Revoke a run's bus tokens (it ended) */
+  /** Revoke a run's bus tokens (it ended): unconditional, whatever the project's bus.consume is now */
   revokeTokens(project: string, runId: string): void;
+  /** Revoke the bus tokens of every run of the project not in `activeRunIds()` (at start: runs that ended while no server ran) */
+  sweepTokens(project: string, activeRunIds: () => string[]): Promise<void>;
   /** This server's URL, given to a run with a bus token as LAIR_URL (where `lair bus` and `lair bus-mcp` post) */
   serverUrl?: string;
 }
@@ -3770,13 +3790,14 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
   }
 
   /** A project's bus hooks for its service (none without the bus): each reads the project's bus.consume when used. */
-  private busOptions(project: string): Pick<AgentsServiceOptions, "bus" | "mintBusToken" | "revokeBusToken" | "busServerUrl"> {
+  private busOptions(project: string): Pick<AgentsServiceOptions, "bus" | "mintBusToken" | "revokeBusToken" | "sweepBusTokens" | "busServerUrl"> {
     const bus = this.options.bus;
     if (!bus) return {};
     return {
       bus: () => bus.lineSource(project),
       mintBusToken: (runId, agent) => bus.mintToken(project, runId, agent),
       revokeBusToken: (runId) => bus.revokeTokens(project, runId),
+      sweepBusTokens: (activeRunIds) => bus.sweepTokens(project, activeRunIds),
       busServerUrl: bus.serverUrl,
     };
   }

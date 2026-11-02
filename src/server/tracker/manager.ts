@@ -188,6 +188,8 @@ export class TrackerManager {
         pending: [],
         recentWrites: [],
         queue: { waiting: 0, dropped: 0 },
+        closedUnmerged: [],
+        removedTasks: [],
         warnings: [],
       };
     }
