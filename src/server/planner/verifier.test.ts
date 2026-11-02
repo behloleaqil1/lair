@@ -26,6 +26,7 @@ import {
   type SpawnCall,
 } from "./testing/harness.js";
 import { parseTasksFile } from "../agents/fill.js";
+import type { PrSource } from "./pr-ownership.js";
 
 afterEach(cleanup);
 
@@ -975,5 +976,197 @@ describe("the run's decision tells the owner which options cannot be undone", ()
     expect(await effectsOf([DROP, ADD], ["approve", "reject"])).toMatchObject({ approve_all: "irreversible", follow_verifier: "irreversible" });
     // Declining never changes anything
     expect(await effectsOf([REWORD, ADD], ["approve", "reject"])).toMatchObject({ reject_all: "reversible" });
+  });
+});
+
+// ============ PR OWNERSHIP OF FINISH PROPOSALS (#290) ============
+
+/** The one stand-in: the PR host, answering from a table (a missing number fails as the host would). */
+function prsFrom(
+  pulls: Record<number, { headRef: string; title: string; body?: string | null; state?: "open" | "closed" | "merged" } | Error>,
+  mapping: PrSource["mapping"] = null,
+): PrSource & { reads: number[] } {
+  const reads: number[] = [];
+  return {
+    reads,
+    mapping,
+    missing: null,
+    reader: {
+      getPullRequest: async (n: number) => {
+        reads.push(n);
+        const pr = pulls[n];
+        if (pr instanceof Error) throw pr;
+        if (!pr) throw new Error(`GitHub GET /repos/example/demo/pulls/${n}: 404`);
+        return { number: n, body: null, state: "merged" as const, ...pr };
+      },
+    },
+  };
+}
+
+/** review.authors.branch_pattern agent/{agent}/** as review/config compiles it */
+const AGENT_BRANCHES: PrSource["mapping"] = { branchPattern: /^agent\/(?<agent>[^/]+)\//, branches: [], fromTasksFile: false };
+
+/** finish auto-applies on an approve (approval never, auto_apply finish): the case where a wrong PR would mark the task done */
+const AUTO_FINISH = { approval: { finish: "never" }, verifier: { id: "verifier", prompt_file: "verifier.md", auto_apply: ["finish"] } };
+
+async function ownershipSetup(p: Paths, prs: PrSource): Promise<Harness> {
+  const h = await setup(p, plannerWithVerifier(p, AUTO_FINISH), {
+    prOwnership: prs,
+    extra: {
+      dragons: {
+        "worker-a": { id: "worker-a", name: "Alice", model: "model-a", machine: "local", instructions: "", adapter: "test-cli" },
+        "worker-b": { id: "worker-b", name: "Bob", model: "model-a", machine: "local", instructions: "", adapter: "test-cli" },
+        planner: { id: "planner", name: "Planner", model: "model-a", machine: "local", instructions: "", adapter: "test-cli" },
+        verifier: { id: "verifier", name: "Verifier", model: "model-a", machine: "local", instructions: "", adapter: "test-cli" },
+      },
+    } as never,
+  });
+  writeFileSync(join(p.promptsDir, "verifier.md"), "You are the verifier.\n");
+  await h.service.cycle();
+  await startPlannerRun(h, 31 * SEC);
+  return h;
+}
+
+const promptOf = (call: SpawnCall) => readFileSync(call.argv[call.argv.indexOf("--prompt") + 1], "utf-8");
+const dataOf = (prompt: string) => {
+  const blocks = [...prompt.matchAll(/```json\n([\s\S]*?)\n```/g)];
+  return JSON.parse(blocks[blocks.length - 1][1]) as { proposals: { index: number; pr_ownership?: { state: string; note: string } }[] };
+};
+const doneLine = (h: Harness, task: string) => tasksText(h).split("\n").some((l) => l.includes(`|${task}|`) && /^\S*done/i.test(l));
+
+describe("PR ownership of finish proposals (#290)", () => {
+  it("ownership-1. a finish naming another task's merged PR is refused by Lair before the verifier", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    const prs = prsFrom({ 230: { headRef: "agent/worker-b/feat-search", title: "Search page", body: "the search screen" } }, AGENT_BRANCHES);
+    const h = await ownershipSetup(p, prs);
+    const before = tasksText(h);
+    await runPlannerAgent(h, (c) => writeProposals(c, { proposals: [{ op: "finish", task: "feat-login", reason: "merged as #230" }] }));
+    await h.service.cycle();
+
+    expect(prs.reads).toEqual([230]);
+    const [refused] = h.service.proposals({ status: "rejected" });
+    expect(refused?.refusal).toContain("PR #230 does not belong to task feat-login");
+    expect(refused?.refusal).toContain("agent/worker-b/feat-search");
+    expect(h.service.proposals({ status: "pending" })).toHaveLength(0);
+    // Nothing left to verify, nothing applied
+    expect(h.spawner.calls.some((c) => c.env.LAIR_AGENT === "verifier")).toBe(false);
+    await h.agentsService.tick();
+    expect(h.spawner.calls.some((c) => c.env.LAIR_AGENT === "verifier")).toBe(false);
+    expect(tasksText(h)).toBe(before);
+  });
+
+  it("ownership-2. the task's agent's PR by review.authors is owned: the verifier sees it and an approve applies the finish", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    // The branch names neither the task nor does the title: only the agent mapping says it is worker-a's
+    const prs = prsFrom({ 231: { headRef: "agent/worker-a/login-form-v2", title: "Login form v2" } }, AGENT_BRANCHES);
+    const h = await ownershipSetup(p, prs);
+    await runPlannerAgent(h, (c) => writeProposals(c, { proposals: [{ op: "finish", task: "feat-login", reason: "merged as #231" }] }));
+    await h.service.cycle();
+    expect(h.service.proposals({ status: "rejected" })).toHaveLength(0);
+
+    const call = await runVerifierAgent(h, (c) =>
+      writeVerdicts(c, { verdicts: [{ proposal: 0, verdict: "approve", reason: "PR #231 is worker-a's and merged" }] }),
+    );
+    const data = dataOf(promptOf(call));
+    expect(data.proposals[0].pr_ownership?.state).toBe("owned");
+    expect(data.proposals[0].pr_ownership?.note).toContain("branch_agent_match");
+    await h.service.cycle();
+    expect(doneLine(h, "feat-login")).toBe(true);
+    expect(open(h)).toHaveLength(0);
+  });
+
+  it("ownership-3. the same branch without the authors mapping is refused (the mapping is what makes it owned)", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    const prs = prsFrom({ 231: { headRef: "agent/worker-a/login-form-v2", title: "Login form v2" } }, null);
+    const h = await ownershipSetup(p, prs);
+    await runPlannerAgent(h, (c) => writeProposals(c, { proposals: [{ op: "finish", task: "feat-login", reason: "merged as #231" }] }));
+    await h.service.cycle();
+    expect(h.service.proposals({ status: "rejected" })[0]?.refusal).toContain("PR #231 does not belong to task feat-login");
+    expect(doneLine(h, "feat-login")).toBe(false);
+  });
+
+  it("ownership-4. a PR Lair cannot read holds the finish as unsure: the verifier's approve does not apply it", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    const prs = prsFrom({ 230: new Error("GitHub GET /repos/example/demo/pulls/230: 502") });
+    const h = await ownershipSetup(p, prs);
+    await runPlannerAgent(h, (c) => writeProposals(c, { proposals: [{ op: "finish", task: "feat-login", reason: "merged as #230" }] }));
+    await h.service.cycle();
+
+    const call = await runVerifierAgent(h, (c) =>
+      writeVerdicts(c, { verdicts: [{ proposal: 0, verdict: "approve", reason: "looks merged" }] }),
+    );
+    expect(dataOf(promptOf(call)).proposals[0].pr_ownership?.state).toBe("unsure");
+    await h.service.cycle();
+
+    const [held] = h.service.proposals({ status: "pending" });
+    expect(held?.verifierVerdict).toBe("unsure");
+    expect(held?.verifierReason).toContain("PR #230 could not be read");
+    expect(doneLine(h, "feat-login")).toBe(false);
+    expect(open(h)).toHaveLength(1);
+  });
+
+  it("ownership-5. no PR host at all: unsure, never owned", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    const h = await ownershipSetup(p, { reader: null, mapping: null, missing: "the project has no review block" });
+    await runPlannerAgent(h, (c) => writeProposals(c, { proposals: [{ op: "finish", task: "feat-login", reason: "merged as #50" }] }));
+    await h.service.cycle();
+    await runVerifierAgent(h, (c) => writeVerdicts(c, { verdicts: [{ proposal: 0, verdict: "approve", reason: "ok" }] }));
+    await h.service.cycle();
+    const [held] = h.service.proposals({ status: "pending" });
+    expect(held?.verifierVerdict).toBe("unsure");
+    expect(held?.verifierReason).toContain("the project has no review block");
+    expect(doneLine(h, "feat-login")).toBe(false);
+  });
+
+  it("ownership-6. a finish naming no PR is not checked; one naming its own task's PR by title is owned", async () => {
+    const p = makePaths();
+    // worker-b stays idle (the planner run's trigger); feat-search is an unassigned line
+    tasks(p, "worker-a|Alice|feat-login|Login form", "|Bob|feat-search|Search page");
+    const prs = prsFrom({ 232: { headRef: "topic/search", title: "feat-search: the search page" } });
+    const h = await ownershipSetup(p, prs);
+    await runPlannerAgent(h, (c) =>
+      writeProposals(c, {
+        proposals: [
+          { op: "finish", task: "feat-login", reason: "completed per owner message" },
+          { op: "finish", task: "feat-search", reason: "PR #232 merged" },
+        ],
+      }),
+    );
+    await h.service.cycle();
+    expect(prs.reads).toEqual([232]);
+
+    const call = await runVerifierAgent(h, (c) =>
+      writeVerdicts(c, {
+        verdicts: [
+          { proposal: 0, verdict: "approve", reason: "owner confirmed" },
+          { proposal: 1, verdict: "approve", reason: "merged" },
+        ],
+      }),
+    );
+    const data = dataOf(promptOf(call));
+    expect(data.proposals.find((x) => x.index === 0)?.pr_ownership).toBeUndefined();
+    expect(data.proposals.find((x) => x.index === 1)?.pr_ownership?.note).toContain("title_body_match");
+    await h.service.cycle();
+    expect(doneLine(h, "feat-login")).toBe(true);
+    expect(doneLine(h, "feat-search")).toBe(true);
+  });
+
+  it("ownership-7. the verifier prompt tells it to answer unsure when a PR cannot be read", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    const h = await ownershipSetup(p, prsFrom({ 50: { headRef: "agent/worker-a/feat-login", title: "Login" } }));
+    await runPlannerAgent(h, (c) => writeProposals(c, { proposals: [{ op: "finish", task: "feat-login", reason: "merged as #50" }] }));
+    await h.service.cycle();
+    const call = await runVerifierAgent(h, (c) => writeVerdicts(c, { verdicts: [] }));
+    const prompt = promptOf(call);
+    expect(prompt).toContain("PR ownership for finish proposals");
+    expect(prompt).toContain("cannot (no tool, an error, no network), verdict **unsure**");
+    expect(prompt).toContain("maps to the task's agent through review.authors");
+    expect(dataOf(prompt).proposals[0].pr_ownership?.note).toContain("branch_contains_task");
   });
 });

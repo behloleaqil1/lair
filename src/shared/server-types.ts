@@ -315,6 +315,9 @@ export type EventType =
   | "planner.changed"
   | "planner.run_started"
   | "planner.run_finished"
+  // Pending triggers that start no run beyond the debounce and min_interval_seconds, once per stall:
+  // {project, reason (paused | read_only | max_runs_per_day), until (ISO or null), triggers, runsInDay, maxRunsPerDay}
+  | "planner.run_held"
   | "planner.proposals_pending"
   | "planner.blocked"
   | "planner.tasks_file_restored"
