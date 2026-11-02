@@ -38,6 +38,10 @@ npm run build
 npm start
 ```
 
+npm runs no dependency install scripts here (`.npmrc` sets `ignore-scripts=true`): only `better-sqlite3`, `esbuild` and,
+on macOS, `fsevents` run theirs, through `npm run rebuild:native`, which `npm run build` runs for you once after each
+install. [Install scripts](docs/getting-started.md#install-scripts) explains the list and how a new entry is added.
+
 Open `http://localhost:4777`. Lair starts with the bundled `example` project, which reads synthetic files in
 `fixtures/`, so you can click through every section right away. Start Lair from the repository root: it reads
 `projects/` and writes its state to `data/` relative to the current directory. [Getting Started](docs/getting-started.md)

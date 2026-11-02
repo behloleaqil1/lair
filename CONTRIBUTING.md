@@ -21,7 +21,7 @@ Thank you for your interest in contributing to Lair! This document provides guid
 
 1. Fork the repository
 2. Clone your fork: `git clone https://github.com/YOUR-USERNAME/lair.git`
-3. Install dependencies: `npm install`
+3. Install dependencies: `npm run setup` (`npm ci`, then the install scripts of the few allowed packages; see [Install scripts](docs/getting-started.md#install-scripts))
 4. Create a branch: `git checkout -b feature/your-feature-name`
 
 ## Development
