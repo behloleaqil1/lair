@@ -28,6 +28,7 @@ import {
 } from "fs";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 import Database from "better-sqlite3";
 import type { AgentAdapter, ProjectConfig } from "../../shared/types.js";
 import type { AgentEventKind, AgentsStatusView, AgentView, FillStatusView, PromptFileView } from "../../shared/agents-types.js";
@@ -62,13 +63,26 @@ import {
   startRunAction,
 } from "../../client/agents-actions";
 import { readLock } from "./locks.js";
+import { ReviewManager } from "../review/service.js";
+import { FakeRemote, fakeGitHubApi } from "../review/testing/fakes.js";
+import type { FetchLike } from "../review/github.js";
+import { RepoSources } from "../repos/index.js";
 import { DataService } from "../services/data.js";
 import { listPromptFiles, MAX_PROMPT_FILE_BYTES, PromptFileError, readPromptFile } from "./prompts.js";
 import type { AgentProbes, ProcessOwner, ProcessSpawner, SpawnOptions, SystemInfo, MemoryReading } from "./probes.js";
 import type { DecisionInbox, DecisionRequest } from "./decisions.js";
 import { AgentsStore, SCHEMA_VERSION } from "./store.js";
 import type { AgentEvent, AgentRun } from "./types.js";
-import { BusConsumers, agentsBusFor, closeBusStores, hashBusToken, structuredReport, type BusConsumeMode } from "../bus/index.js";
+import {
+  BusConsumers,
+  agentsBusFor,
+  closeBusStores,
+  existingBusStore,
+  hashBusToken,
+  openedBusStore,
+  structuredReport,
+  type BusConsumeMode,
+} from "../bus/index.js";
 import { busStoreFor, forgetBusService, registerBusRoutes } from "../routes/bus.js";
 
 // ============ BOUNDARY FAKES ============
@@ -334,6 +348,9 @@ const BASE = {
 
 const FALLBACK = { fallbacks: { "worker-a": [{ adapter: "other-cli", model: "model-b", provider: "provider-b" }] } };
 
+/** The ready guard's repositories in a project without repos:: the review repository alone, `PR #n` forms only */
+const DEMO_SOURCE = { repos: [{ repo: "example/demo", default: true, base: null, ciCounts: true, refs: [] }], legacy: true };
+
 interface Paths {
   dir: string;
   agentsDir: string;
@@ -365,12 +382,70 @@ interface Harness extends Paths {
 const dirs: string[] = [];
 const managers: AgentsManager[] = [];
 const apps: FastifyInstance[] = [];
+const reviewManagers: ReviewManager[] = [];
 
 afterEach(async () => {
   for (const app of apps.splice(0)) await app.close();
   for (const manager of managers.splice(0)) await manager.stop();
+  for (const reviews of reviewManagers.splice(0)) reviews.close();
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
+
+// ---- The ready guard over several repositories (repos:): the server's wiring over a stand-in GitHub API ----
+
+const PR_AUTHOR = { name: "Worker", email: "worker@users.noreply.github.com" };
+
+/** A project whose review repository is example/app and that lists example/lib too (lib's hosted CI does not count) */
+const multiRepo = (p: { dir: string }, repos: unknown[] = [{ repo: "example/app", default: true, refs: ["app"] }, { repo: "example/lib", ci_counts: false, refs: ["lib"] }]) => ({
+  github: "example/app",
+  repos,
+  review: {
+    enabled: true,
+    reviewers: { green: [] },
+    merge: {
+      gate: { source: "checks", required: ["build"] },
+      method: "local",
+      local_strategy: "ff-only",
+      allowed_emails: ["*@users.noreply.github.com"],
+      work_dir: join(p.dir, "work"),
+    },
+  },
+});
+
+/** Open PR `n` on `agent`'s branch (on main) with these check runs: its head sha */
+function openPr(remote: FakeRemote, n: number, checks: [string, string][] = [["build", "success"]], agent = "worker-a"): string {
+  const base = remote.branches.get("main") ?? remote.commit([], PR_AUTHOR, "init");
+  remote.branches.set("main", base);
+  const head = remote.commit([base], PR_AUTHOR, `change ${n}`);
+  remote.openPull({ number: n, headRef: `agent/${agent}/change-${n}`, headSha: head, files: [] });
+  remote.setChecks(head, checks);
+  return head;
+}
+
+/**
+ * src/server/index.ts's wiring of the ready guard: the review module and RepoSources, both over one GitHub API
+ * (the only stand-in: example/app and example/lib, each a FakeRemote). While `libHangs()` lib's API never
+ * answers; a request ends only when its signal aborts, as fetch does. Returns how many requests went to lib.
+ */
+function wireRepos(manager: AgentsManager, config: ProjectConfig, app: FakeRemote, lib: FakeRemote, libHangs = () => false): { libCalls: () => number } {
+  const apiApp = fakeGitHubApi(app);
+  const apiLib = fakeGitHubApi(lib);
+  let libCalls = 0;
+  const fetch: FetchLike = (url, init) => {
+    const path = new URL(url).pathname;
+    if (path !== "/repos/example/lib" && !path.startsWith("/repos/example/lib/")) return apiApp(url, init);
+    libCalls++;
+    if (!libHangs()) return apiLib(url, init);
+    return new Promise((_, reject) => init?.signal?.addEventListener("abort", () => reject(new Error("aborted"))));
+  };
+  const reviews = new ReviewManager({ dbPath: ":memory:", fetch, env: {}, autoRequestMs: 0, agentCheckMs: 0 });
+  reviewManagers.push(reviews);
+  reviews.load([{ name: "demo", config }]);
+  if (!reviews.get("demo")) throw new Error(`reviews are off: ${reviews.info("demo").errors.join("; ")}`);
+  const sources = new RepoSources({ review: (project) => reviews.get(project), fetch, env: {}, timeoutMs: 50 });
+  manager.useReadyFacts((project, projectConfig) => sources.readyFacts(project, projectConfig));
+  return { libCalls: () => libCalls };
+}
 
 function makePaths(): Paths {
   const dir = mkdtempSync(join(tmpdir(), "lair-agents-"));
@@ -436,10 +511,12 @@ function setup(
     dragons?: Record<string, unknown>;
     /** Read the process table as the server does: `ps` through the shared cache (10 s max age) */
     cachedPs?: boolean;
+    /** More top-level config keys (they replace the default ones) */
+    extra?: (p: Paths) => Record<string, unknown>;
   } = {},
 ): Harness {
   const paths = options.paths ?? makePaths();
-  const config = projectConfig(paths, { ...BASE, ...agents(paths) }, options.readOnly, options.dragons);
+  const config = { ...projectConfig(paths, { ...BASE, ...agents(paths) }, options.readOnly, options.dragons), ...options.extra?.(paths) } as ProjectConfig;
   const clock = new FakeClock();
   const procs = new FakeProcessTable(clock);
   const spawner = new FakeSpawner(procs, clock);
@@ -3679,7 +3756,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     async function finished(facts: () => typeof green, guard = true, line = DONE, description = "Login form") {
       const h = setup(fill({ agents: ["worker-a"], ready_guard: guard }));
       prompts(h);
-      h.manager.useReadyFacts(() => ({ facts: async () => facts() }));
+      h.manager.useReadyFacts(() => ({ ...DEMO_SOURCE, facts: async () => facts() }));
       tasks(h, `worker-a|Alice|feat-login|${description}`);
       await check(h);
       await at(h, 0); // pid 5001
@@ -3777,7 +3854,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
       const seen: number[] = [];
       const h = setup(fill({ agents: ["worker-a"], ready_guard: true }));
       prompts(h);
-      h.manager.useReadyFacts(() => ({ facts: async (pr: number) => (seen.push(pr), { ...green, headSha: "def9999abc" }) }));
+      h.manager.useReadyFacts(() => ({ ...DEMO_SOURCE, facts: async (_repo: string, pr: number) => (seen.push(pr), { ...green, headSha: "def9999abc" }) }));
       tasks(h, "worker-a|Alice|feat-login|Login form");
       await check(h);
       await at(h, 0);
@@ -3830,6 +3907,114 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
       const h = await finished(() => ({ ...green, checks: [{ name: "build", state: "failure" as const }] }), false);
       expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "done" });
       expect(eventsOf(h, "fill_report_refused")).toEqual([]);
+    });
+  });
+
+  describe("ready guard over the project's repositories (repos:): each PR is read from its own repository", () => {
+    /** The server's wiring with repos: (example/app is the review repository and the default) */
+    function wired(repos?: unknown[], libHangs?: () => boolean) {
+      const app = new FakeRemote("example/app");
+      const lib = new FakeRemote("example/lib");
+      const h = setup(fill({ ready_guard: true }), { extra: (p) => multiRepo(p, repos) });
+      prompts(h);
+      const { libCalls } = wireRepos(h.manager, h.config, app, lib, libHangs);
+      return { h, app, lib, libCalls };
+    }
+
+    /** worker-a runs feat-login (its description: `description`), writes `line` and exits 0; then fill checks it */
+    async function reported(h: Harness, line: string, description = "Login form") {
+      tasks(h, `worker-a|Alice|feat-login|${description}`);
+      await check(h);
+      await at(h, 0);
+      appendFileSync(h.queueFile, `${line}\n`);
+      h.spawner.exit(5001, 0);
+      await at(h, MIN);
+      return check(h);
+    }
+
+    const refusedReason = (h: Harness) => eventsOf(h, "fill_report_refused")[0]?.data.reason;
+
+    it("AT-5 readyGuard_ci_counts_off: on lib (ci_counts: false) red or missing CI is no item; a conflict still is", async () => {
+      for (const checks of [[["build", "failure"], ["lint", "failure"]], []] as [string, string][][]) {
+        const { h, lib } = wired();
+        const head = openPr(lib, 7, checks);
+        expect(lineOf(await reported(h, `- DONE feat-login by worker-a 12:05Z: lib PR #7 at ${head.slice(0, 7)}`), "feat-login").state).toBe("done");
+        expect(eventsOf(h, "fill_report_refused")).toEqual([]);
+        expect(eventsOf(h, "fill_report_waiting")).toEqual([]);
+      }
+      const { h, lib } = wired();
+      const head = openPr(lib, 7, [["build", "failure"]]);
+      lib.pulls.get(7)!.mergeable = false;
+      expect(lineOf(await reported(h, `- DONE feat-login by worker-a 12:05Z: lib PR #7 at ${head.slice(0, 7)}`), "feat-login").state).not.toBe("done");
+      expect(refusedReason(h)).toBe("conflicting");
+      expect(eventsOf(h, "fill_report_refused")[0].data).toMatchObject({ repo: "example/lib", pr: 7 });
+      expect(String(eventsOf(h, "fill_report_refused")[0].data.instruction)).toContain("Your report for lib#7 was refused");
+    });
+
+    it("AT-6 readyGuard_reads_other_repo: lib's PR is read from lib's host only, with no gate and no findings", async () => {
+      // lib's CI counts here; it has no `build` run, so the review repository's gate (build) would refuse it
+      const { h, app, lib } = wired([{ repo: "example/app", default: true, refs: ["app"] }, { repo: "example/lib", refs: ["lib"] }]);
+      const head = openPr(lib, 7, [["lint", "success"]]);
+      expect(lineOf(await reported(h, `- DONE feat-login by worker-a 12:05Z: lib PR #7 at ${head.slice(0, 7)}`), "feat-login").state).toBe("done");
+      expect(lib.requests.length).toBeGreaterThan(0);
+      expect(lib.requests.every((r) => r.path.startsWith("/repos/example/lib/"))).toBe(true);
+      expect(lib.requests.map((r) => r.path.split("?")[0])).toContain(`/repos/example/lib/commits/${head}/check-runs`);
+      expect(app.requests).toEqual([]);
+    });
+
+    it("AT-7 readyGuard_default_repo_unchanged: the bus tail PR #12 [sha] is the default repository's, read through the review module", async () => {
+      const { h, app, lib } = wired();
+      const head = openPr(app, 12);
+      const line = `- DONE feat-login by worker-a (Alice) 12:05Z: follow-up to lib#3 [gate-1] PR #12 [${head.slice(0, 7)}]`;
+      expect(lineOf(await reported(h, line), "feat-login").state).toBe("done");
+      expect(app.requests.map((r) => r.path)).toContain("/repos/example/app/pulls/12");
+      expect(lib.requests).toEqual([]);
+      // The review module's gate applies on its repository: without the build run the same report is refused
+      const second = wired();
+      const red = openPr(second.app, 12, [["lint", "success"]]);
+      await reported(second.h, `- DONE feat-login by worker-a 12:05Z: PR #12 at ${red.slice(0, 7)}`);
+      expect(refusedReason(second.h)).toBe("gate_unverified");
+    });
+
+    it("AT-8 readyGuard_host_down_per_repo: lib's host not answering holds lib's report only; app's in the same check is judged", async () => {
+      let hang = true;
+      const { h, app, lib, libCalls } = wired(undefined, () => hang);
+      const libHead = openPr(lib, 7);
+      const appHead = openPr(app, 12, [["build", "success"]], "worker-b");
+      tasks(h, "worker-a|Alice|feat-lib|Fix the lib", "worker-b|Bob|feat-app|Fix the app");
+      await check(h);
+      await at(h, 0);
+      appendFileSync(h.queueFile, `- DONE feat-lib by worker-a 12:05Z: lib PR #7 at ${libHead.slice(0, 7)}\n- DONE feat-app by worker-b 12:06Z: PR #12 at ${appHead.slice(0, 7)}\n`);
+      h.spawner.exit(5001, 0);
+      h.spawner.exit(5002, 0);
+      await at(h, MIN);
+      let status = await check(h);
+      expect(lineOf(status, "feat-lib")).toMatchObject({ state: "held", hold: "report_refused" });
+      expect(eventsOf(h, "fill_report_waiting").map((e) => [e.task, e.data.reason, e.data.repo])).toEqual([["feat-lib", "unverifiable", "example/lib"]]);
+      expect(lineOf(status, "feat-app").state).toBe("done");
+      expect(app.requests.map((r) => r.path)).toContain("/repos/example/app/pulls/12");
+      // lib backs off: the next check asks lib nothing, even once it answers again
+      const asked = libCalls();
+      hang = false;
+      status = await check(h);
+      expect(libCalls()).toBe(asked);
+      expect(lineOf(status, "feat-lib")).toMatchObject({ state: "held", hold: "report_refused" });
+      expect(lib.requests).toEqual([]);
+    });
+
+    it("AT-9 readyGuard_ambiguous_across_repos: app#5 and lib#5 are two PRs; the task's own PR settles it", async () => {
+      const first = wired();
+      openPr(first.lib, 5);
+      await reported(first.h, "- DONE feat-login by worker-a 12:05Z: app#5 and lib#5 at abc1234", "Login form");
+      expect(refusedReason(first.h)).toBe("ambiguous");
+      expect(eventsOf(first.h, "fill_report_refused")[0].evidence.join(" ")).toContain("(#5, lib#5)");
+
+      const { h, lib } = wired();
+      const head = openPr(lib, 5);
+      expect(lineOf(await reported(h, `- DONE feat-login by worker-a 12:05Z: app#5 and lib#5 at ${head.slice(0, 7)}`, "Fix the review findings of lib#5"), "feat-login").state).toBe(
+        "done",
+      );
+      expect(lib.requests.map((r) => r.path)).toContain("/repos/example/lib/pulls/5");
     });
   });
 
@@ -5939,7 +6124,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
       const asked: number[] = [];
       const h = setup(fill({ ...FLEET, agents: ["worker-a"], ready_guard: true }));
       prompts(h);
-      h.manager.useReadyFacts(() => ({ facts: async (pr: number) => (asked.push(pr), { ...facts }) }));
+      h.manager.useReadyFacts(() => ({ ...DEMO_SOURCE, facts: async (_repo: string, pr: number) => (asked.push(pr), { ...facts }) }));
       tasks(h, "worker-a|Viserion|feat-login|Open a PR for the login form");
       // Real line shapes: an agent's READY with its PR and head, attributed "by <agent> (<Name>) HH:MMZ"
       await runEndingWith(h, "- READY old-task PR #9 at abc1234 by worker-a (Viserion) 12:00Z: all findings fixed");
@@ -6262,6 +6447,7 @@ describe("12. the bus (bus.consume): fill reads an agent's structured report in 
     fill: Record<string, unknown> = {},
     restartOf?: BusHarness,
     tokenUsers?: (project: string) => boolean,
+    extra?: (p: Paths) => Record<string, unknown>,
   ): Promise<BusHarness> {
     const paths = restartOf?.paths ?? makePaths();
     const config = {
@@ -6270,6 +6456,7 @@ describe("12. the bus (bus.consume): fill reads an agent's structured report in 
         fill: { enabled: true, tasks_file: tasksPath(paths), agents: ["worker-a"], prompt_files: ["{prompts_dir}/{agent}.txt"], max_active: 2, interval_seconds: 3600, ...fill },
       }),
       bus: { consume: mode },
+      ...extra?.(paths),
     } as ProjectConfig;
     mkdirSync(paths.promptsDir, { recursive: true });
     writeFileSync(join(paths.promptsDir, "worker-a.txt"), "You are worker A.\n");
@@ -6296,7 +6483,15 @@ describe("12. the bus (bus.consume): fill reads an agent's structured report in 
       dbPath: paths.dbPath,
       probes: { processes: procs, fs: new NodeFileSystem(), runner: new FakeCommandRunner(), clock, spawner, self: SELF, systemInfo: new FakeSystemInfo() },
       events,
-      bus: agentsBusFor({ consumers, store: (project) => busStoreFor(project, dataDir), clock, serverUrl: SERVER_URL, tokenUsers }),
+      bus: agentsBusFor({
+        consumers,
+        store: (project) => busStoreFor(project, dataDir),
+        openedStore: (project) => openedBusStore(project, dataDir),
+        existingStore: (project) => existingBusStore(project, dataDir),
+        clock,
+        serverUrl: SERVER_URL,
+        tokenUsers,
+      }),
     });
     managers.push(manager);
     manager.load([{ name: "demo", config }]);
@@ -6393,6 +6588,22 @@ describe("12. the bus (bus.consume): fill reads an agent's structured report in 
     expect(lineOf(again, "feat-login")).toMatchObject({ state: "held", hold: "blocked" });
     expect(kinds(again, "fill_held")).toHaveLength(1);
     expect(inboxEntries(h.paths)).toHaveLength(1);
+  });
+
+  it("AT-7 readyGuard_default_repo_unchanged: a DONE report with pr: 12 is the default repository's PR, read through the review module", async () => {
+    const app = new FakeRemote("example/app");
+    const lib = new FakeRemote("example/lib");
+    const head = openPr(app, 12);
+    const h = await busSetup("on", { ready_guard: true }, undefined, undefined, (p) => multiRepo(p));
+    wireRepos(h.manager, h.config, app, lib);
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    const token = await started(h);
+    expect((await report(h, token, { kind: "DONE", task: "feat-login", summary: "merged", pr: 12, sha: head.slice(0, 10) })).statusCode).toBe(200);
+    h.spawner.exit(5001, 0);
+    await h.service.tick();
+    await vi.waitFor(() => expect(lineOf(h, "feat-login")?.state).toBe("done"));
+    expect(app.requests.map((r) => r.path)).toContain("/repos/example/app/pulls/12");
+    expect(lib.requests).toEqual([]);
   });
 
   it("on: a WAITING over the bus waits on its gate id, from the report's field (its summary names no gate)", async () => {
@@ -6512,5 +6723,187 @@ describe("12. the bus (bus.consume): fill reads an agent's structured report in 
     const late = await report(h, token, { kind: "DONE", task: "feat-login", summary: "late" });
     expect(late.statusCode).toBe(401);
     expect(readFileSync(h.paths.queueFile, "utf-8")).not.toContain("late");
+  });
+
+  // ============ Lair #260: a run's bus token is revoked on every way it ends; a report is validated at the route ============
+
+  const busStoreOf = (h: BusHarness) => busStoreFor("demo", join(h.paths.dir, "data"));
+  const RATE_LIMIT = "Error: 429 Too Many Requests: rate limit exceeded, retry later";
+  const NETWORK_DOWN =
+    'Error: A network error occurred. Please check your connection and try again. (code -32000): {"errorType":"ClientNetworkError","retryErrorType":"TRANSIENT"}';
+  /** The started process writes `line` to its log and exits 1 at once */
+  const diesOn = (h: BusHarness, line: string) => {
+    h.spawner.behaviour = (pid, log, call) => {
+      if (call !== 1) return;
+      writeLog(h.clock, log, `${line}\n`);
+      h.spawner.exit(pid, 1);
+    };
+  };
+
+  /** Each way a run ends, with what makes it end: `before` runs before fill starts the run, `end` after */
+  const endPaths: Array<{ path: string; state: string; before?: (h: BusHarness) => void; end: (h: BusHarness, runId: string) => Promise<void> }> = [
+    {
+      path: "completed (exit 0): endRun",
+      state: "completed",
+      end: async (h) => {
+        h.spawner.exit(5001, 0);
+        await h.service.tick();
+      },
+    },
+    {
+      path: "crashed (exit 1): recover",
+      state: "failed",
+      end: async (h) => {
+        h.clock.advance(5 * MIN);
+        h.spawner.exit(5001, 1);
+        await h.service.tick();
+      },
+    },
+    {
+      path: "a rate limit: failover",
+      state: "failed",
+      before: (h) => diesOn(h, RATE_LIMIT),
+      end: async (h) => void (await h.service.tick()),
+    },
+    {
+      path: "a network error: transient retry",
+      state: "failed",
+      before: (h) => diesOn(h, NETWORK_DOWN),
+      end: async (h) => void (await h.service.tick()),
+    },
+    {
+      path: "the owner's fresh session: SIGTERM, then recover",
+      state: "failed",
+      end: async (h, runId) => {
+        await h.service.freshSession(runId);
+        await h.service.tick();
+      },
+    },
+    {
+      path: "spawn errors past start_timeout_minutes: never started",
+      state: "never_started",
+      before: (h) => void (h.spawner.failAll = "spawn agent-cli ENOENT"),
+      end: async (h) => {
+        h.clock.advance(11 * MIN);
+        await h.service.tick();
+      },
+    },
+    {
+      path: "its claim released before it started: lost claim",
+      state: "lost_claim",
+      before: (h) => void (h.spawner.failAll = "spawn agent-cli ENOENT"),
+      end: async (h) => void (await h.service.releaseClaim("feat-login")),
+    },
+  ];
+
+  it.each(endPaths)("$path: the run's bus token is revoked, and the bus refuses it", async ({ state, before, end }) => {
+    const h = await busSetup("on");
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    before?.(h);
+    const token = await started(h);
+    expect(token).toMatch(/^lairbus_/);
+    const run = runsOf(h)[0];
+    expect(busStoreOf(h).validateToken(hashBusToken(token))).toMatchObject({ runId: run.id });
+
+    await end(h, run.id);
+
+    expect(h.store.getRun(run.id)?.state).toBe(state);
+    expect(busStoreOf(h).validateToken(hashBusToken(token))).toBeNull();
+    // Every token the run was given (one per start attempt) is revoked, not only the last
+    expect(busStoreOf(h).getTokenForRun(run.id)).toBeNull();
+    const late = await report(h, token, { kind: "DONE", task: "feat-login", summary: "late" });
+    expect(late.statusCode).toBe(401);
+  });
+
+  it("bus.consume switched off by a reload mid-run: the token minted while it was on is still revoked when the run ends", async () => {
+    const h = await busSetup("on");
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    const token = await started(h);
+    // What the server's config reload does (index.ts applyBusConfig)
+    h.consumers.setMode("demo", "off");
+    forgetBusService("demo");
+    h.spawner.exit(5001, 0);
+    await h.service.tick();
+    expect(runsOf(h)[0].state).toBe("completed");
+    expect(busStoreOf(h).validateToken(hashBusToken(token))).toBeNull();
+  });
+
+  it("a restart revokes the tokens of runs that ended while no server was there to revoke them, with the bus off by then too", async () => {
+    const h = await busSetup("on");
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    const token = await started(h);
+    // The run ended, but its token was never revoked (the server stopped first, or an older one never revoked it)
+    const run = runsOf(h)[0];
+    h.store.saveRun({ ...run, state: "failed", endedAt: h.clock.now(), detail: "crashed" });
+    expect(busStoreOf(h).validateToken(hashBusToken(token))).not.toBeNull();
+
+    // A new server process: no bus store open, and bus.consume switched off meanwhile
+    closeBusStores();
+    const again = await busSetup("off", {}, h);
+    again.manager.start();
+    await vi.waitFor(() => expect(busStoreOf(again).validateToken(hashBusToken(token))).toBeNull());
+  });
+
+  it("a restart of a project that never had a bus store creates none (nothing to sweep)", async () => {
+    const h = await busSetup("off");
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    await started(h);
+    h.manager.start();
+    h.spawner.exit(5001, 0);
+    await vi.waitFor(() => expect(runsOf(h)[0].state).toBe("completed"));
+    await h.manager.stop();
+    expect(existsSync(join(h.paths.dir, "data", "bus"))).toBe(false);
+  });
+
+  it("the bus finds a live run however many runs came after it (more than 100)", async () => {
+    const h = await busSetup("on");
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    const token = await started(h);
+    const live = runsOf(h)[0];
+    for (let i = 1; i <= 120; i++) {
+      h.store.insertRun({ ...live, id: `ended-${i}`, task: `chore-${i}`, chainId: `chain-${i}`, state: "completed", requestedAt: live.requestedAt + i, endedAt: live.requestedAt + i });
+    }
+    expect(h.service.runs(100).some((r) => r.id === live.id)).toBe(false);
+    const whoami = await h.app.inject({ method: "POST", url: "/api/bus/call", headers: { authorization: `Bearer ${token}` }, payload: { tool: "whoami", args: {} } });
+    expect(whoami.statusCode).toBe(200);
+    expect(whoami.json().data).toMatchObject({ runId: live.id, task: "feat-login" });
+    const posted = await report(h, token, { kind: "PROGRESS", task: "feat-login", summary: "half way" });
+    expect(posted.statusCode).toBe(200);
+  });
+
+  it("refuses at the route (400) a report the consumers would refuse: a sha that isn't 7 to 64 hex digits, a gate id that isn't a plain name; nothing is stored or mirrored", async () => {
+    const h = await busSetup("on");
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    const token = await started(h);
+    const refused: Array<[Record<string, unknown>, string]> = [
+      [{ sha: "not-a-sha" }, "sha"],
+      [{ sha: "abc12" }, "sha"],
+      [{ sha: "a".repeat(65) }, "sha"],
+      [{ gate_id: "../escape" }, "gate_id"],
+      [{ gate_id: "dir/gate" }, "gate_id"],
+      [{ gate_id: "-rf" }, "gate_id"],
+      [{ gate_id: "gate 1" }, "gate_id"],
+      [{ gate_id: "a..b" }, "gate_id"],
+    ];
+    for (const [args, field] of refused) {
+      const posted = await report(h, token, { kind: "WAITING", task: "feat-login", summary: "the gate runs", ...args });
+      expect(posted.statusCode, JSON.stringify(args)).toBe(400);
+      expect(posted.json().error).toContain(field);
+    }
+    expect(busStoreOf(h).listReports()).toEqual([]);
+    expect(existsSync(h.paths.queueFile) ? readFileSync(h.paths.queueFile, "utf-8") : "").not.toContain("[bus:");
+    expect(h.consumers.health("demo").refusedCount).toBe(0);
+
+    // The same report with a plain gate id and a hex sha is stored, mirrored and read
+    const ok = await report(h, token, { kind: "WAITING", task: "feat-login", summary: "the gate runs", gate_id: "gate-42.v2_x", sha: "ABC1234" });
+    expect(ok.statusCode).toBe(200);
+    expect(busStoreOf(h).listReports()).toHaveLength(1);
+    expect(readFileSync(h.paths.queueFile, "utf-8")).toContain(`[bus:${ok.json().data.id}]`);
+  });
+
+  it("every way a run ends goes through runEnded (static): no other code of the service sets an ended state", () => {
+    const code = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "service.ts"), "utf8");
+    expect(code.match(/\.state\s*=\s*"(completed|failed|never_started|lost_claim|superseded)"/g)).toBeNull();
+    expect(code.match(/\b\w+\.state\s*=\s*[a-z]\w*\s*;/g)).toEqual(["run.state = state;"]);
   });
 });
