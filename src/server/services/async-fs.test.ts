@@ -147,7 +147,7 @@ function bigProject(): ProjectConfig {
   mkdirSync(results, { recursive: true });
   mkdirSync(join(dir, "gates", "queue"), { recursive: true });
   const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
-  writeFileSync(join(agents, "dragons.txt"), "worker-a|Worker A|task-1\n");
+  writeFileSync(join(agents, "dragons.txt"), "worker-a\tWorker A\ttask-1\n");
   for (let i = 0; i < FILES; i++) {
     const stamp = `20261101T${String(Math.floor(i / 3600) % 24).padStart(2, "0")}${String(Math.floor(i / 60) % 60).padStart(2, "0")}${String(i % 60).padStart(2, "0")}Z`;
     const log = join(agents, `worker-a-${stamp}-${i}.log`);
