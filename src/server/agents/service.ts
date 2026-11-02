@@ -4000,6 +4000,7 @@ export class AgentsService {
       projectBudget,
       fill: this.fillStatus(),
       unreachable: this.unreachableViews(agents),
+      spendEnabled: this.spend.enabled,
     };
   }
 

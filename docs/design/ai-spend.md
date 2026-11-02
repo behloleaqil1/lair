@@ -1,6 +1,6 @@
 # AI spend and waste
 
-- **Status:** design. PR 1 (measure) and PR 2 (classify, API, daily summary, notices) of §7 are built; the rest is not. The feature decisions are made (§8, 2026-11-02).
+- **Status:** design. Of §7, PR 1 (measure; 1b is not built), PR 2 (classify, API, daily summary, notices), PR 3 (dashboard), PR 4 (G1) and PR 5 (G2, G4) are built; the rest is not. The feature decisions are made (§8, 2026-11-02).
 - **Base:** main `9bce85a`.
 - **Related:** [autonomy.md §6](autonomy.md#6-agents-budgets-failover-and-session-recovery-module-agents) (the agents module), [review-stages.md](review-stages.md) (staged review slots, `ask_after`, built separately), [planner.md](planner.md), [decision-policies.md](decision-policies.md) (the brain), issue #185 (usage limit detector).
 
@@ -266,7 +266,7 @@ CREATE INDEX IF NOT EXISTS idx_agents_spend_pending ON agents_spend_pending(proj
   - reviews per head (heads reviewed more than once);
   - planner acceptance;
   - each guard's mode and its `would` and `did` counts;
-  - `reported: false`, with `null` tokens and cost, for any group whose adapters report no tokens.
+  - `reported: false`, with `null` tokens and cost, for any group whose adapters report no tokens, and `reportedRuns` (how many runs reported them) on every totals.
   "today" is the UTC day.
 - `GET /api/agents/spend/runs?project=<p>&task=<id>&limit=` returns that task's run rows. These hold numbers, ids and enums only, never a prompt or a log line.
 
@@ -282,6 +282,14 @@ CREATE INDEX IF NOT EXISTS idx_agents_spend_pending ON agents_spend_pending(proj
 - "not reported" in place of tokens and cost for adapters that don't report them.
 
 AgentDetail gets a "Spend" line (today's runs per class and cost or requests) next to its Budget section. Charts follow the dashboard's existing component styles.
+
+**As built (PR 3).**
+
+- The agents status (`GET /api/agents/status`, not owner-only) says only whether spend is on (`spendEnabled`), so the panel and the Spend line show while it is on and a signed-out browser sees "shown to the owner only" in their place. Their numbers come from the owner-only spend route alone, read once a minute and on each switch.
+- The bars cover each unit with data: cost and tokens where an adapter reported them (else "not reported" in their place), requests, model turns, agent time and runs. Runs not classified yet are a fourth, grey segment when there are some. Each bar has its numbers beside it in text.
+- A class or a waste reason with runs none of which reported (or counted) the unit says "not reported" in its place, never "$0.00" or "0 tokens"; a class with no runs is a true 0. Each totals object of the API carries `reportedRuns` (how many of its `runs` reported tokens and cost), so a mixed fleet is told from the data, whatever the table is grouped by: a caveat beside the bars ("cover only the 2 of 3 runs whose adapter reported them"), the waste share in cost says "of the reported cost (2 of 3 runs)", a reason says "reported for 1 of them", and the agent's Spend line says "cost $0.30 for 1 of 5 runs (partly reported ...)".
+- The table is by agent first (task, origin and project on its select). A row whose runs have none of the panel's unit shows its waste share in the next unit it has ("100% of requests").
+- The guard lines read the API's `mode`, `would` and `did` per guard, in plain words ("watching: would have cooled a provider once today").
 
 **Daily summary.** At `agents.spend.daily_summary_utc` ("00:05"), for the UTC day that just ended, each project records one `spend_daily` event (dedupe key `spend_daily:<project>:<date>`, so a restart doesn't repeat it). It is published on the event bus as `agents.spend.daily`. The data is the same totals the API gives for that day: numbers, enums and task ids only. The same step writes that day's `agents_spend_daily` rows. The supervisor digest may read it. No AI run makes it.
 

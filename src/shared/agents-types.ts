@@ -76,7 +76,8 @@ export type SpendUnit = "cost" | "requests" | "minutes" | "runs";
 
 /**
  * Spend summed over runs. `reported: false` when no run of them reported tokens and cost: both are null then ("not
- * reported"), never estimated. requests and turns are null when no run had them.
+ * reported"), never estimated. requests and turns are null when no run had them. `reportedRuns`: how many of the runs
+ * reported tokens and cost; fewer than `runs` (and more than 0) means tokens and cost cover only those runs.
  */
 export interface SpendTotalsView {
   runs: number;
@@ -86,6 +87,7 @@ export interface SpendTotalsView {
   tokens: number | null;
   cost: number | null;
   reported: boolean;
+  reportedRuns: number;
 }
 
 /** (idle + no_result) / (productive + idle + no_result), per unit; null where the unit has nothing */
@@ -420,6 +422,11 @@ export interface AgentsStatusView {
   fill?: FillStatusView;
   /** Providers Lair holds new starts on: their runs died of transient errors (agents.transient_patterns) */
   unreachable?: ProviderUnreachableView[];
+  /**
+   * agents.spend.enabled (docs/design/ai-spend.md §4.4): Home's AI spend panel and an agent's Spend line show only
+   * while it is on. Their data comes from the owner-only GET /api/agents/spend; this says only whether there is any
+   */
+  spendEnabled?: boolean;
 }
 
 /**
