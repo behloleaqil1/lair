@@ -977,3 +977,143 @@ describe("the run's decision tells the owner which options cannot be undone", ()
     expect(await effectsOf([REWORD, ADD], ["approve", "reject"])).toMatchObject({ reject_all: "reversible" });
   });
 });
+
+
+  // PR ownership tests (issue #290)
+  it("19. verifier prompt includes PR ownership guidance for finish proposals with PR reference", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    const h = await setupWithVerifier(p);
+    await h.service.cycle();
+    await startPlannerRun(h, 31 * SEC);
+
+    // Planner proposes a finish with a PR reference
+    await runPlannerAgent(h, (c) =>
+      writeProposals(c, { proposals: [{ op: "finish", task: "feat-login", reason: "merged as #230" }] }),
+    );
+    await h.service.cycle();
+
+    // The verifier should be started
+    const [run] = runsOf(h);
+    expect(run.verifierState).toBe("running");
+
+    // Tick to spawn the verifier
+    await h.agentsService.tick();
+
+    // Find the verifier spawn call
+    const verifierCall = h.spawner.calls.find((c) => c.env.LAIR_AGENT === "verifier");
+    expect(verifierCall).toBeDefined();
+
+    // Read the prompt and check it contains PR ownership guidance
+    const promptFile = verifierCall!.argv[verifierCall!.argv.indexOf("--prompt") + 1];
+    const prompt = readFileSync(promptFile, "utf-8");
+
+    expect(prompt).toContain("PR ownership for finish proposals");
+    expect(prompt).toContain("branch contains the task id");
+    expect(prompt).toContain("title or body names the task id");
+    expect(prompt).toContain("gh pr view");
+
+    // The proposal data should be in the prompt
+    expect(prompt).toContain('"op": "finish"');
+    expect(prompt).toContain('"task": "feat-login"');
+    expect(prompt).toContain("merged as #230");
+  });
+
+  it("20. verifier unsure verdict for unrelated PR keeps proposal pending for owner", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    const h = await setupWithVerifier(p);
+    await h.service.cycle();
+    await startPlannerRun(h, 31 * SEC);
+
+    // Planner proposes a finish with a PR that doesn't belong to the task
+    await runPlannerAgent(h, (c) =>
+      writeProposals(c, { proposals: [{ op: "finish", task: "feat-login", reason: "merged as #230 (but #230 is another task's PR)" }] }),
+    );
+    await h.service.cycle();
+
+    // Verifier returns unsure because PR doesn't belong to task
+    await runVerifierAgent(h, (c) =>
+      writeVerdicts(c, {
+        verdicts: [
+          {
+            proposal: 0,
+            verdict: "unsure",
+            reason: "PR #230 does not belong to task feat-login: branch is kiro/other-task, title does not name feat-login",
+            evidence: ["gh pr view 230: headRefName=kiro/other-task, title='other feature'"],
+          },
+        ],
+      }),
+    );
+    await h.service.cycle();
+
+    // Proposal should stay pending for owner to decide
+    const pending = h.service.proposals({ status: "pending" });
+    expect(pending).toHaveLength(1);
+    expect(pending[0].verifierVerdict).toBe("unsure");
+    expect(pending[0].verifierReason).toContain("PR #230 does not belong to task");
+    expect(open(h)).toHaveLength(1);
+  });
+
+  it("21. verifier approve verdict for matching PR allows proposal to proceed", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    const h = await setupWithVerifier(p);
+    await h.service.cycle();
+    await startPlannerRun(h, 31 * SEC);
+
+    // Planner proposes a finish with a PR that belongs to the task
+    await runPlannerAgent(h, (c) =>
+      writeProposals(c, { proposals: [{ op: "finish", task: "feat-login", reason: "merged as #50" }] }),
+    );
+    await h.service.cycle();
+
+    // Verifier approves because PR branch contains task id
+    await runVerifierAgent(h, (c) =>
+      writeVerdicts(c, {
+        verdicts: [
+          {
+            proposal: 0,
+            verdict: "approve",
+            reason: "PR #50 belongs to task feat-login: branch is kiro/worker-a/feat-login",
+            evidence: ["gh pr view 50: headRefName=kiro/worker-a/feat-login"],
+          },
+        ],
+      }),
+    );
+    await h.service.cycle();
+
+    // Proposal should be pending for owner (finish has approval: always by default)
+    const pending = h.service.proposals({ status: "pending" });
+    expect(pending).toHaveLength(1);
+    expect(pending[0].verifierVerdict).toBe("approve");
+    expect(open(h)).toHaveLength(1);
+  });
+
+  it("22. finish proposal without PR reference proceeds normally", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    const h = await setupWithVerifier(p);
+    await h.service.cycle();
+    await startPlannerRun(h, 31 * SEC);
+
+    // Planner proposes a finish without a PR reference
+    await runPlannerAgent(h, (c) =>
+      writeProposals(c, { proposals: [{ op: "finish", task: "feat-login", reason: "completed per owner message" }] }),
+    );
+    await h.service.cycle();
+
+    // Verifier approves (no PR to check)
+    await runVerifierAgent(h, (c) =>
+      writeVerdicts(c, {
+        verdicts: [{ proposal: 0, verdict: "approve", reason: "owner confirmed completion" }],
+      }),
+    );
+    await h.service.cycle();
+
+    // Proposal should be pending for owner
+    const pending = h.service.proposals({ status: "pending" });
+    expect(pending).toHaveLength(1);
+    expect(pending[0].verifierVerdict).toBe("approve");
+    expect(open(h)).toHaveLength(1);
+  });
