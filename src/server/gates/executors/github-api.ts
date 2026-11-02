@@ -11,6 +11,9 @@ import type { HttpFetch, HttpResponse } from "./types.js";
 
 export const GITHUB_API_URL = "https://api.github.com";
 
+/** How long one request may take, its body included; a request with no answer by then fails */
+export const GITHUB_API_TIMEOUT_MS = 60_000;
+
 export class GitHubApiError extends Error {
   constructor(
     readonly status: number,
@@ -133,6 +136,8 @@ export class GitHubApi {
       token: string;
       fetch: HttpFetch;
       baseUrl?: string;
+      /** Per request (default GITHUB_API_TIMEOUT_MS) */
+      timeoutMs?: number;
     },
   ) {
     this.baseUrl = options.baseUrl ?? GITHUB_API_URL;
@@ -155,17 +160,25 @@ export class GitHubApi {
       "User-Agent": "lair",
     };
     if (body !== undefined) headers["Content-Type"] = "application/json";
+    const timeoutMs = this.options.timeoutMs ?? GITHUB_API_TIMEOUT_MS;
+    const signal = AbortSignal.timeout(timeoutMs);
+    const timedOut = () =>
+      new GitHubApiError(0, `GitHub API ${method} ${path.split("?")[0]}: no answer within ${Math.round(timeoutMs / 1000)} s`);
     let response: HttpResponse;
     try {
       response = await this.options.fetch(`${this.baseUrl}${path}`, {
         method,
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
+        signal,
       });
     } catch (e) {
+      if (signal.aborted) throw timedOut();
       throw new GitHubApiError(0, `GitHub API unreachable: ${e instanceof Error ? e.message : String(e)}`);
     }
-    const text = await response.text().catch(() => "");
+    // A body cut off by the timeout is a failure, never an empty answer
+    const text = await response.text().catch(() => (signal.aborted ? null : ""));
+    if (text === null) throw timedOut();
     return { status: response.status, text };
   }
 
