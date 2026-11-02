@@ -42,6 +42,8 @@ export interface HostCommit {
   sha: string;
   author: PersonIdentity;
   committer: PersonIdentity;
+  /** The committer date (ISO 8601), or null when the host gives none */
+  committedAt: string | null;
   /** The full message: trailers such as Co-authored-by publish emails too */
   message: string;
 }

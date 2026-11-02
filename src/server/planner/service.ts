@@ -565,7 +565,7 @@ export class PlannerService {
     const agentsStore = this.agents.store();
     if (this.settings.markDone !== "off" && agentsStore) {
       // bus.consume on: a line that mirrors a bus report is read by the report (fill's checkDone, the same way)
-      const queue = new QueueLines(this.config.queue_file, bus?.mode === "on" ? bus : null);
+      const queue = await QueueLines.read(this.config.queue_file, bus?.mode === "on" ? bus : null);
       for (const open of doc.tasks) {
         // An unassigned line has no agent whose done report fill's checks (and its ready guard) can judge: it is
         // left to the owner (or a reassign); fill doesn't count it as ready work once a queue line reports it done
@@ -579,7 +579,7 @@ export class PlannerService {
         try {
           const patterns = this.settings.fillPatterns;
           const until = queueWindowEnd(agentsStore, this.project, patterns, line, latest);
-          check = checkDone(agentsStore, this.project, queue, patterns, line, latest, until);
+          check = await checkDone(agentsStore, this.project, queue, patterns, line, latest, until);
         } catch {
           continue;
         }
@@ -936,7 +936,7 @@ export class PlannerService {
       else this.store.insertRun(run);
       await this.failed(run, now, false);
     };
-    const template = buildPrompt([agent.promptFile], getPromptsDir(this.config), { agent: agent.id, task });
+    const template = await buildPrompt([agent.promptFile], getPromptsDir(this.config), { agent: agent.id, task });
     if (!template.ok) return fail(`the planner agent's prompt: ${template.reason}`);
     try {
       mkdirSync(this.settings.workDir, { recursive: true, mode: 0o700 });
@@ -1192,7 +1192,7 @@ export class PlannerService {
     const id = randomUUID();
     const task = `verifier-${utcStamp(now)}-${id.slice(0, 6)}`;
 
-    const template = buildPrompt([verifier.promptFile], getPromptsDir(this.config), { agent: verifier.id, task });
+    const template = await buildPrompt([verifier.promptFile], getPromptsDir(this.config), { agent: verifier.id, task });
     if (!template.ok) {
       console.warn(`[planner] ${this.project}: verifier prompt template: ${template.reason}`);
       return false;

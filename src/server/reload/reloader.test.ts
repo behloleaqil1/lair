@@ -219,6 +219,25 @@ describe("live config reload", () => {
     expect(h.watchdogs.get("shop")!.settings.intervalSeconds).toBe(90);
   });
 
+  it("an invalid repos: is the project's problem on the banner, at startup and on a change (no one module owns it)", async () => {
+    const bad = [{ repo: "example/app", default: true }, { repo: "lib" }];
+    // At startup: the project loads, and the banner says what is wrong
+    const h = await setup({ watchdog: watchdog(60), delivery: delivery(30), repos: bad });
+    await h.reloader.settled();
+    expect(h.reloader.problemOf("shop")).toContain("repos[1].repo: use owner/name");
+    const oldWatchdog = h.watchdogs.get("shop")!;
+    expect(oldWatchdog.running).toBe(true);
+
+    // Fixed: the problem is gone; broken again: refused, the running config stays
+    h.write({ watchdog: watchdog(60), delivery: delivery(30), repos: [{ repo: "example/app" }] });
+    await waitFor("the fix", () => h.reloader.problemOf("shop") === null);
+    h.write({ watchdog: watchdog(90), delivery: delivery(30), repos: [{ repo: "example/app", refs: ["pr"] }] });
+    await waitFor("the problem", () => h.reloader.problemOf("shop") !== null);
+    await h.reloader.settled();
+    expect(h.reloader.problemOf("shop")).toContain("repos[0].refs[0]: pr and pull are not repository names");
+    expect(h.watchdogs.get("shop")!.settings.intervalSeconds).toBe(60);
+  });
+
   it("reloads once for rapid successive writes, with the last one", async () => {
     const h = await setup({ watchdog: watchdog(60), delivery: delivery(30) });
     const oldWatchdog = h.watchdogs.get("shop")!;

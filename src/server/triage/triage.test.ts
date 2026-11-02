@@ -637,4 +637,43 @@ describe("actions: pre-existing, flaky, code", () => {
     expect(event.data).toMatchObject({ project: "demo", agent: "worker-a", recordId: out.record.id });
     expect(String(event.data.text)).toContain("OrderServiceTest#totalIncludesTax()");
   });
+
+  it("custom parsers from config parse test output through the real entry point (M2)", async () => {
+    // A custom parser for a made-up test framework, wired through triage config
+    h = harness({
+      enabled: true,
+      mode: "act",
+      parsers: {
+        custom: [
+          {
+            name: "mytest",
+            detect: "MyTest Framework",
+            fail_pattern: 'FAIL:\\s+(?<suite>[^:]+)::(?<name>\\S+)\\s+-\\s+(?<message>.+)',
+            summary_pattern: '(?<failed>\\d+) failed, (?<passed>\\d+) passed',
+          },
+        ],
+      },
+    });
+
+    // Test output that matches the custom parser
+    const output = `
+MyTest Framework v1.0
+Running tests...
+PASS: orders::test_create
+FAIL: orders::test_total - expected 108 but got 100
+PASS: orders::test_delete
+Summary: 1 failed, 2 passed
+`;
+
+    const out = await h.ingest({
+      result: gate({ sha: sha("custom1"), branch: "feat/custom-test", steps: [step("test", "failed", output, 1)] }),
+      context: { agent: "worker-a" },
+    });
+
+    // The custom parser should have parsed the failure
+    expect(out.record.causes).toHaveLength(1);
+    expect(out.record.causes[0].cause.parser).toBe("mytest");
+    expect(out.record.causes[0].cause.tests[0]).toMatchObject({ suite: "orders", name: "test_total" });
+    expect(out.record.causes[0].cause.message).toBe("expected 108 but got 100");
+  });
 });

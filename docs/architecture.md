@@ -92,6 +92,7 @@ Pure functions that parse project files into typed structures:
 
 - **`data.ts`**: main data service, aggregates parsers for each view (read-only); a gate's record and log path, and a dragon's newest log, for the dashboard's details
 - **`log-tail.ts`**: the bounded tail of a log the owner reads (lines, bytes, line length, no symlinks, credentials masked)
+- **`async-fs.ts`**: bounded `fs/promises` reads for request handlers and timer ticks (a tail, a small file, a capped listing, a few reads at a time, one listing shared while in flight): no synchronous fs call on those paths (issue #245; `ci-guards.test.ts` lists the modules held to it)
 - **`command.ts`**: runs configured commands as argument arrays (no shell) and appends each action to `data/audit.log`
 - **`dragon-registry.ts`**: the dragons a project has (YAML `dragons:` plus `dragons.txt`); start/stop requests are checked against it and the start dialog lists it
 - **`adapters.ts`**: built-in agent adapter definitions and command builders (adapters are listed in the UI; dragons are started with `dragon_start_cmd`)

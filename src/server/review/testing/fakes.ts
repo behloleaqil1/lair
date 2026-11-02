@@ -13,6 +13,8 @@ import type { Clock } from "../service.js";
 export interface Person {
   name: string;
   email: string;
+  /** The commit's date for this person (GitHub's commit.author.date / commit.committer.date), when a test sets one */
+  date?: string;
 }
 
 export interface FakeCommit {
@@ -47,6 +49,8 @@ export interface FakePull {
   user: string;
   mergeable: boolean | null;
   files: FakeFile[];
+  /** Its updated_at (default 2026-01-01T00:00:00Z) */
+  updatedAt?: string;
 }
 
 export interface FakeCheckRun {
@@ -217,7 +221,7 @@ function pullJson(remote: FakeRemote, p: FakePull, detail: boolean): Record<stri
     base: { ref: p.baseRef },
     user: { login: p.user },
     labels: p.labels.map((name) => ({ name })),
-    updated_at: "2026-01-01T00:00:00Z",
+    updated_at: p.updatedAt ?? "2026-01-01T00:00:00Z",
   };
 }
 

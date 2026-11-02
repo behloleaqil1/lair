@@ -29,7 +29,7 @@ import {
 } from "./human-auth/index.js";
 import { registerControlRoutes } from "./routes/controls.js";
 import { busStoreFor, forgetBusService, registerBusRoutes } from "./routes/bus.js";
-import { BusConsumers, agentsBusFor, closeBusStores, existingBusStore, openedBusStore, parseBusConfig, structuredReport } from "./bus/index.js";
+import { BusConsumers, BusLive, agentsBusFor, closeBusStores, existingBusStore, openedBusStore, parseBusConfig, structuredReport } from "./bus/index.js";
 import { registerProcessRoutes } from "./routes/processes.js";
 import { registerSettingsRoutes } from "./routes/settings.js";
 import { getSupervisor } from "./services/supervisor.js";
@@ -61,6 +61,7 @@ import { PlacementManager, registerPlacementRoutes } from "./placement/index.js"
 import { HostServicesManager, registerHostServicesRoutes } from "./host-services/index.js";
 import { CloudManager, registerCloudRoutes } from "./cloud/index.js";
 import { InfraMonitorManager, registerInfraMonitorRoutes } from "./infra-monitor/index.js";
+import { PrHealthManager, registerPrHealthRoutes, startedLine as prHealthStartedLine } from "./pr-health/index.js";
 import { ChecksManager, agentRunIsActive, registerChecksRoutes } from "./checks/index.js";
 import { registerDashboardRoutes } from "./dashboard/index.js";
 import type { DashboardSources } from "./dashboard/routes.js";
@@ -247,7 +248,7 @@ fastify.get<{ Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      return respond(service.getOverview());
+      return respond(await service.getOverview());
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -260,7 +261,7 @@ fastify.get<{ Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      return respond(service.getDragons());
+      return respond(await service.getDragons());
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -273,7 +274,7 @@ fastify.get<{ Params: { id: string }; Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      const dragon = service.getDragonById(request.params.id);
+      const dragon = await service.getDragonById(request.params.id);
       if (!dragon) {
         return respondError(`Dragon not found: ${request.params.id}`);
       }
@@ -292,7 +293,7 @@ fastify.get<{ Params: { id: string }; Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      const lines = service.getQueueLinesByAgent(request.params.id);
+      const lines = await service.getQueueLinesByAgent(request.params.id);
       return respond(lines);
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
@@ -306,8 +307,8 @@ fastify.get<{ Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      const queue = service.getGateQueue();
-      const results = service.getRecentGateResults(24);
+      const queue = await service.getGateQueue();
+      const results = await service.getRecentGateResults(24);
       return respond({ queue, results });
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
@@ -321,9 +322,9 @@ fastify.get<{ Querystring: { project?: string; status?: string } }>(
     try {
       const service = getDataService(request.query.project);
       if (request.query.status) {
-        return respond(service.getGatesByStatus(request.query.status));
+        return respond(await service.getGatesByStatus(request.query.status));
       }
-      return respond(service.getGateQueue());
+      return respond(await service.getGateQueue());
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -338,7 +339,7 @@ fastify.get<{ Querystring: { project?: string; hours?: string } }>(
       const hours = request.query.hours
         ? parseInt(request.query.hours, 10)
         : 24;
-      return respond(service.getRecentGateResults(hours));
+      return respond(await service.getRecentGateResults(hours));
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -356,9 +357,9 @@ fastify.get<{ Querystring: { project?: string; types?: string } }>(
       const service = getDataService(request.query.project);
       if (request.query.types) {
         const types = request.query.types.split(",");
-        return respond(service.getQueueLinesByType(types));
+        return respond(await service.getQueueLinesByType(types));
       }
-      return respond(service.getQueueLines());
+      return respond(await service.getQueueLines());
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -385,7 +386,7 @@ fastify.get<{ Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      return respond(service.getMachineStatuses());
+      return respond(await service.getMachineStatuses());
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -398,7 +399,7 @@ fastify.get<{ Querystring: { project?: string } }>(
   async (request) => {
     try {
       const service = getDataService(request.query.project);
-      return respond(service.getOrchestratorStatus());
+      return respond(await service.getOrchestratorStatus());
     } catch (e) {
       return respondError(e instanceof Error ? e.message : "Unknown error");
     }
@@ -573,6 +574,12 @@ const applyBusConfig = (entry: { name: string; config?: ProjectConfig }) => {
   forgetBusService(entry.name);
 };
 for (const entry of projectEntries) applyBusConfig(entry);
+// The bus live on the dashboard's `bus` WebSocket channel (Home → Bus), for projects whose bus.consume isn't off
+const busLive = new BusLive({
+  events: getEventBus(),
+  mode: (project) => busConsumers.mode(project),
+  publish: (project, update) => wsServer?.broadcast("bus", update, { project }),
+});
 
 const agents: AgentsManager = new AgentsManager({
   dbPath: join(process.cwd(), "data", "agents.db"),
@@ -819,6 +826,14 @@ infraMonitor.load(projectEntries);
 infraMonitor.useDecisions(decisionInbox);
 await registerInfraMonitorRoutes(fastify, infraMonitor, () => getDefaultProject());
 
+// PR health (src/server/pr-health/): the open PRs of each repository in repos:
+// that conflict, fall behind, get no CI or go red, and the agent whose task
+// line or branch owns each (fill's last check). Off unless a project sets
+// `pr_health.enabled: true`; observe only: events and a read-only status.
+const prHealth = new PrHealthManager({ events: getEventBus(), agents });
+prHealth.load(projectEntries);
+await registerPrHealthRoutes(fastify, prHealth, () => getDefaultProject());
+
 // Agent checks (src/server/checks/): agents test on a runner before they gate.
 // One per project with `checks:` configured (off by default). A request needs
 // the run's bus token and a run the agents module has running; a run tests the
@@ -940,6 +955,7 @@ const reloader = new ConfigReloader({
     supervisor: selfChecks,
     trackers,
     infraMonitor,
+    prHealth,
     bus: {
       validate: (config) => {
         const parsed = parseBusConfig(config.bus);
@@ -1042,6 +1058,7 @@ const stopServer = async (reason: string) => {
 
   // The bus consumers first: no report or run end starts a check or a cycle from here on
   busConsumers.stop();
+  busLive.stop();
 
   // Stop the planner first: it requests runs from the agents module
   await planner.stop();
@@ -1067,6 +1084,8 @@ const stopServer = async (reason: string) => {
   await hostServices.stop();
   // Stop infra monitor: any tick in progress is cut short
   await infraMonitor.stop();
+  // Stop PR health: a tick in progress ends at its next request
+  await prHealth.stop();
 
   // Stop the shared process cache (all modules have stopped, so no one reads it)
   disposeProcessCache();
@@ -1213,6 +1232,7 @@ const start = async () => {
 
     // The bus consumers (after fill and the planner, which they wake)
     busConsumers.start();
+    busLive.start();
     const onBus = busConsumers.enabled();
     console.log(onBus.length > 0 ? `[bus] On or observing for: ${onBus.join(", ")}` : "[bus] Off (no project sets bus.consume)");
     // Start the tracker (after the planner and the agents, whose events it follows): each syncs in the background,
@@ -1263,6 +1283,9 @@ const start = async () => {
         ? `[infra-monitor] Watching jobs for: ${infraMonitored.join(", ")}`
         : "[infra-monitor] Off (no project sets infra_monitor.enabled)",
     );
+
+    // Start PR health (each project's open PRs and their owners; observe only)
+    console.log(prHealthStartedLine(prHealth.start()));
 
     // Start agent checks (reconcile queued/running from a restart)
     const checking = checks.start();

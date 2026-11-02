@@ -1,17 +1,59 @@
 /**
  * The planner's file access: bounded reads that stay inside configured roots
  * (also once symlinks are resolved), and the atomic write of the tasks file.
- * Opening and reading regular files is fill's code (agents/fill.ts).
+ * (Fill reads its files asynchronously, #245; the planner's reads here are
+ * still synchronous.)
  */
 import { createHash, randomUUID } from "crypto";
-import { closeSync, constants, fsyncSync, lstatSync, openSync, realpathSync, renameSync, unlinkSync, writeSync } from "fs";
+import { closeSync, constants, fstatSync, fsyncSync, lstatSync, openSync, readSync, realpathSync, renameSync, unlinkSync, writeSync } from "fs";
 import { basename, dirname, join, resolve } from "path";
-import { openRegular, readAt } from "../agents/fill.js";
 import { isInside } from "./config.js";
 
 export const sha256 = (text: string) => createHash("sha256").update(text, "utf-8").digest("hex");
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+type Opened = { fd: number; size: number } | { error: string };
+
+/**
+ * Open a regular file for reading. O_NONBLOCK, so a FIFO put in its place
+ * doesn't block the server (it is refused as not a regular file);
+ * `noFollow` refuses a symlink as the last component.
+ */
+function openRegular(path: string, noFollow: boolean): Opened {
+  let fd: number;
+  try {
+    const flags = constants.O_RDONLY | (constants.O_NONBLOCK ?? 0) | (noFollow ? (constants.O_NOFOLLOW ?? 0) : 0);
+    fd = openSync(path, flags);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    return {
+      error: code === "ENOENT" ? "does not exist" : code === "ELOOP" ? "is a symlink" : `cannot be read (${code ?? message(e)})`,
+    };
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) {
+      closeSync(fd);
+      return { error: "is not a regular file" };
+    }
+    return { fd, size: st.size };
+  } catch (e) {
+    closeSync(fd);
+    return { error: `cannot be read (${message(e)})` };
+  }
+}
+
+function readAt(fd: number, position: number, length: number): Buffer {
+  const buffer = Buffer.alloc(length);
+  let done = 0;
+  while (done < length) {
+    const n = readSync(fd, buffer, done, length - done, position + done);
+    if (n === 0) break;
+    done += n;
+  }
+  return done === length ? buffer : buffer.subarray(0, done);
+}
 
 export type ReadResult = { ok: true; text: string; bytes: number; real: string } | { ok: false; reason: string };
 

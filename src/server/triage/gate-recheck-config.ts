@@ -37,8 +37,7 @@ export const GATE_RECHECK_KEYS = {
   max_pending: z.number().int().min(1).max(50).default(3),
 };
 
-const GateRecheckSchema = z.object(GATE_RECHECK_KEYS);
-type RawGateRecheck = z.infer<typeof GateRecheckSchema>;
+type RawGateRecheck = z.infer<z.ZodObject<typeof GATE_RECHECK_KEYS>>;
 
 export interface GateRecheckSettings {
   mode: "off" | "observe" | "act";

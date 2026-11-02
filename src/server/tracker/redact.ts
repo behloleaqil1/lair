@@ -59,14 +59,33 @@ export function makeRedactor(options: RedactorOptions): Redact {
     for (const rule of secretRules) out = out.replace(rule, "[redacted]");
     if (homeRule) out = out.replace(homeRule, "[path]");
     for (const [rule, replacement] of RULES) out = out.replace(rule, replacement);
-    for (const pattern of options.patterns) {
-      pattern.lastIndex = 0;
-      out = out.replace(pattern, "[redacted]");
-    }
+    out = applyPatterns(out, options.patterns);
     // eslint-disable-next-line no-control-regex
     out = out.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, " ").trim();
-    return out.length > max ? `${out.slice(0, Math.max(0, max - 3)).trimEnd()}...` : out;
+    return bound(out, max);
   };
+}
+
+function applyPatterns(text: string, patterns: RegExp[]): string {
+  let out = text;
+  for (const pattern of patterns) {
+    pattern.lastIndex = 0;
+    out = out.replace(pattern, "[redacted]");
+  }
+  return out;
+}
+
+const bound = (text: string, max: number) => (text.length > max ? `${text.slice(0, Math.max(0, max - 3)).trimEnd()}...` : text);
+
+/**
+ * A repository's redactor: `base` (the built-in rules and the project's
+ * patterns), then the repository's own patterns, then the bound. The text is
+ * bounded only after every pattern ran, so a cut never leaves part of a
+ * name the patterns would have caught.
+ */
+export function withPatterns(base: Redact, patterns: RegExp[]): Redact {
+  if (patterns.length === 0) return base;
+  return (text, max) => bound(applyPatterns(base(text, Number.POSITIVE_INFINITY), patterns).trim(), max);
 }
 
 /** One line: newlines become spaces (a title, a field value). */

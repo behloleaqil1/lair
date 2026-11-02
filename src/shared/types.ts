@@ -166,6 +166,12 @@ export interface ProjectConfig {
    */
   infra_monitor?: Record<string, unknown>;
   /**
+   * PR health: open pull requests that conflict, fall behind, get no CI or
+   * go red (src/server/pr-health/). Validated by parsePrHealthConfig; see
+   * docs/configuration.md#pr-health
+   */
+  pr_health?: Record<string, unknown>;
+  /**
    * Agent checks: agents test on a runner before they gate
    * (src/server/checks/). Validated by parseChecksConfig; see
    * docs/configuration.md#checks

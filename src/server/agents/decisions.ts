@@ -217,7 +217,7 @@ export class InboxFileDecisions implements DecisionInbox {
     const file = this.target(decision.project);
     if (!file) return { id, via: "store only (no inbox_file)" };
     try {
-      this.fs.append(file, formatDecision(decision, id, new Date(this.clock.now()).toISOString()));
+      await this.fs.append(file, formatDecision(decision, id, new Date(this.clock.now()).toISOString()));
       return { id, via: `inbox file ${file}` };
     } catch (e) {
       return { id, via: `store only (could not write ${file}: ${e instanceof Error ? e.message : String(e)})` };

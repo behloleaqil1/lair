@@ -170,7 +170,7 @@ export class StepExecutors {
       case "restart_agent":
       case "stop_duplicate": {
         const agent = vars.agent;
-        if (!agent || !view.agentIds().includes(agent)) {
+        if (!agent || !(await view.agentIds()).includes(agent)) {
           return { refused: true, reason: `${agent ?? "(none)"} is not a configured agent` };
         }
         if (!view.isLocalAgent(agent)) {
@@ -181,7 +181,7 @@ export class StepExecutors {
           return { refused: true, reason: `pid ${vars.pid ?? "(none)"} is not a live process of agent ${agent}` };
         }
         if (action === "restart_agent") {
-          const gate = view.waitingOn(agent);
+          const gate = await view.waitingOn(agent);
           if (gate) return { refused: true, reason: `agent ${agent} is WAITING on gate ${gate}` };
         } else if (procs.length < 2 || procs[0].pid === pid) {
           return { refused: true, reason: `pid ${pid} is not a duplicate of agent ${agent}` };
@@ -200,8 +200,8 @@ export class StepExecutors {
         // The claim's recorded pid running as the agent (the detector's rule, claimPidBelongsTo)
         // means the agent is alive though it doesn't match watchdog.agent_command; a reused pid
         // doesn't stop the release
-        const claim = view.claims().find((c) => c.agent === vars.agent);
-        const claimPid = claim ? view.claimPid(claim) : null;
+        const claim = (await view.claims()).find((c) => c.agent === vars.agent);
+        const claimPid = claim ? await view.claimPid(claim) : null;
         if (claim && claimPid !== null && (await view.claimPidIsAgents(claim, claimPid))) {
           return {
             refused: true,

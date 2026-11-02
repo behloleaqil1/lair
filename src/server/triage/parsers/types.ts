@@ -19,6 +19,8 @@ export interface ParseOutput {
   flaky: TestRef[];
   /** Failed tests as the report counts them (its summary line), when it has one */
   failedCount?: number;
+  /** Notes about parsing issues (e.g., pattern timed out) */
+  notes?: string[];
 }
 
 export interface EvidenceParser {
@@ -34,4 +36,25 @@ export interface EvidenceParser {
   detect(text: string, lines: string[]): boolean;
   /** Reads bounded input only (boundedLines(), or the XML reader's caps) */
   parse(text: string, options: ParseOptions): ParseOutput;
+}
+
+/**
+ * Async evidence parser interface. Custom parsers use this to run regex in
+ * worker threads with hard timeouts. Built-in parsers stay sync.
+ */
+export interface AsyncEvidenceParser {
+  /** The parser id (e.g., a custom parser name) */
+  id: string;
+  /** Source type - custom parsers are console parsers */
+  source: "report" | "console";
+  /** Async detect: may run regex in a worker thread */
+  detect(text: string, lines: string[]): Promise<boolean>;
+  /** Async parse: may run regex in worker threads */
+  parse(text: string, options: ParseOptions): Promise<ParseOutput>;
+}
+
+/** Check if a parser is async (has Promise-returning methods) */
+export function isAsyncParser(parser: EvidenceParser | AsyncEvidenceParser): parser is AsyncEvidenceParser {
+  // Custom parsers created with createCustomParser are marked async
+  return (parser as { async?: boolean }).async === true;
 }

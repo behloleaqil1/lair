@@ -255,6 +255,67 @@ describe("bus: messages sent as the owner", () => {
   });
 });
 
+describe("bus: GET /api/bus/activity (Home → Bus's first page)", () => {
+  const SECRET = "only the owner reads this text";
+  const NOTE = "acknowledged with a private note";
+  beforeAll(() => {
+    const store = getBusStore(PROJECT, TMP);
+    const at = Date.parse("2026-03-02T12:00:00.000Z");
+    for (let i = 0; i < 205; i++) store.createReport("worker-z", "run-z", "PROGRESS", "task-z", `step ${i} ${"x".repeat(900)}`, at + i);
+    const id = store.sendMessage("owner", "worker-z", SECRET, 5, at);
+    store.getUnreadMessages("worker-z", at + 1);
+    store.ackMessage(id, "worker-z", NOTE, at + 2);
+  });
+
+  const activity = async (query: string, headers: Record<string, string> = BROWSER) => {
+    const res = await app.inject({ url: `/api/bus/activity${p}${query}`, headers });
+    return { status: res.statusCode, body: res.json() };
+  };
+
+  it("answers at most 200 of each kind, 50 by default, and refuses a limit that is not a whole number from 1", async () => {
+    expect((await activity("&limit=500")).body.data.reports).toHaveLength(200);
+    expect((await activity("&limit=200")).body.data.reports).toHaveLength(200);
+    expect((await activity("&limit=3")).body.data.reports).toHaveLength(3);
+    expect((await activity("")).body.data.reports).toHaveLength(50);
+    for (const bad of ["0", "-1", "abc", "2.5", ""]) {
+      const res = await activity(`&limit=${bad}`);
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe("limit must be a whole number from 1 to 200");
+    }
+  });
+
+  it("cuts a report's summary to 500 characters and gives the newest first", async () => {
+    const [newest] = (await activity("&limit=1")).body.data.reports;
+    expect(newest).toMatchObject({ type: "report", agent: "worker-z", task: "task-z", kind: "PROGRESS" });
+    expect(newest.summary.startsWith("step 204 ")).toBe(true);
+    expect(newest.summary).toHaveLength(500);
+  });
+
+  it("gives message texts and ack notes to the owner's session only; anyone else gets the metadata and state", async () => {
+    const open = await activity("&limit=5");
+    expect(open.body.data.owner).toBe(false);
+    // (the earlier tests' messages are in the same store)
+    expect(open.body.data.messages.filter((m: { to: string }) => m.to === "worker-z")).toEqual([
+      { id: expect.any(String), at: "2026-03-02T12:00:00.000Z", from: "owner", to: "worker-z", state: "acknowledged" },
+    ]);
+    expect(JSON.stringify(open.body)).not.toContain(SECRET);
+    expect(JSON.stringify(open.body)).not.toContain(NOTE);
+
+    const owned = await activity("&limit=5", owner());
+    expect(owned.body.data.owner).toBe(true);
+    expect(owned.body.data.messages.find((m: { to: string }) => m.to === "worker-z")).toMatchObject({ text: SECRET, ackNote: NOTE, state: "acknowledged" });
+  });
+
+  it("answers 404 while the project's bus.consume is off", async () => {
+    busMode = "off";
+    try {
+      expect((await activity("")).status).toBe(404);
+    } finally {
+      busMode = "on";
+    }
+  });
+});
+
 describe("processes: start, stop and restart", () => {
   function supervisorSpies() {
     const supervisor = getSupervisor();

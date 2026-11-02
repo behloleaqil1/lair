@@ -23,7 +23,9 @@ export type TrackerOp =
   | "close_milestone"
   | "reopen_milestone"
   /** The owner asked for a reconcile now (value: the owner session id) */
-  | "sync_requested";
+  | "sync_requested"
+  /** A proposed link: would_link (not made), or made (value: "auto", or "owner <session id>"); in Lair's store only */
+  | "link_issue";
 
 /** A task and the GitHub issue that tracks it */
 export interface TrackerLink {
@@ -60,8 +62,8 @@ export interface TrackerWrite {
   mode: TrackerMode;
   /** observe: what would have been sent (JSON, redacted) */
   wouldSend: string | null;
-  /** would_close: a removed task line whose issue close_removed_tasks (off) would close */
-  result: "success" | "error" | "rate_limited" | "skipped" | "would_send" | "would_close";
+  /** would_close: a removed task line whose issue close_removed_tasks (off) would close; would_link: a proposed link not made (auto_link off, observe mode, or ambiguous) */
+  result: "success" | "error" | "rate_limited" | "skipped" | "would_send" | "would_close" | "would_link";
   error: string | null;
   /** How many times the same observe row was seen (observe rows are kept once) */
   count: number;
@@ -117,6 +119,35 @@ export interface TrackerRemovedTask {
   action: "waiting" | "would_close" | "closing";
 }
 
+/** Why a reconcile proposes an issue for a task */
+export type TrackerLinkReason =
+  /** The open issue's title or body names the task id */
+  | "mentions_task"
+  /** An open PR of the task (its branch ends with the task id, or its body names it) closes the issue */
+  | "pull_closes"
+  /** The issue's title is close to the title Lair would give the task */
+  | "similar_title";
+
+export interface TrackerLinkCandidate {
+  repo: string;
+  issueNumber: number;
+  issueUrl: string;
+  title: string;
+  reasons: TrackerLinkReason[];
+  /** similar_title: the similarity (0 to 1) */
+  score: number | null;
+  /** pull_closes: the PR */
+  pr: number | null;
+}
+
+/** An unlinked task and the issues the last reconcile found for it */
+export interface TrackerLinkProposal {
+  task: string;
+  candidates: TrackerLinkCandidate[];
+  /** would_link: one candidate, waiting for the owner (or auto_link in act mode); ambiguous: more than one candidate, or the issue is proposed for another task too: never linked automatically */
+  action: "would_link" | "ambiguous";
+}
+
 /** GET /api/tracker/status */
 export interface TrackerStatusView {
   project: string;
@@ -136,6 +167,8 @@ export interface TrackerStatusView {
   closedUnmerged: TrackerUnmergedPull[];
   /** Linked tasks whose line left the tasks file and whose issue is still open */
   removedTasks: TrackerRemovedTask[];
+  /** Unlinked tasks and the issues the last reconcile proposes for them (POST /api/tracker/links accepts one) */
+  proposals: TrackerLinkProposal[];
   warnings: string[];
   /** Config errors (the tracker did not start) */
   errors: string[];

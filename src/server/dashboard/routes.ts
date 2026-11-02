@@ -17,7 +17,7 @@
  * default project is used.
  */
 import type { FastifyInstance, FastifyReply } from "fastify";
-import { statSync } from "fs";
+import { statOrNull } from "../services/async-fs.js";
 import { resolve, sep } from "path";
 import { z } from "zod";
 import { rejectCrossSiteRequests } from "../origin.js";
@@ -119,9 +119,9 @@ function inside(dir: string, path: string): boolean {
   return target.startsWith(root.endsWith(sep) ? root : `${root}${sep}`);
 }
 
-function mtimeOf(path: string): number {
+async function mtimeOf(path: string): Promise<number> {
   try {
-    return statSync(path).mtimeMs;
+    return (await statOrNull(path))?.mtimeMs ?? -1;
   } catch {
     return -1;
   }
@@ -139,13 +139,13 @@ export interface FoundGate {
  * runs, then triage), and what is needed for its output; null when none
  * knows it. The dashboard's routes and the supervisor's ops API read it.
  */
-export function lookUpGate(sources: DashboardSources, project: string, id: string): FoundGate | null {
+export async function lookUpGate(sources: DashboardSources, project: string, id: string): Promise<FoundGate | null> {
   const data = sources.data(project);
   const records = tryRead(() => sources.triageRecords?.(project, LOOKUP_LIMIT) ?? [], [] as TriageRecord[]);
   const placement = tryRead(() => sources.placement?.(project) ?? null, null as PlacementStatus | null);
-  const record = data.getGateRecord(id);
+  const record = await data.getGateRecord(id);
   if (record.gate || record.result || record.logPath) {
-    const logText = data.getGateLogText(id);
+    const logText = await data.getGateLogText(id);
     const triage = triageRecordFor(records, [id]);
     const detail = queueGateDetail(project, id, { ...record, logText }, { triage, placement });
     return { detail, triage, logText, run: null };
@@ -162,7 +162,7 @@ export function lookUpGate(sources: DashboardSources, project: string, id: strin
 }
 
 /** A found gate's log tail: a pipeline run's job log, else the queue's log file; null without one. */
-export function gateLogTail(sources: DashboardSources, project: string, id: string, found: FoundGate, lines: number): LogTailView | null {
+export async function gateLogTail(sources: DashboardSources, project: string, id: string, found: FoundGate, lines: number): Promise<LogTailView | null> {
   if (found.run) return pipelineLog(found.run, lines);
   return found.detail.source === "queue" ? sources.data(project).getGateLogTail(id, lines) : null;
 }
@@ -172,17 +172,17 @@ export function gateLogTail(sources: DashboardSources, project: string, id: stri
  * only one inside agents_dir is read) or its launcher's newest log in
  * agents_dir, whichever was written last.
  */
-export function agentLogTail(sources: DashboardSources, project: string, id: string, lines: number): AgentLogView {
+export async function agentLogTail(sources: DashboardSources, project: string, id: string, lines: number): Promise<AgentLogView> {
   const config = sources.config(project);
   const runs = tryRead(() => sources.agentRuns?.(project, LOOKUP_LIMIT) ?? [], [] as AgentRunView[]);
   const run = runs.find((r) => r.agent === id && typeof r.logPath === "string" && inside(config.agents_dir, r.logPath));
   const runPath = run?.logPath ?? null;
-  const dragonPath = sources.data(project).getDragonLogPath(id);
+  const dragonPath = await sources.data(project).getDragonLogPath(id);
   // The newer of the two (a launcher outside Lair may have written since)
-  if (runPath && (!dragonPath || runPath === dragonPath || mtimeOf(runPath) >= mtimeOf(dragonPath))) {
-    return { agent: id, source: "run", runId: run?.id ?? null, log: readLogTail(runPath, lines) };
+  if (runPath && (!dragonPath || runPath === dragonPath || (await mtimeOf(runPath)) >= (await mtimeOf(dragonPath)))) {
+    return { agent: id, source: "run", runId: run?.id ?? null, log: await readLogTail(runPath, lines) };
   }
-  if (dragonPath) return { agent: id, source: "dragon", runId: null, log: readLogTail(dragonPath, lines) };
+  if (dragonPath) return { agent: id, source: "dragon", runId: null, log: await readLogTail(dragonPath, lines) };
   return { agent: id, source: null, runId: null, log: null };
 }
 
@@ -222,7 +222,7 @@ export async function registerDashboardRoutes(
       if (!query.success) return fail(reply, 400, "Invalid query");
       const project = projectOf(query.data);
       try {
-        const found = lookUp(project, request.params.id);
+        const found = await lookUp(project, request.params.id);
         if (!found) return fail(reply, 404, `No gate ${request.params.id} in ${project}: not in the queue, the results, the pipeline runs or triage`);
         return respond<GateDetailView>(found.detail);
       } catch (e) {
@@ -240,10 +240,10 @@ export async function registerDashboardRoutes(
         const project = projectOf(query.data);
         const lines = clampLines(query.data.lines);
         try {
-          const found = lookUp(project, request.params.id);
+          const found = await lookUp(project, request.params.id);
           if (!found) return fail(reply, 404, `No gate ${request.params.id} in ${project}`);
           const id = request.params.id;
-          const log = gateLogTail(sources, project, id, found, lines);
+          const log = await gateLogTail(sources, project, id, found, lines);
           const output: GateOutputView = gateOutput(id, log, found.triage, {
             logText: found.logText,
             failedSteps: found.detail.failedSteps,
@@ -266,7 +266,7 @@ export async function registerDashboardRoutes(
         const lines = clampLines(query.data.lines);
         const id = request.params.id;
         try {
-          return respond(agentLogTail(sources, project, id, lines));
+          return respond(await agentLogTail(sources, project, id, lines));
         } catch (e) {
           request.log.error({ err: e }, "dashboard: an owner read failed");
           return fail(reply, 500, READ_FAILED);

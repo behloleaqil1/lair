@@ -156,18 +156,18 @@ describe("NodeFileSystem", () => {
     dir = null;
   });
 
-  it("reads a tail, stats, lists, and returns null or [] for missing paths", () => {
+  it("reads a tail, stats, lists, and returns null or [] for missing paths", async () => {
     dir = mkdtempSync(join(tmpdir(), "lair-probes-"));
     const fs = new NodeFileSystem();
     writeFileSync(join(dir, "a.log"), "0123456789");
-    expect(fs.read(join(dir, "a.log"))).toBe("0123456789");
-    expect(fs.read(join(dir, "a.log"), 4)).toBe("6789");
-    expect(fs.read(join(dir, "missing"))).toBeNull();
-    expect(fs.stat(join(dir, "missing"))).toBeNull();
-    expect(fs.stat(dir)?.isDirectory).toBe(true);
-    expect(fs.list(dir)).toEqual(["a.log"]);
-    expect(fs.list(join(dir, "missing"))).toEqual([]);
-    fs.append(join(dir, "a.log"), "!");
-    expect(fs.read(join(dir, "a.log"))).toBe("0123456789!");
+    expect(await fs.read(join(dir, "a.log"))).toBe("0123456789");
+    expect(await fs.read(join(dir, "a.log"), 4)).toBe("6789");
+    expect(await fs.read(join(dir, "missing"))).toBeNull();
+    expect(await fs.stat(join(dir, "missing"))).toBeNull();
+    expect((await fs.stat(dir))?.isDirectory).toBe(true);
+    expect(await fs.list(dir)).toEqual(["a.log"]);
+    expect(await fs.list(join(dir, "missing"))).toEqual([]);
+    await fs.append(join(dir, "a.log"), "!");
+    expect(await fs.read(join(dir, "a.log"))).toBe("0123456789!");
   });
 });
