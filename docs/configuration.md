@@ -3271,7 +3271,7 @@ No one module owns `repos:`, so an edit to it reloads every module of the projec
 
 ## PR health
 
-PR health reads the open pull requests of each repository in [`repos:`](#repositories) and finds the ones that went bad: `conflicts` (the host says the PR can't merge into its base), `behind` (more than `behind_threshold` commits behind the base), `no_ci` (no check has run at the head of a non-draft PR for `no_ci_minutes`) and `ci_red` (the newest run of a check at the head failed). `no_ci` and `ci_red` need the repository's `ci_counts`. Design: [docs/design/pr-health.md](design/pr-health.md).
+PR health reads the open pull requests of each repository in [`repos:`](#repositories) and finds the ones that went bad: `conflicts` (the host says the PR can't merge into its base), `behind` (more than `behind_threshold` commits behind the base), `no_ci` (no check has run at the head of a non-draft PR for `no_ci_minutes`) and `ci_red` (the newest run of a check at the head failed). `no_ci` and `ci_red` need the repository's `ci_counts` and its `pr_health.repos.<owner/name>.ci_signal`. Design: [docs/design/pr-health.md](design/pr-health.md).
 
 It is off unless a project sets `pr_health.enabled: true`, and it starts in **observe** mode: it emits events and serves a read-only status (`GET /api/pr-health/status?project=`), and writes nothing. In **act** mode it also sends the owning agent one note per problem and withdraws it once the problem clears, and raises a Decision Inbox notice only when nobody owns the PR or a note could not be delivered (see Act mode below). Startup logs `[pr-health] Watching PRs for: …` or `[pr-health] Off (no project sets pr_health.enabled)`, and a changed `pr_health:`, `review:` or `repos:` reloads it without a restart.
 
@@ -3282,6 +3282,9 @@ pr_health:
   interval_seconds: 300
   ignored_prs: [example/app#7]
   ignored_branches: ["dependabot/**"]
+  repos:
+    example/app: { ci_signal: false }   # its hosted CI is not the merge signal: no no_ci or ci_red
+  owner: { rule: branch_first }
   notify_cmd: ["/opt/lair-hooks/agent-note", "{agent}", "{id}", "{message}"]
   withdraw_cmd: ["/opt/lair-hooks/agent-unnote", "{agent}", "{id}", "{message}"]
 ```
@@ -3300,7 +3303,9 @@ pr_health:
 | `kinds.{conflicts,behind,no_ci,ci_red}` | boolean | `true` | Turn a kind off |
 | `ignored_prs` | list | `[]` | `owner/name#N` of a listed repository, at most 200 |
 | `ignored_branches` | list | `["dependabot/**"]` | Head branch globs (`*` within one segment, `**` across, `?`), at most 50 |
-| `owner.branch_window_minutes` | integer | `360` | 0-10080: how recent a head commit must be for the owner rule's branch step (0: no branch step) |
+| `repos.<owner/name>.ci_signal` | boolean | `true` | `false`: the repository's hosted CI is not its merge signal (for example, another gate decides), so PR health raises no `no_ci` or `ci_red` for it and reads no checks; `conflicts` and `behind` are still found. Unlike `repos[].ci_counts: false`, the ready guard still checks CI. The repository must be listed in `repos:` |
+| `owner.rule` | `task_line` \| `branch_first` | `task_line` | Which owner rule names a PR's owner (see Owner below) |
+| `owner.branch_window_minutes` | integer | `360` | 0-10080: how recent a head commit must be for the `task_line` rule's branch step (0: no branch step); `branch_first` does not use it |
 | `notify_cmd`, `withdraw_cmd` | argv \| null | `null` | The commands that send a note and withdraw one (act mode); placeholders `{agent}`, `{repo}`, `{pr}`, `{head}` (8 hex), `{kinds}` (comma-separated), `{id}` (the delivery id) and `{message}` (one line, at most 500 characters) only. `withdraw_cmd: null` marks a withdrawal `skipped` |
 | `command_timeout_seconds` | integer | `30` | 1-300; a command that does not exit in time is killed with its process group and counts as failed |
 | `max_attempts` | integer | `3` | 1-5 attempts per note or withdrawal |
@@ -3314,6 +3319,8 @@ pr_health:
 **Failures.** Each repository is read on its own: a timeout, a rate-limit answer or any host error stops that repository for the tick and keeps its findings exactly as they were (nothing is cleared, and nothing is found again when it recovers); its state is `error`, and `pr_health.repo_error` is emitted once when an error streak starts. The request budget and the deadline stop a repository the same way, with `partial` in the status and the unread PRs first next tick.
 
 **Owner.** After each tick, every (repository, PR, head) with a finding gets an owner from fill's last check (in memory; no file is read). The owner is the agent of the latest open task line (`started`, `claimed` or `held`) whose name or description names the PR: `app#42`, `app PR #42`, `example/app#42`, or a bare `PR #42` / `#42`, which means the line's `repo:owner/name` repository, else the default. Done, malformed, not-allowlisted and unassigned lines never name one. If no line does, and `owner.branch_window_minutes` is above 0, the owner is the one agent the head branch maps to through `review.authors.branch_pattern` and `review.authors.branches`, if that agent has an open line and the head commit's committer date is inside the window (read once per head). Otherwise nobody owns it, with the reason. With no agents module or fill off nobody owns any PR; before fill's first check the owner is unknown.
+
+With `owner.rule: branch_first` every PR has an owner, found in this order: (1) the one agent the head branch maps to through `review.authors.branch_pattern` and `review.authors.branches`, with no window and no open task line needed (`source: branch`); (2) else the author the review module registered for the PR, for the review repository only (`source: review`); (3) else the latest open task line naming the PR, as above (`source: task_line`; before fill's first check the owner is unknown); (4) else the host account that opened the PR (`source: pr_author`), which gets the note like any owner. Nobody owns it only when the host gives no PR author, or one that is not a host account name.
 
 **Status.** `GET /api/pr-health/status?project=` shows each repository (`state`, `partial`, `truncated`, skipped PRs with why), each finding with its owner, and `planned`: what act mode would do now, a note per owned (repository, PR, head) with the argv `notify_cmd` would run, and a `no_owner` notice per unowned one (an unknown owner plans nothing). The note's text uses Lair's words and counts only, never a branch name, check name or PR title.
 
