@@ -8,11 +8,12 @@
  * - a line names it when its task id is the result's branch, the branch's
  *   last path segment (`<prefix>/<task>`) or the result's pipeline (track),
  *   or when its description has the branch as a whole word;
- * - only some of these show who wrote the branch: the whole branch, the
- *   description, or the last segment when an earlier segment is the line's
- *   own agent (`kiro/<agent>/<task>`, `<agent>/<task>`). The last segment
- *   alone or the pipeline alone (a line `e2e` would name every e2e failure;
- *   a held line `fix-login` would name `other/fix-login` after a takeover)
+ * - only some of these show who wrote the branch: the whole branch, or the
+ *   last segment when an earlier segment is the line's own agent
+ *   (`kiro/<agent>/<task>`, `<agent>/<task>`). The last segment alone, the
+ *   pipeline alone (a line `e2e` would name every e2e failure; a held line
+ *   `fix-login` would name `other/fix-login` after a takeover) or the
+ *   description (a review line "review kiro/a/fix-login" is not its author)
  *   count as naming the result, so they make a match ambiguous, but never
  *   pick an author on their own;
  * - a line is open when it has an agent and a task and fill's last check
@@ -48,9 +49,9 @@ export interface AuthorLine {
   task: string;
   /**
    * How the line names the result: `branch` (the whole branch), `agent_branch`
-   * (the last segment, with the line's agent as an earlier one) and
-   * `description` show its author; `segment` (the last segment only) and
-   * `pipeline` don't, so they never pick an author alone.
+   * (the last segment, with the line's agent as an earlier one) show its
+   * author; `description`, `segment` (the last segment only) and `pipeline`
+   * don't, so they never pick an author alone.
    */
   by: "branch" | "agent_branch" | "description" | "segment" | "pipeline";
 }
@@ -59,13 +60,13 @@ export interface AuthorLine {
 export const NAMED_BY: Record<AuthorLine["by"], string> = {
   branch: "branch",
   agent_branch: "agent and task in the branch",
-  description: "description",
+  description: "description only",
   segment: "branch's last segment only",
   pipeline: "pipeline only",
 };
 
 /** The ways of naming a result that show who wrote the branch */
-const SHOWS_AUTHOR: ReadonlySet<AuthorLine["by"]> = new Set(["branch", "agent_branch", "description"]);
+const SHOWS_AUTHOR: ReadonlySet<AuthorLine["by"]> = new Set(["branch", "agent_branch"]);
 
 export type AuthorMatch =
   | { kind: "one"; author: AuthorLine }
@@ -81,7 +82,7 @@ const BRANCH_CHAR = /[A-Za-z0-9._/-]/;
 function inside(file: string, dir: string): boolean {
   let root: string;
   try {
-    root = realpathSync(resolve(dir));
+    root = realpathSync.native(resolve(dir));
   } catch {
     root = resolve(dir);
   }
@@ -89,13 +90,15 @@ function inside(file: string, dir: string): boolean {
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
-/** Whether `text` has `word` with no branch character right before or after it. */
+/** Whether `text` has `word` with no branch character right before or after it (a sentence's closing "." is not one). */
 function namesWord(text: string, word: string): boolean {
   let at = text.indexOf(word);
   while (at >= 0) {
     const before = at > 0 ? text[at - 1] : "";
-    const after = text[at + word.length] ?? "";
-    if (!BRANCH_CHAR.test(before) && !BRANCH_CHAR.test(after)) return true;
+    const end = at + word.length;
+    const after = text[end] ?? "";
+    const closing = after === "." && !BRANCH_CHAR.test(text[end + 1] ?? "");
+    if (!BRANCH_CHAR.test(before) && (closing || !BRANCH_CHAR.test(after))) return true;
     at = text.indexOf(word, at + 1);
   }
   return false;
@@ -138,7 +141,8 @@ export function findExternalAuthor(view: FillStatusView | null, repo: string, su
   if (!view.tasksFile) return { kind: "unavailable", detail: "agents.fill has no tasks file" };
   let file: string;
   try {
-    file = realpathSync(view.tasksFile);
+    // native: the path's real case too, so a case-insensitive file system can't put it "outside" the repository
+    file = realpathSync.native(view.tasksFile);
   } catch {
     return { kind: "unavailable", detail: "agents.fill's tasks file cannot be read" };
   }

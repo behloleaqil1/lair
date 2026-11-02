@@ -322,8 +322,10 @@ describe("matchAuthorLines and findExternalAuthor", () => {
     expect(matchAuthorLines([line(1, "worker-a", "fix-login", "held")], { branch: "kiro/worker-b/fix-login", pipelineId: "p" })[0]?.by).toBe("segment");
     expect(matchAuthorLines([line(1, "worker-a", "backend", "held")], subject)[0]?.by).toBe("pipeline");
     expect(matchAuthorLines([line(1, "worker-a", "t1", "held", "on team/fix-login, then review")], subject)[0]?.by).toBe("description");
+    expect(matchAuthorLines([line(1, "worker-a", "t1", "held", "Fix the bug on team/fix-login.")], subject)[0]?.by).toBe("description");
     // Part of a longer name is not the branch
     expect(matchAuthorLines([line(1, "worker-a", "t1", "held", "on team/fix-login-2")], subject)).toEqual([]);
+    expect(matchAuthorLines([line(1, "worker-a", "t1", "held", "on team/fix-login.v2")], subject)).toEqual([]);
     expect(matchAuthorLines([line(1, "worker-a", "login", "held")], subject)).toEqual([]);
     // A bare branch name is never read from a description
     expect(matchAuthorLines([line(1, "worker-a", "t1", "held", "fix the bug")], { branch: "fix", pipelineId: "p" })).toEqual([]);
@@ -347,6 +349,8 @@ describe("matchAuthorLines and findExternalAuthor", () => {
       kind: "one",
       author: { agent: "worker-a", by: "agent_branch" },
     });
+    // A description alone (a review line) names it but is not its author
+    expect(findExternalAuthor(fillView(file, [line(1, "worker-b", "review-login", "started", "review team/fix-login (PR 12)")]), repo, subject, NOW).kind).toBe("none");
     // A strong match plus a pipeline-only one is ambiguous
     const both = [line(1, "worker-a", "fix-login", "held"), line(2, "worker-b", "backend", "started")];
     expect(findExternalAuthor(fillView(file, both), repo, { branch: "worker-a/fix-login", pipelineId: "backend" }, NOW).kind).toBe("ambiguous");
