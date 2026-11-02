@@ -19,6 +19,11 @@
  * proposals are applied (act mode, ops without approval: always) or wait for
  * the owner, in the Planner view and as one Decision Inbox item per run.
  * Cycles and the owner's actions run one at a time.
+ *
+ * The guards (planner.guards, AI spend's G6) keep runs to what can apply:
+ * closed work leaves the context, an owner message a closed task carried out
+ * is handled, a run on unchanged inputs is skipped, and a tasks-file change
+ * during a run is kept with each proposal checked against it (D7).
  */
 import { randomUUID } from "crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "fs";
@@ -32,6 +37,8 @@ import type {
   BlockedView,
   ChangeSource,
   ChangeView,
+  HandledMessageView,
+  OwnerMessageStateView,
   PlannerOverviewView,
   PlannerRunView,
   PlannerStatusView,
@@ -46,9 +53,13 @@ import type {
 import type { DecisionProducer, DecisionResolution, RaiseDecisionInput } from "../decisions/types.js";
 import { buildPrompt, checkDone, MAX_TASKS_FILE_BYTES, QueueLines, queueWindowEnd, type DoneCheck } from "../agents/fill.js";
 import { extractBusId, mirroredReport, type BusLineSource } from "../bus/consumers.js";
-import { doneLineMatches, fillPatternFor } from "../agents/config.js";
+import { anyAgentPatternFor, doneLineMatches, fillPatternFor } from "../agents/config.js";
+import type { ModuleGuard } from "../agents/service.js";
 import { utcStamp } from "../agents/sessions.js";
-import { isActive, type QueueMark } from "../agents/types.js";
+import { isActive, isValidTaskId, type QueueMark } from "../agents/types.js";
+import type { SpendGuardId } from "../../shared/agents-types.js";
+import { NO_SOURCE_REPOS, parseReadyReport } from "../ready-guard/guard.js";
+import { parseReposConfig } from "../repos/config.js";
 import { getPromptsDir } from "../routes/controls.js";
 import { loadKnownDragons } from "../services/dragon-registry.js";
 import type { PlannerAgents } from "./agents.js";
@@ -56,7 +67,18 @@ import { classifyBlocked } from "./blocked.js";
 import type { OwnerSourceSettings, PlannerSettings, PlanSourceSettings, QueueSourceSettings } from "./config.js";
 import { buildContext, plannerSection } from "./context.js";
 import { clean, readTasksFile, sha256, writeTasksFile } from "./files.js";
-import { checkProposals, isOp, PROPOSAL_FILE, readProposalFile, type CheckContext } from "./proposals.js";
+import {
+  closedWork,
+  contextClosed,
+  inputsHash,
+  MAX_MERGED_PRS,
+  openTriggers,
+  ownMergedPr,
+  type ContextClosed,
+  type MergedPr,
+  type PlannerPrs,
+} from "./guards.js";
+import { checkProposals, isOp, PROPOSAL_FILE, readProposalFile, type CheckContext, type CheckedProposal } from "./proposals.js";
 import {
   namesTask,
   readOwnerMessages,
@@ -119,6 +141,64 @@ const BASELINE = "baseline";
 const BUS_APPLIED = "bus_applied";
 const MAX_BUS_APPLIED = 2000;
 
+// G6, the planner guards (docs/design/ai-spend.md §4.5)
+/** Per task: the PR its own DONE line names (the newest line), read as the ready guard reads it */
+const TASK_PRS = "task_prs";
+const MAX_TASK_PRS = 2000;
+/** Per planner run: the owner-message ids of its context (the only ones from_message may name) */
+const RUN_MESSAGES = "run_messages";
+const MAX_RUN_MESSAGES = 20;
+/** Per proposal with from_message, until it is decided and its task closes: the message it carries out */
+const MESSAGE_LINKS = "message_links";
+const MAX_MESSAGE_LINKS = 1000;
+/** Owner messages recorded as handled, by id */
+const HANDLED = "handled_messages";
+const MAX_HANDLED = 1000;
+/** Per planner run: the hash of its inputs (skip_unchanged) */
+const RUN_HASHES = "run_hashes";
+const MAX_RUN_HASHES = 200;
+/** The active run's change to the tasks file (recheck_on_change): kept (act), or the changed text (observe) */
+const RECHECK = "recheck_edit";
+/** Per guard: the streak its last notice was about (one notice per streak) */
+const GUARD_STREAKS = "guard_streaks";
+/** The notice's evidence codes (class planner.guard_notice) */
+type GuardNoticeCode = "would_skip" | "would_apply" | "tasks_file_kept";
+
+interface MessageLink {
+  message: string;
+  task: string;
+  run: string;
+  at: number;
+}
+
+interface HandledRecord {
+  task: string | null;
+  at: number;
+  by: "lair" | "owner";
+  proposal: string | null;
+}
+
+interface RecheckEdit {
+  run: string;
+  /** act: the edit was kept, and the run's proposals are checked against it */
+  kept: boolean;
+  /** observe: the text the edit left (the file was put back), to count what act would have applied */
+  text?: string;
+}
+
+const handledView = (id: string, record: HandledRecord): HandledMessageView => ({
+  id,
+  task: record.task,
+  at: new Date(record.at).toISOString(),
+  by: record.by,
+});
+
+/** Keep the newest `max` entries of a record (insertion order: the newest last). */
+function newest<T>(record: Record<string, T>, max: number): Record<string, T> {
+  const entries = Object.entries(record);
+  return entries.length > max ? Object.fromEntries(entries.slice(-max)) : record;
+}
+
 interface Known {
   hash: string;
   text: string;
@@ -165,6 +245,8 @@ export interface PlannerServiceOptions {
   decisions: () => DecisionProducer | null;
   /** The project's bus (bus.consume observe or on; read at each cycle), or null: queue lines only */
   bus?: () => BusLineSource | null;
+  /** The review store's merged PRs (planner.guards.prefilter_closed); without it no PR counts as merged */
+  prs?: PlannerPrs;
 }
 
 function withReadiness(tasks: PlanTask[]): PlanTaskView[] {
@@ -199,6 +281,7 @@ export class PlannerService {
   private idle: string[] = [];
   private messages: OwnerMessage[] = [];
   private bus?: () => BusLineSource | null;
+  private prs?: PlannerPrs;
   /** cycleSoon's cycle after the one in progress */
   private again: Promise<void> | null = null;
   /** stop() ran: events start no cycle */
@@ -211,6 +294,7 @@ export class PlannerService {
     this.store = options.store;
     this.agents = options.agents;
     this.bus = options.bus;
+    this.prs = options.prs;
     this.clock = options.clock;
     this.events = options.events;
     this.decisions = options.decisions;
@@ -311,6 +395,8 @@ export class PlannerService {
     const baseline = this.state<boolean>(BASELINE) !== true;
     await this.onEvents(doc, settled, queue?.events ?? [], now);
     this.markApplied(queue?.events ?? []);
+    if (this.settings.guards.prefilterClosed !== "off") this.notePrLines(queue?.events ?? [], doc);
+    if (this.settings.guards.handledMessages !== "off") await this.followMessages(doc, settled, now);
     this.collect(doc, settled, plan.hashes, this.messages, baseline, now);
     this.doc = doc;
     this.setState(BASELINE, true);
@@ -482,7 +568,40 @@ export class PlannerService {
     }
     if (known.hash === doc.hash) return doc;
     const diff = diffTexts(known.text, doc.text);
+    const recheck = this.settings.guards.recheckOnChange;
+    if (active && this.writes && recheck === "act") {
+      // D7: the edit is kept and recorded, and each of the run's proposals is checked against the file when it ends
+      active.tampered = true;
+      this.store.saveRun(active);
+      this.setState(RECHECK, { run: active.id, kept: true } satisfies RecheckEdit);
+      this.store.addChange({
+        project: this.project,
+        at: now,
+        source: "external",
+        outcome: "applied",
+        op: "edit",
+        reason: `edited outside Lair while planner run ${short(active.id)} was active: kept (planner.guards.recheck_on_change: act); each of the run's proposals is checked against the file as it is when the run ends`,
+        diff,
+        runId: active.id,
+      });
+      this.setState(KNOWN, { hash: doc.hash, text: doc.text } satisfies Known);
+      await this.guardNotice("planner_recheck_on_change", `run:${active.id}`, {
+        title: `The tasks file changed while planner run ${short(active.id)} was active: Lair kept the change`,
+        context: [
+          "Lair kept this change and recorded it with its diff (Planner view, history). Each of the run's proposals is checked against the file as it is when the run ends; the ones still valid go on as usual, the rest are refused one by one with the reason.",
+          "",
+          ...diff.slice(0, 40).map((line) => `    ${line}`),
+          "",
+          "Only Lair should write the tasks file while a planner run is active. If the planner agent made this change, restore the file from the history.",
+        ].join("\n"),
+        code: "tasks_file_kept",
+        facts: { run: active.id, lines_changed: diff.length },
+      });
+      return doc;
+    }
     if (active && this.writes) {
+      // observe: today's path below puts the file back; what act would have kept is remembered to count against it
+      if (recheck === "observe") this.setState(RECHECK, { run: active.id, kept: false, text: doc.text } satisfies RecheckEdit);
       const restored = writeTasksFile(this.settings.tasksFile, known.text, doc.hash, MAX_TASKS_FILE_BYTES);
       active.tampered = true;
       this.store.saveRun(active);
@@ -825,11 +944,12 @@ export class PlannerService {
   private collect(doc: TasksDoc, settled: Set<string>, hashes: Map<string, string>, messages: OwnerMessage[], baseline: boolean, now: number): void {
     const seen = this.state<string[]>(SEEN) ?? [];
     const seenSet = new Set(seen);
+    const handled = this.handledIds();
     for (const m of messages) {
       if (seenSet.has(m.id)) continue;
       seenSet.add(m.id);
       seen.push(m.id);
-      if (!baseline) this.addTrigger("owner_message", now, { task: null, detail: `owner message [${m.id}]: ${m.text}` });
+      if (!baseline && !handled.has(m.id)) this.addTrigger("owner_message", now, { task: null, detail: `owner message [${m.id}]: ${m.text}` });
     }
     this.setState(SEEN, seen.slice(-MAX_SEEN_MESSAGES));
 
@@ -906,7 +1026,38 @@ export class PlannerService {
   private async startRun(doc: TasksDoc, now: number): Promise<void> {
     const agent = this.settings.agent;
     if (!agent) return;
-    const triggers = this.state<TriggerView[]>(TRIGGERS) ?? [];
+    const pending = this.state<TriggerView[]>(TRIGGERS) ?? [];
+    const guards = this.settings.guards;
+    // G6 prefilter_closed: closed work (a done id, a task whose own PR merged) leaves the context in act mode
+    let triggers = pending;
+    let openTasks = this.planTasks.filter((t) => !t.done);
+    let closed: ContextClosed | null = null;
+    let dropped: { tasks: [string, string][]; triggers: number } | null = null;
+    if (guards.prefilterClosed !== "off") {
+      const merged = this.mergedPrs();
+      const ids = [...openTasks.flatMap((t) => (t.id === null ? [] : [t.id])), ...pending.flatMap((t) => (t.task === null ? [] : [t.task]))];
+      const found = closedWork(ids, doc.done, this.ownMerged(merged));
+      const kept = openTasks.filter((t) => t.id === null || !found.tasks.has(t.id));
+      const keptTriggers = openTriggers(pending, found);
+      const tasks = openTasks.flatMap((t): [string, string][] => (t.id !== null && found.tasks.has(t.id) ? [[t.id, found.tasks.get(t.id) ?? ""]] : []));
+      if (tasks.length > 0 || keptTriggers.length < pending.length) dropped = { tasks, triggers: pending.length - keptTriggers.length };
+      if (guards.prefilterClosed === "act") {
+        openTasks = kept;
+        triggers = keptTriggers;
+        closed = contextClosed(found, merged);
+      }
+    }
+    // G6 handled_messages: a handled owner message is left out
+    const messages = this.openMessages();
+    const blocked = this.blockedViews().filter((b) => !b.task.startsWith("?"));
+    // G6 skip_unchanged: the inputs of the last finished run that gave nothing applicable
+    let hash: string | null = null;
+    let unchanged: StoredRun | null = null;
+    if (guards.skipUnchanged.mode !== "off") {
+      hash = inputsHash({ tasksText: doc.text, openTasks, messages, blocked, closed, allowlist: this.settings.allowlist, idle: this.idle });
+      unchanged = this.unchangedRun(hash, now);
+      if (unchanged && guards.skipUnchanged.mode === "act") return this.skipRun(hash, unchanged, pending, now);
+    }
     const id = randomUUID();
     const task = `planner-${utcStamp(now)}-${id.slice(0, 6)}`;
     const dir = join(this.settings.workDir, id);
@@ -959,19 +1110,29 @@ export class PlannerService {
       allowlist: this.settings.allowlist,
       idleAgents: this.idle,
       doc,
-      openTasks: this.planTasks.filter((t) => !t.done),
+      openTasks,
       events: this.state<QueueEvent[]>(RECENT) ?? [],
-      messages: this.messages,
-      blocked: this.blockedViews().filter((b) => !b.task.startsWith("?")),
+      messages,
+      blocked,
+      closed,
       maxBytes: this.settings.contextMaxBytes,
     };
+    const section = (bundle: ReturnType<typeof buildContext>) =>
+      plannerSection({
+        runId: id,
+        proposalFile,
+        maxProposals: agent.maxProposals,
+        context: bundle,
+        fromMessage: guards.handledMessages !== "off",
+        closed: closed !== null,
+      });
     let context = buildContext(input);
-    let prompt = `${template.text}\n\n${plannerSection({ runId: id, proposalFile, maxProposals: agent.maxProposals, context })}`;
+    let prompt = `${template.text}\n\n${section(context)}`;
     if (prompt.length > PROMPT_LIMIT) {
       const room = PROMPT_LIMIT - template.text.length - 4000;
       if (room < 4096) return fail(`the planner agent's prompt template is too long (${template.text.length} characters)`);
       context = buildContext({ ...input, maxBytes: room });
-      prompt = `${template.text}\n\n${plannerSection({ runId: id, proposalFile, maxProposals: agent.maxProposals, context })}`;
+      prompt = `${template.text}\n\n${section(context)}`;
     }
     try {
       writeFileSync(join(dir, "context.json"), context.json, { mode: 0o600 });
@@ -980,6 +1141,7 @@ export class PlannerService {
     }
     // Recorded before the request: after a restart its agent run is found by task id
     this.store.insertRun(run);
+    await this.guardsAtStart(run, context.json, { hash, unchanged, dropped });
     try {
       const view = await this.agents.requestRun(this.project, { agent: agent.id, task, prompt }, { origin: "planner" });
       run.agentRunId = view.id;
@@ -996,8 +1158,382 @@ export class PlannerService {
     await this.emit("planner.run_started", { runId: id, agentRunId: run.agentRunId, triggers: triggers.map((t) => t.kind) });
   }
 
+  // ============ G6: THE PLANNER GUARDS (docs/design/ai-spend.md §4.5) ============
+
+  /** The review store's merged PRs (none without it, or when it can't be read). */
+  private mergedPrs(): MergedPr[] {
+    try {
+      return this.prs?.mergedPrs(this.project, MAX_MERGED_PRS) ?? [];
+    } catch (e) {
+      console.warn(`[planner] ${this.project}: the merged PRs could not be read: ${message(e)}`);
+      return [];
+    }
+  }
+
+  /** Why a task's own PR counts as merged (by its branch, or the PR its own DONE line names), or null. */
+  private ownMerged(merged: MergedPr[]): (task: string) => string | null {
+    const prs = this.state<Record<string, number>>(TASK_PRS) ?? {};
+    return ownMergedPr(merged, (task) => (Object.hasOwn(prs, task) ? prs[task] : null));
+  }
+
+  /**
+   * prefilter_closed: the PR a new queue line names as its task's own report, kept per task. A line is a task's own
+   * DONE line as fill reads it (done_pattern, by any agent; a bus report by its kind and task), and its PR is read as
+   * the ready guard reads it. A PR of another repository than the review module's is not one review.db records.
+   */
+  private notePrLines(events: QueueEvent[], doc: TasksDoc): void {
+    const named = events.filter((e) => /#\d/.test(e.text));
+    if (named.length === 0) return;
+    const repos = parseReposConfig(this.config);
+    const listed = repos.ok && repos.repos.length > 0;
+    const reviewRepo = ((this.config.review as { repo?: unknown } | undefined)?.repo ?? this.config.github) as unknown;
+    const own = listed && typeof reviewRepo === "string" ? reviewRepo.toLowerCase() : null;
+    const known = new Set<string>([...doc.tasks.map((t) => t.task), ...doc.done.keys(), ...this.planTasks.flatMap((t) => (t.id === null ? [] : [t.id]))]);
+    const prs = this.state<Record<string, number>>(TASK_PRS) ?? {};
+    let changed = false;
+    for (const event of named) {
+      for (const task of this.doneLineTasks(event, known)) {
+        const text = findTask(doc, task)?.description ?? this.planTasks.find((t) => t.id === task)?.text ?? "";
+        const parsed = parseReadyReport(event.text, text, listed && repos.ok ? repos.repos : NO_SOURCE_REPOS, !(listed && repos.ok && repos.from === "repos"));
+        if (parsed.kind !== "pr" || (own !== null && parsed.report.repo.toLowerCase() !== own)) continue;
+        delete prs[task];
+        prs[task] = parsed.report.pr;
+        changed = true;
+      }
+    }
+    if (changed) this.setState(TASK_PRS, newest(prs, MAX_TASK_PRS));
+  }
+
+  /** The tasks a queue line is the own DONE line of (fill's done_pattern for the task, by any agent). */
+  private doneLineTasks(event: QueueEvent, known: Set<string>): string[] {
+    if (event.busId !== undefined) return event.type === "DONE" && event.task !== null && isValidTaskId(event.task) ? [event.task] : [];
+    const out: string[] = [];
+    for (const task of known) {
+      if (!namesTask(event.text, task)) continue;
+      let pattern: ReturnType<typeof anyAgentPatternFor> = null;
+      try {
+        pattern = anyAgentPatternFor(this.settings.fillPatterns.donePattern, task);
+      } catch {
+        continue;
+      }
+      // A done_pattern that names no task (it matches by agent): the line's own DONE keyword and task
+      const own = pattern ? doneLineMatches(pattern, event.text) : event.type === "DONE" && event.task === task;
+      if (own) out.push(task);
+    }
+    return out;
+  }
+
+  /** Owner messages for a run's context: the handled ones are left out (handled_messages on). */
+  private openMessages(): OwnerMessage[] {
+    if (this.settings.guards.handledMessages === "off") return this.messages;
+    const handled = this.handledIds();
+    return this.messages.filter((m) => !handled.has(m.id));
+  }
+
+  private handledIds(): Set<string> {
+    if (this.settings.guards.handledMessages === "off") return new Set();
+    return new Set(Object.keys(this.state<Record<string, HandledRecord>>(HANDLED) ?? {}));
+  }
+
+  /**
+   * skip_unchanged: the last finished run with these inputs, when it ended with nothing applicable (no proposal
+   * applied or waiting). A run that failed (its agent didn't complete) is no evidence. None once max_skip_hours have
+   * passed since the last run.
+   */
+  private unchangedRun(hash: string, now: number): StoredRun | null {
+    const lastRun = this.state<number>(LAST_RUN);
+    if (lastRun !== null && now - lastRun >= this.settings.guards.skipUnchanged.maxSkipMs) return null;
+    const hashes = this.state<Record<string, string>>(RUN_HASHES) ?? {};
+    for (const run of this.store.listRuns(this.project, MAX_RUN_HASHES)) {
+      if (run.state === "running" || hashes[run.id] !== hash) continue;
+      if (run.state !== "done") return null;
+      return this.store.runProposals(run.id).some((p) => p.status === "applied" || p.status === "pending") ? null : run;
+    }
+    return null;
+  }
+
+  /** skip_unchanged act: no planner run; the triggers are consumed. */
+  private async skipRun(hash: string, earlier: StoredRun, triggers: TriggerView[], now: number): Promise<void> {
+    this.setState(TRIGGERS, []);
+    const prefix = hash.slice(0, 12);
+    await this.emit("planner.skipped", { hash: prefix, earlierRunId: earlier.id, triggers: triggers.map((t) => t.kind) });
+    await this.guardEvent("guard_did", {
+      guard: "planner_skip_unchanged",
+      verdict: "skip",
+      subject: earlier.id,
+      summary: `planner_skip_unchanged: no planner run: its inputs (${prefix}) are those of run ${short(earlier.id)}, which gave nothing applicable`,
+      evidence: [`inputs ${prefix}`, `earlier run ${earlier.id}: ${clean(earlier.detail, 200)}`, `triggers: ${triggers.map((t) => t.kind).join(", ") || "none"}`],
+      data: { hash: prefix, earlier_run: earlier.id, triggers: triggers.length },
+      dedupeKey: `guard_did:planner_skip_unchanged:${earlier.id}:${now}`,
+    });
+  }
+
+  /** At a run's start: its inputs' hash and context messages, and what prefilter_closed and skip_unchanged found. */
+  private async guardsAtStart(
+    run: StoredRun,
+    contextJson: string,
+    found: { hash: string | null; unchanged: StoredRun | null; dropped: { tasks: [string, string][]; triggers: number } | null },
+  ): Promise<void> {
+    const guards = this.settings.guards;
+    if (found.hash !== null) {
+      this.setState(RUN_HASHES, newest({ ...(this.state<Record<string, string>>(RUN_HASHES) ?? {}), [run.id]: found.hash }, MAX_RUN_HASHES));
+    }
+    if (guards.handledMessages !== "off") {
+      let ids: string[] = [];
+      try {
+        const bundle = JSON.parse(contextJson) as { ownerMessages?: { id?: unknown }[] };
+        ids = (bundle.ownerMessages ?? []).flatMap((m) => (typeof m.id === "string" ? [m.id] : []));
+      } catch {
+        // Not JSON: no message can be named
+      }
+      this.setState(RUN_MESSAGES, newest({ ...(this.state<Record<string, string[]>>(RUN_MESSAGES) ?? {}), [run.id]: ids }, MAX_RUN_MESSAGES));
+    }
+    const dropped = found.dropped;
+    if (dropped && guards.prefilterClosed !== "off") {
+      const act = guards.prefilterClosed === "act";
+      const ids = dropped.tasks.map(([id]) => id);
+      const evidence = [
+        ...dropped.tasks.slice(0, 20).map(([id, why]) => `${id}: ${why}`),
+        ...(dropped.tasks.length > 20 ? [`and ${dropped.tasks.length - 20} more`] : []),
+        ...(dropped.triggers > 0 ? [`${dropped.triggers} trigger(s) about closed tasks`] : []),
+      ];
+      const recorded = await this.guardEvent(act ? "guard_did" : "guard_would", {
+        guard: "planner_prefilter_closed",
+        verdict: act ? "skip" : "would_skip",
+        subject: run.id,
+        summary: `planner_prefilter_closed${act ? "" : " (observe)"}: ${dropped.tasks.length} closed task(s) and ${dropped.triggers} trigger(s) ${act ? "left out of" : "would leave"} planner run ${short(run.id)}'s context`,
+        evidence,
+        data: { tasks: ids.slice(0, 50), count: dropped.tasks.length, triggers: dropped.triggers },
+        dedupeKey: `${act ? "guard_did" : "guard_would"}:planner_prefilter_closed:${run.id}`,
+      });
+      if (recorded && !act) {
+        await this.guardNotice("planner_prefilter_closed", sha256([...ids].sort().join("\n")), {
+          title: `The planner's closed-work guard would leave ${dropped.tasks.length} closed task(s) out of planner runs`,
+          context: [
+            `In act mode Lair would leave these out of planner run ${short(run.id)}'s context, so the planner agent would not propose them again. It is in observe mode, so the run sees them as before.`,
+            "",
+            ...evidence.map((line) => `- ${line}`),
+          ].join("\n"),
+          code: "would_skip",
+          facts: { run: run.id, tasks: dropped.tasks.length, triggers: dropped.triggers },
+        });
+      }
+    }
+    const earlier = found.unchanged;
+    if (earlier && found.hash !== null && guards.skipUnchanged.mode === "observe") {
+      const prefix = found.hash.slice(0, 12);
+      const recorded = await this.guardEvent("guard_would", {
+        guard: "planner_skip_unchanged",
+        verdict: "would_skip",
+        subject: earlier.id,
+        summary: `planner_skip_unchanged (observe): planner run ${short(run.id)} has the inputs (${prefix}) of run ${short(earlier.id)}, which gave nothing applicable: act mode would not start it`,
+        evidence: [`inputs ${prefix}`, `earlier run ${earlier.id}: ${clean(earlier.detail, 200)}`, `run ${run.id} starts as before`],
+        data: { hash: prefix, earlier_run: earlier.id, run: run.id },
+        dedupeKey: `guard_would:planner_skip_unchanged:${earlier.id}`,
+      });
+      if (recorded) {
+        await this.guardNotice("planner_skip_unchanged", found.hash, {
+          title: `The planner's unchanged-inputs guard would skip planner runs: nothing changed since run ${short(earlier.id)}`,
+          context: [
+            `Planner run ${short(run.id)} has the same inputs as run ${short(earlier.id)}, which gave nothing that could apply. In act mode Lair would not start it (until an input changes, or planner.guards.skip_unchanged.max_skip_hours pass). It is in observe mode, so the run starts as before.`,
+          ].join("\n"),
+          code: "would_skip",
+          facts: { run: run.id, earlier_run: earlier.id, hash: prefix },
+        });
+      }
+    }
+  }
+
+  /**
+   * handled_messages: a proposal that carries out an owner message was applied and its task closed (a done line, or
+   * an applied finish): the message is handled (act), or would be (observe). A declined or refused one leaves it open.
+   */
+  private async followMessages(doc: TasksDoc, settled: Set<string>, now: number): Promise<void> {
+    const links = this.state<Record<string, MessageLink>>(MESSAGE_LINKS) ?? {};
+    let changed = false;
+    for (const [proposalId, link] of Object.entries(links)) {
+      const p = this.store.getProposal(proposalId);
+      if (!p || p.status === "rejected" || p.status === "declined") {
+        delete links[proposalId];
+        changed = true;
+        continue;
+      }
+      if (p.status !== "applied" || !(doc.done.has(link.task) || settled.has(link.task))) continue;
+      delete links[proposalId];
+      changed = true;
+      await this.messageClosed(link, proposalId, now);
+    }
+    if (changed) this.setState(MESSAGE_LINKS, links);
+  }
+
+  private async messageClosed(link: MessageLink, proposalId: string, now: number): Promise<void> {
+    const evidence = [
+      `proposal ${short(proposalId)} of planner run ${short(link.run)} carried out owner message ${link.message}`,
+      `its task ${link.task} is done`,
+    ];
+    if (this.settings.guards.handledMessages === "act") {
+      const handled = this.state<Record<string, HandledRecord>>(HANDLED) ?? {};
+      if (handled[link.message]) return;
+      handled[link.message] = { task: link.task, at: now, by: "lair", proposal: proposalId };
+      this.setState(HANDLED, newest(handled, MAX_HANDLED));
+      this.dropMessageTriggers(link.message);
+      await this.guardEvent("guard_did", {
+        guard: "planner_handled_messages",
+        verdict: "skip",
+        subject: link.message,
+        task: link.task,
+        summary: `planner_handled_messages: owner message ${link.message} is handled (its task ${link.task} is done): later planner runs leave it out`,
+        evidence,
+        data: { message: link.message, task: link.task, proposal: proposalId },
+        dedupeKey: `guard_did:planner_handled_messages:${link.message}:${proposalId}`,
+      });
+      return;
+    }
+    const recorded = await this.guardEvent("guard_would", {
+      guard: "planner_handled_messages",
+      verdict: "would_skip",
+      subject: link.message,
+      task: link.task,
+      summary: `planner_handled_messages (observe): owner message ${link.message} would be handled (its task ${link.task} is done); it stays in the planner's context`,
+      evidence,
+      data: { message: link.message, task: link.task, proposal: proposalId },
+      dedupeKey: `guard_would:planner_handled_messages:${link.message}`,
+    });
+    if (recorded) {
+      await this.guardNotice("planner_handled_messages", `message:${link.message}`, {
+        title: `The planner's handled-messages guard would mark owner message ${clean(link.message, 64)} handled`,
+        context: [
+          `In act mode Lair would record owner message ${link.message} as handled and leave it out of later planner runs: a proposal that carried it out was applied and its task ${link.task} is done. It is in observe mode, so the message stays in the planner's context.`,
+        ].join("\n"),
+        code: "would_skip",
+        facts: { message: clean(link.message, 64), task: link.task, proposal: proposalId },
+      });
+    }
+  }
+
+  /** A handled message's owner_message trigger waiting for a run goes. */
+  private dropMessageTriggers(id: string): void {
+    const triggers = this.state<TriggerView[]>(TRIGGERS) ?? [];
+    const kept = triggers.filter((t) => !(t.kind === "owner_message" && t.detail.startsWith(`owner message [${id}]`)));
+    if (kept.length !== triggers.length) this.setState(TRIGGERS, kept);
+  }
+
+  /** One guard_would or guard_did event in the agents module (the spend API counts them); never throws. */
+  private async guardEvent(kind: "guard_would" | "guard_did", guard: ModuleGuard): Promise<boolean> {
+    try {
+      return await this.agents.recordGuard(this.project, kind, guard);
+    } catch (e) {
+      console.warn(`[planner] ${this.project}: a ${guard.guard} verdict was not recorded: ${message(e)}`);
+      return false;
+    }
+  }
+
+  /**
+   * One Decision Inbox notice (attention: notice: nothing waits on it, and the notifier never sends it outside Lair)
+   * per guard and streak: a streak the guard's last notice was about raises none again, also after a restart.
+   */
+  private async guardNotice(
+    guard: SpendGuardId,
+    streak: string,
+    notice: { title: string; context: string; code: GuardNoticeCode; facts: Record<string, string | number | boolean | null> },
+  ): Promise<void> {
+    const streaks = this.state<Record<string, string>>(GUARD_STREAKS) ?? {};
+    if (streaks[guard] === streak) return;
+    this.setState(GUARD_STREAKS, { ...streaks, [guard]: streak });
+    await this.raise({
+      kind: "other",
+      attention: "notice",
+      key: `guard:${guard}:${sha256(streak).slice(0, 16)}`,
+      ref: `guard:${guard}`,
+      title: notice.title,
+      context: notice.context,
+      options: [{ id: "noted", label: "Noted", consequences: "The notice closes. Nothing else changes.", effect: "reversible" }],
+      recommended: { optionId: "noted", reasoning: "Nothing is decided here: it is for your information." },
+      class: "planner.guard_notice",
+      evidence: { code: notice.code, facts: { guard, ...notice.facts }, cause_cleared: false, linked_issue: null },
+    });
+  }
+
+  /** The active run's change to the tasks file (recheck_on_change), if this run had one. */
+  private recheckOf(runId: string): RecheckEdit | null {
+    const edit = this.state<RecheckEdit>(RECHECK);
+    return edit && edit.run === runId ? edit : null;
+  }
+
+  /** A run whose proposals are all refused: the tasks file changed while it ran, and the change wasn't kept (D7). */
+  private refusedWhole(run: StoredRun): boolean {
+    return run.tampered && this.recheckOf(run.id)?.kept !== true;
+  }
+
+  /**
+   * At a run's end, once its proposals are stored: the owner messages its accepted proposals carry out
+   * (handled_messages), and what recheck_on_change did (act: each proposal was checked against the changed file) or
+   * would have done (observe: the file was put back; how many proposals the change left valid).
+   */
+  private async guardsAtFinish(
+    run: StoredRun,
+    items: unknown[],
+    ctx: CheckContext,
+    checked: CheckedProposal[],
+    stored: StoredProposal[],
+    now: number,
+  ): Promise<void> {
+    const guards = this.settings.guards;
+    if (guards.handledMessages !== "off") {
+      const links = this.state<Record<string, MessageLink>>(MESSAGE_LINKS) ?? {};
+      let added = false;
+      checked.forEach((c, i) => {
+        const p = stored[i];
+        if (c.fromMessage === null || !p || p.status !== "pending") return;
+        links[p.id] = { message: c.fromMessage, task: p.task, run: run.id, at: now };
+        added = true;
+      });
+      if (added) this.setState(MESSAGE_LINKS, newest(links, MAX_MESSAGE_LINKS));
+    }
+    const edit = this.recheckOf(run.id);
+    if (!run.tampered || !edit) return;
+    if (edit.kept) {
+      const valid = stored.filter((p) => p.status === "pending").length;
+      await this.guardEvent("guard_did", {
+        guard: "planner_recheck_on_change",
+        verdict: "apply",
+        subject: run.id,
+        summary: `planner_recheck_on_change: the tasks file changed while planner run ${short(run.id)} was active and was kept: ${valid} of ${stored.length} proposal(s) still hold and go on, the rest are refused one by one`,
+        evidence: stored.filter((p) => p.refusal).slice(0, 20).map((p) => `${p.op} ${p.task}: ${clean(p.refusal, 200)}`),
+        data: { run: run.id, valid, refused: stored.length - valid },
+        dedupeKey: `guard_did:planner_recheck_on_change:${run.id}`,
+      });
+      return;
+    }
+    if (edit.text === undefined || guards.recheckOnChange !== "observe") return;
+    const changed = parseTasksDoc(edit.text, this.settings.doneMarker, this.settings.onePerAgent);
+    const again = checkProposals(items, { ...ctx, doc: changed }).checked;
+    const valid = again.filter((c) => !c.refusal).length;
+    const recorded = await this.guardEvent("guard_would", {
+      guard: "planner_recheck_on_change",
+      verdict: "would_apply",
+      subject: run.id,
+      summary: `planner_recheck_on_change (observe): the tasks file changed while planner run ${short(run.id)} was active and was put back; act mode would keep the change and let ${valid} of ${again.length} proposal(s) go on`,
+      evidence: again.filter((c) => c.refusal).slice(0, 20).map((c) => `${c.op} ${c.task}: ${clean(c.refusal, 200)}`),
+      data: { run: run.id, would_apply: valid, refused: again.length - valid },
+      dedupeKey: `guard_would:planner_recheck_on_change:${run.id}`,
+    });
+    if (recorded) {
+      await this.guardNotice("planner_recheck_on_change", `run:${run.id}`, {
+        title: `The planner's recheck guard would have kept planner run ${short(run.id)}'s ${valid} valid proposal(s)`,
+        context: [
+          `The tasks file changed while planner run ${short(run.id)} was active, so Lair put it back and refused all ${again.length} of its proposals, as before. In act mode (planner.guards.recheck_on_change) Lair would keep the change, record it, and check each proposal against it: ${valid} would still hold and go on.`,
+        ].join("\n"),
+        code: "would_apply",
+        facts: { run: run.id, would_apply: valid, proposals: again.length },
+      });
+    }
+  }
+
   /** A run that didn't give proposals: its triggers wait for the next one; too many in a row pause runs. */
   private async failed(run: StoredRun, now: number, requeue = true): Promise<void> {
+    // The run is over: a change to the tasks file it saw is no longer the active run's (recheck_on_change)
+    if (this.recheckOf(run.id)) this.setState(RECHECK, null);
     if (requeue) {
       const pending = this.state<TriggerView[]>(TRIGGERS) ?? [];
       for (const t of run.triggers) {
@@ -1121,7 +1657,14 @@ export class PlannerService {
       return this.failed(run, now);
     }
     const agent = this.settings.agent;
-    const { checked } = checkProposals(file.items, this.checkContext(doc, agent?.maxProposals ?? 10));
+    const guards = this.settings.guards;
+    const ctx = this.checkContext(doc, agent?.maxProposals ?? 10);
+    // G6: from_message may name only an owner message of this run's context; an add of closed work is refused
+    if (guards.handledMessages !== "off") ctx.messages = new Set((this.state<Record<string, string[]>>(RUN_MESSAGES) ?? {})[run.id] ?? []);
+    if (guards.prefilterClosed === "act") ctx.ownMerged = this.ownMerged(this.mergedPrs());
+    const { checked } = checkProposals(file.items, ctx);
+    // The tasks file changed while the run was active and was put back: every proposal is refused (D7 keeps the edit)
+    const whole = this.refusedWhole(run);
     const stored = checked.map((c) =>
       this.store.insertProposal({
         project: this.project,
@@ -1132,12 +1675,10 @@ export class PlannerService {
         agent: c.agent,
         text: c.text,
         reason: c.reason,
-        status: c.refusal || run.tampered ? "rejected" : "pending",
-        refusal: run.tampered
-          ? "the tasks file changed while this planner run was active: its proposals are refused"
-          : c.refusal,
-        decidedBy: c.refusal || run.tampered ? "lair" : null,
-        decidedAt: c.refusal || run.tampered ? now : null,
+        status: c.refusal || whole ? "rejected" : "pending",
+        refusal: whole ? "the tasks file changed while this planner run was active: its proposals are refused" : c.refusal,
+        decidedBy: c.refusal || whole ? "lair" : null,
+        decidedAt: c.refusal || whole ? now : null,
         createdAt: now,
         verifierVerdict: null,
         verifierReason: null,
@@ -1145,10 +1686,11 @@ export class PlannerService {
       }),
     );
     const accepted = stored.filter((p) => p.status === "pending");
+    await this.guardsAtFinish(run, file.items, ctx, checked, stored, now);
 
     // Check if verification is needed
     const verifier = this.settings.verifier;
-    if (verifier && accepted.length > 0 && !run.tampered) {
+    if (verifier && accepted.length > 0 && !whole) {
       // Filter proposals that need verification (not in skip_ops)
       const needsVerification = accepted.filter((p) => !verifier.skipOps.includes(p.op as never));
       if (needsVerification.length > 0) {
@@ -1452,14 +1994,17 @@ export class PlannerService {
       }
     }
 
-    run.state = run.tampered ? "failed" : "done";
+    // D7 (recheck_on_change act): a change kept during the run leaves it done, each proposal checked against it
+    const whole = this.refusedWhole(run);
+    if (this.recheckOf(run.id)) this.setState(RECHECK, null);
+    run.state = whole ? "failed" : "done";
     run.endedAt = now;
     run.detail = `${after.length} proposal(s): ${count("applied")} applied, ${count("pending")} waiting for you, ${count("rejected")} refused${verifierNote}${
-      run.tampered ? " (the tasks file changed while it ran)" : ""
+      run.tampered ? (whole ? " (the tasks file changed while it ran)" : " (the tasks file changed while it ran: kept, and each proposal checked against it)") : ""
     }${note}`;
     this.store.saveRun(run);
 
-    if (run.tampered) return this.failed(run, now, true);
+    if (whole) return this.failed(run, now, true);
     this.setState(FAILURES, 0);
     await this.emit("planner.run_finished", { runId: run.id, state: run.state, detail: run.detail });
   }
@@ -1850,6 +2395,54 @@ export class PlannerService {
     });
   }
 
+  /**
+   * The owner marks an owner message handled (planner.guards.handled_messages on): later planner runs leave it out,
+   * and its waiting trigger goes. Idempotent; 404 for an id that isn't an owner message the planner read.
+   */
+  async markMessageHandled(id: string): Promise<OwnerMessageStateView> {
+    this.handledGuardOn();
+    if (this.lastCycle === null) await this.cycle();
+    return this.exclusive(async () => {
+      const handled = this.state<Record<string, HandledRecord>>(HANDLED) ?? {};
+      const known = handled[id];
+      if (known) return { id, handled: handledView(id, known) };
+      if (!this.messages.some((m) => m.id === id)) throw new PlannerError(404, `No owner message ${clean(id, 64)}`);
+      const record: HandledRecord = { task: null, at: this.clock.now(), by: "owner", proposal: null };
+      handled[id] = record;
+      this.setState(HANDLED, newest(handled, MAX_HANDLED));
+      this.dropMessageTriggers(id);
+      return { id, handled: handledView(id, record) };
+    });
+  }
+
+  /**
+   * The owner reopens a handled owner message: later planner runs see it again, and it is a trigger once more.
+   * Idempotent (a message that isn't handled stays as it is); 404 for an id that is neither handled nor an owner
+   * message the planner read.
+   */
+  async reopenMessage(id: string): Promise<OwnerMessageStateView> {
+    this.handledGuardOn();
+    if (this.lastCycle === null) await this.cycle();
+    return this.exclusive(async () => {
+      const handled = this.state<Record<string, HandledRecord>>(HANDLED) ?? {};
+      const read = this.messages.find((m) => m.id === id);
+      if (!handled[id]) {
+        if (!read) throw new PlannerError(404, `No owner message ${clean(id, 64)}`);
+        return { id, handled: null };
+      }
+      delete handled[id];
+      this.setState(HANDLED, handled);
+      if (read) this.addTrigger("owner_message", this.clock.now(), { task: null, detail: `owner message [${read.id}] (reopened by the owner): ${read.text}` });
+      return { id, handled: null };
+    });
+  }
+
+  private handledGuardOn(): void {
+    if (this.settings.guards.handledMessages === "off") {
+      throw new PlannerError(409, "planner.guards.handled_messages is off: set it to observe or act to mark owner messages handled");
+    }
+  }
+
   /** The owner's "check now": a cycle, then what the planner sees. */
   async checkNow(): Promise<PlannerOverviewView> {
     await this.cycle();
@@ -1915,6 +2508,10 @@ export class PlannerService {
           }
         : null,
       pausedReason: this.state<{ reason: string }>(PAUSED)?.reason ?? null,
+      handledMessages: Object.entries(this.state<Record<string, HandledRecord>>(HANDLED) ?? {})
+        .reverse()
+        .slice(0, 200)
+        .map(([id, record]) => handledView(id, record)),
     };
   }
 

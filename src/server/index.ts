@@ -773,6 +773,8 @@ const planner = await mountPlanner(fastify, {
   defaultProject: () => getDefaultProject(),
   humanAuth,
   bus: (project) => busConsumers.lineSource(project),
+  // planner.guards.prefilter_closed: the PRs review.db records as merged, with their branches (no host call)
+  prs: { mergedPrs: (project, limit) => reviews.mergedPrs(project, limit) },
 });
 planner.useDecisions(decisionInbox);
 

@@ -133,4 +133,47 @@ describe("planner config", () => {
     if (!quiet.ok) throw new Error(quiet.errors.join("; "));
     expect(quiet.settings.warnings[0]).toMatch(/an agent can change what the planner reads$/);
   });
+
+  it("G6 guards: off by default; a mode other than off needs agents.spend.enabled (naming both keys); a bad mode or bound is refused", () => {
+    const base = { enabled: true, agent: { id: "planner", prompt_file: "planner.md" } };
+    const plain = project(base, undefined);
+    const parsed = parsePlannerConfig(plain.planner, plain);
+    if (!parsed.ok) throw new Error(parsed.errors.join("; "));
+    expect(parsed.settings.guards).toEqual({
+      prefilterClosed: "off",
+      handledMessages: "off",
+      skipUnchanged: { mode: "off", maxSkipMs: 24 * 3_600_000 },
+      recheckOnChange: "off",
+    });
+
+    const guards = { prefilter_closed: "observe", handled_messages: "act", skip_unchanged: { mode: "observe", max_skip_hours: 6 }, recheck_on_change: "act" };
+    expect(errorsOf(project({ ...base, guards }, undefined))).toEqual([
+      "planner.guards.prefilter_closed: observe needs agents.spend.enabled: true (a guard's verdicts and counts are written by spend)",
+      "planner.guards.handled_messages: act needs agents.spend.enabled: true (a guard's verdicts and counts are written by spend)",
+      "planner.guards.skip_unchanged.mode: observe needs agents.spend.enabled: true (a guard's verdicts and counts are written by spend)",
+      "planner.guards.recheck_on_change: act needs agents.spend.enabled: true (a guard's verdicts and counts are written by spend)",
+    ]);
+    // Explicit off needs nothing
+    expect(errorsOf(project({ ...base, guards: { prefilter_closed: "off", skip_unchanged: { mode: "off" } } }, undefined))).toEqual([]);
+
+    const spendOn = (planner: unknown) => {
+      const config = project(planner, undefined);
+      (config.agents as Record<string, unknown>).spend = { enabled: true };
+      return config;
+    };
+    const on = spendOn({ ...base, guards });
+    const ok = parsePlannerConfig(on.planner, on);
+    if (!ok.ok) throw new Error(ok.errors.join("; "));
+    expect(ok.settings.guards).toEqual({
+      prefilterClosed: "observe",
+      handledMessages: "act",
+      skipUnchanged: { mode: "observe", maxSkipMs: 6 * 3_600_000 },
+      recheckOnChange: "act",
+    });
+    expect(errorsOf(spendOn({ ...base, guards: { handled_messages: "sometimes" } }))[0]).toContain("planner.guards.handled_messages");
+    expect(errorsOf(spendOn({ ...base, guards: { skip_unchanged: { mode: "act", max_skip_hours: 0 } } }))[0]).toContain(
+      "planner.guards.skip_unchanged.max_skip_hours",
+    );
+    expect(errorsOf(spendOn({ ...base, guards: { skip: "act" } }))[0]).toContain("planner.guards: Unrecognized key(s)");
+  });
 });

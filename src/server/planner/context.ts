@@ -8,6 +8,7 @@
 import type { BlockedView, PlannerMode, PlanTaskView, TriggerView } from "../../shared/planner-types.js";
 import { PLANNER_OPS } from "../../shared/planner-types.js";
 import { clean } from "./files.js";
+import type { ContextClosed } from "./guards.js";
 import type { OwnerMessage, QueueEvent } from "./sources.js";
 import type { TasksDoc } from "./tasks-file.js";
 
@@ -26,6 +27,8 @@ export interface ContextInput {
   events: QueueEvent[];
   messages: OwnerMessage[];
   blocked: BlockedView[];
+  /** planner.guards.prefilter_closed act: the finished work, so the model sees it too (absent otherwise) */
+  closed?: ContextClosed | null;
   maxBytes: number;
 }
 
@@ -89,6 +92,14 @@ export function buildContext(input: ContextInput): ContextBundle {
       reason: s(b.reason, 400),
       attempts: b.attempts,
     })),
+    ...(input.closed
+      ? {
+          closed: {
+            tasks: input.closed.tasks.map((t) => ({ id: s(t.id, 128), why: s(t.why, 200) })),
+            mergedPrs: input.closed.mergedPrs.map((m) => ({ pr: m.pr, branch: s(m.branch, 200) })),
+          },
+        }
+      : {}),
   };
   const cut: string[] = [];
   let json = JSON.stringify(bundle, null, 1);
@@ -115,7 +126,19 @@ export function buildContext(input: ContextInput): ContextBundle {
 }
 
 /** The prompt section Lair writes after the template: where to write, what, and the bundle as data. */
-export function plannerSection(input: { runId: string; proposalFile: string; maxProposals: number; context: ContextBundle }): string {
+export function plannerSection(input: {
+  runId: string;
+  proposalFile: string;
+  maxProposals: number;
+  context: ContextBundle;
+  /** planner.guards.handled_messages on: a proposal may name the owner message it carries out */
+  fromMessage?: boolean;
+  /** planner.guards.prefilter_closed act: the context lists closed work */
+  closed?: boolean;
+}): string {
+  const shape = input.fromMessage
+    ? '{"proposals": [{"op": "add|finish|reassign|reword|drop|unblock", "task": "<task id>", "agent": "<agent id>", "text": "<one line>", "reason": "<why>", "from_message": "<owner message id, when the proposal carries out one>"}]}'
+    : '{"proposals": [{"op": "add|finish|reassign|reword|drop|unblock", "task": "<task id>", "agent": "<agent id>", "text": "<one line>", "reason": "<why>"}]}';
   return [
     `## Lair planner run ${input.runId}`,
     "",
@@ -123,13 +146,20 @@ export function plannerSection(input: { runId: string; proposalFile: string; max
     "",
     "The file holds one object:",
     "",
-    '{"proposals": [{"op": "add|finish|reassign|reword|drop|unblock", "task": "<task id>", "agent": "<agent id>", "text": "<one line>", "reason": "<why>"}]}',
+    shape,
     "",
     `- At most ${input.maxProposals} proposals. Lair checks each one and refuses what breaks a rule, with the reason.`,
     "- add: a new task id, an agent from rules.allowlist, and text (the line's description). finish: the task is done.",
     "  reassign: another allowlisted agent. reword: new text. drop: remove the line. unblock: the blocker is gone.",
     "- A tasks file line whose agent is null is unassigned: ready work for any agent. reassign gives it to one.",
     "- agent only for add and reassign; text only for add and reword; reason always.",
+    ...(input.fromMessage
+      ? [
+          "- from_message: the id of the owner message (ownerMessages) the proposal carries out; leave it out otherwise.",
+          "  Lair marks that message handled once the proposal's task is done, so it is not planned for again.",
+        ]
+      : []),
+    ...(input.closed ? ["- closed lists finished work (done tasks, tasks whose own PR merged, merged PRs): never propose it again."] : []),
     "- Do not edit the tasks file or any other file: Lair applies the proposals it accepts.",
     "- Write an empty list when nothing should change: {\"proposals\": []}",
     "",
