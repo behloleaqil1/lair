@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { evaluateReady, isPrWork, parseReadyReport, unmappedFindings, type ReadyFacts, type ReadyVerdict } from "./guard.js";
+import { evaluateReady, isPrWork, parseReadyReport as parse, unmappedFindings, type ReadyFacts, type ReadyVerdict } from "./guard.js";
 
 const HEAD = "abc1234def56789012345678901234567890abcd";
 
@@ -16,8 +16,13 @@ const ready: ReadyFacts = {
   findingIds: [],
 };
 
+const R = "example/demo";
+/** A project without repos:: the review repository alone, `PR #n` forms only */
+const REPOS = [{ repo: R, default: true, base: null, ciCounts: true, refs: [] }];
+const parseReadyReport = (line: string, taskText = "") => parse(line, taskText, REPOS, true);
+
 const judge = (facts: Partial<ReadyFacts>, sha: string | null = "abc1234"): Promise<ReadyVerdict> =>
-  evaluateReady({ pr: 7, sha }, { facts: async () => ({ ...ready, ...facts }) });
+  evaluateReady({ repo: R, pr: 7, sha }, { repos: REPOS, facts: async () => ({ ...ready, ...facts }) });
 
 function refused(v: ReadyVerdict) {
   if (v.ok) throw new Error("expected a refusal");
@@ -26,19 +31,19 @@ function refused(v: ReadyVerdict) {
 
 describe("parseReadyReport", () => {
   it("reads the PR and the head from an agent's own DONE line", () => {
-    expect(parseReadyReport("- DONE task-a by worker-a 10:00Z: PR #12 at ABC1234, CI green")).toEqual({ kind: "pr", report: { pr: 12, sha: "abc1234" } });
-    expect(parseReadyReport("- DONE task-a by worker-a: pull request #5")).toEqual({ kind: "pr", report: { pr: 5, sha: null } });
+    expect(parseReadyReport("- DONE task-a by worker-a 10:00Z: PR #12 at ABC1234, CI green")).toEqual({ kind: "pr", report: { repo: R, pr: 12, sha: "abc1234" } });
+    expect(parseReadyReport("- DONE task-a by worker-a: pull request #5")).toEqual({ kind: "pr", report: { repo: R, pr: 5, sha: null } });
   });
   it("reads the tail the bus mirror writes, and a PR number in the summary does not win", () => {
     const line = "- DONE task-a by worker-a (Alice) 10:00Z: follow-up to PR #3, CI green [gate-9] PR #99 [abc1234]";
-    expect(parseReadyReport(line)).toEqual({ kind: "pr", report: { pr: 99, sha: "abc1234" } });
+    expect(parseReadyReport(line)).toEqual({ kind: "pr", report: { repo: R, pr: 99, sha: "abc1234" } });
   });
   it("the PR the task names wins over a PR number in free text", () => {
     const line = "- DONE task-a by worker-a: follow-up to PR #3, PR #99 at abc1234";
-    expect(parseReadyReport(line, "Fix review findings of PR #99")).toEqual({ kind: "pr", report: { pr: 99, sha: "abc1234" } });
+    expect(parseReadyReport(line, "Fix review findings of PR #99")).toEqual({ kind: "pr", report: { repo: R, pr: 99, sha: "abc1234" } });
   });
   it("a line that names several PRs, none of them the task's, is ambiguous", () => {
-    expect(parseReadyReport("- DONE task-a by worker-a: PR #3 and PR #99 at abc1234")).toEqual({ kind: "ambiguous", prs: [3, 99] });
+    expect(parseReadyReport("- DONE task-a by worker-a: PR #3 and PR #99 at abc1234")).toEqual({ kind: "ambiguous", prs: [{ repo: R, pr: 3 }, { repo: R, pr: 99 }] });
   });
   it("is none for a line that names no PR", () => {
     expect(parseReadyReport("- DONE task-a by worker-a 10:00Z: merged by hand")).toEqual({ kind: "none" });
@@ -121,7 +126,7 @@ describe("evaluateReady", () => {
   });
 
   it("a host that fails is a retry, never an acceptance", async () => {
-    const v = await evaluateReady({ pr: 7, sha: null }, { facts: async () => { throw new Error("401 token abc"); } });
+    const v = await evaluateReady({ repo: R, pr: 7, sha: null }, { repos: REPOS, facts: async () => { throw new Error("401 token abc"); } });
     expect(refused(v)).toMatchObject({ reason: "unverifiable", retry: true });
     expect(JSON.stringify(v)).not.toContain("token");
   });
@@ -142,13 +147,13 @@ describe("evaluateReady: fences, deadline, agent", () => {
   });
 
   it("a host that does not answer in time is a retry marked hostDown", async () => {
-    const v = await evaluateReady({ pr: 7, sha: null }, { facts: () => new Promise(() => {}) }, { timeoutMs: 10 });
+    const v = await evaluateReady({ repo: R, pr: 7, sha: null }, { repos: REPOS, facts: () => new Promise(() => {}) }, { timeoutMs: 10 });
     expect(refused(v)).toMatchObject({ reason: "unverifiable", retry: true, hostDown: true });
   });
 
   it("refuses a PR on another agent's branch, and accepts the agent's own", async () => {
     const run = (headRef: string) =>
-      evaluateReady({ pr: 7, sha: "abc1234" }, { facts: async () => ({ ...ready, headRef }) }, { agent: "worker-a" });
+      evaluateReady({ repo: R, pr: 7, sha: "abc1234" }, { repos: REPOS, facts: async () => ({ ...ready, headRef }) }, { agent: "worker-a" });
     expect(refused(await run("kiro/worker-b/login"))).toMatchObject({ reason: "wrong_agent", retry: false });
     expect(await run("kiro/worker-a/login")).toEqual({ ok: true });
   });

@@ -1,6 +1,6 @@
 # Agent Sandboxing: isolation of agent runs from the owner and from each other
 
-> **Design reviewed against [DESIGN-CHECKLIST.md](/Users/dev/leadforge/work/kiro-runs/DESIGN-CHECKLIST.md).** Every code
+> **Design reviewed against the design checklist.** Every code
 > reference verified with `git grep`/`git show` on `github/main` (7e90e73). New items marked "new".
 
 This document is ROADMAP.md item B4: "An agent cannot read the owner token, Lair's data or another agent's run

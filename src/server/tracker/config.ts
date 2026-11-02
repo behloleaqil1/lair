@@ -45,6 +45,8 @@ export interface TrackerSettings {
   mode: TrackerMode;
   repos: RepoSettings[];
   createIssuesForNewTasks: boolean;
+  /** A linked task whose line left the tasks file (two reconciles in a row) has its issue closed as not planned; off: recorded as would_close */
+  closeRemovedTasks: boolean;
   blockedLabel: string;
   /** The owner's patterns, applied after the built-in redaction */
   redactPatterns: RegExp[];
@@ -129,6 +131,8 @@ export const TrackerSchema = z
     /** Default: the project's `github:` repository, without a board */
     repos: z.array(RepoSchema).max(20).default([]),
     create_issues_for_new_tasks: z.boolean().default(false),
+    /** Close the issue of a linked task whose line was removed or commented out by hand (absent two reconciles in a row) */
+    close_removed_tasks: z.boolean().default(false),
     blocked_label: Label.default("blocked"),
     /** Regular expressions (case-insensitive) redacted from every text sent to GitHub, after the built-in ones */
     redact_patterns: z.array(z.string().min(1).max(500)).max(50).default([]),
@@ -245,6 +249,7 @@ export function parseTrackerConfig(raw: unknown, project: ProjectConfig): Tracke
       mode: value.mode,
       repos,
       createIssuesForNewTasks: value.create_issues_for_new_tasks,
+      closeRemovedTasks: value.close_removed_tasks,
       blockedLabel: value.blocked_label,
       redactPatterns,
       reconcileIntervalSeconds: value.reconcile_interval_seconds,

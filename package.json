@@ -47,6 +47,7 @@
     "test:watch": "vitest",
     "lint": "eslint src",
     "typecheck": "tsc --noEmit",
+    "check:generic": "tsx scripts/check-generic.ts",
     "setup": "npm ci && npm run rebuild:native",
     "rebuild:native": "node scripts/install-scripts.mjs rebuild",
     "check:install-scripts": "node scripts/install-scripts.mjs check"
