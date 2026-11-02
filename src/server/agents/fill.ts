@@ -269,11 +269,13 @@ async function withRegular<T>(path: string, noFollow: boolean, fallback: (reason
   }
 }
 
+type BoundedRead = { ok: true; text: string } | { ok: false; reason: string };
+
 /** A whole regular file of at most `maxBytes`, as text. */
-export function readBounded(path: string, maxBytes: number, noFollow: boolean): Promise<{ ok: true; text: string } | { ok: false; reason: string }> {
-  return withRegular(path, noFollow, (reason) => ({ ok: false as const, reason }), async (handle, size) => {
-    if (size > maxBytes) return { ok: false as const, reason: `is larger than ${maxBytes} bytes (${size})` };
-    return { ok: true as const, text: (await readAt(handle, 0, size)).toString("utf-8") };
+export function readBounded(path: string, maxBytes: number, noFollow: boolean): Promise<BoundedRead> {
+  return withRegular<BoundedRead>(path, noFollow, (reason) => ({ ok: false, reason }), async (handle, size) => {
+    if (size > maxBytes) return { ok: false, reason: `is larger than ${maxBytes} bytes (${size})` };
+    return { ok: true, text: (await readAt(handle, 0, size)).toString("utf-8") };
   });
 }
 
