@@ -2702,6 +2702,10 @@ export class AgentsFill {
    * agent wrote its line, so none is missed; at most one more run): the one fill already recorded for the run (it woke
    * it, or would have), else one the server sent (WakeArrivals), else the modules' records (WakeFacts), read on the
    * first look at this wait after a start and then at most every wake.poll_seconds. null: not yet.
+   * A bus message wakes only while it is unread, as the state check reads it: one the agent read during its run (its
+   * inbox fetch marks it read) is no news, so a message's arrival is taken only once the bus store says an unread one
+   * came since the start (read at once for an arrival newer than the last read). Without a bus store to read, the
+   * event is all fill knows, and it is taken.
    */
   private async eventCame(latest: AgentRun, agent: string, task: string, target: WakeTarget, now: number): Promise<WakeCame | null> {
     const { store, project, settings } = this.options;
@@ -2714,18 +2718,23 @@ export class AgentsFill {
     }
     const since = latest.spawnedAt ?? latest.requestedAt;
     const arrived = this.arrivals.since(wakeKey(target, agent), since);
-    if (arrived) return arrived;
+    const facts = this.options.wakeFacts?.();
+    if (arrived && (target.kind !== "message" || !facts?.message)) return arrived;
     const pollKey = `${task}|${latest.id}`;
     this.waitingSeen.add(pollKey);
     const last = this.stateChecked.get(pollKey);
-    if (last !== undefined && now - last < settings.wake.pollSeconds * 1000) return null;
+    const unreadToConfirm = arrived !== null && (last === undefined || arrived.at >= last);
+    if (!unreadToConfirm && last !== undefined && now - last < settings.wake.pollSeconds * 1000) return null;
     this.stateChecked.set(pollKey, now);
     try {
-      return await wakeStateOf(this.options.wakeFacts?.(), project, agent, target, since);
+      const found = await wakeStateOf(facts, project, agent, target, since);
+      // An unread message whose event fill heard came as that event
+      return found !== null && arrived !== null ? arrived : found;
     } catch (e) {
-      // A record that can't be read is no event: the wait goes on (max_wait_minutes still bounds it), read again later
+      // A record that can't be read is no event: the wait goes on (max_wait_minutes still bounds it), read again later.
+      // A message whose event came is taken, read or not (at most one more run): the store can't say
       console.warn(`[agents] ${project}: fill could not read whether ${wakeLabel(target)} came for ${task}: ${e instanceof Error ? e.message : String(e)}`);
-      return null;
+      return arrived;
     }
   }
 

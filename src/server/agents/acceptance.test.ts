@@ -7974,19 +7974,24 @@ describe("AI spend G3: waiting agents woken by the awaited event (docs/design/ai
 
   it("AT-17 act: a wait on the bus starts again on a message to its agent, not on one to another agent; a message sent while Lair was down is found in the bus store", async () => {
     const h = setup(g3("act"));
-    const bus = new BusStore("demo", join(h.dir, "bus.db"));
-    h.manager.useWakeFacts({ message: (_project, agent, since) => bus.unreadSince(agent, since) });
+    const busA = new BusStore("demo", join(h.dir, "bus.db"));
+    h.manager.useWakeFacts({ message: (_project, agent, since) => busA.unreadSince(agent, since) });
     fillTask(h);
     await runEndingWith(h, "- WAITING feat-login on bus by worker-a: asked worker-b");
     expect((await check(h)).waiting).toMatchObject({ wake: "a bus message to it", fallbackAt: null });
+    // As BusService sends one: the message is stored, then its event goes out
+    busA.sendMessage("owner", "worker-b", "for worker-b", 5, NOW + 5 * MIN);
     await emitAt(h, 5, "bus.message", busMessage("worker-b"));
     expect((await check(h)).hold).toBe("waiting");
+    busA.sendMessage("owner", "worker-a", "for worker-a", 5, NOW + 6 * MIN);
     await emitAt(h, 6, "bus.message", busMessage("worker-a"));
     expect((await check(h)).state).toBe("started");
-    expect(eventsOf(h, "guard_did").map((e) => [e.data.event, e.data.target, e.data.source])).toEqual([["bus.message", "message", "event"]]);
+    expect(eventsOf(h, "guard_did").map((e) => [e.data.event, e.data.target, e.data.source, e.data.eventAt])).toEqual([["bus.message", "message", "event", at12(6)]]);
+    busA.close();
 
-    // The state check: a message read already, or to another agent, wakes nothing; an unread one to it does
+    // The state check: a message to another agent wakes nothing; an unread one to it does
     const h2 = setup(g3("act"));
+    const bus = new BusStore("demo", join(h2.dir, "bus.db"));
     h2.manager.useWakeFacts({ message: (_project, agent, since) => bus.unreadSince(agent, since) });
     fillTask(h2);
     await runEndingWith(h2, "- WAITING feat-login on bus by worker-a: asked worker-b");
@@ -8047,6 +8052,30 @@ describe("AI spend G3: waiting agents woken by the awaited event (docs/design/ai
       }
     });
   }
+
+  it("AT-17 act: a bus message the agent read during its run wakes nothing through its event; an unread one after it does", async () => {
+    const h = setup(g3("act"));
+    const bus = new BusStore("demo", join(h.dir, "bus.db"));
+    h.manager.useWakeFacts({ message: (_project, agent, since) => bus.unreadSince(agent, since) });
+    fillTask(h);
+    await runEndingWith(h, "- WAITING feat-login on bus by worker-a: answered the owner", async () => {
+      // The owner's message comes during the run (stored, then its event, as BusService sends it), and the agent reads it
+      bus.sendMessage("owner", "worker-a", "use the small page size", 5, NOW + 0.5 * MIN);
+      await emitAt(h, 0.5, "bus.message", busMessage("worker-a"));
+      expect(bus.getUnreadMessages("worker-a", NOW + 0.75 * MIN)).toHaveLength(1);
+    });
+    expect((await check(h)).hold).toBe("waiting");
+    h.clock.t = NOW + 5 * MIN;
+    expect((await check(h)).hold).toBe("waiting");
+    expect(runs(h)).toHaveLength(1);
+    expect(eventsOf(h, "guard_did")).toEqual([]);
+    // A message after it, unread: it wakes it, as the event
+    bus.sendMessage("owner", "worker-a", "one more thing", 5, NOW + 6 * MIN);
+    await emitAt(h, 6, "bus.message", busMessage("worker-a"));
+    expect((await check(h)).state).toBe("started");
+    expect(eventsOf(h, "guard_did").map((e) => [e.data.event, e.data.source, e.data.eventAt])).toEqual([["bus.message", "event", at12(6)]]);
+    bus.close();
+  });
 
   it("a capture that isn't a PR number is refused and shown: the wait names nothing (fallback, counted)", async () => {
     const h = setup(g3("act"));
