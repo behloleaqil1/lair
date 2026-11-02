@@ -7,6 +7,7 @@ import {
   hashBusToken,
   isBusTokenFormat,
   redactBusToken,
+  redactBusTokens,
   BUS_TOKEN_PREFIX,
 } from "./tokens.js";
 
@@ -125,6 +126,17 @@ describe("bus tokens", () => {
       const text = "Some text";
       const redacted = redactBusToken(text, "");
       expect(redacted).toBe("Some text");
+    });
+  });
+
+  describe("redactBusTokens", () => {
+    it("replaces every bus token, whole or cut short, without knowing which one", () => {
+      const [a, b] = [newBusToken(), newBusToken()];
+      expect(redactBusTokens(`run ${a}, old ${b}; cut ${b.slice(0, 12)}.`)).toBe("run [bus-token], old [bus-token]; cut [bus-token].");
+    });
+
+    it("leaves text without a token as it is", () => {
+      expect(redactBusTokens("ready for review: PR 7 at abc1234")).toBe("ready for review: PR 7 at abc1234");
     });
   });
 });

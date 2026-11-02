@@ -17,6 +17,7 @@
 import type { EventBus } from "../core/event-bus.js";
 import type { BusStore, BusReport, BusMessage } from "./store.js";
 import type { BusTokenBinding } from "./tokens.js";
+import { redactBusTokens } from "./tokens.js";
 import type { ReportKind } from "../../bus/types.js";
 import { BusMirror, type BusMirrorConfig } from "./mirror.js";
 import { BUS_SUMMARY_MAX } from "../../shared/bus-live.js";
@@ -178,7 +179,8 @@ export class BusService {
     }
 
     const now = Date.now();
-    const sanitizedSummary = sanitizeText(summary, MAX_SUMMARY_CHARS);
+    // No bus token in a summary: the board, the mirror files and the live channel show it to every reader
+    const sanitizedSummary = redactBusTokens(sanitizeText(summary, MAX_SUMMARY_CHARS));
 
     const id = this.store.createReport(
       binding.agent,
