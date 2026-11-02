@@ -290,6 +290,11 @@ export type EventType =
   | "infra_monitor.finding"
   | "infra_monitor.cleared"
   | "infra_monitor.requeued"
+  // PR health (src/server/pr-health/): {project, key, repo, pr, head, kind, owner, ownerSource, mode} /
+  // {project, key, repo, pr, head, kind, why} / {project, repo, error}
+  | "pr_health.finding"
+  | "pr_health.cleared"
+  | "pr_health.repo_error"
   // Cloud machines (src/server/cloud/): {project, limit, spend, reason}
   | "cloud.guard_tripped"
   // The owner cleared the trip: {project, trippedAt, limit, spend, by (owner session id), note}

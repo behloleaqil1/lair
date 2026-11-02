@@ -3106,9 +3106,52 @@ repos:
 
 **PR references.** Task text and done lines name a PR as `owner/name#12` (a listed repository), `<ref>#12`, `<ref> PR #12` or `<ref> pull request #12` (that entry's repository), or `PR #12` (the task's repository when its description has `repo:owner/name`, the tracker's tag, else the default). A bare number never names a repository that is neither the task's nor the default, and `xapp#12`, `app#123` and `app#12a` are not `app#12`.
 
-**Without `repos:`** the list is `tracker.repos[]` (each entry's `repo` and `default`; two or more with no default are read as no default), else the review repository (`review.repo`, else `github:`, with `review.default_branch` as its base), else empty: the modules that need it are inactive and say why. The ready guard reads the list only when `repos:` is set; without it the guard works as before (the review repository, `PR #<n>` forms only). An invalid `repos:` is reported (`repos[1].refs[0]: ...`) and turns off what reads it (the ready guard reads only the review repository, as without `repos:`); the project still loads.
+**Without `repos:`** the list is `tracker.repos[]` (each entry's `repo` and `default`; two or more with no default are read as no default), else the review repository (`review.repo`, else `github:`, with `review.default_branch` as its base), else empty: the modules that need it are inactive and say why. The ready guard reads the list only when `repos:` is set; without it the guard works as before (the review repository, `PR #<n>` forms only). An invalid `repos:` is reported (`repos[1].refs[0]: ...`) and turns off what reads it (the ready guard reads only the review repository, as without `repos:`, and PR health does not start); the project still loads. The error shows on the dashboard's config banner from startup on, and a live reload to an invalid `repos:` is refused (the previous config keeps running). An explicit ref that is another entry's name (`refs: [lib]` beside `example/lib` without `refs`) is an error too: set that entry's `refs` to tell them apart.
+
+No one module owns `repos:`, so an edit to it reloads every module of the project.
 
 **Hosts.** Each listed repository other than the review repository is read through a GitHub host of its own, built once (a rate-limit answer blocks only that repository), with the review module's token (`review.token_env`, `review.token_cmd`) and `review.api_url`; one request may take 20 s, and a timeout is a failure.
+
+## PR health
+
+PR health reads the open pull requests of each repository in [`repos:`](#repositories) and finds the ones that went bad: `conflicts` (the host says the PR can't merge into its base), `behind` (more than `behind_threshold` commits behind the base), `no_ci` (no check has run at the head of a non-draft PR for `no_ci_minutes`) and `ci_red` (the newest run of a check at the head failed). `no_ci` and `ci_red` need the repository's `ci_counts`. Design: [docs/design/pr-health.md](design/pr-health.md).
+
+It is off unless a project sets `pr_health.enabled: true`, and it only observes: it emits events and keeps a status, and writes nothing. This version is the detector alone; the owner rule, the status route and the server wiring come next, then act mode (a note to the owning agent, Decision Inbox notices).
+
+```yaml
+pr_health:
+  enabled: true
+  mode: observe                  # act arrives in a later version (it needs notify_cmd)
+  interval_seconds: 300
+  ignored_prs: [example/app#7]
+  ignored_branches: ["dependabot/**"]
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | |
+| `mode` | `observe` \| `act` | `observe` | `act` needs `notify_cmd`; this version does not act |
+| `interval_seconds` | integer | `300` | 60-3600; the first tick runs 1 s after start, and the next is scheduled when one ends |
+| `request_timeout_seconds` | integer | `20` | 1-120; a timeout is a failure of that repository for the tick |
+| `max_prs_per_repo` | integer | `30` | 1-100 PRs read per repository and tick (newest first, PRs left unread last tick before them) |
+| `max_requests_per_tick` | integer | `120` | 10-1000 requests per tick, shared by the project's repositories; a tick also ends at half the interval |
+| `behind_threshold` | integer | `30` | 1-10000 |
+| `no_ci_minutes` | integer | `20` | 1-1440, since the PR was last updated |
+| `clear_minutes` | integer | `10` | 0-1440: a kind that successful reads no longer find is cleared after this long |
+| `kinds.{conflicts,behind,no_ci,ci_red}` | boolean | `true` | Turn a kind off |
+| `ignored_prs` | list | `[]` | `owner/name#N` of a listed repository, at most 200 |
+| `ignored_branches` | list | `["dependabot/**"]` | Head branch globs (`*` within one segment, `**` across, `?`), at most 50 |
+| `owner.branch_window_minutes` | integer | `360` | 0-10080, for the owner rule (a later version) |
+| `notify_cmd`, `withdraw_cmd` | argv \| null | `null` | For act mode (a later version); placeholders `{agent}`, `{repo}`, `{pr}`, `{head}`, `{kinds}`, `{id}`, `{message}` only |
+| `command_timeout_seconds`, `max_attempts`, `backoff_seconds`, `escalate_after_minutes` | | `30`, `3`, `300`, `null` | For act mode (a later version) |
+
+**What is read.** Each tick reads each repository in order: its open PRs (one page of 100; `truncated` in the status says more exist, and a PR missing from a full page is not taken as closed) and its base tip. A PR named in `ignored_prs`, from a branch in `ignored_branches` or into another branch than the base (a stacked PR) is skipped and listed with why. For the others the PR itself is read for its mergeability and compared with the base when its head or the base tip moved or mergeability was not known yet, and its checks are read unless they all passed at this head. An unchanged PR whose checks passed costs no request. The host's token and URL are the review module's (`review.token_env`, `review.token_cmd`, `review.api_url`), else `GITHUB_TOKEN` and `https://api.github.com`.
+
+**Findings.** One per (repository, PR, head, kind), keyed `pr_health:<owner/name>#<n>@<head8>:<kind>`. A moved head, a closed PR and a PR that becomes skipped clear at once; a kind that is no longer found clears after `clear_minutes`. Mergeability the host has not worked out yet (`null`) neither opens nor clears `conflicts`. Findings are kept in memory and found again after a restart.
+
+**Failures.** Each repository is read on its own: a timeout, a rate-limit answer or any host error stops that repository for the tick and keeps its findings exactly as they were (nothing is cleared, and nothing is found again when it recovers); its state is `error`, and `pr_health.repo_error` is emitted once when an error streak starts. The request budget and the deadline stop a repository the same way, with `partial` in the status and the unread PRs first next tick.
+
+**Events.** `pr_health.finding` `{project, key, repo, pr, head, kind, owner, ownerSource, mode}` (the owner is `null` until the owner rule arrives), `pr_health.cleared` `{project, key, repo, pr, head, kind, why}` (`fixed`, `head_moved`, `closed` or `ignored`) and `pr_health.repo_error` `{project, repo, error}`.
 
 ## Tracker
 
