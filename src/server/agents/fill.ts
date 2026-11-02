@@ -94,7 +94,7 @@ import {
   reportPatternFor,
   REPORTED_TASK_GROUP,
   taskLineMatch,
-  WAKE_VALUE,
+  isPlainName,
   type FillPattern,
   type FillSettings,
 } from "./config.js";
@@ -383,7 +383,7 @@ const queuedText = (q: QueuedGate) =>
   `${q.gate}${q.requeuedFrom ? ` (re-queued from ${q.requeuedFrom})` : ""} still ${q.status} in ${q.lane} since ${iso(q.since)}`;
 
 /** What a waiting line may name and fill may look up: one plain name (WAKE_VALUE), no ".." */
-const isPlainWake = (value: string) => WAKE_VALUE.test(value) && !value.includes("..");
+const isPlainWake = isPlainName;
 
 /** The first line of a small regular file (no symlink as its last part), trimmed; null when it can't be read. */
 function firstLineOf(path: string, maxBytes: number): string | null {

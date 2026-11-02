@@ -197,6 +197,13 @@ across restarts), the planner keeps the ids of the reports it handled. A report 
 `agents.fill.tasks_file`, or by an agent fill doesn't run, is ignored and shown on Home → Health
 (`GET /api/bus/consumers?project=<name>`), as is an event that fails validation.
 
+A run's bus token is revoked on every way the run ends (exit, crash, failover, transient retry, never started, stopped,
+claim released), whatever `bus.consume` is by then, and at start Lair revokes the tokens of runs that ended while it
+was down. `lair bus report` is refused with 400, and nothing is stored or mirrored, when its `sha` isn't 7 to 64 hex
+digits or its `gate_id` isn't a plain name (letters, digits, `.`, `_` and `-`, starting with a letter or digit, no
+`..`). The mirror appends to `queue_file`, `inbox_file` and `mail_dir` without blocking the server, one line at a time
+per file; an owner message to a recipient that isn't a plain name gets no mailbox file.
+
 Turn `observe` on first, compare on Home → Health, then switch to `on`.
 
 ## Dragons (agents)
@@ -3209,7 +3216,11 @@ The client itself is read-only in observe mode: a write is refused before anythi
 
 Only `outcome: "applied"` changes count (`planned` is the planner's own observe mode). An `agent.run.ended` changes nothing: an exit is not a done task. Events never wait on GitHub: a handler queues a job and returns, the jobs of a project run one at a time on a bounded queue (500), and a job dropped when it is full is caught up by the next reconcile.
 
-**Reconcile** (at start, then every `reconcile_interval_seconds`, and on the owner's request): links the tasks of the tasks file that have none yet (at most 10 a cycle), finishes the ones marked done there, moves the cards of open PRs to In review, adds missing cards, puts back cards moved by hand (counted as drift fixed only when the fix was sent), retries closes that failed, and closes or reopens milestones. The next one is scheduled when it ends, so two never overlap.
+**Reconcile** (at start, then every `reconcile_interval_seconds`, and on the owner's request): links the tasks of the tasks file that have none yet (at most 10 a cycle), finishes the ones marked done there, finishes the ones whose PR was merged outside the review module, drops the ones whose line was removed by hand, moves the cards of open PRs to In review, adds missing cards, puts back cards moved by hand (counted as drift fixed only when the fix was sent), retries closes that failed, and closes or reopens milestones. The next one is scheduled when it ends, so two never overlap.
+
+**Merges made outside the review module.** `review.merged` comes only from a merge the review module makes; a PR merged by a script's push, `gh pr merge` or the GitHub web UI emits nothing. So while a linked task is In progress or In review, each reconcile reads one page of the closed PRs of every tracked repository (the newest 100 by update: one request per repository, with the usual timeout; none when no task is In progress or In review) and matches them as `review.submitted` does (the issues a PR closes, a task id ending its branch name). A merged PR finishes its tasks as `review.merged` does: Done, the issue closed as completed, through the write budget, at most 10 tasks a reconcile (the rest wait for the next one). A PR closed without merging changes nothing: the status lists it under `closedUnmerged`. A finished task is never read again, so a merge is applied once, also across a restart. A PR merged long ago that has left the newest 100 is not seen.
+
+**Task lines removed by hand.** The planner's own drop arrives as an event. A linked task whose line is not in the tasks file and not marked done (deleted, or commented out with `#`) for 2 reconciles in a row counts as dropped: with `close_removed_tasks: true` its issue is closed as not planned (at most 10 a reconcile); with the key off (the default) nothing is sent, a `would_close` row is recorded in the audit (once, counted up on each reconcile) and the status lists the task under `removedTasks`. A line fill refuses (malformed, longer than 2000 characters, past its 200 tasks) is still in the file: the task ids on it are never dropped. A tasks file with no task line at all is taken for a broken write and counts nothing. The count is kept in memory, so a restart or a config reload starts it again; a line that comes back resets it.
 
 **Milestones.** With `close_when_complete` (the default), an open milestone with closed issues and no open one is closed, and a closed one with an open issue is reopened. Only its state is sent: its title, description and due date are the owner's. Lair never creates a milestone; a rule naming one that does not exist is reported and the issue is created without it.
 
@@ -3237,6 +3248,7 @@ Only `outcome: "applied"` changes count (`planned` is the planner's own observe 
 | `repos[].milestones.close_when_complete` | `true` | Close a complete milestone, reopen one with an open issue |
 | `repos[].milestones.rules` | `[]` | `{tasks: [globs], milestone: "title"}`: the existing milestone of the issues created for those tasks |
 | `create_issues_for_new_tasks` | `false` | Create an issue for a task none is linked to (act mode) |
+| `close_removed_tasks` | `false` | Close as not planned the issue of a linked task whose line was removed or commented out by hand (missing 2 reconciles in a row); off: recorded as `would_close` and listed in the status |
 | `blocked_label` | `blocked` | The label of a blocked task's issue |
 | `redact_patterns` | `[]` | Redacted from every text sent, after the built-in rules |
 | `reconcile_interval_seconds` | `900` | 60 to 86400 |
@@ -3251,7 +3263,7 @@ The tasks it follows are `agents.fill.tasks_file` (the planner's done marker mar
 
 `?project=` defaults to the default project. Every route is the owner's (`/api/tracker` is owner-only, reads included: they show task text and repositories):
 
-- `GET /api/tracker/status`: the mode, each repository and its board (loaded, or why not), the token's scopes (granted, missing), the sync state (last reconcile, next one, drift fixed, errors, the rate-limit wait, what needs the owner), the links, the pending creates, the latest 50 writes (each with its result, or `would_send` in observe mode), the queue (waiting, dropped), warnings and config errors
+- `GET /api/tracker/status`: the mode, each repository and its board (loaded, or why not), the token's scopes (granted, missing), the sync state (last reconcile, next one, drift fixed, errors, the rate-limit wait, what needs the owner), the links, the pending creates, the latest 50 writes (each with its result, or `would_send` in observe mode, or `would_close` for a removed task line while `close_removed_tasks` is off), the queue (waiting, dropped), `closedUnmerged` (linked tasks' PRs the last reconcile saw closed without merging), `removedTasks` (linked tasks whose line is missing: reconciles missed, and `waiting`, `would_close` or `closing`), warnings and config errors
 - `POST /api/tracker/reconcile`: a reconcile now, queued after the jobs waiting (202); recorded in the audit with the owner session. 404 when the tracker is off for the project
 
 The tracker emits no events of its own. The dashboard tab is not built yet.

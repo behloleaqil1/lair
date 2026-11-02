@@ -9,6 +9,10 @@
  * - Agents may send only to "orchestrator" and "owner"
  * - The owner can send to any agent
  * - An agent can read and ack only its own messages
+ *
+ * A report or message is stored, then mirrored (awaited: the mirror's writes
+ * are asynchronous), then emitted: a consumer that reads the mirrored line
+ * on the event finds it in the file.
  */
 import type { EventBus } from "../core/event-bus.js";
 import type { BusStore, BusReport, BusMessage } from "./store.js";
@@ -149,7 +153,7 @@ export class BusService {
 
   // ============ report ============
 
-  report(
+  async report(
     binding: BusTokenBinding,
     kind: ReportKind,
     task: string,
@@ -157,7 +161,7 @@ export class BusService {
     gateId?: string,
     pr?: number,
     sha?: string,
-  ): BusResult<ReportResult> {
+  ): Promise<BusResult<ReportResult>> {
     // Validate: the run must hold this task
     const claimedTask = this.getClaimedTask(binding.runId);
     if (claimedTask !== task) {
@@ -190,7 +194,7 @@ export class BusService {
     // Mirror to text files
     const mirrored: string[] = [];
     if (this.mirror) {
-      const files = this.mirror.mirrorReport(binding.agent, kind, task, sanitizedSummary, iso(now), gateId, pr, sha, id);
+      const files = await this.mirror.mirrorReport(binding.agent, kind, task, sanitizedSummary, iso(now), gateId, pr, sha, id);
       mirrored.push(...files);
     }
 
@@ -201,7 +205,7 @@ export class BusService {
 
     // Wake on DONE or BLOCKED
     if (this.wakeFile && (kind === "DONE" || kind === "BLOCKED")) {
-      this.mirror?.touchWake(this.wakeFile);
+      await this.mirror?.touchWake(this.wakeFile);
     }
 
     return { ok: true, data: { id, mirrored } };
@@ -250,7 +254,7 @@ export class BusService {
 
   // ============ send (from agent) ============
 
-  send(binding: BusTokenBinding, to: string, text: string, priority?: number): BusResult<SendResult> {
+  async send(binding: BusTokenBinding, to: string, text: string, priority?: number): Promise<BusResult<SendResult>> {
     // Agents can only send to orchestrator or owner
     if (to !== ORCHESTRATOR_ID && to !== OWNER_ID) {
       return {
@@ -265,7 +269,7 @@ export class BusService {
 
     // Mirror to text files
     if (this.mirror) {
-      this.mirror.mirrorMessage(messageId, binding.agent, to, sanitizedText, iso(now));
+      await this.mirror.mirrorMessage(messageId, binding.agent, to, sanitizedText, iso(now));
     }
 
     // Emit event
@@ -278,14 +282,14 @@ export class BusService {
 
   // ============ send (from owner) ============
 
-  sendFromOwner(to: string, text: string, priority?: number): BusResult<SendResult> {
+  async sendFromOwner(to: string, text: string, priority?: number): Promise<BusResult<SendResult>> {
     const now = Date.now();
     const sanitizedText = sanitizeText(text, MAX_MESSAGE_CHARS);
     const messageId = this.store.sendMessage(OWNER_ID, to, sanitizedText, priority ?? 5, now);
 
     // Mirror to text files
     if (this.mirror) {
-      this.mirror.mirrorMessage(messageId, OWNER_ID, to, sanitizedText, iso(now));
+      await this.mirror.mirrorMessage(messageId, OWNER_ID, to, sanitizedText, iso(now));
     }
 
     // Emit event
@@ -295,7 +299,7 @@ export class BusService {
 
     // Wake on owner message
     if (this.wakeFile) {
-      this.mirror?.touchWake(this.wakeFile);
+      await this.mirror?.touchWake(this.wakeFile);
     }
 
     return { ok: true, data: { messageId, to } };

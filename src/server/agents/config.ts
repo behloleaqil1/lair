@@ -528,6 +528,13 @@ export function matchesByAgent(fill: Pick<FillSettings, "donePattern" | "waiting
 /** What a waiting line may name to wait on: one plain name (a gate id, say), never a path or an option */
 export const WAKE_VALUE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 
+/**
+ * One plain name (WAKE_VALUE) with no "..": never a path, an option or a parent directory. What a waiting line may
+ * name and fill may look up (a gate id), what the bus accepts as a report's gate id, and what the bus mirror joins
+ * into a directory as a file name.
+ */
+export const isPlainName = (value: string): boolean => WAKE_VALUE.test(value) && !value.includes("..");
+
 export interface BudgetLimit {
   soft?: number;
   hard?: number;

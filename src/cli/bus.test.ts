@@ -134,7 +134,7 @@ describe("bus CLI", () => {
 
       let capturedBody: { tool: string; args: Record<string, unknown> } | null = null;
       const code = await busCli(
-        ["report", "--kind", "WAITING", "--task", "feat-x", "--summary-file", summaryFile, "--gate", "gate-123", "--pr", "42", "--sha", "abc123"],
+        ["report", "--kind", "WAITING", "--task", "feat-x", "--summary-file", summaryFile, "--gate", "gate-123", "--pr", "42", "--sha", "abc1234"],
         deps({
           fetch: async (_url, init) => {
             capturedBody = JSON.parse(init.body);
@@ -146,7 +146,7 @@ describe("bus CLI", () => {
       expect(code).toBe(EXIT_OK);
       expect(capturedBody!.args.gate_id).toBe("gate-123");
       expect(capturedBody!.args.pr).toBe(42);
-      expect(capturedBody!.args.sha).toBe("abc123");
+      expect(capturedBody!.args.sha).toBe("abc1234");
     });
 
     it("rejects invalid --kind", async () => {
