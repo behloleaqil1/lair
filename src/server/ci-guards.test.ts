@@ -13,7 +13,8 @@
  * The route guard (no mutating method on a public route) lives in
  * human-auth/route-ownership.test.ts beside the route scan it uses.
  */
-import { readdirSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -589,9 +590,11 @@ export function wiringProblems(indexSource: string, modules: readonly string[], 
   return problems;
 }
 
-function moduleDirectories(dir: string): string[] {
+/** The directories under dir that hold source (a directory of tests only, such as an end-to-end suite, is not a module) */
+export function moduleDirectories(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true })
     .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+    .filter((entry) => sourceFiles(join(dir, entry.name)).length > 0)
     .map((entry) => entry.name);
 }
 
@@ -640,6 +643,19 @@ describe("wiring guard", () => {
         "helpers: on UNWIRED_ALLOWED but index.ts imports it: remove the stale entry",
       ]);
       expect(wiringProblems("", [], allowed)).toEqual(["helpers: on UNWIRED_ALLOWED but no such directory"]);
+    });
+
+    it("counts a directory with source as a module, and one with tests only as none", () => {
+      const root = mkdtempSync(join(tmpdir(), "ci-guards-"));
+      try {
+        mkdirSync(join(root, "feature", "nested"), { recursive: true });
+        writeFileSync(join(root, "feature", "nested", "thing.ts"), "export const thing = 1;\n");
+        mkdirSync(join(root, "suite"));
+        writeFileSync(join(root, "suite", "cycle.test.ts"), "export {};\n");
+        expect(moduleDirectories(root)).toEqual(["feature"]);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
     });
   });
 });
