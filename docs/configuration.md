@@ -1393,7 +1393,7 @@ Globs use `**` (any directories), `*`, `?` and `{a,b}`; a glob without `/` match
 | `agent:<id>` | That reviewer agent, never the author; the author must be known (an unknown author may be that very agent) |
 | `peer` | Any reviewer, agent or human, other than the author |
 | `self` | The author's own review (its self-check) |
-| `{any_of: [...], different_model: true}` | Any of the listed ones; with `different_model`, an agent on a model other than the author's (a human always qualifies). `pool: [ids]` names the reviewer agents for this slot ([Reviews by agents](#reviews-by-agents)) |
+| `{any_of: [...], different_model: true}` | Any of the listed ones; with `different_model`, an agent on a model other than the author's (a human always qualifies). `pool: [ids]` names the reviewer agents for this slot ([Reviews by agents](#reviews-by-agents)). `ask_after: [gate, earlier_slots]` (either or both) asks for the slot only once the gate passed at the head and/or every earlier slot of the tier is approved there ([Staged slots](#staged-slots)) |
 
 Defaults: `red: [human]`, `amber: [peer]`, `green: [self]`. Only an `approve` given at the PR's current head sha counts; a push makes every older review stale, and a reviewer's later review replaces its earlier one. The author is the agent Lair's own modules registered for the PR (the agent assigner or intake; never settable over HTTP), else the agent the branch mappings name (`authors.branch_pattern`, `authors.branches` and `authors.from_tasks_file`, see [Reviews by agents](#reviews-by-agents)); its model comes from `dragons:` or `authors.models`. `branch_pattern` is a template, not a regular expression: `{agent}` (exactly once) is an agent id, `*` matches within one path segment and `**` (at most once) across segments, and everything else is literal, so `agent/{agent}/**` reads `worker-a` from `agent/worker-a/fix-login`. Branch names longer than 255 characters never match. With no author, no agent slot (`agent:<id>`, `peer`, `self`) and no `different_model` can be satisfied, no agent is asked to review, and the status says why (`authorNote`).
 
@@ -1551,11 +1551,28 @@ The runner sends `--pipeline <id>` and `--pipeline-version <version>` with each 
 
 ### Reviewers and the Decision Inbox
 
-`POST /api/review/prs/:number/request-reviews` (owner only: asking can start reviewer runs) asks for every missing review at the head, once per head: a named or peer reviewer agent, or the author's self-check, through the agent assigner, and a human through the Decision Inbox. A slot is asked for again at the same head only after its assignee reviewed without filling it (for example on the author's model when `different_model` is set), as a new round: the earlier rounds' records stay. A round is written, with its token's hash, before the assigner is called; one that Lair never finished handing on (it stopped in between, or the assigner failed) doesn't count after 10 minutes, so the slot can be asked for again. When the PR gets a new head, the human reviews asked for at the old one are withdrawn from the Decision Inbox, so only the current head's request stays open.
+`POST /api/review/prs/:number/request-reviews` (owner only: asking can start reviewer runs) asks for every missing review at the head, once per head: a named or peer reviewer agent, or the author's self-check, through the agent assigner, and a human through the Decision Inbox. A slot still waiting on its `ask_after` is skipped, and the response says so ([Staged slots](#staged-slots)). A slot is asked for again at the same head only after its assignee reviewed without filling it (for example on the author's model when `different_model` is set), as a new round: the earlier rounds' records stay. A round is written, with its token's hash, before the assigner is called; one that Lair never finished handing on (it stopped in between, or the assigner failed) doesn't count after 10 minutes, so the slot can be asked for again. When the PR gets a new head, the human reviews asked for at the old one are withdrawn from the Decision Inbox, so only the current head's request stays open.
 
 Each agent assignment carries a random token, which the assigner must hand only to the agent doing the review; Lair stores only its hash, recorded before the assigner is called. A token counts for **one** review: a second review with it is refused (403), and so is a review under an assignment that a later request replaced. An assignment for a named agent (or the author's self-check) is that agent's, and a review under it must name that agent; one for any peer binds to the first agent, other than the author, that reviews with it.
 
 A project with [reviews by agents](#reviews-by-agents) has its named and peer reviews done by agents Lair starts; otherwise, and for self-checks, agent requests are published on the event bus as `review.assignment_requested`. The assignment event carries the token, and the event bus is internal to the server: it is not served over HTTP. The review module's decisions (a human review, a refused merge, no agent review) are raised in the [Decision Inbox](#decision-inbox) as module `review`. Other events: `review.submitted`, `review.invalidated` (a push made reviews stale), `review.merged`, `review.merge_refused`.
+
+### Staged slots
+
+An expensive reviewer (a strong model, a busy human) should review only work that is a real candidate. A slot in object form can set `ask_after`, a list with either or both of:
+
+- `gate`: ask for the slot only once the merge gate passed at the PR's current head (the merge policy's rule: every required check passed, for the head; signed results where `merge.gate.source: signed`);
+- `earlier_slots`: ask only once every earlier slot in the same tier list is filled by an approval at the head.
+
+```yaml
+review:
+  reviewers:
+    red:
+      - { any_of: [peer], pool: [reviewer-a, reviewer-b] }
+      - { any_of: [peer], different_model: true, pool: [strong-reviewer], ask_after: [gate, earlier_slots] }
+```
+
+Until its condition holds at the head, a missing slot is `waiting`: it is not asked for (no round, no token, no attempt, no run, no Decision Inbox item). The PR's status shows the reason on the slot (`slots[i].waiting`, also in its `detail`) and in `assignments` as state `waiting`, and the dashboard's "Required reviews" table shows it. Lair looks again at a waiting slot on the scan every minute (at most 10 PRs per scan, the ones looked at longest ago first; a project with [reviews by agents](#reviews-by-agents)), and at once when a gate result is stored for the head or an approval arrives for it; then only the waiting slots are asked, so the other slots are still asked once per head. A new head starts over, and the condition is checked at the new head. The owner's "Request missing reviews" skips waiting slots too: their outcome's channel is `waiting`, with the reason. Merge rules don't change: a waiting slot is a missing one, and a `request_changes` from any reviewer blocks the merge. Without `ask_after` a slot is asked as soon as it is missing. An unknown value, a value listed twice, an empty list and `earlier_slots` on a tier's first slot are config errors.
 
 ### Reviews by agents
 
@@ -1621,7 +1638,7 @@ The model recorded with the review is the one of the profile the run actually ru
 
 **Retries and decisions.** A run can end without a review: it exited without submitting, crashed past the agents module's own recovery, or was escalated. Then the slot is retried with a new token (the old one stops working) after `retries.backoff_seconds`, doubling up to `retries.max_backoff_seconds`, by an agent that hasn't tried yet when there is one. After `retries.max_attempts` runs the slot fails and Lair raises an `escalation` decision in the Decision Inbox ("No agent reviewed PR #n at <sha>"); only the owner's "Request missing reviews" starts a new round. A push or a closed PR makes the open assignments `stale`: nothing more starts for that head, and a review run still going is stopped (its claim is released, and the agents module stops it on its next check). The state is in `data/review.db` (schema version 2), so a restart carries on where it stopped.
 
-**Status.** A PR's "Required reviews" table (PRs section) shows each slot's request, read-only: `requested` (with the retry time), `assigned to <agent>` (the run and the attempt), `reviewed by <agent>`, `failed` or `stale`, with the detail. `GET /api/review/prs/:number` returns the same as `assignments`.
+**Status.** A PR's "Required reviews" table (PRs section) shows each slot's request, read-only: `requested` (with the retry time), `assigned to <agent>` (the run and the attempt), `reviewed by <agent>`, `failed`, `stale` or `waiting` ([staged slots](#staged-slots)), with the detail. `GET /api/review/prs/:number` returns the same as `assignments`.
 
 **Authors.** A peer review needs to know who wrote the PR. Besides `authors.branch_pattern`, which reads an agent id carried in the branch name:
 

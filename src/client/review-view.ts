@@ -18,12 +18,20 @@ export const ASSIGNMENT_BADGE: Record<SlotAssignmentState, string> = {
   reviewed: "badge-success",
   failed: "badge-error",
   stale: "badge-neutral",
+  waiting: "badge-neutral",
 };
+
+/** The owner's "Request missing reviews" result in one line: the slots it skipped as waiting (askAfter) are named, with why. */
+export function requestReviewsMessage(outcomes: { slot: string; channel: string; detail: string }[]): string {
+  const waiting = outcomes.filter((o) => o.channel === "waiting");
+  if (waiting.length === 0) return "Request reviews: done";
+  return `Request reviews: done; skipped ${waiting.length} waiting: ${waiting.map((o) => `${o.slot} (${o.detail})`).join("; ")}`;
+}
 
 /**
  * A slot's request at the head, in a few words: "requested", "assigned to
- * <agent>", "reviewed by <agent>", "failed" or "stale", with the attempt and
- * the run when an agent's run took it; null when it wasn't asked for.
+ * <agent>", "reviewed by <agent>", "failed", "stale" or "waiting", with the
+ * attempt and the run when an agent's run took it; null when it wasn't asked for.
  */
 export function assignmentLabel(a: SlotAssignmentView | undefined): { badge: string; text: string; detail: string } | null {
   if (!a) return null;

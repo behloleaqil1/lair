@@ -29,7 +29,7 @@ import type {
 import type { DecisionEvidence } from "../../shared/decision-types.js";
 import type { EventBus } from "../core/event-bus.js";
 import { assessRisk } from "../policy/risk-rules.js";
-import { matchSlots } from "../policy/reviewer-slots.js";
+import { matchSlots, withSlotWaits } from "../policy/reviewer-slots.js";
 import { evaluateMergePolicy } from "../policy/merge-policy.js";
 import { parseReviewConfig, type ReviewSettings } from "./config.js";
 import { mapAuthor } from "./authors.js";
@@ -212,8 +212,10 @@ export class ReviewService {
   private readonly gateSource: GateSource;
   private repoInfo: { at: number; repo: HostRepo | null } | null = null;
   private integrityRuns = new Map<string, Promise<void>>();
-  /** requestReviews in progress per PR: a second call shares it, so a slot is never asked for twice at once */
-  private requesting = new Map<number, Promise<RequestOutcome[]>>();
+  /** requestReviews in progress per PR (`only`: the slots it looks at): a second call shares or follows it, so a slot is never asked for twice at once */
+  private requesting = new Map<number, { promise: Promise<RequestOutcome[]>; only?: readonly number[] }>();
+  /** The slots a round left waiting (askAfter) per PR, at its head: the scan, a gate result or a review there looks again */
+  private waiting = new Map<number, { headSha: string; slots: number[]; checkedAt: number }>();
   private merging = false;
   /** Set by drain() (a config reload): no merge starts here any more */
   private closing = false;
@@ -315,11 +317,11 @@ export class ReviewService {
     }
   }
 
-  /** Where each slot's request stands at `headSha`: reviews by agents, else the request record. */
+  /** Where each slot's request stands at `headSha`: reviews by agents, else the request record, else why it waits. */
   private assignmentViews(n: number, headSha: string, slots: SlotStatus[]): SlotAssignmentView[] {
     const rows = new Map(this.o.store.agentAssignments(this.project, n, headSha).map((r) => [r.slot, r]));
     const views: SlotAssignmentView[] = [];
-    slots.forEach((_slot, index) => {
+    slots.forEach((slot, index) => {
       const row = rows.get(index);
       if (row) {
         views.push({
@@ -337,7 +339,23 @@ export class ReviewService {
         return;
       }
       const request = this.o.store.getRequest(this.project, n, headSha, index);
-      if (!request) return;
+      if (!request) {
+        if (slot.waiting) {
+          views.push({
+            slot: index,
+            state: "waiting",
+            channel: "waiting",
+            agent: null,
+            runId: null,
+            attempts: 0,
+            maxAttempts: null,
+            detail: slot.waiting,
+            notBefore: null,
+            updatedAt: this.now(),
+          });
+        }
+        return;
+      }
       views.push({
         slot: index,
         state: request.usedBy ? "reviewed" : "requested",
@@ -616,11 +634,14 @@ export class ReviewService {
         headSha: r.headSha,
         superseded: r.superseded,
       }));
-    const slots = matchSlots(this.settings.reviewers[risk.tier], candidates, author, pr.headSha, others);
+    const matched = matchSlots(this.settings.reviewers[risk.tier], candidates, author, pr.headSha, others);
     const redSlots =
-      risk.tier === "red" ? slots : matchSlots(this.settings.reviewers.red, candidates, author, pr.headSha, others);
+      risk.tier === "red" ? matched : matchSlots(this.settings.reviewers.red, candidates, author, pr.headSha, others);
 
     const gate = await this.gateSource.checksAt(pr.headSha);
+    // The merge policy's gate rule (every required check passed, for the head): a slot with askAfter: gate waits for it
+    const gatePassed = gate.length > 0 && gate.every((g) => g.status === "passed" && g.sha === pr.headSha);
+    const slots = withSlotWaits(matched, gatePassed, pr.headSha);
     let baseTip: string | null = null;
     let behindBy: number | null = null;
     try {
@@ -776,6 +797,8 @@ export class ReviewService {
       blockingFindings: input.findings.filter((f) => f.blocking).length,
       stale: review.stale,
     });
+    // An approval may be what a slot with askAfter: earlier_slots waits for
+    if (input.verdict === "approve") this.askWaiting((pr, headSha) => pr === n && headSha === input.headSha);
     return { review, stale: review.stale };
   }
 
@@ -1002,7 +1025,10 @@ export class ReviewService {
         403,
       );
     }
-    return this.o.store.addGateResult(this.project, trusted, this.now());
+    const stored = this.o.store.addGateResult(this.project, trusted, this.now());
+    // It may complete the gate a slot with askAfter: gate waits for at that head
+    if (stored) this.askWaiting((_pr, headSha) => headSha === signed.result.commitSha);
+    return stored;
   }
 
   /**
@@ -1023,6 +1049,7 @@ export class ReviewService {
       return { stored: false, detail: `the result is ${bytes} bytes, more than review keeps (${MAX_TRIAGE_RESULT_BYTES})` };
     }
     const stored = this.o.store.addGateResult(this.project, signed, this.now());
+    if (stored) this.askWaiting((_pr, headSha) => headSha === signed.result.commitSha);
     return { stored, detail: stored ? "stored" : "already stored" };
   }
 
@@ -1030,16 +1057,33 @@ export class ReviewService {
    * Ask for every missing review at the head, once per head: a named or peer
    * agent through the assigner, the author's self-check through the
    * assigner, and a human through the Decision Inbox. No agent is asked
-   * while the PR's author is unknown. `origin`: the owner (POST
+   * while the PR's author is unknown, nor for a slot waiting on its
+   * askAfter (outcome `waiting`). `origin`: the owner (POST
    * ./request-reviews, owner only) also asks again for a slot whose reviews
-   * by agents failed; the automatic scan never does.
+   * by agents failed; the automatic scan never does. `only`: look at these
+   * slots alone (the ones a round left waiting).
    */
-  requestReviews(n: number, origin: RequestOrigin = "owner"): Promise<RequestOutcome[]> {
+  requestReviews(n: number, origin: RequestOrigin = "owner", only?: readonly number[]): Promise<RequestOutcome[]> {
     const running = this.requesting.get(n);
-    if (running) return running;
-    const request = this.requestNow(n, origin).finally(() => this.requesting.delete(n));
-    this.requesting.set(n, request);
-    return request;
+    // A round for the waiting slots shares the round in progress; a full round shares a full one and follows a partial one
+    if (running && (only || !running.only)) return running.promise;
+    const start = () => this.requestNow(n, origin, only);
+    const promise: Promise<RequestOutcome[]> = (running ? running.promise.then(start, start) : start()).finally(() => {
+      if (this.requesting.get(n)?.promise === promise) this.requesting.delete(n);
+    });
+    this.requesting.set(n, { promise, only });
+    return promise;
+  }
+
+  /** Ask again, in the background, for the slots left waiting at a head that a gate result or a review just arrived for. */
+  private askWaiting(at: (pr: number, headSha: string) => boolean): void {
+    if (this.closing) return;
+    for (const [n, w] of this.waiting) {
+      if (!at(n, w.headSha)) continue;
+      void this.requestReviews(n, "auto", w.slots).catch((e) =>
+        console.warn(`[review] ${this.project} #${n}: asking for the waiting reviews failed: ${e instanceof Error ? e.message : e}`),
+      );
+    }
   }
 
   /** Last automatic round per PR: which head, and when */
@@ -1049,23 +1093,41 @@ export class ReviewService {
    * The automatic path (reviews by agents): request the missing reviews of
    * every open, non-draft PR when it is first seen or its head changed, at
    * most once per AUTO_REQUEST_MIN_INTERVAL_MS per PR. A failed round waits
-   * for the owner. Returns the PRs it asked for.
+   * for the owner. At a head it asked at already, it looks again at the
+   * slots left waiting (askAfter) only: at most MAX_AUTO_EVALUATIONS PRs per
+   * scan, the ones looked at longest ago first. Returns the PRs it asked for.
    */
   async requestOpenPullRequests(): Promise<number[]> {
     if (this.closing) return [];
     const asked: number[] = [];
+    const rechecks: { n: number; slots: number[]; checkedAt: number }[] = [];
     for (const pr of await this.o.host.listOpenPullRequests()) {
       await this.noteHead(pr);
       if (pr.draft) continue;
       const now = this.o.clock.now();
       const last = this.autoRequested.get(pr.number);
-      if (last && (last.headSha === pr.headSha || now - last.at < AUTO_REQUEST_MIN_INTERVAL_MS)) continue;
+      if (last?.headSha === pr.headSha) {
+        const waits = this.waiting.get(pr.number);
+        if (waits?.headSha === pr.headSha) rechecks.push({ n: pr.number, slots: waits.slots, checkedAt: waits.checkedAt });
+        continue;
+      }
+      if (last && now - last.at < AUTO_REQUEST_MIN_INTERVAL_MS) continue;
       this.autoRequested.set(pr.number, { headSha: pr.headSha, at: now });
       try {
         await this.requestReviews(pr.number, "auto");
         asked.push(pr.number);
       } catch (e) {
         console.warn(`[review] ${this.project} #${pr.number}: automatic review request failed: ${e instanceof Error ? e.message : e}`);
+      }
+    }
+    rechecks.sort((a, b) => a.checkedAt - b.checkedAt);
+    for (const r of rechecks.slice(0, MAX_AUTO_EVALUATIONS)) {
+      if (this.closing) break;
+      try {
+        const outcomes = await this.requestReviews(r.n, "auto", r.slots);
+        if (outcomes.some((o) => o.channel !== "waiting")) asked.push(r.n);
+      } catch (e) {
+        console.warn(`[review] ${this.project} #${r.n}: asking for the waiting reviews failed: ${e instanceof Error ? e.message : e}`);
       }
     }
     return asked;
@@ -1298,10 +1360,12 @@ export class ReviewService {
     }
   }
 
-  private async requestNow(n: number, origin: RequestOrigin): Promise<RequestOutcome[]> {
+  private async requestNow(n: number, origin: RequestOrigin, only?: readonly number[]): Promise<RequestOutcome[]> {
     const status = await this.status(n);
     const outcomes: RequestOutcome[] = [];
+    const waiting: number[] = [];
     for (const [index, slot] of status.slots.entries()) {
+      if (only && !only.includes(index)) continue;
       if (slot.satisfiedBy) continue;
       // Once per head; again when the assignee reviewed without filling the slot, or (the owner) when reviews by agents failed
       const previous = this.o.store.getRequest(this.project, n, status.headSha, index);
@@ -1323,6 +1387,12 @@ export class ReviewService {
           channel: "already requested",
           detail: failedRound ? `at ${short(status.headSha)}: it failed, and only the owner asks again` : `at ${short(status.headSha)}`,
         });
+        continue;
+      }
+      // Staged slots: not asked for (no round, token, attempt or run) until its askAfter holds at the head
+      if (slot.waiting) {
+        waiting.push(index);
+        outcomes.push({ slot: slot.label, channel: "waiting", detail: `not asked for yet: ${slot.waiting}` });
         continue;
       }
       const options = slot.slot.anyOf;
@@ -1441,6 +1511,11 @@ export class ReviewService {
       }
       this.o.store.recordRequest(this.project, n, status.headSha, index, channel, detail, this.now());
       outcomes.push({ slot: slot.label, channel, detail });
+    }
+    if (waiting.length > 0) {
+      this.waiting.set(n, { headSha: status.headSha, slots: waiting, checkedAt: this.o.clock.now() });
+    } else {
+      this.waiting.delete(n);
     }
     return outcomes;
   }
