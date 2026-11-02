@@ -40,7 +40,7 @@ export const KNOWN_DECISION_CLASSES: Readonly<Record<string, { policy: string; c
   "agents.cannot_start": { policy: "C11", codes: ["probe_failed", "fill_waiting"] },
   "host-services.service_down": { policy: "C12", codes: ["start_failed", "flapping", "not_started", "probe_timeout"] },
   "pr_health.notice": { policy: "C13", codes: ["no_owner", "delivery_failed", "unfixed"] },
-  "agents.spend_notice": { policy: "C14", codes: ["waste_share", "task_attempts", "would_park", "would_cool", "budget_soft", "would_block"] },
+  "agents.spend_notice": { policy: "C14", codes: ["waste_share", "task_attempts", "would_park", "would_cool", "budget_soft", "would_block", "would_wake"] },
 };
 
 export function isKnownDecisionClass(id: string): boolean {
