@@ -55,6 +55,7 @@ import type {
   ProviderUnreachableView,
   RunOrigin,
   SpendGroupBy,
+  SpendGuardId,
   SpendReportView,
   SpendWindow,
   StopReason,
@@ -505,6 +506,20 @@ interface EventInput {
   evidence?: string[];
   data?: Record<string, unknown>;
   dedupeKey?: string;
+}
+
+/** A verdict of a guard another module runs (AgentsService.recordModuleGuard): numbers, ids and enums only. */
+export interface ModuleGuard {
+  guard: SpendGuardId;
+  /** would_skip, would_apply (observe); skip, apply (act) */
+  verdict: string;
+  /** What it is about: a planner run, a message id */
+  subject: string;
+  task?: string | null;
+  summary: string;
+  evidence: string[];
+  data: Record<string, string | number | boolean | null | string[]>;
+  dedupeKey: string;
 }
 
 type LockAttempt = { ok: true; held: AgentLockSettings[] } | { ok: false; wait: StoredLockWait };
@@ -3727,6 +3742,27 @@ export class AgentsService {
     return this.spend.recordCall(call);
   }
 
+  /**
+   * A guard another module runs (the planner's G6 parts): one guard_would (observe) or guard_did (act) event, so the
+   * spend API counts it with the agents' own guards. Once per dedupe key; nothing while agents.spend is off. True
+   * when this call recorded it.
+   */
+  async recordModuleGuard(kind: "guard_would" | "guard_did", guard: ModuleGuard): Promise<boolean> {
+    if (!this.spend.enabled) return false;
+    return this.record(
+      kind,
+      {
+        task: guard.task ?? undefined,
+        subject: guard.subject,
+        summary: guard.summary,
+        evidence: guard.evidence,
+        data: { ...guard.data, guard: guard.guard, verdict: guard.verdict },
+        dedupeKey: guard.dedupeKey,
+      },
+      this.probes.clock.now(),
+    );
+  }
+
   // ============ REAPERS ============
 
   private async claimReleased(claim: Claim, t: Tick, why: string): Promise<void> {
@@ -4828,6 +4864,19 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
       return this.services.get(project)?.recordCall(call) ?? false;
     } catch (e) {
       console.warn(`[agents] ${project}: a model call was not recorded: ${e instanceof Error ? e.message : String(e)}`);
+      return false;
+    }
+  }
+
+  /**
+   * A guard verdict of another module (AgentsService.recordModuleGuard): recorded while the project's agents module
+   * runs with agents.spend on, else nothing. Never throws; true when this call recorded it.
+   */
+  async recordModuleGuard(project: string, kind: "guard_would" | "guard_did", guard: ModuleGuard): Promise<boolean> {
+    try {
+      return (await this.services.get(project)?.recordModuleGuard(kind, guard)) ?? false;
+    } catch (e) {
+      console.warn(`[agents] ${project}: a ${guard.guard} verdict was not recorded: ${e instanceof Error ? e.message : String(e)}`);
       return false;
     }
   }

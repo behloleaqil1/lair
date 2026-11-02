@@ -33,10 +33,19 @@ import type { SignedGateResult } from "../../shared/policy-types.js";
  *    the owner (its decision needs an answer; anyone else's is a notice).
  * 4: review_auto_merges: each automatic merge (review.merge.auto) per PR and
  *    head, written before it starts, so one a restart interrupted is known.
+ * 5: review_prs.head_ref, .state and .state_seen_at: the PR's branch and
+ *    state as the review module last read them from the host (the planner's
+ *    closed-work guard reads which task's own PR merged from them).
  */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
-const SCHEMA_4 = `
+export const SCHEMA_5 = `
+  ALTER TABLE review_prs ADD COLUMN head_ref TEXT;
+  ALTER TABLE review_prs ADD COLUMN state TEXT;
+  ALTER TABLE review_prs ADD COLUMN state_seen_at TEXT;
+`;
+
+export const SCHEMA_4 = `
   CREATE TABLE IF NOT EXISTS review_auto_merges (
     project TEXT NOT NULL,
     pr INTEGER NOT NULL,
@@ -50,9 +59,9 @@ const SCHEMA_4 = `
   CREATE INDEX IF NOT EXISTS idx_review_auto_merges_state ON review_auto_merges(project, state);
 `;
 
-const SCHEMA_3 = `ALTER TABLE review_holds ADD COLUMN by_owner INTEGER NOT NULL DEFAULT 0;`;
+export const SCHEMA_3 = `ALTER TABLE review_holds ADD COLUMN by_owner INTEGER NOT NULL DEFAULT 0;`;
 
-const SCHEMA_2 = `
+export const SCHEMA_2 = `
   CREATE TABLE review_requests_2 (
     project TEXT NOT NULL,
     pr INTEGER NOT NULL,
@@ -501,6 +510,8 @@ export class ReviewStore {
         if (version < 3) this.db.exec(SCHEMA_3);
         // 3 -> 4: automatic merges are new (no rows to carry over)
         if (version < 4) this.db.exec(SCHEMA_4);
+        // 4 -> 5: a PR's branch and state are unknown until the review module reads it again
+        if (version < 5) this.db.exec(SCHEMA_5);
         this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
       })();
     }
@@ -654,6 +665,38 @@ export class ReviewStore {
       .prepare(`UPDATE review_prs SET head_sha = ?, head_seen_at = ? WHERE project = ? AND pr = ?`)
       .run(headSha, at, project, pr);
     return previous;
+  }
+
+  /**
+   * Record a PR's branch and state as read from the host now. Written only when one of them changed (a scan reads
+   * every open PR each time); state_seen_at is when the state last changed.
+   */
+  observePull(project: string, pr: number, headRef: string | null, state: "open" | "closed" | "merged" | null, at: string): void {
+    this.ensurePr(project, pr);
+    this.db
+      .prepare(
+        `UPDATE review_prs SET head_ref = ?, state = ?, state_seen_at = CASE WHEN state IS ? THEN state_seen_at ELSE ? END
+         WHERE project = ? AND pr = ? AND (head_ref IS NOT ? OR state IS NOT ?)`,
+      )
+      .run(headRef, state, state, at, project, pr, headRef, state);
+  }
+
+  /**
+   * PRs this store records as merged: by the review module (review_merges), or read as merged from the host. With
+   * the branch the review module last read (null when it never read one), the newest first, at most `limit`.
+   */
+  mergedPrs(project: string, limit: number): { pr: number; branch: string | null; at: string | null }[] {
+    return this.db
+      .prepare(
+        `SELECT pr, MAX(branch) AS branch, MAX(at) AS at FROM (
+           SELECT m.pr AS pr, p.head_ref AS branch, m.merged_at AS at
+             FROM review_merges m LEFT JOIN review_prs p ON p.project = m.project AND p.pr = m.pr
+            WHERE m.project = ?
+           UNION ALL
+           SELECT pr, head_ref AS branch, state_seen_at AS at FROM review_prs WHERE project = ? AND state = 'merged'
+         ) GROUP BY pr ORDER BY at DESC, pr DESC LIMIT ?`,
+      )
+      .all(project, project, limit) as { pr: number; branch: string | null; at: string | null }[];
   }
 
   setAuthor(project: string, pr: number, author: ReviewerRef): void {

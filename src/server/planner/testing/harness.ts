@@ -27,6 +27,7 @@ import {
 } from "../../watchdog/probes.js";
 import { mountPlanner, plannerAgentsFrom, type PlannerManager, type PlannerService } from "../index.js";
 import type { BusLineSource } from "../../bus/consumers.js";
+import type { PlannerPrs } from "../guards.js";
 
 export const NOW = Date.parse("2026-03-02T12:00:00.000Z");
 export const SEC = 1000;
@@ -263,6 +264,8 @@ export async function setup(
     extra?: Partial<ProjectConfig>;
     /** The project's bus as fill and the planner read it (bus.consume observe or on); no bus without it */
     bus?: (project: string) => BusLineSource | null;
+    /** The review store's merged PRs as the server wires them (planner.guards.prefilter_closed); none without it */
+    prs?: PlannerPrs;
   } = {},
 ): Promise<Harness> {
   const config = projectConfig(p, planner, options.extra);
@@ -310,6 +313,7 @@ export async function setup(
     defaultProject: () => "demo",
     humanAuth: auth,
     bus: busSource,
+    prs: options.prs,
   });
   plannerManager.useDecisions(inbox);
   await app.ready();

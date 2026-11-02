@@ -38,7 +38,7 @@ const RAISERS: Record<string, string[]> = {
   "decisions/holds.ts": [".hold"],
   "gates/pipeline-service.ts": ["pipelines.budget"],
   "host-services/service.ts": ["host-services.service_down"],
-  "planner/service.ts": ["planner.tamper", "planner.unblock", "planner.attempts", "planner.failing", "planner.proposal"],
+  "planner/service.ts": ["planner.tamper", "planner.unblock", "planner.attempts", "planner.failing", "planner.proposal", "planner.guard_notice"],
   "review/agent-assigner.ts": ["review.config", "review.stuck"],
   "review/service.ts": ["review.merge_failed", "review.human_review", "review.emails"],
   "supervisor/chat.ts": ["supervisor.digest"],
