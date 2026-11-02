@@ -104,4 +104,40 @@ export interface PrHealthStatus {
   repos: RepoView[];
   findings: FindingView[];
   planned: Planned[];
+  /** The delivery ledger's records of this project (act mode; observe never reads the ledger) */
+  deliveries: NoteRecord[];
+  /** The ledger's cap gave way to records it still needs, or null */
+  warning: string | null;
+}
+
+/** A withdrawal of a sent note (act mode), with why its problem cleared */
+export interface WithdrawState {
+  status: "running" | "done" | "skipped" | "failed" | "gave_up";
+  why: ClearedWhy;
+  attempts: number;
+  lastAttemptAt: number;
+  nextAttemptAt: number | null;
+  lastError: string | null;
+}
+
+/** One note in the delivery ledger (data/pr-health-deliveries.json, act mode): the new kinds of one (repo, PR, head) */
+export interface NoteRecord {
+  project: string;
+  /** The delivery id, {id}: pr_health:<repo>#<n>@<head8>:<kinds joined "+"> */
+  id: string;
+  repo: string;
+  pr: number;
+  /** The full head sha */
+  head: string;
+  kinds: Kind[];
+  agent: string;
+  /** running: started and not finished (a restart counts it as a failed attempt); sent is final */
+  status: "running" | "sent" | "failed" | "gave_up";
+  attempts: number;
+  lastAttemptAt: number;
+  nextAttemptAt: number | null;
+  lastError: string | null;
+  argv: string[];
+  sentAt: number | null;
+  withdraw: WithdrawState | null;
 }

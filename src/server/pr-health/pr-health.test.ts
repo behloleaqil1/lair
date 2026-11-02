@@ -197,15 +197,18 @@ describe("PR health: off, config and the event loop", () => {
     expect(manager.status("demo").lastError).toMatch(/pr_health\.interval_seconds/);
   });
 
-  it("AT-26 prHealth_sources_no_sync_io: no synchronous fs or child process in pr-health/ and repos/", () => {
+  it("AT-26 prHealth_sources_no_sync_io: no synchronous fs or child process in pr-health/, repos/ and core/act-ledger.ts", () => {
     const here = dirname(fileURLToPath(import.meta.url));
     const sources = [here, join(here, "..", "repos")].flatMap((dir) =>
       readdirSync(dir)
         .filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"))
         .map((f) => join(dir, f)),
     );
+    sources.push(join(here, "..", "core", "act-ledger.ts"));
     const names = sources.map((f) => f.split(/[\\/]/).slice(-2).join("/"));
-    expect(names).toEqual(expect.arrayContaining(["pr-health/service.ts", "pr-health/detect.ts", "pr-health/config.ts", "repos/refs.ts", "repos/hosts.ts"]));
+    expect(names).toEqual(
+      expect.arrayContaining(["pr-health/service.ts", "pr-health/detect.ts", "pr-health/config.ts", "pr-health/act.ts", "pr-health/notices.ts", "repos/refs.ts", "repos/hosts.ts", "core/act-ledger.ts"]),
+    );
     for (const file of sources) {
       const code = readFileSync(file, "utf8")
         .split("\n")

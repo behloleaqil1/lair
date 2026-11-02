@@ -48,6 +48,7 @@ const RAISERS: Record<string, string[]> = {
   "triage/service.ts": ["triage.gate_failure", "triage.revert"],
   "watchdog/escalation.ts": ["watchdog."],
   "infra-monitor/service.ts": ["infra_monitor.notice"],
+  "pr-health/notices.ts": ["pr_health.notice"],
 };
 
 /** Raise calls: the inbox, a module's own wrapper, or a request handed to a decision hook. */

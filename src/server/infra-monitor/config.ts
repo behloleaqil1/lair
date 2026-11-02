@@ -181,26 +181,28 @@ export function actBlockedReason(config: ProjectConfig, settings: InfraMonitorSe
 }
 
 /**
- * Fill requeue_cmd. Each value is substituted once (no value is read as a
+ * Fill a command template (requeue_cmd here, PR health's notify_cmd and
+ * withdraw_cmd). Each value is substituted once (no value is read as a
  * template), and a value that would turn an argument into an option (a
- * leading "-" where the template has none) is refused: ids come from file
- * names in the queue.
+ * leading "-" where the template has none) is refused. `key` names the
+ * template in errors.
  */
-export function buildRequeueArgv(
-  template: readonly string[],
-  vars: { id: string; from: string; to: string },
-): { argv: string[] } | { error: string } {
-  const values: Record<string, string> = vars;
+export function buildArgv(key: string, template: readonly string[], vars: Readonly<Record<string, string>>): { argv: string[] } | { error: string } {
   for (const n of placeholdersIn(template)) {
-    if (!Object.hasOwn(values, n)) return { error: `requeue_cmd: no value for {${n}}` };
+    if (!Object.hasOwn(vars, n)) return { error: `${key}: no value for {${n}}` };
   }
   const argv: string[] = [];
   for (const arg of template) {
-    const filled = arg.replace(PLACEHOLDER, (_, n: string) => values[n]);
+    const filled = arg.replace(PLACEHOLDER, (_, n: string) => vars[n]);
     if (filled.startsWith("-") && !arg.startsWith("-")) {
-      return { error: `requeue_cmd: the value in "${arg}" starts with "-" and would be read as an option` };
+      return { error: `${key}: the value in "${arg}" starts with "-" and would be read as an option` };
     }
     argv.push(filled);
   }
   return { argv };
+}
+
+/** Fill requeue_cmd: ids come from file names in the queue. */
+export function buildRequeueArgv(template: readonly string[], vars: { id: string; from: string; to: string }): { argv: string[] } | { error: string } {
+  return buildArgv("requeue_cmd", template, vars);
 }

@@ -20,19 +20,28 @@
  * deadline stop it the same way and mark it partial.
  * 4. Then, for each (repo, PR, head) with open findings: its owner (owner.ts)
  *    and what act mode would do (plan.ts). A new finding's event carries it.
+ * 5. Act mode only (mode: act, not read_only): notes and their withdrawals
+ *    through the delivery ledger (act.ts), then the Decision Inbox notices
+ *    (notices.ts).
  *
- * Observe only: it emits events and serves a status, and writes nothing.
+ * Observe mode emits events and serves a status, and writes nothing: no
+ * command, no decision, no ledger.
  */
+import { join } from "path";
 import type { EventBus } from "../core/event-bus.js";
+import type { DecisionProducer } from "../decisions/types.js";
+import { SpawnRunner, type CommandRunner } from "../infra-monitor/probes.js";
 import type { ProjectConfig } from "../../shared/types.js";
 import { tokenFrom, type FetchLike } from "../review/github.js";
 import type { GitHost, HostCommit, HostPullRequest } from "../review/host.js";
 import { newestChecks, RepoHosts, type RepoEntry } from "../repos/index.js";
+import { Deliveries, DeliveryLedger, type TickReads } from "./act.js";
 import { actBlockedReason, KINDS, parsePrHealthConfig, type PrHealthSettings } from "./config.js";
 import { findingKey, kindsOf, readOrder, skipReason } from "./detect.js";
+import { noticeCode, Notices } from "./notices.js";
 import { ownerOf, type FillSource, type OwnerInputs } from "./owner.js";
 import { plan, type PlanGroup } from "./plan.js";
-import type { ClearedWhy, FindingView, Planned, PrFacts, PrHealthStatus, PrHealthTick, RepoView } from "./types.js";
+import type { ClearedWhy, FindingView, NoteRecord, Planned, PrFacts, PrHealthStatus, PrHealthTick, RepoView } from "./types.js";
 
 type Log = Pick<Console, "warn" | "log">;
 
@@ -60,7 +69,13 @@ export interface PrHealthOptions {
   log?: Log;
   /** Delay of the first tick after start() (default 1 s) */
   firstTickMs?: number;
+  /** Act mode's delivery ledger (the manager's, shared by its projects; default: in memory) */
+  ledger?: DeliveryLedger;
+  /** Runs notify_cmd and withdraw_cmd (tests stand in for the process here) */
+  runner?: CommandRunner;
 }
+
+const emptyReads = (): TickReads => ({ listed: new Map(), read: new Map() });
 
 interface RepoState {
   view: RepoView;
@@ -89,6 +104,16 @@ export class PrHealth {
   private readonly pushTimes = new Map<string, number | null>();
   private planned: Planned[] = [];
   private budget = { used: 0, deadline: 0 };
+  /** What this tick read successfully (act mode judges a sent note cleared from it) */
+  private reads = emptyReads();
+  /** Repositories whose list succeeded since this instance started */
+  private readonly listedOnce = new Set<string>();
+  private readonly ledger: DeliveryLedger;
+  private readonly deliveries: Deliveries;
+  private readonly notices: Notices;
+  private decisions?: DecisionProducer;
+  /** stop() kills a command in progress */
+  private abort = new AbortController();
 
   private timer: NodeJS.Timeout | null = null;
   private ticking: Promise<PrHealthTick | null> | null = null;
@@ -138,10 +163,44 @@ export class PrHealth {
       };
       this.repos.set(entry.repo, { view, cache: new Map(), unread: new Set(), prs: new Map() });
     }
+    this.ledger = options.ledger ?? new DeliveryLedger(null, (r) => this.keeps(r));
+    this.deliveries = new Deliveries({
+      project: this.project,
+      settings: this.settings,
+      ledger: this.ledger,
+      runner: options.runner ?? new SpawnRunner(),
+      cwd: this.config.repo,
+      events: this.events,
+      log: this.log,
+      now: this.now,
+    });
+    this.notices = new Notices(this.project, this.events);
   }
 
   get running(): boolean {
     return !this.stopped;
+  }
+
+  /** Why act mode does nothing, or null when it acts. */
+  get actBlocked(): string | null {
+    return actBlockedReason(this.config, this.settings);
+  }
+
+  useDecisions(decisions: DecisionProducer): void {
+    this.decisions = decisions;
+  }
+
+  /**
+   * The ledger never prunes a record PR health still needs: one of a
+   * repository not read since start, one whose withdrawal is pending, and
+   * one whose head still has an open finding (so its note is never sent again).
+   */
+  keeps(r: NoteRecord): boolean {
+    if (!this.listedOnce.has(r.repo)) return true;
+    const w = r.withdraw;
+    if (r.status === "sent" && (w === null || w.status === "running" || (w.status === "failed" && w.attempts < this.settings.maxAttempts))) return true;
+    for (const f of this.findings.values()) if (f.repo === r.repo && f.pr === r.pr && f.head === r.head) return true;
+    return false;
   }
 
   /** Every request of a tick passes here before it goes out. */
@@ -202,6 +261,7 @@ export class PrHealth {
   /** One read PR's kinds against its open findings. */
   private apply(entry: RepoEntry, pr: HostPullRequest, facts: PrFacts, now: number): void {
     const { found, unknown } = kindsOf(pr, facts, entry, this.settings, now);
+    this.reads.read.set(`${entry.repo}#${pr.number}`, { head: facts.headSha, found, unknown });
     for (const f of this.findingsOf(entry.repo, pr.number)) if (f.head !== facts.headSha) this.clear(f, "head_moved");
     for (const kind of KINDS) {
       const key = findingKey(entry.repo, pr.number, facts.headSha, kind);
@@ -272,6 +332,8 @@ export class PrHealth {
         pr,
         head,
         kinds: list.map((f) => f.kind),
+        seen: list.filter((f) => f.clearingSince === null).map((f) => f.kind),
+        since: Math.min(...list.map((f) => f.since)),
         owner: result,
         base: state.view.base,
         behindBy: facts?.behindBy ?? 0,
@@ -337,6 +399,9 @@ export class PrHealth {
         else due.push(pr);
       }
       this.clearGone(state, open, skipped);
+      this.listedOnce.add(entry.repo);
+      const heads = new Map(open.map((p) => [p.number, p.headSha]));
+      this.reads.listed.set(entry.repo, { heads, skipped: new Set(skipped.map((s) => s.pr)), truncated: view.truncated });
       const ordered = readOrder(due, state.unread);
       for (const pr of ordered.slice(this.settings.maxPrsPerRepo)) skipped.push({ pr: pr.number, why: "max_prs_per_repo" });
       view.skipped = skipped;
@@ -377,12 +442,14 @@ export class PrHealth {
   private async runTick(): Promise<PrHealthTick | null> {
     const now = this.now();
     this.budget = { used: 0, deadline: now + this.settings.intervalSeconds * 500 };
+    this.reads = emptyReads();
     try {
       let prsRead = 0;
       for (const entry of this.settings.repos) prsRead += await this.readRepo(entry, now);
-      this.planned = plan(await this.assignOwners(now), this.settings);
+      const groups = await this.assignOwners(now);
+      this.planned = plan(groups, this.settings);
       for (const view of this.opened.splice(0)) if (this.findings.has(view.key)) this.announce(view);
-      this.lastError = null;
+      this.lastError = this.actBlocked === null && !this.halted ? ((await this.act(groups, now))[0] ?? null) : null;
       const done = this.now();
       this.lastTick = { at: iso(now), durationMs: done - now, requests: this.budget.used, prsRead, findings: this.findings.size };
       this.lastFinishedAt = done;
@@ -394,6 +461,35 @@ export class PrHealth {
     }
   }
 
+  // ============ ACT ============
+
+  /** Notes and withdrawals (an unusable ledger stops them), then the inbox notices; returns the problems met. */
+  private async act(groups: PlanGroup[], now: number): Promise<string[]> {
+    const errors: string[] = [];
+    await this.ledger.load();
+    if (this.ledger.error) errors.push(this.ledger.error);
+    else errors.push(...(await this.deliveries.run(groups, this.reads, now, this.abort.signal)));
+    if (this.abort.signal.aborted) return errors;
+    if (!this.decisions) {
+      if (groups.length > 0) errors.push("no Decision Inbox: notices can't be raised");
+      return errors;
+    }
+    const records = this.ledger.error ? [] : this.ledger.list(this.project);
+    const findings = new Map<string, FindingView[]>();
+    for (const f of this.findings.values()) findings.set(`${f.repo}#${f.pr}@${f.head}`, [...(findings.get(`${f.repo}#${f.pr}@${f.head}`) ?? []), f]);
+    const heads = groups.map((group) => {
+      const at = records.filter((r) => r.repo === group.repo && r.pr === group.pr && r.head === group.head);
+      return { group, notice: noticeCode(group, at, this.settings, now), findings: findings.get(`${group.repo}#${group.pr}@${group.head}`) ?? [] };
+    });
+    errors.push(...(await this.notices.sync(this.decisions, heads, (repo) => this.listedOnce.has(repo), now, this.settings.clearMinutes)));
+    return errors;
+  }
+
+  /** Withdraw this project's open notices (act turned off for it). */
+  async withdrawAll(reason: string): Promise<void> {
+    if (this.decisions) await this.notices.withdrawAll(this.decisions, reason, this.log);
+  }
+
   // ============ LIFECYCLE ============
 
   /** Start the timer (nothing to watch: no timer). The next tick is scheduled when the last one ends. */
@@ -401,6 +497,7 @@ export class PrHealth {
     if (!this.stopped || this.settings.inactive !== null || this.settings.repos.length === 0) return;
     this.stopped = false;
     this.halted = false;
+    if (this.abort.signal.aborted) this.abort = new AbortController();
     this.startedAt = this.now();
     const loop = async () => {
       if (this.stopped) return;
@@ -417,6 +514,7 @@ export class PrHealth {
   async stop(): Promise<void> {
     this.stopped = true;
     this.halted = true;
+    this.abort.abort();
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
@@ -433,7 +531,7 @@ export class PrHealth {
       enabled: true,
       running: this.running,
       mode: this.settings.mode,
-      actBlocked: actBlockedReason(this.config, this.settings),
+      actBlocked: this.actBlocked,
       inactive: this.settings.inactive,
       intervalSeconds: this.settings.intervalSeconds,
       lastTick: this.lastTick,
@@ -442,6 +540,8 @@ export class PrHealth {
       repos: [...this.repos.values()].map(({ view }) => ({ ...view, skipped: view.skipped.map((s) => ({ ...s })) })),
       findings: [...this.findings.values()].map((f) => ({ ...f, owner: f.owner === "unknown" ? f.owner : { ...f.owner } })),
       planned: this.planned.map((p) => ("argv" in p && p.argv ? { ...p, argv: [...p.argv] } : { ...p })),
+      deliveries: this.actBlocked === null ? this.ledger.list(this.project) : [],
+      warning: this.actBlocked === null ? this.ledger.warning : null,
     };
   }
 }
@@ -454,7 +554,10 @@ export interface ProjectEntry {
   error?: string;
 }
 
-export type PrHealthManagerOptions = Omit<PrHealthOptions, "project" | "config" | "settings">;
+export type PrHealthManagerOptions = Omit<PrHealthOptions, "project" | "config" | "settings" | "ledger"> & {
+  /** The delivery ledger file (act mode); null keeps it in memory (tests) */
+  ledgerPath?: string | null;
+};
 
 /** The startup log line for the projects PR health watches. */
 export function startedLine(projects: string[]): string {
@@ -466,8 +569,19 @@ export class PrHealthManager {
   private readonly monitors = new Map<string, PrHealth>();
   private readonly problems = new Map<string, string[]>();
   private phase: "loaded" | "started" | "stopped" = "loaded";
+  private decisions?: DecisionProducer;
+  readonly ledger: DeliveryLedger;
 
-  constructor(private readonly options: PrHealthManagerOptions = {}) {}
+  constructor(private readonly options: PrHealthManagerOptions = {}) {
+    const path = options.ledgerPath === undefined ? join(process.cwd(), "data", "pr-health-deliveries.json") : options.ledgerPath;
+    // A project PR health does not run now keeps its records
+    this.ledger = new DeliveryLedger(path, (r) => this.monitors.get(r.project)?.keeps(r) ?? true);
+  }
+
+  useDecisions(decisions: DecisionProducer): void {
+    this.decisions = decisions;
+    for (const monitor of this.monitors.values()) monitor.useDecisions(decisions);
+  }
 
   load(projects: ProjectEntry[]): void {
     for (const entry of projects) {
@@ -484,7 +598,9 @@ export class PrHealthManager {
         continue;
       }
       if (!parsed.settings.enabled) continue;
-      this.monitors.set(entry.name, new PrHealth({ ...this.options, project: entry.name, config: entry.config, settings: parsed.settings }));
+      const monitor = new PrHealth({ ...this.options, ledger: this.ledger, project: entry.name, config: entry.config, settings: parsed.settings });
+      if (this.decisions) monitor.useDecisions(this.decisions);
+      this.monitors.set(entry.name, monitor);
     }
   }
 
@@ -498,11 +614,17 @@ export class PrHealthManager {
   /** A changed project file: stop the project's instance, then start it from the new config (none: off). */
   async reloadProject(entry: ProjectEntry): Promise<void> {
     if (this.phase === "stopped") return;
-    await this.monitors.get(entry.name)?.stop();
+    const old = this.monitors.get(entry.name);
+    await old?.stop();
     this.monitors.delete(entry.name);
     this.problems.delete(entry.name);
     this.load([entry]);
-    if (this.phase === "started") this.monitors.get(entry.name)?.start();
+    const next = this.monitors.get(entry.name);
+    // The old instance raised notices and the new one won't: they are withdrawn, not left open (no command runs)
+    if (old && old.actBlocked === null && (!next || next.actBlocked !== null)) {
+      await old.withdrawAll("PR health no longer raises notices for this project (turned off, observe mode or read_only).");
+    }
+    if (this.phase === "started") next?.start();
   }
 
   async stop(): Promise<void> {
@@ -532,6 +654,8 @@ export class PrHealthManager {
       repos: [],
       findings: [],
       planned: [],
+      deliveries: [],
+      warning: null,
     };
   }
 }
