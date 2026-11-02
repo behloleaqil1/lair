@@ -21,6 +21,7 @@ describe("parseTriageConfig", () => {
       flaky: { ticketAfter: 2, quarantine: true, releaseAfterPasses: 5 },
       bisect: { enabled: true, revert: "propose" },
       baseMaxAgeHours: 72,
+      externalAuthor: "off",
       trustedNodes: [],
       commands: {},
     });
