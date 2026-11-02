@@ -93,6 +93,7 @@ import {
 import { proposalView, type ChangeInput, type PlannerStore, type StoredProposal, type StoredRun } from "./store.js";
 import { applyEdit, diffOf, diffTexts, findTask, parseTasksDoc, renderLine, type TaskEdit, type TasksDoc } from "./tasks-file.js";
 import { parseVerdicts, readVerdictsFile, verifierSection, VERDICTS_FILE } from "./verifier.js";
+import { checkFinishOwnership, type PrSource } from "./pr-ownership.js";
 
 /** The module name the planner raises decisions as. */
 export const DECISION_MODULE = "planner";
@@ -266,7 +267,15 @@ export interface PlannerServiceOptions {
   bus?: () => BusLineSource | null;
   /** The review store's merged PRs (planner.guards.prefilter_closed); without it no PR counts as merged */
   prs?: PlannerPrs;
+  /** How finish proposals' PRs are read for their ownership; none: a PR claim is unsure */
+  prOwnership?: PrSource;
 }
+
+/** The start of the reason Lair gives a finish proposal whose PR it could not check (held for the owner). */
+export const OWNERSHIP_UNSURE = "Lair could not check PR ownership: ";
+
+/** Lair held this proposal (a PR whose ownership it could not check): no verdict lifts the hold, only the owner applies it. */
+const heldByLair = (p: StoredProposal) => p.verifierVerdict === "unsure" && (p.verifierReason ?? "").startsWith(OWNERSHIP_UNSURE);
 
 function withReadiness(tasks: PlanTask[]): PlanTaskView[] {
   const done = new Map<string, boolean>();
@@ -301,6 +310,7 @@ export class PlannerService {
   private messages: OwnerMessage[] = [];
   private bus?: () => BusLineSource | null;
   private prs?: PlannerPrs;
+  private prOwnership: PrSource;
   /** cycleSoon's cycle after the one in progress */
   private again: Promise<void> | null = null;
   /** stop() ran: events start no cycle */
@@ -319,6 +329,7 @@ export class PlannerService {
     this.clock = options.clock;
     this.events = options.events;
     this.decisions = options.decisions;
+    this.prOwnership = options.prOwnership ?? { reader: null, mapping: null, missing: "no PR host is connected" };
   }
 
   get running(): boolean {
@@ -1742,6 +1753,20 @@ export class PlannerService {
     const { checked } = checkProposals(file.items, ctx);
     // The tasks file changed while the run was active and was put back: every proposal is refused (D7 keeps the edit)
     const whole = this.refusedWhole(run);
+    // PR ownership (#290): a finish whose reason names a merged PR of another task is refused; one Lair cannot read is held
+    const ownership = new Map<number, { state: string; note: string | null }>();
+    for (const c of checked) {
+      if (c.op !== "finish" || c.refusal || whole) continue;
+      const result = await checkFinishOwnership({
+        reason: c.reason,
+        task: c.task,
+        agent: findTask(doc, c.task)?.agent ?? c.agent,
+        source: this.prOwnership,
+      });
+      if (result.state === "none") continue;
+      if (result.state === "not_owned") c.refusal = result.note;
+      ownership.set(c.index, result);
+    }
     const stored = checked.map((c) =>
       this.store.insertProposal({
         project: this.project,
@@ -1757,8 +1782,10 @@ export class PlannerService {
         decidedBy: c.refusal || whole ? "lair" : null,
         decidedAt: c.refusal || whole ? now : null,
         createdAt: now,
-        verifierVerdict: null,
-        verifierReason: null,
+        // Held by Lair until the owner decides; no verifier verdict can turn it into an approve
+        verifierVerdict: !c.refusal && ownership.get(c.index)?.state === "unsure" ? "unsure" : null,
+        verifierReason:
+          !c.refusal && ownership.get(c.index)?.state === "unsure" ? `${OWNERSHIP_UNSURE}${ownership.get(c.index)?.note}` : null,
         verifierEvidence: null,
       }),
     );
@@ -1772,7 +1799,7 @@ export class PlannerService {
       const needsVerification = accepted.filter((p) => !verifier.skipOps.includes(p.op as never));
       if (needsVerification.length > 0) {
         // Start verifier run
-        const started = await this.startVerifier(run, accepted, now);
+        const started = await this.startVerifier(run, accepted, now, ownership);
         if (started) {
           run.verifierState = "running";
           run.detail = `${accepted.length} proposal(s) accepted; verifier run started`;
@@ -1798,7 +1825,12 @@ export class PlannerService {
   }
 
   /** Start the verifier agent run for a planner run's accepted proposals. */
-  private async startVerifier(run: StoredRun, accepted: StoredProposal[], now: number): Promise<boolean> {
+  private async startVerifier(
+    run: StoredRun,
+    accepted: StoredProposal[],
+    now: number,
+    ownership: Map<number, { state: string; note: string | null }>,
+  ): Promise<boolean> {
     const verifier = this.settings.verifier;
     if (!verifier) return false;
 
@@ -1843,6 +1875,7 @@ export class PlannerService {
       agent: p.agent,
       text: p.text,
       reason: p.reason,
+      prOwnership: ownership.get(p.index) ?? null,
     }));
 
     const section = verifierSection({
@@ -1951,7 +1984,7 @@ export class PlannerService {
       this.store.saveRun(run);
       // Mark all pending proposals as unverified
       for (const p of this.store.runProposals(run.id)) {
-        if (p.status === "pending") {
+        if (p.status === "pending" && !heldByLair(p)) {
           this.store.setVerifierVerdict(p.id, "unverified", "verification failed", null);
         }
       }
@@ -1975,6 +2008,8 @@ export class PlannerService {
     for (const p of proposals) {
       if (p.status !== "pending") continue;
 
+      // Lair held it (a PR it could not check): no verdict lifts the hold, only the owner decides
+      if (heldByLair(p)) continue;
       const v = verdictMap.get(p.index);
       if (v) {
         this.store.setVerifierVerdict(p.id, v.verdict, v.reason, v.evidence);
@@ -2004,6 +2039,8 @@ export class PlannerService {
 
     for (const p of accepted) {
       if (!this.writes || !isOp(p.op)) continue;
+      // Lair held it (a PR whose ownership it could not check): only the owner applies it
+      if (heldByLair(p)) continue;
 
       // Check auto-apply (requires verifier with auto_apply config)
       if (verifier && this.settings.approval[p.op] === "never") {
