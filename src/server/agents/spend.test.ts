@@ -12,6 +12,8 @@
  *   previous one; the last `modelUsage` and `total_cost_usd` are the process's totals);
  * - claude-stream-json-usage-limit.jsonl: a run that hit a usage limit at once (is_error, cost 0, empty modelUsage);
  * - kiro-requests-30.txt: a kiro CLI run with 30 request lines, ending on the provider's DAILY_REQUEST_COUNT 429.
+ * Text values are replaced; numbers, event types and model names are the CLIs' own. Fields of a result event no
+ * parser reads (subagent stats, usage iterations, per-model window sizes) are left out, to keep each line short.
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "fs";
