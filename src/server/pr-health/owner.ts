@@ -12,12 +12,27 @@
  *    branch maps to through review.authors (branch_pattern, branches), if it
  *    has an open line and the head commit's committer date is in the window.
  *    The date is read (listCommits) only when this step is reached.
+ *
+ * With owner.rule branch_first (#292) every PR with an author has an owner:
+ * 1. the one agent the head branch maps to through review.authors (no window
+ *    and no open line needed: the branch says whose work it is);
+ * 2. else the author the review module registered for the PR (its own
+ *    repository only);
+ * 3. else the latest open task line naming the PR, as above (fill on but not
+ *    checked yet: unknown);
+ * 4. else the host account that opened the PR.
  */
 import type { FillLineView, FillStatusView } from "../../shared/agents-types.js";
 import type { ProjectConfig } from "../../shared/types.js";
 import { mapAuthor, type BranchGlob } from "../review/authors.js";
 import { parsePrRefs, taskRepoOf, type RepoEntry } from "../repos/index.js";
+import type { OwnerRule } from "./config.js";
 import type { OwnerView } from "./types.js";
+
+/** The review module as PR health reads it: the PR author it registered */
+export interface ReviewAuthorSource {
+  get(project: string): { settings: { repo: string }; registeredAuthor(pr: number): string | null } | undefined;
+}
 
 /** The agents module as PR health reads it: fill's last check of a project */
 export interface FillSource {
@@ -30,11 +45,19 @@ export interface OwnerInputs {
   repos: RepoEntry[];
   authors: { branchPattern: RegExp | null; branches: BranchGlob[] };
   branchWindowMinutes: number;
+  /** Default task_line */
+  rule?: OwnerRule;
+  /** The review module's repository and its registered author of a PR (branch_first) */
+  reviewRepo?: string | null;
+  registeredAuthor?: (pr: number) => string | null;
   config: Pick<ProjectConfig, "agents" | "repo">;
   now: number;
 }
 
 export type OwnerResult = { owner: OwnerView } | { unknown: string };
+
+/** A host account name as GitHub allows it (a bot's ends in [bot]); anything else names nobody */
+const HOST_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?$/;
 
 const OPEN_STATES: ReadonlySet<FillLineView["state"]> = new Set(["started", "claimed", "held"]);
 
@@ -53,23 +76,48 @@ function openLines(fill: FillStatusView | null): FillLineView[] | OwnerResult {
  * head commit's committer date (epoch ms, or null when it is not known); a
  * failed read makes the owner unknown this tick.
  */
-export async function ownerOf(
-  pr: { repo: string; number: number; headRef: string },
-  inputs: OwnerInputs,
-  pushedAt: () => Promise<number | null>,
-): Promise<OwnerResult> {
-  const lines = openLines(inputs.fill);
-  if (!Array.isArray(lines)) return lines;
+/** The latest open line naming (repo, pr), or null */
+function namingLine(pr: { repo: string; number: number }, lines: FillLineView[], repos: RepoEntry[]): FillLineView | null {
   const repo = pr.repo.toLowerCase();
   let latest: FillLineView | null = null;
   for (const line of lines) {
     const text = `${line.name ?? ""} ${line.description ?? ""}`;
-    const refs = parsePrRefs(text, inputs.repos, { mode: "mention", taskRepo: taskRepoOf(line.description ?? "") });
+    const refs = parsePrRefs(text, repos, { mode: "mention", taskRepo: taskRepoOf(line.description ?? "") });
     if (refs.some((r) => r.repo.toLowerCase() === repo && r.number === pr.number) && (latest === null || line.line > latest.line)) latest = line;
   }
-  if (latest) {
-    return { owner: { agent: latest.agent, source: "task_line", line: latest.line, reason: `task line ${latest.line} names the PR` } };
-  }
+  return latest;
+}
+
+const byLine = (line: FillLineView): OwnerResult => ({
+  owner: { agent: line.agent, source: "task_line", line: line.line, reason: `task line ${line.line} names the PR` },
+});
+
+/** owner.rule branch_first: branch mapping, the review module's author, a task line, the PR's author */
+function branchFirst(pr: { repo: string; number: number; headRef: string; user?: string | null }, inputs: OwnerInputs): OwnerResult {
+  const { branchPattern, branches } = inputs.authors;
+  const mapped = branchPattern === null && branches.length === 0 ? null : mapAuthor({ branchPattern, branches, fromTasksFile: false }, pr.headRef, inputs.config).agent;
+  if (mapped) return { owner: { agent: mapped, source: "branch", line: null, reason: `its branch maps to ${mapped} (review.authors)` } };
+  const isReviewRepo = inputs.reviewRepo != null && inputs.reviewRepo.toLowerCase() === pr.repo.toLowerCase();
+  const registered = isReviewRepo ? (inputs.registeredAuthor?.(pr.number) ?? null) : null;
+  if (registered) return { owner: { agent: registered, source: "review", line: null, reason: `the review module registered ${registered} as its author` } };
+  const lines = openLines(inputs.fill);
+  if (!Array.isArray(lines) && "unknown" in lines) return lines;
+  const latest = Array.isArray(lines) ? namingLine(pr, lines, inputs.repos) : null;
+  if (latest) return byLine(latest);
+  if (pr.user && HOST_LOGIN.test(pr.user)) return { owner: { agent: pr.user, source: "pr_author", line: null, reason: `no branch mapping, registered author or task line names an owner; ${pr.user} opened the PR` } };
+  return nobody("no branch mapping, registered author or task line names an owner, and the host gives no usable PR author");
+}
+
+export async function ownerOf(
+  pr: { repo: string; number: number; headRef: string; user?: string | null },
+  inputs: OwnerInputs,
+  pushedAt: () => Promise<number | null>,
+): Promise<OwnerResult> {
+  if (inputs.rule === "branch_first") return branchFirst(pr, inputs);
+  const lines = openLines(inputs.fill);
+  if (!Array.isArray(lines)) return lines;
+  const latest = namingLine(pr, lines, inputs.repos);
+  if (latest) return byLine(latest);
   const none = "no open task line names the PR";
   const window = inputs.branchWindowMinutes;
   if (window === 0) return nobody(`${none}, and the branch rule is off (owner.branch_window_minutes: 0)`);

@@ -24,6 +24,11 @@ export function skipReason(pr: HostPullRequest, repo: string, base: string, sett
   return null;
 }
 
+/** Whether the repository's hosted CI counts for PR health: its ci_counts, and pr_health.repos.<repo>.ci_signal */
+export function ciIsSignal(entry: RepoEntry, settings: Pick<PrHealthSettings, "noCiSignal">): boolean {
+  return entry.ciCounts && !settings.noCiSignal.includes(entry.repo);
+}
+
 /** PRs left unread last tick first, then the most recently updated. */
 export function readOrder(prs: HostPullRequest[], unread: ReadonlySet<number>): HostPullRequest[] {
   const at = (p: HostPullRequest) => Date.parse(p.updatedAt ?? "") || 0;
@@ -34,7 +39,9 @@ export function readOrder(prs: HostPullRequest[], unread: ReadonlySet<number>): 
  * The kinds found at the PR's head, and those whose state is unknown: a
  * `mergeable` the host has not computed yet is neither a conflict nor the
  * end of one. Drafts get every kind but no_ci. Pending checks are neither
- * red nor missing; skipped and neutral runs count as checks.
+ * red nor missing; skipped and neutral runs count as checks. A repository
+ * whose CI is not a signal (ci_counts or pr_health ci_signal false) gets
+ * neither no_ci nor ci_red.
  */
 export function kindsOf(
   pr: HostPullRequest,
@@ -49,7 +56,7 @@ export function kindsOf(
   if (on.conflicts && facts.mergeable === false) found.add("conflicts");
   if (on.conflicts && facts.mergeable === null) unknown.add("conflicts");
   if (on.behind && facts.behindBy > settings.behindThreshold) found.add("behind");
-  if (entry.ciCounts && facts.checks) {
+  if (ciIsSignal(entry, settings) && facts.checks) {
     const updated = Date.parse(pr.updatedAt ?? "");
     const quietFor = Number.isFinite(updated) ? now - updated : 0;
     if (on.no_ci && !pr.draft && facts.checks.length === 0 && quietFor >= settings.noCiMinutes * 60_000) found.add("no_ci");
