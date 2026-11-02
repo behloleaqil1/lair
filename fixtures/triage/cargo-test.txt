@@ -1,0 +1,23 @@
+
+running 5 tests
+test orders::tests::test_apply_discount ... ok
+test orders::tests::test_calculate_total ... FAILED
+test orders::tests::test_validate_order ... ok
+test db::tests::test_connect ... FAILED
+test utils::tests::test_format_money ... ok
+
+failures:
+
+---- orders::tests::test_calculate_total stdout ----
+thread 'orders::tests::test_calculate_total' panicked at 'assertion failed: `(left == right)`: left: `100`, right: `108`', src/orders.rs:45:9
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- db::tests::test_connect stdout ----
+thread 'db::tests::test_connect' panicked at 'connection failed: Connection refused (os error 111)', src/db.rs:23:5
+
+
+failures:
+    db::tests::test_connect
+    orders::tests::test_calculate_total
+
+test result: FAILED. 3 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s

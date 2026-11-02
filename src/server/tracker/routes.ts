@@ -10,6 +10,9 @@
  *                                          and the latest writes
  *   POST /api/tracker/reconcile?project=  queue a reconcile now; recorded in
  *                                          the audit with the owner session
+ *   POST /api/tracker/links?project=      accept a proposed link {task, repo,
+ *                                          issue}: queued (202), made in a job
+ *                                          and audited with the owner session
  *
  * `?project=` is validated by the root guards (src/server/root-guards.ts);
  * without it the default project is used.
@@ -29,6 +32,14 @@ function fail(reply: FastifyReply, code: number, error: string) {
 }
 
 const ProjectQuery = z.object({ project: z.string().optional() });
+
+const AcceptLinkBody = z
+  .object({
+    task: z.string().min(1).max(128),
+    repo: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, "use owner/name"),
+    issue: z.number().int().min(1),
+  })
+  .strict();
 
 export async function registerTrackerRoutes(
   fastify: FastifyInstance,
@@ -56,6 +67,21 @@ export async function registerTrackerRoutes(
       const service = manager.get(project);
       if (!service) return fail(reply, 404, `The tracker is off for ${project} (tracker.enabled)`);
       if (!service.requestReconcile(session.id)) return fail(reply, 503, "The tracker's queue is full or it is stopping: try again shortly");
+      return reply.code(202).send(respond({ queued: true, mode: service.settings.mode }));
+    });
+
+    app.post("/api/tracker/links", { bodyLimit: 2048 }, async (request, reply) => {
+      const query = ProjectQuery.safeParse(request.query ?? {});
+      if (!query.success) return fail(reply, 400, `Invalid query: ${query.error.issues[0].path.join(".")}`);
+      const project = query.data.project ?? defaultProject();
+      const session = auth.sessionOf(request);
+      if (!session) return fail(reply, 403, "Only the owner can link tasks to issues");
+      const body = AcceptLinkBody.safeParse(request.body ?? {});
+      if (!body.success) return fail(reply, 400, `Invalid body: ${body.error.issues[0].path.join(".") || "(root)"}: ${body.error.issues[0].message}`);
+      const service = manager.get(project);
+      if (!service) return fail(reply, 404, `The tracker is off for ${project} (tracker.enabled)`);
+      const accepted = service.acceptLink(body.data.task, body.data.repo, body.data.issue, session.id);
+      if (!accepted.ok) return fail(reply, accepted.code, accepted.error);
       return reply.code(202).send(respond({ queued: true, mode: service.settings.mode }));
     });
   });

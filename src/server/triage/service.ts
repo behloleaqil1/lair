@@ -53,7 +53,7 @@ import type {
 import type { DecisionProducer, DecisionResolution } from "../decisions/types.js";
 import { verifySignedGateResult } from "../gates/signature.js";
 import { FULL_SHA, actBlockedReason, type TriageSettings } from "./config.js";
-import { parseGateEvidence, type EvidenceParser, type GateEvidence, type ReportInput } from "./parsers/index.js";
+import { parseGateEvidenceAsync, type AsyncEvidenceParser, type EvidenceParser, type GateEvidence, type ReportInput } from "./parsers/index.js";
 import { classifyCause, overallClass, type BaseFacts, type ClassifyContext } from "./classifier.js";
 import type { TestRow, TriageStore } from "./store.js";
 import type { CommitInfo, GitProbe } from "./git.js";
@@ -143,7 +143,7 @@ export interface TriageServiceOptions {
   decisionsViaCommand?: boolean;
   /** Trusted nodes' public keys (PEM), by node id */
   nodeKeys: Map<string, string>;
-  parsers: EvidenceParser[];
+  parsers: (EvidenceParser | AsyncEvidenceParser)[];
   events?: EventBus;
 }
 
@@ -683,7 +683,7 @@ export class TriageService {
     const openOnDefault = isDefault && !failed && purpose === "gate" ? store.openIncident(project, settings.defaultBranch, pipelineId) : null;
     if (openOnDefault) greenAfterRed = await this.contains(sha, openOnDefault.redSha);
 
-    const evidence = parseGateEvidence(result, input.reports ?? [], {
+    const evidence = await parseGateEvidenceAsync(result, input.reports ?? [], {
       contextPatterns: settings.contextPatterns,
       parsers: this.o.parsers,
     });

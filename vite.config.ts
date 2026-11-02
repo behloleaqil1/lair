@@ -10,6 +10,7 @@ export default defineConfig({
     },
   },
   test: {
+    globalSetup: ['scripts/vitest-global-setup.mjs'],
     setupFiles: ['src/server/decisions/testing/raise-guard.ts'],
   },
   build: {

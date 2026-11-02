@@ -6,6 +6,8 @@ import { z } from "zod";
 import type { ProjectConfig } from "../../shared/types.js";
 import { GATE_RECHECK_KEYS, parseGateRecheck, type GateRecheckSettings } from "./gate-recheck-config.js";
 import { DEFAULT_INFRA_SIGNATURES, DEFAULT_TIMEOUT_SIGNATURES, type CompiledSignature, type SignatureDef } from "./signatures.js";
+import { createCustomParser, validateCustomParserConfig, type CustomParserConfig } from "./parsers/custom.js";
+import type { AsyncEvidenceParser, EvidenceParser } from "./parsers/types.js";
 
 export const INFRA_KINDS = ["network", "container", "oom", "runner", "disk", "load"] as const;
 export type InfraKind = (typeof INFRA_KINDS)[number];
@@ -203,6 +205,26 @@ export const TriageSchema = z
     commands: z.object(commandsShape).strict().default({}),
     /** Where decisions go when no raise_decision command is set (default: inbox_file) */
     decision_file: z.string().min(1).optional(),
+    /** Custom parsers for project-specific test output formats */
+    parsers: z
+      .object({
+        /** Custom regex parsers for test frameworks not covered by built-ins */
+        custom: z
+          .array(
+            z
+              .object({
+                name: z.string().min(1).max(32),
+                detect: z.string().min(1).max(500),
+                fail_pattern: z.string().min(1).max(1000),
+                summary_pattern: z.string().max(500).optional(),
+              })
+              .strict(),
+          )
+          .max(10)
+          .default([]),
+      })
+      .strict()
+      .default({}),
   })
   .strict();
 
@@ -256,6 +278,8 @@ export interface TriageSettings {
   };
   commands: Partial<Record<CommandId, string[]>>;
   decisionFile?: string;
+  /** Custom parsers created from config (wired on load and reload). Async parsers use worker threads with hard timeouts. */
+  customParsers: (EvidenceParser | AsyncEvidenceParser)[];
 }
 
 export type TriageParseResult = { ok: true; settings: TriageSettings } | { ok: false; errors: string[] };
@@ -357,6 +381,32 @@ export function parseTriageConfig(raw: unknown): TriageParseResult {
     nodeIds.add(node.id);
   }
 
+  // Validate and create custom parsers
+  const customParsers: (EvidenceParser | AsyncEvidenceParser)[] = [];
+  const customNames = new Set<string>();
+  for (let i = 0; i < value.parsers.custom.length; i++) {
+    const cfg = value.parsers.custom[i];
+    const where = `triage.parsers.custom[${i}]`;
+    if (customNames.has(cfg.name)) {
+      errors.push(`${where}: duplicate parser name '${cfg.name}'`);
+      continue;
+    }
+    customNames.add(cfg.name);
+    const validationErrors = validateCustomParserConfig(cfg);
+    if (validationErrors.length > 0) {
+      for (const err of validationErrors) {
+        errors.push(`${where}: ${err}`);
+      }
+      continue;
+    }
+    const parser = createCustomParser(cfg as CustomParserConfig);
+    if (!parser) {
+      errors.push(`${where}: could not create parser (patterns are invalid)`);
+      continue;
+    }
+    customParsers.push(parser);
+  }
+
   if (errors.length > 0) return { ok: false, errors };
 
   return {
@@ -406,6 +456,7 @@ export function parseTriageConfig(raw: unknown): TriageParseResult {
       },
       commands: value.commands,
       decisionFile: value.decision_file,
+      customParsers,
     },
   };
 }

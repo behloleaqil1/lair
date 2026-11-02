@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { actBlockedReason, DEFAULT_CONTEXT_PATTERNS, DEFAULT_INFRA_PATTERNS, parseTriageConfig } from "./config.js";
 import { fillArgv, formatDecision } from "./adapters.js";
 import { projectConfig } from "./testing/harness.js";
+import { isAsyncParser } from "./parsers/types.js";
 
 describe("parseTriageConfig", () => {
   it("is off and in observe mode by default, with the built-in patterns", () => {
@@ -78,6 +79,96 @@ describe("parseTriageConfig", () => {
     expect(actBlockedReason(projectConfig("/home/user/project", {}, { read_only: true }), parsed.settings)).toBe(
       "the project is read_only",
     );
+  });
+});
+
+describe("custom parsers through config", () => {
+  it("creates custom parsers from valid config entries", async () => {
+    const parsed = parseTriageConfig({
+      enabled: true,
+      parsers: {
+        custom: [
+          {
+            name: "mytest",
+            detect: "MyTest Framework",
+            fail_pattern: 'FAIL:\\s+(?<suite>[^:]+)::(?<name>\\S+)\\s+-\\s+(?<message>.+)',
+            summary_pattern: '(?<failed>\\d+) failed, (?<passed>\\d+) passed',
+          },
+        ],
+      },
+    });
+    if (!parsed.ok) throw new Error(parsed.errors.join("; "));
+    expect(parsed.settings.customParsers).toHaveLength(1);
+    expect(parsed.settings.customParsers[0].id).toBe("mytest");
+    // The parser actually works - custom parsers are async
+    const text = `
+MyTest Framework v1.0
+Running tests...
+FAIL: orders::test_total - expected 108 but got 100
+Summary: 1 failed, 2 passed
+`;
+    const parser = parsed.settings.customParsers[0];
+    expect(isAsyncParser(parser)).toBe(true);
+    if (!isAsyncParser(parser)) throw new Error("Expected async parser");
+    const out = await parser.parse(text, { contextPatterns: [] });
+    expect(out.causes).toHaveLength(1);
+    expect(out.causes[0].tests[0]).toMatchObject({ suite: "orders", name: "test_total" });
+    expect(out.failedCount).toBe(1);
+  });
+
+  it("refuses invalid custom parser configs with clear notices naming the field", () => {
+    const emptyString = parseTriageConfig({
+      parsers: { custom: [{ name: "test", detect: "x", fail_pattern: "(?<name>\\w*)" }] },
+    });
+    expect(emptyString.ok).toBe(false);
+    if (!emptyString.ok) {
+      expect(emptyString.errors).toContain(
+        "triage.parsers.custom[0]: custom parser 'fail_pattern' must not match the empty string (causes infinite loops)",
+      );
+    }
+
+    const nestedQuantifier = parseTriageConfig({
+      parsers: { custom: [{ name: "test", detect: "x", fail_pattern: "(a+)+(?<name>x)" }] },
+    });
+    expect(nestedQuantifier.ok).toBe(false);
+    if (!nestedQuantifier.ok) {
+      expect(nestedQuantifier.errors).toContain(
+        "triage.parsers.custom[0]: custom parser 'fail_pattern' contains nested quantifiers, which can cause catastrophic backtracking",
+      );
+    }
+
+    const backreference = parseTriageConfig({
+      parsers: { custom: [{ name: "test", detect: "x", fail_pattern: "(a)\\1(?<name>x)" }] },
+    });
+    expect(backreference.ok).toBe(false);
+    if (!backreference.ok) {
+      expect(backreference.errors).toContain(
+        "triage.parsers.custom[0]: custom parser 'fail_pattern' contains backreferences, which can cause exponential time complexity",
+      );
+    }
+
+    const missingName = parseTriageConfig({
+      parsers: { custom: [{ name: "test", detect: "x", fail_pattern: "FAIL: (?<other>x)" }] },
+    });
+    expect(missingName.ok).toBe(false);
+    if (!missingName.ok) {
+      expect(missingName.errors).toContain(
+        "triage.parsers.custom[0]: custom parser 'fail_pattern' must include a (?<name>...) capture group",
+      );
+    }
+
+    const duplicateName = parseTriageConfig({
+      parsers: {
+        custom: [
+          { name: "test", detect: "x", fail_pattern: "(?<name>x)" },
+          { name: "test", detect: "y", fail_pattern: "(?<name>y)" },
+        ],
+      },
+    });
+    expect(duplicateName.ok).toBe(false);
+    if (!duplicateName.ok) {
+      expect(duplicateName.errors).toContain("triage.parsers.custom[1]: duplicate parser name 'test'");
+    }
   });
 });
 

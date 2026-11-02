@@ -1,0 +1,22 @@
+{"Time":"2026-03-02T12:00:00.001Z","Action":"start","Package":"example.com/shop/orders"}
+{"Time":"2026-03-02T12:00:00.002Z","Action":"run","Package":"example.com/shop/orders","Test":"TestCalculateTotal"}
+{"Time":"2026-03-02T12:00:00.003Z","Action":"output","Package":"example.com/shop/orders","Test":"TestCalculateTotal","Output":"=== RUN   TestCalculateTotal\n"}
+{"Time":"2026-03-02T12:00:00.004Z","Action":"output","Package":"example.com/shop/orders","Test":"TestCalculateTotal","Output":"    orders_test.go:15: expected 108, got 100\n"}
+{"Time":"2026-03-02T12:00:00.005Z","Action":"output","Package":"example.com/shop/orders","Test":"TestCalculateTotal","Output":"--- FAIL: TestCalculateTotal (0.00s)\n"}
+{"Time":"2026-03-02T12:00:00.006Z","Action":"fail","Package":"example.com/shop/orders","Test":"TestCalculateTotal","Elapsed":0.001}
+{"Time":"2026-03-02T12:00:00.007Z","Action":"run","Package":"example.com/shop/orders","Test":"TestApplyDiscount"}
+{"Time":"2026-03-02T12:00:00.008Z","Action":"output","Package":"example.com/shop/orders","Test":"TestApplyDiscount","Output":"=== RUN   TestApplyDiscount\n"}
+{"Time":"2026-03-02T12:00:00.009Z","Action":"output","Package":"example.com/shop/orders","Test":"TestApplyDiscount","Output":"--- PASS: TestApplyDiscount (0.00s)\n"}
+{"Time":"2026-03-02T12:00:00.010Z","Action":"pass","Package":"example.com/shop/orders","Test":"TestApplyDiscount","Elapsed":0.001}
+{"Time":"2026-03-02T12:00:00.011Z","Action":"run","Package":"example.com/shop/orders","Test":"TestConnectDB"}
+{"Time":"2026-03-02T12:00:00.012Z","Action":"output","Package":"example.com/shop/orders","Test":"TestConnectDB","Output":"=== RUN   TestConnectDB\n"}
+{"Time":"2026-03-02T12:00:00.013Z","Action":"output","Package":"example.com/shop/orders","Test":"TestConnectDB","Output":"panic: dial tcp 127.0.0.1:5432: connect: connection refused\n"}
+{"Time":"2026-03-02T12:00:00.014Z","Action":"output","Package":"example.com/shop/orders","Test":"TestConnectDB","Output":"\n"}
+{"Time":"2026-03-02T12:00:00.015Z","Action":"output","Package":"example.com/shop/orders","Test":"TestConnectDB","Output":"goroutine 1 [running]:\n"}
+{"Time":"2026-03-02T12:00:00.016Z","Action":"output","Package":"example.com/shop/orders","Test":"TestConnectDB","Output":"example.com/shop/orders.TestConnectDB(0x14000106340)\n"}
+{"Time":"2026-03-02T12:00:00.017Z","Action":"output","Package":"example.com/shop/orders","Test":"TestConnectDB","Output":"        /home/user/project/orders/orders_test.go:42 +0x1c\n"}
+{"Time":"2026-03-02T12:00:00.018Z","Action":"output","Package":"example.com/shop/orders","Test":"TestConnectDB","Output":"--- FAIL: TestConnectDB (0.01s)\n"}
+{"Time":"2026-03-02T12:00:00.019Z","Action":"fail","Package":"example.com/shop/orders","Test":"TestConnectDB","Elapsed":0.01}
+{"Time":"2026-03-02T12:00:00.020Z","Action":"output","Package":"example.com/shop/orders","Output":"FAIL\n"}
+{"Time":"2026-03-02T12:00:00.021Z","Action":"output","Package":"example.com/shop/orders","Output":"FAIL\texample.com/shop/orders\t0.015s\n"}
+{"Time":"2026-03-02T12:00:00.022Z","Action":"fail","Package":"example.com/shop/orders","Elapsed":0.015}
