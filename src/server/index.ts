@@ -78,6 +78,7 @@ import {
 import { SettingsService, registerSettingsUiRoutes } from "./settings/index.js";
 import { mountPlanner, plannerAgentsFrom } from "./planner/index.js";
 import { TrackerManager, registerTrackerRoutes } from "./tracker/index.js";
+import { WorkStoreManager, registerWorkRoutes } from "./work/index.js";
 import { join } from "path";
 import type { ApiResponse, ProjectConfig } from "../shared/types.js";
 import { initProcessCache, disposeProcessCache, CachedProcessTable } from "./core/process-cache.js";
@@ -786,6 +787,22 @@ trackers.load(projectEntries);
 trackers.useDecisions(decisionInbox);
 await registerTrackerRoutes(fastify, trackers, () => getDefaultProject(), humanAuth);
 
+// The work store (src/server/work/, docs/design/work-store.md): one SQLite file per project with
+// `work_store.mode: observe` (off by default: no store file, today's files exactly). In observe it follows the files
+// one way when the owner imports (a dry run first); fill, the planner and the tracker still read the files. Every
+// route is the owner's.
+const works = new WorkStoreManager({
+  dataDir: join(process.cwd(), "data"),
+  runs: () => agents.getStore(),
+  bus: (project) => busConsumers.lineSource(project),
+  accepted: (project) => {
+    const service = agents.get(project);
+    return service ? (agent, task, line, description, report) => service.reportAccepted(agent, task, line, description, report) : undefined;
+  },
+});
+works.load(projectEntries);
+await registerWorkRoutes(fastify, works, () => getDefaultProject(), humanAuth);
+
 // Placement: one per project with `placement.enabled: true` (off by
 // default). It probes the project's machines, estimates when each queued
 // job of the project's own gate queue finishes on each lane, and moves jobs
@@ -963,6 +980,7 @@ const reloader = new ConfigReloader({
       },
       reloadProject: async (entry) => applyBusConfig(entry),
     },
+    work: works,
   }),
   initial: projectEntries,
   events: getEventBus(),
@@ -1066,6 +1084,9 @@ const stopServer = async (reason: string) => {
   // Stop the tracker: its requests to GitHub in flight are cut short (a create cut short is found again by its
   // marker on the next start), then its store closes
   await trackers.stop();
+
+  // Close the work stores (an import in flight finishes its one transaction first: it never awaits inside it)
+  await works.stop();
 
   // Stop agent supervision: the agents keep running for the next server to adopt, unless a project sets
   // agents.on_restart: stop (then their runs are stopped too, within a bounded wait)
