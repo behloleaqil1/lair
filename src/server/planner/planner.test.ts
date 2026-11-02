@@ -1083,10 +1083,10 @@ describe("bus reports (bus.consume): a line the bus mirrored is read by its repo
       events,
     });
     /** A report as POST /api/bus/call files it for a run that holds `task` */
-    const report = (agent: string, kind: "DONE" | "BLOCKED", task: string, summary: string): number => {
+    const report = async (agent: string, kind: "DONE" | "BLOCKED", task: string, summary: string): Promise<number> => {
       const runId = `run-${claims.size + 1}`;
       claims.set(runId, task);
-      const result = service.report({ project: "demo", agent, runId, tokenHash: `h-${runId}`, issuedAt: NOW }, kind, task, summary);
+      const result = await service.report({ project: "demo", agent, runId, tokenHash: `h-${runId}`, issuedAt: NOW }, kind, task, summary);
       if (!result.ok) throw new Error(result.error.message);
       return result.data.id;
     };
@@ -1102,7 +1102,7 @@ describe("bus reports (bus.consume): a line the bus mirrored is read by its repo
     const bus = busFor(p, "on");
     const h = await setup(p, plannerBlock(p), { bus: (project) => bus.consumers.lineSource(project) });
     await h.service.cycle();
-    const id = bus.report("worker-a", "BLOCKED", "feat-login", SUMMARY);
+    const id = await bus.report("worker-a", "BLOCKED", "feat-login", SUMMARY);
     const mirrored = readFileSync(p.queueFile, "utf-8").trim().split("\n").at(-1) ?? "";
     expect(mirrored).toMatch(new RegExp(`\\[bus:${id}\\]$`));
     await h.service.cycle();
@@ -1129,7 +1129,7 @@ describe("bus reports (bus.consume): a line the bus mirrored is read by its repo
     const bus = busFor(p, "observe");
     const h = await setup(p, plannerBlock(p), { bus: (project) => bus.consumers.lineSource(project) });
     await h.service.cycle();
-    const id = bus.report("worker-a", "BLOCKED", "feat-login", SUMMARY);
+    const id = await bus.report("worker-a", "BLOCKED", "feat-login", SUMMARY);
     await h.service.cycle();
 
     expect(h.service.overview().blocked.map((b) => b.task)).toEqual(["feat-search"]);
@@ -1152,7 +1152,7 @@ describe("bus reports (bus.consume): a line the bus mirrored is read by its repo
     const bus = busFor(p, "on");
     const h = await setup(p, plannerBlock(p, { agent: undefined }), { bus: (project) => bus.consumers.lineSource(project) });
     await h.service.cycle();
-    bus.report("worker-a", "DONE", "feat-login", "merged");
+    await bus.report("worker-a", "DONE", "feat-login", "merged");
     await h.service.cycle();
     expect(taskIds(h)).toEqual(["feat-search"]);
     expect(history(h)[0]).toMatchObject({ source: "deterministic", outcome: "applied", op: "mark_done", task: "feat-login" });

@@ -28,6 +28,7 @@ import {
 } from "fs";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 import Database from "better-sqlite3";
 import type { AgentAdapter, ProjectConfig } from "../../shared/types.js";
 import type { AgentEventKind, AgentsStatusView, AgentView, FillStatusView, PromptFileView } from "../../shared/agents-types.js";
@@ -68,7 +69,16 @@ import type { AgentProbes, ProcessOwner, ProcessSpawner, SpawnOptions, SystemInf
 import type { DecisionInbox, DecisionRequest } from "./decisions.js";
 import { AgentsStore, SCHEMA_VERSION } from "./store.js";
 import type { AgentEvent, AgentRun } from "./types.js";
-import { BusConsumers, agentsBusFor, closeBusStores, hashBusToken, structuredReport, type BusConsumeMode } from "../bus/index.js";
+import {
+  BusConsumers,
+  agentsBusFor,
+  closeBusStores,
+  existingBusStore,
+  hashBusToken,
+  openedBusStore,
+  structuredReport,
+  type BusConsumeMode,
+} from "../bus/index.js";
 import { busStoreFor, forgetBusService, registerBusRoutes } from "../routes/bus.js";
 
 // ============ BOUNDARY FAKES ============
@@ -6296,7 +6306,15 @@ describe("12. the bus (bus.consume): fill reads an agent's structured report in 
       dbPath: paths.dbPath,
       probes: { processes: procs, fs: new NodeFileSystem(), runner: new FakeCommandRunner(), clock, spawner, self: SELF, systemInfo: new FakeSystemInfo() },
       events,
-      bus: agentsBusFor({ consumers, store: (project) => busStoreFor(project, dataDir), clock, serverUrl: SERVER_URL, tokenUsers }),
+      bus: agentsBusFor({
+        consumers,
+        store: (project) => busStoreFor(project, dataDir),
+        openedStore: (project) => openedBusStore(project, dataDir),
+        existingStore: (project) => existingBusStore(project, dataDir),
+        clock,
+        serverUrl: SERVER_URL,
+        tokenUsers,
+      }),
     });
     managers.push(manager);
     manager.load([{ name: "demo", config }]);
@@ -6512,5 +6530,187 @@ describe("12. the bus (bus.consume): fill reads an agent's structured report in 
     const late = await report(h, token, { kind: "DONE", task: "feat-login", summary: "late" });
     expect(late.statusCode).toBe(401);
     expect(readFileSync(h.paths.queueFile, "utf-8")).not.toContain("late");
+  });
+
+  // ============ Lair #260: a run's bus token is revoked on every way it ends; a report is validated at the route ============
+
+  const busStoreOf = (h: BusHarness) => busStoreFor("demo", join(h.paths.dir, "data"));
+  const RATE_LIMIT = "Error: 429 Too Many Requests: rate limit exceeded, retry later";
+  const NETWORK_DOWN =
+    'Error: A network error occurred. Please check your connection and try again. (code -32000): {"errorType":"ClientNetworkError","retryErrorType":"TRANSIENT"}';
+  /** The started process writes `line` to its log and exits 1 at once */
+  const diesOn = (h: BusHarness, line: string) => {
+    h.spawner.behaviour = (pid, log, call) => {
+      if (call !== 1) return;
+      writeLog(h.clock, log, `${line}\n`);
+      h.spawner.exit(pid, 1);
+    };
+  };
+
+  /** Each way a run ends, with what makes it end: `before` runs before fill starts the run, `end` after */
+  const endPaths: Array<{ path: string; state: string; before?: (h: BusHarness) => void; end: (h: BusHarness, runId: string) => Promise<void> }> = [
+    {
+      path: "completed (exit 0): endRun",
+      state: "completed",
+      end: async (h) => {
+        h.spawner.exit(5001, 0);
+        await h.service.tick();
+      },
+    },
+    {
+      path: "crashed (exit 1): recover",
+      state: "failed",
+      end: async (h) => {
+        h.clock.advance(5 * MIN);
+        h.spawner.exit(5001, 1);
+        await h.service.tick();
+      },
+    },
+    {
+      path: "a rate limit: failover",
+      state: "failed",
+      before: (h) => diesOn(h, RATE_LIMIT),
+      end: async (h) => void (await h.service.tick()),
+    },
+    {
+      path: "a network error: transient retry",
+      state: "failed",
+      before: (h) => diesOn(h, NETWORK_DOWN),
+      end: async (h) => void (await h.service.tick()),
+    },
+    {
+      path: "the owner's fresh session: SIGTERM, then recover",
+      state: "failed",
+      end: async (h, runId) => {
+        await h.service.freshSession(runId);
+        await h.service.tick();
+      },
+    },
+    {
+      path: "spawn errors past start_timeout_minutes: never started",
+      state: "never_started",
+      before: (h) => void (h.spawner.failAll = "spawn agent-cli ENOENT"),
+      end: async (h) => {
+        h.clock.advance(11 * MIN);
+        await h.service.tick();
+      },
+    },
+    {
+      path: "its claim released before it started: lost claim",
+      state: "lost_claim",
+      before: (h) => void (h.spawner.failAll = "spawn agent-cli ENOENT"),
+      end: async (h) => void (await h.service.releaseClaim("feat-login")),
+    },
+  ];
+
+  it.each(endPaths)("$path: the run's bus token is revoked, and the bus refuses it", async ({ state, before, end }) => {
+    const h = await busSetup("on");
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    before?.(h);
+    const token = await started(h);
+    expect(token).toMatch(/^lairbus_/);
+    const run = runsOf(h)[0];
+    expect(busStoreOf(h).validateToken(hashBusToken(token))).toMatchObject({ runId: run.id });
+
+    await end(h, run.id);
+
+    expect(h.store.getRun(run.id)?.state).toBe(state);
+    expect(busStoreOf(h).validateToken(hashBusToken(token))).toBeNull();
+    // Every token the run was given (one per start attempt) is revoked, not only the last
+    expect(busStoreOf(h).getTokenForRun(run.id)).toBeNull();
+    const late = await report(h, token, { kind: "DONE", task: "feat-login", summary: "late" });
+    expect(late.statusCode).toBe(401);
+  });
+
+  it("bus.consume switched off by a reload mid-run: the token minted while it was on is still revoked when the run ends", async () => {
+    const h = await busSetup("on");
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    const token = await started(h);
+    // What the server's config reload does (index.ts applyBusConfig)
+    h.consumers.setMode("demo", "off");
+    forgetBusService("demo");
+    h.spawner.exit(5001, 0);
+    await h.service.tick();
+    expect(runsOf(h)[0].state).toBe("completed");
+    expect(busStoreOf(h).validateToken(hashBusToken(token))).toBeNull();
+  });
+
+  it("a restart revokes the tokens of runs that ended while no server was there to revoke them, with the bus off by then too", async () => {
+    const h = await busSetup("on");
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    const token = await started(h);
+    // The run ended, but its token was never revoked (the server stopped first, or an older one never revoked it)
+    const run = runsOf(h)[0];
+    h.store.saveRun({ ...run, state: "failed", endedAt: h.clock.now(), detail: "crashed" });
+    expect(busStoreOf(h).validateToken(hashBusToken(token))).not.toBeNull();
+
+    // A new server process: no bus store open, and bus.consume switched off meanwhile
+    closeBusStores();
+    const again = await busSetup("off", {}, h);
+    again.manager.start();
+    await vi.waitFor(() => expect(busStoreOf(again).validateToken(hashBusToken(token))).toBeNull());
+  });
+
+  it("a restart of a project that never had a bus store creates none (nothing to sweep)", async () => {
+    const h = await busSetup("off");
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    await started(h);
+    h.manager.start();
+    h.spawner.exit(5001, 0);
+    await vi.waitFor(() => expect(runsOf(h)[0].state).toBe("completed"));
+    await h.manager.stop();
+    expect(existsSync(join(h.paths.dir, "data", "bus"))).toBe(false);
+  });
+
+  it("the bus finds a live run however many runs came after it (more than 100)", async () => {
+    const h = await busSetup("on");
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    const token = await started(h);
+    const live = runsOf(h)[0];
+    for (let i = 1; i <= 120; i++) {
+      h.store.insertRun({ ...live, id: `ended-${i}`, task: `chore-${i}`, chainId: `chain-${i}`, state: "completed", requestedAt: live.requestedAt + i, endedAt: live.requestedAt + i });
+    }
+    expect(h.service.runs(100).some((r) => r.id === live.id)).toBe(false);
+    const whoami = await h.app.inject({ method: "POST", url: "/api/bus/call", headers: { authorization: `Bearer ${token}` }, payload: { tool: "whoami", args: {} } });
+    expect(whoami.statusCode).toBe(200);
+    expect(whoami.json().data).toMatchObject({ runId: live.id, task: "feat-login" });
+    const posted = await report(h, token, { kind: "PROGRESS", task: "feat-login", summary: "half way" });
+    expect(posted.statusCode).toBe(200);
+  });
+
+  it("refuses at the route (400) a report the consumers would refuse: a sha that isn't 7 to 64 hex digits, a gate id that isn't a plain name; nothing is stored or mirrored", async () => {
+    const h = await busSetup("on");
+    tasks(h, "worker-a|Alice|feat-login|Build the login form");
+    const token = await started(h);
+    const refused: Array<[Record<string, unknown>, string]> = [
+      [{ sha: "not-a-sha" }, "sha"],
+      [{ sha: "abc12" }, "sha"],
+      [{ sha: "a".repeat(65) }, "sha"],
+      [{ gate_id: "../escape" }, "gate_id"],
+      [{ gate_id: "dir/gate" }, "gate_id"],
+      [{ gate_id: "-rf" }, "gate_id"],
+      [{ gate_id: "gate 1" }, "gate_id"],
+      [{ gate_id: "a..b" }, "gate_id"],
+    ];
+    for (const [args, field] of refused) {
+      const posted = await report(h, token, { kind: "WAITING", task: "feat-login", summary: "the gate runs", ...args });
+      expect(posted.statusCode, JSON.stringify(args)).toBe(400);
+      expect(posted.json().error).toContain(field);
+    }
+    expect(busStoreOf(h).listReports()).toEqual([]);
+    expect(existsSync(h.paths.queueFile) ? readFileSync(h.paths.queueFile, "utf-8") : "").not.toContain("[bus:");
+    expect(h.consumers.health("demo").refusedCount).toBe(0);
+
+    // The same report with a plain gate id and a hex sha is stored, mirrored and read
+    const ok = await report(h, token, { kind: "WAITING", task: "feat-login", summary: "the gate runs", gate_id: "gate-42.v2_x", sha: "ABC1234" });
+    expect(ok.statusCode).toBe(200);
+    expect(busStoreOf(h).listReports()).toHaveLength(1);
+    expect(readFileSync(h.paths.queueFile, "utf-8")).toContain(`[bus:${ok.json().data.id}]`);
+  });
+
+  it("every way a run ends goes through runEnded (static): no other code of the service sets an ended state", () => {
+    const code = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "service.ts"), "utf8");
+    expect(code.match(/\.state\s*=\s*"(completed|failed|never_started|lost_claim|superseded)"/g)).toBeNull();
+    expect(code.match(/\b\w+\.state\s*=\s*[a-z]\w*\s*;/g)).toEqual(["run.state = state;"]);
   });
 });

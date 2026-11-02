@@ -55,9 +55,9 @@ const BUS_TOOLS = [
       kind: ReportKind.describe("Status kind"),
       task: z.string().min(1).max(200).describe("Task identifier"),
       summary: z.string().min(1).max(10000).describe("Status summary"),
-      gate_id: z.string().max(200).optional().describe("Gate id if relevant"),
+      gate_id: z.string().max(200).optional().describe("Gate id if relevant: one plain name (letters, digits, ., _ and -; no / or ..)"),
       pr: z.number().int().positive().optional().describe("PR number if relevant"),
-      sha: z.string().max(64).optional().describe("Commit SHA if relevant"),
+      sha: z.string().max(64).optional().describe("Commit SHA if relevant: 7 to 64 hex digits"),
     },
   },
   {

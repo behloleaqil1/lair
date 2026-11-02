@@ -67,8 +67,8 @@ afterEach(() => {
 });
 
 /** A report as an agent posts it (POST /api/bus/call runs BusService.report): its id */
-function report(kind: "DONE" | "WAITING" | "BLOCKED" | "PROGRESS" | "TICK", options: { gate?: string; pr?: number; sha?: string } = {}): number {
-  const result = service.report(binding("worker-a", "run-1"), kind, "feat-login", "the summary", options.gate, options.pr, options.sha);
+async function report(kind: "DONE" | "WAITING" | "BLOCKED" | "PROGRESS" | "TICK", options: { gate?: string; pr?: number; sha?: string } = {}): Promise<number> {
+  const result = await service.report(binding("worker-a", "run-1"), kind, "feat-login", "the summary", options.gate, options.pr, options.sha);
   if (!result.ok) throw new Error(result.error.message);
   return result.data.id;
 }
@@ -120,8 +120,8 @@ function consumers(mode: BusConsumeMode, problem: (report: StructuredReport) => 
 // ============ THE MARKER ============
 
 describe("the bus marker on mirrored lines", () => {
-  it("reads the id the mirror ends a line with, and only there", () => {
-    const id = report("DONE", { gate: "gate-7", pr: 42, sha: "deadbeefcafe" });
+  it("reads the id the mirror ends a line with, and only there", async () => {
+    const id = await report("DONE", { gate: "gate-7", pr: 42, sha: "deadbeefcafe" });
     const line = readFileSync(join(dir, "queue.md"), "utf-8").trim();
     expect(line).toMatch(/PR #42 \[deadbee\] \[bus:\d+\]$/);
     expect(extractBusId(line)).toBe(id);
@@ -135,8 +135,8 @@ describe("the bus marker on mirrored lines", () => {
     expect(extractBusId("- DONE x by a 12:00Z: y")).toBeNull();
   });
 
-  it("tells the mirror's line for a report from a hand-written line that ends with its marker", () => {
-    const id = report("BLOCKED");
+  it("tells the mirror's line for a report from a hand-written line that ends with its marker", async () => {
+    const id = await report("BLOCKED");
     const line = readFileSync(join(dir, "queue.md"), "utf-8").trim();
     const stored = structuredReport(store.getReport(id)!);
     expect(isMirrorOf(line, stored)).toBe(true);
@@ -149,13 +149,13 @@ describe("the bus marker on mirrored lines", () => {
 // ============ VALIDATION ============
 
 describe("bus event validation: every field checked, a refusal has its reason", () => {
-  it("accepts the report events BusService emits, for every kind", () => {
+  it("accepts the report events BusService emits, for every kind", async () => {
     for (const kind of ["DONE", "WAITING", "BLOCKED", "PROGRESS", "TICK"] as const) {
-      report(kind, { gate: "gate-1", pr: 7, sha: "abc1234" });
+      await report(kind, { gate: "gate-1", pr: 7, sha: "abc1234" });
       const checked = validateBusReportEvent(lastData("bus.report"));
       expect(checked).toMatchObject({ ok: true, value: { project: PROJECT, agent: "worker-a", kind, task: "feat-login", gateId: "gate-1", pr: 7, sha: "abc1234" } });
     }
-    report("DONE");
+    await report("DONE");
     expect(validateBusReportEvent(lastData("bus.report"))).toMatchObject({ ok: true, value: { kind: "DONE" } });
   });
 
@@ -183,10 +183,10 @@ describe("bus event validation: every field checked, a refusal has its reason", 
     if (!checked.ok) expect(checked.reason).toContain(field);
   });
 
-  it("accepts the message events BusService emits, and refuses each bad field with its reason", () => {
-    service.send(binding("worker-a", "run-1"), "orchestrator", "I need the staging password", 3);
+  it("accepts the message events BusService emits, and refuses each bad field with its reason", async () => {
+    await service.send(binding("worker-a", "run-1"), "orchestrator", "I need the staging password", 3);
     expect(validateBusMessageEvent(lastData("bus.message"))).toMatchObject({ ok: true, value: { project: PROJECT, from: "worker-a", to: "orchestrator", priority: 3 } });
-    service.sendFromOwner("worker-a", "go on");
+    await service.sendFromOwner("worker-a", "go on");
     expect(validateBusMessageEvent(lastData("bus.message"))).toMatchObject({ ok: true, value: { from: "owner", to: "worker-a", priority: 5 } });
     const good = { project: PROJECT, id: "m1", from: "worker-a", to: "orchestrator", priority: 5 };
     const bad: [Record<string, unknown>, string][] = [
@@ -204,8 +204,8 @@ describe("bus event validation: every field checked, a refusal has its reason", 
     }
   });
 
-  it("finds an event that doesn't match the report the bus stored under its id", () => {
-    const id = report("WAITING", { gate: "gate-1" });
+  it("finds an event that doesn't match the report the bus stored under its id", async () => {
+    const id = await report("WAITING", { gate: "gate-1" });
     const stored = structuredReport(store.getReport(id)!);
     const event = { project: PROJECT, id, agent: "worker-a", kind: "WAITING" as const, task: "feat-login", gateId: "gate-1" };
     expect(eventMismatch(event, stored)).toBeNull();
@@ -219,13 +219,13 @@ describe("bus event validation: every field checked, a refusal has its reason", 
 // ============ CONFIG ============
 
 describe("bus.consume", () => {
-  it("is off without a bus block, and takes off, observe or on", () => {
+  it("is off without a bus block, and takes off, observe or on", async () => {
     expect(parseBusConfig(undefined)).toEqual({ ok: true, settings: { consume: "off" } });
     expect(parseBusConfig({})).toEqual({ ok: true, settings: { consume: "off" } });
     for (const consume of ["off", "observe", "on"]) expect(parseBusConfig({ consume })).toEqual({ ok: true, settings: { consume } });
   });
 
-  it("refuses another value, an unknown key and a block that isn't a mapping, with the reason", () => {
+  it("refuses another value, an unknown key and a block that isn't a mapping, with the reason", async () => {
     expect(parseBusConfig({ consume: "yes" })).toEqual({ ok: false, errors: ['bus.consume must be one of off, observe, on; got "yes"'] });
     expect(parseBusConfig({ consume: true })).toMatchObject({ ok: false });
     expect(parseBusConfig({ consum: "on" })).toEqual({ ok: false, errors: ["bus.consum is not a known key (known: consume)"] });
@@ -237,7 +237,7 @@ describe("bus.consume", () => {
 // ============ DISPATCH ============
 
 describe("BusConsumers: one subscription for the server, dispatched by project", () => {
-  it("subscribes once per event type, however many projects there are", () => {
+  it("subscribes once per event type, however many projects there are", async () => {
     let subscriptions = 0;
     const counting = new EventBus();
     const on = counting.on.bind(counting);
@@ -255,9 +255,9 @@ describe("BusConsumers: one subscription for the server, dispatched by project",
 
   it("on: a valid DONE, WAITING or BLOCKED report wakes the modules once, with the report as stored", async () => {
     const { calls } = consumers("on");
-    const done = report("DONE", { pr: 42, sha: "abc1234" });
-    const waiting = report("WAITING", { gate: "gate-1" });
-    const blocked = report("BLOCKED");
+    const done = await report("DONE", { pr: 42, sha: "abc1234" });
+    const waiting = await report("WAITING", { gate: "gate-1" });
+    const blocked = await report("BLOCKED");
     await settle();
     expect(calls.reports.map((r) => [r.id, r.kind, r.task, r.agent])).toEqual([
       [done, "DONE", "feat-login", "worker-a"],
@@ -270,8 +270,8 @@ describe("BusConsumers: one subscription for the server, dispatched by project",
 
   it("on: PROGRESS and TICK reports are received but wake nothing (they change no state)", async () => {
     const { bus, calls } = consumers("on");
-    report("PROGRESS");
-    report("TICK");
+    await report("PROGRESS");
+    await report("TICK");
     await settle();
     expect(calls.reports).toEqual([]);
     expect(bus.health(PROJECT)).toMatchObject({ received: 2, refusedCount: 0 });
@@ -280,7 +280,7 @@ describe("BusConsumers: one subscription for the server, dispatched by project",
   it("observe and off: a report wakes nothing", async () => {
     for (const mode of ["observe", "off"] as const) {
       const { bus, calls } = consumers(mode);
-      report("DONE");
+      await report("DONE");
       await settle();
       expect(calls.reports).toEqual([]);
       expect(bus.health(PROJECT).received).toBe(mode === "observe" ? 1 : 0);
@@ -303,7 +303,7 @@ describe("BusConsumers: one subscription for the server, dispatched by project",
 
   it("refuses an event that doesn't match the bus store (no such report, or other fields)", async () => {
     const { bus, calls } = consumers("on");
-    const id = report("DONE");
+    const id = await report("DONE");
     await settle();
     calls.reports.length = 0;
     await events.emit("bus.report", { project: PROJECT, id: id + 100, agent: "worker-a", kind: "DONE", task: "feat-login" });
@@ -317,7 +317,7 @@ describe("BusConsumers: one subscription for the server, dispatched by project",
 
   it("ignores, and audits, a report for a task or agent no module knows: nothing is woken for it", async () => {
     const { bus, calls } = consumers("on", (r) => (r.task === "feat-login" ? "task feat-login is not in agents.fill.tasks_file: fill ignores the report" : null));
-    const id = report("DONE");
+    const id = await report("DONE");
     await settle();
     expect(calls.reports).toEqual([]);
     expect(bus.health(PROJECT).refused).toEqual([
@@ -336,8 +336,8 @@ describe("BusConsumers: one subscription for the server, dispatched by project",
 
   it("on: a message to the orchestrator wakes the planner; one to an agent doesn't", async () => {
     const { calls } = consumers("on");
-    service.send(binding("worker-a", "run-1"), "orchestrator", "need a decision");
-    service.sendFromOwner("worker-a", "go on");
+    await service.send(binding("worker-a", "run-1"), "orchestrator", "need a decision");
+    await service.sendFromOwner("worker-a", "go on");
     await settle();
     expect(calls.messages).toEqual(["demo:worker-a->orchestrator"]);
   });
@@ -356,14 +356,14 @@ describe("BusConsumers: one subscription for the server, dispatched by project",
   it("stop() unsubscribes: nothing is woken after it", async () => {
     const { bus, calls } = consumers("on");
     bus.stop();
-    report("DONE");
+    await report("DONE");
     await settle();
     expect(calls.reports).toEqual([]);
   });
 });
 
 describe("BusConsumers.lineSource: the bus as fill and the planner read it", () => {
-  it("is null while off, and follows the mode", () => {
+  it("is null while off, and follows the mode", async () => {
     const { bus } = consumers("off");
     expect(bus.lineSource(PROJECT)).toBeNull();
     bus.setMode(PROJECT, "observe");
@@ -374,10 +374,10 @@ describe("BusConsumers.lineSource: the bus as fill and the planner read it", () 
     expect(bus.enabled()).toEqual([PROJECT]);
   });
 
-  it("reads each report from the store once, in one read for many ids", () => {
+  it("reads each report from the store once, in one read for many ids", async () => {
     // Filed before the consumers start: no event of theirs has read them yet
-    const a = report("DONE");
-    const b = report("BLOCKED");
+    const a = await report("DONE");
+    const b = await report("BLOCKED");
     const { bus, calls } = consumers("on");
     const source = bus.lineSource(PROJECT)!;
     expect([...source.reports([a, b, 999]).keys()]).toEqual([a, b]);
@@ -387,7 +387,7 @@ describe("BusConsumers.lineSource: the bus as fill and the planner read it", () 
     expect(calls.storeReads).toEqual([[a, b, 999], [999]]);
   });
 
-  it("a store that can't be read gives no reports (lines are read as hand-written), and says why", () => {
+  it("a store that can't be read gives no reports (lines are read as hand-written), and says why", async () => {
     const warnings: string[] = [];
     const bus = new BusConsumers({
       events,
@@ -405,7 +405,7 @@ describe("BusConsumers.lineSource: the bus as fill and the planner read it", () 
     expect(warnings).toEqual(["[bus-consumers] demo: the bus store could not be read: SQLITE_BUSY: database is locked"]);
   });
 
-  it("observe: keeps what both readings made of each report once (in memory), and counts the differences", () => {
+  it("observe: keeps what both readings made of each report once (in memory), and counts the differences", async () => {
     const { bus } = consumers("observe");
     const source = bus.lineSource(PROJECT)!;
     source.observed({ consumer: "fill", busId: 1, task: "t", agent: "a", report: "done", file: "done" });
@@ -423,7 +423,7 @@ describe("BusConsumers.lineSource: the bus as fill and the planner read it", () 
     expect(bus.health(PROJECT).observations.total).toBe(0);
   });
 
-  it("audits a module's ignored report once per reason", () => {
+  it("audits a module's ignored report once per reason", async () => {
     const { bus } = consumers("on");
     const source = bus.lineSource(PROJECT)!;
     source.ignored(4, "a queue line ends with this report's marker, but the bus store has no such report: read as a hand-written line");
@@ -431,7 +431,7 @@ describe("BusConsumers.lineSource: the bus as fill and the planner read it", () 
     expect(bus.health(PROJECT)).toMatchObject({ refusedCount: 1, refused: [{ busId: 4 }] });
   });
 
-  it("health is off with nothing for a project it doesn't know", () => {
+  it("health is off with nothing for a project it doesn't know", async () => {
     const { bus } = consumers("on");
     expect(bus.health("unknown")).toEqual({ mode: "off", received: 0, refused: [], refusedCount: 0, observations: { total: 0, matches: 0, mismatches: 0, recent: [] } });
   });

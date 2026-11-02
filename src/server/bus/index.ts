@@ -15,7 +15,7 @@ export type {
   BusServiceOptions,
 } from "./service.js";
 
-export { BusStore, getBusStore, closeBusStores, messageState } from "./store.js";
+export { BusStore, getBusStore, openedBusStore, existingBusStore, closeBusStores, messageState } from "./store.js";
 export type { BusReport, BusMessage, MessageState } from "./store.js";
 
 export {

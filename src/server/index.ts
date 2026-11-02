@@ -29,7 +29,7 @@ import {
 } from "./human-auth/index.js";
 import { registerControlRoutes } from "./routes/controls.js";
 import { busStoreFor, forgetBusService, registerBusRoutes } from "./routes/bus.js";
-import { BusConsumers, agentsBusFor, closeBusStores, parseBusConfig, structuredReport } from "./bus/index.js";
+import { BusConsumers, agentsBusFor, closeBusStores, existingBusStore, openedBusStore, parseBusConfig, structuredReport } from "./bus/index.js";
 import { registerProcessRoutes } from "./routes/processes.js";
 import { registerSettingsRoutes } from "./routes/settings.js";
 import { getSupervisor } from "./services/supervisor.js";
@@ -579,10 +579,12 @@ const agents: AgentsManager = new AgentsManager({
   budget: getBudgetManager(),
   tools: aiTools,
   probes: systemAgentProbesWithCache(processCache),
-  // A bus token per run (and its revocation when the run ends) while the project's bus is on
+  // A bus token per run while the project's bus is on, revoked on every way the run ends (and at start, for runs that ended meanwhile)
   bus: agentsBusFor({
     consumers: busConsumers,
     store: (project) => busStoreFor(project, busDataDir),
+    openedStore: (project) => openedBusStore(project, busDataDir),
+    existingStore: (project) => existingBusStore(project, busDataDir),
     clock: { now: () => Date.now() },
     serverUrl: dashboardUrlFor(HOST, PORT),
     // The checks take the run's bus token too: a project with checks: gives its runs one with the bus off
