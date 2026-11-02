@@ -311,7 +311,7 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       "repos.*.redact_patterns": { help: "Regular expressions removed from this repository's texts only (e.g. a private name a public repository must never see), after the project-wide ones" },
       "repos.*.create_issues": { help: "Create issues in this repository for tasks with none (default: create_issues_for_new_tasks): on for a private repository, off for a public one" },
       create_issues_for_new_tasks: { help: "A task with no issue gets one (act mode); otherwise only issues it names or with its exact title are linked" },
-      auto_link: { help: "Link the issue a reconcile proposes for a task (one candidate only) without asking, in act mode; off: proposals wait in the status for the owner" },
+      auto_link: { help: "Link the issue a reconcile proposes for a task (one candidate, named by the task id or closed by the task's PR; a close title alone never) without asking, in act mode; off: proposals wait in the status for the owner" },
       redact_patterns: { help: "Regular expressions removed from every text sent to GitHub, after the built-in ones (paths, tokens, emails, addresses)" },
       token_env: { sensitive: true, help: "The env var holding the GitHub token; default: review.token_env, else GITHUB_TOKEN" },
       api_url: { sensitive: true, advanced: true, help: "https only: the token is sent to it" },

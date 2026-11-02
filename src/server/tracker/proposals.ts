@@ -5,11 +5,13 @@
  * read once per reconcile; the service decides what becomes a link.
  *
  * - mentions_task: the issue's title or body names the task id as a word.
- *   A task id that is a plain word (no digit and none of . _ / # : -) or
- *   shorter than 4 characters is too common to be matched this way.
+ *   A task id that is a plain word (no digit and none of . _ / # : -), has
+ *   no letter, or is shorter than 4 characters is too common to be matched
+ *   this way.
  * - similar_title: the issue's title is close (character bigrams, Dice
  *   coefficient, SIMILAR_TITLE_MIN) to the task's description, or to the
- *   task id and description together.
+ *   task id and description together. Sibling titles ("... bug 1" and
+ *   "... bug 2") score high too, so it alone never auto-links.
  *
  * Texts are bounded before they are matched, and each issue's words and
  * bigrams are computed once.
@@ -33,7 +35,8 @@ export interface IssueMatch {
 
 /** A task id distinctive enough to be matched where it is named */
 export function distinctiveTaskId(task: string): boolean {
-  return task.length >= 4 && /[0-9._/#:-]/.test(task);
+  // A letter too: an all-digit id would match every "#1234"
+  return task.length >= 4 && /[A-Za-z]/.test(task) && /[0-9._/#:-]/.test(task);
 }
 
 /** The task-id-shaped words of a text (split where a task id cannot go on; a trailing . : or # is punctuation) */

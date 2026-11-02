@@ -29,6 +29,7 @@ import { parseTrackerConfig } from "./config.js";
 import { GitHubError, GitHubTrackerClient } from "./github-projects.js";
 import { FakeGitHub } from "./testing/fake-github.js";
 import { distinctiveTaskId, mentionTokens, titleSimilarity } from "./proposals.js";
+import { makeRedactor, withPatterns } from "./redact.js";
 
 const PROJECT = "shop";
 const TOKEN = `ghp_${"a".repeat(36)}`;
@@ -1183,7 +1184,7 @@ describe("link proposals (#262 item 1)", () => {
     const first = gh.addIssue("acme/web", { title: "feat-login follow-up" });
     const second = gh.addIssue("acme/web", { title: "Session cookies", body: "Depends on feat-login." });
     const shared = gh.addIssue("acme/web", { title: "Settings page layout" });
-    const cart = gh.addIssue("acme/web", { title: "Shopping cart drawer" });
+    const cart = gh.addIssue("acme/web", { title: "Shopping cart drawer", body: "Tracks feat-cart." });
     const h = await rig({
       gh,
       tracker: { auto_link: true },
@@ -1197,7 +1198,7 @@ describe("link proposals (#262 item 1)", () => {
     let status = await h.status();
     expect(status.links.map((l) => [l.task, l.issueNumber])).toEqual([["feat-cart", cart.number]]);
     expect(gh.card(board, "acme/web", cart.number)?.status).toBe("Backlog");
-    expect(status.recentWrites.filter((w) => w.op === "link_issue" && w.result === "success").map((w) => w.value)).toEqual(["auto: similar_title"]);
+    expect(status.recentWrites.filter((w) => w.op === "link_issue" && w.result === "success").map((w) => w.value)).toEqual(["auto: mentions_task, similar_title"]);
     expect(status.proposals.map((p) => [p.task, p.action, p.candidates.map((c) => c.issueNumber).sort()])).toEqual([
       ["feat-login", "ambiguous", [first.number, second.number].sort()],
       ["feat-set1", "ambiguous", [shared.number]],
@@ -1293,10 +1294,62 @@ describe("link proposals (#262 item 1)", () => {
     expect((await h.status()).links.map((l) => l.task)).toEqual(["feat-12"]);
   });
 
+  it("a close title alone never auto-links: a sibling's issue (its task done or absent) stays would_link for the owner", async () => {
+    const gh = new FakeGitHub();
+    gh.addBoard("acme", 1);
+    const l08 = gh.addIssue("acme/web", { title: "L-08: add tests for the tracker" });
+    const bug1 = gh.addIssue("acme/web", { title: "Fix login bug 1" });
+    const h = await rig({
+      gh,
+      tracker: { auto_link: true },
+      tasks: ["worker-a|Alice|L-09|add tests for the tracker", "worker-a|Alice|fix-login-2|Fix login bug 2"],
+      done: ["worker-a|Alice|L-08|add tests for the tracker"],
+    });
+    await h.reconcile();
+    const status = await h.status();
+    expect(status.links).toEqual([]);
+    expect(gh.writes()).toEqual([]);
+    expect(status.proposals.map((p) => [p.task, p.action, p.candidates.map((c) => [c.issueNumber, c.reasons.join("+")])])).toEqual([
+      ["L-09", "would_link", [[l08.number, "similar_title"]]],
+      ["fix-login-2", "would_link", [[bug1.number, "similar_title"]]],
+    ]);
+    expect(status.recentWrites.filter((w) => w.op === "link_issue" && w.result === "success")).toEqual([]);
+  });
+
+  it("a task's candidates are issues of its own repository only", async () => {
+    const gh = new FakeGitHub();
+    gh.addIssue("acme/site", { title: "Follow-up for core-auth" });
+    gh.addIssue("acme/core", { title: "Blog for site-blog" });
+    const right = gh.addIssue("acme/site", { title: "site-blog layout" });
+    const h = await rig({
+      gh,
+      tracker: { auto_link: true },
+      repos: [{ repo: "acme/core", default: true }, { repo: "acme/site", match: { tasks: ["site-*"] } }],
+      tasks: ["worker-a|Alice|core-auth|Auth service", "worker-a|Alice|site-blog|Blog"],
+    });
+    const status = await h.status();
+    expect(status.links.map((l) => `${l.task} ${l.repo}#${l.issueNumber}`)).toEqual([`site-blog acme/site#${right.number}`]);
+    expect(status.proposals).toEqual([]);
+  });
+
+  it("a repository's name straddling the title bound is redacted before the cut", () => {
+    const base = makeRedactor({ patterns: [], env: {}, home: "/nonexistent-home" });
+    const site = withPatterns(base, [/zephyr\w*/gi]);
+    const text = `${"a".repeat(193)} zephyrus tail`;
+    // Cut first, the name's start would survive
+    expect(base(text, 200)).toMatch(/zep/);
+    const out = site(text, 200);
+    expect(out.length).toBeLessThanOrEqual(200);
+    expect(out).not.toMatch(/zep/i);
+    expect(out.endsWith("...")).toBe(true);
+  });
+
   it("matching: a task id is a word of its own; a plain-word id is never matched by mention; titles compare by bigrams", () => {
     expect([...mentionTokens("Fixes (feat-a). See `feat-b`: x, feat-c.v2 and #feat-d")].filter((w) => w.startsWith("feat"))).toEqual(["feat-a", "feat-b", "feat-c.v2", "feat-d"]);
     expect(distinctiveTaskId("login")).toBe(false);
     expect(distinctiveTaskId("api")).toBe(false);
+    expect(distinctiveTaskId("1234")).toBe(false);
+    expect(distinctiveTaskId("12-34")).toBe(false);
     expect(distinctiveTaskId("feat-a")).toBe(true);
     expect(titleSimilarity("Order history page for customers", "order history page, for customer")).toBeGreaterThan(0.9);
     expect(titleSimilarity("Login form (web)", "Login form")).toBeLessThan(0.85);

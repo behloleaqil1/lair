@@ -354,9 +354,14 @@ export class TrackerService {
       throw e;
     }
     if (!issue || issue.state !== "open" || issue.isPullRequest) return audit("skipped", `the issue is ${issue ? (issue.isPullRequest ? "a pull request" : "closed") : "not found"}`);
+    try {
+      await this.link(task, candidate.repo, issue, this.initialStatus(this.proposalInfo.get(task) ?? null));
+    } catch (e) {
+      audit("error", `the link was not made: ${message(e)}`.slice(0, 300));
+      throw e;
+    }
     audit("success", null);
     this.proposals = this.proposals.filter((p) => p.task !== task);
-    await this.link(task, candidate.repo, issue, this.initialStatus(this.proposalInfo.get(task) ?? null));
   }
 
   /** An answer to one of the tracker's decisions: "check again" checks the token's scopes again. */
@@ -1075,10 +1080,14 @@ export class TrackerService {
   private async reconcileProposals(snapshot: TasksSnapshot, openPulls: Map<string, Pull[]>, errors: string[]): Promise<void> {
     const tracked = this.settings.repos.map((r) => r.repo);
     const wanted: TaskInfo[] = [];
+    // A task's candidates are issues of the repository it goes to (repoFor), never another one
+    const repoOf = new Map<string, string>();
     for (const info of snapshot.open) {
       if (this.store.getLink(this.project, info.task) || this.store.getPending(this.project, info.task)) continue;
       const state = this.repoFor(info.task, info);
-      if (state && !explicitIssue(info.description, state.settings.repo, tracked)) wanted.push(info);
+      if (!state || explicitIssue(info.description, state.settings.repo, tracked)) continue;
+      wanted.push(info);
+      repoOf.set(info.task, state.settings.repo.toLowerCase());
     }
     if (wanted.length === 0) {
       this.proposals = [];
@@ -1086,8 +1095,10 @@ export class TrackerService {
       return;
     }
     const index = new IssueIndex();
+    const needed = new Set(repoOf.values());
     for (const state of this.repos.values()) {
       if (this.stopped) return;
+      if (!needed.has(state.settings.repo.toLowerCase())) continue;
       try {
         for (const issue of await this.client.listOpenIssues(state.settings.repo, OPEN_ISSUES_PER_REPO)) index.add(state.settings.repo, issue);
       } catch (e) {
@@ -1100,7 +1111,7 @@ export class TrackerService {
     const found = new Map<string, Map<string, TrackerLinkCandidate>>();
     const add = (task: string, repo: string, issue: Issue, reason: TrackerLinkReason, score: number | null, pr: number | null) => {
       const key = IssueIndex.key(repo, issue.number);
-      if (linked.has(key) || issue.isPullRequest || issue.state !== "open") return;
+      if (repo.toLowerCase() !== repoOf.get(task) || linked.has(key) || issue.isPullRequest || issue.state !== "open") return;
       issues.set(key, issue);
       const byIssue = found.get(task) ?? new Map<string, TrackerLinkCandidate>();
       found.set(task, byIssue);
@@ -1126,7 +1137,7 @@ export class TrackerService {
           for (const ref of closingRefs(pull.body, prRepo)) {
             const refRepo = this.repoState(ref.repo)?.settings.repo;
             const key = IssueIndex.key(ref.repo, ref.number);
-            if (!refRepo || linked.has(key)) continue;
+            if (!refRepo || refRepo.toLowerCase() !== repoOf.get(task) || linked.has(key)) continue;
             let issue = index.get(refRepo, ref.number) ?? issues.get(key) ?? null;
             if (!issue) {
               if (this.stopped || lookups >= MAX_PROPOSAL_LOOKUPS) continue;
@@ -1162,15 +1173,25 @@ export class TrackerService {
       if (this.stopped) return;
       const c = p.candidates[0];
       const issue = issues.get(IssueIndex.key(c.repo, c.issueNumber));
-      if (p.action === "would_link" && issue && this.settings.autoLink && this.settings.mode === "act" && autoLinked < MAX_NEW_LINKS_PER_RECONCILE) {
+      // A close title alone is never enough: sibling titles ("... bug 1", "... bug 2") score high. The task id named,
+      // or a PR of the task closing the issue, must be among the reasons
+      const evidence = c.reasons.some((r) => r !== "similar_title");
+      if (p.action === "would_link" && evidence && issue && this.settings.autoLink && this.settings.mode === "act" && autoLinked < MAX_NEW_LINKS_PER_RECONCILE) {
         autoLinked++;
-        this.store.recordWrite(
-          this.project,
-          { task: p.task, repo: c.repo, issueNumber: c.issueNumber, op: "link_issue", value: `auto: ${c.reasons.join(", ")}`, mode: "act", wouldSend: null, result: "success", error: null },
-          this.iso(),
-        );
         this.proposals = this.proposals.filter((x) => x !== p);
-        await this.link(p.task, c.repo, issue, this.initialStatus(this.proposalInfo.get(p.task) ?? null)).catch((e) => errors.push(`${p.task}: ${message(e)}`));
+        const audit = (result: "success" | "error", error: string | null) =>
+          this.store.recordWrite(
+            this.project,
+            { task: p.task, repo: c.repo, issueNumber: c.issueNumber, op: "link_issue", value: `auto: ${c.reasons.join(", ")}`, mode: "act", wouldSend: null, result, error },
+            this.iso(),
+          );
+        try {
+          await this.link(p.task, c.repo, issue, this.initialStatus(this.proposalInfo.get(p.task) ?? null));
+          audit("success", null);
+        } catch (e) {
+          audit("error", message(e).slice(0, 300));
+          errors.push(`${p.task}: ${message(e)}`);
+        }
         continue;
       }
       const named = p.candidates.map((x) => `${x.repo}#${x.issueNumber}`);

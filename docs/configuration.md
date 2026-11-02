@@ -3155,11 +3155,11 @@ tracker:
 
 | Reason | When |
 |---|---|
-| `mentions_task` | the issue's title or body names the task id as a word of its own (a task id of 4 or more characters with a digit or one of `. _ / # : -`; a plain word like `login` is too common) |
+| `mentions_task` | the issue's title or body names the task id as a word of its own (a task id of 4 or more characters with a letter and a digit or one of `. _ / # : -`; a plain word like `login` or a number like `1234` is too common) |
 | `pull_closes` | an open PR of the task (its branch ends with the task id, or its body names it) closes the issue (`Closes #N`), open and unlinked (at most 5 issues read one by one a reconcile when the page did not have them) |
 | `similar_title` | the issue's title is close to the task's description, alone or after the task id (character bigrams, 0.85 or more; titles of fewer than 10 letters and digits are never compared) |
 
-An issue linked to a task already is never proposed. A task with one candidate issue, proposed for no other task, is `would_link`; two candidates, or one issue proposed for two tasks, is `ambiguous` and never linked automatically. The status lists the proposals (`proposals`), and each one is recorded once in the audit as `would_link` (op `link_issue`, counted up on each reconcile). With `auto_link: true` in act mode, a `would_link` proposal is linked by the reconcile (at most 10 a reconcile; audited as `link_issue` with `auto: <reasons>`); in observe mode it is recorded only, whatever `auto_link` says. The owner accepts a proposal (an ambiguous one too, by naming the issue) with `POST /api/tracker/links`. A link lives in Lair's store; its card then moves as any link's does. A failed read (the page, an issue) links nothing and leaves the last proposals as they were.
+Only issues of the repository the task goes to are candidates, and an issue linked to a task already is never proposed. A task with one candidate issue, proposed for no other task, is `would_link`; two candidates, or one issue proposed for two tasks, is `ambiguous` and never linked automatically. The status lists the proposals (`proposals`), and each one is recorded once in the audit as `would_link` (op `link_issue`, counted up on each reconcile). With `auto_link: true` in act mode, a `would_link` proposal whose reasons include `mentions_task` or `pull_closes` is linked by the reconcile (at most 10 a reconcile; audited as `link_issue` with `auto: <reasons>` once the link is made). A `similar_title` match alone is never linked automatically (sibling titles such as "fix login bug 1" and "fix login bug 2" score high): it waits for the owner; in observe mode it is recorded only, whatever `auto_link` says. The owner accepts a proposal (an ambiguous one too, by naming the issue) with `POST /api/tracker/links`. A link lives in Lair's store; its card then moves as any link's does. A failed read (the page, an issue) links nothing and leaves the last proposals as they were.
 
 **Observe and act.**
 
@@ -3222,7 +3222,7 @@ Only `outcome: "applied"` changes count (`planned` is the planner's own observe 
 | `repos[].milestones.close_when_complete` | `true` | Close a complete milestone, reopen one with an open issue |
 | `repos[].milestones.rules` | `[]` | `{tasks: [globs], milestone: "title"}`: the existing milestone of the issues created for those tasks |
 | `create_issues_for_new_tasks` | `false` | Create an issue for a task none is linked to (act mode); the default of each `repos[].create_issues` |
-| `auto_link` | `false` | Link a proposed issue (one candidate, proposed for no other task) without the owner, in act mode; off: recorded as `would_link`, listed in the status for the owner to accept |
+| `auto_link` | `false` | Link a proposed issue (one candidate, proposed for no other task, and named by the task id or closed by the task's PR: a close title alone never) without the owner, in act mode; off: recorded as `would_link`, listed in the status for the owner to accept |
 | `close_removed_tasks` | `false` | Close as not planned the issue of a linked task whose line was removed or commented out by hand (missing 2 reconciles in a row); off: recorded as `would_close` and listed in the status |
 | `blocked_label` | `blocked` | The label of a blocked task's issue |
 | `redact_patterns` | `[]` | Redacted from every text sent, after the built-in rules |
