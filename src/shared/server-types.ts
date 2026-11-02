@@ -295,6 +295,11 @@ export type EventType =
   | "pr_health.finding"
   | "pr_health.cleared"
   | "pr_health.repo_error"
+  // PR health act mode: {project, id, repo, pr, head, kinds, agent, result, attempts, error} /
+  // {project, id, agent, result, attempts, error} / {project, key, code, decisionId}
+  | "pr_health.noted"
+  | "pr_health.withdrawn"
+  | "pr_health.escalated"
   // Cloud machines (src/server/cloud/): {project, limit, spend, reason}
   | "cloud.guard_tripped"
   // The owner cleared the trip: {project, trippedAt, limit, spend, by (owner session id), note}

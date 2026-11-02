@@ -166,8 +166,8 @@ export function parsePrHealthConfig(project: ProjectConfig): ParseResult {
 }
 
 /** Why act mode does nothing for this project, or null when it acts. */
-export function actBlockedReason(config: ProjectConfig, settings: PrHealthSettings): string {
+export function actBlockedReason(config: ProjectConfig, settings: PrHealthSettings): string | null {
   if (settings.mode !== "act") return "pr_health.mode is observe: findings are shown, nothing is sent or raised";
   if (config.read_only === true) return "the project is read_only";
-  return "act mode is not available in this version: findings are shown, nothing is sent or raised";
+  return null;
 }
