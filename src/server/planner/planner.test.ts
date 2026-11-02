@@ -5,7 +5,7 @@
  * asserts the tasks file on disk, what the stores recorded, the decisions
  * raised and the routes' answers.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { appendFileSync, chmodSync, existsSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 import { parseTasksFile } from "../agents/fill.js";
@@ -38,6 +38,9 @@ import { BusService } from "../bus/service.js";
 import { BusStore } from "../bus/store.js";
 
 afterEach(cleanup);
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 const open = (h: Harness) => h.inbox.list({ project: "demo", status: "open" }).filter((d) => d.source.module === "planner");
 const taskIds = (h: Harness) => parseTasksFile(tasksText(h)).flatMap((e) => (e.kind === "task" ? [e.task] : []));
@@ -487,7 +490,10 @@ describe("proposals", () => {
     expect(open(h).map((d) => d.key)).toEqual([expect.stringMatching(/^failing:/)]);
     at(h, 31 * SEC + 1800 * SEC);
     await h.service.cycle();
+    await h.service.cycle();
     expect(runsOf(h)).toHaveLength(3);
+    // The held triggers are reported once, not at every cycle
+    expect(h.bus.filter((e) => e.type === "planner.run_held").map((e) => [e.data.reason, e.data.until, e.data.triggers])).toEqual([["paused", null, 1]]);
     expect(await h.answer(open(h)[0].id, "retry")).toBe(200);
     expect(h.service.status().paused).toBe(false);
   });
@@ -1022,6 +1028,81 @@ describe("blocked tasks, fill's holds, recovery and cost", () => {
     at(h, 24 * 60 * MIN);
     await h.service.cycle();
     expect(runsOf(h)).toHaveLength(3);
+  });
+
+  it("triggers held by max_runs_per_day are logged once and emitted as planner.run_held with when a run can start; the usual waits are not", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const held = (h: Harness) => h.bus.filter((e) => e.type === "planner.run_held").map((e) => e.data);
+    const logged = () => warn.mock.calls.map((c) => String(c[0])).filter((line) => line.startsWith("[planner] demo: "));
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    const agent = { id: "planner", prompt_file: "planner.md", min_interval_seconds: 600, debounce_seconds: 0, max_runs_per_day: 2 };
+    const h = await setup(p, plannerBlock(p, { agent }));
+    await h.service.cycle(); // worker-b is idle: a trigger, and the first run
+    expect(runsOf(h)).toHaveLength(1);
+    await runPlannerAgent(h, (c) => writeProposals(c, { proposals: [] }));
+    await h.service.cycle();
+
+    // A trigger inside min_interval_seconds just waits: no stall to report
+    appendFileSync(p.planFile, "- [ ] feat-cart: Cart\n");
+    at(h, 4 * MIN);
+    await h.service.cycle();
+    expect(runsOf(h)).toHaveLength(1);
+    expect(held(h)).toEqual([]);
+    expect(logged()).toEqual([]);
+    at(h, 10 * MIN);
+    await h.service.cycle();
+    expect(runsOf(h)).toHaveLength(2);
+    await runPlannerAgent(h, (c) => writeProposals(c, { proposals: [] }));
+    await h.service.cycle();
+
+    // At the cap: the triggers wait until the first run is 24 hours old, and the log and an event say so, once
+    appendFileSync(p.planFile, "- [ ] feat-pay: Payments\n");
+    at(h, 20 * MIN);
+    await h.service.cycle();
+    expect(runsOf(h)).toHaveLength(2);
+    const until = new Date(NOW + 24 * 60 * MIN).toISOString();
+    expect(held(h)).toEqual([{ project: "demo", reason: "max_runs_per_day", until, triggers: 1, runsInDay: 2, maxRunsPerDay: 2 }]);
+    expect(logged()).toEqual([
+      `[planner] demo: 1 trigger(s) pending, no planner run until ${until}: max_runs_per_day (2) runs started in the 24 hours before`,
+    ]);
+    appendFileSync(p.planFile, "- [ ] feat-refund: Refunds\n");
+    at(h, 60 * MIN);
+    await h.service.cycle();
+    await h.service.cycle();
+    expect(runsOf(h)).toHaveLength(2);
+    expect(held(h)).toHaveLength(1);
+    expect(logged()).toHaveLength(1);
+
+    // A slot frees: the run starts; the next stall (until the second run is 24 hours old) is reported again
+    at(h, 24 * 60 * MIN);
+    await h.service.cycle();
+    expect(runsOf(h)).toHaveLength(3);
+    await runPlannerAgent(h, (c) => writeProposals(c, { proposals: [] }));
+    await h.service.cycle();
+    appendFileSync(p.planFile, "- [ ] feat-tax: Taxes\n");
+    at(h, 24 * 60 * MIN + 5 * MIN);
+    await h.service.cycle();
+    expect(runsOf(h)).toHaveLength(3);
+    expect(held(h).map((d) => d.until)).toEqual([until, new Date(NOW + 10 * MIN + 24 * 60 * MIN).toISOString()]);
+    expect(logged()).toHaveLength(2);
+  });
+
+  it("triggers in a read_only project are logged once and emitted as planner.run_held", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    const h = await setup(p, plannerBlock(p), { extra: { read_only: true } });
+    await h.service.cycle();
+    at(h, 5 * MIN);
+    await h.service.cycle();
+    expect(runsOf(h)).toEqual([]);
+    expect(h.bus.filter((e) => e.type === "planner.run_held").map((e) => e.data)).toEqual([
+      { project: "demo", reason: "read_only", until: null, triggers: 1, runsInDay: 0, maxRunsPerDay: 24 },
+    ]);
+    expect(warn.mock.calls.map((c) => String(c[0])).filter((line) => line.startsWith("[planner] demo: "))).toEqual([
+      "[planner] demo: 1 trigger(s) pending, no planner run: the project is read_only",
+    ]);
   });
 });
 

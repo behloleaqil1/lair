@@ -3209,7 +3209,7 @@ Config errors (an unknown key, an invalid pattern or one without its group, a `t
 - `POST /api/planner/check`: check now
 - `POST /api/planner/proposals/<id>/approve`, `.../reject`, `POST /api/planner/runs/<id>/approve`, `.../reject`, `POST /api/planner/resume`: each with `{"confirm": true}` (HTTP 400 without; 409 when nothing waits)
 
-Events: `planner.changed`, `planner.run_started`, `planner.run_finished`, `planner.proposals_pending`, `planner.blocked`, `planner.tasks_file_restored`. Decisions are raised as module `planner`. Everything is kept in `data/planner.db`: a restart keeps the pending triggers, the planner run in progress, waiting proposals and the history.
+Events: `planner.changed`, `planner.run_started`, `planner.run_finished`, `planner.run_held`, `planner.proposals_pending`, `planner.blocked`, `planner.tasks_file_restored`. `planner.run_held` (with a `[planner]` log line) says once per stall that pending triggers start no run beyond the debounce and `min_interval_seconds`: runs are paused, the project is `read_only`, or `max_runs_per_day` runs started in the 24 hours before (`until`: when the cap lets one more start). Decisions are raised as module `planner`. Everything is kept in `data/planner.db`: a restart keeps the pending triggers, the planner run in progress, waiting proposals and the history.
 
 ## Repositories
 
