@@ -316,6 +316,13 @@ One deployment runs an interim `agents.failover.cooldown_minutes: 120` as a stop
 - A run already running isn't stopped by someone else's quota line. It ends on its own, as today.
 - In observe, the provider isn't cooled beyond today's rule. Each start that would have waited records `would_cool` with the reset time Lair would have used.
 - Recommended: patterns for the CLIs in use. On the 48 hours above, this would have replaced 114 failed starts with about 6 probes, and 77 decisions with 1.
+- **As built (PR 4).**
+  - The cooldown's state is kept on events of a new kind, `quota` (provider, since, next probe, backoff step, lines, reset), next to the `failover` event of kind `quota`. A `quota_cleared` event ends it: a start after the latest quota line that lives past `dead_on_start_seconds` or exits 0, or the owner's "Try now". A quota state older than 48 hours is over.
+  - A provider in a quota cooldown is passed over like one in a transient outage, so a fallback on another provider wins; with none, the run waits for the probe the same way (one start at a time, no `start_timeout_minutes`).
+  - The quota's cooldown replaces `cooldown_minutes` for quota lines rather than adding to it: `coolingUntil` still reads only rate-limit and provider-error failovers, so the interim 120-minute cooldown doesn't hold a quota's probe back. The quota failover's run ends `rate_limit` (§4.2's end kinds don't change).
+  - Each cooldown records one `guard_did` (`verdict: "cool"`); its decision is class `agents.provider_limit`, code `provider_quota`.
+  - Observe's streak per provider lasts until a start on it works, read from the run records at the next quota line, so it writes only the `guard_would` and its notice (class `agents.spend_notice`, code `would_cool`). Its `would_cool` window (to the time act would have cooled until) is what G2 leaves out.
+  - A reset group is read as an ISO time with a zone, `HH:MM` or `H[:MM]am|pm` with an optional zone (`Z`, `UTC`, `GMT`, an offset, or an IANA name), or `in <n> minutes|hours`. Quota patterns run in a vm that interrupts them after 50 ms (no match then), and a pattern slow on short lines is refused at load.
 
 **G2. Per-task no-result cap.** `agents.spend.guards.task_no_result_cap: { mode: off, max: 6, window_hours: 24 }`.
 

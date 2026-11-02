@@ -7416,3 +7416,165 @@ describe("AI spend guards on failed runs: G2 no-result cap, G4 hung-repeat (docs
     });
   }
 });
+
+describe("AI spend G1: the fleet quota cooldown (docs/design/ai-spend.md §4.5; AT-13, AT-14, AT-15, AT-28)", () => {
+  /** The provider's real quota line (a sanitized run log): a 429 that also matches the default rate_limit_patterns */
+  const QUOTA_LINE = readFileSync(join(process.cwd(), "fixtures", "agents-usage", "kiro-requests-30.txt"), "utf-8")
+    .split("\n")
+    .find((line) => line.includes("DAILY_REQUEST_COUNT"))!;
+  const WORKER_C = { "worker-c": { name: "C", model: "model-a", machine: "local", instructions: "", adapter: "test-cli" } };
+  const quotaOn = (quota: Record<string, unknown>, spend: Record<string, unknown> = {}) => () => ({ spend: { enabled: true, ...spend }, failover: { quota } });
+  /** Every start ends on `line` at once (exit 1), except the calls `works` names, which run on */
+  const ending = (h: Harness, line: string, works: (call: number) => boolean = () => false) => {
+    h.spawner.behaviour = (pid, log, call) => {
+      if (works(call)) return writeLog(h.clock, log, "working\n");
+      writeLog(h.clock, log, `${line}\n`);
+      h.spawner.exit(pid, 1);
+    };
+  };
+  const guardOf = (h: Harness) => h.service.spendReport("today", "project").guards.find((g) => g.guard === "quota");
+  const iso = (ms: number) => new Date(ms).toISOString();
+  /** worker-a's run ends on the quota line; then worker-b and worker-c each get a task on the same provider */
+  const threeWaiting = async (h: Harness) => {
+    await request(h, "worker-a", "t-a");
+    await at(h, 0); // worker-a starts
+    await at(h, 0); // and ends on the quota line
+    await request(h, "worker-b", "t-b");
+    await request(h, "worker-c", "t-c");
+    await at(h, 0);
+    await at(h, 30 * SEC); // (before dead_on_start_seconds: a run that ends sooner never worked)
+  };
+
+  it("AT-13 act: a quota line cools the provider for every agent at once, with one decision; one probe at 30 min, the next at +60; a probe that works starts the rest", async () => {
+    // G2 on too: no run that ends in the fleet's quota cooldown counts toward it (D2)
+    const h = setup(quotaOn({ mode: "act" }, { guards: { task_no_result_cap: { mode: "act", max: 2 } } }), { dragons: WORKER_C });
+    const { inbox } = await withInbox(h);
+    ending(h, QUOTA_LINE, (call) => call >= 3);
+    await threeWaiting(h);
+
+    // The run ends as a quota failover; nobody starts on provider-a (no two-agent threshold), and nothing is counted
+    expect(h.spawner.calls).toHaveLength(1);
+    const [hit] = eventsOf(h, "failover");
+    expect(hit).toMatchObject({ subject: "provider-a", data: { kind: "quota", failovers: 0, capped: false, quota: { reset: null }, coolingUntil: iso(NOW + 30 * MIN) } });
+    expect(h.store.getRun(hit.runId!)).toMatchObject({ state: "failed", endKind: "rate_limit" });
+    const waiting = () => runs(h).filter((r) => r.state === "queued");
+    expect(waiting().map((r) => [r.agent, r.failovers ?? 0]).sort()).toEqual([["worker-a", 0], ["worker-b", 0], ["worker-c", 0]]);
+    expect(waiting().every((r) => r.detail.includes("provider provider-a hit its quota"))).toBe(true);
+    expect(eventsOf(h, "quota").map((e) => e.data)).toEqual([
+      expect.objectContaining({ provider: "provider-a", since: NOW, nextTryAt: NOW + 30 * MIN, steps: 1, hits: 1, reset: null }),
+    ]);
+    expect(eventsOf(h, "guard_did").map((e) => [e.subject, e.data.guard, e.data.verdict])).toEqual([["provider-a", "quota", "cool"]]);
+    // One decision for the provider, none per task
+    const open = () => inbox.list({ project: "demo", status: "open" });
+    expect(open().map((d) => d.key)).toEqual([`quota:provider-a:${NOW}`]);
+    expect(open()[0]).toMatchObject({ class: "agents.provider_limit", classKnown: true, evidence: { code: "provider_quota" } });
+    expect(open()[0].options.map((o) => o.id)).toEqual(["wait", "retry_now"]);
+
+    // 30 min: one probe starts, the others wait; it hits the quota again, so the next probe is at +60 min
+    await at(h, 30 * MIN);
+    expect(h.spawner.calls).toHaveLength(2);
+    await at(h, 30 * MIN);
+    expect(eventsOf(h, "failover").map((e) => [e.data.kind, e.data.failovers])).toEqual([["quota", 0], ["quota", 0]]);
+    expect(eventsOf(h, "quota").at(-1)?.data).toMatchObject({ since: NOW, nextTryAt: NOW + 90 * MIN, steps: 2, hits: 2 });
+    await at(h, 60 * MIN);
+    await at(h, 89 * MIN);
+    expect(h.spawner.calls).toHaveLength(2);
+    expect(waiting()).toHaveLength(3);
+    expect(waiting().every((r) => (r.failovers ?? 0) === 0 && r.startRetries === 0)).toBe(true);
+    expect(open()).toHaveLength(1);
+    expect(eventsOf(h, "guard_did")).toHaveLength(1); // one cooldown, one verdict
+    expect(eventsOf(h, "escalated")).toEqual([]);
+
+    // 90 min: the next probe, and it works: the cooldown ends, the others start, and the decision is withdrawn
+    await at(h, 90 * MIN);
+    expect(h.spawner.calls).toHaveLength(3);
+    await at(h, 91 * MIN + 10 * SEC); // alive past dead_on_start_seconds
+    expect(eventsOf(h, "quota_cleared").map((e) => e.data)).toEqual([expect.objectContaining({ provider: "provider-a", since: NOW, by: "start" })]);
+    await at(h, 92 * MIN);
+    expect(h.spawner.calls).toHaveLength(5);
+    expect(open()).toEqual([]);
+    expect(guardOf(h)).toMatchObject({ mode: "act", would: 0, did: 1 });
+  });
+
+  it("AT-13 act: 'Try now' ends the cooldown and every waiting run starts on the next check", async () => {
+    const h = setup(quotaOn({ mode: "act" }), { dragons: WORKER_C });
+    const { inbox, answer } = await withInbox(h);
+    ending(h, QUOTA_LINE, (call) => call >= 2);
+    await threeWaiting(h);
+    const [asked] = inbox.list({ project: "demo", status: "open" });
+    expect((await answer(asked.id, { optionId: "retry_now" })).statusCode).toBe(200);
+    expect(eventsOf(h, "quota_cleared").map((e) => e.data.by)).toEqual(["owner"]);
+    await at(h, 2 * MIN);
+    expect(h.spawner.calls).toHaveLength(4);
+  });
+
+  it("AT-14 act: a reset time with no zone is the server's local time; one that isn't a time falls back to the backoff; a reset is capped at 24 h", async () => {
+    const pattern = "hit your .* limit . resets (?<reset>.+)$";
+    const cases: [string, number, (start: number) => number][] = [
+      ["You've hit your daily limit · resets 5am", new Date(2026, 2, 3, 1, 0, 0).getTime(), () => new Date(2026, 2, 3, 5, 0, 0).getTime()],
+      ["You've hit your daily limit · resets soon", NOW, (start) => start + 30 * MIN],
+      ["You've hit your daily limit · resets in 30 hours", NOW, (start) => start + 24 * 60 * MIN],
+    ];
+    for (const [line, start, expected] of cases) {
+      const h = setup(quotaOn({ mode: "act", patterns: [pattern] }));
+      ending(h, line);
+      await request(h, "worker-a", "t-a");
+      h.clock.t = start;
+      await h.service.tick();
+      await h.service.tick();
+      const [cooled] = eventsOf(h, "quota");
+      expect([line, cooled?.data.nextTryAt]).toEqual([line, expected(start)]);
+      expect(cooled.data.reset).toBe(line.slice(line.indexOf("resets ") + "resets ".length));
+    }
+  });
+
+  for (const mode of ["off", "observe"] as const) {
+    it(`${mode === "off" ? "AT-15 off" : "AT-28 observe"}: the same quota line takes today's rate-limit path${mode === "observe" ? ", with one would_cool and one notice for the provider's streak" : ""}`, async () => {
+      const h = setup(quotaOn({ mode }), { dragons: WORKER_C });
+      const { inbox } = await withInbox(h);
+      ending(h, QUOTA_LINE);
+      await threeWaiting(h); // worker-b and worker-c start (one agent's rate limit cools the provider for it alone)
+      expect(h.spawner.calls).toHaveLength(3); // and end on the same line
+      await at(h, 31 * MIN); // today's cooldowns are over: all three start again
+      await at(h, 31 * MIN + 30 * SEC); // and hit it again
+      expect(h.spawner.calls).toHaveLength(6);
+      const failovers = eventsOf(h, "failover");
+      expect(failovers.map((e) => e.data.kind)).toEqual(Array(6).fill("rate_limit"));
+      expect(failovers.map((e) => e.data.failovers as number).sort()).toEqual([1, 1, 1, 2, 2, 2]);
+      expect(eventsOf(h, "quota")).toEqual([]);
+      expect(eventsOf(h, "guard_did")).toEqual([]);
+      const notices = inbox.list({ project: "demo", status: "open" }).filter((d) => d.attention === "notice");
+      if (mode === "off") {
+        expect(failovers.every((e) => e.data.quota === undefined)).toBe(true);
+        expect(eventsOf(h, "guard_would")).toEqual([]);
+        expect(notices).toEqual([]);
+        return;
+      }
+      expect(failovers.every((e) => (e.data.quota as { reset: unknown } | undefined)?.reset === null)).toBe(true);
+      // worker-a's run at 0 (the only failover then) is the subject's first line: the act test's cooldown start
+      const would = eventsOf(h, "guard_would");
+      expect(would).toHaveLength(1);
+      expect(would[0]).toMatchObject({
+        subject: "provider-a",
+        runId: failovers[0].runId,
+        data: { guard: "quota", verdict: "would_cool", provider: "provider-a", until: iso(NOW + 30 * MIN), reset: null },
+      });
+      expect(notices.map((d) => [d.key, d.class, d.classKnown, d.evidence?.code])).toEqual([
+        [`guard_would:quota:${failovers[0].runId}`, "agents.spend_notice", true, "would_cool"],
+      ]);
+      expect(guardOf(h)).toMatchObject({ mode: "observe", would: 1, did: 0 });
+
+      // A start on the provider that works ends the streak: the notice is withdrawn, and the next quota line is a new one
+      ending(h, QUOTA_LINE, () => true);
+      await at(h, 63 * MIN); // all three start again, and run on
+      expect(h.spawner.calls).toHaveLength(9);
+      await at(h, 64 * MIN + 10 * SEC); // past dead_on_start_seconds
+      expect(inbox.list({ project: "demo", status: "open" }).filter((d) => d.attention === "notice")).toEqual([]);
+      const [live] = runs(h).filter((r) => r.state === "running" && r.agent === "worker-a");
+      writeLog(h.clock, live.logPath!, `${QUOTA_LINE}\n`);
+      h.spawner.exit(live.pid!, 1);
+      await at(h, 65 * MIN);
+      expect(eventsOf(h, "guard_would").map((e) => e.runId)).toEqual([failovers[0].runId, live.id]);
+    });
+  }
+});

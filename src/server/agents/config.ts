@@ -9,7 +9,7 @@ import { isValidDragonId } from "../parsers/dragon-config.js";
 import { attributedAgent } from "../parsers/queue.js";
 import { getAdapter } from "../services/adapters.js";
 import { placeholdersIn } from "../watchdog/config.js";
-import { guardsNeedSpendErrors, resolveUsageParsers, spendConfigErrors, type SpendSettings } from "./spend.js";
+import { guardsNeedSpendErrors, resolveUsageParsers, slowOnShortLines, spendConfigErrors, type SpendSettings } from "./spend.js";
 
 /** A guard's mode (docs/design/ai-spend.md §4.5): off computes nothing; observe records what it would do; act does it */
 export const GUARD_MODES = ["off", "observe", "act"] as const;
@@ -64,6 +64,16 @@ export const DEFAULT_TRANSIENT_PATTERNS = [
 /** At most this many transient_patterns, each at most this many characters */
 export const MAX_TRANSIENT_PATTERNS = 50;
 export const MAX_TRANSIENT_PATTERN_CHARS = 300;
+
+/**
+ * Lines that mean a quota, not a burst (G1, agents.failover.quota.patterns, matched case-insensitively): a daily
+ * request count, or a usage limit that says when it resets. A pattern may capture (?<reset>...): an ISO time, HH:MM
+ * or H am/pm with an optional zone, or "in <n> minutes|hours".
+ */
+export const DEFAULT_QUOTA_PATTERNS = ["DAILY_REQUEST_COUNT", "hit your .* limit"];
+/** At most this many quota patterns, each at most this many characters */
+export const MAX_QUOTA_PATTERNS = 20;
+export const MAX_QUOTA_PATTERN_CHARS = 300;
 
 const LimitSchema = z
   .object({
@@ -304,6 +314,21 @@ export const AgentsSchema = z
         cooldown_minutes: z.number().min(0).default(30),
         /** Failovers per task (chain of runs); one more is escalated instead */
         max_failovers: z.number().int().min(0).max(20).default(3),
+        /**
+         * G1, the fleet quota cooldown (docs/design/ai-spend.md §4.5): a line matching `patterns` (checked before the
+         * rate-limit patterns) cools its provider for every agent until its reset time, else for backoff_minutes,
+         * doubling per failed probe up to max_backoff_minutes; then one start probes it. Observe: today's path, and
+         * a would_cool record
+         */
+        quota: z
+          .object({
+            mode: z.enum(GUARD_MODES).default("off"),
+            patterns: z.array(z.string().min(1).max(MAX_QUOTA_PATTERN_CHARS)).max(MAX_QUOTA_PATTERNS).default(DEFAULT_QUOTA_PATTERNS),
+            backoff_minutes: z.number().positive().max(1440).default(30),
+            max_backoff_minutes: z.number().positive().max(1440).default(240),
+          })
+          .strict()
+          .default({}),
       })
       .strict()
       .default({}),
@@ -657,6 +682,8 @@ export interface AgentsSettings {
     silenceSeconds: number;
     cooldownMinutes: number;
     maxFailovers: number;
+    /** G1 (agents.failover.quota): the patterns compiled case-insensitive, the backoff in ms */
+    quota: { mode: GuardMode; patterns: RegExp[]; backoffMs: number; maxBackoffMs: number };
   };
   /** agents.transient_patterns (compiled case-insensitive), agents.transient_max_minutes and agents.transient_max_retries */
   transient: { patterns: RegExp[]; maxMinutes: number; maxRetries: number };
@@ -736,6 +763,16 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
     "agents.failover.provider_error_patterns",
     errors,
   );
+  const quota = value.failover.quota;
+  const quotaPatterns = compile(quota.patterns, "i", "agents.failover.quota.patterns", errors);
+  if (quota.patterns.length === 0) errors.push("agents.failover.quota.patterns: must not be empty (the lines that mean a quota)");
+  quotaPatterns.forEach((re, i) => {
+    if (re.test("")) errors.push(`agents.failover.quota.patterns[${i}]: it matches an empty line, so every line would be a quota`);
+    else if (slowOnShortLines(re)) errors.push(`agents.failover.quota.patterns[${i}]: it takes too long on a short line (nested quantifiers backtrack): simplify it`);
+  });
+  if (quota.max_backoff_minutes < quota.backoff_minutes) {
+    errors.push(`agents.failover.quota.max_backoff_minutes: must be at least backoff_minutes (${quota.backoff_minutes})`);
+  }
   const transientPatterns = compile(value.transient_patterns, "i", "agents.transient_patterns", errors);
   const usagePatterns = compile(value.usage_patterns, "gi", "agents.usage_patterns", errors);
   value.usage_patterns.forEach((pattern, i) => {
@@ -844,6 +881,12 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
         silenceSeconds: value.failover.silence_seconds,
         cooldownMinutes: value.failover.cooldown_minutes,
         maxFailovers: value.failover.max_failovers,
+        quota: {
+          mode: quota.mode,
+          patterns: quotaPatterns,
+          backoffMs: quota.backoff_minutes * 60000,
+          maxBackoffMs: quota.max_backoff_minutes * 60000,
+        },
       },
       transient: { patterns: transientPatterns, maxMinutes: value.transient_max_minutes, maxRetries: value.transient_max_retries },
       usagePatterns,

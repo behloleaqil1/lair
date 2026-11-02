@@ -309,6 +309,10 @@ export type AgentEventKind =
   | "fill_unmatched"
   | "transient"
   | "transient_cleared"
+  /** A provider's fleet quota cooldown (G1 act): its state, kept on each event, so the newest one says where it stands */
+  | "quota"
+  /** A start on a provider in a quota cooldown worked, or the owner chose "Try now": the cooldown is over */
+  | "quota_cleared"
   | "run_adopted"
   | "run_lost"
   | "stopped_for_shutdown"
