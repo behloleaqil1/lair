@@ -35,12 +35,12 @@ describe("extractPrNumbers", () => {
   });
 
   it("extracts PR from '(merged as #N)'", () => {
-    expect(extractPrNumbers("(merged as #400)")).toEqual([{ number: 400, context: "(merged as #400)" }]);
+    expect(extractPrNumbers("(merged as #400)")).toEqual([{ number: 400, context: "merged as #400" }]);
   });
 
   it("extracts bare #N when reason contains merge keyword", () => {
     expect(extractPrNumbers("completed, merge PR #500")).toEqual([{ number: 500, context: "#500" }]);
-    expect(extractPrNumbers("PR #600 was merged today")).toEqual([{ number: 600, context: "#600 was merged" }]);
+    expect(extractPrNumbers("PR #600 was merged today")).toEqual([{ number: 600, context: "#600" }]);
   });
 
   it("does not extract bare #N without merge keyword", () => {

@@ -71,10 +71,11 @@ export function branchContainsTask(branch: string, taskId: string): boolean {
   const norm = (s: string) => s.toLowerCase().replace(/[-_]/g, "/");
   const branchParts = norm(branch).split("/");
   const taskParts = norm(taskId).split("/");
+  // Check as consecutive path segments (exact segment match)
   for (let i = 0; i <= branchParts.length - taskParts.length; i++) {
     if (taskParts.every((t, j) => branchParts[i + j] === t)) return true;
   }
-  return norm(branch).endsWith(norm(taskId));
+  return false;
 }
 
 /** Check if a branch maps to the expected agent via review.authors config. */
@@ -91,9 +92,14 @@ export function branchMatchesAgent(branch: string, expectedAgent: string | null,
 export function titleBodyNamesTask(pr: PrMetadata, taskId: string): boolean {
   const text = `${pr.title} ${pr.body ?? ""}`.toLowerCase();
   const escaped = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const variants = [taskId, taskId.replace(/-/g, "_"), taskId.replace(/_/g, "-")];
+  const task = taskId.toLowerCase();
+  // Word boundary: must be preceded and followed by non-word-like chars (not letters, digits, or hyphens)
+  // This prevents "feat-login" from matching "feat-login-fix"
+  const boundary = "(?<![a-z0-9-])"; // negative lookbehind: not preceded by word char or hyphen
+  const endBoundary = "(?![a-z0-9-])"; // negative lookahead: not followed by word char or hyphen
+  const variants = [task, task.replace(/-/g, "_"), task.replace(/_/g, "-")];
   for (const v of variants) {
-    if (new RegExp(`\\b${escaped(v.toLowerCase())}\\b`).test(text)) return true;
+    if (new RegExp(`${boundary}${escaped(v)}${endBoundary}`).test(text)) return true;
   }
   return false;
 }
