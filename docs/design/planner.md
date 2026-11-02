@@ -196,9 +196,10 @@ dedupe key is per task, so a task that reports `BLOCKED` every few minutes asks 
   agent and its next possible run, pending proposals with approve and reject, recent runs, and history with each
   change's diff. A "Check now" button runs a cycle.
 - **Routes** under `/api/planner` (in `OWNER_ONLY_PREFIXES`, no CORS): every read and every write needs an owner
-  session (the status too: its errors and warnings name paths on the machine); writes also need `confirm: true`.
+  session (the status too: its errors and warnings name paths on the machine); writes also need `confirm: true`,
+  except marking an owner message handled or reopening it (reversible, idempotent).
 - **Events**: `planner.changed`, `planner.run_started`, `planner.run_finished`, `planner.proposals_pending`,
-  `planner.blocked`, `planner.tasks_file_restored`.
+  `planner.blocked`, `planner.tasks_file_restored`, `planner.skipped`.
 - **Decisions** as module `planner`.
 
 ## Restarts and reloads
@@ -311,6 +312,46 @@ recommends `reject_all`.
 Verification runs only when `planner.verifier` is configured. A project that doesn't need it leaves the block out.
 The verifier can also be disabled per-op: `planner.verifier.skip_ops` lists ops that bypass the verifier and proceed
 straight to approval rules (default: `[]`). `drop` may never appear in `auto_apply` (config error).
+
+## Guards: propose only what can apply (AI spend G6)
+
+One busy deployment's planner proposed work that was already done (closed task ids, and a cleanup finished days
+earlier, from an old owner message), ran again on inputs that had given nothing applicable, and had 9 runs refused
+whole because the tasks file changed while they ran: 37 of 45 proposals were refused or declined, each after a paid
+run (and often a verifier run). `planner.guards` ([ai-spend.md §4.5](ai-spend.md#45-guards-off-observe-act)) adds
+four checks. Each has its own mode, `off` (the default), `observe` (a `guard_would` event in the agents module, one
+notice per streak, nothing changes) or `act` (a `guard_did` event). They need `agents.spend.enabled`, whose API counts
+them. None calls a model or the network: they read the tasks file, the queue lines and `review.db`.
+
+- **`prefilter_closed`.** Before the context is built, closed work leaves `openTasks` and the triggers: a done id of
+  the tasks file, or a task whose **own** PR merged. A task's own PR is one whose head branch names the task id (whole
+  `/`-separated parts), or the PR its own READY or DONE line names (`- READY <task> ...`, or fill's `done_pattern` for
+  that task; the PR read as the ready guard reads it; the planner keeps, per task, the PR its newest such line names). A PR merged when `review_merges`
+  has it, or when the review module last read it from the host as merged: the review module keeps each PR's branch and
+  state as it reads them (`review_prs.head_ref` and `.state`, review.db schema 5). A task whose text only mentions a
+  merged PR stays, as does a `done_no_next` trigger (its point is the idle agent). The context gains `closed` (the
+  newest 200 closed tasks with why, and merged PRs with branches), and a rule refuses an `add` of a task whose own PR
+  merged before the verifier is asked, so that verifier run is saved too.
+- **`handled_messages`.** Lair's instructions after the template document `from_message`; a proposal naming an id
+  that isn't one of its run's context's owner messages is refused. Once a proposal with it is applied and its task
+  closes (its done line, or an applied `finish`), the message is recorded as handled in `planner_state` (by id, so it is
+  idempotent; the newest 1,000, with the task and the time) and leaves later contexts and triggers. A declined or
+  refused proposal leaves it open. The owner marks a message handled, or reopens it, through two owner-only planner
+  routes (`POST /api/planner/messages/:id/handled` and `.../reopen`; idempotent, 404 for an unknown id).
+- **`skip_unchanged`.** A sha256 over the inputs that decide what can be proposed, and only those (the tasks file's
+  text, `openTasks` by id, source and text, the open owner messages by id and text, `blocked` by task, class and reason,
+  `closed`, the allowlist and the idle set), is kept per run. A run whose hash is that of the last finished run with it,
+  when that run ended `done` with nothing applied or waiting, isn't started: its triggers are consumed and a
+  `planner.skipped` event names the earlier run. Recent queue events, the triggers and times are left out (a hash over
+  them would never repeat). A failed run is no evidence, and `max_skip_hours` after the last run a run starts anyway.
+  A run with an `owner_retry` trigger (the owner's "Let the planner try again") is never skipped, nor a would-be skip:
+  that answer resets the task's attempts and the owner's keep, which decide refusals but are no input of the hash.
+- **`recheck_on_change` (D7).** In act mode a change to the tasks file during a run is kept and recorded with its
+  diff, one notice names the run, and at the run's end each proposal is checked against the file as it is then; the
+  valid ones go on to the verifier and the approval, the rest are refused one by one. The run keeps `tampered`, and
+  the history keeps the diff, so the owner can still restore the file. The risk that the planner agent wrote the file
+  itself is covered by that record and the notice; running agents as separate OS users closes it. Observe keeps today's
+  restore-and-refuse, and counts the proposals that would have gone on.
 
 ## Not built
 

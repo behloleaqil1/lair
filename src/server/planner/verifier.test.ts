@@ -1011,7 +1011,7 @@ const AUTO_FINISH = { approval: { finish: "never" }, verifier: { id: "verifier",
 
 async function ownershipSetup(p: Paths, prs: PrSource): Promise<Harness> {
   const h = await setup(p, plannerWithVerifier(p, AUTO_FINISH), {
-    prs,
+    prOwnership: prs,
     extra: {
       dragons: {
         "worker-a": { id: "worker-a", name: "Alice", model: "model-a", machine: "local", instructions: "", adapter: "test-cli" },

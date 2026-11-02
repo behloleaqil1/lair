@@ -15,6 +15,9 @@
  *   POST /api/planner/runs/:id/approve           {confirm: true}: every proposal of the run that waits
  *   POST /api/planner/runs/:id/reject            {confirm: true}
  *   POST /api/planner/resume                     {confirm: true}: planner runs again after a pause
+ *   POST /api/planner/messages/:id/handled       an owner message is handled: later runs leave it out (idempotent)
+ *   POST /api/planner/messages/:id/reopen        a handled owner message is open again (idempotent)
+ *     (both need planner.guards.handled_messages on: 409 when it is off; 404 for an id that isn't an owner message)
  *
  * /api/planner is in OWNER_ONLY_PREFIXES (no CORS). An owner-only route
  * checks the session before the body is read. The planner agent, like any
@@ -42,6 +45,9 @@ const ListQuery = ProjectQuery.extend({ limit: z.coerce.number().int().min(1).ma
 const ProposalQuery = ListQuery.extend({ status: z.enum(["pending", "applied", "rejected", "declined"]).optional() });
 const ConfirmBody = z.object({ confirm: z.boolean().optional() }).strict();
 const CONFIRM = "Send confirm: true (the Planner view asks first)";
+/** An owner message id as the planner reads it (`- OWNER <time> [<id>]: ...`): 1-64 characters on one line, no ']' */
+const isMessageId = (id: string): boolean =>
+  id.length >= 1 && id.length <= 64 && ![...id].some((ch) => ch < " " || ch === "\u007f" || ch === "]");
 
 export async function registerPlannerRoutes(
   fastify: FastifyInstance,
@@ -162,5 +168,26 @@ export async function registerPlannerRoutes(
     confirmed("/api/planner/runs/:id/approve", (s, id) => s.approveRun(id), { id: true });
     confirmed("/api/planner/runs/:id/reject", (s, id) => s.rejectRun(id), { id: true });
     confirmed("/api/planner/resume", (s) => s.resume(), { id: false });
+
+    // G6 handled_messages: the owner marks an owner message handled, or reopens it. Both are idempotent and
+    // reversible (no confirm needed); the session is checked before the body is read, as on every route here
+    const messageGuard = requireValidIdParam(isMessageId, "owner message");
+    const messageAction = (path: string, action: (service: PlannerService, id: string) => Promise<unknown>) => {
+      app.post<{ Params: { id?: string } }>(path, { onRequest: ownerOnly.onRequest, preHandler: messageGuard }, async (request, reply) => {
+        const query = ProjectQuery.safeParse(request.query ?? {});
+        if (!query.success) return fail(reply, 400, "Invalid query");
+        const body = ConfirmBody.safeParse(request.body ?? {});
+        if (!body.success) return fail(reply, 400, "Invalid body: send {} or nothing");
+        const service = serviceOf(reply, projectOf(query.data));
+        if (!service) return reply;
+        try {
+          return respond(await action(service, request.params.id ?? ""));
+        } catch (e) {
+          return handle(reply, e);
+        }
+      });
+    };
+    messageAction("/api/planner/messages/:id/handled", (s, id) => s.markMessageHandled(id));
+    messageAction("/api/planner/messages/:id/reopen", (s, id) => s.reopenMessage(id));
   });
 }

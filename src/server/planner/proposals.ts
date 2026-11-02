@@ -29,6 +29,9 @@ const ProposalSchema = z
   })
   .strict();
 
+/** planner.guards.handled_messages on: a proposal may also name the owner message it carries out */
+const MessageProposalSchema = ProposalSchema.extend({ from_message: z.string().min(1).max(200).optional() }).strict();
+
 const FileSchema = z.object({ proposals: z.array(z.unknown()).max(MAX_ITEMS) }).strict();
 
 export type ProposalFile = { ok: true; items: unknown[] } | { ok: false; reason: string };
@@ -62,6 +65,8 @@ export interface CheckedProposal {
   refusal: string | null;
   /** The tasks-file edit (null for unblock, and when refused) */
   edit: TaskEdit | null;
+  /** The owner message it carries out (planner.guards.handled_messages on), or null */
+  fromMessage: string | null;
 }
 
 export interface CheckContext {
@@ -83,6 +88,13 @@ export interface CheckContext {
    */
   blocked: (task: string) => { class: BlockedClass; kept: boolean; attempts: number } | null;
   attemptsPerTask: number;
+  /**
+   * planner.guards.handled_messages on: the owner-message ids of the run's context, the only ones from_message may
+   * name. Absent: from_message is an unknown key (refused, as any other)
+   */
+  messages?: ReadonlySet<string>;
+  /** planner.guards.prefilter_closed act: why a task's own PR counts as merged, or null (an add of it is refused) */
+  ownMerged?: (task: string) => string | null;
 }
 
 function field(value: unknown, max: number): string {
@@ -90,11 +102,14 @@ function field(value: unknown, max: number): string {
 }
 
 /** Check one proposal against the tasks file as `doc` is. Null when it passes; else why not. */
-function refusalOf(p: z.infer<typeof ProposalSchema>, text: string | null, ctx: CheckContext, doc: TasksDoc): string | null {
+function refusalOf(p: z.infer<typeof MessageProposalSchema>, text: string | null, ctx: CheckContext, doc: TasksDoc): string | null {
   if (!isValidTaskId(p.task)) {
     return `${clean(p.task, 80)} is not a valid task id (1-128 letters, digits, '.', '_', '-', '/', ':', '#', starting with a letter or digit, no '.' or '..' segment)`;
   }
   if (ctx.taskIdPattern && !ctx.taskIdPattern.test(p.task)) return `task ${p.task} does not match planner.task_id_pattern`;
+  if (p.from_message !== undefined && !ctx.messages?.has(p.from_message)) {
+    return `from_message ${clean(p.from_message, 64)} is not an owner message of this run's context`;
+  }
   const needsAgent = p.op === "add" || p.op === "reassign";
   if (needsAgent && !p.agent) return `${p.op} needs an agent`;
   if (!needsAgent && p.agent !== undefined) return `${p.op} takes no agent`;
@@ -111,8 +126,11 @@ function refusalOf(p: z.infer<typeof ProposalSchema>, text: string | null, ctx: 
   if (p.op === "add") {
     if (line) return `task ${p.task} is already in the tasks file (line ${line.line})`;
     if (doc.done.has(p.task)) return `task ${p.task} is done (line ${doc.done.get(p.task)}): task ids are not reused`;
+    const merged = ctx.ownMerged?.(p.task) ?? null;
+    if (merged) return `task ${p.task} is closed work: ${merged} (planner.guards.prefilter_closed)`;
     return null;
   }
+  if (!line && doc.done.has(p.task)) return `task ${p.task} is done (line ${doc.done.get(p.task)}): it has no open line to ${p.op}`;
   if (!line) return `task ${p.task} has no open line in the tasks file`;
   if (p.op === "reassign" && p.agent === line.agent) return `task ${p.task} is already ${p.agent}'s`;
   if (p.op === "reassign" || p.op === "drop") {
@@ -175,18 +193,20 @@ export function checkProposals(items: unknown[], ctx: CheckContext): { checked: 
       reason: field(raw.reason, MAX_REASON_CHARS) || "(no reason given)",
       refusal: null,
       edit: null,
+      fromMessage: null,
     };
     if (index >= ctx.maxProposals) {
       checked.push({ ...base, refusal: `over the cap of ${ctx.maxProposals} proposals per run` });
       return;
     }
-    const parsed = ProposalSchema.safeParse(item);
+    // from_message is a known key only while the handled_messages guard is on
+    const parsed = (ctx.messages ? MessageProposalSchema : ProposalSchema).safeParse(item);
     if (!parsed.success) {
       const issue = parsed.error.issues[0];
       checked.push({ ...base, refusal: `not a proposal: ${issue.path.join(".") || "(item)"}: ${issue.message}` });
       return;
     }
-    const p = parsed.data;
+    const p: z.infer<typeof MessageProposalSchema> = parsed.data;
     // The text becomes a description: one line, control characters removed, never longer than a description
     const text = p.text !== undefined ? clean(p.text, 4000) : null;
     let refusal = refusalOf(p, text, ctx, doc);
@@ -208,6 +228,7 @@ export function checkProposals(items: unknown[], ctx: CheckContext): { checked: 
       reason: clean(p.reason, MAX_REASON_CHARS),
       refusal,
       edit: refusal ? null : edit,
+      fromMessage: p.from_message ?? null,
     });
   });
   return { checked, doc };
