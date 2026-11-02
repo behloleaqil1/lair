@@ -84,6 +84,9 @@ The first cycle only records a baseline (the queue's end, the messages and file 
 triggers. Triggers are kept in the store. A run starts when the newest trigger is `debounce_seconds` old, at least
 `min_interval_seconds` after the previous run started, fewer than `max_runs_per_day` runs started in the 24 hours
 before, and no planner run is active: many triggers make one run, and no stream of them makes more than the cap.
+Pending triggers held longer than the debounce and `min_interval_seconds` (runs paused, the project `read_only`, or the
+cap reached) are reported once per stall: a `[planner]` log line and `planner.run_held`, with when the cap lets the
+next run start.
 
 ### The run
 
@@ -198,8 +201,8 @@ dedupe key is per task, so a task that reports `BLOCKED` every few minutes asks 
 - **Routes** under `/api/planner` (in `OWNER_ONLY_PREFIXES`, no CORS): every read and every write needs an owner
   session (the status too: its errors and warnings name paths on the machine); writes also need `confirm: true`,
   except marking an owner message handled or reopening it (reversible, idempotent).
-- **Events**: `planner.changed`, `planner.run_started`, `planner.run_finished`, `planner.proposals_pending`,
-  `planner.blocked`, `planner.tasks_file_restored`, `planner.skipped`.
+- **Events**: `planner.changed`, `planner.run_started`, `planner.run_finished`, `planner.run_held`,
+  `planner.proposals_pending`, `planner.blocked`, `planner.tasks_file_restored`, `planner.skipped`.
 - **Decisions** as module `planner`.
 
 ## Restarts and reloads
