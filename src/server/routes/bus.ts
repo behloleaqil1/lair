@@ -10,7 +10,8 @@
  * - GET  /api/bus/board: Board state for the UI (open)
  * - GET  /api/bus/events: SSE feed for the UI (open)
  * - POST /api/bus/send: Owner sends a message (requires owner session)
- * - GET  /api/bus/messages/:agentId: Message list for the UI (open)
+ * - GET  /api/bus/messages/:agentId: Message list for the UI (open); message texts and ack notes only with the
+ *   owner's session
  * - GET  /api/bus/activity: The Bus tab's first load, bounded by ?limit (at most 200); message texts and ack notes
  *   only with the owner's session (the live updates are on the `bus` WebSocket channel: src/server/bus/live.ts)
  *
@@ -547,7 +548,7 @@ async function busRoutes(
     },
   );
 
-  // ============ GET /api/bus/messages/:agentId - Agent messages (for UI) ============
+  // ============ GET /api/bus/messages/:agentId - Agent messages (open; texts and ack notes for the owner only) ============
 
   fastify.get<{
     Params: { agentId: string };
@@ -560,18 +561,19 @@ async function busRoutes(
 
     const { service } = getBusService(project, options);
     const messages = service.listMessages(agentId, { direction, limit });
+    // As GET /api/bus/activity: anyone gets the metadata, only the owner's session the texts and ack notes
+    const owner = auth.verifyRequest(request.headers, { method: request.method }).ok;
 
     return respond({
       messages: messages.map((m) => ({
         id: m.id,
         from: m.fromId,
         to: m.toId,
-        text: m.text,
         priority: m.priority,
         createdAt: new Date(m.createdAt).toISOString(),
         readAt: m.readAt ? new Date(m.readAt).toISOString() : null,
         ackAt: m.ackAt ? new Date(m.ackAt).toISOString() : null,
-        ackNote: m.ackNote,
+        ...(owner ? { text: m.text, ackNote: m.ackNote } : {}),
       })),
       unread: service.countUnread(agentId),
     });

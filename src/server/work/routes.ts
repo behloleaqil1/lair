@@ -3,7 +3,8 @@
  * paths are the owner's). /api/work is in OWNER_ONLY_PREFIXES, so no CORS is granted under it either; agents never
  * call it (they report through the bus). The owner check runs on the request, before any body is read.
  *
- *   GET  /api/work/status?project=            the mode, the store's schema version, tasks by state, the last import
+ *   GET  /api/work/status?project=            the mode (also when off), the store's schema version, tasks by state,
+ *                                              the last import, the follower and a comparison with fill's view
  *   GET  /api/work/tasks?project=&state=&agent=&limit=   tasks with the state their claim gives them (§1.5)
  *   GET  /api/work/task?project=&id=          one task and its newest events (ids may hold "/" and "#")
  *   POST /api/work/import?project=            import the configured files one way; body {dry_run}, default true:
@@ -68,6 +69,8 @@ export async function registerWorkRoutes(fastify: FastifyInstance, manager: Work
       if (!query.success) return invalid(reply, "query", query.error);
       const body = ImportBody.safeParse(request.body ?? {});
       if (!body.success) return invalid(reply, "body", body.error);
+      // The session requireOwner verified above is the actor. Kept as a guard, as the other owner routes do: if the
+      // hooks ever change, an import with no verified session is refused, never written with a made-up actor
       const session = auth.sessionOf(request);
       if (!session) return fail(reply, 403, "Only the owner can import into the work store");
       const project = query.data.project ?? defaultProject();

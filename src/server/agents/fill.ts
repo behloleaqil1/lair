@@ -2200,7 +2200,8 @@ export class AgentsFill {
    * and checked again, for at most settings.readyWaitMinutes from its first
    * check (stored as fill_report_waiting, so a restart keeps it); then it is
    * `expired` and the caller asks the owner. Nothing here marks the task done
-   * or sends anything to review.
+   * or sends anything to review. `record: false` (the work store, which only
+   * observes) gives the verdict and records nothing: those events are fill's.
    */
   async guardReport(
     agent: string,
@@ -2209,6 +2210,7 @@ export class AgentsFill {
     latest: AgentRun | null,
     taskText: string,
     report: StructuredReport | null = null,
+    options: { record?: boolean } = {},
   ): Promise<{ retry: boolean; expired: boolean; since: number; problems: string[] } | null> {
     const { store, project, settings, probes } = this.options;
     if (!settings.readyGuard) return null;
@@ -2257,8 +2259,9 @@ export class AgentsFill {
     }
     if (verdict.ok) return null;
     const hash = createHash("sha256").update(line).digest("hex").slice(0, 16);
+    const record = options.record !== false;
     if (!verdict.retry) {
-      await this.options.record(
+      if (record) await this.options.record(
         "fill_report_refused",
         {
           agent,
@@ -2279,7 +2282,7 @@ export class AgentsFill {
       .listEvents(project, { kinds: ["fill_report_waiting"], task, limit: 20 })
       .find((e) => e.data.lineHash === hash && (e.data.runId ?? null) === runId);
     const since = first?.at ?? now;
-    if (!first) {
+    if (!first && record) {
       await this.options.record(
         "fill_report_waiting",
         {

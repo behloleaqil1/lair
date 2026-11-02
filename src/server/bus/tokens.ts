@@ -52,3 +52,11 @@ export function redactBusToken(text: string, token: string): string {
   if (!token || token.length === 0) return text;
   return text.split(token).join("[bus-token]");
 }
+
+/** Any bus token, whole or cut short: the prefix and the base64url characters after it */
+const BUS_TOKEN_PATTERN = new RegExp(`${BUS_TOKEN_PREFIX}[A-Za-z0-9_-]+`, "g");
+
+/** Remove every bus token from a text other readers see (a report's summary): the writer's own or any other run's */
+export function redactBusTokens(text: string): string {
+  return text.replace(BUS_TOKEN_PATTERN, "[bus-token]");
+}

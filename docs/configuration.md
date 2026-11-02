@@ -3407,28 +3407,48 @@ default; a project opts in, and moves one step at a time.
 
 ```yaml
 work_store:
-  mode: off  # off | observe
+  mode: off      # off | observe
+  files: follow  # follow
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `work_store.mode` | `off` \| `observe` | `off` | `off`: today's files exactly; no store file is created and every `/api/work` route answers 404 for the project. `observe`: the project's store (`data/work/<project>.db`) follows the files one way when you import; fill, the planner and the tracker still read the files |
+| `work_store.mode` | `off` \| `observe` | `off` | `off`: today's files exactly; no store file is created; `GET /api/work/status` reports `off`, and every other `/api/work` read and the import answer 404 for the project. `observe`: the project's store (`data/work/<project>.db`) follows the files one way (below); fill, the planner and the tracker still read the files, and nothing else reads the store |
+| `work_store.files` | `follow` | `follow` | How the files relate to the store: `follow` keeps the store in step with them, one way (the store never writes a project file). `mirror` and `none` come in a later version |
 
 An unknown key under `work_store:` or another value is a config error (the live reload keeps the previous config, and
-the store stays off). `on`, where fill reads the store, comes in a later version.
+the store stays off). `on`, where fill reads the store, comes in a later version. In `observe` the store is opened, and
+`data/work/<project>.db` created, by the follower's first step (at start, or within 15 s of switching to `observe`), a status
+read or an import, whichever comes first.
 
 **Import.** `POST /api/work/import?project=<name>` with `{"dry_run": true}` (the default) reports what it would change
 and writes nothing; `{"dry_run": false}` applies it in one transaction, with your session as the actor on every event.
 It reads only the configured files, `agents.fill.tasks_file` and `queue_file`, with fill's own parser and checks: an
 open line is `ready`; a `DONE` line fill accepts makes it `done` (a `DONE` the ready guard refuses does not); its
 latest run's last `WAITING` or `BLOCKED` line makes it `waiting` or `blocked`; a done line (the planner's
-`done_marker`) is `done`; a task imported before and gone from the file is `dropped`. A task a run or claim holds stays
-`ready` and is shown `assigned` or `running`. Running the import again changes only what differs; an unreadable tasks
-file imports and drops nothing; a line fill refuses is a warning, and the task ids on it are never dropped.
+`done_marker`) is `done`; a task imported before and gone from the file is `dropped`. A task a run or claim holds keeps
+its state (a new one is `ready`) and is shown `assigned` or `running`. Fill's holds (a decision, a pause, a refusal)
+are not a state of the store. Running the import again changes only what differs; an unreadable tasks file imports and
+drops nothing; a line fill refuses is a warning, and the task ids on it are never dropped. Only tasks an import made
+follow the files: one the planner or you made is never changed by them (the import lists it under `skipped`).
 
-**Reads.** `GET /api/work/status?project=<name>` (the mode, the schema version, tasks by state, the last import),
-`GET /api/work/tasks?project=<name>&state=&agent=&limit=` and `GET /api/work/task?project=<name>&id=<task>` (one task
-and its newest events). Every `/api/work` route needs the owner's session, reads included.
+**Following (`files: follow`).** Your first applied import adopts the store; from then on it follows by itself, and a
+dry run before that adopts nothing. Every 15 s, and at once on a bus report or a run's start, end or released claim:
+the store applies the bus reports and run facts that came since its last ones, each once, also across a restart
+(`WAITING`, `BLOCKED` and an accepted `DONE` set the state; `PROGRESS`, `TICK`, a refused `DONE`, a run's end and a
+released claim are recorded on the task only; a live run's start shows a waiting or blocked task running again); then it
+looks at the two files' size and time, and imports again only when one changed (the follower is the actor). A step that
+fails or takes longer than 60 s is shown as a failure in the status and backs off (doubling, up to 10 minutes); a ready
+guard that fails on a `DONE` is such a failure (the report is read again, never taken as refused). The store asks fill's
+ready guard for its verdict only: it writes no event in the agents store. The status's `applied` counts the facts
+recorded on a task (a `PROGRESS` too), `skipped` those for tasks the store does not have or already recorded. Do not `VACUUM`
+`data/agents.db` while a project follows (the store reads its events by row).
+
+**Reads.** `GET /api/work/status?project=<name>` (the mode, the schema version, tasks by state, the last import, whether
+the store is adopted and its cursors, the follower's checks, reads and failures, and a comparison with fill's view at
+its last check: the tasks the two disagree on, fill's holds left out), `GET /api/work/tasks?project=<name>&state=&agent=&limit=`
+and `GET /api/work/task?project=<name>&id=<task>` (one task and its newest events). Every `/api/work` route needs the
+owner's session, reads included.
 
 ## Lessons
 

@@ -316,6 +316,47 @@ describe("bus: GET /api/bus/activity (Home → Bus's first page)", () => {
   });
 });
 
+describe("bus: GET /api/bus/messages/:agentId (an agent's messages)", () => {
+  const TEXT = "a private instruction for worker-m";
+  const NOTE = "worker-m's private ack note";
+  const at = Date.parse("2026-03-03T09:00:00.000Z");
+  let id = "";
+  beforeAll(() => {
+    const store = getBusStore(PROJECT, TMP);
+    id = store.sendMessage("owner", "worker-m", TEXT, 3, at);
+    store.getUnreadMessages("worker-m", at + 1);
+    store.ackMessage(id, "worker-m", NOTE, at + 2);
+  });
+
+  const messages = async (headers: Record<string, string>) => {
+    const res = await app.inject({ url: `/api/bus/messages/worker-m${p}`, headers });
+    expect(res.statusCode).toBe(200);
+    return { raw: res.body, data: res.json().data };
+  };
+  const metadata = {
+    from: "owner",
+    to: "worker-m",
+    priority: 3,
+    createdAt: "2026-03-03T09:00:00.000Z",
+    readAt: "2026-03-03T09:00:00.001Z",
+    ackAt: "2026-03-03T09:00:00.002Z",
+  };
+
+  it("gives anyone without the owner's session the metadata only: no text, no ack note", async () => {
+    for (const headers of [{}, BROWSER, { ...BROWSER, [OWNER_SESSION_HEADER]: "not-a-session" }]) {
+      const { raw, data } = await messages(headers);
+      expect(data).toEqual({ messages: [{ id, ...metadata }], unread: 0 });
+      expect(raw).not.toContain(TEXT);
+      expect(raw).not.toContain(NOTE);
+    }
+  });
+
+  it("gives the owner's session the text and the ack note", async () => {
+    const { data } = await messages(owner());
+    expect(data).toEqual({ messages: [{ id, ...metadata, text: TEXT, ackNote: NOTE }], unread: 0 });
+  });
+});
+
 describe("processes: start, stop and restart", () => {
   function supervisorSpies() {
     const supervisor = getSupervisor();
