@@ -233,6 +233,16 @@ interface BlockedRecord {
   kept?: string;
 }
 
+/** Pending triggers that start no run beyond the usual waits (planner.run_held) */
+interface RunStall {
+  reason: "paused" | "read_only" | "max_runs_per_day";
+  /** When the cap lets one more run start; null: until the owner resumes runs or the project is writable */
+  until: number | null;
+  triggers: number;
+  runsInDay: number;
+  maxRunsPerDay: number;
+}
+
 /** A change to make: an edit of the tasks file, and its record. */
 interface PlannedChange {
   edit: TaskEdit;
@@ -305,6 +315,8 @@ export class PlannerService {
   private again: Promise<void> | null = null;
   /** stop() ran: events start no cycle */
   private ended = false;
+  /** The stall last reported (noteStall), so each is reported once */
+  private stallKey: string | null = null;
 
   constructor(options: PlannerServiceOptions) {
     this.project = options.project;
@@ -1002,6 +1014,13 @@ export class PlannerService {
     return this.store.runStartsSince(this.project, now - DAY_MS);
   }
 
+  /** The runs started in the 24 hours before `now`, and when max_runs_per_day lets one more start (0: now). */
+  private dayCap(now: number, maxRunsPerDay: number): { runs: number; freeAt: number } {
+    const day = this.runsInDay(now);
+    // At the cap: once the oldest run of the window is 24 hours old (the one that makes room)
+    return { runs: day.length, freeAt: day.length >= maxRunsPerDay ? day[day.length - maxRunsPerDay] + DAY_MS : 0 };
+  }
+
   /**
    * When a run can start, given the pending triggers (null: none pending):
    * the newest trigger debounce_seconds old, min_interval_seconds after the
@@ -1013,15 +1032,56 @@ export class PlannerService {
     if (!agent || triggers.length === 0) return null;
     const lastTrigger = this.state<number>(LAST_TRIGGER) ?? 0;
     const lastRun = this.state<number>(LAST_RUN);
-    const day = this.runsInDay(now);
-    // At the cap: once the oldest run of the window is 24 hours old (the one that makes room)
-    const dayFree = day.length >= agent.maxRunsPerDay ? day[day.length - agent.maxRunsPerDay] + DAY_MS : 0;
+    const dayFree = this.dayCap(now, agent.maxRunsPerDay).freeAt;
     return Math.max(lastTrigger + agent.debounceSeconds * 1000, lastRun === null ? 0 : lastRun + agent.minIntervalSeconds * 1000, dayFree);
+  }
+
+  /**
+   * Why pending triggers start no run beyond the usual waits (the debounce
+   * and min_interval_seconds): planner runs are paused, the project is
+   * read_only, or max_runs_per_day runs started in the 24 hours before
+   * (until: when the cap lets one more start). null: none pending, or only
+   * the usual waits.
+   */
+  private stallOf(now: number): RunStall | null {
+    const agent = this.settings.agent;
+    const triggers = (this.state<TriggerView[]>(TRIGGERS) ?? []).length;
+    if (!agent || triggers === 0) return null;
+    const cap = this.dayCap(now, agent.maxRunsPerDay);
+    const facts = { triggers, runsInDay: cap.runs, maxRunsPerDay: agent.maxRunsPerDay };
+    if (this.state(PAUSED)) return { reason: "paused", until: null, ...facts };
+    if (this.config.read_only === true) return { reason: "read_only", until: null, ...facts };
+    if (cap.freeAt > now) return { reason: "max_runs_per_day", until: cap.freeAt, ...facts };
+    return null;
+  }
+
+  /**
+   * A stall is visible: once per stall (its reason and until), a log line
+   * and planner.run_held; again after a restart or reload. Without it a day
+   * of pending triggers and no run left no trace outside the Planner view.
+   */
+  private async noteStall(now: number): Promise<void> {
+    const stall = this.stallOf(now);
+    const key = stall ? `${stall.reason}:${stall.until ?? ""}` : null;
+    if (key === this.stallKey) return;
+    this.stallKey = key;
+    if (!stall) return;
+    const until = stall.until === null ? null : iso(stall.until);
+    const why =
+      stall.reason === "max_runs_per_day"
+        ? ` until ${until}: max_runs_per_day (${stall.maxRunsPerDay}) runs started in the 24 hours before`
+        : stall.reason === "read_only"
+          ? ": the project is read_only"
+          : ": planner runs are paused (resume them in the Planner view)";
+    console.warn(`[planner] ${this.project}: ${stall.triggers} trigger(s) pending, no planner run${why}`);
+    await this.emit("planner.run_held", { ...stall, until });
   }
 
   private async maybeStart(doc: TasksDoc, now: number): Promise<void> {
     const agent = this.settings.agent;
-    if (!agent || this.state(PAUSED) || this.config.read_only === true) return;
+    if (!agent) return;
+    await this.noteStall(now);
+    if (this.state(PAUSED) || this.config.read_only === true) return;
     const at = this.nextRunAt(now);
     if (at === null || now < at) return;
     await this.startRun(doc, now);
