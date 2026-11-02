@@ -139,6 +139,13 @@ const WakeSchema = z
     requeue_marker: z.string().min(1).max(500).optional(),
     /** With nothing to wait on (no capture, or no wake.file), the task starts again after this long */
     fallback_seconds: z.number().min(0).default(900),
+    /**
+     * G3 (docs/design/ai-spend.md §4.5): a waiting line that captures (?<pr>...), (?<decision>...) or
+     * (?<message>bus) is woken by that event (a review, a merge or a merge refusal of the PR; the decision answered; a
+     * bus message to the agent). act: such a wait has no fallback timer; observe: the timer runs as before and each
+     * event that would have woken it is recorded; off: the captures are ignored
+     */
+    events: z.object({ mode: z.enum(GUARD_MODES).default("off") }).strict().default({}),
   })
   .strict();
 
@@ -458,6 +465,8 @@ export interface FillSettings {
     maxQueueWaitMinutes: number;
     requeueMarker?: string;
     fallbackSeconds: number;
+    /** G3: waits on a PR, a decision or a bus message woken by that event */
+    events: { mode: GuardMode };
   };
   idle: {
     /** 0: off (the idle states are still shown) */
@@ -960,6 +969,7 @@ export function parseAgentsConfig(raw: unknown, project?: ProjectConfig): Agents
           maxQueueWaitMinutes: value.fill.wake.max_queue_wait_minutes,
           requeueMarker: value.fill.wake.requeue_marker,
           fallbackSeconds: value.fill.wake.fallback_seconds,
+          events: { mode: value.fill.wake.events.mode },
         },
         idle: {
           noticeMinutes: value.fill.idle.notice_minutes,
@@ -1081,7 +1091,7 @@ function doneMatchOf(fill: Pick<RawSettings["fill"], "done_match" | "done_patter
  * off. Warnings, not errors: such blocks worked before done_match.
  */
 export function fillConfigWarnings(
-  fill: Pick<RawSettings["fill"], "done_match" | "done_pattern" | "waiting_pattern" | "blocked_pattern">,
+  fill: Pick<RawSettings["fill"], "done_match" | "done_pattern" | "waiting_pattern" | "blocked_pattern"> & { wake?: { events?: { mode: GuardMode } } },
 ): string[] {
   const warnings: string[] = [];
   if (!fill.done_pattern.includes("{task}")) {
@@ -1102,8 +1112,17 @@ export function fillConfigWarnings(
       `agents.fill.${key} has no {task}: a ${what} line the agent writes about another task changes its open task, and is not reported as unmatched. Put {task} in ${key} so a line changes only the task it names`,
     );
   }
+  const events = fill.wake?.events?.mode ?? "off";
+  if (events !== "off" && !WAKE_EVENT_GROUPS.some((group) => fill.waiting_pattern.includes(`(?<${group}>`))) {
+    warnings.push(
+      `agents.fill.wake.events.mode is ${events}, but waiting_pattern captures no (?<pr>...), (?<decision>...) or (?<message>bus): no wait names an event, so the guard has nothing to wake`,
+    );
+  }
   return warnings;
 }
+
+/** The waiting_pattern groups G3 (agents.fill.wake.events) reads: what a wait names as its event */
+export const WAKE_EVENT_GROUPS = ["pr", "decision", "message"] as const;
 
 /** Backoff for attempt n (1-based): base * 2^(n-1), capped. In milliseconds. */
 export function backoffMs(attempt: number, baseSeconds: number, maxSeconds: number): number {

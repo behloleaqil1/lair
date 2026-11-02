@@ -942,6 +942,30 @@ describe("AT-33: a guard (or a request or minute budget) needs agents.spend; bud
     }
   });
 
+  it("G3 (fill.wake.events): off by default; observe and act load with spend on; a bad mode is refused; on with no event capture in waiting_pattern is a warning", () => {
+    const fill = (wake: Record<string, unknown>, waiting_pattern?: string) => ({
+      enabled: true,
+      spend: { enabled: true },
+      fill: { enabled: true, tasks_file: "work/tasks.txt", agents: ["worker-a"], prompt_files: ["{prompts_dir}/{agent}.txt"], wake, ...(waiting_pattern ? { waiting_pattern } : {}) },
+    });
+    const off = parseAgentsConfig(fill({}), config);
+    expect(off.ok && off.settings.fill.wake.events).toEqual({ mode: "off" });
+    expect(off.ok && off.settings.fill.warnings.some((w) => w.includes("wake.events"))).toBe(false);
+    const withPr = "^-\\s+WAITING\\s+{task}(?:\\s+PR\\s+(?<pr>\\d{1,7}))?(?=\\s|$)";
+    for (const mode of ["observe", "act"] as const) {
+      const on = parseAgentsConfig(fill({ events: { mode } }, withPr), config);
+      expect(on.ok && on.settings.fill.wake.events).toEqual({ mode });
+      expect(on.ok && on.settings.fill.warnings).toEqual([]);
+      // The default waiting_pattern names no event: a warning, not an error
+      const bare = parseAgentsConfig(fill({ events: { mode } }), config);
+      expect(bare.ok && bare.settings.fill.warnings).toEqual([
+        `agents.fill.wake.events.mode is ${mode}, but waiting_pattern captures no (?<pr>...), (?<decision>...) or (?<message>bus): no wait names an event, so the guard has nothing to wake`,
+      ]);
+    }
+    expect(errorsOf(fill({ events: { mode: "wake" } })).some((e) => e.startsWith("agents.fill.wake.events.mode:"))).toBe(true);
+    expect(errorsOf(fill({ events: { mode: "act", poll: 5 } })).some((e) => e.startsWith("agents.fill.wake.events:"))).toBe(true);
+  });
+
   it("a daily_requests or daily_minutes limit with spend off is refused, naming both keys", () => {
     expect(errorsOf({ enabled: true, budgets: { project: { daily_requests: { soft: 800 } } } })).toContain(
       "agents.budgets.project.daily_requests: needs agents.spend.enabled: true (counted from the spend records)",

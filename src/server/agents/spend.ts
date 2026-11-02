@@ -580,7 +580,7 @@ export interface SpendNotice {
   question: string;
   context: string;
   /** Its evidence code (one of class agents.spend_notice's, decisions/structure.ts) and facts (numbers and ids) */
-  code: "waste_share" | "task_attempts" | "would_park" | "would_cool";
+  code: "waste_share" | "task_attempts" | "would_park" | "would_cool" | "would_wake";
   facts?: Record<string, string | number | boolean | null>;
 }
 

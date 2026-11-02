@@ -122,6 +122,22 @@ import {
   type ReadyVerdict,
 } from "../ready-guard/guard.js";
 import { extractBusId, mirroredReport, type BusLineSource, type StructuredReport } from "../bus/consumers.js";
+import type { SpendNotice } from "./spend.js";
+import {
+  WakeArrivals,
+  storedCaptures,
+  wakeCapturesOf,
+  wakeFacts,
+  wakeKey,
+  wakeLabel,
+  wakeStateOf,
+  wakeTargetOf,
+  type WakeCame,
+  type WakeCaptures,
+  type WakeEventType,
+  type WakeFacts,
+  type WakeTarget,
+} from "./wake-events.js";
 
 export const MAX_TASKS_FILE_BYTES = 256 * 1024;
 export const MAX_TASK_LINES = 200;
@@ -301,13 +317,25 @@ interface RunStatus {
   wake: string | null;
   /** bus.consume on: the id of the bus report the line was read from (its gate id is the wake), else null */
   busId: number | null;
+  /** A waiting line's G3 captures ((?<pr>...), (?<decision>...), (?<message>...)), not yet checked */
+  captures: WakeCaptures | null;
 }
 
-/** What a waiting run waits on (see AgentsFill.classifyWait); `named` is a wake that resolved to a file, else null. */
+/** A wait on an event (G3, wake.events): what it names, and the event that came for it (null: none yet) */
+interface EventWait {
+  target: WakeTarget;
+  label: string;
+  came: WakeCame | null;
+}
+
+/**
+ * What a waiting run waits on (see AgentsFill.classifyWait); `named` is a wake that resolved to a file (or, G3 act, the
+ * event it names), else null. `event`: G3's wait on an event (act: pending or woken by it; observe: weak, as before).
+ */
 type WaitState =
-  | { kind: "pending"; named: string | null; view: FillWaitingView; detail: string; file: string }
-  | { kind: "woken"; named: string | null; file: string }
-  | { kind: "weak"; named: string | null; view: FillWaitingView; detail: string; fallbackAt: number | null };
+  | { kind: "pending"; named: string | null; view: FillWaitingView; detail: string; file: string; event?: EventWait }
+  | { kind: "woken"; named: string | null; file: string; event?: EventWait }
+  | { kind: "weak"; named: string | null; view: FillWaitingView; detail: string; fallbackAt: number | null; event?: EventWait };
 
 /** How many of a task's newest chains the no-done count and the wait streak look at */
 const MAX_CHAINS_LOOKED_AT = 50;
@@ -432,6 +460,8 @@ export interface LineMatch<K extends LineKind = LineKind> {
   line: string;
   wake: string | null;
   report: StructuredReport | null;
+  /** A waiting line's (?<pr>...), (?<decision>...) and (?<message>...) captures (G3), or null */
+  captures?: WakeCaptures | null;
 }
 
 /** One read of the queue file: its last QUEUE_MAX_BYTES from `begin`, and its size then */
@@ -542,11 +572,14 @@ export class QueueLines {
       const report = line.report;
       if (report === null || report.kind !== REPORT_KIND[query.kind] || report.task !== subject.task) return null;
       if ((subject.own || query.pattern.agent !== null) && report.agent.toLowerCase() !== subject.agent.toLowerCase()) return null;
-      return { kind: query.kind, line: line.text, wake: query.kind === "waiting" ? report.gateId : null, report };
+      // The report carries a gate id only: G3's captures come from the pattern on the mirrored line, when it matches
+      const captures = query.kind === "waiting" ? wakeCapturesOf(taskLineMatch(query.pattern, line.text)?.groups) : null;
+      return { kind: query.kind, line: line.text, wake: query.kind === "waiting" ? report.gateId : null, report, captures };
     }
     const match = taskLineMatch(query.pattern, line.text);
     if (match === null) return null;
-    return { kind: query.kind, line: line.text, wake: query.kind === "waiting" ? match.groups?.wake?.trim() || null : null, report: null };
+    const waiting = query.kind === "waiting";
+    return { kind: query.kind, line: line.text, wake: waiting ? match.groups?.wake?.trim() || null : null, report: null, captures: waiting ? wakeCapturesOf(match.groups) : null };
   }
 
   /**
@@ -626,7 +659,7 @@ export class QueueLines {
       until,
     );
     if (!last) return null;
-    return { kind: last.kind, line: last.line, wake: last.wake, busId: last.report?.id ?? null };
+    return { kind: last.kind, line: last.line, wake: last.wake, busId: last.report?.id ?? null, captures: last.captures ?? null };
   }
 
   /** A mark still describes this file: it isn't past its end and the bytes before it are unchanged. */
@@ -1056,6 +1089,8 @@ export interface FillEventInput {
   agent?: string;
   task?: string;
   runId?: string;
+  /** What it is about (a guard's task) */
+  subject?: string;
   summary: string;
   evidence?: string[];
   data?: Record<string, unknown>;
@@ -1106,6 +1141,10 @@ export interface AgentsFillOptions {
   readyFacts?: () => ReadyFactsSource | undefined;
   /** The project's bus at this check (bus.consume observe or on), or null: queue lines only, as without the bus */
   bus?: () => BusLineSource | null;
+  /** G3 (wake.events): the other modules' records the state check reads (reviews, decisions, bus messages); undefined: none */
+  wakeFacts?: () => WakeFacts | undefined;
+  /** G3 observe: one notice per would_wake (AgentsService's spend notice; false without a Decision Inbox) */
+  notice?: (notice: SpendNotice) => Promise<boolean>;
 }
 
 /** How a report or a line reads, for observe mode's comparison: its kind, and the gate a waiting one waits on */
@@ -1171,8 +1210,23 @@ export class AgentsFill {
   private idleStates = new Map<string, IdleState>();
   /** Each agent's open idle notice: its episode's start (ms), null for none; read from the store once per agent */
   private idleNotices = new Map<string, number | null>();
+  /** G3: the server events that came for a PR, a decision or an agent's messages (in memory: a restart loses them) */
+  private arrivals = new WakeArrivals();
+  /** G3: when the state check last read a waiting run's target (task|run -> time); none yet: read on the next look */
+  private stateChecked = new Map<string, number>();
 
   constructor(private options: AgentsFillOptions) {}
+
+  /**
+   * G3 (wake.events observe or act): a server event that may wake a wait (WAKE_EVENT_TYPES, its key from
+   * wakeKeyOfEvent). It is kept, and while the loop runs a check runs now instead of at the next interval (before
+   * start(), the runs aren't reconciled yet: the first check reads it). Nothing else changes here.
+   */
+  noteWakeEvent(key: string, event: WakeEventType): Promise<void> {
+    if (this.options.settings.wake.events.mode === "off" || this.ended) return Promise.resolve();
+    this.arrivals.note(key, event, this.options.probes.clock.now());
+    return this.stopped ? Promise.resolve() : this.checkSoon();
+  }
 
   get running(): boolean {
     return !this.stopped;
@@ -1914,6 +1968,8 @@ export class AgentsFill {
       if (latest && status?.kind === "waiting") {
         const since = latest.endedAt ?? latest.requestedAt;
         const wait = await this.classifyWait(latest, agent, task, status, now);
+        // G3 observe: the event the wait names came; recorded once, and nothing else changes
+        if (wait.kind === "weak" && wait.event?.came) await this.wouldWake(latest, agent, task, wait.event, wait.event.came);
         // Waiting on nothing that came is a run without progress: N of them hold the task (and that hold stays)
         const completions = wait.kind === "weak" ? this.completionsWithoutDone(task, releasedChain) : [];
         if (completions.length >= settings.maxCompletionsWithoutDone) {
@@ -1986,7 +2042,10 @@ export class AgentsFill {
           });
           continue;
         }
-        if (wait.kind === "woken") {
+        if (wait.kind === "woken" && wait.event?.came) {
+          // G3 act: the event it waits on came: it starts again now, with no backoff and nothing counted
+          await this.wokenByEvent(latest, agent, task, wait.event, wait.event.came);
+        } else if (wait.kind === "woken") {
           // What it waited on came after the run ended: it starts again now, with no backoff and nothing counted
           await this.options.record(
             "fill_woken",
@@ -2002,13 +2061,18 @@ export class AgentsFill {
             probes.clock.now(),
           );
         } else if (wait.kind === "pending") {
-          const detail = queued ? `waiting: ${queuedText(queued)}; starts again once ${wait.file} exists` : wait.detail;
+          const detail = queued ? `waiting: ${queuedText(queued)}; ${wait.event ? `starts again on ${wait.file}` : `starts again once ${wait.file} exists`}` : wait.detail;
           await hold("waiting", detail, latest.id, { ...wait.view, queued: queuedView }, status.busId);
           continue;
         } else {
-          // Waiting on nothing that came: a run without progress, counted and backed off
+          // Waiting on nothing that came: a run without progress, counted and backed off. G3 act: a wait that names
+          // nothing gets a fallback that doubles after each such run, up to max_backoff_seconds
           const count = completions.length;
-          const at = Math.max(wait.fallbackAt ?? 0, since + backoffMs(Math.max(count, 1), settings.backoffSeconds, settings.maxBackoffSeconds));
+          const fallbackAt =
+            settings.wake.events.mode === "act" && wait.fallbackAt !== null && !wait.event
+              ? since + backoffMs(Math.max(count, 1), settings.wake.fallbackSeconds, Math.max(settings.maxBackoffSeconds, settings.wake.fallbackSeconds))
+              : wait.fallbackAt;
+          const at = Math.max(fallbackAt ?? 0, since + backoffMs(Math.max(count, 1), settings.backoffSeconds, settings.maxBackoffSeconds));
           if (now < at) {
             await hold(
               "waiting",
@@ -2018,6 +2082,8 @@ export class AgentsFill {
             );
             continue;
           }
+          // G3 observe: the timer starts a wait whose event didn't come (act would have kept it waiting)
+          if (wait.event && wait.event.came === null) await this.timerWake(latest, agent, task, wait.event);
         }
       } else if (latest && latest.state === "completed") {
         const completions = this.completionsWithoutDone(task, releasedChain);
@@ -2142,6 +2208,9 @@ export class AgentsFill {
     }
     for (const key of [...this.lastQueued.keys()]) {
       if (!this.waitingSeen.has(key)) this.lastQueued.delete(key);
+    }
+    for (const key of [...this.stateChecked.keys()]) {
+      if (!this.waitingSeen.has(key)) this.stateChecked.delete(key);
     }
     // A check cut short saw only some lines: what it didn't see may still be held
     if (!signal.aborted) await this.withdrawLifted(views, wanted);
@@ -2482,7 +2551,13 @@ export class AgentsFill {
           runId: latest.id,
           summary: `fill: run ${short(latest.id)} of ${agent} on ${task} ended ${seen.kind}: ${oneLine(seen.line)}`,
           evidence: [seen.line],
-          data: seen.busId === null ? { line: seen.line, wake: seen.wake } : { line: seen.line, wake: seen.wake, busId: seen.busId },
+          data: {
+            line: seen.line,
+            wake: seen.wake,
+            ...(seen.busId === null ? {} : { busId: seen.busId }),
+            // G3's captures, kept like the wake (only when the line has some)
+            ...(seen.captures === null ? {} : { captures: seen.captures }),
+          },
           dedupeKey: `fill_status:${task}:${latest.id}:${seen.kind}:${sha256(Buffer.from(seen.line, "utf-8")).slice(0, 16)}`,
         },
         probes.clock.now(),
@@ -2496,6 +2571,7 @@ export class AgentsFill {
       line: String(kept.data.line ?? ""),
       wake: typeof kept.data.wake === "string" ? kept.data.wake : null,
       busId: typeof kept.data.busId === "number" ? kept.data.busId : null,
+      captures: storedCaptures(kept.data.captures),
     };
   }
 
@@ -2584,16 +2660,169 @@ export class AgentsFill {
       await note("fill_weak", `fill: ${file} was there before run ${short(latest.id)}'s chain started: waiting on it was no wait`);
       return stale;
     }
+    // G3 (wake.events): a wait that names a PR, a decision or a bus message (and no gate file). act: it waits for that
+    // event, with no fallback timer (max_wait_minutes still bounds it); observe: the timer below runs as before, and the
+    // check records the event that would have woken it
+    const mode = settings.wake.events.mode;
+    const named3 = mode === "off" ? { target: null, refused: null } : wakeTargetOf(status.captures);
+    let event: EventWait | undefined;
+    if (named3.target !== null) {
+      const label = wakeLabel(named3.target);
+      event = { target: named3.target, label, came: await this.eventCame(latest, agent, task, named3.target, now) };
+      if (mode === "act") {
+        if (event.came) return { kind: "woken", named: label, file: label, event };
+        return {
+          kind: "pending",
+          named: label,
+          file: label,
+          view: { ...view(null), wake: label },
+          detail: `waiting: ${label} since ${iso(since)}; no fallback timer: it starts again when that comes`,
+          event,
+        };
+      }
+    }
     const fallbackAt = since + settings.wake.fallbackSeconds * 1000;
+    if (refused === null && named3.refused !== null) refused = named3.refused;
     return {
       kind: "weak",
       named,
       fallbackAt,
       view: view(fallbackAt),
-      detail: [`waiting: ${shown ?? "(nothing named)"} since ${iso(since)}`, ...(refused !== null ? [`wake "${shown}" refused: ${refused}`] : [])].join(
-        "; ",
-      ),
+      detail: [
+        `waiting: ${shown ?? "(nothing named)"} since ${iso(since)}`,
+        ...(refused !== null && refused !== named3.refused ? [`wake "${shown}" refused: ${refused}`] : []),
+        ...(named3.refused !== null ? [`event refused: ${named3.refused}`] : []),
+      ].join("; "),
+      ...(event ? { event } : {}),
     };
+  }
+
+  /**
+   * G3: the event a wait names, when it came after its run started (an event during the run may have come before the
+   * agent wrote its line, so none is missed; at most one more run): the one fill already recorded for the run (it woke
+   * it, or would have), else one the server sent (WakeArrivals), else the modules' records (WakeFacts), read on the
+   * first look at this wait after a start and then at most every wake.poll_seconds. null: not yet.
+   */
+  private async eventCame(latest: AgentRun, agent: string, task: string, target: WakeTarget, now: number): Promise<WakeCame | null> {
+    const { store, project, settings } = this.options;
+    const recorded = store
+      .listEvents(project, { kinds: ["guard_did", "guard_would", "fill_woken"], task, runId: latest.id, limit: 10 })
+      .find((e) => e.data.guard === "wake_events" && typeof e.data.event === "string" && typeof e.data.eventAt === "string");
+    if (recorded) {
+      const at = Date.parse(String(recorded.data.eventAt));
+      return { event: recorded.data.event as WakeEventType, at: Number.isFinite(at) ? at : recorded.at, source: recorded.data.source === "state" ? "state" : "event" };
+    }
+    const since = latest.spawnedAt ?? latest.requestedAt;
+    const arrived = this.arrivals.since(wakeKey(target, agent), since);
+    if (arrived) return arrived;
+    const pollKey = `${task}|${latest.id}`;
+    this.waitingSeen.add(pollKey);
+    const last = this.stateChecked.get(pollKey);
+    if (last !== undefined && now - last < settings.wake.pollSeconds * 1000) return null;
+    this.stateChecked.set(pollKey, now);
+    try {
+      return await wakeStateOf(this.options.wakeFacts?.(), project, agent, target, since);
+    } catch (e) {
+      // A record that can't be read is no event: the wait goes on (max_wait_minutes still bounds it), read again later
+      console.warn(`[agents] ${project}: fill could not read whether ${wakeLabel(target)} came for ${task}: ${e instanceof Error ? e.message : String(e)}`);
+      return null;
+    }
+  }
+
+  /** G3's record of an event that came for a wait: numbers, ids and the event's type and time */
+  private eventData(task: string, wait: EventWait, came: WakeCame): Record<string, string | number> {
+    return { guard: "wake_events", task, ...wakeFacts(wait.target), event: came.event, eventAt: iso(came.at), source: came.source };
+  }
+
+  /** G3 act: the event came. One guard_did, then fill_woken (both once per run); the check starts the task again. */
+  private async wokenByEvent(latest: AgentRun, agent: string, task: string, wait: EventWait, came: WakeCame): Promise<void> {
+    const data = this.eventData(task, wait, came);
+    const evidence = [`${came.event} at ${iso(came.at)} (${came.source === "event" ? "the server event" : "its module's record"})`];
+    const at = this.options.probes.clock.now();
+    await this.options.record(
+      "guard_did",
+      {
+        agent,
+        task,
+        runId: latest.id,
+        subject: task,
+        summary: `wake_events: ${came.event} came for ${wait.label}: ${agent} starts on ${task} again (no fallback timer)`,
+        evidence,
+        data: { ...data, verdict: "wake" },
+        dedupeKey: `guard_did:wake_events:${latest.id}`,
+      },
+      at,
+    );
+    await this.options.record(
+      "fill_woken",
+      {
+        agent,
+        task,
+        runId: latest.id,
+        summary: `fill: ${came.event} came for ${wait.label}: ${agent} starts on ${task} again`,
+        evidence,
+        data,
+        dedupeKey: `fill_woken:${task}:${latest.id}`,
+      },
+      at,
+    );
+  }
+
+  /**
+   * G3 observe: the event that would have woken the wait came. One guard_would and one notice per waiting run (its
+   * streak); nothing else changes: the fallback timer starts it as before.
+   */
+  private async wouldWake(latest: AgentRun, agent: string, task: string, wait: EventWait, came: WakeCame): Promise<void> {
+    const at = this.options.probes.clock.now();
+    const data = this.eventData(task, wait, came);
+    const recorded = await this.options.record(
+      "guard_would",
+      {
+        agent,
+        task,
+        runId: latest.id,
+        subject: task,
+        summary: `wake_events (observe): ${came.event} came for ${wait.label}: would start ${task} again now; it goes on as before (the fallback timer)`,
+        evidence: [`${came.event} at ${iso(came.at)} (${came.source === "event" ? "the server event" : "its module's record"})`],
+        data: { ...data, verdict: "would_wake" },
+        dedupeKey: `guard_would:wake_events:${latest.id}`,
+      },
+      at,
+    );
+    if (!recorded) return;
+    await this.options.notice?.({
+      key: `guard_would:wake_events:${latest.id}`,
+      ref: `spend:guard:${at}:${task}`,
+      question: `wake_events would start ${task} again: ${came.event} came for ${wait.label}`,
+      code: "would_wake",
+      facts: { guard: "wake_events", task, event: came.event, ...wakeFacts(wait.target) },
+      context: [
+        `In act mode Lair would start ${task} for ${agent} again now, on the event its WAITING line names, with no fallback timer. It is in observe mode, so the fallback timer starts it as before.`,
+        "",
+        `- ${came.event} at ${iso(came.at)}, after run ${short(latest.id)} started`,
+      ].join("\n"),
+    });
+  }
+
+  /**
+   * G3 observe: the fallback timer starts a wait whose event hasn't come (act would have kept it waiting). One
+   * fill_wake_timer per run says no event was due.
+   */
+  private async timerWake(latest: AgentRun, agent: string, task: string, wait: EventWait): Promise<void> {
+    await this.options.record(
+      "fill_wake_timer",
+      {
+        agent,
+        task,
+        runId: latest.id,
+        subject: task,
+        summary: `fill: the fallback timer starts ${task} again for ${agent}; ${wait.label} hasn't come (wake.events observe: act would keep it waiting)`,
+        evidence: [],
+        data: { guard: "wake_events", task, ...wakeFacts(wait.target), eventDue: false },
+        dedupeKey: `fill_wake_timer:${task}:${latest.id}`,
+      },
+      this.options.probes.clock.now(),
+    );
   }
 
   /**

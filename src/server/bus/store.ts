@@ -462,6 +462,17 @@ export class BusStore {
     return rows.map(toMessage);
   }
 
+  /** The first message to an agent sent after `since` (ms) that it hasn't read, or null (a waiting agent's wake). */
+  unreadSince(agentId: string, since: number): { id: string; at: number } | null {
+    const row = this.db
+      .prepare(
+        `SELECT id, created_at FROM bus_messages WHERE project = ? AND to_id = ? AND read_at IS NULL AND created_at > ?
+           ORDER BY created_at LIMIT 1`,
+      )
+      .get(this.project, agentId, since) as { id: string; created_at: number } | undefined;
+    return row ? { id: row.id, at: row.created_at } : null;
+  }
+
   /** Count unread messages for an agent. */
   countUnread(agentId: string): number {
     const row = this.db

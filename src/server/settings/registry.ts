@@ -419,6 +419,13 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       "fill.wake.max_queue_wait_minutes": { label: "Max queue wait", group: "Fill", level: "advanced", help: "Waiting this long holds even while the gate is still queued" },
       "fill.wake.requeue_marker": { label: "Requeue marker", group: "Fill", level: "advanced", help: "A marker naming the id a gate was re-queued as" },
       "fill.wake.fallback_seconds": { label: "Fallback wait", group: "Fill", level: "advanced", help: "With nothing to wait on, the task starts again after this long" },
+      "fill.wake.events": { label: "Event wake", group: "Fill", level: "advanced", help: "Wake a wait that names a PR, a decision or a bus message on that event" },
+      "fill.wake.events.mode": {
+        label: "Event wake mode",
+        group: "Fill",
+        level: "advanced",
+        help: "off, observe (the timer runs; record what an event would have woken) or act (no timer: the event wakes it)",
+      },
     },
   },
   {

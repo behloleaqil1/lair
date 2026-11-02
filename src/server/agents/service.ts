@@ -125,6 +125,7 @@ import { extractHungLogLines, extractLastTool, lastLines, moveSessionAside, resu
 import { countsTowardCap, endKindOf, originOf, SpendRecorder, type ModelCall, type SpendNotice } from "./spend.js";
 import type { SpendFacts } from "./spend-classify.js";
 import { guardModes, spendReport, SpendReportError } from "./spend-report.js";
+import { WAKE_EVENT_TYPES, wakeKeyOfEvent, type WakeFacts } from "./wake-events.js";
 import { AgentsStore, type ClaimResult, type HungInfo } from "./store.js";
 import {
   claimView,
@@ -481,6 +482,8 @@ export interface AgentsServiceOptions {
   readyFacts?: () => ReadyFactsSource | undefined;
   /** What the review, planner and supervisor modules recorded about their runs (AI spend's classes; read on each use) */
   spendFacts?: () => SpendFacts | undefined;
+  /** G3 (agents.fill.wake.events): whether a PR was reviewed or merged, a decision answered, a bus message sent (read on each use) */
+  wakeFacts?: () => WakeFacts | undefined;
   /** The project's bus as fill reads it (bus.consume observe or on; read at each check), or null */
   bus?: () => BusLineSource | null;
   /** This server's URL, given as LAIR_URL to a run that gets a bus token (unless a module gave it one) */
@@ -619,6 +622,8 @@ export class AgentsService {
         withdraw: (decision, reason) => this.withdrawDecision(decision, reason, this.probes.clock.now()),
         readyFacts: options.readyFacts,
         bus: options.bus,
+        wakeFacts: options.wakeFacts,
+        notice: (notice) => this.spendNotice(notice),
       });
     }
   }
@@ -4280,6 +4285,19 @@ export class AgentsService {
   }
 
   /**
+   * G3 (agents.fill.wake.events observe or act, with fill on): a server event that may wake a waiting run (a review,
+   * a merge or a merge refusal of a PR; a decision answered or expired; a bus message), as AgentsManager routes it to
+   * the project's service. Fill keeps it and checks now (not awaited: the emitter doesn't wait for the check).
+   * Nothing while the guard is off, or for data that doesn't check.
+   */
+  noteWakeEvent(type: string, data: unknown): void {
+    const fill = this.fill;
+    if (!fill || this.settings.fill.wake.events.mode === "off") return;
+    const found = wakeKeyOfEvent(type, data, this.project);
+    if (found) void fill.noteWakeEvent(found.key, found.event);
+  }
+
+  /**
    * Stop ticking and filling; resolves once the fill check, tick or action in
    * progress has finished (fill first, so it requests nothing more).
    */
@@ -4479,9 +4497,20 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
   private evidenceUpdates = false;
   /** "started" between start() and stop(); a reload never runs once "stopped" */
   private phase: "loaded" | "started" | "stopped" = "loaded";
+  /** G3: the manager's subscriptions to the wake events (until stop()) */
+  private wakeUnsubscribes: (() => void)[] = [];
 
   constructor(private options: AgentsManagerOptions) {
     this.decisions = options.decisions ?? null;
+    // G3 (agents.fill.wake.events): the server events that may wake a waiting run go to their project's service,
+    // which ignores them while the guard is off (a reload may turn it on). Unsubscribed by stop()
+    for (const type of WAKE_EVENT_TYPES) {
+      const unsubscribe = options.events?.on(type, (event) => {
+        const project = typeof event.data.project === "string" ? event.data.project : null;
+        if (project !== null && this.phase !== "stopped") this.services.get(project)?.noteWakeEvent(event.type, event.data);
+      });
+      if (unsubscribe) this.wakeUnsubscribes.push(unsubscribe);
+    }
   }
 
   private readyFacts: ((project: string, config: ProjectConfig) => ReadyFactsSource | undefined) | null = null;
@@ -4500,6 +4529,18 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
    */
   useSpendFacts(facts: SpendFacts): void {
     this.spendFacts = facts;
+  }
+
+  private wakeFacts: WakeFacts | null = null;
+
+  /**
+   * G3 (agents.fill.wake.events): whether a PR was reviewed or merged, a decision answered, or a bus message sent, read
+   * from those modules' records when fill checks a wait's current state (on its first look after a start, then at
+   * most every wake.poll_seconds). Read on each use, so it may be set after load(); without it only the server
+   * events wake a wait.
+   */
+  useWakeFacts(facts: WakeFacts): void {
+    this.wakeFacts = facts;
   }
 
   /** Raise decisions through `inbox` instead (a stand-in for the Decision Inbox, in tests). */
@@ -4583,6 +4624,7 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
           tools: this.options.tools,
           readyFacts: () => this.readyFacts?.(entry.name, config),
           spendFacts: () => this.spendFacts ?? undefined,
+          wakeFacts: () => this.wakeFacts ?? undefined,
           ...this.busOptions(entry.name),
         }),
       );
@@ -4667,6 +4709,7 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
    */
   async stop(options: { planned?: boolean } = {}): Promise<void> {
     this.phase = "stopped";
+    for (const unsubscribe of this.wakeUnsubscribes.splice(0)) unsubscribe();
     for (const stop of this.stopFollowing.values()) stop();
     this.stopFollowing.clear();
     await Promise.all([...this.services.values()].map((service) => service.stop()));
