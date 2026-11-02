@@ -320,6 +320,11 @@ interface VmTime {
 const requestContext = createContext({ re: /./, lines: [] as string[], n: 0 });
 const requestScript = new Script("n = 0; for (const line of lines) if (re.test(line)) n++;");
 
+/** A pattern that takes over PROBE_TIMEOUT_MS on PROBE_LINES (nested quantifiers backtracking): refused at config load. */
+export function slowOnShortLines(re: RegExp): boolean {
+  return countMatchingLines(re, PROBE_LINES, PROBE_TIMEOUT_MS) === null;
+}
+
 /** The lines `re` matches, interrupted after `timeoutMs` (a pattern that backtracks badly): null then. */
 function countMatchingLines(re: RegExp, lines: string[], timeoutMs = REQUEST_PATTERN_TIMEOUT_MS): number | null {
   requestContext.re = re;
@@ -574,8 +579,8 @@ export interface SpendNotice {
   ref: string;
   question: string;
   context: string;
-  /** Its evidence code and facts (numbers and ids), for the decision's structure (class agents.spend_notice) */
-  code?: string;
+  /** Its evidence code (one of class agents.spend_notice's, decisions/structure.ts) and facts (numbers and ids) */
+  code: "waste_share" | "task_attempts" | "would_park" | "would_cool";
   facts?: Record<string, string | number | boolean | null>;
 }
 

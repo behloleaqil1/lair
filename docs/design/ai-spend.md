@@ -316,6 +316,13 @@ One deployment runs an interim `agents.failover.cooldown_minutes: 120` as a stop
 - A run already running isn't stopped by someone else's quota line. It ends on its own, as today.
 - In observe, the provider isn't cooled beyond today's rule. Each start that would have waited records `would_cool` with the reset time Lair would have used.
 - Recommended: patterns for the CLIs in use. On the 48 hours above, this would have replaced 114 failed starts with about 6 probes, and 77 decisions with 1.
+- **As built (PR 4).**
+  - The cooldown's state is kept on events of a new kind, `quota` (provider, since, next probe, backoff step, lines, reset), next to the `failover` event of kind `quota`. A `quota_cleared` event ends it: a start after the latest quota line that lives past `dead_on_start_seconds` or exits 0, or the owner's "Try now". A quota state older than 48 hours is over.
+  - A provider in a quota cooldown is passed over like one in a transient outage, so a fallback on another provider wins; with none, the run waits for the probe the same way (one start at a time, no `start_timeout_minutes`).
+  - The quota's cooldown replaces `cooldown_minutes` for quota lines rather than adding to it: `coolingUntil` still reads only rate-limit and provider-error failovers, so the interim 120-minute cooldown doesn't hold a quota's probe back. The quota failover's run ends `rate_limit` (§4.2's end kinds don't change).
+  - Each cooldown records one `guard_did` (`verdict: "cool"`); its decision is class `agents.provider_limit`, code `provider_quota`.
+  - Observe's streak per provider lasts until a start on it works, read from the run records at the next quota line, so it writes only the `guard_would` and its notice (class `agents.spend_notice`, code `would_cool`). G2 leaves out a run that ends while the streak is open (#315): from its `would_cool` until a start on the provider works by the run's end, as act's cooldown lasts until a probe works (it does not end with the first backoff window).
+  - A reset group is read as an ISO time with a zone, `HH:MM` or `H[:MM]am|pm` with an optional zone (`Z`, `UTC`, `GMT`, an offset, or an IANA name), or `in <n> minutes|hours`. Quota patterns run in a vm that interrupts them after 50 ms (no match then), and a pattern slow on short lines is refused at load.
 
 **G2. Per-task no-result cap.** `agents.spend.guards.task_no_result_cap: { mode: off, max: 6, window_hours: 24 }`.
 
@@ -323,10 +330,11 @@ One deployment runs an interim `agents.failover.cooldown_minutes: 120` as a stop
   - A fill task gets the fill hold `no_result_cap`, its claim is released, and one `escalation` decision is raised per task and streak. The options are `start_again` (resets the count), `fresh_session` and `keep_parked`.
   - A module run (review, planner, verifier) ends its chain and is escalated once through the existing `escalate` path. Its module's own caps still apply.
 - **What doesn't count**, by D2's reasoning (the failure isn't the task's):
-  - runs that died while their provider was in a **fleet** outage or a fleet quota cooldown (decision D2), since G1 and the transient rule handle those. G1's observe-mode `would_cool` windows count as cooldowns here too;
+  - runs that died while their provider was in a **fleet** outage or a fleet quota cooldown (decision D2), since G1 and the transient rule handle those. G1's observe-mode streaks (from a `would_cool` until a start on the provider works) count as cooldowns here too;
   - runs with `lair_restart = 1` (`exit_unknown`, `lost`, `vars_lost`): Lair's own restart ended them;
-  - runs that ended `stopped`: an owner stop or a shutdown.
-- **As built (PR 5).** The count is read from the run records of the task's chains, at the moment a failed run's chain would go on (a restart, a failover, a transient or never-started retry), so the run that just failed counts at once. A fleet outage is the provider's latest `transient` event by the run's end saying every agent waits; until G1 exists, the fleet cooldown is today's rate-limit and provider-error cooldown once two agents' failovers made it fleet-wide, and G1's quota cooldown (and its `would_cool` windows) joins it with PR 4. The count starts over when the task's fill hold is released: `start_again` releases it, and so does a release in Work. A superseded run never ran, so it isn't counted.
+  - runs that ended `stopped`: an owner stop or a shutdown;
+  - runs that ended `lost_claim` because their claim was released on request: by the owner (the Agents view or the API) or by a module stopping its own run (a review whose PR moved on, a supervisor turn). A claim another run took still counts.
+- **As built (PR 5).** The count is read from the run records of the task's chains, at the moment a failed run's chain would go on (a restart, a failover, a transient or never-started retry), so the run that just failed counts at once. A fleet outage is the provider's latest `transient` event by the run's end saying every agent waits; until G1 exists, the fleet cooldown is today's rate-limit and provider-error cooldown once two agents' failovers made it fleet-wide, and G1's quota cooldown (and its observe streaks) joins it with PR 4. The count starts over when the task's fill hold is released: `start_again` releases it, and so does a release in Work. A superseded run never ran, so it isn't counted.
 - On the data above, with `max: 6`, the 13 tasks that took 10 or more attempts would each have stopped at their sixth no-result run and asked once.
 
 **G3. Waiting agents woken only by the awaited event.** This extends `agents.fill.wake`.
