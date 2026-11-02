@@ -2,7 +2,8 @@
  * review.db schema 1 -> 2 on a populated file: a v1 database written with
  * the schema as it shipped, then opened by the current ReviewStore. Every
  * row is kept, the request rows become round 1 (with their token hashes and
- * uses), and the new tables work.
+ * uses), and the new tables work. And 4 -> 5 the same way: a PR's branch and
+ * state start unknown, and the merges recorded before are still merged PRs.
  */
 import { afterEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
@@ -10,7 +11,7 @@ import { createHash } from "crypto";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { ReviewStore, SCHEMA_1, SCHEMA_VERSION } from "./store.js";
+import { ReviewStore, SCHEMA_1, SCHEMA_2, SCHEMA_3, SCHEMA_4, SCHEMA_VERSION } from "./store.js";
 
 const HEAD = "a".repeat(40);
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -55,7 +56,7 @@ describe("review.db: schema 1 to 2", () => {
       const version = reader.pragma("user_version", { simple: true });
       reader.close();
       expect(version).toBe(SCHEMA_VERSION);
-      expect(SCHEMA_VERSION).toBe(4);
+      expect(SCHEMA_VERSION).toBe(5);
 
       const used = store.getRequest("demo", 7, HEAD, 0)!;
       expect(used).toMatchObject({
@@ -146,6 +147,60 @@ describe("review.db: schema 1 to 2", () => {
       expect(again.getAutoMerge("demo", 7, HEAD)).toMatchObject({ state: "started", startedAt: 1000 });
     } finally {
       again.close();
+    }
+  });
+});
+
+describe("review.db: schema 4 to 5", () => {
+  /** A review.db at schema version 4 (as it shipped) with two PRs, one merged by the review module. */
+  function v4Database(): string {
+    const dir = mkdtempSync(join(tmpdir(), "lair-review-v4-"));
+    dirs.push(dir);
+    const path = join(dir, "review.db");
+    const db = new Database(path);
+    db.exec(SCHEMA_1);
+    db.exec(SCHEMA_2);
+    db.exec(SCHEMA_3);
+    db.exec(SCHEMA_4);
+    db.pragma("user_version = 4");
+    db.prepare(`INSERT INTO review_prs (project, pr, head_sha, head_seen_at, author_id, author_kind) VALUES ('demo', 7, ?, '2026-03-01T09:00:00.000Z', 'worker-a', 'agent')`).run(HEAD);
+    db.prepare(`INSERT INTO review_prs (project, pr, head_sha, head_seen_at) VALUES ('demo', 8, ?, '2026-03-01T09:00:00.000Z')`).run(HEAD);
+    db.prepare(
+      `INSERT INTO review_merges (id, project, pr, head_sha, method, strategy, result_sha, initiated_by, merged_at, commits_checked, conditions, client)
+       VALUES ('merge-1', 'demo', 7, ?, 'host', 'squash', NULL, 'owner', '2026-03-01T10:00:00.000Z', 1, '{}', NULL)`,
+    ).run(HEAD);
+    db.close();
+    return path;
+  }
+
+  it("keeps every row; the merged PR is listed with no branch until the review module reads it again", () => {
+    const path = v4Database();
+    const store = new ReviewStore(path);
+    try {
+      const reader = new Database(path);
+      expect(reader.pragma("user_version", { simple: true })).toBe(5);
+      reader.close();
+      expect(store.currentHead("demo", 7)).toBe(HEAD);
+      expect(store.getAuthor("demo", 7)).toEqual({ id: "worker-a", kind: "agent" });
+      expect(store.mergedPrs("demo", 10)).toEqual([{ pr: 7, branch: null, at: "2026-03-01T10:00:00.000Z" }]);
+
+      // The review module reads the PRs from the host: their branches and states are kept, written only when changed
+      store.observePull("demo", 7, "agent/worker-a/t-7", "merged", "2026-03-02T09:00:00.000Z");
+      store.observePull("demo", 8, "agent/worker-b/t-8", "open", "2026-03-02T09:00:00.000Z");
+      expect(store.mergedPrs("demo", 10)).toEqual([{ pr: 7, branch: "agent/worker-a/t-7", at: "2026-03-02T09:00:00.000Z" }]);
+      // PR 8 merged outside the review module and was read as merged later; then read again unchanged
+      store.observePull("demo", 8, "agent/worker-b/t-8", "merged", "2026-03-02T10:00:00.000Z");
+      store.observePull("demo", 8, "agent/worker-b/t-8", "merged", "2026-03-02T11:00:00.000Z");
+      // A PR the review module never saw before: listed once read as merged
+      store.observePull("demo", 9, "agent/worker-a/t-9", "open", "2026-03-02T11:00:00.000Z");
+      expect(store.mergedPrs("demo", 10)).toEqual([
+        { pr: 8, branch: "agent/worker-b/t-8", at: "2026-03-02T10:00:00.000Z" },
+        { pr: 7, branch: "agent/worker-a/t-7", at: "2026-03-02T09:00:00.000Z" },
+      ]);
+      expect(store.mergedPrs("demo", 1)).toHaveLength(1);
+      expect(store.mergedPrs("other", 10)).toEqual([]);
+    } finally {
+      store.close();
     }
   });
 });

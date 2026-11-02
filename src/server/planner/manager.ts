@@ -9,6 +9,7 @@ import type { DecisionProducer } from "../decisions/types.js";
 import type { PlannerAgents } from "./agents.js";
 import type { BusLineSource } from "../bus/consumers.js";
 import { parsePlannerConfig } from "./config.js";
+import type { PlannerPrs } from "./guards.js";
 import { DECISION_MODULE, NO_VERDICT_REASON, PlannerService } from "./service.js";
 import { PlannerStore } from "./store.js";
 
@@ -29,6 +30,8 @@ export interface PlannerManagerOptions {
   clock?: { now(): number };
   /** The project's bus as the planner reads it (bus.consume observe or on; read at each cycle), or null */
   bus?: (project: string) => BusLineSource | null;
+  /** The review store's merged PRs (planner.guards.prefilter_closed); without it no PR counts as merged */
+  prs?: PlannerPrs;
 }
 
 const systemClock = { now: () => Date.now() };
@@ -70,6 +73,7 @@ export class PlannerManager {
         events: this.options.events,
         decisions: () => this.producer,
         bus: this.options.bus ? () => this.options.bus?.(entry.name) ?? null : undefined,
+        prs: this.options.prs,
       });
       this.services.set(entry.name, service);
       this.follow(entry.name, service);

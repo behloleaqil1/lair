@@ -236,6 +236,23 @@ describe("required reviewers per tier", () => {
   });
 });
 
+describe("each PR's branch and state, kept for the planner's closed-work guard", () => {
+  it("keeps the branch and state of each PR it reads; a PR read as merged is listed with its branch, from review.db only", async () => {
+    const { service, remote } = setup({}, [README]);
+    await service.status(3);
+    expect(manager!.mergedPrs("demo", 10)).toEqual([]);
+    // Merged outside the review module: the next read sees it
+    const pull = remote.pulls.get(3)!;
+    pull.state = "closed";
+    pull.merged = true;
+    await service.status(3);
+    expect(manager!.mergedPrs("demo", 10)).toEqual([{ pr: 3, branch: "agent/worker-a/change", at: new Date(NOW).toISOString() }]);
+    // Read from the store: the host isn't asked again
+    remote.pulls.delete(3);
+    expect(manager!.mergedPrs("demo", 10)).toEqual([{ pr: 3, branch: "agent/worker-a/change", at: new Date(NOW).toISOString() }]);
+  });
+});
+
 describe("test integrity check in the policy", () => {
   it("blocks a red-tier PR whose test asserts only on its own fakes, with file:line", async () => {
     const { service, head } = setup({}, [MIGRATION, SELF_ASSERTING]);
