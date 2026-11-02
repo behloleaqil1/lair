@@ -27,7 +27,7 @@ describe("G1 quota lines: matchQuota and quotaResetAt", () => {
     expect(quotaResetAt("11:00Z", noon)).toBe(Date.parse("2026-03-04T11:00:00Z"));
     expect(quotaResetAt("6pm (+05:00)", noon)).toBe(Date.parse("2026-03-03T13:00:00Z"));
     expect(quotaResetAt("9am (America/New_York)", noon)).toBe(Date.parse("2026-03-03T14:00:00Z"));
-    expect(quotaResetAt("8pm (Asia/Karachi)", noon)).toBe(Date.parse("2026-03-03T15:00:00Z"));
+    expect(quotaResetAt("11pm (Asia/Tokyo)", noon)).toBe(Date.parse("2026-03-03T14:00:00Z"));
     expect(quotaResetAt("2026-03-03T18:00:00Z", noon)).toBe(Date.parse("2026-03-03T18:00:00Z"));
     expect(quotaResetAt("2026-03-03T20:00:00+05:00", noon)).toBe(Date.parse("2026-03-03T15:00:00Z"));
     expect(quotaResetAt("in 90 minutes", noon)).toBe(noon + 1.5 * HOUR);
