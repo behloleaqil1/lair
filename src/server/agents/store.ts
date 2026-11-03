@@ -457,6 +457,14 @@ export class AgentsStore {
     );
   }
 
+  /** How many of a task's runs were started in a fresh session (a recovery, or a "fresh session" answer). */
+  freshSessionsForTask(project: string, task: string): number {
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS n FROM agents_runs WHERE project = ? AND task = ? AND json_extract(data, '$.sessionMode') = 'fresh'`)
+      .get(project, task) as { n: number };
+    return row.n;
+  }
+
   /** A task's runs requested since `since`, in every chain, the latest `limit` of them, oldest first. */
   taskRunsSince(project: string, task: string, since: number, limit: number): AgentRun[] {
     return this.runs(

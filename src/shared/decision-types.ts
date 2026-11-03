@@ -190,6 +190,10 @@ export interface Decision {
   /** True when `class` is in the policy table (src/server/decisions/structure.ts) */
   classKnown?: boolean;
   evidence?: DecisionEvidence;
+  /** Each real change of the evidence after the raise adds 1 (0 at the raise; absent without evidence) */
+  evidenceRev?: number;
+  /** When the raising module last re-read the class's live facts (absent until the first re-read) */
+  factsAt?: string;
   /** Only in GET /api/decisions/:id */
   audit?: DecisionAuditEntry[];
 }
@@ -245,6 +249,8 @@ export interface PolicyAgreementRow {
 export interface DecisionPoliciesStatus {
   /** data/server.yaml decision_policies.enabled: off, nothing is proposed or traced and `agreement` is empty */
   enabled: boolean;
+  /** decision_policies.live_facts (and enabled): raisers re-read their open decisions' live facts */
+  liveFacts: boolean;
   source: "file" | "built-in";
   version: string;
   policies: { id: string; class: string; codes: string[]; answer: string; state: string; maxTier: number }[];

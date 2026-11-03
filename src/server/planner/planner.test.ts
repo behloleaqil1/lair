@@ -42,7 +42,10 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-const open = (h: Harness) => h.inbox.list({ project: "demo", status: "open" }).filter((d) => d.source.module === "planner");
+// The planner's open decisions. These tests run act mode without the act-mode guards on purpose: the act-rule warning
+// notice that raises (class planner.act_rules) is tested in act-safety.test.ts (planner-act.md AT-2, AT-17)
+const open = (h: Harness) =>
+  h.inbox.list({ project: "demo", status: "open" }).filter((d) => d.source.module === "planner" && d.class !== "planner.act_rules");
 const taskIds = (h: Harness) => parseTasksFile(tasksText(h)).flatMap((e) => (e.kind === "task" ? [e.task] : []));
 const runsOf = (h: Harness) => h.service.runs();
 const history = (h: Harness) => h.service.history();

@@ -16,11 +16,22 @@ const CODE = /^[a-z][a-z0-9_]{0,59}$/;
 const FACT_KEY = /^[a-z][a-z0-9_]{0,59}$/;
 
 /**
- * The classes of the policy table (C1-C15) with the evidence codes each
+ * A known class: its policy, the evidence codes it allows, and its `live` facts: the facts its module may
+ * re-read and change while the decision is open (docs/design/decision-brain.md §4.1). `cause_cleared` and
+ * `linked_issue` move by event and are in no list.
+ */
+export interface KnownDecisionClass {
+  policy: string;
+  codes: readonly string[];
+  live?: readonly string[];
+}
+
+/**
+ * The classes of the policy table (C1-C16) with the evidence codes each
  * allows. A class outside this table is allowed but flagged; a known class
  * takes only its own codes.
  */
-export const KNOWN_DECISION_CLASSES: Readonly<Record<string, { policy: string; codes: readonly string[] }>> = {
+export const KNOWN_DECISION_CLASSES: Readonly<Record<string, KnownDecisionClass>> = {
   "agents.provider_limit": { policy: "C1", codes: ["provider_rate_limit", "provider_quota", "provider_unreachable"] },
   "supervisor.check_failing": { policy: "C2", codes: ["check_failing"] },
   "watchdog.idle_capacity": { policy: "C3", codes: ["idle_capacity"] },
@@ -28,11 +39,15 @@ export const KNOWN_DECISION_CLASSES: Readonly<Record<string, { policy: string; c
   "agents.gave_up": {
     policy: "C5",
     codes: ["provider_limit", "dead_on_start", "exit0_no_report", "blocked_reported", "repeated_failure"],
+    // hold_on_pr is next_move's input, so the two move together
+    live: ["task_state", "next_move", "review_at_head", "gate_at_head", "hold_on_pr", "blocker_cleared", "limit_reset_passed"],
   },
   "planner.proposal": { policy: "C6", codes: ["verifier_rejected", "verifier_passed", "verifier_missing", "writer_conflict"] },
   "planner.unblock": { policy: "C7", codes: ["infra", "waiting_on_gate", "needs_owner"] },
   // The planner guards' notices (G6, docs/design/ai-spend.md §4.5): what observe mode would do, or a kept change
   "planner.guard_notice": { policy: "C15", codes: ["would_skip", "would_apply", "tasks_file_kept"] },
+  // planner.mode: act without the guards act mode needs, in warn mode (docs/design/planner-act.md §4.3, D1)
+  "planner.act_rules": { policy: "C16", codes: ["act_rules_missing"] },
   "triage.gate_failure": {
     policy: "C8",
     codes: ["infra_download", "docker_down", "test_assertion", "unknown_failure", "infra_other", "same_failure_again"],
@@ -47,6 +62,16 @@ export const KNOWN_DECISION_CLASSES: Readonly<Record<string, { policy: string; c
 
 export function isKnownDecisionClass(id: string): boolean {
   return Object.hasOwn(KNOWN_DECISION_CLASSES, id);
+}
+
+/** The facts a class's module may change on an open decision ([] for an unknown class or one without a list). */
+export function liveFactsOf(id: string | undefined): readonly string[] {
+  return id !== undefined && isKnownDecisionClass(id) ? (KNOWN_DECISION_CLASSES[id].live ?? []) : [];
+}
+
+/** One fact value as the evidence takes it (a string of one line, a finite number, a boolean or null). */
+export function isFactValue(value: unknown): value is string | number | boolean | null {
+  return FactValue.safeParse(value).success;
 }
 
 const FactValue = z.union([

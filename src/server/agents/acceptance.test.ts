@@ -5749,6 +5749,202 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(inbox.list({ project: "demo", status: "open" })).toEqual([]);
   });
 
+  // ---- Decision brain v3: evidence for agents (docs/design/decision-brain.md §4.1, PR 1) ----
+
+  describe("decision brain v3: gave-up decisions carry the facts that decide them, and fill re-reads the live ones", () => {
+    const ON = "decision_policies:\n  enabled: true\n";
+    const LIVE = "decision_policies:\n  enabled: true\n  live_facts: true\n";
+    const gaveUp = (inbox: Awaited<ReturnType<typeof withInbox>>["inbox"]) =>
+      inbox.list({ project: "demo", status: "open" }).filter((d) => d.class === "agents.gave_up");
+
+    /** feat-login's runs all die on start until the agents module escalates: its decision (agents.gave_up / repeated_failure) */
+    async function escalated(h: Harness, inbox: Awaited<ReturnType<typeof withInbox>>["inbox"]) {
+      h.spawner.behaviour = (pid) => h.spawner.exit(pid, 1);
+      await check(h);
+      for (const ms of [0, 0, 10 * SEC, 10 * SEC, 30 * SEC, 30 * SEC, 70 * SEC, 70 * SEC]) await at(h, ms);
+      const [decision, ...more] = gaveUp(inbox);
+      expect(more).toEqual([]);
+      expect(decision).toMatchObject({ key: expect.stringMatching(/^escalation:/), evidence: { code: "repeated_failure" } });
+      return decision;
+    }
+
+    it("gaveUpCarriesTaskState (AT-1): open, kept through a one-check gap, reassigned, closed only at the LINE_GONE_CHECKS-th check", async () => {
+      const h = setup(fill({ agents: ["worker-a"] }));
+      const { inbox } = await withInbox(h, { serverYaml: LIVE });
+      prompts(h);
+      tasks(h, "worker-a|Alice|feat-login|Login form");
+      const raised = await escalated(h, inbox);
+      // At the raise: the task's line was open at fill's last check; its runs started in a fresh session are counted
+      const fresh = runs(h).filter((r) => r.sessionMode === "fresh").length;
+      expect(fresh).toBeGreaterThan(0);
+      expect(raised.evidence!.facts).toMatchObject({ agent: "worker-a", task: "feat-login", task_state: "open", pr: null, fresh_sessions: fresh });
+      expect(raised).toMatchObject({ evidenceRev: 0 });
+      expect(raised.factsAt).toBeUndefined();
+      const now = () => inbox.get(raised.id)!;
+
+      // A check re-reads it: the same value, so only factsAt moves
+      await check(h);
+      expect(now()).toMatchObject({ evidenceRev: 0, factsAt: new Date(h.clock.t).toISOString(), evidence: { facts: { task_state: "open" } } });
+
+      // Gone for one check, then back: still open, no new revision (the re-read is still stamped)
+      tasks(h, "# feat-login is being rewritten");
+      h.clock.t += SEC;
+      await check(h);
+      expect(now()).toMatchObject({ evidenceRev: 0, factsAt: new Date(h.clock.t).toISOString(), evidence: { facts: { task_state: "open" } } });
+      tasks(h, "worker-a|Alice|feat-login|Login form");
+      await check(h);
+      expect(now()).toMatchObject({ evidenceRev: 0, evidence: { facts: { task_state: "open" } } });
+
+      // Another agent's line names it (one fill never starts): reassigned
+      tasks(h, "worker-c|Cy|feat-login|Login form");
+      await check(h);
+      expect(now()).toMatchObject({ status: "open", evidenceRev: 1, evidence: { facts: { task_state: "reassigned" } } });
+
+      // Gone from the tasks file: closed only at the LINE_GONE_CHECKS-th check in a row
+      tasks(h, "# feat-login is no longer planned");
+      for (let i = 1; i < LINE_GONE_CHECKS; i++) await check(h);
+      expect(now()).toMatchObject({ status: "open", evidenceRev: 1, evidence: { facts: { task_state: "reassigned" } } });
+      await check(h);
+      expect(now()).toMatchObject({ status: "open", evidenceRev: 2, evidence: { facts: { task_state: "closed" } } });
+      // Each change is audited; nothing answered or withdrew it
+      expect(now().audit!.filter((a) => a.action === "evidence_updated").map((a) => a.detail)).toEqual([
+        "agents updated the evidence: task_state open -> reassigned",
+        "agents updated the evidence: task_state reassigned -> closed",
+      ]);
+      expect(now().answer).toBeUndefined();
+    });
+
+    it("a provider-limit escalation (agents.gave_up / provider_limit) carries its facts, null where nothing was read", async () => {
+      const h = setup(() => FALLBACK);
+      const { inbox } = await withInbox(h, { serverYaml: LIVE });
+      h.spawner.behaviour = (pid, log) => {
+        writeLog(h.clock, log, "Error: 429 Too Many Requests\n");
+        h.spawner.exit(pid, 1);
+      };
+      await request(h);
+      for (let i = 0; i < 6; i++) await at(h, 0);
+      await at(h, 30 * MIN);
+      for (let i = 0; i < 6; i++) await at(h, 30 * MIN);
+      const [decision] = gaveUp(inbox);
+      // No fill here (no tasks file read: task_state null); a 429 line names no reset time
+      expect(decision.evidence).toMatchObject({
+        code: "provider_limit",
+        facts: { task: "feat-login", task_state: null, pr: null, fresh_sessions: 0, limit_resets_at: null, limit_reset_passed: null },
+      });
+    });
+
+    it("limitResetPassed, live: fill's re-read turns a provider limit's reset true once its time passes (AT-1's provider_limit task)", async () => {
+      // fill never starts worker-a here (not allowlisted): the line only says the task is open
+      const h = setup(fill({ agents: ["worker-b"] }));
+      const { inbox } = await withInbox(h, { serverYaml: LIVE });
+      prompts(h);
+      tasks(h, "worker-a|Alice|feat-login|Login form");
+      const resets = new Date(NOW + 10 * MIN).toISOString();
+      // As the agents module raises it (service.ts escalate, provider_limit), with the v3 facts
+      const { decision } = await inbox.raise({
+        project: "demo",
+        kind: "escalation",
+        title: "worker-a is paused on feat-login: it failed 4 time(s), and Lair's automatic restarts are used up",
+        context: "Why it stopped: 4 provider errors or rate limits in a row",
+        options: [
+          { id: "fresh_session", label: "Start it again", consequences: "Starts it again.", effect: "reversible" },
+          { id: "release", label: "Leave the task unclaimed", consequences: "Frees it.", effect: "frees_task" },
+        ],
+        recommended: { optionId: "release", reasoning: "Every automatic recovery was used." },
+        source: { module: "agents", ref: "chain:c1" },
+        key: "escalation:c1:4",
+        blocks: ["agents:demo:task:feat-login"],
+        class: "agents.gave_up",
+        evidence: {
+          code: "provider_limit",
+          facts: { agent: "worker-a", task: "feat-login", attempt_count: 4, last_exit: 1, task_state: "open", pr: null, fresh_sessions: 0, limit_resets_at: resets, limit_reset_passed: false },
+          cause_cleared: false,
+          linked_issue: null,
+        },
+      });
+      await check(h);
+      expect(inbox.get(decision.id)).toMatchObject({ evidenceRev: 0, evidence: { facts: { task_state: "open", limit_reset_passed: false } } });
+      h.clock.t = NOW + 11 * MIN;
+      await check(h);
+      expect(inbox.get(decision.id)).toMatchObject({ status: "open", evidenceRev: 1, evidence: { facts: { task_state: "open", limit_reset_passed: true } } });
+    });
+
+    it("with live_facts off, the facts stay as raised", async () => {
+      const h = setup(fill({ agents: ["worker-a"] }));
+      const { inbox } = await withInbox(h, { serverYaml: ON });
+      prompts(h);
+      tasks(h, "worker-a|Alice|feat-login|Login form");
+      const raised = await escalated(h, inbox);
+      expect(raised.evidence!.facts).toMatchObject({ task_state: "open", fresh_sessions: expect.any(Number) });
+      tasks(h, "worker-c|Cy|feat-login|Login form");
+      for (let i = 0; i <= LINE_GONE_CHECKS; i++) await check(h);
+      expect(inbox.get(raised.id)).toMatchObject({ status: "open", evidenceRev: 0, evidence: raised.evidence });
+      expect(inbox.get(raised.id)!.factsAt).toBeUndefined();
+    });
+
+    for (const [name, blocked, facts] of [
+      ["a PR", "waiting on PR #12 to merge", { block_class: "task", block_target: "pr", blocked_on_pr: 12, blocker_cleared: null, pr: 12 }],
+      ["an owner approval", "needs the owner's approval of the schema", { block_class: "owner", block_target: "unknown", blocked_on_pr: null, blocker_cleared: null }],
+      ["an unparseable reason", "something odd happened", { block_class: "task", block_target: "unknown", blocked_on_pr: null, blocker_cleared: null }],
+    ] as const) {
+      it(`blockedFacts (AT-3): a BLOCKED line naming ${name}`, async () => {
+        const h = setup(fill({ agents: ["worker-a"] }));
+        const { inbox } = await withInbox(h, { serverYaml: LIVE });
+        prompts(h);
+        tasks(h, "worker-a|Alice|feat-login|Login form");
+        await runEndingWith(h, `- BLOCKED feat-login by worker-a: ${blocked}`);
+        await check(h);
+        const [decision] = gaveUp(inbox);
+        expect(decision.evidence).toMatchObject({ code: "blocked_reported", facts: { task_state: "open", fresh_sessions: 0, ...facts } });
+        // Re-read: nothing a person must clear reads cleared
+        await check(h);
+        expect(inbox.get(decision.id)).toMatchObject({ evidenceRev: 0, evidence: { facts: { blocker_cleared: null } } });
+      });
+    }
+
+    it("blockedFacts (AT-3): a BLOCKED line naming host load reads cleared once the load per CPU is under fill's start limit", async () => {
+      const h = setup(fill({ agents: ["worker-a"], capacity: { load_per_cpu_max: 1.0 } }));
+      const { inbox } = await withInbox(h, { serverYaml: LIVE });
+      prompts(h);
+      tasks(h, "worker-a|Alice|feat-login|Login form");
+      h.systemInfo.load = 2.0;
+      h.systemInfo.cpus = 4;
+      await runEndingWith(h, "- BLOCKED feat-login by worker-a: host load too high to run the suite");
+      h.systemInfo.load = 8.0; // 2.0 per CPU: above the limit
+      await check(h);
+      const [decision] = gaveUp(inbox);
+      expect(decision.evidence!.facts).toMatchObject({ block_class: "environment", block_target: "host_load", blocker_cleared: false });
+      await check(h);
+      expect(inbox.get(decision.id)).toMatchObject({ evidenceRev: 0 });
+      h.systemInfo.load = 2.0; // 0.5 per CPU
+      await check(h);
+      expect(inbox.get(decision.id)).toMatchObject({ status: "open", evidenceRev: 1, evidence: { facts: { blocker_cleared: true } } });
+    });
+
+    it("offWritesNothing (AT-20, the agents part): with the switches at their defaults, a gave-up decision has its four facts and never moves", async () => {
+      for (const serverYaml of [undefined, null, "server: {}\n"] as const) {
+        const h = setup(fill({ agents: ["worker-a"], capacity: { load_per_cpu_max: 1.0 } }));
+        const { inbox } = await withInbox(h, serverYaml === undefined ? {} : { serverYaml });
+        prompts(h);
+        tasks(h, "worker-a|Alice|feat-login|Login form");
+        h.systemInfo.load = 2.0;
+        h.systemInfo.cpus = 4;
+        await runEndingWith(h, "- BLOCKED feat-login by worker-a: host load too high, see PR #12");
+        await check(h);
+        const [decision] = gaveUp(inbox);
+        expect(Object.keys(decision.evidence!.facts).sort()).toEqual(["agent", "attempt_count", "last_exit", "task"]);
+        h.systemInfo.load = 0.5;
+        tasks(h, "worker-c|Cy|feat-login|Login form");
+        for (let i = 0; i <= LINE_GONE_CHECKS; i++) await check(h);
+        const after = inbox.get(decision.id)!;
+        expect(after).toMatchObject({ evidenceRev: 0, evidence: decision.evidence });
+        expect(after.factsAt).toBeUndefined();
+        expect(after.audit!.filter((a) => a.action === "evidence_updated")).toEqual([]);
+        expect(inbox.policyTraces()).toEqual([]);
+      }
+    });
+  });
+
   // ---- Idle detection (fill.idle): report only, one notice per episode ----
 
   describe("idle detection: an agent idle while ready work exists gets one notice per episode", () => {

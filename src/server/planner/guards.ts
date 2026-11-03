@@ -14,6 +14,7 @@ export interface PlannerGuards {
   handledMessages: GuardMode;
   skipUnchanged: { mode: GuardMode; maxSkipMs: number };
   recheckOnChange: GuardMode;
+  dedupePending: GuardMode;
 }
 
 /** The guards with every part off (the default) */
@@ -22,6 +23,7 @@ export const GUARDS_OFF: PlannerGuards = {
   handledMessages: "off",
   skipUnchanged: { mode: "off", maxSkipMs: 24 * 3_600_000 },
   recheckOnChange: "off",
+  dedupePending: "off",
 };
 
 /** A PR the review store records as merged (review_merges, or the state the review module last read from the host). */

@@ -60,7 +60,8 @@ import type {
   SpendWindow,
   StopReason,
 } from "../../shared/agents-types.js";
-import type { Decision } from "../../shared/decision-types.js";
+import type { Decision, DecisionFactValue } from "../../shared/decision-types.js";
+import { raiseFacts, readOrNull } from "./brain-facts.js";
 import type { DecisionProducer, DecisionResolution } from "../decisions/types.js";
 import type { SignInRefusal, ToolReadiness } from "../ai/types.js";
 import { buildStartCommand, getAdapter } from "../services/adapters.js";
@@ -645,6 +646,12 @@ export class AgentsService {
         bus: options.bus,
         wakeFacts: options.wakeFacts,
         notice: (notice) => this.spendNotice(notice),
+        brainFacts: () => {
+          const inbox = this.decisions();
+          if (!inbox.brainFacts) return undefined;
+          const refresh = inbox.refreshFacts?.bind(inbox);
+          return { refresh: inbox.brainFacts.live && refresh ? refresh : null };
+        },
       });
     }
   }
@@ -2427,11 +2434,30 @@ export class AgentsService {
     return resumeSummary({ run, chain, config: this.config, view: this.view(t), branchState, why });
   }
 
+  /**
+   * The v3 facts of a gave-up decision this module raises (docs/design/decision-brain.md §4.1), while the decision
+   * policies are on; {} while they are off. The task's state is fill's at its last check (null without fill, or
+   * when no line named it then).
+   */
+  private gaveUpFacts(run: AgentRun, code: string, now: number, limitResetsAt?: string | null): Record<string, DecisionFactValue> {
+    if (!this.decisions().brainFacts) return {};
+    return raiseFacts({
+      code,
+      taskState: readOrNull(() => this.fill?.taskState(run.task, run.agent) ?? null),
+      // A run that died left no report line here; the PR at the head is read by PR 1b
+      pr: null,
+      freshSessions: readOrNull(() => this.store.freshSessionsForTask(this.project, run.task)),
+      limitResetsAt,
+      now,
+    });
+  }
+
   private async escalate(
     run: AgentRun,
     why: string,
     t: Tick,
     code: "repeated_failure" | "dead_on_start" | "provider_limit" = "repeated_failure",
+    limitResetsAt?: string | null,
   ): Promise<void> {
     this.store.releaseClaim(this.project, run.task, run.id);
     const chain = this.store.chainRuns(run.chainId).map((r) => (r.id === run.id ? run : r));
@@ -2486,7 +2512,13 @@ export class AgentsService {
           class: "agents.gave_up",
           evidence: {
             code,
-            facts: { agent: run.agent, task: run.task, attempt_count: chain.length, last_exit: run.exitCode ?? null },
+            facts: {
+              agent: run.agent,
+              task: run.task,
+              attempt_count: chain.length,
+              last_exit: run.exitCode ?? null,
+              ...this.gaveUpFacts(run, code, t.now, limitResetsAt),
+            },
             cause_cleared: false,
             linked_issue: null,
           },
@@ -2745,7 +2777,13 @@ export class AgentsService {
           class: "agents.gave_up",
           evidence: {
             code: "repeated_failure",
-            facts: { agent: run.agent, task: run.task, attempt_count: v.counted.length, last_exit: run.exitCode ?? null },
+            facts: {
+              agent: run.agent,
+              task: run.task,
+              attempt_count: v.counted.length,
+              last_exit: run.exitCode ?? null,
+              ...this.gaveUpFacts(run, "repeated_failure", t.now),
+            },
             cause_cleared: false,
             linked_issue: null,
           },
@@ -2859,7 +2897,15 @@ export class AgentsService {
     this.store.saveRun(run);
     if (parked) return;
     if (!next) {
-      await this.escalate(run, `${done + 1} provider errors or rate limits in a row (failover.max_failovers is ${this.settings.failover.maxFailovers}): ${oneLine(info.line, 200)}`, t, "provider_limit");
+      const reset = info.quota?.reset ?? null;
+      const resetAt = reset === null ? null : quotaResetAt(reset, t.now);
+      await this.escalate(
+        run,
+        `${done + 1} provider errors or rate limits in a row (failover.max_failovers is ${this.settings.failover.maxFailovers}): ${oneLine(info.line, 200)}`,
+        t,
+        "provider_limit",
+        resetAt === null ? null : iso(resetAt),
+      );
       return;
     }
     this.store.insertRun(next);
@@ -4604,6 +4650,7 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
   private producer: DecisionProducer | null = null;
   /** useEvidenceUpdates(): off by default */
   private evidenceUpdates = false;
+  private liveFacts = false;
   /** "started" between start() and stop(); a reload never runs once "stopped" */
   private phase: "loaded" | "started" | "stopped" = "loaded";
   /** G3: the manager's subscriptions to the wake events (until stop()) */
@@ -4668,7 +4715,7 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
     for (const stop of this.stopFollowing.values()) stop();
     this.stopFollowing.clear();
     this.producer = decisions;
-    this.decisions = new ProducerDecisions(decisions, this.fileInbox(), { evidenceUpdates: this.evidenceUpdates });
+    this.decisions = new ProducerDecisions(decisions, this.fileInbox(), { evidenceUpdates: this.evidenceUpdates, liveFacts: this.liveFacts });
     for (const [project, service] of this.services) this.follow(project, service);
   }
 
@@ -4676,11 +4723,15 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
    * Re-evaluate the evidence of decisions this module raised (a provider-limit decision's cause cleared once
    * its reset time passed: AgentsService.refreshCauses). Off until the decision policies turn it on
    * (src/server/decisions/policies/, data/server.yaml decision_policies.enabled); off, no decision's evidence
-   * changes after it was raised.
+   * changes after it was raised. On, its gave-up decisions carry the v3 facts at the raise; `liveFacts`
+   * (decision_policies.live_facts): fill also re-reads their live facts at each check.
    */
-  useEvidenceUpdates(on: boolean): void {
+  useEvidenceUpdates(on: boolean, options: { liveFacts?: boolean } = {}): void {
     this.evidenceUpdates = on;
-    if (this.producer) this.decisions = new ProducerDecisions(this.producer, this.fileInbox(), { evidenceUpdates: on });
+    this.liveFacts = on && options.liveFacts === true;
+    if (this.producer) {
+      this.decisions = new ProducerDecisions(this.producer, this.fileInbox(), { evidenceUpdates: on, liveFacts: this.liveFacts });
+    }
   }
 
   private follow(project: string, service: AgentsService): void {

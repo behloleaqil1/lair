@@ -70,7 +70,8 @@ import { constants, type Dir } from "fs";
 import { lstat, open, opendir, realpath, type FileHandle } from "fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
-import type { Decision } from "../../shared/decision-types.js";
+import type { Decision, DecisionFactValue } from "../../shared/decision-types.js";
+import { blockReason, blockerCleared, limitResetPassed, prOfLine, raiseFacts, readOrNull, taskStateOf, type TaskState } from "./brain-facts.js";
 import type {
   AgentEventKind,
   AgentRunView,
@@ -1112,6 +1113,8 @@ interface HoldQuestion {
   withOutput?: boolean;
   /** The evidence code: why the task is held (agents.gave_up, or agents.cannot_start for probe_failed and fill_waiting) */
   code: "probe_failed" | "fill_waiting" | "repeated_failure" | "exit0_no_report" | "blocked_reported";
+  /** The run's last WAITING or BLOCKED line, when it ended on one: the v3 facts' `pr` and block facts */
+  report?: RunStatus | null;
 }
 
 export interface AgentsFillOptions {
@@ -1147,6 +1150,11 @@ export interface AgentsFillOptions {
   wakeFacts?: () => WakeFacts | undefined;
   /** G3 observe: one notice per would_wake (AgentsService's spend notice; false without a Decision Inbox) */
   notice?: (notice: SpendNotice) => Promise<boolean>;
+  /**
+   * The decision policies are on: gave-up decisions carry the v3 facts (docs/design/decision-brain.md §4.1), and
+   * with `refresh` (decision_policies.live_facts) each check re-reads their live facts. Undefined: off.
+   */
+  brainFacts?: () => { refresh: ((id: string, facts: Record<string, DecisionFactValue>) => Promise<void>) | null } | undefined;
 }
 
 /** How a report or a line reads, for observe mode's comparison: its kind, and the gate a waiting one waits on */
@@ -1198,6 +1206,10 @@ export class AgentsFill {
   private waitingSeen = new Set<string>();
   /** Open decisions whose line is gone from the tasks file: in how many checks in a row (key -> checks) */
   private lineGone = new Map<string, number>();
+  /** The live facts' own count of the same (decision id -> checks): task_state reads closed only at LINE_GONE_CHECKS */
+  private factsLineGone = new Map<string, number>();
+  /** The last re-read error logged per decision (decision id -> error) */
+  private factsWarned = new Map<string, string>();
   /** When fill last saw a waiting run's gate in the gate queue (task|run -> time); the store keeps the first and last sightings */
   private lastQueued = new Map<string, number>();
   /** The unmatched reports of the lines' last runs at the last complete check (rebuilt from the queue each check) */
@@ -1941,6 +1953,7 @@ export class AgentsFill {
         await hold("blocked", reason, latest.id, null, status.busId);
         await ask(latest, fillDecisionKey(task, latest.id, "blocked"), {
           code: "blocked_reported",
+          report: status,
           question: `${agent} is paused on ${task}: it reported the task blocked`,
           context: [`Run ${short(latest.id)} ended ${iso(latest.endedAt ?? latest.requestedAt)} on this line:`, "", ...asData(status.line)],
           startConsequences: `Fill starts ${task} for ${agent} again on its next check: choose this once what blocked it is cleared.`,
@@ -1958,6 +1971,7 @@ export class AgentsFill {
         );
         await ask(run, fillDecisionKey(task, run.id), {
           code: "exit0_no_report",
+          report: status,
           question: `${agent} is paused on ${task}: its last ${count} run(s) ended without reporting it done`,
           context: [
             "Runs:",
@@ -2216,6 +2230,7 @@ export class AgentsFill {
     }
     // A check cut short saw only some lines: what it didn't see may still be held
     if (!signal.aborted) await this.withdrawLifted(views, wanted);
+    if (!signal.aborted) await this.refreshLiveFacts(views);
     // A line whose last run reported another task says so, beside why it is where it is
     for (const report of unmatchedThisCheck) {
       const view = views.find((v) => v.task === report.openTask);
@@ -2451,6 +2466,85 @@ export class AgentsFill {
     this.lineGone = gone;
   }
 
+  /** The task's state in the tasks file at the last check (brain-facts.ts taskStateOf), null when no line named it. */
+  taskState(task: string, agent: string): TaskState | null {
+    return taskStateOf(this.lines, task, agent) ?? null;
+  }
+
+  /**
+   * decision_policies.live_facts: re-read the live facts of the agents module's open gave-up decisions in this
+   * project, one update per decision with every live fact its code has (docs/design/decision-brain.md §4.1).
+   * A task whose line is missing keeps its last task_state until LINE_GONE_CHECKS checks in a row (a tasks file
+   * mid-rewrite never reads as closed); the count starts again once a line names it. Evidence only: nothing is
+   * answered or withdrawn. Never throws.
+   */
+  private async refreshLiveFacts(views: FillLineView[]): Promise<void> {
+    const refresh = this.options.brainFacts?.()?.refresh ?? null;
+    if (!refresh) {
+      this.factsLineGone.clear();
+      this.factsWarned.clear();
+      return;
+    }
+    const gone = new Map<string, number>();
+    const warned = new Map<string, string>();
+    const now = this.options.probes.clock.now();
+    for (const decision of this.options.openDecisions()) {
+      const evidence = decision.evidence;
+      if (decision.class !== "agents.gave_up" || !evidence || typeof evidence.facts.task !== "string") continue;
+      const agent = typeof evidence.facts.agent === "string" ? evidence.facts.agent : null;
+      let state: DecisionFactValue | undefined = taskStateOf(views, evidence.facts.task, agent);
+      if (state === undefined) {
+        const checks = (this.factsLineGone.get(decision.id) ?? 0) + 1;
+        gone.set(decision.id, checks);
+        // Fewer checks: the last value stands (sent again, so the re-read is still stamped)
+        state = checks >= LINE_GONE_CHECKS ? "closed" : (evidence.facts.task_state ?? null);
+      }
+      const facts: Record<string, DecisionFactValue> = { task_state: state };
+      if (evidence.code === "blocked_reported") {
+        facts.blocker_cleared = blockerCleared(evidence.facts.block_class, evidence.facts.block_target, this.loadOk());
+      }
+      if (evidence.code === "provider_limit") facts.limit_reset_passed = limitResetPassed(evidence.facts.limit_resets_at, now);
+      try {
+        await refresh(decision.id, facts);
+        this.factsWarned.delete(decision.id);
+      } catch (e) {
+        // Once per decision and error, not at every check (a decision closed meanwhile fails the same way each time)
+        const error = message(e);
+        if (this.factsWarned.get(decision.id) !== error) {
+          console.warn(`[agents] ${this.options.project}: could not re-read the facts of decision ${decision.id}: ${error}`);
+        }
+        warned.set(decision.id, error);
+      }
+    }
+    this.factsLineGone = gone;
+    this.factsWarned = warned;
+  }
+
+  /** The bus report a run's last line was read from (bus.consume on), if it is still stored. */
+  private storedReport(report: RunStatus): StructuredReport | undefined {
+    return report.busId !== null ? this.options.bus?.()?.reports([report.busId]).get(report.busId) : undefined;
+  }
+
+  /** The PR a run's last report names: the bus report's own field, else the line's text. */
+  private reportPr(report: RunStatus): number | null {
+    return this.storedReport(report)?.pr ?? prOfLine(report.line);
+  }
+
+  /** A BLOCKED report's reason: the bus report's summary, else the line after its first ": " (the planner's reading). */
+  private blockedReason(report: RunStatus): string {
+    return blockReason(report.line, this.storedReport(report)?.summary);
+  }
+
+  /** Whether the machine's load per CPU is below fill's start limit now; null without a limit or a reading. */
+  private loadOk(): boolean | null {
+    const max = this.options.settings.capacity.loadPerCpuMax;
+    const info = this.options.probes.systemInfo;
+    const cpus = info.cpuCount();
+    const load = info.loadAvg1();
+    if (max === undefined || !(Number.isFinite(cpus) && cpus > 0 && Number.isFinite(load))) return null;
+    return load / cpus <= max;
+  }
+
   /**
    * Where the decision of a hold stands (`key`: fillDecisionKey, or the
    * run's escalationDecisionKey): open, answered (with the option), withdrawn,
@@ -2513,7 +2607,24 @@ export class AgentsFill {
           class: ask.code === "probe_failed" || ask.code === "fill_waiting" ? "agents.cannot_start" : "agents.gave_up",
           evidence: {
             code: ask.code,
-            facts: { agent, task, attempt_count: latest?.attempt ?? null, last_exit: latest?.exitCode ?? null },
+            facts: {
+              agent,
+              task,
+              attempt_count: latest?.attempt ?? null,
+              last_exit: latest?.exitCode ?? null,
+              // Fill raises only for a line of this agent that is not done: its task is open
+              ...(this.options.brainFacts?.() && ask.code !== "probe_failed" && ask.code !== "fill_waiting"
+                ? raiseFacts({
+                    code: ask.code,
+                    taskState: "open",
+                    pr: ask.report ? readOrNull(() => this.reportPr(ask.report!)) : null,
+                    freshSessions: readOrNull(() => this.options.store.freshSessionsForTask(this.options.project, task)),
+                    blockedReason: ask.report?.kind === "blocked" ? (readOrNull(() => this.blockedReason(ask.report!)) ?? undefined) : undefined,
+                    loadOk: this.loadOk(),
+                    now: this.options.probes.clock.now(),
+                  })
+                : {}),
+            },
             cause_cleared: false,
             linked_issue: null,
           },
