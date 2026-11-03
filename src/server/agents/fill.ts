@@ -77,14 +77,15 @@ import {
   headFacts,
   limitResetPassed,
   prOfLine,
+  PrReader,
   raiseFacts,
   readOrNull,
-  readPr,
   taskStateOf,
   type PrHeadSource,
   type PrHeadView,
   type TaskState,
 } from "./brain-facts.js";
+import { parsePrRefs } from "../repos/refs.js";
 import type {
   AgentEventKind,
   AgentRunView,
@@ -170,6 +171,8 @@ const QUEUE_LINE_CHARS = 1000;
 const MARK_TAIL_BYTES = 256;
 /** Checks in a row a held line must be gone from the tasks file before its decision is withdrawn */
 export const LINE_GONE_CHECKS = 3;
+/** How long before an escalated chain's start a report may be for its `pr` fact (fill.lastReportPr) */
+export const PR_REPORT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 /** Where a hold's decision stands (AgentsFill.holdDecision) */
 export type HoldDecisionState =
@@ -1225,6 +1228,10 @@ export class AgentsFill {
   private factsLineGone = new Map<string, number>();
   /** The last re-read error logged per decision (decision id -> error) */
   private factsWarned = new Map<string, string>();
+  /** The v3 facts' reads of PRs (bounded, backing off after a failure) */
+  private readonly prReader: PrReader;
+  /** This check's reads of PRs: one per PR */
+  private checkPrs: (pr: number | null) => Promise<PrHeadView | null>;
   /** When fill last saw a waiting run's gate in the gate queue (task|run -> time); the store keeps the first and last sightings */
   private lastQueued = new Map<string, number>();
   /** The unmatched reports of the lines' last runs at the last complete check (rebuilt from the queue each check) */
@@ -1244,7 +1251,10 @@ export class AgentsFill {
   /** G3: when the state check last read a waiting run's target (task|run -> time); none yet: read on the next look */
   private stateChecked = new Map<string, number>();
 
-  constructor(private options: AgentsFillOptions) {}
+  constructor(private options: AgentsFillOptions) {
+    this.prReader = new PrReader(options.project, () => options.prFacts?.(), () => options.probes.clock.now());
+    this.checkPrs = this.prReader.batch();
+  }
 
   /**
    * G3 (wake.events observe or act): a server event that may wake a wait (WAKE_EVENT_TYPES, its key from
@@ -1641,6 +1651,8 @@ export class AgentsFill {
 
   private async evaluate(signal: AbortSignal, now: number): Promise<FillLineView[]> {
     const { project, settings, store, config, probes } = this.options;
+    // The v3 facts read each PR at most once in this check (the raise's read and the re-read share it)
+    this.checkPrs = this.prReader.batch();
     const path = this.tasksPath;
     if (!path) throw new Error("agents.fill.tasks_file is not set");
     const read = await readBounded(path, MAX_TASKS_FILE_BYTES, false);
@@ -2491,11 +2503,9 @@ export class AgentsFill {
     if (known && known.status !== "withdrawn") return {};
     const pr = ask.report ? readOrNull(() => this.reportPr(ask.report!)) : null;
     const blockedReason = ask.report?.kind === "blocked" ? (readOrNull(() => this.blockedReason(ask.report!)) ?? undefined) : undefined;
-    const blockedOn = blockedReason !== undefined ? prOfLine(blockedReason) : null;
-    const source = readOrNull(() => this.options.prFacts?.());
-    const prView = await readPr(source ?? undefined, this.options.project, pr);
-    // The PR it waits on is often the run's own: read once
-    const blockedPrView = blockedOn === pr ? prView : await readPr(source ?? undefined, this.options.project, blockedOn);
+    const blockedOn = blockedReason !== undefined ? readOrNull(() => this.prRef(blockedReason)) : null;
+    // In parallel, and once per PR in this check (the PR it waits on is often the run's own)
+    const [prView, blockedPrView] = await Promise.all([this.checkPrs(pr), this.checkPrs(blockedOn)]);
     // Fill raises only for a line of this agent that is not done: its task is open
     return raiseFacts({
       code: ask.code,
@@ -2503,6 +2513,7 @@ export class AgentsFill {
       pr,
       freshSessions: readOrNull(() => this.options.store.freshSessionsForTask(this.options.project, task)),
       blockedReason,
+      prOf: (text) => this.prRef(text),
       loadOk: this.loadOk(),
       prView,
       agents: this.agentNames(),
@@ -2517,11 +2528,19 @@ export class AgentsFill {
   }
 
   /**
-   * The PR the task's last WAITING or BLOCKED report by `agent` names (any run of the task: a run that died left
-   * none of its own), or null. For the agents service's own escalations.
+   * The PR the task's last WAITING or BLOCKED report by `agent` names, or null. For the agents service's own
+   * escalations: a run that died left none of its own, so a report from the task's earlier runs counts, but only
+   * one made at most PR_REPORT_MAX_AGE_MS before `since` (the escalated chain's start): an old report may name a PR
+   * the task has moved on from (and a PR that merged meanwhile reads no next move).
    */
-  lastReportPr(task: string, agent: string): number | null {
-    const kept = this.options.store.listEvents(this.options.project, { kinds: ["fill_waiting", "fill_blocked"], task, agent, limit: 1 })[0];
+  lastReportPr(task: string, agent: string, since: number): number | null {
+    const kept = this.options.store.listEvents(this.options.project, {
+      kinds: ["fill_waiting", "fill_blocked"],
+      task,
+      agent,
+      since: since - PR_REPORT_MAX_AGE_MS,
+      limit: 1,
+    })[0];
     if (!kept) return null;
     return this.reportPr({
       kind: kept.kind === "fill_waiting" ? "waiting" : "blocked",
@@ -2532,10 +2551,12 @@ export class AgentsFill {
     });
   }
 
-  /** The v3 facts read at a PR's head for the service's own raise: the PR, the PR as read, and the project's agents */
+  /**
+   * The v3 facts read at a PR's head for the service's own raise: the PR as read (bounded, and null at once while
+   * the reads back off after a failure), and the project's agents
+   */
   async prHeadFacts(pr: number | null): Promise<{ prView: PrHeadView | null; agents: string[] }> {
-    const source = readOrNull(() => this.options.prFacts?.());
-    return { prView: await readPr(source ?? undefined, this.options.project, pr), agents: this.agentNames() };
+    return { prView: await this.prReader.read(pr), agents: this.agentNames() };
   }
 
   /** The task's state in the tasks file at the last check (brain-facts.ts taskStateOf), null when no line named it. */
@@ -2561,21 +2582,15 @@ export class AgentsFill {
     const warned = new Map<string, string>();
     const now = this.options.probes.clock.now();
     const agents = this.agentNames();
-    // One read per PR per check, however many decisions name it
-    const source = readOrNull(() => this.options.prFacts?.()) ?? undefined;
-    const seen = new Map<number, Promise<PrHeadView | null>>();
-    const prs = {
-      read: (pr: number | null): Promise<PrHeadView | null> => {
-        if (pr === null) return Promise.resolve(null);
-        let found = seen.get(pr);
-        if (!found) {
-          found = readPr(source, this.options.project, pr);
-          seen.set(pr, found);
-        }
-        return found;
-      },
-    };
-    for (const decision of this.options.openDecisions()) {
+    const open = this.options.openDecisions().filter((d) => d.class === "agents.gave_up" && d.evidence && typeof d.evidence.facts.task === "string");
+    // Every PR these decisions name, read at once (one bounded wait per check, however many PRs), once per PR
+    const named = (facts: Record<string, DecisionFactValue>) => [
+      Object.hasOwn(facts, "pr") && typeof facts.pr === "number" ? facts.pr : null,
+      facts.block_target === "pr" && typeof facts.blocked_on_pr === "number" ? facts.blocked_on_pr : null,
+    ];
+    await Promise.all(open.flatMap((d) => named(d.evidence!.facts)).map((pr) => this.checkPrs(pr)));
+    const prs = { read: this.checkPrs };
+    for (const decision of open) {
       const evidence = decision.evidence;
       if (decision.class !== "agents.gave_up" || !evidence || typeof evidence.facts.task !== "string") continue;
       const agent = typeof evidence.facts.agent === "string" ? evidence.facts.agent : null;
@@ -2618,7 +2633,20 @@ export class AgentsFill {
 
   /** The PR a run's last report names: the bus report's own field, else the line's text. */
   private reportPr(report: RunStatus): number | null {
-    return this.storedReport(report)?.pr ?? prOfLine(report.line);
+    return this.storedReport(report)?.pr ?? this.prRef(report.line);
+  }
+
+  /**
+   * A PR of the project's own repository (`github`, the one the review module reads) that `text` names, as the
+   * repos module reads a report (`PR #12`; `lib PR #7` or `owner/name#7` is another repository's: null). Without
+   * a repositories source, `PR #12` / `pull request #12`.
+   */
+  private prRef(text: string): number | null {
+    const own = this.options.config.github;
+    const source = readOrNull(() => this.options.readyFacts?.());
+    if (!source || !own) return prOfLine(text);
+    const [ref] = parsePrRefs(text.slice(0, 1000), source.repos, { mode: "report", qualified: source.legacy !== true });
+    return ref && ref.repo.toLowerCase() === own.toLowerCase() ? ref.number : null;
   }
 
   /** A BLOCKED report's reason: the bus report's summary, else the line after its first ": " (the planner's reading). */

@@ -49,9 +49,17 @@ function setup() {
   return { remote, reviews, dbPath, old, head, base };
 }
 
-function review(dbPath: string, headSha: string, reviewer: { id: string; kind: "agent" | "human" }, verdict: "approve" | "request_changes", at: string) {
+function review(
+  dbPath: string,
+  headSha: string,
+  reviewer: { id: string; kind: "agent" | "human" | "check" },
+  verdict: "approve" | "request_changes",
+  at: string,
+  blocking = false,
+) {
   const store = new ReviewStore(dbPath);
-  store.addReview({ project: "demo", pr: 12, headSha, reviewer, verdict, summary: "s", context: {}, findings: [], client: null, at });
+  const findings = blocking ? [{ severity: "high" as const, file: "src/a.ts", line: 3, text: "a test was deleted", blocking: true, rule: null }] : [];
+  store.addReview({ project: "demo", pr: 12, headSha, reviewer, verdict, summary: "s", context: {}, findings, client: null, at });
   store.close();
 }
 
@@ -68,6 +76,22 @@ describe("brainPrFacts: a PR as the decision brain reads it", () => {
     // A person asks for changes: both stand
     review(h.dbPath, h.head, { id: "someone", kind: "human" }, "request_changes", "2026-03-02T11:30:00.000Z");
     expect((await h.reviews.brainPrFacts("demo", 12))!.verdicts.sort()).toEqual(["approve", "request_changes"]);
+  });
+
+  it("as the merge policy counts them: a check's request for changes and an open blocking finding count, a check's approval does not; a superseded verdict never", async () => {
+    const h = setup();
+    review(h.dbPath, h.head, { id: "lair:test-integrity", kind: "check" }, "approve", "2026-03-02T11:00:00.000Z");
+    expect((await h.reviews.brainPrFacts("demo", 12))!.verdicts).toEqual([]);
+    review(h.dbPath, h.head, { id: "lair:test-integrity", kind: "check" }, "request_changes", "2026-03-02T11:05:00.000Z", true);
+    review(h.dbPath, h.head, { id: "worker-b", kind: "agent" }, "approve", "2026-03-02T11:10:00.000Z");
+    // The check asks for changes, and its blocking finding is open
+    expect((await h.reviews.brainPrFacts("demo", 12))!.verdicts.sort()).toEqual(["approve", "request_changes", "request_changes"]);
+
+    // A reviewer that approved head A, then asked for changes at head B: back at A, its approval is superseded
+    const g = setup();
+    review(g.dbPath, g.head, { id: "worker-b", kind: "agent" }, "approve", "2026-03-02T11:00:00.000Z");
+    review(g.dbPath, g.old, { id: "worker-b", kind: "agent" }, "request_changes", "2026-03-02T11:10:00.000Z");
+    expect((await g.reviews.brainPrFacts("demo", 12))!.verdicts).toEqual([]);
   });
 
   it("the required gate at the head, and the unreleased holds on this PR or every PR, with who added each", async () => {

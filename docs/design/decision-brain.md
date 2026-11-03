@@ -109,7 +109,7 @@ Each raiser adds these facts at the raise. Facts hold codes, ids, numbers, boole
 
 `next_move` is computed by one function, in this order:
 
-1. `null` when `pr` is null, `gate_at_head` is `fail`, `hold_on_pr` is `owner`, or `hold_on_pr` is null (the hold state could not be read, so a hold may stand). That is v1 C5's approved guard in full ("a task with a failing gate or a human-set hold goes to the owner", decision-policies.md:36): no rule answers either case, and no answered case of §1 starts an agent on a failing gate.
+1. `null` when `pr` is null, the PR is not open (merged, closed, or its state could not be read: PR 1b), `gate_at_head` is `fail`, `hold_on_pr` is `owner`, or `hold_on_pr` is null (the hold state could not be read, so a hold may stand). That is v1 C5's approved guard in full ("a task with a failing gate or a human-set hold goes to the owner", decision-policies.md:36): no rule answers either case, and no answered case of §1 starts an agent on a failing gate.
 2. `other` when `gate_at_head` is `queued`, `hold_on_pr` is `orchestrator`, `policy` or `agent`, or `review_at_head` is `approve` and `gate_at_head` is `pass`.
 3. `agent` when `review_at_head` is `request_changes` or `gate_at_head` is `none`.
 4. `null` otherwise (any input `null` that the steps above needed; a null `hold_on_pr` already stopped at step 1).

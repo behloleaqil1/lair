@@ -597,21 +597,27 @@ export class ReviewService {
 
   /**
    * The decision brain's view of a PR (src/server/agents/brain-facts.ts PrHeadView): its state and head read from
-   * the host now, each reviewer's latest verdict at exactly that head, each required gate there, and the
-   * unreleased holds on it. Read only: nothing is recorded, not even the head (a read must not withdraw reviews).
+   * the host now, each reviewer's latest verdict at exactly that head (as the merge policy counts them; a check's
+   * request for changes and an open blocking finding count as one), each required gate there, and the unreleased
+   * holds on it. Read only: nothing is recorded, not even the head (a read must not withdraw reviews).
    */
   async brainPrFacts(n: number): Promise<PrHeadView> {
     const pr = await this.o.host.getPullRequest(n);
-    const latest = new Map<string, "approve" | "request_changes">();
-    for (const review of this.o.store.listReviews(this.project, n)) {
-      // Oldest first: a reviewer's later verdict at the same head replaces the earlier one
-      if (review.headSha === pr.headSha && review.reviewer.kind !== "check") latest.set(`${review.reviewer.kind}:${review.reviewer.id}`, review.verdict);
-    }
+    // As the merge policy reads them (evaluate): each reviewer's latest review, only at this head
+    const reviews = this.annotate(this.o.store.listReviews(this.project, n), pr.headSha);
+    const current = reviews.filter((r) => !r.stale && !r.superseded);
+    const verdicts = current
+      // Lair's own checks (test integrity) only ever hold a PR back: their request for changes counts, never an approval
+      .filter((r) => r.reviewer.kind !== "check" || r.verdict === "request_changes")
+      .map((r) => r.verdict);
+    // An open blocking finding the merge policy still refuses on is a request for changes too
+    const blocking = reviews.some((r) => r.findings.some((f) => f.status === "open" && f.blocking && !f.superseded));
+    if (blocking) verdicts.push("request_changes");
     const required = await this.gateSource.checksAt(pr.headSha);
     return {
       state: pr.state,
       headSha: pr.headSha,
-      verdicts: [...latest.values()],
+      verdicts,
       gate: required.length === 0 ? null : required.map((g) => g.status),
       holds: this.o.store.activeHolds(this.project, n).map((h) => ({ byOwner: h.byOwner === true, by: h.createdBy })),
     };

@@ -2443,10 +2443,20 @@ export class AgentsService {
    * when no line named it then). A run that died left no report: `pr` is the one the task's last WAITING or
    * BLOCKED report by this agent named (fill's store; null without fill), read at its head as fill reads it.
    */
-  private async gaveUpFacts(run: AgentRun, code: string, now: number, limitResetsAt?: string | null): Promise<Record<string, DecisionFactValue>> {
-    if (!this.decisions().brainFacts) return {};
-    const pr = readOrNull(() => this.fill?.lastReportPr(run.task, run.agent) ?? null);
-    const head = this.fill ? await this.fill.prHeadFacts(pr) : { prView: null, agents: [] };
+  private async gaveUpFacts(
+    run: AgentRun,
+    key: string,
+    code: string,
+    now: number,
+    limitResetsAt?: string | null,
+  ): Promise<Record<string, DecisionFactValue>> {
+    const inbox = this.decisions();
+    if (!inbox.brainFacts) return {};
+    const since = this.store.chainRuns(run.chainId)[0]?.requestedAt ?? run.requestedAt;
+    const pr = readOrNull(() => this.fill?.lastReportPr(run.task, run.agent, since) ?? null);
+    // Read under the module's lock: bounded, null at once while reads back off, and none when nothing will be raised
+    const known = readOrNull(() => inbox.find?.(this.project, key) ?? null);
+    const head = this.fill && !(known && known.status !== "withdrawn") ? await this.fill.prHeadFacts(pr) : { prView: null, agents: [] };
     return raiseFacts({
       code,
       taskState: readOrNull(() => this.fill?.taskState(run.task, run.agent) ?? null),
@@ -2524,7 +2534,7 @@ export class AgentsService {
               task: run.task,
               attempt_count: chain.length,
               last_exit: run.exitCode ?? null,
-              ...(await this.gaveUpFacts(run, code, t.now, limitResetsAt)),
+              ...(await this.gaveUpFacts(run, escalationDecisionKey(run.chainId, chain.length), code, t.now, limitResetsAt)),
             },
             cause_cleared: false,
             linked_issue: null,
@@ -2789,7 +2799,7 @@ export class AgentsService {
               task: run.task,
               attempt_count: v.counted.length,
               last_exit: run.exitCode ?? null,
-              ...(await this.gaveUpFacts(run, "repeated_failure", t.now)),
+              ...(await this.gaveUpFacts(run, guardDecisionKey(v.guard, run.id), "repeated_failure", t.now)),
             },
             cause_cleared: false,
             linked_issue: null,

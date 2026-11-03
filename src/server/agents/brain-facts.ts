@@ -39,7 +39,9 @@ export interface PrHeadSource {
 }
 
 /** How long one read of a PR may take: a source that does not answer in time is a fact that cannot be read */
-export const PR_FACTS_TIMEOUT_MS = 10_000;
+export const PR_FACTS_TIMEOUT_MS = 5_000;
+/** After a read that failed or timed out, no PR is read for this long (its facts are null): a slow host costs one timeout */
+export const PR_FACTS_BACKOFF_MS = 60_000;
 
 /** Whether the module adds these facts at the raise, and whether it re-reads the live ones at each check. */
 export interface BrainFactsMode {
@@ -54,19 +56,26 @@ const BLOCK_PATTERNS = {
   environment: DEFAULT_ENVIRONMENT_PATTERNS.map((p) => new RegExp(p, "i")),
 };
 
-/** A PR reference: "PR 12", "PR #12", "pull request #12" or ".../pull/12". A bare "#12" may be an issue: not one. */
-const PR_REFERENCE = /\b(?:PR|pull request)\s*#?(\d{1,7})\b|\/pull\/(\d{1,7})\b/i;
 /**
- * The machine's load named as the obstacle, by a phrase that only means that ("load per cpu", "load average",
- * "load too high", "load above", "high load", "load > n"); not any "load" or "cpu" word near "over" or "high"
+ * A PR reference of the project's own repository: "PR #12" or "pull request #12" (the repos module's report form).
+ * A bare "#12" may be an issue, "PR 4" may be a step of a plan, and a link may be another repository's: none is one.
  */
-const LOAD_REFERENCE =
-  /\bload\s+per\s+cpu\b|\bload\s+average\b|\bload\s+(?:is\s+|was\s+)?too\s+high\b|\bload\s+(?:is\s+|was\s+)?above\b|\bhigh\s+load\b|\bload\s*[<>]\s*\d/i;
+const PR_REFERENCE = /\b(?:PR|pull request)\s*#(\d{1,7})(?![0-9A-Za-z_])/i;
+/**
+ * The machine's load named as the obstacle, by a phrase that only means that: "load per cpu", "load average", or
+ * the machine named with it ("host load too high", "runner load above the limit", "high system load"). Not any
+ * "load" word near "over", "above" or "high" (a load test, a page load, cpu profiling).
+ */
+const MACHINE = String.raw`(?:host|machine|runner|server|system|cpu)`;
+const LOAD_REFERENCE = new RegExp(
+  String.raw`\bload\s+per\s+cpu\b|\bload\s+average\b|\b${MACHINE}\s+load\s+(?:is\s+|was\s+)?(?:too\s+high|above)\b|\bhigh\s+${MACHINE}\s+load\b`,
+  "i",
+);
 
 /** The PR a report line names, or null. */
 export function prOfLine(line: string): number | null {
   const m = PR_REFERENCE.exec(line.slice(0, MAX_TEXT));
-  const n = m ? Number(m[1] ?? m[2]) : NaN;
+  const n = m ? Number(m[1]) : NaN;
   return Number.isSafeInteger(n) && n > 0 ? n : null;
 }
 
@@ -76,10 +85,13 @@ export function prOfLine(line: string): number | null {
  * hand-written line says after its first ": " (never the task id or the agent's name). Anything else is
  * `unknown`, never a guess.
  */
-export function blockFacts(reason: string): { block_class: string; block_target: BlockTarget; blocked_on_pr: number | null } {
+export function blockFacts(
+  reason: string,
+  prOf: (text: string) => number | null = prOfLine,
+): { block_class: string; block_target: BlockTarget; blocked_on_pr: number | null } {
   const text = reason.slice(0, MAX_TEXT);
   const blockClass = classifyBlocked(text, BLOCK_PATTERNS).class;
-  const pr = prOfLine(text);
+  const pr = prOf(text);
   const target: BlockTarget =
     pr !== null ? "pr" : LOAD_REFERENCE.test(text) ? "host_load" : blockClass === "environment" ? "environment" : "unknown";
   return { block_class: blockClass, block_target: target, blocked_on_pr: pr };
@@ -135,19 +147,21 @@ export function holdOnPr(view: PrHeadView | null, agents: readonly string[]): Ho
 }
 
 /**
- * Who moves the task next (docs/design/decision-brain.md §4.1), in this order: null with no PR, a failing gate,
- * an owner's hold or a hold that could not be read (a person decides); `other` while the gate runs, another role
+ * Who moves the task next (docs/design/decision-brain.md §4.1), in this order: null with no PR, a PR that is not
+ * open (merged, closed or not read), a failing gate, an owner's hold or a hold that could not be read (a person decides); `other` while the gate runs, another role
  * holds it, or it is approved with a passing gate; `agent` when changes are requested or no gate ran yet; null
  * otherwise.
  */
 export function nextMove(input: {
   pr: number | null;
+  /** The PR's state as read: a merged or closed PR (or one not read) has no next move on it */
+  state?: PrHeadView["state"];
   review: ReviewAtHead | null;
   gate: GateAtHead | null;
   hold: HolderRole | "none" | null;
 }): NextMove | null {
   const { pr, review, gate, hold } = input;
-  if (pr === null || gate === "fail" || hold === "owner" || hold === null) return null;
+  if (pr === null || input.state !== "open" || gate === "fail" || hold === "owner" || hold === null) return null;
   if (gate === "queued" || hold !== "none" || (review === "approve" && gate === "pass")) return "other";
   if (review === "request_changes" || gate === "none") return "agent";
   return null;
@@ -159,24 +173,81 @@ export function headFacts(pr: number | null, view: PrHeadView | null, agents: re
   const review = reviewAtHead(seen);
   const gate = gateAtHead(seen);
   const hold = pr === null ? null : holdOnPr(seen, agents);
-  return { review_at_head: review, gate_at_head: gate, hold_on_pr: hold, next_move: nextMove({ pr, review, gate, hold }) };
+  return { review_at_head: review, gate_at_head: gate, hold_on_pr: hold, next_move: nextMove({ pr, state: seen?.state ?? null, review, gate, hold }) };
 }
 
-/** One read of a PR through `source`, bounded by PR_FACTS_TIMEOUT_MS: a failure or a timeout is null, never a value. */
-export async function readPr(source: PrHeadSource | undefined, project: string, pr: number | null, timeoutMs = PR_FACTS_TIMEOUT_MS): Promise<PrHeadView | null> {
-  if (!source || pr === null) return null;
+/** One read of a PR through `source`, bounded by `timeoutMs`: a failure or a timeout is an error, never a value. */
+async function readOnce(source: PrHeadSource, project: string, pr: number, timeoutMs: number): Promise<PrHeadView | null> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
-      source.pr(project, pr),
-      new Promise<null>((resolve) => {
-        timer = setTimeout(() => resolve(null), timeoutMs);
+      Promise.resolve().then(() => source.pr(project, pr)),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`no answer within ${timeoutMs} ms`)), timeoutMs);
       }),
     ]);
-  } catch {
-    return null;
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** One read of a PR through `source`, bounded by `timeoutMs`: a failure or a timeout is null, never a value. */
+export async function readPr(source: PrHeadSource | undefined, project: string, pr: number | null, timeoutMs = PR_FACTS_TIMEOUT_MS): Promise<PrHeadView | null> {
+  if (!source || pr === null) return null;
+  try {
+    return await readOnce(source, project, pr, timeoutMs);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A project's reads of PRs for the v3 facts. Each read is bounded (PR_FACTS_TIMEOUT_MS); after one fails or times
+ * out, every read answers null until PR_FACTS_BACKOFF_MS passed, so a slow or unreachable host costs one timeout
+ * per minute, not one per decision. A failure is logged once per error (no token is ever part of it).
+ */
+export class PrReader {
+  private downUntil = 0;
+  private warned: string | null = null;
+
+  constructor(
+    private readonly project: string,
+    private readonly source: () => PrHeadSource | undefined,
+    private readonly now: () => number,
+    private readonly timeoutMs = PR_FACTS_TIMEOUT_MS,
+  ) {}
+
+  async read(pr: number | null): Promise<PrHeadView | null> {
+    if (pr === null || this.now() < this.downUntil) return null;
+    const source = readOrNull(() => this.source());
+    if (!source) return null;
+    try {
+      const view = await readOnce(source, this.project, pr, this.timeoutMs);
+      this.warned = null;
+      return view;
+    } catch (e) {
+      this.downUntil = this.now() + PR_FACTS_BACKOFF_MS;
+      const error = (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 200);
+      if (this.warned !== error) {
+        console.warn(`[agents] ${this.project}: could not read PR #${pr} for a decision's facts (null for a minute): ${error}`);
+        this.warned = error;
+      }
+      return null;
+    }
+  }
+
+  /** One read per PR for one pass (a fill check): the same PR named twice is read once */
+  batch(): (pr: number | null) => Promise<PrHeadView | null> {
+    const seen = new Map<number, Promise<PrHeadView | null>>();
+    return (pr) => {
+      if (pr === null) return Promise.resolve(null);
+      let found = seen.get(pr);
+      if (!found) {
+        found = this.read(pr);
+        seen.set(pr, found);
+      }
+      return found;
+    };
   }
 }
 
@@ -224,6 +295,8 @@ export function raiseFacts(input: {
   freshSessions: number | null;
   /** The BLOCKED report's reason (blockReason) */
   blockedReason?: string;
+  /** How a PR reference is read in it (default prOfLine) */
+  prOf?: (text: string) => number | null;
   loadOk?: boolean | null;
   limitResetsAt?: string | null;
   /** The run's PR read at its head (readPr of `pr`), and the project's agents (holdOnPr) */
@@ -240,7 +313,8 @@ export function raiseFacts(input: {
     ...headFacts(input.pr, input.prView ?? null, input.agents ?? []),
   };
   if (input.code === "blocked_reported") {
-    const block = input.blockedReason !== undefined ? blockFacts(input.blockedReason) : { block_class: null, block_target: "unknown", blocked_on_pr: null };
+    const block =
+      input.blockedReason !== undefined ? blockFacts(input.blockedReason, input.prOf) : { block_class: null, block_target: "unknown", blocked_on_pr: null };
     Object.assign(facts, block, {
       blocker_cleared: blockerCleared(block.block_class, block.block_target, input.loadOk ?? null, input.blockedPrView ?? null),
     });

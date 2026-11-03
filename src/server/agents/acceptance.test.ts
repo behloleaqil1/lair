@@ -5988,6 +5988,9 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
           { review_at_head: "request_changes", hold_on_pr: "owner", next_move: null },
         ],
         ["an orchestrator's hold", view({ holds: [{ byOwner: false, by: "release-coordinator" }] }), { hold_on_pr: "orchestrator", next_move: "other" }],
+        // Not in the spec's table: a PR that is no longer open has no next move on it, whatever its reviews say
+        ["changes requested, but the PR is closed", view({ state: "closed", verdicts: ["request_changes"] }), { review_at_head: "request_changes", next_move: null }],
+        ["no gate, but the PR is merged", view({ state: "merged" }), { gate_at_head: "none", next_move: null }],
       ] as const) {
         it(`exit0NextMove (AT-2): a PR whose head has ${name}`, async () => {
           const h = setup(exit0Fill());
@@ -5997,10 +6000,10 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
           tasks(h, "worker-a|Alice|feat-login|Login form");
           const decision = await exit0(h, inbox, WAITS_ON_PR);
           expect(decision.evidence!.facts).toMatchObject({ task_state: "open", pr: 12, ...expected });
-          // Once for the raise and once by that check's re-read; a later check finds it raised and only re-reads
-          expect(reads).toEqual([12, 12]);
+          // One read in the check that raises it (the re-read shares the raise's), one per check after
+          expect(reads).toEqual([12]);
           await check(h);
-          expect(reads).toEqual([12, 12, 12]);
+          expect(reads).toEqual([12, 12]);
           expect(inbox.get(decision.id)).toMatchObject({ evidenceRev: 0 });
         });
       }
@@ -6037,8 +6040,21 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
         expect(now()).toMatchObject({ evidenceRev: 2, evidence: { facts: { hold_on_pr: "owner", next_move: null } } });
         // The host fails: every fact at the head is null (a hold may stand), not the last value
         views.set(12, new Error("502 from the git host"));
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
         await check(h);
         expect(now()).toMatchObject({ evidenceRev: 3, evidence: { facts: { review_at_head: null, gate_at_head: null, hold_on_pr: null, next_move: null } } });
+        // For a minute after, no PR is read (a host that fails costs one wait); then it is read again
+        views.set(12, view({ verdicts: ["approve"], gate: ["passed"] }));
+        h.clock.t += 30 * SEC;
+        await check(h);
+        expect(now()).toMatchObject({ evidenceRev: 3 });
+        h.clock.t += 31 * SEC;
+        await check(h);
+        expect(now()).toMatchObject({ evidenceRev: 4, evidence: { facts: { next_move: "other" } } });
+        expect(warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes("could not read PR"))).toEqual([
+          "[agents] demo: could not read PR #12 for a decision's facts (null for a minute): 502 from the git host",
+        ]);
+        warn.mockRestore();
         // Nothing answered it
         expect(now().answer).toBeUndefined();
       });
@@ -6046,27 +6062,34 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
       it("blockedFacts (AT-3, the PR case): a BLOCKED line naming another PR reads false while it is open, then true once it merged", async () => {
         const h = setup(fill({ agents: ["worker-a"] }));
         const { inbox } = await withInbox(h, { serverYaml: LIVE });
-        const views = new Map<number, View | Error>([[9, view()]]);
+        const views = new Map<number, View | Error>([
+          [12, view({ verdicts: ["approve"], gate: ["passed"] })],
+          [9, view()],
+        ]);
         const reads = prSource(h, views);
         prompts(h);
         tasks(h, "worker-a|Alice|feat-login|Login form");
-        await runEndingWith(h, "- BLOCKED feat-login by worker-a: waiting on PR #9 to merge");
+        // Its own PR is #12 (before the reason); what it waits on is #9
+        await runEndingWith(h, "- BLOCKED feat-login PR #12 by worker-a: waiting on PR #9 to merge");
         await check(h);
         const [decision] = gaveUp(inbox);
         expect(decision.evidence).toMatchObject({
           code: "blocked_reported",
-          facts: { pr: 9, block_class: "task", block_target: "pr", blocked_on_pr: 9, blocker_cleared: false },
+          facts: { pr: 12, next_move: "other", block_class: "task", block_target: "pr", blocked_on_pr: 9, blocker_cleared: false },
         });
         await check(h);
         expect(inbox.get(decision.id)).toMatchObject({ evidenceRev: 0, evidence: { facts: { blocker_cleared: false } } });
         views.set(9, view({ state: "merged" }));
         await check(h);
         expect(inbox.get(decision.id)).toMatchObject({ status: "open", evidenceRev: 1, evidence: { facts: { blocker_cleared: true } } });
-        // One read per PR per check (the raise's, then each check's re-read), though the run's PR and the PR it waits on are the same
-        expect(reads).toEqual([9, 9, 9, 9]);
+        // One read of each PR per check: the raise's read is the re-read's in the same check
+        expect(reads.filter((pr) => pr === 9)).toEqual([9, 9, 9]);
+        expect(reads.filter((pr) => pr === 12)).toEqual([12, 12, 12]);
         // A source that cannot read it: null, never cleared
         views.set(9, new Error("timeout"));
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
         await check(h);
+        warn.mockRestore();
         expect(inbox.get(decision.id)).toMatchObject({ evidenceRev: 2, evidence: { facts: { blocker_cleared: null } } });
       });
 

@@ -2,7 +2,7 @@
  * Evidence v3's pure readers (docs/design/decision-brain.md §4.1): what a report line names, what a BLOCKED line
  * waits on, the task's state in one check's lines, and a limit's reset. A fact that cannot be read is null.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { FillLineView } from "../../shared/agents-types.js";
 import {
   blockFacts,
@@ -13,7 +13,9 @@ import {
   holdOnPr,
   limitResetPassed,
   nextMove,
+  PR_FACTS_BACKOFF_MS,
   prOfLine,
+  PrReader,
   raiseFacts,
   readOrNull,
   readPr,
@@ -39,12 +41,15 @@ const line = (over: Partial<FillLineView>): FillLineView => ({
 });
 
 describe("evidence v3 readers", () => {
-  it("prOfLine: a PR reference, never a bare issue number", () => {
+  it("prOfLine: a PR reference of the project's repository, never a bare issue number, a plan step or a link", () => {
     expect(prOfLine("- WAITING feat-login gate-1 by worker-a: PR #42 waits for review")).toBe(42);
     expect(prOfLine("opened pull request #7")).toBe(7);
-    expect(prOfLine("see https://example.com/o/r/pull/913")).toBe(913);
-    expect(prOfLine("PR 12 is ready")).toBe(12);
+    expect(prOfLine("PR#8 [abcdef1]")).toBe(8);
+    // A link may be another repository's PR, and "PR 4" a step of a plan: read at a head, either would be the wrong PR
+    expect(prOfLine("see https://example.com/vendor/sdk/pull/913")).toBeNull();
+    expect(prOfLine("needs PR 4 of the plan")).toBeNull();
     expect(prOfLine("fixes #329")).toBeNull();
+    expect(prOfLine("PR #12abc")).toBeNull();
     expect(prOfLine("no reference")).toBeNull();
   });
 
@@ -148,10 +153,19 @@ describe("evidence v3 readers", () => {
   });
 
   it("LOAD_REFERENCE: only a phrase that means the machine's load; a load test or cpu profiling is not one", () => {
-    for (const reason of ["load per cpu is 2.3", "load average 9.1", "host load too high", "the load is too high", "load above the limit", "high load on the runner", "load > 4 on the host"]) {
+    for (const reason of ["load per cpu is 2.3", "load average 9.1", "host load too high", "the runner load is above the limit", "high system load on the box", "machine load was too high"]) {
       expect(blockFacts(reason).block_target, reason).toBe("host_load");
     }
-    for (const reason of ["the load test is over budget", "cpu profiling handed over to the owner", "a cpu-heavy step runs over the limit", "the page loads too slowly"]) {
+    for (const reason of [
+      "the load test is over budget",
+      "cpu profiling handed over to the owner",
+      "a cpu-heavy step runs over the limit",
+      "the page loads too slowly",
+      "the page load is above the 3 s budget",
+      "the high load test scenario fails",
+      "the load is too high for the fixture",
+      "load > 4 items per page",
+    ]) {
       expect(blockFacts(reason).block_target, reason).not.toBe("host_load");
     }
   });
@@ -197,7 +211,9 @@ describe("evidence v3 at a PR's head", () => {
 
   it("nextMove: the spec's order (null first: no PR, a failing gate, an owner's or an unread hold)", () => {
     const at = (review: "approve" | "request_changes" | "none" | null, gate: "pass" | "fail" | "queued" | "none" | null, hold: "owner" | "orchestrator" | "policy" | "agent" | "none" | null, pr: number | null = 12) =>
-      nextMove({ pr, review, gate, hold });
+      nextMove({ pr, state: "open", review, gate, hold });
+    // A merged, closed or unread PR has no next move on it
+    for (const state of ["merged", "closed", null] as const) expect(nextMove({ pr: 12, state, review: "request_changes", gate: "none", hold: "none" })).toBeNull();
     expect(at("request_changes", "none", "none", null)).toBeNull();
     expect(at("request_changes", "fail", "none")).toBeNull();
     expect(at("request_changes", "none", "owner")).toBeNull();
@@ -217,6 +233,48 @@ describe("evidence v3 at a PR's head", () => {
   it("headFacts: without a PR every fact is null, whatever was read", () => {
     expect(headFacts(null, view({ verdicts: ["approve"], gate: ["passed"] }), [])).toEqual({ review_at_head: null, gate_at_head: null, hold_on_pr: null, next_move: null });
     expect(headFacts(12, null, [])).toEqual({ review_at_head: null, gate_at_head: null, hold_on_pr: null, next_move: null });
+    // Closed over a request for changes: the facts are what was read, and no one moves next
+    expect(headFacts(12, view({ state: "closed", verdicts: ["request_changes"] }), [])).toEqual({ review_at_head: "request_changes", gate_at_head: "none", hold_on_pr: "none", next_move: null });
+  });
+
+  it("PrReader: bounded; after a failure or a timeout every read is null for a minute (one wait, not one per decision); one read per PR per batch", async () => {
+    let t = 0;
+    let calls = 0;
+    let answer: () => Promise<PrHeadView | null> = async () => view();
+    const reader = new PrReader("demo", () => ({ pr: () => (calls++, answer()) }), () => t, 20);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      expect(await reader.read(12)).toEqual(view());
+      answer = () => new Promise<PrHeadView>(() => undefined);
+      expect(await reader.read(12)).toBeNull();
+      expect(calls).toBe(2);
+      // Backing off: no read at all
+      answer = async () => view();
+      t += PR_FACTS_BACKOFF_MS - 1;
+      expect(await reader.read(13)).toBeNull();
+      expect(calls).toBe(2);
+      t += 1;
+      expect(await reader.read(13)).toEqual(view());
+      answer = () => Promise.reject(new Error("401 Bad credentials"));
+      expect(await reader.read(13)).toBeNull();
+      t += PR_FACTS_BACKOFF_MS;
+      expect(await reader.read(13)).toBeNull();
+      // Logged once per error, with the PR and never more than the error's first line
+      expect(warn.mock.calls.map((c) => c[0])).toEqual([
+        "[agents] demo: could not read PR #12 for a decision's facts (null for a minute): no answer within 20 ms",
+        "[agents] demo: could not read PR #13 for a decision's facts (null for a minute): 401 Bad credentials",
+      ]);
+    } finally {
+      warn.mockRestore();
+    }
+    t += PR_FACTS_BACKOFF_MS;
+    answer = async () => view();
+    const batch = reader.batch();
+    calls = 0;
+    await Promise.all([batch(12), batch(12), batch(null), batch(14)]);
+    expect(calls).toBe(2);
+    // No source wired: null, nothing read
+    expect(await new PrReader("demo", () => undefined, () => 0).read(12)).toBeNull();
   });
 
   it("blockerCleared for a PR: merged or closed is cleared, open is not, unread is null", () => {
