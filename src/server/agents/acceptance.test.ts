@@ -5786,9 +5786,11 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
       await check(h);
       expect(now()).toMatchObject({ evidenceRev: 0, factsAt: new Date(h.clock.t).toISOString(), evidence: { facts: { task_state: "open" } } });
 
-      // Gone for one check, then back: still open, no new revision
+      // Gone for one check, then back: still open, no new revision (the re-read is still stamped)
       tasks(h, "# feat-login is being rewritten");
+      h.clock.t += SEC;
       await check(h);
+      expect(now()).toMatchObject({ evidenceRev: 0, factsAt: new Date(h.clock.t).toISOString(), evidence: { facts: { task_state: "open" } } });
       tasks(h, "worker-a|Alice|feat-login|Login form");
       await check(h);
       expect(now()).toMatchObject({ evidenceRev: 0, evidence: { facts: { task_state: "open" } } });
@@ -5810,6 +5812,61 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
         "agents updated the evidence: task_state reassigned -> closed",
       ]);
       expect(now().answer).toBeUndefined();
+    });
+
+    it("a provider-limit escalation (agents.gave_up / provider_limit) carries its facts, null where nothing was read", async () => {
+      const h = setup(() => FALLBACK);
+      const { inbox } = await withInbox(h, { serverYaml: LIVE });
+      h.spawner.behaviour = (pid, log) => {
+        writeLog(h.clock, log, "Error: 429 Too Many Requests\n");
+        h.spawner.exit(pid, 1);
+      };
+      await request(h);
+      for (let i = 0; i < 6; i++) await at(h, 0);
+      await at(h, 30 * MIN);
+      for (let i = 0; i < 6; i++) await at(h, 30 * MIN);
+      const [decision] = gaveUp(inbox);
+      // No fill here (no tasks file read: task_state null); a 429 line names no reset time
+      expect(decision.evidence).toMatchObject({
+        code: "provider_limit",
+        facts: { task: "feat-login", task_state: null, pr: null, fresh_sessions: 0, limit_resets_at: null, limit_reset_passed: null },
+      });
+    });
+
+    it("limitResetPassed, live: fill's re-read turns a provider limit's reset true once its time passes (AT-1's provider_limit task)", async () => {
+      // fill never starts worker-a here (not allowlisted): the line only says the task is open
+      const h = setup(fill({ agents: ["worker-b"] }));
+      const { inbox } = await withInbox(h, { serverYaml: LIVE });
+      prompts(h);
+      tasks(h, "worker-a|Alice|feat-login|Login form");
+      const resets = new Date(NOW + 10 * MIN).toISOString();
+      // As the agents module raises it (service.ts escalate, provider_limit), with the v3 facts
+      const { decision } = await inbox.raise({
+        project: "demo",
+        kind: "escalation",
+        title: "worker-a is paused on feat-login: it failed 4 time(s), and Lair's automatic restarts are used up",
+        context: "Why it stopped: 4 provider errors or rate limits in a row",
+        options: [
+          { id: "fresh_session", label: "Start it again", consequences: "Starts it again.", effect: "reversible" },
+          { id: "release", label: "Leave the task unclaimed", consequences: "Frees it.", effect: "frees_task" },
+        ],
+        recommended: { optionId: "release", reasoning: "Every automatic recovery was used." },
+        source: { module: "agents", ref: "chain:c1" },
+        key: "escalation:c1:4",
+        blocks: ["agents:demo:task:feat-login"],
+        class: "agents.gave_up",
+        evidence: {
+          code: "provider_limit",
+          facts: { agent: "worker-a", task: "feat-login", attempt_count: 4, last_exit: 1, task_state: "open", pr: null, fresh_sessions: 0, limit_resets_at: resets, limit_reset_passed: false },
+          cause_cleared: false,
+          linked_issue: null,
+        },
+      });
+      await check(h);
+      expect(inbox.get(decision.id)).toMatchObject({ evidenceRev: 0, evidence: { facts: { task_state: "open", limit_reset_passed: false } } });
+      h.clock.t = NOW + 11 * MIN;
+      await check(h);
+      expect(inbox.get(decision.id)).toMatchObject({ status: "open", evidenceRev: 1, evidence: { facts: { task_state: "open", limit_reset_passed: true } } });
     });
 
     it("with live_facts off, the facts stay as raised", async () => {

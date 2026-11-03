@@ -71,7 +71,7 @@ import { lstat, open, opendir, realpath, type FileHandle } from "fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { Decision, DecisionFactValue } from "../../shared/decision-types.js";
-import { blockerCleared, limitResetPassed, prOfLine, raiseFacts, taskStateOf, type TaskState } from "./brain-facts.js";
+import { blockReason, blockerCleared, limitResetPassed, prOfLine, raiseFacts, readOrNull, taskStateOf, type TaskState } from "./brain-facts.js";
 import type {
   AgentEventKind,
   AgentRunView,
@@ -1208,6 +1208,8 @@ export class AgentsFill {
   private lineGone = new Map<string, number>();
   /** The live facts' own count of the same (decision id -> checks): task_state reads closed only at LINE_GONE_CHECKS */
   private factsLineGone = new Map<string, number>();
+  /** The last re-read error logged per decision (decision id -> error) */
+  private factsWarned = new Map<string, string>();
   /** When fill last saw a waiting run's gate in the gate queue (task|run -> time); the store keeps the first and last sightings */
   private lastQueued = new Map<string, number>();
   /** The unmatched reports of the lines' last runs at the last complete check (rebuilt from the queue each check) */
@@ -2480,39 +2482,57 @@ export class AgentsFill {
     const refresh = this.options.brainFacts?.()?.refresh ?? null;
     if (!refresh) {
       this.factsLineGone.clear();
+      this.factsWarned.clear();
       return;
     }
     const gone = new Map<string, number>();
+    const warned = new Map<string, string>();
     const now = this.options.probes.clock.now();
     for (const decision of this.options.openDecisions()) {
       const evidence = decision.evidence;
       if (decision.class !== "agents.gave_up" || !evidence || typeof evidence.facts.task !== "string") continue;
       const agent = typeof evidence.facts.agent === "string" ? evidence.facts.agent : null;
-      let state = taskStateOf(views, evidence.facts.task, agent);
+      let state: DecisionFactValue | undefined = taskStateOf(views, evidence.facts.task, agent);
       if (state === undefined) {
         const checks = (this.factsLineGone.get(decision.id) ?? 0) + 1;
         gone.set(decision.id, checks);
-        if (checks >= LINE_GONE_CHECKS) state = "closed";
+        // Fewer checks: the last value stands (sent again, so the re-read is still stamped)
+        state = checks >= LINE_GONE_CHECKS ? "closed" : (evidence.facts.task_state ?? null);
       }
-      const facts: Record<string, DecisionFactValue> = state === undefined ? {} : { task_state: state };
+      const facts: Record<string, DecisionFactValue> = { task_state: state };
       if (evidence.code === "blocked_reported") {
         facts.blocker_cleared = blockerCleared(evidence.facts.block_class, evidence.facts.block_target, this.loadOk());
       }
       if (evidence.code === "provider_limit") facts.limit_reset_passed = limitResetPassed(evidence.facts.limit_resets_at, now);
-      if (Object.keys(facts).length === 0) continue;
       try {
         await refresh(decision.id, facts);
+        this.factsWarned.delete(decision.id);
       } catch (e) {
-        console.warn(`[agents] ${this.options.project}: could not re-read the facts of decision ${decision.id}: ${message(e)}`);
+        // Once per decision and error, not at every check (a decision closed meanwhile fails the same way each time)
+        const error = message(e);
+        if (this.factsWarned.get(decision.id) !== error) {
+          console.warn(`[agents] ${this.options.project}: could not re-read the facts of decision ${decision.id}: ${error}`);
+        }
+        warned.set(decision.id, error);
       }
     }
     this.factsLineGone = gone;
+    this.factsWarned = warned;
+  }
+
+  /** The bus report a run's last line was read from (bus.consume on), if it is still stored. */
+  private storedReport(report: RunStatus): StructuredReport | undefined {
+    return report.busId !== null ? this.options.bus?.()?.reports([report.busId]).get(report.busId) : undefined;
   }
 
   /** The PR a run's last report names: the bus report's own field, else the line's text. */
   private reportPr(report: RunStatus): number | null {
-    const stored = report.busId !== null ? this.options.bus?.()?.reports([report.busId]).get(report.busId) : undefined;
-    return stored?.pr ?? prOfLine(report.line);
+    return this.storedReport(report)?.pr ?? prOfLine(report.line);
+  }
+
+  /** A BLOCKED report's reason: the bus report's summary, else the line after its first ": " (the planner's reading). */
+  private blockedReason(report: RunStatus): string {
+    return blockReason(report.line, this.storedReport(report)?.summary);
   }
 
   /** Whether the machine's load per CPU is below fill's start limit now; null without a limit or a reading. */
@@ -2597,9 +2617,9 @@ export class AgentsFill {
                 ? raiseFacts({
                     code: ask.code,
                     taskState: "open",
-                    pr: ask.report ? this.reportPr(ask.report) : null,
-                    freshSessions: this.options.store.freshSessionsForTask(this.options.project, task),
-                    blockedLine: ask.report?.kind === "blocked" ? ask.report.line : undefined,
+                    pr: ask.report ? readOrNull(() => this.reportPr(ask.report!)) : null,
+                    freshSessions: readOrNull(() => this.options.store.freshSessionsForTask(this.options.project, task)),
+                    blockedReason: ask.report?.kind === "blocked" ? (readOrNull(() => this.blockedReason(ask.report!)) ?? undefined) : undefined,
                     loadOk: this.loadOk(),
                     now: this.options.probes.clock.now(),
                   })

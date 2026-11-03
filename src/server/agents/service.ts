@@ -61,7 +61,7 @@ import type {
   StopReason,
 } from "../../shared/agents-types.js";
 import type { Decision, DecisionFactValue } from "../../shared/decision-types.js";
-import { raiseFacts } from "./brain-facts.js";
+import { raiseFacts, readOrNull } from "./brain-facts.js";
 import type { DecisionProducer, DecisionResolution } from "../decisions/types.js";
 import type { SignInRefusal, ToolReadiness } from "../ai/types.js";
 import { buildStartCommand, getAdapter } from "../services/adapters.js";
@@ -2443,9 +2443,10 @@ export class AgentsService {
     if (!this.decisions().brainFacts) return {};
     return raiseFacts({
       code,
-      taskState: this.fill?.taskState(run.task, run.agent) ?? null,
+      taskState: readOrNull(() => this.fill?.taskState(run.task, run.agent) ?? null),
+      // A run that died left no report line here; the PR at the head is read by PR 1b
       pr: null,
-      freshSessions: this.store.freshSessionsForTask(this.project, run.task),
+      freshSessions: readOrNull(() => this.store.freshSessionsForTask(this.project, run.task)),
       limitResetsAt,
       now,
     });

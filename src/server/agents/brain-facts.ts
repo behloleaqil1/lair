@@ -27,8 +27,8 @@ const BLOCK_PATTERNS = {
 
 /** A PR reference: "PR 12", "PR #12", "pull request #12" or ".../pull/12". A bare "#12" may be an issue: not one. */
 const PR_REFERENCE = /\b(?:PR|pull request)\s*#?(\d{1,7})\b|\/pull\/(\d{1,7})\b/i;
-/** A reference to the machine's load */
-const LOAD_REFERENCE = /\b(?:load(?: average)?|cpu)\b/i;
+/** The machine's load named as the obstacle (the planner's load patterns, and "load average"), not any "load" word */
+const LOAD_REFERENCE = /\b(?:load|cpu)\b.{0,20}\b(?:above|over|too high|high)\b|\bload\s*[<>]|\bload average\b/i;
 
 /** The PR a report line names, or null. */
 export function prOfLine(line: string): number | null {
@@ -38,11 +38,13 @@ export function prOfLine(line: string): number | null {
 }
 
 /**
- * What a BLOCKED line waits on: the planner's class (owner, environment or task) first, then a fixed list (a PR
- * reference, a load reference). Anything else is `unknown`, never a guess.
+ * What a BLOCKED report waits on: the planner's class (owner, environment or task) first, then a fixed list (a PR
+ * reference, a load reference). Only the reason is read, as the planner reads it: a bus report's summary, or what a
+ * hand-written line says after its first ": " (never the task id or the agent's name). Anything else is
+ * `unknown`, never a guess.
  */
-export function blockFacts(line: string): { block_class: string; block_target: BlockTarget; blocked_on_pr: number | null } {
-  const text = line.slice(0, MAX_TEXT);
+export function blockFacts(reason: string): { block_class: string; block_target: BlockTarget; blocked_on_pr: number | null } {
+  const text = reason.slice(0, MAX_TEXT);
   const blockClass = classifyBlocked(text, BLOCK_PATTERNS).class;
   const pr = prOfLine(text);
   const target: BlockTarget =
@@ -73,6 +75,23 @@ export function taskStateOf(lines: readonly FillLineView[], task: string, agent:
   return own.some((l) => l.state === "done") ? "closed" : "open";
 }
 
+/** A BLOCKED report's reason, as the planner reads it: the bus report's summary, else the line after its first ": ". */
+export function blockReason(line: string, summary: string | undefined): string {
+  if (summary !== undefined) return summary;
+  // planner/sources.ts reasonOf: what follows the first ": " (the whole line without one)
+  const i = line.indexOf(": ");
+  return i >= 0 ? line.slice(i + 2) : line;
+}
+
+/** A fact reader that fails is a fact that cannot be read: null, never a decision that is not raised. */
+export function readOrNull<T>(read: () => T): T | null {
+  try {
+    return read();
+  } catch {
+    return null;
+  }
+}
+
 /** A provider limit's reset passed: true or false from the `limit_resets_at` fact, null without one. */
 export function limitResetPassed(resetsAt: unknown, now: number): boolean | null {
   const at = typeof resetsAt === "string" ? Date.parse(resetsAt) : NaN;
@@ -84,15 +103,16 @@ export function raiseFacts(input: {
   code: string;
   taskState: TaskState | null;
   pr: number | null;
-  freshSessions: number;
-  blockedLine?: string;
+  freshSessions: number | null;
+  /** The BLOCKED report's reason (blockReason) */
+  blockedReason?: string;
   loadOk?: boolean | null;
   limitResetsAt?: string | null;
   now: number;
 }): Record<string, DecisionFactValue> {
   const facts: Record<string, DecisionFactValue> = { task_state: input.taskState, pr: input.pr, fresh_sessions: input.freshSessions };
   if (input.code === "blocked_reported") {
-    const block = input.blockedLine !== undefined ? blockFacts(input.blockedLine) : { block_class: null, block_target: "unknown", blocked_on_pr: null };
+    const block = input.blockedReason !== undefined ? blockFacts(input.blockedReason) : { block_class: null, block_target: "unknown", blocked_on_pr: null };
     Object.assign(facts, block, { blocker_cleared: blockerCleared(block.block_class, block.block_target, input.loadOk ?? null) });
   }
   if (input.code === "provider_limit") {

@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 import type { FillLineView } from "../../shared/agents-types.js";
-import { blockFacts, blockerCleared, limitResetPassed, prOfLine, raiseFacts, taskStateOf } from "./brain-facts.js";
+import { blockFacts, blockReason, blockerCleared, limitResetPassed, prOfLine, raiseFacts, readOrNull, taskStateOf } from "./brain-facts.js";
 
 const line = (over: Partial<FillLineView>): FillLineView => ({
   line: 1,
@@ -38,6 +38,34 @@ describe("evidence v3 readers", () => {
     expect(blockFacts("host load too high to run the suite")).toEqual({ block_class: "environment", block_target: "host_load", blocked_on_pr: null });
     expect(blockFacts("docker daemon is not running")).toEqual({ block_class: "environment", block_target: "environment", blocked_on_pr: null });
     expect(blockFacts("something odd happened")).toEqual({ block_class: "task", block_target: "unknown", blocked_on_pr: null });
+    // "load" as a verb is not the machine's load
+    expect(blockFacts("the fixtures fail to load, waiting on design")).toEqual({ block_class: "task", block_target: "unknown", blocked_on_pr: null });
+    expect(blockFacts("load average 9.1 on the runner")).toMatchObject({ block_target: "host_load" });
+  });
+
+  it("blockReason: only the reason is read, never the task id or the agent's name", () => {
+    // A task id that holds 'load' or 'account' changes nothing
+    expect(blockFacts(blockReason("- BLOCKED load-test-suite by worker-a 12:01Z: something odd happened", undefined))).toEqual({
+      block_class: "task",
+      block_target: "unknown",
+      blocked_on_pr: null,
+    });
+    expect(blockFacts(blockReason("- BLOCKED account-settings by worker-a: waiting on PR #12", undefined))).toEqual({
+      block_class: "task",
+      block_target: "pr",
+      blocked_on_pr: 12,
+    });
+    // A bus report's summary is its reason
+    expect(blockReason("- BLOCKED feat-login by worker-a: mirrored text", "needs the owner")).toBe("needs the owner");
+  });
+
+  it("readOrNull: a reader that throws is a fact that cannot be read", () => {
+    expect(readOrNull(() => 3)).toBe(3);
+    expect(
+      readOrNull(() => {
+        throw new Error("SQLITE_BUSY");
+      }),
+    ).toBeNull();
   });
 
   it("blockerCleared: only a load block reads cleared here; owner, unknown, PR and environment are null", () => {
@@ -82,7 +110,7 @@ describe("evidence v3 readers", () => {
       limit_resets_at: "2026-03-02T11:00:00.000Z",
       limit_reset_passed: true,
     });
-    expect(raiseFacts({ code: "blocked_reported", taskState: "open", pr: 12, freshSessions: 0, blockedLine: "waiting on PR #12", loadOk: true, now })).toEqual({
+    expect(raiseFacts({ code: "blocked_reported", taskState: "open", pr: 12, freshSessions: 0, blockedReason: "waiting on PR #12", loadOk: true, now })).toEqual({
       task_state: "open",
       pr: 12,
       fresh_sessions: 0,
