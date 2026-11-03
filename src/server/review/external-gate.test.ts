@@ -412,6 +412,24 @@ describe("review.merge.external_gate", () => {
     expect(row.reasons.join("\n")).toMatch(/^Tier: .* is not in external_gate\.tiers \(green\)/m);
   });
 
+  it("externalGate_act_tiers: act merges only the tiers in tiers; the owner may still merge another tier", async () => {
+    const amber = boot(repo([ROUTE]), { mode: "act", tiers: ["green"] });
+    amber.service.addGateResult(signed(amber.head, "backend"));
+    const status = await amber.service.status(3);
+    expect(status.risk.tier).toBe("amber");
+    expect(status.canMerge).toBe(true);
+    expect(status.autoMergeStatus).toBe("manual");
+    await amber.scan();
+    expect(amber.remote.branches.get("main")).toBe(amber.base);
+
+    const green = boot(repo([README]), { mode: "act", tiers: ["green"] });
+    green.service.addGateResult(signed(green.head, "docs"));
+    expect((await green.service.status(3)).autoMergeStatus).toBe("auto");
+    await green.scan();
+    expect(green.remote.branches.get("main")).toBe(green.head);
+    expect(green.service.listMerges()).toEqual([expect.objectContaining({ pr: 3, initiatedBy: "lair:policy" })]);
+  });
+
   it("externalGate_config: off by default; checks source, act with merge.auto, an empty need and an unknown pipeline are config errors", () => {
     const parse = (merge: Record<string, unknown>, review: Record<string, unknown> = {}) =>
       parseReviewConfig({ enabled: true, merge: { gate: GATE, ...merge }, ...review }, { github: REPO });

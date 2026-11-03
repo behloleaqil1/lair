@@ -11,6 +11,7 @@ import type { ProjectConfig } from "../../shared/types.js";
 import type {
   ClientInfo,
   FindingSeverity,
+  MergeCondition,
   MergeRefusal,
   MergeResponse,
   ExternalGateVerdict,
@@ -31,7 +32,7 @@ import type { DecisionEvidence } from "../../shared/decision-types.js";
 import type { EventBus } from "../core/event-bus.js";
 import { assessRisk } from "../policy/risk-rules.js";
 import { matchSlots, withSlotWaits } from "../policy/reviewer-slots.js";
-import { evaluateMergePolicy, type MergePolicyInput } from "../policy/merge-policy.js";
+import { evaluateMergePolicy, holdsCondition, type MergePolicyResult } from "../policy/merge-policy.js";
 import { parseReviewConfig, type ReviewSettings } from "./config.js";
 import { mapAuthor } from "./authors.js";
 import { AGENTS_CHANNEL, AgentReviewAssigner, CHECK_INTERVAL_MS } from "./agent-assigner.js";
@@ -166,6 +167,9 @@ export function mergeFailedEvidence(pr: number, headSha: string, refusedBy: stri
     linked_issue: null,
   };
 }
+
+/** The default branch's state when its hold does not apply */
+const NOT_RED = { red: false, hold: null };
 
 /** Whether the scan runs the project's merge sweep: merge.auto, or review.merge.external_gate observe or act. */
 function sweeps(service: ReviewService): boolean {
@@ -666,13 +670,9 @@ export class ReviewService {
       behindBy = null;
     }
     const holds = this.o.store.activeHolds(this.project, n);
-    const ext = this.settings.merge.externalGate;
-    // R1 (docs/design/merge-external-gate.md): the hosted CI is not the signal, so in act a red default branch holds nothing
-    const exempt = ext.mode !== "off" && ext.defaultRedExempt;
-    const red =
-      ext.mode === "act" && exempt ? { red: false, hold: null } : await this.defaultBranchRed(pr, defaultBranch, baseTip);
+    const red = this.ignoresDefaultRed() ? NOT_RED : await this.defaultBranchRed(pr, defaultBranch, baseTip);
 
-    const policyInput: MergePolicyInput = {
+    const policy = evaluateMergePolicy({
       pr: {
         state: pr.state,
         draft: pr.draft,
@@ -689,39 +689,20 @@ export class ReviewService {
       openBlocking,
       holds,
       defaultBranchRed: red.hold,
-    };
+    });
+
     const plan = planMerge(this.settings.merge);
-    let policy = evaluateMergePolicy(policyInput);
-    let externalGate: ExternalGateVerdict | null = null;
-    if (ext.mode !== "off") {
-      const g = this.settings.merge.gate;
-      // R2: any trusted pass at the head may meet a rule (a gate source other than signed is a config error: nothing trusted)
-      const rules = gateRulesCondition(
-        ext.gateRules,
-        files.map((f) => ({ path: f.path, patch: f.patch })),
-        this.o.store.gateResults(this.project, pr.headSha),
-        pr.headSha,
-        g.source === "signed"
-          ? { project: this.project, nodeKeys: g.nodeKeys, pipelineVersions: g.pipelineVersions }
-          : { project: this.project, nodeKeys: {}, pipelineVersions: {} },
-      );
-      const base = exempt ? evaluateMergePolicy({ ...policyInput, defaultBranchRed: null }) : policy;
-      const conditions = [...base.conditions, rules];
-      const failed = conditions.filter((c) => !c.ok).map((c) => `${c.label}: ${c.detail}`);
-      const held = exempt ? null : this.autoMergeHeld(red.red, redSlots);
-      const tiers = ext.tiers;
-      const extReasons = [
-        ...failed,
-        ...(plan.refusal ? [`Merge method: ${plan.refusal}`] : []),
-        ...(this.readOnly ? ["Read-only: the project sets read_only: true, so Lair does not merge"] : []),
-        ...(tiers && !tiers.includes(risk.tier) ? [`Tier: ${risk.tier} is not in external_gate.tiers (${tiers.join(", ")})`] : []),
-        ...(held ? [`Automatic merge: ${held}`] : []),
-      ];
-      externalGate = { mode: ext.mode, wouldMerge: extReasons.length === 0, reasons: extReasons, defaultRedExempt: exempt };
-      // In act the rules are the policy of every merge path; observe changes nothing
-      if (ext.mode === "act") policy = { allowed: failed.length === 0, conditions, reasons: failed };
-    }
-    const reasons = [...policy.reasons];
+    const external = this.externalVerdict({
+      policy,
+      holds,
+      red,
+      redSlots,
+      files,
+      tier: risk.tier,
+      headSha: pr.headSha,
+      planRefusal: plan.refusal,
+    });
+    const reasons = [...(external?.actPolicy ?? policy).reasons];
     if (plan.refusal) reasons.push(`Merge method: ${plan.refusal}`);
     if (this.readOnly) reasons.push("Read-only: the project sets read_only: true, so Lair does not merge");
     const status: PrReviewStatus = {
@@ -747,12 +728,12 @@ export class ReviewService {
       findings,
       gate,
       holds,
-      conditions: policy.conditions,
+      conditions: (external?.actPolicy ?? policy).conditions,
       hostUser: pr.user,
-      canMerge: policy.allowed && !plan.refusal && !this.readOnly,
+      canMerge: (external?.actPolicy ?? policy).allowed && !plan.refusal && !this.readOnly,
       reasons,
       autoMergeStatus: this.autoMergeStatusFor(risk.tier),
-      externalGate,
+      externalGate: external?.verdict ?? null,
       plan,
       readOnly: this.readOnly,
       evaluatedAt: this.now(),
@@ -765,6 +746,66 @@ export class ReviewService {
       evaluatedAt: status.evaluatedAt,
     });
     return { status, defaultBranchRed: red.red, redSlots };
+  }
+
+  /**
+   * R1 (docs/design/merge-external-gate.md): in external_gate act, a repository
+   * whose hosted CI is not its signal has no default-branch hold.
+   */
+  private ignoresDefaultRed(): boolean {
+    const ext = this.settings.merge.externalGate;
+    return ext.mode === "act" && ext.defaultRedExempt;
+  }
+
+  /**
+   * review.merge.external_gate's verdict at the head (null while it is off):
+   * the policy without the default-branch hold when the repository is exempt
+   * (R1), plus the gate rules (R2), the tiers and what keeps any merge from
+   * running. In act its policy (actPolicy) is the policy of every merge path;
+   * in observe it is only recorded.
+   */
+  private externalVerdict(input: {
+    policy: MergePolicyResult;
+    holds: MergeHold[];
+    red: { red: boolean; hold: string | null };
+    redSlots: SlotStatus[];
+    files: HostFile[];
+    tier: Tier;
+    headSha: string;
+    planRefusal: string | null;
+  }): { verdict: ExternalGateVerdict; actPolicy: MergePolicyResult | null } | null {
+    const ext = this.settings.merge.externalGate;
+    if (ext.mode === "off") return null;
+    const g = this.settings.merge.gate;
+    // Any trusted pass at the head may meet a rule; a gate source other than signed is a config error (nothing trusted)
+    const rules = gateRulesCondition(
+      ext.gateRules,
+      input.files.map((f) => ({ path: f.path, patch: f.patch })),
+      this.o.store.gateResults(this.project, input.headSha),
+      input.headSha,
+      g.source === "signed"
+        ? { project: this.project, nodeKeys: g.nodeKeys, pipelineVersions: g.pipelineVersions }
+        : { project: this.project, nodeKeys: {}, pipelineVersions: {} },
+    );
+    const exempt = ext.defaultRedExempt;
+    // In act the hold was never read (ignoresDefaultRed); observe shows the policy as act would have it
+    const unheld = (c: MergeCondition) =>
+      ext.mode === "observe" && exempt && c.id === "holds" ? holdsCondition(input.holds, null) : c;
+    const conditions = [...input.policy.conditions.map(unheld), rules];
+    const failed = conditions.filter((c) => !c.ok).map((c) => `${c.label}: ${c.detail}`);
+    const held = exempt ? null : this.autoMergeHeld(input.red.red, input.redSlots);
+    const tiers = ext.tiers;
+    const reasons = [
+      ...failed,
+      ...(input.planRefusal ? [`Merge method: ${input.planRefusal}`] : []),
+      ...(this.readOnly ? ["Read-only: the project sets read_only: true, so Lair does not merge"] : []),
+      ...(tiers && !tiers.includes(input.tier) ? [`Tier: ${input.tier} is not in external_gate.tiers (${tiers.join(", ")})`] : []),
+      ...(held ? [`Automatic merge: ${held}`] : []),
+    ];
+    return {
+      verdict: { mode: ext.mode, wouldMerge: reasons.length === 0, reasons, defaultRedExempt: exempt },
+      actPolicy: ext.mode === "act" ? { allowed: failed.length === 0, conditions, reasons: failed } : null,
+    };
   }
 
   /** Open PRs, with the verdict of their last evaluation at the current head. */

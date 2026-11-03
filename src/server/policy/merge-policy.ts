@@ -185,13 +185,7 @@ export function evaluateMergePolicy(input: MergePolicyInput): MergePolicyResult 
           },
   );
 
-  const holdReasons = input.holds.map((h) => `${h.reason} (hold ${h.id} by ${h.createdBy})`);
-  if (input.defaultBranchRed) holdReasons.unshift(input.defaultBranchRed);
-  conditions.push(
-    holdReasons.length > 0
-      ? { id: "holds", ok: false, label: "No hold", detail: holdReasons.join("; ") }
-      : { id: "holds", ok: true, label: "No hold", detail: "no hold applies" },
-  );
+  conditions.push(holdsCondition(input.holds, input.defaultBranchRed));
 
   const failed = conditions.filter((c) => !c.ok);
   return {
@@ -199,4 +193,13 @@ export function evaluateMergePolicy(input: MergePolicyInput): MergePolicyResult 
     conditions,
     reasons: failed.map((c) => `${c.label}: ${c.detail}`),
   };
+}
+
+/** The `holds` condition: every active hold, and the default branch's red state when it holds the PR. */
+export function holdsCondition(holds: MergeHold[], defaultBranchRed: string | null): MergeCondition {
+  const holdReasons = holds.map((h) => `${h.reason} (hold ${h.id} by ${h.createdBy})`);
+  if (defaultBranchRed) holdReasons.unshift(defaultBranchRed);
+  return holdReasons.length > 0
+    ? { id: "holds", ok: false, label: "No hold", detail: holdReasons.join("; ") }
+    : { id: "holds", ok: true, label: "No hold", detail: "no hold applies" };
 }
