@@ -5768,7 +5768,7 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
       return decision;
     }
 
-    it("gaveUpCarriesTaskState (AT-1): open, kept through a one-check gap, reassigned, closed only at the LINE_GONE_CHECKS-th check", async () => {
+    it("gaveUpCarriesTaskState (AT-1, the live re-read): open, kept through a one-check gap, reassigned, closed only at the LINE_GONE_CHECKS-th check of a line gone", async () => {
       const h = setup(fill({ agents: ["worker-a"] }));
       const { inbox } = await withInbox(h, { serverYaml: LIVE });
       prompts(h);
@@ -5919,6 +5919,189 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
       h.systemInfo.load = 2.0; // 0.5 per CPU
       await check(h);
       expect(inbox.get(decision.id)).toMatchObject({ status: "open", evidenceRev: 1, evidence: { facts: { blocker_cleared: true } } });
+    });
+
+    it("gaveUpCarriesTaskState (AT-1, at the raise): a task marked done reads closed, and fill's next check withdraws the decision (a done line is never re-read)", async () => {
+      // The line is done before any run: fill never starts it, and its done line says the task is closed
+      const h = setup(fill({ agents: ["worker-a"] }));
+      const { inbox } = await withInbox(h, { serverYaml: LIVE });
+      prompts(h);
+      tasks(h, "worker-a|Alice|feat-login|Login form");
+      appendFileSync(h.queueFile, "- DONE feat-login by worker-a 11:59Z: merged\n");
+      await check(h);
+      // A run asked for by hand dies until the agents module escalates it
+      h.spawner.behaviour = (pid) => h.spawner.exit(pid, 1);
+      await request(h);
+      for (const ms of [0, 0, 10 * SEC, 10 * SEC, 30 * SEC, 30 * SEC, 70 * SEC, 70 * SEC]) await at(h, ms);
+      const [decision] = gaveUp(inbox);
+      expect(decision).toMatchObject({ key: expect.stringMatching(/^escalation:/), evidence: { facts: { task_state: "closed" } } });
+      await check(h);
+      expect(inbox.get(decision.id)).toMatchObject({ status: "withdrawn", evidenceRev: 0 });
+    });
+
+    describe("the facts read at a PR's head (PR 1b): the review module's PR read is the one faked boundary", () => {
+      const HEAD = "abcdef1234567890abcdef1234567890abcdef12";
+      type View = import("./brain-facts.js").PrHeadView;
+      const view = (over: Partial<View> = {}): View => ({ state: "open", headSha: HEAD, verdicts: [], gate: ["missing"], holds: [], ...over });
+      /** The review module's PR read (ReviewManager.brainPrFacts), as the server wires it: one view per PR, null when unknown */
+      function prSource(h: Harness, views: Map<number, View | Error>) {
+        const reads: number[] = [];
+        h.manager.usePrFacts({
+          pr: async (project, pr) => {
+            reads.push(pr);
+            expect(project).toBe("demo");
+            const found = views.get(pr);
+            if (found instanceof Error) throw found;
+            return found ?? null;
+          },
+        });
+        return reads;
+      }
+
+      /** Three WAITING runs that wait on nothing: held for no progress with one exit0_no_report decision (fill.ts holdNoDone) */
+      async function exit0(h: Harness, inbox: Awaited<ReturnType<typeof withInbox>>["inbox"], waiting: string) {
+        endsWith(h, { 1: waiting, 2: waiting, 3: waiting });
+        await runAt(h, 0);
+        await check(h);
+        await runAt(h, 2);
+        await check(h);
+        await runAt(h, 5);
+        expect(lineOf(await check(h), "feat-login")).toMatchObject({ state: "held", hold: "no_done" });
+        const [decision, ...more] = gaveUp(inbox);
+        expect(more).toEqual([]);
+        expect(decision.evidence!.code).toBe("exit0_no_report");
+        return decision;
+      }
+      const WAITS_ON_PR = "- WAITING feat-login by worker-a: PR #12 waits for its review";
+      const exit0Fill = () => fill({ agents: ["worker-a"], max_completions_without_done: 3, backoff_seconds: 60, wake: { fallback_seconds: 60 } });
+
+      for (const [name, at, expected] of [
+        ["an approve review and a passing gate", view({ verdicts: ["approve"], gate: ["passed"] }), { review_at_head: "approve", gate_at_head: "pass", hold_on_pr: "none", next_move: "other" }],
+        ["a queued gate", view({ gate: ["pending"] }), { review_at_head: "none", gate_at_head: "queued", hold_on_pr: "none", next_move: "other" }],
+        ["changes requested", view({ verdicts: ["request_changes"], gate: ["passed"] }), { review_at_head: "request_changes", gate_at_head: "pass", hold_on_pr: "none", next_move: "agent" }],
+        ["no gate", view(), { review_at_head: "none", gate_at_head: "none", hold_on_pr: "none", next_move: "agent" }],
+        ["a failing gate with no hold", view({ gate: ["failed"] }), { review_at_head: "none", gate_at_head: "fail", hold_on_pr: "none", next_move: null }],
+        ["changes requested and a failing gate", view({ verdicts: ["request_changes"], gate: ["failed"] }), { review_at_head: "request_changes", gate_at_head: "fail", next_move: null }],
+        [
+          "changes requested and an owner's hold",
+          view({ verdicts: ["request_changes"], holds: [{ byOwner: true, by: "me" }] }),
+          { review_at_head: "request_changes", hold_on_pr: "owner", next_move: null },
+        ],
+        ["an orchestrator's hold", view({ holds: [{ byOwner: false, by: "release-coordinator" }] }), { hold_on_pr: "orchestrator", next_move: "other" }],
+      ] as const) {
+        it(`exit0NextMove (AT-2): a PR whose head has ${name}`, async () => {
+          const h = setup(exit0Fill());
+          const { inbox } = await withInbox(h, { serverYaml: LIVE });
+          const reads = prSource(h, new Map([[12, at]]));
+          prompts(h);
+          tasks(h, "worker-a|Alice|feat-login|Login form");
+          const decision = await exit0(h, inbox, WAITS_ON_PR);
+          expect(decision.evidence!.facts).toMatchObject({ task_state: "open", pr: 12, ...expected });
+          // Once for the raise and once by that check's re-read; a later check finds it raised and only re-reads
+          expect(reads).toEqual([12, 12]);
+          await check(h);
+          expect(reads).toEqual([12, 12, 12]);
+          expect(inbox.get(decision.id)).toMatchObject({ evidenceRev: 0 });
+        });
+      }
+
+      it("exit0NextMove (AT-2): no PR named: every fact at a head is null and no PR is read", async () => {
+        const h = setup(exit0Fill());
+        const { inbox } = await withInbox(h, { serverYaml: LIVE });
+        const reads = prSource(h, new Map([[12, view({ verdicts: ["approve"], gate: ["passed"] })]]));
+        prompts(h);
+        tasks(h, "worker-a|Alice|feat-login|Login form");
+        const decision = await exit0(h, inbox, "- WAITING feat-login by worker-a: waiting on a review");
+        expect(decision.evidence!.facts).toMatchObject({ pr: null, review_at_head: null, gate_at_head: null, hold_on_pr: null, next_move: null });
+        await check(h);
+        expect(reads).toEqual([]);
+      });
+
+      it("exit0NextMove (AT-2), live: the re-read moves next_move with its inputs; a source that fails or is gone reads null, never a guess", async () => {
+        const h = setup(exit0Fill());
+        const { inbox } = await withInbox(h, { serverYaml: LIVE });
+        const views = new Map<number, View | Error>([[12, view({ verdicts: ["request_changes"] })]]);
+        prSource(h, views);
+        prompts(h);
+        tasks(h, "worker-a|Alice|feat-login|Login form");
+        const decision = await exit0(h, inbox, WAITS_ON_PR);
+        expect(decision.evidence!.facts).toMatchObject({ review_at_head: "request_changes", gate_at_head: "none", next_move: "agent" });
+        const now = () => inbox.get(decision.id)!;
+        // The reviewer approves at the head and the gate passes: the next move is someone else's
+        views.set(12, view({ verdicts: ["approve"], gate: ["passed"] }));
+        await check(h);
+        expect(now()).toMatchObject({ status: "open", evidenceRev: 1, evidence: { facts: { review_at_head: "approve", gate_at_head: "pass", hold_on_pr: "none", next_move: "other" } } });
+        // The owner holds it
+        views.set(12, view({ verdicts: ["approve"], gate: ["passed"], holds: [{ byOwner: true, by: "me" }] }));
+        await check(h);
+        expect(now()).toMatchObject({ evidenceRev: 2, evidence: { facts: { hold_on_pr: "owner", next_move: null } } });
+        // The host fails: every fact at the head is null (a hold may stand), not the last value
+        views.set(12, new Error("502 from the git host"));
+        await check(h);
+        expect(now()).toMatchObject({ evidenceRev: 3, evidence: { facts: { review_at_head: null, gate_at_head: null, hold_on_pr: null, next_move: null } } });
+        // Nothing answered it
+        expect(now().answer).toBeUndefined();
+      });
+
+      it("blockedFacts (AT-3, the PR case): a BLOCKED line naming another PR reads false while it is open, then true once it merged", async () => {
+        const h = setup(fill({ agents: ["worker-a"] }));
+        const { inbox } = await withInbox(h, { serverYaml: LIVE });
+        const views = new Map<number, View | Error>([[9, view()]]);
+        const reads = prSource(h, views);
+        prompts(h);
+        tasks(h, "worker-a|Alice|feat-login|Login form");
+        await runEndingWith(h, "- BLOCKED feat-login by worker-a: waiting on PR #9 to merge");
+        await check(h);
+        const [decision] = gaveUp(inbox);
+        expect(decision.evidence).toMatchObject({
+          code: "blocked_reported",
+          facts: { pr: 9, block_class: "task", block_target: "pr", blocked_on_pr: 9, blocker_cleared: false },
+        });
+        await check(h);
+        expect(inbox.get(decision.id)).toMatchObject({ evidenceRev: 0, evidence: { facts: { blocker_cleared: false } } });
+        views.set(9, view({ state: "merged" }));
+        await check(h);
+        expect(inbox.get(decision.id)).toMatchObject({ status: "open", evidenceRev: 1, evidence: { facts: { blocker_cleared: true } } });
+        // One read per PR per check (the raise's, then each check's re-read), though the run's PR and the PR it waits on are the same
+        expect(reads).toEqual([9, 9, 9, 9]);
+        // A source that cannot read it: null, never cleared
+        views.set(9, new Error("timeout"));
+        await check(h);
+        expect(inbox.get(decision.id)).toMatchObject({ evidenceRev: 2, evidence: { facts: { blocker_cleared: null } } });
+      });
+
+      it("an escalation the agents service raises itself carries pr from the task's last report, read at its head", async () => {
+        const h = setup(fill({ agents: ["worker-a"], wake: { fallback_seconds: 60 } }));
+        const { inbox } = await withInbox(h, { serverYaml: LIVE });
+        prSource(h, new Map([[12, view({ verdicts: ["request_changes"] })]]));
+        prompts(h);
+        tasks(h, "worker-a|Alice|feat-login|Login form");
+        // The first run reports it waits on PR #12 (on nothing fill can watch: started again after a minute)
+        await runEndingWith(h, WAITS_ON_PR);
+        // Every run after that dies on start, until the agents module escalates it
+        h.spawner.behaviour = (pid) => h.spawner.exit(pid, 1);
+        h.clock.t = NOW + 2 * MIN;
+        expect(lineOf(await check(h), "feat-login").state).toBe("started");
+        for (const ms of [0, 0, 10 * SEC, 10 * SEC, 30 * SEC, 30 * SEC, 70 * SEC, 70 * SEC]) await at(h, 2 * MIN + ms);
+        const [decision, ...more] = gaveUp(inbox);
+        expect(more).toEqual([]);
+        expect(decision).toMatchObject({
+          key: expect.stringMatching(/^escalation:/),
+          evidence: { code: "repeated_failure", facts: { pr: 12, review_at_head: "request_changes", gate_at_head: "none", hold_on_pr: "none", next_move: "agent" } },
+        });
+      });
+
+      it("with the decision policies off, no PR is read and no fact at a head is added", async () => {
+        const h = setup(exit0Fill());
+        const { inbox } = await withInbox(h, {});
+        const reads = prSource(h, new Map([[12, view()]]));
+        prompts(h);
+        tasks(h, "worker-a|Alice|feat-login|Login form");
+        const decision = await exit0(h, inbox, WAITS_ON_PR);
+        expect(Object.keys(decision.evidence!.facts).sort()).toEqual(["agent", "attempt_count", "last_exit", "task"]);
+        await check(h);
+        expect(reads).toEqual([]);
+      });
     });
 
     it("offWritesNothing (AT-20, the agents part): with the switches at their defaults, a gave-up decision has its four facts and never moves", async () => {

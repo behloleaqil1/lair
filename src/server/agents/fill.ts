@@ -71,7 +71,20 @@ import { lstat, open, opendir, realpath, type FileHandle } from "fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
 import type { Decision, DecisionFactValue } from "../../shared/decision-types.js";
-import { blockReason, blockerCleared, limitResetPassed, prOfLine, raiseFacts, readOrNull, taskStateOf, type TaskState } from "./brain-facts.js";
+import {
+  blockReason,
+  blockerCleared,
+  headFacts,
+  limitResetPassed,
+  prOfLine,
+  raiseFacts,
+  readOrNull,
+  readPr,
+  taskStateOf,
+  type PrHeadSource,
+  type PrHeadView,
+  type TaskState,
+} from "./brain-facts.js";
 import type {
   AgentEventKind,
   AgentRunView,
@@ -1155,6 +1168,8 @@ export interface AgentsFillOptions {
    * with `refresh` (decision_policies.live_facts) each check re-reads their live facts. Undefined: off.
    */
   brainFacts?: () => { refresh: ((id: string, facts: Record<string, DecisionFactValue>) => Promise<void>) | null } | undefined;
+  /** Where the v3 facts read a PR at its head (the review module); undefined: not wired, those facts are null */
+  prFacts?: () => PrHeadSource | undefined;
 }
 
 /** How a report or a line reads, for observe mode's comparison: its kind, and the gate a waiting one waits on */
@@ -2466,6 +2481,63 @@ export class AgentsFill {
     this.lineGone = gone;
   }
 
+  /**
+   * The v3 facts of a gave-up decision fill is about to raise ({} while the decision policies are off, for the
+   * cannot-start codes, and when the decision is already there: the raise would change nothing, so no PR is read).
+   */
+  private async gaveUpRaiseFacts(key: string, task: string, ask: HoldQuestion): Promise<Record<string, DecisionFactValue>> {
+    if (!this.options.brainFacts?.() || ask.code === "probe_failed" || ask.code === "fill_waiting") return {};
+    const known = this.options.findDecision(key);
+    if (known && known.status !== "withdrawn") return {};
+    const pr = ask.report ? readOrNull(() => this.reportPr(ask.report!)) : null;
+    const blockedReason = ask.report?.kind === "blocked" ? (readOrNull(() => this.blockedReason(ask.report!)) ?? undefined) : undefined;
+    const blockedOn = blockedReason !== undefined ? prOfLine(blockedReason) : null;
+    const source = readOrNull(() => this.options.prFacts?.());
+    const prView = await readPr(source ?? undefined, this.options.project, pr);
+    // The PR it waits on is often the run's own: read once
+    const blockedPrView = blockedOn === pr ? prView : await readPr(source ?? undefined, this.options.project, blockedOn);
+    // Fill raises only for a line of this agent that is not done: its task is open
+    return raiseFacts({
+      code: ask.code,
+      taskState: "open",
+      pr,
+      freshSessions: readOrNull(() => this.options.store.freshSessionsForTask(this.options.project, task)),
+      blockedReason,
+      loadOk: this.loadOk(),
+      prView,
+      agents: this.agentNames(),
+      blockedPrView,
+      now: this.options.probes.clock.now(),
+    });
+  }
+
+  /** The project's agents (fill's and the configured ones): a hold whose `by` names one is an agent's */
+  private agentNames(): string[] {
+    return [...new Set([...this.options.settings.agents, ...Object.keys(this.options.config.dragons ?? {})])];
+  }
+
+  /**
+   * The PR the task's last WAITING or BLOCKED report by `agent` names (any run of the task: a run that died left
+   * none of its own), or null. For the agents service's own escalations.
+   */
+  lastReportPr(task: string, agent: string): number | null {
+    const kept = this.options.store.listEvents(this.options.project, { kinds: ["fill_waiting", "fill_blocked"], task, agent, limit: 1 })[0];
+    if (!kept) return null;
+    return this.reportPr({
+      kind: kept.kind === "fill_waiting" ? "waiting" : "blocked",
+      line: String(kept.data.line ?? ""),
+      wake: null,
+      busId: typeof kept.data.busId === "number" ? kept.data.busId : null,
+      captures: null,
+    });
+  }
+
+  /** The v3 facts read at a PR's head for the service's own raise: the PR, the PR as read, and the project's agents */
+  async prHeadFacts(pr: number | null): Promise<{ prView: PrHeadView | null; agents: string[] }> {
+    const source = readOrNull(() => this.options.prFacts?.());
+    return { prView: await readPr(source ?? undefined, this.options.project, pr), agents: this.agentNames() };
+  }
+
   /** The task's state in the tasks file at the last check (brain-facts.ts taskStateOf), null when no line named it. */
   taskState(task: string, agent: string): TaskState | null {
     return taskStateOf(this.lines, task, agent) ?? null;
@@ -2488,6 +2560,21 @@ export class AgentsFill {
     const gone = new Map<string, number>();
     const warned = new Map<string, string>();
     const now = this.options.probes.clock.now();
+    const agents = this.agentNames();
+    // One read per PR per check, however many decisions name it
+    const source = readOrNull(() => this.options.prFacts?.()) ?? undefined;
+    const seen = new Map<number, Promise<PrHeadView | null>>();
+    const prs = {
+      read: (pr: number | null): Promise<PrHeadView | null> => {
+        if (pr === null) return Promise.resolve(null);
+        let found = seen.get(pr);
+        if (!found) {
+          found = readPr(source, this.options.project, pr);
+          seen.set(pr, found);
+        }
+        return found;
+      },
+    };
     for (const decision of this.options.openDecisions()) {
       const evidence = decision.evidence;
       if (decision.class !== "agents.gave_up" || !evidence || typeof evidence.facts.task !== "string") continue;
@@ -2500,8 +2587,12 @@ export class AgentsFill {
         state = checks >= LINE_GONE_CHECKS ? "closed" : (evidence.facts.task_state ?? null);
       }
       const facts: Record<string, DecisionFactValue> = { task_state: state };
+      // The PR it was raised with, read at its head now (raised while the policies were off: no pr fact, none added)
+      const pr = typeof evidence.facts.pr === "number" ? evidence.facts.pr : null;
+      if (Object.hasOwn(evidence.facts, "pr")) Object.assign(facts, headFacts(pr, await prs.read(pr), agents));
       if (evidence.code === "blocked_reported") {
-        facts.blocker_cleared = blockerCleared(evidence.facts.block_class, evidence.facts.block_target, this.loadOk());
+        const blockedOn = evidence.facts.block_target === "pr" && typeof evidence.facts.blocked_on_pr === "number" ? evidence.facts.blocked_on_pr : null;
+        facts.blocker_cleared = blockerCleared(evidence.facts.block_class, evidence.facts.block_target, this.loadOk(), await prs.read(blockedOn));
       }
       if (evidence.code === "provider_limit") facts.limit_reset_passed = limitResetPassed(evidence.facts.limit_resets_at, now);
       try {
@@ -2574,6 +2665,7 @@ export class AgentsFill {
     ask: HoldQuestion,
   ): Promise<void> {
     const output = ask.withOutput === false || !latest ? [] : lastOutput(latest);
+    const facts = await this.gaveUpRaiseFacts(key, task, ask);
     await this.options.raise(
       {
         kind: "escalation",
@@ -2612,18 +2704,7 @@ export class AgentsFill {
               task,
               attempt_count: latest?.attempt ?? null,
               last_exit: latest?.exitCode ?? null,
-              // Fill raises only for a line of this agent that is not done: its task is open
-              ...(this.options.brainFacts?.() && ask.code !== "probe_failed" && ask.code !== "fill_waiting"
-                ? raiseFacts({
-                    code: ask.code,
-                    taskState: "open",
-                    pr: ask.report ? readOrNull(() => this.reportPr(ask.report!)) : null,
-                    freshSessions: readOrNull(() => this.options.store.freshSessionsForTask(this.options.project, task)),
-                    blockedReason: ask.report?.kind === "blocked" ? (readOrNull(() => this.blockedReason(ask.report!)) ?? undefined) : undefined,
-                    loadOk: this.loadOk(),
-                    now: this.options.probes.clock.now(),
-                  })
-                : {}),
+              ...facts,
             },
             cause_cleared: false,
             linked_issue: null,

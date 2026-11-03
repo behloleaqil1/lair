@@ -61,7 +61,7 @@ import type {
   StopReason,
 } from "../../shared/agents-types.js";
 import type { Decision, DecisionFactValue } from "../../shared/decision-types.js";
-import { raiseFacts, readOrNull } from "./brain-facts.js";
+import { raiseFacts, readOrNull, type PrHeadSource } from "./brain-facts.js";
 import type { DecisionProducer, DecisionResolution } from "../decisions/types.js";
 import type { SignInRefusal, ToolReadiness } from "../ai/types.js";
 import { buildStartCommand, getAdapter } from "../services/adapters.js";
@@ -492,6 +492,8 @@ export interface AgentsServiceOptions {
   spendFacts?: () => SpendFacts | undefined;
   /** G3 (agents.fill.wake.events): whether a PR was reviewed or merged, a decision answered, a bus message sent (read on each use) */
   wakeFacts?: () => WakeFacts | undefined;
+  /** Where the decision brain's v3 facts read a PR at its head (the review module; read on each use) */
+  prFacts?: () => PrHeadSource | undefined;
   /** The project's bus as fill reads it (bus.consume observe or on; read at each check), or null */
   bus?: () => BusLineSource | null;
   /** This server's URL, given as LAIR_URL to a run that gets a bus token (unless a module gave it one) */
@@ -652,6 +654,7 @@ export class AgentsService {
           const refresh = inbox.refreshFacts?.bind(inbox);
           return { refresh: inbox.brainFacts.live && refresh ? refresh : null };
         },
+        prFacts: options.prFacts,
       });
     }
   }
@@ -2437,17 +2440,21 @@ export class AgentsService {
   /**
    * The v3 facts of a gave-up decision this module raises (docs/design/decision-brain.md §4.1), while the decision
    * policies are on; {} while they are off. The task's state is fill's at its last check (null without fill, or
-   * when no line named it then).
+   * when no line named it then). A run that died left no report: `pr` is the one the task's last WAITING or
+   * BLOCKED report by this agent named (fill's store; null without fill), read at its head as fill reads it.
    */
-  private gaveUpFacts(run: AgentRun, code: string, now: number, limitResetsAt?: string | null): Record<string, DecisionFactValue> {
+  private async gaveUpFacts(run: AgentRun, code: string, now: number, limitResetsAt?: string | null): Promise<Record<string, DecisionFactValue>> {
     if (!this.decisions().brainFacts) return {};
+    const pr = readOrNull(() => this.fill?.lastReportPr(run.task, run.agent) ?? null);
+    const head = this.fill ? await this.fill.prHeadFacts(pr) : { prView: null, agents: [] };
     return raiseFacts({
       code,
       taskState: readOrNull(() => this.fill?.taskState(run.task, run.agent) ?? null),
-      // A run that died left no report line here; the PR at the head is read by PR 1b
-      pr: null,
+      pr,
       freshSessions: readOrNull(() => this.store.freshSessionsForTask(this.project, run.task)),
       limitResetsAt,
+      prView: head.prView,
+      agents: head.agents,
       now,
     });
   }
@@ -2517,7 +2524,7 @@ export class AgentsService {
               task: run.task,
               attempt_count: chain.length,
               last_exit: run.exitCode ?? null,
-              ...this.gaveUpFacts(run, code, t.now, limitResetsAt),
+              ...(await this.gaveUpFacts(run, code, t.now, limitResetsAt)),
             },
             cause_cleared: false,
             linked_issue: null,
@@ -2782,7 +2789,7 @@ export class AgentsService {
               task: run.task,
               attempt_count: v.counted.length,
               last_exit: run.exitCode ?? null,
-              ...this.gaveUpFacts(run, "repeated_failure", t.now),
+              ...(await this.gaveUpFacts(run, "repeated_failure", t.now)),
             },
             cause_cleared: false,
             linked_issue: null,
@@ -4699,6 +4706,17 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
     this.wakeFacts = facts;
   }
 
+  private prFacts: PrHeadSource | null = null;
+
+  /**
+   * Where the v3 facts of a gave-up decision read its PR at the head (review, gate and hold there; the PR a BLOCKED
+   * report waits on: merged or closed), read only while the decision policies are on (docs/design/decision-brain.md
+   * §4.1). Read on each use, so it may be set after load(); without it those facts are null.
+   */
+  usePrFacts(facts: PrHeadSource): void {
+    this.prFacts = facts;
+  }
+
   /** Raise decisions through `inbox` instead (a stand-in for the Decision Inbox, in tests). */
   setDecisionInbox(inbox: DecisionInbox): void {
     this.decisions = inbox;
@@ -4785,6 +4803,7 @@ export class AgentsManager implements SupervisedAgents, AgentRuns {
           readyFacts: () => this.readyFacts?.(entry.name, config),
           spendFacts: () => this.spendFacts ?? undefined,
           wakeFacts: () => this.wakeFacts ?? undefined,
+          prFacts: () => this.prFacts ?? undefined,
           ...this.busOptions(entry.name),
         }),
       );

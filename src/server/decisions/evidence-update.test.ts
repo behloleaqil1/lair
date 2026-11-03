@@ -163,6 +163,22 @@ describe("updateEvidence", () => {
     expect(inbox.get(held.id)!.factsAt).toBeUndefined();
   });
 
+  it("the raise's 30-fact cap holds after an update: a live fact that would be the 31st is refused, and nothing moves", async () => {
+    const inbox = setup();
+    // 30 facts at the raise (the most the raise takes), without review_at_head
+    const facts: Record<string, string | number | null> = { agent: "agent-a", task: "feat-login", task_state: "open", pr: 12, next_move: "other" };
+    for (let i = 0; Object.keys(facts).length < 30; i++) facts[`extra_${i}`] = i;
+    const { decision } = await inbox.raise(gaveUp({ evidence: { code: "exit0_no_report", facts, cause_cleared: false, linked_issue: null } }));
+    expect(Object.keys(decision.evidence!.facts)).toHaveLength(30);
+    // A fact it already has still moves
+    await inbox.updateEvidence(decision.id, { module: "agents", facts: { next_move: "agent" } });
+    expect(inbox.get(decision.id)).toMatchObject({ evidenceRev: 1, evidence: { facts: { next_move: "agent" } } });
+    // A new live fact would be the 31st: refused, the whole update with it
+    await rejects(inbox.updateEvidence(decision.id, { module: "agents", facts: { task_state: "closed", review_at_head: "approve" } }), 400);
+    expect(inbox.get(decision.id)).toMatchObject({ evidenceRev: 1, evidence: { facts: { task_state: "open" } } });
+    expect(Object.keys(inbox.get(decision.id)!.evidence!.facts)).toHaveLength(30);
+  });
+
   it("not for a decision raised over HTTP, whatever module name the caller gave", async () => {
     const inbox = setup();
     const { decision } = await inbox.raiseFromHttp(input({ key: "http" }));

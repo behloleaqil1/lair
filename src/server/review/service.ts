@@ -36,6 +36,7 @@ import { mapAuthor } from "./authors.js";
 import { AGENTS_CHANNEL, AgentReviewAssigner, CHECK_INTERVAL_MS } from "./agent-assigner.js";
 import { hashToken, newAssignmentToken } from "./tokens.js";
 import { ACTIVE_STATES } from "../agents/types.js";
+import type { PrHeadView } from "../agents/brain-facts.js";
 import { checkTestIntegrity, isTestFile, type IntegrityFile } from "./integrity.js";
 import { GitHubHost, tokenFrom, type FetchLike, type TokenSource } from "./github.js";
 import type { GitHost, HostFile, HostPullRequest, HostRepo } from "./host.js";
@@ -591,6 +592,28 @@ export class ReviewService {
       commitShas: (await host.listCommits(n)).map((c) => c.sha),
       gate: required.length === 0 ? null : required.map((g) => ({ name: g.name, status: g.status })),
       findingIds,
+    };
+  }
+
+  /**
+   * The decision brain's view of a PR (src/server/agents/brain-facts.ts PrHeadView): its state and head read from
+   * the host now, each reviewer's latest verdict at exactly that head, each required gate there, and the
+   * unreleased holds on it. Read only: nothing is recorded, not even the head (a read must not withdraw reviews).
+   */
+  async brainPrFacts(n: number): Promise<PrHeadView> {
+    const pr = await this.o.host.getPullRequest(n);
+    const latest = new Map<string, "approve" | "request_changes">();
+    for (const review of this.o.store.listReviews(this.project, n)) {
+      // Oldest first: a reviewer's later verdict at the same head replaces the earlier one
+      if (review.headSha === pr.headSha && review.reviewer.kind !== "check") latest.set(`${review.reviewer.kind}:${review.reviewer.id}`, review.verdict);
+    }
+    const required = await this.gateSource.checksAt(pr.headSha);
+    return {
+      state: pr.state,
+      headSha: pr.headSha,
+      verdicts: [...latest.values()],
+      gate: required.length === 0 ? null : required.map((g) => g.status),
+      holds: this.o.store.activeHolds(this.project, n).map((h) => ({ byOwner: h.byOwner === true, by: h.createdBy })),
     };
   }
 
@@ -2000,6 +2023,12 @@ export class ReviewManager {
     if (found.recorded) return { verdict: "productive", headSha: found.headSha };
     const now = (this.options.clock ?? systemClock).now();
     return { verdict: now < until ? "pending" : "idle", headSha: found.headSha };
+  }
+
+  /** The decision brain's view of a project's PR (ReviewService.brainPrFacts); null when the project has no reviews. */
+  async brainPrFacts(project: string, pr: number): Promise<PrHeadView | null> {
+    const service = this.services.get(project);
+    return service ? service.brainPrFacts(pr) : null;
   }
 
   /** AI spend: a PR's head as the review store last read it (null: unknown). */
