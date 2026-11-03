@@ -145,7 +145,7 @@ describe("triage.external_author: tasks_file", () => {
     const out = await externalFailure(h, "feature/unknown-work");
     expect(out.actions.find((a) => a.kind === "route")).toMatchObject({
       status: "planned",
-      detail: "2 cause(s) to the owner: no single author (not run: triage.mode is observe)",
+      detail: "2 cause(s) to the owner: no author known (not run: triage.mode is observe)",
     });
     expect(out.actions.find((a) => a.kind === "decision")).toBeUndefined();
     expect(h.inbox()).toBe("");
@@ -318,6 +318,8 @@ describe("matchAuthorLines and findExternalAuthor", () => {
     expect(matchAuthorLines([line(1, "worker-a", "team/fix-login", "held")], subject)[0]?.by).toBe("branch");
     expect(matchAuthorLines([line(1, "worker-a", "fix-login", "held")], subject)[0]?.by).toBe("segment");
     expect(matchAuthorLines([line(1, "worker-a", "fix-login", "held")], { branch: "kiro/worker-a/fix-login", pipelineId: "p" })[0]?.by).toBe("agent_branch");
+    // A description that quotes the line's own branch does not demote it (#343 review N1)
+    expect(matchAuthorLines([line(1, "worker-a", "fix-login", "held", "push to kiro/worker-a/fix-login, then gate")], { branch: "kiro/worker-a/fix-login", pipelineId: "p" })[0]?.by).toBe("agent_branch");
     // Another agent's id in the branch is not the line's agent
     expect(matchAuthorLines([line(1, "worker-a", "fix-login", "held")], { branch: "kiro/worker-b/fix-login", pipelineId: "p" })[0]?.by).toBe("segment");
     expect(matchAuthorLines([line(1, "worker-a", "backend", "held")], subject)[0]?.by).toBe("pipeline");

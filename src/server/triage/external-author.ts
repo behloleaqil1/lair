@@ -107,12 +107,13 @@ function namesWord(text: string, word: string): boolean {
 function namedBy(line: FillLineView & { task: string }, subject: AuthorSubject): AuthorLine["by"] | null {
   const branch = subject.branch;
   if (line.task === branch) return "branch";
-  // A namespaced branch only: a bare word like "fix" names too much
-  if (branch.includes("/") && line.description && namesWord(line.description, branch)) return "description";
+  // The branch shape first (#343 review N1): a line whose description quotes its own branch is still its agent's
   if (branch.endsWith(`/${line.task}`)) {
     const prefix = branch.slice(0, branch.length - line.task.length - 1).split("/");
     return line.agent !== null && prefix.includes(line.agent) ? "agent_branch" : "segment";
   }
+  // A namespaced branch only: a bare word like "fix" names too much
+  if (branch.includes("/") && line.description && namesWord(line.description, branch)) return "description";
   if (line.task === subject.pipelineId) return "pipeline";
   return null;
 }

@@ -1202,7 +1202,7 @@ export class TriageService {
     }, and no author agent is known for it: who fixes it?`;
     const blocked = this.actBlocked;
     if (blocked) {
-      this.action({ recordId: record.id }, "route", "planned", `${causes.length} cause(s) to the owner: no single author (not run: ${blocked})`);
+      this.action({ recordId: record.id }, "route", "planned", `${causes.length} cause(s) to the owner: no author known (not run: ${blocked})`);
       return;
     }
     this.raiseDecision({ recordId: record.id }, s, {
