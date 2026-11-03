@@ -15,7 +15,7 @@ import { EventBus } from "../../core/event-bus.js";
 import { generateNodeKeyPair, signGateResult } from "../../gates/signature.js";
 import { NodeFileSystem, type Clock, type CommandOutput, type CommandRunner } from "../../watchdog/probes.js";
 import type { CommitInfo, GitProbe } from "../git.js";
-import { TriageManager } from "../manager.js";
+import { TriageManager, type TriageManagerOptions } from "../manager.js";
 import type { IngestInput, IngestOutcome, TriageService } from "../service.js";
 
 export const NOW = Date.parse("2026-03-02T12:00:00.000Z");
@@ -229,6 +229,8 @@ export function harness(
   extra: Partial<ProjectConfig> = {},
   /** A restart: the same project directory and store file as an earlier harness */
   restart?: { dir: string; dbPath: string },
+  /** In-process adapters from other modules (the server's are in src/server/index.ts) */
+  adapters?: TriageManagerOptions["adapters"],
 ): Harness {
   const dir = restart?.dir ?? mkdtempSync(join(tmpdir(), "lair-triage-"));
   const runner = new FakeRunner();
@@ -240,6 +242,7 @@ export function harness(
     dbPath: restart?.dbPath ?? ":memory:",
     probes: { runner, clock, fs: new NodeFileSystem(), git: () => git },
     events,
+    adapters,
   });
   manager.load([{ name: "demo", config }]);
   const service = manager.get("demo");
