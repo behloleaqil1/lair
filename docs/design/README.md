@@ -27,6 +27,7 @@
 | [phase4-fleet.md](phase4-fleet.md) | Phase 4: SSH machines, distributed gates, agent management | Partly built: SSH machines, gate distribution, agent adapters (only `kiro` is tested), budgets and self-healing; the manager chat view is not built |
 | [phase5-deploy.md](phase5-deploy.md) | Phase 5: Deployment, GitHub integration, kickstart | Planned, not built |
 | [sandbox.md](sandbox.md) | Agent sandboxing: threat model, isolation options, per-agent OS users, scoped credentials, migration | Planned; design for ROADMAP.md B4 |
+| [agent-launch.md](agent-launch.md) | Agent launch contract: what every adapter launch gives a run (bus, task header with the merge signal, prompt by file never argv, push and history rules, identity, checks), observe first, with a contract test for each adapter | Planned, not built |
 
 ## Principles
 
@@ -46,6 +47,8 @@
 - [supervisor.md](supervisor.md): the supervisor, Lair's operator: self-checks, answers, diagnoses and fixes within the autonomy the owner gives it
 - [ai-roles.md](ai-roles.md): any AI tool and model, per role; how Lair checks sign-in and keeps API keys
 - [ai-spend.md](ai-spend.md): AI spend and waste: usage per run, productive/idle/no-result classes, a spend panel, and guards against retry, wake and planner waste
+- [decision-brain.md](decision-brain.md): decision brain v3: rules for today's repeating decision classes, a per-class bench on all answered decisions, abstain rules, and a shadow trial for a small local model
+- [provider-limits.md](provider-limits.md): provider quotas and outages: structured error matching, daily and monthly caps with probes toward the reset, a burst of dead-on-start runs as an outage, fallback order per role, and switch-back
 - [settings-v2.md](settings-v2.md): Settings organised by task, and the look and feel of the whole dashboard
 - [app-architecture.md](app-architecture.md): the architecture stage for the apps Lair builds: quality attributes, trade-offs, ADRs, the stack, reference architectures and fitness functions
 - [importer.md](importer.md): taking over an existing project: discovery and audit, a proposed setup, shadow mode, a staged reversible cutover
