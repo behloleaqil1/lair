@@ -13,7 +13,8 @@ export interface ShadowSource {
   /** Open decisions with a class, oldest first, after `after` */
   openPage(after: OpenDecisionCursor | null, limit: number): OpenDecisionCursor[];
   recordPolicyTrace(row: PolicyTraceRow): boolean;
-  hasPolicyTrace(decisionId: string, proposer: string, version: string): boolean;
+  /** `evidenceRev` null: a row at any evidence revision */
+  hasPolicyTrace(decisionId: string, proposer: string, version: string, evidenceRev: number | null): boolean;
 }
 
 /** A real object with those four methods, so there is nothing to cast to. */
@@ -22,7 +23,8 @@ export function shadowSource(source: ShadowSource): ShadowSource {
     get: (id: string) => source.get(id),
     openPage: (after: OpenDecisionCursor | null, limit: number) => source.openPage(after, limit),
     recordPolicyTrace: (row: PolicyTraceRow) => source.recordPolicyTrace(row),
-    hasPolicyTrace: (id: string, proposer: string, version: string) => source.hasPolicyTrace(id, proposer, version),
+    hasPolicyTrace: (id: string, proposer: string, version: string, evidenceRev: number | null) =>
+      source.hasPolicyTrace(id, proposer, version, evidenceRev),
   });
 }
 
@@ -43,7 +45,11 @@ export class PolicyShadow {
     private readonly log: (line: string) => void = () => undefined,
   ) {}
 
-  /** Propose for one decision; returns the rows newly written. Never throws: a failing shadow must not hold up a decision. */
+  /**
+   * Propose for one decision; returns the rows newly written. Never throws: a failing shadow must not hold up a
+   * decision. One row per decision, proposer and version: the row records the evidence revision it was made on,
+   * and a later revision is not proposed for again (that is decision_policies.repropose_on_update, not built yet).
+   */
   propose(decisionId: string): PolicyTraceRow[] {
     const written: PolicyTraceRow[] = [];
     try {
@@ -52,7 +58,7 @@ export class PolicyShadow {
       const at = this.now();
       for (const proposer of this.proposers()) {
         const version = proposer.version();
-        if (this.source.hasPolicyTrace(decisionId, proposer.id, version)) continue;
+        if (this.source.hasPolicyTrace(decisionId, proposer.id, version, null)) continue;
         const proposal = proposer.propose(decision, at);
         if (!proposal || !decision.class) continue;
         const row: PolicyTraceRow = {
@@ -65,6 +71,8 @@ export class PolicyShadow {
           reasonCode: proposal.reasonCode,
           confidence: proposal.confidence,
           at: at.toISOString(),
+          evidenceRev: decision.evidenceRev ?? 0,
+          proposedOption: proposal.option,
         };
         if (this.source.recordPolicyTrace(row)) written.push(row);
       }

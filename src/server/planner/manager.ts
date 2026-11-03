@@ -65,6 +65,8 @@ export class PlannerManager {
         continue;
       }
       if (!parsed.settings.enabled) continue;
+      // The act-mode rules in warn mode (docs/design/planner-act.md §4.3): the load warning; the service raises one notice
+      for (const rule of parsed.settings.actRules) console.warn(`[planner] ${entry.name} (config): ${rule}`);
       this.store ??= new PlannerStore(this.options.dbPath);
       const service = new PlannerService({
         project: entry.name,

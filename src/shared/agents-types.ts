@@ -160,6 +160,7 @@ export const SPEND_GUARDS = [
   "planner_handled_messages",
   "planner_skip_unchanged",
   "planner_recheck_on_change",
+  "planner_dedupe_pending",
 ] as const;
 export type SpendGuardId = (typeof SPEND_GUARDS)[number];
 

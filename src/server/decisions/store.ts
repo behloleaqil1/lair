@@ -34,7 +34,9 @@ import type { ValidRaise } from "./validate.js";
 // 4: decisions.class and decisions.evidence (JSON), nullable: the policy class and its machine-readable evidence
 // 5: decisions.outcome, outcome_at, outcome_evidence: the outcome tracker's verdict on an answered decision
 // 6: policy_trace: one row per decision, proposer and version (docs/design/decision-policies.md §5); shadow proposals only
-export const SCHEMA_VERSION = 6;
+// 7: decisions.evidence_rev and facts_at (live facts, docs/design/decision-brain.md §4.1); policy_trace.evidence_rev
+//    in its key and proposed_option
+export const SCHEMA_VERSION = 7;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS decisions (
@@ -71,7 +73,9 @@ const SCHEMA = `
     evidence TEXT,
     outcome TEXT,
     outcome_at TEXT,
-    outcome_evidence TEXT
+    outcome_evidence TEXT,
+    evidence_rev INTEGER NOT NULL DEFAULT 0,
+    facts_at TEXT
   );
   CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_open_key_via
     ON decisions(project, source_module, dedupe_key, raised_via) WHERE status = 'open';
@@ -105,7 +109,9 @@ const SCHEMA = `
     reason_code TEXT NOT NULL,
     confidence REAL NOT NULL,
     at TEXT NOT NULL,
-    PRIMARY KEY (decision_id, proposer, version)
+    evidence_rev INTEGER NOT NULL DEFAULT 0,
+    proposed_option TEXT,
+    PRIMARY KEY (decision_id, proposer, version, evidence_rev)
   );
 `;
 
@@ -144,6 +150,8 @@ interface DecisionRow {
   outcome_evidence: string | null;
   class: string | null;
   evidence: string | null;
+  evidence_rev: number;
+  facts_at: string | null;
 }
 
 /** Open first, by urgency (soonest expiry, then oldest); then the rest, newest first. */
@@ -209,6 +217,10 @@ export interface PolicyTraceRow {
   reasonCode: string;
   confidence: number;
   at: string;
+  /** The decision's evidence revision the proposal was made on */
+  evidenceRev: number;
+  /** What the proposer said before the shared abstain rules (equal to `option` until they exist) */
+  proposedOption: string | null;
 }
 
 export interface PolicyTraceJoined extends PolicyTraceRow {
@@ -272,9 +284,22 @@ export class DecisionStore {
             this.db.exec(`ALTER TABLE decisions ADD COLUMN ${column} TEXT`);
           }
         }
+        // Versions 1 to 6 lack the evidence revision: every decision is still as raised, never re-read
+        if (version >= 1 && version <= 6) {
+          this.db.exec(`ALTER TABLE decisions ADD COLUMN evidence_rev INTEGER NOT NULL DEFAULT 0`);
+          this.db.exec(`ALTER TABLE decisions ADD COLUMN facts_at TEXT`);
+        }
+        // Version 6's trace has the old key: its rows move to the new table at revision 0, proposed as traced
+        if (version === 6) this.db.exec(`ALTER TABLE policy_trace RENAME TO policy_trace_v6`);
         // One open decision per key and per way in: an HTTP caller's key never stands for a module's own
         this.db.exec(`DROP INDEX IF EXISTS idx_decisions_open_key`);
         this.db.exec(SCHEMA);
+        if (version === 6) {
+          this.db.exec(`
+            INSERT INTO policy_trace (decision_id, proposer, version, class, policy, option, reason_code, confidence, at, evidence_rev, proposed_option)
+              SELECT decision_id, proposer, version, class, policy, option, reason_code, confidence, at, 0, option FROM policy_trace_v6;
+            DROP TABLE policy_trace_v6;`);
+        }
         this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
       })();
     }
@@ -576,31 +601,41 @@ export class DecisionStore {
     return row?.delivery_error ?? null;
   }
 
-  /** Replace an open decision's evidence (the caller changed only cause_cleared / linked_issue). False: not open, or none. */
-  updateEvidence(id: string, evidence: DecisionEvidence): boolean {
+  /**
+   * Replace an open decision's evidence (the caller checked what may move). `bump`: a real change, so the
+   * revision goes up by 1; `factsAt`: a re-read's time (null keeps the last one). False: not open, or none.
+   */
+  updateEvidence(id: string, evidence: DecisionEvidence, how: { bump: boolean; factsAt: string | null }): boolean {
     const r = this.db
-      .prepare(`UPDATE decisions SET evidence = ? WHERE id = ? AND status = 'open' AND evidence IS NOT NULL`)
-      .run(JSON.stringify(evidence), id);
+      .prepare(
+        `UPDATE decisions SET evidence = ?, evidence_rev = evidence_rev + ?, facts_at = COALESCE(?, facts_at)
+          WHERE id = ? AND status = 'open' AND evidence IS NOT NULL`,
+      )
+      .run(JSON.stringify(evidence), how.bump ? 1 : 0, how.factsAt, id);
     return r.changes > 0;
   }
 
-  /** Record a proposal: one row per decision, proposer and version, so a repeat (a restart) changes nothing. True: a new row. */
+  /**
+   * Record a proposal: one row per decision, proposer, version and evidence revision, so a repeat (a restart)
+   * changes nothing. True: a new row.
+   */
   addTrace(t: PolicyTraceRow): boolean {
     const r = this.db
       .prepare(
-        `INSERT OR IGNORE INTO policy_trace (decision_id, proposer, version, class, policy, option, reason_code, confidence, at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT OR IGNORE INTO policy_trace
+           (decision_id, proposer, version, class, policy, option, reason_code, confidence, at, evidence_rev, proposed_option)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(t.decisionId, t.proposer, t.version, t.class, t.policy, t.option, t.reasonCode, t.confidence, t.at);
+      .run(t.decisionId, t.proposer, t.version, t.class, t.policy, t.option, t.reasonCode, t.confidence, t.at, t.evidenceRev, t.proposedOption);
     return r.changes > 0;
   }
 
-  /** Whether this proposer version already has a row for the decision. */
-  hasTrace(decisionId: string, proposer: string, version: string): boolean {
+  /** Whether this proposer version already has a row for the decision at `evidenceRev` (null: at any revision). */
+  hasTrace(decisionId: string, proposer: string, version: string, evidenceRev: number | null): boolean {
     return (
       this.db
-        .prepare(`SELECT 1 FROM policy_trace WHERE decision_id = ? AND proposer = ? AND version = ?`)
-        .get(decisionId, proposer, version) !== undefined
+        .prepare(`SELECT 1 FROM policy_trace WHERE decision_id = ? AND proposer = ? AND version = ? AND (? IS NULL OR evidence_rev = ?)`)
+        .get(decisionId, proposer, version, evidenceRev, evidenceRev) !== undefined
     );
   }
 
@@ -664,7 +699,7 @@ export class DecisionStore {
     const rows = this.db
       .prepare(
         `SELECT t.decision_id, t.proposer, t.version, t.class, t.policy, t.option, t.reason_code, t.confidence, t.at,
-                d.status, d.answer_option, d.options
+                t.evidence_rev, t.proposed_option, d.status, d.answer_option, d.options
            FROM policy_trace t JOIN decisions d ON d.id = t.decision_id ORDER BY t.at, t.decision_id LIMIT ?`,
       )
       .all(limit) as {
@@ -677,6 +712,8 @@ export class DecisionStore {
       reason_code: string;
       confidence: number;
       at: string;
+      evidence_rev: number;
+      proposed_option: string | null;
       status: string;
       answer_option: string | null;
       options: string;
@@ -691,6 +728,8 @@ export class DecisionStore {
       reasonCode: r.reason_code,
       confidence: r.confidence,
       at: r.at,
+      evidenceRev: r.evidence_rev,
+      proposedOption: r.proposed_option,
       status: r.status as DecisionStatus,
       answer: r.status === "answered" ? r.answer_option : null,
       options: JSON.parse(r.options) as DecisionOption[],
@@ -753,7 +792,8 @@ export class DecisionStore {
         ? { outcome: row.outcome, outcomeAt: row.outcome_at ?? undefined, outcomeEvidence: parseEvidence(row.outcome_evidence) }
         : {}),
       ...(row.class ? { class: row.class, classKnown: isKnownDecisionClass(row.class) } : {}),
-      ...(row.evidence ? { evidence: JSON.parse(row.evidence) as DecisionEvidence } : {}),
+      ...(row.evidence ? { evidence: JSON.parse(row.evidence) as DecisionEvidence, evidenceRev: row.evidence_rev } : {}),
+      ...(row.facts_at ? { factsAt: row.facts_at } : {}),
     };
   }
 }

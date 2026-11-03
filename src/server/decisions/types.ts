@@ -6,6 +6,7 @@ import type {
   Decision,
   DecisionAttention,
   DecisionEvidence,
+  DecisionFactValue,
   DecisionKind,
   DecisionLink,
   DecisionOption,
@@ -80,12 +81,20 @@ export interface AnswerContext {
   userAgent?: string;
 }
 
-/** What a producer may change on an open decision's evidence after it raised it: the two facts that move. */
+/**
+ * What a producer may change on an open decision's evidence after it raised it: `cause_cleared` and
+ * `linked_issue` (by event), and its class's `live` facts (a re-read, structure.ts liveFactsOf).
+ */
 export interface EvidenceUpdateInput {
   /** Must be the module that raised the decision */
   module: string;
   cause_cleared?: boolean;
   linked_issue?: number | null;
+  /**
+   * A re-read of the class's live facts, all of them in one call: it stamps `factsAt` even when no value
+   * changed. A fact outside the class's `live` list refuses the whole update.
+   */
+  facts?: Record<string, DecisionFactValue>;
 }
 
 export interface WithdrawInput {
@@ -129,10 +138,11 @@ export interface DecisionProducer {
   raise(input: RaiseDecisionInput): Promise<RaiseResult>;
   withdraw(id: string, input: WithdrawInput): Promise<Decision>;
   /**
-   * Re-evaluate `cause_cleared` / `linked_issue` of an open decision this
-   * module raised: both are set at the raise, and only the module knows when
-   * they change. Nothing else on the decision moves; a decision without
-   * evidence, or one already closed, is refused.
+   * Re-evaluate `cause_cleared` / `linked_issue`, or re-read the class's
+   * live facts, of an open decision this module raised: only the module
+   * knows when they change. Nothing else on the decision moves; a decision
+   * without evidence, one already closed, or a fact not in its class's live
+   * list is refused.
    */
   updateEvidence(id: string, input: EvidenceUpdateInput): Promise<Decision>;
   blockedOn(ref: string): Decision | null;

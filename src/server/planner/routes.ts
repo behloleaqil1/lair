@@ -15,6 +15,7 @@
  *   POST /api/planner/runs/:id/approve           {confirm: true}: every proposal of the run that waits
  *   POST /api/planner/runs/:id/reject            {confirm: true}
  *   POST /api/planner/resume                     {confirm: true}: planner runs again after a pause
+ *   POST /api/planner/changes/:id/undo           {confirm: true}: undo an applied proposal's change (idempotent)
  *   POST /api/planner/messages/:id/handled       an owner message is handled: later runs leave it out (idempotent)
  *   POST /api/planner/messages/:id/reopen        a handled owner message is open again (idempotent)
  *     (both need planner.guards.handled_messages on: 409 when it is off; 404 for an id that isn't an owner message)
@@ -168,6 +169,7 @@ export async function registerPlannerRoutes(
     confirmed("/api/planner/runs/:id/approve", (s, id) => s.approveRun(id), { id: true });
     confirmed("/api/planner/runs/:id/reject", (s, id) => s.rejectRun(id), { id: true });
     confirmed("/api/planner/resume", (s) => s.resume(), { id: false });
+    confirmed("/api/planner/changes/:id/undo", (s, id) => s.undoChange(id), { id: true });
 
     // G6 handled_messages: the owner marks an owner message handled, or reopens it. Both are idempotent and
     // reversible (no confirm needed); the session is checked before the body is read, as on every route here

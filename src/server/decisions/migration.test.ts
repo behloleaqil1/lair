@@ -1,8 +1,9 @@
 /**
- * Decision store files from every older schema version (1 to 5), as the server of that version wrote them,
+ * Decision store files from every older schema version (1 to 6), as the server of that version wrote them,
  * opened the way the server opens them (mountDecisions on data/decisions.db): each comes out at the current
- * version with the policy trace table (6), its columns and indexes the same as a new file's, and every row it
- * held intact, including the structure (4) and outcome (5) columns. The decision policies then trace on it.
+ * version with the policy trace table (6), the evidence revision (7), its columns and indexes the same as a new
+ * file's, and every row it held intact, including the structure (4), outcome (5) and trace (6) rows. The
+ * decision policies then trace on it.
  */
 import { afterEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
@@ -13,10 +14,12 @@ import { join } from "path";
 import { EventBus } from "../core/event-bus.js";
 import { HumanAuth } from "../human-auth/index.js";
 import { mountDecisions } from "./mount.js";
-import { mountDecisionPolicies } from "./policies/index.js";
+import { DEFAULT_POLICIES_YAML, mountDecisionPolicies, parsePolicyTable } from "./policies/index.js";
+import { RULES_PROPOSER } from "./policies/rules.js";
 import { DecisionStore, SCHEMA_VERSION } from "./store.js";
 
 const NOW = Date.parse("2026-03-02T12:00:00.000Z");
+const BUILT_IN_VERSION = parsePolicyTable(DEFAULT_POLICIES_YAML).version;
 const dirs: string[] = [];
 const apps: FastifyInstance[] = [];
 afterEach(async () => {
@@ -47,6 +50,12 @@ const COLUMNS: Record<number, string> = {
   5: `${V1_COLUMNS}, raised_via TEXT NOT NULL DEFAULT 'server', attention TEXT NOT NULL DEFAULT 'action', class TEXT, evidence TEXT,
      outcome TEXT, outcome_at TEXT, outcome_evidence TEXT`,
 };
+COLUMNS[6] = COLUMNS[5];
+// Version 6's trace: one row per decision, proposer and version
+const V6_TRACE = `CREATE TABLE policy_trace (
+    decision_id TEXT NOT NULL REFERENCES decisions(id), proposer TEXT NOT NULL, version TEXT NOT NULL, class TEXT NOT NULL,
+    policy TEXT NOT NULL, option TEXT, reason_code TEXT NOT NULL, confidence REAL NOT NULL, at TEXT NOT NULL,
+    PRIMARY KEY (decision_id, proposer, version));`;
 // Versions 1 and 2 had one open decision per key; 3 made it per key and way in
 const OPEN_KEY_INDEX: Record<number, string> = {
   1: `CREATE UNIQUE INDEX idx_decisions_open_key ON decisions(project, source_module, dedupe_key) WHERE status = 'open';`,
@@ -56,6 +65,7 @@ const OPEN_KEY_INDEX: Record<number, string> = {
   5: `CREATE UNIQUE INDEX idx_decisions_open_key_via ON decisions(project, source_module, dedupe_key, raised_via) WHERE status = 'open';
       CREATE INDEX idx_decisions_await_outcome ON decisions(answered_at) WHERE status = 'answered' AND outcome IS NULL;`,
 };
+OPEN_KEY_INDEX[6] = OPEN_KEY_INDEX[5];
 
 const OPTIONS = JSON.stringify([
   { id: "wait", label: "Wait", consequences: "The task starts when the cooldown ends.", effect: "reversible" },
@@ -112,6 +122,12 @@ function oldFile(path: string, version: number): void {
   );
   db.prepare(`INSERT INTO decision_blocks (decision_id, ref) VALUES (?, ?)`).run(OPEN_ID, "agents:demo:task:feat-login");
   db.prepare(`INSERT INTO decision_audit (decision_id, at, action, actor, detail) VALUES (?, ?, 'raised', 'agents', 'raised')`).run(OPEN_ID, "2026-03-01T00:00:00.000Z");
+  if (has(6)) {
+    // The open decision was traced by the server of version 6 (with the built-in table's version at that time)
+    db.exec(V6_TRACE);
+    db.prepare(`INSERT INTO policy_trace VALUES (?, ?, ?, 'agents.provider_limit', 'c1-wait', 'wait', 'matched', 1, ?)`)
+      .run(OPEN_ID, RULES_PROPOSER, BUILT_IN_VERSION, "2026-03-01T00:00:01.000Z");
+  }
   db.pragma(`user_version = ${version}`);
   db.close();
 }
@@ -159,11 +175,11 @@ async function start(dbPath: string, policies: boolean) {
 }
 
 describe("decision store files from older schema versions", () => {
-  it("the schema is at version 6, the policy trace", () => {
-    expect(SCHEMA_VERSION).toBe(6);
+  it("the schema is at version 7, the evidence revision", () => {
+    expect(SCHEMA_VERSION).toBe(7);
   });
 
-  for (const version of [1, 2, 3, 4, 5]) {
+  for (const version of [1, 2, 3, 4, 5, 6]) {
     it(`a version ${version} file opens at version ${SCHEMA_VERSION} with the policy trace and keeps every row`, async () => {
       const dir = tempDir();
       const fresh = join(dir, "fresh.db");
@@ -173,11 +189,12 @@ describe("decision store files from older schema versions", () => {
 
       const path = join(dir, "decisions.db");
       oldFile(path, version);
-      expect(shape(path).tables.policy_trace).toBeUndefined();
+      expect(shape(path).tables.policy_trace === undefined).toBe(version < 6);
 
       const { app, inbox, policies } = await start(path, true);
-      // The open decision with a class gets its proposal from the catch-up at start
-      expect(await policies!.caughtUp).toBe(version >= 4 ? 1 : 0);
+      // The open decision with a class gets its proposal from the catch-up at start; version 6 traced it already
+      // (its row is kept as it was, at revision 0, so the catch-up writes no second one)
+      expect(await policies!.caughtUp).toBe(version >= 4 && version < 6 ? 1 : 0);
 
       const open = inbox.get(OPEN_ID)!;
       expect(open).toMatchObject({ status: "open", title: "Every profile is rate limited", attention: "action", raisedVia: "server", blocks: ["agents:demo:task:feat-login"] });
@@ -191,7 +208,11 @@ describe("decision store files from older schema versions", () => {
           expect(d.class).toBe("agents.provider_limit");
           expect(d.evidence).toEqual(JSON.parse(EVIDENCE));
         }
-        expect(inbox.policyTraces()).toMatchObject([{ decisionId: OPEN_ID, policy: "c1-wait", option: "wait" }]);
+        expect(inbox.policyTraces()).toMatchObject([{ decisionId: OPEN_ID, policy: "c1-wait", option: "wait", evidenceRev: 0, proposedOption: "wait" }]);
+        // Every decision is at revision 0 and was never re-read
+        for (const d of [open, answered]) expect(d).toMatchObject({ evidenceRev: 0 });
+        for (const d of [open, answered]) expect(d.factsAt).toBeUndefined();
+        if (version === 6) expect(inbox.policyTraces()[0]).toMatchObject({ proposer: RULES_PROPOSER, version: BUILT_IN_VERSION, reasonCode: "matched", at: "2026-03-01T00:00:01.000Z" });
       } else {
         expect(open.class).toBeUndefined();
         expect(open.evidence).toBeUndefined();
@@ -207,10 +228,12 @@ describe("decision store files from older schema versions", () => {
       }
 
       // A trace row can be written on the upgraded file, once, and is counted against the answer
-      const row = { decisionId: ANSWERED_ID, proposer: "test", version: "v1", class: "agents.provider_limit", policy: "p", option: "wait", reasonCode: "r", confidence: 1, at: new Date(NOW).toISOString() };
+      const row = { decisionId: ANSWERED_ID, proposer: "test", version: "v1", class: "agents.provider_limit", policy: "p", option: "wait", reasonCode: "r", confidence: 1, at: new Date(NOW).toISOString(), evidenceRev: 0, proposedOption: "wait" };
       expect(inbox.recordPolicyTrace(row)).toBe(true);
       expect(inbox.recordPolicyTrace(row)).toBe(false);
-      expect(inbox.hasPolicyTrace(ANSWERED_ID, "test", "v1")).toBe(true);
+      expect(inbox.hasPolicyTrace(ANSWERED_ID, "test", "v1", 0)).toBe(true);
+      expect(inbox.hasPolicyTrace(ANSWERED_ID, "test", "v1", 1)).toBe(false);
+      expect(inbox.hasPolicyTrace(ANSWERED_ID, "test", "v1", null)).toBe(true);
       expect(inbox.policyAgreement().find((r) => r.proposer === "test")).toMatchObject({ traced: 1, compared: 1, agreed: 1 });
       // The file is still the inbox's: a new decision raises
       expect((await inbox.raise({ project: "demo", kind: "other", title: "New", context: "c", options: [{ id: "ok", label: "OK", consequences: "x" }], recommended: { optionId: "ok", reasoning: "r" }, source: { module: "agents", ref: "r" }, key: "new" })).created).toBe(true);

@@ -356,6 +356,31 @@ them. None calls a model or the network: they read the tasks file, the queue lin
   itself is covered by that record and the notice; running agents as separate OS users closes it. Observe keeps today's
   restore-and-refuse, and counts the proposals that would have gone on.
 
+## Act safety
+
+Built from [planner-act.md](planner-act.md) §8, PR 1 (§4.3 there is the design):
+
+- **Act-mode rules.** `mode: act` needs `guards.recheck_on_change: act`, and `guards.prefilter_closed` and
+  `guards.dedupe_pending` at least `observe`. This release warns (a load warning and one `planner.act_rules` notice
+  per project and config text); the next refuses. One constant, `ACT_RULES` in `config.ts`, switches the two.
+- **Refusal window** (`act.refuse_undone_days`, 7; 0 is off). The owner's undo, an owner decline, an outside edit
+  that removes an open line, and one that changes a planner-reworded or reassigned line back, each leave a record keyed
+  by op, task and text hash in `planner_state` (`refused`, the newest 1,000). Within the window the same change is
+  refused in the proposal checks; another text for the same op and task, or an `add` of a task an `add` record holds
+  (until its plan text changes), is held for the owner (`verifier_verdict: unsure`, reason "Lair holds this for you:
+  ..."), as an unchecked PR ownership is.
+- **`dedupe_pending`.** A proposal matching one still pending from an earlier run (op, task, agent; text for a
+  `reword`) is refused in act and recorded as a `would_refuse` in observe.
+- **The verifier sees merged PRs.** With `prefilter_closed: observe`, the planner's context has no `closed` block, so
+  the verifier's context alone gains `closed.mergedPrs` (the newest 200 from the review store). With it `off` both
+  contexts are today's (planner-act.md §8: every part off by default); with `act` the planner's context has them.
+- **Undo.** `POST /api/planner/changes/:id/undo` reverses an applied proposal's `add`, `reword`, `reassign` or
+  `finish` while its line is as the change wrote it and its task has no active run or claim. The new text, an `undo`
+  row (dedupe key `undo:<change id>`, so it is idempotent) and the refusal record go into one intent, so a restart
+  finishes them. Undoing a `finish` reopens the owner messages its closing handled. A `read_only` project refuses it.
+- **Fail closed.** A hold stays while a plan source can't be read; the verifier's auto-apply checks the refusals and
+  holds again, so a decline made while a run was verified still holds.
+
 ## Not built
 
 Task cards with acceptance criteria and size budgets, a dependency graph across documents, stacked-branch rebases,

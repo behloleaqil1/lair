@@ -186,6 +186,8 @@ const GuardsSchema = z
       .default({}),
     /** The tasks file changed during a run (act mode): keep the edit and check each proposal against it (D7) */
     recheck_on_change: GuardMode.default("off"),
+    /** A proposal identical to one still pending from an earlier run is refused (docs/design/planner-act.md §4.3) */
+    dedupe_pending: GuardMode.default("off"),
   })
   .strict()
   .default({});
@@ -240,8 +242,37 @@ const PlannerSchema = z
     /** An extra rule for the task ids proposals may name (fill's rules always apply) */
     task_id_pattern: Pattern.optional(),
     guards: GuardsSchema,
+    act: z
+      .object({
+        /** Days a change the owner undid, declined or removed is not proposed again (0: off; planner-act.md §4.3, D2) */
+        refuse_undone_days: z.number().int().min(0).max(90).default(7),
+      })
+      .strict()
+      .default({}),
   })
   .strict();
+
+/**
+ * The act-mode rules (docs/design/planner-act.md §4.3, D1): warn in the first release that has them, refuse from the
+ * next one. Flipping this constant is its own PR.
+ */
+export const ACT_RULES: "warn" | "refuse" = "warn";
+
+/** What planner.mode: act still needs: one message per rule, naming the keys to set (empty: none). */
+export function actRuleProblems(value: { mode: string; guards: { recheck_on_change: string; prefilter_closed: string; dedupe_pending: string } }): string[] {
+  if (value.mode !== "act") return [];
+  const out: string[] = [];
+  if (value.guards.recheck_on_change !== "act") {
+    out.push(
+      `planner.mode: act needs planner.guards.recheck_on_change: act (it is ${value.guards.recheck_on_change}): without it an outside edit made during a planner run is put back`,
+    );
+  }
+  const low = (["prefilter_closed", "dedupe_pending"] as const).filter((key) => value.guards[key] === "off");
+  if (low.length > 0) {
+    out.push(`planner.mode: act needs ${low.map((key) => `planner.guards.${key}`).join(" and ")} at least observe (now off)`);
+  }
+  return out;
+}
 
 type Raw = z.infer<typeof PlannerSchema>;
 
@@ -337,6 +368,10 @@ export interface PlannerSettings {
   fillEnabled: boolean;
   /** G6, the planner guards (docs/design/ai-spend.md §4.5) */
   guards: PlannerGuards;
+  /** Days a change the owner undid, declined or removed is not proposed again; 0: off (planner-act.md §4.3) */
+  refuseUndoneDays: number;
+  /** The act-mode rules this config breaks, in warn mode (one notice per text; planner-act.md §4.3) */
+  actRules: string[];
   /** Not errors: the planner runs, but the owner should know */
   warnings: string[];
 }
@@ -394,7 +429,7 @@ export function isInside(root: string, path: string): boolean {
  * project's agents block: the tasks file, the allowlist and done_pattern are
  * fill's, and the planner agent runs through the agents module.
  */
-export function parsePlannerConfig(raw: unknown, project: ProjectConfig): PlannerParseResult {
+export function parsePlannerConfig(raw: unknown, project: ProjectConfig, actRules: "warn" | "refuse" = ACT_RULES): PlannerParseResult {
   const parsed = PlannerSchema.safeParse(raw ?? {});
   if (!parsed.success) {
     return {
@@ -594,12 +629,19 @@ export function parsePlannerConfig(raw: unknown, project: ProjectConfig): Planne
     ["handled_messages", value.guards.handled_messages],
     ["skip_unchanged.mode", value.guards.skip_unchanged.mode],
     ["recheck_on_change", value.guards.recheck_on_change],
+    ["dedupe_pending", value.guards.dedupe_pending],
   ];
   for (const [key, mode] of guardModes) {
     if (mode !== "off" && !spendOn) {
       errors.push(`planner.guards.${key}: ${mode} needs agents.spend.enabled: true (a guard's verdicts and counts are written by spend)`);
     }
   }
+
+  const broken = actRuleProblems(value);
+  const migrate =
+    "; set, in this order: agents.spend.enabled: true, planner.guards.recheck_on_change: act, then planner.guards.prefilter_closed and planner.guards.dedupe_pending: observe or act";
+  if (actRules === "refuse") errors.push(...broken.map((m) => `${m}${migrate}`));
+  else warnings.push(...broken.map((m) => `${m} (refused from the next release)${migrate}`));
 
   // Files whoever can write chooses what the agents work on: keep them out of the repo the agents work in
   if (value.enabled) {
@@ -663,7 +705,10 @@ export function parsePlannerConfig(raw: unknown, project: ProjectConfig): Planne
         handledMessages: value.guards.handled_messages,
         skipUnchanged: { mode: value.guards.skip_unchanged.mode, maxSkipMs: value.guards.skip_unchanged.max_skip_hours * 3_600_000 },
         recheckOnChange: value.guards.recheck_on_change,
+        dedupePending: value.guards.dedupe_pending,
       },
+      refuseUndoneDays: value.act.refuse_undone_days,
+      actRules: actRules === "warn" ? broken : [],
       warnings,
     },
   };

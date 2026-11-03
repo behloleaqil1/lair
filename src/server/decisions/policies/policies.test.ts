@@ -221,7 +221,7 @@ function reader(inbox: DecisionInbox) {
     get: (id) => inbox.get(id),
     openPage: (after, limit) => inbox.openClassified(after, limit),
     recordPolicyTrace: (r) => inbox.recordPolicyTrace(r),
-    hasPolicyTrace: (a, b, c) => inbox.hasPolicyTrace(a, b, c),
+    hasPolicyTrace: (a, b, c, d) => inbox.hasPolicyTrace(a, b, c, d),
   });
 }
 
@@ -319,7 +319,7 @@ describe("shadow: trace and agreement on the real inbox", () => {
   it("a disagreement on an outward or irreversible proposal counts as unsafe; one on a reversible option does not", async () => {
     const { inbox } = setup();
     const trace = (decisionId: string, option: string) =>
-      inbox.recordPolicyTrace({ decisionId, proposer: "manual", version: "v", class: "agents.provider_limit", policy: "p", option, reasonCode: "r", confidence: 1, at: NOW.toISOString() });
+      inbox.recordPolicyTrace({ decisionId, proposer: "manual", version: "v", class: "agents.provider_limit", policy: "p", option, reasonCode: "r", confidence: 1, at: NOW.toISOString(), evidenceRev: 0, proposedOption: option });
     const goHold: DecisionOption[] = [
       { id: "go", label: "Go", consequences: "c", effect: "outward" },
       { id: "hold", label: "Hold", consequences: "c", effect: "reversible" },

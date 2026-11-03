@@ -29,10 +29,11 @@ export type { PolicyTable, Proposal, Proposer } from "./types.js";
 
 /**
  * A module that re-evaluates the evidence of decisions it raised (`cause_cleared`, `linked_issue`) for the
- * rules: the agents module. It does so only while the decision policies are on.
+ * rules: the agents module. It does so only while the decision policies are on; `liveFacts`: it also re-reads
+ * its open decisions' live facts (decision_policies.live_facts).
  */
 export interface EvidenceUpdates {
-  useEvidenceUpdates(on: boolean): void;
+  useEvidenceUpdates(on: boolean, options?: { liveFacts?: boolean }): void;
 }
 
 export interface MountDecisionPoliciesOptions {
@@ -56,6 +57,8 @@ export interface DecisionPoliciesOptions {
   events: EventBus;
   /** false: subscribe() does nothing, and status() reads no trace */
   enabled: boolean;
+  /** decision_policies.live_facts (shown in status()) */
+  liveFacts?: boolean;
   /** Why data/server.yaml's section was refused (shown with the table) */
   configErrors?: string[];
   clock?: () => Date;
@@ -80,7 +83,7 @@ export class DecisionPolicies {
         get: (id) => inbox.get(id),
         openPage: (after, limit) => inbox.openClassified(after, limit),
         recordPolicyTrace: (row) => inbox.recordPolicyTrace(row),
-        hasPolicyTrace: (id, proposer, version) => inbox.hasPolicyTrace(id, proposer, version),
+        hasPolicyTrace: (id, proposer, version, evidenceRev) => inbox.hasPolicyTrace(id, proposer, version, evidenceRev),
       }),
       () => [new RuleProposer(() => this.table)],
       options.clock,
@@ -111,6 +114,7 @@ export class DecisionPolicies {
   status(): DecisionPoliciesStatus {
     return {
       enabled: this.options.enabled,
+      liveFacts: this.options.enabled && this.options.liveFacts === true,
       source: this.source,
       version: this.table.version,
       policies: this.table.policies.map((p) => ({ id: p.id, class: p.class, codes: p.codes, answer: p.answer, state: p.state, maxTier: p.maxTier })),
@@ -129,11 +133,13 @@ export async function mountDecisionPolicies(fastify: FastifyInstance, options: M
   const config = loadDecisionPoliciesConfig(options.configPath, options.fileOptions);
   if (!config.ok) for (const error of config.errors) log(`decision policies off: ${error}`);
   const enabled = config.ok && config.settings.enabled;
+  const liveFacts = enabled && config.settings.liveFacts;
   const policies = new DecisionPolicies({
     policiesPath: options.policiesPath,
     inbox: options.inbox,
     events: options.events,
     enabled,
+    liveFacts,
     configErrors: config.ok ? [] : config.errors,
     clock: options.clock,
     log,
@@ -147,7 +153,7 @@ export async function mountDecisionPolicies(fastify: FastifyInstance, options: M
   });
   if (!enabled) return policies;
   const unsubscribe = policies.subscribe();
-  for (const producer of options.evidenceProducers ?? []) producer.useEvidenceUpdates(true);
+  for (const producer of options.evidenceProducers ?? []) producer.useEvidenceUpdates(true, { liveFacts });
   fastify.addHook("onClose", async () => {
     unsubscribe();
     for (const producer of options.evidenceProducers ?? []) producer.useEvidenceUpdates(false);

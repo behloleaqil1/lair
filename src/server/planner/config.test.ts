@@ -144,6 +144,7 @@ describe("planner config", () => {
       handledMessages: "off",
       skipUnchanged: { mode: "off", maxSkipMs: 24 * 3_600_000 },
       recheckOnChange: "off",
+      dedupePending: "off",
     });
 
     const guards = { prefilter_closed: "observe", handled_messages: "act", skip_unchanged: { mode: "observe", max_skip_hours: 6 }, recheck_on_change: "act" };
@@ -169,6 +170,7 @@ describe("planner config", () => {
       handledMessages: "act",
       skipUnchanged: { mode: "observe", maxSkipMs: 6 * 3_600_000 },
       recheckOnChange: "act",
+      dedupePending: "off",
     });
     expect(errorsOf(spendOn({ ...base, guards: { handled_messages: "sometimes" } }))[0]).toContain("planner.guards.handled_messages");
     expect(errorsOf(spendOn({ ...base, guards: { skip_unchanged: { mode: "act", max_skip_hours: 0 } } }))[0]).toContain(

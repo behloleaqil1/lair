@@ -20,6 +20,7 @@ import {
   getVerifierAgreement,
   proposalAction,
   resumeAction,
+  undoAction,
   runAction,
   send,
   type PlannerAction,
@@ -309,6 +310,8 @@ export function Planner({ project, refreshKey }: Props) {
             <div>
               <Badge tone={STATUS_BADGE[c.outcome] ?? "badge-neutral"}>{c.outcome}</Badge> <code>{c.op}</code> {c.task ?? ""}{" "}
               <span className="muted small">· {c.source} · {time(c.at)}</span>
+              {c.undoneBy && <span className="muted small"> · undone</span>}
+              {c.undoable && <> <Button size="sm" onClick={() => act(undoAction(project, c))}>Undo</Button></>}
             </div>
             <div className="muted small">{c.reason}</div>
             {c.diff.length > 0 && <pre className="code-block">{c.diff.join("\n")}</pre>}

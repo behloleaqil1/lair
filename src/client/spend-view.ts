@@ -377,6 +377,7 @@ const GUARD_TEXT: Record<SpendGuardId, { name: string; one: string; many: (n: nu
   planner_handled_messages: { name: "Planner: mark carried-out requests", one: "marked a request carried out once", many: (n) => `marked requests carried out ${n} times` },
   planner_skip_unchanged: { name: "Planner: skip a run when nothing changed", one: "skipped a planner run once", many: (n) => `skipped planner runs ${n} times` },
   planner_recheck_on_change: { name: "Planner: keep what still holds after a tasks-file edit", one: "kept a run's valid proposals once", many: (n) => `kept runs' valid proposals ${n} times` },
+  planner_dedupe_pending: { name: "Planner: refuse a proposal already pending", one: "refused a pending duplicate once", many: (n) => `refused pending duplicates ${n} times` },
 };
 
 export const MODE_LABEL: Record<SpendGuardView["mode"], string> = { off: "off", observe: "watching", act: "on" };

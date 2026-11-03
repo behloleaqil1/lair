@@ -48,6 +48,7 @@ export const GUARD_KEYS: Record<SpendGuardId, { path: string[]; root: "agents" |
   planner_handled_messages: { root: "planner", path: ["guards", "handled_messages"], fallback: "off" },
   planner_skip_unchanged: { root: "planner", path: ["guards", "skip_unchanged", "mode"], fallback: "off" },
   planner_recheck_on_change: { root: "planner", path: ["guards", "recheck_on_change"], fallback: "off" },
+  planner_dedupe_pending: { root: "planner", path: ["guards", "dedupe_pending"], fallback: "off" },
 };
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
