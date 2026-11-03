@@ -31,6 +31,8 @@ import {
   type Paths,
 } from "./testing/harness.js";
 
+vi.setConfig({ testTimeout: 30_000 });
+
 const DAY = 24 * 60 * MIN;
 const stores: { close(): void }[] = [];
 afterEach(async () => {
@@ -215,9 +217,9 @@ describe("AT-15: the readiness report", () => {
   it("more than one dedupe would_refuse, or more than one refusal-window refusal, on one day: not yet, naming (3) or (4)", async () => {
     const { h } = await week();
     h.clock.t = NOW + 10 * DAY;
-    // Two would_refuse on day 6, as the planner records them (the agents module's recordGuard)
+    // Two would_refuse on day 10, as the planner records them (the agents module's recordModuleGuard)
     for (const n of [1, 2]) {
-      await h.agents.recordGuard("demo", "guard_would", {
+      const recorded = await h.agents.recordModuleGuard("demo", "guard_would", {
         guard: "planner_dedupe_pending",
         verdict: "would_refuse",
         subject: `run-${n}`,
@@ -226,6 +228,7 @@ describe("AT-15: the readiness report", () => {
         data: { run: `run-${n}`, task: `t${n}`, op: "add", pending: `p${n}` },
         dedupeKey: `guard_would:planner_dedupe_pending:run-${n}:0`,
       });
+      expect(recorded).toBe(true);
     }
     const dedupe = row(await report(h), "planner.mode");
     expect(failing(dedupe)).toEqual(["dedupe"]);

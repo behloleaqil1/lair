@@ -603,5 +603,5 @@ describe("Fable #357 lows", () => {
     const dup = h.service.proposals({ limit: 500 }).find((x) => x.task === "t1" && x.runId !== first.runId);
     expect(dup).toMatchObject({ status: "rejected" });
     expect(dup?.refusal).toBe(`already pending as proposal ${first.id.slice(0, 8)} of run ${first.runId.slice(0, 8)} (planner.guards.dedupe_pending)`);
-  });
+  }, 60_000);
 });

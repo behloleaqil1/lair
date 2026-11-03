@@ -42,6 +42,7 @@ import type {
   PlannerOverviewView,
   PlannerRunView,
   PlannerStatusView,
+  PlannerReadinessView,
   PlanTaskView,
   ProposalStatus,
   RefusalView,
@@ -95,6 +96,7 @@ import {
 import { proposalView, UNDOABLE_OPS, type ChangeInput, type PlannerStore, type StoredProposal, type StoredRun } from "./store.js";
 import { applyEdit, diffOf, diffTexts, findTask, parseTasksDoc, renderLine, type TaskEdit, type TasksDoc } from "./tasks-file.js";
 import { parseVerdicts, readVerdictsFile, verifierSection, VERDICTS_FILE } from "./verifier.js";
+import { MODE_HISTORY, nextModeHistory, readinessReport, switchedAt, WOULD, type ModeEntry, type WouldRecord } from "./readiness.js";
 import { checkFinishOwnership, type PrSource } from "./pr-ownership.js";
 
 /** The module name the planner raises decisions as. */
@@ -170,6 +172,8 @@ const REFUSED = "refused";
 const MAX_REFUSED = 1000;
 /** The hash of the act-mode rules the last planner.act_rules notice was about (one notice per config text) */
 const ACT_RULES_NOTICE = "act_rules_notice";
+/** When the act streak the last planner.act_readiness notice was about began (one notice per switch to act) */
+const READINESS_NOTICE = "act_readiness_notice";
 
 interface RefusalRecord {
   op: string;
@@ -186,7 +190,7 @@ const refusalKey = (op: string, task: string, textHash: string) => `${op}:${task
 /** The text a refusal is keyed by: an add's or reword's description, a reassign's agent, nothing for the other ops. */
 const keyText = (op: string, text: string | null, agent: string | null): string =>
   op === "add" || op === "reword" ? clean(text ?? "", 500) : op === "reassign" ? (agent ?? "") : "";
-const WHY_VERB: Record<RefusalView["why"], string> = { undid: "undid", declined: "declined", removed: "removed" };
+const WHY_VERB: Record<RefusalView["why"], string> = { undid: "undid", declined: "declined", removed: "removed", reverted: "changed back" };
 /** The start of the reason of a proposal Lair holds for the owner because of an earlier refusal (never applies by itself) */
 export const REFUSAL_HOLD = "Lair holds this for you: ";
 
@@ -352,6 +356,9 @@ export class PlannerService {
   private ended = false;
   /** The stall last reported (noteStall), so each is reported once */
   private stallKey: string | null = null;
+  /** planner.mode act while the readiness report says not yet: checked at the first cycle after a load */
+  private readinessChecked = false;
+  private readinessWarning: string | null = null;
 
   constructor(options: PlannerServiceOptions) {
     this.project = options.project;
@@ -442,6 +449,7 @@ export class PlannerService {
   private async cycleAt(now: number): Promise<void> {
     this.finishIntent();
     await this.actRulesNotice();
+    if (this.settings.actEvidence.enabled) await this.noteModes(now);
     const plan = this.readPlans();
     const owner = this.readOwner();
     this.planTasks = withReadiness(plan.tasks);
@@ -1792,9 +1800,8 @@ export class PlannerService {
     if (guards.handledMessages !== "off") ctx.messages = new Set((this.state<Record<string, string[]>>(RUN_MESSAGES) ?? {})[run.id] ?? []);
     if (guards.prefilterClosed === "act") ctx.ownMerged = this.ownMerged(this.mergedPrs());
     // planner-act.md §4.3: the refusal window, and a proposal still pending from an earlier run (dedupe_pending act)
-    const earlier = this.store.listProposals(this.project, { status: "pending", limit: 5000 }).filter((p) => p.runId !== run.id);
     const duplicateOf = (p: { op: string; task: string; agent: string | null; text: string | null }) =>
-      earlier.find((e) => e.op === p.op && e.task === p.task && e.agent === p.agent && (p.op !== "reword" || e.text === p.text)) ?? null;
+      this.store.pendingTwin(this.project, { op: p.op, task: p.task, agent: p.agent, ...(p.op === "reword" ? { text: p.text } : {}) }, run.id);
     ctx.refusedBefore = (p) => {
       const refused = this.refusedBefore(p.op, p.task, keyText(p.op, p.text, p.agent), now);
       if (refused || guards.dedupePending !== "act") return refused;
@@ -2643,7 +2650,11 @@ export class PlannerService {
   /** One planner.act_rules notice per config text while act mode lacks the guards it needs (warn mode, D1). */
   private async actRulesNotice(): Promise<void> {
     const rules = this.settings.actRules;
-    if (rules.length === 0) return;
+    if (rules.length === 0) {
+      // The config meets the rules now: breaking them again later is news, so it raises a new notice
+      if (this.state<string>(ACT_RULES_NOTICE) !== null) this.setState(ACT_RULES_NOTICE, null);
+      return;
+    }
     const hash = sha256(rules.join("\n"));
     if (this.state<string>(ACT_RULES_NOTICE) === hash) return;
     const raised = await this.raise({
@@ -2762,7 +2773,7 @@ export class PlannerService {
       const was = body(last.diff.find((d) => d.startsWith("-")));
       const wrote = body(last.diff.find((d) => d.startsWith("+")));
       if (wrote !== clean(before.rows[line.line - 1], 2000) || was !== clean(after.rows[now_.line - 1], 2000)) continue;
-      records.push(this.refusalRecord(last.op, line.task, keyText(last.op, line.description, line.agent), "removed", now));
+      records.push(this.refusalRecord(last.op, line.task, keyText(last.op, line.description, line.agent), "reverted", now));
     }
     this.addRefusals(records);
     for (const line of after.tasks) if (!findTask(before, line.task)) this.releaseHolds(line.task);
@@ -2905,6 +2916,92 @@ export class PlannerService {
     });
   }
 
+  // ============ READINESS (docs/design/planner-act.md §4.4) ============
+
+  /**
+   * planner.act_evidence on: the modes of this load join mode_history when they differ from its newest entry. Once per
+   * load, planner.mode act while the report says not yet gives a load warning and one notice per switch to act.
+   */
+  private async noteModes(now: number): Promise<void> {
+    const g = this.settings.guards;
+    const entry: ModeEntry = {
+      at: now,
+      mode: this.settings.mode,
+      guards: {
+        prefilter_closed: g.prefilterClosed,
+        handled_messages: g.handledMessages,
+        skip_unchanged: g.skipUnchanged.mode,
+        recheck_on_change: g.recheckOnChange,
+        dedupe_pending: g.dedupePending,
+      },
+      // The backlog and spec parts (planner-act.md §8 PRs 3-5) add their modes here
+      parts: {},
+    };
+    const history = nextModeHistory(this.state<ModeEntry[]>(MODE_HISTORY) ?? [], entry);
+    if (history) this.setState(MODE_HISTORY, history);
+    if (this.readinessChecked) return;
+    this.readinessChecked = true;
+    if (this.settings.mode !== "act") return;
+    const row = this.buildReadiness(now).rows.find((r) => r.part === "planner.mode");
+    if (row?.verdict !== "not_yet") return;
+    const failing = row.criteria.filter((c) => !c.ok);
+    this.readinessWarning = `planner.mode: act is set, but the readiness report says not yet: ${failing.map((c) => c.label).join(", ")} (GET /api/planner/readiness)`;
+    console.warn(`[planner] ${this.project}: ${this.readinessWarning}`);
+    const switched = switchedAt(this.state<ModeEntry[]>(MODE_HISTORY) ?? [], "planner.mode") ?? now;
+    if (this.state<number>(READINESS_NOTICE) === switched) return;
+    const raised = await this.raise({
+      kind: "other",
+      attention: "notice",
+      key: `act_readiness:${switched}`,
+      ref: "planner",
+      title: "The planner runs in act mode before the readiness report says ready",
+      context: [
+        ...failing.map((c) => `- ${c.label}: ${c.detail}`),
+        "",
+        "Nothing is refused: you may know something the numbers don't. The Planner view shows the report; switch planner.mode back to observe if it should wait.",
+      ].join("\n"),
+      options: [{ id: "noted", label: "Noted", consequences: "The notice closes. Nothing else changes.", effect: "reversible" }],
+      recommended: { optionId: "noted", reasoning: "Nothing is decided here: the mode is the project's config." },
+      class: "planner.act_readiness",
+      evidence: { code: "act_not_ready", facts: { failing: failing.length }, cause_cleared: false, linked_issue: null },
+    });
+    // Not raised (no inbox yet, or it failed): the next load tries again
+    if (raised !== null) this.setState(READINESS_NOTICE, switched);
+  }
+
+  private buildReadiness(now: number): PlannerReadinessView {
+    const { days, minSamples, minAgreement } = this.settings.actEvidence;
+    const since = now - days * DAY_MS;
+    const history = this.state<ModeEntry[]>(MODE_HISTORY) ?? [];
+    const switched = switchedAt(history, "planner.mode");
+    const verifier = this.settings.verifier;
+    const agentsStore = this.agents.store();
+    const dedupe = agentsStore
+      ?.listEvents(this.project, { kinds: ["guard_would", "guard_did"], since, limit: 10_000 })
+      .filter((e) => e.data.guard === "planner_dedupe_pending")
+      .map((e) => e.at);
+    return readinessReport({
+      now,
+      days,
+      minSamples,
+      minAgreement,
+      autoOps: verifier ? verifier.autoApply.filter((op) => this.settings.approval[op] === "never") : [],
+      // A proposal Lair held for the owner carries Lair's unsure, not the verifier's
+      proposals: this.store.proposalsSince(this.project, since).filter((p) => !heldByLair(p)),
+      changes: this.store.changesSince(this.project, Math.min(since, switched ?? since)),
+      dedupeEvents: dedupe ?? null,
+      history,
+      would: this.state<WouldRecord[]>(WOULD) ?? [],
+      doneMarker: this.settings.doneMarker,
+    });
+  }
+
+  /** GET /api/planner/readiness: read-only (no state, no event, no notice). 409 while planner.act_evidence is off. */
+  readiness(): PlannerReadinessView {
+    if (!this.settings.actEvidence.enabled) throw new PlannerError(409, "The readiness report is off: set planner.act_evidence.enabled: true");
+    return this.buildReadiness(this.clock.now());
+  }
+
   // ============ VIEWS ============
 
   status(errors: string[] = []): PlannerStatusView {
@@ -2920,6 +3017,7 @@ export class PlannerService {
       errors,
       warnings: [
         ...this.settings.warnings,
+        ...(this.readinessWarning ? [this.readinessWarning] : []),
         ...(this.config.read_only === true ? ["the project is read_only: the planner writes nothing and starts no run"] : []),
       ],
       counts: {
@@ -2968,7 +3066,8 @@ export class PlannerService {
         .reverse()
         .slice(0, 200)
         .map(([id, record]) => handledView(id, record)),
-      refusals: Object.values(this.state<Record<string, RefusalRecord>>(REFUSED) ?? {})
+      // Through refusals(): with refuse_undone_days 0 nothing is refused or held, so nothing is listed
+      refusals: this.refusals()
         .reverse()
         .slice(0, 200)
         .map((r) => ({ op: r.op, task: r.task, at: iso(r.at), why: r.why, held: this.holdActive(r) })),

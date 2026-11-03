@@ -8,15 +8,17 @@
  * docs/configuration.md#planner).
  */
 import { useEffect, useState } from "react";
-import type { ChangeView, PlannerOverviewView, PlannerRunView, ProposalView } from "../../shared/planner-types";
+import type { ChangeView, PlannerOverviewView, PlannerReadinessView, PlannerRunView, ProposalView } from "../../shared/planner-types";
 import { Badge } from "../ui/Badge";
 import { Button } from "../ui/Button";
+import { ReadinessPanel } from "./PlannerReadiness";
 import {
   checkNowAction,
   getHistory,
   getOverview,
   getProposals,
   getRuns,
+  getReadiness,
   getVerifierAgreement,
   proposalAction,
   resumeAction,
@@ -61,6 +63,8 @@ interface Data {
   runs: PlannerRunView[];
   history: ChangeView[];
   agreement: VerifierAgreementStats | null;
+  /** null while planner.act_evidence is off (the route answers 409) */
+  readiness: PlannerReadinessView | null;
 }
 
 export function Planner({ project, refreshKey }: Props) {
@@ -79,10 +83,11 @@ export function Planner({ project, refreshKey }: Props) {
       getRuns(project),
       getHistory(project),
       getVerifierAgreement(project).catch(() => null),
+      getReadiness(project).catch(() => null),
     ])
-      .then(([overview, pending, recent, runs, history, agreement]) => {
+      .then(([overview, pending, recent, runs, history, agreement, readiness]) => {
         if (!live) return;
-        setData({ overview, pending, recent: recent.filter((p) => p.status !== "pending").slice(0, 50), runs, history, agreement });
+        setData({ overview, pending, recent: recent.filter((p) => p.status !== "pending").slice(0, 50), runs, history, agreement, readiness });
         setError(null);
       })
       .catch((e: unknown) => {
@@ -116,7 +121,7 @@ export function Planner({ project, refreshKey }: Props) {
     );
   }
   if (!data) return <div className="loading">Loading the planner...</div>;
-  const { overview: o, pending, recent, runs, history, agreement } = data;
+  const { overview: o, pending, recent, runs, history, agreement, readiness } = data;
 
   return (
     <div>
@@ -149,6 +154,8 @@ export function Planner({ project, refreshKey }: Props) {
         {o.paused && <Button size="sm" variant="primary" onClick={() => act(resumeAction(project))}>Resume planner runs</Button>}
         {notice && <span className="muted small">{notice}</span>}
       </div>
+
+      {readiness && <ReadinessPanel report={readiness} />}
 
       <div className="card">
         <h3>Waiting for you ({pending.length})</h3>

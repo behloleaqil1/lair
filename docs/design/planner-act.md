@@ -1,6 +1,7 @@
 # Planner act mode and the ready backlog
 
-- **Status:** design, not built. Nothing here is code yet.
+- **Status:** §8 PRs 1 (act safety) and 2 (readiness report) are built; PRs 3-6 are design. [planner.md](planner.md)
+  describes what is built.
 - **Base:** main `8181543`. Every file:line below was checked on that commit (the cited files are the same as on
   `0debc32`). It includes AI spend G6 (#322, merged `99ba9209`) and the verifier's PR ownership check (#308, merged
   `4f62b7f`).
@@ -346,9 +347,10 @@ A plan task can need a spec before it is built. It needs one when:
   `reword`, the text is compared as well. In observe, it is recorded as `would_refuse` and kept.
 - **Merged PRs for the verifier** (#298, second half). With `prefilter_closed: act` the verifier already gets the
   newest 200 merged PRs through the planner's context (`closed.mergedPrs`, `guards.ts:135-139`, embedded by
-  `verifier.ts:192-195`). With `prefilter_closed` `off` or `observe`, the verifier's context alone gains the same
-  block, from the same source and with the same limit (`MAX_CLOSED_LISTED`). The planner's own context is unchanged.
-  This is data only: the verifier still decides.
+  `verifier.ts:192-195`). With `prefilter_closed: observe`, the verifier's context alone gains the same block, from
+  the same source and with the same limit (`MAX_CLOSED_LISTED`). The planner's own context is unchanged. With
+  `prefilter_closed: off` neither context has it: off is today's behaviour (§8, every part off by default; AT-20's
+  verifier half is checked with `observe`). This is data only: the verifier still decides.
 
 **Notices for outside edits (D3).** One notice per planner run, which is G6's existing `planner_recheck_on_change`
 notice (`service.ts:620`, deduplicated per run by `guardNotice`). Each further edit in the same run raises no notice
@@ -405,7 +407,13 @@ The Planner view shows an Undo button on each applied change that can be undone.
 Turning a part to `act` stays a config change by the owner. Lair never switches a mode by itself. To support that
 choice, Lair computes a readiness report for each part over the last `act_evidence.days` days (default 7). It reads
 only `planner.db` and the spend events, and is shown by `GET /api/planner/readiness` (owner only) and in the Planner
-view.
+view. Like every new part it is behind a switch, `act_evidence.enabled` (default `false`): off, Lair keeps no mode
+history, the route answers 409 and nothing warns. Turn it on together with the parts' `observe`.
+
+The `would_add`, `would_assign` and `would_spec` records the report counts are kept in `planner_state` under
+`act_evidence` (the newest 2,000), each `{kind, task, agent, at, planText, specLink}`, written by the part that would
+have acted (PRs 3-5). A `would_add` fails when its `planText` matches the skip marker or its task was done by `at`; a
+`would_spec` fails when the part found a merged spec link (`specLink`).
 
 **Mode history (new).** On every config load and reload, the planner appends `{at, planner.mode, each guard's mode,
 each part's mode}` to `planner_state` under `mode_history`, only when it differs from the newest entry, newest 200.
@@ -467,6 +475,7 @@ planner:
   guards:                          # G6 (config.ts:172-191) plus:
     dedupe_pending: off            # off | observe | act
   act_evidence:
+    enabled: false                 # the mode history, the report and its load warning
     days: 7                        # 1-60
     min_samples: 20                # 1-1000
     min_agreement: 0.9             # (0, 1]

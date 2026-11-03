@@ -9,6 +9,7 @@
  *   GET  /api/planner/proposals?status=&limit=
  *   GET  /api/planner/runs?limit=
  *   GET  /api/planner/history?limit=             changes with their diffs
+ *   GET  /api/planner/readiness                  the evidence to switch each part to act (read-only; 409 while act_evidence is off)
  *   POST /api/planner/check                      run a cycle now
  *   POST /api/planner/proposals/:id/approve      {confirm: true}
  *   POST /api/planner/proposals/:id/reject       {confirm: true}
@@ -125,6 +126,18 @@ export async function registerPlannerRoutes(
       const service = serviceOf(reply, projectOf(query.data));
       if (!service) return reply;
       return respond(service.verifierAgreement());
+    });
+
+    app.get("/api/planner/readiness", ownerOnly, async (request, reply) => {
+      const query = ProjectQuery.safeParse(request.query ?? {});
+      if (!query.success) return fail(reply, 400, "Invalid query");
+      const service = serviceOf(reply, projectOf(query.data));
+      if (!service) return reply;
+      try {
+        return respond(service.readiness());
+      } catch (e) {
+        return handle(reply, e);
+      }
     });
 
     app.post("/api/planner/check", ownerOnly, async (request, reply) => {
