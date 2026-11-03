@@ -191,7 +191,9 @@ export type MergeConditionId =
   | "findings"
   | "mergeable"
   | "up_to_date"
-  | "holds";
+  | "holds"
+  /** review.merge.external_gate.gate_rules (only while external_gate is act) */
+  | "gate_rules";
 
 export interface MergeCondition {
   id: MergeConditionId;
@@ -214,6 +216,16 @@ export interface MergePlan {
 }
 
 // ============ API RESPONSES ============
+
+/** What the external-gate sweep would do with a PR at its head (docs/design/merge-external-gate.md). */
+export interface ExternalGateVerdict {
+  mode: "observe" | "act";
+  wouldMerge: boolean;
+  /** One line per failed condition, as in reasons */
+  reasons: string[];
+  /** The default-branch hold does not apply (the repository's hosted CI is not its signal) */
+  defaultRedExempt: boolean;
+}
 
 export interface PrReviewStatus {
   project: string;
@@ -255,6 +267,8 @@ export interface PrReviewStatus {
    * - null: auto-merge not enabled (merge.auto: false)
    */
   autoMergeStatus: "auto" | "manual" | null;
+  /** review.merge.external_gate's verdict at the head; null while it is off */
+  externalGate: ExternalGateVerdict | null;
   plan: MergePlan;
   readOnly: boolean;
   evaluatedAt: string;

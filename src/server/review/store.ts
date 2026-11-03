@@ -36,8 +36,22 @@ import type { SignedGateResult } from "../../shared/policy-types.js";
  * 5: review_prs.head_ref, .state and .state_seen_at: the PR's branch and
  *    state as the review module last read them from the host (the planner's
  *    closed-work guard reads which task's own PR merged from them).
+ * 6: review_merge_observations: what review.merge.external_gate's sweep
+ *    would do with each PR at a head, and why not.
  */
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
+
+export const SCHEMA_6 = `
+  CREATE TABLE IF NOT EXISTS review_merge_observations (
+    project TEXT NOT NULL,
+    pr INTEGER NOT NULL,
+    head_sha TEXT NOT NULL,
+    would_merge INTEGER NOT NULL,
+    reasons TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY (project, pr, head_sha)
+  );
+`;
 
 export const SCHEMA_5 = `
   ALTER TABLE review_prs ADD COLUMN head_ref TEXT;
@@ -512,6 +526,8 @@ export class ReviewStore {
         if (version < 4) this.db.exec(SCHEMA_4);
         // 4 -> 5: a PR's branch and state are unknown until the review module reads it again
         if (version < 5) this.db.exec(SCHEMA_5);
+        // 5 -> 6: no sweep observed anything before
+        if (version < 6) this.db.exec(SCHEMA_6);
         this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
       })();
     }
@@ -1231,6 +1247,48 @@ export class ReviewStore {
     return row.at;
   }
 
+  // ============ MERGE OBSERVATIONS (review.merge.external_gate) ============
+
+  /**
+   * Record the sweep's verdict for a PR at a head (at most 20 reasons). True
+   * when the verdict or the reasons differ from the row there before (or
+   * there was none), so a caller announces only a change.
+   */
+  observeMerge(project: string, pr: number, headSha: string, wouldMerge: boolean, reasons: string[], at: string): boolean {
+    const kept = JSON.stringify(reasons.slice(0, 20));
+    return this.db.transaction(() => {
+      const before = this.db
+        .prepare(`SELECT would_merge, reasons FROM review_merge_observations WHERE project = ? AND pr = ? AND head_sha = ?`)
+        .get(project, pr, headSha) as { would_merge: number; reasons: string } | undefined;
+      this.db
+        .prepare(
+          `INSERT INTO review_merge_observations (project, pr, head_sha, would_merge, reasons, observed_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(project, pr, head_sha) DO UPDATE SET
+             would_merge = excluded.would_merge, reasons = excluded.reasons, observed_at = excluded.observed_at`,
+        )
+        .run(project, pr, headSha, wouldMerge ? 1 : 0, kept, at);
+      return !before || before.would_merge !== (wouldMerge ? 1 : 0) || before.reasons !== kept;
+    })();
+  }
+
+  /** The newest observations, by PR number then time (at most `limit`). */
+  mergeObservations(project: string, limit = 200): MergeObservation[] {
+    const rows = this.db
+      .prepare(
+        `SELECT pr, head_sha, would_merge, reasons, observed_at FROM review_merge_observations
+         WHERE project = ? ORDER BY pr, observed_at LIMIT ?`,
+      )
+      .all(project, limit) as { pr: number; head_sha: string; would_merge: number; reasons: string; observed_at: string }[];
+    return rows.map((r) => ({
+      pr: r.pr,
+      headSha: r.head_sha,
+      wouldMerge: r.would_merge === 1,
+      reasons: JSON.parse(r.reasons) as string[],
+      observedAt: r.observed_at,
+    }));
+  }
+
   /**
    * Automatic merges this process is running, by "<project>:<pr>:<head>".
    * In memory only: after a restart none runs. It lives with the store,
@@ -1245,6 +1303,14 @@ export class ReviewStore {
  * tried again at this head), `skipped` (the head moved or the policy changed
  * as it started: it may be tried again), `interrupted` (a restart stopped it).
  */
+export interface MergeObservation {
+  pr: number;
+  headSha: string;
+  wouldMerge: boolean;
+  reasons: string[];
+  observedAt: string;
+}
+
 export type AutoMergeState = "started" | "merged" | "failed" | "skipped" | "interrupted";
 
 export interface AutoMergeRecord {

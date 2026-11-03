@@ -129,6 +129,37 @@ const GateSchema = z.discriminatedUnion("source", [
     .strict(),
 ]);
 
+/** review.merge.external_gate (docs/design/merge-external-gate.md): merging on the signed gate at the exact head */
+const GateRuleSchema = z
+  .object({
+    id: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/, "use lowercase letters, digits, - and _"),
+    /** Path globs (as in tiers.rules); a changed file matching one makes the rule apply */
+    paths: z.array(z.string().min(1).max(200)).min(1).max(50),
+    /** Plain substrings (no regex): with them, only a matching file whose added lines contain one applies */
+    added_line_contains: z.array(z.string().min(1).max(200)).max(50).default([]),
+    /** Any one option met by any one trusted pass at the head meets the rule */
+    needs_any: z
+      .array(
+        z
+          .object({
+            pipelines: z.array(PipelineId).min(1).max(50).optional(),
+            reports: z.array(z.string().min(1).max(200)).min(1).max(50).optional(),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(20),
+  })
+  .strict();
+
+const ExternalGateSchema = z
+  .object({
+    mode: z.enum(["off", "observe", "act"]).default("off"),
+    tiers: z.array(TierSchema).min(1).optional(),
+    gate_rules: z.array(GateRuleSchema).max(50).default([]),
+  })
+  .strict();
+
 const IdentitySchema = z
   .object({
     name: z.string().min(1),
@@ -161,6 +192,7 @@ const MergeSchema = z
     auto_tiers: z.array(TierSchema).optional(),
     /** The least time between two automatic merges of the project */
     auto_min_interval_seconds: z.number().int().min(0).max(86_400).default(120),
+    external_gate: ExternalGateSchema.default({}),
   })
   .strict();
 
@@ -282,6 +314,23 @@ export interface MergeSettings {
   /** Tiers automatic merge applies to; null means all tiers */
   autoTiers: Tier[] | null;
   autoMinIntervalSeconds: number;
+  externalGate: ExternalGateSettings;
+}
+
+export interface GateRule {
+  id: string;
+  paths: string[];
+  addedLineContains: string[];
+  needsAny: { pipelines: string[] | null; reports: string[] | null }[];
+}
+
+export interface ExternalGateSettings {
+  mode: "off" | "observe" | "act";
+  /** Tiers it merges (act) or reports as mergeable (observe); null: every tier */
+  tiers: Tier[] | null;
+  gateRules: GateRule[];
+  /** The review repository's hosted CI is not its signal (pr_health.repos.<repo>.ci_signal: false): no default-red hold */
+  defaultRedExempt: boolean;
 }
 
 export interface IntegritySettings {
@@ -454,7 +503,7 @@ function reviewerPools(
 
 export function parseReviewConfig(
   raw: unknown,
-  project: Pick<ProjectConfig, "github"> & Partial<Pick<ProjectConfig, "agents" | "ai">>,
+  project: Pick<ProjectConfig, "github"> & Partial<Pick<ProjectConfig, "agents" | "ai" | "pr_health">>,
 ): ParseResult {
   const parsed = ReviewSchema.safeParse(raw ?? {});
   if (!parsed.success) {
@@ -577,6 +626,8 @@ export function parseReviewConfig(
     errors.push("review.merge.auto_tiers: an empty array is a config error; use auto: false instead");
   }
 
+  if (merge) errors.push(...externalGateErrors(merge));
+
   if (errors.length > 0) return { ok: false, errors };
 
   const identity = merge?.identity ?? null;
@@ -646,7 +697,61 @@ export function parseReviewConfig(
         auto: merge?.auto ?? false,
         autoTiers: merge?.auto_tiers ?? null,
         autoMinIntervalSeconds: merge?.auto_min_interval_seconds ?? 120,
+        externalGate: {
+          mode: merge?.external_gate.mode ?? "off",
+          tiers: merge?.external_gate.tiers ?? null,
+          gateRules: (merge?.external_gate.gate_rules ?? []).map((r) => ({
+            id: r.id,
+            paths: r.paths,
+            addedLineContains: r.added_line_contains,
+            needsAny: r.needs_any.map((n) => ({ pipelines: n.pipelines ?? null, reports: n.reports ?? null })),
+          })),
+          defaultRedExempt: !hostedCiIsSignal(project.pr_health, repo ?? ""),
+        },
       },
     },
   };
+}
+
+/** The merge block's external_gate problems (it needs the signed gate, replaces merge.auto, names known pipelines). */
+function externalGateErrors(merge: z.infer<typeof MergeSchema>): string[] {
+  const ext = merge.external_gate;
+  const errors: string[] = [];
+  if (ext.mode === "off" && ext.gate_rules.length === 0) return errors;
+  const at = "review.merge.external_gate";
+  if (merge.gate.source !== "signed") {
+    errors.push(`${at}: needs merge.gate.source: signed (the signed gate at the head is the merge signal)`);
+  }
+  if (ext.mode === "act" && merge.auto) errors.push(`${at}.mode: act replaces merge.auto; set auto: false`);
+  const known = merge.gate.source === "signed" ? merge.gate.pipeline_versions : {};
+  const ids = new Set<string>();
+  for (const rule of ext.gate_rules) {
+    if (ids.has(rule.id)) errors.push(`${at}.gate_rules: duplicate rule id ${rule.id}`);
+    ids.add(rule.id);
+    rule.needs_any.forEach((need, i) => {
+      if (!need.pipelines && !need.reports) errors.push(`${at}.gate_rules.${rule.id}.needs_any[${i}]: needs pipelines or reports`);
+      for (const p of need.pipelines ?? []) {
+        if (!Object.prototype.hasOwnProperty.call(known, p)) {
+          errors.push(`${at}.gate_rules.${rule.id}.needs_any[${i}]: unknown pipeline ${p} (not in merge.gate.pipeline_versions)`);
+        }
+      }
+    });
+  }
+  return errors;
+}
+
+/**
+ * Whether the repository's hosted CI is its merge signal: false only when
+ * pr_health.repos.<owner/name>.ci_signal is false for it (names compared
+ * case-insensitively). Read from the raw block: PR health validates it.
+ */
+function hostedCiIsSignal(prHealth: unknown, repo: string): boolean {
+  if (!prHealth || typeof prHealth !== "object") return true;
+  const repos = (prHealth as { repos?: unknown }).repos;
+  if (!repos || typeof repos !== "object") return true;
+  for (const [name, over] of Object.entries(repos as Record<string, unknown>)) {
+    if (name.toLowerCase() !== repo.toLowerCase() || !over || typeof over !== "object") continue;
+    if ((over as { ci_signal?: unknown }).ci_signal === false) return false;
+  }
+  return true;
 }

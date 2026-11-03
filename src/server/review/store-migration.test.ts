@@ -11,7 +11,7 @@ import { createHash } from "crypto";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { ReviewStore, SCHEMA_1, SCHEMA_2, SCHEMA_3, SCHEMA_4, SCHEMA_VERSION } from "./store.js";
+import { ReviewStore, SCHEMA_1, SCHEMA_2, SCHEMA_3, SCHEMA_4, SCHEMA_5, SCHEMA_VERSION } from "./store.js";
 
 const HEAD = "a".repeat(40);
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -56,7 +56,7 @@ describe("review.db: schema 1 to 2", () => {
       const version = reader.pragma("user_version", { simple: true });
       reader.close();
       expect(version).toBe(SCHEMA_VERSION);
-      expect(SCHEMA_VERSION).toBe(5);
+      expect(SCHEMA_VERSION).toBe(6);
 
       const used = store.getRequest("demo", 7, HEAD, 0)!;
       expect(used).toMatchObject({
@@ -178,7 +178,7 @@ describe("review.db: schema 4 to 5", () => {
     const store = new ReviewStore(path);
     try {
       const reader = new Database(path);
-      expect(reader.pragma("user_version", { simple: true })).toBe(5);
+      expect(reader.pragma("user_version", { simple: true })).toBe(6);
       reader.close();
       expect(store.currentHead("demo", 7)).toBe(HEAD);
       expect(store.getAuthor("demo", 7)).toEqual({ id: "worker-a", kind: "agent" });
@@ -199,6 +199,38 @@ describe("review.db: schema 4 to 5", () => {
       ]);
       expect(store.mergedPrs("demo", 1)).toHaveLength(1);
       expect(store.mergedPrs("other", 10)).toEqual([]);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe("review.db: schema 5 to 6", () => {
+  it("keeps every row of a v5 file and adds merge observations, written and announced once per change", () => {
+    const dir = mkdtempSync(join(tmpdir(), "lair-review-v5-"));
+    dirs.push(dir);
+    const path = join(dir, "review.db");
+    const db = new Database(path);
+    for (const schema of [SCHEMA_1, SCHEMA_2, SCHEMA_3, SCHEMA_4, SCHEMA_5]) db.exec(schema);
+    db.pragma("user_version = 5");
+    db.prepare(`INSERT INTO review_prs (project, pr, head_sha, head_seen_at) VALUES ('demo', 7, ?, '2026-03-01T09:00:00.000Z')`).run(HEAD);
+    db.close();
+
+    const store = new ReviewStore(path);
+    try {
+      const reader = new Database(path);
+      expect(reader.pragma("user_version", { simple: true })).toBe(6);
+      reader.close();
+      expect(store.currentHead("demo", 7)).toBe(HEAD);
+      expect(store.mergeObservations("demo")).toEqual([]);
+
+      expect(store.observeMerge("demo", 7, HEAD, false, ["No hold: freeze"], "2026-03-02T09:00:00.000Z")).toBe(true);
+      expect(store.observeMerge("demo", 7, HEAD, false, ["No hold: freeze"], "2026-03-02T09:05:00.000Z")).toBe(false);
+      expect(store.observeMerge("demo", 7, HEAD, true, [], "2026-03-02T09:10:00.000Z")).toBe(true);
+      expect(store.mergeObservations("demo")).toEqual([
+        { pr: 7, headSha: HEAD, wouldMerge: true, reasons: [], observedAt: "2026-03-02T09:10:00.000Z" },
+      ]);
+      expect(store.mergeObservations("other")).toEqual([]);
     } finally {
       store.close();
     }

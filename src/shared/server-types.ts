@@ -238,6 +238,7 @@ export type EventType =
   | "review.decision_requested"
   | "review.merged"
   | "review.merge_refused"
+  | "review.merge_observed"
   // Agents (src/server/agents/)
   | "agent.run.requested"
   | "agent.run.started"

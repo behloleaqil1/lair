@@ -13,6 +13,7 @@ import type {
   FindingSeverity,
   MergeRefusal,
   MergeResponse,
+  ExternalGateVerdict,
   PrReviewStatus,
   PrSummary,
   ReviewerRef,
@@ -30,7 +31,7 @@ import type { DecisionEvidence } from "../../shared/decision-types.js";
 import type { EventBus } from "../core/event-bus.js";
 import { assessRisk } from "../policy/risk-rules.js";
 import { matchSlots, withSlotWaits } from "../policy/reviewer-slots.js";
-import { evaluateMergePolicy } from "../policy/merge-policy.js";
+import { evaluateMergePolicy, type MergePolicyInput } from "../policy/merge-policy.js";
 import { parseReviewConfig, type ReviewSettings } from "./config.js";
 import { mapAuthor } from "./authors.js";
 import { AGENTS_CHANNEL, AgentReviewAssigner, CHECK_INTERVAL_MS } from "./agent-assigner.js";
@@ -43,7 +44,8 @@ import type { ReadyFacts } from "../ready-guard/guard.js";
 import { newestChecks } from "../repos/checks.js";
 import { systemGit, type GitRunner } from "./git.js";
 import { LocalMerger, mergeOnHost, planMerge, type MergeExecution } from "./executor.js";
-import { ReviewStore, type AssignmentRecord, type AutoMergeState, type StoredReview } from "./store.js";
+import { ReviewStore, type AssignmentRecord, type AutoMergeState, type MergeObservation, type StoredReview } from "./store.js";
+import { gateRulesCondition } from "./gate-rules.js";
 import { checkEnvironment, runPreMergeCheck, systemCheckRunner, type CheckRunner } from "./check.js";
 import { hostChecksGate, signedGate, type GateSource } from "./gate-source.js";
 import { verifySignedGateResult } from "../gates/signature.js";
@@ -163,6 +165,11 @@ export function mergeFailedEvidence(pr: number, headSha: string, refusedBy: stri
     cause_cleared: false,
     linked_issue: null,
   };
+}
+
+/** Whether the scan runs the project's merge sweep: merge.auto, or review.merge.external_gate observe or act. */
+function sweeps(service: ReviewService): boolean {
+  return service.settings.merge.auto || service.settings.merge.externalGate.mode !== "off";
 }
 
 /** The Decision Inbox key of an automatic merge's failure (or interruption) at one head: one per PR and head. */
@@ -659,9 +666,13 @@ export class ReviewService {
       behindBy = null;
     }
     const holds = this.o.store.activeHolds(this.project, n);
-    const red = await this.defaultBranchRed(pr, defaultBranch, baseTip);
+    const ext = this.settings.merge.externalGate;
+    // R1 (docs/design/merge-external-gate.md): the hosted CI is not the signal, so in act a red default branch holds nothing
+    const exempt = ext.mode !== "off" && ext.defaultRedExempt;
+    const red =
+      ext.mode === "act" && exempt ? { red: false, hold: null } : await this.defaultBranchRed(pr, defaultBranch, baseTip);
 
-    const policy = evaluateMergePolicy({
+    const policyInput: MergePolicyInput = {
       pr: {
         state: pr.state,
         draft: pr.draft,
@@ -678,9 +689,38 @@ export class ReviewService {
       openBlocking,
       holds,
       defaultBranchRed: red.hold,
-    });
-
+    };
     const plan = planMerge(this.settings.merge);
+    let policy = evaluateMergePolicy(policyInput);
+    let externalGate: ExternalGateVerdict | null = null;
+    if (ext.mode !== "off") {
+      const g = this.settings.merge.gate;
+      // R2: any trusted pass at the head may meet a rule (a gate source other than signed is a config error: nothing trusted)
+      const rules = gateRulesCondition(
+        ext.gateRules,
+        files.map((f) => ({ path: f.path, patch: f.patch })),
+        this.o.store.gateResults(this.project, pr.headSha),
+        pr.headSha,
+        g.source === "signed"
+          ? { project: this.project, nodeKeys: g.nodeKeys, pipelineVersions: g.pipelineVersions }
+          : { project: this.project, nodeKeys: {}, pipelineVersions: {} },
+      );
+      const base = exempt ? evaluateMergePolicy({ ...policyInput, defaultBranchRed: null }) : policy;
+      const conditions = [...base.conditions, rules];
+      const failed = conditions.filter((c) => !c.ok).map((c) => `${c.label}: ${c.detail}`);
+      const held = exempt ? null : this.autoMergeHeld(red.red, redSlots);
+      const tiers = ext.tiers;
+      const extReasons = [
+        ...failed,
+        ...(plan.refusal ? [`Merge method: ${plan.refusal}`] : []),
+        ...(this.readOnly ? ["Read-only: the project sets read_only: true, so Lair does not merge"] : []),
+        ...(tiers && !tiers.includes(risk.tier) ? [`Tier: ${risk.tier} is not in external_gate.tiers (${tiers.join(", ")})`] : []),
+        ...(held ? [`Automatic merge: ${held}`] : []),
+      ];
+      externalGate = { mode: ext.mode, wouldMerge: extReasons.length === 0, reasons: extReasons, defaultRedExempt: exempt };
+      // In act the rules are the policy of every merge path; observe changes nothing
+      if (ext.mode === "act") policy = { allowed: failed.length === 0, conditions, reasons: failed };
+    }
     const reasons = [...policy.reasons];
     if (plan.refusal) reasons.push(`Merge method: ${plan.refusal}`);
     if (this.readOnly) reasons.push("Read-only: the project sets read_only: true, so Lair does not merge");
@@ -712,6 +752,7 @@ export class ReviewService {
       canMerge: policy.allowed && !plan.refusal && !this.readOnly,
       reasons,
       autoMergeStatus: this.autoMergeStatusFor(risk.tier),
+      externalGate,
       plan,
       readOnly: this.readOnly,
       evaluatedAt: this.now(),
@@ -1170,9 +1211,13 @@ export class ReviewService {
   async autoMerge(): Promise<AutoMergeOutcome | null> {
     await this.reportInterruptedAutoMerges();
     const merge = this.settings.merge;
-    if (!merge.auto || this.readOnly || this.closing || this.merging) return null;
+    // external_gate observe: the same sweep records what it would merge (R4) and merges nothing; act merges as auto does
+    const observing = merge.externalGate.mode === "observe";
+    const acting = merge.auto || merge.externalGate.mode === "act";
+    if ((!acting && !observing) || this.readOnly || this.closing || this.merging) return null;
     const last = this.o.store.lastAutoMergeStart(this.project);
-    if (last !== null && this.o.clock.now() - last < merge.autoMinIntervalSeconds * 1000) return null;
+    const mayAttempt = acting && !(last !== null && this.o.clock.now() - last < merge.autoMinIntervalSeconds * 1000);
+    if (!mayAttempt && !observing) return null;
 
     const open = (await this.o.host.listOpenPullRequests()).filter((p) => !p.draft).sort((a, b) => a.number - b.number);
     const start = open.findIndex((p) => p.number > this.autoCursor);
@@ -1193,6 +1238,8 @@ export class ReviewService {
       if (gate.length === 0 || gate.some((g) => g.status !== "passed")) continue;
       evaluated++;
       const { status, defaultBranchRed, redSlots } = await this.evaluate(pr.number);
+      if (observing && status.externalGate) this.recordObservation(status.number, status.headSha, status.externalGate);
+      if (!mayAttempt) continue;
       if (!status.canMerge || status.headSha !== pr.headSha) continue;
       // Check if this tier is in auto_tiers (null means all tiers allowed)
       if (!this.isAutoMergeTier(status.risk.tier)) continue;
@@ -1222,7 +1269,8 @@ export class ReviewService {
    * When auto_tiers is set, only listed tiers merge automatically.
    */
   private isAutoMergeTier(tier: Tier): boolean {
-    const autoTiers = this.settings.merge.autoTiers;
+    const merge = this.settings.merge;
+    const autoTiers = merge.externalGate.mode === "act" ? merge.externalGate.tiers : merge.autoTiers;
     return autoTiers === null || autoTiers.includes(tier);
   }
 
@@ -1233,8 +1281,20 @@ export class ReviewService {
    * - null: merge.auto is off
    */
   private autoMergeStatusFor(tier: Tier): "auto" | "manual" | null {
-    if (!this.settings.merge.auto) return null;
+    if (!this.settings.merge.auto && this.settings.merge.externalGate.mode !== "act") return null;
     return this.isAutoMergeTier(tier) ? "auto" : "manual";
+  }
+
+  /** Keep the sweep's verdict at this head; announce it only when it changed (a quiet project emits nothing per scan). */
+  private recordObservation(pr: number, headSha: string, verdict: ExternalGateVerdict): void {
+    if (this.o.store.observeMerge(this.project, pr, headSha, verdict.wouldMerge, verdict.reasons, this.now())) {
+      this.emit("review.merge_observed", { pr, headSha, wouldMerge: verdict.wouldMerge, reasons: verdict.reasons.slice(0, 20) });
+    }
+  }
+
+  /** What review.merge.external_gate's sweep recorded (observe), by PR. */
+  listMergeObservations(): MergeObservation[] {
+    return this.o.store.mergeObservations(this.project);
   }
 
   private async attemptAutoMerge(status: PrReviewStatus): Promise<AutoMergeOutcome> {
@@ -1827,9 +1887,11 @@ export class ReviewManager {
   /**
    * The automatic path: every project with reviews by agents requests the
    * missing reviews of its open PRs (ReviewService.requestOpenPullRequests),
-   * and every project with review.merge.auto merges at most one PR its
-   * policy allows (ReviewService.autoMerge). Automatic merges a restart
-   * interrupted are reported for every project, auto or not. Concurrent
+   * and every project with review.merge.auto (or external_gate act) merges
+   * at most one PR its policy allows (ReviewService.autoMerge); with
+   * external_gate observe the same sweep only records what it would merge.
+   * Automatic merges a restart interrupted are reported for every project,
+   * auto or not. Concurrent
    * calls share the scan in progress; it never rejects.
    */
   requestOpenPullRequests(): Promise<void> {
@@ -1844,11 +1906,11 @@ export class ReviewManager {
         }
         try {
           // autoMerge() reports them first itself
-          if (!service.settings.merge.auto) await service.reportInterruptedAutoMerges();
+          if (!sweeps(service)) await service.reportInterruptedAutoMerges();
         } catch (e) {
           console.warn(`[review] ${project}: reporting interrupted automatic merges failed: ${e instanceof Error ? e.message : e}`);
         }
-        if (service.settings.merge.auto) {
+        if (sweeps(service)) {
           try {
             await service.autoMerge();
           } catch (e) {

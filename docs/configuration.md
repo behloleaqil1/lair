@@ -1487,6 +1487,9 @@ Before anything is published, Lair checks every commit that would land on the ta
 | `merge.auto` | boolean | `false` | Merge every PR the policy allows, from the periodic scan of open PRs ([below](#automatic-merge)) |
 | `merge.auto_tiers` | array | — | Tiers that auto-merge applies to: `["amber", "green"]` excludes red; absent or null means all tiers |
 | `merge.auto_min_interval_seconds` | number | `120` | The least time between two automatic merge attempts of the project; skipped ones don't count (0 to 86400) |
+| `merge.external_gate.mode` | `off` \| `observe` \| `act` | `off` | Merge on the signed gate at the exact head, observed first ([below](#merging-on-an-external-gate-signal)) |
+| `merge.external_gate.tiers` | array | all tiers | Tiers the sweep merges (act) or reports as mergeable (observe) |
+| `merge.external_gate.gate_rules` | array | `[]` | Stricter gate requirements for PRs whose changes match (below) |
 
 Other keys: `provider` (`github`), `api_url` (default `https://api.github.com`), `token_env` (default `GITHUB_TOKEN`), `token_cmd` (an argv printing the token, used when `token_env` is unset), `default_branch`, `authors.models` (agent id to model). Unknown keys are config errors; a project with an invalid `review:` block has reviews off, and `GET /api/review/status` shows the errors.
 
@@ -1518,6 +1521,39 @@ With `merge.auto: true`, the review module's periodic scan of open PRs (every 60
 - **Read-only.** A project with `read_only: true` never merges, automatically or not.
 
 Start with `auto: false`, and compare the PRs shown as "Merge ready" with what you would merge, before you turn it on.
+
+### Merging on an external gate signal
+
+For a repository whose merge signal is a signed gate result from its own gate system (`merge.gate.source: signed`), not its hosted CI. Design: [docs/design/merge-external-gate.md](design/merge-external-gate.md).
+
+```yaml
+pr_health:
+  repos:
+    example/app: { ci_signal: false }   # its hosted CI is not the merge signal
+review:
+  merge:
+    gate: { source: signed, required: [{ any_of: [full, scoped] }], node_keys: { ... }, pipeline_versions: { full: "1", scoped: "1" } }
+    auto: false
+    external_gate:
+      mode: observe
+      tiers: [amber, green]
+      gate_rules:
+        - id: routes
+          paths: ["server/src/main/**/*.java"]
+          added_line_contains: ["@GetMapping", "@PostMapping"]
+          needs_any:
+            - { pipelines: [full] }
+            - { reports: [AccessControlTest] }
+```
+
+- **`mode: observe`.** The periodic scan (the automatic merge's, above, also with `merge.auto: false`) records for every open PR whose gate passed at its head whether Lair would merge it, with every reason it wouldn't. The verdict at each head is kept in the review store, and the event `review.merge_observed` is sent only when it changes. `GET /api/review/prs/:n` shows it as `externalGate: {mode, wouldMerge, reasons, defaultRedExempt}`. Nothing merges through it, no check runs and no decision is raised, and the policy of every other merge (the owner's button, `merge.auto`) is unchanged.
+- **`mode: act`.** The scan merges what it would merge, as `merge.auto` does (one per scan, `auto_min_interval_seconds` apart, `check_cmd`, recorded as `lair:policy`), for the tiers in `tiers`. The gate rules and the default-branch rule below become part of the policy for every merge of the project. `act` replaces `merge.auto`: both on is a config error.
+- **The default branch.** When `pr_health.repos.<owner/name>.ci_signal` is `false` for the review repository (names compared case-insensitively), a red default branch (`hold_when_default_red`) holds no PR and asks for no red-tier reviews: each PR's own gate at its head is the signal. Otherwise the hold works as before.
+- **Gate rules.** A rule applies when a changed file matches one of `paths` (globs as in `tiers.rules`) and, with `added_line_contains`, one of its added lines contains one of the strings (plain text, no patterns). A file whose patch the host left out (a very large diff) counts as matching. It is met when any signed result at the head that the gate would trust (known node, valid signature, this project, the configured pipeline version) passed and meets one `needs_any` entry: its pipeline is one of `pipelines`, and each of `reports` is part of one of its signed report names (each given part must hold). A pass with a newer trusted failure of the same pipeline at the head doesn't count. An unmet rule is the condition `Gate rules: <id> needs a passed gate at <head> with ...`. A pipeline in `needs_any` that isn't in `merge.gate.pipeline_versions`, an entry with neither key, and a duplicate id are config errors.
+- **What stays.** A PR whose base is not the default branch is never merged. A PR on hold (`POST /api/review/holds`) isn't either. An attempt refused at a head (for example by `check_cmd`) is not tried again until the head changes.
+- `external_gate` with `merge.gate.source: checks` is a config error.
+
+Run `observe` until its verdicts match what you would merge, then set `act` (and `auto: false`).
 
 ### Gates from an external queue through triage
 
