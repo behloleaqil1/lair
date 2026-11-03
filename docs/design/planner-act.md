@@ -359,8 +359,9 @@ repeats were silent *overwrites*, and with the guard in act nothing is overwritt
   outside edit.
 - `planner.mode: act` requires `guards.prefilter_closed` and `guards.dedupe_pending` to be at least `observe`.
 - These two rules **warn** in the first release that has them (a load warning plus one `attention: notice` item of
-  class `planner.act_rules` per project and config text, naming the keys to set; D1), and **refuse** from the next release. The switch between the two is one constant, changed in its
-  own PR. Existing `act` installs keep working through one release.
+  class `planner.act_rules` per project and config text, naming the keys to set; D1), and **refuse** from the next
+  release. The switch between the two is one constant, changed in its own PR. Existing `act` installs keep working
+  through one release.
 - `backlog.mode: act`, `backlog.assign: act` or `spec_first.mode: act` while `planner.mode` is `observe` is refused at
   once (new keys, so no install has them). Observe writes nothing, so those settings would be a no-op that looks
   active.
