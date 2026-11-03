@@ -1,8 +1,9 @@
 # Planner act mode and the ready backlog
 
 - **Status:** design, not built. Nothing here is code yet.
-- **Base:** main `0debc32`. Every file:line below is on that commit. It includes AI spend G6 (#322, merged
-  `99ba9209`) and the verifier's PR ownership check (#308, merged `4f62b7f`).
+- **Base:** main `8181543`. Every file:line below was checked on that commit (the cited files are the same as on
+  `0debc32`). It includes AI spend G6 (#322, merged `99ba9209`) and the verifier's PR ownership check (#308, merged
+  `4f62b7f`).
 - **Issues:** #243 (act mode: verified proposals apply, stay ahead, race guard), #96 and #252 (act mode put back outside
   edits to the tasks file), #97 (the same proposal in consecutive runs), #298 (an owner request proposed again after
   its work merged), #166 (no agent idles while ready work exists), #294 (AI spend, whose guard G6 is the planner's
@@ -87,14 +88,14 @@ owner removed between runs (§4.3, refusal window).
 
 ## 2. What exists today
 
-Found with `git grep -n` on main `0debc32`, one path at a time, over `src/server/planner`, `src/server/agents`,
+Found with `git grep -n` on main `8181543`, one path at a time, over `src/server/planner`, `src/server/agents`,
 `src/shared` and `docs/design/planner.md`. Searched keywords: idle, ready, restore, tamper, recheck_on_change,
 prefilter_closed, guardNotice, auto_apply, approval, unassigned, phase, spec, pending, declined, duplicate, undo,
 mergedPrs, ownMergedPr, checkPrOwnership, nameOf, startable, readyPlanTasks.
 
 | What | Where | What it does | What is missing |
 |---|---|---|---|
-| Planner modes | `src/server/planner/config.ts:196` `mode: observe \| act` | `observe` writes nothing (each change recorded once as `planned`, `docs/configuration.md:3113`; `service.ts:768`). `act` writes the tasks file | One switch for everything. No evidence report, no per-part modes |
+| Planner modes | `src/server/planner/config.ts:196` `mode: observe \| act` | `observe` writes nothing (each change recorded once as `planned`, `docs/configuration.md:3189`; `service.ts:768`). `act` writes the tasks file | One switch for everything. No evidence report, no per-part modes |
 | Approval per op | `config.ts:215-225` | `add` and `reword` default to `never` (apply by themselves in act). The other ops default to `always` | Kept as is |
 | Verifier auto-apply | `config.ts:156` `verifier.auto_apply`; `config.ts:483-488` (`drop` never allowed) | Verifier-approved ops in this list apply in act mode | Kept as is |
 | Compare-and-swap write | `src/server/planner/files.ts:147-150` `writeTasksFile(path, text, expectHash, maxBytes)` | Writes atomically, and only if the file still has the expected hash | Kept as is. Every write in this spec goes through it |
