@@ -107,7 +107,7 @@ Two more checks found nothing on `0debc32`: `git grep -n -E "launch_contract|lau
 | `bus_via` | What Lair does | Used by default by |
 |---|---|---|
 | `flag` | Writes `<session_dir>/lair-mcp-<run>.json`, holding one `mcpServers.lair` entry whose `command` and `args` are the resolved `bus_command` (below). The adapter's own `start_cmd` must carry the whole-element placeholder `{mcp_config_args}` where the tool takes the flag, and the adapter's `mcp_config` (for example `["--mcp-config", "{mcp_config_file}"]`) is what it expands to. When the bus part isn't `on`, `{mcp_config_args}` expands to **zero** argv elements, so `off` and `observe` give the argv of today. Lair never appends a flag on its own | claude-code, copilot, if the flag is confirmed (below) |
-| `owner_file` | Reads the owner's tool config file `owner_mcp_file`, a path template relative to the repository. It checks that the file has a server whose command line ends in `bus-mcp`, and whose `command` is an absolute path that doesn't reach a denied name: when it is a script with a `#!/usr/bin/env <name>` line, `<name>` must not be in `deny_commands`. Otherwise the gap is `bus:owner_file_missing` or `bus:owner_file_unresolved`. It never writes the file | kiro, cursor-agent, gemini, opencode, codex |
+| `owner_file` | Reads the owner's tool config file `owner_mcp_file`, a path template relative to the repository, or absolute (or `~/`-relative) when the tool reads its config from outside the repo (§4.9). It checks that the file has a server whose command line ends in `bus-mcp`, and whose `command` is an absolute path that doesn't reach a denied name: when it is a script with a `#!/usr/bin/env <name>` line, `<name>` must not be in `deny_commands`. Otherwise the gap is `bus:owner_file_missing` or `bus:owner_file_unresolved`. It never writes the file | kiro, cursor-agent, gemini, opencode, codex |
 | `cli` | Nothing to register. The header tells the agent to report with the resolved `lair bus report` command | aider, goose |
 
 The default for each built-in adapter is checked against that CLI's public reference in PR 3, and the contract test pins it. Until that check passes, an adapter stays `owner_file` or `cli`. `flag` is only for tools that read a JSON file in the `mcpServers` shape: `mcp_config_format` has one value, `mcp-servers-json`, today. A tool with another format (TOML, its own settings file) uses `owner_file` until a format is added.
@@ -259,12 +259,12 @@ agent_adapters:
     bus_via: flag             # flag | owner_file | cli
     mcp_config: ["--mcp-config", "{mcp_config_file}"]   # what {mcp_config_args} expands to when bus is on
     mcp_config_format: mcp-servers-json   # with bus_via: flag; the only format today
-    owner_mcp_file: ".tool/agents/{agent}.json"   # with bus_via: owner_file, relative to the repo
+    owner_mcp_file: ".tool/agents/{agent}.json"   # with bus_via: owner_file; relative to the repo, or absolute / ~/
     prompt_via: file          # file | stdin
     exec_commands: []         # commands a wrapper script runs by name
 ```
 
-Validation: unknown keys are refused, as in `parseBusConfig` (`src/server/bus/config.ts:19`). `require` may only name parts that are `on`. `bus_via: flag` needs `{mcp_config_args}` as a whole element of `start_cmd` and `{mcp_config_file}` in `mcp_config`. A `branch_template` whose rendering doesn't match `review.authors.branch_pattern` is refused. `bus_via: owner_file` on a custom adapter needs `owner_mcp_file`. `owner_mcp_file` must stay inside the repo (no `..`, no absolute path). A pattern that doesn't compile is refused. A `deny_commands` name equal to an adapter's `argv[0]` or `exec_commands` name is refused. `docs/configuration.md` gets an "Agent launch contract" section.
+Validation: unknown keys are refused, as in `parseBusConfig` (`src/server/bus/config.ts:19`). `require` may only name parts that are `on`. `bus_via: flag` needs `{mcp_config_args}` as a whole element of `start_cmd` and `{mcp_config_file}` in `mcp_config`. A `branch_template` whose rendering doesn't match `review.authors.branch_pattern` is refused. `bus_via: owner_file` on a custom adapter needs `owner_mcp_file`. A relative `owner_mcp_file` must stay inside the repo (no `..`). An absolute or `~/`-relative one is allowed, for a wrapper that runs its tool outside the repo (for example a wrapper that cds to a workspace folder above the repo and runs `--agent <fixed name>`, so the tool reads `<workspace>/.kiro/agents/<fixed name>.json`); it is opened with the same no-final-symlink, no-FIFO rule (§4.10). A pattern that doesn't compile is refused. A `deny_commands` name equal to an adapter's `argv[0]` or `exec_commands` name is refused. `docs/configuration.md` gets an "Agent launch contract" section.
 
 ### 4.10 Security
 
@@ -272,7 +272,7 @@ Validation: unknown keys are refused, as in `parseBusConfig` (`src/server/bus/co
 - Prompt text stays off the argv and out of the `started` event (§4.4).
 - The hooks and stubs are Lair's own files, and their contents are fixed. Nothing from the task, the prompt or the repository is put into them. The only values they read are environment variables that Lair sets and the output of the two `git` calls in §4.5, and they read those as data (no `eval`, no `sh -c`).
 - Detection on the remote is read-only, with a deterministic event id and one decision for each PR under the decisions store's open-decision key (`decisions/store.ts:76-77`), so a restart or a second poll never raises a second one.
-- The owner's tool config (`owner_mcp_file`) is read only, never written, and is opened without following a symlink out of the repo (as `src/server/agents/prompts.ts:10-14` opens prompt files: no final symlink, no FIFO).
+- The owner's tool config (`owner_mcp_file`) is read only, never written, and is opened without following a final symlink and never as a FIFO, whether its path is inside the repo or absolute (as `src/server/agents/prompts.ts:10-14` opens prompt files: no final symlink, no FIFO).
 
 ### 4.11 Reliability
 
