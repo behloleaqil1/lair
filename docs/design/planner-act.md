@@ -146,7 +146,7 @@ from what fill actually starts.
 - **Fill's answer (new).** `AgentsFill` exports `capacityNow(): { startable: string[]; freeSlots: number }`, computed
   by the same code fill's tick uses to decide a start, with every hold fill applies: no active run or claim, not
   paused or held (`OWNER_HOLDS`), not cooling down after a failover or a quota error, `fill.max_active`,
-  `capacity.heavy_work.max_active`, the load hold on `local` agents, spend budgets, and `fill.enabled`. The planner
+  the load hold on `local` agents, spend budgets, and `fill.enabled`. The planner
   reads it through the agents module, as it already reads the agents store. With fill off it is
   `{ startable: [], freeSlots: 0 }`.
 - **Startable agent:** an agent in `capacityNow().startable` that is not the planner or the verifier: fill would start
@@ -202,7 +202,9 @@ unrelated to the existing `backlog_file` plan source kind, `config.ts:87-89`.)
 **Unassigned adds.** With `backlog.unassigned: true`, an `add` may omit `agent`. The line is then written in the
 unassigned form that fill already parses. This keeps two jobs apart: the model decides **what** is next, and the rule
 below decides **who** takes it. `backlog.unassigned: true` needs `backlog.assign` other than `off` (a load error
-otherwise), because without the rule no agent ever starts such a line.
+otherwise), because without the rule no agent ever starts such a line. `backlog.mode: act` with `unassigned: true`
+needs `backlog.assign: act` (a load error otherwise): unassigned lines count as ready only when the rule assigns
+them, so with `assign: observe` an add never reduces the deficit and `backlog_low` fires again.
 
 **The assign rule (`backlog.assign`, deterministic, no model).** On each cycle:
 
@@ -365,8 +367,8 @@ repeats were silent *overwrites*, and with the guard in act nothing is overwritt
 - `backlog.mode: act`, `backlog.assign: act` or `spec_first.mode: act` while `planner.mode` is `observe` is refused at
   once (new keys, so no install has them). Observe writes nothing, so those settings would be a no-op that looks
   active.
-- `backlog.unassigned: true` with `backlog.assign: off`, and `backlog.source: rules` with `unassigned: false`, are
-  refused (§4.1).
+- `backlog.unassigned: true` with `backlog.assign: off`, `backlog.mode: act` with `unassigned: true` and
+  `backlog.assign` other than `act`, and `backlog.source: rules` with `unassigned: false`, are refused (§4.1).
 - A new part set to anything other than `off` requires `agents.spend.enabled`, as G6 does (`config.ts:589-601`),
   because the evidence counts (§4.4) come from spend.
 
@@ -526,7 +528,7 @@ covers its negative cases.
 | AT-17 | Every new part `off`, `refuse_undone_days: 0`, `dedupe_pending: off`, and the act-rule warning excluded (it is AT-2's; it has its own class `planner.act_rules`, not `planner.guard_notice`) | The inputs of AT-1, AT-3 to AT-14, AT-18, AT-18b and AT-20 | Today's behaviour, unchanged: the same writes, history rows and decisions, and no new notice besides the act-rule warning. In AT-1 with G6 off, today's restore still happens; that is G6's own test, not this spec's |
 | AT-18 | `mode: act`, `refuse_undone_days: 7`, no verifier, `approval.add: never`. Run N's `add t1` applied | The owner undoes it; run N+1 proposes `add t1` with the same text, then run N+2 with other text. Separately, the owner declines `add t2` in observe, and the project switches to act. Separately, the owner deletes a 3-day-old planner line `t3` by hand. The fake clock moves to day 8 | N+1's `add t1` is refused with the undo reason and counted. N+2's waits for the owner and names the record. `add t2` is refused in act within 7 days. `add t3` is refused for 7 days. On day 8 an `add` of `t1`, `t2` or `t3` waits for the owner (hold) instead of applying; after the plan rewords `t3`, its `add` is checked normally. A restart between the undo's write and its history row keeps the record exactly once |
 | AT-18b | AT-18's records, plus `backlog.mode: act`, `source: rules`, `unassigned: true`, `assign: act` | The undo raises the deficit and `backlog_low` fires; a rules cycle runs; the owner undoes an assignment of line L to `agent-a`, then the assign rule runs | The rules source offers none of `t1`, `t2`, `t3` (on day 8 too, while held). The assign rule gives L to `agent-b`, not `agent-a` |
-| AT-19 | Load rules, each alone: `mode: act` with `prefilter_closed: off`; with `dedupe_pending: off`; `backlog.mode: act` with `planner.mode: observe`; `spec_first.mode: act` with `planner.mode: observe`; `unassigned: true` with `assign: off`; `source: rules` with `unassigned: false`; `backlog.mode: observe` with `agents.spend.enabled: false`; `skip_pattern` of 501 characters | Config load | The first two warn (warn mode) or refuse (refuse mode), naming the keys; each of the others is refused, naming its keys. The defaults load with no warning |
+| AT-19 | Load rules, each alone: `mode: act` with `prefilter_closed: off`; with `dedupe_pending: off`; `backlog.mode: act` with `planner.mode: observe`; `spec_first.mode: act` with `planner.mode: observe`; `unassigned: true` with `assign: off`; `backlog.mode: act` with `unassigned: true` and `assign: observe`; `source: rules` with `unassigned: false`; `backlog.mode: observe` with `agents.spend.enabled: false`; `skip_pattern` of 501 characters | Config load | The first two warn (warn mode) or refuse (refuse mode), naming the keys; each of the others is refused, naming its keys. The defaults load with no warning |
 | AT-20 | `spec_first.mode: act`, `stall_hours: 48`, `x-spec`'s PR open for 49 hours; separately `prefilter_closed: observe` with 3 merged PRs in the review store | A cycle; a verifier run | One stall notice for `x-spec`, none on the next cycle, and `x` stays waiting. The verifier's context has `closed.mergedPrs` with the 3 PRs and the planner's context has no `closed` block. With `prefilter_closed: act`, both have it once |
 
 ## 8. Build PRs, in order
