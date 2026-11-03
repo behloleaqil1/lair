@@ -137,6 +137,8 @@ export const TriageSchema = z
     overload_per_core: z.number().positive().default(2),
     /** A base commit's result older than this is not used to call a failure pre-existing */
     base_max_age_hours: z.number().positive().default(72),
+    /** A result that names no agent: off, or its author from agents.fill's tasks file (external-author.ts) */
+    external_author: z.enum(["off", "tasks_file"]).default("off"),
     /** Nodes whose signed results POST /api/triage/results accepts */
     trusted_nodes: z
       .array(
@@ -248,6 +250,8 @@ export interface TriageSettings {
   contextPatterns: RegExp[];
   overloadPerCore: number;
   baseMaxAgeHours: number;
+  /** A result that names no agent: "tasks_file" reads its author from agents.fill's tasks file */
+  externalAuthor: "off" | "tasks_file";
   trustedNodes: { id: string; publicKeyFile: string }[];
   actions: { infra: "recheck" | "route" | "none"; preExisting: "fix_task" | "none"; code: "route" | "none" };
   recheck: {
@@ -423,6 +427,7 @@ export function parseTriageConfig(raw: unknown): TriageParseResult {
       contextPatterns,
       overloadPerCore: value.overload_per_core,
       baseMaxAgeHours: value.base_max_age_hours,
+      externalAuthor: value.external_author,
       trustedNodes: value.trusted_nodes.map((n) => ({ id: n.id, publicKeyFile: n.public_key_file })),
       actions: {
         infra: value.actions.infra,

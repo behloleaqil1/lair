@@ -12,6 +12,7 @@
  * | RevertOpener     | triage.commands.open_revert               | review / policy (revert PR through gate) |
  * | CapacityProbe    | load and memory limits, capacity_cmd      | runners / scheduler (measured capacity)  |
  * | OwnerGuard       | the owner credential (human-auth)         | (built)                                  |
+ * | TaskLinesSource  | (none)                                    | agents (fill's tasks file lines)         |
  *
  * Without a command, a route or a task is still recorded in the store and
  * emitted on the event bus (triage.routed, triage.task_created), so a module
@@ -24,6 +25,7 @@ import type { DecisionEffect, DecisionStructure } from "../../shared/decision-ty
 import type { Recheck, TriageTask } from "../../shared/triage-types.js";
 import type { DecisionProducer } from "../decisions/types.js";
 import type { Clock, CommandRunner } from "../watchdog/probes.js";
+import type { TaskLinesSource } from "./external-author.js";
 import { COMMAND_PLACEHOLDERS, LIST_PLACEHOLDERS, type CommandId, type TriageSettings } from "./config.js";
 
 /** The module name triage raises Decision Inbox decisions as */
@@ -172,6 +174,8 @@ export interface TriageAdapters {
   decisions?: DecisionRaiser;
   revert?: RevertOpener;
   capacity?: CapacityProbe;
+  /** agents.fill's tasks file lines, for triage.external_author: tasks_file (external-author.ts) */
+  taskLines?: TaskLinesSource;
 }
 
 // ============ COMMANDS ============

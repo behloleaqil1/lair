@@ -79,6 +79,7 @@ import {
 import { applyProbe, nextStep, retryProbe, startBisect, type ProbeOutcome } from "./bisect.js";
 import { GateRechecks, type GatePlan } from "./gate-recheck.js";
 import { clip, testClass } from "./text.js";
+import { findExternalAuthor, NAMED_BY, type AuthorMatch } from "./external-author.js";
 import type { Clock, CommandRunner } from "../watchdog/probes.js";
 
 // ============ INPUT AND ERRORS ============
@@ -737,6 +738,19 @@ export class TriageService {
         })
       : [];
 
+    // No agent named: its author from the tasks file, when triage.external_author is on (external-author.ts)
+    let agent = context.agent ?? origin?.agent;
+    let authorNote: string | undefined;
+    if (!agent && failed && !isDefault && purpose === "gate" && settings.externalAuthor === "tasks_file") {
+      const match = this.externalAuthor(result.branch, pipelineId);
+      if (match.kind === "one") {
+        agent = match.author.agent;
+        authorNote = `author ${agent}: the one open tasks file line that names this result (line ${match.author.line}, task ${match.author.task}, by its ${NAMED_BY[match.author.by]})`;
+      } else {
+        authorNote = `no author from the tasks file: ${match.detail}`;
+      }
+    }
+
     // A red default branch: what the incident's bisect needs from git, read before the transaction
     const regressions = isDefault && purpose !== "bisect" && failed ? classified.filter((c) => c.verdict.class === "code") : [];
     const plan =
@@ -754,7 +768,7 @@ export class TriageService {
         sha,
         branch: result.branch,
         baseSha,
-        agent: context.agent ?? origin?.agent,
+        agent,
         pr: context.pr ?? origin?.pr,
         purpose,
         recheckId: recheck?.id ?? linked?.recheck.id,
@@ -770,6 +784,7 @@ export class TriageService {
       if (classified.length > 0) store.insertCauses(id, classified);
       if (branchNote) this.action({ recordId: id }, "note", "recorded", branchNote);
       if (plainNote) this.action({ recordId: id }, "note", "recorded", plainNote);
+      if (authorNote) this.action({ recordId: id }, "note", "recorded", authorNote);
 
       // Which tests passed: listed as passed by a report, or (a gate run) failed
       // at this commit in a step this run ran and passed
@@ -1132,11 +1147,15 @@ export class TriageService {
     const agent = record.agent;
     s.events.push({ type: "triage.routed", data: { recordId: record.id, agent: agent ?? null, sha: record.sha, text } });
     if (!agent) {
+      if (this.settings.externalAuthor === "tasks_file") {
+        this.routeToOwner(record, causes, s, why);
+        return;
+      }
       this.action(
         { recordId: record.id },
         "route",
         "skipped",
-        "no author agent: only a trusted result (the gates module's gate.completed event) names one",
+        "no author agent: only a trusted result (the gates module's gate.completed event) names one, or triage.external_author: tasks_file",
       );
       return;
     }
@@ -1155,6 +1174,59 @@ export class TriageService {
       { kind: "route", target: { recordId: record.id }, what: `${causes.length} cause(s) sent to ${agent}`, message: msg },
       plannedArgv(this.settings, "notify_agent", messageVars(msg)),
     );
+  }
+
+  /** The result's author from agents.fill's tasks file (no source: none). */
+  private externalAuthor(branch: string, pipelineId: string): AuthorMatch {
+    const source = this.o.adapters.taskLines;
+    if (!source) return { kind: "unavailable", detail: "no tasks file source is connected (agents.fill)" };
+    let view;
+    try {
+      view = source();
+    } catch (e) {
+      return { kind: "unavailable", detail: `agents.fill's status could not be read (${clip(message(e), 160)})` };
+    }
+    return findExternalAuthor(view, this.o.config.repo, { branch, pipelineId }, this.now());
+  }
+
+  /**
+   * No author agent known for the record (the result named none and, when
+   * looked up, triage.external_author found no single one; a record from
+   * before the setting was on was never looked up): the owner is asked, once
+   * per commit. Observe mode (or
+   * read_only) only records whom it would ask.
+   */
+  private routeToOwner(record: TriageRecord, causes: ClassifiedCause[], s: Section, why?: string): void {
+    const question = `Gate ${record.gateId} failed at ${short(record.sha)} on ${record.branch}${
+      why ? ` (${why})` : ""
+    }, and no author agent is known for it: who fixes it?`;
+    const blocked = this.actBlocked;
+    if (blocked) {
+      this.action({ recordId: record.id }, "route", "planned", `${causes.length} cause(s) to the owner: no single author (not run: ${blocked})`);
+      return;
+    }
+    this.raiseDecision({ recordId: record.id }, s, {
+      project: this.project,
+      subject: `route:${record.sha}`,
+      kind: "escalation",
+      question,
+      context: causes.flatMap((c) => [describe(c), ...c.verdict.evidence.slice(0, 2)]).slice(0, 8),
+      options: [
+        { id: "fix", label: "Have it fixed", consequences: "Nothing runs: give the failure to whoever should fix it", effect: "reversible" },
+        { id: "ignore", label: "Ignore", consequences: "The failure stays blocking", effect: "reversible" },
+      ],
+      recommended: "fix",
+      structure: {
+        class: "triage.gate_failure",
+        evidence: {
+          code: causes.every((c) => c.verdict.class === "code") ? "test_assertion" : "unknown_failure",
+          facts: { gate: clip(record.gateId, 200), sha: record.sha, author_known: false },
+          cause_cleared: false,
+          linked_issue: null,
+        },
+      },
+      why: "The result names no author agent and none is known for it. triage.external_author looks one up in the tasks file when such a result arrives; the record's notes say what it found, or have no author note if it was not looked up.",
+    });
   }
 
   private preExisting(record: TriageRecord, c: ClassifiedCause, s: Section): void {
