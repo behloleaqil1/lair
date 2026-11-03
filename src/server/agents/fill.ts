@@ -345,6 +345,8 @@ type WaitState =
 const MAX_CHAINS_LOOKED_AT = 50;
 /** A waiting line whose pattern captured no wake: at most this many of its words are looked at as gate ids */
 const MAX_LINE_WORDS = 64;
+/** ... and at most this many of them (bracketed ones first) are looked up on disk: re-queue markers and result files */
+const MAX_LINE_LOOKUPS = 8;
 /** What is cut from both ends of a word before it is looked at as a gate id ("[<id>]", "<id>,", "(<id>)") */
 const LINE_WORD_EDGES = /^[[(<{"'`]+|[\])>}"'`.,;:!?]+$/g;
 
@@ -1979,11 +1981,12 @@ export class AgentsFill {
       if (latest && status?.kind === "waiting") {
         const since = latest.endedAt ?? latest.requestedAt;
         // A line whose pattern captured no wake may still name the gate it waits on (#347)
-        const lineGate = status.wake === null ? await this.gateInLine(latest, task, status.line, gateQueue) : null;
+        const lineGate = status.wake === null ? await this.gateInLine(latest, task, status, gateQueue) : null;
         const waitStatus = lineGate === null ? status : { ...status, wake: lineGate };
-        const wait = await this.classifyWait(latest, agent, task, waitStatus, now, gateQueue);
         // The gate it waits on is still in the gate queue (under its id, or one it was re-queued as): a live wait
-        const queued = wait.kind === "woken" ? null : await this.queuedGate(waitStatus.wake, gateQueue);
+        const inQueue = await this.queuedGate(waitStatus.wake, gateQueue);
+        const wait = await this.classifyWait(latest, agent, task, waitStatus, now, inQueue);
+        const queued = wait.kind === "woken" ? null : inQueue;
         // G3 observe: the event the wait names came; recorded once, and nothing else changes
         if (wait.kind === "weak" && wait.event?.came) await this.wouldWake(latest, agent, task, wait.event, wait.event.came);
         // Waiting on nothing that came is a run without progress: N of them hold the task (and that hold stays).
@@ -2089,6 +2092,7 @@ export class AgentsFill {
           // Waiting on nothing that came: a run without progress, counted and backed off. G3 act: a wait that names
           // nothing gets a fallback that doubles after each such run, up to max_backoff_seconds
           const count = completions.length;
+          const counted = completions.some((r) => r.id === latest.id);
           const fallbackAt =
             settings.wake.events.mode === "act" && wait.fallbackAt !== null && !wait.event
               ? since + backoffMs(Math.max(count, 1), settings.wake.fallbackSeconds, Math.max(settings.maxBackoffSeconds, settings.wake.fallbackSeconds))
@@ -2097,7 +2101,7 @@ export class AgentsFill {
           if (now < at) {
             await hold(
               "waiting",
-              `${wait.detail}; counted as a run without progress (${count} of ${settings.maxCompletionsWithoutDone}): starting it again at ${iso(at)}`,
+              `${wait.detail}; ${counted ? `counted as a run without progress (${count} of ${settings.maxCompletionsWithoutDone})` : "not counted (its gate was in the gate queue)"}: starting it again at ${iso(at)}`,
               latest.id,
               { ...wait.view, fallbackAt: iso(at), queued: queuedView },
             );
@@ -2620,7 +2624,7 @@ export class AgentsFill {
     task: string,
     status: RunStatus,
     now: number,
-    gateQueue: () => Promise<Map<string, QueuedRequest>>,
+    queued: QueuedGate | null,
   ): Promise<WaitState> {
     const { settings, store, project, probes } = this.options;
     const since = latest.endedAt ?? latest.requestedAt;
@@ -2654,8 +2658,15 @@ export class AgentsFill {
           .map((e) => e.kind),
       );
       if (seen.has("fill_woken")) return { kind: "woken", file, named };
-      if (seen.has("fill_weak")) return stale;
       const pollKey = `${task}|${latest.id}`;
+      if (seen.has("fill_weak")) {
+        // Its gate was in the gate queue again after that (#347): a result written since fill saw it there is the re-run's
+        const queuedAt = queued === null ? store.listEvents(project, { kinds: ["fill_gate_queued"], task, runId: latest.id, limit: 1 })[0]?.at : undefined;
+        if (queuedAt === undefined) return stale;
+        this.waitingSeen.add(pollKey);
+        const again = await this.wakeFile(pollKey, file, now);
+        return again.state === "present" && again.mtimeMs > queuedAt ? { kind: "woken", file, named } : stale;
+      }
       this.waitingSeen.add(pollKey);
       const found = await this.wakeFile(pollKey, file, now);
       const path = file;
@@ -2691,7 +2702,6 @@ export class AgentsFill {
     // No wake.file: a gate the wait names is waited on while it is in the gate queue, and it came once it left it
     // (fill saw it there for this run). One fill never saw there names nothing it can wait on, as before (#347)
     if (!settings.wake.file && status.wake !== null && isPlainWake(status.wake)) {
-      const queued = await this.queuedGate(status.wake, gateQueue);
       if (queued !== null) {
         return {
           kind: "pending",
@@ -2939,25 +2949,35 @@ export class AgentsFill {
    * gate queue for this run before (fill_gate_queued, so it holds once the
    * gate left the queue and across restarts), else the first of the line's
    * words (at most MAX_LINE_WORDS, a plain name once brackets and
-   * punctuation are cut) that is a gate in the gate queue now or, with
-   * wake.file, whose result came after the run's chain started. null: it
-   * names nothing fill can wait on (a finished gate's id is no wait).
+   * punctuation are cut, bracketed ones first) that is
+   * - a gate in the gate queue (under its id, or one wake.requeue_marker
+   *   says it became) whose request was written since the run's chain
+   *   started: the run queued it, not another task long before; or
+   * - with wake.file, and when the line names no G3 event to wait on: a gate
+   *   whose result (or a re-queued id's) came after the chain started.
+   * The disk is read for at most MAX_LINE_LOOKUPS words. null: it names
+   * nothing fill can wait on (a finished gate's id is no wait).
    */
-  private async gateInLine(run: AgentRun, task: string, line: string, gateQueue: () => Promise<Map<string, QueuedRequest>>): Promise<string | null> {
+  private async gateInLine(run: AgentRun, task: string, status: RunStatus, gateQueue: () => Promise<Map<string, QueuedRequest>>): Promise<string | null> {
     const { store, project, settings } = this.options;
     const kept = store.listEvents(project, { kinds: ["fill_gate_queued"], task, runId: run.id, limit: 1 })[0];
     if (kept) {
       const gate = typeof kept.data.requeuedFrom === "string" ? kept.data.requeuedFrom : kept.data.gate;
       if (typeof gate === "string" && isPlainWake(gate)) return gate;
     }
-    const words = [...new Set(line.split(/\s+/, MAX_LINE_WORDS).map((word) => word.replace(LINE_WORD_EDGES, "")))].filter(isPlainWake);
+    const raw = status.line.split(/\s+/, MAX_LINE_WORDS);
+    const plain = (words: string[]) => words.map((word) => word.replace(LINE_WORD_EDGES, "")).filter(isPlainWake);
+    const words = [...new Set([...plain(raw.filter((w) => w.startsWith("["))), ...plain(raw)])];
     if (words.length === 0) return null;
-    const queue = await gateQueue();
-    const queued = words.find((word) => queue.has(word));
-    if (queued !== undefined) return queued;
-    if (!settings.wake.file) return null;
     const start = this.chainStart(run);
-    for (const word of words) {
+    const queue = await gateQueue();
+    const ownQueued = async (word: string) => ((await this.queuedGate(word, gateQueue))?.since ?? -Infinity) >= start;
+    for (const word of words) if (queue.has(word) && (await ownQueued(word))) return word;
+    const lookups = words.slice(0, MAX_LINE_LOOKUPS);
+    if (settings.wake.requeueMarker) for (const word of lookups) if (!queue.has(word) && (await ownQueued(word))) return word;
+    // A result that came: not for a line that names an event to wait on (G3 waits for that instead)
+    if (!settings.wake.file || (settings.wake.events.mode !== "off" && wakeTargetOf(status.captures).target !== null)) return null;
+    for (const word of lookups) {
       const path = this.wakePath(word);
       if (!path.ok) continue;
       try {
@@ -2965,6 +2985,7 @@ export class AgentsFill {
       } catch {
         // No result under that name
       }
+      if ((await this.requeuedResult(word, start)) !== null) return word;
     }
     return null;
   }

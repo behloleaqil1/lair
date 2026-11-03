@@ -5444,6 +5444,55 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(line.detail).toContain("(2 of 3)");
   });
 
+  it("#347: a line naming a gate another task queued before this run's chain started is no wait: counted as before", async () => {
+    const h = setup(gateFill({ fallback_seconds: 60 }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    requestAt(h, `remote.1.${GATE}.req`, -30 * MIN); // queued half an hour before the run began
+    await runEndingWith(h, mirrored(GATE));
+    h.clock.t = NOW + 90 * SEC; // before the fallback and the backoff (+2 min)
+    const line = lineOf(await check(h), "feat-login");
+    expect(line).toMatchObject({ hold: "waiting", waiting: { wake: null, queued: null } });
+    expect(line.detail).toContain("waiting: (nothing named)");
+    expect(line.detail).toContain("counted as a run without progress (1 of 3)");
+    expect(eventsOf(h, "fill_gate_queued")).toEqual([]);
+  });
+
+  it("#347: a line naming a gate that was re-queued under a new id (wake.requeue_marker) waits on the new id's request", async () => {
+    const h = setup(gateFill({ fallback_seconds: 60, requeue_marker: "{gates_dir}/results/{wake}.recheck-{n}" }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    const NEW = "20260302T121500Z-feat-login-tr1-abcdef12-7";
+    // The run's gate was re-checked as NEW before fill first looked: GATE is gone from the queue, NEW is in it
+    writeFileSync(join(h.gatesDir, "results", `${GATE}.recheck-1`), `${NEW}\n`);
+    requestAt(h, `remote.1.${NEW}.req`, 40 * SEC);
+    await runEndingWith(h, mirrored(GATE));
+    h.clock.t = NOW + 20 * MIN;
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({
+      state: "held",
+      hold: "waiting",
+      waiting: { wake: GATE, queued: { gate: NEW, requeuedFrom: GATE } },
+    });
+    await h.service.tick();
+    expect(runs(h)).toHaveLength(1);
+  });
+
+  it("#347: a captured gate with an old result, queued again: the re-run's result written after fill saw it queued is a real wake", async () => {
+    const h = setup(gateFill({ fallback_seconds: 900 }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    resultAt(h, GATE, -60 * MIN);
+    const req = requestAt(h, `remote.1.${GATE}.req`, 30 * SEC);
+    await runEndingWith(h, `- WAITING feat-login ${GATE} by worker-a 12:01Z: gate queued`);
+    h.clock.t = NOW + 5 * MIN;
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ hold: "waiting", waiting: { queued: { gate: GATE } } });
+    unlinkSync(req);
+    resultAt(h, GATE, 9 * MIN); // the re-run's result
+    h.clock.t = NOW + 10 * MIN; // well before fallback_seconds (15 min)
+    expect(lineOf(await check(h), "feat-login").state).toBe("started");
+    expect(eventsOf(h, "fill_woken")).toHaveLength(1);
+  });
+
   // ---- Runs whose exit status a restart lost ----
 
   const UNSEEN = "exit unknown (it ended while Lair was restarting); classified from its queue line";
@@ -8064,6 +8113,23 @@ describe("AI spend G3: waiting agents woken by the awaited event (docs/design/ai
   };
   const check = async (h: Harness) => lineOf(await h.service.checkFill());
   const guardOf = (h: Harness) => h.service.spendReport("today", "project").guards.find((g) => g.guard === "wake_events");
+
+  it("#347: act, with wake.file: a line naming a PR and a gate that already passed waits for the PR, not the gate's result", async () => {
+    const h = setup(g3("act", {}, { file: "{gates_dir}/results/{wake}.rc" }));
+    fillTask(h);
+    const gate = "20260302T120030Z-feat-login-abcdef12-1";
+    await runEndingWith(h, `- WAITING feat-login PR 12 by worker-a 12:01Z: gate passed [${gate}] [bus:1]`, async () => {
+      mkdirSync(join(h.gatesDir, "results"), { recursive: true });
+      writeFileSync(join(h.gatesDir, "results", `${gate}.rc`), "0\n");
+      const t = new Date(NOW + 30 * SEC);
+      utimesSync(join(h.gatesDir, "results", `${gate}.rc`), t, t);
+    });
+    h.clock.t = NOW + 2 * MIN;
+    const line = await check(h);
+    expect(line).toMatchObject({ state: "held", hold: "waiting" });
+    expect(line.detail).toContain("no fallback timer");
+    expect(eventsOf(h, "fill_woken")).toEqual([]);
+  });
 
   /** Fill starts feat-login at NOW (pid 5001), which (after `during`) writes `queueLine` and exits 0; the tick at +1 min sees it end. */
   async function runEndingWith(h: Harness, queueLine: string, during?: () => Promise<void>): Promise<AgentRun> {
