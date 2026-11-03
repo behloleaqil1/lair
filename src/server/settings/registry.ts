@@ -486,6 +486,11 @@ export const SETTINGS_SECTIONS: readonly SectionEntry[] = [
       default_context_patterns: { label: "Use default context patterns", help: "Also use the built-in context patterns" },
       overload_per_core: { label: "Overload threshold", level: "advanced", help: "A timeout while load per core was at least this is infra" },
       base_max_age_hours: { label: "Base result max age", level: "advanced", help: "A base commit's result older than this is not used to call a failure pre-existing" },
+      external_author: {
+        label: "Author of results that name none",
+        level: "advanced",
+        help: "tasks_file: route a failure to the agent of the one open fill tasks file line that names it, else to the owner",
+      },
       trusted_nodes: { label: "Trusted nodes", help: "Nodes whose signed results POST /api/triage/results accepts" },
       "trusted_nodes.*.id": { label: "Node ID", help: "Identifier for the trusted node" },
       "trusted_nodes.*.public_key_file": { label: "Public key file", widget: "path", help: "The node's Ed25519 public key (PEM)" },
