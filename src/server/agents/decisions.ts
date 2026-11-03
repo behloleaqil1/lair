@@ -10,10 +10,12 @@ import { randomUUID } from "crypto";
 import type {
   Decision,
   DecisionEffect,
+  DecisionFactValue,
   DecisionKind as InboxKind,
   DecisionStructure,
 } from "../../shared/decision-types.js";
 import type { DecisionProducer, RaiseDecisionInput } from "../decisions/types.js";
+import type { BrainFactsMode } from "./brain-facts.js";
 import type { Clock, FileSystem } from "../watchdog/probes.js";
 
 /** The module name the agents module raises decisions as. */
@@ -86,6 +88,13 @@ export interface DecisionInbox {
   withdraw?(id: string, reason: string): Promise<void>;
   /** Tell the inbox an open decision's cause cleared (docs/design/decision-policies.md §4). Absent: this inbox can't. */
   causeCleared?(id: string): Promise<void>;
+  /**
+   * Present while the decision policies are on: the module adds the v3 facts at the raise
+   * (docs/design/decision-brain.md §4.1); `live` (decision_policies.live_facts): it also re-reads them.
+   */
+  readonly brainFacts?: BrainFactsMode;
+  /** One re-read of an open decision's live facts. Present only with `brainFacts.live`. */
+  refreshFacts?(id: string, facts: Record<string, DecisionFactValue>): Promise<void>;
 }
 
 function oneLine(text: string, max = 500): string {
@@ -167,16 +176,25 @@ export class ProducerDecisions implements DecisionInbox {
    * decision_policies.enabled): without it the agents module never changes a raised decision's evidence.
    */
   readonly causeCleared?: (id: string) => Promise<void>;
+  readonly brainFacts?: BrainFactsMode;
+  /** Present only with `liveFacts` (decision_policies.live_facts) */
+  readonly refreshFacts?: (id: string, facts: Record<string, DecisionFactValue>) => Promise<void>;
 
   constructor(
     private producer: DecisionProducer,
     private fallback: DecisionInbox,
-    options: { evidenceUpdates?: boolean } = {},
+    options: { evidenceUpdates?: boolean; liveFacts?: boolean } = {},
   ) {
     if (options.evidenceUpdates) {
       this.causeCleared = async (id: string) => {
         await this.producer.updateEvidence(id, { module: DECISION_MODULE, cause_cleared: true });
       };
+      this.brainFacts = Object.freeze({ live: options.liveFacts === true });
+      if (options.liveFacts) {
+        this.refreshFacts = async (id, facts) => {
+          await this.producer.updateEvidence(id, { module: DECISION_MODULE, facts });
+        };
+      }
     }
   }
 

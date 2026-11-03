@@ -33,6 +33,7 @@ import type {
   RaisedVia,
 } from "./store.js";
 import { SecretStoreUnavailableError, type SecretStore } from "./secrets.js";
+import { isFactValue, liveFactsOf } from "./structure.js";
 import { DecisionError, parseAnswerInput, parseRaiseInput, parseWithdrawInput } from "./validate.js";
 import type {
   AnswerContext,
@@ -275,22 +276,26 @@ export class DecisionInbox implements DecisionProducer {
   }
 
   /**
-   * The module that raised an open decision says its cause cleared, or that
-   * an issue tracks it. Only these two facts move, only for an open decision
-   * of a module inside the server, only by that module; a change is audited,
-   * and the same value again changes nothing.
+   * The module that raised an open decision says its cause cleared, that an issue tracks it, or re-reads its
+   * class's live facts. Only these move, only for an open decision of a module inside the server, only by that
+   * module. A real change is audited and adds 1 to `evidenceRev`; the same value again changes nothing, except
+   * that a re-read (`facts`) always stamps `factsAt`. A fact outside the class's live list refuses the update.
    */
   async updateEvidence(id: string, input: EvidenceUpdateInput): Promise<Decision> {
     const { module } = input;
     const issue = input.linked_issue;
-    if (input.cause_cleared === undefined && issue === undefined) {
-      throw new DecisionError(400, "Invalid update: give cause_cleared or linked_issue");
+    const facts = input.facts;
+    if (input.cause_cleared === undefined && issue === undefined && facts === undefined) {
+      throw new DecisionError(400, "Invalid update: give cause_cleared, linked_issue or facts");
     }
     if (input.cause_cleared !== undefined && typeof input.cause_cleared !== "boolean") {
       throw new DecisionError(400, "Invalid update: cause_cleared must be true or false");
     }
     if (issue !== undefined && issue !== null && !(Number.isSafeInteger(issue) && issue > 0)) {
       throw new DecisionError(400, "Invalid update: linked_issue must be a positive whole number or null");
+    }
+    if (facts !== undefined && (typeof facts !== "object" || facts === null || Array.isArray(facts))) {
+      throw new DecisionError(400, "Invalid update: facts must be an object");
     }
     const decision = this.store.get(id);
     if (!decision) throw new DecisionError(404, "Decision not found");
@@ -300,20 +305,33 @@ export class DecisionInbox implements DecisionProducer {
     if (decision.status !== "open") throw new DecisionError(409, `Decision is ${decision.status}, not open`);
     const before = decision.evidence;
     if (!before) throw new DecisionError(409, "Decision has no evidence to update");
+    const live = liveFactsOf(decision.class);
+    const changes: string[] = [];
+    const nextFacts = { ...before.facts };
+    for (const [name, value] of Object.entries(facts ?? {})) {
+      if (!live.includes(name)) throw new DecisionError(400, `Invalid update: ${name} is not a live fact of ${decision.class ?? "this decision"}`);
+      if (!isFactValue(value)) throw new DecisionError(400, `Invalid update: ${name} must be a one-line string, a number, a boolean or null`);
+      const old = Object.hasOwn(before.facts, name) ? before.facts[name] : null;
+      if (old !== value) changes.push(`${name} ${String(old)} -> ${String(value)}`);
+      nextFacts[name] = value;
+    }
     const next = {
       ...before,
+      facts: nextFacts,
       ...(input.cause_cleared !== undefined ? { cause_cleared: input.cause_cleared } : {}),
       ...(issue !== undefined ? { linked_issue: issue } : {}),
     };
-    const changes: string[] = [];
     if (next.cause_cleared !== before.cause_cleared) changes.push(`cause_cleared ${before.cause_cleared} -> ${next.cause_cleared}`);
     if (next.linked_issue !== before.linked_issue) changes.push(`linked_issue ${before.linked_issue ?? "none"} -> ${next.linked_issue ?? "none"}`);
-    if (changes.length === 0) return decision;
+    if (changes.length === 0 && facts === undefined) return decision;
     const at = this.iso();
-    if (!this.store.updateEvidence(id, next)) {
+    const changed = changes.length > 0;
+    if (!this.store.updateEvidence(id, changed ? next : before, { bump: changed, factsAt: facts !== undefined ? at : null })) {
       throw new DecisionError(409, `Decision is ${this.store.get(id)?.status ?? decision.status}, not open`);
     }
-    this.store.addAudit(id, { at, action: "evidence_updated", actor: module, detail: `${module} updated the evidence: ${changes.join("; ")}` });
+    if (changed) {
+      this.store.addAudit(id, { at, action: "evidence_updated", actor: module, detail: `${module} updated the evidence: ${changes.join("; ")}` });
+    }
     return this.get(id)!;
   }
 
@@ -322,8 +340,9 @@ export class DecisionInbox implements DecisionProducer {
     return this.store.addTrace(row);
   }
 
-  hasPolicyTrace(decisionId: string, proposer: string, version: string): boolean {
-    return this.store.hasTrace(decisionId, proposer, version);
+  /** `evidenceRev` null: a row at any evidence revision */
+  hasPolicyTrace(decisionId: string, proposer: string, version: string, evidenceRev: number | null): boolean {
+    return this.store.hasTrace(decisionId, proposer, version, evidenceRev);
   }
 
   /** Trace rows joined to their decisions, at most `limit` (tests and diagnostics). */

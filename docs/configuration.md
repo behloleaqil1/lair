@@ -3656,11 +3656,13 @@ It is off until `data/server.yaml` says otherwise (read once at start, so a chan
 ```yaml
 decision_policies:
   enabled: true
+  live_facts: false
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | boolean | `false` | Off: nothing is proposed or written to the trace (not at start either), no module updates a raised decision's evidence (`cause_cleared`), and `GET /api/owner/decision-policies` shows the table and `enabled: false` with no agreement. A section with any other key or a value of another type is refused: the policies stay off and the reason is logged and shown in the view |
+| `enabled` | boolean | `false` | Off: nothing is proposed or written to the trace (not at start either), no module updates a raised decision's evidence (`cause_cleared`), the agents module's gave-up decisions carry only their first four facts, and `GET /api/owner/decision-policies` shows the table and `enabled: false` with no agreement. A section with any other key or a value of another type is refused: the policies stay off and the reason is logged and shown in the view |
+| `live_facts` | boolean | `false` | Needs `enabled` (alone it is refused, and the section stays off). On: at each fill check the agents module re-reads the live facts of its open gave-up decisions (below). Evidence only: nothing is answered, withdrawn or raised, and a re-read does not make a new proposal. The view shows `liveFacts` |
 
 Without `data/policies.yaml` Lair uses a built-in table with rules C1 (`agents.provider_limit` → `wait` while its cause stands), C2 (`supervisor.check_failing` → `noted` when an issue tracks the check), C3 (`watchdog.idle_capacity` → `stand_down` after two playbook attempts, never with nothing running), C4 (`watchdog.orphan_claim` → `stand_down` while a runner is alive) and C11 (`agents.cannot_start` → `keep_held` while the task's run is below its third attempt; from the third on, or without an attempt count, it abstains). To change it, write the file and restart (it is read once at start):
 
@@ -3686,6 +3688,22 @@ A condition tests a key of the decision's `evidence.facts`, or `cause_cleared` /
 **The trace** is the `policy_trace` table in `data/decisions.db`: one row per decision, proposer and table version (the version is a hash of the table, so any change starts a new comparison): class, policy, proposed option (empty when it abstained), reason code, confidence, time. A repeated event or a restart writes no second row; open decisions raised while Lair was down (or while the policies were off) get theirs at the next start, all of them, a page at a time in the background. A proposal is written once, when the decision is raised (or at that catch-up): a later `cause_cleared` update does not make a new one. **Agreement** joins the trace to the answers people gave (counted in the database, so the view never reads the whole trace): per class and version, `compared` (answered), `agreed`, `disagreed`, `abstained`, `agreement` (agreed of agreed + disagreed), `coverage` (proposed of compared), `unsafeDisagreements` (a disagreement where the proposal was an `irreversible` or `outward` option), and the decisions still open or withdrawn. It is `GET /api/owner/decision-policies` (owner only) and the **Policy agreement** card on the Decisions page when you are signed in as the owner.
 
 **`cause_cleared` and `linked_issue`** are set when a module raises a decision. A module that learns more later calls `updateEvidence` on the Decision Inbox (`DecisionProducer.updateEvidence`): only the module that raised an open decision, only those two facts, audited as `evidence_updated`, and the same value again changes nothing. While `decision_policies.enabled` is on, the agents module does it for a provider-limit decision when the reset time it named has passed; while it is off, no decision's evidence changes after it was raised. No module tracks an issue yet, so `linked_issue` stays empty and C2 abstains; the planner's C7 stays out of the table until its module re-evaluates `cause_cleared`.
+
+**Evidence v3 for agents** ([decision-brain.md](design/decision-brain.md) §4.1, PR 1). While `enabled` is on, an `agents.gave_up` decision also carries, at the raise:
+
+| Fact | Codes | Value |
+|------|-------|-------|
+| `task_state` | all | `open`, `closed` (its line is done, or gone from the tasks file for 3 fill checks in a row) or `reassigned` (only another agent's line names it); null when fill's last check saw no line for it |
+| `pr` | all | the PR the run's last WAITING or BLOCKED report names (the bus report's own field, else a `PR #n` / `pull request #n` / `/pull/n` in the line; a bare `#n` may be an issue and is not read), or null |
+| `fresh_sessions` | all | how many of the task's runs started in a fresh session |
+| `block_class` | `blocked_reported` | the planner's default BLOCKED classifier on the line: `owner`, `environment` or `task` |
+| `block_target`, `blocked_on_pr` | `blocked_reported` | `pr` (with its number), `host_load`, `environment` or `unknown`, from a fixed list (a PR reference, a load reference) after the class |
+| `blocker_cleared` | `blocked_reported` | `host_load`: whether the load per CPU is at or under `agents.fill.capacity.load_per_cpu_max` (null without the limit); an owner block, an unknown target, a PR and the environment: null (only a person clears them, or a later build reads them) |
+| `limit_resets_at`, `limit_reset_passed` | `provider_limit` | the reset time the provider's line gave, and whether it has passed (null without one) |
+
+Each class of the policy table has a list of **live facts**, the only facts its module may change on an open decision: for `agents.gave_up` `task_state`, `next_move`, `review_at_head`, `gate_at_head`, `hold_on_pr`, `blocker_cleared` and `limit_reset_passed`. `updateEvidence` refuses any other fact (and refuses the whole update), and stays limited to the raising module and open decisions. A real change is audited as `evidence_updated` and adds 1 to the decision's `evidenceRev` (0 at the raise); a re-read stamps `factsAt` even when nothing changed (then with no audit entry and no new revision). A line missing for fewer than 3 checks keeps the last `task_state`, so a tasks file mid-rewrite never reads as closed.
+
+The decisions file is at schema version 7: `evidence_rev` and `facts_at` on each decision (0 and empty on an older file), and the trace's key is decision, proposer, version and `evidence_rev`, with `proposed_option` (an older trace row is kept at revision 0 with its option). One proposal is still written per decision and table version.
 
 ## Brain trainer
 

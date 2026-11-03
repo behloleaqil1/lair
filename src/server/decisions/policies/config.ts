@@ -5,6 +5,7 @@
  *
  *   decision_policies:
  *     enabled: true    # write shadow proposals into the policy trace, and let modules update a raised decision's evidence
+ *     live_facts: true # modules re-read the live facts of their open decisions (docs/design/decision-brain.md §4.1); needs enabled
  */
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
@@ -12,15 +13,20 @@ import { readCheckedFile, type ServerConfigFileOptions } from "../../restart/ser
 
 export interface DecisionPoliciesSettings {
   enabled: boolean;
+  /** Raisers re-read their open decisions' live facts at each check (evidence only; nothing answers) */
+  liveFacts: boolean;
 }
 
-export const DECISION_POLICIES_OFF: DecisionPoliciesSettings = { enabled: false };
+export const DECISION_POLICIES_OFF: DecisionPoliciesSettings = { enabled: false, liveFacts: false };
 
 export type DecisionPoliciesConfigResult =
   | { ok: true; settings: DecisionPoliciesSettings }
   | { ok: false; errors: string[]; settings: DecisionPoliciesSettings };
 
-const Schema = z.object({ enabled: z.boolean().default(false) }).strict();
+const Schema = z
+  .object({ enabled: z.boolean().default(false), live_facts: z.boolean().default(false) })
+  .strict()
+  .refine((s) => s.enabled || !s.live_facts, { message: "needs enabled: true", path: ["live_facts"] });
 
 export function parseDecisionPoliciesConfig(raw: unknown): DecisionPoliciesConfigResult {
   const section = typeof raw === "object" && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>).decision_policies : undefined;
@@ -33,7 +39,7 @@ export function parseDecisionPoliciesConfig(raw: unknown): DecisionPoliciesConfi
       settings: DECISION_POLICIES_OFF,
     };
   }
-  return { ok: true, settings: { enabled: parsed.data.enabled } };
+  return { ok: true, settings: { enabled: parsed.data.enabled, liveFacts: parsed.data.live_facts } };
 }
 
 /** Read and parse the section from data/server.yaml. A refused file is off, with the reason. */

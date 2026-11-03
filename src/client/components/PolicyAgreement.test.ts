@@ -8,6 +8,7 @@ import { PolicyAgreement, PolicyAgreementView } from "./PolicyAgreement";
 
 const status = (over: Partial<DecisionPoliciesStatus> = {}): DecisionPoliciesStatus => ({
   enabled: true,
+  liveFacts: false,
   source: "built-in",
   version: "ab12cd34",
   policies: [{ id: "c1-wait", class: "agents.provider_limit", codes: [], answer: "wait", state: "shadow", maxTier: 1 }],

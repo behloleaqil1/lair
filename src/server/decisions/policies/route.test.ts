@@ -66,6 +66,7 @@ async function server(options: { serverYaml?: string; policiesYaml?: string; bef
   const tokenPath = join(dir, "owner.token");
   const auth = HumanAuth.open({ tokenPath, dbPath: ":memory:" });
   const evidence: boolean[] = [];
+  const liveFacts: boolean[] = [];
   const logs: string[] = [];
   const policies = await mountDecisionPolicies(app, {
     configPath,
@@ -73,13 +74,20 @@ async function server(options: { serverYaml?: string; policiesYaml?: string; bef
     inbox,
     events,
     humanAuth: auth,
-    evidenceProducers: [{ useEvidenceUpdates: (on) => evidence.push(on) }],
+    evidenceProducers: [
+      {
+        useEvidenceUpdates: (on, o) => {
+          evidence.push(on);
+          liveFacts.push(o?.liveFacts === true);
+        },
+      },
+    ],
     log: (line) => logs.push(line),
   });
   await app.ready();
   const owner = { ...BROWSER, [OWNER_SESSION_HEADER]: auth.createSession(readFileSync(tokenPath, "utf-8").trim())!.session };
   const get = async () => (await app.inject({ url: "/api/owner/decision-policies", headers: owner })).json().data;
-  return { app, owner, inbox, policies, evidence, logs, get };
+  return { app, owner, inbox, policies, evidence, liveFacts, logs, get };
 }
 
 describe("decision policies: off by default", () => {
@@ -96,7 +104,7 @@ describe("decision policies: off by default", () => {
       expect(h.inbox.policyTraces()).toEqual([]);
       expect(h.evidence).toEqual([]);
       const data = await h.get();
-      expect(data).toMatchObject({ enabled: false, source: "built-in", agreement: [] });
+      expect(data).toMatchObject({ enabled: false, liveFacts: false, source: "built-in", agreement: [] });
       expect(data.policies).toHaveLength(5);
       if (yaml?.includes("yes please")) {
         expect(data.errors.join(" ")).toContain("decision_policies.enabled");
@@ -113,8 +121,10 @@ describe("decision policies: off by default", () => {
     await h.inbox.raise(limit("after"));
     expect(h.inbox.policyTraces().map((t) => t.policy)).toEqual(["c1-wait", "c1-wait", "c1-wait"]);
     expect(h.evidence).toEqual([true]);
+    // live_facts is off unless the section turns it on
+    expect(h.liveFacts).toEqual([false]);
     const data = await h.get();
-    expect(data).toMatchObject({ enabled: true, errors: [] });
+    expect(data).toMatchObject({ enabled: true, liveFacts: false, errors: [] });
     expect(data.agreement).toMatchObject([{ class: "agents.provider_limit", traced: 3, pending: 3 }]);
     await h.app.close();
     apps.splice(apps.indexOf(h.app), 1);
@@ -124,12 +134,36 @@ describe("decision policies: off by default", () => {
     expect(h.inbox.policyTraces()).toHaveLength(3);
   });
 
+  it("live_facts on: the producers re-read their live facts, and the route says so", async () => {
+    const h = await server({ serverYaml: "decision_policies:\n  enabled: true\n  live_facts: true\n" });
+    expect(h.evidence).toEqual([true]);
+    expect(h.liveFacts).toEqual([true]);
+    expect(await h.get()).toMatchObject({ enabled: true, liveFacts: true, errors: [] });
+  });
+
+  it("live_facts without enabled: refused, and everything stays off", async () => {
+    const h = await server({ serverYaml: "decision_policies:\n  live_facts: true\n" });
+    expect(h.evidence).toEqual([]);
+    const data = await h.get();
+    expect(data).toMatchObject({ enabled: false, liveFacts: false });
+    expect(data.errors).toEqual(["decision_policies.live_facts: needs enabled: true"]);
+  });
+
   it("parses the section; the restart's own reading of data/server.yaml accepts it", () => {
-    expect(parseDecisionPoliciesConfig({})).toEqual({ ok: true, settings: { enabled: false } });
-    expect(parseDecisionPoliciesConfig({ decision_policies: null })).toEqual({ ok: true, settings: { enabled: false } });
-    expect(parseDecisionPoliciesConfig({ decision_policies: {} })).toEqual({ ok: true, settings: { enabled: false } });
-    expect(parseDecisionPoliciesConfig({ decision_policies: { enabled: true } })).toEqual({ ok: true, settings: { enabled: true } });
-    expect(parseDecisionPoliciesConfig({ decision_policies: { enabled: true, mode: "act" } })).toMatchObject({ ok: false, settings: { enabled: false } });
+    const off = { enabled: false, liveFacts: false };
+    expect(parseDecisionPoliciesConfig({})).toEqual({ ok: true, settings: off });
+    expect(parseDecisionPoliciesConfig({ decision_policies: null })).toEqual({ ok: true, settings: off });
+    expect(parseDecisionPoliciesConfig({ decision_policies: {} })).toEqual({ ok: true, settings: off });
+    expect(parseDecisionPoliciesConfig({ decision_policies: { enabled: true } })).toEqual({ ok: true, settings: { enabled: true, liveFacts: false } });
+    expect(parseDecisionPoliciesConfig({ decision_policies: { enabled: true, mode: "act" } })).toMatchObject({ ok: false, settings: off });
+    // live_facts: off by default; on only with enabled (alone it is refused, and the whole section stays off)
+    expect(parseDecisionPoliciesConfig({ decision_policies: { enabled: true, live_facts: true } })).toEqual({ ok: true, settings: { enabled: true, liveFacts: true } });
+    expect(parseDecisionPoliciesConfig({ decision_policies: { live_facts: true } })).toEqual({
+      ok: false,
+      errors: ["decision_policies.live_facts: needs enabled: true"],
+      settings: off,
+    });
+    expect(parseDecisionPoliciesConfig({ decision_policies: { enabled: true, live_facts: "yes" } })).toMatchObject({ ok: false, settings: off });
     expect(parseServerConfig({ server: {}, decision_policies: { enabled: true } }).ok).toBe(true);
   });
 });
