@@ -44,6 +44,7 @@ import type {
   PlannerStatusView,
   PlanTaskView,
   ProposalStatus,
+  RefusalView,
   ProposalView,
   SourceStatusView,
   TriggerKind,
@@ -71,6 +72,7 @@ import {
   closedWork,
   contextClosed,
   inputsHash,
+  MAX_CLOSED_LISTED,
   MAX_MERGED_PRS,
   openTriggers,
   ownMergedPr,
@@ -90,7 +92,7 @@ import {
   type PlanTask,
   type QueueEvent,
 } from "./sources.js";
-import { proposalView, type ChangeInput, type PlannerStore, type StoredProposal, type StoredRun } from "./store.js";
+import { proposalView, UNDOABLE_OPS, type ChangeInput, type PlannerStore, type StoredProposal, type StoredRun } from "./store.js";
 import { applyEdit, diffOf, diffTexts, findTask, parseTasksDoc, renderLine, type TaskEdit, type TasksDoc } from "./tasks-file.js";
 import { parseVerdicts, readVerdictsFile, verifierSection, VERDICTS_FILE } from "./verifier.js";
 import { checkFinishOwnership, type PrSource } from "./pr-ownership.js";
@@ -163,6 +165,31 @@ const MAX_RUN_HASHES = 200;
 const RECHECK = "recheck_edit";
 /** Per guard: the streak its last notice was about (one notice per streak) */
 const GUARD_STREAKS = "guard_streaks";
+/** What the owner undid, declined or removed (planner.act.refuse_undone_days), by refusalKey; the newest last */
+const REFUSED = "refused";
+const MAX_REFUSED = 1000;
+/** The hash of the act-mode rules the last planner.act_rules notice was about (one notice per config text) */
+const ACT_RULES_NOTICE = "act_rules_notice";
+
+interface RefusalRecord {
+  op: string;
+  task: string;
+  /** sha256 of the cleaned text: the description (add, reword), the agent (reassign), "" (the other ops) */
+  textHash: string;
+  /** sha256 of the task's plan text when recorded ("" when no plan source has it): an add's hold lasts while it holds */
+  planTextHash: string;
+  at: number;
+  why: RefusalView["why"];
+}
+
+const refusalKey = (op: string, task: string, textHash: string) => `${op}:${task}:${textHash}`;
+/** The text a refusal is keyed by: an add's or reword's description, a reassign's agent, nothing for the other ops. */
+const keyText = (op: string, text: string | null, agent: string | null): string =>
+  op === "add" || op === "reword" ? clean(text ?? "", 500) : op === "reassign" ? (agent ?? "") : "";
+const WHY_VERB: Record<RefusalView["why"], string> = { undid: "undid", declined: "declined", removed: "removed" };
+/** The start of the reason of a proposal Lair holds for the owner because of an earlier refusal (never applies by itself) */
+export const REFUSAL_HOLD = "Lair holds this for you: ";
+
 /** The notice's evidence codes (class planner.guard_notice) */
 type GuardNoticeCode = "would_skip" | "would_apply" | "tasks_file_kept";
 
@@ -219,6 +246,8 @@ interface Intent {
   afterHash: string;
   text: string;
   changes: ChangeInput[];
+  /** The refusal records the write makes (an undo), written with its history */
+  refused?: RefusalRecord[];
 }
 
 interface BlockedRecord {
@@ -274,8 +303,12 @@ export interface PlannerServiceOptions {
 /** The start of the reason Lair gives a finish proposal whose PR it could not check (held for the owner). */
 export const OWNERSHIP_UNSURE = "Lair could not check PR ownership: ";
 
-/** Lair held this proposal (a PR whose ownership it could not check): no verdict lifts the hold, only the owner applies it. */
-const heldByLair = (p: StoredProposal) => p.verifierVerdict === "unsure" && (p.verifierReason ?? "").startsWith(OWNERSHIP_UNSURE);
+/**
+ * Lair held this proposal (a PR whose ownership it could not check, or a change the owner undid, declined or removed
+ * before): no verdict lifts the hold, only the owner applies it.
+ */
+const heldByLair = (p: StoredProposal) =>
+  p.verifierVerdict === "unsure" && [OWNERSHIP_UNSURE, REFUSAL_HOLD].some((prefix) => (p.verifierReason ?? "").startsWith(prefix));
 
 function withReadiness(tasks: PlanTask[]): PlanTaskView[] {
   const done = new Map<string, boolean>();
@@ -406,6 +439,7 @@ export class PlannerService {
 
   private async cycleAt(now: number): Promise<void> {
     this.finishIntent();
+    await this.actRulesNotice();
     const plan = this.readPlans();
     const owner = this.readOwner();
     this.planTasks = withReadiness(plan.tasks);
@@ -529,6 +563,7 @@ export class PlannerService {
     const read = readTasksFile(this.settings.tasksFile, MAX_TASKS_FILE_BYTES);
     if (read.ok && sha256(read.text) === intent.afterHash) {
       for (const change of intent.changes) this.store.addChange(change);
+      this.addRefusals(intent.refused ?? []);
       this.setState(KNOWN, { hash: intent.afterHash, text: intent.text });
     }
     this.setState(INTENT, null);
@@ -603,6 +638,7 @@ export class PlannerService {
     const recheck = this.settings.guards.recheckOnChange;
     if (active && this.writes && recheck === "act") {
       // D7: the edit is kept and recorded, and each of the run's proposals is checked against the file when it ends
+      this.noteOutsideEdit(known.text, doc, now);
       active.tampered = true;
       this.store.saveRun(active);
       this.setState(RECHECK, { run: active.id, kept: true } satisfies RecheckEdit);
@@ -660,6 +696,7 @@ export class PlannerService {
           diff,
           runId: active.id,
         });
+        this.noteOutsideEdit(known.text, doc, now);
         this.setState(KNOWN, { hash: doc.hash, text: doc.text } satisfies Known);
       }
       await this.raise({
@@ -704,6 +741,7 @@ export class PlannerService {
       diff,
       runId: active?.id ?? null,
     });
+    this.noteOutsideEdit(known.text, doc, now);
     this.setState(KNOWN, { hash: doc.hash, text: doc.text } satisfies Known);
     return doc;
   }
@@ -1750,7 +1788,18 @@ export class PlannerService {
     // G6: from_message may name only an owner message of this run's context; an add of closed work is refused
     if (guards.handledMessages !== "off") ctx.messages = new Set((this.state<Record<string, string[]>>(RUN_MESSAGES) ?? {})[run.id] ?? []);
     if (guards.prefilterClosed === "act") ctx.ownMerged = this.ownMerged(this.mergedPrs());
+    // planner-act.md §4.3: the refusal window, and a proposal still pending from an earlier run (dedupe_pending act)
+    const earlier = this.store.listProposals(this.project, { status: "pending", limit: 500 }).filter((p) => p.runId !== run.id);
+    const duplicateOf = (p: { op: string; task: string; agent: string | null; text: string | null }) =>
+      earlier.find((e) => e.op === p.op && e.task === p.task && e.agent === p.agent && (p.op !== "reword" || e.text === p.text)) ?? null;
+    ctx.refusedBefore = (p) => {
+      const refused = this.refusedBefore(p.op, p.task, keyText(p.op, p.text, p.agent), now);
+      if (refused || guards.dedupePending !== "act") return refused;
+      const twin = duplicateOf(p);
+      return twin ? `already pending as proposal ${short(twin.id)} of run ${short(twin.runId)} (planner.guards.dedupe_pending)` : null;
+    };
     const { checked } = checkProposals(file.items, ctx);
+    if (guards.dedupePending !== "off") await this.dedupeEvents(run, checked, duplicateOf);
     // The tasks file changed while the run was active and was put back: every proposal is refused (D7 keeps the edit)
     const whole = this.refusedWhole(run);
     // PR ownership (#290): a finish whose reason names a merged PR of another task is refused; one Lair cannot read is held
@@ -1766,6 +1815,12 @@ export class PlannerService {
       if (result.state === "none") continue;
       if (result.state === "not_owned") c.refusal = result.note;
       ownership.set(c.index, result);
+    }
+    // An earlier refusal with other text, or an add of a task the owner took away: it waits for the owner (the hold)
+    const holds = new Map<number, string>();
+    for (const c of checked) {
+      const hold = c.refusal || whole ? null : this.holdOf(c.op, c.task, now);
+      if (hold) holds.set(c.index, hold);
     }
     const stored = checked.map((c) =>
       this.store.insertProposal({
@@ -1783,9 +1838,14 @@ export class PlannerService {
         decidedAt: c.refusal || whole ? now : null,
         createdAt: now,
         // Held by Lair until the owner decides; no verifier verdict can turn it into an approve
-        verifierVerdict: !c.refusal && ownership.get(c.index)?.state === "unsure" ? "unsure" : null,
-        verifierReason:
-          !c.refusal && ownership.get(c.index)?.state === "unsure" ? `${OWNERSHIP_UNSURE}${ownership.get(c.index)?.note}` : null,
+        verifierVerdict: !c.refusal && (ownership.get(c.index)?.state === "unsure" || holds.has(c.index)) ? "unsure" : null,
+        verifierReason: c.refusal
+          ? null
+          : ownership.get(c.index)?.state === "unsure"
+            ? `${OWNERSHIP_UNSURE}${ownership.get(c.index)?.note}`
+            : holds.has(c.index)
+              ? `${REFUSAL_HOLD}${holds.get(c.index)}`
+              : null,
         verifierEvidence: null,
       }),
     );
@@ -1867,6 +1927,7 @@ export class PlannerService {
     } catch {
       // Context not available; verifier runs with minimal context
     }
+    contextJson = this.verifierContext(contextJson);
 
     const proposals = accepted.map((p) => ({
       index: p.index,
@@ -2265,6 +2326,8 @@ export class PlannerService {
     if (changes.length > 0) {
       const result = await this.commit(doc, changes, now);
       for (const change of result.applied) this.store.decide(change.proposalId ?? "", "applied", by, now);
+      // The owner approved a line for the task again: an earlier undo, decline or removal no longer holds it
+      if (!by.startsWith("lair:")) for (const change of result.applied) if (change.edit.op === "add") this.releaseHolds(change.edit.task);
       for (const { change, reason } of result.refused) this.store.decide(change.proposalId ?? "", "rejected", by, now, `no longer valid: ${reason}`);
     }
     for (const { proposal, reason } of unblocks) {
@@ -2395,10 +2458,10 @@ export class PlannerService {
           }
           for (const p of toReject) {
             const reason = p.verifierReason ? `verifier: ${p.verifierReason}` : "rejected by verifier";
-            this.store.decide(p.id, "declined", by, now, reason);
+            this.declineByOwner(p, by, now, reason);
           }
         } else {
-          for (const p of pending) this.store.decide(p.id, "declined", by, now, "rejected by the owner");
+          for (const p of pending) this.declineByOwner(p, by, now, "rejected by the owner");
         }
         return;
       }
@@ -2467,7 +2530,7 @@ export class PlannerService {
   rejectProposal(id: string): Promise<ProposalView> {
     return this.exclusive(async () => {
       const p = this.pendingProposal(id);
-      this.store.decide(p.id, "declined", "owner", this.clock.now(), "rejected by the owner");
+      this.declineByOwner(p, "owner", this.clock.now(), "rejected by the owner");
       await this.settleDecision(p.runId);
       return proposalView(this.store.getProposal(id) ?? p);
     });
@@ -2493,7 +2556,7 @@ export class PlannerService {
   rejectRun(runId: string): Promise<ProposalView[]> {
     return this.exclusive(async () => {
       const now = this.clock.now();
-      for (const p of this.runPending(runId)) this.store.decide(p.id, "declined", "owner", now, "rejected by the owner");
+      for (const p of this.runPending(runId)) this.declineByOwner(p, "owner", now, "rejected by the owner");
       await this.settleDecision(runId);
       return this.store.runProposals(runId).map(proposalView);
     });
@@ -2560,6 +2623,240 @@ export class PlannerService {
     return this.overview();
   }
 
+  // ============ ACT SAFETY (docs/design/planner-act.md §4.3) ============
+
+  /** One planner.act_rules notice per config text while act mode lacks the guards it needs (warn mode, D1). */
+  private async actRulesNotice(): Promise<void> {
+    const rules = this.settings.actRules;
+    if (rules.length === 0) return;
+    const hash = sha256(rules.join("\n"));
+    if (this.state<string>(ACT_RULES_NOTICE) === hash) return;
+    this.setState(ACT_RULES_NOTICE, hash);
+    await this.raise({
+      kind: "other",
+      attention: "notice",
+      key: `act_rules:${hash.slice(0, 16)}`,
+      ref: "planner",
+      title: "The planner runs in act mode without the guards act mode needs",
+      context: [
+        ...rules.map((rule) => `- ${rule}`),
+        "",
+        "Set, in this order: agents.spend.enabled: true; planner.guards.recheck_on_change: act; planner.guards.prefilter_closed and planner.guards.dedupe_pending: observe (or act). From the next release the planner does not load in act mode without them.",
+      ].join("\n"),
+      options: [{ id: "noted", label: "Noted", consequences: "The notice closes. Nothing else changes.", effect: "reversible" }],
+      recommended: { optionId: "noted", reasoning: "Nothing is decided here: set the keys in the project's config." },
+      class: "planner.act_rules",
+      evidence: { code: "act_rules_missing", facts: { rules: rules.length }, cause_cleared: false, linked_issue: null },
+    });
+  }
+
+  private planTextHash(task: string): string {
+    const planned = this.planTasks.find((t) => t.id === task);
+    return planned ? sha256(planned.text) : "";
+  }
+
+  private refusalRecord(op: string, task: string, text: string, why: RefusalView["why"], now: number): RefusalRecord {
+    return { op, task, textHash: sha256(text), planTextHash: this.planTextHash(task), at: now, why };
+  }
+
+  /** Keep refusal records (none while planner.act.refuse_undone_days is 0); a record for the same key replaces it. */
+  private addRefusals(records: RefusalRecord[]): void {
+    if (records.length === 0 || this.settings.refuseUndoneDays === 0) return;
+    let all = this.state<Record<string, RefusalRecord>>(REFUSED) ?? {};
+    for (const r of records) all = withEntry(all, refusalKey(r.op, r.task, r.textHash), r);
+    this.setState(REFUSED, newest(all, MAX_REFUSED));
+  }
+
+  /** The owner added or approved a line for the task again: its add records go (no refusal, no hold). */
+  private releaseHolds(task: string): void {
+    const all = this.state<Record<string, RefusalRecord>>(REFUSED) ?? {};
+    const kept = Object.fromEntries(Object.entries(all).filter(([, r]) => !(r.op === "add" && r.task === task)));
+    if (Object.keys(kept).length !== Object.keys(all).length) this.setState(REFUSED, kept);
+  }
+
+  private refusals(): RefusalRecord[] {
+    return this.settings.refuseUndoneDays === 0 ? [] : Object.values(this.state<Record<string, RefusalRecord>>(REFUSED) ?? {});
+  }
+
+  private inWindow(r: RefusalRecord, now: number): boolean {
+    return now - r.at < this.settings.refuseUndoneDays * DAY_MS;
+  }
+
+  /** An add record holds its task until the task's plan text changes (in no plan source: until the owner adds it). */
+  private holdActive(r: RefusalRecord): boolean {
+    return r.op === "add" && (r.planTextHash === "" || r.planTextHash === this.planTextHash(r.task));
+  }
+
+  private why(r: RefusalRecord): string {
+    return `the owner ${WHY_VERB[r.why]} ${r.op} ${r.task} on ${iso(r.at).slice(0, 10)}`;
+  }
+
+  /** The same op, task and text the owner undid, declined or removed within the window: refused, with the reason. */
+  private refusedBefore(op: string, task: string, text: string, now: number): string | null {
+    const hash = sha256(text);
+    const r = this.refusals().find((x) => x.op === op && x.task === task && x.textHash === hash && this.inWindow(x, now));
+    return r ? `${this.why(r)}: not proposed again for ${this.settings.refuseUndoneDays} days (planner.act.refuse_undone_days)` : null;
+  }
+
+  /** The same op and task with other text within the window, or an add of a held task: it waits for the owner. */
+  private holdOf(op: string, task: string, now: number): string | null {
+    const r = this.refusals().find((x) => x.op === op && x.task === task && (this.inWindow(x, now) || this.holdActive(x)));
+    return r ? `${this.why(r)}; it waits for you` : null;
+  }
+
+  /** An owner's decline: decided, and recorded so the same proposal is not made again (decidedBy "lair:..." is not the owner). */
+  private declineByOwner(p: StoredProposal, by: string, now: number, reason: string): void {
+    this.store.decide(p.id, "declined", by, now, reason);
+    if (!by.startsWith("lair:")) this.addRefusals([this.refusalRecord(p.op, p.task, keyText(p.op, p.text, p.agent), "declined", now)]);
+  }
+
+  /**
+   * An edit made outside Lair: a task's open line removed (not marked done) is recorded as an add the owner removed,
+   * whatever its age; a line the planner reworded or reassigned and the edit changed back is recorded as that op. A
+   * task given a line again releases its holds.
+   */
+  private noteOutsideEdit(beforeText: string, after: TasksDoc, now: number): void {
+    if (this.settings.refuseUndoneDays === 0) return;
+    const before = parseTasksDoc(beforeText, this.settings.doneMarker, this.settings.onePerAgent);
+    const records: RefusalRecord[] = [];
+    const body = (row: string | undefined) => (row === undefined ? null : row.replace(/^[-+]\d+ /, ""));
+    for (const line of before.tasks) {
+      const now_ = findTask(after, line.task);
+      if (!now_) {
+        if (!after.done.has(line.task)) records.push(this.refusalRecord("add", line.task, keyText("add", line.description, null), "removed", now));
+        continue;
+      }
+      if (now_.description === line.description && now_.agent === line.agent) continue;
+      const last = this.store.lastChange(this.project, line.task);
+      if (!last || last.source !== "proposal" || last.outcome !== "applied" || (last.op !== "reword" && last.op !== "reassign")) continue;
+      const was = body(last.diff.find((d) => d.startsWith("-")));
+      const wrote = body(last.diff.find((d) => d.startsWith("+")));
+      if (wrote !== before.rows[line.line - 1] || was !== after.rows[now_.line - 1]) continue;
+      records.push(this.refusalRecord(last.op, line.task, keyText(last.op, line.description, line.agent), "removed", now));
+    }
+    this.addRefusals(records);
+    for (const line of after.tasks) if (!findTask(before, line.task)) this.releaseHolds(line.task);
+  }
+
+  /** dedupe_pending: a guard_did per refused duplicate (act), a guard_would per one it would refuse (observe). */
+  private async dedupeEvents(
+    run: StoredRun,
+    checked: CheckedProposal[],
+    duplicateOf: (p: { op: string; task: string; agent: string | null; text: string | null }) => StoredProposal | null,
+  ): Promise<void> {
+    const act = this.settings.guards.dedupePending === "act";
+    for (const c of checked) {
+      if (act ? !c.refusal?.endsWith("(planner.guards.dedupe_pending)") : c.refusal !== null) continue;
+      const twin = duplicateOf(c);
+      if (!twin) continue;
+      await this.guardEvent(act ? "guard_did" : "guard_would", {
+        guard: "planner_dedupe_pending",
+        verdict: act ? "refuse" : "would_refuse",
+        subject: run.id,
+        summary: `planner_dedupe_pending${act ? "" : " (observe)"}: ${c.op} ${c.task} of planner run ${short(run.id)} ${act ? "is" : "would be"} refused: already pending as proposal ${short(twin.id)} of run ${short(twin.runId)}`,
+        evidence: [`${c.op} ${c.task}${c.agent ? ` -> ${c.agent}` : ""}`, `pending: proposal ${twin.id} of run ${twin.runId}`],
+        data: { run: run.id, task: c.task, op: c.op, pending: twin.id },
+        dedupeKey: `${act ? "guard_did" : "guard_would"}:planner_dedupe_pending:${run.id}:${c.index}`,
+      });
+    }
+  }
+
+  /**
+   * The verifier's context: with prefilter_closed not act, the planner's context has no merged PRs, so the verifier's
+   * alone gains them, from the same source and with the same limit (#298). Data only: the verifier still decides.
+   */
+  private verifierContext(json: string): string {
+    if (this.settings.guards.prefilterClosed === "act") return json;
+    const merged = this.mergedPrs().slice(0, MAX_CLOSED_LISTED);
+    if (merged.length === 0) return json;
+    try {
+      const parsed: unknown = JSON.parse(json);
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return json;
+      return JSON.stringify({ ...parsed, closed: { mergedPrs: merged.map((m) => ({ pr: m.pr, branch: m.branch === null ? null : clean(m.branch, 200) })) } });
+    } catch {
+      return json;
+    }
+  }
+
+  /**
+   * The owner's Undo of an applied change (POST /api/planner/changes/:id/undo): an applied proposal's add (the line
+   * goes), reword or reassign (the line before it comes back) or finish (the line without the done marker comes back),
+   * only while the line is exactly as the change wrote it and its task has no active run or claim. The line, the undo
+   * row and the refusal record are written together through an intent (a restart finishes them). Idempotent: an undone
+   * change returns its undo row.
+   */
+  undoChange(id: string): Promise<ChangeView> {
+    return this.exclusive(async () => {
+      this.finishIntent();
+      const change = this.store.getChange(this.project, id);
+      if (!change) throw new PlannerError(404, `No change ${clean(id, 64)}`);
+      const done = this.store.changeByKey(this.project, `undo:${id}`);
+      if (done) return done;
+      if (change.source === "deterministic") {
+        throw new PlannerError(409, `Lair's rules made this change (${clean(change.reason, 300)}): the next check would make it again, so edit the queue line or the file`);
+      }
+      if (change.source !== "proposal" || change.outcome !== "applied" || !UNDOABLE_OPS.includes(change.op)) {
+        throw new PlannerError(409, `this ${change.op} (${change.source}, ${change.outcome}) can't be undone here: edit the file`);
+      }
+      const task = change.task ?? "";
+      const now = this.clock.now();
+      const read = readTasksFile(this.settings.tasksFile, MAX_TASKS_FILE_BYTES);
+      if (!read.ok) throw new PlannerError(409, `the tasks file: ${read.reason}`);
+      const doc = await this.watchTasksFile(parseTasksDoc(read.text, this.settings.doneMarker, this.settings.onePerAgent), this.store.activeRun(this.project), now);
+      if (change.op === "add" && doc.done.has(task)) throw new PlannerError(409, `task ${task} is done (line ${doc.done.get(task)}): its line stays`);
+      const body = (prefix: string) => change.diff.find((d) => d.startsWith(prefix))?.replace(/^[-+]\d+ /, "") ?? null;
+      const wrote = body("+");
+      const was = body("-");
+      const line = change.op === "mark_done" ? doc.done.get(task) : findTask(doc, task)?.line;
+      if (line === undefined || wrote === null || doc.rows[line - 1] !== wrote) {
+        throw new PlannerError(409, `the line of task ${task} is no longer as this change wrote it: edit the file`);
+      }
+      const agentsStore = this.agents.store();
+      const latest = agentsStore?.latestRunForTask(this.project, task);
+      if (latest && isActive(latest.state)) throw new PlannerError(409, `task ${task} has an active run (${short(latest.id)} of ${latest.agent}): undo it once that run ends`);
+      const claim = agentsStore?.getClaim(this.project, task);
+      if (claim) throw new PlannerError(409, `task ${task} is claimed by run ${short(claim.runId)} (agent ${claim.agent}): undo it once the claim ends`);
+      if (change.op !== "add" && was === null) throw new PlannerError(409, "this change has no earlier line to put back: edit the file");
+      const current = findTask(doc, task);
+      const rows = [...doc.rows];
+      if (change.op === "add") rows.splice(line - 1, 1);
+      else rows[line - 1] = was ?? "";
+      const next = parseTasksDoc(rows.join("\n"), this.settings.doneMarker, this.settings.onePerAgent);
+      if (next.malformed.length > doc.malformed.length) throw new PlannerError(409, "putting the line back would make the file malformed: edit the file");
+      const op = change.op === "mark_done" ? "finish" : change.op;
+      const record: ChangeInput = {
+        project: this.project,
+        at: now,
+        source: "owner",
+        outcome: "applied",
+        op: "undo",
+        task,
+        agent: change.agent,
+        reason: `the owner undid change ${short(id)} (${op} ${task})`,
+        diff: diffOf(line, wrote, change.op === "add" ? null : was),
+        runId: change.runId,
+        proposalId: change.proposalId,
+        dedupeKey: `undo:${id}`,
+      };
+      const refused = [this.refusalRecord(op, task, keyText(op, current?.description ?? null, current?.agent ?? null), "undid", now)];
+      this.setState(INTENT, { afterHash: next.hash, text: next.text, changes: [record], refused } satisfies Intent);
+      const written = writeTasksFile(this.settings.tasksFile, next.text, doc.hash, MAX_TASKS_FILE_BYTES);
+      if (!written.ok) {
+        this.setState(INTENT, null);
+        throw new PlannerError(409, `the tasks file was not written: ${written.reason}`);
+      }
+      this.store.addChange(record);
+      this.addRefusals(refused);
+      this.setState(KNOWN, { hash: next.hash, text: next.text } satisfies Known);
+      this.setState(INTENT, null);
+      this.doc = next;
+      await this.emit("planner.changed", { op: "undo", task, source: "owner", outcome: "applied" });
+      const undone = this.store.changeByKey(this.project, `undo:${id}`);
+      if (!undone) throw new PlannerError(500, "the undo was written but not recorded");
+      return undone;
+    });
+  }
+
   // ============ VIEWS ============
 
   status(errors: string[] = []): PlannerStatusView {
@@ -2623,6 +2920,10 @@ export class PlannerService {
         .reverse()
         .slice(0, 200)
         .map(([id, record]) => handledView(id, record)),
+      refusals: Object.values(this.state<Record<string, RefusalRecord>>(REFUSED) ?? {})
+        .reverse()
+        .slice(0, 200)
+        .map((r) => ({ op: r.op, task: r.task, at: iso(r.at), why: r.why, held: this.holdActive(r) })),
     };
   }
 

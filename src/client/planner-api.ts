@@ -59,6 +59,14 @@ export function runAction(project: string, runId: string, pending: number, actio
   };
 }
 
+export function undoAction(project: string, change: ChangeView): PlannerAction {
+  return {
+    question: `Undo "${change.op} ${change.task ?? ""}"? Lair puts the line back as it was, only if nobody changed it since, and won't propose the same change again for a while.`,
+    url: withProject(`/api/planner/changes/${encodeURIComponent(change.id)}/undo`, project),
+    body: { confirm: true },
+  };
+}
+
 export function resumeAction(project: string): PlannerAction {
   return {
     question: "Resume planner runs? The next trigger starts one.",

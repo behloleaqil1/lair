@@ -148,7 +148,8 @@ export interface ProposalView {
  * external: someone else edited the tasks file; restored: Lair put back what
  * it last wrote (act mode, a change while a planner run was active)
  */
-export type ChangeSource = "deterministic" | "proposal" | "external" | "restored";
+/** owner: the owner's Undo of an applied change (op "undo") */
+export type ChangeSource = "deterministic" | "proposal" | "external" | "restored" | "owner";
 /** applied: written to the tasks file; planned: observe mode, not written; failed: not written */
 export type ChangeOutcome = "applied" | "planned" | "failed";
 
@@ -165,6 +166,23 @@ export interface ChangeView {
   diff: string[];
   runId: string | null;
   proposalId: string | null;
+  /** The Planner view offers Undo (POST /api/planner/changes/:id/undo): an applied proposal's add, reword, reassign or finish */
+  undoable: boolean;
+  /** The owner's undo of this change, if any */
+  undoneBy: string | null;
+}
+
+/**
+ * A change the owner undid, declined or removed (docs/design/planner-act.md §4.3): the same op, task and text is
+ * refused for planner.act.refuse_undone_days; an add's task is held for the owner until its plan text changes.
+ */
+export interface RefusalView {
+  op: string;
+  task: string;
+  at: string;
+  why: "undid" | "declined" | "removed";
+  /** An add of the task waits for the owner (the hold) */
+  held: boolean;
 }
 
 /** GET /api/planner/status (owner only: its errors and warnings name paths on this machine). */
@@ -217,6 +235,8 @@ export interface PlannerOverviewView extends PlannerStatusView {
   pausedReason: string | null;
   /** Owner messages recorded as handled (planner.guards.handled_messages), the newest first */
   handledMessages: HandledMessageView[];
+  /** What the owner undid, declined or removed, the newest first (planner.act.refuse_undone_days) */
+  refusals: RefusalView[];
 }
 
 /** An owner message recorded as handled: left out of the planner's later contexts and triggers. */

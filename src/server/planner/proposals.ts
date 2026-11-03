@@ -95,6 +95,11 @@ export interface CheckContext {
   messages?: ReadonlySet<string>;
   /** planner.guards.prefilter_closed act: why a task's own PR counts as merged, or null (an add of it is refused) */
   ownMerged?: (task: string) => string | null;
+  /**
+   * Why a proposal is refused although it passes the checks above, or null: the owner undid, declined or removed the
+   * same change (planner.act.refuse_undone_days), or it is still pending from an earlier run (guards.dedupe_pending act)
+   */
+  refusedBefore?: (p: { op: string; task: string; agent: string | null; text: string | null }) => string | null;
 }
 
 function field(value: unknown, max: number): string {
@@ -210,6 +215,7 @@ export function checkProposals(items: unknown[], ctx: CheckContext): { checked: 
     // The text becomes a description: one line, control characters removed, never longer than a description
     const text = p.text !== undefined ? clean(p.text, 4000) : null;
     let refusal = refusalOf(p, text, ctx, doc);
+    if (!refusal && ctx.refusedBefore) refusal = ctx.refusedBefore({ op: p.op, task: p.task, agent: p.agent ?? null, text });
     if (!refusal && tasks.has(p.task)) refusal = `another proposal of this run is about task ${p.task}`;
     if (!refusal && !clean(p.reason, MAX_REASON_CHARS)) refusal = "the reason is empty";
     const edit = refusal ? null : editOf(p, text, ctx);
