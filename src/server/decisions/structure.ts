@@ -27,7 +27,7 @@ export interface KnownDecisionClass {
 }
 
 /**
- * The classes of the policy table (C1-C15) with the evidence codes each
+ * The classes of the policy table (C1-C16) with the evidence codes each
  * allows. A class outside this table is allowed but flagged; a known class
  * takes only its own codes.
  */
@@ -46,6 +46,8 @@ export const KNOWN_DECISION_CLASSES: Readonly<Record<string, KnownDecisionClass>
   "planner.unblock": { policy: "C7", codes: ["infra", "waiting_on_gate", "needs_owner"] },
   // The planner guards' notices (G6, docs/design/ai-spend.md §4.5): what observe mode would do, or a kept change
   "planner.guard_notice": { policy: "C15", codes: ["would_skip", "would_apply", "tasks_file_kept"] },
+  // planner.mode: act without the guards act mode needs, in warn mode (docs/design/planner-act.md §4.3, D1)
+  "planner.act_rules": { policy: "C16", codes: ["act_rules_missing"] },
   "triage.gate_failure": {
     policy: "C8",
     codes: ["infra_download", "docker_down", "test_assertion", "unknown_failure", "infra_other", "same_failure_again"],

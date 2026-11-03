@@ -225,9 +225,35 @@ interface ChangeRow {
   diff: string;
   run_id: string | null;
   proposal_id: string | null;
+  /** The owner's undo of it (its dedupe key is "undo:<id>") */
+  undone_by: string | null;
 }
 
 const iso = (ms: number) => new Date(ms).toISOString();
+
+/** The ops of an applied proposal the owner can undo (docs/design/planner-act.md §4.3, Undo) */
+export const UNDOABLE_OPS: readonly string[] = ["add", "reword", "reassign", "mark_done"];
+
+const CHANGE_SELECT = `SELECT c.*, (SELECT u.id FROM planner_changes u WHERE u.project = c.project AND u.dedupe_key = 'undo:' || c.id) AS undone_by
+  FROM planner_changes c`;
+
+function toChange(row: ChangeRow): ChangeView {
+  return {
+    id: row.id,
+    at: iso(row.at),
+    source: row.source as ChangeSource,
+    outcome: row.outcome as ChangeOutcome,
+    op: row.op,
+    task: row.task,
+    agent: row.agent,
+    reason: row.reason,
+    diff: JSON.parse(row.diff) as string[],
+    runId: row.run_id,
+    proposalId: row.proposal_id,
+    undoable: row.source === "proposal" && row.outcome === "applied" && UNDOABLE_OPS.includes(row.op) && row.undone_by === null,
+    undoneBy: row.undone_by,
+  };
+}
 
 function toRun(row: RunRow): StoredRun {
   return {
@@ -625,21 +651,29 @@ export class PlannerStore {
 
   listChanges(project: string, limit = 100): ChangeView[] {
     const rows = this.db
-      .prepare(`SELECT * FROM planner_changes WHERE project = ? ORDER BY at DESC, rowid DESC LIMIT ?`)
+      .prepare(`${CHANGE_SELECT} WHERE c.project = ? ORDER BY c.at DESC, c.rowid DESC LIMIT ?`)
       .all(project, limit) as ChangeRow[];
-    return rows.map((row) => ({
-      id: row.id,
-      at: iso(row.at),
-      source: row.source as ChangeSource,
-      outcome: row.outcome as ChangeOutcome,
-      op: row.op,
-      task: row.task,
-      agent: row.agent,
-      reason: row.reason,
-      diff: JSON.parse(row.diff) as string[],
-      runId: row.run_id,
-      proposalId: row.proposal_id,
-    }));
+    return rows.map(toChange);
+  }
+
+  /** One change of the project, or null. */
+  getChange(project: string, id: string): ChangeView | null {
+    const row = this.db.prepare(`${CHANGE_SELECT} WHERE c.project = ? AND c.id = ?`).get(project, id) as ChangeRow | undefined;
+    return row ? toChange(row) : null;
+  }
+
+  /** The change recorded with this dedupe key, or null. */
+  changeByKey(project: string, key: string): ChangeView | null {
+    const row = this.db.prepare(`${CHANGE_SELECT} WHERE c.project = ? AND c.dedupe_key = ?`).get(project, key) as ChangeRow | undefined;
+    return row ? toChange(row) : null;
+  }
+
+  /** A task's newest change, or null. */
+  lastChange(project: string, task: string): ChangeView | null {
+    const row = this.db
+      .prepare(`${CHANGE_SELECT} WHERE c.project = ? AND c.task = ? ORDER BY c.at DESC, c.rowid DESC LIMIT 1`)
+      .get(project, task) as ChangeRow | undefined;
+    return row ? toChange(row) : null;
   }
 
   // ============ ATTEMPTS ============
