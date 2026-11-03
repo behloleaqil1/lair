@@ -5,7 +5,7 @@
  * process spawner and the clock are fake, and the planner agent's run is a fixed proposals.json.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { appendFileSync, utimesSync, writeFileSync } from "fs";
+import { appendFileSync, readFileSync, rmSync, utimesSync, writeFileSync } from "fs";
 import { join } from "path";
 import type { ProjectConfig } from "../../shared/types.js";
 import { ReviewStore } from "../review/store.js";
@@ -129,11 +129,12 @@ describe("AT-2 and AT-19: the act-mode config rules", () => {
     expect(notice).toMatchObject({ attention: "notice", evidence: { code: "act_rules_missing", facts: { rules: 1 } } });
     expect(notice.context).toContain("planner.guards.recheck_on_change");
     expect(notice.context).toContain("agents.spend.enabled: true");
-    // A reload (the planner on the same data) raises no second notice
+    // The owner closes it; a reload (the planner on the same data, the same config) raises no second notice
+    expect(await h.answer(notice.id, "noted")).toBe(200);
     await h.planner.stop();
     const again = await boot(p, { guards }, { dbs: h.dbs, clock: h.clock });
     await again.service.cycle();
-    expect(notices(again, "planner.act_rules")).toHaveLength(1);
+    expect(notices(again, "planner.act_rules").map((d) => d.id)).toEqual([notice.id]);
     // Refuse mode (the next release): the planner does not load, with the same keys
     const refused = parse(p, blockOf(p, { guards }), "refuse");
     expect(refused.ok).toBe(false);
@@ -305,6 +306,12 @@ describe("AT-14: the owner's Undo", () => {
 
   it("a reword's undo puts the line before it back; a rules change (the queue's done line) is refused naming the queue line", async () => {
     const { p, h } = await applied();
+    // An add whose task has a done line since: its line stays
+    appendFileSync(p.queueFile, "- DONE t1 by worker-a 12:20Z: merged\n");
+    await h.service.cycle();
+    expect(tasksText(h)).toContain("#done worker-a|Alice|t1|One");
+    const doneAdd = await undo(h, changeOf(h, "add", "t1").id);
+    expect([doneAdd.statusCode, doneAdd.json().error]).toEqual([409, "task t1 is done (line 5): its line stays"]);
     const reword = await undo(h, changeOf(h, "reword", "t2").id);
     expect(reword.statusCode).toBe(200);
     expect(tasksText(h)).toContain("worker-a|Alice|t2|Two\n");
@@ -391,6 +398,58 @@ describe("AT-18: the refusal window and the hold", () => {
     expect(again.service.history().filter((x) => x.op === "undo")).toHaveLength(1);
   });
 
+  it("a plan source that can't be read keeps a hold; only a real change of the task's plan text lifts it", async () => {
+    const p = makePaths();
+    writeFileSync(p.planFile, ["# Plan", "- [ ] t1: First"].join("\n"));
+    tasks(p, ...BASE, "worker-a|Alice|t1|First");
+    const h = await boot(p, { guards: SAFE });
+    writeFileSync(p.tasksFile, tasksText(h).replace("worker-a|Alice|t1|First\n", ""));
+    await h.service.cycle();
+    expect(h.service.overview().refusals).toEqual([expect.objectContaining({ task: "t1", why: "removed", held: true })]);
+    rmSync(p.planFile);
+    h.clock.t = NOW + 8 * DAY;
+    await planRun(h, [add("t1", "worker-a", "First")]);
+    expect(proposalOf(h, "t1")).toMatchObject({ status: "pending", verifierVerdict: "unsure" });
+    expect(h.service.overview().refusals[0].held).toBe(true);
+    writeFileSync(p.planFile, ["# Plan", "- [ ] t1: First, again"].join("\n"));
+    await h.service.cycle();
+    expect(h.service.overview().refusals[0].held).toBe(false);
+  });
+
+  it("a verifier-approved add is not applied when the owner declined the same add while it was verified", async () => {
+    const p = makePaths();
+    tasks(p, ...BASE);
+    const h = await boot(p, { guards: SAFE, verifier: { id: "verifier", prompt_file: "verifier.md", auto_apply: ["add"] } });
+    const verify = async (verdict: string) => {
+      const before = h.spawner.calls.length;
+      h.spawner.behaviour = (c) => {
+        if (c.env.LAIR_AGENT !== "verifier") return;
+        const path = /Write your verdicts as JSON to this file, and nothing else: (\S+)/.exec(promptOf(c))?.[1] ?? "";
+        writeFileSync(path, JSON.stringify({ verdicts: [{ proposal: 0, verdict, reason: "checked" }] }));
+      };
+      await h.agentsService.tick();
+      const call = h.spawner.calls.slice(before).find((c) => c.env.LAIR_AGENT === "verifier") as SpawnCall;
+      h.spawner.behaviour = undefined;
+      h.clock.t += 2 * MIN;
+      appendFileSync(call.logPath, "verified\n");
+      utimesSync(call.logPath, new Date(h.clock.now()), new Date(h.clock.now()));
+      h.spawner.exit(call.pid, 0);
+      await h.agentsService.tick();
+      await h.service.cycle();
+    };
+    // Run B: the verifier is unsure, so add t5 waits for the owner
+    await planRun(h, [add("t5", "worker-b", "Five")]);
+    await verify("unsure");
+    const b = proposalOf(h, "t5");
+    expect(b.status).toBe("pending");
+    // Run A proposes the same add (dedupe_pending observes only); while its verifier runs the owner declines B's
+    await planRun(h, [add("t5", "worker-b", "Five")]);
+    expect((await post(h, `/api/planner/proposals/${b.id}/reject`)).statusCode).toBe(200);
+    await verify("approve");
+    expect(proposalOf(h, "t5")).toMatchObject({ status: "rejected", refusal: expect.stringMatching(/^the owner declined add t5 on /) });
+    expect(readFileSync(h.tasksFile, "utf-8")).not.toContain("|t5|");
+  });
+
   it("a hand edit that puts back a line the planner reworded is recorded as that reword; another hand edit is not", async () => {
     const p = makePaths();
     tasks(p, ...BASE, "worker-a|Alice|t2|Two");
@@ -419,7 +478,7 @@ describe("AT-20 (verifier half): the verifier sees merged PRs when prefilter_clo
   }
   const jsonOf = (prompt: string) => JSON.parse(prompt.slice(prompt.lastIndexOf("```json\n") + "```json\n".length, prompt.lastIndexOf("\n```")));
 
-  async function verified(prefilter: "observe" | "act") {
+  async function verified(prefilter: "off" | "observe" | "act") {
     const p = makePaths();
     tasks(p, ...BASE);
     const h = await boot(p, { mode: "observe", guards: { prefilter_closed: prefilter }, verifier: { id: "verifier", prompt_file: "verifier.md" } }, { reviews: reviewsWith3(p) });
@@ -434,6 +493,12 @@ describe("AT-20 (verifier half): the verifier sees merged PRs when prefilter_clo
     const { planner, verifier } = await verified("observe");
     expect(planner.closed).toBeUndefined();
     expect(verifier.context.closed.mergedPrs.map((m: { pr: number }) => m.pr).sort()).toEqual([41, 42, 43]);
+  });
+
+  it("off: today's contexts, neither has it", async () => {
+    const { planner, verifier } = await verified("off");
+    expect(planner.closed).toBeUndefined();
+    expect(verifier.context.closed).toBeUndefined();
   });
 
   it("act: both have it, once", async () => {

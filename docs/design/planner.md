@@ -371,12 +371,15 @@ Built from [planner-act.md](planner-act.md) §8, PR 1 (§4.3 there is the design
   ..."), as an unchecked PR ownership is.
 - **`dedupe_pending`.** A proposal matching one still pending from an earlier run (op, task, agent; text for a
   `reword`) is refused in act and recorded as a `would_refuse` in observe.
-- **The verifier sees merged PRs.** With `prefilter_closed` not `act`, the planner's context has no `closed` block,
-  so the verifier's context alone gains `closed.mergedPrs` (the newest 200 from the review store).
+- **The verifier sees merged PRs.** With `prefilter_closed: observe`, the planner's context has no `closed` block, so
+  the verifier's context alone gains `closed.mergedPrs` (the newest 200 from the review store). With it `off` both
+  contexts are today's (planner-act.md §8: every part off by default); with `act` the planner's context has them.
 - **Undo.** `POST /api/planner/changes/:id/undo` reverses an applied proposal's `add`, `reword`, `reassign` or
   `finish` while its line is as the change wrote it and its task has no active run or claim. The new text, an `undo`
   row (dedupe key `undo:<change id>`, so it is idempotent) and the refusal record go into one intent, so a restart
-  finishes them.
+  finishes them. Undoing a `finish` reopens the owner messages its closing handled. A `read_only` project refuses it.
+- **Fail closed.** A hold stays while a plan source can't be read; the verifier's auto-apply checks the refusals and
+  holds again, so a decline made while a run was verified still holds.
 
 ## Not built
 
