@@ -407,3 +407,12 @@ export async function runPlannerAgent(h: Harness, write: (call: SpawnCall) => vo
 export function writeProposals(call: SpawnCall, proposals: unknown): void {
   writeFileSync(proposalPathOf(call), typeof proposals === "string" ? proposals : JSON.stringify(proposals));
 }
+
+/**
+ * A live claim on `task` by a run of `agent`, recorded as the agents module records one when fill starts a line (the
+ * server owns it, so it never counts as dead).
+ */
+export function claimTask(h: Harness, task: string, agent: string, runId = "00000000-0000-4000-8000-00000000c1a1"): void {
+  const result = h.agentsStore.claim("demo", task, runId, agent, SELF, h.clock.now(), () => true);
+  if (!result.ok) throw new Error(`task ${task} is already claimed by run ${result.holder.runId}`);
+}
