@@ -95,8 +95,8 @@ mergedPrs, ownMergedPr, checkPrOwnership, nameOf, startable, readyPlanTasks.
 
 | What | Where | What it does | What is missing |
 |---|---|---|---|
-| Planner modes | `src/server/planner/config.ts:196` `mode: observe \| act` | `observe` writes nothing (each change recorded once as `planned`, `docs/configuration.md:3189`; `service.ts:768`). `act` writes the tasks file | One switch for everything. No evidence report, no per-part modes |
-| Approval per op | `config.ts:215-225` | `add` and `reword` default to `never` (apply by themselves in act). The other ops default to `always` | Kept as is |
+| Planner modes | `src/server/planner/config.ts:196` `mode: observe \| act` | `observe` applies nothing by itself: each rules change is recorded once as `planned` (`docs/configuration.md:3189`; `service.ts:768`), and every proposal waits for the owner; one the owner approves is written (`service.ts:2378`, then `writeTasksFile` at `:575`). `act` also writes the rules' changes and auto-applied proposals (`writes`, `service.ts:340-342`) | One switch for everything. No evidence report, no per-part modes |
+| Approval per op | `config.ts:215-225` | `add` and `reword` default to `never`. In act an op set to `never` applies by itself when there is no verifier, or when the verifier approved it and it is in `auto_apply`, or it is in `skip_ops` (`service.ts:2040-2060`). The other ops default to `always` | Kept as is |
 | Verifier auto-apply | `config.ts:156` `verifier.auto_apply`; `config.ts:483-488` (`drop` never allowed) | Verifier-approved ops in this list apply in act mode | Kept as is |
 | Compare-and-swap write | `src/server/planner/files.ts:147-150` `writeTasksFile(path, text, expectHash, maxBytes)` | Writes atomically, and only if the file still has the expected hash | Kept as is. Every write in this spec goes through it |
 | G6 guards | `config.ts:172-191` `GuardsSchema` (`prefilter_closed`, `handled_messages`, `skip_unchanged`, `recheck_on_change`, each `off`/`observe`/`act`, default `off`); `config.ts:589-601` (a guard not `off` needs `agents.spend.enabled`); `docs/design/planner.md:319-357` | Merged (#322). Closed work leaves the context, a handled owner message is not proposed again, an unchanged run is skipped, an outside edit during a run is kept | Act mode does not require any of them (§4.3) |
@@ -111,7 +111,7 @@ mergedPrs, ownMergedPr, checkPrOwnership, nameOf, startable, readyPlanTasks.
 | Context ordering | `context.ts:43-48` `orderTasks` | Tasks named by triggers come first, then ready tasks | No phase order, and no count of how many lines are wanted |
 | Add rules | `src/server/planner/proposals.ts:113-114` (`add` needs an agent), `:127-128` (an existing line or a done id is refused) | Refuses a duplicate line or a reused id | An `add` can't make an unassigned line. Nothing compares a proposal with pending ones (#97), or with one the owner undid or declined |
 | Proposal outcomes | `src/shared/planner-types.ts:118` `ProposalStatus` (`pending`, `applied`, `rejected`, `declined`); `service.ts:2401` (owner declines, `decidedBy` the owner), `:2079` (verifier declines, `decidedBy: "lair:verifier"`) | An owner decline is recorded on the proposal | Nothing reads it when a later run proposes the same thing (§4.3) |
-| Line names | `service.ts:1719` `nameOf` (the dragon's configured name, else the agent id); `proposals.ts:161` | Fills the `<name>` field of an `add` or `reassign` line | Kept as is. The assign rule uses it (§4.1) |
+| Line names | `service.ts:1719` `nameOf` (the agent's configured name, else the agent id); `proposals.ts:161` | Fills the `<name>` field of an `add` or `reassign` line | Kept as is. The assign rule uses it (§4.1) |
 | Unassigned lines | `src/server/agents/fill.ts:726-736` (line format `<agent>\|<name>\|<task>\|<desc>`, an empty agent field is unassigned), `:987-1035` `unassignedLine` (claim check at `:1011-1015`) | Ready work for any agent while open. Fill never starts it | No rule assigns one to an idle agent |
 | Idle notice | `src/server/agents/config.ts:158-169` `IDLE_READY_SOURCES = ["tasks_file"]`, `fill.idle.notice_minutes` (0 = off) | One notice per idle episode while ready work exists | Ready work comes only from the tasks file. The plan is not a source |
 | Fill holds and capacity | `fill.ts:176` `OWNER_HOLDS`; `src/server/agents/config.ts:217` `fill.max_active`, `:199` and `:957` `capacity.heavy_work.max_active`, `:172` `AgentClass` (local agents held by load) | Fill decides inside `AgentsFill` (`fill.ts:1183`) whether it starts a line | No exported answer to "which agents would fill start now" (git grep `startable` in `src/server`: none) |
@@ -149,14 +149,21 @@ from what fill actually starts.
   `capacity.heavy_work.max_active`, the load hold on `local` agents, spend budgets, and `fill.enabled`. The planner
   reads it through the agents module, as it already reads the agents store. With fill off it is
   `{ startable: [], freeSlots: 0 }`.
-- **Startable agent:** an agent in `capacityNow().startable` that is not the planner or the verifier.
+- **Startable agent:** an agent in `capacityNow().startable` that is not the planner or the verifier: fill would start
+  it now if it had an open line that is not heavy work. Heavy work is judged per task (`fill.ts:3144` `isHeavyTask`,
+  checked at `:3133`), so `capacityNow()` does not hold an agent back for `capacity.heavy_work.max_active`; a heavy
+  line beyond that limit waits in fill as it does today.
 - **Free slots:** `capacityNow().freeSlots`.
 - **Idle capacity:** the smaller of free slots and the number of startable agents.
 - **Ready line:** an open line in the tasks file that fill will start once its agent is free:
   - assigned to an allowlisted agent other than the planner or the verifier, with no active run or claim on its task,
     no hold, and not done (a line for a busy agent counts: it is the margin `ahead` keeps); or
   - unassigned and ready according to `unassignedLine`, **only while `backlog.assign` is `act`**. Otherwise no rule
-    gives it to an agent, and counting it would let unassigned lines satisfy the deficit while every agent stays idle.
+    gives it to an agent, and counting it would let unassigned lines satisfy the deficit while every agent stays idle;
+    or
+  - a pending `add` (any source, any run) that would make such a line once approved. It counts until it is approved
+    or declined, so a shortage that pending adds already cover does not start another paid run that proposes them
+    again (#97), whatever `dedupe_pending`'s mode.
 - **Target:** idle capacity plus `ahead`. `ahead` keeps a margin of lines for agents that are about to finish.
 - **Room:** how many new lines can be written where fill will start them. Unlimited while `unassigned: true` (and so
   `assign` is on). Otherwise the allowlisted agents (not the planner or the verifier) that may take another line: all
@@ -186,7 +193,7 @@ these agents: <the agents that have room>", a list that is never empty while `wa
 - **Closed work.** G6 `prefilter_closed` removes closed work first.
 - **Already in the file.** A plan task whose id has an open or done line in the tasks file is not offered (an `add`
   of it would be refused, `proposals.ts:127-128`).
-- **Removed by the owner.** A plan task with a removal hold (§4.3, refusal window) is not offered.
+- **Undone, declined or removed by the owner.** A plan task with a hold (§4.3, refusal window) is not offered.
 
 The planner exposes the result as `readyPlanTasks(): PlanTaskView[]` (new; git grep finds no such name). Fill's idle
 notice reads it (below). It is empty when the planner or `backlog` is off. (`planner.backlog` is this new block; it is
@@ -203,7 +210,7 @@ otherwise), because without the rule no agent ever starts such a line.
 2. Give it the first ready unassigned line, in file order, for which no refusal record of op `assign` names this agent
    (an owner's Undo of an assignment). Such a line goes to the next agent instead.
 3. Write the agent and its name into that line. The name is `nameOf(agent)` (`service.ts:1719`): the agent's
-   configured dragon name, or the agent id when it has none.
+   configured name, or the agent id when it has none.
 
 Each assignment is one history row with source `rules`, op `assign`, and before and after lines. It is written through
 the compare-and-swap write. A line that a run or claim holds is skipped (`unassignedLine`'s claim check). Before each
@@ -218,7 +225,10 @@ needs `unassigned: true`, and with it `assign` on):
 - the description is the plan text, cleaned and cut to 500 characters.
 
 These lines go through the same checks as a model's `add`, including the refusal window (§4.3), as proposals with
-source `rules`. They then follow the approval rules. The verifier is asked only when `backlog.verify_rules: true`.
+source `rules`. The verifier is asked only when `backlog.verify_rules: true`. A rules `add` applies by itself only
+when `planner.mode` and `backlog.mode` are both `act`, `approval.add` is `never`, no refusal record or hold names it,
+and, with `verify_rules: true`, the verifier approved it (`add` need not be in `auto_apply`: a rules add is treated
+like an op in `skip_ops`, `service.ts:2052`). Otherwise it waits for the owner.
 With `source: model` (the default), the model proposes, as it does today.
 
 **Bounds.** At most `max_adds_per_run` adds per run or rules cycle, and at most `max_adds_per_hour` **applied** adds
@@ -233,6 +243,9 @@ the owner can approve it later. The existing caps still apply: 200 tasks and 256
 
 - **Writes nothing.** `backlog.mode: observe` writes nothing, and the assign rule only records `would_assign`.
 - **Rules source:** records `would_add` with the task ids.
+- **Once each.** A `would_add` is recorded once per task id, and a `would_assign` once per task id and agent, until
+  that task gets a line (the keys are kept in `planner_state`, newest 1,000). A refusal by a cap (`max_adds_per_hour`,
+  above) is recorded once per streak of cycles that hit the cap, not once per cycle.
 - **Model source:** the trigger fires, and the `add`s of a run that a `backlog_low` trigger started always wait for the
   owner, even with `planner.mode: act` and `approval.add: never`. Only `backlog.mode: act` lets them apply by
   themselves.
@@ -262,8 +275,10 @@ A plan task can need a spec before it is built. It needs one when:
 - **Why not `checkPrOwnership`.** #308's matcher (`pr-ownership.ts:116-135`) also accepts a PR whose title or body
   names the task id, or whose branch maps to the task's agent. A build PR whose body says "implements the spec from
   X-spec" would then count as the spec's merge. Specs first uses `ownMergedPr` only.
-- **After the merge.** `X` becomes ready and is offered like any other task. Its context details gain the spec's path
-  from the merged PR's changed files, so the build task points to the spec.
+- **After the merge.** `X` becomes ready and is offered like any other task. Its context details gain the spec's path,
+  so the build task points to the spec: the first `link_pattern` match in `X-spec`'s DONE line, else in `X`'s plan
+  text. The review store keeps no changed files of a PR (`MergedPr` is `pr`, `branch`, `at`, `guards.ts:28-34`), so
+  the path is not read from the PR. With no match the details say "spec merged in PR #<n>".
 - **The prompt.** Fill gains a `{kind}` placeholder in `prompt_files` (added to the allowed placeholders at
   `src/server/agents/config.ts:1014`). It is `spec` when the task id ends in `spec_first.suffix` and `build` otherwise.
   A project can then add a file such as `{prompts_dir}/kinds/{kind}.md`. A file whose template contains `{kind}` and
@@ -290,14 +305,19 @@ A plan task can need a spec before it is built. It needs one when:
 - **Refusal window for undone, declined and removed changes** (`planner.act.refuse_undone_days`, default 7, 0 = off;
   D2). Lair records a refusal when:
   - the owner undoes an applied change (Undo, below);
-  - an outside edit removes a task's open line, or changes back a line the planner wrote, **whatever its age** (the
-    edit's diff takes out the line; a line turned into a done line is not a removal); or
+  - an outside edit removes a task's open line, **whatever its age** (the edit's diff takes out the line and no line
+    with that task id is left; a line turned into a done line is not a removal); or
+  - an outside edit changes back a line the planner wrote: the task id stays, and the line's description or agent goes
+    back to what it was before the planner's change (recorded as that change's op, `reword` or `reassign`, with the
+    planner's text). Any other hand edit of a line is not recorded; or
   - the owner declines a proposal (status `declined`, `decidedBy` not starting with `lair:`, `service.ts:2401`; this
     includes the owner's "follow the verifier" answer, `service.ts:2398`).
 
-  The record is `{op, task, textHash, at, why}`, keyed by op, task id and `sha256` of the cleaned text (the line
-  description for `add` and `reword`, the agent id for `reassign` and `assign`, empty for the other ops; an outside
-  removal is recorded as op `add` with the removed line's description). It is kept in `planner_state` under `refused`,
+  The record is `{op, task, textHash, planTextHash, at, why}`, keyed by op, task id and `sha256` of the cleaned text
+  (the line description for `add` and `reword`, the agent id for `reassign` and `assign`, empty for the other ops; an
+  outside removal is recorded as op `add` with the removed line's description). `planTextHash` is the `sha256` of the
+  task's plan text at the time of the record (empty when the task is in no plan source); the hold below compares it,
+  never `textHash`, because a line's description is rarely the plan's exact text. It is kept in `planner_state` under `refused`,
   newest 1,000 (like `handled_messages`, `service.ts:157-158`). It is written in the same `exclusive()` step as the
   change or decision that causes it; for a file write it is part of that write's intent, so the intent replay
   (`service.ts:526`, `finishIntent`) writes it after a restart. While a record is younger than the window:
@@ -307,11 +327,13 @@ A plan task can need a spec before it is built. It needs one when:
     the owner, with the record named in its reason;
   - the refusals are counted in the readiness report (§4.4).
 
-  **Removal hold.** A task whose open line the owner removed by hand also gets a removal hold that outlives the window:
-  until the plan changes that task's text (its hash differs from the one recorded), or the owner adds a line for it
-  again, `readyPlanTasks()` doesn't offer it, the context marks it "the owner removed its line on <date>", and an `add`
-  of it never applies by itself (it waits for the owner). So a line the owner removed never comes back without the
-  owner's approval; for the window it isn't even proposed.
+  **Hold.** Every record of op `add` (an undone add, a declined add, a line removed by hand) also puts a hold on its
+  task that outlives the window: until the task's plan text changes (its `sha256` differs from the record's
+  `planTextHash`), or the owner adds or approves a line for it again, `readyPlanTasks()` doesn't offer it, the context
+  marks it "the owner undid (declined, removed) its line on <date>", and an `add` of it never applies by itself (it
+  waits for the owner). So a line the owner removed, undid or declined never comes back without the owner's approval;
+  for the window it isn't even proposed. A task in no plan source keeps its hold until the owner adds or approves a
+  line for it.
 
   The records and holds are kept in `planner.mode: observe` as well, so a project that switches to act already has
   them. This closes the loop where an undo or a removal raises the deficit, `backlog_low` fires again, and the same
@@ -336,8 +358,8 @@ repeats were silent *overwrites*, and with the guard in act nothing is overwritt
 - `planner.mode: act` requires `guards.recheck_on_change: act`. Without it the restore path can still overwrite an
   outside edit.
 - `planner.mode: act` requires `guards.prefilter_closed` and `guards.dedupe_pending` to be at least `observe`.
-- These two rules **warn** in the first release that has them (a load warning plus one notice per project, naming the
-  keys to set; D1), and **refuse** from the next release. The switch between the two is one constant, changed in its
+- These two rules **warn** in the first release that has them (a load warning plus one `attention: notice` item of
+  class `planner.act_rules` per project and config text, naming the keys to set; D1), and **refuse** from the next release. The switch between the two is one constant, changed in its
   own PR. Existing `act` installs keep working through one release.
 - `backlog.mode: act`, `backlog.assign: act` or `spec_first.mode: act` while `planner.mode` is `observe` is refused at
   once (new keys, so no install has them). Observe writes nothing, so those settings would be a no-op that looks
@@ -391,7 +413,7 @@ The report reads it for criterion (5) and to find when a part was switched to ac
 | `planner.mode: act` | (1) at least `min_samples` (20) proposals in auto-applied ops were verified; (2) of those the verifier approved, the owner approved at least `min_agreement` (0.9); (3) no more than one `would_refuse` from `dedupe_pending` per day; (4) no more than one refusal-window refusal per day; (5) `mode_history` shows `recheck_on_change` in `observe` or `act` for the whole window |
 | `backlog.mode: act` | At least `min_samples` `backlog_low` triggers or `would_add` records, and at least `min_agreement` of the would-add task ids were later added by the owner or approved. None was a closed or skipped task |
 | `backlog.assign: act` | At least `min_samples` `would_assign` records. At least `min_agreement` of them match the assignment that happened next (by the owner or by an approved proposal); a record with no later assignment is not counted either way |
-| `spec_first.mode: act` | At least 5 `would_spec` records, and none of them for a task that already had a merged spec link (a false positive) |
+| `spec_first.mode: act` | At least `min(5, min_samples)` `would_spec` records (marked tasks are few, so 20 could take months), and none of them for a task that already had a merged spec link (a false positive) |
 
 **After the switch.** For a part whose newest `mode_history` entry is `act`, the report adds a check over the time
 since that entry: no change the planner applied was undone by the owner or **edited back** within 24 hours. Edited
@@ -410,7 +432,7 @@ something the numbers don't. The report is read-only and has no side effects.
 - Write over a newer file. Every write compares the hash, and in act mode the restore path is gone once the act rule
   refuses (§4.3).
 - Propose again, for the refusal window, a change the owner undid, declined or removed, or apply by itself an `add` of
-  a task whose line the owner removed.
+  a task whose line the owner undid, declined or removed until its plan text changes.
 - Skip a spec, or start a build whose spec PR hasn't merged.
 - Propose a task marked owner-only or blocked, or a later-phase task while `strict` holds.
 
@@ -461,14 +483,15 @@ Load checks:
 
 ## 6. Decisions
 
-- **D1 (F8, orchestrator).** The act-mode load rules (`recheck_on_change: act`, `prefilter_closed` and
+- **D1 (owner decision).** The act-mode load rules (`recheck_on_change: act`, `prefilter_closed` and
   `dedupe_pending` at least `observe`) **warn** on existing installs in the first release that has them, and
   **refuse** from the next release. Rules on new keys refuse at once.
-- **D2 (F3, orchestrator).** An add the owner undid or declined is not proposed again or applied by itself for
+- **D2 (owner decision).** An add the owner undid or declined is not proposed again or applied by itself for
   **7 days**, keyed by task id plus text hash (and op), config `planner.act.refuse_undone_days`. It is on by default,
-  unlike the new parts, because it only refuses or holds. A line the owner removed by hand also gets a removal hold
+  unlike the new parts, because it only refuses or holds. A task whose line the owner undid, declined or removed by
+  hand also gets a hold
   (§4.3).
-- **D3 (F17, orchestrator).** **One notice per planner run** for outside edits, which is G6's existing notice. Not
+- **D3 (owner decision).** **One notice per planner run** for outside edits, which is G6's existing notice. Not
   one per edit.
 - **D4.** Capacity is fill's own answer (`capacityNow()`), not a copy of fill's rules in the planner.
 - **D5.** Specs first uses G6's `ownMergedPr`, not `checkPrOwnership` (§4.2).
@@ -483,24 +506,25 @@ covers its negative cases.
 
 | AT | Given | When | Then |
 |---|---|---|---|
-| AT-1 | `mode: act`, `recheck_on_change: act`. Planner run R is active. The owner adds 3 lines, then 2 minutes later removes one line | R ends with 2 proposals: `reword` of the task whose line the owner removed, and `add` of a new task `t9` | The file keeps both of the owner's edits, and nothing is written back. Exactly one inbox item of class `planner.guard_notice` for R, and two `external` history rows, each with its diff. The `reword` is refused with the reason that the task has no open line; the `add t9` applies on top of the edited file. A removal record and hold exist for the removed task |
-| AT-2 | `mode: act`, `recheck_on_change: observe` | Config load, with the rule in warn mode, then with it in refuse mode | Warn mode: the planner loads, one load warning and one notice naming `planner.mode` and `planner.guards.recheck_on_change`; a reload raises no second notice. Refuse mode: refused with the same keys |
+| AT-1 | `mode: act`, `recheck_on_change: act`, `prefilter_closed: observe`, `dedupe_pending: observe`, `agents.spend.enabled: true` (so no act-rule warning). Planner run R is active. The owner adds 3 lines; a cycle runs; 2 minutes later the owner removes one line; a cycle runs (the fake clock drives both cycles) | R ends with 2 proposals: `reword` of the task whose line the owner removed, and `add` of a new task `t9` | The file keeps both of the owner's edits, and nothing is written back. Exactly one inbox item of class `planner.guard_notice` for R, and two `external` history rows, each with its diff. The `reword` is refused with the reason that the task has no open line; the `add t9` applies on top of the edited file. A removal record and hold exist for the removed task |
+| AT-2 | `mode: act`, `recheck_on_change: observe` | Config load, with the rule in warn mode, then with it in refuse mode | Warn mode: the planner loads, one load warning and one notice of class `planner.act_rules` naming `planner.mode` and `planner.guards.recheck_on_change`; a reload raises no second notice. Refuse mode: refused with the same keys |
 | AT-3 | `backlog.mode: act`, `unassigned: false`, fill enabled with 4 allowlisted agents, `fill.max_active: 4`, 1 agent running (the harness's process table), 1 ready line for a busy agent, `ahead: 2` | A cycle | `capacityNow()` gives 3 startable agents and 3 free slots. One `backlog_low` trigger with `want = 4` (3 + 2 − 1). The next cycle with the same state gives no new trigger. A new ready line gives a new fingerprint. With `max_active: 2` (1 free slot), `want = 2`. With fill's patterns one line per agent and every agent holding an open line, room is 0: no trigger |
-| AT-4 | The same as AT-3, but `max_adds_per_run: 2`, and the run returns 4 adds | The run ends | 2 apply, 2 are refused with the cap reason. Then with `max_adds_per_hour` reached, a further rules cycle adds nothing and records the reason, and an owner approval of a waiting add returns the reason and leaves it pending |
+| AT-4 | The same as AT-3, but `max_adds_per_run: 2`, and the run returns 4 adds | The run ends | 2 apply, 2 are refused with the cap reason. Then with `max_adds_per_hour` reached, further rules cycles add nothing and record the reason once for the streak (10 cycles, one record), and an owner approval of a waiting add returns the reason and leaves it pending |
 | AT-5 | `backlog.assign: act`, `unassigned: true`. 2 startable agents with no line, 3 unassigned ready lines, one of them claimed by a run | A cycle | The first two unclaimed lines are assigned, in allowlist order, with the agents' names, by compare-and-swap writes, with 2 `assign` history rows. A restart before the second write finishes it once: no line is assigned twice |
 | AT-6 | `backlog.source: rules`, `unassigned: true`, `assign: act`, `phase_order: strict`. Plan: phase 1 has one open task marked `[owner-only]` and one open task `a`; phase 2 has task `b` | A cycle with deficit 2 | Only `a` is added. The `[owner-only]` task is never added, and `b` waits until `a` is done |
 | AT-7 | The same as AT-6, with `a` done | A cycle | `b` is added. A plan task whose id is a done id (G6 `prefilter_closed`) is not added |
 | AT-8 | `backlog.mode: observe`, `assign: observe`, `source: rules`; then `source: model` with `planner.mode: act` and `approval.add: never` | The inputs of AT-5 to AT-7; then a `backlog_low` run returning 2 adds | The tasks file is byte-for-byte unchanged. `would_add` and `would_assign` are recorded once each. The model run's 2 adds are pending for the owner, not applied |
 | AT-9 | `spec_first.mode: act`. Plan task `x` marked `[spec]` | A run proposes `add x`, then `add x-spec` | `add x` is refused with "x needs its spec first (x-spec)". `x-spec` applies with kind `spec` |
-| AT-10 | The same as AT-9. `x-spec` has a DONE line, but its PR is still open | A cycle | `x` is not ready (`waitingOn: ["x-spec"]`). After the review store records the PR (head branch contains `x-spec`) as merged, `x` is ready and its details name the spec file |
+| AT-10 | The same as AT-9. `x-spec` has a DONE line, but its PR is still open | A cycle | `x` is not ready (`waitingOn: ["x-spec"]`). After the review store records the PR (head branch contains `x-spec`) as merged, `x` is ready and its details name the spec file from `x-spec`'s DONE line; with no path there, they name the PR |
 | AT-11 | The same as AT-10, but the DONE line names a merged PR of another task, and a merged build PR's body names `x-spec` | A cycle | `x` stays not ready, because neither PR is the spec task's own |
 | AT-12 | Fill `prompt_files: ["{prompts_dir}/base.md", "{prompts_dir}/kinds/{kind}.md"]`, with only `kinds/spec.md` present | Fill starts `x-spec`, then `y` | `x-spec`'s prompt includes `spec.md`. `y`'s prompt is built without the missing `kinds/build.md`. A missing `base.md` still fails as today |
 | AT-13 | `dedupe_pending: act`. Run 1 left `add t1 agent-a` pending | Run 2 proposes `add t1 agent-a` and `add t1 agent-b` | The first is refused as "already pending as proposal …", and the second is checked normally. In `observe`, both are kept and one `would_refuse` is recorded |
 | AT-14 | Applied change C added line L | `POST /api/planner/changes/C/undo` with `confirm: true`, twice. Then the same for a change whose line the owner has since edited, for one whose task has an active run, and for a `drop` | The first call removes L and records an undo row and a refusal record. The second returns that same row and changes nothing. The edited, running and `drop` ones return 409 with their reasons. Without an owner session: 403. Without `confirm`: 400 |
 | AT-15 | 7 days of planner rows: 25 verified auto-apply proposals, 24 approved by the owner; `mode_history` with `recheck_on_change: observe` from day 2. Also 20 `would_add` records (19 later added by the owner, 1 for a skipped task), 20 `would_assign` records (18 matching the next assignment, 2 with none), 5 `would_spec` records (1 for a task with a merged spec link) | `GET /api/planner/readiness` | `planner.mode` is **not yet**, naming criterion (5). With `observe` for the whole window it is **ready**. After a switch to act with one undo within 24 h, the row says **switch back recommended** and lists the change. `backlog.mode` is **not yet** (the skipped task). `backlog.assign` is **ready** (18 of 18 counted). `spec_first.mode` is **not yet** (the false positive). The route has no side effects, and returns 403 without an owner session |
 | AT-16 | `fill.idle.ready_sources: [tasks_file, plan]`, `notice_minutes: 5`. No ready lines, one ready plan task, one agent idle for 6 minutes | Fill ticks | One idle notice that names the plan source. A second tick in the same episode raises nothing. With the planner off, no notice |
-| AT-17 | Every new part `off`, `refuse_undone_days: 0` | The inputs of AT-1, AT-3 to AT-14, AT-18 and AT-20 | Today's behaviour, unchanged. In AT-1 with G6 off, today's restore still happens; that is G6's own test, not this spec's |
-| AT-18 | `mode: act`, `refuse_undone_days: 7`, `backlog.mode: act`. Run N's `add t1` applied | The owner undoes it; the deficit rises and `backlog_low` fires; run N+1 proposes `add t1` with the same text, then run N+2 with other text. Separately, the owner declines `add t2` in observe, and the project switches to act | N+1's `add t1` is refused with the undo reason and counted. N+2's waits for the owner and names the record. `add t2` is refused in act within 7 days. On day 8 `add t1` is checked normally. A restart keeps the records Separately, the owner deletes a 3-day-old planner line `t3` by hand: `add t3` is refused for 7 days; on day 8 it waits for the owner (removal hold) and the rules source doesn't offer it; after the plan rewords `t3` it is offered again. The assign rule, after the owner undid an assignment of line L to `agent-a`, gives L to `agent-b` |
+| AT-17 | Every new part `off`, `refuse_undone_days: 0`, `dedupe_pending: off`, and the act-rule warning excluded (it is AT-2's; it has its own class `planner.act_rules`, not `planner.guard_notice`) | The inputs of AT-1, AT-3 to AT-14, AT-18, AT-18b and AT-20 | Today's behaviour, unchanged: the same writes, history rows and decisions, and no new notice besides the act-rule warning. In AT-1 with G6 off, today's restore still happens; that is G6's own test, not this spec's |
+| AT-18 | `mode: act`, `refuse_undone_days: 7`, no verifier, `approval.add: never`. Run N's `add t1` applied | The owner undoes it; run N+1 proposes `add t1` with the same text, then run N+2 with other text. Separately, the owner declines `add t2` in observe, and the project switches to act. Separately, the owner deletes a 3-day-old planner line `t3` by hand. The fake clock moves to day 8 | N+1's `add t1` is refused with the undo reason and counted. N+2's waits for the owner and names the record. `add t2` is refused in act within 7 days. `add t3` is refused for 7 days. On day 8 an `add` of `t1`, `t2` or `t3` waits for the owner (hold) instead of applying; after the plan rewords `t3`, its `add` is checked normally. A restart between the undo's write and its history row keeps the record exactly once |
+| AT-18b | AT-18's records, plus `backlog.mode: act`, `source: rules`, `unassigned: true`, `assign: act` | The undo raises the deficit and `backlog_low` fires; a rules cycle runs; the owner undoes an assignment of line L to `agent-a`, then the assign rule runs | The rules source offers none of `t1`, `t2`, `t3` (on day 8 too, while held). The assign rule gives L to `agent-b`, not `agent-a` |
 | AT-19 | Load rules, each alone: `mode: act` with `prefilter_closed: off`; with `dedupe_pending: off`; `backlog.mode: act` with `planner.mode: observe`; `spec_first.mode: act` with `planner.mode: observe`; `unassigned: true` with `assign: off`; `source: rules` with `unassigned: false`; `backlog.mode: observe` with `agents.spend.enabled: false`; `skip_pattern` of 501 characters | Config load | The first two warn (warn mode) or refuse (refuse mode), naming the keys; each of the others is refused, naming its keys. The defaults load with no warning |
 | AT-20 | `spec_first.mode: act`, `stall_hours: 48`, `x-spec`'s PR open for 49 hours; separately `prefilter_closed: observe` with 3 merged PRs in the review store | A cycle; a verifier run | One stall notice for `x-spec`, none on the next cycle, and `x` stays waiting. The verifier's context has `closed.mergedPrs` with the 3 PRs and the planner's context has no `closed` block. With `prefilter_closed: act`, both have it once |
 
@@ -519,6 +543,7 @@ and [planner.md](planner.md).
    - The verifier's merged-PR context when `prefilter_closed` is not `act`.
    - The undo route and its button.
    - ATs 1, 2, 13, 14, 18, 19 (its act-rule part), the verifier half of AT-20, and AT-17 for these parts.
+   - AT-18b is built with PR 4 (it needs the trigger, the rules source and the assign rule).
 2. **Readiness report.** `mode_history`, `GET /api/planner/readiness`, the counts from `planner.db` and the spend
    events, the after-switch check, the Planner view panel, and the load warning. AT-15.
 3. **Backlog: trigger and model source.**
@@ -529,7 +554,7 @@ and [planner.md](planner.md).
    - Unassigned adds and both caps.
    - ATs 3, 4, the model half of AT-8, AT-19's backlog rules, and AT-17.
 4. **Backlog: assign rule and rules source.** `backlog.assign`, `source: rules`, `verify_rules`, and fill's `plan`
-   ready source for the idle notice. ATs 5-8, 16.
+   ready source for the idle notice. ATs 5-8, 16, 18b.
 5. **Specs first.** The `spec` kind, the waiting build task, the own-PR merge check (`ownMergedPr`), the stall notice,
    and fill's `{kind}` placeholder. ATs 9-12, the stall half of AT-20.
 6. **Refuse mode for the act rules** (one release after PR 1 ships): flips the constant from warn to refuse. AT-2's
@@ -550,7 +575,7 @@ the operator's install:
 | Risk | Mitigation |
 |---|---|
 | Act mode applies wrong work faster than an owner can see it | It needs G6 and dedupe active (warn, then refuse). Adds are capped per run and per hour. Every change has a history row and an Undo. The readiness report needs a week of agreement first, and recommends switching back when applied changes are undone |
-| A line the owner removed comes back | The refusal window refuses the same change for 7 days and holds a changed one for the owner, from every source. A removal hold keeps a removed task out of the backlog until its plan text changes, and its `add` always waits for the owner |
+| A line the owner removed comes back | The refusal window refuses the same change for 7 days and holds a changed one for the owner, from every source. A hold keeps an undone, declined or removed task out of the backlog until its plan text changes, and its `add` always waits for the owner |
 | Outside writers and Lair race on the file | Every write compares the hash. A lost race is retried on the next cycle from a fresh read. An outside edit is kept and recorded, never overwritten |
 | An upgrade stops an act install from planning | One release of warnings with the keys named before the rule refuses (D1) |
 | The backlog counts capacity fill won't use | Capacity is fill's own `capacityNow()`, and unassigned lines count only while the assign rule is in act |
