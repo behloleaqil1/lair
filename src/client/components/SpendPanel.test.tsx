@@ -140,7 +140,7 @@ describe("AT-35: Home's AI spend panel", () => {
     expect(part("losses")).toBe("0 context reloads (a restart that re-sent a failed run's context) · 0 runs ended by a Lair restart");
 
     // One line per guard: G1 watched the quota line once; the others in observe had nothing; the rest are off
-    expect(panel()!.querySelectorAll("[data-guard]")).toHaveLength(9);
+    expect(panel()!.querySelectorAll("[data-guard]")).toHaveLength(10);
     expect(guard("quota")).toBe("watching Provider quota cooldown: Would have cooled a provider once today (UTC); it changed nothing");
     expect(guard("task_no_result_cap")).toContain("watching");
     expect(guard("task_no_result_cap")).toContain("Nothing it would have done today (UTC)");
@@ -148,6 +148,7 @@ describe("AT-35: Home's AI spend panel", () => {
     expect(guard("budget")).toContain("watching");
     expect(guard("wake_events")).toBe("off Wake waiting agents on their event: Off");
     expect(guard("planner_skip_unchanged")).toContain("Off");
+    expect(guard("planner_dedupe_pending")).toBe("off Planner: refuse a proposal already pending: Off");
 
     // Axe on the panel: no serious or critical violations (colour contrast is tokens.test.ts's)
     const result = await axe.run(panel()!, { resultTypes: ["violations"], rules: { "color-contrast": { enabled: false } } });
