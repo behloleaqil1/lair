@@ -679,12 +679,12 @@ export class PlannerStore {
     return rows.map(toChange);
   }
 
-  /** Changes at or after `since`, the oldest first (the readiness report; at most `limit`). */
+  /** Changes at or after `since`: the newest `limit` of them, the oldest first (the readiness report). */
   changesSince(project: string, since: number, limit = 20_000): ChangeView[] {
     const rows = this.db
-      .prepare(`${CHANGE_SELECT} WHERE c.project = ? AND c.at >= ? ORDER BY c.at, c.rowid LIMIT ?`)
+      .prepare(`${CHANGE_SELECT} WHERE c.project = ? AND c.at >= ? ORDER BY c.at DESC, c.rowid DESC LIMIT ?`)
       .all(project, since, limit) as ChangeRow[];
-    return rows.map(toChange);
+    return rows.reverse().map(toChange);
   }
 
   /** One change of the project, or null. */

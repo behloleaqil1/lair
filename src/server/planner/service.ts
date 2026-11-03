@@ -174,6 +174,11 @@ const MAX_REFUSED = 1000;
 const ACT_RULES_NOTICE = "act_rules_notice";
 /** When the act streak the last planner.act_readiness notice was about began (one notice per switch to act) */
 const READINESS_NOTICE = "act_readiness_notice";
+/** When the mode history was last known to hold (at most every 10 minutes): a longer silence is a gap in it */
+const MODES_SEEN = "mode_history_seen";
+const MODES_SEEN_EVERY = 10 * 60_000;
+const MODES_GAP = 60 * 60_000;
+const MAX_SPEND_EVENTS = 50_000;
 
 interface RefusalRecord {
   op: string;
@@ -449,7 +454,14 @@ export class PlannerService {
   private async cycleAt(now: number): Promise<void> {
     this.finishIntent();
     await this.actRulesNotice();
-    if (this.settings.actEvidence.enabled) await this.noteModes(now);
+    if (this.settings.actEvidence.enabled) {
+      // The report is evidence only: a failure here never stops the planner's cycle
+      try {
+        await this.noteModes(now);
+      } catch (e) {
+        console.warn(`[planner] ${this.project}: the mode history was not updated: ${message(e)}`);
+      }
+    }
     const plan = this.readPlans();
     const owner = this.readOwner();
     this.planTasks = withReadiness(plan.tasks);
@@ -2937,8 +2949,13 @@ export class PlannerService {
       // The backlog and spec parts (planner-act.md §8 PRs 3-5) add their modes here
       parts: {},
     };
-    const history = nextModeHistory(this.state<ModeEntry[]>(MODE_HISTORY) ?? [], entry);
+    // A load after a silence (the planner or act_evidence off): nobody knows the modes then, so the entry marks a gap
+    const seen = this.state<number>(MODES_SEEN);
+    if (!this.readinessChecked && typeof seen === "number" && now - seen > MODES_GAP) entry.gapFrom = seen;
+    const stored = this.state<unknown>(MODE_HISTORY);
+    const history = nextModeHistory(Array.isArray(stored) ? (stored as ModeEntry[]) : [], entry);
     if (history) this.setState(MODE_HISTORY, history);
+    if (typeof seen !== "number" || now - seen >= MODES_SEEN_EVERY || history) this.setState(MODES_SEEN, now);
     if (this.readinessChecked) return;
     this.readinessChecked = true;
     if (this.settings.mode !== "act") return;
@@ -2947,7 +2964,7 @@ export class PlannerService {
     const failing = row.criteria.filter((c) => !c.ok);
     this.readinessWarning = `planner.mode: act is set, but the readiness report says not yet: ${failing.map((c) => c.label).join(", ")} (GET /api/planner/readiness)`;
     console.warn(`[planner] ${this.project}: ${this.readinessWarning}`);
-    const switched = switchedAt(this.state<ModeEntry[]>(MODE_HISTORY) ?? [], "planner.mode") ?? now;
+    const switched = switchedAt(history ?? (Array.isArray(stored) ? (stored as ModeEntry[]) : []), "planner.mode") ?? now;
     if (this.state<number>(READINESS_NOTICE) === switched) return;
     const raised = await this.raise({
       kind: "other",
@@ -2972,14 +2989,16 @@ export class PlannerService {
   private buildReadiness(now: number): PlannerReadinessView {
     const { days, minSamples, minAgreement } = this.settings.actEvidence;
     const since = now - days * DAY_MS;
-    const history = this.state<ModeEntry[]>(MODE_HISTORY) ?? [];
+    const stored = this.state<unknown>(MODE_HISTORY);
+    const history = Array.isArray(stored) ? (stored as ModeEntry[]) : [];
     const switched = switchedAt(history, "planner.mode");
     const verifier = this.settings.verifier;
     const agentsStore = this.agents.store();
     const dedupe = agentsStore
-      ?.listEvents(this.project, { kinds: ["guard_would", "guard_did"], since, limit: 10_000 })
-      .filter((e) => e.data.guard === "planner_dedupe_pending")
-      .map((e) => e.at);
+      ?.listEvents(this.project, { kinds: ["guard_would", "guard_did"], since, limit: MAX_SPEND_EVENTS });
+    // So many guard events that some may be missing: criterion (3) can't be judged (fail closed)
+    const dedupeEvents =
+      dedupe === undefined || dedupe.length >= MAX_SPEND_EVENTS ? null : dedupe.filter((e) => e.data.guard === "planner_dedupe_pending").map((e) => e.at);
     return readinessReport({
       now,
       days,
@@ -2989,7 +3008,7 @@ export class PlannerService {
       // A proposal Lair held for the owner carries Lair's unsure, not the verifier's
       proposals: this.store.proposalsSince(this.project, since).filter((p) => !heldByLair(p)),
       changes: this.store.changesSince(this.project, Math.min(since, switched ?? since)),
-      dedupeEvents: dedupe ?? null,
+      dedupeEvents,
       history,
       would: this.state<WouldRecord[]>(WOULD) ?? [],
       doneMarker: this.settings.doneMarker,

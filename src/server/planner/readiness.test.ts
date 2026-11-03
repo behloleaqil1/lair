@@ -188,6 +188,12 @@ describe("AT-15: the readiness report", () => {
     };
     const add = (task: string, text: string) => ({ op: "add", task, agent: "worker-a", text, reason: "ready in the plan" });
 
+    // Marking the planner's line done within the hour is not an edit back
+    await planRun([add("t0", "Zero")]);
+    h.clock.t += 30 * MIN;
+    writeFileSync(p.tasksFile, tasksText(h).replace("worker-a|Alice|t0|Zero", "#done worker-a|Alice|t0|Zero"));
+    await h.service.cycle();
+    expect(row(await report(h), "planner.mode").verdict).not.toBe("switch_back");
     // A change edited only after 24 h: no switch back
     await planRun([add("t1", "One")]);
     h.clock.t += DAY + 10 * MIN;
@@ -266,6 +272,14 @@ describe("AT-15: the readiness report", () => {
       expect.objectContaining({ at: NOW + MIN, mode: "observe", guards: expect.objectContaining({ recheck_on_change: "off" }) }),
       expect.objectContaining({ at: NOW + 3 * MIN, mode: "observe", guards: expect.objectContaining({ recheck_on_change: "observe" }) }),
     ]);
+    // Off for two hours (nothing kept then), on again with the same modes: the entry marks the gap, and nothing covers it
+    const later = await reload(changed, p, { mode: "observe", act_evidence: ON, guards: { recheck_on_change: "observe" } }, NOW + 3 * MIN + 2 * 60 * MIN);
+    expect(storeOf(later).get<unknown[]>("demo", MODE_HISTORY)?.at(-1)).toEqual(
+      expect.objectContaining({ at: NOW + 3 * MIN + 2 * 60 * MIN, gapFrom: NOW + 3 * MIN }),
+    );
+    later.clock.t = NOW + 7 * DAY + 4 * MIN;
+    const gap = row(await report(later), "planner.mode").criteria.find((c) => c.id === "recheck_history");
+    expect(gap).toMatchObject({ ok: false, detail: "no mode history from 2026-03-02T12:03 to 2026-03-02T14:03 (the planner or act_evidence was off)" });
   });
 
   it("the load warning: act set while planner.mode is not yet raises one warning and one notice for the switch; a reload raises no second", async () => {
@@ -289,6 +303,18 @@ describe("AT-15: the readiness report", () => {
     const quiet = await boot(p2, { guards: SAFE });
     expect(quiet.service.status().warnings.filter((w) => w.includes("readiness"))).toEqual([]);
     expect(quiet.inbox.list({ project: "demo" }).filter((d) => d.class === "planner.act_readiness")).toEqual([]);
+  });
+
+  it("a readiness failure never stops the cycle: it is logged and the planner works on", async () => {
+    const p = makePaths();
+    tasks(p, "worker-a|Alice|feat-login|Login form");
+    vi.spyOn(PlannerStore.prototype, "proposalsSince").mockImplementation(() => {
+      throw new Error("disk I/O error");
+    });
+    const warn = vi.spyOn(console, "warn");
+    const h = await boot(p, { guards: SAFE, act_evidence: ON });
+    expect(h.service.status().lastError).toBeNull();
+    expect(warn).toHaveBeenCalledWith("[planner] demo: the mode history was not updated: disk I/O error");
   });
 
   it("config: act_evidence's bounds", () => {

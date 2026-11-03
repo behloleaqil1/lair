@@ -415,14 +415,14 @@ The `would_add`, `would_assign` and `would_spec` records the report counts are k
 have acted (PRs 3-5). A `would_add` fails when its `planText` matches the skip marker or its task was done by `at`; a
 `would_spec` fails when the part found a merged spec link (`specLink`).
 
-**Mode history (new).** On every config load and reload, the planner appends `{at, planner.mode, each guard's mode,
+**Mode history (new).** At the first cycle of every config load and reload, the planner appends `{at, planner.mode, each guard's mode,
 each part's mode}` to `planner_state` under `mode_history`, only when it differs from the newest entry, newest 200.
 The report reads it for criterion (5) and to find when a part was switched to act.
 
 | Part | Ready when (all hold) |
 |---|---|
 | `planner.mode: act` | (1) at least `min_samples` (20) proposals in auto-applied ops were verified; (2) of those the verifier approved, the owner approved at least `min_agreement` (0.9); (3) no more than one `would_refuse` from `dedupe_pending` per day; (4) no more than one refusal-window refusal per day; (5) `mode_history` shows `recheck_on_change` in `observe` or `act` for the whole window |
-| `backlog.mode: act` | At least `min_samples` `backlog_low` triggers or `would_add` records, and at least `min_agreement` of the would-add task ids were later added by the owner or approved. None was a closed or skipped task |
+| `backlog.mode: act` | At least `min_samples` `backlog_low` triggers (counted from PR 3, which adds the trigger) or `would_add` records, and at least `min_agreement` of the would-add task ids were later added by the owner or approved. None was a closed or skipped task |
 | `backlog.assign: act` | At least `min_samples` `would_assign` records. At least `min_agreement` of them match the assignment that happened next (by the owner or by an approved proposal); a record with no later assignment is not counted either way |
 | `spec_first.mode: act` | At least `min(5, min_samples)` `would_spec` records (marked tasks are few, so 20 could take months), and none of them for a task that already had a merged spec link (a false positive) |
 

@@ -477,7 +477,7 @@ describe("AT-18: the refusal window and the hold", () => {
     expect(h.service.overview().refusals).toEqual([]);
     writeFileSync(p.tasksFile, tasksText(h).replace("worker-a|Alice|t2|Two, better", "worker-a|Alice|t2|Two"));
     await h.service.cycle();
-    // Changed back, not removed: the line is still there (Fable #357 low 2)
+    // Changed back, not removed: the line is still there (PR #357 review, low 2)
     expect(h.service.overview().refusals).toEqual([expect.objectContaining({ op: "reword", task: "t2", why: "reverted", held: false })]);
     await planRun(h, [{ op: "reword", task: "t2", text: "Two, better", reason: "r" }]);
     expect(proposalOf(h, "t2").refusal).toMatch(/^the owner changed back reword t2 on 2026-03-02: not proposed again for 7 days/);
@@ -546,7 +546,7 @@ describe("AT-17: these parts off are today's behaviour", () => {
   });
 });
 
-describe("Fable #357 lows", () => {
+describe("PR #357 review lows", () => {
   it("low 1: a config that no longer breaks the act rules clears the notice state, so breaking them again raises a new notice", async () => {
     const p = makePaths();
     tasks(p, ...BASE);
