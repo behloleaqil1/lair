@@ -9,6 +9,9 @@ import {
   redactBusToken,
   redactBusTokens,
   BUS_TOKEN_PREFIX,
+  EXT_TOKEN_PREFIX,
+  isExtTokenFormat,
+  newExtToken,
 } from "./tokens.js";
 
 describe("bus tokens", () => {
@@ -137,6 +140,25 @@ describe("bus tokens", () => {
 
     it("leaves text without a token as it is", () => {
       expect(redactBusTokens("ready for review: PR 7 at abc1234")).toBe("ready for review: PR 7 at abc1234");
+    });
+
+    it("replaces an external worker's token too, whole or cut short", () => {
+      const ext = newExtToken();
+      expect(redactBusTokens(`ext ${ext}; cut ${ext.slice(0, 12)}.`)).toBe("ext [bus-token]; cut [bus-token].");
+    });
+  });
+
+  describe("external worker tokens", () => {
+    it("have their own prefix and shape: the run token check refuses them, and theirs refuses a run's", () => {
+      const ext = newExtToken();
+      expect(ext.startsWith(EXT_TOKEN_PREFIX)).toBe(true);
+      expect(ext).toHaveLength(EXT_TOKEN_PREFIX.length + 43);
+      expect(isExtTokenFormat(ext)).toBe(true);
+      expect(isBusTokenFormat(ext)).toBe(false);
+      expect(isExtTokenFormat(newBusToken())).toBe(false);
+      expect(isExtTokenFormat(`${ext}A`)).toBe(false);
+      expect(isExtTokenFormat(`${EXT_TOKEN_PREFIX}${"A".repeat(42)}!`)).toBe(false);
+      expect(newExtToken()).not.toBe(ext);
     });
   });
 });
