@@ -33,6 +33,7 @@ import Database from "better-sqlite3";
 import type { AgentAdapter, ProjectConfig } from "../../shared/types.js";
 import type { AgentEventKind, AgentsStatusView, AgentView, FillStatusView, PromptFileView } from "../../shared/agents-types.js";
 import { EventBus } from "../core/event-bus.js";
+import { BusMirror } from "../bus/mirror.js";
 import { BudgetManager } from "../fleet/budget.js";
 import {
   NodeFileSystem,
@@ -5458,6 +5459,135 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
     expect(eventsOf(h, "fill_gate_queued")).toEqual([]);
   });
 
+  // ---- #347 round 2: real mirrored lines (bus/mirror.ts), the whole line scanned ----
+
+  /** A long run summary, as agents write them: `words` words, with no gate id in it */
+  const summaryOf = (words: number) =>
+    Array.from({ length: words }, (_, i) => ["merged", "main", "into", "the", "branch;", "targeted", "tests", "passed,", "full", "gate", "queued", "next."][i % 12]).join(" ");
+
+  /**
+   * Fill starts feat-login at NOW (pid 5001); the run reports WAITING through the bus mirror (BusMirror.mirrorReport,
+   * the line the bus really writes: the gate id after "by <agent>" and the summary) and exits 0; seen at +1 min.
+   */
+  async function runMirroring(h: Harness, summary: string, gateId?: string, sha?: string): Promise<void> {
+    await check(h);
+    await at(h, 0);
+    const written = await new BusMirror({ queueFile: h.queueFile }).mirrorReport(
+      "worker-a",
+      "WAITING",
+      "feat-login",
+      summary,
+      new Date(NOW + 30 * SEC).toISOString(),
+      gateId,
+      12,
+      sha,
+      7,
+    );
+    expect(written).toEqual([h.queueFile]);
+    h.spawner.exit(5001, 0);
+    await at(h, MIN);
+    expect(runs(h)[0].state).toBe("completed");
+  }
+
+  const mirroredCases: { name: string; summary: string; words: number; minChars: number }[] = [
+    // Over 64 words, under 1000 characters: the gate id is past the 64th word
+    { name: "a 120-word summary", summary: summaryOf(120), words: 120, minChars: 700 },
+    // The bus mirror's longest summary: the line is over 2000 characters, the gate id after the 2000th
+    { name: "a 2000-character summary", summary: summaryOf(400).slice(0, 2000), words: 250, minChars: 2000 },
+  ];
+
+  for (const c of mirroredCases) {
+    it(`#347 F1: a real mirrored line with ${c.name}, its gate id only at the end, waits on that queued gate: held, not counted`, async () => {
+      const h = setup(gateFill({ fallback_seconds: 60 }));
+      prompts(h);
+      tasks(h, "worker-a|Alice|feat-login|Login form");
+      requestAt(h, `remote.1.${GATE}.req`, 20 * SEC);
+      await runMirroring(h, c.summary, GATE, "abcdef1234567");
+      const written = readFileSync(h.queueFile, "utf-8").trim().split("\n").at(-1) ?? "";
+      expect(written.split(/\s+/).length).toBeGreaterThan(c.words);
+      expect(written.length).toBeGreaterThan(c.minChars);
+      expect(written.endsWith(`[${GATE}] PR #12 [abcdef1] [bus:7]`)).toBe(true);
+      for (const minute of [5, 30]) {
+        h.clock.t = NOW + minute * MIN;
+        const line = lineOf(await check(h), "feat-login");
+        expect(line).toMatchObject({ state: "held", hold: "waiting", waiting: { wake: GATE, queued: { gate: GATE, status: "queued" } } });
+        expect(line.detail).not.toContain("counted as a run without progress");
+        await h.service.tick();
+      }
+      expect(runs(h)).toHaveLength(1);
+      expect(eventsOf(h, "fill_gate_queued").map((e) => e.data)).toMatchObject([{ gate: GATE, own: true }]);
+    });
+  }
+
+  it("#347 F1: a real mirrored line with a long summary and no gate id names nothing: counted as before", async () => {
+    const h = setup(gateFill({ fallback_seconds: 60 }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    requestAt(h, `remote.1.${GATE}.req`, 20 * SEC); // a gate in the queue the line doesn't name
+    await runMirroring(h, summaryOf(200));
+    h.clock.t = NOW + 90 * SEC;
+    const line = lineOf(await check(h), "feat-login");
+    expect(line).toMatchObject({ hold: "waiting", waiting: { wake: null, queued: null } });
+    expect(line.detail).toContain("counted as a run without progress (1 of 3)");
+    expect(eventsOf(h, "fill_gate_queued")).toEqual([]);
+  });
+
+  it("#347 F1: of two queued gates a mirrored line names, the bracketed id nearest the end (the report's gate id) is the wake", async () => {
+    const h = setup(gateFill({ fallback_seconds: 60 }));
+    prompts(h);
+    tasks(h, "worker-a|Alice|feat-login|Login form");
+    const EARLIER = "20260302T115900Z-feat-login-abcdef12-4241";
+    requestAt(h, `remote.1.${EARLIER}.req`, 10 * SEC);
+    requestAt(h, `remote.1.${GATE}.req`, 20 * SEC);
+    await runMirroring(h, `the first gate [${EARLIER}] failed on a flaky test; ${summaryOf(80)}`, GATE);
+    h.clock.t = NOW + 5 * MIN;
+    expect(lineOf(await check(h), "feat-login")).toMatchObject({ hold: "waiting", waiting: { wake: GATE, queued: { gate: GATE } } });
+  });
+
+  it("#347 L3: at most 8 of a line's words (bracketed ones nearest the end first) are looked up for a result on disk", async () => {
+    const ids = Array.from({ length: 9 }, (_, i) => `20260302T1200${10 + i}Z-feat-login-abcdef12-${i}`);
+    // ids[8] is the bracketed word nearest the end, ids[0] the 9th from it
+    for (const [found, index] of [
+      [false, 0],
+      [true, 1],
+    ] as const) {
+      const h = setup(gateFill({ fallback_seconds: 60 }));
+      prompts(h);
+      tasks(h, "worker-a|Alice|feat-login|Login form");
+      resultAt(h, ids[index], 40 * SEC); // its result came during the run
+      await runMirroring(h, `gates ${ids.map((id) => `[${id}]`).join(" ")} queued earlier`);
+      h.clock.t = NOW + 90 * SEC;
+      const line = lineOf(await check(h), "feat-login");
+      if (found) {
+        expect(line.state).toBe("started");
+        expect(eventsOf(h, "fill_woken")).toHaveLength(1);
+      } else {
+        expect(line).toMatchObject({ hold: "waiting", waiting: { wake: null } });
+        expect(eventsOf(h, "fill_woken")).toEqual([]);
+      }
+    }
+  });
+
+  it("#347 L2: a captured gate queued before the run's chain started is not the run's own: counted, with or without wake.file (its queue time still shown)", async () => {
+    for (const config of [
+      gateFill({ fallback_seconds: 60 }),
+      fill({ agents: ["worker-a"], waiting_pattern: WAITS_ON_GATE, backoff_seconds: 60, wake: { fallback_seconds: 60 } }),
+    ]) {
+      const h = setup(config);
+      prompts(h);
+      tasks(h, "worker-a|Alice|feat-login|Login form");
+      resultAt(h, GATE, -60 * MIN); // an old result of the id
+      requestAt(h, `remote.1.${GATE}.req`, -30 * MIN); // and a request for it from before the run began
+      await runEndingWith(h, `- WAITING feat-login ${GATE} by worker-a 12:01Z: gate queued`);
+      h.clock.t = NOW + 90 * SEC;
+      const line = lineOf(await check(h), "feat-login");
+      expect(line).toMatchObject({ hold: "waiting", waiting: { wake: GATE, queued: { gate: GATE } } });
+      expect(line.detail).toContain(`${GATE} still queued in remote since 2026-03-02T11:30:00.000Z`);
+      expect(line.detail).toContain("counted as a run without progress (1 of 3)");
+      expect(eventsOf(h, "fill_gate_queued").map((e) => e.data.own)).toEqual([false]);
+    }
+  });
+
   it("#347: a line naming a gate that was re-queued under a new id (wake.requeue_marker) waits on the new id's request", async () => {
     const h = setup(gateFill({ fallback_seconds: 60, requeue_marker: "{gates_dir}/results/{wake}.recheck-{n}" }));
     prompts(h);
@@ -8325,6 +8455,24 @@ describe("AI spend G3: waiting agents woken by the awaited event (docs/design/ai
     expect(line).toMatchObject({ state: "held", hold: "waiting" });
     expect(line.detail).toContain("no fallback timer");
     expect(eventsOf(h, "fill_woken")).toEqual([]);
+  });
+
+  it("#347 L4: act: a line naming a PR and a gate in the gate queue waits for the PR; the gate is not scanned for", async () => {
+    const h = setup(g3("act", {}, { file: "{gates_dir}/results/{wake}.rc" }));
+    fillTask(h);
+    const gate = "20260302T120030Z-feat-login-abcdef12-1";
+    await runEndingWith(h, `- WAITING feat-login PR 12 by worker-a 12:01Z: gate queued [${gate}] [bus:1]`, async () => {
+      mkdirSync(join(h.gatesDir, "queue"), { recursive: true });
+      const req = join(h.gatesDir, "queue", `remote.1.${gate}.req`);
+      writeFileSync(req, "feat-login\nabcdef12\n./gate.sh\n");
+      const t = new Date(NOW + 30 * SEC);
+      utimesSync(req, t, t);
+    });
+    h.clock.t = NOW + 2 * MIN;
+    const line = await check(h);
+    expect(line).toMatchObject({ state: "held", hold: "waiting", waiting: { wake: "PR 12 (a review, a merge or a merge refusal)", queued: null } });
+    expect(line.detail).toContain("no fallback timer");
+    expect(eventsOf(h, "fill_gate_queued")).toEqual([]);
   });
 
   /** Fill starts feat-login at NOW (pid 5001), which (after `during`) writes `queueLine` and exits 0; the tick at +1 min sees it end. */
