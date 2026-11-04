@@ -5921,22 +5921,19 @@ describe("11. fill: Lair starts runs itself from a task list", () => {
       expect(inbox.get(decision.id)).toMatchObject({ status: "open", evidenceRev: 1, evidence: { facts: { blocker_cleared: true } } });
     });
 
-    it("gaveUpCarriesTaskState (AT-1, at the raise): a task marked done reads closed, and fill's next check withdraws the decision (a done line is never re-read)", async () => {
-      // The line is done before any run: fill never starts it, and its done line says the task is closed
+    it("gaveUpCarriesTaskState (AT-1, marked done): fill's sweep withdraws the decision before any re-read, so a done line never reads as closed", async () => {
       const h = setup(fill({ agents: ["worker-a"] }));
       const { inbox } = await withInbox(h, { serverYaml: LIVE });
       prompts(h);
       tasks(h, "worker-a|Alice|feat-login|Login form");
-      appendFileSync(h.queueFile, "- DONE feat-login by worker-a 11:59Z: merged\n");
-      await check(h);
-      // A run asked for by hand dies until the agents module escalates it
-      h.spawner.behaviour = (pid) => h.spawner.exit(pid, 1);
-      await request(h);
-      for (const ms of [0, 0, 10 * SEC, 10 * SEC, 30 * SEC, 30 * SEC, 70 * SEC, 70 * SEC]) await at(h, ms);
-      const [decision] = gaveUp(inbox);
-      expect(decision).toMatchObject({ key: expect.stringMatching(/^escalation:/), evidence: { facts: { task_state: "closed" } } });
-      await check(h);
-      expect(inbox.get(decision.id)).toMatchObject({ status: "withdrawn", evidenceRev: 0 });
+      const raised = await escalated(h, inbox);
+      expect(raised.evidence!.facts).toMatchObject({ task_state: "open" });
+      // The chain ended; the agent's DONE line lands, and the next check sees the task done
+      appendFileSync(h.queueFile, "- DONE feat-login by worker-a 12:05Z: merged\n");
+      expect(lineOf(await check(h), "feat-login").state).toBe("done");
+      // Withdrawn by the sweep (fill.ts withdrawLifted runs before the re-read): never re-read, never closed
+      expect(inbox.get(raised.id)).toMatchObject({ status: "withdrawn", evidenceRev: 0, evidence: { facts: { task_state: "open" } } });
+      expect(inbox.get(raised.id)!.factsAt).toBeUndefined();
     });
 
     describe("the facts read at a PR's head (PR 1b): the review module's PR read is the one faked boundary", () => {
