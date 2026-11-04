@@ -200,9 +200,10 @@ across restarts), the planner keeps the ids of the reports it handled. A report 
 A run's bus token is revoked on every way the run ends (exit, crash, failover, transient retry, never started, stopped,
 claim released), whatever `bus.consume` is by then, and at start Lair revokes the tokens of runs that ended while it
 was down. `lair bus report` is refused with 400, and nothing is stored or mirrored, when its `sha` isn't 7 to 64 hex
-digits or its `gate_id` isn't a plain name (letters, digits, `.`, `_` and `-`, starting with a letter or digit, no
-`..`) or holds a bus token. The mirror appends to `queue_file`, `inbox_file` and `mail_dir` without blocking the server, one line at a time
-per file; an owner message to a recipient that isn't a plain name gets no mailbox file.
+digits, its `gate_id` isn't a plain name (letters, digits, `.`, `_` and `-`, starting with a letter or digit, no
+`..`), or its task or `gate_id` holds a bus token. The mirror appends to `queue_file`, `inbox_file` and `mail_dir`
+without blocking the server, one line at a time per file; an owner message to a recipient that isn't a plain name gets
+no mailbox file.
 
 Turn `observe` on first, compare on Home → Health, then switch to `on`.
 
@@ -230,8 +231,8 @@ tokens. The worker sets it as `LAIR_BUS_TOKEN` and reports with `lair bus report
   run id is `ext:<token id>`.
 - **takes the same report path as a run's** (the same checks, the summary cleaned and every bus token in it replaced by
   `[bus-token]`, the same mirrored line ending `[bus:<id>]`, the same `bus.report` event), so Home, fill and the planner
-  see it. There is no claim to check: it may report on any task id (a letter or digit first, then letters, digits,
-  `.`, `/`, `#`, `:` and `-`; 400 otherwise). With fill's default patterns (no `{agent}`) a `DONE` it sends for a fill
+  see it. There is no claim to check: it may report on any task id (1 to 128 letters, digits, `.`, `_`, `-`, `/`, `:`
+  or `#`, a letter or digit first; 400 otherwise, and for one that holds a bus token). With fill's default patterns (no `{agent}`) a `DONE` it sends for a fill
   task counts as a hand-written `DONE` line would, so give it only the kinds it needs. A fleet agent must not be named
   `ext`: a pattern reads `by ext:<worker>` as written by `ext`.
 - **sends only its kinds** (default `PROGRESS`, `WAITING`, `DONE` and `BLOCKED`; `TICK` only when named): another kind

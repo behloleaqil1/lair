@@ -90,19 +90,22 @@ const ReportKindSchema = z.enum(["WAITING", "DONE", "BLOCKED", "PROGRESS", "TICK
 /** A commit id: 7 to 64 hex digits (the consumers refuse a report whose sha isn't hex) */
 const SHA = /^[0-9a-f]{7,64}$/i;
 
+/** A task or gate id is mirrored and shown as written: never with a bus token in it (the summary has one redacted) */
+const NO_BUS_TOKEN = (value: string) => redactBusTokens(value) === value;
+
 const toolSchemas = {
   whoami: z.object({}),
   // A report the consumers would refuse is refused here (400), never stored or mirrored: its wake-up would be lost
   report: z.object({
     kind: ReportKindSchema,
-    task: z.string().min(1).max(200),
+    task: z.string().min(1).max(200).refine(NO_BUS_TOKEN, "never a bus token"),
     summary: z.string().min(1).max(10000),
     // What a WAITING run waits on, as fill looks it up: one plain name (no '/', no '..', no leading '-')
     gate_id: z
       .string()
       .max(200)
       .refine(isPlainName, "a plain name: letters, digits, '.', '_' and '-', starting with a letter or digit, no '..'")
-      .refine((value) => redactBusTokens(value) === value, "never a bus token")
+      .refine(NO_BUS_TOKEN, "never a bus token")
       .optional(),
     pr: z.number().int().positive().optional(),
     sha: z.string().regex(SHA, "a commit id: 7 to 64 hex digits").optional(),
@@ -336,7 +339,7 @@ async function busRoutes(
     // The run path's checks, and a task id the consumers take (a run's is its claimed task, already one)
     const parsed = toolSchemas.report.safeParse(args ?? {});
     if (!parsed.success || !isValidTaskId(parsed.data.task)) {
-      const why = parsed.success ? "task: a task id (a letter or digit first, then letters, digits, '.', '/', '#', ':' and '-')" : firstIssues(parsed.error, "args");
+      const why = parsed.success ? "task: a task id (1 to 128 letters, digits, '.', '_', '-', '/', ':' or '#', a letter or digit first)" : firstIssues(parsed.error, "args");
       audit("refused", why);
       return refuse(400, why);
     }
