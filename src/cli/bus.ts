@@ -7,14 +7,17 @@
  *   lair bus ack --message <id> [--note <text>]
  *   lair bus send --to orchestrator|owner --text <text> [--priority <1-10>]
  *   lair bus board
+ *   lair bus token create|list|revoke ...   (the owner's: TOKEN_USAGE)
  *
  * Reads LAIR_BUS_TOKEN and LAIR_URL from the environment (Lair sets them for
- * agent runs). The token is never printed.
+ * agent runs; a worker outside Lair's runs sets an external worker token,
+ * which only reports). The token is never printed. `lair bus token` reads
+ * LAIR_OWNER_SESSION instead, and never prints it.
  *
  * Exit codes: 0 success; 1 refused by Lair; 2 usage error; 3 Lair unreachable.
  */
 import { closeSync, constants, fstatSync, openSync, readSync } from "fs";
-import { isBusTokenFormat, redactBusToken } from "../server/bus/tokens.js";
+import { isBusTokenFormat, isExtTokenFormat, redactBusToken } from "../server/bus/tokens.js";
 
 export const EXIT_OK = 0;
 export const EXIT_REFUSED = 1;
@@ -35,9 +38,24 @@ export const USAGE = [
   "  send --to orchestrator|owner --text <text> [--priority <1-10>]",
   "                                              Send a message",
   "  board                                       Get the board state",
+  "  token create|list|revoke ...                The owner's external worker tokens (lair bus token)",
   "",
-  "Reads LAIR_BUS_TOKEN and LAIR_URL from the environment.",
+  "Reads LAIR_BUS_TOKEN and LAIR_URL from the environment. An external worker's token only reports.",
 ].join("\n");
+
+export const TOKEN_USAGE = [
+  "Usage: lair bus token <command> --project <p> [options]",
+  "",
+  "  create --worker <id> [--ttl <n>m|h|d] [--kinds PROGRESS,WAITING,DONE,BLOCKED]",
+  "                    A report-only token for a worker outside Lair's runs, printed once (default 24h, at most 30d)",
+  "  list              The project's external worker tokens (never the tokens)",
+  "  revoke <id>       Revoke one",
+  "",
+  "The owner's: reads LAIR_OWNER_SESSION (a dashboard's owner session) and LAIR_URL from the environment.",
+].join("\n");
+
+const TTL = /^([1-9]\d{0,4})([mhd])$/;
+const TTL_MINUTES = { m: 1, h: 60, d: 24 * 60 } as const;
 
 const MAX_SUMMARY_CHARS = 10_000;
 const MAX_SUMMARY_FILE_BYTES = 50 * 1024;
@@ -51,7 +69,7 @@ export interface BusCliDeps {
   env: Record<string, string | undefined>;
   fetch: (
     url: string,
-    init: { method: string; headers: Record<string, string>; body: string; signal: AbortSignal },
+    init: { method: string; headers: Record<string, string>; body?: string; signal: AbortSignal },
   ) => Promise<{ status: number; text(): Promise<string> }>;
   out: (line: string) => void;
   err: (line: string) => void;
@@ -114,6 +132,7 @@ function require(options: Map<string, string>, ...names: string[]): void {
 }
 
 export async function busCli(args: string[], deps: BusCliDeps): Promise<number> {
+  if (args[0] === "token") return tokenCli(args.slice(1), deps);
   const token = deps.env.LAIR_BUS_TOKEN ?? "";
   const say = (write: (line: string) => void, line: string) =>
     write(token.length > 0 ? redactBusToken(line, token) : line);
@@ -125,7 +144,9 @@ export async function busCli(args: string[], deps: BusCliDeps): Promise<number> 
 
   let request: { tool: string; args: Record<string, unknown> };
   try {
-    if (!isBusTokenFormat(token)) throw new UsageError("LAIR_BUS_TOKEN is not set (Lair sets it for agent runs)");
+    if (!isBusTokenFormat(token) && !isExtTokenFormat(token)) {
+      throw new UsageError("LAIR_BUS_TOKEN is not set (Lair sets it for agent runs; the owner makes an external worker's: lair bus token create)");
+    }
 
     const { command, options } = parseArgs(args);
 
@@ -207,6 +228,77 @@ export async function busCli(args: string[], deps: BusCliDeps): Promise<number> 
     return usage(e instanceof Error ? e.message : String(e));
   }
 
+  return callLair(deps, say, usage, "POST", "/api/bus/call", () => ({ authorization: `Bearer ${token}` }), request);
+}
+
+/**
+ * `lair bus token create|list|revoke`: the owner's external worker tokens. The owner session goes as the dashboard
+ * sends it (header, origin, same-origin), so the server checks it as any owner-only request; it is never printed.
+ */
+async function tokenCli(args: string[], deps: BusCliDeps): Promise<number> {
+  const session = deps.env.LAIR_OWNER_SESSION ?? "";
+  const say = (write: (line: string) => void, line: string) => write(session.length > 0 ? line.split(session).join("[owner-session]") : line);
+  const usage = (why: string) => {
+    say(deps.err, `lair bus token: ${why}`);
+    say(deps.err, TOKEN_USAGE);
+    return EXIT_USAGE;
+  };
+
+  let method: "GET" | "POST" = "POST";
+  let path: string;
+  let payload: Record<string, unknown> | undefined;
+  try {
+    if (session.length < 20) throw new UsageError("LAIR_OWNER_SESSION is not set (a dashboard's owner session)");
+    // `revoke <id>`: the one argument that isn't an option
+    const id = args[0] === "revoke" && args[1] !== undefined && !args[1].startsWith("--") ? args[1] : undefined;
+    const { command, options } = parseArgs(id === undefined ? args : [args[0], ...args.slice(2)]);
+    require(options, "project");
+    const query = `?project=${encodeURIComponent(options.get("project")!)}`;
+    switch (command) {
+      case "create": {
+        require(options, "worker");
+        const ttl = options.get("ttl");
+        const ttlParts = ttl === undefined ? null : TTL.exec(ttl);
+        if (ttl !== undefined && ttlParts === null) throw new UsageError("--ttl must be minutes, hours or days: 90m, 24h, 7d");
+        const kinds = options.get("kinds")?.split(",").map((kind) => kind.trim().toUpperCase());
+        if (kinds?.some((kind) => !KINDS.includes(kind as ReportKind))) throw new UsageError(`--kinds must be some of: ${KINDS.join(", ")}`);
+        path = `/api/bus/tokens${query}`;
+        payload = {
+          worker: options.get("worker"),
+          ...(ttlParts ? { ttl_minutes: Number(ttlParts[1]) * TTL_MINUTES[ttlParts[2] as keyof typeof TTL_MINUTES] } : {}),
+          ...(kinds ? { kinds } : {}),
+        };
+        break;
+      }
+      case "list":
+        method = "GET";
+        path = `/api/bus/tokens${query}`;
+        break;
+      case "revoke":
+        if (id === undefined) throw new UsageError("revoke needs the token's id: lair bus token revoke <id> --project <p>");
+        path = `/api/bus/tokens/${encodeURIComponent(id)}/revoke${query}`;
+        payload = {};
+        break;
+      default:
+        throw new UsageError(`unknown command: ${command}`);
+    }
+  } catch (e) {
+    return usage(e instanceof Error ? e.message : String(e));
+  }
+
+  return callLair(deps, say, usage, method, path, (origin) => ({ "x-lair-owner-session": session, origin, "sec-fetch-site": "same-origin" }), payload);
+}
+
+/** One request to Lair (JSON), its data printed: 0, else 1 refused, 2 a bad LAIR_URL, 3 unreachable or a server error */
+async function callLair(
+  deps: BusCliDeps,
+  say: (write: (line: string) => void, line: string) => void,
+  usage: (why: string) => number,
+  method: "GET" | "POST",
+  path: string,
+  headers: (origin: string) => Record<string, string>,
+  payload?: unknown,
+): Promise<number> {
   let base: URL;
   try {
     base = new URL(deps.env.LAIR_URL || DEFAULT_SERVER_URL);
@@ -217,16 +309,17 @@ export async function busCli(args: string[], deps: BusCliDeps): Promise<number> 
     return usage("LAIR_URL is not an http(s) URL");
   }
 
-  const url = new URL("/api/bus/call", base).toString();
+  const url = new URL(path, base).toString();
+  const init: Parameters<BusCliDeps["fetch"]>[1] = { method, headers: headers(base.origin), signal: AbortSignal.timeout(deps.timeoutMs ?? TIMEOUT_MS) };
+  // A GET has no body
+  if (payload !== undefined) {
+    init.headers["content-type"] = "application/json";
+    init.body = JSON.stringify(payload);
+  }
   let status: number;
   let text: string;
   try {
-    const response = await deps.fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-      body: JSON.stringify(request),
-      signal: AbortSignal.timeout(deps.timeoutMs ?? TIMEOUT_MS),
-    });
+    const response = await deps.fetch(url, init);
     status = response.status;
     text = (await response.text()).slice(0, MAX_RESPONSE_CHARS);
   } catch (e) {

@@ -62,6 +62,8 @@ export const OWNER_ONLY_PREFIXES: readonly string[] = [
   "/api/pipelines",
   // Only the owner's message route of the bus: its board and event stream keep their CORS
   "/api/bus/send",
+  // External worker tokens: making, listing, revoking and their audit (every route the owner's)
+  "/api/bus/tokens",
   // The bus's agent API takes a run's bus token, not the owner session; no browser page may call it either
   "/api/bus/call",
   // Host services: the owner's tick runs start commands (its reads under /api/host-services stay public)
